@@ -2067,6 +2067,12 @@ fn tiny_inner() -> Inner {
     let c = config::Config::parse(&raw).unwrap();
     let store = weights::Store::open_fixture(&path, None).unwrap();
     let vision = media::Vision::metadata(&serde_json::Value::Null, &store, &c).unwrap();
+    let mut decoder = decoder::Decoder::new(c.clone(), store).unwrap();
+    decoder.paged = Some(super::paged::create(&c).unwrap());
+    inner_over(decoder, vision, true)
+}
+
+fn inner_over(decoder: decoder::Decoder, vision: media::Vision, has_mtp: bool) -> Inner {
     let tokenizer_dir = Temp::new();
     let tokenizer_path = tokenizer_dir.0.join("tokenizer.json");
     std::fs::write(
@@ -2077,8 +2083,6 @@ fn tiny_inner() -> Inner {
     std::fs::write(&tokenizer_path,r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"a":0,"b":1,"<unk>":2},"unk_token":"<unk>"}}"#).unwrap();
     let tokenizer =
         Arc::new(Qwen3Tokenizer::load_from_file_sync(tokenizer_path.to_str().unwrap()).unwrap());
-    let mut decoder = decoder::Decoder::new(c.clone(), store).unwrap();
-    decoder.paged = Some(super::paged::create(&c).unwrap());
     Inner {
         decoder,
         tokenizer,
@@ -2087,7 +2091,7 @@ fn tiny_inner() -> Inner {
         rows: Default::default(),
         active_seq: None,
         mtp: Default::default(),
-        has_mtp: true,
+        has_mtp,
         vision,
         media_prefill: None,
         _pool_guard: None,
@@ -7702,4 +7706,281 @@ fn real_model_teacher_forced_env_arms() {
         !failed,
         "the reference argmax differs from D3_EXPECTED (see D3 EXPECTED MISMATCH lines)"
     );
+}
+
+/// Real-model verify against AR on the mapped pack, paged as served: owner 1
+/// decodes greedy AR steps; owner 2 runs 32 teacher-forced verifies of three
+/// of those tokens beside owner 3's one- and two-row verifies, a third of
+/// which reject a poisoned draft. Every verified row of an accepted
+/// prefix carries the AR step's logits bits, no layer reads its routes
+/// through `read_routes`, and both owners then continue AR exactly. A verify
+/// that trips the wire keeps those bits and checks its tape against the
+/// mapped banks before the store moves to slots, where the next verify reads
+/// every layer's routes back, with the same bits. Needs
+/// `QWEN4_EXP_REAL_MODEL` / `QWEN4_EXP_REAL_INPUTS` and `--test-threads=1`.
+#[test]
+#[ignore]
+fn real_model_verify_rows_match_ar_steps() {
+    use crate::engine::hybrid_scheduler::{
+        HybridSchedulerBackend, ScheduledVerifyCommit, ScheduledVerifyRow,
+    };
+    let (Ok(model), Ok(inputs)) = (
+        std::env::var("QWEN4_EXP_REAL_MODEL"),
+        std::env::var("QWEN4_EXP_REAL_INPUTS"),
+    ) else {
+        eprintln!(
+            "real_model_verify_rows_match_ar_steps: QWEN4_EXP_REAL_MODEL / QWEN4_EXP_REAL_INPUTS not set"
+        );
+        return;
+    };
+    const VERIFIES: usize = 32;
+    let inputs: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(inputs).unwrap()).unwrap();
+    let prompt: Vec<u32> = inputs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"] == "6k")
+        .expect("a 6k case")["tokenIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_u64().unwrap() as u32)
+        .collect();
+    let store = weights::Store::open(Path::new(&model)).unwrap();
+    let config = gguf::config(&store).unwrap();
+    let vision = media::Vision::metadata(&serde_json::Value::Null, &store, &config).unwrap();
+    let mut decoder = decoder::Decoder::new(config.clone(), store).unwrap();
+    let adapter = super::paged::create(&config).unwrap();
+    let pool_bytes = adapter.bytes_per_block().unwrap() * u64::from(adapter.block_capacity());
+    decoder.paged = Some(adapter);
+    decoder.register_cache_limit();
+    decoder.weights.prepare_mapped_pack().unwrap();
+    decoder.weights.select_mapped_residency(pool_bytes).unwrap();
+    decoder.weights.prepare_hot().unwrap();
+    decoder.weights.publish_live();
+    decoder.residency_changed();
+    assert!(
+        decoder.weights.plan.mapped,
+        "the live host refused the pack"
+    );
+    let mut inner = inner_over(decoder, vision, false);
+    let layers = config.num_hidden_layers;
+    let top = config.num_experts_per_tok;
+
+    let bits = |a: &MxArray| -> Vec<u32> {
+        a.to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    };
+    let argmax = |a: &MxArray| -> u32 {
+        let last = a.shape().unwrap().len() as i32 - 1;
+        a.argmax(last, Some(false))
+            .unwrap()
+            .item_at_uint32(0)
+            .unwrap()
+    };
+    let prefill = |inner: &mut Inner, seq: u32| -> MxArray {
+        inner.activate_paged_seq(seq).unwrap();
+        let mut start = 0;
+        let mut logits = None;
+        while start < prompt.len() {
+            let end = (start + inner.decoder.prefill_slice_size()).min(prompt.len());
+            logits = Some(
+                inner
+                    .decoder
+                    .prefill_chunk(&prompt[start..end], None, end == prompt.len())
+                    .unwrap(),
+            );
+            start = end;
+        }
+        logits.unwrap()
+    };
+
+    // `ar[k]` holds the logits after `tokens[k]`; `tokens[k + 1]` is their argmax.
+    let mut logits = prefill(&mut inner, 1);
+    let mut tokens = vec![argmax(&logits)];
+    let mut ar = Vec::new();
+    for k in 0..3 * VERIFIES + 7 {
+        logits = inner.decoder.step(tokens[k]).unwrap();
+        ar.push(bits(&logits));
+        tokens.push(argmax(&logits));
+    }
+    prefill(&mut inner, 2);
+    prefill(&mut inner, 3);
+
+    let ready = |a: &MxArray| unsafe { mlx_sys::mlx_array_is_available(a.as_raw_ptr()) };
+    let poison = |t: u32| (t + 1) % config.vocab_size as u32;
+    let readbacks = inner.decoder.route_readbacks;
+    let hits = inner.decoder.weights.slot_hits;
+    let (mut front2, mut front3) = (0usize, 0usize);
+    for k in 0..VERIFIES {
+        // Owner 3: two rows kept, two rows with the second rejected, one row.
+        let (width3, keep3) = [(2, 2), (2, 1), (1, 1)][k % 3];
+        let mut rows3 = tokens[front3..front3 + width3].to_vec();
+        for t in &mut rows3[keep3..] {
+            *t = poison(*t);
+        }
+        let verified = inner
+            .verify_mtp(&[
+                ScheduledVerifyRow {
+                    seq_id: 2,
+                    first_position: (prompt.len() + front2) as u32,
+                    tokens: tokens[front2..front2 + 3].to_vec(),
+                    speculative: true,
+                },
+                ScheduledVerifyRow {
+                    seq_id: 3,
+                    first_position: (prompt.len() + front3) as u32,
+                    tokens: rows3,
+                    speculative: true,
+                },
+            ])
+            .unwrap();
+        // Before any output is read: a read would complete every ancestor.
+        let adapter = inner.decoder.paged.as_ref().unwrap();
+        for layer in 0..(0..layers).filter(|&l| !config.linear(l)).count() as u32 {
+            assert!(
+                ready(&adapter.key_pool_array(layer).unwrap())
+                    && ready(&adapter.value_pool_array(layer).unwrap()),
+                "verify {k}: a page write of layer {layer} is still lazy"
+            );
+        }
+        assert!(
+            inner.decoder.snapshot().arrays().all(ready)
+                && inner.rows.values().all(|state| state.arrays().all(ready)),
+            "verify {k}: a frontier is still lazy"
+        );
+        let width = 3 + width3 as i64;
+        assert_eq!(&*verified.shape().unwrap(), [width, 1, ar[0].len() as i64]);
+        let rows: Vec<Vec<u32>> = (0..width)
+            .map(|r| bits(&verified.slice_axis(0, r, r + 1).unwrap()))
+            .collect();
+        for j in 0..3 {
+            assert!(
+                rows[j] == ar[front2 + j],
+                "verify {k}: owner 2 row {j} differs from AR step {}",
+                front2 + j
+            );
+        }
+        for j in 0..keep3 {
+            assert!(
+                rows[3 + j] == ar[front3 + j],
+                "verify {k}: owner 3 row {j} differs from AR step {}",
+                front3 + j
+            );
+        }
+        for result in inner
+            .commit_mtp(&[
+                ScheduledVerifyCommit {
+                    seq_id: 3,
+                    keep: keep3,
+                },
+                ScheduledVerifyCommit { seq_id: 2, keep: 3 },
+            ])
+            .unwrap()
+        {
+            result.unwrap();
+        }
+        front2 += 3;
+        front3 += keep3;
+    }
+    assert_eq!(
+        inner.decoder.route_readbacks - readbacks,
+        0,
+        "a mapped verify read its routes back through read_routes"
+    );
+    let hit = inner.decoder.weights.slot_hits - hits;
+    assert!(
+        hit >= (2 * VERIFIES * layers * top) as u64,
+        "the verify route tapes were not committed: {hit} slot hits"
+    );
+    for (seq, front) in [(2, front2), (3, front3)] {
+        inner.activate_paged_seq(seq).unwrap();
+        assert_eq!(inner.decoder.history.len(), prompt.len() + front);
+        let step = inner.decoder.step(tokens[front]).unwrap();
+        assert!(
+            bits(&step) == ar[front],
+            "owner {seq} does not continue AR exactly after its verifies"
+        );
+    }
+
+    // The wire takes this verify's own pass as the eighth slow 3-row pass.
+    inner.activate_paged_seq(2).unwrap();
+    let front = front2 + 1;
+    let mapped = inner.decoder.weights.plan.mapped_bytes;
+    let wire = inner.decoder.weights.tripwire_mut();
+    *wire = tripwire::Tripwire::default();
+    let reads = memory::process_disk_reads();
+    wire.begin_turn(reads);
+    for _ in 0..8 {
+        wire.observe(3, std::time::Duration::from_micros(1), reads, mapped);
+    }
+    for _ in 0..7 {
+        wire.observe(3, std::time::Duration::from_secs(1), reads, mapped);
+    }
+    assert!(wire.tripped().is_none() && wire.slow_streak() == 7);
+    let readbacks = inner.decoder.route_readbacks;
+    let verified = inner
+        .verify_mtp(&[ScheduledVerifyRow {
+            seq_id: 2,
+            first_position: (prompt.len() + front) as u32,
+            tokens: tokens[front..front + 3].to_vec(),
+            speculative: true,
+        }])
+        .expect("a verify that trips the wire must keep its mapped rows");
+    assert!(
+        !inner.decoder.weights.plan.mapped
+            && matches!(
+                inner.decoder.weights.live.fallback(),
+                Some(tripwire::Fallback::SlowSteps { rows: 3, .. })
+            ),
+        "the primed verify did not trip the wire"
+    );
+    assert_eq!(
+        inner.decoder.route_readbacks, readbacks,
+        "the tripping verify read its routes back through read_routes"
+    );
+    for j in 0..3 {
+        assert!(
+            bits(&verified.slice_axis(0, j, j + 1).unwrap()) == ar[front + j as usize],
+            "the tripping verify row {j} differs from AR step {}",
+            front + j as usize
+        );
+    }
+    inner
+        .commit_mtp(&[ScheduledVerifyCommit { seq_id: 2, keep: 3 }])
+        .unwrap()
+        .remove(0)
+        .unwrap();
+
+    let front = front + 3;
+    let readbacks = inner.decoder.route_readbacks;
+    let verified = inner
+        .verify_mtp(&[ScheduledVerifyRow {
+            seq_id: 2,
+            first_position: (prompt.len() + front) as u32,
+            tokens: tokens[front..front + 3].to_vec(),
+            speculative: true,
+        }])
+        .unwrap();
+    assert_eq!(
+        inner.decoder.route_readbacks - readbacks,
+        layers as u64,
+        "a verify over slots must read every layer's routes on the host"
+    );
+    for j in 0..3 {
+        assert!(
+            bits(&verified.slice_axis(0, j, j + 1).unwrap()) == ar[front + j as usize],
+            "the slot verify row {j} differs from AR step {}",
+            front + j as usize
+        );
+    }
+    inner
+        .commit_mtp(&[ScheduledVerifyCommit { seq_id: 2, keep: 3 }])
+        .unwrap()
+        .remove(0)
+        .unwrap();
 }

@@ -151,6 +151,9 @@ pub struct Decoder {
     verification: Option<Vec<DecoderState>>,
     device_routes: Option<Vec<(usize, MxArray)>>,
     device_route_cooldown: usize,
+    /// Layers whose routes a pass read back to the host one at a time.
+    #[cfg(test)]
+    pub(super) route_readbacks: u64,
     pub last_chunk_hidden: Vec<MxArray>,
     /// The weight budget this store registers with the process-wide cache
     /// limit; re-registered whenever the residency changes, between turns or
@@ -246,6 +249,8 @@ impl Decoder {
             verification: None,
             device_routes: None,
             device_route_cooldown: 0,
+            #[cfg(test)]
+            route_readbacks: 0,
             last_chunk_hidden: Vec::new(),
             cache_limit_guard: None,
             #[cfg(test)]
@@ -1351,7 +1356,7 @@ impl Decoder {
             self.resident_experts(x, &selected, &scores, i)?
         };
         let ids = if resident.is_none() {
-            selected.to_uint32()?.to_vec()
+            self.read_routes(&selected)?
         } else {
             Vec::new()
         };
@@ -1401,6 +1406,14 @@ impl Decoder {
         let (shared, gate) = self.shared_expert_parts(x, i)?;
         sum.astype(x.dtype()?)?
             .add(&math::sigmoid_mul(&gate, &shared)?)
+    }
+    /// A layer's routes on the host: the pass waits here for the GPU.
+    fn read_routes(&mut self, selected: &MxArray) -> Result<Vec<u32>> {
+        #[cfg(test)]
+        {
+            self.route_readbacks += 1;
+        }
+        Ok(selected.to_uint32()?.to_vec())
     }
     fn shared_expert_parts(&mut self, x: &MxArray, i: usize) -> Result<(MxArray, MxArray)> {
         let p = format!("layers.{i}.mlp");
@@ -1523,9 +1536,10 @@ impl Decoder {
         ))
     }
 
-    /// `moe` over a `[1, R, H]` verify window: one routing readback for all
-    /// rows, then the routed and shared experts through the row-batched slot
-    /// kernels. Without those kernels every row runs the single-row MoE.
+    /// `moe` over a `[1, R, H]` verify window: the routes of all rows stay on
+    /// the device over the mapped pack, otherwise one routing readback, then
+    /// the routed and shared experts through the row-batched slot kernels.
+    /// Without those kernels every row runs the single-row MoE.
     fn moe_rows(&mut self, x: &MxArray, i: usize) -> Result<MxArray> {
         let rows = x.shape_at(1)?;
         if rows == 1 {
@@ -1547,9 +1561,12 @@ impl Decoder {
             if let Some((selected, scores)) =
                 math::rows::singleton_routes(&logits, c.num_experts_per_tok)?
             {
+                if let Some(out) = self.tentative_shared_expert_rows(x, &selected, &scores, i)? {
+                    return Ok(out);
+                }
                 let mut sum = self.resident_experts(x, &selected, &scores, i)?;
                 if sum.is_none() {
-                    let ids = selected.to_uint32()?.to_vec();
+                    let ids = self.read_routes(&selected)?;
                     if let Some(out) = self.slotted_shared_experts(x, &ids, &scores, i)? {
                         return Ok(out);
                     }
@@ -2029,9 +2046,17 @@ impl Decoder {
         if tokens.is_empty() || tokens.len() > 4 {
             return Err(Error::from_reason("Qwen4 verification width must be 1-4"));
         }
+        self.rotary_tables.get_mut().clear();
+        let started = std::time::Instant::now();
         self.verification = Some(Vec::new());
+        if self.verify_routes_on_device() {
+            self.device_routes = Some(Vec::with_capacity(self.config.num_hidden_layers));
+        }
         let result = (|| {
-            self.prefill_chunk(tokens, None, false)?;
+            if cfg!(target_os = "macos") {
+                self.weights.check_forward_headroom()?;
+            }
+            self.prefill_chunk_inner(tokens, None, false)?;
             // The pass stays open through the head: these rows are row-exact
             // too, and `linear_rows` is batched outside a verification pass.
             let window =
@@ -2044,11 +2069,20 @@ impl Decoder {
             let states = self.verification.take().ok_or_else(|| {
                 Error::from_reason("Qwen4 verification lost its accepted-frontier snapshots")
             })?;
+            let routes = self.device_routes.take();
+            let tape = routes
+                .as_ref()
+                .filter(|routes| !routes.is_empty())
+                .map(|routes| {
+                    MxArray::concatenate_many(routes.iter().map(|(_, ids)| ids).collect(), Some(0))
+                })
+                .transpose()?;
             // Commit rolls the page cursor back and restores one of these
             // states: every pool write and frontier array must be complete.
             let completed: Vec<_> = std::iter::once(&logits)
                 .chain(states.iter().flat_map(DecoderState::arrays))
                 .chain(self.caches.iter().flat_map(LayerCache::arrays))
+                .chain(tape.iter())
                 .collect();
             MxArray::async_eval_arrays(&completed);
             if let Some(adapter) = &mut self.paged {
@@ -2057,10 +2091,28 @@ impl Decoder {
                     .map_err(Error::from_reason)?;
             }
             MxArray::eval_arrays_with_context(&completed, "qwen4::decoder::verify")?;
+            if let (Some(routes), Some(tape)) = (routes, tape) {
+                let layers: Vec<_> = routes.iter().map(|(layer, _)| *layer).collect();
+                if !self.weights.commit_device_routes(
+                    &layers,
+                    &tape.to_uint32()?,
+                    tokens.len() * self.config.num_experts_per_tok,
+                )? {
+                    return Err(Error::from_reason(
+                        "Qwen4 verification routes lost their mapped banks",
+                    ));
+                }
+            }
             Ok((logits, states))
         })();
+        self.rotary_tables.get_mut().clear();
         match result {
-            Ok(verified) => Ok(verified),
+            Ok(verified) => {
+                // Only after the route commit: a pass that trips the wire
+                // drops the mapped banks the tape is checked against.
+                self.observe_pass(tokens.len(), started.elapsed());
+                Ok(verified)
+            }
             Err(error) => {
                 self.reset();
                 Err(error)

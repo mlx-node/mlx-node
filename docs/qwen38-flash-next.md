@@ -231,7 +231,9 @@ there as the ownerless session that ownerless AR turns continue; one that still
 reaches the exclusive lane (`MLX_SERVE_FORCE_SERIAL`) is refused before prefill
 instead of decoding plain AR. Proposals use private draft state; verification
 runs every draft row through each layer together, reading the layer's weights
-once, with one routing readback per layer, and commits only accepted target
+once; over the mapped pack its routes stay on the device and one readback at
+the end checks every layer, over slot banks each layer reads its routes back
+to fill its slots. It commits only accepted target
 frontiers, whose head rows are written by the next proposal's first draft pass
 together with its anchor row. The head's routed experts become resident Q8
 (affine, group 32) banks on the first MTP owner, about 2.6 GiB for the released

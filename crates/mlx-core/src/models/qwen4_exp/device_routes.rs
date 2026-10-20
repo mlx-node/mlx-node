@@ -196,6 +196,63 @@ impl Decoder {
         Ok(Some(out))
     }
 
+    /// Every mapped expert has a bank row, so a verify pass reads no expert
+    /// and its routes can wait for the pass end. Slot banks keep the host
+    /// routes: a verify pass loads the experts it misses. The shapes are the
+    /// row kernels': a layer whose rows fall back to the one-row MoE would
+    /// put one-row routes on the R-row tape.
+    pub(super) fn verify_routes_on_device(&self) -> bool {
+        self.gguf()
+            && self.weights.plan.mapped
+            && self.config.hidden_size == 2560
+            && self.config.moe_intermediate_size == 640
+            && self.config.num_experts == 512
+            && self.config.num_experts_per_tok == 10
+            && self
+                .weights
+                .device_slots_ready(self.config.num_hidden_layers)
+    }
+
+    /// `tentative_shared_experts` over the `[1, R, H]` verify rows.
+    pub(super) fn tentative_shared_expert_rows(
+        &mut self,
+        x: &MxArray,
+        selected: &MxArray,
+        scores: &MxArray,
+        layer: usize,
+    ) -> Result<Option<MxArray>> {
+        if self.device_routes.is_none() || x.dtype()? != DType::BFloat16 {
+            return Ok(None);
+        }
+        let shared = ["gate", "up", "down"].map(|part| {
+            self.weights
+                .resident_bank(&format!("blk.{layer}.ffn_{part}_shexp.weight"))
+        });
+        let [Some(gate), Some(up), Some(down)] = shared else {
+            return Ok(None);
+        };
+        let shared = [gate, up, down];
+        let Some((banks, local)) = self.weights.device_expert_slots(layer, selected)? else {
+            return Ok(None);
+        };
+        let shared_gate = self.linear_rows(
+            x,
+            &format!("layers.{layer}.mlp.shared_expert_gate.weight"),
+            &format!("blk.{layer}.ffn_gate_inp_shexp.weight"),
+        )?;
+        let Some(out) =
+            math::rows::routed_shared_experts(x, &local, scores, &banks, &shared, &shared_gate)?
+        else {
+            return Ok(None);
+        };
+        self.weights.finish_expert_slots(layer, &out)?;
+        self.device_routes
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Qwen4 tentative verify lost its route tape"))?
+            .push((layer, selected.reshape(&[-1])?));
+        Ok(Some(out))
+    }
+
     pub(super) fn tentative_experts(
         &mut self,
         x: &MxArray,
