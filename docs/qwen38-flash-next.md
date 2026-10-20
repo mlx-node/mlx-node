@@ -168,7 +168,11 @@ grace gate for real orphan reasons, never an expiry on its own: a healthy
 manifested pack stays cached indefinitely. Removal requires a non-blocking
 lock on the pack's `lock` file, which every process serving or building the
 pack holds shared; directories without a manifest are never removed, since
-nothing can prove them stale, and a load never sweeps its own pack. The same
+nothing can prove them stale, and a load never sweeps its own pack. Legacy
+chunk directories named `.mlx-qwen4-packed-v2-<64 lowercase hex>`, which older
+releases write, are removed automatically once idle for one hour and unlocked
+(a non-blocking lock on their `budget` file), with or without a manifest; any
+other name under that prefix is kept. The same
 maintenance sweeps stale entries of the native GGUF cache under a 24 h grace
 and per-entry locks; `.mlx-qwen4-assets-v2-*` tokenizer sidecars are exempt
 from orphan removal and their markers are re-stamped on use, so they are only
@@ -177,8 +181,8 @@ collected by the `MLX_NATIVE_GGUF_CACHE_MAX_GB` least-recently-used cap.
 A breached SSD-read safety limit reclaims the allocator freelist and re-polls
 before erroring.
 
-| Setting                      | Behavior                                                                |
-| ---------------------------- | ----------------------------------------------------------------------- |
+| Setting                        | Behavior                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `MLX_NATIVE_GGUF_CACHE_MAX_GB` | Optional cap on the whole native GGUF cache (packed weights plus extracted tokenizer assets), in GiB; least-recently-used eviction under a 24 h grace, with atomic root-wide admission at publish (a conversion that cannot fit loads from its staging dir instead; a later reload reuses that staged result rather than re-converting, and the refused dir is a per-pid load output the sweep keeps while the process lives). Unset, `<=0` or unparseable means unlimited. |
 
 `residencyInfo()` reports the admitted bytes, hot inventory, resident banks,

@@ -31,6 +31,12 @@ pub(super) const MAPPED_DIR_PREFIX: &str = ".mlx-qwen4-mapped-v3-";
 /// A mapped dir's stable lock file: SH while a model reads or builds the
 /// pack, EX by an evictor. Never renamed or unlinked (flock needs the inode).
 const MAPPED_LOCK: &str = "lock";
+/// Per-expert chunk dirs of the retired format, which older releases still
+/// write (up to 96 GiB each). Nothing reads them; the sweep removes them.
+const RETIRED_CHUNK_PREFIX: &str = ".mlx-qwen4-packed-v2-";
+/// The retired format's ledger: every older build holds it EX while writing
+/// a chunk; builds after v0.0.16 also hold it SH while reading one.
+const RETIRED_CHUNK_LOCK: &str = "budget";
 
 fn err(e: impl std::fmt::Display) -> Error {
     Error::from_reason(e.to_string())
@@ -364,15 +370,23 @@ pub(super) fn dir_stat(dirfd: &File, name: &OsStr) -> Option<libc::stat> {
 }
 
 /// Producer identities are exactly 64 lowercase hex chars (the source
-/// fingerprint) under the mapped prefix. Anything else under it — a
-/// `-backup` suffix, a typo, a manual copy — is foreign: never swept.
-pub(super) fn dir_name_identity(dir: &Path) -> Option<&str> {
-    let suffix = dir.file_name()?.to_str()?.strip_prefix(MAPPED_DIR_PREFIX)?;
+/// fingerprint) under their prefix. Anything else under it — a `-backup`
+/// suffix, a typo, a manual copy — is foreign: never swept.
+fn prefixed_identity<'a>(dir: &'a Path, prefix: &str) -> Option<&'a str> {
+    let suffix = dir.file_name()?.to_str()?.strip_prefix(prefix)?;
     (suffix.len() == 64
         && suffix
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
     .then_some(suffix)
+}
+
+pub(super) fn dir_name_identity(dir: &Path) -> Option<&str> {
+    prefixed_identity(dir, MAPPED_DIR_PREFIX)
+}
+
+fn is_retired_chunk_dir(dir: &Path) -> bool {
+    prefixed_identity(dir, RETIRED_CHUNK_PREFIX).is_some()
 }
 
 /// Newest mtime over the dir and every direct entry (.manifest, lock,
@@ -466,12 +480,9 @@ fn try_exclusive_lock(path: &Path) -> Option<Option<File>> {
     }
 }
 
-/// The mapped dir's lock file; every open `MappedPack` holds it SH.
-fn try_mapped_lock(dir: &Path) -> Option<Option<File>> {
-    try_exclusive_lock(&dir.join(MAPPED_LOCK))
-}
-
-fn locked_remove(dir: &Path, reason: &str, still_stale: impl Fn(&Path) -> bool) -> u64 {
+/// `lock` names the file every user of the dir flocks: `MAPPED_LOCK` for a
+/// mapped dir, `RETIRED_CHUNK_LOCK` for a retired chunk dir.
+fn locked_remove(dir: &Path, lock: &str, reason: &str, still_stale: impl Fn(&Path) -> bool) -> u64 {
     // In-process exclusion first: a same-process holder's SH flock cannot
     // stop this process's EX request, so the flock alone would let us delete
     // a dir a pack of this process serves. The registry lock is held through
@@ -487,9 +498,9 @@ fn locked_remove(dir: &Path, reason: &str, still_stale: impl Fn(&Path) -> bool) 
     // A mapped dir has no creation window: `hold_mapped_dir` takes the SH
     // lock before the manifest is written, so a lock-free manifested dir is
     // one nobody is reading or building.
-    let Some(_guard) = try_mapped_lock(dir) else {
+    let Some(_guard) = try_exclusive_lock(&dir.join(lock)) else {
         debug!(
-            "packed cache: keeping {} (mapped pack is open or being built)",
+            "packed cache: keeping {} (its {lock} file is held)",
             dir.display()
         );
         return 0;
@@ -516,7 +527,7 @@ fn locked_remove(dir: &Path, reason: &str, still_stale: impl Fn(&Path) -> bool) 
 }
 
 fn remove_packed_dir(dir: &Path, reason: &str) -> u64 {
-    locked_remove(dir, reason, |d| {
+    locked_remove(dir, MAPPED_LOCK, reason, |d| {
         is_real_dir(d) && packed_orphan_reason(d).is_some()
     })
 }
@@ -542,7 +553,9 @@ pub(super) fn admit_mapped_file(dirfd: &File, staging: &File, file_bytes: u64) -
     staging.set_len(file_bytes).map_err(err)
 }
 
-/// Remove orphaned sibling `.mlx-qwen4-mapped-v3-*` dirs. Never fatal.
+/// Remove orphaned sibling `.mlx-qwen4-mapped-v3-*` dirs, and every
+/// `.mlx-qwen4-packed-v2-<64 lowercase hex>` dir once it is idle and
+/// unlocked. Never fatal.
 fn sweep_packed_cache(parent: &Path, current: &Path) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let Ok(entries) = fs::read_dir(parent) else {
@@ -550,7 +563,23 @@ fn sweep_packed_cache(parent: &Path, current: &Path) {
         };
         for entry in entries.flatten() {
             let dir = entry.path();
-            if dir == current || !is_real_dir(&dir) || dir_name_identity(&dir).is_none() {
+            if dir == current || !is_real_dir(&dir) {
+                continue;
+            }
+            if is_retired_chunk_dir(&dir) {
+                // A v0.0.16 process takes no lock and stamps nothing on
+                // reads, and stops writing once its ledger is full, so an
+                // idle dir can be removed under it: its reads then miss and
+                // re-import, never see torn data. A dir with no `budget` yet
+                // has nothing to lock; only its fresh mtime keeps it.
+                if packed_dir_idle(&dir) {
+                    locked_remove(&dir, RETIRED_CHUNK_LOCK, "retired chunk format", |d| {
+                        is_real_dir(d) && packed_dir_idle(d)
+                    });
+                }
+                continue;
+            }
+            if dir_name_identity(&dir).is_none() {
                 continue;
             }
             if let Some(reason) = packed_orphan_reason(&dir) {
@@ -1230,10 +1259,10 @@ mod tests {
         let unknown = parent.join(format!("{MAPPED_DIR_PREFIX}{}", "b".repeat(64)));
         fs::create_dir(&unknown).unwrap();
         fs::write(unknown.join("x.mapped"), b"data").unwrap();
-        // A name under the prefix that is not a 64-hex identity is foreign,
-        // and so is every per-expert chunk dir of the earlier format.
+        // A name under the prefix that is not a 64-hex identity is foreign;
+        // an idle chunk dir of the retired format is removed.
         let foreign = parent.join(format!("{MAPPED_DIR_PREFIX}backup"));
-        let chunks = parent.join(format!(".mlx-qwen4-packed-v2-{}", "d".repeat(64)));
+        let chunks = parent.join(format!("{RETIRED_CHUNK_PREFIX}{}", "d".repeat(64)));
         for dir in [&foreign, &chunks] {
             fs::create_dir(dir).unwrap();
             fs::write(dir.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
@@ -1248,7 +1277,7 @@ mod tests {
         assert!(current.exists(), "the current identity's dir is current");
         assert!(unknown.exists());
         assert!(foreign.exists());
-        assert!(chunks.exists());
+        assert!(!chunks.exists());
     }
 
     #[test]
@@ -1307,7 +1336,7 @@ mod tests {
     // flock is per-process on BSD/macOS, so a held pack lock can only be
     // observed from a second process.
     #[test]
-    #[ignore = "helper process for held_mapped_dir_lock_blocks_the_sweep"]
+    #[ignore = "helper process for the held-lock sweep tests"]
     fn packed_budget_lock_child() {
         let path = PathBuf::from(
             std::env::var_os("MLX_NODE_PACKED_LOCK_TEST_PATH").expect("lock-test child path"),
@@ -1330,6 +1359,40 @@ mod tests {
         fs::write(acquired, b"acquired").unwrap();
         // The parent kills this process once the sweep assertion completes.
         std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// Dropping a bare `Child` leaves it running: a failed assertion would
+    /// keep the lock and the test's output pipe open for the child's sleep.
+    struct LockHolder(std::process::Child);
+
+    impl Drop for LockHolder {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A second process holding `path` shared until dropped.
+    fn shared_lock_holder(temp: &Path, path: &Path) -> LockHolder {
+        let acquired = temp.join(format!("{}.acquired", uuid::Uuid::new_v4()));
+        let holder = LockHolder(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("models::qwen4_exp::packed_cache::tests::packed_budget_lock_child")
+                .arg("--ignored")
+                .env("MLX_NODE_PACKED_LOCK_TEST_PATH", path)
+                .env("MLX_NODE_PACKED_LOCK_TEST_ACQUIRED", &acquired)
+                .env("MLX_NODE_PACKED_LOCK_TEST_SHARED", "1")
+                .spawn()
+                .unwrap(),
+        );
+        for _ in 0..500 {
+            if acquired.is_file() {
+                return holder;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("child never acquired {}", path.display());
     }
 
     /// A mapped dir fixture: `<letter>*64` identity, one `x.mapped` of
@@ -1362,27 +1425,10 @@ mod tests {
         fs::create_dir(&current).unwrap();
         // Another process reads the pack: its SH lock keeps the orphan.
         let stale = mapped_fixture(&parent, 'a', 100, true);
-        let acquired = temp.0.join("child.acquired");
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg("models::qwen4_exp::packed_cache::tests::packed_budget_lock_child")
-            .arg("--ignored")
-            .env("MLX_NODE_PACKED_LOCK_TEST_PATH", stale.join(MAPPED_LOCK))
-            .env("MLX_NODE_PACKED_LOCK_TEST_ACQUIRED", &acquired)
-            .env("MLX_NODE_PACKED_LOCK_TEST_SHARED", "1")
-            .spawn()
-            .unwrap();
-        for _ in 0..500 {
-            if acquired.is_file() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(acquired.is_file(), "child never acquired the mapped lock");
+        let holder = shared_lock_holder(&temp.0, &stale.join(MAPPED_LOCK));
         sweep_packed_cache(&parent, &current);
         assert!(stale.exists(), "an open pack is not swept");
-        child.kill().unwrap();
-        let _ = child.wait();
+        drop(holder);
         sweep_packed_cache(&parent, &current);
         assert!(!stale.exists());
         // The same process holding the dir through `hold_mapped_dir` (a
@@ -1390,15 +1436,89 @@ mod tests {
         let held = mapped_fixture(&parent, 'b', 100, true);
         let dirfd = open_dir_nofollow(&held).unwrap();
         let guard = hold_mapped_dir(&held, &dirfd).unwrap();
-        assert_eq!(locked_remove(&held, "test", |_| true), 0);
+        assert_eq!(locked_remove(&held, MAPPED_LOCK, "test", |_| true), 0);
         assert!(held.exists());
         drop(guard);
-        assert!(locked_remove(&held, "test", |_| true) > 0);
+        assert!(locked_remove(&held, MAPPED_LOCK, "test", |_| true) > 0);
         assert!(!held.exists());
         // Holding a dir an evictor removed meanwhile is refused.
         let gone = mapped_fixture(&parent, 'd', 100, true);
         let dirfd = open_dir_nofollow(&gone).unwrap();
         fs::remove_dir_all(&gone).unwrap();
         assert!(hold_mapped_dir(&gone, &dirfd).is_err());
+    }
+
+    /// A retired chunk dir holding `files`, every witness aged past the sweep
+    /// grace when `aged`.
+    fn chunk_fixture(parent: &Path, suffix: &str, files: &[(&str, &[u8])], aged: bool) -> PathBuf {
+        let dir = parent.join(format!("{RETIRED_CHUNK_PREFIX}{suffix}"));
+        fs::create_dir(&dir).unwrap();
+        for (name, bytes) in files {
+            fs::write(dir.join(name), bytes).unwrap();
+        }
+        if aged {
+            for entry in fs::read_dir(&dir).unwrap() {
+                age(&entry.unwrap().path(), 7200);
+            }
+            age_dir(&dir, 7200);
+        }
+        dir
+    }
+
+    #[test]
+    fn retired_chunk_dirs_are_swept_once_idle_and_unlocked() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        fs::create_dir(&parent).unwrap();
+        let source = temp.0.join("source.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
+        let identity = cache.identity().unwrap();
+        // v0.0.16 writes a `budget` ledger and `.pack` chunks, no manifest.
+        let ledger = 64_u64.to_le_bytes();
+        let written: [(&str, &[u8]); 2] = [(RETIRED_CHUNK_LOCK, &ledger), ("x.pack", &[0; 64])];
+        let released = chunk_fixture(&parent, &"a".repeat(64), &written, true);
+        // Named for the source being loaded, with a manifest that still
+        // verifies: the format is retired, so a live source keeps nothing.
+        let manifested = [written[0], written[1], (".manifest", cache.manifest())];
+        let same_source = chunk_fixture(&parent, identity, &manifested, true);
+        assert_eq!(identity_from_manifest(&same_source).unwrap(), identity);
+        // origin/main writes the manifest at load and `budget` only with its
+        // first chunk, so a dir it never wrote to has no ledger to lock.
+        let stub_files: [(&str, &[u8]); 1] = [(".manifest", b"path=/gone\nfile=x.gguf\n")];
+        let stub = chunk_fixture(&parent, &"e".repeat(64), &stub_files, true);
+        let fresh = chunk_fixture(&parent, &"b".repeat(64), &written, false);
+        let locked = chunk_fixture(&parent, &"c".repeat(64), &written, true);
+        let foreign = chunk_fixture(&parent, "backup", &written, true);
+        for dir in [&released, &same_source, &stub, &locked, &foreign] {
+            assert!(packed_dir_idle(dir), "{} must read as idle", dir.display());
+        }
+        assert!(!packed_dir_idle(&fresh));
+        // An old build reading the dir holds its ledger shared.
+        let holder = shared_lock_holder(&temp.0, &locked.join(RETIRED_CHUNK_LOCK));
+        let _ = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
+        assert!(
+            !released.exists(),
+            "an idle manifest-less dir v0.0.16 wrote is removed"
+        );
+        assert!(
+            !same_source.exists(),
+            "an idle dir of the current source is removed"
+        );
+        assert!(
+            !stub.exists(),
+            "an idle manifest-only dir with no ledger is removed"
+        );
+        assert!(fresh.exists(), "a dir used within the hour stays");
+        assert!(locked.exists(), "a dir whose ledger is held stays");
+        assert!(
+            foreign.exists(),
+            "a name that is not a 64-hex identity is foreign"
+        );
+        drop(holder);
+        let _ = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        assert!(!locked.exists(), "the released ledger no longer keeps it");
+        assert!(fresh.exists());
+        assert!(foreign.exists());
     }
 }

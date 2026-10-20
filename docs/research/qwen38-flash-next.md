@@ -622,7 +622,10 @@ too (`MLX_QWEN4_RESIDENCY`, `MLX_QWEN4_WEIGHT_CACHE_GIB`,
 `MLX_QWEN4_MAPPED_PACK`): the load maps the expert pack when live memory holds
 it and falls back to the slot path otherwise. The per-expert chunk cache and
 its `MLX_QWEN4_PACKED_CACHE_DIR` / `MLX_QWEN4_PACKED_CACHE_MAX_GB` controls were
-removed; the mapped pack is the only prepared format.
+removed; the mapped pack is the only prepared format. Leftover chunk
+directories named `.mlx-qwen4-packed-v2-<64 lowercase hex>` are removed
+automatically once idle for one hour and unlocked; any other name under that
+prefix is kept.
 
 The opt-in exact fusions measured on 2026-10-20 (teacher-forced logits on the
 6k and 16k prompts in one process, mapped residency, 256 positions) were
