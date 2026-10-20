@@ -6,6 +6,10 @@ These are deterministic synthetic checkpoints, not samples of the released
 and includes MTP and three-axis rotary reference outputs.
 
 The oracles were generated from `mlx-vlm/mlx_vlm/models/qwen4_exp/` with seed 104.
+`bf16/paged/mtp-oracle.json` replays that drafter with the MTP hidden norm taken
+per hyper-connection stream (`group_size=hidden_size`, as the target's `hc_norm`
+and llama.cpp's MTP graph); the released mlx-vlm drafter normalizes the joined
+streams, which costs about 2 % of the accepted drafts on the real checkpoint.
 The GGUF fixtures represent the same tensors with the GGUF layout transforms
 (norm offsets, tiled GDN heads, split indexer and combined PLE table). They are
 unquantized to isolate layout correctness. Separate native tests construct packed

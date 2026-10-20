@@ -3765,6 +3765,81 @@ fn prefill_bootstrap_uses_dimensions_and_live_headroom() {
     assert!(memory::prefill_window(&config, &plan) < large);
 }
 
+/// The MTP hidden norm is one RMS per hyper-connection stream: stretching a
+/// single stream of every target hidden row leaves the head's residual and
+/// logits where they were, where a norm over the joined streams moves them.
+#[test]
+fn mtp_hidden_norm_is_per_stream() {
+    let path = fixture().join("bf16/paged");
+    let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+    let c = config::Config::parse(&raw).unwrap();
+    assert!(c.hc_count >= 2, "the fixture must carry several streams");
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("mtp-oracle.json")).unwrap()).unwrap();
+    let shape = [1, 1, (c.hc_count * c.hidden_size) as i64];
+    let mut reference = decoder::Decoder::new(
+        c.clone(),
+        weights::Store::open_fixture(&path, None).unwrap(),
+    )
+    .unwrap();
+    let mut stretched = decoder::Decoder::new(
+        c.clone(),
+        weights::Store::open_fixture(&path, None).unwrap(),
+    )
+    .unwrap();
+    let (mut reference_cache, mut stretched_cache) = (
+        decoder::LayerCache::default(),
+        decoder::LayerCache::default(),
+    );
+    let mut worst = 0f32;
+    for row in oracle["rows"].as_array().unwrap() {
+        let values: Vec<f32> = row["input_hidden"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let token = row["token"].as_u64().unwrap() as u32;
+        let position = row["position"].as_u64().unwrap() as usize;
+        // Sixteen times stream 0: exact in bf16, so only the norm's grouping
+        // can tell the two rows apart.
+        let mut scaled = values.clone();
+        for v in &mut scaled[..c.hidden_size] {
+            *v *= 16.0;
+        }
+        let hidden = MxArray::from_float32(&values, &shape)
+            .unwrap()
+            .astype(crate::array::DType::BFloat16)
+            .unwrap();
+        let scaled = MxArray::from_float32(&scaled, &shape)
+            .unwrap()
+            .astype(crate::array::DType::BFloat16)
+            .unwrap();
+        let (h, logits, next) = reference
+            .draft_step(&[hidden], &[token], position, &mut reference_cache)
+            .unwrap();
+        reference_cache = next;
+        let (h2, logits2, next) = stretched
+            .draft_step(&[scaled], &[token], position, &mut stretched_cache)
+            .unwrap();
+        stretched_cache = next;
+        for (a, b) in [(h, h2), (logits, logits2)] {
+            let diff = a
+                .to_float32()
+                .unwrap()
+                .iter()
+                .zip(b.to_float32().unwrap().iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            worst = worst.max(diff);
+        }
+    }
+    assert!(
+        worst < 0.02,
+        "a stretched stream moved the draft head by {worst}"
+    );
+}
+
 #[test]
 fn mtp_cache_only_prefill_matches_full_head_history_and_keeps_target_state() {
     let path = fixture().join("bf16/paged");
@@ -8249,4 +8324,308 @@ fn real_model_verify_rows_match_ar_steps() {
         .unwrap()
         .remove(0)
         .unwrap();
+}
+
+/// Teacher-forced acceptance of the MTP head on fixed committed streams.
+/// `A_STREAMS` is a JSON `{case: {stream: [ids]}}`; every (case, arm,
+/// stream) gets its own paged owner: the prompt is prefilled with the target
+/// hiddens observed, then cycles of propose(`A_DEPTH`) / verify
+/// `[anchor, drafts]` / commit the prefix that matches the stream run with the
+/// next anchor forced from the stream, as the scheduled lane commits them.
+/// Prints per-position acceptance and writes `A_OUT`. `A_ARMS` names
+/// environment arms as `real_model_teacher_forced_env_arms` does. Needs
+/// `QWEN4_EXP_REAL_MODEL`, `QWEN4_EXP_REAL_INPUTS`, `QWEN4_EXP_REAL_AUX` and
+/// `--test-threads=1`.
+#[test]
+#[ignore]
+fn real_model_draft_acceptance_on_forced_streams() {
+    use crate::engine::hybrid_scheduler::{
+        HybridSchedulerBackend, ScheduledVerifyCommit, ScheduledVerifyRow,
+    };
+    use rand::SeedableRng;
+    use std::time::Instant;
+    let (Ok(model), Ok(inputs), Ok(aux), Ok(streams)) = (
+        std::env::var("QWEN4_EXP_REAL_MODEL"),
+        std::env::var("QWEN4_EXP_REAL_INPUTS"),
+        std::env::var("QWEN4_EXP_REAL_AUX"),
+        std::env::var("A_STREAMS"),
+    ) else {
+        eprintln!(
+            "real_model_draft_acceptance_on_forced_streams: QWEN4_EXP_REAL_MODEL / QWEN4_EXP_REAL_INPUTS / QWEN4_EXP_REAL_AUX / A_STREAMS not set"
+        );
+        return;
+    };
+    let depth: usize = std::env::var("A_DEPTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    assert!((1..=3).contains(&depth), "A_DEPTH must be 1..=3");
+    let cases: Vec<String> = std::env::var("A_CASES")
+        .unwrap_or_else(|_| "6k,16k".into())
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let mut arms: Vec<(String, Vec<(String, String)>)> = std::env::var("A_ARMS")
+        .unwrap_or_default()
+        .split(';')
+        .filter(|s| !s.trim().is_empty())
+        .map(|arm| {
+            let env: Vec<(String, String)> = arm
+                .split('+')
+                .map(|kv| {
+                    let (k, v) = kv.split_once('=').expect("A_ARMS entries are NAME=VAL");
+                    (k.trim().to_owned(), v.trim().to_owned())
+                })
+                .collect();
+            (arm.trim().to_owned(), env)
+        })
+        .collect();
+    if arms.is_empty() {
+        arms.push(("base".into(), Vec::new()));
+    }
+    let inputs: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(inputs).unwrap()).unwrap();
+    let streams: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(streams).unwrap()).unwrap();
+    let ids = |v: &serde_json::Value| -> Vec<u32> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_u64().unwrap() as u32)
+            .collect()
+    };
+    let prompt_for = |name: &str| -> Vec<u32> {
+        ids(&inputs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == name)
+            .unwrap_or_else(|| panic!("case {name} in inputs"))["tokenIds"])
+    };
+
+    let mut store = weights::Store::open(Path::new(&model)).unwrap();
+    let mut config = gguf::config(&store).unwrap();
+    auxiliary::attach(&mut store, &mut config, Path::new(&aux)).unwrap();
+    assert!(
+        auxiliary::validate_mtp(&store, &config).unwrap(),
+        "the auxiliary checkpoint carries no MTP head"
+    );
+    let vision = media::Vision::metadata(&serde_json::Value::Null, &store, &config).unwrap();
+    let mut decoder = decoder::Decoder::new(config.clone(), store).unwrap();
+    let adapter = super::paged::create(&config).unwrap();
+    let pool_bytes = adapter.bytes_per_block().unwrap() * u64::from(adapter.block_capacity());
+    decoder.paged = Some(adapter);
+    decoder.register_cache_limit();
+    decoder.weights.prepare_mapped_pack().unwrap();
+    decoder.weights.select_mapped_residency(pool_bytes).unwrap();
+    decoder.weights.prepare_hot().unwrap();
+    decoder.weights.publish_live();
+    decoder.residency_changed();
+    assert!(
+        decoder.weights.plan.mapped,
+        "the live host refused the pack"
+    );
+    eprintln!(
+        "A residency: mapped={} slots={} depth={depth}",
+        decoder.weights.plan.mapped, decoder.weights.plan.partial_expert_slots
+    );
+    let mut inner = inner_over(decoder, vision, true);
+    let params = inner.resolve_params(&crate::engine::types::ChatConfig {
+        temperature: Some(0.0),
+        enable_mtp: Some(true),
+        mtp_depth: Some(depth as i32),
+        ..Default::default()
+    });
+    assert_eq!(params.mtp_depth, depth);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+    let argmax = |a: &MxArray| -> u32 {
+        let last = a.shape().unwrap().len() as i32 - 1;
+        a.argmax(last, Some(false))
+            .unwrap()
+            .item_at_uint32(0)
+            .unwrap()
+    };
+
+    let mut out = serde_json::Map::new();
+    out.insert("depth".into(), serde_json::json!(depth));
+    let mut runs = Vec::new();
+    let mut seq: u32 = 0;
+    for case in &cases {
+        let prompt = prompt_for(case);
+        let case_streams = streams[case]
+            .as_object()
+            .unwrap_or_else(|| panic!("A_STREAMS has no case {case}"));
+        for (arm, env) in &arms {
+            for (key, value) in env {
+                unsafe { std::env::set_var(key, value) };
+            }
+            for (stream, forced) in case_streams {
+                let forced = ids(forced);
+                seq += 1;
+                inner.activate_paged_seq(seq).unwrap();
+                if inner.decoder.weights.begin_turn().unwrap().is_some() {
+                    eprintln!(
+                        "A WARNING: a slot fallback was applied before {case} {arm} {stream}"
+                    );
+                }
+                let mapped = inner.decoder.weights.plan.mapped;
+                let slots = inner.decoder.weights.plan.partial_expert_slots;
+                assert!(inner.begin_mtp(seq, 0).unwrap());
+                let started = Instant::now();
+                let mut logits = None;
+                let mut start = 0;
+                while start < prompt.len() {
+                    let end = (start + inner.decoder.prefill_slice_size()).min(prompt.len());
+                    logits = Some(
+                        inner
+                            .decoder
+                            .prefill_chunk(&prompt[start..end], None, end == prompt.len())
+                            .unwrap(),
+                    );
+                    let hidden = inner.decoder.last_chunk_hidden.clone();
+                    inner
+                        .observe_mtp(seq, &prompt[start..end], &hidden)
+                        .unwrap();
+                    start = end;
+                }
+                let first = argmax(&logits.unwrap());
+                let prefill_ms = started.elapsed().as_secs_f64() * 1e3;
+                let mut cycles = Vec::new();
+                let mut hits = vec![0usize; depth];
+                let mut raw_hits = vec![0usize; depth];
+                let mut target_disagree = 0usize;
+                let mut t = 0usize;
+                let cycling = Instant::now();
+                while t + depth < forced.len() {
+                    let anchor = forced[t];
+                    let proposal = inner
+                        .propose_mtp(seq, anchor, depth, &params, &mut rng, false)
+                        .unwrap();
+                    let drafts: Vec<u32> = proposal.draft_ids.iter().map(|&d| d as u32).collect();
+                    assert_eq!(
+                        drafts.len(),
+                        depth,
+                        "{case} {arm} {stream}: cycle {} drafted {} tokens",
+                        cycles.len(),
+                        drafts.len()
+                    );
+                    let truth = &forced[t + 1..t + 1 + depth];
+                    let k = drafts.iter().zip(truth).take_while(|(d, x)| d == x).count();
+                    for (i, (d, x)) in drafts.iter().zip(truth).enumerate() {
+                        if d == x {
+                            raw_hits[i] += 1;
+                        }
+                    }
+                    for h in hits.iter_mut().take(k) {
+                        *h += 1;
+                    }
+                    let mut tokens = vec![anchor];
+                    tokens.extend(&drafts);
+                    let verified = inner
+                        .verify_mtp(&[ScheduledVerifyRow {
+                            seq_id: seq,
+                            first_position: (prompt.len() + t) as u32,
+                            tokens,
+                            speculative: true,
+                        }])
+                        .unwrap();
+                    let target = verified
+                        .argmax(-1, None)
+                        .unwrap()
+                        .astype(crate::array::DType::Int32)
+                        .unwrap();
+                    let target: Vec<u32> = (0..=depth)
+                        .map(|i| target.item_at_int32(i).unwrap() as u32)
+                        .collect();
+                    // Rows 0..=k are kept: their argmax is the target's own
+                    // continuation of the kept prefix (the bonus token last).
+                    let disagree = target[..=k]
+                        .iter()
+                        .zip(&forced[t + 1..])
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    target_disagree += disagree;
+                    inner
+                        .commit_mtp(&[ScheduledVerifyCommit {
+                            seq_id: seq,
+                            keep: k + 1,
+                        }])
+                        .unwrap()
+                        .remove(0)
+                        .unwrap();
+                    cycles.push(serde_json::json!({
+                        "t": t,
+                        "anchor": anchor,
+                        "drafts": drafts,
+                        "truth": truth,
+                        "k": k,
+                        "target": target,
+                        "target_disagree": disagree,
+                    }));
+                    t += k + 1;
+                }
+                let cycle_ms = cycling.elapsed().as_secs_f64() * 1e3 / cycles.len().max(1) as f64;
+                let n = cycles.len();
+                let accepted: usize = hits.iter().sum();
+                let by_pos: Vec<f64> = hits.iter().map(|&h| h as f64 / n as f64).collect();
+                let raw_by_pos: Vec<f64> = raw_hits.iter().map(|&h| h as f64 / n as f64).collect();
+                let cond: Vec<f64> = (1..depth)
+                    .map(|i| {
+                        if hits[i - 1] > 0 {
+                            hits[i] as f64 / hits[i - 1] as f64
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                let tokens_per_cycle = t as f64 / n as f64;
+                eprintln!(
+                    "A {case} {arm} {stream}: cycles={n} drafted={} accepted={accepted} byPos={by_pos:?} rawByPos={raw_by_pos:?} cond={cond:?} tok/cycle={tokens_per_cycle:.3} committed={t} target_disagree={target_disagree} first_argmax={first} forced0={} prefill_ms={prefill_ms:.0} cycle_ms={cycle_ms:.2} mapped={mapped} slots={slots}",
+                    n * depth,
+                    forced[0]
+                );
+                runs.push(serde_json::json!({
+                    "case": case,
+                    "arm": arm,
+                    "stream": stream,
+                    "cycles": n,
+                    "drafted": n * depth,
+                    "accepted": accepted,
+                    "by_pos": by_pos,
+                    "raw_by_pos": raw_by_pos,
+                    "cond": cond,
+                    "tokens_per_cycle": tokens_per_cycle,
+                    "committed": t,
+                    "target_disagree": target_disagree,
+                    "first_argmax": first,
+                    "forced0": forced[0],
+                    "prefill_ms": prefill_ms,
+                    "cycle_ms": cycle_ms,
+                    "mapped": mapped,
+                    "slots": slots,
+                    "detail": cycles,
+                }));
+                out.insert("runs".into(), serde_json::Value::Array(runs.clone()));
+                if let Ok(path) = std::env::var("A_OUT") {
+                    std::fs::write(&path, serde_json::to_vec_pretty(&out).unwrap()).unwrap();
+                }
+                inner.release_scheduled_recurrent_for(seq);
+                inner
+                    .decoder
+                    .paged
+                    .as_mut()
+                    .unwrap()
+                    .release_request_for(seq)
+                    .unwrap();
+            }
+            for (key, _) in env {
+                unsafe { std::env::remove_var(key) };
+            }
+        }
+    }
+    assert!(
+        inner.decoder.weights.plan.mapped,
+        "the store left the mapped pack during the probe"
+    );
 }

@@ -88,12 +88,15 @@ impl Decoder {
                 true,
             )?;
             let e = self.linear(&e, "fc_embedding.weight", "")?;
+            // One RMS per hyper-connection stream, as the target's hc_norm
+            // and llama.cpp's MTP graph: a joint RMS over the streams
+            // (mlx-vlm) loses ~2 % of the accepted drafts on the checkpoint.
             let h = self
                 .norm(
                     &hidden,
                     "pre_fc_norm_hidden.weight",
                     "",
-                    c.hidden_size * c.hc_count,
+                    c.hidden_size,
                     true,
                 )?
                 .reshape(&[1, n as i64, c.hc_count as i64, c.hidden_size as i64])?;
