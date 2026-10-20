@@ -597,18 +597,7 @@ impl Store {
         {
             return self.mtp_bank_bytes();
         }
-        let (mut total, mut peak) = (0u64, 0u64);
-        for (.., bytes) in &specs {
-            // Imported chunks and the concatenated bank coexist while the
-            // earlier banks are already held.
-            peak = peak.max(total.saturating_add(bytes.saturating_mul(2)));
-            total = total.saturating_add(*bytes);
-        }
-        let pinned = self.protected_bytes + self.bank_bytes + self.slot_bytes;
-        let room = self.cache_limit.saturating_sub(pinned);
-        if total > self.auxiliary_cache_allowance()?
-            || peak.saturating_add(MAX_READ_BYTES * 3) > room
-        {
+        if !self.mtp_banks_fit()? {
             self.mtp_banks_declined = true;
             return Ok(0);
         }
@@ -624,6 +613,26 @@ impl Store {
         }
         super::super::memory::maintain_freelist(self.plan.physical_bytes);
         self.mtp_bank_bytes()
+    }
+
+    pub(super) fn mtp_banks_fit(&self) -> Result<bool> {
+        let (mut total, mut peak) = (0u64, 0u64);
+        for (.., bytes) in &self.mtp_bank_specs()? {
+            // Imported chunks and the concatenated bank coexist while the
+            // earlier banks are already held.
+            peak = peak.max(total.saturating_add(bytes.saturating_mul(2)));
+            total = total.saturating_add(*bytes);
+        }
+        let pinned = self.protected_bytes + self.bank_bytes + self.slot_bytes;
+        let room = self.cache_limit.saturating_sub(pinned);
+        // The slot banks a cached capacity has yet to build stay pinned beside
+        // the draft banks, and the last one still needs its staging.
+        let planned = (self.protected_bytes + self.bank_bytes + self.planned_slot_bytes()?)
+            .saturating_add(total)
+            .saturating_add(MAX_READ_BYTES * 3);
+        Ok(total <= self.auxiliary_cache_allowance()?
+            && peak.saturating_add(MAX_READ_BYTES * 3) <= room
+            && planned <= self.cache_limit)
     }
 
     fn build_mtp_expert_banks(

@@ -519,17 +519,7 @@ impl Store {
             return Ok(n);
         }
         let mut layer_bytes = HashMap::<&str, u64>::new();
-        let routed = self
-            .tensors
-            .iter()
-            .filter(|(name, _)| {
-                name.contains("_exps.weight")
-                    && !super::residency::is_auxiliary(name)
-                    && !self.banks.contains_key(*name)
-            })
-            .try_fold(0u64, |n, (_, t)| {
-                t.runtime_bytes().map(|b| n.saturating_add(b))
-            })?;
+        let routed = self.slot_routed_bytes()?;
         for (name, tensor) in &self.tensors {
             if name.contains("_exps.weight")
                 && !super::residency::is_auxiliary(name)
@@ -551,11 +541,18 @@ impl Store {
         // bounded staging and sparse-row room inside the admitted weight cap.
         // Fully resident expert banks are included in `fixed`, and only the
         // remaining layers share slots. Never reserve a second copy of them.
-        // Draft banks a mapped turn installed stay pinned past the switch to
-        // slots and are not in `fixed`: the reserve holds them and the staging.
-        let reserve = self
-            .auxiliary_cache_allowance()?
-            .max(self.mtp_bank_bytes()?.saturating_add(MAX_READ_BYTES * 6));
+        // Draft banks stay pinned beside every slot bank and are not in
+        // `fixed`: the reserve holds the installed ones, or the ones the first
+        // MTP turn will admit after this count is cached, and the staging.
+        let allowance = self.auxiliary_cache_allowance()?;
+        let estimate = self.mtp_bank_estimate()?;
+        let admissible = if !self.mtp_banks_declined && estimate <= allowance {
+            estimate
+        } else {
+            0
+        };
+        let draft = self.mtp_bank_bytes()?.max(admissible);
+        let reserve = allowance.max(draft.saturating_add(MAX_READ_BYTES * 6));
         let bytes = self
             .cache_limit
             .saturating_sub(fixed)
@@ -579,6 +576,36 @@ impl Store {
         let capacity = if capacity < top { 0 } else { capacity };
         self.slot_capacity = Some(capacity);
         Ok(capacity)
+    }
+
+    /// Routed main-network expert bytes the slots serve.
+    fn slot_routed_bytes(&self) -> Result<u64> {
+        self.tensors
+            .iter()
+            .filter(|(name, _)| {
+                name.contains("_exps.weight")
+                    && !super::residency::is_auxiliary(name)
+                    && !self.banks.contains_key(*name)
+            })
+            .try_fold(0u64, |n, (_, t)| {
+                t.runtime_bytes().map(|b| n.saturating_add(b))
+            })
+    }
+
+    /// Every layer's slot bank at the cached capacity, built or not.
+    pub(super) fn planned_slot_bytes(&self) -> Result<u64> {
+        let experts = self
+            .metadata
+            .get("qwen4exp.expert_count")
+            .and_then(GgufMetaValue::as_u64)
+            .unwrap_or(0);
+        let planned = match self.slot_capacity {
+            Some(capacity) if !self.plan.mapped && experts > 0 => {
+                (self.slot_routed_bytes()? as u128 * capacity as u128 / experts as u128) as u64
+            }
+            _ => 0,
+        };
+        Ok(planned.max(self.slot_bytes))
     }
 
     pub(in super::super) fn expert_slots(
@@ -1263,14 +1290,24 @@ mod tests {
         assert_eq!(store.bytes_read, 0);
         assert_eq!(store.slot_bytes, 0);
     }
-    /// A mapped MTP turn installs the Q8 draft banks; a trip then sizes the
-    /// slots from the fallback budget while they stay pinned. Every layer's
-    /// slot bank is built with only LRU rows evictable, so the last one needs
-    /// the banks, all slots and its staging inside the budget.
-    #[test]
-    fn fallback_slots_fit_beside_installed_draft_banks() {
+    const DRAFT_HEADS: [(&str, i64, i64); 2] = [
+        ("mtp.layers.0.mlp.experts.gate_up_proj", 512 * 1280, 2560),
+        ("mtp.layers.0.mlp.experts.down_proj", 512 * 2560, 640),
+    ];
+    const FIXED_BANK_BYTES: u64 = 5_245_160_960;
+    const TEXT_ONLY_SLOTS_6_TO_70_GIB: [usize; 65] = [
+        0, 11, 18, 25, 32, 39, 45, 52, 59, 66, 73, 80, 86, 93, 100, 107, 114, 120, 127, 134, 141,
+        148, 154, 161, 168, 175, 182, 189, 195, 202, 209, 216, 223, 229, 236, 243, 250, 257, 264,
+        270, 277, 284, 291, 298, 304, 311, 318, 325, 332, 339, 345, 352, 359, 366, 373, 379, 386,
+        393, 400, 407, 413, 420, 427, 434, 441,
+    ];
+
+    /// The released UD-Q4_K_XL checkpoint's routed experts (or one GGUF type
+    /// for all of them), its fixed bank bytes and the MTP head, on the slot
+    /// path, with each layer's routed bytes.
+    fn draft_bank_store(uniform: Option<GgufTensorType>) -> Option<(Store, Vec<u64>)> {
         if !crate::engine::persistence::compiled_forward_backend_available() {
-            return;
+            return None;
         }
         let mut store = Store::open_metadata(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp"),
@@ -1279,14 +1316,18 @@ mod tests {
         .unwrap();
         store.tensors.clear();
         store.gguf = true;
-        // The released UD-Q4_K_XL checkpoint's routed experts.
-        let mut routed = 0u64;
+        store
+            .metadata
+            .insert("qwen4exp.expert_count".into(), GgufMetaValue::Uint32(512));
+        let mut layers = Vec::new();
         for layer in 0..48 {
-            let (gate_up, down) = match layer {
-                2 => (GgufTensorType::Q5K, GgufTensorType::Q8_0),
-                4 | 30 | 46 | 47 => (GgufTensorType::Q4K, GgufTensorType::Q8_0),
-                _ => (GgufTensorType::Q4K, GgufTensorType::Q5_1),
+            let (gate_up, down) = match (uniform, layer) {
+                (Some(t), _) => (t, t),
+                (None, 2) => (GgufTensorType::Q5K, GgufTensorType::Q8_0),
+                (None, 4 | 30 | 46 | 47) => (GgufTensorType::Q4K, GgufTensorType::Q8_0),
+                (None, _) => (GgufTensorType::Q4K, GgufTensorType::Q5_1),
             };
+            let mut bytes = 0;
             for part in ["gate", "up", "down"] {
                 let t = Tensor {
                     path: PathBuf::new(),
@@ -1299,22 +1340,17 @@ mod tests {
                     bytes: 0,
                     encoding: Encoding::Gguf(if part == "down" { down } else { gate_up }),
                 };
-                routed += t.runtime_bytes().unwrap();
+                bytes += t.runtime_bytes().unwrap();
                 store
                     .tensors
                     .insert(format!("blk.{layer}.ffn_{part}_exps.weight"), t);
             }
+            layers.push(bytes);
         }
-        assert_eq!(routed, 78_538_342_400);
-        let fixed = 5_245_160_960;
-        store.plan.hot_bytes = routed + fixed;
+        store.plan.hot_bytes = layers.iter().sum::<u64>() + FIXED_BANK_BYTES;
         store.plan.mapped = false;
         store.draft_bank_budget = 0;
-        let heads: [(&str, i64, i64); 2] = [
-            ("mtp.layers.0.mlp.experts.gate_up_proj", 512 * 1280, 2560),
-            ("mtp.layers.0.mlp.experts.down_proj", 512 * 2560, 640),
-        ];
-        for (name, rows, width) in heads {
+        for (name, rows, width) in DRAFT_HEADS {
             store.tensors.insert(
                 name.into(),
                 Tensor {
@@ -1326,22 +1362,12 @@ mod tests {
                 },
             );
         }
-        let draft = store.mtp_bank_estimate().unwrap();
-        assert_eq!(draft, 2_831_155_200);
-        let slots = |store: &mut Store, gib: u64| {
-            store.cache_limit = gib << 30;
-            store.slot_capacity = None;
-            store.expert_slot_capacity(512, 10).unwrap()
-        };
-        let budgets = [10u64, 16, 20, 26, 30, 36];
-        let text = budgets.map(|gib| slots(&mut store, gib));
-        assert_eq!(
-            [text[1], text[3]],
-            [63, 125],
-            "no installed draft bank: the slot count is unchanged"
-        );
-        // Installed as the bank admission leaves them, never evaluated.
-        for (name, rows, width) in heads {
+        Some((store, layers))
+    }
+
+    /// The draft banks as the admission installs them, never evaluated.
+    fn install_draft_banks(store: &mut Store) -> u64 {
+        for (name, rows, width) in DRAFT_HEADS {
             let lazy = |columns: i64, dtype| MxArray::zeros(&[rows, columns], Some(dtype)).unwrap();
             store.banks.insert(
                 name.into(),
@@ -1356,9 +1382,53 @@ mod tests {
                 }),
             );
         }
-        assert_eq!(store.mtp_bank_bytes().unwrap(), draft);
-        store.bank_bytes = fixed + draft;
-        store.cache_bytes = store.bank_bytes;
+        let draft = store.mtp_bank_bytes().unwrap();
+        store.bank_bytes += draft;
+        store.cache_bytes += draft;
+        draft
+    }
+
+    /// One pass's slot-bank builds at `capacity`: the eviction `expert_slots`
+    /// runs before each layer's bank, with no LRU row to give way.
+    fn build_slot_banks(store: &mut Store, layers: &[u64], capacity: usize) -> Result<()> {
+        for &layer in layers {
+            let bytes = layer * capacity as u64 / 512;
+            store.evict_to(store.cache_limit.saturating_sub(bytes + MAX_READ_BYTES * 3))?;
+            store.slot_bytes += bytes;
+            store.cache_bytes += bytes;
+        }
+        Ok(())
+    }
+
+    /// A mapped MTP turn installs the Q8 draft banks; a trip then sizes the
+    /// slots from the fallback budget while they stay pinned. Every layer's
+    /// slot bank is built with only LRU rows evictable, so the last one needs
+    /// the banks, all slots and its staging inside the budget.
+    #[test]
+    fn fallback_slots_fit_beside_installed_draft_banks() {
+        let Some((mut store, layers)) = draft_bank_store(None) else {
+            return;
+        };
+        let routed: u64 = layers.iter().sum();
+        assert_eq!(routed, 78_538_342_400);
+        let fixed = FIXED_BANK_BYTES;
+        let draft = store.mtp_bank_estimate().unwrap();
+        assert_eq!(draft, 2_831_155_200);
+        let slots = |store: &mut Store, gib: u64| {
+            store.cache_limit = gib << 30;
+            store.slot_capacity = None;
+            store.expert_slot_capacity(512, 10).unwrap()
+        };
+        let budgets = [10u64, 16, 20, 26, 30, 36];
+        let text = budgets.map(|gib| slots(&mut store, gib));
+        assert_eq!(
+            [text[1], text[3]],
+            [63, 125],
+            "no installed draft bank: the slot count is unchanged"
+        );
+        store.bank_bytes = fixed;
+        store.cache_bytes = fixed;
+        assert_eq!(install_draft_banks(&mut store), draft);
         let banked = budgets.map(|gib| slots(&mut store, gib));
         let table =
             format!("slots at {budgets:?} GiB: {banked:?} with the banks, {text:?} without");
@@ -1374,6 +1444,147 @@ mod tests {
         }
         assert_eq!(store.bytes_read, 0);
         assert_eq!(store.slot_bytes, 0);
+    }
+
+    /// `prepare_hot` caches the slot count before the first MTP turn admits
+    /// the draft banks, and that turn's pass builds every layer's slot bank
+    /// beside them. Every 1/16 GiB from 6 to 70 GiB, on an all-Q5_1 geometry
+    /// and the released one: no layer runs out of staging, and the banks are
+    /// still admitted at every whole budget from 22 GiB.
+    #[test]
+    fn draft_banks_admitted_after_the_cached_slot_count_leave_every_layer_staging() {
+        for (uniform, at_22) in [(Some(GgufTensorType::Q5_1), 85), (None, 98)] {
+            let Some((mut store, layers)) = draft_bank_store(uniform) else {
+                return;
+            };
+            let mut admitted = Vec::new();
+            for sixteenths in 6 * 16..=70 * 16u64 {
+                let limit = sixteenths << 26;
+                store.banks.retain(|name, _| !name.starts_with("mtp."));
+                store.bank_bytes = FIXED_BANK_BYTES;
+                store.cache_bytes = FIXED_BANK_BYTES;
+                store.slot_bytes = 0;
+                store.slot_capacity = None;
+                store.mtp_banks_declined = false;
+                store.cache_limit = limit;
+                let capacity = store.expert_slot_capacity(512, 10).unwrap();
+                let fits = store.mtp_banks_fit().unwrap();
+                if fits {
+                    install_draft_banks(&mut store);
+                }
+                let gib = limit as f64 / (1u64 << 30) as f64;
+                if capacity > 0 {
+                    build_slot_banks(&mut store, &layers, capacity).unwrap_or_else(|e| {
+                        panic!("{uniform:?} at {gib} GiB, {capacity} slots, banks {fits}: {e}")
+                    });
+                }
+                assert!(
+                    store.cache_bytes + MAX_READ_BYTES * 3 <= limit,
+                    "{uniform:?} at {gib} GiB"
+                );
+                if limit == 22 << 30 {
+                    assert_eq!(
+                        (capacity, fits),
+                        (at_22, true),
+                        "{uniform:?} at 22 GiB: (slots, draft banks admitted)"
+                    );
+                }
+                if fits && limit % (1 << 30) == 0 {
+                    admitted.push(limit >> 30);
+                }
+            }
+            assert_eq!(admitted, (22..=70).collect::<Vec<_>>(), "{uniform:?}");
+            assert_eq!(store.bytes_read, 0);
+        }
+    }
+
+    /// The draft reserve costs slots only at budgets whose admission will take
+    /// the banks; a decline gives them back, and a text-only load sizes
+    /// exactly as before.
+    #[test]
+    fn slot_count_reserves_only_draft_banks_the_admission_takes() {
+        let Some((mut store, _)) = draft_bank_store(None) else {
+            return;
+        };
+        let slots = |store: &mut Store, gib: u64| {
+            store.cache_limit = gib << 30;
+            store.slot_capacity = None;
+            store.expert_slot_capacity(512, 10).unwrap()
+        };
+        let mut text_only = draft_bank_store(None).unwrap().0;
+        text_only
+            .tensors
+            .retain(|name, _| !name.starts_with("mtp."));
+        assert_eq!(text_only.mtp_bank_estimate().unwrap(), 0);
+        let text: Vec<usize> = (6..=70).map(|gib| slots(&mut text_only, gib)).collect();
+        assert_eq!(text, TEXT_ONLY_SLOTS_6_TO_70_GIB, "no MTP head");
+        let budgets = [21u64, 22, 23, 24, 26, 30];
+        assert_eq!(
+            budgets.map(|gib| slots(&mut store, gib)),
+            [94, 98, 105, 112, 125, 149],
+            "MTP head attached"
+        );
+        store.mtp_banks_declined = true;
+        assert_eq!(
+            budgets.map(|gib| slots(&mut store, gib)),
+            [94, 100, 106, 112, 125, 149],
+            "draft banks declined"
+        );
+    }
+
+    /// A slot count cached with no room for the draft banks beside it: the
+    /// admission declines them before reading a byte, the decline sticks, and
+    /// every layer still builds. Half the layers already built: the same.
+    #[test]
+    fn draft_bank_admission_declines_beside_a_cached_count_without_staging() {
+        let Some((mut store, layers)) = draft_bank_store(Some(GgufTensorType::Q5_1)) else {
+            return;
+        };
+        let routed: u64 = layers.iter().sum();
+        let draft = store.mtp_bank_estimate().unwrap();
+        store.cache_limit = 22 << 30;
+        assert!(draft <= store.auxiliary_cache_allowance().unwrap());
+        // The count sized without the draft reserve.
+        let capacity = 87;
+        assert!(
+            FIXED_BANK_BYTES + routed * capacity as u64 / 512 + draft + MAX_READ_BYTES * 3
+                > store.cache_limit
+        );
+        for built in [0, 24] {
+            store.bank_bytes = FIXED_BANK_BYTES;
+            store.cache_bytes = FIXED_BANK_BYTES;
+            store.slot_bytes = 0;
+            store.slot_capacity = Some(capacity);
+            store.mtp_banks_declined = false;
+            build_slot_banks(&mut store, &layers[..built], capacity).unwrap();
+            assert!(
+                !store.mtp_banks_fit().unwrap(),
+                "{built} layers built: the draft banks fit beside {capacity} slots"
+            );
+            let admitted = store
+                .prepare_mtp_expert_banks_with(&mut |_: u64| -> Result<()> {
+                    panic!("the draft banks were admitted")
+                })
+                .unwrap();
+            assert_eq!(admitted, 0);
+            assert!(store.mtp_banks_declined);
+            assert_eq!(store.mtp_bank_bytes().unwrap(), 0);
+            assert_eq!(
+                store
+                    .prepare_mtp_expert_banks_with(&mut |_| Ok(()))
+                    .unwrap(),
+                0,
+                "a declined build must not retry"
+            );
+            build_slot_banks(&mut store, &layers[built..], capacity).unwrap();
+        }
+        store.bank_bytes = FIXED_BANK_BYTES;
+        store.cache_bytes = FIXED_BANK_BYTES;
+        store.slot_bytes = 0;
+        store.slot_capacity = Some(85);
+        store.mtp_banks_declined = false;
+        assert!(store.mtp_banks_fit().unwrap(), "85 slots leave the staging");
+        assert_eq!(store.bytes_read, 0);
     }
     /// The same fallback on the released checkpoint: a mapped load with the
     /// MTP head attached installs the draft banks (`begin_mtp`'s call), a trip
@@ -1485,6 +1696,98 @@ mod tests {
             decoder.weights.slot_bytes as f64 / (1u64 << 30) as f64,
             decoder.weights.cache_bytes as f64 / (1u64 << 30) as f64
         );
+    }
+    /// The released checkpoint loaded on the slot path at a forced budget:
+    /// `prepare_hot` caches the slot count, the first MTP turn's call admits
+    /// the draft banks, and a turn builds every layer's slot bank beside
+    /// them. 22 GiB is a budget the product picks; at 22.25 GiB a count
+    /// cached without the draft reserve overruns the last layer's staging.
+    /// Opt-in, the same variables as `real_fallback_slots_beside_draft_banks`:
+    /// `cargo test -p mlx-core --lib real_slot_load_admits_draft_banks_beside_the_cached_count
+    /// -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_slot_load_admits_draft_banks_beside_the_cached_count() {
+        use super::super::super::{auxiliary, decoder::Decoder, gguf};
+        let (Ok(model), Ok(aux), Ok(inputs)) = (
+            std::env::var("QWEN4_EXP_REAL_MODEL"),
+            std::env::var("QWEN4_EXP_REAL_AUX"),
+            std::env::var("QWEN4_EXP_REAL_INPUTS"),
+        ) else {
+            eprintln!(
+                "real_slot_load_admits_draft_banks_beside_the_cached_count: QWEN4_EXP_REAL_MODEL / QWEN4_EXP_REAL_AUX / QWEN4_EXP_REAL_INPUTS not set"
+            );
+            return;
+        };
+        let cases: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(inputs).unwrap()).unwrap();
+        let prompt: Vec<u32> = cases
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "6k")
+            .expect("a 6k case")["tokenIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .take(8)
+            .map(|t| t.as_u64().unwrap() as u32)
+            .collect();
+        for limit in [22u64 << 30, (89u64 << 30) / 4] {
+            let gib = limit as f64 / (1u64 << 30) as f64;
+            let mut store = Store::open(Path::new(&model)).unwrap();
+            let mut config = gguf::config(&store).unwrap();
+            auxiliary::attach(&mut store, &mut config, Path::new(&aux)).unwrap();
+            let mut decoder = Decoder::new(config, store).unwrap();
+            decoder.weights.set_cache_limit(limit);
+            decoder.register_cache_limit();
+            decoder.weights.prepare_fixture_hot().unwrap();
+            decoder.weights.publish_live();
+            decoder.residency_changed();
+            assert!(!decoder.weights.plan.mapped);
+            assert_eq!(decoder.weights.cache_limit, limit);
+            let slots = decoder.weights.plan.partial_expert_slots;
+            assert_eq!(decoder.weights.slot_capacity, Some(slots));
+            let draft = decoder.weights.prepare_mtp_expert_banks().unwrap();
+            eprintln!(
+                "{gib} GiB: {slots} slots cached, draft banks {:.3} GiB, banks {:.3} GiB",
+                draft as f64 / (1u64 << 30) as f64,
+                decoder.weights.bank_bytes as f64 / (1u64 << 30) as f64
+            );
+            assert_eq!(draft, 2_831_155_200, "{gib} GiB admits the draft banks");
+            decoder.reset();
+            decoder.weights.begin_turn().unwrap();
+            let mut logits = decoder
+                .prefill_chunk(&prompt, None, true)
+                .unwrap_or_else(|e| {
+                    panic!("the slot turn failed at {slots} slots, {gib} GiB: {e}")
+                });
+            let mut text = Vec::new();
+            for _ in 0..16 {
+                let last = logits.shape().unwrap().len() as i32 - 1;
+                let id = logits
+                    .argmax(last, Some(false))
+                    .unwrap()
+                    .item_at_uint32(0)
+                    .unwrap();
+                text.push(id);
+                logits = decoder.step(id).unwrap();
+            }
+            assert_eq!(
+                decoder.weights.slots.len(),
+                48,
+                "every layer built its slots"
+            );
+            assert!(decoder.weights.cache_bytes <= decoder.weights.cache_limit);
+            eprintln!(
+                "{gib} GiB: {text:?}; slot bytes {:.3} GiB, cache {:.3} GiB, peak {:.3} GiB",
+                decoder.weights.slot_bytes as f64 / (1u64 << 30) as f64,
+                decoder.weights.cache_bytes as f64 / (1u64 << 30) as f64,
+                decoder.weights.peak_cache_bytes as f64 / (1u64 << 30) as f64
+            );
+            drop(decoder);
+            crate::array::memory::synchronize_and_clear_cache();
+        }
     }
     #[test]
     fn slot_replacement_completes_all_lazy_readers_and_retains_warm_codes() {
