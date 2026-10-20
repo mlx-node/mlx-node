@@ -5472,7 +5472,7 @@ export interface Qwen4ExpResidencyInfo {
   partialExpertSlots: number;
   /**
    * Routed expert tensors the slot path reads by range from the mapped
-   * pack; 0 means every expert read goes through the per-expert chunks.
+   * pack; 0 means every expert read is imported from the checkpoint.
    */
   mappedPackFiles: number;
   /**

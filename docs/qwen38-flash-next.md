@@ -142,64 +142,44 @@ weight LRU. Only selected cold experts are read. Every source read and its
 F32-equivalent size are capped at 64 MiB; bank preparation accounts for both
 imported chunks and their destination.
 
-The optional prepared SSD cache stores losslessly imported matrix chunks, so
-later RAM evictions or restarts do not repeat the import. It excludes sparse
-lookup rows, verifies checksums before importing arrays, and publishes files
-atomically. Each checkpoint/cache version is capped at 96 GiB and leaves at
-least 16 GiB disk space. It defaults to `~/Library/Caches/mlx-node/qwen4-packed`
-on macOS. Deleting that cache is safe while the model is stopped.
+The routed expert tensors of a GGUF checkpoint are kept as a mapped expert
+pack under `~/Library/Caches/mlx-node/qwen4-packed` on macOS:
+`.mlx-qwen4-mapped-v3-<identity>/`, one file per `(layer, tensor)` whose three
+quantized arrays are 16 KiB-aligned sections with the experts in id order
+(~74 GiB for Flash Next). The first load builds it from the checkpoint,
+hashing every section and reading each file back before its atomic rename;
+later loads check the header and file size. Each tensor is built under its own
+`.<tensor>.lock` file, which is never renamed or unlinked, so two loaders of
+one checkpoint never rebuild or truncate each other's published file; a tensor
+another process is building is left out of this load's pack. The build stops
+when the disk falls under a 16 GiB reserve. Mapped residency maps the sections
+directly; the slot path reads whole experts from them by range through the
+page cache. A tensor the pack lacks, and every other matrix (fixed
+projections, sparse lookup rows), is imported from the checkpoint. Deleting
+the pack is safe while the model is stopped.
 
-Each identity directory also carries a `.manifest` recording its canonical
-source directory and packed file list. Opening the cache sweeps sibling
-`.mlx-qwen4-packed-v2-*` and `.mlx-qwen4-mapped-v3-*` directories: one is
-orphaned only when its manifest cannot prove liveness (missing or unreadable
-source) or records a different identity than its directory name — and only
-once the newest `budget`/`.manifest`/`.pack`/`.mapped` mtime is also older
-than one hour. The hour is a grace gate for real orphan reasons, never an
-expiry on its own: a healthy manifested dir stays cached indefinitely until
-`MLX_QWEN4_PACKED_CACHE_MAX_GB` evicts it. Removal requires a non-blocking
-lock on that directory's `budget` ledger — a live writer holds it — or, for a
-mapped pack, on its `lock` file, which every process serving or building the
+Each pack directory carries a `.manifest` recording its canonical source
+directory and packed file list. Opening a checkpoint sweeps sibling
+`.mlx-qwen4-mapped-v3-*` directories: one is orphaned only when its manifest
+cannot prove liveness (missing or unreadable source) or records a different
+identity than its directory name — and only once the newest
+`.manifest`/`lock`/`.mapped` mtime is also older than one hour. The hour is a
+grace gate for real orphan reasons, never an expiry on its own: a healthy
+manifested pack stays cached indefinitely. Removal requires a non-blocking
+lock on the pack's `lock` file, which every process serving or building the
 pack holds shared; directories without a manifest are never removed, since
-nothing can prove them stale. Under the ledger lock, its `used` figure is
-reconciled against the `.pack` bytes actually on disk. The two directories of
-one identity are one checkpoint's cache: a load never sweeps or evicts its
-own chunk dir or mapped dir. The same maintenance sweeps stale entries of the native
-GGUF cache under a 24 h grace and per-entry locks; `.mlx-qwen4-assets-v2-*`
-tokenizer sidecars are exempt from orphan removal and their markers are
-re-stamped on use, so they are only collected by the
-`MLX_NATIVE_GGUF_CACHE_MAX_GB` least-recently-used cap.
+nothing can prove them stale, and a load never sweeps its own pack. The same
+maintenance sweeps stale entries of the native GGUF cache under a 24 h grace
+and per-entry locks; `.mlx-qwen4-assets-v2-*` tokenizer sidecars are exempt
+from orphan removal and their markers are re-stamped on use, so they are only
+collected by the `MLX_NATIVE_GGUF_CACHE_MAX_GB` least-recently-used cap.
 
 A breached SSD-read safety limit reclaims the allocator freelist and re-polls
 before erroring.
 
 | Setting                      | Behavior                                                                |
 | ---------------------------- | ----------------------------------------------------------------------- |
-| `MLX_QWEN4_PACKED_CACHE_DIR` | Override the prepared-cache location.                                   |
-| `MLX_QWEN4_PACKED_CACHE_MAX_GB` | Optional global cap across every packed-cache identity directory, in GiB; least-recently-used eviction. Unset or `<=0` keeps only the per-checkpoint 96 GiB budget. |
 | `MLX_NATIVE_GGUF_CACHE_MAX_GB` | Optional cap on the whole native GGUF cache (packed weights plus extracted tokenizer assets), in GiB; least-recently-used eviction under a 24 h grace, with atomic root-wide admission at publish (a conversion that cannot fit loads from its staging dir instead; a later reload reuses that staged result rather than re-converting, and the refused dir is a per-pid load output the sweep keeps while the process lives). Unset, `<=0` or unparseable means unlimited. |
-
-The routed expert tensors of a GGUF checkpoint are also kept as a mapped expert
-pack beside the chunk cache: `.mlx-qwen4-mapped-v3-<identity>/`, one file per
-`(layer, tensor)` whose three quantized arrays are 16 KiB-aligned sections with
-the experts in id order (~74 GiB for Flash Next). The first load builds it from
-the verified chunks (else from the checkpoint), hashing every section and
-reading each file back before its atomic rename; later loads check the header
-and file size. Each tensor is built under its own `.<tensor>.lock` file, which
-is never renamed or unlinked, so two loaders of one checkpoint never rebuild
-or truncate each other's published file; a tensor another process is building
-is left out of this load's pack. Mapped residency maps its sections
-directly; the slot path reads whole experts from it by range through the page
-cache instead of opening, locking, stamping and hashing one chunk file per
-expert; a tensor the pack lacks (the build stops when the
-disk falls under the 16 GiB reserve, or when `MLX_QWEN4_PACKED_CACHE_MAX_GB`
-leaves no room after evicting idle siblings) keeps the chunk reader. The
-mapped dir's `.mapped` and staging bytes count toward that cap like `.pack`
-bytes — a file is admitted and its staging file sized to its final length
-under one root-wide lock, so concurrent builders never admit against the same
-room — and an orphaned or least-recently-used mapped dir is removed by the
-same sweep — except one whose `lock` file a process holds shared, which every
-open or building pack does.
 
 `residencyInfo()` reports the admitted bytes, hot inventory, resident banks,
 expert-slot capacity (the expert count in mapped mode), the number of tensors

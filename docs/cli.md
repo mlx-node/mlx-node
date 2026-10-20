@@ -926,7 +926,7 @@ Leading positionals pass through to the agent binary and run without spawning th
 ### Native caches
 
 GGUF-backed loads (Qwen3.8, Gemma 4, Muse-Glimmer and the other GGUF families)
-and the Qwen3.8 prepared SSD weight cache write into per-user native caches.
+and the Qwen3.8 mapped expert pack write into per-user native caches.
 Both self-maintain on the next load: stale or orphaned entries are removed
 under per-key locks, and live writers are never disturbed — deleting a cache
 directory yourself is only needed to reclaim space immediately.
@@ -935,8 +935,6 @@ directory yourself is only needed to reclaim space immediately.
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `MLX_NATIVE_GGUF_CACHE_DIR`        | Override the native GGUF cache location (packed weights, extracted tokenizer assets, companions)                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `MLX_NATIVE_GGUF_CACHE_MAX_GB`     | Cap its total size, in GiB (fractional allowed). `<=0`, unset or unparseable = unlimited. Least-recently-used entries evict under a 24 h grace; a conversion that still cannot fit is not published — the load reads it from its staging directory instead, and a later reload reuses that staged result instead of re-converting. A refused load keeps a per-pid fallback dir that never counts toward the cap and outlives every sweep while the process lives (tokenizer sidecars keep a `.mlx-qwen4-assets-live-{identity}-{pid}` twin of it) |
-| `MLX_QWEN4_PACKED_CACHE_DIR`       | Override the Qwen3.8 prepared SSD cache location (default `~/Library/Caches/mlx-node/qwen4-packed`)                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `MLX_QWEN4_PACKED_CACHE_MAX_GB`    | Cap its total size across all checkpoints (chunk dirs and mapped packs), in GiB (fractional allowed). `<=0` or unset = only the per-checkpoint 96 GiB budget                                                                                                                                                                                                                                                                                                                                                                                      |
 
 ## Dashboard
 

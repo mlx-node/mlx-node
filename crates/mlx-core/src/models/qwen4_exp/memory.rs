@@ -18,7 +18,7 @@ pub(super) struct Plan {
     /// `residencyInfo` reports what is actually pinned.
     pub resident_bank_bytes: Arc<AtomicU64>,
     pub partial_expert_slots: usize,
-    /// Routed expert tensors served from the mapped pack (0 = chunk reader).
+    /// Routed expert tensors served from the mapped pack (0 = checkpoint reads).
     pub mapped_pack_files: usize,
     /// Every routed expert is addressed in place through the mapped pack:
     /// no slot banks, no mid-turn staging, no wired-limit context.

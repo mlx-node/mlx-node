@@ -1,8 +1,8 @@
 //! Mapped expert pack v3: one file per routed `(layer, tensor)` holding the
 //! three quantized arrays as page-aligned sections with experts in id order,
 //! so a section can back a bank directly (slot id == expert id) or be read by
-//! expert range. Built once beside the per-expert chunk cache from its
-//! verified chunks, else from the checkpoint through the ordinary importer.
+//! expert range. Built once from the checkpoint through the ordinary
+//! importer.
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -178,16 +178,6 @@ pub(super) struct ExpertRecord {
 }
 
 impl ExpertRecord {
-    pub(super) fn from_chunk(chunk: VerifiedChunk) -> Self {
-        Self {
-            group: chunk.header.group,
-            bits: chunk.header.bits,
-            mode: chunk.header.mode,
-            arrays: chunk.header.arrays,
-            data: chunk.data,
-        }
-    }
-
     pub(super) fn from_weight(weight: &super::weights::Weight) -> Result<Self> {
         let (arrays, data) = packed_cache::encode_weight(weight)?;
         Ok(Self {
@@ -223,14 +213,13 @@ impl ExpertRecord {
     }
 }
 
-/// Where the builder takes expert records from. `cached` may run on worker
-/// threads; `import` creates MLX arrays and runs on the calling thread only.
-pub(super) trait ExpertSource: Sync {
+/// Where the builder takes expert records from. `import` creates MLX arrays
+/// and runs on the calling thread only.
+pub(super) trait ExpertSource {
     fn name(&self) -> &str;
     fn experts(&self) -> usize;
     fn rows_per_expert(&self) -> usize;
     fn width(&self) -> usize;
-    fn cached(&self, expert: usize) -> Result<Option<ExpertRecord>>;
     fn import(&self, expert: usize) -> Result<ExpertRecord>;
 }
 
@@ -265,7 +254,7 @@ pub(super) struct LayerFile {
 impl LayerFile {
     /// `None` when the file is absent; `Err` when present but not a valid
     /// pack for `name`/`identity` (truncated, foreign, corrupt).
-    fn open(dirfd: &File, name: &str, identity: &str, verify: bool) -> Result<Option<Self>> {
+    fn open(dirfd: &File, name: &str, identity: &str) -> Result<Option<Self>> {
         let file = match packed_cache::dir_open_at(
             dirfd,
             OsStr::new(&file_name(name)),
@@ -291,14 +280,11 @@ impl LayerFile {
         if header.file_bytes != len {
             return Err(err("Mapped pack file size differs from its header"));
         }
-        let layer = Self { file, header };
-        if verify {
-            layer.verify_sections()?;
-        }
-        Ok(Some(layer))
+        Ok(Some(Self { file, header }))
     }
 
     /// Re-hash every section payload against the header.
+    #[cfg(test)]
     pub(super) fn verify_sections(&self) -> Result<()> {
         verify_sections(&self.file, &self.header)
     }
@@ -405,47 +391,17 @@ fn verify_sections(file: &File, header: &MappedHeader) -> Result<()> {
     Ok(())
 }
 
-/// Fetch `first..first + count`: the chunk fast path on worker threads, the
-/// importer on this thread for whatever the cache lacks. Every record must
-/// share the first expert's geometry.
+/// Import `first..first + count`. Every record must share the first
+/// expert's geometry.
 fn fetch_group(
     source: &dyn ExpertSource,
     first: usize,
     count: usize,
     prototype: Option<&ExpertRecord>,
 ) -> Result<Vec<ExpertRecord>> {
-    let workers = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .clamp(1, 8)
-        .min(count);
-    let mut records: Vec<Option<ExpertRecord>> = std::thread::scope(|scope| {
-        let jobs: Vec<_> = (0..workers)
-            .map(|w| {
-                scope.spawn(move || {
-                    (w..count)
-                        .step_by(workers)
-                        .map(|i| (i, source.cached(first + i).ok().flatten()))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        let mut out: Vec<Option<ExpertRecord>> = (0..count).map(|_| None).collect();
-        for job in jobs {
-            for (i, record) in job
-                .join()
-                .map_err(|_| err("Mapped pack reader worker panicked"))?
-            {
-                out[i] = record;
-            }
-        }
-        Ok::<_, Error>(out)
-    })?;
     let mut out = Vec::with_capacity(count);
-    for (i, slot) in records.iter_mut().enumerate() {
-        let record = match slot.take() {
-            Some(record) => record,
-            None => source.import(first + i)?,
-        };
+    for i in 0..count {
+        let record = source.import(first + i)?;
         if let Some(prototype) = prototype.or(out.first())
             && !record.same_geometry(prototype)
         {
@@ -462,18 +418,13 @@ fn fetch_group(
 
 /// The pinned dir a pack is opened or built in.
 struct Site<'a> {
-    dir: &'a Path,
     dirfd: &'a File,
     identity: &'a str,
-    /// Re-hash every section of every file opened.
-    verify: bool,
-    /// The configured root-wide cache cap, if any.
-    cap: Option<u64>,
 }
 
 impl Site<'_> {
     fn open(&self, name: &str) -> Result<Option<LayerFile>> {
-        LayerFile::open(self.dirfd, name, self.identity, self.verify)
+        LayerFile::open(self.dirfd, name, self.identity)
     }
 }
 
@@ -525,7 +476,7 @@ fn build_file(site: &Site<'_>, source: &dyn ExpertSource) -> Result<Outcome> {
         return Err(e);
     }
     let _ = site.dirfd.sync_all();
-    match LayerFile::open(site.dirfd, name, site.identity, false)? {
+    match LayerFile::open(site.dirfd, name, site.identity)? {
         Some(file) => Ok(Outcome::Built(file)),
         None => Err(err(format!("{name} vanished after its build"))),
     }
@@ -574,7 +525,7 @@ fn write_file(site: &Site<'_>, staging: &File, source: &dyn ExpertSource) -> Res
         cursor += round_up(payload);
     }
     let file_bytes = cursor;
-    packed_cache::admit_mapped_file(site.dir, site.dirfd, staging, file_bytes, site.cap)
+    packed_cache::admit_mapped_file(site.dirfd, staging, file_bytes)
         .map_err(|e| err(format!("{name}: {}", e.reason)))?;
     let mut hashers: Vec<Sha256> = sections.iter().map(|_| Sha256::new()).collect();
     let mut pending = Some(first);
@@ -647,7 +598,7 @@ pub(super) struct MappedPack {
 impl MappedPack {
     /// Open every valid tensor file under `dir`, rebuild invalid ones and
     /// build missing ones from `sources`. Building stops at the first
-    /// failure (disk, cap, source) and the files that exist stay usable; a
+    /// failure (disk, source) and the files that exist stay usable; a
     /// tensor another process is building right now is left out of this
     /// pack. Sections are hashed when built and read back; an open checks
     /// the header and the file size only.
@@ -656,47 +607,6 @@ impl MappedPack {
         identity: &str,
         manifest: Option<&[u8]>,
         sources: &[&dyn ExpertSource],
-    ) -> Result<(Self, BuildReport)> {
-        Self::open_or_build_with(
-            dir,
-            identity,
-            manifest,
-            sources,
-            false,
-            packed_cache::packed_total_cap(),
-        )
-    }
-
-    /// `verify` re-hashes every section of every file it opens.
-    #[cfg(test)]
-    pub(super) fn open_or_build_verifying(
-        dir: &Path,
-        identity: &str,
-        manifest: Option<&[u8]>,
-        sources: &[&dyn ExpertSource],
-    ) -> Result<(Self, BuildReport)> {
-        Self::open_or_build_with(dir, identity, manifest, sources, true, None)
-    }
-
-    /// Builds under an injected root-wide cap instead of the environment's.
-    #[cfg(test)]
-    pub(super) fn open_or_build_capped(
-        dir: &Path,
-        identity: &str,
-        manifest: Option<&[u8]>,
-        sources: &[&dyn ExpertSource],
-        cap: u64,
-    ) -> Result<(Self, BuildReport)> {
-        Self::open_or_build_with(dir, identity, manifest, sources, false, Some(cap))
-    }
-
-    fn open_or_build_with(
-        dir: &Path,
-        identity: &str,
-        manifest: Option<&[u8]>,
-        sources: &[&dyn ExpertSource],
-        verify: bool,
-        cap: Option<u64>,
     ) -> Result<(Self, BuildReport)> {
         packed_cache::unlink_if_symlink(dir);
         std::fs::create_dir_all(dir).map_err(err)?;
@@ -710,11 +620,8 @@ impl MappedPack {
             packed_cache::dir_write_file(&dirfd, ".manifest", manifest).map_err(err)?;
         }
         let site = Site {
-            dir,
             dirfd: &dirfd,
             identity,
-            verify,
-            cap,
         };
         let mut report = BuildReport {
             opened: 0,
@@ -827,7 +734,7 @@ impl MappedPack {
 
     /// The slot path's expert batch: every request must be one whole expert
     /// of a packed tensor, else `None` and the caller keeps its own reader.
-    /// A read failure also yields `None`: the chunk reader still has the
+    /// A read failure also yields `None`: the checkpoint still has the
     /// bytes, and a corrupt file is reported at the next load's open.
     pub(super) fn read_batch(
         &self,
@@ -882,7 +789,9 @@ impl MappedPack {
                     match chunk {
                         Ok(chunk) => out[i] = Some(chunk),
                         Err(e) => {
-                            warn!("qwen4 mapped pack: read failed, using chunks: {e}");
+                            warn!(
+                                "qwen4 mapped pack: read failed, importing from the checkpoint: {e}"
+                            );
                             return Ok(None);
                         }
                     }
@@ -1009,9 +918,8 @@ mod tests {
         }
     }
 
-    /// Serves one bank: experts below `cached_below` through the fast path,
-    /// the rest through `import`; counts both so a test can tell them apart.
-    /// Records are cut from the whole bank's row-major bytes, independently
+    /// Serves one bank through `import`, counting the imports. Records are
+    /// cut from the whole bank's row-major bytes, independently
     /// of the builder's own slicing.
     struct BankSource {
         name: String,
@@ -1022,12 +930,10 @@ mod tests {
         data: Vec<u8>,
         experts: usize,
         rows: usize,
-        cached_below: usize,
-        cached_calls: std::sync::atomic::AtomicUsize,
         imports: std::sync::atomic::AtomicUsize,
     }
     impl BankSource {
-        fn new(name: &str, bank: Weight, experts: usize, cached_below: usize) -> Self {
+        fn new(name: &str, bank: Weight, experts: usize) -> Self {
             let rows = bank.values.shape().unwrap()[0] as usize / experts;
             let width = bank.values.shape().unwrap()[1] as usize * 32 / bank.bits as usize;
             let (arrays, data) = packed_cache::encode_weight(&bank).unwrap();
@@ -1040,8 +946,6 @@ mod tests {
                 data,
                 experts,
                 rows,
-                cached_below,
-                cached_calls: Default::default(),
                 imports: Default::default(),
             }
         }
@@ -1083,11 +987,6 @@ mod tests {
         fn width(&self) -> usize {
             self.width
         }
-        fn cached(&self, expert: usize) -> Result<Option<ExpertRecord>> {
-            self.cached_calls
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok((expert < self.cached_below).then(|| self.record(expert)))
-        }
         fn import(&self, expert: usize) -> Result<ExpertRecord> {
             self.imports
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1095,27 +994,16 @@ mod tests {
         }
     }
 
-    fn sources(cached_below: usize) -> Vec<BankSource> {
+    fn sources() -> Vec<BankSource> {
         // 37 experts: more than two build groups with a ragged tail.
         vec![
             BankSource::new(
                 "blk.0.ffn_gate_exps.weight",
                 bank(37, 4, 256, false, 71),
                 37,
-                cached_below,
             ),
-            BankSource::new(
-                "blk.0.ffn_up_exps.weight",
-                bank(37, 4, 256, false, 197),
-                37,
-                cached_below,
-            ),
-            BankSource::new(
-                "blk.0.ffn_down_exps.weight",
-                bank(37, 8, 128, true, 13),
-                37,
-                cached_below,
-            ),
+            BankSource::new("blk.0.ffn_up_exps.weight", bank(37, 4, 256, false, 197), 37),
+            BankSource::new("blk.0.ffn_down_exps.weight", bank(37, 8, 128, true, 13), 37),
         ]
     }
 
@@ -1139,7 +1027,7 @@ mod tests {
     fn sections_equal_concatenated_expert_payloads_in_id_order_and_are_page_aligned() {
         let temp = Temp::new();
         let dir = temp.0.join(format!("{DIR_PREFIX}{IDENTITY}"));
-        let banks = sources(20);
+        let banks = sources();
         let (pack, report) =
             MappedPack::open_or_build(&dir, IDENTITY, Some(b"path_hex=00\n"), &dyn_sources(&banks))
                 .unwrap();
@@ -1149,12 +1037,6 @@ mod tests {
         for source in &banks {
             assert_eq!(
                 source.imports.load(std::sync::atomic::Ordering::Relaxed),
-                17
-            );
-            assert_eq!(
-                source
-                    .cached_calls
-                    .load(std::sync::atomic::Ordering::Relaxed),
                 37
             );
             let file = pack.file(&source.name).unwrap();
@@ -1213,8 +1095,7 @@ mod tests {
             );
             file.verify_sections().unwrap();
         }
-        // Mutation: one flipped payload byte fails verification and is
-        // rebuilt byte-identical at the next open.
+        // Mutation: one flipped payload byte fails verification.
         let name = &banks[1].name;
         let path = dir.join(file_name(name));
         let original = fs::read(&path).unwrap();
@@ -1224,17 +1105,16 @@ mod tests {
         drop(pack);
         fs::write(&path, &flipped).unwrap();
         let dirfd = packed_cache::open_dir_nofollow(&dir).unwrap();
-        let reopened = LayerFile::open(&dirfd, name, IDENTITY, false)
-            .unwrap()
-            .unwrap();
+        let reopened = LayerFile::open(&dirfd, name, IDENTITY).unwrap().unwrap();
         let error = reopened.verify_sections().unwrap_err().reason;
         assert!(error.contains("checksum mismatch"), "{error}");
-        assert!(LayerFile::open(&dirfd, name, IDENTITY, true).is_err());
         drop(reopened);
         drop(dirfd);
+        // An open checks the header and the size only; a rebuild republishes
+        // the same bytes.
+        fs::remove_file(&path).unwrap();
         let (_, report) =
-            MappedPack::open_or_build_verifying(&dir, IDENTITY, None, &dyn_sources(&banks))
-                .unwrap();
+            MappedPack::open_or_build(&dir, IDENTITY, None, &dyn_sources(&banks)).unwrap();
         assert_eq!((report.opened, report.built), (2, 1));
         assert_eq!(fs::read(&path).unwrap(), original);
         // A header that names another checkpoint or tensor is foreign.
@@ -1249,7 +1129,7 @@ mod tests {
         fs::copy(&path, other_dir.join(file_name(name))).unwrap();
         let other_fd = packed_cache::open_dir_nofollow(&other_dir).unwrap();
         let foreign = |tensor: &str, identity: &str| {
-            LayerFile::open(&other_fd, tensor, identity, false)
+            LayerFile::open(&other_fd, tensor, identity)
                 .err()
                 .map(|e| e.reason)
         };
@@ -1264,7 +1144,7 @@ mod tests {
             "a file whose header names another checkpoint"
         );
         assert!(
-            LayerFile::open(&other_fd, name, IDENTITY, false)
+            LayerFile::open(&other_fd, name, IDENTITY)
                 .unwrap()
                 .is_some()
         );
@@ -1274,14 +1154,10 @@ mod tests {
     fn builder_resumes_from_a_partial_directory_and_rebuilds_truncated_files() {
         let temp = Temp::new();
         let complete = temp.0.join(format!("a/{DIR_PREFIX}{IDENTITY}"));
-        let banks = sources(37);
+        let banks = sources();
         let (_, report) =
             MappedPack::open_or_build(&complete, IDENTITY, None, &dyn_sources(&banks)).unwrap();
         assert_eq!((report.opened, report.built), (0, 3));
-        for source in &banks {
-            // Every expert came from the fast path; nothing was imported.
-            assert_eq!(source.imports.load(std::sync::atomic::Ordering::Relaxed), 0);
-        }
         let partial = temp.0.join(format!("b/{DIR_PREFIX}{IDENTITY}"));
         fs::create_dir_all(&partial).unwrap();
         let [gate, up, down] = ["gate", "up", "down"].map(|p| format!("blk.0.ffn_{p}_exps.weight"));
@@ -1348,7 +1224,7 @@ mod tests {
     fn build_file_opens_a_final_published_before_its_lock_and_leaves_the_staging_file_alone() {
         let temp = Temp::new();
         let dir = temp.0.join(format!("{DIR_PREFIX}{IDENTITY}"));
-        let banks = sources(37);
+        let banks = sources();
         let (pack, _) =
             MappedPack::open_or_build(&dir, IDENTITY, None, &dyn_sources(&banks)).unwrap();
         drop(pack);
@@ -1362,25 +1238,18 @@ mod tests {
             .write(true)
             .open(&tmp_path)
             .unwrap();
-        let fetched = up.cached_calls.load(Relaxed);
+        let fetched = up.imports.load(Relaxed);
         let dirfd = packed_cache::open_dir_nofollow(&dir).unwrap();
         let site = Site {
-            dir: &dir,
             dirfd: &dirfd,
             identity: IDENTITY,
-            verify: false,
-            cap: None,
         };
         let outcome = build_file(&site, up).unwrap();
         assert!(
             matches!(outcome, Outcome::Opened(_)),
             "a valid final is opened, not rebuilt"
         );
-        assert_eq!(
-            up.cached_calls.load(Relaxed),
-            fetched,
-            "no expert was fetched"
-        );
+        assert_eq!(up.imports.load(Relaxed), fetched, "no expert was fetched");
         assert_eq!(fs::read(&final_path).unwrap(), published);
         assert_eq!(
             fs::read(&tmp_path).unwrap(),
@@ -1398,79 +1267,11 @@ mod tests {
         assert!(!tmp_path.exists());
     }
 
-    /// Under a root-wide cap a file is admitted only once idle mapped
-    /// siblings have been evicted to make room; a fresh sibling cannot be
-    /// evicted, so the build stops at the file that does not fit.
-    #[test]
-    fn builder_admits_files_under_the_root_cap_by_evicting_idle_mapped_siblings() {
-        let temp = Temp::new();
-        let parent = temp.0.join("cache");
-        fs::create_dir(&parent).unwrap();
-        let banks = sources(37);
-        let sibling = |letter: &str, aged: bool| {
-            let dir = parent.join(format!("{DIR_PREFIX}{}", letter.repeat(64)));
-            fs::create_dir(&dir).unwrap();
-            fs::write(dir.join("x.mapped"), vec![0u8; 100 << 10]).unwrap();
-            fs::write(dir.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
-            if aged {
-                let old = std::time::SystemTime::now() - Duration::from_secs(7200);
-                for entry in [dir.join("x.mapped"), dir.join(".manifest")] {
-                    File::options()
-                        .write(true)
-                        .open(entry)
-                        .unwrap()
-                        .set_modified(old)
-                        .unwrap();
-                }
-                File::open(&dir).unwrap().set_modified(old).unwrap();
-            }
-            dir
-        };
-        // Every fixture file is 80 KiB: three fit a 300 KiB cap only once the
-        // idle 100 KiB sibling is evicted for the third.
-        let idle = sibling("a", true);
-        let dir = parent.join(format!("{DIR_PREFIX}{IDENTITY}"));
-        let (pack, report) = MappedPack::open_or_build_capped(
-            &dir,
-            IDENTITY,
-            Some(b"path_hex=00\n"),
-            &dyn_sources(&banks),
-            300 << 10,
-        )
-        .unwrap();
-        assert_eq!((report.opened, report.built, report.skipped), (0, 3, 0));
-        assert!(
-            !idle.exists(),
-            "the idle sibling made room for the third file"
-        );
-        for source in &banks {
-            assert_eq!(pack.file(&source.name).unwrap().header.file_bytes, 80 << 10);
-        }
-        drop(pack);
-        fs::remove_dir_all(&dir).unwrap();
-        // A fresh sibling is not evictable: the second file would overspend a
-        // 200 KiB cap, so the build stops there and the first file stays.
-        let fresh = sibling("b", false);
-        let (pack, report) = MappedPack::open_or_build_capped(
-            &dir,
-            IDENTITY,
-            Some(b"path_hex=00\n"),
-            &dyn_sources(&banks),
-            200 << 10,
-        )
-        .unwrap();
-        assert_eq!((report.opened, report.built, report.skipped), (0, 1, 2));
-        assert_eq!(pack.len(), 1);
-        assert!(fresh.exists());
-        assert!(dir.join(file_name(&banks[0].name)).is_file());
-        assert!(!dir.join(tmp_name(&banks[1].name)).exists());
-    }
-
     #[test]
     fn read_batch_serves_whole_experts_only() {
         let temp = Temp::new();
         let dir = temp.0.join(format!("{DIR_PREFIX}{IDENTITY}"));
-        let banks = sources(37);
+        let banks = sources();
         let (pack, _) =
             MappedPack::open_or_build(&dir, IDENTITY, None, &dyn_sources(&banks)).unwrap();
         let requests = vec![

@@ -374,7 +374,7 @@ pub struct Qwen4ExpResidencyInfo {
     /// count in mapped mode).
     pub partial_expert_slots: u32,
     /// Routed expert tensors the slot path reads by range from the mapped
-    /// pack; 0 means every expert read goes through the per-expert chunks.
+    /// pack; 0 means every expert read is imported from the checkpoint.
     pub mapped_pack_files: u32,
     /// Every routed expert is addressed in place through the mapped pack;
     /// the weight budget then covers dense banks and rows only.

@@ -1,7 +1,7 @@
 //! Bounded, positional SSD reads. Descriptors never create MLX arrays. Only
 //! selected expert matrices and embedding rows are read on cache misses.
-//! Admitted hot banks can be prepared once; PLE stays row-addressable. Matrix chunks
-//! may reuse a bounded persistent cache of their losslessly packed arrays.
+//! Admitted hot banks can be prepared once; PLE stays row-addressable. Routed
+//! experts of a GGUF checkpoint also live in the mapped expert pack.
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -132,11 +132,13 @@ impl Tensor {
         }
         Ok((self.offset + self.row_bytes()? * start as u64, bytes))
     }
-    fn packed_key(&self, name: &str, start: usize, rows: usize) -> Result<Option<String>> {
-        let (offset, bytes) = self.range(start, rows)?;
+    /// Quantized multi-row GGUF matrices the mapped pack can hold; sparse
+    /// embedding/PLE rows are cheap to unpack and never packed.
+    fn packable(&self, name: &str, start: usize, rows: usize) -> Result<bool> {
+        let (_, bytes) = self.range(start, rows)?;
         Ok(match self.encoding {
-            Encoding::Gguf(ty)
-                if rows > 1
+            Encoding::Gguf(ty) => {
+                rows > 1
                     && bytes >= 4096
                     && (ty.k_quant_format().is_some()
                         || matches!(
@@ -147,18 +149,9 @@ impl Tensor {
                                 | GgufTensorType::Q8_0
                         ))
                     && name != "per_layer_token_embd.weight"
-                    && name != "token_embd.weight" =>
-            {
-                Some(super::packed_cache::chunk_key(
-                    &self.path,
-                    offset,
-                    bytes,
-                    rows,
-                    self.width()?,
-                    ty as u32,
-                ))
+                    && name != "token_embd.weight"
             }
-            _ => None,
+            Encoding::Safe(_) => false,
         })
     }
 }
@@ -715,8 +708,8 @@ impl Store {
         if !t.bytes.is_multiple_of(t.rows()? as u64) {
             return Err(err(format!("Unaligned SSD rows: {name}")));
         }
-        // Relative, absolute and symlink aliases must share the same prepared
-        // chunk keys. Resolve once while indexing, not on each matrix read.
+        // Relative, absolute and symlink aliases must share one source
+        // identity and one descriptor. Resolve once while indexing.
         t.path = t.path.canonicalize().map_err(err)?;
         if self.tensors.insert(name.clone(), t).is_some() {
             return Err(err(format!("Duplicate tensor {name}")));
@@ -966,18 +959,17 @@ impl Store {
     /// verified CPU payloads coexist; MLX imports and all Store/slot mutations
     /// stay on the inference thread in original request order. Whole-expert
     /// batches of packed tensors come from the mapped pack by range; anything
-    /// else from the per-expert chunk cache.
+    /// else is imported from the checkpoint.
     fn read_expert_batch(
         &mut self,
         requests: &[(String, usize, usize)],
     ) -> Result<Vec<Arc<Weight>>> {
-        if self.packed.is_none() {
+        if self.mapped.is_none() {
             return requests
                 .iter()
                 .map(|(name, start, rows)| self.read(name, *start, *rows))
                 .collect();
         }
-        let mut jobs = Vec::new();
         let mut indices = Vec::new();
         let mut total = 0u64;
         for (i, (name, start, rows)) in requests.iter().enumerate() {
@@ -987,14 +979,13 @@ impl Store {
                 continue;
             }
             let d = self.descriptor(name)?;
-            if let Some(key) = d.packed_key(name, *start, *rows)? {
+            if d.packable(name, *start, *rows)? {
                 let bytes = (d.runtime_bytes()? / d.rows()? as u64).saturating_mul(*rows as u64);
                 total = total.saturating_add(bytes);
-                jobs.push((key, bytes));
                 indices.push(i);
             }
         }
-        if total > MAX_READ_BYTES || jobs.len() > 24 || jobs.len() < 2 {
+        if total > MAX_READ_BYTES || indices.len() > 24 || indices.len() < 2 {
             return requests
                 .iter()
                 .map(|(name, start, rows)| self.read(name, *start, *rows))
@@ -1008,24 +999,17 @@ impl Store {
         super::memory::maintain_freelist(self.plan.physical_bytes);
         super::memory::admit(staging_bytes)?;
         let subset: Vec<_> = indices.iter().map(|&i| requests[i].clone()).collect();
-        let mapped = self
+        let verified = self
             .mapped
             .as_ref()
             .map(|pack| pack.read_batch(&subset))
             .transpose()?
             .flatten();
-        let verified = match mapped {
-            Some(chunks) => chunks.into_iter().map(Some).collect(),
-            None => {
-                let cache = self.packed.as_ref().ok_or_else(|| {
-                    err("Qwen4 packed cache disappeared before the prepared batch read")
-                })?;
-                cache.read_batch(&jobs)?
-            }
-        };
         let mut prepared: Vec<_> = (0..requests.len()).map(|_| None).collect();
-        for (i, chunk) in indices.into_iter().zip(verified) {
-            prepared[i] = Some(chunk);
+        if let Some(chunks) = verified {
+            for (i, chunk) in indices.into_iter().zip(chunks) {
+                prepared[i] = Some(chunk);
+            }
         }
         requests
             .iter()
@@ -1034,15 +1018,12 @@ impl Store {
             .collect()
     }
 
-    /// Open the mapped expert pack beside the chunk cache, building whatever
-    /// is missing from verified chunks or the checkpoint. A failure leaves
-    /// the chunk reader in charge; it never fails the load.
+    /// Open the mapped expert pack, building whatever is missing from the
+    /// checkpoint. A failure leaves the checkpoint reader in charge; it
+    /// never fails the load.
     pub(in super::super) fn prepare_mapped_pack(&mut self) -> Result<()> {
         let dir = match &self.packed {
-            Some(packed) if self.gguf => match packed.mapped_dir() {
-                Some(dir) => dir,
-                None => return Ok(()),
-            },
+            Some(packed) if self.gguf => packed.mapped_dir().to_path_buf(),
             _ => return Ok(()),
         };
         self.prepare_mapped_pack_at(&dir)
@@ -1062,7 +1043,7 @@ impl Store {
             };
             if tensor.shape.len() != 3
                 || tensor.shape[0] == 0
-                || tensor.packed_key(name, 0, tensor.shape[1])?.is_none()
+                || !tensor.packable(name, 0, tensor.shape[1])?
             {
                 continue;
             }
@@ -1072,13 +1053,9 @@ impl Store {
             return Ok(());
         }
         routed.sort_by_key(|r| (r.0, r.1));
-        let sources: Vec<RoutedExpertSource<'_>> = routed
+        let sources: Vec<RoutedExpertSource> = routed
             .into_iter()
-            .map(|(_, _, name, tensor)| RoutedExpertSource {
-                name,
-                tensor,
-                packed,
-            })
+            .map(|(_, _, name, tensor)| RoutedExpertSource { name, tensor })
             .collect();
         let dyn_sources: Vec<&dyn super::mapped_pack::ExpertSource> = sources
             .iter()
@@ -1088,7 +1065,7 @@ impl Store {
         match super::mapped_pack::MappedPack::open_or_build(
             dir,
             identity,
-            packed.manifest(),
+            Some(packed.manifest()),
             &dyn_sources,
         ) {
             Ok((pack, report)) => {
@@ -1104,7 +1081,9 @@ impl Store {
                 self.mapped = Some(pack);
             }
             Err(e) => {
-                tracing::warn!("qwen4 mapped pack unavailable, using expert chunks: {e}");
+                tracing::warn!(
+                    "qwen4 mapped pack unavailable, importing experts from the checkpoint: {e}"
+                );
             }
         }
         Ok(())
@@ -1317,7 +1296,7 @@ impl Store {
         start: usize,
         rows: usize,
         lookup: bool,
-        prepared: Option<Option<super::packed_cache::VerifiedChunk>>,
+        prepared: Option<super::packed_cache::VerifiedChunk>,
     ) -> Result<Arc<Weight>> {
         let mapped = self.plan.mapped;
         self.read_impl_with(name, start, rows, lookup, prepared, || {
@@ -1331,7 +1310,7 @@ impl Store {
         start: usize,
         rows: usize,
         lookup: bool,
-        prepared: Option<Option<super::packed_cache::VerifiedChunk>>,
+        prepared: Option<super::packed_cache::VerifiedChunk>,
         growth_check: impl FnOnce() -> Result<()>,
     ) -> Result<Arc<Weight>> {
         if let Some(bank) = self.banks.get(name) {
@@ -1370,17 +1349,9 @@ impl Store {
             self.growth_bytes = 0;
         }
         self.evict_to(cache_limit.saturating_sub(MAX_READ_BYTES * 3))?;
-        // Do not persist sparse embedding/PLE rows: they are cheap to unpack,
-        // and caching the enormous table would consume disk without reuse.
-        let packed_key = d.packed_key(name, start, rows)?;
-        let prepared = match prepared {
-            Some(chunk) => chunk
-                .map(super::packed_cache::VerifiedChunk::into_weight)
-                .transpose()?,
-            None => packed_key
-                .as_ref()
-                .and_then(|key| self.packed.as_ref()?.read(key).ok().flatten()),
-        };
+        let prepared = prepared
+            .map(super::packed_cache::VerifiedChunk::into_weight)
+            .transpose()?;
         let prepared_hit = prepared.is_some();
         let weight = if let Some((weight, bytes)) = prepared {
             self.packed_hits += 1;
@@ -1402,11 +1373,6 @@ impl Store {
         }
         if !prepared_hit {
             self.bytes_read += bytes;
-            if let (Some(cache), Some(key)) = (&self.packed, &packed_key) {
-                // Cache I/O is optional. A read-only/full disk keeps the original
-                // bounded GGUF path usable, and no partial entry is published.
-                let _ = cache.write(key, &weight);
-            }
         }
         self.retain_read(name, key, weight, lookup, rows)
     }
@@ -1800,15 +1766,13 @@ fn routed_expert_tensor(name: &str) -> Option<(usize, usize)> {
     Some((layer, part))
 }
 
-/// One routed expert tensor as the mapped-pack builder sees it: verified
-/// chunks first, the checkpoint importer for whatever the cache lacks.
-struct RoutedExpertSource<'a> {
+/// One routed expert tensor as the mapped-pack builder imports it.
+struct RoutedExpertSource {
     name: String,
     tensor: Tensor,
-    packed: &'a super::packed_cache::PackedCache,
 }
 
-impl super::mapped_pack::ExpertSource for RoutedExpertSource<'_> {
+impl super::mapped_pack::ExpertSource for RoutedExpertSource {
     fn name(&self) -> &str {
         &self.name
     }
@@ -1820,17 +1784,6 @@ impl super::mapped_pack::ExpertSource for RoutedExpertSource<'_> {
     }
     fn width(&self) -> usize {
         self.tensor.shape[2]
-    }
-    fn cached(&self, expert: usize) -> Result<Option<super::mapped_pack::ExpertRecord>> {
-        let rows = self.rows_per_expert();
-        let Some(key) = self.tensor.packed_key(&self.name, expert * rows, rows)? else {
-            return Ok(None);
-        };
-        let limit = (self.tensor.runtime_bytes()? / self.tensor.rows()? as u64) * rows as u64;
-        Ok(self
-            .packed
-            .read_verified(&key, limit)?
-            .map(super::mapped_pack::ExpertRecord::from_chunk))
     }
     fn import(&self, expert: usize) -> Result<super::mapped_pack::ExpertRecord> {
         let rows = self.rows_per_expert();
@@ -2906,35 +2859,16 @@ mod mapped_tests {
     }
 
     #[test]
-    fn mapped_pack_matches_the_checkpoint_and_the_chunks_and_feeds_the_slot_batch() {
+    fn mapped_pack_matches_the_checkpoint_and_feeds_the_slot_batch() {
         let temp = Temp::new();
         let gguf = temp.0.join("experts.gguf");
         write_fixture(&gguf);
         let root = temp.0.join("cache");
         let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
-        let packed_dir = fs::read_dir(&root)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .find(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(".mlx-qwen4-packed-v2-"))
-            })
-            .unwrap();
-        let packs = || {
-            fs::read_dir(&packed_dir)
-                .unwrap()
-                .flatten()
-                .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
-                .count()
-        };
-        assert_eq!(packs(), 0);
-        // No chunk exists yet: every record comes from the GGUF importer.
+        // Every record comes from the GGUF importer.
         let from_gguf = temp.0.join("from-gguf");
         store.prepare_mapped_pack_at(&from_gguf).unwrap();
         assert_eq!(store.plan.mapped_pack_files, 3);
-        assert_eq!(packs(), 0, "the builder never writes chunks");
         let mapped = store.mapped.take().unwrap();
         // Oracle: the ordinary reader, expert by expert, encoded as a chunk.
         for (name, rows, _, _, _) in PARTS {
@@ -2964,19 +2898,19 @@ mod mapped_tests {
                 assert_eq!(whole[s], expected[s], "{name} section {s}");
             }
         }
-        assert_eq!(packs(), 15, "the oracle reads published every expert chunk");
-        // Second build from the chunk fast path: byte-identical files.
-        let from_chunks = temp.0.join("from-chunks");
-        store.prepare_mapped_pack_at(&from_chunks).unwrap();
+        // A second build is byte-identical.
+        let again = temp.0.join("again");
+        store.prepare_mapped_pack_at(&again).unwrap();
         for (name, ..) in PARTS {
             let file_name = format!("{name}.mapped");
             assert_eq!(
                 fs::read(from_gguf.join(&file_name)).unwrap(),
-                fs::read(from_chunks.join(&file_name)).unwrap(),
-                "{name}: chunk-built file differs from the checkpoint-built file"
+                fs::read(again.join(&file_name)).unwrap(),
+                "{name}: the second build differs from the first"
             );
         }
-        // The slot batch through the range reader equals the chunk reader.
+        // The slot batch through the range reader equals the checkpoint
+        // reader.
         let requests: Vec<_> = [4usize, 0, 2]
             .into_iter()
             .flat_map(|expert| PARTS.map(|(name, rows, ..)| (name.to_owned(), expert * rows, rows)))
@@ -2999,14 +2933,14 @@ mod mapped_tests {
             "range reads are prepared hits"
         );
         store.evict_to(0).unwrap();
-        let via_chunks: Vec<_> = store
+        let via_checkpoint: Vec<_> = store
             .read_expert_batch(&requests)
             .unwrap()
             .iter()
             .map(|w| encoded(w))
             .collect();
-        assert_eq!(store.packed_hits, packed_hits + 18);
-        assert_eq!(via_pack, via_chunks);
+        assert_eq!(store.packed_hits, packed_hits + 9);
+        assert_eq!(via_pack, via_checkpoint);
         store.mapped = Some(pack);
         assert_eq!(
             super::routed_expert_tensor("blk.47.ffn_down_exps.weight"),

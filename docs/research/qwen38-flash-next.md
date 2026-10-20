@@ -7,9 +7,10 @@ macOS 27 recheck. The [runtime guide](../qwen38-flash-next.md) covers usage.
 
 > **Log only.** Every `MLX_QWEN4_*` switch this report names was deleted on
 > 20 October 2026 (one code path remains per site; the measured winners are
-> now unconditional, the losers and their kernels are gone). The remaining
-> Qwen4 environment variables are listed in [perf.md](../perf.md). Sections
-> below describe experiments as they were run and are not current controls.
+> now unconditional, the losers and their kernels are gone). No Qwen4-specific
+> environment variable remains; the shared ones are listed in
+> [perf.md](../perf.md). Sections below describe experiments as they were run
+> and are not current controls.
 
 ## Reviewer follow-up, 17 September
 
@@ -482,11 +483,13 @@ GEMM**, which can change arithmetic and continuation. They remain off by
 default. Native exactness tests for the new load/routing ports do not erase
 those separately documented numerical differences.
 
-### Measured configuration
+### Measured configuration (17 September 2026, historical)
 
-Use these settings before starting the process. Other Qwen4 controls retain
-their documented defaults; the measured mixer down/injection fusion is disabled.
-The supplied GGUF codes, system reserves and admission rules are unchanged.
+The run used these settings; every `MLX_QWEN4_*` variable below was deleted on
+20 October 2026 and is no longer read. Other Qwen4 controls kept their
+then-documented defaults; the measured mixer down/injection fusion was
+disabled. The supplied GGUF codes, system reserves and admission rules were
+unchanged.
 
 ```sh
 export MLX_METAL_HASH_KERNEL_CACHE=1
@@ -614,7 +617,12 @@ fallbacks. The opt-in arms that had measured within noise or as losers
 (`MLX_QWEN4_EXPERT_LANE_STAGING`, `MLX_QWEN4_GDN_VECTOR_ROWS`,
 `MLX_QWEN4_REFERENCE_DOWN_SCHEDULE`, `MLX_QWEN4_GDN_DECODE_PREFETCH`,
 `MLX_QWEN4_PREFILL_REFERENCE_INDIRECT`) were deleted with their kernel
-variants, as were the trace and check probes.
+variants, as were the trace and check probes. The residency selectors went
+too (`MLX_QWEN4_RESIDENCY`, `MLX_QWEN4_WEIGHT_CACHE_GIB`,
+`MLX_QWEN4_MAPPED_PACK`): the load maps the expert pack when live memory holds
+it and falls back to the slot path otherwise. The per-expert chunk cache and
+its `MLX_QWEN4_PACKED_CACHE_DIR` / `MLX_QWEN4_PACKED_CACHE_MAX_GB` controls were
+removed; the mapped pack is the only prepared format.
 
 The opt-in exact fusions measured on 2026-10-20 (teacher-forced logits on the
 6k and 16k prompts in one process, mapped residency, 256 positions) were
