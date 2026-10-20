@@ -291,19 +291,6 @@ impl Store {
         refresh: &mut impl FnMut(&mut super::super::memory::Plan) -> Result<()>,
     ) -> Result<()> {
         self.prepare_hot_with_admission(admit, refresh)?;
-        self.plan.resident_expert_layers = self
-            .tensors
-            .keys()
-            .filter(|name| {
-                name.ends_with(".ffn_gate_exps.weight")
-                    && !is_auxiliary(name)
-                    && ["gate", "up", "down"].iter().all(|part| {
-                        self.banks.contains_key(
-                            &name.replace("ffn_gate_exps", &format!("ffn_{part}_exps")),
-                        )
-                    })
-            })
-            .count();
         if let (Some(experts), Some(top)) = (
             self.metadata
                 .get("qwen4exp.expert_count")
@@ -337,13 +324,7 @@ impl Store {
             refresh(&mut self.plan)?;
             self.cache_limit = self.plan.budget;
         }
-        let names = if self.plan.resident {
-            let mut names: Vec<_> = self.tensors.keys().filter(|n| is_hot(n)).cloned().collect();
-            names.sort();
-            names
-        } else {
-            self.projection_bank_names()?
-        };
+        let names = self.projection_bank_names()?;
         if names.is_empty() {
             return Ok(());
         }
@@ -370,17 +351,10 @@ impl Store {
         self.cache_bytes = 0;
         self.growth_bytes = 0;
         self.plan.resident_bank_bytes.store(0, Ordering::Relaxed);
-        self.plan.resident_expert_layers = 0;
         self.plan.partial_expert_slots = 0;
         crate::array::memory::synchronize_and_clear_cache();
-        if self.plan.policy == "full" {
-            return Err(err(
-                "Qwen4 full residency cannot preserve first-request headroom",
-            ));
-        }
         refresh(&mut self.plan)?;
         self.cache_limit = self.plan.budget;
-        self.plan.resident = false;
         self.slot_capacity = None;
         let names = self.projection_bank_names()?;
         if !self.prepare_banks(names, admit)? {
@@ -1168,17 +1142,15 @@ mod tests {
     }
 
     #[test]
-    fn failed_full_load_releases_banks_before_partial_retry() {
-        for policy in ["auto", "full"] {
-            let mut store = Store::open_metadata(&fixture().join("model.gguf"), None).unwrap();
+    fn failed_bank_load_releases_banks_before_the_retry() {
+        let mut store = Store::open_metadata(&fixture().join("model.gguf"), None).unwrap();
+        {
             store.plan.hot_bytes = store.hot_bytes().unwrap();
-            store.plan.resident = true;
-            store.plan.policy = policy.into();
             let mut refused = false;
             let mut refreshed = false;
             let result = store.prepare_hot_with_admission(
                 &mut |bytes| {
-                    // Simulate headroom loss only after the full bank set is
+                    // Simulate headroom loss only after the bank set is
                     // complete. No large allocation or OS settings change needed.
                     if bytes == super::super::super::memory::WORKING_BYTES && !refused {
                         refused = true;
@@ -1194,15 +1166,12 @@ mod tests {
                 },
             );
             assert!(refused);
-            assert_eq!(refreshed, policy == "auto");
-            if policy == "full" {
-                assert!(result.is_err());
-                assert!(store.banks.is_empty());
-                assert_eq!(store.cache_bytes, 0);
-            } else {
-                result.unwrap();
-                assert!(!store.plan.resident);
-                assert!(!store.banks.is_empty());
+            assert!(refreshed);
+            result.unwrap();
+        }
+        assert!(!store.banks.is_empty());
+        {
+            {
                 assert!(
                     store
                         .banks
@@ -1301,12 +1270,10 @@ mod tests {
                 "budget selection must read only descriptors"
             );
 
-            // A metadata-only fixture can exercise the partial policy without
+            // A metadata-only fixture can exercise the bank preparation without
             // requesting tens of GiB from the machine running these tests.
             s.cache_limit = CACHE_BYTES;
-            s.plan.policy = "auto".into();
             s.prepare_fixture_hot().unwrap();
-            assert!(!s.plan.resident);
             assert_eq!(s.bank_bytes, bytes);
             assert_eq!(s.cache_bytes, bytes);
             assert_eq!(s.plan.resident_bank_bytes.load(Ordering::Relaxed), bytes);
@@ -1356,16 +1323,19 @@ mod tests {
     }
 
     #[test]
-    fn resident_banks_preserve_rows_and_leave_lookup_and_auxiliary_weights_cold() {
+    fn projection_banks_preserve_rows_and_leave_lookup_and_auxiliary_weights_cold() {
         for path in [fixture(), fixture().join("bf16/paged/model.gguf")] {
             let mut s = Store::open_metadata(&path, None).unwrap();
-            s.plan.resident = true;
-            let hot = s.hot_bytes().unwrap();
             assert_eq!(s.bytes_read, 0);
             s.prepare_fixture_hot().unwrap();
-            assert_eq!(s.cache_bytes, hot);
+            assert_eq!(s.cache_bytes, s.bank_bytes);
             assert!(s.cache.is_empty());
             assert!(s.banks.keys().all(|name| is_hot(name)));
+            assert!(
+                s.banks
+                    .keys()
+                    .all(|name| is_fixed_projection(name, &s.tensors[name]))
+            );
             assert!(!s.banks.is_empty());
             let reads = (s.bytes_read, s.packed_hits, s.packed_bytes_read);
             let mut reference = Store::open_metadata(&path, None).unwrap();
@@ -1407,12 +1377,16 @@ mod tests {
     #[test]
     fn oversized_bank_is_rejected_before_any_payload_read() {
         let mut s = Store::open_metadata(&fixture(), None).unwrap();
-        s.plan.resident = true;
         let d = s.tensors.get_mut("lm_head.weight").unwrap();
         d.shape = vec![1 << 30, 1];
         d.bytes = 4 << 30;
+        // Budget selection leaves such a checkpoint on its chunk path...
+        assert!(s.projection_bank_names().unwrap().is_empty());
+        s.prepare_fixture_hot().unwrap();
+        assert!(s.banks.is_empty());
+        // ...and an explicit bank request is refused before any read.
         assert!(
-            s.prepare_fixture_hot()
+            s.prepare_banks(vec!["lm_head.weight".into()], &mut |_| Ok(()))
                 .unwrap_err()
                 .to_string()
                 .contains("1 GiB bank budget")

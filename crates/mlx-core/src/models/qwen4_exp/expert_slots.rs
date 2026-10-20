@@ -138,12 +138,12 @@ impl Store {
             .max(self.draft_bank_budget))
     }
 
-    /// Map every routed expert of every layer from the pack when `auto`
-    /// residency selects it (memory::mapped_residency_selected) and the live
-    /// host holds the pack beside what stays anonymous (memory::mapped_plan),
-    /// replacing the slot budget by one for dense banks and auxiliary rows
-    /// only. Any failure leaves the slot path in charge. `pool_bytes` is the
-    /// paged KV pool created before this decision.
+    /// Map every routed expert of every layer from the pack when the pack is
+    /// complete and the live host holds it beside what stays anonymous
+    /// (memory::mapped_plan), replacing the slot budget by one for dense
+    /// banks and auxiliary rows only. Any failure leaves the slot path in
+    /// charge. `pool_bytes` is the paged KV pool created before this
+    /// decision.
     pub(in super::super) fn select_mapped_residency(&mut self, pool_bytes: u64) -> Result<()> {
         let Some(experts) = self
             .metadata
@@ -194,12 +194,7 @@ impl Store {
                     .is_some_and(|file| file.header.experts as usize == experts)
             })
         });
-        if !super::super::memory::mapped_residency_selected(
-            &self.plan.policy,
-            super::super::memory::explicit_weight_budget(),
-            complete,
-            super::super::memory::mapped_pack_disabled(),
-        ) {
+        if !complete {
             return Ok(());
         }
         let pack_bytes: u64 = layers

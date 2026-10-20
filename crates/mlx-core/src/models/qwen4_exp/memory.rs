@@ -11,15 +11,12 @@ pub(super) const WORKING_BYTES: u64 = 4 << 30;
 pub(super) struct Plan {
     pub budget: u64,
     pub hot_bytes: u64,
-    pub resident: bool,
-    pub policy: String,
     pub available_bytes: Option<u64>,
     pub physical_bytes: Option<u64>,
     /// Shared with the model handle's clone: banks installed on the model
     /// thread after load (the MTP expert banks) publish their bytes here so
     /// `residencyInfo` reports what is actually pinned.
     pub resident_bank_bytes: Arc<AtomicU64>,
-    pub resident_expert_layers: usize,
     pub partial_expert_slots: usize,
     /// Routed expert tensors served from the mapped pack (0 = chunk reader).
     pub mapped_pack_files: usize,
@@ -137,73 +134,33 @@ pub(super) fn mapped_gate(host: &HostMemory, anonymous_need: u64, margin: u64) -
 }
 
 pub(super) fn plan(hot_bytes: u64) -> Result<Plan> {
-    let policy = match std::env::var_os("MLX_QWEN4_RESIDENCY") {
-        None => "auto".into(),
-        Some(value) => value
-            .to_str()
-            .map(str::to_owned)
-            .filter(|s| ["auto", "stream", "full"].contains(&s.as_str()))
-            .ok_or_else(|| {
-                Error::from_reason("MLX_QWEN4_RESIDENCY must be auto, stream or full")
-            })?,
-    };
-    let explicit = std::env::var_os("MLX_QWEN4_WEIGHT_CACHE_GIB")
-        .map(|value| {
-            value
-                .to_str()
-                .and_then(|s| s.parse::<u64>().ok())
-                .filter(|n| *n >= 2)
-                .and_then(|g| g.checked_mul(1 << 30))
-                .ok_or_else(|| {
-                    Error::from_reason("MLX_QWEN4_WEIGHT_CACHE_GIB must be an integer of at least 2 that fits in bytes; live device admission still applies")
-                })
-        })
-        .transpose()?;
     let desired = hot_bytes
         .checked_add((2 << 30) - 1)
         .map(|n| (n >> 30) << 30)
         .ok_or_else(|| Error::from_reason("Qwen4 hot-weight size overflow"))?;
-    // Read the live machine at bootstrap. The streaming setting limits desired
-    // residency; it must not force an 8 GiB allocation on a busy desktop.
+    // Read the live machine at bootstrap; the budget must not force an
+    // allocation on a busy desktop.
     let snapshot = if cfg!(target_os = "macos") {
         Some((available_memory()?, physical_memory()?))
     } else {
         None
     };
-    let budget = if let Some(bytes) = explicit {
-        bytes
-    } else if let Some((available, physical)) = snapshot {
-        let desired = if policy == "stream" {
-            desired.min(super::weights::CACHE_BYTES)
-        } else {
-            desired
-        };
-        automatic_budget(desired, available, physical)
-    } else {
-        super::weights::CACHE_BYTES
+    let budget = match snapshot {
+        Some((available, physical)) => automatic_budget(desired, available, physical),
+        None => super::weights::CACHE_BYTES,
     };
     if budget == 0 {
         return Err(Error::from_reason(
             "Qwen4 bootstrap has no whole GiB for weights after system/working reserves; release memory before loading",
         ));
     }
-    if policy == "full" && desired > budget {
-        return Err(Error::from_reason(format!(
-            "Qwen4 full hot-path residency needs {:.2} GiB plus system/working headroom; bootstrap admitted {:.2} GiB for weights",
-            desired as f64 / (1u64 << 30) as f64,
-            budget as f64 / (1u64 << 30) as f64
-        )));
-    }
     admit(budget)?;
     Ok(Plan {
         budget,
         hot_bytes,
-        resident: policy != "stream" && desired <= budget,
-        policy,
         available_bytes: snapshot.map(|s| s.0),
         physical_bytes: snapshot.map(|s| s.1),
         resident_bank_bytes: Arc::default(),
-        resident_expert_layers: 0,
         partial_expert_slots: 0,
         mapped_pack_files: 0,
         mapped: false,
@@ -211,26 +168,6 @@ pub(super) fn plan(hot_bytes: u64) -> Result<Plan> {
         mapped_bank_budget: 0,
         live_non_reclaimable: 0,
     })
-}
-
-/// `auto` considers the pack when every routed tensor is in it; an explicit
-/// weight budget, `stream`, `full` and `MLX_QWEN4_MAPPED_PACK=0` keep the
-/// slot path. Whether the banks fit is `mapped_plan`'s live decision.
-pub(super) fn mapped_residency_selected(
-    policy: &str,
-    explicit_budget: bool,
-    pack_complete: bool,
-    disabled: bool,
-) -> bool {
-    policy == "auto" && !explicit_budget && !disabled && pack_complete
-}
-
-pub(super) fn mapped_pack_disabled() -> bool {
-    std::env::var_os("MLX_QWEN4_MAPPED_PACK").is_some_and(|v| v == "0")
-}
-
-pub(super) fn explicit_weight_budget() -> bool {
-    std::env::var_os("MLX_QWEN4_WEIGHT_CACHE_GIB").is_some()
 }
 
 /// Whole GiB the mapped budget asks for: dense banks (plus the Q8 draft
@@ -289,7 +226,6 @@ pub(super) fn mapped_plan(
         )));
     }
     plan.budget = desired;
-    plan.resident = false;
     plan.mapped = true;
     Ok(())
 }
@@ -359,7 +295,6 @@ pub(super) fn slot_fallback_plan_with(
             >> 30
             << 30,
     );
-    plan.resident = false;
     plan.mapped = false;
     plan.mapped_bytes = 0;
     plan.mapped_bank_budget = 0;
@@ -412,9 +347,9 @@ fn automatic_budget(desired: u64, available: u64, physical: u64) -> u64 {
 }
 
 /// Reconcile the bootstrap ceiling after tokenizer and private page pools have
-/// been created, or after releasing an abandoned full-residency load. This is
-/// called with no owned weight arrays, so live headroom needs no inferred credit
-/// from MLX's process-global allocation counters.
+/// been created, or after releasing an abandoned bank load. This is called
+/// with no owned weight arrays, so live headroom needs no inferred credit from
+/// MLX's process-global allocation counters.
 pub(super) fn refresh_plan(plan: &mut Plan) -> Result<()> {
     if !cfg!(target_os = "macos") {
         return Ok(());
@@ -426,14 +361,12 @@ pub(super) fn refresh_plan(plan: &mut Plan) -> Result<()> {
 
 fn refresh_from_snapshot(plan: &mut Plan, available: u64, physical: u64) -> Result<()> {
     let budget = automatic_budget(plan.budget, available, physical);
-    let desired = plan.hot_bytes.saturating_add((2 << 30) - 1) >> 30 << 30;
-    if budget == 0 || (plan.policy == "full" && desired > budget) {
+    if budget == 0 {
         return Err(Error::from_reason(
             "Qwen4 load has insufficient headroom for weights and first-request working memory",
         ));
     }
     plan.budget = budget;
-    plan.resident = plan.policy != "stream" && desired <= budget;
     plan.available_bytes = Some(available);
     plan.physical_bytes = Some(physical);
     Ok(())
@@ -683,18 +616,6 @@ mod tests {
         assert!(!fits_with_headroom(u64::MAX, u64::MAX, 16 << 30));
     }
 
-    #[test]
-    fn mapped_residency_needs_auto_and_a_complete_pack() {
-        assert!(mapped_residency_selected("auto", false, true, false));
-        // MLX_QWEN4_WEIGHT_CACHE_GIB pins an anonymous budget: slots.
-        assert!(!mapped_residency_selected("auto", true, true, false));
-        assert!(!mapped_residency_selected("stream", false, true, false));
-        assert!(!mapped_residency_selected("full", false, true, false));
-        // MLX_QWEN4_MAPPED_PACK=0 is the slot A/B arm.
-        assert!(!mapped_residency_selected("auto", false, true, true));
-        assert!(!mapped_residency_selected("auto", false, false, false));
-    }
-
     fn gib(n: f64) -> u64 {
         (n * (1u64 << 30) as f64) as u64
     }
@@ -794,12 +715,9 @@ mod tests {
         Plan {
             budget: 73 << 30,
             hot_bytes: 83_631_869_440,
-            resident: true,
-            policy: "auto".into(),
             available_bytes: None,
             physical_bytes: None,
             resident_bank_bytes: Arc::default(),
-            resident_expert_layers: 0,
             partial_expert_slots: 442,
             mapped_pack_files: 144,
             mapped: false,
@@ -820,7 +738,7 @@ mod tests {
         // No live snapshot (fixtures, other platforms): the desired budget is
         // taken as is and the bank budget is the pack.
         mapped_plan(&mut plan, gib(3.8), 1 << 30, gib(73.15)).unwrap();
-        assert!(plan.mapped && !plan.resident);
+        assert!(plan.mapped);
         assert_eq!(plan.budget, 6 << 30);
         assert_eq!(plan.mapped_bank_budget, gib(73.15));
         // Qwen3.8 Flash Next on the 128 GiB desktop: 73.15 GiB of pack, 4.9
@@ -859,7 +777,7 @@ mod tests {
         let mut unread =
             || -> Result<HostMemory> { panic!("a plan without a snapshot reads no host") };
         slot_fallback_plan_with(&mut plan, gib(11.4), &mut unread, &mut |_| {});
-        assert!(!plan.mapped && !plan.resident);
+        assert!(!plan.mapped);
         assert_eq!(plan.mapped_bytes, 0);
         assert_eq!(plan.mapped_bank_budget, 0);
         assert_eq!(
@@ -1159,16 +1077,13 @@ mod tests {
     }
 
     #[test]
-    fn load_reconciliation_preserves_working_room_and_explicit_full_policy() {
+    fn load_reconciliation_preserves_working_room() {
         let original = Plan {
             budget: 79 << 30,
             hot_bytes: 83_631_869_440,
-            resident: true,
-            policy: "auto".into(),
             available_bytes: Some(99 << 30),
             physical_bytes: Some(128 << 30),
             resident_bank_bytes: Arc::default(),
-            resident_expert_layers: 0,
             partial_expert_slots: 0,
             mapped_pack_files: 0,
             mapped: false,
@@ -1179,17 +1094,10 @@ mod tests {
         let mut plan = original.clone();
         refresh_from_snapshot(&mut plan, 94 << 30, 128 << 30).unwrap();
         assert_eq!(plan.budget, 74 << 30);
-        assert!(!plan.resident);
         assert!(plan.budget + WORKING_BYTES + system_reserve(128 << 30) <= 94 << 30);
         // A later free-memory increase cannot exceed the admitted ceiling.
         refresh_from_snapshot(&mut plan, 112 << 30, 128 << 30).unwrap();
         assert_eq!(plan.budget, 74 << 30);
-        let mut full = original.clone();
-        full.policy = "full".into();
-        assert!(refresh_from_snapshot(&mut full, 94 << 30, 128 << 30).is_err());
-        assert_eq!(full.budget, original.budget);
-        refresh_from_snapshot(&mut full, 112 << 30, 128 << 30).unwrap();
-        assert!(full.resident);
         assert!(refresh_from_snapshot(&mut plan, 19 << 30, 128 << 30).is_err());
     }
 

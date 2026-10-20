@@ -43,14 +43,14 @@ weights load only when used. Text-only GGUF generation needs no auxiliary model.
 
 ## Memory and SSD caching
 
-The default `auto` policy calculates the weight budget at bootstrap from actual
+The weight budget is calculated at bootstrap from actual
 tensor sizes, physical RAM, and live free/file-backed memory. It reserves one
 eighth of RAM for the system (bounded to 2–16 GiB), plus 4 GiB for runtime work,
 and caps weights at 75% of physical RAM. Anonymous inactive and compressed
 memory do not count as available. The budget is reconciled after tokenizer and
 page-pool creation; growth rechecks headroom.
 
-With a complete mapped expert pack (below), `auto` maps every routed expert
+With a complete mapped expert pack (below), the load maps every routed expert
 in place when the live host holds the whole pack beside what stays anonymous:
 the pack's sections back the expert banks as no-copy Metal buffers, slot id
 is expert id, and no expert is ever copied, missed or staged during a turn.
@@ -129,11 +129,9 @@ when other processes' anonymous memory leaves less than that (a 20 GiB
 working set beside the 78 GiB pack on 128 GiB), the kernel re-faults the pack
 layer by layer and a 6k turn reads about 1 TB from SSD at 0.4 tokens/s
 instead of 50; the live-memory gate and the tripwire above send such a host
-to the slot path. `MLX_QWEN4_MAPPED_PACK=0` keeps the slot path for A/B;
-`MLX_QWEN4_WEIGHT_CACHE_GIB`, `stream` and `full` also select it.
+to the slot path.
 
-Otherwise, if the hot text network fits, it is prepared once in resident
-quantized banks; else fixed projections are retained within a quarter of the
+On the slot path, fixed projections are retained within a quarter of the
 budget and routed experts use stable slots sized from the remaining budget and
 tensor geometry. Sparse token/PLE rows stay on SSD: the 17 rows a token needs
 (its embedding and 16 hashed PLE rows) are requested from four reader threads
@@ -177,11 +175,6 @@ before erroring.
 
 | Setting                      | Behavior                                                                |
 | ---------------------------- | ----------------------------------------------------------------------- |
-| `MLX_QWEN4_RESIDENCY=auto`   | Admit full or partial hot residency from current headroom.              |
-| `MLX_QWEN4_RESIDENCY=full`   | Require the full hot set; fail if it cannot fit safely.                 |
-| `MLX_QWEN4_RESIDENCY=stream` | Bound the on-demand cache to at most 8 GiB unless overridden.           |
-| `MLX_QWEN4_WEIGHT_CACHE_GIB` | Optional integer ceiling, at least 2 GiB; live admission still applies. Pins an anonymous budget, so the slot path is used even when the mapped pack exists. |
-| `MLX_QWEN4_MAPPED_PACK=0`    | Keep the slot path although the mapped pack is complete (A/B arm).      |
 | `MLX_QWEN4_PACKED_CACHE_DIR` | Override the prepared-cache location.                                   |
 | `MLX_QWEN4_PACKED_CACHE_MAX_GB` | Optional global cap across every packed-cache identity directory, in GiB; least-recently-used eviction. Unset or `<=0` keeps only the per-checkpoint 96 GiB budget. |
 | `MLX_NATIVE_GGUF_CACHE_MAX_GB` | Optional cap on the whole native GGUF cache (packed weights plus extracted tokenizer assets), in GiB; least-recently-used eviction under a 24 h grace, with atomic root-wide admission at publish (a conversion that cannot fit loads from its staging dir instead; a later reload reuses that staged result rather than re-converting, and the refused dir is a per-pid load output the sweep keeps while the process lives). Unset, `<=0` or unparseable means unlimited. |

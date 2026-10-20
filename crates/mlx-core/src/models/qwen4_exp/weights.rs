@@ -563,12 +563,9 @@ impl Store {
             plan: super::memory::Plan {
                 budget: cache_limit,
                 hot_bytes: 0,
-                resident: false,
-                policy: "stream".into(),
                 available_bytes: None,
                 physical_bytes: None,
                 resident_bank_bytes: Default::default(),
-                resident_expert_layers: 0,
                 partial_expert_slots: 0,
                 mapped_pack_files: 0,
                 mapped: false,
@@ -1456,14 +1453,10 @@ impl Store {
         // Always-used projections have a protected segment; experts and sparse
         // rows use the remaining LRU. Cap protection at 75%, so new reads retain
         // staging headroom even for a different/BF16 checkpoint topology.
-        // Assembled banks and protected chunks share the pinned allowance.
-        // Full residency reserves the whole main network during preparation;
-        // partial residency keeps at least 25% available to the expert/row LRU.
-        let protect_limit = if self.plan.resident {
-            cache_limit.saturating_sub(self.plan.hot_bytes.max(self.bank_bytes)) * 3 / 4
-        } else {
-            (cache_limit.saturating_sub(self.slot_bytes) * 3 / 4).saturating_sub(self.bank_bytes)
-        };
+        // Assembled banks and protected chunks share the pinned allowance;
+        // at least 25% stays available to the expert/row LRU.
+        let protect_limit =
+            (cache_limit.saturating_sub(self.slot_bytes) * 3 / 4).saturating_sub(self.bank_bytes);
         if d.shape.len() <= 2
             && name != "token_embd.weight"
             && name != "embed_tokens.weight"
@@ -2792,8 +2785,8 @@ mod cache_tests {
             None,
         )
         .unwrap();
-        store.plan.resident = true;
-        store.plan.hot_bytes = CACHE_BYTES - 1024;
+        // Pinned banks leave 768 bytes of the protected allowance.
+        store.bank_bytes = CACHE_BYTES * 3 / 4 - 768;
         let descriptor = store
             .descriptor("layers.0.attn_hyper_connection.hc_norm.weight")
             .unwrap()
@@ -3065,12 +3058,10 @@ mod mapped_tests {
         let map = |dir: &str| {
             let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
             store.prepare_mapped_pack_at(&temp.0.join(dir)).unwrap();
-            store.plan.policy = "auto".into();
             store
                 .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
                     plan.budget = 1 << 30;
                     plan.mapped = true;
-                    plan.resident = false;
                     Ok(())
                 })
                 .unwrap();
@@ -3179,14 +3170,12 @@ mod mapped_tests {
         let dense = store.fixed_projection_bytes().unwrap();
         let dir = temp.0.join("mapped");
         store.prepare_mapped_pack_at(&dir).unwrap();
-        store.plan.policy = "auto".into();
         let mut charged = None;
         store
             .select_mapped_residency_with(EXPERTS, 1 << 30, &mut |plan, need, _, _| {
                 charged = Some(need);
                 plan.budget = super::super::memory::mapped_desired(need);
                 plan.mapped = true;
-                plan.resident = false;
                 Ok(())
             })
             .unwrap();
@@ -3255,7 +3244,6 @@ mod mapped_tests {
             })
             .sum();
         let before = store.cache_bytes;
-        store.plan.policy = "auto".into();
         store
             .select_mapped_residency_with(EXPERTS, 1 << 30, &mut |plan, dense, pool, pack| {
                 // The fixture holds routed experts only; the gate sees
@@ -3264,7 +3252,6 @@ mod mapped_tests {
                 assert_eq!(pack, expected_bytes);
                 plan.budget = 1 << 30;
                 plan.mapped = true;
-                plan.resident = false;
                 Ok(())
             })
             .unwrap();
@@ -3409,12 +3396,10 @@ mod mapped_tests {
             bytes[at],
             "the damaged page must not survive"
         );
-        store.plan.policy = "auto".into();
         store
             .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
                 plan.budget = 1 << 30;
                 plan.mapped = true;
-                plan.resident = false;
                 Ok(())
             })
             .unwrap();
@@ -3422,7 +3407,6 @@ mod mapped_tests {
 
         let mut other = Store::open_fixture(&gguf, Some(&root)).unwrap();
         other.prepare_mapped_pack_at(&dir).unwrap();
-        other.plan.policy = "auto".into();
         other
             .select_mapped_residency_with(EXPERTS + 1, 0, &mut |_, _, _, _| {
                 panic!("an incomplete pack must not be admitted")
@@ -3445,7 +3429,6 @@ mod mapped_tests {
         store
             .prepare_mapped_pack_at(&temp.0.join("mapped"))
             .unwrap();
-        store.plan.policy = "auto".into();
         let budget_before = store.plan.budget;
         let limit_before = store.cache_limit;
         let mut seen_pack = 0;
@@ -3497,12 +3480,10 @@ mod mapped_tests {
         store
             .prepare_mapped_pack_at(&temp.0.join("mapped"))
             .unwrap();
-        store.plan.policy = "auto".into();
         store
             .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
                 plan.budget = 1 << 30;
                 plan.mapped = true;
-                plan.resident = false;
                 Ok(())
             })
             .unwrap();
@@ -3615,12 +3596,10 @@ mod mapped_tests {
         store
             .prepare_mapped_pack_at(&temp.0.join("mapped"))
             .unwrap();
-        store.plan.policy = "auto".into();
         store
             .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
                 plan.budget = 1 << 30;
                 plan.mapped = true;
-                plan.resident = false;
                 Ok(())
             })
             .unwrap();
@@ -3691,12 +3670,10 @@ mod mapped_tests {
         store
             .prepare_mapped_pack_at(&temp.0.join("mapped"))
             .unwrap();
-        store.plan.policy = "auto".into();
         store
             .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
                 plan.budget = 1 << 30;
                 plan.mapped = true;
-                plan.resident = false;
                 Ok(())
             })
             .unwrap();
@@ -3750,12 +3727,10 @@ mod mapped_tests {
         store
             .prepare_mapped_pack_at(&temp.0.join("mapped"))
             .unwrap();
-        store.plan.policy = "auto".into();
         store
             .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
                 plan.budget = 1 << 30;
                 plan.mapped = true;
-                plan.resident = false;
                 Ok(())
             })
             .unwrap();

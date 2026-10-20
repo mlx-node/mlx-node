@@ -357,14 +357,12 @@ pub struct Qwen4ExpLoadOptions {
     pub auxiliary_model_path: Option<String>,
 }
 
-/// Load-time residency decision (full residency is admitted before payload
+/// Load-time residency decision (the budget is admitted before payload
 /// reads) plus the live pinned-bank total.
 #[napi(object)]
 pub struct Qwen4ExpResidencyInfo {
-    pub policy: String,
     pub weight_budget_bytes: f64,
     pub hot_weight_bytes: f64,
-    pub full_hot_residency: bool,
     pub prefill_chunk_tokens: u32,
     /// Free plus reclaimable file-backed memory observed at bootstrap.
     pub available_memory_bytes: Option<f64>,
@@ -372,9 +370,8 @@ pub struct Qwen4ExpResidencyInfo {
     /// Assembled matrices actually pinned right now: partial projection banks
     /// and the MTP expert banks built on the first MTP owner.
     pub resident_bank_bytes: f64,
-    /// Complete routed layers whose expert IDs stay on the GPU.
-    pub resident_expert_layers: u32,
-    /// Shared slot capacity for the remaining partial layers at bootstrap.
+    /// Shared slot capacity for the routed layers at bootstrap (the expert
+    /// count in mapped mode).
     pub partial_expert_slots: u32,
     /// Routed expert tensors the slot path reads by range from the mapped
     /// pack; 0 means every expert read goes through the per-expert chunks.
@@ -609,10 +606,8 @@ impl Qwen4ExpModel {
         let live = &self.live;
         let fallback = live.fallback();
         Qwen4ExpResidencyInfo {
-            policy: self.residency.policy.clone(),
             weight_budget_bytes: live.weight_budget.load(Ordering::Acquire) as f64,
             hot_weight_bytes: self.residency.hot_bytes as f64,
-            full_hot_residency: self.residency.resident,
             prefill_chunk_tokens: live.prefill_chunk_tokens.load(Ordering::Acquire) as u32,
             available_memory_bytes: self.residency.available_bytes.map(|n| n as f64),
             physical_memory_bytes: self.residency.physical_bytes.map(|n| n as f64),
@@ -620,7 +615,6 @@ impl Qwen4ExpModel {
                 .residency
                 .resident_bank_bytes
                 .load(std::sync::atomic::Ordering::Relaxed) as f64,
-            resident_expert_layers: self.residency.resident_expert_layers as u32,
             partial_expert_slots: live.partial_expert_slots.load(Ordering::Acquire) as u32,
             mapped_pack_files: self.residency.mapped_pack_files as u32,
             mapped: live.mapped.load(Ordering::Acquire),

@@ -1105,77 +1105,6 @@ fn q5_1_ssd_rows_preserve_high_bits_and_stored_minimum() {
     assert_eq!(store.bytes_read, bytes, "warm lookup must not read SSD");
 }
 
-#[test]
-fn full_bank_preparation_reuses_streamed_expert_chunks_after_restart() {
-    let dir = Temp::new();
-    let path = dir.0.join("test.gguf");
-    let mut b = b"GGUF".to_vec();
-    b.extend_from_slice(&3u32.to_le_bytes());
-    b.extend_from_slice(&1u64.to_le_bytes());
-    b.extend_from_slice(&1u64.to_le_bytes());
-    gguf_string(&mut b, "general.architecture");
-    b.extend_from_slice(&8u32.to_le_bytes());
-    gguf_string(&mut b, "qwen4exp");
-    let name = "blk.0.ffn_gate_exps.weight";
-    gguf_string(&mut b, name);
-    b.extend_from_slice(&3u32.to_le_bytes());
-    for d in [32u64, 256, 2] {
-        b.extend_from_slice(&d.to_le_bytes());
-    }
-    b.extend_from_slice(&7u32.to_le_bytes());
-    b.extend_from_slice(&0u64.to_le_bytes());
-    while !b.len().is_multiple_of(32) {
-        b.push(0);
-    }
-    for row in 0..512 {
-        b.extend_from_slice(&half::f16::from_f32(0.25).to_bits().to_le_bytes());
-        b.extend_from_slice(&half::f16::from_f32(-2.0).to_bits().to_le_bytes());
-        b.extend_from_slice(&(row as u32 * 7919).to_le_bytes());
-        b.extend_from_slice(&[row as u8; 16]);
-    }
-    std::fs::write(&path, b).unwrap();
-    let mut streaming = weights::Store::open_fixture(&path, Some(&dir.0)).unwrap();
-    let expected = streaming
-        .read(name, 0, 256)
-        .unwrap()
-        .values
-        .to_uint32()
-        .unwrap()
-        .to_vec();
-    assert_eq!(streaming.bytes_read, 256 * 24);
-    drop(streaming);
-    let mut resident = weights::Store::open_fixture(&path, Some(&dir.0)).unwrap();
-    resident.plan.resident = true;
-    resident.prepare_fixture_hot().unwrap();
-    assert_eq!(
-        resident.packed_hits, 1,
-        "the previously prepared expert must be reused"
-    );
-    assert_eq!(
-        resident.bytes_read,
-        256 * 24,
-        "only the cold expert should be imported"
-    );
-    assert_eq!(
-        &*resident
-            .read(name, 0, 256)
-            .unwrap()
-            .values
-            .to_uint32()
-            .unwrap(),
-        &expected
-    );
-    drop(resident);
-    let mut restarted = weights::Store::open_fixture(&path, Some(&dir.0)).unwrap();
-    restarted.plan.resident = true;
-    restarted.prepare_fixture_hot().unwrap();
-    assert_eq!(restarted.packed_hits, 2);
-    assert_eq!(
-        restarted.bytes_read, 0,
-        "resident restart must not repeat imports"
-    );
-}
-
 /// One prefill-contract case: which fixture (`""` is the F32 root, `bf16`,
 /// `bf16/paged`), whether to open its GGUF file (the GGUF layout transforms:
 /// split gate/up experts, tiled GDN heads, combined PLE table) or the
@@ -1195,10 +1124,10 @@ fn full_bank_preparation_reuses_streamed_expert_chunks_after_restart() {
 ///   prompt ends on a 1-token chunk, the singleton `layer` path
 ///   inside `prefill_chunk`.
 /// - width 32: crosses the budget inside one chunk, leaves a 4-token tail;
-///   `batched_prefill_*` prepares the fixture under `policy = "auto"` here,
-///   the slotted-expert tier.
-/// - width 64 / 128: past the resident-bank threshold (`prepare_fixture_hot`
-///   with `plan.resident`), over a 126-token prompt: two chunks, or one.
+///   `batched_prefill_*` prepares the fixed projection banks here, the
+///   slotted-expert tier.
+/// - width 64 / 128: the same banks over a 126-token prompt: two chunks, or
+///   one.
 struct PrefillCase {
     fixture: &'static str,
     gguf: bool,
@@ -1294,8 +1223,8 @@ fn chunked_prefill_preserves_singleton_logits_and_continuation() {
 /// Batched prefill (`attention_batch` + `mlp_batch`, or the window carry)
 /// against the unbatched chunk, across the expert tiers the width selects:
 /// demand-loaded experts (safetensors' combined `gate_up_proj` and GGUF's
-/// split `ffn_gate/up_exps`), `policy = "auto"` slots at width 32, and
-/// resident banks at 64 / 128 over a 126-token prompt. The F32 root fixture
+/// split `ffn_gate/up_exps`), and fixed projection banks with slotted
+/// experts at width 32, 64 and 128 (a 126-token prompt). The F32 root fixture
 /// holds the exact tolerance; BF16 allows the TF32 window.
 #[test]
 fn batched_prefill_matches_reference_across_chunks_sparse_boundaries_and_continuation() {
@@ -1311,14 +1240,9 @@ fn batched_prefill_matches_reference_across_chunks_sparse_boundaries_and_continu
         let (path, width) = (case.path(), case.width);
         let (mut scalar, mut batched) = case.decoders();
         scalar.batch_prefill = false;
-        if width >= 64 {
-            batched.weights.plan.resident = true;
-            batched.weights.prepare_fixture_hot().unwrap();
-        } else if width == 32 {
+        if width >= 32 {
             // Assembled fixed projections with demand-loaded experts
             // must preserve the same prompt/continuation contract.
-            batched.weights.plan.resident = false;
-            batched.weights.plan.policy = "auto".into();
             batched.weights.prepare_fixture_hot().unwrap();
         }
         let tokens = [3, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4, 7, 1, 3, 5, 6, 8]

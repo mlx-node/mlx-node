@@ -5450,14 +5450,12 @@ export interface Qwen4ExpLoadOptions {
 }
 
 /**
- * Load-time residency decision (full residency is admitted before payload
+ * Load-time residency decision (the budget is admitted before payload
  * reads) plus the live pinned-bank total.
  */
 export interface Qwen4ExpResidencyInfo {
-  policy: string;
   weightBudgetBytes: number;
   hotWeightBytes: number;
-  fullHotResidency: boolean;
   prefillChunkTokens: number;
   /** Free plus reclaimable file-backed memory observed at bootstrap. */
   availableMemoryBytes?: number;
@@ -5467,9 +5465,10 @@ export interface Qwen4ExpResidencyInfo {
    * and the MTP expert banks built on the first MTP owner.
    */
   residentBankBytes: number;
-  /** Complete routed layers whose expert IDs stay on the GPU. */
-  residentExpertLayers: number;
-  /** Shared slot capacity for the remaining partial layers at bootstrap. */
+  /**
+   * Shared slot capacity for the routed layers at bootstrap (the expert
+   * count in mapped mode).
+   */
   partialExpertSlots: number;
   /**
    * Routed expert tensors the slot path reads by range from the mapped
