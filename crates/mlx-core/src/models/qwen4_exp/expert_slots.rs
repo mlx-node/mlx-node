@@ -551,7 +551,11 @@ impl Store {
         // bounded staging and sparse-row room inside the admitted weight cap.
         // Fully resident expert banks are included in `fixed`, and only the
         // remaining layers share slots. Never reserve a second copy of them.
-        let reserve = self.auxiliary_cache_allowance()?;
+        // Draft banks a mapped turn installed stay pinned past the switch to
+        // slots and are not in `fixed`: the reserve holds them and the staging.
+        let reserve = self
+            .auxiliary_cache_allowance()?
+            .max(self.mtp_bank_bytes()?.saturating_add(MAX_READ_BYTES * 6));
         let bytes = self
             .cache_limit
             .saturating_sub(fixed)
@@ -1258,6 +1262,229 @@ mod tests {
         }
         assert_eq!(store.bytes_read, 0);
         assert_eq!(store.slot_bytes, 0);
+    }
+    /// A mapped MTP turn installs the Q8 draft banks; a trip then sizes the
+    /// slots from the fallback budget while they stay pinned. Every layer's
+    /// slot bank is built with only LRU rows evictable, so the last one needs
+    /// the banks, all slots and its staging inside the budget.
+    #[test]
+    fn fallback_slots_fit_beside_installed_draft_banks() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let mut store = Store::open_metadata(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp"),
+            None,
+        )
+        .unwrap();
+        store.tensors.clear();
+        store.gguf = true;
+        // The released UD-Q4_K_XL checkpoint's routed experts.
+        let mut routed = 0u64;
+        for layer in 0..48 {
+            let (gate_up, down) = match layer {
+                2 => (GgufTensorType::Q5K, GgufTensorType::Q8_0),
+                4 | 30 | 46 | 47 => (GgufTensorType::Q4K, GgufTensorType::Q8_0),
+                _ => (GgufTensorType::Q4K, GgufTensorType::Q5_1),
+            };
+            for part in ["gate", "up", "down"] {
+                let t = Tensor {
+                    path: PathBuf::new(),
+                    shape: if part == "down" {
+                        vec![512, 2560, 640]
+                    } else {
+                        vec![512, 640, 2560]
+                    },
+                    offset: 0,
+                    bytes: 0,
+                    encoding: Encoding::Gguf(if part == "down" { down } else { gate_up }),
+                };
+                routed += t.runtime_bytes().unwrap();
+                store
+                    .tensors
+                    .insert(format!("blk.{layer}.ffn_{part}_exps.weight"), t);
+            }
+        }
+        assert_eq!(routed, 78_538_342_400);
+        let fixed = 5_245_160_960;
+        store.plan.hot_bytes = routed + fixed;
+        store.plan.mapped = false;
+        store.draft_bank_budget = 0;
+        let heads: [(&str, i64, i64); 2] = [
+            ("mtp.layers.0.mlp.experts.gate_up_proj", 512 * 1280, 2560),
+            ("mtp.layers.0.mlp.experts.down_proj", 512 * 2560, 640),
+        ];
+        for (name, rows, width) in heads {
+            store.tensors.insert(
+                name.into(),
+                Tensor {
+                    path: PathBuf::new(),
+                    shape: vec![512, rows as usize / 512, width as usize],
+                    offset: 0,
+                    bytes: rows as u64 * width as u64 * 2,
+                    encoding: Encoding::Safe("BF16".into()),
+                },
+            );
+        }
+        let draft = store.mtp_bank_estimate().unwrap();
+        assert_eq!(draft, 2_831_155_200);
+        let slots = |store: &mut Store, gib: u64| {
+            store.cache_limit = gib << 30;
+            store.slot_capacity = None;
+            store.expert_slot_capacity(512, 10).unwrap()
+        };
+        let budgets = [10u64, 16, 20, 26, 30, 36];
+        let text = budgets.map(|gib| slots(&mut store, gib));
+        assert_eq!(
+            [text[1], text[3]],
+            [63, 125],
+            "no installed draft bank: the slot count is unchanged"
+        );
+        // Installed as the bank admission leaves them, never evaluated.
+        for (name, rows, width) in heads {
+            let lazy = |columns: i64, dtype| MxArray::zeros(&[rows, columns], Some(dtype)).unwrap();
+            store.banks.insert(
+                name.into(),
+                Arc::new(Weight {
+                    values: lazy(width / 4, DType::Uint32),
+                    dense_bf16: None,
+                    scales: Some(lazy(width / 32, DType::Float16)),
+                    biases: Some(lazy(width / 32, DType::Float16)),
+                    group: 32,
+                    bits: 8,
+                    mode: "affine".into(),
+                }),
+            );
+        }
+        assert_eq!(store.mtp_bank_bytes().unwrap(), draft);
+        store.bank_bytes = fixed + draft;
+        store.cache_bytes = store.bank_bytes;
+        let banked = budgets.map(|gib| slots(&mut store, gib));
+        let table =
+            format!("slots at {budgets:?} GiB: {banked:?} with the banks, {text:?} without");
+        for (k, gib) in budgets.into_iter().enumerate() {
+            assert!(
+                store.bank_bytes + routed * banked[k] as u64 / 512 + MAX_READ_BYTES * 3
+                    <= gib << 30,
+                "the slots overrun {gib} GiB beside the draft banks; {table}"
+            );
+            if gib >= 26 {
+                assert_eq!(banked[k], text[k], "{table}");
+            }
+        }
+        assert_eq!(store.bytes_read, 0);
+        assert_eq!(store.slot_bytes, 0);
+    }
+    /// The same fallback on the released checkpoint: a mapped load with the
+    /// MTP head attached installs the draft banks (`begin_mtp`'s call), a trip
+    /// leaves mapped mode on a 128 GiB host snapshot that leaves a 16 GiB slot
+    /// budget, and the next turn builds every layer's slot bank. Opt-in:
+    /// `QWEN4_EXP_REAL_MODEL=<gguf> QWEN4_EXP_REAL_AUX=<MTP checkpoint dir>
+    /// QWEN4_EXP_REAL_INPUTS=<inputs.json> cargo test -p mlx-core --lib
+    /// real_fallback_slots_beside_draft_banks -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_fallback_slots_beside_draft_banks() {
+        use super::super::super::{auxiliary, decoder::Decoder, gguf, memory::HostMemory};
+        let (Ok(model), Ok(aux), Ok(inputs)) = (
+            std::env::var("QWEN4_EXP_REAL_MODEL"),
+            std::env::var("QWEN4_EXP_REAL_AUX"),
+            std::env::var("QWEN4_EXP_REAL_INPUTS"),
+        ) else {
+            eprintln!(
+                "real_fallback_slots_beside_draft_banks: QWEN4_EXP_REAL_MODEL / QWEN4_EXP_REAL_AUX / QWEN4_EXP_REAL_INPUTS not set"
+            );
+            return;
+        };
+        let cases: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(inputs).unwrap()).unwrap();
+        let prompt: Vec<u32> = cases
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "6k")
+            .expect("a 6k case")["tokenIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .take(8)
+            .map(|t| t.as_u64().unwrap() as u32)
+            .collect();
+        let mut store = Store::open(Path::new(&model)).unwrap();
+        let mut config = gguf::config(&store).unwrap();
+        auxiliary::attach(&mut store, &mut config, Path::new(&aux)).unwrap();
+        let mut decoder = Decoder::new(config, store).unwrap();
+        decoder.register_cache_limit();
+        decoder.weights.prepare_mapped_pack().unwrap();
+        decoder.weights.select_mapped_residency(0).unwrap();
+        decoder.weights.prepare_hot().unwrap();
+        decoder.weights.publish_live();
+        decoder.residency_changed();
+        assert!(
+            decoder.weights.plan.mapped,
+            "the live host refused the pack"
+        );
+        let draft = decoder.weights.prepare_mtp_expert_banks().unwrap();
+        assert_eq!(
+            draft, 2_831_155_200,
+            "the mapped plan admits the draft banks"
+        );
+        let turn = |decoder: &mut Decoder| -> Result<Vec<u32>> {
+            decoder.reset();
+            decoder.weights.begin_turn()?;
+            let mut logits = decoder.prefill_chunk(&prompt, None, true)?;
+            let mut text = Vec::new();
+            for _ in 0..16 {
+                let last = logits.shape()?.len() as i32 - 1;
+                let id = logits.argmax(last, Some(false))?.item_at_uint32(0)?;
+                text.push(id);
+                logits = decoder.step(id)?;
+            }
+            Ok(text)
+        };
+        let mapped = turn(&mut decoder).unwrap();
+        assert!(
+            decoder.weights.plan.mapped,
+            "the mapped turn tripped by itself"
+        );
+        let host = HostMemory {
+            physical: 128 << 30,
+            free: 36 << 30,
+            ..Default::default()
+        };
+        decoder
+            .weights
+            .leave_mapped_with(
+                &Fallback::SsdReads { read: 0, mapped: 0 },
+                &mut || Ok(host),
+                &mut |_| {},
+            )
+            .unwrap();
+        decoder.residency_changed();
+        assert_eq!(decoder.weights.cache_limit, 16 << 30);
+        let slots = decoder.weights.plan.partial_expert_slots;
+        let held = decoder.weights.cache_bytes;
+        eprintln!(
+            "fallback: {slots} slots, 16 GiB budget, {:.3} GiB banks ({:.3} GiB draft), {:.3} GiB held",
+            decoder.weights.bank_bytes as f64 / (1u64 << 30) as f64,
+            decoder.weights.mtp_bank_bytes().unwrap() as f64 / (1u64 << 30) as f64,
+            held as f64 / (1u64 << 30) as f64
+        );
+        let fallback = turn(&mut decoder)
+            .unwrap_or_else(|e| panic!("the slot turn failed at {slots} slots: {e}"));
+        assert_eq!(
+            decoder.weights.slots.len(),
+            48,
+            "every layer built its slots"
+        );
+        assert!(decoder.weights.cache_bytes <= decoder.weights.cache_limit);
+        eprintln!(
+            "mapped {mapped:?}\nslots  {fallback:?}\n{} of {} tokens equal; slot bytes {:.3} GiB, cache {:.3} GiB",
+            mapped.iter().zip(&fallback).filter(|(a, b)| a == b).count(),
+            mapped.len(),
+            decoder.weights.slot_bytes as f64 / (1u64 << 30) as f64,
+            decoder.weights.cache_bytes as f64 / (1u64 << 30) as f64
+        );
     }
     #[test]
     fn slot_replacement_completes_all_lazy_readers_and_retains_warm_codes() {
