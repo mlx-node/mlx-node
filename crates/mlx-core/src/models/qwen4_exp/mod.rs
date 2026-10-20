@@ -330,9 +330,12 @@ impl ChatBackend for Inner {
         // the window for the passes after it.
         let mut start = 0;
         while start < tokens.len() {
-            let end = (start + self.decoder.prefill_slice_size()).min(tokens.len());
-            logits = Some(self.decoder.prefill_chunk(
+            let window = self.decoder.prefill_slice_size();
+            let end = (start + window).min(tokens.len());
+            let next_end = (end + window).min(tokens.len());
+            logits = Some(self.decoder.prefill_chunk_ahead(
                 &tokens[start..end],
+                &tokens[end..next_end],
                 None,
                 end == tokens.len(),
             )?);
@@ -494,6 +497,7 @@ impl Qwen4ExpModel {
                 decoder.weights.prepare_mapped_pack()?;
                 decoder.weights.select_mapped_residency(pool_bytes)?;
                 decoder.weights.prepare_hot()?;
+                decoder.weights.start_pack_stream();
                 decoder.weights.publish_live();
                 // Register the final reconciled budget, rather than retaining
                 // the pre-pool estimate in the process-wide allocator policy.

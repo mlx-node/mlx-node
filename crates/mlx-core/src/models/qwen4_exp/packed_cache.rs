@@ -1269,7 +1269,10 @@ mod tests {
             age(&dir.join(".manifest"), 7200);
             age_dir(dir, 7200);
         }
-        let _cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        until_gone(
+            || drop(PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap()),
+            || !stale.exists() && !chunks.exists(),
+        );
         assert!(
             !stale.exists(),
             "an aged mapped dir with a dead source is an orphan"
@@ -1416,6 +1419,20 @@ mod tests {
         dir
     }
 
+    /// The sweep keeps a dir whenever the process-wide holder registry is
+    /// busy (another test of this binary opening or sweeping a pack), so
+    /// `sweep` is repeated until `gone` holds or 1 s has passed; a dir the
+    /// sweep keeps on purpose survives every repeat.
+    fn until_gone(mut sweep: impl FnMut(), gone: impl Fn() -> bool) {
+        for _ in 0..200 {
+            sweep();
+            if gone() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn held_mapped_dir_lock_blocks_the_sweep() {
         let temp = Temp::new();
@@ -1429,7 +1446,7 @@ mod tests {
         sweep_packed_cache(&parent, &current);
         assert!(stale.exists(), "an open pack is not swept");
         drop(holder);
-        sweep_packed_cache(&parent, &current);
+        until_gone(|| sweep_packed_cache(&parent, &current), || !stale.exists());
         assert!(!stale.exists());
         // The same process holding the dir through `hold_mapped_dir` (a
         // loaded MappedPack) is excluded too, by the registry and the lock.
@@ -1439,7 +1456,12 @@ mod tests {
         assert_eq!(locked_remove(&held, MAPPED_LOCK, "test", |_| true), 0);
         assert!(held.exists());
         drop(guard);
-        assert!(locked_remove(&held, MAPPED_LOCK, "test", |_| true) > 0);
+        let removed = std::cell::Cell::new(0);
+        until_gone(
+            || removed.set(removed.get() + locked_remove(&held, MAPPED_LOCK, "test", |_| true)),
+            || removed.get() > 0,
+        );
+        assert!(removed.get() > 0);
         assert!(!held.exists());
         // Holding a dir an evictor removed meanwhile is refused.
         let gone = mapped_fixture(&parent, 'd', 100, true);
@@ -1496,7 +1518,10 @@ mod tests {
         assert!(!packed_dir_idle(&fresh));
         // An old build reading the dir holds its ledger shared.
         let holder = shared_lock_holder(&temp.0, &locked.join(RETIRED_CHUNK_LOCK));
-        let _ = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
+        until_gone(
+            || drop(PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap()),
+            || !released.exists() && !same_source.exists(),
+        );
         assert!(
             !released.exists(),
             "an idle manifest-less dir v0.0.16 wrote is removed"
@@ -1516,7 +1541,10 @@ mod tests {
             "a name that is not a 64-hex identity is foreign"
         );
         drop(holder);
-        let _ = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        until_gone(
+            || drop(PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap()),
+            || !locked.exists(),
+        );
         assert!(!locked.exists(), "the released ledger no longer keeps it");
         assert!(fresh.exists());
         assert!(foreign.exists());
@@ -1567,7 +1595,10 @@ mod tests {
             orphan.exists(),
             "a fixture load swept the user's orphaned mapped pack"
         );
-        let _ = PackedCache::new_at(&parent, BTreeSet::from([fixture_gguf()])).unwrap();
+        until_gone(
+            || drop(PackedCache::new_at(&parent, BTreeSet::from([fixture_gguf()])).unwrap()),
+            || !retired.exists() && !orphan.exists(),
+        );
         assert!(
             !retired.exists() && !orphan.exists(),
             "both dirs must be sweep-eligible or the checks above prove nothing"

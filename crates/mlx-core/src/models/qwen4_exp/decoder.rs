@@ -1380,7 +1380,7 @@ impl Decoder {
         if i == 0 {
             self.weights.wire_mapped_banks(main)?;
         } else {
-            self.weights.prefetch_mapped_layer(i, main);
+            self.weights.keep_wired(i, main)?;
         }
         let c = self.config.clone();
         let p = format!("layers.{i}.mlp");
@@ -1616,7 +1616,7 @@ impl Decoder {
         if i == 0 {
             self.weights.wire_mapped_banks(main)?;
         } else {
-            self.weights.prefetch_mapped_layer(i, main);
+            self.weights.keep_wired(i, main)?;
         }
         let c = self.config.clone();
         if main {
@@ -1825,10 +1825,15 @@ impl Decoder {
 
     /// Hash ids of `tokens` continuing the current history, in gather order.
     fn ple_hash_ids(&self, i: usize, tokens: &[u32]) -> Result<Vec<u64>> {
+        self.ple_hash_ids_after(i, &self.history, tokens)
+    }
+
+    /// The hash ids of `tokens` following `history` (the ngram context is
+    /// its tail).
+    fn ple_hash_ids_after(&self, i: usize, history: &[u32], tokens: &[u32]) -> Result<Vec<u64>> {
         let c = &self.config;
         let [multipliers, sizes, offsets] = self.ple_constants(i)?;
-        let mut previous =
-            self.history[self.history.len().saturating_sub(c.ngram_size - 1)..].to_vec();
+        let mut previous = history[history.len().saturating_sub(c.ngram_size - 1)..].to_vec();
         let mut ids = Vec::new();
         for &token in tokens {
             self.check_cancelled()?;
@@ -1882,15 +1887,50 @@ impl Decoder {
     /// layer, before the layers ahead of it are encoded. The embedding row
     /// is needed at once, so the model thread reads it itself.
     fn prefetch_ple_rows(&mut self, tokens: &[u32]) -> Result<()> {
+        let keys = self.ple_row_keys_after(&self.history.clone(), tokens)?;
+        self.weights.prefetch_rows(&keys)
+    }
+
+    /// The PLE rows of `tokens` following `history`, over every PLE layer.
+    fn ple_row_keys_after(&self, history: &[u32], tokens: &[u32]) -> Result<Vec<(String, usize)>> {
         let mut keys = Vec::new();
-        let c = self.config.clone();
-        for &layer in &c.ple_layer_ids {
+        for &layer in &self.config.ple_layer_ids {
             let Some(i) = layer.checked_sub(1) else {
                 continue;
             };
-            let ids = self.ple_hash_ids(i, tokens)?;
+            let ids = self.ple_hash_ids_after(i, history, tokens)?;
             keys.extend(self.ple_row_keys(i, &ids)?);
         }
+        Ok(keys)
+    }
+
+    /// A prefill window starts: request this window's rows, then, queued
+    /// behind them, the rows of the window after it, so the reader threads
+    /// fetch those while this window's layers run instead of the model
+    /// thread reading them one `pread` at a time at the next window's start
+    /// (1,024 embedding rows and up to 16k PLE rows per window). Two
+    /// requests, not one sorted batch: the rows this window needs now must
+    /// not queue behind rows needed a second later. A window given its
+    /// embeddings (media) has no embedding rows to read.
+    fn prefetch_window_rows(&mut self, tokens: &[u32], next: &[u32], embed: bool) -> Result<()> {
+        let embedding = self.key("embed_tokens.weight", "token_embd.weight");
+        let mut keys = Vec::new();
+        if embed {
+            keys.extend(tokens.iter().map(|&t| (embedding.clone(), t as usize)));
+        }
+        let history = self.history.clone();
+        keys.extend(self.ple_row_keys_after(&history, tokens)?);
+        self.weights.prefetch_rows(&keys)?;
+        if next.is_empty() {
+            return Ok(());
+        }
+        let mut keys = Vec::new();
+        if embed {
+            keys.extend(next.iter().map(|&t| (embedding.clone(), t as usize)));
+        }
+        let mut through = history;
+        through.extend_from_slice(tokens);
+        keys.extend(self.ple_row_keys_after(&through, next)?);
         self.weights.prefetch_rows(&keys)
     }
 
@@ -2089,9 +2129,22 @@ impl Decoder {
     /// Traverse a bounded prompt chunk layer by layer, sharing weight reads
     /// and projections across its tokens. Verification retains singleton
     /// arithmetic and captures state at every accepted frontier.
+    #[cfg(test)]
     pub fn prefill_chunk(
         &mut self,
         tokens: &[u32],
+        embeddings: Option<&MxArray>,
+        project_logits: bool,
+    ) -> Result<MxArray> {
+        self.prefill_chunk_ahead(tokens, &[], embeddings, project_logits)
+    }
+
+    /// `prefill_chunk` whose caller knows the window after this one:
+    /// `next`'s rows are requested while this window runs.
+    pub fn prefill_chunk_ahead(
+        &mut self,
+        tokens: &[u32],
+        next: &[u32],
         embeddings: Option<&MxArray>,
         project_logits: bool,
     ) -> Result<MxArray> {
@@ -2100,7 +2153,7 @@ impl Decoder {
         }
         self.rotary_tables.get_mut().clear();
         let started = std::time::Instant::now();
-        let result = self.prefill_with_device_routes(tokens, embeddings, project_logits);
+        let result = self.prefill_with_device_routes(tokens, next, embeddings, project_logits);
         self.rotary_tables.get_mut().clear();
         if result.is_err() {
             self.reset();
@@ -2123,7 +2176,7 @@ impl Decoder {
             if cfg!(target_os = "macos") {
                 self.weights.check_forward_headroom()?;
             }
-            self.prefill_chunk_inner(tokens, None, false)?;
+            self.prefill_chunk_inner(tokens, &[], None, false)?;
             // The pass stays open through the head: these rows are row-exact
             // too, and `linear_rows` is batched outside a verification pass.
             let window =
@@ -2190,10 +2243,13 @@ impl Decoder {
     fn prefill_chunk_inner(
         &mut self,
         tokens: &[u32],
+        next: &[u32],
         embeddings: Option<&MxArray>,
         project_logits: bool,
     ) -> Result<MxArray> {
         let base = self.history.len();
+        let started = std::time::Instant::now();
+        let rows = (self.weights.lookup.prefetched(), self.weights.lookup.late());
         let submit_span = self.decode_submit_span();
         let async_window = tokens.len() > 8 && self.async_device_prefill();
         let defer_final = self.deferred_forward_completion();
@@ -2220,7 +2276,7 @@ impl Decoder {
             }
             adapter.record_tokens(tokens).map_err(Error::from_reason)?;
         }
-        self.prefetch_ple_rows(tokens)?;
+        self.prefetch_window_rows(tokens, next, embeddings.is_none())?;
         let batched = self.batch_prefill && tokens.len() > 1 && self.verification.is_none();
         let carry = batched && self.window_carry;
         let mut hidden = Vec::with_capacity(if carry { 0 } else { tokens.len() });
@@ -2419,6 +2475,13 @@ impl Decoder {
         if !defer_final {
             MxArray::eval_arrays_with_context(&[&logits], "qwen4::decoder::logits")?;
         }
+        tracing::debug!(
+            "qwen4 prefill window: {} tokens at {base} in {:.1?}, rows prefetched +{} late +{}",
+            tokens.len(),
+            started.elapsed(),
+            self.weights.lookup.prefetched() - rows.0,
+            self.weights.lookup.late() - rows.1
+        );
 
         self.history.extend_from_slice(tokens);
         Ok(logits)

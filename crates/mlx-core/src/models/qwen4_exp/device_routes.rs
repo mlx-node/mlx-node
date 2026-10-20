@@ -61,6 +61,7 @@ impl Decoder {
     pub(super) fn prefill_with_device_routes(
         &mut self,
         tokens: &[u32],
+        next: &[u32],
         embeddings: Option<&MxArray>,
         project: bool,
     ) -> Result<MxArray> {
@@ -81,12 +82,12 @@ impl Decoder {
                 .weights
                 .prefill_device_slots_ready(self.config.num_hidden_layers)
         {
-            return self.prefill_chunk_inner(tokens, embeddings, project);
+            return self.prefill_chunk_inner(tokens, next, embeddings, project);
         }
         self.weights.complete_device_readers()?;
         let base = self.snapshot();
         self.device_routes = Some(Vec::with_capacity(self.config.num_hidden_layers));
-        let tentative = self.prefill_chunk_inner(tokens, embeddings, project);
+        let tentative = self.prefill_chunk_inner(tokens, next, embeddings, project);
         let routes = self.device_routes.take();
         let output = tentative?;
         let routes = routes
@@ -138,7 +139,8 @@ impl Decoder {
                 .map_err(Error::from_reason)?;
         }
         self.restore_state(base);
-        self.prefill_chunk_inner(tokens, embeddings, project)
+        // The tentative pass already requested the next window's rows.
+        self.prefill_chunk_inner(tokens, &[], embeddings, project)
     }
 
     pub(super) fn decode_submit_span(&self) -> usize {
@@ -279,7 +281,7 @@ impl Decoder {
 
     fn ordinary_token(&mut self, token: u32, project: bool) -> Result<MxArray> {
         if self.paged.is_some() {
-            self.prefill_chunk_inner(&[token], None, project)
+            self.prefill_chunk_inner(&[token], &[], None, project)
         } else {
             self.forward_token_inner(token, project)
         }

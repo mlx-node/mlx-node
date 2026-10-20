@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 /// 0.4-0.6 tokens/s until something breaks the cycle. One eval reading one
 /// element of every mapped bank gives them all the same last use first.
 const MAPPED_WIRE_GAP: Duration = Duration::from_millis(900);
+/// Under the driver's ~1.15 s unwire timer and the 900 ms gap above.
+const KEEP_WIRED_EVERY: Duration = Duration::from_millis(700);
 
 /// One layer's routed experts addressed in place: the pack's sections as
 /// no-copy banks, slot id == expert id, so nothing is ever copied, missed
@@ -246,9 +248,14 @@ impl Store {
         let files = (0..=layers.last().copied().unwrap_or(0))
             .map(|layer| mapped.get(&layer).map(|experts| experts.maps.clone()))
             .collect();
-        match super::super::prefetch::Pool::new(files, super::super::prefetch::Advise) {
+        match super::super::prefetch::Pool::new(
+            files,
+            super::super::prefetch::Pread,
+            super::super::prefetch::WORKERS,
+            Arc::clone(&self.rows_pending),
+        ) {
             Ok(pool) => self.prefetch = Some(pool),
-            Err(e) => tracing::warn!("qwen4 mapped pack read-ahead unavailable: {e}"),
+            Err(e) => tracing::warn!("qwen4 mapped pack stream unavailable: {e}"),
         }
         self.cache_limit = self.plan.budget;
         self.draft_bank_budget = draft_bank;
@@ -274,6 +281,38 @@ impl Store {
         self.live.store(&self.plan);
     }
 
+    /// The load picked the mapped plan and read the dense banks: stream the
+    /// pack into the page cache, so a request that arrives after the stream
+    /// finds it resident. Nothing is wired by it and the live-memory gate's
+    /// inputs do not move (file pages are reclaimable).
+    pub(in super::super) fn start_pack_stream(&self) {
+        if self.plan.mapped
+            && let Some(pool) = &self.prefetch
+            && !pool.sampled_resident()
+        {
+            pool.start();
+        }
+    }
+
+    /// A turn opens over the mapped pack: a pack that is not fully resident
+    /// gets a stream unless one runs already, and the turn's first pass
+    /// streams instead of touching every bank.
+    fn stream_for_turn(&mut self) {
+        self.streaming_pass = false;
+        if !self.plan.mapped {
+            return;
+        }
+        let Some(pool) = &self.prefetch else {
+            return;
+        };
+        if pool.streaming() {
+            self.streaming_pass = true;
+        } else if !pool.sampled_resident() {
+            pool.start();
+            self.streaming_pass = true;
+        }
+    }
+
     /// The first turn of a measurement window opens: a trip whose switch
     /// failed at its pass moves the process to the slot path first, then the
     /// window's SSD count and slow streak begin. Returns the fallback applied.
@@ -293,7 +332,10 @@ impl Store {
                 self.leave_mapped(&why)?;
                 Ok(Some(why))
             }
-            _ => Ok(None),
+            _ => {
+                self.stream_for_turn();
+                Ok(None)
+            }
         }
     }
 
@@ -380,7 +422,8 @@ impl Store {
         self.prefetch = None;
         self.mapped_experts.clear();
         self.draft_bank_budget = 0;
-        self.prefetch_pass = false;
+        self.streaming_pass = false;
+        self.last_touch = None;
         self.mapped_pass_start = None;
         self.slot_capacity = None;
         crate::array::memory::synchronize();
@@ -411,20 +454,14 @@ impl Store {
     /// experts); such a pass must leave the stamp alone, or a run of drafts
     /// hides the gap the next main pass has to re-wire for.
     pub(in super::super) fn wire_mapped_banks(&mut self, main: bool) -> Result<()> {
-        self.wire_mapped_banks_at(Instant::now(), main, super::super::prefetch::DEPTH)
-            .map(|_| ())
+        self.wire_mapped_banks_at(Instant::now(), main).map(|_| ())
     }
 
-    /// Returns whether the banks were touched. A stale pass over a pack that
-    /// is not fully resident reads `depth` layers ahead instead: the touch
-    /// binds every bank at once, so the driver would fault the whole pack in
-    /// on the model thread at its own rate before layer 0 runs.
-    pub(super) fn wire_mapped_banks_at(
-        &mut self,
-        now: Instant,
-        main: bool,
-        depth: usize,
-    ) -> Result<bool> {
+    /// Returns whether the banks were touched. A stale pass while the pack
+    /// streams does not touch: the touch binds every bank at once, so the
+    /// driver would fault the whole pack in on the model thread at its own
+    /// rate before layer 0 runs; the stream is ahead of the layers instead.
+    pub(super) fn wire_mapped_banks_at(&mut self, now: Instant, main: bool) -> Result<bool> {
         if !self.plan.mapped || !main {
             return Ok(false);
         }
@@ -435,19 +472,83 @@ impl Store {
         if !stale {
             return Ok(false);
         }
-        self.prefetch_pass = false;
-        if depth > 0
-            && let Some(pool) = self.prefetch.as_mut()
-            && !pool.sampled_resident()
+        if self.streaming_pass {
+            if self.prefetch.as_ref().is_some_and(|pool| pool.streaming()) {
+                self.last_touch = Some(now);
+                return Ok(false);
+            }
+            self.streaming_pass = false;
+        }
+        let elapsed = self.touch_banks(usize::MAX)?;
+        if elapsed > Duration::from_millis(50) {
+            tracing::debug!("qwen4 mapped banks wired in {elapsed:.1?}");
+        }
+        self.mapped_pass_start = Some(now + elapsed);
+        Ok(true)
+    }
+
+    /// Layer `layer` of a pass starts. While the pack streams, the banks of
+    /// the layers already run are touched every `KEEP_WIRED_EVERY` so the
+    /// driver keeps them wired through the long first window: it unwires a
+    /// bank idle for ~1.15 s, and re-wiring all of them at the next window
+    /// cost about a second with the GPU idle. Layers past `layer` are not
+    /// touched: their pages may still be cold.
+    pub(in super::super) fn keep_wired(&mut self, layer: usize, main: bool) -> Result<()> {
+        self.keep_wired_at(Instant::now(), layer, main)
+    }
+
+    pub(super) fn keep_wired_at(&mut self, now: Instant, layer: usize, main: bool) -> Result<()> {
+        if !main || !self.streaming_pass {
+            return Ok(());
+        }
+        if self
+            .last_touch
+            .is_some_and(|last| now.saturating_duration_since(last) < KEEP_WIRED_EVERY)
         {
-            tracing::info!("qwen4 mapped pack not resident: reading {depth} layers ahead");
-            self.prefetch_depth = depth;
-            pool.layer_started(0, depth);
-            self.prefetch_pass = depth < self.last_mapped_layer();
-            return Ok(false);
+            return Ok(());
+        }
+        self.last_touch = Some(now);
+        let elapsed = self.touch_banks(layer)?;
+        tracing::debug!("qwen4 mapped banks through layer {layer} kept wired in {elapsed:.1?}");
+        if !self.prefetch.as_ref().is_some_and(|pool| pool.streaming()) {
+            self.streaming_pass = false;
+        }
+        Ok(())
+    }
+
+    /// The mapped store's stream over the same files through `issue`.
+    #[cfg(test)]
+    pub(super) fn pool_with(&mut self, issue: impl super::super::prefetch::Issue) {
+        let last = self.mapped_experts.keys().max().copied().unwrap_or(0);
+        let files = (0..=last)
+            .map(|layer| self.mapped_experts.get(&layer).map(|e| e.maps.clone()))
+            .collect();
+        self.prefetch = Some(
+            super::super::prefetch::Pool::new(files, issue, 2, Arc::clone(&self.rows_pending))
+                .unwrap(),
+        );
+    }
+
+    /// One eval reading one element of every bank of the layers up to
+    /// `through`, which binds them in a single command buffer.
+    fn touch_banks(&mut self, through: usize) -> Result<Duration> {
+        #[cfg(test)]
+        {
+            let mut layers: Vec<usize> = self
+                .mapped_experts
+                .keys()
+                .copied()
+                .filter(|&layer| layer <= through)
+                .collect();
+            layers.sort_unstable();
+            self.touches.push(layers);
         }
         let mut groups: Vec<(DType, Vec<MxArray>)> = Vec::new();
-        for mapped in self.mapped_experts.values() {
+        for (_, mapped) in self
+            .mapped_experts
+            .iter()
+            .filter(|(layer, _)| **layer <= through)
+        {
             for bank in &mapped.banks {
                 for array in [
                     Some(&bank.values),
@@ -475,33 +576,7 @@ impl Store {
             &touched.iter().collect::<Vec<_>>(),
             "qwen4::mapped::wire",
         )?;
-        let elapsed = started.elapsed();
-        if elapsed > Duration::from_millis(50) {
-            tracing::debug!("qwen4 mapped banks wired in {elapsed:.1?}");
-        }
-        self.mapped_pass_start = Some(now + elapsed);
-        Ok(true)
-    }
-
-    /// Layer `layer` of a pass starts: in a read-ahead pass, request the
-    /// layer `depth` ahead of it. The pass ends with the request for the last
-    /// layer, not at the next layer-0 call: a pass over several rows reaches
-    /// layer 0 once per row.
-    pub(in super::super) fn prefetch_mapped_layer(&mut self, layer: usize, main: bool) {
-        if main
-            && self.prefetch_pass
-            && layer > 0
-            && let Some(pool) = self.prefetch.as_mut()
-        {
-            pool.layer_started(layer, self.prefetch_depth);
-            if layer.saturating_add(self.prefetch_depth) >= self.last_mapped_layer() {
-                self.prefetch_pass = false;
-            }
-        }
-    }
-
-    fn last_mapped_layer(&self) -> usize {
-        self.mapped_experts.keys().max().copied().unwrap_or(0)
+        Ok(started.elapsed())
     }
 
     pub(in super::super) fn expert_slot_capacity(

@@ -188,8 +188,10 @@ impl PagedBackend for Inner {
         // the window for the passes after it.
         let mut start = 0;
         while start < tokens.len() {
-            let end = (start + self.decoder.prefill_slice_size()).min(tokens.len());
+            let window = self.decoder.prefill_slice_size();
+            let end = (start + window).min(tokens.len());
             let chunk = &tokens[start..end];
+            let next = &tokens[end..(end + window).min(tokens.len())];
             let base = self.decoder.history.len();
             let embeddings = if let Some(media) = &self.media_prefill {
                 self.decoder.positions = media.positions.clone();
@@ -203,8 +205,9 @@ impl PagedBackend for Inner {
             } else {
                 None
             };
-            logits = Some(self.decoder.prefill_chunk(
+            logits = Some(self.decoder.prefill_chunk_ahead(
                 chunk,
+                next,
                 embeddings.as_ref(),
                 end == tokens.len(),
             )?);

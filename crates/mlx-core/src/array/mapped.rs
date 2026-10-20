@@ -118,6 +118,12 @@ impl Mmap {
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.file.as_fd()
     }
+
+    /// The descriptor the mapping was made from: reads through it fill the
+    /// page cache the mapping shares without touching the mapping.
+    pub fn file(&self) -> &File {
+        &self.file
+    }
 }
 
 impl Drop for Mmap {

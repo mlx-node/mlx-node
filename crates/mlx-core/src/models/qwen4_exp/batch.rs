@@ -728,7 +728,7 @@ impl Decoder {
         if i == 0 {
             self.weights.wire_mapped_banks(main)?;
         } else {
-            self.weights.prefetch_mapped_layer(i, main);
+            self.weights.keep_wired(i, main)?;
         }
         let c = self.config.clone();
         let tokens = x.shape()?[1] as usize;

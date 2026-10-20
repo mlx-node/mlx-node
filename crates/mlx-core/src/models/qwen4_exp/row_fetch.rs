@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
@@ -38,6 +38,10 @@ struct State {
 pub(super) struct Fetcher {
     shared: Arc<(Mutex<State>, Condvar)>,
     stop: Arc<AtomicBool>,
+    /// Rows queued, being read by a worker, or being read by the taker:
+    /// the reads the SSD still owes the model. Shared with the mapped
+    /// pack's stream, which yields while it is above zero.
+    pending: Arc<AtomicUsize>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -48,8 +52,8 @@ fn read(job: &Job) -> std::io::Result<Vec<u8>> {
 }
 
 impl Fetcher {
-    pub(super) fn new(workers: usize) -> std::io::Result<Self> {
-        Self::start(workers, |builder, body| builder.spawn(body))
+    pub(super) fn new(workers: usize, pending: Arc<AtomicUsize>) -> std::io::Result<Self> {
+        Self::start(workers, pending, |builder, body| builder.spawn(body))
     }
 
     /// `Self` exists before the first spawn: a failed spawn drops it and
@@ -58,6 +62,7 @@ impl Fetcher {
     /// `stop` false for the life of the process.
     fn start(
         workers: usize,
+        pending: Arc<AtomicUsize>,
         mut spawn: impl FnMut(
             std::thread::Builder,
             Box<dyn FnOnce() + Send>,
@@ -74,14 +79,16 @@ impl Fetcher {
                 Condvar::new(),
             )),
             stop: Arc::new(AtomicBool::new(false)),
+            pending,
             workers: Vec::with_capacity(workers),
         };
         for _ in 0..workers {
             let shared = fetcher.shared.clone();
             let stop = fetcher.stop.clone();
+            let pending = fetcher.pending.clone();
             let handle = spawn(
                 std::thread::Builder::new().name("mlx-qwen4-rows".into()),
-                Box::new(move || run(&shared, &stop)),
+                Box::new(move || run(&shared, &stop, &pending)),
             )?;
             fetcher.workers.push(handle);
         }
@@ -94,10 +101,12 @@ impl Fetcher {
         let (lock, ready) = &*self.shared;
         let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
         if state.queue.len() + state.done.len() > PENDING_LIMIT {
+            self.pending.fetch_sub(state.queue.len(), Ordering::AcqRel);
             state.queue.clear();
             state.queued.clear();
             state.done.clear();
         }
+        let mut added = 0;
         for job in jobs {
             if state.running.contains(&job.key)
                 || state.done.contains_key(&job.key)
@@ -106,7 +115,9 @@ impl Fetcher {
                 continue;
             }
             state.queue.push_back(job);
+            added += 1;
         }
+        self.pending.fetch_add(added, Ordering::AcqRel);
         ready.notify_all();
     }
 
@@ -124,7 +135,9 @@ impl Fetcher {
             let job = state.queue.remove(position)?;
             state.queued.remove(key);
             drop(state);
-            return Some((read(&job), true));
+            let bytes = read(&job);
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+            return Some((bytes, true));
         }
         if !state.running.contains(key) {
             return None;
@@ -148,17 +161,35 @@ impl Fetcher {
     }
 }
 
-impl Drop for Fetcher {
-    fn drop(&mut self) {
+impl Fetcher {
+    /// Stop the reader threads and keep every queued and ready row: a row
+    /// requested after this is read on the model thread, late.
+    #[cfg(test)]
+    pub(super) fn pause(&mut self) {
+        self.stop_workers();
+    }
+
+    /// Under the state lock: a worker between its `stop` check and its wait
+    /// holds that lock, so a store and notify outside it could fall between
+    /// the two and the join would wait forever.
+    fn stop_workers(&mut self) {
+        let state = self.shared.0.lock().unwrap_or_else(PoisonError::into_inner);
         self.stop.store(true, Ordering::Release);
         self.shared.1.notify_all();
+        drop(state);
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
     }
 }
 
-fn run(shared: &(Mutex<State>, Condvar), stop: &AtomicBool) {
+impl Drop for Fetcher {
+    fn drop(&mut self) {
+        self.stop_workers();
+    }
+}
+
+fn run(shared: &(Mutex<State>, Condvar), stop: &AtomicBool, pending: &AtomicUsize) {
     let (lock, ready) = shared;
     loop {
         let job = {
@@ -179,6 +210,7 @@ fn run(shared: &(Mutex<State>, Condvar), stop: &AtomicBool) {
         let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
         state.running.remove(&job.key);
         state.done.insert(job.key, bytes);
+        pending.fetch_sub(1, Ordering::AcqRel);
         ready.notify_all();
     }
 }
@@ -225,7 +257,7 @@ mod tests {
         let dir = Temp::new();
         let (file, bytes) = table(&dir);
         // Readers: every row ends up ready or awaited, never re-read wrongly.
-        let fetcher = Fetcher::new(2).unwrap();
+        let fetcher = Fetcher::new(2, Arc::default()).unwrap();
         fetcher.request((0..17).map(|row| job(&file, row)).collect());
         for row in 0..17 {
             let (got, _) = fetcher.take(&("table".into(), row)).unwrap();
@@ -237,7 +269,7 @@ mod tests {
             "never requested"
         );
         // No readers: the taker finds its row queued and reads it itself.
-        let alone = Fetcher::new(0).unwrap();
+        let alone = Fetcher::new(0, Arc::default()).unwrap();
         alone.request(vec![job(&file, 5), job(&file, 40)]);
         let (got, late) = alone.take(&("table".into(), 40)).unwrap();
         assert!(late);
@@ -255,6 +287,45 @@ mod tests {
         assert!(alone.take(&("table".into(), 99)).unwrap().0.is_err());
     }
 
+    /// `pending` is what the SSD still owes the model: a queued row, a row a
+    /// worker reads, a row the taker reads itself; a ready row is not owed.
+    #[test]
+    fn pending_counts_the_rows_queued_running_or_read_by_the_taker() {
+        let temp = Temp::new();
+        let (file, _) = table(&temp);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let alone = Fetcher::new(0, Arc::clone(&pending)).unwrap();
+        alone.request((0..3).map(|row| job(&file, row)).collect());
+        assert_eq!(pending.load(Ordering::Acquire), 3);
+        alone.request(vec![job(&file, 1)]);
+        assert_eq!(
+            pending.load(Ordering::Acquire),
+            3,
+            "a queued key is counted once"
+        );
+        let (_, late) = alone.take(&("table".into(), 1)).unwrap();
+        assert!(late);
+        assert_eq!(
+            pending.load(Ordering::Acquire),
+            2,
+            "the taker's own read is paid"
+        );
+        drop(alone);
+        let fetcher = Fetcher::new(2, Arc::clone(&pending)).unwrap();
+        fetcher.request((0..40).map(|row| job(&file, row)).collect());
+        fetcher.wait_idle();
+        assert_eq!(
+            pending.load(Ordering::Acquire),
+            2,
+            "ready rows are not owed"
+        );
+        for row in 0..40 {
+            let (_, late) = fetcher.take(&("table".into(), row)).unwrap();
+            assert!(!late);
+        }
+        assert_eq!(pending.load(Ordering::Acquire), 2);
+    }
+
     #[test]
     fn a_key_already_pending_is_requested_once() {
         let dir = Temp::new();
@@ -262,7 +333,7 @@ mod tests {
         let key: Key = ("table".into(), 9);
         // Ready in `done`: the second request is skipped, so the one take
         // drains the key and no second completion appears afterwards.
-        let fetcher = Fetcher::new(2).unwrap();
+        let fetcher = Fetcher::new(2, Arc::default()).unwrap();
         fetcher.request(vec![job(&file, 9)]);
         fetcher.wait_idle();
         fetcher.request(vec![job(&file, 9)]);
@@ -276,7 +347,7 @@ mod tests {
         );
         // Still queued (no readers): the key repeated inside one batch and in
         // a later batch is one queued job, read once by the taker.
-        let alone = Fetcher::new(0).unwrap();
+        let alone = Fetcher::new(0, Arc::default()).unwrap();
         alone.request(vec![job(&file, 9), job(&file, 9)]);
         alone.request(vec![job(&file, 9)]);
         let (got, late) = alone.take(&key).unwrap();
@@ -292,7 +363,7 @@ mod tests {
     fn a_failed_spawn_stops_and_joins_the_workers_already_started() {
         let exited = Arc::new(AtomicUsize::new(0));
         let mut spawned = 0;
-        let result = Fetcher::start(4, |builder, body| {
+        let result = Fetcher::start(4, Arc::default(), |builder, body| {
             if spawned == 2 {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }

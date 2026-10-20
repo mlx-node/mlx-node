@@ -4611,19 +4611,29 @@ fn gather_window_runtime_shapes_match_selected() {
 
 #[test]
 fn convolution_history_releases_wide_prefill_storage() {
-    // Run serialized with the GPU suite. Check live allocation ownership,
-    // not allocator cache size; a view would retain > 2 MiB here.
-    crate::array::memory::synchronize();
-    let before = crate::array::memory::get_active_memory();
+    // Live allocation ownership, not allocator cache size: a view would
+    // retain the 2 MiB input on every attempt. The counter is process-wide
+    // and the other tests of this binary allocate concurrently, so the
+    // smallest delta over a few attempts is the one that belongs to the
+    // convolution.
+    let mut retained = f64::MAX;
     let mut history = None;
-    {
-        let x = MxArray::ones(&[1, 512, 1024], Some(crate::array::DType::Float32)).unwrap();
-        let weights = MxArray::ones(&[1024, 4], Some(crate::array::DType::Float32)).unwrap();
-        let output = math::conv_sequence(&x, &weights, &mut history, 4).unwrap();
-        MxArray::eval_arrays(&[&output]).unwrap();
+    for _ in 0..8 {
+        history = None;
+        crate::array::memory::synchronize();
+        let before = crate::array::memory::get_active_memory();
+        {
+            let x = MxArray::ones(&[1, 512, 1024], Some(crate::array::DType::Float32)).unwrap();
+            let weights = MxArray::ones(&[1024, 4], Some(crate::array::DType::Float32)).unwrap();
+            let output = math::conv_sequence(&x, &weights, &mut history, 4).unwrap();
+            MxArray::eval_arrays(&[&output]).unwrap();
+        }
+        crate::array::memory::synchronize();
+        retained = retained.min(crate::array::memory::get_active_memory() - before);
+        if retained < 256. * 1024. {
+            break;
+        }
     }
-    crate::array::memory::synchronize();
-    let retained = crate::array::memory::get_active_memory() - before;
     assert!(
         retained < 256. * 1024.,
         "convolution history retained {retained} bytes"
@@ -5816,6 +5826,71 @@ fn ple_window_history_stays_lazy_and_matches_the_singleton_convolution() {
             );
         }
     }
+}
+
+/// A prefill window hands the reader threads the embedding and PLE rows of
+/// the window after it: with the readers stopped once window 1's requests
+/// are done, window 2 imports every one of its rows ready (none read on the
+/// model thread), with logits identical to the decoder that reads every row
+/// itself.
+/// MUTATION (M-P5-rows-this-window): `prefetch_window_rows` requests the
+/// current window's rows in place of `next`'s -> window 2 requests its rows
+/// with no reader left to fetch them, reads them late, and "window 2 found
+/// every row ready" fails.
+#[test]
+fn the_next_windows_rows_are_requested_while_this_window_runs() {
+    let path = fixture().join("bf16/model.gguf");
+    let open = |readers: bool| {
+        let mut store = weights::Store::open_fixture(&path, None).unwrap();
+        store.row_readers = readers;
+        let config = gguf::config(&store).unwrap();
+        decoder::Decoder::new(config, store).unwrap()
+    };
+    let tokens: Vec<u32> = (0..48)
+        .map(|i| ((i * 13 + i / 4) % 61 + 2) as u32)
+        .collect();
+    let (first, second) = tokens.split_at(24);
+    let (mut direct, mut fetched) = (open(false), open(true));
+    let want = direct
+        .prefill_chunk(first, None, true)
+        .unwrap()
+        .to_float32()
+        .unwrap();
+    let got = fetched
+        .prefill_chunk_ahead(first, second, None, true)
+        .unwrap()
+        .to_float32()
+        .unwrap();
+    assert_eq!(&*got, &*want, "window 1");
+    fetched.weights.pause_rows();
+    let stats = std::sync::Arc::clone(&fetched.weights.lookup);
+    let (prefetched, late, misses) = (stats.prefetched(), stats.late(), stats.misses());
+    let want = direct
+        .prefill_chunk(second, None, true)
+        .unwrap()
+        .to_float32()
+        .unwrap();
+    let got = fetched
+        .prefill_chunk(second, None, true)
+        .unwrap()
+        .to_float32()
+        .unwrap();
+    assert_eq!(&*got, &*want, "window 2");
+    assert_eq!(stats.late(), late, "window 2 found every row ready");
+    let imported = stats.misses() - misses;
+    assert!(imported > 0, "window 2 imported rows");
+    assert_eq!(
+        stats.prefetched() - prefetched,
+        imported,
+        "every row window 2 imported came from the request made during window 1"
+    );
+    assert_eq!(
+        (
+            direct.weights.lookup.prefetched(),
+            direct.weights.lookup.late()
+        ),
+        (0, 0)
+    );
 }
 
 /// PLE rows requested of the reader threads at the token start against the

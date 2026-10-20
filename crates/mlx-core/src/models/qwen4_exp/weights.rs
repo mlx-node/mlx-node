@@ -8,7 +8,7 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use napi::{Error, Result};
 use serde::Deserialize;
@@ -448,10 +448,13 @@ pub struct Store {
     /// Start of the last forward pass in mapped mode (bank re-wire gate).
     mapped_pass_start: Option<std::time::Instant>,
     prefetch: Option<super::prefetch::Pool>,
-    /// The current pass started stale over a pack that was not fully
-    /// resident and reads `prefetch_depth` layers ahead.
-    prefetch_pass: bool,
-    prefetch_depth: usize,
+    /// The turn opened while the pack streams: its passes do not touch, and
+    /// the layers already run are kept wired instead.
+    streaming_pass: bool,
+    last_touch: Option<std::time::Instant>,
+    /// Layers covered by every bank touch, in order.
+    #[cfg(test)]
+    pub(in super::super) touches: Vec<Vec<usize>>,
     wide_routes: HashMap<usize, Vec<u32>>,
     deferred_reduction_layer: Option<usize>,
     slot_capacity: Option<usize>,
@@ -469,6 +472,9 @@ pub struct Store {
     /// One open descriptor per checkpoint file; row reads `pread` through it.
     files: HashMap<PathBuf, Arc<File>>,
     rows: Option<Fetcher>,
+    /// Rows the reader threads or the model thread still have to read;
+    /// the mapped pack's stream yields while it is above zero.
+    rows_pending: Arc<AtomicUsize>,
     #[cfg(test)]
     pub(in super::super) row_readers: bool,
     /// Rows a `linear_rows` window projected one at a time (no row-batched
@@ -584,8 +590,10 @@ impl Store {
             mapped_experts: HashMap::new(),
             mapped_pass_start: None,
             prefetch: None,
-            prefetch_pass: false,
-            prefetch_depth: 0,
+            streaming_pass: false,
+            last_touch: None,
+            #[cfg(test)]
+            touches: Vec::new(),
             wide_routes: HashMap::new(),
             deferred_reduction_layer: None,
             slot_capacity: None,
@@ -602,6 +610,7 @@ impl Store {
             mapped: None,
             files: HashMap::new(),
             rows: None,
+            rows_pending: Arc::default(),
             #[cfg(test)]
             row_readers: true,
             #[cfg(test)]
@@ -1249,13 +1258,27 @@ impl Store {
         if jobs.is_empty() {
             return Ok(());
         }
+        // One ascending sweep per table instead of a random walk of the
+        // checkpoint: the rows of a window are read in file order.
+        jobs.sort_by_key(|job| (Arc::as_ptr(&job.file) as usize, job.offset));
         if self.rows.is_none() {
-            self.rows = Some(Fetcher::new(ROW_READERS).map_err(err)?);
+            self.rows =
+                Some(Fetcher::new(ROW_READERS, Arc::clone(&self.rows_pending)).map_err(err)?);
         }
         if let Some(fetcher) = &self.rows {
             fetcher.request(jobs);
         }
         Ok(())
+    }
+
+    /// Finish the reads in flight, then stop the reader threads: the rows
+    /// they fetched stay ready, a row requested later is read late.
+    #[cfg(test)]
+    pub(in super::super) fn pause_rows(&mut self) {
+        if let Some(fetcher) = &mut self.rows {
+            fetcher.wait_idle();
+            fetcher.pause();
+        }
     }
 
     fn file(&mut self, path: &Path) -> Result<Arc<File>> {
@@ -2799,7 +2822,9 @@ mod cache_tests {
 mod mapped_tests {
     use super::*;
     use crate::models::qwen4_exp::memory;
-    use std::time::Duration;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Condvar, Mutex};
+    use std::time::{Duration, Instant};
 
     struct Temp(PathBuf);
     impl Temp {
@@ -2827,27 +2852,34 @@ mod mapped_tests {
     /// Three routed expert tensors of one layer: Q4_K gate/up and Q5_1 down,
     /// filled with deterministic pseudo-random block bytes.
     fn write_fixture(path: &Path) {
+        write_fixture_layers(path, 1)
+    }
+
+    /// The same three tensors for layers `0..layers`.
+    fn write_fixture_layers(path: &Path, layers: usize) {
         let string = |bytes: &mut Vec<u8>, value: &str| {
             bytes.extend((value.len() as u64).to_le_bytes());
             bytes.extend(value.bytes());
         };
         let mut b = b"GGUF".to_vec();
         b.extend(3u32.to_le_bytes());
-        b.extend((PARTS.len() as u64).to_le_bytes());
+        b.extend(((PARTS.len() * layers) as u64).to_le_bytes());
         b.extend(1u64.to_le_bytes());
         string(&mut b, "general.architecture");
         b.extend(8u32.to_le_bytes());
         string(&mut b, "qwen4exp");
         let mut offset = 0u64;
-        for (name, rows, width, ty, row_bytes) in PARTS {
-            string(&mut b, name);
-            b.extend(3u32.to_le_bytes());
-            for d in [width as u64, rows as u64, EXPERTS as u64] {
-                b.extend(d.to_le_bytes());
+        for layer in 0..layers {
+            for (name, rows, width, ty, row_bytes) in PARTS {
+                string(&mut b, &name.replace("blk.0.", &format!("blk.{layer}.")));
+                b.extend(3u32.to_le_bytes());
+                for d in [width as u64, rows as u64, EXPERTS as u64] {
+                    b.extend(d.to_le_bytes());
+                }
+                b.extend(ty.to_le_bytes());
+                b.extend(offset.to_le_bytes());
+                offset += (EXPERTS * rows * row_bytes) as u64;
             }
-            b.extend(ty.to_le_bytes());
-            b.extend(offset.to_le_bytes());
-            offset += (EXPERTS * rows * row_bytes) as u64;
         }
         while !b.len().is_multiple_of(32) {
             b.push(0);
@@ -2965,101 +2997,175 @@ mod mapped_tests {
         );
     }
 
-    /// A stale pass (the first one, or one after a gap longer than the
-    /// driver's unwire delay) touches the banks when the pack is resident
-    /// and reads ahead instead when it is not; a pass inside the gap, a pass
-    /// that reads no mapped bank (which also leaves the stamp alone) and
-    /// slot mode do neither. With read-ahead off (depth 0) a stale pass
-    /// touches even a cold pack.
+    /// Runs the calling test in a child process. The wired limit is
+    /// process-wide: while a sibling test's scheduled turn holds one, the
+    /// driver wires this test's mmap-backed banks and the freshly built pack
+    /// is never cold. Returns `true` inside the child, `false` in the parent
+    /// after the child passed.
+    fn in_child(name: &str) -> bool {
+        const CHILD: &str = "MLX_QWEN4_STREAM_CHILD";
+        if std::env::var_os(CHILD).is_some_and(|v| v == name) {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name])
+            .env(CHILD, name)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    /// A stream issue that holds every fetch until released, then reads the
+    /// file as the real one does: the stream stays "running" for as long as
+    /// a test needs.
+    #[derive(Default)]
+    struct Gate {
+        released: Mutex<bool>,
+        ready: Condvar,
+        started: AtomicUsize,
+    }
+    impl Gate {
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.ready.notify_all();
+        }
+    }
+    impl super::super::prefetch::Issue for Arc<Gate> {
+        fn fetch(&self, map: &crate::array::Mmap, stop: &AtomicBool, rows: &AtomicUsize) {
+            self.started.fetch_add(1, Ordering::AcqRel);
+            let mut released = self.released.lock().unwrap();
+            // Polled: a pool dropped by a failing test stops the worker
+            // without a release, and nothing signals `ready` then.
+            while !*released && !stop.load(Ordering::Acquire) {
+                released = self
+                    .ready
+                    .wait_timeout(released, Duration::from_millis(10))
+                    .unwrap()
+                    .0;
+            }
+            drop(released);
+            super::super::prefetch::Pread.fetch(map, stop, rows);
+        }
+    }
+
+    fn mapped_store(temp: &Temp, gguf: &Path, dir: &str) -> Store {
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(gguf, Some(&root)).unwrap();
+        store.prepare_mapped_pack_at(&temp.0.join(dir)).unwrap();
+        store
+            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
+                plan.budget = 1 << 30;
+                plan.mapped = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.plan.mapped);
+        assert!(
+            !store.prefetch.as_ref().unwrap().sampled_resident(),
+            "a freshly built pack (F_NOCACHE writes) is cold"
+        );
+        store
+    }
+
+    fn wait_resident(store: &Store) {
+        let pool = store.prefetch.as_ref().unwrap();
+        pool.wait_idle();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pool.sampled_resident() {
+            assert!(Instant::now() < deadline, "the stream did not land in 10 s");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The load picked the mapped plan: after the dense banks the cold pack
+    /// streams; a turn that opens over the stream starts no second one and
+    /// its stale first pass does not touch; once the pack is resident and
+    /// the stream over, a stale pass touches, a pass inside the gap and a
+    /// pass that reads no mapped bank (which also leaves the stamp alone) do
+    /// not; slot mode never touches and never streams.
+    /// MUTATION (M-P5-touch-cold): drop the `streaming_pass` early return of
+    /// `wire_mapped_banks_at` -> "a stale pass over a cold pack streams
+    /// instead of touching" fails.
     #[test]
-    fn mapped_banks_are_rewired_after_a_gap_and_not_within_a_pass() {
-        use std::time::{Duration, Instant};
-        const CHILD: &str = "MLX_QWEN4_REWIRE_CHILD";
-        const NAME: &str = "models::qwen4_exp::weights::mapped_tests::mapped_banks_are_rewired_after_a_gap_and_not_within_a_pass";
-        if std::env::var_os(CHILD).is_none() {
-            // The wired limit is process-wide: while a sibling test's
-            // scheduled turn holds one, the driver wires this test's
-            // mmap-backed banks and the freshly built pack is never cold. A
-            // child process holds none.
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", NAME])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                output.status.success() && stdout.contains("test result: ok. 1 passed"),
-                "{stdout}\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+    fn a_cold_mapped_load_streams_after_the_dense_banks_and_a_stale_pass_does_not_touch() {
+        if !in_child(
+            "models::qwen4_exp::weights::mapped_tests::a_cold_mapped_load_streams_after_the_dense_banks_and_a_stale_pass_does_not_touch",
+        ) {
             return;
         }
         let temp = Temp::new();
         let gguf = temp.0.join("experts.gguf");
         write_fixture(&gguf);
-        let root = temp.0.join("cache");
-        let map = |dir: &str| {
-            let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
-            store.prepare_mapped_pack_at(&temp.0.join(dir)).unwrap();
-            store
-                .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
-                    plan.budget = 1 << 30;
-                    plan.mapped = true;
-                    Ok(())
-                })
-                .unwrap();
-            assert!(store.plan.mapped);
-            assert!(
-                !store.prefetch.as_ref().unwrap().sampled_resident(),
-                "a freshly built pack (F_NOCACHE writes) is cold"
-            );
-            store
-        };
         let t0 = Instant::now();
-        let mut slots = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        let mut slots = Store::open_fixture(&gguf, Some(&temp.0.join("cache"))).unwrap();
+        slots.start_pack_stream();
+        assert!(slots.prefetch.is_none(), "slot mode has no stream");
+        assert!(slots.begin_turn().unwrap().is_none());
+        assert!(!slots.streaming_pass);
         assert!(
-            !slots.wire_mapped_banks_at(t0, true, 3).unwrap(),
+            !slots.wire_mapped_banks_at(t0, true).unwrap(),
             "slot mode never touches"
         );
-        assert!(slots.prefetch.is_none());
 
-        let mut store = map("mapped");
+        let mut store = mapped_store(&temp, &gguf, "mapped");
+        let gate = Arc::new(Gate::default());
+        store.pool_with(Arc::clone(&gate));
+        store.start_pack_stream();
         assert!(
-            !store.wire_mapped_banks_at(t0, true, 3).unwrap(),
-            "a stale pass over a cold pack reads ahead instead of touching"
+            store.prefetch.as_ref().unwrap().streaming(),
+            "the load-time stream runs"
         );
-        assert_eq!(store.prefetch_depth, 3);
-        assert!(
-            !store.prefetch_pass,
-            "the one-layer pack was requested whole at the pass start"
-        );
-        let pool = store.prefetch.as_ref().unwrap();
-        pool.wait_idle();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !pool.sampled_resident() {
-            assert!(Instant::now() < deadline, "read-ahead did not land in 10 s");
+        assert!(!store.streaming_pass, "no turn is open yet");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while gate.started.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline, "no worker started");
             std::thread::sleep(Duration::from_millis(1));
         }
+        assert!(store.begin_turn().unwrap().is_none());
+        assert!(store.streaming_pass, "the turn opened over the stream");
         assert!(
-            !store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(100), true, 3)
-                .unwrap()
+            !store.wire_mapped_banks_at(t0, true).unwrap(),
+            "a stale pass over a cold pack streams instead of touching"
         );
+        assert!(store.touches.is_empty());
+        gate.release();
+        wait_resident(&store);
         assert!(
             !store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(800), true, 3)
+                .wire_mapped_banks_at(t0 + Duration::from_millis(100), true)
+                .unwrap(),
+            "within the pass"
+        );
+        store
+            .keep_wired_at(t0 + Duration::from_millis(800), 0, true)
+            .unwrap();
+        assert_eq!(
+            store.touches,
+            vec![vec![0]],
+            "the streaming pass keeps layer 0 wired"
+        );
+        assert!(!store.streaming_pass, "the stream is over");
+        assert!(
+            !store
+                .wire_mapped_banks_at(t0 + Duration::from_millis(850), true)
                 .unwrap()
         );
         assert!(
             store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(1800), true, 3)
+                .wire_mapped_banks_at(t0 + Duration::from_millis(1800), true)
                 .unwrap(),
             "a stale pass over a resident pack touches"
         );
-        assert!(!store.prefetch_pass);
+        assert_eq!(store.touches.len(), 2);
         assert!(
             !store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(1850), true, 3)
+                .wire_mapped_banks_at(t0 + Duration::from_millis(1850), true)
                 .unwrap()
         );
         let stamp = store.mapped_pass_start;
@@ -3067,7 +3173,7 @@ mod mapped_tests {
         for ms in [2600, 3400] {
             assert!(
                 !store
-                    .wire_mapped_banks_at(t0 + Duration::from_millis(ms), false, 3)
+                    .wire_mapped_banks_at(t0 + Duration::from_millis(ms), false)
                     .unwrap(),
                 "a pass that reads no mapped bank never touches"
             );
@@ -3078,17 +3184,106 @@ mod mapped_tests {
         }
         assert!(
             store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(4200), true, 3)
+                .wire_mapped_banks_at(t0 + Duration::from_millis(4200), true)
                 .unwrap(),
             "the main pass after a run of drafts sees the gap since the last main pass"
         );
-
-        let mut cold = map("mapped-cold");
+        assert!(store.begin_turn().unwrap().is_none());
         assert!(
-            cold.wire_mapped_banks_at(t0, true, 0).unwrap(),
-            "read-ahead off: a stale pass touches a cold pack"
+            !store.streaming_pass && !store.prefetch.as_ref().unwrap().streaming(),
+            "a turn over a resident pack starts no stream"
         );
-        assert!(!cold.prefetch_pass);
+    }
+
+    /// While the pack streams, the layer hooks touch the banks of the
+    /// layers already run, at most every 700 ms, never the layers ahead
+    /// (their pages may be cold), never for a pass that reads no mapped bank,
+    /// and not once the stream is over.
+    /// MUTATION (M-P5-keep-wired-all): `keep_wired_at` touches every layer
+    /// -> "layers 6..7 are not bound yet" fails.
+    #[test]
+    fn keep_wired_touches_only_bound_layers_every_700ms() {
+        if !in_child(
+            "models::qwen4_exp::weights::mapped_tests::keep_wired_touches_only_bound_layers_every_700ms",
+        ) {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture_layers(&gguf, 8);
+        let mut store = mapped_store(&temp, &gguf, "mapped");
+        assert_eq!(store.mapped_experts.len(), 8);
+        let gate = Arc::new(Gate::default());
+        store.pool_with(Arc::clone(&gate));
+        let t0 = Instant::now();
+        assert!(store.begin_turn().unwrap().is_none());
+        assert!(store.streaming_pass);
+        assert!(!store.wire_mapped_banks_at(t0, true).unwrap());
+        store
+            .keep_wired_at(t0 + Duration::from_millis(100), 5, true)
+            .unwrap();
+        assert!(store.touches.is_empty(), "100 ms after the pass start");
+        store
+            .keep_wired_at(t0 + Duration::from_millis(800), 5, true)
+            .unwrap();
+        assert_eq!(
+            store.touches,
+            vec![vec![0, 1, 2, 3, 4, 5]],
+            "layers 6..7 are not bound yet"
+        );
+        store
+            .keep_wired_at(t0 + Duration::from_millis(900), 7, true)
+            .unwrap();
+        assert_eq!(store.touches.len(), 1, "100 ms after the last touch");
+        store
+            .keep_wired_at(t0 + Duration::from_millis(1600), 7, false)
+            .unwrap();
+        assert_eq!(store.touches.len(), 1, "a pass that reads no mapped bank");
+        assert!(store.streaming_pass);
+        gate.release();
+        wait_resident(&store);
+        store
+            .keep_wired_at(t0 + Duration::from_millis(1600), 7, true)
+            .unwrap();
+        assert_eq!(store.touches.len(), 2);
+        assert_eq!(store.touches[1], (0..8).collect::<Vec<_>>());
+        assert!(!store.streaming_pass, "the stream is over");
+        store
+            .keep_wired_at(t0 + Duration::from_millis(2400), 7, true)
+            .unwrap();
+        assert_eq!(store.touches.len(), 2, "no streaming pass, no touch");
+    }
+
+    /// The tripwire's SSD count starts at the turn: the pack bytes the
+    /// load-time stream read before it are below the baseline, and the turn
+    /// over a pack the stream made resident starts no stream of its own.
+    #[test]
+    fn a_streaming_turn_keeps_the_tripwire_baseline() {
+        if !in_child(
+            "models::qwen4_exp::weights::mapped_tests::a_streaming_turn_keeps_the_tripwire_baseline",
+        ) {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let mut store = mapped_store(&temp, &gguf, "mapped");
+        let before = memory::process_disk_reads();
+        store.start_pack_stream();
+        wait_resident(&store);
+        let after = memory::process_disk_reads();
+        assert!(
+            after >= before + store.plan.mapped_bytes,
+            "the stream read the pack from disk ({} B over {} B)",
+            after - before,
+            store.plan.mapped_bytes
+        );
+        assert!(store.begin_turn().unwrap().is_none());
+        assert!(
+            store.tripwire_mut().turn_start_reads() >= after,
+            "the stream's bytes are not charged to the turn"
+        );
+        assert!(!store.streaming_pass);
     }
 
     /// With the MTP head attached, the mapped plan's anonymous need carries
@@ -3583,7 +3778,7 @@ mod mapped_tests {
         assert_eq!(store.live.fallback(), Some(why));
         assert!(
             !store
-                .wire_mapped_banks_at(std::time::Instant::now(), true, 3)
+                .wire_mapped_banks_at(std::time::Instant::now(), true)
                 .unwrap(),
             "a slot store never touches banks"
         );

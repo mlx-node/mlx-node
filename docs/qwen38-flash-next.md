@@ -108,21 +108,50 @@ starts later than that after the previous one would otherwise re-wire the
 layers one by one and fall into a 0.5 tokens/s cycle, so every main-network
 forward pass whose predecessor started more than 0.9 s earlier first reads
 one element of every mapped bank in a single eval (the MTP head's passes read
-no mapped bank and neither touch nor count as a predecessor). When such a
-pass finds the pack not fully resident (eight 256 KiB `mincore` probes per
-file), it reads ahead instead of touching: a worker thread asks the kernel
-(`F_RDADVISE`, which skips resident pages) for the whole files of layers 0
-to 3 as the pass starts and for layer L+3 as layer L starts, so a cold first
-prompt streams the pack at the SSD's rate (10.5 GiB/s measured) rather than
-the driver's fault rate (4.2 GiB/s), and the model thread never reads; the
-touch would bind every bank at once and fault the whole pack in before
-layer 0. The worker reads one byte of every page it requested, through a
-view of the file that lives only for that walk: advisory pages are
-speculative and were reclaimed before the driver bound them, doubling a
-cold window's reads, and a walk through the banks' own mapping left the
-whole pack in the process's page tables (75 GiB of RSS between turns). A
-pass over several rows (MTP verification) runs every layer's hook once per
-row; the pool requests each layer once per pass. The depth is three layers.
+no mapped bank and neither touch nor count as a predecessor). The pack is
+streamed into the page cache, never faulted in through the driver: when the
+load has picked the mapped plan and read the dense banks, eight reader
+threads start reading the whole pack in layer order with 4 MiB buffered
+`pread`s, skipping every 4 MiB chunk that is already resident (one `mincore` over each file before its reads: between two reads of a file `mincore` reports the pages the kernel's read-ahead has in flight as in core, and a check per chunk skipped a third of an evicted pack unread, leaving it 54 of 73 GiB resident; a partly evicted pack costs only its holes, and every byte goes through a worker's own read with kernel read-ahead off (`F_RDAHEAD` 0; eight workers reach the SSD's rate without it); the stop and yield checks come before every chunk, resident or not, so nothing is read or in flight past the chunk a stop or a pending row allows, where an `F_RDADVISE` or the read-ahead would run on after the pool is dropped and ahead of the model's rows). Over the evicted pack this reaches 12.3 GiB/s against the SSD's
+12.6, where one thread walking one file at a time behind its advisory
+reached 9.3. The readers run at the default I/O tier: a throttled or
+utility-tier read (`IOPOL_THROTTLE`, `IOPOL_UTILITY`) is paced behind other
+readers, but its pages are speculative and 8 % of the pack survived such a
+walk against a full page cache, so a lower tier would read the pack for
+nothing. The cost is borne by whatever else reads the SSD during the ~6 s
+stream (a cold 11 GiB read alongside it took 6.8 s instead of 0.95), except
+the model's own row reads: while embedding or PLE rows are queued for the
+reader threads or being read on the model thread, the workers wait between
+two 4 MiB reads. One small read behind eight 4 MiB reads in the SSD queue
+costs milliseconds, and a cold window's 2,000 inline row reads then held
+layer 0 back until the stream was over (layer 0 began 6 s into a 7.1 s first
+window). The load returns before the stream does; a turn that opens while it
+runs changes nothing, a turn that opens over a pack that is not fully
+resident with no stream running starts one. The
+stream's order is every request's order, so a request never waits for a byte
+it does not need, and a request that arrives after the stream finished finds
+the pack resident. Resident is not wired: that request still pays the first
+bind of every bank, the page-table work for 73 GiB of page-cache pages on the
+model thread (about 2.5 s: a 6k prompt 8 s after load took 7.4 s against
+4.7-5.2 warm and 11.4 cold), and the driver unwires a bank idle for about a
+second, so nothing short of touching the banks while idle would make it
+warm. While the pack streams, a stale pass does not touch: the
+touch would bind every bank at once and fault the whole pack in on the model
+thread before layer 0. Instead, every 700 ms, the banks of the layers already
+run are touched so the driver keeps them wired through the long first window
+(it unwires a bank idle for about 1.15 s; re-wiring all of them at the second
+window cost about a second with the GPU idle). The reads go through the
+files' descriptors, never through the banks' mapping (pages touched there
+stay in the process's page tables for the mapping's life: 75 GiB of RSS
+between turns) and never through the advisory alone (advisory pages are
+speculative and were reclaimed before the driver bound them, doubling a cold
+window's reads). The stream stops within one 4 MiB read when the store
+leaves the mapped path or the model unloads; a cache reset does not stop it.
+Nothing it reads is wired, the live-memory gate's inputs do not move (file
+pages are reclaimable) and the tripwire's SSD count starts at the turn. A
+prefill window also hands the reader threads the embedding and PLE rows of
+the window after it, in file order, so the next window finds its rows ready
+instead of reading them one `pread` at a time on the model thread.
 Every prefill
 window and every decode step needs the entire routed set resident at once:
 when other processes' anonymous memory leaves less than that (a 20 GiB
