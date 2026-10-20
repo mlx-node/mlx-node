@@ -15,11 +15,17 @@ mod paged;
 mod prefetch;
 mod route_plan;
 mod row_fetch;
-mod runtime_flags;
 mod tripwire;
 mod weights;
 
 const MAX_PREFILL_CHUNK: usize = 1024;
+
+/// MLX's own `MLX_ENABLE_TF32` (default on). The NAX kernels refuse TF32-off
+/// processes in C++; the Rust callers check the same setting first so a
+/// refused window is never entered tentatively.
+fn tf32_enabled() -> bool {
+    std::env::var_os("MLX_ENABLE_TF32").is_none_or(|value| value != "0")
+}
 
 use crate::array::MxArray;
 use crate::engine::backend::{ChatBackend, DecodeStep, ResetScope, SaveStateArgs, TurnSetup};

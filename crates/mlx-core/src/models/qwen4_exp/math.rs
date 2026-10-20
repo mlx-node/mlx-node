@@ -1,5 +1,4 @@
 use crate::array::{DType, MxArray};
-use crate::models::qwen4_exp::runtime_flags;
 use crate::nn::Activations;
 use napi::{Error, Result};
 
@@ -12,10 +11,7 @@ pub(super) fn routed_experts(
     banks: &[std::sync::Arc<super::weights::Weight>; 3],
 ) -> Result<Option<MxArray>> {
     let shape = x.shape()?;
-    if runtime_flags::is_zero(c"MLX_QWEN4_FUSED_EXPERTS")
-        || runtime_flags::is_zero(c"MLX_QWEN4_DIRECT_GEMV")
-        || runtime_flags::is_zero(c"MLX_QWEN4_AFFINE_GEMV")
-        || !crate::engine::persistence::compiled_forward_backend_available()
+    if !crate::engine::persistence::compiled_forward_backend_available()
         || x.dtype()? != DType::BFloat16
         || shape.first() != Some(&1)
         || shape.len() != 3
@@ -91,9 +87,6 @@ pub(super) fn routed_shared_experts(
         || x.dtype()? != DType::BFloat16
         || *shared_gate.shape()? != [1, 1, 1]
         || shared_gate.dtype()? != DType::BFloat16
-        || runtime_flags::is_zero(c"MLX_QWEN4_FUSED_EXPERTS")
-        || runtime_flags::is_zero(c"MLX_QWEN4_DIRECT_GEMV")
-        || runtime_flags::is_zero(c"MLX_QWEN4_AFFINE_GEMV")
         || !matches!(banks[0].mode.as_str(), "q4k" | "q5k")
         || banks[0].mode != banks[1].mode
         || banks[0].bits != banks[1].bits
@@ -123,10 +116,6 @@ pub(super) fn routed_shared_experts(
     let raw = unsafe { mlx_sys::mlx_qwen4_routed_shared_experts(inputs.as_ptr(), inputs.len()) };
     if raw.is_null() {
         return Ok(None);
-    }
-    if runtime_flags::is_one(c"MLX_QWEN4_TRACE_SHARED_EXPERTS") {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| eprintln!("QWEN4_SHARED_EXPERTS singleton mixed K-quant/Q8 path"));
     }
     MxArray::from_handle(raw, "Qwen4 fused routed/shared experts").map(Some)
 }
@@ -189,15 +178,6 @@ pub(super) fn prefill_indirect(
     if raw.is_null() {
         Ok(None)
     } else {
-        if runtime_flags::is_one(c"MLX_QWEN4_TRACE_PREFILL_INDIRECT") {
-            static TRACE: std::sync::Once = std::sync::Once::new();
-            TRACE.call_once(|| {
-                eprintln!(
-                    "QWEN4_PREFILL_INDIRECT tile_rows=32 assignments={} bank_slots={experts}",
-                    ids.size().unwrap_or(0)
-                )
-            });
-        }
         MxArray::from_handle(raw, "Qwen4 indirect expert prefill").map(Some)
     }
 }
@@ -225,7 +205,6 @@ pub(super) fn combine_expert_rows(
     if let Some(inverse) = inverse
         && tokens > 8
         && crate::engine::persistence::compiled_forward_backend_available()
-        && !runtime_flags::is_zero(c"MLX_QWEN4_SORTED_COMBINE")
     {
         let raw = unsafe {
             mlx_sys::mlx_qwen4_sorted_combine(
@@ -320,10 +299,7 @@ pub(super) fn recurrent_step(
         ));
     }
     let (query_heads, kd) = (*query_heads, *kd);
-    if kd >= 32
-        && kd % 32 == 0
-        && crate::engine::persistence::compiled_forward_backend_available()
-        && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_GDN")
+    if kd >= 32 && kd % 32 == 0 && crate::engine::persistence::compiled_forward_backend_available()
     {
         let q = q.reshape(&[1, 1, query_heads, kd])?;
         let k = k.reshape(&[1, 1, query_heads, kd])?;
@@ -394,10 +370,7 @@ pub(super) fn recurrent_sequence(
 ) -> Result<(MxArray, MxArray)> {
     let shape = q.shape()?;
     let (tokens, heads, kd) = (shape[1], shape[2], shape[3]);
-    if kd >= 32
-        && kd % 32 == 0
-        && crate::engine::persistence::compiled_forward_backend_available()
-        && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_GDN")
+    if kd >= 32 && kd % 32 == 0 && crate::engine::persistence::compiled_forward_backend_available()
     {
         let mut out = std::ptr::null_mut();
         let mut next = std::ptr::null_mut();
@@ -504,7 +477,6 @@ pub(super) fn conv_sequence(
         && x.dtype()? == DType::BFloat16
         && weight.dtype()? == DType::Float32
         && crate::engine::persistence::compiled_forward_backend_available()
-        && !runtime_flags::is_zero(c"MLX_QWEN4_WINDOW_CONV")
     {
         let old = match state {
             Some(s) => s.clone(),
@@ -591,9 +563,7 @@ pub(super) fn gdn_epilogue(
 }
 
 pub fn norm(x: &MxArray, w: &MxArray, group: usize, eps: f64, centered: bool) -> Result<MxArray> {
-    if !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
-        && crate::engine::persistence::compiled_forward_backend_available()
-    {
+    if crate::engine::persistence::compiled_forward_backend_available() {
         let out = unsafe {
             mlx_sys::mlx_qwen4_norm(x.as_raw_ptr(), w.as_raw_ptr(), group as i32, eps, centered)
         };
@@ -1150,7 +1120,6 @@ pub(super) fn conv_window(
         && x.dtype()? == DType::BFloat16
         && weight.dtype()? == DType::Float32
         && crate::engine::persistence::compiled_forward_backend_available()
-        && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_PLE_CONV")
     {
         let raw = unsafe {
             mlx_sys::mlx_qwen4_prefill_ple_conv(
@@ -1291,7 +1260,6 @@ pub(super) fn route_sort(
         || ids.dtype()? != DType::Uint32
         || ids.ndim()? != 1
         || !crate::engine::persistence::compiled_forward_backend_available()
-        || runtime_flags::is_zero(c"MLX_QWEN4_COUNTING_SORT")
     {
         return Ok(None);
     }
@@ -1329,9 +1297,7 @@ pub(super) fn gdn_gates(
     // complete GDN/preparation receives compact projection storage.
     let a = a.astype(DType::Float32)?;
     let b = b.astype(DType::Float32)?;
-    if !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
-        && crate::engine::persistence::compiled_forward_backend_available()
-    {
+    if crate::engine::persistence::compiled_forward_backend_available() {
         let (mut decay, mut beta) = (std::ptr::null_mut(), std::ptr::null_mut());
         let ok = unsafe {
             mlx_sys::mlx_qwen4_gdn_gates(
@@ -1358,11 +1324,7 @@ pub(super) fn gdn_gates(
 }
 
 pub(super) fn swiglu(gate: &MxArray, up: &MxArray) -> Result<MxArray> {
-    if runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE") {
-        Activations::silu(gate)?.mul(up)
-    } else {
-        Activations::swiglu_compiled(gate, up)
-    }
+    Activations::swiglu_compiled(gate, up)
 }
 pub(super) fn attention_output(attention: &MxArray, projection: &MxArray) -> Result<MxArray> {
     let shape = attention.shape()?;
@@ -1543,11 +1505,7 @@ pub(super) fn qsa_fail_pipeline_probes(count: i32) -> i32 {
 }
 
 pub(super) fn sigmoid_mul(gate: &MxArray, value: &MxArray) -> Result<MxArray> {
-    if runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE") {
-        value.mul(&Activations::sigmoid(gate)?)
-    } else {
-        Activations::sigmoid_mul_compiled(gate, value)
-    }
+    Activations::sigmoid_mul_compiled(gate, value)
 }
 
 #[cfg(test)]
@@ -1782,40 +1740,6 @@ pub(super) mod rows {
         } else {
             MxArray::from_handle(raw, "Qwen4 row-batched hyper up").map(Some)
         }
-    }
-
-    /// Adds the `[1, R, 4]` injection gate to `hyper_up`; returns (mixed, gate).
-    pub(crate) fn hyper_up_inject(
-        w: &Weight,
-        x: &MxArray,
-        normed: &MxArray,
-        injection: &MxArray,
-    ) -> Result<Option<(MxArray, MxArray)>> {
-        let Some((scales, biases)) = affine_q8(w) else {
-            return Ok(None);
-        };
-        if row_count(x, Some(320))?.is_none() || !backend() {
-            return Ok(None);
-        }
-        let (mut mixed, mut gate) = (std::ptr::null_mut(), std::ptr::null_mut());
-        if !unsafe {
-            mlx_sys::mlx_qwen4_hyper_up_inject_rows(
-                x.as_raw_ptr(),
-                w.values.as_raw_ptr(),
-                scales.as_raw_ptr(),
-                biases.as_raw_ptr(),
-                normed.as_raw_ptr(),
-                injection.as_raw_ptr(),
-                &mut mixed,
-                &mut gate,
-            )
-        } {
-            return Ok(None);
-        }
-        Ok(Some((
-            MxArray::from_handle(mixed, "Qwen4 row-batched mixer with injection")?,
-            MxArray::from_handle(gate, "Qwen4 row-batched mixer injection gate")?,
-        )))
     }
 
     /// `x` is `[1, R, 2560]`, `ids` holds `10 R` routes, `scores` `10 R`

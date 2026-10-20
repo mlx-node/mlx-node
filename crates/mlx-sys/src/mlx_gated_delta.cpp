@@ -32,10 +32,6 @@ static const char* gated_delta_step_4vcol_source =
     #include "metal/common/gated_delta_step_4vcol.metal.inc"
 ;
 
-static const char* gated_delta_step_4vcol_vector_source =
-    #include "metal/common/gated_delta_step_4vcol_vector.metal.inc"
-;
-
 static const char* gated_delta_fused_gating_source =
     #include "metal/common/gated_delta_fused_gating.metal.inc"
 ;
@@ -52,7 +48,7 @@ static const char* gated_delta_replay_source =
 static std::mutex kernel_cache_mutex;
 static std::unordered_map<int, mlx::core::fast::CustomKernelFunction> kernel_cache;
 
-// per_step_variant: 0=legacy, 1=2-vcol, 2=4-vcol, 3=4-vcol vector loads with FP32 state.
+// per_step_variant: 0=legacy, 1=2-vcol, 2=4-vcol.
 static mlx::core::fast::CustomKernelFunction& get_or_create_kernel(
     bool has_mask, bool vectorized, int per_step_variant) {
     int key = (has_mask ? 1 : 0) | (vectorized ? 2 : 0) | (per_step_variant << 2);
@@ -67,18 +63,14 @@ static mlx::core::fast::CustomKernelFunction& get_or_create_kernel(
     if (has_mask) suffix += "_mask";
     if (per_step_variant == 1) suffix += "_2v";
     else if (per_step_variant == 2) suffix += "_4v";
-    else if (per_step_variant == 3) suffix += "_4v_vector";
 
     std::vector<std::string> inputs = {"q", "k", "v", "g", "beta", "state_in", "T"};
-    if (per_step_variant == 3) inputs.pop_back();
     if (has_mask) {
         inputs.push_back("mask");
     }
 
     const char* src;
-    if (per_step_variant == 3) {
-        src = gated_delta_step_4vcol_vector_source;
-    } else if (per_step_variant == 1) {
+    if (per_step_variant == 1) {
         src = gated_delta_step_2vcol_source;
     } else if (per_step_variant == 2) {
         src = gated_delta_step_4vcol_source;
@@ -182,26 +174,11 @@ static bool gated_delta_kernel_impl(
                 per_step_variant = 1;
             }
         }
-        // Reference data-motion port only. Keep other shapes and model families
-        // on their current kernels; the custom kernel materializes contiguous
-        // input views before the aligned vector loads.
-        auto vector_rows = std::getenv("MLX_QWEN4_GDN_VECTOR_ROWS");
-        if (float_output && prefer_four && per_step_variant == 2 && T > 8
-            && Dk == 128 && vector_rows && std::string(vector_rows) == "1"
-            && q_arr.dtype() == k_arr.dtype() && q_arr.dtype() == v_arr.dtype()
-            && state_arr.dtype() == mlx::core::float32
-            && g_arr.dtype() == mlx::core::float32
-            && beta_arr.dtype() == mlx::core::float32) {
-            per_step_variant = 3;
-            inputs.pop_back();
-            template_args.emplace_back("Q", q_arr.dtype());
-            template_args.emplace_back("T", T);
-        }
         auto& kernel = get_or_create_kernel(has_mask, vectorized, per_step_variant);
 
         int grid_y = Dv;
         if (per_step_variant == 1) grid_y = Dv / 2;
-        else if (per_step_variant >= 2) grid_y = Dv / 4;
+        else if (per_step_variant == 2) grid_y = Dv / 4;
 
         auto results = kernel(
             inputs,
@@ -585,15 +562,14 @@ bool mlx_dflash2_conv(
 }
 
 // Qwen4's measured M5 shape benefits from four value rows per SIMD group.
-// Other model families retain the existing default and environment controls.
+// Other model families retain the existing default.
 bool mlx_qwen4_gated_delta_kernel(mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* g,
     mlx_array* beta, mlx_array* state, mlx_array* mask, mlx_array** out_y, mlx_array** out_state) {
     if (!q || !v) return false;
     auto& query = *reinterpret_cast<array*>(q);
     auto& value = *reinterpret_cast<array*>(v);
     static const int arch = mlx_gpu_architecture_gen();
-    auto setting = std::getenv("MLX_QWEN4_GDN_4ROWS");
-    bool measured_shape = arch >= 17 && (!setting || std::string(setting) != "0")
+    bool measured_shape = arch >= 17
         && query.ndim() == 4 && value.ndim() == 4 && query.shape(0) == 1
         && query.shape(3) == 128 && value.shape(2) == 48 && value.shape(3) == 128
         && (query.dtype() == mlx::core::float32 || query.dtype() == mlx::core::bfloat16);

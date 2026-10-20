@@ -5,6 +5,12 @@ Research: 15–17 September 2026. Starting revision:
 initial performance record, mlx.fast investigation, prefill port log, and
 macOS 27 recheck. The [runtime guide](../qwen38-flash-next.md) covers usage.
 
+> **Log only.** Every `MLX_QWEN4_*` switch this report names was deleted on
+> 20 October 2026 (one code path remains per site; the measured winners are
+> now unconditional, the losers and their kernels are gone). The remaining
+> Qwen4 environment variables are listed in [perf.md](../perf.md). Sections
+> below describe experiments as they were run and are not current controls.
+
 ## Reviewer follow-up, 17 September
 
 The read-only GGUF asset-directory finding was reproduced through the packaged
@@ -596,20 +602,19 @@ preserving lane ownership, K traversal, accumulation and output rounding.
 Shared-expert fusions preserve the individual routed/shared products and their
 final addition. Compiled graph wrappers receive every changing array explicitly.
 
-### Defaults and optional controls
+### Defaults and optional controls (historical)
 
-Eligible exact ports through reference-v9 are enabled, together with smaller
-headers, `MLX_QWEN4_CACHE_FLAGS`, `MLX_QWEN4_DEFER_FINAL_COMPLETION`, and split
-Metal residency sets. Runtime switches accept `0` for their control path.
-Shape, dtype, hardware and transaction eligibility still select fallbacks.
-
-Default prefill controls include `MLX_QWEN4_PREFILL_MIXER_BM32`,
-`MLX_QWEN4_PREFILL_HC_MIX`, `MLX_QWEN4_PREFILL_GDN_NORM`,
-`MLX_QWEN4_PREFILL_Q8_PREFETCH`, `MLX_QWEN4_PREFILL_SHARED_PAIR`,
-`MLX_QWEN4_PREFILL_PLE_CONV`,
-`MLX_QWEN4_PREFILL_PACKED_EXPERTS`, `MLX_QWEN4_PREFILL_REFERENCE_INDIRECT`,
-`MLX_QWEN4_PREFILL_DEVICE_ROUTES`, `MLX_QWEN4_PREFILL_NORM`,
-`MLX_QWEN4_PREFILL_ASYNC_WINDOW`, and `MLX_QWEN4_PREFILL_SHARED_Q8`.
+Through 19 October 2026 the eligible exact ports through reference-v9 were
+enabled behind default-on runtime switches (`MLX_QWEN4_CACHE_FLAGS`,
+`MLX_QWEN4_DEFER_FINAL_COMPLETION`, the `MLX_QWEN4_PREFILL_*` family and the
+decode fusions), each accepting `0` for its control path. On 20 October 2026
+every one of those switches was removed: the enabled path is the only path,
+and shape, dtype, hardware and transaction eligibility alone select the
+fallbacks. The opt-in arms that had measured within noise or as losers
+(`MLX_QWEN4_EXPERT_LANE_STAGING`, `MLX_QWEN4_GDN_VECTOR_ROWS`,
+`MLX_QWEN4_REFERENCE_DOWN_SCHEDULE`, `MLX_QWEN4_GDN_DECODE_PREFETCH`,
+`MLX_QWEN4_PREFILL_REFERENCE_INDIRECT`) were deleted with their kernel
+variants, as were the trace and check probes.
 
 The opt-in exact fusions measured on 2026-10-20 (teacher-forced logits on the
 6k and 16k prompts in one process, mapped residency, 256 positions) were

@@ -1,5 +1,4 @@
 #include "mlx_common.h"
-#include "mlx_qwen4_flags.h"
 #ifdef MLX_NODE_METAL_ENABLED
 #include "metal/common/native_activations.h"
 #include "metal/common/quantized.h"
@@ -41,27 +40,8 @@ const array &native_bf16_sigmoid_table() {
   return table;
 }
 
-// The injection path uses the uncompiled sigmoid after its BF16 division.
-// Include both scalar boundaries in the lookup; the compiled mixer sigmoid
-// table above intentionally represents a different native operation.
-const array &native_bf16_inject_table() {
-  static const array table = [] {
-    std::vector<uint16_t> bits(65536);
-    for (size_t i = 0; i < bits.size(); ++i)
-      bits[i] = uint16_t(i);
-    auto values = mlx::core::view(
-        array(bits.data(), {65536}, mlx::core::uint16), mlx::core::bfloat16);
-    auto result = mlx::core::sigmoid(values / array(4, mlx::core::bfloat16)) *
-                  array(2, mlx::core::bfloat16);
-    mlx::core::eval({result});
-    return result;
-  }();
-  return table;
-}
-
 // All changing weights, slot mappings, scores and activations are inputs.
 // Shapes specialize the two supported gate formats and two down formats.
-template <bool LANES>
 std::vector<array> routed_experts(const std::vector<array> &a) {
   int tokens = a[0].shape(1), experts = a[3].shape(0) / 640;
   int gate_bits = a[3].shape(1) * 32 / 2560;
@@ -69,7 +49,7 @@ std::vector<array> routed_experts(const std::vector<array> &a) {
   static auto gu = mlx::core::fast::metal_kernel(
       "qwen4_gate_up_decode", {"x", "ids", "wg", "sg", "bg", "wu", "su", "bu"},
       {"out"}, R"(
-    quantized_expert_gate_up<T,BITS,2560,640,E,10,LANES>(x,ids,wg,sg,bg,wu,su,bu,out,
+    quantized_expert_gate_up<T,BITS,2560,640,E,10>(x,ids,wg,sg,bg,wu,su,bu,out,
       threadgroup_position_in_grid.z,threadgroup_position_in_grid.y,
       simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
   )",
@@ -79,14 +59,13 @@ std::vector<array> routed_experts(const std::vector<array> &a) {
                    {32, 160, tokens * 10}, {32, 2, 1},
                    {{"T", mlx::core::bfloat16},
                     {"BITS", gate_bits},
-                    {"E", experts},
-                    {"LANES", LANES}},
+                    {"E", experts}},
                    std::nullopt, false, mlx::core::Device::gpu)[0];
   static auto down = mlx::core::fast::metal_kernel(
       "qwen4_down_combine_decode",
       {"x", "ids", "scores", "w", "scales", "biases"}, {"out"}, R"(
     threadgroup P products[10*4];
-    affine_expert_down_combine<T,P,BITS,2560,640,E,10,4,5,LANES>(x,ids,scores,w,scales,biases,out,products,
+    affine_expert_down_combine<T,P,BITS,2560,640,E,10,4,5>(x,ids,scores,w,scales,biases,out,products,
       threadgroup_position_in_grid.z,threadgroup_position_in_grid.y,
       simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
   )",
@@ -96,7 +75,6 @@ std::vector<array> routed_experts(const std::vector<array> &a) {
            {a[2].dtype()}, {32, 640 * 5, tokens}, {32, 5, 1},
            {{"T", mlx::core::bfloat16},
             {"P", a[2].dtype()},
-            {"LANES", LANES},
             {"BITS", down_bits},
             {"E", experts}},
            std::nullopt, false, mlx::core::Device::gpu)[0];
@@ -110,8 +88,8 @@ const std::string &shared_expert_header() {
   return header;
 }
 
-template <int RPS, bool STAGE, bool LANES>
 std::vector<array> routed_shared_experts(const std::vector<array> &a) {
+  constexpr int RPS = 4;
   const int rows = a[0].shape(1);
   const int experts = a[3].shape(0) / 640;
   const int gate_bits = a[3].shape(1) * 32 / 2560;
@@ -128,11 +106,11 @@ std::vector<array> routed_shared_experts(const std::vector<array> &a) {
     const uint z = threadgroup_position_in_grid.z;
     const uint simd = simdgroup_index_in_threadgroup;
     if (z < 10 * ROWS) {
-      routed_gu_rows<T,BITS,2560,640,E,10,ROWS,LANES>(x,ids,wg,sg,bg,wu,su,bu,out,
+      routed_gu_rows<T,BITS,2560,640,E,10,ROWS>(x,ids,wg,sg,bg,wu,su,bu,out,
         z,threadgroup_position_in_grid.y,simd,thread_index_in_simdgroup);
     } else {
       const uint row = simd % ROWS;
-      q4_shared_gu<T,LANES>(x + row * 2560,swg,ssg,sbg,swu,ssu,sbu,sigmoid_table,
+      q4_shared_gu<T>(x + row * 2560,swg,ssg,sbg,swu,ssu,sbu,sigmoid_table,
         out + (10 * ROWS + row) * 640,
         threadgroup_position_in_grid.y * 8 + (simd / ROWS) * 4,thread_index_in_simdgroup);
     }
@@ -146,7 +124,6 @@ std::vector<array> routed_shared_experts(const std::vector<array> &a) {
          {{"T", mlx::core::bfloat16},
           {"BITS", gate_bits},
           {"E", experts},
-          {"LANES", LANES},
           {"ROWS", rows}},
          std::nullopt, false, mlx::core::Device::gpu)[0];
   // One threadgroup per RPS-column output tile serves every row with
@@ -158,7 +135,7 @@ std::vector<array> routed_shared_experts(const std::vector<array> &a) {
       {"out"}, R"(
     threadgroup P products[10*RPS*ROWS];
     threadgroup T shared_products[RPS*ROWS];
-    q4_down_combine_shared<T,P,BITS,2560,640,E,10,RPS,5,ROWS,STAGE>(
+    q4_down_combine_shared<T,P,BITS,2560,640,E,10,RPS,5,ROWS>(
       x,ids,scores,w,scales,biases,sw,ss,sb,gate,sigmoid_table,out,products,shared_products,
       threadgroup_position_in_grid.y,simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
   )",
@@ -170,7 +147,6 @@ std::vector<array> routed_shared_experts(const std::vector<array> &a) {
               {{"T", mlx::core::bfloat16},
                {"P", a[2].dtype()},
                {"RPS", RPS},
-               {"STAGE", STAGE || LANES},
                {"BITS", down_bits},
                {"E", experts},
                {"ROWS", rows}},
@@ -178,12 +154,11 @@ std::vector<array> routed_shared_experts(const std::vector<array> &a) {
 }
 
 // 0..11 are the routed-expert inputs, 12..20 the shared banks, 21 the BF16
-// shared gate and 22 the sigmoid table. The default schedule serves both the
+// shared gate and 22 the sigmoid table. One schedule serves both the
 // single-row entry and the R-row entry.
 const std::function<std::vector<array>(const std::vector<array> &)> &
 routed_shared_default() {
-  static auto compiled =
-      mlx::core::compile(routed_shared_experts<4, false, false>);
+  static auto compiled = mlx::core::compile(routed_shared_experts);
   return compiled;
 }
 
@@ -290,10 +265,7 @@ std::vector<array> dense_decode_graph(const std::vector<array> &in) {
 mlx_array *dense_decode_run(const array &x, const array &w, const array &s,
                             const array &b) {
   static auto compiled = mlx::core::compile(dense_decode_graph);
-  auto setting = qwen4_env("MLX_QWEN4_CACHED_KERNEL_GRAPHS");
-  const bool cached = (!setting || std::string(setting) != "0");
-  auto result =
-      cached ? compiled({x, w, s, b}) : dense_decode_graph({x, w, s, b});
+  auto result = compiled({x, w, s, b});
   return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
 }
 
@@ -372,58 +344,6 @@ hyper_up_compiled() {
   return compiled;
 }
 
-std::vector<array> hyper_up_inject_graph(const std::vector<array> &a) {
-  const int rows = a[0].shape(1);
-  static const std::string epilogue = R"(
-    if (threadgroup_position_in_grid.y == 0 &&
-        simdgroup_index_in_threadgroup == 0 && lane < 4) {
-      for (int row = 0; row < ROWS; ++row)
-        inject_out[row * 4 + lane] =
-            inject_table[as_type<ushort>(inject_projection[row * 4 + lane])];
-    }
-  )";
-  static const std::string source = std::string(
-#include "metal/qwen4/dense_decode.metal.inc"
-      ) + epilogue;
-  static auto kernel = mlx::core::fast::metal_kernel(
-      "qwen4_hyper_up_inject",
-      {"x", "w", "scales", "biases", "normed", "sigmoid_table",
-       "inject_projection", "inject_table"},
-      {"out", "inject_out"}, source, qmv_header());
-  return kernel(a, {{1, rows, 2560}, {1, rows, 4}},
-                  {mlx::core::bfloat16, mlx::core::bfloat16}, {32, 2560, 1},
-                  {32, 2, 1},
-                  {{"T", mlx::core::bfloat16},
-                   {"K", 320},
-                   {"N", 10240},
-                   {"FAST", false},
-                   {"RPS", 4},
-                   {"ACT", false},
-                   {"MIX", 1},
-                   {"ROWS", rows}},
-                  std::nullopt, false, mlx::core::Device::gpu);
-}
-
-const std::function<std::vector<array>(const std::vector<array> &)> &
-hyper_up_inject_compiled() {
-  static auto compiled = mlx::core::compile(hyper_up_inject_graph);
-  return compiled;
-}
-
-bool hyper_up_inject_run(const array &x, const array &w, const array &s,
-                         const array &b, const array &n, const array &g,
-                         const std::function<std::vector<array>(
-                             const std::vector<array> &)> &fn,
-                         mlx_array **out, mlx_array **out_gate) {
-  auto result =
-      fn({x, w, s, b, n, native_bf16_sigmoid_table(), g,
-          native_bf16_inject_table()});
-  auto mixed = std::make_unique<array>(std::move(result[0]));
-  auto gate = std::make_unique<array>(std::move(result[1]));
-  *out = reinterpret_cast<mlx_array *>(mixed.release());
-  *out_gate = reinterpret_cast<mlx_array *>(gate.release());
-  return true;
-}
 } // namespace
 #endif
 
@@ -580,11 +500,8 @@ extern "C" mlx_array *mlx_qwen4_hyper_up(mlx_array *input, mlx_array *weight,
     const auto &n = *reinterpret_cast<array *>(normed);
     if (!hyper_up_admits(x, w, s, b, n, 1))
       return nullptr;
-    auto setting = qwen4_env("MLX_QWEN4_CACHED_KERNEL_GRAPHS");
-    const bool cached = (!setting || std::string(setting) != "0");
-    const auto &table = native_bf16_sigmoid_table();
-    auto result = cached ? hyper_up_compiled()({x, w, s, b, n, table})
-                         : hyper_up_graph({x, w, s, b, n, table});
+    auto result =
+        hyper_up_compiled()({x, w, s, b, n, native_bf16_sigmoid_table()});
     return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
   } catch (const std::exception &e) {
     std::cerr << "Qwen4 hyper up: " << e.what() << std::endl;
@@ -619,35 +536,6 @@ extern "C" mlx_array *mlx_qwen4_hyper_up_rows(mlx_array *input,
   return nullptr;
 }
 
-extern "C" bool mlx_qwen4_hyper_up_inject_rows(
-    mlx_array *input, mlx_array *weight, mlx_array *scales, mlx_array *biases,
-    mlx_array *normed, mlx_array *injection, mlx_array **out,
-    mlx_array **out_gate) {
-  if (!out || !out_gate) return false;
-  *out = nullptr;
-  *out_gate = nullptr;
-#ifdef MLX_NODE_METAL_ENABLED
-  try {
-    if (!input || !weight || !scales || !biases || !normed || !injection)
-      return false;
-    const auto &x = *reinterpret_cast<array *>(input);
-    const auto &w = *reinterpret_cast<array *>(weight);
-    const auto &s = *reinterpret_cast<array *>(scales);
-    const auto &b = *reinterpret_cast<array *>(biases);
-    const auto &n = *reinterpret_cast<array *>(normed);
-    const auto &g = *reinterpret_cast<array *>(injection);
-    if (!hyper_up_admits(x, w, s, b, n, 4) ||
-        g.shape() != Shape{1, x.shape(1), 4} || g.dtype() != x.dtype())
-      return false;
-    return hyper_up_inject_run(x, w, s, b, n, g, hyper_up_inject_compiled(),
-                               out, out_gate);
-  } catch (const std::exception &e) {
-    std::cerr << "Qwen4 row-batched mixer injection: " << e.what()
-              << std::endl;
-  }
-#endif
-  return false;
-}
 extern "C" mlx_array *mlx_qwen4_routed_experts(mlx_array *x, mlx_array *ids,
                                                mlx_array *scores, mlx_array *wg,
                                                mlx_array *sg, mlx_array *bg,
@@ -694,27 +582,8 @@ extern "C" mlx_array *mlx_qwen4_routed_experts(mlx_array *x, mlx_array *ids,
         a[10].dtype() != mlx::core::float16 || a[11].shape() != a[10].shape() ||
         a[11].dtype() != mlx::core::float16)
       return nullptr;
-    const auto lanes = qwen4_env("MLX_QWEN4_EXPERT_LANE_STAGING");
-    auto out = [&] {
-      if (lanes && std::string(lanes) == "1") {
-        static auto fn = mlx::core::compile(routed_experts<true>);
-        return fn(a)[0];
-      }
-      static auto fn = mlx::core::compile(routed_experts<false>);
-      return fn(a)[0];
-    }();
-    // Opt-in evidence that a real decode reaches this specialization. All
-    // changing inputs remain graph arguments; no model arrays are captured.
-    static const bool trace =
-        qwen4_env("MLX_QWEN4_TRACE_FUSED_EXPERTS") != nullptr;
-    static thread_local bool traced = false;
-    if (trace && !traced) {
-      std::cerr << "QWEN4_FUSED_EXPERTS tokens=" << a[0].shape(1)
-                << " score_dtype=" << a[2].dtype() << " experts=" << experts
-                << std::endl;
-      traced = true;
-    }
-    return reinterpret_cast<mlx_array *>(new array(std::move(out)));
+    static auto fn = mlx::core::compile(routed_experts);
+    return reinterpret_cast<mlx_array *>(new array(fn(a)[0]));
   } catch (const std::exception &e) {
     std::cerr << "Qwen4 routed experts: " << e.what() << std::endl;
   }
@@ -733,29 +602,8 @@ extern "C" mlx_array *mlx_qwen4_routed_shared_experts(mlx_array *const *inputs,
         !routed_shared_admits(a, 1))
       return nullptr;
     a.push_back(native_bf16_sigmoid_table());
-    // TrackFastMoE's singleton two-row tiles and distributed staging.
-    // Keep the four-row schedule available for a paired whole-model check.
-    const auto schedule = qwen4_env("MLX_QWEN4_REFERENCE_DOWN_SCHEDULE");
-    const auto lanes = qwen4_env("MLX_QWEN4_EXPERT_LANE_STAGING");
-    array out = [&] {
-      if (lanes && std::string(lanes) == "1") {
-        if (schedule && std::string(schedule) == "1") {
-          static auto compiled =
-              mlx::core::compile(routed_shared_experts<2, true, true>);
-          return compiled(a)[0];
-        }
-        static auto compiled =
-            mlx::core::compile(routed_shared_experts<4, false, true>);
-        return compiled(a)[0];
-      }
-      if (schedule && std::string(schedule) == "1") {
-        static auto compiled =
-            mlx::core::compile(routed_shared_experts<2, true, false>);
-        return compiled(a)[0];
-      }
-      return routed_shared_default()(a)[0];
-    }();
-    return reinterpret_cast<mlx_array *>(new array(std::move(out)));
+    return reinterpret_cast<mlx_array *>(
+        new array(routed_shared_default()(a)[0]));
   } catch (const std::exception &e) {
     std::cerr << "Qwen4 routed/shared experts: " << e.what() << std::endl;
   }

@@ -52,7 +52,6 @@ impl Decoder {
                 "Qwen4 MTP history window exceeds admission",
             ));
         }
-        let _flags = runtime_flags::scope();
         let mut embeddings = Vec::with_capacity(tokens.len());
         for &token in tokens {
             self.check_cancelled()?;

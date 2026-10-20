@@ -2510,13 +2510,6 @@ pub type MlxGraphBuilder = unsafe extern "C" fn(
 ) -> bool;
 
 unsafe extern "C" {
-    /// Forward-local runtime settings. Begin/end must run on the same thread.
-    pub fn mlx_qwen4_flags_begin();
-    pub fn mlx_qwen4_flags_end();
-    pub fn mlx_qwen4_flag_equals(
-        name: *const std::os::raw::c_char,
-        value: *const std::os::raw::c_char,
-    ) -> bool;
     /// Exclusive mutable expert-slot transaction. The caller must evaluate all
     /// lazy readers of destination banks before recycling slots.
     pub fn mlx_qwen4_copy_weight_rows(
@@ -2787,16 +2780,6 @@ unsafe extern "C" {
         biases: *mut mlx_array,
         normed: *mut mlx_array,
     ) -> *mut mlx_array;
-    pub fn mlx_qwen4_hyper_up_inject_rows(
-        x: *mut mlx_array,
-        weight: *mut mlx_array,
-        scales: *mut mlx_array,
-        biases: *mut mlx_array,
-        normed: *mut mlx_array,
-        injection: *mut mlx_array,
-        out: *mut *mut mlx_array,
-        out_gate: *mut *mut mlx_array,
-    ) -> bool;
     pub fn mlx_qwen4_routed_shared_experts_rows(
         inputs: *const *mut mlx_array,
         count: usize,

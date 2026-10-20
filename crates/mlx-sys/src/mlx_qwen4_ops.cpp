@@ -1,6 +1,5 @@
 #include "mlx_common.h"
 #include "mlx_kquant.h"
-#include "mlx_qwen4_flags.h"
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -17,56 +16,7 @@
 #include "mlx/primitives.h"
 #endif
 
-namespace {
-struct ForwardFlags {
-  size_t depth = 0;
-  bool enabled = false;
-  std::map<std::string, std::optional<std::string>, std::less<>> values;
-};
-thread_local ForwardFlags forward_flags;
-} // namespace
-
-const char *qwen4_env(const char *name) noexcept {
-  if (!name)
-    return nullptr;
-  if (!forward_flags.depth || !forward_flags.enabled)
-    return std::getenv(name);
-  try {
-    auto found = forward_flags.values.find(std::string_view(name));
-    if (found == forward_flags.values.end()) {
-      const auto raw = std::getenv(name);
-      found = forward_flags.values
-                  .emplace(name, raw ? std::optional<std::string>(raw)
-                                     : std::nullopt)
-                  .first;
-    }
-    return found->second ? found->second->c_str() : nullptr;
-  } catch (...) {
-    // Allocation failure must not cross the C ABI or change flag semantics.
-    return std::getenv(name);
-  }
-}
-
 extern "C" {
-
-void mlx_qwen4_flags_begin() noexcept {
-  if (forward_flags.depth++ == 0) {
-    const auto setting = std::getenv("MLX_QWEN4_CACHE_FLAGS");
-    forward_flags.enabled = !setting || std::strcmp(setting, "0") != 0;
-  }
-}
-
-void mlx_qwen4_flags_end() noexcept {
-  if (forward_flags.depth && --forward_flags.depth == 0) {
-    forward_flags.values.clear();
-    forward_flags.enabled = false;
-  }
-}
-
-bool mlx_qwen4_flag_equals(const char *name, const char *value) noexcept {
-  const auto setting = qwen4_env(name);
-  return setting && value && std::strcmp(setting, value) == 0;
-}
 
 // Singleton only: wider reductions use a different operation schedule.
 bool mlx_qwen4_singleton_routes(mlx_array *logits, mlx_array **ids,
@@ -91,9 +41,7 @@ bool mlx_qwen4_singleton_routes(mlx_array *logits, mlx_array **ids,
                       mlx::core::default_stream(mlx::core::Device::gpu));
     };
     static auto compiled = mlx::core::compile(graph);
-    auto setting = qwen4_env("MLX_QWEN4_CACHED_KERNEL_GRAPHS");
-    const bool cached = (!setting || std::string(setting) != "0");
-    auto result = cached ? compiled({x}) : graph({x});
+    auto result = compiled({x});
     auto i = std::make_unique<array>(std::move(result[0]));
     auto p = std::make_unique<array>(std::move(result[1]));
     *ids = reinterpret_cast<mlx_array *>(i.release());
@@ -134,9 +82,7 @@ bool mlx_qwen4_prefill_routes(mlx_array *logits, mlx_array **ids,
                       mlx::core::default_stream(mlx::core::Device::gpu));
     };
     static auto compiled = mlx::core::compile(graph);
-    auto setting = qwen4_env("MLX_QWEN4_CACHED_KERNEL_GRAPHS");
-    const bool cached = (!setting || std::string(setting) != "0");
-    auto result = cached ? compiled({x}) : graph({x});
+    auto result = compiled({x});
     auto i = std::make_unique<array>(std::move(result[0]));
     auto p = std::make_unique<array>(std::move(result[1]));
     *ids = reinterpret_cast<mlx_array *>(i.release());
@@ -778,14 +724,9 @@ mlx_array *mlx_qwen4_norm(mlx_array *x, mlx_array *w, int group, double eps,
          weight = *reinterpret_cast<array *>(w);
     if (input.shape(-1) % group || weight.size() != input.shape(-1))
       return nullptr;
-    const auto port = qwen4_env("MLX_QWEN4_PREFILL_NORM");
-    if (group == 2560 && !centered && (!port || std::string(port) != "0")) {
+    if (group == 2560 && !centered) {
       if (auto result = mlx_qwen4_prefill_norm(x, w, eps))
         return result;
-    }
-    const auto decode_port = qwen4_env("MLX_QWEN4_DECODE_NORM");
-    if (group == 2560 && !centered &&
-        (!decode_port || std::string(decode_port) != "0")) {
       if (auto result = mlx_qwen4_decode_norm(x, w, eps))
         return result;
     }
@@ -889,17 +830,7 @@ mlx_array *mlx_qwen4_gdn_epilogue(mlx_array *out, mlx_array *z, mlx_array *norm,
     std::vector<array> a{x, g, w, array(float(eps))};
     static auto fn = mlx::core::compile(qwen4_gdn_epilogue_graph);
     static auto port = mlx::core::compile(qwen4_gdn_norm_port);
-    const auto setting = qwen4_env("MLX_QWEN4_PREFILL_GDN_NORM");
-    auto y = (!setting || std::string(setting) != "0") && x.shape(1) > 8
-                 ? port(a)[0]
-                 : fn(a)[0];
-    if (qwen4_env("MLX_QWEN4_EPILOGUE_CHECK")) {
-      auto ref = qwen4_gdn_epilogue_graph(a)[0];
-      if (mlx::core::any(not_equal(y, ref)).item<bool>()) {
-        std::cerr << "QWEN4_EPILOGUE_CHECK_FAILED" << std::endl;
-        return nullptr;
-      }
-    }
+    auto y = x.shape(1) > 8 ? port(a)[0] : fn(a)[0];
     return reinterpret_cast<mlx_array *>(new array(std::move(y)));
   } catch (const std::exception &e) {
     std::cerr << "Qwen4 GDN epilogue: " << e.what() << std::endl;
@@ -1006,10 +937,7 @@ bool mlx_qwen4_route_sort(mlx_array *ids, int experts, mlx_array **order,
         count({input}, {{blocks * experts}}, {mlx::core::uint32},
               {blocks * 256, 1, 1}, {256, 1, 1},
               {{"E", experts},
-               {"BALLOT", experts > 256 && experts <= 512 &&
-                              (!qwen4_env("MLX_QWEN4_BALLOT_ROUTE_SORT") ||
-                               std::string(qwen4_env(
-                                   "MLX_QWEN4_BALLOT_ROUTE_SORT")) != "0")}},
+               {"BALLOT", experts > 256 && experts <= 512}},
               std::nullopt, false, stream);
     auto result =
         scatter({input, counts[0]}, {{rows}, {rows}, {rows}},

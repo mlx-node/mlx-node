@@ -2,7 +2,6 @@
 //! mutated only after their last lazy reader has completed. The ordinary LRU
 //! supplies bounded misses and releases imported chunks after the slot copy.
 use super::*;
-use crate::models::qwen4_exp::runtime_flags;
 use std::time::{Duration, Instant};
 
 /// The driver unwires a bound file-backed bank ~1.15 s after its last use and
@@ -253,12 +252,7 @@ impl Store {
             .map(|layer| mapped.get(&layer).map(|experts| experts.maps.clone()))
             .collect();
         match super::super::prefetch::Pool::new(files, super::super::prefetch::Advise) {
-            Ok(pool) => {
-                if super::super::prefetch::at_load() {
-                    pool.request_all();
-                }
-                self.prefetch = Some(pool);
-            }
+            Ok(pool) => self.prefetch = Some(pool),
             Err(e) => tracing::warn!("qwen4 mapped pack read-ahead unavailable: {e}"),
         }
         self.cache_limit = self.plan.budget;
@@ -422,12 +416,8 @@ impl Store {
     /// experts); such a pass must leave the stamp alone, or a run of drafts
     /// hides the gap the next main pass has to re-wire for.
     pub(in super::super) fn wire_mapped_banks(&mut self, main: bool) -> Result<()> {
-        self.wire_mapped_banks_at(
-            Instant::now(),
-            main,
-            super::super::prefetch::depth_from_env(),
-        )
-        .map(|_| ())
+        self.wire_mapped_banks_at(Instant::now(), main, super::super::prefetch::DEPTH)
+            .map(|_| ())
     }
 
     /// Returns whether the banks were touched. A stale pass over a pack that
@@ -527,10 +517,7 @@ impl Store {
         if self.plan.mapped {
             return Ok(experts);
         }
-        if !self.gguf
-            || runtime_flags::is_zero(c"MLX_QWEN4_EXPERT_SLOTS")
-            || !crate::engine::persistence::compiled_forward_backend_available()
-        {
+        if !self.gguf || !crate::engine::persistence::compiled_forward_backend_available() {
             return Ok(0);
         }
         if let Some(n) = self.slot_capacity {

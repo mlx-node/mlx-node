@@ -1,7 +1,6 @@
 //! Window-wide causal attention. Pages remain the persistent storage; only
 //! the current window and a bounded view of its prefix feed SDPA.
 use super::*;
-use crate::models::qwen4_exp::runtime_flags;
 
 impl Decoder {
     pub(super) fn rope_window(&self, x: &MxArray, start: usize, count: usize) -> Result<MxArray> {
@@ -9,7 +8,7 @@ impl Decoder {
     }
 
     fn use_batch_rotary(&self) -> bool {
-        self.batch_rotary && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_ROTARY")
+        self.batch_rotary
     }
 
     fn rope_window_positions(
@@ -100,9 +99,8 @@ impl Decoder {
         let t = x.shape()?[1] as usize;
         let dtype = x.dtype()?;
         let sparse = base + t > c.indexer_budget;
-        if runtime_flags::is_zero(c"MLX_QWEN4_ATTENTION_WINDOW")
-            // F32 fixtures retain singleton SDPA accumulation (wide NAX uses TF32).
-            || dtype == DType::Float32
+        // F32 fixtures retain singleton SDPA accumulation (wide NAX uses TF32).
+        if dtype == DType::Float32
             || self.verification.is_some()
             || self.position_override.is_some()
             || (sparse

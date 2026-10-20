@@ -1,5 +1,4 @@
 #include "mlx_common.h"
-#include "mlx_qwen4_flags.h"
 
 extern "C" int mlx_gpu_architecture_gen();
 extern "C" bool mlx_qwen4_gated_delta_kernel(mlx_array *, mlx_array *,
@@ -16,7 +15,6 @@ const char *complete_gdn_header =
 #include "metal/common/precise_sigmoid.metal.inc"
     ;
 
-template <bool PREFETCH>
 std::vector<array> complete_gdn_metal(const std::vector<array> &in) {
   static auto fn =
       mlx::core::fast::metal_kernel("qwen4_gdn_complete",
@@ -27,7 +25,7 @@ std::vector<array> complete_gdn_metal(const std::vector<array> &in) {
                                     , complete_gdn_header);
   return fn(in, {{1, 1, 6144}, in[8].shape(), in[5].shape()},
             {in[0].dtype(), mlx::core::float32, in[0].dtype()}, {32, 32, 48},
-            {32, 32, 1}, {{"T", in[0].dtype()}, {"KC", in[5].shape(0) + 1}, {"PREFETCH", PREFETCH}},
+            {32, 32, 1}, {{"T", in[0].dtype()}, {"KC", in[5].shape(0) + 1}},
             std::nullopt, false,
             mlx::core::default_stream(mlx::core::Device::gpu));
 }
@@ -238,28 +236,17 @@ mlx_qwen4_complete_gdn(mlx_array *qkv, mlx_array *z, mlx_array *a, mlx_array *b,
     // trace. MLX fuses pointwise work while preserving the recurrent primitive.
     static auto fn = mlx::core::compile(complete_gdn);
     static const int arch = mlx_gpu_architecture_gen();
-    auto setting = qwen4_env("MLX_QWEN4_COMPLETE_GDN_METAL");
-    auto rows = qwen4_env("MLX_QWEN4_GDN_4ROWS");
-    bool fused = arch >= 17 && (!setting || std::string(setting) != "0") &&
-                 (!rows || std::string(rows) != "0");
-    static auto compiled_metal = mlx::core::compile(complete_gdn_metal<false>);
-    static auto compiled_prefetch = mlx::core::compile(complete_gdn_metal<true>);
-    const auto pf = qwen4_env("MLX_QWEN4_GDN_DECODE_PREFETCH");
-    const bool prefetch = pf && std::string(pf) == "1";
-    auto cached_setting = qwen4_env("MLX_QWEN4_CACHED_KERNEL_GRAPHS");
-    const bool cached = (!cached_setting || std::string(cached_setting) != "0");
+    // The single-kernel port needs the M5 generation's SIMD geometry.
+    const bool fused = arch >= 17;
+    static auto compiled_metal = mlx::core::compile(complete_gdn_metal);
     if (!fused) {
-      // Compact gate storage is a Metal-kernel port. Keep the older-GPU and
-      // explicit rollback graph's original F32 inputs: putting these casts
-      // inside compile changes pointwise fusion and its rounding.
+      // Compact gate storage is a Metal-kernel port. Keep the older-GPU
+      // graph's original F32 inputs: putting these casts inside compile
+      // changes pointwise fusion and its rounding.
       in[2] = astype(in[2], mlx::core::float32);
       in[3] = astype(in[3], mlx::core::float32);
     }
-    auto result =
-        fused ? (prefetch
-                     ? (cached ? compiled_prefetch(in) : complete_gdn_metal<true>(in))
-                     : (cached ? compiled_metal(in) : complete_gdn_metal<false>(in)))
-              : fn(in);
+    auto result = fused ? compiled_metal(in) : fn(in);
     auto y = std::make_unique<array>(std::move(result[0]));
     auto s = std::make_unique<array>(std::move(result[1]));
     auto h = std::make_unique<array>(std::move(result[2]));

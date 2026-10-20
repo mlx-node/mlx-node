@@ -3,17 +3,14 @@
 //! mappings. Any miss restores the recurrent/page frontier and replays using
 //! the ordinary loader. This never predicts an expert or approximates routing.
 use super::*;
-use crate::models::qwen4_exp::runtime_flags;
 
 impl Decoder {
     pub(super) fn deferred_state_submission(&self) -> bool {
-        self.device_routes.is_some() && !runtime_flags::is_zero(c"MLX_QWEN4_STATE_SUBMISSION")
+        self.device_routes.is_some()
     }
 
     pub(super) fn deferred_forward_completion(&self) -> bool {
-        self.deferred_state_submission()
-            && self.verification.is_none()
-            && !runtime_flags::is_zero(c"MLX_QWEN4_DEFER_FINAL_COMPLETION")
+        self.deferred_state_submission() && self.verification.is_none()
     }
 
     fn pending_state_arrays(&self) -> Vec<&MxArray> {
@@ -21,7 +18,7 @@ impl Decoder {
     }
 
     pub(super) fn async_device_prefill(&self) -> bool {
-        self.device_routes.is_some() && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_ASYNC_WINDOW")
+        self.device_routes.is_some()
     }
 
     /// TrackP12Prefill.sortedMoE's device-only route/sort/indirect execution,
@@ -79,10 +76,7 @@ impl Decoder {
             || self.config.num_experts_per_tok != 10
             || !crate::engine::persistence::compiled_forward_backend_available()
             || !unsafe { mlx_sys::mlx_metal_is_nax_available() }
-            || runtime_flags::is_zero(c"MLX_ENABLE_TF32")
-            || runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_DEVICE_ROUTES")
-            || runtime_flags::is_zero(c"MLX_QWEN4_COUNTING_SORT")
-            || runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_INDIRECT")
+            || !super::super::tf32_enabled()
             || !self
                 .weights
                 .prefill_device_slots_ready(self.config.num_hidden_layers)
@@ -104,15 +98,7 @@ impl Decoder {
         }
         let tape = MxArray::concatenate_many(routes.iter().map(|(_, ids)| ids).collect(), Some(0))?;
         let mut completed = vec![&output, &tape];
-        if !runtime_flags::is_zero(c"MLX_QWEN4_STATE_SUBMISSION") {
-            completed.extend(self.pending_state_arrays());
-        } else if !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_ASYNC_WINDOW") {
-            completed.extend(
-                self.caches
-                    .iter()
-                    .filter_map(|cache| cache.ple_conv.as_ref()),
-            );
-        }
+        completed.extend(self.pending_state_arrays());
         MxArray::eval_arrays_with_context(&completed, "qwen4::prefill_device_routes::commit")?;
         if let Some(adapter) = &mut self.paged {
             adapter
@@ -127,18 +113,7 @@ impl Decoder {
             &ids,
             tokens.len() * self.config.num_experts_per_tok,
         )?;
-        let force = runtime_flags::is_one(c"MLX_QWEN4_PREFILL_DEVICE_ROUTE_FORCE_REPLAY");
-        if runtime_flags::is_one(c"MLX_QWEN4_TRACE_DEVICE_ROUTES") {
-            eprintln!(
-                "QWEN4_PREFILL_DEVICE_ROUTES position={} tokens={} layers={} hit={} replay={}",
-                base.history.len(),
-                tokens.len(),
-                routes.len(),
-                hit,
-                !hit || force
-            );
-        }
-        if hit && !force {
+        if hit {
             return Ok(output);
         }
         drop(output);
@@ -167,14 +142,8 @@ impl Decoder {
     }
 
     pub(super) fn decode_submit_span(&self) -> usize {
-        if self.device_routes.is_some()
-            && !runtime_flags::is_zero(c"MLX_QWEN4_DEVICE_ROUTE_WIDE_SUBMISSION")
-        {
-            if !runtime_flags::is_zero(c"MLX_QWEN4_DEVICE_ROUTE_COALESCED") {
-                self.config.num_hidden_layers
-            } else {
-                12
-            }
+        if self.device_routes.is_some() {
+            self.config.num_hidden_layers
         } else {
             3
         }
@@ -185,7 +154,6 @@ impl Decoder {
         // then submit groups of three while building the rest of this token.
         // Ordinary decoding retains its per-layer submission and short waits.
         self.device_routes.is_none()
-            || runtime_flags::is_zero(c"MLX_QWEN4_DEVICE_ROUTE_COALESCED")
             || (completed_layers >= 2 && (completed_layers - 2).is_multiple_of(3))
     }
 
@@ -196,10 +164,7 @@ impl Decoder {
         scores: &MxArray,
         layer: usize,
     ) -> Result<Option<MxArray>> {
-        if self.device_routes.is_none()
-            || runtime_flags::is_zero(c"MLX_QWEN4_SHARED_EXPERTS")
-            || runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
-        {
+        if self.device_routes.is_none() {
             return Ok(None);
         }
         let shared = ["gate", "up", "down"].map(|part| {
@@ -280,8 +245,6 @@ impl Decoder {
             || !self
                 .weights
                 .device_slots_ready(self.config.num_hidden_layers)
-            || runtime_flags::is_zero(c"MLX_QWEN4_DEVICE_ROUTES")
-            || runtime_flags::is_zero(c"MLX_QWEN4_FUSED_EXPERTS")
         {
             return self.ordinary_token(token, project);
         }
@@ -300,9 +263,7 @@ impl Decoder {
         // The normal decoder already completes its final hidden/logits. Join
         // the tape explicitly, so one readback validates all layers at once.
         let mut completed = vec![&out, &tape];
-        if !runtime_flags::is_zero(c"MLX_QWEN4_STATE_SUBMISSION") {
-            completed.extend(self.pending_state_arrays());
-        }
+        completed.extend(self.pending_state_arrays());
         MxArray::eval_arrays_with_context(&completed, "qwen4::device_routes::commit")?;
         // A deferred final layer can leave its page write lazy. Complete it
         // before validating routes, releasing readers, or publishing output.
@@ -311,29 +272,17 @@ impl Decoder {
                 .eval_pending_pool_writes()
                 .map_err(Error::from_reason)?;
         }
-        if !runtime_flags::is_zero(c"MLX_QWEN4_DEVICE_ROUTE_READER_JOIN") {
-            self.weights.complete_device_readers()?;
-        }
+        self.weights.complete_device_readers()?;
         let ids = tape.to_uint32()?;
         let layers: Vec<_> = routes.iter().map(|(layer, _)| *layer).collect();
         let hit =
             self.weights
                 .commit_device_routes(&layers, &ids, self.config.num_experts_per_tok)?;
-        let force_replay = runtime_flags::is_one(c"MLX_QWEN4_DEVICE_ROUTE_FORCE_REPLAY");
-        if runtime_flags::is_one(c"MLX_QWEN4_TRACE_DEVICE_ROUTES") {
-            eprintln!(
-                "QWEN4_DEVICE_ROUTES position={} layers={} hit={} replay={}",
-                base.history.len(),
-                routes.len(),
-                hit,
-                !hit || force_replay
-            );
-        }
-        if hit && !force_replay {
+        if hit {
             return Ok(out);
         }
         drop(out);
-        self.device_route_cooldown = if force_replay { 0 } else { 16 };
+        self.device_route_cooldown = 16;
         self.replay_device_token(base, token, project)
     }
 

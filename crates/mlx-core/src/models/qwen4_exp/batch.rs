@@ -1,7 +1,6 @@
 //! Matrix batching for prompt windows and scheduled decode rows. Stateful
 //! attention/PLE preserve each owner's order; stateless HC/MLP share weights.
 use super::*;
-use crate::models::qwen4_exp::runtime_flags;
 use std::collections::BTreeMap;
 
 impl Decoder {
@@ -12,7 +11,7 @@ impl Decoder {
         scores: &MxArray,
         i: usize,
     ) -> Result<Option<MxArray>> {
-        if !self.gguf() || runtime_flags::is_zero(c"MLX_QWEN4_RESIDENT_GATHER") {
+        if !self.gguf() {
             return Ok(None);
         }
         let banks = ["gate", "up", "down"].map(|part| {
@@ -46,7 +45,6 @@ impl Decoder {
             &selected.reshape(&[-1])?,
             &banks,
             self.config.num_experts,
-            self.config.num_experts,
         )? {
             return math::combine_expert_rows(&output, scores, Some(&inverse), top).map(Some);
         }
@@ -74,23 +72,15 @@ impl Decoder {
         }
     }
 
-    // The fused 32-row layout benefits dispersed routing; concentrated routes
-    // retain 64-row tiles to amortize packed-weight reads. Partial banks already
-    // know their active count. Full residency keeps device-only routing.
+    // Every window of at least 256 assignments takes the fused 32-row tiles.
     fn indirect_expert_assignment_rows(
         input: &MxArray,
         token_rows: &MxArray,
         ids: &MxArray,
         banks: &[std::sync::Arc<super::super::weights::Weight>; 3],
         experts: usize,
-        active_experts: usize,
     ) -> Result<Option<(MxArray, MxArray)>> {
-        if runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_INDIRECT")
-            || ids.size()? < 256
-            || (ids.size()? / active_experts.max(1) as u64 >= 32
-                && runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_REFERENCE_INDIRECT"))
-            || input.dtype()? != DType::BFloat16
-        {
+        if ids.size()? < 256 || input.dtype()? != DType::BFloat16 {
             return Ok(None);
         }
         let Some((order, inverse, selected)) = math::route_sort(ids, experts)? else {
@@ -140,7 +130,7 @@ impl Decoder {
             ids.clone()
         };
         let x = x.reshape(&[rows, 1, input.shape()?[1]])?;
-        let tiles = if sorted && !runtime_flags::is_zero(c"MLX_QWEN4_EXPERT_TILES") {
+        let tiles = if sorted {
             math::expert_tiles(&selected, experts)?
         } else {
             None
@@ -179,7 +169,6 @@ impl Decoder {
         selected: &MxArray,
         banks: &[std::sync::Arc<super::super::weights::Weight>; 3],
         capacity: usize,
-        active_experts: usize,
         top: usize,
     ) -> Result<(MxArray, Option<MxArray>)> {
         let tokens = x.shape_at(1)?;
@@ -188,14 +177,9 @@ impl Decoder {
             .reshape(&[tokens, 1])?
             .broadcast_to(&[tokens, top as i64])?
             .reshape(&[-1])?;
-        if let Some((out, inverse)) = Self::indirect_expert_assignment_rows(
-            &source,
-            &token_rows,
-            selected,
-            banks,
-            capacity,
-            active_experts,
-        )? {
+        if let Some((out, inverse)) =
+            Self::indirect_expert_assignment_rows(&source, &token_rows, selected, banks, capacity)?
+        {
             return Ok((out, Some(inverse)));
         }
         Self::sorted_expert_assignment_rows(
@@ -231,7 +215,6 @@ impl Decoder {
             && c.moe_intermediate_size == 640
             && x.dtype()? == DType::BFloat16
             && ids.len() == x.shape()?[1] as usize * c.num_experts_per_tok
-            && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_EXPERTS")
             && ids
                 .iter()
                 .copied()
@@ -250,8 +233,7 @@ impl Decoder {
         }
         // Leave the experts used nearest the prompt boundary in the slots.
         // Router order is restored below, independently of SSD load order.
-        let linear_plan =
-            x.shape_at(1)? > 8 && !runtime_flags::is_zero(c"MLX_QWEN4_LINEAR_ROUTE_PLAN");
+        let linear_plan = x.shape_at(1)? > 8;
         let mut last = BTreeMap::new();
         let linear_order = if linear_plan {
             Some(
@@ -273,10 +255,7 @@ impl Decoder {
                     .unwrap_or_else(|| last.keys().copied().collect()),
             );
         }
-        if active_experts <= capacity
-            && x.shape_at(1)? > 8
-            && !runtime_flags::is_zero(c"MLX_QWEN4_SINGLE_SLOT_GROUP")
-        {
+        if active_experts <= capacity && x.shape_at(1)? > 8 {
             self.check_cancelled()?;
             let Some((banks, slots, count)) =
                 self.weights
@@ -285,20 +264,11 @@ impl Decoder {
                 return Ok(None);
             };
             let selected = MxArray::from_uint32(&slots, &[slots.len() as i64])?;
-            let (out, inverse) = Self::single_slot_group_rows(
-                x,
-                &selected,
-                &banks,
-                count,
-                active_experts,
-                c.num_experts_per_tok,
-            )?;
+            let (out, inverse) =
+                Self::single_slot_group_rows(x, &selected, &banks, count, c.num_experts_per_tok)?;
             let reduced =
                 math::combine_expert_rows(&out, scores, inverse.as_ref(), c.num_experts_per_tok)?;
-            if self.verification.is_none()
-                && !runtime_flags::is_zero(c"MLX_QWEN4_DEFER_EXPERT_REDUCTION")
-                && !runtime_flags::is_zero(c"MLX_QWEN4_ASYNC_SUBMISSION")
-            {
+            if self.verification.is_none() {
                 // This one bank group has no intervening slot reuse. Keep
                 // its reduction as the lease, so the large assignment output
                 // is released after GPU execution. A later router/frontier
@@ -360,7 +330,6 @@ impl Decoder {
                     &selected,
                     &banks,
                     count,
-                    experts.len(),
                 )? {
                 (out, Some(inverse))
             } else {
@@ -458,7 +427,7 @@ impl Decoder {
             return Ok(Some(out));
         }
         use super::super::weights::{MAX_READ_BYTES, Weight};
-        if !self.gguf() || runtime_flags::is_zero(c"MLX_QWEN4_BATCH_EXPERTS") {
+        if !self.gguf() {
             return Ok(None);
         }
         let (h, m) = (self.config.hidden_size, self.config.moe_intermediate_size);
@@ -628,7 +597,6 @@ impl Decoder {
         let prepared = if self.gguf()
             && c.linear_conv_kernel_dim == 4
             && (kh, nh, kd, vd) == (16, 48, 128, 128)
-            && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_GDN_PREP")
         {
             math::gdn_prepare(&qkv, &a, &b, &conv, &mut cache.conv, &scale, &dt)?
         } else {
@@ -675,9 +643,7 @@ impl Decoder {
         self.submit_state(&[&state], "qwen4::batch::recurrent_state")?;
         cache.recurrent = Some(state);
         let norm = self.dense(&format!("{p}.norm.weight"), &format!("{g}.ssm_norm.weight"))?;
-        let replay = if c.output_gate_type == "sigmoid"
-            && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_EPILOGUE")
-        {
+        let replay = if c.output_gate_type == "sigmoid" {
             math::gdn_epilogue(&out, &z, &norm, c.rms_norm_eps)?
         } else {
             None

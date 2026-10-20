@@ -26,7 +26,7 @@ constexpr int BP=get_bytes_per_pack<BITS>();
 auto packed=(const device uint8_t*)w + size_t(col)*(K*BP/VP);
 uint qr=tid/2,qb=(tid%2)*32;
 uint4 qwords[2]; float qs,qbias;
-if constexpr(WEIGHT_PREFETCH) {
+{
     auto src=(const device uint32_t*)(packed+qr*K+qb+0);
     qwords[0]=uint4(src[0],src[1],src[2],src[3]);
     qwords[1]=uint4(src[4],src[5],src[6],src[7]);
@@ -35,7 +35,7 @@ if constexpr(WEIGHT_PREFETCH) {
 }
 for (int base=0; base<K; base+=BK) {
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if constexpr(WEIGHT_PREFETCH) {
+  {
     auto dst=(threadgroup vec<C,4>*)(Ws+qr*PAD+qb);
     STEEL_PRAGMA_UNROLL
     for(int j=0;j<8;++j) {
@@ -45,30 +45,14 @@ for (int base=0; base<K; base+=BK) {
         C(qs*float((word>>16)&255u)+qbias),
         C(qs*float(word>>24)+qbias));
     }
-  } else
-  {
-    constexpr int READS=(BN*(BK/VP))/128;
-    uint row=(READS*tid)/(BK/VP), kcol=(READS*tid%(BK/VP))*VP;
-    size_t side=size_t(col+row)*(K/GS)+(base+kcol)/GS;
-    float scale=float(scales[side]), bias=float(biases[side]);
-    STEEL_PRAGMA_UNROLL
-    for (int pack=0; pack<READS; ++pack) {
-      float values[VP];
-      dequantize<float,VP,BITS,false>(packed+row*(K*BP/VP)+(base+kcol+pack*VP)*BP/VP,
-        scale,bias,values);
-      STEEL_PRAGMA_UNROLL
-      for (int v=0; v<VP; ++v) Ws[row*PAD+kcol+pack*VP+v]=C(values[v]);
-    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if constexpr(WEIGHT_PREFETCH) {
-    if(base+BK<K) {
+  if(base+BK<K) {
     auto src=(const device uint32_t*)(packed+qr*K+qb+(base+BK));
     qwords[0]=uint4(src[0],src[1],src[2],src[3]);
     qwords[1]=uint4(src[4],src[5],src[6],src[7]);
     size_t side=size_t(col+qr)*(K/32)+(qb+(base+BK))/32;
     qs=float(scales[side]); qbias=float(biases[side]);
-    }
   }
   if (valid>0) {
     STEEL_PRAGMA_NO_UNROLL

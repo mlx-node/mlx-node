@@ -2,7 +2,6 @@
 //! assemble fixed projections while experts, PLE/token rows and optional
 //! vision/MTP remain demand loaded. All source reads stay bounded.
 use super::*;
-use crate::models::qwen4_exp::runtime_flags;
 use std::sync::atomic::Ordering;
 
 pub(super) fn is_auxiliary(name: &str) -> bool {
@@ -34,8 +33,7 @@ impl Tensor {
     fn dense_projection_cache_bytes(&self, name: &str) -> Result<u64> {
         let f32 = matches!(&self.encoding, Encoding::Safe(t) if t == "F32")
             || matches!(self.encoding, Encoding::Gguf(GgufTensorType::F32));
-        if runtime_flags::is_zero(c"MLX_QWEN4_DENSE_BF16_CACHE")
-            || !f32
+        if !f32
             || !is_fixed_projection(name, self)
             || name.contains("conv1d")
             || !(self.shape.len() == 2
@@ -343,11 +341,8 @@ impl Store {
             let mut names: Vec<_> = self.tensors.keys().filter(|n| is_hot(n)).cloned().collect();
             names.sort();
             names
-        } else if self.plan.policy != "stream" && !runtime_flags::is_zero(c"MLX_QWEN4_DENSE_BANKS")
-        {
-            self.projection_bank_names()?
         } else {
-            Vec::new()
+            self.projection_bank_names()?
         };
         if names.is_empty() {
             return Ok(());
@@ -387,11 +382,7 @@ impl Store {
         self.cache_limit = self.plan.budget;
         self.plan.resident = false;
         self.slot_capacity = None;
-        let names = if runtime_flags::is_zero(c"MLX_QWEN4_DENSE_BANKS") {
-            Vec::new()
-        } else {
-            self.projection_bank_names()?
-        };
+        let names = self.projection_bank_names()?;
         if !self.prepare_banks(names, admit)? {
             return Err(err(
                 "Qwen4 partial residency lost first-request headroom during load",
@@ -749,8 +740,7 @@ impl Store {
             && x.dtype()? == DType::BFloat16
             && first.ends_with(".ffn_gate_shexp.weight")
             && second.ends_with(".ffn_up_shexp.weight")
-            && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_SHARED_PAIR")
-            && !runtime_flags::is_zero(c"MLX_ENABLE_TF32")
+            && super::super::tf32_enabled()
             && unsafe { mlx_sys::mlx_metal_is_nax_available() }
         {
             let eligible = |w: &Weight| -> Result<bool> {
@@ -783,7 +773,7 @@ impl Store {
         if first.ends_with(".ssm_alpha.weight") && second.ends_with(".ssm_beta.weight") {
             return Ok((self.linear(first, x)?, self.linear(second, x)?));
         }
-        if (rows <= 8 || wide_shared) && !runtime_flags::is_zero(c"MLX_QWEN4_PAIRED_PROJECTIONS") {
+        if rows <= 8 || wide_shared {
             let key = (first.to_owned(), second.to_owned());
             if !self.paired_banks.contains_key(&key)
                 && let (Some(a), Some(b)) = (
@@ -864,7 +854,6 @@ impl Weight {
             // The generic fast path uses a different accumulation for K%512=0.
             && x.shape()?.last().is_some_and(|k| k % 512 != 0)
             && crate::engine::persistence::compiled_forward_backend_available()
-            && !runtime_flags::is_zero(c"MLX_QWEN4_AFFINE_GEMV")
         {
             let out = unsafe {
                 mlx_sys::mlx_qwen4_affine_expert_gemv(
@@ -884,7 +873,6 @@ impl Weight {
             && ids.size()? <= 80
             && let (Some(scales), Some(biases)) = (&self.scales, &self.biases)
             && crate::engine::persistence::compiled_forward_backend_available()
-            && !runtime_flags::is_zero(c"MLX_QWEN4_DIRECT_GEMV")
         {
             let mode = std::ffi::CString::new(self.mode.as_str()).map_err(err)?;
             let out = unsafe {

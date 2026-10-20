@@ -122,10 +122,7 @@ speculative and were reclaimed before the driver bound them, doubling a
 cold window's reads, and a walk through the banks' own mapping left the
 whole pack in the process's page tables (75 GiB of RSS between turns). A
 pass over several rows (MTP verification) runs every layer's hook once per
-row; the pool requests each layer once per pass. `MLX_QWEN4_PREFETCH_LAYERS`
-sets the depth (default 3; `0` restores the unconditional touch; a depth past
-the last layer requests the whole pack as the pass starts) and
-`MLX_QWEN4_PREFETCH_AT_LOAD=1` requests the whole pack as the model loads.
+row; the pool requests each layer once per pass. The depth is three layers.
 Every prefill
 window and every decode step needs the entire routed set resident at once:
 when other processes' anonymous memory leaves less than that (a 20 GiB
@@ -185,9 +182,6 @@ before erroring.
 | `MLX_QWEN4_RESIDENCY=stream` | Bound the on-demand cache to at most 8 GiB unless overridden.           |
 | `MLX_QWEN4_WEIGHT_CACHE_GIB` | Optional integer ceiling, at least 2 GiB; live admission still applies. Pins an anonymous budget, so the slot path is used even when the mapped pack exists. |
 | `MLX_QWEN4_MAPPED_PACK=0`    | Keep the slot path although the mapped pack is complete (A/B arm).      |
-| `MLX_QWEN4_PREFETCH_LAYERS`  | Layers of the mapped pack read ahead of the one computing when a pass starts over a pack that is not fully resident (default 3; `0` disables read-ahead and a stale pass always touches every bank). |
-| `MLX_QWEN4_PREFETCH_AT_LOAD=1` | Ask the kernel for the whole mapped pack as the model loads (opt-in; moves the first prompt's SSD time into the load). |
-| `MLX_QWEN4_PACKED_CACHE=0`   | Disable prepared SSD caching.                                           |
 | `MLX_QWEN4_PACKED_CACHE_DIR` | Override the prepared-cache location.                                   |
 | `MLX_QWEN4_PACKED_CACHE_MAX_GB` | Optional global cap across every packed-cache identity directory, in GiB; least-recently-used eviction. Unset or `<=0` keeps only the per-checkpoint 96 GiB budget. |
 | `MLX_NATIVE_GGUF_CACHE_MAX_GB` | Optional cap on the whole native GGUF cache (packed weights plus extracted tokenizer assets), in GiB; least-recently-used eviction under a 24 h grace, with atomic root-wide admission at publish (a conversion that cannot fit loads from its staging dir instead; a later reload reuses that staged result rather than re-converting, and the refused dir is a per-pid load output the sweep keeps while the process lives). Unset, `<=0` or unparseable means unlimited. |

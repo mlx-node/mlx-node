@@ -1634,109 +1634,6 @@ fn fused_recurrence_sequence_matches_varying_stepwise_inputs_and_continuation() 
 }
 
 #[test]
-fn vector_recurrence_preserves_outputs_state_and_continuation() {
-    use crate::array::DType;
-    const CHILD: &str = "MLX_QWEN4_VECTOR_RECURRENCE_TEST_CHILD";
-    if std::env::var(CHILD).as_deref() != Ok("1") {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "models::qwen4_exp::tests::vector_recurrence_preserves_outputs_state_and_continuation",
-                "--test-threads=1",
-            ])
-            .env(CHILD, "1")
-            .env("MLX_QWEN4_GDN_4ROWS", "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    let make = |shape: &[i64], phase: f32, scale: f32, dtype: DType, strided: bool, offset: i64| {
-        let n = shape.iter().product::<i64>();
-        let data = (0..(n + offset) * if strided { 2 } else { 1 })
-            .map(|i| ((i as f32 + phase) * 0.017).sin() * scale)
-            .collect::<Vec<_>>();
-        let x = MxArray::from_float32(&data, &[n + offset, if strided { 2 } else { 1 }])
-            .unwrap()
-            .astype(dtype)
-            .unwrap();
-        let x = x.slice_axis(0, offset, n + offset).unwrap();
-        let x = if strided {
-            x.slice_axis(1, 0, 1).unwrap()
-        } else {
-            x
-        };
-        x.reshape(shape).unwrap()
-    };
-    for dtype in [DType::Float32, DType::BFloat16] {
-        for (strided, offset) in [(false, 0), (true, 0), (false, 1), (true, 1)] {
-            let initial = make(
-                &[1, 48, 128, 128],
-                7.0,
-                0.1,
-                DType::Float32,
-                strided,
-                offset,
-            );
-            let snapshot = initial.to_float32().unwrap().to_vec();
-            let mut control = initial.clone();
-            let mut candidate = initial.clone();
-            for tokens in [7, 9, 1024, 1] {
-                // Compact tiled GGUF key heads: this catches an accidental port
-                // of the reference's consecutive, rather than modulo, mapping.
-                let q = make(&[1, tokens, 16, 128], 1.0, 0.05, dtype, strided, offset);
-                let k = make(&[1, tokens, 16, 128], 3.0, 0.06, dtype, strided, offset);
-                let v = make(&[1, tokens, 48, 128], 9.0, 0.2, dtype, strided, offset);
-                let g = make(&[1, tokens, 48], 2.0, 0.03, DType::Float32, strided, offset)
-                    .add_scalar(0.95)
-                    .unwrap();
-                let b = make(&[1, tokens, 48], 5.0, 0.2, DType::Float32, strided, offset)
-                    .add_scalar(0.5)
-                    .unwrap();
-                // Only this test runs in the child. Fully evaluate each graph
-                // before changing the flag, then compare every output/state bit.
-                unsafe { std::env::set_var("MLX_QWEN4_GDN_VECTOR_ROWS", "0") };
-                let (want, next_control) =
-                    math::recurrent_sequence(&q, &k, &v, &g, &b, &control).unwrap();
-                let expected = [
-                    want.to_float32().unwrap().to_vec(),
-                    next_control.to_float32().unwrap().to_vec(),
-                ];
-                unsafe { std::env::set_var("MLX_QWEN4_GDN_VECTOR_ROWS", "1") };
-                let (got, next_candidate) =
-                    math::recurrent_sequence(&q, &k, &v, &g, &b, &candidate).unwrap();
-                for (actual, expected) in [
-                    got.to_float32().unwrap(),
-                    next_candidate.to_float32().unwrap(),
-                ]
-                .iter()
-                .zip(&expected)
-                {
-                    assert_eq!(actual.len(), expected.len());
-                    for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
-                        assert!(
-                            actual.is_finite() && actual.to_bits() == expected.to_bits(),
-                            "tokens={tokens}, strided={strided}, offset={offset}, index={index}: {actual} != {expected}"
-                        );
-                    }
-                }
-                control = next_control;
-                candidate = next_candidate;
-            }
-            assert_eq!(initial.to_float32().unwrap().as_ref(), snapshot.as_slice());
-        }
-    }
-}
-
-#[test]
 fn batched_causal_convolution_matches_stepwise_history() {
     use crate::array::DType;
     for dtype in [DType::Float32, DType::BFloat16] {
@@ -3237,35 +3134,11 @@ fn incomplete_mtp_companion_is_rejected_before_payload_reads() {
     assert_eq!(store.bytes_read, 0);
 }
 
+/// The fused kernels against the ordinary projections, including mixed
+/// quantization, changing routes, missing slots and shared experts.
 #[test]
 fn fused_routed_experts_preserve_mixed_formats_and_changing_inputs() {
     if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    const CHILD: &str = "MLX_QWEN4_EXPERT_STAGING_TEST_CHILD";
-    if std::env::var(CHILD).as_deref() != Ok("1") {
-        // Exercise both epilogues against the ordinary projections, including
-        // mixed quantization, changing routes, missing slots and shared experts.
-        // Process isolation avoids mutating settings used by other GPU tests.
-        for (lanes, schedule) in [("0", "0"), ("1", "0"), ("1", "1")] {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "models::qwen4_exp::tests::fused_routed_experts_preserve_mixed_formats_and_changing_inputs",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1")
-                .env("MLX_QWEN4_EXPERT_LANE_STAGING", lanes)
-                .env("MLX_QWEN4_REFERENCE_DOWN_SCHEDULE", schedule)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "lanes={lanes}, schedule={schedule}: {}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
         return;
     }
     use crate::array::DType;
@@ -3954,7 +3827,6 @@ fn compact_q8_decode_preserves_promoted_gemv_and_bf16_rounding() {
 fn hyper_up_preserves_native_sigmoid_halfway_rounding() {
     use crate::array::DType;
     use crate::models::quantized_linear::QuantizedLinear;
-    use crate::nn::Activations;
     if !crate::engine::persistence::compiled_forward_backend_available() {
         return;
     }
@@ -4020,63 +3892,6 @@ fn hyper_up_preserves_native_sigmoid_halfway_rounding() {
     .to_float32()
     .unwrap();
     assert_eq!(&*actual, &*expected);
-    for injection in [
-        [-27.375, -21.25, 1.5078125, -14.875],
-        [0.0, 27.375, -128.0, 128.0],
-        [0.023, 0.91, -0.137, -0.42],
-    ] {
-        let gate = MxArray::from_float32(&injection, &[1, 1, 4])
-            .unwrap()
-            .astype(DType::BFloat16)
-            .unwrap();
-        let expected_gate = Activations::sigmoid(&gate.div_scalar(4.0).unwrap())
-            .unwrap()
-            .mul_scalar(2.0)
-            .unwrap()
-            .to_float32()
-            .unwrap();
-        let mut mixed = std::ptr::null_mut();
-        let mut fused_gate = std::ptr::null_mut();
-        assert!(unsafe {
-            mlx_sys::mlx_qwen4_hyper_up_inject_rows(
-                x.as_raw_ptr(),
-                w.as_raw_ptr(),
-                s.as_raw_ptr(),
-                b.as_raw_ptr(),
-                n.as_raw_ptr(),
-                gate.as_raw_ptr(),
-                &mut mixed,
-                &mut fused_gate,
-            )
-        });
-        let mixed = MxArray::from_handle(mixed, "mixer with gate regression")
-            .unwrap()
-            .to_float32()
-            .unwrap();
-        let fused_gate = MxArray::from_handle(fused_gate, "injection gate regression")
-            .unwrap()
-            .to_float32()
-            .unwrap();
-        assert_eq!(&*mixed, &*expected);
-        assert_eq!(&*fused_gate, &*expected_gate);
-        // Unsupported dtype must leave both output handles empty.
-        let fp32_gate = gate.astype(DType::Float32).unwrap();
-        let mut mixed = std::ptr::null_mut();
-        let mut fused_gate = std::ptr::null_mut();
-        assert!(!unsafe {
-            mlx_sys::mlx_qwen4_hyper_up_inject_rows(
-                x.as_raw_ptr(),
-                w.as_raw_ptr(),
-                s.as_raw_ptr(),
-                b.as_raw_ptr(),
-                n.as_raw_ptr(),
-                fp32_gate.as_raw_ptr(),
-                &mut mixed,
-                &mut fused_gate,
-            )
-        });
-        assert!(mixed.is_null() && fused_gate.is_null());
-    }
 }
 
 #[test]
@@ -4514,36 +4329,6 @@ impl CompleteGdnInputs {
             .unwrap();
         (out, next, history.unwrap())
     }
-}
-
-#[test]
-fn complete_gdn_compact_gates_preserve_fallback_rounding() {
-    // Exercise the older-GPU graph on every Metal host. A forced rollback
-    // used to fuse the BF16 gate casts differently from its F32 control.
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "models::qwen4_exp::tests::complete_gdn_replay_preserves_outputs_and_independent_histories",
-            "--exact", "--test-threads=1",
-        ])
-        .env("MLX_QWEN4_COMPLETE_GDN_METAL", "0")
-        .status().unwrap();
-    assert!(status.success(), "complete GDN fallback regression failed");
-}
-
-#[test]
-fn complete_gdn_prefetch_preserves_outputs_and_independent_histories() {
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "models::qwen4_exp::tests::complete_gdn_replay_preserves_outputs_and_independent_histories", "--test-threads=1"])
-        .env("MLX_QWEN4_GDN_DECODE_PREFETCH", "1")
-        .status()
-        .unwrap();
-    assert!(
-        status.success(),
-        "GDN prefetch changed output, state or history bits"
-    );
 }
 
 #[test]
@@ -5007,8 +4792,7 @@ fn indirect_prefill_preserves_mixed_formats_rows_and_tail_rounding() {
                 .astype(DType::BFloat16)
                 .unwrap();
                 let (output, inverse) =
-                    decoder::Decoder::single_slot_group_rows(&x, &routes, &banks, e, e - 1, top)
-                        .unwrap();
+                    decoder::Decoder::single_slot_group_rows(&x, &routes, &banks, e, top).unwrap();
                 let expected = math::combine_expert_rows(&expected_rows, &scores, None, top)
                     .unwrap()
                     .to_float32()
@@ -5741,9 +5525,7 @@ fn reference_hyper_norm_preserves_mean_boundaries_and_offset_views() {
 fn shared_prefill_preserves_q8_values_companions_and_row_tails() {
     use crate::array::DType;
     use crate::models::quantized_linear::QuantizedLinear;
-    if std::env::var("MLX_ENABLE_TF32").as_deref() == Ok("0")
-        || runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_SHARED_Q8")
-    {
+    if !super::tf32_enabled() {
         return;
     }
     let ids = MxArray::from_uint32(&vec![0; 256], &[256]).unwrap();
@@ -7126,7 +6908,6 @@ fn row_batched_decode_kernels_match_single_row_calls_bit_for_bit() {
 
         let x = bf16_rows(rows, 320, 1. / 64., 8., &mut next);
         let normed = bf16_rows(rows, 10240, 1. / 128., 4., &mut next);
-        let injection = bf16_rows(rows, 4, 1. / 16., 32., &mut next);
         let singles: Vec<MxArray> = (0..rows)
             .map(|j| {
                 MxArray::from_handle(
@@ -7151,38 +6932,6 @@ fn row_batched_decode_kernels_match_single_row_calls_bit_for_bit() {
             &batched,
             &stack_rows(&singles),
             &format!("hyper up rows={rows}"),
-        );
-
-        let (mut mixed_singles, mut gate_singles) = (Vec::new(), Vec::new());
-        for j in 0..rows {
-            let (mut mixed, mut gate) = (std::ptr::null_mut(), std::ptr::null_mut());
-            assert!(unsafe {
-                mlx_sys::mlx_qwen4_hyper_up_inject_rows(
-                    row(&x, j).as_raw_ptr(),
-                    up.values.as_raw_ptr(),
-                    us.as_raw_ptr(),
-                    ub.as_raw_ptr(),
-                    row(&normed, j).as_raw_ptr(),
-                    row(&injection, j).as_raw_ptr(),
-                    &mut mixed,
-                    &mut gate,
-                )
-            });
-            mixed_singles.push(MxArray::from_handle(mixed, "single-row mixer inject").unwrap());
-            gate_singles.push(MxArray::from_handle(gate, "single-row inject gate").unwrap());
-        }
-        let (mixed, gate) = math::rows::hyper_up_inject(&up, &x, &normed, &injection)
-            .unwrap()
-            .expect("row-batched hyper up inject admits [1, R, 320]");
-        assert_same_bits(
-            &mixed,
-            &stack_rows(&mixed_singles),
-            &format!("hyper up inject mixed rows={rows}"),
-        );
-        assert_same_bits(
-            &gate,
-            &stack_rows(&gate_singles),
-            &format!("hyper up inject gate rows={rows}"),
         );
     }
     // Routed experts (already row-indexed) and routed + shared experts over
@@ -7614,36 +7363,19 @@ fn row_batched_decode_kernels_three_rows_vs_one_row_gpu_time() {
             .collect();
         let x = bf16_rows(4, 320, 1. / 64., 8., &mut next);
         let normed = bf16_rows(4, 10240, 1. / 128., 4., &mut next);
-        let injection = bf16_rows(4, 4, 1. / 16., 32., &mut next);
-        let (ups2, x2, normed2) = (ups.clone(), x.clone(), normed.clone());
         measure(
             "hyper_up_10240x320",
             nbanks,
             Box::new(move |rows, call| {
                 vec![
                     math::rows::hyper_up(
-                        &ups2[call % nbanks],
-                        &x2.slice_axis(1, 0, rows).unwrap(),
-                        &normed2.slice_axis(1, 0, rows).unwrap(),
+                        &ups[call % nbanks],
+                        &x.slice_axis(1, 0, rows).unwrap(),
+                        &normed.slice_axis(1, 0, rows).unwrap(),
                     )
                     .unwrap()
                     .unwrap(),
                 ]
-            }),
-        );
-        measure(
-            "hyper_up_inject_10240x320",
-            nbanks,
-            Box::new(move |rows, call| {
-                let (mixed, gate) = math::rows::hyper_up_inject(
-                    &ups[call % nbanks],
-                    &x.slice_axis(1, 0, rows).unwrap(),
-                    &normed.slice_axis(1, 0, rows).unwrap(),
-                    &injection.slice_axis(1, 0, rows).unwrap(),
-                )
-                .unwrap()
-                .unwrap();
-                vec![mixed, gate]
             }),
         );
     }

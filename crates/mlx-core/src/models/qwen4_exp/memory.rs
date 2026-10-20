@@ -1,6 +1,5 @@
 //! Admit hot weights against live system headroom. Preserve room for other
 //! applications, recurrent state, page pools and transient work.
-use crate::models::qwen4_exp::runtime_flags;
 use napi::{Error, Result};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -481,14 +480,8 @@ fn workspace_cache_bytes(physical: Option<u64>) -> u64 {
 }
 
 pub(super) fn maintain_freelist(physical: Option<u64>) {
-    let limit = if !runtime_flags::is_zero(c"MLX_QWEN4_REUSE_WORKSPACE") {
-        workspace_cache_bytes(physical)
-    } else {
-        FREE_CACHE_BYTES
-    };
-    if runtime_flags::is_one(c"MLX_QWEN4_FLUSH_EVERY_LAYER")
-        || crate::array::memory::get_cache_memory() > limit as f64
-    {
+    let limit = workspace_cache_bytes(physical);
+    if crate::array::memory::get_cache_memory() > limit as f64 {
         crate::array::memory::clear_cache();
     }
 }
@@ -1352,35 +1345,6 @@ pub(super) fn prefill_window(c: &super::config::Config, plan: &Plan) -> usize {
         window /= 2;
     }
     window
-}
-
-/// Runtime tuning may shorten the bootstrap-admitted window, never grow it.
-/// Invalid values preserve admission. This does not allocate another page pool
-/// or alter the verified/MTP frontier width.
-pub(super) fn prefill_slice(admitted: usize, requested: Option<&str>) -> usize {
-    requested
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| n.is_power_of_two())
-        .map_or(admitted, |n| n.min(admitted))
-}
-
-#[test]
-fn runtime_slices_cannot_exceed_bootstrap_admission() {
-    for admitted in [1, 2, 32, 64, 256, 512, 1024] {
-        for request in [
-            None,
-            Some("0"),
-            Some("7"),
-            Some("256"),
-            Some("1024"),
-            Some("2048"),
-            Some("invalid"),
-        ] {
-            let actual = prefill_slice(admitted, request);
-            assert!(actual > 0 && actual <= admitted && actual.is_power_of_two());
-        }
-        assert_eq!(prefill_slice(admitted, Some("256")), admitted.min(256));
-    }
 }
 
 /// Flash Next geometry (48 layers, 12 full attention, K/V 2 x 256, 32,768

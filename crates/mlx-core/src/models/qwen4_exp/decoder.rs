@@ -1,6 +1,5 @@
 use super::{config::Config, math, weights::Store};
 use crate::array::{DType, MxArray, scaled_dot_product_attention};
-use crate::models::qwen4_exp::runtime_flags;
 use crate::nn::Activations;
 use napi::{Error, Result};
 use std::sync::{
@@ -215,8 +214,7 @@ impl Decoder {
     }
 
     pub fn prefill_slice_size(&self) -> usize {
-        let requested = std::env::var("MLX_QWEN4_PREFILL_SLICE").ok();
-        super::memory::prefill_slice(self.prefill_chunk_size, requested.as_deref())
+        self.prefill_chunk_size
     }
 
     pub fn new(config: Config, weights: Store) -> Result<Self> {
@@ -229,7 +227,7 @@ impl Decoder {
             window_carry: true,
             async_prefill: true,
             batch_rotary: true,
-            batch_prefill: !runtime_flags::is_zero(c"MLX_QWEN4_BATCH_PREFILL"),
+            batch_prefill: true,
             caches: (0..config.num_hidden_layers)
                 .map(|_| LayerCache::default())
                 .collect(),
@@ -831,8 +829,6 @@ impl Decoder {
         } else {
             let up = self.weights.linear(&key, &down)?;
             let combined = if self.gguf()
-                && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_HC_MIX")
-                && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
                 && crate::engine::persistence::compiled_forward_backend_available()
             {
                 unsafe { mlx_sys::mlx_qwen4_prefill_hc_mix(up.as_raw_ptr(), n.as_raw_ptr()) }
@@ -891,8 +887,6 @@ impl Decoder {
             && self.gguf()
             && self.config.hidden_size == 2560
             && self.config.hc_count == 4
-            && !runtime_flags::is_zero(c"MLX_QWEN4_INJECT_NORM")
-            && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
             && crate::engine::persistence::compiled_forward_backend_available()
         {
             let w = self.dense(hf, gg)?;
@@ -920,9 +914,7 @@ impl Decoder {
         Ok((Self::inject(x, branch, gate)?, None))
     }
     fn submit(&self, arrays: &[&MxArray], context: &str) -> Result<()> {
-        if !runtime_flags::is_zero(c"MLX_QWEN4_ASYNC_SUBMISSION")
-            && crate::engine::persistence::compiled_forward_backend_available()
-        {
+        if crate::engine::persistence::compiled_forward_backend_available() {
             MxArray::async_eval_arrays(arrays);
             Ok(())
         } else {
@@ -940,9 +932,7 @@ impl Decoder {
         }
     }
     fn inject(x: &MxArray, y: &MxArray, g: &MxArray) -> Result<MxArray> {
-        if !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
-            && crate::engine::persistence::compiled_forward_backend_available()
-        {
+        if crate::engine::persistence::compiled_forward_backend_available() {
             return MxArray::from_handle(
                 unsafe {
                     mlx_sys::mlx_qwen4_inject(x.as_raw_ptr(), y.as_raw_ptr(), g.as_raw_ptr())
@@ -1032,9 +1022,6 @@ impl Decoder {
             && c.rms_norm_eps > 0.0
             && c.output_gate_type == "sigmoid"
             && qkv.dtype()? == DType::BFloat16
-            && !runtime_flags::is_zero(c"MLX_QWEN4_COMPLETE_GDN")
-            && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_GDN")
-            && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
             && crate::engine::persistence::compiled_forward_backend_available()
         {
             let scale = self.dense(&format!("{p}.A_log"), &format!("{g}.ssm_a"))?;
@@ -1481,9 +1468,6 @@ impl Decoder {
         if self.gguf()
             && c.hc_count == 4
             && c.hidden_size == 2560
-            && !runtime_flags::is_zero(c"MLX_QWEN4_DECODE_MIXER_ACT")
-            && !runtime_flags::is_zero(c"MLX_QWEN4_HYPER_UP")
-            && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
             && let (Some(down_bank), Some(up_bank)) = (
                 self.weights.resident_bank(&down_key),
                 self.weights.resident_bank(&up_key),
@@ -1600,11 +1584,6 @@ impl Decoder {
             || c.hidden_size != 2560
             || c.moe_intermediate_size != 640
             || x.dtype()? != DType::BFloat16
-            || runtime_flags::is_zero(c"MLX_QWEN4_FUSED_EXPERTS")
-            || runtime_flags::is_zero(c"MLX_QWEN4_SHARED_EXPERTS")
-            || runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
-            || runtime_flags::is_zero(c"MLX_QWEN4_DIRECT_GEMV")
-            || runtime_flags::is_zero(c"MLX_QWEN4_AFFINE_GEMV")
         {
             return Ok(None);
         }
@@ -1941,7 +1920,6 @@ impl Decoder {
         value.add(&convolved)
     }
     pub fn step(&mut self, token: u32) -> Result<MxArray> {
-        let _flags = runtime_flags::scope();
         self.rotary_tables.get_mut().clear();
         let started = std::time::Instant::now();
         let result = self.forward_with_device_routes(token, true);
@@ -2033,7 +2011,6 @@ impl Decoder {
         embeddings: Option<&MxArray>,
         project_logits: bool,
     ) -> Result<MxArray> {
-        let _flags = runtime_flags::scope();
         if cfg!(target_os = "macos") {
             self.weights.check_forward_headroom()?;
         }
@@ -2049,7 +2026,6 @@ impl Decoder {
         result
     }
     pub fn verify_chunk(&mut self, tokens: &[u32]) -> Result<(MxArray, Vec<DecoderState>)> {
-        let _flags = runtime_flags::scope();
         if tokens.is_empty() || tokens.len() > 4 {
             return Err(Error::from_reason("Qwen4 verification width must be 1-4"));
         }
@@ -2127,8 +2103,7 @@ impl Decoder {
         }
         self.prefetch_ple_rows(tokens)?;
         let batched = self.batch_prefill && tokens.len() > 1 && self.verification.is_none();
-        let carry =
-            batched && self.window_carry && !runtime_flags::is_zero(c"MLX_QWEN4_WINDOW_CARRY");
+        let carry = batched && self.window_carry;
         let mut hidden = Vec::with_capacity(if carry { 0 } else { tokens.len() });
         let window_embedding = if embeddings.is_none() && tokens.len() > 1 {
             Some(

@@ -2,7 +2,6 @@
 //! selected expert matrices and embedding rows are read on cache misses.
 //! Admitted hot banks can be prepared once; PLE stays row-addressable. Matrix chunks
 //! may reuse a bounded persistent cache of their losslessly packed arrays.
-use crate::models::qwen4_exp::runtime_flags;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -179,16 +178,10 @@ pub struct Weight {
 impl Weight {
     pub(super) fn mixer_act(&self, x: &MxArray) -> Result<Option<MxArray>> {
         let decode = x.shape_at(1)? == 1;
-        let setting = if decode {
-            c"MLX_QWEN4_DECODE_MIXER_ACT"
-        } else {
-            c"MLX_QWEN4_PREFILL_MIXER_BM32"
-        };
         if self.mode != "affine"
             || self.bits != 8
             || self.group != 32
             || !crate::engine::persistence::compiled_forward_backend_available()
-            || runtime_flags::is_zero(setting)
         {
             return Ok(None);
         }
@@ -216,12 +209,7 @@ impl Weight {
     }
 
     pub(super) fn hyper_up(&self, x: &MxArray, normed: &MxArray) -> Result<Option<MxArray>> {
-        if self.mode != "affine"
-            || self.bits != 8
-            || self.group != 32
-            || runtime_flags::is_zero(c"MLX_QWEN4_HYPER_UP")
-            || runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
-        {
+        if self.mode != "affine" || self.bits != 8 || self.group != 32 {
             return Ok(None);
         }
         let (Some(scales), Some(biases)) = (&self.scales, &self.biases) else {
@@ -319,11 +307,7 @@ impl Weight {
                 return MxArray::from_handle(compact, "Qwen4 compact dense decode");
             }
         }
-        let compact = if self.mode == "affine"
-            && self.bits == 8
-            && self.group == 32
-            && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_DENSE_STORAGE")
-        {
+        let compact = if self.mode == "affine" && self.bits == 8 && self.group == 32 {
             match (&self.scales, &self.biases) {
                 (Some(scales), Some(biases)) => unsafe {
                     mlx_sys::mlx_qwen4_dense_prefill(
@@ -354,7 +338,6 @@ impl Weight {
         } else {
             let values = if x.dtype()? == DType::BFloat16
                 && let Some(dense) = &self.dense_bf16
-                && !runtime_flags::is_zero(c"MLX_QWEN4_DENSE_BF16_CACHE")
             {
                 dense
             } else {
@@ -641,7 +624,7 @@ impl Store {
         if s.tensors.is_empty() {
             return Err(err("No model tensors found"));
         }
-        if s.gguf && !runtime_flags::is_zero(c"MLX_QWEN4_PACKED_CACHE") {
+        if s.gguf {
             let files = s.tensors.values().map(|t| t.path.clone()).collect();
             s.packed = match root {
                 Some(root) => super::packed_cache::PackedCache::new_at(root, files),
@@ -991,7 +974,7 @@ impl Store {
         &mut self,
         requests: &[(String, usize, usize)],
     ) -> Result<Vec<Arc<Weight>>> {
-        if self.packed.is_none() || runtime_flags::is_zero(c"MLX_QWEN4_PARALLEL_READS") {
+        if self.packed.is_none() {
             return requests
                 .iter()
                 .map(|(name, start, rows)| self.read(name, *start, *rows))
@@ -2155,12 +2138,9 @@ mod cache_tests {
                 );
             }
             let key = (names[0].to_owned(), names[1].to_owned());
-            let enabled = !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_SHARED_PAIR")
-                && !runtime_flags::is_zero(c"MLX_QWEN4_PAIRED_PROJECTIONS")
-                && !runtime_flags::is_zero(c"MLX_ENABLE_TF32");
             if rows < 512 {
                 assert!(!store.paired_banks.contains_key(&key));
-            } else if enabled {
+            } else if super::super::tf32_enabled() {
                 assert_eq!(store.paired_banks[&key].bytes().unwrap(), bytes);
             }
         }

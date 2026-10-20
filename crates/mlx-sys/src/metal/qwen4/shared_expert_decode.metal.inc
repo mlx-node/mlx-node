@@ -1,7 +1,7 @@
 R"metal(
 // Shared Q8 gate/up uses the same fast GEMV walk as the separate projection.
 // x and out already point at the caller's row; every row keeps row 0's walk.
-template <typename T, bool LANES>
+template <typename T>
 METAL_FUNC void q4_shared_gu(const device T* x,
  const device uint* wg,const device half* sg,const device half* bg,
  const device uint* wu,const device half* su,const device half* bu,
@@ -16,14 +16,9 @@ METAL_FUNC void q4_shared_gu(const device T* x,
    u[r]+=qdot<float,8,8,false>((const device uchar*)wu+row*2560+col,values,float(su[side]),float(bu[side]),sum);
   }
  }
- if constexpr (LANES) {
-  for(int r=0;r<4;++r){g[r]=simd_sum(g[r]);u[r]=simd_sum(u[r]);}
-  if(lane<4){T gate=T(g[lane]),up=T(u[lane]);T silu=T(sigmoid_table[as_type<ushort>(gate)]*gate);out[first+lane]=float(T(silu*up));}
- } else {
  for(int r=0;r<4;++r){
   T gate=T(simd_sum(g[r])),up=T(simd_sum(u[r]));
   if(lane==0){T silu=T(sigmoid_table[as_type<ushort>(gate)]*gate);out[first+r]=float(T(silu*up));}
- }
  }
 }
 
@@ -36,7 +31,7 @@ METAL_FUNC void q4_shared_gu(const device T* x,
 // expert. Every other simdgroup returns. A missing slot (id >= E) owns itself.
 // Each simdgroup runs the single-row walk unchanged (same lane assignment,
 // ascending K order, own F32 accumulator), so row j carries a one-row call's bits.
-template <typename T, int BITS, int H, int M, int E, int TOP, int ROWS, bool LANES>
+template <typename T, int BITS, int H, int M, int E, int TOP, int ROWS>
 METAL_FUNC void routed_gu_rows(
     const device T* x, const device uint* ids,
     const device uint* wg, const device uchar* sg, const device half* bg,
@@ -81,27 +76,17 @@ METAL_FUNC void routed_gu_rows(
     }
   }
   device float* hidden = out + size_t(row * TOP) * M + first;
-  if constexpr (LANES) {
-    for (int r = 0; r < 4; ++r) { g[r] = simd_sum(g[r]); u[r] = simd_sum(u[r]); }
-    if (lane < 4) {
-      T gate = T(g[lane]), up = T(u[lane]);
+  for (int r = 0; r < 4; ++r) {
+    T gate = T(simd_sum(g[r])), up = T(simd_sum(u[r]));
+    if (lane == 0) {
       T silu = T(precise_sigmoid(gate) * gate);
       const float value = float(T(silu * up));
-      for (int slot = 0; slot < TOP; ++slot) if ((slots >> slot) & 1u) hidden[slot * M + lane] = value;
-    }
-  } else {
-    for (int r = 0; r < 4; ++r) {
-      T gate = T(simd_sum(g[r])), up = T(simd_sum(u[r]));
-      if (lane == 0) {
-        T silu = T(precise_sigmoid(gate) * gate);
-        const float value = float(T(silu * up));
-        for (int slot = 0; slot < TOP; ++slot) if ((slots >> slot) & 1u) hidden[slot * M + r] = value;
-      }
+      for (int slot = 0; slot < TOP; ++slot) if ((slots >> slot) & 1u) hidden[slot * M + r] = value;
     }
   }
 }
 
-template<typename T, int RPS, bool STAGE>
+template<typename T, int RPS>
 METAL_FUNC void q4_shared_down(const device float* x,const device uint* w,
  const device half* scales,const device half* biases,T gate,const device T* sigmoid_table,
  threadgroup T* products,uint first,uint lane) {
@@ -118,13 +103,7 @@ METAL_FUNC void q4_shared_down(const device float* x,const device uint* w,
  for(int r=0;r<RPS;++r){size_t row=first+r,side=row*20+col/32;
   result[r]+=qdot_safe<float,4,8,false>((const device uchar*)w+row*640+col,values,float(scales[side]),float(biases[side]),sum,4);
  }
- if constexpr (STAGE) {
-  // TrackFastMoE MLXFAST-STAGELANES: each lane stores one reduced row.
-  for(int r=0;r<RPS;++r) result[r]=simd_sum(result[r]);
-  if(lane<RPS) products[lane]=T(sigmoid_table[as_type<ushort>(gate)]*T(result[lane]));
- } else {
-  for(int r=0;r<RPS;++r){T value=T(simd_sum(result[r]));if(lane==0)products[r]=T(sigmoid_table[as_type<ushort>(gate)]*value);}
- }
+ for(int r=0;r<RPS;++r){T value=T(simd_sum(result[r]));if(lane==0)products[r]=T(sigmoid_table[as_type<ushort>(gate)]*value);}
 }
 
 // One threadgroup per RPS-column output tile with (KSG + 1) * ROWS simdgroups:
@@ -134,7 +113,7 @@ METAL_FUNC void q4_shared_down(const device float* x,const device uint* w,
 // time, so a tile shared between rows is read from the core's cache after the
 // first simdgroup. Each simdgroup runs the single-row math unchanged and each
 // row folds its own ten products in slot order.
-template <typename T, typename P, int BITS, int H, int M, int E, int TOP, int RPS, int KSG, int ROWS, bool STAGE, typename GateT>
+template <typename T, typename P, int BITS, int H, int M, int E, int TOP, int RPS, int KSG, int ROWS, typename GateT>
 METAL_FUNC void q4_down_combine_shared(
     const device float* x, const device uint* ids, const device P* scores,
     const device uint* w, const device half* scales, const device half* biases,
@@ -166,23 +145,15 @@ METAL_FUNC void q4_down_combine_shared(
         }
       }
     }
-    if constexpr (STAGE) {
-      for (int r = 0; r < RPS; ++r) result[r] = simd_sum(result[r]);
-      if (lane < RPS) {
-        volatile float product = float(P(T(result[lane]))) * float(scores[assignment]);
-        products[assignment * RPS + lane] = P(product);
-      }
-    } else {
-      for (int r = 0; r < RPS; ++r) {
-        T value = T(simd_sum(result[r]));
-        if (lane == 0) {
-          volatile float product = float(P(value)) * float(scores[assignment]);
-          products[assignment * RPS + r] = P(product);
-        }
+    for (int r = 0; r < RPS; ++r) {
+      T value = T(simd_sum(result[r]));
+      if (lane == 0) {
+        volatile float product = float(P(value)) * float(scores[assignment]);
+        products[assignment * RPS + r] = P(product);
       }
     }
   }
-  if (role == KSG) q4_shared_down<T,RPS,STAGE>(x + size_t(TOP * ROWS + token) * M, sw, ss, sb, shared_gate[token], sigmoid_table, shared_products + token * RPS, first, lane);
+  if (role == KSG) q4_shared_down<T,RPS>(x + size_t(TOP * ROWS + token) * M, sw, ss, sb, shared_gate[token], sigmoid_table, shared_products + token * RPS, first, lane);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (simd < ROWS && lane < RPS) {
     const uint row = simd;

@@ -15,21 +15,11 @@ use std::thread::JoinHandle;
 use crate::array::{Mmap, page_size};
 
 /// Layers read ahead of the one computing, ~1.5 GiB each on Flash Next.
-const DEFAULT_DEPTH: usize = 3;
+pub(super) const DEPTH: usize = 3;
 /// Residency is sampled, never swept: mincore costs 0.22 us per page, 1.2 s
 /// for the whole pack, against ~5 ms for eight 256 KiB probes per file.
 const PROBES: usize = 8;
 const PROBE_PAGES: usize = 16;
-
-pub(super) fn depth_from_env() -> usize {
-    std::env::var_os("MLX_QWEN4_PREFETCH_LAYERS")
-        .and_then(|value| value.to_str()?.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_DEPTH)
-}
-
-pub(super) fn at_load() -> bool {
-    std::env::var_os("MLX_QWEN4_PREFETCH_AT_LOAD").is_some_and(|value| value == "1")
-}
 
 /// How a request reaches the kernel; tests record instead.
 pub(super) trait Issue: Send + 'static {
@@ -167,7 +157,8 @@ impl Pool {
         self.requested = through + 1;
     }
 
-    pub(super) fn request_all(&self) {
+    #[cfg(test)]
+    fn request_all(&self) {
         self.request(0..self.layers.len());
     }
 
