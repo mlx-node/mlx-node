@@ -929,7 +929,9 @@ GGUF-backed loads (Qwen3.8, Gemma 4, Muse-Glimmer and the other GGUF families)
 and the Qwen3.8 mapped expert pack write into per-user native caches.
 Both self-maintain on the next load: stale or orphaned entries are removed
 under per-key locks, and live writers are never disturbed — deleting a cache
-directory yourself is only needed to reclaim space immediately.
+directory yourself is only needed to reclaim space immediately. A Qwen3.8 pack
+whose source volume is unplugged is kept until the volume returns, and is then
+checked against its source again.
 
 | Env var                            | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

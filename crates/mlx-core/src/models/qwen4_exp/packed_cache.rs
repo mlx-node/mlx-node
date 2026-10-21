@@ -1702,20 +1702,30 @@ mod tests {
             "a plain dir on its parent's device is no mount point"
         );
         assert!(is_mounted(&live), "{} must be mounted", live.display());
-        let fixture = |letter: char, source_dir: &Path, mount: &Path| {
+        let fixture = |letter: char, manifest: String| {
             let dir = mapped_fixture(&parent, letter, 100, true);
-            fs::write(dir.join(".manifest"), manifest_naming(source_dir, mount)).unwrap();
+            fs::write(dir.join(".manifest"), manifest).unwrap();
             age(&dir.join(".manifest"), 7200);
             age_dir(&dir, 7200);
             dir
         };
-        let away = fixture('1', &unplugged.join("models"), &unplugged);
-        let left_behind = fixture('2', &leftover.join("models"), &leftover);
-        let deleted = fixture('3', &base, &live);
+        let away = fixture('1', manifest_naming(&unplugged.join("models"), &unplugged));
+        let left_behind = fixture('2', manifest_naming(&leftover.join("models"), &leftover));
+        let deleted = fixture('3', manifest_naming(&base, &live));
+        let unrecorded = fixture(
+            '4',
+            format!(
+                "path_hex={}\nfile_hex={}\n",
+                hex(base.as_os_str().as_bytes()),
+                hex(b"x.gguf")
+            ),
+        );
         assert_eq!(manifest_source(&away).unwrap(), Source::Unreachable);
         assert_eq!(manifest_source(&left_behind).unwrap(), Source::Unreachable);
+        assert_eq!(manifest_source(&unrecorded).unwrap(), Source::Unreachable);
         assert_eq!(packed_orphan_reason(&away), None);
         assert_eq!(packed_orphan_reason(&left_behind), None);
+        assert_eq!(packed_orphan_reason(&unrecorded), None);
         assert_eq!(packed_orphan_reason(&deleted), Some("source deleted"));
         let current = parent.join("current");
         until_gone(
@@ -1727,6 +1737,10 @@ mod tests {
         assert!(
             left_behind.exists(),
             "a left-behind mount dir keeps its pack"
+        );
+        assert!(
+            unrecorded.exists(),
+            "a missing file with no mount record keeps its pack"
         );
     }
 
@@ -1754,7 +1768,6 @@ mod tests {
         let path = hex(base.as_os_str().as_bytes());
         let mount = hex(mount_point(&base).as_os_str().as_bytes());
         let file = hex(b"x.gguf");
-        // Each one would read Deleted if its fault were skipped.
         let corrupt = [
             (
                 '1',

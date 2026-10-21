@@ -625,7 +625,10 @@ its `MLX_QWEN4_PACKED_CACHE_DIR` / `MLX_QWEN4_PACKED_CACHE_MAX_GB` controls were
 removed; the mapped pack is the only prepared format. Leftover chunk
 directories named `.mlx-qwen4-packed-v2-<64 lowercase hex>` are removed
 automatically once idle for one hour and unlocked; any other name under that
-prefix is kept.
+prefix is kept. A v3 mapped pack (`.mlx-qwen4-mapped-v3-*`) is removed only on
+proof (changed fingerprint, or a file deleted from a mounted volume); an
+unplugged source keeps it, and the fingerprint no longer includes the device
+number.
 
 The opt-in exact fusions measured on 2026-10-20 (teacher-forced logits on the
 6k and 16k prompts in one process, mapped residency, 256 positions) were
