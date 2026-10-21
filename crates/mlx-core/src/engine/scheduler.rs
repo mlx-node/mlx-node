@@ -54,6 +54,10 @@ pub(crate) struct TurnState<P> {
     /// Maximum additional hypothetical query rows; never part of token_history.
     pub decode_draft_allowance: u32,
     pub pinned_prefill_breaks: Vec<u32>,
+    /// The family prefills this prompt as one group of windows in one step
+    /// (`HybridSchedulerBackend::scheduler_whole_prompt_prefill`); re-pinned
+    /// with the breaks on every restore and replay.
+    pub whole_prompt_prefill: bool,
     pub token_history: Vec<u32>,
     pub status: TurnStatus,
     pub cancelled: Option<Arc<AtomicBool>>,
@@ -186,6 +190,7 @@ impl<P> TurnState<P> {
             prompt_tokens,
             decode_draft_allowance: 0,
             pinned_prefill_breaks,
+            whole_prompt_prefill: false,
             token_history,
             status: TurnStatus::Waiting,
             cancelled,
@@ -1131,7 +1136,18 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                         .saturating_sub(turn.num_computed_tokens),
                     StepKind::Decode => 1,
                 };
-                let num_tokens = pending.min(row_limit).min(budget);
+                // A whole-prompt prefill row ignores the token budget and is
+                // the step's only prefill row; it waits while another turn's
+                // prefill row is planned ahead of it.
+                let whole = kind == StepKind::Prefill && turn.whole_prompt_prefill;
+                if whole && rows.iter().any(|row| row.kind == StepKind::Prefill) {
+                    continue;
+                }
+                let num_tokens = if whole {
+                    pending.min(row_limit)
+                } else {
+                    pending.min(row_limit).min(budget)
+                };
                 if num_tokens == 0 {
                     continue;
                 }
@@ -1142,7 +1158,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                     num_tokens,
                     cancel_snapshot: turn.cancel_snapshot,
                 });
-                budget -= num_tokens;
+                budget = if whole { 0 } else { budget - num_tokens };
             }
         }
         StepPlan {

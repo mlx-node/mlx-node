@@ -22,8 +22,11 @@ pub(super) struct Job {
 }
 
 /// Rows a request may leave behind (never taken: a cancelled turn, a
-/// replayed token) before the next request drops everything pending.
-const PENDING_LIMIT: usize = 1 << 16;
+/// replayed token) before the next request drops everything pending. Above
+/// the 557,056 rows of a whole 32,768-token prompt (17 per token), which a
+/// layer-major prefill requests before its first layer; a later request
+/// must never drop those while they wait.
+const PENDING_LIMIT: usize = 1 << 20;
 
 struct State {
     queue: VecDeque<Job>,

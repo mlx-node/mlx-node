@@ -31,7 +31,10 @@ pub const CACHE_BYTES: u64 = 8 << 30;
 pub(super) const MAX_READ_BYTES: u64 = 64 << 20;
 const MAX_HEADER_BYTES: u64 = 16 << 20;
 /// Reader threads for token/PLE rows: 17 random 90 B-2.7 KB reads per token.
-const ROW_READERS: usize = 4;
+/// A layer-major prefill asks for a whole prompt's rows at once while the
+/// pack stream yields to them: 32 readers finish a 6k prompt's 58,718 rows
+/// in 0.27 s beside the stream, 4 in 1.17 s (P5/C2 M4).
+const ROW_READERS: usize = 32;
 
 /// Decoded-row LRU and reader-thread counters, shared with `residencyInfo()`.
 #[derive(Default)]
