@@ -671,14 +671,32 @@ struct RotaryKey {
     dtype: DType,
 }
 
-/// At most the attention and compressed-indexer tables for one admitted window.
+/// The attention and compressed-indexer tables of the windows one pass
+/// holds: two per window, so a layer-major group of W windows keeps 2W.
 /// These are temporary graph inputs, never part of an owner's persistent state.
-#[derive(Default)]
-pub(super) struct RotaryWindowCache(Vec<(RotaryKey, MxArray, MxArray)>);
+pub(super) struct RotaryWindowCache {
+    tables: Vec<(RotaryKey, MxArray, MxArray)>,
+    capacity: usize,
+}
+
+impl Default for RotaryWindowCache {
+    fn default() -> Self {
+        Self {
+            tables: Vec::new(),
+            capacity: 2,
+        }
+    }
+}
 
 impl RotaryWindowCache {
     pub fn clear(&mut self) {
-        self.0.clear();
+        self.tables.clear();
+        self.capacity = 2;
+    }
+
+    /// Hold the tables of `windows` windows for the pass that starts.
+    pub fn reserve(&mut self, windows: usize) {
+        self.capacity = 2 * windows.max(1);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -704,7 +722,7 @@ impl RotaryWindowCache {
     }
 
     fn tables(&mut self, key: RotaryKey) -> Result<(MxArray, MxArray)> {
-        if let Some((_, cos, sin)) = self.0.iter().find(|(old, _, _)| *old == key) {
+        if let Some((_, cos, sin)) = self.tables.iter().find(|(old, _, _)| *old == key) {
             return Ok((cos.clone(), sin.clone()));
         }
         let (cos, sin) = rotary_tables(
@@ -715,10 +733,10 @@ impl RotaryWindowCache {
             key.interleaved,
             key.dtype,
         )?;
-        if self.0.len() == 2 {
-            self.0.remove(0);
+        if self.tables.len() >= self.capacity {
+            self.tables.remove(0);
         }
-        self.0.push((key, cos.clone(), sin.clone()));
+        self.tables.push((key, cos.clone(), sin.clone()));
         Ok((cos, sin))
     }
 }
@@ -1035,13 +1053,13 @@ mod rotary_window_tests {
                                 .unwrap(),
                             "{dtype:?}, {interleaved}, {count}, {width}"
                         );
-                        assert!(cache.0.len() <= 2);
+                        assert!(cache.tables.len() <= 2);
                     }
                 }
             }
         }
         cache.clear();
-        assert!(cache.0.is_empty());
+        assert!(cache.tables.is_empty());
     }
 }
 

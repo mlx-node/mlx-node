@@ -455,9 +455,17 @@ pub struct Store {
     /// the layers already run are kept wired instead.
     streaming_pass: bool,
     last_touch: Option<std::time::Instant>,
+    /// A layer-major prefill group runs: the banks of the layers already
+    /// swept are kept wired until it commits, through asynchronous touches
+    /// whose arrays wait in `pending_touch` for that commit.
+    group_in_progress: bool,
+    pending_touch: Vec<MxArray>,
     /// Layers covered by every bank touch, in order.
     #[cfg(test)]
     pub(in super::super) touches: Vec<Vec<usize>>,
+    /// Whether each touch in `touches` was submitted asynchronously.
+    #[cfg(test)]
+    pub(in super::super) touches_async: Vec<bool>,
     wide_routes: HashMap<usize, Vec<u32>>,
     deferred_reduction_layer: Option<usize>,
     slot_capacity: Option<usize>,
@@ -598,8 +606,12 @@ impl Store {
             prefetch: None,
             streaming_pass: false,
             last_touch: None,
+            group_in_progress: false,
+            pending_touch: Vec::new(),
             #[cfg(test)]
             touches: Vec::new(),
+            #[cfg(test)]
+            touches_async: Vec::new(),
             wide_routes: HashMap::new(),
             deferred_reduction_layer: None,
             slot_capacity: None,

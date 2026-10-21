@@ -214,7 +214,7 @@ impl Tripwire {
             .map(|seed| (seed, false))
     }
 
-    #[cfg(test)]
+    /// The symptom held and not yet applied.
     pub fn tripped(&self) -> Option<&Fallback> {
         self.tripped.as_ref()
     }
@@ -231,6 +231,25 @@ impl Tripwire {
 
     pub fn take(&mut self) -> Option<Fallback> {
         self.tripped.take()
+    }
+
+    /// The SSD rule alone, between two layer sweeps of a prefill group:
+    /// `reads_now` is the process's disk read counter now. Returns the
+    /// symptom that tripped, once; the pass-level rules see the group's
+    /// windows after it.
+    pub fn observe_ssd(&mut self, reads_now: u64, mapped_bytes: u64) -> Option<&Fallback> {
+        if self.tripped.is_some() {
+            return None;
+        }
+        let read = reads_now.saturating_sub(self.turn_start_reads);
+        if mapped_bytes > 0 && read > mapped_bytes.saturating_mul(SSD_FACTOR) {
+            self.tripped = Some(Fallback::SsdReads {
+                read,
+                mapped: mapped_bytes,
+            });
+            return self.tripped.as_ref();
+        }
+        None
     }
 
     /// One main-network pass of `rows` rows took `elapsed`; `reads_now` is

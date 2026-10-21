@@ -62,7 +62,8 @@ impl Decoder {
             let adapter = self.paged.as_mut().ok_or_else(|| {
                 Error::from_reason("Qwen4 scheduled attention has no paged cache")
             })?;
-            super::super::paged::write_rows(adapter, index, &k, &v, self.history.len() as u32)?;
+            let first = self.history.len() as u32;
+            super::super::paged::write_rows(adapter, index, &k, &v, first, first)?;
             // Owners share the pool. Complete the write before activating another.
             adapter
                 .eval_pending_pool_writes()

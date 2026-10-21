@@ -50,6 +50,21 @@ impl State {
             .get(&seq)
             .map(|owner| (owner.cache.history_shape().0, owner.rows.len()))
     }
+    /// (draft cache arrays, waiting (hidden, token) rows, frontier) of an
+    /// owner: what a prefill's observes leave behind.
+    #[cfg(test)]
+    pub(super) fn draft_state(
+        &self,
+        seq: u32,
+    ) -> Option<(Vec<MxArray>, Vec<(MxArray, u32)>, usize)> {
+        self.owners.get(&seq).map(|owner| {
+            (
+                owner.cache.arrays().cloned().collect(),
+                owner.rows.clone(),
+                owner.frontier,
+            )
+        })
+    }
     pub fn owner_frontier(&self, seq: u32) -> Option<usize> {
         self.owners.get(&seq).map(|owner| owner.frontier)
     }
@@ -105,6 +120,14 @@ impl Inner {
             return Ok(owner.tracking);
         }
         Ok(false)
+    }
+    /// Whether `observe_mtp` for `seq` would record the hidden rows it is
+    /// given: a prefill builds its per-token views only then.
+    pub(super) fn mtp_tracking(&self, seq: u32) -> bool {
+        self.mtp
+            .owners
+            .get(&seq)
+            .is_some_and(|owner| owner.tracking)
     }
     pub fn observe_mtp(&mut self, seq: u32, tokens: &[u32], hidden: &[MxArray]) -> Result<()> {
         let Some(mut owner) = self.mtp.owners.remove(&seq) else {

@@ -45,17 +45,22 @@ pub fn create(config: &super::config::Config) -> Result<PagedKVCacheAdapter> {
 /// The native bridge compacts strided inputs and preserves offsets for
 /// contiguous read-only K/V views. An explicit zero selects independent
 /// copies for comparison; mutable pool and metadata constraints stay strict.
+/// The rows go to positions `base..` of the tokens recorded for this
+/// request, never below `floor` (the tokens recorded before this pass): a
+/// layer-major group records all its windows first and writes each window at
+/// its own base.
 pub(super) fn write_rows(
     adapter: &mut PagedKVCacheAdapter,
     layer: u32,
     keys: &MxArray,
     values: &MxArray,
     base: u32,
+    floor: u32,
 ) -> Result<()> {
     let keys = keys.astype(crate::array::DType::BFloat16)?;
     let values = values.astype(crate::array::DType::BFloat16)?;
     adapter
-        .update_keys_values_native(layer, &keys, &values, base)
+        .update_keys_values_native_recorded(layer, &keys, &values, base, floor)
         .map_err(Error::from_reason)
 }
 
@@ -183,6 +188,24 @@ impl PagedBackend for Inner {
     }
     fn paged_prefill(&mut self, tokens: &[u32], _: &Prefix, stream: Stream) -> Result<MxArray> {
         let _context = crate::stream::StreamContext::new(stream);
+        // Group mode is read again here: a trip applied since admission runs
+        // the whole-prompt row one window at a time below.
+        if self.media_prefill.is_none() && self.decoder.group_mode(tokens.len()) {
+            let seq = self.active_seq.unwrap_or(0);
+            let (windows, tail) = self.decoder.group_windows(tokens);
+            let tracking = self.mtp_tracking(seq);
+            let (logits, views) = self.decoder.prefill_group(&windows, tail, true, tracking)?;
+            if tracking {
+                for (window, hidden) in windows.iter().zip(&views) {
+                    self.observe_mtp(seq, window, hidden)?;
+                }
+                if !tail.is_empty() {
+                    let hidden = self.decoder.last_chunk_hidden.clone();
+                    self.observe_mtp(seq, tail, &hidden)?;
+                }
+            }
+            return logits.squeeze(Some(&[1]));
+        }
         let mut logits = None;
         // Read before every pass: a pass that leaves the mapped path shrinks
         // the window for the passes after it.
@@ -400,6 +423,12 @@ impl HybridSchedulerBackend for Inner {
     }
     fn scheduler_prefill_slice_tokens(&self) -> u32 {
         self.decoder.prefill_slice_size() as u32
+    }
+    fn scheduler_whole_prompt_prefill(&self, prompt_tokens: u32, cached_prefix: u32) -> bool {
+        self.media_prefill.is_none()
+            && self
+                .decoder
+                .group_mode(prompt_tokens.saturating_sub(cached_prefix) as usize)
     }
     fn max_position_embeddings(&self) -> i32 {
         self.decoder.config.effective_context_limit() as i32

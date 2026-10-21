@@ -5,7 +5,7 @@
 use super::*;
 
 impl Decoder {
-    pub(super) fn deferred_state_submission(&self) -> bool {
+    pub(in super::super) fn deferred_state_submission(&self) -> bool {
         self.device_routes.is_some()
     }
 
@@ -13,7 +13,7 @@ impl Decoder {
         self.deferred_state_submission() && self.verification.is_none()
     }
 
-    fn pending_state_arrays(&self) -> Vec<&MxArray> {
+    pub(super) fn pending_state_arrays(&self) -> Vec<&MxArray> {
         self.caches.iter().flat_map(LayerCache::arrays).collect()
     }
 
@@ -58,14 +58,16 @@ impl Decoder {
         Ok(reduced)
     }
 
-    pub(super) fn prefill_with_device_routes(
+    pub(super) fn prefill_group_with_device_routes(
         &mut self,
-        tokens: &[u32],
+        windows: &[&[u32]],
         next: &[u32],
         embeddings: Option<&MxArray>,
         project: bool,
     ) -> Result<MxArray> {
-        if !(256..=1024).contains(&tokens.len())
+        if windows
+            .iter()
+            .any(|tokens| !(256..=1024).contains(&tokens.len()))
             || embeddings.is_some()
             || !self.gguf()
             || !self.batch_prefill
@@ -82,24 +84,66 @@ impl Decoder {
                 .weights
                 .prefill_device_slots_ready(self.config.num_hidden_layers)
         {
-            return self.prefill_chunk_inner(tokens, next, embeddings, project);
+            return self.prefill_group_inner(windows, next, embeddings, project);
         }
         self.weights.complete_device_readers()?;
-        let base = self.snapshot();
-        self.device_routes = Some(Vec::with_capacity(self.config.num_hidden_layers));
-        let tentative = self.prefill_chunk_inner(tokens, next, embeddings, project);
+        // Only a one-window pass replays a miss; a group of more is an error.
+        let base = (windows.len() == 1).then(|| self.snapshot());
+        self.device_routes = Some(Vec::with_capacity(
+            self.config.num_hidden_layers * windows.len(),
+        ));
+        let tentative = self.prefill_group_inner(windows, next, embeddings, project);
         let routes = self.device_routes.take();
         let output = tentative?;
-        let routes = routes
-            .ok_or_else(|| Error::from_reason("Qwen4 tentative prefill lost its route tape"))?;
-        if routes.len() != self.config.num_hidden_layers {
+        let Some(routes) = routes else {
+            if windows.len() > 1 {
+                // A trip between two sweeps committed the tape so far and
+                // closed the transaction; the rest of the group ran plain.
+                return Ok(output);
+            }
+            return Err(Error::from_reason(
+                "Qwen4 tentative prefill lost its route tape",
+            ));
+        };
+        if routes.len() != self.config.num_hidden_layers * windows.len() {
             return Err(Error::from_reason(
                 "Qwen4 tentative prefill has an incomplete route tape",
             ));
         }
+        let streams = std::mem::take(&mut self.group_streams);
+        let mut outputs = vec![&output];
+        outputs.extend(streams.iter());
+        let hit = self.commit_tentative(&outputs, &routes);
+        self.group_streams = streams;
+        #[cfg(test)]
+        self.tentative_commits.push(windows.len());
+        if hit? {
+            return Ok(output);
+        }
+        let Some(base) = base else {
+            return Err(Error::from_reason(
+                "Qwen4 prefill group routes lost their mapped banks",
+            ));
+        };
+        drop(output);
+        self.replay_device_prefill(base, windows[0], embeddings, project)
+    }
+
+    /// Complete a tentative pass and check its tape: `outputs` (the logits
+    /// and every residual stream), the tape, every state array and the
+    /// group's pending bank touches evaluate together, the pool writes after
+    /// them, then the routes are checked against the unchanged host mapping.
+    pub(super) fn commit_tentative(
+        &mut self,
+        outputs: &[&MxArray],
+        routes: &[(usize, MxArray)],
+    ) -> Result<bool> {
         let tape = MxArray::concatenate_many(routes.iter().map(|(_, ids)| ids).collect(), Some(0))?;
-        let mut completed = vec![&output, &tape];
+        let touches = self.weights.take_pending_touches();
+        let mut completed = outputs.to_vec();
+        completed.push(&tape);
         completed.extend(self.pending_state_arrays());
+        completed.extend(touches.iter());
         MxArray::eval_arrays_with_context(&completed, "qwen4::prefill_device_routes::commit")?;
         if let Some(adapter) = &mut self.paged {
             adapter
@@ -107,18 +151,27 @@ impl Decoder {
                 .map_err(Error::from_reason)?;
         }
         self.weights.complete_device_readers()?;
+        self.note("qwen4::routes::commit");
         let ids = tape.to_uint32()?;
-        let layers: Vec<_> = routes.iter().map(|(layer, _)| *layer).collect();
-        let hit = self.weights.commit_device_routes(
-            &layers,
-            &ids,
-            tokens.len() * self.config.num_experts_per_tok,
-        )?;
-        if hit {
-            return Ok(output);
+        let mut entries = Vec::with_capacity(routes.len());
+        let mut offset = 0;
+        for (layer, selected) in routes {
+            let len = selected.shape_at(0)? as usize;
+            let end = offset + len;
+            let Some(entry) = ids.get(offset..end) else {
+                return Err(Error::from_reason(
+                    "Qwen4 device route tape has an invalid shape",
+                ));
+            };
+            entries.push((*layer, entry));
+            offset = end;
         }
-        drop(output);
-        self.replay_device_prefill(base, tokens, embeddings, project)
+        if offset != ids.len() {
+            return Err(Error::from_reason(
+                "Qwen4 device route tape has an invalid shape",
+            ));
+        }
+        self.weights.commit_device_route_entries(&entries)
     }
 
     pub(in super::super) fn replay_device_prefill(

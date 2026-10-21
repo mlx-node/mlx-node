@@ -325,25 +325,7 @@ impl ChatBackend for Inner {
             ));
         }
         let _context = StreamContext::new(stream);
-        let mut logits = None;
-        // Read before every pass: a pass that leaves the mapped path shrinks
-        // the window for the passes after it.
-        let mut start = 0;
-        while start < tokens.len() {
-            let window = self.decoder.prefill_slice_size();
-            let end = (start + window).min(tokens.len());
-            let next_end = (end + window).min(tokens.len());
-            logits = Some(self.decoder.prefill_chunk_ahead(
-                &tokens[start..end],
-                &tokens[end..next_end],
-                None,
-                end == tokens.len(),
-            )?);
-            start = end;
-        }
-        logits
-            .ok_or_else(|| Error::from_reason("Empty qwen4_exp prefill"))?
-            .squeeze(Some(&[1]))
+        self.decoder.prefill_prompt(tokens)?.squeeze(Some(&[1]))
     }
     type Decode<'a>
         = Step<'a>

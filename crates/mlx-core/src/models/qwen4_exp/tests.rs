@@ -4673,7 +4673,7 @@ fn paged_writes_accept_offset_projection_views() {
             .to_float32()
             .unwrap()
             .to_vec();
-        paged::write_rows(&mut pages, 0, &view, &view, base as u32).unwrap();
+        paged::write_rows(&mut pages, 0, &view, &view, base as u32, base as u32).unwrap();
         drop(view);
         drop(backing);
         pages.eval_pending_pool_writes().unwrap();
@@ -4711,7 +4711,7 @@ fn gather_window_runtime_shapes_match_selected() {
         let shape = [written as i64, h as i64, d as i64];
         let k = rows(&shape, start);
         let v = rows(&shape, start + 61);
-        paged::write_rows(&mut pages, 0, &k, &v, start as u32).unwrap();
+        paged::write_rows(&mut pages, 0, &k, &v, start as u32, start as u32).unwrap();
         pages.eval_pending_pool_writes().unwrap();
         let base = start + written;
         let fresh_shape = [1, h as i64, fresh as i64, d as i64];

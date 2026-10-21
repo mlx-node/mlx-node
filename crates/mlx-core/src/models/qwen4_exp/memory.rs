@@ -55,7 +55,7 @@ pub(super) const MAPPED_MARGIN: u64 = 4 << 30;
 /// available a 6k turn wired 89.5 GiB and left 8.8 GiB, where llama.cpp runs
 /// the same model. The load gate and the tripwire own the posture; this
 /// floor only refuses at the kernel's critical level.
-const MAPPED_TURN_FLOOR: u64 = 2 << 30;
+pub(super) const MAPPED_TURN_FLOOR: u64 = 2 << 30;
 
 /// One `host_statistics64` read, in bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -399,21 +399,96 @@ impl Store {
         }
     }
 
+    /// A layer sweep of a prefill group ended: the SSD rule alone is checked
+    /// here (the slow-pass rules see the group's windows after it). Returns
+    /// whether a trip is held, this one or an earlier one not yet applied.
+    pub(in super::super) fn observe_sweep(&mut self) -> bool {
+        if !self.plan.mapped {
+            return self.tripwire.tripped().is_some();
+        }
+        if let Some(why) = self.tripwire.observe_ssd(
+            super::super::memory::process_disk_reads(),
+            self.plan.mapped_bytes,
+        ) {
+            tracing::warn!(
+                "qwen4 residency: mapped turn thrashes ({why}); the group goes on over slots after this sweep"
+            );
+        }
+        self.tripwire.tripped().is_some()
+    }
+
+    /// Apply a trip held by `observe_sweep` (or armed earlier) now that
+    /// nothing lazy reads a mapped bank: the store leaves the mapped path and
+    /// the request goes on over slots. Without a held trip nothing changes;
+    /// a switch that fails leaves the trip armed for the next turn to open.
+    pub(in super::super) fn apply_held_trip(&mut self) -> Result<Option<Fallback>> {
+        let Some(why) = self.tripwire.take() else {
+            return Ok(None);
+        };
+        if !self.plan.mapped {
+            return Ok(None);
+        }
+        match self.leave_mapped(&why) {
+            Ok(()) => Ok(Some(why)),
+            Err(error) => {
+                self.tripwire.rearm(why);
+                Err(error)
+            }
+        }
+    }
+
+    /// A layer-major prefill group of more than one window starts: its
+    /// bank touches run asynchronously and keep going after the stream ends,
+    /// until `end_group`.
+    pub(in super::super) fn begin_group(&mut self) {
+        self.group_in_progress = true;
+    }
+
+    /// The group ended, committed or not: touches issued since
+    /// `begin_group` and not taken by a commit are dropped.
+    pub(in super::super) fn end_group(&mut self) {
+        self.group_in_progress = false;
+        self.pending_touch.clear();
+    }
+
+    /// The arrays of the asynchronous touches since the last take; a group
+    /// commit evaluates them with its frontier.
+    pub(in super::super) fn take_pending_touches(&mut self) -> Vec<MxArray> {
+        std::mem::take(&mut self.pending_touch)
+    }
+
+    /// The turn opened over a pack that streams (or streamed) into the page
+    /// cache: its first pass runs beside the stream.
+    pub(in super::super) fn streaming_pass(&self) -> bool {
+        self.streaming_pass
+    }
+
+    /// Whether the pack stream's threads exist.
+    #[cfg(test)]
+    pub(in super::super) fn pack_stream_alive(&self) -> bool {
+        self.prefetch.is_some()
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn group_in_progress(&self) -> bool {
+        self.group_in_progress
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn pending_touches(&self) -> usize {
+        self.pending_touch.len()
+    }
+
     #[cfg(test)]
     pub(in super::super) fn tripwire_mut(&mut self) -> &mut super::super::tripwire::Tripwire {
         &mut self.tripwire
     }
 
+    /// Hold `why` as a sweep or pass would have tripped it; the store
+    /// applies it where it applies a real trip.
     #[cfg(test)]
-    pub(super) fn trip(&mut self, why: Fallback) {
-        self.tripwire.begin_turn(0);
-        let mapped = self.plan.mapped_bytes;
-        match why {
-            Fallback::SsdReads { read, .. } => {
-                self.tripwire.observe(1, Duration::ZERO, read, mapped);
-            }
-            other => panic!("test trips through SSD reads only, not {other}"),
-        }
+    pub(in super::super) fn trip(&mut self, why: Fallback) {
+        self.tripwire.rearm(why);
     }
 
     /// Drop the mapped banks and run the slot path from here on: the slot
@@ -442,6 +517,7 @@ impl Store {
         self.draft_bank_budget = 0;
         self.streaming_pass = false;
         self.last_touch = None;
+        self.pending_touch.clear();
         self.mapped_pass_start = None;
         self.slot_capacity = None;
         crate::array::memory::synchronize();
@@ -516,7 +592,7 @@ impl Store {
     }
 
     pub(super) fn keep_wired_at(&mut self, now: Instant, layer: usize, main: bool) -> Result<()> {
-        if !main || !self.streaming_pass {
+        if !main || !self.plan.mapped || !(self.streaming_pass || self.group_in_progress) {
             return Ok(());
         }
         if self
@@ -548,7 +624,10 @@ impl Store {
     }
 
     /// One eval reading one element of every bank of the layers up to
-    /// `through`, which binds them in a single command buffer.
+    /// `through`, which binds them in a single command buffer. Inside a
+    /// prefill group the eval would wait behind the queued sweeps (51-258 ms
+    /// measured), so the read is submitted asynchronously and its arrays
+    /// wait for the group commit.
     fn touch_banks(&mut self, through: usize) -> Result<Duration> {
         #[cfg(test)]
         {
@@ -590,10 +669,19 @@ impl Store {
             .map(|(_, list)| MxArray::concatenate_many(list.iter().collect(), Some(0)))
             .collect::<Result<Vec<_>>>()?;
         let started = Instant::now();
-        MxArray::eval_arrays_with_context(
-            &touched.iter().collect::<Vec<_>>(),
-            "qwen4::mapped::wire",
-        )?;
+        if self.group_in_progress {
+            #[cfg(test)]
+            self.touches_async.push(true);
+            MxArray::async_eval_arrays(&touched.iter().collect::<Vec<_>>());
+            self.pending_touch.extend(touched);
+        } else {
+            #[cfg(test)]
+            self.touches_async.push(false);
+            MxArray::eval_arrays_with_context(
+                &touched.iter().collect::<Vec<_>>(),
+                "qwen4::mapped::wire",
+            )?;
+        }
         Ok(started.elapsed())
     }
 
@@ -1006,8 +1094,22 @@ impl Store {
         if ids.len() != layers.len() * top || top == 0 {
             return Err(err("Qwen4 device route tape has an invalid shape"));
         }
+        let entries: Vec<_> = layers.iter().copied().zip(ids.chunks_exact(top)).collect();
+        self.commit_device_route_entries(&entries)
+    }
+
+    /// `commit_device_routes` over entries of their own lengths: a prefill
+    /// group's tape holds one entry per (layer, window) and its last window
+    /// may be shorter.
+    pub(in super::super) fn commit_device_route_entries(
+        &mut self,
+        entries: &[(usize, &[u32])],
+    ) -> Result<bool> {
+        if entries.iter().any(|(_, selected)| selected.is_empty()) {
+            return Err(err("Qwen4 device route tape has an invalid shape"));
+        }
         if self.plan.mapped {
-            for (&layer, selected) in layers.iter().zip(ids.chunks_exact(top)) {
+            for &(layer, selected) in entries {
                 let Some(mapped) = self.mapped_experts.get(&layer) else {
                     return Ok(false);
                 };
@@ -1020,7 +1122,7 @@ impl Store {
             }
             return Ok(true);
         }
-        for (&layer, selected) in layers.iter().zip(ids.chunks_exact(top)) {
+        for &(layer, selected) in entries {
             let Some(slots) = self.slots.get(&layer) else {
                 return Ok(false);
             };
@@ -1035,7 +1137,7 @@ impl Store {
                 return Ok(false);
             }
         }
-        for (&layer, selected) in layers.iter().zip(ids.chunks_exact(top)) {
+        for &(layer, selected) in entries {
             let slots = self
                 .slots
                 .get_mut(&layer)
