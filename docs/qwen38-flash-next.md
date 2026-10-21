@@ -257,6 +257,14 @@ one gather GEMV per token, and MTP verification projects all of its rows' PLE
 embeddings in one call before the gate and convolution advance row by row.
 Every row keeps the bits of its single-row projection.
 
+The decode mixer activation (the hyper-connection down projection, Q8
+320 x 10240, with its SiLU epilogue) splits K across the eight simdgroups of a
+threadgroup per output: each walks five of the forty 256-column blocks and
+stores every block's term, and simdgroup 0 adds the forty terms in ascending
+block order, the order of the one-simdgroup chain it replaces, before the same
+`simd_sum`. Every F32 sum and BF16 output keeps its bits; a partial sum per
+simdgroup would reassociate the chain and is not used.
+
 The shared scheduler supports up to four live owners. QSA K/V pages are admitted
 against a pool capped at 1 GiB; recurrent rows and MTP draft state are admitted
 against the 4 GiB working allowance left after that pool and the prefill window

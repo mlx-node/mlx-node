@@ -2773,6 +2773,13 @@ unsafe extern "C" {
         scales: *mut mlx_array,
         biases: *mut mlx_array,
     ) -> *mut mlx_array;
+    pub fn mlx_qwen4_mixer_sums(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        split: bool,
+    ) -> *mut mlx_array;
     pub fn mlx_qwen4_hyper_up_rows(
         x: *mut mlx_array,
         weight: *mut mlx_array,

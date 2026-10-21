@@ -7148,6 +7148,18 @@ fn row_batched_decode_kernels_match_single_row_calls_bit_for_bit() {
             &stack_rows(&singles),
             &format!("mixer activation rows={rows}"),
         );
+        // The split mixer kernel against the one-simdgroup chain it replaced.
+        assert_same_bits(
+            &mixer_sums(&down, &mixer_in, true),
+            &mixer_sums(&down, &mixer_in, false),
+            &format!("mixer F32 sums rows={rows}"),
+        );
+        let dense = math::rows::dense_decode(&down, &mixer_in).unwrap().unwrap();
+        assert_same_bits(
+            &batched,
+            &crate::nn::Activations::silu(&dense.div_scalar(4.).unwrap()).unwrap(),
+            &format!("mixer activation vs chain rows={rows}"),
+        );
 
         let x = bf16_rows(rows, 320, 1. / 64., 8., &mut next);
         let normed = bf16_rows(rows, 10240, 1. / 128., 4., &mut next);
@@ -8846,6 +8858,63 @@ fn ple_window_runs_four_rows_per_row_kernel_call_bit_for_bit() {
                     }
                 }
             }
+        }
+    }
+}
+
+fn mixer_sums(w: &weights::Weight, x: &MxArray, split: bool) -> MxArray {
+    let (s, b) = (w.scales.as_ref().unwrap(), w.biases.as_ref().unwrap());
+    MxArray::from_handle(
+        unsafe {
+            mlx_sys::mlx_qwen4_mixer_sums(
+                x.as_raw_ptr(),
+                w.values.as_raw_ptr(),
+                s.as_raw_ptr(),
+                b.as_raw_ptr(),
+                split,
+            )
+        },
+        "mixer sums",
+    )
+    .unwrap()
+}
+
+/// The split mixer kernel (eight simdgroups per output, every block's term
+/// stored, added in block order) against the one-simdgroup chain: the raw
+/// F32 sums before any BF16 rounding, and the BF16 SiLU outputs against
+/// `silu(dense / 4)` over the shared dense kernel's chain.
+#[test]
+fn mixer_act_split_keeps_the_one_simdgroup_chain_bit_for_bit() {
+    use crate::array::DType;
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    for seed in 0..8u32 {
+        let mut next = xorshift(0x2545_f491 ^ seed.wrapping_mul(0x9e37_79b9));
+        let down = q8_bank(320, 10240, &mut next);
+        for rows in 1..=4i64 {
+            let x = bf16_rows(rows, 10240, 1. / 256., 2., &mut next);
+            let what = format!("seed={seed} rows={rows}");
+            let chain = mixer_sums(&down, &x, false);
+            assert_eq!(chain.dtype().unwrap(), DType::Float32);
+            assert_same_bits(
+                &mixer_sums(&down, &x, true),
+                &chain,
+                &format!("F32 sums {what}"),
+            );
+            let dense = math::rows::dense_decode(&down, &x).unwrap().unwrap();
+            assert_same_bits(
+                &chain.astype(DType::BFloat16).unwrap(),
+                &dense,
+                &format!("chain vs dense kernel {what}"),
+            );
+            let act = math::rows::mixer_act(&down, &x).unwrap().unwrap();
+            assert_eq!(act.dtype().unwrap(), DType::BFloat16);
+            assert_same_bits(
+                &act,
+                &crate::nn::Activations::silu(&dense.div_scalar(4.).unwrap()).unwrap(),
+                &format!("BF16 activation {what}"),
+            );
         }
     }
 }

@@ -77,13 +77,7 @@ for (int row = 0; row < ROWS; ++row) {
   } else {
     for (int r = 0; r < RPS; ++r) {
       const float value = simd_sum(result[row][r]);
-      if (lane == 0) {
-        T v = T(value);
-        // TrackFastMixer's one-row schedule and SiLU epilogue. The local
-        // mixer divides its BF16 projection by four before native SiLU.
-        if constexpr (ACT) v = sigmoid_table[as_type<ushort>(T(v * T(0.25f)))];
-        out[row * N + first + r] = v;
-      }
+      if (lane == 0) out[row * N + first + r] = T(value);
     }
   }
 }

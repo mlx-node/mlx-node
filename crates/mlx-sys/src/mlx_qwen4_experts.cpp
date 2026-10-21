@@ -256,7 +256,6 @@ std::vector<array> dense_decode_graph(const std::vector<array> &in) {
                  {"N", n},
                  {"FAST", n % 8 == 0 && k % 512 == 0},
                  {"RPS", rps},
-                 {"ACT", false},
                  {"MIX", false},
                  {"ROWS", rows}},
                 std::nullopt, false, mlx::core::Device::gpu);
@@ -279,24 +278,28 @@ bool mixer_act_admits(const array &x, const array &w, const array &s,
          b.dtype() == s.dtype();
 }
 
-std::vector<array> mixer_act_graph(const std::vector<array> &a) {
-  const int rows = a[0].shape(1);
+const mlx::core::fast::CustomKernelFunction &mixer_act_kernel() {
   static auto kernel = mlx::core::fast::metal_kernel(
       "qwen4_decode_mixer_act",
-      {"x", "w", "scales", "biases", "normed", "sigmoid_table"}, {"out"},
-#include "metal/qwen4/dense_decode.metal.inc"
+      {"x", "w", "scales", "biases", "sigmoid_table"}, {"out"},
+#include "metal/qwen4/mixer_act_decode.metal.inc"
       , qmv_header());
-  return kernel({a[0], a[1], a[2], a[3], a[0], a[4]}, {{1, rows, 320}},
-                {mlx::core::bfloat16}, {32, 320, 1}, {32, 2, 1},
-                {{"T", mlx::core::bfloat16},
-                 {"K", 10240},
-                 {"N", 320},
-                 {"FAST", true},
-                 {"MIX", false},
-                 {"RPS", 1},
-                 {"ACT", true},
-                 {"ROWS", rows}},
-                std::nullopt, false, mlx::core::Device::gpu);
+  return kernel;
+}
+
+// One threadgroup of eight simdgroups per output row.
+std::vector<array> mixer_act_dispatch(const std::vector<array> &a, bool sums) {
+  const int rows = a[0].shape(1);
+  return mixer_act_kernel()(
+      {a[0], a[1], a[2], a[3], a[4]}, {{1, rows, 320}},
+      {sums ? mlx::core::float32 : mlx::core::bfloat16}, {32, 320 * 8, 1},
+      {32, 8, 1},
+      {{"T", mlx::core::bfloat16}, {"ROWS", rows}, {"SUMS", sums}},
+      std::nullopt, false, mlx::core::Device::gpu);
+}
+
+std::vector<array> mixer_act_graph(const std::vector<array> &a) {
+  return mixer_act_dispatch(a, false);
 }
 
 mlx_array *mixer_act_run(const array &x, const array &w, const array &s,
@@ -332,7 +335,6 @@ std::vector<array> hyper_up_graph(const std::vector<array> &in) {
                  {"N", 10240},
                  {"FAST", false},
                  {"RPS", 4},
-                 {"ACT", false},
                  {"MIX", 1},
                  {"ROWS", rows}},
                 std::nullopt, false, mlx::core::Device::gpu);
@@ -486,6 +488,50 @@ extern "C" mlx_array *mlx_qwen4_decode_mixer_act_rows(mlx_array *input,
 #endif
   return nullptr;
 }
+// The F32 simd_sum behind every mixer output, from the split kernel or, with
+// `split` false, from the shared dense kernel's one-simdgroup chain (RPS 1)
+// over an exact F32 copy of x. Only bitwise tests call it.
+extern "C" mlx_array *mlx_qwen4_mixer_sums(mlx_array *input, mlx_array *weight,
+                                           mlx_array *scales,
+                                           mlx_array *biases, bool split) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!input || !weight || !scales || !biases)
+      return nullptr;
+    const auto &x = *reinterpret_cast<array *>(input);
+    const auto &w = *reinterpret_cast<array *>(weight);
+    const auto &s = *reinterpret_cast<array *>(scales);
+    const auto &b = *reinterpret_cast<array *>(biases);
+    if (!mixer_act_admits(x, w, s, b, 4))
+      return nullptr;
+    if (split)
+      return reinterpret_cast<mlx_array *>(new array(
+          mixer_act_dispatch({x, w, s, b, native_bf16_silu_table()}, true)[0]));
+    static auto chain = mlx::core::fast::metal_kernel(
+        "qwen4_dense_decode",
+        {"x", "w", "scales", "biases", "normed", "sigmoid_table"}, {"out"},
+#include "metal/qwen4/dense_decode.metal.inc"
+        , qmv_header());
+    const auto xf = mlx::core::astype(x, mlx::core::float32);
+    const int rows = x.shape(1);
+    auto out = chain({xf, w, s, b, xf, xf}, {{1, rows, 320}},
+                     {mlx::core::float32}, {32, 320, 1}, {32, 2, 1},
+                     {{"T", mlx::core::float32},
+                      {"K", 10240},
+                      {"N", 320},
+                      {"FAST", true},
+                      {"RPS", 1},
+                      {"MIX", false},
+                      {"ROWS", rows}},
+                     std::nullopt, false, mlx::core::Device::gpu);
+    return reinterpret_cast<mlx_array *>(new array(std::move(out[0])));
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 mixer sums: " << e.what() << std::endl;
+  }
+#endif
+  return nullptr;
+}
+
 extern "C" mlx_array *mlx_qwen4_hyper_up(mlx_array *input, mlx_array *weight,
                                          mlx_array *scales, mlx_array *biases,
                                          mlx_array *normed) {
