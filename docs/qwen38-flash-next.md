@@ -188,16 +188,21 @@ projections, sparse lookup rows), is imported from the checkpoint. Deleting
 the pack is safe while the model is stopped.
 
 Each pack directory carries a `.manifest` recording its canonical source
-directory and packed file list. Opening a checkpoint sweeps sibling
-`.mlx-qwen4-mapped-v3-*` directories: one is orphaned only when its manifest
-cannot prove liveness (missing or unreadable source) or records a different
-identity than its directory name — and only once the newest
-`.manifest`/`lock`/`.mapped` mtime is also older than one hour. The hour is a
-grace gate for real orphan reasons, never an expiry on its own: a healthy
-manifested pack stays cached indefinitely. Removal requires a non-blocking
-lock on the pack's `lock` file, which every process serving or building the
-pack holds shared; directories without a manifest are never removed, since
-nothing can prove them stale, and a load never sweeps its own pack. Legacy
+directory, the mount point that directory sits on, and the packed file list.
+Opening a checkpoint sweeps sibling `.mlx-qwen4-mapped-v3-*` directories: one
+is orphaned only when its manifest proves it stale — every source file is
+present and fingerprints to another identity, or a source file is gone while
+the recorded mount point is still mounted — and only once the newest
+`.manifest`/`lock`/`.mapped` mtime is also older than one hour. A pack whose
+source volume is unplugged, whose source cannot be read, or whose manifest is
+unreadable is kept. The fingerprint is the canonical path, inode, size, mtime
+and ctime of each file, never the device number, which macOS reassigns across
+reboots and re-plugs. The hour is a grace gate for real orphan reasons, never
+an expiry on its own: a healthy manifested pack stays cached indefinitely.
+Removal requires a non-blocking lock on the pack's `lock` file, which every
+process serving or building the pack holds shared; directories without a
+manifest are never removed, since nothing can prove them stale, and a load
+never sweeps its own pack. Legacy
 chunk directories named `.mlx-qwen4-packed-v2-<64 lowercase hex>`, which older
 releases write, are removed automatically once idle for one hour and unlocked
 (a non-blocking lock on their `budget` file), with or without a manifest; any

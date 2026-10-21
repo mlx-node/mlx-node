@@ -72,15 +72,24 @@ pub(super) struct PackedCache {
     manifest: Vec<u8>,
 }
 
-fn packed_identity(files: impl Iterator<Item = PathBuf>) -> Result<String> {
+/// Canonical path and metadata of each source file, in order.
+fn stat_sources(files: impl Iterator<Item = PathBuf>) -> Vec<io::Result<(PathBuf, fs::Metadata)>> {
+    files
+        .map(|path| {
+            let canonical = path.canonicalize()?;
+            let meta = fs::metadata(&canonical)?;
+            Ok((canonical, meta))
+        })
+        .collect()
+}
+
+/// No device number: macOS renumbers volumes across reboots and re-plugs.
+fn packed_identity(files: &[(PathBuf, fs::Metadata)]) -> String {
     let mut hash = Sha256::new();
     hash.update(MAGIC);
-    for path in files {
-        let canonical = path.canonicalize().map_err(err)?;
-        let meta = fs::metadata(&canonical).map_err(err)?;
+    for (canonical, meta) in files {
         hash.update(canonical.as_os_str().as_bytes());
         for n in [
-            meta.dev(),
             meta.ino(),
             meta.len(),
             meta.mtime() as u64,
@@ -91,7 +100,7 @@ fn packed_identity(files: impl Iterator<Item = PathBuf>) -> Result<String> {
             hash.update(n.to_le_bytes());
         }
     }
-    Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Lowercase-hex encode raw bytes — the `.manifest` `path_hex=`/`file_hex=`
@@ -132,15 +141,25 @@ fn packed_hex_decode(field: &[u8]) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Recompute an identity dir's source fingerprint from its `.manifest`. Any
-/// missing source file or unreadable manifest is Err so callers can treat the
-/// dir as orphaned. `path_hex=`/`file_hex=` lines (raw OS bytes as hex) are
-/// preferred over the lossy `path=`/`file=` lines they twin; pre-hex
-/// manifests keep working through the raw fields.
-fn identity_from_manifest(dir: &Path) -> Result<String> {
+/// What a pack's `.manifest` proves about its source now.
+#[derive(Debug, PartialEq, Eq)]
+enum Source {
+    /// Every file stats; the identity it hashes to.
+    Present(String),
+    /// A file is gone while the mount point the manifest recorded is mounted.
+    Deleted,
+    /// Its volume is not mounted, or a stat failed for another reason.
+    Unreachable,
+}
+
+/// Err = unreadable or corrupt manifest. `path_hex=`/`file_hex=` lines (raw
+/// OS bytes as hex) are preferred over the lossy `path=`/`file=` lines they
+/// twin; pre-hex manifests keep working through the raw fields.
+fn manifest_source(dir: &Path) -> Result<Source> {
     let data = fs::read(dir.join(".manifest")).map_err(err)?;
     let mut path_raw = None;
     let mut path_hex = None;
+    let mut mount_hex = None;
     let mut file_raws: Vec<&[u8]> = Vec::new();
     let mut file_hexes: Vec<&[u8]> = Vec::new();
     for line in data.split(|&b| b == b'\n') {
@@ -148,6 +167,8 @@ fn identity_from_manifest(dir: &Path) -> Result<String> {
             path_hex = Some(raw);
         } else if let Some(raw) = line.strip_prefix(b"path=".as_slice()) {
             path_raw = Some(raw);
+        } else if let Some(raw) = line.strip_prefix(b"mount_hex=".as_slice()) {
+            mount_hex = Some(raw);
         } else if let Some(raw) = line.strip_prefix(b"file_hex=".as_slice()) {
             file_hexes.push(raw);
         } else if let Some(raw) = line.strip_prefix(b"file=".as_slice()) {
@@ -163,6 +184,13 @@ fn identity_from_manifest(dir: &Path) -> Result<String> {
             .map(|raw| PathBuf::from(OsStr::from_bytes(raw)))
             .ok_or_else(|| err("packed manifest missing path="))?
     };
+    let mount = mount_hex
+        .map(|hex| {
+            packed_hex_decode(hex)
+                .map(|bytes| PathBuf::from(OsStr::from_bytes(&bytes)))
+                .ok_or_else(|| err("packed manifest has corrupt mount_hex="))
+        })
+        .transpose()?;
     let files: Vec<PathBuf> = if !file_hexes.is_empty() {
         let mut files = Vec::with_capacity(file_hexes.len());
         for hex in file_hexes {
@@ -180,12 +208,28 @@ fn identity_from_manifest(dir: &Path) -> Result<String> {
     if files.is_empty() {
         return Err(err("packed manifest lists no files"));
     }
-    packed_identity(files.into_iter())
+    let mut stats = Vec::with_capacity(files.len());
+    let mut missing = false;
+    for stat in stat_sources(files.into_iter()) {
+        match stat {
+            Ok(stat) => stats.push(stat),
+            Err(e) if e.kind() == ErrorKind::NotFound => missing = true,
+            Err(_) => return Ok(Source::Unreachable),
+        }
+    }
+    Ok(if !missing {
+        Source::Present(packed_identity(&stats))
+    } else if mount.is_some_and(|mount| is_mounted(&mount)) {
+        Source::Deleted
+    } else {
+        Source::Unreachable
+    })
 }
 
-/// Serialize canonical source paths into `.manifest` bytes: the hex twins
-/// come first (`path_hex=`, then every `file_hex=`), the raw `path=`/`file=`
-/// display lines last. A raw line whose bytes contain a newline is omitted
+/// Serialize canonical source paths into `.manifest` bytes: the hex records
+/// come first (`path_hex=`, `mount_hex=`, then every `file_hex=`), the raw
+/// `path=`/`file=` display lines last; the mount point has no raw twin. A
+/// raw line whose bytes contain a newline is omitted
 /// entirely — a newline is the only byte that can forge a record line, and a
 /// path holding "\nfile_hex=evil" would inject an earlier authoritative-
 /// looking line into the same file. The raw lines keep readable manifests
@@ -198,6 +242,11 @@ fn pack_manifest(canonical: &[PathBuf]) -> Vec<u8> {
         .unwrap_or_default();
     let mut manifest = b"path_hex=".to_vec();
     manifest.extend_from_slice(&packed_hex_encode(base.as_os_str().as_bytes()));
+    manifest.push(b'\n');
+    manifest.extend_from_slice(b"mount_hex=");
+    manifest.extend_from_slice(&packed_hex_encode(
+        mount_point(&base).as_os_str().as_bytes(),
+    ));
     manifest.push(b'\n');
     let mut raw = Vec::new();
     if !base.as_os_str().as_bytes().contains(&b'\n') {
@@ -226,6 +275,32 @@ fn pack_manifest(canonical: &[PathBuf]) -> Vec<u8> {
 /// real dirs, so links are foreign.
 pub(super) fn is_real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
+/// The highest ancestor of `path` on its device: the mount point it sits on.
+fn mount_point(path: &Path) -> PathBuf {
+    let device = |p: &Path| fs::symlink_metadata(p).ok().map(|m| m.dev());
+    let dev = device(path);
+    let mut mount = path;
+    while let Some(parent) = mount.parent() {
+        if dev.is_none() || device(parent) != dev {
+            break;
+        }
+        mount = parent;
+    }
+    mount.to_path_buf()
+}
+
+/// `mount` is a mount point now: `/`, or a real dir on another device than
+/// its parent. A left-behind mount dir is a plain dir on its parent's device.
+fn is_mounted(mount: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(mount) else {
+        return false;
+    };
+    meta.is_dir()
+        && mount
+            .parent()
+            .is_none_or(|parent| fs::symlink_metadata(parent).is_ok_and(|p| p.dev() != meta.dev()))
 }
 
 /// Unlink `path` only when it is a symlink — `fs::remove_file` removes just
@@ -411,24 +486,21 @@ fn packed_dir_idle(dir: &Path) -> bool {
     packed_dir_mtime(dir).is_some_and(|newest| newest < SystemTime::now() - PACKED_SWEEP_MIN_AGE)
 }
 
-/// None keeps the dir (manifest-less dirs are never orphan-deleted: their
-/// staleness cannot be proven). The idle gate is a safety grace for the
-/// orphan reasons, never itself a reason: an idle dir whose manifest still
-/// recomputes to its name identity is a healthy cache, and deleting it would
-/// only force a full repack on the next load.
+/// None keeps the dir. Only proof removes one: a present source that hashes
+/// to another identity, or a file gone from a mount point that is still
+/// mounted. An unplugged volume, an unreadable file, a corrupt manifest or
+/// no manifest proves nothing. The idle gate is a race grace, never a reason.
 fn packed_orphan_reason(dir: &Path) -> Option<&'static str> {
     let manifest = dir.join(".manifest");
     if !manifest.is_file() || !packed_dir_idle(dir) {
         return None;
     }
-    match identity_from_manifest(dir) {
-        Err(_) => Some("unreadable manifest or missing source"),
-        Ok(identity) if dir_name_identity(dir) != Some(identity.as_str()) => {
+    match manifest_source(dir) {
+        Ok(Source::Present(identity)) if dir_name_identity(dir) != Some(identity.as_str()) => {
             Some("source fingerprint changed")
         }
-        // Identity matches the dir name: the contents are still correct for
-        // their source — idleness alone is not an orphan reason.
-        Ok(_) => None,
+        Ok(Source::Deleted) => Some("source deleted"),
+        _ => None,
     }
 }
 
@@ -723,11 +795,12 @@ impl PackedCache {
     /// `root`. Nothing is created here: the pack builder creates the dir,
     /// takes its lock and only then publishes the manifest.
     pub(super) fn new_at(root: &Path, files: BTreeSet<PathBuf>) -> Result<Self> {
-        let mut canonical = Vec::with_capacity(files.len());
-        for path in &files {
-            canonical.push(path.canonicalize().map_err(err)?);
-        }
-        let identity = packed_identity(canonical.iter().cloned())?;
+        let stats = stat_sources(files.into_iter())
+            .into_iter()
+            .collect::<io::Result<Vec<_>>>()
+            .map_err(err)?;
+        let identity = packed_identity(&stats);
+        let canonical: Vec<PathBuf> = stats.into_iter().map(|(path, _)| path).collect();
         let cache = Self {
             dir: root.join(format!("{MAPPED_DIR_PREFIX}{identity}")),
             manifest: pack_manifest(&canonical),
@@ -1164,36 +1237,36 @@ mod tests {
         let dir = published(&cache);
         let manifest = fs::read_to_string(dir.join(".manifest")).unwrap();
         let canonical = source.canonicalize().unwrap();
+        let source_dir = canonical.parent().unwrap();
+        let mut lines = manifest.lines();
         assert_eq!(
-            manifest.lines().next().unwrap(),
-            format!(
-                "path_hex={}",
-                String::from_utf8(packed_hex_encode(
-                    canonical.parent().unwrap().as_os_str().as_bytes()
-                ))
-                .unwrap()
-            ),
+            lines.next().unwrap(),
+            format!("path_hex={}", hex(source_dir.as_os_str().as_bytes())),
             "the authoritative hex record leads the manifest:\n{manifest}"
         );
+        let mount = mount_point(source_dir);
+        assert_eq!(
+            lines.next().unwrap(),
+            format!("mount_hex={}", hex(mount.as_os_str().as_bytes())),
+            "the source's mount point follows it:\n{manifest}"
+        );
+        assert!(is_mounted(&mount), "{} must be mounted", mount.display());
         assert!(
             manifest.lines().any(|line| line == "file=source.gguf"),
             "the raw file record follows its hex twin:\n{manifest}"
         );
         assert_eq!(
-            identity_from_manifest(&dir).unwrap(),
-            dir_name_identity(&dir).unwrap()
+            manifest_source(&dir).unwrap(),
+            Source::Present(dir_name_identity(&dir).unwrap().to_owned())
         );
-        // Deleting the source makes the identity unverifiable; the orphan
-        // verdict still waits out the idle grace on the newest witness.
+        // A file gone from a mounted volume proves the pack stale; the verdict
+        // still waits out the idle grace on the newest witness.
         fs::remove_file(&source).unwrap();
-        assert!(identity_from_manifest(&dir).is_err());
+        assert_eq!(manifest_source(&dir).unwrap(), Source::Deleted);
         assert_eq!(packed_orphan_reason(&dir), None);
         age(&dir.join(".manifest"), 7200);
         age_dir(&dir, 7200);
-        assert_eq!(
-            packed_orphan_reason(&dir),
-            Some("unreadable manifest or missing source")
-        );
+        assert_eq!(packed_orphan_reason(&dir), Some("source deleted"));
     }
 
     /// A raw `file=` line carries the filename's bytes verbatim, so a name
@@ -1226,9 +1299,13 @@ mod tests {
             !manifest.lines().any(|line| line == "file_hex=6262"),
             "the injected record must never be written:\n{manifest}"
         );
+        assert!(
+            manifest.lines().all(|line| !line.starts_with("mount=")),
+            "the mount point is written as hex only:\n{manifest}"
+        );
         assert_eq!(
-            identity_from_manifest(&dir).unwrap(),
-            dir_name_identity(&dir).unwrap(),
+            manifest_source(&dir).unwrap(),
+            Source::Present(dir_name_identity(&dir).unwrap().to_owned()),
             "the real file still verifies through its hex twin"
         );
     }
@@ -1241,20 +1318,18 @@ mod tests {
         let source = temp.0.join("source.gguf");
         fs::write(&source, b"weights").unwrap();
         let cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
-        // The current identity's dir, with the same orphan-looking manifest
-        // and age as the stale sibling: only being current keeps it.
+        // The current identity's dir, with the same orphan manifest and age
+        // as the stale sibling: only being current keeps it.
         let current = cache.mapped_dir().to_path_buf();
         fs::create_dir(&current).unwrap();
         fs::write(current.join("x.mapped"), vec![0_u8; 100]).unwrap();
-        fs::write(current.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
+        fs::write(current.join(".manifest"), deleted_manifest(&parent)).unwrap();
         age(&current.join("x.mapped"), 7200);
         age(&current.join(".manifest"), 7200);
         age_dir(&current, 7200);
+        assert_eq!(packed_orphan_reason(&current), Some("source deleted"));
         let stale = mapped_fixture(&parent, 'a', 100, true);
-        assert_eq!(
-            packed_orphan_reason(&stale),
-            Some("unreadable manifest or missing source")
-        );
+        assert_eq!(packed_orphan_reason(&stale), Some("source deleted"));
         // A manifest-less dir is never orphan-deleted: nothing proves it stale.
         let unknown = parent.join(format!("{MAPPED_DIR_PREFIX}{}", "b".repeat(64)));
         fs::create_dir(&unknown).unwrap();
@@ -1265,10 +1340,11 @@ mod tests {
         let chunks = parent.join(format!("{RETIRED_CHUNK_PREFIX}{}", "d".repeat(64)));
         for dir in [&foreign, &chunks] {
             fs::create_dir(dir).unwrap();
-            fs::write(dir.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
+            fs::write(dir.join(".manifest"), deleted_manifest(&parent)).unwrap();
             age(&dir.join(".manifest"), 7200);
             age_dir(dir, 7200);
         }
+        assert_eq!(packed_orphan_reason(&foreign), Some("source deleted"));
         until_gone(
             || drop(PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap()),
             || !stale.exists() && !chunks.exists(),
@@ -1317,9 +1393,11 @@ mod tests {
         let outside = temp.0.join("outside");
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("x.mapped"), vec![0_u8; 1 << 20]).unwrap();
-        fs::write(outside.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
+        fs::write(outside.join(".manifest"), deleted_manifest(&temp.0)).unwrap();
+        age(&outside.join("x.mapped"), 7200);
         age(&outside.join(".manifest"), 7200);
         age_dir(&outside, 7200);
+        assert_eq!(packed_orphan_reason(&outside), Some("source deleted"));
         // A root-level entry whose NAME claims an identity but whose inode is
         // a symlink: foreign, immune to the sweep.
         let link = parent.join(format!("{MAPPED_DIR_PREFIX}{}", "a".repeat(64)));
@@ -1398,9 +1476,31 @@ mod tests {
         panic!("child never acquired {}", path.display());
     }
 
+    fn hex(bytes: &[u8]) -> String {
+        String::from_utf8(packed_hex_encode(bytes)).unwrap()
+    }
+
+    /// A manifest naming `source_dir/x.gguf`, recorded on `mount`.
+    fn manifest_naming(source_dir: &Path, mount: &Path) -> String {
+        format!(
+            "path_hex={}\nmount_hex={}\nfile_hex={}\n",
+            hex(source_dir.as_os_str().as_bytes()),
+            hex(mount.as_os_str().as_bytes()),
+            hex(b"x.gguf")
+        )
+    }
+
+    /// A manifest proving its source deleted: no `x.gguf` in `source_dir`,
+    /// whose mount point is mounted.
+    fn deleted_manifest(source_dir: &Path) -> String {
+        let source_dir = source_dir.canonicalize().unwrap();
+        assert!(!source_dir.join("x.gguf").exists());
+        manifest_naming(&source_dir, &mount_point(&source_dir))
+    }
+
     /// A mapped dir fixture: `<letter>*64` identity, one `x.mapped` of
-    /// `bytes`, a manifest whose source is gone, every witness aged past the
-    /// sweep grace when `aged`.
+    /// `bytes`, a manifest whose source is deleted, every witness aged past
+    /// the sweep grace when `aged`.
     fn mapped_fixture(parent: &Path, letter: char, bytes: usize, aged: bool) -> PathBuf {
         let dir = parent.join(format!(
             "{MAPPED_DIR_PREFIX}{}",
@@ -1408,7 +1508,7 @@ mod tests {
         ));
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("x.mapped"), vec![0_u8; bytes]).unwrap();
-        fs::write(dir.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
+        fs::write(dir.join(".manifest"), deleted_manifest(parent)).unwrap();
         fs::write(dir.join(MAPPED_LOCK), b"").unwrap();
         if aged {
             for entry in ["x.mapped", ".manifest", MAPPED_LOCK] {
@@ -1504,7 +1604,10 @@ mod tests {
         // verifies: the format is retired, so a live source keeps nothing.
         let manifested = [written[0], written[1], (".manifest", cache.manifest())];
         let same_source = chunk_fixture(&parent, identity, &manifested, true);
-        assert_eq!(identity_from_manifest(&same_source).unwrap(), identity);
+        assert_eq!(
+            manifest_source(&same_source).unwrap(),
+            Source::Present(identity.to_owned())
+        );
         // origin/main writes the manifest at load and `budget` only with its
         // first chunk, so a dir it never wrote to has no ledger to lock.
         let stub_files: [(&str, &[u8]); 1] = [(".manifest", b"path=/gone\nfile=x.gguf\n")];
@@ -1548,6 +1651,189 @@ mod tests {
         assert!(!locked.exists(), "the released ledger no longer keeps it");
         assert!(fresh.exists());
         assert!(foreign.exists());
+    }
+
+    #[test]
+    fn identity_hashes_path_inode_size_and_times_but_not_the_device() {
+        let temp = Temp::new();
+        let first = temp.0.join("a.gguf");
+        let second = temp.0.join("b.gguf");
+        fs::write(&first, b"first split").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let cache = PackedCache::new_at(
+            &temp.0.join("cache"),
+            BTreeSet::from([second.clone(), first.clone()]),
+        )
+        .unwrap();
+        let mut hash = Sha256::new();
+        hash.update(MAGIC);
+        for path in [&first, &second] {
+            let canonical = path.canonicalize().unwrap();
+            let meta = fs::metadata(&canonical).unwrap();
+            hash.update(canonical.as_os_str().as_bytes());
+            for n in [
+                meta.ino(),
+                meta.len(),
+                meta.mtime() as u64,
+                meta.mtime_nsec() as u64,
+                meta.ctime() as u64,
+                meta.ctime_nsec() as u64,
+            ] {
+                hash.update(n.to_le_bytes());
+            }
+        }
+        let expected: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(cache.identity(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn an_unmounted_source_volume_keeps_its_pack() {
+        let temp = Temp::new();
+        let base = temp.0.canonicalize().unwrap();
+        let parent = base.join("cache");
+        fs::create_dir(&parent).unwrap();
+        let unplugged = base.join("Volumes/T7");
+        let leftover = base.join("leftover");
+        fs::create_dir(&leftover).unwrap();
+        let live = mount_point(&base);
+        assert!(!is_mounted(&unplugged));
+        assert!(
+            !is_mounted(&leftover),
+            "a plain dir on its parent's device is no mount point"
+        );
+        assert!(is_mounted(&live), "{} must be mounted", live.display());
+        let fixture = |letter: char, source_dir: &Path, mount: &Path| {
+            let dir = mapped_fixture(&parent, letter, 100, true);
+            fs::write(dir.join(".manifest"), manifest_naming(source_dir, mount)).unwrap();
+            age(&dir.join(".manifest"), 7200);
+            age_dir(&dir, 7200);
+            dir
+        };
+        let away = fixture('1', &unplugged.join("models"), &unplugged);
+        let left_behind = fixture('2', &leftover.join("models"), &leftover);
+        let deleted = fixture('3', &base, &live);
+        assert_eq!(manifest_source(&away).unwrap(), Source::Unreachable);
+        assert_eq!(manifest_source(&left_behind).unwrap(), Source::Unreachable);
+        assert_eq!(packed_orphan_reason(&away), None);
+        assert_eq!(packed_orphan_reason(&left_behind), None);
+        assert_eq!(packed_orphan_reason(&deleted), Some("source deleted"));
+        let current = parent.join("current");
+        until_gone(
+            || sweep_packed_cache(&parent, &current),
+            || !deleted.exists(),
+        );
+        assert!(!deleted.exists(), "a file gone from a live mount is swept");
+        assert!(away.exists(), "an unplugged volume keeps its pack");
+        assert!(
+            left_behind.exists(),
+            "a left-behind mount dir keeps its pack"
+        );
+    }
+
+    /// Resets a `chmod 000` before `Temp` removes the tree.
+    struct Mode(PathBuf, u32);
+
+    impl Drop for Mode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_manifest_or_an_unreadable_source_keeps_the_pack() {
+        let temp = Temp::new();
+        let base = temp.0.canonicalize().unwrap();
+        let parent = base.join("cache");
+        fs::create_dir(&parent).unwrap();
+        let path = hex(base.as_os_str().as_bytes());
+        let mount = hex(mount_point(&base).as_os_str().as_bytes());
+        let file = hex(b"x.gguf");
+        // Each one would read Deleted if its fault were skipped.
+        let corrupt = [
+            (
+                '1',
+                format!("path_hex=zz\nmount_hex={mount}\nfile_hex={file}\n"),
+            ),
+            ('2', format!("mount_hex={mount}\nfile_hex={file}\n")),
+            ('3', format!("path_hex={path}\nmount_hex={mount}\n")),
+            (
+                '4',
+                format!("path_hex={path}\nmount_hex=zz\nfile_hex={file}\n"),
+            ),
+        ];
+        let mut kept = Vec::new();
+        for (letter, manifest) in corrupt {
+            let dir = mapped_fixture(&parent, letter, 100, true);
+            fs::write(dir.join(".manifest"), &manifest).unwrap();
+            age(&dir.join(".manifest"), 7200);
+            age_dir(&dir, 7200);
+            assert!(manifest_source(&dir).is_err(), "{manifest}");
+            assert_eq!(packed_orphan_reason(&dir), None, "{manifest}");
+            kept.push(dir);
+        }
+        // Root reads through any mode.
+        let mut restore = Vec::new();
+        if unsafe { libc::geteuid() } != 0 {
+            let unreadable = mapped_fixture(&parent, '5', 100, true);
+            restore.push(Mode(unreadable.join(".manifest"), 0o644));
+            chmod(&unreadable.join(".manifest"), 0o000);
+            assert!(manifest_source(&unreadable).is_err());
+            assert_eq!(packed_orphan_reason(&unreadable), None);
+            kept.push(unreadable);
+            let source_dir = base.join("src");
+            fs::create_dir(&source_dir).unwrap();
+            fs::write(source_dir.join("x.gguf"), b"weights").unwrap();
+            let cache =
+                PackedCache::new_at(&parent, BTreeSet::from([source_dir.join("x.gguf")])).unwrap();
+            let denied = published(&cache);
+            age(&denied.join(".manifest"), 7200);
+            age_dir(&denied, 7200);
+            restore.push(Mode(source_dir.clone(), 0o755));
+            chmod(&source_dir, 0o000);
+            assert_eq!(manifest_source(&denied).unwrap(), Source::Unreachable);
+            assert_eq!(packed_orphan_reason(&denied), None);
+            kept.push(denied);
+        }
+        sweep_packed_cache(&parent, &parent.join("current"));
+        for dir in &kept {
+            assert!(dir.exists(), "{} was swept", dir.display());
+        }
+    }
+
+    #[test]
+    fn a_split_set_missing_one_file_on_a_mounted_volume_is_an_orphan() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        let pack = |name: &str| {
+            let source_dir = temp.0.join(name);
+            fs::create_dir(&source_dir).unwrap();
+            let files = [source_dir.join("a.gguf"), source_dir.join("b.gguf")];
+            for file in &files {
+                fs::write(file, file.as_os_str().as_bytes()).unwrap();
+            }
+            let cache = PackedCache::new_at(&parent, BTreeSet::from(files.clone())).unwrap();
+            (files, published(&cache))
+        };
+        let (files, removed) = pack("removed");
+        fs::remove_file(&files[1]).unwrap();
+        let (files, rewritten) = pack("rewritten");
+        fs::write(&files[0], b"new weights").unwrap();
+        for dir in [&removed, &rewritten] {
+            age(&dir.join(".manifest"), 7200);
+            age_dir(dir, 7200);
+        }
+        assert_eq!(manifest_source(&removed).unwrap(), Source::Deleted);
+        assert_eq!(packed_orphan_reason(&removed), Some("source deleted"));
+        assert_eq!(
+            packed_orphan_reason(&rewritten),
+            Some("source fingerprint changed")
+        );
     }
 
     fn fixture_gguf() -> PathBuf {
