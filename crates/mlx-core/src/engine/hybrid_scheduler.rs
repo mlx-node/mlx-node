@@ -3475,6 +3475,12 @@ mod tests {
         // A degenerate or zero-length range still terminates at the target.
         assert_eq!(prefill_slice_ends(0, 7, 512, []), [7]);
         assert_eq!(prefill_slice_ends(128, 128, 512, [64]), Vec::<u32>::new());
+        // A whole-prompt step: the saturating slice gives the one end.
+        assert_eq!(prefill_slice_ends(0, 6219, u32::MAX, []), [6219]);
+        assert_eq!(
+            prefill_slice_ends(100, 6219, u32::MAX, [3000]),
+            [3000, 6219]
+        );
     }
 
     #[test]

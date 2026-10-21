@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::Ordering;
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp")
 }
@@ -4234,9 +4235,13 @@ fn draft_history_buffer_matches_its_concatenated_rows() {
 #[test]
 fn draft_history_appends_in_place() {
     let mut seed = 0xD1B5_4A32_D192_ED03u64;
+    // An eval's command buffer holds its outputs' buffers until its completion
+    // handler runs, after the eval returns; a write before that copies instead of
+    // donating, so the next append waits for the GPU to retire it.
     let storage = |cache: &decoder::LayerCache| {
         let (_, keys, values) = cache.draft_kv().unwrap();
         MxArray::eval_arrays(&[keys, values]).unwrap();
+        crate::array::memory::synchronize();
         (keys.storage_ptr(), values.storage_ptr())
     };
     let mut owner = decoder::LayerCache::default();
@@ -7877,18 +7882,19 @@ fn real_model_teacher_forced_env_arms() {
         let mapped = decoder.weights.plan.mapped;
         let slots = decoder.weights.plan.partial_expert_slots;
         let started = Instant::now();
-        let mut logits = None;
-        let mut start = 0;
-        while start < prompt.len() {
-            let end = (start + decoder.prefill_slice_size()).min(prompt.len());
-            logits = Some(
-                decoder
-                    .prefill_chunk(&prompt[start..end], None, end == prompt.len())
-                    .map_err(|e| format!("prefill: {e}"))?,
-            );
-            start = end;
-        }
-        let mut logits = logits.ok_or("empty prompt")?;
+        let group = decoder.group_mode(prompt.len());
+        let mut logits = decoder
+            .prefill_prompt(prompt)
+            .map_err(|e| format!("prefill: {e}"))?;
+        eprintln!(
+            "D3 prefill: {} tokens as {}",
+            prompt.len(),
+            if group {
+                "one layer-major group"
+            } else {
+                "windows"
+            }
+        );
         let bf16 = logits.dtype().unwrap() == crate::array::DType::BFloat16;
         let prefill_ms = started.elapsed().as_secs_f64() * 1e3;
         let mut arm = Arm {
@@ -8917,4 +8923,722 @@ fn mixer_act_split_keeps_the_one_simdgroup_chain_bit_for_bit() {
             );
         }
     }
+}
+
+// ---- layer-major prefill groups (P5/C2) --------------------------------------
+// The fixture fails the tentative gate (hidden 32, BF16 experts), so these
+// run the plain path; `real_model_group_matches_window_at_a_time_on_a_cold_pack`
+// proves the tentative/mapped group on the real checkpoint.
+
+/// A paged GGUF fixture decoder whose admitted window is `width` tokens.
+fn group_fixture_decoder(width: usize, seq: u32) -> decoder::Decoder {
+    let path = fixture().join("bf16/paged/model.gguf");
+    let store = weights::Store::open_fixture(&path, None).unwrap();
+    let config = gguf::config(&store).unwrap();
+    let mut decoder = decoder::Decoder::new(config.clone(), store).unwrap();
+    decoder.prefill_window_pin = Some(width);
+    decoder.prefill_chunk_size = width;
+    let mut adapter = paged::create(&config).unwrap();
+    adapter.begin_request(seq).unwrap();
+    adapter.allocate_suffix_blocks(53).unwrap();
+    decoder.paged = Some(adapter);
+    decoder
+}
+
+/// 53 tokens: three windows of 16 and a 5-token tail at width 16.
+fn group_prompt() -> Vec<u32> {
+    (0..53)
+        .map(|i| ((i * 13 + i / 4) % 61 + 2) as u32)
+        .collect()
+}
+
+fn f32s(a: &MxArray) -> Vec<f32> {
+    a.astype(crate::array::DType::Float32)
+        .unwrap()
+        .to_float32()
+        .unwrap()
+        .to_vec()
+}
+
+/// Every cache array and every pool K/V position of a decoder's frontier.
+fn frontier_bytes(d: &decoder::Decoder) -> Vec<Vec<f32>> {
+    let mut out: Vec<Vec<f32>> = d.caches.iter().flat_map(|c| c.arrays().map(f32s)).collect();
+    let adapter = d.paged.as_ref().unwrap();
+    let positions: Vec<i32> = (0..d.history.len() as i32).collect();
+    let full = (0..d.config.num_hidden_layers).filter(|&i| !d.config.linear(i));
+    for (layer, _) in full.enumerate() {
+        let (k, v) = paged::gather_selected(
+            adapter,
+            layer as u32,
+            &positions,
+            d.config.num_key_value_heads,
+            d.config.head_dim,
+        )
+        .unwrap();
+        out.push(f32s(&k));
+        out.push(f32s(&v));
+    }
+    out
+}
+
+/// T1. One group of three windows plus the tail pass gives the bytes of four
+/// one-window passes: logits, every cache array, every pool K/V position,
+/// every hidden view and the history.
+/// MUTATION (M-C2-sweep-order): the inner loop walks windows in reverse ->
+/// window 2's GDN state comes from window 3's; "caches and pool K/V" fails.
+/// MUTATION (M-C2-cursor): `set_cursor` keeps the group base for every window
+/// -> rope positions, PLE context and page base are wrong; "logits" fails.
+#[test]
+fn a_group_of_windows_matches_one_window_at_a_time_bit_for_bit() {
+    let prompt = group_prompt();
+    let mut grouped = group_fixture_decoder(16, 1);
+    let mut windowed = group_fixture_decoder(16, 2);
+    let (windows, tail) = grouped.group_windows(&prompt);
+    assert_eq!(
+        windows.iter().map(|w| w.len()).collect::<Vec<_>>(),
+        [16, 16, 16]
+    );
+    assert_eq!(tail.len(), 5);
+    let (logits, views) = grouped.prefill_group(&windows, tail, true, true).unwrap();
+    let mut group_hidden: Vec<Vec<f32>> = views.iter().flatten().map(f32s).collect();
+    group_hidden.extend(grouped.last_chunk_hidden.iter().map(f32s));
+    let mut window_hidden = Vec::new();
+    let mut expected = None;
+    for (k, chunk) in windows
+        .iter()
+        .copied()
+        .chain(std::iter::once(tail))
+        .enumerate()
+    {
+        expected = Some(windowed.prefill_chunk(chunk, None, k == 3).unwrap());
+        window_hidden.extend(windowed.last_chunk_hidden.iter().map(f32s));
+    }
+    assert_eq!(f32s(&logits), f32s(&expected.unwrap()), "logits");
+    assert_eq!(group_hidden.len(), prompt.len());
+    assert_eq!(group_hidden, window_hidden, "hidden views");
+    assert_eq!(grouped.history, windowed.history);
+    assert_eq!(
+        frontier_bytes(&grouped),
+        frontier_bytes(&windowed),
+        "caches and pool K/V"
+    );
+    assert!(
+        grouped.tentative_commits.is_empty(),
+        "the fixture runs the plain path"
+    );
+    assert!(
+        grouped
+            .submit_log
+            .borrow()
+            .iter()
+            .any(|e| e == "qwen4::group::end")
+    );
+}
+
+/// T2. The group asks the reader threads for every window's rows and the
+/// tail's before layer 0: every row it imports was requested, and once the
+/// readers are paused after sweep 0 nothing waits for a row.
+/// MUTATION (M-C2-rows-first-window): `prefetch_group_rows` requests window
+/// 1's rows only -> windows 2 and 3 import inline; "every row ... requested"
+/// fails.
+#[test]
+fn a_group_requests_every_windows_rows_before_layer_0() {
+    use std::sync::atomic::AtomicU64;
+    let path = fixture().join("bf16/model.gguf");
+    let mut store = weights::Store::open_fixture(&path, None).unwrap();
+    store.row_readers = true;
+    let config = gguf::config(&store).unwrap();
+    let mut decoder = decoder::Decoder::new(config, store).unwrap();
+    decoder.prefill_chunk_size = 16;
+    let prompt = group_prompt();
+    let stats = Arc::clone(&decoder.weights.lookup);
+    let (prefetched, late, misses) = (stats.prefetched(), stats.late(), stats.misses());
+    let late_after_sweep_0 = Arc::new(AtomicU64::new(u64::MAX));
+    decoder.after_sweep = Some(Box::new({
+        let stats = Arc::clone(&stats);
+        let cell = Arc::clone(&late_after_sweep_0);
+        move |d, layer| {
+            if layer == 0 {
+                d.weights.pause_rows();
+                cell.store(stats.late(), Ordering::Release);
+            }
+        }
+    }));
+    let (windows, tail) = decoder.group_windows(&prompt);
+    decoder.prefill_group(&windows, tail, true, false).unwrap();
+    let imported = stats.misses() - misses;
+    assert!(imported > 0, "the group imported rows");
+    assert_eq!(
+        (stats.prefetched() - prefetched) + (stats.late() - late),
+        imported,
+        "every row the group and its tail imported was requested up front"
+    );
+    assert_eq!(
+        stats.late(),
+        late_after_sweep_0.load(Ordering::Acquire),
+        "after sweep 0 no row waited: every window's PLE rows and the tail's were ready"
+    );
+}
+
+/// T3. The group records its windows before any layer runs and never the
+/// tail, which records itself; the cursor leaves `history` at the prefix
+/// between sweeps.
+#[test]
+fn a_group_records_its_windows_up_front_and_the_tail_records_itself() {
+    let prompt = group_prompt();
+    let mut decoder = group_fixture_decoder(16, 1);
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    decoder.after_sweep = Some(Box::new({
+        let seen = Arc::clone(&seen);
+        move |d, layer| {
+            seen.lock().unwrap().push((
+                layer,
+                d.paged.as_ref().unwrap().request_tokens().to_vec(),
+                d.history.clone(),
+            ));
+        }
+    }));
+    let (windows, tail) = decoder.group_windows(&prompt);
+    decoder.prefill_group(&windows, tail, true, false).unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 4, "one hook call per sweep");
+    for (layer, recorded, history) in seen.iter() {
+        assert_eq!(
+            recorded,
+            &prompt[..48],
+            "sweep {layer}: the three windows are recorded, the tail is not"
+        );
+        assert!(
+            history.is_empty(),
+            "sweep {layer}: the cursor rests at the prefix"
+        );
+    }
+    assert_eq!(
+        decoder.paged.as_ref().unwrap().request_tokens(),
+        &prompt[..]
+    );
+    assert_eq!(decoder.history, prompt);
+}
+
+/// T4. A trip held at the end of a sweep: the group's frontier is evaluated
+/// first, the store then leaves the mapped path (here: nothing to leave, the
+/// trip is consumed), and the remaining sweeps finish with the same bytes.
+/// `apply_held_trip` itself is proven on a mapped store in
+/// `weights::mapped_tests::observe_sweep_holds_the_trip_and_apply_held_trip_switches`.
+/// MUTATION (M-C2-trip-switch-first): `switch_mid_group` applies the trip
+/// before the frontier eval -> "the frontier is evaluated before" fails.
+#[test]
+fn a_trip_between_sweeps_evaluates_the_group_before_the_switch_and_finishes() {
+    use super::tripwire::Fallback;
+    let prompt = group_prompt();
+    let mut tripped = group_fixture_decoder(16, 1);
+    let mut plain = group_fixture_decoder(16, 2);
+    tripped.after_sweep = Some(Box::new(|d, layer| {
+        if layer == 1 {
+            d.weights.trip(Fallback::SsdReads {
+                read: 3000,
+                mapped: 1000,
+            });
+        }
+    }));
+    let (windows, tail) = tripped.group_windows(&prompt);
+    let (logits, _) = tripped.prefill_group(&windows, tail, true, false).unwrap();
+    let (expected, _) = plain.prefill_group(&windows, tail, true, false).unwrap();
+    assert_eq!(f32s(&logits), f32s(&expected), "logits");
+    assert_eq!(frontier_bytes(&tripped), frontier_bytes(&plain));
+    let log = tripped.submit_log.borrow().clone();
+    let at = |event: &str| {
+        log.iter()
+            .position(|e| e == event)
+            .unwrap_or_else(|| panic!("{event} in {log:?}"))
+    };
+    assert!(
+        at("qwen4::group::frontier") < at("qwen4::group::trip"),
+        "the frontier is evaluated before the store may leave the mapped path: {log:?}"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|e| *e == "qwen4::group::frontier")
+            .count(),
+        1,
+        "one switch per group"
+    );
+    assert_eq!(
+        log[..at("qwen4::group::frontier")]
+            .iter()
+            .filter(|e| *e == "qwen4::batch::mlp")
+            .count(),
+        6,
+        "sweeps 0 and 1 of three windows ran before the frontier eval"
+    );
+    assert!(
+        !log.contains(&"qwen4::group::switch".to_owned()),
+        "the fixture store is not mapped: nothing to leave"
+    );
+    assert!(
+        tripped.weights.tripwire_mut().tripped().is_none(),
+        "the held trip was consumed"
+    );
+    assert!(!tripped.weights.group_in_progress());
+    assert_eq!(tripped.weights.pending_touches(), 0);
+}
+
+/// T6 (hook). The whole-prompt step follows group mode: never on the plain
+/// fixture store, and with group mode pinned on only for a suffix of more
+/// than one window.
+/// MUTATION (M-C2-slice-always): the `paged.rs` hook returns true -> "the
+/// fixture store is not mapped" fails.
+#[test]
+fn the_whole_prompt_hook_follows_group_mode() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    let mut inner = tiny_inner();
+    inner.decoder.prefill_chunk_size = 16;
+    assert!(
+        !inner.scheduler_whole_prompt_prefill(53, 0),
+        "the fixture store is not mapped"
+    );
+    inner.decoder.group_pin = Some(true);
+    assert!(inner.scheduler_whole_prompt_prefill(53, 0));
+    assert!(
+        !inner.scheduler_whole_prompt_prefill(53, 40),
+        "13 new tokens are one window"
+    );
+    assert!(
+        !inner.scheduler_whole_prompt_prefill(20, 0),
+        "16 + 4 is one window and a tail"
+    );
+    assert!(
+        inner.scheduler_whole_prompt_prefill(32, 0),
+        "two full windows"
+    );
+    inner.decoder.group_pin = Some(false);
+    assert!(!inner.scheduler_whole_prompt_prefill(53, 0));
+    inner.decoder.group_pin = Some(true);
+    inner.decoder.window_carry = false;
+    assert!(
+        !inner.scheduler_whole_prompt_prefill(53, 0),
+        "only the carried window path serves a group"
+    );
+}
+
+/// T7. The tripwire sees one sample per window (the group's time shared by
+/// rows) and the tail pass its own, after the group.
+/// MUTATION (M-C2-tail-in-group): `group_windows` keeps the short final
+/// window in the group -> no tail pass; "the tail runs after the group" fails.
+#[test]
+fn a_group_feeds_the_tripwire_one_sample_per_window_and_the_tail_its_own() {
+    let prompt = group_prompt();
+    let mut decoder = group_fixture_decoder(16, 1);
+    let (windows, tail) = decoder.group_windows(&prompt);
+    decoder.prefill_group(&windows, tail, true, false).unwrap();
+    let samples = decoder.pass_samples.clone();
+    assert_eq!(
+        samples.iter().map(|(rows, _)| *rows).collect::<Vec<_>>(),
+        [16, 16, 16, 5]
+    );
+    assert_eq!(samples[0].1, samples[1].1);
+    assert_eq!(samples[1].1, samples[2].1);
+    assert!(samples[0].1 > std::time::Duration::ZERO);
+    let log = decoder.submit_log.borrow();
+    let group_end = log.iter().position(|e| e == "qwen4::group::end").unwrap();
+    let tail_start = log
+        .iter()
+        .position(|e| e == "qwen4::tail::start")
+        .expect("the tail runs after the group");
+    assert!(group_end < tail_start);
+    assert_eq!(log.iter().filter(|e| *e == "qwen4::group::end").count(), 1);
+}
+
+/// T8. A cancel between two sweeps fails the group and resets the decoder:
+/// no history, no caches, no tentative transaction, no group flag or touch.
+#[test]
+fn cancel_between_two_sweeps_resets_the_decoder() {
+    let prompt = group_prompt();
+    let mut decoder = group_fixture_decoder(16, 1);
+    let flag = Arc::new(AtomicBool::new(false));
+    decoder.cancelled = Some(Arc::clone(&flag));
+    decoder.after_sweep = Some(Box::new(move |_, layer| {
+        if layer == 2 {
+            flag.store(true, Ordering::Release);
+        }
+    }));
+    let (windows, tail) = decoder.group_windows(&prompt);
+    let error = decoder
+        .prefill_group(&windows, tail, true, false)
+        .err()
+        .expect("the cancel fails the group");
+    assert!(error.reason.contains("cancelled"), "{}", error.reason);
+    assert!(decoder.history.is_empty());
+    assert!(decoder.caches.iter().all(|c| c.arrays().count() == 0));
+    assert!(decoder.last_chunk_hidden.is_empty());
+    assert!(!decoder.deferred_state_submission());
+    assert!(!decoder.weights.group_in_progress());
+    assert_eq!(decoder.weights.pending_touches(), 0);
+}
+
+/// T9 and the `paged_prefill` dispatch. With group mode pinned on, the paged
+/// lane runs the prompt as a group and observes the MTP owner per window and
+/// then for the tail; the owner's draft cache, waiting rows and frontier are
+/// those of the window-at-a-time lane (pinned off), and so are the logits.
+#[test]
+fn observe_mtp_after_a_group_gives_the_same_draft_cache() {
+    use crate::engine::backend::PagedBackend;
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    let prompt = group_prompt();
+    let run = |pin: bool| {
+        let mut inner = tiny_inner();
+        inner.decoder.prefill_window_pin = Some(16);
+        inner.decoder.prefill_chunk_size = 16;
+        inner.decoder.group_pin = Some(pin);
+        inner.activate_paged_seq(1).unwrap();
+        assert!(inner.begin_mtp(1, 0).unwrap());
+        let prefix = inner
+            .prime_prefix_state(&prompt, false, 32, &[], 0)
+            .unwrap();
+        let logits = inner
+            .paged_prefill(
+                &prompt,
+                &prefix,
+                Stream::default(crate::stream::DeviceType::Gpu),
+            )
+            .unwrap();
+        let (cache, rows, frontier) = inner.mtp.draft_state(1).unwrap();
+        let log = inner.decoder.submit_log.borrow().clone();
+        (
+            cache.iter().map(f32s).collect::<Vec<_>>(),
+            rows.iter().map(|(h, t)| (f32s(h), *t)).collect::<Vec<_>>(),
+            frontier,
+            log,
+            f32s(&logits),
+        )
+    };
+    let grouped = run(true);
+    let windowed = run(false);
+    assert!(grouped.3.iter().any(|e| e == "qwen4::group::end"));
+    assert!(grouped.3.iter().any(|e| e == "qwen4::tail::start"));
+    assert!(!windowed.3.iter().any(|e| e == "qwen4::group::end"));
+    assert!(
+        !grouped.0.is_empty(),
+        "two windows flushed into the draft cache"
+    );
+    assert_eq!(grouped.0, windowed.0, "draft cache");
+    assert_eq!(grouped.1, windowed.1, "waiting rows");
+    assert_eq!(grouped.2, windowed.2, "frontier");
+    assert_eq!(grouped.4, windowed.4, "logits");
+}
+
+/// T10. The tentative/mapped group on the real checkpoint: after `evict.sh`
+/// the turn opens over a streaming pack and runs the prompt as one group
+/// with one tentative commit; a second run over the now resident pack runs
+/// one window at a time with one commit per full window. Logits, every cache
+/// array, every pool K/V position and the hidden views are byte-equal.
+/// Needs `QWEN4_EXP_REAL_MODEL` / `QWEN4_EXP_REAL_INPUTS`, `T10_CASE`
+/// (`6k` or `16k`), a cold pack and `--test-threads=1`.
+#[test]
+#[ignore]
+fn real_model_group_matches_window_at_a_time_on_a_cold_pack() {
+    let (Ok(model), Ok(inputs)) = (
+        std::env::var("QWEN4_EXP_REAL_MODEL"),
+        std::env::var("QWEN4_EXP_REAL_INPUTS"),
+    ) else {
+        eprintln!(
+            "real_model_group_matches_window_at_a_time_on_a_cold_pack: QWEN4_EXP_REAL_MODEL / QWEN4_EXP_REAL_INPUTS not set"
+        );
+        return;
+    };
+    let case = std::env::var("T10_CASE").unwrap_or_else(|_| "6k".into());
+    let inputs: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(inputs).unwrap()).unwrap();
+    let prompt: Vec<u32> = inputs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == case)
+        .unwrap_or_else(|| panic!("case {case} in inputs"))["tokenIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_u64().unwrap() as u32)
+        .collect();
+    let store = weights::Store::open(Path::new(&model)).unwrap();
+    let config = gguf::config(&store).unwrap();
+    let mut decoder = decoder::Decoder::new(config.clone(), store).unwrap();
+    let adapter = super::paged::create(&config).unwrap();
+    let pool_bytes = adapter.bytes_per_block().unwrap() * u64::from(adapter.block_capacity());
+    decoder.paged = Some(adapter);
+    decoder.register_cache_limit();
+    decoder.weights.prepare_mapped_pack().unwrap();
+    decoder.weights.select_mapped_residency(pool_bytes).unwrap();
+    decoder.weights.prepare_hot().unwrap();
+    decoder.weights.publish_live();
+    decoder.residency_changed();
+    assert!(
+        decoder.weights.plan.mapped,
+        "the live host refused the pack"
+    );
+    let full = (0..config.num_hidden_layers)
+        .filter(|&i| !config.linear(i))
+        .count();
+    let capture = |d: &decoder::Decoder, logits: &MxArray| -> Vec<Vec<f32>> {
+        let mut out = vec![f32s(logits)];
+        out.extend(d.caches.iter().flat_map(|c| c.arrays().map(f32s)));
+        out.extend(d.last_chunk_hidden.iter().map(f32s));
+        let adapter = d.paged.as_ref().unwrap();
+        let positions: Vec<i32> = (0..d.history.len() as i32).collect();
+        for layer in 0..full {
+            let (k, v) = paged::gather_selected(
+                adapter,
+                layer as u32,
+                &positions,
+                config.num_key_value_heads,
+                config.head_dim,
+            )
+            .unwrap();
+            out.push(f32s(&k));
+            out.push(f32s(&v));
+        }
+        out
+    };
+    let mut runs = Vec::new();
+    for (run, seq) in ["group", "windows"].into_iter().zip(1u32..) {
+        decoder.reset();
+        {
+            let adapter = decoder.paged.as_mut().unwrap();
+            if seq > 1 {
+                adapter.release_request().unwrap();
+            }
+            adapter.begin_request(seq).unwrap();
+            adapter.allocate_suffix_blocks(prompt.len() as u32).unwrap();
+        }
+        assert!(
+            decoder.weights.begin_turn().unwrap().is_none(),
+            "{run}: a slot fallback was applied"
+        );
+        let group = decoder.group_mode(prompt.len());
+        assert_eq!(
+            group,
+            run == "group",
+            "{run}: group mode follows the stream (cold pack for the first run, resident for the second)"
+        );
+        decoder.tentative_commits.clear();
+        let started = std::time::Instant::now();
+        let logits = decoder.prefill_prompt(&prompt).unwrap();
+        let elapsed = started.elapsed();
+        let (windows, tail) = decoder.group_windows(&prompt);
+        let commits = decoder.tentative_commits.clone();
+        if group {
+            assert_eq!(
+                commits,
+                vec![windows.len()],
+                "{run}: one tentative commit over every window"
+            );
+        } else {
+            assert_eq!(
+                commits,
+                vec![1; windows.len()],
+                "{run}: one tentative commit per full window"
+            );
+        }
+        eprintln!(
+            "T10 {case} {run}: {} tokens = {} windows + {} tail in {elapsed:.2?}, commits {commits:?}, mapped {}",
+            prompt.len(),
+            windows.len(),
+            tail.len(),
+            decoder.weights.plan.mapped
+        );
+        assert!(
+            decoder.weights.plan.mapped,
+            "{run}: the store stayed mapped"
+        );
+        runs.push(capture(&decoder, &logits));
+    }
+    assert_eq!(runs[0].len(), runs[1].len());
+    for (i, (a, b)) in runs[0].iter().zip(&runs[1]).enumerate() {
+        assert!(a == b, "T10 {case}: array {i} of {} differs", runs[0].len());
+    }
+    eprintln!(
+        "T10 {case}: {} arrays byte-equal between the group and the window-at-a-time run",
+        runs[0].len()
+    );
+}
+
+/// T11. A trip forced between two sweeps of a real-model group on a cold
+/// pack: the frontier is evaluated and the tape committed before the store
+/// leaves the mapped path, the group finishes plain on slots with the group
+/// base as the fallback position, the pack stream is gone, no lazy pool
+/// write is discarded, and the request decodes the D3 6k reference. Needs
+/// the real-model env, `D3_EXPECTED`, a cold pack and `--test-threads=1`.
+#[test]
+#[ignore]
+fn real_model_forced_trip_between_sweeps_switches_after_the_frontier_eval() {
+    use super::tripwire::Fallback;
+    use tracing_subscriber::prelude::*;
+    let (Ok(model), Ok(inputs)) = (
+        std::env::var("QWEN4_EXP_REAL_MODEL"),
+        std::env::var("QWEN4_EXP_REAL_INPUTS"),
+    ) else {
+        eprintln!(
+            "real_model_forced_trip_between_sweeps_switches_after_the_frontier_eval: QWEN4_EXP_REAL_MODEL / QWEN4_EXP_REAL_INPUTS not set"
+        );
+        return;
+    };
+    let inputs: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(inputs).unwrap()).unwrap();
+    let prompt: Vec<u32> = inputs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "6k")
+        .expect("a 6k case")["tokenIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_u64().unwrap() as u32)
+        .collect();
+    let expected: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::env::var("D3_EXPECTED").expect("D3_EXPECTED")).unwrap(),
+    )
+    .unwrap();
+    let reference: Vec<u32> = expected["cases"]["6k"]["reference"]["argmax"]
+        .as_array()
+        .expect("D3_EXPECTED has a 6k reference argmax")
+        .iter()
+        .take(9)
+        .map(|t| t.as_u64().unwrap() as u32)
+        .collect();
+    struct Warnings(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                self.0.lock().unwrap().push(message.0);
+            }
+        }
+    }
+    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _capture = tracing_subscriber::registry()
+        .with(Warnings(warnings.clone()))
+        .set_default();
+    let store = weights::Store::open(Path::new(&model)).unwrap();
+    let config = gguf::config(&store).unwrap();
+    let mut decoder = decoder::Decoder::new(config.clone(), store).unwrap();
+    let adapter = super::paged::create(&config).unwrap();
+    let pool_bytes = adapter.bytes_per_block().unwrap() * u64::from(adapter.block_capacity());
+    decoder.paged = Some(adapter);
+    decoder.register_cache_limit();
+    decoder.weights.prepare_mapped_pack().unwrap();
+    decoder.weights.select_mapped_residency(pool_bytes).unwrap();
+    decoder.weights.prepare_hot().unwrap();
+    decoder.weights.publish_live();
+    decoder.residency_changed();
+    assert!(
+        decoder.weights.plan.mapped,
+        "the live host refused the pack"
+    );
+    {
+        let adapter = decoder.paged.as_mut().unwrap();
+        adapter.begin_request(1).unwrap();
+        adapter.allocate_suffix_blocks(prompt.len() as u32).unwrap();
+    }
+    assert!(decoder.weights.begin_turn().unwrap().is_none());
+    assert!(
+        decoder.group_mode(prompt.len()),
+        "the pack must be cold (evict.sh) for the turn to open over the stream"
+    );
+    let mapped_bytes = decoder.weights.plan.mapped_bytes;
+    decoder.after_sweep = Some(Box::new(move |d, layer| {
+        if layer == 5 {
+            d.weights.trip(Fallback::SsdReads {
+                read: 3 * mapped_bytes,
+                mapped: mapped_bytes,
+            });
+        }
+    }));
+    let started = std::time::Instant::now();
+    let logits = decoder.prefill_prompt(&prompt).unwrap();
+    let elapsed = started.elapsed();
+    let log = decoder.submit_log.borrow().clone();
+    let at = |event: &str| {
+        log.iter()
+            .position(|e| e == event)
+            .unwrap_or_else(|| panic!("{event} in {log:?}"))
+    };
+    assert!(
+        at("qwen4::routes::commit") < at("qwen4::group::frontier")
+            && at("qwen4::group::frontier") < at("qwen4::group::trip")
+            && at("qwen4::group::trip") < at("qwen4::group::switch"),
+        "tape commit -> frontier evaluated -> trip -> switch: {:?}",
+        log.iter()
+            .filter(|e| e.starts_with("qwen4::group") || e.starts_with("qwen4::routes"))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !decoder.weights.plan.mapped,
+        "the store left the mapped path"
+    );
+    assert!(
+        !decoder.weights.pack_stream_alive(),
+        "the pack stream is gone"
+    );
+    assert_eq!(
+        decoder
+            .weights
+            .live
+            .fallback_token_index
+            .load(Ordering::Acquire),
+        0,
+        "the fallback position is the group base"
+    );
+    assert!(
+        decoder.tentative_commits.is_empty(),
+        "the mid-group commit closed the transaction; the end of the group commits nothing"
+    );
+    assert_eq!(decoder.history, prompt);
+    let argmax = |a: &MxArray| -> u32 {
+        let last = a.shape().unwrap().len() as i32 - 1;
+        a.argmax(last, Some(false))
+            .unwrap()
+            .item_at_uint32(0)
+            .unwrap()
+    };
+    let mut token = argmax(&logits);
+    let mut text = vec![token];
+    for _ in 0..8 {
+        token = argmax(&decoder.step(token).unwrap());
+        text.push(token);
+    }
+    eprintln!(
+        "T11: group with a trip after sweep 5 in {elapsed:.2?}; slots {}; first tokens {text:?}",
+        decoder.weights.plan.partial_expert_slots
+    );
+    assert_eq!(text, reference, "the D3 6k reference prefix");
+    let warnings = warnings.lock().unwrap().clone();
+    eprintln!("T11 warnings: {warnings:?}");
+    assert!(
+        warnings.iter().any(|w| w.contains("mapped -> slots")),
+        "the capture sees the switch's own warning: {warnings:?}"
+    );
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| w.contains("discarded an unevaluated native write")),
+        "no lazy pool write is discarded: {warnings:?}"
+    );
 }

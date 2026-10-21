@@ -15411,6 +15411,85 @@ mod tests {
         assert_eq!(adapter.current_token_count(), TOKENS as u32);
     }
 
+    /// The strict entry takes only the most recently recorded suffix; the
+    /// recorded entry takes any chunk inside `floor..recorded`, never below
+    /// the floor or past the recorded tokens (a layer-major prefill records
+    /// every window first and writes each at its own base).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recorded_write_entry_takes_inner_chunks_above_the_floor() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            4,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(e) => {
+                eprintln!("skipping recorded_write_entry_takes_inner_chunks_above_the_floor: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
+        adapter.reset_for_new_request(11).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let rows = |seed: f32| {
+            let bits: Vec<u16> = (0..4 * 64)
+                .map(|i| f16::from_f32(seed + (i / 64) as f32).to_bits())
+                .collect();
+            MxArray::from_float16(&bits, &[4, 1, 64]).expect("rows")
+        };
+        let (k, v) = (rows(1.), rows(11.));
+        match adapter.update_keys_values_native_recorded(0, &k, &v, 0, 0) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping recorded_write_entry_takes_inner_chunks_above_the_floor: {e}");
+                return;
+            }
+            Err(e) => panic!("the first window of a recorded prompt: {e}"),
+        }
+        let strict = adapter.update_keys_values_native(0, &k, &v, 0).unwrap_err();
+        assert!(
+            strict.contains("most recently recorded"),
+            "the strict entry refuses a chunk below the suffix: {strict}"
+        );
+        adapter.update_keys_values_native(0, &k, &v, 4).unwrap();
+        adapter
+            .update_keys_values_native_recorded(1, &k, &v, 4, 0)
+            .unwrap();
+        let below = adapter
+            .update_keys_values_native_recorded(1, &k, &v, 2, 4)
+            .unwrap_err();
+        assert!(
+            below.contains("outside the recorded range 4..8"),
+            "a chunk below the floor reaches the committed prefix: {below}"
+        );
+        let past = adapter
+            .update_keys_values_native_recorded(1, &k, &v, 6, 0)
+            .unwrap_err();
+        assert!(
+            past.contains("outside the recorded range 0..8"),
+            "a chunk past the recorded tokens: {past}"
+        );
+        adapter.eval_pending_pool_writes().unwrap();
+        adapter
+            .update_keys_values_native_recorded(1, &k, &v, 0, 0)
+            .unwrap();
+        adapter.eval_pending_pool_writes().unwrap();
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn test_gather_kv_for_prefill_sdpa_preserves_layout_and_native_dependency() {

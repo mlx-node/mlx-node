@@ -3296,6 +3296,131 @@ mod mapped_tests {
             .keep_wired_at(t0 + Duration::from_millis(2400), 7, true)
             .unwrap();
         assert_eq!(store.touches.len(), 2, "no streaming pass, no touch");
+        assert_eq!(
+            store.touches_async,
+            vec![false, false],
+            "outside a group every touch is a synchronous eval"
+        );
+    }
+
+    /// T5. A layer-major group keeps the banks of the layers already swept
+    /// wired after the stream ends, through asynchronous touches whose arrays
+    /// wait for the group commit; a warm one-window turn (no group) touches
+    /// nothing once the stream is over.
+    /// MUTATION (M-C2-keep-wired-stops): `keep_wired_at` keeps today's
+    /// `!streaming_pass` early return -> "the group keeps touching after the
+    /// stream" fails.
+    /// MUTATION (M-C2-touch-sync): `touch_banks` evaluates synchronously
+    /// inside a group -> "asynchronous inside the group" fails.
+    #[test]
+    fn keep_wired_runs_through_a_group_only_and_touches_async() {
+        if !in_child(
+            "models::qwen4_exp::weights::mapped_tests::keep_wired_runs_through_a_group_only_and_touches_async",
+        ) {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture_layers(&gguf, 8);
+        let mut store = mapped_store(&temp, &gguf, "mapped");
+        let gate = Arc::new(Gate::default());
+        store.pool_with(Arc::clone(&gate));
+        let t0 = Instant::now();
+        assert!(store.begin_turn().unwrap().is_none());
+        assert!(store.streaming_pass);
+        assert!(!store.wire_mapped_banks_at(t0, true).unwrap());
+        store.begin_group();
+        store
+            .keep_wired_at(t0 + Duration::from_millis(800), 3, true)
+            .unwrap();
+        assert_eq!(store.touches, vec![vec![0, 1, 2, 3]]);
+        assert_eq!(
+            store.touches_async,
+            vec![true],
+            "asynchronous inside the group"
+        );
+        let pending = store.pending_touches();
+        assert!(pending > 0, "the touch's arrays wait for the commit");
+        gate.release();
+        wait_resident(&store);
+        store
+            .keep_wired_at(t0 + Duration::from_millis(1600), 5, true)
+            .unwrap();
+        assert_eq!(store.touches.len(), 2);
+        assert_eq!(store.touches[1], vec![0, 1, 2, 3, 4, 5]);
+        assert!(!store.streaming_pass, "the stream is over");
+        store
+            .keep_wired_at(t0 + Duration::from_millis(2400), 7, true)
+            .unwrap();
+        assert_eq!(
+            store.touches.len(),
+            3,
+            "the group keeps touching after the stream"
+        );
+        assert_eq!(store.touches[2], (0..8).collect::<Vec<_>>());
+        assert_eq!(store.touches_async, vec![true, true, true]);
+        assert_eq!(store.pending_touches(), 3 * pending);
+        let taken = store.take_pending_touches();
+        assert_eq!(taken.len(), 3 * pending);
+        assert_eq!(store.pending_touches(), 0);
+        MxArray::eval_arrays(&taken.iter().collect::<Vec<_>>()).unwrap();
+        store.end_group();
+        assert!(!store.group_in_progress());
+        store
+            .keep_wired_at(t0 + Duration::from_millis(3200), 7, true)
+            .unwrap();
+        assert_eq!(store.touches.len(), 3, "no group, no stream: no touch");
+        // A warm turn over the resident pack: no stream, no group, no touch.
+        assert!(store.begin_turn().unwrap().is_none());
+        assert!(!store.streaming_pass);
+        store
+            .keep_wired_at(t0 + Duration::from_millis(4000), 7, true)
+            .unwrap();
+        assert_eq!(store.touches.len(), 3);
+    }
+
+    /// T4 (store). `observe_sweep` holds a trip and applies nothing: the
+    /// store stays mapped until `apply_held_trip`, which leaves the mapped
+    /// path, drops the pack stream and reports the symptom once; without a
+    /// held trip it changes nothing.
+    /// MUTATION (M-C2-trip-switch-first, store side): `observe_sweep` calls
+    /// `observe_pass_at` -> "held, not applied" fails.
+    #[test]
+    fn observe_sweep_holds_the_trip_and_apply_held_trip_switches() {
+        if !in_child(
+            "models::qwen4_exp::weights::mapped_tests::observe_sweep_holds_the_trip_and_apply_held_trip_switches",
+        ) {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let mut store = mapped_store(&temp, &gguf, "mapped");
+        store.start_pack_stream();
+        wait_resident(&store);
+        assert!(store.begin_turn().unwrap().is_none());
+        assert!(!store.observe_sweep(), "nothing read since the turn opened");
+        assert!(store.apply_held_trip().unwrap().is_none());
+        assert!(store.plan.mapped);
+        let mapped = store.plan.mapped_bytes;
+        store.trip(super::super::tripwire::Fallback::SsdReads {
+            read: 3 * mapped,
+            mapped,
+        });
+        assert!(store.observe_sweep(), "the trip is reported");
+        assert!(store.plan.mapped, "held, not applied");
+        assert!(store.prefetch.is_some());
+        assert!(store.observe_sweep(), "and reported again until applied");
+        let applied = store.apply_held_trip().unwrap();
+        assert!(matches!(
+            applied,
+            Some(super::super::tripwire::Fallback::SsdReads { .. })
+        ));
+        assert!(!store.plan.mapped, "the store left the mapped path");
+        assert!(store.mapped_experts.is_empty());
+        assert!(store.prefetch.is_none(), "the pack stream is gone");
+        assert!(store.apply_held_trip().unwrap().is_none(), "applied once");
+        assert!(!store.observe_sweep());
     }
 
     /// The tripwire's SSD count starts at the turn: the pack bytes the

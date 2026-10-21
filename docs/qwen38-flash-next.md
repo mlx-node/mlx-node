@@ -152,6 +152,34 @@ pages are reclaimable) and the tripwire's SSD count starts at the turn. A
 prefill window also hands the reader threads the embedding and PLE rows of
 the window after it, in file order, so the next window finds its rows ready
 instead of reading them one `pread` at a time on the model thread.
+A turn that opens over a streaming pack runs its prompt layer-major, as one
+group: every 1024-token window of the prompt at layer 0, then every window at
+layer 1, and so on, so each expert bank is bound once, when its layer's sweep
+reaches it, instead of once per window while the window waits for the pages
+behind the stream (an immediate cold 6k prompt bound the whole pack inside
+window 1: 11.5 s to the first token). The partition, every kernel and every
+per-window shape stay those of the window-major run, and the GDN, PLE, indexer
+and page state flow from one window to the next inside each sweep as they flow
+between two passes. The group is one pass for the scheduler, which gives such
+a turn its whole prompt in one step instead of 1024-token slices
+(`whole_prompt_prefill`; every other turn keeps the slice grid and the shared
+budget), records every window in the page cache before any layer runs and
+writes each window's keys and values at its own base, asks the reader threads
+for every window's embedding rows, then every window's PLE rows, then the
+tail's, before layer 0 (32 reader threads; a 6k prompt's 58.7k rows land in
+about 0.3 s beside the stream), and
+keeps the banks of the layers already swept wired until its commit through
+asynchronous touches (a synchronous touch waits behind the queued sweeps). A
+final window shorter than 256 rows runs after the group as its own pass: below
+the tentative threshold it would read its routes back and drain the GPU inside
+every sweep. The MTP owner sees the windows in order after the group. Warm
+turns, slot turns, media turns and turns that open once the stream is over
+run one window at a time as before, with the next window's rows requested
+while this one runs. A tripwire symptom between two sweeps evaluates the
+group's frontier and commits its route tape first, so nothing lazy still
+reads a mapped bank, then leaves the mapped path; the remaining sweeps run
+plain on slots over the same partition and `fallbackTokenIndex` is the group's
+base.
 Every prefill
 window and every decode step needs the entire routed set resident at once:
 when other processes' anonymous memory leaves less than that (a 20 GiB

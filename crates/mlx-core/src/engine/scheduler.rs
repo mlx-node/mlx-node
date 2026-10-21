@@ -2175,4 +2175,72 @@ mod tests {
         assert_eq!(scheduler.stats().admission_deferred_state, 6);
         assert_eq!(scheduler.stats().reserved_state_bytes, 3 * GEMMA_STATE);
     }
+
+    /// A whole-prompt prefill row (a cold Flash Next turn in group mode)
+    /// ignores the token budget, is its step's only prefill row, and waits
+    /// while another turn's prefill row is planned ahead of it; every other
+    /// turn keeps the 1024-slice grid under the shared budget.
+    /// MUTATION: `build_plan` subtracts the whole row from the budget ->
+    /// u32 underflow (debug panic) on the 6219-token row.
+    #[test]
+    fn a_whole_prompt_row_ignores_the_budget_and_is_the_steps_only_prefill_row() {
+        let running = |seq_id: SeqId, prompt: usize, breaks: Vec<u32>, whole: bool| {
+            let mut turn =
+                TurnState::new(seq_id, vec![1; prompt], 0, breaks, None, "payload").expect("turn");
+            turn.status = TurnStatus::Running;
+            turn.whole_prompt_prefill = whole;
+            turn
+        };
+        let rows = |plan: &StepPlan| {
+            plan.rows
+                .iter()
+                .map(|row| (row.seq_id, row.kind, row.num_tokens))
+                .collect::<Vec<_>>()
+        };
+        // A decode peer runs its row first; the cold turn's whole prompt
+        // follows in one row, past the 2048 budget.
+        let mut scheduler = Scheduler::<_, (), ()>::new(4, 2048).unwrap();
+        let mut peer = running(1, 4, vec![4], false);
+        peer.num_computed_tokens = 4;
+        peer.token_history.push(9);
+        peer.num_tokens += 1;
+        scheduler.running.push(peer);
+        scheduler.running.push(running(2, 6219, vec![6219], true));
+        assert_eq!(
+            rows(&scheduler.build_plan()),
+            [(1, StepKind::Decode, 1), (2, StepKind::Prefill, 6219)]
+        );
+        // Two warm turns keep today's rule: 1024 each, 2048 per step.
+        let mut scheduler = Scheduler::<_, (), ()>::new(4, 2048).unwrap();
+        scheduler
+            .running
+            .push(running(3, 3000, vec![1024, 2048, 3000], false));
+        scheduler
+            .running
+            .push(running(4, 3000, vec![1024, 2048, 3000], false));
+        assert_eq!(
+            rows(&scheduler.build_plan()),
+            [(3, StepKind::Prefill, 1024), (4, StepKind::Prefill, 1024)]
+        );
+        // A warm prefill row ahead of the cold turn: the cold turn waits.
+        let mut scheduler = Scheduler::<_, (), ()>::new(4, 2048).unwrap();
+        scheduler
+            .running
+            .push(running(5, 3000, vec![1024, 2048, 3000], false));
+        scheduler.running.push(running(6, 6219, vec![6219], true));
+        assert_eq!(
+            rows(&scheduler.build_plan()),
+            [(5, StepKind::Prefill, 1024)]
+        );
+        // The cold turn ahead: no other prefill row joins its step.
+        let mut scheduler = Scheduler::<_, (), ()>::new(4, 2048).unwrap();
+        scheduler.running.push(running(7, 6219, vec![6219], true));
+        scheduler
+            .running
+            .push(running(8, 3000, vec![1024, 2048, 3000], false));
+        assert_eq!(
+            rows(&scheduler.build_plan()),
+            [(7, StepKind::Prefill, 6219)]
+        );
+    }
 }
