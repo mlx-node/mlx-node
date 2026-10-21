@@ -363,7 +363,7 @@ impl Decoder {
     }
 
     /// The MTP head's experts live in two resident banks (gate|up fused, down)
-    /// built on the first MTP owner; route them on the device like the target's.
+    /// built at load; route them on the device like the target's.
     pub(super) fn mtp_resident_experts(
         &self,
         x: &MxArray,

@@ -2062,6 +2062,12 @@ fn media_mrope_matches_reference_including_compressed_indexer_block_positions() 
 }
 
 fn tiny_inner() -> Inner {
+    let (decoder, vision) = tiny_decoder();
+    inner_over(decoder, vision, true)
+}
+
+/// The paged fixture with the MTP head, before the load's last step.
+fn tiny_decoder() -> (decoder::Decoder, media::Vision) {
     let path = fixture().join("bf16/paged");
     let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
     let c = config::Config::parse(&raw).unwrap();
@@ -2069,10 +2075,15 @@ fn tiny_inner() -> Inner {
     let vision = media::Vision::metadata(&serde_json::Value::Null, &store, &c).unwrap();
     let mut decoder = decoder::Decoder::new(c.clone(), store).unwrap();
     decoder.paged = Some(super::paged::create(&c).unwrap());
-    inner_over(decoder, vision, true)
+    (decoder, vision)
 }
 
-fn inner_over(decoder: decoder::Decoder, vision: media::Vision, has_mtp: bool) -> Inner {
+/// The load's last step: the draft banks are built (fixture stores have no
+/// pack stream).
+fn inner_over(mut decoder: decoder::Decoder, vision: media::Vision, has_mtp: bool) -> Inner {
+    if has_mtp {
+        decoder.weights.finish_load();
+    }
     let tokenizer_dir = Temp::new();
     let tokenizer_path = tokenizer_dir.0.join("tokenizer.json");
     std::fs::write(
@@ -2573,22 +2584,20 @@ fn scheduled_decode_preserves_sampling_shape_and_owner_logits() {
 }
 
 #[test]
-fn mtp_owner_starts_without_banks_when_the_cache_cannot_stage_them() {
+fn mtp_owner_starts_without_banks_when_the_load_cannot_stage_them() {
     use crate::engine::backend::PagedBackend;
     use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
     use rand::SeedableRng;
-    let mut inner = tiny_inner();
+    let (mut decoder, vision) = tiny_decoder();
     // 3 x MAX_READ_BYTES: the first bank's eviction target saturates to zero
     // and passes, the second bank's cannot once the first is pinned.
-    inner
-        .decoder
-        .weights
-        .set_cache_limit(weights::MAX_READ_BYTES * 3);
-    let before = inner.decoder.weights.cached_bytes();
-    inner.activate_paged_seq(1).unwrap();
-    assert!(inner.begin_mtp(1, 0).unwrap());
+    decoder.weights.set_cache_limit(weights::MAX_READ_BYTES * 3);
+    let before = decoder.weights.cached_bytes();
+    let mut inner = inner_over(decoder, vision, true);
     assert_eq!(inner.decoder.weights.mtp_bank_bytes().unwrap(), 0);
     assert_eq!(inner.decoder.weights.cached_bytes(), before);
+    inner.activate_paged_seq(1).unwrap();
+    assert!(inner.begin_mtp(1, 0).unwrap());
     // Ordinary reads need the fixture's staging room; the decline is sticky.
     inner.decoder.weights.set_cache_limit(1 << 30);
     let params = inner.resolve_params(&crate::engine::types::ChatConfig {
@@ -2625,20 +2634,65 @@ fn mtp_owner_starts_without_banks_when_the_cache_cannot_stage_them() {
 }
 
 #[test]
-fn residency_info_sees_the_mtp_banks_built_on_the_first_owner() {
-    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+fn residency_info_sees_the_mtp_banks_built_at_load() {
     use std::sync::atomic::Ordering;
-    let mut inner = tiny_inner();
-    // The model handle keeps a clone of the plan taken at load.
-    let handle = inner.decoder.weights.plan.clone();
-    let at_load = handle.resident_bank_bytes.load(Ordering::Relaxed);
-    inner.activate_paged_seq(1).unwrap();
-    assert!(inner.begin_mtp(1, 0).unwrap());
+    let (decoder, vision) = tiny_decoder();
+    // The model handle keeps a clone of the plan.
+    let handle = decoder.weights.plan.clone();
+    let before = handle.resident_bank_bytes.load(Ordering::Relaxed);
+    let inner = inner_over(decoder, vision, true);
     let banks = inner.decoder.weights.mtp_bank_bytes().unwrap();
     assert!(banks > 0);
     assert_eq!(
         handle.resident_bank_bytes.load(Ordering::Relaxed),
-        at_load + banks
+        before + banks
+    );
+}
+
+/// T1. The load builds the draft banks whenever the MTP head is attached and
+/// the first MTP turn builds nothing; a load without the head builds none.
+/// MUTATION (M-L2c-build-in-turn): the build moves back into `begin_mtp`
+/// -> "the load built the draft banks" fails.
+#[test]
+fn the_load_builds_the_draft_banks_only_with_the_head() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    use std::sync::atomic::Ordering;
+    let (decoder, vision) = tiny_decoder();
+    let handle = decoder.weights.plan.clone();
+    let before = handle.resident_bank_bytes.load(Ordering::Relaxed);
+    let mut inner = inner_over(decoder, vision, true);
+    let weights = &inner.decoder.weights;
+    let banks = weights.mtp_bank_bytes().unwrap();
+    assert!(banks > 0, "the load built the draft banks");
+    assert_eq!(
+        handle.resident_bank_bytes.load(Ordering::Relaxed),
+        before + banks
+    );
+    let held = |weights: &weights::Store| {
+        [
+            "mtp.layers.0.mlp.experts.gate_up_proj",
+            "mtp.layers.0.mlp.experts.down_proj",
+        ]
+        .map(|name| weights.resident_bank(name).unwrap())
+    };
+    let at_load = held(weights);
+    let cached = weights.cached_bytes();
+    inner.activate_paged_seq(1).unwrap();
+    assert!(inner.begin_mtp(1, 0).unwrap());
+    let weights = &inner.decoder.weights;
+    for (before, after) in at_load.iter().zip(held(weights)) {
+        assert!(Arc::ptr_eq(before, &after), "the turn rebuilt a draft bank");
+    }
+    assert_eq!(weights.mtp_bank_bytes().unwrap(), banks);
+    assert_eq!(weights.cached_bytes(), cached, "the turn built nothing");
+
+    let mut text_only = weights::Store::open_fixture(&fixture(), None).unwrap();
+    let before = text_only.plan.resident_bank_bytes.load(Ordering::Relaxed);
+    text_only.finish_load();
+    assert_eq!(text_only.mtp_bank_bytes().unwrap(), 0);
+    assert_eq!(
+        text_only.plan.resident_bank_bytes.load(Ordering::Relaxed),
+        before
     );
 }
 

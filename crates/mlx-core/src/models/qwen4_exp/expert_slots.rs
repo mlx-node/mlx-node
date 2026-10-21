@@ -206,8 +206,8 @@ impl Store {
             .flat_map(|file| file.header.sections.iter().map(|s| s.length))
             .sum();
         let dense = self.fixed_projection_bytes()?;
-        // The Q8 draft banks are anonymous MLX memory built on the first MTP
-        // owner: a mapped host must hold them beside the dense banks.
+        // The Q8 draft banks are anonymous MLX memory built at load: a mapped
+        // host must hold them beside the dense banks.
         let draft_bank = self.mtp_bank_estimate()?;
         let mut candidate = self.plan.clone();
         if let Err(e) = plan(
@@ -279,6 +279,24 @@ impl Store {
     /// Publish the residency the load settled on.
     pub(in super::super) fn publish_live(&self) {
         self.live.store(&self.plan);
+    }
+
+    /// The load settled on its residency and read the dense banks: build the
+    /// MTP head's draft banks, then start the pack stream. A head the host
+    /// cannot stage keeps its drafts on the row reader for the process; the
+    /// load goes on.
+    pub(in super::super) fn finish_load(&mut self) {
+        self.finish_load_with(&mut super::super::memory::admit);
+    }
+
+    pub(super) fn finish_load_with(&mut self, admit: &mut impl FnMut(u64) -> Result<()>) {
+        if let Err(error) = self.prepare_mtp_expert_banks_with(admit) {
+            tracing::warn!(
+                reason = %error.reason,
+                "Qwen4 MTP expert banks unavailable; drafts read expert rows"
+            );
+        }
+        self.start_pack_stream();
     }
 
     /// The load picked the mapped plan and read the dense banks: stream the
@@ -617,8 +635,8 @@ impl Store {
         // Fully resident expert banks are included in `fixed`, and only the
         // remaining layers share slots. Never reserve a second copy of them.
         // Draft banks stay pinned beside every slot bank and are not in
-        // `fixed`: the reserve holds the installed ones, or the ones the first
-        // MTP turn will admit after this count is cached, and the staging.
+        // `fixed`: the reserve holds the installed ones, or the ones the load
+        // admits right after this count is cached, and the staging.
         let allowance = self.auxiliary_cache_allowance()?;
         let estimate = self.mtp_bank_estimate()?;
         let admissible = if !self.mtp_banks_declined && estimate <= allowance {
@@ -1527,9 +1545,9 @@ mod tests {
         assert_eq!(store.slot_bytes, 0);
     }
 
-    /// `prepare_hot` caches the slot count before the first MTP turn admits
-    /// the draft banks, and that turn's pass builds every layer's slot bank
-    /// beside them. Every 1/16 GiB from 6 to 70 GiB, on an all-Q5_1 geometry
+    /// `prepare_hot` caches the slot count before the load admits the draft
+    /// banks, and the first turn's pass builds every layer's slot bank beside
+    /// them. Every 1/16 GiB from 6 to 70 GiB, on an all-Q5_1 geometry
     /// and the released one: no layer runs out of staging, and the banks are
     /// still admitted at every whole budget from 22 GiB.
     #[test]
@@ -1732,7 +1750,7 @@ mod tests {
         assert_eq!(store.bytes_read, 0);
     }
     /// The same fallback on the released checkpoint: a mapped load with the
-    /// MTP head attached installs the draft banks (`begin_mtp`'s call), a trip
+    /// MTP head attached installs the draft banks (the load's call), a trip
     /// leaves mapped mode on a 128 GiB host snapshot that leaves a 16 GiB slot
     /// budget, and the next turn builds every layer's slot bank. Opt-in:
     /// `QWEN4_EXP_REAL_MODEL=<gguf> QWEN4_EXP_REAL_AUX=<MTP checkpoint dir>
@@ -1843,7 +1861,7 @@ mod tests {
         );
     }
     /// The released checkpoint loaded on the slot path at a forced budget:
-    /// `prepare_hot` caches the slot count, the first MTP turn's call admits
+    /// `prepare_hot` caches the slot count, the load's call admits
     /// the draft banks, and a turn builds every layer's slot bank beside
     /// them. 22 GiB is a budget the product picks; at 22.25 GiB a count
     /// cached without the draft reserve overruns the last layer's staging.

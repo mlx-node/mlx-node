@@ -371,7 +371,7 @@ pub struct Qwen4ExpResidencyInfo {
     pub available_memory_bytes: Option<f64>,
     pub physical_memory_bytes: Option<f64>,
     /// Assembled matrices actually pinned right now: partial projection banks
-    /// and the MTP expert banks built on the first MTP owner.
+    /// and the MTP expert banks built at load.
     pub resident_bank_bytes: f64,
     /// Shared slot capacity for the routed layers at bootstrap (the expert
     /// count in mapped mode).
@@ -497,7 +497,7 @@ impl Qwen4ExpModel {
                 decoder.weights.prepare_mapped_pack()?;
                 decoder.weights.select_mapped_residency(pool_bytes)?;
                 decoder.weights.prepare_hot()?;
-                decoder.weights.start_pack_stream();
+                decoder.weights.finish_load();
                 decoder.weights.publish_live();
                 // Register the final reconciled budget, rather than retaining
                 // the pre-pool estimate in the process-wide allocator policy.

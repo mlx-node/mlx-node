@@ -607,15 +607,16 @@ impl Store {
         }
     }
 
-    /// Build the MTP head's routed experts as resident Q8 (affine, g32) banks
-    /// so a draft step gathers them on the device. Runs once, on the first MTP
-    /// owner; the whole aux tensor streams through 64 MiB row chunks. Both
-    /// banks or none: nothing is installed or charged until both evaluated,
-    /// and a cache that cannot stage them keeps the row-reader draft path.
+    #[cfg(test)]
     pub(in super::super) fn prepare_mtp_expert_banks(&mut self) -> Result<u64> {
         self.prepare_mtp_expert_banks_with(&mut super::super::memory::admit)
     }
 
+    /// Build the MTP head's routed experts as resident Q8 (affine, g32) banks
+    /// so a draft step gathers them on the device. Runs once, at load; the
+    /// whole aux tensor streams through 64 MiB row chunks. Both banks or
+    /// none: nothing is installed or charged until both evaluated, and a
+    /// cache that cannot stage them keeps the row-reader draft path.
     pub(super) fn prepare_mtp_expert_banks_with(
         &mut self,
         admit: &mut impl FnMut(u64) -> Result<()>,
@@ -1515,6 +1516,52 @@ mod tests {
                 assert_eq!(s.mtp_bank_bytes().unwrap(), 0, "{why}");
             }
             assert_eq!(seen, want, "{why}");
+        }
+    }
+
+    /// T3b. The load keeps the f16 retry: a host that refuses the f32
+    /// gate_up staging gets the f16 layout, one that refuses both loads
+    /// without draft banks.
+    #[test]
+    fn the_load_retries_the_f16_layout_when_f32_is_refused() {
+        let (experts, _, _cleanup) = real_shape_mtp_experts();
+        let bytes = |n: usize, width: usize, eighths: usize| {
+            (MTP_TEST_EXPERTS * n * width * eighths / 8) as u64
+        };
+        let (wide, narrow, down) = (
+            bytes(1280, 2560, 10),
+            bytes(1280, 2560, 9),
+            bytes(2560, 640, 9),
+        );
+        let staging = |bank: u64| 2 * bank + super::super::super::memory::WORKING_BYTES;
+        for (refused, built) in [
+            (vec![staging(wide)], true),
+            (vec![staging(wide), staging(narrow)], false),
+        ] {
+            let mut s = Store::open_fixture(&fixture().join("bf16/paged"), None).unwrap();
+            s.tensors.extend(experts.iter().cloned());
+            let mut seen = Vec::new();
+            s.finish_load_with(&mut |bytes| {
+                seen.push(bytes);
+                if refused.contains(&bytes) {
+                    Err(err("simulated headroom loss at load"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(seen[..2], [staging(wide), staging(narrow)], "built={built}");
+            if built {
+                assert_eq!(s.mtp_bank_bytes().unwrap(), narrow + down);
+                let bank = s.resident_bank(MTP_EXPERT_BANKS[0]).unwrap();
+                assert_eq!(
+                    [&bank.scales, &bank.biases].map(|a| a.as_ref().unwrap().dtype().unwrap()),
+                    [DType::Float16; 2]
+                );
+                assert!(!s.mtp_banks_declined);
+            } else {
+                assert_eq!(s.mtp_bank_bytes().unwrap(), 0);
+                assert!(s.mtp_banks_declined);
+            }
         }
     }
 

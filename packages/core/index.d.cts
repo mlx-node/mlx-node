@@ -5462,7 +5462,7 @@ export interface Qwen4ExpResidencyInfo {
   physicalMemoryBytes?: number;
   /**
    * Assembled matrices actually pinned right now: partial projection banks
-   * and the MTP expert banks built on the first MTP owner.
+   * and the MTP expert banks built at load.
    */
   residentBankBytes: number;
   /**

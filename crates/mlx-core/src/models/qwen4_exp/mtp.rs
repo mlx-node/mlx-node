@@ -91,14 +91,6 @@ impl State {
 impl Inner {
     pub fn begin_mtp(&mut self, seq: u32, position: u32) -> Result<bool> {
         if position == 0 {
-            // Best effort: without the banks the head's experts stream
-            // through the row reader, so the turn must not fail here.
-            if let Err(error) = self.decoder.weights.prepare_mtp_expert_banks() {
-                tracing::warn!(
-                    reason = %error.reason,
-                    "Qwen4 MTP expert banks unavailable; drafts read expert rows"
-                );
-            }
             self.mtp.owners.insert(
                 seq,
                 Owner {

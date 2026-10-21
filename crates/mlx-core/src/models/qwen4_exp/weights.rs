@@ -3286,6 +3286,134 @@ mod mapped_tests {
         assert!(!store.streaming_pass);
     }
 
+    /// A load up to its last step: the fixture MTP head attached (or not)
+    /// before the gate, the mapped plan, a held pack stream and the dense
+    /// banks. Returns the gate's anonymous need and the draft bank estimate.
+    fn mapped_load(
+        temp: &Temp,
+        gguf: &Path,
+        dir: &str,
+        head: bool,
+    ) -> (Store, Arc<Gate>, u64, u64) {
+        let mut store =
+            Store::open_fixture(gguf, Some(&temp.0.join(format!("{dir}-cache")))).unwrap();
+        if head {
+            let aux = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/qwen4-exp/bf16/paged");
+            store
+                .attach_auxiliary(Store::open_fixture(&aux, None).unwrap())
+                .unwrap();
+        }
+        let estimate = store.mtp_bank_estimate().unwrap();
+        assert_eq!(estimate > 0, head, "the fixture head has routed experts");
+        store.prepare_mapped_pack_at(&temp.0.join(dir)).unwrap();
+        let mut charged = 0;
+        store
+            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, need, _, _| {
+                charged = need;
+                plan.budget = 1 << 30;
+                plan.mapped = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.plan.mapped);
+        let gate = Arc::new(Gate::default());
+        store.pool_with(Arc::clone(&gate));
+        store.prepare_fixture_hot().unwrap();
+        (store, gate, charged, estimate)
+    }
+
+    /// T2. With the MTP head attached the load builds the draft banks the
+    /// gate charged before any pack fetch starts, then streams the pack,
+    /// whether or not a turn will ever ask for MTP; without the head it only
+    /// streams.
+    #[test]
+    fn the_load_builds_the_draft_banks_before_the_pack_stream_starts() {
+        if !in_child(
+            "models::qwen4_exp::weights::mapped_tests::the_load_builds_the_draft_banks_before_the_pack_stream_starts",
+        ) {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        for (head, dir) in [(true, "head"), (false, "plain")] {
+            let (mut store, gate, charged, estimate) = mapped_load(&temp, &gguf, dir, head);
+            let dense = store.fixed_projection_bytes().unwrap();
+            assert_eq!(
+                charged,
+                dense + estimate,
+                "{dir}: the gate charges the bank"
+            );
+            let mut seen = Vec::new();
+            store.finish_load_with(&mut |_| {
+                // A pack fetch issued before the build starts within this wait.
+                let deadline = Instant::now() + Duration::from_millis(100);
+                while gate.started.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                seen.push(gate.started.load(Ordering::Acquire));
+                Ok(())
+            });
+            assert_eq!(seen.is_empty(), !head, "{dir}: the build admits its banks");
+            assert!(
+                seen.iter().all(|&started| started == 0),
+                "{dir}: no pack fetch started before the build ({seen:?})"
+            );
+            assert_eq!(
+                store.mtp_bank_bytes().unwrap(),
+                estimate,
+                "{dir}: the load built the banks the gate charged"
+            );
+            assert!(
+                store.prefetch.as_ref().unwrap().streaming(),
+                "{dir}: the pack streams after the build"
+            );
+            gate.release();
+            wait_resident(&store);
+        }
+    }
+
+    /// T3a. A load whose host refuses the draft banks still loads: the pack
+    /// streams, the drafts stay on the row reader and nothing retries.
+    /// MUTATION (M-L2c-load-fails-on-decline): `finish_load_with` returns the
+    /// build's error before the stream -> "the declined load still streams"
+    /// fails.
+    #[test]
+    fn a_load_that_cannot_stage_the_draft_banks_still_loads_and_never_retries() {
+        if !in_child(
+            "models::qwen4_exp::weights::mapped_tests::a_load_that_cannot_stage_the_draft_banks_still_loads_and_never_retries",
+        ) {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let (mut store, gate, ..) = mapped_load(&temp, &gguf, "mapped", true);
+        let mut admissions = 0;
+        store.finish_load_with(&mut |_| {
+            admissions += 1;
+            Err(err("simulated headroom loss at load"))
+        });
+        assert!(admissions >= 1);
+        assert!(store.mtp_banks_declined);
+        assert_eq!(store.mtp_bank_bytes().unwrap(), 0);
+        assert!(
+            store.prefetch.as_ref().unwrap().streaming(),
+            "the declined load still streams the pack"
+        );
+        assert_eq!(
+            store
+                .prepare_mtp_expert_banks_with(&mut |_| Ok(()))
+                .unwrap(),
+            0,
+            "a declined head is never built later"
+        );
+        assert_eq!(store.mtp_bank_bytes().unwrap(), 0);
+        gate.release();
+        wait_resident(&store);
+    }
+
     /// With the MTP head attached, the mapped plan's anonymous need carries
     /// the Q8 draft banks beside the dense banks, the allowance admits that
     /// bank once the plan is mapped, and leaving the mapped path drops it.
