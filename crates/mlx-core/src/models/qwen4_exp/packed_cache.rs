@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -152,11 +152,12 @@ enum Source {
     Unreachable,
 }
 
-/// Err = unreadable or corrupt manifest. `path_hex=`/`file_hex=` lines (raw
-/// OS bytes as hex) are preferred over the lossy `path=`/`file=` lines they
-/// twin; pre-hex manifests keep working through the raw fields.
-fn manifest_source(dir: &Path) -> Result<Source> {
-    let data = fs::read(dir.join(".manifest")).map_err(err)?;
+/// The source files a `.manifest` names and the mount point it recorded.
+/// `path_hex=`/`file_hex=` lines (raw OS bytes as hex) are preferred over the
+/// lossy `path=`/`file=` lines they twin. A manifest is complete only when its
+/// last line is `end=<hex file count>` matching its file records: a torn or
+/// truncated write can drop splits while every record left still decodes.
+fn parse_manifest(data: &[u8]) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
     let mut path_raw = None;
     let mut path_hex = None;
     let mut mount_hex = None;
@@ -208,6 +209,22 @@ fn manifest_source(dir: &Path) -> Result<Source> {
     if files.is_empty() {
         return Err(err("packed manifest lists no files"));
     }
+    let end = data
+        .strip_suffix(b"\n")
+        .and_then(|data| data.rsplit(|&b| b == b'\n').next())
+        .and_then(|line| line.strip_prefix(b"end=".as_slice()))
+        .filter(|hex| !hex.is_empty() && hex.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .and_then(|hex| usize::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
+    if end != Some(files.len()) {
+        return Err(err("packed manifest is incomplete"));
+    }
+    Ok((files, mount))
+}
+
+/// Err = unreadable, corrupt or incomplete manifest.
+fn manifest_source(dir: &Path) -> Result<Source> {
+    let data = fs::read(dir.join(".manifest")).map_err(err)?;
+    let (files, mount) = parse_manifest(&data)?;
     let mut stats = Vec::with_capacity(files.len());
     let mut missing = false;
     for stat in stat_sources(files.into_iter()) {
@@ -228,7 +245,8 @@ fn manifest_source(dir: &Path) -> Result<Source> {
 
 /// Serialize canonical source paths into `.manifest` bytes: the hex records
 /// come first (`path_hex=`, `mount_hex=`, then every `file_hex=`), the raw
-/// `path=`/`file=` display lines last; the mount point has no raw twin. A
+/// `path=`/`file=` display lines next, and `end=<hex file count>` last; the
+/// mount point has no raw twin. A
 /// raw line whose bytes contain a newline is omitted
 /// entirely — a newline is the only byte that can forge a record line, and a
 /// path holding "\nfile_hex=evil" would inject an earlier authoritative-
@@ -266,6 +284,7 @@ fn pack_manifest(canonical: &[PathBuf]) -> Vec<u8> {
         }
     }
     manifest.extend_from_slice(&raw);
+    manifest.extend_from_slice(format!("end={:x}\n", canonical.len()).as_bytes());
     manifest
 }
 
@@ -376,16 +395,42 @@ pub(super) fn dir_open_at(
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-/// Create-or-truncate `name` inside `dirfd` and write `contents`.
-/// O_NOFOLLOW keeps a planted link at `name` from redirecting the write.
-pub(super) fn dir_write_file(dirfd: &File, name: &str, contents: &[u8]) -> io::Result<()> {
-    let mut file = dir_open_at(
+/// Publish `manifest` as the pack's `.manifest` unless a complete one is
+/// there: written to `.manifest.tmp`, synced, then renamed over it, so a
+/// crash leaves the old manifest or the new one, never a torn one.
+/// O_NOFOLLOW keeps a planted link at either name from redirecting a read or
+/// the write.
+pub(super) fn publish_manifest(dirfd: &File, manifest: &[u8]) -> io::Result<()> {
+    let current = OsStr::new(".manifest");
+    let complete = dir_stat(dirfd, current)
+        .is_some_and(|stat| (stat.st_mode & libc::S_IFMT) == libc::S_IFREG)
+        && dir_open_at(
+            dirfd,
+            current,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+        .and_then(|mut file| {
+            let mut data = Vec::new();
+            file.read_to_end(&mut data).map(|_| data)
+        })
+        .is_ok_and(|data| parse_manifest(&data).is_ok());
+    if complete {
+        return Ok(());
+    }
+    let mut tmp = dir_open_at(
         dirfd,
-        OsStr::new(name),
+        OsStr::new(".manifest.tmp"),
         libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0o644,
     )?;
-    file.write_all(contents)
+    tmp.write_all(manifest)?;
+    tmp.sync_all()?;
+    match dir_renameat(dirfd, ".manifest.tmp", ".manifest") {
+        // A concurrent loader renamed the same inode first; our bytes are in it.
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
 }
 
 /// Atomic `rename` inside the pinned dir — both endpoints relative to
@@ -488,8 +533,8 @@ fn packed_dir_idle(dir: &Path) -> bool {
 
 /// None keeps the dir. Only proof removes one: a present source that hashes
 /// to another identity, or a file gone from a mount point that is still
-/// mounted. An unplugged volume, an unreadable file, a corrupt manifest or
-/// no manifest proves nothing. The idle gate is a race grace, never a reason.
+/// mounted. An unplugged volume, an unreadable file, a corrupt or incomplete
+/// manifest or no manifest proves nothing. The idle gate is a race grace, never a reason.
 fn packed_orphan_reason(dir: &Path) -> Option<&'static str> {
     let manifest = dir.join(".manifest");
     if !manifest.is_file() || !packed_dir_idle(dir) {
@@ -1255,6 +1300,10 @@ mod tests {
             manifest.lines().any(|line| line == "file=source.gguf"),
             "the raw file record follows its hex twin:\n{manifest}"
         );
+        assert!(
+            manifest.ends_with("\nend=1\n"),
+            "the completion record ends the manifest:\n{manifest}"
+        );
         assert_eq!(
             manifest_source(&dir).unwrap(),
             Source::Present(dir_name_identity(&dir).unwrap().to_owned())
@@ -1483,7 +1532,7 @@ mod tests {
     /// A manifest naming `source_dir/x.gguf`, recorded on `mount`.
     fn manifest_naming(source_dir: &Path, mount: &Path) -> String {
         format!(
-            "path_hex={}\nmount_hex={}\nfile_hex={}\n",
+            "path_hex={}\nmount_hex={}\nfile_hex={}\nend=1\n",
             hex(source_dir.as_os_str().as_bytes()),
             hex(mount.as_os_str().as_bytes()),
             hex(b"x.gguf")
@@ -1715,7 +1764,7 @@ mod tests {
         let unrecorded = fixture(
             '4',
             format!(
-                "path_hex={}\nfile_hex={}\n",
+                "path_hex={}\nfile_hex={}\nend=1\n",
                 hex(base.as_os_str().as_bytes()),
                 hex(b"x.gguf")
             ),
@@ -1771,13 +1820,13 @@ mod tests {
         let corrupt = [
             (
                 '1',
-                format!("path_hex=zz\nmount_hex={mount}\nfile_hex={file}\n"),
+                format!("path_hex=zz\nmount_hex={mount}\nfile_hex={file}\nend=1\n"),
             ),
-            ('2', format!("mount_hex={mount}\nfile_hex={file}\n")),
-            ('3', format!("path_hex={path}\nmount_hex={mount}\n")),
+            ('2', format!("mount_hex={mount}\nfile_hex={file}\nend=1\n")),
+            ('3', format!("path_hex={path}\nmount_hex={mount}\nend=0\n")),
             (
                 '4',
-                format!("path_hex={path}\nmount_hex=zz\nfile_hex={file}\n"),
+                format!("path_hex={path}\nmount_hex=zz\nfile_hex={file}\nend=1\n"),
             ),
         ];
         let mut kept = Vec::new();
@@ -1847,6 +1896,154 @@ mod tests {
             packed_orphan_reason(&rewritten),
             Some("source fingerprint changed")
         );
+    }
+
+    /// A published pack of two unchanged source splits, `a.gguf` and `b.gguf`.
+    fn split_pack(temp: &Temp) -> (PackedCache, PathBuf) {
+        let source_dir = temp.0.join("src");
+        fs::create_dir(&source_dir).unwrap();
+        let files = [source_dir.join("a.gguf"), source_dir.join("b.gguf")];
+        for file in &files {
+            fs::write(file, file.as_os_str().as_bytes()).unwrap();
+        }
+        let cache = PackedCache::new_at(&temp.0.join("cache"), BTreeSet::from(files)).unwrap();
+        let dir = published(&cache);
+        (cache, dir)
+    }
+
+    /// Replace `dir`'s manifest, age the dir past the grace and sweep it:
+    /// the orphan reason it read and whether it survived.
+    fn sweep_with_manifest(dir: &Path, manifest: &[u8]) -> (Option<&'static str>, bool) {
+        fs::write(dir.join(".manifest"), manifest).unwrap();
+        age(&dir.join(".manifest"), 7200);
+        age_dir(dir, 7200);
+        let reason = packed_orphan_reason(dir);
+        let parent = dir.parent().unwrap();
+        until_gone(
+            || sweep_packed_cache(parent, &parent.join("current")),
+            || !dir.exists(),
+        );
+        (reason, dir.exists())
+    }
+
+    /// An interrupted manifest write leaves valid hex records that omit
+    /// splits: hashing the partial list would read as a changed fingerprint.
+    #[test]
+    fn a_truncated_split_manifest_keeps_its_pack() {
+        let temp = Temp::new();
+        let (cache, dir) = split_pack(&temp);
+        let manifest = cache.manifest();
+        let first = manifest
+            .windows(b"file_hex=".len())
+            .position(|w| w == b"file_hex=")
+            .unwrap();
+        let cut = first + manifest[first..].iter().position(|&b| b == b'\n').unwrap() + 1;
+        let (reason, kept) = sweep_with_manifest(&dir, &manifest[..cut]);
+        assert!(
+            reason.is_none() && kept,
+            "reason {reason:?}, swept {}, manifest:\n{}",
+            !kept,
+            String::from_utf8_lossy(&manifest[..cut])
+        );
+    }
+
+    #[test]
+    fn a_manifest_whose_end_record_miscounts_its_files_keeps_its_pack() {
+        let temp = Temp::new();
+        let (cache, dir) = split_pack(&temp);
+        let manifest = String::from_utf8(cache.manifest().to_vec()).unwrap();
+        assert!(manifest.ends_with("\nend=2\n"), "{manifest}");
+        let dropped = manifest.replacen(&format!("file_hex={}\n", hex(b"b.gguf")), "", 1);
+        assert_ne!(dropped, manifest);
+        let (reason, kept) = sweep_with_manifest(&dir, dropped.as_bytes());
+        assert!(
+            reason.is_none() && kept,
+            "reason {reason:?}, swept {}, manifest:\n{dropped}",
+            !kept
+        );
+        // The complete manifest of the same pack still verifies.
+        assert_eq!(sweep_with_manifest(&dir, manifest.as_bytes()), (None, true));
+        assert_eq!(
+            manifest_source(&dir).unwrap(),
+            Source::Present(cache.identity().unwrap().to_owned())
+        );
+    }
+
+    /// A crash before the rename leaves `.manifest.tmp`: never read as the
+    /// manifest, and gone once a load publishes the manifest.
+    #[test]
+    fn a_leftover_manifest_tmp_is_ignored_and_replaced() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        fs::create_dir(&parent).unwrap();
+        let dir = mapped_fixture(&parent, 'a', 100, true);
+        assert_eq!(packed_orphan_reason(&dir), Some("source deleted"));
+        fs::rename(dir.join(".manifest"), dir.join(".manifest.tmp")).unwrap();
+        age_dir(&dir, 7200);
+        assert_eq!(packed_orphan_reason(&dir), None);
+        sweep_packed_cache(&parent, &parent.join("current"));
+        assert!(dir.exists(), "a stale .manifest.tmp is no manifest");
+        fs::write(dir.join(".manifest.tmp"), b"path_hex=2f\nfile_hex=").unwrap();
+        let manifest = deleted_manifest(&parent);
+        publish_manifest(&open_dir_nofollow(&dir).unwrap(), manifest.as_bytes()).unwrap();
+        assert_eq!(
+            fs::read(dir.join(".manifest")).unwrap(),
+            manifest.as_bytes()
+        );
+        assert!(
+            !dir.join(".manifest.tmp").exists(),
+            "the leftover .manifest.tmp must be replaced by the publish"
+        );
+    }
+
+    /// Packs published before the completion record carry none: the load
+    /// that opens one rewrites it, and leaves every other pack's alone.
+    #[test]
+    fn a_load_heals_its_own_incomplete_manifest_and_no_other() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        let source = temp.0.join("source.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
+        let complete = cache.manifest().to_vec();
+        let old = complete.strip_suffix(b"end=1\n").unwrap();
+        let current = published(&cache);
+        fs::write(current.join(".manifest"), old).unwrap();
+        let sibling = parent.join(format!("{MAPPED_DIR_PREFIX}{}", "a".repeat(64)));
+        fs::create_dir(&sibling).unwrap();
+        fs::write(sibling.join(".manifest"), old).unwrap();
+        age(&sibling.join(".manifest"), 7200);
+        age_dir(&sibling, 7200);
+        let inode = |dir: &Path| fs::metadata(dir.join(".manifest")).unwrap().ino();
+        let before = inode(&current);
+        let load = || {
+            let cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
+            drop(
+                super::super::mapped_pack::MappedPack::open_or_build(
+                    cache.mapped_dir(),
+                    cache.identity().unwrap(),
+                    Some(cache.manifest()),
+                    &[],
+                )
+                .unwrap(),
+            );
+        };
+        load();
+        assert_eq!(
+            fs::read(current.join(".manifest")).unwrap(),
+            complete,
+            "the opened pack's manifest must gain its completion record"
+        );
+        let healed = inode(&current);
+        assert_ne!(healed, before, "the manifest is replaced by rename");
+        assert!(!current.join(".manifest.tmp").exists());
+        assert_eq!(
+            fs::read(sibling.join(".manifest")).unwrap(),
+            old,
+            "a pack no load opened keeps its manifest"
+        );
+        load();
+        assert_eq!(inode(&current), healed, "a complete manifest is left as is");
     }
 
     fn fixture_gguf() -> PathBuf {

@@ -613,11 +613,8 @@ impl MappedPack {
         let dirfd = packed_cache::open_dir_nofollow(dir)
             .ok_or_else(|| err(format!("{} is not a real directory", dir.display())))?;
         let hold = packed_cache::hold_mapped_dir(dir, &dirfd).map_err(err)?;
-        if let Some(manifest) = manifest
-            && packed_cache::dir_stat(&dirfd, OsStr::new(".manifest"))
-                .is_none_or(|stat| (stat.st_mode & libc::S_IFMT) != libc::S_IFREG)
-        {
-            packed_cache::dir_write_file(&dirfd, ".manifest", manifest).map_err(err)?;
+        if let Some(manifest) = manifest {
+            packed_cache::publish_manifest(&dirfd, manifest).map_err(err)?;
         }
         let site = Site {
             dirfd: &dirfd,
