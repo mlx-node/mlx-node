@@ -2939,6 +2939,7 @@ fn prefill_window_projections_stay_batched_outside_verification() {
         inner.decoder.weights.single_row_projections, 0,
         "the prefill window projected weights one row at a time"
     );
+    inner.decoder.weights.vector_windows.clear();
     inner
         .verify_mtp(&[ScheduledVerifyRow {
             seq_id: 1,
@@ -2947,6 +2948,14 @@ fn prefill_window_projections_stay_batched_outside_verification() {
             speculative: true,
         }])
         .unwrap();
+    // PLE key and value: one three-row window each per PLE layer.
+    let windows = &inner.decoder.weights.vector_windows;
+    assert_eq!(
+        windows.len(),
+        2 * inner.decoder.config.ple_layer_ids.len(),
+        "{windows:?}"
+    );
+    assert!(windows.iter().all(|&(rows, _)| rows == 3), "{windows:?}");
     assert!(
         inner.decoder.weights.single_row_projections >= 3,
         "verification projects each of its rows alone: {}",
@@ -8682,4 +8691,161 @@ fn real_model_draft_acceptance_on_forced_streams() {
         inner.decoder.weights.plan.mapped,
         "the store left the mapped pack during the probe"
     );
+}
+
+fn xorshift(seed: u32) -> impl FnMut() -> u32 {
+    let mut s = seed | 1;
+    move || {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        s
+    }
+}
+
+/// Today's PLE vector path before the row kernel: one M=1 gather GEMV per vector.
+fn gather_vectors(w: &weights::Weight, x: &MxArray) -> MxArray {
+    use crate::array::DType;
+    let count = x.shape_at(1).unwrap();
+    let width = x.shape_at(2).unwrap();
+    w.gather_rows(
+        &x.reshape(&[count, 1, width]).unwrap(),
+        &MxArray::zeros(&[count], Some(DType::Uint32)).unwrap(),
+        1,
+        false,
+    )
+    .unwrap()
+    .reshape(&[1, count, w.values.shape_at(0).unwrap()])
+    .unwrap()
+}
+
+/// The PLE key (10240 x 2560) and value (2560 x 2560) Q8 shapes: the gather
+/// GEMV per vector, the single-row projection per row and the row kernel
+/// write the same bits for R = 1, 3 and 4.
+#[test]
+fn ple_projection_row_kernel_matches_gather_and_single_rows_bit_for_bit() {
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    for seed in 0..4u32 {
+        let mut next = xorshift(0x9e37_79b9 ^ seed.wrapping_mul(0x0100_0193));
+        for (n, k) in [(10240usize, 2560usize), (2560, 2560)] {
+            let w = q8_bank(n, k, &mut next);
+            for rows in [1i64, 3, 4] {
+                let x = bf16_rows(rows, k as i64, 1. / 256., 2., &mut next);
+                let dense = math::rows::dense_decode(&w, &x)
+                    .unwrap()
+                    .expect("the row kernel admits the PLE shape");
+                let singles: Vec<MxArray> =
+                    (0..rows).map(|j| w.linear(&row(&x, j)).unwrap()).collect();
+                let what = format!("seed={seed} N={n} K={k} rows={rows}");
+                assert_same_bits(&gather_vectors(&w, &x), &dense, &format!("gather {what}"));
+                assert_same_bits(&stack_rows(&singles), &dense, &format!("single {what}"));
+            }
+        }
+    }
+}
+
+/// A Q8_0 GGUF of `(name, rows, width)` tensors with random F16 scales and int8 codes.
+fn write_q8_gguf(
+    path: &std::path::Path,
+    tensors: &[(&str, usize, usize)],
+    next: &mut impl FnMut() -> u32,
+) {
+    let mut b = b"GGUF".to_vec();
+    b.extend_from_slice(&3u32.to_le_bytes());
+    b.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+    b.extend_from_slice(&1u64.to_le_bytes());
+    gguf_string(&mut b, "general.architecture");
+    b.extend_from_slice(&8u32.to_le_bytes());
+    gguf_string(&mut b, "qwen4exp");
+    let mut offset = 0u64;
+    for &(name, n, k) in tensors {
+        gguf_string(&mut b, name);
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&(k as u64).to_le_bytes());
+        b.extend_from_slice(&(n as u64).to_le_bytes());
+        b.extend_from_slice(&8u32.to_le_bytes());
+        b.extend_from_slice(&offset.to_le_bytes());
+        offset += (n * k / 32 * 34) as u64;
+        assert!(offset.is_multiple_of(32));
+    }
+    while !b.len().is_multiple_of(32) {
+        b.push(0);
+    }
+    for &(_, n, k) in tensors {
+        for _ in 0..n * k / 32 {
+            let scale = half::f16::from_f32((next() % 97 + 1) as f32 / 16384.);
+            b.extend_from_slice(&scale.to_bits().to_le_bytes());
+            for _ in 0..8 {
+                b.extend_from_slice(&next().to_le_bytes());
+            }
+        }
+    }
+    std::fs::write(path, b).unwrap();
+}
+
+/// `linear_ple_window` through the real GGUF loader, from a resident bank
+/// and from staged read chunks: every window of R > 1 vectors runs four rows
+/// per row-kernel call (256 calls for 1024 rows, per weight chunk) and keeps
+/// the bits of the gather GEMV per vector and of the single-row projection.
+#[test]
+fn ple_window_runs_four_rows_per_row_kernel_call_bit_for_bit() {
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    let width = 2560usize;
+    let names = [
+        ("blk.1.ple_key.weight", 10240usize),
+        ("blk.1.ple_value.weight", 2560usize),
+    ];
+    let chunk = (weights::MAX_READ_BYTES as usize / (width * 4)).clamp(1, 4096);
+    for seed in 0..2u32 {
+        let mut next = xorshift(0x5bd1_e995 ^ seed.wrapping_mul(0x0100_0193));
+        let dir = Temp::new();
+        let path = dir.0.join("ple.gguf");
+        write_q8_gguf(
+            &path,
+            &[
+                (names[0].0, names[0].1, width),
+                (names[1].0, names[1].1, width),
+            ],
+            &mut next,
+        );
+        for banked in [true, false] {
+            let mut store = weights::Store::open_fixture(&path, None).unwrap();
+            if banked {
+                store.prepare_fixture_hot().unwrap();
+            }
+            for (name, n) in names {
+                assert_eq!(store.resident_bank(name).is_some(), banked, "{name}");
+                let w = weights::Weight::concatenate_rows(
+                    &(0..n)
+                        .step_by(chunk)
+                        .map(|s| store.read(name, s, (n - s).min(chunk)).unwrap())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                let chunks = if banked { 1 } else { n.div_ceil(chunk) as u64 };
+                for rows in [1i64, 3, 4, 5, 1023, 1024] {
+                    let x = bf16_rows(rows, width as i64, 1. / 256., 2., &mut next);
+                    store.vector_windows.clear();
+                    let window = store.linear_ple_window(name, &x).unwrap();
+                    let calls = if rows == 1 {
+                        0
+                    } else {
+                        chunks * (rows as u64).div_ceil(4)
+                    };
+                    let what = format!("seed={seed} banked={banked} {name} rows={rows}");
+                    assert_eq!(store.vector_windows, [(rows, calls)], "{what}");
+                    assert_same_bits(&window, &gather_vectors(&w, &x), &format!("gather {what}"));
+                    if rows <= 5 {
+                        let singles: Vec<MxArray> =
+                            (0..rows).map(|j| w.linear(&row(&x, j)).unwrap()).collect();
+                        assert_same_bits(&window, &stack_rows(&singles), &format!("single {what}"));
+                    }
+                }
+            }
+        }
+    }
 }

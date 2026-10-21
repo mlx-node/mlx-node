@@ -1717,15 +1717,24 @@ impl Decoder {
         let mut saved = vec![LayerCache::default(); rows];
         let row = |a: &MxArray, j: usize| a.slice_axis(1, j as i64, j as i64 + 1);
         let x = if self.config.ple_layer_ids.contains(&(i + 1)) {
-            let mut parts = Vec::with_capacity(rows);
-            for (j, &token) in tokens.iter().enumerate() {
+            let dtype = x.dtype()?;
+            let mut embeddings = Vec::with_capacity(rows);
+            for &token in tokens {
                 self.check_cancelled()?;
-                let input = row(x, j)?;
-                parts.push(input.add(&self.ple(&input, token, i, cache)?)?);
+                embeddings.push(self.ple_embeddings(&[token], i, dtype)?);
                 self.history.push(token);
-                saved[j].ple_conv = cache.ple_conv.clone();
             }
             self.history.truncate(base);
+            let embeddings = MxArray::concatenate_many(embeddings.iter().collect(), Some(1))?;
+            let (key, value) = self.ple_projections(&embeddings, i)?;
+            let mut parts = Vec::with_capacity(rows);
+            for (j, saved) in saved.iter_mut().enumerate() {
+                self.check_cancelled()?;
+                let input = row(x, j)?;
+                let ple = self.ple_mix(&input, &row(&key, j)?, &row(&value, j)?, i, cache)?;
+                parts.push(input.add(&ple)?);
+                saved.ple_conv = cache.ple_conv.clone();
+            }
             MxArray::concatenate_many(parts.iter().collect(), Some(1))?
         } else {
             x.clone()
@@ -1941,10 +1950,15 @@ impl Decoder {
         i: usize,
         cache: &mut LayerCache,
     ) -> Result<MxArray> {
+        let embeddings = self.ple_embeddings(tokens, i, x.dtype()?)?;
+        let (key, value) = self.ple_projections(&embeddings, i)?;
+        self.ple_mix(x, &key, &value, i, cache)
+    }
+
+    /// The `[1, T, ple_embed_dim]` embeddings of `tokens` following the history.
+    fn ple_embeddings(&mut self, tokens: &[u32], i: usize, dtype: DType) -> Result<MxArray> {
         let c = self.config.clone();
         let t = tokens.len() as i64;
-        let p = format!("layers.{i}.ple");
-        let g = format!("blk.{i}");
         let ids = self.ple_hash_ids(i, tokens)?;
         let mut groups: std::collections::BTreeMap<String, (Vec<usize>, Vec<usize>)> =
             Default::default();
@@ -1975,21 +1989,47 @@ impl Decoder {
                 .collect::<Result<Vec<_>>>()?;
             MxArray::concatenate_many(rows, Some(0))?
         };
-        let emb = emb
-            .reshape(&[1, t, c.ple_embed_dim as i64])?
-            .astype(x.dtype()?)?;
+        emb.reshape(&[1, t, c.ple_embed_dim as i64])?.astype(dtype)
+    }
 
+    /// The PLE key and value projections of a `[1, T, ple_embed_dim]` window.
+    fn ple_projections(&mut self, emb: &MxArray, i: usize) -> Result<(MxArray, MxArray)> {
+        let p = format!("layers.{i}.ple");
+        let g = format!("blk.{i}");
         let key = self.weights.linear_ple_window(
             &self.key(
                 &format!("{p}.key_proj.weight"),
                 &format!("{g}.ple_key.weight"),
             ),
-            &emb,
+            emb,
         )?;
+        let value = self.weights.linear_ple_window(
+            &self.key(
+                &format!("{p}.value_proj.weight"),
+                &format!("{g}.ple_value.weight"),
+            ),
+            emb,
+        )?;
+        Ok((key, value))
+    }
 
+    /// The PLE gate and convolution over `x` (`[1, T, 4H]`) given the
+    /// window's key and value projections.
+    fn ple_mix(
+        &mut self,
+        x: &MxArray,
+        key: &MxArray,
+        value: &MxArray,
+        i: usize,
+        cache: &mut LayerCache,
+    ) -> Result<MxArray> {
+        let c = self.config.clone();
+        let t = x.shape_at(1)?;
+        let p = format!("layers.{i}.ple");
+        let g = format!("blk.{i}");
         let key = self
             .norm(
-                &key,
+                key,
                 &format!("{p}.norm_key.weight"),
                 &format!("{g}.ple_norm_key.weight"),
                 c.hidden_size,
@@ -2005,14 +2045,6 @@ impl Decoder {
                 true,
             )?
             .reshape(&[1, t, c.hc_count as i64, c.hidden_size as i64])?;
-        let value = self.weights.linear_ple_window(
-            &self.key(
-                &format!("{p}.value_proj.weight"),
-                &format!("{g}.ple_value.weight"),
-            ),
-            &emb,
-        )?;
-
         let score = key
             .mul(&query)?
             .sum(Some(&[-1]), Some(true))?

@@ -250,6 +250,13 @@ Paged K/V writes accept read-only contiguous offset views while preserving stric
 mutable-pool validation. GDN recurrent state remains F32, and BF16 rounding
 boundaries are retained where required for parity.
 
+The PLE key and value projections run an admitted Q8 bank (affine, group 32,
+BF16 input) through the row-exact decode kernel, four vectors per call: a
+prefill window of T tokens makes ceil(T / 4) calls per weight chunk instead of
+one gather GEMV per token, and MTP verification projects all of its rows' PLE
+embeddings in one call before the gate and convolution advance row by row.
+Every row keeps the bits of its single-row projection.
+
 The shared scheduler supports up to four live owners. QSA K/V pages are admitted
 against a pool capped at 1 GiB; recurrent rows and MTP draft state are admitted
 against the 4 GiB working allowance left after that pool and the prefill window

@@ -481,6 +481,9 @@ pub struct Store {
     /// kernel admitted the weight); a prefill window must never add to it.
     #[cfg(test)]
     pub(in super::super) single_row_projections: u64,
+    /// (vectors, row-kernel calls) of every vector-window projection.
+    #[cfg(test)]
+    pub(in super::super) vector_windows: Vec<(i64, u64)>,
     /// Measurement hook: `false` leaves every imported row in its own
     /// buffer (the pre-fold shape) so a test can time the fold alone.
     #[cfg(test)]
@@ -615,6 +618,8 @@ impl Store {
             row_readers: true,
             #[cfg(test)]
             single_row_projections: 0,
+            #[cfg(test)]
+            vector_windows: Vec::new(),
             #[cfg(test)]
             fold_rows: true,
             lookup: Arc::default(),
@@ -1625,11 +1630,10 @@ impl Store {
     }
 
     /// Batch independent vectors while retaining the singleton projection's
-    /// accumulation. PLE formerly used GEMV per token; ordinary prompt GEMM
-    /// can round differently and change the subsequent greedy token stream.
-    /// mlxfast TrackFastModel.pleForward uses the ordinary projection for a
-    /// wide window. Keep its M/N/K matrix dispatch, with our existing GGUF
-    /// loader, rather than broadcasting one GEMV for every prompt token.
+    /// accumulation: an ordinary prompt GEMM can round differently and change
+    /// the subsequent greedy token stream. An admitted Q8 bank runs four
+    /// vectors per call of the row-exact decode kernel, every row with the
+    /// bits of its single-row projection.
     pub fn linear_ple_window(&mut self, name: &str, x: &MxArray) -> Result<MxArray> {
         self.linear_vector_window(name, x)
     }
@@ -1649,9 +1653,30 @@ impl Store {
             return Err(err(format!("Projection shape mismatch: {name}")));
         }
         let count = x.size()? as i64 / width;
+        #[cfg(test)]
+        let dense_row_calls = std::cell::Cell::new(0u64);
         let project = |w: &Weight| -> Result<MxArray> {
             if !vectors || count == 1 {
                 return w.linear(x);
+            }
+            let mut out_shape = outer_shape.to_vec();
+            out_shape.push(w.values.shape_at(0)?);
+            let window = x.reshape(&[1, count, width])?;
+            let step = super::math::rows::MAX_ROWS;
+            let mut parts = Vec::with_capacity(((count + step - 1) / step) as usize);
+            for start in (0..count).step_by(step as usize) {
+                let rows = window.slice_axis(1, start, (start + step).min(count))?;
+                match super::math::rows::dense_decode(w, &rows)? {
+                    Some(out) => parts.push(out),
+                    None if parts.is_empty() => break,
+                    None => return Err(err("Qwen4 row kernel refused part of a vector window")),
+                }
+                #[cfg(test)]
+                dense_row_calls.set(dense_row_calls.get() + 1);
+            }
+            if !parts.is_empty() {
+                return MxArray::concatenate_many(parts.iter().collect(), Some(1))?
+                    .reshape(&out_shape);
             }
             let input = x.reshape(&[count, 1, width])?;
             let output = if w.scales.is_some() {
@@ -1669,27 +1694,31 @@ impl Store {
                     .collect::<Result<Vec<_>>>()?;
                 MxArray::concatenate_many(parts.iter().collect(), Some(0))?
             };
-            let mut out_shape = outer_shape.to_vec();
-            out_shape.push(w.values.shape_at(0)?);
             output.reshape(&out_shape)
         };
         // Staging chunks bound SSD reads. A resident matrix can use a single
         // projection, particularly the large vocabulary head, without copying
         // weights or launching one kernel for every former read chunk.
-        if let Some(bank) = self.banks.get(name) {
-            return project(bank);
-        }
-        let chunk = (MAX_READ_BYTES as usize / (d.width()? * 4)).clamp(1, 4096);
-        let mut outputs = Vec::new();
-        for start in (0..rows).step_by(chunk) {
-            let weight = self.read(name, start, (rows - start).min(chunk))?;
-            outputs.push(project(&weight)?);
-        }
-        if outputs.len() == 1 {
-            Ok(outputs.remove(0))
+        let output = if let Some(bank) = self.banks.get(name) {
+            project(bank)
         } else {
-            MxArray::concatenate_many(outputs.iter().collect(), Some(-1))
+            let chunk = (MAX_READ_BYTES as usize / (d.width()? * 4)).clamp(1, 4096);
+            let mut outputs = Vec::new();
+            for start in (0..rows).step_by(chunk) {
+                let weight = self.read(name, start, (rows - start).min(chunk))?;
+                outputs.push(project(&weight)?);
+            }
+            if outputs.len() == 1 {
+                Ok(outputs.remove(0))
+            } else {
+                MxArray::concatenate_many(outputs.iter().collect(), Some(-1))
+            }
+        };
+        #[cfg(test)]
+        if vectors {
+            self.vector_windows.push((count, dense_row_calls.get()));
         }
+        output
     }
     /// `x` is `[1, R, K]`, `R <= 4`. Row `j` of the result carries the bits of
     /// `linear` applied to row `j` alone: an admitted Q8 bank streams once
