@@ -33,7 +33,7 @@
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.8.6",
-    "@oxc-node/cli": "^0.1.0",
+    "@oxc-node/cli": "^1.0.0",
     "vite-plus": "catalog:"
   },
   "optionalDependencies": {
