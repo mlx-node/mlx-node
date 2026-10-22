@@ -183,7 +183,7 @@ base.
 Every prefill
 window and every decode step needs the entire routed set resident at once:
 when other processes' anonymous memory leaves less than that (a 20 GiB
-working set beside the 78 GiB pack on 128 GiB), the kernel re-faults the pack
+working set beside the 73 GiB pack on 128 GiB), the kernel re-faults the pack
 layer by layer and a 6k turn reads about 1 TB from SSD at 0.4 tokens/s
 instead of 50; the live-memory gate and the tripwire above send such a host
 to the slot path.
@@ -191,7 +191,7 @@ to the slot path.
 On the slot path, fixed projections are retained within a quarter of the
 budget and routed experts use stable slots sized from the remaining budget and
 tensor geometry. Sparse token/PLE rows stay on SSD: the 17 rows a token needs
-(its embedding and 16 hashed PLE rows) are requested from four reader threads
+(its embedding and 16 hashed PLE rows) are requested from the 32 reader threads
 as soon as the token is known, `pread` from descriptors kept open, and imported
 lazily into the layer that consumes them, so the model thread neither opens
 files nor drains the GPU at the token start; decoded rows are kept in the
@@ -200,7 +200,7 @@ F32-equivalent size are capped at 64 MiB; bank preparation accounts for both
 imported chunks and their destination.
 
 The routed expert tensors of a GGUF checkpoint are kept as a mapped expert
-pack under `~/Library/Caches/mlx-node/qwen4-packed` on macOS:
+pack under `~/Library/Caches/mlx-node/qwen4-packed` on macOS (`~/.cache/mlx-node/qwen4-packed` elsewhere):
 `.mlx-qwen4-mapped-v3-<identity>/`, one file per `(layer, tensor)` whose three
 quantized arrays are 16 KiB-aligned sections with the experts in id order
 (~74 GiB for Flash Next). The first load builds it from the checkpoint,
@@ -250,6 +250,15 @@ before erroring.
 | Setting                        | Behavior                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `MLX_NATIVE_GGUF_CACHE_MAX_GB` | Optional cap on the whole native GGUF cache (packed weights plus extracted tokenizer assets), in GiB; least-recently-used eviction under a 24 h grace, with atomic root-wide admission at publish (a conversion that cannot fit loads from its staging dir instead; a later reload reuses that staged result rather than re-converting, and the refused dir is a per-pid load output the sweep keeps while the process lives). Unset, `<=0` or unparseable means unlimited. |
+| `QWEN4_EXP_REAL_MODEL`         | Opt-in real-model tests (ignored by default): the Qwen3.8 GGUF path.                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `QWEN4_EXP_REAL_INPUTS`        | Their prompts: a `{name, tokenIds}` case list from `oxnode scripts/benchmark-fixture.ts fetch --fixture qwen38 --output inputs.json`.                                                                                                                                                                                                                                                                                                                                       |
+| `QWEN4_EXP_REAL_AUX`           | The MTP checkpoint dir the slot tests attach.                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `QWEN4_EXP_REAL_STEPS`         | Greedy decode steps per case (default 256).                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `QWEN4_EXP_REAL_CASES`         | Comma-separated case names (default `6k,16k`).                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `QWEN4_EXP_REAL_EXPECTED`      | A `QWEN4_EXP_REAL_OUT` file of an earlier run: each case's greedy argmax must equal its `reference.argmax`.                                                                                                                                                                                                                                                                                                                                                                 |
+| `QWEN4_EXP_REAL_OUT`           | Where the greedy test writes each case's argmax and tokens.                                                                                                                                                                                                                                                                                                                                                                                                                 |
+
+Run them with `QWEN4_EXP_REAL_MODEL=... QWEN4_EXP_REAL_INPUTS=... cargo test -p mlx-core --lib real_ -- --ignored --test-threads=1 --nocapture`.
 
 `residencyInfo()` reports the admitted bytes, hot inventory, resident banks,
 expert-slot capacity (the expert count in mapped mode), the number of tensors
