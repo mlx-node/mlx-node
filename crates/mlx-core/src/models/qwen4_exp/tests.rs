@@ -3577,8 +3577,12 @@ fn expert_aligned_prefill_preserves_quantized_projections_and_tile_tails() {
 fn stable_gpu_routing_preserves_duplicates_tails_and_inverse() {
     use crate::array::MxArray;
     for (experts, rows) in [
+        (7, 3),
         (7, 257),
         (256, 1024),
+        (454, 49),
+        (512, 1),
+        (512, 200),
         (454, 257),
         (454, 10240),
         (511, 2049),

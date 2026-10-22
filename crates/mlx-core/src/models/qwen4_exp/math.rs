@@ -1299,7 +1299,7 @@ pub(super) fn route_sort(
     ids: &MxArray,
     experts: usize,
 ) -> Result<Option<(MxArray, MxArray, MxArray)>> {
-    if !(256..=65536).contains(&ids.size()?)
+    if !(1..=65536).contains(&ids.size()?)
         || experts == 0
         || experts > 1024
         || ids.dtype()? != DType::Uint32
