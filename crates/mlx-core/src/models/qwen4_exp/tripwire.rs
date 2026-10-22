@@ -414,7 +414,7 @@ mod tests {
     /// behind them) trips against the fastest window; the re-wire step and
     /// healthy steps do not.
     ///
-    /// MUTATION (M-M6-seed): `reference` returns `None` for a row count with
+    /// MUTATION: `reference` returns `None` for a row count with
     /// fewer than `MIN_SAMPLES` samples; the thrash runs on.
     #[test]
     fn a_first_turn_thrash_trips_against_the_prompts_fastest_window() {
@@ -467,9 +467,9 @@ mod tests {
     /// pack refaulting behind them trip, and one pass under the read floor
     /// breaks their streak.
     ///
-    /// MUTATION (M-M6F2-reads): a seed-judged slow pass counts without
+    /// MUTATION: a seed-judged slow pass counts without
     /// `SEED_PASS_READ` of reads; the contended passes trip at pass eight.
-    /// MUTATION (M-M6F2-record): a seed-judged slow pass without reads is
+    /// MUTATION: a seed-judged slow pass without reads is
     /// not recorded; the row count never owns its median.
     #[test]
     fn contended_passes_judged_against_the_seed_learn_their_own_pace() {

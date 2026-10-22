@@ -106,10 +106,9 @@ impl HostMemory {
     }
 }
 
-/// The residency decision as a byte budget for mapped banks. Today every
-/// routed bank maps or none does; a per-layer split can read the same
-/// budget.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The residency decision as a byte budget for mapped banks: every routed
+/// bank maps or none does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct MappedGate {
     pub bank_budget: u64,
     pub non_reclaimable: u64,
@@ -174,8 +173,7 @@ pub(super) fn plan(hot_bytes: u64) -> Result<Plan> {
 /// banks while the MTP head is attached) and LRU room. Routed experts are
 /// not in it; neither is the rest of the auxiliary inventory, whose rows
 /// stream through the LRU room (measured: a mapped process with the MTP
-/// checkpoint attached and MTP off holds 7.8-8.3 GiB in all, where an 8 GiB
-/// auxiliary term modeled 13 GiB and refused the desktop the pack ran on).
+/// checkpoint attached and MTP off holds 7.8-8.3 GiB in all).
 pub(super) fn mapped_desired(dense_bytes: u64) -> u64 {
     dense_bytes
         .saturating_add(MAPPED_LRU_BYTES)
@@ -521,14 +519,13 @@ pub(super) fn host_memory() -> Result<HostMemory> {
     unsafe {
         mach_port_deallocate(mach_task_self_, host);
     }
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if ok != 0 || page_size <= 0 {
+    let page = crate::array::page_size() as u64;
+    if ok != 0 {
         return Err(Error::from_reason(
             "Cannot establish Qwen4 larger-cache memory headroom",
         ));
     }
     let stats = unsafe { stats.assume_init() };
-    let page = page_size as u64;
     Ok(HostMemory {
         physical: physical_memory()?,
         free: u64::from(stats.free_count) * page,
@@ -644,7 +641,7 @@ mod tests {
         host
     }
 
-    /// The desktop of 2026-10-19 15:47 (vm_stat): the same free memory with
+    /// A 128 GiB desktop (vm_stat): the same free memory with
     /// a 40 GiB anonymous hog beside it must send the pack to slots, and
     /// free memory alone must not admit it.
     #[test]
@@ -689,7 +686,7 @@ mod tests {
             "live anonymous memory decides, not free"
         );
         assert!(mapped_gate(&hog, need, 0).bank_budget < gate.bank_budget - gib(39.0));
-        // M3's 20 GiB hog (det-hog-1: 1.06 TB of re-reads) is refused too.
+        // A 20 GiB hog beside it is refused too.
         let hog20 = coherent(HostMemory {
             free: gib(57.3),
             anonymous: gib(20.1) + gib(20.0),
@@ -727,7 +724,7 @@ mod tests {
         }
     }
 
-    /// MUTATION (M-M6-gate): `mapped_desired` adds an 8 GiB auxiliary term
+    /// MUTATION: `mapped_desired` adds an 8 GiB auxiliary term
     /// again; the desktop below is refused at 40 GiB live.
     #[test]
     fn mapped_budget_holds_dense_banks_and_lru_room_and_maps_this_desktop() {
@@ -745,8 +742,7 @@ mod tests {
         // GiB of dense banks (78.03 GiB hot set minus the pack), a 1 GiB KV
         // pool. The anonymous need is 7 + 1 = 8 GiB, so the pack maps while
         // live non-reclaimable memory stays at or below 128 - 4 - 73.15 - 8 =
-        // 42.85 GiB (the desktop idled at 34-42 GiB on 2026-10-19; the 8 GiB
-        // auxiliary term and the 6 GiB margin drew the line at 35.85).
+        // 42.85 GiB (the desktop idles at 34-42 GiB).
         let need = mapped_desired(gib(4.9)) + (1 << 30);
         assert_eq!(need, 8 << 30);
         let desktop = |live: f64| {
@@ -789,7 +785,7 @@ mod tests {
         assert_eq!(plan.budget, super::super::weights::CACHE_BYTES);
     }
 
-    /// Request 1 of M5-hog40-during-1 started 13 ms after request 0 ended,
+    /// Request 1 started 13 ms after request 0 ended,
     /// while 23 GiB of the pack were still wired: the budget read 20 GiB
     /// where the unwired host gave 27-29. The plan sizes from the sample
     /// after wired has fallen and settled, not from the first one.
@@ -900,7 +896,7 @@ mod tests {
     }
 
     /// The host a mapped turn left when it tripped ten tokens into its
-    /// decode beside a 40 GiB touching hog (M6F-hog40-during-1, 2026-10-19):
+    /// decode beside a 40 GiB touching hog:
     /// the unwired pack showed 68 GiB of free plus file cache and the
     /// bootstrap rule handed out 48 GiB of slots, while 15 GiB of pages
     /// stood in swap and the pool held the hog's incompressible pages; when
@@ -912,7 +908,7 @@ mod tests {
     /// snapshot (free plus file plus purgeable minus a margin, above the
     /// rule's own 20 GiB reserve).
     ///
-    /// MUTATION (M-M6-room): `slot_fallback_plan_with` sizes from the plain
+    /// MUTATION: `slot_fallback_plan_with` sizes from the plain
     /// `available()` again; the hogged host gets 48 GiB of slots.
     #[test]
     fn slot_fallback_budget_counts_the_compressed_and_swapped_debt() {
@@ -963,7 +959,7 @@ mod tests {
             size(swamped, gib(5.0)),
             (gib(5.0) + super::super::weights::MAX_READ_BYTES * 3 + ((1 << 30) - 1)) >> 30 << 30
         );
-        // This desktop at 22:22 the same day (host_statistics64 read): 1.4
+        // The same desktop, quiet (host_statistics64 read): 1.4
         // GiB of pool inflation and 9.0 GiB of old swap cost the rule 5 GiB
         // of slots against the plain count.
         let quiet = coherent(HostMemory {
@@ -1353,9 +1349,9 @@ fn flash_next_scheduled_state_budget_holds_one_long_mtp_owner() {
 /// Two Flash Next owners parked right after a 1024-row prefill slice, with
 /// 1023 trusted rows and the seed waiting and nothing drafted: each keeps
 /// 1024 BF16 hidden rows of 20,480 B beside its recurrent row and no draft
-/// K/V. A budget sized to the draft-K/V figure those rows used to be charged
-/// at admits a third owner only after reclaim.
-/// MUTATION (M-INT2-rows): charge waiting rows as draft K/V in
+/// K/V. A budget sized to the draft-K/V figure for those rows admits a third
+/// owner only after reclaim.
+/// MUTATION: charge waiting rows as draft K/V in
 /// `draft_owner_bytes`; `held` falls to the K/V figure, the third owner fits
 /// and the AfterReclaim assertion fails.
 #[test]

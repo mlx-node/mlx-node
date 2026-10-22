@@ -12,12 +12,12 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use napi::{Error, Result};
+use napi::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
-use super::weights::Weight;
+use super::weights::{Weight, err};
 use crate::array::{DType, MxArray};
 
 /// Seeds the source fingerprint that names the pack dir: a new value
@@ -31,16 +31,12 @@ pub(super) const MAPPED_DIR_PREFIX: &str = ".mlx-qwen4-mapped-v3-";
 /// A mapped dir's stable lock file: SH while a model reads or builds the
 /// pack, EX by an evictor. Never renamed or unlinked (flock needs the inode).
 const MAPPED_LOCK: &str = "lock";
-/// Per-expert chunk dirs of the retired format, which older releases still
-/// write (up to 96 GiB each). Nothing reads them; the sweep removes them.
+/// Per-expert chunk dirs of the previous pack format (up to 96 GiB each).
+/// Nothing reads them here; the sweep removes them.
 const RETIRED_CHUNK_PREFIX: &str = ".mlx-qwen4-packed-v2-";
-/// The retired format's ledger: every older build holds it EX while writing
-/// a chunk; builds after v0.0.16 also hold it SH while reading one.
+/// The previous format's ledger: a writer holds it EX per chunk; a reader
+/// holds it SH or nothing at all, so unlocked never proves unread.
 const RETIRED_CHUNK_LOCK: &str = "budget";
-
-fn err(e: impl std::fmt::Display) -> Error {
-    Error::from_reason(e.to_string())
-}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub(super) struct ArrayInfo {
@@ -110,12 +106,12 @@ fn packed_identity(files: &[(PathBuf, fs::Metadata)]) -> String {
 /// reader that inspects text. The hex twins are authoritative on parse; a
 /// present-but-corrupt hex field is a corrupt manifest (Err), never license
 /// to trust the lossy line.
-fn packed_hex_encode(bytes: &[u8]) -> Vec<u8> {
+pub(super) fn packed_hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = Vec::with_capacity(bytes.len() * 2);
+    let mut out = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
-        out.push(HEX[(byte >> 4) as usize]);
-        out.push(HEX[(byte & 0x0f) as usize]);
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
 }
@@ -259,12 +255,11 @@ fn pack_manifest(canonical: &[PathBuf]) -> Vec<u8> {
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_default();
     let mut manifest = b"path_hex=".to_vec();
-    manifest.extend_from_slice(&packed_hex_encode(base.as_os_str().as_bytes()));
+    manifest.extend_from_slice(packed_hex_encode(base.as_os_str().as_bytes()).as_bytes());
     manifest.push(b'\n');
     manifest.extend_from_slice(b"mount_hex=");
-    manifest.extend_from_slice(&packed_hex_encode(
-        mount_point(&base).as_os_str().as_bytes(),
-    ));
+    manifest
+        .extend_from_slice(packed_hex_encode(mount_point(&base).as_os_str().as_bytes()).as_bytes());
     manifest.push(b'\n');
     let mut raw = Vec::new();
     if !base.as_os_str().as_bytes().contains(&b'\n') {
@@ -275,7 +270,7 @@ fn pack_manifest(canonical: &[PathBuf]) -> Vec<u8> {
     for path in canonical {
         let rel = path.strip_prefix(&base).unwrap_or(path);
         manifest.extend_from_slice(b"file_hex=");
-        manifest.extend_from_slice(&packed_hex_encode(rel.as_os_str().as_bytes()));
+        manifest.extend_from_slice(packed_hex_encode(rel.as_os_str().as_bytes()).as_bytes());
         manifest.push(b'\n');
         if !rel.as_os_str().as_bytes().contains(&b'\n') {
             raw.extend_from_slice(b"file=");
@@ -684,11 +679,10 @@ fn sweep_packed_cache(parent: &Path, current: &Path) {
                 continue;
             }
             if is_retired_chunk_dir(&dir) {
-                // A v0.0.16 process takes no lock and stamps nothing on
-                // reads, and stops writing once its ledger is full, so an
-                // idle dir can be removed under it: its reads then miss and
-                // re-import, never see torn data. A dir with no `budget` yet
-                // has nothing to lock; only its fresh mtime keeps it.
+                // A reader of this format may hold no lock and stamps nothing, and a
+                // writer stops once its ledger is full, so an idle dir can be removed
+                // under it: its reads then miss and re-import, never see torn data. A dir
+                // with no `budget` yet has nothing to lock; only its fresh mtime keeps it.
                 if packed_dir_idle(&dir) {
                     locked_remove(&dir, RETIRED_CHUNK_LOCK, "retired chunk format", |d| {
                         is_real_dir(d) && packed_dir_idle(d)
@@ -1286,13 +1280,19 @@ mod tests {
         let mut lines = manifest.lines();
         assert_eq!(
             lines.next().unwrap(),
-            format!("path_hex={}", hex(source_dir.as_os_str().as_bytes())),
+            format!(
+                "path_hex={}",
+                packed_hex_encode(source_dir.as_os_str().as_bytes())
+            ),
             "the authoritative hex record leads the manifest:\n{manifest}"
         );
         let mount = mount_point(source_dir);
         assert_eq!(
             lines.next().unwrap(),
-            format!("mount_hex={}", hex(mount.as_os_str().as_bytes())),
+            format!(
+                "mount_hex={}",
+                packed_hex_encode(mount.as_os_str().as_bytes())
+            ),
             "the source's mount point follows it:\n{manifest}"
         );
         assert!(is_mounted(&mount), "{} must be mounted", mount.display());
@@ -1525,17 +1525,13 @@ mod tests {
         panic!("child never acquired {}", path.display());
     }
 
-    fn hex(bytes: &[u8]) -> String {
-        String::from_utf8(packed_hex_encode(bytes)).unwrap()
-    }
-
     /// A manifest naming `source_dir/x.gguf`, recorded on `mount`.
     fn manifest_naming(source_dir: &Path, mount: &Path) -> String {
         format!(
             "path_hex={}\nmount_hex={}\nfile_hex={}\nend=1\n",
-            hex(source_dir.as_os_str().as_bytes()),
-            hex(mount.as_os_str().as_bytes()),
-            hex(b"x.gguf")
+            packed_hex_encode(source_dir.as_os_str().as_bytes()),
+            packed_hex_encode(mount.as_os_str().as_bytes()),
+            packed_hex_encode(b"x.gguf")
         )
     }
 
@@ -1645,7 +1641,7 @@ mod tests {
         fs::write(&source, b"weights").unwrap();
         let cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
         let identity = cache.identity().unwrap();
-        // v0.0.16 writes a `budget` ledger and `.pack` chunks, no manifest.
+        // The chunk format writes a `budget` ledger and `.pack` chunks, no manifest.
         let ledger = 64_u64.to_le_bytes();
         let written: [(&str, &[u8]); 2] = [(RETIRED_CHUNK_LOCK, &ledger), ("x.pack", &[0; 64])];
         let released = chunk_fixture(&parent, &"a".repeat(64), &written, true);
@@ -1657,7 +1653,7 @@ mod tests {
             manifest_source(&same_source).unwrap(),
             Source::Present(identity.to_owned())
         );
-        // origin/main writes the manifest at load and `budget` only with its
+        // The chunk format writes the manifest at load and `budget` only with its
         // first chunk, so a dir it never wrote to has no ledger to lock.
         let stub_files: [(&str, &[u8]); 1] = [(".manifest", b"path=/gone\nfile=x.gguf\n")];
         let stub = chunk_fixture(&parent, &"e".repeat(64), &stub_files, true);
@@ -1676,7 +1672,7 @@ mod tests {
         );
         assert!(
             !released.exists(),
-            "an idle manifest-less dir v0.0.16 wrote is removed"
+            "an idle manifest-less chunk dir is removed"
         );
         assert!(
             !same_source.exists(),
@@ -1765,8 +1761,8 @@ mod tests {
             '4',
             format!(
                 "path_hex={}\nfile_hex={}\nend=1\n",
-                hex(base.as_os_str().as_bytes()),
-                hex(b"x.gguf")
+                packed_hex_encode(base.as_os_str().as_bytes()),
+                packed_hex_encode(b"x.gguf")
             ),
         );
         assert_eq!(manifest_source(&away).unwrap(), Source::Unreachable);
@@ -1814,9 +1810,9 @@ mod tests {
         let base = temp.0.canonicalize().unwrap();
         let parent = base.join("cache");
         fs::create_dir(&parent).unwrap();
-        let path = hex(base.as_os_str().as_bytes());
-        let mount = hex(mount_point(&base).as_os_str().as_bytes());
-        let file = hex(b"x.gguf");
+        let path = packed_hex_encode(base.as_os_str().as_bytes());
+        let mount = packed_hex_encode(mount_point(&base).as_os_str().as_bytes());
+        let file = packed_hex_encode(b"x.gguf");
         let corrupt = [
             (
                 '1',
@@ -1953,7 +1949,11 @@ mod tests {
         let (cache, dir) = split_pack(&temp);
         let manifest = String::from_utf8(cache.manifest().to_vec()).unwrap();
         assert!(manifest.ends_with("\nend=2\n"), "{manifest}");
-        let dropped = manifest.replacen(&format!("file_hex={}\n", hex(b"b.gguf")), "", 1);
+        let dropped = manifest.replacen(
+            &format!("file_hex={}\n", packed_hex_encode(b"b.gguf")),
+            "",
+            1,
+        );
         assert_ne!(dropped, manifest);
         let (reason, kept) = sweep_with_manifest(&dir, dropped.as_bytes());
         assert!(

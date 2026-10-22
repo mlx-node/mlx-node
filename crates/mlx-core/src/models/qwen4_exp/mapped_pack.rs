@@ -14,12 +14,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use napi::{Error, Result};
+use napi::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use super::packed_cache::{self, ArrayInfo, Header, VerifiedChunk};
+use super::weights::err;
 use crate::array::{DType, Mmap, MxArray};
 
 /// Apple page size: every section offset and length is a multiple, so a
@@ -32,10 +33,6 @@ const BUILD_GROUP: usize = 16;
 const VERIFY_CHUNK: usize = 8 << 20;
 const STAMP_EVERY: Duration = Duration::from_secs(5);
 
-fn err(e: impl std::fmt::Display) -> Error {
-    Error::from_reason(e.to_string())
-}
-
 fn round_up(n: u64) -> u64 {
     n.div_ceil(PAGE) * PAGE
 }
@@ -47,10 +44,6 @@ fn element_bytes(dtype: &str) -> Option<u64> {
         "U8" | "I8" => Some(1),
         _ => None,
     }
-}
-
-fn hex(digest: &[u8]) -> String {
-    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -381,7 +374,7 @@ fn verify_sections(file: &File, header: &MappedHeader) -> Result<()> {
             at += n as u64;
             remaining -= n as u64;
         }
-        if hex(&hasher.finalize()) != s.sha256 {
+        if packed_cache::packed_hex_encode(&hasher.finalize()) != s.sha256 {
             return Err(err(format!(
                 "Mapped pack section checksum mismatch in {} ({})",
                 header.name, s.dtype
@@ -549,7 +542,7 @@ fn write_file(site: &Site<'_>, staging: &File, source: &dyn ExpertSource) -> Res
         start += count;
     }
     for (section, hasher) in sections.iter_mut().zip(hashers) {
-        section.sha256 = hex(&hasher.finalize());
+        section.sha256 = packed_cache::packed_hex_encode(&hasher.finalize());
     }
     let header = MappedHeader {
         identity: site.identity.into(),
@@ -1071,7 +1064,10 @@ mod tests {
                 assert_eq!(expected[s].len() as u64, payload);
                 let got = section_bytes(&path, section, payload);
                 assert_eq!(got, expected[s], "{} section {s} bytes", source.name);
-                assert_eq!(hex(&Sha256::digest(&got)), section.sha256);
+                assert_eq!(
+                    packed_cache::packed_hex_encode(&Sha256::digest(&got)),
+                    section.sha256
+                );
                 // A range read returns the same bytes the file holds.
                 let range = file.read_range(5, 9).unwrap();
                 let rec = section.record_bytes as usize;

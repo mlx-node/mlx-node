@@ -1387,9 +1387,9 @@ mod tests {
     /// affine expert GEMV refuses) is built with f32 sides once, and its
     /// gather keeps the bits of the f16-sided bank it replaces; the down bank
     /// keeps f16 sides for the GEMV, and the estimate is the built bytes.
-    /// MUTATIONS: M-M1-f16 (`quantize_q8` keeps f16 sides) -> the gate_up
-    /// dtype assertion; M-M1-estimate (9/8 bytes for f32 sides) -> the bytes;
-    /// M-M1-bits (`quantize_q8` quantizes at the side dtype) -> `rows=10`.
+    /// MUTATIONS: `quantize_q8` keeps f16 sides -> the gate_up dtype
+    /// assertion; 9/8 bytes for f32 sides -> the bytes; `quantize_q8`
+    /// quantizes at the side dtype -> `rows=10`.
     #[test]
     fn mtp_gate_up_bank_holds_f32_sides_with_the_f16_gather_bits() {
         if !crate::engine::persistence::compiled_forward_backend_available() {
@@ -1460,9 +1460,8 @@ mod tests {
     /// The f32 sides need more live headroom than the f16 layout: a refused
     /// f32 build builds the f16 one once instead of declining the draft banks,
     /// and declines them only when that is refused too.
-    /// MUTATIONS: M-M1-live (no f16 retry) -> "the f32 gate_up staging";
-    /// M-M1-live-any (the retry for any layout) ->
-    /// `failed_second_mtp_bank_leaves_no_partial_bank`.
+    /// MUTATIONS: no f16 retry -> "the f32 gate_up staging"; the retry for
+    /// any layout -> `failed_second_mtp_bank_leaves_no_partial_bank`.
     #[test]
     fn refused_f32_draft_banks_fall_back_to_the_f16_layout() {
         let (experts, _, _cleanup) = real_shape_mtp_experts();
@@ -1527,7 +1526,7 @@ mod tests {
         }
     }
 
-    /// T3b. The load keeps the f16 retry: a host that refuses the f32
+    /// The load keeps the f16 retry: a host that refuses the f32
     /// gate_up staging gets the f16 layout, one that refuses both loads
     /// without draft banks.
     #[test]

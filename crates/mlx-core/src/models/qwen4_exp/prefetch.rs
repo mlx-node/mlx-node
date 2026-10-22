@@ -8,13 +8,13 @@
 //! needs is behind anything it does not. The workers read at the default
 //! I/O tier: a throttled or utility-tier read is paced behind other readers
 //! but its pages are speculative, and 8 % of the pack survived such a walk
-//! against a full page cache (P5/L2 Q3), so a lower tier would only read the
+//! against a full page cache, so a lower tier would only read the
 //! pack for nothing. They yield to the model's row reads instead: while
 //! embedding or PLE rows are queued for the reader threads or read on the
 //! model thread, a worker waits between two chunks. One small read behind
 //! eight 4 MiB reads in the SSD queue costs milliseconds, and a cold
 //! window's 2,000 inline row reads then held layer 0 back until the stream
-//! was over (P5/L2 DIAG2: layer 0 began 6 s into a 7.1 s window). A chunk
+//! was over (layer 0 began 6 s into a 7.1 s window). A chunk
 //! that is already resident is skipped (one mincore per file, before its
 //! reads), so a partly evicted pack costs its holes, and every byte the
 //! stream asks for goes through a worker's own read with kernel read-ahead
@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use crate::array::{Mmap, page_size};
 
 /// Reader threads per mapped store. Buffered 4 MiB reads reach the SSD's
-/// rate at queue depth 8 (12.3 of 12.6 GiB/s measured, P5/L2 Q2); more
+/// rate at queue depth 8 (12.3 of 12.6 GiB/s measured); more
 /// adds nothing.
 pub(super) const WORKERS: usize = 8;
 /// Bytes per `pread`, with kernel read-ahead off: a worker checks `stop`
@@ -81,7 +81,7 @@ impl Issue for Pread {
         // Kernel read-ahead would issue I/O past the last chunk a stop or a
         // pending row allows, and reports pages in flight to mincore as in
         // core; eight workers reach the SSD's rate without it (12.31 against
-        // 12.33 GiB/s, P5/L2 streamprobe).
+        // 12.33 GiB/s).
         // SAFETY: the descriptor stays open for the mapping's lifetime and
         // F_RDAHEAD only sets its read-ahead policy.
         if unsafe { libc::fcntl(map.file().as_raw_fd(), libc::F_RDAHEAD, 0) } != 0 {
@@ -132,8 +132,7 @@ impl Issue for Pread {
 /// the same file reports the pages the kernel's read-ahead has in flight as
 /// in core: a mincore per chunk skipped a third of an evicted pack unread
 /// (6,191 of 18,809 chunks) and left it 54 of 73 GiB resident; one sweep
-/// per file before its reads skipped nothing and left every page resident
-/// (P5/L2 streamprobe, modes mincore / bitmap).
+/// per file before its reads skipped nothing and left every page resident.
 fn cold_chunks(map: &Mmap) -> Vec<bool> {
     let page = page_size();
     let chunks = map.len().div_ceil(CHUNK);
@@ -480,7 +479,7 @@ mod tests {
     /// is observable with one worker; several workers complete out of
     /// order); a start while it runs adds nothing; a later stream visits
     /// every file again (the read itself skips the resident chunks).
-    /// MUTATION (M-P5-order): a worker takes `files.len() - 1 - i` -> "one
+    /// MUTATION: a worker takes `files.len() - 1 - i` -> "one
     /// worker: every file once, in layer order" fails.
     #[test]
     fn a_stream_fetches_the_files_in_layer_order_once() {
@@ -536,7 +535,7 @@ mod tests {
     /// Only the chunks that are not resident are read: a file with chunks 1
     /// and 3 in the page cache has exactly those two skipped, costs disk
     /// reads for the two cold ones and ends fully resident.
-    /// MUTATION (M-P5-skip): drop the resident-chunk skip in `Pread::fetch`
+    /// MUTATION: drop the resident-chunk skip in `Pread::fetch`
     /// -> no chunk is skipped and "the resident chunks were read again"
     /// fails.
     #[test]
@@ -572,7 +571,7 @@ mod tests {
     /// A resident file is scanned under the same contract as a cold one: a
     /// fetch with `stop` already set skips nothing, and one with rows
     /// pending waits before its first chunk.
-    /// MUTATION (M-P5-resident-stop): check `stop` and the rows after the
+    /// MUTATION: check `stop` and the rows after the
     /// resident-chunk skip instead of before it -> "a stopped fetch scanned
     /// the resident chunks" fails.
     #[test]
@@ -620,7 +619,7 @@ mod tests {
     /// the pacer releases it twice, one chunk at a time, and sets the stop
     /// while it is held, so the stop lands after exactly two chunks
     /// whatever the scheduler does to the threads.
-    /// MUTATION (M-P5-readahead): drop the F_RDAHEAD fcntl in `Pread::fetch`
+    /// MUTATION: drop the F_RDAHEAD fcntl in `Pread::fetch`
     /// -> the kernel reads ahead of the last chunk and "the kernel read
     /// ahead past the stop" fails.
     #[test]
@@ -688,7 +687,7 @@ mod tests {
     /// Dropping the pool (the mapped-to-slots switch, unload) returns within
     /// one chunk: the worker sees `stop` between two chunks of a file, and
     /// the real read loop reads nothing once `stop` is set.
-    /// MUTATION (M-P5-nostop): `Pread::fetch` ignores `stop` -> the stopped
+    /// MUTATION: `Pread::fetch` ignores `stop` -> the stopped
     /// fetch reads the whole file and "a stopped fetch reads nothing" fails.
     #[test]
     fn drop_stops_the_stream_within_one_chunk() {
@@ -732,7 +731,7 @@ mod tests {
     /// The stream yields to the model's row reads: while rows are pending
     /// no chunk is read, the reads resume when the count drops to zero,
     /// and a pool dropped while it yields still returns at once.
-    /// MUTATION (M-P5-yield): drop the wait on `rows` in `Pread::fetch` ->
+    /// MUTATION: drop the wait on `rows` in `Pread::fetch` ->
     /// "the stream read on while rows were pending" fails.
     #[test]
     fn the_stream_yields_to_pending_row_reads() {

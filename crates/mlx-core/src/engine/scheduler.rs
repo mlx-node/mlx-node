@@ -2210,7 +2210,7 @@ mod tests {
             rows(&scheduler.build_plan()),
             [(1, StepKind::Decode, 1), (2, StepKind::Prefill, 6219)]
         );
-        // Two warm turns keep today's rule: 1024 each, 2048 per step.
+        // Two warm turns: 1024 each, 2048 per step.
         let mut scheduler = Scheduler::<_, (), ()>::new(4, 2048).unwrap();
         scheduler
             .running

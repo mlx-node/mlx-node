@@ -588,12 +588,12 @@ impl Store {
         Ok(true)
     }
 
-    /// Layer `layer` of a pass starts. While the pack streams, the banks of
-    /// the layers already run are touched every `KEEP_WIRED_EVERY` so the
-    /// driver keeps them wired through the long first window: it unwires a
-    /// bank idle for ~1.15 s, and re-wiring all of them at the next window
-    /// cost about a second with the GPU idle. Layers past `layer` are not
-    /// touched: their pages may still be cold.
+    /// Layer `layer` of a pass starts. While the pack streams or a prefill
+    /// group runs, the banks of the layers already run are touched every
+    /// `KEEP_WIRED_EVERY` so the driver keeps them wired through the long
+    /// first window: it unwires a bank idle for ~1.15 s, and re-wiring all of
+    /// them at the next window cost about a second with the GPU idle. Layers
+    /// past `layer` are not touched: their pages may still be cold.
     pub(in super::super) fn keep_wired(&mut self, layer: usize, main: bool) -> Result<()> {
         self.keep_wired_at(Instant::now(), layer, main)
     }
@@ -1803,9 +1803,8 @@ mod tests {
     /// build would take: below a 22.66 GiB slot allowance, beside a mapped
     /// plan that charged the f16 layout, or with only the f16 staging left.
     /// The reserve never holds less than the build.
-    /// MUTATIONS: M-M1-narrow (only the f32 layout) -> 22 GiB; M-M1-mapped
-    /// (the slot allowance beside a mapped charge) -> the f16 charge;
-    /// M-M1-room (no f16 retry) -> the f16 staging.
+    /// MUTATIONS: only the f32 layout -> 22 GiB; the slot allowance beside a
+    /// mapped charge -> the f16 charge; no f16 retry -> the f16 staging.
     #[test]
     fn draft_banks_take_f32_sides_only_where_they_fit() {
         let Some((mut store, _)) = draft_bank_store(None) else {
@@ -1866,19 +1865,12 @@ mod tests {
     /// QWEN4_EXP_REAL_INPUTS=<inputs.json> cargo test -p mlx-core --lib
     /// real_fallback_slots_beside_draft_banks -- --ignored --nocapture`
     #[test]
-    #[ignore]
+    #[ignore = "real checkpoint: QWEN4_EXP_REAL_MODEL, QWEN4_EXP_REAL_INPUTS, QWEN4_EXP_REAL_AUX; --test-threads=1"]
     fn real_fallback_slots_beside_draft_banks() {
         use super::super::super::{auxiliary, decoder::Decoder, gguf, memory::HostMemory};
-        let (Ok(model), Ok(aux), Ok(inputs)) = (
-            std::env::var("QWEN4_EXP_REAL_MODEL"),
-            std::env::var("QWEN4_EXP_REAL_AUX"),
-            std::env::var("QWEN4_EXP_REAL_INPUTS"),
-        ) else {
-            eprintln!(
-                "real_fallback_slots_beside_draft_banks: QWEN4_EXP_REAL_MODEL / QWEN4_EXP_REAL_AUX / QWEN4_EXP_REAL_INPUTS not set"
-            );
-            return;
-        };
+        let model = std::env::var("QWEN4_EXP_REAL_MODEL").expect("QWEN4_EXP_REAL_MODEL");
+        let aux = std::env::var("QWEN4_EXP_REAL_AUX").expect("QWEN4_EXP_REAL_AUX");
+        let inputs = std::env::var("QWEN4_EXP_REAL_INPUTS").expect("QWEN4_EXP_REAL_INPUTS");
         let cases: serde_json::Value =
             serde_json::from_slice(&std::fs::read(inputs).unwrap()).unwrap();
         let prompt: Vec<u32> = cases
@@ -1961,10 +1953,9 @@ mod tests {
             "every layer built its slots"
         );
         assert!(decoder.weights.cache_bytes <= decoder.weights.cache_limit);
+        assert_eq!(mapped, fallback, "the slot turn gives the mapped text");
         eprintln!(
-            "mapped {mapped:?}\nslots  {fallback:?}\n{} of {} tokens equal; slot bytes {:.3} GiB, cache {:.3} GiB",
-            mapped.iter().zip(&fallback).filter(|(a, b)| a == b).count(),
-            mapped.len(),
+            "slot bytes {:.3} GiB, cache {:.3} GiB",
             decoder.weights.slot_bytes as f64 / (1u64 << 30) as f64,
             decoder.weights.cache_bytes as f64 / (1u64 << 30) as f64
         );
@@ -1978,19 +1969,12 @@ mod tests {
     /// `cargo test -p mlx-core --lib real_slot_load_admits_draft_banks_beside_the_cached_count
     /// -- --ignored --nocapture`
     #[test]
-    #[ignore]
+    #[ignore = "real checkpoint: QWEN4_EXP_REAL_MODEL, QWEN4_EXP_REAL_INPUTS, QWEN4_EXP_REAL_AUX; --test-threads=1"]
     fn real_slot_load_admits_draft_banks_beside_the_cached_count() {
         use super::super::super::{auxiliary, decoder::Decoder, gguf};
-        let (Ok(model), Ok(aux), Ok(inputs)) = (
-            std::env::var("QWEN4_EXP_REAL_MODEL"),
-            std::env::var("QWEN4_EXP_REAL_AUX"),
-            std::env::var("QWEN4_EXP_REAL_INPUTS"),
-        ) else {
-            eprintln!(
-                "real_slot_load_admits_draft_banks_beside_the_cached_count: QWEN4_EXP_REAL_MODEL / QWEN4_EXP_REAL_AUX / QWEN4_EXP_REAL_INPUTS not set"
-            );
-            return;
-        };
+        let model = std::env::var("QWEN4_EXP_REAL_MODEL").expect("QWEN4_EXP_REAL_MODEL");
+        let aux = std::env::var("QWEN4_EXP_REAL_AUX").expect("QWEN4_EXP_REAL_AUX");
+        let inputs = std::env::var("QWEN4_EXP_REAL_INPUTS").expect("QWEN4_EXP_REAL_INPUTS");
         let cases: serde_json::Value =
             serde_json::from_slice(&std::fs::read(inputs).unwrap()).unwrap();
         let prompt: Vec<u32> = cases
@@ -2005,6 +1989,7 @@ mod tests {
             .take(8)
             .map(|t| t.as_u64().unwrap() as u32)
             .collect();
+        let mut first: Option<Vec<u32>> = None;
         for limit in [22u64 << 30, (89u64 << 30) / 4] {
             let gib = limit as f64 / (1u64 << 30) as f64;
             let mut store = Store::open(Path::new(&model)).unwrap();
@@ -2051,8 +2036,12 @@ mod tests {
                 "every layer built its slots"
             );
             assert!(decoder.weights.cache_bytes <= decoder.weights.cache_limit);
+            match &first {
+                None => first = Some(text),
+                Some(first) => assert_eq!(&text, first, "{gib} GiB gives the 22 GiB text"),
+            }
             eprintln!(
-                "{gib} GiB: {text:?}; slot bytes {:.3} GiB, cache {:.3} GiB, peak {:.3} GiB",
+                "{gib} GiB: slot bytes {:.3} GiB, cache {:.3} GiB, peak {:.3} GiB",
                 decoder.weights.slot_bytes as f64 / (1u64 << 30) as f64,
                 decoder.weights.cache_bytes as f64 / (1u64 << 30) as f64,
                 decoder.weights.peak_cache_bytes as f64 / (1u64 << 30) as f64

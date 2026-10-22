@@ -33,7 +33,7 @@ const MAX_HEADER_BYTES: u64 = 16 << 20;
 /// Reader threads for token/PLE rows: 17 random 90 B-2.7 KB reads per token.
 /// A layer-major prefill asks for a whole prompt's rows at once while the
 /// pack stream yields to them: 32 readers finish a 6k prompt's 58,718 rows
-/// in 0.27 s beside the stream, 4 in 1.17 s (P5/C2 M4).
+/// in 0.27 s beside the stream, 4 in 1.17 s.
 const ROW_READERS: usize = 32;
 
 /// Decoded-row LRU and reader-thread counters, shared with `residencyInfo()`.
@@ -77,8 +77,8 @@ impl LookupStats {
     }
 }
 
-fn err(message: impl ToString) -> Error {
-    Error::from_reason(message.to_string())
+pub(super) fn err(e: impl std::fmt::Display) -> Error {
+    Error::from_reason(e.to_string())
 }
 
 #[derive(Clone)]
@@ -495,10 +495,6 @@ pub struct Store {
     /// (vectors, row-kernel calls) of every vector-window projection.
     #[cfg(test)]
     pub(in super::super) vector_windows: Vec<(i64, u64)>,
-    /// Measurement hook: `false` leaves every imported row in its own
-    /// buffer (the pre-fold shape) so a test can time the fold alone.
-    #[cfg(test)]
-    pub(in super::super) fold_rows: bool,
     pub lookup: Arc<LookupStats>,
     pub live: Arc<Live>,
     tripwire: Tripwire,
@@ -635,8 +631,6 @@ impl Store {
             single_row_projections: 0,
             #[cfg(test)]
             vector_windows: Vec::new(),
-            #[cfg(test)]
-            fold_rows: true,
             lookup: Arc::default(),
             live: Arc::default(),
             tripwire: Tripwire::default(),
@@ -1186,11 +1180,7 @@ impl Store {
         // per import to every layer of every decode token (measured 11 us
         // per 2-hit/6-miss lookup, 0.5 ms per token over 48 layers).
         imported.retain(|&(id, _)| self.cache.contains_key(&(name.to_string(), id, 1)));
-        #[cfg(test)]
-        let fold = self.fold_rows;
-        #[cfg(not(test))]
-        let fold = true;
-        if fold && imported.len() > 1 {
+        if imported.len() > 1 {
             let fresh = MxArray::concatenate_many(
                 imported.iter().map(|&(_, slot)| &rows[slot]).collect(),
                 Some(0),
@@ -2257,10 +2247,7 @@ mod cache_tests {
 
     /// A GGUF of one Q5_1 `token_embd.weight` [8, 32]: 24 bytes per row.
     fn rows_gguf(dir: &Path) -> (PathBuf, Vec<u8>) {
-        rows_gguf_n(dir, 8)
-    }
-
-    fn rows_gguf_n(dir: &Path, rows: u32) -> (PathBuf, Vec<u8>) {
+        let rows = 8u32;
         let path = dir.join("rows.gguf");
         let mut b = b"GGUF".to_vec();
         b.extend(3u32.to_le_bytes());
@@ -2290,184 +2277,6 @@ mod cache_tests {
         }
         fs::write(&path, &b).unwrap();
         (path, b)
-    }
-
-    /// What one decode step pays per layer for the window fold: a PLE lookup
-    /// of eight rows where the two unigram heads hit the LRU and six n-gram
-    /// heads miss (the steady-decode shape), timed through the eval of its
-    /// window, with the fold against the pre-fold shape (one buffer per
-    /// row). Prints both medians and the delta scaled to the 48 layers of a
-    /// token. The values are bit-identical across both shapes.
-    #[test]
-    fn decode_row_lookup_fold_cost_per_layer() {
-        let cleanup = Cleanup::new();
-        let dir = cleanup.0.clone();
-        let (path, _) = rows_gguf_n(&dir, 4096);
-        let name = "token_embd.weight";
-        let rounds = 400usize;
-        let mut medians = Vec::new();
-        let mut sums = Vec::new();
-        for fold in [true, false, true, false] {
-            let mut store = Store::open_fixture(&path, Some(&dir)).unwrap();
-            store.fold_rows = fold;
-            let warm = store.lookup_rows(name, &[0, 1]).unwrap();
-            MxArray::eval_arrays(&[&warm]).unwrap();
-            let mut costs = Vec::with_capacity(rounds);
-            let mut sum = 0.0f64;
-            for round in 0..rounds {
-                let m = 2 + round * 6;
-                let ids = [0, 1, m, m + 1, m + 2, m + 3, m + 4, m + 5];
-                let started = std::time::Instant::now();
-                let window = store.lookup_rows(name, &ids).unwrap();
-                MxArray::eval_arrays(&[&window]).unwrap();
-                costs.push(started.elapsed());
-                sum += window
-                    .astype(DType::Float32)
-                    .unwrap()
-                    .to_float32()
-                    .unwrap()
-                    .iter()
-                    .map(|&v| f64::from(v))
-                    .sum::<f64>();
-            }
-            costs.sort_unstable();
-            medians.push((fold, costs[costs.len() / 2], costs[costs.len() * 9 / 10]));
-            sums.push(sum);
-            assert_eq!(store.lookup.misses(), 2 + 6 * rounds as u64);
-        }
-        assert!(sums.windows(2).all(|w| w[0] == w[1]), "{sums:?}");
-        for (fold, median, p90) in &medians {
-            eprintln!(
-                "row lookup (2 hits + 6 misses) fold={fold}: median {median:.1?}, p90 {p90:.1?}"
-            );
-        }
-        let fold = medians.iter().filter(|m| m.0).map(|m| m.1).min().unwrap();
-        let plain = medians.iter().filter(|m| !m.0).map(|m| m.1).min().unwrap();
-        let delta = fold.saturating_sub(plain);
-        eprintln!(
-            "fold delta per lookup {delta:.1?}; x48 layers = {:.1?} per decode token",
-            delta * 48
-        );
-    }
-
-    /// The same measurement on the real model, one process: a 6k turn's 256
-    /// decode steps with the window fold and without it (`fold_rows`), the
-    /// prompt being the pinned R0 "6k" case. Opt-in, needs the checkpoint:
-    /// `QWEN4_EXP_REAL_MODEL=<gguf> QWEN4_EXP_REAL_INPUTS=<inputs.json>
-    /// cargo test -p mlx-core --lib real_6k_turn_fold_cost -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn real_6k_turn_fold_cost() {
-        let (Ok(model), Ok(inputs)) = (
-            std::env::var("QWEN4_EXP_REAL_MODEL"),
-            std::env::var("QWEN4_EXP_REAL_INPUTS"),
-        ) else {
-            eprintln!(
-                "real_6k_turn_fold_cost: QWEN4_EXP_REAL_MODEL / QWEN4_EXP_REAL_INPUTS not set"
-            );
-            return;
-        };
-        let cases: serde_json::Value = serde_json::from_slice(&fs::read(inputs).unwrap()).unwrap();
-        let tokens: Vec<u32> = cases
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|case| case["name"] == "6k")
-            .expect("a 6k case")["tokenIds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t.as_u64().unwrap() as u32)
-            .collect();
-        let store = Store::open(Path::new(&model)).unwrap();
-        let config = super::super::gguf::config(&store).unwrap();
-        let mut decoder = super::super::decoder::Decoder::new(config, store).unwrap();
-        decoder.register_cache_limit();
-        decoder.weights.prepare_mapped_pack().unwrap();
-        decoder.weights.select_mapped_residency(0).unwrap();
-        decoder.weights.prepare_hot().unwrap();
-        decoder.weights.publish_live();
-        decoder.residency_changed();
-        eprintln!(
-            "residency: mapped={} slots={} budget={:.1} GiB window={}",
-            decoder.weights.plan.mapped,
-            decoder.weights.plan.partial_expert_slots,
-            decoder.weights.plan.budget as f64 / (1u64 << 30) as f64,
-            decoder.prefill_chunk_size
-        );
-        let argmax = |logits: &MxArray| -> u32 {
-            let last = logits.shape().unwrap().len() as i32 - 1;
-            logits
-                .argmax(last, Some(false))
-                .unwrap()
-                .item_at_uint32(0)
-                .unwrap()
-        };
-        let steps = 256usize;
-        let mut texts = Vec::new();
-        for fold in [true, false, true, false] {
-            decoder.weights.fold_rows = fold;
-            decoder.reset();
-            // Every arm imports the same rows: the LRU would otherwise hold
-            // the first arm's rows and the later arms would fold nothing.
-            let rows = decoder
-                .weights
-                .window_banks
-                .values()
-                .map(|bank| bank.bytes)
-                .sum::<u64>()
-                + decoder
-                    .weights
-                    .cache
-                    .iter()
-                    .filter(|(key, _)| !decoder.weights.row_bank.contains_key(*key))
-                    .map(|(_, weight)| weight.bytes().unwrap())
-                    .sum::<u64>();
-            let target = decoder.weights.cache_bytes - rows;
-            decoder.weights.evict_to(target).unwrap();
-            assert!(decoder.weights.cache.is_empty(), "the LRU holds rows only");
-            decoder.weights.begin_turn().unwrap();
-            let started = std::time::Instant::now();
-            let mut logits = None;
-            let mut start = 0;
-            while start < tokens.len() {
-                let end = (start + decoder.prefill_slice_size()).min(tokens.len());
-                logits = Some(
-                    decoder
-                        .prefill_chunk(&tokens[start..end], None, end == tokens.len())
-                        .unwrap(),
-                );
-                start = end;
-            }
-            let mut token = argmax(&logits.unwrap());
-            let prefill = started.elapsed();
-            let mut generated = vec![token];
-            let mut times = Vec::with_capacity(steps);
-            for _ in 0..steps {
-                let started = std::time::Instant::now();
-                let logits = decoder.step(token).unwrap();
-                token = argmax(&logits);
-                times.push(started.elapsed());
-                generated.push(token);
-            }
-            let steady = &times[32..];
-            let mean = steady.iter().sum::<std::time::Duration>() / steady.len() as u32;
-            let mut sorted = steady.to_vec();
-            sorted.sort_unstable();
-            eprintln!(
-                "fold={fold}: prefill {prefill:.1?} ({:.0} tok/s), decode steps 32..{steps}: mean {mean:.2?} median {:.2?} -> {:.2} tok/s, lookups {} misses {}",
-                tokens.len() as f64 / prefill.as_secs_f64(),
-                sorted[sorted.len() / 2],
-                1.0 / mean.as_secs_f64(),
-                decoder.weights.lookup.lookups(),
-                decoder.weights.lookup.misses(),
-            );
-            texts.push(generated);
-        }
-        assert!(
-            texts.windows(2).all(|w| w[0] == w[1]),
-            "the fold must not change the greedy text"
-        );
     }
 
     #[test]
@@ -3133,7 +2942,7 @@ mod mapped_tests {
     /// the stream over, a stale pass touches, a pass inside the gap and a
     /// pass that reads no mapped bank (which also leaves the stamp alone) do
     /// not; slot mode never touches and never streams.
-    /// MUTATION (M-P5-touch-cold): drop the `streaming_pass` early return of
+    /// MUTATION: drop the `streaming_pass` early return of
     /// `wire_mapped_banks_at` -> "a stale pass over a cold pack streams
     /// instead of touching" fails.
     #[test]
@@ -3243,7 +3052,7 @@ mod mapped_tests {
     /// layers already run, at most every 700 ms, never the layers ahead
     /// (their pages may be cold), never for a pass that reads no mapped bank,
     /// and not once the stream is over.
-    /// MUTATION (M-P5-keep-wired-all): `keep_wired_at` touches every layer
+    /// MUTATION: `keep_wired_at` touches every layer
     /// -> "layers 6..7 are not bound yet" fails.
     #[test]
     fn keep_wired_touches_only_bound_layers_every_700ms() {
@@ -3303,14 +3112,14 @@ mod mapped_tests {
         );
     }
 
-    /// T5. A layer-major group keeps the banks of the layers already swept
+    /// A layer-major group keeps the banks of the layers already swept
     /// wired after the stream ends, through asynchronous touches whose arrays
     /// wait for the group commit; a warm one-window turn (no group) touches
     /// nothing once the stream is over.
-    /// MUTATION (M-C2-keep-wired-stops): `keep_wired_at` keeps today's
+    /// MUTATION: `keep_wired_at` keeps the
     /// `!streaming_pass` early return -> "the group keeps touching after the
     /// stream" fails.
-    /// MUTATION (M-C2-touch-sync): `touch_banks` evaluates synchronously
+    /// MUTATION: `touch_banks` evaluates synchronously
     /// inside a group -> "asynchronous inside the group" fails.
     #[test]
     fn keep_wired_runs_through_a_group_only_and_touches_async() {
@@ -3379,11 +3188,11 @@ mod mapped_tests {
         assert_eq!(store.touches.len(), 3);
     }
 
-    /// T4 (store). `observe_sweep` holds a trip and applies nothing: the
+    /// `observe_sweep` holds a trip and applies nothing: the
     /// store stays mapped until `apply_held_trip`, which leaves the mapped
     /// path, drops the pack stream and reports the symptom once; without a
     /// held trip it changes nothing.
-    /// MUTATION (M-C2-trip-switch-first, store side): `observe_sweep` calls
+    /// MUTATION (store side): `observe_sweep` calls
     /// `observe_pass_at` -> "held, not applied" fails.
     #[test]
     fn observe_sweep_holds_the_trip_and_apply_held_trip_switches() {
@@ -3492,7 +3301,7 @@ mod mapped_tests {
         (store, gate, charged, estimate)
     }
 
-    /// T2. With the MTP head attached the load builds the draft banks the
+    /// With the MTP head attached the load builds the draft banks the
     /// gate charged before any pack fetch starts, then streams the pack,
     /// whether or not a turn will ever ask for MTP; without the head it only
     /// streams.
@@ -3543,9 +3352,9 @@ mod mapped_tests {
         }
     }
 
-    /// T3a. A load whose host refuses the draft banks still loads: the pack
+    /// A load whose host refuses the draft banks still loads: the pack
     /// streams, the drafts stay on the row reader and nothing retries.
-    /// MUTATION (M-L2c-load-fails-on-decline): `finish_load_with` returns the
+    /// MUTATION: `finish_load_with` returns the
     /// build's error before the stream -> "the declined load still streams"
     /// fails.
     #[test]
@@ -3586,7 +3395,7 @@ mod mapped_tests {
     /// With the MTP head attached, the mapped plan's anonymous need carries
     /// the Q8 draft banks beside the dense banks, the allowance admits that
     /// bank once the plan is mapped, and leaving the mapped path drops it.
-    /// MUTATION (M-INT2-bank): pass `dense` alone to the gate -> the gate sees
+    /// MUTATION: pass `dense` alone to the gate -> the gate sees
     /// the dense bytes without the bank and the first assertion fails.
     #[test]
     fn mapped_plan_charges_the_draft_bank_while_the_mtp_head_is_attached() {
@@ -3903,7 +3712,7 @@ mod mapped_tests {
     /// host, slots built on demand, the reason published) and the same
     /// request's next pass maps its expert ids through slots.
     ///
-    /// MUTATION (M-M6-switch): `observe_pass_at` logs the trip and returns
+    /// MUTATION: `observe_pass_at` logs the trip and returns
     /// `Ok(None)` without `apply_fallback`; the request finishes mapped.
     #[test]
     fn a_trip_observed_mid_turn_leaves_the_mapped_path_at_that_pass() {
@@ -3987,6 +3796,7 @@ mod mapped_tests {
     /// costs microseconds, not the 0.3 ms per token that would show in a
     /// 20 ms decode step. Prints the median and p99 per pass.
     #[test]
+    #[ignore = "release microbenchmark; run with --nocapture"]
     fn per_pass_bookkeeping_costs_microseconds() {
         let mapped = 73u64 << 30;
         let mut wire = Tripwire::default();
@@ -4092,7 +3902,7 @@ mod mapped_tests {
     /// from its next pass) and the SSD baseline of the window in progress
     /// stays.
     ///
-    /// MUTATION (M-M5R2-1b): `apply_fallback` returns `Ok(None)` without
+    /// MUTATION: `apply_fallback` returns `Ok(None)` without
     /// leaving; the store stays mapped.
     #[test]
     fn an_admission_beside_an_open_turn_applies_the_trip_and_keeps_the_window() {
