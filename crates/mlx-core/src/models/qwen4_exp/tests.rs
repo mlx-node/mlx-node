@@ -5149,6 +5149,238 @@ fn expert_prefill_runtime_sizes_match_quantized_matmul() {
     }
 }
 
+/// A window split over slot banks gives the bits of the one-bank run for
+/// every split. The capacities put the remainder group in each class the
+/// old bank-keyed choice took on its own: under 80 rows (per-row GEMV),
+/// under 256 (the host sort's floor), under four rows per slot (MLX's
+/// gather-vector pick), at or above it (NAX), a 200-token window whose first
+/// group crosses MLX's rows-per-expert line, and a 75-token tail. On
+/// a706d8058 every 1024-token split with a remainder under four rows per
+/// slot, every 2000-token split and the 200-token window differ.
+#[test]
+fn slot_groups_match_the_whole_window_bit_for_bit() {
+    use crate::array::DType;
+    use decoder::GroupBanks;
+    use std::collections::HashMap;
+    const E: usize = 512;
+    let (h, m, top) = (256usize, 128usize, 10usize);
+    let probe = MxArray::from_uint32(&[0; 256], &[256]).unwrap();
+    if math::expert_tiles(&probe, 1).unwrap().is_none() {
+        return;
+    }
+    let banks = [
+        quantized_expert_bank(E, m, h, 4, false, 71),
+        quantized_expert_bank(E, m, h, 4, false, 197),
+        quantized_expert_bank(E, h, m, 8, true, 13),
+    ];
+    // Slot banks of `capacity` rows per expert matrix, filled on each lease
+    // by row copies from the full bank: the production shape without a store.
+    struct SlotBanks<'a> {
+        banks: &'a [std::sync::Arc<weights::Weight>; 3],
+        capacity: usize,
+        leases: usize,
+    }
+    impl GroupBanks for SlotBanks<'_> {
+        fn lease(
+            &mut self,
+            experts: &[u32],
+        ) -> Result<Option<([std::sync::Arc<weights::Weight>; 3], Vec<u32>, usize)>> {
+            let mut slot_of = HashMap::new();
+            let mut occupants = Vec::new();
+            for &expert in experts {
+                slot_of.entry(expert).or_insert_with(|| {
+                    occupants.push(expert);
+                    occupants.len() as u32 - 1
+                });
+            }
+            assert!(
+                occupants.len() <= self.capacity,
+                "{} experts for {} slots",
+                occupants.len(),
+                self.capacity
+            );
+            occupants.resize(self.capacity, occupants[0]);
+            let rows = MxArray::from_uint32(&occupants, &[self.capacity as i64]).unwrap();
+            let bank = |w: &weights::Weight| {
+                let take = |a: &MxArray| {
+                    let s = a.shape().unwrap();
+                    a.reshape(&[E as i64, s[0] / E as i64, s[1]])
+                        .unwrap()
+                        .take(&rows, 0)
+                        .unwrap()
+                        .reshape(&[-1, s[1]])
+                        .unwrap()
+                };
+                std::sync::Arc::new(weights::Weight {
+                    values: take(&w.values),
+                    scales: w.scales.as_ref().map(take),
+                    biases: w.biases.as_ref().map(take),
+                    ..w.clone()
+                })
+            };
+            self.leases += 1;
+            Ok(Some((
+                [
+                    bank(&self.banks[0]),
+                    bank(&self.banks[1]),
+                    bank(&self.banks[2]),
+                ],
+                experts.iter().map(|e| slot_of[e]).collect(),
+                self.capacity,
+            )))
+        }
+        fn release(&mut self, _: &MxArray) -> Result<()> {
+            Ok(())
+        }
+    }
+    let routes = |tokens: usize, pool: usize, mut state: u64| -> Vec<u32> {
+        let mut ids = Vec::with_capacity(tokens * top);
+        for _ in 0..tokens {
+            let mut picked: Vec<u32> = Vec::with_capacity(top);
+            while picked.len() < top {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let expert = ((state >> 33) % pool as u64) as u32;
+                if !picked.contains(&expert) {
+                    picked.push(expert);
+                }
+            }
+            ids.extend(picked);
+        }
+        ids
+    };
+    // (tokens, expert pool, remainder-row targets beside 454 and 461 slots)
+    let windows: [(usize, usize, &[usize]); 5] = [
+        (1024, 470, &[40, 120, 600, 1400, 2000]),
+        (2000, 470, &[40, 600]),
+        (200, 470, &[]),
+        (75, 300, &[40]),
+        (20, 470, &[]),
+    ];
+    let mut failures = Vec::new();
+    for (tokens, pool, targets) in windows {
+        let ids = routes(tokens, pool, 0x5eed + tokens as u64);
+        let rows = ids.len();
+        let x = MxArray::from_float32(
+            &(0..tokens * h)
+                .map(|i| ((i * 13 % 251) as f32 - 125.) / 128. + ((i / h) % 17) as f32 / 64.)
+                .collect::<Vec<_>>(),
+            &[1, tokens as i64, h as i64],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let scores = MxArray::from_float32(
+            &(0..rows)
+                .map(|i| (i % 11 + 1) as f32 * 0.0113)
+                .collect::<Vec<_>>(),
+            &[1, rows as i64, 1],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let selected = MxArray::from_uint32(&ids, &[rows as i64]).unwrap();
+        let (out, inverse) =
+            decoder::Decoder::single_slot_group_rows(&x, &selected, &banks, E, top).unwrap();
+        let reference = math::combine_expert_rows(&out, &scores, inverse.as_ref(), top)
+            .unwrap()
+            .to_uint16_native()
+            .unwrap();
+        // The whole-bank bits, for comparison across trees.
+        let digest = reference.iter().fold(0xcbf29ce484222325u64, |d, &v| {
+            (d ^ u64::from(v)).wrapping_mul(0x100000001b3)
+        });
+        eprintln!("slot groups: whole-bank tokens {tokens} rows {rows} digest {digest:016x}");
+        let order = route_plan::expert_order(&ids, E).unwrap();
+        let mut counts = vec![0usize; E];
+        for &e in &ids {
+            counts[e as usize] += 1;
+        }
+        // Rows of the experts past slot `c` in last-use order: the remainder.
+        let remainder = |c: usize| {
+            order[c.min(order.len())..]
+                .iter()
+                .map(|&e| counts[e as usize])
+                .sum::<usize>()
+        };
+        let mut capacities = vec![454usize, 461];
+        for &target in targets {
+            capacities.push(
+                (top..order.len())
+                    .min_by_key(|&c| remainder(c).abs_diff(target))
+                    .unwrap(),
+            );
+        }
+        if tokens == 1024 {
+            let bands: Vec<_> = capacities[2..].iter().map(|&c| (c, remainder(c))).collect();
+            assert!(
+                bands[0].1 <= 80
+                    && (81..256).contains(&bands[1].1)
+                    && (256..4 * bands[2].0).contains(&bands[2].1)
+                    && (256..4 * bands[3].0).contains(&bands[3].1)
+                    && bands[4].1 >= 4 * bands[4].0,
+                "remainder bands {bands:?}"
+            );
+        }
+        if tokens == 200 {
+            // One group whose bank has exactly the window's experts: four
+            // rows per slot, the NAX line of the old bank-keyed choice.
+            capacities.push(order.len());
+        }
+        if tokens == 75 {
+            capacities.push(200);
+        }
+        if tokens == 20 {
+            capacities.push(100);
+        }
+        for capacity in capacities {
+            let mut slots = SlotBanks {
+                banks: &banks,
+                capacity,
+                leases: 0,
+            };
+            let (out, inverse, groups) = if order.len() <= capacity {
+                let (group_banks, local, count) = slots.lease(&ids).unwrap().unwrap();
+                let local = MxArray::from_uint32(&local, &[rows as i64]).unwrap();
+                let (out, inverse) =
+                    decoder::Decoder::single_slot_group_rows(&x, &local, &group_banks, count, top)
+                        .unwrap();
+                (out, inverse, 1)
+            } else {
+                let groups = route_plan::assignment_groups(&ids, &order, E, capacity).unwrap();
+                let (out, inverse) =
+                    decoder::Decoder::grouped_expert_rows(&x, &ids, &groups, top, &mut slots)
+                        .unwrap()
+                        .unwrap();
+                (out, Some(inverse), groups.len())
+            };
+            assert_eq!(slots.leases, groups);
+            let actual = math::combine_expert_rows(&out, &scores, inverse.as_ref(), top)
+                .unwrap()
+                .to_uint16_native()
+                .unwrap();
+            let differing = actual
+                .iter()
+                .zip(&reference)
+                .filter(|(a, b)| a != b)
+                .count();
+            let first = actual.iter().zip(&reference).position(|(a, b)| a != b);
+            let line = format!(
+                "tokens {tokens} rows {rows} distinct {} capacity {capacity} groups {groups} remainder {}: {differing} of {} bf16 values differ, first {first:?}",
+                order.len(),
+                remainder(capacity),
+                reference.len()
+            );
+            eprintln!("slot groups: {line}");
+            if differing > 0 {
+                failures.push(line);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 #[test]
 fn compact_dense_prefill_preserves_affine_rounding_views_and_fallbacks() {
     use crate::array::DType;
@@ -9467,10 +9699,11 @@ fn real_model_group_matches_window_at_a_time_on_a_cold_pack() {
 /// leaves the mapped path, the group finishes plain on slots with the group
 /// base as the fallback position, the pack stream is gone, and no lazy pool
 /// write is discarded. The same decoder then serves the prompt again one
-/// window at a time on the same slots; both texts are printed, not
-/// asserted, because a slot run's text follows its resident expert set.
-/// Needs the real-model env, `D3_EXPECTED`, a cold pack and
-/// `--test-threads=1`.
+/// window at a time on the same slots. Both texts equal the mapped D3
+/// reference: the slot path runs every window's expert groups through the
+/// window's kernel, so layers carried from the mapped sweeps and layers
+/// computed on slots of any count give one bit stream. Needs the real-model
+/// env, `D3_EXPECTED`, a cold pack and `--test-threads=1`.
 #[test]
 #[ignore]
 fn real_model_forced_trip_between_sweeps_switches_after_the_frontier_eval() {
@@ -9660,6 +9893,14 @@ fn real_model_forced_trip_between_sweeps_switches_after_the_frontier_eval() {
         decoder.weights.plan.mapped
     );
     assert!(!group, "the plain rerun runs one window at a time");
+    assert_eq!(
+        tripped, reference,
+        "the tripped run (mapped sweeps 0-5, slots after) gives the mapped reference text"
+    );
+    assert_eq!(
+        plain, reference,
+        "the plain slot rerun at {slots} slots gives the mapped reference text"
+    );
     assert!(
         warnings.iter().any(|w| w.contains("mapped -> slots")),
         "the capture sees the switch's own warning: {warnings:?}"

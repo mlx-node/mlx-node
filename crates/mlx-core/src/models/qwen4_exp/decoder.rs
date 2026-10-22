@@ -17,6 +17,16 @@ mod draft_window;
 #[path = "scheduled_batch.rs"]
 mod scheduled_batch;
 
+/// Slot banks for a window's expert groups: a lease per group, then the
+/// release of that group's output before the slots serve the next group.
+pub(super) trait GroupBanks {
+    fn lease(
+        &mut self,
+        experts: &[u32],
+    ) -> Result<Option<([Arc<super::weights::Weight>; 3], Vec<u32>, usize)>>;
+    fn release(&mut self, output: &MxArray) -> Result<()>;
+}
+
 struct AttentionProjections {
     qg: MxArray,
     k: MxArray,

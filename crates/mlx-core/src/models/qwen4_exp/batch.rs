@@ -1,7 +1,32 @@
 //! Matrix batching for prompt windows and scheduled decode rows. Stateful
 //! attention/PLE preserve each owner's order; stateless HC/MLP share weights.
+use super::super::weights::Weight;
 use super::*;
 use std::collections::BTreeMap;
+
+type Banks = [std::sync::Arc<Weight>; 3];
+
+struct LayerSlots<'a> {
+    decoder: &'a mut Decoder,
+    layer: usize,
+}
+
+impl GroupBanks for LayerSlots<'_> {
+    fn lease(&mut self, experts: &[u32]) -> Result<Option<(Banks, Vec<u32>, usize)>> {
+        self.decoder.check_cancelled()?;
+        let (count, top) = (
+            self.decoder.config.num_experts,
+            self.decoder.config.num_experts_per_tok,
+        );
+        self.decoder
+            .weights
+            .expert_slots(self.layer, count, top, experts)
+    }
+
+    fn release(&mut self, output: &MxArray) -> Result<()> {
+        self.decoder.weights.finish_expert_slots(self.layer, output)
+    }
+}
 
 impl Decoder {
     pub(super) fn resident_experts(
@@ -39,22 +64,9 @@ impl Decoder {
             .broadcast_to(&[tokens, top as i64])?
             .reshape(&[-1])?;
         let source = x.reshape(&[tokens, h as i64])?;
-        if let Some((output, inverse)) = Self::indirect_expert_assignment_rows(
-            &source,
-            &token_rows,
-            &selected.reshape(&[-1])?,
-            &banks,
-            self.config.num_experts,
-        )? {
-            return math::combine_expert_rows(&output, scores, Some(&inverse), top).map(Some);
-        }
-        let input = source.take(&token_rows, 0)?;
-        let (output, inverse) = Self::sorted_expert_assignment_rows(
-            &input,
-            &selected.reshape(&[-1])?,
-            &banks,
-            self.config.num_experts,
-        )?;
+        let ids = selected.reshape(&[-1])?;
+        let (output, inverse) =
+            Self::window_expert_rows(&source, &token_rows, &ids, &banks, self.config.num_experts)?;
         math::combine_expert_rows(&output, scores, inverse.as_ref(), top).map(Some)
     }
 
@@ -62,7 +74,7 @@ impl Decoder {
     pub(in super::super) fn expert_assignment_rows(
         input: &MxArray,
         ids: &MxArray,
-        banks: &[std::sync::Arc<super::super::weights::Weight>; 3],
+        banks: &Banks,
         experts: usize,
     ) -> Result<MxArray> {
         let (output, inverse) = Self::sorted_expert_assignment_rows(input, ids, banks, experts)?;
@@ -72,12 +84,29 @@ impl Decoder {
         }
     }
 
+    /// The rows of one window, or of one slot group of it. `experts` is the
+    /// row count of the bank in hand.
+    fn window_expert_rows(
+        source: &MxArray,
+        token_rows: &MxArray,
+        ids: &MxArray,
+        banks: &Banks,
+        experts: usize,
+    ) -> Result<(MxArray, Option<MxArray>)> {
+        if let Some((out, inverse)) =
+            Self::indirect_expert_assignment_rows(source, token_rows, ids, banks, experts)?
+        {
+            return Ok((out, Some(inverse)));
+        }
+        Self::sorted_expert_assignment_rows(&source.take(token_rows, 0)?, ids, banks, experts)
+    }
+
     // Every window of at least 256 assignments takes the fused 32-row tiles.
     fn indirect_expert_assignment_rows(
         input: &MxArray,
         token_rows: &MxArray,
         ids: &MxArray,
-        banks: &[std::sync::Arc<super::super::weights::Weight>; 3],
+        banks: &Banks,
         experts: usize,
     ) -> Result<Option<(MxArray, MxArray)>> {
         if ids.size()? < 256 || input.dtype()? != DType::BFloat16 {
@@ -100,7 +129,7 @@ impl Decoder {
     fn sorted_expert_assignment_rows(
         input: &MxArray,
         ids: &MxArray,
-        banks: &[std::sync::Arc<super::super::weights::Weight>; 3],
+        banks: &Banks,
         experts: usize,
     ) -> Result<(MxArray, Option<MxArray>)> {
         let rows = ids.size()? as i64;
@@ -135,7 +164,7 @@ impl Decoder {
         } else {
             None
         };
-        let project = |bank: &super::super::weights::Weight, x: &MxArray| -> Result<MxArray> {
+        let project = |bank: &Weight, x: &MxArray| -> Result<MxArray> {
             if let Some(tiles) = &tiles
                 && let Some(out) = bank.tiled_expert_rows(x, &selected, tiles, experts)?
             {
@@ -167,7 +196,7 @@ impl Decoder {
     pub(in super::super) fn single_slot_group_rows(
         x: &MxArray,
         selected: &MxArray,
-        banks: &[std::sync::Arc<super::super::weights::Weight>; 3],
+        banks: &Banks,
         capacity: usize,
         top: usize,
     ) -> Result<(MxArray, Option<MxArray>)> {
@@ -177,17 +206,51 @@ impl Decoder {
             .reshape(&[tokens, 1])?
             .broadcast_to(&[tokens, top as i64])?
             .reshape(&[-1])?;
-        if let Some((out, inverse)) =
-            Self::indirect_expert_assignment_rows(&source, &token_rows, selected, banks, capacity)?
-        {
-            return Ok((out, Some(inverse)));
+        Self::window_expert_rows(&source, &token_rows, selected, banks, capacity)
+    }
+
+    /// A window over more experts than the slots hold: each group of
+    /// `groups` (assignment indices into `ids`) runs on its leased bank.
+    /// Returns the stacked rows and the inverse that restores router order,
+    /// or None once a lease is refused.
+    pub(in super::super) fn grouped_expert_rows(
+        x: &MxArray,
+        ids: &[u32],
+        groups: &[Vec<usize>],
+        top: usize,
+        banks: &mut impl GroupBanks,
+    ) -> Result<Option<(MxArray, MxArray)>> {
+        let source = x.reshape(&[-1, x.shape_at(2)?])?;
+        let mut values = Vec::with_capacity(groups.len());
+        let mut group_inverses = Vec::with_capacity(groups.len());
+        let mut inverse = vec![0i32; ids.len()];
+        let mut output_row = 0;
+        for assignments in groups {
+            let requested: Vec<_> = assignments.iter().map(|&s| ids[s]).collect();
+            let Some((group_banks, slots, count)) = banks.lease(&requested)? else {
+                return Ok(None);
+            };
+            let rows: Vec<_> = assignments.iter().map(|&s| (s / top) as i32).collect();
+            let token_rows = MxArray::from_int32(&rows, &[rows.len() as i64])?;
+            let selected = MxArray::from_uint32(&slots, &[slots.len() as i64])?;
+            let (out, local_inverse) =
+                Self::window_expert_rows(&source, &token_rows, &selected, &group_banks, count)?;
+            banks.release(&out)?;
+            let local_inverse = match local_inverse {
+                Some(inverse) => inverse.astype(DType::Int32)?,
+                None => MxArray::arange(0.0, assignments.len() as f64, None, Some(DType::Int32))?,
+            };
+            group_inverses.push(local_inverse.add(&MxArray::from_int32(&[output_row], &[])?)?);
+            for &slot in assignments {
+                inverse[slot] = output_row;
+                output_row += 1;
+            }
+            values.push(out);
         }
-        Self::sorted_expert_assignment_rows(
-            &source.take(&token_rows, 0)?,
-            selected,
-            banks,
-            capacity,
-        )
+        let out = MxArray::concatenate_many(values.iter().collect(), Some(0))?;
+        let inverse = MxArray::concatenate_many(group_inverses.iter().collect(), Some(0))?
+            .take(&MxArray::from_int32(&inverse, &[inverse.len() as i64])?, 0)?;
+        Ok(Some((out, inverse)))
     }
 
     fn slotted_experts(
@@ -233,29 +296,13 @@ impl Decoder {
         }
         // Leave the experts used nearest the prompt boundary in the slots.
         // Router order is restored below, independently of SSD load order.
-        let linear_plan = x.shape_at(1)? > 8;
-        let mut last = BTreeMap::new();
-        let linear_order = if linear_plan {
-            Some(
-                super::super::route_plan::expert_order(ids, c.num_experts)
-                    .map_err(Error::from_reason)?,
-            )
-        } else {
-            for (assignment, &expert) in ids.iter().enumerate() {
-                last.insert(expert, assignment);
-            }
-            None
-        };
-        let active_experts = linear_order.as_ref().map_or(last.len(), Vec::len);
-        if x.shape_at(1)? > 8 {
-            self.weights.note_prefill_routes(
-                i,
-                linear_order
-                    .clone()
-                    .unwrap_or_else(|| last.keys().copied().collect()),
-            );
+        let order = super::super::route_plan::expert_order(ids, c.num_experts)
+            .map_err(Error::from_reason)?;
+        let wide = x.shape_at(1)? > 8;
+        if wide {
+            self.weights.note_prefill_routes(i, order.clone());
         }
-        if active_experts <= capacity && x.shape_at(1)? > 8 {
+        if order.len() <= capacity && wide {
             self.check_cancelled()?;
             let Some((banks, slots, count)) =
                 self.weights
@@ -280,81 +327,21 @@ impl Decoder {
             }
             return Ok(Some(reduced));
         }
-        let groups = linear_order.unwrap_or_else(|| {
-            let mut groups = last.keys().copied().collect::<Vec<_>>();
-            groups.sort_by_key(|e| last[e]);
-            groups
-        });
-        let mut planned_assignments = if linear_plan {
-            Some(
-                super::super::route_plan::assignment_groups(ids, &groups, c.num_experts, capacity)
-                    .map_err(Error::from_reason)?,
-            )
-        } else {
-            None
+        let groups =
+            super::super::route_plan::assignment_groups(ids, &order, c.num_experts, capacity)
+                .map_err(Error::from_reason)?;
+        let mut slots = LayerSlots {
+            decoder: self,
+            layer: i,
         };
-        let mut values = Vec::new();
-        let mut group_inverses = Vec::new();
-        let mut inverse = vec![0i32; ids.len()];
-        let mut output_row = 0;
-        for (group, experts) in groups.chunks(capacity).enumerate() {
-            self.check_cancelled()?;
-            let assignments = if let Some(planned) = &mut planned_assignments {
-                std::mem::take(&mut planned[group])
-            } else {
-                let wanted: std::collections::HashSet<_> = experts.iter().copied().collect();
-                ids.iter()
-                    .enumerate()
-                    .filter(|(_, e)| wanted.contains(e))
-                    .map(|(slot, _)| slot)
-                    .collect::<Vec<_>>()
-            };
-            let requested: Vec<_> = assignments.iter().map(|&s| ids[s]).collect();
-            let Some((banks, slots, count)) =
-                self.weights
-                    .expert_slots(i, c.num_experts, c.num_experts_per_tok, &requested)?
-            else {
-                return Ok(None);
-            };
-            let rows: Vec<_> = assignments
-                .iter()
-                .map(|&s| (s / c.num_experts_per_tok) as i32)
-                .collect();
-            let source = x.reshape(&[-1, c.hidden_size as i64])?;
-            let token_rows = MxArray::from_int32(&rows, &[rows.len() as i64])?;
-            let selected = MxArray::from_uint32(&slots, &[slots.len() as i64])?;
-            let (out, local_inverse) = if let Some((out, inverse)) =
-                Self::indirect_expert_assignment_rows(
-                    &source,
-                    &token_rows,
-                    &selected,
-                    &banks,
-                    count,
-                )? {
-                (out, Some(inverse))
-            } else {
-                let input = source.take(&token_rows, 0)?;
-                Self::sorted_expert_assignment_rows(&input, &selected, &banks, count)?
-            };
-            self.weights.finish_expert_slots(i, &out)?;
-            let local_inverse = match local_inverse {
-                Some(inverse) => inverse.astype(DType::Int32)?,
-                None => MxArray::arange(0.0, assignments.len() as f64, None, Some(DType::Int32))?,
-            };
-            group_inverses.push(local_inverse.add(&MxArray::from_int32(&[output_row], &[])?)?);
-            for slot in assignments {
-                inverse[slot] = output_row;
-                output_row += 1;
-            }
-            values.push(out);
-        }
-        let out = MxArray::concatenate_many(values.iter().collect(), Some(0))?;
-        let inverse = MxArray::concatenate_many(group_inverses.iter().collect(), Some(0))?
-            .take(&MxArray::from_int32(&inverse, &[inverse.len() as i64])?, 0)?;
-        let tokens = x.shape()?[1];
+        let Some((out, inverse)) =
+            Self::grouped_expert_rows(x, ids, &groups, c.num_experts_per_tok, &mut slots)?
+        else {
+            return Ok(None);
+        };
         let reduced =
             math::combine_expert_rows(&out, scores, Some(&inverse), c.num_experts_per_tok)?;
-        if tokens > 8 {
+        if wide {
             // A wide assignment tensor is tens of MiB per layer. Once its
             // reduction is complete it must not remain pinned by slot leases.
             self.weights.complete_expert_window(i, &reduced)?;
