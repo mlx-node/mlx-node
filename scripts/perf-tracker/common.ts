@@ -205,7 +205,8 @@ export function mlxAcceptance(
   const drafted = total('mtpMeanDepth', depth);
   const accepted = total('mtpMeanAcceptedTokens', mean);
   const most = rule.mlxDraftsPerCycle * cycles;
-  const least = most - (rule.mlxDraftsPerCycle * (rule.mlxDraftsPerCycle - 1)) / 2;
+  // Native records a cycle only when it drafts at least one token.
+  const least = Math.max(cycles, most - (rule.mlxDraftsPerCycle * (rule.mlxDraftsPerCycle - 1)) / 2);
   if (drafted > most || drafted < least) {
     throw new Error(
       `${label}: mlx-node drafted ${drafted} tokens in ${cycles} cycles; ${rule.mlxDraftsPerCycle} per cycle drafts ${least}–${most}`,
@@ -504,8 +505,19 @@ export async function assertFileSha256(path: string, expected: string): Promise<
   if (actual !== expected) throw new Error(`${path}: SHA-256 ${actual}, expected ${expected}`);
 }
 
+// A runtime that renames a timing field yields undefined, and JSON writes NaN as null.
+export function assertMeasured(values: Record<string, unknown>, label: string): void {
+  for (const [field, value] of Object.entries(values)) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      throw new Error(`${label}: ${field} ${String(value)} is not a positive finite number`);
+    }
+  }
+}
+
 export function median(values: readonly number[]): number {
   if (!values.length) throw new Error('median of no values');
+  const bad = values.findIndex((value) => typeof value !== 'number' || !Number.isFinite(value) || value < 0);
+  if (bad >= 0) throw new Error(`median of ${String(values[bad])} at index ${bad}: not a finite non-negative number`);
   const sorted = [...values].sort((a, b) => a - b);
   const mid = sorted.length >> 1;
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;

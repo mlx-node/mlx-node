@@ -64,11 +64,12 @@ that cache on the file path, inode, ctime and device.
 
   Both runtimes fall back to plain decoding without an error when a draft is missing or fails to start, so every
   sample is gated: mlx-node needs `hasMtpWeights()` after load, `mtpCycles > 0`, and the suite's depth `d` in every
-  cycle but the length tail, so `d × cycles − d(d − 1)/2 ≤ drafted ≤ d × cycles` (`d` = 7, 7, 2; the Qwen3.8 27B GGUF
-  also carries a one-token MTP head); llama.cpp needs `timings.draft_n > 0` and its type in
+  cycle but the length tail, so `max(cycles, d × cycles − d(d − 1)/2) ≤ drafted ≤ d × cycles` (`d` = 7, 7, 2; the
+  Qwen3.8 27B GGUF also carries a one-token MTP head); llama.cpp needs `timings.draft_n > 0` and its type in
   `generation_settings["speculative.types"]`. Every counter the report uses must be present, finite and a possible
-  count: accepted ≤ drafted, and mlx-node's committed tokens per cycle equal its accepted drafts + 1. The draft files
-  are part of the identity: preflight checks their hashes, and provenance records them.
+  count: accepted ≤ drafted, and mlx-node's committed tokens per cycle equal its accepted drafts + 1. Every timing and
+  rate must be a positive finite number, so a renamed llama.cpp field fails its sample. The draft files are part of
+  the identity: preflight checks their hashes, and provenance records them.
 
   Speculation changes prefill as well as decode. mlx-node's DFlash2 turn runs on its flat cache in 2,048-token
   chunks, DSpark keeps target hidden states for the draft, and both Qwen MTP and llama.cpp's DFlash run the draft over

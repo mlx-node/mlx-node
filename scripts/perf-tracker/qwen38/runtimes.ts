@@ -7,7 +7,7 @@ import { request } from 'node:http';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 
-import { ROOT, llamaServerPath, sleep, writeJson, type FixtureCase } from '../common.js';
+import { ROOT, assertMeasured, llamaServerPath, sleep, writeJson, type FixtureCase } from '../common.js';
 import { descendants, processTable } from './admission.js';
 import { HERE, MODEL_PATH, PORT, type Speculated } from './suite.js';
 
@@ -150,7 +150,17 @@ export class MlxWorker implements Runner {
 
   async sample(item: FixtureCase, run: number | string, maxNewTokens: number): Promise<Result> {
     this.child.stdin!.write(`${JSON.stringify({ name: item.name, run, maxNewTokens })}\n`);
-    return (await this.inbox.next()) as Result;
+    const result = (await this.inbox.next()) as Result;
+    const performance: Partial<Result['performance']> = result.performance ?? {};
+    assertMeasured(
+      {
+        'performance.ttftMs': performance.ttftMs,
+        'performance.prefillTokensPerSecond': performance.prefillTokensPerSecond,
+        'performance.decodeTokensPerSecond': performance.decodeTokensPerSecond,
+      },
+      `mlx-node ${item.name} run ${run}`,
+    );
+    return result;
   }
 
   async close(): Promise<void> {
@@ -339,6 +349,14 @@ export class LlamaServer implements Runner {
       text: text.join(''),
     };
     await writeJson(join(this.out, 'raw', `llama-${run}-${item.name}.json`), result);
+    assertMeasured(
+      {
+        'timings.prompt_ms': timings.prompt_ms,
+        'timings.prompt_per_second': timings.prompt_per_second,
+        'timings.predicted_per_second': timings.predicted_per_second,
+      },
+      `llama.cpp ${item.name} run ${run}`,
+    );
     if (result.promptTokens !== item.tokenIds.length || cached !== 0) {
       throw new Error(
         `llama.cpp prompt/cache accounting: expected ${item.tokenIds.length}/0, received ${result.promptTokens}/${cached}`,

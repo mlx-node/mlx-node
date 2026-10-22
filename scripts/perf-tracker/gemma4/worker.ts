@@ -14,6 +14,7 @@ import {
   ROOT,
   assertCleanEnv,
   assertLoadedAddon,
+  assertMeasured,
   llamaAcceptance,
   llamaServerPath,
   mlxAcceptance,
@@ -107,6 +108,14 @@ async function mlx() {
     throw new Error(`Workload mismatch: ${JSON.stringify(result)}`);
   }
   const acceptance = mlxAcceptance(p, SPECULATION, id);
+  assertMeasured(
+    {
+      'performance.ttftMs': p.ttftMs,
+      'performance.prefillTokensPerSecond': p.prefillTokensPerSecond,
+      'performance.decodeTokensPerSecond': p.decodeTokensPerSecond,
+    },
+    `mlx-node ${id}`,
+  );
   const decodeMs = ((result.numTokens - 1) / p.decodeTokensPerSecond) * 1000;
   const sample = {
     runtime,
@@ -216,6 +225,15 @@ async function llama() {
       throw new Error(`Workload mismatch: ${JSON.stringify(result)}`);
     }
     const acceptance = llamaAcceptance(t, String(result.generation_settings['speculative.types']), SPECULATION, id);
+    assertMeasured(
+      {
+        'timings.prompt_ms': t.prompt_ms,
+        'timings.prompt_per_second': t.prompt_per_second,
+        'timings.predicted_ms': t.predicted_ms,
+        'timings.predicted_per_second': t.predicted_per_second,
+      },
+      `llama.cpp ${id}`,
+    );
     const sample = {
       runtime,
       name: data!.name,
