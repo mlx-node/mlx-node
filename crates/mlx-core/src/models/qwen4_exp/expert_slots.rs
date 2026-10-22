@@ -1867,34 +1867,18 @@ mod tests {
     #[test]
     #[ignore = "real checkpoint: QWEN4_EXP_REAL_MODEL, QWEN4_EXP_REAL_INPUTS, QWEN4_EXP_REAL_AUX; --test-threads=1"]
     fn real_fallback_slots_beside_draft_banks() {
+        use super::super::super::tests::{argmax, go_live, real_prompt};
         use super::super::super::{auxiliary, decoder::Decoder, gguf, memory::HostMemory};
         let model = std::env::var("QWEN4_EXP_REAL_MODEL").expect("QWEN4_EXP_REAL_MODEL");
         let aux = std::env::var("QWEN4_EXP_REAL_AUX").expect("QWEN4_EXP_REAL_AUX");
         let inputs = std::env::var("QWEN4_EXP_REAL_INPUTS").expect("QWEN4_EXP_REAL_INPUTS");
-        let cases: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(inputs).unwrap()).unwrap();
-        let prompt: Vec<u32> = cases
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|case| case["name"] == "6k")
-            .expect("a 6k case")["tokenIds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .take(8)
-            .map(|t| t.as_u64().unwrap() as u32)
-            .collect();
+        let mut prompt = real_prompt(Path::new(&inputs), "6k");
+        prompt.truncate(8);
         let mut store = Store::open(Path::new(&model)).unwrap();
         let mut config = gguf::config(&store).unwrap();
         auxiliary::attach(&mut store, &mut config, Path::new(&aux)).unwrap();
         let mut decoder = Decoder::new(config, store).unwrap();
-        decoder.register_cache_limit();
-        decoder.weights.prepare_mapped_pack().unwrap();
-        decoder.weights.select_mapped_residency(0).unwrap();
-        decoder.weights.prepare_hot().unwrap();
-        decoder.weights.publish_live();
-        decoder.residency_changed();
+        go_live(&mut decoder, 0);
         assert!(
             decoder.weights.plan.mapped,
             "the live host refused the pack"
@@ -1910,8 +1894,7 @@ mod tests {
             let mut logits = decoder.prefill_chunk(&prompt, None, true)?;
             let mut text = Vec::new();
             for _ in 0..16 {
-                let last = logits.shape()?.len() as i32 - 1;
-                let id = logits.argmax(last, Some(false))?.item_at_uint32(0)?;
+                let id = argmax(&logits);
                 text.push(id);
                 logits = decoder.step(id)?;
             }
@@ -1971,24 +1954,13 @@ mod tests {
     #[test]
     #[ignore = "real checkpoint: QWEN4_EXP_REAL_MODEL, QWEN4_EXP_REAL_INPUTS, QWEN4_EXP_REAL_AUX; --test-threads=1"]
     fn real_slot_load_admits_draft_banks_beside_the_cached_count() {
+        use super::super::super::tests::{argmax, real_prompt};
         use super::super::super::{auxiliary, decoder::Decoder, gguf};
         let model = std::env::var("QWEN4_EXP_REAL_MODEL").expect("QWEN4_EXP_REAL_MODEL");
         let aux = std::env::var("QWEN4_EXP_REAL_AUX").expect("QWEN4_EXP_REAL_AUX");
         let inputs = std::env::var("QWEN4_EXP_REAL_INPUTS").expect("QWEN4_EXP_REAL_INPUTS");
-        let cases: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(inputs).unwrap()).unwrap();
-        let prompt: Vec<u32> = cases
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|case| case["name"] == "6k")
-            .expect("a 6k case")["tokenIds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .take(8)
-            .map(|t| t.as_u64().unwrap() as u32)
-            .collect();
+        let mut prompt = real_prompt(Path::new(&inputs), "6k");
+        prompt.truncate(8);
         let mut first: Option<Vec<u32>> = None;
         for limit in [22u64 << 30, (89u64 << 30) / 4] {
             let gib = limit as f64 / (1u64 << 30) as f64;
@@ -2021,12 +1993,7 @@ mod tests {
                 });
             let mut text = Vec::new();
             for _ in 0..16 {
-                let last = logits.shape().unwrap().len() as i32 - 1;
-                let id = logits
-                    .argmax(last, Some(false))
-                    .unwrap()
-                    .item_at_uint32(0)
-                    .unwrap();
+                let id = argmax(&logits);
                 text.push(id);
                 logits = decoder.step(id).unwrap();
             }
