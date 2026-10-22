@@ -190,10 +190,6 @@ impl DecoderState {
     }
 }
 pub struct Decoder {
-    pub batch_prefill: bool,
-    pub window_carry: bool,
-    pub async_prefill: bool,
-    pub batch_rotary: bool,
     pub prefill_chunk_size: usize,
     /// A test that sizes admission through the prefill window keeps its
     /// window across the turn opens that re-derive it from the plan.
@@ -313,10 +309,6 @@ impl Decoder {
             prefill_chunk_size,
             #[cfg(test)]
             prefill_window_pin: None,
-            window_carry: true,
-            async_prefill: true,
-            batch_rotary: true,
-            batch_prefill: true,
             caches: (0..config.num_hidden_layers)
                 .map(|_| LayerCache::default())
                 .collect(),
@@ -430,6 +422,10 @@ impl Decoder {
             sections,
             interleaved,
         )
+    }
+    #[cfg(test)]
+    pub(super) fn rope_row(&self, x: &MxArray, pos: usize) -> Result<MxArray> {
+        self.rope(x, pos)
     }
     fn gguf(&self) -> bool {
         self.weights.gguf && self.scope.is_empty()
@@ -2358,7 +2354,7 @@ impl Decoder {
     pub(super) fn group_mode(&self, suffix: usize) -> bool {
         let slice = self.prefill_slice_size().max(1);
         let windows = suffix / slice + usize::from(suffix % slice >= 256);
-        if windows < 2 || !self.batch_prefill || !self.window_carry || self.verification.is_some() {
+        if windows < 2 || self.verification.is_some() {
             return false;
         }
         #[cfg(test)]
@@ -2692,8 +2688,7 @@ impl Decoder {
         } else {
             self.prefetch_window_rows(tokens, next, embeddings.is_none())?;
         }
-        let batched = self.batch_prefill && tokens.len() > 1 && self.verification.is_none();
-        let carry = batched && self.window_carry;
+        let carry = tokens.len() > 1 && self.verification.is_none();
         if group && !carry {
             return Err(Error::from_reason(
                 "Qwen4 prefill group needs the carried window path",
@@ -2798,8 +2793,6 @@ impl Decoder {
                         defer_final,
                     )?;
                 }
-            } else if batched {
-                hidden = self.attention_batch(&hidden, tokens, i, &mut cache)?;
             } else if self.verification.is_some() {
                 let input = window
                     .take()
@@ -2838,9 +2831,6 @@ impl Decoder {
                 self.paged_chunk_start = base;
             }
             if !carry {
-                if batched {
-                    hidden = self.mlp_batch(&hidden, i)?;
-                }
                 self.write_window_kv(
                     i,
                     &mut cache,

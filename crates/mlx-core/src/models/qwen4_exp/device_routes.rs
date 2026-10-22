@@ -70,8 +70,6 @@ impl Decoder {
             .any(|tokens| !(256..=1024).contains(&tokens.len()))
             || embeddings.is_some()
             || !self.gguf()
-            || !self.batch_prefill
-            || !self.window_carry
             || self.verification.is_some()
             || self.device_routes.is_some()
             || self.config.hidden_size != 2560

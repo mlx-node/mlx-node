@@ -1183,55 +1183,19 @@ impl PrefillCase {
     }
 }
 
-/// `prefill_chunk` with batching off (one `layer` per token inside the chunk
-/// loop) against `step` one token at a time: exact logits, history and
-/// continuation. F32 and BF16, both layouts, a width below the indexer
-/// compress ratio (the first chunk forms no index block), a width that ends
-/// on a 1-token chunk and one that crosses the indexer budget inside a chunk.
-#[test]
-fn chunked_prefill_preserves_singleton_logits_and_continuation() {
-    for case in [
-        PrefillCase::new("", false, 7),
-        PrefillCase::new("", true, 32),
-        PrefillCase::new("bf16", true, 2),
-        PrefillCase::new("bf16", true, 7),
-        PrefillCase::new("bf16", false, 32),
-    ] {
-        let (path, width) = (case.path(), case.width);
-        let (mut single, mut chunked) = case.decoders();
-        chunked.batch_prefill = false;
-        let tokens = [3, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4, 7, 1, 3, 5, 6, 8].repeat(2);
-        for chunk in tokens.chunks(width) {
-            let mut want = None;
-            for &token in chunk {
-                want = Some(single.step(token).unwrap());
-            }
-            let got = chunked.prefill_chunk(chunk, None, true).unwrap();
-            assert_eq!(
-                &*got.to_float32().unwrap(),
-                &*want.unwrap().to_float32().unwrap(),
-                "{path:?}, chunk width {width}"
-            );
-            assert_eq!(chunked.history, single.history);
-        }
-        assert_eq!(
-            &*chunked.step(11).unwrap().to_float32().unwrap(),
-            &*single.step(11).unwrap().to_float32().unwrap()
-        );
-    }
-}
-
-/// Batched prefill (`attention_batch` + `mlp_batch`, or the window carry)
-/// against the unbatched chunk, across the expert tiers the width selects:
-/// demand-loaded experts (safetensors' combined `gate_up_proj` and GGUF's
-/// split `ffn_gate/up_exps`), and fixed projection banks with slotted
-/// experts at width 32, 64 and 128 (a 126-token prompt). The F32 root fixture
-/// holds the exact tolerance; BF16 allows the TF32 window.
+/// The window carry against `step` one token at a time, across the expert
+/// tiers the width selects: demand-loaded experts (safetensors' combined
+/// `gate_up_proj` and GGUF's split `ffn_gate/up_exps`), and fixed projection
+/// banks with slotted experts at width 32, 64 and 128 (a 126-token prompt).
+/// The F32 root fixture holds the exact tolerance; BF16 allows the TF32
+/// window.
 #[test]
 fn batched_prefill_matches_reference_across_chunks_sparse_boundaries_and_continuation() {
     for case in [
         PrefillCase::new("", false, 7),
+        PrefillCase::new("", true, 32),
         PrefillCase::new("", true, 64),
+        PrefillCase::new("bf16", true, 2),
         PrefillCase::new("bf16", true, 7),
         PrefillCase::new("bf16", false, 32),
         PrefillCase::new("bf16/paged", true, 2),
@@ -1239,8 +1203,7 @@ fn batched_prefill_matches_reference_across_chunks_sparse_boundaries_and_continu
         PrefillCase::new("bf16/paged", false, 128),
     ] {
         let (path, width) = (case.path(), case.width);
-        let (mut scalar, mut batched) = case.decoders();
-        scalar.batch_prefill = false;
+        let (mut single, mut batched) = case.decoders();
         if width >= 32 {
             // Assembled fixed projections with demand-loaded experts
             // must preserve the same prompt/continuation contract.
@@ -1254,9 +1217,12 @@ fn batched_prefill_matches_reference_across_chunks_sparse_boundaries_and_continu
             0.04
         };
         for chunk in tokens.chunks(width) {
-            let want = scalar.prefill_chunk(chunk, None, true).unwrap();
+            let mut want = None;
+            for &token in chunk {
+                want = Some(single.step(token).unwrap());
+            }
             let got = batched.prefill_chunk(chunk, None, true).unwrap();
-            let a = want.to_float32().unwrap();
+            let a = want.unwrap().to_float32().unwrap();
             let b = got.to_float32().unwrap();
             let error = a
                 .iter()
@@ -1264,9 +1230,9 @@ fn batched_prefill_matches_reference_across_chunks_sparse_boundaries_and_continu
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
             assert!(error < tolerance, "{path:?}, width={width}, error={error}");
-            assert_eq!(scalar.history, batched.history);
+            assert_eq!(single.history, batched.history);
         }
-        let a = scalar.step(11).unwrap().to_float32().unwrap();
+        let a = single.step(11).unwrap().to_float32().unwrap();
         let b = batched.step(11).unwrap().to_float32().unwrap();
         let error = a
             .iter()
@@ -1280,14 +1246,24 @@ fn batched_prefill_matches_reference_across_chunks_sparse_boundaries_and_continu
     }
 }
 
-/// The window carry with asynchronous MLP submission against per-row
-/// batching with synchronous evaluation, over a 126-token prompt: exact
-/// logits, history, every retained frontier row, and continuation. A width
-/// that opens with a dense sub-budget window (7), one of 32-token windows
-/// (32, 32, 32, 30) and the whole prompt as one window; F32 (no dense
-/// window) and both BF16 fixtures, both layouts.
+/// The window carry against `step` one token at a time over a 126-token
+/// prompt: logits, history, every retained frontier row, and continuation.
+/// A width that opens with a dense sub-budget window (7), one of 32-token
+/// windows (32, 32, 32, 30) and the whole prompt as one window; F32 (no
+/// dense window) and both BF16 fixtures, both layouts.
 #[test]
 fn contiguous_prompt_windows_preserve_rows_frontiers_and_continuation() {
+    // Largest difference, relative to the reference's largest magnitude.
+    let error = |a: &MxArray, b: &MxArray| {
+        let (a, b) = (a.to_float32().unwrap(), b.to_float32().unwrap());
+        assert_eq!(a.len(), b.len());
+        let scale = a.iter().fold(1f32, |m, v| m.max(v.abs()));
+        a.iter()
+            .zip(b.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / scale
+    };
     for case in [
         PrefillCase::new("", true, 7),
         PrefillCase::new("bf16", false, 32),
@@ -1295,75 +1271,90 @@ fn contiguous_prompt_windows_preserve_rows_frontiers_and_continuation() {
         PrefillCase::new("bf16/paged", true, 128),
     ] {
         let (path, width) = (case.path(), case.width);
-        let (mut rows, mut window) = case.decoders();
-        rows.window_carry = false;
-        rows.async_prefill = false;
-        window.async_prefill = true;
+        let (mut single, mut window) = case.decoders();
+        let tolerance = if case.fixture.is_empty() {
+            0.0001
+        } else {
+            0.04
+        };
         let tokens = [3, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4, 7, 1, 3, 5, 6, 8].repeat(7);
         for chunk in tokens.chunks(width) {
-            let expected = rows.prefill_chunk(chunk, None, true).unwrap();
-            let actual = window.prefill_chunk(chunk, None, true).unwrap();
-            assert_eq!(
-                &*expected.to_float32().unwrap(),
-                &*actual.to_float32().unwrap(),
-                "{path:?}, width={width}"
-            );
-            assert_eq!(rows.history, window.history);
-            assert_eq!(rows.last_chunk_hidden.len(), window.last_chunk_hidden.len());
-            for (a, b) in rows.last_chunk_hidden.iter().zip(&window.last_chunk_hidden) {
-                assert_eq!(&*a.to_float32().unwrap(), &*b.to_float32().unwrap());
+            let mut want = None;
+            let mut rows = Vec::with_capacity(chunk.len());
+            for &token in chunk {
+                want = Some(single.step(token).unwrap());
+                rows.push(single.last_chunk_hidden[0].clone());
+            }
+            let got = window.prefill_chunk(chunk, None, true).unwrap();
+            let e = error(&want.unwrap(), &got);
+            assert!(e < tolerance, "{path:?}, width={width}, error={e}");
+            assert_eq!(single.history, window.history);
+            assert_eq!(rows.len(), window.last_chunk_hidden.len());
+            for (j, (a, b)) in rows.iter().zip(&window.last_chunk_hidden).enumerate() {
+                let e = error(a, b);
+                assert!(e < tolerance, "{path:?}, width={width}, row {j}: error={e}");
             }
         }
-        assert_eq!(
-            &*rows.step(11).unwrap().to_float32().unwrap(),
-            &*window.step(11).unwrap().to_float32().unwrap()
+        let e = error(&single.step(11).unwrap(), &window.step(11).unwrap());
+        assert!(
+            e < tolerance,
+            "continuation {path:?}, width={width}, error={e}"
         );
     }
 }
 
+/// The batched rotary tables rotate a window bit for bit like `rope` row by
+/// row, over contiguous windows and strided index-block positions, and new
+/// positions (another owner) never reuse the previous owner's tables.
 #[test]
-fn batched_rotary_preserves_split_indexer_blocks_and_owner_changes() {
+fn batched_rotary_matches_per_row_rope_across_owner_changes() {
+    use crate::array::DType;
     let path = fixture().join("bf16");
     let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
-    let mut config = config::Config::parse(&raw).unwrap();
-    // Cross the dense-to-sparse attention boundary after forming batched blocks.
-    config.indexer_budget = 32;
-    let mut reference = decoder::Decoder::new(
-        config.clone(),
-        weights::Store::open_fixture(&path, None).unwrap(),
-    )
-    .unwrap();
-    reference.batch_rotary = false;
-    let mut candidate =
+    let config = config::Config::parse(&raw).unwrap();
+    let head = config.head_dim as i64;
+    let mut decoder =
         decoder::Decoder::new(config, weights::Store::open_fixture(&path, None).unwrap()).unwrap();
-    for owner in 0..2 {
-        reference.reset();
-        candidate.reset();
-        let positions: Vec<_> = (0..96)
+    let mut offset = 0;
+    let mut windows: Vec<Vec<usize>> = [3, 7, 2, 17, 3, 4, 28, 32]
+        .iter()
+        .map(|&count| {
+            let window = (offset..offset + count).collect();
+            offset += count;
+            window
+        })
+        .collect();
+    windows.push((0..6).map(|b| 5 + 4 * b).collect());
+    for owner in 0..2i64 {
+        decoder.positions = (0..96)
             .map(|p| [p + owner * 100, p / 3 + owner * 10, p / 5 + 3])
             .collect();
-        reference.positions = positions.clone();
-        candidate.positions = positions;
-        let tokens = [3, 9, 4, 7, 1, 5, 8, 2].repeat(12);
-        let mut offset = 0;
-        for count in [3, 7, 2, 17, 3, 4, 28, 32] {
-            let chunk = &tokens[offset..offset + count];
-            let expected = reference.prefill_chunk(chunk, None, true).unwrap();
-            let got = candidate.prefill_chunk(chunk, None, true).unwrap();
+        for offsets in &windows {
+            let t = offsets.len() as i64;
+            let values: Vec<f32> = (0..2 * t * head)
+                .map(|i| (i as f32 * 0.37 + owner as f32).sin())
+                .collect();
+            let x = MxArray::from_float32(&values, &[1, 2, t, head])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            let got = decoder.rope_positions(&x, offsets).unwrap();
+            let rows = offsets
+                .iter()
+                .enumerate()
+                .map(|(j, &pos)| {
+                    decoder
+                        .rope_row(&x.slice_axis(2, j as i64, j as i64 + 1).unwrap(), pos)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let want = MxArray::concatenate_many(rows.iter().collect(), Some(2)).unwrap();
             assert_eq!(
                 &*got.to_float32().unwrap(),
-                &*expected.to_float32().unwrap(),
-                "owner={owner}, offset={offset}"
+                &*want.to_float32().unwrap(),
+                "owner={owner}, offsets={offsets:?}"
             );
-            offset += count;
         }
-        // Restoring a frontier must not keep the next owner's rotary tables.
-        let saved = candidate.snapshot();
-        assert_eq!(
-            &*candidate.step(11).unwrap().to_float32().unwrap(),
-            &*reference.step(11).unwrap().to_float32().unwrap()
-        );
-        candidate.restore_state(saved);
     }
 }
 
@@ -2926,7 +2917,6 @@ fn prefill_window_projections_stay_batched_outside_verification() {
     use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, ScheduledVerifyRow};
     let prompt = [3, 9, 5, 2, 7, 11, 12, 8, 10, 9, 13, 7, 4, 3, 11, 8, 6, 5];
     let mut inner = tiny_inner();
-    assert!(inner.decoder.batch_prefill && inner.decoder.window_carry);
     inner.activate_paged_seq(1).unwrap();
     inner.begin_mtp(1, 0).unwrap();
     let prefix = inner
@@ -4595,7 +4585,6 @@ fn wide_causal_windows_match_singleton_with_pages_media_and_retained_prefix() {
         weights::Store::open_fixture(&path, None).unwrap(),
     )
     .unwrap();
-    reference.batch_prefill = false;
     let mut candidate = decoder::Decoder::new(
         c.clone(),
         weights::Store::open_fixture(&path, None).unwrap(),
@@ -4613,11 +4602,11 @@ fn wide_causal_windows_match_singleton_with_pages_media_and_retained_prefix() {
     candidate.rope_delta = -4;
     for count in [7, 65, 128, 3] {
         let tokens: Vec<u32> = (0..count).map(|i| (i % 11 + 1) as u32).collect();
-        let a = reference
-            .prefill_chunk(&tokens, None, true)
-            .unwrap()
-            .to_float32()
-            .unwrap();
+        let mut a = None;
+        for &token in &tokens {
+            a = Some(reference.step(token).unwrap());
+        }
+        let a = a.unwrap().to_float32().unwrap();
         let b = candidate
             .prefill_chunk(&tokens, None, true)
             .unwrap()
@@ -9488,12 +9477,6 @@ fn the_whole_prompt_hook_follows_group_mode() {
     );
     inner.decoder.group_pin = Some(false);
     assert!(!inner.scheduler_whole_prompt_prefill(53, 0));
-    inner.decoder.group_pin = Some(true);
-    inner.decoder.window_carry = false;
-    assert!(
-        !inner.scheduler_whole_prompt_prefill(53, 0),
-        "only the carried window path serves a group"
-    );
 }
 
 /// T7. The tripwire sees one sample per window (the group's time shared by

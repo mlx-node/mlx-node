@@ -7,8 +7,13 @@ impl Decoder {
         self.rope_window_positions(x, start..start + count)
     }
 
-    fn use_batch_rotary(&self) -> bool {
-        self.batch_rotary
+    #[cfg(test)]
+    pub(in super::super) fn rope_positions(
+        &self,
+        x: &MxArray,
+        offsets: &[usize],
+    ) -> Result<MxArray> {
+        self.rope_window_positions(x, offsets.iter().copied())
     }
 
     fn rope_window_positions(
@@ -17,19 +22,9 @@ impl Decoder {
         offsets: impl Iterator<Item = usize>,
     ) -> Result<MxArray> {
         let (positions, sections, interleaved) = self.rotary_window_parameters(offsets);
-        if self.use_batch_rotary() {
-            return self.rotary_tables.borrow_mut().apply(
-                x,
-                positions,
-                self.config.rope_dims(),
-                self.config.rope_theta(),
-                sections,
-                interleaved,
-            );
-        }
-        math::mrope_window(
+        self.rotary_tables.borrow_mut().apply(
             x,
-            &positions,
+            positions,
             self.config.rope_dims(),
             self.config.rope_theta(),
             sections,
@@ -167,23 +162,12 @@ impl Decoder {
                 c.indexer_head_dim,
                 true,
             )?;
-            let rotated = if self.use_batch_rotary() {
-                self.rope_window_positions(
+            let rotated = self
+                .rope_window_positions(
                     &norms.reshape(&[1, 1, blocks as i64, id])?,
                     (0..blocks).map(|b| base - tail + b * ratio),
                 )?
-                .reshape(&[blocks as i64, id])?
-            } else {
-                let keys = (0..blocks)
-                    .map(|b| {
-                        self.rope(
-                            &norms.slice_axis(0, b as i64, b as i64 + 1)?,
-                            base - tail + b * ratio,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                MxArray::concatenate_many(keys.iter().collect(), Some(0))?
-            };
+                .reshape(&[blocks as i64, id])?;
             let keys = cache.append_index_keys(rotated)?;
             self.submit_state(&[keys], "qwen4::window::index_keys")?;
         }

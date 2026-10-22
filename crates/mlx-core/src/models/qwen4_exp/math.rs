@@ -674,20 +674,6 @@ fn rotary_angles(
     angles
 }
 
-/// Position tables for a complete [B,H,T,D] window, preserving the singleton
-/// angle computation and intermediate dtype. Media axes may differ per token.
-pub(super) fn mrope_window(
-    x: &MxArray,
-    positions: &[[i64; 3]],
-    dims: usize,
-    theta: f64,
-    sections: [usize; 3],
-    interleaved: bool,
-) -> Result<MxArray> {
-    let (cos, sin) = rotary_tables(positions, dims, theta, sections, interleaved, x.dtype()?)?;
-    apply_rotary_window(x, dims, &cos, &sin)
-}
-
 #[derive(PartialEq)]
 struct RotaryKey {
     positions: Vec<[i64; 3]>,

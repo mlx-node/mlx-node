@@ -484,30 +484,6 @@ impl Decoder {
         Ok(Some(out))
     }
 
-    pub(super) fn attention_batch(
-        &mut self,
-        rows: &[MxArray],
-        tokens: &[u32],
-        i: usize,
-        cache: &mut LayerCache,
-    ) -> Result<Vec<MxArray>> {
-        let x = MxArray::concatenate_many(rows.iter().collect(), Some(1))?;
-        let out = self.attention_matrix(&x, tokens, i, cache)?;
-        (0..rows.len())
-            .map(|j| out.slice_axis(1, j as i64, j as i64 + 1))
-            .collect()
-    }
-
-    pub(super) fn attention_matrix(
-        &mut self,
-        x: &MxArray,
-        tokens: &[u32],
-        i: usize,
-        cache: &mut LayerCache,
-    ) -> Result<MxArray> {
-        Ok(self.attention_matrix_for_mlp(x, tokens, i, cache, false)?.0)
-    }
-
     pub(super) fn attention_matrix_for_mlp(
         &mut self,
         x: &MxArray,
@@ -715,15 +691,11 @@ impl Decoder {
         let gate = gate
             .ok_or_else(|| Error::from_reason("Qwen4 batched MLP is missing its injection gate"))?;
         let out = Self::inject(x, &branch, &gate)?;
-        if self.async_prefill {
-            // The next router readback (or final window output) fences this
-            // graph. Slot-bank readers remain retained until their own fence.
-            // Reference schedule: first two layers, then groups of three.
-            if !self.async_device_prefill() || (i >= 1 && (i - 1).is_multiple_of(3)) {
-                self.submit(&[&out], "qwen4::batch::mlp")?;
-            }
-        } else {
-            MxArray::eval_arrays_with_context(&[&out], "qwen4::batch::mlp")?;
+        // The next router readback (or final window output) fences this
+        // graph. Slot-bank readers remain retained until their own fence.
+        // Reference schedule: first two layers, then groups of three.
+        if !self.async_device_prefill() || (i >= 1 && (i - 1).is_multiple_of(3)) {
+            self.submit(&[&out], "qwen4::batch::mlp")?;
         }
 
         Ok(out)
