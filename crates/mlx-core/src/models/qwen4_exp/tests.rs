@@ -1,6 +1,69 @@
 use super::*;
+use std::sync::atomic::Ordering;
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp")
+}
+
+/// The `QWEN4_EXP_REAL_CASES` names of the real-checkpoint tests.
+pub(super) fn real_cases() -> Vec<String> {
+    std::env::var("QWEN4_EXP_REAL_CASES")
+        .unwrap_or_else(|_| "6k,16k".into())
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The token ids of case `name` in a benchmark `inputs.json`.
+pub(super) fn real_prompt(inputs: &Path, name: &str) -> Vec<u32> {
+    let cases: serde_json::Value = serde_json::from_slice(&std::fs::read(inputs).unwrap()).unwrap();
+    cases
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"] == name)
+        .unwrap_or_else(|| panic!("case {name} in {}", inputs.display()))["tokenIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_u64().unwrap() as u32)
+        .collect()
+}
+
+pub(super) fn argmax(logits: &MxArray) -> u32 {
+    let last = logits.shape().unwrap().len() as i32 - 1;
+    logits
+        .argmax(last, Some(false))
+        .unwrap()
+        .item_at_uint32(0)
+        .unwrap()
+}
+
+/// The served load: the mapped pack with `pool_bytes` of paged KV beside it.
+pub(super) fn go_live(decoder: &mut decoder::Decoder, pool_bytes: u64) {
+    decoder.register_cache_limit();
+    decoder.weights.prepare_mapped_pack().unwrap();
+    decoder.weights.select_mapped_residency(pool_bytes).unwrap();
+    decoder.weights.prepare_hot().unwrap();
+    decoder.weights.publish_live();
+    decoder.residency_changed();
+}
+
+/// The prompt in `prefill_slice_size` chunks; the logits of the last one.
+pub(super) fn prefill_all(decoder: &mut decoder::Decoder, prompt: &[u32]) -> MxArray {
+    let mut start = 0;
+    let mut logits = None;
+    while start < prompt.len() {
+        let end = (start + decoder.prefill_slice_size()).min(prompt.len());
+        logits = Some(
+            decoder
+                .prefill_chunk(&prompt[start..end], None, end == prompt.len())
+                .unwrap(),
+        );
+        start = end;
+    }
+    logits.expect("a non-empty prompt")
 }
 
 #[test]
@@ -151,6 +214,686 @@ fn failed_exclusive_turns_release_empty_owners_and_preserve_live_history() {
     );
     assert_eq!(states["live"], vec![3, 4]);
     assert_eq!(sequences.len(), 1);
+}
+
+/// An ownerless MTP request that still reaches the exclusive lane, where
+/// native MTP cannot run, must fail before prefill instead of decoding AR
+/// under `enableMtp: true`, and must name MLX_SERVE_FORCE_SERIAL only when
+/// that switch is what routed it there.
+///
+/// MUTATION: restore the silent decline (drop the ownerless check in
+/// `run_paged_turn`); the MTP turns then complete as AR and the
+/// `expect_err` below fails.
+/// MUTATION: name MLX_SERVE_FORCE_SERIAL unconditionally in that refusal;
+/// the `force_serial()` comparison below fails.
+#[test]
+fn ownerless_mtp_turn_errors_instead_of_decoding_autoregressive() {
+    use crate::engine::cmd::ChatCmd;
+    use crate::engine::hybrid_scheduler::{
+        HybridSchedulerBackend, HybridSchedulerState, SchedulerOwnerContext,
+    };
+    let mut inner = tiny_inner();
+    let mut sequences = std::collections::HashMap::new();
+    let mut states = std::collections::HashMap::new();
+    let mut next = 1;
+    let mut turn = |inner: &mut Inner, enable_mtp: bool, streaming: bool| {
+        let message: crate::tokenizer::ChatMessage =
+            serde_json::from_value(serde_json::json!({"role":"user","content":"a"})).unwrap();
+        let config = crate::engine::types::ChatConfig {
+            max_new_tokens: Some(2),
+            temperature: Some(0.0),
+            enable_mtp: Some(enable_mtp),
+            ..Default::default()
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (reply, mut rx) = tokio::sync::oneshot::channel();
+        let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(16);
+        let cmd = if streaming {
+            ChatCmd::StreamSessionStart {
+                messages: vec![message],
+                config,
+                cancelled,
+                stream_tx,
+            }
+        } else {
+            ChatCmd::SessionStart {
+                messages: vec![message],
+                config,
+                cancelled,
+                reply,
+            }
+        };
+        inner.execute_chat_barrier(
+            cmd,
+            SchedulerOwnerContext {
+                owner_sequences: &mut sequences,
+                owner_states: &mut states,
+                next_seq_id: &mut next,
+            },
+        );
+        let outcome = if streaming {
+            let mut last = None;
+            while let Ok(chunk) = stream_rx.try_recv() {
+                let failed = chunk.is_err();
+                last = Some(chunk.map(|_| ()));
+                if failed {
+                    break;
+                }
+            }
+            last.unwrap()
+        } else {
+            rx.try_recv().unwrap().map(|_| ())
+        };
+        (outcome, sequences.clone(), states.clone())
+    };
+    for streaming in [false, true] {
+        let (outcome, owners, _) = turn(&mut inner, true, streaming);
+        let reason = outcome.expect_err("ownerless MTP must not decode").reason;
+        assert!(
+            reason.starts_with("qwen4_exp runs enableMtp only on its shared scheduler"),
+            "{reason}"
+        );
+        assert_eq!(
+            reason.contains("MLX_SERVE_FORCE_SERIAL"),
+            HybridSchedulerState::<Inner>::force_serial(),
+            "{reason}"
+        );
+        assert!(owners.is_empty(), "a refused turn leaves no owner");
+        assert!(
+            inner
+                .decoder
+                .paged
+                .as_ref()
+                .unwrap()
+                .live_seq_ids()
+                .is_empty()
+        );
+    }
+    // The same ownerless request without MTP completes, so the refusal above
+    // is the MTP gate, not a fixture that cannot run a turn.
+    let (outcome, _, live) = turn(&mut inner, false, false);
+    outcome.unwrap();
+    let history = live[""].clone();
+    assert!(!history.is_empty());
+    // A refusal happens before prefill and keeps the live legacy session.
+    for streaming in [false, true] {
+        let (outcome, _, after) = turn(&mut inner, true, streaming);
+        assert!(outcome.is_err());
+        assert_eq!(after[""], history);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TurnKind {
+    Start,
+    Continue,
+    ContinueTool,
+    StreamContinue,
+    StreamContinueTool,
+}
+
+/// The fixture's page pool is 16 blocks (128 KiB). A 120-token MTP start needs
+/// 4 blocks of pages but 115 KiB of recurrent row and draft state, which the
+/// pool must not be charged for: on the real model that charge refused every
+/// MTP prompt above ~7.5k tokens ("max pool holds 1365").
+/// MUTATION: charge draft state to the pool again (override
+/// `scheduled_draft_state_bytes` in qwen4's scheduler impl with
+/// `memory::draft_state_bytes`); the start is refused with "max pool holds 16"
+/// and the `unwrap` of the turn fails.
+#[test]
+fn mtp_turn_near_the_context_limit_is_admitted_against_pages_only() {
+    use crate::engine::hybrid_scheduler::{
+        HybridSchedulerBackend, HybridSchedulerState, reservation_fits_empty_pool,
+    };
+    let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
+    let c = state.inner.decoder.config.clone();
+    let adapter = state.inner.decoder.paged.as_ref().unwrap();
+    let (blocks, bytes_per_block) = (adapter.block_capacity(), adapter.bytes_per_block().unwrap());
+    assert_eq!((blocks, bytes_per_block), (16, 8192));
+    let max_new_tokens = 120;
+    let requested = crate::engine::scheduler::scheduled_materialized_tokens(1, max_new_tokens);
+    let pages = requested.div_ceil(adapter.block_size());
+    let state_bytes =
+        memory::row_state_bytes(&c) + memory::draft_state_bytes(&c, u64::from(requested));
+    assert!(reservation_fits_empty_pool(
+        pages,
+        blocks,
+        bytes_per_block,
+        0
+    ));
+    assert!(
+        !reservation_fits_empty_pool(pages, blocks, bytes_per_block, state_bytes),
+        "{state_bytes} B of row and draft state beside {pages} pages must overflow the pool, or this test proves nothing"
+    );
+    let capacity = state.inner.scheduled_state_capacity().unwrap();
+    assert!(capacity.held == 0 && state_bytes <= capacity.budget);
+    let (_, cycles) = drive_turn(
+        &mut state,
+        TurnKind::Start,
+        true,
+        max_new_tokens as i32,
+        Some("long"),
+    )
+    .unwrap();
+    assert!(cycles.is_some_and(|n| n > 0), "{cycles:?}");
+    assert_eq!(state.owner_sequences.len(), 1);
+}
+
+/// Held off-pool state counts every parked or active row, each owner's draft
+/// K/V and the verify snapshots of an owner inside an MTP turn; a candidate
+/// that already owns a row or a draft frontier is charged only for what it
+/// adds.
+/// MUTATION: count only `rows` (drop the active row) in
+/// `scheduled_state_capacity`; the first `held == row` assertion fails.
+#[test]
+fn scheduled_state_accounting_counts_rows_and_tracked_drafts() {
+    use crate::engine::backend::PagedBackend;
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    let mut inner = tiny_inner();
+    let c = inner.decoder.config.clone();
+    let row = memory::row_state_bytes(&c);
+    let kv = memory::draft_kv_bytes_per_token(&c);
+    assert!(row > 0 && kv > 0);
+    let held = |inner: &Inner| inner.scheduled_state_capacity().unwrap().held;
+    assert_eq!(held(&inner), 0);
+    assert_eq!(inner.scheduled_state_candidate_bytes(1, 100, false), row);
+    assert_eq!(
+        inner.scheduled_state_candidate_bytes(1, 100, true),
+        row + memory::draft_state_bytes(&c, 100)
+    );
+    inner.activate_paged_seq(1).unwrap();
+    assert_eq!(held(&inner), row);
+    assert_eq!(inner.scheduled_state_candidate_bytes(1, 100, false), 0);
+    assert_eq!(inner.scheduled_state_candidate_bytes(2, 100, false), row);
+    inner.begin_mtp(1, 0).unwrap();
+    let prompt = [3, 9, 5, 2, 7, 11, 12, 8];
+    let prefix = inner
+        .prime_prefix_state(&prompt, false, 32, &[], 0)
+        .unwrap();
+    inner
+        .paged_prefill(
+            &prompt,
+            &prefix,
+            Stream::default(crate::stream::DeviceType::Gpu),
+        )
+        .unwrap();
+    let frontier = prompt.len() as u64;
+    // Nothing is cached yet: the trusted rows and the seed wait as hidden rows.
+    assert_eq!(inner.mtp.draft_rows(1), Some((0, prompt.len() - 1)));
+    let tracked = memory::draft_owner_bytes(&c, 0, frontier, true);
+    let parked = memory::draft_owner_bytes(&c, 0, frontier, false);
+    assert_eq!(held(&inner), row + tracked);
+    assert_eq!(
+        inner.scheduled_state_candidate_bytes(1, 100, true),
+        memory::draft_state_bytes(&c, 100 - frontier)
+    );
+    inner.release_scheduled_speculation(1);
+    assert_eq!(held(&inner), row + parked);
+    inner.park_active_scheduled_recurrent().unwrap();
+    assert_eq!(held(&inner), row + parked);
+    inner.activate_paged_seq(2).unwrap();
+    assert_eq!(held(&inner), 2 * row + parked);
+    inner.release_scheduled_recurrent_for(1);
+    assert_eq!(held(&inner), row);
+}
+
+/// Two MTP owners whose turns end right after a prefill that left width-1
+/// trusted rows waiting (nothing proposed): the parked owners keep those BF16
+/// hidden rows and the seed, nothing is flushed at parking, and the held
+/// state charges the rows at their hidden size with no draft K/V for them,
+/// so a third owner is admitted against what the rows really hold.
+/// MUTATION: charge waiting rows as draft K/V in
+/// `draft_owner_bytes`; the held assertions fail.
+#[test]
+fn parked_mtp_owners_charge_their_waiting_hidden_rows() {
+    use crate::engine::backend::PagedBackend;
+    use crate::engine::hybrid_scheduler::{
+        HybridSchedulerBackend, ScheduledStateCapacity, ScheduledStateFit, scheduled_state_fit,
+    };
+    let mut inner = tiny_inner();
+    let c = inner.decoder.config.clone();
+    let width = 8usize;
+    inner.decoder.prefill_window_pin = Some(width);
+    inner.decoder.prefill_chunk_size = width;
+    let row = memory::row_state_bytes(&c);
+    let hidden = memory::draft_hidden_row_bytes(&c);
+    assert!(hidden > 0);
+    let held = |inner: &Inner| inner.scheduled_state_capacity().unwrap().held;
+    let prompt: Vec<u32> = (0..width as u32).map(|i| (i * 5 + 3) % 60).collect();
+    for seq in [1u32, 2] {
+        inner.activate_paged_seq(seq).unwrap();
+        inner.begin_mtp(seq, 0).unwrap();
+        let prefix = inner
+            .prime_prefix_state(&prompt, false, 32, &[], 0)
+            .unwrap();
+        inner
+            .paged_prefill(
+                &prompt,
+                &prefix,
+                Stream::default(crate::stream::DeviceType::Gpu),
+            )
+            .unwrap();
+        assert_eq!(
+            inner.mtp.draft_rows(seq),
+            Some((0, width - 1)),
+            "width - 1 trusted rows wait beside the seed; the draft cache is empty"
+        );
+        inner.release_scheduled_speculation(seq);
+        assert_eq!(
+            inner.mtp.draft_rows(seq),
+            Some((0, width - 1)),
+            "parking flushes nothing"
+        );
+        inner.park_active_scheduled_recurrent().unwrap();
+    }
+    let parked = width as u64 * hidden;
+    assert_eq!(
+        parked,
+        memory::draft_owner_bytes(&c, 0, width as u64, false)
+    );
+    assert_eq!(held(&inner), 2 * (row + parked));
+    let candidate = inner.scheduled_state_candidate_bytes(3, width as u32, true);
+    let capacity = |budget: u64| {
+        Some(ScheduledStateCapacity {
+            budget,
+            held: held(&inner),
+        })
+    };
+    assert_eq!(
+        scheduled_state_fit(capacity(2 * (row + parked) + candidate), 0, candidate),
+        ScheduledStateFit::Fits
+    );
+    assert_eq!(
+        scheduled_state_fit(capacity(2 * (row + parked) + candidate - 1), 0, candidate),
+        ScheduledStateFit::AfterReclaim,
+        "one byte under what the parked rows hold must wait for reclaim"
+    );
+}
+
+/// Two MTP owners queued in one drive pass, before any scheduler step. The
+/// first owner's draft state does not exist until its first prefill chunk, so
+/// only the reservation kept on its waiting turn can make the second owner
+/// defer. The budget is shrunk through the prefill window to the shape of two
+/// 16k Flash Next owners (`memory::flash_next_scheduled_state_budget_holds_one_long_mtp_owner`):
+/// two rows and one draft fit, two drafts do not.
+/// MUTATION: drop `outstanding_bytes` from the sum in `scheduled_state_fit`;
+/// both owners are admitted in the first pass and `live_turns() == 1` fails.
+#[test]
+fn queued_mtp_owner_keeps_its_draft_reservation_until_its_owner_exists() {
+    use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, HybridSchedulerState};
+    use crate::model_thread::LoopControl;
+    let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
+    let c = state.inner.decoder.config.clone();
+    let adapter = state.inner.decoder.paged.as_ref().unwrap();
+    let pool = adapter.bytes_per_block().unwrap() * u64::from(adapter.block_capacity());
+    let max_new_tokens = 120;
+    let requested = crate::engine::scheduler::scheduled_materialized_tokens(1, max_new_tokens);
+    let row = memory::row_state_bytes(&c);
+    let draft = memory::draft_state_bytes(&c, u64::from(requested));
+    let target = 4 * row + draft;
+    let budget_at =
+        |chunk: usize| memory::scheduled_state_budget(pool, memory::prefill_scratch(&c, chunk));
+    let (mut lo, mut hi) = (1usize, 1usize << 31);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if budget_at(mid) <= target {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    // Every turn open re-derives the window from the plan; the pin keeps
+    // the shrunk budget through both admissions.
+    state.inner.decoder.prefill_window_pin = Some(lo);
+    state.inner.decoder.prefill_chunk_size = lo;
+    let capacity = state.inner.scheduled_state_capacity().unwrap();
+    assert_eq!(capacity.held, 0);
+    let budget = capacity.budget;
+    assert!(
+        2 * row + draft <= budget && budget < 2 * row + 2 * draft,
+        "budget {budget} B must admit two rows and one draft ({} B) but not two drafts ({} B)",
+        2 * row + draft,
+        2 * row + 2 * draft
+    );
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (first, mut first_reply) =
+        turn_command(TurnKind::Start, true, max_new_tokens as i32, Some("first"));
+    let (second, mut second_reply) =
+        turn_command(TurnKind::Start, true, max_new_tokens as i32, Some("second"));
+    assert!(sender.send(first).is_ok() && sender.send(second).is_ok());
+    assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+    assert_eq!(
+        state.live_turns(),
+        1,
+        "the second owner must wait for the first owner's draft reservation"
+    );
+    assert!(state.has_prepared_waiting());
+    assert!(second_reply.poll().is_none());
+    let (first_text, first_cycles) =
+        finish_turn(&mut state, &mut receiver, &mut first_reply).unwrap();
+    assert!(first_cycles.is_some_and(|n| n > 0), "{first_cycles:?}");
+    let (second_text, second_cycles) =
+        finish_turn(&mut state, &mut receiver, &mut second_reply).unwrap();
+    assert!(second_cycles.is_some_and(|n| n > 0), "{second_cycles:?}");
+    assert_eq!(second_text, first_text);
+    assert_eq!(state.owner_sequences.len(), 2);
+}
+
+/// A preempted MTP turn drops its row and draft owner and re-admits both on
+/// resume. The resume sizes the draft state from the turn's token bound, not
+/// from its block reservation: with `MLX_SCHED_RESERVE_FULL_ISL=0` the block
+/// reservation covers the prompt plus one growth block, and a turn re-admitted
+/// at that size would grow its draft frontier beside owners the full bound
+/// defers. The turn is admitted with the full-ISL reservation and shrunk to
+/// the partial shape before the preemption.
+/// MUTATION: size the resume candidate from
+/// `block_reservation_total * block_size` again in `try_resume_preempted`;
+/// the resumed turn carries `row + draft(64 tokens)` and the
+/// `scheduled_state_bytes` assertion after the resume fails.
+#[test]
+fn resumed_mtp_turn_keeps_the_draft_reservation_of_its_token_bound() {
+    use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, HybridSchedulerState};
+    use crate::engine::scheduler::TurnStatus;
+    use crate::model_thread::LoopControl;
+    let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
+    let c = state.inner.decoder.config.clone();
+    let max_new_tokens = 120;
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (command, mut reply) = turn_command(TurnKind::Start, true, max_new_tokens, Some("owner"));
+    assert!(sender.send(command).is_ok());
+    assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+    let seq = state.owner_sequences["owner"];
+    let turn = state.turn_mut(seq).unwrap();
+    assert_eq!(turn.status, TurnStatus::Running);
+    let prompt_tokens = turn.payload.prompt_tokens.len() as u32;
+    let requested = crate::engine::scheduler::scheduled_materialized_tokens(
+        prompt_tokens,
+        max_new_tokens as u32,
+    );
+    let reserved =
+        memory::row_state_bytes(&c) + memory::draft_state_bytes(&c, u64::from(requested));
+    assert_eq!(turn.scheduled_state_bytes, reserved);
+    turn.block_reservation_total = prompt_tokens.div_ceil(turn.block_size) + 1;
+    let partial = turn.block_reservation_total * turn.block_size;
+    assert!(
+        partial < requested,
+        "a {partial}-token block reservation must undercut the {requested}-token bound, or this test proves nothing"
+    );
+    assert!(state.preempt_running(seq));
+    assert!(
+        state.turn_mut(seq).unwrap().scheduled_state_bytes == reserved
+            && state.inner.scheduled_state_capacity().unwrap().held == 0,
+        "preemption releases the row and the draft owner"
+    );
+    state.resume_preempted();
+    let turn = state.turn_mut(seq).unwrap();
+    assert_eq!((turn.status, turn.preemptions), (TurnStatus::Waiting, 1));
+    assert_eq!(turn.scheduled_state_bytes, reserved);
+    let (text, cycles) = finish_turn(&mut state, &mut receiver, &mut reply).unwrap();
+    assert!(cycles.is_some_and(|n| n > 0), "{cycles:?}");
+    let (control, _) = drive_turn(
+        &mut state,
+        TurnKind::Start,
+        true,
+        max_new_tokens,
+        Some("control"),
+    )
+    .unwrap();
+    assert_eq!(text, control);
+}
+
+/// Drives one turn without a `cacheOwnerId` through the scheduler and returns
+/// its text and MTP cycle count.
+fn drive_ownerless_turn(
+    state: &mut crate::engine::hybrid_scheduler::HybridSchedulerState<Inner>,
+    kind: TurnKind,
+    enable_mtp: bool,
+) -> Result<(String, Option<u32>)> {
+    drive_turn(state, kind, enable_mtp, 8, None)
+}
+
+/// Drives one turn through the scheduler and returns its text and MTP cycle
+/// count.
+fn drive_turn(
+    state: &mut crate::engine::hybrid_scheduler::HybridSchedulerState<Inner>,
+    kind: TurnKind,
+    enable_mtp: bool,
+    max_new_tokens: i32,
+    cache_owner_id: Option<&str>,
+) -> Result<(String, Option<u32>)> {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (command, mut reply) = turn_command(kind, enable_mtp, max_new_tokens, cache_owner_id);
+    assert!(sender.send(command).is_ok());
+    finish_turn(state, &mut receiver, &mut reply)
+}
+
+type CommandReceiver = tokio::sync::mpsc::UnboundedReceiver<
+    crate::engine::model_command::ModelCommand<std::convert::Infallible>,
+>;
+
+/// Drives the scheduler until `reply` resolves.
+fn finish_turn(
+    state: &mut crate::engine::hybrid_scheduler::HybridSchedulerState<Inner>,
+    receiver: &mut CommandReceiver,
+    reply: &mut TurnReply,
+) -> Result<(String, Option<u32>)> {
+    use crate::model_thread::LoopControl;
+    for _ in 0..1024 {
+        if let Some(result) = reply.poll() {
+            return result;
+        }
+        assert!(matches!(state.drive(receiver), LoopControl::Continue));
+    }
+    panic!("the {:?} turn did not finish", reply.kind);
+}
+
+struct TurnReply {
+    kind: TurnKind,
+    rx: tokio::sync::oneshot::Receiver<Result<crate::engine::types::ChatResult>>,
+    stream_rx: tokio::sync::mpsc::Receiver<Result<crate::engine::types::ChatStreamChunk>>,
+    streamed: String,
+}
+
+impl TurnReply {
+    /// The turn's text and MTP cycle count once it has replied.
+    fn poll(&mut self) -> Option<Result<(String, Option<u32>)>> {
+        while let Ok(chunk) = self.stream_rx.try_recv() {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => return Some(Err(error)),
+            };
+            self.streamed.push_str(&chunk.text);
+            if chunk.done {
+                return Some(Ok((
+                    std::mem::take(&mut self.streamed),
+                    chunk.performance.and_then(|p| p.mtp_cycles),
+                )));
+            }
+        }
+        match self.rx.try_recv() {
+            Ok(Ok(result)) => Some(Ok((
+                result.text,
+                result.performance.and_then(|p| p.mtp_cycles),
+            ))),
+            Ok(Err(error)) => Some(Err(error)),
+            Err(_) => None,
+        }
+    }
+}
+
+/// One chat command for the scheduler and the handle its reply arrives on.
+fn turn_command(
+    kind: TurnKind,
+    enable_mtp: bool,
+    max_new_tokens: i32,
+    cache_owner_id: Option<&str>,
+) -> (
+    crate::engine::model_command::ModelCommand<std::convert::Infallible>,
+    TurnReply,
+) {
+    use crate::engine::cmd::ChatCmd;
+    use crate::engine::model_command::ModelCommand;
+    let message = |role: &str| -> crate::tokenizer::ChatMessage {
+        serde_json::from_value(serde_json::json!({"role": role, "content": "a"})).unwrap()
+    };
+    let messages = match kind {
+        TurnKind::Start => vec![message("user")],
+        TurnKind::Continue | TurnKind::StreamContinue => {
+            vec![message("user"), message("assistant"), message("user")]
+        }
+        TurnKind::ContinueTool | TurnKind::StreamContinueTool => {
+            vec![message("user"), message("assistant"), message("tool")]
+        }
+    };
+    let config = crate::engine::types::ChatConfig {
+        max_new_tokens: Some(max_new_tokens),
+        temperature: Some(0.0),
+        enable_mtp: Some(enable_mtp),
+        mtp_depth: Some(2),
+        mtp_adaptive_depth: Some(false),
+        report_performance: Some(true),
+        cache_owner_id: cache_owner_id.map(str::to_owned),
+        ..Default::default()
+    };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let (stream_tx, stream_rx) = crate::model_thread::stream_channel(256);
+    let command = match kind {
+        TurnKind::Start => ChatCmd::SessionStart {
+            messages,
+            config,
+            reply,
+            cancelled,
+        },
+        TurnKind::Continue => ChatCmd::SessionContinue {
+            messages,
+            config,
+            reply,
+            cancelled,
+        },
+        TurnKind::ContinueTool => ChatCmd::SessionContinueTool {
+            messages,
+            config,
+            reply,
+            cancelled,
+        },
+        TurnKind::StreamContinue => ChatCmd::StreamSessionContinue {
+            messages,
+            config,
+            stream_tx,
+            cancelled,
+        },
+        TurnKind::StreamContinueTool => ChatCmd::StreamSessionContinueTool {
+            messages,
+            config,
+            stream_tx,
+            cancelled,
+        },
+    };
+    (
+        ModelCommand::from_chat(command),
+        TurnReply {
+            kind,
+            rx,
+            stream_rx,
+            streamed: String::new(),
+        },
+    )
+}
+
+/// An ownerless `enableMtp` start or continuation (sync, streaming, tool)
+/// runs native MTP on the scheduler as the empty owner, the session ownerless
+/// exclusive turns already keep: an ownerless AR turn in between reuses that
+/// owner, and repeated requests never add an owner or a parked row.
+///
+/// MUTATION: drop `ownerless_speculation_is_scheduled` from the lane choice in
+/// `HybridSchedulerState::drive`; the MTP start then takes the exclusive lane,
+/// is refused, and the first `unwrap` below fails.
+/// MUTATION: drop the empty-owner fallback from `owner_known` in
+/// `chat_requires_barrier`; the first MTP continuation then takes the
+/// exclusive lane, is refused, and its `unwrap` fails.
+#[test]
+fn ownerless_mtp_turn_runs_on_the_scheduler_as_the_ownerless_session() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerState;
+    let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
+    let (text, cycles) = drive_ownerless_turn(&mut state, TurnKind::Start, true).unwrap();
+    assert!(cycles.is_some_and(|n| n > 0), "{cycles:?}");
+    assert_eq!(state.owner_sequences.len(), 1);
+    let seq = state.owner_sequences[""];
+    let (plain, cycles) = drive_ownerless_turn(&mut state, TurnKind::Start, false).unwrap();
+    assert_eq!(cycles, None);
+    assert_eq!(plain, text);
+    let (again, cycles) = drive_ownerless_turn(&mut state, TurnKind::Start, true).unwrap();
+    assert!(cycles.is_some_and(|n| n > 0), "{cycles:?}");
+    assert_eq!(again, text);
+    for kind in [
+        TurnKind::Continue,
+        TurnKind::StreamContinue,
+        TurnKind::ContinueTool,
+        TurnKind::StreamContinueTool,
+    ] {
+        let (_, cycles) = drive_ownerless_turn(&mut state, kind, true)
+            .unwrap_or_else(|error| panic!("{kind:?}: {}", error.reason));
+        assert!(cycles.is_some_and(|n| n > 0), "{kind:?}: {cycles:?}");
+        assert_eq!(
+            state.owner_sequences,
+            std::collections::HashMap::from([(String::new(), seq)]),
+            "{kind:?}"
+        );
+        assert_eq!(
+            state.inner.rows.len() + usize::from(state.inner.active_seq.is_some()),
+            1,
+            "{kind:?}"
+        );
+    }
+}
+
+/// Under MLX_SERVE_FORCE_SERIAL every turn takes the exclusive lane, so an
+/// ownerless `enableMtp` start or continuation is refused before prefill and
+/// the refusal names the switch; an ownerless AR turn still runs.
+///
+/// MUTATION: never name MLX_SERVE_FORCE_SERIAL in the `run_paged_turn`
+/// refusal; the child's `contains` assertions fail.
+#[test]
+fn forced_serial_refuses_ownerless_mtp_and_names_the_switch() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerState;
+    const CHILD: &str = "MLX_QWEN4_FORCED_SERIAL_MTP_CHILD";
+    const NAME: &str =
+        "models::qwen4_exp::tests::forced_serial_refuses_ownerless_mtp_and_names_the_switch";
+    if std::env::var_os(CHILD).is_none() {
+        // The switch is read from the process environment on every command;
+        // a child process keeps it away from concurrent scheduler tests.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME])
+            .env(CHILD, "1")
+            .env("MLX_SERVE_FORCE_SERIAL", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    assert!(HybridSchedulerState::<Inner>::force_serial());
+    let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
+    let refused = |result: Result<(String, Option<u32>)>| {
+        let reason = result.expect_err("ownerless MTP must not decode").reason;
+        assert!(reason.contains("MLX_SERVE_FORCE_SERIAL"), "{reason}");
+    };
+    refused(drive_ownerless_turn(&mut state, TurnKind::Start, true));
+    let (_, cycles) = drive_ownerless_turn(&mut state, TurnKind::Start, false).unwrap();
+    assert_eq!(cycles, None);
+    for kind in [
+        TurnKind::Continue,
+        TurnKind::StreamContinue,
+        TurnKind::ContinueTool,
+        TurnKind::StreamContinueTool,
+    ] {
+        refused(drive_ownerless_turn(&mut state, kind, true));
+    }
 }
 
 #[test]
@@ -425,77 +1168,6 @@ fn q5_1_ssd_rows_preserve_high_bits_and_stored_minimum() {
     assert_eq!(store.bytes_read, bytes, "warm lookup must not read SSD");
 }
 
-#[test]
-fn full_bank_preparation_reuses_streamed_expert_chunks_after_restart() {
-    let dir = Temp::new();
-    let path = dir.0.join("test.gguf");
-    let mut b = b"GGUF".to_vec();
-    b.extend_from_slice(&3u32.to_le_bytes());
-    b.extend_from_slice(&1u64.to_le_bytes());
-    b.extend_from_slice(&1u64.to_le_bytes());
-    gguf_string(&mut b, "general.architecture");
-    b.extend_from_slice(&8u32.to_le_bytes());
-    gguf_string(&mut b, "qwen4exp");
-    let name = "blk.0.ffn_gate_exps.weight";
-    gguf_string(&mut b, name);
-    b.extend_from_slice(&3u32.to_le_bytes());
-    for d in [32u64, 256, 2] {
-        b.extend_from_slice(&d.to_le_bytes());
-    }
-    b.extend_from_slice(&7u32.to_le_bytes());
-    b.extend_from_slice(&0u64.to_le_bytes());
-    while !b.len().is_multiple_of(32) {
-        b.push(0);
-    }
-    for row in 0..512 {
-        b.extend_from_slice(&half::f16::from_f32(0.25).to_bits().to_le_bytes());
-        b.extend_from_slice(&half::f16::from_f32(-2.0).to_bits().to_le_bytes());
-        b.extend_from_slice(&(row as u32 * 7919).to_le_bytes());
-        b.extend_from_slice(&[row as u8; 16]);
-    }
-    std::fs::write(&path, b).unwrap();
-    let mut streaming = weights::Store::open_fixture(&path, Some(&dir.0)).unwrap();
-    let expected = streaming
-        .read(name, 0, 256)
-        .unwrap()
-        .values
-        .to_uint32()
-        .unwrap()
-        .to_vec();
-    assert_eq!(streaming.bytes_read, 256 * 24);
-    drop(streaming);
-    let mut resident = weights::Store::open_fixture(&path, Some(&dir.0)).unwrap();
-    resident.plan.resident = true;
-    resident.prepare_fixture_hot().unwrap();
-    assert_eq!(
-        resident.packed_hits, 1,
-        "the previously prepared expert must be reused"
-    );
-    assert_eq!(
-        resident.bytes_read,
-        256 * 24,
-        "only the cold expert should be imported"
-    );
-    assert_eq!(
-        &*resident
-            .read(name, 0, 256)
-            .unwrap()
-            .values
-            .to_uint32()
-            .unwrap(),
-        &expected
-    );
-    drop(resident);
-    let mut restarted = weights::Store::open_fixture(&path, Some(&dir.0)).unwrap();
-    restarted.plan.resident = true;
-    restarted.prepare_fixture_hot().unwrap();
-    assert_eq!(restarted.packed_hits, 2);
-    assert_eq!(
-        restarted.bytes_read, 0,
-        "resident restart must not repeat imports"
-    );
-}
-
 /// One prefill-contract case: which fixture (`""` is the F32 root, `bf16`,
 /// `bf16/paged`), whether to open its GGUF file (the GGUF layout transforms:
 /// split gate/up experts, tiled GDN heads, combined PLE table) or the
@@ -512,13 +1184,13 @@ fn full_bank_preparation_reuses_streamed_expert_chunks_after_restart() {
 ///   `attention_window`, the rest the sparse singleton path.
 /// - width 7: the first chunk is a dense window (BF16) that splits an index
 ///   block (7 = 4 + 3); every later chunk is past the budget; a 36-token
-///   prompt ends on a 1-token chunk, the singleton `layer_with_norm` path
+///   prompt ends on a 1-token chunk, the singleton `layer` path
 ///   inside `prefill_chunk`.
 /// - width 32: crosses the budget inside one chunk, leaves a 4-token tail;
-///   `batched_prefill_*` prepares the fixture under `policy = "auto"` here,
-///   the slotted-expert tier.
-/// - width 64 / 128: past the resident-bank threshold (`prepare_fixture_hot`
-///   with `plan.resident`), over a 126-token prompt: two chunks, or one.
+///   `batched_prefill_*` prepares the fixed projection banks here, the
+///   slotted-expert tier.
+/// - width 64 / 128: the same banks over a 126-token prompt: two chunks, or
+///   one.
 struct PrefillCase {
     fixture: &'static str,
     gguf: bool,
@@ -573,55 +1245,19 @@ impl PrefillCase {
     }
 }
 
-/// `prefill_chunk` with batching off (one `layer` per token inside the chunk
-/// loop) against `step` one token at a time: exact logits, history and
-/// continuation. F32 and BF16, both layouts, a width below the indexer
-/// compress ratio (the first chunk forms no index block), a width that ends
-/// on a 1-token chunk and one that crosses the indexer budget inside a chunk.
-#[test]
-fn chunked_prefill_preserves_singleton_logits_and_continuation() {
-    for case in [
-        PrefillCase::new("", false, 7),
-        PrefillCase::new("", true, 32),
-        PrefillCase::new("bf16", true, 2),
-        PrefillCase::new("bf16", true, 7),
-        PrefillCase::new("bf16", false, 32),
-    ] {
-        let (path, width) = (case.path(), case.width);
-        let (mut single, mut chunked) = case.decoders();
-        chunked.batch_prefill = false;
-        let tokens = [3, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4, 7, 1, 3, 5, 6, 8].repeat(2);
-        for chunk in tokens.chunks(width) {
-            let mut want = None;
-            for &token in chunk {
-                want = Some(single.step(token).unwrap());
-            }
-            let got = chunked.prefill_chunk(chunk, None, true).unwrap();
-            assert_eq!(
-                &*got.to_float32().unwrap(),
-                &*want.unwrap().to_float32().unwrap(),
-                "{path:?}, chunk width {width}"
-            );
-            assert_eq!(chunked.history, single.history);
-        }
-        assert_eq!(
-            &*chunked.step(11).unwrap().to_float32().unwrap(),
-            &*single.step(11).unwrap().to_float32().unwrap()
-        );
-    }
-}
-
-/// Batched prefill (`attention_batch` + `mlp_batch`, or the window carry)
-/// against the unbatched chunk, across the expert tiers the width selects:
-/// demand-loaded experts (safetensors' combined `gate_up_proj` and GGUF's
-/// split `ffn_gate/up_exps`), `policy = "auto"` slots at width 32, and
-/// resident banks at 64 / 128 over a 126-token prompt. The F32 root fixture
-/// holds the exact tolerance; BF16 allows the TF32 window.
+/// The window carry against `step` one token at a time, across the expert
+/// tiers the width selects: demand-loaded experts (safetensors' combined
+/// `gate_up_proj` and GGUF's split `ffn_gate/up_exps`), and fixed projection
+/// banks with slotted experts at width 32, 64 and 128 (a 126-token prompt).
+/// The F32 root fixture holds the exact tolerance; BF16 allows the TF32
+/// window.
 #[test]
 fn batched_prefill_matches_reference_across_chunks_sparse_boundaries_and_continuation() {
     for case in [
         PrefillCase::new("", false, 7),
+        PrefillCase::new("", true, 32),
         PrefillCase::new("", true, 64),
+        PrefillCase::new("bf16", true, 2),
         PrefillCase::new("bf16", true, 7),
         PrefillCase::new("bf16", false, 32),
         PrefillCase::new("bf16/paged", true, 2),
@@ -629,16 +1265,10 @@ fn batched_prefill_matches_reference_across_chunks_sparse_boundaries_and_continu
         PrefillCase::new("bf16/paged", false, 128),
     ] {
         let (path, width) = (case.path(), case.width);
-        let (mut scalar, mut batched) = case.decoders();
-        scalar.batch_prefill = false;
-        if width >= 64 {
-            batched.weights.plan.resident = true;
-            batched.weights.prepare_fixture_hot().unwrap();
-        } else if width == 32 {
+        let (mut single, mut batched) = case.decoders();
+        if width >= 32 {
             // Assembled fixed projections with demand-loaded experts
             // must preserve the same prompt/continuation contract.
-            batched.weights.plan.resident = false;
-            batched.weights.plan.policy = "auto".into();
             batched.weights.prepare_fixture_hot().unwrap();
         }
         let tokens = [3, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4, 7, 1, 3, 5, 6, 8]
@@ -649,9 +1279,12 @@ fn batched_prefill_matches_reference_across_chunks_sparse_boundaries_and_continu
             0.04
         };
         for chunk in tokens.chunks(width) {
-            let want = scalar.prefill_chunk(chunk, None, true).unwrap();
+            let mut want = None;
+            for &token in chunk {
+                want = Some(single.step(token).unwrap());
+            }
             let got = batched.prefill_chunk(chunk, None, true).unwrap();
-            let a = want.to_float32().unwrap();
+            let a = want.unwrap().to_float32().unwrap();
             let b = got.to_float32().unwrap();
             let error = a
                 .iter()
@@ -659,9 +1292,9 @@ fn batched_prefill_matches_reference_across_chunks_sparse_boundaries_and_continu
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
             assert!(error < tolerance, "{path:?}, width={width}, error={error}");
-            assert_eq!(scalar.history, batched.history);
+            assert_eq!(single.history, batched.history);
         }
-        let a = scalar.step(11).unwrap().to_float32().unwrap();
+        let a = single.step(11).unwrap().to_float32().unwrap();
         let b = batched.step(11).unwrap().to_float32().unwrap();
         let error = a
             .iter()
@@ -675,14 +1308,24 @@ fn batched_prefill_matches_reference_across_chunks_sparse_boundaries_and_continu
     }
 }
 
-/// The window carry with asynchronous MLP submission against per-row
-/// batching with synchronous evaluation, over a 126-token prompt: exact
-/// logits, history, every retained frontier row, and continuation. A width
-/// that opens with a dense sub-budget window (7), one of 32-token windows
-/// (32, 32, 32, 30) and the whole prompt as one window; F32 (no dense
-/// window) and both BF16 fixtures, both layouts.
+/// The window carry against `step` one token at a time over a 126-token
+/// prompt: logits, history, every retained frontier row, and continuation.
+/// A width that opens with a dense sub-budget window (7), one of 32-token
+/// windows (32, 32, 32, 30) and the whole prompt as one window; F32 (no
+/// dense window) and both BF16 fixtures, both layouts.
 #[test]
 fn contiguous_prompt_windows_preserve_rows_frontiers_and_continuation() {
+    // Largest difference, relative to the reference's largest magnitude.
+    let error = |a: &MxArray, b: &MxArray| {
+        let (a, b) = (a.to_float32().unwrap(), b.to_float32().unwrap());
+        assert_eq!(a.len(), b.len());
+        let scale = a.iter().fold(1f32, |m, v| m.max(v.abs()));
+        a.iter()
+            .zip(b.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / scale
+    };
     for case in [
         PrefillCase::new("", true, 7),
         PrefillCase::new("bf16", false, 32),
@@ -690,165 +1333,91 @@ fn contiguous_prompt_windows_preserve_rows_frontiers_and_continuation() {
         PrefillCase::new("bf16/paged", true, 128),
     ] {
         let (path, width) = (case.path(), case.width);
-        let (mut rows, mut window) = case.decoders();
-        rows.window_carry = false;
-        rows.async_prefill = false;
-        window.async_prefill = true;
+        let (mut single, mut window) = case.decoders();
+        let tolerance = if case.fixture.is_empty() {
+            0.0001
+        } else {
+            0.04
+        };
         let tokens = [3, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4, 7, 1, 3, 5, 6, 8].repeat(7);
         for chunk in tokens.chunks(width) {
-            let expected = rows.prefill_chunk(chunk, None, true).unwrap();
-            let actual = window.prefill_chunk(chunk, None, true).unwrap();
-            assert_eq!(
-                &*expected.to_float32().unwrap(),
-                &*actual.to_float32().unwrap(),
-                "{path:?}, width={width}"
-            );
-            assert_eq!(rows.history, window.history);
-            assert_eq!(rows.last_chunk_hidden.len(), window.last_chunk_hidden.len());
-            for (a, b) in rows.last_chunk_hidden.iter().zip(&window.last_chunk_hidden) {
-                assert_eq!(&*a.to_float32().unwrap(), &*b.to_float32().unwrap());
+            let mut want = None;
+            let mut rows = Vec::with_capacity(chunk.len());
+            for &token in chunk {
+                want = Some(single.step(token).unwrap());
+                rows.push(single.last_chunk_hidden[0].clone());
+            }
+            let got = window.prefill_chunk(chunk, None, true).unwrap();
+            let e = error(&want.unwrap(), &got);
+            assert!(e < tolerance, "{path:?}, width={width}, error={e}");
+            assert_eq!(single.history, window.history);
+            assert_eq!(rows.len(), window.last_chunk_hidden.len());
+            for (j, (a, b)) in rows.iter().zip(&window.last_chunk_hidden).enumerate() {
+                let e = error(a, b);
+                assert!(e < tolerance, "{path:?}, width={width}, row {j}: error={e}");
             }
         }
-        assert_eq!(
-            &*rows.step(11).unwrap().to_float32().unwrap(),
-            &*window.step(11).unwrap().to_float32().unwrap()
+        let e = error(&single.step(11).unwrap(), &window.step(11).unwrap());
+        assert!(
+            e < tolerance,
+            "continuation {path:?}, width={width}, error={e}"
         );
     }
 }
 
+/// The batched rotary tables rotate a window bit for bit like `rope` row by
+/// row, over contiguous windows and strided index-block positions, and new
+/// positions (another owner) never reuse the previous owner's tables.
 #[test]
-fn batched_rotary_preserves_split_indexer_blocks_and_owner_changes() {
+fn batched_rotary_matches_per_row_rope_across_owner_changes() {
+    use crate::array::DType;
     let path = fixture().join("bf16");
     let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
-    let mut config = config::Config::parse(&raw).unwrap();
-    // Cross the dense-to-sparse attention boundary after forming batched blocks.
-    config.indexer_budget = 32;
-    let mut reference = decoder::Decoder::new(
-        config.clone(),
-        weights::Store::open_fixture(&path, None).unwrap(),
-    )
-    .unwrap();
-    reference.batch_rotary = false;
-    let mut candidate =
+    let config = config::Config::parse(&raw).unwrap();
+    let head = config.head_dim as i64;
+    let mut decoder =
         decoder::Decoder::new(config, weights::Store::open_fixture(&path, None).unwrap()).unwrap();
-    for owner in 0..2 {
-        reference.reset();
-        candidate.reset();
-        let positions: Vec<_> = (0..96)
+    let mut offset = 0;
+    let mut windows: Vec<Vec<usize>> = [3, 7, 2, 17, 3, 4, 28, 32]
+        .iter()
+        .map(|&count| {
+            let window = (offset..offset + count).collect();
+            offset += count;
+            window
+        })
+        .collect();
+    windows.push((0..6).map(|b| 5 + 4 * b).collect());
+    for owner in 0..2i64 {
+        decoder.positions = (0..96)
             .map(|p| [p + owner * 100, p / 3 + owner * 10, p / 5 + 3])
             .collect();
-        reference.positions = positions.clone();
-        candidate.positions = positions;
-        let tokens = [3, 9, 4, 7, 1, 5, 8, 2].repeat(12);
-        let mut offset = 0;
-        for count in [3, 7, 2, 17, 3, 4, 28, 32] {
-            let chunk = &tokens[offset..offset + count];
-            let expected = reference.prefill_chunk(chunk, None, true).unwrap();
-            let got = candidate.prefill_chunk(chunk, None, true).unwrap();
+        for offsets in &windows {
+            let t = offsets.len() as i64;
+            let values: Vec<f32> = (0..2 * t * head)
+                .map(|i| (i as f32 * 0.37 + owner as f32).sin())
+                .collect();
+            let x = MxArray::from_float32(&values, &[1, 2, t, head])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            let got = decoder.rope_positions(&x, offsets).unwrap();
+            let rows = offsets
+                .iter()
+                .enumerate()
+                .map(|(j, &pos)| {
+                    decoder
+                        .rope_row(&x.slice_axis(2, j as i64, j as i64 + 1).unwrap(), pos)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let want = MxArray::concatenate_many(rows.iter().collect(), Some(2)).unwrap();
             assert_eq!(
                 &*got.to_float32().unwrap(),
-                &*expected.to_float32().unwrap(),
-                "owner={owner}, offset={offset}"
+                &*want.to_float32().unwrap(),
+                "owner={owner}, offsets={offsets:?}"
             );
-            offset += count;
         }
-        // Restoring a frontier must not keep the next owner's rotary tables.
-        let saved = candidate.snapshot();
-        assert_eq!(
-            &*candidate.step(11).unwrap().to_float32().unwrap(),
-            &*reference.step(11).unwrap().to_float32().unwrap()
-        );
-        candidate.restore_state(saved);
     }
-}
-
-#[test]
-fn prepared_ssd_matrix_survives_store_reopen_and_recovers_from_corruption() {
-    let dir = Temp::new();
-    let path = dir.0.join("test.gguf");
-    let mut b = b"GGUF".to_vec();
-    b.extend_from_slice(&3u32.to_le_bytes());
-    b.extend_from_slice(&1u64.to_le_bytes());
-    b.extend_from_slice(&1u64.to_le_bytes());
-    gguf_string(&mut b, "general.architecture");
-    b.extend_from_slice(&8u32.to_le_bytes());
-    gguf_string(&mut b, "qwen4exp");
-    gguf_string(&mut b, "projection.weight");
-    b.extend_from_slice(&2u32.to_le_bytes());
-    b.extend_from_slice(&32u64.to_le_bytes());
-    b.extend_from_slice(&256u64.to_le_bytes());
-    b.extend_from_slice(&7u32.to_le_bytes());
-    b.extend_from_slice(&0u64.to_le_bytes());
-    while !b.len().is_multiple_of(32) {
-        b.push(0);
-    }
-    for row in 0..256 {
-        b.extend_from_slice(&half::f16::from_f32(0.25).to_bits().to_le_bytes());
-        b.extend_from_slice(&half::f16::from_f32(-2.0).to_bits().to_le_bytes());
-        b.extend_from_slice(&(row as u32 * 7919).to_le_bytes());
-        b.extend_from_slice(&[row as u8; 16]);
-    }
-    std::fs::write(&path, b).unwrap();
-    let mut first = weights::Store::open_fixture(&path, Some(&dir.0)).unwrap();
-    let want = first
-        .read("projection.weight", 0, 256)
-        .unwrap()
-        .values
-        .to_uint32()
-        .unwrap()
-        .to_vec();
-    assert_eq!(first.bytes_read, 256 * 24);
-    drop(first);
-    let mut reopened = weights::Store::open_fixture(&path, Some(&dir.0)).unwrap();
-    assert_eq!(
-        reopened
-            .read("projection.weight", 0, 256)
-            .unwrap()
-            .values
-            .to_uint32()
-            .unwrap()
-            .as_ref(),
-        want.as_slice()
-    );
-    assert_eq!(reopened.bytes_read, 0);
-    assert_eq!(reopened.packed_hits, 1);
-    drop(reopened);
-    let alias = dir.0.join("alias.gguf");
-    std::os::unix::fs::symlink(&path, &alias).unwrap();
-    let mut aliased = weights::Store::open_fixture(&alias, Some(&dir.0)).unwrap();
-    aliased.read("projection.weight", 0, 256).unwrap();
-    assert_eq!(
-        aliased.bytes_read, 0,
-        "symlink alias must reuse prepared matrices"
-    );
-    assert_eq!(aliased.packed_hits, 1);
-    drop(aliased);
-    let root = std::fs::read_dir(&dir.0)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .find(|p| p.is_dir())
-        .unwrap();
-    let entry = std::fs::read_dir(root)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .find(|p| p.extension().is_some_and(|s| s == "pack"))
-        .unwrap();
-    let mut bytes = std::fs::read(&entry).unwrap();
-    *bytes.last_mut().unwrap() ^= 1;
-    std::fs::write(entry, bytes).unwrap();
-    let mut repaired = weights::Store::open_fixture(&path, Some(&dir.0)).unwrap();
-    assert_eq!(
-        repaired
-            .read("projection.weight", 0, 256)
-            .unwrap()
-            .values
-            .to_uint32()
-            .unwrap()
-            .as_ref(),
-        want.as_slice()
-    );
-    assert_eq!(repaired.bytes_read, 256 * 24);
-    assert_eq!(repaired.packed_hits, 0);
 }
 
 #[test]
@@ -954,109 +1523,6 @@ fn fused_recurrence_sequence_matches_varying_stepwise_inputs_and_continuation() 
 }
 
 #[test]
-fn vector_recurrence_preserves_outputs_state_and_continuation() {
-    use crate::array::DType;
-    const CHILD: &str = "MLX_QWEN4_VECTOR_RECURRENCE_TEST_CHILD";
-    if std::env::var(CHILD).as_deref() != Ok("1") {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "models::qwen4_exp::tests::vector_recurrence_preserves_outputs_state_and_continuation",
-                "--test-threads=1",
-            ])
-            .env(CHILD, "1")
-            .env("MLX_QWEN4_GDN_4ROWS", "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    let make = |shape: &[i64], phase: f32, scale: f32, dtype: DType, strided: bool, offset: i64| {
-        let n = shape.iter().product::<i64>();
-        let data = (0..(n + offset) * if strided { 2 } else { 1 })
-            .map(|i| ((i as f32 + phase) * 0.017).sin() * scale)
-            .collect::<Vec<_>>();
-        let x = MxArray::from_float32(&data, &[n + offset, if strided { 2 } else { 1 }])
-            .unwrap()
-            .astype(dtype)
-            .unwrap();
-        let x = x.slice_axis(0, offset, n + offset).unwrap();
-        let x = if strided {
-            x.slice_axis(1, 0, 1).unwrap()
-        } else {
-            x
-        };
-        x.reshape(shape).unwrap()
-    };
-    for dtype in [DType::Float32, DType::BFloat16] {
-        for (strided, offset) in [(false, 0), (true, 0), (false, 1), (true, 1)] {
-            let initial = make(
-                &[1, 48, 128, 128],
-                7.0,
-                0.1,
-                DType::Float32,
-                strided,
-                offset,
-            );
-            let snapshot = initial.to_float32().unwrap().to_vec();
-            let mut control = initial.clone();
-            let mut candidate = initial.clone();
-            for tokens in [7, 9, 1024, 1] {
-                // Compact tiled GGUF key heads: this catches an accidental port
-                // of the reference's consecutive, rather than modulo, mapping.
-                let q = make(&[1, tokens, 16, 128], 1.0, 0.05, dtype, strided, offset);
-                let k = make(&[1, tokens, 16, 128], 3.0, 0.06, dtype, strided, offset);
-                let v = make(&[1, tokens, 48, 128], 9.0, 0.2, dtype, strided, offset);
-                let g = make(&[1, tokens, 48], 2.0, 0.03, DType::Float32, strided, offset)
-                    .add_scalar(0.95)
-                    .unwrap();
-                let b = make(&[1, tokens, 48], 5.0, 0.2, DType::Float32, strided, offset)
-                    .add_scalar(0.5)
-                    .unwrap();
-                // Only this test runs in the child. Fully evaluate each graph
-                // before changing the flag, then compare every output/state bit.
-                unsafe { std::env::set_var("MLX_QWEN4_GDN_VECTOR_ROWS", "0") };
-                let (want, next_control) =
-                    math::recurrent_sequence(&q, &k, &v, &g, &b, &control).unwrap();
-                let expected = [
-                    want.to_float32().unwrap().to_vec(),
-                    next_control.to_float32().unwrap().to_vec(),
-                ];
-                unsafe { std::env::set_var("MLX_QWEN4_GDN_VECTOR_ROWS", "1") };
-                let (got, next_candidate) =
-                    math::recurrent_sequence(&q, &k, &v, &g, &b, &candidate).unwrap();
-                for (actual, expected) in [
-                    got.to_float32().unwrap(),
-                    next_candidate.to_float32().unwrap(),
-                ]
-                .iter()
-                .zip(&expected)
-                {
-                    assert_eq!(actual.len(), expected.len());
-                    for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
-                        assert!(
-                            actual.is_finite() && actual.to_bits() == expected.to_bits(),
-                            "tokens={tokens}, strided={strided}, offset={offset}, index={index}: {actual} != {expected}"
-                        );
-                    }
-                }
-                control = next_control;
-                candidate = next_candidate;
-            }
-            assert_eq!(initial.to_float32().unwrap().as_ref(), snapshot.as_slice());
-        }
-    }
-}
-
-#[test]
 fn batched_causal_convolution_matches_stepwise_history() {
     use crate::array::DType;
     for dtype in [DType::Float32, DType::BFloat16] {
@@ -1081,12 +1547,13 @@ fn batched_causal_convolution_matches_stepwise_history() {
             .unwrap();
             let actual = math::conv_sequence(&input, &weight, &mut a, 4).unwrap();
             for t in 0..tokens {
-                let want = math::conv(
+                let want = math::conv_with_completion(
                     &input.slice_axis(1, t, t + 1).unwrap(),
                     &weight,
                     &mut b,
                     4,
                     1,
+                    false,
                 )
                 .unwrap()
                 .to_float32()
@@ -1135,12 +1602,13 @@ fn dilated_ple_window_preserves_history_across_short_and_long_chunks() {
             .unwrap();
             let actual = math::conv_window(&x, &weight, &mut batched, 4, 3).unwrap();
             for t in 0..tokens {
-                let want = math::conv(
+                let want = math::conv_with_completion(
                     &x.slice_axis(1, t, t + 1).unwrap(),
                     &weight,
                     &mut scalar,
                     4,
                     3,
+                    false,
                 )
                 .unwrap()
                 .to_float32()
@@ -1354,6 +1822,178 @@ fn paged_qsa_matches_flat_across_page_boundaries_sparse_selection_and_owner_swit
 }
 
 #[test]
+fn mtp_draft_gathers_the_resident_q8_expert_bank() {
+    let path = fixture().join("bf16/paged");
+    let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+    let c = config::Config::parse(&raw).unwrap();
+    let store = weights::Store::open_fixture(&path, None).unwrap();
+    let mut decoder = decoder::Decoder::new(c.clone(), store).unwrap();
+    let bytes = decoder.weights.prepare_fixture_mtp_expert_banks().unwrap();
+    assert!(bytes > 0);
+    assert_eq!(
+        decoder.weights.prepare_fixture_mtp_expert_banks().unwrap(),
+        bytes
+    );
+    assert_eq!(decoder.weights.mtp_bank_bytes().unwrap(), bytes);
+    let gate_up = decoder
+        .weights
+        .resident_bank("mtp.layers.0.mlp.experts.gate_up_proj")
+        .unwrap();
+    assert!(gate_up.scales.is_some());
+    assert_eq!(
+        (gate_up.bits, gate_up.group, gate_up.mode.as_str()),
+        (8, 32, "affine")
+    );
+    assert_eq!(
+        gate_up.scales.as_ref().unwrap().dtype().unwrap(),
+        crate::array::DType::Float16
+    );
+    assert!(
+        decoder
+            .weights
+            .resident_bank("mtp.layers.0.mlp.experts.down_proj")
+            .is_some()
+    );
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("mtp-oracle.json")).unwrap()).unwrap();
+    let mut cache = decoder::LayerCache::default();
+    let mut worst = 0f32;
+    for row in oracle["rows"].as_array().unwrap() {
+        let hidden: Vec<f32> = row["input_hidden"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let hidden = MxArray::from_float32(&hidden, &[1, 1, (c.hc_count * c.hidden_size) as i64])
+            .unwrap()
+            .astype(crate::array::DType::BFloat16)
+            .unwrap();
+        let (_, logits, next) = decoder
+            .draft_step(
+                &[hidden],
+                &[row["token"].as_u64().unwrap() as u32],
+                row["position"].as_u64().unwrap() as usize,
+                &mut cache,
+            )
+            .unwrap();
+        cache = next;
+        let expected: Vec<f32> = row["logits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let actual = logits.to_float32().unwrap();
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0
+        };
+        assert_eq!(
+            argmax(&actual),
+            argmax(&expected),
+            "position {}",
+            row["position"]
+        );
+        let diff = actual
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        worst = worst.max(diff);
+    }
+    assert!(worst < 0.04, "Q8 draft logits drift {worst}");
+    for name in [
+        "mtp.layers.0.mlp.experts.gate_up_proj",
+        "mtp.layers.0.mlp.experts.down_proj",
+    ] {
+        assert!(
+            !decoder.weights.lru_holds(name),
+            "{name} was read through the LRU"
+        );
+    }
+}
+
+#[test]
+fn mtp_resident_bank_matches_the_dense_expert_sum() {
+    let path = fixture().join("bf16/paged");
+    let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+    let c = config::Config::parse(&raw).unwrap();
+    let store = weights::Store::open_fixture(&path, None).unwrap();
+    let mut decoder = decoder::Decoder::new(c.clone(), store).unwrap();
+    let (h, m) = (c.hidden_size, c.moe_intermediate_size);
+    let x = MxArray::from_float32(
+        &(0..h).map(|i| (i as f32 * 0.37).sin()).collect::<Vec<_>>(),
+        &[1, 1, h as i64],
+    )
+    .unwrap()
+    .astype(crate::array::DType::BFloat16)
+    .unwrap();
+    let ids = [1u32, 3];
+    let selected = MxArray::from_uint32(&ids, &[1, 1, 2]).unwrap();
+    let scores = MxArray::from_float32(&[0.6, 0.4], &[1, 1, 2])
+        .unwrap()
+        .astype(crate::array::DType::BFloat16)
+        .unwrap();
+    // The dense reference is the pre-bank draft path: row reads + linear.
+    let mut reference: Option<MxArray> = None;
+    for (j, &e) in ids.iter().enumerate() {
+        let e = e as usize;
+        let both = decoder
+            .weights
+            .read("mtp.layers.0.mlp.experts.gate_up_proj", e * 2 * m, 2 * m)
+            .unwrap()
+            .linear(&x)
+            .unwrap();
+        let hidden = math::swiglu(
+            &both.slice_axis(2, 0, m as i64).unwrap(),
+            &both.slice_axis(2, m as i64, 2 * m as i64).unwrap(),
+        )
+        .unwrap();
+        let out = decoder
+            .weights
+            .read("mtp.layers.0.mlp.experts.down_proj", e * h, h)
+            .unwrap()
+            .linear(&hidden)
+            .unwrap()
+            .mul(&scores.slice_axis(2, j as i64, j as i64 + 1).unwrap())
+            .unwrap();
+        reference = Some(match reference {
+            None => out,
+            Some(acc) => acc.add(&out).unwrap(),
+        });
+    }
+    let reference = reference.unwrap().to_float32().unwrap();
+    assert!(
+        decoder
+            .mtp_resident_experts_for_test(&x, &selected, &scores)
+            .unwrap()
+            .is_none()
+    );
+    decoder.weights.prepare_fixture_mtp_expert_banks().unwrap();
+    let actual = decoder
+        .mtp_resident_experts_for_test(&x, &selected, &scores)
+        .unwrap()
+        .unwrap();
+    assert_eq!(*actual.shape().unwrap(), [1, 1, h as i64]);
+    let actual = actual.to_float32().unwrap();
+    let scale = reference.iter().fold(0f32, |a, b| a.max(b.abs()));
+    let diff = actual
+        .iter()
+        .zip(reference.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    eprintln!("mtp bank expert sum: max |diff| {diff} of scale {scale}");
+    assert!(
+        scale > 0.0 && diff <= 0.02 * scale,
+        "diff {diff} scale {scale}"
+    );
+}
+
+#[test]
 fn mtp_head_matches_reference_hc_norm_and_shifted_history() {
     let path = fixture().join("bf16/paged");
     let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
@@ -1375,16 +2015,16 @@ fn mtp_head_matches_reference_hc_norm_and_shifted_history() {
             .unwrap()
             .astype(crate::array::DType::BFloat16)
             .unwrap();
-        let (h, logits) = decoder
+        let (h, logits, next) = decoder
             .draft_step(
-                &hidden,
-                row["token"].as_u64().unwrap() as u32,
+                &[hidden],
+                &[row["token"].as_u64().unwrap() as u32],
                 row["position"].as_u64().unwrap() as usize,
                 &mut cache,
-                true,
             )
             .unwrap();
-        for (actual, key) in [(h, "hidden"), (logits.unwrap(), "logits")] {
+        cache = next;
+        for (actual, key) in [(h, "hidden"), (logits, "logits")] {
             let diff = actual
                 .to_float32()
                 .unwrap()
@@ -1479,11 +2119,28 @@ fn media_mrope_matches_reference_including_compressed_indexer_block_positions() 
 }
 
 fn tiny_inner() -> Inner {
+    let (decoder, vision) = tiny_decoder();
+    inner_over(decoder, vision, true)
+}
+
+/// The paged fixture with the MTP head, before the load's last step.
+fn tiny_decoder() -> (decoder::Decoder, media::Vision) {
     let path = fixture().join("bf16/paged");
     let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
     let c = config::Config::parse(&raw).unwrap();
     let store = weights::Store::open_fixture(&path, None).unwrap();
     let vision = media::Vision::metadata(&serde_json::Value::Null, &store, &c).unwrap();
+    let mut decoder = decoder::Decoder::new(c.clone(), store).unwrap();
+    decoder.paged = Some(super::paged::create(&c).unwrap());
+    (decoder, vision)
+}
+
+/// The load's last step: the draft banks are built (fixture stores have no
+/// pack stream).
+fn inner_over(mut decoder: decoder::Decoder, vision: media::Vision, has_mtp: bool) -> Inner {
+    if has_mtp {
+        decoder.weights.finish_fixture_load();
+    }
     let tokenizer_dir = Temp::new();
     let tokenizer_path = tokenizer_dir.0.join("tokenizer.json");
     std::fs::write(
@@ -1494,8 +2151,6 @@ fn tiny_inner() -> Inner {
     std::fs::write(&tokenizer_path,r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"a":0,"b":1,"<unk>":2},"unk_token":"<unk>"}}"#).unwrap();
     let tokenizer =
         Arc::new(Qwen3Tokenizer::load_from_file_sync(tokenizer_path.to_str().unwrap()).unwrap());
-    let mut decoder = decoder::Decoder::new(c.clone(), store).unwrap();
-    decoder.paged = Some(super::paged::create(&c).unwrap());
     Inner {
         decoder,
         tokenizer,
@@ -1504,11 +2159,12 @@ fn tiny_inner() -> Inner {
         rows: Default::default(),
         active_seq: None,
         mtp: Default::default(),
-        has_mtp: true,
+        has_mtp,
         vision,
         media_prefill: None,
         _pool_guard: None,
-        _cache_limit_guard: crate::cache_limit::coordinator().register(1 << 20),
+        open_turns: Default::default(),
+        exclusive_turn: false,
     }
 }
 
@@ -1698,6 +2354,258 @@ fn scheduled_owner_switch_does_not_inherit_another_requests_cancellation() {
     assert!(inner.decoder.check_cancelled().is_err());
 }
 
+/// Scheduled turns overlap on one model, and residency and the tripwire
+/// window are per model: the first turn to open on an idle model starts the
+/// window (disk baseline, slow streak), later admissions join it, a finish
+/// beside an open turn keeps it, and the first admission after the set
+/// empties starts a new one. The exclusive lane's flag pair is one window.
+///
+/// MUTATION: `scheduled_turn_opened` passes `first = true` for
+/// every admission; the second admission re-baselines and the SENTINEL
+/// assertions fail.
+#[test]
+fn scheduled_turns_share_one_tripwire_window_until_the_last_one_closes() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    use std::time::Duration;
+    const SENTINEL: u64 = u64::MAX - 1;
+    let mut inner = tiny_inner();
+    let poison = |inner: &mut Inner| {
+        let wire = inner.decoder.weights.tripwire_mut();
+        wire.begin_turn(SENTINEL);
+        for _ in 0..8 {
+            wire.observe(1, Duration::from_millis(25), SENTINEL, 0, || false);
+        }
+        for _ in 0..3 {
+            wire.observe(1, Duration::from_millis(2_400), SENTINEL, 0, || false);
+        }
+        assert_eq!((wire.turn_start_reads(), wire.slow_streak()), (SENTINEL, 3));
+    };
+    let window = |inner: &mut Inner| {
+        let wire = inner.decoder.weights.tripwire_mut();
+        (wire.turn_start_reads(), wire.slow_streak())
+    };
+    poison(&mut inner);
+    inner.scheduled_turn_opened(1);
+    let (base, streak) = window(&mut inner);
+    assert_ne!(base, SENTINEL, "the first admission starts a window");
+    assert_eq!(streak, 0);
+    poison(&mut inner);
+    inner.scheduled_turn_opened(2);
+    assert_eq!(
+        window(&mut inner),
+        (SENTINEL, 3),
+        "a second admission joins the window"
+    );
+    inner.scheduled_turn_closed(1);
+    assert_eq!(
+        window(&mut inner),
+        (SENTINEL, 3),
+        "a finish beside an open turn keeps the window"
+    );
+    inner.scheduled_turn_closed(2);
+    assert!(inner.open_turns.is_empty());
+    assert_eq!(window(&mut inner), (SENTINEL, 3), "a close never baselines");
+    inner.scheduled_turn_opened(3);
+    assert_ne!(
+        window(&mut inner).0,
+        SENTINEL,
+        "the set emptied: a new window"
+    );
+    assert_eq!(window(&mut inner).1, 0);
+    inner.scheduled_turn_closed(3);
+    poison(&mut inner);
+    inner.set_turn_cancel_flag(Some(Arc::new(AtomicBool::new(false))));
+    assert_ne!(
+        window(&mut inner).0,
+        SENTINEL,
+        "an exclusive turn is a window"
+    );
+    poison(&mut inner);
+    inner.set_turn_cancel_flag(Some(Arc::new(AtomicBool::new(false))));
+    assert_eq!(
+        window(&mut inner),
+        (SENTINEL, 3),
+        "a flag re-installed inside the turn is the same window"
+    );
+    inner.set_turn_cancel_flag(None);
+    assert_eq!(window(&mut inner), (SENTINEL, 3));
+    inner.set_turn_cancel_flag(Some(Arc::new(AtomicBool::new(false))));
+    assert_ne!(window(&mut inner).0, SENTINEL, "the next exclusive turn");
+    inner.set_turn_cancel_flag(None);
+}
+
+/// Two owned turns admitted back to back overlap on the scheduler: both are
+/// open at once, and the set is empty once both finished, so the close runs
+/// on the normal finish path.
+///
+/// MUTATION: drop `scheduled_turn_closed` from the top of
+/// `finish_completed`; the set still holds both turns at the end.
+#[test]
+fn scheduled_turns_open_at_admission_and_close_when_they_finish() {
+    use crate::engine::cmd::ChatCmd;
+    use crate::engine::hybrid_scheduler::HybridSchedulerState;
+    use crate::engine::model_command::ModelCommand;
+    use crate::model_thread::LoopControl;
+    let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut replies = Vec::new();
+    for owner in ["a", "b"] {
+        let config = crate::engine::types::ChatConfig {
+            max_new_tokens: Some(8),
+            temperature: Some(0.0),
+            cache_owner_id: Some(owner.to_string()),
+            ..Default::default()
+        };
+        let messages = vec![
+            serde_json::from_value(serde_json::json!({"role": "user", "content": "a"})).unwrap(),
+        ];
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        assert!(
+            sender
+                .send(ModelCommand::from_chat(ChatCmd::SessionStart {
+                    messages,
+                    config,
+                    reply,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                }))
+                .is_ok()
+        );
+        replies.push(rx);
+    }
+    let mut most_open = 0;
+    let mut done = 0;
+    for _ in 0..2048 {
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        most_open = most_open.max(state.inner.open_turns.len());
+        for rx in &mut replies {
+            if let Ok(result) = rx.try_recv() {
+                result.unwrap();
+                done += 1;
+            }
+        }
+        if done == 2 {
+            break;
+        }
+    }
+    assert_eq!(done, 2, "both turns finished");
+    assert_eq!(most_open, 2, "the second admission joined the first turn");
+    assert!(state.inner.open_turns.is_empty());
+    assert!(!state.inner.exclusive_turn);
+}
+
+/// The prefill window follows the plan in force: a fallback shrinks the slot
+/// allowance (budget / 16) below what the load admitted, and the next turn to
+/// open prefills with the window that allowance admits, not the load's.
+///
+/// MUTATION: `open_turn` keeps `decoder.prefill_chunk_size`;
+/// the window stays at the load's value.
+#[test]
+fn a_turn_opens_with_the_prefill_window_of_the_plan_in_force() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    use std::sync::atomic::Ordering;
+    let mut inner = tiny_inner();
+    let config = Arc::clone(&inner.decoder.config);
+    let admitted = inner.decoder.prefill_chunk_size;
+    assert_eq!(
+        admitted,
+        memory::prefill_window(&config, &inner.decoder.weights.plan)
+    );
+    assert!(admitted >= 4);
+    let mut plan = inner.decoder.weights.plan.clone();
+    plan.mapped = false;
+    plan.available_bytes = None;
+    plan.physical_bytes = None;
+    plan.budget = 16 * memory::prefill_scratch(&config, admitted / 4);
+    let narrow = memory::prefill_window(&config, &plan);
+    assert_eq!(narrow, admitted / 4);
+    inner.decoder.weights.plan = plan;
+    inner.scheduled_turn_opened(1);
+    assert_eq!(inner.decoder.prefill_chunk_size, narrow);
+    assert_eq!(
+        inner
+            .decoder
+            .weights
+            .live
+            .prefill_chunk_tokens
+            .load(Ordering::Acquire),
+        narrow as u64
+    );
+    inner.scheduled_turn_closed(1);
+}
+
+/// Rows of every prefill pass over `prompt` when the admitted window is cut
+/// from `wide` to `narrow` after the first pass, as a pass that leaves the
+/// mapped path does through `Decoder::residency_changed`.
+fn prefill_pass_rows(
+    inner: &mut Inner,
+    paged: bool,
+    prompt: &[u32],
+    wide: usize,
+    narrow: usize,
+) -> Vec<usize> {
+    use crate::engine::backend::{ChatBackend, PagedBackend};
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    use std::sync::{Arc, Mutex};
+    let rows = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&rows);
+    let mut done = 0usize;
+    inner.decoder.prefill_chunk_size = wide;
+    inner.decoder.after_pass = Some(Box::new(move |decoder: &mut decoder::Decoder| {
+        seen.lock().unwrap().push(decoder.history.len() - done);
+        done = decoder.history.len();
+        decoder.prefill_chunk_size = narrow;
+    }));
+    let stream = Stream::default(crate::stream::DeviceType::Gpu);
+    let logits = if paged {
+        inner.activate_paged_seq(1).unwrap();
+        let prefix = inner.prime_prefix_state(prompt, false, 32, &[], 0).unwrap();
+        inner.paged_prefill(prompt, &prefix, stream).unwrap()
+    } else {
+        inner.decoder.paged = None;
+        inner.prefill(prompt, stream).unwrap()
+    };
+    inner.decoder.after_pass = None;
+    assert_eq!(
+        &*logits.shape().unwrap(),
+        [1, 64],
+        "the last pass projects the logits"
+    );
+    assert_eq!(inner.decoder.history, prompt);
+    Arc::into_inner(rows)
+        .expect("the hook was dropped")
+        .into_inner()
+        .unwrap()
+}
+
+/// A mapped prefill that trips mid-prompt leaves the rest of the prompt a
+/// smaller window (the slot allowance's), and every pass after the switch
+/// must take it: the whole-prompt loops read the admitted slice before each
+/// pass instead of once before the loop.
+///
+/// MUTATION: `Inner::prefill` takes the slice size once before
+/// its loop; the passes after the cut keep 32 rows.
+#[test]
+fn an_exclusive_prefill_reads_the_admitted_window_before_every_pass() {
+    let prompt: Vec<u32> = (0..96).map(|i| 3 + (i % 10) as u32).collect();
+    let mut inner = tiny_inner();
+    let rows = prefill_pass_rows(&mut inner, false, &prompt, 32, 8);
+    let mut expected = vec![32];
+    expected.extend([8; 8]);
+    assert_eq!(rows, expected);
+}
+
+/// MUTATION: `paged_prefill` takes the slice size once before
+/// its loop; the passes after the cut keep 32 rows.
+#[test]
+fn an_exclusive_paged_prefill_reads_the_admitted_window_before_every_pass() {
+    let prompt: Vec<u32> = (0..96).map(|i| 3 + (i % 10) as u32).collect();
+    let mut inner = tiny_inner();
+    let rows = prefill_pass_rows(&mut inner, true, &prompt, 32, 8);
+    let mut expected = vec![32];
+    expected.extend([8; 8]);
+    assert_eq!(rows, expected);
+}
+
 #[test]
 fn scheduled_decode_preserves_sampling_shape_and_owner_logits() {
     use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
@@ -1729,6 +2637,119 @@ fn scheduled_decode_preserves_sampling_shape_and_owner_logits() {
     assert_eq!(
         &*logits.squeeze(Some(&[1])).unwrap().shape().unwrap(),
         [2, 64]
+    );
+}
+
+#[test]
+fn mtp_owner_starts_without_banks_when_the_load_cannot_stage_them() {
+    use crate::engine::backend::PagedBackend;
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    use rand::SeedableRng;
+    let (mut decoder, vision) = tiny_decoder();
+    // 3 x MAX_READ_BYTES: the first bank's eviction target saturates to zero
+    // and passes, the second bank's cannot once the first is pinned.
+    decoder.weights.set_cache_limit(weights::MAX_READ_BYTES * 3);
+    let before = decoder.weights.cached_bytes();
+    let mut inner = inner_over(decoder, vision, true);
+    assert_eq!(inner.decoder.weights.mtp_bank_bytes().unwrap(), 0);
+    assert_eq!(inner.decoder.weights.cached_bytes(), before);
+    inner.activate_paged_seq(1).unwrap();
+    assert!(inner.begin_mtp(1, 0).unwrap());
+    // Ordinary reads need the fixture's staging room; the decline is sticky.
+    inner.decoder.weights.set_cache_limit(1 << 30);
+    let params = inner.resolve_params(&crate::engine::types::ChatConfig {
+        temperature: Some(0.0),
+        enable_mtp: Some(true),
+        mtp_depth: Some(2),
+        ..Default::default()
+    });
+    let prompt = [3, 9, 5, 7];
+    let prefix = inner
+        .prime_prefix_state(&prompt, false, 32, &[], 0)
+        .unwrap();
+    let logits = inner
+        .paged_prefill(
+            &prompt,
+            &prefix,
+            Stream::default(crate::stream::DeviceType::Gpu),
+        )
+        .unwrap();
+    let anchor = logits.argmax(-1, None).unwrap().item_at_int32(0).unwrap() as u32;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(19);
+    let proposal = inner
+        .propose_mtp(1, anchor, 2, &params, &mut rng, true)
+        .unwrap();
+    assert_eq!(proposal.draft_ids.len(), 2);
+    assert!(
+        inner
+            .decoder
+            .weights
+            .lru_holds("mtp.layers.0.mlp.experts.gate_up_proj"),
+        "drafts must have streamed expert rows through the LRU"
+    );
+    assert_eq!(inner.decoder.weights.mtp_bank_bytes().unwrap(), 0);
+}
+
+#[test]
+fn residency_info_sees_the_mtp_banks_built_at_load() {
+    use std::sync::atomic::Ordering;
+    let (decoder, vision) = tiny_decoder();
+    // The model handle keeps a clone of the plan.
+    let handle = decoder.weights.plan.clone();
+    let before = handle.resident_bank_bytes.load(Ordering::Relaxed);
+    let inner = inner_over(decoder, vision, true);
+    let banks = inner.decoder.weights.mtp_bank_bytes().unwrap();
+    assert!(banks > 0);
+    assert_eq!(
+        handle.resident_bank_bytes.load(Ordering::Relaxed),
+        before + banks
+    );
+}
+
+/// The load builds the draft banks whenever the MTP head is attached and
+/// the first MTP turn builds nothing; a load without the head builds none.
+/// MUTATION: the build moves back into `begin_mtp`
+/// -> "the load built the draft banks" fails.
+#[test]
+fn the_load_builds_the_draft_banks_only_with_the_head() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    use std::sync::atomic::Ordering;
+    let (decoder, vision) = tiny_decoder();
+    let handle = decoder.weights.plan.clone();
+    let before = handle.resident_bank_bytes.load(Ordering::Relaxed);
+    let mut inner = inner_over(decoder, vision, true);
+    let weights = &inner.decoder.weights;
+    let banks = weights.mtp_bank_bytes().unwrap();
+    assert!(banks > 0, "the load built the draft banks");
+    assert_eq!(
+        handle.resident_bank_bytes.load(Ordering::Relaxed),
+        before + banks
+    );
+    let held = |weights: &weights::Store| {
+        [
+            "mtp.layers.0.mlp.experts.gate_up_proj",
+            "mtp.layers.0.mlp.experts.down_proj",
+        ]
+        .map(|name| weights.resident_bank(name).unwrap())
+    };
+    let at_load = held(weights);
+    let cached = weights.cached_bytes();
+    inner.activate_paged_seq(1).unwrap();
+    assert!(inner.begin_mtp(1, 0).unwrap());
+    let weights = &inner.decoder.weights;
+    for (before, after) in at_load.iter().zip(held(weights)) {
+        assert!(Arc::ptr_eq(before, &after), "the turn rebuilt a draft bank");
+    }
+    assert_eq!(weights.mtp_bank_bytes().unwrap(), banks);
+    assert_eq!(weights.cached_bytes(), cached, "the turn built nothing");
+
+    let mut text_only = weights::Store::open_fixture(&fixture(), None).unwrap();
+    let before = text_only.plan.resident_bank_bytes.load(Ordering::Relaxed);
+    text_only.finish_fixture_load();
+    assert_eq!(text_only.mtp_bank_bytes().unwrap(), 0);
+    assert_eq!(
+        text_only.plan.resident_bank_bytes.load(Ordering::Relaxed),
+        before
     );
 }
 
@@ -1888,6 +2909,24 @@ fn mtp_transaction_restores_every_accepted_frontier_and_continues_exactly() {
                 speculative: true,
             }])
             .unwrap();
+        // Inspect readiness before any output is read: reading the logits
+        // would complete every ancestor and hide a missing final completion.
+        let ready = |a: &MxArray| unsafe { mlx_sys::mlx_array_is_available(a.as_raw_ptr()) };
+        let c = inner.decoder.config.clone();
+        let adapter = inner.decoder.paged.as_ref().unwrap();
+        let attention_layers = (0..c.num_hidden_layers).filter(|&l| !c.linear(l)).count();
+        assert!(attention_layers > 0);
+        for layer in 0..attention_layers as u32 {
+            assert!(
+                ready(&adapter.key_pool_array(layer).unwrap())
+                    && ready(&adapter.value_pool_array(layer).unwrap()),
+                "keep {keep}: verification returned with a lazy page write in layer {layer}"
+            );
+        }
+        assert!(
+            inner.decoder.snapshot().arrays().all(ready),
+            "keep {keep}: verification returned with a lazy frontier"
+        );
         assert_eq!(&*actual.shape().unwrap(), [4, 1, 64]);
         let actual = actual
             .transpose(Some(&[1, 0, 2]))
@@ -1904,6 +2943,10 @@ fn mtp_transaction_restores_every_accepted_frontier_and_continues_exactly() {
             .unwrap()
             .remove(0)
             .unwrap();
+        assert!(
+            inner.decoder.snapshot().arrays().all(ready),
+            "keep {keep}: the restored frontier is lazy"
+        );
         assert_eq!(
             inner.decoder.history,
             [&prompt[..], &verify[..keep]].concat()
@@ -1923,6 +2966,57 @@ fn mtp_transaction_restores_every_accepted_frontier_and_continues_exactly() {
             "keep {keep}"
         );
     }
+}
+
+/// A prefill window runs the shared projections batched: no weight is
+/// projected one row at a time (an 18-row window exceeds the row kernels'
+/// four rows, so each row would otherwise dispatch its own projection). The
+/// verification pass over the same decoder is row-exact, and this fixture's
+/// weights are not Q8 banks, so there every row is projected alone.
+#[test]
+fn prefill_window_projections_stay_batched_outside_verification() {
+    use crate::engine::backend::PagedBackend;
+    use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, ScheduledVerifyRow};
+    let prompt = [3, 9, 5, 2, 7, 11, 12, 8, 10, 9, 13, 7, 4, 3, 11, 8, 6, 5];
+    let mut inner = tiny_inner();
+    inner.activate_paged_seq(1).unwrap();
+    inner.begin_mtp(1, 0).unwrap();
+    let prefix = inner
+        .prime_prefix_state(&prompt, false, 32, &[], 0)
+        .unwrap();
+    inner
+        .paged_prefill(
+            &prompt,
+            &prefix,
+            Stream::default(crate::stream::DeviceType::Gpu),
+        )
+        .unwrap();
+    assert_eq!(
+        inner.decoder.weights.single_row_projections, 0,
+        "the prefill window projected weights one row at a time"
+    );
+    inner.decoder.weights.vector_windows.clear();
+    inner
+        .verify_mtp(&[ScheduledVerifyRow {
+            seq_id: 1,
+            first_position: prompt.len() as u32,
+            tokens: vec![4, 11, 7],
+            speculative: true,
+        }])
+        .unwrap();
+    // PLE key and value: one three-row window each per PLE layer.
+    let windows = &inner.decoder.weights.vector_windows;
+    assert_eq!(
+        windows.len(),
+        2 * inner.decoder.config.ple_layer_ids.len(),
+        "{windows:?}"
+    );
+    assert!(windows.iter().all(|&(rows, _)| rows == 3), "{windows:?}");
+    assert!(
+        inner.decoder.weights.single_row_projections >= 3,
+        "verification projects each of its rows alone: {}",
+        inner.decoder.weights.single_row_projections
+    );
 }
 
 #[test]
@@ -1998,35 +3092,11 @@ fn incomplete_mtp_companion_is_rejected_before_payload_reads() {
     assert_eq!(store.bytes_read, 0);
 }
 
+/// The fused kernels against the ordinary projections, including mixed
+/// quantization, changing routes, missing slots and shared experts.
 #[test]
 fn fused_routed_experts_preserve_mixed_formats_and_changing_inputs() {
     if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    const CHILD: &str = "MLX_QWEN4_EXPERT_STAGING_TEST_CHILD";
-    if std::env::var(CHILD).as_deref() != Ok("1") {
-        // Exercise both epilogues against the ordinary projections, including
-        // mixed quantization, changing routes, missing slots and shared experts.
-        // Process isolation avoids mutating settings used by other GPU tests.
-        for (lanes, schedule) in [("0", "0"), ("1", "0"), ("1", "1")] {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "models::qwen4_exp::tests::fused_routed_experts_preserve_mixed_formats_and_changing_inputs",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1")
-                .env("MLX_QWEN4_EXPERT_LANE_STAGING", lanes)
-                .env("MLX_QWEN4_REFERENCE_DOWN_SCHEDULE", schedule)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "lanes={lanes}, schedule={schedule}: {}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
         return;
     }
     use crate::array::DType;
@@ -2454,56 +3524,6 @@ fn sorted_expert_combine_keeps_product_rounding_and_reduction_order() {
                 &*actual, &*reference,
                 "{hidden} {value_type:?} {score_type:?}"
             );
-            if hidden == 2560 && value_type == DType::BFloat16 {
-                for phase in [0.0, 0.71] {
-                    let shared = MxArray::from_float32(
-                        &(0..tokens * hidden)
-                            .map(|i| (i as f32 * 0.039 + phase).sin() * 2.3)
-                            .collect::<Vec<_>>(),
-                        &[1, tokens as i64, hidden as i64],
-                    )
-                    .unwrap()
-                    .astype(DType::BFloat16)
-                    .unwrap();
-                    let gate = MxArray::from_float32(
-                        &(0..tokens)
-                            .map(|i| (i as f32 * 0.37 + phase).cos() * 9.0)
-                            .collect::<Vec<_>>(),
-                        &[1, tokens as i64, 1],
-                    )
-                    .unwrap()
-                    .astype(DType::BFloat16)
-                    .unwrap();
-                    let reduced =
-                        MxArray::from_float32(&reference, &[1, tokens as i64, hidden as i64])
-                            .unwrap()
-                            .astype(DType::BFloat16)
-                            .unwrap();
-                    let expected = reduced
-                        .add(&math::sigmoid_mul(&gate, &shared).unwrap())
-                        .unwrap()
-                        .to_float32()
-                        .unwrap();
-                    let raw = unsafe {
-                        mlx_sys::mlx_qwen4_sorted_shared_combine(
-                            values.as_raw_ptr(),
-                            scores.as_raw_ptr(),
-                            inverse.as_raw_ptr(),
-                            shared.as_raw_ptr(),
-                            gate.as_raw_ptr(),
-                            top as i32,
-                        )
-                    };
-                    let combined = MxArray::from_handle(raw, "sorted shared combine test")
-                        .unwrap()
-                        .to_float32()
-                        .unwrap();
-                    assert_eq!(
-                        &*combined, &*expected,
-                        "shared {score_type:?} phase={phase}"
-                    );
-                }
-            }
         }
     }
 }
@@ -2612,8 +3632,12 @@ fn expert_aligned_prefill_preserves_quantized_projections_and_tile_tails() {
 fn stable_gpu_routing_preserves_duplicates_tails_and_inverse() {
     use crate::array::MxArray;
     for (experts, rows) in [
+        (7, 3),
         (7, 257),
         (256, 1024),
+        (454, 49),
+        (512, 1),
+        (512, 200),
         (454, 257),
         (454, 10240),
         (511, 2049),
@@ -2738,26 +3762,6 @@ fn compact_q8_decode_preserves_promoted_gemv_and_bf16_rounding() {
                         normed.as_raw_ptr(),
                     )
                 };
-                if super::runtime_flags::is_one(c"MLX_QWEN4_MIXER_UP_COLUMNS") {
-                    let injection = MxArray::zeros(&[1, 1, 4], Some(DType::BFloat16)).unwrap();
-                    let (mut mixed, mut gate) = (std::ptr::null_mut(), std::ptr::null_mut());
-                    assert!(unsafe {
-                        mlx_sys::mlx_qwen4_hyper_up_inject(
-                            x.as_raw_ptr(),
-                            w.as_raw_ptr(),
-                            s.as_raw_ptr(),
-                            b.as_raw_ptr(),
-                            normed.as_raw_ptr(),
-                            injection.as_raw_ptr(),
-                            &mut mixed,
-                            &mut gate,
-                        )
-                    });
-                    let mixed = MxArray::from_handle(mixed, "two-column mixer").unwrap();
-                    let gate = MxArray::from_handle(gate, "two-column injection").unwrap();
-                    assert_eq!(&*mixed.to_float32().unwrap(), &*want.to_float32().unwrap());
-                    assert_eq!(&*gate.to_float32().unwrap(), &[1.; 4]);
-                }
                 let got = MxArray::from_handle(raw, "hyper up specialization must run").unwrap();
                 assert_eq!(
                     &*got.to_float32().unwrap(),
@@ -2782,60 +3786,9 @@ fn compact_q8_decode_preserves_promoted_gemv_and_bf16_rounding() {
 }
 
 #[test]
-fn parallel_mixer_products_preserve_projection_and_halfway_rounding() {
-    // Reuse the independent GEMV/normalization references with the lane port
-    // enabled in isolated processes, including fused injection output.
-    for test in [
-        "compact_q8_decode_preserves_promoted_gemv_and_bf16_rounding",
-        "hyper_up_preserves_native_sigmoid_halfway_rounding",
-    ] {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                &format!("models::qwen4_exp::tests::{test}"),
-                "--test-threads=1",
-            ])
-            .env("MLX_QWEN4_MIXER_LANE_PRODUCTS", "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{test}: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-}
-
-#[test]
-fn two_column_mixer_preserves_projections_and_halfway_rounding() {
-    for test in [
-        "compact_q8_decode_preserves_promoted_gemv_and_bf16_rounding",
-        "hyper_up_preserves_native_sigmoid_halfway_rounding",
-    ] {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                &format!("models::qwen4_exp::tests::{test}"),
-                "--test-threads=1",
-            ])
-            .env("MLX_QWEN4_MIXER_UP_COLUMNS", "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{test}: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-}
-
-#[test]
 fn hyper_up_preserves_native_sigmoid_halfway_rounding() {
     use crate::array::DType;
     use crate::models::quantized_linear::QuantizedLinear;
-    use crate::nn::Activations;
     if !crate::engine::persistence::compiled_forward_backend_available() {
         return;
     }
@@ -2901,63 +3854,6 @@ fn hyper_up_preserves_native_sigmoid_halfway_rounding() {
     .to_float32()
     .unwrap();
     assert_eq!(&*actual, &*expected);
-    for injection in [
-        [-27.375, -21.25, 1.5078125, -14.875],
-        [0.0, 27.375, -128.0, 128.0],
-        [0.023, 0.91, -0.137, -0.42],
-    ] {
-        let gate = MxArray::from_float32(&injection, &[1, 1, 4])
-            .unwrap()
-            .astype(DType::BFloat16)
-            .unwrap();
-        let expected_gate = Activations::sigmoid(&gate.div_scalar(4.0).unwrap())
-            .unwrap()
-            .mul_scalar(2.0)
-            .unwrap()
-            .to_float32()
-            .unwrap();
-        let mut mixed = std::ptr::null_mut();
-        let mut fused_gate = std::ptr::null_mut();
-        assert!(unsafe {
-            mlx_sys::mlx_qwen4_hyper_up_inject(
-                x.as_raw_ptr(),
-                w.as_raw_ptr(),
-                s.as_raw_ptr(),
-                b.as_raw_ptr(),
-                n.as_raw_ptr(),
-                gate.as_raw_ptr(),
-                &mut mixed,
-                &mut fused_gate,
-            )
-        });
-        let mixed = MxArray::from_handle(mixed, "mixer with gate regression")
-            .unwrap()
-            .to_float32()
-            .unwrap();
-        let fused_gate = MxArray::from_handle(fused_gate, "injection gate regression")
-            .unwrap()
-            .to_float32()
-            .unwrap();
-        assert_eq!(&*mixed, &*expected);
-        assert_eq!(&*fused_gate, &*expected_gate);
-        // Unsupported dtype must leave both output handles empty.
-        let fp32_gate = gate.astype(DType::Float32).unwrap();
-        let mut mixed = std::ptr::null_mut();
-        let mut fused_gate = std::ptr::null_mut();
-        assert!(!unsafe {
-            mlx_sys::mlx_qwen4_hyper_up_inject(
-                x.as_raw_ptr(),
-                w.as_raw_ptr(),
-                s.as_raw_ptr(),
-                b.as_raw_ptr(),
-                n.as_raw_ptr(),
-                fp32_gate.as_raw_ptr(),
-                &mut mixed,
-                &mut fused_gate,
-            )
-        });
-        assert!(mixed.is_null() && fused_gate.is_null());
-    }
 }
 
 #[test]
@@ -2971,7 +3867,7 @@ fn prefill_bootstrap_uses_dimensions_and_live_headroom() {
     plan.budget = 32 << 30;
     plan.available_bytes = Some(64 << 30);
     plan.physical_bytes = Some(128 << 30);
-    let small = memory::prefill_window(&config, &plan).unwrap();
+    let small = memory::prefill_window(&config, &plan);
     config.hidden_size = 8192;
     config.hc_count = 4;
     config.moe_intermediate_size = 4096;
@@ -2979,17 +3875,92 @@ fn prefill_bootstrap_uses_dimensions_and_live_headroom() {
     config.head_dim = 256;
     config.num_experts_per_tok = 10;
     config.indexer_budget = 2048;
-    let large = memory::prefill_window(&config, &plan).unwrap();
+    let large = memory::prefill_window(&config, &plan);
     assert!(large < small);
     let old_ple = config.ple_conv_kernel_size;
     config.ple_conv_kernel_size = 64;
     assert!(
-        memory::prefill_window(&config, &plan).unwrap() < large,
+        memory::prefill_window(&config, &plan) < large,
         "A dominant PLE stage must reduce the admitted window"
     );
     config.ple_conv_kernel_size = old_ple;
     plan.available_bytes = Some((51 << 30) + (128 << 20));
-    assert!(memory::prefill_window(&config, &plan).unwrap() < large);
+    assert!(memory::prefill_window(&config, &plan) < large);
+}
+
+/// The MTP hidden norm is one RMS per hyper-connection stream: stretching a
+/// single stream of every target hidden row leaves the head's residual and
+/// logits where they were, where a norm over the joined streams moves them.
+#[test]
+fn mtp_hidden_norm_is_per_stream() {
+    let path = fixture().join("bf16/paged");
+    let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+    let c = config::Config::parse(&raw).unwrap();
+    assert!(c.hc_count >= 2, "the fixture must carry several streams");
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("mtp-oracle.json")).unwrap()).unwrap();
+    let shape = [1, 1, (c.hc_count * c.hidden_size) as i64];
+    let mut reference = decoder::Decoder::new(
+        c.clone(),
+        weights::Store::open_fixture(&path, None).unwrap(),
+    )
+    .unwrap();
+    let mut stretched = decoder::Decoder::new(
+        c.clone(),
+        weights::Store::open_fixture(&path, None).unwrap(),
+    )
+    .unwrap();
+    let (mut reference_cache, mut stretched_cache) = (
+        decoder::LayerCache::default(),
+        decoder::LayerCache::default(),
+    );
+    let mut worst = 0f32;
+    for row in oracle["rows"].as_array().unwrap() {
+        let values: Vec<f32> = row["input_hidden"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let token = row["token"].as_u64().unwrap() as u32;
+        let position = row["position"].as_u64().unwrap() as usize;
+        // Sixteen times stream 0: exact in bf16, so only the norm's grouping
+        // can tell the two rows apart.
+        let mut scaled = values.clone();
+        for v in &mut scaled[..c.hidden_size] {
+            *v *= 16.0;
+        }
+        let hidden = MxArray::from_float32(&values, &shape)
+            .unwrap()
+            .astype(crate::array::DType::BFloat16)
+            .unwrap();
+        let scaled = MxArray::from_float32(&scaled, &shape)
+            .unwrap()
+            .astype(crate::array::DType::BFloat16)
+            .unwrap();
+        let (h, logits, next) = reference
+            .draft_step(&[hidden], &[token], position, &mut reference_cache)
+            .unwrap();
+        reference_cache = next;
+        let (h2, logits2, next) = stretched
+            .draft_step(&[scaled], &[token], position, &mut stretched_cache)
+            .unwrap();
+        stretched_cache = next;
+        for (a, b) in [(h, h2), (logits, logits2)] {
+            let diff = a
+                .to_float32()
+                .unwrap()
+                .iter()
+                .zip(b.to_float32().unwrap().iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            worst = worst.max(diff);
+        }
+    }
+    assert!(
+        worst < 0.02,
+        "a stretched stream moved the draft head by {worst}"
+    );
 }
 
 #[test]
@@ -3034,9 +4005,10 @@ fn mtp_cache_only_prefill_matches_full_head_history_and_keeps_target_state() {
         let mut full_cache = decoder::LayerCache::default();
         let mut fast_cache = decoder::LayerCache::default();
         for i in 0..16 {
-            reference
-                .draft_step(&hidden[i], tokens[i], i, &mut full_cache, false)
-                .unwrap();
+            full_cache = reference
+                .draft_step(&hidden[i..=i], &tokens[i..=i], i, &mut full_cache)
+                .unwrap()
+                .2;
         }
         for start in (0..16).step_by(width) {
             let end = (start + width).min(16);
@@ -3049,14 +4021,14 @@ fn mtp_cache_only_prefill_matches_full_head_history_and_keeps_target_state() {
                 )
                 .unwrap();
         }
-        let (_, a) = reference
-            .draft_step(&hidden[16], tokens[16], 16, &mut full_cache, true)
+        let (_, a, _) = reference
+            .draft_step(&hidden[16..17], &tokens[16..17], 16, &mut full_cache)
             .unwrap();
-        let (_, b) = candidate
-            .draft_step(&hidden[16], tokens[16], 16, &mut fast_cache, true)
+        let (_, b, _) = candidate
+            .draft_step(&hidden[16..17], &tokens[16..17], 16, &mut fast_cache)
             .unwrap();
-        let a = a.unwrap().to_float32().unwrap();
-        let b = b.unwrap().to_float32().unwrap();
+        let a = a.to_float32().unwrap();
+        let b = b.to_float32().unwrap();
         let error = a
             .iter()
             .zip(b.iter())
@@ -3065,6 +4037,390 @@ fn mtp_cache_only_prefill_matches_full_head_history_and_keeps_target_state() {
         assert!(error < 0.04, "MTP history width={width}, error={error}");
         assert_eq!(candidate.history, [3, 9, 7]);
     }
+}
+
+#[test]
+fn mtp_first_draft_pass_extends_only_the_trusted_history() {
+    let path = fixture().join("bf16/paged");
+    let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+    let c = config::Config::parse(&raw).unwrap();
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("mtp-oracle.json")).unwrap()).unwrap();
+    let rows = oracle["rows"].as_array().unwrap();
+    let tokens: Vec<u32> = rows
+        .iter()
+        .map(|r| r["token"].as_u64().unwrap() as u32)
+        .collect();
+    let hidden: Vec<MxArray> = rows
+        .iter()
+        .map(|r| {
+            let values: Vec<f32> = r["input_hidden"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_f64().unwrap() as f32)
+                .collect();
+            MxArray::from_float32(&values, &[1, 1, (c.hc_count * c.hidden_size) as i64])
+                .unwrap()
+                .astype(crate::array::DType::BFloat16)
+                .unwrap()
+        })
+        .collect();
+    let decoder = || {
+        decoder::Decoder::new(
+            c.clone(),
+            weights::Store::open_fixture(&path, None).unwrap(),
+        )
+        .unwrap()
+    };
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0
+    };
+    // Rows start..end - 1 are trusted history, row end - 1 runs the head.
+    for (start, end) in [(0, 1), (0, 6), (5, 11), (3, 17)] {
+        let head = end - 1;
+        let mut reference = decoder();
+        let mut candidate = decoder();
+        let mut base = decoder::LayerCache::default();
+        if start > 0 {
+            reference
+                .draft_prefill(&hidden[..start], &tokens[..start], 0, &mut base)
+                .unwrap();
+        }
+        let mut separate = base.clone();
+        if head > start {
+            reference
+                .draft_prefill(
+                    &hidden[start..head],
+                    &tokens[start..head],
+                    start,
+                    &mut separate,
+                )
+                .unwrap();
+        }
+        let (_, expected, _) = reference
+            .draft_step(&hidden[head..end], &tokens[head..end], head, &mut separate)
+            .unwrap();
+        let mut merged = base.clone();
+        let (_, actual, draft) = candidate
+            .draft_step(&hidden[start..end], &tokens[start..end], start, &mut merged)
+            .unwrap();
+        assert_eq!(
+            merged.history_shape(),
+            separate.history_shape(),
+            "rows {start}..{end}: the trusted cache must hold the history rows only"
+        );
+        assert_eq!(merged.history_shape().0, head);
+        assert_eq!(draft.history_shape().0, end, "rows {start}..{end}");
+        let expected = expected.to_float32().unwrap();
+        let actual = actual.to_float32().unwrap();
+        let oracle: Vec<f32> = rows[head]["logits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        for (name, other) in [("separate passes", &expected[..]), ("oracle", &oracle[..])] {
+            let error = actual
+                .iter()
+                .zip(other)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(error < 0.04, "rows {start}..{end} vs {name}: {error}");
+            assert_eq!(
+                argmax(&actual),
+                argmax(other),
+                "rows {start}..{end} vs {name}"
+            );
+        }
+        assert!(candidate.history.is_empty());
+    }
+}
+
+#[test]
+fn draft_pass_submits_its_input_rows_before_the_head() {
+    let path = fixture().join("bf16/paged");
+    let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+    let c = config::Config::parse(&raw).unwrap();
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("mtp-oracle.json")).unwrap()).unwrap();
+    let rows = &oracle["rows"].as_array().unwrap()[..3];
+    let tokens: Vec<u32> = rows
+        .iter()
+        .map(|r| r["token"].as_u64().unwrap() as u32)
+        .collect();
+    let hidden: Vec<MxArray> = rows
+        .iter()
+        .map(|r| {
+            let values: Vec<f32> = r["input_hidden"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_f64().unwrap() as f32)
+                .collect();
+            MxArray::from_float32(&values, &[1, 1, (c.hc_count * c.hidden_size) as i64])
+                .unwrap()
+                .astype(crate::array::DType::BFloat16)
+                .unwrap()
+        })
+        .collect();
+    let mut decoder = decoder::Decoder::new(
+        c.clone(),
+        weights::Store::open_fixture(&path, None).unwrap(),
+    )
+    .unwrap();
+    let (next, logits, _) = decoder
+        .draft_step(&hidden, &tokens, 0, &mut decoder::LayerCache::default())
+        .unwrap();
+    MxArray::eval_arrays(&[&next, &logits]).unwrap();
+    let log = decoder.submit_log.take();
+    assert_eq!(
+        log.iter()
+            .filter(|c| *c == "qwen4::mtp::draft_input")
+            .count(),
+        1,
+        "{log:?}"
+    );
+    assert_eq!(
+        log[..2],
+        ["qwen4::mtp::draft_input", "qwen4::decoder::kv"],
+        "the input rows reach the GPU before the head's attention: {log:?}"
+    );
+    decoder
+        .draft_prefill(
+            &hidden[..2],
+            &tokens[..2],
+            0,
+            &mut decoder::LayerCache::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        decoder.submit_log.take(),
+        ["qwen4::mtp::draft_input"],
+        "a history window submits its input rows once"
+    );
+}
+
+/// `[1, 2, n, 8]` BF16 draft K/V rows (finite bit patterns), laid out like the
+/// transposed projections the draft path writes.
+fn draft_kv_rows(seed: &mut u64, n: usize) -> MxArray {
+    let bits: Vec<u16> = (0..n * 16)
+        .map(|_| {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            (*seed >> 16) as u16 & 0xBFFF
+        })
+        .collect();
+    MxArray::from_bfloat16(&bits, &[1, n as i64, 2, 8])
+        .unwrap()
+        .transpose(Some(&[0, 2, 1, 3]))
+        .unwrap()
+}
+
+#[test]
+fn draft_history_buffer_matches_its_concatenated_rows() {
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let extend = |reference: Option<&(MxArray, MxArray)>, k: &MxArray, v: &MxArray| match reference
+    {
+        Some((rk, rv)) => (
+            MxArray::concatenate(rk, k, 2).unwrap(),
+            MxArray::concatenate(rv, v, 2).unwrap(),
+        ),
+        None => (k.clone(), v.clone()),
+    };
+    let mut owner = decoder::LayerCache::default();
+    let mut trusted: Option<(MxArray, MxArray)> = None;
+    let mut step = 0;
+    while trusted.as_ref().map_or(0, |r| r.0.shape_at(2).unwrap()) < 600 {
+        let n = 1 + step % 4;
+        let (k, v) = (draft_kv_rows(&mut seed, n), draft_kv_rows(&mut seed, n));
+        let mut cache = owner.clone();
+        cache.append_draft_kv(&k, &v).unwrap();
+        let extended = extend(trusted.as_ref(), &k, &v);
+        let mut heads = vec![(cache.clone(), extended.clone())];
+        for _ in 0..2 {
+            let (mut draft, reference) = heads.last().cloned().unwrap();
+            let (k, v) = (draft_kv_rows(&mut seed, 1), draft_kv_rows(&mut seed, 1));
+            draft.append_draft_kv(&k, &v).unwrap();
+            heads.push((draft, extend(Some(&reference), &k, &v)));
+        }
+        let mut holders = vec![(&cache, &extended)];
+        holders.extend(heads[1..].iter().map(|(c, r)| (c, r)));
+        if let Some(reference) = &trusted {
+            holders.push((&owner, reference));
+        }
+        for (holder, reference) in holders {
+            let (rows, keys, values) = holder.draft_kv().unwrap();
+            assert_eq!(rows as i64, reference.0.shape_at(2).unwrap(), "step {step}");
+            let random: Vec<i32> = (0..7)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed % rows as u64) as i32
+                })
+                .collect();
+            let all: Vec<i32> = (0..rows as i32).collect();
+            for indices in [all, random] {
+                let indices = MxArray::from_int32(&indices, &[indices.len() as i64]).unwrap();
+                for (buffer, expected) in [(keys, &reference.0), (values, &reference.1)] {
+                    assert_eq!(
+                        buffer
+                            .take(&indices, 2)
+                            .unwrap()
+                            .to_uint16_native()
+                            .unwrap(),
+                        expected
+                            .take(&indices, 2)
+                            .unwrap()
+                            .to_uint16_native()
+                            .unwrap(),
+                        "step {step}: {rows} rows"
+                    );
+                }
+            }
+        }
+        owner = cache;
+        trusted = Some(extended);
+        step += 1;
+    }
+}
+
+#[test]
+fn draft_history_appends_in_place() {
+    let mut seed = 0xD1B5_4A32_D192_ED03u64;
+    // An eval's command buffer holds its outputs' buffers until its completion
+    // handler runs, after the eval returns; a write before that copies instead of
+    // donating, so the next append waits for the GPU to retire it.
+    let storage = |cache: &decoder::LayerCache| {
+        let (_, keys, values) = cache.draft_kv().unwrap();
+        MxArray::eval_arrays(&[keys, values]).unwrap();
+        crate::array::memory::synchronize();
+        (keys.storage_ptr(), values.storage_ptr())
+    };
+    let mut owner = decoder::LayerCache::default();
+    let (k, v) = (draft_kv_rows(&mut seed, 1), draft_kv_rows(&mut seed, 1));
+    owner.append_draft_kv(&k, &v).unwrap();
+    let start = storage(&owner);
+    assert!(!start.0.is_null() && !start.1.is_null());
+    let mut holder = owner.clone();
+    for n in [3, 1, 1, 2, 1, 1, 4, 1] {
+        let mut next = holder.clone();
+        let (k, v) = (draft_kv_rows(&mut seed, n), draft_kv_rows(&mut seed, n));
+        next.append_draft_kv(&k, &v).unwrap();
+        holder = next;
+    }
+    assert_eq!(
+        storage(&holder),
+        start,
+        "appends that fit write the buffer in place"
+    );
+    assert_eq!(owner.draft_kv().unwrap().0, 1);
+    let mut grown = holder.clone();
+    let (k, v) = (draft_kv_rows(&mut seed, 256), draft_kv_rows(&mut seed, 256));
+    grown.append_draft_kv(&k, &v).unwrap();
+    let after = storage(&grown);
+    assert!(
+        after.0 != start.0 && after.1 != start.1,
+        "a growth moves the rows"
+    );
+    assert_eq!(
+        storage(&holder),
+        start,
+        "the other holders keep their buffer"
+    );
+}
+
+#[test]
+fn mtp_accepted_rows_wait_for_the_next_first_draft_pass() {
+    use crate::engine::backend::PagedBackend;
+    use crate::engine::hybrid_scheduler::{
+        HybridSchedulerBackend, ScheduledVerifyCommit, ScheduledVerifyRow,
+    };
+    use rand::SeedableRng;
+    let mut inner = tiny_inner();
+    let params = inner.resolve_params(&crate::engine::types::ChatConfig {
+        temperature: Some(0.0),
+        enable_mtp: Some(true),
+        ..Default::default()
+    });
+    assert_eq!(
+        params.mtp_depth, 2,
+        "Flash Next drafts two tokens by default"
+    );
+    let prompt = [3, 9, 5, 2, 7, 11, 12, 8, 10];
+    assert!(inner.decoder.prefill_chunk_size > prompt.len());
+    inner.activate_paged_seq(1).unwrap();
+    inner.begin_mtp(1, 0).unwrap();
+    let prefix = inner
+        .prime_prefix_state(&prompt, false, 32, &[], 0)
+        .unwrap();
+    let logits = inner
+        .paged_prefill(
+            &prompt,
+            &prefix,
+            Stream::default(crate::stream::DeviceType::Gpu),
+        )
+        .unwrap();
+    assert_eq!(inner.mtp.draft_rows(1), Some((0, 8)));
+    let anchor = logits.argmax(-1, None).unwrap().item_at_int32(0).unwrap() as u32;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+    let proposal = inner
+        .propose_mtp(1, anchor, 2, &params, &mut rng, false)
+        .unwrap();
+    assert_eq!(proposal.draft_ids.len(), 2);
+    assert_eq!(
+        inner.mtp.draft_rows(1),
+        Some((8, 0)),
+        "the anchor row stays out of the persistent draft cache"
+    );
+    let mut tokens = vec![anchor];
+    tokens.extend(proposal.draft_ids.iter().map(|&t| t as u32));
+    inner
+        .verify_mtp(&[ScheduledVerifyRow {
+            seq_id: 1,
+            first_position: prompt.len() as u32,
+            tokens: tokens.clone(),
+            speculative: true,
+        }])
+        .unwrap();
+    inner
+        .commit_mtp(&[ScheduledVerifyCommit { seq_id: 1, keep: 2 }])
+        .unwrap()
+        .remove(0)
+        .unwrap();
+    assert_eq!(
+        inner.mtp.draft_rows(1),
+        Some((8, 2)),
+        "commit leaves accepted rows for the next proposal"
+    );
+    let next = inner
+        .propose_mtp(1, 13, 2, &params, &mut rng, false)
+        .unwrap();
+    assert_eq!(next.draft_ids.len(), 2);
+    assert_eq!(inner.mtp.draft_rows(1), Some((10, 0)));
+    // Whole windows are written as soon as they fill.
+    let mut windowed = tiny_inner();
+    windowed.decoder.prefill_chunk_size = 4;
+    windowed.activate_paged_seq(1).unwrap();
+    windowed.begin_mtp(1, 0).unwrap();
+    let prompt = [3, 9, 5, 2, 7, 11, 12, 8, 10, 6];
+    let prefix = windowed
+        .prime_prefix_state(&prompt, false, 32, &[], 0)
+        .unwrap();
+    windowed
+        .paged_prefill(
+            &prompt,
+            &prefix,
+            Stream::default(crate::stream::DeviceType::Gpu),
+        )
+        .unwrap();
+    assert_eq!(windowed.mtp.draft_rows(1), Some((8, 1)));
 }
 
 struct CompleteGdnInputs {
@@ -3143,7 +4499,9 @@ impl CompleteGdnInputs {
             .unwrap();
         }
         let mut history = Some(history.clone());
-        let qkv = math::conv(&self.qkv, &self.conv, &mut history, self.kernel, 1).unwrap();
+        let qkv =
+            math::conv_with_completion(&self.qkv, &self.conv, &mut history, self.kernel, 1, false)
+                .unwrap();
         let q = math::l2(
             &qkv.slice_axis(2, 0, 2048)
                 .unwrap()
@@ -3203,36 +4561,6 @@ impl CompleteGdnInputs {
             .unwrap();
         (out, next, history.unwrap())
     }
-}
-
-#[test]
-fn complete_gdn_compact_gates_preserve_fallback_rounding() {
-    // Exercise the older-GPU graph on every Metal host. A forced rollback
-    // used to fuse the BF16 gate casts differently from its F32 control.
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "models::qwen4_exp::tests::complete_gdn_replay_preserves_outputs_and_independent_histories",
-            "--exact", "--test-threads=1",
-        ])
-        .env("MLX_QWEN4_COMPLETE_GDN_METAL", "0")
-        .status().unwrap();
-    assert!(status.success(), "complete GDN fallback regression failed");
-}
-
-#[test]
-fn complete_gdn_prefetch_preserves_outputs_and_independent_histories() {
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "models::qwen4_exp::tests::complete_gdn_replay_preserves_outputs_and_independent_histories", "--test-threads=1"])
-        .env("MLX_QWEN4_GDN_DECODE_PREFETCH", "1")
-        .status()
-        .unwrap();
-    assert!(
-        status.success(),
-        "GDN prefetch changed output, state or history bits"
-    );
 }
 
 #[test]
@@ -3319,7 +4647,6 @@ fn wide_causal_windows_match_singleton_with_pages_media_and_retained_prefix() {
         weights::Store::open_fixture(&path, None).unwrap(),
     )
     .unwrap();
-    reference.batch_prefill = false;
     let mut candidate = decoder::Decoder::new(
         c.clone(),
         weights::Store::open_fixture(&path, None).unwrap(),
@@ -3337,11 +4664,11 @@ fn wide_causal_windows_match_singleton_with_pages_media_and_retained_prefix() {
     candidate.rope_delta = -4;
     for count in [7, 65, 128, 3] {
         let tokens: Vec<u32> = (0..count).map(|i| (i % 11 + 1) as u32).collect();
-        let a = reference
-            .prefill_chunk(&tokens, None, true)
-            .unwrap()
-            .to_float32()
-            .unwrap();
+        let mut a = None;
+        for &token in &tokens {
+            a = Some(reference.step(token).unwrap());
+        }
+        let a = a.unwrap().to_float32().unwrap();
         let b = candidate
             .prefill_chunk(&tokens, None, true)
             .unwrap()
@@ -3409,7 +4736,7 @@ fn paged_writes_accept_offset_projection_views() {
             .to_float32()
             .unwrap()
             .to_vec();
-        paged::write_rows(&mut pages, 0, &view, &view, base as u32).unwrap();
+        paged::write_rows(&mut pages, 0, &view, &view, base as u32, base as u32).unwrap();
         drop(view);
         drop(backing);
         pages.eval_pending_pool_writes().unwrap();
@@ -3447,7 +4774,7 @@ fn gather_window_runtime_shapes_match_selected() {
         let shape = [written as i64, h as i64, d as i64];
         let k = rows(&shape, start);
         let v = rows(&shape, start + 61);
-        paged::write_rows(&mut pages, 0, &k, &v, start as u32).unwrap();
+        paged::write_rows(&mut pages, 0, &k, &v, start as u32, start as u32).unwrap();
         pages.eval_pending_pool_writes().unwrap();
         let base = start + written;
         let fresh_shape = [1, h as i64, fresh as i64, d as i64];
@@ -3485,19 +4812,29 @@ fn gather_window_runtime_shapes_match_selected() {
 
 #[test]
 fn convolution_history_releases_wide_prefill_storage() {
-    // Run serialized with the GPU suite. Check live allocation ownership,
-    // not allocator cache size; a view would retain > 2 MiB here.
-    crate::array::memory::synchronize();
-    let before = crate::array::memory::get_active_memory();
+    // Live allocation ownership, not allocator cache size: a view would
+    // retain the 2 MiB input on every attempt. The counter is process-wide
+    // and the other tests of this binary allocate concurrently, so the
+    // smallest delta over a few attempts is the one that belongs to the
+    // convolution.
+    let mut retained = f64::MAX;
     let mut history = None;
-    {
-        let x = MxArray::ones(&[1, 512, 1024], Some(crate::array::DType::Float32)).unwrap();
-        let weights = MxArray::ones(&[1024, 4], Some(crate::array::DType::Float32)).unwrap();
-        let output = math::conv_sequence(&x, &weights, &mut history, 4).unwrap();
-        MxArray::eval_arrays(&[&output]).unwrap();
+    for _ in 0..8 {
+        history = None;
+        crate::array::memory::synchronize();
+        let before = crate::array::memory::get_active_memory();
+        {
+            let x = MxArray::ones(&[1, 512, 1024], Some(crate::array::DType::Float32)).unwrap();
+            let weights = MxArray::ones(&[1024, 4], Some(crate::array::DType::Float32)).unwrap();
+            let output = math::conv_sequence(&x, &weights, &mut history, 4).unwrap();
+            MxArray::eval_arrays(&[&output]).unwrap();
+        }
+        crate::array::memory::synchronize();
+        retained = retained.min(crate::array::memory::get_active_memory() - before);
+        if retained < 256. * 1024. {
+            break;
+        }
     }
-    crate::array::memory::synchronize();
-    let retained = crate::array::memory::get_active_memory() - before;
     assert!(
         retained < 256. * 1024.,
         "convolution history retained {retained} bytes"
@@ -3514,24 +4851,6 @@ fn convolution_history_releases_wide_prefill_storage() {
             .iter()
             .all(|&x| x == 1.)
     );
-}
-
-#[test]
-fn bf16_indirect_prefill_staging_preserves_scalar_load_results() {
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "models::qwen4_exp::tests::indirect_prefill_preserves_mixed_formats_rows_and_tail_rounding",
-            "--test-threads=1",
-        ])
-        .env("QWEN4_TEST_BF16_STAGING", "1")
-        .env("MLX_QWEN4_PREFILL_REFERENCE_BF16", "1")
-        .status()
-        .unwrap();
-    assert!(status.success(), "BF16 staging changed an output bit");
 }
 
 fn quantized_expert_bank(
@@ -3607,7 +4926,6 @@ fn indirect_prefill_preserves_mixed_formats_rows_and_tail_rounding() {
     // This mode runs only in the isolated child above. The scalar-load path
     // is the oracle for an address-only BF16 prefetch change, not for the
     // separate BF16-vs-F32 arithmetic experiment.
-    let check_bf16_staging = std::env::var_os("QWEN4_TEST_BF16_STAGING").is_some();
     let (h, m, tokens) = (256usize, 128usize, 53usize);
     let ids: Vec<u32> = counts
         .iter()
@@ -3650,36 +4968,6 @@ fn indirect_prefill_preserves_mixed_formats_rows_and_tail_rounding() {
                 bank(m, h, gb, false, 197),
                 bank(h, m, db, true, 13),
             ];
-            if check_bf16_staging {
-                for phase in [0., 0.125] {
-                    let input = source
-                        .add_scalar(phase)
-                        .unwrap()
-                        .astype(DType::BFloat16)
-                        .unwrap();
-                    // The child's main thread alone changes the switch, and
-                    // each graph is fully evaluated before the next change.
-                    unsafe { std::env::set_var("MLX_QWEN4_PREFILL_DOWN_STAGING", "0") };
-                    unsafe { std::env::set_var("MLX_QWEN4_PREFILL_HOIST_ZERO", "0") };
-                    let expected = math::prefill_indirect(&input, &ids, &token_rows, &banks, e)
-                        .unwrap()
-                        .expect("supported scalar BF16 path")
-                        .to_float32()
-                        .unwrap();
-                    unsafe { std::env::set_var("MLX_QWEN4_PREFILL_DOWN_STAGING", "1") };
-                    unsafe { std::env::set_var("MLX_QWEN4_PREFILL_HOIST_ZERO", "1") };
-                    let actual = math::prefill_indirect(&input, &ids, &token_rows, &banks, e)
-                        .unwrap()
-                        .expect("supported staged BF16 path")
-                        .to_float32()
-                        .unwrap();
-                    assert_eq!(
-                        &*actual, &*expected,
-                        "BF16 stage gate={gb} down={db} phase={phase}"
-                    );
-                }
-                continue;
-            }
             let gate = banks[0]
                 .tiled_expert_rows(&expanded, &ids, &tiles, e)
                 .unwrap()
@@ -3744,9 +5032,15 @@ fn indirect_prefill_preserves_mixed_formats_rows_and_tail_rounding() {
                 .unwrap()
                 .astype(DType::BFloat16)
                 .unwrap();
-                let (output, inverse) =
-                    decoder::Decoder::single_slot_group_rows(&x, &routes, &banks, e, e - 1, top)
-                        .unwrap();
+                let (output, inverse) = decoder::Decoder::single_slot_group_rows(
+                    &x,
+                    &routes,
+                    &banks,
+                    e,
+                    math::ExpertKernel::for_window(assignments, e),
+                    top,
+                )
+                .unwrap();
                 let expected = math::combine_expert_rows(&expected_rows, &scores, None, top)
                     .unwrap()
                     .to_float32()
@@ -3920,11 +5214,270 @@ fn expert_prefill_runtime_sizes_match_quantized_matmul() {
     }
 }
 
+/// The window's row count and the model's expert count decide the expert
+/// kernel; a slot bank's row count and a group's size never enter.
+#[test]
+fn expert_kernel_follows_the_window_not_the_bank() {
+    use math::ExpertKernel::{self, Gather, Rows, Tiles};
+    let kernel = |rows| ExpertKernel::for_window(rows, 512);
+    assert_eq!(kernel(10240), Tiles);
+    assert_eq!(kernel(2048), Tiles);
+    assert_eq!(kernel(2047), Gather);
+    assert_eq!(kernel(750), Gather);
+    assert_eq!(kernel(256), Gather);
+    assert_eq!(kernel(81), Gather);
+    assert_eq!(kernel(80), Rows);
+    assert_eq!(kernel(1), Rows);
+    assert_eq!(kernel(65537), Gather);
+    assert_eq!(ExpertKernel::for_window(256, 10), Tiles);
+    assert_eq!(ExpertKernel::for_window(255, 10), Gather);
+    assert_eq!(ExpertKernel::for_window(40, 0), Rows);
+}
+
+/// A window split over slot banks gives the bits of the one-bank run for
+/// every split. The capacities put the remainder group in each class the
+/// old bank-keyed choice took on its own: under 80 rows (per-row GEMV),
+/// under 256 (the host sort's floor), under four rows per slot (MLX's
+/// gather-vector pick), at or above it (NAX), a 200-token window whose first
+/// group crosses MLX's rows-per-expert line, and a 75-token tail.
+#[test]
+fn slot_groups_match_the_whole_window_bit_for_bit() {
+    use crate::array::DType;
+    use decoder::GroupBanks;
+    use std::collections::HashMap;
+    const E: usize = 512;
+    let (h, m, top) = (256usize, 128usize, 10usize);
+    let probe = MxArray::from_uint32(&[0; 256], &[256]).unwrap();
+    if math::expert_tiles(&probe, 1).unwrap().is_none() {
+        return;
+    }
+    let banks = [
+        quantized_expert_bank(E, m, h, 4, false, 71),
+        quantized_expert_bank(E, m, h, 4, false, 197),
+        quantized_expert_bank(E, h, m, 8, true, 13),
+    ];
+    // Slot banks of `capacity` rows per expert matrix, filled on each lease
+    // by row copies from the full bank: the production shape without a store.
+    struct SlotBanks<'a> {
+        banks: &'a [std::sync::Arc<weights::Weight>; 3],
+        capacity: usize,
+        leases: usize,
+    }
+    impl GroupBanks for SlotBanks<'_> {
+        fn lease(
+            &mut self,
+            experts: &[u32],
+        ) -> Result<Option<([std::sync::Arc<weights::Weight>; 3], Vec<u32>, usize)>> {
+            let mut slot_of = HashMap::new();
+            let mut occupants = Vec::new();
+            for &expert in experts {
+                slot_of.entry(expert).or_insert_with(|| {
+                    occupants.push(expert);
+                    occupants.len() as u32 - 1
+                });
+            }
+            assert!(
+                occupants.len() <= self.capacity,
+                "{} experts for {} slots",
+                occupants.len(),
+                self.capacity
+            );
+            occupants.resize(self.capacity, occupants[0]);
+            let rows = MxArray::from_uint32(&occupants, &[self.capacity as i64]).unwrap();
+            let bank = |w: &weights::Weight| {
+                let take = |a: &MxArray| {
+                    let s = a.shape().unwrap();
+                    a.reshape(&[E as i64, s[0] / E as i64, s[1]])
+                        .unwrap()
+                        .take(&rows, 0)
+                        .unwrap()
+                        .reshape(&[-1, s[1]])
+                        .unwrap()
+                };
+                std::sync::Arc::new(weights::Weight {
+                    values: take(&w.values),
+                    scales: w.scales.as_ref().map(take),
+                    biases: w.biases.as_ref().map(take),
+                    ..w.clone()
+                })
+            };
+            self.leases += 1;
+            Ok(Some((
+                [
+                    bank(&self.banks[0]),
+                    bank(&self.banks[1]),
+                    bank(&self.banks[2]),
+                ],
+                experts.iter().map(|e| slot_of[e]).collect(),
+                self.capacity,
+            )))
+        }
+        fn release(&mut self, _: &MxArray) -> Result<()> {
+            Ok(())
+        }
+    }
+    let routes = |tokens: usize, pool: usize, mut state: u64| -> Vec<u32> {
+        let mut ids = Vec::with_capacity(tokens * top);
+        for _ in 0..tokens {
+            let mut picked: Vec<u32> = Vec::with_capacity(top);
+            while picked.len() < top {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let expert = ((state >> 33) % pool as u64) as u32;
+                if !picked.contains(&expert) {
+                    picked.push(expert);
+                }
+            }
+            ids.extend(picked);
+        }
+        ids
+    };
+    // (tokens, expert pool, remainder-row targets beside 454 and 461 slots)
+    let windows: [(usize, usize, &[usize]); 5] = [
+        (1024, 470, &[40, 120, 600, 1400, 2000]),
+        (2000, 470, &[40, 600]),
+        (200, 470, &[]),
+        (75, 300, &[40]),
+        (20, 470, &[]),
+    ];
+    let mut failures = Vec::new();
+    for (tokens, pool, targets) in windows {
+        let ids = routes(tokens, pool, 0x5eed + tokens as u64);
+        let rows = ids.len();
+        let x = MxArray::from_float32(
+            &(0..tokens * h)
+                .map(|i| ((i * 13 % 251) as f32 - 125.) / 128. + ((i / h) % 17) as f32 / 64.)
+                .collect::<Vec<_>>(),
+            &[1, tokens as i64, h as i64],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let scores = MxArray::from_float32(
+            &(0..rows)
+                .map(|i| (i % 11 + 1) as f32 * 0.0113)
+                .collect::<Vec<_>>(),
+            &[1, rows as i64, 1],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let kernel = math::ExpertKernel::for_window(rows, E);
+        let selected = MxArray::from_uint32(&ids, &[rows as i64]).unwrap();
+        let (out, inverse) =
+            decoder::Decoder::single_slot_group_rows(&x, &selected, &banks, E, kernel, top)
+                .unwrap();
+        let reference = math::combine_expert_rows(&out, &scores, inverse.as_ref(), top)
+            .unwrap()
+            .to_uint16_native()
+            .unwrap();
+        // The whole-bank bits, for comparison across trees.
+        let digest = reference.iter().fold(0xcbf29ce484222325u64, |d, &v| {
+            (d ^ u64::from(v)).wrapping_mul(0x100000001b3)
+        });
+        eprintln!("slot groups: whole-bank tokens {tokens} rows {rows} digest {digest:016x}");
+        let order = route_plan::expert_order(&ids, E).unwrap();
+        let mut counts = vec![0usize; E];
+        for &e in &ids {
+            counts[e as usize] += 1;
+        }
+        // Rows of the experts past slot `c` in last-use order: the remainder.
+        let remainder = |c: usize| {
+            order[c.min(order.len())..]
+                .iter()
+                .map(|&e| counts[e as usize])
+                .sum::<usize>()
+        };
+        let mut capacities = vec![454usize, 461];
+        for &target in targets {
+            capacities.push(
+                (top..order.len())
+                    .min_by_key(|&c| remainder(c).abs_diff(target))
+                    .unwrap(),
+            );
+        }
+        if tokens == 1024 {
+            let bands: Vec<_> = capacities[2..].iter().map(|&c| (c, remainder(c))).collect();
+            assert!(
+                bands[0].1 <= 80
+                    && (81..256).contains(&bands[1].1)
+                    && (256..4 * bands[2].0).contains(&bands[2].1)
+                    && (256..4 * bands[3].0).contains(&bands[3].1)
+                    && bands[4].1 >= 4 * bands[4].0,
+                "remainder bands {bands:?}"
+            );
+        }
+        if tokens == 200 {
+            // One group whose bank has exactly the window's experts: four
+            // rows per slot, the NAX line of the old bank-keyed choice.
+            capacities.push(order.len());
+        }
+        if tokens == 75 {
+            capacities.push(200);
+        }
+        if tokens == 20 {
+            capacities.push(100);
+        }
+        for capacity in capacities {
+            let mut slots = SlotBanks {
+                banks: &banks,
+                capacity,
+                leases: 0,
+            };
+            let (out, inverse, groups) = if order.len() <= capacity {
+                let (group_banks, local, count) = slots.lease(&ids).unwrap().unwrap();
+                let local = MxArray::from_uint32(&local, &[rows as i64]).unwrap();
+                let (out, inverse) = decoder::Decoder::single_slot_group_rows(
+                    &x,
+                    &local,
+                    &group_banks,
+                    count,
+                    kernel,
+                    top,
+                )
+                .unwrap();
+                (out, inverse, 1)
+            } else {
+                let groups = route_plan::assignment_groups(&ids, &order, E, capacity).unwrap();
+                let (out, inverse) = decoder::Decoder::grouped_expert_rows(
+                    &x, &ids, &groups, kernel, top, &mut slots,
+                )
+                .unwrap()
+                .unwrap();
+                (out, Some(inverse), groups.len())
+            };
+            assert_eq!(slots.leases, groups);
+            let actual = math::combine_expert_rows(&out, &scores, inverse.as_ref(), top)
+                .unwrap()
+                .to_uint16_native()
+                .unwrap();
+            let differing = actual
+                .iter()
+                .zip(&reference)
+                .filter(|(a, b)| a != b)
+                .count();
+            let first = actual.iter().zip(&reference).position(|(a, b)| a != b);
+            let line = format!(
+                "tokens {tokens} rows {rows} distinct {} capacity {capacity} groups {groups} remainder {} {kernel:?}: {differing} of {} bf16 values differ, first {first:?}",
+                order.len(),
+                remainder(capacity),
+                reference.len()
+            );
+            eprintln!("slot groups: {line}");
+            if differing > 0 {
+                failures.push(line);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 #[test]
 fn compact_dense_prefill_preserves_affine_rounding_views_and_fallbacks() {
     use crate::array::DType;
     use crate::models::quantized_linear::QuantizedLinear;
-    if std::env::var("MLX_ENABLE_TF32").as_deref() == Ok("0") {
+    if !super::tf32_enabled() {
         return;
     }
     let ids = MxArray::from_uint32(&vec![0; 256], &[256]).unwrap();
@@ -4064,90 +5617,6 @@ fn compact_dense_prefill_preserves_affine_rounding_views_and_fallbacks() {
 }
 
 #[test]
-fn route_register_results_preserve_probability_ties_and_scores() {
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["router_preserves_probability", "--test-threads=1"])
-        .env("MLX_QWEN4_ROUTE_REGISTER_RESULTS", "1")
-        .status()
-        .unwrap();
-    assert!(
-        status.success(),
-        "register routing changed IDs or score bits"
-    );
-}
-
-#[test]
-fn singleton_router_row_schedule_preserves_native_gemv() {
-    use crate::array::DType;
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    for phase in 0..4 {
-        let x = MxArray::from_float32(
-            &(0..5120)
-                .map(|i| ((i * 131 + phase * 53) as f32 * 0.017).sin())
-                .collect::<Vec<_>>(),
-            &[1, 1, 5120],
-        )
-        .unwrap()
-        .astype(DType::BFloat16)
-        .unwrap();
-        // Offset and strided inputs exercise the custom primitive's copies.
-        let x = if phase % 2 == 0 {
-            x.slice_axis(2, 2560, 5120).unwrap()
-        } else {
-            x.reshape(&[2560, 2])
-                .unwrap()
-                .slice_axis(1, 1, 2)
-                .unwrap()
-                .reshape(&[1, 1, 2560])
-                .unwrap()
-        };
-        let w = MxArray::from_float32(
-            &(0..513 * 2560)
-                .map(|i| ((i * 37 + phase * 101) as f32 * 0.0031).cos() * 0.125)
-                .collect::<Vec<_>>(),
-            &[513, 2560],
-        )
-        .unwrap()
-        .astype(DType::BFloat16)
-        .unwrap()
-        .slice_axis(0, 1, 513)
-        .unwrap();
-        let expected = x
-            .matmul(&w.transpose(None).unwrap())
-            .unwrap()
-            .to_float32()
-            .unwrap();
-        let raw = unsafe { mlx_sys::mlx_qwen4_router_decode(x.as_raw_ptr(), w.as_raw_ptr()) };
-        assert!(!raw.is_null(), "supported router shape");
-        let actual = MxArray::from_handle(raw, "router regression")
-            .unwrap()
-            .to_float32()
-            .unwrap();
-        for (i, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
-            assert_eq!(
-                actual.to_bits(),
-                expected.to_bits(),
-                "router phase={phase} row={i}"
-            );
-        }
-        assert!(
-            unsafe {
-                mlx_sys::mlx_qwen4_router_decode(
-                    x.astype(DType::Float32).unwrap().as_raw_ptr(),
-                    w.as_raw_ptr(),
-                )
-            }
-            .is_null()
-        );
-    }
-}
-
-#[test]
 fn singleton_router_preserves_probability_rounding_ties_and_normalization() {
     use crate::array::{DType, MxArray};
     use crate::nn::Activations;
@@ -4211,136 +5680,6 @@ fn singleton_router_preserves_probability_rounding_ties_and_normalization() {
 }
 
 #[test]
-fn combined_routes_preserve_probability_ties_dense_gate_and_changing_views() {
-    use crate::array::DType;
-    use crate::nn::Activations;
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    const CHILD: &str = "MLX_QWEN4_COMBINED_ROUTE_TEST_CHILD";
-    if std::env::var(CHILD).as_deref() != Ok("1") {
-        for cached in ["0", "1"] {
-            for registers in ["0", "1"] {
-                let output = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "models::qwen4_exp::tests::combined_routes_preserve_probability_ties_dense_gate_and_changing_views", "--test-threads=1"])
-                    .env(CHILD, "1")
-                    .env("MLX_QWEN4_CACHED_KERNEL_GRAPHS", cached)
-                    .env("MLX_QWEN4_ROUTE_REGISTER_RESULTS", registers)
-                    .output().unwrap();
-                assert!(
-                    output.status.success(),
-                    "cached={cached}, registers={registers}: {}\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        }
-        return;
-    }
-    for case in 0..64 {
-        // Select alternating columns: real strided views with changing input
-        // and weight storage catch accidental graph constant captures.
-        let view = |values: &[f32], width: i64| {
-            MxArray::from_float32(values, &[width, 2])
-                .unwrap()
-                .astype(DType::BFloat16)
-                .unwrap()
-                .slice_axis(1, case % 2, case % 2 + 1)
-                .unwrap()
-                .transpose(None)
-                .unwrap()
-        };
-        let l: Vec<f32> = (0..1024)
-            .map(|i| match case {
-                0 => 0.,
-                1 => (i % 4) as f32,
-                2 => f32::NEG_INFINITY,
-                3 => f32::INFINITY,
-                4 if i == 14 => f32::NAN,
-                5 if i == 1023 => f32::INFINITY,
-                _ => ((i * 131 + case * 53) as f32 * 0.017).sin() * case as f32 * 0.3,
-            })
-            .collect();
-        let l = view(&l, 512).reshape(&[1, 1, 512]).unwrap();
-        let values: Vec<f32> = (0..5120)
-            .map(|i| ((i * 19 + case * 37) % 257) as f32 / 128. - 1.)
-            .collect();
-        let weights: Vec<f32> = (0..5120)
-            .map(|i| ((i * 31 + case * 13) % 511) as f32 / 256. - 1.)
-            .collect();
-        let x = view(&values, 2560).reshape(&[1, 1, 2560]).unwrap();
-        let w = view(&weights, 2560);
-        let probs = Activations::softmax_precise(&l, Some(-1)).unwrap();
-        let want_ids = probs
-            .argpartition(-10, Some(-1))
-            .unwrap()
-            .slice_axis(2, 502, 512)
-            .unwrap();
-        let want_scores = probs.take_along_axis(&want_ids, -1).unwrap();
-        let want_scores = want_scores
-            .div(&want_scores.sum(Some(&[-1]), Some(true)).unwrap())
-            .unwrap();
-        let want_gate = x.matmul(&w.transpose(None).unwrap()).unwrap();
-        let (mut ids, mut scores, mut gate) = (
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        assert!(unsafe {
-            mlx_sys::mlx_qwen4_routes_shared_gate(
-                l.as_raw_ptr(),
-                x.as_raw_ptr(),
-                w.as_raw_ptr(),
-                &mut ids,
-                &mut scores,
-                &mut gate,
-            )
-        });
-        let ids = MxArray::from_handle(ids, "combined IDs").unwrap();
-        let scores = MxArray::from_handle(scores, "combined scores").unwrap();
-        let gate = MxArray::from_handle(gate, "combined gate").unwrap();
-        assert_eq!(
-            &*ids.to_uint32().unwrap(),
-            &*want_ids.to_uint32().unwrap(),
-            "IDs case={case}"
-        );
-        for (a, b) in scores
-            .to_float32()
-            .unwrap()
-            .iter()
-            .zip(want_scores.to_float32().unwrap().iter())
-        {
-            assert!(
-                a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
-                "scores case={case}: {a} vs {b}"
-            );
-        }
-        assert_eq!(
-            &*gate.to_float32().unwrap(),
-            &*want_gate.to_float32().unwrap(),
-            "gate case={case}"
-        );
-        let unsupported = l.astype(DType::Float32).unwrap();
-        let (mut ids, mut scores, mut gate) = (
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        assert!(!unsafe {
-            mlx_sys::mlx_qwen4_routes_shared_gate(
-                unsupported.as_raw_ptr(),
-                x.as_raw_ptr(),
-                w.as_raw_ptr(),
-                &mut ids,
-                &mut scores,
-                &mut gate,
-            )
-        });
-        assert!(ids.is_null() && scores.is_null() && gate.is_null());
-    }
-}
-
-#[test]
 fn reference_prefill_hc_mix_preserves_bf16_boundaries_and_views() {
     use crate::array::DType;
     if !crate::engine::persistence::compiled_forward_backend_available() {
@@ -4383,159 +5722,10 @@ fn reference_prefill_hc_mix_preserves_bf16_boundaries_and_views() {
 }
 
 #[test]
-fn mixer_split_k_preserves_independent_projections() {
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "mixer_down_injection_matches_independent_projections",
-            "--test-threads=1",
-        ])
-        .env("MLX_QWEN4_MIXER_SPLIT_K", "1")
-        .env("MLX_QWEN4_MIXER_DOWN_INJECT", "0")
-        .status()
-        .unwrap();
-    assert!(
-        status.success(),
-        "ordered split-K mixer changed projection bits"
-    );
-}
-
-#[test]
-fn mixer_down_injection_matches_independent_projections() {
-    use crate::array::DType;
-    use crate::models::quantized_linear::QuantizedLinear;
-    use crate::nn::Activations;
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    for phase in [3usize, 17] {
-        let k = 10240;
-        // Offset views and changing weight values catch cached-graph captures.
-        let make = |n: usize| {
-            let w = MxArray::from_uint32(
-                &(0..(n + 1) * k / 4)
-                    .map(|i| {
-                        (i as u32)
-                            .wrapping_mul(0x9e3779b9)
-                            .wrapping_add(phase as u32)
-                    })
-                    .collect::<Vec<_>>(),
-                &[(n + 1) as i64, (k / 4) as i64],
-            )
-            .unwrap()
-            .slice_axis(0, 1, (n + 1) as i64)
-            .unwrap();
-            let s = MxArray::from_float32(
-                &(0..(n + 1) * k / 32)
-                    .map(|i| ((i * 13 + phase) % 61 + 1) as f32 / 65536.)
-                    .collect::<Vec<_>>(),
-                &[(n + 1) as i64, (k / 32) as i64],
-            )
-            .unwrap()
-            .astype(DType::Float16)
-            .unwrap()
-            .slice_axis(0, 1, (n + 1) as i64)
-            .unwrap();
-            let b = s.mul_scalar(-128.).unwrap().astype(DType::Float16).unwrap();
-            (w, s, b)
-        };
-        let (wd, sd, bd) = make(320);
-        let (wi, si, bi) = make(4);
-        let x = MxArray::from_float32(
-            &(0..2 * k)
-                .map(|i| ((i * 17 + phase) % 251) as f32 / 128. - 1.)
-                .collect::<Vec<_>>(),
-            &[2, k as i64],
-        )
-        .unwrap()
-        .astype(DType::BFloat16)
-        .unwrap()
-        .slice_axis(0, 1, 2)
-        .unwrap()
-        .reshape(&[1, 1, k as i64])
-        .unwrap();
-        let project = |w: &MxArray, s: &MxArray, b: &MxArray| {
-            QuantizedLinear::new(
-                w.clone(),
-                s.clone(),
-                Some(b.clone()),
-                None,
-                32,
-                8,
-                "affine".into(),
-            )
-            .forward(&x)
-            .unwrap()
-        };
-        let expected_act =
-            Activations::silu(&project(&wd, &sd, &bd).div_scalar(4.).unwrap()).unwrap();
-        let expected_gate = project(&wi, &si, &bi);
-        if std::env::var("MLX_QWEN4_MIXER_SPLIT_K").as_deref() == Ok("1") {
-            let weight = |w: &MxArray, s: &MxArray, b: &MxArray| weights::Weight {
-                values: w.clone(),
-                dense_bf16: None,
-                scales: Some(s.clone()),
-                biases: Some(b.clone()),
-                group: 32,
-                bits: 8,
-                mode: "affine".into(),
-            };
-            let (actual, gate) = weight(&wd, &sd, &bd)
-                .mixer_down_inject(&x, &weight(&wi, &si, &bi))
-                .unwrap()
-                .expect("split-K independently enables its eligible mixer path");
-            assert_eq!(
-                &*actual.to_float32().unwrap(),
-                &*expected_act.to_float32().unwrap()
-            );
-            assert_eq!(
-                &*gate.to_float32().unwrap(),
-                &*expected_gate.to_float32().unwrap()
-            );
-        }
-        let call = |input: &MxArray, out: &mut _, gate: &mut _| unsafe {
-            mlx_sys::mlx_qwen4_mixer_down_inject(
-                input.as_raw_ptr(),
-                wd.as_raw_ptr(),
-                sd.as_raw_ptr(),
-                bd.as_raw_ptr(),
-                wi.as_raw_ptr(),
-                si.as_raw_ptr(),
-                bi.as_raw_ptr(),
-                out,
-                gate,
-            )
-        };
-        let (mut out, mut gate) = (std::ptr::null_mut(), std::ptr::null_mut());
-        assert!(call(&x, &mut out, &mut gate));
-        let out = MxArray::from_handle(out, "fused down activation").unwrap();
-        let gate = MxArray::from_handle(gate, "fused injection projection").unwrap();
-        assert_eq!(
-            &*out.to_float32().unwrap(),
-            &*expected_act.to_float32().unwrap()
-        );
-        assert_eq!(
-            &*gate.to_float32().unwrap(),
-            &*expected_gate.to_float32().unwrap()
-        );
-        for unsupported in [
-            x.astype(DType::Float32).unwrap(),
-            x.broadcast_to(&[1, 2, k as i64]).unwrap(),
-        ] {
-            let (mut out, mut gate) = (x.as_raw_ptr(), x.as_raw_ptr());
-            assert!(!call(&unsupported, &mut out, &mut gate));
-            assert!(out.is_null() && gate.is_null());
-        }
-    }
-}
-
-#[test]
 fn reference_prefill_mixer_tile_preserves_affine8_projection() {
     use crate::array::DType;
     use crate::models::quantized_linear::QuantizedLinear;
-    if std::env::var("MLX_ENABLE_TF32").as_deref() == Ok("0") {
+    if !super::tf32_enabled() {
         return;
     }
     let ids = MxArray::from_uint32(&vec![0; 256], &[256]).unwrap();
@@ -4696,7 +5886,7 @@ fn reference_prefill_router_preserves_probability_order_and_scores() {
             }
         }
     }
-    let x = MxArray::zeros(&[1, 8, 512], Some(DType::BFloat16)).unwrap();
+    let x = MxArray::zeros(&[1, 1025, 512], Some(DType::BFloat16)).unwrap();
     let (mut ids, mut scores) = (std::ptr::null_mut(), std::ptr::null_mut());
     assert!(!unsafe { mlx_sys::mlx_qwen4_prefill_routes(x.as_raw_ptr(), &mut ids, &mut scores) });
     assert!(ids.is_null() && scores.is_null());
@@ -4842,9 +6032,7 @@ fn reference_hyper_norm_preserves_mean_boundaries_and_offset_views() {
 fn shared_prefill_preserves_q8_values_companions_and_row_tails() {
     use crate::array::DType;
     use crate::models::quantized_linear::QuantizedLinear;
-    if std::env::var("MLX_ENABLE_TF32").as_deref() == Ok("0")
-        || runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_SHARED_Q8")
-    {
+    if !super::tf32_enabled() {
         return;
     }
     let ids = MxArray::from_uint32(&vec![0; 256], &[256]).unwrap();
@@ -5040,7 +6228,7 @@ fn fused_injection_norm_preserves_stream_values_and_group_reduction() {
 }
 
 #[test]
-fn deferred_ple_history_matches_completed_windows_and_continuation() {
+fn ple_window_history_stays_lazy_and_matches_the_singleton_convolution() {
     use crate::array::DType;
     for dtype in [DType::Float32, DType::BFloat16] {
         let weight = MxArray::arange(0., 64., None, Some(DType::Float32))
@@ -5051,7 +6239,7 @@ fn deferred_ple_history_matches_completed_windows_and_continuation() {
             .unwrap()
             .reshape(&[16, 4])
             .unwrap();
-        let (mut deferred, mut completed) = (None, None);
+        let (mut window, mut singleton) = (None, None);
         let mut pending = Vec::new();
         for rows in [1i64, 17, 1, 1, 33, 9, 1, 11, 1] {
             let x = MxArray::arange(0., (rows * 16) as f64, None, Some(DType::Float32))
@@ -5064,25 +6252,34 @@ fn deferred_ple_history_matches_completed_windows_and_continuation() {
                 .unwrap()
                 .astype(dtype)
                 .unwrap();
-            let actual =
-                math::conv_window_with_completion(&x, &weight, &mut deferred, 4, 3, true).unwrap();
-            // Value parity alone missed the singleton's unconditional wait.
-            // Inspect readiness before the control or any output is evaluated.
+            let actual = math::conv_window(&x, &weight, &mut window, 4, 3).unwrap();
+            // Value parity alone would miss an eager wait. Inspect readiness
+            // before the reference or any output is evaluated.
             assert!(
-                !unsafe {
-                    mlx_sys::mlx_array_is_available(deferred.as_ref().unwrap().as_raw_ptr())
-                },
-                "deferred PLE history was eagerly completed for {rows} rows"
+                !unsafe { mlx_sys::mlx_array_is_available(window.as_ref().unwrap().as_raw_ptr()) },
+                "PLE history was eagerly completed for {rows} rows"
             );
-            let expected = math::conv_window(&x, &weight, &mut completed, 4, 3).unwrap();
+            let expected = (0..rows)
+                .map(|t| {
+                    math::conv_with_completion(
+                        &x.slice_axis(1, t, t + 1).unwrap(),
+                        &weight,
+                        &mut singleton,
+                        4,
+                        3,
+                        false,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
             assert!(unsafe {
-                mlx_sys::mlx_array_is_available(completed.as_ref().unwrap().as_raw_ptr())
+                mlx_sys::mlx_array_is_available(singleton.as_ref().unwrap().as_raw_ptr())
             });
             pending.push((
                 actual,
-                expected,
-                deferred.clone().unwrap(),
-                completed.clone().unwrap(),
+                MxArray::concatenate_many(expected.iter().collect(), Some(1)).unwrap(),
+                window.clone().unwrap(),
+                singleton.clone().unwrap(),
             ));
         }
         for (actual, expected, tail, wanted_tail) in pending {
@@ -5098,33 +6295,145 @@ fn deferred_ple_history_matches_completed_windows_and_continuation() {
     }
 }
 
+/// A prefill window hands the reader threads the embedding and PLE rows of
+/// the window after it: with the readers stopped once window 1's requests
+/// are done, window 2 imports every one of its rows ready (none read on the
+/// model thread), with logits identical to the decoder that reads every row
+/// itself.
+/// MUTATION: `prefetch_window_rows` requests the
+/// current window's rows in place of `next`'s -> window 2 requests its rows
+/// with no reader left to fetch them, reads them late, and "window 2 found
+/// every row ready" fails.
+#[test]
+fn the_next_windows_rows_are_requested_while_this_window_runs() {
+    let path = fixture().join("bf16/model.gguf");
+    let open = |readers: bool| {
+        let mut store = weights::Store::open_fixture(&path, None).unwrap();
+        store.row_readers = readers;
+        let config = gguf::config(&store).unwrap();
+        decoder::Decoder::new(config, store).unwrap()
+    };
+    let tokens: Vec<u32> = (0..48)
+        .map(|i| ((i * 13 + i / 4) % 61 + 2) as u32)
+        .collect();
+    let (first, second) = tokens.split_at(24);
+    let (mut direct, mut fetched) = (open(false), open(true));
+    let want = direct
+        .prefill_chunk(first, None, true)
+        .unwrap()
+        .to_float32()
+        .unwrap();
+    let got = fetched
+        .prefill_chunk_ahead(first, second, None, true)
+        .unwrap()
+        .to_float32()
+        .unwrap();
+    assert_eq!(&*got, &*want, "window 1");
+    fetched.weights.pause_rows();
+    let stats = std::sync::Arc::clone(&fetched.weights.lookup);
+    let (prefetched, late, misses) = (stats.prefetched(), stats.late(), stats.misses());
+    let want = direct
+        .prefill_chunk(second, None, true)
+        .unwrap()
+        .to_float32()
+        .unwrap();
+    let got = fetched
+        .prefill_chunk(second, None, true)
+        .unwrap()
+        .to_float32()
+        .unwrap();
+    assert_eq!(&*got, &*want, "window 2");
+    assert_eq!(stats.late(), late, "window 2 found every row ready");
+    let imported = stats.misses() - misses;
+    assert!(imported > 0, "window 2 imported rows");
+    assert_eq!(
+        stats.prefetched() - prefetched,
+        imported,
+        "every row window 2 imported came from the request made during window 1"
+    );
+    assert_eq!(
+        (
+            direct.weights.lookup.prefetched(),
+            direct.weights.lookup.late()
+        ),
+        (0, 0)
+    );
+}
+
+/// PLE rows requested of the reader threads at the token start against the
+/// same decoder reading them on its own thread: identical logits over a
+/// decode run, and every PLE row the prefetching decoder imported came from
+/// a request (a wrong hash id leaves rows unconsumed, a wrong row changes
+/// the logits).
+#[test]
+fn prefetched_ple_rows_match_this_thread_reads_and_are_consumed() {
+    let path = fixture().join("bf16/model.gguf");
+    let open = |readers: bool| {
+        let mut store = weights::Store::open_fixture(&path, None).unwrap();
+        store.row_readers = readers;
+        let config = gguf::config(&store).unwrap();
+        decoder::Decoder::new(config, store).unwrap()
+    };
+    let tokens: Vec<u32> = (0..24)
+        .map(|i| ((i * 11 + i / 3) % 61 + 2) as u32)
+        .collect();
+    let (mut direct, mut fetched) = (open(false), open(true));
+    // Distinct PLE rows the run imports: the hash ids of every token over
+    // the growing history, each row once (the fixture LRU never evicts).
+    let c = fetched.config.clone();
+    let constants = |name: &str| {
+        gguf::integers(&fetched.weights.metadata, &format!("qwen4exp.ple.{name}")).unwrap()
+    };
+    let (multipliers, sizes, offsets) = (
+        constants("layer_multipliers"),
+        constants("head_vocab_sizes"),
+        constants("head_offsets"),
+    );
+    let mut ple_rows = std::collections::HashSet::new();
+    for (i, &token) in tokens.iter().enumerate() {
+        ple_rows.extend(
+            math::hash_ids(
+                token,
+                &tokens[..i],
+                c.eos_token_id,
+                c.ngram_size,
+                c.heads_per_ngram,
+                &multipliers,
+                &sizes,
+                &offsets,
+            )
+            .unwrap(),
+        );
+    }
+    for &token in &tokens {
+        let want = direct.step(token).unwrap().to_float32().unwrap();
+        let got = fetched.step(token).unwrap().to_float32().unwrap();
+        assert_eq!(&*got, &*want, "token {token}");
+    }
+    let stats = &fetched.weights.lookup;
+    assert_eq!(
+        (
+            direct.weights.lookup.prefetched(),
+            direct.weights.lookup.late()
+        ),
+        (0, 0)
+    );
+    assert!(ple_rows.len() > 8 && (ple_rows.len() as u64) < stats.misses());
+    assert_eq!(
+        stats.prefetched() + stats.late(),
+        ple_rows.len() as u64,
+        "every imported PLE row must have been requested ahead"
+    );
+}
+
 /// The batched QSA window (selection + indexed kernel) against the per-token
-/// sparse path it replaces, with `MLX_QWEN4_BATCHED_QSA` toggled between the
-/// two decoders' forwards. Budgets 8/16/32 put the sparse cut-off inside,
-/// before and after mixed windows; the only attention layer's index blocks
-/// come from identical inputs on both paths, so they must match bit for bit.
+/// sparse path: one decoder takes the tokens as multi-token chunks, the other
+/// one token at a time (a width-1 `prefill_chunk` runs the per-token path).
+/// Budgets 8/16/32 put the sparse cut-off inside, before and after mixed
+/// windows; the only attention layer's index blocks come from identical inputs
+/// on both paths, so they must match bit for bit.
 #[test]
 fn batched_qsa_matches_per_token_flat_and_paged() {
-    const CHILD: &str = "MLX_QWEN4_BATCHED_QSA_TEST_CHILD";
-    if std::env::var(CHILD).as_deref() != Ok("1") {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "models::qwen4_exp::tests::batched_qsa_matches_per_token_flat_and_paged",
-                "--test-threads=1",
-            ])
-            .env(CHILD, "1")
-            .env_remove("MLX_QWEN4_BATCHED_QSA")
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("1 passed"),
-            "{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
     if !crate::engine::persistence::compiled_forward_backend_available() {
         return;
     }
@@ -5135,10 +6444,6 @@ fn batched_qsa_matches_per_token_flat_and_paged() {
             .zip(b.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max)
-    };
-    // Each forward reads the flag once; fully evaluated before it changes.
-    let batched_qsa = |on: bool| unsafe {
-        std::env::set_var("MLX_QWEN4_BATCHED_QSA", if on { "1" } else { "0" })
     };
     let path = fixture().join("bf16/paged");
     let raw: serde_json::Value =
@@ -5175,29 +6480,24 @@ fn batched_qsa_matches_per_token_flat_and_paged() {
                     sparse_windows += 1;
                 }
                 let label = format!("budget={budget} paged={paged} end={offset}");
-                batched_qsa(false);
-                let want = per_token.prefill_chunk(chunk, None, true).unwrap();
-                want.eval();
-                batched_qsa(true);
+                let mut want = None;
+                for &token in chunk {
+                    let logits = per_token.prefill_chunk(&[token], None, true).unwrap();
+                    logits.eval();
+                    want = Some(logits);
+                }
+                let want = want.unwrap();
                 let got = batched.prefill_chunk(chunk, None, true).unwrap();
                 got.eval();
                 let error = max_error(&want, &got);
                 assert!(error < 0.04, "{label}: logits error {error}");
                 assert_eq!(per_token.history, batched.history, "{label}");
-                assert_eq!(
-                    per_token.last_chunk_hidden.len(),
-                    batched.last_chunk_hidden.len(),
-                    "{label}"
+                assert_eq!(batched.last_chunk_hidden.len(), count, "{label}");
+                let error = max_error(
+                    per_token.last_chunk_hidden.last().unwrap(),
+                    batched.last_chunk_hidden.last().unwrap(),
                 );
-                for (row, (a, b)) in per_token
-                    .last_chunk_hidden
-                    .iter()
-                    .zip(&batched.last_chunk_hidden)
-                    .enumerate()
-                {
-                    let error = max_error(a, b);
-                    assert!(error < 0.04, "{label}: hidden row {row} error {error}");
-                }
+                assert!(error < 0.04, "{label}: last hidden row error {error}");
                 if paged {
                     assert_eq!(
                         batched.paged.as_ref().unwrap().request_tokens(),
@@ -5231,10 +6531,8 @@ fn batched_qsa_matches_per_token_flat_and_paged() {
             }
             assert!(sparse_windows > 0);
             for token in [11, 4, 9] {
-                batched_qsa(false);
                 let want = per_token.step(token).unwrap();
                 want.eval();
-                batched_qsa(true);
                 let got = batched.step(token).unwrap();
                 got.eval();
                 let error = max_error(&want, &got);
@@ -5244,102 +6542,6 @@ fn batched_qsa_matches_per_token_flat_and_paged() {
                 );
             }
         }
-    }
-}
-
-/// Ratio 34 leaves 33 tokens in the incomplete block of rows ending at 33, 67
-/// and 101, one more than the kernel's 32 SIMD groups attend. Sparse windows
-/// must take the per-token path (bit for bit), and the kernel must refuse it.
-#[test]
-fn batched_qsa_falls_back_past_kernel_tail_width() {
-    use crate::array::DType;
-    const CHILD: &str = "MLX_QWEN4_QSA_TAIL_TEST_CHILD";
-    if std::env::var(CHILD).as_deref() != Ok("1") {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "models::qwen4_exp::tests::batched_qsa_falls_back_past_kernel_tail_width",
-                "--test-threads=1",
-            ])
-            .env(CHILD, "1")
-            .env_remove("MLX_QWEN4_BATCHED_QSA")
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("1 passed"),
-            "{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return;
-    }
-    let batched_qsa = |on: bool| unsafe {
-        std::env::set_var("MLX_QWEN4_BATCHED_QSA", if on { "1" } else { "0" })
-    };
-    let path = fixture().join("bf16/paged");
-    let raw: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
-    let mut config = config::Config::parse(&raw).unwrap();
-    config.indexer_compress_ratio = 34;
-    config.indexer_budget = 34;
-    let make = || {
-        decoder::Decoder::new(
-            config.clone(),
-            weights::Store::open_fixture(&path, None).unwrap(),
-        )
-        .unwrap()
-    };
-    let (mut per_token, mut batched) = (make(), make());
-    let tokens: Vec<u32> = (0..110)
-        .map(|i| ((i * 7 + i / 5) % 19 + 3) as u32)
-        .collect();
-    let mut offset = 0;
-    for count in [30, 30, 30, 20] {
-        let chunk = &tokens[offset..offset + count];
-        offset += count;
-        batched_qsa(false);
-        let want = per_token.prefill_chunk(chunk, None, true).unwrap();
-        want.eval();
-        batched_qsa(true);
-        let got = batched.prefill_chunk(chunk, None, true).unwrap();
-        got.eval();
-        let (want, got) = (want.to_float32().unwrap(), got.to_float32().unwrap());
-        let error = want
-            .iter()
-            .zip(got.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
-        assert_eq!(&*want, &*got, "end={offset}: logits error {error}");
-    }
-
-    let values = |shape: &[i64], seed: usize| {
-        let n = shape.iter().product::<i64>() as usize;
-        MxArray::from_float32(
-            &(0..n)
-                .map(|i| ((i * 37 + seed * 11) % 101) as f32 / 50.0 - 1.0)
-                .collect::<Vec<_>>(),
-            shape,
-        )
-        .unwrap()
-        .astype(DType::BFloat16)
-        .unwrap()
-    };
-    let (q, k, v) = (
-        values(&[1, 2, 1, 32], 1),
-        values(&[1, 2, 67, 32], 2),
-        values(&[1, 2, 67, 32], 3),
-    );
-    let selected = MxArray::from_int32(&[0], &[1, 1, 1]).unwrap();
-    let ends = MxArray::from_int32(&[67], &[1, 1]).unwrap();
-    for (block, ok) in [(33, true), (34, false)] {
-        assert_eq!(
-            math::qsa_attention(&q, &k, &v, &selected, &ends, 0.2, block).is_ok(),
-            ok,
-            "block_size={block}"
-        );
     }
 }
 
@@ -5443,9 +6645,43 @@ fn qsa_select_matches_reference_transcription() {
     }
 }
 
-/// The indexed kernel against SDPA with a boolean mask built from the same
+/// |a - b| in units of the BF16 spacing at the larger magnitude of the two
+/// (0 when both are 0), so near-zero sign flips do not count as thousands.
+pub(super) fn bf16_ulp_distance(a: f32, b: f32) -> u32 {
+    let magnitude = a.abs().max(b.abs());
+    if magnitude == 0.0 || !magnitude.is_finite() {
+        return if a == b { 0 } else { u32::MAX };
+    }
+    let exponent = magnitude.log2().floor() as i32;
+    let ulp = 2f32.powi(exponent - 7);
+    ((a - b).abs() / ulp).round() as u32
+}
+
+/// `[0 ULP, 1, 2, 3-4, 5+]` counts and the largest distance over two arrays.
+pub(super) fn bf16_ulp_histogram(a: &[f32], b: &[f32]) -> ([usize; 5], u32) {
+    assert_eq!(a.len(), b.len());
+    let mut hist = [0usize; 5];
+    let mut max = 0;
+    for (&x, &y) in a.iter().zip(b) {
+        let d = bf16_ulp_distance(x, y);
+        max = max.max(d);
+        hist[match d {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3..=4 => 3,
+            _ => 4,
+        }] += 1;
+    }
+    (hist, max)
+}
+
+/// The kernel against SDPA with a boolean mask built from the same
 /// picks (mlx-vlm's `build_mask`): selected blocks below each row's end, plus
-/// its incomplete tail block. -1 picks contribute nothing.
+/// its incomplete tail block. -1 picks contribute nothing. Includes the
+/// released checkpoint's geometry (24/2 heads, D 256, ratio 4, top-k 512) and
+/// a ratio-33 case whose tail block fills all 32 SIMD groups; ratio 34 is
+/// refused (the window falls back to the per-token path).
 #[test]
 fn qsa_kernel_matches_masked_sdpa() {
     use crate::array::DType;
@@ -5464,14 +6700,17 @@ fn qsa_kernel_matches_masked_sdpa() {
         .astype(dtype)
         .unwrap()
     };
-    let ratio = 4;
     for dtype in [DType::BFloat16, DType::Float16] {
-        for (heads, kv_heads, dim, base, t, topk) in [
-            (4i64, 2i64, 32i64, 29usize, 13usize, 8usize),
-            (8, 2, 128, 61, 40, 16),
-            (4, 4, 64, 0, 37, 2),
+        for (heads, kv_heads, dim, base, t, topk, ratio) in [
+            (4i64, 2i64, 32i64, 29usize, 13usize, 8usize, 4usize),
+            (8, 2, 128, 61, 40, 16, 4),
+            (4, 4, 64, 0, 37, 2, 4),
+            (4, 2, 32, 20, 60, 1, 33),
+            (24, 2, 256, 4096, 48, 512, 4),
         ] {
-            let label = format!("{dtype:?} heads={heads}/{kv_heads} dim={dim} base={base} t={t}");
+            let label = format!(
+                "{dtype:?} heads={heads}/{kv_heads} dim={dim} base={base} t={t} ratio={ratio}"
+            );
             let length = (base + t) as i64;
             let q = values(&[1, heads, t as i64, dim], 1, dtype);
             let k = values(&[1, kv_heads, length, dim], 2, dtype);
@@ -5482,9 +6721,11 @@ fn qsa_kernel_matches_masked_sdpa() {
             let (selected, query_ends) =
                 math::qsa_select(&query, &index_keys, base, ratio, topk).unwrap();
             let picks = selected.to_int32().unwrap().to_vec();
-            assert!(
-                picks.contains(&-1) && blocks > topk,
-                "{label}: expected causal and sparse rows"
+            assert!(blocks > topk, "{label}: expected sparse rows");
+            assert_eq!(
+                picks.contains(&-1),
+                base < ratio * topk,
+                "{label}: causal rows exist exactly below the budget"
             );
             let mut mask = vec![0i32; t * length as usize];
             for j in 0..t {
@@ -5510,8 +6751,17 @@ fn qsa_kernel_matches_masked_sdpa() {
             let scale = (dim as f64).powf(-0.5);
             let want =
                 crate::array::scaled_dot_product_attention(&q, &k, &v, scale, Some(&mask)).unwrap();
-            let got =
-                math::qsa_attention(&q, &k, &v, &selected, &query_ends, scale, ratio).unwrap();
+            let got = math::qsa_attention(
+                &q,
+                &k,
+                &v,
+                &selected,
+                &query_ends,
+                scale,
+                ratio,
+                math::QsaKernel::ByCapability,
+            )
+            .unwrap();
             assert_eq!(
                 got.shape().unwrap().as_ref(),
                 want.shape().unwrap().as_ref(),
@@ -5523,9 +6773,292 @@ fn qsa_kernel_matches_masked_sdpa() {
                 .zip(b.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
+            let (hist, max_ulp) = bf16_ulp_histogram(&a, &b);
+            eprintln!("{label}: max abs {error:.5} ULP hist {hist:?} max {max_ulp}");
             assert!(error < 0.04, "{label}: error {error}");
         }
     }
+    let q = values(&[1, 2, 1, 32], 1, DType::BFloat16);
+    let k = values(&[1, 2, 67, 32], 2, DType::BFloat16);
+    let v = values(&[1, 2, 67, 32], 3, DType::BFloat16);
+    let selected = MxArray::from_int32(&[0], &[1, 1, 1]).unwrap();
+    let ends = MxArray::from_int32(&[67], &[1, 1]).unwrap();
+    for (block, ok) in [(33, true), (34, false)] {
+        assert_eq!(
+            math::qsa_attention(
+                &q,
+                &k,
+                &v,
+                &selected,
+                &ends,
+                0.2,
+                block,
+                math::QsaKernel::ByCapability
+            )
+            .is_ok(),
+            ok,
+            "block_size={block}"
+        );
+    }
+}
+
+/// The paired kernel against the single-head kernel it replaces, raw output
+/// bits over every batch, head, query row and dim: GQA factors 1, 3, 5 and 12
+/// (odd factors leave the last head unpaired), batches above 1, -1 picks,
+/// exact and incomplete tail blocks, query ends below the key length, D 256
+/// and D 64, block sizes 4, 8 and 33. The capability pick must match both and
+/// must run the paired kernel wherever the kv group has two heads and the
+/// paired pipeline holds the threadgroup.
+#[test]
+fn qsa_paired_kernel_matches_single_head_bit_for_bit() {
+    use crate::array::DType;
+    use math::QsaKernel;
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    let values = |shape: &[i64], seed: usize, dtype: DType| {
+        let n = shape.iter().product::<i64>() as usize;
+        MxArray::from_float32(
+            &(0..n)
+                .map(|i| (((i * 37 + seed * 11) % 101) as f32 / 50.0 - 1.0) * 0.8)
+                .collect::<Vec<_>>(),
+            shape,
+        )
+        .unwrap()
+        .astype(dtype)
+        .unwrap()
+    };
+    let bits = |a: &MxArray| {
+        a.to_float32()
+            .unwrap()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect::<Vec<_>>()
+    };
+    let (mut paired_cases, mut pairable_cases, mut capability_paired) = (0, 0, 0);
+    for (heads, kv_heads, dim, length, t, topk, block, batch) in [
+        (2i64, 2i64, 64i64, 70usize, 9usize, 3usize, 4usize, 2i64),
+        (6, 2, 256, 300, 11, 6, 4, 2),
+        (5, 1, 64, 130, 7, 4, 8, 2),
+        (10, 2, 64, 200, 10, 2, 33, 2),
+        (24, 2, 256, 4144, 48, 512, 4, 1),
+        (24, 2, 256, 600, 16, 512, 4, 2),
+    ] {
+        for dtype in [DType::BFloat16, DType::Float16] {
+            let label = format!(
+                "{dtype:?} heads={heads}/{kv_heads} dim={dim} length={length} t={t} topk={topk} block={block} batch={batch}"
+            );
+            let rows = batch as usize * t;
+            let q = values(&[batch, heads, t as i64, dim], 1, dtype);
+            let k = values(&[batch, kv_heads, length as i64, dim], 2, dtype);
+            let v = values(&[batch, kv_heads, length as i64, dim], 3, dtype);
+            // Per row: a query end (the key length, one below it, an exact
+            // block multiple, half a block past one, inside the first block,
+            // anywhere) and sorted picks among its complete blocks, -1 first;
+            // sparse rows drop up to two picks so -1 appears there too.
+            let mut ends = Vec::with_capacity(rows);
+            let mut picks = Vec::with_capacity(rows * topk);
+            let (mut exact_tails, mut partial_tails, mut below_length, mut unused) = (0, 0, 0, 0);
+            for row in 0..rows {
+                let end = match row % 6 {
+                    0 => length,
+                    1 => length - 1,
+                    2 => ((row * 7 + 3) % (length / block) + 1) * block,
+                    3 => ((row * 11) % length / block * block + block / 2 + 1).min(length),
+                    4 => row % block + 1,
+                    _ => (row * 13 + 5) % length + 1,
+                };
+                let complete = end / block;
+                let keep = complete.min(topk - row % 3);
+                let stride = complete.checked_div(keep).unwrap_or(1).max(1);
+                let mut chosen: Vec<i32> = (0..keep)
+                    .map(|i| ((row + i * stride) % complete) as i32)
+                    .collect();
+                chosen.sort_unstable();
+                chosen.dedup();
+                if end % block == 0 {
+                    exact_tails += 1;
+                } else {
+                    partial_tails += 1;
+                }
+                if end < length {
+                    below_length += 1;
+                }
+                unused += topk - chosen.len();
+                ends.push(end as i32);
+                picks.extend(std::iter::repeat_n(-1, topk - chosen.len()));
+                picks.extend(chosen);
+            }
+            assert!(
+                exact_tails > 0 && partial_tails > 0 && below_length > 0 && unused > 0,
+                "{label}: exact tails {exact_tails} partial {partial_tails} below length {below_length} unused picks {unused}"
+            );
+            let selected = MxArray::from_int32(&picks, &[batch, t as i64, topk as i64]).unwrap();
+            let query_ends = MxArray::from_int32(&ends, &[batch, t as i64]).unwrap();
+            let scale = (dim as f64).powf(-0.5);
+            let run = |kernel: QsaKernel| {
+                math::qsa_dispatch(&q, &k, &v, &selected, &query_ends, scale, block, kernel)
+                    .unwrap()
+            };
+            let threads = |kernel: QsaKernel| {
+                math::qsa_pipeline_threads(&q, &k, &v, &selected, &query_ends, block, kernel)
+            };
+            let single_threads = threads(QsaKernel::SingleHead);
+            let paired_threads = threads(QsaKernel::PairedHeads);
+            eprintln!(
+                "{label}: maxTotalThreadsPerThreadgroup single-head {single_threads} paired {paired_threads}"
+            );
+            assert!(
+                single_threads >= 1024,
+                "{label}: the single-head pipeline holds {single_threads} threads"
+            );
+            assert!(
+                paired_threads > 0,
+                "{label}: the paired pipeline did not build"
+            );
+            let (single, single_heads) = run(QsaKernel::SingleHead);
+            assert_eq!(single_heads, 1, "{label}: the single-head kernel");
+            let want = bits(&single);
+            assert!(
+                want.iter().any(|&b| f32::from_bits(b) != 0.0),
+                "{label}: all-zero output"
+            );
+            let compare = |name: &str, got: &MxArray| {
+                let got = bits(got);
+                assert_eq!(got.len(), want.len(), "{label}: {name}");
+                let differing = want.iter().zip(&got).filter(|(a, b)| a != b).count();
+                if differing > 0 {
+                    let first = want.iter().zip(&got).position(|(a, b)| a != b).unwrap();
+                    let per_batch = (heads * t as i64 * dim) as usize;
+                    let per_head = (t as i64 * dim) as usize;
+                    panic!(
+                        "{label}: {name} differs from the single-head kernel in {differing} of {} outputs; first at batch {} head {} row {} dim {}: {} vs {}",
+                        want.len(),
+                        first / per_batch,
+                        first % per_batch / per_head,
+                        first % per_head / dim as usize,
+                        first % dim as usize,
+                        f32::from_bits(want[first]),
+                        f32::from_bits(got[first])
+                    );
+                }
+            };
+            // A kv group of one head has no second head to pair, and a GPU whose
+            // paired pipeline holds fewer than 1024 threads runs single-head.
+            let pairable = heads / kv_heads >= 2 && paired_threads >= 1024;
+            if pairable {
+                pairable_cases += 1;
+            }
+            let want_heads = if pairable { 2 } else { 1 };
+            let (capability, capability_heads) = run(QsaKernel::ByCapability);
+            assert_eq!(
+                capability_heads, want_heads,
+                "{label}: the capability pick ran the {capability_heads}-head kernel; the paired pipeline holds {paired_threads} threads"
+            );
+            if capability_heads == 2 {
+                capability_paired += 1;
+            }
+            compare("the capability pick", &capability);
+            if paired_threads >= 1024 {
+                let (paired, paired_heads) = run(QsaKernel::PairedHeads);
+                assert_eq!(paired_heads, 2, "{label}: the paired kernel");
+                compare("the paired kernel", &paired);
+                paired_cases += 1;
+            }
+        }
+    }
+    eprintln!(
+        "paired kernel compared bit for bit on {paired_cases} geometry/dtype cases; the capability pick ran it on {capability_paired} of {pairable_cases} pairable"
+    );
+    if pairable_cases == 0 {
+        eprintln!(
+            "note: no paired pipeline holds 1024 threads on this GPU, so the capability pick was checked single-head only"
+        );
+    } else {
+        assert_eq!(
+            capability_paired, pairable_cases,
+            "the capability pick ran the paired kernel on {capability_paired} of {pairable_cases} pairable cases"
+        );
+    }
+}
+
+/// A pipeline probe that throws (a failed Metal compile) is not remembered:
+/// that call falls back to the single-head kernel, the next call probes again
+/// and runs the paired kernel, writing the same bits.
+#[test]
+fn qsa_failed_pipeline_probe_is_retried() {
+    use crate::array::DType;
+    use math::QsaKernel;
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    // A geometry no other test builds, so neither pipeline is cached yet.
+    let (heads, kv_heads, dim, length, t, topk, block) = (4i64, 2i64, 64i64, 90i64, 5i64, 7i64, 4);
+    let values = |shape: &[i64], seed: usize| {
+        let n = shape.iter().product::<i64>() as usize;
+        MxArray::from_float32(
+            &(0..n)
+                .map(|i| (((i * 37 + seed * 11) % 101) as f32 / 50.0 - 1.0) * 0.8)
+                .collect::<Vec<_>>(),
+            shape,
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap()
+    };
+    let q = values(&[1, heads, t, dim], 1);
+    let k = values(&[1, kv_heads, length, dim], 2);
+    let v = values(&[1, kv_heads, length, dim], 3);
+    let picks: Vec<i32> = (0..t * topk).map(|i| (i % topk * 2) as i32).collect();
+    let ends = vec![length as i32 - 1; t as usize];
+    let selected = MxArray::from_int32(&picks, &[1, t, topk]).unwrap();
+    let query_ends = MxArray::from_int32(&ends, &[1, t]).unwrap();
+    let run = || {
+        math::qsa_dispatch(
+            &q,
+            &k,
+            &v,
+            &selected,
+            &query_ends,
+            0.125,
+            block,
+            QsaKernel::ByCapability,
+        )
+        .unwrap()
+    };
+    let bits = |a: &MxArray| {
+        a.to_float32()
+            .unwrap()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(math::qsa_fail_pipeline_probes(1), 0);
+    let (first, first_heads) = run();
+    assert_eq!(
+        math::qsa_fail_pipeline_probes(0),
+        0,
+        "the injected failure was not consumed: the paired pipeline was already cached"
+    );
+    assert_eq!(
+        first_heads, 1,
+        "the call whose paired probe failed ran the {first_heads}-head kernel"
+    );
+    let (second, second_heads) = run();
+    let paired_threads = math::qsa_pipeline_threads(
+        &q,
+        &k,
+        &v,
+        &selected,
+        &query_ends,
+        block,
+        QsaKernel::PairedHeads,
+    );
+    assert_eq!(
+        second_heads, 2,
+        "the call after the failed probe ran the {second_heads}-head kernel (the paired pipeline holds {paired_threads} threads)"
+    );
+    assert_eq!(bits(&first), bits(&second), "single-head vs paired bits");
 }
 
 /// The per-token path partitions a row as long as its own block count; the
@@ -5698,4 +7231,1829 @@ fn bf16_paged_oracle_through_prefill_chunk() {
             );
         }
     }
+}
+
+/// Deterministic Q8 affine bank for the row-batched kernel gates.
+fn q8_bank(n: usize, k: usize, next: &mut impl FnMut() -> u32) -> weights::Weight {
+    use crate::array::DType;
+    let codes: Vec<u32> = (0..n * k / 4).map(|_| next()).collect();
+    let scales: Vec<f32> = (0..n * k / 32)
+        .map(|_| ((next() % 97) as f32 + 1.) / 16384.)
+        .collect();
+    let biases: Vec<f32> = scales
+        .iter()
+        .map(|s| -s * (64 + next() % 129) as f32)
+        .collect();
+    weights::Weight {
+        values: MxArray::from_uint32(&codes, &[n as i64, k as i64 / 4]).unwrap(),
+        dense_bf16: None,
+        scales: Some(
+            MxArray::from_float32(&scales, &[n as i64, k as i64 / 32])
+                .unwrap()
+                .astype(DType::Float16)
+                .unwrap(),
+        ),
+        biases: Some(
+            MxArray::from_float32(&biases, &[n as i64, k as i64 / 32])
+                .unwrap()
+                .astype(DType::Float16)
+                .unwrap(),
+        ),
+        group: 32,
+        bits: 8,
+        mode: "affine".into(),
+    }
+}
+
+/// Mixed-format routed banks (gate/up K-quant, down affine) plus Q8 shared banks.
+fn expert_banks(
+    experts: usize,
+    gate_bits: usize,
+    down_bits: usize,
+    next: &mut impl FnMut() -> u32,
+) -> (
+    [std::sync::Arc<weights::Weight>; 3],
+    [std::sync::Arc<weights::Weight>; 3],
+) {
+    use std::sync::Arc;
+    let (h, m) = (2560usize, 640usize);
+    let mut bank = |e: usize, n: usize, k: usize, bits: usize, affine: bool| {
+        let values: Vec<u32> = (0..e * n * k * bits / 32).map(|_| next()).collect();
+        let scales = if affine {
+            let values: Vec<u16> = (0..e * n * k / 32)
+                .map(|_| half::f16::from_f32((next() % 97 + 1) as f32 / 16384.).to_bits())
+                .collect();
+            MxArray::from_float16(&values, &[(e * n) as i64, (k / 32) as i64]).unwrap()
+        } else {
+            let values: Vec<u8> = (0..e * n * k / 16).map(|_| (next() % 64) as u8).collect();
+            MxArray::from_uint8(&values, &[(e * n) as i64, (k / 16) as i64]).unwrap()
+        };
+        let side = if affine { k / 32 } else { k / 128 };
+        let biases: Vec<u16> = (0..e * n * side)
+            .map(|_| {
+                half::f16::from_f32(
+                    (next() % 97 + 1) as f32 / 16384. * if affine { -1. } else { 1. },
+                )
+                .to_bits()
+            })
+            .collect();
+        Arc::new(weights::Weight {
+            dense_bf16: None,
+            values: MxArray::from_uint32(&values, &[(e * n) as i64, (k * bits / 32) as i64])
+                .unwrap(),
+            scales: Some(scales),
+            biases: Some(MxArray::from_float16(&biases, &[(e * n) as i64, side as i64]).unwrap()),
+            group: 32,
+            bits: bits as i32,
+            mode: if affine {
+                "affine"
+            } else if bits == 4 {
+                "q4k"
+            } else {
+                "q5k"
+            }
+            .into(),
+        })
+    };
+    (
+        [
+            bank(experts, m, h, gate_bits, false),
+            bank(experts, m, h, gate_bits, false),
+            bank(experts, h, m, down_bits, true),
+        ],
+        [
+            bank(1, m, h, 8, true),
+            bank(1, m, h, 8, true),
+            bank(1, h, m, 8, true),
+        ],
+    )
+}
+
+fn bf16_rows(
+    rows: i64,
+    width: i64,
+    scale: f32,
+    shift: f32,
+    next: &mut impl FnMut() -> u32,
+) -> MxArray {
+    use crate::array::DType;
+    let values: Vec<f32> = (0..rows * width)
+        .map(|_| (next() % 1024) as f32 * scale - shift)
+        .collect();
+    MxArray::from_float32(&values, &[1, rows, width])
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap()
+}
+
+fn f32_bits(a: &MxArray) -> Vec<u32> {
+    a.to_float32()
+        .unwrap()
+        .iter()
+        .map(|v| v.to_bits())
+        .collect()
+}
+
+/// Bit equality with a readable failure: the first differing index and both bit patterns.
+fn assert_same_bits(actual: &MxArray, expected: &MxArray, what: &str) {
+    let (a, e) = (f32_bits(actual), f32_bits(expected));
+    assert_eq!(a.len(), e.len(), "{what}: length");
+    let diffs: Vec<usize> = (0..a.len()).filter(|&i| a[i] != e[i]).collect();
+    assert!(
+        diffs.is_empty(),
+        "{what}: {} of {} values differ, first at {} ({:#010x} vs {:#010x})",
+        diffs.len(),
+        a.len(),
+        diffs[0],
+        a[diffs[0]],
+        e[diffs[0]]
+    );
+}
+
+fn row(a: &MxArray, j: i64) -> MxArray {
+    a.slice_axis(1, j, j + 1).unwrap()
+}
+
+/// A copied one-element row. MLX binds an input under eight elements in the
+/// constant address space, whose buffer offset must be 4-byte aligned; a BF16
+/// row view at an odd element offset would read the element before it.
+fn gate_row(a: &MxArray, j: i64) -> MxArray {
+    use crate::array::DType;
+    row(a, j)
+        .astype(DType::Float32)
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap()
+}
+
+fn stack_rows(parts: &[MxArray]) -> MxArray {
+    MxArray::concatenate_many(parts.iter().collect(), Some(1)).unwrap()
+}
+
+#[test]
+fn row_batched_decode_kernels_match_single_row_calls_bit_for_bit() {
+    use crate::array::DType;
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    let mut seed = 0x9e37_79b9u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    // Dense Q8 projections: the fast walk (K % 512 == 0, N % 8 == 0), partial
+    // tails, a four-row output and the two mixer geometries.
+    for (n, k) in [
+        (64usize, 2560usize),
+        (4, 2560),
+        (320, 2560),
+        (64, 288),
+        (20, 640),
+    ] {
+        let w = q8_bank(n, k, &mut next);
+        let (s, b) = (w.scales.as_ref().unwrap(), w.biases.as_ref().unwrap());
+        for rows in 1..=4 {
+            let x = bf16_rows(rows, k as i64, 1. / 256., 2., &mut next);
+            let singles: Vec<MxArray> = (0..rows)
+                .map(|j| {
+                    MxArray::from_handle(
+                        unsafe {
+                            mlx_sys::mlx_qwen4_dense_decode(
+                                row(&x, j).as_raw_ptr(),
+                                w.values.as_raw_ptr(),
+                                s.as_raw_ptr(),
+                                b.as_raw_ptr(),
+                            )
+                        },
+                        "single-row dense decode",
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let batched = math::rows::dense_decode(&w, &x)
+                .unwrap()
+                .expect("row-batched dense decode admits [1, R, K]");
+            assert_eq!(*batched.shape().unwrap(), [1, rows, n as i64]);
+            assert_same_bits(
+                &batched,
+                &stack_rows(&singles),
+                &format!("dense decode N={n} K={k} rows={rows}"),
+            );
+        }
+        let five = bf16_rows(5, k as i64, 1. / 256., 2., &mut next);
+        assert!(math::rows::dense_decode(&w, &five).unwrap().is_none());
+    }
+    // Mixer activation (10240 -> 320 with SiLU), hyper up (320 -> 10240 with
+    // the four-stream sigmoid mean) and hyper up with the injection gate.
+    let down = q8_bank(320, 10240, &mut next);
+    let up = q8_bank(10240, 320, &mut next);
+    let (ds, db) = (down.scales.as_ref().unwrap(), down.biases.as_ref().unwrap());
+    let (us, ub) = (up.scales.as_ref().unwrap(), up.biases.as_ref().unwrap());
+    for rows in 1..=4 {
+        let mixer_in = bf16_rows(rows, 10240, 1. / 256., 2., &mut next);
+        let singles: Vec<MxArray> = (0..rows)
+            .map(|j| {
+                MxArray::from_handle(
+                    unsafe {
+                        mlx_sys::mlx_qwen4_decode_mixer_act(
+                            row(&mixer_in, j).as_raw_ptr(),
+                            down.values.as_raw_ptr(),
+                            ds.as_raw_ptr(),
+                            db.as_raw_ptr(),
+                        )
+                    },
+                    "single-row mixer activation",
+                )
+                .unwrap()
+            })
+            .collect();
+        let batched = math::rows::mixer_act(&down, &mixer_in)
+            .unwrap()
+            .expect("row-batched mixer activation admits [1, R, 10240]");
+        assert_same_bits(
+            &batched,
+            &stack_rows(&singles),
+            &format!("mixer activation rows={rows}"),
+        );
+        // The split mixer kernel against the one-simdgroup chain it replaced.
+        assert_same_bits(
+            &mixer_sums(&down, &mixer_in, true),
+            &mixer_sums(&down, &mixer_in, false),
+            &format!("mixer F32 sums rows={rows}"),
+        );
+        let dense = math::rows::dense_decode(&down, &mixer_in).unwrap().unwrap();
+        assert_same_bits(
+            &batched,
+            &crate::nn::Activations::silu(&dense.div_scalar(4.).unwrap()).unwrap(),
+            &format!("mixer activation vs chain rows={rows}"),
+        );
+
+        let x = bf16_rows(rows, 320, 1. / 64., 8., &mut next);
+        let normed = bf16_rows(rows, 10240, 1. / 128., 4., &mut next);
+        let singles: Vec<MxArray> = (0..rows)
+            .map(|j| {
+                MxArray::from_handle(
+                    unsafe {
+                        mlx_sys::mlx_qwen4_hyper_up(
+                            row(&x, j).as_raw_ptr(),
+                            up.values.as_raw_ptr(),
+                            us.as_raw_ptr(),
+                            ub.as_raw_ptr(),
+                            row(&normed, j).as_raw_ptr(),
+                        )
+                    },
+                    "single-row hyper up",
+                )
+                .unwrap()
+            })
+            .collect();
+        let batched = math::rows::hyper_up(&up, &x, &normed)
+            .unwrap()
+            .expect("row-batched hyper up admits [1, R, 320]");
+        assert_same_bits(
+            &batched,
+            &stack_rows(&singles),
+            &format!("hyper up rows={rows}"),
+        );
+    }
+    // Routed experts (already row-indexed) and routed + shared experts over
+    // the four admitted bank formats, both score dtypes and a missing slot.
+    let experts = 3usize;
+    for (gate_bits, down_bits) in [(4usize, 5usize), (4, 8), (5, 5), (5, 8)] {
+        let (banks, shared) = expert_banks(experts, gate_bits, down_bits, &mut next);
+        for rows in 1..=4 {
+            let x = bf16_rows(rows, 2560, 1. / 256., 2., &mut next);
+            let mut selected: Vec<u32> = (0..rows * 10).map(|_| next() % experts as u32).collect();
+            if rows > 1 {
+                selected[19] = experts as u32;
+            }
+            let ids = MxArray::from_uint32(&selected, &[rows * 10]).unwrap();
+            let gates: Vec<f32> = (0..rows)
+                .map(|j| {
+                    if j == 0 {
+                        -6.84375
+                    } else {
+                        (next() % 256) as f32 / 16. - 8.
+                    }
+                })
+                .collect();
+            let shared_gate = MxArray::from_float32(&gates, &[1, rows, 1])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            for score_type in [DType::Float32, DType::BFloat16] {
+                let scores: Vec<f32> = (0..rows * 10)
+                    .map(|_| (next() % 19 + 1) as f32 / 100.)
+                    .collect();
+                let scores = MxArray::from_float32(&scores, &[1, rows, 10])
+                    .unwrap()
+                    .astype(score_type)
+                    .unwrap();
+                let singles: Vec<MxArray> = (0..rows)
+                    .map(|j| {
+                        math::routed_experts(
+                            &row(&x, j),
+                            &ids.slice_axis(0, j * 10, j * 10 + 10).unwrap(),
+                            &row(&scores, j),
+                            &banks,
+                        )
+                        .unwrap()
+                        .unwrap()
+                    })
+                    .collect();
+                let batched = math::routed_experts(&x, &ids, &scores, &banks)
+                    .unwrap()
+                    .unwrap();
+                assert_same_bits(
+                    &batched,
+                    &stack_rows(&singles),
+                    &format!(
+                        "routed experts gate={gate_bits} down={down_bits} scores={score_type:?} rows={rows}"
+                    ),
+                );
+                let singles: Vec<MxArray> = (0..rows)
+                    .map(|j| {
+                        math::routed_shared_experts(
+                            &row(&x, j),
+                            &ids.slice_axis(0, j * 10, j * 10 + 10).unwrap(),
+                            &row(&scores, j),
+                            &banks,
+                            &shared,
+                            &gate_row(&shared_gate, j),
+                        )
+                        .unwrap()
+                        .expect("single-row routed/shared fast path")
+                    })
+                    .collect();
+                let batched = math::rows::routed_shared_experts(
+                    &x,
+                    &ids,
+                    &scores,
+                    &banks,
+                    &shared,
+                    &shared_gate,
+                )
+                .unwrap()
+                .expect("row-batched routed/shared experts admit [1, R, 2560]");
+                assert_eq!(batched.dtype().unwrap(), DType::BFloat16);
+                assert_same_bits(
+                    &batched,
+                    &stack_rows(&singles),
+                    &format!(
+                        "routed/shared experts gate={gate_bits} down={down_bits} scores={score_type:?} rows={rows}"
+                    ),
+                );
+            }
+        }
+    }
+    // Cross-row expert reuse in the R-row routed/shared kernels: an expert's
+    // weights stream once per threadgroup set and every assignment on it is
+    // written. The same routes in every row, one row's routes rotated per row
+    // and routes distinct across rows must each carry the single-row bits.
+    let experts = 64usize;
+    let (banks, shared) = expert_banks(experts, 4, 5, &mut next);
+    let base: Vec<u32> = (0..10).map(|s| (s * 7 + 3) as u32).collect();
+    for rows in 1..=4 {
+        let x = bf16_rows(rows, 2560, 1. / 256., 2., &mut next);
+        let shared_gate = bf16_rows(rows, 1, 1. / 64., 8., &mut next);
+        let count = rows as usize * 10;
+        let patterns: [(&str, Vec<u32>); 3] = [
+            ("same", (0..count).map(|i| base[i % 10]).collect()),
+            (
+                "rotated",
+                (0..count)
+                    .map(|i| base[(i % 10 + i / 10 * 3) % 10])
+                    .collect(),
+            ),
+            (
+                "distinct",
+                (0..count).map(|i| (i * 5 % experts) as u32).collect(),
+            ),
+        ];
+        for (pattern, routes) in patterns {
+            let ids = MxArray::from_uint32(&routes, &[rows * 10]).unwrap();
+            for score_type in [DType::Float32, DType::BFloat16] {
+                let scores: Vec<f32> = (0..count)
+                    .map(|_| (next() % 19 + 1) as f32 / 100.)
+                    .collect();
+                let scores = MxArray::from_float32(&scores, &[1, rows, 10])
+                    .unwrap()
+                    .astype(score_type)
+                    .unwrap();
+                let singles: Vec<MxArray> = (0..rows)
+                    .map(|j| {
+                        math::routed_shared_experts(
+                            &row(&x, j),
+                            &ids.slice_axis(0, j * 10, j * 10 + 10).unwrap(),
+                            &row(&scores, j),
+                            &banks,
+                            &shared,
+                            &gate_row(&shared_gate, j),
+                        )
+                        .unwrap()
+                        .expect("single-row routed/shared fast path")
+                    })
+                    .collect();
+                let batched = math::rows::routed_shared_experts(
+                    &x,
+                    &ids,
+                    &scores,
+                    &banks,
+                    &shared,
+                    &shared_gate,
+                )
+                .unwrap()
+                .expect("row-batched routed/shared experts admit [1, R, 2560]");
+                assert_same_bits(
+                    &batched,
+                    &stack_rows(&singles),
+                    &format!(
+                        "routed/shared experts {pattern} routes scores={score_type:?} rows={rows}"
+                    ),
+                );
+            }
+        }
+    }
+    // Routing: probability rounding, ties, NaN and infinite rows side by side.
+    for dtype in [DType::BFloat16, DType::Float32] {
+        for rows in 1..=4 {
+            let values: Vec<f32> = (0..rows as usize * 512)
+                .map(|i| {
+                    let (case, e) = (i / 512 + rows as usize, i % 512);
+                    match case {
+                        1 => (e % 4) as f32,
+                        2 => f32::NEG_INFINITY,
+                        3 if e == 7 => f32::NAN,
+                        4 if e == 511 => f32::INFINITY,
+                        _ => ((e * 131 + case * 53) as f32 * 0.017).sin() * case as f32 * 0.3,
+                    }
+                })
+                .collect();
+            let logits = MxArray::from_float32(&values, &[1, rows, 512])
+                .unwrap()
+                .astype(dtype)
+                .unwrap();
+            let (mut id_singles, mut score_singles) = (Vec::new(), Vec::new());
+            for j in 0..rows {
+                let (mut ids, mut scores) = (std::ptr::null_mut(), std::ptr::null_mut());
+                assert!(unsafe {
+                    mlx_sys::mlx_qwen4_singleton_routes(
+                        row(&logits, j).as_raw_ptr(),
+                        &mut ids,
+                        &mut scores,
+                    )
+                });
+                id_singles.push(MxArray::from_handle(ids, "single-row route IDs").unwrap());
+                score_singles
+                    .push(MxArray::from_handle(scores, "single-row route scores").unwrap());
+            }
+            let (ids, scores) = math::rows::singleton_routes(&logits, 10)
+                .unwrap()
+                .expect("row-batched routing admits [1, R, 512]");
+            assert_eq!(
+                &*ids.to_uint32().unwrap(),
+                &*stack_rows(&id_singles).to_uint32().unwrap(),
+                "route IDs {dtype:?} rows={rows}"
+            );
+            assert_same_bits(
+                &scores,
+                &stack_rows(&score_singles),
+                &format!("route scores {dtype:?} rows={rows}"),
+            );
+        }
+    }
+    // Injection + hyper norm (already row-indexed): stream and normed rows.
+    let weight = MxArray::from_float32(
+        &(0..10240)
+            .map(|i| 1.01 + ((i * 7) % 97) as f32 / 400.)
+            .collect::<Vec<_>>(),
+        &[10240],
+    )
+    .unwrap();
+    for rows in 1..=4 {
+        let x = bf16_rows(rows, 10240, 1. / 64., 8., &mut next);
+        let y = bf16_rows(rows, 2560, 1. / 128., 4., &mut next);
+        let gate = bf16_rows(rows, 4, 1. / 256., 2., &mut next);
+        let (mut stream_singles, mut normed_singles) = (Vec::new(), Vec::new());
+        for j in 0..rows {
+            let (mut s, mut n) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert!(unsafe {
+                mlx_sys::mlx_qwen4_inject_norm(
+                    row(&x, j).as_raw_ptr(),
+                    row(&y, j).as_raw_ptr(),
+                    row(&gate, j).as_raw_ptr(),
+                    weight.as_raw_ptr(),
+                    1e-6,
+                    &mut s,
+                    &mut n,
+                )
+            });
+            stream_singles.push(MxArray::from_handle(s, "single-row stream").unwrap());
+            normed_singles.push(MxArray::from_handle(n, "single-row normed").unwrap());
+        }
+        let (mut s, mut n) = (std::ptr::null_mut(), std::ptr::null_mut());
+        assert!(unsafe {
+            mlx_sys::mlx_qwen4_inject_norm(
+                x.as_raw_ptr(),
+                y.as_raw_ptr(),
+                gate.as_raw_ptr(),
+                weight.as_raw_ptr(),
+                1e-6,
+                &mut s,
+                &mut n,
+            )
+        });
+        let s = MxArray::from_handle(s, "row-batched stream").unwrap();
+        let n = MxArray::from_handle(n, "row-batched normed").unwrap();
+        assert_same_bits(
+            &s,
+            &stack_rows(&stream_singles),
+            &format!("inject stream rows={rows}"),
+        );
+        assert_same_bits(
+            &n,
+            &stack_rows(&normed_singles),
+            &format!("inject norm rows={rows}"),
+        );
+    }
+}
+
+/// Greedy decode of `QWEN4_EXP_REAL_STEPS` tokens (default 256) per
+/// `QWEN4_EXP_REAL_CASES` case on the mapped pack. Each case's argmax must
+/// equal `QWEN4_EXP_REAL_EXPECTED` (the `QWEN4_EXP_REAL_OUT` of an earlier
+/// run); this run writes its own `QWEN4_EXP_REAL_OUT`. `QWEN4_EXP_REAL_INPUTS`
+/// is `{name, tokenIds}` cases from `oxnode scripts/benchmark-fixture.ts
+/// fetch --fixture qwen38 --output inputs.json`.
+#[test]
+#[ignore = "real checkpoint: QWEN4_EXP_REAL_MODEL, QWEN4_EXP_REAL_INPUTS; --test-threads=1"]
+fn real_model_greedy_argmax_matches_expected() {
+    let model = std::env::var("QWEN4_EXP_REAL_MODEL").expect("QWEN4_EXP_REAL_MODEL");
+    let inputs = std::env::var("QWEN4_EXP_REAL_INPUTS").expect("QWEN4_EXP_REAL_INPUTS");
+    let steps: usize = std::env::var("QWEN4_EXP_REAL_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
+    let expected: Option<serde_json::Value> = std::env::var("QWEN4_EXP_REAL_EXPECTED")
+        .ok()
+        .map(|p| serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap());
+
+    let store = weights::Store::open(Path::new(&model)).unwrap();
+    let config = gguf::config(&store).unwrap();
+    let mut decoder = decoder::Decoder::new(config, store).unwrap();
+    go_live(&mut decoder, 0);
+    eprintln!(
+        "greedy residency: mapped={} slots={} budget={:.1} GiB window={}",
+        decoder.weights.plan.mapped,
+        decoder.weights.plan.partial_expert_slots,
+        decoder.weights.plan.budget as f64 / (1u64 << 30) as f64,
+        decoder.prefill_chunk_size
+    );
+
+    let mut failed = false;
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "residency".into(),
+        serde_json::json!({
+            "mapped": decoder.weights.plan.mapped,
+            "slots": decoder.weights.plan.partial_expert_slots,
+        }),
+    );
+    let mut case_results = serde_json::Map::new();
+    for case in real_cases() {
+        let prompt = real_prompt(Path::new(&inputs), &case);
+        decoder.reset();
+        if decoder.weights.begin_turn().unwrap().is_some() {
+            eprintln!("greedy WARNING: a slot fallback was applied before {case}");
+        }
+        let group = decoder.group_mode(prompt.len());
+        let mut logits = decoder.prefill_prompt(&prompt).unwrap();
+        let mut tokens = Vec::with_capacity(steps);
+        for i in 0..steps {
+            let id = argmax(&logits);
+            tokens.push(id);
+            if i + 1 < steps {
+                logits = decoder.step(id).unwrap();
+            }
+        }
+        eprintln!(
+            "greedy {case}: prompt={} as {} mapped={} slots={} tokens={:?}",
+            prompt.len(),
+            if group {
+                "one layer-major group"
+            } else {
+                "windows"
+            },
+            decoder.weights.plan.mapped,
+            decoder.weights.plan.partial_expert_slots,
+            &tokens[..16.min(tokens.len())]
+        );
+        if let Some(expected) = &expected {
+            let want: Vec<u32> = expected["cases"][case.as_str()]["reference"]["argmax"]
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!("QWEN4_EXP_REAL_EXPECTED has no reference argmax for {case}")
+                })
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect();
+            let mismatches: Vec<usize> = want
+                .iter()
+                .zip(&tokens)
+                .enumerate()
+                .filter(|(_, (w, g))| w != g)
+                .map(|(p, _)| p)
+                .collect();
+            if want.len() != tokens.len() || !mismatches.is_empty() {
+                failed = true;
+                eprintln!(
+                    "greedy {case} EXPECTED MISMATCH: {} positions differ from QWEN4_EXP_REAL_EXPECTED (first: {:?}), lengths {} vs {}",
+                    mismatches.len(),
+                    mismatches.first(),
+                    want.len(),
+                    tokens.len()
+                );
+            } else {
+                eprintln!(
+                    "greedy {case} EXPECTED OK: {} positions match QWEN4_EXP_REAL_EXPECTED",
+                    want.len()
+                );
+            }
+        }
+        case_results.insert(
+            case.clone(),
+            serde_json::json!({ "reference": { "argmax": tokens, "tokens": tokens } }),
+        );
+        out.insert(
+            "cases".into(),
+            serde_json::Value::Object(case_results.clone()),
+        );
+        if let Ok(path) = std::env::var("QWEN4_EXP_REAL_OUT") {
+            std::fs::write(&path, serde_json::to_vec_pretty(&out).unwrap()).unwrap();
+            eprintln!("greedy wrote {path}");
+        }
+    }
+    assert!(
+        !failed,
+        "the greedy argmax differs from QWEN4_EXP_REAL_EXPECTED (see EXPECTED MISMATCH lines)"
+    );
+}
+
+/// Real-model verify against AR on the mapped pack, paged as served: owner 1
+/// decodes greedy AR steps; owner 2 runs 32 teacher-forced verifies of three
+/// of those tokens beside owner 3's one- and two-row verifies, a third of
+/// which reject a poisoned draft. Every verified row of an accepted
+/// prefix carries the AR step's logits bits, no layer reads its routes
+/// through `read_routes`, and both owners then continue AR exactly. A verify
+/// that trips the wire keeps those bits and checks its tape against the
+/// mapped banks before the store moves to slots, where the next verify reads
+/// every layer's routes back, with the same bits.
+#[test]
+#[ignore = "real checkpoint: QWEN4_EXP_REAL_MODEL, QWEN4_EXP_REAL_INPUTS; --test-threads=1"]
+fn real_model_verify_rows_match_ar_steps() {
+    use crate::engine::hybrid_scheduler::{
+        HybridSchedulerBackend, ScheduledVerifyCommit, ScheduledVerifyRow,
+    };
+    let model = std::env::var("QWEN4_EXP_REAL_MODEL").expect("QWEN4_EXP_REAL_MODEL");
+    let inputs = std::env::var("QWEN4_EXP_REAL_INPUTS").expect("QWEN4_EXP_REAL_INPUTS");
+    const VERIFIES: usize = 32;
+    let prompt = real_prompt(Path::new(&inputs), "6k");
+    let store = weights::Store::open(Path::new(&model)).unwrap();
+    let config = gguf::config(&store).unwrap();
+    let vision = media::Vision::metadata(&serde_json::Value::Null, &store, &config).unwrap();
+    let mut decoder = decoder::Decoder::new(config.clone(), store).unwrap();
+    let adapter = super::paged::create(&config).unwrap();
+    let pool_bytes = adapter.bytes_per_block().unwrap() * u64::from(adapter.block_capacity());
+    decoder.paged = Some(adapter);
+    go_live(&mut decoder, pool_bytes);
+    assert!(
+        decoder.weights.plan.mapped,
+        "the live host refused the pack"
+    );
+    let mut inner = inner_over(decoder, vision, false);
+    let layers = config.num_hidden_layers;
+    let top = config.num_experts_per_tok;
+
+    let bits = |a: &MxArray| -> Vec<u32> {
+        a.to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    };
+    let prefill = |inner: &mut Inner, seq: u32| -> MxArray {
+        inner.activate_paged_seq(seq).unwrap();
+        prefill_all(&mut inner.decoder, &prompt)
+    };
+
+    // `ar[k]` holds the logits after `tokens[k]`; `tokens[k + 1]` is their argmax.
+    let mut logits = prefill(&mut inner, 1);
+    let mut tokens = vec![argmax(&logits)];
+    let mut ar = Vec::new();
+    for k in 0..3 * VERIFIES + 7 {
+        logits = inner.decoder.step(tokens[k]).unwrap();
+        ar.push(bits(&logits));
+        tokens.push(argmax(&logits));
+    }
+    prefill(&mut inner, 2);
+    prefill(&mut inner, 3);
+
+    let ready = |a: &MxArray| unsafe { mlx_sys::mlx_array_is_available(a.as_raw_ptr()) };
+    let poison = |t: u32| (t + 1) % config.vocab_size as u32;
+    let readbacks = inner.decoder.route_readbacks;
+    let hits = inner.decoder.weights.slot_hits;
+    let (mut front2, mut front3) = (0usize, 0usize);
+    for k in 0..VERIFIES {
+        // Owner 3: two rows kept, two rows with the second rejected, one row.
+        let (width3, keep3) = [(2, 2), (2, 1), (1, 1)][k % 3];
+        let mut rows3 = tokens[front3..front3 + width3].to_vec();
+        for t in &mut rows3[keep3..] {
+            *t = poison(*t);
+        }
+        let verified = inner
+            .verify_mtp(&[
+                ScheduledVerifyRow {
+                    seq_id: 2,
+                    first_position: (prompt.len() + front2) as u32,
+                    tokens: tokens[front2..front2 + 3].to_vec(),
+                    speculative: true,
+                },
+                ScheduledVerifyRow {
+                    seq_id: 3,
+                    first_position: (prompt.len() + front3) as u32,
+                    tokens: rows3,
+                    speculative: true,
+                },
+            ])
+            .unwrap();
+        // Before any output is read: a read would complete every ancestor.
+        let adapter = inner.decoder.paged.as_ref().unwrap();
+        for layer in 0..(0..layers).filter(|&l| !config.linear(l)).count() as u32 {
+            assert!(
+                ready(&adapter.key_pool_array(layer).unwrap())
+                    && ready(&adapter.value_pool_array(layer).unwrap()),
+                "verify {k}: a page write of layer {layer} is still lazy"
+            );
+        }
+        assert!(
+            inner.decoder.snapshot().arrays().all(ready)
+                && inner.rows.values().all(|state| state.arrays().all(ready)),
+            "verify {k}: a frontier is still lazy"
+        );
+        let width = 3 + width3 as i64;
+        assert_eq!(&*verified.shape().unwrap(), [width, 1, ar[0].len() as i64]);
+        let rows: Vec<Vec<u32>> = (0..width)
+            .map(|r| bits(&verified.slice_axis(0, r, r + 1).unwrap()))
+            .collect();
+        for j in 0..3 {
+            assert!(
+                rows[j] == ar[front2 + j],
+                "verify {k}: owner 2 row {j} differs from AR step {}",
+                front2 + j
+            );
+        }
+        for j in 0..keep3 {
+            assert!(
+                rows[3 + j] == ar[front3 + j],
+                "verify {k}: owner 3 row {j} differs from AR step {}",
+                front3 + j
+            );
+        }
+        for result in inner
+            .commit_mtp(&[
+                ScheduledVerifyCommit {
+                    seq_id: 3,
+                    keep: keep3,
+                },
+                ScheduledVerifyCommit { seq_id: 2, keep: 3 },
+            ])
+            .unwrap()
+        {
+            result.unwrap();
+        }
+        front2 += 3;
+        front3 += keep3;
+    }
+    assert_eq!(
+        inner.decoder.route_readbacks - readbacks,
+        0,
+        "a mapped verify read its routes back through read_routes"
+    );
+    let hit = inner.decoder.weights.slot_hits - hits;
+    assert!(
+        hit >= (2 * VERIFIES * layers * top) as u64,
+        "the verify route tapes were not committed: {hit} slot hits"
+    );
+    for (seq, front) in [(2, front2), (3, front3)] {
+        inner.activate_paged_seq(seq).unwrap();
+        assert_eq!(inner.decoder.history.len(), prompt.len() + front);
+        let step = inner.decoder.step(tokens[front]).unwrap();
+        assert!(
+            bits(&step) == ar[front],
+            "owner {seq} does not continue AR exactly after its verifies"
+        );
+    }
+
+    // The wire takes this verify's own pass as the eighth slow 3-row pass.
+    inner.activate_paged_seq(2).unwrap();
+    let front = front2 + 1;
+    let mapped = inner.decoder.weights.plan.mapped_bytes;
+    let wire = inner.decoder.weights.tripwire_mut();
+    *wire = tripwire::Tripwire::default();
+    let reads = memory::process_disk_reads();
+    wire.begin_turn(reads);
+    for _ in 0..8 {
+        wire.observe(
+            3,
+            std::time::Duration::from_micros(1),
+            reads,
+            mapped,
+            || false,
+        );
+    }
+    for _ in 0..7 {
+        wire.observe(3, std::time::Duration::from_secs(1), reads, mapped, || {
+            false
+        });
+    }
+    assert!(wire.tripped().is_none() && wire.slow_streak() == 7);
+    let readbacks = inner.decoder.route_readbacks;
+    let verified = inner
+        .verify_mtp(&[ScheduledVerifyRow {
+            seq_id: 2,
+            first_position: (prompt.len() + front) as u32,
+            tokens: tokens[front..front + 3].to_vec(),
+            speculative: true,
+        }])
+        .expect("a verify that trips the wire must keep its mapped rows");
+    assert!(
+        !inner.decoder.weights.plan.mapped
+            && matches!(
+                inner.decoder.weights.live.fallback(),
+                Some(tripwire::Fallback::SlowSteps { rows: 3, .. })
+            ),
+        "the primed verify did not trip the wire"
+    );
+    assert_eq!(
+        inner.decoder.route_readbacks, readbacks,
+        "the tripping verify read its routes back through read_routes"
+    );
+    for j in 0..3 {
+        assert!(
+            bits(&verified.slice_axis(0, j, j + 1).unwrap()) == ar[front + j as usize],
+            "the tripping verify row {j} differs from AR step {}",
+            front + j as usize
+        );
+    }
+    inner
+        .commit_mtp(&[ScheduledVerifyCommit { seq_id: 2, keep: 3 }])
+        .unwrap()
+        .remove(0)
+        .unwrap();
+
+    let front = front + 3;
+    let readbacks = inner.decoder.route_readbacks;
+    let verified = inner
+        .verify_mtp(&[ScheduledVerifyRow {
+            seq_id: 2,
+            first_position: (prompt.len() + front) as u32,
+            tokens: tokens[front..front + 3].to_vec(),
+            speculative: true,
+        }])
+        .unwrap();
+    assert_eq!(
+        inner.decoder.route_readbacks - readbacks,
+        layers as u64,
+        "a verify over slots must read every layer's routes on the host"
+    );
+    for j in 0..3 {
+        assert!(
+            bits(&verified.slice_axis(0, j, j + 1).unwrap()) == ar[front + j as usize],
+            "the slot verify row {j} differs from AR step {}",
+            front + j as usize
+        );
+    }
+    inner
+        .commit_mtp(&[ScheduledVerifyCommit { seq_id: 2, keep: 3 }])
+        .unwrap()
+        .remove(0)
+        .unwrap();
+}
+
+fn xorshift(seed: u32) -> impl FnMut() -> u32 {
+    let mut s = seed | 1;
+    move || {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        s
+    }
+}
+
+/// Today's PLE vector path before the row kernel: one M=1 gather GEMV per vector.
+fn gather_vectors(w: &weights::Weight, x: &MxArray) -> MxArray {
+    use crate::array::DType;
+    let count = x.shape_at(1).unwrap();
+    let width = x.shape_at(2).unwrap();
+    w.gather_rows(
+        &x.reshape(&[count, 1, width]).unwrap(),
+        &MxArray::zeros(&[count], Some(DType::Uint32)).unwrap(),
+        1,
+        false,
+    )
+    .unwrap()
+    .reshape(&[1, count, w.values.shape_at(0).unwrap()])
+    .unwrap()
+}
+
+/// The PLE key (10240 x 2560) and value (2560 x 2560) Q8 shapes: the gather
+/// GEMV per vector, the single-row projection per row and the row kernel
+/// write the same bits for R = 1, 3 and 4.
+#[test]
+fn ple_projection_row_kernel_matches_gather_and_single_rows_bit_for_bit() {
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    for seed in 0..4u32 {
+        let mut next = xorshift(0x9e37_79b9 ^ seed.wrapping_mul(0x0100_0193));
+        for (n, k) in [(10240usize, 2560usize), (2560, 2560)] {
+            let w = q8_bank(n, k, &mut next);
+            for rows in [1i64, 3, 4] {
+                let x = bf16_rows(rows, k as i64, 1. / 256., 2., &mut next);
+                let dense = math::rows::dense_decode(&w, &x)
+                    .unwrap()
+                    .expect("the row kernel admits the PLE shape");
+                let singles: Vec<MxArray> =
+                    (0..rows).map(|j| w.linear(&row(&x, j)).unwrap()).collect();
+                let what = format!("seed={seed} N={n} K={k} rows={rows}");
+                assert_same_bits(&gather_vectors(&w, &x), &dense, &format!("gather {what}"));
+                assert_same_bits(&stack_rows(&singles), &dense, &format!("single {what}"));
+            }
+        }
+    }
+}
+
+/// A Q8_0 GGUF of `(name, rows, width)` tensors with random F16 scales and int8 codes.
+fn write_q8_gguf(
+    path: &std::path::Path,
+    tensors: &[(&str, usize, usize)],
+    next: &mut impl FnMut() -> u32,
+) {
+    let mut b = b"GGUF".to_vec();
+    b.extend_from_slice(&3u32.to_le_bytes());
+    b.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+    b.extend_from_slice(&1u64.to_le_bytes());
+    gguf_string(&mut b, "general.architecture");
+    b.extend_from_slice(&8u32.to_le_bytes());
+    gguf_string(&mut b, "qwen4exp");
+    let mut offset = 0u64;
+    for &(name, n, k) in tensors {
+        gguf_string(&mut b, name);
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&(k as u64).to_le_bytes());
+        b.extend_from_slice(&(n as u64).to_le_bytes());
+        b.extend_from_slice(&8u32.to_le_bytes());
+        b.extend_from_slice(&offset.to_le_bytes());
+        offset += (n * k / 32 * 34) as u64;
+        assert!(offset.is_multiple_of(32));
+    }
+    while !b.len().is_multiple_of(32) {
+        b.push(0);
+    }
+    for &(_, n, k) in tensors {
+        for _ in 0..n * k / 32 {
+            let scale = half::f16::from_f32((next() % 97 + 1) as f32 / 16384.);
+            b.extend_from_slice(&scale.to_bits().to_le_bytes());
+            for _ in 0..8 {
+                b.extend_from_slice(&next().to_le_bytes());
+            }
+        }
+    }
+    std::fs::write(path, b).unwrap();
+}
+
+/// `linear_ple_window` through the real GGUF loader, from a resident bank
+/// and from staged read chunks: every window of R > 1 vectors runs four rows
+/// per row-kernel call (256 calls for 1024 rows, per weight chunk) and keeps
+/// the bits of the gather GEMV per vector and of the single-row projection.
+#[test]
+fn ple_window_runs_four_rows_per_row_kernel_call_bit_for_bit() {
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    let width = 2560usize;
+    let names = [
+        ("blk.1.ple_key.weight", 10240usize),
+        ("blk.1.ple_value.weight", 2560usize),
+    ];
+    let chunk = (weights::MAX_READ_BYTES as usize / (width * 4)).clamp(1, 4096);
+    for seed in 0..2u32 {
+        let mut next = xorshift(0x5bd1_e995 ^ seed.wrapping_mul(0x0100_0193));
+        let dir = Temp::new();
+        let path = dir.0.join("ple.gguf");
+        write_q8_gguf(
+            &path,
+            &[
+                (names[0].0, names[0].1, width),
+                (names[1].0, names[1].1, width),
+            ],
+            &mut next,
+        );
+        for banked in [true, false] {
+            let mut store = weights::Store::open_fixture(&path, None).unwrap();
+            if banked {
+                store.prepare_fixture_hot().unwrap();
+            }
+            for (name, n) in names {
+                assert_eq!(store.resident_bank(name).is_some(), banked, "{name}");
+                let w = weights::Weight::concatenate_rows(
+                    &(0..n)
+                        .step_by(chunk)
+                        .map(|s| store.read(name, s, (n - s).min(chunk)).unwrap())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                let chunks = if banked { 1 } else { n.div_ceil(chunk) as u64 };
+                for rows in [1i64, 3, 4, 5, 1023, 1024] {
+                    let x = bf16_rows(rows, width as i64, 1. / 256., 2., &mut next);
+                    store.vector_windows.clear();
+                    let window = store.linear_ple_window(name, &x).unwrap();
+                    let calls = if rows == 1 {
+                        0
+                    } else {
+                        chunks * (rows as u64).div_ceil(4)
+                    };
+                    let what = format!("seed={seed} banked={banked} {name} rows={rows}");
+                    assert_eq!(store.vector_windows, [(rows, calls)], "{what}");
+                    assert_same_bits(&window, &gather_vectors(&w, &x), &format!("gather {what}"));
+                    if rows <= 5 {
+                        let singles: Vec<MxArray> =
+                            (0..rows).map(|j| w.linear(&row(&x, j)).unwrap()).collect();
+                        assert_same_bits(&window, &stack_rows(&singles), &format!("single {what}"));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn mixer_sums(w: &weights::Weight, x: &MxArray, split: bool) -> MxArray {
+    let (s, b) = (w.scales.as_ref().unwrap(), w.biases.as_ref().unwrap());
+    MxArray::from_handle(
+        unsafe {
+            mlx_sys::mlx_qwen4_mixer_sums(
+                x.as_raw_ptr(),
+                w.values.as_raw_ptr(),
+                s.as_raw_ptr(),
+                b.as_raw_ptr(),
+                split,
+            )
+        },
+        "mixer sums",
+    )
+    .unwrap()
+}
+
+/// The split mixer kernel (eight simdgroups per output, every block's term
+/// stored, added in block order) against the one-simdgroup chain: the raw
+/// F32 sums before any BF16 rounding, and the BF16 SiLU outputs against
+/// `silu(dense / 4)` over the shared dense kernel's chain.
+#[test]
+fn mixer_act_split_keeps_the_one_simdgroup_chain_bit_for_bit() {
+    use crate::array::DType;
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    for seed in 0..8u32 {
+        let mut next = xorshift(0x2545_f491 ^ seed.wrapping_mul(0x9e37_79b9));
+        let down = q8_bank(320, 10240, &mut next);
+        for rows in 1..=4i64 {
+            let x = bf16_rows(rows, 10240, 1. / 256., 2., &mut next);
+            let what = format!("seed={seed} rows={rows}");
+            let chain = mixer_sums(&down, &x, false);
+            assert_eq!(chain.dtype().unwrap(), DType::Float32);
+            assert_same_bits(
+                &mixer_sums(&down, &x, true),
+                &chain,
+                &format!("F32 sums {what}"),
+            );
+            let dense = math::rows::dense_decode(&down, &x).unwrap().unwrap();
+            assert_same_bits(
+                &chain.astype(DType::BFloat16).unwrap(),
+                &dense,
+                &format!("chain vs dense kernel {what}"),
+            );
+            let act = math::rows::mixer_act(&down, &x).unwrap().unwrap();
+            assert_eq!(act.dtype().unwrap(), DType::BFloat16);
+            assert_same_bits(
+                &act,
+                &crate::nn::Activations::silu(&dense.div_scalar(4.).unwrap()).unwrap(),
+                &format!("BF16 activation {what}"),
+            );
+        }
+    }
+}
+
+// ---- layer-major prefill groups ----------------------------------------------
+// The fixture fails the tentative gate (hidden 32, BF16 experts), so these
+// run the plain path; `real_model_group_matches_window_at_a_time_on_a_cold_pack`
+// proves the tentative/mapped group on the real checkpoint.
+
+/// A paged GGUF fixture decoder whose admitted window is `width` tokens.
+fn group_fixture_decoder(width: usize, seq: u32) -> decoder::Decoder {
+    let path = fixture().join("bf16/paged/model.gguf");
+    let store = weights::Store::open_fixture(&path, None).unwrap();
+    let config = gguf::config(&store).unwrap();
+    let mut decoder = decoder::Decoder::new(config.clone(), store).unwrap();
+    decoder.prefill_window_pin = Some(width);
+    decoder.prefill_chunk_size = width;
+    let mut adapter = paged::create(&config).unwrap();
+    adapter.begin_request(seq).unwrap();
+    adapter.allocate_suffix_blocks(53).unwrap();
+    decoder.paged = Some(adapter);
+    decoder
+}
+
+/// 53 tokens: three windows of 16 and a 5-token tail at width 16.
+fn group_prompt() -> Vec<u32> {
+    (0..53)
+        .map(|i| ((i * 13 + i / 4) % 61 + 2) as u32)
+        .collect()
+}
+
+fn f32s(a: &MxArray) -> Vec<f32> {
+    a.astype(crate::array::DType::Float32)
+        .unwrap()
+        .to_float32()
+        .unwrap()
+        .to_vec()
+}
+
+/// Every cache array and every pool K/V position of a decoder's frontier.
+fn frontier_bytes(d: &decoder::Decoder) -> Vec<Vec<f32>> {
+    let mut out: Vec<Vec<f32>> = d.caches.iter().flat_map(|c| c.arrays().map(f32s)).collect();
+    let adapter = d.paged.as_ref().unwrap();
+    let positions: Vec<i32> = (0..d.history.len() as i32).collect();
+    let full = (0..d.config.num_hidden_layers).filter(|&i| !d.config.linear(i));
+    for (layer, _) in full.enumerate() {
+        let (k, v) = paged::gather_selected(
+            adapter,
+            layer as u32,
+            &positions,
+            d.config.num_key_value_heads,
+            d.config.head_dim,
+        )
+        .unwrap();
+        out.push(f32s(&k));
+        out.push(f32s(&v));
+    }
+    out
+}
+
+/// One group of three windows plus the tail pass gives the bytes of four
+/// one-window passes: logits, every cache array, every pool K/V position,
+/// every hidden view and the history.
+/// MUTATION: the inner loop walks windows in reverse ->
+/// window 2's GDN state comes from window 3's; "caches and pool K/V" fails.
+/// MUTATION: `set_cursor` keeps the group base for every window
+/// -> rope positions, PLE context and page base are wrong; "logits" fails.
+#[test]
+fn a_group_of_windows_matches_one_window_at_a_time_bit_for_bit() {
+    let prompt = group_prompt();
+    let mut grouped = group_fixture_decoder(16, 1);
+    let mut windowed = group_fixture_decoder(16, 2);
+    let (windows, tail) = grouped.group_windows(&prompt);
+    assert_eq!(
+        windows.iter().map(|w| w.len()).collect::<Vec<_>>(),
+        [16, 16, 16]
+    );
+    assert_eq!(tail.len(), 5);
+    let (logits, views) = grouped.prefill_group(&windows, tail, true, true).unwrap();
+    let mut group_hidden: Vec<Vec<f32>> = views.iter().flatten().map(f32s).collect();
+    group_hidden.extend(grouped.last_chunk_hidden.iter().map(f32s));
+    let mut window_hidden = Vec::new();
+    let mut expected = None;
+    for (k, chunk) in windows
+        .iter()
+        .copied()
+        .chain(std::iter::once(tail))
+        .enumerate()
+    {
+        expected = Some(windowed.prefill_chunk(chunk, None, k == 3).unwrap());
+        window_hidden.extend(windowed.last_chunk_hidden.iter().map(f32s));
+    }
+    assert_eq!(f32s(&logits), f32s(&expected.unwrap()), "logits");
+    assert_eq!(group_hidden.len(), prompt.len());
+    assert_eq!(group_hidden, window_hidden, "hidden views");
+    assert_eq!(grouped.history, windowed.history);
+    assert_eq!(
+        frontier_bytes(&grouped),
+        frontier_bytes(&windowed),
+        "caches and pool K/V"
+    );
+    assert!(
+        grouped.tentative_commits.is_empty(),
+        "the fixture runs the plain path"
+    );
+    assert!(
+        grouped
+            .submit_log
+            .borrow()
+            .iter()
+            .any(|e| e == "qwen4::group::end")
+    );
+}
+
+/// The group asks the reader threads for every window's rows and the
+/// tail's before layer 0: every row it imports was requested, and once the
+/// readers are paused after sweep 0 nothing waits for a row.
+/// MUTATION: `prefetch_group_rows` requests window
+/// 1's rows only -> windows 2 and 3 import inline; "every row ... requested"
+/// fails.
+#[test]
+fn a_group_requests_every_windows_rows_before_layer_0() {
+    use std::sync::atomic::AtomicU64;
+    let path = fixture().join("bf16/model.gguf");
+    let mut store = weights::Store::open_fixture(&path, None).unwrap();
+    store.row_readers = true;
+    let config = gguf::config(&store).unwrap();
+    let mut decoder = decoder::Decoder::new(config, store).unwrap();
+    decoder.prefill_chunk_size = 16;
+    let prompt = group_prompt();
+    let stats = Arc::clone(&decoder.weights.lookup);
+    let (prefetched, late, misses) = (stats.prefetched(), stats.late(), stats.misses());
+    let late_after_sweep_0 = Arc::new(AtomicU64::new(u64::MAX));
+    decoder.after_sweep = Some(Box::new({
+        let stats = Arc::clone(&stats);
+        let cell = Arc::clone(&late_after_sweep_0);
+        move |d, layer| {
+            if layer == 0 {
+                d.weights.pause_rows();
+                cell.store(stats.late(), Ordering::Release);
+            }
+        }
+    }));
+    let (windows, tail) = decoder.group_windows(&prompt);
+    decoder.prefill_group(&windows, tail, true, false).unwrap();
+    let imported = stats.misses() - misses;
+    assert!(imported > 0, "the group imported rows");
+    assert_eq!(
+        (stats.prefetched() - prefetched) + (stats.late() - late),
+        imported,
+        "every row the group and its tail imported was requested up front"
+    );
+    assert_eq!(
+        stats.late(),
+        late_after_sweep_0.load(Ordering::Acquire),
+        "after sweep 0 no row waited: every window's PLE rows and the tail's were ready"
+    );
+}
+
+/// The group records its windows before any layer runs and never the
+/// tail, which records itself; the cursor leaves `history` at the prefix
+/// between sweeps.
+#[test]
+fn a_group_records_its_windows_up_front_and_the_tail_records_itself() {
+    let prompt = group_prompt();
+    let mut decoder = group_fixture_decoder(16, 1);
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    decoder.after_sweep = Some(Box::new({
+        let seen = Arc::clone(&seen);
+        move |d, layer| {
+            seen.lock().unwrap().push((
+                layer,
+                d.paged.as_ref().unwrap().request_tokens().to_vec(),
+                d.history.clone(),
+            ));
+        }
+    }));
+    let (windows, tail) = decoder.group_windows(&prompt);
+    decoder.prefill_group(&windows, tail, true, false).unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 4, "one hook call per sweep");
+    for (layer, recorded, history) in seen.iter() {
+        assert_eq!(
+            recorded,
+            &prompt[..48],
+            "sweep {layer}: the three windows are recorded, the tail is not"
+        );
+        assert!(
+            history.is_empty(),
+            "sweep {layer}: the cursor rests at the prefix"
+        );
+    }
+    assert_eq!(
+        decoder.paged.as_ref().unwrap().request_tokens(),
+        &prompt[..]
+    );
+    assert_eq!(decoder.history, prompt);
+}
+
+/// A trip held at the end of a sweep: the group's frontier is evaluated
+/// first, the store then leaves the mapped path (here: nothing to leave, the
+/// trip is consumed), and the remaining sweeps finish with the same bytes.
+/// `apply_held_trip` itself is proven on a mapped store in
+/// `weights::mapped_tests::observe_sweep_holds_the_trip_and_apply_held_trip_switches`.
+/// MUTATION: `switch_mid_group` applies the trip
+/// before the frontier eval -> "the frontier is evaluated before" fails.
+#[test]
+fn a_trip_between_sweeps_evaluates_the_group_before_the_switch_and_finishes() {
+    use super::tripwire::Fallback;
+    let prompt = group_prompt();
+    let mut tripped = group_fixture_decoder(16, 1);
+    let mut plain = group_fixture_decoder(16, 2);
+    tripped.after_sweep = Some(Box::new(|d, layer| {
+        if layer == 1 {
+            d.weights.trip(Fallback::SsdReads {
+                read: 3000,
+                mapped: 1000,
+            });
+        }
+    }));
+    let (windows, tail) = tripped.group_windows(&prompt);
+    let (logits, _) = tripped.prefill_group(&windows, tail, true, false).unwrap();
+    let (expected, _) = plain.prefill_group(&windows, tail, true, false).unwrap();
+    assert_eq!(f32s(&logits), f32s(&expected), "logits");
+    assert_eq!(frontier_bytes(&tripped), frontier_bytes(&plain));
+    let log = tripped.submit_log.borrow().clone();
+    let at = |event: &str| {
+        log.iter()
+            .position(|e| e == event)
+            .unwrap_or_else(|| panic!("{event} in {log:?}"))
+    };
+    assert!(
+        at("qwen4::group::frontier") < at("qwen4::group::trip"),
+        "the frontier is evaluated before the store may leave the mapped path: {log:?}"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|e| *e == "qwen4::group::frontier")
+            .count(),
+        1,
+        "one switch per group"
+    );
+    assert_eq!(
+        log[..at("qwen4::group::frontier")]
+            .iter()
+            .filter(|e| *e == "qwen4::batch::mlp")
+            .count(),
+        6,
+        "sweeps 0 and 1 of three windows ran before the frontier eval"
+    );
+    assert!(
+        !log.contains(&"qwen4::group::switch".to_owned()),
+        "the fixture store is not mapped: nothing to leave"
+    );
+    assert!(
+        tripped.weights.tripwire_mut().tripped().is_none(),
+        "the held trip was consumed"
+    );
+    assert!(!tripped.weights.group_in_progress());
+    assert_eq!(tripped.weights.pending_touches(), 0);
+}
+
+/// The whole-prompt step follows group mode: never on the plain
+/// fixture store, and with group mode pinned on only for a suffix of more
+/// than one window.
+/// MUTATION: the `paged.rs` hook returns true -> "the
+/// fixture store is not mapped" fails.
+#[test]
+fn the_whole_prompt_hook_follows_group_mode() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    let mut inner = tiny_inner();
+    inner.decoder.prefill_chunk_size = 16;
+    assert!(
+        !inner.scheduler_whole_prompt_prefill(53, 0),
+        "the fixture store is not mapped"
+    );
+    inner.decoder.group_pin = Some(true);
+    assert!(inner.scheduler_whole_prompt_prefill(53, 0));
+    assert!(
+        !inner.scheduler_whole_prompt_prefill(53, 40),
+        "13 new tokens are one window"
+    );
+    assert!(
+        !inner.scheduler_whole_prompt_prefill(20, 0),
+        "16 + 4 is one window and a tail"
+    );
+    assert!(
+        inner.scheduler_whole_prompt_prefill(32, 0),
+        "two full windows"
+    );
+    inner.decoder.group_pin = Some(false);
+    assert!(!inner.scheduler_whole_prompt_prefill(53, 0));
+}
+
+/// The tripwire sees one sample per window (the group's time shared by
+/// rows) and the tail pass its own, after the group.
+/// MUTATION: `group_windows` keeps the short final
+/// window in the group -> no tail pass; "the tail runs after the group" fails.
+#[test]
+fn a_group_feeds_the_tripwire_one_sample_per_window_and_the_tail_its_own() {
+    let prompt = group_prompt();
+    let mut decoder = group_fixture_decoder(16, 1);
+    let (windows, tail) = decoder.group_windows(&prompt);
+    decoder.prefill_group(&windows, tail, true, false).unwrap();
+    let samples = decoder.pass_samples.clone();
+    assert_eq!(
+        samples.iter().map(|(rows, _)| *rows).collect::<Vec<_>>(),
+        [16, 16, 16, 5]
+    );
+    assert_eq!(samples[0].1, samples[1].1);
+    assert_eq!(samples[1].1, samples[2].1);
+    assert!(samples[0].1 > std::time::Duration::ZERO);
+    let log = decoder.submit_log.borrow();
+    let group_end = log.iter().position(|e| e == "qwen4::group::end").unwrap();
+    let tail_start = log
+        .iter()
+        .position(|e| e == "qwen4::tail::start")
+        .expect("the tail runs after the group");
+    assert!(group_end < tail_start);
+    assert_eq!(log.iter().filter(|e| *e == "qwen4::group::end").count(), 1);
+}
+
+/// A cancel between two sweeps fails the group and resets the decoder:
+/// no history, no caches, no tentative transaction, no group flag or touch.
+#[test]
+fn cancel_between_two_sweeps_resets_the_decoder() {
+    let prompt = group_prompt();
+    let mut decoder = group_fixture_decoder(16, 1);
+    let flag = Arc::new(AtomicBool::new(false));
+    decoder.cancelled = Some(Arc::clone(&flag));
+    decoder.after_sweep = Some(Box::new(move |_, layer| {
+        if layer == 2 {
+            flag.store(true, Ordering::Release);
+        }
+    }));
+    let (windows, tail) = decoder.group_windows(&prompt);
+    let error = decoder
+        .prefill_group(&windows, tail, true, false)
+        .err()
+        .expect("the cancel fails the group");
+    assert!(error.reason.contains("cancelled"), "{}", error.reason);
+    assert!(decoder.history.is_empty());
+    assert!(decoder.caches.iter().all(|c| c.arrays().count() == 0));
+    assert!(decoder.last_chunk_hidden.is_empty());
+    assert!(!decoder.deferred_state_submission());
+    assert!(!decoder.weights.group_in_progress());
+    assert_eq!(decoder.weights.pending_touches(), 0);
+}
+
+/// The `paged_prefill` dispatch. With group mode pinned on, the paged
+/// lane runs the prompt as a group and observes the MTP owner per window and
+/// then for the tail; the owner's draft cache, waiting rows and frontier are
+/// those of the window-at-a-time lane (pinned off), and so are the logits.
+#[test]
+fn observe_mtp_after_a_group_gives_the_same_draft_cache() {
+    use crate::engine::backend::PagedBackend;
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    let prompt = group_prompt();
+    let run = |pin: bool| {
+        let mut inner = tiny_inner();
+        inner.decoder.prefill_window_pin = Some(16);
+        inner.decoder.prefill_chunk_size = 16;
+        inner.decoder.group_pin = Some(pin);
+        inner.activate_paged_seq(1).unwrap();
+        assert!(inner.begin_mtp(1, 0).unwrap());
+        let prefix = inner
+            .prime_prefix_state(&prompt, false, 32, &[], 0)
+            .unwrap();
+        let logits = inner
+            .paged_prefill(
+                &prompt,
+                &prefix,
+                Stream::default(crate::stream::DeviceType::Gpu),
+            )
+            .unwrap();
+        let (cache, rows, frontier) = inner.mtp.draft_state(1).unwrap();
+        let log = inner.decoder.submit_log.borrow().clone();
+        (
+            cache.iter().map(f32s).collect::<Vec<_>>(),
+            rows.iter().map(|(h, t)| (f32s(h), *t)).collect::<Vec<_>>(),
+            frontier,
+            log,
+            f32s(&logits),
+        )
+    };
+    let grouped = run(true);
+    let windowed = run(false);
+    assert!(grouped.3.iter().any(|e| e == "qwen4::group::end"));
+    assert!(grouped.3.iter().any(|e| e == "qwen4::tail::start"));
+    assert!(!windowed.3.iter().any(|e| e == "qwen4::group::end"));
+    assert!(
+        !grouped.0.is_empty(),
+        "two windows flushed into the draft cache"
+    );
+    assert_eq!(grouped.0, windowed.0, "draft cache");
+    assert_eq!(grouped.1, windowed.1, "waiting rows");
+    assert_eq!(grouped.2, windowed.2, "frontier");
+    assert_eq!(grouped.4, windowed.4, "logits");
+}
+
+/// The tentative/mapped group on the real checkpoint: with the pack's pages
+/// out of the page cache the turn opens over a streaming pack and runs the
+/// prompt as one group with one tentative commit; a second run over the now
+/// resident pack runs one window at a time with one commit per full window.
+/// Logits, every cache array, every pool K/V position and the hidden views
+/// are byte-equal. Runs the first `QWEN4_EXP_REAL_CASES` case (`6k` by
+/// default) and needs a cold pack.
+#[test]
+#[ignore = "real checkpoint: QWEN4_EXP_REAL_MODEL, QWEN4_EXP_REAL_INPUTS; --test-threads=1"]
+fn real_model_group_matches_window_at_a_time_on_a_cold_pack() {
+    let model = std::env::var("QWEN4_EXP_REAL_MODEL").expect("QWEN4_EXP_REAL_MODEL");
+    let inputs = std::env::var("QWEN4_EXP_REAL_INPUTS").expect("QWEN4_EXP_REAL_INPUTS");
+    let case = real_cases()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "6k".into());
+    let prompt = real_prompt(Path::new(&inputs), &case);
+    let store = weights::Store::open(Path::new(&model)).unwrap();
+    let config = gguf::config(&store).unwrap();
+    let mut decoder = decoder::Decoder::new(config.clone(), store).unwrap();
+    let adapter = super::paged::create(&config).unwrap();
+    let pool_bytes = adapter.bytes_per_block().unwrap() * u64::from(adapter.block_capacity());
+    decoder.paged = Some(adapter);
+    go_live(&mut decoder, pool_bytes);
+    assert!(
+        decoder.weights.plan.mapped,
+        "the live host refused the pack"
+    );
+    let full = (0..config.num_hidden_layers)
+        .filter(|&i| !config.linear(i))
+        .count();
+    let capture = |d: &decoder::Decoder, logits: &MxArray| -> Vec<Vec<f32>> {
+        let mut out = vec![f32s(logits)];
+        out.extend(d.caches.iter().flat_map(|c| c.arrays().map(f32s)));
+        out.extend(d.last_chunk_hidden.iter().map(f32s));
+        let adapter = d.paged.as_ref().unwrap();
+        let positions: Vec<i32> = (0..d.history.len() as i32).collect();
+        for layer in 0..full {
+            let (k, v) = paged::gather_selected(
+                adapter,
+                layer as u32,
+                &positions,
+                config.num_key_value_heads,
+                config.head_dim,
+            )
+            .unwrap();
+            out.push(f32s(&k));
+            out.push(f32s(&v));
+        }
+        out
+    };
+    let mut runs = Vec::new();
+    for (run, seq) in ["group", "windows"].into_iter().zip(1u32..) {
+        decoder.reset();
+        {
+            let adapter = decoder.paged.as_mut().unwrap();
+            if seq > 1 {
+                adapter.release_request().unwrap();
+            }
+            adapter.begin_request(seq).unwrap();
+            adapter.allocate_suffix_blocks(prompt.len() as u32).unwrap();
+        }
+        assert!(
+            decoder.weights.begin_turn().unwrap().is_none(),
+            "{run}: a slot fallback was applied"
+        );
+        let group = decoder.group_mode(prompt.len());
+        assert_eq!(
+            group,
+            run == "group",
+            "{run}: group mode follows the stream (cold pack for the first run, resident for the second)"
+        );
+        decoder.tentative_commits.clear();
+        let started = std::time::Instant::now();
+        let logits = decoder.prefill_prompt(&prompt).unwrap();
+        let elapsed = started.elapsed();
+        let (windows, tail) = decoder.group_windows(&prompt);
+        let commits = decoder.tentative_commits.clone();
+        if group {
+            assert_eq!(
+                commits,
+                vec![windows.len()],
+                "{run}: one tentative commit over every window"
+            );
+        } else {
+            assert_eq!(
+                commits,
+                vec![1; windows.len()],
+                "{run}: one tentative commit per full window"
+            );
+        }
+        eprintln!(
+            "group vs windows {case} {run}: {} tokens = {} windows + {} tail in {elapsed:.2?}, commits {commits:?}, mapped {}",
+            prompt.len(),
+            windows.len(),
+            tail.len(),
+            decoder.weights.plan.mapped
+        );
+        assert!(
+            decoder.weights.plan.mapped,
+            "{run}: the store stayed mapped"
+        );
+        runs.push(capture(&decoder, &logits));
+    }
+    assert_eq!(runs[0].len(), runs[1].len());
+    for (i, (a, b)) in runs[0].iter().zip(&runs[1]).enumerate() {
+        assert!(
+            a == b,
+            "group vs windows {case}: array {i} of {} differs",
+            runs[0].len()
+        );
+    }
+    eprintln!(
+        "group vs windows {case}: {} arrays byte-equal between the group and the window-at-a-time run",
+        runs[0].len()
+    );
+}
+
+/// A trip forced between two sweeps of a real-model group on a cold
+/// pack: the frontier is evaluated and the tape committed before the store
+/// leaves the mapped path, the group finishes plain on slots with the group
+/// base as the fallback position, the pack stream is gone, and no lazy pool
+/// write is discarded. The same decoder then serves the prompt again one
+/// window at a time on the same slots. Both texts equal the
+/// `QWEN4_EXP_REAL_EXPECTED` reference: the slot path runs every window's
+/// expert groups through the window's kernel, so layers carried from the
+/// mapped sweeps and layers computed on slots of any count give one bit
+/// stream. Needs a cold pack.
+#[test]
+#[ignore = "real checkpoint: QWEN4_EXP_REAL_MODEL, QWEN4_EXP_REAL_INPUTS, QWEN4_EXP_REAL_EXPECTED; --test-threads=1"]
+fn real_model_forced_trip_between_sweeps_switches_after_the_frontier_eval() {
+    use super::tripwire::Fallback;
+    use tracing_subscriber::prelude::*;
+    let model = std::env::var("QWEN4_EXP_REAL_MODEL").expect("QWEN4_EXP_REAL_MODEL");
+    let inputs = std::env::var("QWEN4_EXP_REAL_INPUTS").expect("QWEN4_EXP_REAL_INPUTS");
+    let prompt = real_prompt(Path::new(&inputs), "6k");
+    let expected: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::env::var("QWEN4_EXP_REAL_EXPECTED").expect("QWEN4_EXP_REAL_EXPECTED"))
+            .unwrap(),
+    )
+    .unwrap();
+    let reference: Vec<u32> = expected["cases"]["6k"]["reference"]["argmax"]
+        .as_array()
+        .expect("QWEN4_EXP_REAL_EXPECTED has a 6k reference argmax")
+        .iter()
+        .take(9)
+        .map(|t| t.as_u64().unwrap() as u32)
+        .collect();
+    struct Warnings(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                self.0.lock().unwrap().push(message.0);
+            }
+        }
+    }
+    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _capture = tracing_subscriber::registry()
+        .with(Warnings(warnings.clone()))
+        .set_default();
+    let store = weights::Store::open(Path::new(&model)).unwrap();
+    let config = gguf::config(&store).unwrap();
+    let mut decoder = decoder::Decoder::new(config.clone(), store).unwrap();
+    let adapter = super::paged::create(&config).unwrap();
+    let pool_bytes = adapter.bytes_per_block().unwrap() * u64::from(adapter.block_capacity());
+    decoder.paged = Some(adapter);
+    go_live(&mut decoder, pool_bytes);
+    assert!(
+        decoder.weights.plan.mapped,
+        "the live host refused the pack"
+    );
+    {
+        let adapter = decoder.paged.as_mut().unwrap();
+        adapter.begin_request(1).unwrap();
+        adapter.allocate_suffix_blocks(prompt.len() as u32).unwrap();
+    }
+    assert!(decoder.weights.begin_turn().unwrap().is_none());
+    assert!(
+        decoder.group_mode(prompt.len()),
+        "the pack must be cold (its pages evicted from the page cache) for the turn to open over the stream"
+    );
+    let mapped_bytes = decoder.weights.plan.mapped_bytes;
+    decoder.after_sweep = Some(Box::new(move |d, layer| {
+        if layer == 5 {
+            d.weights.trip(Fallback::SsdReads {
+                read: 3 * mapped_bytes,
+                mapped: mapped_bytes,
+            });
+        }
+    }));
+    let started = std::time::Instant::now();
+    let logits = decoder.prefill_prompt(&prompt).unwrap();
+    let elapsed = started.elapsed();
+    let log = decoder.submit_log.borrow().clone();
+    let at = |event: &str| {
+        log.iter()
+            .position(|e| e == event)
+            .unwrap_or_else(|| panic!("{event} in {log:?}"))
+    };
+    assert!(
+        at("qwen4::routes::commit") < at("qwen4::group::frontier")
+            && at("qwen4::group::frontier") < at("qwen4::group::trip")
+            && at("qwen4::group::trip") < at("qwen4::group::switch"),
+        "tape commit -> frontier evaluated -> trip -> switch: {:?}",
+        log.iter()
+            .filter(|e| e.starts_with("qwen4::group") || e.starts_with("qwen4::routes"))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !decoder.weights.plan.mapped,
+        "the store left the mapped path"
+    );
+    assert!(
+        !decoder.weights.pack_stream_alive(),
+        "the pack stream is gone"
+    );
+    assert_eq!(
+        decoder
+            .weights
+            .live
+            .fallback_token_index
+            .load(Ordering::Acquire),
+        0,
+        "the fallback position is the group base"
+    );
+    assert!(
+        decoder.tentative_commits.is_empty(),
+        "the mid-group commit closed the transaction; the end of the group commits nothing"
+    );
+    assert_eq!(decoder.history, prompt);
+    let decode = |decoder: &mut decoder::Decoder, logits: &MxArray| -> Vec<u32> {
+        let mut token = argmax(logits);
+        let mut text = vec![token];
+        for _ in 0..8 {
+            token = argmax(&decoder.step(token).unwrap());
+            text.push(token);
+        }
+        text
+    };
+    let tripped = decode(&mut decoder, &logits);
+    let slots = decoder.weights.plan.partial_expert_slots;
+    eprintln!(
+        "forced trip: group with a trip after sweep 5 in {elapsed:.2?}; slots {slots}; first tokens {tripped:?}"
+    );
+    let warnings = warnings.lock().unwrap().clone();
+    eprintln!("forced trip warnings: {warnings:?}");
+    decoder.after_sweep = None;
+    decoder.reset();
+    {
+        let adapter = decoder.paged.as_mut().unwrap();
+        adapter.release_request().unwrap();
+        adapter.begin_request(2).unwrap();
+        adapter.allocate_suffix_blocks(prompt.len() as u32).unwrap();
+    }
+    let fallback = decoder.weights.begin_turn().unwrap();
+    let group = decoder.group_mode(prompt.len());
+    decoder.tentative_commits.clear();
+    let started = std::time::Instant::now();
+    let logits = decoder.prefill_prompt(&prompt).unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(decoder.history, prompt);
+    let plain = decode(&mut decoder, &logits);
+    eprintln!(
+        "forced trip slots {slots} tripped {tripped:?} plain {plain:?} reference {reference:?} equal {} group_mode {group} slots_after {} mapped {} fallback {fallback:?} plain_prefill {elapsed:.2?}",
+        tripped == plain,
+        decoder.weights.plan.partial_expert_slots,
+        decoder.weights.plan.mapped
+    );
+    assert!(!group, "the plain rerun runs one window at a time");
+    assert_eq!(
+        tripped, reference,
+        "the tripped run (mapped sweeps 0-5, slots after) gives the mapped reference text"
+    );
+    assert_eq!(
+        plain, reference,
+        "the plain slot rerun at {slots} slots gives the mapped reference text"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("mapped -> slots")),
+        "the capture sees the switch's own warning: {warnings:?}"
+    );
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| w.contains("discarded an unevaluated native write")),
+        "no lazy pool write is discarded: {warnings:?}"
+    );
 }

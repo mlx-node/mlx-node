@@ -60,6 +60,46 @@ pub(crate) struct SchedulerCacheSnapshot {
     pub bytes_per_block: u64,
 }
 
+/// Per-sequence state a family keeps outside the paged pool (recurrent rows,
+/// draft snapshots): what it may hold at once and what it holds now.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScheduledStateCapacity {
+    pub budget: u64,
+    pub held: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScheduledStateFit {
+    Fits,
+    AfterReclaim,
+    Never,
+}
+
+/// `outstanding_bytes` is what queued and running turns reserved but their
+/// sequences do not hold yet; it counts like held state. A candidate above
+/// the whole budget must error, never defer: no reclaim can make room for it.
+pub(crate) fn scheduled_state_fit(
+    capacity: Option<ScheduledStateCapacity>,
+    outstanding_bytes: u64,
+    candidate_bytes: u64,
+) -> ScheduledStateFit {
+    let Some(capacity) = capacity else {
+        return ScheduledStateFit::Fits;
+    };
+    if candidate_bytes > capacity.budget {
+        ScheduledStateFit::Never
+    } else if capacity
+        .held
+        .saturating_add(outstanding_bytes)
+        .saturating_add(candidate_bytes)
+        > capacity.budget
+    {
+        ScheduledStateFit::AfterReclaim
+    } else {
+        ScheduledStateFit::Fits
+    }
+}
+
 /// Result of unified-memory reservation after reclaiming idle parked rows.
 #[derive(Debug)]
 enum MemoryReserveOutcome {
@@ -111,6 +151,19 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn scheduler_wired_bytes(&self) -> Option<usize> {
         None
     }
+    /// `seq_id` was admitted; called before the turn's cancel flag, wired
+    /// context and prefill slices are read, so a backend that changes its
+    /// residency per turn does it here. Every opened turn is closed once, on
+    /// whichever path finishes or rejects it.
+    fn scheduled_turn_opened(&mut self, _seq_id: SeqId) {}
+    fn scheduled_turn_closed(&mut self, _seq_id: SeqId) {}
+    /// The family prefills this prompt (`prompt_tokens`, `cached_prefix` of
+    /// them cached) as one group of windows: its prefill is one slice and
+    /// one step, the step's only prefill row, outside the token budget.
+    /// Read with the slice grid at admission and at every re-pin.
+    fn scheduler_whole_prompt_prefill(&self, _prompt_tokens: u32, _cached_prefix: u32) -> bool {
+        false
+    }
 
     fn paged_adapter(&self) -> Option<&PagedKVCacheAdapter>;
     fn paged_adapter_mut(&mut self) -> Option<&mut PagedKVCacheAdapter>;
@@ -161,6 +214,13 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
         scheduler_long_prefill_tokens()
     }
     fn reset_owner_on_session_start(&self) -> bool {
+        false
+    }
+    /// The exclusive lane keeps the ownerless session in the scheduler's owner
+    /// tables under the empty owner id, so the scheduled lane can serve that
+    /// same session. Without this, an ownerless turn must stay exclusive: its
+    /// session lives outside the tables the scheduled lane reads.
+    fn ownerless_session_in_owner_tables(&self) -> bool {
         false
     }
     fn release_scheduled_cache(&mut self, seq_id: SeqId) -> Result<()> {
@@ -234,6 +294,26 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
         Ok(())
     }
     fn scheduled_draft_state_bytes(&self, _total_tokens: u32) -> u64 {
+        0
+    }
+    /// A family whose recurrent rows and draft snapshots live outside the
+    /// paged pool budgets them here and charges nothing to the pool through
+    /// `recurrent_state_bytes` / `scheduled_draft_state_bytes`.
+    fn scheduled_state_capacity(&self) -> Option<ScheduledStateCapacity> {
+        None
+    }
+    /// Off-pool state this turn adds beside what the family already holds.
+    fn scheduled_state_candidate_bytes(
+        &self,
+        _seq_id: SeqId,
+        _total_tokens: u32,
+        _speculative: bool,
+    ) -> u64 {
+        0
+    }
+    /// Off-pool state `seq_id` holds now; a live turn's reservation is charged
+    /// only beyond this.
+    fn scheduled_state_held_bytes(&self, _seq_id: SeqId) -> u64 {
         0
     }
     /// Return false when this prefix cannot seed complete draft state. The
@@ -684,6 +764,10 @@ pub(crate) struct ScheduledTurn<P> {
     pub(crate) failure: Option<Error>,
     pub(crate) allocation_failed: bool,
     pub(crate) preemption_replay: Option<PreemptionReplay>,
+    /// Token bound the off-pool state reservation was sized for. The block
+    /// reservation may cover fewer tokens (`MLX_SCHED_RESERVE_FULL_ISL=0`),
+    /// so a resume must not derive the bound from it.
+    pub(crate) requested_tokens: u32,
 }
 
 struct PreparedTurn {
@@ -696,6 +780,7 @@ struct PreparedTurn {
     reservation_blocks: u32,
     block_size: u32,
     reservation_state_bytes: u64,
+    requested_tokens: u32,
 }
 
 struct PreparedDecodeRow {
@@ -872,6 +957,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     turn.payload.scheduled_speculation = None;
                     turn.decode_draft_allowance = 0;
                     turn.recurrent_state_bytes = self.inner.recurrent_state_bytes();
+                    turn.scheduled_state_bytes = 0;
                 }
                 Err(error) => return Ok(Self::fail(turn, row, error)),
             }
@@ -977,11 +1063,11 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             return Ok(Self::fail(turn, row, error));
         }
         sampled.eval();
-        if turn.payload.params.report_performance {
-            turn.payload.first_token_instant = Some(Instant::now());
-        }
         crate::array::synchronize_and_clear_cache();
         if turn.payload.params.max_new_tokens == 0 {
+            if turn.payload.params.report_performance {
+                turn.payload.first_token_instant = Some(Instant::now());
+            }
             turn.payload.profiler.snapshot_memory_after();
             turn.payload.profiler.report();
             return Ok(RowStepResult {
@@ -1038,6 +1124,12 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             } else if let Some(reason) = row.repetition {
                 turn.payload.finish_reason = reason.to_string();
             }
+        }
+        // The prefill-sampled token is emitted only here, one decode forward
+        // later; stamping TTFT at the sample hides that forward (seconds on a
+        // cold request) inside decode time.
+        if turn.payload.params.report_performance && turn.payload.first_token_instant.is_none() {
+            turn.payload.first_token_instant = Some(Instant::now());
         }
     }
 
@@ -1450,6 +1542,26 @@ pub(crate) struct HybridSchedulerState<B: HybridSchedulerBackend> {
     next_seq_id: SeqId,
 }
 
+/// The pinned prefill ends of one prompt and whether the family runs it as
+/// one whole-prompt step (then the grid is the one end `prompt`).
+fn prefill_breaks<B: HybridSchedulerBackend>(
+    inner: &B,
+    cached_prefix: u32,
+    prompt_tokens: u32,
+    extra_breaks: Vec<u32>,
+) -> (Vec<u32>, bool) {
+    let whole = inner.scheduler_whole_prompt_prefill(prompt_tokens, cached_prefix);
+    let slice = if whole {
+        u32::MAX
+    } else {
+        inner.scheduler_prefill_slice_tokens()
+    };
+    (
+        prefill_slice_ends(cached_prefix, prompt_tokens, slice, extra_breaks),
+        whole,
+    )
+}
+
 impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     pub(crate) fn continuous_batching_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1507,6 +1619,16 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         Self::chat_config(command)
             .and_then(|config| config.cache_owner_id.as_deref())
             .is_some_and(|owner| !owner.is_empty())
+    }
+
+    /// An ownerless speculative request takes the scheduled lane as the empty
+    /// owner when the family keeps its ownerless session in the owner tables.
+    /// The legacy-owner drain still admits it only into an idle scheduler, so
+    /// the empty owner never has two turns in flight.
+    fn ownerless_speculation_is_scheduled(&self, command: &ChatCmd) -> bool {
+        self.inner.ownerless_session_in_owner_tables()
+            && self.inner.supports_scheduled_speculation()
+            && Self::chat_config(command).is_some_and(|config| config.enable_mtp == Some(true))
     }
 
     fn chat_requires_legacy_owner_drain(command: &ChatCmd) -> bool {
@@ -1596,6 +1718,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         });
         let owner_known = Self::chat_config(command)
             .and_then(|config| config.cache_owner_id.as_deref())
+            .or_else(|| self.inner.ownerless_session_in_owner_tables().then_some(""))
             .is_some_and(|owner| self.owner_sequences.contains_key(owner));
         has_media || (is_continue && !owner_known)
     }
@@ -1959,6 +2082,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             newly_assigned,
             reservation_blocks,
             block_size,
+            requested_tokens,
         }))
     }
 
@@ -2032,6 +2156,38 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         self.reclaim_one_idle_scheduled_with(seq_id, B::release_scheduled_cache)
     }
 
+    #[cfg(test)]
+    pub(crate) fn live_turns(&self) -> usize {
+        self.scheduler.waiting_len() + self.scheduler.running_len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_prepared_waiting(&self) -> bool {
+        self.prepared_waiting.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn turn_mut(
+        &mut self,
+        seq_id: SeqId,
+    ) -> Option<&mut TurnState<ScheduledTurn<B::PrefixState>>> {
+        self.scheduler.turn_mut(seq_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preempt_running(&mut self, seq_id: SeqId) -> bool {
+        let Some(turn) = self.scheduler.preempt_running(seq_id) else {
+            return false;
+        };
+        self.handle_preempted(turn);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resume_preempted(&mut self) {
+        self.try_resume_preempted();
+    }
+
     fn reclaim_one_idle_scheduled_with<F>(
         &mut self,
         seq_id: SeqId,
@@ -2061,15 +2217,34 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         seq_id: SeqId,
         reservation_blocks: u32,
         candidate_state_bytes: u64,
+        state_candidate_bytes: u64,
         snapshot: SchedulerCacheSnapshot,
     ) -> Result<MemoryReserveOutcome> {
         self.try_reserve_reclaiming_idle_with(
             seq_id,
             reservation_blocks,
             candidate_state_bytes,
+            state_candidate_bytes,
             snapshot,
             B::release_scheduled_cache,
         )
+    }
+
+    fn scheduled_state_exceeded(&self, candidate_bytes: u64) -> Error {
+        let capacity = self
+            .inner
+            .scheduled_state_capacity()
+            .unwrap_or(ScheduledStateCapacity { budget: 0, held: 0 });
+        let mib = |bytes: u64| bytes as f64 / (1u64 << 20) as f64;
+        Error::from_reason(format!(
+            "{} working memory: this turn needs {:.0} MiB of recurrent and draft state beside \
+             {:.0} MiB already held, but only {:.0} MiB remain after the page pool and the \
+             prefill window; release idle cache owners or retry without enableMtp",
+            B::SCHEDULER_NAME,
+            mib(candidate_bytes),
+            mib(capacity.held),
+            mib(capacity.budget)
+        ))
     }
 
     /// Unified-memory admission decision against one cache snapshot.
@@ -2101,6 +2276,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         seq_id: SeqId,
         reservation_blocks: u32,
         candidate_state_bytes: u64,
+        state_candidate_bytes: u64,
         mut snapshot: SchedulerCacheSnapshot,
         mut release_cache: F,
     ) -> Result<MemoryReserveOutcome>
@@ -2110,12 +2286,28 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         loop {
             let decision =
                 self.reserve_memory_decision(&snapshot, reservation_blocks, candidate_state_bytes);
-            if decision.admitted {
+            let outstanding_bytes = {
+                let inner = &self.inner;
+                self.scheduler
+                    .outstanding_scheduled_state_bytes(|seq| inner.scheduled_state_held_bytes(seq))
+            };
+            let state = scheduled_state_fit(
+                self.inner.scheduled_state_capacity(),
+                outstanding_bytes,
+                state_candidate_bytes,
+            );
+            if state == ScheduledStateFit::Never {
+                return Err(self.scheduled_state_exceeded(state_candidate_bytes));
+            }
+            if decision.admitted && state == ScheduledStateFit::Fits {
                 return Ok(MemoryReserveOutcome::Admitted);
             }
             if !self.reclaim_one_idle_scheduled_with(seq_id, &mut release_cache)? {
                 if self.scheduler.has_live_turns() {
                     return Ok(MemoryReserveOutcome::Defer);
+                }
+                if state != ScheduledStateFit::Fits {
+                    return Err(self.scheduled_state_exceeded(state_candidate_bytes));
                 }
                 // No live turns: one pool grow may still make the
                 // reservation fit, so grow-and-retry once. The fit math
@@ -2244,6 +2436,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         if !self.ensure_recurrent_slot(prepared.seq_id) {
             return Err(prepared);
         }
+        let mut scheduled_state_bytes = 0u64;
         if let Some(snapshot) = cache_snapshot {
             let reuse = prepared.admitted.plan.is_delta || prepared.admitted.params.reuse_cache;
             let charge = prepared
@@ -2254,10 +2447,21 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     &prepared.admitted.tokens,
                     reuse,
                 ));
+            let state_candidate_bytes = self.inner.scheduled_state_candidate_bytes(
+                prepared.seq_id,
+                prepared.requested_tokens,
+                matches!(
+                    prepared.admitted.plan.decoder,
+                    engine::plan::DecoderPlan::Speculative(_)
+                ),
+            );
+            scheduled_state_bytes = state_candidate_bytes
+                .saturating_add(self.inner.scheduled_state_held_bytes(prepared.seq_id));
             match self.try_reserve_reclaiming_idle(
                 prepared.seq_id,
                 charge,
                 candidate_state_bytes,
+                state_candidate_bytes,
                 snapshot,
             ) {
                 Ok(MemoryReserveOutcome::Admitted) => {}
@@ -2290,6 +2494,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             reservation_blocks,
             block_size,
             reservation_state_bytes,
+            requested_tokens,
         } = *prepared;
         if cancelled.load(Ordering::Relaxed) {
             if newly_assigned {
@@ -2320,6 +2525,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             &admitted.params.cache_owner_id,
             admitted.params.cache_root_owner_id.as_deref(),
         );
+        self.inner.scheduled_turn_opened(seq_id);
         self.inner
             .set_turn_cancel_flag(Some(Arc::clone(&cancelled)));
         let owner_history = self
@@ -2341,6 +2547,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 self.inner.abort_paged_turn();
                 self.inner.release_scheduled_recurrent_for(seq_id);
                 self.inner.release_scheduled_speculation(seq_id);
+                self.inner.scheduled_turn_closed(seq_id);
                 self.inner.set_turn_cancel_flag(None);
                 self.owner_states.remove(&owner_id);
                 self.owner_sequences.remove(&owner_id);
@@ -2359,6 +2566,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.inner.abort_paged_turn();
             self.inner.release_scheduled_recurrent_for(seq_id);
             self.inner.release_scheduled_speculation(seq_id);
+            self.inner.scheduled_turn_closed(seq_id);
             self.inner.set_turn_cancel_flag(None);
             self.owner_states.remove(&owner_id);
             self.owner_sequences.remove(&owner_id);
@@ -2438,15 +2646,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             failure: None,
             allocation_failed: false,
             preemption_replay: None,
+            requested_tokens,
         };
         let prompt_len = admitted.tokens.len() as u32;
         let cached_prefix = payload.prefix.effective_cached_prefix_len() as u32;
-        let breaks = prefill_slice_ends(
-            cached_prefix,
-            prompt_len,
-            self.inner.scheduler_prefill_slice_tokens(),
-            self.inner.extra_prefill_breaks(prompt_len, cached_prefix),
-        );
+        let extra_breaks = self.inner.extra_prefill_breaks(prompt_len, cached_prefix);
+        let (breaks, whole_prompt_prefill) =
+            prefill_breaks(&self.inner, cached_prefix, prompt_len, extra_breaks);
         let turn_cancelled = Arc::clone(&cancelled);
         let draft_allowance = if payload.scheduled_speculation.is_some() {
             payload.params.mtp_depth as u32
@@ -2467,6 +2673,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 self.inner.abort_paged_turn();
                 self.inner.release_scheduled_recurrent_for(seq_id);
                 self.inner.release_scheduled_speculation(seq_id);
+                self.inner.scheduled_turn_closed(seq_id);
                 self.inner.set_turn_cancel_flag(None);
                 self.owner_states.remove(&failed_owner_id);
                 self.owner_sequences.remove(&failed_owner_id);
@@ -2477,8 +2684,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             }
         }
         .with_block_reservation(reservation_blocks, materialized_blocks, block_size)
-        .with_recurrent_state_reservation(reservation_state_bytes);
+        .with_recurrent_state_reservation(reservation_state_bytes)
+        .with_scheduled_state_reservation(scheduled_state_bytes);
         turn.decode_draft_allowance = draft_allowance;
+        turn.whole_prompt_prefill = whole_prompt_prefill;
         if let Some(restore) = restore {
             self.pending_restores.insert(seq_id, restore);
             if let Err(error) = self.scheduler.try_enqueue_turn(turn) {
@@ -2570,10 +2779,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     turn.payload
                         .profiler
                         .set_prompt_tokens(restored.profiler_prefill_tokens);
-                    turn.pinned_prefill_breaks = prefill_slice_ends(
+                    (turn.pinned_prefill_breaks, turn.whole_prompt_prefill) = prefill_breaks(
+                        &self.inner,
                         turn.num_computed_tokens,
                         turn.prompt_tokens,
-                        self.inner.scheduler_prefill_slice_tokens(),
                         restored.extra_prefill_breaks,
                     );
                     if let Err(error) =
@@ -2612,7 +2821,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             &prompt_tokens,
             self.inner.scheduler_prefill_slice_tokens(),
         ) {
-            Ok(replay) => replay,
+            Ok(replay) => {
+                (turn.pinned_prefill_breaks, turn.whole_prompt_prefill) =
+                    prefill_breaks(&self.inner, 0, turn.prompt_tokens, Vec::new());
+                replay
+            }
             Err(error) => {
                 self.fail_preempted(turn, error);
                 return;
@@ -2677,13 +2890,22 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             } else {
                 turn.block_reservation_total
             };
+            let state_candidate_bytes = self.inner.scheduled_state_candidate_bytes(
+                turn.seq_id,
+                turn.payload.requested_tokens,
+                turn.payload.scheduled_speculation.is_some(),
+            );
             match self.try_reserve_reclaiming_idle(
                 turn.seq_id,
                 charge,
                 turn.recurrent_state_bytes,
+                state_candidate_bytes,
                 snapshot,
             ) {
-                Ok(MemoryReserveOutcome::Admitted) => {}
+                Ok(MemoryReserveOutcome::Admitted) => {
+                    turn.scheduled_state_bytes = state_candidate_bytes
+                        .saturating_add(self.inner.scheduled_state_held_bytes(turn.seq_id));
+                }
                 Ok(MemoryReserveOutcome::Defer) => {
                     self.scheduler.prepend_preempted(turn);
                     return;
@@ -2769,13 +2991,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             .saturating_add(restore.as_ref().map_or(0, B::restore_reserved_blocks));
         turn.num_computed_tokens = prefix.effective_cached_prefix_len() as u32;
         turn.block_materialized_blocks = materialized_blocks;
-        turn.pinned_prefill_breaks = prefill_slice_ends(
-            turn.num_computed_tokens,
-            target,
-            self.inner.scheduler_prefill_slice_tokens(),
-            self.inner
-                .extra_prefill_breaks(target, turn.num_computed_tokens),
-        );
+        let extra_breaks = self
+            .inner
+            .extra_prefill_breaks(target, turn.num_computed_tokens);
+        (turn.pinned_prefill_breaks, turn.whole_prompt_prefill) =
+            prefill_breaks(&self.inner, turn.num_computed_tokens, target, extra_breaks);
         let Some(replay) = turn.payload.preemption_replay.as_mut() else {
             self.fail_preempted(
                 turn,
@@ -2798,6 +3018,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     }
 
     fn finish_completed(&mut self, mut turn: TurnState<ScheduledTurn<B::PrefixState>>) {
+        // Every arm below ends the turn, the error returns included.
+        self.inner.scheduled_turn_closed(turn.seq_id);
         let Some(cancelled) = turn.cancelled.take() else {
             let owner_id = turn.payload.owner_id.clone();
             self.inner.abort_paged_turn();
@@ -3007,7 +3229,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     let is_reset = matches!(chat, ChatCmd::ResetCaches { .. });
                     let mut exclusive = false;
                     if !self.inner.scheduler_cache_available()
-                        || !Self::chat_has_explicit_owner(&chat)
+                        || !(Self::chat_has_explicit_owner(&chat)
+                            || self.ownerless_speculation_is_scheduled(&chat))
                         || self.chat_requires_barrier(&chat)
                     {
                         self.scheduler
@@ -3252,6 +3475,12 @@ mod tests {
         // A degenerate or zero-length range still terminates at the target.
         assert_eq!(prefill_slice_ends(0, 7, 512, []), [7]);
         assert_eq!(prefill_slice_ends(128, 128, 512, [64]), Vec::<u32>::new());
+        // A whole-prompt step: the saturating slice gives the one end.
+        assert_eq!(prefill_slice_ends(0, 6219, u32::MAX, []), [6219]);
+        assert_eq!(
+            prefill_slice_ends(100, 6219, u32::MAX, [3000]),
+            [3000, 6219]
+        );
     }
 
     #[test]
@@ -3745,7 +3974,7 @@ mod tests {
         );
 
         let outcome = state
-            .try_reserve_reclaiming_idle(2, reservation_blocks, rec, snapshot)
+            .try_reserve_reclaiming_idle(2, reservation_blocks, rec, 0, snapshot)
             .expect("reserve after reclaim");
         assert!(
             matches!(outcome, MemoryReserveOutcome::Admitted),
@@ -3784,11 +4013,58 @@ mod tests {
             bytes_per_block: 4096,
         };
         let outcome = state
-            .try_reserve_reclaiming_idle(2, 10, 1, snapshot)
+            .try_reserve_reclaiming_idle(2, 10, 1, 0, snapshot)
             .expect("no snapshot refresh");
         assert!(
             matches!(outcome, MemoryReserveOutcome::Reject { total_blocks: 100 }),
             "idle scheduler must hard-error, not spin in prepared_waiting: {outcome:?}"
+        );
+    }
+
+    /// Off-pool state admission: a candidate above the whole budget errors
+    /// instead of deferring behind rows no reclaim can free enough of, and a
+    /// queued turn's unmaterialized reservation counts like held state.
+    /// MUTATION: compare the candidate with `>=` in `scheduled_state_fit`; the
+    /// exact-budget row below reports `Never` and its assertion fails.
+    /// MUTATION: drop `outstanding_bytes` from the sum; `(20, 21)` reports
+    /// `Fits` and its assertion fails.
+    #[test]
+    fn scheduled_state_fit_orders_fits_reclaim_and_never() {
+        assert_eq!(
+            scheduled_state_fit(None, u64::MAX, u64::MAX),
+            ScheduledStateFit::Fits
+        );
+        let capacity = Some(ScheduledStateCapacity {
+            budget: 100,
+            held: 60,
+        });
+        assert_eq!(
+            scheduled_state_fit(capacity, 0, 40),
+            ScheduledStateFit::Fits
+        );
+        assert_eq!(
+            scheduled_state_fit(capacity, 0, 41),
+            ScheduledStateFit::AfterReclaim
+        );
+        assert_eq!(
+            scheduled_state_fit(capacity, 0, 100),
+            ScheduledStateFit::AfterReclaim
+        );
+        assert_eq!(
+            scheduled_state_fit(capacity, 0, 101),
+            ScheduledStateFit::Never
+        );
+        assert_eq!(
+            scheduled_state_fit(capacity, 20, 20),
+            ScheduledStateFit::Fits
+        );
+        assert_eq!(
+            scheduled_state_fit(capacity, 20, 21),
+            ScheduledStateFit::AfterReclaim
+        );
+        assert_eq!(
+            scheduled_state_fit(capacity, 20, 100),
+            ScheduledStateFit::AfterReclaim
         );
     }
 
@@ -3878,7 +4154,7 @@ mod tests {
             bytes_per_block: 4096,
         };
         let error = state
-            .try_reserve_reclaiming_idle_with(2, 10, 1, snapshot, |_inner, victim| {
+            .try_reserve_reclaiming_idle_with(2, 10, 1, 0, snapshot, |_inner, victim| {
                 assert_eq!(victim, 1);
                 Err(Error::from_reason("injected cache release failure"))
             })
@@ -3912,7 +4188,7 @@ mod tests {
             0,
         ));
         let without_credit = state
-            .try_reserve_reclaiming_idle(2, reservation_blocks, 0, snapshot)
+            .try_reserve_reclaiming_idle(2, reservation_blocks, 0, 0, snapshot)
             .expect("no snapshot refresh");
         assert!(
             matches!(
@@ -3924,7 +4200,7 @@ mod tests {
         let charge = reservation_blocks.saturating_sub(already_materialized);
         assert_eq!(charge, 10);
         let with_credit = state
-            .try_reserve_reclaiming_idle(2, charge, 0, snapshot)
+            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
             .expect("no snapshot refresh");
         assert!(
             matches!(with_credit, MemoryReserveOutcome::Admitted),
@@ -4087,7 +4363,7 @@ mod tests {
             .set_grow_headroom_probe_override(Some(Arc::new(Ok)));
         let charge = snapshot.blocks.free_blocks + 1;
         let outcome = state
-            .try_reserve_reclaiming_idle(2, charge, 0, snapshot)
+            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
             .expect("grow + re-reserve");
         assert!(
             matches!(outcome, MemoryReserveOutcome::Admitted),
@@ -4120,7 +4396,7 @@ mod tests {
         let reservation_blocks = snapshot.blocks.free_blocks;
         let candidate_state_bytes = u64::from(snapshot.blocks.free_blocks) * bytes_per_block + 1;
         let outcome = state
-            .try_reserve_reclaiming_idle(2, reservation_blocks, candidate_state_bytes, snapshot)
+            .try_reserve_reclaiming_idle(2, reservation_blocks, candidate_state_bytes, 0, snapshot)
             .expect("grow + re-reserve");
         assert!(
             matches!(outcome, MemoryReserveOutcome::Admitted),
@@ -4157,7 +4433,7 @@ mod tests {
             })));
         let charge = snapshot.blocks.free_blocks + 1;
         let outcome = state
-            .try_reserve_reclaiming_idle(2, charge, 0, snapshot)
+            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
             .expect("declined grow keeps Reject");
         assert!(
             matches!(outcome, MemoryReserveOutcome::Reject { total_blocks: 4 }),
@@ -4193,7 +4469,7 @@ mod tests {
             })));
         let charge = snapshot.blocks.free_blocks + 1;
         let outcome = state
-            .try_reserve_reclaiming_idle(2, charge, 0, snapshot)
+            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
             .expect("partial grow + re-reserve");
         assert!(
             matches!(outcome, MemoryReserveOutcome::Admitted),
@@ -4223,7 +4499,7 @@ mod tests {
             .expect("paged adapter")
             .set_grow_headroom_probe_override(Some(Arc::new(Ok)));
         let outcome = state
-            .try_reserve_reclaiming_idle(2, 17, 0, snapshot)
+            .try_reserve_reclaiming_idle(2, 17, 0, 0, snapshot)
             .expect("above-max Reject");
         assert!(
             matches!(outcome, MemoryReserveOutcome::Reject { total_blocks: 4 }),
@@ -4553,7 +4829,7 @@ mod tests {
         };
         let mut unpin_calls = 0u32;
         let outcome = state
-            .try_reserve_reclaiming_idle_with(2, 10, 0, snapshot, |_inner, victim| {
+            .try_reserve_reclaiming_idle_with(2, 10, 0, 0, snapshot, |_inner, victim| {
                 unpin_calls += 1;
                 assert!(
                     unpin_calls <= 2,

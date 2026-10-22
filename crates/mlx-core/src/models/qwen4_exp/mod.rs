@@ -5,17 +5,27 @@ mod auxiliary;
 mod config;
 mod decoder;
 mod gguf;
+mod mapped_pack;
 mod math;
 mod media;
 mod memory;
 mod mtp;
 mod packed_cache;
 mod paged;
+mod prefetch;
 mod route_plan;
-mod runtime_flags;
+mod row_fetch;
+mod tripwire;
 mod weights;
 
 const MAX_PREFILL_CHUNK: usize = 1024;
+
+/// MLX's own `MLX_ENABLE_TF32` (default on). The NAX kernels refuse TF32-off
+/// processes in C++; the Rust callers check the same setting first so a
+/// refused window is never entered tentatively.
+fn tf32_enabled() -> bool {
+    std::env::var_os("MLX_ENABLE_TF32").is_none_or(|value| value != "0")
+}
 
 use crate::array::MxArray;
 use crate::engine::backend::{ChatBackend, DecodeStep, ResetScope, SaveStateArgs, TurnSetup};
@@ -46,7 +56,35 @@ struct Inner {
     vision: media::Vision,
     media_prefill: Option<media::Prepared>,
     _pool_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
-    _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
+    /// Scheduled turns admitted and not yet finished; the first to open
+    /// after the set emptied starts a tripwire window, every open adds its
+    /// turn to the one in progress.
+    open_turns: std::collections::HashSet<u32>,
+    /// A whole turn of the exclusive lane is open (its cancel flag is
+    /// installed); it is one window of its own.
+    exclusive_turn: bool,
+}
+
+impl Inner {
+    /// A turn opens. A trip whose mid-turn switch failed moves the process to
+    /// the slot path here, before any pass of the turn; the first turn of a
+    /// window also starts the window's SSD count and slow streak. The prefill
+    /// window follows the plan in force.
+    fn open_turn(&mut self, first: bool) {
+        let applied = if first {
+            self.decoder.weights.begin_turn()
+        } else {
+            self.decoder.weights.apply_fallback()
+        };
+        match applied {
+            Ok(Some(_)) => self.decoder.residency_changed(),
+            Ok(None) => self.decoder.refresh_prefill_window(),
+            Err(error) => {
+                tracing::warn!("qwen4 residency: slot fallback not applied: {error}");
+                self.decoder.refresh_prefill_window();
+            }
+        }
+    }
 }
 struct Step<'a>(&'a mut Inner);
 impl DecodeStep for Step<'_> {
@@ -118,6 +156,21 @@ impl ChatBackend for Inner {
         &mut self,
         args: &mut crate::engine::backend::WholeTurnArgs<'_>,
     ) -> Result<crate::engine::backend::TurnOutput> {
+        // Native MTP runs only on the scheduled lane; an ownerless MTP request
+        // that lands here would otherwise decode AR under `enableMtp: true`.
+        if matches!(
+            args.plan.decoder,
+            crate::engine::plan::DecoderPlan::Speculative(_)
+        ) && args.params.cache_owner_id.is_empty()
+        {
+            return Err(Error::from_reason(
+                if crate::engine::hybrid_scheduler::HybridSchedulerState::<Self>::force_serial() {
+                    "qwen4_exp runs enableMtp only on its shared scheduler, which MLX_SERVE_FORCE_SERIAL turns off; set enableMtp: false or unset MLX_SERVE_FORCE_SERIAL"
+                } else {
+                    "qwen4_exp runs enableMtp only on its shared scheduler, and this ownerless request was routed to the exclusive lane; set enableMtp: false"
+                },
+            ));
+        }
         crate::engine::paged_turn::run_paged_turn(self, args)
     }
     fn run_multimodal_turn(
@@ -176,7 +229,7 @@ impl ChatBackend for Inner {
         let mut config = config.clone();
         crate::engine::params::apply_generation_defaults(&mut config, &self.defaults);
         let mut params = crate::engine::params::extract_chat_params(&config);
-        params.mtp_depth = params.mtp_depth.min(3);
+        params.mtp_depth = config.mtp_depth.map_or(2, |_| params.mtp_depth.min(3));
         // The shared measured verification policy models greedy acceptance.
         // Stochastic requests retain fixed-depth, distribution-correct MTP.
         if !crate::sampling::is_greedy_temperature(
@@ -241,7 +294,26 @@ impl ChatBackend for Inner {
     fn eval_caches(&self) -> Result<()> {
         Ok(())
     }
+    /// Mapped experts are file-backed: a wired limit does not pin them and
+    /// only delays their unwiring after the turn (3.2 s vs 1.2 s measured).
+    fn wired_limit_bytes(&self) -> Option<usize> {
+        if self.decoder.weights.plan.mapped {
+            None
+        } else {
+            Some(usize::MAX)
+        }
+    }
+    /// The exclusive lane installs its flag once per whole turn and clears
+    /// it after; the scheduler installs one per admission and prefill slice
+    /// of turns it has already opened (`scheduled_turn_opened`), so those
+    /// never start a window here.
     fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
+        if flag.is_none() {
+            self.exclusive_turn = false;
+        } else if self.open_turns.is_empty() && !self.exclusive_turn {
+            self.exclusive_turn = true;
+            self.open_turn(true);
+        }
         self.decoder.cancelled = flag;
     }
     fn prefill(&mut self, tokens: &[u32], stream: Stream) -> Result<MxArray> {
@@ -253,18 +325,7 @@ impl ChatBackend for Inner {
             ));
         }
         let _context = StreamContext::new(stream);
-        let mut logits = None;
-        let chunk_size = self.decoder.prefill_slice_size();
-        for (i, chunk) in tokens.chunks(chunk_size).enumerate() {
-            logits = Some(self.decoder.prefill_chunk(
-                chunk,
-                None,
-                (i + 1) * chunk_size >= tokens.len(),
-            )?);
-        }
-        logits
-            .ok_or_else(|| Error::from_reason("Empty qwen4_exp prefill"))?
-            .squeeze(Some(&[1]))
+        self.decoder.prefill_prompt(tokens)?.squeeze(Some(&[1]))
     }
     type Decode<'a>
         = Step<'a>
@@ -281,23 +342,63 @@ pub struct Qwen4ExpLoadOptions {
     pub auxiliary_model_path: Option<String>,
 }
 
-/// Load-time residency decision; full residency is admitted before payload reads.
+/// Load-time residency decision (the budget is admitted before payload
+/// reads) plus the live pinned-bank total.
 #[napi(object)]
 pub struct Qwen4ExpResidencyInfo {
-    pub policy: String,
     pub weight_budget_bytes: f64,
     pub hot_weight_bytes: f64,
-    pub full_hot_residency: bool,
     pub prefill_chunk_tokens: u32,
     /// Free plus reclaimable file-backed memory observed at bootstrap.
     pub available_memory_bytes: Option<f64>,
     pub physical_memory_bytes: Option<f64>,
-    /// Assembled matrices actually pinned, including partial projection banks.
+    /// Assembled matrices actually pinned right now: partial projection banks
+    /// and the MTP expert banks built at load.
     pub resident_bank_bytes: f64,
-    /// Complete routed layers whose expert IDs stay on the GPU.
-    pub resident_expert_layers: u32,
-    /// Shared slot capacity for the remaining partial layers at bootstrap.
+    /// Shared slot capacity for the routed layers at bootstrap (the expert
+    /// count in mapped mode).
     pub partial_expert_slots: u32,
+    /// Routed expert tensors the slot path reads by range from the mapped
+    /// pack; 0 means every expert read is imported from the checkpoint.
+    pub mapped_pack_files: u32,
+    /// Every routed expert is addressed in place through the mapped pack;
+    /// the weight budget then covers dense banks and rows only.
+    pub mapped: bool,
+    /// Pack bytes backing live arrays in mapped mode (clean page cache the
+    /// Metal driver wires while a command buffer binds them).
+    pub mapped_bytes: f64,
+    /// Bytes of mapped banks the host could hold beside what stays anonymous
+    /// when the residency was chosen: physical RAM minus a margin, the live
+    /// non-reclaimable memory below and the anonymous need. The pack maps
+    /// when this covers every bank.
+    pub mapped_bank_budget_bytes: f64,
+    /// Wired, compressed and other processes' anonymous memory when the
+    /// residency was chosen.
+    pub live_non_reclaimable_bytes: f64,
+    /// Why the slot path serves the experts although the pack exists: the
+    /// load gate, or a mapped turn that read over twice the pack from SSD or
+    /// ran eight consecutive passes over ten times their median (over the
+    /// fastest larger pass while they have no median of their own).
+    pub fallback_reason: Option<String>,
+    pub fallback_read_bytes: Option<f64>,
+    pub fallback_slow_steps: Option<u32>,
+    /// Tokens the request held when it left the mapped path between two of
+    /// its passes; absent for the load gate.
+    pub fallback_token_index: Option<u32>,
+    /// Token/PLE rows asked of the decoded-row LRU since load, and the ones
+    /// it had to import.
+    pub decoded_row_lookups: f64,
+    pub decoded_row_misses: f64,
+    /// Share of decoded-row lookups served without an import.
+    pub decoded_row_hit_rate: f64,
+    /// Imported rows whose bytes a reader thread had ready, and those the
+    /// model thread read or waited for after requesting them.
+    pub prefetched_rows: f64,
+    pub late_rows: f64,
+    /// Decoded rows the LRU bound evicted since load, and the bytes those
+    /// evictions released (a window's shared buffer goes with its last row).
+    pub decoded_row_evictions: f64,
+    pub decoded_row_evicted_bytes: f64,
 }
 
 #[napi(object)]
@@ -318,7 +419,8 @@ pub struct Qwen4ExpModel {
     has_mtp: bool,
     paged_capacity: u32,
     residency: memory::Plan,
-    prefill_chunk_size: usize,
+    live: Arc<tripwire::Live>,
+    lookup: Arc<weights::LookupStats>,
     supports_images: bool,
 }
 #[napi]
@@ -373,18 +475,18 @@ impl Qwen4ExpModel {
                     * u64::from(paged_capacity);
                 decoder.paged = Some(adapter);
                 let pool_guard = Some(crate::cache_limit::coordinator().register_pool(pool_bytes));
-                let mut cache_limit_guard =
-                    crate::cache_limit::coordinator().register(decoder.weights.cache_budget());
+                decoder.register_cache_limit();
+                decoder.weights.prepare_mapped_pack()?;
+                decoder.weights.select_mapped_residency(pool_bytes)?;
                 decoder.weights.prepare_hot()?;
+                decoder.weights.finish_load();
+                decoder.weights.publish_live();
                 // Register the final reconciled budget, rather than retaining
                 // the pre-pool estimate in the process-wide allocator policy.
-                drop(cache_limit_guard);
-                cache_limit_guard =
-                    crate::cache_limit::coordinator().register(decoder.weights.cache_budget());
-                decoder.prefill_chunk_size =
-                    memory::prefill_window(&config, &decoder.weights.plan)?;
-                let prefill_chunk_size = decoder.prefill_chunk_size;
+                decoder.residency_changed();
                 let residency = decoder.weights.plan.clone();
+                let live = Arc::clone(&decoder.weights.live);
+                let lookup = Arc::clone(&decoder.weights.lookup);
                 let assets = assets.to_string_lossy().into_owned();
                 let inner = Inner {
                     decoder,
@@ -398,7 +500,8 @@ impl Qwen4ExpModel {
                     vision,
                     media_prefill: None,
                     _pool_guard: pool_guard,
-                    _cache_limit_guard: cache_limit_guard,
+                    open_turns: std::collections::HashSet::new(),
+                    exclusive_turn: false,
                 };
                 Ok((
                     crate::engine::hybrid_scheduler::HybridSchedulerState::new(inner)?,
@@ -408,7 +511,8 @@ impl Qwen4ExpModel {
                         has_mtp,
                         paged_capacity,
                         residency,
-                        prefill_chunk_size,
+                        live,
+                        lookup,
                         supports_images,
                     ),
                 ))
@@ -421,7 +525,8 @@ impl Qwen4ExpModel {
             has_mtp,
             paged_capacity,
             residency,
-            prefill_chunk_size,
+            live,
+            lookup,
             supports_images,
         ) = match ready.await {
             Ok(Ok(init)) => init,
@@ -453,7 +558,8 @@ impl Qwen4ExpModel {
             has_mtp,
             paged_capacity,
             residency,
-            prefill_chunk_size,
+            live,
+            lookup,
             supports_images,
         })
     }
@@ -481,17 +587,46 @@ impl Qwen4ExpModel {
     }
     #[napi]
     pub fn residency_info(&self) -> Qwen4ExpResidencyInfo {
+        use std::sync::atomic::Ordering;
+        let (lookups, misses) = (self.lookup.lookups(), self.lookup.misses());
+        let live = &self.live;
+        let fallback = live.fallback();
         Qwen4ExpResidencyInfo {
-            policy: self.residency.policy.clone(),
-            weight_budget_bytes: self.residency.budget as f64,
+            weight_budget_bytes: live.weight_budget.load(Ordering::Acquire) as f64,
             hot_weight_bytes: self.residency.hot_bytes as f64,
-            full_hot_residency: self.residency.resident,
-            prefill_chunk_tokens: self.prefill_chunk_size as u32,
+            prefill_chunk_tokens: live.prefill_chunk_tokens.load(Ordering::Acquire) as u32,
             available_memory_bytes: self.residency.available_bytes.map(|n| n as f64),
             physical_memory_bytes: self.residency.physical_bytes.map(|n| n as f64),
-            resident_bank_bytes: self.residency.resident_bank_bytes as f64,
-            resident_expert_layers: self.residency.resident_expert_layers as u32,
-            partial_expert_slots: self.residency.partial_expert_slots as u32,
+            resident_bank_bytes: self
+                .residency
+                .resident_bank_bytes
+                .load(std::sync::atomic::Ordering::Relaxed) as f64,
+            partial_expert_slots: live.partial_expert_slots.load(Ordering::Acquire) as u32,
+            mapped_pack_files: self.residency.mapped_pack_files as u32,
+            mapped: live.mapped.load(Ordering::Acquire),
+            mapped_bytes: live.mapped_bytes.load(Ordering::Acquire) as f64,
+            mapped_bank_budget_bytes: live.mapped_bank_budget.load(Ordering::Acquire) as f64,
+            live_non_reclaimable_bytes: live.live_non_reclaimable.load(Ordering::Acquire) as f64,
+            fallback_reason: fallback.as_ref().map(ToString::to_string),
+            fallback_read_bytes: fallback
+                .as_ref()
+                .and_then(tripwire::Fallback::read_bytes)
+                .map(|n| n as f64),
+            fallback_slow_steps: fallback.as_ref().and_then(tripwire::Fallback::slow_steps),
+            fallback_token_index: Some(live.fallback_token_index.load(Ordering::Acquire))
+                .filter(|&index| index != tripwire::NO_TOKEN_INDEX)
+                .map(|index| u32::try_from(index).unwrap_or(u32::MAX)),
+            decoded_row_lookups: lookups as f64,
+            decoded_row_misses: misses as f64,
+            decoded_row_hit_rate: if lookups == 0 {
+                0.0
+            } else {
+                1.0 - misses as f64 / lookups as f64
+            },
+            prefetched_rows: self.lookup.prefetched() as f64,
+            late_rows: self.lookup.late() as f64,
+            decoded_row_evictions: self.lookup.evicted_rows() as f64,
+            decoded_row_evicted_bytes: self.lookup.evicted_row_bytes() as f64,
         }
     }
     #[napi]

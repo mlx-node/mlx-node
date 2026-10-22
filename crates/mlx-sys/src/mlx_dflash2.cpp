@@ -47,11 +47,8 @@ bool selector_pipeline_supported(const array& output, int required_threads) {
   auto& device = mlx::core::metal::device(custom->stream().device);
   // CustomKernel::eval_gpu's library key; any other key compiles the source
   // a second time.
-  std::ostringstream library_name;
-  library_name << name << '_' << std::hex << std::hash<std::string>{}(source)
-               << std::dec << '_' << std::get<10>(state);
   auto* library = device.get_library(
-      library_name.str(), mlx::core::CompileOptions(std::get<10>(state)),
+      custom->library_name(), mlx::core::CompileOptions(std::get<10>(state)),
       [&source] { return mlx::core::metal::utils() + source; });
   auto* pipeline = device.get_kernel(name, library);
   const bool supported = pipeline->threadExecutionWidth() == kSimdWidth &&

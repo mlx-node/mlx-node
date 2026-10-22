@@ -10,6 +10,7 @@ pub mod padding;
 mod comparison;
 mod creation;
 mod data;
+pub mod mapped;
 pub mod memory;
 mod ops;
 mod random;
@@ -20,6 +21,7 @@ mod shape;
 pub use attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 pub use banded_attention::banded_attention;
 pub(crate) use handle::{MxHandle, check_handle};
+pub use mapped::{Mmap, mapped_array_bytes, page_size};
 pub use padding::{PaddedSequences, pad_float_sequences, pad_sequences};
 
 // Re-exports from memory submodule (used across the crate)

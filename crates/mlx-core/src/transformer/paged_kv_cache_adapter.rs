@@ -3787,6 +3787,63 @@ impl PagedKVCacheAdapter {
         values: &MxArray,
         first_logical_position: u32,
     ) -> Result<(), String> {
+        let Some(num_tokens) = self.native_write_tokens(layer_idx, keys, values)? else {
+            return Ok(());
+        };
+        let current = self.request_tokens.len() as u32;
+        let expected_first = current.checked_sub(num_tokens).ok_or_else(|| {
+            format!(
+                "update_keys_values_native: chunk has {num_tokens} tokens but only {current} \
+                 have been recorded (call record_tokens first)"
+            )
+        })?;
+        if first_logical_position != expected_first {
+            return Err(format!(
+                "update_keys_values_native: first_logical_position {first_logical_position} \
+                 does not align with the recorded suffix (expected {expected_first} based on \
+                 current_token_count {current} and chunk size {num_tokens}). The chunk must \
+                 cover the most recently recorded tokens."
+            ));
+        }
+        self.native_write(layer_idx, keys, values, first_logical_position, num_tokens)
+    }
+
+    /// [`Self::update_keys_values_native`] for a chunk anywhere inside the
+    /// tokens recorded at or after `floor`: a layer-major prefill records
+    /// every window of a prompt before any layer runs and writes window `w`
+    /// of layer `L` at its own base. `floor` is the token count recorded
+    /// before that prompt, so no write can reach the committed prefix.
+    #[cfg(target_os = "macos")]
+    pub fn update_keys_values_native_recorded(
+        &mut self,
+        layer_idx: u32,
+        keys: &MxArray,
+        values: &MxArray,
+        first_logical_position: u32,
+        floor: u32,
+    ) -> Result<(), String> {
+        let Some(num_tokens) = self.native_write_tokens(layer_idx, keys, values)? else {
+            return Ok(());
+        };
+        let current = self.request_tokens.len() as u32;
+        let end = first_logical_position.checked_add(num_tokens);
+        if first_logical_position < floor || end.is_none_or(|end| end > current) {
+            return Err(format!(
+                "update_keys_values_native_recorded: chunk {first_logical_position}..+{num_tokens} \
+                 lies outside the recorded range {floor}..{current}"
+            ));
+        }
+        self.native_write(layer_idx, keys, values, first_logical_position, num_tokens)
+    }
+
+    /// The token count of a native K/V write, `None` for an empty chunk.
+    #[cfg(target_os = "macos")]
+    fn native_write_tokens(
+        &self,
+        layer_idx: u32,
+        keys: &MxArray,
+        values: &MxArray,
+    ) -> Result<Option<u32>, String> {
         if self.block_table.is_none() {
             return Err(
                 "update_keys_values_native called before reset_for_new_request \
@@ -3806,27 +3863,18 @@ impl PagedKVCacheAdapter {
         let keys_meta = KvTensorMeta::from_array(keys, "keys")?;
         let values_meta = KvTensorMeta::from_array(values, "values")?;
         let info = validate_kv_input(&keys_meta, &values_meta, self.layer_kv_pool.config())?;
-        let num_tokens = info.num_tokens;
-        if num_tokens == 0 {
-            return Ok(());
-        }
+        Ok((info.num_tokens > 0).then_some(info.num_tokens))
+    }
 
-        let current = self.request_tokens.len() as u32;
-        let expected_first = current.checked_sub(num_tokens).ok_or_else(|| {
-            format!(
-                "update_keys_values_native: chunk has {num_tokens} tokens but only {current} \
-                 have been recorded (call record_tokens first)"
-            )
-        })?;
-        if first_logical_position != expected_first {
-            return Err(format!(
-                "update_keys_values_native: first_logical_position {first_logical_position} \
-                 does not align with the recorded suffix (expected {expected_first} based on \
-                 current_token_count {current} and chunk size {num_tokens}). The chunk must \
-                 cover the most recently recorded tokens."
-            ));
-        }
-
+    #[cfg(target_os = "macos")]
+    fn native_write(
+        &mut self,
+        layer_idx: u32,
+        keys: &MxArray,
+        values: &MxArray,
+        first_logical_position: u32,
+        num_tokens: u32,
+    ) -> Result<(), String> {
         let trace_enabled = inference_trace_enabled();
         let inference_debug_enabled =
             tracing::enabled!(target: "mlx_core::inference", tracing::Level::DEBUG);
@@ -4122,6 +4170,21 @@ impl PagedKVCacheAdapter {
         _first_logical_position: u32,
     ) -> Result<(), String> {
         Err("update_keys_values_native is only supported on macOS (Metal backend)".to_string())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn update_keys_values_native_recorded(
+        &mut self,
+        _layer_idx: u32,
+        _keys: &MxArray,
+        _values: &MxArray,
+        _first_logical_position: u32,
+        _floor: u32,
+    ) -> Result<(), String> {
+        Err(
+            "update_keys_values_native_recorded is only supported on macOS (Metal backend)"
+                .to_string(),
+        )
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -15346,6 +15409,85 @@ mod tests {
             }
         }
         assert_eq!(adapter.current_token_count(), TOKENS as u32);
+    }
+
+    /// The strict entry takes only the most recently recorded suffix; the
+    /// recorded entry takes any chunk inside `floor..recorded`, never below
+    /// the floor or past the recorded tokens (a layer-major prefill records
+    /// every window first and writes each at its own base).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recorded_write_entry_takes_inner_chunks_above_the_floor() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            4,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(e) => {
+                eprintln!("skipping recorded_write_entry_takes_inner_chunks_above_the_floor: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
+        adapter.reset_for_new_request(11).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let rows = |seed: f32| {
+            let bits: Vec<u16> = (0..4 * 64)
+                .map(|i| f16::from_f32(seed + (i / 64) as f32).to_bits())
+                .collect();
+            MxArray::from_float16(&bits, &[4, 1, 64]).expect("rows")
+        };
+        let (k, v) = (rows(1.), rows(11.));
+        match adapter.update_keys_values_native_recorded(0, &k, &v, 0, 0) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping recorded_write_entry_takes_inner_chunks_above_the_floor: {e}");
+                return;
+            }
+            Err(e) => panic!("the first window of a recorded prompt: {e}"),
+        }
+        let strict = adapter.update_keys_values_native(0, &k, &v, 0).unwrap_err();
+        assert!(
+            strict.contains("most recently recorded"),
+            "the strict entry refuses a chunk below the suffix: {strict}"
+        );
+        adapter.update_keys_values_native(0, &k, &v, 4).unwrap();
+        adapter
+            .update_keys_values_native_recorded(1, &k, &v, 4, 0)
+            .unwrap();
+        let below = adapter
+            .update_keys_values_native_recorded(1, &k, &v, 2, 4)
+            .unwrap_err();
+        assert!(
+            below.contains("outside the recorded range 4..8"),
+            "a chunk below the floor reaches the committed prefix: {below}"
+        );
+        let past = adapter
+            .update_keys_values_native_recorded(1, &k, &v, 6, 0)
+            .unwrap_err();
+        assert!(
+            past.contains("outside the recorded range 0..8"),
+            "a chunk past the recorded tokens: {past}"
+        );
+        adapter.eval_pending_pool_writes().unwrap();
+        adapter
+            .update_keys_values_native_recorded(1, &k, &v, 0, 0)
+            .unwrap();
+        adapter.eval_pending_pool_writes().unwrap();
     }
 
     #[cfg(target_os = "macos")]

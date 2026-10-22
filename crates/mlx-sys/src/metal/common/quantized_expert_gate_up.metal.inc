@@ -45,52 +45,34 @@ if(live) {
 }
 // Dead row ownership does not change across K tiles. Initialize once;
 // the first loop barrier publishes these zeros before any cooperative load.
-if constexpr(HOIST_ZERO) {
-  if(!live) {
-    STEEL_PRAGMA_UNROLL
-    for(int v=0;v<2;++v) ((threadgroup uint4*)(As+ar*PAD+ac))[v]=uint4(0);
-  }
+if(!live) {
+  STEEL_PRAGMA_UNROLL
+  for(int v=0;v<2;++v) ((threadgroup uint4*)(As+ar*PAD+ac))[v]=uint4(0);
 }
 uint wr32=tid/2,wk32=(tid%2)*32;
 PackedGroup32<BITS> pg,pu;
 float gs,gb,us,ub;
 KQScales<float,BITS,8,true,KQ_LINEAR,0> gscale(sgs,bg, (wr+wr32)*(K/32)+wk32/32);
 KQScales<float,BITS,8,true,KQ_LINEAR,0> uscale(sus,bu, (wr+wr32)*(K/32)+wk32/32);
-if constexpr(PREFETCH) {
- gscale.at(0,gs,gb);uscale.at(0,us,ub);
- pg.prefetch(gp+wr32*(K*BP/VP)+wk32*BP/VP,gs,gb);
- pu.prefetch(up+wr32*(K*BP/VP)+wk32*BP/VP,us,ub);
-}
+gscale.at(0,gs,gb);uscale.at(0,us,ub);
+pg.prefetch(gp+wr32*(K*BP/VP)+wk32*BP/VP,gs,gb);
+pu.prefetch(up+wr32*(K*BP/VP)+wk32*BP/VP,us,ub);
 for(int base=0;base<K;base+=BK) {
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if constexpr(PREFETCH) {
-    pg.store(Gs+wr32*PAD+wk32);pu.store(Us+wr32*PAD+wk32);
-  } else {
-  using Loader=QuantizedBlockLoader<T,BN,BK,PAD,true,128,32,BITS,8,true,KQ_LINEAR,0>;
-  Loader gl(gp+base*BP/VP,KQScales<float,BITS,8,true,KQ_LINEAR,0>(sgs,bg,wr*(K/32)+base/32),K,Gs,sg,lane);
-  Loader ul(up+base*BP/VP,KQScales<float,BITS,8,true,KQ_LINEAR,0>(sus,bu,wr*(K/32)+base/32),K,Us,sg,lane);
-  gl.load_unsafe(); ul.load_unsafe();
-  }
-  if constexpr(HOIST_ZERO) {
-    if(live) {
-      STEEL_PRAGMA_UNROLL
-      for(int v=0;v<2;++v) ((threadgroup uint4*)(As+ar*PAD+ac))[v]=av[v];
-    }
-  } else {
+  pg.store(Gs+wr32*PAD+wk32);pu.store(Us+wr32*PAD+wk32);
+  if(live) {
     STEEL_PRAGMA_UNROLL
-    for(int v=0;v<2;++v) ((threadgroup uint4*)(As+ar*PAD+ac))[v]=live?av[v]:uint4(0);
+    for(int v=0;v<2;++v) ((threadgroup uint4*)(As+ar*PAD+ac))[v]=av[v];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if(live && base+BK<K) {
     auto src=(const device uint4*)(x+size_t(token)*K+base+BK+ac);
     av[0]=src[0]; av[1]=src[1];
   }
-  if constexpr(PREFETCH) {
-    if(base+BK<K) {
-      gscale.at((base+BK)/32,gs,gb);uscale.at((base+BK)/32,us,ub);
-      pg.prefetch(gp+wr32*(K*BP/VP)+(base+BK+wk32)*BP/VP,gs,gb);
-      pu.prefetch(up+wr32*(K*BP/VP)+(base+BK+wk32)*BP/VP,us,ub);
-    }
+  if(base+BK<K) {
+    gscale.at((base+BK)/32,gs,gb);uscale.at((base+BK)/32,us,ub);
+    pg.prefetch(gp+wr32*(K*BP/VP)+(base+BK+wk32)*BP/VP,gs,gb);
+    pu.prefetch(up+wr32*(K*BP/VP)+(base+BK+wk32)*BP/VP,us,ub);
   }
   if(valid>0) {
     STEEL_PRAGMA_UNROLL

@@ -5,6 +5,13 @@ Research: 15–17 September 2026. Starting revision:
 initial performance record, mlx.fast investigation, prefill port log, and
 macOS 27 recheck. The [runtime guide](../qwen38-flash-next.md) covers usage.
 
+> **Log only.** Every `MLX_QWEN4_*` switch this report names was deleted on
+> 20 October 2026 (one code path remains per site; the measured winners are
+> now unconditional, the losers and their kernels are gone). No Qwen4-specific
+> environment variable remains; the shared ones are listed in
+> [perf.md](../perf.md). Sections below describe experiments as they were run
+> and are not current controls.
+
 ## Reviewer follow-up, 17 September
 
 The read-only GGUF asset-directory finding was reproduced through the packaged
@@ -476,32 +483,19 @@ GEMM**, which can change arithmetic and continuation. They remain off by
 default. Native exactness tests for the new load/routing ports do not erase
 those separately documented numerical differences.
 
-### Measured configuration
+### Measured configuration (17 September 2026, historical)
 
-Use these settings before starting the process. Other Qwen4 controls retain
-their documented defaults; the measured mixer down/injection fusion is disabled.
-The supplied GGUF codes, system reserves and admission rules are unchanged.
+The run used these settings; every `MLX_QWEN4_*` variable below was deleted on
+20 October 2026 and is no longer read. Other Qwen4 controls kept their
+then-documented defaults; the measured mixer down/injection fusion was
+disabled. The supplied GGUF codes, system reserves and admission rules were
+unchanged.
 
 ```sh
 export MLX_METAL_HASH_KERNEL_CACHE=1
-export MLX_QWEN4_ATTENTION_NORM_ROTARY=1
-export MLX_QWEN4_DECODE_ASYNC_PLE=1
 export MLX_QWEN4_EXPERT_LANE_STAGING=1
-export MLX_QWEN4_FUSED_ROTARY=1
-export MLX_QWEN4_GDN_GATE_INPUTS=1
-export MLX_QWEN4_GDN_GATE_PAIR=1
 export MLX_QWEN4_GDN_VECTOR_ROWS=1
-export MLX_QWEN4_INJECT_NEXT_NORM=1
-export MLX_QWEN4_MIXER_DOWN_INJECT=0
-export MLX_QWEN4_MIXER_INJECT=1
-export MLX_QWEN4_MIXER_LANE_PRODUCTS=1
-export MLX_QWEN4_PREFILL_PLE_GEMM=1
-export MLX_QWEN4_PREFILL_REFERENCE_BF16=1
-export MLX_QWEN4_PREFILL_SHARED_COMBINE=1
 export MLX_QWEN4_REFERENCE_DOWN_SCHEDULE=1
-export MLX_QWEN4_ROTARY_TABLES=1
-export MLX_QWEN4_ROUTER_ROW_SCHEDULE=1
-export MLX_QWEN4_ROUTE_REGISTER_RESULTS=1
 export MLX_QWEN4_WEIGHT_CACHE_GIB=63
 ```
 
@@ -611,27 +605,42 @@ preserving lane ownership, K traversal, accumulation and output rounding.
 Shared-expert fusions preserve the individual routed/shared products and their
 final addition. Compiled graph wrappers receive every changing array explicitly.
 
-### Defaults and optional controls
+### Defaults and optional controls (historical)
 
-Eligible exact ports through reference-v9 are enabled, together with smaller
-headers, `MLX_QWEN4_CACHE_FLAGS`, `MLX_QWEN4_DEFER_FINAL_COMPLETION`, and split
-Metal residency sets. Runtime switches accept `0` for their control path.
-Shape, dtype, hardware and transaction eligibility still select fallbacks.
+Through 19 October 2026 the eligible exact ports through reference-v9 were
+enabled behind default-on runtime switches (`MLX_QWEN4_CACHE_FLAGS`,
+`MLX_QWEN4_DEFER_FINAL_COMPLETION`, the `MLX_QWEN4_PREFILL_*` family and the
+decode fusions), each accepting `0` for its control path. On 20 October 2026
+every one of those switches was removed: the enabled path is the only path,
+and shape, dtype, hardware and transaction eligibility alone select the
+fallbacks. The opt-in arms that had measured within noise or as losers
+(`MLX_QWEN4_EXPERT_LANE_STAGING`, `MLX_QWEN4_GDN_VECTOR_ROWS`,
+`MLX_QWEN4_REFERENCE_DOWN_SCHEDULE`, `MLX_QWEN4_GDN_DECODE_PREFETCH`,
+`MLX_QWEN4_PREFILL_REFERENCE_INDIRECT`) were deleted with their kernel
+variants, as were the trace and check probes. The residency selectors went
+too (`MLX_QWEN4_RESIDENCY`, `MLX_QWEN4_WEIGHT_CACHE_GIB`,
+`MLX_QWEN4_MAPPED_PACK`): the load maps the expert pack when live memory holds
+it and falls back to the slot path otherwise. The per-expert chunk cache and
+its `MLX_QWEN4_PACKED_CACHE_DIR` / `MLX_QWEN4_PACKED_CACHE_MAX_GB` controls were
+removed; the mapped pack is the only prepared format. Leftover chunk
+directories named `.mlx-qwen4-packed-v2-<64 lowercase hex>` are removed
+automatically once idle for one hour and unlocked; any other name under that
+prefix is kept. A v3 mapped pack (`.mlx-qwen4-mapped-v3-*`) is removed only on
+proof (changed fingerprint, or a file deleted from a mounted volume); an
+unplugged source keeps it, and the fingerprint no longer includes the device
+number.
 
-Default prefill controls include `MLX_QWEN4_PREFILL_MIXER_BM32`,
-`MLX_QWEN4_PREFILL_HC_MIX`, `MLX_QWEN4_PREFILL_GDN_NORM`,
-`MLX_QWEN4_PREFILL_Q8_PREFETCH`, `MLX_QWEN4_PREFILL_SHARED_PAIR`,
-`MLX_QWEN4_PREFILL_ROUTER`, `MLX_QWEN4_PREFILL_PLE_CONV`,
-`MLX_QWEN4_PREFILL_PACKED_EXPERTS`, `MLX_QWEN4_PREFILL_REFERENCE_INDIRECT`,
-`MLX_QWEN4_PREFILL_DEVICE_ROUTES`, `MLX_QWEN4_PREFILL_NORM`,
-`MLX_QWEN4_PREFILL_ASYNC_WINDOW`, and `MLX_QWEN4_PREFILL_SHARED_Q8`.
-
-`MLX_QWEN4_PREFILL_REFERENCE_BF16=1` and `MLX_QWEN4_PREFILL_PLE_GEMM=1`
-are **arithmetic experiments, off by default**. Historical results exceeding
-90% prefill used both. Rotary reuse/fusion, next-layer injection/norm, deferred
-PLE (`MLX_QWEN4_DECODE_ASYNC_PLE`), mixer injection, shared combine, reference
-down scheduling, attention normalization/rotary and direct/paired GDN gates
-remain optional. Their existence is not evidence of a repeatable speedup.
+The opt-in exact fusions measured on 2026-10-20 (teacher-forced logits on the
+6k and 16k prompts in one process, mapped residency, 256 positions) were
+bit-identical but moved steady decode by less than the run's own 5.8% drift,
+and `MLX_QWEN4_PREFILL_REFERENCE_BF16` / `MLX_QWEN4_PREFILL_PLE_GEMM` changed
+the argmax at 2-4 of 256 positions; all of them were removed with their
+kernels: attention norm+rotary, rotary tables, fused rotary window, paired and
+BF16 GDN gates, mixer down/injection and split-K, mixer injection and its
+two-column and lane-product variants, combined routes + shared gate, direct
+attention gate, router row schedule, prefill shared combine, BF16 prefill GDN
+values, deferred prefill MLP, synchronous projections. The PLE history copy is
+always lazy (the former `MLX_QWEN4_DECODE_ASYNC_PLE` is the only behaviour).
 
 ### Bounded residency on macOS 27
 

@@ -1,11 +1,11 @@
 {
   "repo": "mlx-node/mlx-node",
-  "mlx_commit": "bcad393045a29b3c7aaaf7a03de76b33737cb154",
-  "release_tag": "mlx-prebuilt-bcad393045a2-6d601cad",
+  "mlx_commit": "e68b9ba778fcc97565013585c36c5bb9f66cf8bf",
+  "release_tag": "mlx-prebuilt-e68b9ba778fc-6d601cad",
   "assets": {
     "aarch64-apple-darwin": {
       "file": "mlx-aarch64-apple-darwin.tar.gz",
-      "sha256": "cb993bf87acce62b188e56f5475074c8cdee6ae73746104f17c7eb46fdf10ab3"
+      "sha256": "19b09bfdf3e2cc1acedab7344e4d3d9e80c75a073058223a351ba3600bf350d0"
     }
   }
 }

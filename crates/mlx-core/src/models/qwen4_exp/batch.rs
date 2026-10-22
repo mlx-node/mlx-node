@@ -1,8 +1,33 @@
 //! Matrix batching for prompt windows and scheduled decode rows. Stateful
 //! attention/PLE preserve each owner's order; stateless HC/MLP share weights.
+use super::super::math::ExpertKernel;
+use super::super::weights::Weight;
 use super::*;
-use crate::models::qwen4_exp::runtime_flags;
 use std::collections::BTreeMap;
+
+type Banks = [std::sync::Arc<Weight>; 3];
+
+struct LayerSlots<'a> {
+    decoder: &'a mut Decoder,
+    layer: usize,
+}
+
+impl GroupBanks for LayerSlots<'_> {
+    fn lease(&mut self, experts: &[u32]) -> Result<Option<(Banks, Vec<u32>, usize)>> {
+        self.decoder.check_cancelled()?;
+        let (count, top) = (
+            self.decoder.config.num_experts,
+            self.decoder.config.num_experts_per_tok,
+        );
+        self.decoder
+            .weights
+            .expert_slots(self.layer, count, top, experts)
+    }
+
+    fn release(&mut self, output: &MxArray) -> Result<()> {
+        self.decoder.weights.finish_expert_slots(self.layer, output)
+    }
+}
 
 impl Decoder {
     pub(super) fn resident_experts(
@@ -12,7 +37,7 @@ impl Decoder {
         scores: &MxArray,
         i: usize,
     ) -> Result<Option<MxArray>> {
-        if !self.gguf() || runtime_flags::is_zero(c"MLX_QWEN4_RESIDENT_GATHER") {
+        if !self.gguf() {
             return Ok(None);
         }
         let banks = ["gate", "up", "down"].map(|part| {
@@ -40,20 +65,13 @@ impl Decoder {
             .broadcast_to(&[tokens, top as i64])?
             .reshape(&[-1])?;
         let source = x.reshape(&[tokens, h as i64])?;
-        if let Some((output, inverse)) = Self::indirect_expert_assignment_rows(
+        let ids = selected.reshape(&[-1])?;
+        let kernel = ExpertKernel::for_window(ids.size()? as usize, self.config.num_experts);
+        let (output, inverse) = Self::window_expert_rows(
+            kernel,
             &source,
             &token_rows,
-            &selected.reshape(&[-1])?,
-            &banks,
-            self.config.num_experts,
-            self.config.num_experts,
-        )? {
-            return math::combine_expert_rows(&output, scores, Some(&inverse), top).map(Some);
-        }
-        let input = source.take(&token_rows, 0)?;
-        let (output, inverse) = Self::sorted_expert_assignment_rows(
-            &input,
-            &selected.reshape(&[-1])?,
+            &ids,
             &banks,
             self.config.num_experts,
         )?;
@@ -64,33 +82,51 @@ impl Decoder {
     pub(in super::super) fn expert_assignment_rows(
         input: &MxArray,
         ids: &MxArray,
-        banks: &[std::sync::Arc<super::super::weights::Weight>; 3],
+        banks: &Banks,
         experts: usize,
     ) -> Result<MxArray> {
-        let (output, inverse) = Self::sorted_expert_assignment_rows(input, ids, banks, experts)?;
+        let kernel = ExpertKernel::for_window(ids.size()? as usize, experts);
+        let (output, inverse) =
+            Self::sorted_expert_assignment_rows(input, ids, banks, experts, kernel)?;
         match inverse {
             Some(inverse) => output.take(&inverse, 0),
             None => Ok(output),
         }
     }
 
-    // The fused 32-row layout benefits dispersed routing; concentrated routes
-    // retain 64-row tiles to amortize packed-weight reads. Partial banks already
-    // know their active count. Full residency keeps device-only routing.
+    /// The rows of one window, or of one slot group of it, through the
+    /// window's kernel. `experts` is the row count of the bank in hand.
+    fn window_expert_rows(
+        kernel: ExpertKernel,
+        source: &MxArray,
+        token_rows: &MxArray,
+        ids: &MxArray,
+        banks: &Banks,
+        experts: usize,
+    ) -> Result<(MxArray, Option<MxArray>)> {
+        if kernel == ExpertKernel::Tiles
+            && let Some((out, inverse)) =
+                Self::indirect_expert_assignment_rows(source, token_rows, ids, banks, experts)?
+        {
+            return Ok((out, Some(inverse)));
+        }
+        Self::sorted_expert_assignment_rows(
+            &source.take(token_rows, 0)?,
+            ids,
+            banks,
+            experts,
+            kernel,
+        )
+    }
+
     fn indirect_expert_assignment_rows(
         input: &MxArray,
         token_rows: &MxArray,
         ids: &MxArray,
-        banks: &[std::sync::Arc<super::super::weights::Weight>; 3],
+        banks: &Banks,
         experts: usize,
-        active_experts: usize,
     ) -> Result<Option<(MxArray, MxArray)>> {
-        if runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_INDIRECT")
-            || ids.size()? < 256
-            || (ids.size()? / active_experts.max(1) as u64 >= 32
-                && runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_REFERENCE_INDIRECT"))
-            || input.dtype()? != DType::BFloat16
-        {
+        if input.dtype()? != DType::BFloat16 {
             return Ok(None);
         }
         let Some((order, inverse, selected)) = math::route_sort(ids, experts)? else {
@@ -110,48 +146,42 @@ impl Decoder {
     fn sorted_expert_assignment_rows(
         input: &MxArray,
         ids: &MxArray,
-        banks: &[std::sync::Arc<super::super::weights::Weight>; 3],
+        banks: &Banks,
         experts: usize,
+        kernel: ExpertKernel,
     ) -> Result<(MxArray, Option<MxArray>)> {
         let rows = ids.size()? as i64;
-        let sorted = rows > 80;
-        let routing = if sorted {
-            super::super::math::route_sort(ids, experts)?
+        let width = input.shape()?[1];
+        let (x, selected, inverse, tiles) = if kernel == ExpertKernel::Rows {
+            (input.clone(), ids.clone(), None, None)
         } else {
-            None
+            let (order, inverse, selected) = match math::route_sort(ids, experts)? {
+                Some(sorted) => sorted,
+                None => {
+                    let order = ids.argsort(Some(0))?;
+                    (order.clone(), order.argsort(Some(0))?, ids.take(&order, 0)?)
+                }
+            };
+            let tiles = if kernel == ExpertKernel::Tiles {
+                math::expert_tiles(&selected, experts)?
+            } else {
+                None
+            };
+            (input.take(&order, 0)?, selected, Some(inverse), tiles)
         };
-        let order = if let Some((order, _, _)) = &routing {
-            Some(order.clone())
-        } else if sorted {
-            Some(ids.argsort(Some(0))?)
-        } else {
-            None
-        };
-        let x = if let Some(order) = &order {
-            input.take(order, 0)?
-        } else {
-            input.clone()
-        };
-        let selected = if let Some((_, _, ids)) = &routing {
-            ids.clone()
-        } else if let Some(order) = &order {
-            ids.take(order, 0)?
-        } else {
-            ids.clone()
-        };
-        let x = x.reshape(&[rows, 1, input.shape()?[1]])?;
-        let tiles = if sorted && !runtime_flags::is_zero(c"MLX_QWEN4_EXPERT_TILES") {
-            math::expert_tiles(&selected, experts)?
-        } else {
-            None
-        };
-        let project = |bank: &super::super::weights::Weight, x: &MxArray| -> Result<MxArray> {
+        let x = x.reshape(&[rows, 1, width])?;
+        let project = |bank: &Weight, x: &MxArray| -> Result<MxArray> {
+            if kernel == ExpertKernel::Rows {
+                return bank.expert_rows(x, &selected, experts, false);
+            }
             if let Some(tiles) = &tiles
                 && let Some(out) = bank.tiled_expert_rows(x, &selected, tiles, experts)?
             {
                 return Ok(out);
             }
-            bank.expert_rows(x, &selected, experts, sorted)
+            // MLX picks its matrix kernel from rows / bank experts, a bank
+            // property; only a Tiles window the NAX kernels refused may let it.
+            bank.gather_rows(x, &selected, experts, kernel == ExpertKernel::Tiles)
         };
         let gate = project(&banks[0], &x)?;
 
@@ -161,13 +191,6 @@ impl Decoder {
 
         let out = project(&banks[2], &hidden)?.reshape(&[rows, -1])?;
 
-        let inverse = match order {
-            Some(order) => Some(match routing {
-                Some((_, inverse, _)) => inverse,
-                None => order.argsort(Some(0))?,
-            }),
-            None => None,
-        };
         Ok((out, inverse))
     }
 
@@ -177,9 +200,9 @@ impl Decoder {
     pub(in super::super) fn single_slot_group_rows(
         x: &MxArray,
         selected: &MxArray,
-        banks: &[std::sync::Arc<super::super::weights::Weight>; 3],
+        banks: &Banks,
         capacity: usize,
-        active_experts: usize,
+        kernel: ExpertKernel,
         top: usize,
     ) -> Result<(MxArray, Option<MxArray>)> {
         let tokens = x.shape_at(1)?;
@@ -188,22 +211,58 @@ impl Decoder {
             .reshape(&[tokens, 1])?
             .broadcast_to(&[tokens, top as i64])?
             .reshape(&[-1])?;
-        if let Some((out, inverse)) = Self::indirect_expert_assignment_rows(
-            &source,
-            &token_rows,
-            selected,
-            banks,
-            capacity,
-            active_experts,
-        )? {
-            return Ok((out, Some(inverse)));
+        Self::window_expert_rows(kernel, &source, &token_rows, selected, banks, capacity)
+    }
+
+    /// A window over more experts than the slots hold: each group of
+    /// `groups` (assignment indices into `ids`) runs on its leased bank with
+    /// the window's kernel. Returns the stacked rows and the inverse that
+    /// restores router order, or None once a lease is refused.
+    pub(in super::super) fn grouped_expert_rows(
+        x: &MxArray,
+        ids: &[u32],
+        groups: &[Vec<usize>],
+        kernel: ExpertKernel,
+        top: usize,
+        banks: &mut impl GroupBanks,
+    ) -> Result<Option<(MxArray, MxArray)>> {
+        let source = x.reshape(&[-1, x.shape_at(2)?])?;
+        let mut values = Vec::with_capacity(groups.len());
+        let mut group_inverses = Vec::with_capacity(groups.len());
+        let mut inverse = vec![0i32; ids.len()];
+        let mut output_row = 0;
+        for assignments in groups {
+            let requested: Vec<_> = assignments.iter().map(|&s| ids[s]).collect();
+            let Some((group_banks, slots, count)) = banks.lease(&requested)? else {
+                return Ok(None);
+            };
+            let rows: Vec<_> = assignments.iter().map(|&s| (s / top) as i32).collect();
+            let token_rows = MxArray::from_int32(&rows, &[rows.len() as i64])?;
+            let selected = MxArray::from_uint32(&slots, &[slots.len() as i64])?;
+            let (out, local_inverse) = Self::window_expert_rows(
+                kernel,
+                &source,
+                &token_rows,
+                &selected,
+                &group_banks,
+                count,
+            )?;
+            banks.release(&out)?;
+            let local_inverse = match local_inverse {
+                Some(inverse) => inverse.astype(DType::Int32)?,
+                None => MxArray::arange(0.0, assignments.len() as f64, None, Some(DType::Int32))?,
+            };
+            group_inverses.push(local_inverse.add(&MxArray::from_int32(&[output_row], &[])?)?);
+            for &slot in assignments {
+                inverse[slot] = output_row;
+                output_row += 1;
+            }
+            values.push(out);
         }
-        Self::sorted_expert_assignment_rows(
-            &source.take(&token_rows, 0)?,
-            selected,
-            banks,
-            capacity,
-        )
+        let out = MxArray::concatenate_many(values.iter().collect(), Some(0))?;
+        let inverse = MxArray::concatenate_many(group_inverses.iter().collect(), Some(0))?
+            .take(&MxArray::from_int32(&inverse, &[inverse.len() as i64])?, 0)?;
+        Ok(Some((out, inverse)))
     }
 
     fn slotted_experts(
@@ -231,7 +290,6 @@ impl Decoder {
             && c.moe_intermediate_size == 640
             && x.dtype()? == DType::BFloat16
             && ids.len() == x.shape()?[1] as usize * c.num_experts_per_tok
-            && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_EXPERTS")
             && ids
                 .iter()
                 .copied()
@@ -250,33 +308,14 @@ impl Decoder {
         }
         // Leave the experts used nearest the prompt boundary in the slots.
         // Router order is restored below, independently of SSD load order.
-        let linear_plan =
-            x.shape_at(1)? > 8 && !runtime_flags::is_zero(c"MLX_QWEN4_LINEAR_ROUTE_PLAN");
-        let mut last = BTreeMap::new();
-        let linear_order = if linear_plan {
-            Some(
-                super::super::route_plan::expert_order(ids, c.num_experts)
-                    .map_err(Error::from_reason)?,
-            )
-        } else {
-            for (assignment, &expert) in ids.iter().enumerate() {
-                last.insert(expert, assignment);
-            }
-            None
-        };
-        let active_experts = linear_order.as_ref().map_or(last.len(), Vec::len);
-        if x.shape_at(1)? > 8 {
-            self.weights.note_prefill_routes(
-                i,
-                linear_order
-                    .clone()
-                    .unwrap_or_else(|| last.keys().copied().collect()),
-            );
+        let order = super::super::route_plan::expert_order(ids, c.num_experts)
+            .map_err(Error::from_reason)?;
+        let wide = x.shape_at(1)? > 8;
+        if wide {
+            self.weights.note_prefill_routes(i, order.clone());
         }
-        if active_experts <= capacity
-            && x.shape_at(1)? > 8
-            && !runtime_flags::is_zero(c"MLX_QWEN4_SINGLE_SLOT_GROUP")
-        {
+        let kernel = ExpertKernel::for_window(ids.len(), c.num_experts);
+        if order.len() <= capacity && wide {
             self.check_cancelled()?;
             let Some((banks, slots, count)) =
                 self.weights
@@ -290,15 +329,12 @@ impl Decoder {
                 &selected,
                 &banks,
                 count,
-                active_experts,
+                kernel,
                 c.num_experts_per_tok,
             )?;
             let reduced =
                 math::combine_expert_rows(&out, scores, inverse.as_ref(), c.num_experts_per_tok)?;
-            if self.verification.is_none()
-                && !runtime_flags::is_zero(c"MLX_QWEN4_DEFER_EXPERT_REDUCTION")
-                && !runtime_flags::is_zero(c"MLX_QWEN4_ASYNC_SUBMISSION")
-            {
+            if self.verification.is_none() {
                 // This one bank group has no intervening slot reuse. Keep
                 // its reduction as the lease, so the large assignment output
                 // is released after GPU execution. A later router/frontier
@@ -310,87 +346,80 @@ impl Decoder {
             }
             return Ok(Some(reduced));
         }
-        let groups = linear_order.unwrap_or_else(|| {
-            let mut groups = last.keys().copied().collect::<Vec<_>>();
-            groups.sort_by_key(|e| last[e]);
-            groups
-        });
-        let mut planned_assignments = if linear_plan {
-            Some(
-                super::super::route_plan::assignment_groups(ids, &groups, c.num_experts, capacity)
-                    .map_err(Error::from_reason)?,
-            )
-        } else {
-            None
+        let groups =
+            super::super::route_plan::assignment_groups(ids, &order, c.num_experts, capacity)
+                .map_err(Error::from_reason)?;
+        let mut slots = LayerSlots {
+            decoder: self,
+            layer: i,
         };
-        let mut values = Vec::new();
-        let mut group_inverses = Vec::new();
-        let mut inverse = vec![0i32; ids.len()];
-        let mut output_row = 0;
-        for (group, experts) in groups.chunks(capacity).enumerate() {
-            self.check_cancelled()?;
-            let assignments = if let Some(planned) = &mut planned_assignments {
-                std::mem::take(&mut planned[group])
-            } else {
-                let wanted: std::collections::HashSet<_> = experts.iter().copied().collect();
-                ids.iter()
-                    .enumerate()
-                    .filter(|(_, e)| wanted.contains(e))
-                    .map(|(slot, _)| slot)
-                    .collect::<Vec<_>>()
-            };
-            let requested: Vec<_> = assignments.iter().map(|&s| ids[s]).collect();
-            let Some((banks, slots, count)) =
-                self.weights
-                    .expert_slots(i, c.num_experts, c.num_experts_per_tok, &requested)?
-            else {
-                return Ok(None);
-            };
-            let rows: Vec<_> = assignments
-                .iter()
-                .map(|&s| (s / c.num_experts_per_tok) as i32)
-                .collect();
-            let source = x.reshape(&[-1, c.hidden_size as i64])?;
-            let token_rows = MxArray::from_int32(&rows, &[rows.len() as i64])?;
-            let selected = MxArray::from_uint32(&slots, &[slots.len() as i64])?;
-            let (out, local_inverse) = if let Some((out, inverse)) =
-                Self::indirect_expert_assignment_rows(
-                    &source,
-                    &token_rows,
-                    &selected,
-                    &banks,
-                    count,
-                    experts.len(),
-                )? {
-                (out, Some(inverse))
-            } else {
-                let input = source.take(&token_rows, 0)?;
-                Self::sorted_expert_assignment_rows(&input, &selected, &banks, count)?
-            };
-            self.weights.finish_expert_slots(i, &out)?;
-            let local_inverse = match local_inverse {
-                Some(inverse) => inverse.astype(DType::Int32)?,
-                None => MxArray::arange(0.0, assignments.len() as f64, None, Some(DType::Int32))?,
-            };
-            group_inverses.push(local_inverse.add(&MxArray::from_int32(&[output_row], &[])?)?);
-            for slot in assignments {
-                inverse[slot] = output_row;
-                output_row += 1;
-            }
-            values.push(out);
-        }
-        let out = MxArray::concatenate_many(values.iter().collect(), Some(0))?;
-        let inverse = MxArray::concatenate_many(group_inverses.iter().collect(), Some(0))?
-            .take(&MxArray::from_int32(&inverse, &[inverse.len() as i64])?, 0)?;
-        let tokens = x.shape()?[1];
+        let Some((out, inverse)) =
+            Self::grouped_expert_rows(x, ids, &groups, kernel, c.num_experts_per_tok, &mut slots)?
+        else {
+            return Ok(None);
+        };
         let reduced =
             math::combine_expert_rows(&out, scores, Some(&inverse), c.num_experts_per_tok)?;
-        if tokens > 8 {
+        if wide {
             // A wide assignment tensor is tens of MiB per layer. Once its
             // reduction is complete it must not remain pinned by slot leases.
             self.weights.complete_expert_window(i, &reduced)?;
         }
         Ok(Some(reduced))
+    }
+
+    /// The MTP head's experts live in two resident banks (gate|up fused, down)
+    /// built at load; route them on the device like the target's.
+    pub(super) fn mtp_resident_experts(
+        &self,
+        x: &MxArray,
+        selected: &MxArray,
+        scores: &MxArray,
+    ) -> Result<Option<MxArray>> {
+        let prefix = format!("{}layers.0.mlp.experts", self.scope);
+        let (Some(gate_up), Some(down)) = (
+            self.weights
+                .resident_bank(&format!("{prefix}.gate_up_proj")),
+            self.weights.resident_bank(&format!("{prefix}.down_proj")),
+        ) else {
+            return Ok(None);
+        };
+        let c = &self.config;
+        let tokens = x.shape_at(1)?;
+        let (h, m, top) = (
+            c.hidden_size as i64,
+            c.moe_intermediate_size as i64,
+            c.num_experts_per_tok as i64,
+        );
+        let rows = tokens * top;
+        let token_rows = MxArray::arange(0.0, tokens as f64, None, Some(DType::Int32))?
+            .reshape(&[tokens, 1])?
+            .broadcast_to(&[tokens, top])?
+            .reshape(&[-1])?;
+        let input = x
+            .reshape(&[tokens, h])?
+            .take(&token_rows, 0)?
+            .reshape(&[rows, 1, h])?;
+        let ids = selected.reshape(&[-1])?;
+        let both = gate_up.expert_rows(&input, &ids, c.num_experts, false)?;
+        let hidden = math::swiglu(&both.slice_axis(2, 0, m)?, &both.slice_axis(2, m, 2 * m)?)?;
+        let out = down
+            .expert_rows(&hidden, &ids, c.num_experts, false)?
+            .reshape(&[rows, h])?;
+        math::combine_expert_rows(&out, scores, None, top as usize).map(Some)
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn mtp_resident_experts_for_test(
+        &mut self,
+        x: &MxArray,
+        selected: &MxArray,
+        scores: &MxArray,
+    ) -> Result<Option<MxArray>> {
+        self.scope = "mtp.".into();
+        let out = self.mtp_resident_experts(x, selected, scores);
+        self.scope.clear();
+        out
     }
 
     pub(super) fn selected_experts(
@@ -404,7 +433,7 @@ impl Decoder {
             return Ok(Some(out));
         }
         use super::super::weights::{MAX_READ_BYTES, Weight};
-        if !self.gguf() || runtime_flags::is_zero(c"MLX_QWEN4_BATCH_EXPERTS") {
+        if !self.gguf() {
             return Ok(None);
         }
         let (h, m) = (self.config.hidden_size, self.config.moe_intermediate_size);
@@ -455,32 +484,6 @@ impl Decoder {
         Ok(Some(out))
     }
 
-    pub(super) fn attention_batch(
-        &mut self,
-        rows: &[MxArray],
-        tokens: &[u32],
-        i: usize,
-        cache: &mut LayerCache,
-    ) -> Result<Vec<MxArray>> {
-        let x = MxArray::concatenate_many(rows.iter().collect(), Some(1))?;
-        let out = self.attention_matrix(&x, tokens, i, cache)?;
-        (0..rows.len())
-            .map(|j| out.slice_axis(1, j as i64, j as i64 + 1))
-            .collect()
-    }
-
-    pub(super) fn attention_matrix(
-        &mut self,
-        x: &MxArray,
-        tokens: &[u32],
-        i: usize,
-        cache: &mut LayerCache,
-    ) -> Result<MxArray> {
-        Ok(self
-            .attention_matrix_for_mlp(x, tokens, i, cache, false, None)?
-            .0)
-    }
-
     pub(super) fn attention_matrix_for_mlp(
         &mut self,
         x: &MxArray,
@@ -488,7 +491,6 @@ impl Decoder {
         i: usize,
         cache: &mut LayerCache,
         normalize: bool,
-        incoming_norm: Option<&MxArray>,
     ) -> Result<(MxArray, Option<MxArray>)> {
         let base = self.history.len();
         let x = if self.config.ple_layer_ids.contains(&(i + 1)) {
@@ -502,7 +504,7 @@ impl Decoder {
             &format!("layers.{i}.attn_hyper_connection"),
             &format!("blk.{i}.hc_attn"),
             true,
-            incoming_norm,
+            None,
         )?;
 
         let branch = if self.config.linear(i) {
@@ -577,7 +579,6 @@ impl Decoder {
         let prepared = if self.gguf()
             && c.linear_conv_kernel_dim == 4
             && (kh, nh, kd, vd) == (16, 48, 128, 128)
-            && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_GDN_PREP")
         {
             math::gdn_prepare(&qkv, &a, &b, &conv, &mut cache.conv, &scale, &dt)?
         } else {
@@ -593,21 +594,10 @@ impl Decoder {
                 &qkv.slice_axis(2, kh * kd, 2 * kh * kd)?
                     .reshape(&[1, t, kh, kd])?,
             )?;
-            let compact = x.dtype()? == DType::BFloat16
-                && kd >= 32
-                && kd % 32 == 0
-                && crate::engine::persistence::compiled_forward_backend_available()
-                && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_GDN")
-                && runtime_flags::is_one(c"MLX_QWEN4_PREFILL_GDN_BF16");
-            let storage = if compact {
-                DType::BFloat16
-            } else {
-                DType::Float32
-            };
             let v = qkv
                 .slice_axis(2, 2 * kh * kd, 2 * kh * kd + nh * vd)?
                 .reshape(&[1, t, nh, vd])?
-                .astype(storage)?;
+                .astype(DType::Float32)?;
             let (q, k) = if self.gguf() {
                 (q, k)
             } else {
@@ -617,7 +607,13 @@ impl Decoder {
                 )
             };
             let (decay, beta) = math::gdn_gates(&a, &b, &scale, &dt)?;
-            [q.astype(storage)?, k.astype(storage)?, v, decay, beta]
+            [
+                q.astype(DType::Float32)?,
+                k.astype(DType::Float32)?,
+                v,
+                decay,
+                beta,
+            ]
         };
 
         let state = match &cache.recurrent {
@@ -629,9 +625,7 @@ impl Decoder {
         self.submit_state(&[&state], "qwen4::batch::recurrent_state")?;
         cache.recurrent = Some(state);
         let norm = self.dense(&format!("{p}.norm.weight"), &format!("{g}.ssm_norm.weight"))?;
-        let replay = if c.output_gate_type == "sigmoid"
-            && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_EPILOGUE")
-        {
+        let replay = if c.output_gate_type == "sigmoid" {
             math::gdn_epilogue(&out, &z, &norm, c.rms_norm_eps)?
         } else {
             None
@@ -675,7 +669,7 @@ impl Decoder {
     }
 
     pub(super) fn mlp_matrix(&mut self, x: &MxArray, i: usize) -> Result<MxArray> {
-        Ok(self.mlp_matrix_for_attention(x, i, None, false)?.0)
+        self.mlp_matrix_for_attention(x, i, None)
     }
 
     pub(super) fn mlp_matrix_for_attention(
@@ -683,8 +677,7 @@ impl Decoder {
         x: &MxArray,
         i: usize,
         normed: Option<&MxArray>,
-        normalize_next: bool,
-    ) -> Result<(MxArray, Option<MxArray>)> {
+    ) -> Result<MxArray> {
         let (mixed, gate) = self.hyper_with_norm(
             x,
             &format!("layers.{i}.mlp_hyper_connection"),
@@ -697,23 +690,24 @@ impl Decoder {
 
         let gate = gate
             .ok_or_else(|| Error::from_reason("Qwen4 batched MLP is missing its injection gate"))?;
-        let (out, next_norm) =
-            self.inject_for_next_attention(x, &branch, &gate, i, normalize_next)?;
-        if self.async_prefill || runtime_flags::is_one(c"MLX_QWEN4_PREFILL_DEFER_MLP") {
-            // The next router readback (or final window output) fences this
-            // graph. Slot-bank readers remain retained until their own fence.
-            // Reference schedule: first two layers, then groups of three.
-            if !self.async_device_prefill() || (i >= 1 && (i - 1).is_multiple_of(3)) {
-                self.submit(&[&out], "qwen4::batch::mlp")?;
-            }
-        } else {
-            MxArray::eval_arrays_with_context(&[&out], "qwen4::batch::mlp")?;
+        let out = Self::inject(x, &branch, &gate)?;
+        // The next router readback (or final window output) fences this
+        // graph. Slot-bank readers remain retained until their own fence.
+        // Reference schedule: first two layers, then groups of three.
+        if !self.async_device_prefill() || (i >= 1 && (i - 1).is_multiple_of(3)) {
+            self.submit(&[&out], "qwen4::batch::mlp")?;
         }
 
-        Ok((out, next_norm))
+        Ok(out)
     }
 
     pub(super) fn moe_batch(&mut self, x: &MxArray, i: usize) -> Result<MxArray> {
+        let main = self.gguf();
+        if i == 0 {
+            self.weights.wire_mapped_banks(main)?;
+        } else {
+            self.weights.keep_wired(i, main)?;
+        }
         let c = self.config.clone();
         let tokens = x.shape()?[1] as usize;
         let p = format!("layers.{i}.mlp");
@@ -739,17 +733,8 @@ impl Decoder {
         };
         let scores = scores.reshape(&[1, (tokens * top) as i64, 1])?;
 
-        if self.device_routes.is_some()
-            && runtime_flags::is_one(c"MLX_QWEN4_PREFILL_SHARED_COMBINE")
-        {
-            let (shared, gate) = self.shared_expert_parts(x, i, None)?;
-            let out =
-                self.tentative_prefill_experts(x, &selected, &scores, i, Some((&shared, &gate)))?;
-
-            return Ok(out);
-        }
         let resident = if self.device_routes.is_some() {
-            Some(self.tentative_prefill_experts(x, &selected, &scores, i, None)?)
+            Some(self.tentative_prefill_experts(x, &selected, &scores, i)?)
         } else {
             self.resident_experts(x, &selected, &scores, i)?
         };
@@ -826,7 +811,7 @@ impl Decoder {
             }
         };
 
-        let (shared, gate) = self.shared_expert_parts(x, i, None)?;
+        let (shared, gate) = self.shared_expert_parts(x, i)?;
         let output = sum
             .astype(x.dtype()?)?
             .add(&math::sigmoid_mul(&gate, &shared)?)?;

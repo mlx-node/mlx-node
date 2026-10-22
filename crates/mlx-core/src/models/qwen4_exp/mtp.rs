@@ -1,6 +1,7 @@
 //! Native HC MTP with trusted target frontiers and transactional verification.
-//! Proposals use a private draft-cache clone. Only accepted target hidden rows
-//! advance the persistent draft cache; rejected speculative hiddens never do.
+//! Only accepted target hidden rows advance the persistent draft cache;
+//! rejected speculative hiddens never do. Accepted rows wait for the next
+//! proposal, whose first draft pass covers them and the anchor row together.
 use super::{
     Inner,
     decoder::{DecoderState, LayerCache},
@@ -11,7 +12,6 @@ use crate::engine::hybrid_scheduler::{
     HybridSchedulerBackend, ScheduledVerifyCommit, ScheduledVerifyRow,
 };
 use crate::engine::params::ChatParams;
-use crate::models::qwen4_exp::runtime_flags;
 use napi::{Error, Result};
 use std::collections::HashMap;
 
@@ -19,6 +19,9 @@ use std::collections::HashMap;
 struct Owner {
     cache: LayerCache,
     hidden: Option<MxArray>,
+    /// Trusted (target hidden, next token) rows not yet in `cache`, ending at
+    /// position `frontier - 2`.
+    rows: Vec<(MxArray, u32)>,
     frontier: usize,
     tracking: bool,
 }
@@ -39,6 +42,50 @@ impl State {
         self.owners.remove(&seq);
         self.pending.remove(&seq);
         self.budget.clear();
+    }
+    /// (rows in the draft cache, trusted rows waiting for the next pass).
+    #[cfg(test)]
+    pub(super) fn draft_rows(&self, seq: u32) -> Option<(usize, usize)> {
+        self.owners
+            .get(&seq)
+            .map(|owner| (owner.cache.history_shape().0, owner.rows.len()))
+    }
+    /// (draft cache arrays, waiting (hidden, token) rows, frontier) of an
+    /// owner: what a prefill's observes leave behind.
+    #[cfg(test)]
+    pub(super) fn draft_state(
+        &self,
+        seq: u32,
+    ) -> Option<(Vec<MxArray>, Vec<(MxArray, u32)>, usize)> {
+        self.owners.get(&seq).map(|owner| {
+            (
+                owner.cache.arrays().cloned().collect(),
+                owner.rows.clone(),
+                owner.frontier,
+            )
+        })
+    }
+    pub fn owner_frontier(&self, seq: u32) -> Option<usize> {
+        self.owners.get(&seq).map(|owner| owner.frontier)
+    }
+    /// What an owner holds: draft K/V for its cached rows, the hidden rows
+    /// waiting for the next first draft pass (trusted rows and the seed),
+    /// plus its verify snapshots inside an MTP turn.
+    fn owner_bytes(c: &super::config::Config, owner: &Owner) -> u64 {
+        let hidden_rows = owner.rows.len() as u64 + u64::from(owner.hidden.is_some());
+        let cached_rows = (owner.frontier as u64).saturating_sub(hidden_rows);
+        super::memory::draft_owner_bytes(c, cached_rows, hidden_rows, owner.tracking)
+    }
+    pub fn held_bytes(&self, c: &super::config::Config) -> u64 {
+        self.owners
+            .values()
+            .map(|owner| Self::owner_bytes(c, owner))
+            .sum()
+    }
+    pub fn owner_held_bytes(&self, c: &super::config::Config, seq: u32) -> u64 {
+        self.owners
+            .get(&seq)
+            .map_or(0, |owner| Self::owner_bytes(c, owner))
     }
     pub fn finish(&mut self, seq: u32, frontier: Option<usize>) {
         self.pending.remove(&seq);
@@ -74,6 +121,14 @@ impl Inner {
         }
         Ok(false)
     }
+    /// Whether `observe_mtp` for `seq` would record the hidden rows it is
+    /// given: a prefill builds its per-token views only then.
+    pub(super) fn mtp_tracking(&self, seq: u32) -> bool {
+        self.mtp
+            .owners
+            .get(&seq)
+            .is_some_and(|owner| owner.tracking)
+    }
     pub fn observe_mtp(&mut self, seq: u32, tokens: &[u32], hidden: &[MxArray]) -> Result<()> {
         let Some(mut owner) = self.mtp.owners.remove(&seq) else {
             return Ok(());
@@ -86,39 +141,27 @@ impl Inner {
                 "Qwen4 MTP target hidden alignment mismatch",
             ));
         }
-        let result = (|| {
-            if tokens.len() > 1 && !runtime_flags::is_zero(c"MLX_QWEN4_MTP_PREFILL") {
-                let skip = usize::from(owner.hidden.is_none());
-                let mut previous = Vec::with_capacity(tokens.len());
-                if let Some(h) = &owner.hidden {
-                    previous.push(h.clone());
-                }
-                previous.extend_from_slice(&hidden[..hidden.len() - 1]);
-                let position = (owner.frontier + skip).saturating_sub(1);
-                let width = self.decoder.prefill_chunk_size;
-                for (chunk, (h, t)) in previous
-                    .chunks(width)
-                    .zip(tokens[skip..].chunks(width))
-                    .enumerate()
-                {
-                    self.decoder
-                        .draft_prefill(h, t, position + chunk * width, &mut owner.cache)?;
-                }
-                owner.hidden = hidden.last().cloned();
-                owner.frontier += tokens.len();
-                return Ok(());
+        // Prefill hands over lazy views of its hidden window, and a verifier
+        // restore must not reinstate a frontier that still holds them.
+        let lazy: Vec<_> = hidden
+            .iter()
+            .filter(|h| !unsafe { mlx_sys::mlx_array_is_available(h.as_raw_ptr()) })
+            .collect();
+        MxArray::eval_arrays_with_context(&lazy, "qwen4::mtp::target_rows")?;
+        for (&token, target_hidden) in tokens.iter().zip(hidden) {
+            if let Some(previous) = owner.hidden.replace(target_hidden.clone()) {
+                owner.rows.push((previous, token));
             }
-            for (&token, target_hidden) in tokens.iter().zip(hidden) {
-                if let Some(previous) = &owner.hidden {
-                    self.decoder.draft_prefill(
-                        std::slice::from_ref(previous),
-                        &[token],
-                        owner.frontier - 1,
-                        &mut owner.cache,
-                    )?;
-                }
-                owner.hidden = Some(target_hidden.clone());
-                owner.frontier += 1;
+            owner.frontier += 1;
+        }
+        let width = self.decoder.prefill_chunk_size;
+        let result = (|| {
+            // A full window cannot also carry the next proposal's anchor row.
+            while owner.rows.len() >= width {
+                let position = owner.frontier - 1 - owner.rows.len();
+                let (h, t): (Vec<_>, Vec<_>) = owner.rows.drain(..width).unzip();
+                self.decoder
+                    .draft_prefill(&h, &t, position, &mut owner.cache)?;
             }
             Ok(())
         })();
@@ -141,16 +184,19 @@ impl Inner {
             .owners
             .get(&seq)
             .ok_or_else(|| Error::from_reason("Qwen4 MTP missing owner"))?;
-        let mut hidden = owner
+        let seed = owner
             .hidden
             .clone()
             .ok_or_else(|| Error::from_reason("Qwen4 MTP missing target HC seed"))?;
-        let mut cache = owner.cache.clone();
         let start = owner
             .frontier
             .checked_sub(1)
             .ok_or_else(|| Error::from_reason("Qwen4 MTP empty frontier"))?;
-        let mut token = anchor;
+        let mut cache = owner.cache.clone();
+        let (mut hidden, mut tokens): (Vec<_>, Vec<_>) = owner.rows.iter().cloned().unzip();
+        hidden.push(seed);
+        tokens.push(anchor);
+        let mut position = start + 1 - tokens.len();
         let mut draft_ids = Vec::new();
         let mut draft_dists = Vec::new();
         let mut keep_probabilities = Vec::new();
@@ -159,13 +205,10 @@ impl Inner {
         let cfg = crate::models::qwen3_5::mtp_decode::mtp_draft_sampling_config(cfg);
         for i in 0..cap.min(3) {
             self.decoder.check_cancelled()?;
-            let (next, logits) =
-                self.decoder
-                    .draft_step(&hidden, token, start + i, &mut cache, true)?;
-            hidden = next;
-            let logits = logits
-                .ok_or_else(|| Error::from_reason("Qwen4 MTP draft step produced no logits"))?
-                .reshape(&[-1])?;
+            let (next, logits, draft) = self
+                .decoder
+                .draft_step(&hidden, &tokens, position, &mut cache)?;
+            let logits = logits.reshape(&[-1])?;
             let id = if greedy {
                 logits.argmax(-1, None)?.astype(DType::Int32)?
             } else {
@@ -175,15 +218,39 @@ impl Inner {
                 draft_dists.push(dist);
                 id
             };
-            token = id.item_at_int32(0)? as u32;
-            if confidence {
-                let probabilities = crate::nn::Activations::softmax_precise(
+            let probabilities = if confidence {
+                Some(crate::nn::Activations::softmax_precise(
                     &logits.astype(DType::Float32)?,
                     Some(-1),
-                )?;
+                )?)
+            } else {
+                None
+            };
+            let mut ready = vec![&id, &next];
+            ready.extend(probabilities.iter());
+            if i == 0 {
+                ready.extend(cache.arrays());
+            }
+            MxArray::eval_arrays_with_context(&ready, "qwen4::mtp::draft")?;
+            if i == 0 {
+                // The first pass appended exactly the owner's trusted rows.
+                let owner = self
+                    .mtp
+                    .owners
+                    .get_mut(&seq)
+                    .ok_or_else(|| Error::from_reason("Qwen4 MTP missing owner"))?;
+                owner.cache = cache;
+                owner.rows.clear();
+            }
+            let token = id.item_at_int32(0)? as u32;
+            if let Some(probabilities) = &probabilities {
                 keep_probabilities.push(probabilities.item_at_float32(token as usize)?);
             }
             draft_ids.push(token as i32);
+            hidden = vec![next];
+            tokens = vec![token];
+            position = start + i + 1;
+            cache = draft;
         }
         Ok(DsparkProposal {
             draft_ids,

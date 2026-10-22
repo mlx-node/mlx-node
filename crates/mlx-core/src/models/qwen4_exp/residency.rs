@@ -2,7 +2,7 @@
 //! assemble fixed projections while experts, PLE/token rows and optional
 //! vision/MTP remain demand loaded. All source reads stay bounded.
 use super::*;
-use crate::models::qwen4_exp::runtime_flags;
+use std::sync::atomic::Ordering;
 
 pub(super) fn is_auxiliary(name: &str) -> bool {
     ["mtp.", "visual.", "vision_tower.", "v.", "mm.", "nextn."]
@@ -33,8 +33,7 @@ impl Tensor {
     fn dense_projection_cache_bytes(&self, name: &str) -> Result<u64> {
         let f32 = matches!(&self.encoding, Encoding::Safe(t) if t == "F32")
             || matches!(self.encoding, Encoding::Gguf(GgufTensorType::F32));
-        if runtime_flags::is_zero(c"MLX_QWEN4_DENSE_BF16_CACHE")
-            || !f32
+        if !f32
             || !is_fixed_projection(name, self)
             || name.contains("conv1d")
             || !(self.shape.len() == 2
@@ -262,6 +261,18 @@ impl Store {
         self.banks.get(name).cloned()
     }
 
+    /// Fixed projections with their dense compute copies: the hot set minus
+    /// routed experts, what the mapped budget must hold as banks.
+    pub(super) fn fixed_projection_bytes(&self) -> Result<u64> {
+        self.tensors
+            .iter()
+            .filter(|(name, tensor)| is_fixed_projection(name, tensor))
+            .try_fold(0u64, |n, (name, t)| {
+                n.checked_add(t.bank_bytes(name)?)
+                    .ok_or_else(|| err("Fixed projection inventory overflow"))
+            })
+    }
+
     pub(in super::super) fn prepare_hot(&mut self) -> Result<()> {
         self.prepare_hot_with_policy(
             &mut super::super::memory::admit,
@@ -280,19 +291,6 @@ impl Store {
         refresh: &mut impl FnMut(&mut super::super::memory::Plan) -> Result<()>,
     ) -> Result<()> {
         self.prepare_hot_with_admission(admit, refresh)?;
-        self.plan.resident_expert_layers = self
-            .tensors
-            .keys()
-            .filter(|name| {
-                name.ends_with(".ffn_gate_exps.weight")
-                    && !is_auxiliary(name)
-                    && ["gate", "up", "down"].iter().all(|part| {
-                        self.banks.contains_key(
-                            &name.replace("ffn_gate_exps", &format!("ffn_{part}_exps")),
-                        )
-                    })
-            })
-            .count();
         if let (Some(experts), Some(top)) = (
             self.metadata
                 .get("qwen4exp.expert_count")
@@ -326,16 +324,7 @@ impl Store {
             refresh(&mut self.plan)?;
             self.cache_limit = self.plan.budget;
         }
-        let names = if self.plan.resident {
-            let mut names: Vec<_> = self.tensors.keys().filter(|n| is_hot(n)).cloned().collect();
-            names.sort();
-            names
-        } else if self.plan.policy != "stream" && !runtime_flags::is_zero(c"MLX_QWEN4_DENSE_BANKS")
-        {
-            self.projection_bank_names()?
-        } else {
-            Vec::new()
-        };
+        let names = self.projection_bank_names()?;
         if names.is_empty() {
             return Ok(());
         }
@@ -351,31 +340,23 @@ impl Store {
         self.banks.clear();
         self.paired_banks.clear();
         self.cache.clear();
+        self.window_banks.clear();
+        self.row_bank.clear();
         self.order.clear();
         self.recency.clear();
         self.protected.clear();
         self.protected_bytes = 0;
         self.bank_bytes = 0;
+        self.mtp_banks_declined = false;
         self.cache_bytes = 0;
         self.growth_bytes = 0;
-        self.plan.resident_bank_bytes = 0;
-        self.plan.resident_expert_layers = 0;
+        self.plan.resident_bank_bytes.store(0, Ordering::Relaxed);
         self.plan.partial_expert_slots = 0;
         crate::array::memory::synchronize_and_clear_cache();
-        if self.plan.policy == "full" {
-            return Err(err(
-                "Qwen4 full residency cannot preserve first-request headroom",
-            ));
-        }
         refresh(&mut self.plan)?;
         self.cache_limit = self.plan.budget;
-        self.plan.resident = false;
         self.slot_capacity = None;
-        let names = if runtime_flags::is_zero(c"MLX_QWEN4_DENSE_BANKS") {
-            Vec::new()
-        } else {
-            self.projection_bank_names()?
-        };
+        let names = self.projection_bank_names()?;
         if !self.prepare_banks(names, admit)? {
             return Err(err(
                 "Qwen4 partial residency lost first-request headroom during load",
@@ -389,13 +370,20 @@ impl Store {
         // Fixed projections get at most a quarter, leaving most RAM for experts.
         let mut names = Vec::new();
         let mut bytes = 0u64;
+        // The mapped budget holds no experts: banks may take all but the
+        // LRU room memory::mapped_desired reserved.
+        let cap = if self.plan.mapped {
+            self.cache_limit.saturating_sub(2 << 30)
+        } else {
+            self.cache_limit / 4
+        };
         for (name, tensor) in &self.tensors {
             if !is_fixed_projection(name, tensor) {
                 continue;
             }
             let size = tensor.bank_bytes(name)?;
             // An unusual dense/BF16 checkpoint keeps its bounded chunk path.
-            if size > 1 << 30 || size > (self.cache_limit / 4).saturating_sub(bytes) {
+            if size > 1 << 30 || size > cap.saturating_sub(bytes) {
                 return Ok(Vec::new());
             }
             bytes += size;
@@ -462,31 +450,309 @@ impl Store {
             .flatten()
             .collect();
             MxArray::eval_arrays_with_context(&arrays, "Qwen4 prepare resident bank")?;
-            let keys: Vec<_> = self
-                .cache
-                .keys()
-                .filter(|(n, _, _)| n == &name)
-                .cloned()
-                .collect();
-            for key in keys {
-                if let Some(w) = self.cache.remove(&key) {
-                    self.cache_bytes -= w.bytes()?;
-                    if self.protected.remove(&key) {
-                        self.protected_bytes -= w.bytes()?;
-                    }
-                }
-                self.recency.remove(&key);
-            }
-            let bytes = bank.bytes()?;
-            self.bank_bytes += bytes;
-            self.cache_bytes += bytes;
-            self.plan.resident_bank_bytes = self.bank_bytes;
-            self.peak_cache_bytes = self.peak_cache_bytes.max(self.cache_bytes);
-            self.banks.insert(name, Arc::new(bank));
+            self.install_bank(name, bank)?;
             drop(chunks);
             super::super::memory::maintain_freelist(self.plan.physical_bytes);
         }
         Ok(true)
+    }
+
+    /// Replace the LRU rows of `name` with one resident bank, outside the LRU
+    /// but inside the cache budget.
+    fn install_bank(&mut self, name: String, bank: Weight) -> Result<()> {
+        let keys: Vec<_> = self
+            .cache
+            .keys()
+            .filter(|(n, _, _)| n == &name)
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some((w, freed)) = self.uncache(&key)? {
+                self.cache_bytes -= freed;
+                if self.protected.remove(&key) {
+                    self.protected_bytes -= w.bytes()?;
+                }
+            }
+            self.recency.remove(&key);
+        }
+        let bytes = bank.bytes()?;
+        self.bank_bytes += bytes;
+        self.cache_bytes += bytes;
+        self.plan
+            .resident_bank_bytes
+            .store(self.bank_bytes, Ordering::Relaxed);
+        self.peak_cache_bytes = self.peak_cache_bytes.max(self.cache_bytes);
+        self.banks.insert(name, Arc::new(bank));
+        Ok(())
+    }
+}
+
+const MTP_EXPERT_BANKS: [&str; 2] = [
+    "mtp.layers.0.mlp.experts.gate_up_proj",
+    "mtp.layers.0.mlp.experts.down_proj",
+];
+
+/// A draft bank as the admission builds it: name, descriptor, rows, width,
+/// Q8 side dtype (none for a dense gather bank), bytes.
+pub(super) type MtpBankSpec = (&'static str, Tensor, usize, usize, Option<DType>, u64);
+
+impl Weight {
+    fn quantize_q8(values: &MxArray, sides: DType) -> Result<Self> {
+        // Quantize at f16, the GGUF import dtype the affine expert GEMV
+        // reads. f32 `sides` hold those same values for a bank it refuses:
+        // MLX gather_qmm promotes bf16 x with f16 sides to f32 and would cast
+        // the whole bank on every call; an astype to its own dtype is a no-op.
+        let source = values.astype(DType::Float16)?;
+        let (mut codes, mut scales, mut biases) = (
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        let ok = unsafe {
+            mlx_sys::mlx_quantize(
+                source.as_raw_ptr(),
+                32,
+                8,
+                c"affine".as_ptr(),
+                &mut codes,
+                &mut scales,
+                &mut biases,
+            )
+        };
+        if !ok {
+            return Err(err("Qwen4 MTP expert bank quantization failed"));
+        }
+        let values = MxArray::from_handle(codes, "Qwen4 MTP bank codes")?;
+        let scales = MxArray::from_handle(scales, "Qwen4 MTP bank scales")?;
+        let biases = MxArray::from_handle(biases, "Qwen4 MTP bank biases")?;
+        Ok(Self {
+            values,
+            dense_bf16: None,
+            scales: Some(scales.astype(sides)?),
+            biases: Some(biases.astype(sides)?),
+            group: 32,
+            bits: 8,
+            mode: "affine".into(),
+        })
+    }
+}
+
+impl Store {
+    pub(in super::super) fn mtp_bank_bytes(&self) -> Result<u64> {
+        MTP_EXPERT_BANKS
+            .iter()
+            .filter_map(|name| self.banks.get(*name))
+            .try_fold(0u64, |n, w| Ok(n + w.bytes()?))
+    }
+
+    /// The MTP head's routed-expert banks in one layout. `wide` gives a bank
+    /// the affine expert GEMV refuses f32 sides. Empty without the head.
+    fn mtp_bank_specs(&self, wide: bool) -> Result<Vec<MtpBankSpec>> {
+        if MTP_EXPERT_BANKS
+            .iter()
+            .any(|name| !self.tensors.contains_key(*name))
+        {
+            return Ok(Vec::new());
+        }
+        MTP_EXPERT_BANKS
+            .iter()
+            .map(|&name| {
+                let d = self.descriptor(name)?.clone();
+                let (rows, width) = (d.rows()?, d.width()?);
+                // MLX affine quantization needs K % 32 == 0; a narrower expert
+                // (fixtures) stays a dense gather bank.
+                let f32_sides = wide && !Weight::affine_gemv_takes(width);
+                let sides = (width % 32 == 0).then_some(if f32_sides {
+                    DType::Float32
+                } else {
+                    DType::Float16
+                });
+                // Eighths of a byte per weight: a code byte, and a scale and
+                // a bias per 32 weights.
+                let eighths = match sides {
+                    None => 16,
+                    Some(DType::Float32) => 10,
+                    Some(_) => 9,
+                };
+                let bytes = (rows as u64)
+                    .saturating_mul(width as u64)
+                    .saturating_mul(eighths)
+                    / 8;
+                Ok((name, d, rows, width, sides, bytes))
+            })
+            .collect()
+    }
+
+    /// What the draft banks may take: the mapped plan's charge for them, or
+    /// the slot path's auxiliary allowance.
+    fn mtp_bank_allowance(&self) -> Result<u64> {
+        if self.draft_bank_budget > 0 {
+            Ok(self.draft_bank_budget)
+        } else {
+            self.auxiliary_cache_allowance()
+        }
+    }
+
+    /// Anonymous bytes the draft banks take once built: what a mapped plan
+    /// charges beside the dense banks while the MTP head is attached, so the
+    /// live-memory gate and the bank admission see the same number. The f32
+    /// sides only when the allowance holds them, as in the admission.
+    pub(in super::super) fn mtp_bank_estimate(&self) -> Result<u64> {
+        let total = |specs: Vec<MtpBankSpec>| specs.iter().fold(0u64, |n, s| n.saturating_add(s.5));
+        let wide = total(self.mtp_bank_specs(true)?);
+        if wide <= self.mtp_bank_allowance()? {
+            Ok(wide)
+        } else {
+            Ok(total(self.mtp_bank_specs(false)?))
+        }
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn prepare_mtp_expert_banks(&mut self) -> Result<u64> {
+        self.prepare_mtp_expert_banks_with(&mut super::super::memory::admit)
+    }
+
+    /// The draft-bank build without the live host admission: it asks for
+    /// `WORKING_BYTES` beside the bank, which a 7 GB CI runner refuses.
+    #[cfg(test)]
+    pub(in super::super) fn prepare_fixture_mtp_expert_banks(&mut self) -> Result<u64> {
+        self.prepare_mtp_expert_banks_with(&mut |_| Ok(()))
+    }
+
+    /// Build the MTP head's routed experts as resident Q8 (affine, g32) banks
+    /// so a draft step gathers them on the device. Runs once, at load; the
+    /// whole aux tensor streams through 64 MiB row chunks. Both banks or
+    /// none: nothing is installed or charged until both evaluated, and a
+    /// cache that cannot stage them keeps the row-reader draft path.
+    pub(super) fn prepare_mtp_expert_banks_with(
+        &mut self,
+        admit: &mut impl FnMut(u64) -> Result<()>,
+    ) -> Result<u64> {
+        if self.mtp_banks_declined {
+            return Ok(0);
+        }
+        if self.mtp_bank_specs(false)?.is_empty() {
+            return Ok(0);
+        }
+        if MTP_EXPERT_BANKS
+            .iter()
+            .all(|name| self.banks.contains_key(*name))
+        {
+            return self.mtp_bank_bytes();
+        }
+        let Some(specs) = self.mtp_bank_admission()? else {
+            self.mtp_banks_declined = true;
+            return Ok(0);
+        };
+        let mut built = self.build_mtp_expert_banks(&specs, admit);
+        // The f32 sides need more live headroom than the f16 layout, which
+        // the store admits whenever it admits them.
+        if built.is_err() && specs.iter().any(|spec| spec.4 == Some(DType::Float32)) {
+            let narrow = self.mtp_bank_specs(false)?;
+            built = self.build_mtp_expert_banks(&narrow, admit);
+        }
+        let built = match built {
+            Ok(built) => built,
+            Err(error) => {
+                self.mtp_banks_declined = true;
+                return Err(error);
+            }
+        };
+        for (name, bank) in built {
+            self.install_bank(name.into(), bank)?;
+        }
+        super::super::memory::maintain_freelist(self.plan.physical_bytes);
+        self.mtp_bank_bytes()
+    }
+
+    /// The layout the draft banks are built in now: the f32 sides when they
+    /// fit, else the f16 ones, else none.
+    pub(super) fn mtp_bank_admission(&self) -> Result<Option<Vec<MtpBankSpec>>> {
+        let allowance = self.mtp_bank_allowance()?;
+        let pinned = self.protected_bytes + self.bank_bytes + self.slot_bytes;
+        let room = self.cache_limit.saturating_sub(pinned);
+        let planned_slots = self.planned_slot_bytes()?;
+        for wide in [true, false] {
+            let specs = self.mtp_bank_specs(wide)?;
+            let (mut total, mut peak) = (0u64, 0u64);
+            for (.., bytes) in &specs {
+                // Imported chunks and the concatenated bank coexist while the
+                // earlier banks are already held.
+                peak = peak.max(total.saturating_add(bytes.saturating_mul(2)));
+                total = total.saturating_add(*bytes);
+            }
+            // The slot banks a cached capacity has yet to build stay pinned
+            // beside the draft banks, and the last one still needs its staging.
+            let planned = (self.protected_bytes + self.bank_bytes + planned_slots)
+                .saturating_add(total)
+                .saturating_add(MAX_READ_BYTES * 3);
+            if total <= allowance
+                && peak.saturating_add(MAX_READ_BYTES * 3) <= room
+                && planned <= self.cache_limit
+            {
+                return Ok(Some(specs));
+            }
+        }
+        Ok(None)
+    }
+
+    fn build_mtp_expert_banks(
+        &mut self,
+        specs: &[MtpBankSpec],
+        admit: &mut impl FnMut(u64) -> Result<()>,
+    ) -> Result<Vec<(&'static str, Weight)>> {
+        let mut built = Vec::with_capacity(specs.len());
+        let mut held = 0u64;
+        for (name, d, rows, width, sides, bytes) in specs {
+            let (rows, width, bytes) = (*rows, *width, *bytes);
+            self.evict_to(
+                self.cache_limit
+                    .saturating_sub(held + bytes.saturating_mul(2) + MAX_READ_BYTES * 3),
+            )?;
+            admit(bytes.saturating_mul(2) + super::super::memory::WORKING_BYTES)?;
+            let chunk = (MAX_READ_BYTES as usize / (width * 4)).clamp(1, rows);
+            let mut chunks = Vec::with_capacity(rows.div_ceil(chunk));
+            for start in (0..rows).step_by(chunk) {
+                let values = d.import_rows(start, (rows - start).min(chunk))?.values;
+                let weight = if let Some(sides) = sides {
+                    Weight::quantize_q8(&values, *sides)?
+                } else {
+                    Weight {
+                        values,
+                        dense_bf16: None,
+                        scales: None,
+                        biases: None,
+                        group: 0,
+                        bits: 0,
+                        mode: String::new(),
+                    }
+                };
+                let arrays: Vec<_> = [
+                    Some(&weight.values),
+                    weight.scales.as_ref(),
+                    weight.biases.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                MxArray::eval_arrays_with_context(&arrays, "Qwen4 MTP expert bank chunk")?;
+                chunks.push(Arc::new(weight));
+            }
+            let bank = Weight::concatenate_rows(&chunks)?;
+            let arrays: Vec<_> = [
+                Some(&bank.values),
+                bank.scales.as_ref(),
+                bank.biases.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            MxArray::eval_arrays_with_context(&arrays, "Qwen4 MTP expert bank")?;
+            drop(chunks);
+            held += bank.bytes()?;
+            built.push((*name, bank));
+        }
+        Ok(built)
     }
 }
 
@@ -518,8 +784,7 @@ impl Store {
             && x.dtype()? == DType::BFloat16
             && first.ends_with(".ffn_gate_shexp.weight")
             && second.ends_with(".ffn_up_shexp.weight")
-            && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_SHARED_PAIR")
-            && !runtime_flags::is_zero(c"MLX_ENABLE_TF32")
+            && super::super::tf32_enabled()
             && unsafe { mlx_sys::mlx_metal_is_nax_available() }
         {
             let eligible = |w: &Weight| -> Result<bool> {
@@ -546,20 +811,13 @@ impl Store {
         };
         // The reference groups QKV/Z/B/A projections. Here A/B are F32
         // source matrices with cached BF16 compute weights, unlike Q8 QKV/Z.
-        let gate_pair =
-            first.ends_with(".ssm_alpha.weight") && second.ends_with(".ssm_beta.weight");
-        let dense_gates = gate_pair
-            && rows == 1
-            && x.dtype()? == DType::BFloat16
-            && shape.last() == Some(&2560)
-            && runtime_flags::is_one(c"MLX_QWEN4_GDN_GATE_PAIR");
         // A wider N changes MLX's matrix-multiply schedule for short windows.
         // This must precede the paired-bank cache lookup: a bank prepared by
         // singleton decoding must not opt a later verification window in.
-        if gate_pair && !dense_gates {
+        if first.ends_with(".ssm_alpha.weight") && second.ends_with(".ssm_beta.weight") {
             return Ok((self.linear(first, x)?, self.linear(second, x)?));
         }
-        if (rows <= 8 || wide_shared) && !runtime_flags::is_zero(c"MLX_QWEN4_PAIRED_PROJECTIONS") {
+        if rows <= 8 || wide_shared {
             let key = (first.to_owned(), second.to_owned());
             if !self.paired_banks.contains_key(&key)
                 && let (Some(a), Some(b)) = (
@@ -569,17 +827,6 @@ impl Store {
             {
                 let storage_compatible = match (&a.scales, &b.scales) {
                     (Some(a), Some(b)) => a.dtype()? == b.dtype()?,
-                    (None, None) => {
-                        dense_gates
-                            && a.values.dtype()? == DType::Float32
-                            && b.values.dtype()? == DType::Float32
-                            && *a.values.shape()? == [48, 2560]
-                            && *b.values.shape()? == [48, 2560]
-                            && a.dense_bf16.is_some()
-                            && b.dense_bf16.is_some()
-                            && a.biases.is_none()
-                            && b.biases.is_none()
-                    }
                     _ => false,
                 };
                 let compatible = storage_compatible
@@ -635,6 +882,12 @@ impl Store {
 }
 
 impl Weight {
+    /// The input widths the affine expert GEMV takes: the generic fast path
+    /// uses a different accumulation for K%512=0.
+    fn affine_gemv_takes(k: usize) -> bool {
+        !k.is_multiple_of(512)
+    }
+
     pub(in super::super) fn expert_rows(
         &self,
         x: &MxArray,
@@ -648,10 +901,10 @@ impl Weight {
             && let (Some(scales), Some(biases)) = (&self.scales, &self.biases)
             && scales.dtype().ok() == Some(DType::Float16)
             && ids.size()? <= 80
-            // The generic fast path uses a different accumulation for K%512=0.
-            && x.shape()?.last().is_some_and(|k| k % 512 != 0)
+            && x.shape()?
+                .last()
+                .is_some_and(|&k| Self::affine_gemv_takes(k as usize))
             && crate::engine::persistence::compiled_forward_backend_available()
-            && !runtime_flags::is_zero(c"MLX_QWEN4_AFFINE_GEMV")
         {
             let out = unsafe {
                 mlx_sys::mlx_qwen4_affine_expert_gemv(
@@ -671,7 +924,6 @@ impl Weight {
             && ids.size()? <= 80
             && let (Some(scales), Some(biases)) = (&self.scales, &self.biases)
             && crate::engine::persistence::compiled_forward_backend_available()
-            && !runtime_flags::is_zero(c"MLX_QWEN4_DIRECT_GEMV")
         {
             let mode = std::ffi::CString::new(self.mode.as_str()).map_err(err)?;
             let out = unsafe {
@@ -920,7 +1172,11 @@ mod tests {
             // Reproduce the actual cache state after a singleton projection.
             // Short verification windows must use the two original N=48
             // matmuls even though the joined N=96 bank is already cached.
-            let mut store = Store::open_metadata(&fixture().join("model.gguf"), None).unwrap();
+            let mut store = Store::open_metadata(
+                &fixture().join("model.gguf"),
+                Some(&Store::fixture_pack_root()),
+            )
+            .unwrap();
             let first = "blk.0.ssm_alpha.weight";
             let second = "blk.0.ssm_beta.weight";
             for (name, start) in [(first, 0), (second, 48)] {
@@ -967,17 +1223,19 @@ mod tests {
     }
 
     #[test]
-    fn failed_full_load_releases_banks_before_partial_retry() {
-        for policy in ["auto", "full"] {
-            let mut store = Store::open_metadata(&fixture().join("model.gguf"), None).unwrap();
+    fn failed_bank_load_releases_banks_before_the_retry() {
+        let mut store = Store::open_metadata(
+            &fixture().join("model.gguf"),
+            Some(&Store::fixture_pack_root()),
+        )
+        .unwrap();
+        {
             store.plan.hot_bytes = store.hot_bytes().unwrap();
-            store.plan.resident = true;
-            store.plan.policy = policy.into();
             let mut refused = false;
             let mut refreshed = false;
             let result = store.prepare_hot_with_admission(
                 &mut |bytes| {
-                    // Simulate headroom loss only after the full bank set is
+                    // Simulate headroom loss only after the bank set is
                     // complete. No large allocation or OS settings change needed.
                     if bytes == super::super::super::memory::WORKING_BYTES && !refused {
                         refused = true;
@@ -993,15 +1251,12 @@ mod tests {
                 },
             );
             assert!(refused);
-            assert_eq!(refreshed, policy == "auto");
-            if policy == "full" {
-                assert!(result.is_err());
-                assert!(store.banks.is_empty());
-                assert_eq!(store.cache_bytes, 0);
-            } else {
-                result.unwrap();
-                assert!(!store.plan.resident);
-                assert!(!store.banks.is_empty());
+            assert!(refreshed);
+            result.unwrap();
+        }
+        assert!(!store.banks.is_empty());
+        {
+            {
                 assert!(
                     store
                         .banks
@@ -1009,7 +1264,10 @@ mod tests {
                         .all(|name| is_fixed_projection(name, &store.tensors[name]))
                 );
                 assert_eq!(store.cache_bytes, store.bank_bytes);
-                assert_eq!(store.plan.resident_bank_bytes, store.bank_bytes);
+                assert_eq!(
+                    store.plan.resident_bank_bytes.load(Ordering::Relaxed),
+                    store.bank_bytes
+                );
                 assert!(store.bank_bytes < store.plan.hot_bytes);
                 assert!(
                     store.cache.is_empty()
@@ -1021,9 +1279,303 @@ mod tests {
     }
 
     #[test]
+    fn mtp_banks_decline_when_the_cache_cannot_stage_both() {
+        // 3 x MAX_READ_BYTES lets the first bank's eviction target saturate
+        // to zero and pass; the second bank's cannot once the first is pinned.
+        let mut s = Store::open_fixture(&fixture().join("bf16/paged"), None).unwrap();
+        s.cache_limit = MAX_READ_BYTES * 3;
+        let before = s.cache_bytes;
+        let mut declined = |_: u64| -> Result<()> { panic!("a declined build reached the host") };
+        assert_eq!(s.prepare_mtp_expert_banks_with(&mut declined).unwrap(), 0);
+        assert_eq!(s.mtp_bank_bytes().unwrap(), 0);
+        assert!(MTP_EXPERT_BANKS.iter().all(|n| !s.banks.contains_key(*n)));
+        assert_eq!(s.cache_bytes, before);
+        assert_eq!(s.bank_bytes, 0);
+        assert_eq!(s.plan.resident_bank_bytes.load(Ordering::Relaxed), 0);
+        assert!(s.mtp_banks_declined, "a declined build must not retry");
+        s.cache_limit = CACHE_BYTES;
+        assert_eq!(s.prepare_mtp_expert_banks_with(&mut declined).unwrap(), 0);
+        s.mtp_banks_declined = false;
+        let bytes = s.prepare_fixture_mtp_expert_banks().unwrap();
+        assert!(bytes > 0);
+        assert_eq!(s.cache_bytes, before + bytes);
+    }
+
+    #[test]
+    fn failed_second_mtp_bank_leaves_no_partial_bank() {
+        let mut s = Store::open_fixture(&fixture().join("bf16/paged"), None).unwrap();
+        let before = (s.cache_bytes, s.bank_bytes);
+        let mut admissions = 0;
+        let error = s
+            .prepare_mtp_expert_banks_with(&mut |_| {
+                admissions += 1;
+                if admissions == 2 {
+                    Err(err("simulated headroom loss before the second bank"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert!(error.reason.contains("second bank"), "{error}");
+        assert_eq!(admissions, 2);
+        assert!(MTP_EXPERT_BANKS.iter().all(|n| !s.banks.contains_key(*n)));
+        assert_eq!((s.cache_bytes, s.bank_bytes), before);
+        assert_eq!(s.mtp_bank_bytes().unwrap(), 0);
+        assert_eq!(s.plan.resident_bank_bytes.load(Ordering::Relaxed), 0);
+        assert!(s.mtp_banks_declined);
+        assert_eq!(s.prepare_mtp_expert_banks().unwrap(), 0);
+        s.mtp_banks_declined = false;
+        let bytes = s.prepare_mtp_expert_banks_with(&mut |_| Ok(())).unwrap();
+        assert!(bytes > 0);
+        assert!(MTP_EXPERT_BANKS.iter().all(|n| s.banks.contains_key(*n)));
+        assert_eq!(s.bank_bytes, before.1 + bytes);
+        assert_eq!(
+            s.plan.resident_bank_bytes.load(Ordering::Relaxed),
+            s.bank_bytes
+        );
+    }
+
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const MTP_TEST_EXPERTS: usize = 4;
+
+    /// The MTP head's routed-expert banks at their real expert shapes (four
+    /// experts, BF16 in a temporary file), with each bank's source rows.
+    fn real_shape_mtp_experts() -> (Vec<(String, Tensor)>, Vec<MxArray>, Cleanup) {
+        let dir = std::env::temp_dir().join(format!("qwen4-mtp-sides-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cleanup = Cleanup(dir.clone());
+        let path = dir.join("experts.bin");
+        let banks = [
+            (MTP_EXPERT_BANKS[0], 1280, 2560),
+            (MTP_EXPERT_BANKS[1], 2560, 640),
+        ];
+        let (mut payload, mut tensors, mut sources) = (Vec::new(), Vec::new(), Vec::new());
+        for (k, (name, n, width)) in banks.into_iter().enumerate() {
+            let rows = MTP_TEST_EXPERTS * n;
+            let bits: Vec<u16> = (0..rows * width)
+                .map(|i| {
+                    let hash = (i as u32 ^ k as u32).wrapping_mul(2654435761) >> 8;
+                    let row = 0.05 + (i / width % 7) as f32 * 0.04;
+                    let v = (hash as f32 / (1u32 << 24) as f32 - 0.5) * row;
+                    (v.to_bits() >> 16) as u16
+                })
+                .collect();
+            tensors.push((
+                name.into(),
+                Tensor {
+                    path: path.clone(),
+                    shape: vec![MTP_TEST_EXPERTS, n, width],
+                    offset: payload.len() as u64,
+                    bytes: bits.len() as u64 * 2,
+                    encoding: Encoding::Safe("BF16".into()),
+                },
+            ));
+            payload.extend(bits.iter().flat_map(|b| b.to_le_bytes()));
+            sources.push(MxArray::from_bfloat16(&bits, &[rows as i64, width as i64]).unwrap());
+        }
+        std::fs::write(&path, &payload).unwrap();
+        (tensors, sources, cleanup)
+    }
+
+    /// The draft gate_up bank at its real expert shape (1280 x 2560, a K the
+    /// affine expert GEMV refuses) is built with f32 sides once, and its
+    /// gather keeps the bits of the f16-sided bank it replaces; the down bank
+    /// keeps f16 sides for the GEMV, and the estimate is the built bytes.
+    /// MUTATIONS: `quantize_q8` keeps f16 sides -> the gate_up dtype
+    /// assertion; 9/8 bytes for f32 sides -> the bytes; `quantize_q8`
+    /// quantizes at the side dtype -> `rows=10`.
+    #[test]
+    fn mtp_gate_up_bank_holds_f32_sides_with_the_f16_gather_bits() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let (experts, sources, _cleanup) = real_shape_mtp_experts();
+        let mut s = Store::open_fixture(&fixture().join("bf16/paged"), None).unwrap();
+        s.tensors.extend(experts);
+        let estimate = s.mtp_bank_estimate().unwrap();
+        let installed = s.prepare_mtp_expert_banks_with(&mut |_| Ok(())).unwrap();
+        let sides = |name: &str| {
+            let bank = s.resident_bank(name).unwrap();
+            [&bank.scales, &bank.biases].map(|a| a.as_ref().unwrap().dtype().unwrap())
+        };
+        assert_eq!(
+            sides(MTP_EXPERT_BANKS[0]),
+            [DType::Float32; 2],
+            "the gather casts f16 gate_up sides on every draft"
+        );
+        assert_eq!(
+            sides(MTP_EXPERT_BANKS[1]),
+            [DType::Float16; 2],
+            "the affine expert GEMV reads f16 down sides"
+        );
+        assert_eq!(installed, s.mtp_bank_bytes().unwrap());
+        assert_eq!(
+            installed,
+            (MTP_TEST_EXPERTS * 1280 * 2560 * 10 / 8 + MTP_TEST_EXPERTS * 2560 * 640 * 9 / 8)
+                as u64
+        );
+        assert_eq!(estimate, installed, "the estimate charges the built banks");
+        let gate_up = s.resident_bank(MTP_EXPERT_BANKS[0]).unwrap();
+        let before = Weight::quantize_q8(&sources[0], DType::Float16).unwrap();
+        for rows in [10usize, 40, 120] {
+            let ids = MxArray::from_uint32(
+                &(0..rows)
+                    .map(|i| ((i * 7 + i / 3) % MTP_TEST_EXPERTS) as u32)
+                    .collect::<Vec<_>>(),
+                &[rows as i64],
+            )
+            .unwrap();
+            let x = MxArray::from_float32(
+                &(0..rows * 2560)
+                    .map(|i| (i as f32 * 0.013).cos())
+                    .collect::<Vec<_>>(),
+                &[rows as i64, 1, 2560],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let bits = |bank: &Weight| {
+                bank.expert_rows(&x, &ids, MTP_TEST_EXPERTS, false)
+                    .unwrap()
+                    .astype(DType::Float32)
+                    .unwrap()
+                    .to_float32()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            };
+            let want = bits(&before);
+            assert!(want.iter().any(|&b| b != 0), "rows={rows}");
+            assert_eq!(bits(&gate_up), want, "rows={rows}");
+        }
+    }
+
+    /// The f32 sides need more live headroom than the f16 layout: a refused
+    /// f32 build builds the f16 one once instead of declining the draft banks,
+    /// and declines them only when that is refused too.
+    /// MUTATIONS: no f16 retry -> "the f32 gate_up staging"; the retry for
+    /// any layout -> `failed_second_mtp_bank_leaves_no_partial_bank`.
+    #[test]
+    fn refused_f32_draft_banks_fall_back_to_the_f16_layout() {
+        let (experts, _, _cleanup) = real_shape_mtp_experts();
+        let bytes = |n: usize, width: usize, eighths: usize| {
+            (MTP_TEST_EXPERTS * n * width * eighths / 8) as u64
+        };
+        let (wide, narrow, down) = (
+            bytes(1280, 2560, 10),
+            bytes(1280, 2560, 9),
+            bytes(2560, 640, 9),
+        );
+        let [wide_up, narrow_up, down_up] =
+            [wide, narrow, down].map(|bank| 2 * bank + super::super::super::memory::WORKING_BYTES);
+        let cases: [(&str, &[usize], &[u64], bool); 3] = [
+            (
+                "the f32 gate_up staging",
+                &[0],
+                &[wide_up, narrow_up, down_up],
+                true,
+            ),
+            (
+                "the down staging beside the f32 gate_up bank",
+                &[1],
+                &[wide_up, down_up, narrow_up, down_up],
+                true,
+            ),
+            (
+                "both gate_up stagings",
+                &[0, 1],
+                &[wide_up, narrow_up],
+                false,
+            ),
+        ];
+        for (why, refused, want, built) in cases {
+            let mut s = Store::open_fixture(&fixture().join("bf16/paged"), None).unwrap();
+            s.tensors.extend(experts.iter().cloned());
+            assert_eq!(s.mtp_bank_estimate().unwrap(), wide + down, "{why}");
+            let mut seen = Vec::new();
+            let result = s.prepare_mtp_expert_banks_with(&mut |bytes| {
+                seen.push(bytes);
+                if refused.contains(&(seen.len() - 1)) {
+                    Err(err("simulated headroom loss"))
+                } else {
+                    Ok(())
+                }
+            });
+            if built {
+                assert_eq!(result.ok(), Some(narrow + down), "{why}");
+                let bank = s.resident_bank(MTP_EXPERT_BANKS[0]).unwrap();
+                assert_eq!(
+                    [&bank.scales, &bank.biases].map(|a| a.as_ref().unwrap().dtype().unwrap()),
+                    [DType::Float16; 2],
+                    "{why}"
+                );
+                assert!(!s.mtp_banks_declined, "{why}");
+            } else {
+                assert!(result.is_err(), "{why}");
+                assert!(s.mtp_banks_declined, "{why}");
+                assert_eq!(s.mtp_bank_bytes().unwrap(), 0, "{why}");
+            }
+            assert_eq!(seen, want, "{why}");
+        }
+    }
+
+    /// The load keeps the f16 retry: a host that refuses the f32
+    /// gate_up staging gets the f16 layout, one that refuses both loads
+    /// without draft banks.
+    #[test]
+    fn the_load_retries_the_f16_layout_when_f32_is_refused() {
+        let (experts, _, _cleanup) = real_shape_mtp_experts();
+        let bytes = |n: usize, width: usize, eighths: usize| {
+            (MTP_TEST_EXPERTS * n * width * eighths / 8) as u64
+        };
+        let (wide, narrow, down) = (
+            bytes(1280, 2560, 10),
+            bytes(1280, 2560, 9),
+            bytes(2560, 640, 9),
+        );
+        let staging = |bank: u64| 2 * bank + super::super::super::memory::WORKING_BYTES;
+        for (refused, built) in [
+            (vec![staging(wide)], true),
+            (vec![staging(wide), staging(narrow)], false),
+        ] {
+            let mut s = Store::open_fixture(&fixture().join("bf16/paged"), None).unwrap();
+            s.tensors.extend(experts.iter().cloned());
+            let mut seen = Vec::new();
+            s.finish_load_with(&mut |bytes| {
+                seen.push(bytes);
+                if refused.contains(&bytes) {
+                    Err(err("simulated headroom loss at load"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(seen[..2], [staging(wide), staging(narrow)], "built={built}");
+            if built {
+                assert_eq!(s.mtp_bank_bytes().unwrap(), narrow + down);
+                let bank = s.resident_bank(MTP_EXPERT_BANKS[0]).unwrap();
+                assert_eq!(
+                    [&bank.scales, &bank.biases].map(|a| a.as_ref().unwrap().dtype().unwrap()),
+                    [DType::Float16; 2]
+                );
+                assert!(!s.mtp_banks_declined);
+            } else {
+                assert_eq!(s.mtp_bank_bytes().unwrap(), 0);
+                assert!(s.mtp_banks_declined);
+            }
+        }
+    }
+
+    #[test]
     fn partial_projection_banks_use_actual_sizes_and_preserve_expert_lru() {
         for path in [fixture(), fixture().join("model.gguf")] {
-            let mut s = Store::open_metadata(&path, None).unwrap();
+            let mut s = Store::open_metadata(&path, Some(&Store::fixture_pack_root())).unwrap();
             let bytes: u64 = s
                 .tensors
                 .iter()
@@ -1041,15 +1593,13 @@ mod tests {
                 "budget selection must read only descriptors"
             );
 
-            // A metadata-only fixture can exercise the partial policy without
+            // A metadata-only fixture can exercise the bank preparation without
             // requesting tens of GiB from the machine running these tests.
             s.cache_limit = CACHE_BYTES;
-            s.plan.policy = "auto".into();
             s.prepare_fixture_hot().unwrap();
-            assert!(!s.plan.resident);
             assert_eq!(s.bank_bytes, bytes);
             assert_eq!(s.cache_bytes, bytes);
-            assert_eq!(s.plan.resident_bank_bytes, bytes);
+            assert_eq!(s.plan.resident_bank_bytes.load(Ordering::Relaxed), bytes);
             assert!(s.cache.is_empty());
             assert_eq!(s.banks.len(), names.len());
             assert!(
@@ -1058,7 +1608,8 @@ mod tests {
                     .all(|n| is_fixed_projection(n, &s.tensors[n]))
             );
             let loaded = (s.bytes_read, s.packed_bytes_read);
-            let mut control = Store::open_metadata(&path, None).unwrap();
+            let mut control =
+                Store::open_metadata(&path, Some(&Store::fixture_pack_root())).unwrap();
             for name in names {
                 let rows = s.descriptor(&name).unwrap().rows().unwrap();
                 for start in [0, rows - 1] {
@@ -1096,19 +1647,23 @@ mod tests {
     }
 
     #[test]
-    fn resident_banks_preserve_rows_and_leave_lookup_and_auxiliary_weights_cold() {
+    fn projection_banks_preserve_rows_and_leave_lookup_and_auxiliary_weights_cold() {
         for path in [fixture(), fixture().join("bf16/paged/model.gguf")] {
-            let mut s = Store::open_metadata(&path, None).unwrap();
-            s.plan.resident = true;
-            let hot = s.hot_bytes().unwrap();
+            let mut s = Store::open_metadata(&path, Some(&Store::fixture_pack_root())).unwrap();
             assert_eq!(s.bytes_read, 0);
             s.prepare_fixture_hot().unwrap();
-            assert_eq!(s.cache_bytes, hot);
+            assert_eq!(s.cache_bytes, s.bank_bytes);
             assert!(s.cache.is_empty());
             assert!(s.banks.keys().all(|name| is_hot(name)));
+            assert!(
+                s.banks
+                    .keys()
+                    .all(|name| is_fixed_projection(name, &s.tensors[name]))
+            );
             assert!(!s.banks.is_empty());
             let reads = (s.bytes_read, s.packed_hits, s.packed_bytes_read);
-            let mut reference = Store::open_metadata(&path, None).unwrap();
+            let mut reference =
+                Store::open_metadata(&path, Some(&Store::fixture_pack_root())).unwrap();
             for name in s.banks.keys().cloned().collect::<Vec<_>>() {
                 let rows = s.descriptor(&name).unwrap().rows().unwrap();
                 for start in [0, rows - 1] {
@@ -1147,12 +1702,16 @@ mod tests {
     #[test]
     fn oversized_bank_is_rejected_before_any_payload_read() {
         let mut s = Store::open_metadata(&fixture(), None).unwrap();
-        s.plan.resident = true;
         let d = s.tensors.get_mut("lm_head.weight").unwrap();
         d.shape = vec![1 << 30, 1];
         d.bytes = 4 << 30;
+        // Budget selection leaves such a checkpoint on its chunk path...
+        assert!(s.projection_bank_names().unwrap().is_empty());
+        s.prepare_fixture_hot().unwrap();
+        assert!(s.banks.is_empty());
+        // ...and an explicit bank request is refused before any read.
         assert!(
-            s.prepare_fixture_hot()
+            s.prepare_banks(vec!["lm_head.weight".into()], &mut |_| Ok(()))
                 .unwrap_err()
                 .to_string()
                 .contains("1 GiB bank budget")

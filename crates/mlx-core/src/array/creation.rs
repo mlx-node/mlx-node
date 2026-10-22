@@ -1,7 +1,11 @@
+use super::mapped::{MAPPED_ARRAY_BYTES, MappedLease, Mmap, page_size, release_mapped};
 use super::{DType, MxArray};
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use std::ffi::c_void;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 fn validate_data_shape(data_len: usize, shape: &[i64], context: &str) -> Result<()> {
     let mut expected: usize = 1;
@@ -245,6 +249,82 @@ impl MxArray {
         let dt = dtype.unwrap_or(DType::Float32);
         let handle = unsafe { sys::mlx_array_arange(start, stop, step.unwrap_or(1.0), dt.code()) };
         MxArray::from_handle(handle, "array_arange")
+    }
+}
+
+impl MxArray {
+    /// An array whose storage is `map[offset..offset + nbytes]`, with no
+    /// copy. `offset` must be page-aligned (the Metal no-copy buffer rule);
+    /// any other refusal by the driver is an error, never a copied array.
+    pub fn from_mapped(
+        map: &Arc<Mmap>,
+        offset: usize,
+        shape: &[i64],
+        dtype: DType,
+    ) -> Result<Self> {
+        let mut numel: usize = 1;
+        for (axis, &dim) in shape.iter().enumerate() {
+            let dim = usize::try_from(dim).map_err(|_| {
+                Error::from_reason(format!(
+                    "from_mapped: negative dimension {dim} at axis {axis}"
+                ))
+            })?;
+            numel = numel.checked_mul(dim).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "from_mapped: shape {shape:?} overflows usize at axis {axis}"
+                ))
+            })?;
+        }
+        let nbytes = numel
+            .checked_mul(dtype.byte_size())
+            .ok_or_else(|| Error::from_reason("from_mapped: byte size overflows usize"))?;
+        if nbytes == 0 {
+            return Err(Error::from_reason(
+                "from_mapped: an empty array cannot be mapped",
+            ));
+        }
+        let page = page_size();
+        if !offset.is_multiple_of(page) {
+            return Err(Error::from_reason(format!(
+                "from_mapped: offset {offset} is not page-aligned ({page} B pages)"
+            )));
+        }
+        let end = offset
+            .checked_add(nbytes)
+            .ok_or_else(|| Error::from_reason("from_mapped: range overflows usize"))?;
+        if end > map.len() {
+            return Err(Error::from_reason(format!(
+                "from_mapped: range {offset}..{end} exceeds the mapping length {}",
+                map.len()
+            )));
+        }
+        let lease = Box::into_raw(Box::new(MappedLease {
+            _map: Arc::clone(map),
+            bytes: nbytes,
+        }));
+        MAPPED_ARRAY_BYTES.fetch_add(nbytes as u64, Ordering::AcqRel);
+        // SAFETY: the pointer range is inside the live mapping; the lease
+        // keeps it mapped until MLX runs release_mapped.
+        let handle = unsafe {
+            sys::mlx_array_from_mapped(
+                map.as_ptr().add(offset).cast_mut().cast::<c_void>(),
+                nbytes,
+                shape.as_ptr(),
+                shape.len(),
+                dtype.code(),
+                Some(release_mapped),
+                lease.cast::<c_void>(),
+            )
+        };
+        if handle.is_null() {
+            // SAFETY: the bridge did not take the lease on a null return.
+            unsafe { release_mapped(lease.cast::<c_void>()) };
+            return Err(Error::from_reason(format!(
+                "from_mapped: Metal refused a no-copy buffer over the mapping \
+                 (offset {offset}, {nbytes} bytes)"
+            )));
+        }
+        MxArray::from_handle(handle, "array_from_mapped")
     }
 }
 

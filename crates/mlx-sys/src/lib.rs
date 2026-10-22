@@ -2510,13 +2510,6 @@ pub type MlxGraphBuilder = unsafe extern "C" fn(
 ) -> bool;
 
 unsafe extern "C" {
-    /// Forward-local runtime settings. Begin/end must run on the same thread.
-    pub fn mlx_qwen4_flags_begin();
-    pub fn mlx_qwen4_flags_end();
-    pub fn mlx_qwen4_flag_equals(
-        name: *const std::os::raw::c_char,
-        value: *const std::os::raw::c_char,
-    ) -> bool;
     /// Exclusive mutable expert-slot transaction. The caller must evaluate all
     /// lazy readers of destination banks before recycling slots.
     pub fn mlx_qwen4_copy_weight_rows(
@@ -2539,14 +2532,6 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
-    pub fn mlx_qwen4_routes_shared_gate(
-        logits: *mut mlx_array,
-        input: *mut mlx_array,
-        weight: *mut mlx_array,
-        ids: *mut *mut mlx_array,
-        scores: *mut *mut mlx_array,
-        gate: *mut *mut mlx_array,
-    ) -> bool;
     pub fn mlx_qwen4_singleton_routes(
         logits: *mut mlx_array,
         ids: *mut *mut mlx_array,
@@ -2661,22 +2646,6 @@ unsafe extern "C" {
     ) -> *mut mlx_array;
     pub fn mlx_qwen4_prefill_norm(x: *mut mlx_array, w: *mut mlx_array, eps: f64)
     -> *mut mlx_array;
-    pub fn mlx_qwen4_rotary_window(
-        x: *mut mlx_array,
-        cosine: *mut mlx_array,
-        sine: *mut mlx_array,
-    ) -> *mut mlx_array;
-    pub fn mlx_qwen4_attention_gate(
-        attention: *mut mlx_array,
-        projection: *mut mlx_array,
-    ) -> *mut mlx_array;
-    pub fn mlx_qwen4_attention_norm_rotary(
-        x: *mut mlx_array,
-        weight: *mut mlx_array,
-        cosine: *mut mlx_array,
-        sine: *mut mlx_array,
-        eps: f64,
-    ) -> *mut mlx_array;
     pub fn mlx_qwen4_decode_norm(x: *mut mlx_array, w: *mut mlx_array, eps: f64) -> *mut mlx_array;
     pub fn mlx_qwen4_inject_norm(
         x: *mut mlx_array,
@@ -2686,17 +2655,6 @@ unsafe extern "C" {
         eps: f64,
         stream: *mut *mut mlx_array,
         normed: *mut *mut mlx_array,
-    ) -> bool;
-    pub fn mlx_qwen4_mixer_down_inject(
-        input: *mut mlx_array,
-        down: *mut mlx_array,
-        down_scales: *mut mlx_array,
-        down_biases: *mut mlx_array,
-        inject: *mut mlx_array,
-        inject_scales: *mut mlx_array,
-        inject_biases: *mut mlx_array,
-        out: *mut *mut mlx_array,
-        out_inject: *mut *mut mlx_array,
     ) -> bool;
     pub fn mlx_qwen4_decode_mixer_act(
         x: *mut mlx_array,
@@ -2747,8 +2705,22 @@ unsafe extern "C" {
         query_ends: *mut mlx_array,
         scale: f32,
         block_size: i32,
+        heads_per_group: i32,
         out: *mut *mut mlx_array,
-    ) -> bool;
+    ) -> i32;
+    pub fn mlx_qwen4_qsa_attention_pipeline_threads(
+        queries: *mut mlx_array,
+        keys: *mut mlx_array,
+        values: *mut mlx_array,
+        selected: *mut mlx_array,
+        query_ends: *mut mlx_array,
+        block_size: i32,
+        heads_per_group: i32,
+    ) -> i32;
+    /// TEST-ONLY: the calling thread's next `count` QSA pipeline probes that
+    /// miss the cache throw as a failed Metal compile would; returns the count
+    /// armed before the call.
+    pub fn mlx_test_qwen4_qsa_fail_probes(count: i32) -> i32;
 }
 
 unsafe extern "C" {
@@ -2780,14 +2752,44 @@ unsafe extern "C" {
         scales: *mut mlx_array,
         biases: *mut mlx_array,
     ) -> *mut mlx_array;
-    pub fn mlx_qwen4_router_decode(input: *mut mlx_array, weight: *mut mlx_array)
-    -> *mut mlx_array;
-
     pub fn mlx_qwen4_dense_decode(
         x: *mut mlx_array,
         weight: *mut mlx_array,
         scales: *mut mlx_array,
         biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+    /// Row-batched twins of the single-row decode kernels: `x` is `[1, R, K]`
+    /// with `R` in `1..=4`, every row's weight read is shared, and row `j`
+    /// carries the bits of the single-row entry on row `j` alone.
+    pub fn mlx_qwen4_dense_decode_rows(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_decode_mixer_act_rows(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_mixer_sums(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        split: bool,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_hyper_up_rows(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        normed: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_routed_shared_experts_rows(
+        inputs: *const *mut mlx_array,
+        count: usize,
     ) -> *mut mlx_array;
     pub fn mlx_qwen4_prefill_mixer_act(
         input: *mut mlx_array,
@@ -2803,25 +2805,6 @@ unsafe extern "C" {
         biases: *mut mlx_array,
         normed: *mut mlx_array,
     ) -> *mut mlx_array;
-    pub fn mlx_qwen4_hyper_up_inject(
-        x: *mut mlx_array,
-        weight: *mut mlx_array,
-        scales: *mut mlx_array,
-        biases: *mut mlx_array,
-        normed: *mut mlx_array,
-        injection: *mut mlx_array,
-        out: *mut *mut mlx_array,
-        out_gate: *mut *mut mlx_array,
-    ) -> bool;
-    pub fn mlx_qwen4_sorted_shared_combine(
-        values: *mut mlx_array,
-        scores: *mut mlx_array,
-        inverse: *mut mlx_array,
-        shared: *mut mlx_array,
-        gate: *mut mlx_array,
-        top: i32,
-    ) -> *mut mlx_array;
-
     pub fn mlx_qwen4_expert_prefill(
         x: *mut mlx_array,
         ids: *mut mlx_array,
@@ -2904,4 +2887,23 @@ unsafe extern "C" {
         out_y: *mut *mut mlx_array,
         out_state: *mut *mut mlx_array,
     ) -> bool;
+}
+
+unsafe extern "C" {
+    // Array over caller-owned storage (`mlx_mapped.cpp`). Null when the Metal
+    // driver refuses a no-copy buffer over `ptr`; never an array over copied
+    // bytes. `release_fn(ctx)` runs once when the last array sharing the
+    // storage is dropped, and does not run on a null return.
+    pub fn mlx_array_from_mapped(
+        ptr: *mut std::ffi::c_void,
+        bytes: usize,
+        shape: *const i64,
+        ndim: usize,
+        dtype: i32,
+        release_fn: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+        ctx: *mut std::ffi::c_void,
+    ) -> *mut mlx_array;
+    // Null unless the array is available (a mapped array, or an evaluated
+    // array that was already waited on); never waits and never throws.
+    pub fn mlx_array_data_ptr(handle: *mut mlx_array) -> *const std::ffi::c_void;
 }

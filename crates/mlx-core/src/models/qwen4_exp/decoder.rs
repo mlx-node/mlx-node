@@ -1,6 +1,5 @@
 use super::{config::Config, math, weights::Store};
 use crate::array::{DType, MxArray, scaled_dot_product_attention};
-use crate::models::qwen4_exp::runtime_flags;
 use crate::nn::Activations;
 use napi::{Error, Result};
 use std::sync::{
@@ -18,6 +17,16 @@ mod draft_window;
 #[path = "scheduled_batch.rs"]
 mod scheduled_batch;
 
+/// Slot banks for a window's expert groups: a lease per group, then the
+/// release of that group's output before the slots serve the next group.
+pub(super) trait GroupBanks {
+    fn lease(
+        &mut self,
+        experts: &[u32],
+    ) -> Result<Option<([Arc<super::weights::Weight>; 3], Vec<u32>, usize)>>;
+    fn release(&mut self, output: &MxArray) -> Result<()>;
+}
+
 struct AttentionProjections {
     qg: MxArray,
     k: MxArray,
@@ -32,6 +41,17 @@ struct GdnProjections {
     a: MxArray,
     b: MxArray,
 }
+impl GdnProjections {
+    fn row(&self, row: usize) -> Result<Self> {
+        let slice = |a: &MxArray| a.slice_axis(1, row as i64, row as i64 + 1);
+        Ok(Self {
+            qkv: slice(&self.qkv)?,
+            z: slice(&self.z)?,
+            a: slice(&self.a)?,
+            b: slice(&self.b)?,
+        })
+    }
+}
 impl AttentionProjections {
     fn row(&self, row: usize) -> Result<Self> {
         let slice = |a: &MxArray| a.slice_axis(1, row as i64, row as i64 + 1);
@@ -45,12 +65,19 @@ impl AttentionProjections {
     }
 }
 
+const DRAFT_HISTORY_STEP: usize = 256;
+const DRAFT_HEAD_ROWS: usize = 3;
+
 #[derive(Clone, Default)]
 pub struct LayerCache {
     conv: Option<MxArray>,
     recurrent: Option<MxArray>,
     keys: Option<MxArray>,
     values: Option<MxArray>,
+    /// Draft history: the rows of `keys`/`values` this cache owns. Clones
+    /// share one buffer and write in place past their own rows, so no cache
+    /// may read past its own rows.
+    draft_rows: Option<usize>,
     index_tail: Vec<MxArray>,
     /// `[blocks, indexer_head_dim]`. Snapshots and replay share handles, so
     /// appending must build a new array, never write into this one.
@@ -71,6 +98,78 @@ impl LayerCache {
         };
         Ok(self.index_keys.insert(keys))
     }
+    /// Write draft K/V rows after this cache's rows. A buffer too small for
+    /// them is replaced in this cache only: other holders keep reading theirs.
+    pub(super) fn append_draft_kv(
+        &mut self,
+        k: &MxArray,
+        v: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
+        let rows = self.draft_rows.unwrap_or(0);
+        let end = rows + k.shape_at(2)? as usize;
+        let capacity = match &self.keys {
+            Some(keys) => keys.shape_at(2)? as usize,
+            None => 0,
+        };
+        if end > capacity {
+            let target = (end + DRAFT_HEAD_ROWS).next_multiple_of(DRAFT_HISTORY_STEP);
+            let grow = |old: &Option<MxArray>, update: &MxArray| -> Result<MxArray> {
+                let shape = [
+                    update.shape_at(0)?,
+                    update.shape_at(1)?,
+                    (target - rows) as i64,
+                    update.shape_at(3)?,
+                ];
+                let fresh = MxArray::zeros(&shape, Some(update.dtype()?))?;
+                match old {
+                    Some(old) if rows > 0 => {
+                        MxArray::concatenate(&old.slice_axis(2, 0, rows as i64)?, &fresh, 2)
+                    }
+                    _ => Ok(fresh),
+                }
+            };
+            self.keys = Some(grow(&self.keys, k)?);
+            self.values = Some(grow(&self.values, v)?);
+        }
+        let (Some(keys), Some(values)) = (self.keys.as_mut(), self.values.as_mut()) else {
+            return Err(Error::from_reason(
+                "Qwen4 MTP draft history lost its buffer",
+            ));
+        };
+        keys.slice_assign_axis_inplace(2, rows as i64, end as i64, k)?;
+        values.slice_assign_axis_inplace(2, rows as i64, end as i64, v)?;
+        self.draft_rows = Some(end);
+        Ok((keys.clone(), values.clone()))
+    }
+    /// (rows, K buffer, V buffer) of a draft history.
+    #[cfg(test)]
+    pub(super) fn draft_kv(&self) -> Option<(usize, &MxArray, &MxArray)> {
+        Some((self.draft_rows?, self.keys.as_ref()?, self.values.as_ref()?))
+    }
+    /// (K/V rows, indexer blocks, indexer tail rows).
+    #[cfg(test)]
+    pub(super) fn history_shape(&self) -> (usize, usize, usize) {
+        let rows = self.draft_rows.unwrap_or_else(|| {
+            self.keys
+                .as_ref()
+                .map_or(0, |keys| keys.shape_at(2).unwrap() as usize)
+        });
+        (
+            rows,
+            self.index_block_count().unwrap(),
+            self.index_tail.len(),
+        )
+    }
+    pub(super) fn arrays(&self) -> impl Iterator<Item = &MxArray> {
+        self.conv
+            .iter()
+            .chain(self.recurrent.iter())
+            .chain(self.ple_conv.iter())
+            .chain(self.keys.iter())
+            .chain(self.values.iter())
+            .chain(self.index_keys.iter())
+            .chain(self.index_tail.iter())
+    }
 }
 #[derive(Clone, Default)]
 pub struct DecoderState {
@@ -82,12 +181,20 @@ pub struct DecoderState {
     last_chunk_hidden: Vec<MxArray>,
     cancelled: Option<Arc<AtomicBool>>,
 }
+impl DecoderState {
+    pub(super) fn arrays(&self) -> impl Iterator<Item = &MxArray> {
+        self.caches
+            .iter()
+            .flat_map(LayerCache::arrays)
+            .chain(self.last_chunk_hidden.iter())
+    }
+}
 pub struct Decoder {
-    pub batch_prefill: bool,
-    pub window_carry: bool,
-    pub async_prefill: bool,
-    pub batch_rotary: bool,
     pub prefill_chunk_size: usize,
+    /// A test that sizes admission through the prefill window keeps its
+    /// window across the turn opens that re-derive it from the plan.
+    #[cfg(test)]
+    pub(super) prefill_window_pin: Option<usize>,
     // Like TrackFastModel's retained configuration, share immutable metadata
     // across forward helpers instead of copying its strings/lists per layer.
     pub config: Arc<Config>,
@@ -106,23 +213,102 @@ pub struct Decoder {
     verification: Option<Vec<DecoderState>>,
     device_routes: Option<Vec<(usize, MxArray)>>,
     device_route_cooldown: usize,
+    /// Layers whose routes a pass read back to the host one at a time.
+    #[cfg(test)]
+    pub(super) route_readbacks: u64,
+    #[cfg(test)]
+    pub(super) submit_log: std::cell::RefCell<Vec<String>>,
     pub last_chunk_hidden: Vec<MxArray>,
+    /// The final residual streams of the last layer-major group, one per
+    /// window, until its views are taken.
+    group_streams: Vec<MxArray>,
+    /// Tests pin group mode on or off in place of the live rule.
+    #[cfg(test)]
+    pub(super) group_pin: Option<bool>,
+    /// Tentative commits taken, each with the windows it covered.
+    #[cfg(test)]
+    pub(super) tentative_commits: Vec<usize>,
+    /// Every (rows, elapsed) sample handed to the tripwire, in order.
+    #[cfg(test)]
+    pub(super) pass_samples: Vec<(usize, std::time::Duration)>,
+    /// Runs after every layer sweep of a group, with the layer; tests trip
+    /// the wire or cancel between two sweeps through it.
+    #[cfg(test)]
+    pub(super) after_sweep: Option<Box<dyn FnMut(&mut Decoder, usize) + Send>>,
+    /// The weight budget this store registers with the process-wide cache
+    /// limit; re-registered whenever the residency changes, between turns or
+    /// between two passes of one request.
+    cache_limit_guard: Option<crate::cache_limit::CacheLimitGuard>,
+    /// Runs after every observed pass; tests cut the admitted window between
+    /// two passes of one prompt through it.
+    #[cfg(test)]
+    pub(super) after_pass: Option<Box<dyn FnMut(&mut Decoder) + Send>>,
 }
 impl Decoder {
+    /// Register the budget in force with the process-wide cache limit.
+    pub fn register_cache_limit(&mut self) {
+        self.cache_limit_guard = None;
+        self.cache_limit_guard =
+            Some(crate::cache_limit::coordinator().register(self.weights.cache_budget()));
+    }
+
+    /// The prefill window follows the plan in force (mapped or fallback).
+    pub fn refresh_prefill_window(&mut self) {
+        let window = super::memory::prefill_window(&self.config, &self.weights.plan);
+        #[cfg(test)]
+        let window = self.prefill_window_pin.unwrap_or(window);
+        self.prefill_chunk_size = window;
+        self.weights
+            .live
+            .prefill_chunk_tokens
+            .store(self.prefill_chunk_size as u64, Ordering::Release);
+    }
+
+    /// The store changed its residency: the budget it registers and the
+    /// prefill window it admits follow.
+    pub fn residency_changed(&mut self) {
+        self.register_cache_limit();
+        self.refresh_prefill_window();
+    }
+
+    /// One main-network pass over `rows` rows took `elapsed`. A pass that
+    /// trips the wire moves the store to slots before the next one; the
+    /// request goes on with its state intact, and `residencyInfo()` records
+    /// the position it left the mapped path at.
+    pub(super) fn observe_pass(&mut self, rows: usize, elapsed: std::time::Duration) {
+        #[cfg(test)]
+        self.pass_samples.push((rows, elapsed));
+        match self.weights.observe_pass(rows, elapsed) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                self.weights
+                    .live
+                    .fallback_token_index
+                    .store(self.history.len() as u64, Ordering::Release);
+                self.residency_changed();
+            }
+            Err(error) => {
+                tracing::warn!("qwen4 residency: slot fallback not applied: {error}")
+            }
+        }
+        #[cfg(test)]
+        if let Some(mut hook) = self.after_pass.take() {
+            hook(self);
+            self.after_pass = Some(hook);
+        }
+    }
+
     pub fn prefill_slice_size(&self) -> usize {
-        let requested = std::env::var("MLX_QWEN4_PREFILL_SLICE").ok();
-        super::memory::prefill_slice(self.prefill_chunk_size, requested.as_deref())
+        self.prefill_chunk_size
     }
 
     pub fn new(config: Config, weights: Store) -> Result<Self> {
         // Validate the checkpoint topology before the first tensor payload read.
-        let prefill_chunk_size = super::memory::prefill_window(&config, &weights.plan)?;
+        let prefill_chunk_size = super::memory::prefill_window(&config, &weights.plan);
         let d = Self {
             prefill_chunk_size,
-            window_carry: true,
-            async_prefill: true,
-            batch_rotary: true,
-            batch_prefill: !runtime_flags::is_zero(c"MLX_QWEN4_BATCH_PREFILL"),
+            #[cfg(test)]
+            prefill_window_pin: None,
             caches: (0..config.num_hidden_layers)
                 .map(|_| LayerCache::default())
                 .collect(),
@@ -141,7 +327,23 @@ impl Decoder {
             verification: None,
             device_routes: None,
             device_route_cooldown: 0,
+            #[cfg(test)]
+            route_readbacks: 0,
+            #[cfg(test)]
+            submit_log: Default::default(),
             last_chunk_hidden: Vec::new(),
+            group_streams: Vec::new(),
+            #[cfg(test)]
+            group_pin: None,
+            #[cfg(test)]
+            tentative_commits: Vec::new(),
+            #[cfg(test)]
+            pass_samples: Vec::new(),
+            #[cfg(test)]
+            after_sweep: None,
+            cache_limit_guard: None,
+            #[cfg(test)]
+            after_pass: None,
         };
         d.preflight()?;
         Ok(d)
@@ -194,38 +396,24 @@ impl Decoder {
         self.rope_delta = 0;
         self.media_digests.clear();
         self.last_chunk_hidden.clear();
+        self.group_streams.clear();
         self.caches = (0..self.config.num_hidden_layers)
             .map(|_| LayerCache::default())
             .collect();
     }
     fn rope(&self, x: &MxArray, pos: usize) -> Result<MxArray> {
-        let cached = runtime_flags::is_one(c"MLX_QWEN4_ROTARY_TABLES");
-        if !cached && (!self.scope.is_empty() || self.positions.is_empty()) {
+        if !self.scope.is_empty() || self.positions.is_empty() {
             return math::rope(x, pos, self.config.rope_dims(), self.config.rope_theta());
         }
         let v = &self.config.rope_parameters;
-        let (p, sections, interleaved) = if !self.scope.is_empty() || self.positions.is_empty() {
-            ([pos as i64; 3], [0; 3], true)
-        } else {
-            (
-                self.positions
-                    .get(pos)
-                    .copied()
-                    .unwrap_or([pos as i64 + self.rope_delta; 3]),
-                std::array::from_fn(|i| v["mrope_section"][i].as_u64().unwrap_or(0) as usize),
-                v["mrope_interleaved"].as_bool().unwrap_or(true),
-            )
-        };
-        if cached {
-            return self.rotary_tables.borrow_mut().apply_singleton(
-                x,
-                p,
-                self.config.rope_dims(),
-                self.config.rope_theta(),
-                sections,
-                interleaved,
-            );
-        }
+        let p = self
+            .positions
+            .get(pos)
+            .copied()
+            .unwrap_or([pos as i64 + self.rope_delta; 3]);
+        let sections =
+            std::array::from_fn(|i| v["mrope_section"][i].as_u64().unwrap_or(0) as usize);
+        let interleaved = v["mrope_interleaved"].as_bool().unwrap_or(true);
         math::mrope(
             x,
             p,
@@ -234,6 +422,10 @@ impl Decoder {
             sections,
             interleaved,
         )
+    }
+    #[cfg(test)]
+    pub(super) fn rope_row(&self, x: &MxArray, pos: usize) -> Result<MxArray> {
+        self.rope(x, pos)
     }
     fn gguf(&self) -> bool {
         self.weights.gguf && self.scope.is_empty()
@@ -259,6 +451,30 @@ impl Decoder {
     ) -> Result<(MxArray, MxArray)> {
         self.weights
             .linear_pair(x, &self.key(a.0, a.1), &self.key(b.0, b.1))
+    }
+    /// Row-exact projections of a verification window (`[1, R, K]`, `R <= 4`):
+    /// row `j` carries the bits of the single-row projection. Outside a
+    /// verification pass a window is a prefill window, whatever its row
+    /// count, and takes the batched projection: the row kernels admit four
+    /// rows, and every other row would run a single-row projection of its own
+    /// (a 6k prompt dispatched 1.5 M of them).
+    fn linear_rows(&mut self, x: &MxArray, hf: &str, gg: &str) -> Result<MxArray> {
+        if self.verification.is_none() {
+            return self.linear(x, hf, gg);
+        }
+        self.weights.linear_rows(&self.key(hf, gg), x)
+    }
+    fn linear_pair_rows(
+        &mut self,
+        x: &MxArray,
+        a: (&str, &str),
+        b: (&str, &str),
+    ) -> Result<(MxArray, MxArray)> {
+        if self.verification.is_none() {
+            return self.linear_pair(x, a, b);
+        }
+        self.weights
+            .linear_pair_rows(x, &self.key(a.0, a.1), &self.key(b.0, b.1))
     }
     fn norm(
         &mut self,
@@ -637,34 +853,7 @@ impl Decoder {
                 true,
             )?
         };
-        let paired = if (runtime_flags::is_one(c"MLX_QWEN4_MIXER_DOWN_INJECT")
-            || runtime_flags::is_one(c"MLX_QWEN4_MIXER_SPLIT_K"))
-            && inject
-            && self.gguf()
-            && c.hc_count == 4
-            && c.hidden_size == 2560
-            && x.shape()?[1] == 1
-        {
-            let down_key = self.key(
-                &format!("{hf}.input_mix_weight_down.weight"),
-                &format!("{gg}_down.weight"),
-            );
-            let inject_key = self.key(
-                &format!("{hf}.block_inject_weight.weight"),
-                &format!("{gg}_inject.weight"),
-            );
-            match (
-                self.weights.resident_bank(&down_key),
-                self.weights.resident_bank(&inject_key),
-            ) {
-                (Some(down), Some(injection)) => down.mixer_down_inject(&n, &injection)?,
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let activated = if paired.is_none()
-            && self.gguf()
+        let activated = if self.gguf()
             && c.hc_count == 4
             && c.hidden_size == 2560
             && (x.shape()?[1] >= 1024 || x.shape()?[1] == 1)
@@ -681,10 +870,8 @@ impl Decoder {
         } else {
             None
         };
-        let is_activated = paired.is_some() || activated.is_some();
-        let (down, inject_projection) = if let Some((down, gate)) = paired {
-            (down, Some(gate))
-        } else if let Some(activated) = activated {
+        let is_activated = activated.is_some();
+        let (down, inject_projection) = if let Some(activated) = activated {
             let gate = if inject {
                 Some(self.linear(
                     &n,
@@ -727,15 +914,6 @@ impl Decoder {
             &format!("{hf}.input_mix_weight_up.weight"),
             &format!("{gg}_up.weight"),
         );
-        if self.gguf()
-            && c.hc_count == 4
-            && c.hidden_size == 2560
-            && let Some(injection) = inject_projection.as_ref()
-            && let Some(weight) = self.weights.resident_bank(&key)
-            && let Some((mixed, gate)) = weight.hyper_up_inject(&down, &n, injection)?
-        {
-            return Ok((mixed, Some(gate)));
-        }
         let fused = if self.gguf() && c.hc_count == 4 && c.hidden_size == 2560 {
             self.weights
                 .resident_bank(&key)
@@ -750,8 +928,6 @@ impl Decoder {
         } else {
             let up = self.weights.linear(&key, &down)?;
             let combined = if self.gguf()
-                && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_HC_MIX")
-                && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
                 && crate::engine::persistence::compiled_forward_backend_available()
             {
                 unsafe { mlx_sys::mlx_qwen4_prefill_hc_mix(up.as_raw_ptr(), n.as_raw_ptr()) }
@@ -797,35 +973,6 @@ impl Decoder {
         )
     }
 
-    fn inject_for_next_attention(
-        &mut self,
-        x: &MxArray,
-        branch: &MxArray,
-        gate: &MxArray,
-        layer: usize,
-        normalize: bool,
-    ) -> Result<(MxArray, Option<MxArray>)> {
-        let next = layer + 1;
-        // PLE adds to the stream before its attention norm. Never carry a
-        // normalization across that addition or across a forward boundary.
-        if normalize
-            && next < self.config.num_hidden_layers
-            && !self.config.ple_layer_ids.contains(&(next + 1))
-            && runtime_flags::is_one(c"MLX_QWEN4_INJECT_NEXT_NORM")
-        {
-            self.inject_for_hyper(
-                x,
-                branch,
-                gate,
-                &format!("layers.{next}.attn_hyper_connection.hc_norm.weight"),
-                &format!("blk.{next}.hc_attn_norm.weight"),
-                true,
-            )
-        } else {
-            Ok((Self::inject(x, branch, gate)?, None))
-        }
-    }
-
     fn inject_for_hyper(
         &mut self,
         x: &MxArray,
@@ -839,8 +986,6 @@ impl Decoder {
             && self.gguf()
             && self.config.hidden_size == 2560
             && self.config.hc_count == 4
-            && !runtime_flags::is_zero(c"MLX_QWEN4_INJECT_NORM")
-            && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
             && crate::engine::persistence::compiled_forward_backend_available()
         {
             let w = self.dense(hf, gg)?;
@@ -868,10 +1013,9 @@ impl Decoder {
         Ok((Self::inject(x, branch, gate)?, None))
     }
     fn submit(&self, arrays: &[&MxArray], context: &str) -> Result<()> {
-        if !runtime_flags::is_zero(c"MLX_QWEN4_ASYNC_SUBMISSION")
-            && self.verification.is_none()
-            && crate::engine::persistence::compiled_forward_backend_available()
-        {
+        #[cfg(test)]
+        self.submit_log.borrow_mut().push(context.to_owned());
+        if crate::engine::persistence::compiled_forward_backend_available() {
             MxArray::async_eval_arrays(arrays);
             Ok(())
         } else {
@@ -889,9 +1033,7 @@ impl Decoder {
         }
     }
     fn inject(x: &MxArray, y: &MxArray, g: &MxArray) -> Result<MxArray> {
-        if !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
-            && crate::engine::persistence::compiled_forward_backend_available()
-        {
+        if crate::engine::persistence::compiled_forward_backend_available() {
             return MxArray::from_handle(
                 unsafe {
                     mlx_sys::mlx_qwen4_inject(x.as_raw_ptr(), y.as_raw_ptr(), g.as_raw_ptr())
@@ -906,7 +1048,7 @@ impl Decoder {
         )
     }
     fn gdn_projections(&mut self, x: &MxArray, p: &str, g: &str) -> Result<GdnProjections> {
-        let (qkv, z) = self.linear_pair(
+        let (qkv, z) = self.linear_pair_rows(
             x,
             (
                 &format!("{p}.in_proj_qkv.weight"),
@@ -923,45 +1065,44 @@ impl Decoder {
             self.config.linear_num_value_heads as i64,
             self.config.linear_value_head_dim as i64,
         ])?;
-        // TrackFastModel.bindGDN groups compatible projections. The GGUF
-        // gate matrices are dense F32, so pair them separately from Q8 QKV/Z.
-        let (a, b) = if self.gguf() && runtime_flags::is_one(c"MLX_QWEN4_GDN_GATE_PAIR") {
-            self.linear_pair(
+        let a = self
+            .linear_rows(
                 x,
-                (
-                    &format!("{p}.in_proj_a.weight"),
-                    &format!("{g}.ssm_alpha.weight"),
-                ),
-                (
-                    &format!("{p}.in_proj_b.weight"),
-                    &format!("{g}.ssm_beta.weight"),
-                ),
+                &format!("{p}.in_proj_a.weight"),
+                &format!("{g}.ssm_alpha.weight"),
             )?
-        } else {
-            (
-                self.linear(
-                    x,
-                    &format!("{p}.in_proj_a.weight"),
-                    &format!("{g}.ssm_alpha.weight"),
-                )?,
-                self.linear(
-                    x,
-                    &format!("{p}.in_proj_b.weight"),
-                    &format!("{g}.ssm_beta.weight"),
-                )?,
-            )
-        };
-        // TrackFastGDNDecode reads projected BF16 gates directly. Keep local
-        // F32 gate arithmetic inside the consumer, without two cast buffers.
-        let (a, b) = if self.gguf() && runtime_flags::is_one(c"MLX_QWEN4_GDN_GATE_INPUTS") {
-            (a, b)
-        } else {
-            (a.astype(DType::Float32)?, b.astype(DType::Float32)?)
-        };
+            .astype(DType::Float32)?;
+        let b = self
+            .linear_rows(
+                x,
+                &format!("{p}.in_proj_b.weight"),
+                &format!("{g}.ssm_beta.weight"),
+            )?
+            .astype(DType::Float32)?;
         Ok(GdnProjections { qkv, z, a, b })
     }
 
     fn gdn(&mut self, x: &MxArray, i: usize, cache: &mut LayerCache) -> Result<MxArray> {
+        let p = format!("layers.{i}.linear_attn");
+        let g = format!("blk.{i}");
+        let projections = self.gdn_projections(x, &p, &g)?;
+        let out = self.gdn_mix(x.dtype()?, &projections, i, cache)?;
+        self.linear(
+            &out,
+            &format!("{p}.out_proj.weight"),
+            &format!("{g}.ssm_out.weight"),
+        )
+    }
+
+    /// The stateful middle of one GDN row: the conv history and the recurrent
+    /// state advance by exactly one token.
+    fn gdn_mix(
+        &mut self,
+        dtype: DType,
+        projections: &GdnProjections,
+        i: usize,
+        cache: &mut LayerCache,
+    ) -> Result<MxArray> {
         let c = self.config.clone();
         let p = format!("layers.{i}.linear_attn");
         let g = format!("blk.{i}");
@@ -970,22 +1111,18 @@ impl Decoder {
         let kd = c.linear_key_head_dim as i64;
         let vd = c.linear_value_head_dim as i64;
         let keydim = kh * kd;
-        let GdnProjections { qkv, z, a, b } = self.gdn_projections(x, &p, &g)?;
+        let GdnProjections { qkv, z, a, b } = projections;
         let conv = self.dense(
             &format!("{p}.conv1d.weight"),
             &format!("{g}.ssm_conv1d.weight"),
         )?;
         if self.gguf()
-            && self.verification.is_none()
             && (kh, nh, kd, vd) == (16, 48, 128, 128)
             && (2..=8).contains(&c.linear_conv_kernel_dim)
             && c.rms_norm_eps.is_finite()
             && c.rms_norm_eps > 0.0
             && c.output_gate_type == "sigmoid"
             && qkv.dtype()? == DType::BFloat16
-            && !runtime_flags::is_zero(c"MLX_QWEN4_COMPLETE_GDN")
-            && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_GDN")
-            && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
             && crate::engine::persistence::compiled_forward_backend_available()
         {
             let scale = self.dense(&format!("{p}.A_log"), &format!("{g}.ssm_a"))?;
@@ -1003,10 +1140,10 @@ impl Decoder {
                 None => MxArray::zeros(&[1, nh, vd, kd], Some(DType::Float32))?,
             };
             let (out, state, history) = math::complete_gdn(
-                &qkv,
-                &z,
-                &a,
-                &b,
+                qkv,
+                z,
+                a,
+                b,
                 &conv,
                 &history,
                 &scale,
@@ -1018,13 +1155,16 @@ impl Decoder {
             self.submit_state(&[&out, &state, &history], "qwen4::decoder::complete_gdn")?;
             cache.recurrent = Some(state);
             cache.conv = Some(history);
-            return self.linear(
-                &out,
-                &format!("{p}.out_proj.weight"),
-                &format!("{g}.ssm_out.weight"),
-            );
+            return Ok(out);
         }
-        let qkv = math::conv(&qkv, &conv, &mut cache.conv, c.linear_conv_kernel_dim, 1)?;
+        let qkv = math::conv_with_completion(
+            qkv,
+            &conv,
+            &mut cache.conv,
+            c.linear_conv_kernel_dim,
+            1,
+            self.verification.is_some(),
+        )?;
         let q = math::l2(&qkv.slice_axis(2, 0, keydim)?.reshape(&[1, kh, kd])?)?
             .mul_scalar((kd as f64).powf(-0.5))?;
         let k = math::l2(
@@ -1056,7 +1196,7 @@ impl Decoder {
         let dt = self
             .dense(&format!("{p}.dt_bias"), &format!("{g}.ssm_dt.bias"))?
             .astype(DType::Float32)?;
-        let (decay, beta) = math::gdn_gates(&a, &b, &a_scale, &dt)?;
+        let (decay, beta) = math::gdn_gates(a, b, &a_scale, &dt)?;
         let decay = decay.reshape(&[1, nh, 1, 1])?;
         let state = match &cache.recurrent {
             Some(s) => s.clone(),
@@ -1064,7 +1204,7 @@ impl Decoder {
         };
         let (out, state) =
             math::recurrent_step(&q, &k, &v, &decay, &beta.reshape(&[1, nh, 1])?, &state)?;
-        let out = out.astype(x.dtype()?)?;
+        let out = out.astype(dtype)?;
         self.submit_state(&[&state], "qwen4::decoder::state")?;
         cache.recurrent = Some(state);
         let w = self.dense(&format!("{p}.norm.weight"), &format!("{g}.ssm_norm.weight"))?;
@@ -1076,12 +1216,7 @@ impl Decoder {
         } else {
             math::swiglu(&z, &out)?
         };
-        let out = out.astype(x.dtype()?)?.reshape(&[1, 1, nh * vd])?;
-        self.linear(
-            &out,
-            &format!("{p}.out_proj.weight"),
-            &format!("{g}.ssm_out.weight"),
-        )
+        out.astype(dtype)?.reshape(&[1, 1, nh * vd])
     }
     fn attention(&mut self, x: &MxArray, i: usize, cache: &mut LayerCache) -> Result<MxArray> {
         let projections = self.attention_projections(x, i)?;
@@ -1091,12 +1226,12 @@ impl Decoder {
     fn attention_projections(&mut self, x: &MxArray, i: usize) -> Result<AttentionProjections> {
         let p = format!("layers.{i}.self_attn");
         let g = format!("blk.{i}");
-        let qg = self.linear(
+        let qg = self.linear_rows(
             x,
             &format!("{p}.q_proj.weight"),
             &format!("{g}.attn_q.weight"),
         )?;
-        let (k, v) = self.linear_pair(
+        let (k, v) = self.linear_pair_rows(
             x,
             (&format!("{p}.k_proj.weight"), &format!("{g}.attn_k.weight")),
             (&format!("{p}.v_proj.weight"), &format!("{g}.attn_v.weight")),
@@ -1105,11 +1240,11 @@ impl Decoder {
         let id = self.config.indexer_head_dim as i64;
         let (iq, ik) = if self.gguf() {
             (
-                self.linear(x, "", &format!("{g}.indexer.q_proj.weight"))?,
-                self.linear(x, "", &format!("{g}.indexer.k_proj.weight"))?,
+                self.linear_rows(x, "", &format!("{g}.indexer.q_proj.weight"))?,
+                self.linear_rows(x, "", &format!("{g}.indexer.k_proj.weight"))?,
             )
         } else {
-            let qk = self.linear(x, &format!("{p}.indexer.index_qk_proj.weight"), "")?;
+            let qk = self.linear_rows(x, &format!("{p}.indexer.index_qk_proj.weight"), "")?;
             (
                 qk.slice_axis(2, 0, ih * id)?,
                 qk.slice_axis(2, ih * id, (ih + 1) * id)?,
@@ -1160,13 +1295,18 @@ impl Decoder {
             .v
             .reshape(&[1, 1, kh, hd])?
             .transpose(Some(&[0, 2, 1, 3]))?;
-        let keys = match &cache.keys {
-            Some(old) => MxArray::concatenate(old, &k, 2)?,
-            None => k,
-        };
-        let values = match &cache.values {
-            Some(old) => MxArray::concatenate(old, &v, 2)?,
-            None => v,
+        let (keys, values) = if cache.draft_rows.is_some() {
+            cache.append_draft_kv(&k, &v)?
+        } else {
+            let keys = match &cache.keys {
+                Some(old) => MxArray::concatenate(old, &k, 2)?,
+                None => k,
+            };
+            let values = match &cache.values {
+                Some(old) => MxArray::concatenate(old, &v, 2)?,
+                None => v,
+            };
+            (keys, values)
         };
         self.submit_state(&[&keys, &values], "qwen4::decoder::kv")?;
         cache.keys = Some(keys.clone());
@@ -1270,6 +1410,12 @@ impl Decoder {
         }
     }
     fn moe(&mut self, x: &MxArray, i: usize) -> Result<MxArray> {
+        let main = self.gguf();
+        if i == 0 {
+            self.weights.wire_mapped_banks(main)?;
+        } else {
+            self.weights.keep_wired(i, main)?;
+        }
         let c = self.config.clone();
         let p = format!("layers.{i}.mlp");
         let g = format!("blk.{i}");
@@ -1278,39 +1424,30 @@ impl Decoder {
             &format!("{p}.gate.weight"),
             &format!("{g}.ffn_gate_inp.weight"),
         )?;
-        let combined = if self.gguf()
-            && runtime_flags::is_one(c"MLX_QWEN4_ROUTE_SHARED_GATE")
-            && !runtime_flags::is_zero(c"MLX_QWEN4_DENSE_BF16_CACHE")
-            && let Some(weight) = self
-                .weights
-                .resident_bank(&format!("{g}.ffn_gate_inp_shexp.weight"))
-            && let Some(dense) = &weight.dense_bf16
+        let (selected, scores) =
+            if let Some(routes) = math::singleton_routes(&logits, c.num_experts_per_tok)? {
+                routes
+            } else {
+                let probs = Activations::softmax_precise(&logits, Some(-1))?;
+                let ne = c.num_experts as i64;
+                let top = c.num_experts_per_tok as i64;
+                let selected =
+                    probs
+                        .argpartition(-(top as i32), Some(-1))?
+                        .slice_axis(2, ne - top, ne)?;
+                let scores = probs.take_along_axis(&selected, -1)?;
+                let scores = scores.div(&scores.sum(Some(&[-1]), Some(true))?)?;
+                (selected, scores)
+            };
+        if !self.scope.is_empty()
+            && let Some(sum) = self.mtp_resident_experts(x, &selected, &scores)?
         {
-            math::routes_shared_gate(&logits, x, dense, c.num_experts_per_tok)?
-        } else {
-            None
-        };
-        let mut shared_gate = None;
-        let (selected, scores) = if let Some((selected, scores, gate)) = combined {
-            shared_gate = Some(gate);
-            (selected, scores)
-        } else if let Some(routes) = math::singleton_routes(&logits, c.num_experts_per_tok)? {
-            routes
-        } else {
-            let probs = Activations::softmax_precise(&logits, Some(-1))?;
-            let ne = c.num_experts as i64;
-            let top = c.num_experts_per_tok as i64;
-            let selected =
-                probs
-                    .argpartition(-(top as i32), Some(-1))?
-                    .slice_axis(2, ne - top, ne)?;
-            let scores = probs.take_along_axis(&selected, -1)?;
-            let scores = scores.div(&scores.sum(Some(&[-1]), Some(true))?)?;
-            (selected, scores)
-        };
-        if let Some(out) =
-            self.tentative_shared_experts(x, &selected, &scores, shared_gate.as_ref(), i)?
-        {
+            let (shared, gate) = self.shared_expert_parts(x, i)?;
+            return sum
+                .astype(x.dtype()?)?
+                .add(&math::sigmoid_mul(&gate, &shared)?);
+        }
+        if let Some(out) = self.tentative_shared_experts(x, &selected, &scores, i)? {
             return Ok(out);
         }
         let device = self.tentative_experts(x, &selected, &scores, i)?;
@@ -1320,7 +1457,7 @@ impl Decoder {
             self.resident_experts(x, &selected, &scores, i)?
         };
         let ids = if resident.is_none() {
-            selected.to_uint32()?.to_vec()
+            self.read_routes(&selected)?
         } else {
             Vec::new()
         };
@@ -1367,19 +1504,22 @@ impl Decoder {
             MxArray::concatenate_many(weighted.iter().collect(), Some(1))?
                 .sum(Some(&[1]), Some(true))?
         };
-        let (shared, gate) = self.shared_expert_parts(x, i, shared_gate)?;
+        let (shared, gate) = self.shared_expert_parts(x, i)?;
         sum.astype(x.dtype()?)?
             .add(&math::sigmoid_mul(&gate, &shared)?)
     }
-    fn shared_expert_parts(
-        &mut self,
-        x: &MxArray,
-        i: usize,
-        precomputed_gate: Option<MxArray>,
-    ) -> Result<(MxArray, MxArray)> {
+    /// A layer's routes on the host: the pass waits here for the GPU.
+    fn read_routes(&mut self, selected: &MxArray) -> Result<Vec<u32>> {
+        #[cfg(test)]
+        {
+            self.route_readbacks += 1;
+        }
+        Ok(selected.to_uint32()?.to_vec())
+    }
+    fn shared_expert_parts(&mut self, x: &MxArray, i: usize) -> Result<(MxArray, MxArray)> {
         let p = format!("layers.{i}.mlp");
         let g = format!("blk.{i}");
-        let (gate, up) = self.linear_pair(
+        let (gate, up) = self.linear_pair_rows(
             x,
             (
                 &format!("{p}.shared_expert.gate_proj.weight"),
@@ -1391,20 +1531,17 @@ impl Decoder {
             ),
         )?;
         let activation = math::swiglu(&gate, &up)?;
-        let shared = self.linear(
+        let shared = self.linear_rows(
             &activation,
             &format!("{p}.shared_expert.down_proj.weight"),
             &format!("{g}.ffn_down_shexp.weight"),
         )?;
         drop(activation);
-        let gate = match precomputed_gate {
-            Some(gate) => gate,
-            None => self.linear(
-                x,
-                &format!("{p}.shared_expert_gate.weight"),
-                &format!("{g}.ffn_gate_inp_shexp.weight"),
-            )?,
-        };
+        let gate = self.linear_rows(
+            x,
+            &format!("{p}.shared_expert_gate.weight"),
+            &format!("{g}.ffn_gate_inp_shexp.weight"),
+        )?;
         Ok((shared, gate))
     }
 
@@ -1418,17 +1555,296 @@ impl Decoder {
         self.ple_window(x, &[token], i, cache)
     }
 
-    fn ple_window(
+    /// `hyper_with_norm` over a `[1, R, 4H]` verify window. The admitted
+    /// mixer banks stream once through the row-batched kernels; any other
+    /// configuration runs the single-row mixer per row.
+    fn hyper_rows(
+        &mut self,
+        x: &MxArray,
+        hf: &str,
+        gg: &str,
+        inject: bool,
+        normed: Option<&MxArray>,
+    ) -> Result<(MxArray, Option<MxArray>)> {
+        let rows = x.shape_at(1)?;
+        if rows == 1 {
+            return self.hyper_with_norm(x, hf, gg, inject, normed);
+        }
+        let c = self.config.clone();
+        let down_key = self.key(
+            &format!("{hf}.input_mix_weight_down.weight"),
+            &format!("{gg}_down.weight"),
+        );
+        let up_key = self.key(
+            &format!("{hf}.input_mix_weight_up.weight"),
+            &format!("{gg}_up.weight"),
+        );
+        if self.gguf()
+            && c.hc_count == 4
+            && c.hidden_size == 2560
+            && let (Some(down_bank), Some(up_bank)) = (
+                self.weights.resident_bank(&down_key),
+                self.weights.resident_bank(&up_key),
+            )
+        {
+            let n = match normed {
+                Some(normed) => normed.clone(),
+                None => self.norm(
+                    x,
+                    &format!("{hf}.hc_norm.weight"),
+                    &format!("{gg}_norm.weight"),
+                    c.hidden_size,
+                    true,
+                )?,
+            };
+            if let Some(down) = math::rows::mixer_act(&down_bank, &n)? {
+                let injection = if inject {
+                    Some(self.linear_rows(
+                        &n,
+                        &format!("{hf}.block_inject_weight.weight"),
+                        &format!("{gg}_inject.weight"),
+                    )?)
+                } else {
+                    None
+                };
+                if let Some(mixed) = math::rows::hyper_up(&up_bank, &down, &n)? {
+                    let gate = injection
+                        .map(|w| -> Result<MxArray> {
+                            Activations::sigmoid(&w.div_scalar(c.hc_count as f64)?)?.mul_scalar(2.0)
+                        })
+                        .transpose()?;
+                    return Ok((mixed, gate));
+                }
+            }
+        }
+        let mut mixed = Vec::with_capacity(rows as usize);
+        let mut gates = Vec::with_capacity(rows as usize);
+        for j in 0..rows {
+            let normed = normed.map(|n| n.slice_axis(1, j, j + 1)).transpose()?;
+            let (m, gate) =
+                self.hyper_with_norm(&x.slice_axis(1, j, j + 1)?, hf, gg, inject, normed.as_ref())?;
+            mixed.push(m);
+            gates.extend(gate);
+        }
+        let gate = if inject {
+            Some(MxArray::concatenate_many(gates.iter().collect(), Some(1))?)
+        } else {
+            None
+        };
+        Ok((
+            MxArray::concatenate_many(mixed.iter().collect(), Some(1))?,
+            gate,
+        ))
+    }
+
+    /// `moe` over a `[1, R, H]` verify window: the routes of all rows stay on
+    /// the device over the mapped pack, otherwise one routing readback, then
+    /// the routed and shared experts through the row-batched slot kernels.
+    /// Without those kernels every row runs the single-row MoE.
+    fn moe_rows(&mut self, x: &MxArray, i: usize) -> Result<MxArray> {
+        let rows = x.shape_at(1)?;
+        if rows == 1 {
+            return self.moe(x, i);
+        }
+        let main = self.gguf();
+        if i == 0 {
+            self.weights.wire_mapped_banks(main)?;
+        } else {
+            self.weights.keep_wired(i, main)?;
+        }
+        let c = self.config.clone();
+        if main {
+            let logits = self.linear_rows(
+                x,
+                &format!("layers.{i}.mlp.gate.weight"),
+                &format!("blk.{i}.ffn_gate_inp.weight"),
+            )?;
+            if let Some((selected, scores)) =
+                math::rows::singleton_routes(&logits, c.num_experts_per_tok)?
+            {
+                if let Some(out) = self.tentative_shared_expert_rows(x, &selected, &scores, i)? {
+                    return Ok(out);
+                }
+                let mut sum = self.resident_experts(x, &selected, &scores, i)?;
+                if sum.is_none() {
+                    let ids = self.read_routes(&selected)?;
+                    if let Some(out) = self.slotted_shared_experts(x, &ids, &scores, i)? {
+                        return Ok(out);
+                    }
+                    sum = self.selected_experts(x, &ids, &scores, i)?;
+                }
+                if let Some(sum) = sum {
+                    let (shared, gate) = self.shared_expert_parts(x, i)?;
+                    return sum
+                        .astype(x.dtype()?)?
+                        .add(&math::sigmoid_mul(&gate, &shared)?);
+                }
+            }
+        }
+        let parts = (0..rows)
+            .map(|j| self.moe(&x.slice_axis(1, j, j + 1)?, i))
+            .collect::<Result<Vec<_>>>()?;
+        MxArray::concatenate_many(parts.iter().collect(), Some(1))
+    }
+
+    /// The routed and shared experts of the verify rows in one kernel over
+    /// the host-checked slots: the device-route decode kernel with the
+    /// routes already known.
+    fn slotted_shared_experts(
+        &mut self,
+        x: &MxArray,
+        ids: &[u32],
+        scores: &MxArray,
+        i: usize,
+    ) -> Result<Option<MxArray>> {
+        let c = self.config.clone();
+        if c.num_experts_per_tok != 10
+            || c.hidden_size != 2560
+            || c.moe_intermediate_size != 640
+            || x.dtype()? != DType::BFloat16
+        {
+            return Ok(None);
+        }
+        let shared = ["gate", "up", "down"].map(|part| {
+            self.weights
+                .resident_bank(&format!("blk.{i}.ffn_{part}_shexp.weight"))
+        });
+        let [Some(gate), Some(up), Some(down)] = shared else {
+            return Ok(None);
+        };
+        let shared = [gate, up, down];
+        let Some((banks, slots, _)) =
+            self.weights
+                .expert_slots(i, c.num_experts, c.num_experts_per_tok, ids)?
+        else {
+            return Ok(None);
+        };
+        let shared_gate = self.linear_rows(
+            x,
+            &format!("layers.{i}.mlp.shared_expert_gate.weight"),
+            &format!("blk.{i}.ffn_gate_inp_shexp.weight"),
+        )?;
+        let slots = MxArray::from_uint32(&slots, &[slots.len() as i64])?;
+        let Some(out) =
+            math::rows::routed_shared_experts(x, &slots, scores, &banks, &shared, &shared_gate)?
+        else {
+            return Ok(None);
+        };
+        self.weights.finish_expert_slots(i, &out)?;
+        Ok(Some(out))
+    }
+
+    /// One decoder layer over the `[1, R, 4H]` verify window. Projections,
+    /// mixers, router, experts and output projections read their weights
+    /// once for all rows through the row-exact kernels; PLE, GDN and
+    /// attention state advance row by row. `saved[j]` is this layer's cache
+    /// after row `j`: the frontier a commit of `j + 1` tokens restores.
+    fn verify_layer(
         &mut self,
         x: &MxArray,
         tokens: &[u32],
         i: usize,
         cache: &mut LayerCache,
-    ) -> Result<MxArray> {
-        let c = self.config.clone();
-        let t = tokens.len() as i64;
+    ) -> Result<(MxArray, Vec<LayerCache>)> {
+        let base = self.history.len();
+        let rows = tokens.len();
+        let mut saved = vec![LayerCache::default(); rows];
+        let row = |a: &MxArray, j: usize| a.slice_axis(1, j as i64, j as i64 + 1);
+        let x = if self.config.ple_layer_ids.contains(&(i + 1)) {
+            let dtype = x.dtype()?;
+            let mut embeddings = Vec::with_capacity(rows);
+            for &token in tokens {
+                self.check_cancelled()?;
+                embeddings.push(self.ple_embeddings(&[token], i, dtype)?);
+                self.history.push(token);
+            }
+            self.history.truncate(base);
+            let embeddings = MxArray::concatenate_many(embeddings.iter().collect(), Some(1))?;
+            let (key, value) = self.ple_projections(&embeddings, i)?;
+            let mut parts = Vec::with_capacity(rows);
+            for (j, saved) in saved.iter_mut().enumerate() {
+                self.check_cancelled()?;
+                let input = row(x, j)?;
+                let ple = self.ple_mix(&input, &row(&key, j)?, &row(&value, j)?, i, cache)?;
+                parts.push(input.add(&ple)?);
+                saved.ple_conv = cache.ple_conv.clone();
+            }
+            MxArray::concatenate_many(parts.iter().collect(), Some(1))?
+        } else {
+            x.clone()
+        };
+        let (mixed, gate) = self.hyper_rows(
+            &x,
+            &format!("layers.{i}.attn_hyper_connection"),
+            &format!("blk.{i}.hc_attn"),
+            true,
+            None,
+        )?;
+        let branch = if self.config.linear(i) {
+            let p = format!("layers.{i}.linear_attn");
+            let g = format!("blk.{i}");
+            let projections = self.gdn_projections(&mixed, &p, &g)?;
+            let dtype = mixed.dtype()?;
+            let mut outputs = Vec::with_capacity(rows);
+            for (j, saved) in saved.iter_mut().enumerate() {
+                self.check_cancelled()?;
+                outputs.push(self.gdn_mix(dtype, &projections.row(j)?, i, cache)?);
+                saved.conv = cache.conv.clone();
+                saved.recurrent = cache.recurrent.clone();
+            }
+            let out = MxArray::concatenate_many(outputs.iter().collect(), Some(1))?;
+            self.linear_rows(
+                &out,
+                &format!("{p}.out_proj.weight"),
+                &format!("{g}.ssm_out.weight"),
+            )?
+        } else {
+            let projections = self.attention_projections(&mixed, i)?;
+            let mut outputs = Vec::with_capacity(rows);
+            for (j, (&token, saved)) in tokens.iter().zip(saved.iter_mut()).enumerate() {
+                self.check_cancelled()?;
+                outputs.push(self.attention_projected(
+                    &row(&mixed, j)?,
+                    i,
+                    cache,
+                    &projections.row(j)?,
+                    false,
+                )?);
+                self.history.push(token);
+                if self.paged.is_none() {
+                    saved.keys = cache.keys.clone();
+                    saved.values = cache.values.clone();
+                }
+                saved.index_tail = cache.index_tail.clone();
+                saved.index_keys = cache.index_keys.clone();
+            }
+            self.history.truncate(base);
+            let out = MxArray::concatenate_many(outputs.iter().collect(), Some(1))?;
+            self.linear_rows(
+                &out,
+                &format!("layers.{i}.self_attn.o_proj.weight"),
+                &format!("blk.{i}.attn_output.weight"),
+            )?
+        };
+        let gate = gate
+            .ok_or_else(|| Error::from_reason("Qwen4 attention is missing its injection gate"))?;
+        let (x, normed) = self.inject_for_mlp(&x, &branch, &gate, i, true)?;
+        let (mixed, gate) = self.hyper_rows(
+            &x,
+            &format!("layers.{i}.mlp_hyper_connection"),
+            &format!("blk.{i}.hc_ffn"),
+            true,
+            normed.as_ref(),
+        )?;
+        let branch = self.moe_rows(&mixed, i)?;
+        let gate =
+            gate.ok_or_else(|| Error::from_reason("Qwen4 MLP is missing its injection gate"))?;
+        Ok((Self::inject(&x, &branch, &gate)?, saved))
+    }
+
+    /// `[multipliers, head sizes, head offsets]` of PLE layer `i`.
+    fn ple_constants(&self, i: usize) -> Result<[Vec<u64>; 3]> {
         let p = format!("layers.{i}.ple");
-        let g = format!("blk.{i}");
         let constants = |name: &str| -> Result<Vec<u64>> {
             if self.gguf() {
                 super::gguf::integers(&self.weights.metadata, &format!("qwen4exp.ple.{name}"))
@@ -1443,11 +1859,24 @@ impl Decoder {
                 ))
             }
         };
-        let multipliers = constants("layer_multipliers")?;
-        let sizes = constants("head_vocab_sizes")?;
-        let offsets = constants("head_offsets")?;
-        let mut previous =
-            self.history[self.history.len().saturating_sub(c.ngram_size - 1)..].to_vec();
+        Ok([
+            constants("layer_multipliers")?,
+            constants("head_vocab_sizes")?,
+            constants("head_offsets")?,
+        ])
+    }
+
+    /// Hash ids of `tokens` continuing the current history, in gather order.
+    fn ple_hash_ids(&self, i: usize, tokens: &[u32]) -> Result<Vec<u64>> {
+        self.ple_hash_ids_after(i, &self.history, tokens)
+    }
+
+    /// The hash ids of `tokens` following `history` (the ngram context is
+    /// its tail).
+    fn ple_hash_ids_after(&self, i: usize, history: &[u32], tokens: &[u32]) -> Result<Vec<u64>> {
+        let c = &self.config;
+        let [multipliers, sizes, offsets] = self.ple_constants(i)?;
+        let mut previous = history[history.len().saturating_sub(c.ngram_size - 1)..].to_vec();
         let mut ids = Vec::new();
         for &token in tokens {
             self.check_cancelled()?;
@@ -1463,34 +1892,120 @@ impl Decoder {
             )?);
             previous.push(token);
         }
+        Ok(ids)
+    }
 
-        let emb = if self.gguf() {
-            self.weights.lookup_rows(
-                "per_layer_token_embd.weight",
-                &ids.iter().map(|&id| id as usize).collect::<Vec<_>>(),
-            )?
-        } else {
-            let mut groups: std::collections::BTreeMap<String, (Vec<usize>, Vec<usize>)> =
-                Default::default();
-            for (position, id) in ids.iter().enumerate() {
-                let mut local = *id as usize;
-                let mut found = false;
-                for shard in 0..c.split_ngram_parts {
-                    let key = format!("{p}.ple_embedding.ngram_embedding.shard_{shard}.weight");
-                    let count = self.weights.descriptor(&key)?.rows()?;
-                    if local < count {
-                        let (rows, positions) = groups.entry(key).or_default();
-                        rows.push(local);
-                        positions.push(position);
-                        found = true;
-                        break;
+    /// The table row behind each hash id: the one GGUF table, or the
+    /// safetensors shard that holds it.
+    fn ple_row_keys(&self, i: usize, ids: &[u64]) -> Result<Vec<(String, usize)>> {
+        if self.gguf() {
+            return Ok(ids
+                .iter()
+                .map(|&id| ("per_layer_token_embd.weight".to_string(), id as usize))
+                .collect());
+        }
+        let p = format!("layers.{i}.ple");
+        let shards = (0..self.config.split_ngram_parts)
+            .map(|shard| {
+                let key = format!("{p}.ple_embedding.ngram_embedding.shard_{shard}.weight");
+                let count = self.weights.descriptor(&key)?.rows()?;
+                Ok((key, count))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ids.iter()
+            .map(|&id| {
+                let mut local = id as usize;
+                for (key, count) in &shards {
+                    if local < *count {
+                        return Ok((key.clone(), local));
                     }
                     local -= count;
                 }
-                if !found {
-                    return Err(Error::from_reason("PLE row outside checkpoint vocabulary"));
-                }
-            }
+                Err(Error::from_reason("PLE row outside checkpoint vocabulary"))
+            })
+            .collect()
+    }
+
+    /// Hand the reader threads the PLE rows `tokens` will need at their PLE
+    /// layer, before the layers ahead of it are encoded. The embedding row
+    /// is needed at once, so the model thread reads it itself.
+    fn prefetch_ple_rows(&mut self, tokens: &[u32]) -> Result<()> {
+        let keys = self.ple_row_keys_after(&self.history.clone(), tokens)?;
+        self.weights.prefetch_rows(&keys)
+    }
+
+    /// The PLE rows of `tokens` following `history`, over every PLE layer.
+    fn ple_row_keys_after(&self, history: &[u32], tokens: &[u32]) -> Result<Vec<(String, usize)>> {
+        let mut keys = Vec::new();
+        for &layer in &self.config.ple_layer_ids {
+            let Some(i) = layer.checked_sub(1) else {
+                continue;
+            };
+            let ids = self.ple_hash_ids_after(i, history, tokens)?;
+            keys.extend(self.ple_row_keys(i, &ids)?);
+        }
+        Ok(keys)
+    }
+
+    /// A prefill window starts: request this window's rows, then, queued
+    /// behind them, the rows of the window after it, so the reader threads
+    /// fetch those while this window's layers run instead of the model
+    /// thread reading them one `pread` at a time at the next window's start
+    /// (1,024 embedding rows and up to 16k PLE rows per window). Two
+    /// requests, not one sorted batch: the rows this window needs now must
+    /// not queue behind rows needed a second later. A window given its
+    /// embeddings (media) has no embedding rows to read.
+    fn prefetch_window_rows(&mut self, tokens: &[u32], next: &[u32], embed: bool) -> Result<()> {
+        let embedding = self.key("embed_tokens.weight", "token_embd.weight");
+        let mut keys = Vec::new();
+        if embed {
+            keys.extend(tokens.iter().map(|&t| (embedding.clone(), t as usize)));
+        }
+        let history = self.history.clone();
+        keys.extend(self.ple_row_keys_after(&history, tokens)?);
+        self.weights.prefetch_rows(&keys)?;
+        if next.is_empty() {
+            return Ok(());
+        }
+        let mut keys = Vec::new();
+        if embed {
+            keys.extend(next.iter().map(|&t| (embedding.clone(), t as usize)));
+        }
+        let mut through = history;
+        through.extend_from_slice(tokens);
+        keys.extend(self.ple_row_keys_after(&through, next)?);
+        self.weights.prefetch_rows(&keys)
+    }
+
+    fn ple_window(
+        &mut self,
+        x: &MxArray,
+        tokens: &[u32],
+        i: usize,
+        cache: &mut LayerCache,
+    ) -> Result<MxArray> {
+        let embeddings = self.ple_embeddings(tokens, i, x.dtype()?)?;
+        let (key, value) = self.ple_projections(&embeddings, i)?;
+        self.ple_mix(x, &key, &value, i, cache)
+    }
+
+    /// The `[1, T, ple_embed_dim]` embeddings of `tokens` following the history.
+    fn ple_embeddings(&mut self, tokens: &[u32], i: usize, dtype: DType) -> Result<MxArray> {
+        let c = self.config.clone();
+        let t = tokens.len() as i64;
+        let ids = self.ple_hash_ids(i, tokens)?;
+        let mut groups: std::collections::BTreeMap<String, (Vec<usize>, Vec<usize>)> =
+            Default::default();
+        for (position, (name, row)) in self.ple_row_keys(i, &ids)?.into_iter().enumerate() {
+            let (rows, positions) = groups.entry(name).or_default();
+            rows.push(row);
+            positions.push(position);
+        }
+        let emb = if groups.len() == 1
+            && let Some((name, (rows, _))) = groups.pop_first()
+        {
+            self.weights.lookup_rows(&name, &rows)?
+        } else {
             let mut rows = vec![None; ids.len()];
             for (name, (indices, positions)) in groups {
                 let bank = self.weights.lookup_rows(&name, &indices)?;
@@ -1508,21 +2023,47 @@ impl Decoder {
                 .collect::<Result<Vec<_>>>()?;
             MxArray::concatenate_many(rows, Some(0))?
         };
-        let emb = emb
-            .reshape(&[1, t, c.ple_embed_dim as i64])?
-            .astype(x.dtype()?)?;
+        emb.reshape(&[1, t, c.ple_embed_dim as i64])?.astype(dtype)
+    }
 
+    /// The PLE key and value projections of a `[1, T, ple_embed_dim]` window.
+    fn ple_projections(&mut self, emb: &MxArray, i: usize) -> Result<(MxArray, MxArray)> {
+        let p = format!("layers.{i}.ple");
+        let g = format!("blk.{i}");
         let key = self.weights.linear_ple_window(
             &self.key(
                 &format!("{p}.key_proj.weight"),
                 &format!("{g}.ple_key.weight"),
             ),
-            &emb,
+            emb,
         )?;
+        let value = self.weights.linear_ple_window(
+            &self.key(
+                &format!("{p}.value_proj.weight"),
+                &format!("{g}.ple_value.weight"),
+            ),
+            emb,
+        )?;
+        Ok((key, value))
+    }
 
+    /// The PLE gate and convolution over `x` (`[1, T, 4H]`) given the
+    /// window's key and value projections.
+    fn ple_mix(
+        &mut self,
+        x: &MxArray,
+        key: &MxArray,
+        value: &MxArray,
+        i: usize,
+        cache: &mut LayerCache,
+    ) -> Result<MxArray> {
+        let c = self.config.clone();
+        let t = x.shape_at(1)?;
+        let p = format!("layers.{i}.ple");
+        let g = format!("blk.{i}");
         let key = self
             .norm(
-                &key,
+                key,
                 &format!("{p}.norm_key.weight"),
                 &format!("{g}.ple_norm_key.weight"),
                 c.hidden_size,
@@ -1538,14 +2079,6 @@ impl Decoder {
                 true,
             )?
             .reshape(&[1, t, c.hc_count as i64, c.hidden_size as i64])?;
-        let value = self.weights.linear_ple_window(
-            &self.key(
-                &format!("{p}.value_proj.weight"),
-                &format!("{g}.ple_value.weight"),
-            ),
-            &emb,
-        )?;
-
         let score = key
             .mul(&query)?
             .sum(Some(&[-1]), Some(true))?
@@ -1567,105 +2100,26 @@ impl Decoder {
             &format!("{p}.conv1d.weight"),
             &format!("{g}.ple_conv1d.weight"),
         )?;
-        let convolved = if (tokens.len() > 8 && self.async_device_prefill())
-            || (self.deferred_state_submission()
-                && runtime_flags::is_one(c"MLX_QWEN4_DECODE_ASYNC_PLE"))
-        {
-            math::conv_window_with_completion(
-                &normalized,
-                &weight,
-                &mut cache.ple_conv,
-                c.ple_conv_kernel_size,
-                c.ngram_size,
-                true,
-            )?
-        } else {
-            math::conv_window(
-                &normalized,
-                &weight,
-                &mut cache.ple_conv,
-                c.ple_conv_kernel_size,
-                c.ngram_size,
-            )?
-        };
+        let convolved = math::conv_window(
+            &normalized,
+            &weight,
+            &mut cache.ple_conv,
+            c.ple_conv_kernel_size,
+            c.ngram_size,
+        )?;
         value.add(&convolved)
     }
-    /// Run the released one-layer MTP head against its own QSA state. Scope,
-    /// position and the target page adapter are restored on every error path.
-    pub fn draft_step(
-        &mut self,
-        hidden: &MxArray,
-        token: u32,
-        position: usize,
-        cache: &mut LayerCache,
-        project: bool,
-    ) -> Result<(MxArray, Option<MxArray>)> {
-        let _flags = runtime_flags::scope();
-        let embedding = self.embed_token(token)?;
-        let target_pages = self.paged.take();
-        self.scope = "mtp.".into();
-        self.position_override = Some(position);
-        let result: Result<(MxArray, MxArray)> = (|| {
-            let c = self.config.clone();
-            let e = self.norm(
-                &embedding,
-                "pre_fc_norm_embedding.weight",
-                "",
-                c.hidden_size,
-                true,
-            )?;
-            let e = self.linear(&e, "fc_embedding.weight", "")?;
-            let h = self
-                .norm(
-                    hidden,
-                    "pre_fc_norm_hidden.weight",
-                    "",
-                    c.hidden_size * c.hc_count,
-                    true,
-                )?
-                .reshape(&[1, 1, c.hc_count as i64, c.hidden_size as i64])?;
-            let h = self.linear(&h, "fc_hidden.weight", "")?;
-            let mut x =
-                h.add(&e.expand_dims(2)?)?
-                    .reshape(&[1, 1, (c.hc_count * c.hidden_size) as i64])?;
-            let (input, inject) = self.hyper(&x, "layers.0.attn_hyper_connection", "", true)?;
-            let attn = self.attention(&input, 0, cache)?;
-            let inject = inject.ok_or_else(|| {
-                Error::from_reason("Qwen4 MTP attention is missing its injection gate")
-            })?;
-            x = Self::inject(&x, &attn, &inject)?;
-            let (input, inject) = self.hyper(&x, "layers.0.mlp_hyper_connection", "", true)?;
-            let mlp = self.moe(&input, 0)?;
-            let inject = inject
-                .ok_or_else(|| Error::from_reason("Qwen4 MTP MLP is missing its injection gate"))?;
-            x = Self::inject(&x, &mlp, &inject)?;
-            MxArray::eval_arrays_with_context(&[&x], "qwen4::decoder::x")?;
-            let (mixed, _) = self.hyper(&x, "hyper_connection_mixer", "", false)?;
-            Ok((x, mixed))
-        })();
-        self.scope.clear();
-        self.position_override = None;
-        self.paged = target_pages;
-        let (hidden, mixed) = result?;
-        let logits = if project {
-            Some(self.linear(&mixed, "lm_head.weight", "output.weight")?)
-        } else {
-            None
-        };
-        if let Some(logits) = &logits {
-            MxArray::eval_arrays_with_context(&[logits], "qwen4::decoder::logits")?;
-        }
-        Ok((hidden, logits))
-    }
     pub fn step(&mut self, token: u32) -> Result<MxArray> {
-        let _flags = runtime_flags::scope();
         self.rotary_tables.get_mut().clear();
+        let started = std::time::Instant::now();
         let result = self.forward_with_device_routes(token, true);
         self.rotary_tables.get_mut().clear();
         // A read failure or cancellation can happen after earlier layers have
         // advanced. Discard the entire prefix instead of reusing partial state.
         if result.is_err() {
             self.reset();
+        } else {
+            self.observe_pass(1, started.elapsed());
         }
         result
     }
@@ -1677,19 +2131,7 @@ impl Decoder {
         i: usize,
         cache: &mut LayerCache,
     ) -> Result<MxArray> {
-        Ok(self.layer_with_norm(x, token, i, cache, None, false)?.0)
-    }
-
-    fn layer_with_norm(
-        &mut self,
-        x: MxArray,
-        token: u32,
-        i: usize,
-        cache: &mut LayerCache,
-        incoming_norm: Option<&MxArray>,
-        normalize_next: bool,
-    ) -> Result<(MxArray, Option<MxArray>)> {
-        let (x, normed) = self.attention_block_for_mlp(x, token, i, cache, true, incoming_norm)?;
+        let (x, normed) = self.attention_block_for_mlp(x, token, i, cache, true)?;
         let (mixed, gate) = self.hyper_with_norm(
             &x,
             &format!("layers.{i}.mlp_hyper_connection"),
@@ -1700,7 +2142,7 @@ impl Decoder {
         let branch = self.moe(&mixed, i)?;
         let gate =
             gate.ok_or_else(|| Error::from_reason("Qwen4 MLP is missing its injection gate"))?;
-        self.inject_for_next_attention(&x, &branch, &gate, i, normalize_next)
+        Self::inject(&x, &branch, &gate)
     }
 
     fn attention_block(
@@ -1710,9 +2152,7 @@ impl Decoder {
         i: usize,
         cache: &mut LayerCache,
     ) -> Result<MxArray> {
-        Ok(self
-            .attention_block_for_mlp(x, token, i, cache, false, None)?
-            .0)
+        Ok(self.attention_block_for_mlp(x, token, i, cache, false)?.0)
     }
 
     fn attention_block_for_mlp(
@@ -1722,7 +2162,6 @@ impl Decoder {
         i: usize,
         cache: &mut LayerCache,
         normalize: bool,
-        incoming_norm: Option<&MxArray>,
     ) -> Result<(MxArray, Option<MxArray>)> {
         if self.config.ple_layer_ids.contains(&(i + 1)) {
             x = x.add(&self.ple(&x, token, i, cache)?)?;
@@ -1732,7 +2171,7 @@ impl Decoder {
             &format!("layers.{i}.attn_hyper_connection"),
             &format!("blk.{i}.hc_attn"),
             true,
-            incoming_norm,
+            None,
         )?;
         let branch = if self.config.linear(i) {
             self.gdn(&mixed, i, cache)?
@@ -1744,82 +2183,490 @@ impl Decoder {
         self.inject_for_mlp(&x, &branch, &gate, i, normalize)
     }
 
+    /// The token's embedding row as a lazy array: an LRU hit or an import
+    /// the consuming layer submits, never a drain at the token start.
     pub fn embed_token(&mut self, token: u32) -> Result<MxArray> {
         let key = self.key("embed_tokens.weight", "token_embd.weight");
         self.weights
-            .read(&key, token as usize, 1)?
-            .dense()?
+            .lookup_rows(&key, &[token as usize])?
             .reshape(&[1, 1, self.config.hidden_size as i64])
     }
 
     /// Traverse a bounded prompt chunk layer by layer, sharing weight reads
     /// and projections across its tokens. Verification retains singleton
     /// arithmetic and captures state at every accepted frontier.
+    #[cfg(test)]
     pub fn prefill_chunk(
         &mut self,
         tokens: &[u32],
         embeddings: Option<&MxArray>,
         project_logits: bool,
     ) -> Result<MxArray> {
-        let _flags = runtime_flags::scope();
+        self.prefill_chunk_ahead(tokens, &[], embeddings, project_logits)
+    }
+
+    /// `prefill_chunk` whose caller knows the window after this one:
+    /// `next`'s rows are requested while this window runs.
+    pub fn prefill_chunk_ahead(
+        &mut self,
+        tokens: &[u32],
+        next: &[u32],
+        embeddings: Option<&MxArray>,
+        project_logits: bool,
+    ) -> Result<MxArray> {
         if cfg!(target_os = "macos") {
             self.weights.check_forward_headroom()?;
         }
         self.rotary_tables.get_mut().clear();
-        let result = self.prefill_with_device_routes(tokens, embeddings, project_logits);
+        let started = std::time::Instant::now();
+        let result =
+            self.prefill_group_with_device_routes(&[tokens], next, embeddings, project_logits);
         self.rotary_tables.get_mut().clear();
         if result.is_err() {
             self.reset();
+        } else {
+            self.observe_pass(tokens.len(), started.elapsed());
         }
         result
     }
     pub fn verify_chunk(&mut self, tokens: &[u32]) -> Result<(MxArray, Vec<DecoderState>)> {
-        let _flags = runtime_flags::scope();
         if tokens.is_empty() || tokens.len() > 4 {
             return Err(Error::from_reason("Qwen4 verification width must be 1-4"));
         }
+        self.rotary_tables.get_mut().clear();
+        let started = std::time::Instant::now();
         self.verification = Some(Vec::new());
-        self.prefill_chunk(tokens, None, false)?;
-        let states = self.verification.take().ok_or_else(|| {
-            Error::from_reason("Qwen4 verification lost its accepted-frontier snapshots")
-        })?;
-        let mut logits = Vec::with_capacity(tokens.len());
-        for h in self.last_chunk_hidden.clone() {
-            let (mixed, _) = self.hyper(&h, "hyper_connection_mixer", "output_hc", false)?;
-            logits.push(
-                self.linear(&mixed, "lm_head.weight", "output.weight")?
-                    .reshape(&[1, -1])?,
-            );
+        if self.verify_routes_on_device() {
+            self.device_routes = Some(Vec::with_capacity(self.config.num_hidden_layers));
         }
-        Ok((
-            MxArray::concatenate_many(logits.iter().collect(), Some(0))?,
-            states,
-        ))
+        let result = (|| {
+            if cfg!(target_os = "macos") {
+                self.weights.check_forward_headroom()?;
+            }
+            self.prefill_chunk_inner(tokens, &[], None, false)?;
+            // The pass stays open through the head: these rows are row-exact
+            // too, and `linear_rows` is batched outside a verification pass.
+            let window =
+                MxArray::concatenate_many(self.last_chunk_hidden.iter().collect(), Some(1))?;
+            let (mixed, _) =
+                self.hyper_rows(&window, "hyper_connection_mixer", "output_hc", false, None)?;
+            let logits = self
+                .linear_rows(&mixed, "lm_head.weight", "output.weight")?
+                .reshape(&[tokens.len() as i64, -1])?;
+            let states = self.verification.take().ok_or_else(|| {
+                Error::from_reason("Qwen4 verification lost its accepted-frontier snapshots")
+            })?;
+            let routes = self.device_routes.take();
+            let tape = routes
+                .as_ref()
+                .filter(|routes| !routes.is_empty())
+                .map(|routes| {
+                    MxArray::concatenate_many(routes.iter().map(|(_, ids)| ids).collect(), Some(0))
+                })
+                .transpose()?;
+            // Commit rolls the page cursor back and restores one of these
+            // states: every pool write and frontier array must be complete.
+            let completed: Vec<_> = std::iter::once(&logits)
+                .chain(states.iter().flat_map(DecoderState::arrays))
+                .chain(self.caches.iter().flat_map(LayerCache::arrays))
+                .chain(tape.iter())
+                .collect();
+            MxArray::async_eval_arrays(&completed);
+            if let Some(adapter) = &mut self.paged {
+                adapter
+                    .eval_pending_pool_writes()
+                    .map_err(Error::from_reason)?;
+            }
+            MxArray::eval_arrays_with_context(&completed, "qwen4::decoder::verify")?;
+            if let (Some(routes), Some(tape)) = (routes, tape) {
+                let layers: Vec<_> = routes.iter().map(|(layer, _)| *layer).collect();
+                if !self.weights.commit_device_routes(
+                    &layers,
+                    &tape.to_uint32()?,
+                    tokens.len() * self.config.num_experts_per_tok,
+                )? {
+                    return Err(Error::from_reason(
+                        "Qwen4 verification routes lost their mapped banks",
+                    ));
+                }
+            }
+            Ok((logits, states))
+        })();
+        self.rotary_tables.get_mut().clear();
+        match result {
+            Ok(verified) => {
+                // Only after the route commit: a pass that trips the wire
+                // drops the mapped banks the tape is checked against.
+                self.observe_pass(tokens.len(), started.elapsed());
+                Ok(verified)
+            }
+            Err(error) => {
+                self.reset();
+                Err(error)
+            }
+        }
     }
 
     fn prefill_chunk_inner(
         &mut self,
         tokens: &[u32],
+        next: &[u32],
+        embeddings: Option<&MxArray>,
+        project_logits: bool,
+    ) -> Result<MxArray> {
+        self.prefill_group_inner(&[tokens], next, embeddings, project_logits)
+    }
+
+    /// A test event (`submit_log`): the group's frontier evaluated, the
+    /// route commit, end, trip, switch and the tail's start, in the order
+    /// they ran.
+    fn note(&self, event: &str) {
+        #[cfg(test)]
+        self.submit_log.borrow_mut().push(event.to_owned());
+        #[cfg(not(test))]
+        let _ = event;
+    }
+
+    /// The windows of `tokens` a group runs and the tail that runs after it:
+    /// slices of the admitted window, except a final one shorter than both
+    /// the slice and 256 rows, which fails the tentative gate and would drain
+    /// the GPU inside every sweep.
+    pub fn group_windows<'t>(&self, tokens: &'t [u32]) -> (Vec<&'t [u32]>, &'t [u32]) {
+        let slice = self.prefill_slice_size().max(1);
+        let mut windows: Vec<&[u32]> = tokens.chunks(slice).collect();
+        let tail = match windows.last() {
+            Some(last) if last.len() < slice && last.len() < 256 => {
+                let tail = *last;
+                windows.pop();
+                tail
+            }
+            _ => &tokens[tokens.len()..],
+        };
+        (windows, tail)
+    }
+
+    /// Whether a prompt of `suffix` new tokens runs as one layer-major
+    /// group: the turn opened over a streaming pack, the carried window path
+    /// serves it, every window is a tentative-eligible slice, and the W
+    /// residual streams fit beside the mapped turn floor. Read at admission
+    /// and again at execution: a trip applied in between runs the prompt one
+    /// window at a time.
+    pub(super) fn group_mode(&self, suffix: usize) -> bool {
+        let slice = self.prefill_slice_size().max(1);
+        let windows = suffix / slice + usize::from(suffix % slice >= 256);
+        if windows < 2 || self.verification.is_some() {
+            return false;
+        }
+        #[cfg(test)]
+        if let Some(pin) = self.group_pin {
+            return pin;
+        }
+        if !self.weights.plan.mapped || !self.weights.streaming_pass() || slice < 256 {
+            return false;
+        }
+        let Ok(host) = super::memory::host_memory() else {
+            return false;
+        };
+        let need = 22_400 * suffix as u64
+            + super::memory::prefill_scratch(&self.config, super::MAX_PREFILL_CHUNK)
+            + super::memory::MAPPED_TURN_FLOOR;
+        need <= host.available()
+    }
+
+    /// A whole prompt: one layer-major group and its tail in group mode,
+    /// else one window at a time with the next window's rows requested while
+    /// this one runs. The window is read before every pass: a pass that
+    /// leaves the mapped path shrinks it for the passes after it.
+    pub fn prefill_prompt(&mut self, tokens: &[u32]) -> Result<MxArray> {
+        if self.group_mode(tokens.len()) {
+            let (windows, tail) = self.group_windows(tokens);
+            return Ok(self.prefill_group(&windows, tail, true, false)?.0);
+        }
+        let mut logits = None;
+        let mut start = 0;
+        while start < tokens.len() {
+            let window = self.prefill_slice_size();
+            let end = (start + window).min(tokens.len());
+            let next_end = (end + window).min(tokens.len());
+            logits = Some(self.prefill_chunk_ahead(
+                &tokens[start..end],
+                &tokens[end..next_end],
+                None,
+                end == tokens.len(),
+            )?);
+            start = end;
+        }
+        logits.ok_or_else(|| Error::from_reason("Empty qwen4_exp prefill"))
+    }
+
+    /// One layer-major group over `windows`, then `tail` as its own pass on
+    /// the group's final state. Returns the logits of the last row and, when
+    /// `views` is set, one hidden view per token of every window (what the
+    /// MTP observer takes per window); `last_chunk_hidden` holds the last
+    /// pass's views as after any pass. An error resets the decoder.
+    pub fn prefill_group(
+        &mut self,
+        windows: &[&[u32]],
+        tail: &[u32],
+        project_logits: bool,
+        views: bool,
+    ) -> Result<(MxArray, Vec<Vec<MxArray>>)> {
+        if windows.is_empty() {
+            return Err(Error::from_reason("Qwen4 prefill group has no windows"));
+        }
+        if cfg!(target_os = "macos") {
+            self.weights.check_forward_headroom()?;
+        }
+        let rows: Vec<usize> = windows.iter().map(|w| w.len()).collect();
+        let total: usize = rows.iter().sum();
+        self.rotary_tables.get_mut().clear();
+        self.rotary_tables.get_mut().reserve(windows.len());
+        if windows.len() > 1 {
+            // Writes a failed turn left lazy would otherwise ride on this
+            // group's first gather of the same layer.
+            if let Some(adapter) = &mut self.paged {
+                adapter
+                    .eval_pending_pool_writes()
+                    .map_err(Error::from_reason)?;
+            }
+            self.weights.begin_group();
+        }
+        let started = std::time::Instant::now();
+        let result = self.prefill_group_with_device_routes(
+            windows,
+            tail,
+            None,
+            project_logits && tail.is_empty(),
+        );
+        self.rotary_tables.get_mut().clear();
+        self.weights.end_group();
+        let logits = match result {
+            Ok(logits) => logits,
+            Err(error) => {
+                self.group_streams.clear();
+                self.reset();
+                return Err(error);
+            }
+        };
+        self.note("qwen4::group::end");
+        let streams = std::mem::take(&mut self.group_streams);
+        let views = if views && windows.len() > 1 {
+            streams
+                .iter()
+                .zip(&rows)
+                .map(|(stream, &n)| {
+                    (0..n)
+                        .map(|j| stream.slice_axis(1, j as i64, j as i64 + 1))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else if views {
+            vec![self.last_chunk_hidden.clone()]
+        } else {
+            Vec::new()
+        };
+        let elapsed = started.elapsed();
+        if windows.len() > 1 {
+            for &n in &rows {
+                self.observe_pass(n, elapsed.mul_f64(n as f64 / total as f64));
+            }
+        } else {
+            self.observe_pass(total, elapsed);
+        }
+        if tail.is_empty() {
+            return Ok((logits, views));
+        }
+        self.note("qwen4::tail::start");
+        let logits = self.prefill_chunk_ahead(tail, &[], None, project_logits)?;
+        Ok((logits, views))
+    }
+
+    /// Window `w` of a group starts a layer: `history` is the prompt before
+    /// it and the page cursor its base, as at the start of its own pass.
+    fn set_cursor(&mut self, base: usize, windows: &[&[u32]], w: usize) {
+        self.history.truncate(base);
+        for window in &windows[..w] {
+            self.history.extend_from_slice(window);
+        }
+        self.paged_chunk_start = self.history.len();
+    }
+
+    /// A group starts: every window's embedding rows, then every window's
+    /// PLE rows, then the tail's, three requests in that order so sweep 0
+    /// never queues behind sweep 1's rows and the tail's behind neither.
+    fn prefetch_group_rows(&mut self, windows: &[&[u32]], tail: &[u32]) -> Result<()> {
+        let embedding = self.key("embed_tokens.weight", "token_embd.weight");
+        let keys: Vec<_> = windows
+            .iter()
+            .flat_map(|w| w.iter().map(|&t| (embedding.clone(), t as usize)))
+            .collect();
+        self.weights.prefetch_rows(&keys)?;
+        let mut history = self.history.clone();
+        let mut keys = Vec::new();
+        for window in windows {
+            keys.extend(self.ple_row_keys_after(&history, window)?);
+            history.extend_from_slice(window);
+        }
+        self.weights.prefetch_rows(&keys)?;
+        if tail.is_empty() {
+            return Ok(());
+        }
+        let mut keys: Vec<_> = tail
+            .iter()
+            .map(|&t| (embedding.clone(), t as usize))
+            .collect();
+        keys.extend(self.ple_row_keys_after(&history, tail)?);
+        self.weights.prefetch_rows(&keys)
+    }
+
+    /// Layer `i` of a window of `rows` tokens at `first` is done: a full
+    /// attention layer's keys and values go to the pool, lazily, and are
+    /// evaluated where a plain pass evaluates them.
+    #[allow(clippy::too_many_arguments)]
+    fn write_window_kv(
+        &mut self,
+        i: usize,
+        cache: &mut LayerCache,
+        rows: usize,
+        first: usize,
+        floor: usize,
+        async_window: bool,
+        submit_span: usize,
+        defer_final: bool,
+    ) -> Result<()> {
+        if self.config.linear(i) {
+            return Ok(());
+        }
+        let Some(adapter) = &mut self.paged else {
+            return Ok(());
+        };
+        let layer = (0..i).filter(|&l| !self.config.linear(l)).count() as u32;
+        let shape = [
+            rows as i64,
+            self.config.num_key_value_heads as i64,
+            self.config.head_dim as i64,
+        ];
+        let k = cache
+            .keys
+            .take()
+            .ok_or_else(|| Error::from_reason("Qwen4 prefill produced no attention keys"))?
+            .transpose(Some(&[0, 2, 1, 3]))?
+            .reshape(&shape)?;
+        let v = cache
+            .values
+            .take()
+            .ok_or_else(|| Error::from_reason("Qwen4 prefill produced no attention values"))?
+            .transpose(Some(&[0, 2, 1, 3]))?
+            .reshape(&shape)?;
+        super::paged::write_rows(adapter, layer, &k, &v, first as u32, floor as u32)?;
+        let layers = self.config.num_hidden_layers;
+        if self.verification.is_none()
+            && ((rows > 1 && !async_window)
+                || (i + 1).is_multiple_of(submit_span)
+                || i + 1 == layers)
+            && !(defer_final && i + 1 == layers)
+        {
+            adapter
+                .eval_pending_pool_writes()
+                .map_err(Error::from_reason)?;
+        }
+        Ok(())
+    }
+
+    /// A trip is held at the end of a sweep: the group's frontier (every
+    /// stream, the tape so far, the caches, the pending touches) is evaluated
+    /// and committed first, so nothing lazy reads a mapped bank, then the
+    /// store leaves the mapped path and the remaining sweeps run plain on
+    /// slots over the same partition.
+    fn switch_mid_group(&mut self, streams: &[MxArray], base: usize) -> Result<()> {
+        let outputs: Vec<&MxArray> = streams.iter().collect();
+        match self.device_routes.take() {
+            Some(routes) => {
+                if !self.commit_tentative(&outputs, &routes)? {
+                    return Err(Error::from_reason(
+                        "Qwen4 prefill group routes lost their mapped banks",
+                    ));
+                }
+            }
+            None => {
+                let touches = self.weights.take_pending_touches();
+                let mut completed = outputs;
+                completed.extend(self.pending_state_arrays());
+                completed.extend(touches.iter());
+                MxArray::eval_arrays_with_context(&completed, "qwen4::group::frontier")?;
+                if let Some(adapter) = &mut self.paged {
+                    adapter
+                        .eval_pending_pool_writes()
+                        .map_err(Error::from_reason)?;
+                }
+            }
+        }
+        self.note("qwen4::group::frontier");
+        self.note("qwen4::group::trip");
+        match self.weights.apply_held_trip() {
+            Ok(Some(_)) => {
+                self.note("qwen4::group::switch");
+                self.weights.end_group();
+                self.weights
+                    .live
+                    .fallback_token_index
+                    .store(base as u64, Ordering::Release);
+                self.residency_changed();
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!("qwen4 residency: slot fallback not applied: {error}")
+            }
+        }
+        Ok(())
+    }
+
+    /// One pass over `windows`, `for layer { for window }`. A group of one
+    /// window is the window-major pass; a group of more runs every window of
+    /// a layer before the next layer, each window at its own cursor, so the
+    /// GDN, PLE, indexer and page state flows from (layer, w) to
+    /// (layer, w + 1) as a window-major run carries it between passes.
+    fn prefill_group_inner(
+        &mut self,
+        windows: &[&[u32]],
+        next: &[u32],
         embeddings: Option<&MxArray>,
         project_logits: bool,
     ) -> Result<MxArray> {
         let base = self.history.len();
-        let submit_span = self.decode_submit_span();
-        let async_window = tokens.len() > 8 && self.async_device_prefill();
-        let defer_final = self.deferred_forward_completion();
-        if tokens.is_empty()
-            || tokens.len() > super::MAX_PREFILL_CHUNK
-            || base + tokens.len() > self.config.effective_context_limit()
-            || tokens.iter().any(|&t| t as usize >= self.config.vocab_size)
+        let started = std::time::Instant::now();
+        let rows = (self.weights.lookup.prefetched(), self.weights.lookup.late());
+        let group = windows.len() > 1;
+        let tokens = *windows
+            .first()
+            .ok_or_else(|| Error::from_reason("Qwen4 prefill group has no windows"))?;
+        let total: usize = windows.iter().map(|w| w.len()).sum();
+        let layers = self.config.num_hidden_layers;
+        let mut submit_span = self.decode_submit_span();
+        let mut async_window = windows.iter().all(|w| w.len() > 8) && self.async_device_prefill();
+        let mut defer_final = self.deferred_forward_completion();
+        if windows
+            .iter()
+            .any(|w| w.is_empty() || w.len() > super::MAX_PREFILL_CHUNK)
+            || base + total > self.config.effective_context_limit()
+            || windows
+                .iter()
+                .flat_map(|w| w.iter())
+                .any(|&t| t as usize >= self.config.vocab_size)
         {
             return Err(Error::from_reason(
                 "Qwen4 prefill chunk exceeds token/context budget",
             ));
         }
-        if let Some(e) = embeddings
-            && *e.shape()? != [1, tokens.len() as i64, self.config.hidden_size as i64]
-        {
-            return Err(Error::from_reason("Qwen4 media embedding shape mismatch"));
+        if let Some(e) = embeddings {
+            if group {
+                return Err(Error::from_reason(
+                    "Qwen4 prefill group takes no media embeddings",
+                ));
+            }
+            if *e.shape()? != [1, tokens.len() as i64, self.config.hidden_size as i64] {
+                return Err(Error::from_reason("Qwen4 media embedding shape mismatch"));
+            }
         }
         self.paged_chunk_start = base;
         if let Some(adapter) = &mut self.paged {
@@ -1828,17 +2675,33 @@ impl Decoder {
                     "Qwen4 paged/recurrent frontier mismatch",
                 ));
             }
-            adapter.record_tokens(tokens).map_err(Error::from_reason)?;
+            if group {
+                adapter
+                    .record_tokens(&windows.concat())
+                    .map_err(Error::from_reason)?;
+            } else {
+                adapter.record_tokens(tokens).map_err(Error::from_reason)?;
+            }
         }
-        let batched = self.batch_prefill && tokens.len() > 1 && self.verification.is_none();
-        let carry =
-            batched && self.window_carry && !runtime_flags::is_zero(c"MLX_QWEN4_WINDOW_CARRY");
+        if group {
+            self.prefetch_group_rows(windows, next)?;
+        } else {
+            self.prefetch_window_rows(tokens, next, embeddings.is_none())?;
+        }
+        let carry = tokens.len() > 1 && self.verification.is_none();
+        if group && !carry {
+            return Err(Error::from_reason(
+                "Qwen4 prefill group needs the carried window path",
+            ));
+        }
         let mut hidden = Vec::with_capacity(if carry { 0 } else { tokens.len() });
+        let embedding_key = self.key("embed_tokens.weight", "token_embd.weight");
+        let hc = self.config.hc_count as i32;
         let window_embedding = if embeddings.is_none() && tokens.len() > 1 {
             Some(
                 self.weights
                     .lookup_rows(
-                        &self.key("embed_tokens.weight", "token_embd.weight"),
+                        &embedding_key,
                         &tokens.iter().map(|&t| t as usize).collect::<Vec<_>>(),
                     )?
                     .reshape(&[1, tokens.len() as i64, self.config.hidden_size as i64])?,
@@ -1846,14 +2709,15 @@ impl Decoder {
         } else {
             None
         };
-        let mut window = if carry {
+        // One residual stream per window; the other windows' streams start
+        // at their layer-0 step, from the rows the fetcher holds by then.
+        let mut streams: Vec<MxArray> = Vec::with_capacity(windows.len());
+        let mut window: Option<MxArray> = None;
+        if carry {
             let embeddings = embeddings.or(window_embedding.as_ref()).ok_or_else(|| {
                 Error::from_reason("Qwen4 prefill window is missing its token embeddings")
             })?;
-            Some(MxArray::tile(
-                embeddings,
-                &[1, 1, self.config.hc_count as i32],
-            )?)
+            streams.push(MxArray::tile(embeddings, &[1, 1, hc])?);
         } else {
             for (j, &token) in tokens.iter().enumerate() {
                 self.check_cancelled()?;
@@ -1861,10 +2725,9 @@ impl Decoder {
                     Some(e) => e.slice_axis(1, j as i64, j as i64 + 1)?,
                     None => self.embed_token(token)?,
                 };
-                hidden.push(MxArray::tile(&row, &[1, 1, self.config.hc_count as i32])?);
+                hidden.push(MxArray::tile(&row, &[1, 1, hc])?);
             }
-            None
-        };
+        }
         if self.verification.is_some() {
             self.verification = Some(
                 (0..tokens.len())
@@ -1887,46 +2750,65 @@ impl Decoder {
                     .collect(),
             );
         }
-        let mut attention_normed = None;
-        for i in 0..self.config.num_hidden_layers {
+        if self.verification.is_some() {
+            window = Some(MxArray::concatenate_many(hidden.iter().collect(), Some(1))?);
+            hidden.clear();
+        }
+        for i in 0..layers {
             self.check_cancelled()?;
             let mut cache = std::mem::take(&mut self.caches[i]);
-            let mut mlp_normed = None;
-            // Verification retains the singleton arithmetic and a state at
-            // every accepted frontier. Only ordinary prompt MLPs are batched.
             if carry {
+                for (w, tokens_w) in windows.iter().enumerate() {
+                    if group {
+                        if w > 0 {
+                            self.check_cancelled()?;
+                        }
+                        self.set_cursor(base, windows, w);
+                    }
+                    let input = if i == 0 && w > 0 {
+                        let rows: Vec<usize> = tokens_w.iter().map(|&t| t as usize).collect();
+                        let e = self.weights.lookup_rows(&embedding_key, &rows)?.reshape(&[
+                            1,
+                            tokens_w.len() as i64,
+                            self.config.hidden_size as i64,
+                        ])?;
+                        let stream = MxArray::tile(&e, &[1, 1, hc])?;
+                        streams.push(stream.clone());
+                        stream
+                    } else {
+                        streams[w].clone()
+                    };
+                    let (stream, normed) =
+                        self.attention_matrix_for_mlp(&input, tokens_w, i, &mut cache, true)?;
+                    streams[w] = self.mlp_matrix_for_attention(&stream, i, normed.as_ref())?;
+                    let first = self.paged_chunk_start;
+                    self.write_window_kv(
+                        i,
+                        &mut cache,
+                        tokens_w.len(),
+                        first,
+                        base,
+                        async_window,
+                        submit_span,
+                        defer_final,
+                    )?;
+                }
+            } else if self.verification.is_some() {
                 let input = window
-                    .as_ref()
-                    .ok_or_else(|| Error::from_reason("Qwen4 attention lost its prefill window"))?;
-                let (stream, normed) = self.attention_matrix_for_mlp(
-                    input,
-                    tokens,
-                    i,
-                    &mut cache,
-                    true,
-                    attention_normed.as_ref(),
-                )?;
+                    .take()
+                    .ok_or_else(|| Error::from_reason("Qwen4 verification lost its window"))?;
+                let (stream, saved) = self.verify_layer(&input, tokens, i, &mut cache)?;
+                self.submit(&[&stream], "qwen4::decoder::verify")?;
                 window = Some(stream);
-                mlp_normed = normed;
-            } else if batched {
-                hidden = self.attention_batch(&hidden, tokens, i, &mut cache)?;
+                if let Some(states) = &mut self.verification {
+                    for (state, saved) in states.iter_mut().zip(saved) {
+                        state.caches[i] = saved;
+                    }
+                }
             } else {
                 for (j, &token) in tokens.iter().enumerate() {
                     self.check_cancelled()?;
-                    let next = if tokens.len() == 1 && self.verification.is_none() {
-                        let (stream, normed) = self.layer_with_norm(
-                            hidden[j].clone(),
-                            token,
-                            i,
-                            &mut cache,
-                            attention_normed.as_ref(),
-                            true,
-                        )?;
-                        attention_normed = normed;
-                        stream
-                    } else {
-                        self.layer(hidden[j].clone(), token, i, &mut cache)?
-                    };
+                    let next = self.layer(hidden[j].clone(), token, i, &mut cache)?;
                     if defer_final && i + 1 == self.config.num_hidden_layers {
                         // TrackFastModel returns a lazy final mixer/head. The
                         // checked route commit joins it with all state/readers.
@@ -1942,68 +2824,27 @@ impl Decoder {
                     }
                     hidden[j] = next;
                     self.history.push(token);
-                    if let Some(states) = &mut self.verification {
-                        let mut saved = cache.clone();
-                        if self.paged.is_some() {
-                            saved.keys = None;
-                            saved.values = None;
-                        }
-                        states[j].caches[i] = saved;
-                    }
                 }
             }
             self.history.truncate(base);
-            if carry {
-                let input = window
-                    .as_ref()
-                    .ok_or_else(|| Error::from_reason("Qwen4 MLP lost its prefill window"))?;
-                let (stream, normed) =
-                    self.mlp_matrix_for_attention(input, i, mlp_normed.as_ref(), true)?;
-                window = Some(stream);
-                attention_normed = normed;
-            } else if batched {
-                hidden = self.mlp_batch(&hidden, i)?;
+            if group {
+                self.paged_chunk_start = base;
             }
-            if !self.config.linear(i)
-                && let Some(adapter) = &mut self.paged
-            {
-                let layer = (0..i).filter(|&l| !self.config.linear(l)).count() as u32;
-                let k = cache
-                    .keys
-                    .take()
-                    .ok_or_else(|| Error::from_reason("Qwen4 prefill produced no attention keys"))?
-                    .transpose(Some(&[0, 2, 1, 3]))?
-                    .reshape(&[
-                        tokens.len() as i64,
-                        self.config.num_key_value_heads as i64,
-                        self.config.head_dim as i64,
-                    ])?;
-                let v = cache
-                    .values
-                    .take()
-                    .ok_or_else(|| {
-                        Error::from_reason("Qwen4 prefill produced no attention values")
-                    })?
-                    .transpose(Some(&[0, 2, 1, 3]))?
-                    .reshape(&[
-                        tokens.len() as i64,
-                        self.config.num_key_value_heads as i64,
-                        self.config.head_dim as i64,
-                    ])?;
-                super::paged::write_rows(adapter, layer, &k, &v, base as u32)?;
-                if ((tokens.len() > 1 && !async_window)
-                    || (i + 1) % submit_span == 0
-                    || i + 1 == self.config.num_hidden_layers
-                    || self.verification.is_some())
-                    && !(defer_final && i + 1 == self.config.num_hidden_layers)
-                {
-                    adapter
-                        .eval_pending_pool_writes()
-                        .map_err(Error::from_reason)?;
-                }
+            if !carry {
+                self.write_window_kv(
+                    i,
+                    &mut cache,
+                    tokens.len(),
+                    base,
+                    base,
+                    async_window,
+                    submit_span,
+                    defer_final,
+                )?;
             }
             self.caches[i] = cache;
             if tokens.len() == 1
+                && self.verification.is_none()
                 && ((i + 1) % submit_span == 0 || i + 1 == self.config.num_hidden_layers)
                 && !(defer_final && i + 1 == self.config.num_hidden_layers)
                 && let Some(adapter) = &mut self.paged
@@ -2013,12 +2854,32 @@ impl Decoder {
                     .map_err(Error::from_reason)?;
             }
             super::memory::maintain_freelist(self.weights.plan.physical_bytes);
+            if group {
+                #[cfg(test)]
+                if let Some(mut hook) = self.after_sweep.take() {
+                    hook(self, i);
+                    self.after_sweep = Some(hook);
+                }
+                if self.weights.observe_sweep() {
+                    self.switch_mid_group(&streams, base)?;
+                    submit_span = self.decode_submit_span();
+                    async_window =
+                        windows.iter().all(|w| w.len() > 8) && self.async_device_prefill();
+                    defer_final = self.deferred_forward_completion();
+                }
+            }
         }
-        if let Some(window) = window {
+        let last_tokens = windows[windows.len() - 1];
+        let final_window = if carry {
+            streams.last().cloned()
+        } else {
+            window
+        };
+        if let Some(window) = final_window {
             // Only public/MTP frontier capture needs token views. Keep one
             // matrix across layer boundaries instead of rebuilding it twice
             // per layer from thousands of token-sized lazy array objects.
-            hidden = (0..tokens.len())
+            hidden = (0..last_tokens.len())
                 .map(|j| window.slice_axis(1, j as i64, j as i64 + 1))
                 .collect::<Result<Vec<_>>>()?;
         }
@@ -2032,6 +2893,10 @@ impl Decoder {
             .ok_or_else(|| Error::from_reason("Qwen4 prefill produced no hidden rows"))?
             .clone();
         self.last_chunk_hidden = hidden;
+        if self.verification.is_some() {
+            self.history.extend_from_slice(tokens);
+            return Ok(last_hidden);
+        }
         let (mixed, _) = self.hyper(&last_hidden, "hyper_connection_mixer", "output_hc", false)?;
         let logits = if project_logits {
             self.linear(&mixed, "lm_head.weight", "output.weight")?
@@ -2041,8 +2906,22 @@ impl Decoder {
         if !defer_final {
             MxArray::eval_arrays_with_context(&[&logits], "qwen4::decoder::logits")?;
         }
+        tracing::debug!(
+            "qwen4 prefill {}: {total} tokens at {base} in {:.1?}, rows prefetched +{} late +{}",
+            if group {
+                format!("group of {} windows", windows.len())
+            } else {
+                "window".to_owned()
+            },
+            started.elapsed(),
+            self.weights.lookup.prefetched() - rows.0,
+            self.weights.lookup.late() - rows.1
+        );
 
-        self.history.extend_from_slice(tokens);
+        for window in windows {
+            self.history.extend_from_slice(window);
+        }
+        self.group_streams = if group { streams } else { Vec::new() };
         Ok(logits)
     }
 
@@ -2057,18 +2936,13 @@ impl Decoder {
                 "qwen4_exp token/context outside configured limits",
             ));
         }
-        let key = self.key("embed_tokens.weight", "token_embd.weight");
-        let row = self
-            .weights
-            .read(&key, token as usize, 1)?
-            .dense()?
-            .reshape(&[1, 1, self.config.hidden_size as i64])?;
+        self.prefetch_ple_rows(&[token])?;
+        let row = self.embed_token(token)?;
         let mut x = MxArray::tile(&row, &[1, 1, self.config.hc_count as i32])?;
-        let mut normed = None;
         for i in 0..self.config.num_hidden_layers {
             self.check_cancelled()?;
             let mut cache = std::mem::take(&mut self.caches[i]);
-            (x, normed) = self.layer_with_norm(x, token, i, &mut cache, normed.as_ref(), true)?;
+            x = self.layer(x, token, i, &mut cache)?;
             if defer_final && i + 1 == self.config.num_hidden_layers {
                 // The validated route commit completes the final head too.
             } else if (i + 1) % submit_span != 0 && i + 1 < self.config.num_hidden_layers {

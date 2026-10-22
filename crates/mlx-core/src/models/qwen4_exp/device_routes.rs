@@ -3,38 +3,22 @@
 //! mappings. Any miss restores the recurrent/page frontier and replays using
 //! the ordinary loader. This never predicts an expert or approximates routing.
 use super::*;
-use crate::models::qwen4_exp::runtime_flags;
 
 impl Decoder {
-    pub(super) fn deferred_state_submission(&self) -> bool {
-        self.device_routes.is_some() && !runtime_flags::is_zero(c"MLX_QWEN4_STATE_SUBMISSION")
+    pub(in super::super) fn deferred_state_submission(&self) -> bool {
+        self.device_routes.is_some()
     }
 
     pub(super) fn deferred_forward_completion(&self) -> bool {
-        self.deferred_state_submission()
-            && self.verification.is_none()
-            && !runtime_flags::is_zero(c"MLX_QWEN4_DEFER_FINAL_COMPLETION")
+        self.deferred_state_submission() && self.verification.is_none()
     }
 
-    fn pending_state_arrays(&self) -> Vec<&MxArray> {
-        self.caches
-            .iter()
-            .flat_map(|cache| {
-                cache
-                    .conv
-                    .iter()
-                    .chain(cache.recurrent.iter())
-                    .chain(cache.ple_conv.iter())
-                    .chain(cache.keys.iter())
-                    .chain(cache.values.iter())
-                    .chain(cache.index_keys.iter())
-                    .chain(cache.index_tail.iter())
-            })
-            .collect()
+    pub(super) fn pending_state_arrays(&self) -> Vec<&MxArray> {
+        self.caches.iter().flat_map(LayerCache::arrays).collect()
     }
 
     pub(super) fn async_device_prefill(&self) -> bool {
-        self.device_routes.is_some() && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_ASYNC_WINDOW")
+        self.device_routes.is_some()
     }
 
     /// TrackP12Prefill.sortedMoE's device-only route/sort/indirect execution,
@@ -45,7 +29,6 @@ impl Decoder {
         selected: &MxArray,
         scores: &MxArray,
         layer: usize,
-        shared: Option<(&MxArray, &MxArray)>,
     ) -> Result<MxArray> {
         let tokens = x.shape_at(1)?;
         let top = self.config.num_experts_per_tok;
@@ -66,11 +49,7 @@ impl Decoder {
         )?
         .ok_or_else(|| Error::from_reason("Qwen4 tentative prefill requires indirect experts"))?;
         let output = output.reshape(&[tokens * top as i64, self.config.hidden_size as i64])?;
-        let reduced = if let Some((shared, gate)) = shared {
-            math::combine_shared_expert_rows(&output, scores, &inverse, shared, gate, top)?
-        } else {
-            math::combine_expert_rows(&output, scores, Some(&inverse), top)?
-        };
+        let reduced = math::combine_expert_rows(&output, scores, Some(&inverse), top)?;
         self.weights.finish_expert_slots(layer, &reduced)?;
         self.device_routes
             .as_mut()
@@ -79,17 +58,18 @@ impl Decoder {
         Ok(reduced)
     }
 
-    pub(super) fn prefill_with_device_routes(
+    pub(super) fn prefill_group_with_device_routes(
         &mut self,
-        tokens: &[u32],
+        windows: &[&[u32]],
+        next: &[u32],
         embeddings: Option<&MxArray>,
         project: bool,
     ) -> Result<MxArray> {
-        if !(256..=1024).contains(&tokens.len())
+        if windows
+            .iter()
+            .any(|tokens| !(256..=1024).contains(&tokens.len()))
             || embeddings.is_some()
             || !self.gguf()
-            || !self.batch_prefill
-            || !self.window_carry
             || self.verification.is_some()
             || self.device_routes.is_some()
             || self.config.hidden_size != 2560
@@ -97,40 +77,71 @@ impl Decoder {
             || self.config.num_experts_per_tok != 10
             || !crate::engine::persistence::compiled_forward_backend_available()
             || !unsafe { mlx_sys::mlx_metal_is_nax_available() }
-            || runtime_flags::is_zero(c"MLX_ENABLE_TF32")
-            || runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_DEVICE_ROUTES")
-            || runtime_flags::is_zero(c"MLX_QWEN4_COUNTING_SORT")
-            || runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_INDIRECT")
+            || !super::super::tf32_enabled()
             || !self
                 .weights
                 .prefill_device_slots_ready(self.config.num_hidden_layers)
         {
-            return self.prefill_chunk_inner(tokens, embeddings, project);
+            return self.prefill_group_inner(windows, next, embeddings, project);
         }
         self.weights.complete_device_readers()?;
-        let base = self.snapshot();
-        self.device_routes = Some(Vec::with_capacity(self.config.num_hidden_layers));
-        let tentative = self.prefill_chunk_inner(tokens, embeddings, project);
+        // Only a one-window pass replays a miss; a group of more is an error.
+        let base = (windows.len() == 1).then(|| self.snapshot());
+        self.device_routes = Some(Vec::with_capacity(
+            self.config.num_hidden_layers * windows.len(),
+        ));
+        let tentative = self.prefill_group_inner(windows, next, embeddings, project);
         let routes = self.device_routes.take();
         let output = tentative?;
-        let routes = routes
-            .ok_or_else(|| Error::from_reason("Qwen4 tentative prefill lost its route tape"))?;
-        if routes.len() != self.config.num_hidden_layers {
+        let Some(routes) = routes else {
+            if windows.len() > 1 {
+                // A trip between two sweeps committed the tape so far and
+                // closed the transaction; the rest of the group ran plain.
+                return Ok(output);
+            }
+            return Err(Error::from_reason(
+                "Qwen4 tentative prefill lost its route tape",
+            ));
+        };
+        if routes.len() != self.config.num_hidden_layers * windows.len() {
             return Err(Error::from_reason(
                 "Qwen4 tentative prefill has an incomplete route tape",
             ));
         }
-        let tape = MxArray::concatenate_many(routes.iter().map(|(_, ids)| ids).collect(), Some(0))?;
-        let mut completed = vec![&output, &tape];
-        if !runtime_flags::is_zero(c"MLX_QWEN4_STATE_SUBMISSION") {
-            completed.extend(self.pending_state_arrays());
-        } else if !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_ASYNC_WINDOW") {
-            completed.extend(
-                self.caches
-                    .iter()
-                    .filter_map(|cache| cache.ple_conv.as_ref()),
-            );
+        let streams = std::mem::take(&mut self.group_streams);
+        let mut outputs = vec![&output];
+        outputs.extend(streams.iter());
+        let hit = self.commit_tentative(&outputs, &routes);
+        self.group_streams = streams;
+        #[cfg(test)]
+        self.tentative_commits.push(windows.len());
+        if hit? {
+            return Ok(output);
         }
+        let Some(base) = base else {
+            return Err(Error::from_reason(
+                "Qwen4 prefill group routes lost their mapped banks",
+            ));
+        };
+        drop(output);
+        self.replay_device_prefill(base, windows[0], embeddings, project)
+    }
+
+    /// Complete a tentative pass and check its tape: `outputs` (the logits
+    /// and every residual stream), the tape, every state array and the
+    /// group's pending bank touches evaluate together, the pool writes after
+    /// them, then the routes are checked against the unchanged host mapping.
+    pub(super) fn commit_tentative(
+        &mut self,
+        outputs: &[&MxArray],
+        routes: &[(usize, MxArray)],
+    ) -> Result<bool> {
+        let tape = MxArray::concatenate_many(routes.iter().map(|(_, ids)| ids).collect(), Some(0))?;
+        let touches = self.weights.take_pending_touches();
+        let mut completed = outputs.to_vec();
+        completed.push(&tape);
+        completed.extend(self.pending_state_arrays());
+        completed.extend(touches.iter());
         MxArray::eval_arrays_with_context(&completed, "qwen4::prefill_device_routes::commit")?;
         if let Some(adapter) = &mut self.paged {
             adapter
@@ -138,29 +149,27 @@ impl Decoder {
                 .map_err(Error::from_reason)?;
         }
         self.weights.complete_device_readers()?;
+        self.note("qwen4::routes::commit");
         let ids = tape.to_uint32()?;
-        let layers: Vec<_> = routes.iter().map(|(layer, _)| *layer).collect();
-        let hit = self.weights.commit_device_routes(
-            &layers,
-            &ids,
-            tokens.len() * self.config.num_experts_per_tok,
-        )?;
-        let force = runtime_flags::is_one(c"MLX_QWEN4_PREFILL_DEVICE_ROUTE_FORCE_REPLAY");
-        if runtime_flags::is_one(c"MLX_QWEN4_TRACE_DEVICE_ROUTES") {
-            eprintln!(
-                "QWEN4_PREFILL_DEVICE_ROUTES position={} tokens={} layers={} hit={} replay={}",
-                base.history.len(),
-                tokens.len(),
-                routes.len(),
-                hit,
-                !hit || force
-            );
+        let mut entries = Vec::with_capacity(routes.len());
+        let mut offset = 0;
+        for (layer, selected) in routes {
+            let len = selected.shape_at(0)? as usize;
+            let end = offset + len;
+            let Some(entry) = ids.get(offset..end) else {
+                return Err(Error::from_reason(
+                    "Qwen4 device route tape has an invalid shape",
+                ));
+            };
+            entries.push((*layer, entry));
+            offset = end;
         }
-        if hit && !force {
-            return Ok(output);
+        if offset != ids.len() {
+            return Err(Error::from_reason(
+                "Qwen4 device route tape has an invalid shape",
+            ));
         }
-        drop(output);
-        self.replay_device_prefill(base, tokens, embeddings, project)
+        self.weights.commit_device_route_entries(&entries)
     }
 
     pub(in super::super) fn replay_device_prefill(
@@ -181,18 +190,13 @@ impl Decoder {
                 .map_err(Error::from_reason)?;
         }
         self.restore_state(base);
-        self.prefill_chunk_inner(tokens, embeddings, project)
+        // The tentative pass already requested the next window's rows.
+        self.prefill_chunk_inner(tokens, &[], embeddings, project)
     }
 
     pub(super) fn decode_submit_span(&self) -> usize {
-        if self.device_routes.is_some()
-            && !runtime_flags::is_zero(c"MLX_QWEN4_DEVICE_ROUTE_WIDE_SUBMISSION")
-        {
-            if !runtime_flags::is_zero(c"MLX_QWEN4_DEVICE_ROUTE_COALESCED") {
-                self.config.num_hidden_layers
-            } else {
-                12
-            }
+        if self.device_routes.is_some() {
+            self.config.num_hidden_layers
         } else {
             3
         }
@@ -203,7 +207,6 @@ impl Decoder {
         // then submit groups of three while building the rest of this token.
         // Ordinary decoding retains its per-layer submission and short waits.
         self.device_routes.is_none()
-            || runtime_flags::is_zero(c"MLX_QWEN4_DEVICE_ROUTE_COALESCED")
             || (completed_layers >= 2 && (completed_layers - 2).is_multiple_of(3))
     }
 
@@ -212,13 +215,9 @@ impl Decoder {
         x: &MxArray,
         selected: &MxArray,
         scores: &MxArray,
-        shared_gate: Option<&MxArray>,
         layer: usize,
     ) -> Result<Option<MxArray>> {
-        if self.device_routes.is_none()
-            || runtime_flags::is_zero(c"MLX_QWEN4_SHARED_EXPERTS")
-            || runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
-        {
+        if self.device_routes.is_none() {
             return Ok(None);
         }
         let shared = ["gate", "up", "down"].map(|part| {
@@ -232,14 +231,11 @@ impl Decoder {
         let Some((banks, local)) = self.weights.device_expert_slots(layer, selected)? else {
             return Ok(None);
         };
-        let shared_gate = match shared_gate {
-            Some(gate) => gate.clone(),
-            None => self.linear(
-                x,
-                &format!("layers.{layer}.mlp.shared_expert_gate.weight"),
-                &format!("blk.{layer}.ffn_gate_inp_shexp.weight"),
-            )?,
-        };
+        let shared_gate = self.linear(
+            x,
+            &format!("layers.{layer}.mlp.shared_expert_gate.weight"),
+            &format!("blk.{layer}.ffn_gate_inp_shexp.weight"),
+        )?;
         let Some(out) =
             math::routed_shared_experts(x, &local, scores, &banks, &shared, &shared_gate)?
         else {
@@ -249,6 +245,63 @@ impl Decoder {
         self.device_routes
             .as_mut()
             .ok_or_else(|| Error::from_reason("Qwen4 tentative decode lost its route tape"))?
+            .push((layer, selected.reshape(&[-1])?));
+        Ok(Some(out))
+    }
+
+    /// Every mapped expert has a bank row, so a verify pass reads no expert
+    /// and its routes can wait for the pass end. Slot banks keep the host
+    /// routes: a verify pass loads the experts it misses. The shapes are the
+    /// row kernels': a layer whose rows fall back to the one-row MoE would
+    /// put one-row routes on the R-row tape.
+    pub(super) fn verify_routes_on_device(&self) -> bool {
+        self.gguf()
+            && self.weights.plan.mapped
+            && self.config.hidden_size == 2560
+            && self.config.moe_intermediate_size == 640
+            && self.config.num_experts == 512
+            && self.config.num_experts_per_tok == 10
+            && self
+                .weights
+                .device_slots_ready(self.config.num_hidden_layers)
+    }
+
+    /// `tentative_shared_experts` over the `[1, R, H]` verify rows.
+    pub(super) fn tentative_shared_expert_rows(
+        &mut self,
+        x: &MxArray,
+        selected: &MxArray,
+        scores: &MxArray,
+        layer: usize,
+    ) -> Result<Option<MxArray>> {
+        if self.device_routes.is_none() || x.dtype()? != DType::BFloat16 {
+            return Ok(None);
+        }
+        let shared = ["gate", "up", "down"].map(|part| {
+            self.weights
+                .resident_bank(&format!("blk.{layer}.ffn_{part}_shexp.weight"))
+        });
+        let [Some(gate), Some(up), Some(down)] = shared else {
+            return Ok(None);
+        };
+        let shared = [gate, up, down];
+        let Some((banks, local)) = self.weights.device_expert_slots(layer, selected)? else {
+            return Ok(None);
+        };
+        let shared_gate = self.linear_rows(
+            x,
+            &format!("layers.{layer}.mlp.shared_expert_gate.weight"),
+            &format!("blk.{layer}.ffn_gate_inp_shexp.weight"),
+        )?;
+        let Some(out) =
+            math::rows::routed_shared_experts(x, &local, scores, &banks, &shared, &shared_gate)?
+        else {
+            return Ok(None);
+        };
+        self.weights.finish_expert_slots(layer, &out)?;
+        self.device_routes
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Qwen4 tentative verify lost its route tape"))?
             .push((layer, selected.reshape(&[-1])?));
         Ok(Some(out))
     }
@@ -279,7 +332,7 @@ impl Decoder {
 
     fn ordinary_token(&mut self, token: u32, project: bool) -> Result<MxArray> {
         if self.paged.is_some() {
-            self.prefill_chunk_inner(&[token], None, project)
+            self.prefill_chunk_inner(&[token], &[], None, project)
         } else {
             self.forward_token_inner(token, project)
         }
@@ -302,8 +355,6 @@ impl Decoder {
             || !self
                 .weights
                 .device_slots_ready(self.config.num_hidden_layers)
-            || runtime_flags::is_zero(c"MLX_QWEN4_DEVICE_ROUTES")
-            || runtime_flags::is_zero(c"MLX_QWEN4_FUSED_EXPERTS")
         {
             return self.ordinary_token(token, project);
         }
@@ -322,9 +373,7 @@ impl Decoder {
         // The normal decoder already completes its final hidden/logits. Join
         // the tape explicitly, so one readback validates all layers at once.
         let mut completed = vec![&out, &tape];
-        if !runtime_flags::is_zero(c"MLX_QWEN4_STATE_SUBMISSION") {
-            completed.extend(self.pending_state_arrays());
-        }
+        completed.extend(self.pending_state_arrays());
         MxArray::eval_arrays_with_context(&completed, "qwen4::device_routes::commit")?;
         // A deferred final layer can leave its page write lazy. Complete it
         // before validating routes, releasing readers, or publishing output.
@@ -333,29 +382,17 @@ impl Decoder {
                 .eval_pending_pool_writes()
                 .map_err(Error::from_reason)?;
         }
-        if !runtime_flags::is_zero(c"MLX_QWEN4_DEVICE_ROUTE_READER_JOIN") {
-            self.weights.complete_device_readers()?;
-        }
+        self.weights.complete_device_readers()?;
         let ids = tape.to_uint32()?;
         let layers: Vec<_> = routes.iter().map(|(layer, _)| *layer).collect();
         let hit =
             self.weights
                 .commit_device_routes(&layers, &ids, self.config.num_experts_per_tok)?;
-        let force_replay = runtime_flags::is_one(c"MLX_QWEN4_DEVICE_ROUTE_FORCE_REPLAY");
-        if runtime_flags::is_one(c"MLX_QWEN4_TRACE_DEVICE_ROUTES") {
-            eprintln!(
-                "QWEN4_DEVICE_ROUTES position={} layers={} hit={} replay={}",
-                base.history.len(),
-                routes.len(),
-                hit,
-                !hit || force_replay
-            );
-        }
-        if hit && !force_replay {
+        if hit {
             return Ok(out);
         }
         drop(out);
-        self.device_route_cooldown = if force_replay { 0 } else { 16 };
+        self.device_route_cooldown = 16;
         self.replay_device_token(base, token, project)
     }
 

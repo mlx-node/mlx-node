@@ -1651,50 +1651,58 @@ pub fn load_gguf_tensors<P: AsRef<Path>>(
                 tensor.mlx_shape()
             );
         }
-
-        if let Some(format) = tensor.tensor_type.k_quant_format() {
-            if options.import_k_quants {
-                for (name, arr) in load_kquant_repack(&mut reader, gguf, tensor, format)? {
-                    weights.insert(name, arr);
-                }
-            } else if tensor.tensor_type == GgufTensorType::Q6K {
-                // The pre-K-quant fallback: one dequantized tensor, in one
-                // position, for one architecture.
-                let is_gemma4 = gguf
-                    .metadata
-                    .get("general.architecture")
-                    .and_then(GgufMetaValue::as_str)
-                    == Some("gemma4");
-                if !is_gemma4 || tensor.name != "token_embd.weight" {
-                    return Err(Error::from_reason(format!(
-                        "Q6_K tensor '{}' is unsupported in this position. mlx-node currently supports Q6_K only for Gemma4 token_embd.weight, dequantized to BF16.",
-                        tensor.name
-                    )));
-                }
-                let arr = load_q6k_tensor_bf16(&mut reader, gguf, tensor)?;
-                weights.insert(tensor.name.clone(), arr);
-            } else {
-                return Err(Error::from_reason(format!(
-                    "{} tensor '{}' needs the K-quant import, which is not enabled. mlx-node reads {} only when K-quant import is requested.",
-                    tensor.tensor_type.name(),
-                    tensor.name,
-                    tensor.tensor_type.name(),
-                )));
-            }
-        } else if tensor.tensor_type.is_mlx_affine_quantized()
-            || tensor.tensor_type.is_mlx_mxfp4_quantized()
-        {
-            let triplet = load_quantized_tensor(&mut reader, gguf, tensor)?;
-            for (name, arr) in triplet {
-                weights.insert(name, arr);
-            }
-        } else {
-            let arr = load_unquantized_tensor(&mut reader, gguf, tensor)?;
-            weights.insert(tensor.name.clone(), arr);
+        for (name, arr) in load_gguf_tensor(&mut reader, gguf, tensor, options)? {
+            weights.insert(name, arr);
         }
     }
 
     Ok(weights)
+}
+
+/// Load one tensor of `gguf` from `reader`, which may be the file itself or
+/// an in-memory copy of the tensor's payload with `gguf.data_offset` and
+/// `tensor.offset` describing where it sits in that reader.
+pub(crate) fn load_gguf_tensor(
+    reader: &mut (impl Read + Seek),
+    gguf: &GgufFile,
+    tensor: &GgufTensorInfo,
+    options: GgufLoadOptions,
+) -> Result<Vec<(String, MxArray)>> {
+    if let Some(format) = tensor.tensor_type.k_quant_format() {
+        if options.import_k_quants {
+            load_kquant_repack(reader, gguf, tensor, format)
+        } else if tensor.tensor_type == GgufTensorType::Q6K {
+            // The pre-K-quant fallback: one dequantized tensor, in one
+            // position, for one architecture.
+            let is_gemma4 = gguf
+                .metadata
+                .get("general.architecture")
+                .and_then(GgufMetaValue::as_str)
+                == Some("gemma4");
+            if !is_gemma4 || tensor.name != "token_embd.weight" {
+                return Err(Error::from_reason(format!(
+                    "Q6_K tensor '{}' is unsupported in this position. mlx-node currently supports Q6_K only for Gemma4 token_embd.weight, dequantized to BF16.",
+                    tensor.name
+                )));
+            }
+            let arr = load_q6k_tensor_bf16(reader, gguf, tensor)?;
+            Ok(vec![(tensor.name.clone(), arr)])
+        } else {
+            Err(Error::from_reason(format!(
+                "{} tensor '{}' needs the K-quant import, which is not enabled. mlx-node reads {} only when K-quant import is requested.",
+                tensor.tensor_type.name(),
+                tensor.name,
+                tensor.tensor_type.name(),
+            )))
+        }
+    } else if tensor.tensor_type.is_mlx_affine_quantized()
+        || tensor.tensor_type.is_mlx_mxfp4_quantized()
+    {
+        load_quantized_tensor(reader, gguf, tensor)
+    } else {
+        let arr = load_unquantized_tensor(reader, gguf, tensor)?;
+        Ok(vec![(tensor.name.clone(), arr)])
+    }
 }
 
 // ── Key Remapping ───────────────────────────────────────────────────────────

@@ -4,10 +4,9 @@ use super::{Inner, Step};
 use crate::array::MxArray;
 use crate::engine::backend::{PagedBackend, PagedPrefix};
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridStepExecutor, NoRestoreTicket,
+    HybridSchedulerBackend, HybridStepExecutor, NoRestoreTicket, ScheduledStateCapacity,
 };
 use crate::engine::paged_stepper::PagedStepper;
-use crate::models::qwen4_exp::runtime_flags;
 use crate::stream::Stream;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use napi::{Error, Result};
@@ -46,20 +45,22 @@ pub fn create(config: &super::config::Config) -> Result<PagedKVCacheAdapter> {
 /// The native bridge compacts strided inputs and preserves offsets for
 /// contiguous read-only K/V views. An explicit zero selects independent
 /// copies for comparison; mutable pool and metadata constraints stay strict.
+/// The rows go to positions `base..` of the tokens recorded for this
+/// request, never below `floor` (the tokens recorded before this pass): a
+/// layer-major group records all its windows first and writes each window at
+/// its own base.
 pub(super) fn write_rows(
     adapter: &mut PagedKVCacheAdapter,
     layer: u32,
     keys: &MxArray,
     values: &MxArray,
     base: u32,
+    floor: u32,
 ) -> Result<()> {
     let keys = keys.astype(crate::array::DType::BFloat16)?;
     let values = values.astype(crate::array::DType::BFloat16)?;
-    let views = !runtime_flags::is_zero(c"MLX_QWEN4_PAGED_VIEWS");
-    let keys = if views { keys } else { keys.deep_copy()? };
-    let values = if views { values } else { values.deep_copy()? };
     adapter
-        .update_keys_values_native(layer, &keys, &values, base)
+        .update_keys_values_native_recorded(layer, &keys, &values, base, floor)
         .map_err(Error::from_reason)
 }
 
@@ -187,9 +188,33 @@ impl PagedBackend for Inner {
     }
     fn paged_prefill(&mut self, tokens: &[u32], _: &Prefix, stream: Stream) -> Result<MxArray> {
         let _context = crate::stream::StreamContext::new(stream);
+        // Group mode is read again here: a trip applied since admission runs
+        // the whole-prompt row one window at a time below.
+        if self.media_prefill.is_none() && self.decoder.group_mode(tokens.len()) {
+            let seq = self.active_seq.unwrap_or(0);
+            let (windows, tail) = self.decoder.group_windows(tokens);
+            let tracking = self.mtp_tracking(seq);
+            let (logits, views) = self.decoder.prefill_group(&windows, tail, true, tracking)?;
+            if tracking {
+                for (window, hidden) in windows.iter().zip(&views) {
+                    self.observe_mtp(seq, window, hidden)?;
+                }
+                if !tail.is_empty() {
+                    let hidden = self.decoder.last_chunk_hidden.clone();
+                    self.observe_mtp(seq, tail, &hidden)?;
+                }
+            }
+            return logits.squeeze(Some(&[1]));
+        }
         let mut logits = None;
-        let chunk_size = self.decoder.prefill_slice_size();
-        for (i, chunk) in tokens.chunks(chunk_size).enumerate() {
+        // Read before every pass: a pass that leaves the mapped path shrinks
+        // the window for the passes after it.
+        let mut start = 0;
+        while start < tokens.len() {
+            let window = self.decoder.prefill_slice_size();
+            let end = (start + window).min(tokens.len());
+            let chunk = &tokens[start..end];
+            let next = &tokens[end..(end + window).min(tokens.len())];
             let base = self.decoder.history.len();
             let embeddings = if let Some(media) = &self.media_prefill {
                 self.decoder.positions = media.positions.clone();
@@ -203,13 +228,15 @@ impl PagedBackend for Inner {
             } else {
                 None
             };
-            logits = Some(self.decoder.prefill_chunk(
+            logits = Some(self.decoder.prefill_chunk_ahead(
                 chunk,
+                next,
                 embeddings.as_ref(),
-                (i + 1) * chunk_size >= tokens.len(),
+                end == tokens.len(),
             )?);
             let hidden = self.decoder.last_chunk_hidden.clone();
             self.observe_mtp(self.active_seq.unwrap_or(0), chunk, &hidden)?;
+            start = end;
         }
         logits
             .ok_or_else(|| Error::from_reason("Qwen4 empty paged prefill"))?
@@ -222,9 +249,11 @@ impl PagedBackend for Inner {
         &mut self,
         _: &crate::engine::params::ChatParams,
     ) -> Result<bool> {
-        // The scheduled lane owns proposal/verification transactions. An
-        // exclusive legacy/media barrier serves target AR without opening a
-        // second, competing speculative cache owner.
+        // The scheduled lane owns proposal/verification transactions. An owned
+        // turn routed here (cold continue of an unknown owner,
+        // MLX_SERVE_FORCE_SERIAL) serves target AR without opening a second,
+        // competing speculative cache owner. An ownerless one never gets here:
+        // `run_paged_turn` refuses it before prefill.
         Ok(false)
     }
     fn finalize_paged_turn(&mut self, reuse: bool, _: u64) {
@@ -298,7 +327,7 @@ impl HybridSchedulerBackend for Inner {
     type StepExecutor<'a> = HybridStepExecutor<'a, Self>;
     const SCHEDULER_NAME: &'static str = "qwen4_exp";
     fn scheduler_wired_bytes(&self) -> Option<usize> {
-        if runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_WIRED") {
+        if self.decoder.weights.plan.mapped {
             return None;
         }
         let pages = self.decoder.paged.as_ref().map_or(Some(0), |p| {
@@ -323,6 +352,9 @@ impl HybridSchedulerBackend for Inner {
     fn supports_scheduled_speculation(&self) -> bool {
         self.has_mtp
     }
+    fn ownerless_session_in_owner_tables(&self) -> bool {
+        true
+    }
     fn supports_adaptive_scheduled_speculation(&self) -> bool {
         self.has_mtp
     }
@@ -346,13 +378,6 @@ impl HybridSchedulerBackend for Inner {
             .ok_or_else(|| Error::from_reason("Qwen4 speculative reservation has no paged cache"))?
             .reserve_rows(queries as u32)
             .is_ok())
-    }
-    fn scheduled_draft_state_bytes(&self, tokens: u32) -> u64 {
-        4 * self.recurrent_state_bytes()
-            + tokens as u64
-                * self.decoder.config.num_key_value_heads as u64
-                * self.decoder.config.head_dim as u64
-                * 8
     }
     fn propose_scheduled(
         &mut self,
@@ -387,36 +412,63 @@ impl HybridSchedulerBackend for Inner {
     fn scheduler_capacity(&self) -> usize {
         4
     }
+    fn scheduled_turn_opened(&mut self, seq: SeqId) {
+        let first = self.open_turns.is_empty() && !self.exclusive_turn;
+        if self.open_turns.insert(seq) {
+            self.open_turn(first);
+        }
+    }
+    fn scheduled_turn_closed(&mut self, seq: SeqId) {
+        self.open_turns.remove(&seq);
+    }
     fn scheduler_prefill_slice_tokens(&self) -> u32 {
         self.decoder.prefill_slice_size() as u32
+    }
+    fn scheduler_whole_prompt_prefill(&self, prompt_tokens: u32, cached_prefix: u32) -> bool {
+        self.media_prefill.is_none()
+            && self
+                .decoder
+                .group_mode(prompt_tokens.saturating_sub(cached_prefix) as usize)
     }
     fn max_position_embeddings(&self) -> i32 {
         self.decoder.config.effective_context_limit() as i32
     }
-    fn recurrent_state_bytes(&self) -> u64 {
+    fn scheduled_state_capacity(&self) -> Option<ScheduledStateCapacity> {
         let c = &self.decoder.config;
-        // Include the maximum indexer history and convolution windows as well
-        // as F32 recurrent matrices in scheduler admission accounting.
-        let linear = (0..c.num_hidden_layers).filter(|&i| c.linear(i)).count();
-        let full = c.num_hidden_layers - linear;
-        (linear
-            * (c.linear_num_value_heads * c.linear_key_head_dim * c.linear_value_head_dim * 4
-                + (2 * c.linear_num_key_heads * c.linear_key_head_dim
-                    + c.linear_num_value_heads * c.linear_value_head_dim)
-                    * c.linear_conv_kernel_dim
-                    * 4)
-            + full * c.indexer_head_dim * c.effective_context_limit() / c.indexer_compress_ratio
-                * 4
-            + c.ple_layer_ids.len()
-                * c.hc_count
-                * c.hidden_size
-                * c.ple_conv_kernel_size
-                * c.ngram_size
-                * 4) as u64
+        let pool = self.decoder.paged.as_ref().map_or(0, |p| {
+            p.bytes_per_block()
+                .unwrap_or(0)
+                .saturating_mul(u64::from(p.block_capacity()))
+        });
+        let row = super::memory::row_state_bytes(c);
+        Some(ScheduledStateCapacity {
+            budget: super::memory::scheduled_state_budget(
+                pool,
+                super::memory::prefill_scratch(c, self.decoder.prefill_chunk_size),
+            ),
+            held: (self.rows.len() + usize::from(self.active_seq.is_some())) as u64 * row
+                + self.mtp.held_bytes(c),
+        })
     }
-    fn scheduled_recurrent_bytes(&self) -> u64 {
-        (self.rows.len() + usize::from(self.active_seq.is_some())) as u64
-            * self.recurrent_state_bytes()
+    fn scheduled_state_candidate_bytes(&self, seq: SeqId, tokens: u32, speculative: bool) -> u64 {
+        let c = &self.decoder.config;
+        let row = if self.has_scheduled_recurrent(seq) {
+            0
+        } else {
+            super::memory::row_state_bytes(c)
+        };
+        let draft = if speculative {
+            let held = self.mtp.owner_frontier(seq).unwrap_or(0) as u64;
+            super::memory::draft_state_bytes(c, u64::from(tokens).saturating_sub(held))
+        } else {
+            0
+        };
+        row + draft
+    }
+    fn scheduled_state_held_bytes(&self, seq: SeqId) -> u64 {
+        let c = &self.decoder.config;
+        u64::from(self.has_scheduled_recurrent(seq)) * super::memory::row_state_bytes(c)
+            + self.mtp.owner_held_bytes(c, seq)
     }
     fn has_scheduled_recurrent(&self, seq: SeqId) -> bool {
         self.active_seq == Some(seq) || self.rows.contains_key(&seq)
@@ -463,7 +515,7 @@ impl HybridSchedulerBackend for Inner {
                 "Qwen4 scheduled batch exceeds owner capacity",
             ));
         }
-        if rows.len() > 1 && !runtime_flags::is_zero(c"MLX_QWEN4_BATCH_DECODE") {
+        if rows.len() > 1 {
             return self.decode_shared_layers(rows);
         }
         let mut logits = Vec::with_capacity(rows.len());
@@ -622,6 +674,7 @@ pub(super) fn gather_window(
 
 impl Inner {
     fn decode_shared_layers(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
+        let started = std::time::Instant::now();
         let result = (|| {
             let mut hidden = Vec::with_capacity(rows.len());
             for &(seq, token) in rows {
@@ -656,6 +709,8 @@ impl Inner {
                 }
                 self.release_scheduled_recurrent_for(seq);
             }
+        } else {
+            self.decoder.observe_pass(rows.len(), started.elapsed());
         }
         result
     }

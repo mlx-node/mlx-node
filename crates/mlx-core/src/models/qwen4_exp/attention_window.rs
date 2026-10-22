@@ -1,15 +1,19 @@
 //! Window-wide causal attention. Pages remain the persistent storage; only
 //! the current window and a bounded view of its prefix feed SDPA.
 use super::*;
-use crate::models::qwen4_exp::runtime_flags;
 
 impl Decoder {
     pub(super) fn rope_window(&self, x: &MxArray, start: usize, count: usize) -> Result<MxArray> {
         self.rope_window_positions(x, start..start + count)
     }
 
-    fn use_batch_rotary(&self) -> bool {
-        self.batch_rotary && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_ROTARY")
+    #[cfg(test)]
+    pub(in super::super) fn rope_positions(
+        &self,
+        x: &MxArray,
+        offsets: &[usize],
+    ) -> Result<MxArray> {
+        self.rope_window_positions(x, offsets.iter().copied())
     }
 
     fn rope_window_positions(
@@ -18,19 +22,9 @@ impl Decoder {
         offsets: impl Iterator<Item = usize>,
     ) -> Result<MxArray> {
         let (positions, sections, interleaved) = self.rotary_window_parameters(offsets);
-        if self.use_batch_rotary() {
-            return self.rotary_tables.borrow_mut().apply(
-                x,
-                positions,
-                self.config.rope_dims(),
-                self.config.rope_theta(),
-                sections,
-                interleaved,
-            );
-        }
-        math::mrope_window(
+        self.rotary_tables.borrow_mut().apply(
             x,
-            &positions,
+            positions,
             self.config.rope_dims(),
             self.config.rope_theta(),
             sections,
@@ -80,28 +74,6 @@ impl Decoder {
         count: usize,
         window: bool,
     ) -> Result<MxArray> {
-        if self.gguf()
-            && self.config.head_dim == 256
-            && x.dtype()? == DType::BFloat16
-            && runtime_flags::is_one(c"MLX_QWEN4_ATTENTION_NORM_ROTARY")
-            && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
-        {
-            let weight = self.dense(hf, gg)?;
-            let (positions, sections, interleaved) =
-                self.rotary_window_parameters(start..start + count);
-            if let Some(out) = self.rotary_tables.borrow_mut().apply_normalized(
-                x,
-                &weight,
-                positions,
-                self.config.rope_dims(),
-                self.config.rope_theta(),
-                sections,
-                interleaved,
-                self.config.rms_norm_eps,
-            )? {
-                return Ok(out);
-            }
-        }
         let normalized = self.norm(x, hf, gg, self.config.head_dim, true)?;
         if window {
             self.rope_window(&normalized, start, count)
@@ -122,14 +94,12 @@ impl Decoder {
         let t = x.shape()?[1] as usize;
         let dtype = x.dtype()?;
         let sparse = base + t > c.indexer_budget;
-        if runtime_flags::is_zero(c"MLX_QWEN4_ATTENTION_WINDOW")
-            // F32 fixtures retain singleton SDPA accumulation (wide NAX uses TF32).
-            || dtype == DType::Float32
+        // F32 fixtures retain singleton SDPA accumulation (wide NAX uses TF32).
+        if dtype == DType::Float32
             || self.verification.is_some()
             || self.position_override.is_some()
             || (sparse
-                && (runtime_flags::is_zero(c"MLX_QWEN4_BATCHED_QSA")
-                    || !matches!(dtype, DType::BFloat16 | DType::Float16)
+                && (!matches!(dtype, DType::BFloat16 | DType::Float16)
                     || !c.head_dim.is_multiple_of(32)
                     // The kernel attends at most 32 incomplete-block tokens.
                     || c.indexer_compress_ratio > 33
@@ -192,23 +162,12 @@ impl Decoder {
                 c.indexer_head_dim,
                 true,
             )?;
-            let rotated = if self.use_batch_rotary() {
-                self.rope_window_positions(
+            let rotated = self
+                .rope_window_positions(
                     &norms.reshape(&[1, 1, blocks as i64, id])?,
                     (0..blocks).map(|b| base - tail + b * ratio),
                 )?
-                .reshape(&[blocks as i64, id])?
-            } else {
-                let keys = (0..blocks)
-                    .map(|b| {
-                        self.rope(
-                            &norms.slice_axis(0, b as i64, b as i64 + 1)?,
-                            base - tail + b * ratio,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                MxArray::concatenate_many(keys.iter().collect(), Some(0))?
-            };
+                .reshape(&[blocks as i64, id])?;
             let keys = cache.append_index_keys(rotated)?;
             self.submit_state(&[keys], "qwen4::window::index_keys")?;
         }
@@ -253,7 +212,16 @@ impl Decoder {
             // Rows whose complete blocks fit the budget select all of them
             // (the rest are -1), so the kernel is causal for those rows.
             let (selected, query_ends) = self.qsa_select(i, cache, &projections.iq, base, t)?;
-            math::qsa_attention(&q, &keys, &values, &selected, &query_ends, scale, ratio)?
+            math::qsa_attention(
+                &q,
+                &keys,
+                &values,
+                &selected,
+                &query_ends,
+                scale,
+                ratio,
+                math::QsaKernel::ByCapability,
+            )?
         } else {
             crate::array::scaled_dot_product_attention_causal(&q, &keys, &values, scale)?
         };

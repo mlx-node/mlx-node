@@ -1,7 +1,8 @@
 //! Admit hot weights against live system headroom. Preserve room for other
 //! applications, recurrent state, page pools and transient work.
-use crate::models::qwen4_exp::runtime_flags;
 use napi::{Error, Result};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 pub(super) const FREE_CACHE_BYTES: u64 = 512 << 20;
 pub(super) const WORKING_BYTES: u64 = 4 << 30;
@@ -10,85 +11,326 @@ pub(super) const WORKING_BYTES: u64 = 4 << 30;
 pub(super) struct Plan {
     pub budget: u64,
     pub hot_bytes: u64,
-    pub resident: bool,
-    pub policy: String,
     pub available_bytes: Option<u64>,
     pub physical_bytes: Option<u64>,
-    pub resident_bank_bytes: u64,
-    pub resident_expert_layers: usize,
+    /// Shared with the model handle's clone: banks installed on the model
+    /// thread after load (the MTP expert banks) publish their bytes here so
+    /// `residencyInfo` reports what is actually pinned.
+    pub resident_bank_bytes: Arc<AtomicU64>,
     pub partial_expert_slots: usize,
+    /// Routed expert tensors served from the mapped pack (0 = checkpoint reads).
+    pub mapped_pack_files: usize,
+    /// Every routed expert is addressed in place through the mapped pack:
+    /// no slot banks, no mid-turn staging, no wired-limit context.
+    pub mapped: bool,
+    /// Bytes of pack sections backing live arrays; MLX counts them in
+    /// `active_memory`, so budgets subtract them.
+    pub mapped_bytes: u64,
+    /// Bytes of mapped banks the host could hold beside everything that
+    /// stays anonymous when the residency was chosen (`mapped_gate`).
+    pub mapped_bank_budget: u64,
+    /// `HostMemory::non_reclaimable` when the residency was chosen.
+    pub live_non_reclaimable: u64,
+}
+
+/// LRU rows (token, PLE and streamed auxiliary MTP/vision rows), paired banks
+/// and import staging under the mapped budget. Auxiliary inventory holds no
+/// anonymous bank of its own on this path; a resident draft bank, when one
+/// exists, must be added to `mapped_desired` or a mapped MTP turn outgrows the
+/// gate by that bank.
+const MAPPED_LRU_BYTES: u64 = 2 << 30;
+/// Room the mapped decision keeps between its need and physical RAM for
+/// what other processes allocate during a pass. Measured on the 128 GiB
+/// desktop: mapped 6k turns at 39-41 GiB live kept 7.5-7.6 GiB of free plus
+/// file cache where this model predicts 5.85-6.15 (the KV pool and LRU
+/// room are counted whole, the rounding adds up to 1 GiB), so 4 GiB here
+/// leaves about 5.5 GiB real at the threshold; a wrong call costs one
+/// tripwire window (about two minutes of re-reads, then the request goes on
+/// over slots), a refused call costs the slot path for the life of the
+/// process (0.4x decode, 0.3x prefill).
+pub(super) const MAPPED_MARGIN: u64 = 4 << 30;
+/// Free plus file cache a mapped turn must leave before it stops growing
+/// anonymous memory. The wired pack sits in neither, so the slot path's
+/// reserve (an eighth of RAM) cannot hold during a mapped turn: at 88 GiB
+/// available a 6k turn wired 89.5 GiB and left 8.8 GiB, where llama.cpp runs
+/// the same model. The load gate and the tripwire own the posture; this
+/// floor only refuses at the kernel's critical level.
+pub(super) const MAPPED_TURN_FLOOR: u64 = 2 << 30;
+
+/// One `host_statistics64` read, in bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct HostMemory {
+    pub physical: u64,
+    pub free: u64,
+    /// Pageable file-backed pages: clean cache the kernel drops on demand
+    /// (a resident mapped pack is in here between turns, wired pages are
+    /// not).
+    pub file: u64,
+    /// Pageable anonymous pages of every process, active or not.
+    pub anonymous: u64,
+    pub purgeable: u64,
+    pub wired: u64,
+    /// Physical pages the compressor pool occupies.
+    pub compressor: u64,
+    /// Uncompressed size of the pages in the compressor pool
+    /// (`total_uncompressed_pages_in_compressor`): what they take back when
+    /// touched again (2.3-2.7x the pool for idle apps, 1x for incompressible
+    /// data).
+    pub uncompressed: u64,
+    /// Pages swapped out, uncompressed (`swapped_count`: 9.0 GiB beside
+    /// 4.9 GB of swap file measured).
+    pub swapped: u64,
+    /// Page faults since boot. `host_statistics64` answers only a few
+    /// fresh reads per second per host and hands every other caller its
+    /// previous answer; a sample equal to the last one in every field is
+    /// that copy, not a quiet host (faults never stand still for 250 ms).
+    pub faults: u64,
+}
+
+impl HostMemory {
+    /// Free plus clean file cache: what the kernel hands out without
+    /// touching another process's data.
+    pub fn available(&self) -> u64 {
+        self.free.saturating_add(self.file)
+    }
+
+    /// Memory a turn cannot take from the host: wired, the compressor pool
+    /// and other processes' anonymous pages (purgeable ones excepted). The
+    /// kernel evicts clean file pages before it compresses those, a mapped
+    /// pack between two bank bindings included: beside 20-40 GiB of them a
+    /// 6k turn re-read 1.06-2.3 TB and decoded at 0.06-0.4 tokens/s.
+    pub fn non_reclaimable(&self) -> u64 {
+        self.wired
+            .saturating_add(self.compressor)
+            .saturating_add(self.anonymous.saturating_sub(self.purgeable))
+    }
+}
+
+/// The residency decision as a byte budget for mapped banks: every routed
+/// bank maps or none does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct MappedGate {
+    pub bank_budget: u64,
+    pub non_reclaimable: u64,
+    pub anonymous_need: u64,
+}
+
+/// Mapped banks fit when physical RAM minus the margin, the host's live
+/// non-reclaimable memory and what this process keeps anonymous beside the
+/// pack (dense banks, bounded auxiliary inventory, LRU room, the KV pool)
+/// covers them.
+pub(super) fn mapped_gate(host: &HostMemory, anonymous_need: u64, margin: u64) -> MappedGate {
+    let non_reclaimable = host.non_reclaimable();
+    MappedGate {
+        bank_budget: host
+            .physical
+            .saturating_sub(margin)
+            .saturating_sub(non_reclaimable)
+            .saturating_sub(anonymous_need),
+        non_reclaimable,
+        anonymous_need,
+    }
 }
 
 pub(super) fn plan(hot_bytes: u64) -> Result<Plan> {
-    let policy = match std::env::var_os("MLX_QWEN4_RESIDENCY") {
-        None => "auto".into(),
-        Some(value) => value
-            .to_str()
-            .map(str::to_owned)
-            .filter(|s| ["auto", "stream", "full"].contains(&s.as_str()))
-            .ok_or_else(|| {
-                Error::from_reason("MLX_QWEN4_RESIDENCY must be auto, stream or full")
-            })?,
-    };
-    let explicit = std::env::var_os("MLX_QWEN4_WEIGHT_CACHE_GIB")
-        .map(|value| {
-            value
-                .to_str()
-                .and_then(|s| s.parse::<u64>().ok())
-                .filter(|n| *n >= 2)
-                .and_then(|g| g.checked_mul(1 << 30))
-                .ok_or_else(|| {
-                    Error::from_reason("MLX_QWEN4_WEIGHT_CACHE_GIB must be an integer of at least 2 that fits in bytes; live device admission still applies")
-                })
-        })
-        .transpose()?;
     let desired = hot_bytes
         .checked_add((2 << 30) - 1)
         .map(|n| (n >> 30) << 30)
         .ok_or_else(|| Error::from_reason("Qwen4 hot-weight size overflow"))?;
-    // Read the live machine at bootstrap. The streaming setting limits desired
-    // residency; it must not force an 8 GiB allocation on a busy desktop.
+    // Read the live machine at bootstrap; the budget must not force an
+    // allocation on a busy desktop.
     let snapshot = if cfg!(target_os = "macos") {
         Some((available_memory()?, physical_memory()?))
     } else {
         None
     };
-    let budget = if let Some(bytes) = explicit {
-        bytes
-    } else if let Some((available, physical)) = snapshot {
-        let desired = if policy == "stream" {
-            desired.min(super::weights::CACHE_BYTES)
-        } else {
-            desired
-        };
-        automatic_budget(desired, available, physical)
-    } else {
-        super::weights::CACHE_BYTES
+    let budget = match snapshot {
+        Some((available, physical)) => automatic_budget(desired, available, physical),
+        None => super::weights::CACHE_BYTES,
     };
     if budget == 0 {
         return Err(Error::from_reason(
             "Qwen4 bootstrap has no whole GiB for weights after system/working reserves; release memory before loading",
         ));
     }
-    if policy == "full" && desired > budget {
-        return Err(Error::from_reason(format!(
-            "Qwen4 full hot-path residency needs {:.2} GiB plus system/working headroom; bootstrap admitted {:.2} GiB for weights",
-            desired as f64 / (1u64 << 30) as f64,
-            budget as f64 / (1u64 << 30) as f64
-        )));
-    }
     admit(budget)?;
     Ok(Plan {
         budget,
         hot_bytes,
-        resident: policy != "stream" && desired <= budget,
-        policy,
         available_bytes: snapshot.map(|s| s.0),
         physical_bytes: snapshot.map(|s| s.1),
-        resident_bank_bytes: 0,
-        resident_expert_layers: 0,
+        resident_bank_bytes: Arc::default(),
         partial_expert_slots: 0,
+        mapped_pack_files: 0,
+        mapped: false,
+        mapped_bytes: 0,
+        mapped_bank_budget: 0,
+        live_non_reclaimable: 0,
     })
+}
+
+/// Whole GiB the mapped budget asks for: dense banks (plus the Q8 draft
+/// banks while the MTP head is attached) and LRU room. Routed experts are
+/// not in it; neither is the rest of the auxiliary inventory, whose rows
+/// stream through the LRU room (measured: a mapped process with the MTP
+/// checkpoint attached and MTP off holds 7.8-8.3 GiB in all).
+pub(super) fn mapped_desired(dense_bytes: u64) -> u64 {
+    dense_bytes
+        .saturating_add(MAPPED_LRU_BYTES)
+        .saturating_add((1 << 30) - 1)
+        >> 30
+        << 30
+}
+
+/// Replace the slot budget by one that admits only what stays anonymous in
+/// mapped mode, when the live host holds the pack beside it. The routed
+/// experts are clean page cache the OS may evict between turns; during a
+/// pass the driver wires every bank, so the whole pack must fit at once.
+/// `pool_bytes` is the paged KV pool as configured, allocated before this
+/// decision.
+pub(super) fn mapped_plan(
+    plan: &mut Plan,
+    dense_bytes: u64,
+    pool_bytes: u64,
+    pack_bytes: u64,
+) -> Result<()> {
+    let desired = mapped_desired(dense_bytes);
+    let anonymous_need = desired.saturating_add(pool_bytes);
+    // A bootstrap snapshot exists only on the live macOS host; fixtures and
+    // other platforms take the desired budget without a gate.
+    let gate = match plan.physical_bytes {
+        Some(_) => {
+            let host = host_memory()?;
+            plan.available_bytes = Some(host.available());
+            plan.physical_bytes = Some(host.physical);
+            mapped_gate(&host, anonymous_need, MAPPED_MARGIN)
+        }
+        None => MappedGate {
+            bank_budget: pack_bytes,
+            non_reclaimable: 0,
+            anonymous_need,
+        },
+    };
+    plan.mapped_bank_budget = gate.bank_budget;
+    plan.live_non_reclaimable = gate.non_reclaimable;
+    if gate.bank_budget < pack_bytes {
+        return Err(Error::from_reason(format!(
+            "mapped banks need {:.1} GiB, the host leaves {:.1} GiB beside {:.1} GiB live memory, {:.1} GiB anonymous need and a {:.0} GiB margin",
+            pack_bytes as f64 / (1u64 << 30) as f64,
+            gate.bank_budget as f64 / (1u64 << 30) as f64,
+            gate.non_reclaimable as f64 / (1u64 << 30) as f64,
+            anonymous_need as f64 / (1u64 << 30) as f64,
+            MAPPED_MARGIN as f64 / (1u64 << 30) as f64,
+        )));
+    }
+    plan.budget = desired;
+    plan.mapped = true;
+    Ok(())
+}
+
+/// The driver unwires a released bank 1.2-3.2 s after the turn that bound
+/// it. A fallback budget taken before that counts the pack against the
+/// slots for the life of the process (88 slots where ~27 GiB was there).
+const UNWIRE_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+const UNWIRE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+const UNWIRE_STEP: u64 = 256 << 20;
+/// Fresh samples without a fall, one second of polls, before the release
+/// counts as finished: the driver lets the banks go in steps, and one flat
+/// sample between two steps would make the budget of that plateau permanent.
+const UNWIRE_FLAT_SAMPLES: u32 = 4;
+
+/// Free plus file cache the host will have once everything live has been
+/// touched again: what is free now plus the purgeable pages, minus the
+/// inflation of the compressor pool (uncompressed minus occupied) and the
+/// pages swapped out. Right after a mapped turn unwires its pack the plain
+/// count lies: beside a 40 GiB touching hog it read 60-68 GiB while the hog
+/// and the apps sat compressed and swapped; the 47-48 GiB of slots the
+/// bootstrap rule sized from it had to share RAM with them when they came
+/// back, the kernel cycled the incompressible banks and the hog through
+/// the compressor at 7 GB/s, and the request decoded at 0.10 tokens/s. The
+/// compressor's physical pages are no debt: they are already outside free
+/// plus file cache.
+pub(super) fn available_after_debt(host: &HostMemory) -> u64 {
+    host.available()
+        .saturating_add(host.purgeable)
+        .saturating_sub(host.uncompressed.saturating_sub(host.compressor))
+        .saturating_sub(host.swapped)
+}
+
+/// The slot budget for a process that leaves mapped mode after a tripwire:
+/// the bootstrap rule over the live host's `available_after_debt`, partial
+/// residency only. Called with the banks already released; the budget has
+/// to cover what the store still holds. A host that cannot be read leaves
+/// the held bytes as the budget, so the store is never left between the two
+/// paths.
+pub(super) fn slot_fallback_plan_with(
+    plan: &mut Plan,
+    held_bytes: u64,
+    host: &mut dyn FnMut() -> Result<HostMemory>,
+    sleep: &mut dyn FnMut(std::time::Duration),
+) {
+    let desired = plan.hot_bytes.saturating_add((2 << 30) - 1) >> 30 << 30;
+    let budget = match plan.physical_bytes {
+        Some(_) => match settled_host(host, sleep) {
+            Ok(host) => {
+                let available = available_after_debt(&host);
+                plan.available_bytes = Some(available);
+                automatic_budget(desired, available, host.physical)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "qwen4 residency: host memory unreadable after leaving mapped mode ({error}); slots sized from the held bytes"
+                );
+                0
+            }
+        },
+        None => desired.min(super::weights::CACHE_BYTES),
+    };
+    plan.budget = budget.max(
+        held_bytes
+            .saturating_add(super::weights::MAX_READ_BYTES * 3)
+            .saturating_add((1 << 30) - 1)
+            >> 30
+            << 30,
+    );
+    plan.mapped = false;
+    plan.mapped_bytes = 0;
+    plan.mapped_bank_budget = 0;
+    plan.partial_expert_slots = 0;
+}
+
+/// Sample the host until wired memory has fallen and then held for
+/// `UNWIRE_FLAT_SAMPLES` fresh samples, or `UNWIRE_SETTLE` has passed; the
+/// last fresh sample is the one to size from. A sample equal to the previous
+/// one is the kernel's cached answer (`HostMemory::faults`): it neither
+/// counts as flat nor ends the loop.
+fn settled_host(
+    host: &mut dyn FnMut() -> Result<HostMemory>,
+    sleep: &mut dyn FnMut(std::time::Duration),
+) -> Result<HostMemory> {
+    let mut last = host()?;
+    let mut fell = false;
+    let mut flat = 0;
+    let mut waited = std::time::Duration::ZERO;
+    while waited < UNWIRE_SETTLE {
+        sleep(UNWIRE_POLL);
+        waited += UNWIRE_POLL;
+        let next = host()?;
+        if next == last {
+            continue;
+        }
+        if last.wired.saturating_sub(next.wired) > UNWIRE_STEP {
+            fell = true;
+            flat = 0;
+        } else if fell {
+            flat += 1;
+        }
+        last = next;
+        if flat >= UNWIRE_FLAT_SAMPLES {
+            break;
+        }
+    }
+    Ok(last)
 }
 
 fn automatic_budget(desired: u64, available: u64, physical: u64) -> u64 {
@@ -103,9 +345,9 @@ fn automatic_budget(desired: u64, available: u64, physical: u64) -> u64 {
 }
 
 /// Reconcile the bootstrap ceiling after tokenizer and private page pools have
-/// been created, or after releasing an abandoned full-residency load. This is
-/// called with no owned weight arrays, so live headroom needs no inferred credit
-/// from MLX's process-global allocation counters.
+/// been created, or after releasing an abandoned bank load. This is called
+/// with no owned weight arrays, so live headroom needs no inferred credit from
+/// MLX's process-global allocation counters.
 pub(super) fn refresh_plan(plan: &mut Plan) -> Result<()> {
     if !cfg!(target_os = "macos") {
         return Ok(());
@@ -117,14 +359,12 @@ pub(super) fn refresh_plan(plan: &mut Plan) -> Result<()> {
 
 fn refresh_from_snapshot(plan: &mut Plan, available: u64, physical: u64) -> Result<()> {
     let budget = automatic_budget(plan.budget, available, physical);
-    let desired = plan.hot_bytes.saturating_add((2 << 30) - 1) >> 30 << 30;
-    if budget == 0 || (plan.policy == "full" && desired > budget) {
+    if budget == 0 {
         return Err(Error::from_reason(
             "Qwen4 load has insufficient headroom for weights and first-request working memory",
         ));
     }
     plan.budget = budget;
-    plan.resident = plan.policy != "stream" && desired <= budget;
     plan.available_bytes = Some(available);
     plan.physical_bytes = Some(physical);
     Ok(())
@@ -171,20 +411,20 @@ fn workspace_cache_bytes(physical: Option<u64>) -> u64 {
 }
 
 pub(super) fn maintain_freelist(physical: Option<u64>) {
-    let limit = if !runtime_flags::is_zero(c"MLX_QWEN4_REUSE_WORKSPACE") {
-        workspace_cache_bytes(physical)
-    } else {
-        FREE_CACHE_BYTES
-    };
-    if runtime_flags::is_one(c"MLX_QWEN4_FLUSH_EVERY_LAYER")
-        || crate::array::memory::get_cache_memory() > limit as f64
-    {
+    let limit = workspace_cache_bytes(physical);
+    if crate::array::memory::get_cache_memory() > limit as f64 {
         crate::array::memory::clear_cache();
     }
 }
 
-pub(super) fn check_growth_headroom() -> Result<()> {
-    if available_memory()? < system_reserve(physical_memory()?) {
+pub(super) fn check_growth_headroom(mapped: bool) -> Result<()> {
+    let host = host_memory()?;
+    let floor = if mapped {
+        MAPPED_TURN_FLOOR
+    } else {
+        system_reserve(host.physical)
+    };
+    if host.available() < floor {
         return Err(Error::from_reason(
             "Qwen4 stopped weight growth to preserve system headroom",
         ));
@@ -227,60 +467,9 @@ fn fits_with_headroom(bytes: u64, available: u64, reserve: u64) -> bool {
         .is_some_and(|need| need <= available)
 }
 
-/// Read `kern.memorystatus_vm_pressure_level`: levels below 2 are normal.
-#[cfg(target_os = "macos")]
-fn read_pressure_level() -> Result<i32> {
-    let mut pressure = 0i32;
-    let mut size = std::mem::size_of_val(&pressure);
-    if unsafe {
-        libc::sysctlbyname(
-            c"kern.memorystatus_vm_pressure_level".as_ptr(),
-            (&mut pressure as *mut i32).cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return Err(Error::from_reason(
-            "Cannot read macOS memory pressure for Qwen4 bootstrap",
-        ));
-    }
-    Ok(pressure)
-}
-
-/// Wait out a transient pressure spike before failing a load. The ignore
-/// opt-out is checked before the first read so it bypasses the gate entirely,
-/// including a sysctl failure. Injection points keep the timing testable.
-#[cfg(any(target_os = "macos", test))]
-fn wait_for_pressure(
-    mut read: impl FnMut() -> Result<i32>,
-    ignore_flag: impl Fn() -> bool,
-    mut sleep: impl FnMut(std::time::Duration),
-) -> Result<()> {
-    if ignore_flag() {
-        return Ok(());
-    }
-    let mut retries = 0;
-    loop {
-        match read() {
-            Ok(level) if level < 2 => return Ok(()),
-            _ if retries < 12 => {
-                retries += 1;
-                sleep(std::time::Duration::from_millis(250));
-            }
-            _ => {
-                return Err(Error::from_reason(
-                    "Qwen4 bootstrap requires normal, readable macOS memory pressure",
-                ));
-            }
-        }
-    }
-}
-
 /// Re-check the SSD read safety limit after freeing the allocator freelist.
-/// A freelist spike is transient; real pressure still refuses after the same
-/// bounded re-poll the bootstrap pressure gate uses.
+/// A freelist spike is transient; real pressure still refuses after a
+/// bounded re-poll.
 pub(super) fn check_active_memory_budget(
     cache_limit: u64,
     mut active: impl FnMut() -> f64,
@@ -302,8 +491,12 @@ pub(super) fn check_active_memory_budget(
     ))
 }
 
-#[cfg(target_os = "macos")]
 fn available_memory() -> Result<u64> {
+    Ok(host_memory()?.available())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn host_memory() -> Result<HostMemory> {
     unsafe extern "C" {
         fn mach_host_self() -> libc::mach_port_t;
         static mach_task_self_: libc::mach_port_t;
@@ -312,11 +505,6 @@ fn available_memory() -> Result<u64> {
             name: libc::mach_port_t,
         ) -> libc::kern_return_t;
     }
-    wait_for_pressure(
-        read_pressure_level,
-        || runtime_flags::is_one(c"MLX_QWEN4_IGNORE_MEMORY_PRESSURE"),
-        std::thread::sleep,
-    )?;
     let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
     let mut count = libc::HOST_VM_INFO64_COUNT;
     let host = unsafe { mach_host_self() };
@@ -331,23 +519,55 @@ fn available_memory() -> Result<u64> {
     unsafe {
         mach_port_deallocate(mach_task_self_, host);
     }
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if ok != 0 || page_size <= 0 {
+    let page = crate::array::page_size() as u64;
+    if ok != 0 {
         return Err(Error::from_reason(
             "Cannot establish Qwen4 larger-cache memory headroom",
         ));
     }
     let stats = unsafe { stats.assume_init() };
-    // Exclude anonymous inactive memory and the compressor: growing the model
-    // cache must not assume that the OS can compress/swap the user's apps.
-    Ok((u64::from(stats.free_count) + u64::from(stats.external_page_count)) * page_size as u64)
+    Ok(HostMemory {
+        physical: physical_memory()?,
+        free: u64::from(stats.free_count) * page,
+        file: u64::from(stats.external_page_count) * page,
+        anonymous: u64::from(stats.internal_page_count) * page,
+        purgeable: u64::from(stats.purgeable_count) * page,
+        wired: u64::from(stats.wire_count) * page,
+        compressor: u64::from(stats.compressor_page_count) * page,
+        uncompressed: stats.total_uncompressed_pages_in_compressor * page,
+        swapped: stats.swapped_count * page,
+        faults: stats.faults,
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
-fn available_memory() -> Result<u64> {
+pub(super) fn host_memory() -> Result<HostMemory> {
     Err(Error::from_reason(
         "Qwen4 larger-cache admission is currently available only on macOS",
     ))
+}
+
+/// Bytes this process has read from disk since it started
+/// (`proc_pid_rusage`, the counter the mapped pack's page-ins land in).
+#[cfg(target_os = "macos")]
+pub(super) fn process_disk_reads() -> u64 {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as libc::c_int,
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast(),
+        )
+    };
+    if rc != 0 {
+        return 0;
+    }
+    unsafe { info.assume_init() }.ri_diskio_bytesread
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(super) fn process_disk_reads() -> u64 {
+    0
 }
 
 #[cfg(test)]
@@ -393,86 +613,488 @@ mod tests {
         assert!(!fits_with_headroom(u64::MAX, u64::MAX, 16 << 30));
     }
 
+    fn gib(n: f64) -> u64 {
+        (n * (1u64 << 30) as f64) as u64
+    }
+
+    /// A fixture a `host_statistics64` read could have produced: free,
+    /// file-backed, anonymous, wired and compressor pages partition physical
+    /// RAM (speculative pages sit in both free and file: 0.5-1.4 GiB
+    /// measured), purgeable pages are anonymous, and the compressor stores
+    /// at least what it occupies.
+    fn coherent(host: HostMemory) -> HostMemory {
+        let sum = host.free + host.file + host.anonymous + host.wired + host.compressor;
+        assert!(
+            sum <= host.physical + (1 << 30),
+            "incoherent fixture: {:.1} GiB of pages on a {:.1} GiB host",
+            sum as f64 / (1u64 << 30) as f64,
+            host.physical as f64 / (1u64 << 30) as f64
+        );
+        assert!(
+            host.purgeable <= host.anonymous,
+            "purgeable pages are anonymous"
+        );
+        assert!(
+            host.uncompressed >= host.compressor,
+            "the pool stores what it occupies"
+        );
+        host
+    }
+
+    /// A 128 GiB desktop (vm_stat): the same free memory with
+    /// a 40 GiB anonymous hog beside it must send the pack to slots, and
+    /// free memory alone must not admit it.
     #[test]
-    fn load_reconciliation_preserves_working_room_and_explicit_full_policy() {
+    fn mapped_gate_reads_live_memory_not_free() {
+        let pack = gib(73.15);
+        let need = gib(13.0);
+        let quiet = coherent(HostMemory {
+            physical: 128 << 30,
+            free: gib(77.3),
+            file: gib(10.0),
+            anonymous: gib(20.1),
+            purgeable: gib(0.7),
+            wired: gib(13.2),
+            compressor: gib(7.5),
+            uncompressed: gib(18.0),
+            swapped: gib(3.0),
+            faults: 0,
+        });
+        let gate = mapped_gate(&quiet, need, 0);
+        assert_eq!(
+            gate.non_reclaimable,
+            gib(13.2) + gib(7.5) + gib(20.1) - gib(0.7)
+        );
+        assert_eq!(
+            gate.bank_budget,
+            (128u64 << 30) - gate.non_reclaimable - need
+        );
+        assert!(gate.bank_budget >= pack, "the quiet desktop holds the pack");
+        assert!(
+            mapped_gate(&quiet, need, MAPPED_MARGIN).bank_budget < pack,
+            "with the margin this desktop is 2 GiB short"
+        );
+        // A touching 40 GiB hog takes its pages out of free: anonymous grows
+        // by the hog.
+        let hog = coherent(HostMemory {
+            free: gib(37.3),
+            anonymous: gib(20.1) + gib(40.0),
+            ..quiet
+        });
+        assert!(
+            mapped_gate(&hog, need, 0).bank_budget < pack,
+            "live anonymous memory decides, not free"
+        );
+        assert!(mapped_gate(&hog, need, 0).bank_budget < gate.bank_budget - gib(39.0));
+        // A 20 GiB hog beside it is refused too.
+        let hog20 = coherent(HostMemory {
+            free: gib(57.3),
+            anonymous: gib(20.1) + gib(20.0),
+            ..quiet
+        });
+        assert!(mapped_gate(&hog20, need, 0).bank_budget < pack);
+        // Purgeable pages are reclaimable; wired and compressed are not.
+        let purgeable = coherent(HostMemory {
+            purgeable: gib(30.0),
+            ..hog20
+        });
+        assert!(mapped_gate(&purgeable, need, 0).bank_budget >= pack);
+        let wired = coherent(HostMemory {
+            free: gib(57.3),
+            wired: gib(13.2) + gib(20.0),
+            ..quiet
+        });
+        assert!(mapped_gate(&wired, need, 0).bank_budget < pack);
+        assert_eq!(mapped_gate(&quiet, u64::MAX, 0).bank_budget, 0);
+    }
+
+    fn plan_without_snapshot() -> Plan {
+        Plan {
+            budget: 73 << 30,
+            hot_bytes: 83_631_869_440,
+            available_bytes: None,
+            physical_bytes: None,
+            resident_bank_bytes: Arc::default(),
+            partial_expert_slots: 442,
+            mapped_pack_files: 144,
+            mapped: false,
+            mapped_bytes: 0,
+            mapped_bank_budget: 0,
+            live_non_reclaimable: 0,
+        }
+    }
+
+    /// MUTATION: `mapped_desired` adds an 8 GiB auxiliary term
+    /// again; the desktop below is refused at 40 GiB live.
+    #[test]
+    fn mapped_budget_holds_dense_banks_and_lru_room_and_maps_this_desktop() {
+        assert_eq!(mapped_desired(gib(3.8)), 6 << 30);
+        assert_eq!(mapped_desired(gib(1.9)), 4 << 30);
+        assert_eq!(mapped_desired(0), 2 << 30);
+        let mut plan = plan_without_snapshot();
+        // No live snapshot (fixtures, other platforms): the desired budget is
+        // taken as is and the bank budget is the pack.
+        mapped_plan(&mut plan, gib(3.8), 1 << 30, gib(73.15)).unwrap();
+        assert!(plan.mapped);
+        assert_eq!(plan.budget, 6 << 30);
+        assert_eq!(plan.mapped_bank_budget, gib(73.15));
+        // Qwen3.8 Flash Next on the 128 GiB desktop: 73.15 GiB of pack, 4.9
+        // GiB of dense banks (78.03 GiB hot set minus the pack), a 1 GiB KV
+        // pool. The anonymous need is 7 + 1 = 8 GiB, so the pack maps while
+        // live non-reclaimable memory stays at or below 128 - 4 - 73.15 - 8 =
+        // 42.85 GiB (the desktop idles at 34-42 GiB).
+        let need = mapped_desired(gib(4.9)) + (1 << 30);
+        assert_eq!(need, 8 << 30);
+        let desktop = |live: f64| {
+            coherent(HostMemory {
+                physical: 128 << 30,
+                free: gib(60.0),
+                file: gib(128.0 - 60.0) - gib(live),
+                anonymous: gib(live) - gib(20.0),
+                purgeable: 0,
+                wired: gib(13.0),
+                compressor: gib(7.0),
+                uncompressed: gib(17.0),
+                swapped: gib(5.0),
+                faults: 0,
+            })
+        };
+        assert!(mapped_gate(&desktop(42.8), need, MAPPED_MARGIN).bank_budget >= gib(73.15));
+        assert!(mapped_gate(&desktop(42.0), need, MAPPED_MARGIN).bank_budget >= gib(73.15));
+        assert!(mapped_gate(&desktop(42.9), need, MAPPED_MARGIN).bank_budget < gib(73.15));
+    }
+
+    #[test]
+    fn slot_fallback_plan_covers_what_the_store_holds() {
+        let mut plan = plan_without_snapshot();
+        plan.mapped = true;
+        plan.mapped_bytes = gib(73.15);
+        plan.mapped_bank_budget = gib(74.0);
+        let mut unread =
+            || -> Result<HostMemory> { panic!("a plan without a snapshot reads no host") };
+        slot_fallback_plan_with(&mut plan, gib(11.4), &mut unread, &mut |_| {});
+        assert!(!plan.mapped);
+        assert_eq!(plan.mapped_bytes, 0);
+        assert_eq!(plan.mapped_bank_budget, 0);
+        assert_eq!(
+            plan.budget,
+            super::super::weights::CACHE_BYTES.max(12 << 30)
+        );
+        plan.budget = 0;
+        slot_fallback_plan_with(&mut plan, 0, &mut unread, &mut |_| {});
+        assert_eq!(plan.budget, super::super::weights::CACHE_BYTES);
+    }
+
+    /// Request 1 started 13 ms after request 0 ended,
+    /// while 23 GiB of the pack were still wired: the budget read 20 GiB
+    /// where the unwired host gave 27-29. The plan sizes from the sample
+    /// after wired has fallen and settled, not from the first one.
+    #[test]
+    fn slot_fallback_sizes_from_the_host_after_the_banks_unwire() {
+        let still_wired = coherent(HostMemory {
+            physical: 128 << 30,
+            free: gib(0.13),
+            file: gib(43.69),
+            anonymous: gib(30.0),
+            purgeable: 0,
+            wired: gib(23.31),
+            compressor: gib(10.0),
+            uncompressed: gib(10.0),
+            swapped: 0,
+            faults: 1,
+        });
+        let unwiring = HostMemory {
+            free: gib(0.2),
+            file: gib(47.2),
+            wired: gib(19.0),
+            faults: 2,
+            ..still_wired
+        };
+        let settled = HostMemory {
+            free: gib(0.3),
+            file: gib(50.6),
+            wired: gib(16.7),
+            faults: 3,
+            ..still_wired
+        };
+        let flat = |n: u64| HostMemory {
+            faults: settled.faults + n,
+            ..settled
+        };
+        let mut samples = std::collections::VecDeque::from([
+            still_wired,
+            unwiring,
+            settled,
+            flat(1),
+            flat(2),
+            flat(3),
+            flat(4),
+        ]);
+        let mut slept = Vec::new();
+        let mut plan = plan_without_snapshot();
+        plan.physical_bytes = Some(128 << 30);
+        plan.hot_bytes = gib(83.0);
+        plan.mapped = true;
+        slot_fallback_plan_with(
+            &mut plan,
+            gib(5.0),
+            &mut || Ok(samples.pop_front().expect("more samples than polls")),
+            &mut |d| slept.push(d),
+        );
+        assert_eq!(plan.available_bytes, Some(settled.available()));
+        assert_eq!(
+            plan.budget,
+            automatic_budget(gib(84.0), settled.available(), 128 << 30)
+        );
+        assert_eq!(plan.budget, gib(30.0));
+        assert!(
+            automatic_budget(gib(84.0), still_wired.available(), 128 << 30) < plan.budget,
+            "the wired sample would have undersized the slots"
+        );
+        assert_eq!(
+            slept,
+            vec![UNWIRE_POLL; 2 + UNWIRE_FLAT_SAMPLES as usize],
+            "one second of flat fresh samples past the last fall"
+        );
+        assert_eq!(samples.len(), 0);
+        assert!(!plan.mapped);
+
+        // A host that never falls is polled for the settle window, no longer.
+        let mut polls = 0usize;
+        let mut slept = std::time::Duration::ZERO;
+        let mut plan = plan_without_snapshot();
+        plan.physical_bytes = Some(128 << 30);
+        plan.hot_bytes = gib(83.0);
+        slot_fallback_plan_with(
+            &mut plan,
+            0,
+            &mut || {
+                polls += 1;
+                Ok(settled)
+            },
+            &mut |d| slept += d,
+        );
+        assert_eq!(slept, UNWIRE_SETTLE);
+        assert_eq!(
+            polls,
+            1 + (UNWIRE_SETTLE.as_millis() / UNWIRE_POLL.as_millis()) as usize
+        );
+        assert_eq!(plan.budget, gib(30.0));
+
+        // An unreadable host sizes from the held bytes and still leaves mapped mode.
+        let mut plan = plan_without_snapshot();
+        plan.physical_bytes = Some(128 << 30);
+        plan.mapped = true;
+        slot_fallback_plan_with(
+            &mut plan,
+            gib(11.4),
+            &mut || Err(Error::from_reason("no host statistics")),
+            &mut |_| panic!("no poll without a first sample"),
+        );
+        assert!(!plan.mapped);
+        assert_eq!(plan.budget, 12 << 30);
+    }
+
+    /// The host a mapped turn left when it tripped ten tokens into its
+    /// decode beside a 40 GiB touching hog:
+    /// the unwired pack showed 68 GiB of free plus file cache and the
+    /// bootstrap rule handed out 48 GiB of slots, while 15 GiB of pages
+    /// stood in swap and the pool held the hog's incompressible pages; when
+    /// they came back the kernel cycled banks and hog through the compressor
+    /// at 7 GB/s and the request decoded at 0.11 tokens/s (its successor,
+    /// banks full, 12 tokens/s). Sized from the free plus file cache the host
+    /// keeps once that debt is paid, the same rule gives 33 GiB. The pool's
+    /// physical pages are no debt: a cap on them is inert on a coherent
+    /// snapshot (free plus file plus purgeable minus a margin, above the
+    /// rule's own 20 GiB reserve).
+    ///
+    /// MUTATION: `slot_fallback_plan_with` sizes from the plain
+    /// `available()` again; the hogged host gets 48 GiB of slots.
+    #[test]
+    fn slot_fallback_budget_counts_the_compressed_and_swapped_debt() {
+        let hogged = coherent(HostMemory {
+            physical: 128 << 30,
+            free: gib(2.0),
+            file: gib(66.0),
+            anonymous: gib(40.0),
+            purgeable: 0,
+            wired: gib(14.0),
+            compressor: gib(6.0),
+            uncompressed: gib(7.0),
+            swapped: gib(15.0),
+            faults: 1,
+        });
+        let size = |host: HostMemory, held: u64| {
+            let mut plan = plan_without_snapshot();
+            plan.physical_bytes = Some(128 << 30);
+            plan.hot_bytes = gib(83.0);
+            plan.mapped = true;
+            slot_fallback_plan_with(&mut plan, held, &mut || Ok(host), &mut |_| {});
+            assert!(!plan.mapped);
+            assert_eq!(plan.available_bytes, Some(available_after_debt(&host)));
+            plan.budget
+        };
+        assert_eq!(
+            automatic_budget(gib(84.0), hogged.available(), 128 << 30),
+            gib(48.0)
+        );
+        assert_eq!(available_after_debt(&hogged), gib(52.0));
+        assert_eq!(size(hogged, gib(5.0)), gib(32.0));
+        // The whole hog swapped and the apps compressed 2.5:1: nothing comes
+        // back as free memory, the budget is what the store holds plus
+        // staging.
+        let swamped = coherent(HostMemory {
+            anonymous: gib(14.0),
+            compressor: gib(12.0),
+            uncompressed: gib(30.0),
+            swapped: gib(15.0) + gib(40.0),
+            file: gib(86.0),
+            ..hogged
+        });
+        assert_eq!(
+            available_after_debt(&swamped),
+            gib(88.0) - gib(18.0) - gib(55.0)
+        );
+        assert_eq!(
+            size(swamped, gib(5.0)),
+            (gib(5.0) + super::super::weights::MAX_READ_BYTES * 3 + ((1 << 30) - 1)) >> 30 << 30
+        );
+        // The same desktop, quiet (host_statistics64 read): 1.4
+        // GiB of pool inflation and 9.0 GiB of old swap cost the rule 5 GiB
+        // of slots against the plain count.
+        let quiet = coherent(HostMemory {
+            physical: 128 << 30,
+            free: gib(7.90),
+            file: gib(101.25),
+            anonymous: gib(12.40),
+            purgeable: gib(0.43),
+            wired: gib(5.84),
+            compressor: gib(1.08),
+            uncompressed: gib(2.53),
+            swapped: gib(9.04),
+            faults: 1,
+        });
+        assert_eq!(
+            automatic_budget(gib(84.0), quiet.available(), 128 << 30),
+            gib(84.0)
+        );
+        assert_eq!(size(quiet, gib(5.0)), gib(79.0));
+    }
+
+    fn release(wired: f64, file: f64, faults: u64) -> HostMemory {
+        coherent(HostMemory {
+            physical: 128 << 30,
+            free: 1 << 30,
+            file: gib(file),
+            anonymous: 30 << 30,
+            purgeable: 0,
+            wired: gib(wired),
+            compressor: 10 << 30,
+            uncompressed: 10 << 30,
+            swapped: 0,
+            faults,
+        })
+    }
+
+    /// The driver lets the banks go in steps. One flat sample between two
+    /// steps (50 -> 45 -> 45 -> 16 GiB wired) is not the end of the release:
+    /// the budget comes from the 16 GiB host, not the 45 GiB plateau.
+    #[test]
+    fn slot_fallback_waits_out_a_release_plateau() {
+        let plateau = release(45.0, 25.0, 3);
+        let done = release(16.0, 54.0, 8);
+        let mut samples = std::collections::VecDeque::from([
+            release(50.0, 20.0, 1),
+            release(45.0, 25.0, 2),
+            plateau,
+            release(16.0, 54.0, 4),
+            release(16.0, 54.0, 5),
+            release(16.0, 54.0, 6),
+            release(16.0, 54.0, 7),
+            done,
+        ]);
+        let mut polls = 0usize;
+        let mut plan = plan_without_snapshot();
+        plan.physical_bytes = Some(128 << 30);
+        plan.hot_bytes = gib(83.0);
+        plan.mapped = true;
+        slot_fallback_plan_with(
+            &mut plan,
+            0,
+            &mut || Ok(samples.pop_front().expect("more samples than polls")),
+            &mut |_| polls += 1,
+        );
+        assert_eq!(samples.len(), 0);
+        assert_eq!(polls, 7);
+        assert_eq!(plan.available_bytes, Some(done.available()));
+        assert_eq!(plan.budget, gib(35.0));
+        assert_eq!(
+            automatic_budget(gib(84.0), plateau.available(), 128 << 30),
+            gib(6.0),
+            "stopping at the plateau would have left 6 GiB of slots for good"
+        );
+    }
+
+    /// `host_statistics64` answers a few fresh reads per second and repeats
+    /// its last answer otherwise; a run of those copies right after the first
+    /// fall is skipped, not taken as a settled host.
+    #[test]
+    fn slot_fallback_skips_the_kernels_cached_samples() {
+        let first_fall = release(45.0, 25.0, 2);
+        let done = release(16.0, 54.0, 7);
+        let mut samples = std::collections::VecDeque::from([
+            release(50.0, 20.0, 1),
+            first_fall,
+            first_fall,
+            first_fall,
+            first_fall,
+            first_fall,
+            release(16.0, 54.0, 3),
+            release(16.0, 54.0, 4),
+            release(16.0, 54.0, 5),
+            release(16.0, 54.0, 6),
+            done,
+        ]);
+        let mut polls = 0usize;
+        let mut plan = plan_without_snapshot();
+        plan.physical_bytes = Some(128 << 30);
+        plan.hot_bytes = gib(83.0);
+        plan.mapped = true;
+        slot_fallback_plan_with(
+            &mut plan,
+            0,
+            &mut || Ok(samples.pop_front().expect("more samples than polls")),
+            &mut |_| polls += 1,
+        );
+        assert_eq!(samples.len(), 0);
+        assert_eq!(polls, 10);
+        assert_eq!(plan.available_bytes, Some(done.available()));
+        assert_eq!(plan.budget, gib(35.0));
+    }
+
+    #[test]
+    fn load_reconciliation_preserves_working_room() {
         let original = Plan {
             budget: 79 << 30,
             hot_bytes: 83_631_869_440,
-            resident: true,
-            policy: "auto".into(),
             available_bytes: Some(99 << 30),
             physical_bytes: Some(128 << 30),
-            resident_bank_bytes: 0,
-            resident_expert_layers: 0,
+            resident_bank_bytes: Arc::default(),
             partial_expert_slots: 0,
+            mapped_pack_files: 0,
+            mapped: false,
+            mapped_bytes: 0,
+            mapped_bank_budget: 0,
+            live_non_reclaimable: 0,
         };
         let mut plan = original.clone();
         refresh_from_snapshot(&mut plan, 94 << 30, 128 << 30).unwrap();
         assert_eq!(plan.budget, 74 << 30);
-        assert!(!plan.resident);
         assert!(plan.budget + WORKING_BYTES + system_reserve(128 << 30) <= 94 << 30);
         // A later free-memory increase cannot exceed the admitted ceiling.
         refresh_from_snapshot(&mut plan, 112 << 30, 128 << 30).unwrap();
         assert_eq!(plan.budget, 74 << 30);
-        let mut full = original.clone();
-        full.policy = "full".into();
-        assert!(refresh_from_snapshot(&mut full, 94 << 30, 128 << 30).is_err());
-        assert_eq!(full.budget, original.budget);
-        refresh_from_snapshot(&mut full, 112 << 30, 128 << 30).unwrap();
-        assert!(full.resident);
         assert!(refresh_from_snapshot(&mut plan, 19 << 30, 128 << 30).is_err());
-    }
-
-    #[test]
-    fn pressure_gate_waits_out_a_transient_spike() {
-        use std::sync::{Arc, Mutex};
-        let levels = Arc::new(Mutex::new(vec![2, 1].into_iter()));
-        let sleeps = Arc::new(Mutex::new(Vec::new()));
-        let read = {
-            let levels = Arc::clone(&levels);
-            move || {
-                levels
-                    .lock()
-                    .unwrap()
-                    .next()
-                    .ok_or_else(|| Error::from_reason("unexpected extra read"))
-            }
-        };
-        let sleep = {
-            let sleeps = Arc::clone(&sleeps);
-            move |d| sleeps.lock().unwrap().push(d)
-        };
-        super::wait_for_pressure(read, || false, sleep).unwrap();
-        assert_eq!(
-            *sleeps.lock().unwrap(),
-            vec![std::time::Duration::from_millis(250)]
-        );
-    }
-
-    #[test]
-    fn pressure_gate_gives_up_after_bounded_retries() {
-        let mut sleeps = 0;
-        let err = super::wait_for_pressure(|| Ok(3), || false, |_| sleeps += 1).unwrap_err();
-        assert_eq!(sleeps, 12);
-        assert!(
-            err.reason
-                .contains("requires normal, readable macOS memory pressure")
-        );
-    }
-
-    #[test]
-    fn pressure_gate_ignore_bypasses_unreadable_sysctl() {
-        let mut reads = 0;
-        super::wait_for_pressure(
-            || {
-                reads += 1;
-                Err(Error::from_reason("sysctl unavailable"))
-            },
-            || true,
-            |_| panic!("ignore must not wait"),
-        )
-        .unwrap();
-        assert_eq!(reads, 0);
     }
 
     #[test]
@@ -550,59 +1172,222 @@ pub(super) fn prefill_scratch(c: &super::config::Config, tokens: usize) -> u64 {
     per_token.saturating_mul(t).saturating_add(window.max(qsa))
 }
 
-pub(super) fn prefill_window(c: &super::config::Config, plan: &Plan) -> Result<usize> {
+/// Recurrent matrices, convolution windows, the compressed indexer history
+/// and PLE windows one sequence keeps as F32 arrays outside the page pool.
+pub(super) fn row_state_bytes(c: &super::config::Config) -> u64 {
+    let linear = (0..c.num_hidden_layers).filter(|&i| c.linear(i)).count();
+    let full = c.num_hidden_layers - linear;
+    (linear
+        * (c.linear_num_value_heads * c.linear_key_head_dim * c.linear_value_head_dim * 4
+            + (2 * c.linear_num_key_heads * c.linear_key_head_dim
+                + c.linear_num_value_heads * c.linear_value_head_dim)
+                * c.linear_conv_kernel_dim
+                * 4)
+        + full * c.indexer_head_dim * c.effective_context_limit() / c.indexer_compress_ratio * 4
+        + c.ple_layer_ids.len()
+            * c.hc_count
+            * c.hidden_size
+            * c.ple_conv_kernel_size
+            * c.ngram_size
+            * 4) as u64
+}
+
+/// F32 draft-layer K/V per token.
+pub(super) fn draft_kv_bytes_per_token(c: &super::config::Config) -> u64 {
+    (c.num_key_value_heads * c.head_dim * 8) as u64
+}
+
+/// Verify snapshots of up to four accepted frontiers plus the draft K/V of
+/// `tokens`: what an owner holds once every token is in its draft cache.
+pub(super) fn draft_state_bytes(c: &super::config::Config, tokens: u64) -> u64 {
+    4 * row_state_bytes(c) + tokens * draft_kv_bytes_per_token(c)
+}
+
+/// One BF16 target hidden row (`hc_count x hidden_size`) an MTP owner keeps
+/// until the next first draft pass writes it into the draft cache.
+pub(super) fn draft_hidden_row_bytes(c: &super::config::Config) -> u64 {
+    (c.hc_count * c.hidden_size * 2) as u64
+}
+
+/// What an MTP owner holds now: draft K/V for the rows in its cache, the
+/// hidden rows still waiting (trusted rows and the seed), and the verify
+/// snapshots while it is inside an MTP turn. A waiting row has no K/V yet.
+pub(super) fn draft_owner_bytes(
+    c: &super::config::Config,
+    cached_rows: u64,
+    hidden_rows: u64,
+    tracking: bool,
+) -> u64 {
+    let snapshots = if tracking { 4 * row_state_bytes(c) } else { 0 };
+    snapshots + cached_rows * draft_kv_bytes_per_token(c) + hidden_rows * draft_hidden_row_bytes(c)
+}
+
+/// What the working allowance leaves for scheduled rows and draft state once
+/// the page pool and one prefill window's scratch have their share.
+pub(super) fn scheduled_state_budget(pool_bytes: u64, prefill_scratch: u64) -> u64 {
+    WORKING_BYTES
+        .saturating_sub(pool_bytes)
+        .saturating_sub(prefill_scratch)
+}
+
+/// The prefill window the current plan's scratch allowance admits; computed
+/// again whenever the plan changes (a mapped process that moved to slots
+/// has a smaller allowance than the one its load admitted).
+pub(super) fn prefill_window(c: &super::config::Config, plan: &Plan) -> usize {
     let live = match (plan.available_bytes, plan.physical_bytes) {
         (Some(a), Some(p)) => a.saturating_sub(plan.budget + system_reserve(p) + (2 << 30)),
         _ => plan.budget / 16,
     };
-    let allowance = (plan.budget / 16).min(2 << 30).min(live);
+    // The mapped budget holds no experts, so it does not scale the scratch.
+    let allowance = if plan.mapped {
+        (2 << 30).min(live)
+    } else {
+        (plan.budget / 16).min(2 << 30).min(live)
+    };
     let mut window = super::MAX_PREFILL_CHUNK;
     while window > 1 && prefill_scratch(c, window) > allowance {
         window /= 2;
     }
-    if let Some(value) = std::env::var_os("MLX_QWEN4_PREFILL_CHUNK") {
-        let requested = value
-            .to_str()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|n| n.is_power_of_two() && *n <= super::MAX_PREFILL_CHUNK)
-            .ok_or_else(|| {
-                Error::from_reason("MLX_QWEN4_PREFILL_CHUNK must be a power of two from 1 to 1024")
-            })?;
-        if requested > window {
-            return Err(Error::from_reason(format!(
-                "Qwen4 prefill window {requested} exceeds bootstrap scratch allowance; admitted {window}"
-            )));
-        }
-        window = requested;
-    }
-    Ok(window)
+    window
 }
 
-/// Runtime tuning may shorten the bootstrap-admitted window, never grow it.
-/// Invalid values preserve admission. This does not allocate another page pool
-/// or alter the verified/MTP frontier width.
-pub(super) fn prefill_slice(admitted: usize, requested: Option<&str>) -> usize {
-    requested
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| n.is_power_of_two())
-        .map_or(admitted, |n| n.min(admitted))
+/// Flash Next geometry (48 layers, 12 full attention, K/V 2 x 256, 32,768
+/// context): one 32k MTP owner fits the working budget beside the 1 GiB page
+/// pool and the 1024-token prefill window, two do not, four AR rows do.
+/// MUTATION: stop subtracting `prefill_scratch` in `scheduled_state_budget`;
+/// two 32k MTP owners then fit and the `2 * mtp_32k > budget` assertion fails.
+/// MUTATION: drop the four verify snapshots from `draft_state_bytes`; the 16k
+/// pair then fits and the `2 * row + 2 * draft_16k > budget` assertion fails.
+/// The released Flash Next geometry (Qwen3.8 Flash Next).
+#[cfg(test)]
+fn flash_next_config() -> super::config::Config {
+    super::config::Config::parse(&serde_json::json!({
+        "model_type": "qwen4_exp_text",
+        "hidden_size": 2560,
+        "num_hidden_layers": 48,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "vocab_size": 248320,
+        "num_experts": 512,
+        "num_experts_per_tok": 10,
+        "moe_intermediate_size": 640,
+        "shared_expert_intermediate_size": 640,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 48,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "hc_count": 4,
+        "hc_lowrank": 320,
+        "rms_norm_eps": 1e-6,
+        "max_position_embeddings": 262144,
+        "full_attention_interval": 4,
+        "indexer_n_heads": 4,
+        "indexer_head_dim": 128,
+        "indexer_budget": 2048,
+        "indexer_compress_ratio": 4,
+        "ple_layer_ids": [2],
+        "ple_embed_dim": 2560,
+        "ple_conv_kernel_size": 4,
+        "ngram_size": 3,
+        "heads_per_ngram": 8,
+        "ngram_vocab_size_base": 20000000u64,
+        "split_ngram_parts": 128,
+        "eos_token_id": 248044
+    }))
+    .unwrap()
 }
 
 #[test]
-fn runtime_slices_cannot_exceed_bootstrap_admission() {
-    for admitted in [1, 2, 32, 64, 256, 512, 1024] {
-        for request in [
-            None,
-            Some("0"),
-            Some("7"),
-            Some("256"),
-            Some("1024"),
-            Some("2048"),
-            Some("invalid"),
-        ] {
-            let actual = prefill_slice(admitted, request);
-            assert!(actual > 0 && actual <= admitted && actual.is_power_of_two());
-        }
-        assert_eq!(prefill_slice(admitted, Some("256")), admitted.min(256));
-    }
+fn flash_next_scheduled_state_budget_holds_one_long_mtp_owner() {
+    let c = flash_next_config();
+    assert_eq!(c.effective_context_limit(), 32_768);
+    assert_eq!(row_state_bytes(&c), 169_967_616);
+    assert_eq!(draft_kv_bytes_per_token(&c), 4096);
+    let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
+        12,
+        2,
+        256,
+        32,
+        mlx_paged_attn::metal::MetalDtype::BFloat16,
+    )
+    .unwrap();
+    assert_eq!(bytes_per_block, 786_432);
+    let blocks = (1024u64 << 20) / bytes_per_block;
+    assert_eq!(blocks, 1365);
+    let budget = scheduled_state_budget(blocks * bytes_per_block, prefill_scratch(&c, 1024));
+    let row = row_state_bytes(&c);
+    let mtp_16k = row + draft_state_bytes(&c, 18_754 + 255);
+    let mtp_32k = row + draft_state_bytes(&c, 32_488 + 255);
+    assert!(
+        mtp_16k <= mtp_32k && mtp_32k <= budget,
+        "one 32k MTP owner ({mtp_32k} B) must fit the {budget} B working budget"
+    );
+    assert!(
+        2 * mtp_32k > budget,
+        "two 32k MTP owners ({} B) must wait for a row to be reclaimed from the {budget} B budget",
+        2 * mtp_32k
+    );
+    assert!(4 * row <= budget, "four AR rows must fit");
+    // Two 16k MTP owners queued in one drain pass: the page pool admits both,
+    // and the second owner sees two rows plus its own draft, which fits. Only
+    // the first owner's draft reservation, not materialized before its first
+    // prefill chunk, makes the second defer.
+    let draft_16k = draft_state_bytes(&c, 18_754 + 255);
+    let blocks_16k = (18_754u64 + 255).div_ceil(32);
+    assert_eq!(blocks_16k, 595);
+    assert!(2 * blocks_16k <= blocks);
+    assert!(2 * row + draft_16k <= budget);
+    assert!(
+        2 * row + 2 * draft_16k > budget,
+        "two 16k MTP owners ({} B) must not both pass admission against the {budget} B budget",
+        2 * row + 2 * draft_16k
+    );
+}
+
+/// Two Flash Next owners parked right after a 1024-row prefill slice, with
+/// 1023 trusted rows and the seed waiting and nothing drafted: each keeps
+/// 1024 BF16 hidden rows of 20,480 B beside its recurrent row and no draft
+/// K/V. A budget sized to the draft-K/V figure for those rows admits a third
+/// owner only after reclaim.
+/// MUTATION: charge waiting rows as draft K/V in
+/// `draft_owner_bytes`; `held` falls to the K/V figure, the third owner fits
+/// and the AfterReclaim assertion fails.
+#[test]
+fn flash_next_parked_owners_charge_their_waiting_hidden_rows() {
+    use crate::engine::hybrid_scheduler::{
+        ScheduledStateCapacity, ScheduledStateFit, scheduled_state_fit,
+    };
+    let c = flash_next_config();
+    assert_eq!(draft_hidden_row_bytes(&c), 20_480);
+    let row = row_state_bytes(&c);
+    let parked = draft_owner_bytes(&c, 0, 1024, false);
+    assert_eq!(parked, 1024 * 20_480);
+    let kv_figure = 1024 * draft_kv_bytes_per_token(&c);
+    assert!(parked > kv_figure);
+    assert_eq!(
+        draft_owner_bytes(&c, 7, 1, true),
+        4 * row + 7 * 4096 + 20_480,
+        "cached rows pay K/V, the seed pays its hidden row, a tracked owner its snapshots"
+    );
+    let candidate = row + draft_state_bytes(&c, 256);
+    let budget = 2 * (row + kv_figure) + candidate;
+    let held = 2 * (row + parked);
+    assert_eq!(
+        scheduled_state_fit(Some(ScheduledStateCapacity { budget, held }), 0, candidate),
+        ScheduledStateFit::AfterReclaim,
+        "the retained hidden rows overcommit a budget sized to their K/V figure"
+    );
+    assert_eq!(
+        scheduled_state_fit(
+            Some(ScheduledStateCapacity {
+                budget,
+                held: 2 * (row + kv_figure),
+            }),
+            0,
+            candidate
+        ),
+        ScheduledStateFit::Fits
+    );
 }

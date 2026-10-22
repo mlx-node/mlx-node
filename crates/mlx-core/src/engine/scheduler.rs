@@ -54,6 +54,10 @@ pub(crate) struct TurnState<P> {
     /// Maximum additional hypothetical query rows; never part of token_history.
     pub decode_draft_allowance: u32,
     pub pinned_prefill_breaks: Vec<u32>,
+    /// The family prefills this prompt as one group of windows in one step
+    /// (`HybridSchedulerBackend::scheduler_whole_prompt_prefill`); re-pinned
+    /// with the breaks on every restore and replay.
+    pub whole_prompt_prefill: bool,
     pub token_history: Vec<u32>,
     pub status: TurnStatus,
     pub cancelled: Option<Arc<AtomicBool>>,
@@ -70,7 +74,14 @@ pub(crate) struct TurnState<P> {
     /// Constant-size recurrent/sliding state charged in the same byte budget
     /// as future paged-block growth. Zero means this row has no hybrid state.
     pub recurrent_state_bytes: u64,
+    /// Preemption drops both state charges (`recurrent_state_bytes` and
+    /// `scheduled_state_bytes`) until resume preparation succeeds.
     pub recurrent_state_reservation_active: bool,
+    /// Off-pool state (recurrent row, draft snapshots and K/V) this turn's
+    /// sequence holds once fully materialized. Admission charges the part the
+    /// family does not hold yet, so a queued MTP turn keeps its draft
+    /// reservation until its owner exists.
+    pub scheduled_state_bytes: u64,
     pub preemptions: u32,
     pub payload: P,
     arrival_order: u64,
@@ -179,6 +190,7 @@ impl<P> TurnState<P> {
             prompt_tokens,
             decode_draft_allowance: 0,
             pinned_prefill_breaks,
+            whole_prompt_prefill: false,
             token_history,
             status: TurnStatus::Waiting,
             cancelled,
@@ -189,6 +201,7 @@ impl<P> TurnState<P> {
             block_reservation_active: true,
             recurrent_state_bytes: 0,
             recurrent_state_reservation_active: true,
+            scheduled_state_bytes: 0,
             preemptions: 0,
             payload,
             arrival_order: 0,
@@ -248,6 +261,11 @@ impl<P> TurnState<P> {
         self
     }
 
+    pub fn with_scheduled_state_reservation(mut self, bytes: u64) -> Self {
+        self.scheduled_state_bytes = bytes;
+        self
+    }
+
     fn unallocated_reserved_blocks(&self) -> u32 {
         if !self.block_reservation_active
             || self.block_reservation_total == 0
@@ -262,6 +280,14 @@ impl<P> TurnState<P> {
     fn reserved_recurrent_state_bytes(&self) -> u64 {
         if self.recurrent_state_reservation_active {
             self.recurrent_state_bytes
+        } else {
+            0
+        }
+    }
+
+    fn outstanding_scheduled_state_bytes(&self, held: u64) -> u64 {
+        if self.recurrent_state_reservation_active {
+            self.scheduled_state_bytes.saturating_sub(held)
         } else {
             0
         }
@@ -721,6 +747,17 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             })
     }
 
+    /// Off-pool state the waiting and running turns reserved beyond what
+    /// their sequences hold now (`held`).
+    pub fn outstanding_scheduled_state_bytes(&self, held: impl Fn(SeqId) -> u64) -> u64 {
+        self.waiting
+            .iter()
+            .chain(self.running.iter())
+            .fold(0u64, |sum, turn| {
+                sum.saturating_add(turn.outstanding_scheduled_state_bytes(held(turn.seq_id)))
+            })
+    }
+
     pub fn try_reserve_memory(
         &mut self,
         telemetry: MemoryTelemetry,
@@ -879,6 +916,30 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         }
         self.waiting = retained;
         cancelled
+    }
+
+    fn preempt_running_at(&mut self, index: usize) -> TurnState<P> {
+        let mut victim = self.running.remove(index);
+        victim.status = TurnStatus::Preempted;
+        victim.block_reservation_active = false;
+        victim.recurrent_state_reservation_active = false;
+        victim.preemptions = victim.preemptions.saturating_add(1);
+        self.stats.preemptions = self.stats.preemptions.saturating_add(1);
+        victim
+    }
+
+    #[cfg(test)]
+    pub fn preempt_running(&mut self, seq_id: SeqId) -> Option<TurnState<P>> {
+        let index = self.running.iter().position(|turn| turn.seq_id == seq_id)?;
+        Some(self.preempt_running_at(index))
+    }
+
+    #[cfg(test)]
+    pub fn turn_mut(&mut self, seq_id: SeqId) -> Option<&mut TurnState<P>> {
+        self.waiting
+            .iter_mut()
+            .chain(self.running.iter_mut())
+            .find(|turn| turn.seq_id == seq_id)
     }
 
     /// Remove the oldest preempted row for model-specific cache re-preparation.
@@ -1075,7 +1136,18 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                         .saturating_sub(turn.num_computed_tokens),
                     StepKind::Decode => 1,
                 };
-                let num_tokens = pending.min(row_limit).min(budget);
+                // A whole-prompt prefill row ignores the token budget and is
+                // the step's only prefill row; it waits while another turn's
+                // prefill row is planned ahead of it.
+                let whole = kind == StepKind::Prefill && turn.whole_prompt_prefill;
+                if whole && rows.iter().any(|row| row.kind == StepKind::Prefill) {
+                    continue;
+                }
+                let num_tokens = if whole {
+                    pending.min(row_limit)
+                } else {
+                    pending.min(row_limit).min(budget)
+                };
                 if num_tokens == 0 {
                     continue;
                 }
@@ -1086,7 +1158,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                     num_tokens,
                     cancel_snapshot: turn.cancel_snapshot,
                 });
-                budget -= num_tokens;
+                budget = if whole { 0 } else { budget - num_tokens };
             }
         }
         StepPlan {
@@ -1166,13 +1238,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                 .iter()
                 .rposition(|turn| turn.status == TurnStatus::Running)
         {
-            let mut victim = self.running.remove(index);
-            victim.status = TurnStatus::Preempted;
-            victim.block_reservation_active = false;
-            victim.recurrent_state_reservation_active = false;
-            victim.preemptions = victim.preemptions.saturating_add(1);
-            self.stats.preemptions = self.stats.preemptions.saturating_add(1);
-            preempted = Some(victim);
+            preempted = Some(self.preempt_running_at(index));
         }
 
         let mut completed = Vec::new();
@@ -1617,6 +1683,28 @@ mod tests {
             SchedulerAction::Stepped { .. }
         ));
         assert!(scheduler.has_pending_control());
+    }
+
+    /// MUTATION: drop the `recurrent_state_reservation_active` gate in
+    /// `TurnState::outstanding_scheduled_state_bytes`; the preempted row keeps
+    /// reporting 70 and the `0` assertion fails.
+    #[test]
+    fn outstanding_scheduled_state_skips_preempted_rows_and_held_state() {
+        let mut scheduler = Scheduler::<_, (), ()>::new(2, 4).expect("scheduler");
+        scheduler
+            .enqueue_turn(turn(1, 0, &[4], None).with_scheduled_state_reservation(100))
+            .expect("enqueue 1");
+        scheduler
+            .enqueue_turn(turn(2, 0, &[4], None).with_scheduled_state_reservation(50))
+            .expect("enqueue 2");
+        let held = |seq_id: SeqId| if seq_id == 1 { 30 } else { 80 };
+        assert_eq!(scheduler.outstanding_scheduled_state_bytes(held), 70);
+        let victim = scheduler.take_waiting(1).expect("take victim");
+        scheduler.prepend_preempted(victim);
+        assert_eq!(scheduler.outstanding_scheduled_state_bytes(held), 0);
+        let victim = scheduler.take_preempted().expect("resume victim");
+        scheduler.ready_preempted(victim, false);
+        assert_eq!(scheduler.outstanding_scheduled_state_bytes(held), 70);
     }
 
     #[test]
@@ -2086,5 +2174,73 @@ mod tests {
         assert_eq!(scheduler.waiting_len(), 2);
         assert_eq!(scheduler.stats().admission_deferred_state, 6);
         assert_eq!(scheduler.stats().reserved_state_bytes, 3 * GEMMA_STATE);
+    }
+
+    /// A whole-prompt prefill row (a cold Flash Next turn in group mode)
+    /// ignores the token budget, is its step's only prefill row, and waits
+    /// while another turn's prefill row is planned ahead of it; every other
+    /// turn keeps the 1024-slice grid under the shared budget.
+    /// MUTATION: `build_plan` subtracts the whole row from the budget ->
+    /// u32 underflow (debug panic) on the 6219-token row.
+    #[test]
+    fn a_whole_prompt_row_ignores_the_budget_and_is_the_steps_only_prefill_row() {
+        let running = |seq_id: SeqId, prompt: usize, breaks: Vec<u32>, whole: bool| {
+            let mut turn =
+                TurnState::new(seq_id, vec![1; prompt], 0, breaks, None, "payload").expect("turn");
+            turn.status = TurnStatus::Running;
+            turn.whole_prompt_prefill = whole;
+            turn
+        };
+        let rows = |plan: &StepPlan| {
+            plan.rows
+                .iter()
+                .map(|row| (row.seq_id, row.kind, row.num_tokens))
+                .collect::<Vec<_>>()
+        };
+        // A decode peer runs its row first; the cold turn's whole prompt
+        // follows in one row, past the 2048 budget.
+        let mut scheduler = Scheduler::<_, (), ()>::new(4, 2048).unwrap();
+        let mut peer = running(1, 4, vec![4], false);
+        peer.num_computed_tokens = 4;
+        peer.token_history.push(9);
+        peer.num_tokens += 1;
+        scheduler.running.push(peer);
+        scheduler.running.push(running(2, 6219, vec![6219], true));
+        assert_eq!(
+            rows(&scheduler.build_plan()),
+            [(1, StepKind::Decode, 1), (2, StepKind::Prefill, 6219)]
+        );
+        // Two warm turns: 1024 each, 2048 per step.
+        let mut scheduler = Scheduler::<_, (), ()>::new(4, 2048).unwrap();
+        scheduler
+            .running
+            .push(running(3, 3000, vec![1024, 2048, 3000], false));
+        scheduler
+            .running
+            .push(running(4, 3000, vec![1024, 2048, 3000], false));
+        assert_eq!(
+            rows(&scheduler.build_plan()),
+            [(3, StepKind::Prefill, 1024), (4, StepKind::Prefill, 1024)]
+        );
+        // A warm prefill row ahead of the cold turn: the cold turn waits.
+        let mut scheduler = Scheduler::<_, (), ()>::new(4, 2048).unwrap();
+        scheduler
+            .running
+            .push(running(5, 3000, vec![1024, 2048, 3000], false));
+        scheduler.running.push(running(6, 6219, vec![6219], true));
+        assert_eq!(
+            rows(&scheduler.build_plan()),
+            [(5, StepKind::Prefill, 1024)]
+        );
+        // The cold turn ahead: no other prefill row joins its step.
+        let mut scheduler = Scheduler::<_, (), ()>::new(4, 2048).unwrap();
+        scheduler.running.push(running(7, 6219, vec![6219], true));
+        scheduler
+            .running
+            .push(running(8, 3000, vec![1024, 2048, 3000], false));
+        assert_eq!(
+            rows(&scheduler.build_plan()),
+            [(7, StepKind::Prefill, 6219)]
+        );
     }
 }

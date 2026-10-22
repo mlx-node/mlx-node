@@ -1,96 +1,91 @@
-//! Optional, lossless SSD cache of already imported quantized matrix chunks.
-//! Opening a Store only fingerprints source metadata. Entries are created on
-//! demand, atomically, and contain at most one bounded row/expert chunk.
+//! The mapped expert pack's cache root: the source fingerprint that names
+//! a checkpoint's pack dir and its `.manifest`, the stale-dir sweep, the
+//! descriptor-relative file helpers the pack builder writes through, and
+//! the per-expert array encoding the pack's sections hold.
 use std::collections::BTreeSet;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use napi::{Error, Result};
+use napi::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::{debug, info};
+use tracing::debug;
 
-use super::weights::{MAX_READ_BYTES, Weight};
+use super::weights::{Weight, err};
 use crate::array::{DType, MxArray};
 
+/// Seeds the source fingerprint that names the pack dir: a new value
+/// renames every checkpoint's dir, so each load would rebuild its pack.
 const MAGIC: &[u8; 8] = b"Q4PACK02";
-const MAX_HEADER: usize = 4096;
-const DISK_BUDGET: u64 = 96 << 30;
 const FREE_RESERVE: u64 = 16 << 30;
-/// Idle identity dirs are stale after this; `.pack`/budget mtime stamps on
-/// verified reads keep a live dir young.
+/// An orphan reason waits out this grace on the dir's newest mtime; the
+/// manifest stamp of a serving pack keeps a live dir young.
 const PACKED_SWEEP_MIN_AGE: Duration = Duration::from_secs(3600);
-const DIR_PREFIX: &str = ".mlx-qwen4-packed-v2-";
-/// Optional total cap across all identity dirs; unset/<=0 keeps the per-dir
-/// DISK_BUDGET behaviour.
-const TOTAL_CAP_ENV: &str = "MLX_QWEN4_PACKED_CACHE_MAX_GB";
+pub(super) const MAPPED_DIR_PREFIX: &str = ".mlx-qwen4-mapped-v3-";
+/// A mapped dir's stable lock file: SH while a model reads or builds the
+/// pack, EX by an evictor. Never renamed or unlinked (flock needs the inode).
+const MAPPED_LOCK: &str = "lock";
+/// Per-expert chunk dirs of the previous pack format (up to 96 GiB each).
+/// Nothing reads them here; the sweep removes them.
+const RETIRED_CHUNK_PREFIX: &str = ".mlx-qwen4-packed-v2-";
+/// The previous format's ledger: a writer holds it EX per chunk; a reader
+/// holds it SH or nothing at all, so unlocked never proves unread.
+const RETIRED_CHUNK_LOCK: &str = "budget";
 
-fn err(e: impl std::fmt::Display) -> Error {
-    Error::from_reason(e.to_string())
-}
-
-#[derive(Serialize, Deserialize)]
-struct ArrayInfo {
-    dtype: String,
-    shape: Vec<i64>,
-    bytes: usize,
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(super) struct ArrayInfo {
+    pub(super) dtype: String,
+    pub(super) shape: Vec<i64>,
+    pub(super) bytes: usize,
 }
 #[derive(Serialize, Deserialize)]
-struct Header {
-    key: String,
-    group: i32,
-    bits: i32,
-    mode: String,
+pub(super) struct Header {
+    pub(super) key: String,
+    pub(super) group: i32,
+    pub(super) bits: i32,
+    pub(super) mode: String,
     // values, scales, optional biases
-    arrays: Vec<ArrayInfo>,
+    pub(super) arrays: Vec<ArrayInfo>,
 }
 
 /// Fully verified owned bytes; no file mapping or path-based trust survives a read.
 pub(super) struct VerifiedChunk {
-    header: Header,
-    data: Vec<u8>,
-    file_len: u64,
+    pub(super) header: Header,
+    pub(super) data: Vec<u8>,
+    pub(super) file_len: u64,
 }
 
+/// One checkpoint's place under the cache root: its mapped pack dir, named
+/// by the source fingerprint, and the `.manifest` the pack carries.
 pub(super) struct PackedCache {
-    root: PathBuf,
-    /// `.manifest` bytes written by `new_at`; `write` republishes them if a
-    /// sweep deletes the file (or the whole dir) mid-session. None only for
-    /// tests constructing the struct literally.
-    manifest: Option<Vec<u8>>,
+    dir: PathBuf,
+    manifest: Vec<u8>,
 }
 
-pub(super) fn chunk_key(
-    path: &Path,
-    offset: u64,
-    bytes: u64,
-    rows: usize,
-    width: usize,
-    ty: u32,
-) -> String {
-    let mut hash = Sha256::new();
-    hash.update(path.as_os_str().as_bytes());
-    for n in [offset, bytes, rows as u64, width as u64, ty as u64] {
-        hash.update(n.to_le_bytes());
-    }
-    hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
+/// Canonical path and metadata of each source file, in order.
+fn stat_sources(files: impl Iterator<Item = PathBuf>) -> Vec<io::Result<(PathBuf, fs::Metadata)>> {
+    files
+        .map(|path| {
+            let canonical = path.canonicalize()?;
+            let meta = fs::metadata(&canonical)?;
+            Ok((canonical, meta))
+        })
+        .collect()
 }
 
-fn packed_identity(files: impl Iterator<Item = PathBuf>) -> Result<String> {
+/// No device number: macOS renumbers volumes across reboots and re-plugs.
+fn packed_identity(files: &[(PathBuf, fs::Metadata)]) -> String {
     let mut hash = Sha256::new();
     hash.update(MAGIC);
-    for path in files {
-        let canonical = path.canonicalize().map_err(err)?;
-        let meta = fs::metadata(&canonical).map_err(err)?;
+    for (canonical, meta) in files {
         hash.update(canonical.as_os_str().as_bytes());
         for n in [
-            meta.dev(),
             meta.ino(),
             meta.len(),
             meta.mtime() as u64,
@@ -101,7 +96,7 @@ fn packed_identity(files: impl Iterator<Item = PathBuf>) -> Result<String> {
             hash.update(n.to_le_bytes());
         }
     }
-    Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Lowercase-hex encode raw bytes — the `.manifest` `path_hex=`/`file_hex=`
@@ -111,12 +106,12 @@ fn packed_identity(files: impl Iterator<Item = PathBuf>) -> Result<String> {
 /// reader that inspects text. The hex twins are authoritative on parse; a
 /// present-but-corrupt hex field is a corrupt manifest (Err), never license
 /// to trust the lossy line.
-fn packed_hex_encode(bytes: &[u8]) -> Vec<u8> {
+pub(super) fn packed_hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = Vec::with_capacity(bytes.len() * 2);
+    let mut out = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
-        out.push(HEX[(byte >> 4) as usize]);
-        out.push(HEX[(byte & 0x0f) as usize]);
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
 }
@@ -142,15 +137,26 @@ fn packed_hex_decode(field: &[u8]) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Recompute an identity dir's source fingerprint from its `.manifest`. Any
-/// missing source file or unreadable manifest is Err so callers can treat the
-/// dir as orphaned. `path_hex=`/`file_hex=` lines (raw OS bytes as hex) are
-/// preferred over the lossy `path=`/`file=` lines they twin; pre-hex
-/// manifests keep working through the raw fields.
-fn identity_from_manifest(dir: &Path) -> Result<String> {
-    let data = fs::read(dir.join(".manifest")).map_err(err)?;
+/// What a pack's `.manifest` proves about its source now.
+#[derive(Debug, PartialEq, Eq)]
+enum Source {
+    /// Every file stats; the identity it hashes to.
+    Present(String),
+    /// A file is gone while the mount point the manifest recorded is mounted.
+    Deleted,
+    /// Its volume is not mounted, or a stat failed for another reason.
+    Unreachable,
+}
+
+/// The source files a `.manifest` names and the mount point it recorded.
+/// `path_hex=`/`file_hex=` lines (raw OS bytes as hex) are preferred over the
+/// lossy `path=`/`file=` lines they twin. A manifest is complete only when its
+/// last line is `end=<hex file count>` matching its file records: a torn or
+/// truncated write can drop splits while every record left still decodes.
+fn parse_manifest(data: &[u8]) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
     let mut path_raw = None;
     let mut path_hex = None;
+    let mut mount_hex = None;
     let mut file_raws: Vec<&[u8]> = Vec::new();
     let mut file_hexes: Vec<&[u8]> = Vec::new();
     for line in data.split(|&b| b == b'\n') {
@@ -158,6 +164,8 @@ fn identity_from_manifest(dir: &Path) -> Result<String> {
             path_hex = Some(raw);
         } else if let Some(raw) = line.strip_prefix(b"path=".as_slice()) {
             path_raw = Some(raw);
+        } else if let Some(raw) = line.strip_prefix(b"mount_hex=".as_slice()) {
+            mount_hex = Some(raw);
         } else if let Some(raw) = line.strip_prefix(b"file_hex=".as_slice()) {
             file_hexes.push(raw);
         } else if let Some(raw) = line.strip_prefix(b"file=".as_slice()) {
@@ -173,6 +181,13 @@ fn identity_from_manifest(dir: &Path) -> Result<String> {
             .map(|raw| PathBuf::from(OsStr::from_bytes(raw)))
             .ok_or_else(|| err("packed manifest missing path="))?
     };
+    let mount = mount_hex
+        .map(|hex| {
+            packed_hex_decode(hex)
+                .map(|bytes| PathBuf::from(OsStr::from_bytes(&bytes)))
+                .ok_or_else(|| err("packed manifest has corrupt mount_hex="))
+        })
+        .transpose()?;
     let files: Vec<PathBuf> = if !file_hexes.is_empty() {
         let mut files = Vec::with_capacity(file_hexes.len());
         for hex in file_hexes {
@@ -190,12 +205,45 @@ fn identity_from_manifest(dir: &Path) -> Result<String> {
     if files.is_empty() {
         return Err(err("packed manifest lists no files"));
     }
-    packed_identity(files.into_iter())
+    let end = data
+        .strip_suffix(b"\n")
+        .and_then(|data| data.rsplit(|&b| b == b'\n').next())
+        .and_then(|line| line.strip_prefix(b"end=".as_slice()))
+        .filter(|hex| !hex.is_empty() && hex.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .and_then(|hex| usize::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
+    if end != Some(files.len()) {
+        return Err(err("packed manifest is incomplete"));
+    }
+    Ok((files, mount))
 }
 
-/// Serialize canonical source paths into `.manifest` bytes: the hex twins
-/// come first (`path_hex=`, then every `file_hex=`), the raw `path=`/`file=`
-/// display lines last. A raw line whose bytes contain a newline is omitted
+/// Err = unreadable, corrupt or incomplete manifest.
+fn manifest_source(dir: &Path) -> Result<Source> {
+    let data = fs::read(dir.join(".manifest")).map_err(err)?;
+    let (files, mount) = parse_manifest(&data)?;
+    let mut stats = Vec::with_capacity(files.len());
+    let mut missing = false;
+    for stat in stat_sources(files.into_iter()) {
+        match stat {
+            Ok(stat) => stats.push(stat),
+            Err(e) if e.kind() == ErrorKind::NotFound => missing = true,
+            Err(_) => return Ok(Source::Unreachable),
+        }
+    }
+    Ok(if !missing {
+        Source::Present(packed_identity(&stats))
+    } else if mount.is_some_and(|mount| is_mounted(&mount)) {
+        Source::Deleted
+    } else {
+        Source::Unreachable
+    })
+}
+
+/// Serialize canonical source paths into `.manifest` bytes: the hex records
+/// come first (`path_hex=`, `mount_hex=`, then every `file_hex=`), the raw
+/// `path=`/`file=` display lines next, and `end=<hex file count>` last; the
+/// mount point has no raw twin. A
+/// raw line whose bytes contain a newline is omitted
 /// entirely — a newline is the only byte that can forge a record line, and a
 /// path holding "\nfile_hex=evil" would inject an earlier authoritative-
 /// looking line into the same file. The raw lines keep readable manifests
@@ -207,7 +255,11 @@ fn pack_manifest(canonical: &[PathBuf]) -> Vec<u8> {
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_default();
     let mut manifest = b"path_hex=".to_vec();
-    manifest.extend_from_slice(&packed_hex_encode(base.as_os_str().as_bytes()));
+    manifest.extend_from_slice(packed_hex_encode(base.as_os_str().as_bytes()).as_bytes());
+    manifest.push(b'\n');
+    manifest.extend_from_slice(b"mount_hex=");
+    manifest
+        .extend_from_slice(packed_hex_encode(mount_point(&base).as_os_str().as_bytes()).as_bytes());
     manifest.push(b'\n');
     let mut raw = Vec::new();
     if !base.as_os_str().as_bytes().contains(&b'\n') {
@@ -218,7 +270,7 @@ fn pack_manifest(canonical: &[PathBuf]) -> Vec<u8> {
     for path in canonical {
         let rel = path.strip_prefix(&base).unwrap_or(path);
         manifest.extend_from_slice(b"file_hex=");
-        manifest.extend_from_slice(&packed_hex_encode(rel.as_os_str().as_bytes()));
+        manifest.extend_from_slice(packed_hex_encode(rel.as_os_str().as_bytes()).as_bytes());
         manifest.push(b'\n');
         if !rel.as_os_str().as_bytes().contains(&b'\n') {
             raw.extend_from_slice(b"file=");
@@ -227,22 +279,49 @@ fn pack_manifest(canonical: &[PathBuf]) -> Vec<u8> {
         }
     }
     manifest.extend_from_slice(&raw);
+    manifest.extend_from_slice(format!("end={:x}\n", canonical.len()).as_bytes());
     manifest
 }
 
 /// A cache dir on disk is a REAL directory — never a symlink. `Path::is_dir`
-/// follows links, so a `.mlx-qwen4-packed-v2-*` symlink would admit its
-/// external target into sizing (`read_dir` walks it) and eviction. The
-/// producers only ever emit real dirs, so links are foreign.
-fn is_real_dir(path: &Path) -> bool {
+/// follows links, so a `.mlx-qwen4-mapped-v3-*` symlink would admit its
+/// external target into the sweep's eviction. The producers only ever emit
+/// real dirs, so links are foreign.
+pub(super) fn is_real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
+/// The highest ancestor of `path` on its device: the mount point it sits on.
+fn mount_point(path: &Path) -> PathBuf {
+    let device = |p: &Path| fs::symlink_metadata(p).ok().map(|m| m.dev());
+    let dev = device(path);
+    let mut mount = path;
+    while let Some(parent) = mount.parent() {
+        if dev.is_none() || device(parent) != dev {
+            break;
+        }
+        mount = parent;
+    }
+    mount.to_path_buf()
+}
+
+/// `mount` is a mount point now: `/`, or a real dir on another device than
+/// its parent. A left-behind mount dir is a plain dir on its parent's device.
+fn is_mounted(mount: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(mount) else {
+        return false;
+    };
+    meta.is_dir()
+        && mount
+            .parent()
+            .is_none_or(|parent| fs::symlink_metadata(parent).is_ok_and(|p| p.dev() != meta.dev()))
 }
 
 /// Unlink `path` only when it is a symlink — `fs::remove_file` removes just
 /// the link, never its target. Any other occupant or lookup failure is left
 /// for the caller's `create_dir_all` to surface. Prevents a planted link
 /// from redirecting dir creation and writes outside the cache root.
-fn unlink_if_symlink(path: &Path) {
+pub(super) fn unlink_if_symlink(path: &Path) {
     if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()) {
         let _ = fs::remove_file(path);
     }
@@ -252,8 +331,8 @@ fn unlink_if_symlink(path: &Path) {
 // A path check cannot pin what it validated: an actor able to mutate the
 // cache parent could `rename` the real identity dir away and plant a
 // symlink between the check and any `dir.join(name)` open, redirecting
-// .manifest/budget/.tmp/.pack writes outside the cache root. Every write
-// under `self.root` therefore runs relative to a directory fd opened once
+// .manifest/.tmp/.mapped writes outside the cache root. Every write under
+// a pack dir therefore runs relative to a directory fd opened once
 // with O_DIRECTORY|O_NOFOLLOW: the fd pins THE validated inode, and a
 // swapped path afterwards resolves nothing (writes then land in the — now
 // unlinked — real dir and are reclaimed on close, never in the link's
@@ -277,7 +356,7 @@ fn dir_c_name(name: &OsStr) -> io::Result<std::ffi::CString> {
 /// the descriptor-relative root for all writes under it. `None` on any
 /// failure (symlink, missing, non-dir): callers treat that exactly like
 /// the old not-a-real-dir check.
-fn open_dir_nofollow(path: &Path) -> Option<File> {
+pub(super) fn open_dir_nofollow(path: &Path) -> Option<File> {
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     // SAFETY: `c_path` outlives the call; the fd is wrapped in `File`,
     // which owns it.
@@ -294,7 +373,7 @@ fn open_dir_nofollow(path: &Path) -> Option<File> {
     Some(unsafe { File::from_raw_fd(fd) })
 }
 
-fn dir_open_at(
+pub(super) fn dir_open_at(
     dirfd: &File,
     name: &OsStr,
     flags: libc::c_int,
@@ -311,45 +390,47 @@ fn dir_open_at(
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-/// Create-or-truncate `name` inside `dirfd` and write `contents`.
-/// O_NOFOLLOW keeps a planted link at `name` from redirecting the write.
-fn dir_write_file(dirfd: &File, name: &str, contents: &[u8]) -> io::Result<()> {
-    let mut file = dir_open_at(
+/// Publish `manifest` as the pack's `.manifest` unless a complete one is
+/// there: written to `.manifest.tmp`, synced, then renamed over it, so a
+/// crash leaves the old manifest or the new one, never a torn one.
+/// O_NOFOLLOW keeps a planted link at either name from redirecting a read or
+/// the write.
+pub(super) fn publish_manifest(dirfd: &File, manifest: &[u8]) -> io::Result<()> {
+    let current = OsStr::new(".manifest");
+    let complete = dir_stat(dirfd, current)
+        .is_some_and(|stat| (stat.st_mode & libc::S_IFMT) == libc::S_IFREG)
+        && dir_open_at(
+            dirfd,
+            current,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+        .and_then(|mut file| {
+            let mut data = Vec::new();
+            file.read_to_end(&mut data).map(|_| data)
+        })
+        .is_ok_and(|data| parse_manifest(&data).is_ok());
+    if complete {
+        return Ok(());
+    }
+    let mut tmp = dir_open_at(
         dirfd,
-        OsStr::new(name),
+        OsStr::new(".manifest.tmp"),
         libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0o644,
     )?;
-    file.write_all(contents)
-}
-
-/// Open `name` inside `dirfd` for the `budget` ledger: read-write when the
-/// ledger must be (re)created, read-only otherwise. O_NOFOLLOW keeps a
-/// planted link from redirecting the flock and bytes outside the pinned
-/// dir.
-fn dir_open_file(dirfd: &File, name: &str, create: bool) -> io::Result<File> {
-    let flags = if create {
-        libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC
-    } else {
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
-    };
-    dir_open_at(dirfd, OsStr::new(name), flags, 0o644)
-}
-
-/// `create_new` staging temp inside `dirfd`: O_EXCL keeps a pre-existing
-/// name (or planted link) from being opened.
-fn dir_create_new_file(dirfd: &File, name: &str) -> io::Result<File> {
-    dir_open_at(
-        dirfd,
-        OsStr::new(name),
-        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        0o644,
-    )
+    tmp.write_all(manifest)?;
+    tmp.sync_all()?;
+    match dir_renameat(dirfd, ".manifest.tmp", ".manifest") {
+        // A concurrent loader renamed the same inode first; our bytes are in it.
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
 }
 
 /// Atomic `rename` inside the pinned dir — both endpoints relative to
 /// `dirfd`, so a swapped `self.root` path cannot redirect either side.
-fn dir_renameat(dirfd: &File, from: &str, to: &str) -> io::Result<()> {
+pub(super) fn dir_renameat(dirfd: &File, from: &str, to: &str) -> io::Result<()> {
     let c_from = dir_c_name(OsStr::new(from))?;
     let c_to = dir_c_name(OsStr::new(to))?;
     // SAFETY: `dirfd` is an open directory descriptor; both names are live
@@ -370,7 +451,7 @@ fn dir_renameat(dirfd: &File, from: &str, to: &str) -> io::Result<()> {
 
 /// Unlink `name` inside the pinned dir. Errors are surfaced so callers can
 /// tell a real removal from a miss.
-fn dir_unlinkat(dirfd: &File, name: &OsStr) -> io::Result<()> {
+pub(super) fn dir_unlinkat(dirfd: &File, name: &OsStr) -> io::Result<()> {
     let c_name = dir_c_name(name)?;
     // SAFETY: `dirfd` is an open directory descriptor and `c_name` is a
     // live NUL-terminated name; flag 0 removes files only, never dirs.
@@ -383,7 +464,7 @@ fn dir_unlinkat(dirfd: &File, name: &OsStr) -> io::Result<()> {
 
 /// `lstat` relative to the pinned dir: a symlink at `name` reports its own
 /// metadata, never the target's — same contract as `fs::symlink_metadata`.
-fn dir_stat(dirfd: &File, name: &OsStr) -> Option<libc::stat> {
+pub(super) fn dir_stat(dirfd: &File, name: &OsStr) -> Option<libc::stat> {
     let c_name = dir_c_name(name).ok()?;
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `dirfd` is an open directory descriptor, `c_name` is a live
@@ -403,73 +484,28 @@ fn dir_stat(dirfd: &File, name: &OsStr) -> Option<libc::stat> {
     Some(unsafe { stat.assume_init() })
 }
 
-/// Producer identities are exactly 64 lowercase hex chars (the blake-style
-/// source fingerprint). Anything else under the prefix — `.mlx-qwen4-packed-
-/// v2-backup`, a typo, a manual copy — is foreign: never sized, never swept,
-/// never evicted.
-fn dir_name_identity(dir: &Path) -> Option<&str> {
-    let suffix = dir.file_name()?.to_str()?.strip_prefix(DIR_PREFIX)?;
-    if suffix.len() == 64
+/// Producer identities are exactly 64 lowercase hex chars (the source
+/// fingerprint) under their prefix. Anything else under it — a `-backup`
+/// suffix, a typo, a manual copy — is foreign: never swept.
+fn prefixed_identity<'a>(dir: &'a Path, prefix: &str) -> Option<&'a str> {
+    let suffix = dir.file_name()?.to_str()?.strip_prefix(prefix)?;
+    (suffix.len() == 64
         && suffix
             .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    {
-        return Some(suffix);
-    }
-    None
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+    .then_some(suffix)
 }
 
-/// Producer chunk files are `{chunk_key}.pack` where chunk_key is a SHA-256
-/// hexdigest — 64 lowercase hex chars. A `backup.pack` or `notes.pack`
-/// dropped inside an identity dir is foreign: never counted as spend and
-/// never a deletion candidate.
-fn is_pack_name(name: &OsStr) -> bool {
-    let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".pack")) else {
-        return false;
-    };
-    stem.len() == 64
-        && stem
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+pub(super) fn dir_name_identity(dir: &Path) -> Option<&str> {
+    prefixed_identity(dir, MAPPED_DIR_PREFIX)
 }
 
-/// Producer staging files are `{Uuid::new_v4()}.tmp` — 36 chars:
-/// 8-4-4-4-12 lowercase hex separated by dashes, version nibble `4` at
-/// position 14, variant `[89ab]` at 19. A `notes.tmp` or `snapshot.tmp` in
-/// the dir is foreign: never counted as retained spend and never unlinked
-/// by the stale-tmp reaper.
-fn is_tmp_name(name: &OsStr) -> bool {
-    let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".tmp")) else {
-        return false;
-    };
-    let b = stem.as_bytes();
-    b.len() == 36
-        && [8usize, 13, 18, 23].iter().all(|&i| b[i] == b'-')
-        && b[14] == b'4'
-        && matches!(b[19], b'8' | b'9' | b'a' | b'b')
-        && b.iter().enumerate().all(|(i, c)| {
-            [8usize, 13, 18, 23].contains(&i) || (c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-        })
+fn is_retired_chunk_dir(dir: &Path) -> bool {
+    prefixed_identity(dir, RETIRED_CHUNK_PREFIX).is_some()
 }
 
-/// `libc::stat` timestamps are signed: a restored or manually stamped file
-/// can carry a pre-epoch mtime, and casting a negative `st_mtime` to u64
-/// wraps to a near-`u64::MAX` duration whose epoch addition panics. Clamp
-/// negative values to UNIX_EPOCH — such a file is simply the oldest.
-fn stat_mtime(stat: &libc::stat) -> SystemTime {
-    if stat.st_mtime < 0 || stat.st_mtime_nsec < 0 {
-        return SystemTime::UNIX_EPOCH;
-    }
-    // A corrupt far-future mtime must read as FRESH (kept, never swept):
-    // the conservative failure is retention, not deletion.
-    SystemTime::UNIX_EPOCH
-        .checked_add(Duration::from_secs(stat.st_mtime as u64))
-        .and_then(|t| t.checked_add(Duration::from_nanos(stat.st_mtime_nsec as u64)))
-        .unwrap_or_else(SystemTime::now)
-}
-
-/// Newest mtime over the dir and every direct entry (.manifest, budget,
-/// .pack, in-flight .tmp); a present-but-unreadable mtime counts as fresh
+/// Newest mtime over the dir and every direct entry (.manifest, lock,
+/// .mapped, in-flight .tmp); a present-but-unreadable mtime counts as fresh
 /// (None) so the dir is never deleted on a bad clock.
 fn packed_dir_mtime(dir: &Path) -> Option<SystemTime> {
     // symlink_metadata at both levels: a link's own mtime counts, its target
@@ -490,24 +526,21 @@ fn packed_dir_idle(dir: &Path) -> bool {
     packed_dir_mtime(dir).is_some_and(|newest| newest < SystemTime::now() - PACKED_SWEEP_MIN_AGE)
 }
 
-/// None keeps the dir (manifest-less dirs are never orphan-deleted: their
-/// staleness cannot be proven). The idle gate is a safety grace for the
-/// orphan reasons, never itself a reason: an idle dir whose manifest still
-/// recomputes to its name identity is a healthy cache, and deleting it would
-/// only force a full repack on the next load.
+/// None keeps the dir. Only proof removes one: a present source that hashes
+/// to another identity, or a file gone from a mount point that is still
+/// mounted. An unplugged volume, an unreadable file, a corrupt or incomplete
+/// manifest or no manifest proves nothing. The idle gate is a race grace, never a reason.
 fn packed_orphan_reason(dir: &Path) -> Option<&'static str> {
     let manifest = dir.join(".manifest");
     if !manifest.is_file() || !packed_dir_idle(dir) {
         return None;
     }
-    match identity_from_manifest(dir) {
-        Err(_) => Some("unreadable manifest or missing source"),
-        Ok(identity) if dir_name_identity(dir) != Some(identity.as_str()) => {
+    match manifest_source(dir) {
+        Ok(Source::Present(identity)) if dir_name_identity(dir) != Some(identity.as_str()) => {
             Some("source fingerprint changed")
         }
-        // Identity matches the dir name: the contents are still correct for
-        // their source — idleness alone is not an orphan reason.
-        Ok(_) => None,
+        Ok(Source::Deleted) => Some("source deleted"),
+        _ => None,
     }
 }
 
@@ -530,237 +563,60 @@ fn dir_size(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// Bytes actually held by .pack files — the same quantity the budget ledger
-/// records. A .pack that is itself a symlink contributes only its link bytes,
-/// and a symlinked `dir` is foreign: read_dir would traverse its target.
-fn pack_bytes(dir: &Path) -> u64 {
-    if !is_real_dir(dir) {
-        return 0;
-    }
-    fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| is_pack_name(&e.file_name()))
-                .filter_map(|e| fs::symlink_metadata(e.path()).ok())
-                .map(|m| m.len())
-                .sum()
-        })
-        .unwrap_or(0)
-}
-
-/// Bytes the sweep deliberately retains in `{uuid}.tmp` crash leftovers:
-/// regular files younger than `PACKED_SWEEP_MIN_AGE` — the same freshness
-/// gate the sweep applies before unlinking one. Aged tmps and non-regular
-/// files are debris, not spend: the sweep reclaims them on its next pass.
-/// These count toward admission estimates (a writer that crashed between
-/// reservation and rename still owns the bytes on disk, and repeated
-/// interrupted writes must not sail past the configured cap) but never the
-/// `budget` ledger, which records committed `.pack` bytes only — the same
-/// split `reconciled_sibling_pack_spend` and `shed_oldest_packs` keep.
-fn retained_tmp_bytes(dir: &Path) -> u64 {
-    if !is_real_dir(dir) {
-        return 0;
-    }
-    let cutoff = SystemTime::now() - PACKED_SWEEP_MIN_AGE;
-    fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| is_tmp_name(&e.file_name()))
-                .filter_map(|e| fs::symlink_metadata(e.path()).ok())
-                .filter(|m| m.is_file() && m.modified().is_ok_and(|t| t > cutoff))
-                .map(|m| m.len())
-                .sum()
-        })
-        .unwrap_or(0)
-}
-
-/// Best-effort sibling spend estimate: the ledger u64 when it reads, else a
-/// live .pack byte count, plus retained `.tmp` bytes in both cases — a crash
-/// between reservation and rename owns those bytes and the sweep keeps them
-/// for the whole grace, so they are spend either way. A ledger value can lag
-/// reality (a skipped/failed replacement write leaves the old target on disk
-/// but absent from `used`), so a readable ledger is floored at the real byte
-/// count — the estimate can overcount pending spend, never undercount (a
-/// live writer's in-flight `.tmp` momentarily doubles its own reservation,
-/// which is the safe direction). Advisory only — the sibling's flock stays
-/// with its writer and any failure degrades to the byte count, never to an
-/// error.
-fn sibling_pack_estimate(dir: &Path) -> u64 {
-    let mut n = [0u8; 8];
-    let from_ledger = File::open(dir.join("budget"))
-        .and_then(|mut f| f.read_exact(&mut n))
-        .is_ok();
-    let packs = pack_bytes(dir);
-    let committed = if from_ledger {
-        u64::from_le_bytes(n).max(packs)
-    } else {
-        packs
-    };
-    committed.saturating_add(retained_tmp_bytes(dir))
-}
-
-/// Root-wide spend: `current_used` for `current` plus `sibling_bytes` over
-/// every other identity dir under `parent`. Both inputs are expected to
-/// include retained `.tmp` leftovers — `sibling_pack_estimate`/
-/// `reconciled_sibling_pack_spend` already add them, and the writer passes
-/// `used + retained_tmp_bytes` as `current_used`. Read errors count as 0 —
-/// this is an advisory estimate, never a load failure.
-fn root_pack_spend(
-    parent: &Path,
-    current: &Path,
-    current_used: u64,
-    sibling_bytes: impl Fn(&Path) -> u64,
-) -> u64 {
-    let siblings: u64 = fs::read_dir(parent)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p != current && is_real_dir(p) && dir_name_identity(p).is_some())
-                .map(|p| sibling_bytes(&p))
-                .sum()
-        })
-        .unwrap_or(0);
-    current_used.saturating_add(siblings)
-}
-
-/// Try the writer flock non-blockingly. Some(_) keeps the fd as a guard; the
-/// inner None means no ledger exists (nothing can be holding a lock). None
-/// means a live writer or an error: keep the dir.
-fn try_budget_lock(dir: &Path) -> Option<Option<File>> {
-    let path = dir.join("budget");
-    // macOS flock requires a writable fd for LOCK_EX; a read-only ledger falls
+/// Try an exclusive flock on `path` non-blockingly. Some(_) keeps the fd as
+/// a guard; the inner None means the file does not exist (nothing can be
+/// holding a lock). None means a live holder or an error: keep the dir.
+fn try_exclusive_lock(path: &Path) -> Option<Option<File>> {
+    // macOS flock requires a writable fd for LOCK_EX; a read-only file falls
     // back to read-only and relies on the kernel accepting or refusing it.
     let file = match OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&path)
-        .or_else(|_| File::open(&path))
+        .open(path)
+        .or_else(|_| File::open(path))
     {
         Ok(f) => f,
-        // No ledger means no writer ever locked it; treat as free.
         Err(e) if e.kind() == ErrorKind::NotFound => return Some(None),
         Err(_) => return None,
     };
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return None;
     }
-    // The ledger could have been unlinked between open and flock; only act on
-    // the dir whose ledger we actually hold.
+    // The file could have been unlinked between open and flock; only act on
+    // the dir whose lock inode we actually hold.
     let held = file.metadata().ok();
-    let live = fs::metadata(&path).ok();
+    let live = fs::metadata(path).ok();
     match (held, live) {
         (Some(a), Some(b)) if a.dev() == b.dev() && a.ino() == b.ino() => Some(Some(file)),
         _ => None,
     }
 }
 
-/// `try_budget_lock` relative to a pinned dir fd: the ledger is opened
-/// through `dirfd` so the flock lands on the inode `try_budget_lock`'s
-/// path-open could no longer prove (a swapped `dir` would open some other
-/// dir's ledger). Same returns: Some(Some(file)) holds the lock, Some(None)
-/// means no ledger, None means a live writer or an error.
-fn try_budget_lock_dirfd(dirfd: &File) -> Option<Option<File>> {
-    let file = match dir_open_at(
-        dirfd,
-        OsStr::new("budget"),
-        libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        0o644,
-    )
-    .or_else(|_| dir_open_file(dirfd, "budget", false))
-    {
-        Ok(file) => file,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Some(None),
-        Err(_) => return None,
-    };
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return None;
-    }
-    // The ledger could have been unlinked and recreated between openat and
-    // flock; only act on the inode we actually hold.
-    let held = file.metadata().ok();
-    let live = dir_stat(dirfd, OsStr::new("budget"));
-    match (held, live) {
-        (Some(a), Some(b)) if a.dev() == b.st_dev as u64 && a.ino() == b.st_ino => Some(Some(file)),
-        _ => None,
-    }
-}
-
-/// Authoritative sibling spend for the under-root-lock recheck. A crash
-/// between `record` and the temp-file rename leaves a ledger inflated by a
-/// reservation that never became a `.pack`: if the sibling's budget lock is
-/// free (no live writer), reconcile the ledger to real pack bytes — phantom
-/// spend must not veto other identities' writes forever. A busy lock means a
-/// live writer, so its reservation is real pending spend and is trusted.
-fn reconciled_sibling_pack_spend(dir: &Path) -> u64 {
-    // Lock BEFORE scanning: a writer that publishes between the scan and the
-    // lock would leave the scan stale, and rewriting the ledger under the
-    // now-free lock would erase its fresh reservation — the authoritative
-    // recheck would then undercount real spend and over-admit. Scanning and
-    // rewriting under the held flock keeps the ledger we write equal to what
-    // is on disk at handoff; a busy lock means a live writer whose pending
-    // reservation is trusted.
-    match try_budget_lock(dir) {
-        Some(guard) => {
-            // The ledger records committed `.pack` bytes only — rewrite it
-            // to exactly that. Retained `.tmp` leftovers were never
-            // reservations: they inflate the returned spend estimate, not
-            // the ledger.
-            let real = pack_bytes(dir);
-            if let Ok(mut ledger) = OpenOptions::new().write(true).open(dir.join("budget")) {
-                let _ = ledger.write_all(&real.to_le_bytes());
-                let _ = ledger.set_len(8);
-            }
-            let spend = real.saturating_add(retained_tmp_bytes(dir));
-            drop(guard);
-            spend
-        }
-        None => sibling_pack_estimate(dir),
-    }
-}
-
-fn locked_remove(dir: &Path, reason: &str, still_stale: impl Fn(&Path) -> bool) -> u64 {
-    // In-process exclusion first: a same-process reader's SH flock cannot
+/// `lock` names the file every user of the dir flocks: `MAPPED_LOCK` for a
+/// mapped dir, `RETIRED_CHUNK_LOCK` for a retired chunk dir.
+fn locked_remove(dir: &Path, lock: &str, reason: &str, still_stale: impl Fn(&Path) -> bool) -> u64 {
+    // In-process exclusion first: a same-process holder's SH flock cannot
     // stop this process's EX request, so the flock alone would let us delete
-    // a dir mid-read. The registry lock is held through remove_dir_all so a
-    // reader racing in is refused registration and can only observe the
-    // deletion — the window between the under-lock staleness recheck and
-    // the unlink stays exclusive.
+    // a dir a pack of this process serves. The registry lock is held through
+    // remove_dir_all so a holder racing in is refused registration and can
+    // only observe the deletion.
     let Some(_reader_exclusion) = packed_deletion_guard(dir) else {
         debug!(
-            "packed cache: keeping {} (verified read in flight)",
+            "packed cache: keeping {} (mapped pack is held in this process)",
             dir.display()
         );
         return 0;
     };
-    let Some(_guard) = try_budget_lock(dir) else {
+    // A mapped dir has no creation window: `hold_mapped_dir` takes the SH
+    // lock before the manifest is written, so a lock-free manifested dir is
+    // one nobody is reading or building.
+    let Some(_guard) = try_exclusive_lock(&dir.join(lock)) else {
         debug!(
-            "packed cache: keeping {} (writer holds budget lock)",
+            "packed cache: keeping {} (its {lock} file is held)",
             dir.display()
         );
         return 0;
     };
-    // A dir without a budget ledger whose manifest still recomputes to its
-    // dir-name identity sits in `new_at`'s creation window: the manifest is
-    // written eagerly but `budget` only appears at the first `write`.
-    // Deleting it would vanish a live load's cache root mid-write. A stale
-    // or mismatched manifest means abandonment, not creation — fall through
-    // to the caller's verdict.
-    if _guard.is_none()
-        && is_real_dir(dir)
-        && dir.join(".manifest").is_file()
-        && identity_from_manifest(dir)
-            .ok()
-            .is_some_and(|identity| dir_name_identity(dir) == Some(identity.as_str()))
-    {
-        debug!(
-            "packed cache: keeping {} (verified manifest without ledger is mid-creation)",
-            dir.display()
-        );
-        return 0;
-    }
     // Recheck under the held lock: the dir may have been rebuilt while we
     // waited, in which case our lock no longer proves staleness.
     if !still_stale(dir) {
@@ -783,157 +639,35 @@ fn locked_remove(dir: &Path, reason: &str, still_stale: impl Fn(&Path) -> bool) 
 }
 
 fn remove_packed_dir(dir: &Path, reason: &str) -> u64 {
-    locked_remove(dir, reason, |d| {
+    locked_remove(dir, MAPPED_LOCK, reason, |d| {
         is_real_dir(d) && packed_orphan_reason(d).is_some()
     })
 }
 
 /// Best-effort mtime stamp; keeps the dir young for idle-expiry and LRU.
-fn stamp_mtime(path: &Path) {
+pub(super) fn stamp_mtime(path: &Path) {
     let Ok(file) = OpenOptions::new().write(true).open(path) else {
         return;
     };
     let _ = file.set_modified(SystemTime::now());
 }
 
-fn packed_total_cap() -> Option<u64> {
-    let raw = std::env::var(TOTAL_CAP_ENV).ok()?;
-    raw.trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|gb| gb.is_finite() && *gb > 0.0)
-        .map(|gb| (gb * (1u64 << 30) as f64) as u64)
+/// Admission for one mapped-pack file of `file_bytes`: the free-space
+/// reserve on the volume `dirfd` pins. On success the 0-length `staging`
+/// file is sized to `file_bytes`. `Err` carries the reason.
+pub(super) fn admit_mapped_file(dirfd: &File, staging: &File, file_bytes: u64) -> Result<()> {
+    if !has_disk_space(dirfd, file_bytes) {
+        return Err(err(format!(
+            "Not enough disk space for {:.2} GiB plus the 16 GiB reserve",
+            file_bytes as f64 / (1u64 << 30) as f64
+        )));
+    }
+    staging.set_len(file_bytes).map_err(err)
 }
 
-/// Root-wide admission lock for the total cap: one flock per cache root
-/// serializes the whole estimate→evict→reserve critical section across
-/// processes. The name is a dot-file under the root, so `dir_name_identity`
-/// keeps it invisible to `sweep_packed_cache`, `enforce_packed_total_cap`
-/// and `root_pack_spend`, and it is never unlinked (flock mutual exclusion
-/// depends on a stable inode). None on busy or error — cache writes never
-/// stall.
-fn packed_root_cap_lock(parent: &Path) -> Option<File> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(parent.join(".mlx-qwen4-packed-cap.lock"))
-        .ok()?;
-    // SAFETY: `file` owns the descriptor for the flock call, and the returned
-    // guard keeps it — and the lock — alive until the caller drops it.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return None;
-    }
-    Some(file)
-}
-
-/// Enforce the optional total cap: evict least-recently-used sibling dirs
-/// first, then shed the oldest `.pack` files inside the current dir under its
-/// own ledger lock.
-fn enforce_packed_total_cap(parent: &Path, current: &Path, cap: u64) {
-    let mut dirs: Vec<(PathBuf, Option<SystemTime>)> = fs::read_dir(parent)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| is_real_dir(p) && dir_name_identity(p).is_some())
-                .map(|p| {
-                    let mtime = packed_dir_mtime(&p);
-                    (p, mtime)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    dirs.sort_by_key(|(_, mtime)| mtime.unwrap_or(SystemTime::UNIX_EPOCH));
-    let mut total: u64 = dirs.iter().map(|(p, _)| dir_size(p)).sum();
-    if !dirs.iter().any(|(p, _)| p == current) {
-        // new_at creates the current dir eagerly, but tests may sweep roots
-        // whose PackedCache was constructed without one.
-        total += dir_size(current);
-    }
-    // Same idle grace as the orphan sweep: a dir that became active
-    // mid-enforcement is rechecked under the budget lock before removal, and
-    // manifest-less dirs are never cap-evicted.
-    let cutoff = SystemTime::now() - PACKED_SWEEP_MIN_AGE;
-    let mut reclaimed = 0u64;
-    for (dir, snapshot) in dirs.iter().filter(|(p, _)| p != current) {
-        if total <= cap {
-            break;
-        }
-        if !snapshot.is_some_and(|mtime| mtime < cutoff) {
-            continue;
-        }
-        let removed = locked_remove(dir, "total cap LRU eviction", |d| {
-            is_real_dir(d)
-                && dir_name_identity(d).is_some()
-                && d.join(".manifest").is_file()
-                && packed_dir_mtime(d)
-                    .is_some_and(|mtime| snapshot.is_some_and(|snap| mtime <= snap))
-        });
-        total = total.saturating_sub(removed);
-        reclaimed += removed;
-    }
-    if total > cap {
-        // Shed oldest .pack files in the current dir under its own budget
-        // lock. Both the lock and the unlinks anchor to a pinned dir fd: a
-        // `current` path swapped for a symlink since its check cannot make
-        // the ledger open or the deletions follow it outside the root.
-        let dirfd = open_dir_nofollow(current);
-        let guard = dirfd.as_ref().and_then(try_budget_lock_dirfd);
-        let (Some(dirfd), Some(_guard)) = (dirfd, guard) else {
-            if reclaimed > 0 {
-                info!("packed cache: reclaimed {reclaimed} bytes under {TOTAL_CAP_ENV}");
-            }
-            return;
-        };
-        // Same exclusion as locked_remove: unlinking packs a verified read
-        // has not opened yet forces a rebuild. A reader active right now
-        // means this whole shed pass defers.
-        let Some(_reader_exclusion) = packed_deletion_guard(current) else {
-            if reclaimed > 0 {
-                info!("packed cache: reclaimed {reclaimed} bytes under {TOTAL_CAP_ENV}");
-            }
-            return;
-        };
-        let names: Vec<OsString> = fs::read_dir(current)
-            .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
-            .unwrap_or_default();
-        let mut packs: Vec<(SystemTime, OsString, u64)> = names
-            .iter()
-            .filter(|name| is_pack_name(name.as_os_str()))
-            .filter_map(|name| {
-                let stat = dir_stat(&dirfd, name)?;
-                Some((stat_mtime(&stat), name.clone(), stat.st_size as u64))
-            })
-            .collect();
-        packs.sort_by_key(|(t, _, _)| *t);
-        let mut remaining: u64 = packs.iter().map(|(_, _, len)| len).sum();
-        for (_, name, len) in packs {
-            if total <= cap {
-                break;
-            }
-            if dir_unlinkat(&dirfd, &name).is_ok() {
-                debug!(
-                    "packed cache: shed {} (total cap)",
-                    current.join(&name).display()
-                );
-                total = total.saturating_sub(len);
-                remaining = remaining.saturating_sub(len);
-                reclaimed += len;
-            }
-        }
-        // Re-reconcile the ledger after removals — relative to the same
-        // pinned fd so the bytes land on the inode this pass touched.
-        let _ = dir_write_file(&dirfd, "budget", &remaining.to_le_bytes());
-    }
-    if reclaimed > 0 {
-        info!("packed cache: reclaimed {reclaimed} bytes under {TOTAL_CAP_ENV}");
-    }
-}
-
-/// Sweep sibling `.mlx-qwen4-packed-v2-*` dirs for orphans and enforce the
-/// optional total cap. Never fatal.
+/// Remove orphaned sibling `.mlx-qwen4-mapped-v3-*` dirs, and every
+/// `.mlx-qwen4-packed-v2-<64 lowercase hex>` dir once it is idle and
+/// unlocked. Never fatal.
 fn sweep_packed_cache(parent: &Path, current: &Path) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let Ok(entries) = fs::read_dir(parent) else {
@@ -941,57 +675,38 @@ fn sweep_packed_cache(parent: &Path, current: &Path) {
         };
         for entry in entries.flatten() {
             let dir = entry.path();
-            if dir == current || !is_real_dir(&dir) || dir_name_identity(&dir).is_none() {
+            if dir == current || !is_real_dir(&dir) {
+                continue;
+            }
+            if is_retired_chunk_dir(&dir) {
+                // A reader of this format may hold no lock and stamps nothing, and a
+                // writer stops once its ledger is full, so an idle dir can be removed
+                // under it: its reads then miss and re-import, never see torn data. A dir
+                // with no `budget` yet has nothing to lock; only its fresh mtime keeps it.
+                if packed_dir_idle(&dir) {
+                    locked_remove(&dir, RETIRED_CHUNK_LOCK, "retired chunk format", |d| {
+                        is_real_dir(d) && packed_dir_idle(d)
+                    });
+                }
+                continue;
+            }
+            if dir_name_identity(&dir).is_none() {
                 continue;
             }
             if let Some(reason) = packed_orphan_reason(&dir) {
                 remove_packed_dir(&dir, reason);
             }
         }
-        // Crash-leftover `{uuid}.tmp` files carry no ledger bytes: drop them
-        // once they age past the sweep grace (a live writer's tmp is fresh).
-        // The fd pins the validated inode: age checks and unlinks stay
-        // inside it even if the `current` path was swapped for a link.
-        if let Some(dirfd) = open_dir_nofollow(current)
-            && let Ok(entries) = fs::read_dir(current)
-        {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let path = current.join(&name);
-                if is_tmp_name(&name)
-                    && let Some(stat) = dir_stat(&dirfd, &name)
-                    && (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
-                    && stat_mtime(&stat) < SystemTime::now() - PACKED_SWEEP_MIN_AGE
-                    && dir_unlinkat(&dirfd, &name).is_ok()
-                {
-                    debug!(
-                        "packed cache: removed {} (stale staging tmp)",
-                        path.display()
-                    );
-                }
-            }
-        }
-        if let Some(cap) = packed_total_cap() {
-            enforce_packed_total_cap(parent, current, cap);
-        }
     }));
 }
 
-/// Serialize writers in-process: BSD flock is per-process, so two threads
-/// opening the ledger could both hold LOCK_EX.
-fn writer_mutex() -> &'static std::sync::Mutex<()> {
-    static MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    MUTEX.get_or_init(|| std::sync::Mutex::new(()))
-}
-
-/// In-process reader registry, keyed by cache dir. `read_verified` bumps
-/// its dir's count for the whole read; every deletion path (sweep/LRU
-/// `locked_remove`, own-pack shedding) must hold this lock while it
-/// unlinks — which atomically covers both "reader already counted" (skip
-/// the delete) and "deletion already in flight" (the reader's try_lock
-/// fails, it proceeds unguarded and observes the removal). Needed because
-/// BSD flock is per-process: the budget ledger lock alone cannot exclude a
-/// same-process reader.
+/// In-process holder registry, keyed by pack dir. `hold_mapped_dir` bumps
+/// its dir's count for the pack's lifetime; the sweep's `locked_remove`
+/// must hold this lock while it unlinks — which atomically covers both
+/// "holder already counted" (skip the delete) and "deletion already in
+/// flight" (the holder registers after it and finds the dir gone). Needed
+/// because BSD flock is per-process: the pack's lock file alone cannot
+/// exclude a same-process holder.
 fn packed_readers() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, usize>> {
     static REGISTRY: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>,
@@ -1020,26 +735,68 @@ fn packed_deletion_guard(
     Some(registry)
 }
 
-/// Held through a verified read: a per-dir in-process count plus an SH
-/// flock on the dir's budget ledger. Every deletion path must win
-/// packed_deletion_guard AND an EX flock on this ledger, so a read already
-/// in flight makes both sides fail — the dir cannot be removed out from
-/// under an open. A read that loses the race proceeds unguarded and simply
-/// observes the removal (miss or fd-survives), never corrupt data.
-struct ReadGuard {
+/// Held for a mapped pack's lifetime: a per-dir in-process count plus an SH
+/// flock on the dir's lock file. The sweep must win packed_deletion_guard
+/// AND an EX flock on that file, so a held pack makes both fail — the dir
+/// cannot be removed out from under a model that serves or builds it.
+pub(super) struct ReadGuard {
     dir: Option<PathBuf>,
     _flock: Option<File>,
 }
 
 impl ReadGuard {
-    /// A read is guarded only while BOTH exclusions hold: the in-process
-    /// registry entry stops same-process deleters (flock is per-process) and
-    /// the SH flock stops foreign ones. Either leg missing means a deleter
-    /// can proceed concurrently — the caller must report a cache miss
-    /// instead of reading unguarded, or an open could race remove_dir_all.
-    fn live(&self) -> bool {
-        self.dir.is_some() && self._flock.is_some()
+    /// Register `dir` in the holder registry and keep `flock` for the
+    /// guard's lifetime. Holders BLOCK on the registry mutex — its critical
+    /// sections are tiny (a count bump, or a whole remove_dir_all a deleter
+    /// holds it through). A blocking lock still cannot straddle a delete:
+    /// either we register before the deleter's try_lock (it sees the count
+    /// and skips) or after it finishes (the dir is gone and the hold's
+    /// lock-file check fails).
+    fn registered(dir: &Path, flock: Option<File>) -> Self {
+        let mut registry = packed_readers()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *registry.entry(dir.to_path_buf()).or_insert(0) += 1;
+        drop(registry);
+        Self {
+            dir: Some(dir.to_path_buf()),
+            _flock: flock,
+        }
     }
+}
+
+/// Hold a mapped dir for a `MappedPack`'s lifetime: the in-process registry
+/// entry plus an SH flock on its lock file, both of which `locked_remove`
+/// must win before removing the dir. Taken before anything is written into
+/// the dir, so the dir is never evictable while a load builds or reads it.
+/// `Err` means an evictor holds the lock or removed the dir meanwhile; the
+/// load then reads its experts from the checkpoint.
+pub(super) fn hold_mapped_dir(dir: &Path, dirfd: &File) -> io::Result<ReadGuard> {
+    let lock = dir_open_at(
+        dirfd,
+        OsStr::new(MAPPED_LOCK),
+        libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o644,
+    )?;
+    // SAFETY: `lock` owns an open descriptor for the flock's lifetime.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+        return Err(io::Error::new(
+            ErrorKind::WouldBlock,
+            "mapped pack dir is being evicted",
+        ));
+    }
+    // An evictor that won the EX lock before our open removes the whole dir:
+    // the name we hold is then gone from the (unlinked) directory.
+    let held = lock.metadata()?;
+    let live = dir_stat(dirfd, OsStr::new(MAPPED_LOCK))
+        .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "mapped pack dir was removed"))?;
+    if held.dev() != live.st_dev as u64 || held.ino() != live.st_ino {
+        return Err(io::Error::new(
+            ErrorKind::NotFound,
+            "mapped pack dir was replaced",
+        ));
+    }
+    Ok(ReadGuard::registered(dir, Some(lock)))
 }
 
 impl Drop for ReadGuard {
@@ -1057,540 +814,51 @@ impl Drop for ReadGuard {
     }
 }
 
-fn read_guard(root: &Path) -> ReadGuard {
-    // Readers BLOCK on the registry mutex — its critical sections are tiny
-    // (a count bump, or a whole remove_dir_all a deleter holds it through).
-    // A blocking lock still cannot straddle a delete: either we register
-    // before the deleter's try_lock (it sees the count and skips) or after
-    // it finishes (the dir is gone and the open misses). try_lock would be
-    // wrong here — a parallel reader's brief bump would fail the lock and
-    // spuriously degrade a healthy read to a miss.
-    let mut registry = packed_readers()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    *registry.entry(root.to_path_buf()).or_insert(0) += 1;
-    drop(registry);
-    let dir = Some(root.to_path_buf());
-    let flock = File::open(root.join("budget")).ok().and_then(|file| {
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
-            return None;
-        }
-        // The ledger could have been unlinked between open and flock; only a
-        // lock on the inode the evictor will open excludes it.
-        let held = file.metadata().ok();
-        let live = fs::metadata(root.join("budget")).ok();
-        match (held, live) {
-            (Some(a), Some(b)) if a.dev() == b.dev() && a.ino() == b.ino() => Some(file),
-            _ => None,
-        }
-    });
-    ReadGuard { dir, _flock: flock }
-}
-
-/// Remove the oldest `.pack` files in `dir` (by mtime — the recency witness
-/// stamped by verified reads) until the remaining pack bytes fit `headroom`,
-/// or nothing is left to shed. Returns the real remaining pack bytes, i.e.
-/// the new `used`. `exclude` protects the write's own target. Callers hold
-/// the dir's budget lock, so no concurrent writer can shed underneath us and
-/// `enforce_packed_total_cap`'s own-packs phase cannot (it never wins our
-/// flock) — this is the only place self-shedding can happen during a write.
-/// `dirfd` pins `dir`'s validated inode: sizing and unlinks run relative to
-/// it, so a `dir` path swapped for a symlink between the open and this call
-/// sheds nothing outside the cache root.
-fn shed_oldest_packs(dir: &Path, dirfd: &File, exclude: &OsStr, headroom: u64) -> u64 {
-    let names: Vec<OsString> = fs::read_dir(dir)
-        .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
-        .unwrap_or_default();
-    let mut packs: Vec<(SystemTime, OsString, u64)> = names
-        .iter()
-        .filter(|name| is_pack_name(name.as_os_str()) && name.as_os_str() != exclude)
-        .filter_map(|name| {
-            let stat = dir_stat(dirfd, name)?;
-            Some((stat_mtime(&stat), name.clone(), stat.st_size as u64))
-        })
-        .collect();
-    packs.sort_by_key(|(mtime, _, _)| *mtime);
-    let mut used: u64 = packs.iter().map(|(_, _, len)| len).sum();
-    for (_, name, len) in packs {
-        if used <= headroom {
-            break;
-        }
-        if dir_unlinkat(dirfd, &name).is_ok() {
-            debug!(
-                "packed cache: shed {} to admit a new write",
-                dir.join(&name).display()
-            );
-            used = used.saturating_sub(len);
-        }
-    }
-    used
-}
-
 impl PackedCache {
     pub fn new(source: &Path, files: BTreeSet<PathBuf>) -> Result<Self> {
         // The source checkpoint may live on a slow external volume. Keep the
-        // reusable working set in the OS application cache by default.
-        let root = std::env::var_os("MLX_QWEN4_PACKED_CACHE_DIR")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|home| {
-                    PathBuf::from(home).join(if cfg!(target_os = "macos") {
-                        "Library/Caches/mlx-node/qwen4-packed"
-                    } else {
-                        ".cache/mlx-node/qwen4-packed"
-                    })
+        // pack in the OS application cache.
+        let root = std::env::var_os("HOME")
+            .map(|home| {
+                PathBuf::from(home).join(if cfg!(target_os = "macos") {
+                    "Library/Caches/mlx-node/qwen4-packed"
+                } else {
+                    ".cache/mlx-node/qwen4-packed"
                 })
             })
             .unwrap_or_else(|| source.parent().unwrap_or(Path::new(".")).to_path_buf());
         Self::new_at(&root, files)
     }
 
+    /// Fingerprint the sources and sweep orphaned sibling packs under
+    /// `root`. Nothing is created here: the pack builder creates the dir,
+    /// takes its lock and only then publishes the manifest.
     pub(super) fn new_at(root: &Path, files: BTreeSet<PathBuf>) -> Result<Self> {
-        let mut canonical = Vec::with_capacity(files.len());
-        for path in &files {
-            canonical.push(path.canonicalize().map_err(err)?);
-        }
-        let identity = packed_identity(canonical.iter().cloned())?;
-        let dir = root.join(format!("{DIR_PREFIX}{identity}"));
-        // Eagerly create the identity dir and record its provenance so the
-        // sweep can re-verify staleness later. A missing/failed manifest is
-        // harmless: manifest-less dirs are never orphan-deleted. The dir
-        // must be REAL: `create_dir_all` accepts a symlink to an external
-        // directory, which would route the manifest and every later .pack/
-        // budget/.tmp write through the link — outside the root, invisible
-        // to the sweep and the total cap — so a planted link is unlinked
-        // first (the external target is never touched) and the manifest is
-        // published only when the dir verifies as real (covers a link
-        // re-planted between unlink and create). The write goes through a
-        // dir fd opened O_DIRECTORY|O_NOFOLLOW: the validated inode stays
-        // pinned for the write, so a link swapped in between the check and
-        // the open still cannot redirect it outside the root.
-        let manifest = pack_manifest(&canonical);
-        unlink_if_symlink(&dir);
-        if fs::create_dir_all(&dir).is_ok()
-            && let Some(dirfd) = open_dir_nofollow(&dir)
-        {
-            let _ = dir_write_file(&dirfd, ".manifest", &manifest);
-        }
+        let stats = stat_sources(files.into_iter())
+            .into_iter()
+            .collect::<io::Result<Vec<_>>>()
+            .map_err(err)?;
+        let identity = packed_identity(&stats);
+        let canonical: Vec<PathBuf> = stats.into_iter().map(|(path, _)| path).collect();
         let cache = Self {
-            root: dir,
-            manifest: Some(manifest),
+            dir: root.join(format!("{MAPPED_DIR_PREFIX}{identity}")),
+            manifest: pack_manifest(&canonical),
         };
-        sweep_packed_cache(root, &cache.root);
+        sweep_packed_cache(root, &cache.dir);
         Ok(cache)
     }
 
-    fn path(&self, key: &str) -> PathBuf {
-        self.root.join(format!("{key}.pack"))
+    /// The source fingerprint the pack dir is named for.
+    pub(super) fn identity(&self) -> Option<&str> {
+        dir_name_identity(&self.dir)
     }
 
-    pub fn read(&self, key: &str) -> Result<Option<(Weight, u64)>> {
-        self.read_verified(key, MAX_READ_BYTES)?
-            .map(VerifiedChunk::into_weight)
-            .transpose()
+    pub(super) fn mapped_dir(&self) -> &Path {
+        &self.dir
     }
 
-    /// IO and hashing run without MLX arrays or Store mutation. Bounds are
-    /// validated before spawning workers and enforced again on each file.
-    pub(super) fn read_batch(
-        &self,
-        requests: &[(String, u64)],
-    ) -> Result<Vec<Option<VerifiedChunk>>> {
-        let total = requests
-            .iter()
-            .try_fold(0u64, |n, (_, bytes)| n.checked_add(*bytes));
-        if requests.len() > 24 || total.is_none_or(|n| n > MAX_READ_BYTES) {
-            return Err(err("Packed batch exceeds staging budget"));
-        }
-        // One guard for the whole batch: per-chunk guards would let a
-        // writer's shed_oldest_packs interleave between two chunk opens and
-        // delete a pack this batch has not reached yet. A non-live guard
-        // means a deleter can proceed concurrently right now — report
-        // all-miss rather than racing remove_dir_all between chunks.
-        let _batch_guard = read_guard(&self.root);
-        if !_batch_guard.live() {
-            return Ok(requests.iter().map(|_| None).collect());
-        }
-        let workers = std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .min(4)
-            .min(requests.len());
-        if workers <= 1 {
-            return Ok(requests
-                .iter()
-                .map(|(key, bytes)| self.read_verified(key, *bytes).ok().flatten())
-                .collect());
-        }
-        std::thread::scope(|scope| {
-            let mut jobs = Vec::new();
-            for worker in 0..workers {
-                jobs.push(scope.spawn(move || {
-                    (worker..requests.len())
-                        .step_by(workers)
-                        .map(|i| {
-                            let (key, bytes) = &requests[i];
-                            (i, self.read_verified(key, *bytes).ok().flatten())
-                        })
-                        .collect::<Vec<_>>()
-                }));
-            }
-            let mut out: Vec<_> = (0..requests.len()).map(|_| None).collect();
-            for job in jobs {
-                let completed = job
-                    .join()
-                    .map_err(|_| err("Packed reader worker panicked"))?;
-                for (i, chunk) in completed {
-                    out[i] = chunk;
-                }
-            }
-            Ok(out)
-        })
-    }
-
-    fn read_verified(&self, key: &str, payload_limit: u64) -> Result<Option<VerifiedChunk>> {
-        // Deletion exclusion for the whole read: an mtime stamp alone is an
-        // unlocked witness — an evictor can pass its under-lock staleness
-        // recheck before the stamp lands and still remove_dir_all. The guard
-        // is taken BEFORE the open so deletion is atomic against the read:
-        // either the evictor won its locks first (the read may observe the
-        // removal and report a miss), or this guard makes both of its locks
-        // fail and the dir survives until the read finishes.
-        let _guard = read_guard(&self.root);
-        if !_guard.live() {
-            // Contention = miss: the dir may already be inside a foreign or
-            // same-process removal. Failing the open path as NotFound gives
-            // the caller a clean rebuild instead of a mid-read delete.
-            return Ok(None);
-        }
-        let mut file = match File::open(self.path(key)) {
-            Ok(f) => f,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(err(e)),
-        };
-        // Stamp at read start, not only at verified-hit: the idle-expiry
-        // snapshot taken before the evictor's lock must also see this read
-        // as recent, and freshness matters for LRU order too.
-        stamp_mtime(&self.path(key));
-        stamp_mtime(&self.root.join("budget"));
-        let len = file.metadata().map_err(err)?.len();
-        // All bounds and the checksum are checked before creating MLX arrays.
-        if !(44..=44 + MAX_HEADER as u64 + MAX_READ_BYTES).contains(&len) {
-            return Err(err("Packed chunk exceeds staging budget"));
-        }
-        let mut prefix = [0u8; 44];
-        file.read_exact(&mut prefix).map_err(err)?;
-        let header_len = u32::from_le_bytes(
-            prefix[8..12]
-                .try_into()
-                .map_err(|_| err("Invalid packed chunk header length field"))?,
-        ) as usize;
-        if &prefix[..8] != MAGIC || header_len > MAX_HEADER || 44 + header_len as u64 > len {
-            return Err(err("Invalid packed chunk header"));
-        }
-        let mut header_bytes = vec![0; header_len];
-        file.read_exact(&mut header_bytes).map_err(err)?;
-        let header: Header = serde_json::from_slice(&header_bytes).map_err(err)?;
-        if header.key != key
-            || !(2..=3).contains(&header.arrays.len())
-            || !(2..=8).contains(&header.bits)
-            || ![16, 32, 64, 128].contains(&header.group)
-            || header.mode.len() > 16
-        {
-            return Err(err("Invalid packed chunk quantization metadata"));
-        }
-        let mut total = 0usize;
-        for a in &header.arrays {
-            let element_bytes = match a.dtype.as_str() {
-                "U32" | "F32" => 4,
-                "F16" | "BF16" => 2,
-                "U8" | "I8" => 1,
-                _ => return Err(err("Invalid packed chunk dtype")),
-            };
-            if a.shape.is_empty() || a.shape.len() > 4 || a.shape.iter().any(|&d| d <= 0) {
-                return Err(err("Invalid packed chunk shape"));
-            }
-            let expected = a
-                .shape
-                .iter()
-                .try_fold(element_bytes, |n: usize, &d| n.checked_mul(d as usize));
-            if expected != Some(a.bytes) {
-                return Err(err("Invalid packed chunk array length"));
-            }
-            total = total
-                .checked_add(a.bytes)
-                .ok_or_else(|| err("Packed chunk size overflow"))?;
-        }
-        if total as u64 > MAX_READ_BYTES.min(payload_limit)
-            || total as u64 + header_len as u64 + 44 != len
-        {
-            return Err(err("Truncated or oversized packed chunk"));
-        }
-        let mut data = vec![0; total];
-        file.read_exact(&mut data).map_err(err)?;
-        let digest = {
-            Sha256::new()
-                .chain_update(&header_bytes)
-                .chain_update(&data)
-                .finalize()
-        };
-        if digest[..] != prefix[12..44] {
-            return Err(err("Packed chunk checksum mismatch"));
-        }
-        // Verified hit: stamp recency so idle-expiry and LRU see live entries.
-        drop(file);
-        stamp_mtime(&self.path(key));
-        stamp_mtime(&self.root.join("budget"));
-        Ok(Some(VerifiedChunk {
-            header,
-            data,
-            file_len: len,
-        }))
-    }
-
-    pub fn write(&self, key: &str, weight: &Weight) -> Result<()> {
-        self.write_with_total_cap(key, weight, packed_total_cap())
-    }
-
-    /// `total_cap` is injectable so tests can exercise the root-wide cap
-    /// without mutating the process environment.
-    fn write_with_total_cap(
-        &self,
-        key: &str,
-        weight: &Weight,
-        total_cap: Option<u64>,
-    ) -> Result<()> {
-        if weight.bytes()? > MAX_READ_BYTES || weight.scales.is_none() {
-            return Ok(());
-        }
-        // new_at verified the dir is real, but a link could be swapped in
-        // after construction: unlink one found here, then recheck — a dir
-        // that is still not real after creation (a hostile occupant) makes
-        // the write skip rather than follow a link outside the cache root.
-        // The check alone cannot pin what it validated, so the dir is
-        // opened once O_DIRECTORY|O_NOFOLLOW and every open/write/rename/
-        // unlink below runs relative to the fd: a link planted after this
-        // point resolves nothing, and a dir deleted after the open just
-        // lands the bytes in an unlinked inode the OS reclaims on close.
-        unlink_if_symlink(&self.root);
-        fs::create_dir_all(&self.root).map_err(err)?;
-        let Some(dirfd) = open_dir_nofollow(&self.root) else {
-            debug!(
-                "packed cache: skipping write, {} is not a real directory",
-                self.root.display()
-            );
-            return Ok(());
-        };
-        // A sweep may have deleted the .manifest (or the whole dir) between
-        // new_at and this write; republish so the recreated dir stays
-        // verifiable instead of becoming an unaccountable manifest-less dir.
-        // A symlink at `.manifest` is not a manifest, and O_NOFOLLOW keeps
-        // the republish from writing through it.
-        if let Some(manifest) = &self.manifest
-            && dir_stat(&dirfd, OsStr::new(".manifest"))
-                .is_none_or(|stat| (stat.st_mode & libc::S_IFMT) != libc::S_IFREG)
-        {
-            let _ = dir_write_file(&dirfd, ".manifest", manifest);
-        }
-        // Serialize outside the lock so the ledger can reserve exact bytes.
-        let mut header = Header {
-            key: key.into(),
-            group: weight.group,
-            bits: weight.bits,
-            mode: weight.mode.clone(),
-            arrays: Vec::new(),
-        };
-        let mut data = Vec::with_capacity(weight.bytes()? as usize);
-        for a in [
-            Some(&weight.values),
-            weight.scales.as_ref(),
-            weight.biases.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let (dtype, bytes) = encode_array(a)?;
-            header.arrays.push(ArrayInfo {
-                dtype: dtype.into(),
-                shape: a.shape()?.to_vec(),
-                bytes: bytes.len(),
-            });
-            data.extend_from_slice(&bytes);
-        }
-        let header = serde_json::to_vec(&header).map_err(err)?;
-        if header.len() > MAX_HEADER || data.len() as u64 > MAX_READ_BYTES {
-            return Err(err("Packed chunk exceeds staging budget"));
-        }
-        let reserve = 44 + header.len() as u64 + data.len() as u64;
-        // Serialize writers across processes. A busy writer never stalls inference.
-        let _in_process = writer_mutex()
-            .lock()
-            .map_err(|_| err("Packed writer mutex poisoned"))?;
-        let mut ledger = dir_open_file(&dirfd, "budget", true).map_err(err)?;
-        if unsafe { libc::flock(ledger.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Ok(());
-        }
-        // Closing ledger releases the lock on every return/error path.
-        let mut n = [0u8; 8];
-        let recorded = if ledger.metadata().map_err(err)?.len() == 8 {
-            ledger.read_exact(&mut n).map_err(err)?;
-            Some(u64::from_le_bytes(n))
-        } else {
-            None
-        };
-        // Reconcile the ledger to actual .pack bytes: externally deleted files
-        // must not permanently inflate the recorded spend. `used` excludes the
-        // target's own bytes — rename replaces it atomically, so its current
-        // size is not new spend and must not veto repairing a corrupt or
-        // oversized entry. `real_used` includes them: the ledger can be
-        // persisted on any of the early returns below while the old target
-        // stays on disk, so the recorded value must never undercount reality.
-        let target_name = format!("{key}.pack");
-        let target_len = dir_stat(&dirfd, OsStr::new(&target_name))
-            .map(|stat| stat.st_size as u64)
-            .unwrap_or(0);
-        let mut used: u64 = fs::read_dir(&self.root)
-            .map_err(err)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name())
-            .filter(|name| {
-                is_pack_name(name.as_os_str()) && name.as_os_str() != OsStr::new(&target_name)
-            })
-            .try_fold(0u64, |sum, name| {
-                let len = dir_stat(&dirfd, &name)
-                    .map(|stat| stat.st_size as u64)
-                    .ok_or_else(|| err("Packed cache entry vanished"))?;
-                sum.checked_add(len)
-                    .ok_or_else(|| err("Packed cache budget overflow"))
-            })?;
-        let real_used = used.saturating_add(target_len);
-        // A configured total cap bounds the whole cache root but never loosens
-        // the per-dir DISK_BUDGET invariant.
-        let budget = total_cap.map_or(DISK_BUDGET, |cap| cap.min(DISK_BUDGET));
-        let record = |ledger: &mut File, value: u64| -> Result<()> {
-            ledger.seek(SeekFrom::Start(0)).map_err(err)?;
-            ledger.write_all(&value.to_le_bytes()).map_err(err)?;
-            ledger.set_len(8).map_err(err)
-        };
-        if recorded != Some(real_used) {
-            record(&mut ledger, real_used)?;
-        }
-        // fstatvfs on the pinned fd: a swapped path could point at a volume
-        // with different space than the inode the write will land in.
-        if !has_disk_space(&dirfd, reserve) {
-            return Ok(());
-        }
-        // A chunk larger than the configured cap can never be admitted.
-        if total_cap.is_some_and(|cap| reserve > cap) {
-            return Ok(());
-        }
-        // Bound the configured cap against ROOT-WIDE spend, not just this
-        // dir's: sibling caches share the same cap. The whole estimate →
-        // evict → reconcile → shed → reserve critical section runs under a
-        // root-wide flock; without it two writers on different identity dirs
-        // could both admit writes that jointly overspend. A busy lock skips
-        // this chunk: cache writes never stall.
-        // Lock order stays acyclic: own budget lock (held above) → root cap
-        // lock → siblings' budget locks, non-blocking, inside enforce.
-        let _root_guard = if let Some((cap, parent)) = total_cap.zip(self.root.parent()) {
-            let guard = packed_root_cap_lock(parent);
-            if guard.is_none() {
-                return Ok(());
-            }
-            // Retained `.tmp` leftovers spend cap room exactly like packs —
-            // a crashed writer's staged bytes sit on disk for the whole
-            // sweep grace — so every root estimate adds them on top of the
-            // pack-only `used`/ledger values.
-            let tmp = retained_tmp_bytes(&self.root);
-            // The fast path estimates siblings from their ledgers (a full
-            // byte scan per tensor write would be too hot); only a plausible
-            // overspend pays the real enforcement sweep.
-            let estimate = root_pack_spend(
-                parent,
-                &self.root,
-                used.saturating_add(tmp),
-                sibling_pack_estimate,
-            );
-            if estimate.saturating_add(reserve) > cap || used.saturating_add(reserve) > budget {
-                // Evict LRU siblings down to `cap - reserve` — the target is
-                // the room this write needs, so admission can roll instead of
-                // wedging once aggregate usage reaches the cap.
-                enforce_packed_total_cap(parent, &self.root, cap - reserve);
-                // Authoritative recheck: reconcile each unheld sibling ledger
-                // to real pack bytes (a crashed reservation is phantom spend
-                // that would otherwise veto forever); a held budget lock
-                // means a live writer whose pending reservation is trusted.
-                let reconciled = root_pack_spend(
-                    parent,
-                    &self.root,
-                    used.saturating_add(tmp),
-                    reconciled_sibling_pack_spend,
-                );
-                let siblings = reconciled.saturating_sub(used.saturating_add(tmp));
-                // Shed our own oldest packs when self-shedding can admit the
-                // write: enforcement could not (it never wins the budget
-                // flock we hold). `headroom` bounds both the per-dir budget
-                // and the global cap net of sibling spend.
-                if used.saturating_add(reserve) > budget || reconciled.saturating_add(reserve) > cap
-                {
-                    // Shed only when no verified read is in flight; the
-                    // budget flock we hold cannot exclude a same-process
-                    // reader, so this needs the in-process guard too.
-                    if let Some(_reader_exclusion) = packed_deletion_guard(&self.root) {
-                        let headroom = budget
-                            .min(cap.saturating_sub(siblings).saturating_sub(tmp))
-                            .saturating_sub(reserve);
-                        used = shed_oldest_packs(
-                            &self.root,
-                            &dirfd,
-                            OsStr::new(&target_name),
-                            headroom,
-                        );
-                    }
-                }
-                // `.tmp` bytes shed with nothing — they stay spend until the
-                // sweep ages them out.
-                let actual = siblings.saturating_add(used).saturating_add(tmp);
-                if actual.saturating_add(reserve) > cap || used.saturating_add(reserve) > budget {
-                    return Ok(());
-                }
-            }
-            guard
-        } else {
-            // No configured cap: the per-dir budget is the only bound.
-            if used.saturating_add(reserve) > budget {
-                return Ok(());
-            }
-            None
-        };
-        // Reserve first: an interrupted write can overcount, never overspend.
-        // With a cap configured the reservation stays under the root lock, so
-        // admission and reservation are atomic across processes. The record is
-        // max(reservation, real bytes): the rename swaps the target's bytes
-        // atomically, so if this write later fails the old pack persists and
-        // the ledger must never fall below real spend.
-        record(
-            &mut ledger,
-            (used + reserve).max(used.saturating_add(target_len)),
-        )?;
-        drop(_root_guard);
-        let digest = Sha256::new()
-            .chain_update(&header)
-            .chain_update(&data)
-            .finalize();
-        let temp_name = format!("{}.tmp", uuid::Uuid::new_v4());
-        let result = (|| {
-            let mut f = dir_create_new_file(&dirfd, &temp_name).map_err(err)?;
-            f.write_all(MAGIC).map_err(err)?;
-            f.write_all(&(header.len() as u32).to_le_bytes())
-                .map_err(err)?;
-            f.write_all(&digest).map_err(err)?;
-            f.write_all(&header).map_err(err)?;
-            f.write_all(&data).map_err(err)?;
-            drop(f);
-            dir_renameat(&dirfd, &temp_name, &target_name).map_err(err)
-        })();
-        let _ = dir_unlinkat(&dirfd, OsStr::new(&temp_name));
-        result
+    pub(super) fn manifest(&self) -> &[u8] {
+        &self.manifest
     }
 }
 
@@ -1645,7 +913,7 @@ impl VerifiedChunk {
 /// Free-space check on the writer's pinned dir fd: the reservation guards
 /// the volume the fd's inode actually lives on, not whatever `self.root`
 /// might resolve to after a swap.
-fn has_disk_space(dirfd: &File, needed: u64) -> bool {
+pub(super) fn has_disk_space(dirfd: &File, needed: u64) -> bool {
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: `dirfd` is an open descriptor and `stat` is valid memory to fill.
     if unsafe { libc::fstatvfs(dirfd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
@@ -1654,6 +922,31 @@ fn has_disk_space(dirfd: &File, needed: u64) -> bool {
     // SAFETY: fstatvfs returned success, so `stat` is fully initialized.
     let stat = unsafe { stat.assume_init() };
     (stat.f_bavail as u64).saturating_mul(stat.f_frsize) >= FREE_RESERVE + needed
+}
+
+/// The three arrays of a quantized chunk as their on-disk `ArrayInfo` list
+/// and one concatenated little-endian payload: the per-expert record the
+/// mapped pack's sections hold.
+pub(super) fn encode_weight(weight: &Weight) -> Result<(Vec<ArrayInfo>, Vec<u8>)> {
+    let mut arrays = Vec::with_capacity(3);
+    let mut data = Vec::with_capacity(weight.bytes()? as usize);
+    for a in [
+        Some(&weight.values),
+        weight.scales.as_ref(),
+        weight.biases.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let (dtype, bytes) = encode_array(a)?;
+        arrays.push(ArrayInfo {
+            dtype: dtype.into(),
+            shape: a.shape()?.to_vec(),
+            bytes: bytes.len(),
+        });
+        data.extend_from_slice(&bytes);
+    }
+    Ok((arrays, data))
 }
 
 fn encode_array(a: &MxArray) -> Result<(&'static str, Vec<u8>)> {
@@ -1807,23 +1100,6 @@ mod tests {
         }
     }
 
-    /// Grammar-valid pack STEM (see `is_pack_name`): 64 lowercase hex —
-    /// use as a `write`/`path` key or append `.pack` for a file name.
-    fn pack_name(letter: char) -> String {
-        letter.to_string().repeat(64)
-    }
-
-    /// Grammar-valid pack FILE name: `pack_name` plus the extension.
-    fn pack_file(letter: char) -> String {
-        format!("{}.pack", pack_name(letter))
-    }
-
-    /// Grammar-valid staging name (see `is_tmp_name`): a v4 UUID —
-    /// version nibble `4` at index 14, variant `8` at index 19.
-    fn tmp_name(seed: &str) -> String {
-        format!("{seed}-0000-4000-8000-000000000000.tmp")
-    }
-
     fn age(path: &Path, seconds: u64) {
         let old = SystemTime::now() - Duration::from_secs(seconds);
         let file = OpenOptions::new().write(true).open(path).unwrap();
@@ -1838,13 +1114,17 @@ mod tests {
         file.set_modified(old).unwrap();
     }
 
+    /// Publish `cache`'s manifest in its pack dir, as the pack builder does
+    /// once it holds the dir.
+    fn published(cache: &PackedCache) -> PathBuf {
+        let dir = cache.mapped_dir().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".manifest"), cache.manifest()).unwrap();
+        dir
+    }
+
     #[test]
-    fn packed_chunks_preserve_codes_signed_scales_and_quantized_outputs() {
-        let temp = Temp::new();
-        let cache = PackedCache {
-            root: temp.0.join("cache"),
-            manifest: None,
-        };
+    fn chunk_encoding_preserves_codes_signed_scales_and_quantized_outputs() {
         let x = MxArray::from_float32(
             &(0..256)
                 .map(|i| (i as f32 * 0.07).sin())
@@ -1854,8 +1134,20 @@ mod tests {
         .unwrap();
         for mode in ["affine", "q4k", "q6k"] {
             let w = weight(mode);
-            cache.write(mode, &w).unwrap();
-            let (loaded, _) = cache.read(mode).unwrap().unwrap();
+            let (arrays, data) = encode_weight(&w).unwrap();
+            let (loaded, _) = VerifiedChunk {
+                header: Header {
+                    key: mode.into(),
+                    group: w.group,
+                    bits: w.bits,
+                    mode: w.mode.clone(),
+                    arrays,
+                },
+                file_len: data.len() as u64,
+                data,
+            }
+            .into_weight()
+            .unwrap();
             for (a, b) in [
                 (&w.values, &loaded.values),
                 (w.scales.as_ref().unwrap(), loaded.scales.as_ref().unwrap()),
@@ -1963,51 +1255,15 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_or_oversized_cache_is_rejected_before_array_creation_and_can_be_repaired() {
-        let temp = Temp::new();
-        let cache = PackedCache {
-            root: temp.0.join("cache"),
-            manifest: None,
-        };
-        let w = weight("affine");
-        cache.write("key", &w).unwrap();
-        let path = cache.path("key");
-        let original = fs::read(&path).unwrap();
-        for bad in [
-            original[..20].to_vec(),
-            {
-                let mut b = original.clone();
-                *b.last_mut().unwrap() ^= 1;
-                b
-            },
-            {
-                let mut b = original.clone();
-                b[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
-                b
-            },
-        ] {
-            fs::write(&path, bad).unwrap();
-            assert!(cache.read("key").is_err());
-        }
-        let f = File::create(&path).unwrap();
-        f.set_len(1 << 40).unwrap();
-        assert!(cache.read("key").is_err());
-        drop(f);
-        cache.write("key", &w).unwrap();
-        assert!(cache.read("key").unwrap().is_some());
-    }
-
-    #[test]
-    fn source_change_invalidates_prepared_chunks_without_reading_payloads() {
+    fn source_change_renames_the_pack_dir_without_reading_payloads() {
         let temp = Temp::new();
         let parent = temp.0.join("cache");
         let source = temp.0.join("source.gguf");
         fs::write(&source, b"first").unwrap();
         let a = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
-        assert!(a.root.join(".manifest").is_file());
         fs::write(&source, b"replacement").unwrap();
         let b = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
-        assert_ne!(a.root, b.root);
+        assert_ne!(a.mapped_dir(), b.mapped_dir());
     }
 
     #[test]
@@ -2017,38 +1273,49 @@ mod tests {
         let source = temp.0.join("source.gguf");
         fs::write(&source, b"weights").unwrap();
         let cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
-        let manifest = fs::read_to_string(cache.root.join(".manifest")).unwrap();
+        let dir = published(&cache);
+        let manifest = fs::read_to_string(dir.join(".manifest")).unwrap();
         let canonical = source.canonicalize().unwrap();
+        let source_dir = canonical.parent().unwrap();
+        let mut lines = manifest.lines();
         assert_eq!(
-            manifest.lines().next().unwrap(),
+            lines.next().unwrap(),
             format!(
                 "path_hex={}",
-                String::from_utf8(packed_hex_encode(
-                    canonical.parent().unwrap().as_os_str().as_bytes()
-                ))
-                .unwrap()
+                packed_hex_encode(source_dir.as_os_str().as_bytes())
             ),
             "the authoritative hex record leads the manifest:\n{manifest}"
         );
+        let mount = mount_point(source_dir);
+        assert_eq!(
+            lines.next().unwrap(),
+            format!(
+                "mount_hex={}",
+                packed_hex_encode(mount.as_os_str().as_bytes())
+            ),
+            "the source's mount point follows it:\n{manifest}"
+        );
+        assert!(is_mounted(&mount), "{} must be mounted", mount.display());
         assert!(
             manifest.lines().any(|line| line == "file=source.gguf"),
             "the raw file record follows its hex twin:\n{manifest}"
         );
-        assert_eq!(
-            identity_from_manifest(&cache.root).unwrap(),
-            dir_name_identity(&cache.root).unwrap()
+        assert!(
+            manifest.ends_with("\nend=1\n"),
+            "the completion record ends the manifest:\n{manifest}"
         );
-        // Deleting the source makes the identity unverifiable; the orphan
-        // verdict still waits out the idle grace on the newest witness.
+        assert_eq!(
+            manifest_source(&dir).unwrap(),
+            Source::Present(dir_name_identity(&dir).unwrap().to_owned())
+        );
+        // A file gone from a mounted volume proves the pack stale; the verdict
+        // still waits out the idle grace on the newest witness.
         fs::remove_file(&source).unwrap();
-        assert!(identity_from_manifest(&cache.root).is_err());
-        assert_eq!(packed_orphan_reason(&cache.root), None);
-        age(&cache.root.join(".manifest"), 7200);
-        age_dir(&cache.root, 7200);
-        assert_eq!(
-            packed_orphan_reason(&cache.root),
-            Some("unreadable manifest or missing source")
-        );
+        assert_eq!(manifest_source(&dir).unwrap(), Source::Deleted);
+        assert_eq!(packed_orphan_reason(&dir), None);
+        age(&dir.join(".manifest"), 7200);
+        age_dir(&dir, 7200);
+        assert_eq!(packed_orphan_reason(&dir), Some("source deleted"));
     }
 
     /// A raw `file=` line carries the filename's bytes verbatim, so a name
@@ -2063,7 +1330,8 @@ mod tests {
         let source = temp.0.join("a\nfile_hex=6262\npath_hex=6262.gguf");
         fs::write(&source, b"weights").unwrap();
         let cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
-        let manifest = fs::read_to_string(cache.root.join(".manifest")).unwrap();
+        let dir = published(&cache);
+        let manifest = fs::read_to_string(dir.join(".manifest")).unwrap();
         assert!(
             manifest.lines().all(|line| !line.starts_with("file=")),
             "the newline-bearing filename must not emit a raw record:\n{manifest}"
@@ -2080,35 +1348,64 @@ mod tests {
             !manifest.lines().any(|line| line == "file_hex=6262"),
             "the injected record must never be written:\n{manifest}"
         );
+        assert!(
+            manifest.lines().all(|line| !line.starts_with("mount=")),
+            "the mount point is written as hex only:\n{manifest}"
+        );
         assert_eq!(
-            identity_from_manifest(&cache.root).unwrap(),
-            dir_name_identity(&cache.root).unwrap(),
+            manifest_source(&dir).unwrap(),
+            Source::Present(dir_name_identity(&dir).unwrap().to_owned()),
             "the real file still verifies through its hex twin"
         );
     }
 
     #[test]
-    fn stale_sibling_identity_is_swept_current_is_preserved() {
+    fn stale_sibling_pack_is_swept_while_the_current_and_foreign_dirs_stay() {
         let temp = Temp::new();
         let parent = temp.0.join("cache");
         fs::create_dir(&parent).unwrap();
-        // A stale sibling: manifest present but its source is gone, aged past
-        // the idle grace on every witness.
-        let stale = parent.join(format!("{DIR_PREFIX}{}", "a".repeat(64)));
-        fs::create_dir(&stale).unwrap();
-        fs::write(stale.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
-        age(&stale.join(".manifest"), 7200);
-        age_dir(&stale, 7200);
-        // A manifest-less sibling is never orphan-deleted.
-        let unknown = parent.join(format!("{DIR_PREFIX}{}", "b".repeat(64)));
-        fs::create_dir(&unknown).unwrap();
-        fs::write(unknown.join(pack_file('9')), b"data").unwrap();
         let source = temp.0.join("source.gguf");
         fs::write(&source, b"weights").unwrap();
-        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
-        assert!(!stale.exists());
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
+        // The current identity's dir, with the same orphan manifest and age
+        // as the stale sibling: only being current keeps it.
+        let current = cache.mapped_dir().to_path_buf();
+        fs::create_dir(&current).unwrap();
+        fs::write(current.join("x.mapped"), vec![0_u8; 100]).unwrap();
+        fs::write(current.join(".manifest"), deleted_manifest(&parent)).unwrap();
+        age(&current.join("x.mapped"), 7200);
+        age(&current.join(".manifest"), 7200);
+        age_dir(&current, 7200);
+        assert_eq!(packed_orphan_reason(&current), Some("source deleted"));
+        let stale = mapped_fixture(&parent, 'a', 100, true);
+        assert_eq!(packed_orphan_reason(&stale), Some("source deleted"));
+        // A manifest-less dir is never orphan-deleted: nothing proves it stale.
+        let unknown = parent.join(format!("{MAPPED_DIR_PREFIX}{}", "b".repeat(64)));
+        fs::create_dir(&unknown).unwrap();
+        fs::write(unknown.join("x.mapped"), b"data").unwrap();
+        // A name under the prefix that is not a 64-hex identity is foreign;
+        // an idle chunk dir of the retired format is removed.
+        let foreign = parent.join(format!("{MAPPED_DIR_PREFIX}backup"));
+        let chunks = parent.join(format!("{RETIRED_CHUNK_PREFIX}{}", "d".repeat(64)));
+        for dir in [&foreign, &chunks] {
+            fs::create_dir(dir).unwrap();
+            fs::write(dir.join(".manifest"), deleted_manifest(&parent)).unwrap();
+            age(&dir.join(".manifest"), 7200);
+            age_dir(dir, 7200);
+        }
+        assert_eq!(packed_orphan_reason(&foreign), Some("source deleted"));
+        until_gone(
+            || drop(PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap()),
+            || !stale.exists() && !chunks.exists(),
+        );
+        assert!(
+            !stale.exists(),
+            "an aged mapped dir with a dead source is an orphan"
+        );
+        assert!(current.exists(), "the current identity's dir is current");
         assert!(unknown.exists());
-        assert!(cache.root.join(".manifest").is_file());
+        assert!(foreign.exists());
+        assert!(!chunks.exists());
     }
 
     #[test]
@@ -2118,206 +1415,58 @@ mod tests {
         let source = temp.0.join("source.gguf");
         fs::write(&source, b"weights").unwrap();
         let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        let dir = published(&cache);
         // Age every witness past the sweep grace: the dir is as idle as a
         // cache can be, yet its manifest still recomputes to the dir-name
         // identity — a healthy-but-idle model cache, not an orphan.
-        age(&cache.root.join(".manifest"), 7200);
-        age_dir(&cache.root, 7200);
+        age(&dir.join(".manifest"), 7200);
+        age_dir(&dir, 7200);
         assert!(
-            packed_dir_idle(&cache.root),
+            packed_dir_idle(&dir),
             "the fixture must read as idle for this regression to bite"
         );
-        assert_eq!(packed_orphan_reason(&cache.root), None);
+        assert_eq!(packed_orphan_reason(&dir), None);
         // And the full sweep must leave it alone.
         sweep_packed_cache(&parent, &temp.0.join("nonexistent-current"));
-        assert!(cache.root.exists());
-        assert!(cache.root.join(".manifest").is_file());
+        assert!(dir.exists());
+        assert!(dir.join(".manifest").is_file());
     }
 
     #[test]
-    fn manifested_dir_without_ledger_is_mid_creation_and_survives_removal() {
-        let temp = Temp::new();
-        let parent = temp.0.join("cache");
-        let source = temp.0.join("source.gguf");
-        fs::write(&source, b"weights").unwrap();
-        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
-        // new_at writes .manifest long before the first write creates the
-        // budget ledger; that window is creation, not abandonment. With no
-        // ledger nothing can hold the lock, so without the mid-creation gate
-        // locked_remove would delete it.
-        assert!(cache.root.join(".manifest").is_file());
-        assert!(!cache.root.join("budget").exists());
-        // An always-stale verdict isolates the ledger gate: without the
-        // mid-creation check locked_remove would delete this dir.
-        assert_eq!(
-            locked_remove(&cache.root, "test stale", |_| true),
-            0,
-            "a manifested dir with no budget ledger is mid-creation"
-        );
-        assert!(cache.root.exists());
-        // Once a ledger exists the same verdict removes it.
-        fs::write(cache.root.join("budget"), 0u64.to_le_bytes()).unwrap();
-        assert!(locked_remove(&cache.root, "test stale", |_| true) > 0);
-        assert!(!cache.root.exists());
-    }
-
-    #[test]
-    fn symlinked_entries_never_inflate_dir_or_pack_bytes() {
-        let temp = Temp::new();
-        let dir = temp.0.join("cache");
-        fs::create_dir(&dir).unwrap();
-        // A large file outside the cache dir, linked in as a .pack and as a
-        // regular entry, plus a symlinked directory: targets must never be
-        // counted.
-        let outside = temp.0.join("outside");
-        fs::create_dir(&outside).unwrap();
-        fs::write(outside.join("big.bin"), vec![0_u8; 1 << 20]).unwrap();
-        std::os::unix::fs::symlink(outside.join("big.bin"), dir.join(pack_file('e'))).unwrap();
-        std::os::unix::fs::symlink(outside.join("big.bin"), dir.join("linked.bin")).unwrap();
-        std::os::unix::fs::symlink(&outside, dir.join("linked-dir")).unwrap();
-        fs::write(dir.join(pack_file('f')), vec![0_u8; 64]).unwrap();
-        let link_len = |name: &str| fs::symlink_metadata(dir.join(name)).unwrap().len();
-        // A symlink contributes only its own link bytes — never the target's.
-        assert_eq!(pack_bytes(&dir), 64 + link_len(&pack_file('e')));
-        assert_eq!(
-            dir_size(&dir),
-            64 + link_len(&pack_file('e')) + link_len("linked.bin") + link_len("linked-dir")
-        );
-        assert!(
-            pack_bytes(&dir) < 1 << 16,
-            "pack_bytes followed a symlink: {}",
-            pack_bytes(&dir)
-        );
-    }
-
-    #[test]
-    fn symlinked_identity_dir_is_foreign_to_sweep_and_spend() {
+    fn symlinked_identity_dir_is_foreign_to_the_sweep() {
         let temp = Temp::new();
         let parent = temp.0.join("root");
         fs::create_dir(&parent).unwrap();
-        // Bytes outside the cache root must never be counted or deleted.
+        // Bytes outside the cache root must never be deleted, even behind a
+        // stale-looking manifest.
         let outside = temp.0.join("outside");
         fs::create_dir(&outside).unwrap();
-        fs::write(outside.join("big.pack"), vec![0_u8; 1 << 20]).unwrap();
+        fs::write(outside.join("x.mapped"), vec![0_u8; 1 << 20]).unwrap();
+        fs::write(outside.join(".manifest"), deleted_manifest(&temp.0)).unwrap();
+        age(&outside.join("x.mapped"), 7200);
+        age(&outside.join(".manifest"), 7200);
+        age_dir(&outside, 7200);
+        assert_eq!(packed_orphan_reason(&outside), Some("source deleted"));
         // A root-level entry whose NAME claims an identity but whose inode is
-        // a symlink: foreign — invisible to sizing and immune to the sweep.
-        let link = parent.join(format!("{DIR_PREFIX}{}", "a".repeat(64)));
+        // a symlink: foreign, immune to the sweep.
+        let link = parent.join(format!("{MAPPED_DIR_PREFIX}{}", "a".repeat(64)));
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         let source = temp.0.join("source.gguf");
         fs::write(&source, b"weights").unwrap();
-        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
+        let _cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
         assert!(link.is_symlink(), "the sweep must never touch a link");
         assert_eq!(
             fs::canonicalize(&link).unwrap(),
             outside.canonicalize().unwrap(),
             "the link target is intact"
         );
-        // Sizing ignores the link's target bytes entirely.
-        assert_eq!(root_pack_spend(&parent, &cache.root, 0, pack_bytes), 0);
-        assert_eq!(reconciled_sibling_pack_spend(&link), 0);
-        assert_eq!(sibling_pack_estimate(&link), 0);
+        assert!(outside.join("x.mapped").is_file());
     }
 
-    /// When the cache's OWN identity name is occupied by a symlink,
-    /// `new_at` must unlink it and create a real dir. `create_dir_all`
-    /// accepts a link-to-dir, which would land the manifest and every later
-    /// write in the external target while the sweep and the cap count the
-    /// link itself as foreign — an escaped, uncounted, unswept cache.
-    #[test]
-    fn packed_cache_new_at_replaces_symlinked_identity_dir() {
-        let temp = Temp::new();
-        let parent = temp.0.join("cache");
-        fs::create_dir(&parent).unwrap();
-        let source = temp.0.join("source.gguf");
-        fs::write(&source, b"weights").unwrap();
-        // The real identity dir for `source` is unlinked and replaced with a
-        // symlink whose target carries a marker; construction must admit no
-        // bytes outside the root.
-        let identity = packed_identity(BTreeSet::from([source.clone()]).into_iter()).unwrap();
-        let expected = parent.join(format!("{DIR_PREFIX}{identity}"));
-        let cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
-        assert_eq!(cache.root, expected);
-        fs::remove_dir_all(&cache.root).unwrap();
-        let outside = temp.0.join("outside");
-        fs::create_dir(&outside).unwrap();
-        fs::write(outside.join("marker"), b"keep").unwrap();
-        std::os::unix::fs::symlink(&outside, &cache.root).unwrap();
-        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
-        assert!(
-            is_real_dir(&cache.root),
-            "the link must be replaced by a real dir"
-        );
-        assert_ne!(
-            fs::canonicalize(&cache.root).unwrap(),
-            outside.canonicalize().unwrap(),
-            "the real dir must not resolve to the external target"
-        );
-        assert!(cache.root.join(".manifest").is_file());
-        cache.write("key", &weight("affine")).unwrap();
-        assert!(cache.path("key").is_file());
-        // The external target is untouched: the marker survives and nothing
-        // the cache wrote landed there.
-        assert_eq!(fs::read(outside.join("marker")).unwrap(), b"keep");
-        assert!(!outside.join(".manifest").exists());
-        assert!(!outside.join("key.pack").exists());
-    }
-
-    /// `new_at` validates the identity dir by path, but a path check cannot
-    /// pin the inode: rename the real dir aside and plant a symlink to an
-    /// external dir at `cache.root`, and every `dir.join(name)` write would
-    /// follow it outside the cache root. `write` re-validates by opening the
-    /// dir O_DIRECTORY|O_NOFOLLOW and then does ALL child opens/writes/
-    /// renames/unlinks relative to that fd — the swap either keeps the fd's
-    /// inode (writes land in the renamed-aside real dir) or makes the open
-    /// fail (write skips, and the replanted link is unlinked and replaced by
-    /// a fresh real dir first). In every case the external target stays
-    /// byte-for-byte untouched.
-    #[test]
-    fn packed_cache_writes_stay_in_the_validated_inode() {
-        let temp = Temp::new();
-        let parent = temp.0.join("cache");
-        fs::create_dir(&parent).unwrap();
-        let source = temp.0.join("source.gguf");
-        fs::write(&source, b"weights").unwrap();
-        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
-
-        // Swap the validated dir for a link: real dir aside, link planted.
-        let aside = temp.0.join("renamed-aside");
-        fs::rename(&cache.root, &aside).unwrap();
-        let outside = temp.0.join("outside");
-        fs::create_dir(&outside).unwrap();
-        fs::write(outside.join("marker"), b"keep").unwrap();
-        std::os::unix::fs::symlink(&outside, &cache.root).unwrap();
-
-        cache.write("key", &weight("affine")).unwrap();
-
-        // The external target absorbed nothing: no republished manifest, no
-        // budget ledger, no staging temp, no pack.
-        assert_eq!(fs::read(outside.join("marker")).unwrap(), b"keep");
-        let names: Vec<_> = fs::read_dir(&outside)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name())
-            .collect();
-        assert_eq!(
-            names,
-            vec![OsString::from("marker")],
-            "descriptor-relative writes must not reach the link target"
-        );
-        // The write either recreated a real dir at the path (link unlinked)
-        // or landed in the pinned aside inode — never through the link.
-        if is_real_dir(&cache.root) {
-            assert!(cache.path("key").is_file());
-        } else {
-            assert!(aside.join("key.pack").is_file());
-        }
-        assert!(aside.join(".manifest").is_file());
-    }
-
-    // flock is per-process on BSD/macOS, so a held writer lock can only be
+    // flock is per-process on BSD/macOS, so a held pack lock can only be
     // observed from a second process.
     #[test]
-    #[ignore = "helper process for held_budget_lock_skips_sweep_deletion"]
+    #[ignore = "helper process for the held-lock sweep tests"]
     fn packed_budget_lock_child() {
         let path = PathBuf::from(
             std::env::var_os("MLX_NODE_PACKED_LOCK_TEST_PATH").expect("lock-test child path"),
@@ -2331,598 +1480,624 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap();
-        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let operation = if std::env::var_os("MLX_NODE_PACKED_LOCK_TEST_SHARED").is_some() {
+            libc::LOCK_SH
+        } else {
+            libc::LOCK_EX
+        };
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), operation) }, 0);
         fs::write(acquired, b"acquired").unwrap();
         // The parent kills this process once the sweep assertion completes.
         std::thread::sleep(Duration::from_secs(60));
     }
 
-    #[test]
-    fn held_budget_lock_skips_sweep_deletion() {
-        let temp = Temp::new();
-        let parent = temp.0.join("cache");
-        fs::create_dir(&parent).unwrap();
-        let stale = parent.join(format!("{DIR_PREFIX}{}", "a".repeat(64)));
-        fs::create_dir(&stale).unwrap();
-        fs::write(stale.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
-        fs::write(stale.join("budget"), 0u64.to_le_bytes()).unwrap();
-        age(&stale.join(".manifest"), 7200);
-        age(&stale.join("budget"), 7200);
-        age_dir(&stale, 7200);
-        let acquired = temp.0.join("child.acquired");
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg("models::qwen4_exp::packed_cache::tests::packed_budget_lock_child")
-            .arg("--ignored")
-            .env("MLX_NODE_PACKED_LOCK_TEST_PATH", stale.join("budget"))
-            .env("MLX_NODE_PACKED_LOCK_TEST_ACQUIRED", &acquired)
-            .spawn()
-            .unwrap();
+    /// Dropping a bare `Child` leaves it running: a failed assertion would
+    /// keep the lock and the test's output pipe open for the child's sleep.
+    struct LockHolder(std::process::Child);
+
+    impl Drop for LockHolder {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A second process holding `path` shared until dropped.
+    fn shared_lock_holder(temp: &Path, path: &Path) -> LockHolder {
+        let acquired = temp.join(format!("{}.acquired", uuid::Uuid::new_v4()));
+        let holder = LockHolder(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("models::qwen4_exp::packed_cache::tests::packed_budget_lock_child")
+                .arg("--ignored")
+                .env("MLX_NODE_PACKED_LOCK_TEST_PATH", path)
+                .env("MLX_NODE_PACKED_LOCK_TEST_ACQUIRED", &acquired)
+                .env("MLX_NODE_PACKED_LOCK_TEST_SHARED", "1")
+                .spawn()
+                .unwrap(),
+        );
         for _ in 0..500 {
             if acquired.is_file() {
-                break;
+                return holder;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(acquired.is_file(), "child never acquired the budget lock");
+        panic!("child never acquired {}", path.display());
+    }
+
+    /// A manifest naming `source_dir/x.gguf`, recorded on `mount`.
+    fn manifest_naming(source_dir: &Path, mount: &Path) -> String {
+        format!(
+            "path_hex={}\nmount_hex={}\nfile_hex={}\nend=1\n",
+            packed_hex_encode(source_dir.as_os_str().as_bytes()),
+            packed_hex_encode(mount.as_os_str().as_bytes()),
+            packed_hex_encode(b"x.gguf")
+        )
+    }
+
+    /// A manifest proving its source deleted: no `x.gguf` in `source_dir`,
+    /// whose mount point is mounted.
+    fn deleted_manifest(source_dir: &Path) -> String {
+        let source_dir = source_dir.canonicalize().unwrap();
+        assert!(!source_dir.join("x.gguf").exists());
+        manifest_naming(&source_dir, &mount_point(&source_dir))
+    }
+
+    /// A mapped dir fixture: `<letter>*64` identity, one `x.mapped` of
+    /// `bytes`, a manifest whose source is deleted, every witness aged past
+    /// the sweep grace when `aged`.
+    fn mapped_fixture(parent: &Path, letter: char, bytes: usize, aged: bool) -> PathBuf {
+        let dir = parent.join(format!(
+            "{MAPPED_DIR_PREFIX}{}",
+            letter.to_string().repeat(64)
+        ));
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("x.mapped"), vec![0_u8; bytes]).unwrap();
+        fs::write(dir.join(".manifest"), deleted_manifest(parent)).unwrap();
+        fs::write(dir.join(MAPPED_LOCK), b"").unwrap();
+        if aged {
+            for entry in ["x.mapped", ".manifest", MAPPED_LOCK] {
+                age(&dir.join(entry), 7200);
+            }
+            age_dir(&dir, 7200);
+        }
+        dir
+    }
+
+    /// The sweep keeps a dir whenever the process-wide holder registry is
+    /// busy (another test of this binary opening or sweeping a pack), so
+    /// `sweep` is repeated until `gone` holds or 1 s has passed; a dir the
+    /// sweep keeps on purpose survives every repeat.
+    fn until_gone(mut sweep: impl FnMut(), gone: impl Fn() -> bool) {
+        for _ in 0..200 {
+            sweep();
+            if gone() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn held_mapped_dir_lock_blocks_the_sweep() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        fs::create_dir(&parent).unwrap();
+        let current = parent.join(format!("{MAPPED_DIR_PREFIX}{}", "c".repeat(64)));
+        fs::create_dir(&current).unwrap();
+        // Another process reads the pack: its SH lock keeps the orphan.
+        let stale = mapped_fixture(&parent, 'a', 100, true);
+        let holder = shared_lock_holder(&temp.0, &stale.join(MAPPED_LOCK));
+        sweep_packed_cache(&parent, &current);
+        assert!(stale.exists(), "an open pack is not swept");
+        drop(holder);
+        until_gone(|| sweep_packed_cache(&parent, &current), || !stale.exists());
+        assert!(!stale.exists());
+        // The same process holding the dir through `hold_mapped_dir` (a
+        // loaded MappedPack) is excluded too, by the registry and the lock.
+        let held = mapped_fixture(&parent, 'b', 100, true);
+        let dirfd = open_dir_nofollow(&held).unwrap();
+        let guard = hold_mapped_dir(&held, &dirfd).unwrap();
+        assert_eq!(locked_remove(&held, MAPPED_LOCK, "test", |_| true), 0);
+        assert!(held.exists());
+        drop(guard);
+        let removed = std::cell::Cell::new(0);
+        until_gone(
+            || removed.set(removed.get() + locked_remove(&held, MAPPED_LOCK, "test", |_| true)),
+            || removed.get() > 0,
+        );
+        assert!(removed.get() > 0);
+        assert!(!held.exists());
+        // Holding a dir an evictor removed meanwhile is refused.
+        let gone = mapped_fixture(&parent, 'd', 100, true);
+        let dirfd = open_dir_nofollow(&gone).unwrap();
+        fs::remove_dir_all(&gone).unwrap();
+        assert!(hold_mapped_dir(&gone, &dirfd).is_err());
+    }
+
+    /// A retired chunk dir holding `files`, every witness aged past the sweep
+    /// grace when `aged`.
+    fn chunk_fixture(parent: &Path, suffix: &str, files: &[(&str, &[u8])], aged: bool) -> PathBuf {
+        let dir = parent.join(format!("{RETIRED_CHUNK_PREFIX}{suffix}"));
+        fs::create_dir(&dir).unwrap();
+        for (name, bytes) in files {
+            fs::write(dir.join(name), bytes).unwrap();
+        }
+        if aged {
+            for entry in fs::read_dir(&dir).unwrap() {
+                age(&entry.unwrap().path(), 7200);
+            }
+            age_dir(&dir, 7200);
+        }
+        dir
+    }
+
+    #[test]
+    fn retired_chunk_dirs_are_swept_once_idle_and_unlocked() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        fs::create_dir(&parent).unwrap();
         let source = temp.0.join("source.gguf");
         fs::write(&source, b"weights").unwrap();
-        let _cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
-        // A live writer's held flock makes the sweep keep even an orphan dir.
-        assert!(stale.exists());
-        child.kill().unwrap();
-        let _ = child.wait();
-        let _cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
-        assert!(!stale.exists());
-    }
-
-    // An in-flight verified read holds packed_readers shared; BSD flock is
-    // per-process so the budget lock alone cannot exclude same-process
-    // readers — locked_remove must defer while a read guard is live.
-    #[test]
-    fn locked_remove_defers_while_a_verified_read_is_in_flight() {
-        let temp = Temp::new();
-        let parent = temp.0.join("cache");
-        fs::create_dir(&parent).unwrap();
-        let stale = parent.join(format!("{DIR_PREFIX}{}", "a".repeat(64)));
-        fs::create_dir(&stale).unwrap();
-        fs::write(stale.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
-        fs::write(stale.join("budget"), 0u64.to_le_bytes()).unwrap();
-        age(&stale.join(".manifest"), 7200);
-        age(&stale.join("budget"), 7200);
-        age_dir(&stale, 7200);
-        assert!(packed_orphan_reason(&stale).is_some());
-        let guard = read_guard(&stale);
-        assert_eq!(locked_remove(&stale, "test", |_| true), 0);
-        assert!(stale.exists());
-        drop(guard);
-        assert!(locked_remove(&stale, "test", |_| true) > 0);
-        assert!(!stale.exists());
-    }
-
-    // Names under the prefix that don't match the 64-hex producer grammar
-    // are foreign: an aged `.mlx-qwen4-packed-v2-backup` with a malformed
-    // manifest must survive the sweep, and a pack stamped before the epoch
-    // must order as oldest rather than panic.
-    #[test]
-    fn sweep_leaves_non_identity_prefixed_dirs_and_handles_pre_epoch_packs() {
-        let temp = Temp::new();
-        let parent = temp.0.join("cache");
-        fs::create_dir(&parent).unwrap();
-        let foreign = parent.join(format!("{DIR_PREFIX}backup"));
-        fs::create_dir(&foreign).unwrap();
-        fs::write(foreign.join(".manifest"), "not a manifest\n").unwrap();
-        age(&foreign.join(".manifest"), 7200);
-        age_dir(&foreign, 7200);
-        sweep_packed_cache(&parent, &parent.join("current"));
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
+        let identity = cache.identity().unwrap();
+        // The chunk format writes a `budget` ledger and `.pack` chunks, no manifest.
+        let ledger = 64_u64.to_le_bytes();
+        let written: [(&str, &[u8]); 2] = [(RETIRED_CHUNK_LOCK, &ledger), ("x.pack", &[0; 64])];
+        let released = chunk_fixture(&parent, &"a".repeat(64), &written, true);
+        // Named for the source being loaded, with a manifest that still
+        // verifies: the format is retired, so a live source keeps nothing.
+        let manifested = [written[0], written[1], (".manifest", cache.manifest())];
+        let same_source = chunk_fixture(&parent, identity, &manifested, true);
+        assert_eq!(
+            manifest_source(&same_source).unwrap(),
+            Source::Present(identity.to_owned())
+        );
+        // The chunk format writes the manifest at load and `budget` only with its
+        // first chunk, so a dir it never wrote to has no ledger to lock.
+        let stub_files: [(&str, &[u8]); 1] = [(".manifest", b"path=/gone\nfile=x.gguf\n")];
+        let stub = chunk_fixture(&parent, &"e".repeat(64), &stub_files, true);
+        let fresh = chunk_fixture(&parent, &"b".repeat(64), &written, false);
+        let locked = chunk_fixture(&parent, &"c".repeat(64), &written, true);
+        let foreign = chunk_fixture(&parent, "backup", &written, true);
+        for dir in [&released, &same_source, &stub, &locked, &foreign] {
+            assert!(packed_dir_idle(dir), "{} must read as idle", dir.display());
+        }
+        assert!(!packed_dir_idle(&fresh));
+        // An old build reading the dir holds its ledger shared.
+        let holder = shared_lock_holder(&temp.0, &locked.join(RETIRED_CHUNK_LOCK));
+        until_gone(
+            || drop(PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap()),
+            || !released.exists() && !same_source.exists(),
+        );
+        assert!(
+            !released.exists(),
+            "an idle manifest-less chunk dir is removed"
+        );
+        assert!(
+            !same_source.exists(),
+            "an idle dir of the current source is removed"
+        );
+        assert!(
+            !stub.exists(),
+            "an idle manifest-only dir with no ledger is removed"
+        );
+        assert!(fresh.exists(), "a dir used within the hour stays");
+        assert!(locked.exists(), "a dir whose ledger is held stays");
+        assert!(
+            foreign.exists(),
+            "a name that is not a 64-hex identity is foreign"
+        );
+        drop(holder);
+        until_gone(
+            || drop(PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap()),
+            || !locked.exists(),
+        );
+        assert!(!locked.exists(), "the released ledger no longer keeps it");
+        assert!(fresh.exists());
         assert!(foreign.exists());
-        // st_mtime before the epoch used to wrap into a panic-inducing
-        // duration; it now orders as the oldest entry.
-        let cache_dir = parent.join(format!("{DIR_PREFIX}{}", "d".repeat(64)));
-        fs::create_dir(&cache_dir).unwrap();
-        let pack = cache_dir.join(pack_file('0'));
-        fs::write(&pack, b"x").unwrap();
-        let epoch_minus_one = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
-        OpenOptions::new()
-            .write(true)
-            .open(&pack)
-            .unwrap()
-            .set_modified(epoch_minus_one)
-            .unwrap();
-        let stat = dir_stat(
-            &open_dir_nofollow(&cache_dir).unwrap(),
-            OsStr::new(&pack_file('0')),
+    }
+
+    #[test]
+    fn identity_hashes_path_inode_size_and_times_but_not_the_device() {
+        let temp = Temp::new();
+        let first = temp.0.join("a.gguf");
+        let second = temp.0.join("b.gguf");
+        fs::write(&first, b"first split").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let cache = PackedCache::new_at(
+            &temp.0.join("cache"),
+            BTreeSet::from([second.clone(), first.clone()]),
         )
         .unwrap();
-        assert_eq!(stat_mtime(&stat), SystemTime::UNIX_EPOCH);
-    }
-
-    #[test]
-    fn ledger_reconciles_externally_deleted_packs() {
-        let temp = Temp::new();
-        let cache = PackedCache {
-            root: temp.0.join("cache"),
-            manifest: None,
-        };
-        let w = weight("affine");
-        cache.write(&pack_name('a'), &w).unwrap();
-        cache.write(&pack_name('b'), &w).unwrap();
-        // Simulated external cleanup inflates the recorded spend.
-        fs::remove_file(cache.path(&pack_name('a'))).unwrap();
-        cache.write(&pack_name('c'), &w).unwrap();
-        let mut n = [0u8; 8];
-        File::open(cache.root.join("budget"))
-            .unwrap()
-            .read_exact(&mut n)
-            .unwrap();
-        let actual: u64 = fs::read_dir(&cache.root)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.path().extension().is_some_and(|s| s == "pack"))
-            .map(|e| e.metadata().unwrap().len())
-            .sum();
-        // Recorded spend = reconciled used + exact reserve for the new pack,
-        // which now equals the true on-disk bytes.
-        assert_eq!(u64::from_le_bytes(n), actual);
-        cache.write(&pack_name('d'), &w).unwrap();
-        File::open(cache.root.join("budget"))
-            .unwrap()
-            .read_exact(&mut n)
-            .unwrap();
-        assert_eq!(
-            u64::from_le_bytes(n),
-            fs::metadata(cache.path(&pack_name('d'))).unwrap().len()
-                + fs::metadata(cache.path(&pack_name('b'))).unwrap().len()
-                + fs::metadata(cache.path(&pack_name('c'))).unwrap().len()
-        );
-    }
-
-    #[test]
-    fn total_cap_sheds_oldest_packs_in_current_dir() {
-        let temp = Temp::new();
-        let cache = PackedCache {
-            root: temp.0.join("cache"),
-            manifest: None,
-        };
-        let w = weight("affine");
-        for (key, seconds) in [
-            (pack_name('a'), 300u64),
-            (pack_name('b'), 200),
-            (pack_name('c'), 100),
-        ] {
-            cache.write(&key, &w).unwrap();
-            age(&cache.path(&key), seconds);
-        }
-        let pack = fs::metadata(cache.path(&pack_name('a'))).unwrap().len();
-        // Cap fits exactly two packs plus ledger bytes: shed only the oldest.
-        enforce_packed_total_cap(&temp.0, &cache.root, 2 * pack + 64);
-        assert!(!cache.path(&pack_name('a')).exists());
-        assert!(cache.path(&pack_name('b')).exists());
-        assert!(cache.path(&pack_name('c')).exists());
-        // Ledger re-reconciled to actual bytes.
-        let mut n = [0u8; 8];
-        File::open(cache.root.join("budget"))
-            .unwrap()
-            .read_exact(&mut n)
-            .unwrap();
-        assert_eq!(u64::from_le_bytes(n), 2 * pack);
-    }
-
-    #[test]
-    fn write_republishes_manifest_and_sweep_drops_stale_tmps() {
-        let temp = Temp::new();
-        let parent = temp.0.join("cache");
-        let source = temp.0.join("source.gguf");
-        fs::write(&source, b"weights").unwrap();
-        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
-        // A sweep-deleted manifest comes back on the next write.
-        fs::remove_file(cache.root.join(".manifest")).unwrap();
-        cache.write("key", &weight("affine")).unwrap();
-        assert!(cache.root.join(".manifest").is_file());
-        // Crash leftovers in the current dir leave through the sweep once
-        // aged; a fresh .tmp (a plausibly live writer) is kept.
-        let stale_tmp = cache.root.join(tmp_name("00000000"));
-        let live_tmp = cache.root.join(tmp_name("11111111"));
-        fs::write(&stale_tmp, b"x").unwrap();
-        fs::write(&live_tmp, b"x").unwrap();
-        age(&stale_tmp, 7200);
-        sweep_packed_cache(&parent, &cache.root);
-        assert!(!stale_tmp.exists());
-        assert!(live_tmp.exists());
-    }
-
-    #[test]
-    fn total_cap_evicts_only_idle_manifested_siblings() {
-        let temp = Temp::new();
-        let parent = temp.0.join("cache");
-        fs::create_dir(&parent).unwrap();
-        // Eldest with a manifest and past the idle grace: the only eviction.
-        let oldest = parent.join(format!("{DIR_PREFIX}{}", "a".repeat(64)));
-        fs::create_dir(&oldest).unwrap();
-        fs::write(oldest.join(pack_file('a')), vec![0_u8; 100]).unwrap();
-        fs::write(oldest.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
-        age(&oldest.join(pack_file('a')), 7200);
-        age(&oldest.join(".manifest"), 7200);
-        age_dir(&oldest, 7200);
-        // Fresh manifest dir and manifest-less dir both survive the cap: the
-        // idle grace shields the first, the manifest requirement the second.
-        let fresh = parent.join(format!("{DIR_PREFIX}{}", "b".repeat(64)));
-        fs::create_dir(&fresh).unwrap();
-        fs::write(fresh.join(pack_file('b')), vec![0_u8; 100]).unwrap();
-        fs::write(fresh.join(".manifest"), "path=/gone\nfile=x.gguf\n").unwrap();
-        let bare = parent.join(format!("{DIR_PREFIX}{}", "c".repeat(64)));
-        fs::create_dir(&bare).unwrap();
-        fs::write(bare.join(pack_file('c')), vec![0_u8; 100]).unwrap();
-        age(&bare.join(pack_file('c')), 7200);
-        age_dir(&bare, 7200);
-        let cache = PackedCache {
-            root: temp.0.join("current"),
-            manifest: None,
-        };
-        fs::create_dir(&cache.root).unwrap();
-        enforce_packed_total_cap(&parent, &cache.root, 150);
-        assert!(!oldest.exists());
-        assert!(fresh.exists());
-        assert!(bare.exists());
-    }
-
-    #[test]
-    fn verified_read_stamps_recency() {
-        let temp = Temp::new();
-        let parent = temp.0.join("cache");
-        let source = temp.0.join("source.gguf");
-        fs::write(&source, b"weights").unwrap();
-        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
-        cache.write("key", &weight("affine")).unwrap();
-        age(&cache.path("key"), 7200);
-        age(&cache.root.join("budget"), 7200);
-        age(&cache.root.join(".manifest"), 7200);
-        let before = fs::metadata(cache.path("key")).unwrap().modified().unwrap();
-        assert!(before < SystemTime::now() - PACKED_SWEEP_MIN_AGE);
-        assert!(cache.read("key").unwrap().is_some());
-        let after = fs::metadata(cache.path("key")).unwrap().modified().unwrap();
-        assert!(after > before);
-        // Identity verifies and the stamped pack keeps the dir's newest mtime
-        // inside the grace window (the dir mtime itself is also fresh).
-        assert_eq!(packed_orphan_reason(&cache.root), None);
-    }
-
-    #[test]
-    fn read_stamps_witnesses_before_verification_completes() {
-        let temp = Temp::new();
-        let parent = temp.0.join("cache");
-        let source = temp.0.join("source.gguf");
-        fs::write(&source, b"weights").unwrap();
-        let cache = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
-        cache.write("key", &weight("affine")).unwrap();
-        let mut corrupt = fs::read(cache.path("key")).unwrap();
-        *corrupt.last_mut().unwrap() ^= 1;
-        fs::write(cache.path("key"), corrupt).unwrap();
-        age(&cache.path("key"), 7200);
-        age(&cache.root.join("budget"), 7200);
-        age(&cache.root.join(".manifest"), 7200);
-        age_dir(&cache.root, 7200);
-        assert!(packed_dir_idle(&cache.root));
-        // Even though verification fails, the open already refreshed the
-        // witnesses: an evictor racing this read sees a live dir.
-        assert!(cache.read("key").is_err());
-        assert!(!packed_dir_idle(&cache.root));
-    }
-
-    // A read whose guard cannot take BOTH exclusions reports a miss instead
-    // of racing remove_dir_all: here the ledger is absent, so the flock leg
-    // has nothing to pin and the guard is not live.
-    #[test]
-    fn read_reports_miss_when_exclusion_is_incomplete() {
-        let temp = Temp::new();
-        let cache = PackedCache {
-            root: temp.0.join("cache"),
-            manifest: None,
-        };
-        cache.write(&pack_name('a'), &weight("affine")).unwrap();
-        fs::remove_file(cache.root.join("budget")).unwrap();
-        assert!(cache.read(&pack_name('a')).unwrap().is_none());
-        // With the ledger restored both legs hold and reads hit again.
-        fs::write(cache.root.join("budget"), 0u64.to_le_bytes()).unwrap();
-        assert!(cache.read(&pack_name('a')).unwrap().is_some());
-    }
-
-    #[test]
-    fn parallel_reads_preserve_order_ownership_and_revalidate_changed_files() {
-        let temp = Temp::new();
-        let cache = PackedCache {
-            root: temp.0.join("cache"),
-            manifest: None,
-        };
-        for mode in ["affine", "q4k", "q6k"] {
-            cache.write(mode, &weight(mode)).unwrap();
-        }
-        let requests: Vec<_> = ["q6k", "affine", "missing", "q4k", "q6k"]
-            .into_iter()
-            .map(|key| (key.to_string(), 4096))
-            .collect();
-        let chunks = cache.read_batch(&requests).unwrap();
-        // Returned bytes own the verified generation even if the path changes
-        // before main-thread import. No mmap or stale verification is reused.
-        fs::write(cache.path("q6k"), b"truncated").unwrap();
-        let mut corrupt = fs::read(cache.path("affine")).unwrap();
-        *corrupt.last_mut().unwrap() ^= 1;
-        fs::write(cache.path("affine"), corrupt).unwrap();
-        for ((key, _), chunk) in requests.iter().zip(chunks) {
-            if key == "missing" {
-                assert!(chunk.is_none());
-                continue;
+        let mut hash = Sha256::new();
+        hash.update(MAGIC);
+        for path in [&first, &second] {
+            let canonical = path.canonicalize().unwrap();
+            let meta = fs::metadata(&canonical).unwrap();
+            hash.update(canonical.as_os_str().as_bytes());
+            for n in [
+                meta.ino(),
+                meta.len(),
+                meta.mtime() as u64,
+                meta.mtime_nsec() as u64,
+                meta.ctime() as u64,
+                meta.ctime_nsec() as u64,
+            ] {
+                hash.update(n.to_le_bytes());
             }
-            let (got, _) = chunk.unwrap().into_weight().unwrap();
-            let want = weight(key);
-            assert_eq!(
-                encode_array(&got.values).unwrap(),
-                encode_array(&want.values).unwrap()
-            );
-            assert_eq!(
-                encode_array(got.scales.as_ref().unwrap()).unwrap(),
-                encode_array(want.scales.as_ref().unwrap()).unwrap()
-            );
         }
-        let changed = cache.read_batch(&requests).unwrap();
-        assert!(
-            changed[0].is_none()
-                && changed[1].is_none()
-                && changed[2].is_none()
-                && changed[4].is_none()
-        );
-        assert!(changed[3].is_some());
-        assert!(cache.read_batch(&[("q4k".into(), 1)]).unwrap()[0].is_none());
-        assert!(
-            cache
-                .read_batch(&[("q4k".into(), MAX_READ_BYTES + 1)])
-                .is_err()
-        );
-        assert!(cache.read_batch(&vec![("q4k".into(), 1); 25]).is_err());
+        let expected: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(cache.identity(), Some(expected.as_str()));
     }
 
     #[test]
-    fn total_cap_admission_counts_sibling_reservations_and_busy_lock_skips() {
+    fn an_unmounted_source_volume_keeps_its_pack() {
+        let temp = Temp::new();
+        let base = temp.0.canonicalize().unwrap();
+        let parent = base.join("cache");
+        fs::create_dir(&parent).unwrap();
+        let unplugged = base.join("Volumes/T7");
+        let leftover = base.join("leftover");
+        fs::create_dir(&leftover).unwrap();
+        let live = mount_point(&base);
+        assert!(!is_mounted(&unplugged));
+        assert!(
+            !is_mounted(&leftover),
+            "a plain dir on its parent's device is no mount point"
+        );
+        assert!(is_mounted(&live), "{} must be mounted", live.display());
+        let fixture = |letter: char, manifest: String| {
+            let dir = mapped_fixture(&parent, letter, 100, true);
+            fs::write(dir.join(".manifest"), manifest).unwrap();
+            age(&dir.join(".manifest"), 7200);
+            age_dir(&dir, 7200);
+            dir
+        };
+        let away = fixture('1', manifest_naming(&unplugged.join("models"), &unplugged));
+        let left_behind = fixture('2', manifest_naming(&leftover.join("models"), &leftover));
+        let deleted = fixture('3', manifest_naming(&base, &live));
+        let unrecorded = fixture(
+            '4',
+            format!(
+                "path_hex={}\nfile_hex={}\nend=1\n",
+                packed_hex_encode(base.as_os_str().as_bytes()),
+                packed_hex_encode(b"x.gguf")
+            ),
+        );
+        assert_eq!(manifest_source(&away).unwrap(), Source::Unreachable);
+        assert_eq!(manifest_source(&left_behind).unwrap(), Source::Unreachable);
+        assert_eq!(manifest_source(&unrecorded).unwrap(), Source::Unreachable);
+        assert_eq!(packed_orphan_reason(&away), None);
+        assert_eq!(packed_orphan_reason(&left_behind), None);
+        assert_eq!(packed_orphan_reason(&unrecorded), None);
+        assert_eq!(packed_orphan_reason(&deleted), Some("source deleted"));
+        let current = parent.join("current");
+        until_gone(
+            || sweep_packed_cache(&parent, &current),
+            || !deleted.exists(),
+        );
+        assert!(!deleted.exists(), "a file gone from a live mount is swept");
+        assert!(away.exists(), "an unplugged volume keeps its pack");
+        assert!(
+            left_behind.exists(),
+            "a left-behind mount dir keeps its pack"
+        );
+        assert!(
+            unrecorded.exists(),
+            "a missing file with no mount record keeps its pack"
+        );
+    }
+
+    /// Resets a `chmod 000` before `Temp` removes the tree.
+    struct Mode(PathBuf, u32);
+
+    impl Drop for Mode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_manifest_or_an_unreadable_source_keeps_the_pack() {
+        let temp = Temp::new();
+        let base = temp.0.canonicalize().unwrap();
+        let parent = base.join("cache");
+        fs::create_dir(&parent).unwrap();
+        let path = packed_hex_encode(base.as_os_str().as_bytes());
+        let mount = packed_hex_encode(mount_point(&base).as_os_str().as_bytes());
+        let file = packed_hex_encode(b"x.gguf");
+        let corrupt = [
+            (
+                '1',
+                format!("path_hex=zz\nmount_hex={mount}\nfile_hex={file}\nend=1\n"),
+            ),
+            ('2', format!("mount_hex={mount}\nfile_hex={file}\nend=1\n")),
+            ('3', format!("path_hex={path}\nmount_hex={mount}\nend=0\n")),
+            (
+                '4',
+                format!("path_hex={path}\nmount_hex=zz\nfile_hex={file}\nend=1\n"),
+            ),
+        ];
+        let mut kept = Vec::new();
+        for (letter, manifest) in corrupt {
+            let dir = mapped_fixture(&parent, letter, 100, true);
+            fs::write(dir.join(".manifest"), &manifest).unwrap();
+            age(&dir.join(".manifest"), 7200);
+            age_dir(&dir, 7200);
+            assert!(manifest_source(&dir).is_err(), "{manifest}");
+            assert_eq!(packed_orphan_reason(&dir), None, "{manifest}");
+            kept.push(dir);
+        }
+        // Root reads through any mode.
+        let mut restore = Vec::new();
+        if unsafe { libc::geteuid() } != 0 {
+            let unreadable = mapped_fixture(&parent, '5', 100, true);
+            restore.push(Mode(unreadable.join(".manifest"), 0o644));
+            chmod(&unreadable.join(".manifest"), 0o000);
+            assert!(manifest_source(&unreadable).is_err());
+            assert_eq!(packed_orphan_reason(&unreadable), None);
+            kept.push(unreadable);
+            let source_dir = base.join("src");
+            fs::create_dir(&source_dir).unwrap();
+            fs::write(source_dir.join("x.gguf"), b"weights").unwrap();
+            let cache =
+                PackedCache::new_at(&parent, BTreeSet::from([source_dir.join("x.gguf")])).unwrap();
+            let denied = published(&cache);
+            age(&denied.join(".manifest"), 7200);
+            age_dir(&denied, 7200);
+            restore.push(Mode(source_dir.clone(), 0o755));
+            chmod(&source_dir, 0o000);
+            assert_eq!(manifest_source(&denied).unwrap(), Source::Unreachable);
+            assert_eq!(packed_orphan_reason(&denied), None);
+            kept.push(denied);
+        }
+        sweep_packed_cache(&parent, &parent.join("current"));
+        for dir in &kept {
+            assert!(dir.exists(), "{} was swept", dir.display());
+        }
+    }
+
+    #[test]
+    fn a_split_set_missing_one_file_on_a_mounted_volume_is_an_orphan() {
         let temp = Temp::new();
         let parent = temp.0.join("cache");
-        let source_a = temp.0.join("a.gguf");
-        let source_b = temp.0.join("b.gguf");
-        fs::write(&source_a, b"first").unwrap();
-        fs::write(&source_b, b"second").unwrap();
-        let a = PackedCache::new_at(&parent, BTreeSet::from([source_a])).unwrap();
-        let b = PackedCache::new_at(&parent, BTreeSet::from([source_b])).unwrap();
-        assert_ne!(a.root, b.root);
-        let w = weight("affine");
-        // Under the cap the write goes through and the ledger reserves it.
-        a.write_with_total_cap(&pack_name('e'), &w, Some(u64::MAX))
-            .unwrap();
-        let pack = fs::metadata(a.path(&pack_name('e'))).unwrap().len();
-        assert!(pack > 0);
-        // A sibling ledger reservation counts toward the shared cap: b's
-        // write is vetoed even though its own dir is empty, and no eviction
-        // can free it (a's dir is fresh).
-        b.write_with_total_cap(&pack_name('e'), &w, Some(pack))
-            .unwrap();
-        assert!(!b.path(&pack_name('e')).exists());
-        // A busy root cap lock skips the chunk instead of stalling; the next
-        // write after the guard drops succeeds.
-        let guard = packed_root_cap_lock(&parent).unwrap();
-        a.write_with_total_cap(&pack_name('f'), &w, Some(u64::MAX))
-            .unwrap();
-        assert!(!a.path(&pack_name('f')).exists());
-        drop(guard);
-        a.write_with_total_cap(&pack_name('f'), &w, Some(u64::MAX))
-            .unwrap();
-        assert!(a.path(&pack_name('f')).exists());
-        // The cap lock file itself is never treated as a cache dir.
-        assert!(parent.join(".mlx-qwen4-packed-cap.lock").is_file());
-        assert_eq!(
-            root_pack_spend(&parent, &b.root, 0, sibling_pack_estimate),
-            pack * 2,
-            "the lock file must not be counted as spend"
-        );
-    }
-
-    #[test]
-    fn total_cap_sheds_own_oldest_packs_to_admit_new_write() {
-        let temp = Temp::new();
-        let cache = PackedCache {
-            root: temp.0.join("cache"),
-            manifest: None,
+        let pack = |name: &str| {
+            let source_dir = temp.0.join(name);
+            fs::create_dir(&source_dir).unwrap();
+            let files = [source_dir.join("a.gguf"), source_dir.join("b.gguf")];
+            for file in &files {
+                fs::write(file, file.as_os_str().as_bytes()).unwrap();
+            }
+            let cache = PackedCache::new_at(&parent, BTreeSet::from(files.clone())).unwrap();
+            (files, published(&cache))
         };
-        let w = weight("affine");
-        for (key, seconds) in [
-            (pack_name('a'), 300u64),
-            (pack_name('b'), 200),
-            (pack_name('c'), 100),
-        ] {
-            cache.write(&key, &w).unwrap();
-            age(&cache.path(&key), seconds);
+        let (files, removed) = pack("removed");
+        fs::remove_file(&files[1]).unwrap();
+        let (files, rewritten) = pack("rewritten");
+        fs::write(&files[0], b"new weights").unwrap();
+        for dir in [&removed, &rewritten] {
+            age(&dir.join(".manifest"), 7200);
+            age_dir(dir, 7200);
         }
-        let pack = fs::metadata(cache.path(&pack_name('a'))).unwrap().len();
-        // A cap that fits exactly two packs plus the pending write: the
-        // writer must shed its own oldest pack (enforcement cannot — it
-        // never wins the budget flock the writer holds), turning the dir
-        // into a true LRU instead of wedging once usage reaches the cap.
-        // (pack names must satisfy is_pack_name: 64 lowercase hex.)
-        cache
-            .write_with_total_cap(&pack_name('d'), &w, Some(2 * pack + pack))
-            .unwrap();
-        assert!(
-            !cache.path(&pack_name('a')).exists(),
-            "oldest pack is shed for room"
+        assert_eq!(manifest_source(&removed).unwrap(), Source::Deleted);
+        assert_eq!(packed_orphan_reason(&removed), Some("source deleted"));
+        assert_eq!(
+            packed_orphan_reason(&rewritten),
+            Some("source fingerprint changed")
         );
-        assert!(cache.path(&pack_name('b')).exists());
-        assert!(cache.path(&pack_name('c')).exists());
-        assert!(
-            cache.path(&pack_name('d')).exists(),
-            "the new write must be admitted"
+    }
+
+    /// A published pack of two unchanged source splits, `a.gguf` and `b.gguf`.
+    fn split_pack(temp: &Temp) -> (PackedCache, PathBuf) {
+        let source_dir = temp.0.join("src");
+        fs::create_dir(&source_dir).unwrap();
+        let files = [source_dir.join("a.gguf"), source_dir.join("b.gguf")];
+        for file in &files {
+            fs::write(file, file.as_os_str().as_bytes()).unwrap();
+        }
+        let cache = PackedCache::new_at(&temp.0.join("cache"), BTreeSet::from(files)).unwrap();
+        let dir = published(&cache);
+        (cache, dir)
+    }
+
+    /// Replace `dir`'s manifest, age the dir past the grace and sweep it:
+    /// the orphan reason it read and whether it survived.
+    fn sweep_with_manifest(dir: &Path, manifest: &[u8]) -> (Option<&'static str>, bool) {
+        fs::write(dir.join(".manifest"), manifest).unwrap();
+        age(&dir.join(".manifest"), 7200);
+        age_dir(dir, 7200);
+        let reason = packed_orphan_reason(dir);
+        let parent = dir.parent().unwrap();
+        until_gone(
+            || sweep_packed_cache(parent, &parent.join("current")),
+            || !dir.exists(),
         );
-        // Ledger records reconciled used + reserve = 3 packs.
-        let mut n = [0u8; 8];
-        File::open(cache.root.join("budget"))
-            .unwrap()
-            .read_exact(&mut n)
+        (reason, dir.exists())
+    }
+
+    /// An interrupted manifest write leaves valid hex records that omit
+    /// splits: hashing the partial list would read as a changed fingerprint.
+    #[test]
+    fn a_truncated_split_manifest_keeps_its_pack() {
+        let temp = Temp::new();
+        let (cache, dir) = split_pack(&temp);
+        let manifest = cache.manifest();
+        let first = manifest
+            .windows(b"file_hex=".len())
+            .position(|w| w == b"file_hex=")
             .unwrap();
-        assert_eq!(u64::from_le_bytes(n), 3 * pack);
+        let cut = first + manifest[first..].iter().position(|&b| b == b'\n').unwrap() + 1;
+        let (reason, kept) = sweep_with_manifest(&dir, &manifest[..cut]);
+        assert!(
+            reason.is_none() && kept,
+            "reason {reason:?}, swept {}, manifest:\n{}",
+            !kept,
+            String::from_utf8_lossy(&manifest[..cut])
+        );
     }
 
     #[test]
-    fn crashed_sibling_reservation_is_reconciled_at_recheck() {
+    fn a_manifest_whose_end_record_miscounts_its_files_keeps_its_pack() {
+        let temp = Temp::new();
+        let (cache, dir) = split_pack(&temp);
+        let manifest = String::from_utf8(cache.manifest().to_vec()).unwrap();
+        assert!(manifest.ends_with("\nend=2\n"), "{manifest}");
+        let dropped = manifest.replacen(
+            &format!("file_hex={}\n", packed_hex_encode(b"b.gguf")),
+            "",
+            1,
+        );
+        assert_ne!(dropped, manifest);
+        let (reason, kept) = sweep_with_manifest(&dir, dropped.as_bytes());
+        assert!(
+            reason.is_none() && kept,
+            "reason {reason:?}, swept {}, manifest:\n{dropped}",
+            !kept
+        );
+        // The complete manifest of the same pack still verifies.
+        assert_eq!(sweep_with_manifest(&dir, manifest.as_bytes()), (None, true));
+        assert_eq!(
+            manifest_source(&dir).unwrap(),
+            Source::Present(cache.identity().unwrap().to_owned())
+        );
+    }
+
+    /// A crash before the rename leaves `.manifest.tmp`: never read as the
+    /// manifest, and gone once a load publishes the manifest.
+    #[test]
+    fn a_leftover_manifest_tmp_is_ignored_and_replaced() {
         let temp = Temp::new();
         let parent = temp.0.join("cache");
         fs::create_dir(&parent).unwrap();
-        // Sibling identity dir with a small real pack but a ledger claiming
-        // u64::MAX: a crash between `record` and rename leaves phantom spend
-        // that must not veto other identities forever.
-        let sibling = parent.join(format!("{DIR_PREFIX}{}", "a".repeat(64)));
+        let dir = mapped_fixture(&parent, 'a', 100, true);
+        assert_eq!(packed_orphan_reason(&dir), Some("source deleted"));
+        fs::rename(dir.join(".manifest"), dir.join(".manifest.tmp")).unwrap();
+        age_dir(&dir, 7200);
+        assert_eq!(packed_orphan_reason(&dir), None);
+        sweep_packed_cache(&parent, &parent.join("current"));
+        assert!(dir.exists(), "a stale .manifest.tmp is no manifest");
+        fs::write(dir.join(".manifest.tmp"), b"path_hex=2f\nfile_hex=").unwrap();
+        let manifest = deleted_manifest(&parent);
+        publish_manifest(&open_dir_nofollow(&dir).unwrap(), manifest.as_bytes()).unwrap();
+        assert_eq!(
+            fs::read(dir.join(".manifest")).unwrap(),
+            manifest.as_bytes()
+        );
+        assert!(
+            !dir.join(".manifest.tmp").exists(),
+            "the leftover .manifest.tmp must be replaced by the publish"
+        );
+    }
+
+    /// Packs published before the completion record carry none: the load
+    /// that opens one rewrites it, and leaves every other pack's alone.
+    #[test]
+    fn a_load_heals_its_own_incomplete_manifest_and_no_other() {
+        let temp = Temp::new();
+        let parent = temp.0.join("cache");
+        let source = temp.0.join("source.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
+        let complete = cache.manifest().to_vec();
+        let old = complete.strip_suffix(b"end=1\n").unwrap();
+        let current = published(&cache);
+        fs::write(current.join(".manifest"), old).unwrap();
+        let sibling = parent.join(format!("{MAPPED_DIR_PREFIX}{}", "a".repeat(64)));
         fs::create_dir(&sibling).unwrap();
-        fs::write(sibling.join(pack_file('a')), vec![0_u8; 64]).unwrap();
-        let ledger_path = sibling.join("budget");
-        fs::write(&ledger_path, u64::MAX.to_le_bytes()).unwrap();
-        let source = temp.0.join("b.gguf");
-        fs::write(&source, b"second").unwrap();
-        let b = PackedCache::new_at(&parent, BTreeSet::from([source])).unwrap();
-        let w = weight("affine");
-        // The sibling is fresh and manifest-less: nothing can evict it, so
-        // admission is possible only if the recheck reconciles the phantom
-        // ledger to its real pack bytes.
-        b.write_with_total_cap(&pack_name('e'), &w, Some(u64::MAX))
-            .unwrap();
-        let pack = fs::metadata(b.path(&pack_name('e'))).unwrap().len();
-        fs::write(&ledger_path, u64::MAX.to_le_bytes()).unwrap();
-        b.write_with_total_cap("k2", &w, Some(pack * 10)).unwrap();
-        assert!(
-            b.path("k2").exists(),
-            "a reconciled phantom reservation must not veto the write"
-        );
-        let mut n = [0u8; 8];
-        File::open(&ledger_path)
-            .unwrap()
-            .read_exact(&mut n)
-            .unwrap();
+        fs::write(sibling.join(".manifest"), old).unwrap();
+        age(&sibling.join(".manifest"), 7200);
+        age_dir(&sibling, 7200);
+        let inode = |dir: &Path| fs::metadata(dir.join(".manifest")).unwrap().ino();
+        let before = inode(&current);
+        let load = || {
+            let cache = PackedCache::new_at(&parent, BTreeSet::from([source.clone()])).unwrap();
+            drop(
+                super::super::mapped_pack::MappedPack::open_or_build(
+                    cache.mapped_dir(),
+                    cache.identity().unwrap(),
+                    Some(cache.manifest()),
+                    &[],
+                )
+                .unwrap(),
+            );
+        };
+        load();
         assert_eq!(
-            u64::from_le_bytes(n),
-            64,
-            "the unheld sibling ledger is rewritten to real pack bytes"
+            fs::read(current.join(".manifest")).unwrap(),
+            complete,
+            "the opened pack's manifest must gain its completion record"
         );
-        // While the sibling's budget lock is held the ledger is a live
-        // writer's pending reservation and stays trusted: the write vetoes.
-        fs::write(&ledger_path, u64::MAX.to_le_bytes()).unwrap();
-        let held = try_budget_lock(&sibling).unwrap().unwrap();
-        b.write_with_total_cap("k3", &w, Some(pack * 10)).unwrap();
-        assert!(!b.path("k3").exists());
-        drop(held);
+        let healed = inode(&current);
+        assert_ne!(healed, before, "the manifest is replaced by rename");
+        assert!(!current.join(".manifest.tmp").exists());
+        assert_eq!(
+            fs::read(sibling.join(".manifest")).unwrap(),
+            old,
+            "a pack no load opened keeps its manifest"
+        );
+        load();
+        assert_eq!(inode(&current), healed, "a complete manifest is left as is");
+    }
+
+    fn fixture_gguf() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp/model.gguf")
     }
 
     #[test]
-    fn skipped_replacement_write_keeps_ledger_at_or_above_real_bytes() {
-        let temp = Temp::new();
-        let cache = PackedCache {
-            root: temp.0.join("cache"),
-            manifest: None,
-        };
-        let w = weight("affine");
-        cache.write(&pack_name('a'), &w).unwrap();
-        let pack = fs::metadata(cache.path(&pack_name('a'))).unwrap().len();
-        // A vetoed REPLACEMENT write leaves the old target on disk: the
-        // ledger reconcile must record real spend (target included), not the
-        // ex-target `used` — an undercounted ledger would let siblings
-        // overspend the configured cap.
-        cache
-            .write_with_total_cap(&pack_name('a'), &w, Some(1))
-            .unwrap();
-        let mut n = [0u8; 8];
-        File::open(cache.root.join("budget"))
-            .unwrap()
-            .read_exact(&mut n)
-            .unwrap();
-        assert!(
-            u64::from_le_bytes(n) >= pack,
-            "ledger {} must stay >= real pack bytes {}",
-            u64::from_le_bytes(n),
-            pack
-        );
-        assert!(cache.path(&pack_name('a')).exists());
-        // And sibling estimates floor a stale-low ledger at real bytes.
-        fs::write(cache.root.join("budget"), 0u64.to_le_bytes()).unwrap();
-        assert_eq!(sibling_pack_estimate(&cache.root), pack);
+    #[ignore = "helper process for fixture_loads_cannot_sweep_an_external_cache"]
+    fn fixture_open_child() {
+        super::super::weights::Store::open_fixture(&fixture_gguf(), None).unwrap();
     }
 
-    /// A `{uuid}.tmp` crash leftover is kept by the sweep for the whole
-    /// grace, so it must count as spend in every admission estimate —
-    /// otherwise repeated interrupted writes sail past the configured cap.
-    /// Retained = regular and inside the sweep grace; aged-out leftovers and
-    /// non-regular `.tmp` names are debris, never spend.
+    /// HOME is overridden only in a child: other tests read it unlocked.
     #[test]
-    fn retained_tmp_files_count_toward_admission_estimates() {
+    fn fixture_loads_cannot_sweep_an_external_cache() {
         let temp = Temp::new();
-        let dir = temp.0.join("cache");
-        fs::create_dir(&dir).unwrap();
-        fs::write(dir.join(pack_file('f')), vec![0_u8; 128]).unwrap();
-        fs::write(dir.join(tmp_name("22222222")), vec![0_u8; 512]).unwrap();
-        let stale_tmp = dir.join(tmp_name("33333333"));
-        fs::write(&stale_tmp, vec![0_u8; 256]).unwrap();
-        age(&stale_tmp, 2 * PACKED_SWEEP_MIN_AGE.as_secs());
-        fs::create_dir(dir.join(tmp_name("44444444"))).unwrap();
-        let outside = temp.0.join("outside.bin");
-        fs::write(&outside, vec![0_u8; 1 << 20]).unwrap();
-        std::os::unix::fs::symlink(&outside, dir.join(tmp_name("55555555"))).unwrap();
-        assert_eq!(pack_bytes(&dir), 128);
-        assert_eq!(retained_tmp_bytes(&dir), 512);
-        // No ledger: estimate = pack bytes + retained tmp bytes.
-        assert_eq!(sibling_pack_estimate(&dir), 640);
-        assert_eq!(reconciled_sibling_pack_spend(&dir), 640);
-        // A ledger reservation does not hide the tmp spend either, and the
-        // reconcile rewrites the ledger to pack bytes only — `.tmp`
-        // leftovers were never reservations.
-        fs::write(dir.join("budget"), 64u64.to_le_bytes()).unwrap();
-        assert_eq!(sibling_pack_estimate(&dir), 128 + 512);
-        assert_eq!(reconciled_sibling_pack_spend(&dir), 640);
-        let mut n = [0u8; 8];
-        File::open(dir.join("budget"))
-            .unwrap()
-            .read_exact(&mut n)
+        let home = temp.0.join("home");
+        let parent = home.join(if cfg!(target_os = "macos") {
+            "Library/Caches/mlx-node/qwen4-packed"
+        } else {
+            ".cache/mlx-node/qwen4-packed"
+        });
+        fs::create_dir_all(&parent).unwrap();
+        let stub: [(&str, &[u8]); 1] = [(".manifest", b"path=/gone\nfile=x.gguf\n")];
+        let retired = chunk_fixture(&parent, &"a".repeat(64), &stub, true);
+        let orphan = mapped_fixture(&parent, 'b', 100, true);
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("models::qwen4_exp::packed_cache::tests::fixture_open_child")
+            .arg("--ignored")
+            .env("HOME", &home)
+            .output()
             .unwrap();
-        assert_eq!(u64::from_le_bytes(n), 128);
-        // The writer's own dir counts the same way through root_pack_spend.
-        assert_eq!(
-            root_pack_spend(&temp.0, &dir, 128 + 512, sibling_pack_estimate),
-            640
-        );
-        // And admission itself must see the retained bytes: a cap with room
-        // for the write beside the pack alone must veto once the tmp spend
-        // is counted, then admit after the leftover ages out.
-        let w = weight("affine");
-        let cache = PackedCache {
-            root: dir.clone(),
-            manifest: None,
-        };
-        // The write reservation equals a published pack's length — measure
-        // it once in a scratch dir.
-        let reserve = {
-            let probe = PackedCache {
-                root: temp.0.join("probe"),
-                manifest: None,
-            };
-            probe.write("k", &w).unwrap();
-            fs::metadata(probe.path("k")).unwrap().len()
-        };
-        fs::remove_file(dir.join("budget")).unwrap();
-        cache
-            .write_with_total_cap("k", &w, Some(128 + reserve))
-            .unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
         assert!(
-            !cache.path("k").exists(),
-            "a retained crash leftover must veto admission over the cap"
+            child.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "fixture child did not run: {stdout}{}",
+            String::from_utf8_lossy(&child.stderr)
         );
-        fs::remove_file(dir.join(tmp_name("22222222"))).unwrap();
-        cache
-            .write_with_total_cap("k", &w, Some(128 + reserve))
-            .unwrap();
         assert!(
-            cache.path("k").exists(),
-            "once the leftover is gone the same cap admits the write"
+            retired.exists(),
+            "a fixture load swept the user's retired chunk dir"
+        );
+        assert!(
+            orphan.exists(),
+            "a fixture load swept the user's orphaned mapped pack"
+        );
+        until_gone(
+            || drop(PackedCache::new_at(&parent, BTreeSet::from([fixture_gguf()])).unwrap()),
+            || !retired.exists() && !orphan.exists(),
+        );
+        assert!(
+            !retired.exists() && !orphan.exists(),
+            "both dirs must be sweep-eligible or the checks above prove nothing"
         );
     }
 }

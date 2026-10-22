@@ -1,21 +1,24 @@
 //! Bounded, positional SSD reads. Descriptors never create MLX arrays. Only
 //! selected expert matrices and embedding rows are read on cache misses.
-//! Admitted hot banks can be prepared once; PLE stays row-addressable. Matrix chunks
-//! may reuse a bounded persistent cache of their losslessly packed arrays.
-use crate::models::qwen4_exp::runtime_flags;
+//! Admitted hot banks can be prepared once; PLE stays row-addressable. Routed
+//! experts of a GGUF checkpoint also live in the mapped expert pack.
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use napi::{Error, Result};
 use serde::Deserialize;
 
+use super::row_fetch::{Fetcher, Job};
+use super::tripwire::{Fallback, Live, Tripwire};
 use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::QuantizedLinear;
 use crate::utils::gguf::{
-    GgufFile, GgufLoadOptions, GgufMetaValue, GgufTensorInfo, GgufTensorType, load_gguf_tensors,
+    GgufFile, GgufLoadOptions, GgufMetaValue, GgufTensorInfo, GgufTensorType, load_gguf_tensor,
     parse_gguf, symmetric_zero_point,
 };
 
@@ -27,9 +30,55 @@ mod residency;
 pub const CACHE_BYTES: u64 = 8 << 30;
 pub(super) const MAX_READ_BYTES: u64 = 64 << 20;
 const MAX_HEADER_BYTES: u64 = 16 << 20;
+/// Reader threads for token/PLE rows: 17 random 90 B-2.7 KB reads per token.
+/// A layer-major prefill asks for a whole prompt's rows at once while the
+/// pack stream yields to them: 32 readers finish a 6k prompt's 58,718 rows
+/// in 0.27 s beside the stream, 4 in 1.17 s.
+const ROW_READERS: usize = 32;
 
-fn err(message: impl ToString) -> Error {
-    Error::from_reason(message.to_string())
+/// Decoded-row LRU and reader-thread counters, shared with `residencyInfo()`.
+#[derive(Default)]
+pub struct LookupStats {
+    /// Distinct rows asked of the decoded-row LRU per lookup window.
+    pub lookups: AtomicU64,
+    /// Lookups the LRU had to import.
+    pub misses: AtomicU64,
+    /// Imports whose bytes a reader thread had ready.
+    pub prefetched: AtomicU64,
+    /// Imports the model thread read itself or waited for after requesting.
+    pub late: AtomicU64,
+    /// Decoded rows the LRU bound evicted, and the bytes those evictions
+    /// released: a window's shared buffer goes with its last row.
+    pub evicted_rows: AtomicU64,
+    pub evicted_row_bytes: AtomicU64,
+}
+
+impl LookupStats {
+    fn count(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn evicted_rows(&self) -> u64 {
+        self.evicted_rows.load(Ordering::Relaxed)
+    }
+    pub fn evicted_row_bytes(&self) -> u64 {
+        self.evicted_row_bytes.load(Ordering::Relaxed)
+    }
+    pub fn lookups(&self) -> u64 {
+        self.lookups.load(Ordering::Relaxed)
+    }
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
+    }
+    pub fn prefetched(&self) -> u64 {
+        self.prefetched.load(Ordering::Relaxed)
+    }
+    pub fn late(&self) -> u64 {
+        self.late.load(Ordering::Relaxed)
+    }
+}
+
+pub(super) fn err(e: impl std::fmt::Display) -> Error {
+    Error::from_reason(e.to_string())
 }
 
 #[derive(Clone)]
@@ -86,11 +135,13 @@ impl Tensor {
         }
         Ok((self.offset + self.row_bytes()? * start as u64, bytes))
     }
-    fn packed_key(&self, name: &str, start: usize, rows: usize) -> Result<Option<String>> {
-        let (offset, bytes) = self.range(start, rows)?;
+    /// Quantized multi-row GGUF matrices the mapped pack can hold; sparse
+    /// embedding/PLE rows are cheap to unpack and never packed.
+    fn packable(&self, name: &str, start: usize, rows: usize) -> Result<bool> {
+        let (_, bytes) = self.range(start, rows)?;
         Ok(match self.encoding {
-            Encoding::Gguf(ty)
-                if rows > 1
+            Encoding::Gguf(ty) => {
+                rows > 1
                     && bytes >= 4096
                     && (ty.k_quant_format().is_some()
                         || matches!(
@@ -101,18 +152,9 @@ impl Tensor {
                                 | GgufTensorType::Q8_0
                         ))
                     && name != "per_layer_token_embd.weight"
-                    && name != "token_embd.weight" =>
-            {
-                Some(super::packed_cache::chunk_key(
-                    &self.path,
-                    offset,
-                    bytes,
-                    rows,
-                    self.width()?,
-                    ty as u32,
-                ))
+                    && name != "token_embd.weight"
             }
-            _ => None,
+            Encoding::Safe(_) => false,
         })
     }
 }
@@ -130,64 +172,12 @@ pub struct Weight {
     pub(super) mode: String,
 }
 impl Weight {
-    pub(super) fn mixer_down_inject(
-        &self,
-        x: &MxArray,
-        injection: &Self,
-    ) -> Result<Option<(MxArray, MxArray)>> {
-        if !(runtime_flags::is_one(c"MLX_QWEN4_MIXER_DOWN_INJECT")
-            || runtime_flags::is_one(c"MLX_QWEN4_MIXER_SPLIT_K"))
-            || runtime_flags::is_zero(c"MLX_QWEN4_DECODE_MIXER_ACT")
-            || !crate::engine::persistence::compiled_forward_backend_available()
-            || [self, injection]
-                .iter()
-                .any(|w| w.mode != "affine" || w.bits != 8 || w.group != 32)
-        {
-            return Ok(None);
-        }
-        let (Some(sd), Some(bd), Some(si), Some(bi)) = (
-            &self.scales,
-            &self.biases,
-            &injection.scales,
-            &injection.biases,
-        ) else {
-            return Ok(None);
-        };
-        let mut out = std::ptr::null_mut();
-        let mut gate = std::ptr::null_mut();
-        if !unsafe {
-            mlx_sys::mlx_qwen4_mixer_down_inject(
-                x.as_raw_ptr(),
-                self.values.as_raw_ptr(),
-                sd.as_raw_ptr(),
-                bd.as_raw_ptr(),
-                injection.values.as_raw_ptr(),
-                si.as_raw_ptr(),
-                bi.as_raw_ptr(),
-                &mut out,
-                &mut gate,
-            )
-        } {
-            return Ok(None);
-        }
-        Ok(Some((
-            MxArray::from_handle(out, "Qwen4 mixer activation with injection")?,
-            MxArray::from_handle(gate, "Qwen4 mixer injection projection")?,
-        )))
-    }
-
     pub(super) fn mixer_act(&self, x: &MxArray) -> Result<Option<MxArray>> {
         let decode = x.shape_at(1)? == 1;
-        let setting = if decode {
-            c"MLX_QWEN4_DECODE_MIXER_ACT"
-        } else {
-            c"MLX_QWEN4_PREFILL_MIXER_BM32"
-        };
         if self.mode != "affine"
             || self.bits != 8
             || self.group != 32
             || !crate::engine::persistence::compiled_forward_backend_available()
-            || runtime_flags::is_zero(setting)
         {
             return Ok(None);
         }
@@ -214,53 +204,8 @@ impl Weight {
         }
     }
 
-    pub(super) fn hyper_up_inject(
-        &self,
-        x: &MxArray,
-        normed: &MxArray,
-        injection: &MxArray,
-    ) -> Result<Option<(MxArray, MxArray)>> {
-        if self.mode != "affine"
-            || self.bits != 8
-            || self.group != 32
-            || !runtime_flags::is_one(c"MLX_QWEN4_MIXER_INJECT")
-            || runtime_flags::is_zero(c"MLX_QWEN4_HYPER_UP")
-            || runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
-        {
-            return Ok(None);
-        }
-        let (Some(scales), Some(biases)) = (&self.scales, &self.biases) else {
-            return Ok(None);
-        };
-        let mut mixed = std::ptr::null_mut();
-        let mut gate = std::ptr::null_mut();
-        if !unsafe {
-            mlx_sys::mlx_qwen4_hyper_up_inject(
-                x.as_raw_ptr(),
-                self.values.as_raw_ptr(),
-                scales.as_raw_ptr(),
-                biases.as_raw_ptr(),
-                normed.as_raw_ptr(),
-                injection.as_raw_ptr(),
-                &mut mixed,
-                &mut gate,
-            )
-        } {
-            return Ok(None);
-        }
-        Ok(Some((
-            MxArray::from_handle(mixed, "Qwen4 mixer with injection")?,
-            MxArray::from_handle(gate, "Qwen4 mixer injection gate")?,
-        )))
-    }
-
     pub(super) fn hyper_up(&self, x: &MxArray, normed: &MxArray) -> Result<Option<MxArray>> {
-        if self.mode != "affine"
-            || self.bits != 8
-            || self.group != 32
-            || runtime_flags::is_zero(c"MLX_QWEN4_HYPER_UP")
-            || runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
-        {
+        if self.mode != "affine" || self.bits != 8 || self.group != 32 {
             return Ok(None);
         }
         let (Some(scales), Some(biases)) = (&self.scales, &self.biases) else {
@@ -344,7 +289,6 @@ impl Weight {
         if self.mode == "affine"
             && self.bits == 8
             && self.group == 32
-            && !runtime_flags::is_zero(c"MLX_QWEN4_DENSE_DECODE_STORAGE")
             && let (Some(scales), Some(biases)) = (&self.scales, &self.biases)
         {
             let compact = unsafe {
@@ -356,18 +300,10 @@ impl Weight {
                 )
             };
             if !compact.is_null() {
-                let y = MxArray::from_handle(compact, "Qwen4 compact dense decode")?;
-                if runtime_flags::is_one(c"MLX_QWEN4_SYNC_PROJECTIONS") {
-                    MxArray::eval_arrays_with_context(&[&y], "qwen4::weights::y")?;
-                }
-                return Ok(y);
+                return MxArray::from_handle(compact, "Qwen4 compact dense decode");
             }
         }
-        let compact = if self.mode == "affine"
-            && self.bits == 8
-            && self.group == 32
-            && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_DENSE_STORAGE")
-        {
+        let compact = if self.mode == "affine" && self.bits == 8 && self.group == 32 {
             match (&self.scales, &self.biases) {
                 (Some(scales), Some(biases)) => unsafe {
                     mlx_sys::mlx_qwen4_dense_prefill(
@@ -398,24 +334,11 @@ impl Weight {
         } else {
             let values = if x.dtype()? == DType::BFloat16
                 && let Some(dense) = &self.dense_bf16
-                && !runtime_flags::is_zero(c"MLX_QWEN4_DENSE_BF16_CACHE")
             {
                 dense
             } else {
                 &self.values
             };
-            if runtime_flags::is_one(c"MLX_QWEN4_ROUTER_ROW_SCHEDULE") {
-                let compact = unsafe {
-                    mlx_sys::mlx_qwen4_router_decode(x.as_raw_ptr(), values.as_raw_ptr())
-                };
-                if !compact.is_null() {
-                    let y = MxArray::from_handle(compact, "Qwen4 router row schedule")?;
-                    if runtime_flags::is_one(c"MLX_QWEN4_SYNC_PROJECTIONS") {
-                        MxArray::eval_arrays_with_context(&[&y], "qwen4::weights::y")?;
-                    }
-                    return Ok(y);
-                }
-            }
             let weight = values.transpose(None)?.astype(x.dtype()?)?;
             let shape = x.shape()?;
             let (&width, outer_shape) = shape
@@ -438,13 +361,6 @@ impl Weight {
                 x.matmul(&weight)?
             }
         };
-        // MLX owns the input buffers until this output is evaluated, including
-        // when an LRU entry is evicted. The decoder fences each expert output,
-        // recurrent update and layer; these bounded groups can submit their
-        // dependent projections together instead of blocking after each one.
-        if runtime_flags::is_one(c"MLX_QWEN4_SYNC_PROJECTIONS") {
-            MxArray::eval_arrays_with_context(&[&y], "qwen4::weights::y")?;
-        }
         Ok(y)
     }
     pub fn dense(&self) -> Result<MxArray> {
@@ -486,15 +402,26 @@ impl Weight {
         .into_iter()
         .flatten()
         {
-            bytes += a.size()?
-                * match a.dtype()? {
-                    DType::Uint8 | DType::Int8 => 1,
-                    DType::Float16 | DType::BFloat16 => 2,
-                    _ => 4,
-                };
+            bytes += array_bytes(a)?;
         }
         Ok(bytes)
     }
+}
+
+fn array_bytes(a: &MxArray) -> Result<u64> {
+    Ok(a.size()?
+        * match a.dtype()? {
+            DType::Uint8 | DType::Int8 => 1,
+            DType::Float16 | DType::BFloat16 => 2,
+            _ => 4,
+        })
+}
+
+/// One lookup window's Metal buffer, shared by the rows it imported. It is
+/// released with its last row view, so it is charged whole until then.
+struct WindowBank {
+    bytes: u64,
+    views: usize,
 }
 
 pub struct Store {
@@ -514,8 +441,31 @@ pub struct Store {
     pub(super) plan: super::memory::Plan,
     banks: HashMap<String, Arc<Weight>>,
     bank_bytes: u64,
+    mtp_banks_declined: bool,
+    /// Draft-bank bytes the mapped plan budgeted beside the dense banks; the
+    /// bank admission honours them, the slot path leaves them at zero.
+    draft_bank_budget: u64,
     paired_banks: HashMap<(String, String), Arc<Weight>>,
     slots: HashMap<usize, expert_slots::ExpertSlots>,
+    mapped_experts: HashMap<usize, expert_slots::MappedExperts>,
+    /// Start of the last forward pass in mapped mode (bank re-wire gate).
+    mapped_pass_start: Option<std::time::Instant>,
+    prefetch: Option<super::prefetch::Pool>,
+    /// The turn opened while the pack streams: its passes do not touch, and
+    /// the layers already run are kept wired instead.
+    streaming_pass: bool,
+    last_touch: Option<std::time::Instant>,
+    /// A layer-major prefill group runs: the banks of the layers already
+    /// swept are kept wired until it commits, through asynchronous touches
+    /// whose arrays wait in `pending_touch` for that commit.
+    group_in_progress: bool,
+    pending_touch: Vec<MxArray>,
+    /// Layers covered by every bank touch, in order.
+    #[cfg(test)]
+    pub(in super::super) touches: Vec<Vec<usize>>,
+    /// Whether each touch in `touches` was submitted asynchronously.
+    #[cfg(test)]
+    pub(in super::super) touches_async: Vec<bool>,
     wide_routes: HashMap<usize, Vec<u32>>,
     deferred_reduction_layer: Option<usize>,
     slot_capacity: Option<usize>,
@@ -529,8 +479,28 @@ pub struct Store {
     packed: Option<super::packed_cache::PackedCache>,
     pub packed_hits: u64,
     pub packed_bytes_read: u64,
-    pub lookup_batches: u64,
-    pub lookup_misses: u64,
+    mapped: Option<super::mapped_pack::MappedPack>,
+    /// One open descriptor per checkpoint file; row reads `pread` through it.
+    files: HashMap<PathBuf, Arc<File>>,
+    rows: Option<Fetcher>,
+    /// Rows the reader threads or the model thread still have to read;
+    /// the mapped pack's stream yields while it is above zero.
+    rows_pending: Arc<AtomicUsize>,
+    #[cfg(test)]
+    pub(in super::super) row_readers: bool,
+    /// Rows a `linear_rows` window projected one at a time (no row-batched
+    /// kernel admitted the weight); a prefill window must never add to it.
+    #[cfg(test)]
+    pub(in super::super) single_row_projections: u64,
+    /// (vectors, row-kernel calls) of every vector-window projection.
+    #[cfg(test)]
+    pub(in super::super) vector_windows: Vec<(i64, u64)>,
+    pub lookup: Arc<LookupStats>,
+    pub live: Arc<Live>,
+    tripwire: Tripwire,
+    window_banks: HashMap<u64, WindowBank>,
+    row_bank: HashMap<(String, usize, usize), u64>,
+    next_window_bank: u64,
 }
 
 #[derive(Deserialize)]
@@ -542,7 +512,8 @@ struct SafeDescriptor {
 
 impl Store {
     pub(super) fn check_forward_headroom(&self) -> Result<()> {
-        self.check_forward_headroom_with(super::memory::check_growth_headroom)
+        let mapped = self.plan.mapped;
+        self.check_forward_headroom_with(|| super::memory::check_growth_headroom(mapped))
     }
 
     fn check_forward_headroom_with(&self, check: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -567,7 +538,8 @@ impl Store {
     /// payload reads still pass the ordinary live admission checks.
     #[cfg(test)]
     pub(in super::super) fn open_fixture(path: &Path, root: Option<&Path>) -> Result<Self> {
-        let mut store = Self::open_metadata(path, root)?;
+        let root = root.map_or_else(Self::fixture_pack_root, Path::to_path_buf);
+        let mut store = Self::open_metadata(path, Some(&root))?;
         store.fixture = true;
         // Logical ceiling includes the importer staging allowance; the
         // synthetic tensors allocate only their actual payload sizes.
@@ -575,6 +547,14 @@ impl Store {
         store.plan.budget = store.cache_limit;
         store.plan.hot_bytes = store.hot_bytes()?;
         Ok(store)
+    }
+
+    /// `open_metadata`'s `None` resolves the user's real pack cache, whose
+    /// sweep deletes idle packs of other builds and processes; a unit test
+    /// must never reach it. The root is never created.
+    #[cfg(test)]
+    fn fixture_pack_root() -> PathBuf {
+        std::env::temp_dir().join(format!("mlx-qwen4-fixture-packs-{}", uuid::Uuid::new_v4()))
     }
 
     /// Auxiliary source checkpoints contribute only descriptors, so their
@@ -601,18 +581,33 @@ impl Store {
             plan: super::memory::Plan {
                 budget: cache_limit,
                 hot_bytes: 0,
-                resident: false,
-                policy: "stream".into(),
                 available_bytes: None,
                 physical_bytes: None,
-                resident_bank_bytes: 0,
-                resident_expert_layers: 0,
+                resident_bank_bytes: Default::default(),
                 partial_expert_slots: 0,
+                mapped_pack_files: 0,
+                mapped: false,
+                mapped_bytes: 0,
+                mapped_bank_budget: 0,
+                live_non_reclaimable: 0,
             },
             banks: HashMap::new(),
             bank_bytes: 0,
+            mtp_banks_declined: false,
+            draft_bank_budget: 0,
             paired_banks: HashMap::new(),
             slots: HashMap::new(),
+            mapped_experts: HashMap::new(),
+            mapped_pass_start: None,
+            prefetch: None,
+            streaming_pass: false,
+            last_touch: None,
+            group_in_progress: false,
+            pending_touch: Vec::new(),
+            #[cfg(test)]
+            touches: Vec::new(),
+            #[cfg(test)]
+            touches_async: Vec::new(),
             wide_routes: HashMap::new(),
             deferred_reduction_layer: None,
             slot_capacity: None,
@@ -626,8 +621,22 @@ impl Store {
             packed: None,
             packed_hits: 0,
             packed_bytes_read: 0,
-            lookup_batches: 0,
-            lookup_misses: 0,
+            mapped: None,
+            files: HashMap::new(),
+            rows: None,
+            rows_pending: Arc::default(),
+            #[cfg(test)]
+            row_readers: true,
+            #[cfg(test)]
+            single_row_projections: 0,
+            #[cfg(test)]
+            vector_windows: Vec::new(),
+            lookup: Arc::default(),
+            live: Arc::default(),
+            tripwire: Tripwire::default(),
+            window_banks: HashMap::new(),
+            row_bank: HashMap::new(),
+            next_window_bank: 0,
         };
         if s.gguf {
             s.index_gguf(path)?;
@@ -637,7 +646,7 @@ impl Store {
         if s.tensors.is_empty() {
             return Err(err("No model tensors found"));
         }
-        if s.gguf && !runtime_flags::is_zero(c"MLX_QWEN4_PACKED_CACHE") {
+        if s.gguf {
             let files = s.tensors.values().map(|t| t.path.clone()).collect();
             s.packed = match root {
                 Some(root) => super::packed_cache::PackedCache::new_at(root, files),
@@ -672,11 +681,46 @@ impl Store {
                 continue;
             }
             self.recency.remove(&old);
-            if let Some(w) = self.cache.remove(&old) {
-                self.cache_bytes -= w.bytes()?;
+            if let Some((_, freed)) = self.uncache(&old)? {
+                self.cache_bytes -= freed;
+                if old.2 == 1 {
+                    LookupStats::count(&self.lookup.evicted_rows);
+                    self.lookup
+                        .evicted_row_bytes
+                        .fetch_add(freed, Ordering::Relaxed);
+                }
             }
         }
         Ok(())
+    }
+    /// Drop a cache entry and return it with the bytes its removal released:
+    /// a row view of a window's buffer releases that buffer's bytes with the
+    /// last view and nothing before, every other entry its own bytes.
+    pub(super) fn uncache(
+        &mut self,
+        key: &(String, usize, usize),
+    ) -> Result<Option<(Arc<Weight>, u64)>> {
+        let Some(w) = self.cache.remove(key) else {
+            return Ok(None);
+        };
+        let freed = match self.row_bank.remove(key) {
+            Some(id) => {
+                let bank = self
+                    .window_banks
+                    .get_mut(&id)
+                    .ok_or_else(|| err("Qwen4 decoded row names a released window buffer"))?;
+                bank.views -= 1;
+                if bank.views == 0 {
+                    let bytes = bank.bytes;
+                    self.window_banks.remove(&id);
+                    bytes
+                } else {
+                    0
+                }
+            }
+            None => w.bytes()?,
+        };
+        Ok(Some((w, freed)))
     }
     fn insert(&mut self, name: String, mut t: Tensor) -> Result<()> {
         let elements = t
@@ -696,8 +740,8 @@ impl Store {
         if !t.bytes.is_multiple_of(t.rows()? as u64) {
             return Err(err(format!("Unaligned SSD rows: {name}")));
         }
-        // Relative, absolute and symlink aliases must share the same prepared
-        // chunk keys. Resolve once while indexing, not on each matrix read.
+        // Relative, absolute and symlink aliases must share one source
+        // identity and one descriptor. Resolve once while indexing.
         t.path = t.path.canonicalize().map_err(err)?;
         if self.tensors.insert(name.clone(), t).is_some() {
             return Err(err(format!("Duplicate tensor {name}")));
@@ -890,6 +934,19 @@ impl Store {
         }
         Ok(())
     }
+    #[cfg(test)]
+    pub(super) fn lru_holds(&self, name: &str) -> bool {
+        self.cache.keys().any(|(n, _, _)| n == name)
+    }
+    #[cfg(test)]
+    pub(super) fn cached_bytes(&self) -> u64 {
+        self.cache_bytes
+    }
+    #[cfg(test)]
+    pub(super) fn set_cache_limit(&mut self, bytes: u64) {
+        self.cache_limit = bytes;
+        self.plan.budget = bytes;
+    }
     pub fn descriptor(&self, name: &str) -> Result<&Tensor> {
         self.tensors
             .get(name)
@@ -932,18 +989,19 @@ impl Store {
 
     /// Preload only the already selected expert group. At most 64 MiB of
     /// verified CPU payloads coexist; MLX imports and all Store/slot mutations
-    /// stay on the inference thread in original request order.
+    /// stay on the inference thread in original request order. Whole-expert
+    /// batches of packed tensors come from the mapped pack by range; anything
+    /// else is imported from the checkpoint.
     fn read_expert_batch(
         &mut self,
         requests: &[(String, usize, usize)],
     ) -> Result<Vec<Arc<Weight>>> {
-        if self.packed.is_none() || runtime_flags::is_zero(c"MLX_QWEN4_PARALLEL_READS") {
+        if self.mapped.is_none() {
             return requests
                 .iter()
                 .map(|(name, start, rows)| self.read(name, *start, *rows))
                 .collect();
         }
-        let mut jobs = Vec::new();
         let mut indices = Vec::new();
         let mut total = 0u64;
         for (i, (name, start, rows)) in requests.iter().enumerate() {
@@ -953,14 +1011,13 @@ impl Store {
                 continue;
             }
             let d = self.descriptor(name)?;
-            if let Some(key) = d.packed_key(name, *start, *rows)? {
+            if d.packable(name, *start, *rows)? {
                 let bytes = (d.runtime_bytes()? / d.rows()? as u64).saturating_mul(*rows as u64);
                 total = total.saturating_add(bytes);
-                jobs.push((key, bytes));
                 indices.push(i);
             }
         }
-        if total > MAX_READ_BYTES || jobs.len() > 24 || jobs.len() < 2 {
+        if total > MAX_READ_BYTES || indices.len() > 24 || indices.len() < 2 {
             return requests
                 .iter()
                 .map(|(name, start, rows)| self.read(name, *start, *rows))
@@ -973,14 +1030,18 @@ impl Store {
         self.evict_to(self.cache_limit.saturating_sub(staging_bytes))?;
         super::memory::maintain_freelist(self.plan.physical_bytes);
         super::memory::admit(staging_bytes)?;
-        let cache = self
-            .packed
+        let subset: Vec<_> = indices.iter().map(|&i| requests[i].clone()).collect();
+        let verified = self
+            .mapped
             .as_ref()
-            .ok_or_else(|| err("Qwen4 packed cache disappeared before the prepared batch read"))?;
-        let verified = cache.read_batch(&jobs)?;
+            .map(|pack| pack.read_batch(&subset))
+            .transpose()?
+            .flatten();
         let mut prepared: Vec<_> = (0..requests.len()).map(|_| None).collect();
-        for (i, chunk) in indices.into_iter().zip(verified) {
-            prepared[i] = Some(chunk);
+        if let Some(chunks) = verified {
+            for (i, chunk) in indices.into_iter().zip(chunks) {
+                prepared[i] = Some(chunk);
+            }
         }
         requests
             .iter()
@@ -989,9 +1050,82 @@ impl Store {
             .collect()
     }
 
-    /// Gather a bounded lookup window, sharing duplicate rows and submitting
-    /// cold imports/dequantizations together. Decoded rows use the existing
-    /// Store-owned LRU and its byte accounting, so no second cache is reserved.
+    /// Open the mapped expert pack, building whatever is missing from the
+    /// checkpoint. A failure leaves the checkpoint reader in charge; it
+    /// never fails the load.
+    pub(in super::super) fn prepare_mapped_pack(&mut self) -> Result<()> {
+        let dir = match &self.packed {
+            Some(packed) if self.gguf => packed.mapped_dir().to_path_buf(),
+            _ => return Ok(()),
+        };
+        self.prepare_mapped_pack_at(&dir)
+    }
+
+    fn prepare_mapped_pack_at(&mut self, dir: &Path) -> Result<()> {
+        let Some(packed) = &self.packed else {
+            return Ok(());
+        };
+        let Some(identity) = packed.identity() else {
+            return Ok(());
+        };
+        let mut routed: Vec<(usize, usize, String, Tensor)> = Vec::new();
+        for (name, tensor) in &self.tensors {
+            let Some((layer, part)) = routed_expert_tensor(name) else {
+                continue;
+            };
+            if tensor.shape.len() != 3
+                || tensor.shape[0] == 0
+                || !tensor.packable(name, 0, tensor.shape[1])?
+            {
+                continue;
+            }
+            routed.push((layer, part, name.clone(), tensor.clone()));
+        }
+        if routed.is_empty() {
+            return Ok(());
+        }
+        routed.sort_by_key(|r| (r.0, r.1));
+        let sources: Vec<RoutedExpertSource> = routed
+            .into_iter()
+            .map(|(_, _, name, tensor)| RoutedExpertSource { name, tensor })
+            .collect();
+        let dyn_sources: Vec<&dyn super::mapped_pack::ExpertSource> = sources
+            .iter()
+            .map(|s| s as &dyn super::mapped_pack::ExpertSource)
+            .collect();
+        let started = std::time::Instant::now();
+        match super::mapped_pack::MappedPack::open_or_build(
+            dir,
+            identity,
+            Some(packed.manifest()),
+            &dyn_sources,
+        ) {
+            Ok((pack, report)) => {
+                tracing::info!(
+                    "qwen4 mapped pack: {} opened, {} built, {} unavailable in {:.1} s at {}",
+                    report.opened,
+                    report.built,
+                    report.skipped,
+                    started.elapsed().as_secs_f64(),
+                    pack.dir().display()
+                );
+                self.plan.mapped_pack_files = pack.len();
+                self.mapped = Some(pack);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "qwen4 mapped pack unavailable, importing experts from the checkpoint: {e}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Gather a bounded lookup window, sharing duplicate rows. Decoded rows
+    /// use the existing Store-owned LRU and its byte accounting, so no second
+    /// cache is reserved. The gather stays lazy: the layer that consumes it
+    /// submits the imports and dequantizations with its own graph instead of
+    /// draining the GPU at the token start.
     pub fn lookup_rows(&mut self, name: &str, ids: &[usize]) -> Result<MxArray> {
         let d = self.descriptor(name)?;
         let total_rows = d.rows()?;
@@ -1006,28 +1140,196 @@ impl Store {
             return Err(err("Lookup window exceeds tensor or staging bounds"));
         }
         let mut unique = HashMap::new();
-        let misses_before = self.lookup_misses;
         let mut rows = Vec::new();
         let mut order = Vec::with_capacity(ids.len());
+        let mut imported = Vec::new();
+        let banked = self.banks.contains_key(name);
         for &id in ids {
             let slot = if let Some(&slot) = unique.get(&id) {
                 slot
             } else {
+                LookupStats::count(&self.lookup.lookups);
+                let miss = !banked && !self.cache.contains_key(&(name.to_string(), id, 1));
+                if miss {
+                    LookupStats::count(&self.lookup.misses);
+                }
                 let row = self.read_impl(name, id, 1, true, None)?.dense_pending()?;
-                let slot = rows.len() as i32;
+                let slot = rows.len();
                 rows.push(row);
+                if miss {
+                    imported.push((id, slot));
+                }
                 unique.insert(id, slot);
                 slot
             };
-            order.push(slot);
+            order.push(slot as i32);
         }
-        let bank = MxArray::concatenate_many(rows.iter().collect(), Some(0))?;
-        let out = bank.take(&MxArray::from_int32(&order, &[order.len() as i64])?, 0)?;
-        if self.lookup_misses != misses_before {
-            MxArray::eval_arrays_with_context(&[&out], "qwen4::lookup_window")?;
+        if let [row] = rows.as_slice()
+            && order.len() == 1
+        {
+            return Ok(row.clone());
         }
-        self.lookup_batches += 1;
-        Ok(out)
+        // The rows this window imported and still holds share one Metal
+        // buffer: each buffer is a Metal resource and MLX aborts at ~499k of
+        // them, which one buffer per row reached on the third fresh
+        // 10k-token prompt. Rows the LRU already held keep their buffer, so
+        // no buffer carries a slot nothing points to, and a window's buffer
+        // is charged whole until its last row view is evicted. The window
+        // then takes that buffer as ONE concatenation input beside the held
+        // rows: one input per imported row again would add a copy dispatch
+        // per import to every layer of every decode token (measured 11 us
+        // per 2-hit/6-miss lookup, 0.5 ms per token over 48 layers).
+        imported.retain(|&(id, _)| self.cache.contains_key(&(name.to_string(), id, 1)));
+        if imported.len() > 1 {
+            let fresh = MxArray::concatenate_many(
+                imported.iter().map(|&(_, slot)| &rows[slot]).collect(),
+                Some(0),
+            )?;
+            let bytes = array_bytes(&fresh)?;
+            let id = self.next_window_bank;
+            self.next_window_bank += 1;
+            let mut rehomed = 0;
+            let mut position = vec![0i32; rows.len()];
+            for (i, &(row, slot)) in imported.iter().enumerate() {
+                let key = (name.to_string(), row, 1);
+                let view = fresh.slice_axis(0, i as i64, i as i64 + 1)?;
+                let entry = self
+                    .cache
+                    .get_mut(&key)
+                    .ok_or_else(|| err("Qwen4 decoded row left the LRU inside its window"))?;
+                rehomed += entry.bytes()?;
+                *entry = Arc::new(Weight {
+                    values: view,
+                    dense_bf16: None,
+                    scales: None,
+                    biases: None,
+                    group: 0,
+                    bits: 0,
+                    mode: String::new(),
+                });
+                self.row_bank.insert(key, id);
+                position[slot] = i as i32;
+            }
+            self.window_banks.insert(
+                id,
+                WindowBank {
+                    bytes,
+                    views: imported.len(),
+                },
+            );
+            self.cache_bytes = self.cache_bytes - rehomed + bytes;
+            self.peak_cache_bytes = self.peak_cache_bytes.max(self.cache_bytes);
+            let mut parts = vec![&fresh];
+            for (slot, row) in rows.iter().enumerate() {
+                if !imported.iter().any(|&(_, s)| s == slot) {
+                    position[slot] = (imported.len() + parts.len() - 1) as i32;
+                    parts.push(row);
+                }
+            }
+            let order: Vec<i32> = order.iter().map(|&slot| position[slot as usize]).collect();
+            let window = if parts.len() == 1 {
+                fresh
+            } else {
+                MxArray::concatenate_many(parts, Some(0))?
+            };
+            return window.take(&MxArray::from_int32(&order, &[order.len() as i64])?, 0);
+        }
+        let window = MxArray::concatenate_many(rows.iter().collect(), Some(0))?;
+        window.take(&MxArray::from_int32(&order, &[order.len() as i64])?, 0)
+    }
+
+    /// Start reading rows `(tensor, row)` on the reader threads; rows the
+    /// LRU or a bank already holds are skipped. `read_impl` takes the bytes
+    /// when it imports the row.
+    pub fn prefetch_rows(&mut self, keys: &[(String, usize)]) -> Result<()> {
+        #[cfg(test)]
+        if !self.row_readers {
+            return Ok(());
+        }
+        let mut seen = HashSet::new();
+        let mut jobs = Vec::new();
+        for (name, row) in keys {
+            if !seen.insert((name.as_str(), *row))
+                || self.banks.contains_key(name)
+                || self.cache.contains_key(&(name.clone(), *row, 1))
+            {
+                continue;
+            }
+            let d = self.descriptor(name)?.clone();
+            let (offset, len) = d.range(*row, 1)?;
+            let file = self.file(&d.path)?;
+            jobs.push(Job {
+                key: (name.clone(), *row),
+                file,
+                offset,
+                len: len as usize,
+            });
+        }
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        // One ascending sweep per table instead of a random walk of the
+        // checkpoint: the rows of a window are read in file order.
+        jobs.sort_by_key(|job| (Arc::as_ptr(&job.file) as usize, job.offset));
+        if self.rows.is_none() {
+            self.rows =
+                Some(Fetcher::new(ROW_READERS, Arc::clone(&self.rows_pending)).map_err(err)?);
+        }
+        if let Some(fetcher) = &self.rows {
+            fetcher.request(jobs);
+        }
+        Ok(())
+    }
+
+    /// Finish the reads in flight, then stop the reader threads: the rows
+    /// they fetched stay ready, a row requested later is read late.
+    #[cfg(test)]
+    pub(in super::super) fn pause_rows(&mut self) {
+        if let Some(fetcher) = &mut self.rows {
+            fetcher.wait_idle();
+            fetcher.pause();
+        }
+    }
+
+    fn file(&mut self, path: &Path) -> Result<Arc<File>> {
+        if let Some(file) = self.files.get(path) {
+            return Ok(Arc::clone(file));
+        }
+        let file = Arc::new(File::open(path).map_err(err)?);
+        self.files.insert(path.to_path_buf(), Arc::clone(&file));
+        Ok(file)
+    }
+
+    /// Import `rows` rows of `d`: bytes a reader thread fetched for a single
+    /// row, else a `pread` through the shared descriptor. A reader's error is
+    /// dropped, never returned: it may be older than this lookup, and only the
+    /// read done now says whether the row is readable.
+    fn import_rows(&mut self, d: &Tensor, name: &str, start: usize, rows: usize) -> Result<Weight> {
+        let fetched = if rows == 1 {
+            self.rows
+                .as_ref()
+                .and_then(|fetcher| fetcher.take(&(name.to_string(), start)))
+        } else {
+            None
+        };
+        let bytes = match fetched {
+            Some((Ok(bytes), late)) => {
+                LookupStats::count(if late {
+                    &self.lookup.late
+                } else {
+                    &self.lookup.prefetched
+                });
+                bytes
+            }
+            fetched => {
+                if fetched.is_some() {
+                    LookupStats::count(&self.lookup.late);
+                }
+                let file = self.file(&d.path)?;
+                d.read_rows(&file, start, rows)?
+            }
+        };
+        d.import_bytes(&bytes, rows)
     }
 
     fn read_impl(
@@ -1036,7 +1338,22 @@ impl Store {
         start: usize,
         rows: usize,
         lookup: bool,
-        prepared: Option<Option<super::packed_cache::VerifiedChunk>>,
+        prepared: Option<super::packed_cache::VerifiedChunk>,
+    ) -> Result<Arc<Weight>> {
+        let mapped = self.plan.mapped;
+        self.read_impl_with(name, start, rows, lookup, prepared, || {
+            super::memory::check_growth_headroom(mapped)
+        })
+    }
+
+    fn read_impl_with(
+        &mut self,
+        name: &str,
+        start: usize,
+        rows: usize,
+        lookup: bool,
+        prepared: Option<super::packed_cache::VerifiedChunk>,
+        growth_check: impl FnOnce() -> Result<()>,
     ) -> Result<Arc<Weight>> {
         if let Some(bank) = self.banks.get(name) {
             let d = self.descriptor(name)?;
@@ -1051,150 +1368,39 @@ impl Store {
             return Ok(w);
         }
         let d = self.descriptor(name)?.clone();
-        let (offset, bytes) = d.range(start, rows)?;
+        let (_, bytes) = d.range(start, rows)?;
         let cache_limit = self.cache_limit;
         // Refuse before allocation, also accounting for other models in this
         // process. A freelist spike is transient, so reclaim it and re-poll
         // briefly under the same safety limit before refusing.
         super::memory::check_active_memory_budget(
             cache_limit,
-            crate::array::memory::get_active_memory,
+            || {
+                crate::array::memory::get_active_memory()
+                    - crate::array::mapped_array_bytes() as f64
+            },
             crate::array::memory::clear_cache,
             std::thread::sleep,
         )?;
         super::memory::maintain_freelist(self.plan.physical_bytes);
+        // Mapped experts never pass through here, so growth_bytes holds only
+        // anonymous bytes: token/PLE rows, MTP/vision weights and fallback
+        // projection chunks still consume the system reserve in mapped mode.
         if cfg!(target_os = "macos") && self.growth_bytes >= 256 << 20 {
-            super::memory::check_growth_headroom()?;
+            growth_check()?;
             self.growth_bytes = 0;
         }
         self.evict_to(cache_limit.saturating_sub(MAX_READ_BYTES * 3))?;
-        // Do not persist sparse embedding/PLE rows: they are cheap to unpack,
-        // and caching the enormous table would consume disk without reuse.
-        let packed_key = d.packed_key(name, start, rows)?;
-        let prepared = match prepared {
-            Some(chunk) => chunk
-                .map(super::packed_cache::VerifiedChunk::into_weight)
-                .transpose()?,
-            None => packed_key
-                .as_ref()
-                .and_then(|key| self.packed.as_ref()?.read(key).ok().flatten()),
-        };
+        let prepared = prepared
+            .map(super::packed_cache::VerifiedChunk::into_weight)
+            .transpose()?;
         let prepared_hit = prepared.is_some();
-        let shape = [rows as i64, d.width()? as i64];
         let weight = if let Some((weight, bytes)) = prepared {
             self.packed_hits += 1;
             self.packed_bytes_read += bytes;
             weight
         } else {
-            match &d.encoding {
-                Encoding::Safe(dtype) => {
-                    let mut f = File::open(&d.path).map_err(err)?;
-                    f.seek(SeekFrom::Start(offset)).map_err(err)?;
-                    let mut buf = vec![0; bytes as usize];
-                    f.read_exact(&mut buf).map_err(err)?;
-                    let values = match dtype.as_str() {
-                        "BF16" | "F16" => {
-                            let v: Vec<u16> = buf
-                                .as_chunks::<2>()
-                                .0
-                                .iter()
-                                .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                                .collect();
-                            if dtype == "BF16" {
-                                MxArray::from_bfloat16(&v, &shape)?
-                            } else {
-                                MxArray::from_float16(&v, &shape)?
-                            }
-                        }
-                        "F32" => MxArray::from_float32(
-                            &buf.as_chunks::<4>()
-                                .0
-                                .iter()
-                                .map(|b| f32::from_le_bytes(*b))
-                                .collect::<Vec<_>>(),
-                            &shape,
-                        )?,
-                        "I64" => MxArray::from_int64(
-                            &buf.as_chunks::<8>()
-                                .0
-                                .iter()
-                                .map(|b| i64::from_le_bytes(*b))
-                                .collect::<Vec<_>>(),
-                            &shape,
-                        )?,
-                        _ => unreachable!(),
-                    };
-                    Weight {
-                        dense_bf16: None,
-                        values,
-                        scales: None,
-                        biases: None,
-                        group: 0,
-                        bits: 0,
-                        mode: String::new(),
-                    }
-                }
-                Encoding::Gguf(ty) => {
-                    let tensor = GgufTensorInfo {
-                        name: "weight".into(),
-                        n_dims: 2,
-                        dims: vec![d.width()? as u64, rows as u64],
-                        tensor_type: *ty,
-                        offset: 0,
-                    };
-                    let g = GgufFile {
-                        version: 3,
-                        tensor_count: 1,
-                        metadata: HashMap::new(),
-                        tensors: vec![tensor],
-                        alignment: 32,
-                        data_offset: offset,
-                    };
-                    let mut a = load_gguf_tensors(
-                        &d.path,
-                        &g,
-                        GgufLoadOptions {
-                            verbose: false,
-                            import_k_quants: true,
-                        },
-                    )?;
-                    let values = a
-                        .remove("weight")
-                        .ok_or_else(|| err("GGUF row reader produced no weight"))?;
-                    let scales = a.remove("weight.scales");
-                    let mut biases = a.remove("weight.biases");
-                    if let Some(zero) = symmetric_zero_point(*ty) {
-                        biases = Some(
-                            scales
-                                .as_ref()
-                                .ok_or_else(|| err("Missing affine scales"))?
-                                .mul_scalar(-(zero as f64))?,
-                        );
-                    }
-                    let (group, bits, mode) = if let Some(k) = ty.k_quant_format() {
-                        (k.group_size() as i32, k.bits() as i32, k.mlx_mode())
-                    } else {
-                        (
-                            32,
-                            match ty {
-                                GgufTensorType::Q5_1 => 5,
-                                GgufTensorType::Q8_0 => 8,
-                                _ => 4,
-                            },
-                            "affine",
-                        )
-                    };
-                    Weight {
-                        dense_bf16: None,
-                        values,
-                        scales,
-                        biases,
-                        group,
-                        bits,
-                        mode: mode.into(),
-                    }
-                }
-            }
+            self.import_rows(&d, name, start, rows)?
         };
         let arrays: Vec<_> = [
             Some(&weight.values),
@@ -1209,12 +1415,21 @@ impl Store {
         }
         if !prepared_hit {
             self.bytes_read += bytes;
-            if let (Some(cache), Some(key)) = (&self.packed, &packed_key) {
-                // Cache I/O is optional. A read-only/full disk keeps the original
-                // bounded GGUF path usable, and no partial entry is published.
-                let _ = cache.write(key, &weight);
-            }
         }
+        self.retain_read(name, key, weight, lookup, rows)
+    }
+
+    /// Cache, protect and account a freshly imported chunk.
+    fn retain_read(
+        &mut self,
+        name: &str,
+        key: (String, usize, usize),
+        weight: Weight,
+        lookup: bool,
+        rows: usize,
+    ) -> Result<Arc<Weight>> {
+        let cache_limit = self.cache_limit;
+        let d = self.descriptor(name)?.clone();
         // Embedding lookup already produces BF16 values. Retain that result
         // for a reused row instead of launching a dequantization on every
         // token/PLE access. Charge its actual bytes to the same bounded LRU;
@@ -1225,9 +1440,7 @@ impl Store {
                 || name == "embed_tokens.weight"
                 || name == "per_layer_token_embd.weight"
                 || name.contains("ngram_embedding"))
-            && !runtime_flags::is_zero(c"MLX_QWEN4_CACHE_EMBEDDING_ROWS")
         {
-            self.lookup_misses += 1;
             Weight {
                 dense_bf16: None,
                 values: if lookup {
@@ -1248,14 +1461,10 @@ impl Store {
         // Always-used projections have a protected segment; experts and sparse
         // rows use the remaining LRU. Cap protection at 75%, so new reads retain
         // staging headroom even for a different/BF16 checkpoint topology.
-        // Assembled banks and protected chunks share the pinned allowance.
-        // Full residency reserves the whole main network during preparation;
-        // partial residency keeps at least 25% available to the expert/row LRU.
-        let protect_limit = if self.plan.resident {
-            cache_limit.saturating_sub(self.plan.hot_bytes.max(self.bank_bytes)) * 3 / 4
-        } else {
-            (cache_limit.saturating_sub(self.slot_bytes) * 3 / 4).saturating_sub(self.bank_bytes)
-        };
+        // Assembled banks and protected chunks share the pinned allowance;
+        // at least 25% stays available to the expert/row LRU.
+        let protect_limit =
+            (cache_limit.saturating_sub(self.slot_bytes) * 3 / 4).saturating_sub(self.bank_bytes);
         if d.shape.len() <= 2
             && name != "token_embd.weight"
             && name != "embed_tokens.weight"
@@ -1277,6 +1486,144 @@ impl Store {
         self.cache.insert(key, Arc::clone(&weight));
         Ok(weight)
     }
+}
+
+impl Tensor {
+    /// Import `rows` rows from `start` straight from the checkpoint: raw
+    /// safetensors bytes, or GGUF blocks through the K-quant repack. No cache
+    /// or accounting is touched; the arrays are lazy.
+    pub(super) fn import_rows(&self, start: usize, rows: usize) -> Result<Weight> {
+        let file = File::open(&self.path).map_err(err)?;
+        self.import_bytes(&self.read_rows(&file, start, rows)?, rows)
+    }
+
+    /// The checkpoint bytes of `rows` rows from `start`, through an open
+    /// descriptor of the tensor's file.
+    pub(super) fn read_rows(&self, file: &File, start: usize, rows: usize) -> Result<Vec<u8>> {
+        let (offset, bytes) = self.range(start, rows)?;
+        let mut buf = vec![0; bytes as usize];
+        file.read_exact_at(&mut buf, offset).map_err(err)?;
+        Ok(buf)
+    }
+
+    /// Decode the checkpoint bytes of `rows` consecutive rows into lazy arrays.
+    pub(super) fn import_bytes(&self, buf: &[u8], rows: usize) -> Result<Weight> {
+        if rows == 0 || buf.len() as u64 != self.row_bytes()?.saturating_mul(rows as u64) {
+            return Err(err("SSD row payload does not match its descriptor"));
+        }
+        let shape = [rows as i64, self.width()? as i64];
+        Ok(match &self.encoding {
+            Encoding::Safe(dtype) => {
+                let values = match dtype.as_str() {
+                    "BF16" | "F16" => {
+                        let v: Vec<u16> = buf
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                            .collect();
+                        if dtype == "BF16" {
+                            MxArray::from_bfloat16(&v, &shape)?
+                        } else {
+                            MxArray::from_float16(&v, &shape)?
+                        }
+                    }
+                    "F32" => MxArray::from_float32(
+                        &buf.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|b| f32::from_le_bytes(*b))
+                            .collect::<Vec<_>>(),
+                        &shape,
+                    )?,
+                    "I64" => MxArray::from_int64(
+                        &buf.as_chunks::<8>()
+                            .0
+                            .iter()
+                            .map(|b| i64::from_le_bytes(*b))
+                            .collect::<Vec<_>>(),
+                        &shape,
+                    )?,
+                    _ => unreachable!(),
+                };
+                Weight {
+                    dense_bf16: None,
+                    values,
+                    scales: None,
+                    biases: None,
+                    group: 0,
+                    bits: 0,
+                    mode: String::new(),
+                }
+            }
+            Encoding::Gguf(ty) => {
+                let tensor = GgufTensorInfo {
+                    name: "weight".into(),
+                    n_dims: 2,
+                    dims: vec![self.width()? as u64, rows as u64],
+                    tensor_type: *ty,
+                    offset: 0,
+                };
+                let g = GgufFile {
+                    version: 3,
+                    tensor_count: 1,
+                    metadata: HashMap::new(),
+                    tensors: Vec::new(),
+                    alignment: 32,
+                    data_offset: 0,
+                };
+                let mut a: HashMap<String, MxArray> = load_gguf_tensor(
+                    &mut Cursor::new(buf),
+                    &g,
+                    &tensor,
+                    GgufLoadOptions {
+                        verbose: false,
+                        import_k_quants: true,
+                    },
+                )?
+                .into_iter()
+                .collect();
+                let values = a
+                    .remove("weight")
+                    .ok_or_else(|| err("GGUF row reader produced no weight"))?;
+                let scales = a.remove("weight.scales");
+                let mut biases = a.remove("weight.biases");
+                if let Some(zero) = symmetric_zero_point(*ty) {
+                    biases = Some(
+                        scales
+                            .as_ref()
+                            .ok_or_else(|| err("Missing affine scales"))?
+                            .mul_scalar(-(zero as f64))?,
+                    );
+                }
+                let (group, bits, mode) = if let Some(k) = ty.k_quant_format() {
+                    (k.group_size() as i32, k.bits() as i32, k.mlx_mode())
+                } else {
+                    (
+                        32,
+                        match ty {
+                            GgufTensorType::Q5_1 => 5,
+                            GgufTensorType::Q8_0 => 8,
+                            _ => 4,
+                        },
+                        "affine",
+                    )
+                };
+                Weight {
+                    dense_bf16: None,
+                    values,
+                    scales,
+                    biases,
+                    group,
+                    bits,
+                    mode: mode.into(),
+                }
+            }
+        })
+    }
+}
+
+impl Store {
     pub fn dense(&mut self, name: &str) -> Result<MxArray> {
         let d = self.descriptor(name)?;
         let shape = d.shape.iter().map(|&i| i as i64).collect::<Vec<_>>();
@@ -1288,23 +1635,12 @@ impl Store {
     }
 
     /// Batch independent vectors while retaining the singleton projection's
-    /// accumulation. PLE formerly used GEMV per token; ordinary prompt GEMM
-    /// can round differently and change the subsequent greedy token stream.
-    /// mlxfast TrackFastModel.pleForward uses the ordinary projection for a
-    /// wide window. Keep its M/N/K matrix dispatch, with our existing GGUF
-    /// loader, rather than broadcasting one GEMV for every prompt token.
+    /// accumulation: an ordinary prompt GEMM can round differently and change
+    /// the subsequent greedy token stream. An admitted Q8 bank runs four
+    /// vectors per call of the row-exact decode kernel, every row with the
+    /// bits of its single-row projection.
     pub fn linear_ple_window(&mut self, name: &str, x: &MxArray) -> Result<MxArray> {
-        if self.gguf
-            && x.dtype()? == DType::BFloat16
-            && x.shape()?.len() == 3
-            && x.shape()?[0] == 1
-            && x.shape()?[1] > 8
-            && runtime_flags::is_one(c"MLX_QWEN4_PREFILL_PLE_GEMM")
-        {
-            self.linear(name, x)
-        } else {
-            self.linear_vector_window(name, x)
-        }
+        self.linear_vector_window(name, x)
     }
 
     pub fn linear_vector_window(&mut self, name: &str, x: &MxArray) -> Result<MxArray> {
@@ -1322,9 +1658,30 @@ impl Store {
             return Err(err(format!("Projection shape mismatch: {name}")));
         }
         let count = x.size()? as i64 / width;
+        #[cfg(test)]
+        let dense_row_calls = std::cell::Cell::new(0u64);
         let project = |w: &Weight| -> Result<MxArray> {
             if !vectors || count == 1 {
                 return w.linear(x);
+            }
+            let mut out_shape = outer_shape.to_vec();
+            out_shape.push(w.values.shape_at(0)?);
+            let window = x.reshape(&[1, count, width])?;
+            let step = super::math::rows::MAX_ROWS;
+            let mut parts = Vec::with_capacity(((count + step - 1) / step) as usize);
+            for start in (0..count).step_by(step as usize) {
+                let rows = window.slice_axis(1, start, (start + step).min(count))?;
+                match super::math::rows::dense_decode(w, &rows)? {
+                    Some(out) => parts.push(out),
+                    None if parts.is_empty() => break,
+                    None => return Err(err("Qwen4 row kernel refused part of a vector window")),
+                }
+                #[cfg(test)]
+                dense_row_calls.set(dense_row_calls.get() + 1);
+            }
+            if !parts.is_empty() {
+                return MxArray::concatenate_many(parts.iter().collect(), Some(1))?
+                    .reshape(&out_shape);
             }
             let input = x.reshape(&[count, 1, width])?;
             let output = if w.scales.is_some() {
@@ -1342,28 +1699,108 @@ impl Store {
                     .collect::<Result<Vec<_>>>()?;
                 MxArray::concatenate_many(parts.iter().collect(), Some(0))?
             };
-            let mut out_shape = outer_shape.to_vec();
-            out_shape.push(w.values.shape_at(0)?);
             output.reshape(&out_shape)
         };
         // Staging chunks bound SSD reads. A resident matrix can use a single
         // projection, particularly the large vocabulary head, without copying
         // weights or launching one kernel for every former read chunk.
-        if let Some(bank) = self.banks.get(name) {
-            return project(bank);
-        }
-        let chunk = (MAX_READ_BYTES as usize / (d.width()? * 4)).clamp(1, 4096);
-        let mut outputs = Vec::new();
-        for start in (0..rows).step_by(chunk) {
-            let weight = self.read(name, start, (rows - start).min(chunk))?;
-            outputs.push(project(&weight)?);
-        }
-        if outputs.len() == 1 {
-            Ok(outputs.remove(0))
+        let output = if let Some(bank) = self.banks.get(name) {
+            project(bank)
         } else {
-            MxArray::concatenate_many(outputs.iter().collect(), Some(-1))
+            let chunk = (MAX_READ_BYTES as usize / (d.width()? * 4)).clamp(1, 4096);
+            let mut outputs = Vec::new();
+            for start in (0..rows).step_by(chunk) {
+                let weight = self.read(name, start, (rows - start).min(chunk))?;
+                outputs.push(project(&weight)?);
+            }
+            if outputs.len() == 1 {
+                Ok(outputs.remove(0))
+            } else {
+                MxArray::concatenate_many(outputs.iter().collect(), Some(-1))
+            }
+        };
+        #[cfg(test)]
+        if vectors {
+            self.vector_windows.push((count, dense_row_calls.get()));
         }
+        output
     }
+    /// `x` is `[1, R, K]`, `R <= 4`. Row `j` of the result carries the bits of
+    /// `linear` applied to row `j` alone: an admitted Q8 bank streams once
+    /// through the row-batched kernel, every other weight runs its single-row
+    /// projection per row.
+    pub(super) fn linear_rows(&mut self, name: &str, x: &MxArray) -> Result<MxArray> {
+        let count = x.shape_at(1)?;
+        if count == 1 {
+            return self.linear(name, x);
+        }
+        let d = self.descriptor(name)?;
+        let rows = d.rows()?;
+        let width = d.width()?;
+        if x.shape()?.last().copied() != Some(width as i64) {
+            return Err(err(format!("Projection shape mismatch: {name}")));
+        }
+        let chunk = (MAX_READ_BYTES as usize / (width * 4)).clamp(1, 4096);
+        #[cfg(test)]
+        let single_rows = std::cell::Cell::new(0u64);
+        let project = |w: &Weight| -> Result<MxArray> {
+            if let Some(out) = super::math::rows::dense_decode(w, x)? {
+                return Ok(out);
+            }
+            #[cfg(test)]
+            single_rows.set(single_rows.get() + count as u64);
+            let parts = (0..count)
+                .map(|j| w.linear(&x.slice_axis(1, j, j + 1)?))
+                .collect::<Result<Vec<_>>>()?;
+            MxArray::concatenate_many(parts.iter().collect(), Some(1))
+        };
+        let output = if let Some(bank) = self.banks.get(name) {
+            project(bank)?
+        } else {
+            let mut outputs = Vec::new();
+            for start in (0..rows).step_by(chunk) {
+                let weight = self.read(name, start, (rows - start).min(chunk))?;
+                outputs.push(project(&weight)?);
+            }
+            if outputs.len() == 1 {
+                outputs.remove(0)
+            } else {
+                MxArray::concatenate_many(outputs.iter().collect(), Some(-1))?
+            }
+        };
+        #[cfg(test)]
+        {
+            self.single_row_projections += single_rows.get();
+        }
+        Ok(output)
+    }
+
+    /// `linear_pair` for a `[1, R, K]` window: the paired bank prepared by
+    /// single-row decoding streams once, otherwise each projection runs
+    /// through `linear_rows`.
+    pub(super) fn linear_pair_rows(
+        &mut self,
+        x: &MxArray,
+        first: &str,
+        second: &str,
+    ) -> Result<(MxArray, MxArray)> {
+        if x.shape_at(1)? == 1 {
+            return self.linear_pair(x, first, second);
+        }
+        let key = (first.to_owned(), second.to_owned());
+        if let Some(bank) = self.paired_banks.get(&key)
+            && let Some(output) = super::math::rows::dense_decode(bank, x)?
+        {
+            let n = self.descriptor(first)?.rows()? as i64;
+            let axis = output.ndim()? as usize - 1;
+            return Ok((
+                output.slice_axis(axis, 0, n)?,
+                output.slice_axis(axis, n, output.shape()?[axis])?,
+            ));
+        }
+        Ok((self.linear_rows(first, x)?, self.linear_rows(second, x)?))
+    }
+
     pub fn integers(&self, name: &str) -> Result<Vec<u64>> {
         let d = self.descriptor(name)?;
         if !matches!(&d.encoding, Encoding::Safe(t) if t == "I64") || d.bytes > 4096 {
@@ -1378,6 +1815,47 @@ impl Store {
             .iter()
             .map(|x| u64::from_le_bytes(*x))
             .collect())
+    }
+}
+
+/// `blk.{layer}.ffn_{gate|up|down}_exps.weight` -> `(layer, part)`.
+fn routed_expert_tensor(name: &str) -> Option<(usize, usize)> {
+    let (layer, rest) = name.strip_prefix("blk.")?.split_once('.')?;
+    let layer = layer.parse::<usize>().ok()?;
+    let part = [
+        "ffn_gate_exps.weight",
+        "ffn_up_exps.weight",
+        "ffn_down_exps.weight",
+    ]
+    .iter()
+    .position(|p| *p == rest)?;
+    Some((layer, part))
+}
+
+/// One routed expert tensor as the mapped-pack builder imports it.
+struct RoutedExpertSource {
+    name: String,
+    tensor: Tensor,
+}
+
+impl super::mapped_pack::ExpertSource for RoutedExpertSource {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn experts(&self) -> usize {
+        self.tensor.shape[0]
+    }
+    fn rows_per_expert(&self) -> usize {
+        self.tensor.shape[1]
+    }
+    fn width(&self) -> usize {
+        self.tensor.shape[2]
+    }
+    fn import(&self, expert: usize) -> Result<super::mapped_pack::ExpertRecord> {
+        let rows = self.rows_per_expert();
+        super::mapped_pack::ExpertRecord::from_weight(
+            &self.tensor.import_rows(expert * rows, rows)?,
+        )
     }
 }
 
@@ -1515,6 +1993,80 @@ mod cache_tests {
     }
 
     #[test]
+    fn mapped_store_keeps_the_forward_headroom_guard() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp");
+        let mut production = Store::open_metadata(&path, None).unwrap();
+        production.plan.mapped = true;
+        let checked = std::cell::Cell::new(0);
+        let unavailable = || {
+            checked.set(checked.get() + 1);
+            Err(err("simulated exhausted system headroom"))
+        };
+        assert!(production.check_forward_headroom_with(unavailable).is_err());
+        assert_eq!(
+            checked.get(),
+            1,
+            "mapped store skipped the forward headroom check"
+        );
+    }
+
+    /// Only the routed experts are file-backed in mapped mode; every other
+    /// read is anonymous growth and keeps the 256 MiB system-headroom recheck.
+    #[test]
+    fn mapped_store_rechecks_growth_headroom_for_anonymous_rows() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp");
+        let mut store = Store::open_metadata(&path, None).unwrap();
+        store.plan.mapped = true;
+        let checked = std::cell::Cell::new(0);
+        let unavailable = || {
+            checked.set(checked.get() + 1);
+            Err(err("simulated exhausted system headroom"))
+        };
+        let row = store
+            .read_impl_with("embed_tokens.weight", 0, 1, false, None, unavailable)
+            .unwrap();
+        assert_eq!(
+            checked.get(),
+            0,
+            "a read under 256 MiB of growth queried headroom"
+        );
+        assert_eq!(
+            store.growth_bytes,
+            row.bytes().unwrap(),
+            "mapped mode must charge anonymous rows as growth"
+        );
+        store.growth_bytes = 256 << 20;
+        let error =
+            match store.read_impl_with("embed_tokens.weight", 1, 1, false, None, unavailable) {
+                Ok(_) => panic!("mapped store ignored exhausted growth headroom"),
+                Err(error) => error,
+            };
+        assert!(error.reason.contains("simulated"), "{}", error.reason);
+        assert_eq!(checked.get(), 1);
+        assert_eq!(
+            store.growth_bytes,
+            256 << 20,
+            "a refused read must leave the growth pending"
+        );
+        assert!(
+            !store
+                .cache
+                .contains_key(&("embed_tokens.weight".to_string(), 1, 1))
+        );
+        store
+            .read_impl_with("embed_tokens.weight", 1, 1, false, None, || Ok(()))
+            .unwrap();
+        assert_eq!(
+            store.growth_bytes,
+            row.bytes().unwrap(),
+            "a passing check restarts the growth count"
+        );
+    }
+
+    #[test]
     fn reference_shared_prefill_pair_preserves_projections_and_storage() {
         if !unsafe { mlx_sys::mlx_metal_is_nax_available() } {
             return;
@@ -1598,12 +2150,9 @@ mod cache_tests {
                 );
             }
             let key = (names[0].to_owned(), names[1].to_owned());
-            let enabled = !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_SHARED_PAIR")
-                && !runtime_flags::is_zero(c"MLX_QWEN4_PAIRED_PROJECTIONS")
-                && !runtime_flags::is_zero(c"MLX_ENABLE_TF32");
             if rows < 512 {
                 assert!(!store.paired_banks.contains_key(&key));
-            } else if enabled {
+            } else if super::super::tf32_enabled() {
                 assert_eq!(store.paired_banks[&key].bytes().unwrap(), bytes);
             }
         }
@@ -1682,17 +2231,23 @@ mod cache_tests {
             assert_eq!(&*actual, &*expected, "dtype {dtype:?}");
         }
     }
-    #[test]
-    fn batched_lookup_reuses_decoded_rows_and_survives_eviction() {
-        let dir = std::env::temp_dir().join(format!("qwen4-lookup-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        struct Cleanup(PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.0);
-            }
+    struct Cleanup(PathBuf);
+    impl Cleanup {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("qwen4-lookup-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
         }
-        let _cleanup = Cleanup(dir.clone());
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A GGUF of one Q5_1 `token_embd.weight` [8, 32]: 24 bytes per row.
+    fn rows_gguf(dir: &Path) -> (PathBuf, Vec<u8>) {
+        let rows = 8u32;
         let path = dir.join("rows.gguf");
         let mut b = b"GGUF".to_vec();
         b.extend(3u32.to_le_bytes());
@@ -1708,19 +2263,27 @@ mod cache_tests {
         string(&mut b, "token_embd.weight");
         b.extend(2u32.to_le_bytes());
         b.extend(32u64.to_le_bytes());
-        b.extend(8u64.to_le_bytes());
+        b.extend(u64::from(rows).to_le_bytes());
         b.extend(7u32.to_le_bytes());
         b.extend(0u64.to_le_bytes());
         while !b.len().is_multiple_of(32) {
             b.push(0);
         }
-        for row in 0..8u32 {
+        for row in 0..rows {
             b.extend(half::f16::from_f32(0.015625).to_bits().to_le_bytes());
             b.extend(half::f16::from_f32(-0.25).to_bits().to_le_bytes());
             b.extend((row * 7919).to_le_bytes());
             b.extend([row as u8; 16]);
         }
-        fs::write(&path, b).unwrap();
+        fs::write(&path, &b).unwrap();
+        (path, b)
+    }
+
+    #[test]
+    fn batched_lookup_reuses_decoded_rows_and_survives_eviction() {
+        let cleanup = Cleanup::new();
+        let dir = cleanup.0.clone();
+        let (path, _) = rows_gguf(&dir);
         let mut store = Store::open_fixture(&path, Some(&dir)).unwrap();
         let mut oracle = Store::open_fixture(&path, Some(&dir)).unwrap();
         let ids = [3usize, 1, 3, 7];
@@ -1742,12 +2305,15 @@ mod cache_tests {
             .unwrap()
             .to_vec();
         let cold = store.lookup_rows("token_embd.weight", &ids).unwrap();
+        assert!(
+            !unsafe { mlx_sys::mlx_array_is_available(cold.as_raw_ptr()) },
+            "a cold lookup window must stay lazy for its consumer's graph"
+        );
         assert_eq!(store.bytes_read, 3 * 24);
-        assert_eq!(store.lookup_misses, 3);
+        assert_eq!((store.lookup.lookups(), store.lookup.misses()), (3, 3));
         assert_eq!(store.cache_bytes, 3 * 32 * 2);
         let warm = store.lookup_rows("token_embd.weight", &ids).unwrap();
-        assert_eq!(store.lookup_batches, 2);
-        assert_eq!(store.lookup_misses, 3);
+        assert_eq!((store.lookup.lookups(), store.lookup.misses()), (6, 3));
         assert_eq!(store.bytes_read, 3 * 24);
         assert!(store.lookup_rows("token_embd.weight", &[0, 8]).is_err());
         assert_eq!(
@@ -1757,12 +2323,275 @@ mod cache_tests {
         );
         store.evict_to(0).unwrap();
         assert_eq!(store.cache_bytes, 0);
-        for output in [cold, warm] {
+        // Reader threads: the same rows, requested ahead and consumed by the
+        // import, decode to the same bits through the in-memory GGUF path.
+        let keys: Vec<_> = ids
+            .iter()
+            .map(|&id| ("token_embd.weight".to_string(), id))
+            .collect();
+        store.prefetch_rows(&keys).unwrap();
+        let fetched = store.lookup_rows("token_embd.weight", &ids).unwrap();
+        assert_eq!((store.lookup.lookups(), store.lookup.misses()), (9, 6));
+        assert_eq!(store.lookup.prefetched() + store.lookup.late(), 3);
+        store.prefetch_rows(&keys).unwrap();
+        let hits = store.lookup_rows("token_embd.weight", &ids).unwrap();
+        assert_eq!(store.lookup.misses(), 6, "LRU hits request nothing");
+        assert_eq!(store.lookup.prefetched() + store.lookup.late(), 3);
+        for output in [cold, warm, fetched, hits] {
             assert_eq!(
                 &*output.astype(DType::Float32).unwrap().to_float32().unwrap(),
                 &expected
             );
         }
+    }
+
+    /// A lookup window leaves one Metal buffer behind for the rows it
+    /// imported; rows it hit stay where they are; the LRU charges a window's
+    /// buffer whole until its last row view is evicted and reports the
+    /// bytes it released, so the charge is the memory that is allocated.
+    #[test]
+    fn decoded_rows_share_their_windows_buffer_and_stay_under_the_lru_bound() {
+        let cleanup = Cleanup::new();
+        let dir = cleanup.0.clone();
+        let (path, _) = rows_gguf(&dir);
+        let mut store = Store::open_fixture(&path, Some(&dir)).unwrap();
+        let mut oracle = Store::open_fixture(&path, Some(&dir)).unwrap();
+        let name = "token_embd.weight";
+        let rb: usize = 32 * 2;
+        let key = |id: usize| (name.to_string(), id, 1);
+        let cached = |store: &Store, id: usize| store.cache[&key(id)].values.clone();
+        let f32s = |a: &MxArray| a.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let same_bits = |store: &Store, oracle: &mut Store, id: usize| {
+            let expected = oracle.read(name, id, 1).unwrap().dense().unwrap();
+            assert_eq!(&*f32s(&cached(store, id)), &*f32s(&expected), "row {id}");
+        };
+        // What is allocated: every live window buffer whole, plus every row
+        // that has its own buffer.
+        let allocated = |store: &Store| -> u64 {
+            store.window_banks.values().map(|b| b.bytes).sum::<u64>()
+                + store
+                    .cache
+                    .iter()
+                    .filter(|(k, _)| !store.row_bank.contains_key(*k))
+                    .map(|(_, w)| w.bytes().unwrap())
+                    .sum::<u64>()
+        };
+        let held =
+            |store: &Store, ids: &[usize]| ids.iter().all(|&id| store.cache.contains_key(&key(id)));
+        let gone = |store: &Store, ids: &[usize]| {
+            ids.iter().all(|&id| !store.cache.contains_key(&key(id)))
+        };
+
+        let window = store.lookup_rows(name, &[5, 1, 6, 1, 2]).unwrap();
+        MxArray::eval_arrays(&[&window]).unwrap();
+        let views: Vec<_> = [5usize, 1, 6, 2]
+            .iter()
+            .map(|&id| cached(&store, id))
+            .collect();
+        MxArray::eval_arrays(&views.iter().collect::<Vec<_>>()).unwrap();
+        let base = views[0].storage_ptr() as usize;
+        assert_ne!(base, 0);
+        for (slot, (view, id)) in views.iter().zip([5usize, 1, 6, 2]).enumerate() {
+            assert_eq!(
+                view.storage_ptr() as usize,
+                base + slot * rb,
+                "row {id} is slot {slot} of the window's buffer"
+            );
+            same_bits(&store, &mut oracle, id);
+        }
+        assert_eq!(store.cache_bytes, 4 * rb as u64);
+        assert_eq!(store.cache_bytes, allocated(&store));
+        assert_eq!(store.window_banks.len(), 1);
+
+        // A hit stays in its buffer; a window's single miss keeps its own.
+        let next = store.lookup_rows(name, &[1, 7]).unwrap();
+        MxArray::eval_arrays(&[&next]).unwrap();
+        let (kept, own) = (cached(&store, 1), cached(&store, 7));
+        MxArray::eval_arrays(&[&kept, &own]).unwrap();
+        assert_eq!(
+            kept.storage_ptr() as usize,
+            base + rb,
+            "a hit is not copied"
+        );
+        assert!(!store.row_bank.contains_key(&key(7)));
+        assert_eq!(store.cache_bytes, 5 * rb as u64);
+        assert_eq!(store.cache_bytes, allocated(&store));
+        assert_eq!(
+            &*f32s(&next),
+            &*f32s(&MxArray::concatenate_many(vec![&kept, &own], Some(0)).unwrap())
+        );
+
+        // Two misses around a hit: a second buffer holds the two.
+        let third = store.lookup_rows(name, &[3, 1, 4]).unwrap();
+        MxArray::eval_arrays(&[&third]).unwrap();
+        let (a, b) = (cached(&store, 3), cached(&store, 4));
+        MxArray::eval_arrays(&[&a, &b]).unwrap();
+        assert_eq!(a.storage_ptr() as usize + rb, b.storage_ptr() as usize);
+        assert_eq!(cached(&store, 1).storage_ptr() as usize, base + rb);
+        assert_eq!(store.cache_bytes, 7 * rb as u64);
+        assert_eq!(store.cache_bytes, allocated(&store));
+        assert_eq!(store.window_banks.len(), 2);
+        for id in [3, 1, 4] {
+            same_bits(&store, &mut oracle, id);
+        }
+
+        // LRU order is 5, 6, 2, 7, 3, 1, 4. Evicting rows of a buffer that
+        // still has a view releases nothing; the last view releases it all,
+        // and the counters say what was released.
+        store.evict_to(7 * rb as u64 - 1).unwrap();
+        assert!(gone(&store, &[5, 6, 2, 7]) && held(&store, &[3, 1, 4]));
+        assert_eq!(
+            store.cache_bytes,
+            6 * rb as u64,
+            "the first buffer is charged whole for its one live row"
+        );
+        assert_eq!(store.cache_bytes, allocated(&store));
+        assert_eq!(
+            (
+                store.lookup.evicted_rows(),
+                store.lookup.evicted_row_bytes()
+            ),
+            (4, rb as u64)
+        );
+        assert_eq!(cached(&store, 1).storage_ptr() as usize, base + rb);
+        same_bits(&store, &mut oracle, 1);
+        store.evict_to(5 * rb as u64).unwrap();
+        assert!(gone(&store, &[3, 1]) && held(&store, &[4]));
+        assert_eq!(
+            store.cache_bytes,
+            2 * rb as u64,
+            "the first buffer went with row 1"
+        );
+        assert_eq!(store.cache_bytes, allocated(&store));
+        assert_eq!(store.lookup.evicted_row_bytes(), 5 * rb as u64);
+        same_bits(&store, &mut oracle, 4);
+        store.evict_to(0).unwrap();
+        assert_eq!(store.cache_bytes, 0);
+        assert!(
+            store.cache.is_empty() && store.window_banks.is_empty() && store.row_bank.is_empty()
+        );
+        assert_eq!(
+            (
+                store.lookup.evicted_rows(),
+                store.lookup.evicted_row_bytes()
+            ),
+            (7, 7 * rb as u64)
+        );
+
+        // Four rows fit beside the staging reserve; a window of eight evicts
+        // in LRU order while it imports and folds the rows that survived.
+        store.cache_limit = MAX_READ_BYTES * 3 + 4 * rb as u64;
+        let wide = store.lookup_rows(name, &[0, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+        MxArray::eval_arrays(&[&wide]).unwrap();
+        assert_eq!(store.cache_bytes, 5 * rb as u64, "LRU bound");
+        assert_eq!(store.cache_bytes, allocated(&store));
+        assert_eq!(store.window_banks.len(), 1);
+        assert!(gone(&store, &[0, 1, 2]) && held(&store, &[3, 4, 5, 6, 7]));
+        assert_eq!(
+            (
+                store.lookup.evicted_rows(),
+                store.lookup.evicted_row_bytes()
+            ),
+            (10, 10 * rb as u64)
+        );
+        let expected: Vec<_> = (0..8)
+            .map(|id| oracle.read(name, id, 1).unwrap().dense().unwrap())
+            .collect();
+        assert_eq!(
+            &*f32s(&wide),
+            &*f32s(&MxArray::concatenate_many(expected.iter().collect(), Some(0)).unwrap())
+        );
+        same_bits(&store, &mut oracle, 7);
+    }
+
+    /// A reader's failed read is consumed with its request and never
+    /// returned: the import reads the row itself, so the file as it is now
+    /// decides, and nothing for the key stays behind.
+    #[test]
+    fn a_row_readers_error_is_dropped_and_the_import_reads_the_row_itself() {
+        let cleanup = Cleanup::new();
+        let dir = cleanup.0.clone();
+        let (path, bytes) = rows_gguf(&dir);
+        let mut store = Store::open_fixture(&path, Some(&dir)).unwrap();
+        let mut oracle = Store::open_fixture(&path, Some(&dir)).unwrap();
+        let name = "token_embd.weight";
+        let keys = [(name.to_string(), 7usize)];
+        let (offset, _) = store.descriptor(name).unwrap().range(7, 1).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(offset + 10)
+            .unwrap();
+        store.prefetch_rows(&keys).unwrap();
+        store.rows.as_ref().unwrap().wait_idle();
+        fs::write(&path, &bytes).unwrap();
+        store.prefetch_rows(&keys).unwrap();
+        let row = store.lookup_rows(name, &[7]).unwrap();
+        let expected = oracle.read(name, 7, 1).unwrap().dense().unwrap();
+        assert_eq!(
+            &*row.astype(DType::Float32).unwrap().to_float32().unwrap(),
+            &*expected
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+        );
+        assert_eq!((store.lookup.prefetched(), store.lookup.late()), (0, 1));
+        store.rows.as_ref().unwrap().wait_idle();
+        assert!(
+            store.rows.as_ref().unwrap().take(&keys[0]).is_none(),
+            "nothing for the key may stay behind"
+        );
+    }
+
+    /// PLE rows of the GGUF fixture through the reader threads against the
+    /// direct importer, bit for bit, with every requested row consumed.
+    #[test]
+    fn prefetched_ple_rows_match_the_direct_importer_and_are_consumed() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp/model.gguf");
+        let mut store = Store::open_fixture(&path, None).unwrap();
+        let name = "per_layer_token_embd.weight";
+        let d = store.descriptor(name).unwrap().clone();
+        let total = d.rows().unwrap();
+        let ids: Vec<usize> = (0..16usize)
+            .map(|h| (h * 7919 + 13) % total)
+            .chain([13 % total])
+            .collect();
+        let distinct = ids.iter().collect::<HashSet<_>>().len() as u64;
+        let expected = ids
+            .iter()
+            .map(|&id| d.import_rows(id, 1).unwrap().dense().unwrap())
+            .collect::<Vec<_>>();
+        let expected = MxArray::concatenate_many(expected.iter().collect(), Some(0))
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+        let keys: Vec<_> = ids.iter().map(|&id| (name.to_string(), id)).collect();
+        store.prefetch_rows(&keys).unwrap();
+        let fetched = store.lookup_rows(name, &ids).unwrap();
+        assert!(!unsafe { mlx_sys::mlx_array_is_available(fetched.as_raw_ptr()) });
+        assert_eq!(
+            &*fetched
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap(),
+            &expected
+        );
+        assert_eq!(
+            (store.lookup.lookups(), store.lookup.misses()),
+            (distinct, distinct)
+        );
+        assert_eq!(
+            store.lookup.prefetched() + store.lookup.late(),
+            distinct,
+            "every imported row must come from the request"
+        );
     }
 
     #[test]
@@ -1794,8 +2623,8 @@ mod cache_tests {
             None,
         )
         .unwrap();
-        store.plan.resident = true;
-        store.plan.hot_bytes = CACHE_BYTES - 1024;
+        // Pinned banks leave 768 bytes of the protected allowance.
+        store.bank_bytes = CACHE_BYTES * 3 / 4 - 768;
         let descriptor = store
             .descriptor("layers.0.attn_hyper_connection.hc_norm.weight")
             .unwrap()
@@ -1839,5 +2668,1387 @@ mod cache_tests {
         assert!(!store.cache.contains_key(&key(0)));
         store.evict_to(0).unwrap();
         assert!(store.cache.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod mapped_tests {
+    use super::*;
+    use crate::models::qwen4_exp::memory;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    struct Temp(PathBuf);
+    impl Temp {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("qwen4-mapped-store-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const EXPERTS: usize = 5;
+    const PARTS: [(&str, usize, usize, u32, usize); 3] = [
+        // (name, rows per expert, width, GGUF type, block bytes per row)
+        ("blk.0.ffn_gate_exps.weight", 32, 256, 12, 144),
+        ("blk.0.ffn_up_exps.weight", 32, 256, 12, 144),
+        ("blk.0.ffn_down_exps.weight", 128, 64, 7, 48),
+    ];
+
+    /// Three routed expert tensors of one layer: Q4_K gate/up and Q5_1 down,
+    /// filled with deterministic pseudo-random block bytes.
+    fn write_fixture(path: &Path) {
+        write_fixture_layers(path, 1)
+    }
+
+    /// The same three tensors for layers `0..layers`.
+    fn write_fixture_layers(path: &Path, layers: usize) {
+        let string = |bytes: &mut Vec<u8>, value: &str| {
+            bytes.extend((value.len() as u64).to_le_bytes());
+            bytes.extend(value.bytes());
+        };
+        let mut b = b"GGUF".to_vec();
+        b.extend(3u32.to_le_bytes());
+        b.extend(((PARTS.len() * layers) as u64).to_le_bytes());
+        b.extend(1u64.to_le_bytes());
+        string(&mut b, "general.architecture");
+        b.extend(8u32.to_le_bytes());
+        string(&mut b, "qwen4exp");
+        let mut offset = 0u64;
+        for layer in 0..layers {
+            for (name, rows, width, ty, row_bytes) in PARTS {
+                string(&mut b, &name.replace("blk.0.", &format!("blk.{layer}.")));
+                b.extend(3u32.to_le_bytes());
+                for d in [width as u64, rows as u64, EXPERTS as u64] {
+                    b.extend(d.to_le_bytes());
+                }
+                b.extend(ty.to_le_bytes());
+                b.extend(offset.to_le_bytes());
+                offset += (EXPERTS * rows * row_bytes) as u64;
+            }
+        }
+        while !b.len().is_multiple_of(32) {
+            b.push(0);
+        }
+        let mut state = 0x2545_f491u32;
+        for _ in 0..offset {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            b.push((state >> 24) as u8);
+        }
+        fs::write(path, b).unwrap();
+    }
+
+    fn encoded(weight: &Weight) -> (Vec<u8>, i32, i32, String) {
+        let (arrays, data) = super::super::packed_cache::encode_weight(weight).unwrap();
+        let mut tagged = serde_json::to_vec(&arrays).unwrap();
+        tagged.extend(data);
+        (tagged, weight.group, weight.bits, weight.mode.clone())
+    }
+
+    #[test]
+    fn mapped_pack_matches_the_checkpoint_and_feeds_the_slot_batch() {
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        // Every record comes from the GGUF importer.
+        let from_gguf = temp.0.join("from-gguf");
+        store.prepare_mapped_pack_at(&from_gguf).unwrap();
+        assert_eq!(store.plan.mapped_pack_files, 3);
+        let mapped = store.mapped.take().unwrap();
+        // Oracle: the ordinary reader, expert by expert, encoded as a chunk.
+        for (name, rows, _, _, _) in PARTS {
+            let file = mapped.file(name).unwrap();
+            let h = &file.header;
+            assert_eq!(h.experts as usize, EXPERTS);
+            assert_eq!(h.rows_per_expert as usize, rows);
+            let mut expected: Vec<Vec<u8>> = vec![Vec::new(); h.sections.len()];
+            for expert in 0..EXPERTS {
+                let w = store.read(name, expert * rows, rows).unwrap();
+                let (arrays, data) = super::super::packed_cache::encode_weight(&w).unwrap();
+                assert_eq!(arrays.len(), h.sections.len());
+                let mut cursor = 0;
+                for (part, a) in arrays.iter().enumerate() {
+                    expected[part].extend_from_slice(&data[cursor..cursor + a.bytes]);
+                    cursor += a.bytes;
+                }
+                assert_eq!(
+                    (w.group, w.bits, w.mode.as_str()),
+                    (h.group, h.bits, h.mode.as_str())
+                );
+            }
+            let whole = file.read_range(0, EXPERTS).unwrap();
+            for (s, section) in h.sections.iter().enumerate() {
+                assert_eq!(section.offset % super::super::mapped_pack::PAGE, 0);
+                assert_eq!(section.length % super::super::mapped_pack::PAGE, 0);
+                assert_eq!(whole[s], expected[s], "{name} section {s}");
+            }
+        }
+        // A second build is byte-identical.
+        let again = temp.0.join("again");
+        store.prepare_mapped_pack_at(&again).unwrap();
+        for (name, ..) in PARTS {
+            let file_name = format!("{name}.mapped");
+            assert_eq!(
+                fs::read(from_gguf.join(&file_name)).unwrap(),
+                fs::read(again.join(&file_name)).unwrap(),
+                "{name}: the second build differs from the first"
+            );
+        }
+        // The slot batch through the range reader equals the checkpoint
+        // reader.
+        let requests: Vec<_> = [4usize, 0, 2]
+            .into_iter()
+            .flat_map(|expert| PARTS.map(|(name, rows, ..)| (name.to_owned(), expert * rows, rows)))
+            .collect();
+        store.evict_to(0).unwrap();
+        assert_eq!(store.cache.len(), 0);
+        let reads = store.mapped.as_ref().unwrap().reads();
+        let packed_hits = store.packed_hits;
+        let via_pack: Vec<_> = store
+            .read_expert_batch(&requests)
+            .unwrap()
+            .iter()
+            .map(|w| encoded(w))
+            .collect();
+        let pack = store.mapped.take().unwrap();
+        assert_eq!(pack.reads(), reads + 9);
+        assert_eq!(
+            store.packed_hits,
+            packed_hits + 9,
+            "range reads are prepared hits"
+        );
+        store.evict_to(0).unwrap();
+        let via_checkpoint: Vec<_> = store
+            .read_expert_batch(&requests)
+            .unwrap()
+            .iter()
+            .map(|w| encoded(w))
+            .collect();
+        assert_eq!(store.packed_hits, packed_hits + 9);
+        assert_eq!(via_pack, via_checkpoint);
+        store.mapped = Some(pack);
+        assert_eq!(
+            super::routed_expert_tensor("blk.47.ffn_down_exps.weight"),
+            Some((47, 2))
+        );
+        assert_eq!(
+            super::routed_expert_tensor("blk.3.ffn_down_shexp.weight"),
+            None
+        );
+        assert_eq!(
+            super::routed_expert_tensor("nextn.0.ffn_gate_exps.weight"),
+            None
+        );
+    }
+
+    /// Runs the calling test in a child process. The wired limit is
+    /// process-wide: while a sibling test's scheduled turn holds one, the
+    /// driver wires this test's mmap-backed banks and the freshly built pack
+    /// is never cold. Returns `true` inside the child, `false` in the parent
+    /// after the child passed.
+    fn in_child(name: &str) -> bool {
+        const CHILD: &str = "MLX_QWEN4_STREAM_CHILD";
+        if std::env::var_os(CHILD).is_some_and(|v| v == name) {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name])
+            .env(CHILD, name)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    /// A stream issue that holds every fetch until released, then reads the
+    /// file as the real one does: the stream stays "running" for as long as
+    /// a test needs.
+    #[derive(Default)]
+    struct Gate {
+        released: Mutex<bool>,
+        ready: Condvar,
+        started: AtomicUsize,
+    }
+    impl Gate {
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.ready.notify_all();
+        }
+    }
+    impl super::super::prefetch::Issue for Arc<Gate> {
+        fn fetch(&self, map: &crate::array::Mmap, stop: &AtomicBool, rows: &AtomicUsize) {
+            self.started.fetch_add(1, Ordering::AcqRel);
+            let mut released = self.released.lock().unwrap();
+            // Polled: a pool dropped by a failing test stops the worker
+            // without a release, and nothing signals `ready` then.
+            while !*released && !stop.load(Ordering::Acquire) {
+                released = self
+                    .ready
+                    .wait_timeout(released, Duration::from_millis(10))
+                    .unwrap()
+                    .0;
+            }
+            drop(released);
+            super::super::prefetch::Pread.fetch(map, stop, rows);
+        }
+    }
+
+    fn mapped_store(temp: &Temp, gguf: &Path, dir: &str) -> Store {
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(gguf, Some(&root)).unwrap();
+        store.prepare_mapped_pack_at(&temp.0.join(dir)).unwrap();
+        store
+            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
+                plan.budget = 1 << 30;
+                plan.mapped = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.plan.mapped);
+        assert!(
+            !store.prefetch.as_ref().unwrap().sampled_resident(),
+            "a freshly built pack (F_NOCACHE writes) is cold"
+        );
+        store
+    }
+
+    fn wait_resident(store: &Store) {
+        let pool = store.prefetch.as_ref().unwrap();
+        pool.wait_idle();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pool.sampled_resident() {
+            assert!(Instant::now() < deadline, "the stream did not land in 10 s");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The load picked the mapped plan: after the dense banks the cold pack
+    /// streams; a turn that opens over the stream starts no second one and
+    /// its stale first pass does not touch; once the pack is resident and
+    /// the stream over, a stale pass touches, a pass inside the gap and a
+    /// pass that reads no mapped bank (which also leaves the stamp alone) do
+    /// not; slot mode never touches and never streams.
+    /// MUTATION: drop the `streaming_pass` early return of
+    /// `wire_mapped_banks_at` -> "a stale pass over a cold pack streams
+    /// instead of touching" fails.
+    #[test]
+    fn a_cold_mapped_load_streams_after_the_dense_banks_and_a_stale_pass_does_not_touch() {
+        if !in_child(
+            "models::qwen4_exp::weights::mapped_tests::a_cold_mapped_load_streams_after_the_dense_banks_and_a_stale_pass_does_not_touch",
+        ) {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let t0 = Instant::now();
+        let mut slots = Store::open_fixture(&gguf, Some(&temp.0.join("cache"))).unwrap();
+        slots.start_pack_stream();
+        assert!(slots.prefetch.is_none(), "slot mode has no stream");
+        assert!(slots.begin_turn().unwrap().is_none());
+        assert!(!slots.streaming_pass);
+        assert!(
+            !slots.wire_mapped_banks_at(t0, true).unwrap(),
+            "slot mode never touches"
+        );
+
+        let mut store = mapped_store(&temp, &gguf, "mapped");
+        let gate = Arc::new(Gate::default());
+        store.pool_with(Arc::clone(&gate));
+        store.start_pack_stream();
+        assert!(
+            store.prefetch.as_ref().unwrap().streaming(),
+            "the load-time stream runs"
+        );
+        assert!(!store.streaming_pass, "no turn is open yet");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while gate.started.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline, "no worker started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(store.begin_turn().unwrap().is_none());
+        assert!(store.streaming_pass, "the turn opened over the stream");
+        assert!(
+            !store.wire_mapped_banks_at(t0, true).unwrap(),
+            "a stale pass over a cold pack streams instead of touching"
+        );
+        assert!(store.touches.is_empty());
+        gate.release();
+        wait_resident(&store);
+        assert!(
+            !store
+                .wire_mapped_banks_at(t0 + Duration::from_millis(100), true)
+                .unwrap(),
+            "within the pass"
+        );
+        store
+            .keep_wired_at(t0 + Duration::from_millis(800), 0, true)
+            .unwrap();
+        assert_eq!(
+            store.touches,
+            vec![vec![0]],
+            "the streaming pass keeps layer 0 wired"
+        );
+        assert!(!store.streaming_pass, "the stream is over");
+        assert!(
+            !store
+                .wire_mapped_banks_at(t0 + Duration::from_millis(850), true)
+                .unwrap()
+        );
+        assert!(
+            store
+                .wire_mapped_banks_at(t0 + Duration::from_millis(1800), true)
+                .unwrap(),
+            "a stale pass over a resident pack touches"
+        );
+        assert_eq!(store.touches.len(), 2);
+        assert!(
+            !store
+                .wire_mapped_banks_at(t0 + Duration::from_millis(1850), true)
+                .unwrap()
+        );
+        let stamp = store.mapped_pass_start;
+        assert!(stamp.is_some());
+        for ms in [2600, 3400] {
+            assert!(
+                !store
+                    .wire_mapped_banks_at(t0 + Duration::from_millis(ms), false)
+                    .unwrap(),
+                "a pass that reads no mapped bank never touches"
+            );
+            assert_eq!(
+                store.mapped_pass_start, stamp,
+                "a pass that reads no mapped bank must not refresh the stamp"
+            );
+        }
+        assert!(
+            store
+                .wire_mapped_banks_at(t0 + Duration::from_millis(4200), true)
+                .unwrap(),
+            "the main pass after a run of drafts sees the gap since the last main pass"
+        );
+        assert!(store.begin_turn().unwrap().is_none());
+        assert!(
+            !store.streaming_pass && !store.prefetch.as_ref().unwrap().streaming(),
+            "a turn over a resident pack starts no stream"
+        );
+    }
+
+    /// While the pack streams, the layer hooks touch the banks of the
+    /// layers already run, at most every 700 ms, never the layers ahead
+    /// (their pages may be cold), never for a pass that reads no mapped bank,
+    /// and not once the stream is over.
+    /// MUTATION: `keep_wired_at` touches every layer
+    /// -> "layers 6..7 are not bound yet" fails.
+    #[test]
+    fn keep_wired_touches_only_bound_layers_every_700ms() {
+        if !in_child(
+            "models::qwen4_exp::weights::mapped_tests::keep_wired_touches_only_bound_layers_every_700ms",
+        ) {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture_layers(&gguf, 8);
+        let mut store = mapped_store(&temp, &gguf, "mapped");
+        assert_eq!(store.mapped_experts.len(), 8);
+        let gate = Arc::new(Gate::default());
+        store.pool_with(Arc::clone(&gate));
+        let t0 = Instant::now();
+        assert!(store.begin_turn().unwrap().is_none());
+        assert!(store.streaming_pass);
+        assert!(!store.wire_mapped_banks_at(t0, true).unwrap());
+        store
+            .keep_wired_at(t0 + Duration::from_millis(100), 5, true)
+            .unwrap();
+        assert!(store.touches.is_empty(), "100 ms after the pass start");
+        store
+            .keep_wired_at(t0 + Duration::from_millis(800), 5, true)
+            .unwrap();
+        assert_eq!(
+            store.touches,
+            vec![vec![0, 1, 2, 3, 4, 5]],
+            "layers 6..7 are not bound yet"
+        );
+        store
+            .keep_wired_at(t0 + Duration::from_millis(900), 7, true)
+            .unwrap();
+        assert_eq!(store.touches.len(), 1, "100 ms after the last touch");
+        store
+            .keep_wired_at(t0 + Duration::from_millis(1600), 7, false)
+            .unwrap();
+        assert_eq!(store.touches.len(), 1, "a pass that reads no mapped bank");
+        assert!(store.streaming_pass);
+        gate.release();
+        wait_resident(&store);
+        store
+            .keep_wired_at(t0 + Duration::from_millis(1600), 7, true)
+            .unwrap();
+        assert_eq!(store.touches.len(), 2);
+        assert_eq!(store.touches[1], (0..8).collect::<Vec<_>>());
+        assert!(!store.streaming_pass, "the stream is over");
+        store
+            .keep_wired_at(t0 + Duration::from_millis(2400), 7, true)
+            .unwrap();
+        assert_eq!(store.touches.len(), 2, "no streaming pass, no touch");
+        assert_eq!(
+            store.touches_async,
+            vec![false, false],
+            "outside a group every touch is a synchronous eval"
+        );
+    }
+
+    /// A layer-major group keeps the banks of the layers already swept
+    /// wired after the stream ends, through asynchronous touches whose arrays
+    /// wait for the group commit; a warm one-window turn (no group) touches
+    /// nothing once the stream is over.
+    /// MUTATION: `keep_wired_at` keeps the
+    /// `!streaming_pass` early return -> "the group keeps touching after the
+    /// stream" fails.
+    /// MUTATION: `touch_banks` evaluates synchronously
+    /// inside a group -> "asynchronous inside the group" fails.
+    #[test]
+    fn keep_wired_runs_through_a_group_only_and_touches_async() {
+        if !in_child(
+            "models::qwen4_exp::weights::mapped_tests::keep_wired_runs_through_a_group_only_and_touches_async",
+        ) {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture_layers(&gguf, 8);
+        let mut store = mapped_store(&temp, &gguf, "mapped");
+        let gate = Arc::new(Gate::default());
+        store.pool_with(Arc::clone(&gate));
+        let t0 = Instant::now();
+        assert!(store.begin_turn().unwrap().is_none());
+        assert!(store.streaming_pass);
+        assert!(!store.wire_mapped_banks_at(t0, true).unwrap());
+        store.begin_group();
+        store
+            .keep_wired_at(t0 + Duration::from_millis(800), 3, true)
+            .unwrap();
+        assert_eq!(store.touches, vec![vec![0, 1, 2, 3]]);
+        assert_eq!(
+            store.touches_async,
+            vec![true],
+            "asynchronous inside the group"
+        );
+        let pending = store.pending_touches();
+        assert!(pending > 0, "the touch's arrays wait for the commit");
+        gate.release();
+        wait_resident(&store);
+        store
+            .keep_wired_at(t0 + Duration::from_millis(1600), 5, true)
+            .unwrap();
+        assert_eq!(store.touches.len(), 2);
+        assert_eq!(store.touches[1], vec![0, 1, 2, 3, 4, 5]);
+        assert!(!store.streaming_pass, "the stream is over");
+        store
+            .keep_wired_at(t0 + Duration::from_millis(2400), 7, true)
+            .unwrap();
+        assert_eq!(
+            store.touches.len(),
+            3,
+            "the group keeps touching after the stream"
+        );
+        assert_eq!(store.touches[2], (0..8).collect::<Vec<_>>());
+        assert_eq!(store.touches_async, vec![true, true, true]);
+        assert_eq!(store.pending_touches(), 3 * pending);
+        let taken = store.take_pending_touches();
+        assert_eq!(taken.len(), 3 * pending);
+        assert_eq!(store.pending_touches(), 0);
+        MxArray::eval_arrays(&taken.iter().collect::<Vec<_>>()).unwrap();
+        store.end_group();
+        assert!(!store.group_in_progress());
+        store
+            .keep_wired_at(t0 + Duration::from_millis(3200), 7, true)
+            .unwrap();
+        assert_eq!(store.touches.len(), 3, "no group, no stream: no touch");
+        // A warm turn over the resident pack: no stream, no group, no touch.
+        assert!(store.begin_turn().unwrap().is_none());
+        assert!(!store.streaming_pass);
+        store
+            .keep_wired_at(t0 + Duration::from_millis(4000), 7, true)
+            .unwrap();
+        assert_eq!(store.touches.len(), 3);
+    }
+
+    /// `observe_sweep` holds a trip and applies nothing: the
+    /// store stays mapped until `apply_held_trip`, which leaves the mapped
+    /// path, drops the pack stream and reports the symptom once; without a
+    /// held trip it changes nothing.
+    /// MUTATION (store side): `observe_sweep` calls
+    /// `observe_pass_at` -> "held, not applied" fails.
+    #[test]
+    fn observe_sweep_holds_the_trip_and_apply_held_trip_switches() {
+        if !in_child(
+            "models::qwen4_exp::weights::mapped_tests::observe_sweep_holds_the_trip_and_apply_held_trip_switches",
+        ) {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let mut store = mapped_store(&temp, &gguf, "mapped");
+        store.start_pack_stream();
+        wait_resident(&store);
+        assert!(store.begin_turn().unwrap().is_none());
+        assert!(!store.observe_sweep(), "nothing read since the turn opened");
+        assert!(store.apply_held_trip().unwrap().is_none());
+        assert!(store.plan.mapped);
+        let mapped = store.plan.mapped_bytes;
+        // Another reader in the process pushes the count past twice the
+        // pack while the pack stays resident: no trip, the count restarts.
+        let base = store.tripwire_mut().turn_start_reads();
+        assert!(
+            store
+                .observe_pass_at(1, Duration::from_millis(25), base + 3 * mapped)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.plan.mapped && store.tripwire_mut().tripped().is_none());
+        assert_eq!(store.tripwire_mut().turn_start_reads(), base + 3 * mapped);
+        store.trip(super::super::tripwire::Fallback::SsdReads {
+            read: 3 * mapped,
+            mapped,
+        });
+        assert!(store.observe_sweep(), "the trip is reported");
+        assert!(store.plan.mapped, "held, not applied");
+        assert!(store.prefetch.is_some());
+        assert!(store.observe_sweep(), "and reported again until applied");
+        let applied = store.apply_held_trip().unwrap();
+        assert!(matches!(
+            applied,
+            Some(super::super::tripwire::Fallback::SsdReads { .. })
+        ));
+        assert!(!store.plan.mapped, "the store left the mapped path");
+        assert!(store.mapped_experts.is_empty());
+        assert!(store.prefetch.is_none(), "the pack stream is gone");
+        assert!(store.apply_held_trip().unwrap().is_none(), "applied once");
+        assert!(!store.observe_sweep());
+    }
+
+    /// The tripwire's SSD count starts at the turn: the pack bytes the
+    /// load-time stream read before it are below the baseline, and the turn
+    /// over a pack the stream made resident starts no stream of its own.
+    #[test]
+    fn a_streaming_turn_keeps_the_tripwire_baseline() {
+        if !in_child(
+            "models::qwen4_exp::weights::mapped_tests::a_streaming_turn_keeps_the_tripwire_baseline",
+        ) {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let mut store = mapped_store(&temp, &gguf, "mapped");
+        let before = memory::process_disk_reads();
+        store.start_pack_stream();
+        wait_resident(&store);
+        let after = memory::process_disk_reads();
+        assert!(
+            after >= before + store.plan.mapped_bytes,
+            "the stream read the pack from disk ({} B over {} B)",
+            after - before,
+            store.plan.mapped_bytes
+        );
+        assert!(store.begin_turn().unwrap().is_none());
+        assert!(
+            store.tripwire_mut().turn_start_reads() >= after,
+            "the stream's bytes are not charged to the turn"
+        );
+        assert!(!store.streaming_pass);
+    }
+
+    /// A load up to its last step: the fixture MTP head attached (or not)
+    /// before the gate, the mapped plan, a held pack stream and the dense
+    /// banks. Returns the gate's anonymous need and the draft bank estimate.
+    fn mapped_load(
+        temp: &Temp,
+        gguf: &Path,
+        dir: &str,
+        head: bool,
+    ) -> (Store, Arc<Gate>, u64, u64) {
+        let mut store =
+            Store::open_fixture(gguf, Some(&temp.0.join(format!("{dir}-cache")))).unwrap();
+        if head {
+            let aux = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/qwen4-exp/bf16/paged");
+            store
+                .attach_auxiliary(Store::open_fixture(&aux, None).unwrap())
+                .unwrap();
+        }
+        let estimate = store.mtp_bank_estimate().unwrap();
+        assert_eq!(estimate > 0, head, "the fixture head has routed experts");
+        store.prepare_mapped_pack_at(&temp.0.join(dir)).unwrap();
+        let mut charged = 0;
+        store
+            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, need, _, _| {
+                charged = need;
+                plan.budget = 1 << 30;
+                plan.mapped = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.plan.mapped);
+        let gate = Arc::new(Gate::default());
+        store.pool_with(Arc::clone(&gate));
+        store.prepare_fixture_hot().unwrap();
+        (store, gate, charged, estimate)
+    }
+
+    /// With the MTP head attached the load builds the draft banks the
+    /// gate charged before any pack fetch starts, then streams the pack,
+    /// whether or not a turn will ever ask for MTP; without the head it only
+    /// streams.
+    #[test]
+    fn the_load_builds_the_draft_banks_before_the_pack_stream_starts() {
+        if !in_child(
+            "models::qwen4_exp::weights::mapped_tests::the_load_builds_the_draft_banks_before_the_pack_stream_starts",
+        ) {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        for (head, dir) in [(true, "head"), (false, "plain")] {
+            let (mut store, gate, charged, estimate) = mapped_load(&temp, &gguf, dir, head);
+            let dense = store.fixed_projection_bytes().unwrap();
+            assert_eq!(
+                charged,
+                dense + estimate,
+                "{dir}: the gate charges the bank"
+            );
+            let mut seen = Vec::new();
+            store.finish_load_with(&mut |_| {
+                // A pack fetch issued before the build starts within this wait.
+                let deadline = Instant::now() + Duration::from_millis(100);
+                while gate.started.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                seen.push(gate.started.load(Ordering::Acquire));
+                Ok(())
+            });
+            assert_eq!(seen.is_empty(), !head, "{dir}: the build admits its banks");
+            assert!(
+                seen.iter().all(|&started| started == 0),
+                "{dir}: no pack fetch started before the build ({seen:?})"
+            );
+            assert_eq!(
+                store.mtp_bank_bytes().unwrap(),
+                estimate,
+                "{dir}: the load built the banks the gate charged"
+            );
+            assert!(
+                store.prefetch.as_ref().unwrap().streaming(),
+                "{dir}: the pack streams after the build"
+            );
+            gate.release();
+            wait_resident(&store);
+        }
+    }
+
+    /// A load whose host refuses the draft banks still loads: the pack
+    /// streams, the drafts stay on the row reader and nothing retries.
+    /// MUTATION: `finish_load_with` returns the
+    /// build's error before the stream -> "the declined load still streams"
+    /// fails.
+    #[test]
+    fn a_load_that_cannot_stage_the_draft_banks_still_loads_and_never_retries() {
+        if !in_child(
+            "models::qwen4_exp::weights::mapped_tests::a_load_that_cannot_stage_the_draft_banks_still_loads_and_never_retries",
+        ) {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let (mut store, gate, ..) = mapped_load(&temp, &gguf, "mapped", true);
+        let mut admissions = 0;
+        store.finish_load_with(&mut |_| {
+            admissions += 1;
+            Err(err("simulated headroom loss at load"))
+        });
+        assert!(admissions >= 1);
+        assert!(store.mtp_banks_declined);
+        assert_eq!(store.mtp_bank_bytes().unwrap(), 0);
+        assert!(
+            store.prefetch.as_ref().unwrap().streaming(),
+            "the declined load still streams the pack"
+        );
+        assert_eq!(
+            store
+                .prepare_mtp_expert_banks_with(&mut |_| Ok(()))
+                .unwrap(),
+            0,
+            "a declined head is never built later"
+        );
+        assert_eq!(store.mtp_bank_bytes().unwrap(), 0);
+        gate.release();
+        wait_resident(&store);
+    }
+
+    /// With the MTP head attached, the mapped plan's anonymous need carries
+    /// the Q8 draft banks beside the dense banks, the allowance admits that
+    /// bank once the plan is mapped, and leaving the mapped path drops it.
+    /// MUTATION: pass `dense` alone to the gate -> the gate sees
+    /// the dense bytes without the bank and the first assertion fails.
+    #[test]
+    fn mapped_plan_charges_the_draft_bank_while_the_mtp_head_is_attached() {
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        let aux =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp/bf16/paged");
+        store
+            .attach_auxiliary(Store::open_fixture(&aux, None).unwrap())
+            .unwrap();
+        let bank = store.mtp_bank_estimate().unwrap();
+        assert!(bank > 0, "the fixture head has routed experts");
+        let dense = store.fixed_projection_bytes().unwrap();
+        let dir = temp.0.join("mapped");
+        store.prepare_mapped_pack_at(&dir).unwrap();
+        let mut charged = None;
+        store
+            .select_mapped_residency_with(EXPERTS, 1 << 30, &mut |plan, need, _, _| {
+                charged = Some(need);
+                plan.budget = super::super::memory::mapped_desired(need);
+                plan.mapped = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.plan.mapped);
+        assert_eq!(
+            charged,
+            Some(dense + bank),
+            "the gate's anonymous need carries the draft bank"
+        );
+        assert!(
+            store.auxiliary_cache_allowance().unwrap() >= bank,
+            "the mapped budget admits the bank it charged"
+        );
+        let slot_rule = store
+            .tensors
+            .iter()
+            .filter(|(name, _)| super::residency::is_auxiliary(name))
+            .map(|(_, t)| t.runtime_bytes().unwrap())
+            .sum::<u64>()
+            .min(store.cache_limit / 8)
+            .max(MAX_READ_BYTES * 6);
+        store
+            .leave_mapped_with(
+                &Fallback::LoadGate { pack: 0, budget: 0 },
+                &mut super::super::memory::host_memory,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!store.plan.mapped);
+        assert_eq!(
+            store.auxiliary_cache_allowance().unwrap(),
+            slot_rule,
+            "the slot path keeps its own allowance rule"
+        );
+    }
+
+    /// Mapped mode on the fixture pack: identity routing, capacity == experts,
+    /// never a miss or an upload, bank bytes and kernel reads identical to
+    /// the chunk-built banks, leases inert, out-of-range ids refused.
+    #[test]
+    fn mapped_residency_addresses_every_expert_in_place_without_misses() {
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        let dir = temp.0.join("mapped");
+        store.prepare_mapped_pack_at(&dir).unwrap();
+        assert_eq!(store.plan.mapped_pack_files, 3);
+        // Oracle banks: every expert through the ordinary reader, in id order.
+        let oracle: Vec<Arc<Weight>> = PARTS
+            .iter()
+            .map(|(name, rows, ..)| {
+                let chunks: Vec<_> = (0..EXPERTS)
+                    .map(|e| store.read(name, e * *rows, *rows).unwrap())
+                    .collect();
+                Arc::new(Weight::concatenate_rows(&chunks).unwrap())
+            })
+            .collect();
+        store.evict_to(0).unwrap();
+        let expected_bytes: u64 = PARTS
+            .iter()
+            .map(|(name, ..)| {
+                let h = &store.mapped.as_ref().unwrap().file(name).unwrap().header;
+                h.sections.iter().map(|s| s.length).sum::<u64>()
+            })
+            .sum();
+        let before = store.cache_bytes;
+        store
+            .select_mapped_residency_with(EXPERTS, 1 << 30, &mut |plan, dense, pool, pack| {
+                // The fixture holds routed experts only; the gate sees
+                // the pool it was given and the pack's section bytes.
+                assert_eq!((dense, pool), (0, 1 << 30));
+                assert_eq!(pack, expected_bytes);
+                plan.budget = 1 << 30;
+                plan.mapped = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.plan.mapped);
+        assert_eq!(store.plan.mapped_bytes, expected_bytes);
+        assert_eq!(store.plan.partial_expert_slots, EXPERTS);
+        assert_eq!(store.cache_limit, 1 << 30);
+        assert_eq!(store.expert_slot_capacity(EXPERTS, 2).unwrap(), EXPERTS);
+        assert!(store.device_slots_ready(1) && store.prefill_device_slots_ready(1));
+        assert!(!store.device_slots_ready(2));
+        assert_eq!(store.cache_bytes, before, "mapped banks are not anonymous");
+        assert_eq!(store.slot_bytes, 0);
+
+        let ids = [4u32, 0, 2, 2, 1, 3];
+        let (banks, local, capacity) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        assert_eq!(local, ids, "slot id must be the expert id");
+        assert_eq!(capacity, EXPERTS);
+        let device = MxArray::from_uint32(&ids, &[2, 3]).unwrap();
+        let (_, device_local) = store.device_expert_slots(0, &device).unwrap().unwrap();
+        assert_eq!(&*device_local.to_uint32().unwrap(), &ids);
+        let (_, safe, count) = store.prefill_device_expert_slots(0, &device).unwrap();
+        assert_eq!(&*safe.to_uint32().unwrap(), &ids);
+        assert_eq!(count, EXPERTS);
+        for round in 0..3 {
+            assert!(
+                store.commit_device_routes(&[0, 0, 0], &ids, 2).unwrap(),
+                "round {round}"
+            );
+        }
+        assert_eq!(store.slot_misses, 0);
+        assert_eq!(store.slot_upload_bytes, 0);
+        // 5 unique ids in the window, then 2 + 1 + 2 unique per committed tape.
+        assert_eq!(store.slot_hits, 5 + 3 * 5);
+        assert!(store.slots.is_empty(), "the slot machinery stays unused");
+
+        // The mapped banks are the pack's bytes: the same arrays the chunk
+        // reader builds, byte for byte, with the same quantization geometry.
+        for (part, (name, rows, ..)) in PARTS.iter().enumerate() {
+            let bank = &banks[part];
+            assert!(!bank.values.storage_ptr().is_null(), "{name} is not mapped");
+            assert_eq!(
+                encoded(bank),
+                encoded(&oracle[part]),
+                "{name}: mapped bank differs from the chunk-built bank"
+            );
+            for e in [0usize, 2, 4] {
+                assert_eq!(
+                    encoded(&bank.slice_rows(e * rows, *rows).unwrap()),
+                    encoded(&store.read(name, e * rows, *rows).unwrap()),
+                    "{name} expert {e}"
+                );
+            }
+        }
+        // A kernel reading the mapped buffers equals the same kernel on the
+        // anonymous copy of the same bytes.
+        let x = MxArray::from_float32(
+            &(0..6 * 256)
+                .map(|n| ((n % 97) as f32 - 48.) / 64.)
+                .collect::<Vec<_>>(),
+            &[6, 1, 256],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let selected = MxArray::from_uint32(&ids, &[6]).unwrap();
+        let mapped_out = banks[0].gather_rows(&x, &selected, EXPERTS, false).unwrap();
+        let anonymous_out = oracle[0]
+            .gather_rows(&x, &selected, EXPERTS, false)
+            .unwrap();
+        // Bit patterns: the pseudo-random fixture codes decode to NaNs too.
+        let bits = |a: &MxArray| {
+            a.to_float32()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<u32>>()
+        };
+        assert_eq!(bits(&mapped_out), bits(&anonymous_out));
+        // Leases are inert: nothing is retained, completion still evaluates.
+        store.finish_expert_slots(0, &mapped_out).unwrap();
+        store.defer_expert_reduction(0, &mapped_out).unwrap();
+        assert_eq!(store.deferred_reduction_layer, None);
+        store.complete_device_readers().unwrap();
+        store.complete_expert_window(0, &anonymous_out).unwrap();
+        assert!(
+            store
+                .expert_slots(0, EXPERTS, 2, &[EXPERTS as u32])
+                .is_err()
+        );
+        assert!(
+            store
+                .commit_device_routes(&[0], &[EXPERTS as u32, 0], 2)
+                .is_err()
+        );
+        assert!(store.device_expert_slots(1, &device).unwrap().is_none());
+    }
+
+    /// A pack whose header page was damaged is refused at open and rebuilt
+    /// before anything is mapped; a pack whose expert count disagrees with
+    /// the checkpoint keeps the slot path.
+    #[test]
+    fn mapped_residency_refuses_a_damaged_or_mismatched_pack() {
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        let dir = temp.0.join("mapped");
+        store.prepare_mapped_pack_at(&dir).unwrap();
+        let name = PARTS[1].0;
+        let header = store
+            .mapped
+            .as_ref()
+            .unwrap()
+            .file(name)
+            .unwrap()
+            .header
+            .clone();
+        store.mapped = None;
+        // Flip one hex digit of a section checksum inside the header JSON:
+        // still valid JSON, still a 64-char digest, only the page checksum
+        // can tell.
+        let path = dir.join(format!("{name}.mapped"));
+        let mut bytes = fs::read(&path).unwrap();
+        let sha = header.sections[0].sha256.as_bytes();
+        let at = bytes[..super::super::mapped_pack::PAGE as usize]
+            .windows(sha.len())
+            .position(|w| w == sha)
+            .unwrap();
+        bytes[at] = if bytes[at] == b'0' { b'1' } else { b'0' };
+        fs::write(&path, &bytes).unwrap();
+        let opened = fs::metadata(&path).unwrap().len();
+        store.prepare_mapped_pack_at(&dir).unwrap();
+        let rebuilt = store.mapped.as_ref().unwrap().file(name).unwrap();
+        assert_eq!(
+            rebuilt.header, header,
+            "{name} must be rebuilt from the sources"
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), opened);
+        assert_ne!(
+            fs::read(&path).unwrap()[at],
+            bytes[at],
+            "the damaged page must not survive"
+        );
+        store
+            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
+                plan.budget = 1 << 30;
+                plan.mapped = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.plan.mapped);
+
+        let mut other = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        other.prepare_mapped_pack_at(&dir).unwrap();
+        other
+            .select_mapped_residency_with(EXPERTS + 1, 0, &mut |_, _, _, _| {
+                panic!("an incomplete pack must not be admitted")
+            })
+            .unwrap();
+        assert!(!other.plan.mapped);
+        assert_eq!(other.plan.mapped_bytes, 0);
+        assert!(other.mapped_experts.is_empty());
+    }
+
+    /// The live-memory gate says no: the store stays on slots, maps nothing,
+    /// keeps its slot budget and reports the refusal with the gate's budget.
+    #[test]
+    fn a_refused_gate_keeps_the_slot_path_and_reports_the_bank_budget() {
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        store
+            .prepare_mapped_pack_at(&temp.0.join("mapped"))
+            .unwrap();
+        let budget_before = store.plan.budget;
+        let limit_before = store.cache_limit;
+        let mut seen_pack = 0;
+        store
+            .select_mapped_residency_with(EXPERTS, 1 << 30, &mut |plan, _, _, pack| {
+                seen_pack = pack;
+                plan.mapped_bank_budget = pack - 1;
+                plan.live_non_reclaimable = 40 << 30;
+                plan.budget = 1;
+                plan.mapped = true;
+                Err(err("mapped banks need more than the host leaves"))
+            })
+            .unwrap();
+        assert!(seen_pack > 0);
+        assert!(!store.plan.mapped);
+        assert!(store.mapped_experts.is_empty() && store.prefetch.is_none());
+        assert_eq!(
+            (store.plan.budget, store.cache_limit),
+            (budget_before, limit_before)
+        );
+        assert_eq!(store.plan.mapped_bank_budget, seen_pack - 1);
+        assert_eq!(store.plan.live_non_reclaimable, 40 << 30);
+        assert_eq!(
+            store.live.fallback(),
+            Some(Fallback::LoadGate {
+                pack: seen_pack,
+                budget: seen_pack - 1
+            })
+        );
+        assert_eq!(store.expert_slot_capacity(EXPERTS, 2).unwrap(), EXPERTS);
+        assert!(store.slots.is_empty(), "slots are built by the first turn");
+    }
+
+    /// A pass that trips the wire is the request's last mapped one: the
+    /// store leaves the mapped path between that pass and the next (banks
+    /// unmapped, read-ahead released, the slot budget taken from the live
+    /// host, slots built on demand, the reason published) and the same
+    /// request's next pass maps its expert ids through slots.
+    ///
+    /// The pack stays cold behind a held stream, so the SSD count is
+    /// corroborated by the pack's own sample.
+    ///
+    /// MUTATION: `observe_pass_at` logs the trip and returns
+    /// `Ok(None)` without `apply_fallback`; the request finishes mapped.
+    #[test]
+    fn a_trip_observed_mid_turn_leaves_the_mapped_path_at_that_pass() {
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let mut store = mapped_store(&temp, &gguf, "mapped");
+        let gate = Arc::new(Gate::default());
+        store.pool_with(Arc::clone(&gate));
+        let mapped = store.plan.mapped_bytes;
+        assert!(store.begin_turn().unwrap().is_none());
+        let base = store.tripwire_mut().turn_start_reads();
+        let ids = [4u32, 0, 2];
+        let (banks, _, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        let mapped_bank = Arc::as_ptr(&banks[0]);
+        // Passes 1..k read the pack once between them: mapped throughout.
+        for pass in 1..=4u64 {
+            assert!(
+                store
+                    .observe_pass_at(1, Duration::from_millis(25), base + pass * mapped / 4)
+                    .unwrap()
+                    .is_none(),
+                "pass {pass}"
+            );
+            assert!(store.plan.mapped);
+            let (same, _, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+            assert_eq!(Arc::as_ptr(&same[0]), mapped_bank);
+        }
+        // Pass k+1 crosses twice the pack: the store leaves mapped mode now.
+        let why = store
+            .observe_pass_at(1, Duration::from_millis(25), base + 2 * mapped + 1)
+            .unwrap()
+            .expect("the tripping pass applies the switch");
+        assert_eq!(
+            why,
+            Fallback::SsdReads {
+                read: 2 * mapped + 1,
+                mapped
+            }
+        );
+        assert!(!store.plan.mapped);
+        assert_eq!(store.plan.mapped_bytes, 0);
+        assert!(store.mapped_experts.is_empty() && store.prefetch.is_none());
+        assert_eq!(store.cache_limit, store.plan.budget);
+        assert!(store.cache_limit >= store.cache_bytes + MAX_READ_BYTES * 3);
+        assert!(!store.live.mapped.load(Ordering::Acquire));
+        assert_eq!(store.live.fallback(), Some(why));
+        assert_eq!(
+            store.tripwire_mut().turn_start_reads(),
+            base,
+            "the window in progress keeps its baseline"
+        );
+        let (slots, local, capacity) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        assert_ne!(Arc::as_ptr(&slots[0]), mapped_bank, "anonymous slot banks");
+        assert_eq!(capacity, EXPERTS);
+        assert_eq!(local.len(), ids.len());
+        assert!(store.slot_bytes > 0 && store.slots.contains_key(&0));
+        // Later passes of the same request and the next turn change nothing.
+        assert!(
+            store
+                .observe_pass_at(1, Duration::from_millis(25), base + 3 * mapped)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.begin_turn().unwrap().is_none(), "applied once");
+        assert!(!store.plan.mapped);
+    }
+
+    /// The per-pass bookkeeping of a mapped turn (two `Instant::now`, the
+    /// process disk-read counter, the tripwire's median and reference scan)
+    /// costs microseconds, not the 0.3 ms per token that would show in a
+    /// 20 ms decode step. Prints the median and p99 per pass.
+    #[test]
+    #[ignore = "release microbenchmark; run with --nocapture"]
+    fn per_pass_bookkeeping_costs_microseconds() {
+        let mapped = 73u64 << 30;
+        let mut wire = Tripwire::default();
+        wire.begin_turn(memory::process_disk_reads());
+        for window in [12_000u64, 900, 850, 800, 820, 810] {
+            wire.observe(1024, Duration::from_millis(window), 0, mapped, || false);
+        }
+        for _ in 0..64 {
+            wire.observe(1, Duration::from_millis(25), 0, mapped, || false);
+        }
+        let mut costs: Vec<Duration> = (0..4096)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let reads = memory::process_disk_reads();
+                let elapsed = started.elapsed();
+                assert!(wire.observe(1, elapsed, reads, mapped, || false).is_none());
+                wire.observe(4, Duration::from_millis(30), reads, mapped, || false);
+                started.elapsed()
+            })
+            .collect();
+        costs.sort_unstable();
+        let median = costs[costs.len() / 2];
+        let p99 = costs[costs.len() * 99 / 100];
+        eprintln!(
+            "per-pass bookkeeping: median {median:.1?}, p99 {p99:.1?}, max {:.1?}",
+            costs[costs.len() - 1]
+        );
+        assert!(median < Duration::from_micros(300), "median {median:?}");
+    }
+
+    /// A trip taken through the wire directly (its switch did not run at
+    /// the pass) stays armed: the next turn to open applies it, banks
+    /// unmapped, the slot budget taken from the live host, slots built on
+    /// demand, the reason published.
+    #[test]
+    fn a_tripped_mapped_store_runs_its_next_turn_on_slots() {
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        store
+            .prepare_mapped_pack_at(&temp.0.join("mapped"))
+            .unwrap();
+        store
+            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
+                plan.budget = 1 << 30;
+                plan.mapped = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.plan.mapped && store.live.mapped.load(Ordering::Acquire));
+        let mapped = store.plan.mapped_bytes;
+        assert!(store.begin_turn().unwrap().is_none(), "nothing tripped yet");
+        let ids = [4u32, 0, 2];
+        let (banks, _, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        let mapped_bank = Arc::as_ptr(&banks[0]);
+        store.trip(Fallback::SsdReads {
+            read: 2 * mapped + 1,
+            mapped,
+        });
+        // The turn that tripped keeps its mapped banks.
+        assert!(store.plan.mapped);
+        let (same, _, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        assert_eq!(Arc::as_ptr(&same[0]), mapped_bank);
+        assert!(store.live.fallback().is_none());
+
+        let why = store
+            .begin_turn()
+            .unwrap()
+            .expect("the next turn applies the fallback");
+        assert_eq!(
+            why,
+            Fallback::SsdReads {
+                read: 2 * mapped + 1,
+                mapped
+            }
+        );
+        assert!(!store.plan.mapped);
+        assert_eq!(store.plan.mapped_bytes, 0);
+        assert!(store.mapped_experts.is_empty() && store.prefetch.is_none());
+        assert_eq!(store.cache_limit, store.plan.budget);
+        assert!(store.cache_limit >= store.cache_bytes + MAX_READ_BYTES * 3);
+        assert_eq!(store.expert_slot_capacity(EXPERTS, 2).unwrap(), EXPERTS);
+        assert!(!store.live.mapped.load(Ordering::Acquire));
+        assert_eq!(store.live.fallback(), Some(why));
+        assert!(
+            !store
+                .wire_mapped_banks_at(std::time::Instant::now(), true)
+                .unwrap(),
+            "a slot store never touches banks"
+        );
+        let (slots, local, capacity) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        assert_ne!(Arc::as_ptr(&slots[0]), mapped_bank, "anonymous slot banks");
+        assert_eq!(capacity, EXPERTS);
+        assert_eq!(local.len(), ids.len());
+        assert!(store.slot_bytes > 0 && store.slots.contains_key(&0));
+        assert!(store.begin_turn().unwrap().is_none(), "applied once");
+    }
+
+    /// A turn admitted while another is open applies a trip without starting
+    /// a window: the store leaves mapped mode (every open turn runs on slots
+    /// from its next pass) and the SSD baseline of the window in progress
+    /// stays.
+    ///
+    /// MUTATION: `apply_fallback` returns `Ok(None)` without
+    /// leaving; the store stays mapped.
+    #[test]
+    fn an_admission_beside_an_open_turn_applies_the_trip_and_keeps_the_window() {
+        const SENTINEL: u64 = u64::MAX - 1;
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        store
+            .prepare_mapped_pack_at(&temp.0.join("mapped"))
+            .unwrap();
+        store
+            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
+                plan.budget = 1 << 30;
+                plan.mapped = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.begin_turn().unwrap().is_none());
+        let mapped = store.plan.mapped_bytes;
+        let ids = [4u32, 0, 2];
+        let (banks, _, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        let mapped_bank = Arc::as_ptr(&banks[0]);
+        store.trip(Fallback::SsdReads {
+            read: 2 * mapped + 1,
+            mapped,
+        });
+        store.tripwire_mut().begin_turn(SENTINEL);
+        let why = store
+            .apply_fallback()
+            .unwrap()
+            .expect("the admission applies the trip");
+        assert_eq!(
+            why,
+            Fallback::SsdReads {
+                read: 2 * mapped + 1,
+                mapped
+            }
+        );
+        assert!(!store.plan.mapped && store.mapped_experts.is_empty() && store.prefetch.is_none());
+        assert_eq!(store.cache_limit, store.plan.budget);
+        assert_eq!(store.plan.mapped_bytes, 0);
+        assert_eq!(
+            store.tripwire_mut().turn_start_reads(),
+            SENTINEL,
+            "the window in progress keeps its baseline"
+        );
+        assert_eq!(store.live.fallback(), Some(why));
+        let (slots, _, capacity) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        assert_ne!(Arc::as_ptr(&slots[0]), mapped_bank, "anonymous slot banks");
+        assert_eq!(capacity, EXPERTS);
+        assert!(store.apply_fallback().unwrap().is_none(), "applied once");
+    }
+
+    /// The slot budget is sized after the banks are released: the host is
+    /// read with the store's maps already dropped, from the sample after
+    /// wired memory settles, and that budget is the one the store keeps.
+    #[test]
+    fn leaving_mapped_mode_releases_the_banks_before_sizing_the_slots() {
+        use super::super::memory::HostMemory;
+        let temp = Temp::new();
+        let gguf = temp.0.join("experts.gguf");
+        write_fixture(&gguf);
+        let root = temp.0.join("cache");
+        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
+        store
+            .prepare_mapped_pack_at(&temp.0.join("mapped"))
+            .unwrap();
+        store
+            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
+                plan.budget = 1 << 30;
+                plan.mapped = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.plan.mapped);
+        store.plan.physical_bytes = Some(128 << 30);
+        store.plan.hot_bytes = 83 << 30;
+        let map = Arc::clone(&store.mapped_experts[&0].maps[0]);
+        let holders = Arc::strong_count(&map);
+        assert!(holders >= 2, "the store holds the mapping: {holders}");
+        let wired = HostMemory {
+            physical: 128 << 30,
+            free: 1 << 30,
+            file: 20 << 30,
+            anonymous: 30 << 30,
+            purgeable: 0,
+            wired: 50 << 30,
+            compressor: 10 << 30,
+            uncompressed: 10 << 30,
+            swapped: 0,
+            faults: 1,
+        };
+        let released = |faults: u64| HostMemory {
+            file: 54 << 30,
+            wired: 16 << 30,
+            faults,
+            ..wired
+        };
+        let mut samples = std::collections::VecDeque::from([
+            wired,
+            released(2),
+            released(3),
+            released(4),
+            released(5),
+            released(6),
+        ]);
+        let mut seen = Vec::new();
+        let mut slept = 0;
+        let why = Fallback::SsdReads {
+            read: 3 << 30,
+            mapped: 1 << 30,
+        };
+        store
+            .leave_mapped_with(
+                &why,
+                &mut || {
+                    seen.push(Arc::strong_count(&map));
+                    Ok(samples.pop_front().expect("more samples than polls"))
+                },
+                &mut |_| slept += 1,
+            )
+            .unwrap();
+        assert_eq!(seen.len(), 6);
+        assert!(
+            seen.iter().all(|&n| n < holders),
+            "sampled while the store still held its banks: {seen:?} of {holders}"
+        );
+        assert_eq!(slept, 5);
+        assert!(!store.plan.mapped && store.mapped_experts.is_empty() && store.prefetch.is_none());
+        assert_eq!(store.plan.available_bytes, Some(released(6).available()));
+        assert_eq!(store.plan.budget, 35 << 30, "sized from the released host");
+        assert_eq!(store.cache_limit, store.plan.budget);
+        assert_eq!(store.live.fallback(), Some(why));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while Arc::strong_count(&map) > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pack mapping outlived the fallback"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }

@@ -5449,22 +5449,88 @@ export interface Qwen4ExpLoadOptions {
   auxiliaryModelPath?: string;
 }
 
-/** Load-time residency decision; full residency is admitted before payload reads. */
+/**
+ * Load-time residency decision (the budget is admitted before payload
+ * reads) plus the live pinned-bank total.
+ */
 export interface Qwen4ExpResidencyInfo {
-  policy: string;
   weightBudgetBytes: number;
   hotWeightBytes: number;
-  fullHotResidency: boolean;
   prefillChunkTokens: number;
   /** Free plus reclaimable file-backed memory observed at bootstrap. */
   availableMemoryBytes?: number;
   physicalMemoryBytes?: number;
-  /** Assembled matrices actually pinned, including partial projection banks. */
+  /**
+   * Assembled matrices actually pinned right now: partial projection banks
+   * and the MTP expert banks built at load.
+   */
   residentBankBytes: number;
-  /** Complete routed layers whose expert IDs stay on the GPU. */
-  residentExpertLayers: number;
-  /** Shared slot capacity for the remaining partial layers at bootstrap. */
+  /**
+   * Shared slot capacity for the routed layers at bootstrap (the expert
+   * count in mapped mode).
+   */
   partialExpertSlots: number;
+  /**
+   * Routed expert tensors the slot path reads by range from the mapped
+   * pack; 0 means every expert read is imported from the checkpoint.
+   */
+  mappedPackFiles: number;
+  /**
+   * Every routed expert is addressed in place through the mapped pack;
+   * the weight budget then covers dense banks and rows only.
+   */
+  mapped: boolean;
+  /**
+   * Pack bytes backing live arrays in mapped mode (clean page cache the
+   * Metal driver wires while a command buffer binds them).
+   */
+  mappedBytes: number;
+  /**
+   * Bytes of mapped banks the host could hold beside what stays anonymous
+   * when the residency was chosen: physical RAM minus a margin, the live
+   * non-reclaimable memory below and the anonymous need. The pack maps
+   * when this covers every bank.
+   */
+  mappedBankBudgetBytes: number;
+  /**
+   * Wired, compressed and other processes' anonymous memory when the
+   * residency was chosen.
+   */
+  liveNonReclaimableBytes: number;
+  /**
+   * Why the slot path serves the experts although the pack exists: the
+   * load gate, or a mapped turn that read over twice the pack from SSD or
+   * ran eight consecutive passes over ten times their median (over the
+   * fastest larger pass while they have no median of their own).
+   */
+  fallbackReason?: string;
+  fallbackReadBytes?: number;
+  fallbackSlowSteps?: number;
+  /**
+   * Tokens the request held when it left the mapped path between two of
+   * its passes; absent for the load gate.
+   */
+  fallbackTokenIndex?: number;
+  /**
+   * Token/PLE rows asked of the decoded-row LRU since load, and the ones
+   * it had to import.
+   */
+  decodedRowLookups: number;
+  decodedRowMisses: number;
+  /** Share of decoded-row lookups served without an import. */
+  decodedRowHitRate: number;
+  /**
+   * Imported rows whose bytes a reader thread had ready, and those the
+   * model thread read or waited for after requesting them.
+   */
+  prefetchedRows: number;
+  lateRows: number;
+  /**
+   * Decoded rows the LRU bound evicted since load, and the bytes those
+   * evictions released (a window's shared buffer goes with its last row).
+   */
+  decodedRowEvictions: number;
+  decodedRowEvictedBytes: number;
 }
 
 /** Result of text recognition. */
