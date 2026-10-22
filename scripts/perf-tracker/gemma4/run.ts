@@ -11,6 +11,7 @@ import { parseArgs } from 'node:util';
 import {
   ROOT,
   addonIdentity,
+  assertAcPower,
   assertCleanEnv,
   assertPin,
   assertLatestMain,
@@ -149,6 +150,7 @@ async function preflight(out: string, allowDirty: boolean) {
   if ((await exists(join(out, 'raw'))) && (await readdir(join(out, 'raw'))).length) {
     throw new Error(`${out}/raw already holds samples; use a new --out`);
   }
+  assertAcPower();
   const { manifest, path, cases } = await readFixture();
   const current = await identity(manifest, allowDirty);
   const render = JSON.parse(sh('oxnode', [RENDER], { cwd: ROOT })) as unknown;
@@ -260,6 +262,7 @@ async function matrix(out: string, allowDirty: boolean) {
   const manifest = await readManifest();
   const provenance = await readProvenance(out, allowDirty);
   await assertUnchanged(manifest, provenance);
+  assertAcPower();
   let pilotsDone = 0;
   for (const runtime of ['mlx', 'llama'] as const) {
     const path = samplePath(out, sampleId(runtime, manifest.protocol.warmupCase, PILOT_RUN));

@@ -398,9 +398,13 @@ export function assertLoadedAddon(expected = ADDON_PATH): void {
   }
 }
 
-export function assertHostReady(port: number): void {
+export function assertAcPower(): void {
   const power = sh('pmset', ['-g', 'batt']).split('\n')[0];
   if (!power.includes("'AC Power'")) throw new Error(`Measure on AC power: ${power}`);
+}
+
+export function assertHostReady(port: number): void {
+  assertAcPower();
   if (spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN']).status === 0) throw new Error(`Port ${port} is busy`);
 }
 

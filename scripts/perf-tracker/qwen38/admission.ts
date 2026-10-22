@@ -2,6 +2,7 @@
 
 import { execFile, spawnSync } from 'node:child_process';
 import { appendFile } from 'node:fs/promises';
+import { basename } from 'node:path';
 import { promisify } from 'node:util';
 
 import { hostSnapshot, sh, sleep } from '../common.js';
@@ -14,11 +15,10 @@ const LLM_COMMANDS = [
   'llama-server',
   'llama-bench',
   'llama-cli',
-  '/ollama ',
-  '/ollama.app/',
+  'ollama',
   'mlx_lm',
-  '/vllm',
-  '/llmster',
+  'vllm',
+  'llmster',
   'lmstudio',
   'lm studio',
   'mlx-worker.ts',
@@ -45,15 +45,36 @@ interface ProcessEntry {
   pid: number;
   ppid: number;
   cpu: number;
+  executable: string;
   command: string;
 }
 
-export function processTable(): ProcessEntry[] {
-  return sh('ps', ['-axo', 'pid=,ppid=,pcpu=,command='])
+const rows = (columns: string) =>
+  sh('ps', ['-axo', columns])
     .split('\n')
-    .map((line) => /^\s*(\d+)\s+(\d+)\s+([\d.]+)\s+(.+)$/.exec(line))
-    .filter((match): match is RegExpExecArray => match !== null)
-    .map((match) => ({ pid: Number(match[1]), ppid: Number(match[2]), cpu: Number(match[3]), command: match[4] }));
+    .map((line) => /^\s*(\d+)\s+(.+)$/.exec(line))
+    .filter((match): match is RegExpExecArray => match !== null);
+
+// `comm` is the executable path, spaces included; `command` is argv.
+export function processTable(): ProcessEntry[] {
+  const executables = new Map(rows('pid=,comm=').map((match) => [Number(match[1]), match[2]]));
+  return rows('pid=,ppid=,pcpu=,command=')
+    .map((match) => [Number(match[1]), /^(\d+)\s+([\d.]+)\s+(.+)$/.exec(match[2])] as const)
+    .filter((row): row is [number, RegExpExecArray] => row[1] !== null)
+    .map(([pid, match]) => ({
+      pid,
+      ppid: Number(match[1]),
+      cpu: Number(match[2]),
+      executable: executables.get(pid) ?? match[3].split(' ')[0],
+      command: match[3],
+    }));
+}
+
+// The executable decides, or for an interpreter its argv: a shell, editor or
+// `tail` that only names a runtime is not one. An idle runtime still holds memory.
+export function isLocalLlm({ executable, command }: ProcessEntry): boolean {
+  const text = /^(node|python[\d.]*)$/i.test(basename(executable)) ? command : executable;
+  return LLM_COMMANDS.some((marker) => text.toLowerCase().includes(marker));
 }
 
 // `oxnode` runs a script in a child node process, so the PID returned by
@@ -76,10 +97,11 @@ export function otherLocalLlms(): { pid: number; cpu: number; command: string }[
   const table = processTable();
   const own = descendants(table, process.pid);
   const active = [];
-  for (const { pid, cpu, command } of table) {
+  for (const row of table) {
+    const { pid, cpu, command } = row;
     if (own.has(pid)) continue;
     const lower = command.toLowerCase();
-    if (LLM_COMMANDS.some((marker) => lower.includes(marker)) && cpu > 1) {
+    if (isLocalLlm(row)) {
       active.push({ pid, cpu, command });
     } else if (cpu > 10 && (lower.includes('python') || lower.includes('/node '))) {
       const opened = spawnSync('lsof', ['-p', String(pid), '-Fn'], { encoding: 'utf8', maxBuffer: 256 << 20 });

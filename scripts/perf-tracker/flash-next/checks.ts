@@ -2,11 +2,10 @@
 
 import { execFileSync } from 'node:child_process';
 import { lstat } from 'node:fs/promises';
-import { basename } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 
 import { fileHashes, sh, sha256File, sleep, type FixtureCase } from '../common.js';
-import { processTable } from '../qwen38/admission.js';
+import { isLocalLlm, processTable } from '../qwen38/admission.js';
 import type { Result } from '../qwen38/runtimes.js';
 import { sampleAcceptance } from '../qwen38/suite.js';
 import { ASSET_FILES, PROTOCOL, SPECULATION, type Loaded, type SplitIdentity, type Volume } from './suite.js';
@@ -47,16 +46,8 @@ export function assertInternalSsd(paths: readonly string[]): Volume[] {
   return volumes;
 }
 
-// argv[0] decides, since `comm` is cut to 16 characters: a shell, editor or `tail`
-// that only names these files is not a runtime.
 function runtimeProcesses(): { pid: number; command: string }[] {
-  return processTable().filter(({ pid, command }) => {
-    const executable = basename(command.split(' ')[0]);
-    return (
-      pid !== process.pid &&
-      (executable === 'llama-server' || (executable === 'node' && /\/mlx-worker\.ts(\s|$)/.test(command)))
-    );
-  });
+  return processTable().filter((row) => row.pid !== process.pid && isLocalLlm(row));
 }
 
 // A model process left from an earlier block would shrink the next automatic budget.

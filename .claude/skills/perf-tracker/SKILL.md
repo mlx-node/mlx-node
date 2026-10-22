@@ -41,6 +41,8 @@ that cache on the file path, inode, ctime and device.
   until the GPU is at most 5% busy before their 6k and 16k rows; Gemma records the load instead of waiting. If the
   desktop never reaches GPU idle and the user accepts it, `run.ts all --desktop-load` (either Qwen3.8 suite) admits
   every row like the 32k row (no other local LLM). The run records this; say so in the write-up.
+- Every suite refuses battery power. "No other local LLM" counts any open llama.cpp, Ollama, LM Studio, mlx_lm or
+  vLLM process, idle or not, since an idle model still holds memory: quit them before a run.
 - Do not change the protocol: fixtures, llama.cpp arguments, token counts, order, warmups and cooldowns. A changed
   protocol is a new fixture version and a new tracker row, not a rerun.
 - Every suite starts llama-server with `-ctxcp 0 -cram 0` on top of the fixture's arguments. Each measured request is
@@ -93,7 +95,7 @@ that cache on the file path, inode, ctime and device.
 | Free memory   | A normal desktop: do not close apps or free memory for the run. A smaller budget streams more from SSD; name heavy apps in the write-up.                                                                       |
 | MTP           | mlx-node reads the `mtp.*` block of `Qwen/Qwen3.8-Flash-Next` through `auxiliaryModelPath` (`mtp-aux.ts` builds the folder); llama.cpp runs unsloth's Q8_0 MTP GGUF.                                           |
 | Owner         | Each mlx-node request sends its own `cacheOwnerId`. Builds that route an ownerless request to the exclusive lane decode MTP as plain AR (`mtpCycles` absent); no earlier mlx-node sample here ran MTP.         |
-| Leftovers     | Before each load the runner waits up to 60 s for any other `llama-server` or mlx worker to exit, then stops. A leftover model process would shrink the budget.                                                 |
+| Leftovers     | Before each load the runner waits up to 60 s for any other local LLM process (the list above, or an mlx worker) to exit, then stops. A leftover model process would shrink the budget.                         |
 | Prompt IDs    | `prewarm` traces the IDs the native session admits and compares them with the pinned IDs. So `all` includes the proof that `qwen38` runs as `check-ids`; `matrix` refuses a run without it.                    |
 | Fixture       | The Qwen3.8 fixture as is: same messages, same token IDs.                                                                                                                                                      |
 | Agreement     | `compare.md` shows how many characters both runtimes generated identically. Information only, not a gate.                                                                                                      |
