@@ -49,8 +49,9 @@ qwen4_dense_prefill_dispatch(const std::vector<array> &a) {
   return compiled(a);
 }
 
-static std::vector<array>
-qwen4_indirect_prefill_graph(const std::vector<array> &a) {
+// Eager on purpose: compile would keep one ~309 KB trace per row count, and
+// slot groups produce many row counts. Two custom kernels have nothing to fuse.
+static std::vector<array> qwen4_indirect_prefill(const std::vector<array> &a) {
   const auto &x = a[0];
   const auto &ids = a[1];
   const auto &rows = a[2];
@@ -86,11 +87,6 @@ qwen4_indirect_prefill_graph(const std::vector<array> &a) {
            std::nullopt, false,
            mlx::core::default_stream(mlx::core::Device::gpu))[0];
   return {out};
-}
-
-static std::vector<array> qwen4_indirect_prefill(const std::vector<array> &a) {
-  static auto compiled = mlx::core::compile(qwen4_indirect_prefill_graph);
-  return compiled(a);
 }
 
 #endif
