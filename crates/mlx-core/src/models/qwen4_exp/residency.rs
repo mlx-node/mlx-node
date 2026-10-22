@@ -612,6 +612,13 @@ impl Store {
         self.prepare_mtp_expert_banks_with(&mut super::super::memory::admit)
     }
 
+    /// The draft-bank build without the live host admission: it asks for
+    /// `WORKING_BYTES` beside the bank, which a 7 GB CI runner refuses.
+    #[cfg(test)]
+    pub(in super::super) fn prepare_fixture_mtp_expert_banks(&mut self) -> Result<u64> {
+        self.prepare_mtp_expert_banks_with(&mut |_| Ok(()))
+    }
+
     /// Build the MTP head's routed experts as resident Q8 (affine, g32) banks
     /// so a draft step gathers them on the device. Runs once, at load; the
     /// whole aux tensor streams through 64 MiB row chunks. Both banks or
@@ -1278,7 +1285,8 @@ mod tests {
         let mut s = Store::open_fixture(&fixture().join("bf16/paged"), None).unwrap();
         s.cache_limit = MAX_READ_BYTES * 3;
         let before = s.cache_bytes;
-        assert_eq!(s.prepare_mtp_expert_banks().unwrap(), 0);
+        let mut declined = |_: u64| -> Result<()> { panic!("a declined build reached the host") };
+        assert_eq!(s.prepare_mtp_expert_banks_with(&mut declined).unwrap(), 0);
         assert_eq!(s.mtp_bank_bytes().unwrap(), 0);
         assert!(MTP_EXPERT_BANKS.iter().all(|n| !s.banks.contains_key(*n)));
         assert_eq!(s.cache_bytes, before);
@@ -1286,9 +1294,9 @@ mod tests {
         assert_eq!(s.plan.resident_bank_bytes.load(Ordering::Relaxed), 0);
         assert!(s.mtp_banks_declined, "a declined build must not retry");
         s.cache_limit = CACHE_BYTES;
-        assert_eq!(s.prepare_mtp_expert_banks().unwrap(), 0);
+        assert_eq!(s.prepare_mtp_expert_banks_with(&mut declined).unwrap(), 0);
         s.mtp_banks_declined = false;
-        let bytes = s.prepare_mtp_expert_banks().unwrap();
+        let bytes = s.prepare_fixture_mtp_expert_banks().unwrap();
         assert!(bytes > 0);
         assert_eq!(s.cache_bytes, before + bytes);
     }

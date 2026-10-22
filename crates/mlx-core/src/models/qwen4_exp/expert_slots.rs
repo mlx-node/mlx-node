@@ -289,6 +289,13 @@ impl Store {
         self.finish_load_with(&mut super::super::memory::admit);
     }
 
+    /// `finish_load` without the live host admission (see
+    /// `prepare_fixture_mtp_expert_banks`).
+    #[cfg(test)]
+    pub(in super::super) fn finish_fixture_load(&mut self) {
+        self.finish_load_with(&mut |_| Ok(()));
+    }
+
     pub(super) fn finish_load_with(&mut self, admit: &mut impl FnMut(u64) -> Result<()>) {
         if let Err(error) = self.prepare_mtp_expert_banks_with(admit) {
             tracing::warn!(

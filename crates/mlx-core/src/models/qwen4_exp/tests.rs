@@ -1775,9 +1775,12 @@ fn mtp_draft_gathers_the_resident_q8_expert_bank() {
     let c = config::Config::parse(&raw).unwrap();
     let store = weights::Store::open_fixture(&path, None).unwrap();
     let mut decoder = decoder::Decoder::new(c.clone(), store).unwrap();
-    let bytes = decoder.weights.prepare_mtp_expert_banks().unwrap();
+    let bytes = decoder.weights.prepare_fixture_mtp_expert_banks().unwrap();
     assert!(bytes > 0);
-    assert_eq!(decoder.weights.prepare_mtp_expert_banks().unwrap(), bytes);
+    assert_eq!(
+        decoder.weights.prepare_fixture_mtp_expert_banks().unwrap(),
+        bytes
+    );
     assert_eq!(decoder.weights.mtp_bank_bytes().unwrap(), bytes);
     let gate_up = decoder
         .weights
@@ -1917,7 +1920,7 @@ fn mtp_resident_bank_matches_the_dense_expert_sum() {
             .unwrap()
             .is_none()
     );
-    decoder.weights.prepare_mtp_expert_banks().unwrap();
+    decoder.weights.prepare_fixture_mtp_expert_banks().unwrap();
     let actual = decoder
         .mtp_resident_experts_for_test(&x, &selected, &scores)
         .unwrap()
@@ -2083,7 +2086,7 @@ fn tiny_decoder() -> (decoder::Decoder, media::Vision) {
 /// pack stream).
 fn inner_over(mut decoder: decoder::Decoder, vision: media::Vision, has_mtp: bool) -> Inner {
     if has_mtp {
-        decoder.weights.finish_load();
+        decoder.weights.finish_fixture_load();
     }
     let tokenizer_dir = Temp::new();
     let tokenizer_path = tokenizer_dir.0.join("tokenizer.json");
@@ -2689,7 +2692,7 @@ fn the_load_builds_the_draft_banks_only_with_the_head() {
 
     let mut text_only = weights::Store::open_fixture(&fixture(), None).unwrap();
     let before = text_only.plan.resident_bank_bytes.load(Ordering::Relaxed);
-    text_only.finish_load();
+    text_only.finish_fixture_load();
     assert_eq!(text_only.mtp_bank_bytes().unwrap(), 0);
     assert_eq!(
         text_only.plan.resident_bank_bytes.load(Ordering::Relaxed),
