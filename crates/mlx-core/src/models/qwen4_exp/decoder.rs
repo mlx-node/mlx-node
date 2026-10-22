@@ -52,8 +52,25 @@ pub struct LayerCache {
     keys: Option<MxArray>,
     values: Option<MxArray>,
     index_tail: Vec<MxArray>,
-    index_blocks: Vec<MxArray>,
+    /// `[blocks, indexer_head_dim]`. Snapshots and replay share handles, so
+    /// appending must build a new array, never write into this one.
+    index_keys: Option<MxArray>,
     ple_conv: Option<MxArray>,
+}
+impl LayerCache {
+    fn index_block_count(&self) -> Result<usize> {
+        match &self.index_keys {
+            Some(keys) => Ok(keys.shape_at(0)? as usize),
+            None => Ok(0),
+        }
+    }
+    fn append_index_keys(&mut self, keys: MxArray) -> Result<&MxArray> {
+        let keys = match &self.index_keys {
+            Some(old) => MxArray::concatenate(old, &keys, 0)?,
+            None => keys,
+        };
+        Ok(self.index_keys.insert(keys))
+    }
 }
 #[derive(Clone, Default)]
 pub struct DecoderState {
@@ -139,6 +156,10 @@ impl Decoder {
             last_chunk_hidden: self.last_chunk_hidden.clone(),
             cancelled: self.cancelled.clone(),
         }
+    }
+    #[cfg(test)]
+    pub(super) fn index_keys(&self, layer: usize) -> Option<&MxArray> {
+        self.caches[layer].index_keys.as_ref()
     }
     pub fn take_state(&mut self) -> DecoderState {
         let state = DecoderState {
@@ -1167,12 +1188,13 @@ impl Decoder {
                 true,
             )?;
             let block = self.rope(&raw, pos + 1 - c.indexer_compress_ratio)?;
-            self.submit_state(&[&block], "qwen4::decoder::block")?;
-            cache.index_blocks.push(block);
+            let keys = cache.append_index_keys(block)?;
+            self.submit_state(&[keys], "qwen4::decoder::block")?;
             cache.index_tail.clear();
         }
         let topk = c.indexer_budget / c.indexer_compress_ratio;
-        let selected = if cache.index_blocks.len() > topk {
+        let nb = cache.index_block_count()?;
+        let selected = if let Some(index_keys) = cache.index_keys.as_ref().filter(|_| nb > topk) {
             let iq = iq.reshape(&[ih, id])?;
             let iq = self.norm(
                 &iq,
@@ -1182,8 +1204,7 @@ impl Decoder {
                 true,
             )?;
             let iq = self.rope(&iq, pos)?.astype(DType::Float32)?;
-            let blocks = MxArray::concatenate_many(cache.index_blocks.iter().collect(), Some(0))?
-                .astype(DType::Float32)?;
+            let blocks = index_keys.astype(DType::Float32)?;
             let scores = iq
                 .matmul(&blocks.transpose(None)?)?
                 .clip(Some(0.0), None)?
@@ -1193,7 +1214,7 @@ impl Decoder {
             let scores = scores
                 .div_scalar((c.indexer_head_dim as f64).sqrt())?
                 .reshape(&[1, 1, -1])?;
-            let n = cache.index_blocks.len() as i64;
+            let n = nb as i64;
             let indices = scores
                 .argpartition(-(topk as i32), Some(-1))?
                 .slice_axis(2, n - topk as i64, n)?
@@ -1213,7 +1234,7 @@ impl Decoder {
                 .add(&offsets)?
                 .reshape(&[-1])?;
             let tail = MxArray::arange(
-                (cache.index_blocks.len() * c.indexer_compress_ratio) as f64,
+                (nb * c.indexer_compress_ratio) as f64,
                 (pos + 1) as f64,
                 None,
                 Some(DType::Int32),

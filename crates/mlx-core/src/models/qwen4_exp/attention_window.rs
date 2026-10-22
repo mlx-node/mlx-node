@@ -120,10 +120,20 @@ impl Decoder {
         let c = self.config.clone();
         let base = self.history.len();
         let t = x.shape()?[1] as usize;
+        let dtype = x.dtype()?;
+        let sparse = base + t > c.indexer_budget;
         if runtime_flags::is_zero(c"MLX_QWEN4_ATTENTION_WINDOW")
             // F32 fixtures retain singleton SDPA accumulation (wide NAX uses TF32).
-            || x.dtype()? == DType::Float32
-            || base + t > c.indexer_budget || self.verification.is_some()
+            || dtype == DType::Float32
+            || self.verification.is_some()
+            || self.position_override.is_some()
+            || (sparse
+                && (runtime_flags::is_zero(c"MLX_QWEN4_BATCHED_QSA")
+                    || !matches!(dtype, DType::BFloat16 | DType::Float16)
+                    || !c.head_dim.is_multiple_of(32)
+                    // The kernel attends at most 32 incomplete-block tokens.
+                    || c.indexer_compress_ratio > 33
+                    || !crate::engine::persistence::compiled_forward_backend_available()))
         {
             return Ok(None);
         }
@@ -183,29 +193,24 @@ impl Decoder {
                 true,
             )?;
             let rotated = if self.use_batch_rotary() {
-                Some(
-                    self.rope_window_positions(
-                        &norms.reshape(&[1, 1, blocks as i64, id])?,
-                        (0..blocks).map(|b| base - tail + b * ratio),
-                    )?
-                    .reshape(&[blocks as i64, id])?,
-                )
+                self.rope_window_positions(
+                    &norms.reshape(&[1, 1, blocks as i64, id])?,
+                    (0..blocks).map(|b| base - tail + b * ratio),
+                )?
+                .reshape(&[blocks as i64, id])?
             } else {
-                None
+                let keys = (0..blocks)
+                    .map(|b| {
+                        self.rope(
+                            &norms.slice_axis(0, b as i64, b as i64 + 1)?,
+                            base - tail + b * ratio,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                MxArray::concatenate_many(keys.iter().collect(), Some(0))?
             };
-            for b in 0..blocks {
-                if let Some(keys) = &rotated {
-                    cache
-                        .index_blocks
-                        .push(keys.slice_axis(0, b as i64, b as i64 + 1)?);
-                    continue;
-                }
-                let key = self.rope(
-                    &norms.slice_axis(0, b as i64, b as i64 + 1)?,
-                    base - tail + b * ratio,
-                )?;
-                cache.index_blocks.push(key);
-            }
+            let keys = cache.append_index_keys(rotated)?;
+            self.submit_state(&[keys], "qwen4::window::index_keys")?;
         }
         cache.index_tail = (used..tail + t)
             .map(|r| raw.slice_axis(0, r as i64, r as i64 + 1))
@@ -243,12 +248,54 @@ impl Decoder {
             cache.values = Some(values.clone());
             (keys, values)
         };
-        let out = crate::array::scaled_dot_product_attention_causal(
-            &q,
-            &keys,
-            &values,
-            (c.head_dim as f64).powf(-0.5),
-        )?;
+        let scale = (c.head_dim as f64).powf(-0.5);
+        let out = if sparse {
+            // Rows whose complete blocks fit the budget select all of them
+            // (the rest are -1), so the kernel is causal for those rows.
+            let (selected, query_ends) = self.qsa_select(i, cache, &projections.iq, base, t)?;
+            math::qsa_attention(&q, &keys, &values, &selected, &query_ends, scale, ratio)?
+        } else {
+            crate::array::scaled_dot_product_attention_causal(&q, &keys, &values, scale)?
+        };
         Ok(Some(math::attention_output(&out, &qg)?))
+    }
+
+    /// Rows `base..base + t` choose among every block complete at that row,
+    /// including blocks this window completed, so call after appending them.
+    fn qsa_select(
+        &mut self,
+        i: usize,
+        cache: &LayerCache,
+        iq: &MxArray,
+        base: usize,
+        t: usize,
+    ) -> Result<(MxArray, MxArray)> {
+        let c = self.config.clone();
+        let index_keys = cache
+            .index_keys
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Qwen4 sparse window has no indexer blocks"))?;
+        let query = self
+            .norm(
+                &iq.reshape(&[
+                    1,
+                    t as i64,
+                    c.indexer_n_heads as i64,
+                    c.indexer_head_dim as i64,
+                ])?,
+                &format!("layers.{i}.self_attn.indexer.q_layernorm.weight"),
+                &format!("blk.{i}.indexer.q_norm.weight"),
+                c.indexer_head_dim,
+                true,
+            )?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+        let query = self.rope_window(&query, base, t)?;
+        math::qsa_select(
+            &query,
+            index_keys,
+            base,
+            c.indexer_compress_ratio,
+            c.indexer_budget / c.indexer_compress_ratio,
+        )
     }
 }

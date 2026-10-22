@@ -27,7 +27,7 @@ impl Decoder {
                     .chain(cache.ple_conv.iter())
                     .chain(cache.keys.iter())
                     .chain(cache.values.iter())
-                    .chain(cache.index_blocks.iter())
+                    .chain(cache.index_keys.iter())
                     .chain(cache.index_tail.iter())
             })
             .collect()

@@ -1776,6 +1776,92 @@ pub(super) fn attention_output(attention: &MxArray, projection: &MxArray) -> Res
     sigmoid_mul(&gate, &value)
 }
 
+/// mlx-vlm's batched QSA block choice (`select_from_projected`) for rows
+/// `base..base + t`, from the rotated indexer queries `[1, heads, t, dim]` and
+/// the rotated block keys `[blocks, dim]`. Returns the sorted `[1, t, topk]`
+/// picks (-1 where unused) and the exclusive `[1, t]` query ends.
+pub(super) fn qsa_select(
+    query: &MxArray,
+    index_keys: &MxArray,
+    base: usize,
+    ratio: usize,
+    topk: usize,
+) -> Result<(MxArray, MxArray)> {
+    let shape = query.shape()?;
+    let (t, dim) = (shape[2], shape[3]);
+    let blocks = index_keys.shape_at(0)?;
+    let keys = index_keys
+        .astype(DType::Float32)?
+        .reshape(&[1, 1, blocks, dim])?
+        .transpose(Some(&[0, 1, 3, 2]))?;
+    let scores = query
+        .astype(DType::Float32)?
+        .matmul(&keys)?
+        .maximum(&MxArray::scalar_float(0.0)?)?
+        .sum(Some(&[1]), Some(false))?
+        .div_scalar((dim as f64).sqrt())?;
+    let complete: Vec<i32> = (0..t as usize)
+        .map(|j| ((base + j + 1) / ratio) as i32)
+        .collect();
+    let complete = MxArray::from_int32(&complete, &[1, t, 1])?;
+    let ids =
+        MxArray::arange(0., blocks as f64, None, Some(DType::Int32))?.reshape(&[1, 1, blocks])?;
+    let negative = MxArray::scalar_float(f64::NEG_INFINITY)?;
+    let mut scores = ids.less(&complete)?.where_(&scores, &negative)?;
+    let topk = topk as i64;
+    if blocks < topk {
+        scores = scores.pad(&[0, 0, 0, 0, 0, (topk - blocks) as i32], f64::NEG_INFINITY)?;
+    }
+    let width = blocks.max(topk);
+    let selected = scores
+        .argpartition(-(topk as i32), Some(-1))?
+        .slice_axis(2, width - topk, width)?
+        .astype(DType::Int32)?;
+    let selected = selected
+        .less(&complete)?
+        .where_(&selected, &MxArray::scalar_int(-1)?)?
+        .sort(Some(-1))?;
+    let query_ends = MxArray::arange(
+        (base + 1) as f64,
+        (base + t as usize + 1) as f64,
+        None,
+        Some(DType::Int32),
+    )?
+    .reshape(&[1, t])?;
+    Ok((selected, query_ends))
+}
+
+/// mlx-vlm's indexed QSA kernel. `selected` is `[1, t, topk]` sorted block ids
+/// with -1 for unused picks; each row also attends its incomplete block up to
+/// `query_ends` (`[1, t]`, exclusive).
+pub(super) fn qsa_attention(
+    q: &MxArray,
+    keys: &MxArray,
+    values: &MxArray,
+    selected: &MxArray,
+    query_ends: &MxArray,
+    scale: f64,
+    block_size: usize,
+) -> Result<MxArray> {
+    let mut out = std::ptr::null_mut();
+    let ok = unsafe {
+        mlx_sys::mlx_qwen4_qsa_attention(
+            q.as_raw_ptr(),
+            keys.as_raw_ptr(),
+            values.as_raw_ptr(),
+            selected.as_raw_ptr(),
+            query_ends.as_raw_ptr(),
+            scale as f32,
+            block_size as i32,
+            &mut out,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason("Qwen4 sparse attention kernel failed"));
+    }
+    MxArray::from_handle(out, "Qwen4 sparse attention")
+}
+
 pub(super) fn sigmoid_mul(gate: &MxArray, value: &MxArray) -> Result<MxArray> {
     if runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE") {
         value.mul(&Activations::sigmoid(gate)?)

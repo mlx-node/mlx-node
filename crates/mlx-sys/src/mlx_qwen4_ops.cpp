@@ -517,20 +517,26 @@ bool mlx_qwen4_gather_window(mlx_array *keys, mlx_array *values,
         k.dtype() != v.dtype() || k.size() != v.size() || fk.shape(0) != 1 ||
         fk.shape(3) % 8)
       return false;
-    int heads = fk.shape(1), dim = fk.shape(3), fresh = fk.shape(2),
-        count = ids.size();
+    int heads = fk.shape(1), dim = fk.shape(3), count = ids.size();
+    // Sizes that change per row or decode step are runtime arguments: each
+    // distinct template tuple compiles a Metal library that is never evicted.
     static auto kernel = mlx::core::fast::metal_kernel(
-        "qwen4_gather_window", {"keys", "values", "blocks", "ids", "fk", "fv"},
-        {"ko", "vo"}, R"(
+        "qwen4_gather_window",
+        {"keys", "values", "blocks", "ids", "fk", "fv", "base"}, {"ko", "vo"},
+        R"(
+      const int N = ids_shape[0], FRESH = fk_shape[2];
       uint i = thread_position_in_grid.x;
       if (i >= H * N * D) return;
       uint d = i % D, t = (i / D) % N, h = i / (D * N);
       int token = ids[t];
-      if (token < 0 || token >= BASE + FRESH) { ko[i] = 0; vo[i] = 0; return; }
-      if (token >= BASE) {
-        size_t src = (size_t(h) * FRESH + uint(token - BASE)) * D + d;
+      if (token < 0 || token >= base + FRESH) { ko[i] = 0; vo[i] = 0; return; }
+      if (token >= base) {
+        size_t src = (size_t(h) * FRESH + uint(token - base)) * D + d;
         ko[i] = fk[src]; vo[i] = fv[src];
       } else {
+        size_t elements = 1;
+        for (int a = 0; a < keys_ndim; ++a) elements *= size_t(keys_shape[a]);
+        const int POOL = int(elements / (H * D * BS));
         int block = blocks[token / BS];
         if (block < 0 || block >= POOL) { ko[i] = 0; vo[i] = 0; return; }
         uint offset = token % BS;
@@ -540,22 +546,211 @@ bool mlx_qwen4_gather_window(mlx_array *keys, mlx_array *values,
       }
     )");
     auto result = kernel(
-        {k, v, blocks, ids, fk, fv},
+        {k, v, blocks, ids, fk, fv, array(base, mlx::core::int32)},
         {{1, heads, count, dim}, {1, heads, count, dim}},
         {fk.dtype(), fk.dtype()}, {heads * count * dim, 1, 1}, {256, 1, 1},
-        {{"H", heads},
-         {"D", dim},
-         {"N", count},
-         {"BASE", base},
-         {"FRESH", fresh},
-         {"BS", block_size},
-         {"POOL", int(k.size() / (heads * dim * block_size))}},
-        std::nullopt, false, mlx::core::default_stream(mlx::core::Device::gpu));
+        {{"H", heads}, {"D", dim}, {"BS", block_size}}, std::nullopt, false,
+        mlx::core::default_stream(mlx::core::Device::gpu));
     *out_k = reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
     *out_v = reinterpret_cast<mlx_array *>(new array(std::move(result[1])));
     return true;
   } catch (const std::exception &e) {
     std::cerr << "Qwen4 paged window: " << e.what() << std::endl;
+    return false;
+  }
+}
+
+// mlx-vlm's indexed sparse attention (qsa_kernel.py). `selected` rows are
+// sorted block ids with -1 for unused picks; each row also attends its
+// incomplete block up to `query_ends`. Q_LEN and the key length are runtime
+// shapes so chunk length and context never select a new Metal library.
+bool mlx_qwen4_qsa_attention(mlx_array *queries, mlx_array *keys,
+                             mlx_array *values, mlx_array *selected,
+                             mlx_array *query_ends, float scale,
+                             int block_size, mlx_array **out) {
+  try {
+    // One SIMD group per incomplete-block token, 32 per threadgroup.
+    if (!queries || !keys || !values || !selected || !query_ends || !out ||
+        block_size <= 0 || block_size > 33 || !std::isfinite(scale))
+      return false;
+    auto q = *reinterpret_cast<array *>(queries),
+         k = *reinterpret_cast<array *>(keys),
+         v = *reinterpret_cast<array *>(values);
+    auto sel = *reinterpret_cast<array *>(selected),
+         ends = *reinterpret_cast<array *>(query_ends);
+    if (q.ndim() != 4 || k.ndim() != 4 || k.shape() != v.shape() ||
+        (q.dtype() != mlx::core::bfloat16 && q.dtype() != mlx::core::float16) ||
+        k.dtype() != q.dtype() || v.dtype() != q.dtype() ||
+        k.shape(0) != q.shape(0) || k.shape(3) != q.shape(3) ||
+        q.shape(3) % 32 || k.shape(1) <= 0 || q.shape(1) % k.shape(1) ||
+        sel.ndim() != 3 || sel.dtype() != mlx::core::int32 ||
+        sel.shape(0) != q.shape(0) || sel.shape(1) != q.shape(2) ||
+        sel.shape(2) <= 0 || ends.ndim() != 2 ||
+        ends.dtype() != mlx::core::int32 || ends.shape(0) != q.shape(0) ||
+        ends.shape(1) != q.shape(2))
+      return false;
+    const int heads = q.shape(1), kv_heads = k.shape(1), topk = sel.shape(2);
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "qwen4_qsa_attention",
+        {"queries", "keys", "values", "block_indices", "query_ends", "scale"},
+        {"out"}, R"(
+    uint row_idx = threadgroup_position_in_grid.y;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    constexpr int BN = 32;
+    constexpr int BD = 32;
+    constexpr int qk_per_thread = D_SIZE / BD;
+    constexpr int v_per_thread = D_SIZE / BD;
+
+    typedef float U;
+    thread U q[qk_per_thread];
+    thread U o[v_per_thread];
+    threadgroup U outputs[BN * BD];
+    threadgroup U max_scores[BN];
+    threadgroup U sum_exp_scores[BN];
+
+    const int Q_LEN = queries_shape[2];
+    const int key_length = keys_shape[2];
+    int query_idx = int(row_idx % Q_LEN);
+    int batch_head_idx = int(row_idx / Q_LEN);
+    int batch_idx = batch_head_idx / NUM_Q_HEADS;
+    int q_head_idx = batch_head_idx - batch_idx * NUM_Q_HEADS;
+    int kv_head_idx = q_head_idx / GQA_FACTOR;
+    int query_end = int(query_ends[batch_idx * Q_LEN + query_idx]);
+
+    const device T* qptr =
+        queries + ((batch_head_idx * Q_LEN + query_idx) * D_SIZE) +
+        int(simd_lid) * qk_per_thread;
+    device T* optr =
+        out + ((batch_head_idx * Q_LEN + query_idx) * D_SIZE) +
+        int(simd_gid) * v_per_thread;
+
+    U s = U(scale);
+    for (int i = 0; i < qk_per_thread; ++i) {
+        q[i] = s * static_cast<U>(qptr[i]);
+    }
+    for (int i = 0; i < v_per_thread; ++i) {
+        o[i] = 0;
+    }
+
+    int blocks_offset = (batch_idx * Q_LEN + query_idx) * TOPK_BLOCKS;
+    U max_score = -3.4028234663852886e38f;
+    U sum_exp_score = 0;
+
+    for (int selected_idx = int(simd_gid); selected_idx < SELECTED_LENGTH;
+         selected_idx += BN) {
+        int block_slot = selected_idx / BLOCK_SIZE;
+        int block_offset = selected_idx - block_slot * BLOCK_SIZE;
+        int block_idx = int(block_indices[blocks_offset + block_slot]);
+        int key_pos = block_idx * BLOCK_SIZE + block_offset;
+        bool valid = block_idx >= 0 && key_pos < key_length && key_pos < query_end;
+
+        U score = -3.4028234663852886e38f;
+        if (valid) {
+            const device T* kptr =
+                keys + (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
+                         key_pos) * D_SIZE) +
+                int(simd_lid) * qk_per_thread;
+            score = 0;
+            for (int j = 0; j < qk_per_thread; ++j) {
+                score += q[j] * static_cast<U>(kptr[j]);
+            }
+            score = simd_sum(score);
+        }
+
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = valid ? fast::exp(score - new_max) : U(0);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        if (valid) {
+            const device T* vptr =
+                values + (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
+                           key_pos) * D_SIZE) +
+                int(simd_lid) * v_per_thread;
+            for (int j = 0; j < v_per_thread; ++j) {
+                o[j] = o[j] * factor + exp_score * static_cast<U>(vptr[j]);
+            }
+        } else {
+            for (int j = 0; j < v_per_thread; ++j) {
+                o[j] *= factor;
+            }
+        }
+    }
+
+    int tail_start = (query_end / BLOCK_SIZE) * BLOCK_SIZE;
+    int tail_pos = tail_start + int(simd_gid);
+    bool valid_tail = tail_pos < query_end && tail_pos < key_length;
+    if (valid_tail) {
+        const device T* kptr =
+            keys + (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
+                     tail_pos) * D_SIZE) +
+            int(simd_lid) * qk_per_thread;
+        U score = 0;
+        for (int j = 0; j < qk_per_thread; ++j) {
+            score += q[j] * static_cast<U>(kptr[j]);
+        }
+        score = simd_sum(score);
+
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        const device T* vptr =
+            values + (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
+                       tail_pos) * D_SIZE) +
+            int(simd_lid) * v_per_thread;
+        for (int j = 0; j < v_per_thread; ++j) {
+            o[j] = o[j] * factor + exp_score * static_cast<U>(vptr[j]);
+        }
+    }
+
+    if (simd_lid == 0) {
+        max_scores[simd_gid] = max_score;
+        sum_exp_scores[simd_gid] = sum_exp_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    max_score = max_scores[simd_lid];
+    U new_max = simd_max(max_score);
+    U factor = fast::exp(max_score - new_max);
+    U total_sum = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+    for (int i = 0; i < v_per_thread; ++i) {
+        outputs[simd_lid * BD + simd_gid] = o[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+        o[i] = total_sum == 0 ? U(0) : (o[i] / total_sum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (simd_lid == 0) {
+        for (int i = 0; i < v_per_thread; ++i) {
+            optr[i] = static_cast<T>(o[i]);
+        }
+    }
+    )");
+    auto result = kernel(
+        {q, k, v, sel, ends, array(scale, mlx::core::float32)}, {q.shape()},
+        {q.dtype()}, {1024, int(q.shape(0)) * heads * int(q.shape(2)), 1},
+        {1024, 1, 1},
+        {{"T", q.dtype()},
+         {"D_SIZE", int(q.shape(3))},
+         {"NUM_Q_HEADS", heads},
+         {"NUM_KV_HEADS", kv_heads},
+         {"GQA_FACTOR", heads / kv_heads},
+         {"BLOCK_SIZE", block_size},
+         {"TOPK_BLOCKS", topk},
+         {"SELECTED_LENGTH", topk * block_size}},
+        std::nullopt, false, mlx::core::default_stream(mlx::core::Device::gpu));
+    *out = reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
+    return true;
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 sparse attention: " << e.what() << std::endl;
     return false;
   }
 }
@@ -961,6 +1156,7 @@ bool mlx_qwen4_route_sort(mlx_array *ids, int experts, mlx_array **order,
         mlx::core::fast::metal_kernel("qwen4_route_scatter", {"ids", "counts"},
                                       {"order", "inverse", "sorted_ids"}, R"(
       threadgroup uint tile[256], prefix[E], scratch[E], earlier[E];
+      const int R = ids_shape[0], NB = (R + 255) / 256;
       uint lane = thread_position_in_threadgroup.x, block = threadgroup_position_in_grid.x;
       uint row = block * 256 + lane;
       tile[lane] = row < R ? ids[row] : E;
@@ -990,7 +1186,6 @@ bool mlx_qwen4_route_sort(mlx_array *ids, int experts, mlx_array **order,
         count({input}, {{blocks * experts}}, {mlx::core::uint32},
               {blocks * 256, 1, 1}, {256, 1, 1},
               {{"E", experts},
-               {"R", rows},
                {"BALLOT", experts > 256 && experts <= 512 &&
                               (!qwen4_env("MLX_QWEN4_BALLOT_ROUTE_SORT") ||
                                std::string(qwen4_env(
@@ -999,9 +1194,8 @@ bool mlx_qwen4_route_sort(mlx_array *ids, int experts, mlx_array **order,
     auto result =
         scatter({input, counts[0]}, {{rows}, {rows}, {rows}},
                 {mlx::core::uint32, mlx::core::uint32, mlx::core::uint32},
-                {blocks * 256, 1, 1}, {256, 1, 1},
-                {{"E", experts}, {"R", rows}, {"NB", blocks}}, std::nullopt,
-                false, stream);
+                {blocks * 256, 1, 1}, {256, 1, 1}, {{"E", experts}},
+                std::nullopt, false, stream);
     *order = reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
     *inverse = reinterpret_cast<mlx_array *>(new array(std::move(result[1])));
     *sorted_ids =
@@ -1081,6 +1275,7 @@ bool mlx_qwen4_gather_pages(mlx_array *keys, mlx_array *values,
     const int count = indices.size();
     static auto kernel = mlx::core::fast::metal_kernel(
         "qwen4_gather_pages", {"keys", "values", "slots"}, {"ko", "vo"}, R"(
+      const uint TC = slots_shape[0];
       const uint j = thread_position_in_grid.x;
       if (j >= HC * TC * DC) return;
       const uint d = j % DC;
@@ -1095,7 +1290,7 @@ bool mlx_qwen4_gather_pages(mlx_array *keys, mlx_array *values,
     auto result = kernel(
         {k, v, indices}, {{1, heads, count, dim}, {1, heads, count, dim}},
         {k.dtype(), k.dtype()}, {heads * count * dim, 1, 1}, {256, 1, 1},
-        {{"HC", heads}, {"TC", count}, {"DC", dim}, {"BS", block_size}},
+        {{"HC", heads}, {"DC", dim}, {"BS", block_size}},
         std::nullopt, false, mlx::core::default_stream(mlx::core::Device::gpu));
     *out_keys = reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
     *out_values =

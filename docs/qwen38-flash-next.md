@@ -95,6 +95,7 @@ limit reclaims the allocator freelist and re-polls before erroring.
 | `MLX_QWEN4_RESIDENCY=stream` | Bound the on-demand cache to at most 8 GiB unless overridden.           |
 | `MLX_QWEN4_WEIGHT_CACHE_GIB` | Optional integer ceiling, at least 2 GiB; live admission still applies. |
 | `MLX_QWEN4_PREFILL_CHUNK`    | Power of two from 1–1024, constrained by the working-memory allowance.  |
+| `MLX_QWEN4_BATCHED_QSA=0`    | Run prompt windows past the indexer budget one token at a time instead of the batched sparse-attention kernel. |
 | `MLX_QWEN4_PACKED_CACHE=0`   | Disable prepared SSD caching.                                           |
 | `MLX_QWEN4_PACKED_CACHE_DIR` | Override the prepared-cache location.                                   |
 | `MLX_QWEN4_PACKED_CACHE_MAX_GB` | Optional global cap across every packed-cache identity directory, in GiB; least-recently-used eviction. Unset or `<=0` keeps only the per-checkpoint 96 GiB budget. |
