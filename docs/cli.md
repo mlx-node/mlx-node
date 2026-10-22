@@ -1,6 +1,19 @@
 # CLI (`@mlx-node/cli`)
 
-The `mlx` binary is built from `packages/cli/` and exposes the top-level commands `download`, `convert`, `calibrate`, `redact`, `serve`, `launch`, `agent`, and `tts`.
+The `mlx` binary is built from `packages/cli/` and exposes the top-level commands `download`, `convert`, `calibrate`, `redact`, `serve`, `launch`, `agent`, `tts`, and `rerank`.
+
+## `mlx rerank`
+
+```bash
+mlx rerank --model ./reranker --input request.json
+cat request.json | mlx rerank --model local-reranker-name --input -
+```
+
+Input is a JSON object with `query`, `documents`, and optional `top_n`,
+`return_documents`, `truncate`. Documents may be strings or `{ "text": "..." }`.
+The result is JSON on stdout; diagnostics use stderr. Model names resolve in
+the usual models directory. See [reranking](rerank.md) for SDK/HTTP schemas,
+supported checkpoints, conversion, limits and cancellation behavior.
 
 ## `mlx tts`
 
@@ -734,7 +747,7 @@ recipes a comparison is meant to separate.
 
 ## `mlx serve`
 
-Runs the shared inference host (`@mlx-node/server/host`) in the foreground: discovers models under the models dir, binds an Anthropic/OpenAI-compatible HTTP endpoint, and loads weights on the first request. By default chat/decision, ASR and TTS each have one resident slot; `--model-residency single` limits the host to one global slot. Audio-only directories are supported. See [Audio HTTP serving](serve-audio.md) for transcription, speech, SSE and incremental text input.
+Runs the shared inference host (`@mlx-node/server/host`) in the foreground: discovers models under the models dir, binds an Anthropic/OpenAI-compatible HTTP endpoint, and loads weights on the first request. By default chat/decision, ASR, TTS and rerank each have one resident slot; `--model-residency single` limits the host to one global slot. Audio-only and rerank-only directories are supported. See [Audio HTTP serving](serve-audio.md) for transcription, speech, SSE and incremental text input, and [reranking](rerank.md) for `/v1/rerank`, `--rerank-config` and resource lifecycle details.
 
 ```bash
 mlx serve                                        # auto-picked free port
@@ -918,13 +931,13 @@ Both self-maintain on the next load: stale or orphaned entries are removed
 under per-key locks, and live writers are never disturbed — deleting a cache
 directory yourself is only needed to reclaim space immediately.
 
-| Env var                            | Effect                                                                                                                                          |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `MLX_NATIVE_GGUF_CACHE_DIR`        | Override the native GGUF cache location (packed weights, extracted tokenizer assets, companions)                                                 |
+| Env var                            | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MLX_NATIVE_GGUF_CACHE_DIR`        | Override the native GGUF cache location (packed weights, extracted tokenizer assets, companions)                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `MLX_NATIVE_GGUF_CACHE_MAX_GB`     | Cap its total size, in GiB (fractional allowed). `<=0`, unset or unparseable = unlimited. Least-recently-used entries evict under a 24 h grace; a conversion that still cannot fit is not published — the load reads it from its staging directory instead, and a later reload reuses that staged result instead of re-converting. A refused load keeps a per-pid fallback dir that never counts toward the cap and outlives every sweep while the process lives (tokenizer sidecars keep a `.mlx-qwen4-assets-live-{identity}-{pid}` twin of it) |
-| `MLX_QWEN4_PACKED_CACHE_DIR`       | Override the Qwen3.8 prepared SSD cache location (default `~/Library/Caches/mlx-node/qwen4-packed`)                                               |
-| `MLX_QWEN4_PACKED_CACHE_MAX_GB`    | Cap its total size across all checkpoints, in GiB (fractional allowed). `<=0` or unset = only the per-checkpoint 96 GiB budget                    |
-| `MLX_QWEN4_IGNORE_MEMORY_PRESSURE` | `=1` skips the macOS memory-pressure gate that otherwise makes a Qwen3.8 load wait out a transient spike — diagnostic only                        |
+| `MLX_QWEN4_PACKED_CACHE_DIR`       | Override the Qwen3.8 prepared SSD cache location (default `~/Library/Caches/mlx-node/qwen4-packed`)                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `MLX_QWEN4_PACKED_CACHE_MAX_GB`    | Cap its total size across all checkpoints, in GiB (fractional allowed). `<=0` or unset = only the per-checkpoint 96 GiB budget                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `MLX_QWEN4_IGNORE_MEMORY_PRESSURE` | `=1` skips the macOS memory-pressure gate that otherwise makes a Qwen3.8 load wait out a transient spike — diagnostic only                                                                                                                                                                                                                                                                                                                                                                                                                        |
 
 ## Dashboard
 

@@ -14,6 +14,9 @@ import { describe, expect, it } from 'vite-plus/test';
 import { CONVERT_DETECT, detectConvertModelType } from '../src/commands/convert-detect.js';
 
 describe('CONVERT_DETECT overlap precedence', () => {
+  it('routes Jina ranking architecture ahead of the ordinary Qwen3 recipe', () => {
+    expect(detectConvertModelType({ model_type: 'qwen3', architectures: ['JinaForRanking'] })).toBe('jina_reranker');
+  });
   it("resolves model_type 'gemma4_text' WITH a Gemma4Unified architecture to 'gemma4'", () => {
     // The gemma4|gemma4_text row precedes the unified-architecture row. A
     // loop that probed architectures first (as the runtime loader does)

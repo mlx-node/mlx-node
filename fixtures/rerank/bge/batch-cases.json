@@ -1,0 +1,62 @@
+[
+  {
+    "name": "batch-1-ordered",
+    "query": "What is the capital of China?",
+    "documents": [
+      "Beijing is the capital of China.",
+      "中国的首都是北京。",
+      "Paris is the capital of France.",
+      "A recipe for apple pie.",
+      "",
+      "中国的首都是北京。"
+    ],
+    "policy": {
+      "maxBatchSize": 1
+    }
+  },
+  {
+    "name": "batch-1-reversed",
+    "query": "What is the capital of China?",
+    "documents": [
+      "中国的首都是北京。",
+      "",
+      "A recipe for apple pie.",
+      "Paris is the capital of France.",
+      "中国的首都是北京。",
+      "Beijing is the capital of China."
+    ],
+    "policy": {
+      "maxBatchSize": 1
+    }
+  },
+  {
+    "name": "batch-8-ordered",
+    "query": "What is the capital of China?",
+    "documents": [
+      "Beijing is the capital of China.",
+      "中国的首都是北京。",
+      "Paris is the capital of France.",
+      "A recipe for apple pie.",
+      "",
+      "中国的首都是北京。"
+    ],
+    "policy": {
+      "maxBatchSize": 8
+    }
+  },
+  {
+    "name": "batch-8-reversed",
+    "query": "What is the capital of China?",
+    "documents": [
+      "中国的首都是北京。",
+      "",
+      "A recipe for apple pie.",
+      "Paris is the capital of France.",
+      "中国的首都是北京。",
+      "Beijing is the capital of China."
+    ],
+    "policy": {
+      "maxBatchSize": 8
+    }
+  }
+]

@@ -17,6 +17,7 @@ import type { DiscoveredModel } from './discover.js';
 export interface SwapController {
   resolveModel: (name: string) => Promise<void>;
   listModels: () => PublicModelEntry[];
+  disposeAll?: () => Promise<void>;
 }
 
 /**
@@ -46,6 +47,8 @@ export function makeSwapController(
   // followed by an immediate swap to the user's real choice.
   const fallbackEntry = (defaultName != null ? byName.get(defaultName) : undefined) ?? discovered[0];
 
+  // Selection survives eviction by another capability; it holds no model resources.
+  let selectedEntry = fallbackEntry;
   let resident: { name: string } | null = null;
   // Names we registered as aliases to the current resident (e.g.
   // Claude Code's hardcoded `claude-haiku-*` for subagent dispatches /
@@ -67,18 +70,17 @@ export function makeSwapController(
       // Pick the discovered entry to resolve against. If the requested
       // name matches a discovered model, use it. Otherwise (unknown
       // name — Claude Code's hardcoded small-fast-model, etc.) fall
-      // through to the current resident so subagent dispatches don't
-      // 404, loading discovered[0] on first boot if nothing is resident
-      // yet.
+      // through to the last successfully selected chat model, even if
+      // another capability has evicted it in single-resident mode.
       //
-      // CRITICAL: this must read `resident` at RUN time, not QUEUE time.
+      // CRITICAL: this must read `selectedEntry` at RUN time, not QUEUE time.
       // If we capture it before chaining onto `currentOp`, a swap that
       // ran ahead of us will leave us with a stale target — e.g. a haiku
       // alias request that arrived during a `/model a → b` switch would
       // capture `targetEntry = a`, then re-bind itself to `a` and undo
       // the user's switch when its turn finally comes around.
       const knownEntry = byName.get(name);
-      const targetEntry = knownEntry ?? (resident ? (byName.get(resident.name) ?? fallbackEntry) : fallbackEntry);
+      const targetEntry = knownEntry ?? selectedEntry;
       const isAlias = targetEntry.name !== name;
 
       // Swap out any stale resident that isn't the target.
@@ -158,6 +160,7 @@ export function makeSwapController(
       } else if (!resident) {
         resident = { name: targetEntry.name };
       }
+      selectedEntry = targetEntry;
 
       // Re-point any aliases carried across the swap onto the new
       // resident. `registry.registerAny(sameName, differentModel)` drops
@@ -204,5 +207,13 @@ export function makeSwapController(
     }));
   }
 
-  return { resolveModel, listModels };
+  async function disposeAll(): Promise<void> {
+    await currentOp;
+    const sessions = registry.listSessionRegistries();
+    for (const entry of registry.list()) if (registry.getAny(entry.id)) registry.unregister(entry.id);
+    resident = null;
+    aliases.clear();
+    await Promise.all(sessions.map((session) => session.flushPendingDisposals()));
+  }
+  return { resolveModel, listModels, disposeAll };
 }

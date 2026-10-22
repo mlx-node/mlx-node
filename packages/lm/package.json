@@ -60,7 +60,8 @@
     "test": "vp test run"
   },
   "dependencies": {
-    "@mlx-node/core": "workspace:*"
+    "@mlx-node/core": "workspace:*",
+    "@mlx-node/rerank": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^26.4.0"

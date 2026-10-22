@@ -17,6 +17,7 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { join } from 'node:path';
 
 import { audioMetrics, type AudioRequestMetrics } from '../audio-metrics.js';
+import { rerankMetrics } from '../rerank-service.js';
 import { requestPathname } from '../router.js';
 
 export interface Logger {
@@ -322,14 +323,16 @@ export function attachLogger(server: Server, logDir: string): Logger {
 
     const pathname = requestPathname(req);
     const audio = pathname.startsWith('/v1/audio/');
+    const rerank = pathname === '/v1/rerank';
+    const metadataOnly = audio || rerank;
     // Raw WAV requests carry prompt text in their query. Audio logs retain
     // only the route; validated model/phase metadata comes from audioMetrics.
-    const loggedPath = audio ? pathname : req.url;
+    const loggedPath = metadataOnly ? pathname : req.url;
     writePretty(`[req ${rid}] ${req.method ?? '?'} ${loggedPath ?? '?'}`);
     let reqBody = '';
     let reqBytes = 0;
     let resBytes = 0;
-    if (audio) {
+    if (metadataOnly) {
       // Observing read() does not switch a paused upload into flowing mode.
       // A data listener here would defeat the audio handler's backpressure.
       const read = req.read.bind(req);
@@ -354,7 +357,7 @@ export function attachLogger(server: Server, logDir: string): Logger {
       if (chunk != null) {
         try {
           resBytes += typeof chunk === 'string' ? Buffer.byteLength(chunk) : (chunk as Uint8Array).byteLength;
-          if (!audio)
+          if (!metadataOnly)
             chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString('utf8'));
         } catch {
           /* ignore */
@@ -368,7 +371,7 @@ export function attachLogger(server: Server, logDir: string): Logger {
       if (chunk != null) {
         try {
           resBytes += typeof chunk === 'string' ? Buffer.byteLength(chunk) : (chunk as Uint8Array).byteLength;
-          if (!audio)
+          if (!metadataOnly)
             chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString('utf8'));
         } catch {
           /* ignore */
@@ -420,6 +423,7 @@ export function attachLogger(server: Server, logDir: string): Logger {
         resHeaders: res.getHeaders(),
         resBody,
         ...(metrics ? { reqBytes, resBytes, audio: true, audioMetrics: metrics } : {}),
+        ...(rerank ? { reqBytes, resBytes, rerank: true, rerankMetrics: rerankMetrics(res) } : {}),
         elapsedMs: Date.now() - start,
       };
       try {

@@ -20,6 +20,7 @@ Commands:
   calibrate          Calibrate FP8 activation amax for --q-recipe nvidia models
   eval               Score a checkpoint's output quality against a bf16 teacher
   tts                Stream speech to a device or WAV file
+  rerank             Rank documents by query relevance
   redact             Redact PII from text using a privacy-filter model
   serve              Serve local models over an Anthropic/OpenAI-compatible API
   launch claude      Start a local server and spawn Claude Code pointed at it
@@ -88,6 +89,12 @@ async function main() {
       const rest = args.slice(1);
       const { run } = await import('./commands/eval.js');
       await run(rest);
+      break;
+    }
+
+    case 'rerank': {
+      const { run } = await import('./commands/rerank.js');
+      await run(args.slice(1));
       break;
     }
 

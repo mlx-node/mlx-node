@@ -22,6 +22,7 @@ import { toMinimalHealth, type ServerHealth } from './health.js';
 import type { IdleSweeper } from './idle-sweeper.js';
 import type { ModelWorkCoordinator } from './model-work-coordinator.js';
 import type { ModelRegistry } from './registry.js';
+import type { RerankService } from './rerank-service.js';
 import { stringifyStrictJson } from './strict-json.js';
 import type { AnthropicCountTokensRequest, AnthropicMessagesRequest } from './types-anthropic.js';
 import type { ResponsesAPIRequest } from './types.js';
@@ -89,6 +90,7 @@ export interface RouteExtras {
    */
   authenticated?: boolean;
   audio?: AudioService;
+  rerank?: RerankService;
 }
 
 export async function routeRequest(
@@ -108,10 +110,14 @@ export async function routeRequest(
     const name = body && typeof body === 'object' && 'model' in body ? body.model : undefined;
     if (
       typeof name !== 'string' ||
-      !(registry.audio.get(name) || listModels?.().some((e) => e.id === name && e.modality === 'audio'))
+      !(
+        registry.audio.get(name) ||
+        registry.rerank.get(name) ||
+        listModels?.().some((e) => e.id === name && (e.modality === 'audio' || e.task === 'rerank'))
+      )
     )
       return false;
-    if (path.startsWith('/v1/messages')) sendAnthropicBadRequest(res, 'Audio models require an audio endpoint');
+    if (path.startsWith('/v1/messages')) sendAnthropicBadRequest(res, 'Model requires its task-specific endpoint');
     else {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(
@@ -120,13 +126,18 @@ export async function routeRequest(
             type: 'invalid_request_error',
             code: 'model_capability_mismatch',
             param: 'model',
-            message: 'Audio models require an audio endpoint',
+            message: 'Model requires its task-specific endpoint',
           },
         }),
       );
     }
     return true;
   };
+
+  if (path === '/v1/rerank' && extras?.rerank) {
+    await extras.rerank.handle(req, res);
+    return;
+  }
 
   if (path.startsWith('/v1/audio/') && extras?.audio) {
     await extras.audio.handle(req, res, path);

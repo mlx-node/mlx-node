@@ -171,6 +171,12 @@ pub(crate) mod recipe {
             &[]
         }
 
+        fn keep_dense(&self, key: &str) -> bool {
+            self.dense_prefixes()
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+        }
+
         /// True when the family's sanitizer owns dtype conversion (FP8 dequant
         /// and cast), so the generic dtype pass is skipped and tensors flow
         /// into `sanitize` untouched.
@@ -2912,6 +2918,66 @@ pub(crate) mod recipe {
         }
     }
 
+    /// Ranking owns a separate projector and never emits an LM head.
+    pub(crate) struct JinaRerankerRecipe;
+    impl ConversionRecipe for JinaRerankerRecipe {
+        fn model_types(&self) -> &'static [&'static str] {
+            &["jina_reranker"]
+        }
+        fn embed_quantizable(&self) -> bool {
+            true
+        }
+        fn dense_prefixes(&self) -> &'static [&'static str] {
+            &["projector."]
+        }
+        fn sanitize(
+            &self,
+            weights: HashMap<String, MxArray>,
+            config: &serde_json::Value,
+            _dtype: &str,
+            _tied: bool,
+            _verbose: bool,
+        ) -> Result<HashMap<String, MxArray>> {
+            let (c, _) = crate::models::jina_reranker::config::Config::parse(config)?;
+            let adapter =
+                crate::models::jina_reranker::weights::Weights::from_tensors(weights, config)?;
+            adapter.validate_config(&c)?;
+            Ok(adapter.tensors)
+        }
+    }
+
+    pub(crate) struct XlmRobertaRerankerRecipe;
+    impl ConversionRecipe for XlmRobertaRerankerRecipe {
+        fn model_types(&self) -> &'static [&'static str] {
+            &["xlm_roberta_reranker"]
+        }
+        fn embed_quantizable(&self) -> bool {
+            true
+        }
+        fn keep_dense(&self, key: &str) -> bool {
+            key.starts_with("classifier.")
+                || key.starts_with("roberta.embeddings.position_embeddings.")
+                || key.starts_with("roberta.embeddings.token_type_embeddings.")
+                || key.contains(".LayerNorm.")
+                || key.ends_with(".bias")
+        }
+        fn sanitize(
+            &self,
+            weights: HashMap<String, MxArray>,
+            config: &serde_json::Value,
+            _dtype: &str,
+            _tied: bool,
+            _verbose: bool,
+        ) -> Result<HashMap<String, MxArray>> {
+            let c = crate::models::xlm_roberta_reranker::config::Config::parse(config)?;
+            let adapter = crate::models::xlm_roberta_reranker::weights::Weights::from_tensors(
+                weights, config,
+            )?;
+            adapter.validate_config(&c)?;
+            Ok(adapter.tensors)
+        }
+    }
+
     type RecipeFactory = fn() -> Box<dyn ConversionRecipe>;
 
     /// One row per convertible family: the exact HuggingFace `model_type`
@@ -2919,6 +2985,10 @@ pub(crate) mod recipe {
     /// load-bearing: flattened it is [`convertible_model_types`], which the
     /// "unknown model type" error message joins verbatim.
     pub(crate) const RECIPE_REGISTRY: &[(&[&str], RecipeFactory)] = &[
+        (&["jina_reranker"], || Box::new(JinaRerankerRecipe)),
+        (&["xlm_roberta_reranker"], || {
+            Box::new(XlmRobertaRerankerRecipe)
+        }),
         (&["qwen3_asr"], || Box::new(Qwen3AsrRecipe)),
         (&["qwen3_tts"], || Box::new(Qwen3TtsRecipe)),
         (&["qwen3_5"], || Box::new(Qwen35Recipe { is_moe: false })),
@@ -3335,7 +3405,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     }
     let target_dtype = options.dtype.unwrap_or_else(|| "float32".to_string());
     let verbose = options.verbose.unwrap_or(false);
-    let model_type = options.model_type;
+    let mut model_type = options.model_type;
     let do_quantize = options.quantize.unwrap_or(false);
     let quant_mode = options.quant_mode.unwrap_or_else(|| "affine".to_string());
     let quant_recipe = options.quant_recipe;
@@ -3608,6 +3678,68 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         )));
     }
 
+    let is_jina_reranker = config["architectures"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|v| v == "JinaForRanking"));
+    let is_xlmr_reranker = config["architectures"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|v| v == "XLMRobertaForSequenceClassification"));
+    let reranker_family = if is_jina_reranker {
+        Some("jina_reranker")
+    } else if is_xlmr_reranker {
+        Some("xlm_roberta_reranker")
+    } else {
+        None
+    };
+    let is_reranker = reranker_family.is_some();
+    if let Some(family) = reranker_family.or(model_type
+        .as_deref()
+        .filter(|m| matches!(*m, "jina_reranker" | "xlm_roberta_reranker")))
+    {
+        match family {
+            "jina_reranker" => {
+                crate::models::jina_reranker::config::Config::parse(&config)?;
+            }
+            _ => {
+                crate::models::xlm_roberta_reranker::config::Config::parse(&config)?;
+            }
+        }
+        if model_type.as_deref().is_some_and(|v| v != family) {
+            return Err(Error::from_reason(
+                "Reranker architecture conflicts with conversion recipe",
+            ));
+        }
+        model_type = Some(family.into());
+        if quant_recipe.is_some()
+            || quant_mxfp
+            || imatrix_path.is_some()
+            || quant_mtp != "off"
+            || (do_quantize
+                && (quant_bits != 4 || !matches!(quant_mode.as_str(), "affine" | "mxfp4")))
+        {
+            return Err(Error::from_reason(
+                "Reranker conversion supports floating weights, uniform affine 4-bit or MXFP4 only",
+            ));
+        }
+        if crate::models::quant_dispatch::select_quantization_block(&config)?.is_some() {
+            return Err(Error::from_reason(
+                "Convert rerankers from an unquantized source; packed checkpoints can be loaded directly",
+            ));
+        }
+        // Ranking conversion always writes a fresh checkpoint. Reusing a
+        // directory can leave an obsolete projector or shard beside new weights.
+        if output_dir.exists()
+            && fs::read_dir(&output_dir)
+                .map_err(|e| Error::from_reason(e.to_string()))?
+                .next()
+                .is_some()
+        {
+            return Err(Error::from_reason(
+                "Reranker conversion requires a new or empty output directory",
+            ));
+        }
+    }
+
     // A caller may omit `model_type` and rely on generic dtype conversion.
     // Fail closed from the source config before the converter mutex, MLX setup,
     // output creation, or tensor loading for families whose runtimes are dense-only.
@@ -3824,7 +3956,27 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     let single_weights_path = input_dir.join("model.safetensors");
     let alt_weights_path = input_dir.join("weights.safetensors");
 
-    if single_weights_path.exists() {
+    if is_reranker {
+        tensors = if is_jina_reranker {
+            let (c, _) = crate::models::jina_reranker::config::Config::parse(&config)?;
+            let weights = crate::models::jina_reranker::weights::Weights::new(&input_dir, &config)?;
+            // Validate source storage before dtype casts can disguise an invalid
+            // tensor. The recipe validates the canonical tensors again before output.
+            weights.validate_config(&c)?;
+            weights.tensors
+        } else {
+            let c = crate::models::xlm_roberta_reranker::config::Config::parse(&config)?;
+            let weights =
+                crate::models::xlm_roberta_reranker::weights::Weights::new(&input_dir, &config)?;
+            weights.validate_config(&c)?;
+            weights.compute_dtype(&config)?;
+            weights.tensors
+        };
+        num_tensors = tensors.len();
+        num_parameters = tensors.values().try_fold(0usize, |n, tensor| {
+            Ok::<_, Error>(n + tensor.size()? as usize)
+        })?;
+    } else if single_weights_path.exists() {
         // Single file model — lazy load
         info!(
             "Loading SafeTensors file (lazy): {}",
@@ -4189,13 +4341,13 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     }; // end is_gemma_e2b_import else branch
 
     let mut converted_tensors = converted_tensors;
-    let dense_prefixes = model_type
-        .as_deref()
-        .and_then(recipe::recipe_for)
-        .map(|r| r.dense_prefixes())
-        .unwrap_or_default();
+    let conversion_recipe = model_type.as_deref().and_then(recipe::recipe_for);
     let preserved_dense: HashMap<_, _> = converted_tensors
-        .extract_if(|key, _| dense_prefixes.iter().any(|prefix| key.starts_with(prefix)))
+        .extract_if(|key, _| {
+            conversion_recipe
+                .as_ref()
+                .is_some_and(|r| r.keep_dense(key))
+        })
         .collect();
     for (key, tensor) in &preserved_dense {
         if key.ends_with(".scales")
@@ -4599,6 +4751,30 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // Write config.json — clean and sort keys to match mlx-lm/mlx-vlm save_config
     let output_config_path = output_dir.join("config.json");
     let mut output_config = config.clone();
+    if is_jina_reranker {
+        let (_, profile) = crate::models::jina_reranker::config::Config::parse(&config)?;
+        output_config["reranker"] = serde_json::json!({"version": 1, "profile": profile});
+    }
+    if is_xlmr_reranker {
+        let hub_metadata =
+            fs::read_to_string(input_dir.join(".cache/huggingface/download/config.json.metadata"))
+                .ok();
+        // The CLI and dashboard share this completion marker. A converted
+        // floating checkpoint may instead carry its original revision in config.
+        let download_metadata: Option<serde_json::Value> =
+            fs::read_to_string(input_dir.join(".mlx-download-complete.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok());
+        let revision =
+            reranker_source_revision(&config, download_metadata.as_ref(), hub_metadata.as_deref());
+        let compute_dtype = match target_dtype.as_str() {
+            "f16" | "float16" => "float16",
+            "bf16" | "bfloat16" => "bfloat16",
+            "f32" | "float32" => "float32",
+            _ => unreachable!("BGE dtype was validated before conversion"),
+        };
+        output_config["reranker"] = serde_json::json!({"version":1,"family":"xlm_roberta_reranker","profile":"xlmr-cross-encoder-v1","computeDtype":compute_dtype,"sourceRevision":revision});
+    }
     if model_type.as_deref() == Some("qwen3_tts") {
         output_config["mlx_node_tts_format"] = serde_json::json!(1);
     }
@@ -4728,6 +4904,10 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
 
     // Copy tokenizer, model config, and Python model definition files
     let config_files = [
+        // Preserve model attribution independently of the runtime license.
+        "LICENSE",
+        "LICENSE.md",
+        "README.md",
         // Tokenizer files
         "tokenizer.json",
         "tokenizer_config.json",
@@ -10077,8 +10257,97 @@ pub(crate) fn infer_num_layers_from_weights(weights: &HashMap<String, MxArray>) 
     max_layer.map_or(0, |m| m + 1)
 }
 
+fn reranker_source_revision<'a>(
+    config: &'a serde_json::Value,
+    marker: Option<&'a serde_json::Value>,
+    hub_metadata: Option<&'a str>,
+) -> Option<&'a str> {
+    // A partial sync invalidates every older provenance hint in the directory,
+    // including a config-only Hugging Face download and converted metadata.
+    if marker.and_then(|m| m.get("scope")).and_then(|v| v.as_str()) == Some("partial") {
+        return None;
+    }
+    config
+        .get("reranker")
+        .and_then(|v| v.get("sourceRevision"))
+        .and_then(|v| v.as_str())
+        .or_else(|| config.get("_commit_hash").and_then(|v| v.as_str()))
+        .or_else(|| marker.and_then(complete_download_revision))
+        .or_else(|| hub_metadata.and_then(|s| s.lines().next()))
+}
+
+/// Read revision provenance only from complete CLI/dashboard downloads. Partial
+/// sync markers may describe a directory containing tensors from several revisions.
+fn complete_download_revision(marker: &serde_json::Value) -> Option<&str> {
+    let fields = marker.as_object()?;
+    for key in ["repo", "revision", "completedAt"] {
+        fields.get(key)?.as_str()?;
+    }
+    if !fields
+        .get("files")?
+        .as_array()?
+        .iter()
+        .all(|v| v.is_string())
+        || fields
+            .get("scope")
+            .is_some_and(|v| v.as_str() != Some("full"))
+        || ["assetsRepo", "assetsRevision"]
+            .iter()
+            .any(|key| fields.get(*key).is_some_and(|v| !v.is_string()))
+    {
+        return None;
+    }
+    fields.get("revision")?.as_str()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn partial_download_invalidates_older_revision_hints() {
+        let config = serde_json::json!({"_commit_hash": "old-hub", "reranker": {"sourceRevision": "old-source"}});
+        let marker = serde_json::json!({"scope": "partial", "revision": "old-download"});
+        assert_eq!(
+            reranker_source_revision(&config, Some(&marker), Some("old-hub\netag\n")),
+            None
+        );
+        assert_eq!(
+            reranker_source_revision(&config, None, None),
+            Some("old-source")
+        );
+    }
+
+    #[test]
+    fn download_provenance_requires_a_complete_valid_marker() {
+        let marker = serde_json::json!({
+            "repo": "example/model", "revision": "pinned-revision",
+            "files": ["config.json", "model.safetensors"], "completedAt": "2026-10-21T00:00:00Z"
+        });
+        assert_eq!(complete_download_revision(&marker), Some("pinned-revision"));
+        let mut explicit = marker.clone();
+        explicit["scope"] = serde_json::json!("full");
+        assert_eq!(
+            complete_download_revision(&explicit),
+            Some("pinned-revision")
+        );
+        for invalid in [
+            serde_json::json!({"scope": "partial"}),
+            serde_json::json!({"scope": "unknown"}),
+            serde_json::json!({"files": [1]}),
+            serde_json::json!({"repo": null}),
+            serde_json::json!({"assetsRevision": false}),
+        ] {
+            let mut changed = marker.clone();
+            for (key, value) in invalid.as_object().unwrap() {
+                changed[key] = value.clone();
+            }
+            assert_eq!(complete_download_revision(&changed), None);
+        }
+        assert_eq!(
+            complete_download_revision(&serde_json::json!({"revision": "old"})),
+            None
+        );
+    }
+
     use super::*;
     use crate::convert::recipe::{self, ConversionRecipe};
 
@@ -12111,6 +12380,8 @@ mod tests {
         assert_eq!(
             known,
             [
+                "jina_reranker",
+                "xlm_roberta_reranker",
                 "qwen3_asr",
                 "qwen3_tts",
                 "qwen3_5",
@@ -12152,7 +12423,15 @@ mod tests {
             // embed_quantizable must match the packed-embedding allowlist.
             assert_eq!(
                 r.embed_quantizable(),
-                matches!(mt, "qwen3_asr" | "lfm2" | "lfm2_moe" | "k2_horizon"),
+                matches!(
+                    mt,
+                    "jina_reranker"
+                        | "xlm_roberta_reranker"
+                        | "qwen3_asr"
+                        | "lfm2"
+                        | "lfm2_moe"
+                        | "k2_horizon"
+                ),
                 "{mt}: embed_quantizable mismatch vs inline match"
             );
 

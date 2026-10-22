@@ -66,7 +66,14 @@ describe('family-data completeness', () => {
     expect(union).toEqual(MODEL_FAMILY_DATA.map((row) => row.id).sort());
   });
 
-  it('keeps the non-generative set at the embedding/vlm/decision families', () => {
-    expect([...NON_GENERATIVE_FAMILY_IDS].sort()).toEqual(['clef', 'harrier', 'internvl_chat', 'qianfan-ocr']);
+  it('keeps embedding/vlm/decision/rerank families outside chat', () => {
+    expect([...NON_GENERATIVE_FAMILY_IDS].sort()).toEqual([
+      'clef',
+      'harrier',
+      'internvl_chat',
+      'jina_reranker',
+      'qianfan-ocr',
+      'xlm_roberta_reranker',
+    ]);
   });
 });

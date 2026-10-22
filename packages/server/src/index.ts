@@ -116,3 +116,6 @@ export { writeSSEEvent, beginSSE, endSSE, activeSSEStreamCount } from './streami
 export { AudioRegistry } from './audio-registry.js';
 export type { AudioModel, AsrModel, AsrStream } from './audio-registry.js';
 export type { AudioServiceOptions } from './audio-service.js';
+
+export type { RerankServiceOptions } from './rerank-service.js';
+export { RerankRegistry } from './rerank-registry.js';

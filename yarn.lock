@@ -997,6 +997,7 @@ __metadata:
     "@mlx-node/core": "workspace:*"
     "@mlx-node/lm": "workspace:*"
     "@mlx-node/privacy": "workspace:*"
+    "@mlx-node/rerank": "workspace:*"
     "@mlx-node/server": "workspace:*"
     "@mlx-node/tts": "workspace:*"
     "@napi-rs/keyring": "npm:^2.0.0"
@@ -1100,6 +1101,7 @@ __metadata:
   resolution: "@mlx-node/lm@workspace:packages/lm"
   dependencies:
     "@mlx-node/core": "workspace:*"
+    "@mlx-node/rerank": "workspace:*"
     "@types/node": "npm:^26.4.0"
   languageName: unknown
   linkType: soft
@@ -1107,6 +1109,15 @@ __metadata:
 "@mlx-node/privacy@workspace:*, @mlx-node/privacy@workspace:packages/privacy":
   version: 0.0.0-use.local
   resolution: "@mlx-node/privacy@workspace:packages/privacy"
+  dependencies:
+    "@mlx-node/core": "workspace:*"
+    "@types/node": "npm:^26.4.0"
+  languageName: unknown
+  linkType: soft
+
+"@mlx-node/rerank@workspace:*, @mlx-node/rerank@workspace:packages/rerank":
+  version: 0.0.0-use.local
+  resolution: "@mlx-node/rerank@workspace:packages/rerank"
   dependencies:
     "@mlx-node/core": "workspace:*"
     "@types/node": "npm:^26.4.0"
@@ -1121,6 +1132,7 @@ __metadata:
     "@mlx-node/asr": "workspace:*"
     "@mlx-node/core": "workspace:*"
     "@mlx-node/lm": "workspace:*"
+    "@mlx-node/rerank": "workspace:*"
     "@mlx-node/tts": "workspace:*"
     "@types/node": "catalog:"
   languageName: unknown
@@ -7387,6 +7399,7 @@ __metadata:
     "@mlx-node/internal-tools": "workspace:*"
     "@mlx-node/lm": "workspace:*"
     "@mlx-node/privacy": "workspace:*"
+    "@mlx-node/rerank": "workspace:*"
     "@mlx-node/server": "workspace:*"
     "@mlx-node/trl": "workspace:*"
     "@mlx-node/tts": "workspace:*"

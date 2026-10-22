@@ -289,6 +289,9 @@ Examples:
 }
 
 const CORE_FILES = [
+  'LICENSE',
+  'LICENSE.md',
+  'README.md',
   'config.json',
   'tokenizer.json',
   'tokenizer_config.json',

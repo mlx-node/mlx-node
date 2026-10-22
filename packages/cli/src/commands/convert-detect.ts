@@ -7,6 +7,8 @@
  * 'gemma4', never 'gemma4_unified'). The convert-detect parity test pins the
  * overlaps and gates every native convertible model_type against this table.
  */
+import { rerankerFamilies } from '@mlx-node/rerank/catalog';
+
 export interface ConvertDetectRow {
   /** Matches when config.model_type is exactly one of these raw strings. */
   readonly rawModelTypes?: readonly string[];
@@ -17,6 +19,11 @@ export interface ConvertDetectRow {
 }
 
 export const CONVERT_DETECT: readonly ConvertDetectRow[] = [
+  ...rerankerFamilies.map(({ family, architecture }) => ({
+    architecture,
+    rawModelTypes: family === 'jina_reranker' ? [family] : [],
+    out: family,
+  })),
   // The Nemotron architecture is authoritative (native parser + runtime
   // registry probe): it is checked BEFORE every model_type row so a
   // stale-but-recognized model_type (e.g. qwen3_5) cannot route a Nemotron

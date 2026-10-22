@@ -2,15 +2,16 @@
  * Native-free per-family registration rows plus the pure `matchFamily`
  * detection they drive.
  *
- * This module must stay free of runtime imports (`import type` only): it is
+ * This module must stay free of native runtime imports: it is
  * re-exported through the native-free `@mlx-node/agent/catalog` subpath to the
  * dashboard viewer process, which must never dlopen the Metal addon.
  * `packages/agent/__test__/catalog-native-free.test.ts` gates that contract.
  */
 
 import type { ChatConfig } from '@mlx-node/core';
+import { rerankerFamilies } from '@mlx-node/rerank/families';
 
-export type ModelFamilyKind = 'trainable' | 'loadable' | 'embedding' | 'vlm' | 'decision';
+export type ModelFamilyKind = 'trainable' | 'loadable' | 'embedding' | 'vlm' | 'decision' | 'rerank';
 
 export interface NormalizedModelConfig {
   readonly usesDefaultModelType: boolean;
@@ -288,7 +289,7 @@ interface ChatFamilyData extends ModelFamilyDataBase {
 }
 
 interface NonGenerativeFamilyData extends ModelFamilyDataBase {
-  readonly kind: 'embedding' | 'vlm' | 'decision';
+  readonly kind: 'embedding' | 'vlm' | 'decision' | 'rerank';
   readonly traits?: undefined;
   readonly launchPreset?: undefined;
 }
@@ -374,6 +375,14 @@ export const MODEL_FAMILY_DATA = [
       maxOutputTokens: 16384,
     },
   },
+  ...rerankerFamilies.map(({ family, architecture }) => ({
+    id: family,
+    kind: 'rerank' as const,
+    match: {
+      rawModelTypes: family === 'jina_reranker' ? [family] : [],
+      architectureProbe: ({ architectures }: ModelConfigMatchContext) => architectures.has(architecture),
+    },
+  })),
   {
     id: 'harrier',
     kind: 'embedding',
@@ -584,9 +593,9 @@ export const CHAT_FAMILY_IDS: readonly ChatFamilyId[] = MODEL_FAMILY_DATA.filter
 
 /** Detection results that cannot back a chat endpoint (embedding, VLM or decision families). */
 export const NON_GENERATIVE_FAMILY_IDS: ReadonlySet<ModelType> = new Set<ModelType>(
-  MODEL_FAMILY_DATA.filter((row) => row.kind === 'embedding' || row.kind === 'vlm' || row.kind === 'decision').map(
-    (row) => row.id,
-  ),
+  MODEL_FAMILY_DATA.filter(
+    (row) => row.kind === 'embedding' || row.kind === 'vlm' || row.kind === 'decision' || row.kind === 'rerank',
+  ).map((row) => row.id),
 );
 
 interface FamilyDataIndex {

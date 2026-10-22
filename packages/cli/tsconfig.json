@@ -12,6 +12,7 @@
   "references": [
     { "path": "../agent" },
     { "path": "../core" },
+    { "path": "../rerank" },
     { "path": "../lm" },
     { "path": "../privacy" },
     { "path": "../server" },

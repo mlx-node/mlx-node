@@ -1,0 +1,55 @@
+{
+  "name": "@mlx-node/rerank",
+  "version": "0.0.16",
+  "description": "Native reranking on Apple Silicon",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mlx-node/mlx-node.git",
+    "directory": "packages/rerank"
+  },
+  "files": [
+    "dist",
+    "src",
+    "NOTICE"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "@mlx-node/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./catalog": {
+      "@mlx-node/source": "./src/catalog.ts",
+      "types": "./dist/catalog.d.ts",
+      "import": "./dist/catalog.js"
+    },
+    "./types": {
+      "@mlx-node/source": "./src/types.ts",
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js"
+    },
+    "./protocol": {
+      "@mlx-node/source": "./src/protocol.ts",
+      "types": "./dist/protocol.d.ts",
+      "import": "./dist/protocol.js"
+    },
+    "./families": {
+      "@mlx-node/source": "./src/families.ts",
+      "types": "./dist/families.d.ts",
+      "import": "./dist/families.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@mlx-node/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0"
+  }
+}

@@ -89,7 +89,9 @@ export class AudioService {
     deps.registry.setModelLoadAdmissionCoordinator(deps.coordinator);
   }
   private catalog(): PublicModelEntry[] {
-    return this.deps.listModels?.() ?? this.deps.registry.audio.list();
+    return (
+      this.deps.listModels?.() ?? this.deps.registry.list().map((entry) => ({ ...entry, object: 'model' as const }))
+    );
   }
   async handle(req: IncomingMessage, res: ServerResponse, path: string): Promise<void> {
     if (path === '/v1/audio/voices' && req.method === 'GET') {

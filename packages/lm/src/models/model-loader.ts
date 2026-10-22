@@ -7,6 +7,8 @@ import {
   Gemma4Model as NativeGemma4Model,
   ggufArchitecture,
   HarrierModel,
+  JinaRerankerModel,
+  XlmRobertaRerankerModel,
   K2HorizonModel as NativeK2HorizonModel,
   Lfm2Model as NativeLfm2Model,
   MuseGlimmerModel as NativeMuseGlimmerModel,
@@ -96,6 +98,11 @@ interface LoaderBinding {
  * compile.
  */
 const LOADER_BINDINGS = {
+  xlm_roberta_reranker: {
+    load: (path: string) => XlmRobertaRerankerModel.load(path),
+    nativeModelClass: XlmRobertaRerankerModel,
+  },
+  jina_reranker: { load: (path: string) => JinaRerankerModel.load(path), nativeModelClass: JinaRerankerModel },
   clef: { load: (path: string) => ClefModel.load(path), nativeModelClass: ClefModel },
   gemma4: {
     load: (modelPath: string, options?: LoadModelOptions) =>
@@ -253,6 +260,7 @@ export async function loadModel(modelPath: string, options?: LoadModelOptions): 
  *
  * Rejects models that cannot be driven by a `ChatSession`:
  *   - Embedding models (`HarrierModel`) have no chat surface.
+ *   - Rerank models use `loadReranker` from `@mlx-node/rerank`.
  *   - The native `QianfanOCRModel` exposes callback-based streaming
  *     methods that do not structurally satisfy `SessionCapableModel`'s
  *     `AsyncGenerator` overloads. The VLM AsyncGenerator wrapper lives
@@ -283,6 +291,11 @@ export async function loadSession(
   const kind = requireFamilyData(modelType).kind;
   if (kind === 'embedding') {
     throw new Error('loadSession: embedding models (Harrier) cannot be wrapped in a ChatSession');
+  }
+  if (kind === 'rerank') {
+    throw new Error(
+      'loadSession: rerank models cannot be wrapped in a ChatSession; use loadReranker from @mlx-node/rerank.',
+    );
   }
   if (kind === 'vlm') {
     throw new Error(

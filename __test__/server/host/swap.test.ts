@@ -1,16 +1,23 @@
 import type { LoadableModel } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
+import {
+  chatCapability,
+  withCapabilityModels,
+  type CapabilityAdapter,
+} from '../../../packages/server/src/host/capability-models.js';
 import type { DiscoveredModel } from '../../../packages/server/src/host/discover.js';
 import { makeSwapController } from '../../../packages/server/src/host/swap.js';
 import type { ModelRegistry } from '../../../packages/server/src/registry.js';
 
 interface FakeRegistry {
-  getAny: ReturnType<typeof vi.fn>;
+  getAny: ReturnType<typeof vi.fn<(name: string) => unknown>>;
   registerAny: ReturnType<typeof vi.fn>;
   get: ReturnType<typeof vi.fn>;
   register: ReturnType<typeof vi.fn>;
   unregister: ReturnType<typeof vi.fn>;
+  list: () => { id: string }[];
+  listSessionRegistries: () => [];
 }
 
 function fakeRegistry(): FakeRegistry {
@@ -23,7 +30,15 @@ function fakeRegistry(): FakeRegistry {
     resident.delete(name);
     return true;
   });
-  return { get, register, getAny: get, registerAny: register, unregister };
+  return {
+    get,
+    register,
+    getAny: get,
+    registerAny: register,
+    unregister,
+    list: () => [...resident.keys()].map((id) => ({ id })),
+    listSessionRegistries: () => [],
+  };
 }
 
 function discovered(names: string[]): DiscoveredModel[] {
@@ -41,6 +56,35 @@ function discovered(names: string[]): DiscoveredModel[] {
 }
 
 describe('makeSwapController', () => {
+  it.each(['asr', 'rerank'] as const)('preserves the selected chat target after %s evicts it', async (kind) => {
+    const reg = fakeRegistry();
+    const loader = vi.fn(async (path: string) => ({ marker: path }) as unknown as LoadableModel);
+    const chat = makeSwapController(discovered(['a', 'b']), reg as unknown as ModelRegistry, loader, 'a');
+    let otherResident = false;
+    const other: CapabilityAdapter = {
+      kind,
+      listModels: () => [{ id: 'other', object: 'model', created: 0, owned_by: 'test', task: kind }],
+      hasResident: () => otherResident,
+      resolveModel: async () => {
+        otherResident = true;
+      },
+      disposeAll: async () => {
+        otherResident = false;
+      },
+    };
+    const ctrl = withCapabilityModels([chatCapability(chat, reg as unknown as ModelRegistry), other], 'single');
+    await ctrl.resolveModel('a');
+    await ctrl.resolveModel('b');
+    await ctrl.resolveModel('old-alias');
+    await ctrl.resolveModel('other');
+    expect(reg.list()).toEqual([]);
+    expect(otherResident).toBe(true);
+    await ctrl.resolveModel('new-alias');
+    expect(otherResident).toBe(false);
+    expect(loader.mock.calls.map(([path]) => path)).toEqual(['/fake/a', '/fake/b', '/fake/b']);
+    expect(reg.getAny('new-alias')).toEqual({ marker: '/fake/b' });
+    expect(reg.getAny('old-alias')).toBeUndefined();
+  });
   it('loads a model on first resolve and registers it under the requested name', async () => {
     const reg = fakeRegistry();
     const loader = vi.fn(async (p: string) => ({ marker: p }) as unknown as LoadableModel);

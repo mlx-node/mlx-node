@@ -184,11 +184,11 @@ export function createHealthReporter(deps: HealthReporterDeps): () => ServerHeal
     }
 
     if (deps.registry.audio) {
-      depth = Math.max(depth, deps.registry.audio.queueDepth);
+      depth = Math.max(depth, deps.registry.audio.queueDepth, deps.registry.rerank.queueDepth);
       const audioLimit = deps.registry.queueDepthLimit;
-      if (audioLimit !== undefined && deps.registry.audio.pending) {
+      if (audioLimit !== undefined && (deps.registry.audio.pending || deps.registry.rerank.pending)) {
         limit = limit === null ? audioLimit : Math.min(limit, audioLimit);
-        saturated ||= deps.registry.audio.queueDepth >= audioLimit;
+        saturated ||= Math.max(deps.registry.audio.queueDepth, deps.registry.rerank.queueDepth) >= audioLimit;
       }
     }
     const writerActive = deps.modelWorkCoordinator?.writerActive ?? false;

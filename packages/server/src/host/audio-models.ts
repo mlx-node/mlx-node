@@ -6,8 +6,8 @@ import { inspectTtsConfig } from '@mlx-node/tts/catalog';
 
 import { AudioError } from '../audio-io.js';
 import { asrCapabilities, ttsCapabilities, type AudioModel } from '../audio-registry.js';
-import type { PublicModelEntry } from '../handler.js';
 import type { ModelRegistry } from '../registry.js';
+import { chatCapability, withCapabilityModels, type CapabilityAdapter } from './capability-models.js';
 import { hasAudioCheckpointFiles } from './checkpoint-files.js';
 import type { SwapController } from './swap.js';
 
@@ -67,51 +67,20 @@ export async function loadAudioModel(entry: DiscoveredAudioModel): Promise<Audio
   return { kind: 'tts', model: await loadTtsModel(entry.path) };
 }
 
-/** Called only under the shared host's exclusive load bracket. */
-export function withAudioModels(
-  chat: SwapController,
+/** Audio adapters own audio loading; the host owns cross-capability residency. */
+export function audioCapabilities(
   discovered: DiscoveredAudioModel[],
   registry: ModelRegistry,
   loader: (entry: DiscoveredAudioModel) => Promise<AudioModel>,
-  residency: 'capability' | 'single',
-  hasChat: boolean,
-): SwapController {
-  const byName = new Map(discovered.map((e) => [e.name, e]));
+): CapabilityAdapter[] {
   const created = Math.floor(Date.now() / 1000);
-  return {
-    async resolveModel(name) {
-      const entry = byName.get(name);
-      if (!entry) {
-        if (!hasChat) throw new AudioError(404, 'model_not_found', `Model ${name} not found`, 'model');
-        if (residency === 'single') await registry.audio.disposeAll();
-        return chat.resolveModel(name);
-      }
-      if (registry.audio.get(name)) return;
-      if (residency === 'single') {
-        const sessions = registry.listSessionRegistries();
-        for (const item of registry.list()) if (registry.getAny(item.id)) registry.unregister(item.id);
-        for (const session of sessions) await session.flushPendingDisposals();
-      }
-      await registry.audio.disposeAll(residency === 'single' ? undefined : entry.kind);
-      const loaded = await loader(entry);
-      try {
-        if (loaded.kind !== entry.kind) throw new Error('Audio loader returned the wrong task');
-        if (loaded.kind === 'tts') {
-          const actual = ttsCapabilities(loaded.model.capabilities);
-          for (const key of Object.keys(actual))
-            if (JSON.stringify(actual[key]) !== JSON.stringify(entry.capabilities[key]))
-              throw new Error(`TTS catalogue does not match loaded checkpoint: ${key}`);
-        }
-        registry.audio.register(name, loaded);
-      } catch (error) {
-        await loaded.model.dispose();
-        throw error;
-      }
-    },
-    listModels(): PublicModelEntry[] {
-      return [
-        ...chat.listModels(),
-        ...discovered.map((entry) => ({
+  return (['asr', 'tts'] as const).map((kind) => {
+    const entries = discovered.filter((e) => e.kind === kind);
+    return {
+      kind,
+      hasResident: (name) => registry.audio.get(name)?.kind === kind,
+      listModels: () =>
+        entries.map((entry) => ({
           id: entry.name,
           object: 'model' as const,
           created,
@@ -121,7 +90,41 @@ export function withAudioModels(
           model_family: entry.modelType,
           capabilities: entry.capabilities,
         })),
-      ].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-    },
-  };
+      disposeAll: () => registry.audio.disposeAll(kind),
+      async resolveModel(name) {
+        const entry = entries.find((e) => e.name === name);
+        if (!entry) throw new AudioError(404, 'model_not_found', `Model ${name} not found`, 'model');
+        if (registry.audio.get(name)) return;
+        await registry.audio.disposeAll(kind);
+        const loaded = await loader(entry);
+        try {
+          if (loaded.kind !== entry.kind) throw new Error('Audio loader returned the wrong task');
+          if (loaded.kind === 'tts') {
+            const actual = ttsCapabilities(loaded.model.capabilities);
+            for (const key of Object.keys(actual))
+              if (JSON.stringify(actual[key]) !== JSON.stringify(entry.capabilities[key]))
+                throw new Error(`TTS catalogue does not match loaded checkpoint: ${key}`);
+          }
+          registry.audio.register(name, loaded);
+        } catch (error) {
+          await loaded.model.dispose();
+          throw error;
+        }
+      },
+    };
+  });
+}
+/** Compatibility entry point for callers composing only chat and audio. */
+export function withAudioModels(
+  chat: SwapController,
+  discovered: DiscoveredAudioModel[],
+  registry: ModelRegistry,
+  loader: (entry: DiscoveredAudioModel) => Promise<AudioModel>,
+  residency: 'capability' | 'single',
+  hasChat: boolean,
+): SwapController {
+  return withCapabilityModels(
+    [...(hasChat ? [chatCapability(chat, registry)] : []), ...audioCapabilities(discovered, registry, loader)],
+    residency,
+  );
 }

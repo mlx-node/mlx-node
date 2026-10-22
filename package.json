@@ -26,6 +26,7 @@
     "@mlx-node/internal-tools": "workspace:*",
     "@mlx-node/lm": "workspace:*",
     "@mlx-node/privacy": "workspace:*",
+    "@mlx-node/rerank": "workspace:*",
     "@mlx-node/server": "workspace:*",
     "@mlx-node/trl": "workspace:*",
     "@mlx-node/tts": "workspace:*",

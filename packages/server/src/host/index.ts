@@ -49,17 +49,23 @@ import {
   type LoadModelOptions,
 } from '@mlx-node/lm';
 import { findDFlash2Draft } from '@mlx-node/lm/draft-companion';
+import { discoverRerankers, type DiscoveredReranker } from '@mlx-node/rerank/catalog';
+import { validateRerankerFamilies, familyLoadOptions } from '@mlx-node/rerank/protocol';
+import type { RerankerFamilyOptions, RerankerModel } from '@mlx-node/rerank/types';
 
 import type { AudioModel } from '../audio-registry.js';
 import type { AudioServiceOptions } from '../audio-service.js';
 import type { ServerHealth } from '../health.js';
+import { resolveRerankLimits, type RerankServiceOptions } from '../rerank-service.js';
 import { createServer, resolveAuthToken, type CloseOptions, type ServerInstance } from '../server.js';
-import { discoverAudioModels, loadAudioModel, withAudioModels, type DiscoveredAudioModel } from './audio-models.js';
+import { discoverAudioModels, loadAudioModel, audioCapabilities, type DiscoveredAudioModel } from './audio-models.js';
+import { chatCapability, withCapabilityModels } from './capability-models.js';
 import { discoverModels, type DiscoveredModel } from './discover.js';
 import { applyEnginePolicy, type EnginePolicy } from './env-policy.js';
 import { attachLogger as defaultAttachLogger, type Logger } from './logger.js';
 import { hostUrl, isLoopbackBindHost, normalizeLoopbackBindHost, pickFreePort } from './net.js';
 import { resolveModelsDir } from './paths.js';
+import { loadRerankModel, rerankCapability } from './rerank-models.js';
 import { makeSwapController } from './swap.js';
 import { hostTempDirPrefix, sweepOrphanHostTempRoots } from './temp-root.js';
 
@@ -118,6 +124,9 @@ export class InferenceHostClosedError extends Error {
 export interface InferenceHostOptions {
   modelResidency?: 'capability' | 'single';
   audio?: AudioServiceOptions;
+  rerank?: RerankServiceOptions;
+  reranker?: RerankerFamilyOptions;
+  loadRerankModel?: (entry: DiscoveredReranker) => Promise<RerankerModel>;
   loadAudioModel?: (entry: DiscoveredAudioModel) => Promise<AudioModel>;
   /**
    * Port to bind. Omitted ⇒ a free port is picked up-front (so the URL is
@@ -193,6 +202,7 @@ export interface InferenceHost {
   /** Chat/decision inventory for existing chat pickers, alphabetical. */
   models: DiscoveredModel[];
   audioModels: DiscoveredAudioModel[];
+  rerankModels: DiscoveredReranker[];
   /** Name of the default model in models or audioModels. */
   boundModel: string;
   /** Verbose log directory, or `null` when logging is off. */
@@ -242,6 +252,8 @@ export interface InferenceHost {
  * render those into their own messages.
  */
 export async function createInferenceHost(opts: InferenceHostOptions = {}): Promise<InferenceHost> {
+  validateRerankerFamilies(opts.reranker);
+  resolveRerankLimits(opts.rerank);
   const host = opts.host ?? '127.0.0.1';
   // BEFORE the engine policy, the temp sweep and discovery — all of which
   // mutate state outside this function — so a refused start leaves nothing
@@ -274,7 +286,10 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   let firstScanError: unknown;
   const models = await discoverModels(modelsDir, { onEntryFailure: (error) => (firstScanError ??= error) });
   const audioModels = await discoverAudioModels(modelsDir, (error) => (firstScanError ??= error));
-  const allModels = [...models, ...audioModels];
+  const rerankModels = await discoverRerankers(modelsDir, (error) => (firstScanError ??= error));
+  const allModels = [...models, ...audioModels, ...rerankModels];
+  if (new Set(allModels.map((entry) => entry.name)).size !== allModels.length)
+    throw new Error('A model declares conflicting capabilities');
   if (allModels.length === 0) {
     // NoModelsDiscoveredError means "a completed scan found nothing" — the
     // desktop sidecar maps it to a permanent exit. An INCOMPLETE scan's empty
@@ -320,6 +335,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
 
   const serverConfig = {
     audio: opts.audio,
+    rerank: opts.rerank,
     port: requestedPort,
     host: bindHost,
     resolveModel: resolveHttpModel,
@@ -360,13 +376,17 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     }
   };
   const chatController = makeSwapController(models, server.registry, loadModelPagedAware, boundEntry.name);
-  const controller = withAudioModels(
-    chatController,
-    audioModels,
-    server.registry,
-    opts.loadAudioModel ?? loadAudioModel,
+  const controller = withCapabilityModels(
+    [
+      chatCapability(chatController, server.registry),
+      ...audioCapabilities(audioModels, server.registry, opts.loadAudioModel ?? loadAudioModel),
+      rerankCapability(
+        rerankModels,
+        server.registry,
+        opts.loadRerankModel ?? ((entry) => loadRerankModel(entry, familyLoadOptions(opts.reranker, entry.modelType))),
+      ),
+    ],
     opts.modelResidency ?? 'capability',
-    models.length > 0,
   );
   ctrlRef.current = controller;
 
@@ -411,7 +431,9 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   const address = server.server.address();
   const boundPort = address !== null && typeof address === 'object' ? address.port : requestedPort;
 
-  const byName = new Map<string, DiscoveredModel | DiscoveredAudioModel>(allModels.map((m) => [m.name, m]));
+  const byName = new Map<string, DiscoveredModel | DiscoveredAudioModel | DiscoveredReranker>(
+    allModels.map((m) => [m.name, m]),
+  );
 
   // `closeStarted` is an admission latch, checked and flipped synchronously:
   // once close() returns its promise no later out-of-band load can join this
@@ -429,6 +451,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     modelsDir,
     models,
     audioModels,
+    rerankModels,
     boundModel: boundEntry.name,
     logDir: logger?.logDir ?? null,
     server,
@@ -494,14 +517,20 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
         // `allSettled` preserves cleanup when either kind of loader rejects;
         // the original operation still carries that error to its caller.
         await Promise.allSettled([...admittedHostLoads, ...admittedHttpModelLoads]);
-        // Out-of-band audio loads admitted before close may finish after the
-        // HTTP audio service drained. Dispose those late residents as well.
+        // Out-of-band capability loads admitted before close may finish after
+        // their HTTP service drained. Dispose every late resident even if one
+        // capability's cleanup fails.
         let disposalError: unknown;
-        try {
-          if (server.registry.audio.list().length)
-            await server.modelWork.withModelLoad(() => server.registry.audio.disposeAll(), 'host audio shutdown');
-        } catch (error) {
-          disposalError = error;
+        for (const [kind, capability] of [
+          ['audio', server.registry.audio],
+          ['rerank', server.registry.rerank],
+        ] as const) {
+          try {
+            if (capability.list().length)
+              await server.modelWork.withModelLoad(() => capability.disposeAll(), `host ${kind} shutdown`);
+          } catch (error) {
+            disposalError ??= error;
+          }
         }
         // Only once nothing is still serving. The logger writes a request's
         // record from that request's `finish` handler, so ending the streams

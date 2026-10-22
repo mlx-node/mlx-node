@@ -16,6 +16,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 const RAW_MODEL_TYPE_ALIASES = {
   clef: ['clef'],
   harrier: ['harrier'],
+  jina_reranker: ['jina_reranker'],
+  xlm_roberta_reranker: [],
   gemma4: ['gemma4', 'gemma4_text', 'gemma4_unified'],
   muse_glimmer: ['muse_glimmer', 'muse_glimmer_text'],
   qwen3: ['qwen3'],
@@ -176,6 +178,18 @@ describe('declarative model loader registry', () => {
       'loadSession: embedding models (Harrier) cannot be wrapped in a ChatSession',
     );
   });
+
+  it.each([{ model_type: 'jina_reranker' }, { model_type: 'qwen3', architectures: ['JinaForRanking'] }])(
+    'rejects rerank sessions before loading native weights: %j',
+    async (config) => {
+      // This directory intentionally has no weights or tokenizer. Reaching the
+      // native loader would fail with a different error.
+      await writeConfig(config);
+      await expect(loadSession(tempDir)).rejects.toThrow(
+        'loadSession: rerank models cannot be wrapped in a ChatSession; use loadReranker from @mlx-node/rerank.',
+      );
+    },
+  );
 
   it('rejects draftModelPath for families without external draft support', async () => {
     await writeConfig({ model_type: 'qwen3' });

@@ -49,7 +49,11 @@ describe('isDefaultModelDownloadPath', () => {
   });
 
   it('does not admit unrelated root files', () => {
-    expect(isDefaultModelDownloadPath('README.md', new Set())).toBe(false);
+    expect(isDefaultModelDownloadPath('notes.md', new Set())).toBe(false);
+  });
+  it('preserves model attribution and separate ranking projectors', () => {
+    for (const file of ['LICENSE', 'LICENSE.md', 'README.md', 'projector.safetensors'])
+      expect(isDefaultModelDownloadPath(file, new Set())).toBe(true);
   });
 });
 

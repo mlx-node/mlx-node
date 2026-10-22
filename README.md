@@ -81,12 +81,13 @@ See [docs/models.md](docs/models.md) for loading options and model-specific beha
 | Audio            | Qwen3-ASR                                                                      | Offline, streaming, and meeting transcription                    |
 | Speech synthesis | [Qwen3-TTS](docs/tts.md)                                                       | Streaming CustomVoice and Base voice cloning via `@mlx-node/tts` |
 | Embedding        | Harrier                                                                        | Embedding inference                                              |
+| Reranking        | [Jina Reranker v3 / v3.5](docs/rerank.md)                                      | BF16, affine 4-bit and MXFP4; SDK, HTTP and CLI                  |
 
 The detailed support matrix is in [docs/models.md](docs/models.md).
 
 ## Server
 
-`mlx serve` scans the models directory and loads a model when it is first requested. By default it keeps one chat/decision, one ASR and one TTS model resident. Use `--model-residency single` for a single global slot.
+`mlx serve` scans the models directory and loads a model when it is first requested. By default it keeps one chat/decision, one ASR, one TTS and one reranker resident. Use `--model-residency single` for a single global slot; see the [resource lifecycle](docs/rerank.md#architecture-and-operations) for disposal behavior.
 
 ```bash
 mlx serve
@@ -100,6 +101,7 @@ The server implements:
 - `POST /v1/messages`
 - `POST /v1/messages/count_tokens`
 - `GET /v1/models`
+- `POST /v1/rerank` — see [reranking protocols and examples](docs/rerank.md)
 - `POST /v1/audio/transcriptions`, `POST /v1/audio/speech`, `POST /v1/audio/speech/stream`
 - `GET /v1/audio/voices` — see [audio protocols and examples](docs/serve-audio.md)
 - `GET /health` and `GET /v1/health`
@@ -208,6 +210,7 @@ Use `yarn build:native` to build the Node addon. A direct `cargo build` does not
 - [`@mlx-node/trl`](packages/trl): GRPO and SFT training
 - [`@mlx-node/vlm`](packages/vlm): vision-language models and document pipelines
 - [`@mlx-node/asr`](packages/asr): speech recognition
+- [`@mlx-node/rerank`](packages/rerank): general-purpose text reranking
 - [`@mlx-node/privacy`](packages/privacy): local PII detection and redaction
 - [`@mlx-node/cli`](packages/cli): CLI commands
 - [`@mlx-node/core`](packages/core): internal native bindings
@@ -216,6 +219,7 @@ Use `yarn build:native` to build the Node addon. A direct `cargo build` does not
 
 - [CLI](docs/cli.md)
 - [Models and `ChatSession`](docs/models.md)
+- [Reranking](docs/rerank.md)
 - [Inference architecture](docs/inference-architecture.md)
 - [Concurrent inference](docs/concurrent-inference.md)
 - [Paged KV cache](docs/paged-cache.md)

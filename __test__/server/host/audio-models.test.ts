@@ -3,6 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { LoadableModel } from '@mlx-node/lm';
+import type { RerankerModel } from '@mlx-node/rerank';
+import type { DiscoveredReranker } from '@mlx-node/rerank/catalog';
 import type { TtsModel } from '@mlx-node/tts';
 import { afterEach, expect, it, vi } from 'vite-plus/test';
 
@@ -17,7 +19,7 @@ afterEach(async () => {
   host = undefined;
   if (root) await rm(root, { recursive: true, force: true });
 });
-async function setup(residency: 'capability' | 'single' = 'capability', chat = false) {
+async function setup(residency: 'capability' | 'single' = 'capability', chat = false, rerank = false) {
   root = await mkdtemp(join(tmpdir(), 'mlx-audio-models-'));
   for (const [name, kind] of [
     ['asr', 'asr'],
@@ -51,6 +53,30 @@ async function setup(residency: 'capability' | 'single' = 'capability', chat = f
     await writeFile(join(root, 'chat/config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
     await writeFile(join(root, 'chat/model.safetensors'), 'test fixture');
   }
+  const rankModels: RerankerModel[] = [];
+  const rankFamilies = [
+    ['jina', 'jina_reranker', 'JinaForRanking', 'jina-v3'],
+    ['bge', 'xlm_roberta_reranker', 'XLMRobertaForSequenceClassification', 'xlmr-cross-encoder-v1'],
+  ] as const;
+  if (rerank)
+    for (const [name, , architecture] of rankFamilies) {
+      const path = join(root, name);
+      await mkdir(path);
+      await writeFile(join(path, 'config.json'), JSON.stringify({ architectures: [architecture] }));
+      for (const file of ['model.safetensors', 'tokenizer.json', 'tokenizer_config.json'])
+        await writeFile(join(path, file), 'fixture');
+    }
+  const loadRerankModel = vi.fn(async (entry: DiscoveredReranker) => {
+    const descriptor = rankFamilies.find(([name]) => entry.name === name);
+    if (!descriptor) throw Error('unexpected rerank load');
+    const model = {
+      info: { family: descriptor[1], profile: descriptor[3] },
+      dispose: vi.fn(async () => {}),
+      rerank: vi.fn(),
+    } as unknown as RerankerModel;
+    rankModels.push(model);
+    return model;
+  });
   const loaded: AudioModel[] = [];
   const loadAudioModel = vi.fn(async (entry) => {
     const model: AudioModel =
@@ -85,9 +111,16 @@ async function setup(residency: 'capability' | 'single' = 'capability', chat = f
     disableStore: true,
     sweepOrphanTempRoots: false,
     loadAudioModel,
+    loadRerankModel,
+    reranker: {
+      families: {
+        jina_reranker: { policy: { maxBlockTokens: 1000 } },
+        xlm_roberta_reranker: { policy: { maxPairTokens: 256, maxQueryTokens: 128 } },
+      },
+    },
     loadModel: async () => ({}) as LoadableModel,
   });
-  return { host, loaded, loadAudioModel };
+  return { host, loaded, loadAudioModel, rankModels, loadRerankModel };
 }
 it('starts an audio-only host and lists checkpoint metadata without loading weights or chat choices', async () => {
   const { host, loadAudioModel } = await setup();
@@ -239,3 +272,32 @@ it.each(['single', 'capability'] as const)('keeps chat aliases inside chat when 
   expect(host.server.registry.getAny('chat')).toBeDefined();
   expect(host.server.registry.getAny('asr')).toBeUndefined();
 });
+it.each(['single', 'capability'] as const)(
+  'switches BGE/Jina alongside chat, ASR and TTS with %s residency',
+  async (policy) => {
+    const { host, rankModels, loadRerankModel } = await setup(policy, true, true);
+    await host.loadModel('chat');
+    await host.loadModel('asr');
+    await host.loadModel('tts');
+    await host.loadModel('jina');
+    expect(loadRerankModel).toHaveBeenLastCalledWith(
+      expect.objectContaining({ name: 'jina', modelType: 'jina_reranker' }),
+    );
+    await host.loadModel('bge');
+    expect(loadRerankModel).toHaveBeenLastCalledWith(
+      expect.objectContaining({ name: 'bge', modelType: 'xlm_roberta_reranker' }),
+    );
+    expect(vi.spyOn(rankModels[0], 'dispose')).toHaveBeenCalledOnce();
+    expect(host.server.registry.rerank.get('jina')).toBeUndefined();
+    expect(host.server.registry.rerank.get('bge')).toBeDefined();
+    for (const name of ['asr', 'tts']) expect(!!host.server.registry.audio.get(name)).toBe(policy === 'capability');
+    expect(!!host.server.registry.getAny('chat')).toBe(policy === 'capability');
+    for (const name of ['chat', 'asr', 'tts']) {
+      await host.loadModel(name);
+      expect(!!host.server.registry.rerank.get('bge')).toBe(policy === 'capability');
+      await host.loadModel('bge');
+    }
+    await host.close();
+    for (const model of rankModels) expect(vi.spyOn(model, 'dispose')).toHaveBeenCalledOnce();
+  },
+);

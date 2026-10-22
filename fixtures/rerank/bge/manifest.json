@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "baselineRevision": "1fc3baeef159ee02b5df14ca9a6a7de8b06a0dda",
+  "model": {"repository": "BAAI/bge-reranker-v2-m3", "revision": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"},
+  "reference": {"transformers": "4.38.1", "tokenizers": "0.15.2", "torch": "2.7.1", "mlx": "0.32.4", "numpy": "2.2.5", "safetensors": "0.7.0", "pyarrow": "20.0.0"},
+  "thresholds": {
+    "fp32": {"logitMaxAbs": 0.001, "logitMeanAbs": 0.0001, "scoreMaxAbs": 0.00025, "scoreMeanAbs": 0.000025},
+    "sameCheckpoint": {"logitMaxAbs": 0.01, "logitMeanAbs": 0.001, "scoreMaxAbs": 0.0025, "scoreMeanAbs": 0.00025},
+    "quantizationNdcg10MaxDrop": 0.02,
+    "batchingMinThroughputGain": 0.2,
+    "baselineMaxMedianLatencyRegression": 0.05
+  },
+  "datasets": [
+    {"repository":"C-MTEB/T2Reranking","revision":"76631901a18387f85eaa53e5450019b87ad58ef9","file":"data/dev-00000-of-00001-65d96bde8023d9b9.parquet"},
+    {"repository":"mteb/askubuntudupquestions-reranking","revision":"4d853f94cd57d85ec13805aeeac3ae3e5eb4c49c","file":"test.jsonl.gz"}
+  ],
+  "qualitySelection": {"queriesPerDataset": 256, "order": "sha256(query UTF-8) ascending", "retainAllCandidates": true},
+  "performance": {"warmup": 3, "iterations": 10, "candidates": [50,125,200], "pairTokens": [64,512,2048,8192]}
+}

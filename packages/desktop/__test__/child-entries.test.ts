@@ -29,7 +29,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const src = (rel: string): string => resolve(ROOT, 'packages/desktop/src', rel);
 
 /** Packages that map the addon, directly or by re-export. */
-const ADDON_PACKAGES = ['@mlx-node/core', '@mlx-node/lm', '@mlx-node/vlm', '@mlx-node/trl'];
+const ADDON_PACKAGES = ['@mlx-node/core', '@mlx-node/lm', '@mlx-node/vlm', '@mlx-node/trl', '@mlx-node/rerank'];
 
 /**
  * Native-free leaves of otherwise addon-mapping packages — the analogue of
@@ -44,6 +44,10 @@ const ADDON_FREE_SUBPATHS = [
   '@mlx-node/lm/draft-companion',
   '@mlx-node/lm/model-detection',
   '@mlx-node/lm/model-discovery',
+  '@mlx-node/rerank/catalog',
+  '@mlx-node/rerank/families',
+  '@mlx-node/rerank/protocol',
+  '@mlx-node/rerank/types',
 ];
 
 /** Every `from '…'` and bare `import '…'` specifier, **type-only imports included**. */
@@ -295,6 +299,7 @@ describe('MAIN never links the native addon', () => {
       '@mlx-node/lm/model-discovery',
       '@mlx-node/server/host/env-policy',
       '@mlx-node/server/host/paths',
+      '@mlx-node/rerank/families',
     ]);
   });
 });

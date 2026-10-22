@@ -43,6 +43,7 @@ Options:
                       directory name under --models-dir. Defaults to
                       ANTHROPIC_MODEL env, else the first discovered model.
   --model-residency <mode>  capability (default) or single
+  --rerank-config <file>    JSON { policy?, families?, service? } for rerank limits
   --auth-token <tok>  Require this secret on every route except /health,
                       as \`x-api-key\` or \`authorization: Bearer\`. Also
                       readable from MLX_SERVER_AUTH_TOKEN.
@@ -52,7 +53,7 @@ Options:
   -h, --help          Show this help message
 
 Models load lazily. Default residency: one chat/decision model, one ASR model,
-and one TTS model. Use --model-residency single for one model globally.
+one TTS model, and one reranker. Use --model-residency single for one model globally.
 
 Examples:
   mlx serve
@@ -70,6 +71,7 @@ export interface ServeArgs {
   model?: string;
   authToken?: string;
   modelResidency?: 'capability' | 'single';
+  rerankConfig?: string;
   logDir?: string;
 }
 
@@ -91,6 +93,7 @@ export function parseServeArgs(argv: string[]): ServeArgs {
       'models-dir': { type: 'string' },
       model: { type: 'string' },
       'model-residency': { type: 'string' },
+      'rerank-config': { type: 'string' },
       'auth-token': { type: 'string' },
       verbose: { type: 'boolean', short: 'v', default: false },
       'log-dir': { type: 'string' },
@@ -121,6 +124,7 @@ export function parseServeArgs(argv: string[]): ServeArgs {
     modelsDir: values['models-dir'],
     model: values.model,
     ...(modelResidency !== undefined ? { modelResidency } : {}),
+    ...(values['rerank-config'] !== undefined ? { rerankConfig: values['rerank-config'] } : {}),
     authToken: values['auth-token'],
     logDir: verbose ? resolveLogDir(values['log-dir'], resolveMlxNodeHome()) : undefined,
   };
@@ -163,6 +167,7 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
       modelsDir: args.modelsDir,
       model: args.model,
       modelResidency: args.modelResidency,
+      ...(await readRerankConfig(args.rerankConfig)),
       authToken: args.authToken,
       logDir: args.logDir,
       // Same paged-prefill chunking `mlx launch claude` applies. A value
@@ -186,7 +191,7 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
   }
 
   console.log(
-    `[mlx] models dir: ${host.modelsDir} | listening on ${host.url} | discovered ${host.models.length + (host.audioModels?.length ?? 0)} model(s) | default: ${host.boundModel}`,
+    `[mlx] models dir: ${host.modelsDir} | listening on ${host.url} | discovered ${host.models.length + (host.audioModels?.length ?? 0) + (host.rerankModels?.length ?? 0)} model(s) | default: ${host.boundModel}`,
   );
   if (host.logDir !== null) console.log(`[mlx] verbose logging → ${host.logDir}`);
   console.log('Press Ctrl+C to stop.');
@@ -215,4 +220,23 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
   process.on('SIGTERM', onSigterm);
 
   if (deps.onReady !== undefined) await deps.onReady(host);
+}
+
+async function readRerankConfig(
+  path?: string,
+): Promise<Pick<import('@mlx-node/server/host').InferenceHostOptions, 'reranker' | 'rerank'>> {
+  if (!path) return {};
+  const { readFile } = await import('node:fs/promises');
+  const value: unknown = JSON.parse(await readFile(path, 'utf8'));
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid rerank configuration');
+  const config = value as Record<string, unknown>;
+  for (const key of Object.keys(config))
+    if (!['policy', 'families', 'service'].includes(key)) throw new Error(`Unknown rerank config key: ${key}`);
+  return {
+    reranker: {
+      policy: config.policy as import('@mlx-node/rerank/types').RerankerFamilyOptions['policy'],
+      families: config.families as import('@mlx-node/rerank/types').RerankerFamilyOptions['families'],
+    },
+    rerank: config.service as import('@mlx-node/server').RerankServiceOptions,
+  };
 }

@@ -1,0 +1,7 @@
+[
+  {"name":"multilingual","query":"What is the capital of China?","documents":["Beijing is the capital of China.","中国的首都是北京。","Paris is the capital of France.","A recipe for apple pie.","","中国的首都是北京。"]},
+  {"name":"special-tokens","query":"query <pad> <s> </s> café 中文","documents":["<pad>","<s></s>","<mask> café 中文","Emoji 🧑🏽‍💻 combining é",""]},
+  {"name":"truncation","query":"one two three four five six seven eight nine ten","documents":["one two three four five six seven eight nine ten eleven twelve thirteen fourteen","短文",""],"truncate":true,"policy":{"maxPairTokens":16,"maxQueryTokens":4,"maxDocumentTokens":10,"maxBatchTokens":32}},
+  {"name":"empty-candidates","query":"query","documents":[]},
+  {"name":"batch-boundary","query":"search","documents":["short","short","short","short","short","short","short","short","short"]}
+]

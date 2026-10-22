@@ -16,6 +16,7 @@ import { createIdleSweeper, DEFAULT_IDLE_CLEAR_CACHE_MS, parseIdleClearCacheEnv 
 import { runGuardedModelLoad, type LoadModelOptions } from './load-model.js';
 import { ModelWorkCoordinator } from './model-work-coordinator.js';
 import { ModelRegistry } from './registry.js';
+import { RerankService, resolveRerankLimits, type RerankServiceOptions } from './rerank-service.js';
 import { activeSSEStreamCountForResponses } from './streaming.js';
 
 /** Cleanup interval for expired responses (ms). */
@@ -158,6 +159,7 @@ export function resolveAuthToken(explicit: string | undefined): string | undefin
 
 export interface ServerConfig {
   audio?: AudioServiceOptions;
+  rerank?: RerankServiceOptions;
   /** Port to listen on (default: 8080). */
   port?: number;
   /** Hostname to bind to (default: '127.0.0.1'). */
@@ -375,6 +377,7 @@ export interface ServerInstance {
  * ```
  */
 export async function createServer(config?: ServerConfig): Promise<ServerInstance> {
+  resolveRerankLimits(config?.rerank);
   const port = config?.port ?? 8080;
   const host = config?.host ?? '127.0.0.1';
   const authToken = resolveAuthToken(config?.authToken);
@@ -451,8 +454,19 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     },
     config?.audio,
   );
+  const rerank = new RerankService(
+    {
+      registry,
+      coordinator: modelWorkCoordinator,
+      idleSweeper,
+      resolveModel: config?.resolveModel,
+      listModels: config?.listModels,
+    },
+    config?.rerank,
+  );
   const handler = createHandler(registry, {
     audio,
+    rerank,
     cors,
     store,
     responseRetentionSec,
@@ -505,6 +519,8 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
 
     closePromise = (async (): Promise<CloseResult> => {
       const audioClosed = audio.close();
+      const rerankClosed = rerank.close();
+      void rerankClosed.catch(() => {});
       void audioClosed.catch(() => {});
       clearInterval(cleanupTimer);
       idleSweeper.close();
@@ -546,7 +562,9 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
         clearTimeout(forceTimer);
       }
 
-      await audioClosed;
+      const cleanup = await Promise.allSettled([audioClosed, rerankClosed]);
+      const failure = cleanup.find((r) => r.status === 'rejected');
+      if (failure?.status === 'rejected') throw failure.reason;
       return { forced, streamsAborted, durationMs: Date.now() - startedAt };
     })();
 

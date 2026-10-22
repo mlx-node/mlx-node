@@ -11,6 +11,7 @@ import { createHealthReporter, type ServerHealth } from './health.js';
 import type { IdleSweeper } from './idle-sweeper.js';
 import { ModelWorkCoordinator } from './model-work-coordinator.js';
 import type { ModelRegistry } from './registry.js';
+import { RerankService, type RerankServiceOptions } from './rerank-service.js';
 import { requestPathname, routeRequest } from './router.js';
 
 /**
@@ -54,13 +55,15 @@ export interface PublicModelEntry {
   api_backend?: 'messages' | 'responses';
   model_family?: string;
   supports_images?: boolean;
-  modality?: 'audio';
-  task?: 'asr' | 'tts';
+  modality?: 'audio' | 'text';
+  task?: 'asr' | 'tts' | 'rerank';
   capabilities?: Record<string, unknown>;
 }
 
 export interface HandlerOptions {
   audio?: AudioService;
+  rerank?: RerankService;
+  rerankOptions?: RerankServiceOptions;
   audioOptions?: AudioServiceOptions;
   /**
    * Enable CORS headers.
@@ -150,6 +153,13 @@ export function createHandler(
       options?.audioOptions,
     );
 
+  const rerank =
+    options?.rerank ??
+    new RerankService(
+      { registry, coordinator: modelWorkCoordinator, idleSweeper, resolveModel, listModels },
+      options?.rerankOptions,
+    );
+
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     // The guard spans the WHOLE listener, not just `routeRequest`. `http.createServer`
     // discards the returned promise, so anything that escapes here is an unhandled
@@ -207,7 +217,7 @@ export function createHandler(
         resolveModel,
         listModels,
         modelWorkCoordinator,
-        { health, authenticated, audio },
+        { health, authenticated, audio, rerank },
       );
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Internal server error';

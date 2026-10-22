@@ -1,0 +1,296 @@
+{
+  "reviewedHead": "8b47712e6714aa133e35a2cb510149c535947d3d",
+  "mergeBase": "6ccf98fe8ed2a27a5883a1468ccaea24892b3aad",
+  "upstreamAtReview": "1e21e9c5d5208b5895d07784b5a45089bbeb4a2d",
+  "recordedAt": "2026-10-21T15:01:32.240310+00:00",
+  "node": "v24.22.0",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "sources": {
+    "__test__/rerank/bge-contract.test.ts": "59a3070eba382d7006c4782870b8c6d0c48afd1d1147b362b12037a36a56644f",
+    "__test__/rerank/bge-native.test.ts": "a30fe1786674fa67f56faca841edf8bd87f1c60fdeeb972f63577ceb198c33f1",
+    "__test__/rerank/native.test.ts": "86db7176bf105e4a7275930370602c7943ac44f1395bdfa0d1bf3038ffb702d5",
+    "__test__/rerank/sdk.test.ts": "f9f164c3b315ebf69560e98d51a328bb32b38de59513f2081607c0e548b5acfe",
+    "__test__/server/host/swap.test.ts": "85b4e58f9323170e5d9fa2131dc95d344c524fcc2f06a3260cd58a65d6d166db",
+    "__test__/server/rerank.test.ts": "01f46c3cb41e8a34b5930b6ce4f24720707536c51864ce16e3acde1e8469aa73",
+    "crates/mlx-core/src/convert.rs": "f974927191edc4ef860bf1d187e9f58665074847849188f62412170b86a87a9f",
+    "crates/mlx-core/src/models/jina_reranker/inference.rs": "c0b673dd4fdf1264db36fbd5fd284bb0387c0cedd4cea1ad76806792483c9929",
+    "crates/mlx-core/src/models/jina_reranker/weights.rs": "ea2348aa51639bc3678f14229f5bcedefeff1c9372667b10e7e61e838e36257c",
+    "crates/mlx-core/src/models/mod.rs": "a10ec1ffd27835fbdc44d5b687a5cecaa5aeba7755bf2faa88e603b7743ac9ac",
+    "crates/mlx-core/src/models/rerank_checkpoint.rs": "3d9b5bdf72126614962d8acfda892b745ff5c163059cf1602eaa91c2907247c9",
+    "crates/mlx-core/src/models/xlm_roberta_reranker/weights.rs": "7b600ecbf407f3962ccf92437e0b3b0de286b7f0f3acc662dd00efa2ddf9aa10",
+    "packages/rerank/src/protocol.ts": "455909af01bf7bb189cf71e6d31d194d29ed90a9f4e8fff02e270a87f5f584d0",
+    "packages/rerank/src/runtime.ts": "86902c43848163efba80d5c57458e4e17f272a146c2970a1e7df31f35121dc5f",
+    "packages/server/src/host/index.ts": "0c6384872fe4d175e78d0b1b76eb8cfe17b930772d11ce64d40dee4998dd89c7",
+    "packages/server/src/host/swap.ts": "581ec1985a86a4b79a845c7225f7cbf28fee259bf0e25550e8bbee259fc86ec6",
+    "packages/server/src/rerank-service.ts": "3b0126337225bfb22e46d141e942a54f6edb7e99f1f1a496cb6c515afddcd314",
+    "scripts/rerank/benchmark.mjs": "ae5ce78f11bb3b45cfdad0bf8098d346ddf093bd2a7cae46c82a5ae428c99bd5",
+    "scripts/rerank/bge/compare-regression.test.mjs": "d193146f024b82ce7b12de40af1e009e628af26c6a3824e4b1cf5acf263cd407",
+    "scripts/rerank/bge/quality-contract.test.mjs": "14ad018b22231aa243c9ed90431c702e95143844cdc592d29327c03ed549079d",
+    "scripts/rerank/compare.mjs": "60fe0c54b197977aa579147f63d4465bec48f65df5a69387fee66b0f5c4f5a9e",
+    "scripts/rerank/report-lifecycle.test.mjs": "b98b55a056ba1076f53880963d11bb95d592e9f9b38a684c4c82d858dc161b97"
+  },
+  "artifacts": {
+    "packages/core/mlx-core.darwin-arm64.node": "a2e0c8a158e4c405f91319efd5eb9e9ff92d4653dec89f2f28a17197ac0ca81b",
+    "packages/core/mlx.metallib": "4f39d6b98d2ef179bebe498b57d89816fa0097c5ef37ab9c777c1826ead308f9",
+    "packages/core/paged_attn.metallib": "30268b6c8743a0c925ec72a0e02e115fe92306bb2dec027a13a4e2efa9be7426"
+  },
+  "logs": {
+    "addon.log": "ddb47507438898390d12fd6cc0694602b9d178415d64eed39bd6cc552b5d0b6c",
+    "bge-affine.log": "2d201dd7b9047859f6f01a260d402b8d4ec2d4217428455c82fe8e18eb3b2a63",
+    "bge-bf16.log": "4edf64fc2422f28945ede58aa0476d8b3cfefe1954769107e08cde16582aa9df",
+    "bge-fp16.log": "298b61637a97cf16f68e5cc87f1b2fa56d3645c0b09ce7e7dee08025d3f3f7f1",
+    "bge-fp32.log": "2dfcf14915538366d849c1358ee3eed59480493cd3ee8a91ca2ae545b8ead183",
+    "bge-mixed.log": "365294ff76a82b5da918554524aabae811075b136f9da81ef67df7122147246a",
+    "bge-mxfp4.log": "2f846a7cd4a7f282f02c762bb50d7f80097dad843a986aa97f12bce0d3a01b7d",
+    "bge-native-before.log": "fdab592ea8ae96204c194fca50572f0091eb35d8a057663fae6b54cb36f40d41",
+    "bge-surfaces.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "clippy.log": "5041fd198e0d4dfda304a78b2e95adb4573a8eba5eb71e5153e1266383cca52d",
+    "evidence-tests.log": "7f5747c3b1d7c95b7ab50d6dbf50d2569f47d8ba9fd4a0d0b8bde79237cae8e5",
+    "format.log": "9d346090917e2a85819b849192fed6556924c7d24b42621a97bf39e97e936cb4",
+    "jina-gc.log": "bed361fd532ddb54f032712b774172808ee11973951e74885a415328f70710fb",
+    "jina-v3-affine.log": "1dd829348aaf2d041ad1deaccdace887f7b6b77edc102ae2fa7400781cd055e5",
+    "jina-v3-community-mxfp4.log": "cc71064de65e68f2abc4a5256378c7acdb8135b6db34ac57febb0dfc797e16e4",
+    "jina-v3-mxfp4.log": "0368ce3565a739939a2b2fb79585b2c619fb653f4e375eb5c3a1992079321a1e",
+    "jina-v3.log": "d8aefdbf7088b8ec0501479e6544bd8af8d9b030d8b21617c71a8acd26cfe915",
+    "jina-v35-affine.log": "ea598fed27eaefab4e10f8195bbaa7e7f86eaf8ff82c8b5def108c1d865a7077",
+    "jina-v35-community-affine.log": "3a06f98970b18b3b0811c71e011d86540093cf792c41ca8ccac6d13638d40c93",
+    "jina-v35-mxfp4.log": "4ac1418c37ad381e9d1d60d09e8d7b152d2add2382b8d6905d9bde587c357dea",
+    "jina-v35.log": "ffb516d026431dbe598bc0b3187264a62050f149200860bf658e7d53a0bbf4ef",
+    "lint.log": "628c256456556068c1281d4a51a448c492b7ddae77d0691a4d25b9f84105b6fc",
+    "native-after.log": "5c77bc7bacc6ab61dcec63ca0a21878530a65d3b7578f6e8e3b361ce7aab0518",
+    "native-before.log": "f98a7a82737a3ed20e92ca5d92d34c067a1de74d535854d7085d59a289c3e24b",
+    "native-build.log": "bfb75d686d5980c18cf7a3b97831a03d09ea1c198cf235fa8d09828c45ff9bd3",
+    "pure-ts.log": "dc8a26df50d0696574138b7d944a8936bdd918a6a7ef480924e1f59ab7eca2c4",
+    "report-format.log": "a7f43d3be26dd23d4744d0fa4e5c0b8a3d04186dbcd86ec2de3d5196c8988ce4",
+    "rust-calibration-recheck.log": "5d998af1971d28db93702415d2404dfbd2ba52845050e5b954b824346fa07297",
+    "rust-core.log": "412a1b8f9cdf13d106dddebdfb176c65f6086c468a4cac9271674bb9234a30f2",
+    "rust-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "typecheck.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "checks": [
+    {
+      "check": "rust-fmt",
+      "state": "started"
+    },
+    {
+      "check": "rust-fmt",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "clippy",
+      "state": "started"
+    },
+    {
+      "check": "clippy",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "rust-core",
+      "state": "started"
+    },
+    {
+      "check": "rust-core",
+      "state": "completed",
+      "exitCode": 101
+    },
+    {
+      "check": "jina-v3",
+      "state": "started"
+    },
+    {
+      "check": "jina-v3",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "jina-v35",
+      "state": "started"
+    },
+    {
+      "check": "jina-v35",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "jina-v3-affine",
+      "state": "started"
+    },
+    {
+      "check": "jina-v3-affine",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "jina-v3-mxfp4",
+      "state": "started"
+    },
+    {
+      "check": "jina-v3-mxfp4",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "jina-v35-affine",
+      "state": "started"
+    },
+    {
+      "check": "jina-v35-affine",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "jina-v35-mxfp4",
+      "state": "started"
+    },
+    {
+      "check": "jina-v35-mxfp4",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "jina-v3-community-mxfp4",
+      "state": "started"
+    },
+    {
+      "check": "jina-v3-community-mxfp4",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "jina-v35-community-affine",
+      "state": "started"
+    },
+    {
+      "check": "jina-v35-community-affine",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "bge-fp32",
+      "state": "started"
+    },
+    {
+      "check": "bge-fp32",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "bge-fp16",
+      "state": "started"
+    },
+    {
+      "check": "bge-fp16",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "bge-bf16",
+      "state": "started"
+    },
+    {
+      "check": "bge-bf16",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "bge-affine",
+      "state": "started"
+    },
+    {
+      "check": "bge-affine",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "bge-mxfp4",
+      "state": "started"
+    },
+    {
+      "check": "bge-mxfp4",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "bge-mixed",
+      "state": "started"
+    },
+    {
+      "check": "bge-mixed",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "addon",
+      "state": "started"
+    },
+    {
+      "check": "addon",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "jina-gc",
+      "state": "started"
+    },
+    {
+      "check": "jina-gc",
+      "state": "completed",
+      "exitCode": 0
+    },
+    {
+      "check": "bge-surfaces",
+      "state": "started"
+    },
+    {
+      "check": "bge-surfaces",
+      "state": "completed",
+      "exitCode": 0
+    }
+  ],
+  "results": {
+    "pureTsPassed": 2126,
+    "nativeFixturesPassed": 64,
+    "addonPassed": 1801,
+    "addonSkipped": 57,
+    "rustCore": {
+      "passed": 3996,
+      "failed": 1,
+      "ignored": 161,
+      "calibrationMs": [
+        133.28,
+        147.897
+      ],
+      "limitMs": 100
+    },
+    "jinaGoldenCheckpointsPassed": 8,
+    "bgeGoldenCheckpointsPassed": 6,
+    "forcedGcCycles": 1083,
+    "evidenceTestsPassed": 14,
+    "alias": {
+      "before": "a",
+      "after": "b",
+      "expected": "b"
+    },
+    "independentConfirmedReview": "No remaining actionable finding in corrective diff; runtime verification failures are not cleared by static review.",
+    "allTestsPassed": false,
+    "readyForMerge": false
+  },
+  "unchangedAcceptanceLimits": [
+    "FP16 batching throughput target unmet",
+    "Initial Jina regression attempt cause undetermined",
+    "Full performance matrix incomplete"
+  ],
+  "verificationLimitations": [
+    "Rust Qwen3.5 calibration exceeds existing 100ms bound in this run and isolated retry",
+    "Older quality/performance artifacts not relabeled for new binary",
+    "Nonfatal addon process-listener/circular-module warnings preserved in log"
+  ],
+  "correctiveCommits": [
+    "30d8062b0183baed19af676477183f22b2c129bf",
+    "0bd4d3cb8d7b63f7fa12a28e4c671046f3da5d13",
+    "2913abccba969ab36188f430a0f5ed056110443f",
+    "cd71e8994c144356084c4d285b1130c23cd74d00"
+  ]
+}

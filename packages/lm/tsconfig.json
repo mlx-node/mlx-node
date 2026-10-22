@@ -7,5 +7,6 @@
     "noEmit": false,
     "types": ["node"]
   },
+  "references": [{ "path": "../rerank" }],
   "include": ["src/**/*.ts"]
 }
