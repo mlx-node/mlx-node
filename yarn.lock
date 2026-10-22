@@ -7411,7 +7411,7 @@ __metadata:
     "@std/toml": "npm:@jsr/std__toml@^1.0.11"
     "@types/node": "npm:^26.4.0"
     octokit: "npm:^5.0.5"
-    openai: "npm:7.41.0"
+    openai: "npm:7.42.0"
     oxc-parser: "npm:^0.155.0"
     prettier: "npm:^3.9.6"
     typescript: "npm:^7.0.2"
@@ -7593,9 +7593,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"openai@npm:7.41.0":
-  version: 7.41.0
-  resolution: "openai@npm:7.41.0"
+"openai@npm:7.42.0":
+  version: 7.42.0
+  resolution: "openai@npm:7.42.0"
   peerDependencies:
     "@aws-sdk/credential-provider-node": ">=3.972.0 <4"
     "@smithy/hash-node": ">=4.3.0 <5"
@@ -7619,7 +7619,7 @@ __metadata:
       optional: true
     zod:
       optional: true
-  checksum: 10c0/4849796fb5bb2b9296ef79af421736df8b5b6b89b7e6f9fc7c1cb88180f92fbbf06a9b6291f3f8f94d37d2ab3308d5e9d321574763db56e1555bcd7fbf174d6c
+  checksum: 10c0/2911d9f17e7c21f6333ee148e63b9619cf977166ab7eed47f6111fe19c0d2bdfcc308803047aae7950a3240330a259d9da21939ef506812ca3aaaba0beb86c97
   languageName: node
   linkType: hard
 
