@@ -896,7 +896,7 @@ bool mlx_qwen4_route_sort(mlx_array *ids, int experts, mlx_array **order,
       return false;
     auto input = *reinterpret_cast<array *>(ids);
     if (input.ndim() != 1 || input.dtype() != mlx::core::uint32 ||
-        input.size() < 256 || input.size() > 65536)
+        input.size() < 1 || input.size() > 65536)
       return false;
     const int rows = input.size(), blocks = (rows + 255) / 256;
     static auto count =

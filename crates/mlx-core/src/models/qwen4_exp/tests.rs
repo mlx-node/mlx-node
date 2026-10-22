@@ -4974,8 +4974,15 @@ fn indirect_prefill_preserves_mixed_formats_rows_and_tail_rounding() {
                 .unwrap()
                 .astype(DType::BFloat16)
                 .unwrap();
-                let (output, inverse) =
-                    decoder::Decoder::single_slot_group_rows(&x, &routes, &banks, e, top).unwrap();
+                let (output, inverse) = decoder::Decoder::single_slot_group_rows(
+                    &x,
+                    &routes,
+                    &banks,
+                    e,
+                    math::ExpertKernel::for_window(assignments, e),
+                    top,
+                )
+                .unwrap();
                 let expected = math::combine_expert_rows(&expected_rows, &scores, None, top)
                     .unwrap()
                     .to_float32()
@@ -5149,6 +5156,26 @@ fn expert_prefill_runtime_sizes_match_quantized_matmul() {
     }
 }
 
+/// The window's row count and the model's expert count decide the expert
+/// kernel; a slot bank's row count and a group's size never enter.
+#[test]
+fn expert_kernel_follows_the_window_not_the_bank() {
+    use math::ExpertKernel::{self, Gather, Rows, Tiles};
+    let kernel = |rows| ExpertKernel::for_window(rows, 512);
+    assert_eq!(kernel(10240), Tiles);
+    assert_eq!(kernel(2048), Tiles);
+    assert_eq!(kernel(2047), Gather);
+    assert_eq!(kernel(750), Gather);
+    assert_eq!(kernel(256), Gather);
+    assert_eq!(kernel(81), Gather);
+    assert_eq!(kernel(80), Rows);
+    assert_eq!(kernel(1), Rows);
+    assert_eq!(kernel(65537), Gather);
+    assert_eq!(ExpertKernel::for_window(256, 10), Tiles);
+    assert_eq!(ExpertKernel::for_window(255, 10), Gather);
+    assert_eq!(ExpertKernel::for_window(40, 0), Rows);
+}
+
 /// A window split over slot banks gives the bits of the one-bank run for
 /// every split. The capacities put the remainder group in each class the
 /// old bank-keyed choice took on its own: under 80 rows (per-row GEMV),
@@ -5280,9 +5307,11 @@ fn slot_groups_match_the_whole_window_bit_for_bit() {
         .unwrap()
         .astype(DType::BFloat16)
         .unwrap();
+        let kernel = math::ExpertKernel::for_window(rows, E);
         let selected = MxArray::from_uint32(&ids, &[rows as i64]).unwrap();
         let (out, inverse) =
-            decoder::Decoder::single_slot_group_rows(&x, &selected, &banks, E, top).unwrap();
+            decoder::Decoder::single_slot_group_rows(&x, &selected, &banks, E, kernel, top)
+                .unwrap();
         let reference = math::combine_expert_rows(&out, &scores, inverse.as_ref(), top)
             .unwrap()
             .to_uint16_native()
@@ -5343,16 +5372,23 @@ fn slot_groups_match_the_whole_window_bit_for_bit() {
             let (out, inverse, groups) = if order.len() <= capacity {
                 let (group_banks, local, count) = slots.lease(&ids).unwrap().unwrap();
                 let local = MxArray::from_uint32(&local, &[rows as i64]).unwrap();
-                let (out, inverse) =
-                    decoder::Decoder::single_slot_group_rows(&x, &local, &group_banks, count, top)
-                        .unwrap();
+                let (out, inverse) = decoder::Decoder::single_slot_group_rows(
+                    &x,
+                    &local,
+                    &group_banks,
+                    count,
+                    kernel,
+                    top,
+                )
+                .unwrap();
                 (out, inverse, 1)
             } else {
                 let groups = route_plan::assignment_groups(&ids, &order, E, capacity).unwrap();
-                let (out, inverse) =
-                    decoder::Decoder::grouped_expert_rows(&x, &ids, &groups, top, &mut slots)
-                        .unwrap()
-                        .unwrap();
+                let (out, inverse) = decoder::Decoder::grouped_expert_rows(
+                    &x, &ids, &groups, kernel, top, &mut slots,
+                )
+                .unwrap()
+                .unwrap();
                 (out, Some(inverse), groups.len())
             };
             assert_eq!(slots.leases, groups);
@@ -5367,7 +5403,7 @@ fn slot_groups_match_the_whole_window_bit_for_bit() {
                 .count();
             let first = actual.iter().zip(&reference).position(|(a, b)| a != b);
             let line = format!(
-                "tokens {tokens} rows {rows} distinct {} capacity {capacity} groups {groups} remainder {}: {differing} of {} bf16 values differ, first {first:?}",
+                "tokens {tokens} rows {rows} distinct {} capacity {capacity} groups {groups} remainder {} {kernel:?}: {differing} of {} bf16 values differ, first {first:?}",
                 order.len(),
                 remainder(capacity),
                 reference.len()

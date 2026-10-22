@@ -234,7 +234,7 @@ static mlx_array *expert_tiles_impl(mlx_array *ids, int experts,
     auto selected = *reinterpret_cast<array *>(ids);
     int rows = selected.size();
     if (selected.ndim() != 1 || selected.dtype() != mlx::core::uint32 ||
-        rows < 256 || rows > 65536)
+        rows < 1 || rows > 65536)
       return nullptr;
     int count = (rows + tile_rows - 1) / tile_rows + experts;
     static auto kernel = mlx::core::fast::metal_kernel("qwen4_expert_tiles",
@@ -317,8 +317,8 @@ mlx_array *mlx_qwen4_expert_prefill(mlx_array *x, mlx_array *ids,
         b.dtype() != mlx::core::float16)
       return nullptr;
     int rows = input.shape(0), k = input.shape(2), n = w.shape(0) / experts;
-    if (rows < 256 || rows > 65536 || rows / experts < 4 ||
-        selected.size() != rows || k <= 0 || k % 64 || n <= 0 || n % 64 ||
+    if (rows < 1 || rows > 65536 || selected.size() != rows || k <= 0 ||
+        k % 64 || n <= 0 || n % 64 ||
         group != 32 || tiles.shape(0) != (rows + 63) / 64 + experts)
       return nullptr;
     if (affine) {
@@ -386,7 +386,7 @@ extern "C" mlx_array *mlx_qwen4_prefill_indirect(
     if (x.ndim() != 2 || x.dtype() != mlx::core::bfloat16 || x.shape(0) < 1 ||
         ids.ndim() != 1 || ids.dtype() != mlx::core::uint32 ||
         rows.shape() != ids.shape() || rows.dtype() != mlx::core::uint32 ||
-        ids.size() < 256 || ids.size() > 65536 || ids.size() / experts < 4 ||
+        ids.size() < 1 || ids.size() > 65536 ||
         std::any_of(
             w.begin(), w.end(), [](const array &a) { return a.ndim() != 2; }))
       return nullptr;

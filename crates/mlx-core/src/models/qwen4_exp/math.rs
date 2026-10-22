@@ -182,6 +182,33 @@ pub(super) fn prefill_indirect(
     }
 }
 
+/// The expert kernel a prompt window runs, chosen from the window's
+/// assignment count and the model's expert count alone. Every slot group of
+/// the window runs the window's kernel, whatever the slot bank's row count
+/// or the group's size, so a window split over slot banks gives the bits of
+/// the whole-bank run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExpertKernel {
+    /// Sorted assignments through the fused NAX expert tiles.
+    Tiles,
+    /// Sorted assignments through MLX's gather matrix-vector kernel.
+    Gather,
+    /// Router-order assignments through the per-row GEMV.
+    Rows,
+}
+
+impl ExpertKernel {
+    pub(super) fn for_window(rows: usize, experts: usize) -> Self {
+        if experts > 0 && (256..=65536).contains(&rows) && rows / experts >= 4 {
+            Self::Tiles
+        } else if rows > 80 {
+            Self::Gather
+        } else {
+            Self::Rows
+        }
+    }
+}
+
 pub(super) fn expert_tiles(ids: &MxArray, experts: usize) -> Result<Option<MxArray>> {
     if !crate::engine::persistence::compiled_forward_backend_available() {
         return Ok(None);
