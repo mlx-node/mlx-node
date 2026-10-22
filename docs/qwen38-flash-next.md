@@ -69,7 +69,10 @@ the experts with its usual budget; `residencyInfo()` reports the budget
 and the reason for a slot choice (`fallbackReason`). During a pass the driver
 wires every bank, so a mapped turn cannot keep the slot path's free/file
 reserve; it stops growing anonymous memory only below 2 GiB of free plus file
-cache. A mapped turn that reads more than twice the pack from SSD, or runs
+cache. A mapped turn that reads more than twice the pack from SSD with a
+sample of the pack then finding it partly evicted (the read count is the
+whole process's, so another model loading beside the turn adds to it; a
+resident sample starts the count over), or runs
 eight consecutive passes over ten times the running median of their kind
 (a row count with no median yet — the decode steps of a process's first turn
 — is judged against the fastest pass of 256 rows or more seen so far, and

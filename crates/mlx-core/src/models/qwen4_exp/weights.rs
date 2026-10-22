@@ -3212,6 +3212,17 @@ mod mapped_tests {
         assert!(store.apply_held_trip().unwrap().is_none());
         assert!(store.plan.mapped);
         let mapped = store.plan.mapped_bytes;
+        // Another reader in the process pushes the count past twice the
+        // pack while the pack stays resident: no trip, the count restarts.
+        let base = store.tripwire_mut().turn_start_reads();
+        assert!(
+            store
+                .observe_pass_at(1, Duration::from_millis(25), base + 3 * mapped)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.plan.mapped && store.tripwire_mut().tripped().is_none());
+        assert_eq!(store.tripwire_mut().turn_start_reads(), base + 3 * mapped);
         store.trip(super::super::tripwire::Fallback::SsdReads {
             read: 3 * mapped,
             mapped,
@@ -3712,6 +3723,9 @@ mod mapped_tests {
     /// host, slots built on demand, the reason published) and the same
     /// request's next pass maps its expert ids through slots.
     ///
+    /// The pack stays cold behind a held stream, so the SSD count is
+    /// corroborated by the pack's own sample.
+    ///
     /// MUTATION: `observe_pass_at` logs the trip and returns
     /// `Ok(None)` without `apply_fallback`; the request finishes mapped.
     #[test]
@@ -3719,19 +3733,9 @@ mod mapped_tests {
         let temp = Temp::new();
         let gguf = temp.0.join("experts.gguf");
         write_fixture(&gguf);
-        let root = temp.0.join("cache");
-        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
-        store
-            .prepare_mapped_pack_at(&temp.0.join("mapped"))
-            .unwrap();
-        store
-            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
-                plan.budget = 1 << 30;
-                plan.mapped = true;
-                Ok(())
-            })
-            .unwrap();
-        assert!(store.plan.mapped);
+        let mut store = mapped_store(&temp, &gguf, "mapped");
+        let gate = Arc::new(Gate::default());
+        store.pool_with(Arc::clone(&gate));
         let mapped = store.plan.mapped_bytes;
         assert!(store.begin_turn().unwrap().is_none());
         let base = store.tripwire_mut().turn_start_reads();
@@ -3802,18 +3806,18 @@ mod mapped_tests {
         let mut wire = Tripwire::default();
         wire.begin_turn(memory::process_disk_reads());
         for window in [12_000u64, 900, 850, 800, 820, 810] {
-            wire.observe(1024, Duration::from_millis(window), 0, mapped);
+            wire.observe(1024, Duration::from_millis(window), 0, mapped, || false);
         }
         for _ in 0..64 {
-            wire.observe(1, Duration::from_millis(25), 0, mapped);
+            wire.observe(1, Duration::from_millis(25), 0, mapped, || false);
         }
         let mut costs: Vec<Duration> = (0..4096)
             .map(|_| {
                 let started = std::time::Instant::now();
                 let reads = memory::process_disk_reads();
                 let elapsed = started.elapsed();
-                assert!(wire.observe(1, elapsed, reads, mapped).is_none());
-                wire.observe(4, Duration::from_millis(30), reads, mapped);
+                assert!(wire.observe(1, elapsed, reads, mapped, || false).is_none());
+                wire.observe(4, Duration::from_millis(30), reads, mapped, || false);
                 started.elapsed()
             })
             .collect();

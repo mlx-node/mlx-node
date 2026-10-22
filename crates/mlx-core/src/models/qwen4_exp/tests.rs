@@ -2373,10 +2373,10 @@ fn scheduled_turns_share_one_tripwire_window_until_the_last_one_closes() {
         let wire = inner.decoder.weights.tripwire_mut();
         wire.begin_turn(SENTINEL);
         for _ in 0..8 {
-            wire.observe(1, Duration::from_millis(25), SENTINEL, 0);
+            wire.observe(1, Duration::from_millis(25), SENTINEL, 0, || false);
         }
         for _ in 0..3 {
-            wire.observe(1, Duration::from_millis(2_400), SENTINEL, 0);
+            wire.observe(1, Duration::from_millis(2_400), SENTINEL, 0, || false);
         }
         assert_eq!((wire.turn_start_reads(), wire.slow_streak()), (SENTINEL, 3));
     };
@@ -8064,10 +8064,18 @@ fn real_model_verify_rows_match_ar_steps() {
     let reads = memory::process_disk_reads();
     wire.begin_turn(reads);
     for _ in 0..8 {
-        wire.observe(3, std::time::Duration::from_micros(1), reads, mapped);
+        wire.observe(
+            3,
+            std::time::Duration::from_micros(1),
+            reads,
+            mapped,
+            || false,
+        );
     }
     for _ in 0..7 {
-        wire.observe(3, std::time::Duration::from_secs(1), reads, mapped);
+        wire.observe(3, std::time::Duration::from_secs(1), reads, mapped, || {
+            false
+        });
     }
     assert!(wire.tripped().is_none() && wire.slow_streak() == 7);
     let readbacks = inner.decoder.route_readbacks;

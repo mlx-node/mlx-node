@@ -317,7 +317,7 @@ fn run(shared: &Shared, issue: &dyn Issue) {
     }
 }
 
-fn sampled_resident(map: &Mmap) -> bool {
+pub(super) fn sampled_resident(map: &Mmap) -> bool {
     let page = page_size();
     let pages = map.len().div_ceil(page);
     let mut vec = [0u8; PROBE_PAGES];

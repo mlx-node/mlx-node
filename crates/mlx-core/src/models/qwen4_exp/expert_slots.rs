@@ -24,6 +24,15 @@ pub(super) struct MappedExperts {
     experts: usize,
 }
 
+/// Whether every probe of every mapped bank file is in the page cache: the
+/// pack's own evidence behind the process-wide SSD count.
+fn pack_resident(mapped: &HashMap<usize, MappedExperts>) -> bool {
+    mapped
+        .values()
+        .flat_map(|experts| experts.maps.iter())
+        .all(|map| super::super::prefetch::sampled_resident(map))
+}
+
 impl MappedExperts {
     fn open(
         files: [&super::super::mapped_pack::LayerFile; 3],
@@ -387,9 +396,12 @@ impl Store {
         if !self.plan.mapped {
             return Ok(None);
         }
+        let mapped = &self.mapped_experts;
         let Some(why) = self
             .tripwire
-            .observe(rows, elapsed, reads, self.plan.mapped_bytes)
+            .observe(rows, elapsed, reads, self.plan.mapped_bytes, || {
+                pack_resident(mapped)
+            })
             .cloned()
         else {
             return Ok(None);
@@ -413,9 +425,11 @@ impl Store {
         if !self.plan.mapped {
             return self.tripwire.tripped().is_some();
         }
+        let mapped = &self.mapped_experts;
         if let Some(why) = self.tripwire.observe_ssd(
             super::super::memory::process_disk_reads(),
             self.plan.mapped_bytes,
+            || pack_resident(mapped),
         ) {
             tracing::warn!(
                 "qwen4 residency: mapped turn thrashes ({why}); the group goes on over slots after this sweep"

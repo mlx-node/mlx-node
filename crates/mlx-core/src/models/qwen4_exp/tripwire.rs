@@ -8,7 +8,10 @@ use std::time::Duration;
 
 /// SSD bytes one turn may read before the pack is judged not to fit, as a
 /// multiple of the mapped bytes: a cold turn reads the pack once (73-74 GiB
-/// measured), a thrashing one 1.06-2.3 TB.
+/// measured), a thrashing one 1.06-2.3 TB. The counter is the whole
+/// process's, so another model loading beside the turn adds to it: the
+/// rule trips only when a sample of the pack then finds it partly evicted;
+/// a resident pack starts the count over from there.
 const SSD_FACTOR: u64 = 2;
 /// A pass this many times slower than the running median of passes with
 /// the same row count is a thrash symptom (2.4 s against 25-40 ms measured);
@@ -233,23 +236,44 @@ impl Tripwire {
         self.tripped.take()
     }
 
+    /// Whether the window has read more than `SSD_FACTOR` packs with the
+    /// pack not resident behind them; `pack_resident` samples the pack only
+    /// once the bytes are over.
+    fn ssd_rule(
+        &mut self,
+        reads_now: u64,
+        mapped_bytes: u64,
+        pack_resident: impl FnOnce() -> bool,
+    ) -> bool {
+        let read = reads_now.saturating_sub(self.turn_start_reads);
+        if mapped_bytes == 0 || read <= mapped_bytes.saturating_mul(SSD_FACTOR) {
+            return false;
+        }
+        if pack_resident() {
+            self.turn_start_reads = reads_now;
+            return false;
+        }
+        self.tripped = Some(Fallback::SsdReads {
+            read,
+            mapped: mapped_bytes,
+        });
+        true
+    }
+
     /// The SSD rule alone, between two layer sweeps of a prefill group:
     /// `reads_now` is the process's disk read counter now. Returns the
     /// symptom that tripped, once; the pass-level rules see the group's
     /// windows after it.
-    pub fn observe_ssd(&mut self, reads_now: u64, mapped_bytes: u64) -> Option<&Fallback> {
-        if self.tripped.is_some() {
+    pub fn observe_ssd(
+        &mut self,
+        reads_now: u64,
+        mapped_bytes: u64,
+        pack_resident: impl FnOnce() -> bool,
+    ) -> Option<&Fallback> {
+        if self.tripped.is_some() || !self.ssd_rule(reads_now, mapped_bytes, pack_resident) {
             return None;
         }
-        let read = reads_now.saturating_sub(self.turn_start_reads);
-        if mapped_bytes > 0 && read > mapped_bytes.saturating_mul(SSD_FACTOR) {
-            self.tripped = Some(Fallback::SsdReads {
-                read,
-                mapped: mapped_bytes,
-            });
-            return self.tripped.as_ref();
-        }
-        None
+        self.tripped.as_ref()
     }
 
     /// One main-network pass of `rows` rows took `elapsed`; `reads_now` is
@@ -261,18 +285,14 @@ impl Tripwire {
         elapsed: Duration,
         reads_now: u64,
         mapped_bytes: u64,
+        pack_resident: impl FnOnce() -> bool,
     ) -> Option<&Fallback> {
         if self.tripped.is_some() {
             return None;
         }
         let pass_read = reads_now.saturating_sub(self.last_reads);
         self.last_reads = reads_now;
-        let read = reads_now.saturating_sub(self.turn_start_reads);
-        if mapped_bytes > 0 && read > mapped_bytes.saturating_mul(SSD_FACTOR) {
-            self.tripped = Some(Fallback::SsdReads {
-                read,
-                mapped: mapped_bytes,
-            });
+        if self.ssd_rule(reads_now, mapped_bytes, pack_resident) {
             return self.tripped.as_ref();
         }
         if let Some((median, own)) = self.reference(rows) {
@@ -311,24 +331,29 @@ mod tests {
 
     const MS: Duration = Duration::from_millis(1);
 
+    /// The pack sample of a turn whose pack is partly evicted.
+    fn cold() -> bool {
+        false
+    }
+
     #[test]
     fn a_streak_of_slow_steps_trips_but_one_rewire_does_not() {
         let mut wire = Tripwire::default();
         wire.begin_turn(1_000);
         for _ in 0..MIN_SAMPLES {
-            assert!(wire.observe(1, 25 * MS, 1_000, 1 << 30).is_none());
+            assert!(wire.observe(1, 25 * MS, 1_000, 1 << 30, cold).is_none());
         }
         // The first decode step after prefill re-wires the banks (~1.4 s):
         // one slow step, which a fast step forgets.
-        assert!(wire.observe(1, 1_400 * MS, 1_000, 1 << 30).is_none());
+        assert!(wire.observe(1, 1_400 * MS, 1_000, 1 << 30, cold).is_none());
         for _ in 0..SLOW_STREAK - 2 {
-            assert!(wire.observe(1, 300 * MS, 1_000, 1 << 30).is_none());
+            assert!(wire.observe(1, 300 * MS, 1_000, 1 << 30, cold).is_none());
         }
-        assert!(wire.observe(1, 30 * MS, 1_000, 1 << 30).is_none());
+        assert!(wire.observe(1, 30 * MS, 1_000, 1 << 30, cold).is_none());
         for _ in 0..SLOW_STREAK - 1 {
-            assert!(wire.observe(1, 2_400 * MS, 1_000, 1 << 30).is_none());
+            assert!(wire.observe(1, 2_400 * MS, 1_000, 1 << 30, cold).is_none());
         }
-        let tripped = wire.observe(1, 2_400 * MS, 1_000, 1 << 30).cloned();
+        let tripped = wire.observe(1, 2_400 * MS, 1_000, 1 << 30, cold).cloned();
         assert_eq!(
             tripped,
             Some(Fallback::SlowSteps {
@@ -339,7 +364,7 @@ mod tests {
             })
         );
         assert!(
-            wire.observe(1, 2_400 * MS, 1_000, 1 << 30).is_none(),
+            wire.observe(1, 2_400 * MS, 1_000, 1 << 30, cold).is_none(),
             "reported once"
         );
         assert_eq!(wire.take(), tripped);
@@ -355,16 +380,16 @@ mod tests {
         let mut wire = Tripwire::default();
         wire.begin_turn(0);
         for _ in 0..MIN_SAMPLES {
-            assert!(wire.observe(1, 25 * MS, 0, mapped).is_none());
+            assert!(wire.observe(1, 25 * MS, 0, mapped, cold).is_none());
         }
         let mut reads = 0u64;
         for turn in 0..2 * SLOW_STREAK {
             wire.begin_turn(reads);
             reads += mapped;
             let rows = 1000 + 37 * turn as usize;
-            assert!(wire.observe(rows, 900 * MS, reads, mapped).is_none());
+            assert!(wire.observe(rows, 900 * MS, reads, mapped, cold).is_none());
             assert!(
-                wire.observe(1, 1_400 * MS, reads, mapped).is_none(),
+                wire.observe(1, 1_400 * MS, reads, mapped, cold).is_none(),
                 "turn {turn}: the re-wire step is not a streak"
             );
         }
@@ -372,19 +397,19 @@ mod tests {
         // Two slow stretches short of a streak, one per turn, do not add up.
         for _ in 0..2 {
             wire.begin_turn(reads);
-            assert!(wire.observe(1, 1_400 * MS, reads, mapped).is_none());
+            assert!(wire.observe(1, 1_400 * MS, reads, mapped, cold).is_none());
             for _ in 0..SLOW_STREAK - 2 {
-                assert!(wire.observe(1, 300 * MS, reads, mapped).is_none());
+                assert!(wire.observe(1, 300 * MS, reads, mapped, cold).is_none());
             }
         }
         assert!(wire.tripped().is_none());
         // Within one turn the streak still trips.
         wire.begin_turn(reads);
         for _ in 0..SLOW_STREAK - 1 {
-            assert!(wire.observe(1, 2_400 * MS, reads, mapped).is_none());
+            assert!(wire.observe(1, 2_400 * MS, reads, mapped, cold).is_none());
         }
         assert_eq!(
-            wire.observe(1, 2_400 * MS, reads, mapped)
+            wire.observe(1, 2_400 * MS, reads, mapped, cold)
                 .map(Fallback::slow_steps),
             Some(Some(SLOW_STREAK))
         );
@@ -394,16 +419,16 @@ mod tests {
     fn row_counts_keep_their_own_medians() {
         let mut wire = Tripwire::default();
         for _ in 0..MIN_SAMPLES {
-            wire.observe(1, 25 * MS, 0, 1 << 30);
+            wire.observe(1, 25 * MS, 0, 1 << 30, cold);
         }
         // Prefill windows of 1024 rows take 800 ms: not slow decode steps.
         for _ in 0..SLOW_STREAK + 2 {
-            assert!(wire.observe(1024, 800 * MS, 0, 1 << 30).is_none());
+            assert!(wire.observe(1024, 800 * MS, 0, 1 << 30, cold).is_none());
         }
         // Verification passes of 4 rows at 50 ms: healthy against their own
         // (absent) history and against the 1024-row windows.
         for _ in 0..MIN_SAMPLES - 1 {
-            assert!(wire.observe(4, 50 * MS, 0, 1 << 30).is_none());
+            assert!(wire.observe(4, 50 * MS, 0, 1 << 30, cold).is_none());
         }
         assert!(wire.tripped().is_none());
     }
@@ -422,22 +447,25 @@ mod tests {
         let mut wire = Tripwire::default();
         wire.begin_turn(0);
         for window in [12_000, 900, 850, 800, 820, 810] {
-            assert!(wire.observe(1024, window * MS, mapped, mapped).is_none());
+            assert!(
+                wire.observe(1024, window * MS, mapped, mapped, cold)
+                    .is_none()
+            );
         }
         // The first decode step re-wires the banks: one slow pass.
-        assert!(wire.observe(1, 1_400 * MS, mapped, mapped).is_none());
+        assert!(wire.observe(1, 1_400 * MS, mapped, mapped, cold).is_none());
         for _ in 0..3 {
-            assert!(wire.observe(1, 25 * MS, mapped, mapped).is_none());
+            assert!(wire.observe(1, 25 * MS, mapped, mapped, cold).is_none());
         }
         assert_eq!(wire.slow_streak(), 0);
         let mut reads = mapped;
         for _ in 0..SLOW_STREAK - 1 {
             reads += 1 << 30;
-            assert!(wire.observe(1, 2_400 * MS, reads, mapped).is_none());
+            assert!(wire.observe(1, 2_400 * MS, reads, mapped, cold).is_none());
         }
         reads += 1 << 30;
         assert_eq!(
-            wire.observe(1, 2_400 * MS, reads, mapped).cloned(),
+            wire.observe(1, 2_400 * MS, reads, mapped, cold).cloned(),
             Some(Fallback::SlowSteps {
                 rows: 1,
                 step: 2_400 * MS,
@@ -450,11 +478,19 @@ mod tests {
         let mut healthy = Tripwire::default();
         healthy.begin_turn(0);
         for window in [12_000, 900, 850, 800, 820, 810] {
-            assert!(healthy.observe(1024, window * MS, mapped, mapped).is_none());
+            assert!(
+                healthy
+                    .observe(1024, window * MS, mapped, mapped, cold)
+                    .is_none()
+            );
         }
-        assert!(healthy.observe(1, 1_400 * MS, mapped, mapped).is_none());
+        assert!(
+            healthy
+                .observe(1, 1_400 * MS, mapped, mapped, cold)
+                .is_none()
+        );
         for _ in 0..64 {
-            assert!(healthy.observe(1, 30 * MS, mapped, mapped).is_none());
+            assert!(healthy.observe(1, 30 * MS, mapped, mapped, cold).is_none());
         }
         assert_eq!(healthy.reference(1), Some((30 * MS, true)));
         assert!(healthy.tripped().is_none());
@@ -476,32 +512,36 @@ mod tests {
         let mapped = 73u64 << 30;
         let mut wire = Tripwire::default();
         wire.begin_turn(mapped);
-        assert!(wire.observe(256, 200 * MS, mapped, mapped).is_none());
+        assert!(wire.observe(256, 200 * MS, mapped, mapped, cold).is_none());
         assert_eq!(wire.reference(4), Some((200 * MS, false)));
         for pass in 1..=MIN_SAMPLES {
             assert!(
-                wire.observe(4, 250 * MS, mapped, mapped).is_none(),
+                wire.observe(4, 250 * MS, mapped, mapped, cold).is_none(),
                 "pass {pass}"
             );
             assert_eq!(wire.slow_streak(), 0, "pass {pass}");
         }
         assert_eq!(wire.reference(4), Some((250 * MS, true)));
         for _ in 0..2 * SLOW_STREAK {
-            assert!(wire.observe(4, 250 * MS, mapped, mapped).is_none());
+            assert!(wire.observe(4, 250 * MS, mapped, mapped, cold).is_none());
         }
         assert!(wire.tripped().is_none());
 
         let mut thrash = Tripwire::default();
         thrash.begin_turn(mapped);
-        assert!(thrash.observe(256, 200 * MS, mapped, mapped).is_none());
+        assert!(
+            thrash
+                .observe(256, 200 * MS, mapped, mapped, cold)
+                .is_none()
+        );
         let mut reads = mapped;
         for _ in 0..SLOW_STREAK - 1 {
             reads += SEED_PASS_READ;
-            assert!(thrash.observe(4, 250 * MS, reads, mapped).is_none());
+            assert!(thrash.observe(4, 250 * MS, reads, mapped, cold).is_none());
         }
         reads += SEED_PASS_READ;
         assert_eq!(
-            thrash.observe(4, 250 * MS, reads, mapped).cloned(),
+            thrash.observe(4, 250 * MS, reads, mapped, cold).cloned(),
             Some(Fallback::SlowSteps {
                 rows: 4,
                 step: 250 * MS,
@@ -512,15 +552,19 @@ mod tests {
 
         let mut broken = Tripwire::default();
         broken.begin_turn(mapped);
-        assert!(broken.observe(256, 200 * MS, mapped, mapped).is_none());
+        assert!(
+            broken
+                .observe(256, 200 * MS, mapped, mapped, cold)
+                .is_none()
+        );
         let mut reads = mapped;
         for _ in 0..SLOW_STREAK - 1 {
             reads += SEED_PASS_READ;
-            assert!(broken.observe(4, 250 * MS, reads, mapped).is_none());
+            assert!(broken.observe(4, 250 * MS, reads, mapped, cold).is_none());
         }
         assert_eq!(broken.slow_streak(), SLOW_STREAK - 1);
         reads += SEED_PASS_READ - 1;
-        assert!(broken.observe(4, 250 * MS, reads, mapped).is_none());
+        assert!(broken.observe(4, 250 * MS, reads, mapped, cold).is_none());
         assert_eq!(broken.slow_streak(), 0);
     }
 
@@ -531,14 +575,14 @@ mod tests {
     fn a_short_prompt_seeds_no_decode_reference() {
         let mut wire = Tripwire::default();
         wire.begin_turn(0);
-        assert!(wire.observe(40, 60 * MS, 0, 1 << 30).is_none());
+        assert!(wire.observe(40, 60 * MS, 0, 1 << 30, cold).is_none());
         assert_eq!(wire.reference(1), None);
         for _ in 0..2 * SLOW_STREAK {
-            assert!(wire.observe(1, 100 * MS, 0, 1 << 30).is_none());
+            assert!(wire.observe(1, 100 * MS, 0, 1 << 30, cold).is_none());
         }
         assert!(wire.tripped().is_none());
         // A 512-row fallback window is judged against a 1024-row one.
-        assert!(wire.observe(1024, 800 * MS, 0, 1 << 30).is_none());
+        assert!(wire.observe(1024, 800 * MS, 0, 1 << 30, cold).is_none());
         assert_eq!(wire.reference(512), Some((800 * MS, false)));
         assert_eq!(wire.reference(1024), None, "no larger pass exists");
         // A failed switch re-arms the trip for the next turn.
@@ -557,15 +601,15 @@ mod tests {
         wire.begin_turn(500 << 30);
         // A cold turn reads the pack once.
         assert!(
-            wire.observe(1024, 800 * MS, (500 << 30) + mapped, mapped)
+            wire.observe(1024, 800 * MS, (500 << 30) + mapped, mapped, cold)
                 .is_none()
         );
         assert!(
-            wire.observe(1024, 800 * MS, (500 << 30) + 2 * mapped, mapped)
+            wire.observe(1024, 800 * MS, (500 << 30) + 2 * mapped, mapped, cold)
                 .is_none()
         );
         let tripped = wire
-            .observe(1024, 800 * MS, (500 << 30) + 2 * mapped + 1, mapped)
+            .observe(1024, 800 * MS, (500 << 30) + 2 * mapped + 1, mapped, cold)
             .cloned();
         assert_eq!(
             tripped,
@@ -579,12 +623,70 @@ mod tests {
         fresh.begin_turn(1_000 << 30);
         assert!(
             fresh
-                .observe(1, 25 * MS, (1_000 << 30) + mapped, mapped)
+                .observe(1, 25 * MS, (1_000 << 30) + mapped, mapped, cold)
                 .is_none()
         );
         assert!(
-            fresh.observe(1, 25 * MS, 1_000 << 30, 0).is_none(),
+            fresh.observe(1, 25 * MS, 1_000 << 30, 0, cold).is_none(),
             "no mapped bytes, no SSD rule"
+        );
+    }
+
+    /// The read counter is the process's: another model loading beside a
+    /// turn reads past twice the pack while this pack stays resident. The
+    /// pack is sampled only once the bytes are over, a resident sample
+    /// starts the count over, and the same bytes over a partly evicted pack
+    /// trip, between two passes and between two sweeps alike.
+    ///
+    /// MUTATION: `ssd_rule` ignores `pack_resident`; the unrelated reads
+    /// send a resident model to slots.
+    #[test]
+    fn unrelated_reads_beside_a_resident_pack_never_trip() {
+        let mapped = 73u64 << 30;
+        let samples = std::cell::Cell::new(0u32);
+        let resident = || {
+            samples.set(samples.get() + 1);
+            true
+        };
+        let mut wire = Tripwire::default();
+        wire.begin_turn(0);
+        assert!(
+            wire.observe(1, 25 * MS, 2 * mapped, mapped, resident)
+                .is_none()
+        );
+        assert_eq!(samples.get(), 0, "no sample under the bytes");
+        assert!(
+            wire.observe(1, 25 * MS, 3 * mapped, mapped, resident)
+                .is_none()
+        );
+        assert_eq!(samples.get(), 1);
+        assert_eq!(wire.turn_start_reads(), 3 * mapped, "the count starts over");
+        assert!(
+            wire.observe(1, 25 * MS, 5 * mapped, mapped, resident)
+                .is_none()
+        );
+        assert_eq!(samples.get(), 1);
+        assert!(wire.observe_ssd(5 * mapped + 1, mapped, resident).is_none());
+        assert_eq!(samples.get(), 2);
+        assert!(wire.tripped().is_none());
+        // The host evicts the pack and the turn refaults it.
+        assert_eq!(
+            wire.observe(1, 25 * MS, 7 * mapped + 2, mapped, cold)
+                .cloned(),
+            Some(Fallback::SsdReads {
+                read: 2 * mapped + 1,
+                mapped,
+            })
+        );
+        let mut sweep = Tripwire::default();
+        sweep.begin_turn(0);
+        assert!(sweep.observe_ssd(3 * mapped, mapped, resident).is_none());
+        assert_eq!(
+            sweep.observe_ssd(5 * mapped + 1, mapped, cold).cloned(),
+            Some(Fallback::SsdReads {
+                read: 2 * mapped + 1,
+                mapped,
+            })
         );
     }
 
