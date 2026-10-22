@@ -321,7 +321,7 @@ export class LlamaServer implements Runner {
     if (!final) throw new Error('No llama final');
     const timings = final.timings as Record<string, number>;
     const settings = final.generation_settings as Record<string, unknown>;
-    const cached = timings.cache_n ?? 0;
+    const cached = timings.cache_n;
     const result: Result = {
       event: 'result',
       runtime: 'llama.cpp',
@@ -359,7 +359,7 @@ export class LlamaServer implements Runner {
     );
     if (result.promptTokens !== item.tokenIds.length || cached !== 0) {
       throw new Error(
-        `llama.cpp prompt/cache accounting: expected ${item.tokenIds.length}/0, received ${result.promptTokens}/${cached}`,
+        `llama.cpp ${item.name} run ${run}: tokens_evaluated ${result.promptTokens}, timings.cache_n ${cached}; expected ${item.tokenIds.length} and 0`,
       );
     }
     return result;
