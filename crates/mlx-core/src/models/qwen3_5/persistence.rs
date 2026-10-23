@@ -26,11 +26,14 @@ use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::utils::safetensors::load_safetensors_lazy;
 
+use crate::engine::checkpoint_source::CheckpointSource;
 use crate::engine::persistence::{
     KeyRule, RenameSpec, WRAPPER_STRIP_PREFIXES, apply_rename_spec, dequant_fp8_weights,
-    get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
+    get_config_bool, get_config_f64, get_config_i32, load_checkpoint,
     prewarm_checkpoint_pages_with, strip_qwen35_vision_weight_prefix,
 };
+use crate::models::clef::head::{HeadConfig, JointHead};
+use crate::utils::gguf_import::GgufPreload;
 
 use super::config::Qwen3_5Config;
 use super::decoder_layer::AttentionType;
@@ -2526,39 +2529,86 @@ pub async fn load_with_thread(
     draft_model_path: Option<String>,
     kv_format: Option<crate::transformer::KvFormat>,
 ) -> Result<Qwen3_5Model> {
-    load_with_thread_impl(model_path, draft_model_path, kv_format, false).await
+    load_with_source(
+        &CheckpointSource::Dir(PathBuf::from(model_path)),
+        draft_model_path,
+        kv_format,
+    )
+    .await
 }
 
-pub(crate) async fn load_clef_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
-    for name in [
-        "joint_head_config.json",
-        "joint_head.safetensors",
-        "tokenizer.json",
-    ] {
-        let asset = Path::new(model_path).join(name);
-        if !asset.is_file() {
+/// The caller releases `source`'s lease when this fails.
+pub(crate) async fn load_with_source(
+    source: &CheckpointSource,
+    draft_model_path: Option<String>,
+    kv_format: Option<crate::transformer::KvFormat>,
+) -> Result<Qwen3_5Model> {
+    load_with_thread_impl(source, draft_model_path, kv_format, false).await
+}
+
+/// The caller releases `source`'s lease when this fails.
+pub(crate) async fn load_clef_with_source(source: &CheckpointSource) -> Result<Qwen3_5Model> {
+    check_clef_assets(source)?;
+    load_with_thread_impl(source, None, Some(crate::transformer::KvFormat::Bf16), true).await
+}
+
+/// A GGUF carries the decision head itself; a directory must ship it as
+/// `joint_head.safetensors`.
+fn check_clef_assets(source: &CheckpointSource) -> Result<()> {
+    let required: &[&str] = match source {
+        CheckpointSource::Dir(_) => &[
+            "joint_head_config.json",
+            "joint_head.safetensors",
+            "tokenizer.json",
+        ],
+        CheckpointSource::Gguf(_) => &["tokenizer.json"],
+    };
+    for name in required {
+        if !source.asset_dir().join(name).is_file() {
             return Err(Error::from_reason(format!(
                 "Missing CLEF checkpoint asset: {name}"
             )));
         }
     }
-    load_with_thread_impl(
-        model_path,
-        None,
-        Some(crate::transformer::KvFormat::Bf16),
-        true,
-    )
-    .await
+    Ok(())
+}
+
+/// `gguf_head` is `Some` exactly when the weights came from a GGUF preload;
+/// its inner value is the head that preload split off the backbone.
+fn build_clef_head(
+    dir: &Path,
+    hidden_size: i64,
+    gguf_head: Option<Option<(HashMap<String, MxArray>, Value)>>,
+) -> Result<JointHead> {
+    match gguf_head {
+        None => JointHead::load(dir, hidden_size),
+        Some(None) => Err(Error::from_reason(
+            "CLEF GGUF carries no decision head (clef.decision.* tensors)",
+        )),
+        Some(Some((weights, config))) => {
+            let config: HeadConfig = serde_json::from_value(config).map_err(|e| {
+                Error::from_reason(format!("Invalid CLEF GGUF head configuration: {e}"))
+            })?;
+            JointHead::from_weights(config, weights, hidden_size)
+        }
+    }
 }
 
 async fn load_with_thread_impl(
-    model_path: &str,
+    source: &CheckpointSource,
     draft_model_path: Option<String>,
     kv_format: Option<crate::transformer::KvFormat>,
     clef: bool,
 ) -> Result<Qwen3_5Model> {
-    let model_assets_path = model_path.to_string();
+    let model_assets_path = source.asset_dir().to_string_lossy().into_owned();
     let model_path = model_assets_path.clone();
+    let preload_input = match source {
+        CheckpointSource::Dir(_) => None,
+        CheckpointSource::Gguf(checkpoint) => {
+            checkpoint.check_asset_config()?;
+            Some(checkpoint.preload_input(true))
+        }
+    };
 
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
         move || {
@@ -2655,7 +2705,22 @@ async fn load_with_thread_impl(
                 // of embedding it in the main model shards. When present, prefer
                 // the sidecar and drop embedded MTP tensors so key normalization
                 // cannot leave duplicate `mtp.*` entries racing during sanitize.
-                let mut raw_params = load_all_safetensors(path, true)?;
+                let mut preload = preload_input.as_ref().map(GgufPreload::load).transpose()?;
+                if let Some(preload) = preload.as_ref() {
+                    let stats = &preload.stats;
+                    info!(
+                        "GGUF preload: {} bytes in {:.2} s (read wait {:.2} s, page cache {}), \
+                         {} GPU-repacked and {} other tensors",
+                        stats.bytes,
+                        stats.preload_secs,
+                        stats.read_secs,
+                        if stats.nocache { "off" } else { "on" },
+                        stats.gpu_tensors,
+                        stats.cpu_tensors,
+                    );
+                }
+                let mut raw_params = load_checkpoint(path, true, preload.as_mut())?;
+                let gguf_clef_head = preload.map(|preload| preload.clef_head.filter(|_| clef));
 
                 // Second snapshot, against the same inodes the mmap pinned; paired
                 // with the after-fingerprint snapshot below it brackets the WHOLE
@@ -2915,9 +2980,10 @@ async fn load_with_thread_impl(
                     if inner.lm_head.is_none() {
                         return Err(Error::from_reason("CLEF requires lm_head.weight"));
                     }
-                    inner.clef_head = Some(crate::models::clef::head::JointHead::load(
+                    inner.clef_head = Some(build_clef_head(
                         path,
                         config.hidden_size as i64,
+                        gguf_clef_head,
                     )?);
                 }
 
@@ -3377,6 +3443,81 @@ pub fn create_random_qwen35_checkpoint<'env>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn clef_fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../__test__/fixtures/clef")
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mlx-qwen35-{tag}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn clef_head_built_from_preload() {
+        let fixture = clef_fixture();
+        let from_dir = JointHead::load(&fixture, 8).unwrap();
+        let weights = load_safetensors_lazy(fixture.join("joint_head.safetensors")).unwrap();
+        let config: Value = serde_json::from_str(
+            &fs::read_to_string(fixture.join("joint_head_config.json")).unwrap(),
+        )
+        .unwrap();
+
+        // An asset directory holds no head weights.
+        let assets = scratch_dir("clef-assets");
+        let built = build_clef_head(&assets, 8, Some(Some((weights.clone(), config.clone()))));
+        assert!(
+            built.is_ok(),
+            "head not built from the preload: {}",
+            built
+                .as_ref()
+                .err()
+                .map(|e| e.reason.as_str())
+                .unwrap_or_default()
+        );
+        assert_eq!(built.unwrap().nbytes(), from_dir.nbytes());
+
+        let no_head = build_clef_head(&assets, 8, Some(None));
+        assert!(
+            no_head
+                .as_ref()
+                .is_err_and(|e| e.reason.contains("no decision head")),
+            "a CLEF GGUF without a head must be refused"
+        );
+        let mut short = weights;
+        short.remove("residual_gate");
+        assert!(
+            build_clef_head(&assets, 8, Some(Some((short, config)))).is_err(),
+            "preload head weights were not validated"
+        );
+        fs::remove_dir_all(&assets).ok();
+    }
+
+    #[test]
+    fn clef_dir_still_requires_joint_head() {
+        let dir = scratch_dir("clef-dir");
+        for name in ["joint_head_config.json", "tokenizer.json"] {
+            fs::copy(clef_fixture().join(name), dir.join(name)).unwrap();
+        }
+        let source = CheckpointSource::Dir(dir.clone());
+        let missing = check_clef_assets(&source);
+        assert!(
+            missing
+                .as_ref()
+                .is_err_and(|e| e.reason.contains("joint_head.safetensors")),
+            "a CLEF directory without joint_head.safetensors was accepted"
+        );
+        fs::copy(
+            clef_fixture().join("joint_head.safetensors"),
+            dir.join("joint_head.safetensors"),
+        )
+        .unwrap();
+        assert!(check_clef_assets(&source).is_ok());
+        fs::remove_file(dir.join("tokenizer.json")).unwrap();
+        assert!(check_clef_assets(&source).is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn paged_config_reads_root_options_without_losing_absence() {

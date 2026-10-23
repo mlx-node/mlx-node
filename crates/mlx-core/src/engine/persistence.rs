@@ -172,7 +172,6 @@ pub(crate) fn load_all_safetensors(
 /// companion when `load_vision` — the order `load_all_safetensors` keeps. With
 /// `load_vision` false the companion stays in `preload` (Muse takes its draft
 /// from there).
-#[allow(dead_code)]
 pub(crate) fn load_checkpoint(
     dir: &Path,
     load_vision: bool,

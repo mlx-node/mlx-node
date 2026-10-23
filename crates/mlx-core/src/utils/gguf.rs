@@ -8291,18 +8291,6 @@ async fn prepare_qwen35_moe_native_gguf_inner(
     prepare_native_gguf_inner(&input_path, cache_root, NativeGgufFamily::Qwen35Moe, None).await
 }
 
-/// Prepare a Cloudflare CLEF (`general.architecture = clef`) GGUF for native
-/// decision-model loading. The staging conversion splits the embedded
-/// joint-schema head into `joint_head.safetensors` +
-/// `joint_head_config.json` beside the backbone `model.safetensors`, and the
-/// tokenizer is reconstructed from `tokenizer.ggml.*` metadata, so the cached
-/// directory satisfies every asset `load_clef_with_thread` requires.
-pub(crate) async fn prepare_clef_native_gguf(input_path: &Path) -> Result<PathBuf> {
-    let cache_root = native_gguf_cache_root()?;
-    let (input_path, _) = native_gguf_preflight(input_path, NativeGgufFamily::Clef)?;
-    prepare_native_gguf_inner(&input_path, &cache_root, NativeGgufFamily::Clef, None).await
-}
-
 /// Family checks that run before any cache work: the main GGUF's architecture,
 /// required sibling assets, and the companion pick (Gemma4 media projector,
 /// Muse-Glimmer DFlash draft). Returns the canonical main path.
@@ -9220,32 +9208,35 @@ pub(crate) async fn prepare_gguf_assets_in(
 
     // An existing output_dir a loaded model still leases is kept and this load
     // runs from staging (registry lease only).
-    let output_guard = output_dir
-        .exists()
-        .then(|| native_gguf_output_delete_guard(cache_root, &output_dir))
-        .flatten();
-    let prepared_dir = if output_dir.exists() && output_guard.is_none() {
-        staging_dir.clone()
-    } else {
-        if output_dir.exists() {
-            fs::remove_dir_all(&output_dir).map_err(|error| {
+    let prepared_dir = {
+        let output_guard = output_dir
+            .exists()
+            .then(|| native_gguf_output_delete_guard(cache_root, &output_dir))
+            .flatten();
+        let prepared_dir = if output_dir.exists() && output_guard.is_none() {
+            staging_dir.clone()
+        } else {
+            if output_dir.exists() {
+                fs::remove_dir_all(&output_dir).map_err(|error| {
+                    fs::remove_dir_all(&staging_dir).ok();
+                    Error::from_reason(format!(
+                        "Failed to remove incomplete native GGUF cache '{}': {error}",
+                        output_dir.display()
+                    ))
+                })?;
+            }
+            fs::rename(&staging_dir, &output_dir).map_err(|error| {
                 fs::remove_dir_all(&staging_dir).ok();
                 Error::from_reason(format!(
-                    "Failed to remove incomplete native GGUF cache '{}': {error}",
+                    "Failed to publish native GGUF cache '{}' atomically: {error}",
                     output_dir.display()
                 ))
             })?;
-        }
-        fs::rename(&staging_dir, &output_dir).map_err(|error| {
-            fs::remove_dir_all(&staging_dir).ok();
-            Error::from_reason(format!(
-                "Failed to publish native GGUF cache '{}' atomically: {error}",
-                output_dir.display()
-            ))
-        })?;
-        output_dir.clone()
+            output_dir.clone()
+        };
+        drop(output_guard);
+        prepared_dir
     };
-    drop(output_guard);
 
     // Lease before the post-publish sweep, which deletes unleased same-pid
     // staging dirs.

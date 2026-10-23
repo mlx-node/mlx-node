@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};

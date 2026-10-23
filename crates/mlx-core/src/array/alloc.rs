@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Uninitialized MLX-owned destination buffers written through raw pointers,
 //! and numeric ops pinned to the CPU device per call. The CPU ops never touch
 //! MLX's process-wide default device (unlike `CpuConvertGuard`), so they are

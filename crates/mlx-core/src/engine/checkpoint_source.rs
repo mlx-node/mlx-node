@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Where a model's weights come from: a safetensors directory, or a GGUF read
 //! into memory at load beside an asset-only directory (`config.json`,
 //! tokenizer, templates and `gguf-source.json`).
