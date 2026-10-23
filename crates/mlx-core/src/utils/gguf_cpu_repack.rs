@@ -382,3 +382,249 @@ pub(crate) fn decode_affine_band_into(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    use crate::array::{DType, MxArray};
+    use crate::models::quant_dispatch::kquant_tile_rows;
+    use crate::utils::gguf::{GgufFile, load_quantized_tensor};
+    use crate::utils::gguf_gpu::RepackDst;
+
+    fn random_bytes(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn info(ty: GgufTensorType, rows: usize, k: usize) -> GgufTensorInfo {
+        GgufTensorInfo {
+            name: "blk.0.ffn_down.weight".to_string(),
+            n_dims: 2,
+            dims: vec![k as u64, rows as u64],
+            tensor_type: ty,
+            offset: 0,
+        }
+    }
+
+    fn le_bytes(a: &MxArray) -> Vec<u8> {
+        MxArray::eval_arrays_with_context(&[a], "gguf_cpu_repack test").unwrap();
+        match a.dtype().unwrap() {
+            DType::Uint32 => a
+                .to_uint32()
+                .unwrap()
+                .to_vec()
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+            DType::Uint8 => a.to_uint8().unwrap(),
+            DType::Int8 => a.to_int8().unwrap().into_iter().map(|v| v as u8).collect(),
+            DType::Float16 | DType::BFloat16 => a
+                .to_uint16_native()
+                .unwrap()
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+            other => panic!("unexpected dtype {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_affine_band_equals_load_quantized_tensor() {
+        let (rows, k) = (7usize, 96usize);
+        for (i, ty) in [
+            GgufTensorType::Q4_0,
+            GgufTensorType::Q4_1,
+            GgufTensorType::Q5_0,
+            GgufTensorType::Q5_1,
+            GgufTensorType::Q8_0,
+            GgufTensorType::MXFP4,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let t = info(ty, rows, k);
+            let row_bytes = k / ty.block_size() * ty.type_size();
+            let blocks = random_bytes(rows * row_bytes, 11 + i as u64);
+            let gguf = GgufFile {
+                version: 3,
+                tensor_count: 1,
+                metadata: HashMap::new(),
+                tensors: vec![t.clone()],
+                alignment: 32,
+                data_offset: 0,
+            };
+            let want =
+                load_quantized_tensor(&mut std::io::Cursor::new(&blocks), &gguf, &t).unwrap();
+            let (dst, ptrs) = RepackDst::alloc(&t, OutLayout::RowMajor).unwrap();
+            for (row0, n) in [(5usize, 2usize), (0, 2), (2, 3)] {
+                decode_affine_band_into(
+                    ty,
+                    &blocks[row0 * row_bytes..(row0 + n) * row_bytes],
+                    row0,
+                    n,
+                    k,
+                    &ptrs,
+                )
+                .unwrap();
+            }
+            let got: Vec<(&str, &MxArray)> = [(".weight", Some(&dst.weight))]
+                .into_iter()
+                .chain([
+                    (".scales", dst.scales.as_ref()),
+                    (".biases", dst.biases.as_ref()),
+                ])
+                .filter_map(|(s, a)| a.map(|a| (s, a)))
+                .collect();
+            assert_eq!(got.len(), want.len(), "{ty:?}: array count");
+            for (suffix, a) in got {
+                let (_, w) = want
+                    .iter()
+                    .find(|(name, _)| name.ends_with(suffix))
+                    .unwrap_or_else(|| panic!("{ty:?}: oracle has no {suffix}"));
+                assert_eq!(
+                    a.dtype().unwrap(),
+                    w.dtype().unwrap(),
+                    "{ty:?}{suffix} dtype"
+                );
+                assert_eq!(
+                    a.shape().unwrap().to_vec(),
+                    w.shape().unwrap().to_vec(),
+                    "{ty:?}{suffix} shape"
+                );
+                let (g, e) = (le_bytes(a), le_bytes(w));
+                let bad = g.iter().zip(&e).filter(|(x, y)| x != y).count();
+                assert_eq!(
+                    (g.len(), bad),
+                    (e.len(), 0),
+                    "{ty:?}{suffix}: (bytes, mismatched)"
+                );
+            }
+        }
+    }
+
+    fn tile_case<T: Copy + PartialEq + std::fmt::Debug>(
+        name: &str,
+        data: Vec<T>,
+        whole: MxArray,
+        read: impl Fn(&MxArray) -> Vec<T>,
+        rows: usize,
+        cols: usize,
+        unit: usize,
+    ) {
+        let want = read(&kquant_tile_rows(&whole, unit as i64).unwrap());
+        let mut dst = vec![data[0]; rows * cols];
+        let mut row0 = 0;
+        for band in [64usize, 128, 64] {
+            tile_rows_into(
+                &mut dst,
+                &data[row0 * cols..(row0 + band) * cols],
+                row0,
+                band,
+                cols,
+                unit,
+            );
+            row0 += band;
+        }
+        assert_eq!(row0, rows);
+        let bad = dst.iter().zip(&want).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            (dst.len(), bad),
+            (want.len(), 0),
+            "{name}: (len, mismatched)"
+        );
+    }
+
+    #[test]
+    fn tile_rows_into_equals_kquant_tile_rows() {
+        let rows = 256usize;
+        let bytes = random_bytes(rows * 48 * 4, 5);
+        let u32s: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let w = MxArray::from_uint32(&u32s, &[rows as i64, 48]).unwrap();
+        tile_case(
+            "u32",
+            u32s,
+            w,
+            |a| a.to_uint32().unwrap().to_vec(),
+            rows,
+            48,
+            4,
+        );
+        let u8s = random_bytes(rows * 24, 6);
+        let s = MxArray::from_uint8(&u8s, &[rows as i64, 24]).unwrap();
+        tile_case("u8", u8s, s, |a| a.to_uint8().unwrap(), rows, 24, 12);
+        let u16s: Vec<u16> = random_bytes(rows * 16 * 2, 7)
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]) & 0x3BFF)
+            .collect();
+        let b = MxArray::from_float16(&u16s, &[rows as i64, 16]).unwrap();
+        tile_case(
+            "u16",
+            u16s,
+            b,
+            |a| a.to_uint16_native().unwrap(),
+            rows,
+            16,
+            2,
+        );
+    }
+
+    #[test]
+    #[ignore = "bench: 1 GiB Q4_0 CPU decode"]
+    fn bench_q4_0_cpu_decode() {
+        let k = 4096usize;
+        let ty = GgufTensorType::Q4_0;
+        let row_bytes = k / 32 * 18;
+        let rows = (1usize << 30) / row_bytes;
+        let mut src = random_bytes(rows * row_bytes, 3);
+        for b in src.chunks_exact_mut(18) {
+            b[0..2].copy_from_slice(&0x2000u16.to_le_bytes());
+        }
+        let mut weight = vec![0u32; rows * k / 32 * 4];
+        let mut scales = vec![0u16; rows * k / 32];
+        let ptrs = DstPtrs {
+            weight: SendPtr(weight.as_mut_ptr().cast()),
+            scales: Some(SendPtr(scales.as_mut_ptr().cast())),
+            biases: None,
+            rows,
+            k,
+            layout: OutLayout::RowMajor,
+        };
+        let threads = 8;
+        let per = rows.div_ceil(threads);
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            std::thread::scope(|s| {
+                for i in 0..threads {
+                    let (row0, src) = (i * per, &src);
+                    let n = per.min(rows - row0);
+                    let ptrs = &ptrs;
+                    s.spawn(move || {
+                        let band = &src[row0 * row_bytes..(row0 + n) * row_bytes];
+                        decode_affine_band_into(ty, band, row0, n, k, ptrs).unwrap();
+                    });
+                }
+            });
+            best = best.min(t0.elapsed().as_secs_f64());
+        }
+        let gbs = (rows * row_bytes) as f64 / best / 1e9;
+        println!(
+            "BENCH q4_0 cpu decode: {} B, {threads} threads, best {best:.3} s, {gbs:.2} GB/s",
+            rows * row_bytes
+        );
+        assert!(weight.iter().any(|&w| w != 0) && scales.iter().all(|&s| s == 0x2000));
+    }
+}

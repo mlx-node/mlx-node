@@ -1067,3 +1067,754 @@ fn u32_of(v: usize, t: &GgufTensorInfo) -> Result<u32> {
         ))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeSet, HashSet};
+    use std::fs;
+    use std::path::PathBuf;
+
+    use crate::array::memory::get_active_memory;
+    use crate::models::quant_dispatch::kquant_tile_rows;
+    use crate::utils::gguf::{
+        GGUF_MAGIC, GGUF_VERSION_3, GgufMetaValue, GgufValueType, load_gguf_tensors, parse_gguf,
+    };
+    use crate::utils::gguf_plan::OutputRole;
+    use crate::utils::gguf_source::{GgufSourceSet, file_identity};
+    use GgufTensorType::*;
+
+    const MIB: usize = 1 << 20;
+
+    fn random_bytes(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// Block bytes for `ty`; dense types get finite values.
+    fn payload(ty: GgufTensorType, elements: usize, seed: u64) -> Vec<u8> {
+        let small = |bits: u16| bits & 0x3BFF;
+        match ty {
+            F32 => random_bytes(elements * 2, seed)
+                .chunks_exact(2)
+                .flat_map(|c| (f32::from(u16::from_le_bytes([c[0], c[1]])) / 65536.0).to_le_bytes())
+                .collect(),
+            F16 | BF16 => random_bytes(elements * 2, seed)
+                .chunks_exact(2)
+                .flat_map(|c| small(u16::from_le_bytes([c[0], c[1]])).to_le_bytes())
+                .collect(),
+            _ => random_bytes(elements / ty.block_size() * ty.type_size(), seed),
+        }
+    }
+
+    type Spec = (&'static str, Vec<u64>, GgufTensorType);
+
+    /// GGUF v3 bytes with tensor offsets aligned to `alignment`.
+    fn build_gguf(
+        meta: &[(&str, GgufMetaValue)],
+        tensors: &[Spec],
+        alignment: u64,
+        seed: u64,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&GGUF_VERSION_3.to_le_bytes());
+        buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&(meta.len() as u64).to_le_bytes());
+        for (key, value) in meta {
+            buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+            match value {
+                GgufMetaValue::Uint32(v) => {
+                    buf.extend_from_slice(&(GgufValueType::Uint32 as u32).to_le_bytes());
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+                GgufMetaValue::String(s) => {
+                    buf.extend_from_slice(&(GgufValueType::String as u32).to_le_bytes());
+                    buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+                    buf.extend_from_slice(s.as_bytes());
+                }
+                _ => panic!("unsupported metadata value"),
+            }
+        }
+        let data: Vec<Vec<u8>> = tensors
+            .iter()
+            .enumerate()
+            .map(|(i, (_, dims, ty))| {
+                payload(*ty, dims.iter().product::<u64>() as usize, seed + i as u64)
+            })
+            .collect();
+        let mut offsets = Vec::new();
+        let mut at = 0u64;
+        for d in &data {
+            at = at.next_multiple_of(alignment);
+            offsets.push(at);
+            at += d.len() as u64;
+        }
+        for ((name, dims, ty), off) in tensors.iter().zip(&offsets) {
+            buf.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+            buf.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for d in dims {
+                buf.extend_from_slice(&d.to_le_bytes());
+            }
+            buf.extend_from_slice(&(*ty as u32).to_le_bytes());
+            buf.extend_from_slice(&off.to_le_bytes());
+        }
+        buf.resize((buf.len() as u64).next_multiple_of(alignment) as usize, 0);
+        let start = buf.len();
+        for (d, off) in data.iter().zip(&offsets) {
+            buf.resize(start + *off as usize, 0);
+            buf.extend_from_slice(d);
+        }
+        buf
+    }
+
+    struct Fixture {
+        dir: PathBuf,
+        path: PathBuf,
+        handle: GgufFileHandle,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn open_fixture(tag: &str, bytes: &[u8]) -> Fixture {
+        let dir = std::env::temp_dir().join(format!("gguf-import-{tag}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf");
+        fs::write(&path, bytes).unwrap();
+        let header = Arc::new(parse_gguf(&path).unwrap());
+        let identity = file_identity(&path, &header, &fs::metadata(&path).unwrap()).unwrap();
+        let handle = GgufSourceSet::open((&path, header, &identity), None)
+            .unwrap()
+            .main;
+        Fixture { dir, path, handle }
+    }
+
+    fn plan(tiled: &[&str]) -> ImportPlan {
+        ImportPlan {
+            role: OutputRole::Primary,
+            import_k_quants: true,
+            native_qwen35_layout: false,
+            prism: false,
+            tie_word_embeddings: false,
+            preserve_dtype_keys: HashSet::new(),
+            tiled_gguf_names: tiled.iter().map(|s| s.to_string()).collect(),
+            tiled_prefixes: BTreeSet::new(),
+            config: None,
+            clef_head_config: None,
+            asset_copies: Vec::new(),
+            strict_asset_copies: false,
+            muse_secondary: false,
+            ple_shard: None,
+        }
+    }
+
+    fn small_slots(slots: usize) -> ReadConfig {
+        ReadConfig {
+            slot_bytes: MIB,
+            slots,
+            ..ReadConfig::default()
+        }
+    }
+
+    fn require_gpu() -> bool {
+        if cfg!(target_os = "macos") {
+            assert!(gpu_repack_available(), "no GPU repack on macOS");
+            true
+        } else {
+            false
+        }
+    }
+
+    const GPU_SPECS: usize = 9;
+    const TILED: [&str; 4] = [
+        "blk.0.q4k.weight",
+        "blk.0.q6k.weight",
+        "blk.0.iq4xs.weight",
+        "blk.0.q2k.weight",
+    ];
+
+    /// Every GPU type and every CPU type; `[k, rows]` dims.
+    fn every_type_specs() -> Vec<Spec> {
+        vec![
+            ("blk.0.q4k.weight", vec![5120, 512], Q4K),
+            ("blk.0.q5k.weight", vec![768, 130], Q5K),
+            ("blk.0.q6k.weight", vec![1024, 128], Q6K),
+            ("blk.0.iq4xs.weight", vec![768, 64], IQ4XS),
+            ("blk.0.q3k.weight", vec![512, 96], Q3K),
+            ("blk.0.iq4nl.weight", vec![256, 70], IQ4NL),
+            ("blk.0.iq3s.weight", vec![512, 64], IQ3S),
+            ("blk.0.q8_0.weight", vec![96, 33], Q8_0),
+            ("blk.0.mxfp4.weight", vec![64, 40], MXFP4),
+            ("blk.0.q2k.weight", vec![512, 128], Q2K),
+            ("blk.0.iq2s.weight", vec![256, 20], IQ2S),
+            ("blk.0.iq1m.weight", vec![256, 12], IQ1M),
+            ("blk.0.q4_0.weight", vec![4096, 1200], Q4_0),
+            ("blk.0.q4_1.weight", vec![64, 9], Q4_1),
+            ("blk.0.q5_0.weight", vec![96, 5], Q5_0),
+            ("blk.0.q5_1.weight", vec![64, 11], Q5_1),
+            ("blk.0.f16.weight", vec![64, 3], F16),
+            ("blk.0.f32.weight", vec![17], F32),
+            ("blk.0.bf16.weight", vec![32, 4], BF16),
+        ]
+    }
+
+    fn every_type_fixture() -> Fixture {
+        let bytes = build_gguf(
+            &[("general.architecture", GgufMetaValue::String("test".into()))],
+            &every_type_specs(),
+            32,
+            100,
+        );
+        open_fixture("every", &bytes)
+    }
+
+    fn le_bytes(a: &MxArray) -> Vec<u8> {
+        MxArray::eval_arrays_with_context(&[a], "gguf_import test").unwrap();
+        match a.dtype().unwrap() {
+            DType::Uint32 => a
+                .to_uint32()
+                .unwrap()
+                .to_vec()
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+            DType::Uint8 => a.to_uint8().unwrap(),
+            DType::Int8 => a.to_int8().unwrap().into_iter().map(|v| v as u8).collect(),
+            DType::Float16 | DType::BFloat16 => a
+                .to_uint16_native()
+                .unwrap()
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+            DType::Float32 => a
+                .to_float32()
+                .unwrap()
+                .to_vec()
+                .into_iter()
+                .flat_map(|v| v.to_bits().to_le_bytes())
+                .collect(),
+            other => panic!("unexpected dtype {other:?}"),
+        }
+    }
+
+    /// `load_gguf_tensors` with the plan's Tiled64 tensors permuted like
+    /// `tile_kquant_weights_for_disk`.
+    fn oracle(fx: &Fixture, plan: &ImportPlan) -> HashMap<String, MxArray> {
+        let header = &fx.handle.header;
+        let options = GgufLoadOptions {
+            verbose: false,
+            import_k_quants: true,
+        };
+        let mut map = load_gguf_tensors(&fx.path, header, options).unwrap();
+        for t in &header.tensors {
+            if !plan.tiled_gguf_names.contains(&t.name) {
+                continue;
+            }
+            let f = t.tensor_type.k_quant_format().unwrap();
+            let prefix = t.name.strip_suffix(".weight").unwrap();
+            for (key, unit) in [
+                (t.name.clone(), f.bits()),
+                (
+                    format!("{prefix}.scales"),
+                    f.super_ratio() * f.scale_bytes_per_group(),
+                ),
+                (format!("{prefix}.biases"), f.bias_entries_per_super_block()),
+            ] {
+                let tiled = kquant_tile_rows(&map[&key], unit as i64).unwrap();
+                map.insert(key, tiled);
+            }
+        }
+        map
+    }
+
+    fn assert_maps_equal(
+        got: &HashMap<String, MxArray>,
+        want: &HashMap<String, MxArray>,
+        what: &str,
+    ) {
+        let mut gk: Vec<&String> = got.keys().collect();
+        let mut wk: Vec<&String> = want.keys().collect();
+        gk.sort();
+        wk.sort();
+        assert_eq!(gk, wk, "{what}: key sets");
+        let mut bad = Vec::new();
+        for (k, w) in want {
+            let g = &got[k];
+            let (gd, wd) = (g.dtype().unwrap(), w.dtype().unwrap());
+            let (gs, ws) = (g.shape().unwrap().to_vec(), w.shape().unwrap().to_vec());
+            let (gb, wb) = (le_bytes(g), le_bytes(w));
+            let diff = gb.iter().zip(&wb).filter(|(a, b)| a != b).count();
+            if gd != wd || gs != ws || gb.len() != wb.len() || diff > 0 {
+                bad.push(format!(
+                    "{k}: dtype {gd:?}/{wd:?} shape {gs:?}/{ws:?} bytes {}/{} mismatched {diff}",
+                    gb.len(),
+                    wb.len()
+                ));
+            }
+        }
+        bad.sort();
+        assert!(
+            bad.is_empty(),
+            "{what}: {} tensors differ:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    fn read_with(
+        fx: &Fixture,
+        plan: &ImportPlan,
+        backend: RepackBackend,
+        cfg: &ReadConfig,
+        probe: &ImportProbe,
+    ) -> Result<RawTensors> {
+        read_gguf_tensors_with(
+            &fx.handle.file,
+            &fx.handle,
+            plan,
+            backend,
+            PageCacheMode::On,
+            cfg,
+            probe,
+        )
+    }
+
+    #[test]
+    fn staged_read_equals_load_gguf_tensors() {
+        let gpu = require_gpu();
+        let fx = every_type_fixture();
+        let plan = plan(&TILED);
+        let raw = read_with(
+            &fx,
+            &plan,
+            RepackBackend::Auto,
+            &small_slots(SLOTS),
+            &ImportProbe::default(),
+        )
+        .unwrap();
+        assert_maps_equal(&raw.map, &oracle(&fx, &plan), "staged read");
+        let n = every_type_specs().len();
+        let want_gpu = if gpu { GPU_SPECS } else { 0 };
+        assert_eq!(
+            (raw.stats.gpu_tensors, raw.stats.cpu_tensors),
+            (want_gpu, n - want_gpu),
+            "(gpu, cpu) tensors"
+        );
+        assert!(raw.ple_shards.is_none());
+        assert!(raw.stats.bytes >= fx.handle.len - fx.handle.header.data_offset);
+    }
+
+    #[test]
+    fn cpu_only_backend_equals_auto() {
+        let gpu = require_gpu();
+        let fx = every_type_fixture();
+        let plan = plan(&TILED);
+        let cfg = small_slots(2);
+        let auto = read_with(
+            &fx,
+            &plan,
+            RepackBackend::Auto,
+            &cfg,
+            &ImportProbe::default(),
+        )
+        .unwrap();
+        let cpu = read_with(
+            &fx,
+            &plan,
+            RepackBackend::CpuOnly,
+            &cfg,
+            &ImportProbe::default(),
+        )
+        .unwrap();
+        assert_maps_equal(&auto.map, &cpu.map, "Auto vs CpuOnly");
+        assert_eq!(cpu.stats.gpu_tensors, 0);
+        if gpu {
+            assert!(auto.stats.gpu_tensors > 0, "Auto used no GPU kernel");
+        }
+    }
+
+    #[test]
+    fn misaligned_tensor_uses_cpu() {
+        require_gpu();
+        let specs: Vec<Spec> = vec![("a.weight", vec![1], F16), ("b.weight", vec![256, 64], Q4K)];
+        let mut tag = String::new();
+        let fx = loop {
+            let bytes = build_gguf(
+                &[
+                    ("general.alignment", GgufMetaValue::Uint32(2)),
+                    ("general.name", GgufMetaValue::String(tag.clone())),
+                ],
+                &specs,
+                2,
+                7,
+            );
+            let fx = open_fixture("misaligned", &bytes);
+            let h = &fx.handle.header;
+            if !(h.data_offset + h.tensors[1].offset).is_multiple_of(16) {
+                break fx;
+            }
+            tag.push('x');
+        };
+        assert_eq!(fx.handle.header.tensors[1].offset, 2);
+        let plan = plan(&[]);
+        let raw = read_with(
+            &fx,
+            &plan,
+            RepackBackend::Auto,
+            &small_slots(SLOTS),
+            &ImportProbe::default(),
+        )
+        .unwrap();
+        assert_maps_equal(&raw.map, &oracle(&fx, &plan), "misaligned");
+        assert_eq!(
+            (raw.stats.gpu_tensors, raw.stats.cpu_tensors),
+            (0, 2),
+            "(gpu, cpu) tensors"
+        );
+    }
+
+    #[test]
+    fn cpu_inflight_bytes_bounded() {
+        assert_eq!(ReadConfig::default().cpu_inflight_bytes, 256 * MIB);
+        let bytes = build_gguf(
+            &[],
+            &[("blk.0.q4_0.weight", vec![4096, 32768], Q4_0)],
+            32,
+            9,
+        );
+        let fx = open_fixture("inflight", &bytes);
+        let cfg = ReadConfig {
+            slot_bytes: 16 * MIB,
+            cpu_inflight_bytes: 4 * MIB,
+            cpu_band_bytes: MIB,
+            ..ReadConfig::default()
+        };
+        let probe = ImportProbe::default();
+        let raw = read_with(&fx, &plan(&[]), RepackBackend::CpuOnly, &cfg, &probe).unwrap();
+        let max = probe.max_cpu_inflight.load(Ordering::Relaxed);
+        assert!(max > 0);
+        assert!(
+            max <= cfg.cpu_inflight_bytes,
+            "max in-flight {max} > cap {}",
+            cfg.cpu_inflight_bytes
+        );
+        assert_eq!(raw.stats.cpu_tensors, 1);
+    }
+
+    fn position(events: &[ImportEvent], e: &ImportEvent) -> Option<usize> {
+        events.iter().position(|x| x == e)
+    }
+
+    #[test]
+    fn slot_reuse_waits_for_gpu() {
+        let gpu = require_gpu();
+        let fx = every_type_fixture();
+        let plan = plan(&TILED);
+        for slots in [1usize, 2] {
+            let probe = ImportProbe {
+                record: true,
+                ..ImportProbe::default()
+            };
+            let raw =
+                read_with(&fx, &plan, RepackBackend::Auto, &small_slots(slots), &probe).unwrap();
+            if gpu {
+                assert!(raw.stats.gpu_tensors > 0);
+            }
+            let events = probe.events.lock().unwrap().clone();
+            let n = events
+                .iter()
+                .filter(|e| matches!(e, ImportEvent::Submitted(_)))
+                .count();
+            assert!(n > 3, "only {n} windows");
+            let mut early = Vec::new();
+            for v in slots..n {
+                let refill = position(&events, &ImportEvent::Submitted(v)).unwrap();
+                match position(&events, &ImportEvent::Completed(v - slots)) {
+                    Some(done) if done < refill => {}
+                    _ => early.push(v),
+                }
+            }
+            assert_eq!(
+                early.len(),
+                0,
+                "slots {slots}: windows refilled before their slot's window completed: {early:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ple_dense_above_budget_is_sharded_at_alloc() {
+        const NAME: &str = "per_layer_token_embd.weight";
+        const KEY: &str = "embed_tokens_per_layer.weight";
+        let (rows, cols, budget) = (512usize, 64usize, 9000usize);
+        let rows_per_shard = (budget / (cols * 2)).max(1);
+        let bytes = build_gguf(
+            &[(
+                "general.architecture",
+                GgufMetaValue::String("gemma4".into()),
+            )],
+            &[
+                ("blk.0.attn_norm.weight", vec![64], F32),
+                (NAME, vec![cols as u64, rows as u64], BF16),
+            ],
+            32,
+            21,
+        );
+        let fx = open_fixture("ple", &bytes);
+        let mut plan = plan(&[]);
+        plan.ple_shard = Some((NAME.to_string(), rows_per_shard));
+        let cfg = ReadConfig {
+            slot_bytes: 2 * ALIGN as usize,
+            ..ReadConfig::default()
+        };
+        let probe = ImportProbe::default();
+        let raw = read_with(&fx, &plan, RepackBackend::Auto, &cfg, &probe).unwrap();
+        assert!(!raw.map.contains_key(NAME));
+        let (name, shards, rps) = raw.ple_shards.expect("no PLE shards");
+        assert_eq!(name, NAME);
+        let max_alloc = probe.max_alloc_bytes.load(Ordering::Relaxed);
+        assert!(
+            max_alloc <= cfg.slot_bytes.max(budget),
+            "largest allocation {max_alloc} B"
+        );
+
+        let whole =
+            load_gguf_tensors(&fx.path, &fx.handle.header, GgufLoadOptions::default()).unwrap();
+        let mut st = HashMap::from([(KEY.to_string(), whole[NAME].clone())]);
+        crate::utils::safetensors::save_safetensors(
+            fx.dir.join("model.safetensors"),
+            &mut st,
+            None,
+        )
+        .unwrap();
+        let (want, want_rps) =
+            crate::utils::safetensors::load_bf16_tensor_sharded(&fx.dir, KEY, budget).unwrap();
+        assert_eq!(
+            (rps as i64, shards.len()),
+            (want_rps, want.len()),
+            "(rows per shard, shards)"
+        );
+        for (i, (g, w)) in shards.iter().zip(&want).enumerate() {
+            assert!(g.nbytes() <= budget, "shard {i}: {} B", g.nbytes());
+            assert_eq!(
+                g.shape().unwrap().to_vec(),
+                w.shape().unwrap().to_vec(),
+                "shard {i} shape"
+            );
+            let (gb, wb) = (le_bytes(g), le_bytes(w));
+            assert_eq!(
+                gb.iter().zip(&wb).filter(|(a, b)| a != b).count(),
+                0,
+                "shard {i} bytes"
+            );
+        }
+    }
+
+    /// Reads through the fixture file; counts reads that end after the
+    /// import released its buffers and the event index at which each read
+    /// ended.
+    struct MockRead<'a> {
+        file: &'a fs::File,
+        probe: &'a ImportProbe,
+        fail_at: Option<u64>,
+        sleep_ms: u64,
+        after_free: AtomicUsize,
+        ended_at: Mutex<Vec<usize>>,
+    }
+
+    impl<'a> MockRead<'a> {
+        fn new(file: &'a fs::File, probe: &'a ImportProbe) -> Self {
+            Self {
+                file,
+                probe,
+                fail_at: None,
+                sleep_ms: 0,
+                after_free: AtomicUsize::new(0),
+                ended_at: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ReadAt for MockRead<'_> {
+        fn read_exact_at(&self, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+            if self.sleep_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(self.sleep_ms));
+            }
+            if self.fail_at == Some(off) {
+                return Err(std::io::Error::other("injected read failure"));
+            }
+            let r = ReadAt::read_exact_at(self.file, buf, off);
+            if self.probe.freed.load(Ordering::Acquire) {
+                self.after_free.fetch_add(1, Ordering::SeqCst);
+            }
+            let at = self.probe.events.lock().unwrap().len();
+            self.ended_at.lock().unwrap().push(at);
+            r
+        }
+    }
+
+    const GUARD_ORDER: [ImportEvent; 6] = [
+        ImportEvent::Stopped,
+        ImportEvent::ReadersIdle,
+        ImportEvent::CpuJoined,
+        ImportEvent::GpuSynced,
+        ImportEvent::Freed,
+        ImportEvent::CacheCleared,
+    ];
+
+    fn guard_tail(events: &[ImportEvent]) -> Vec<ImportEvent> {
+        events
+            .iter()
+            .filter(|e| !matches!(e, ImportEvent::Submitted(_) | ImportEvent::Completed(_)))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn read_error_mid_import_frees_and_errs() {
+        require_gpu();
+        let fx = every_type_fixture();
+        let plan = plan(&[]);
+        let cfg = small_slots(SLOTS);
+        let windows = plan_reads(&fx.handle.header, fx.handle.len, cfg.slot_bytes, &|_| 1).unwrap();
+        assert!(windows.len() > 4);
+        let probe = ImportProbe {
+            record: true,
+            ..ImportProbe::default()
+        };
+        let mut mock = MockRead::new(&fx.handle.file, &probe);
+        mock.fail_at = Some(windows[3].file_off);
+        mock.sleep_ms = 30;
+        clear_cache();
+        let before = get_active_memory();
+        let err = read_gguf_tensors_with(
+            &mock,
+            &fx.handle,
+            &plan,
+            RepackBackend::Auto,
+            PageCacheMode::On,
+            &cfg,
+            &probe,
+        )
+        .err()
+        .expect("read error must fail the import");
+        let after = get_active_memory();
+        let msg = err.reason.clone();
+        assert!(
+            msg.contains(&fx.handle.path.display().to_string()),
+            "no path in: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("offset {}", windows[3].file_off)),
+            "no offset in: {msg}"
+        );
+        assert_eq!(
+            mock.after_free.load(Ordering::SeqCst),
+            0,
+            "reads ended after free"
+        );
+        assert_eq!(
+            guard_tail(&probe.events.lock().unwrap()),
+            GUARD_ORDER.to_vec()
+        );
+        assert!(
+            after <= before + MIB as f64,
+            "active memory {before} -> {after}"
+        );
+    }
+
+    #[test]
+    fn gpu_error_mid_import_frees_after_readers_stop() {
+        require_gpu();
+        let fx = every_type_fixture();
+        let plan = plan(&[]);
+        let probe = ImportProbe {
+            record: true,
+            gpu_error_at_window: Some(2),
+            ..ImportProbe::default()
+        };
+        let mut mock = MockRead::new(&fx.handle.file, &probe);
+        mock.sleep_ms = 150;
+        let err = read_gguf_tensors_with(
+            &mock,
+            &fx.handle,
+            &plan,
+            RepackBackend::Auto,
+            PageCacheMode::On,
+            &small_slots(SLOTS),
+            &probe,
+        )
+        .err()
+        .expect("GPU error must fail the import");
+        assert!(
+            err.reason.contains("injected GPU repack failure"),
+            "{}",
+            err.reason
+        );
+        let events = probe.events.lock().unwrap().clone();
+        assert_eq!(guard_tail(&events), GUARD_ORDER.to_vec());
+        let idle = position(&events, &ImportEvent::ReadersIdle).unwrap();
+        let ended = mock.ended_at.lock().unwrap().clone();
+        let late = ended.iter().filter(|&&at| at > idle).count();
+        assert!(ended.len() > 3, "only {} reads", ended.len());
+        assert_eq!(
+            late, 0,
+            "reads ended after ReadersIdle (event {idle}): {ended:?}"
+        );
+        assert_eq!(
+            mock.after_free.load(Ordering::SeqCst),
+            0,
+            "reads ended after free"
+        );
+    }
+
+    #[test]
+    fn panic_mid_import_runs_guard() {
+        require_gpu();
+        let fx = every_type_fixture();
+        let plan = plan(&TILED);
+        let probe = ImportProbe {
+            record: true,
+            panic_at_window: Some(1),
+            ..ImportProbe::default()
+        };
+        let mock = MockRead::new(&fx.handle.file, &probe);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            read_gguf_tensors_with(
+                &mock,
+                &fx.handle,
+                &plan,
+                RepackBackend::Auto,
+                PageCacheMode::On,
+                &small_slots(SLOTS),
+                &probe,
+            )
+            .map(|_| ())
+        }));
+        assert!(r.is_err(), "the injected panic did not propagate");
+        let events = probe
+            .events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(guard_tail(&events), GUARD_ORDER.to_vec());
+        assert_eq!(
+            mock.after_free.load(Ordering::SeqCst),
+            0,
+            "reads ended after free"
+        );
+    }
+}
