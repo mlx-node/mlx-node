@@ -7948,15 +7948,11 @@ fn gemma4_native_mmproj(input: &Path, kind: Gemma4MmprojKind) -> Result<Option<P
     }
 }
 
-/// Prepare a complete, losslessly packed Gemma checkpoint in the application
-/// cache. The source directory remains read-only; the matching media
-/// projector — required for unified media configs, opportunistic for a plain
+/// Prepare a complete, losslessly packed Gemma checkpoint under `root`. The
+/// source directory remains read-only; the matching media projector —
+/// required for unified media configs, opportunistic for a plain
 /// `vision_config` — is converted in the same transaction as the text model.
-pub(crate) async fn prepare_gemma4_native_gguf(input: &Path) -> Result<PathBuf> {
-    let root = native_gguf_cache_root()?;
-    prepare_gemma4_native_gguf_in(input, &root).await
-}
-
+#[cfg(test)]
 pub(super) async fn prepare_gemma4_native_gguf_in(input: &Path, root: &Path) -> Result<PathBuf> {
     let (input, companion) = native_gguf_preflight(input, NativeGgufFamily::Gemma4)?;
     let root = initialize_native_gguf_cache_root(root)?;

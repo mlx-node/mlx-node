@@ -9,10 +9,11 @@ use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::cold_tier::{CheckpointLoadGuard, resolve_persist_cold};
+use crate::engine::checkpoint_source::{CheckpointSource, GGUF_SOURCE_FILE};
 use crate::engine::persistence::{
     KeyRule, RenameSpec, WRAPPER_STRIP_PREFIXES, apply_rename_spec, cast_f32_tensors_to_bf16,
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
-    prewarm_checkpoint_pages,
+    load_checkpoint, prewarm_checkpoint_pages,
 };
 use crate::models::paged_config::PagedCacheConfig;
 use crate::models::quant_dispatch::{
@@ -23,6 +24,8 @@ use crate::models::quant_dispatch::{
     resolve_default_mode,
 };
 use crate::tokenizer::Qwen3Tokenizer;
+use crate::utils::gguf::NativeGgufFamily;
+use crate::utils::gguf_import::{GgufPreload, PreloadInput, plan_dense_row_shards};
 
 use super::config::Gemma4Config;
 use super::model::{Gemma4Draft, Gemma4Inner, Gemma4Model, warmup_forward};
@@ -549,9 +552,11 @@ fn is_gemma4_vision_weight_key(key: &str) -> bool {
         || key.starts_with("embed_vision.")
 }
 
+/// `ple_sharded`: the PLE table arrived as row shards beside `params`.
 fn validate_required_weights(
     params: &HashMap<String, MxArray>,
     config: &Gemma4Config,
+    ple_sharded: bool,
 ) -> Result<()> {
     let has = |key: &str| -> bool { params.contains_key(key) };
 
@@ -570,7 +575,7 @@ fn validate_required_weights(
             "per_layer_model_projection.weight",
             "per_layer_projection_norm.weight",
         ] {
-            if !has(key) {
+            if !has(key) && !(ple_sharded && key == PLE_EMBED_KEY) {
                 return Err(Error::from_reason(format!(
                     "Missing required weight: {key}"
                 )));
@@ -1289,24 +1294,50 @@ fn ple_shard_byte_budget() -> usize {
         .unwrap_or(DEFAULT)
 }
 
+const PLE_EMBED_KEY: &str = "embed_tokens_per_layer.weight";
+
+/// Whether a raw checkpoint key sanitizes to [`PLE_EMBED_KEY`] (the same
+/// first-match wrapper strip `sanitize_weights` applies).
+fn is_ple_embed_key(key: &str) -> bool {
+    WRAPPER_STRIP_PREFIXES
+        .iter()
+        .find_map(|prefix| key.strip_prefix(prefix))
+        .unwrap_or(key)
+        == PLE_EMBED_KEY
+}
+
 /// If `embed_tokens_per_layer.weight` is a dense bf16 tensor larger than the
 /// shard budget, load it as sub-cap row shards (streamed from file) and install
 /// them on the PLE embedding, then drop the key from `params` so neither the
 /// dense apply path nor the whole-tensor materialize pass touches the oversized
 /// array. Keyed on this one tensor only — `embed_tokens` (the tied lm_head) is
-/// never sharded (it needs the dense table for `as_linear`).
+/// never sharded (it needs the dense table for `as_linear`). `preloaded` are
+/// the shards a GGUF import already built under the same rule.
 fn maybe_shard_ple_embedding(
     inner: &mut Gemma4Inner,
     params: &mut HashMap<String, MxArray>,
     model_dir: &Path,
+    preloaded: Option<(Vec<MxArray>, usize)>,
 ) -> Result<()> {
-    const KEY: &str = "embed_tokens_per_layer.weight";
+    if let Some((shards, rows_per_shard)) = preloaded {
+        let Some(ple) = inner.ple.as_mut() else {
+            return Ok(());
+        };
+        let rows_per_shard = i64::try_from(rows_per_shard)
+            .map_err(|_| Error::from_reason("PLE rows per shard overflow i64"))?;
+        let n = shards.len();
+        ple.embed_tokens_per_layer
+            .set_sharded(shards, rows_per_shard)?;
+        params.remove(PLE_EMBED_KEY);
+        info!("PLE embed_tokens_per_layer installed from {n} GGUF row shards");
+        return Ok(());
+    }
     // Quantized PLE (scales present) uses a separate load path — leave it alone.
     if params.contains_key("embed_tokens_per_layer.scales") {
         return Ok(());
     }
     let budget = ple_shard_byte_budget();
-    let needs_shard = match params.get(KEY) {
+    let needs_shard = match params.get(PLE_EMBED_KEY) {
         Some(w) => w.dtype()? == DType::BFloat16 && w.nbytes() > budget,
         None => false,
     };
@@ -1317,13 +1348,58 @@ fn maybe_shard_ple_embedding(
         return Ok(());
     };
     let (shards, rows_per_shard) =
-        crate::utils::safetensors::load_bf16_tensor_sharded(model_dir, KEY, budget)?;
+        crate::utils::safetensors::load_bf16_tensor_sharded(model_dir, PLE_EMBED_KEY, budget)?;
     let n = shards.len();
     ple.embed_tokens_per_layer
         .set_sharded(shards, rows_per_shard)?;
-    params.remove(KEY);
+    params.remove(PLE_EMBED_KEY);
     info!("PLE embed_tokens_per_layer loaded (sharded into {n} sub-cap arrays)");
     Ok(())
+}
+
+/// The checkpoint's raw weights, plus the PLE row shards (absent from the
+/// map) when a GGUF's dense bf16 PLE table exceeds `ple_budget`. With
+/// `preload_input`, `path` is the GGUF's asset directory (no weight files)
+/// and the media companion is read only when the config loads media.
+/// Model thread only.
+fn load_gemma_weights(
+    path: &Path,
+    config: &Gemma4Config,
+    preload_input: Option<PreloadInput>,
+    ple_budget: usize,
+) -> Result<(HashMap<String, MxArray>, Option<(Vec<MxArray>, usize)>)> {
+    let media = should_load_media_sidecar(config);
+    let Some(mut input) = preload_input else {
+        return Ok((load_all_safetensors(path, media)?, None));
+    };
+    input.load_companion = media;
+    if config.per_layer_input_embeds {
+        let (_, header, _, plan) = &input.main;
+        let ple_shard = plan_dense_row_shards(
+            header,
+            plan,
+            &input.opts,
+            &is_ple_embed_key,
+            DType::BFloat16,
+            ple_budget,
+        )?;
+        input.main.3.ple_shard = ple_shard;
+    }
+    let mut preload = GgufPreload::load(&input)?;
+    let stats = &preload.stats;
+    info!(
+        "GGUF preload: {} bytes in {:.2} s (read wait {:.2} s, page cache {}), \
+         {} GPU-repacked and {} other tensors",
+        stats.bytes,
+        stats.preload_secs,
+        stats.read_secs,
+        if stats.nocache { "off" } else { "on" },
+        stats.gpu_tensors,
+        stats.cpu_tensors,
+    );
+    let ple_shards = preload.ple_shards.take();
+    let params = load_checkpoint(path, media, Some(&mut preload))?;
+    Ok((params, ple_shards))
 }
 
 /// Packing parameters for a quantized embedding/tied-lm_head load: the
@@ -2588,7 +2664,18 @@ impl Gemma4Inner {
     /// `<model_path>/draft/` is discovered automatically. Draft decoding uses
     /// a scheduler-owned flat target-cache lane while the same loaded target
     /// retains grouped paged pools for ordinary AR/media owners.
+    #[cfg(test)]
     pub fn load_from_dir(model_path: &str, draft_model_path: Option<&str>) -> Result<(Self, u64)> {
+        Self::load_from_source(model_path, None, draft_model_path)
+    }
+
+    /// With `preload_input`, `model_path` is the GGUF's asset directory and
+    /// the weights come from the in-memory import.
+    pub(crate) fn load_from_source(
+        model_path: &str,
+        preload_input: Option<PreloadInput>,
+        draft_model_path: Option<&str>,
+    ) -> Result<(Self, u64)> {
         let path = Path::new(model_path);
 
         let resolved_draft_model_path = resolve_draft_model_path(path, draft_model_path)?;
@@ -2710,7 +2797,8 @@ impl Gemma4Inner {
             resolve_persist_cold("gemma4", persist_env.as_deref(), config.persist_paged_cache);
         let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
 
-        let mut params = load_all_safetensors(path, should_load_media_sidecar(&config))?;
+        let (mut params, ple_shards) =
+            load_gemma_weights(path, &config, preload_input, ple_shard_byte_budget())?;
 
         checkpoint_load.record_mmap();
 
@@ -2735,7 +2823,7 @@ impl Gemma4Inner {
         info!("Sanitized to {} tensors", params.len());
 
         // Validate required weights are present
-        validate_required_weights(&params, &config)?;
+        validate_required_weights(&params, &config, ple_shards.is_some())?;
 
         // Fuse split MoE expert weights: replace separate gate_proj + up_proj
         // with a single gate_up_proj BEFORE apply_weights. This ensures the
@@ -2858,7 +2946,7 @@ impl Gemma4Inner {
         // allocate one buffer. Shard it across sub-cap arrays (streamed from the
         // file) before apply_weights so the dense PLE-load branch is skipped and
         // the forward gathers across shards.
-        maybe_shard_ple_embedding(&mut inner, &mut params, path)?;
+        maybe_shard_ple_embedding(&mut inner, &mut params, path, ple_shards)?;
 
         // Checkpoint byte total of the text map BEFORE installation:
         // `apply_weights_mut` releases the row-major sources of Tiled64
@@ -3155,27 +3243,45 @@ impl Gemma4Model {
         model_path: &str,
         options: Option<super::model::Gemma4LoadOptions>,
     ) -> Result<Self> {
-        let source = Path::new(model_path);
+        let path = Path::new(model_path);
         let mut draft_model_path = options.and_then(|o| o.draft_model_path);
-        // `leased` keeps the prepared cache dir so a failed init can release
-        // the lease prepare took — otherwise a multi-GB entry is pinned
-        // against the cap for the process lifetime.
-        let mut leased: Option<PathBuf> = None;
-        let model_path = if let Some(gguf) = crate::utils::gguf::resolve_gemma4_gguf_source(source)?
-        {
-            // Preserve sibling draft discovery when the target moves into its
-            // native cache directory. An explicit draft option still wins.
-            if draft_model_path.is_none() {
-                draft_model_path =
-                    resolve_draft_model_path(gguf.parent().unwrap_or(Path::new(".")), None)?
-                        .map(|path| path.to_string_lossy().into_owned());
+        let source = CheckpointSource::resolve(path, NativeGgufFamily::Gemma4).await?;
+        let loaded = async {
+            // A GGUF keeps sibling draft discovery from the directory it was
+            // given in; an explicit draft option still wins.
+            if matches!(source, CheckpointSource::Gguf(_))
+                && draft_model_path.is_none()
+                && !path.join(GGUF_SOURCE_FILE).is_file()
+            {
+                let dir = if path.is_dir() {
+                    path
+                } else {
+                    path.parent().unwrap_or(Path::new("."))
+                };
+                draft_model_path = resolve_draft_model_path(dir, None)?
+                    .map(|path| path.to_string_lossy().into_owned());
             }
-            let prepared = crate::utils::gguf::prepare_gemma4_native_gguf(&gguf).await?;
-            let path = prepared.to_string_lossy().into_owned();
-            leased = Some(prepared);
-            path
-        } else {
-            model_path.to_string()
+            Self::load_with_source(&source, draft_model_path).await
+        }
+        .await;
+        if loaded.is_err() {
+            source.release_lease();
+        }
+        loaded
+    }
+
+    /// The caller releases `source`'s lease when this fails.
+    async fn load_with_source(
+        source: &CheckpointSource,
+        draft_model_path: Option<String>,
+    ) -> Result<Self> {
+        let model_path = source.asset_dir().to_string_lossy().into_owned();
+        let preload_input = match source {
+            CheckpointSource::Dir(_) => None,
+            CheckpointSource::Gguf(checkpoint) => {
+                checkpoint.check_asset_config()?;
+                Some(checkpoint.preload_input(false))
+            }
         };
 
         let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
@@ -3187,8 +3293,11 @@ impl Gemma4Model {
                 // sampling — the deterministic path is race-free
                 // against concurrent inference. See `cache_limit.rs`
                 // module docs.
-                let (inner, weight_bytes) =
-                    Gemma4Inner::load_from_dir(&model_path, draft_model_path.as_deref())?;
+                let (inner, weight_bytes) = Gemma4Inner::load_from_source(
+                    &model_path,
+                    preload_input,
+                    draft_model_path.as_deref(),
+                )?;
                 let pool_bytes = inner
                     .kv_cache_coordinator
                     .as_ref()
@@ -3241,18 +3350,8 @@ impl Gemma4Model {
             draft_active,
         ) = match init_rx.await {
             Ok(Ok(init)) => init,
-            Ok(Err(error)) => {
-                if let Some(dir) = leased {
-                    crate::utils::gguf::native_gguf_unlease_in_use(&dir);
-                }
-                return Err(error);
-            }
-            Err(_) => {
-                if let Some(dir) = leased {
-                    crate::utils::gguf::native_gguf_unlease_in_use(&dir);
-                }
-                return Err(napi::Error::from_reason("Model thread exited during load"));
-            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(napi::Error::from_reason("Model thread exited during load")),
         };
 
         Ok(Gemma4Model {
@@ -3273,6 +3372,212 @@ impl Gemma4Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn work_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("mlx-gemma4-{tag}-{}", uuid::Uuid::new_v4()))
+    }
+
+    async fn resolve_gguf(gguf: &Path, cache: &Path) -> CheckpointSource {
+        let source = CheckpointSource::resolve_in(gguf, NativeGgufFamily::Gemma4, Some(cache))
+            .await
+            .unwrap();
+        let CheckpointSource::Gguf(ckpt) = &source else {
+            panic!("the gemma GGUF resolved to a plain directory");
+        };
+        ckpt.check_asset_config().unwrap();
+        source
+    }
+
+    fn gguf_checkpoint(
+        source: &CheckpointSource,
+    ) -> &crate::engine::checkpoint_source::GgufCheckpoint {
+        match source {
+            CheckpointSource::Gguf(ckpt) => ckpt,
+            CheckpointSource::Dir(_) => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn gemma_mmproj_appended_only_with_media() {
+        use crate::utils::gguf_test_fixtures::write_import_fixture;
+
+        let work = work_dir("mmproj");
+        let fx = write_import_fixture("gemma4-mmproj", &work.join("src"));
+        let source = resolve_gguf(&fx.main, &work.join("cache")).await;
+        let ckpt = gguf_checkpoint(&source);
+        let media_on = parse_config(&ckpt.asset_dir).unwrap();
+        assert!(should_load_media_sidecar(&media_on));
+        let mut media_off = media_on.clone();
+        media_off.vision_config = None;
+        media_off.unified_vision_config = None;
+        media_off.has_audio = false;
+        assert!(!should_load_media_sidecar(&media_off));
+
+        let is_media = |key: &String| key.contains("embed_vision");
+        let (on, _) = load_gemma_weights(
+            &ckpt.asset_dir,
+            &media_on,
+            Some(ckpt.preload_input(false)),
+            usize::MAX,
+        )
+        .unwrap();
+        let (off, _) = load_gemma_weights(
+            &ckpt.asset_dir,
+            &media_off,
+            Some(ckpt.preload_input(false)),
+            usize::MAX,
+        )
+        .unwrap();
+        let media_keys: Vec<&String> = on.keys().filter(|key| is_media(key)).collect();
+        assert!(
+            !media_keys.is_empty(),
+            "media on: the mmproj tensors were not appended"
+        );
+        let leaked: Vec<&String> = off.keys().filter(|key| is_media(key)).collect();
+        assert!(
+            leaked.is_empty(),
+            "media off: the mmproj tensors were appended: {leaked:?}"
+        );
+        assert_eq!(
+            off.len() + media_keys.len(),
+            on.len(),
+            "media on/off differ beyond the mmproj tensors"
+        );
+        source.release_lease();
+        std::fs::remove_dir_all(&work).ok();
+    }
+
+    #[tokio::test]
+    async fn gemma_ple_shards_from_preload_pass_validation() {
+        use crate::utils::gguf::{GgufMetaValue, GgufTensorType};
+        use crate::utils::gguf_test_fixtures::build_minimal_gguf;
+
+        const ROWS: u64 = 64;
+        const COLS: u64 = 4;
+        const BUDGET: usize = 100;
+        let rows_per_shard = BUDGET / (COLS as usize * 2);
+        let bf16 = |n: usize, seed: u16| -> Vec<u8> {
+            (0..n as u16)
+                .flat_map(|i| (0x3c00u16 + seed.wrapping_add(i)).to_le_bytes())
+                .collect()
+        };
+        let f32s = |n: usize| -> Vec<u8> { (0..n).flat_map(|_| 1.0f32.to_le_bytes()).collect() };
+        let (embed, proj, ple) = (bf16(32, 0), bf16(32, 100), bf16((ROWS * COLS) as usize, 7));
+        let (norm, proj_norm) = (f32s(8), f32s(4));
+
+        let work = work_dir("ple");
+        let src = work.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("config.json"),
+            serde_json::json!({
+                "model_type": "gemma4",
+                "text_config": {
+                    "num_hidden_layers": 0,
+                    "hidden_size_per_layer_input": COLS,
+                    "vocab_size_per_layer_input": ROWS
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(src.join("tokenizer.json"), "{}").unwrap();
+        let gguf = src.join("gemma-ple.gguf");
+        std::fs::write(
+            &gguf,
+            build_minimal_gguf(
+                &[(
+                    "general.architecture",
+                    GgufMetaValue::String("gemma4".into()),
+                )],
+                &[
+                    ("token_embd.weight", &[8, 4], GgufTensorType::BF16, &embed),
+                    ("output_norm.weight", &[8], GgufTensorType::F32, &norm),
+                    (
+                        "model.per_layer_model_projection.weight",
+                        &[8, 4],
+                        GgufTensorType::BF16,
+                        &proj,
+                    ),
+                    (
+                        "model.per_layer_projection_norm.weight",
+                        &[4],
+                        GgufTensorType::F32,
+                        &proj_norm,
+                    ),
+                    (
+                        "model.embed_tokens_per_layer.weight",
+                        &[COLS, ROWS],
+                        GgufTensorType::BF16,
+                        &ple,
+                    ),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let source = resolve_gguf(&gguf, &work.join("cache")).await;
+        let ckpt = gguf_checkpoint(&source);
+        let config = parse_config(&ckpt.asset_dir).unwrap();
+        assert!(config.per_layer_input_embeds, "fixture config has no PLE");
+
+        let (whole, none) = load_gemma_weights(
+            &ckpt.asset_dir,
+            &config,
+            Some(ckpt.preload_input(false)),
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(none.is_none(), "a PLE under the budget was sharded");
+        let want = whole["model.embed_tokens_per_layer.weight"]
+            .to_uint16_native()
+            .unwrap();
+
+        let (mut params, shards) = load_gemma_weights(
+            &ckpt.asset_dir,
+            &config,
+            Some(ckpt.preload_input(false)),
+            BUDGET,
+        )
+        .unwrap();
+        let (shards, rps) = shards.expect("the PLE above the budget was not sharded");
+        assert_eq!(rps, rows_per_shard, "rows per shard");
+        assert_eq!(
+            shards.len(),
+            (ROWS as usize).div_ceil(rows_per_shard),
+            "shard count"
+        );
+        assert!(
+            !params.contains_key("model.embed_tokens_per_layer.weight"),
+            "the sharded PLE is still in the weight map"
+        );
+        let mut got = Vec::new();
+        for (i, shard) in shards.iter().enumerate() {
+            assert!(shard.nbytes() <= BUDGET, "shard {i}: {} B", shard.nbytes());
+            got.extend(shard.to_uint16_native().unwrap());
+        }
+        assert_eq!(got, want, "PLE shard bytes differ from the whole table");
+
+        let sanitized = sanitize_weights(&mut params, &config).unwrap();
+        let validated = validate_required_weights(&sanitized, &config, true);
+        assert!(
+            validated.is_ok(),
+            "PLE shards from the preload failed validation: {}",
+            validated
+                .as_ref()
+                .err()
+                .map(|e| e.reason.as_str())
+                .unwrap_or_default()
+        );
+        let err = validate_required_weights(&sanitized, &config, false).unwrap_err();
+        assert!(
+            err.reason.contains(PLE_EMBED_KEY),
+            "unexpected error: {}",
+            err.reason
+        );
+        source.release_lease();
+        std::fs::remove_dir_all(&work).ok();
+    }
 
     /// Write a `config.json` into a fresh temp dir and run `parse_config` on it.
     /// Returns the parsed config plus the temp dir path so the caller can clean up.
@@ -5200,13 +5505,14 @@ mod tests {
         };
 
         // Control 1: the complete dense key set validates.
-        validate_required_weights(&full(), &config).expect("complete dense set must validate");
+        validate_required_weights(&full(), &config, false)
+            .expect("complete dense set must validate");
 
         // Control 2: a legitimate QUANTIZED group carries BOTH `.weight`
         // (packed) and `.scales` — the strict check must still pass.
         let mut p = full();
         p.insert("layers.0.mlp.gate_proj.scales".into(), dummy());
-        validate_required_weights(&p, &config)
+        validate_required_weights(&p, &config, false)
             .expect("quantized group (weight + scales sidecar) must validate");
 
         // Scales-only: stripping `.weight` while keeping `.scales` must be
@@ -5214,7 +5520,7 @@ mod tests {
         let mut p = full();
         p.remove("layers.0.mlp.gate_proj.weight");
         p.insert("layers.0.mlp.gate_proj.scales".into(), dummy());
-        let err = validate_required_weights(&p, &config)
+        let err = validate_required_weights(&p, &config, false)
             .expect_err("a lone .scales must no longer satisfy a required .weight");
         assert!(
             format!("{err}").contains("layers.0.mlp.gate_proj.weight"),
@@ -5282,7 +5588,7 @@ mod tests {
         let params = full();
         assert!(!params.contains_key("layers.1.self_attn.k_proj.weight"));
         assert!(!params.contains_key("layers.1.self_attn.v_proj.weight"));
-        validate_required_weights(&params, &config)
+        validate_required_weights(&params, &config, false)
             .expect("a KV-shared layer may omit its own K/V projections");
 
         for missing in [
@@ -5292,7 +5598,7 @@ mod tests {
         ] {
             let mut params = full();
             params.remove(missing);
-            let err = validate_required_weights(&params, &config)
+            let err = validate_required_weights(&params, &config, false)
                 .expect_err("owned K/V and every layer's Q projection remain mandatory");
             assert!(
                 format!("{err}").contains(missing),
@@ -5354,7 +5660,7 @@ mod tests {
         };
 
         let ple_config = make_config(true);
-        validate_required_weights(&full(), &ple_config)
+        validate_required_weights(&full(), &ple_config, false)
             .expect("complete PLE checkpoint must validate");
         for missing in [
             "embed_tokens_per_layer.weight",
@@ -5366,7 +5672,7 @@ mod tests {
         ] {
             let mut params = full();
             params.remove(missing);
-            let err = validate_required_weights(&params, &ple_config)
+            let err = validate_required_weights(&params, &ple_config, false)
                 .expect_err("every enabled PLE component must be required");
             assert!(
                 format!("{err}").contains(missing),
@@ -5376,7 +5682,7 @@ mod tests {
 
         let mut non_ple = full();
         non_ple.retain(|key, _| !key.contains("per_layer"));
-        validate_required_weights(&non_ple, &make_config(false))
+        validate_required_weights(&non_ple, &make_config(false), false)
             .expect("non-PLE checkpoints must not require PLE weights");
     }
 
@@ -5453,7 +5759,7 @@ mod tests {
             let mut p = base_params();
             p.insert("lm_head.scales".into(), dummy());
             p.insert("lm_head.biases".into(), dummy());
-            let err = validate_required_weights(&p, &config)
+            let err = validate_required_weights(&p, &config, false)
                 .expect_err("untied lm_head with only .scales must fail validation");
             assert!(
                 format!("{err}").contains("lm_head.weight"),
@@ -5497,7 +5803,7 @@ mod tests {
         {
             let config = make_validate_config(true);
             let p = base_params();
-            validate_required_weights(&p, &config)
+            validate_required_weights(&p, &config, false)
                 .expect("tied model without lm_head.weight must still validate");
         }
     }
@@ -6132,12 +6438,12 @@ mod tests {
         // Unclipped, non-standardized checkpoints require only learned tower
         // tensors. Every one, including the second vision layer, is mandatory.
         let base = make_config(false, false);
-        validate_required_weights(&full(&base), &base)
+        validate_required_weights(&full(&base), &base, false)
             .expect("complete standard SigLIP key set must validate");
         for missing in standard_vision_keys(&base) {
             let mut params = full(&base);
             params.remove(&missing);
-            let err = validate_required_weights(&params, &base).unwrap_err();
+            let err = validate_required_weights(&params, &base, false).unwrap_err();
             assert!(
                 format!("{err}").contains(&missing),
                 "missing standard vision key '{missing}' must fail closed and name the key, got: {err}"
@@ -6151,16 +6457,16 @@ mod tests {
             "embed_vision.embedding_projection.scales".to_string(),
             dummy(),
         );
-        validate_required_weights(&quantized_projection, &base)
+        validate_required_weights(&quantized_projection, &base, false)
             .expect("quantized vision projection may omit affine biases");
         quantized_projection.insert(
             "embed_vision.embedding_projection.biases".to_string(),
             dummy(),
         );
-        validate_required_weights(&quantized_projection, &base)
+        validate_required_weights(&quantized_projection, &base, false)
             .expect("quantized vision projection with affine biases must validate");
         quantized_projection.remove("embed_vision.embedding_projection.weight");
-        let err = validate_required_weights(&quantized_projection, &base)
+        let err = validate_required_weights(&quantized_projection, &base, false)
             .expect_err("projection sidecars without payload weight must fail closed");
         assert!(
             format!("{err}").contains("embed_vision.embedding_projection.weight"),
@@ -6170,7 +6476,7 @@ mod tests {
         // Clipping and standardization are config-gated, but complete and
         // mandatory when enabled. Removing any conditional tensor must fail.
         let conditioned = make_config(true, true);
-        validate_required_weights(&full(&conditioned), &conditioned)
+        validate_required_weights(&full(&conditioned), &conditioned, false)
             .expect("complete clipped+standardized SigLIP key set must validate");
         let conditional_keys: Vec<String> = standard_vision_keys(&conditioned)
             .into_iter()
@@ -6186,7 +6492,7 @@ mod tests {
         for missing in conditional_keys {
             let mut params = full(&conditioned);
             params.remove(&missing);
-            let err = validate_required_weights(&params, &conditioned).unwrap_err();
+            let err = validate_required_weights(&params, &conditioned, false).unwrap_err();
             assert!(
                 format!("{err}").contains(&missing),
                 "missing conditional vision key '{missing}' must fail closed and name the key, got: {err}"
@@ -6276,7 +6582,7 @@ mod tests {
                 .all(|key| !key.starts_with("model.") && !key.contains(".linear.weight")),
             "sanitized SigLIP keys must use loader-internal names"
         );
-        validate_required_weights(&sanitized, &config)
+        validate_required_weights(&sanitized, &config, false)
             .expect("sanitized raw SigLIP key set must satisfy the validator");
     }
 
@@ -6368,7 +6674,7 @@ mod tests {
         };
 
         // Happy path: the complete set (text + unified vision) validates.
-        validate_required_weights(&full(), &config)
+        validate_required_weights(&full(), &config, false)
             .expect("complete unified-vision key set must validate");
 
         // Negative: each required unified vision key, when absent, must fail
@@ -6388,7 +6694,7 @@ mod tests {
         ] {
             let mut p = full();
             p.remove(missing);
-            let err = validate_required_weights(&p, &config).unwrap_err();
+            let err = validate_required_weights(&p, &config, false).unwrap_err();
             assert!(
                 format!("{err}").contains(missing),
                 "missing unified vision key '{missing}' must fail closed and name the key, got: {err}"
@@ -6414,7 +6720,7 @@ mod tests {
         let mut p = full();
         // Strip every vision key — a text-only model still validates.
         p.retain(|k, _| !k.starts_with("vision_embedder.") && !k.starts_with("embed_vision."));
-        validate_required_weights(&p, &text_only)
+        validate_required_weights(&p, &text_only, false)
             .expect("text-only config must not require unified vision keys");
     }
 
@@ -6491,7 +6797,7 @@ mod tests {
         };
 
         // The declared tower does not exist in the checkpoint: text-only.
-        validate_required_weights(&text_only(), &config)
+        validate_required_weights(&text_only(), &config, false)
             .expect("a vision-declaring text-only checkpoint must validate");
 
         // One vision tensor makes the whole tower required again — a truncated
@@ -6501,7 +6807,7 @@ mod tests {
             "vision_tower.patch_embedder.input_proj.weight".to_string(),
             dummy(),
         );
-        let err = validate_required_weights(&partial, &config)
+        let err = validate_required_weights(&partial, &config, false)
             .expect_err("a partially present vision tower must fail closed");
         assert!(
             format!("{err}").contains("vision_tower.patch_embedder.position_embedding_table"),
@@ -6511,7 +6817,7 @@ mod tests {
         // Text weights stay fail-closed with no vision tensors at all.
         let mut missing_text = text_only();
         missing_text.remove("norm.weight");
-        let err = validate_required_weights(&missing_text, &config)
+        let err = validate_required_weights(&missing_text, &config, false)
             .expect_err("a missing text weight must still fail");
         assert!(
             format!("{err}").contains("Missing required weight: norm.weight"),

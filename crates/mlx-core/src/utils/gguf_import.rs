@@ -1112,17 +1112,75 @@ fn dtype_pass_target(
     plan: &ImportPlan,
     opts: &ImportOptions,
 ) -> Result<Option<DType>> {
-    let Some(target) = opts.dtype.filter(|_| !plan.prism) else {
+    if opts.dtype.filter(|_| !plan.prism).is_none() {
         return Ok(None);
-    };
+    }
+    Ok(dtype_target_for(key, arr.dtype()?, plan, opts))
+}
+
+fn dtype_target_for(
+    key: &str,
+    dtype: DType,
+    plan: &ImportPlan,
+    opts: &ImportOptions,
+) -> Option<DType> {
+    let target = opts.dtype.filter(|_| !plan.prism)?;
     if plan.preserve_dtype_keys.contains(key)
         || key.ends_with(".scales")
         || key.ends_with(".biases")
-        || arr.dtype()? == DType::Uint32
+        || dtype == DType::Uint32
     {
+        return None;
+    }
+    Some(target)
+}
+
+/// `(gguf name, rows per shard)` for the one dense 2-D tensor whose
+/// checkpoint key satisfies `is_target`, when it imports as `dtype` and its
+/// imported bytes exceed `budget`; rows per shard = max(1, budget / imported
+/// row bytes). Header only.
+pub(crate) fn plan_dense_row_shards(
+    header: &GgufFile,
+    plan: &ImportPlan,
+    opts: &ImportOptions,
+    is_target: &dyn Fn(&str) -> bool,
+    dtype: DType,
+    budget: usize,
+) -> Result<Option<(String, usize)>> {
+    let mut hits = header.tensors.iter().filter_map(|t| {
+        let key = gguf_name_to_hf_for_metadata(&t.name, &header.metadata)?;
+        is_target(&key).then_some((t, key))
+    });
+    let Some((t, key)) = hits.next() else {
+        return Ok(None);
+    };
+    if let Some((other, _)) = hits.next() {
+        return Err(Error::from_reason(format!(
+            "GGUF tensors '{}' and '{}' both map to checkpoint key '{key}'",
+            t.name, other.name
+        )));
+    }
+    let (Some(source), [cols, rows]) = (dense_dtype(t.tensor_type), t.dims.as_slice()) else {
+        return Ok(None);
+    };
+    if dtype_target_for(&key, source, plan, opts).unwrap_or(source) != dtype {
         return Ok(None);
     }
-    Ok(Some(target))
+    let row_bytes = usize::try_from(*cols)
+        .ok()
+        .and_then(|cols| cols.checked_mul(dtype.byte_size()))
+        .filter(|&bytes| bytes > 0);
+    let total = row_bytes.and_then(|row| usize::try_from(*rows).ok()?.checked_mul(row));
+    match (row_bytes, total) {
+        (Some(row_bytes), Some(total)) if total > budget => {
+            Ok(Some((t.name.clone(), (budget / row_bytes).max(1))))
+        }
+        (Some(_), Some(_)) => Ok(None),
+        _ => Err(Error::from_reason(format!(
+            "GGUF tensor '{}' has dims {:?} that overflow a row-shard plan",
+            t.name, t.dims
+        ))),
+    }
 }
 
 /// GGUF → HF names, layout fixups, the CLEF head split, and the optional
