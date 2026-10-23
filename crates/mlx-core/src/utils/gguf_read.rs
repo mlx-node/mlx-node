@@ -731,6 +731,7 @@ mod tests {
                 alignment,
                 4096 + 7,
                 vec![
+                    (vec![1], GgufTensorType::F16),
                     (vec![1], GgufTensorType::F32),
                     (vec![3], GgufTensorType::F16),
                     (vec![256, 64], GgufTensorType::Q4K),
@@ -741,10 +742,10 @@ mod tests {
                     (vec![17, 5], GgufTensorType::F32),
                 ],
             );
-            assert_eq!(h.tensors[4].data_size().unwrap(), 100 * MIB as u64);
+            assert_eq!(h.tensors[5].data_size().unwrap(), 100 * MIB as u64);
             check_plan(&h, len, MIB, &|_| 1);
-            check_plan(&h, len, MIB, &|t| if t == 3 || t == 6 { 64 } else { 1 });
-            check_plan(&h, len, 3 * MIB + 5, &|t| if t == 3 { 64 } else { 1 });
+            check_plan(&h, len, MIB, &|t| if t == 4 || t == 7 { 64 } else { 1 });
+            check_plan(&h, len, 3 * MIB + 5, &|t| if t == 4 { 64 } else { 1 });
         }
     }
 
@@ -774,7 +775,7 @@ mod tests {
             assert_eq!(w.file_off % ALIGN, 0, "{w:?}");
             let end = w.file_off + w.len as u64;
             assert!(
-                end == len || w.len as u64 % ALIGN == 0,
+                end == len || (w.len as u64).is_multiple_of(ALIGN),
                 "{w:?} file_len {len}"
             );
         }
