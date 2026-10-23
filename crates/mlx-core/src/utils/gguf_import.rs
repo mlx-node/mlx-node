@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! In-memory GGUF import: the file is read in aligned windows into a small
 //! ring of staging buffers, and every band of rows is repacked (GPU kernels,
 //! or the pure-Rust CPU fallback) straight into the final weight buffers. The
@@ -17,11 +16,13 @@ use napi::{Error, Result};
 use crate::array::alloc::{DstPtrs, OutLayout, SendPtr};
 use crate::array::{DType, MxArray, clear_cache, synchronize};
 use crate::stream::{DeviceType, Stream};
+#[cfg(test)]
+use crate::utils::gguf::NativeGgufFamily;
 use crate::utils::gguf::{
-    GgufFile, GgufLoadOptions, GgufTensorInfo, GgufTensorType, NativeGgufFamily,
-    convert_tensor_dtype, extract_clef_head_assets, fixup_gemma4_mmproj_layout,
-    fixup_gemma4v_mmproj_layout, fixup_qwen35_linear_attn, fixup_qwen35_moe_shared_expert_gate,
-    fixup_shapes, gguf_name_to_hf_for_metadata, load_gguf_tensor, remap_keys,
+    GgufFile, GgufLoadOptions, GgufTensorInfo, GgufTensorType, convert_tensor_dtype,
+    extract_clef_head_assets, fixup_gemma4_mmproj_layout, fixup_gemma4v_mmproj_layout,
+    fixup_qwen35_linear_attn, fixup_qwen35_moe_shared_expert_gate, fixup_shapes,
+    gguf_name_to_hf_for_metadata, load_gguf_tensor, remap_keys,
 };
 use crate::utils::gguf_cpu_repack::{
     copy_dense_band_into, cpu_kquant_band_into, decode_affine_band_into,
@@ -34,9 +35,9 @@ use crate::utils::gguf_read::{
     ALIGN, CHUNK_BYTES, PageCacheMode, READ_THREADS, ReadAt, Reader, SLOT_BYTES, SLOTS, Window,
     log_load_start, maybe_log_slow_disk, plan_reads, sampled_resident_fraction, set_nocache,
 };
-use crate::utils::gguf_source::{
-    GGUF_IMPORT_CONTRACT, GgufFileHandle, GgufFileIdentity, GgufIdentity, GgufSourceSet,
-};
+#[cfg(test)]
+use crate::utils::gguf_source::{GGUF_IMPORT_CONTRACT, GgufIdentity};
+use crate::utils::gguf_source::{GgufFileHandle, GgufFileIdentity, GgufSourceSet};
 use crate::utils::host::physical_memory;
 
 pub(crate) const CPU_THREADS: usize = 8;
@@ -48,6 +49,7 @@ pub(crate) const CPU_BAND_BYTES: usize = 2 << 20;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RepackBackend {
     Auto,
+    #[cfg(test)]
     CpuOnly,
 }
 
@@ -59,6 +61,7 @@ pub(crate) struct LoadStats {
     pub read_secs: f64,
     pub preload_secs: f64,
     pub nocache: bool,
+    #[cfg(test)]
     pub resident: Option<f64>,
     pub gpu_tensors: usize,
     pub cpu_tensors: usize,
@@ -786,6 +789,7 @@ pub(crate) fn read_gguf_tensors_with(
             read_secs: timing.read_secs,
             preload_secs: started.elapsed().as_secs_f64(),
             nocache,
+            #[cfg(test)]
             resident,
             ..stats_base
         },
@@ -1298,7 +1302,6 @@ pub(crate) type PreloadFile = (PathBuf, Arc<GgufFile>, GgufFileIdentity, ImportP
 pub(crate) struct PreloadInput {
     pub main: PreloadFile,
     pub companion: Option<PreloadFile>,
-    pub family: NativeGgufFamily,
     /// Read the companion (gemma: media on; muse: draft present).
     pub load_companion: bool,
     pub opts: ImportOptions,
@@ -1312,14 +1315,12 @@ impl PreloadInput {
     pub(crate) fn new(
         main: PreloadFile,
         companion: Option<PreloadFile>,
-        family: NativeGgufFamily,
         load_companion: bool,
         opts: ImportOptions,
     ) -> Self {
         Self {
             main,
             companion,
-            family,
             load_companion,
             opts,
             #[cfg(test)]
@@ -1338,6 +1339,7 @@ pub(crate) struct GgufPreload {
     pub clef_head: Option<(HashMap<String, MxArray>, serde_json::Value)>,
     /// Row shards of the plan's `ple_shard` tensor (absent from `main`).
     pub ple_shards: Option<(Vec<MxArray>, usize)>,
+    #[cfg(test)]
     pub identity: GgufIdentity,
     pub stats: LoadStats,
 }
@@ -1442,6 +1444,7 @@ impl GgufPreload {
             companion: companion_map,
             clef_head,
             ple_shards,
+            #[cfg(test)]
             identity: GgufIdentity {
                 files: std::iter::once(main_identity)
                     .chain(input.companion.as_ref().map(|(_, _, identity, _)| identity))
@@ -2529,7 +2532,6 @@ pub(crate) mod gate {
             companion
                 .map(|c| file(c, &companion_opts, companion_role))
                 .transpose()?,
-            family,
             load_companion,
             main_opts,
         ))

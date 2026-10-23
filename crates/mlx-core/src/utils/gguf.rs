@@ -9067,7 +9067,6 @@ pub(crate) async fn prepare_gguf_assets_in(
         companion: companion.clone(),
         plans: (main_plan.clone(), companion_plan.clone()),
         opts: opts.clone(),
-        family,
         leased: true,
     };
 

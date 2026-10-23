@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -11,6 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::cold_tier::ShardIdentity;
 use crate::utils::gguf::{GgufFile, source_file_identity_digest};
 
+#[cfg(test)]
 pub(crate) const GGUF_IMPORT_CONTRACT: &str = "gguf-import:v8";
 
 pub(crate) struct GgufFileHandle {
@@ -34,6 +33,7 @@ pub(crate) struct GgufFileIdentity {
     pub header_digest: [u8; 32],
 }
 
+#[cfg(test)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct GgufIdentity {
     pub files: Vec<GgufFileIdentity>,
@@ -121,6 +121,7 @@ impl GgufSourceSet {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn identity(&self) -> GgufIdentity {
         GgufIdentity {
             files: std::iter::once(&self.main)
@@ -131,6 +132,7 @@ impl GgufSourceSet {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn data_bytes(&self) -> u64 {
         std::iter::once(&self.main)
             .chain(self.companion.as_ref())

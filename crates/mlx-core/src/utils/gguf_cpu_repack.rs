@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! CPU fallback of the staged GGUF import: GGUF blocks of a row band are
 //! repacked straight into the tensor's preallocated destination buffers. Pure
 //! Rust, no MLX call, so it runs on any thread. The bytes equal the whole-file
@@ -59,6 +58,7 @@ pub(crate) unsafe fn tile_rows_raw<T: Copy>(
     }
 }
 
+#[cfg(test)]
 fn check_tiling(len: usize, band: usize, row0: usize, rows: usize, cols: usize, unit: usize) {
     assert!(
         unit > 0
@@ -72,6 +72,7 @@ fn check_tiling(len: usize, band: usize, row0: usize, rows: usize, cols: usize, 
 }
 
 /// [`tile_rows_raw`] into a slice holding the whole `[N, cols]` array.
+#[cfg(test)]
 pub(crate) fn tile_rows_into<T: Copy>(
     dst: &mut [T],
     band: &[T],

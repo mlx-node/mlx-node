@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! GPU repack of GGUF raw blocks into the runtime packed arrays, one band of
 //! rows at a time, into destination buffers allocated up front
 //! (`mlx_gguf_repack.cpp`, kernels in `paged_attn.metallib`). The output bytes
@@ -27,6 +26,7 @@ pub(crate) enum GpuRepackKind {
 }
 
 impl GpuRepackKind {
+    #[cfg(test)]
     pub(crate) fn gguf_type(self) -> GgufTensorType {
         match self {
             Self::Q4K => GgufTensorType::Q4K,

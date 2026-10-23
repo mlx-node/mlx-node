@@ -40,7 +40,6 @@ pub(crate) struct GgufCheckpoint {
     pub companion: Option<GgufSourceFile>,
     pub plans: (ImportPlan, Option<ImportPlan>),
     pub opts: ImportOptions,
-    pub family: NativeGgufFamily,
     /// `asset_dir` carries a lease this load must release on failure.
     pub leased: bool,
 }
@@ -113,7 +112,6 @@ impl GgufCheckpoint {
                 .as_ref()
                 .zip(self.plans.1.as_ref())
                 .map(|(companion, plan)| file(companion, plan)),
-            self.family,
             load_companion,
             self.opts.clone(),
         )
@@ -162,7 +160,6 @@ impl GgufCheckpoint {
             companion,
             plans: (main_plan, companion_plan),
             opts,
-            family,
             leased: false,
         })
     }
