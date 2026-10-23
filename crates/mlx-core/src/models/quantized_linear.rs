@@ -958,10 +958,93 @@ pub fn release_tiled_kquant_sources(
     params: &mut HashMap<String, MxArray>,
     tiled: &mut Vec<String>,
 ) {
+    let released = !tiled.is_empty();
     for prefix in tiled.drain(..) {
         for suffix in ["weight", "scales", "biases"] {
             params.remove(&format!("{prefix}.{suffix}"));
         }
+    }
+    if released && FREE_RELEASED_SOURCES.with(std::cell::Cell::get) {
+        crate::array::clear_cache();
+    }
+}
+
+thread_local! {
+    static FREE_RELEASED_SOURCES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While alive, [`release_tiled_kquant_sources`] on this thread also returns
+/// the released buffers to the OS. Enable it for a build over a map whose
+/// arrays are all materialized up front (GGUF preload): nothing later in the
+/// build allocates source-sized buffers, so released sources would otherwise
+/// pile up in the MLX buffer cache (+5.4 GiB peak footprint on Qwen3.8-27B).
+/// A lazy safetensors map reuses them for the next layer's loads instead.
+#[must_use]
+pub struct FreeReleasedSources(bool);
+
+impl FreeReleasedSources {
+    pub fn enable(on: bool) -> Self {
+        Self(FREE_RELEASED_SOURCES.with(|flag| flag.replace(on)))
+    }
+}
+
+impl Drop for FreeReleasedSources {
+    fn drop(&mut self) {
+        FREE_RELEASED_SOURCES.with(|flag| flag.set(self.0));
+    }
+}
+
+#[cfg(test)]
+mod release_sources_tests {
+    use super::*;
+    use crate::array::memory::TEST_CLEAR_CACHE_CALLS;
+
+    fn release_one(params: &mut HashMap<String, MxArray>, prefix: &str) -> u32 {
+        for suffix in ["weight", "scales", "biases"] {
+            params.insert(
+                format!("{prefix}.{suffix}"),
+                MxArray::from_float32(&[1.0], &[1]).unwrap(),
+            );
+        }
+        let before = TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get);
+        release_tiled_kquant_sources(params, &mut vec![prefix.to_string()]);
+        assert!(params.is_empty(), "{prefix}: sources not released");
+        TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get) - before
+    }
+
+    #[test]
+    fn released_sources_leave_the_cache_only_under_the_guard() {
+        let mut params = HashMap::new();
+        assert_eq!(
+            release_one(&mut params, "dir"),
+            0,
+            "lazy-map release cleared the cache"
+        );
+        {
+            let _free = FreeReleasedSources::enable(true);
+            assert_eq!(
+                release_one(&mut params, "preload"),
+                1,
+                "preload release kept the cache"
+            );
+            let before = TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get);
+            release_tiled_kquant_sources(&mut params, &mut Vec::new());
+            assert_eq!(TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get), before);
+            {
+                let _off = FreeReleasedSources::enable(false);
+                assert_eq!(release_one(&mut params, "nested-off"), 0);
+            }
+            assert_eq!(
+                release_one(&mut params, "restored"),
+                1,
+                "inner guard did not restore"
+            );
+        }
+        assert_eq!(
+            release_one(&mut params, "after"),
+            0,
+            "guard leaked past its scope"
+        );
     }
 }
 

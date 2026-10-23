@@ -2705,6 +2705,9 @@ async fn load_with_thread_impl(
                 // of embedding it in the main model shards. When present, prefer
                 // the sidecar and drop embedded MTP tensors so key normalization
                 // cannot leave duplicate `mtp.*` entries racing during sanitize.
+                let _free_released = crate::models::quantized_linear::FreeReleasedSources::enable(
+                    preload_input.is_some(),
+                );
                 let mut preload = preload_input.as_ref().map(GgufPreload::load).transpose()?;
                 if let Some(preload) = preload.as_ref() {
                     let stats = &preload.stats;

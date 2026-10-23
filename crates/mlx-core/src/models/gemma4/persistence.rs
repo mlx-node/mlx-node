@@ -2797,6 +2797,8 @@ impl Gemma4Inner {
             resolve_persist_cold("gemma4", persist_env.as_deref(), config.persist_paged_cache);
         let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
 
+        let _free_released =
+            crate::models::quantized_linear::FreeReleasedSources::enable(preload_input.is_some());
         let (mut params, ple_shards) =
             load_gemma_weights(path, &config, preload_input, ple_shard_byte_budget())?;
 

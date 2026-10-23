@@ -1882,6 +1882,9 @@ pub(crate) async fn load_with_source(
                     && !source_moe_policy.active();
                 let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
 
+                let _free_released = crate::models::quantized_linear::FreeReleasedSources::enable(
+                    preload_input.is_some(),
+                );
                 let mut raw_params = load_moe_weights(path, preload_input.as_ref())?;
 
                 // Second snapshot, against the same inodes the mmap pinned;
