@@ -2540,7 +2540,7 @@ pub fn gguf_name_to_hf(name: &str) -> String {
 /// Remap all keys from GGUF names to HuggingFace names. Reject collisions
 /// rather than letting `HashMap::collect` silently keep one of two semantic
 /// tensors (the failure mode that exposed Gemma4's four-norm mapping gap).
-fn remap_keys(
+pub(super) fn remap_keys(
     weights: HashMap<String, MxArray>,
     metadata: &HashMap<String, GgufMetaValue>,
 ) -> Result<HashMap<String, MxArray>> {
@@ -2583,7 +2583,7 @@ fn square_side_for_chw(flat_dim: i64, key: &str) -> Result<i64> {
 /// two position tables as `[2, positions, hidden]`, versus
 /// `[positions, 2, hidden]` in the checkpoint. Apply only to the positively
 /// identified Gemma4 unified mmproj so other CLIP/Qwen layouts stay unchanged.
-fn fixup_gemma4_mmproj_layout(
+pub(super) fn fixup_gemma4_mmproj_layout(
     weights: &mut HashMap<String, MxArray>,
     metadata: &HashMap<String, GgufMetaValue>,
 ) -> Result<()> {
@@ -2658,7 +2658,7 @@ fn fixup_gemma4_mmproj_layout(
 /// reverses to `[2, positions, hidden]` — already the checkpoint's
 /// `position_embedding_table` layout, so it only needs a shape check. Every
 /// other `gemma4v` tensor is a 1-D/2-D passthrough.
-fn fixup_gemma4v_mmproj_layout(
+pub(super) fn fixup_gemma4v_mmproj_layout(
     weights: &mut HashMap<String, MxArray>,
     metadata: &HashMap<String, GgufMetaValue>,
 ) -> Result<()> {
@@ -2700,7 +2700,7 @@ fn fixup_gemma4v_mmproj_layout(
 /// - Norm weights: GGUF stores delta from 1.0 (like unsanitized HF) → add +1.0
 ///   Applies to input_layernorm, post_attention_layernorm, q_norm, k_norm, final_norm,
 ///   but NOT linear_attn.norm (stored with final values, no shift needed).
-fn fixup_shapes(weights: &mut HashMap<String, MxArray>) -> Result<()> {
+pub(super) fn fixup_shapes(weights: &mut HashMap<String, MxArray>) -> Result<()> {
     // Fix conv1d shapes
     let conv1d_keys: Vec<String> = weights
         .keys()
@@ -2761,7 +2761,7 @@ fn fixup_shapes(weights: &mut HashMap<String, MxArray>) -> Result<()> {
 /// emits the 2-D row stays byte-identical, and a quantized group is left alone
 /// because the loader reads it through `try_build_ql` (reshaping its packed
 /// `.weight` while its `.scales` stayed put would divorce the pair).
-fn fixup_qwen35_moe_shared_expert_gate(
+pub(super) fn fixup_qwen35_moe_shared_expert_gate(
     weights: &mut HashMap<String, MxArray>,
     metadata: &HashMap<String, GgufMetaValue>,
 ) -> Result<()> {
@@ -2836,7 +2836,7 @@ fn reinterleave_cols(arr: &MxArray, n_heads: i64, head_dim: i64) -> Result<MxArr
 /// GGUF (llama.cpp) deinterleaves head dimensions for the value/state head axis
 /// (linear_num_value_heads). This function re-interleaves them back to HF order.
 /// Also converts ssm_a from `-exp(A_log)` back to `A_log`.
-fn fixup_qwen35_linear_attn(
+pub(super) fn fixup_qwen35_linear_attn(
     weights: &mut HashMap<String, MxArray>,
     metadata: &HashMap<String, GgufMetaValue>,
     preserve_tiled_layout: bool,
@@ -2858,7 +2858,7 @@ fn fixup_qwen35_linear_attn(
             .collect::<Vec<_>>();
         for key in keys {
             if let Some(arr) = weights.remove(&key) {
-                weights.insert(key, arr.negative()?.log()?);
+                weights.insert(key, arr.negative_cpu()?.log_cpu()?);
             }
         }
         return Ok(());
@@ -2919,8 +2919,8 @@ fn fixup_qwen35_linear_attn(
             if let Some(arr) = weights.remove(key) {
                 let reinterleaved = reinterleave_1d(&arr, n_value_heads)?;
                 // Convert: A_log = log(-ssm_a) since GGUF stores -exp(A_log)
-                let neg = reinterleaved.negative()?;
-                let a_log = neg.log()?;
+                let neg = reinterleaved.negative_cpu()?;
+                let a_log = neg.log_cpu()?;
                 info!("Fixed {key}: re-interleaved + log(-x)");
                 weights.insert(key.clone(), a_log);
             }
@@ -3086,26 +3086,23 @@ fn clef_dense_tensor(
                     "CLEF packed head tensor '{name}' has no '{biases_name}' and no symmetric zero point to derive it from"
                 ))
             })?;
-            scales.mul_scalar(-f64::from(zero_point))?
+            scales.mul_scalar_cpu(-f64::from(zero_point))?
         }
     };
-    let handle = unsafe {
-        mlx_sys::mlx_dequantize(
-            weight.as_raw_ptr(),
-            scales.as_raw_ptr(),
-            biases.as_raw_ptr(),
-            profile.group_size,
-            profile.bits,
-            -1, // output dtype follows the scales
-            c"affine".as_ptr(),
-        )
-    };
-    if handle.is_null() {
-        return Err(Error::from_reason(format!(
-            "mlx_dequantize failed for CLEF head tensor '{name}'"
-        )));
-    }
-    MxArray::from_handle(handle, "clef_head_dequantize")
+    MxArray::dequantize_cpu(
+        &weight,
+        &scales,
+        Some(&biases),
+        profile.group_size,
+        profile.bits,
+        "affine",
+    )
+    .map_err(|e| {
+        Error::from_reason(format!(
+            "dequantize failed for CLEF head tensor '{name}': {}",
+            e.reason
+        ))
+    })
 }
 
 /// Fuse a split q/k/v projection into the head's torch-style `in_proj`
@@ -3188,7 +3185,7 @@ fn clef_copy_linear(
 /// stores raw parameters that `JointHead::forward` transforms itself. Values
 /// verified against Cloudflare's published clef-flash checkpoint
 /// (exp(2.296875) = 9.943, sigmoid(-2) = 0.1192).
-fn extract_clef_head_assets(
+pub(super) fn extract_clef_head_assets(
     weights: &mut HashMap<String, MxArray>,
     gguf: &GgufFile,
 ) -> Result<Option<(HashMap<String, MxArray>, serde_json::Value)>> {
@@ -5163,12 +5160,12 @@ pub(super) fn prepare_muse_secondary_config(
 
 // ── Dtype Conversion ────────────────────────────────────────────────────────
 
-fn convert_tensor_dtype(arr: MxArray, target: DType) -> Result<MxArray> {
+pub(super) fn convert_tensor_dtype(arr: MxArray, target: DType) -> Result<MxArray> {
     let current = arr.dtype()?;
     if current == target {
         return Ok(arr);
     }
-    arr.astype(target)
+    arr.astype_cpu(target)
 }
 
 // ── NAPI Export ──────────────────────────────────────────────────────────────
@@ -5551,73 +5548,6 @@ fn capture_source_math_operands(
     )?)
 }
 
-/// The converter's in-memory tensor transform: GGUF → HF names, layout
-/// fixups, the CLEF head split, and the optional `--dtype` pass.
-fn transform_loaded(
-    weights: HashMap<String, MxArray>,
-    gguf: &GgufFile,
-    plan: &super::gguf_plan::ImportPlan,
-    opts: &super::gguf_plan::ImportOptions,
-    source_operands: Option<source_math::ImportIdentity>,
-    inline_mtp_index: Option<u64>,
-) -> Result<(
-    HashMap<String, MxArray>,
-    Option<(HashMap<String, MxArray>, serde_json::Value)>,
-    Option<source_math::Preservation>,
-)> {
-    info!("Remapping tensor names to HuggingFace format...");
-    let mut weights = remap_keys(weights, &gguf.metadata)?;
-
-    // Unified Gemma4 mmproj tensors need name-aware CHW→HWC and position-table
-    // permutations after remapping, before the generic shape fixups run. The
-    // gemma4v SigLIP tower needs its own conv-kernel→Linear reshape.
-    fixup_gemma4_mmproj_layout(&mut weights, &gguf.metadata)?;
-    fixup_gemma4v_mmproj_layout(&mut weights, &gguf.metadata)?;
-
-    fixup_shapes(&mut weights)?;
-
-    // Sparse Qwen3.5 stores its shared-expert gate as a bare vector while the
-    // MLX block is a `Linear(hidden, 1)`.
-    fixup_qwen35_moe_shared_expert_gate(&mut weights, &gguf.metadata)?;
-
-    fixup_qwen35_linear_attn(&mut weights, &gguf.metadata, plan.native_qwen35_layout)?;
-
-    // After the GDN fixups (which only touch `linear_attn.*` keys) and before
-    // the dtype pass, so head tensors keep their stored f32/f16 precision.
-    let clef_head = extract_clef_head_assets(&mut weights, gguf)?;
-
-    let preserved_source_operands = source_operands
-        .map(|identity| {
-            capture_source_math_operands(identity, gguf, &weights, inline_mtp_index)
-        })
-        .transpose()?;
-
-    if let Some(target_dtype) = opts.dtype
-        && !plan.prism
-    {
-        info!("Converting to {target_dtype:?}...");
-        let keys: Vec<String> = weights.keys().cloned().collect();
-        for key in keys {
-            if plan.preserve_dtype_keys.contains(&key) {
-                continue;
-            }
-            if key.ends_with(".scales") || key.ends_with(".biases") {
-                continue;
-            }
-            if let Some(arr) = weights.get(&key)
-                && arr.dtype()? == DType::Uint32
-            {
-                continue;
-            }
-            if let Some(arr) = weights.remove(&key) {
-                let converted = convert_tensor_dtype(arr, target_dtype)?;
-                weights.insert(key, converted);
-            }
-        }
-    }
-    Ok((weights, clef_head, preserved_source_operands))
-}
-
 #[napi]
 pub async fn convert_gguf_to_safetensors(
     options: GgufConversionOptions,
@@ -5800,13 +5730,29 @@ async fn convert_gguf_to_safetensors_inner(
     )?;
     info!("Loaded {} tensors", weights.len());
 
-    let (mut weights, clef_head, preserved_source_operands) = transform_loaded(
+    let mut preserved_source_operands = None;
+    let super::gguf_import::ImportedWeights {
+        mut weights,
+        clef_head,
+        ..
+    } = super::gguf_import::transform_imported_with_before_dtype(
         weights,
         &gguf,
         &plan,
         &import_opts,
-        source_operands,
-        qwen35_inline_mtp_index,
+        |weights| {
+            preserved_source_operands = source_operands
+                .map(|identity| {
+                    capture_source_math_operands(
+                        identity,
+                        &gguf,
+                        weights,
+                        qwen35_inline_mtp_index,
+                    )
+                })
+                .transpose()?;
+            Ok(())
+        },
     )?;
 
     // Validate the same ordinary BF16 values that will be serialized. No
@@ -5831,7 +5777,6 @@ async fn convert_gguf_to_safetensors_inner(
             }
         }
     }
-
     // Apply AWQ pre-scaling if imatrix provided. GGUF Q4/Q8 tensors have
     // already been repacked to Uint32 + sidecars above, so the shared guard
     // must run before AWQ can multiply packed integers or fold norms twice.
@@ -8133,8 +8078,8 @@ pub(super) async fn prepare_muse_glimmer_native_gguf_in(
     .await
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum NativeGgufFamily {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NativeGgufFamily {
     Qwen35,
     Qwen35Moe,
     Clef,

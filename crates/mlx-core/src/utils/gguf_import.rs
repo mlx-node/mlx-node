@@ -5,8 +5,9 @@
 //! resulting map equals `load_gguf_tensors` with the plan's Tiled64 tensors
 //! permuted like `tile_kquant_weights_for_disk`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
@@ -14,10 +15,13 @@ use std::time::Instant;
 use napi::{Error, Result};
 
 use crate::array::alloc::{DstPtrs, OutLayout, SendPtr};
-use crate::array::{DType, MxArray, clear_cache};
+use crate::array::{DType, MxArray, clear_cache, synchronize};
 use crate::stream::{DeviceType, Stream};
 use crate::utils::gguf::{
-    GgufFile, GgufLoadOptions, GgufTensorInfo, GgufTensorType, load_gguf_tensor,
+    GgufFile, GgufLoadOptions, GgufTensorInfo, GgufTensorType, NativeGgufFamily,
+    convert_tensor_dtype, extract_clef_head_assets, fixup_gemma4_mmproj_layout,
+    fixup_gemma4v_mmproj_layout, fixup_qwen35_linear_attn, fixup_qwen35_moe_shared_expert_gate,
+    fixup_shapes, gguf_name_to_hf_for_metadata, load_gguf_tensor, remap_keys,
 };
 use crate::utils::gguf_cpu_repack::{
     copy_dense_band_into, cpu_kquant_band_into, decode_affine_band_into,
@@ -25,12 +29,14 @@ use crate::utils::gguf_cpu_repack::{
 use crate::utils::gguf_gpu::{
     GpuRepackKind, RepackDst, band_offset_rule, gpu_kind_for, gpu_repack_available, gpu_repack_band,
 };
-use crate::utils::gguf_plan::ImportPlan;
+use crate::utils::gguf_plan::{ImportOptions, ImportPlan};
 use crate::utils::gguf_read::{
     ALIGN, CHUNK_BYTES, PageCacheMode, READ_THREADS, ReadAt, Reader, SLOT_BYTES, SLOTS, Window,
     log_load_start, maybe_log_slow_disk, plan_reads, sampled_resident_fraction, set_nocache,
 };
-use crate::utils::gguf_source::GgufFileHandle;
+use crate::utils::gguf_source::{
+    GGUF_IMPORT_CONTRACT, GgufFileHandle, GgufFileIdentity, GgufIdentity, GgufSourceSet,
+};
 use crate::utils::host::physical_memory;
 
 pub(crate) const CPU_THREADS: usize = 8;
@@ -116,6 +122,9 @@ pub(crate) struct ImportProbe {
     pub max_cpu_inflight: AtomicUsize,
     pub gpu_error_at_window: Option<usize>,
     pub panic_at_window: Option<usize>,
+    /// `(tensor name, byte offset in the tensor, bit)` flipped in the staged
+    /// bytes after the read, before any repack.
+    pub flip: Option<(String, usize, u8)>,
 }
 
 impl ImportProbe {
@@ -862,6 +871,18 @@ impl Run<'_, '_, '_> {
         let (windows, header, plan) = (self.windows, self.header, self.plan);
         let slot = w % self.guard.slots.len();
         let (staging, base) = self.guard.slots[slot].clone();
+        if let Some((name, off, bit)) = &self.probe.flip {
+            for band in &windows[w].bands {
+                let start = band.row0 * (band.bytes / band.rows);
+                if header.tensors[band.tensor].name == *name
+                    && (start..start + band.bytes).contains(off)
+                {
+                    // SAFETY: window `w`'s read has finished and nothing
+                    // touches its slot until the window completes.
+                    unsafe { *base.0.add(band.src_off + off - start) ^= 1u8 << (bit & 7) };
+                }
+            }
+        }
         let mut outputs = Vec::new();
         for band in &windows[w].bands {
             if self.probe.panic_at_window == Some(w) {
@@ -1068,6 +1089,313 @@ fn u32_of(v: usize, t: &GgufTensorInfo) -> Result<u32> {
     })
 }
 
+/// The tensor transform shared by `convert_gguf_to_safetensors` and the
+/// loader's preload.
+pub(crate) struct ImportedWeights {
+    pub weights: HashMap<String, MxArray>,
+    pub clef_head: Option<(HashMap<String, MxArray>, serde_json::Value)>,
+    /// Keys whose array is a lazy view or reshuffle of the read buffers (not a
+    /// dtype-pass output). The loader copies them into contiguous storage, as
+    /// the safetensors round trip did.
+    pub views: HashSet<String>,
+}
+
+fn is_available(a: &MxArray) -> bool {
+    // SAFETY: the handle is a live array.
+    unsafe { mlx_sys::mlx_array_is_available(a.as_raw_ptr()) }
+}
+
+/// The `--dtype` target for `key`, or `None` when the pass leaves it alone.
+fn dtype_pass_target(
+    key: &str,
+    arr: &MxArray,
+    plan: &ImportPlan,
+    opts: &ImportOptions,
+) -> Result<Option<DType>> {
+    let Some(target) = opts.dtype.filter(|_| !plan.prism) else {
+        return Ok(None);
+    };
+    if plan.preserve_dtype_keys.contains(key)
+        || key.ends_with(".scales")
+        || key.ends_with(".biases")
+        || arr.dtype()? == DType::Uint32
+    {
+        return Ok(None);
+    }
+    Ok(Some(target))
+}
+
+/// GGUF → HF names, layout fixups, the CLEF head split, and the optional
+/// `--dtype` pass. Numeric ops run on the CPU device.
+pub(crate) fn transform_imported(
+    raw: HashMap<String, MxArray>,
+    gguf: &GgufFile,
+    plan: &ImportPlan,
+    opts: &ImportOptions,
+) -> Result<ImportedWeights> {
+    transform_imported_with_before_dtype(raw, gguf, plan, opts, |_| Ok(()))
+}
+
+/// Run `before_dtype` after remapping, layout fixups and CLEF extraction, but
+/// before conversion can change the source norm precision.
+pub(crate) fn transform_imported_with_before_dtype<F>(
+    raw: HashMap<String, MxArray>,
+    gguf: &GgufFile,
+    plan: &ImportPlan,
+    opts: &ImportOptions,
+    before_dtype: F,
+) -> Result<ImportedWeights>
+where
+    F: FnOnce(&HashMap<String, MxArray>) -> Result<()>,
+{
+    tracing::info!("Remapping tensor names to HuggingFace format...");
+    let mut weights = remap_keys(raw, &gguf.metadata)?;
+
+    // Unified Gemma4 mmproj tensors need name-aware CHW→HWC and position-table
+    // permutations after remapping, before the generic shape fixups run. The
+    // gemma4v SigLIP tower needs its own conv-kernel→Linear reshape.
+    fixup_gemma4_mmproj_layout(&mut weights, &gguf.metadata)?;
+    fixup_gemma4v_mmproj_layout(&mut weights, &gguf.metadata)?;
+
+    fixup_shapes(&mut weights)?;
+
+    // Sparse Qwen3.5 stores its shared-expert gate as a bare vector while the
+    // MLX block is a `Linear(hidden, 1)`.
+    fixup_qwen35_moe_shared_expert_gate(&mut weights, &gguf.metadata)?;
+
+    fixup_qwen35_linear_attn(&mut weights, &gguf.metadata, plan.native_qwen35_layout)?;
+
+    // After the GDN fixups (which only touch `linear_attn.*` keys) and before
+    // the dtype pass, so head tensors keep their stored f32/f16 precision.
+    let clef_head = extract_clef_head_assets(&mut weights, gguf)?;
+
+    before_dtype(&weights)?;
+
+    let mut views: HashSet<String> = weights
+        .iter()
+        .filter(|(_, a)| !is_available(a))
+        .map(|(k, _)| k.clone())
+        .collect();
+
+    if let Some(target_dtype) = opts.dtype.filter(|_| !plan.prism) {
+        tracing::info!("Converting to {target_dtype:?}...");
+        let keys: Vec<String> = weights.keys().cloned().collect();
+        for key in keys {
+            let Some(arr) = weights.get(&key) else {
+                continue;
+            };
+            if dtype_pass_target(&key, arr, plan, opts)?.is_none() {
+                continue;
+            }
+            if let Some(arr) = weights.remove(&key) {
+                if arr.dtype()? != target_dtype {
+                    views.remove(&key);
+                }
+                weights.insert(key, convert_tensor_dtype(arr, target_dtype)?);
+            }
+        }
+    }
+    Ok(ImportedWeights {
+        weights,
+        clef_head,
+        views,
+    })
+}
+
+/// Output bytes evaluated per batch while materializing the transform.
+const EVAL_BATCH_BYTES: usize = 512 << 20;
+
+fn eval_lazy<'a>(arrays: impl Iterator<Item = &'a MxArray>) -> Result<()> {
+    let mut batch: Vec<&MxArray> = Vec::new();
+    let mut bytes = 0usize;
+    for a in arrays {
+        if is_available(a) {
+            continue;
+        }
+        bytes += a.nbytes();
+        batch.push(a);
+        if bytes >= EVAL_BATCH_BYTES {
+            MxArray::eval_arrays_with_context(&batch, "GGUF import transform")?;
+            batch.clear();
+            bytes = 0;
+        }
+    }
+    MxArray::eval_arrays_with_context(&batch, "GGUF import transform")
+}
+
+/// Copy `views` into contiguous storage, then evaluate every lazy array.
+fn materialize(map: &mut HashMap<String, MxArray>, views: &HashSet<String>) -> Result<()> {
+    for key in views {
+        if let Some(a) = map.get_mut(key) {
+            *a = a.deep_copy()?;
+        }
+    }
+    eval_lazy(map.values())
+}
+
+/// One GGUF file of a preload: path, the header parsed at prepare, the
+/// identity taken under the prepare lock, and its import plan.
+pub(crate) type PreloadFile = (PathBuf, Arc<GgufFile>, GgufFileIdentity, ImportPlan);
+
+pub(crate) struct PreloadInput {
+    pub main: PreloadFile,
+    pub companion: Option<PreloadFile>,
+    pub family: NativeGgufFamily,
+    /// Read the companion (gemma: media on; muse: draft present).
+    pub load_companion: bool,
+    pub opts: ImportOptions,
+    /// Test hook: `(tensor name, byte offset, bit)` flipped in the main file's
+    /// staged bytes.
+    #[cfg(test)]
+    pub flip: Option<(String, usize, u8)>,
+}
+
+impl PreloadInput {
+    pub(crate) fn new(
+        main: PreloadFile,
+        companion: Option<PreloadFile>,
+        family: NativeGgufFamily,
+        load_companion: bool,
+        opts: ImportOptions,
+    ) -> Self {
+        Self {
+            main,
+            companion,
+            family,
+            load_companion,
+            opts,
+            #[cfg(test)]
+            flip: None,
+        }
+    }
+}
+
+pub(crate) struct GgufPreload {
+    /// Before `expand_symmetric_affine_biases` (what the old cache's
+    /// `model.safetensors` held).
+    pub main: HashMap<String, MxArray>,
+    /// gemma mmproj → vision map; muse draft → draft map. Empty when the
+    /// companion was not read.
+    pub companion: HashMap<String, MxArray>,
+    pub clef_head: Option<(HashMap<String, MxArray>, serde_json::Value)>,
+    /// Row shards of the plan's `ple_shard` tensor (absent from `main`).
+    pub ple_shards: Option<(Vec<MxArray>, usize)>,
+    pub identity: GgufIdentity,
+    pub stats: LoadStats,
+}
+
+fn add_stats(total: &mut LoadStats, part: &LoadStats) {
+    total.bytes += part.bytes;
+    total.read_secs += part.read_secs;
+    total.gpu_tensors += part.gpu_tensors;
+    total.cpu_tensors += part.cpu_tensors;
+}
+
+impl GgufPreload {
+    /// Model thread only.
+    pub(crate) fn load(input: &PreloadInput) -> Result<Self> {
+        Self::load_with(input, RepackBackend::Auto)
+    }
+
+    pub(crate) fn load_with(input: &PreloadInput, backend: RepackBackend) -> Result<Self> {
+        let started = Instant::now();
+        let mode = PageCacheMode::from_env()?;
+        let (main_path, main_header, main_identity, main_plan) = &input.main;
+        let companion = input.companion.as_ref().filter(|_| input.load_companion);
+        let set = GgufSourceSet::open(
+            (main_path, main_header.clone(), main_identity),
+            companion.map(|(path, header, identity, _)| (path.as_path(), header.clone(), identity)),
+        )?;
+
+        let main_probe = ImportProbe {
+            #[cfg(test)]
+            flip: input.flip.clone(),
+            ..ImportProbe::default()
+        };
+        let raw = read_gguf_tensors_with(
+            &set.main.file,
+            &set.main,
+            main_plan,
+            backend,
+            mode,
+            &ReadConfig::default(),
+            &main_probe,
+        )?;
+        let mut stats = raw.stats.clone();
+        let ImportedWeights {
+            weights: mut main,
+            clef_head,
+            views,
+        } = transform_imported(raw.map, main_header, main_plan, &input.opts)?;
+        materialize(&mut main, &views)?;
+
+        let clef_head = match clef_head {
+            Some((mut head, config)) => {
+                let lazy: HashSet<String> = head
+                    .iter()
+                    .filter(|(_, a)| !is_available(a))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                materialize(&mut head, &lazy)?;
+                Some((head, config))
+            }
+            None => None,
+        };
+
+        let ple_shards = match raw.ple_shards {
+            Some((name, shards, rows_per_shard)) => {
+                let key = gguf_name_to_hf_for_metadata(&name, &main_header.metadata).ok_or_else(
+                    || {
+                        Error::from_reason(format!(
+                            "GGUF row-sharded tensor '{name}' has no checkpoint name"
+                        ))
+                    },
+                )?;
+                let shards = shards
+                    .into_iter()
+                    .map(
+                        |shard| match dtype_pass_target(&key, &shard, main_plan, &input.opts)? {
+                            Some(target) => convert_tensor_dtype(shard, target),
+                            None => Ok(shard),
+                        },
+                    )
+                    .collect::<Result<Vec<_>>>()?;
+                eval_lazy(shards.iter())?;
+                Some((shards, rows_per_shard))
+            }
+            None => None,
+        };
+
+        let mut companion_map = HashMap::new();
+        if let (Some(handle), Some((_, header, _, plan))) = (&set.companion, companion) {
+            let raw = read_gguf_tensors(handle, plan, backend, mode)?;
+            add_stats(&mut stats, &raw.stats);
+            let imported = transform_imported(raw.map, header, plan, &input.opts)?;
+            companion_map = imported.weights;
+            materialize(&mut companion_map, &imported.views)?;
+        }
+
+        set.recheck()?;
+        synchronize();
+        clear_cache();
+        stats.preload_secs = started.elapsed().as_secs_f64();
+        Ok(Self {
+            main,
+            companion: companion_map,
+            clef_head,
+            ple_shards,
+            identity: GgufIdentity {
+                files: std::iter::once(main_identity)
+                    .chain(input.companion.as_ref().map(|(_, _, identity, _)| identity))
+                    .cloned()
+                    .collect(),
+                contract: GGUF_IMPORT_CONTRACT,
+            },
+            stats,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1082,7 +1410,11 @@ mod tests {
     };
     use crate::utils::gguf_plan::OutputRole;
     use crate::utils::gguf_source::{GgufSourceSet, file_identity};
+    use crate::utils::gguf_test_fixtures::{
+        IMPORT_FIXTURE_NAMES, ImportFixture, ImportFixtureFamily, write_import_fixture,
+    };
     use GgufTensorType::*;
+    use std::collections::BTreeMap;
 
     const MIB: usize = 1 << 20;
 
@@ -1820,5 +2152,414 @@ mod tests {
             0,
             "reads ended after free"
         );
+    }
+
+    fn import_golden_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/utils/testdata/gguf_import_golden")
+    }
+
+    fn import_work_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("gguf-preload-{tag}-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn fixture_family(f: &ImportFixture) -> NativeGgufFamily {
+        match f.family {
+            ImportFixtureFamily::Qwen35 => NativeGgufFamily::Qwen35,
+            ImportFixtureFamily::Qwen35Moe => NativeGgufFamily::Qwen35Moe,
+            ImportFixtureFamily::Gemma4 => NativeGgufFamily::Gemma4,
+            ImportFixtureFamily::MuseGlimmer => NativeGgufFamily::MuseGlimmer,
+        }
+    }
+
+    fn fixture_input(f: &ImportFixture, load_companion: bool) -> PreloadInput {
+        gate::preload_input(
+            &f.main,
+            f.companion.as_deref(),
+            fixture_family(f),
+            load_companion,
+        )
+        .unwrap()
+    }
+
+    fn golden_manifest(name: &str, stem: &str) -> BTreeMap<String, serde_json::Value> {
+        let path = import_golden_root()
+            .join(name)
+            .join(format!("{stem}.manifest.json"));
+        serde_json::from_slice(&fs::read(&path).unwrap())
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    fn assert_manifest(
+        label: &str,
+        got: &HashMap<String, MxArray>,
+        want: &BTreeMap<String, serde_json::Value>,
+    ) {
+        let got = gate::manifest(got);
+        assert_eq!(
+            got.keys().collect::<Vec<_>>(),
+            want.keys().collect::<Vec<_>>(),
+            "{label}: tensor names"
+        );
+        for (name, want) in want {
+            assert_eq!(&got[name], want, "{label}: tensor {name}");
+        }
+    }
+
+    #[test]
+    fn preload_equals_base_fixture_golden() {
+        let work = import_work_dir("golden");
+        for name in IMPORT_FIXTURE_NAMES {
+            let fx = write_import_fixture(name, &work.join(name));
+            let input = fixture_input(&fx, true);
+            let preload = GgufPreload::load(&input).unwrap();
+            assert_manifest(name, &preload.main, &golden_manifest(name, "model"));
+            match fx.companion {
+                Some(_) => {
+                    let stem = match fx.family {
+                        ImportFixtureFamily::MuseGlimmer => "draft",
+                        _ => "vision",
+                    };
+                    assert_manifest(
+                        &format!("{name}/{stem}"),
+                        &preload.companion,
+                        &golden_manifest(name, stem),
+                    );
+                }
+                None => assert!(preload.companion.is_empty(), "{name}: companion"),
+            }
+            assert!(preload.clef_head.is_none(), "{name}: CLEF head");
+            assert!(preload.ple_shards.is_none(), "{name}: PLE shards");
+            assert_eq!(
+                preload.identity.files.len(),
+                1 + usize::from(fx.companion.is_some()),
+                "{name}: identity files"
+            );
+        }
+        fs::remove_dir_all(&work).ok();
+    }
+
+    fn stream_device(a: &MxArray) -> i32 {
+        // SAFETY: the handle is a live array.
+        unsafe { mlx_sys::mlx_array_stream_device_type(a.as_raw_ptr()) }
+    }
+
+    #[test]
+    fn transform_cpu_ops_on_cpu_stream() {
+        if !require_gpu() {
+            return;
+        }
+        let work = import_work_dir("cpu-ops");
+        let fx = write_import_fixture("qwen35-dense-untied", &work);
+        let input = fixture_input(&fx, false);
+        let (path, header, identity, plan) = &input.main;
+        let set = GgufSourceSet::open((path, header.clone(), identity), None).unwrap();
+        let read = || {
+            read_gguf_tensors(&set.main, plan, RepackBackend::Auto, PageCacheMode::On)
+                .unwrap()
+                .map
+        };
+        let a_log = "model.layers.0.linear_attn.A_log";
+
+        for native in [true, false] {
+            // Only A_log: the fixture's packed projections do not fit the
+            // non-native re-interleave.
+            let mut weights: HashMap<String, MxArray> = remap_keys(read(), &header.metadata)
+                .unwrap()
+                .into_iter()
+                .filter(|(k, _)| k == a_log)
+                .collect();
+            assert_eq!(weights.len(), 1, "fixture has no {a_log}");
+            fixup_qwen35_linear_attn(&mut weights, &header.metadata, native).unwrap();
+            assert_eq!(
+                stream_device(&weights[a_log]),
+                0,
+                "A_log (native layout {native}) is not on the CPU stream"
+            );
+        }
+
+        let raw = read();
+        let raw_dtypes: HashMap<String, DType> = remap_keys(raw, &header.metadata)
+            .unwrap()
+            .iter()
+            .map(|(k, a)| (k.clone(), a.dtype().unwrap()))
+            .collect();
+        let imported = transform_imported(read(), header, plan, &input.opts).unwrap();
+        let mut converted = 0;
+        for (key, a) in &imported.weights {
+            if a.dtype().unwrap() != raw_dtypes[key] {
+                converted += 1;
+                assert_eq!(
+                    stream_device(a),
+                    0,
+                    "dtype pass on {key} is not on the CPU stream"
+                );
+            }
+        }
+        assert!(converted > 0, "the fixture exercised no dtype conversion");
+        fs::remove_dir_all(&work).ok();
+    }
+
+    #[test]
+    fn preload_skips_companion_without_media() {
+        let work = import_work_dir("media");
+        let fx = write_import_fixture("gemma4-mmproj", &work);
+        let off = GgufPreload::load(&fixture_input(&fx, false)).unwrap();
+        let on = GgufPreload::load(&fixture_input(&fx, true)).unwrap();
+        assert!(off.companion.is_empty(), "companion read with media off");
+        assert!(!on.companion.is_empty(), "companion missing with media on");
+
+        let input = fixture_input(&fx, false);
+        let (path, header, identity, plan) = &input.main;
+        let set = GgufSourceSet::open((path, header.clone(), identity), None).unwrap();
+        let main_bytes = read_gguf_tensors(&set.main, plan, RepackBackend::Auto, PageCacheMode::On)
+            .unwrap()
+            .stats
+            .bytes;
+        assert_eq!(off.stats.bytes, main_bytes, "bytes read with media off");
+        assert!(
+            on.stats.bytes > main_bytes,
+            "media on read no companion bytes"
+        );
+        assert_eq!(off.identity.files.len(), 2, "identity keeps the companion");
+        fs::remove_dir_all(&work).ok();
+    }
+
+    #[test]
+    fn preload_flip_changes_one_tensor() {
+        let work = import_work_dir("flip");
+        let fx = write_import_fixture("qwen35-dense-untied", &work);
+        let clean = GgufPreload::load(&fixture_input(&fx, false)).unwrap();
+        let mut input = fixture_input(&fx, false);
+        input.flip = Some(("output_norm.weight".to_string(), 0, 3));
+        let flipped = GgufPreload::load(&input).unwrap();
+        let (a, b) = (gate::manifest(&clean.main), gate::manifest(&flipped.main));
+        let differ: Vec<&String> = a.keys().filter(|k| a[*k] != b[*k]).collect();
+        assert_eq!(
+            differ,
+            vec!["model.norm.weight"],
+            "tensors changed by the flip"
+        );
+        fs::remove_dir_all(&work).ok();
+    }
+}
+
+/// Gate-1 harness: per-tensor manifests of a preload in the real-golden JSON
+/// format (`{name: {dtype, shape, sha256}}`).
+#[cfg(test)]
+pub(crate) mod gate {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::Path;
+
+    use super::*;
+    use crate::utils::gguf::parse_gguf;
+    use crate::utils::gguf_plan::{OutputRole, annotate_gguf_header, plan_gguf_import};
+    use crate::utils::gguf_source::file_identity;
+    use crate::utils::gguf_test_fixtures::sha256_hex;
+
+    fn st_dtype(d: DType) -> &'static str {
+        match d {
+            DType::Float32 => "F32",
+            DType::Float16 => "F16",
+            DType::BFloat16 => "BF16",
+            DType::Int32 => "I32",
+            DType::Uint32 => "U32",
+            DType::Uint8 => "U8",
+            DType::Int8 => "I8",
+        }
+    }
+
+    pub(crate) fn tensor_bytes(a: &MxArray) -> Vec<u8> {
+        MxArray::eval_arrays_with_context(&[a], "gguf gate manifest").unwrap();
+        match a.dtype().unwrap() {
+            DType::Uint32 => a
+                .to_uint32()
+                .unwrap()
+                .to_vec()
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+            DType::Int32 => a
+                .to_int32()
+                .unwrap()
+                .to_vec()
+                .into_iter()
+                .flat_map(i32::to_le_bytes)
+                .collect(),
+            DType::Uint8 => a.to_uint8().unwrap(),
+            DType::Int8 => a.to_int8().unwrap().into_iter().map(|v| v as u8).collect(),
+            DType::Float16 | DType::BFloat16 => a
+                .to_uint16_native()
+                .unwrap()
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+            DType::Float32 => a
+                .to_float32()
+                .unwrap()
+                .to_vec()
+                .into_iter()
+                .flat_map(|v| v.to_bits().to_le_bytes())
+                .collect(),
+        }
+    }
+
+    pub(crate) fn manifest(map: &HashMap<String, MxArray>) -> BTreeMap<String, serde_json::Value> {
+        map.iter()
+            .map(|(name, a)| {
+                let shape: Vec<i64> = a.shape().unwrap().to_vec();
+                (
+                    name.clone(),
+                    serde_json::json!({
+                        "dtype": st_dtype(a.dtype().unwrap()),
+                        "shape": shape,
+                        "sha256": sha256_hex(&tensor_bytes(a)),
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    /// The input native prepare would hand the loader for `main`
+    /// (+ `companion`): same plan options as its converter calls.
+    pub(crate) fn preload_input(
+        main: &Path,
+        companion: Option<&Path>,
+        family: NativeGgufFamily,
+        load_companion: bool,
+    ) -> Result<PreloadInput> {
+        let parent = main.parent().unwrap_or(Path::new("."));
+        let base = ImportOptions {
+            dtype: Some(DType::BFloat16),
+            import_k_quants: true,
+            ..ImportOptions::default()
+        };
+        let main_opts = ImportOptions {
+            native_qwen35_layout: matches!(
+                family,
+                NativeGgufFamily::Qwen35 | NativeGgufFamily::Qwen35Moe | NativeGgufFamily::Clef
+            ),
+            config_source_dir: parent
+                .join("config.json")
+                .is_file()
+                .then(|| parent.to_path_buf()),
+            ..base.clone()
+        };
+        let companion_opts = ImportOptions {
+            config_source_dir: Some(parent.to_path_buf()),
+            ..base
+        };
+        let file = |path: &Path, opts: &ImportOptions, role: OutputRole| -> Result<PreloadFile> {
+            let mut header = parse_gguf(path)?;
+            annotate_gguf_header(&mut header);
+            let plan = plan_gguf_import(&header, path, opts, role)?;
+            let meta = fs::metadata(path)
+                .map_err(|e| Error::from_reason(format!("{}: {e}", path.display())))?;
+            let identity = file_identity(path, &header, &meta)?;
+            Ok((identity.path.clone(), Arc::new(header), identity, plan))
+        };
+        let companion_role = OutputRole::Companion {
+            filename: match family {
+                NativeGgufFamily::MuseGlimmer => "draft.safetensors",
+                _ => "vision.safetensors",
+            }
+            .to_string(),
+        };
+        Ok(PreloadInput::new(
+            file(main, &main_opts, OutputRole::Primary)?,
+            companion
+                .map(|c| file(c, &companion_opts, companion_role))
+                .transpose()?,
+            family,
+            load_companion,
+            main_opts,
+        ))
+    }
+
+    fn family_from_env() -> NativeGgufFamily {
+        match std::env::var("MLX_GATE_FAMILY").as_deref() {
+            Err(_) | Ok("qwen3_5") => NativeGgufFamily::Qwen35,
+            Ok("qwen3_5_moe") => NativeGgufFamily::Qwen35Moe,
+            Ok("clef") => NativeGgufFamily::Clef,
+            Ok("gemma4") => NativeGgufFamily::Gemma4,
+            Ok("muse_glimmer") => NativeGgufFamily::MuseGlimmer,
+            Ok(other) => panic!("unknown MLX_GATE_FAMILY '{other}'"),
+        }
+    }
+
+    fn compare(label: &str, got: &BTreeMap<String, serde_json::Value>, golden: &Path) -> usize {
+        let want: BTreeMap<String, serde_json::Value> =
+            serde_json::from_slice(&fs::read(golden).unwrap())
+                .unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
+        let mut bad = 0;
+        for name in want.keys().filter(|k| !got.contains_key(*k)) {
+            eprintln!("{label}: MISSING {name}");
+            bad += 1;
+        }
+        for (name, entry) in got {
+            match want.get(name) {
+                None => {
+                    eprintln!("{label}: EXTRA {name}");
+                    bad += 1;
+                }
+                Some(w) if w != entry => {
+                    eprintln!("{label}: DIFF {name}: got {entry} want {w}");
+                    bad += 1;
+                }
+                Some(_) => {}
+            }
+        }
+        eprintln!(
+            "{label}: {}/{} equal",
+            want.len().saturating_sub(bad.min(want.len())),
+            want.len()
+        );
+        bad
+    }
+
+    /// `MLX_GATE_GGUF` (+ `MLX_GATE_COMPANION`), `MLX_GATE_MANIFEST`
+    /// (+ `MLX_GATE_COMPANION_MANIFEST`, `MLX_GATE_JOINT_HEAD_MANIFEST`),
+    /// `MLX_GATE_FAMILY` (default qwen3_5), `MLX_GATE_FLIP=name:byte:bit`.
+    #[test]
+    #[ignore = "reads a real GGUF; set MLX_GATE_GGUF and MLX_GATE_MANIFEST"]
+    fn preload_manifest_equals_golden() {
+        let gguf = std::env::var_os("MLX_GATE_GGUF").expect("set MLX_GATE_GGUF");
+        let golden = std::env::var_os("MLX_GATE_MANIFEST").expect("set MLX_GATE_MANIFEST");
+        let companion = std::env::var_os("MLX_GATE_COMPANION");
+        let companion_golden = std::env::var_os("MLX_GATE_COMPANION_MANIFEST");
+        let mut input = preload_input(
+            Path::new(&gguf),
+            companion.as_deref().map(Path::new),
+            family_from_env(),
+            companion.is_some(),
+        )
+        .unwrap();
+        if let Ok(spec) = std::env::var("MLX_GATE_FLIP") {
+            let mut parts = spec.rsplitn(3, ':');
+            let bit = parts.next().unwrap().parse().unwrap();
+            let byte = parts.next().unwrap().parse().unwrap();
+            input.flip = Some((parts.next().unwrap().to_string(), byte, bit));
+        }
+        let preload = GgufPreload::load(&input).unwrap();
+        let s = &preload.stats;
+        eprintln!(
+            "PRELOAD_S {:.3} READ_WAIT_S {:.3} BYTES {} GPU {} CPU {} NOCACHE {} RESIDENT {:?}",
+            s.preload_secs,
+            s.read_secs,
+            s.bytes,
+            s.gpu_tensors,
+            s.cpu_tensors,
+            s.nocache,
+            s.resident
+        );
+        let mut bad = compare("main", &manifest(&preload.main), Path::new(&golden));
+        if let Some(path) = companion_golden {
+            bad += compare("companion", &manifest(&preload.companion), Path::new(&path));
+        }
+        if let Some(path) = std::env::var_os("MLX_GATE_JOINT_HEAD_MANIFEST") {
+            let head = &preload.clef_head.as_ref().expect("no CLEF head").0;
+            bad += compare("joint_head", &manifest(head), Path::new(&path));
+        }
+        assert_eq!(bad, 0, "tensors differ from the golden");
     }
 }
