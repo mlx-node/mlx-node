@@ -46,7 +46,7 @@ pub(super) const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in little-endian
 pub(super) const GGUF_VERSION_3: u32 = 3;
 pub(super) const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
 
-const GGUF_RUNTIME_ASSET_FILES: &[&str] = &[
+pub(super) const GGUF_RUNTIME_ASSET_FILES: &[&str] = &[
     "tokenizer.json",
     "tokenizer_config.json",
     "vocab.json",
@@ -1515,7 +1515,7 @@ fn repack_rows_from_reader(
 /// `load_kquant_repack` names its arrays with this, and the converter's
 /// do-not-dtype-cast set spells out the same three names, so the producer and
 /// the consumer cannot drift into disagreeing about the suffixes.
-fn k_quant_output_keys(weight_key: &str) -> [String; 3] {
+pub(super) fn k_quant_output_keys(weight_key: &str) -> [String; 3] {
     let prefix = weight_key.strip_suffix(".weight").unwrap_or(weight_key);
     [
         weight_key.to_string(),
@@ -1710,7 +1710,7 @@ pub(crate) fn load_gguf_tensor(
 
 // ── Key Remapping ───────────────────────────────────────────────────────────
 
-fn is_gemma4_main_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+pub(super) fn is_gemma4_main_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
     metadata
         .get("general.architecture")
         .and_then(GgufMetaValue::as_str)
@@ -1748,7 +1748,7 @@ fn is_gemma4v_mmproj_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
             == Some("gemma4v")
 }
 
-fn is_muse_glimmer_main_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+pub(super) fn is_muse_glimmer_main_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
     metadata
         .get("general.architecture")
         .and_then(GgufMetaValue::as_str)
@@ -1766,7 +1766,7 @@ fn is_qwen35_moe_main_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
         == Some("qwen35moe")
 }
 
-fn is_muse_glimmer_mmproj_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+pub(super) fn is_muse_glimmer_mmproj_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
     metadata
         .get("general.architecture")
         .and_then(GgufMetaValue::as_str)
@@ -1777,7 +1777,7 @@ fn is_muse_glimmer_mmproj_gguf(metadata: &HashMap<String, GgufMetaValue>) -> boo
             == Some("muse-glimmer")
 }
 
-fn is_muse_glimmer_dflash_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+pub(super) fn is_muse_glimmer_dflash_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
     metadata
         .get("general.architecture")
         .and_then(GgufMetaValue::as_str)
@@ -2085,7 +2085,7 @@ fn muse_glimmer_dflash_name_to_hf(name: &str) -> Option<String> {
     Some(result)
 }
 
-fn gguf_name_to_hf_for_metadata(
+pub(super) fn gguf_name_to_hf_for_metadata(
     name: &str,
     metadata: &HashMap<String, GgufMetaValue>,
 ) -> Option<String> {
@@ -2115,7 +2115,7 @@ fn gguf_name_to_hf_for_metadata(
 /// positive signal; the `clef.decision.*` geometry is validated during head
 /// extraction, not here, so a truncated header still fails inside the
 /// conversion that reads it.
-fn is_clef_main_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+pub(super) fn is_clef_main_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
     metadata
         .get("general.architecture")
         .and_then(GgufMetaValue::as_str)
@@ -2145,7 +2145,8 @@ const QWEN35_INLINE_MTP_NEXTN_SUFFIXES: [&str; 4] = [
     "nextn.hnorm.weight",
     "nextn.shared_head_norm.weight",
 ];
-const QWEN35_INLINE_MTP_INDEX_METADATA: &str = "mlx_node.internal.qwen35_inline_mtp_index";
+pub(super) const QWEN35_INLINE_MTP_INDEX_METADATA: &str =
+    "mlx_node.internal.qwen35_inline_mtp_index";
 
 /// Return the final GGUF block index when a Qwen3.5 file carries llama.cpp's
 /// inline one-layer MTP layout.
@@ -2155,7 +2156,7 @@ const QWEN35_INLINE_MTP_INDEX_METADATA: &str = "mlx_node.internal.qwen35_inline_
 /// structural witness: when any one is present, require the complete group on
 /// `blk.(block_count - 1)` so config synthesis and tensor remapping cannot
 /// disagree about whether that block belongs to the main decoder or MTP.
-fn qwen35_inline_mtp_index(gguf: &GgufFile) -> Result<Option<u64>> {
+pub(super) fn qwen35_inline_mtp_index(gguf: &GgufFile) -> Result<Option<u64>> {
     let arch = gguf
         .metadata
         .get("general.architecture")
@@ -2209,7 +2210,10 @@ fn qwen35_inline_mtp_index(gguf: &GgufFile) -> Result<Option<u64>> {
     Ok(Some(mtp_index))
 }
 
-fn apply_qwen35_inline_mtp_config(config: &mut serde_json::Value, mtp_index: Option<u64>) {
+pub(super) fn apply_qwen35_inline_mtp_config(
+    config: &mut serde_json::Value,
+    mtp_index: Option<u64>,
+) {
     let Some(mtp_index) = mtp_index else {
         return;
     };
@@ -2307,7 +2311,9 @@ fn apply_qwen35_gdn_config(
     apply_qwen35_layer_types(config);
 }
 
-fn validate_qwen35_standalone_geometry(metadata: &HashMap<String, GgufMetaValue>) -> Result<()> {
+pub(super) fn validate_qwen35_standalone_geometry(
+    metadata: &HashMap<String, GgufMetaValue>,
+) -> Result<()> {
     let Some(arch) = metadata
         .get("general.architecture")
         .and_then(GgufMetaValue::as_str)
@@ -3472,7 +3478,9 @@ fn extract_clef_head_assets(
 /// in the old order. Until that transform is implemented at the complete
 /// quant-group level, reject exactly those tensors while the GGUF header is
 /// still the only part of the file that has been read.
-fn qwen35_kquant_dense_fixup_target(gguf: &GgufFile) -> Option<(&GgufTensorInfo, String)> {
+pub(super) fn qwen35_kquant_dense_fixup_target(
+    gguf: &GgufFile,
+) -> Option<(&GgufTensorInfo, String)> {
     const DENSE_FIXUP_SUFFIXES: &[&str] = &[
         ".linear_attn.in_proj_a.weight",
         ".linear_attn.in_proj_b.weight",
@@ -3515,7 +3523,7 @@ fn is_qwen35_hybrid_gguf(
 /// non-empty quantization block that the loader must reject. Some older
 /// Qwen3.5 writers also use `general.architecture = "qwen3"`, so exempt the
 /// characteristic full-attention + GatedDeltaNet hybrid shape.
-fn plain_qwen3_quantized_source(gguf: &GgufFile) -> Option<&GgufTensorInfo> {
+pub(super) fn plain_qwen3_quantized_source(gguf: &GgufFile) -> Option<&GgufTensorInfo> {
     let arch = gguf
         .metadata
         .get("general.architecture")
@@ -3712,15 +3720,15 @@ pub fn extract_config(metadata: &HashMap<String, GgufMetaValue>) -> serde_json::
 /// one step down: Q4_0 and Q4_1 are both 4-bit affine at group 32 and differ
 /// only in whether the offset is derived or stored.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-struct SourceQuantProfile {
+pub(crate) struct SourceQuantProfile {
     bits: i32,
     group_size: i32,
-    mode: &'static str,
+    pub(super) mode: &'static str,
     /// Set when the source block format is symmetric and the converter left the
     /// derived `.biases` companion off disk. Part of the identity, so a
     /// symmetric Q4_0 tensor and an asymmetric Q4_1 tensor no longer collapse
     /// onto one profile and a file holding both is described per tensor.
-    symmetric_zero_point: Option<i32>,
+    pub(super) symmetric_zero_point: Option<i32>,
     /// The byte order the converter WROTE the packed arrays in. `Tiled64` for
     /// the 2-D K-quant linears `tile_kquant_weights_for_disk` permuted before
     /// the save, emitted as the per-tensor `"layout": "t64"` field; the mode
@@ -3737,7 +3745,7 @@ impl SourceQuantProfile {
     /// `GgufTensorType::block_size` is: a quantized type that fell through to
     /// `None` here would be written with no `quantization` entry describing it
     /// and decoded with whatever geometry the runtime happens to default to.
-    fn for_gguf_type(ty: GgufTensorType) -> Option<Self> {
+    pub(super) fn for_gguf_type(ty: GgufTensorType) -> Option<Self> {
         match ty {
             GgufTensorType::F32 | GgufTensorType::F16 | GgufTensorType::BF16 => None,
             // `load_quantized_tensor` repacks these into MLX affine groups of
@@ -3823,7 +3831,7 @@ impl SourceQuantProfile {
     /// Whether the written tensor is a K-quant group `tile_kquant_weights_for_disk`
     /// may permute: the mode is a ggml K/IQ mode (the layout is decided from
     /// the array shape, not here).
-    fn is_k_quant(self) -> bool {
+    pub(super) fn is_k_quant(self) -> bool {
         crate::models::quant_dispatch::parse_mode_str(Some(self.mode))
             .is_some_and(crate::models::quant_dispatch::is_kquant_mode)
     }
@@ -3832,7 +3840,7 @@ impl SourceQuantProfile {
     /// config instead of relying on the top-level triple. Affine at group 32 is
     /// the only shape a generic default can reproduce; the K-quant modes carry
     /// ggml geometry no default supplies, and a tiled tensor must say so.
-    fn requires_explicit_entry(self) -> bool {
+    pub(super) fn requires_explicit_entry(self) -> bool {
         self.mode != "affine" || self.group_size != 32 || self.layout != KQuantLayout::RowMajor
     }
 
@@ -3855,7 +3863,7 @@ impl SourceQuantProfile {
         serde_json::Value::Object(obj)
     }
 
-    fn describe(self) -> String {
+    pub(super) fn describe(self) -> String {
         let tiled = match self.layout {
             KQuantLayout::RowMajor => "",
             KQuantLayout::Tiled64 => ", 64-row tiled",
@@ -3960,7 +3968,7 @@ fn prism_hadamard_runtime_name(name: &str, gguf: &GgufFile) -> Result<String> {
     })
 }
 
-fn prism_hadamard_config(gguf: &GgufFile) -> Result<Option<PrismHadamardConfig>> {
+pub(super) fn prism_hadamard_config(gguf: &GgufFile) -> Result<Option<PrismHadamardConfig>> {
     if !gguf
         .metadata
         .keys()
@@ -4103,7 +4111,7 @@ fn prism_hadamard_config(gguf: &GgufFile) -> Result<Option<PrismHadamardConfig>>
     Ok(Some(config))
 }
 
-fn validate_prism_supplied_config(
+pub(super) fn validate_prism_supplied_config(
     supplied: &serde_json::Value,
     contract: &PrismHadamardConfig,
     gguf: &GgufFile,
@@ -4326,7 +4334,7 @@ fn check_prism_rope_value(
 /// token. So `convert_gguf_to_safetensors` requires both counts before it
 /// writes anything, and this helper is left free to answer the question it can
 /// actually answer.
-fn gemma4_layer_types_from_missing_v(gguf: &GgufFile) -> Result<Option<Vec<String>>> {
+pub(super) fn gemma4_layer_types_from_missing_v(gguf: &GgufFile) -> Result<Option<Vec<String>>> {
     let mut layers = std::collections::BTreeSet::new();
     for tensor in &gguf.tensors {
         if let Some(rest) = tensor.name.strip_prefix("blk.")
@@ -4450,7 +4458,7 @@ fn gemma4_kv_head_counts_are_per_layer(metadata: &HashMap<String, GgufMetaValue>
 /// `parse_layer_types` in `models/gemma4/persistence.rs`). Checking both means a
 /// nested statement is honored even though the converter writes flat keys — a
 /// top-level write would be shadowed by `text_config` and silently do nothing.
-fn gemma4_config_states(config: &serde_json::Value, key: &str) -> bool {
+pub(super) fn gemma4_config_states(config: &serde_json::Value, key: &str) -> bool {
     config
         .get("text_config")
         .and_then(|text_config| text_config.get(key))
@@ -4479,7 +4487,7 @@ fn gemma4_kv_head_counts(metadata: &HashMap<String, GgufMetaValue>) -> Vec<u32> 
 /// sliding and the global KV head count for `layer_types` — literally the pair
 /// of lookups that helper's `pick` makes, so the two cannot disagree about what
 /// counts as "stated".
-fn gemma4_kv_counts_cover_both_layer_types(
+pub(super) fn gemma4_kv_counts_cover_both_layer_types(
     metadata: &HashMap<String, GgufMetaValue>,
     layer_types: &[String],
 ) -> bool {
@@ -4494,7 +4502,7 @@ fn gemma4_kv_counts_cover_both_layer_types(
 
 /// How `gemma4.attention.head_count_kv` is spelled, for the error raised when it
 /// cannot supply both counts.
-fn describe_gemma4_kv_head_counts(metadata: &HashMap<String, GgufMetaValue>) -> String {
+pub(super) fn describe_gemma4_kv_head_counts(metadata: &HashMap<String, GgufMetaValue>) -> String {
     match metadata.get("gemma4.attention.head_count_kv") {
         None => "the key is absent".to_string(),
         Some(GgufMetaValue::ArrayI32(_) | GgufMetaValue::ArrayU32(_)) => {
@@ -4519,7 +4527,7 @@ fn describe_gemma4_kv_head_counts(metadata: &HashMap<String, GgufMetaValue>) -> 
 /// becomes `num_key_value_heads` and the global one
 /// `num_global_key_value_heads`, mirroring how `Gemma4Config::effective_*`
 /// reads them back.
-fn apply_gemma4_attention_geometry(
+pub(super) fn apply_gemma4_attention_geometry(
     config: &mut serde_json::Map<String, serde_json::Value>,
     metadata: &HashMap<String, GgufMetaValue>,
     layer_types: Option<&[String]>,
@@ -4574,7 +4582,7 @@ fn apply_gemma4_attention_geometry(
 /// Whether a config (supplied or synthesized) ties the output head to the
 /// embedding table: `tie_word_embeddings` at the top level or under
 /// `text_config` (the multimodal Gemma4 / Muse shape). Missing means untied.
-fn config_ties_word_embeddings(config: &serde_json::Value) -> bool {
+pub(super) fn config_ties_word_embeddings(config: &serde_json::Value) -> bool {
     config
         .get("tie_word_embeddings")
         .or_else(|| {
@@ -4599,7 +4607,7 @@ fn config_ties_word_embeddings(config: &serde_json::Value) -> bool {
 ///     the loader pads and tiles the merged pair itself);
 ///   * 3-D expert stacks (`switch_mlp.*`): gathered row-wise, excluded by rank
 ///     before the name is consulted.
-const KQUANT_TILED_DISK_PROJECTIONS: [&str; 13] = [
+pub(super) const KQUANT_TILED_DISK_PROJECTIONS: [&str; 13] = [
     "q_proj",
     "k_proj",
     "v_proj",
@@ -4723,7 +4731,7 @@ fn tile_kquant_weights_for_disk(
 /// those entries carry `"layout": "t64"`. The layout never reaches the
 /// block-level default — it is a per-tensor fact, and the default stays what a
 /// reader that ignores the field expects.
-fn preserved_source_quantization(
+pub(super) fn preserved_source_quantization(
     gguf: &GgufFile,
     import_k_quants: bool,
     tiled: &std::collections::BTreeSet<String>,
@@ -4783,7 +4791,7 @@ fn preserved_source_quantization(
     Ok(Some(serde_json::Value::Object(quant)))
 }
 
-fn source_quantization_profiles(
+pub(super) fn source_quantization_profiles(
     gguf: &GgufFile,
     import_k_quants: bool,
 ) -> Result<std::collections::BTreeMap<String, SourceQuantProfile>> {
@@ -4990,7 +4998,7 @@ const UNSCOPED_LAYER_OVERRIDE_PREFIX: &str = "language_model.model.layers.";
 /// uniform affine companion, Meta's file deliberately mixes Q4_K and Q6_K,
 /// so every packed projection needs an explicit mode entry in that shared
 /// config; the text model's top-level default cannot describe both.
-fn prepare_muse_secondary_config(
+pub(super) fn prepare_muse_secondary_config(
     config_path: &Path,
     gguf: &GgufFile,
     import_k_quants: bool,
@@ -5543,6 +5551,73 @@ fn capture_source_math_operands(
     )?)
 }
 
+/// The converter's in-memory tensor transform: GGUF → HF names, layout
+/// fixups, the CLEF head split, and the optional `--dtype` pass.
+fn transform_loaded(
+    weights: HashMap<String, MxArray>,
+    gguf: &GgufFile,
+    plan: &super::gguf_plan::ImportPlan,
+    opts: &super::gguf_plan::ImportOptions,
+    source_operands: Option<source_math::ImportIdentity>,
+    inline_mtp_index: Option<u64>,
+) -> Result<(
+    HashMap<String, MxArray>,
+    Option<(HashMap<String, MxArray>, serde_json::Value)>,
+    Option<source_math::Preservation>,
+)> {
+    info!("Remapping tensor names to HuggingFace format...");
+    let mut weights = remap_keys(weights, &gguf.metadata)?;
+
+    // Unified Gemma4 mmproj tensors need name-aware CHW→HWC and position-table
+    // permutations after remapping, before the generic shape fixups run. The
+    // gemma4v SigLIP tower needs its own conv-kernel→Linear reshape.
+    fixup_gemma4_mmproj_layout(&mut weights, &gguf.metadata)?;
+    fixup_gemma4v_mmproj_layout(&mut weights, &gguf.metadata)?;
+
+    fixup_shapes(&mut weights)?;
+
+    // Sparse Qwen3.5 stores its shared-expert gate as a bare vector while the
+    // MLX block is a `Linear(hidden, 1)`.
+    fixup_qwen35_moe_shared_expert_gate(&mut weights, &gguf.metadata)?;
+
+    fixup_qwen35_linear_attn(&mut weights, &gguf.metadata, plan.native_qwen35_layout)?;
+
+    // After the GDN fixups (which only touch `linear_attn.*` keys) and before
+    // the dtype pass, so head tensors keep their stored f32/f16 precision.
+    let clef_head = extract_clef_head_assets(&mut weights, gguf)?;
+
+    let preserved_source_operands = source_operands
+        .map(|identity| {
+            capture_source_math_operands(identity, gguf, &weights, inline_mtp_index)
+        })
+        .transpose()?;
+
+    if let Some(target_dtype) = opts.dtype
+        && !plan.prism
+    {
+        info!("Converting to {target_dtype:?}...");
+        let keys: Vec<String> = weights.keys().cloned().collect();
+        for key in keys {
+            if plan.preserve_dtype_keys.contains(&key) {
+                continue;
+            }
+            if key.ends_with(".scales") || key.ends_with(".biases") {
+                continue;
+            }
+            if let Some(arr) = weights.get(&key)
+                && arr.dtype()? == DType::Uint32
+            {
+                continue;
+            }
+            if let Some(arr) = weights.remove(&key) {
+                let converted = convert_tensor_dtype(arr, target_dtype)?;
+                weights.insert(key, converted);
+            }
+        }
+    }
+    Ok((weights, clef_head, preserved_source_operands))
+}
+
 #[napi]
 pub async fn convert_gguf_to_safetensors(
     options: GgufConversionOptions,
@@ -5667,332 +5742,55 @@ async fn convert_gguf_to_safetensors_inner(
         info!("  {ttype}: {count} tensors");
     }
 
-    let prism_contract = prism_hadamard_config(&gguf)?;
-    if prism_contract.is_some() {
-        if options.quantize.unwrap_or(false)
+    let dtype = options
+        .dtype
+        .as_deref()
+        .map(super::gguf_plan::parse_import_dtype)
+        .transpose()?;
+    let do_quantize = options.quantize.unwrap_or(false);
+    let import_opts = super::gguf_plan::ImportOptions {
+        dtype,
+        import_k_quants: options.import_k_quants.unwrap_or(false),
+        native_qwen35_layout: options.native_qwen35_layout.unwrap_or(false),
+        config_source_dir,
+        quantize: do_quantize,
+        requantize: do_quantize
             || options.quant_recipe.is_some()
             || options.quant_mxfp.unwrap_or(false)
-            || options.imatrix_path.is_some()
-        {
-            return Err(Error::from_reason(
-                "prism.hadamard sources carry packed PQ2_0 weights that are losslessly repacked, never re-quantized; --quantize / --q-recipe / --q-mxfp / --imatrix-path cannot be combined with a prism.hadamard GGUF. Rejected from the GGUF header before tensor data was loaded.",
-            ));
-        }
-        if options.vlm_key_prefix.unwrap_or(false) {
-            return Err(Error::from_reason(
-                "prism.hadamard sources are text-only; --vlm-key-prefix remaps weights the runtime contract names cannot follow. Rejected from the GGUF header before tensor data was loaded.",
-            ));
-        }
-        if options
-            .output_filename
-            .as_deref()
-            .unwrap_or("model.safetensors")
-            != "model.safetensors"
-        {
-            return Err(Error::from_reason(
-                "prism.hadamard sources must convert as the primary 'model.safetensors' output: the rotation contract lives in config.json, which only the primary conversion writes. Rejected from the GGUF header before tensor data was loaded.",
-            ));
-        }
-    }
+            || options.imatrix_path.is_some(),
+        vlm_key_prefix: options.vlm_key_prefix.unwrap_or(false),
+    };
 
-    let import_k_quants = options.import_k_quants.unwrap_or(false);
-    let native_qwen35_layout =
-        options.native_qwen35_layout.unwrap_or(false) || prism_contract.is_some();
-    // Validate the descriptor-level inline-MTP witness before any destination
-    // file can be created or truncated. The resulting index is also the exact
-    // main-decoder length to write when config.json must be synthesized.
-    let qwen35_inline_mtp_index = qwen35_inline_mtp_index(&gguf)?;
-    if let Some(index) = qwen35_inline_mtp_index {
-        // Keep tensor-name mapping and config synthesis on one validated
-        // witness without threading a second context argument through every
-        // descriptor-only mapping consumer. This key exists only in memory;
-        // extract_config copies a fixed GGUF field set, so it is never emitted.
-        gguf.metadata.insert(
-            QWEN35_INLINE_MTP_INDEX_METADATA.to_string(),
-            GgufMetaValue::Uint64(index),
-        );
-    }
-
-    // Plain Qwen3 has no quantized inference runtime. Preserving Q4_0/Q4_1/
-    // Q8_0 or K-quant source groups would successfully write an artifact whose
-    // loader rejects its quantization metadata. Reject from the header instead;
-    // true Qwen3.5 hybrids remain distinguished by their mixed attention/GDN
-    // tensor shape even when an older writer labels the architecture `qwen3`.
-    if let Some(tensor) = plain_qwen3_quantized_source(&gguf) {
-        return Err(Error::from_reason(format!(
-            "GGUF tensor '{}' uses {}, but the plain Qwen3 runtime is dense-only and cannot consume preserved quantized weights. Use a floating-point Qwen3 source or a Qwen3.5 hybrid checkpoint. Rejected from the GGUF header before tensor data was loaded.",
-            tensor.name,
-            tensor.tensor_type.name(),
-        )));
-    }
-
-    // Qwen3.5 GGUF stores GatedDeltaNet head axes in llama.cpp order, so the
-    // conversion must reinterleave several linear-attention projections. That
-    // transform currently operates on dense arrays. A K-quant projection is a
-    // packed `.weight` plus `.scales` / `.biases`; reshaping only `.weight`
-    // previously crossed the MLX FFI boundary with impossible packed geometry
-    // and aborted the process with an uncaught foreign exception. Fail from the
-    // header instead of loading or mutating any tensor payload.
-    if import_k_quants
-        && !native_qwen35_layout
-        && let Some((tensor, mapped)) = qwen35_kquant_dense_fixup_target(&gguf)
-    {
-        return Err(Error::from_reason(format!(
-            "GGUF tensor '{}' ({}) maps to Qwen3.5 linear-attention tensor '{}', which requires a head-axis reinterleave during conversion. --gguf-kquant cannot safely apply that dense transform to packed codes without also reordering the group's .scales/.biases, so this source cannot currently be imported losslessly. Use a floating-point source or a preconverted checkpoint. Rejected from the GGUF header before tensor data was loaded.",
-            tensor.name,
-            tensor.tensor_type.name(),
-            mapped,
-        )));
-    }
-
-    // K-quant import losslessly repacks supported ggml K/IQ blocks and never
-    // dequantizes them, so any path that would re-quantize the model — an
-    // explicit `--quantize`, a `--q-recipe`, the `--q-mxfp` upgrade, or
-    // `--imatrix-path` AWQ pre-scaling — both contradicts the import and forces
-    // whole-model float residency. Reject the combination upfront, before
-    // loading gigabytes of weights, when the source actually carries K-quant
-    // tensors. (With the import off, Q6_K stays the Gemma4 embedding BF16
-    // fallback and re-quantizing it is still supported, so the guard is scoped
-    // to the import path.)
-    if import_k_quants
-        && gguf
-            .tensors
-            .iter()
-            .any(|t| t.tensor_type.k_quant_format().is_some())
-    {
-        let requantizing = options.quantize.unwrap_or(false)
-            || options.quant_recipe.is_some()
-            || options.quant_mxfp.unwrap_or(false)
-            || options.imatrix_path.is_some();
-        if requantizing {
-            return Err(Error::from_reason(
-                "K-quant GGUF import cannot be combined with re-quantization \
-                 (--quantize / --q-recipe / --q-mxfp / --imatrix-path): ggml \
-                 supported K/IQ blocks are losslessly imported and never \
-                 dequantized. Import them as-is, or drop --gguf-kquant to convert \
-                 a dequantized copy.",
-            ));
-        }
-    }
-
-    // Symmetric ggml blocks (`d * (q - Z)`: Q4_0, Q8_0) repack losslessly into
-    // MLX affine groups whose `.biases` companion is DERIVED from the scale at
-    // load rather than stored, which only works because the emitted config
-    // carries `symmetric_zero_point`. `--quantize` skips every already-packed
-    // group, so the body is unchanged, but the config write then takes the
-    // freshly-quantized branch and emits a `build_quantization_object` that
-    // knows nothing about the marker — a checkpoint that converts and then
-    // cannot be loaded.
-    //
-    // Carrying the marker forward instead is not an option: with `--quantize`
-    // the output is a MIXTURE of skipped symmetric groups (bias derived) and
-    // newly quantized float tensors (bias stored), and a single top-level claim
-    // would falsely describe the latter. Reject upfront, mirroring the K-quant
-    // guard above and the already-quantized gemma-QAT reject in
-    // `convert::convert_model_inner`.
-    //
-    // Not mirrored in the CLI: unlike `--gguf-kquant`, this condition is read
-    // off the file's tensor types rather than the flags, and nothing on the TS
-    // side parses GGUF. The check still runs before a single weight byte is
-    // read — `parse_gguf` above reads only the header, metadata, and tensor
-    // descriptors.
-    if options.quantize.unwrap_or(false)
-        && let Some(tensor) = gguf
-            .tensors
-            .iter()
-            .find(|t| symmetric_zero_point(t.tensor_type).is_some())
-    {
-        return Err(Error::from_reason(format!(
-            "GGUF tensor '{}' is already quantized ({}); convert without --quantize \
-             (--q-mxfp requires it). Symmetric ggml blocks are repacked losslessly to \
-             MLX affine groups whose '.biases' companion is derived from the scale \
-             instead of being stored, and --quantize skips them and then writes a \
-             quantization block describing only the tensors it did quantize — \
-             dropping the '{SYMMETRIC_ZERO_POINT_KEY}' that derivation needs.",
-            tensor.name,
-            tensor.tensor_type.name(),
-        )));
-    }
-
-    // The output file name decides whether this conversion owns config.json, and
-    // two checks below turn on that: the secondary-output reject immediately
-    // after, and the Gemma4 layout detection. Both belong here, ahead of the
-    // save — `save_safetensors` opens the destination with `File::create`, which
-    // truncates any existing file the instant it runs, so a rejection raised
-    // after that point has already destroyed a readable checkpoint.
+    // The output file name decides whether this conversion owns config.json.
+    // Every header-only reject runs in the plan, ahead of the save:
+    // `save_safetensors` opens the destination with `File::create`, which
+    // truncates any existing file the instant it runs.
     let safetensors_filename = options
         .output_filename
         .as_deref()
         .unwrap_or("model.safetensors");
     let is_primary_model = safetensors_filename == "model.safetensors";
+    super::gguf_plan::annotate_gguf_header(&mut gguf);
+    let mut plan = super::gguf_plan::plan_gguf_import(
+        &gguf,
+        &input_path,
+        &import_opts,
+        super::gguf_plan::OutputRole::from_output_filename(safetensors_filename),
+    )?;
+    let import_k_quants = plan.import_k_quants;
 
-    // A secondary output (`--mmproj` writes `vision.safetensors`) shares the
-    // output directory with the primary conversion and deliberately writes no
-    // config.json — the primary one owns it. So a tensor whose decode geometry
-    // can ONLY be expressed in config.json has nowhere to record it: a symmetric
-    // ggml block loses the `symmetric_zero_point` its derived `.biases` is
-    // rebuilt from, and an imported K-quant loses the mode/bits/group_size that
-    // spell out ggml's geometry. Either way the bytes land packed correctly and
-    // are then decoded as the runtime's generic affine default.
-    //
-    // K-quant tensors are exempt when the import is off, matching
-    // `preserved_source_quantization`: without the import no K-quant array
-    // reaches the output for a config entry to describe.
-    //
-    // Header-only, like the two guards above — `parse_gguf` has read the header,
-    // metadata and tensor descriptors and nothing else.
-    if !is_primary_model
-        && !is_muse_glimmer_mmproj_gguf(&gguf.metadata)
-        && !is_muse_glimmer_dflash_gguf(&gguf.metadata)
-        && let Some((tensor, profile)) = gguf.tensors.iter().find_map(|t| {
-            if !import_k_quants && t.tensor_type.k_quant_format().is_some() {
-                return None;
-            }
-            let profile = SourceQuantProfile::for_gguf_type(t.tensor_type)?;
-            (profile.symmetric_zero_point.is_some() || profile.requires_explicit_entry())
-                .then_some((t, profile))
-        })
-    {
-        return Err(Error::from_reason(format!(
-            "GGUF tensor '{}' is {}, which loads as {} only when config.json says so — but this \
-             conversion writes '{safetensors_filename}', a secondary output that writes no \
-             config.json (the primary 'model.safetensors' conversion owns it). The packed bytes \
-             would be written and then decoded with the runtime's default geometry. Convert this \
-             file as the primary output, or use a source whose tensors are float or plain \
-             group-32 affine.",
-            tensor.name,
-            tensor.tensor_type.name(),
-            profile.describe(),
-        )));
-    }
-
-    // Measured off the tensor list and cross-checked against the header, both of
-    // which `parse_gguf` has already read, so the whole decision is available
-    // before the destructive save. Only the primary output can act on it: the
-    // fields it produces are config.json fields.
-    let gemma4_layer_types = if is_primary_model && is_gemma4_main_gguf(&gguf.metadata) {
-        gemma4_layer_types_from_missing_v(&gguf)?
-    } else {
-        None
-    };
-
-    // Where config.json and the runtime assets are read from: an explicit
-    // `--config-dir` is authoritative, otherwise the directory beside the GGUF.
-    // Resolved here rather than at the config write below because the guard that
-    // follows has to know whether the config will be SYNTHESIZED, and it has to
-    // know it before `save_safetensors` truncates the destination.
-    let gguf_dir = input_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let asset_dir = config_source_dir.clone().unwrap_or(gguf_dir);
-    let src_config = asset_dir.join("config.json");
-    let synthesized_config = !src_config.exists();
-
-    if let Some(contract) = &prism_contract
-        && src_config.exists()
-    {
-        let supplied_data = fs::read_to_string(&src_config)
-            .map_err(|e| Error::from_reason(format!("Failed to read config.json: {e}")))?;
-        let supplied: serde_json::Value = serde_json::from_str(&supplied_data)
-            .map_err(|e| Error::from_reason(format!("Failed to parse config.json: {e}")))?;
-        validate_prism_supplied_config(&supplied, contract, &gguf)?;
-    }
-
-    // The text GGUF contains the decoder geometry, but the runtime contract is
-    // the multimodal HF config: it also carries image/video token IDs, the
-    // projector dimensions, vision layer kinds, and Muse's independent
-    // per-layer RoPE table. Inventing those fields would make a text-only
-    // smoke test pass while producing an artifact that cannot safely attach
-    // Meta's mmproj. Require the authoritative base-model assets instead.
-    if is_primary_model && is_muse_glimmer_main_gguf(&gguf.metadata) && synthesized_config {
-        return Err(Error::from_reason(
-            "Muse-Glimmer GGUF conversion requires the authoritative base-model config and tokenizer assets. Pass --config-dir pointing to meta-models/Muse-Glimmer-30B (or place config.json beside the GGUF); the GGUF header alone does not contain the multimodal token IDs and complete vision layer table.",
-        ));
-    }
-
-    // Direct native Qwen loads are allowed to synthesize a standalone config,
-    // so every GDN dimension the runtime consumes must be present and
-    // self-consistent in the GGUF header. Falling through to the loader's
-    // model-size-specific defaults can build random projections with plausible
-    // but wrong shapes. An authoritative sibling config remains the stronger
-    // source and intentionally bypasses this metadata completeness gate.
-    if is_primary_model && native_qwen35_layout && (synthesized_config || prism_contract.is_some())
-    {
-        validate_qwen35_standalone_geometry(&gguf.metadata)?;
-    }
-
-    // Validate and serialize every companion-driven config mutation before
-    // loading tensor payloads or opening the destination SafeTensors file.
-    // `save_safetensors` truncates an existing sidecar immediately; a missing
-    // primary config or malformed DFlash header must therefore fail here while
-    // the previous `vision.safetensors` / `draft.safetensors` is still intact.
+    // A Muse companion merges into the primary config.json already in
+    // `output_dir`; validate and serialize that merge before the save
+    // truncates the previous `vision.safetensors` / `draft.safetensors`.
     let muse_secondary_config_path = output_dir.join("config.json");
-    let prepared_muse_secondary_config = if !is_primary_model
-        && (is_muse_glimmer_mmproj_gguf(&gguf.metadata)
-            || is_muse_glimmer_dflash_gguf(&gguf.metadata))
-    {
+    let prepared_muse_secondary_config = if plan.muse_secondary {
         prepare_muse_secondary_config(&muse_secondary_config_path, &gguf, import_k_quants)?
     } else {
         None
     };
 
-    // A synthesized config gets its KV head counts from
-    // `apply_gemma4_attention_geometry`, which can only tell the sliding count
-    // from the global one when `head_count_kv` is an array with an entry per
-    // layer. A scalar leaves `num_global_key_value_heads` unwritten and the
-    // loader reuses the sliding count for the global layers; an absent key
-    // leaves both unwritten and the loader falls back to 2. Detecting the K=V
-    // layout is proof that those two counts DIFFER, so either fallback builds
-    // global K/V projections at the wrong width. Nothing downstream catches it —
-    // the quantized load path discards `out_features`, so the first token
-    // reaches `keys.reshape(...)` and MLX aborts the process across the
-    // `extern "C-unwind"` boundary instead of returning an error. An
-    // authoritative config states the counts itself and needs no header.
-    if let Some(types) = &gemma4_layer_types
-        && synthesized_config
-        && !gemma4_kv_counts_cover_both_layer_types(&gguf.metadata, types)
-    {
-        return Err(Error::from_reason(format!(
-            "Gemma4 GGUF omits 'attn_v' on {} of its {} decoder blocks, so its global layers \
-             have a different KV head count from its sliding ones — but \
-             'gemma4.attention.head_count_kv' does not state both ({}), and there is no \
-             config.json to take them from, so the converted config would describe the global \
-             layers with the sliding count. Supply the model's config.json with --config-dir.",
-            types.iter().filter(|t| *t == "full_attention").count(),
-            types.len(),
-            describe_gemma4_kv_head_counts(&gguf.metadata),
-        )));
-    }
-
-    // Output keys an optional global `--dtype` request must leave alone,
-    // spelled out rather than inferred from a suffix or a dtype.
-    //
-    // Without the K-quant import, Q6_K is a BF16-only dense fallback: it is a
-    // genuine float array, so nothing else in the cast loop would spare it.
-    // With the import on, the same tensors arrive as a packed uint32 `.weight`
-    // plus `.scales` / `.biases` sidecars whose exact integer and f16 bit
-    // patterns *are* the weights. The loop's generic `.scales` / `.biases` and
-    // uint32 skips happen to cover those three today, which makes them a trap
-    // keyed on suffix spelling; naming the keys here through the same helper
-    // the importer names them with means changing either the suffixes or the
-    // array dtypes cannot quietly start casting them.
-    let preserve_dtype_keys: std::collections::HashSet<String> = gguf
-        .tensors
-        .iter()
-        .filter(|t| t.tensor_type.k_quant_format().is_some())
-        .filter_map(|t| gguf_name_to_hf_for_metadata(&t.name, &gguf.metadata))
-        .flat_map(|key| -> Vec<String> {
-            if import_k_quants {
-                k_quant_output_keys(&key).to_vec()
-            } else {
-                // The pre-import fallback dequantizes the Gemma4 Q6_K embedding
-                // to BF16 and rejects the other two, so there is one key.
-                vec![key]
-            }
-        })
-        .collect();
-
-    // Load tensors
     info!("Loading tensors...");
-    let mut weights = load_gguf_tensors(
+    let weights = load_gguf_tensors(
         &input_path,
         &gguf,
         GgufLoadOptions {
@@ -6002,76 +5800,14 @@ async fn convert_gguf_to_safetensors_inner(
     )?;
     info!("Loaded {} tensors", weights.len());
 
-    // Remap keys from GGUF to HF naming
-    info!("Remapping tensor names to HuggingFace format...");
-    weights = remap_keys(weights, &gguf.metadata)?;
-
-    // Unified Gemma4 mmproj tensors need name-aware CHW→HWC and position-table
-    // permutations after remapping, before the generic shape fixups run. The
-    // gemma4v SigLIP tower needs its own conv-kernel→Linear reshape.
-    fixup_gemma4_mmproj_layout(&mut weights, &gguf.metadata)?;
-    fixup_gemma4v_mmproj_layout(&mut weights, &gguf.metadata)?;
-
-    // Fix shapes that differ between GGUF and HF format
-    fixup_shapes(&mut weights)?;
-
-    // Sparse Qwen3.5 stores its shared-expert gate as a bare vector while the
-    // MLX block is a `Linear(hidden, 1)`.
-    fixup_qwen35_moe_shared_expert_gate(&mut weights, &gguf.metadata)?;
-
-    // Fix Qwen3.5 linear attention head deinterleaving and A_log conversion
-    fixup_qwen35_linear_attn(&mut weights, &gguf.metadata, native_qwen35_layout)?;
-
-    // Route the CLEF decision head out of the backbone map: the tensors
-    // dequantize, fuse into torch-style in_proj groups, and land in
-    // joint_head.safetensors beside model.safetensors — never inside it.
-    // Runs after the GDN fixups (which only touch `linear_attn.*` keys) and
-    // before the dtype pass so head tensors keep their stored f32/f16
-    // precision instead of being rounded by the backbone's --dtype.
-    let clef_head = extract_clef_head_assets(&mut weights, &gguf)?;
-
-    let preserved_source_operands = source_operands
-        .map(|identity| {
-            capture_source_math_operands(identity, &gguf, &weights, qwen35_inline_mtp_index)
-        })
-        .transpose()?;
-
-    // Optional dtype conversion (only for non-quantized weights)
-    if let Some(dtype_str) = &options.dtype {
-        let target_dtype = match dtype_str.as_str() {
-            "float32" | "f32" => DType::Float32,
-            "float16" | "f16" => DType::Float16,
-            "bfloat16" | "bf16" => DType::BFloat16,
-            other => {
-                return Err(Error::from_reason(format!(
-                    "Unsupported dtype: {other}. Use float32, float16, or bfloat16"
-                )));
-            }
-        };
-        if prism_contract.is_none() {
-            info!("Converting to {dtype_str}...");
-            let keys: Vec<String> = weights.keys().cloned().collect();
-            for key in keys {
-                if preserve_dtype_keys.contains(&key) {
-                    continue;
-                }
-                // Skip quantized weight triplets
-                if key.ends_with(".scales") || key.ends_with(".biases") {
-                    continue;
-                }
-                // Skip uint32 packed quantized weights
-                if let Some(arr) = weights.get(&key)
-                    && arr.dtype()? == DType::Uint32
-                {
-                    continue;
-                }
-                if let Some(arr) = weights.remove(&key) {
-                    let converted = convert_tensor_dtype(arr, target_dtype)?;
-                    weights.insert(key, converted);
-                }
-            }
-        }
-    }
+    let (mut weights, clef_head, preserved_source_operands) = transform_loaded(
+        weights,
+        &gguf,
+        &plan,
+        &import_opts,
+        source_operands,
+        qwen35_inline_mtp_index,
+    )?;
 
     // Validate the same ordinary BF16 values that will be serialized. No
     // source operand is inserted into or substituted in the weights map.
@@ -6111,7 +5847,6 @@ async fn convert_gguf_to_safetensors_inner(
 
     // Optional quantization
     let mut per_layer_overrides: HashMap<String, serde_json::Value> = HashMap::new();
-    let do_quantize = options.quantize.unwrap_or(false);
     let quant_mode_str = options
         .quant_mode
         .as_deref()
@@ -6347,30 +6082,24 @@ async fn convert_gguf_to_safetensors_inner(
         .sum();
 
     // Store the eligible 2-D K-quant linears in the 64-row tiled layout the
-    // `_t64` Metal kernels read, so the loader builds them without its
-    // per-load permutation (and its transient second copy). Only the primary
-    // output: the marker lives in config.json, which only the primary writes
-    // (a secondary output's tensors stay row-major and load exactly as
-    // before). Never under `--quantize`: that branch writes a
+    // `_t64` Metal kernels read. Only the primary output: the marker lives in
+    // config.json. Never under `--quantize`: that branch writes a
     // `build_quantization_object` block that knows nothing about the marker.
-    // The prism PQ2_0 path carries no K-quant tensors and keeps its exact
-    // config comparison.
-    let tiled_kquant_prefixes =
-        if is_primary_model && import_k_quants && !do_quantize && prism_contract.is_none() {
-            let profiles = source_quantization_profiles(&gguf, import_k_quants)?;
-            let tie_word_embeddings = if src_config.exists() {
-                let data = fs::read_to_string(&src_config)
-                    .map_err(|e| Error::from_reason(format!("Failed to read config.json: {e}")))?;
-                let supplied: serde_json::Value = serde_json::from_str(&data)
-                    .map_err(|e| Error::from_reason(format!("Failed to parse config.json: {e}")))?;
-                config_ties_word_embeddings(&supplied)
-            } else {
-                config_ties_word_embeddings(&extract_config(&gguf.metadata))
-            };
-            tile_kquant_weights_for_disk(&mut weights, &profiles, tie_word_embeddings)?
-        } else {
-            std::collections::BTreeSet::new()
-        };
+    // The prism PQ2_0 path carries no K-quant tensors.
+    let tiling = is_primary_model && import_k_quants && !do_quantize && !plan.prism;
+    let tiled_kquant_prefixes = if tiling {
+        let profiles = source_quantization_profiles(&gguf, import_k_quants)?;
+        tile_kquant_weights_for_disk(&mut weights, &profiles, plan.tie_word_embeddings)?
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    // `--vlm-key-prefix` renames the keys the tiler looks up, so the header
+    // plan only describes conversions without it.
+    super::gguf_plan::debug_assert_tiled_plan_matches(
+        tiling && !import_opts.vlm_key_prefix,
+        &plan,
+        &tiled_kquant_prefixes,
+    );
 
     // Save SafeTensors
     let safetensors_path = output_dir.join(safetensors_filename);
@@ -6395,193 +6124,43 @@ async fn convert_gguf_to_safetensors_inner(
             &mut head_weights,
             Some(st_metadata.clone()),
         )?;
-        let head_config_str = serde_json::to_string_pretty(&head_config).map_err(|e| {
-            Error::from_reason(format!("Failed to serialize joint_head_config.json: {e}"))
-        })?;
-        fs::write(output_dir.join("joint_head_config.json"), head_config_str).map_err(|e| {
-            Error::from_reason(format!("Failed to write joint_head_config.json: {e}"))
-        })?;
-        info!("Wrote CLEF joint_head.safetensors + joint_head_config.json");
+        debug_assert_eq!(
+            plan.clef_head_config.as_ref(),
+            Some(&head_config),
+            "header CLEF head config (left) differs from the tensor transform (right)"
+        );
+        if !is_primary_model {
+            super::gguf_plan::write_clef_head_config(&output_dir, &head_config)?;
+            info!("Wrote CLEF joint_head.safetensors + joint_head_config.json");
+        }
+        plan.clef_head_config = Some(head_config);
     }
 
-    // Only write config.json and tokenizer files for the primary model file
-    // (`is_primary_model`, resolved before the save). Secondary files (e.g.,
-    // vision.safetensors for mmproj) should not overwrite the config written by
-    // the primary LLM conversion.
+    // Only the primary model file writes config.json and the runtime assets.
+    // Secondary files (e.g. vision.safetensors for mmproj) must not overwrite
+    // the config written by the primary LLM conversion.
     if is_primary_model {
-        // `asset_dir` / `src_config` / `synthesized_config` were resolved before
-        // the save (an explicit `--config-dir` is authoritative — needed by
-        // unified Gemma4, whose full text/vision/audio config cannot be rebuilt
-        // from GGUF metadata — otherwise the alongside-GGUF lookup and the
-        // metadata-extraction fallback).
-        let config_path = output_dir.join("config.json");
-        if config_source_dir.is_some() && !src_config.exists() {
-            return Err(Error::from_reason(format!(
-                "Authoritative config.json not found in config source directory: {}",
-                asset_dir.display()
-            )));
-        }
-
-        // Load or extract config, then inject quantization metadata if needed
-        let mut config_json: serde_json::Value = if src_config.exists() {
-            let data = fs::read_to_string(&src_config)
-                .map_err(|e| Error::from_reason(format!("Failed to read config.json: {e}")))?;
-            serde_json::from_str(&data)
-                .map_err(|e| Error::from_reason(format!("Failed to parse config.json: {e}")))?
-        } else {
-            let mut synthesized = extract_config(&gguf.metadata);
-            apply_qwen35_inline_mtp_config(&mut synthesized, qwen35_inline_mtp_index);
-            synthesized
-        };
-
-        if let Some(contract) = &prism_contract
-            && let Some(obj) = config_json.as_object_mut()
-        {
-            let header = extract_config(&gguf.metadata);
-            if let Some(header_obj) = header.as_object() {
-                for (key, value) in header_obj {
-                    obj.entry(key.clone()).or_insert_with(|| value.clone());
-                }
-            }
-            obj.insert(
-                "prism_hadamard".to_string(),
-                serde_json::to_value(contract).map_err(|e| {
-                    Error::from_reason(format!("Failed to serialize prism_hadamard config: {e}"))
-                })?,
-            );
-        }
-
-        // Measured off the tensor list and cross-checked against the header, so
-        // it also applies to a hand-supplied config.json: a config for a GGUF
-        // whose global layers carry no `attn_v` but that says nothing about the
-        // layout is describing weights that do not exist, and the weights are
-        // the artifact. A config that DOES state either field is the stronger
-        // source and keeps it — writing over an explicit statement would make
-        // `--config-dir` unable to correct a mislabelled checkpoint.
-        if is_gemma4_main_gguf(&gguf.metadata) {
-            // An explicit conversion dtype is the text tensor contract, not
-            // an inference from a multimodal top-level config. Record it where
-            // Gemma's loader can safely enable affine sidecar hoisting.
-            if let Some(dtype) = options.dtype.as_deref()
-                && let Some(text) = config_json
-                    .get_mut("text_config")
-                    .and_then(serde_json::Value::as_object_mut)
+        if let Some(config_json) = plan.config.as_mut() {
+            if do_quantize {
+                let quant_obj = crate::convert::build_quantization_object(
+                    quant_bits,
+                    Some(quant_group_size_effective),
+                    &quant_mode_effective,
+                    &per_layer_overrides,
+                    /* is_privacy_filter */ false,
+                    /* skip_mtp */ false,
+                );
+                config_json["quantization"] = quant_obj.clone();
+                config_json["quantization_config"] = quant_obj;
+            } else if let Some(quant_obj) =
+                preserved_source_quantization(&gguf, import_k_quants, &tiled_kquant_prefixes)?
             {
-                let dtype = match dtype {
-                    "bf16" => "bfloat16",
-                    "f16" => "float16",
-                    "f32" => "float32",
-                    dtype => dtype,
-                };
-                text.insert(
-                    "dtype".to_string(),
-                    serde_json::Value::String(dtype.to_string()),
-                );
-            }
-            if let Some(types) = &gemma4_layer_types {
-                if !gemma4_config_states(&config_json, "attention_k_eq_v") {
-                    config_json["attention_k_eq_v"] = serde_json::Value::Bool(true);
-                }
-                if !gemma4_config_states(&config_json, "layer_types") {
-                    config_json["layer_types"] = serde_json::Value::Array(
-                        types
-                            .iter()
-                            .cloned()
-                            .map(serde_json::Value::String)
-                            .collect(),
-                    );
-                }
-            }
-            // Only when we synthesized the config: an authoritative config.json
-            // already states this geometry, and the GGUF is the weaker source.
-            if synthesized_config && let Some(obj) = config_json.as_object_mut() {
-                apply_gemma4_attention_geometry(obj, &gguf.metadata, gemma4_layer_types.as_deref());
+                // The converter's marks follow what it actually tiled.
+                config_json["quantization"] = quant_obj.clone();
+                config_json["quantization_config"] = quant_obj;
             }
         }
-
-        if is_muse_glimmer_main_gguf(&gguf.metadata) {
-            // llama.cpp's official converter unpermutes decoder and vision Q/K
-            // rows into ggml's interleaved RoPE layout before K-quantization.
-            // Reordering packed rows here would violate lossless import.
-            config_json["muse_glimmer_gguf_rope_layout"] =
-                serde_json::Value::String("interleaved".to_string());
-        }
-
-        if native_qwen35_layout {
-            config_json["qwen35_gguf_gdn_layout"] = serde_json::Value::String("tiled".to_string());
-        }
-
-        if do_quantize {
-            let quant_obj = crate::convert::build_quantization_object(
-                quant_bits,
-                Some(quant_group_size_effective),
-                &quant_mode_effective,
-                &per_layer_overrides,
-                /* is_privacy_filter */ false,
-                /* skip_mtp */ false,
-            );
-            config_json["quantization"] = quant_obj.clone();
-            config_json["quantization_config"] = quant_obj;
-        } else if let Some(quant_obj) =
-            preserved_source_quantization(&gguf, import_k_quants, &tiled_kquant_prefixes)?
-        {
-            // Source Q4_0/Q4_1/Q5_1/Q8_0 tensors were losslessly repacked into MLX
-            // affine groups of 32, and imported K-quants keep ggml's own
-            // geometry. Record that even without an extra quantize request;
-            // otherwise Gemma4 defaults to group_size 64 and decodes the exact
-            // packed bytes with the wrong geometry.
-            config_json["quantization"] = quant_obj.clone();
-            config_json["quantization_config"] = quant_obj;
-        }
-
-        let config_str = serde_json::to_string_pretty(&config_json)
-            .map_err(|e| Error::from_reason(format!("Failed to serialize config: {e}")))?;
-        fs::write(&config_path, &config_str)
-            .map_err(|e| Error::from_reason(format!("Failed to write config.json: {e}")))?;
-        if do_quantize {
-            info!("Wrote config.json with quantization metadata");
-        } else if preserved_source_quantization(&gguf, import_k_quants, &tiled_kquant_prefixes)?
-            .is_some()
-        {
-            info!("Wrote config.json with preserved GGUF source quantization metadata");
-        } else if src_config.exists() {
-            info!("Copied config.json from source directory");
-        } else {
-            info!("Wrote config.json (extracted from GGUF metadata)");
-        }
-
-        // Copy the same runtime assets as the SafeTensors converter. In
-        // particular unified Gemma4 requires its external chat template and
-        // processor config in addition to tokenizer.json.
-        for filename in GGUF_RUNTIME_ASSET_FILES {
-            let src = asset_dir.join(filename);
-            if src.exists() {
-                let dst = output_dir.join(filename);
-                if src == dst {
-                    continue;
-                }
-                if config_source_dir.is_some() {
-                    fs::copy(&src, &dst).map_err(|e| {
-                        Error::from_reason(format!("Failed to copy {filename}: {e}"))
-                    })?;
-                    info!("Copied {filename}");
-                } else if let Err(e) = fs::copy(&src, &dst) {
-                    warn!("Failed to copy {filename}: {e}");
-                } else {
-                    info!("Copied {filename}");
-                }
-            } else if matches!(*filename, "tokenizer.json" | "tokenizer_config.json") {
-                warn!(
-                    "{filename} not found in asset source directory {}. You may need to download it separately.",
-                    asset_dir.display()
-                );
-            }
-        }
-        if !output_dir.join("tokenizer.json").exists()
-            && write_embedded_gpt2_tokenizer(&gguf.metadata, &output_dir)?
-        {
-            info!("Reconstructed tokenizer.json from embedded GGUF GPT-2 metadata");
-        }
+        super::gguf_plan::write_gguf_assets(&plan, None, &gguf, &output_dir)?;
     } else {
         if let Some(config) = prepared_muse_secondary_config {
             fs::write(&muse_secondary_config_path, config).map_err(|error| {
