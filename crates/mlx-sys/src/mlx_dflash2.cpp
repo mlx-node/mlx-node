@@ -1,6 +1,7 @@
 #include "mlx_common.h"
 
 #include <functional>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 
@@ -180,6 +181,69 @@ extern "C" int mlx_dflash2_topk16_test(mlx_array* logits, mlx_array** out_ids,
   return dflash2_topk16_impl(logits, out_ids, out_values);
 }
 
+// Optional source-style selector edge arithmetic. All six arguments are
+// explicit graph inputs, including the changing anchor. Row-contiguous copies
+// are lazy and handled by CustomKernel, so sliced projected rows are accepted.
+extern "C" mlx_array* mlx_dflash2_selector_edges(
+    mlx_array* candidates, mlx_array* unary, mlx_array* hidden,
+    mlx_array* predecessor, mlx_array* successor, mlx_array* anchor) {
+#ifdef MLX_NODE_METAL_ENABLED
+  using namespace mlx::core;
+  if (!candidates || !unary || !hidden || !predecessor || !successor || !anchor ||
+      !mlx::core::metal::is_available() || !(default_device() == Device::gpu))
+    return nullptr;
+  try {
+    const auto& c = *reinterpret_cast<array*>(candidates);
+    const auto& u = *reinterpret_cast<array*>(unary);
+    const auto& h = *reinterpret_cast<array*>(hidden);
+    const auto& p = *reinterpret_cast<array*>(predecessor);
+    const auto& s = *reinterpret_cast<array*>(successor);
+    const auto& a = *reinterpret_cast<array*>(anchor);
+    if (c.dtype() != int32 || u.dtype() != float32 || h.dtype() != bfloat16 ||
+        p.dtype() != bfloat16 || s.dtype() != bfloat16 || a.dtype() != int32 ||
+        c.ndim() != 3 || c.shape(0) != 1 || c.shape(2) != 16 ||
+        c.shape(1) < 1 || c.shape(1) > 7 || u.shape() != c.shape() ||
+        h.shape() != Shape{c.shape(1), 1, 256} || p.ndim() != 2 ||
+        p.shape(0) < 16 || p.shape(1) != 256 || s.shape() != p.shape() ||
+        a.shape() != Shape{1})
+      return nullptr;
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "dflash2_selector_edges", {"candidates", "unary", "hidden",
+                                    "predecessor", "successor", "anchor"}, {"scores"},
+#include "metal/common/dflash2_selector_edges.metal.inc"
+    );
+    auto output = kernel({c, u, h, p, s, a}, {{c.shape(1), 16, 16}}, {float32},
+                         {c.shape(1) * 256, 1, 1}, {256, 1, 1}, {},
+                         std::nullopt, false, Device::gpu);
+    // All supported calls have identical generated input types and rank.
+    // Shape metadata is dynamic, so validate this one source once per device.
+    auto* device = mlx::core::metal::device(default_stream(Device::gpu).device).mtl_device();
+    static std::mutex mutex;
+    static std::vector<std::pair<MTL::Device*, bool>> supported;
+    bool valid = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      auto it = std::find_if(supported.begin(), supported.end(),
+                            [device](const auto& item) { return item.first == device; });
+      if (it == supported.end()) {
+        valid = selector_pipeline_supported(output[0], 256);
+        supported.emplace_back(device, valid);
+      } else {
+        valid = it->second;
+      }
+    }
+    if (!valid) return nullptr;
+    return reinterpret_cast<mlx_array*>(new array(std::move(output[0])));
+  } catch (const std::exception& e) {
+    std::cerr << "mlx_dflash2_selector_edges error: " << e.what() << std::endl;
+    return nullptr;
+  }
+#else
+  (void)candidates; (void)unary; (void)hidden; (void)predecessor; (void)successor; (void)anchor;
+  return nullptr;
+#endif
+}
+
 // Collapse the dependent greedy predecessor walk from roughly four lazy MLX
 // operations per proposal position to one Metal dispatch. The custom-kernel
 // wrapper keeps inputs row-contiguous, inserting a lazy copy for transposed or
@@ -219,5 +283,69 @@ extern "C" bool mlx_dflash2_greedy_path(mlx_array* candidates,
   } catch (const std::exception& e) {
     std::cerr << "mlx_dflash2_greedy_path error: " << e.what() << std::endl;
     return false;
+  }
+}
+
+extern "C" bool mlx_dflash2_greedy_path_confidence(mlx_array* candidates,
+                                        mlx_array* scores,
+                                        mlx_array** out_path, mlx_array** out_confidence) {
+  if (!candidates || !scores || !out_path || !out_confidence)
+    return false;
+  *out_path = nullptr;
+  *out_confidence = nullptr;
+  try {
+    const auto& candidate_ids = *reinterpret_cast<array*>(candidates);
+    const auto& score_table = *reinterpret_cast<array*>(scores);
+    if (candidate_ids.dtype() != mlx::core::int32 ||
+        score_table.dtype() != mlx::core::float32 ||
+        candidate_ids.ndim() != 3 || score_table.ndim() != 3 ||
+        candidate_ids.shape(0) != 1)
+      return false;
+
+    const int length = candidate_ids.shape(1);
+    const int top_k = candidate_ids.shape(2);
+    if (length < 1 || top_k < 1 || top_k > 64 ||
+        score_table.shape(0) != length ||
+        score_table.shape(1) != top_k || score_table.shape(2) != top_k)
+      return false;
+
+    static auto greedy_path = mlx::core::fast::metal_kernel(
+        "dflash2_greedy_path_confidence", {"candidates", "scores"}, {"path", "confidence"},
+#include "metal/common/dflash2_greedy_path_confidence.metal.inc"
+    );
+    auto outputs = greedy_path(
+        {candidate_ids, score_table}, {{length}, {length}}, {mlx::core::int32, mlx::core::float32},
+        {1, 1, 1}, {1, 1, 1}, {}, std::nullopt, false,
+        mlx::core::Device::gpu);
+    auto path = std::make_unique<array>(std::move(outputs[0]));
+    auto confidence = std::make_unique<array>(std::move(outputs[1]));
+    *out_path = reinterpret_cast<mlx_array*>(path.release());
+    *out_confidence = reinterpret_cast<mlx_array*>(confidence.release());
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "mlx_dflash2_greedy_path error: " << e.what() << std::endl;
+    return false;
+  }
+}
+
+extern "C" mlx_array* mlx_dflash2_verify_budget(mlx_array* confidence, mlx_array* parameters) {
+  if (!confidence || !parameters) return nullptr;
+  try {
+    const auto& q = *reinterpret_cast<array*>(confidence);
+    const auto& p = *reinterpret_cast<array*>(parameters);
+    if (q.dtype() != mlx::core::float32 || p.dtype() != mlx::core::float32 ||
+        q.ndim() != 1 || q.shape(0) != 7 || p.ndim() != 1 || p.shape(0) != 18)
+      return nullptr;
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "dflash2_verify_budget", {"confidence", "parameters"}, {"budget"},
+#include "metal/common/dflash2_verify_budget.metal.inc"
+    );
+    auto outputs = kernel({q, p}, {{1}}, {mlx::core::int32},
+                          {1, 1, 1}, {1, 1, 1}, {}, std::nullopt, false,
+                          mlx::core::Device::gpu);
+    return reinterpret_cast<mlx_array*>(new array(std::move(outputs[0])));
+  } catch (const std::exception& e) {
+    std::cerr << "mlx_dflash2_verify_budget error: " << e.what() << std::endl;
+    return nullptr;
   }
 }

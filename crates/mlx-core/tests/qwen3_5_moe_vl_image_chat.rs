@@ -189,7 +189,7 @@ async fn qwen3_5_moe_vl_image_chat_t0_capture() {
     };
     let image = std::fs::read(&image_path).expect("failed to read test image");
 
-    let model = Qwen3_5MoeModel::load(model_path.clone())
+    let model = Qwen3_5MoeModel::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5-VL MoE model");
 
@@ -291,7 +291,7 @@ async fn qwen3_5_moe_vl_reads_document_text() {
     };
     let image = std::fs::read(&image_path).expect("failed to read test image");
 
-    let model = Qwen3_5MoeModel::load(model_path.clone())
+    let model = Qwen3_5MoeModel::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5-VL MoE model");
 

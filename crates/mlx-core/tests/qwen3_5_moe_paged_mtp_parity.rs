@@ -242,7 +242,7 @@ async fn paged_mtp_matches_paged_ar_and_flat_mtp() {
         return;
     };
 
-    let paged_model = Qwen3_5MoeModel::load(model_path.clone())
+    let paged_model = Qwen3_5MoeModel::load(model_path.clone(), None)
         .await
         .expect("failed to load MoE model (paged)");
     assert!(
@@ -316,7 +316,7 @@ async fn paged_mtp_matches_paged_ar_and_flat_mtp() {
     let flat_dir = flat_clone_model_dir(Path::new(&model_path), "parity")
         .expect("flat clone of the checkpoint failed");
     let _cleanup = DirCleanup(flat_dir.clone());
-    let flat_model = Qwen3_5MoeModel::load(flat_dir.to_string_lossy().into_owned())
+    let flat_model = Qwen3_5MoeModel::load(flat_dir.to_string_lossy().into_owned(), None)
         .await
         .expect("failed to load MoE model (flat MTP)");
     assert!(
@@ -372,7 +372,7 @@ async fn paged_mtp_carries_state_a_warm_ar_continue_cannot_tell_from_ar() {
     let Some(model_path) = model_path() else {
         return;
     };
-    let model = Qwen3_5MoeModel::load(model_path.clone())
+    let model = Qwen3_5MoeModel::load(model_path.clone(), None)
         .await
         .expect("failed to load MoE model");
     if !model.has_mtp_weights() || !model.has_block_paged_cache() {
@@ -484,7 +484,7 @@ async fn strict_gdn_state_oracle_is_calibrated_against_a_pure_ar_turn() {
     let Some(model_path) = model_path() else {
         return;
     };
-    let model = Qwen3_5MoeModel::load(model_path.clone())
+    let model = Qwen3_5MoeModel::load(model_path.clone(), None)
         .await
         .expect("failed to load MoE model");
     if !model.has_mtp_weights() || !model.has_block_paged_cache() {

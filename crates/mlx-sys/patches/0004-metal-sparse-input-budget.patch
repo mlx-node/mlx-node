@@ -1,0 +1,107 @@
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -46,6 +46,11 @@
+ 
+   void set_buffer(const MTL::Buffer* buf, int idx, int64_t offset = 0);
+   void set_input_array(const array& a, int idx, int64_t offset = 0);
++  // Scheduling estimate only, in data_size() storage units (not bytes).
++  // Resource binding, hazards, residency and retention remain unchanged.
++  // A repeated binding of this allocation restores its full original charge.
++  void set_input_array_with_budget(
++      const array& a, int idx, size_t touched_units, int64_t offset = 0);
+   void set_output_array(array& a, int idx, int64_t offset = 0);
+   void register_output_array(const array& a);
+ 
+@@ -125,6 +130,7 @@
+ 
+  private:
+   MTL::ComputeCommandEncoder* get_command_encoder();
++  void restore_input_budget(const void* buffer);
+ 
+   Device& device_;
+   bool exiting_{false};
+@@ -134,6 +140,9 @@
+   NS::SharedPtr<MTL::CommandBuffer> buffer_;
+   int buffer_ops_{0};
+   size_t buffer_sizes_{0};
++  // Reduced first bindings in the current encoder. Any later binding, even
++  // through an alias or the budget API, conservatively restores the discount.
++  std::unordered_map<const void*, size_t> input_budget_discounts_;
+ 
+   // The residency set and how many of its sets this queue has attached.
+   ResidencySets& residency_sets_;
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -426,9 +426,20 @@
+   }
+   // Record as both input and output to ensure synchronization between command
+   // buffers
++  restore_input_budget(buf);
+   all_inputs_.insert((void*)buf);
+   all_outputs_.insert((void*)buf);
+   get_command_encoder()->setBuffer(buf, offset, idx);
++}
++
++void CommandEncoder::restore_input_budget(const void* buffer) {
++  if (!input_budget_discounts_.empty()) {
++    auto it = input_budget_discounts_.find(buffer);
++    if (it != input_budget_discounts_.end()) {
++      buffer_sizes_ += it->second;
++      input_budget_discounts_.erase(it);
++    }
++  }
+ }
+ 
+ void CommandEncoder::set_input_array(
+@@ -438,6 +449,11 @@
+   if (trace_level_) {
+     trace_resource(static_cast<const MTL::Buffer*>(a.buffer().ptr()));
+   }
++  // A shared allocation may be rebound through another view or operation.
++  // Restore the first binding's complete charge rather than assuming that
++  // both bindings touch the same selected rows. This also covers a later
++  // ordinary input/output binding after a budgeted sparse input.
++  restore_input_budget(a.buffer().ptr());
+   if (all_inputs_.insert(a.buffer().ptr()).second) {
+     buffer_sizes_ += a.data_size();
+   }
+@@ -447,6 +463,23 @@
+       needs_barrier_ | in_epoch(prev_outputs_, r_buf, barrier_epoch_);
+   auto a_buf = static_cast<const MTL::Buffer*>(a.buffer().ptr());
+   get_command_encoder()->setBuffer(a_buf, a.offset() + offset, idx);
++}
++
++void CommandEncoder::set_input_array_with_budget(
++    const array& a,
++    int idx,
++    size_t touched_units,
++    int64_t offset) {
++  const bool already_bound =
++      all_inputs_.find(a.buffer().ptr()) != all_inputs_.end() ||
++      all_outputs_.find(a.buffer().ptr()) != all_outputs_.end();
++  // The normal API performs ALL actual binding, tracing and hazard work.
++  set_input_array(a, idx, offset);
++  if (!already_bound && touched_units < a.data_size()) {
++    const size_t discount = a.data_size() - touched_units;
++    input_budget_discounts_.emplace(a.buffer().ptr(), discount);
++    buffer_sizes_ -= discount;
++  }
+ }
+ 
+ void CommandEncoder::set_output_array(
+@@ -459,6 +492,7 @@
+ }
+ 
+ void CommandEncoder::register_output_array(const array& a) {
++  restore_input_budget(a.buffer().ptr());
+   all_outputs_.insert(a.buffer().ptr());
+ 
+   auto buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
+@@ -614,6 +648,7 @@
+   next_outputs_.clear();
+   concurrent_outputs_.clear();
+   all_inputs_.clear();
++  input_budget_discounts_.clear();
+ }
+ 
+ void CommandEncoder::signal_event(Event event, uint64_t value) {

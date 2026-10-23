@@ -27,7 +27,8 @@ const NAX_KERNELS: i64 = 8 * 2 * 2;
 /// one_pass, 2pass_1, verify_2pass_1, verify_tile_2pass_1 (BF16); one_pass,
 /// 2pass_1, verify_tile_2pass_1 (int8 K/V); and the tensor-op kernels (each
 /// shape is its own function).
-const SEGMENTED_NAMES: i64 = 4 + 3 + NAX_KERNELS;
+// Both BF16 and FP32 partial variants, plus their256-thread reducers.
+const SEGMENTED_NAMES: i64 = 4 + 3 + 2 * NAX_KERNELS + 2;
 /// Partition counts the vector-SDPA policy returns: 32, 64, 128, 256, 512, 1024.
 const PARTITIONS: i64 = 6;
 /// Tile sizes the tile planner returns: 16, 32.
@@ -109,7 +110,7 @@ fn every_segmented_sdpa_specialization_builds_a_pipeline() {
     assert!(c.report.is_empty(), "{}", c.report);
     // SAFETY: nullary predicate that catches internally.
     let nax = unsafe { mlx_sys::mlx_metal_is_nax_available() };
-    let expected = SEGMENTED_PIPELINES + if nax { NAX_KERNELS } else { 0 };
+    let expected = SEGMENTED_PIPELINES + if nax { 2 * NAX_KERNELS + 2 } else { 0 };
     assert_eq!(c.built, expected, "pipelines built (nax available: {nax})");
 }
 
@@ -118,4 +119,19 @@ fn every_affine_mixed_kernel_builds_a_pipeline() {
     let c = check("affine_mixed", true);
     assert!(c.report.is_empty(), "{}", c.report);
     assert_eq!(c.built, AFFINE_MIXED_NAMES, "pipelines built");
+}
+
+/// Includes both source-only M8 entrypoints, not just their shared-library
+/// presence: exercise the same pipeline loader used by the grouped bridge.
+#[test]
+fn every_splash_moe_kernel_is_in_the_metallib() {
+    assert_names("splash_moe", 15);
+}
+
+#[test]
+fn every_splash_moe_kernel_builds_a_pipeline() {
+    let c = check("splash_moe", true);
+    assert!(c.report.is_empty(), "{}", c.report);
+    let nax = unsafe { mlx_sys::mlx_metal_is_nax_available() };
+    assert_eq!(c.built, if nax { 15 } else { 0 });
 }

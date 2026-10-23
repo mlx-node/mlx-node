@@ -3,6 +3,17 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "build_support/mlx_patches.rs"]
+mod mlx_patches;
+
+#[path = "build_support/metal_cache.rs"]
+mod metal_cache;
+use metal_cache::{AirJob, air_is_current, air_stamp};
+
+#[cfg(test)]
+#[path = "build_support/prebuilt_tests.rs"]
+mod prebuilt_tests;
+
 fn build_file_error(action: &str, path: &Path, error: io::Error) -> io::Error {
     io::Error::new(
         error.kind(),
@@ -130,25 +141,6 @@ fn assert_nax_buildable(deployment_target: &str) {
     }
 }
 
-/// One `.metal` → `.air` compile. `args` are every flag except the input,
-/// output and dependency-file paths.
-struct AirJob {
-    src: PathBuf,
-    air: PathBuf,
-    args: Vec<String>,
-}
-
-/// FNV-1a: stable across Rust releases, unlike `DefaultHasher`, so a stamp
-/// written by one toolchain still reads correctly under the next.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    hash
-}
-
 fn command_stdout(cmd: &mut Command) -> Option<String> {
     let output = cmd.output().ok()?;
     output
@@ -180,30 +172,6 @@ fn depfile_paths(text: &str) -> Vec<PathBuf> {
         paths.push(PathBuf::from(current));
     }
     paths
-}
-
-/// The stamp a job's `.air` was built from: toolchain, flags, and the content
-/// hash of the source and every header it included.
-fn air_stamp(job: &AirJob, toolchain: &str, deps: &[PathBuf]) -> Option<String> {
-    let mut stamp = format!("toolchain {toolchain}\nargs {}\n", job.args.join(" "));
-    for dep in deps {
-        let bytes = std::fs::read(dep).ok()?;
-        stamp.push_str(&format!("{:016x} {}\n", fnv1a(&bytes), dep.display()));
-    }
-    Some(stamp)
-}
-
-fn air_is_current(job: &AirJob, toolchain: &str) -> bool {
-    let stamp_path = job.air.with_extension("air.stamp");
-    let (Ok(stamp), true) = (std::fs::read_to_string(&stamp_path), job.air.exists()) else {
-        return false;
-    };
-    let deps: Vec<PathBuf> = stamp
-        .lines()
-        .skip(2)
-        .filter_map(|line| line.split_once(' ').map(|(_, path)| PathBuf::from(path)))
-        .collect();
-    air_stamp(job, toolchain, &deps).as_deref() == Some(stamp.as_str())
 }
 
 fn compile_air(job: &AirJob, toolchain: &str) {
@@ -337,6 +305,42 @@ fn compile_paged_attn_metallib(
     };
     jobs.extend(kquant_jobs("kquant"));
     jobs.extend(kquant_jobs("kquant_nax"));
+    jobs.push(AirJob {
+        src: bridge_dir.join("splash_moe/moe.metal"),
+        air: out_dir.join("splash_moe.air"),
+        args: vec![
+            "-x".to_string(),
+            "metal".to_string(),
+            "-fno-fast-math".to_string(),
+            "-I".to_string(),
+            mlx_dir.display().to_string(),
+            min_os.clone(),
+        ],
+    });
+    jobs.push(AirJob {
+        src: bridge_dir.join("mixed_projection/mixed_projection.metal"),
+        air: out_dir.join("mixed_projection.air"),
+        args: vec![
+            "-x".to_string(),
+            "metal".to_string(),
+            "-fno-fast-math".to_string(),
+            "-I".to_string(),
+            mlx_dir.display().to_string(),
+            min_os.clone(),
+        ],
+    });
+    jobs.push(AirJob {
+        src: bridge_dir.join("dflash2_attention/draft_attention.metal"),
+        air: out_dir.join("dflash2_attention.air"),
+        args: vec![
+            "-x".to_string(),
+            "metal".to_string(),
+            "-fno-fast-math".to_string(),
+            "-I".to_string(),
+            mlx_dir.display().to_string(),
+            min_os.clone(),
+        ],
+    });
     // bfloat16-only M = 8 tensor-op kernels: one compile, no KQUANT_DTYPE.
     jobs.push(AirJob {
         src: bridge_dir.join("kquant").join("kquant_m8_nax.metal"),
@@ -616,11 +620,11 @@ fn prebuilt_cache_root(manifest_dir: &Path) -> PathBuf {
 }
 
 /// `mlx-prebuilt-<mlx sha12>-<build key8>`. The release is keyed by every
-/// input that shapes the artifact: the submodule commit and the cmake build
-/// key (`prebuilt_build_key`). Changing a cmake define or a file under
-/// `cmake/` without moving the submodule therefore names a NEW release, and
-/// a pin that still names the old one falls back to the source build instead
-/// of linking an artifact built from other inputs.
+/// input that shapes the artifact: the submodule commit and the build key
+/// (`prebuilt_build_key`). Changing a portable cmake define or a file under
+/// `cmake/`, `patches/`, or `build_support/` without moving the submodule
+/// therefore names a NEW release, and a pin that still names the old one falls
+/// back to the source build instead of linking an artifact built from other inputs.
 fn release_tag_for(commit: &str, build_key: &str) -> String {
     format!(
         "mlx-prebuilt-{}-{}",
@@ -702,10 +706,10 @@ fn portable_cmake_defines(
 /// `export_prebuilt`. Those use host-specific paths, so they cannot be
 /// hashed into the key directly. BUMP THIS when changing any of them, or
 /// the workflow computes the existing immutable tag and keeps the old asset.
-const PREBUILT_BUILD_KEY_REVISION: u32 = 1;
+const PREBUILT_BUILD_KEY_REVISION: u32 = 2;
 
 /// sha256 over the portable cmake defines, every file under
-/// `crates/mlx-sys/cmake/` (they run inside MLX's configure) and
+/// `crates/mlx-sys/cmake/`, the tracked MLX source patches and helper, and
 /// `PREBUILT_BUILD_KEY_REVISION`. Together with the submodule commit this is
 /// everything that decides the artifact's bytes, up to the toolchain.
 fn prebuilt_build_key(manifest_dir: &Path, defines: &[(String, String)]) -> io::Result<String> {
@@ -715,17 +719,18 @@ fn prebuilt_build_key(manifest_dir: &Path, defines: &[(String, String)]) -> io::
     }
     // Recursive, like the workflow's `cmake/**` trigger: a new include under
     // a subdirectory must move the key, or the publisher keeps the old asset.
-    let cmake_dir = manifest_dir.join("cmake");
     let mut files = Vec::new();
-    walk_files(&cmake_dir, &mut files)?;
+    for directory in ["cmake", "patches", "build_support"] {
+        walk_files(&manifest_dir.join(directory), &mut files)?;
+    }
     files.sort();
     for file in files {
         let rel = file
-            .strip_prefix(&cmake_dir)
+            .strip_prefix(manifest_dir)
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
-        canonical.push_str(&format!("cmake/{rel}={}\n", sha256_file(&file)?));
+        canonical.push_str(&format!("{rel}={}\n", sha256_file(&file)?));
     }
     let tmp = env::temp_dir().join(format!("mlx-prebuilt-key-{}.txt", std::process::id()));
     std::fs::write(&tmp, canonical)?;
@@ -982,6 +987,37 @@ fn resolve_mlx_source(
                 dir.display()
             );
         }
+        if build_metal && let Some(arch) = triple.strip_suffix("-apple-darwin") {
+            // The tracked Metal patches extend CommandEncoder's layout and
+            // API. An explicit directory must not bypass their ABI identity.
+            let (head, dirty) = submodule_state(mlx_dir).unwrap_or_else(|error| {
+                panic!("mlx-sys: cannot validate explicit Metal prebuilt: {error}")
+            });
+            assert!(
+                !dirty,
+                "mlx-sys: cannot validate MLX_PREBUILT_DIR against a modified MLX submodule; \
+                 use MLX_PREBUILT=0 to build the current source"
+            );
+            let defines = portable_cmake_defines(true, "macos", arch, deployment_target);
+            let key = prebuilt_build_key(manifest_dir, &defines).unwrap_or_else(|error| {
+                panic!("mlx-sys: cannot validate explicit Metal prebuilt build inputs: {error}")
+            });
+            for (field, wanted) in [
+                ("mlx_commit", head.as_str()),
+                ("triple", triple),
+                ("build_key", key.as_str()),
+            ] {
+                let recorded = prebuilt_manifest_field(&dir, field);
+                assert!(
+                    recorded.as_deref() == Some(wanted),
+                    "mlx-sys: MLX_PREBUILT_DIR={} records {field} {:?}, expected {wanted}; \
+                     its Metal encoder ABI cannot be verified against this checkout. \
+                     Use MLX_PREBUILT=0 or export a matching artifact with MLX_PREBUILT_EXPORT",
+                    dir.display(),
+                    recorded,
+                );
+            }
+        }
         if let (Some(recorded), Some(wanted)) =
             (prebuilt_manifest_deployment_target(&dir), deployment_target)
             && recorded != wanted
@@ -1211,6 +1247,8 @@ fn main() -> io::Result<()> {
     // re-run this script or a restored target keeps a prebuilt whose key no
     // longer matches.
     println!("cargo:rerun-if-changed=cmake");
+    println!("cargo:rerun-if-changed=patches");
+    println!("cargo:rerun-if-changed=build_support");
     // The deployment-target floor participates in both the CMake configure
     // and the paged-attn metallib compile; changing it must re-run this
     // script or the caches keep the old floor.
@@ -1257,6 +1295,10 @@ fn main() -> io::Result<()> {
     // `paged_attn_metallib_path` lookup will throw if the metallib is
     // not findable.
     let out_dir_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    // Keep the submodule clean. MLX and the bridge consume the same patched
+    // source tree; the original checkout still identifies the upstream pin.
+    let mlx_source_dir =
+        mlx_patches::prepare(&mlx_dir, &manifest_dir.join("patches"), &out_dir_path)?;
     // Resolved once: it probes the host (`sw_vers`).
     let deployment_target = is_macos.then(macos_deployment_target);
     let paged_metallib_path = if build_metal {
@@ -1266,7 +1308,7 @@ fn main() -> io::Result<()> {
         assert_nax_buildable(deployment_target);
         Some(compile_paged_attn_metallib(
             &manifest_dir,
-            &mlx_dir,
+            &mlx_source_dir,
             &out_dir_path,
             deployment_target,
         ))
@@ -1294,7 +1336,7 @@ fn main() -> io::Result<()> {
     );
 
     // `mlx_root` holds `lib/` (libmlx.a, mlx.metallib) and `include/`:
-    // the cmake install tree (== OUT_DIR) or the unpacked prebuilt dir.
+    // the cmake install tree (OUT_DIR/mlx-cmake) or the unpacked prebuilt dir.
     // `lib_dirs` are the link-search dirs; in source mode also the dirs
     // that receive a `paged_attn.metallib` copy.
     let (mlx_root, lib_dirs, prebuilt) = match mlx_source {
@@ -1345,7 +1387,7 @@ fn main() -> io::Result<()> {
             });
             let (dst, defines, sentinel) = build_mlx_from_source(
                 &manifest_dir,
-                &mlx_dir,
+                &mlx_source_dir,
                 &out_dir_path,
                 build_metal,
                 &target_os,
@@ -1420,12 +1462,12 @@ fn main() -> io::Result<()> {
     // so `cargo test` works without manual env var setup.
     //
     // Source mode: `paged_attn.metallib` goes into every lib dir of the
-    // install tree (`out/lib` next to `mlx.metallib`). Prebuilt mode: the
+    // install tree (`out/mlx-cmake/lib` next to `mlx.metallib`). Prebuilt mode: the
     // prebuilt dir is shared across profiles, so nothing profile-specific
     // is written there; instead `OUT_DIR/lib` gets `paged_attn.metallib`
     // plus a hard link (copy if the cache is on another volume) of the
-    // prebuilt `mlx.metallib`, so `OUT_DIR/lib` holds both metallibs in
-    // both modes and build.ts never has to re-derive the cache location
+    // prebuilt `mlx.metallib`, so the bound install directory holds both
+    // metallibs and build.ts never has to re-derive the cache location
     // from the environment (a relative MLX_PREBUILT_CACHE_DIR or
     // CARGO_TARGET_DIR resolves differently under cargo and under yarn).
     //
@@ -1512,7 +1554,7 @@ fn main() -> io::Result<()> {
         }
     }
 
-    let include_source = mlx_dir.join("mlx");
+    let include_source = mlx_source_dir.join("mlx");
     let include_generated = mlx_root.join("include");
 
     let mut bridge = cc::Build::new();
@@ -1521,7 +1563,7 @@ fn main() -> io::Result<()> {
         .warnings(false)
         .define("MLX_STATIC", None)
         .include(&include_source)
-        .include(&mlx_dir);
+        .include(&mlx_source_dir);
 
     if build_metal || target_os == "linux" {
         bridge.define("MLX_NODE_GPU_ENABLED", None);
@@ -1544,7 +1586,7 @@ fn main() -> io::Result<()> {
             "MLX_NODE_PAGED_ATTN_METALLIB",
             format!("\"{}\"", paged_origin.display()).as_str(),
         );
-        build_bridge_preambles(&mut bridge, &mlx_dir, &src_dir, &out_dir_path)?;
+        build_bridge_preambles(&mut bridge, &mlx_source_dir, &src_dir, &out_dir_path)?;
     }
 
     if is_macos {
@@ -1616,8 +1658,8 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-/// Configure and run the MLX cmake build. Returns the install tree (==
-/// OUT_DIR), the `-D` defines passed (recorded in an exported manifest) and,
+/// Configure and run the MLX cmake build. Returns the install tree, the
+/// `-D` defines passed (recorded in an exported manifest) and,
 /// with `export_release_tag`, the METAL_PATH string baked into libmlx.a.
 #[allow(clippy::too_many_arguments)]
 fn build_mlx_from_source(
@@ -1631,6 +1673,9 @@ fn build_mlx_from_source(
     export_release_tag: Option<String>,
 ) -> (PathBuf, Vec<(String, String)>, Option<String>) {
     let mut cfg = cmake::Config::new(mlx_dir);
+    // A separate build directory avoids stale CMake source paths from builds
+    // that compiled the submodule directly, before source patches were added.
+    cfg.out_dir(out_dir.join("mlx-cmake"));
     let mut defines =
         portable_cmake_defines(build_metal, target_os, target_arch, deployment_target);
     let mut define = |key: &str, value: &str| defines.push((key.to_string(), value.to_string()));
@@ -1765,9 +1810,8 @@ fn build_bridge_preambles(
     }
     // The K-quant headers as source text, for the custom kernels that
     // reuse their decoders (the K-quant ops themselves run from the
-    // prebuilt paged_attn.metallib). Their one project include, the
-    // per-mode traits in kquant_mode.h, is inlined in place so each
-    // preamble stays self-contained, in the generator's format.
+    // prebuilt paged_attn.metallib). Project includes are inlined in place
+    // so each preamble stays self-contained, in the generator's format.
     // kquant_mode.h, the grid tables and kquant_grid.h (in that order:
     // the grid decode needs the mode traits and the tables before it).
     let inlined_body = |name: &str| -> io::Result<String> {
@@ -1788,6 +1832,8 @@ fn build_bridge_preambles(
         inlined_body("kquant_grid_tables")?,
         inlined_body("kquant_grid")?
     );
+    let split_body = inlined_body("kquant_split_reduce")?;
+    let sg8_body = inlined_body("kquant_sg8")?;
     for name in ["kquant", "kquant_nax"] {
         let header = src_dir.join(format!("metal/kquant/{name}.h"));
         let body: String = read_build_source(&header)?
@@ -1797,6 +1843,10 @@ fn build_bridge_preambles(
                 let trimmed = line.trim_start();
                 if trimmed == "#include \"kquant_mode.h\"" {
                     mode_body.clone()
+                } else if trimmed == "#include \"kquant_split_reduce.h\"" {
+                    split_body.clone()
+                } else if trimmed == "#include \"kquant_sg8.h\"" {
+                    sg8_body.clone()
                 } else if trimmed.starts_with("#include \"") && trimmed.ends_with(".h\"") {
                     String::new()
                 } else {

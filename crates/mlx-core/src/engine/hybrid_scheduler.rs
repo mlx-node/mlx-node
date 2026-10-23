@@ -3414,6 +3414,7 @@ mod tests {
             persist_paged_cache: None,
             n_mtp_layers: 0,
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
         }
     }
 
@@ -3740,6 +3741,55 @@ mod tests {
     ///
     /// MUTATION: barrier on `config.enable_mtp` alone — the first assertion
     /// fails, since this dense fixture carries no MTP head.
+    #[test]
+    fn moe_dflash_uses_exclusive_lane_while_disabled_draft_keeps_paged_ar() {
+        let mut inner = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE");
+        inner.dflash2 = Some(
+            crate::models::qwen3_5::dflash2::tiny_dflash2_model_for_stepper_test(
+                &inner.config.to_dense_config(),
+            )
+            .expect("tiny compatible draft"),
+        );
+        assert!(
+            !inner.supports_scheduled_speculation(),
+            "external draft is never native MTP"
+        );
+        let state = HybridSchedulerState::new(inner).expect("construct scheduler");
+        for streaming in [false, true] {
+            let (command, _keepalive): (ChatCmd, Box<dyn std::any::Any>) = if streaming {
+                let (command, rx) = streaming_start(mtp_config());
+                (command, Box::new(rx))
+            } else {
+                let (command, rx) = sync_start(mtp_config());
+                (command, Box::new(rx))
+            };
+            assert!(state.chat_requires_barrier(&command));
+            let plan = TurnPlan::resolve(
+                state.inner.execution_plan(),
+                TurnRequest {
+                    is_delta: false,
+                    input_media: MediaCapabilities::NONE,
+                    context_media: MediaCapabilities::NONE,
+                    speculative_requested: true,
+                    streaming,
+                },
+            );
+            assert_eq!(
+                plan.decoder,
+                DecoderPlan::Speculative(engine::plan::SpeculativeKind::DraftModel)
+            );
+            assert!(!plan.use_paged_attention);
+        }
+        let (command, _rx) = sync_start(ChatConfig {
+            enable_mtp: Some(false),
+            ..ChatConfig::default()
+        });
+        assert!(
+            !state.chat_requires_barrier(&command),
+            "plain AR remains schedulable"
+        );
+    }
+
     #[test]
     fn enable_mtp_without_a_loaded_decoder_keeps_the_scheduled_lane() {
         let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");

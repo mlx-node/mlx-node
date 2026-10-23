@@ -46,6 +46,7 @@ struct GdnFusedParams {
   int a_stride_c;
   int b_stride_t;
   int b_stride_c;
+  int pending_T; // prior tape rows; dynamic keep is a separate explicit input
 };
 
 // `Sigmoid` from mlx/backend/metal/kernels/unary_ops.h, verbatim: the
@@ -77,7 +78,26 @@ inline T gdn_fused_sigmoid(T x) {
     device float* decay_out [[buffer(15)]],
     device bfloat16_t* beta_out [[buffer(16)]],
     device bfloat16_t* history_out [[buffer(17)]],
+#if GDN_FUSED_PREPARED
+    device bfloat16_t* prepared_bt [[buffer(18)]],
+    device float* prepared_sums [[buffer(19)]],
+    constant GdnFusedParams& p [[buffer(20)]],
+#else
     constant GdnFusedParams& p [[buffer(18)]],
+#endif
+#if GDN_FUSED_DEFERRED
+#if GDN_FUSED_PREPARED
+#define GDN_PENDING_SLOT 21
+#else
+#define GDN_PENDING_SLOT 19
+#endif
+    const device bfloat16_t* pending_k [[buffer(GDN_PENDING_SLOT)]],
+    const device bfloat16_t* pending_v [[buffer(GDN_PENDING_SLOT + 1)]],
+    const device float* pending_g [[buffer(GDN_PENDING_SLOT + 2)]],
+    const device bfloat16_t* pending_beta [[buffer(GDN_PENDING_SLOT + 3)]],
+    const device bfloat16_t* pending_qkv [[buffer(GDN_PENDING_SLOT + 4)]],
+    const device int* pending_keep [[buffer(GDN_PENDING_SLOT + 5)]],
+#endif
 #else
 [[kernel]] void mlx_node_gdn_fused_step(
     const device bfloat16_t* q [[buffer(0)]],
@@ -99,7 +119,12 @@ inline T gdn_fused_sigmoid(T x) {
   constexpr int Dk = 32 * n_per_t;
   constexpr int Dv = GDN_FUSED_DV;
   constexpr uint MaxT = Dv / 4;
-  threadgroup bfloat16_t y_sh[MaxT * Dv];
+  // Eight-row verification needs only eight output/preparation rows.
+  // Keep the original SIMD count: storage specialization must not change
+  // either arithmetic schedule, including the 32-SIMD-group default.
+  constexpr uint StorageRows = GDN_FUSED_T8_STORAGE ? 8 : MaxT;
+  threadgroup bfloat16_t y_sh[StorageRows * Dv];
+  constexpr uint SimdGroups = GDN_FUSED_SCAN8 ? 8 : MaxT;
 
   const uint T = uint(p.T);
   const uint Hk = uint(p.hk);
@@ -107,12 +132,17 @@ inline T gdn_fused_sigmoid(T x) {
   const uint b_idx = n / Hv;
   const uint hv_idx = n % Hv;
   const uint hk_idx = hv_idx % Hk;
+#if GDN_FUSED_DEFERRED
+  // Production constructs this scalar only from a checked host keep count.
+  // Clamp the internal raw-FFI operand defensively, without a device readback.
+  const uint P = uint(clamp(pending_keep[0], 0, p.pending_T));
+#endif
 
 #if GDN_FUSED_COMPLETE
   // --- prologue: qwen4_gdn_prepare for this head's q, k, v vectors -------
   // Prepared rows for up to Dv / 8 tokens: with y_sh this stays inside the
   // 32 KiB threadgroup budget (the host limits T accordingly).
-  constexpr uint PrepT = Dv / 8;
+  constexpr uint PrepT = GDN_FUSED_T8_STORAGE ? 8 : Dv / 8;
   threadgroup bfloat16_t q_sh[PrepT * Dk];
   threadgroup bfloat16_t k_sh[PrepT * Dk];
   threadgroup bfloat16_t v_sh[PrepT * Dv];
@@ -124,7 +154,7 @@ inline T gdn_fused_sigmoid(T x) {
     constexpr uint KC = 4;
     const uint W = (2 * Hk) * Dk + Hv * Dv;
     const bool writer = hv_idx < Hk;  // one of the Hv / Hk sharers writes q/k
-    for (uint task = sg; task < 3 * T; task += MaxT) {
+    for (uint task = sg; task < 3 * T; task += SimdGroups) {
       const uint token = task % T;
       const uint kind = task / T;  // 0 = q, 1 = k, 2 = v
       const uint vec = kind == 0 ? hk_idx : (kind == 1 ? Hk + hk_idx : 2 * Hk + hv_idx);
@@ -134,9 +164,20 @@ inline T gdn_fused_sigmoid(T x) {
         float total = 0.0f;
         for (uint tap = 0; tap < KC; ++tap) {
           const uint row = token + tap;
+#if GDN_FUSED_DEFERRED
+          const uint prior = P + row;
+          // Do not read the virtual history for current rows: its prior index
+          // may be beyond the retained tape, even though the select is masked.
+          float value;
+          if (row < KC - 1) value = float(prior < KC - 1
+              ? history[prior * uint(p.hist_stride_r) + ch * uint(p.hist_stride_c)]
+              : pending_qkv[(prior - (KC - 1)) * W + ch]);
+          else value = float(qkv[(row - (KC - 1)) * uint(p.qkv_stride_t) + ch * uint(p.qkv_stride_c)]);
+#else
           float value = float(row < KC - 1
               ? history[row * uint(p.hist_stride_r) + ch * uint(p.hist_stride_c)]
               : qkv[(row - (KC - 1)) * uint(p.qkv_stride_t) + ch * uint(p.qkv_stride_c)]);
+#endif
           float product = value * conv[ch * KC + tap];
           total = product + total;
         }
@@ -146,10 +187,17 @@ inline T gdn_fused_sigmoid(T x) {
         squared += values[i] * values[i];
         if (token == 0 && (kind == 2 || writer)) {
           for (uint row = 0; row + 1 < KC; ++row) {
+#if GDN_FUSED_DEFERRED
+            const uint source = P + row;
+            history_out[row * W + ch] = source < KC - 1
+                ? history[source * uint(p.hist_stride_r) + ch * uint(p.hist_stride_c)]
+                : pending_qkv[(source - (KC - 1)) * W + ch];
+#else
             const uint source = T + row;
             history_out[row * W + ch] = source < KC - 1
                 ? history[source * uint(p.hist_stride_r) + ch * uint(p.hist_stride_c)]
                 : qkv[(source - (KC - 1)) * uint(p.qkv_stride_t) + ch * uint(p.qkv_stride_c)];
+#endif
           }
         }
       }
@@ -207,6 +255,103 @@ inline T gdn_fused_sigmoid(T x) {
   const uint gate_at = hv_idx;
 #endif
 
+#if GDN_FUSED_SCAN8
+  // Splash's two-state-row schedule on eight SIMD groups. Each state row
+  // retains the native recurrence's exact operation/reduction order; only
+  // assignment to SIMD groups and the order of independent rows change.
+  float state_A[n_per_t], state_B[n_per_t];
+  for (int i = 0; i < n_per_t; ++i) {
+    const int s_idx = n_per_t * lane + i;
+    state_A[i] = state_in[(n * Dv + sg) * Dk + s_idx];
+    state_B[i] = state_in[(n * Dv + sg + 8) * Dk + s_idx];
+  }
+  for (uint batch = 0; batch < Dv / 16; ++batch) {
+    const uint dv_A = 16 * batch + sg;
+    const uint dv_B = dv_A + 8;
+    const uint base_A = (n * Dv + dv_A) * Dk;
+    const uint base_B = (n * Dv + dv_B) * Dk;
+    float upcoming_A[n_per_t] = {}, upcoming_B[n_per_t] = {};
+    if (batch + 1 < Dv / 16) {
+      for (int i = 0; i < n_per_t; ++i) {
+        const int s_idx = n_per_t * lane + i;
+        upcoming_A[i] = state_in[base_A + 16 * Dk + s_idx];
+        upcoming_B[i] = state_in[base_B + 16 * Dk + s_idx];
+      }
+    }
+#if GDN_FUSED_DEFERRED
+    for (uint t = 0; t < P; ++t) {
+      const float g_val = pending_g[t * Hv + hv_idx];
+      const float beta_val = float(pending_beta[t * Hv + hv_idx]);
+      float kv_mem_A = 0.0f, kv_mem_B = 0.0f;
+      for (int i = 0; i < n_per_t; ++i) {
+        const int s_idx = n_per_t * lane + i;
+        state_A[i] = state_A[i] * g_val;
+        state_B[i] = state_B[i] * g_val;
+        const float k_val = float(pending_k[(t * Hk + hk_idx) * Dk + s_idx]);
+        kv_mem_A += state_A[i] * k_val;
+        kv_mem_B += state_B[i] * k_val;
+      }
+      kv_mem_A = simd_sum(kv_mem_A);
+      kv_mem_B = simd_sum(kv_mem_B);
+      const float delta_A = (float(pending_v[(t * Hv + hv_idx) * Dv + dv_A]) - kv_mem_A) * beta_val;
+      const float delta_B = (float(pending_v[(t * Hv + hv_idx) * Dv + dv_B]) - kv_mem_B) * beta_val;
+      for (int i = 0; i < n_per_t; ++i) {
+        const int s_idx = n_per_t * lane + i;
+        const float k_val = float(pending_k[(t * Hk + hk_idx) * Dk + s_idx]);
+        state_A[i] = state_A[i] + k_val * delta_A;
+        state_B[i] = state_B[i] + k_val * delta_B;
+      }
+    }
+    for (int i = 0; i < n_per_t; ++i) {
+      const int s_idx = n_per_t * lane + i;
+      state_out[base_A + s_idx] = state_A[i];
+      state_out[base_B + s_idx] = state_B[i];
+    }
+#endif
+    for (uint t = 0; t < T; ++t) {
+      const float g_val = g_[gate_at + t * gate_step];
+      const float beta_val = static_cast<float>(beta_[gate_at + t * gate_step]);
+      float kv_mem_A = 0.0f, kv_mem_B = 0.0f;
+      for (int i = 0; i < n_per_t; ++i) {
+        const int s_idx = n_per_t * lane + i;
+        state_A[i] = state_A[i] * g_val;
+        state_B[i] = state_B[i] * g_val;
+        const float k_val = static_cast<float>(k_[t * qk_step + s_idx]);
+        kv_mem_A += state_A[i] * k_val;
+        kv_mem_B += state_B[i] * k_val;
+      }
+      kv_mem_A = simd_sum(kv_mem_A);
+      kv_mem_B = simd_sum(kv_mem_B);
+      const float delta_A = (static_cast<float>(v_[t * v_step + dv_A]) - kv_mem_A) * beta_val;
+      const float delta_B = (static_cast<float>(v_[t * v_step + dv_B]) - kv_mem_B) * beta_val;
+      float out_A = 0.0f, out_B = 0.0f;
+      for (int i = 0; i < n_per_t; ++i) {
+        const int s_idx = n_per_t * lane + i;
+        const float k_val = static_cast<float>(k_[t * qk_step + s_idx]);
+        const float q_val = static_cast<float>(q_[t * qk_step + s_idx]);
+        state_A[i] = state_A[i] + k_val * delta_A;
+        state_B[i] = state_B[i] + k_val * delta_B;
+        out_A += state_A[i] * q_val;
+        out_B += state_B[i] * q_val;
+      }
+      out_A = simd_sum(out_A);
+      out_B = simd_sum(out_B);
+      if (lane == 0) {
+        y_sh[t * Dv + dv_A] = static_cast<bfloat16_t>(out_A);
+        y_sh[t * Dv + dv_B] = static_cast<bfloat16_t>(out_B);
+      }
+    }
+    for (int i = 0; i < n_per_t; ++i) {
+      const int s_idx = n_per_t * lane + i;
+#if !GDN_FUSED_DEFERRED
+      state_out[base_A + s_idx] = state_A[i];
+      state_out[base_B + s_idx] = state_B[i];
+#endif
+      state_A[i] = upcoming_A[i];
+      state_B[i] = upcoming_B[i];
+    }
+  }
+#else
   const uint dv_A = 4 * sg;
   const uint dv_B = dv_A + 1;
   const uint dv_C = dv_A + 2;
@@ -232,6 +377,48 @@ inline T gdn_fused_sigmoid(T x) {
     state_D[i] = i_state_D[s_idx];
   }
 
+#if GDN_FUSED_DEFERRED
+    for (uint t = 0; t < P; ++t) {
+      const float g_val = pending_g[t * Hv + hv_idx];
+      const float beta_val = float(pending_beta[t * Hv + hv_idx]);
+      float kv_mem_A = 0.0f, kv_mem_B = 0.0f, kv_mem_C = 0.0f, kv_mem_D = 0.0f;
+      for (int i = 0; i < n_per_t; ++i) {
+        const int s_idx = n_per_t * lane + i;
+        state_A[i] = state_A[i] * g_val;
+        state_B[i] = state_B[i] * g_val;
+        state_C[i] = state_C[i] * g_val;
+        state_D[i] = state_D[i] * g_val;
+        const float k_val = float(pending_k[(t * Hk + hk_idx) * Dk + s_idx]);
+        kv_mem_A += state_A[i] * k_val;
+        kv_mem_B += state_B[i] * k_val;
+        kv_mem_C += state_C[i] * k_val;
+        kv_mem_D += state_D[i] * k_val;
+      }
+      kv_mem_A = simd_sum(kv_mem_A);
+      kv_mem_B = simd_sum(kv_mem_B);
+      kv_mem_C = simd_sum(kv_mem_C);
+      kv_mem_D = simd_sum(kv_mem_D);
+      const float delta_A = (float(pending_v[(t * Hv + hv_idx) * Dv + dv_A]) - kv_mem_A) * beta_val;
+      const float delta_B = (float(pending_v[(t * Hv + hv_idx) * Dv + dv_B]) - kv_mem_B) * beta_val;
+      const float delta_C = (float(pending_v[(t * Hv + hv_idx) * Dv + dv_C]) - kv_mem_C) * beta_val;
+      const float delta_D = (float(pending_v[(t * Hv + hv_idx) * Dv + dv_D]) - kv_mem_D) * beta_val;
+      for (int i = 0; i < n_per_t; ++i) {
+        const int s_idx = n_per_t * lane + i;
+        const float k_val = float(pending_k[(t * Hk + hk_idx) * Dk + s_idx]);
+        state_A[i] = state_A[i] + k_val * delta_A;
+        state_B[i] = state_B[i] + k_val * delta_B;
+        state_C[i] = state_C[i] + k_val * delta_C;
+        state_D[i] = state_D[i] + k_val * delta_D;
+      }
+    }
+    for (int i = 0; i < n_per_t; ++i) {
+      const int s_idx = n_per_t * lane + i;
+      o_state_A[s_idx] = state_A[i];
+      o_state_B[s_idx] = state_B[i];
+      o_state_C[s_idx] = state_C[i];
+      o_state_D[s_idx] = state_D[i];
+    }
+#endif
   for (uint t = 0; t < T; ++t) {
     const float g_val = g_[gate_at];
     const float beta_val = static_cast<float>(beta_[gate_at]);
@@ -292,11 +479,14 @@ inline T gdn_fused_sigmoid(T x) {
   }
   for (int i = 0; i < n_per_t; ++i) {
     const int s_idx = n_per_t * lane + i;
+#if !GDN_FUSED_DEFERRED
     o_state_A[s_idx] = state_A[i];
     o_state_B[s_idx] = state_B[i];
     o_state_C[s_idx] = state_C[i];
     o_state_D[s_idx] = state_D[i];
+#endif
   }
+#endif
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // One simdgroup per window row: rms_single_row's lane map (lane owns
@@ -318,13 +508,36 @@ inline T gdn_fused_sigmoid(T x) {
         t * uint(p.z_stride_t) + hv_idx * Dv + lane * 4;
     const device bfloat16_t* w_ = w + lane * 4;
     device bfloat16_t* out_ = out + ((b_idx * T + t) * Hv + hv_idx) * Dv + lane * 4;
+    bfloat16_t rounded[4];
     for (int i = 0; i < 4; ++i) {
       const bfloat16_t normed = w_[i] * static_cast<bfloat16_t>(thread_x[i] * inv);
       const bfloat16_t zt = z_[i];
       const bfloat16_t sig = gdn_fused_sigmoid(zt);
       const bfloat16_t gated = sig * zt;
-      out_[i] = gated * normed;
+      const bfloat16_t value = gated * normed;
+      out_[i] = value;
+      rounded[i] = value;
     }
+#if GDN_FUSED_PREPARED
+    // Exact kquant_qmv_sg8_prep<bf16,32> bytes, emitted from the same
+    // rounded output values. Every scalar half has one writer; adjacent
+    // rows write different halves of a uint32 pair, never read/modify/write.
+    const uint span = (hv_idx * Dv + lane * 4) / 32;
+    const uint fm = lane & 7u, fn = t & ~1u;
+    const uint packed_lane = ((fm & 4u) << 2) | ((fm & 3u) << 1) |
+                             ((fn & 4u) << 1) | ((fn & 2u) >> 1);
+    for (uint i = 0; i < 4; ++i)
+      prepared_bt[((span * 32 + packed_lane) * 4 + i) * 2 + (t & 1u)] = rounded[i];
+    // The original prep's lane bits 1,2,4 represent fm bits 0,1,2.
+    // This producer's adjacent lanes own adjacent fm, so xor 1,2,4
+    // reproduces the exact same FP32 reduction tree over each 32 values.
+    float sum = (float(rounded[0]) + float(rounded[1])) +
+                (float(rounded[2]) + float(rounded[3]));
+    sum += simd_shuffle_xor(sum, ushort(1));
+    sum += simd_shuffle_xor(sum, ushort(2));
+    sum += simd_shuffle_xor(sum, ushort(4));
+    if ((lane & 7u) == 0) prepared_sums[span * 8 + t] = sum;
+#endif
   }
 }
 )"

@@ -11,11 +11,16 @@
 #include <string>
 
 #ifdef MLX_NODE_METAL_ENABLED
+#include "metal/common/quantized.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx_paged_metallib.h"
 
 #include <set>
 #include <sstream>
+
+namespace mlx::core::quantized_preamble {
+const char *utils();
+}
 #endif
 
 using mlx::core::array;
@@ -204,6 +209,34 @@ bool mlx_test_kquant_metallib_check(bool build_pipelines, int64_t *counts,
   (void)counts;
   (void)report;
   (void)len;
+  return false;
+#endif
+}
+
+// Compile the generated K-quant preamble with a concrete SG8 kernel. Unlike
+// the prebuilt name check, this covers project headers inlined for JIT users.
+bool mlx_test_kquant_jit_preamble_check() {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!mlx::core::metal::is_available())
+      return false;
+    auto &d = mlx::core::metal::device(mlx::core::Device::gpu);
+    const std::string name = "mlx_node_test_kquant_jit_preamble";
+    auto *lib = d.get_library(name, [&] {
+      return std::string(mlx::core::quantized_preamble::utils()) +
+             mlx::core::quantized_preamble::gemm() +
+             mlx::core::quantized_preamble::quantized_utils() +
+             mlx::core::quantized_preamble::kquant() +
+             "\ntemplate [[host_name(\"" + name +
+             "\")]] [[kernel]] decltype(kquant_qmv_sg8_prep<bfloat16_t, 32>) "
+             "kquant_qmv_sg8_prep<bfloat16_t, 32>;\n";
+    });
+    return lib != nullptr;
+  } catch (const std::exception &e) {
+    std::cerr << "mlx_test_kquant_jit_preamble_check: " << e.what() << std::endl;
+    return false;
+  }
+#else
   return false;
 #endif
 }

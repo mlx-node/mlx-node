@@ -15,6 +15,10 @@
 //! in CI's `model-test` lane (`.github/workflows/ci.yml`, the `qwen3` leg):
 //!
 //!   cargo test -p mlx-core --test kquant_metallib_names -- --ignored
+//!
+//! Custom JIT kernels consume a generated copy of the same K-quant header.
+//! A separate compile check covers its inlined local helpers, which the
+//! prebuilt library's name set cannot validate.
 
 #![cfg(target_os = "macos")]
 
@@ -32,15 +36,19 @@ const AFFINE_MODES: i64 = 2;
 /// nv 2..8, qmm_t, qmm_t_splitk), plus 4 bfloat16 qmv_sg8 kernels and the 2
 /// sg8 prep kernels (group sizes 16 and 32), plus each affine mode's
 /// dequantize and 15 Tiled64 families.
-const BASE_NAMES: i64 = MODES * 3 * (39 + 15) + 4 + 2 + AFFINE_MODES * 3 * (1 + 15);
+// Q4_K and affine4/64 each add a tiled register-MMA kernel; the six
+// register-MMA formats each add a split-K kernel; three exact M1 gathers
+// consume Q4_K/Q5_K/Q6_K T64 expert stacks.
+const BASE_NAMES: i64 = MODES * 3 * (39 + 15) + 4 + 2 + AFFINE_MODES * 3 * (1 + 15) + 2 + 6 + 3;
 /// 15 modes x 3 dtypes x (qmm_t_nax {aligned, unaligned} x {batched, single}
 /// plus the aligned, single Tiled64 qmm_t_nax_t64, plus gather_qmm_rhs_nax_nt
 /// at bm 32 and 64), plus the bfloat16 tensor-op kernels: the three Tiled64
 /// row tiers (qmm_m8/m16/m32_nax_t64) per mode and the 10 row-major
 /// qmm_m8_nax (q3k, q2k, iq4nl and the seven grid formats); each affine mode
 /// adds qmm_t_nax_t64 per dtype and its three Tiled64 row tiers.
+// The Q6_K tiled M8 head adds one FP32-output NAX kernel.
 const NAX_NAMES: i64 =
-    MODES * 3 * (4 + 1 + 2) + MODES * 3 + 10 + AFFINE_MODES * 3 + AFFINE_MODES * 3;
+    MODES * 3 * (4 + 1 + 2) + MODES * 3 + 10 + AFFINE_MODES * 3 + AFFINE_MODES * 3 + 1;
 
 struct Check {
     base: i64,
@@ -111,6 +119,15 @@ fn every_dispatchable_kernel_is_in_the_metallib() {
         "{} K-quant functions in paged_attn.metallib (nax available: {})",
         c.in_library,
         nax_available()
+    );
+}
+
+#[test]
+fn jit_preamble_compiles_with_local_helpers() {
+    // SAFETY: nullary predicate that catches Metal compiler errors internally.
+    assert!(
+        unsafe { mlx_sys::mlx_test_kquant_jit_preamble_check() },
+        "K-quant JIT preamble failed to compile with its SG8 and split helpers"
     );
 }
 

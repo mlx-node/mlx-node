@@ -539,10 +539,11 @@ fn apply_weights_moe_inner(
     .map(drop)
 }
 
-/// `params` is `&mut` for the same reason as the dense loader's: a 2-D
-/// K-quant projection repacked into the Tiled64 layout at load has its
-/// row-major sources released from the map once its layer is installed
-/// (`release_tiled_kquant_sources`); experts stay row-major and untouched.
+/// `params` is `&mut` for the same reason as the dense loader's: Tiled64
+/// projections own evaluated replacements, so their sources are released from
+/// the map once the layer is installed (`release_tiled_kquant_sources`). The
+/// returned text-byte total is captured before that pruning, keeping
+/// byte-preserving routed-expert and 2-D Tiled64 repacks in the registration.
 fn apply_weights_moe_inner_with_residency(
     inner: &mut Qwen35MoeInner,
     params: &mut HashMap<String, MxArray>,
@@ -552,7 +553,12 @@ fn apply_weights_moe_inner_with_residency(
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     _has_vision: bool,
-) -> Result<PlainFp8Residency> {
+) -> Result<(PlainFp8Residency, u64)> {
+    let text_weight_bytes: u64 = params
+        .values()
+        .map(|a| a.nbytes() as u64)
+        .fold(0u64, |acc, v| acc.saturating_add(v));
+
     // sym8 dispatch covers the NON-EXPERT sublayers (attention q/k/v/o, GDN
     // in_proj_qkvz/in_proj_ba/out_proj, shared-expert MLP body) through the
     // same shared `QuantizedLinear` machinery as the dense qwen3_5 loader.
@@ -1280,6 +1286,16 @@ fn apply_weights_moe_inner_with_residency(
 
                     if let (Some(qg), Some(qu), Some(qd)) = (q_se_gate, q_se_up, q_se_down) {
                         moe.set_quantized_shared_expert(qg, qu, qd)?;
+                        // Tile only after all six projections are known to
+                        // support grouped execution. Mixed unsupported trios
+                        // retain the generic path's native row-major storage.
+                        if moe.finalize_grouped_layout()? {
+                            tiled_prefixes.borrow_mut().extend([
+                                gate_proj_key.clone(),
+                                up_proj_key.clone(),
+                                down_proj_key.clone(),
+                            ]);
+                        }
                     } else {
                         if let Some(w) = params.get(&format!("{}.weight", se_gate_key)) {
                             ensure_dense_weight_floating(&format!("{}.weight", se_gate_key), w)?;
@@ -1544,7 +1560,7 @@ fn apply_weights_moe_inner_with_residency(
         "Applied weights to inner from checkpoint: {} total in checkpoint",
         total_weights
     );
-    Ok(plain_fp8_residency.into_inner())
+    Ok((plain_fp8_residency.into_inner(), text_weight_bytes))
 }
 
 /// Load the vision encoder onto `inner` when the checkpoint ships one —
@@ -1736,7 +1752,17 @@ fn align_affine_embedding_dtype(
 ///
 /// All model state lives on the spawned thread. Returns a thin NAPI shell
 /// with the thread handle and model configuration.
-pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
+pub async fn load_with_thread(
+    model_path: &str,
+    draft_model_path: Option<String>,
+    kv_format: Option<crate::transformer::KvFormat>,
+) -> Result<Qwen3_5MoeModel> {
+    // Snapshot once, before spawning; forward/compiled graphs never read this
+    // diagnostic setting and another load cannot change an existing model.
+    let source_norm_request = super::source_norms::SourceNormRequest::capture()?;
+    let source_qk_request = super::source_qk::SourceQkRequest::capture()?;
+    let source_moe_policy = super::source_math_policy::SourceMoePolicy::capture()?
+        .with_qk_requested(source_qk_request.is_some());
     // Retained for the public wrapper: a direct GGUF load hands this loader the
     // native-packed cache, and the TS streaming wrappers read the tokenizer
     // from here rather than from the `.gguf` source path.
@@ -1777,6 +1803,16 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     .map_err(|e| Error::from_reason(format!("Failed to parse config: {}", e)))?;
 
                 let mut config = parse_config(&raw)?;
+                source_moe_policy.validate_mixer_profile(&config)?;
+                source_moe_policy.validate_head_profile(&config)?;
+                if source_qk_request.is_some() {
+                    super::source_qk::SourceQkRequest::validate_profile(&config, false)?;
+                }
+
+                crate::transformer::KvFormat::parse(config.kv_format.as_deref())
+                    .map_err(|message| Error::from_reason(format!("config.json: {message}")))?;
+                let kv_format = kv_format.unwrap_or_else(|| config.kv_format());
+                config.kv_format = Some(kv_format.as_str().to_string());
 
                 info!(
                     "Qwen3.5 MoE config: {} layers, hidden={}, experts={}x{}",
@@ -1796,7 +1832,8 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     "qwen3_5_moe",
                     persist_env.as_deref(),
                     config.persist_paged_cache,
-                );
+                ) && source_norm_request.is_none()
+                    && !source_moe_policy.active();
                 let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
 
                 // Load all weights
@@ -1867,6 +1904,13 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                 let has_vision = raw_params
                     .keys()
                     .any(|k| strip_qwen35_vision_weight_prefix(k).is_some());
+                if (source_moe_policy.mixer || source_moe_policy.qk || source_moe_policy.head)
+                    && has_vision
+                {
+                    return Err(Error::from_reason(
+                        "source attention/head diagnostics are text-only",
+                    ));
+                }
 
                 let (text_raw_params, vision_params) = if has_vision {
                     let mut vision_params: HashMap<String, MxArray> = HashMap::new();
@@ -1910,6 +1954,18 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                          checkpoint's {residual_dtype:?} residual stream"
                     );
                 }
+                // Original BF16 norms already selected the residual/embedding
+                // dtype above. Replace only sanitized final-value norm keys.
+                let source_norm_identity = source_norm_request
+                    .as_ref()
+                    .map(|request| {
+                        request.replace_parameters(path, &config, has_vision, &mut params)
+                    })
+                    .transpose()?;
+                let source_qk_weights = source_qk_request
+                    .as_ref()
+                    .map(|request| request.load(path, &config, has_vision, &params))
+                    .transpose()?;
                 let quantized = is_quantized_checkpoint(&params);
                 info!(
                     "Sanitized to {} parameters (quantized={})",
@@ -1976,6 +2032,18 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
 
                 // Create inner model
                 let mut inner = Qwen35MoeInner::new(config.clone())?;
+                inner.configure_source_moe_policy(source_moe_policy);
+                if source_moe_policy.active() {
+                    info!(
+                        source_body = source_moe_policy.body,
+                        source_residual = source_moe_policy.residual,
+                        source_routing = source_moe_policy.routing,
+                        source_mixer = source_moe_policy.mixer,
+                        source_qk = source_moe_policy.qk,
+                        source_head = source_moe_policy.head,
+                        "Enabled immutable source MoE arithmetic diagnostic; SSD cache/training/export disabled"
+                    );
+                }
                 inner.row_exact_decode_projections =
                     has_kquant_mode(top_level_mode, &per_layer_quant)
                         || top_level_mode == Some(PerLayerMode::Affine)
@@ -1984,25 +2052,72 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                             .any(|quant| quant.mode == PerLayerMode::Affine);
                 inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(path));
 
-                // Apply weights directly to inner (no locks)
-                let plain_fp8_residency = apply_weights_moe_inner_with_residency(
-                    &mut inner,
-                    &mut params,
-                    &config,
-                    quant_bits,
-                    quant_group_size,
-                    top_level_mode,
-                    &per_layer_quant,
-                    has_vision,
-                )?;
+                // Apply weights directly to inner (no locks). The installer
+                // snapshots text bytes before releasing model-owned Tiled64
+                // sources from `params`.
+                let (plain_fp8_residency, text_weight_bytes) =
+                    apply_weights_moe_inner_with_residency(
+                        &mut inner,
+                        &mut params,
+                        &config,
+                        quant_bits,
+                        quant_group_size,
+                        top_level_mode,
+                        &per_layer_quant,
+                        has_vision,
+                    )?;
 
-                // Materialize mmap-backed weights
+                if source_moe_policy.head {
+                    inner
+                        .lm_head
+                        .as_mut()
+                        .ok_or_else(|| {
+                            Error::from_reason(
+                                "source head requires a separate vocabulary projection",
+                            )
+                        })?
+                        .enable_source_head()?;
+                }
+                if let Some(weights) = source_qk_weights {
+                    weights.install(&mut inner.layers)?;
+                    info!(
+                        "Enabled source QK norm/RoPE diagnostic with verified original F32 operands; T8 target only"
+                    );
+                }
+                if let Some(identity) = source_norm_identity {
+                    for layer in &mut inner.layers {
+                        layer.enable_source_residual_norms(identity.source_reduction)?;
+                    }
+                    if identity.source_reduction {
+                        inner.final_norm.enable_source_f32_splash()?;
+                    } else {
+                        inner.final_norm.enable_source_f32_reference()?;
+                    }
+                    info!(source_reduction = identity.source_reduction,
+                          payload_sha256 = %identity.payload_sha256,
+                          prepared_complete_sha256 = %identity.prepared_complete_sha256,
+                          "Enabled load-only F32 source residual norms with BF16 outputs; explicit arithmetic policy, SSD cache disabled");
+                    inner.source_norm_identity = Some(identity);
+                }
+                // Materialize mmap-backed weights (including owned source F32 norms).
                 let weights_resident = {
                     let mut arrays: Vec<&MxArray> = params.values().collect();
                     if !defer_plain_fp8_materialization() {
                         arrays.extend(plain_fp8_residency.arrays());
                     }
                     crate::array::memory::materialize_weights(&arrays)?
+                };
+
+                let dflash2_weight_bytes = if let Some(draft_path) = draft_model_path.as_deref() {
+                    let (mut draft, bytes) =
+                        crate::models::qwen3_5::dflash2::load_dflash2(Path::new(draft_path))?;
+                    draft.validate_target(&config.to_dense_config())?;
+                    draft.configure_moe_execution(&config);
+                    inner.dflash2 = Some(draft);
+                    info!("Loaded external Qwen3.5 MoE DFlash2 companion from {draft_path}");
+                    bytes
+                } else {
+                    0
                 };
 
                 // Set tokenizer
@@ -2037,23 +2152,21 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     None => weights_resident,
                 };
                 // Deterministic weight-byte total for the cache-limit
-                // coordinator. Includes text + vision weights when a
-                // vision encoder is loaded. `saturating_add` guards
-                // against overflow on a corrupted checkpoint.
-                let mut weight_bytes: u64 = params
-                    .values()
-                    .map(|a| a.nbytes() as u64)
-                    .fold(0u64, |acc, v| acc.saturating_add(v));
+                // coordinator. Text was counted before installation released
+                // Tiled64 sources; add vision weights when an encoder loaded.
+                // `saturating_add` guards against overflow on a corrupted checkpoint.
+                let mut weight_bytes: u64 = text_weight_bytes;
                 if let Some(ref vparams) = vision_params {
                     weight_bytes = vparams
                         .values()
                         .map(|a| a.nbytes() as u64)
                         .fold(weight_bytes, |acc, v| acc.saturating_add(v));
                 }
-                // The serialized Uint8 expert/dense weights and their
-                // scales are already covered by `params`; only the
-                // retained BF16 correctness reconstructions are extra.
+                // The serialized Uint8 expert/dense weights and their scales
+                // are already covered by `text_weight_bytes`; only the retained
+                // BF16 correctness reconstructions are extra.
                 weight_bytes = weight_bytes.saturating_add(plain_fp8_residency.nbytes());
+                weight_bytes = weight_bytes.saturating_add(dflash2_weight_bytes);
 
                 // Prepared projections own their retained arrays. The loader's
                 // source maps can still hold the replaced gate/up, Q/K/V and
@@ -2147,7 +2260,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
             let spatial_merge_size = inner.spatial_merge_size.unwrap_or(2);
             let tokenizer_out = inner.tokenizer.clone();
             let paged_active = inner.paged_adapter.is_some();
-            let mtp_active = inner.has_mtp_weights();
+            let mtp_active = inner.dflash2.is_some() || inner.has_mtp_weights();
             let vision_active = super::model::qwen35_moe_vision_active(
                 inner.vision_encoder.is_some(),
                 inner.image_processor.is_some(),
@@ -2346,6 +2459,10 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
             .get("qwen35_gguf_gdn_layout")
             .and_then(Value::as_str)
             .map(str::to_string),
+        kv_format: raw
+            .get("kv_format")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -2409,6 +2526,28 @@ pub fn create_random_qwen35_moe_checkpoint<'env>(
 mod tests {
     use crate::models::mtp_drafter::strip_wrapper_prefix;
     use serde_json::json;
+
+    #[test]
+    fn moe_flat_cache_precision_preserves_default_and_explicit_format() {
+        let mut raw = json!({
+            "hidden_size": 2048,
+            "num_hidden_layers": 40,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "moe_intermediate_size": 512,
+            "num_experts": 256
+        });
+        let default = parse_config(&raw).unwrap();
+        assert_eq!(default.kv_format(), crate::transformer::KvFormat::Bf16);
+        raw["kv_format"] = json!("int8");
+        let explicit = parse_config(&raw).unwrap();
+        assert_eq!(explicit.kv_format(), crate::transformer::KvFormat::Int8);
+        assert_eq!(explicit.to_dense_config().kv_format(), explicit.kv_format());
+        let restored: Qwen3_5MoeConfig =
+            serde_json::from_value(serde_json::to_value(&explicit).unwrap()).unwrap();
+        assert_eq!(restored.kv_format(), explicit.kv_format());
+    }
 
     #[test]
     fn paged_config_reads_root_options_without_losing_absence() {
@@ -2764,6 +2903,7 @@ mod tests {
             persist_paged_cache: None,
             n_mtp_layers: 0,
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
         }
     }
 
@@ -3038,6 +3178,7 @@ mod tests {
             persist_paged_cache: None,
             n_mtp_layers: 0,
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
         }
     }
 
@@ -3262,6 +3403,219 @@ mod tests {
             "the truncated group must name the missing companion: {}",
             error.reason
         );
+    }
+
+    #[test]
+    fn grouped_expert_tiling_preserves_registered_weight_bytes() {
+        use super::super::switch_glu::SwitchProj;
+        use crate::models::quant_dispatch::kquant_untile_rows;
+
+        if !unsafe { mlx_sys::mlx_splash_moe_available() } {
+            eprintln!("[skip] grouped MoE tiling requires the grouped Metal backend");
+            return;
+        }
+        let mut config = tiny_sym8_moe_cfg();
+        config.hidden_size = 256;
+        config.intermediate_size = 256;
+        config.num_heads = 4;
+        config.head_dim = 64;
+        let mut inner =
+            Qwen35MoeInner::new(config.clone()).expect("Qwen35MoeInner::new must succeed");
+
+        let insert_q4k = |params: &mut HashMap<String, MxArray>, prefix: &str, shape: &[i64]| {
+            let rows = shape[..shape.len() - 1].iter().product::<i64>() as usize;
+            let weights = shape.iter().product::<i64>() as usize;
+            let mut scales_shape = shape[..shape.len() - 1].to_vec();
+            scales_shape.push(16);
+            let mut biases_shape = shape[..shape.len() - 1].to_vec();
+            biases_shape.push(2);
+            params.insert(
+                format!("{prefix}.weight"),
+                MxArray::from_uint32(
+                    &(0..weights)
+                        .map(|i| {
+                            (i as u32)
+                                .wrapping_mul(1_664_525)
+                                .wrapping_add(1_013_904_223)
+                        })
+                        .collect::<Vec<_>>(),
+                    shape,
+                )
+                .expect("weight"),
+            );
+            params.insert(
+                format!("{prefix}.scales"),
+                MxArray::from_uint8(
+                    &(0..rows * 16)
+                        .map(|i| ((i * 37 + 11) % 251 + 1) as u8)
+                        .collect::<Vec<_>>(),
+                    &scales_shape,
+                )
+                .expect("scales"),
+            );
+            params.insert(
+                format!("{prefix}.biases"),
+                MxArray::from_float16(
+                    &(0..rows * 2)
+                        .map(|i| [0x2800u16, 0x2c00, 0x3000, 0x3200][i % 4])
+                        .collect::<Vec<_>>(),
+                    &biases_shape,
+                )
+                .expect("biases"),
+            );
+        };
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "embedding.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 8 * 256], &[8, 256]).expect("embedding"),
+        );
+        params.insert(
+            "final_norm.weight".to_string(),
+            MxArray::from_float32(&vec![1.0f32; 256], &[256]).expect("final_norm"),
+        );
+        params.insert(
+            "layers.0.self_attn.q_proj.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 512 * 256], &[512, 256]).expect("q_proj"),
+        );
+        params.insert(
+            "layers.0.mlp.gate.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 4 * 256], &[4, 256]).expect("router gate"),
+        );
+
+        let expert_prefixes = [
+            "layers.0.mlp.switch_mlp.gate_proj",
+            "layers.0.mlp.switch_mlp.up_proj",
+            "layers.0.mlp.switch_mlp.down_proj",
+        ];
+        let shared_prefixes = [
+            "layers.0.mlp.shared_expert.gate_proj",
+            "layers.0.mlp.shared_expert.up_proj",
+            "layers.0.mlp.shared_expert.down_proj",
+        ];
+        let mut per_layer_quant = HashMap::new();
+        for prefix in expert_prefixes.into_iter().chain(shared_prefixes) {
+            let shape: &[i64] = if prefix.contains(".switch_mlp.") {
+                &[4, 256, 32]
+            } else {
+                &[256, 32]
+            };
+            insert_q4k(&mut params, prefix, shape);
+            per_layer_quant.insert(
+                prefix.to_string(),
+                PerLayerQuant {
+                    bits: 4,
+                    group_size: 32,
+                    mode: PerLayerMode::Q4K,
+                    input_amax: None,
+                    layout: Default::default(),
+                },
+            );
+        }
+
+        let bytes = |arrays: &HashMap<String, MxArray>| {
+            arrays
+                .values()
+                .map(|array| array.nbytes() as u64)
+                .sum::<u64>()
+        };
+        let expected_text_bytes = bytes(&params);
+        let routed_expert_bytes = params
+            .iter()
+            .filter(|(key, _)| key.contains(".mlp.switch_mlp."))
+            .map(|(_, array)| array.nbytes() as u64)
+            .sum::<u64>();
+        let quantized_source_bytes = params
+            .iter()
+            .filter(|(key, _)| {
+                key.contains(".mlp.switch_mlp.") || key.contains(".mlp.shared_expert.")
+            })
+            .map(|(_, array)| array.nbytes() as u64)
+            .sum::<u64>();
+        let mut live = params.clone();
+        let (_fp8_residency, registered_text_bytes) =
+            super::apply_weights_moe_inner_with_residency(
+                &mut inner,
+                &mut live,
+                &config,
+                DEFAULT_QUANT_BITS,
+                DEFAULT_QUANT_GROUP_SIZE,
+                None,
+                &per_layer_quant,
+                false,
+            )
+            .expect("grouped Q4_K experts must load");
+
+        assert_eq!(registered_text_bytes, expected_text_bytes);
+        assert_eq!(
+            expected_text_bytes - bytes(&live),
+            quantized_source_bytes,
+            "the post-install map must lose every released tiled source"
+        );
+        assert_eq!(
+            registered_text_bytes,
+            bytes(&live) + quantized_source_bytes,
+            "registration must not use the pruned post-install map"
+        );
+
+        let MLPType::MoE(moe) = &inner.layers[0].mlp else {
+            panic!("layer 0 must be MoE");
+        };
+        let switch = moe.get_switch_mlp();
+        let mut installed_expert_bytes = 0;
+        for (projection, suffix) in [
+            (&switch.gate_proj, "gate_proj"),
+            (&switch.up_proj, "up_proj"),
+            (&switch.down_proj, "down_proj"),
+        ] {
+            let SwitchProj::Quantized(projection) = projection else {
+                panic!("grouped experts must stay quantized");
+            };
+            assert_eq!(projection.mode(), "q4k@t64");
+            let prefix = format!("layers.0.mlp.switch_mlp.{suffix}");
+            for companion in ["weight", "scales", "biases"] {
+                assert!(!live.contains_key(&format!("{prefix}.{companion}")));
+            }
+            installed_expert_bytes += [
+                projection.get_weight(),
+                projection.get_scales(),
+                projection.get_biases().expect("Q4_K super-scales"),
+            ]
+            .iter()
+            .map(|array| array.nbytes() as u64)
+            .sum::<u64>();
+
+            let untile = |array: &MxArray, unit: i64| {
+                let shape = array.shape().expect("shape");
+                kquant_untile_rows(&array.reshape(&[-1, shape[2]]).expect("flatten"), unit)
+                    .expect("untile")
+                    .reshape(&shape)
+                    .expect("restore expert axis")
+            };
+            let weight = untile(projection.get_weight(), 4);
+            let scales = untile(projection.get_scales(), 16);
+            let biases = untile(projection.get_biases().expect("Q4_K super-scales"), 2);
+            assert_eq!(
+                weight.to_uint32().expect("tiled weight").to_vec(),
+                params[&format!("{prefix}.weight")]
+                    .to_uint32()
+                    .expect("source weight")
+                    .to_vec()
+            );
+            assert_eq!(
+                scales.to_uint8().expect("tiled scales"),
+                params[&format!("{prefix}.scales")]
+                    .to_uint8()
+                    .expect("source scales")
+            );
+            assert_eq!(
+                biases.to_uint16_native().expect("tiled biases"),
+                params[&format!("{prefix}.biases")]
+                    .to_uint16_native()
+                    .expect("source biases")
+            );
+        }
+        assert_eq!(installed_expert_bytes, routed_expert_bytes);
     }
 
     /// T13: the MoE expert stacker keys per-expert companions on the three

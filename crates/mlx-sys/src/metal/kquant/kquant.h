@@ -23,6 +23,7 @@
 
 #include "kquant_mode.h"
 #include "kquant_grid.h"
+#include "kquant_split_reduce.h"
 
 constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
@@ -3643,152 +3644,7 @@ template <
 // kk of fragment j is physical k = 4 kk + j, which is what kquant_qmv_sg8_prep
 // lays out in bt. q6k's 32-code span holds two 16-groups: fragments 0,1 cover
 // the first (k = 2 kk + j), 2,3 the second.
-namespace kq_sg8 {
-
-enum Format : int { Q4K, Q5K, IQ4XS, Q6K, Unsupported };
-
-template <int group_size, int bits, int super_ratio, bool has_min, int kind>
-constexpr Format format() {
-  if (group_size == 32 && super_ratio == 8 && bits == 4) {
-    if (has_min && kind == KQ_LINEAR) {
-      return Q4K;
-    }
-    if (!has_min && kind == KQ_CODEBOOK) {
-      return IQ4XS;
-    }
-  }
-  if (group_size == 32 && super_ratio == 8 && bits == 5 && has_min &&
-      kind == KQ_LINEAR) {
-    return Q5K;
-  }
-  if (group_size == 16 && super_ratio == 16 && bits == 6 && !has_min &&
-      kind == KQ_LINEAR) {
-    return Q6K;
-  }
-  return Unsupported;
-}
-
-template <typename T>
-METAL_FUNC thread vec<T, 2>& te(thread simdgroup_matrix<T, 8, 8>& m) {
-  return reinterpret_cast<thread vec<T, 2>&>(m.thread_elements());
-}
-
-// c += a x b on register operands.
-METAL_FUNC void mma(thread float2& c, uint a, uint b) {
-  simdgroup_matrix<bfloat, 8, 8> A, B;
-  simdgroup_matrix<float, 8, 8> C, D;
-  te(A) = as_type<bfloat2>(a);
-  te(B) = as_type<bfloat2>(b);
-  te(C) = c;
-  simdgroup_multiply_accumulate(D, A, B, C);
-  c = te(D);
-}
-
-METAL_FUNC float bf_lo(uint v) {
-  return as_type<float>(v << 16);
-}
-
-METAL_FUNC float bf_hi(uint v) {
-  return as_type<float>(v & 0xFFFF0000u);
-}
-
-// Sum over the 8 lanes that share fn (fm lives in lane bits 1, 2 and 4).
-METAL_FUNC float fm_reduce(float v) {
-  v += simd_shuffle_xor(v, ushort(2));
-  v += simd_shuffle_xor(v, ushort(4));
-  v += simd_shuffle_xor(v, ushort(16));
-  return v;
-}
-
-// B operand pairs (x[fn][k], x[fn + 1][k]) for k = 4 fm + j, j = 0..3.
-METAL_FUNC void b_pairs4(uint2 a, uint2 b, thread uint (&bq)[4]) {
-  bq[0] = (a.x & 0xFFFFu) | (b.x << 16);
-  bq[1] = (a.x >> 16) | (b.x & 0xFFFF0000u);
-  bq[2] = (a.y & 0xFFFFu) | (b.y << 16);
-  bq[3] = (a.y >> 16) | (b.y & 0xFFFF0000u);
-}
-
-constant constexpr int kIQ4[16] =
-    {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
-
-// A unit is 32 consecutive k of one weight row: one group, or q6k's two
-// 16-groups. A super-block is 8 units.
-template <Format F>
-struct Codes;
-
-template <>
-struct Codes<Q4K> {
-  typedef uint W;
-  static W load(const device uint32_t* row, uint u, uint c) {
-    return row[u * 4 + c];
-  }
-};
-
-template <>
-struct Codes<IQ4XS> {
-  typedef uint W;
-  static W load(const device uint32_t* row, uint u, uint c) {
-    return row[u * 4 + c];
-  }
-};
-
-template <>
-struct Codes<Q5K> {
-  typedef uint2 W;
-  // Lane c's 40 bits start at bit 8c of word c of the 5-word group.
-  static W load(const device uint32_t* row, uint u, uint c) {
-    return uint2(row[u * 5 + c], row[u * 5 + c + 1]);
-  }
-};
-
-template <>
-struct Codes<Q6K> {
-  typedef uint4 W;
-  // The first group's 24-bit chunk starts at bit 24c of the 6-word span, the
-  // second's at bit 96 + 24c; .xy and .zw hold the words covering each. For
-  // c = 3 the second chunk ends at bit 32 of word 5, so its high word is
-  // unused and word 5 is re-read instead of reading past the span.
-  static W load(const device uint32_t* row, uint u, uint c) {
-    const uint wa = (24 * c) >> 5;
-    const uint wb = (96 + 24 * c) >> 5;
-    const device uint32_t* s = row + u * 6;
-    return uint4(s[wa], s[wa + 1], s[wb], s[wb + 1 < 6 ? wb + 1 : wb]);
-  }
-};
-
-// One super-block's scale data: .a = sub-scale bytes, .h = fp16 super scales.
-struct SB {
-  uint4 a;
-  half2 h;
-};
-
-template <Format F>
-METAL_FUNC SB load_sb(
-    const device uint8_t* scales,
-    const device half* biases,
-    uint n,
-    uint K,
-    uint G) {
-  SB s;
-  if constexpr (F == IQ4XS) {
-    const uint2 v = *reinterpret_cast<const device uint2*>(
-        scales + size_t(n) * (K / 32) + G * 8);
-    s.a = uint4(v, 0u, 0u);
-    s.h = half2(biases[size_t(n) * (K / 256) + G], 0.0h);
-  } else if constexpr (F == Q6K) {
-    s.a = *reinterpret_cast<const device uint4*>(
-        scales + size_t(n) * (K / 16) + G * 16);
-    s.h = half2(biases[size_t(n) * (K / 256) + G], 0.0h);
-  } else {
-    s.a = *reinterpret_cast<const device uint4*>(
-        scales + size_t(n) * (K / 16) + G * 16);
-    s.h = *reinterpret_cast<const device half2*>(
-        biases + size_t(n) * (K / 128) + G * 2);
-  }
-  return s;
-}
-
-} // namespace kq_sg8
+#include "kquant_sg8.h"
 
 // bt[u * 32 + lane] holds the 4 B pairs lane uses for unit u; sums[g * 8 + m]
 // is the fp32 sum of row m over group g. One simdgroup per unit.
@@ -3865,7 +3721,8 @@ template <
     int super_ratio,
     bool has_min,
     int kind,
-    int scale_shift>
+    int scale_shift,
+    bool tiled = false>
 [[kernel, max_total_threads_per_threadgroup(128)]] void kquant_qmv_sg8(
     const device uint32_t* w [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
@@ -3905,23 +3762,25 @@ template <
   }
 
   const uint n0 = tg * 32 + sg * 8 + fm;
-  const device uint32_t* row = w + size_t(n0) * rw;
+  const device uint32_t* row = tiled
+      ? reinterpret_cast<const device uint32_t*>(kq_tiled_row<bits>(w, n0, K / 32))
+      : w + size_t(n0) * rw;
   float2 acc = float2(0.0f);
 
-  SB scur = load_sb<F>(scales, biases, n0, K, 0);
+  SB scur = load_sb<F, tiled>(scales, biases, n0, K, 0);
   W wcur[8];
 #pragma unroll
   for (uint gi = 0; gi < 8; ++gi) {
-    wcur[gi] = Codes<F>::load(row, gi, c);
+    wcur[gi] = Codes<F>::load(row, gi, c, tiled ? 64 : 1);
   }
 
   for (uint G = 0; G < nsb; ++G) {
     const uint Gl = G + 1 < nsb ? G + 1 : G;
-    const SB snxt = load_sb<F>(scales, biases, n0, K, Gl);
+    const SB snxt = load_sb<F, tiled>(scales, biases, n0, K, Gl);
     W wnxt[8];
 #pragma unroll
     for (uint gi = 0; gi < 8; ++gi) {
-      wnxt[gi] = Codes<F>::load(row, Gl * 8 + gi, c);
+      wnxt[gi] = Codes<F>::load(row, Gl * 8 + gi, c, tiled ? 64 : 1);
     }
 
 #pragma unroll
@@ -3939,7 +3798,7 @@ template <
           sb = s2.y;
         }
         uint pq[4];
-        if constexpr (F == Q4K) {
+        if constexpr (F == Q4K || F == A4G64) {
           const uint wd = wcur[gi];
 #pragma unroll
           for (int j = 0; j < 4; ++j) {
@@ -3969,7 +3828,16 @@ template <
         mma(c0, pq[2], bq[2]);
         mma(c1, pq[3], bq[3]);
         const float2 d = c0 + c1;
-        if constexpr (F == IQ4XS) {
+        if constexpr (F == A4G64) {
+          // Affine group64 shares one BF16 coefficient pair across two
+          // 32-value register tiles; codes and input sums stay exact.
+          const uint group = gi / 2;
+          const uint shift = 16 * (group & 1);
+          const float scale = kq_bf16_to_float(ushort(scur.a[group / 2] >> shift));
+          const float bias = kq_bf16_to_float(ushort(scur.a[2 + group / 2] >> shift));
+          acc = fma(d, float2(scale), acc);
+          acc = fma(float2(sa, sb), float2(bias), acc);
+        } else if constexpr (F == IQ4XS) {
           const uint byte = (gi < 4 ? scur.a.x : scur.a.y) >> (8 * (gi & 3));
           const float scale =
               float(scur.h.x) * float(as_type<char>(uchar(byte & 0xFFu)));
@@ -4027,4 +3895,207 @@ template <
 
   y[fn * N + n0] = static_cast<T>(acc.x);
   y[(fn + 1) * N + n0] = static_cast<T>(acc.y);
+}
+
+// Opt-in split-K schedule. Unsplit kernel and its ABI above stay unchanged.
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int super_ratio,
+    bool has_min,
+    int kind,
+    int scale_shift,
+    bool tiled = false>
+[[kernel, max_total_threads_per_threadgroup(128)]] void kquant_qmv_sg8_split(
+    const device uint32_t* w [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    const device float16_t* biases [[buffer(2)]],
+    const device uint4* bt [[buffer(3)]],
+    const device float* sums [[buffer(4)]],
+    device T* y [[buffer(5)]],
+    const constant int& in_vec_size [[buffer(6)]],
+    const constant int& out_vec_size [[buffer(7)]],
+    device coherent(device) float* partials [[buffer(8)]],
+    device atomic_uint* counters [[buffer(9)]],
+    const constant int& num_splits [[buffer(10)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tid [[thread_index_in_threadgroup]]) {
+#pragma clang fp reassociate(off)
+  using namespace kq_sg8;
+  constexpr Format F = format<group_size, bits, super_ratio, has_min, kind>();
+  static_assert(F != Unsupported, "no simdgroup-matrix decode for this mode");
+  static_assert(is_same_v<T, bfloat>, "the MMA operands are bfloat16");
+  typedef typename Codes<F>::W W;
+  const uint qid = lane >> 2;
+  const uint fm = (qid & 4u) | ((lane >> 1) & 3u);
+  const uint fn = ((qid & 2u) << 1) | ((lane & 1u) << 1);
+  const uint c = fn >> 1;
+  const uint K = in_vec_size;
+  const uint N = out_vec_size;
+  const uint rw = K * bits / 32;
+  const uint nsb = K / 256;
+  const uint splits = uint(num_splits);
+  const uint split = group.y;
+  const uint first = split * (nsb / splits);
+  const uint end = first + nsb / splits;
+  threadgroup uint arrival;
+
+  threadgroup uint lut2[256];
+  if constexpr (F == IQ4XS) {
+    // lut2[lo | hi << 4] = bf16(v[lo]) | bf16(v[hi]) << 16, both exact.
+    for (uint i = tid; i < 256; i += 128) {
+      const uint lo = as_type<ushort>(bfloat(float(kIQ4[i & 15])));
+      const uint hi = as_type<ushort>(bfloat(float(kIQ4[i >> 4])));
+      lut2[i] = lo | (hi << 16);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  const uint n0 = group.x * 32 + sg * 8 + fm;
+  const device uint32_t* row = tiled
+      ? reinterpret_cast<const device uint32_t*>(kq_tiled_row<bits>(w, n0, K / 32))
+      : w + size_t(n0) * rw;
+  float2 acc = float2(0.0f);
+
+  SB scur = load_sb<F, tiled>(scales, biases, n0, K, first);
+  W wcur[8];
+#pragma unroll
+  for (uint gi = 0; gi < 8; ++gi) {
+    wcur[gi] = Codes<F>::load(row, first * 8 + gi, c, tiled ? 64 : 1);
+  }
+
+  for (uint G = first; G < end; ++G) {
+    const uint Gl = G + 1 < end ? G + 1 : G;
+    const SB snxt = load_sb<F, tiled>(scales, biases, n0, K, Gl);
+    W wnxt[8];
+#pragma unroll
+    for (uint gi = 0; gi < 8; ++gi) {
+      wnxt[gi] = Codes<F>::load(row, Gl * 8 + gi, c, tiled ? 64 : 1);
+    }
+
+#pragma unroll
+    for (uint gi = 0; gi < 8; ++gi) {
+      const uint u = G * 8 + gi;
+      const uint4 t = bt[u * 32 + lane];
+      uint bq[4] = {t.x, t.y, t.z, t.w};
+      if constexpr (F != Q6K) {
+        float sa = 0.0f;
+        float sb = 0.0f;
+        if constexpr (F != IQ4XS) {
+          const float2 s2 =
+              *reinterpret_cast<const device float2*>(sums + u * 8 + fn);
+          sa = s2.x;
+          sb = s2.y;
+        }
+        uint pq[4];
+        if constexpr (F == Q4K || F == A4G64) {
+          const uint wd = wcur[gi];
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            pq[j] = ((wd >> (4 * j)) & 0x000F000Fu) | 0x43004300u;
+          }
+        } else if constexpr (F == Q5K) {
+          const uint2 wv = wcur[gi];
+          const ulong v = ((ulong(wv.y) << 32) | ulong(wv.x)) >> (8 * c);
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            const uint t5 = uint(v >> (5 * j));
+            pq[j] = (t5 & 0x1Fu) | ((t5 >> 4) & 0x001F0000u) | 0x43004300u;
+          }
+        } else {
+          const uint wd = wcur[gi];
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            const uint t4 = wd >> (4 * j);
+            pq[j] = lut2[(t4 & 0xFu) | ((t4 >> 12) & 0xF0u)];
+          }
+        }
+        float2 c0 =
+            F == IQ4XS ? float2(0.0f) : float2(-128.0f * sa, -128.0f * sb);
+        float2 c1 = float2(0.0f);
+        mma(c0, pq[0], bq[0]);
+        mma(c1, pq[1], bq[1]);
+        mma(c0, pq[2], bq[2]);
+        mma(c1, pq[3], bq[3]);
+        const float2 d = c0 + c1;
+        if constexpr (F == A4G64) {
+          // Affine group64 shares one BF16 coefficient pair across two
+          // 32-value register tiles; codes and input sums stay exact.
+          const uint group = gi / 2;
+          const uint shift = 16 * (group & 1);
+          const float scale = kq_bf16_to_float(ushort(scur.a[group / 2] >> shift));
+          const float bias = kq_bf16_to_float(ushort(scur.a[2 + group / 2] >> shift));
+          acc = fma(d, float2(scale), acc);
+          acc = fma(float2(sa, sb), float2(bias), acc);
+        } else if constexpr (F == IQ4XS) {
+          const uint byte = (gi < 4 ? scur.a.x : scur.a.y) >> (8 * (gi & 3));
+          const float scale =
+              float(scur.h.x) * float(as_type<char>(uchar(byte & 0xFFu)));
+          acc = fma(d, float2(scale), acc);
+        } else {
+          const uint uu = scur.a[gi >> 1] >> (16 * (gi & 1));
+          const float scale = float(scur.h.x) * float(uu & 0xFFu);
+          const float bias = -(float(scur.h.y) * float((uu >> 8) & 0xFFu));
+          acc = fma(d, float2(scale), acc);
+          acc = fma(float2(sa, sb), float2(bias), acc);
+        }
+      } else {
+        const float2 sA =
+            *reinterpret_cast<const device float2*>(sums + (2 * u) * 8 + fn);
+        const float2 sB = *reinterpret_cast<const device float2*>(
+            sums + (2 * u + 1) * 8 + fn);
+        const uint sha = (24 * c) & 31u;
+        const uint shb = (96 + 24 * c) & 31u;
+        const uint4 wv = wcur[gi];
+        const ulong va = ((ulong(wv.y) << 32) | ulong(wv.x)) >> sha;
+        const ulong vb = ((ulong(wv.w) << 32) | ulong(wv.z)) >> shb;
+        uint pq[4];
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+          const uint ta = uint(va >> (6 * j));
+          const uint tb = uint(vb >> (6 * j));
+          pq[j] = (ta & 0x3Fu) | ((ta << 4) & 0x003F0000u) | 0x43004300u;
+          pq[2 + j] = (tb & 0x3Fu) | ((tb << 4) & 0x003F0000u) | 0x43004300u;
+        }
+        // (q - 32) x = (128 + q) x - 160 x
+        float2 cA = float2(-160.0f * sA.x, -160.0f * sA.y);
+        float2 cB = float2(-160.0f * sB.x, -160.0f * sB.y);
+        mma(cA, pq[0], bq[0]);
+        mma(cB, pq[2], bq[2]);
+        mma(cA, pq[1], bq[1]);
+        mma(cB, pq[3], bq[3]);
+        const uint gA = 2 * gi;
+        const uint word = scur.a[gA >> 2];
+        const float dS = float(scur.h.x);
+        const float scA =
+            dS * float(as_type<char>(uchar((word >> (8 * (gA & 3))) & 0xFFu)));
+        const float scB = dS *
+            float(as_type<char>(uchar((word >> (8 * ((gA + 1) & 3))) & 0xFFu)));
+        acc = fma(cA, float2(scA), acc);
+        acc = fma(cB, float2(scB), acc);
+      }
+    }
+
+    scur = snxt;
+#pragma unroll
+    for (uint gi = 0; gi < 8; ++gi) {
+      wcur[gi] = wnxt[gi];
+    }
+  }
+
+  const auto at = [&](uint s, uint row) { return (size_t(s) * 8 + row) * N + n0; };
+  partials[at(split, fn)] = acc.x;
+  partials[at(split, fn + 1)] = acc.y;
+  if (!kq_split::split_arrive_last(counters + group.x, splits, tid, &arrival)) return;
+  float2 total(0.0f);
+  for (uint s = 0; s < splits; ++s) {
+    total.x += s == split ? acc.x : partials[at(s, fn)];
+    total.y += s == split ? acc.y : partials[at(s, fn + 1)];
+  }
+  y[fn * N + n0] = static_cast<T>(total.x);
+  y[(fn + 1) * N + n0] = static_cast<T>(total.y);
+  kq_split::split_release(counters + group.x, tid);
 }

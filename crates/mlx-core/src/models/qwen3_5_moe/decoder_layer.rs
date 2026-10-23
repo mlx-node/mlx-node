@@ -13,7 +13,9 @@ use super::sparse_moe::SparseMoeBlock;
 use crate::models::quantized_linear::{MLPVariant, QuantizedLinear};
 // Reuse the dense layer-kind enum for MoE; the routing semantics
 // (Linear vs FullAttentionPaged) are identical between dense and MoE.
-pub(crate) use crate::models::qwen3_5::decoder_layer::Qwen3_5LayerKind;
+pub(crate) use crate::models::qwen3_5::decoder_layer::{
+    LayerVerifyIo, Qwen3_5LayerKind, VerifyResidual,
+};
 
 /// Attention type for a decoder layer.
 ///
@@ -52,15 +54,131 @@ impl MLPType {
     }
 }
 
+/// Owned counterpart of VerifyResidual; meaning is fixed by the graph output.
+/// Source combine returns Hidden, while ordinary FFN stays Pending.
+pub(crate) enum VerifyLayerOutput {
+    Hidden(MxArray),
+    Pending { h: MxArray, delta: MxArray },
+}
+impl VerifyLayerOutput {
+    pub(crate) fn as_input(&self) -> VerifyResidual<'_> {
+        match self {
+            Self::Hidden(h) => VerifyResidual::Hidden(h),
+            Self::Pending { h, delta } => VerifyResidual::Pending { h, delta },
+        }
+    }
+    pub(crate) fn normalize(&self, norm: &RMSNorm) -> Result<(MxArray, MxArray)> {
+        match self {
+            Self::Hidden(h) => Ok((h.clone(), norm.forward(h)?)),
+            Self::Pending { h, delta } => DecoderLayer::add_residual_norm(norm, h, delta),
+        }
+    }
+}
+
 /// A single decoder layer in the Qwen3.5 MoE model.
 pub struct DecoderLayer {
     pub attn: AttentionType,
     pub mlp: MLPType,
     input_layernorm: RMSNorm,
     post_attention_layernorm: RMSNorm,
+    source_mixer: bool,
 }
 
 impl DecoderLayer {
+    pub(crate) fn configure_source_mixer(&mut self, enabled: bool) {
+        self.source_mixer = enabled;
+    }
+
+    fn source_mixer_rows(&self, x: &MxArray) -> Result<bool> {
+        Ok(self.source_mixer
+            && x.shape()?.as_ref() == [1, 8, 2048]
+            && x.dtype()? == crate::array::DType::BFloat16)
+    }
+
+    fn finish_mixer(
+        norm: &RMSNorm,
+        x: &MxArray,
+        output: MxArray,
+        includes_residual: bool,
+    ) -> Result<(MxArray, MxArray)> {
+        if includes_residual {
+            let normalized = norm.forward(&output)?;
+            Ok((output, normalized))
+        } else {
+            Self::add_residual_norm(norm, x, &output)
+        }
+    }
+
+    pub(crate) fn add_residual_norm(
+        norm: &RMSNorm,
+        x: &MxArray,
+        residual: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
+        crate::models::qwen3_5::decoder_layer::DecoderLayer::add_residual_norm(norm, x, residual)
+    }
+
+    pub(crate) fn forward_verify(
+        &mut self,
+        input: VerifyResidual<'_>,
+        io: &mut LayerVerifyIo<'_>,
+        use_kernel: bool,
+        tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
+        row_budget: Option<&MxArray>,
+    ) -> Result<(MxArray, VerifyLayerOutput)> {
+        let (x, normed) = match input {
+            VerifyResidual::Hidden(x) => (x.clone(), self.input_layernorm.forward(x)?),
+            VerifyResidual::Pending { h, delta } => {
+                Self::add_residual_norm(&self.input_layernorm, h, delta)?
+            }
+        };
+        let includes_residual = self.source_mixer_rows(&x)?;
+        let attn_out = match (&mut self.attn, io) {
+            (AttentionType::Linear(gdn), LayerVerifyIo::Linear(ac)) => {
+                if includes_residual {
+                    gdn.forward_source_residual_with_tape(
+                        &normed,
+                        None,
+                        Some(&mut **ac),
+                        use_kernel,
+                        tape_sink,
+                        &x,
+                    )?
+                } else {
+                    gdn.forward_with_tape(&normed, None, Some(&mut **ac), use_kernel, tape_sink)?
+                }
+            }
+            (AttentionType::Full(attn), LayerVerifyIo::FullAttention(aio)) => {
+                if includes_residual {
+                    attn.forward_verify_source_residual(&normed, aio, &x)?
+                } else {
+                    attn.forward_verify(&normed, aio)?
+                }
+            }
+            (AttentionType::Linear(_), _) | (AttentionType::Full(_), _) => {
+                return Err(Error::from_reason(
+                    "Qwen3.5 MoE compiled verify: layer/cache io kind mismatch",
+                ));
+            }
+        };
+
+        let (h, normed) = Self::finish_mixer(
+            &self.post_attention_layernorm,
+            &x,
+            attn_out,
+            includes_residual,
+        )?;
+        if let MLPType::MoE(moe) = &self.mlp {
+            if let Some(hidden) = moe.forward_source_residual(&normed, &h, row_budget)? {
+                return Ok((x, VerifyLayerOutput::Hidden(hidden)));
+            }
+        }
+        let mlp_out = match &self.mlp {
+            MLPType::Dense(mlp) => mlp.forward(&normed)?,
+            MLPType::MoE(moe) => moe.forward_with_budget(&normed, row_budget)?,
+        };
+        Ok((x, VerifyLayerOutput::Pending { h, delta: mlp_out }))
+    }
+
     fn forward_mlp_decode_rows(&self, x: &MxArray) -> Result<MxArray> {
         let batch = usize::try_from(x.shape_at(0)?)
             .map_err(|_| Error::from_reason("Qwen3.5 MoE decode MLP received a negative batch"))?;
@@ -117,6 +235,7 @@ impl DecoderLayer {
             mlp,
             input_layernorm,
             post_attention_layernorm,
+            source_mixer: false,
         })
     }
 
@@ -129,20 +248,37 @@ impl DecoderLayer {
         use_kernel: bool,
     ) -> Result<MxArray> {
         let normed = self.input_layernorm.forward(x)?;
+        let includes_residual = self.source_mixer_rows(x)?;
         let attn_out = match &mut self.attn {
             AttentionType::Linear(gdn) => {
                 let ac = cache.and_then(|c| c.as_arrays_cache_mut());
-                gdn.forward(&normed, mask, ac, use_kernel)?
+                if includes_residual {
+                    gdn.forward_source_residual_with_tape(&normed, mask, ac, use_kernel, None, x)?
+                } else {
+                    gdn.forward(&normed, mask, ac, use_kernel)?
+                }
             }
             AttentionType::Full(attn) => {
                 let kvc = cache.and_then(|c| c.as_kv_cache_mut());
-                attn.forward(&normed, mask, kvc, position_ids)?
+                if includes_residual {
+                    attn.forward_source_residual(&normed, mask, kvc, position_ids, x)?
+                } else {
+                    attn.forward(&normed, mask, kvc, position_ids)?
+                }
             }
         };
 
-        let h = x.add(&attn_out)?;
-
-        let normed = self.post_attention_layernorm.forward(&h)?;
+        let (h, normed) = Self::finish_mixer(
+            &self.post_attention_layernorm,
+            x,
+            attn_out,
+            includes_residual,
+        )?;
+        if let MLPType::MoE(moe) = &self.mlp {
+            if let Some(hidden) = moe.forward_source_residual(&normed, &h, None)? {
+                return Ok(hidden);
+            }
+        }
         let mlp_out = match &self.mlp {
             MLPType::Dense(mlp) => mlp.forward(&normed)?,
             MLPType::MoE(moe) => moe.forward(&normed)?,
@@ -166,21 +302,40 @@ impl DecoderLayer {
         tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
     ) -> Result<MxArray> {
         let normed = self.input_layernorm.forward(x)?;
+        let includes_residual = self.source_mixer_rows(x)?;
         let attn_out = match &mut self.attn {
             AttentionType::Linear(gdn) => {
                 let ac = cache.and_then(|c| c.as_arrays_cache_mut());
-                gdn.forward_with_tape(&normed, mask, ac, use_kernel, tape_sink)?
+                if includes_residual {
+                    gdn.forward_source_residual_with_tape(
+                        &normed, mask, ac, use_kernel, tape_sink, x,
+                    )?
+                } else {
+                    gdn.forward_with_tape(&normed, mask, ac, use_kernel, tape_sink)?
+                }
             }
             AttentionType::Full(attn) => {
                 let _ = tape_sink;
                 let kvc = cache.and_then(|c| c.as_kv_cache_mut());
-                attn.forward(&normed, mask, kvc, position_ids)?
+                if includes_residual {
+                    attn.forward_source_residual(&normed, mask, kvc, position_ids, x)?
+                } else {
+                    attn.forward(&normed, mask, kvc, position_ids)?
+                }
             }
         };
 
-        let h = x.add(&attn_out)?;
-
-        let normed = self.post_attention_layernorm.forward(&h)?;
+        let (h, normed) = Self::finish_mixer(
+            &self.post_attention_layernorm,
+            x,
+            attn_out,
+            includes_residual,
+        )?;
+        if let MLPType::MoE(moe) = &self.mlp {
+            if let Some(hidden) = moe.forward_source_residual(&normed, &h, None)? {
+                return Ok(hidden);
+            }
+        }
         let mlp_out = match &self.mlp {
             MLPType::Dense(mlp) => mlp.forward(&normed)?,
             MLPType::MoE(moe) => moe.forward(&normed)?,
@@ -254,8 +409,8 @@ impl DecoderLayer {
                     rope_position_offset,
                     mrope_cache,
                 )?;
-                let h = x.add(&attn_out)?;
-                let normed = self.post_attention_layernorm.forward(&h)?;
+                let (h, normed) =
+                    Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
                 let mlp_out = match &self.mlp {
                     MLPType::Dense(mlp) => mlp.forward(&normed)?,
                     MLPType::MoE(moe) => moe.forward(&normed)?,
@@ -335,8 +490,8 @@ impl DecoderLayer {
                     rope_position_offset,
                     &mut None,
                 )?;
-                let h = x.add(&attn_out)?;
-                let normed = self.post_attention_layernorm.forward(&h)?;
+                let (h, normed) =
+                    Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
                 let mlp_out = match &self.mlp {
                     MLPType::Dense(mlp) => mlp.forward(&normed)?,
                     MLPType::MoE(moe) => moe.forward(&normed)?,
@@ -438,8 +593,8 @@ impl DecoderLayer {
                         ));
                     }
                 };
-                let h = x.add(&attn_out)?;
-                let normed = self.post_attention_layernorm.forward(&h)?;
+                let (h, normed) =
+                    Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
                 let mlp_out = if preserve_singleton_projection_graphs {
                     self.forward_mlp_decode_rows(&normed)?
                 } else {
@@ -470,8 +625,8 @@ impl DecoderLayer {
                     rows,
                     preserve_singleton_projection_graphs,
                 )?;
-                let h = x.add(&attn_out)?;
-                let normed = self.post_attention_layernorm.forward(&h)?;
+                let (h, normed) =
+                    Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
                 let mlp_out = if preserve_singleton_projection_graphs {
                     self.forward_mlp_decode_rows(&normed)?
                 } else {
@@ -482,6 +637,16 @@ impl DecoderLayer {
                 };
                 h.add(&mlp_out)
             }
+        }
+    }
+
+    pub(crate) fn enable_source_residual_norms(&mut self, source_reduction: bool) -> Result<()> {
+        if source_reduction {
+            self.input_layernorm.enable_source_f32_splash()?;
+            self.post_attention_layernorm.enable_source_f32_splash()
+        } else {
+            self.input_layernorm.enable_source_f32_reference()?;
+            self.post_attention_layernorm.enable_source_f32_reference()
         }
     }
 
@@ -532,3 +697,11 @@ impl DecoderLayer {
         attention || mlp
     }
 }
+
+#[cfg(test)]
+#[path = "source_residual_tests.rs"]
+mod source_residual_tests;
+
+#[cfg(test)]
+#[path = "source_mixer_tests.rs"]
+mod source_mixer_tests;

@@ -177,7 +177,7 @@ async fn moe_session_path_keeps_ttft_flat_across_turns() {
         model_path
     );
 
-    let model = Qwen3_5MoeModel::load(model_path.clone())
+    let model = Qwen3_5MoeModel::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 MoE model");
 
@@ -352,7 +352,7 @@ async fn moe_stream_session_path_keeps_ttft_flat_across_turns() {
         model_path
     );
 
-    let model = Qwen3_5MoeModel::load(model_path.clone())
+    let model = Qwen3_5MoeModel::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 MoE model");
 
@@ -486,7 +486,7 @@ async fn moe_stream_session_cancellation_preserves_cache_for_next_turn() {
         model_path
     );
 
-    let model = Qwen3_5MoeModel::load(model_path.clone())
+    let model = Qwen3_5MoeModel::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 MoE model");
 
@@ -588,7 +588,7 @@ async fn moe_session_continue_rejects_images_with_restart_prefix() {
         model_path
     );
 
-    let model = Qwen3_5MoeModel::load(model_path.clone())
+    let model = Qwen3_5MoeModel::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 MoE model");
 
@@ -634,7 +634,7 @@ async fn moe_session_continue_tool_round_trips() {
         model_path
     );
 
-    let model = Qwen3_5MoeModel::load(model_path.clone())
+    let model = Qwen3_5MoeModel::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 MoE model");
 
@@ -690,7 +690,7 @@ async fn moe_session_continue_errors_before_start() {
         model_path
     );
 
-    let model = Qwen3_5MoeModel::load(model_path.clone())
+    let model = Qwen3_5MoeModel::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 MoE model");
 
@@ -721,7 +721,7 @@ async fn moe_session_start_rejects_reuse_cache_false() {
         model_path
     );
 
-    let model = Qwen3_5MoeModel::load(model_path.clone())
+    let model = Qwen3_5MoeModel::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 MoE model");
 
@@ -762,7 +762,7 @@ async fn moe_session_reset_reproduces_turn_output_deterministically() {
         model_path
     );
 
-    let model = Qwen3_5MoeModel::load(model_path.clone())
+    let model = Qwen3_5MoeModel::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 MoE model");
 
@@ -822,7 +822,7 @@ async fn moe_session_stream_matches_non_stream_byte_for_byte() {
         model_path
     );
 
-    let model = Qwen3_5MoeModel::load(model_path.clone())
+    let model = Qwen3_5MoeModel::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 MoE model");
 
@@ -917,7 +917,7 @@ async fn moe_stream_session_continue_rejects_images_with_restart_prefix() {
         model_path
     );
 
-    let model = Qwen3_5MoeModel::load(model_path.clone())
+    let model = Qwen3_5MoeModel::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 MoE model");
 

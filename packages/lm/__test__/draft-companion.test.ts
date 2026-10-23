@@ -19,9 +19,9 @@ describe('DFlash2 companion discovery', () => {
   });
   afterEach(() => rmSync(root, { recursive: true, force: true }));
 
-  function writeDraft(path = draft): void {
+  function writeDraft(path = draft, config: Record<string, unknown> = {}): void {
     mkdirSync(path, { recursive: true });
-    writeFileSync(join(path, 'config.json'), JSON.stringify({ architectures: ['DFlash2DraftModel'] }));
+    writeFileSync(join(path, 'config.json'), JSON.stringify({ architectures: ['DFlash2DraftModel'], ...config }));
     writeFileSync(join(path, 'model.safetensors'), 'weights');
   }
 
@@ -63,6 +63,49 @@ describe('DFlash2 companion discovery', () => {
       expect(findDFlash2Draft(join(root, name), 'qwen3_5')).toBeUndefined();
     }
     expect(findDFlash2Draft(target, 'qwen3_5_moe')).toBeUndefined();
+  });
+
+  it('pairs the 35B MoE companion without borrowing the dense companion', () => {
+    writeDraft();
+    const moe = join(root, 'Qwen3.6-35B-A3B-Q4_K_M.gguf');
+    expect(findDFlash2Draft(moe, 'qwen3_5_moe')).toBeUndefined();
+    const moeDraft = join(root, 'Qwen3.6-35B-A3B-DFlash2');
+    writeDraft(moeDraft);
+    expect(findDFlash2Draft(moe, 'qwen3_5_moe')).toBe(moeDraft);
+    expect(findDFlash2Draft(moe, 'qwen3_5')).toBeUndefined();
+    expect(findDFlash2Draft(join(root, 'Ornith-1.5-35B-Q4_K_M.gguf'), 'qwen3_5_moe')).toBeUndefined();
+  });
+
+  it('does not borrow an embedded dense draft in a mixed standalone GGUF store', () => {
+    const store = join(root, 'models');
+    mkdirSync(store);
+    const dense = join(store, 'Qwen3.8-27B-UD-Q4_K_XL.gguf');
+    const moe = join(store, 'Qwen3.6-35B-A3B-Q4_K_M.gguf');
+    writeFileSync(dense, 'dense');
+    writeFileSync(moe, 'moe');
+    const embedded = join(store, 'draft');
+    writeDraft(embedded, { model_type: 'qwen3', hidden_size: 5120, num_target_layers: 64 });
+    const moeDraft = join(store, 'Qwen3.6-35B-A3B-DFlash2');
+    writeDraft(moeDraft, { model_type: 'qwen3', hidden_size: 2048, num_target_layers: 40 });
+
+    expect(findDFlash2Draft(dense, 'qwen3_5')).toBe(embedded);
+    expect(findDFlash2Draft(moe, 'qwen3_5_moe')).toBe(moeDraft);
+    rmSync(moeDraft, { recursive: true });
+    expect(findDFlash2Draft(moe, 'qwen3_5_moe')).toBeUndefined();
+    writeDraft(embedded);
+    expect(findDFlash2Draft(moe, 'qwen3_5_moe')).toBeUndefined();
+
+    writeDraft(embedded, { model_type: 'qwen3', hidden_size: 2048, num_target_layers: 40 });
+    expect(findDFlash2Draft(moe, 'qwen3_5_moe')).toBe(embedded);
+  });
+
+  it('allows a renamed MoE target to opt in with an embedded draft', () => {
+    const renamed = join(root, 'ornith');
+    mkdirSync(renamed);
+    const embedded = join(renamed, 'draft');
+    writeDraft(embedded);
+    expect(findDFlash2Draft(renamed, 'qwen3_5_moe')).toBe(embedded);
+    expect(findDFlash2Draft(renamed, 'qwen4_exp')).toBeUndefined();
   });
 
   it('pairs a companion living behind a directory symlink', () => {

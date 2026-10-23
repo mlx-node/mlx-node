@@ -545,6 +545,37 @@ unsafe extern "C-unwind" {
         offset: *mut mlx_array,
         freqs: *mut mlx_array,
     ) -> *mut mlx_array;
+    /// Fused BF16 attention gate and SG8 packing. 1 = built, 0 = unsupported,
+    /// -1 = construction error; all outputs are null on 0/-1.
+    pub fn mlx_attention_sg8_prepare(
+        gate: *mut mlx_array,
+        attention: *mut mlx_array,
+        values: *mut *mut mlx_array,
+        packed: *mut *mut mlx_array,
+        sums: *mut *mut mlx_array,
+    ) -> i32;
+
+    /// Source-style D128/M8 draft attention. 1 = built, 0 = unsupported,
+    /// -1 = invalid argument/construction error; output is null on 0/-1.
+    pub fn mlx_dflash2_attention(
+        queries: *mut mlx_array,
+        keys: *mut mlx_array,
+        values: *mut mlx_array,
+        mask: *mut mlx_array,
+        scale: f32,
+        output: *mut *mut mlx_array,
+    ) -> i32;
+    /// Per-loaded-model policy variant; hardware/shape/dtype guards match
+    /// mlx_dflash2_attention, and disabled returns 0 with a null output.
+    pub fn mlx_dflash2_attention_with_policy(
+        queries: *mut mlx_array,
+        keys: *mut mlx_array,
+        values: *mut mlx_array,
+        mask: *mut mlx_array,
+        scale: f32,
+        enabled: bool,
+        output: *mut *mut mlx_array,
+    ) -> i32;
     pub fn mlx_fast_scaled_dot_product_attention(
         queries: *mut mlx_array,
         keys: *mut mlx_array,
@@ -848,6 +879,25 @@ unsafe extern "C-unwind" {
         rows: i32,
         total_length: i32,
         out: *mut u32,
+    ) -> i32;
+
+    /// TEST-ONLY, platform independent: the NAX partition policy with an
+    /// explicit experiment toggle and the usual MLX_SDPA_BLOCKS override.
+    pub fn mlx_segmented_sdpa_test_nax_partition_count(
+        total_length: i32,
+        tile_n: i32,
+        blocks_override: i32,
+        keys512: bool,
+    ) -> i32;
+
+    /// TEST-ONLY: arbitrary split counts require512-key policy and a bounded reducer.
+    pub fn mlx_segmented_sdpa_test_nax_exact_partition_count(
+        total_length: i32,
+        tile_n: i32,
+        blocks_override: i32,
+        keys512: bool,
+        exact_splits: bool,
+        bounded_reducer: bool,
     ) -> i32;
 
     /// TEST-ONLY, platform independent: the tensor-op planner over
@@ -1924,6 +1974,18 @@ unsafe extern "C-unwind" {
     // ============================================
     // Gather QMM (for QuantizedSwitchLinear / MoE)
     // ============================================
+    /// Exact baseline M1 gather arithmetic on a T64 expert stack.
+    /// 1 = built, 0 = unsupported, -1 = construction error; null output on 0/-1.
+    pub fn mlx_tiled_gather_qmv_m1(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        indices: *mut mlx_array,
+        bits: i32,
+        output: *mut *mut mlx_array,
+    ) -> i32;
+
     pub fn mlx_gather_qmm(
         x: *mut mlx_array,
         w: *mut mlx_array,
@@ -1970,6 +2032,10 @@ unsafe extern "C-unwind" {
         report: *mut std::ffi::c_char,
         len: usize,
     ) -> bool;
+    /// TEST-ONLY: compiles the generated K-quant JIT preamble with a concrete
+    /// SG8 kernel, including its local SG8 and split helpers. False without
+    /// Metal or on a compiler error.
+    pub fn mlx_test_kquant_jit_preamble_check() -> bool;
     /// TEST-ONLY: checks `paged_attn.metallib` against the kernels the
     /// segmented SDPA (`family` "segmented_sdpa") or mixed-affine
     /// ("affine_mixed") dispatcher can request. `counts` (3 slots) receives
@@ -2174,6 +2240,45 @@ unsafe extern "C-unwind" {
         outputs: *mut *mut mlx_array,
     ) -> bool;
 
+    // Ten outputs: the ordinary eight, packed uint32 SG8 operands and F32 sums.
+    /// Pending inputs are k,v,g,beta,qkv plus checked keep scalar [1].
+    /// Outputs retain complete-kernel order, but state/history mean the settled prior prefix.
+    pub fn mlx_gdn_fused_complete_deferred(
+        qkv: *mut mlx_array,
+        a: *mut mlx_array,
+        b: *mut mlx_array,
+        conv: *mut mlx_array,
+        history: *mut mlx_array,
+        scale: *mut mlx_array,
+        dt: *mut mlx_array,
+        state: *mut mlx_array,
+        z: *mut mlx_array,
+        w: *mut mlx_array,
+        eps: f32,
+        state_dst: *mut mlx_array,
+        history_dst: *mut mlx_array,
+        pending: *const *mut mlx_array,
+        prepared: bool,
+        outputs: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_gdn_fused_complete_prepared(
+        qkv: *mut mlx_array,
+        a: *mut mlx_array,
+        b: *mut mlx_array,
+        conv: *mut mlx_array,
+        history: *mut mlx_array,
+        scale: *mut mlx_array,
+        dt: *mut mlx_array,
+        state: *mut mlx_array,
+        z: *mut mlx_array,
+        w: *mut mlx_array,
+        eps: f32,
+        state_dst: *mut mlx_array,
+        history_dst: *mut mlx_array,
+        outputs: *mut *mut mlx_array,
+    ) -> bool;
+
     // Chunked fused GDN prefill for one prompt window, any T (the prompt
     // counterpart of `mlx_gdn_fused_step`): the fused gating + q/k rms_norm
     // + 32-row-chunked recurrence (f32 register state carries) + gated
@@ -2217,6 +2322,14 @@ unsafe extern "C-unwind" {
         out: *mut *mut mlx_array,
     ) -> bool;
 
+    // Draft proposal tail store. Six inputs: full K/V, live+reserved K/V
+    // views, new K/V. Four outputs alias the full buffers and written views.
+    // Physical view offsets and tail lengths are resolved at GPU replay.
+    pub fn mlx_kv_store_window_tail(
+        inputs: *const *mut mlx_array,
+        outputs: *mut *mut mlx_array,
+    ) -> bool;
+
     // Whether `mlx_kv_store_rows` can store several layers in one dispatch
     // (Metal device with residency sets).
     pub fn mlx_kv_store_batched_available() -> bool;
@@ -2231,6 +2344,18 @@ unsafe extern "C-unwind" {
         side: i32,
         out: *mut *mut mlx_array,
     ) -> bool;
+
+    // Original Splash FP32 draft convolution, restricted to the measured
+    // M8/H2048 companion. Side 0 has no residual; side 1 returns complete
+    // hidden state with residual included. Returned handle is caller-owned.
+    pub fn mlx_source_dflash2_conv_available() -> bool;
+    pub fn mlx_source_dflash2_conv(
+        x: *mut mlx_array,
+        dynamic: *mut mlx_array,
+        base: *mut mlx_array,
+        side: i32,
+        residual: *mut mlx_array,
+    ) -> *mut mlx_array;
 
     // GPU architecture generation (M1=13, M2=14, M3=15, M4=16, M5=17)
     pub fn mlx_gpu_architecture_gen() -> i32;
@@ -2579,9 +2704,30 @@ unsafe extern "C" {
         out_ids: *mut *mut mlx_array,
         out_values: *mut *mut mlx_array,
     ) -> i32;
+    /// Optional Splash-style FP32 selector edge scores, K=16 and rank=256.
+    /// All arguments are explicit lazy inputs; returns null off-contract.
+    pub fn mlx_dflash2_selector_edges(
+        candidates: *mut mlx_array,
+        unary: *mut mlx_array,
+        hidden: *mut mlx_array,
+        predecessor: *mut mlx_array,
+        successor: *mut mlx_array,
+        anchor: *mut mlx_array,
+    ) -> *mut mlx_array;
     /// Fused device-resident greedy predecessor walk for DFlash2 selector
     /// candidates `[1,L,K]` i32 and score tables `[L,K,K]` f32. Returns a
     /// lazy `[L]` i32 path, or false when the input contract is not met.
+    pub fn mlx_dflash2_greedy_path_confidence(
+        candidates: *mut mlx_array,
+        scores: *mut mlx_array,
+        out_path: *mut *mut mlx_array,
+        out_confidence: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_dflash2_verify_budget(
+        confidence: *mut mlx_array,
+        parameters: *mut mlx_array,
+    ) -> *mut mlx_array;
+
     pub fn mlx_dflash2_greedy_path(
         candidates: *mut mlx_array,
         scores: *mut mlx_array,
@@ -2590,6 +2736,15 @@ unsafe extern "C" {
     /// Fused residual-add + RMSNorm: writes `h = x + res` and
     /// `normed = rms_norm(h) * w` into the out pointers. Returns false on
     /// contract violation (shape/dtype/contiguity) or kernel build failure.
+    /// H2048, F32 weights/BF16 IO source norm. 1 constructed, 0 fallback, -1 error.
+    pub fn mlx_source_norm_2048(
+        input: *mut mlx_array,
+        weight: *mut mlx_array,
+        residual: *mut mlx_array,
+        staged: bool,
+        out_normalized: *mut *mut mlx_array,
+        out_hidden: *mut *mut mlx_array,
+    ) -> i32;
     pub fn mlx_fused_add_rmsnorm(
         x: *mut mlx_array,
         res: *mut mlx_array,
@@ -2831,6 +2986,121 @@ unsafe extern "C" {
         inputs: *const *mut mlx_array,
         count: usize,
     ) -> *mut mlx_array;
+    pub fn mlx_kquant_sg8_prepared(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        packed: *mut mlx_array,
+        sums: *mut mlx_array,
+        output: *mut *mut mlx_array,
+    ) -> i32;
+    pub fn mlx_kquant_head_f32(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        output: *mut *mut mlx_array,
+    ) -> i32;
+    pub fn mlx_mixed_projection(
+        inputs: *const *mut mlx_array,
+        count: usize,
+        bits: *const u32,
+        segments: u32,
+        outputs: *mut *mut mlx_array,
+    ) -> i32;
+    pub fn mlx_splash_moe_available() -> bool;
+    /// Test-only real Metal encoder scheduling and resource-accounting regression.
+    pub fn mlx_test_sparse_input_budget_encoder() -> bool;
+    /// Real-encoder persistent scratch lifetime, fence and fallback regression.
+    pub fn mlx_test_persistent_workspace_encoder() -> bool;
+    pub fn mlx_test_splash_moe_route_group(
+        logits: *mut mlx_array,
+        shared: *mut mlx_array,
+        top_k: i32,
+        normalize: bool,
+    ) -> *mut mlx_array;
+    pub fn mlx_test_splash_moe_stage(
+        inputs: *const *mut mlx_array,
+        count: usize,
+        formats: *const u32,
+        top_k: i32,
+        normalize: bool,
+        stage: i32,
+    ) -> *mut mlx_array;
+    /// Research-only cumulative dispatch timing; returns one initialized uint32.
+    pub fn mlx_test_splash_moe_profile(
+        inputs: *const *mut mlx_array,
+        count: usize,
+        formats: *const u32,
+        top_k: i32,
+        normalize: bool,
+        stage: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_splash_moe(
+        inputs: *const *mut mlx_array,
+        count: usize,
+        formats: *const u32,
+        top_k: i32,
+        normalize: bool,
+    ) -> *mut mlx_array;
+    pub fn mlx_splash_moe_with_policy(
+        inputs: *const *mut mlx_array,
+        count: usize,
+        formats: *const u32,
+        top_k: i32,
+        normalize: bool,
+        source_math: bool,
+    ) -> *mut mlx_array;
+    /// Slots 1 and 2 carry BF16 router/shared-gate weights instead of logits.
+    /// The source route implies source body arithmetic. Residual is nullable.
+    pub fn mlx_splash_moe_with_router(
+        inputs: *const *mut mlx_array,
+        count: usize,
+        formats: *const u32,
+        top_k: i32,
+        normalize: bool,
+        residual: *mut mlx_array,
+    ) -> *mut mlx_array;
+    /// Packed Uint32 score bits (2048), route IDs (72), coefficient bits (72).
+    pub fn mlx_test_splash_moe_source_routing(
+        input: *mut mlx_array,
+        router: *mut mlx_array,
+        shared: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_splash_moe_source_residual_available() -> bool;
+
+    /// Source Q4 target-output diagnostic. The fixed40-core M5 contract is
+    /// checked before graph construction and again before replay writes.
+    pub fn mlx_source_mixer_q4_available() -> bool;
+    /// Test-only source prep oracle: Table16 BF16 words, F32 sum/seed words,
+    /// then initialized counters, returned as Uint32[19488].
+    pub fn mlx_test_source_mixer_q4_prepare(x: *mut mlx_array) -> *mut mlx_array;
+    /// Owns a new BF16 [8,2048] output handle or returns null on error.
+    /// Inputs: BF16 [8,4096], T64 Q4 [2048,512]/U8[2048,256]/F16[2048,32].
+    /// A nullable BF16 [8,2048] residual is added before the one output cast.
+    pub fn mlx_source_mixer_q4(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        bases: *mut mlx_array,
+        residual: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_test_splash_moe_source_residual_combine(
+        experts: *mut mlx_array,
+        inverse: *mut mlx_array,
+        weights: *mut mlx_array,
+        residual: *mut mlx_array,
+        budget: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_splash_moe_with_residual(
+        inputs: *const *mut mlx_array,
+        count: usize,
+        formats: *const u32,
+        top_k: i32,
+        normalize: bool,
+        residual: *mut mlx_array,
+    ) -> *mut mlx_array;
     pub fn mlx_qwen4_routed_experts(
         x: *mut mlx_array,
         ids: *mut mlx_array,
@@ -2906,4 +3176,28 @@ unsafe extern "C" {
     // Null unless the array is available (a mapped array, or an evaluated
     // array that was already waited on); never waits and never throws.
     pub fn mlx_array_data_ptr(handle: *mut mlx_array) -> *const std::ffi::c_void;
+}
+
+unsafe extern "C" {
+    pub fn mlx_source_qk_norm_rope_available() -> bool;
+    pub fn mlx_source_qk_norm_rope(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        wq: *mut mlx_array,
+        wk: *mut mlx_array,
+        inverse_frequencies: *mut mlx_array,
+        offsets: *mut mlx_array,
+        out_q: *mut *mut mlx_array,
+        out_k: *mut *mut mlx_array,
+    ) -> bool;
+}
+
+unsafe extern "C" {
+    pub fn mlx_source_head_q6_available() -> bool;
+    pub fn mlx_source_head_q6(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        bases: *mut mlx_array,
+    ) -> *mut mlx_array;
 }

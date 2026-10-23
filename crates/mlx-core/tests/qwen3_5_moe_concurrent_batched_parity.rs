@@ -79,7 +79,7 @@ async fn asymmetric_finish_and_cross_owner_warm_wave_match_serial() {
     // process-local controls before model-thread creation is deterministic.
     unsafe { std::env::set_var("MLX_CONTINUOUS_BATCHING", "1") };
     unsafe { std::env::set_var("MLX_SERVE_FORCE_SERIAL", "1") };
-    let model = load_with_thread(&path.to_string_lossy())
+    let model = load_with_thread(&path.to_string_lossy(), None, None)
         .await
         .expect("load Qwen3.5 MoE");
     assert!(

@@ -139,11 +139,20 @@ impl ScheduledMtpTarget for Qwen35MoeInner {
 
 #[cfg(test)]
 pub(crate) fn seeded_inner(seed: u64) -> Qwen35MoeInner {
+    seeded_inner_with_config(seed, |_| {})
+}
+
+#[cfg(test)]
+pub(crate) fn seeded_inner_with_config(
+    seed: u64,
+    adjust: impl FnOnce(&mut Qwen3_5MoeConfig),
+) -> Qwen35MoeInner {
     // Tests run serially because MLX owns one shared device and PRNG.
     unsafe { mlx_sys::mlx_seed(seed) };
     let mut config = super::paged_construction_tests::tiny_paged_forward_moe_cfg();
     config.n_mtp_layers = 1;
     config.vocab_size = 16;
+    adjust(&mut config);
     let mut inner = Qwen35MoeInner::new(config).unwrap();
     super::paged_construction_tests::cast_moe_inner_weights_bf16(&mut inner);
     // Numerical parity is checked separately against the original verifier.

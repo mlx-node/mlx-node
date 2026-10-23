@@ -318,7 +318,9 @@ segmented_kernel(metal::Device &device,
 }
 
 std::vector<std::string> metal_kernel_names() {
-  std::vector<std::string> names;
+  std::vector<std::string> names{
+      "mlx_node_sdpa_segmented_reduce_256_bf16_256",
+      "mlx_node_sdpa_segmented_reduce_256_fp32_256"};
   for (auto kernel :
        {SegmentedKernel::one_pass, SegmentedKernel::two_pass_1,
         SegmentedKernel::verify_two_pass_1,
@@ -330,7 +332,9 @@ std::vector<std::string> metal_kernel_names() {
   for (bool quantized : {false, true}) {
     for (int m : kNaxMs) {
       for (int tile_n : kNaxTileSizes) {
-        names.push_back(kernel_name(nax_kernel(quantized), m, tile_n));
+        const auto name = kernel_name(nax_kernel(quantized), m, tile_n);
+        names.push_back(name);
+        names.push_back(name + "_fp32");
       }
     }
   }
@@ -505,6 +509,7 @@ TileVerifyLaunch tile_verify_launch(metal::Device &device, int rows, int gqa,
 }
 
 struct NaxVerifyLaunch {
+  bool fp32_reduction = false;
   MTL::ComputePipelineState *stage1;
   MTL::ComputePipelineState *stage2;
   SegmentedSdpaNaxPlan plan;
@@ -535,7 +540,7 @@ NaxVerifyLaunch nax_verify_launch(metal::Device &device, int rows, int gqa,
   auto *mtl = device.mtl_device();
   auto *stage2 = reduction_kernel(device);
   const auto c2 = capabilities(stage2, mtl);
-  NaxVerifyLaunch launch{nullptr, stage2, {false, 0, 0, 0, 0, 0}, 0};
+  NaxVerifyLaunch launch{false, nullptr, stage2, {false, 0, 0, 0, 0, 0}, 0};
   const int64_t m = int64_t{rows} * gqa;
   if (rows < 1 || gqa < 1 || !segmented_nax_m_supported(int(m)) ||
       !metal::is_nax_available()) {
@@ -546,15 +551,41 @@ NaxVerifyLaunch nax_verify_launch(metal::Device &device, int rows, int gqa,
   if (tile_n == 0) {
     return launch;
   }
-  launch.stage1 = segmented_kernel(
-      device, {nax_kernel(quantized), true, 0, 0, 0, tile_n, int(m)});
+  launch.fp32_reduction =
+      env::get_var("MLX_SEGMENTED_NAX_FP32_REDUCTION", 0) == 1;
+  launch.stage1 = launch.fp32_reduction
+      ? fast::paged::get_prebuilt_kernel(
+          device, "segmented_sdpa", "NAX FP32 reduction precision",
+          kernel_name(nax_kernel(quantized), int(m), tile_n) + "_fp32")
+      : segmented_kernel(
+          device, {nax_kernel(quantized), true, 0, 0, 0, tile_n, int(m)});
   launch.plan = plan_segmented_verify_nax_launch(
       rows, gqa, capabilities(launch.stage1, mtl), c2);
   if (launch.plan.supported && int(launch.plan.tile_n) != tile_n) {
     launch.plan.supported = false;
   }
-  launch.partitions = segmented_verify_tile_partitions(
-      total_length, tile_n, env::get_var("MLX_SDPA_BLOCKS", 0));
+  if (launch.plan.supported &&
+      (launch.fp32_reduction ||
+       env::get_var("MLX_SEGMENTED_SDPA_REDUCE_256", 0) == 1)) {
+    auto* reduced = fast::paged::get_prebuilt_kernel(
+        device, "segmented_sdpa", "NAX split reduction",
+        launch.fp32_reduction
+            ? "mlx_node_sdpa_segmented_reduce_256_fp32_256"
+            : "mlx_node_sdpa_segmented_reduce_256_bf16_256");
+    const auto limits = capabilities(reduced, mtl);
+    if (limits.thread_execution_width != 32 ||
+        limits.max_threads_per_threadgroup < 256 ||
+        limits.static_threadgroup_memory > limits.max_threadgroup_memory) {
+      throw std::runtime_error("NAX 256-thread reduction is unsupported");
+    }
+    launch.stage2 = reduced;
+    launch.plan.stage2_threads = 256;
+  }
+  launch.partitions = segmented_verify_nax_partitions(
+      total_length, tile_n, env::get_var("MLX_SDPA_BLOCKS", 0),
+      env::get_var("MLX_SEGMENTED_NAX_512_KEYS", 0) == 1,
+      env::get_var("MLX_SEGMENTED_NAX_EXACT_SPLITS", 0) == 1,
+      launch.plan.supported && launch.plan.stage2_threads == 256);
   return launch;
 }
 
@@ -641,9 +672,10 @@ void bind_scales(metal::CommandEncoder &encoder, const ScaleOperands &scales,
 
 void add_reduction_temporaries(metal::CommandEncoder &encoder, int batch,
                                int q_heads, int q_rows, int partitions,
-                               array &partials, array &sums, array &maxs) {
+                               array &partials, array &sums, array &maxs,
+                               Dtype partial_dtype = bfloat16) {
   partials = array({batch, q_heads, q_rows, partitions, kHeadDimension},
-                   bfloat16, nullptr, {});
+                   partial_dtype, nullptr, {});
   sums = array({batch, q_heads, q_rows, partitions}, float32, nullptr, {});
   maxs = array({batch, q_heads, q_rows, partitions}, float32, nullptr, {});
   partials.set_data(allocator::malloc(partials.nbytes()));
@@ -768,6 +800,8 @@ void encode_unified_verify(metal::CommandEncoder &encoder,
 // One block-kernel dispatch (simdgroup-matrix tile or tensor-op): the two
 // kernels bind the same buffers and differ in pipeline, threads and scratch.
 struct BlockVerifyDispatch {
+  bool tensor_ops;
+  bool fp32_reduction;
   const char *counter;
   MTL::ComputePipelineState *stage1;
   MTL::ComputePipelineState *stage2;
@@ -778,7 +812,7 @@ struct BlockVerifyDispatch {
 };
 
 BlockVerifyDispatch block_dispatch(const TileVerifyLaunch &launch) {
-  return {"segmented_sdpa_verify_tile_2pass_1",
+  return {false, false, "segmented_sdpa_verify_tile_2pass_1",
           launch.stage1,
           launch.stage2,
           launch.plan.stage1_threads,
@@ -788,7 +822,7 @@ BlockVerifyDispatch block_dispatch(const TileVerifyLaunch &launch) {
 }
 
 BlockVerifyDispatch block_dispatch(const NaxVerifyLaunch &launch) {
-  return {"segmented_sdpa_verify_nax_2pass_1",
+  return {true, launch.fp32_reduction, "segmented_sdpa_verify_nax_2pass_1",
           launch.stage1,
           launch.stage2,
           launch.plan.stage1_threads,
@@ -814,8 +848,15 @@ void encode_block_verify(metal::CommandEncoder &encoder,
   array sums({}, float32, nullptr, {});
   array maxs({}, float32, nullptr, {});
   add_reduction_temporaries(encoder, batch, q_heads, rows, partitions, partials,
-                            sums, maxs);
+                            sums, maxs, launch.fp32_reduction ? float32 : bfloat16);
   bridge_testing::record(launch.counter);
+  if (launch.tensor_ops && launch.stage2_threads == 256 &&
+      env::get_var("MLX_SEGMENTED_NAX_EXACT_SPLITS", 0) == 1 &&
+      env::get_var("MLX_SEGMENTED_NAX_512_KEYS", 0) == 1 &&
+      env::get_var("MLX_SDPA_BLOCKS", 0) <= 0)
+    bridge_testing::record("segmented_sdpa_nax_exact_splits");
+  if (launch.fp32_reduction)
+    bridge_testing::record("segmented_sdpa_nax_fp32_reduction");
   encoder.set_compute_pipeline_state(launch.stage1);
   encoder.set_input_array(q, 0);
   encoder.set_input_array(pk, 1);
@@ -833,10 +874,28 @@ void encode_block_verify(metal::CommandEncoder &encoder,
   encoder.set_bytes(rows, 13);
   encoder.set_bytes(partitions, 14);
   bind_scales(encoder, scales, 15);
+  // Preserve batch on y; pack head (fast axis) and split into x. The kernel
+  // still writes exactly the original [B,Hq,rows,partitions,D] partial slots.
+  const uint64_t flat_width = uint64_t{static_cast<uint32_t>(kv_heads)} *
+                              static_cast<uint32_t>(partitions);
+  const bool flat_grid = launch.tensor_ops &&
+      env::get_var("MLX_SEGMENTED_NAX_FLAT_GRID", 0) == 1 &&
+      flat_width <= std::numeric_limits<uint32_t>::max();
+  if (launch.tensor_ops) {
+    encoder.set_bytes(int(flat_grid), 20);
+    if (flat_grid) bridge_testing::record("segmented_sdpa_nax_flat_grid");
+    const int page_splits = env::get_var("MLX_SEGMENTED_NAX_PAGE_SPLITS", 0) == 1;
+    encoder.set_bytes(page_splits, 21);
+    if (page_splits) bridge_testing::record("segmented_sdpa_nax_page_splits");
+  }
   encoder.set_threadgroup_memory_length(launch.threadgroup_bytes, 0);
-  encoder.dispatch_threadgroups(MTL::Size(kv_heads, batch, partitions),
-                                MTL::Size(launch.stage1_threads, 1, 1));
+  encoder.dispatch_threadgroups(
+      flat_grid ? MTL::Size(flat_width, batch, 1)
+                : MTL::Size(kv_heads, batch, partitions),
+      MTL::Size(launch.stage1_threads, 1, 1));
   bridge_testing::record("segmented_sdpa_2pass_2");
+  if (launch.stage2_threads == 256)
+    bridge_testing::record("segmented_sdpa_reduce_256");
   encoder.set_compute_pipeline_state(launch.stage2);
   encoder.set_input_array(partials, 0);
   encoder.set_input_array(sums, 1);
@@ -1855,6 +1914,23 @@ extern "C" int mlx_segmented_sdpa_test_verify_tile_plan(
         total_length, static_cast<int>(plan.tile_n), blocks_override));
   }
   return plan.supported ? 1 : 0;
+}
+
+// Pure planner probe: available without Metal, so boundary/override coverage
+// does not need a device or pipeline compilation.
+extern "C" int mlx_segmented_sdpa_test_nax_partition_count(
+    int total_length, int tile_n, int blocks_override, bool keys512) {
+  return mlx::core::segmented_sdpa::segmented_verify_nax_partitions(
+      total_length, tile_n, blocks_override, keys512);
+}
+
+// Pure probe for arbitrary split counts; the old reducer/override fallback
+// remains available to CPU regression tests without any Metal pipeline.
+extern "C" int mlx_segmented_sdpa_test_nax_exact_partition_count(
+    int total_length, int tile_n, int blocks_override, bool keys512,
+    bool exact_splits, bool bounded_reducer) {
+  return mlx::core::segmented_sdpa::segmented_verify_nax_partitions(
+      total_length, tile_n, blocks_override, keys512, exact_splits, bounded_reducer);
 }
 
 // Test-only, platform independent: the tensor-op planner over synthetic

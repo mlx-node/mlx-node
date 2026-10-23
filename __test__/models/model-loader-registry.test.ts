@@ -194,7 +194,7 @@ describe('declarative model loader registry', () => {
   it('rejects draftModelPath for families without external draft support', async () => {
     await writeConfig({ model_type: 'qwen3' });
     await expect(loadModel(tempDir, { draftModelPath: '/tmp/draft' })).rejects.toThrow(
-      `draftModelPath (speculative-decoding draft) is only supported by gemma4 and qwen3_5 models; ${tempDir} has model_type "qwen3"`,
+      `draftModelPath (speculative-decoding draft) is only supported by gemma4, qwen3_5 and qwen3_5_moe models; ${tempDir} has model_type "qwen3"`,
     );
   });
 

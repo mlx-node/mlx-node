@@ -47,4 +47,8 @@ instantiate_kquant_m8_nax(iq3s, 32, 3, 8, false, KQ_GRID_IQ3S, 0)
 // stays on MLX's own kernels).
 instantiate_kquant_m8_nax_tiled(a4g64, 64, 4, 4, false, KQ_AFFINE, 0)
 instantiate_kquant_m8_nax_tiled(a8g64, 64, 8, 4, false, KQ_AFFINE, 0)
+// Head-only experiment: identical BF16 input / half weight staging and
+// FP32 accumulation, with the final logits stored without BF16 rounding.
+instantiate_kernel("q6k_head_f32_m8_nax_t64", kquant_qmm_m8_nax,
+    bfloat16_t, 16, 6, 16, false, KQ_LINEAR, 0, true, 8, float)
 // clang-format on

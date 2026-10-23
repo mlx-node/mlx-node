@@ -130,7 +130,7 @@ async fn load_paged_mtp_model_or_skip() -> Option<Qwen3_5MoeModel> {
         Path::new(&model_path).exists(),
         "MLX_TEST_MOE_MTP_MODEL_PATH does not exist: {model_path}"
     );
-    let model = Qwen3_5MoeModel::load(model_path.clone())
+    let model = Qwen3_5MoeModel::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 MoE model");
     if !model.has_mtp_weights() {

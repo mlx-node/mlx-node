@@ -9,6 +9,7 @@ pub use crate::models::qwen3_5::rms_norm_gated;
 // MoE-specific modules
 pub mod config;
 pub mod decoder_layer;
+pub(crate) mod dflash2_decode;
 pub mod model;
 pub mod mtp;
 pub(crate) mod paged_forward;
@@ -20,3 +21,11 @@ pub mod switch_linear;
 
 pub use config::Qwen3_5MoeConfig;
 pub use model::Qwen3_5MoeModel;
+
+pub(crate) mod verify_budget;
+
+pub(crate) mod source_norms;
+
+pub(crate) mod source_math_policy;
+
+pub(crate) mod source_qk;

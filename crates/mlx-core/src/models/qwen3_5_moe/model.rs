@@ -94,11 +94,16 @@ mod vision_turn;
 #[cfg(test)]
 use self::chat_backend::qwen35_moe_speculative_plan;
 pub(crate) use self::commands::{Qwen35MoeCmd, Qwen35MoeFamilyCommand};
-pub(crate) use self::forward::PREFILL_STEP_SIZE;
+pub(crate) use self::forward::{
+    DFlash2LogitsSpan, PREFILL_STEP_SIZE, forward_dflash2_deferred, forward_dflash2_with_budget,
+    forward_dflash2_with_taps,
+};
 use self::forward::{
     chunked_prefill, eager_verify_step, forward_inner, forward_pre_norm_inner,
     project_logits_from_hidden,
 };
+#[cfg(test)]
+pub(crate) use self::forward::{inject_dflash2_store_failure, take_dflash2_compiled_test_counts};
 pub(crate) use self::mtp::Qwen35MoeDecode;
 use self::paged_backend::{Qwen35MoePrefixState, StreamSender};
 pub(crate) use self::state::qwen35_moe_vision_active;
@@ -120,6 +125,9 @@ use crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER;
 /// and training state. Training commands are routed via `TrainingDispatch`.
 pub(crate) struct Qwen35MoeInner {
     pub(crate) config: Qwen3_5MoeConfig,
+    pub(crate) source_moe_policy: super::source_math_policy::SourceMoePolicy,
+    /// Immutable load-only arithmetic override; never shares ordinary SSD state.
+    pub(crate) source_norm_identity: Option<super::source_norms::SourceNormIdentity>,
     /// The in-flight turn's cooperative-cancel flag, installed by the sync and
     /// streaming session wrappers via [`ChatBackend::set_turn_cancel_flag`] and
     /// cleared (`None`) in their turn epilogue on every exit path. A set flag
@@ -139,6 +147,15 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) caches: Option<Vec<Qwen3_5LayerCache>>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     pub(crate) fa_idx: usize,
+    pub(crate) dflash2: Option<crate::models::qwen3_5::dflash2::DFlash2Model>,
+    pub(crate) dflash2_context: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
+    pub(crate) dflash2_turn_state: Option<super::dflash2_decode::DFlash2TurnState>,
+    /// Set only by a tapped flat prefill; every other cache lane invalidates it.
+    pub(crate) dflash2_flat_lane_authoritative: bool,
+    /// Normalized owner/root identity supplied by the most recent turn.
+    dflash2_owner_key: Option<(String, String)>,
+    pub(crate) dflash2_compiled_verify_disabled: bool,
+    pub(crate) dflash2_verify_budget: super::verify_budget::VerifyBudget,
     pub(crate) vision_encoder: Option<Arc<QwenVisionEncoder>>,
     pub(crate) image_processor: Option<Arc<QwenImageProcessor>>,
     pub(crate) spatial_merge_size: Option<i32>,
@@ -371,9 +388,9 @@ impl Qwen3_5MoeModel {
         self.paged_active
     }
 
-    /// Native admission width for plain text autoregressive turns. MTP and
-    /// multimodal turns remain ordered barriers and do not enter the batched
-    /// decode lane.
+    /// Native admission width for plain text autoregressive turns. Native
+    /// MTP, DFlash2 and multimodal turns retain their speculative or exclusive
+    /// admission policy instead of using this plain autoregressive width.
     #[napi]
     pub fn max_concurrent_sequences(&self) -> u32 {
         if self.paged_active
@@ -406,12 +423,10 @@ impl Qwen3_5MoeModel {
         .await
     }
 
-    /// Whether this checkpoint shipped an MTP head (module loaded by
-    /// `persistence::apply_weights_moe_inner`). Snapshotted at load time from
-    /// `Qwen35MoeInner::has_mtp_weights()` so the TS `ChatSession` can
-    /// auto-default `enableMtp = true` for MTP-capable checkpoints without
-    /// dispatching a command into the model thread. Mirrors
-    /// `Qwen3_5Model::has_mtp_weights`.
+    /// Whether this instance has a native MTP head or a loaded DFlash2
+    /// companion. Snapshotted at load time so the TS `ChatSession` can
+    /// auto-default `enableMtp = true` without dispatching a command into the
+    /// model thread. Mirrors `Qwen3_5Model::has_mtp_weights`.
     ///
     /// Note: this only reports weight availability. Whether the
     /// speculative-decode path actually runs on a given call also requires
@@ -461,7 +476,18 @@ impl Qwen3_5MoeModel {
     /// cache (mirroring the dense Qwen3.5 loader), and the cache directory is
     /// what the model thread reads.
     #[napi]
-    pub async fn load(path: String) -> Result<Qwen3_5MoeModel> {
+    pub async fn load(
+        path: String,
+        options: Option<crate::models::qwen3_5::model::Qwen35LoadOptions>,
+    ) -> Result<Qwen3_5MoeModel> {
+        let options = options.unwrap_or_default();
+        let draft_model_path = options.draft_model_path;
+        let kv_format = options
+            .kv_format
+            .as_deref()
+            .map(|value| crate::transformer::KvFormat::parse(Some(value)))
+            .transpose()
+            .map_err(|message| Error::from_reason(format!("Qwen3.5 MoE load: {message}")))?;
         let source = std::path::Path::new(&path);
         if source.is_file()
             && source
@@ -472,7 +498,13 @@ impl Qwen3_5MoeModel {
             let cache = crate::utils::gguf::prepare_qwen35_moe_native_gguf(source).await?;
             // A failed init must release the lease prepare took (see the
             // dense loader for why the dir would otherwise pin forever).
-            return match persistence::load_with_thread(&cache.to_string_lossy()).await {
+            return match persistence::load_with_thread(
+                &cache.to_string_lossy(),
+                draft_model_path,
+                kv_format,
+            )
+            .await
+            {
                 Ok(model) => Ok(model),
                 Err(error) => {
                     crate::utils::gguf::native_gguf_unlease_in_use(&cache);
@@ -480,7 +512,7 @@ impl Qwen3_5MoeModel {
                 }
             };
         }
-        persistence::load_with_thread(&path).await
+        persistence::load_with_thread(&path, draft_model_path, kv_format).await
     }
 
     /// Generate text from a prompt token sequence.

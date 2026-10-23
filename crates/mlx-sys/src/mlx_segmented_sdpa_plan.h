@@ -297,6 +297,29 @@ inline int segmented_verify_tile_partitions(int total_length, int tile_n,
   return std::clamp(((wanted + 31) / 32) * 32, 32, 1024);
 }
 
+// Optional NAX scheduling experiment: Splash targets 16 Page32 blocks
+// (512 keys) per split. Keep MLX's 32-partition reduction granularity and
+// explicit MLX_SDPA_BLOCKS override. Changing splits changes accumulation
+// order; this is independent of the exact grid-axis permutation experiment.
+inline int segmented_verify_nax_partitions(int total_length, int tile_n,
+                                           int blocks_override,
+                                           bool keys512,
+                                           bool exact_splits = false,
+                                           bool bounded_reducer = false) {
+  // Arbitrary split counts require the bounded 256-thread reducer. The
+  // original reducer consumes whole groups of32 and must never see a tail.
+  if (keys512 && exact_splits && bounded_reducer && blocks_override <= 0) {
+    const int64_t wanted = (int64_t{total_length} + 511) / 512;
+    return static_cast<int>(std::clamp<int64_t>(wanted, 32, 1024));
+  }
+  if (!keys512 || blocks_override > 0) {
+    return segmented_verify_tile_partitions(total_length, tile_n, blocks_override);
+  }
+  const int64_t wanted = (int64_t{total_length} + 511) / 512;
+  return static_cast<int>(std::clamp<int64_t>(
+      ((wanted + 31) / 32) * 32, 32, 1024));
+}
+
 // Tensor-op verify kernel (segmented_sdpa_verify_nax_2pass_1): keys per
 // tile, threads and threadgroup bytes of one dispatch. M = rows * gqa is
 // compiled into the kernel; 256 threads (execution_simdgroups<8>) is the

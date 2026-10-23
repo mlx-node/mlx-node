@@ -263,6 +263,7 @@ pub(crate) struct GdnPrologue<'a> {
 /// and the new state: the kernel tape and the next conv history `[3, W]`.
 pub(crate) struct GdnCompleteOut {
     pub out: MxArray,
+    pub prepared_sg8: Option<crate::models::quantized_linear::PreparedSg8>,
     pub state: MxArray,
     pub tape: GdnKernelTape,
     pub history: MxArray,
@@ -273,34 +274,99 @@ pub(crate) struct GdnCompleteOut {
 /// gate — bit-identical to `gdn_prepare` followed by
 /// [`gated_delta_fused_step`]. `None` when the kernel is off-contract
 /// (B = 1, Dk = Dv = 128, T <= 16, compact tiled heads `hv % Hk`).
+#[cfg(test)]
 pub(crate) fn gated_delta_fused_complete(
     prologue: &GdnPrologue<'_>,
     state: &MxArray,
     tail: &GdnTail<'_>,
 ) -> Option<GdnCompleteOut> {
-    let mut outputs = [std::ptr::null_mut(); 8];
-    let ok = unsafe {
-        sys::mlx_gdn_fused_complete(
-            prologue.qkv.as_raw_ptr(),
-            prologue.a.as_raw_ptr(),
-            prologue.b.as_raw_ptr(),
-            prologue.conv.as_raw_ptr(),
-            prologue.history.as_raw_ptr(),
-            prologue.scale.as_raw_ptr(),
-            prologue.dt_bias.as_raw_ptr(),
-            state.as_raw_ptr(),
-            tail.z.as_raw_ptr(),
-            tail.norm_weight.as_raw_ptr(),
-            tail.eps,
-            tail.state_dst
-                .map(MxArray::as_raw_ptr)
-                .unwrap_or(std::ptr::null_mut()),
-            prologue
-                .history_dst
-                .map(MxArray::as_raw_ptr)
-                .unwrap_or(std::ptr::null_mut()),
-            outputs.as_mut_ptr(),
-        )
+    gated_delta_fused_complete_with_prepared(prologue, state, tail, false)
+}
+
+pub(crate) fn gated_delta_fused_complete_with_prepared(
+    prologue: &GdnPrologue<'_>,
+    state: &MxArray,
+    tail: &GdnTail<'_>,
+    prepared: bool,
+) -> Option<GdnCompleteOut> {
+    gated_delta_fused_complete_impl(prologue, state, tail, prepared, None)
+}
+
+/// Explicit prior tape [k,v,g,beta,qkv,keep] for a deferred verifier. State and
+/// history outputs settle only that prior prefix; the current window remains
+/// represented by its tape. Never reinterpret these outputs as window-final.
+pub(crate) fn gated_delta_fused_complete_deferred(
+    prologue: &GdnPrologue<'_>,
+    state: &MxArray,
+    tail: &GdnTail<'_>,
+    prepared: bool,
+    pending: [&MxArray; 6],
+) -> Option<GdnCompleteOut> {
+    gated_delta_fused_complete_impl(prologue, state, tail, prepared, Some(pending))
+}
+
+fn gated_delta_fused_complete_impl(
+    prologue: &GdnPrologue<'_>,
+    state: &MxArray,
+    tail: &GdnTail<'_>,
+    prepared: bool,
+    pending: Option<[&MxArray; 6]>,
+) -> Option<GdnCompleteOut> {
+    let mut outputs = [std::ptr::null_mut(); 10];
+    let launch = if prepared {
+        sys::mlx_gdn_fused_complete_prepared
+    } else {
+        sys::mlx_gdn_fused_complete
+    };
+    let ok = if let Some(pending) = pending {
+        let pending = pending.map(MxArray::as_raw_ptr);
+        unsafe {
+            sys::mlx_gdn_fused_complete_deferred(
+                prologue.qkv.as_raw_ptr(),
+                prologue.a.as_raw_ptr(),
+                prologue.b.as_raw_ptr(),
+                prologue.conv.as_raw_ptr(),
+                prologue.history.as_raw_ptr(),
+                prologue.scale.as_raw_ptr(),
+                prologue.dt_bias.as_raw_ptr(),
+                state.as_raw_ptr(),
+                tail.z.as_raw_ptr(),
+                tail.norm_weight.as_raw_ptr(),
+                tail.eps,
+                tail.state_dst
+                    .map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+                prologue
+                    .history_dst
+                    .map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+                pending.as_ptr(),
+                prepared,
+                outputs.as_mut_ptr(),
+            )
+        }
+    } else {
+        unsafe {
+            launch(
+                prologue.qkv.as_raw_ptr(),
+                prologue.a.as_raw_ptr(),
+                prologue.b.as_raw_ptr(),
+                prologue.conv.as_raw_ptr(),
+                prologue.history.as_raw_ptr(),
+                prologue.scale.as_raw_ptr(),
+                prologue.dt_bias.as_raw_ptr(),
+                state.as_raw_ptr(),
+                tail.z.as_raw_ptr(),
+                tail.norm_weight.as_raw_ptr(),
+                tail.eps,
+                tail.state_dst
+                    .map(MxArray::as_raw_ptr)
+                    .unwrap_or(std::ptr::null_mut()),
+                prologue
+                    .history_dst
+                    .map(MxArray::as_raw_ptr)
+                    .unwrap_or(std::ptr::null_mut()),
+                outputs.as_mut_ptr(),
+            )
+        }
     };
     if !ok {
         return None;
@@ -308,6 +374,14 @@ pub(crate) fn gated_delta_fused_complete(
     let take = |i: usize, name: &str| MxArray::from_handle(outputs[i], name).ok();
     Some(GdnCompleteOut {
         out: take(0, "gdn_fused_complete:out")?,
+        prepared_sg8: if prepared {
+            Some(crate::models::quantized_linear::PreparedSg8 {
+                packed: take(8, "gdn_fused_complete:packed")?,
+                sums: take(9, "gdn_fused_complete:sums")?,
+            })
+        } else {
+            None
+        },
         state: take(1, "gdn_fused_complete:state")?,
         tape: GdnKernelTape {
             q: take(2, "gdn_fused_complete:q")?,
@@ -2601,3 +2675,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "gdn_deferred_tests.rs"]
+mod deferred_tests;

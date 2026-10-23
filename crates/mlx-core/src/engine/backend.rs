@@ -1990,6 +1990,24 @@ pub(crate) trait DsparkStepper {
         self.verify(&ids)
     }
 
+    /// Optional device-selected live prefix inside a fixed physical verify block.
+    /// Read only after logits are evaluated. The engine caps accepted drafts to
+    /// rows-1, while rollback still receives the full physical write count.
+    fn device_verification_budget(&self) -> Option<&MxArray> {
+        None
+    }
+
+    /// Train a model-specific device budget after successful commit. Raw matches
+    /// include the last valid target row, before retention and stop clamping.
+    fn observe_device_verification(
+        &mut self,
+        _rows: usize,
+        _raw_matches: usize,
+        _milliseconds: f64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Commit the cycle: keep the first `keep` of the `total_written`
     /// (`== 1+L`) target-cache slots [`Self::verify`] wrote and roll back
     /// the rest; consume the stashed tapped hiddens to re-seed the draft

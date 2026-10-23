@@ -57,13 +57,9 @@ async fn run_on_model(
             .await
         }
         "qwen3_5_moe" => {
-            if format.is_some_and(|f| f != crate::transformer::KvFormat::Bf16) {
-                return Err(Error::from_reason(
-                    "mlx eval: kv_format applies to dense qwen3_5 only",
-                ));
-            }
             let model =
-                crate::models::qwen3_5_moe::persistence::load_with_thread(model_path).await?;
+                crate::models::qwen3_5_moe::persistence::load_with_thread(model_path, None, format)
+                    .await?;
             crate::model_thread::send_and_await(&model.thread, |reply| {
                 Qwen35MoeFamilyCommand::EvalTeacherForced { request, reply }
             })
@@ -164,7 +160,7 @@ pub async fn capture_teacher_logits(
 /// would otherwise report a finite, plausible number measured on the wrong
 /// text.
 ///
-/// `kv_format` (`"int8"` / `"bf16"`; unset = the load default) selects the dense qwen3_5
+/// `kv_format` (`"int8"` / `"bf16"`; unset = the load default) selects the Qwen dense or MoE
 /// candidate's flat K/V cache format, so the int8 cache can be scored against
 /// the same teacher cache as the BF16 one.
 #[napi]
