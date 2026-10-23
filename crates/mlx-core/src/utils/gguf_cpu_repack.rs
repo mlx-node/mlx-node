@@ -549,8 +549,10 @@ mod tests {
         let rows = 256usize;
         let bytes = random_bytes(rows * 48 * 4, 5);
         let u32s: Vec<u32> = bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
         let w = MxArray::from_uint32(&u32s, &[rows as i64, 48]).unwrap();
         tile_case(
@@ -566,8 +568,10 @@ mod tests {
         let s = MxArray::from_uint8(&u8s, &[rows as i64, 24]).unwrap();
         tile_case("u8", u8s, s, |a| a.to_uint8().unwrap(), rows, 24, 12);
         let u16s: Vec<u16> = random_bytes(rows * 16 * 2, 7)
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]) & 0x3BFF)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c) & 0x3BFF)
             .collect();
         let b = MxArray::from_float16(&u16s, &[rows as i64, 16]).unwrap();
         tile_case(
@@ -589,7 +593,7 @@ mod tests {
         let row_bytes = k / 32 * 18;
         let rows = (1usize << 30) / row_bytes;
         let mut src = random_bytes(rows * row_bytes, 3);
-        for b in src.chunks_exact_mut(18) {
+        for b in src.as_chunks_mut::<18>().0 {
             b[0..2].copy_from_slice(&0x2000u16.to_le_bytes());
         }
         let mut weight = vec![0u32; rows * k / 32 * 4];

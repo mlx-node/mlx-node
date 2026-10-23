@@ -1103,12 +1103,16 @@ mod tests {
         let small = |bits: u16| bits & 0x3BFF;
         match ty {
             F32 => random_bytes(elements * 2, seed)
-                .chunks_exact(2)
-                .flat_map(|c| (f32::from(u16::from_le_bytes([c[0], c[1]])) / 65536.0).to_le_bytes())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|c| (f32::from(u16::from_le_bytes(*c)) / 65536.0).to_le_bytes())
                 .collect(),
             F16 | BF16 => random_bytes(elements * 2, seed)
-                .chunks_exact(2)
-                .flat_map(|c| small(u16::from_le_bytes([c[0], c[1]])).to_le_bytes())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|c| small(u16::from_le_bytes(*c)).to_le_bytes())
                 .collect(),
             _ => random_bytes(elements / ty.block_size() * ty.type_size(), seed),
         }
