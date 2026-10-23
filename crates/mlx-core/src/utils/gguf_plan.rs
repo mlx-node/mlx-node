@@ -89,6 +89,9 @@ pub(crate) struct ImportPlan {
     /// A Muse mmproj / DFlash companion merges its quantization and DFlash
     /// blocks into the primary `config.json`.
     pub muse_secondary: bool,
+    /// Dense GGUF tensor the staged read allocates as row shards of this many
+    /// rows instead of one buffer (Gemma4 PLE above the shard budget).
+    pub ple_shard: Option<(String, usize)>,
 }
 
 /// Record header facts that tensor-name mapping reads from the metadata map.
@@ -421,6 +424,7 @@ pub(crate) fn plan_gguf_import(
         asset_copies,
         strict_asset_copies: opts.config_source_dir.is_some(),
         muse_secondary: !is_primary && is_muse_companion,
+        ple_shard: None,
     })
 }
 
