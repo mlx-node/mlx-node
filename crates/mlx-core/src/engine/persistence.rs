@@ -1764,7 +1764,7 @@ mod checkpoint_tests {
                     return fixture_payload(*ty, elements, seed);
                 }
                 let mut data = fixture_bytes(seed, elements / 32 * 20);
-                for block in data.chunks_exact_mut(20) {
+                for block in data.as_chunks_mut::<20>().0 {
                     block[..2].copy_from_slice(&half::f16::from_f32(0.01).to_bits().to_le_bytes());
                     block[2..4]
                         .copy_from_slice(&half::f16::from_f32(-0.05).to_bits().to_le_bytes());
