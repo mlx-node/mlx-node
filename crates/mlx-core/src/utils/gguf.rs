@@ -8056,11 +8056,7 @@ fn muse_glimmer_native_draft(input: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
-pub(crate) async fn prepare_muse_glimmer_native_gguf(input: &Path) -> Result<PathBuf> {
-    let root = native_gguf_cache_root()?;
-    prepare_muse_glimmer_native_gguf_in(input, &root).await
-}
-
+#[cfg(test)]
 pub(super) async fn prepare_muse_glimmer_native_gguf_in(
     input: &Path,
     root: &Path,
@@ -8118,10 +8114,13 @@ pub(crate) enum NativeGgufFamily {
 /// overrides to this directory without modifying sources or repacking weights.
 #[napi]
 pub async fn prepare_muse_glimmer_gguf(model_path: String) -> Result<String> {
-    Ok(prepare_muse_glimmer_native_gguf(Path::new(&model_path))
-        .await?
-        .to_string_lossy()
-        .into_owned())
+    Ok(
+        prepare_gguf_assets(Path::new(&model_path), NativeGgufFamily::MuseGlimmer)
+            .await?
+            .asset_dir
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// Release ONE lease reference `prepare_*`/`assets` took on `dir`. Model

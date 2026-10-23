@@ -1,13 +1,14 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
 use crate::cold_tier::{CheckpointLoadGuard, resolve_persist_cold};
+use crate::engine::checkpoint_source::CheckpointSource;
 use crate::engine::persistence::{
-    KeyRule, RenameSpec, apply_rename_spec, load_all_safetensors, parse_generation_defaults,
+    KeyRule, RenameSpec, apply_rename_spec, load_checkpoint, parse_generation_defaults,
 };
 use crate::models::gemma4::quantized_linear::{
     LinearProj, try_build_affine_quantized_linear_tiled, try_build_fp8_e4m3_quantized_linear,
@@ -25,6 +26,8 @@ use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::transformer::{AttentionKind, KVCacheDType};
+use crate::utils::gguf::NativeGgufFamily;
+use crate::utils::gguf_import::{GgufPreload, PreloadInput};
 use crate::utils::safetensors::{SafeTensorsFile, load_safetensors_lazy};
 
 use super::attention::MuseGlimmerAttention;
@@ -197,22 +200,39 @@ pub(super) fn norm(params: &HashMap<String, MxArray>, key: &str, eps: f32) -> Re
     RMSNorm::from_weight(required(params, key)?, Some(eps as f64))
 }
 
-fn load_dflash(
+/// The DFlash draft's raw weights: `preloaded` (the GGUF companion map,
+/// empty without a companion) for a GGUF, else `draft.safetensors` in `path`.
+fn draft_params(
     path: &Path,
+    preloaded: Option<HashMap<String, MxArray>>,
+) -> Result<Option<HashMap<String, MxArray>>> {
+    match preloaded {
+        Some(draft) => Ok((!draft.is_empty()).then_some(draft)),
+        None => {
+            let draft_path = path.join("draft.safetensors");
+            if draft_path.is_file() {
+                load_safetensors_lazy(&draft_path).map(Some)
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn load_dflash(
     config: &MuseGlimmerConfig,
+    params: Option<HashMap<String, MxArray>>,
     default: PerLayerQuant,
     overrides: &HashMap<String, PerLayerQuant>,
 ) -> Result<Option<DFlashModel>> {
-    let draft_path = path.join("draft.safetensors");
-    if !draft_path.is_file() {
+    let Some(params) = params else {
         return Ok(None);
-    }
+    };
     let draft_config = config.dflash_config.clone().ok_or_else(|| {
         Error::from_reason(
-            "Muse-Glimmer has draft.safetensors but config.json has no dflash_config; reconvert the companion GGUF with --draft",
+            "Muse-Glimmer has a DFlash draft but config.json has no dflash_config; reconvert the companion GGUF with --draft",
         )
     })?;
-    let params = load_safetensors_lazy(&draft_path)?;
     let fc = build_projection(&params, "fc", default, overrides)?;
     let hidden_norm = norm(&params, "hidden_norm.weight", draft_config.rms_norm_eps)?;
     let final_norm = norm(&params, "norm.weight", draft_config.rms_norm_eps)?;
@@ -550,9 +570,12 @@ fn canonicalize_target_weights(
     Ok(canonical)
 }
 
-fn load_target_safetensors(
+/// With `preload`, `path` is the GGUF's asset directory (no weight files);
+/// the draft companion stays in the preload.
+fn load_target_weights(
     path: &Path,
     tie_word_embeddings: bool,
+    preload: Option<&mut GgufPreload>,
 ) -> Result<HashMap<String, MxArray>> {
     // Muse-Glimmer execution is text-only today. Keep the optional
     // vision.safetensors sidecar and any vision tensors embedded in the
@@ -560,9 +583,14 @@ fn load_target_safetensors(
     // until a vision forward path consumes them. Tied checkpoints may also
     // carry a redundant lm_head quantization group; logits use the embedding
     // table, so exclude the whole unused group before the same accounting.
-    let norms_are_direct = primary_safetensor_is_mlx(path)?;
+    // The GGUF import writes direct-convention norms (the converter tags that
+    // output "format": "mlx"); shifting them again corrupts every layer.
+    let norms_are_direct = match preload {
+        Some(_) => true,
+        None => primary_safetensor_is_mlx(path)?,
+    };
     let mut params =
-        canonicalize_target_weights(load_all_safetensors(path, false)?, norms_are_direct)?;
+        canonicalize_target_weights(load_checkpoint(path, false, preload)?, norms_are_direct)?;
     params.retain(|key, _| {
         key.starts_with("model.language_model.")
             || (!tie_word_embeddings && key.starts_with("lm_head."))
@@ -581,7 +609,25 @@ fn requires_row_exact_decode_projections(
             .any(|quant| quant.mode == PerLayerMode::Affine)
 }
 
-fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
+fn preload_gguf(input: &PreloadInput) -> Result<GgufPreload> {
+    let preload = GgufPreload::load(input)?;
+    let stats = &preload.stats;
+    tracing::info!(
+        "GGUF preload: {} bytes in {:.2} s (read wait {:.2} s, page cache {}), \
+         {} GPU-repacked and {} other tensors",
+        stats.bytes,
+        stats.preload_secs,
+        stats.read_secs,
+        if stats.nocache { "off" } else { "on" },
+        stats.gpu_tensors,
+        stats.cpu_tensors,
+    );
+    Ok(preload)
+}
+
+/// With `preload_input`, `path` is the GGUF's asset directory (or a host
+/// config overlay of it). Model thread only.
+fn load_inner(path: &Path, preload_input: Option<PreloadInput>) -> Result<(MuseGlimmerInner, u64)> {
     let config = MuseGlimmerConfig::from_path(path)?;
     let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
     let persist_cold = resolve_persist_cold(
@@ -590,7 +636,16 @@ fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
         config.persist_paged_cache,
     );
     let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
-    let mut params = load_target_safetensors(path, config.text_config.tie_word_embeddings)?;
+    let from_gguf = preload_input.is_some();
+    let mut preload = preload_input
+        .map(|input| preload_gguf(&input))
+        .transpose()?;
+    let mut params = load_target_weights(
+        path,
+        config.text_config.tie_word_embeddings,
+        preload.as_mut(),
+    )?;
+    let preloaded_draft = preload.map(|mut preload| std::mem::take(&mut preload.companion));
     checkpoint_load.record_mmap();
     if persist_cold {
         crate::engine::persistence::prewarm_checkpoint_pages(path);
@@ -691,16 +746,20 @@ fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
     })?);
     let response_template = ResponseTemplate::from_tokenizer_config(path)?;
     let gen_defaults = parse_generation_defaults(path);
-    let dflash = load_dflash(path, &config, default, &overrides)?;
-    let paged = build_paged_runtime(&config)?;
-    let has_dflash = dflash.is_some();
-    let weight_bytes = text_weight_bytes.saturating_add(if has_dflash {
-        std::fs::metadata(path.join("draft.safetensors"))
+    let draft = draft_params(path, preloaded_draft)?;
+    let draft_bytes = match (&draft, from_gguf) {
+        (Some(params), true) => params
+            .values()
+            .map(|array| array.nbytes() as u64)
+            .fold(0u64, |acc, v| acc.saturating_add(v)),
+        (Some(_), false) => std::fs::metadata(path.join("draft.safetensors"))
             .map(|meta| meta.len())
-            .unwrap_or(0)
-    } else {
-        0
-    });
+            .unwrap_or(0),
+        (None, _) => 0,
+    };
+    let dflash = load_dflash(&config, draft, default, &overrides)?;
+    let paged = build_paged_runtime(&config)?;
+    let weight_bytes = text_weight_bytes.saturating_add(draft_bytes);
     let weights_resident = if persist_cold {
         let arrays = params.values().collect::<Vec<_>>();
         Some(crate::array::memory::materialize_weights(&arrays)?)
@@ -738,24 +797,29 @@ fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
 }
 
 pub(crate) async fn load_with_thread(model_path: &str) -> Result<MuseGlimmerModel> {
-    // `leased` keeps the prepared cache dir so a failed init can release the
-    // lease prepare took — otherwise a multi-GB entry pins against the cap
-    // for the process lifetime.
-    let mut leased: Option<PathBuf> = None;
-    let model_path = if let Some(gguf) =
-        crate::utils::gguf::resolve_muse_glimmer_gguf_source(Path::new(model_path))?
-    {
-        let prepared = crate::utils::gguf::prepare_muse_glimmer_native_gguf(&gguf).await?;
-        let path = prepared.to_string_lossy().into_owned();
-        leased = Some(prepared);
-        path
-    } else {
-        model_path.to_string()
+    let source =
+        CheckpointSource::resolve(Path::new(model_path), NativeGgufFamily::MuseGlimmer).await?;
+    let loaded = load_with_source(&source).await;
+    if loaded.is_err() {
+        source.release_lease();
+    }
+    loaded
+}
+
+/// The caller releases `source`'s lease when this fails.
+async fn load_with_source(source: &CheckpointSource) -> Result<MuseGlimmerModel> {
+    let model_path = source.asset_dir().to_string_lossy().into_owned();
+    let preload_input = match source {
+        CheckpointSource::Dir(_) => None,
+        CheckpointSource::Gguf(checkpoint) => {
+            checkpoint.check_asset_config()?;
+            Some(checkpoint.preload_input(true))
+        }
     };
     let model_assets_path = model_path.clone();
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
         move || {
-            let (inner, weight_bytes) = load_inner(Path::new(&model_path))?;
+            let (inner, weight_bytes) = load_inner(Path::new(&model_path), preload_input)?;
             let has_dflash = inner.dflash.is_some();
             let pool_bytes = inner
                 .paged
@@ -798,16 +862,8 @@ pub(crate) async fn load_with_thread(model_path: &str) -> Result<MuseGlimmerMode
         pool_cache_limit_guard,
     ) = match init_rx.await {
         Ok(Ok(init)) => init,
-        Ok(Err(error)) => {
-            if let Some(dir) = leased {
-                crate::utils::gguf::native_gguf_unlease_in_use(&dir);
-            }
-            return Err(error);
-        }
+        Ok(Err(error)) => return Err(error),
         Err(_) => {
-            if let Some(dir) = leased {
-                crate::utils::gguf::native_gguf_unlease_in_use(&dir);
-            }
             return Err(Error::from_reason(
                 "Muse-Glimmer model thread exited during load",
             ));
@@ -828,7 +884,7 @@ pub(crate) async fn load_with_thread(model_path: &str) -> Result<MuseGlimmerMode
 #[cfg(test)]
 mod tests {
     use super::{
-        canonicalize_target_weights, load_lm_head, load_target_safetensors, muse_projection_quant,
+        canonicalize_target_weights, load_lm_head, load_target_weights, muse_projection_quant,
         primary_safetensor_is_mlx, quant_lookup_prefix, requires_row_exact_decode_projections,
     };
     use crate::array::MxArray;
@@ -1016,7 +1072,7 @@ mod tests {
         .expect("save mixed Muse safetensors");
         save_one(&dir.join("vision.safetensors"), "vision.weight", 2.0);
 
-        let untied = load_target_safetensors(&dir, false).expect("load untied Muse weights");
+        let untied = load_target_weights(&dir, false, None).expect("load untied Muse weights");
         assert!(untied.contains_key("model.language_model.embed_tokens.weight"));
         assert!(untied.contains_key("lm_head.weight"));
         assert!(untied.contains_key("lm_head.scales"));
@@ -1025,7 +1081,7 @@ mod tests {
         assert!(!untied.contains_key("vision_adapter.fc1.weight"));
         assert!(!untied.contains_key("vision.weight"));
 
-        let tied = load_target_safetensors(&dir, true).expect("load tied Muse weights");
+        let tied = load_target_weights(&dir, true, None).expect("load tied Muse weights");
         assert!(tied.contains_key("model.language_model.embed_tokens.weight"));
         assert!(!tied.keys().any(|key| key.starts_with("lm_head.")));
         assert!(!tied.contains_key("vision_tower.layers.0.attn.q_proj.weight"));
@@ -1086,5 +1142,157 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.reason.contains("lm_head.weight"), "{error}");
+    }
+
+    async fn resolve_muse_gguf(
+        gguf: &std::path::Path,
+        cache: &std::path::Path,
+    ) -> crate::engine::checkpoint_source::CheckpointSource {
+        use crate::engine::checkpoint_source::CheckpointSource;
+        let source = CheckpointSource::resolve_in(
+            gguf,
+            crate::utils::gguf::NativeGgufFamily::MuseGlimmer,
+            Some(cache),
+        )
+        .await
+        .unwrap();
+        let CheckpointSource::Gguf(ckpt) = &source else {
+            panic!("the Muse GGUF resolved to a plain directory");
+        };
+        ckpt.check_asset_config().unwrap();
+        let weight_files: Vec<_> = std::fs::read_dir(&ckpt.asset_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".safetensors"))
+            .collect();
+        assert!(
+            weight_files.is_empty(),
+            "the asset directory holds weight files: {weight_files:?}"
+        );
+        source
+    }
+
+    fn gguf_checkpoint(
+        source: &crate::engine::checkpoint_source::CheckpointSource,
+    ) -> &crate::engine::checkpoint_source::GgufCheckpoint {
+        match source {
+            crate::engine::checkpoint_source::CheckpointSource::Gguf(ckpt) => ckpt,
+            crate::engine::checkpoint_source::CheckpointSource::Dir(_) => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn muse_norms_direct_for_gguf() {
+        use crate::models::muse_glimmer::config::MuseGlimmerConfig;
+        use crate::utils::gguf_import::GgufPreload;
+        use crate::utils::gguf_import::gate::manifest;
+        use crate::utils::gguf_test_fixtures::{prepare_import_fixture, write_import_fixture};
+
+        let work = std::env::temp_dir().join(format!("mlx-muse-norms-{}", uuid::Uuid::new_v4()));
+        let fx = write_import_fixture("muse-draft", &work.join("src"));
+        let converted = prepare_import_fixture(&fx, &work.join("old-cache")).await;
+        let tie = MuseGlimmerConfig::from_path(&converted)
+            .unwrap()
+            .text_config
+            .tie_word_embeddings;
+        let want = manifest(&load_target_weights(&converted, tie, None).unwrap());
+        assert!(
+            want.keys()
+                .any(|key| key.starts_with("model.language_model.layers.")
+                    && key.ends_with("layernorm.weight")),
+            "the fixture carries no sandwich norm: {:?}",
+            want.keys()
+        );
+
+        let source = resolve_muse_gguf(&fx.main, &work.join("cache")).await;
+        let ckpt = gguf_checkpoint(&source);
+        let mut preload = GgufPreload::load(&ckpt.preload_input(true)).unwrap();
+        let got = manifest(&load_target_weights(&ckpt.asset_dir, tie, Some(&mut preload)).unwrap());
+        assert!(
+            !preload.companion.is_empty(),
+            "the target load consumed the draft companion"
+        );
+        assert_eq!(
+            got.keys().collect::<Vec<_>>(),
+            want.keys().collect::<Vec<_>>(),
+            "tensor names"
+        );
+        for (name, entry) in &want {
+            assert_eq!(
+                got.get(name),
+                Some(entry),
+                "tensor {name} differs from the converted checkpoint"
+            );
+        }
+        source.release_lease();
+        std::fs::remove_dir_all(&work).ok();
+    }
+
+    #[tokio::test]
+    async fn muse_draft_from_preload() {
+        use super::draft_params;
+        use crate::models::muse_glimmer::config::MuseGlimmerConfig;
+        use crate::utils::gguf_import::GgufPreload;
+        use crate::utils::gguf_import::gate::manifest;
+        use crate::utils::gguf_test_fixtures::{prepare_import_fixture, write_import_fixture};
+
+        let work = std::env::temp_dir().join(format!("mlx-muse-draft-{}", uuid::Uuid::new_v4()));
+        let fx = write_import_fixture("muse-draft", &work.join("src"));
+        let converted = prepare_import_fixture(&fx, &work.join("old-cache")).await;
+        let want = manifest(
+            &draft_params(&converted, None)
+                .unwrap()
+                .expect("the converted entry has no draft.safetensors"),
+        );
+        assert!(!want.is_empty());
+
+        let source = resolve_muse_gguf(&fx.main, &work.join("cache")).await;
+        let ckpt = gguf_checkpoint(&source);
+        assert!(ckpt.companion.is_some(), "the DFlash sibling was not found");
+        let tie = MuseGlimmerConfig::from_path(&ckpt.asset_dir)
+            .unwrap()
+            .text_config
+            .tie_word_embeddings;
+        let mut preload = GgufPreload::load(&ckpt.preload_input(true)).unwrap();
+        load_target_weights(&ckpt.asset_dir, tie, Some(&mut preload)).unwrap();
+        let draft = draft_params(
+            &ckpt.asset_dir,
+            Some(std::mem::take(&mut preload.companion)),
+        )
+        .unwrap();
+        assert!(
+            draft.is_some(),
+            "the DFlash draft was not taken from the preload companion"
+        );
+        let got = manifest(&draft.unwrap());
+        assert_eq!(
+            got.keys().collect::<Vec<_>>(),
+            want.keys().collect::<Vec<_>>(),
+            "draft tensor names"
+        );
+        for (name, entry) in &want {
+            assert_eq!(got.get(name), Some(entry), "draft tensor {name} differs");
+        }
+        source.release_lease();
+
+        let lone = write_import_fixture("muse-draft", &work.join("lone"));
+        std::fs::remove_file(lone.companion.as_ref().unwrap()).unwrap();
+        let source = resolve_muse_gguf(&lone.main, &work.join("cache")).await;
+        let ckpt = gguf_checkpoint(&source);
+        assert!(ckpt.companion.is_none());
+        let mut preload = GgufPreload::load(&ckpt.preload_input(true)).unwrap();
+        load_target_weights(&ckpt.asset_dir, tie, Some(&mut preload)).unwrap();
+        assert!(
+            draft_params(
+                &ckpt.asset_dir,
+                Some(std::mem::take(&mut preload.companion))
+            )
+            .unwrap()
+            .is_none(),
+            "a GGUF without a DFlash companion produced a draft"
+        );
+        source.release_lease();
+        std::fs::remove_dir_all(&work).ok();
     }
 }
