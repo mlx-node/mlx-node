@@ -1124,7 +1124,7 @@ pub fn mxfp4_repack_block(block: &[u8], words: &mut [u32; 4]) -> u8 {
 /// of stored (see [`symmetric_zero_point`]). MXFP4 yields `(weight, uint8
 /// scales)` for MLX's native `mxfp4` mode, which has no offset at all.
 #[cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
-fn load_quantized_tensor(
+pub(super) fn load_quantized_tensor(
     reader: &mut (impl Read + Seek),
     gguf: &GgufFile,
     tensor: &GgufTensorInfo,

@@ -72,7 +72,7 @@ fn diff(a: &BTreeSet<String>, b: &BTreeSet<String>) -> (Vec<String>, Vec<String>
 #[test]
 fn metallib_matches_the_kernel_table() {
     let table = table_names();
-    assert_eq!(table.len(), 10, "kernel table: {table:?}");
+    assert_eq!(table.len(), 16, "kernel table: {table:?}");
     let mut report = vec![0 as c_char; 1 << 16];
     // SAFETY: `report` is writable for its length.
     let rc =

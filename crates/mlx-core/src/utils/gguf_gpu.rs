@@ -2,11 +2,11 @@
 //! GPU repack of GGUF raw blocks into the runtime packed arrays, one band of
 //! rows at a time, into destination buffers allocated up front
 //! (`mlx_gguf_repack.cpp`, kernels in `paged_attn.metallib`). The output bytes
-//! equal the CPU repacker's (`KQuantRepacker`, then `kquant_tile_rows` for
-//! Tiled64).
+//! equal the CPU loader's: `KQuantRepacker` (then `kquant_tile_rows` for
+//! Tiled64) for the K-quants, `load_quantized_tensor` for Q8_0 and MXFP4.
 
 use crate::array::{DType, MxArray};
-use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
+use crate::utils::gguf::{GgufTensorInfo, GgufTensorType, symmetric_zero_point};
 use napi::bindgen_prelude::*;
 use std::ffi::{CStr, c_char};
 
@@ -20,6 +20,32 @@ pub(crate) enum GpuRepackKind {
     Q6K,
     Iq4Xs,
     Q3K,
+    Iq4Nl,
+    Iq3S,
+    Q8_0,
+    Mxfp4,
+}
+
+impl GpuRepackKind {
+    pub(crate) fn gguf_type(self) -> GgufTensorType {
+        match self {
+            Self::Q4K => GgufTensorType::Q4K,
+            Self::Q5K => GgufTensorType::Q5K,
+            Self::Q6K => GgufTensorType::Q6K,
+            Self::Iq4Xs => GgufTensorType::IQ4XS,
+            Self::Q3K => GgufTensorType::Q3K,
+            Self::Iq4Nl => GgufTensorType::IQ4NL,
+            Self::Iq3S => GgufTensorType::IQ3S,
+            Self::Q8_0 => GgufTensorType::Q8_0,
+            Self::Mxfp4 => GgufTensorType::MXFP4,
+        }
+    }
+
+    /// Q8_0 and MXFP4 load as MLX affine / mxfp4 arrays: row-major only, no
+    /// `.biases`.
+    pub(crate) fn is_kquant(self) -> bool {
+        !matches!(self, Self::Q8_0 | Self::Mxfp4)
+    }
 }
 
 /// Metal is available and `paged_attn.metallib` holds every repack kernel.
@@ -35,6 +61,10 @@ pub(crate) fn gpu_kind_for(t: GgufTensorType) -> Option<GpuRepackKind> {
         GgufTensorType::Q6K => Some(GpuRepackKind::Q6K),
         GgufTensorType::IQ4XS => Some(GpuRepackKind::Iq4Xs),
         GgufTensorType::Q3K => Some(GpuRepackKind::Q3K),
+        GgufTensorType::IQ4NL => Some(GpuRepackKind::Iq4Nl),
+        GgufTensorType::IQ3S => Some(GpuRepackKind::Iq3S),
+        GgufTensorType::Q8_0 => Some(GpuRepackKind::Q8_0),
+        GgufTensorType::MXFP4 => Some(GpuRepackKind::Mxfp4),
         _ => None,
     }
 }
@@ -45,20 +75,35 @@ pub(crate) fn band_offset_rule(kind: GpuRepackKind) -> usize {
     match kind {
         GpuRepackKind::Q4K | GpuRepackKind::Q5K => 16,
         GpuRepackKind::Iq4Xs => 8,
-        GpuRepackKind::Q6K | GpuRepackKind::Q3K => 2,
+        GpuRepackKind::Q6K
+        | GpuRepackKind::Q3K
+        | GpuRepackKind::Iq4Nl
+        | GpuRepackKind::Iq3S
+        | GpuRepackKind::Q8_0 => 2,
+        GpuRepackKind::Mxfp4 => 1,
     }
 }
 
 /// Kernel id of `mlx_gguf_repack.cpp`'s table.
-fn kernel_id(kind: GpuRepackKind, layout: OutLayout) -> i32 {
+fn kernel_id(kind: GpuRepackKind, layout: OutLayout) -> Result<i32> {
+    let tiled = layout == OutLayout::Tiled64;
     let base = match kind {
         GpuRepackKind::Q4K => 0,
         GpuRepackKind::Q5K => 2,
         GpuRepackKind::Q6K => 4,
         GpuRepackKind::Iq4Xs => 6,
         GpuRepackKind::Q3K => 8,
+        GpuRepackKind::Iq4Nl => 10,
+        GpuRepackKind::Iq3S => 12,
+        GpuRepackKind::Q8_0 | GpuRepackKind::Mxfp4 if tiled => {
+            return Err(Error::from_reason(format!(
+                "{kind:?} has no Tiled64 repack kernel"
+            )));
+        }
+        GpuRepackKind::Q8_0 => return Ok(14),
+        GpuRepackKind::Mxfp4 => return Ok(15),
     };
-    base + i32::from(layout == OutLayout::Tiled64)
+    Ok(base + i32::from(tiled))
 }
 
 /// One tensor's destination arrays.
@@ -68,28 +113,69 @@ pub(crate) struct RepackDst {
     pub biases: Option<MxArray>,
 }
 
+/// Destination columns of one row of `k` values, and the `.scales` dtype.
+struct DstCols {
+    weight: usize,
+    scales: usize,
+    scales_dtype: DType,
+    biases: Option<usize>,
+}
+
+/// The loader's destination geometry for `t` with row length `k`: the
+/// K-quant contract (`load_kquant_repack`), or `load_quantized_tensor`'s for
+/// Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / MXFP4. `None` for other types.
+fn dst_cols(t: GgufTensorType, k: usize) -> Option<DstCols> {
+    if let Some(format) = t.k_quant_format() {
+        return Some(DstCols {
+            weight: format.weight_cols(k),
+            scales: format.scales_cols(k),
+            scales_dtype: if format.scales_are_signed() {
+                DType::Int8
+            } else {
+                DType::Uint8
+            },
+            biases: Some(format.biases_cols(k)),
+        });
+    }
+    let words_per_block = match t {
+        GgufTensorType::Q4_0 | GgufTensorType::Q4_1 | GgufTensorType::MXFP4 => 4,
+        GgufTensorType::Q5_0 | GgufTensorType::Q5_1 => 5,
+        GgufTensorType::Q8_0 => 8,
+        _ => return None,
+    };
+    let blocks = k / t.block_size();
+    let mxfp4 = t == GgufTensorType::MXFP4;
+    Some(DstCols {
+        weight: blocks * words_per_block,
+        scales: blocks,
+        scales_dtype: if mxfp4 { DType::Uint8 } else { DType::Float16 },
+        biases: (symmetric_zero_point(t).is_none() && !mxfp4).then_some(blocks),
+    })
+}
+
 impl RepackDst {
-    /// Uninitialized arrays with the loader's shapes and dtypes for `t`
-    /// (`load_kquant_repack`: the GGUF shape with the last dimension replaced
-    /// by the weight / scales / biases columns).
+    /// Uninitialized arrays with the loader's shapes and dtypes for `t`: the
+    /// GGUF shape with the last dimension replaced by the weight / scales /
+    /// biases columns (`load_kquant_repack`, `load_quantized_tensor`).
     pub(crate) fn alloc(t: &GgufTensorInfo, layout: OutLayout) -> Result<(RepackDst, DstPtrs)> {
-        let format = t.tensor_type.k_quant_format().ok_or_else(|| {
-            Error::from_reason(format!(
-                "no packed destination contract for GGUF tensor '{}' of type {}",
-                t.name,
-                t.tensor_type.name()
-            ))
-        })?;
+        let ty = t.tensor_type;
+        let block = ty.block_size();
         let shape = t.mlx_shape();
         let k = shape.last().copied().unwrap_or(0);
-        if k <= 0 || !(k as usize).is_multiple_of(format.block_size()) {
+        if k <= 0 || !(k as usize).is_multiple_of(block) {
             return Err(Error::from_reason(format!(
-                "GGUF tensor '{}' has last dimension {k}; expected a positive multiple of {}",
-                t.name,
-                format.block_size()
+                "GGUF tensor '{}' has last dimension {k}; expected a positive multiple of {block}",
+                t.name
             )));
         }
         let k = k as usize;
+        let cols = dst_cols(ty, k).ok_or_else(|| {
+            Error::from_reason(format!(
+                "no packed destination contract for GGUF tensor '{}' of type {}",
+                t.name,
+                ty.name()
+            ))
+        })?;
         let rows = usize::try_from(t.num_elements()?).map_err(|_| {
             Error::from_reason(format!(
                 "GGUF tensor '{}' element count exceeds usize",
@@ -97,11 +183,15 @@ impl RepackDst {
             ))
         })? / k;
         if layout == OutLayout::Tiled64
-            && (shape.len() != 2 || !rows.is_multiple_of(64) || !k.is_multiple_of(256))
+            && (ty.k_quant_format().is_none()
+                || shape.len() != 2
+                || !rows.is_multiple_of(64)
+                || !k.is_multiple_of(256))
         {
             return Err(Error::from_reason(format!(
-                "GGUF tensor '{}' shape {shape:?} cannot be Tiled64",
-                t.name
+                "GGUF tensor '{}' of type {} shape {shape:?} cannot be Tiled64",
+                t.name,
+                ty.name()
             )));
         }
         let row_shape = |cols: usize| -> Vec<i64> {
@@ -111,27 +201,25 @@ impl RepackDst {
             }
             s
         };
-        let scales_dtype = if format.scales_are_signed() {
-            DType::Int8
-        } else {
-            DType::Uint8
+        let (weight, wp, _) = MxArray::alloc_uninit(&row_shape(cols.weight), DType::Uint32)?;
+        let (scales, sp, _) = MxArray::alloc_uninit(&row_shape(cols.scales), cols.scales_dtype)?;
+        let (biases, bp) = match cols.biases {
+            Some(c) => {
+                let (b, bp, _) = MxArray::alloc_uninit(&row_shape(c), DType::Float16)?;
+                (Some(b), Some(bp))
+            }
+            None => (None, None),
         };
-        let (weight, wp, _) =
-            MxArray::alloc_uninit(&row_shape(format.weight_cols(k)), DType::Uint32)?;
-        let (scales, sp, _) =
-            MxArray::alloc_uninit(&row_shape(format.scales_cols(k)), scales_dtype)?;
-        let (biases, bp, _) =
-            MxArray::alloc_uninit(&row_shape(format.biases_cols(k)), DType::Float16)?;
         Ok((
             RepackDst {
                 weight,
                 scales: Some(scales),
-                biases: Some(biases),
+                biases,
             },
             DstPtrs {
                 weight: wp,
                 scales: Some(sp),
-                biases: Some(bp),
+                biases: bp,
                 rows,
                 k,
                 layout,
@@ -155,31 +243,43 @@ pub(crate) fn gpu_repack_band(
     rows: u32,
     dst: RepackDst,
 ) -> Result<RepackDst> {
+    let kernel = kernel_id(kind, layout)?;
     let scales = dst
         .scales
         .as_ref()
         .ok_or_else(|| Error::from_reason(format!("{kind:?} repack needs a scales array")))?;
-    let biases = dst
-        .biases
-        .as_ref()
-        .ok_or_else(|| Error::from_reason(format!("{kind:?} repack needs a biases array")))?;
+    let biases = match (kind.is_kquant(), dst.biases.as_ref()) {
+        (true, Some(b)) => b.as_raw_ptr(),
+        (false, None) => std::ptr::null_mut(),
+        (true, None) => {
+            return Err(Error::from_reason(format!(
+                "{kind:?} repack needs a biases array"
+            )));
+        }
+        (false, Some(_)) => {
+            return Err(Error::from_reason(format!(
+                "{kind:?} repack has no biases array"
+            )));
+        }
+    };
     let mut err = [0 as c_char; 1024];
     let mut out_w = std::ptr::null_mut();
     let mut out_s = std::ptr::null_mut();
     let mut out_b = std::ptr::null_mut();
-    // SAFETY: every handle is a live array; the out-pointers and `err` are
-    // writable for the call.
+    // SAFETY: every handle is a live array (`biases` may be null for the
+    // kinds without one); the out-pointers and `err` are writable for the
+    // call.
     let rc = unsafe {
         mlx_sys::mlx_gguf_repack_band(
             staging.as_raw_ptr(),
             src_offset,
-            kernel_id(kind, layout),
+            kernel,
             k,
             row0,
             rows,
             dst.weight.as_raw_ptr(),
             scales.as_raw_ptr(),
-            biases.as_raw_ptr(),
+            biases,
             &mut out_w,
             &mut out_s,
             &mut out_b,
@@ -197,46 +297,44 @@ pub(crate) fn gpu_repack_band(
     Ok(RepackDst {
         weight: MxArray::from_handle(out_w, "gguf_repack_band weight")?,
         scales: Some(MxArray::from_handle(out_s, "gguf_repack_band scales")?),
-        biases: Some(MxArray::from_handle(out_b, "gguf_repack_band biases")?),
+        biases: if kind.is_kquant() {
+            Some(MxArray::from_handle(out_b, "gguf_repack_band biases")?)
+        } else {
+            None
+        },
     })
 }
 
-/// The CPU repacker format behind a GPU kind.
+/// Every GPU kind.
 #[cfg(test)]
-fn kquant_format(kind: GpuRepackKind) -> crate::utils::gguf_kquant::KQuantFormat {
-    use crate::utils::gguf_kquant::KQuantFormat;
-    match kind {
-        GpuRepackKind::Q4K => KQuantFormat::Q4K,
-        GpuRepackKind::Q5K => KQuantFormat::Q5K,
-        GpuRepackKind::Q6K => KQuantFormat::Q6K,
-        GpuRepackKind::Iq4Xs => KQuantFormat::IQ4XS,
-        GpuRepackKind::Q3K => KQuantFormat::Q3K,
-    }
+const ALL_KINDS: [GpuRepackKind; 9] = [
+    GpuRepackKind::Q4K,
+    GpuRepackKind::Q5K,
+    GpuRepackKind::Q6K,
+    GpuRepackKind::Iq4Xs,
+    GpuRepackKind::Q3K,
+    GpuRepackKind::Iq4Nl,
+    GpuRepackKind::Iq3S,
+    GpuRepackKind::Q8_0,
+    GpuRepackKind::Mxfp4,
+];
+
+/// GGUF bytes of one row of `k` values.
+#[cfg(test)]
+fn row_bytes(kind: GpuRepackKind, k: usize) -> usize {
+    let t = kind.gguf_type();
+    k / t.block_size() * t.type_size()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::quant_dispatch::kquant_tile_rows;
+    use crate::utils::gguf::{GgufFile, load_quantized_tensor};
     use crate::utils::gguf_kquant::{KQuantScales, repack_kquant};
+    use std::collections::HashMap;
 
-    const KINDS: [GpuRepackKind; 5] = [
-        GpuRepackKind::Q4K,
-        GpuRepackKind::Q5K,
-        GpuRepackKind::Q6K,
-        GpuRepackKind::Iq4Xs,
-        GpuRepackKind::Q3K,
-    ];
-
-    fn gguf_type(kind: GpuRepackKind) -> GgufTensorType {
-        match kind {
-            GpuRepackKind::Q4K => GgufTensorType::Q4K,
-            GpuRepackKind::Q5K => GgufTensorType::Q5K,
-            GpuRepackKind::Q6K => GgufTensorType::Q6K,
-            GpuRepackKind::Iq4Xs => GgufTensorType::IQ4XS,
-            GpuRepackKind::Q3K => GgufTensorType::Q3K,
-        }
-    }
+    const KINDS: [GpuRepackKind; 9] = ALL_KINDS;
 
     /// On macOS the GPU path must be there; elsewhere the GPU tests skip.
     fn require_gpu() -> bool {
@@ -268,7 +366,7 @@ mod tests {
             name: "blk.0.ffn_down.weight".to_string(),
             n_dims: 2,
             dims: vec![k as u64, rows as u64],
-            tensor_type: gguf_type(kind),
+            tensor_type: kind.gguf_type(),
             offset: 0,
         }
     }
@@ -310,27 +408,39 @@ mod tests {
         biases: Vec<u16>,
     }
 
+    /// `biases` is empty for the kinds without `.biases`.
     fn read(dst: &RepackDst) -> Bytes {
         let s = dst.scales.as_ref().unwrap();
-        let b = dst.biases.as_ref().unwrap();
-        MxArray::eval_arrays_with_context(&[&dst.weight, s, b], "gguf_gpu test").unwrap();
+        let mut all = vec![&dst.weight, s];
+        all.extend(dst.biases.as_ref());
+        MxArray::eval_arrays_with_context(&all, "gguf_gpu test").unwrap();
         Bytes {
             weight: dst.weight.to_uint32().unwrap().to_vec(),
             scales: scale_bytes(s),
-            biases: b.to_uint16_native().unwrap(),
+            biases: dst
+                .biases
+                .as_ref()
+                .map(|b| b.to_uint16_native().unwrap())
+                .unwrap_or_default(),
         }
     }
 
     fn scale_bytes(s: &MxArray) -> Vec<u8> {
-        if s.dtype().unwrap() == DType::Int8 {
-            s.to_int8().unwrap().into_iter().map(|v| v as u8).collect()
-        } else {
-            s.to_uint8().unwrap()
+        match s.dtype().unwrap() {
+            DType::Int8 => s.to_int8().unwrap().into_iter().map(|v| v as u8).collect(),
+            DType::Float16 => s
+                .to_uint16_native()
+                .unwrap()
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+            _ => s.to_uint8().unwrap(),
         }
     }
 
     /// The CPU oracle: `repack_kquant`, tiled with `kquant_tile_rows` for
-    /// Tiled64 (the converter's `tile_kquant_weights_for_disk` units).
+    /// Tiled64 (the converter's `tile_kquant_weights_for_disk` units); for
+    /// Q8_0 / MXFP4 `load_quantized_tensor`.
     fn oracle(
         kind: GpuRepackKind,
         layout: OutLayout,
@@ -338,7 +448,10 @@ mod tests {
         rows: usize,
         k: usize,
     ) -> Bytes {
-        let format = kquant_format(kind);
+        let Some(format) = kind.gguf_type().k_quant_format() else {
+            assert_eq!(layout, OutLayout::RowMajor, "{kind:?} is row-major only");
+            return affine_oracle(kind, blocks, rows, k);
+        };
         let arrays = repack_kquant(format, blocks, rows, k).unwrap();
         assert_eq!(
             matches!(arrays.scales, KQuantScales::Signed(_)),
@@ -371,6 +484,33 @@ mod tests {
             weight: tw.to_uint32().unwrap().to_vec(),
             scales: scale_bytes(&ts),
             biases: tb.to_uint16_native().unwrap(),
+        }
+    }
+
+    fn affine_oracle(kind: GpuRepackKind, blocks: &[u8], rows: usize, k: usize) -> Bytes {
+        let info = tensor_info(kind, rows, k);
+        let gguf = GgufFile {
+            version: 3,
+            tensor_count: 1,
+            metadata: HashMap::new(),
+            tensors: vec![info.clone()],
+            alignment: 32,
+            data_offset: 0,
+        };
+        let out = load_quantized_tensor(&mut std::io::Cursor::new(blocks), &gguf, &info).unwrap();
+        let get = |suffix: &str| {
+            out.iter()
+                .find(|(name, _)| name.ends_with(suffix))
+                .map(|(_, a)| a)
+        };
+        let w = get(".weight").unwrap();
+        let s = get(".scales").unwrap();
+        assert!(get(".biases").is_none(), "{kind:?} oracle has biases");
+        MxArray::eval_arrays_with_context(&[w, s], "gguf_gpu affine oracle").unwrap();
+        Bytes {
+            weight: w.to_uint32().unwrap().to_vec(),
+            scales: scale_bytes(s),
+            biases: Vec::new(),
         }
     }
 
@@ -413,8 +553,7 @@ mod tests {
 
     /// One band holding the whole tensor at staging byte `pad`.
     fn whole_tensor_at(kind: GpuRepackKind, layout: OutLayout, rows: usize, k: usize, pad: usize) {
-        let format = kquant_format(kind);
-        let blocks = random_bytes(rows * format.row_bytes(k), (rows * 131 + k + pad) as u64);
+        let blocks = random_bytes(rows * row_bytes(kind, k), (rows * 131 + k + pad) as u64);
         let info = tensor_info(kind, rows, k);
         let (dst, ptrs) = RepackDst::alloc(&info, layout).unwrap();
         assert_eq!((ptrs.rows, ptrs.k, ptrs.layout), (rows, k, layout));
@@ -437,13 +576,21 @@ mod tests {
         );
     }
 
-    /// Row-major: rows {1, 3, 64, 130} x K {256, 768, 5120} (odd block counts
-    /// included) at an aligned offset and at the smallest offset the kernel
-    /// allows above it.
+    /// Row lengths with odd block counts included (288 = 9 blocks of 32).
+    fn row_lengths(kind: GpuRepackKind) -> &'static [usize] {
+        if kind.gguf_type().block_size() == 32 {
+            &[256, 288, 768, 5120]
+        } else {
+            &[256, 768, 5120]
+        }
+    }
+
+    /// Row-major: rows {1, 3, 64, 130} x `row_lengths` at an aligned offset
+    /// and at the smallest offset the kernel allows above it.
     fn row_major_cases(kind: GpuRepackKind) {
         let rule = band_offset_rule(kind);
         for rows in [1, 3, 64, 130] {
-            for k in [256, 768, 5120] {
+            for &k in row_lengths(kind) {
                 for pad in [32, 32 + rule] {
                     whole_tensor_at(kind, OutLayout::RowMajor, rows, k, pad);
                 }
@@ -463,8 +610,8 @@ mod tests {
     }
 
     /// Bands cut from one staging buffer starting at byte `pad`, so the band
-    /// offsets follow the row byte length (odd K-block counts give Q6_K/Q3_K
-    /// band offsets of 2 mod 4).
+    /// offsets follow the row byte length (odd block counts give band offsets
+    /// of 2 mod 4, or odd ones for MXFP4).
     fn bands_of_one_staging(
         kind: GpuRepackKind,
         layout: OutLayout,
@@ -472,9 +619,8 @@ mod tests {
         k: usize,
         pad: usize,
     ) {
-        let format = kquant_format(kind);
         let rows: usize = splits.iter().sum();
-        let row_bytes = format.row_bytes(k);
+        let row_bytes = row_bytes(kind, k);
         let blocks = random_bytes(rows * row_bytes, (rows * 11 + k + pad) as u64);
         let staging = staging_with(&blocks, pad, 77);
         let (mut dst, _) = RepackDst::alloc(&tensor_info(kind, rows, k), layout).unwrap();
@@ -629,18 +775,120 @@ mod tests {
         );
     }
 
-    /// Q6_K / Q3_K with an odd block count whose last block ends exactly at
-    /// the end of the staging array (byte length 2 mod 4): the band is
-    /// accepted and exact, and one byte less is rejected.
+    #[test]
+    fn gpu_iq4nl_row_matches_cpu_repacker() {
+        if !require_gpu() {
+            return;
+        }
+        row_major_cases(GpuRepackKind::Iq4Nl);
+        bands_of_one_staging(
+            GpuRepackKind::Iq4Nl,
+            OutLayout::RowMajor,
+            &[3, 5, 1],
+            288,
+            2,
+        );
+    }
+
+    #[test]
+    fn gpu_iq4nl_t64_matches_cpu_tiled() {
+        if !require_gpu() {
+            return;
+        }
+        tiled_cases(GpuRepackKind::Iq4Nl);
+        bands_of_one_staging(
+            GpuRepackKind::Iq4Nl,
+            OutLayout::Tiled64,
+            &[64, 128, 64],
+            768,
+            2,
+        );
+    }
+
+    #[test]
+    fn gpu_iq3s_row_matches_cpu_repacker() {
+        if !require_gpu() {
+            return;
+        }
+        row_major_cases(GpuRepackKind::Iq3S);
+        bands_of_one_staging(GpuRepackKind::Iq3S, OutLayout::RowMajor, &[3, 5, 1], 768, 2);
+    }
+
+    #[test]
+    fn gpu_iq3s_t64_matches_cpu_tiled() {
+        if !require_gpu() {
+            return;
+        }
+        tiled_cases(GpuRepackKind::Iq3S);
+        bands_of_one_staging(
+            GpuRepackKind::Iq3S,
+            OutLayout::Tiled64,
+            &[64, 128, 64],
+            768,
+            2,
+        );
+    }
+
+    #[test]
+    fn gpu_q8_0_matches_cpu() {
+        if !require_gpu() {
+            return;
+        }
+        let (dst, ptrs) = RepackDst::alloc(
+            &tensor_info(GpuRepackKind::Q8_0, 3, 288),
+            OutLayout::RowMajor,
+        )
+        .unwrap();
+        assert!(
+            dst.biases.is_none() && ptrs.biases.is_none(),
+            "Q8_0 has no .biases"
+        );
+        row_major_cases(GpuRepackKind::Q8_0);
+        bands_of_one_staging(GpuRepackKind::Q8_0, OutLayout::RowMajor, &[3, 5, 1], 288, 2);
+    }
+
+    /// Odd staging offsets: 17-byte blocks at any byte.
+    #[test]
+    fn gpu_mxfp4_matches_cpu() {
+        if !require_gpu() {
+            return;
+        }
+        row_major_cases(GpuRepackKind::Mxfp4);
+        for pad in [1, 3] {
+            bands_of_one_staging(
+                GpuRepackKind::Mxfp4,
+                OutLayout::RowMajor,
+                &[3, 5, 1],
+                288,
+                pad,
+            );
+        }
+    }
+
+    /// The kinds with blocks at any 2-byte (MXFP4: 1-byte) offset, with an
+    /// odd block count whose last block ends exactly at the end of the
+    /// staging array: the band is accepted and exact, and one byte less is
+    /// rejected.
     #[test]
     fn gpu_tail_word_rounding_safe() {
         if !require_gpu() {
             return;
         }
-        for kind in [GpuRepackKind::Q6K, GpuRepackKind::Q3K] {
-            let (rows, k) = (3usize, 768usize);
-            let format = kquant_format(kind);
-            let blocks = random_bytes(rows * format.row_bytes(k), 41);
+        for kind in [
+            GpuRepackKind::Q6K,
+            GpuRepackKind::Q3K,
+            GpuRepackKind::Iq3S,
+            GpuRepackKind::Iq4Nl,
+            GpuRepackKind::Q8_0,
+            GpuRepackKind::Mxfp4,
+        ] {
+            let rows = 3usize;
+            let k = if kind.gguf_type().block_size() == 32 {
+                288
+            } else {
+                768
+            };
+            let blocks = random_bytes(rows * row_bytes(kind, k), 41);
             for pad in [0usize, 2] {
                 let staging = staging_exact(&blocks, pad, 9);
                 let end = pad + blocks.len();
@@ -693,7 +941,8 @@ mod tests {
     }
 
     /// Every kind accepts a band at its `band_offset_rule` and rejects one
-    /// at half of it: the Rust rule and the C++ table agree.
+    /// at half of it (when the rule is above 1): the Rust rule and the C++
+    /// table agree.
     #[test]
     fn gpu_band_offset_rule_matches_kernel_table() {
         if !require_gpu() {
@@ -702,7 +951,7 @@ mod tests {
         for kind in KINDS {
             let (rows, k) = (64usize, 256usize);
             let rule = band_offset_rule(kind);
-            let blocks = random_bytes(rows * kquant_format(kind).row_bytes(k), 13);
+            let blocks = random_bytes(rows * row_bytes(kind, k), 13);
             let staging = staging_with(&blocks, 2 * rule, 13);
             let (dst, _) =
                 RepackDst::alloc(&tensor_info(kind, rows, k), OutLayout::RowMajor).unwrap();
@@ -722,6 +971,9 @@ mod tests {
                 2 * rule,
                 ok.err()
             );
+            if rule == 1 {
+                continue;
+            }
             let half = rule / 2;
             let (dst, _) =
                 RepackDst::alloc(&tensor_info(kind, rows, k), OutLayout::RowMajor).unwrap();
@@ -748,9 +1000,8 @@ mod tests {
     /// Three bands from three staging buffers at nonzero offsets, chained
     /// through the outputs, equal one whole-tensor band.
     fn split_equals_whole(kind: GpuRepackKind, layout: OutLayout, splits: [usize; 3], k: usize) {
-        let format = kquant_format(kind);
         let rows: usize = splits.iter().sum();
-        let row_bytes = format.row_bytes(k);
+        let row_bytes = row_bytes(kind, k);
         let blocks = random_bytes(rows * row_bytes, (rows * 7 + k) as u64);
         let info = tensor_info(kind, rows, k);
 
@@ -791,7 +1042,9 @@ mod tests {
         }
         for kind in KINDS {
             split_equals_whole(kind, OutLayout::RowMajor, [40, 50, 40], 512);
-            split_equals_whole(kind, OutLayout::Tiled64, [64, 128, 64], 512);
+            if kind.is_kquant() {
+                split_equals_whole(kind, OutLayout::Tiled64, [64, 128, 64], 512);
+            }
         }
     }
 
@@ -802,7 +1055,7 @@ mod tests {
         }
         for kind in KINDS {
             let (rows, k) = (64, 1024);
-            let blocks = random_bytes(rows * kquant_format(kind).row_bytes(k), 99);
+            let blocks = random_bytes(rows * row_bytes(kind, k), 99);
             let (dst, _) =
                 RepackDst::alloc(&tensor_info(kind, rows, k), OutLayout::RowMajor).unwrap();
             let staging = staging_with(&blocks, 16, 5);
@@ -833,7 +1086,7 @@ mod tests {
         }
         let (rows, k) = (64usize, 512usize);
         let kind = GpuRepackKind::Q4K;
-        let blocks = random_bytes(rows * kquant_format(kind).row_bytes(k), 3);
+        let blocks = random_bytes(rows * row_bytes(kind, k), 3);
         let info = tensor_info(kind, rows, k);
         let staging = staging_with(&blocks, 16, 3);
         let cases: [(u64, OutLayout, u32, u32, &str); 4] = [
@@ -859,6 +1112,44 @@ mod tests {
                 err.reason
             );
         }
+
+        let kind = GpuRepackKind::Q8_0;
+        let info = tensor_info(kind, rows, k);
+        let blocks = random_bytes(rows * row_bytes(kind, k), 4);
+        let staging = staging_with(&blocks, 16, 4);
+        let (dst, _) = RepackDst::alloc(&info, OutLayout::RowMajor).unwrap();
+        let err = gpu_repack_band(
+            &staging,
+            16,
+            kind,
+            OutLayout::Tiled64,
+            k as u32,
+            0,
+            rows as u32,
+            dst,
+        )
+        .err()
+        .expect("Q8_0 Tiled64 accepted");
+        assert!(err.reason.contains("no Tiled64"), "{}", err.reason);
+        let (mut dst, _) = RepackDst::alloc(&info, OutLayout::RowMajor).unwrap();
+        dst.biases = Some(
+            MxArray::alloc_uninit(&[rows as i64, 16], DType::Float16)
+                .unwrap()
+                .0,
+        );
+        let err = gpu_repack_band(
+            &staging,
+            16,
+            kind,
+            OutLayout::RowMajor,
+            k as u32,
+            0,
+            rows as u32,
+            dst,
+        )
+        .err()
+        .expect("Q8_0 with a biases array accepted");
+        assert!(err.reason.contains("has no biases"), "{}", err.reason);
     }
 
     #[test]
@@ -896,6 +1187,73 @@ mod tests {
         assert_eq!(s.dtype().unwrap(), DType::Int8);
         let b = dst.biases.as_ref().unwrap();
         assert_eq!(b.shape().unwrap().to_vec(), vec![128, 3]);
+
+        // `load_quantized_tensor`'s arrays: same names' shapes and dtypes,
+        // `.biases` only where it emits one.
+        for ty in [
+            GgufTensorType::Q4_0,
+            GgufTensorType::Q4_1,
+            GgufTensorType::Q5_0,
+            GgufTensorType::Q5_1,
+            GgufTensorType::Q8_0,
+            GgufTensorType::MXFP4,
+        ] {
+            let info = GgufTensorInfo {
+                name: "blk.0.ffn_down_exps.weight".to_string(),
+                n_dims: 3,
+                dims: vec![96, 5, 2],
+                tensor_type: ty,
+                offset: 0,
+            };
+            let (dst, ptrs) = RepackDst::alloc(&info, OutLayout::RowMajor).unwrap();
+            assert_eq!((ptrs.rows, ptrs.k), (10, 96), "{ty:?}");
+            let gguf = GgufFile {
+                version: 3,
+                tensor_count: 1,
+                metadata: HashMap::new(),
+                tensors: vec![info.clone()],
+                alignment: 32,
+                data_offset: 0,
+            };
+            let raw = random_bytes(10 * 3 * ty.type_size(), 8);
+            let want =
+                load_quantized_tensor(&mut std::io::Cursor::new(&raw[..]), &gguf, &info).unwrap();
+            let got: Vec<(&str, Option<&MxArray>)> = vec![
+                (".weight", Some(&dst.weight)),
+                (".scales", dst.scales.as_ref()),
+                (".biases", dst.biases.as_ref()),
+            ];
+            for (suffix, arr) in got {
+                let w = want
+                    .iter()
+                    .find(|(n, _)| n.ends_with(suffix))
+                    .map(|(_, a)| a);
+                match (arr, w) {
+                    (Some(a), Some(w)) => {
+                        assert_eq!(
+                            a.shape().unwrap().to_vec(),
+                            w.shape().unwrap().to_vec(),
+                            "{ty:?} {suffix} shape"
+                        );
+                        assert_eq!(
+                            a.dtype().unwrap(),
+                            w.dtype().unwrap(),
+                            "{ty:?} {suffix} dtype"
+                        );
+                    }
+                    (None, None) => {}
+                    (a, w) => panic!(
+                        "{ty:?} {suffix}: alloc has it {}, loader has it {}",
+                        a.is_some(),
+                        w.is_some()
+                    ),
+                }
+            }
+            assert!(
+                RepackDst::alloc(&info, OutLayout::Tiled64).is_err(),
+                "{ty:?} Tiled64"
+            );
+        }
     }
 }
 
@@ -914,16 +1272,12 @@ pub(crate) mod bench {
         const ITERS: u32 = 4;
         let k = 5120u32;
         let mut failures = Vec::new();
-        for kind in [
-            GpuRepackKind::Q4K,
-            GpuRepackKind::Q5K,
-            GpuRepackKind::Q6K,
-            GpuRepackKind::Iq4Xs,
-            GpuRepackKind::Q3K,
-        ] {
+        for kind in ALL_KINDS {
             for layout in [OutLayout::RowMajor, OutLayout::Tiled64] {
-                let id = kernel_id(kind, layout);
-                let row_bytes = kquant_format(kind).row_bytes(k as usize) as u64;
+                let Ok(id) = kernel_id(kind, layout) else {
+                    continue;
+                };
+                let row_bytes = row_bytes(kind, k as usize) as u64;
                 let rows = (TARGET / row_bytes) / 64 * 64;
                 let src = rows * row_bytes;
                 for fresh in [false, true] {

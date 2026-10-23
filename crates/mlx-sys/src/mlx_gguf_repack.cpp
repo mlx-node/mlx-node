@@ -1,4 +1,4 @@
-// GPU repack of GGUF raw blocks into the K-quant runtime arrays. One
+// GPU repack of GGUF raw blocks into the runtime packed arrays. One
 // `GgufRepackBand` primitive writes one band of rows of one tensor from a
 // uint8 staging buffer into caller-allocated destination arrays: the outputs
 // alias the destination buffers (`copy_shared_buffer`), so bands of one tensor
@@ -29,29 +29,39 @@ namespace {
 
 // Indexed by the kernel id the Rust side passes (`GpuRepackKind` x layout).
 // Each id must stay at its index; new kernels are appended.
+enum class ScaleType { U8, I8, F16 };
+
 struct KernelInfo {
   const char* name;
-  uint32_t block_bytes;     // GGUF bytes per 256-value block
-  uint32_t weight_words;    // .weight uint32 words per block (8 * bits)
+  uint32_t block_values;    // values per GGUF block (256 or 32)
+  uint32_t block_bytes;     // GGUF bytes per block
+  uint32_t weight_words;    // .weight uint32 words per block
   uint32_t scale_bytes;     // .scales bytes per block
-  uint32_t bias_bytes;      // .biases bytes per block
+  uint32_t bias_bytes;      // .biases bytes per block; 0 = no .biases
   uint32_t offset_rule;     // staging byte offset of a band must be a multiple
   uint32_t threads_per_blk; // grid = blocks * threads_per_blk
   bool t64;
-  bool signed_scales;       // .scales int8 instead of uint8
+  ScaleType scales;
 };
 
+using ST = ScaleType;
 constexpr KernelInfo kKernels[] = {
-    {"mlx_node_gguf_repack_q4k", 144, 32, 16, 4, 16, 8, false, false},
-    {"mlx_node_gguf_repack_q4k_t64", 144, 32, 16, 4, 16, 8, true, false},
-    {"mlx_node_gguf_repack_q5k", 176, 40, 16, 4, 16, 8, false, false},
-    {"mlx_node_gguf_repack_q5k_t64", 176, 40, 16, 4, 16, 8, true, false},
-    {"mlx_node_gguf_repack_q6k", 210, 48, 16, 2, 2, 8, false, true},
-    {"mlx_node_gguf_repack_q6k_t64", 210, 48, 16, 2, 2, 8, true, true},
-    {"mlx_node_gguf_repack_iq4xs", 136, 32, 8, 2, 8, 8, false, true},
-    {"mlx_node_gguf_repack_iq4xs_t64", 136, 32, 8, 2, 8, 8, true, true},
-    {"mlx_node_gguf_repack_q3k", 110, 24, 16, 2, 2, 2, false, true},
-    {"mlx_node_gguf_repack_q3k_t64", 110, 24, 16, 2, 2, 2, true, true},
+    {"mlx_node_gguf_repack_q4k", 256, 144, 32, 16, 4, 16, 8, false, ST::U8},
+    {"mlx_node_gguf_repack_q4k_t64", 256, 144, 32, 16, 4, 16, 8, true, ST::U8},
+    {"mlx_node_gguf_repack_q5k", 256, 176, 40, 16, 4, 16, 8, false, ST::U8},
+    {"mlx_node_gguf_repack_q5k_t64", 256, 176, 40, 16, 4, 16, 8, true, ST::U8},
+    {"mlx_node_gguf_repack_q6k", 256, 210, 48, 16, 2, 2, 8, false, ST::I8},
+    {"mlx_node_gguf_repack_q6k_t64", 256, 210, 48, 16, 2, 2, 8, true, ST::I8},
+    {"mlx_node_gguf_repack_iq4xs", 256, 136, 32, 8, 2, 8, 8, false, ST::I8},
+    {"mlx_node_gguf_repack_iq4xs_t64", 256, 136, 32, 8, 2, 8, 8, true, ST::I8},
+    {"mlx_node_gguf_repack_q3k", 256, 110, 24, 16, 2, 2, 2, false, ST::I8},
+    {"mlx_node_gguf_repack_q3k_t64", 256, 110, 24, 16, 2, 2, 2, true, ST::I8},
+    {"mlx_node_gguf_repack_iq4nl", 32, 18, 4, 1, 2, 2, 1, false, ST::I8},
+    {"mlx_node_gguf_repack_iq4nl_t64", 32, 18, 4, 1, 2, 2, 1, true, ST::I8},
+    {"mlx_node_gguf_repack_iq3s", 256, 110, 24, 16, 2, 2, 8, false, ST::U8},
+    {"mlx_node_gguf_repack_iq3s_t64", 256, 110, 24, 16, 2, 2, 8, true, ST::U8},
+    {"mlx_node_gguf_repack_q8_0", 32, 34, 8, 2, 0, 2, 1, false, ST::F16},
+    {"mlx_node_gguf_repack_mxfp4", 32, 17, 4, 1, 0, 1, 1, false, ST::U8},
 };
 constexpr int kKernelCount = int(sizeof(kKernels) / sizeof(kKernels[0]));
 
@@ -65,7 +75,7 @@ void write_error(char* err, size_t cap, const std::string& msg) {
 #ifdef MLX_NODE_METAL_ENABLED
 using namespace mlx::core;
 
-constexpr uint32_t kValuesPerBlock = 256;
+constexpr uint32_t kValuesPerUnit = 32;
 constexpr uint32_t kTileRows = 64;
 constexpr uint32_t kThreadgroup = 256;
 
@@ -80,6 +90,18 @@ struct GgufRepackParams {
   uint32_t tile0;
 };
 static_assert(sizeof(GgufRepackParams) == 32, "GgufRepackParams layout");
+
+Dtype scale_dtype(const KernelInfo& info) {
+  switch (info.scales) {
+    case ScaleType::I8:
+      return int8;
+    case ScaleType::F16:
+      return float16;
+    case ScaleType::U8:
+      break;
+  }
+  return uint8;
+}
 
 MTL::ComputePipelineState* repack_kernel(metal::Device& device, int kernel) {
   return fast::paged::get_prebuilt_kernel(device, "gguf_repack", "GGUF repack",
@@ -192,14 +214,15 @@ BandPlan plan_band(int kernel, uint32_t k, uint32_t row0, uint32_t rows,
   expect(kernel >= 0 && kernel < kKernelCount,
          "unknown GGUF repack kernel id " + std::to_string(kernel));
   const auto& info = kKernels[kernel];
-  expect(k > 0 && k % kValuesPerBlock == 0,
-         "K must be a positive multiple of 256, got " + std::to_string(k));
+  expect(k > 0 && k % info.block_values == 0,
+         std::string(info.name) + ": K must be a positive multiple of " +
+             std::to_string(info.block_values) + ", got " + std::to_string(k));
   expect(rows > 0, "band has no rows");
   expect(src_offset % info.offset_rule == 0,
          std::string(info.name) + ": staging offset " +
              std::to_string(src_offset) + " is not a multiple of " +
              std::to_string(info.offset_rule));
-  const uint32_t kb = k / kValuesPerBlock;
+  const uint32_t kb = k / info.block_values;
   const uint64_t nb = uint64_t(rows) * kb;
   expect(nb * info.threads_per_blk <= std::numeric_limits<uint32_t>::max(),
          "band too large for one dispatch");
@@ -215,7 +238,7 @@ BandPlan plan_band(int kernel, uint32_t k, uint32_t row0, uint32_t rows,
   plan.params.src_off = src_offset;
   plan.params.nb = uint32_t(nb);
   plan.params.kb = kb;
-  plan.params.ku = kb * 8;
+  plan.params.ku = kb * (info.block_values / kValuesPerUnit);
   plan.params.row0 = row0;
   plan.params.rows = rows;
   plan.params.tile0 = row0 / kTileRows;
@@ -273,7 +296,9 @@ bool mlx_gguf_repack_available() {
 // `dst_w` / `dst_s` / `dst_b` (the whole tensor's arrays, row-major or
 // Tiled64 per `kernel`). `*out_w` / `*out_s` / `*out_b` receive lazy arrays
 // sharing the destination buffers; the caller adopts them in place of the
-// destination handles. Returns 0, or nonzero with a message in `err`.
+// destination handles. Kernels without `.biases` (Q8_0, MXFP4) take null
+// `dst_b` and leave `*out_b` null (`out_b` may then be null). Returns 0, or
+// nonzero with a message in `err`.
 int32_t mlx_gguf_repack_band(mlx_array* staging, uint64_t src_offset,
                              int32_t kernel, uint32_t k, uint32_t row0,
                              uint32_t rows, mlx_array* dst_w,
@@ -286,11 +311,16 @@ int32_t mlx_gguf_repack_band(mlx_array* staging, uint64_t src_offset,
   write_error(err, err_cap, "");
 #ifdef MLX_NODE_METAL_ENABLED
   try {
-    expect(staging && dst_w && dst_s && dst_b && out_w && out_s && out_b,
-           "null argument");
+    expect(staging && dst_w && dst_s && out_w && out_s, "null argument");
     expect(metal::is_available(), "requires the Metal device");
     const BandPlan plan = plan_band(kernel, k, row0, rows, src_offset);
     const auto& info = kKernels[kernel];
+    const bool has_biases = info.bias_bytes != 0;
+    if (has_biases) {
+      expect(dst_b && out_b, std::string(info.name) + " needs a biases array");
+    } else {
+      expect(!dst_b, std::string(info.name) + " has no biases array");
+    }
     const auto& st = *reinterpret_cast<array*>(staging);
     expect(st.dtype() == uint8, "staging must be uint8");
     expect_dense(st, "staging");
@@ -300,14 +330,17 @@ int32_t mlx_gguf_repack_band(mlx_array* staging, uint64_t src_offset,
 
     const auto& w = *reinterpret_cast<array*>(dst_w);
     const auto& s = *reinterpret_cast<array*>(dst_s);
-    const auto& b = *reinterpret_cast<array*>(dst_b);
     const uint64_t kb = plan.params.kb;
     const uint64_t total = dst_rows(w, uint32, kb * info.weight_words, "weight");
-    expect(dst_rows(s, info.signed_scales ? int8 : uint8, kb * info.scale_bytes,
-                    "scales") == total,
+    const Dtype sdt = scale_dtype(info);
+    expect(dst_rows(s, sdt, kb * info.scale_bytes / size_of(sdt), "scales") ==
+               total,
            "scales rows differ from weight rows");
-    expect(dst_rows(b, float16, kb * info.bias_bytes / 2, "biases") == total,
-           "biases rows differ from weight rows");
+    if (has_biases) {
+      const auto& b = *reinterpret_cast<array*>(dst_b);
+      expect(dst_rows(b, float16, kb * info.bias_bytes / 2, "biases") == total,
+             "biases rows differ from weight rows");
+    }
     expect(uint64_t(row0) + rows <= total, "band runs past the last row");
     if (info.t64) {
       expect(total % kTileRows == 0, "Tiled64 tensor rows must be a multiple of 64");
@@ -315,12 +348,22 @@ int32_t mlx_gguf_repack_band(mlx_array* staging, uint64_t src_offset,
 
     auto stream = default_stream(Device::gpu);
     auto primitive = std::make_shared<GgufRepackBand>(stream, kernel, plan.params);
-    auto outputs = array::make_arrays({w.shape(), s.shape(), b.shape()},
-                                      {w.dtype(), s.dtype(), b.dtype()},
-                                      primitive, {st, w, s, b});
+    std::vector<Shape> shapes{w.shape(), s.shape()};
+    std::vector<Dtype> dtypes{w.dtype(), s.dtype()};
+    std::vector<array> inputs{st, w, s};
+    if (has_biases) {
+      const auto& b = *reinterpret_cast<array*>(dst_b);
+      shapes.push_back(b.shape());
+      dtypes.push_back(b.dtype());
+      inputs.push_back(b);
+    }
+    auto outputs = array::make_arrays(std::move(shapes), dtypes, primitive,
+                                      std::move(inputs));
     *out_w = reinterpret_cast<mlx_array*>(new array(std::move(outputs[0])));
     *out_s = reinterpret_cast<mlx_array*>(new array(std::move(outputs[1])));
-    *out_b = reinterpret_cast<mlx_array*>(new array(std::move(outputs[2])));
+    if (has_biases) {
+      *out_b = reinterpret_cast<mlx_array*>(new array(std::move(outputs[2])));
+    }
     return 0;
   } catch (const std::exception& e) {
     write_error(err, err_cap, std::string("mlx_gguf_repack_band: ") + e.what());
@@ -348,9 +391,10 @@ double mlx_gguf_repack_bench_gpu_seconds(int32_t kernel, uint64_t src_bytes,
     expect(metal::is_available(), "requires the Metal device");
     expect(kernel >= 0 && kernel < kKernelCount, "unknown kernel id");
     expect(iters > 0, "iters must be positive");
-    expect(k > 0 && k % kValuesPerBlock == 0, "K must be a multiple of 256");
     const auto& info = kKernels[kernel];
-    const uint64_t row_bytes = uint64_t(k / kValuesPerBlock) * info.block_bytes;
+    expect(k > 0 && k % info.block_values == 0,
+           "K must be a multiple of the block values");
+    const uint64_t row_bytes = uint64_t(k / info.block_values) * info.block_bytes;
     uint64_t rows = src_bytes / row_bytes;
     if (info.t64) rows -= rows % kTileRows;
     expect(rows > 0 && rows <= std::numeric_limits<int32_t>::max(),
@@ -368,12 +412,17 @@ double mlx_gguf_repack_bench_gpu_seconds(int32_t kernel, uint64_t src_bytes,
     }
 
     const uint64_t kb = plan.params.kb;
+    const Dtype sdt = scale_dtype(info);
     auto make_outs = [&] {
-      return std::vector<array>{
+      std::vector<array> o{
           alloc_array({int32_t(rows), int32_t(kb * info.weight_words)}, uint32),
-          alloc_array({int32_t(rows), int32_t(kb * info.scale_bytes)},
-                      info.signed_scales ? int8 : uint8),
-          alloc_array({int32_t(rows), int32_t(kb * info.bias_bytes / 2)}, float16)};
+          alloc_array({int32_t(rows), int32_t(kb * info.scale_bytes / size_of(sdt))},
+                      sdt)};
+      if (info.bias_bytes != 0) {
+        o.push_back(alloc_array(
+            {int32_t(rows), int32_t(kb * info.bias_bytes / 2)}, float16));
+      }
+      return o;
     };
     std::vector<std::vector<array>> outs;
     outs.push_back(make_outs());

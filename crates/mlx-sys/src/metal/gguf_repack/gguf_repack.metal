@@ -1,5 +1,6 @@
-// GGUF raw blocks -> the K-quant runtime arrays (`.weight` uint32, `.scales`
-// uint8 / int8, `.biases` float16), row-major or Tiled64, for one band of rows
+// GGUF raw blocks -> the runtime packed arrays (`.weight` uint32, `.scales`
+// uint8 / int8 / float16, `.biases` float16 when the format has them),
+// row-major or Tiled64, for one band of rows
 // of a tensor. build.rs prebuilds this file into paged_attn.metallib; the host
 // names below must match the kernel table in mlx_gguf_repack.cpp, which
 // gguf_repack_metallib_names checks both ways.
@@ -7,8 +8,9 @@
 // The staging bytes of the band start at `src_off`; output positions are
 // global (band row `row0`, Tiled64 tile `tile0 = row0 / 64`), so bands of one
 // tensor written in any order give the same arrays as one whole-tensor band.
-// Every output byte must equal the CPU repacker (gguf_kquant.rs
-// KQuantRepacker, then kquant_tile_rows for Tiled64).
+// Every output byte must equal the CPU loader: gguf_kquant.rs KQuantRepacker
+// (then kquant_tile_rows for Tiled64) for the K-quants, gguf.rs
+// load_quantized_tensor for Q8_0 and MXFP4.
 
 #include <metal_stdlib>
 
@@ -499,4 +501,196 @@ static inline uint2 iq4xs_scales(uint w0, uint w1) {
     ((device uint4*)scales)[oo] = q3k_scales(r, B);
     ((device ushort*)biases)[oo] = ldh(r, B + 108u);
   }
+}
+
+// ---------------------------------------------------------------- 32-value blocks
+// IQ4_NL (18 B), Q8_0 (34 B) and MXFP4 (17 B) blocks cover 32 values: one
+// thread per block, kb = ku = blocks per row.
+
+// `ldu` for a run that ends at the block's last byte: when misaligned the
+// extra word is read as a 2-byte load, so nothing past the run is read.
+template <int N>
+static inline void ldu_end(const device uint* r, uint off, thread uint* o) {
+  uint i = off >> 2, sh = (off & 2u) << 3;
+  uint w[N + 1];
+#pragma unroll
+  for (int k = 0; k < N; k++) w[k] = r[i + k];
+  w[N] = sh ? (uint)((const device ushort*)(r + i + N))[0] : 0u;
+#pragma unroll
+  for (int k = 0; k < N; k++) o[k] = fun16(w[k], w[k + 1], sh);
+}
+
+// 16 nibble bytes q0..q3 -> 4 words: codes 0..15 the low nibbles, 16..31 the
+// high nibbles.
+static inline uint4 nib32(uint q0, uint q1, uint q2, uint q3) {
+  return uint4(nib8(q0, q1), nib8(q2, q3), nib8(q0 >> 4, q1 >> 4),
+               nib8(q2 >> 4, q3 >> 4));
+}
+
+// IQ4_NL: d @0, qs @2 (16). `.scales` int8 1, `.biases` d.
+static inline uint4 iq4nl_block(const device uint* r, uint B) {
+  uint q[4];
+  ldu_end<4>(r, B + 2u, q);
+  return nib32(q[0], q[1], q[2], q[3]);
+}
+
+[[kernel]] void mlx_node_gguf_repack_iq4nl(
+    const device uchar* staging [[buffer(0)]],
+    device uint* weight [[buffer(1)]],
+    device char* scales [[buffer(2)]],
+    device half* biases [[buffer(3)]],
+    constant GgufRepackParams& p [[buffer(4)]],
+    uint g [[thread_position_in_grid]]) {
+  if (g >= p.nb) return;
+  const device uint* r = word_base(staging, p.src_off);
+  uint B = (uint)(p.src_off & 3ul) + g * 18u;
+  ulong gb = (ulong)p.row0 * p.kb + g;
+  ((device uint4*)weight)[gb] = iq4nl_block(r, B);
+  scales[gb] = 1;
+  ((device ushort*)biases)[gb] = ldh(r, B);
+}
+
+[[kernel]] void mlx_node_gguf_repack_iq4nl_t64(
+    const device uchar* staging [[buffer(0)]],
+    device uint* weight [[buffer(1)]],
+    device char* scales [[buffer(2)]],
+    device half* biases [[buffer(3)]],
+    constant GgufRepackParams& p [[buffer(4)]],
+    uint g [[thread_position_in_grid]]) {
+  if (g >= p.nb) return;
+  const device uint* r = word_base(staging, p.src_off);
+  uint rr = g & 63u, rest = g >> 6, U = rest % p.ku, T = rest / p.ku;
+  uint b = (T * 64u + rr) * p.kb + U;
+  uint B = (uint)(p.src_off & 3ul) + b * 18u;
+  ulong oo = (ulong)p.tile0 * p.ku * 64u + g;
+  ((device uint4*)weight)[oo] = iq4nl_block(r, B);
+  scales[oo] = 1;
+  ((device ushort*)biases)[oo] = ldh(r, B);
+}
+
+// ---------------------------------------------------------------- IQ3_S
+// 110-byte blocks: d @0, qs @2 (64), qh @66 (8), signs @74 (32), scales @106
+// (4). Unit u -> words le32(qs + 8u), le32(qs + 8u + 4), le32(signs + 4u);
+// `.scales` per unit (qh[u], scale nibble u). One thread per unit:
+// grid = nb * 8.
+
+static inline void iq3s_unit(const device uint* r, uint B, uint u,
+                             thread uint* o) {
+  uint q[2], s[1];
+  ldu<2>(r, B + 2u + 8u * u, q);
+  ldu<1>(r, B + 74u + 4u * u, s);
+  o[0] = q[0];
+  o[1] = q[1];
+  o[2] = s[0];
+}
+
+// Two nibbles per byte of x (low 16 bits) -> 4 bytes, low nibble first.
+static inline uint nibbytes(uint x) {
+  return (x & 0xFu) | ((x & 0xF0u) << 4) | ((x & 0xF00u) << 8) |
+      ((x & 0xF000u) << 12);
+}
+
+static inline uint4 iq3s_scales(const device uint* r, uint B) {
+  uint h[2];
+  ldu<2>(r, B + 66u, h);
+  uint sc = (uint)ldh(r, B + 106u) | ((uint)ldh(r, B + 108u) << 16);
+  uint n0 = nibbytes(sc), n1 = nibbytes(sc >> 16);
+  return uint4(il2(h[0], n0), il2(h[0] >> 16, n0 >> 16), il2(h[1], n1),
+               il2(h[1] >> 16, n1 >> 16));
+}
+
+[[kernel]] void mlx_node_gguf_repack_iq3s(
+    const device uchar* staging [[buffer(0)]],
+    device uint* weight [[buffer(1)]],
+    device uchar* scales [[buffer(2)]],
+    device half* biases [[buffer(3)]],
+    constant GgufRepackParams& p [[buffer(4)]],
+    uint g [[thread_position_in_grid]]) {
+  if (g >= p.nb * 8u) return;
+  const device uint* r = word_base(staging, p.src_off);
+  uint b = g >> 3, u = g & 7u;
+  uint B = (uint)(p.src_off & 3ul) + b * 110u;
+  uint o[3];
+  iq3s_unit(r, B, u, o);
+  ulong gb = (ulong)p.row0 * p.kb + b;
+  device uint* w = weight + (gb * 8u + u) * 3u;
+  w[0] = o[0];
+  w[1] = o[1];
+  w[2] = o[2];
+  if (u == 0) {
+    ((device uint4*)scales)[gb] = iq3s_scales(r, B);
+    ((device ushort*)biases)[gb] = ldh(r, B);
+  }
+}
+
+[[kernel]] void mlx_node_gguf_repack_iq3s_t64(
+    const device uchar* staging [[buffer(0)]],
+    device uint* weight [[buffer(1)]],
+    device uchar* scales [[buffer(2)]],
+    device half* biases [[buffer(3)]],
+    constant GgufRepackParams& p [[buffer(4)]],
+    uint g [[thread_position_in_grid]]) {
+  if (g >= p.nb * 8u) return;
+  const device uint* r = word_base(staging, p.src_off);
+  uint rr = g & 63u, rest = g >> 6, U = rest % p.ku, T = rest / p.ku;
+  uint s = U >> 3, u = U & 7u, b = (T * 64u + rr) * p.kb + s;
+  uint B = (uint)(p.src_off & 3ul) + b * 110u;
+  uint o[3];
+  iq3s_unit(r, B, u, o);
+  ulong tg = (ulong)p.tile0 + T;
+  device uint* w = weight + ((ulong)p.tile0 * p.ku * 64u + g) * 3u;
+  w[0] = o[0];
+  w[1] = o[1];
+  w[2] = o[2];
+  if (u == 0) {
+    ulong oo = (tg * p.kb + s) * 64u + rr;
+    ((device uint4*)scales)[oo] = iq3s_scales(r, B);
+    ((device ushort*)biases)[oo] = ldh(r, B);
+  }
+}
+
+// ---------------------------------------------------------------- Q8_0
+// 34-byte blocks: d @0, qs @2 (32 int8). MLX affine 8-bit: `.weight` = qs
+// bytes ^ 0x80, `.scales` = d (float16), no `.biases`.
+
+[[kernel]] void mlx_node_gguf_repack_q8_0(
+    const device uchar* staging [[buffer(0)]],
+    device uint* weight [[buffer(1)]],
+    device half* scales [[buffer(2)]],
+    constant GgufRepackParams& p [[buffer(4)]],
+    uint g [[thread_position_in_grid]]) {
+  if (g >= p.nb) return;
+  const device uint* r = word_base(staging, p.src_off);
+  uint B = (uint)(p.src_off & 3ul) + g * 34u;
+  uint q[8];
+  ldu_end<8>(r, B + 2u, q);
+  ulong gb = (ulong)p.row0 * p.kb + g;
+  device uint4* w4 = (device uint4*)weight + gb * 2u;
+  w4[0] = uint4(q[0], q[1], q[2], q[3]) ^ 0x80808080u;
+  w4[1] = uint4(q[4], q[5], q[6], q[7]) ^ 0x80808080u;
+  ((device ushort*)scales)[gb] = ldh(r, B);
+}
+
+// ---------------------------------------------------------------- MXFP4
+// 17-byte blocks (any byte offset; byte loads): E8M0 e @0, qs @1 (16).
+// `.weight` codes 0..15 = low nibbles, 16..31 = high nibbles; `.scales` uint8
+// e; no `.biases`.
+
+static inline uint ldb4(const device uchar* s) {
+  return (uint)s[0] | ((uint)s[1] << 8) | ((uint)s[2] << 16) |
+      ((uint)s[3] << 24);
+}
+
+[[kernel]] void mlx_node_gguf_repack_mxfp4(
+    const device uchar* staging [[buffer(0)]],
+    device uint* weight [[buffer(1)]],
+    device uchar* scales [[buffer(2)]],
+    constant GgufRepackParams& p [[buffer(4)]],
+    uint g [[thread_position_in_grid]]) {
+  if (g >= p.nb) return;
+  const device uchar* s = staging + p.src_off + (ulong)g * 17u;
+  ulong gb = (ulong)p.row0 * p.kb + g;
+  ((device uint4*)weight)[gb] =
+      nib32(ldb4(s + 1), ldb4(s + 5), ldb4(s + 9), ldb4(s + 13));
+  scales[gb] = s[0];
 }

@@ -3238,7 +3238,8 @@ unsafe extern "C-unwind" {
     pub fn mlx_gguf_repack_available() -> bool;
     /// Repack rows `[row0, row0 + rows)` (row length `k`) from `staging`
     /// (uint8, band bytes from `src_offset`) into the destination arrays;
-    /// `*out_*` are lazy arrays sharing the destination buffers. 0 on
+    /// `*out_*` are lazy arrays sharing the destination buffers. Kernels
+    /// without `.biases` take a null `dst_b` and leave `*out_b` null. 0 on
     /// success, nonzero with a NUL-terminated message in `err`.
     pub fn mlx_gguf_repack_band(
         staging: *mut mlx_array,
