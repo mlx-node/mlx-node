@@ -2330,7 +2330,8 @@ mod tests {
         let fx = write_import_fixture("qwen35-dense-untied", &work);
         let clean = GgufPreload::load(&fixture_input(&fx, false)).unwrap();
         let mut input = fixture_input(&fx, false);
-        input.flip = Some(("output_norm.weight".to_string(), 0, 3));
+        // Sign bit of the first F32 value: low mantissa bits vanish in the bf16 pass.
+        input.flip = Some(("output_norm.weight".to_string(), 3, 7));
         let flipped = GgufPreload::load(&input).unwrap();
         let (a, b) = (gate::manifest(&clean.main), gate::manifest(&flipped.main));
         let differ: Vec<&String> = a.keys().filter(|k| a[*k] != b[*k]).collect();
