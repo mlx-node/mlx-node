@@ -8259,16 +8259,6 @@ async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) 
     prepare_native_gguf_inner(input_path, cache_root, NativeGgufFamily::Qwen35, None).await
 }
 
-/// Prepare a sparse Qwen3.5 (`qwen35moe`) GGUF for native loading.
-///
-/// Shares the dense Qwen3.5 native cache, layout preservation, and standalone
-/// geometry validation; the only differences are the family's MoE rename table
-/// and its own cache-key layout tag.
-pub(crate) async fn prepare_qwen35_moe_native_gguf(input_path: &Path) -> Result<PathBuf> {
-    let cache_root = native_gguf_cache_root()?;
-    prepare_qwen35_moe_native_gguf_inner(input_path, &cache_root).await
-}
-
 #[cfg(test)]
 pub(super) async fn prepare_qwen35_moe_native_gguf_in(
     input_path: &Path,
@@ -8283,6 +8273,7 @@ pub(super) async fn prepare_qwen35_moe_native_gguf_in(
     prepare_qwen35_moe_native_gguf_inner(input_path, &cache_root).await
 }
 
+#[cfg(test)]
 async fn prepare_qwen35_moe_native_gguf_inner(
     input_path: &Path,
     cache_root: &Path,

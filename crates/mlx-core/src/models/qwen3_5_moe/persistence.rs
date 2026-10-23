@@ -1,7 +1,7 @@
 use crate::vision::qwen::weights::{load_vision_weights, parse_vision_config};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
@@ -11,10 +11,11 @@ use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::cold_tier::{CheckpointLoadGuard, resolve_persist_cold};
+use crate::engine::checkpoint_source::CheckpointSource;
 use crate::engine::persistence::{
     KeyRule, RenameSpec, WRAPPER_STRIP_PREFIXES, apply_rename_spec, dequant_fp8_weights,
-    get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
-    prewarm_checkpoint_pages, strip_qwen35_vision_weight_prefix,
+    get_config_bool, get_config_f64, get_config_i32, load_checkpoint, prewarm_checkpoint_pages,
+    strip_qwen35_vision_weight_prefix,
 };
 use crate::models::mtp_drafter::{DrafterBodyVariant, MTP_MOE_LAYER_LINEAR_SUFFIXES};
 use crate::models::paged_config::PagedCacheConfig;
@@ -31,6 +32,7 @@ use crate::models::qwen3_5::persistence::{
 use crate::nn::Linear;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+use crate::utils::gguf_import::{GgufPreload, PreloadInput};
 use crate::vision::qwen::encoder::QwenVisionEncoder;
 use crate::vision::qwen::processing::QwenImageProcessor;
 
@@ -1757,17 +1759,61 @@ pub async fn load_with_thread(
     draft_model_path: Option<String>,
     kv_format: Option<crate::transformer::KvFormat>,
 ) -> Result<Qwen3_5MoeModel> {
+    load_with_source(
+        &CheckpointSource::Dir(PathBuf::from(model_path)),
+        draft_model_path,
+        kv_format,
+    )
+    .await
+}
+
+/// The text weights of the checkpoint: a GGUF preload when `preload_input` is
+/// set (`path` is then its asset directory and holds no weights), else the
+/// safetensors in `path`. Runs on the model thread.
+fn load_moe_weights(
+    path: &Path,
+    preload_input: Option<&PreloadInput>,
+) -> Result<HashMap<String, MxArray>> {
+    let mut preload = preload_input.map(GgufPreload::load).transpose()?;
+    if let Some(preload) = preload.as_ref() {
+        let stats = &preload.stats;
+        info!(
+            "GGUF preload: {} bytes in {:.2} s (read wait {:.2} s, page cache {}), \
+             {} GPU-repacked and {} other tensors",
+            stats.bytes,
+            stats.preload_secs,
+            stats.read_secs,
+            if stats.nocache { "off" } else { "on" },
+            stats.gpu_tensors,
+            stats.cpu_tensors,
+        );
+    }
+    load_checkpoint(path, false, preload.as_mut())
+}
+
+/// The caller releases `source`'s lease when this fails.
+pub(crate) async fn load_with_source(
+    source: &CheckpointSource,
+    draft_model_path: Option<String>,
+    kv_format: Option<crate::transformer::KvFormat>,
+) -> Result<Qwen3_5MoeModel> {
     // Snapshot once, before spawning; forward/compiled graphs never read this
     // diagnostic setting and another load cannot change an existing model.
     let source_norm_request = super::source_norms::SourceNormRequest::capture()?;
     let source_qk_request = super::source_qk::SourceQkRequest::capture()?;
     let source_moe_policy = super::source_math_policy::SourceMoePolicy::capture()?
         .with_qk_requested(source_qk_request.is_some());
-    // Retained for the public wrapper: a direct GGUF load hands this loader the
-    // native-packed cache, and the TS streaming wrappers read the tokenizer
-    // from here rather than from the `.gguf` source path.
-    let model_assets_path = model_path.to_string();
+    // The TS streaming wrappers read the tokenizer from the asset directory,
+    // never from the `.gguf` source path.
+    let model_assets_path = source.asset_dir().to_string_lossy().into_owned();
     let model_path = model_assets_path.clone();
+    let preload_input = match source {
+        CheckpointSource::Dir(_) => None,
+        CheckpointSource::Gguf(checkpoint) => {
+            checkpoint.check_asset_config()?;
+            Some(checkpoint.preload_input(false))
+        }
+    };
 
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
         move || {
@@ -1836,8 +1882,7 @@ pub async fn load_with_thread(
                     && !source_moe_policy.active();
                 let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
 
-                // Load all weights
-                let mut raw_params = load_all_safetensors(path, false)?;
+                let mut raw_params = load_moe_weights(path, preload_input.as_ref())?;
 
                 // Second snapshot, against the same inodes the mmap pinned;
                 // paired with the after-fingerprint snapshot below it brackets
@@ -2526,6 +2571,69 @@ pub fn create_random_qwen35_moe_checkpoint<'env>(
 mod tests {
     use crate::models::mtp_drafter::strip_wrapper_prefix;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn moe_loader_uses_preload_not_files() {
+        use super::{CheckpointSource, load_moe_weights};
+        use crate::engine::persistence::load_all_safetensors;
+        use crate::utils::gguf::NativeGgufFamily;
+        use crate::utils::gguf_import::gate::manifest;
+        use crate::utils::gguf_test_fixtures::{prepare_import_fixture, write_import_fixture};
+
+        let work = std::env::temp_dir().join(format!("mlx-moe-preload-{}", uuid::Uuid::new_v4()));
+        let fx = write_import_fixture("qwen35moe-3d-experts", &work.join("src"));
+        let converted = prepare_import_fixture(&fx, &work.join("old-cache")).await;
+        let want = manifest(&load_all_safetensors(&converted, false).unwrap());
+
+        let source = CheckpointSource::resolve_in(
+            &fx.main,
+            NativeGgufFamily::Qwen35Moe,
+            Some(&work.join("cache")),
+        )
+        .await
+        .unwrap();
+        let CheckpointSource::Gguf(ckpt) = &source else {
+            panic!("the MoE GGUF resolved to a plain directory");
+        };
+        ckpt.check_asset_config().unwrap();
+        let weight_files: Vec<_> = std::fs::read_dir(&ckpt.asset_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".safetensors")
+            })
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            weight_files.is_empty(),
+            "the asset directory holds weight files: {weight_files:?}"
+        );
+
+        let loaded = load_moe_weights(&ckpt.asset_dir, Some(&ckpt.preload_input(false)));
+        assert!(
+            loaded.is_ok(),
+            "the MoE loader did not take its weights from the preload: {}",
+            loaded
+                .as_ref()
+                .err()
+                .map(|e| e.reason.as_str())
+                .unwrap_or_default()
+        );
+        let got = manifest(&loaded.unwrap());
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "preload tensor count differs from the converted checkpoint"
+        );
+        for (name, entry) in &want {
+            assert_eq!(got.get(name), Some(entry), "tensor {name} differs");
+        }
+        source.release_lease();
+        std::fs::remove_dir_all(&work).ok();
+    }
 
     #[test]
     fn moe_flat_cache_precision_preserves_default_and_explicit_format() {
