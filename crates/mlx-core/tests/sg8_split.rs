@@ -228,7 +228,7 @@ fn sg8_split_compiled_weights_inputs_and_counter_reuse() {
     assert!(gpu_gen() >= 17);
     let _restore = Restore::new();
     setting(true);
-    let id = 0x514B_0000_8;
+    let id = 0x0005_14B0_0008;
     unsafe { mlx_sys::mlx_compiled_graph_erase_matching(u64::MAX, id) };
     let mut state = Builder {
         traces: AtomicUsize::new(0),

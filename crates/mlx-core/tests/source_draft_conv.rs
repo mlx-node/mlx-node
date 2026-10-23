@@ -8,8 +8,10 @@ use std::{
 fn words(path: &Path) -> Vec<u16> {
     std::fs::read(path)
         .unwrap()
-        .chunks_exact(2)
-        .map(|b| u16::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| u16::from_le_bytes(*b))
         .collect()
 }
 fn load(path: &Path, shape: &[i64], view: usize) -> MxArray {
@@ -188,8 +190,10 @@ fn compiled(b: &mut Builder, a: &[MxArray], key: u64) -> Option<Vec<u16>> {
 fn f64_gate(d: &Path, side: i32, got: &[u16]) {
     let refs: Vec<_> = std::fs::read(d.join(format!("oracle-{side}.f64")))
         .unwrap()
-        .chunks_exact(8)
-        .map(|x| f64::from_le_bytes(x.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|x| f64::from_le_bytes(*x))
         .collect();
     assert_eq!(refs.len(), got.len());
     let (mut peak, mut max, mut ss, mut rr) = (0f64, 0f64, 0f64, 0f64);

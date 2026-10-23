@@ -65,8 +65,10 @@ fn oracle(d: &std::path::Path, name: &str, got: &[u32], live: usize) {
     let bytes = std::fs::read(d.join(name)).unwrap();
     assert!(bytes.len() >= live * 2048 * 2);
     let expected: Vec<_> = bytes[..live * 2048 * 2]
-        .chunks_exact(2)
-        .map(|b| u32::from(u16::from_le_bytes([b[0], b[1]])))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| u32::from(u16::from_le_bytes(*b)))
         .collect();
     assert_eq!(
         &got[..live * 2048],
@@ -81,8 +83,10 @@ fn oracle(d: &std::path::Path, name: &str, got: &[u32], live: usize) {
 fn u32file(p: &std::path::Path) -> Vec<u32> {
     std::fs::read(p)
         .unwrap()
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
         .collect()
 }
 pub(super) fn actual(saved: &[MxArray], modes: &[u32], layer: usize) {
@@ -200,8 +204,8 @@ pub(super) fn actual(saved: &[MxArray], modes: &[u32], layer: usize) {
         // Reuse the same graph with changed x and both weight matrices, including
         // a valid nonzero contiguous offset. Compare eager/compiled exact bits.
         let mut a = saved.to_vec();
-        for j in 0..3 {
-            let changed = a[j]
+        for (j, value) in a.iter_mut().enumerate().take(3) {
+            let changed = value
                 .mul_scalar(0.9375 + j as f64 * 0.03125)
                 .unwrap()
                 .astype(DType::BFloat16)
@@ -212,14 +216,14 @@ pub(super) fn actual(saved: &[MxArray], modes: &[u32], layer: usize) {
             let size = shape.iter().product::<i64>();
             let storage = MxArray::concatenate_many(vec![&pad, &flat], Some(0)).unwrap();
             storage.eval();
-            a[j] = storage
+            *value = storage
                 .slice(&[1], &[size + 1])
                 .unwrap()
                 .reshape(&shape)
                 .unwrap();
-            a[j].eval();
+            value.eval();
             assert_ne!(
-                unsafe { mlx_sys::mlx_array_get_buffer_offset(a[j].as_raw_ptr()) } % 16,
+                unsafe { mlx_sys::mlx_array_get_buffer_offset(value.as_raw_ptr()) } % 16,
                 0
             );
         }

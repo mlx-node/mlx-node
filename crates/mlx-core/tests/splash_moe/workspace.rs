@@ -278,8 +278,8 @@ pub(super) fn actual_workspace_replay(
         {
             let m = if mode >= 3 { 8 } else { m };
             let mut a = saved.to_vec();
-            for j in 0..if mode >= 3 { 1 } else { 3 } {
-                a[j] = rows(&a[j], m)
+            for value in a.iter_mut().take(if mode >= 3 { 1 } else { 3 }) {
+                *value = rows(value, m)
                     .mul_scalar(1.0 + iteration as f64 * 0.015625)
                     .unwrap()
                     .astype(DType::BFloat16)

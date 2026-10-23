@@ -150,7 +150,10 @@ impl Qwen35MoeDFlash2Stepper<'_> {
                 .ok_or_else(|| Error::from_reason("deferred GDN caches missing"))?,
         )?;
         self.gdn_blobs = Some(next);
-        let state = self.deferred_gdn.as_mut().expect("borrowed deferred state");
+        let state = self
+            .deferred_gdn
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("deferred GDN state missing"))?;
         state.pending = None;
         state.physical_position = self.next_position;
         Ok(())
@@ -168,7 +171,10 @@ impl Qwen35MoeDFlash2Stepper<'_> {
         if !deferred {
             self.settle_pending_gdn(false)?;
         }
-        let state = self.deferred_gdn.as_mut().expect("checked deferred state");
+        let state = self
+            .deferred_gdn
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("deferred GDN state missing"))?;
         let logical = match state.pending.as_ref() {
             Some(pending) if pending.base_position == state.physical_position => {
                 pending.base_position.checked_add(pending.keep as i32)
@@ -554,7 +560,10 @@ impl DsparkStepper for Qwen35MoeDFlash2Stepper<'_> {
             }
         }
         if deferred {
-            let state = self.deferred_gdn.as_mut().expect("checked deferred state");
+            let state = self
+                .deferred_gdn
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("deferred GDN state missing"))?;
             state.physical_position = self.next_position;
             state.pending = Some(PendingGdn {
                 tape,
@@ -2101,8 +2110,7 @@ mod tests {
                     .unwrap()
                     .base_position -= 1;
                 step.finish()
-                    .err()
-                    .expect("invalid pending frontier must reject publication")
+                    .expect_err("invalid pending frontier must reject publication")
             } else {
                 step.finish()?;
                 break;

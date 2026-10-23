@@ -496,7 +496,6 @@ pub(crate) fn forward_dflash2_deferred(
 /// the caller then uses the eager path. Builder or store errors surface as
 /// `Err` and fail the turn closed, because a store may already have published
 /// some layer writes. A later request can use the eager path after reset.
-
 fn forward_dflash2_compiled(
     inner: &mut Qwen35MoeInner,
     input_ids: &MxArray,

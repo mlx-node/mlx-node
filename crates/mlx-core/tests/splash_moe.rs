@@ -78,7 +78,7 @@ fn expected(
             }
         })
         .collect();
-    for (r, input) in x.chunks_exact(H).enumerate() {
+    for (r, input) in x.as_chunks::<H>().0.iter().enumerate() {
         let mut output = vec![0.0f32; H];
         for slot in 0..=TOP {
             let (expert, offset, coefficient) = if slot == TOP {
@@ -1470,15 +1470,15 @@ fn grouped_actual_layer_stage_comparison() {
             assert_eq!(dtype, DType::BFloat16);
             let actual: Vec<f32> = bits.iter().map(|v| f32::from_bits(v << 16)).collect();
             let first = ((first_row * (i64::from(top) + 1) + first_slot) * width) as usize;
-            if let Some(directory) = &source_reference {
-                if stage >= 2 {
-                    let name = if stage == 2 {
-                        "activation-route.bf16"
-                    } else {
-                        "down-route.bf16"
-                    };
-                    source_math_tests::require_source_bits(directory, name, &bits);
-                }
+            if let Some(directory) = &source_reference
+                && stage >= 2
+            {
+                let name = if stage == 2 {
+                    "activation-route.bf16"
+                } else {
+                    "down-route.bf16"
+                };
+                source_math_tests::require_source_bits(directory, name, &bits);
             }
             first_actual.push(actual[first..first + width as usize].to_vec());
             first_native.push(reference[first..first + width as usize].to_vec());
@@ -1492,8 +1492,7 @@ fn grouped_actual_layer_stage_comparison() {
                 "routed",
                 &actual,
                 &reference,
-                top as usize,
-                width as usize,
+                (top as usize, width as usize),
                 false,
             );
             let shared_ok = report_stage_delta(
@@ -1502,8 +1501,7 @@ fn grouped_actual_layer_stage_comparison() {
                 "shared",
                 &actual,
                 &reference,
-                top as usize,
-                width as usize,
+                (top as usize, width as usize),
                 true,
             );
             // Native vector qmv intentionally differs: its BF16 activation
@@ -1577,8 +1575,7 @@ fn grouped_actual_layer_stage_comparison() {
                         "grouped_vs_cpu_f64",
                         &sample_actual[j],
                         reference,
-                        0,
-                        reference.len(),
+                        (0, reference.len()),
                         true,
                     );
                     let _ = report_stage_delta(
@@ -1587,8 +1584,7 @@ fn grouped_actual_layer_stage_comparison() {
                         "native_vs_cpu_f64",
                         &sample_native[j],
                         reference,
-                        0,
-                        reference.len(),
+                        (0, reference.len()),
                         true,
                     );
                 }
@@ -1610,8 +1606,7 @@ fn grouped_actual_layer_stage_comparison() {
             "combined_native_comparison",
             &actual,
             &reference,
-            0,
-            h as usize,
+            (0, h as usize),
             true,
         );
         if let Some(directory) = &source_reference {
@@ -1632,10 +1627,10 @@ fn report_stage_delta(
     part: &str,
     actual: &[f32],
     reference: &[f32],
-    top: usize,
-    width: usize,
+    layout: (usize, usize),
     shared: bool,
 ) -> bool {
+    let (top, width) = layout;
     assert_eq!(actual.len(), reference.len());
     let mut count = 0usize;
     let mut exact = 0usize;

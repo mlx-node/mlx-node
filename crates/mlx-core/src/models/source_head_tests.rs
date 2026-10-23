@@ -18,8 +18,10 @@ fn fixture_projection() -> Result<LinearProj> {
     Ok(LinearProj::Quantized(QuantizedLinear::new(
         MxArray::from_uint32(
             &weights
-                .chunks_exact(4)
-                .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| u32::from_le_bytes(*v))
                 .collect::<Vec<_>>(),
             &[248320, 384],
         )?,
@@ -29,8 +31,10 @@ fn fixture_projection() -> Result<LinearProj> {
         )?,
         Some(MxArray::from_float16(
             &bases
-                .chunks_exact(2)
-                .map(|v| u16::from_le_bytes(v.try_into().unwrap()))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|v| u16::from_le_bytes(*v))
                 .collect::<Vec<_>>(),
             &[248320, 8],
         )?),
@@ -45,8 +49,10 @@ fn input(case: usize) -> Result<MxArray> {
     let bytes = std::fs::read(root().join(format!("case{case}/x.bf16"))).unwrap();
     MxArray::from_bfloat16(
         &bytes
-            .chunks_exact(2)
-            .map(|v| u16::from_le_bytes(v.try_into().unwrap()))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|v| u16::from_le_bytes(*v))
             .collect::<Vec<_>>(),
         &[8, 2048],
     )
@@ -55,8 +61,10 @@ fn input(case: usize) -> Result<MxArray> {
 fn expected(case: usize) -> Vec<u32> {
     std::fs::read(root().join(format!("case{case}/source.f32")))
         .unwrap()
-        .chunks_exact(4)
-        .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|v| u32::from_le_bytes(*v))
         .collect()
 }
 

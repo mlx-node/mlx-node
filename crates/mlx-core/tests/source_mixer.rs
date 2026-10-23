@@ -11,14 +11,18 @@ const N: i64 = 2048;
 const WORDS: usize = 16384 + 3072 + 32;
 fn words16(bytes: &[u8]) -> Vec<u16> {
     bytes
-        .chunks_exact(2)
-        .map(|b| u16::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| u16::from_le_bytes(*b))
         .collect()
 }
 fn words32(bytes: &[u8]) -> Vec<u32> {
     bytes
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
         .collect()
 }
 fn create(bytes: &[u8], dtype: DType, shape: &[i64]) -> MxArray {
@@ -205,8 +209,10 @@ fn assert_f64(d: &Path, got: &[u32], residual: bool) {
     let indices = words32(&std::fs::read(d.join("oracle-indices.u32")).unwrap());
     let reference: Vec<_> = std::fs::read(d.join("oracle.f64"))
         .unwrap()
-        .chunks_exact(8)
-        .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|b| f64::from_le_bytes(*b))
         .collect();
     let res = words16(&std::fs::read(d.join("residual.bf16")).unwrap());
     assert_eq!(indices.len(), 256);

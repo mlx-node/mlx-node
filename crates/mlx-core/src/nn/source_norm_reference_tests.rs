@@ -32,7 +32,9 @@ fn source_norm_check_f64(input: &MxArray, weights: &[f32], output: &MxArray) {
     );
     let input = input.to_float32().unwrap();
     let got = output.to_float32().unwrap();
-    for (x, y) in input.chunks_exact(2048).zip(got.chunks_exact(2048)) {
+    let input_rows = input.as_chunks::<2048>().0;
+    let got_rows = got.as_chunks::<2048>().0;
+    for (x, y) in input_rows.iter().zip(got_rows) {
         let inverse = (x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / 2048.0 + 1e-6)
             .sqrt()
             .recip();

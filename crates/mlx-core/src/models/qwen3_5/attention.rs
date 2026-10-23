@@ -545,10 +545,11 @@ impl Qwen3_5Attention {
     ) -> Result<MxArray> {
         // Source Table16 prep has its own layout. Do not create a native pack
         // that the source consumer cannot use.
-        if residual.is_none() && self.o_proj.supports_prepared_sg8() {
-            if let Some((values, prepared)) = gate_verify_output_prepared(gate, output)? {
-                return self.o_proj.forward_prepared_sg8(&values, Some(&prepared));
-            }
+        if residual.is_none()
+            && self.o_proj.supports_prepared_sg8()
+            && let Some((values, prepared)) = gate_verify_output_prepared(gate, output)?
+        {
+            return self.o_proj.forward_prepared_sg8(&values, Some(&prepared));
         }
         let values = gate_verify_output(
             gate,

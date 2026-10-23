@@ -4,8 +4,10 @@ pub(super) fn require_source_bits(directory: &std::path::Path, name: &str, actua
     let bytes = std::fs::read(directory.join(name)).unwrap();
     assert_eq!(bytes.len(), actual.len() * 2, "source stage length: {name}");
     let expected: Vec<u32> = bytes
-        .chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]) as u32)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| u16::from_le_bytes(*b) as u32)
         .collect();
     let mismatches = actual.iter().zip(&expected).filter(|(a, b)| a != b).count();
     eprintln!(

@@ -9,8 +9,10 @@ const WORDS: usize = 8 * 256 + 2 * 8 * 9;
 fn load_bf(path: &Path, shape: &[i64]) -> MxArray {
     let bytes = std::fs::read(path).unwrap();
     let values: Vec<_> = bytes
-        .chunks_exact(2)
-        .map(|b| half::bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| half::bf16::from_bits(u16::from_le_bytes(*b)).to_f32())
         .collect();
     assert_eq!(values.len(), shape.iter().product::<i64>() as usize);
     MxArray::from_float32(&values, shape)
@@ -21,8 +23,10 @@ fn load_bf(path: &Path, shape: &[i64]) -> MxArray {
 fn words(path: &Path) -> Vec<u32> {
     std::fs::read(path)
         .unwrap()
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
         .collect()
 }
 fn raw(a: &[MxArray]) -> *mut mlx_sys::mlx_array {
@@ -157,7 +161,7 @@ fn source_router_exact_original_fixtures_and_one_trace_replay() {
     unsafe { mlx_sys::mlx_compiled_graph_erase_matching(u64::MAX, key) };
     for (index, layer) in [0, 5, 10, 39, 0].into_iter().enumerate() {
         let d = root.join(format!("layer{layer}"));
-        let original = vec![
+        let original = [
             load_bf(&d.join("x.bf16"), &[8, 2048]),
             load_bf(&d.join("router.bf16"), &[256, 2048]),
             load_bf(&d.join("shared.bf16"), &[1, 2048]),

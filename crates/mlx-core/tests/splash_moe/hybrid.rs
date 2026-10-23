@@ -109,11 +109,11 @@ fn register_hybrid_selects_exact_column_and_register_stages() {
                     .astype(DType::BFloat16)
                     .unwrap();
                 let (coefficients, ids, shared) = hybrid_routing(&arrays);
-                let mut occupancy = vec![0usize; E];
+                let mut occupancy = [0usize; E];
                 for &expert in &ids {
                     occupancy[expert as usize] += 1;
                 }
-                assert!(occupancy.iter().any(|&n| n == first_occupancy));
+                assert!(occupancy.contains(&first_occupancy));
                 let mut down_bits = Vec::new();
                 for stage in 1..=4 {
                     hybrid_flags(false, false);

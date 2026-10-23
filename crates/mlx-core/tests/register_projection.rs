@@ -145,8 +145,8 @@ fn register_projection_cpu_oracle() {
     let mut peak = 0.0f64;
     let mut squared_error = 0.0f64;
     let mut squared_reference = 0.0f64;
-    for (r, input) in input.chunks_exact(K as usize).enumerate() {
-        for (n, w) in decoded.chunks_exact(K as usize).enumerate() {
+    for (r, input) in input.as_chunks::<{ K as usize }>().0.iter().enumerate() {
+        for (n, w) in decoded.as_chunks::<{ K as usize }>().0.iter().enumerate() {
             let reference = w
                 .iter()
                 .zip(input)

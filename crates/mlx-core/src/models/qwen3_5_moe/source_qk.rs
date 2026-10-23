@@ -53,12 +53,14 @@ fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 fn values(bytes: &[u8]) -> Result<Vec<f32>> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(error("incomplete F32 value"));
     }
     let v: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|x| f32::from_le_bytes(*x))
         .collect();
     if v.iter().any(|x| !x.is_finite()) {
         return Err(error("nonfinite operand"));
@@ -179,8 +181,12 @@ impl SourceQkRequest {
                 validate_rounding(source, &native.to_uint16_native()?)?;
                 pair.push(MxArray::from_float32(source, &[256])?);
             }
-            let k = pair.pop().unwrap();
-            let q = pair.pop().unwrap();
+            let k = pair
+                .pop()
+                .ok_or_else(|| error("incomplete source QK operand pair"))?;
+            let q = pair
+                .pop()
+                .ok_or_else(|| error("incomplete source QK operand pair"))?;
             norms.push((layer, q, k));
         }
         Ok(SourceQkWeights {

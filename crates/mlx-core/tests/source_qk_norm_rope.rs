@@ -8,15 +8,19 @@ use std::{
 fn u16s(path: &Path) -> Vec<u16> {
     std::fs::read(path)
         .unwrap()
-        .chunks_exact(2)
-        .map(|x| u16::from_le_bytes(x.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|x| u16::from_le_bytes(*x))
         .collect()
 }
 fn f32s(path: &Path) -> Vec<f32> {
     std::fs::read(path)
         .unwrap()
-        .chunks_exact(4)
-        .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|x| f32::from_le_bytes(*x))
         .collect()
 }
 fn bf_view(values: &[u16], heads: usize, view: usize) -> MxArray {
