@@ -358,6 +358,7 @@ fn compile_paged_attn_metallib(
         "segmented_sdpa/sdpa_segmented.metal",
         "segmented_sdpa/sdpa_segmented_nax.metal",
         "affine_mixed/affine_qmv_wide_mixed.metal",
+        "gguf_repack/gguf_repack.metal",
     ] {
         let args = vec![
             "-x".to_string(),

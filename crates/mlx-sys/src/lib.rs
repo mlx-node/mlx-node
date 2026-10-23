@@ -3201,3 +3201,75 @@ unsafe extern "C" {
         bases: *mut mlx_array,
     ) -> *mut mlx_array;
 }
+
+unsafe extern "C-unwind" {
+    // Row-contiguous array over a fresh uninitialized allocator buffer
+    // (`mlx_array_alloc.cpp`); `*out_data` receives its CPU-visible storage.
+    // Null (and `*out_data` null) on a bad shape or dtype or allocator failure.
+    pub fn mlx_array_alloc_uninit(
+        shape: *const i64,
+        ndim: usize,
+        dtype: i32,
+        out_data: *mut *mut std::ffi::c_void,
+    ) -> *mut mlx_array;
+    // Ops pinned to the CPU device per call (the default device is untouched).
+    // Null on error.
+    pub fn mlx_array_astype_cpu(handle: *mut mlx_array, dtype: i32) -> *mut mlx_array;
+    pub fn mlx_array_log_cpu(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_negative_cpu(handle: *mut mlx_array) -> *mut mlx_array;
+    /// Same scalar dtype rule as `mlx_array_mul_scalar`.
+    pub fn mlx_array_mul_scalar_cpu(handle: *mut mlx_array, value: f64) -> *mut mlx_array;
+    /// MLX `dequantize` (not the K-quant modes); `biases` may be null; the
+    /// output dtype follows the scales.
+    pub fn mlx_dequantize_cpu(
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::ffi::c_char,
+    ) -> *mut mlx_array;
+    /// TEST-ONLY: device of an unevaluated array's primitive stream: 0 CPU,
+    /// 1 GPU, -1 no primitive.
+    pub fn mlx_array_stream_device_type(handle: *mut mlx_array) -> i32;
+
+    // GGUF GPU repack (`mlx_gguf_repack.cpp`). Without Metal `available` is
+    // false and `band` returns an error.
+    pub fn mlx_gguf_repack_available() -> bool;
+    /// Repack rows `[row0, row0 + rows)` (row length `k`) from `staging`
+    /// (uint8, band bytes from `src_offset`) into the destination arrays;
+    /// `*out_*` are lazy arrays sharing the destination buffers. 0 on
+    /// success, nonzero with a NUL-terminated message in `err`.
+    pub fn mlx_gguf_repack_band(
+        staging: *mut mlx_array,
+        src_offset: u64,
+        kernel: i32,
+        k: u32,
+        row0: u32,
+        rows: u32,
+        dst_w: *mut mlx_array,
+        dst_s: *mut mlx_array,
+        dst_b: *mut mlx_array,
+        out_w: *mut *mut mlx_array,
+        out_s: *mut *mut mlx_array,
+        out_b: *mut *mut mlx_array,
+        err: *mut std::ffi::c_char,
+        err_cap: usize,
+    ) -> i32;
+    /// TEST-ONLY (gate 2): GPU seconds per dispatch over
+    /// `floor(src_bytes / row_bytes)` rows (Tiled64: down to 64 rows);
+    /// negative on error.
+    pub fn mlx_gguf_repack_bench_gpu_seconds(
+        kernel: i32,
+        src_bytes: u64,
+        k: u32,
+        fresh_outputs: bool,
+        iters: u32,
+    ) -> f64;
+    /// TEST-ONLY: kernel table vs the library's `mlx_node_gguf_repack_`
+    /// functions; "missing"/"unexpected" lines into `out`. 0 ok, -1 failure.
+    pub fn mlx_test_gguf_repack_metallib_check(out: *mut std::ffi::c_char, cap: usize) -> i32;
+    /// The kernel table's names, '\n'-joined; returns the length without the
+    /// NUL (written only when `cap` exceeds it).
+    pub fn mlx_gguf_repack_kernel_names(out: *mut std::ffi::c_char, cap: usize) -> usize;
+}
