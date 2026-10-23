@@ -2,6 +2,122 @@ mlx-node contains the third-party material below, which keeps its own license.
 
 Splash (https://github.com/incoai/splash)
 
+The full Apache-2.0 license is reproduced in
+crates/mlx-sys/src/metal/splash_moe/LICENSE.
+
+The grouped GGUF MoE kernels and host plan in
+crates/mlx-sys/src/metal/splash_moe/{abi.h,moe.metal} and
+crates/mlx-sys/src/mlx_splash_moe.cpp are adapted from Splash revision
+1482f6bbc2abf12375332725302019594150b6cb, runtime/ops/MoE.cpp,
+runtime/metal/abi/MoE.h, runtime/metal/kernels/shared/{moe,moe_gguf}.metal
+and runtime/metal/kernels/common/{moe_expert_slab,gguf_column_tile,
+gguf_staged_tile}.h. They preserve GPU expert grouping, dynamic row tiers,
+the sparse column tile, shared expert scheduling and fused gate/up, with
+decoding adapted to mlx-node's three-array quantized storage.
+
+The optional register-based M8 expert path in the same files follows
+runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal and the expert
+schedule in runtime/ops/MoE.hpp at the same revision. It prepares native
+SG8 operands during gather and fused gate/up, retaining BF16 activation
+boundaries and using mlx-node's packed weight and sidecar layout. Splash
+selects its register expert path on Apple9; its use on newer architectures
+here is an independently measured experiment.
+
+The heterogeneous projection dispatch in
+crates/mlx-sys/src/mlx_mixed_projection.cpp and
+crates/mlx-sys/src/metal/mixed_projection/ adapts the fused-segment plan in
+Splash's runtime/ops/LinearGguf.cpp and
+runtime/metal/kernels/shared/gguf_linear.metal at the same revision. It
+reuses the K-quant tile below, retaining each projection's quantization
+format, K split count and separate output.
+
+The single-sequence adaptive verification policy in
+crates/mlx-core/src/models/qwen3_5_moe/verify_budget.rs and the GPU confidence
+and row-budget kernels in
+crates/mlx-sys/src/metal/common/dflash2_{greedy_path_confidence,verify_budget}.metal.inc
+follow Splash's runtime/model/VerifyBudget.{hpp,cpp},
+runtime/ops/DraftSelector.cpp and runtime/metal/kernels/decode/sampling.metal
+at the same revision. The integration keeps a fixed verification shape,
+skips routed-expert work beyond the selected prefix and limits acceptance
+to rows whose target state was verified.
+
+The optional FP32 selector-edge kernel in
+crates/mlx-sys/src/metal/common/dflash2_selector_edges.metal.inc follows
+draft_select_edges in the same sampling.metal source, with existing native
+candidate arrays as inputs and every anchor predecessor row initialized.
+
+The optional D128 draft attention kernel and host bridge in
+crates/mlx-sys/src/metal/dflash2_attention/ and
+crates/mlx-sys/src/mlx_dflash2_attention.cpp adapt the four-split tensor-op
+attention, FP32 online softmax and fixed-order reduction in Splash's
+runtime/metal/kernels/decode/draft.metal at the same revision. Live MLX
+views and an explicit sliding mask replace the source ring addressing;
+dynamic tensor slices bound partial tiles to initialized input rows.
+
+The optional 256-thread target-attention reduction in
+crates/mlx-sys/src/metal/segmented_sdpa/sdpa_segmented_nax.metal adapts
+splash_attention_combine_splits from the same revision's
+runtime/metal/kernels/common/paged_attention_tile.h. It supports native BF16
+partials and optional FP32 partials, bounding the shared weights for up to
+1024 splits. The optional FP32 denominator, page-aligned partitions,
+512-key split policy and flattened dispatch follow
+runtime/ops/PagedAttention.{hpp,cpp} and paged_attention_tile.h. Arbitrary
+split counts require the bounded reducer; the original reducer retains its
+alignment requirements. The optional Q6 head FP32 output policy follows
+Splash's vocabulary projection while retaining native input and weight
+staging arithmetic.
+
+The optional producer-prepared SG8 operands in
+crates/mlx-sys/src/metal/common/{gdn_fused_step,attention_sg8_prepare}.metal.inc
+and their host bridges follow the fused out-projection input preparation in
+runtime/metal/kernels/decode/{gdn,attention_qkv}.metal and
+runtime/metal/kernels/common/gguf_sgmatrix.h. They retain mlx-node's native
+BF16 arithmetic, packing and sum order. The optional SG8 split-K kernels in
+crates/mlx-sys/src/metal/kquant/kquant.h and their launch policy in
+crates/mlx-sys/src/mlx_kquant_register_plan.h follow
+runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal and
+runtime/ops/LinearGguf.cpp, with 32-column tiles and whole 256-input
+superblocks. Both native split kernel families share the source's
+publication and last-arrival reduction protocol through
+crates/mlx-sys/src/metal/kquant/kquant_split_reduce.h.
+
+The optional exact H2048 RMS kernels in
+crates/mlx-sys/src/metal/common/source_norm.metal.inc and their host bridge
+crates/mlx-sys/src/mlx_source_norm.cpp adapt the same revision's
+runtime/metal/kernels/common/rms_inverse.h,
+runtime/metal/kernels/shared/normalization.metal and
+runtime/ops/Normalization.cpp. They preserve the source's ordered
+256-thread reduction, optional 1024-thread staged schedule, FP32 norm
+weights and BF16 input, residual-add and output boundaries.
+
+The optional exact-width Q4 mixer projection in
+crates/mlx-sys/src/mlx_source_mixer.cpp and
+crates/mlx-sys/src/metal/common/source_mixer.metal.inc adapts
+runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal and
+runtime/metal/kernels/common/{gguf_sgmatrix,sgmatrix,split_reduce}.h at
+that revision. It preserves source Table16 packing, 64-column tiles,
+eight whole-superblock K splits, ordered FP32 partial reduction and the
+single BF16 residual epilogue. Native T64 payloads are read through an
+exact integer chunk permutation; weights are not numerically converted.
+The measured-device diagnostic is separate from native SG8 operands.
+
+The optional measured-companion convolution bridge in
+crates/mlx-sys/src/mlx_source_draft_conv.cpp and
+crates/mlx-sys/src/metal/common/source_draft_conv.metal.inc adapts
+runtime/metal/kernels/decode/draft.metal::draft_conv_phase at that
+revision. It preserves the two current-row dynamic taps, ordered FP32
+products and sum, and the finish residual before a single BF16 store.
+The source arithmetic is isolated from the native BF16 operation policy.
+
+The optional strict Q6 vocabulary head in
+crates/mlx-sys/src/mlx_source_head_q6.cpp and
+crates/mlx-sys/src/metal/common/source_head_q6.metal.inc adapts
+runtime/metal/kernels/common/{gguf_staged,gguf_staged_tile,quant_formats}.h
+and runtime/metal/kernels/shared/gguf_linear.metal at that revision.
+It preserves signed-half decoding, the spread K walk, device-A MPP input,
+per-SIMDgroup stage barriers and FP32 output. Only native T64 code and
+metadata addressing is adapted; generic projections remain separate.
+
 The M = 8 K-quant tensor-op kernel in
 crates/mlx-sys/src/metal/kquant/kquant_m8_nax.h (compiled into
 paged_attn.metallib by crates/mlx-sys/src/metal/kquant/kquant_m8_nax.metal)
@@ -53,6 +169,24 @@ early return) — follows the structure of Splash's verify_gdn_fused
 (gdn_decode_scan, gdn_decode_gate) in runtime/metal/kernels/decode/gdn.metal
 and runtime/ops/GDN.cpp, with the arithmetic kept as MLX's rms_norm kernel
 and compiled sigmoid gate so the result equals mlx-node's unfused chain.
+
+The optional source-routing path in
+crates/mlx-sys/src/metal/common/source_routing.metal.inc and its dedicated
+Fast-math JIT encoder in mlx_splash_moe.cpp adapt the FP32 router matrix
+projection, top-k selection, normalization and fused shared scalar gate from
+runtime/metal/kernels/shared/gguf_float.metal, shared/moe.metal,
+common/sgmatrix.h and common/activation.h at the same Splash revision. The
+native BF16 router weights are widened exactly; this diagnostic uses the
+source FP32 arithmetic and retains a separate, explicitly selected policy.
+
+The opt-in original Q/K RMS normalization and RoPE primitive in
+crates/mlx-sys/src/mlx_source_qk_norm_rope.cpp and
+crates/mlx-sys/src/metal/common/source_qk_norm_rope.metal.inc adapts
+Splash common/attention_qkv_prepare.h, common/rms_inverse.h and
+common/target_rope.h at the revision above. It preserves the source
+256-thread reduction, BF16 normalization boundary and FP32 rotary
+arithmetic while accepting separately owned strided MLX inputs.
+
 Splash's LICENSE is the Apache License,
 Version 2.0, whose copyright line it leaves as the template text:
 

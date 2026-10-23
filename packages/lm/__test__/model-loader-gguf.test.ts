@@ -78,8 +78,18 @@ describe('standalone GGUF model detection', () => {
   });
 
   it('rejects kvFormat for other model families', async () => {
+    const { modelPath } = await writeStandaloneGguf('qwen4exp');
+    await expect(loadModel(modelPath, { kvFormat: 'int8' })).rejects.toThrow('only supported by qwen3_5');
+  });
+
+  it('passes a MoE companion and cache precision to the native loader', async () => {
     const { modelPath } = await writeStandaloneGguf('qwen35moe');
-    await expect(loadModel(modelPath, { kvFormat: 'int8' })).rejects.toThrow('only supported by dense qwen3_5');
+    const loaded = {} as Qwen35MoeModel;
+    const loadSpy = vi.spyOn(Qwen35MoeModel, 'load').mockResolvedValue(loaded);
+    await expect(loadModel(modelPath, { draftModelPath: '/moe-draft', kvFormat: 'int8' })).resolves.toBe(loaded);
+    expect(loadSpy).toHaveBeenLastCalledWith(modelPath, { draftModelPath: '/moe-draft', kvFormat: 'int8' });
+    await loadModel(modelPath, { autoLoadDraft: false });
+    expect(loadSpy).toHaveBeenLastCalledWith(modelPath, null);
   });
 
   it('detects Qwen3.8-Flash-Next as its own architecture', async () => {
@@ -126,7 +136,7 @@ describe('standalone GGUF model detection', () => {
     const loaded = {} as Qwen35MoeModel;
     const loadSpy = vi.spyOn(Qwen35MoeModel, 'load').mockResolvedValue(loaded);
     await expect(loadModel(modelPath)).resolves.toBe(loaded);
-    expect(loadSpy).toHaveBeenCalledWith(modelPath);
+    expect(loadSpy).toHaveBeenCalledWith(modelPath, null);
   });
 
   it('recognizes a Gemma4 GGUF file without guessing from its filename', async () => {

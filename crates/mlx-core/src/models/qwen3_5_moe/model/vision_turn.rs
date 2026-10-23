@@ -198,7 +198,9 @@ impl Qwen35MoeInner {
                     if self.config.is_linear_layer(i) {
                         Qwen3_5LayerCache::new_linear()
                     } else {
-                        Qwen3_5LayerCache::new_full_attention()
+                        Qwen3_5LayerCache::new_full_attention_with(
+                            self.config.to_dense_config().kv_format(),
+                        )
                     }
                 })
                 .collect();
@@ -232,7 +234,9 @@ impl Qwen35MoeInner {
                     if self.config.is_linear_layer(i) {
                         Qwen3_5LayerCache::new_linear()
                     } else {
-                        Qwen3_5LayerCache::new_full_attention()
+                        Qwen3_5LayerCache::new_full_attention_with(
+                            self.config.to_dense_config().kv_format(),
+                        )
                     }
                 })
                 .collect();

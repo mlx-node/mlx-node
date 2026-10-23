@@ -18,6 +18,14 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn set_cache_owner_id(&mut self, owner_id: &str, root_owner_id: Option<&str>) {
+        let owner_key = (
+            owner_id.to_owned(),
+            root_owner_id.unwrap_or(owner_id).to_owned(),
+        );
+        if self.dflash2_owner_key.as_ref() != Some(&owner_key) {
+            self.invalidate_dflash2_context();
+            self.dflash2_owner_key = Some(owner_key);
+        }
         self.active_cache_owner_id.clear();
         self.active_cache_owner_id.push_str(owner_id);
         if let Some(root_owner_id) = root_owner_id {
@@ -38,6 +46,17 @@ impl ChatBackend for Qwen35MoeInner {
         Some(&self.gen_defaults)
     }
 
+    fn resolve_params(&self, config: &ChatConfig) -> crate::engine::params::ChatParams {
+        let mut merged = config.clone();
+        crate::engine::apply_generation_defaults(&mut merged, &self.gen_defaults);
+        let mut params = crate::engine::extract_chat_params(&merged);
+        if let Some(draft) = &self.dflash2 {
+            params.mtp_depth = draft.config.block_size;
+            // MoE DFlash keeps physical width fixed and budgets only live GPU rows.
+        }
+        params
+    }
+
     fn extra_eos_ids(&self) -> Vec<u32> {
         self.gen_defaults.eos_token_ids.clone()
     }
@@ -47,6 +66,7 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
+        self.invalidate_dflash2_context();
         match scope {
             // Prefix-miss reset: reset each live layer cache, then install a
             // fresh hybrid cache vec. PRESERVES `cached_token_history` /
@@ -170,6 +190,7 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray> {
+        self.invalidate_dflash2_context();
         // Text-only prefill block (the engine's reset-or-delta split already
         // ran; `self.caches` holds either fresh caches or the live session
         // state). Unlike dense, the MoE `chunked_prefill` returns the
@@ -201,6 +222,7 @@ impl ChatBackend for Qwen35MoeInner {
         Self: 'a;
 
     fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
+        self.invalidate_dflash2_context();
         let is_streaming = self.turn_is_streaming.get();
 
         let embedding = self.embedding.clone();
@@ -229,13 +251,21 @@ impl ChatBackend for Qwen35MoeInner {
             paged_attention: self.paged_adapter.as_ref().map(|_| PagedAttentionPlan {
                 supports_delta: true,
             }),
-            speculative: self.has_mtp_weights().then(qwen35_moe_speculative_plan),
+            speculative: if self.dflash2.is_some() {
+                Some(qwen35_moe_dflash2_plan())
+            } else {
+                self.has_mtp_weights().then(qwen35_moe_speculative_plan)
+            },
         }
     }
 
     fn wired_limit_bytes(&self) -> Option<usize> {
         // Per-turn wired-memory limit = the model's estimated footprint.
-        Some(self.config.estimate_memory_bytes() as usize)
+        let draft = self
+            .dflash2
+            .as_ref()
+            .map_or(0, |draft| draft.weight_bytes as usize);
+        Some((self.config.estimate_memory_bytes() as usize).saturating_add(draft))
     }
 
     fn profiler_label(&self, is_delta: bool, is_streaming: bool) -> &'static str {
@@ -307,17 +337,21 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // The execution plan has already established request opt-in, loaded
-        // MTP weights, flat-cache admission, and text-only input.
         debug_assert!(args.media.is_empty());
-        debug_assert!(matches!(
-            args.plan.decoder,
-            DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
-        ));
-        self.moe_whole_turn(args)
+        match args.plan.decoder {
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel) => self.dflash2_chat_turn(args),
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp) => {
+                self.invalidate_dflash2_context();
+                self.moe_whole_turn(args)
+            }
+            _ => Err(Error::from_reason(
+                "Qwen3.5 MoE received a non-speculative decoder plan",
+            )),
+        }
     }
 
     fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        self.invalidate_dflash2_context();
         self.moe_whole_turn(args)
     }
 }
@@ -339,6 +373,18 @@ pub(super) fn qwen35_moe_speculative_plan() -> SpeculativePlan {
         supported_input_media: MediaCapabilities::NONE,
         supported_context_media: MediaCapabilities::NONE,
         supports_paged_attention: true,
+        supports_streaming: true,
+    }
+}
+
+/// External DFlash2 keeps one authoritative flat target/draft cache lane.
+/// Paged or media turns invalidate its retained taps before advancing state.
+fn qwen35_moe_dflash2_plan() -> SpeculativePlan {
+    SpeculativePlan {
+        kind: SpeculativeKind::DraftModel,
+        supported_input_media: MediaCapabilities::NONE,
+        supported_context_media: MediaCapabilities::NONE,
+        supports_paged_attention: false,
         supports_streaming: true,
     }
 }

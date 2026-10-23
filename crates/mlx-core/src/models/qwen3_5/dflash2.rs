@@ -1,6 +1,6 @@
-//! External DFlash2 drafter for dense Qwen3.8 targets.
+//! External DFlash2 drafter for dense and MoE Qwen3.5/3.8 targets.
 //!
-//! DFlash2 consumes five post-layer target residual streams, runs a five-layer
+//! DFlash2 consumes the checkpoint-selected target residual streams, runs its
 //! parallel draft transformer, and chooses a Markov path through the top-16
 //! token candidates at each position. The drafter shares the target embedding
 //! and language-model head; its checkpoint therefore contains only the draft
@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
@@ -242,7 +243,102 @@ fn memo_sliding_mask(
     Ok(mask)
 }
 
+/// Captured once per loaded companion. A MoE loader may select its measured
+/// structural profile before publishing the model; later environment changes
+/// cannot alter a cached graph or another model's execution policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DraftExecutionPolicy {
+    compile_override: Option<bool>,
+    attention_override: Option<bool>,
+    supported_moe: bool,
+    source_conv_requested: bool,
+    source_conv_supported: bool,
+}
+
+impl DraftExecutionPolicy {
+    #[cfg(test)]
+    fn from_values(
+        compile: Option<&str>,
+        attention: Option<&str>,
+        source_conv: Option<&str>,
+    ) -> Self {
+        Self {
+            compile_override: compile.map(|value| value == "1"),
+            attention_override: attention.map(|value| value == "1"),
+            supported_moe: false,
+            source_conv_requested: source_conv == Some("1"),
+            source_conv_supported: false,
+        }
+    }
+
+    fn capture() -> Self {
+        Self {
+            compile_override: std::env::var_os("MLX_DFLASH2_COMPILE_DRAFT")
+                .map(|value| value == "1"),
+            attention_override: std::env::var_os("MLX_DFLASH2_ATTENTION_NAX")
+                .map(|value| value == "1"),
+            supported_moe: false,
+            source_conv_requested: std::env::var_os("MLX_DFLASH2_SOURCE_CONV")
+                .is_some_and(|value| value == "1"),
+            source_conv_supported: false,
+        }
+    }
+
+    fn with_moe_profile(mut self, supported: bool) -> Self {
+        self.supported_moe = supported;
+        self
+    }
+
+    fn with_source_conv_profile(mut self, supported: bool) -> Self {
+        self.source_conv_supported = supported;
+        self
+    }
+
+    fn source_conv(self) -> bool {
+        self.source_conv_requested && self.supported_moe && self.source_conv_supported
+    }
+
+    fn compile_draft(self) -> bool {
+        self.compile_override.unwrap_or(self.supported_moe)
+    }
+
+    fn tensor_attention(self) -> bool {
+        self.attention_override.unwrap_or(self.supported_moe)
+    }
+}
+
+impl DFlash2Config {
+    fn supports_source_conv(&self, target: [i32; 5]) -> bool {
+        self.supports_moe_execution_defaults(target)
+            && self.target_layers == [1, 6, 11, 16, 22, 27, 32, 37]
+            && self.mask_token_id == 248077
+            && self.vocab_size == 248320
+            && self.max_position_embeddings == 262144
+            && (self.rms_norm_eps as f32).to_bits() == 1e-6f32.to_bits()
+            && (self.rope_theta as f32).to_bits() == 10000000.0f32.to_bits()
+    }
+
+    fn supports_moe_execution_defaults(&self, target: [i32; 5]) -> bool {
+        target == [2048, 40, 256, 8, 512]
+            && self.hidden_size == 2048
+            && self.intermediate_size == 6144
+            && self.target_num_layers == 40
+            && self.target_layers.len() == 8
+            && self.num_hidden_layers == 6
+            && self.num_attention_heads == 32
+            && self.num_key_value_heads == 8
+            && self.head_dim == 128
+            && self.sliding_window == 2048
+            && self.block_size == 7
+            && self.conv_group_size == 16
+            && self.conv_kernel_size == 2
+            && self.selector_rank == 256
+            && self.selector_top_k == 16
+    }
+}
+
 struct DFlash2Attention {
+    tensor_attention_enabled: bool,
     q_proj: LinearProj,
     k_proj: LinearProj,
     v_proj: LinearProj,
@@ -285,15 +381,34 @@ impl DFlash2Attention {
     }
 
     fn project_context(&self, x: &MxArray, base: i32) -> Result<(MxArray, MxArray)> {
+        self.project_context_rows(x, base, None)
+    }
+
+    fn project_context_rows(
+        &self,
+        x: &MxArray,
+        base: i32,
+        retained_rows: Option<i64>,
+    ) -> Result<(MxArray, MxArray)> {
+        let projected_keys = self.k_proj.forward(x)?;
+        let key_prefix = retained_rows
+            .map(|rows| projected_keys.slice_axis(1, 0, rows))
+            .transpose()?;
+        let keys = self.finish_keys(key_prefix.as_ref().unwrap_or(&projected_keys), base)?;
+        let projected_values = self.v_proj.forward(x)?;
+        let value_prefix = retained_rows
+            .map(|rows| projected_values.slice_axis(1, 0, rows))
+            .transpose()?;
         Ok((
-            self.finish_keys(&self.k_proj.forward(x)?, base)?,
-            self.finish_values(&self.v_proj.forward(x)?)?,
+            keys,
+            self.finish_values(value_prefix.as_ref().unwrap_or(&projected_values))?,
         ))
     }
 
     /// `rope(q_norm(q))`, `rope(k_norm(k))` in one dispatch
     /// (`mlx_qk_norm_rope`, bit-identical to the four-op chain) from
     /// `[B, T, H, D]` inputs to `[B, H, T, D]`; `None` on a contract miss.
+    #[cfg(test)]
     fn fused_qk_norm_rope(
         &self,
         queries: &MxArray,
@@ -308,6 +423,21 @@ impl DFlash2Attention {
         }
         let batch = queries.shape_at(0).ok()?;
         let offsets = MxArray::from_int32(&vec![query_base; batch as usize], &[batch]).ok()?;
+        self.fused_qk_norm_rope_offsets(queries, keys, &offsets)
+    }
+
+    fn fused_qk_norm_rope_offsets(
+        &self,
+        queries: &MxArray,
+        keys: &MxArray,
+        offsets: &MxArray,
+    ) -> Option<(MxArray, MxArray)> {
+        if !unsafe { sys::mlx_metal_is_available() }
+            || self.rope.traditional
+            || self.q_norm.eps_f32() != self.k_norm.eps_f32()
+        {
+            return None;
+        }
         let mut out_q = std::ptr::null_mut();
         let mut out_k = std::ptr::null_mut();
         // SAFETY: every handle is a live array for the call; the outputs are
@@ -346,6 +476,17 @@ impl DFlash2Attention {
         max_rows: i64,
     ) -> Result<(MxArray, MxArray, MxArray)> {
         let batch = x.shape_at(0)?;
+        let offsets = MxArray::from_int32(&vec![query_base; batch as usize], &[batch])?;
+        self.project_block_offsets(x, &offsets, max_rows)
+    }
+
+    fn project_block_offsets(
+        &self,
+        x: &MxArray,
+        offsets: &MxArray,
+        max_rows: i64,
+    ) -> Result<(MxArray, MxArray, MxArray)> {
+        let batch = x.shape_at(0)?;
         let seq = x.shape_at(1)?;
         let (queries, keys, values) = match self.qkv_proj.as_ref().filter(|_| seq <= max_rows) {
             Some(qkv_proj) => {
@@ -368,7 +509,7 @@ impl DFlash2Attention {
         };
         let queries = queries.reshape(&[batch, seq, self.num_heads, self.head_dim])?;
         let keys = keys.reshape(&[batch, seq, self.num_kv_heads, self.head_dim])?;
-        let (queries, keys) = match self.fused_qk_norm_rope(&queries, &keys, query_base) {
+        let (queries, keys) = match self.fused_qk_norm_rope_offsets(&queries, &keys, offsets) {
             Some(fused) => fused,
             None => {
                 let queries = self
@@ -377,8 +518,8 @@ impl DFlash2Attention {
                     .transpose(Some(&[0, 2, 1, 3]))?;
                 let keys = self.k_norm.forward(&keys)?.transpose(Some(&[0, 2, 1, 3]))?;
                 (
-                    self.rope.forward(&queries, Some(query_base))?,
-                    self.rope.forward(&keys, Some(query_base))?,
+                    self.rope.forward_with_offsets(&queries, offsets)?,
+                    self.rope.forward_with_offsets(&keys, offsets)?,
                 )
             }
         };
@@ -396,7 +537,6 @@ impl DFlash2Attention {
         query_base: i32,
         masks: &mut SlidingMaskMemo,
     ) -> Result<MxArray> {
-        let batch = queries.shape_at(0)?;
         let seq = queries.shape_at(2)?;
         let mask = memo_sliding_mask(
             masks,
@@ -406,13 +546,60 @@ impl DFlash2Attention {
             keys.shape_at(2)?,
             self.sliding_window,
         )?;
-        let attended = scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            1.0 / (self.head_dim as f64).sqrt(),
-            mask.as_ref(),
-        )?
+        self.attend_masked(queries, keys, values, mask.as_ref())
+    }
+
+    fn attend_masked(
+        &self,
+        queries: &MxArray,
+        keys: &MxArray,
+        values: &MxArray,
+        mask: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        self.attend_masked_with_broadcast(queries, keys, values, mask, None)
+    }
+
+    // MLX's generic SDPA inserts a Broadcast with the construction-time
+    // [B,H,Q,K] shape. During compiled replay, a pre-broadcast explicit input
+    // makes that operation a no-op, allowing masked K to grow dynamically.
+    // The custom tensor-op path keeps its singleton-head mask contract.
+    fn attend_masked_with_broadcast(
+        &self,
+        queries: &MxArray,
+        keys: &MxArray,
+        values: &MxArray,
+        mask: Option<&MxArray>,
+        broadcast_mask: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        let batch = queries.shape_at(0)?;
+        let seq = queries.shape_at(2)?;
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let mut tensor_op = std::ptr::null_mut();
+        let status = unsafe {
+            sys::mlx_dflash2_attention_with_policy(
+                queries.as_raw_ptr(),
+                keys.as_raw_ptr(),
+                values.as_raw_ptr(),
+                mask.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+                scale as f32,
+                self.tensor_attention_enabled,
+                &mut tensor_op,
+            )
+        };
+        // Unsupported devices, shapes and a disabled per-model policy use
+        // the established attention path. A constructed graph's execution
+        // errors propagate; cache mutation is never retried after a failure.
+        let attended = match status {
+            1 => MxArray::from_handle(tensor_op, "dflash2 tensor-op attention")?,
+            0 => {
+                scaled_dot_product_attention(queries, keys, values, scale, broadcast_mask.or(mask))?
+            }
+            _ => {
+                return Err(Error::from_reason(
+                    "DFlash2 tensor-op attention construction failed",
+                ));
+            }
+        }
         .transpose(Some(&[0, 2, 1, 3]))?
         .reshape(&[batch, seq, self.num_heads * self.head_dim])?;
         self.o_proj.forward(&attended)
@@ -446,6 +633,7 @@ impl DFlash2Mlp {
 }
 
 struct GroupedDynamicCausalConv {
+    source_enabled: bool,
     base_kernel: MxArray,
     kernel_projection: LinearProj,
     kernel_size: usize,
@@ -453,6 +641,54 @@ struct GroupedDynamicCausalConv {
 }
 
 impl GroupedDynamicCausalConv {
+    /// The source finish returns the complete hidden state. A selected native
+    /// factory error propagates; only unsupported rows/devices use the old path.
+    fn source_convolve(
+        &self,
+        hidden: &MxArray,
+        dynamic: &MxArray,
+        side: i32,
+        residual: Option<&MxArray>,
+    ) -> Result<Option<MxArray>> {
+        if !self.source_enabled
+            || self.kernel_size != 2
+            || self.group_size != 16
+            || hidden.shape()?.as_ref() != [1, 8, 2048]
+            || hidden.dtype()? != DType::BFloat16
+            || !unsafe { sys::mlx_source_dflash2_conv_available() }
+        {
+            return Ok(None);
+        }
+        let raw = unsafe {
+            sys::mlx_source_dflash2_conv(
+                hidden.as_raw_ptr(),
+                dynamic.as_raw_ptr(),
+                self.base_kernel.as_raw_ptr(),
+                side,
+                residual.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            )
+        };
+        Ok(Some(MxArray::from_handle(
+            raw,
+            "source DFlash2 convolution",
+        )?))
+    }
+
+    fn finish_output(
+        &self,
+        hidden: &MxArray,
+        dynamic: &MxArray,
+        residual: &MxArray,
+    ) -> Result<DraftLayerOutput> {
+        if let Some(hidden) = self.source_convolve(hidden, dynamic, 1, Some(residual))? {
+            return Ok(DraftLayerOutput::Hidden(hidden));
+        }
+        Ok(DraftLayerOutput::Pending(
+            residual.clone(),
+            self.finish(hidden, dynamic)?,
+        ))
+    }
+
     /// Fused single-dispatch conv; `None` when the FFI rejects the inputs
     /// (non-Metal build, dtype mismatch, unusual dims) so the caller can run
     /// the elementwise chain instead.
@@ -546,7 +782,11 @@ impl GroupedDynamicCausalConv {
             self.kernel_size as i64,
             groups,
         ])?;
-        Ok((self.convolve(hidden, &dynamic, 0)?, dynamic))
+        let prepared = match self.source_convolve(hidden, &dynamic, 0, None)? {
+            Some(prepared) => prepared,
+            None => self.convolve(hidden, &dynamic, 0)?,
+        };
+        Ok((prepared, dynamic))
     }
 
     fn finish(&self, hidden: &MxArray, dynamic: &MxArray) -> Result<MxArray> {
@@ -571,9 +811,73 @@ enum DraftResidual<'a> {
     Pending(&'a MxArray, &'a MxArray),
 }
 
+/// Keeps the arithmetic boundary explicit across both eager and compiled
+/// layers. Native convolution leaves a delta for the fused residual norm;
+/// source convolution has already added the residual before its BF16 store.
+enum DraftLayerOutput {
+    Hidden(MxArray),
+    Pending(MxArray, MxArray),
+}
+
+impl DraftLayerOutput {
+    fn as_input(&self) -> DraftResidual<'_> {
+        match self {
+            Self::Hidden(hidden) => DraftResidual::Hidden(hidden),
+            Self::Pending(hidden, delta) => DraftResidual::Pending(hidden, delta),
+        }
+    }
+
+    fn hidden_and_normalized(&self, norm: &RMSNorm) -> Result<(MxArray, MxArray)> {
+        match self {
+            Self::Hidden(hidden) => Ok((hidden.clone(), norm.forward(hidden)?)),
+            Self::Pending(hidden, delta) => DecoderLayer::add_residual_norm(norm, hidden, delta),
+        }
+    }
+}
+
 impl DFlash2Layer {
-    /// Returns this layer's post-attention residual and MLP delta; the caller
-    /// adds them inside the next norm.
+    fn forward_compiled(
+        &self,
+        input: DraftResidual<'_>,
+        window: &[MxArray],
+        offsets: &MxArray,
+        mask: Option<&MxArray>,
+        broadcast_mask: Option<&MxArray>,
+        merged_rows: i64,
+    ) -> Result<(DraftLayerOutput, MxArray, MxArray)> {
+        let (residual, normed) = match input {
+            DraftResidual::Hidden(hidden) => (hidden.clone(), self.input_norm.forward(hidden)?),
+            DraftResidual::Pending(hidden, delta) => {
+                DecoderLayer::add_residual_norm(&self.input_norm, hidden, delta)?
+            }
+        };
+        let (prepared, dynamic) = self.attention_conv.prepare(&normed)?;
+        let (queries, keys, values) =
+            self.attention
+                .project_block_offsets(&prepared, offsets, merged_rows)?;
+        let stored = store_window_tail(window, &keys, &values)?;
+        let attention = self.attention.attend_masked_with_broadcast(
+            &queries,
+            &stored[2],
+            &stored[3],
+            mask,
+            broadcast_mask,
+        )?;
+        let (hidden, normed) = self
+            .attention_conv
+            .finish_output(&attention, &dynamic, &residual)?
+            .hidden_and_normalized(&self.post_attention_norm)?;
+        let (prepared, dynamic) = self.mlp_conv.prepare(&normed)?;
+        let output = self.mlp_conv.finish_output(
+            &self.mlp.forward(&prepared, merged_rows)?,
+            &dynamic,
+            &hidden,
+        )?;
+        Ok((output, stored[0].clone(), stored[1].clone()))
+    }
+
+    /// Returns either complete hidden state or a pending residual and delta
+    /// for the next norm, according to the selected convolution arithmetic.
     fn forward(
         &self,
         input: DraftResidual<'_>,
@@ -582,7 +886,7 @@ impl DFlash2Layer {
         query_base: i32,
         masks: &mut SlidingMaskMemo,
         merged_rows: i64,
-    ) -> Result<(MxArray, MxArray)> {
+    ) -> Result<DraftLayerOutput> {
         let (residual, normed) = match input {
             DraftResidual::Hidden(hidden) => (hidden.clone(), self.input_norm.forward(hidden)?),
             DraftResidual::Pending(hidden, delta) => {
@@ -602,16 +906,16 @@ impl DFlash2Layer {
         let attention = self
             .attention
             .attend(&queries, &keys, &values, key_base, query_base, masks)?;
-        let (hidden, normed) = DecoderLayer::add_residual_norm(
-            &self.post_attention_norm,
-            &residual,
-            &self.attention_conv.finish(&attention, &dynamic)?,
-        )?;
+        let (hidden, normed) = self
+            .attention_conv
+            .finish_output(&attention, &dynamic, &residual)?
+            .hidden_and_normalized(&self.post_attention_norm)?;
         let (prepared, dynamic) = self.mlp_conv.prepare(&normed)?;
-        let delta = self
-            .mlp_conv
-            .finish(&self.mlp.forward(&prepared, merged_rows)?, &dynamic)?;
-        Ok((hidden, delta))
+        self.mlp_conv.finish_output(
+            &self.mlp.forward(&prepared, merged_rows)?,
+            &dynamic,
+            &hidden,
+        )
     }
 }
 
@@ -729,6 +1033,34 @@ impl CandidateSelector {
         MxArray::from_handle(path, "dflash2_greedy_path").ok()
     }
 
+    /// Same greedy predecessor decisions, with temperature-one confidence for
+    /// the GPU verification-row policy. Confidence never changes selected ids.
+    fn fused_greedy_path_confidence(
+        &self,
+        candidates: &MxArray,
+        scores: &MxArray,
+    ) -> Option<(MxArray, MxArray)> {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return None;
+        }
+        let mut path = std::ptr::null_mut();
+        let mut confidence = std::ptr::null_mut();
+        if !unsafe {
+            sys::mlx_dflash2_greedy_path_confidence(
+                candidates.as_raw_ptr(),
+                scores.as_raw_ptr(),
+                &mut path,
+                &mut confidence,
+            )
+        } {
+            return None;
+        }
+        Some((
+            MxArray::from_handle(path, "dflash2_greedy_path_confidence:path").ok()?,
+            MxArray::from_handle(confidence, "dflash2_greedy_path_confidence:confidence").ok()?,
+        ))
+    }
+
     /// Original lazy device walk, retained both as the contract fallback and
     /// as an independent parity oracle for the fused kernel.
     fn lazy_greedy_path(
@@ -775,6 +1107,29 @@ impl CandidateSelector {
         anchor: u32,
         temperature: f64,
         device_path: bool,
+        confidence: Option<&mut Option<MxArray>>,
+        rng: &mut R,
+    ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
+        let anchor_ids = MxArray::from_int32(&[anchor as i32], &[1])?;
+        self.select_with_anchor(
+            hidden,
+            logits,
+            &anchor_ids,
+            temperature,
+            device_path,
+            confidence,
+            rng,
+        )
+    }
+
+    fn select_with_anchor<R: Rng + ?Sized>(
+        &self,
+        hidden: &MxArray,
+        logits: &MxArray,
+        anchor_ids: &MxArray,
+        temperature: f64,
+        device_path: bool,
+        confidence: Option<&mut Option<MxArray>>,
         rng: &mut R,
     ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
         let length = hidden.shape_at(1)? as usize;
@@ -797,43 +1152,22 @@ impl CandidateSelector {
             1,
             self.rank as i64,
         ])?;
-        let candidate_flat = candidates.reshape(&[(length * self.top_k) as i64])?;
-        let successors = self
-            .successor_codebook
-            .forward(&candidate_flat)?
-            .reshape(&[length as i64, self.top_k as i64, self.rank as i64])?;
-        let anchor_ids = MxArray::from_int32(&[anchor as i32], &[1])?;
-        let anchor_embedding = self
-            .predecessor_codebook
-            .forward(&anchor_ids)?
-            .reshape(&[1, 1, self.rank as i64])?
-            .broadcast_to(&[1, self.top_k as i64, self.rank as i64])?;
-        let predecessor_ids = if length > 1 {
-            candidates.slice_axis(1, 0, length as i64 - 1)?
-        } else {
-            MxArray::from_int32(&[], &[0, self.top_k as i64])?
-        };
-        let predecessors = if length > 1 {
-            let previous = self
-                .predecessor_codebook
-                .forward(&predecessor_ids.reshape(&[((length - 1) * self.top_k) as i64])?)?
-                .reshape(&[length as i64 - 1, self.top_k as i64, self.rank as i64])?;
-            MxArray::concatenate(&anchor_embedding, &previous, 0)?
-        } else {
-            anchor_embedding
-        };
-        let edges = predecessors
-            .mul(&projected)?
-            .matmul(&successors.transpose(Some(&[0, 2, 1]))?)?;
-        let scores = edges.add(&unary.reshape(&[length as i64, 1, self.top_k as i64])?)?;
         let candidates = candidates.astype(DType::Int32)?;
-        let scores = scores.astype(DType::Float32)?;
+        let scores = self.edge_scores(&candidates, &unary, &projected, anchor_ids, length)?;
 
         let greedy = is_greedy_temperature(temperature);
         if greedy && device_path {
             // One custom dispatch replaces the per-position gather + reverse
             // + argmax + gather chain. Contract misses retain that lazy graph,
             // and either result stays device-resident into target verify.
+            if let Some(confidence) = confidence {
+                if let Some((path, probabilities)) =
+                    self.fused_greedy_path_confidence(&candidates, &scores)
+                {
+                    *confidence = Some(probabilities);
+                    return Ok((SelectorPath::Device(path), Vec::new()));
+                }
+            }
             let path = match self.fused_greedy_path(&candidates, &scores) {
                 Some(path) => path,
                 None => self.lazy_greedy_path(&candidates, &scores, length)?,
@@ -873,10 +1207,101 @@ impl CandidateSelector {
         }
         Ok((SelectorPath::Host(path), rows))
     }
+
+    fn edge_scores(
+        &self,
+        candidates: &MxArray,
+        unary: &MxArray,
+        projected: &MxArray,
+        anchor_ids: &MxArray,
+        length: usize,
+    ) -> Result<MxArray> {
+        if self.top_k == 16
+            && self.rank == 256
+            && std::env::var("MLX_DFLASH2_SELECTOR_EDGES_FP32").is_ok_and(|v| v == "1")
+            && unsafe { sys::mlx_metal_is_available() && sys::mlx_default_device() == 1 }
+        {
+            let predecessor = self.predecessor_codebook.get_weight();
+            let successor = self.successor_codebook.get_weight();
+            // The native top-k wrapper preserves the head's dtype. Widen
+            // those existing unary values here; changing the head's own
+            // output precision is a separate experiment.
+            let unary = unary.astype(DType::Float32)?;
+            let scores = unsafe {
+                sys::mlx_dflash2_selector_edges(
+                    candidates.as_raw_ptr(),
+                    unary.as_raw_ptr(),
+                    projected.as_raw_ptr(),
+                    predecessor.as_raw_ptr(),
+                    successor.as_raw_ptr(),
+                    anchor_ids.as_raw_ptr(),
+                )
+            };
+            if !scores.is_null() {
+                // Preserve FP32 through the existing greedy/confidence walk;
+                // this experiment intentionally changes the BF16 edge math.
+                return MxArray::from_handle(scores, "dflash2_selector_edges");
+            }
+        }
+        let candidate_flat = candidates.reshape(&[(length * self.top_k) as i64])?;
+        let successors = self
+            .successor_codebook
+            .forward(&candidate_flat)?
+            .reshape(&[length as i64, self.top_k as i64, self.rank as i64])?;
+        let anchor_embedding = self
+            .predecessor_codebook
+            .forward(anchor_ids)?
+            .reshape(&[1, 1, self.rank as i64])?
+            .broadcast_to(&[1, self.top_k as i64, self.rank as i64])?;
+        let predecessor_ids = if length > 1 {
+            candidates.slice_axis(1, 0, length as i64 - 1)?
+        } else {
+            MxArray::from_int32(&[], &[0, self.top_k as i64])?
+        };
+        let predecessors = if length > 1 {
+            let previous = self
+                .predecessor_codebook
+                .forward(&predecessor_ids.reshape(&[((length - 1) * self.top_k) as i64])?)?
+                .reshape(&[length as i64 - 1, self.top_k as i64, self.rank as i64])?;
+            MxArray::concatenate(&anchor_embedding, &previous, 0)?
+        } else {
+            anchor_embedding
+        };
+        let edges = predecessors
+            .mul(&projected)?
+            .matmul(&successors.transpose(Some(&[0, 2, 1]))?)?;
+        let scores = edges.add(&unary.reshape(&[length as i64, 1, self.top_k as i64])?)?;
+        scores.astype(DType::Float32)
+    }
 }
 
 /// Rows a draft window buffer grows by.
 const DRAFT_KV_STEP: i64 = 256;
+
+fn store_window_tail(window: &[MxArray], keys: &MxArray, values: &MxArray) -> Result<Vec<MxArray>> {
+    if window.len() != 4 {
+        return Err(Error::from_reason(
+            "compiled draft window expects full K/V and two views",
+        ));
+    }
+    let args = [
+        window[0].as_raw_ptr(),
+        window[1].as_raw_ptr(),
+        window[2].as_raw_ptr(),
+        window[3].as_raw_ptr(),
+        keys.as_raw_ptr(),
+        values.as_raw_ptr(),
+    ];
+    let mut out = [std::ptr::null_mut(); 4];
+    if !unsafe { sys::mlx_kv_store_window_tail(args.as_ptr(), out.as_mut_ptr()) } {
+        return Err(Error::from_reason(
+            "compiled draft KV tail-store contract failed",
+        ));
+    }
+    out.into_iter()
+        .map(|handle| MxArray::from_handle(handle, "compiled draft tail store"))
+        .collect()
+}
 
 /// Whether draft projections of the given row widths may be row-merged (and
 /// the merge sliced back into views): only Tiled64 K-quant/affine linears,
@@ -1149,6 +1574,59 @@ impl DFlash2ContextCache {
         Ok(())
     }
 
+    /// Project a full eight-row verifier block, then store only its retained
+    /// prefix. This schedule keeps FC and merged K/V on the M8 kernels;
+    /// unretained rows never enter a cache or its token provenance.
+    pub(crate) fn append_full_width_prefix(
+        &mut self,
+        model: &DFlash2Model,
+        fused_context: &MxArray,
+        base: i32,
+        token_ids: &[u32],
+    ) -> Result<()> {
+        let keep = token_ids.len();
+        if fused_context.shape_at(1)? != 8 || model.merged_rows() != 8 || keep == 0 || keep > 8 {
+            return Err(Error::from_reason(
+                "full-width DFlash2 context requires eight projected rows and 1..=8 retained rows",
+            ));
+        }
+        if base != self.logical_len
+            || usize::try_from(self.logical_len).ok() != Some(self.token_history.len())
+            || self.layers.len() != model.layers.len()
+        {
+            return Err(Error::from_reason(
+                "full-width DFlash2 context prefix has inconsistent position, token provenance, or layer count",
+            ));
+        }
+        let next = self
+            .logical_len
+            .checked_add(keep as i32)
+            .ok_or_else(|| Error::from_reason("DFlash2 context length overflow"))?;
+        // Construct and validate every prefix before adopting any store handle.
+        // Projection/shape failures therefore cannot partly advance a window.
+        let prefixes = model.project_context_rows(fused_context, base, Some(keep as i64))?;
+        if prefixes.len() != self.layers.len() {
+            return Err(Error::from_reason(
+                "full-width DFlash2 context projection lost a layer",
+            ));
+        }
+        for (keys, values) in &prefixes {
+            if keys.shape_at(2)? != keep as i64
+                || values.shape()?.as_ref() != keys.shape()?.as_ref()
+            {
+                return Err(Error::from_reason(
+                    "full-width DFlash2 context K/V geometry changed",
+                ));
+            }
+        }
+        for ((keys, values), window) in prefixes.iter().zip(self.layers.iter_mut()) {
+            window.append(keys, values)?;
+        }
+        self.logical_len = next;
+        self.token_history.extend_from_slice(token_ids);
+        Ok(())
+    }
+
     /// Advance logical length and token provenance WITHOUT writing draft
     /// K/V. Prefill uses this for rows older than the sliding window's
     /// retained tail: those rows would be evicted by later appends unread,
@@ -1192,7 +1670,41 @@ impl DFlash2ContextCache {
     }
 }
 
+const COMPILED_DRAFT_TAG: u64 = 0xDFA2_0000_0000_0000;
+static NEXT_COMPILED_DRAFT: AtomicU64 = AtomicU64::new(1);
+
+struct CompiledDraft {
+    id: u64,
+    disabled: AtomicBool,
+    prepared: AtomicBool,
+    #[cfg(test)]
+    traces: AtomicU64,
+}
+
+impl Default for CompiledDraft {
+    fn default() -> Self {
+        Self {
+            id: NEXT_COMPILED_DRAFT.fetch_add(1, Ordering::Relaxed),
+            disabled: AtomicBool::new(false),
+            prepared: AtomicBool::new(false),
+            #[cfg(test)]
+            traces: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Drop for CompiledDraft {
+    fn drop(&mut self) {
+        crate::compiled_graph::erase_compiled_graphs_matching(
+            0xffff_ffff_ffff_0000,
+            COMPILED_DRAFT_TAG | ((self.id & 0xffff_ffff) << 16),
+        );
+    }
+}
+
 pub(crate) struct DFlash2Model {
+    execution_policy: DraftExecutionPolicy,
+    compiled: CompiledDraft,
     pub(crate) config: DFlash2Config,
     pub(crate) weight_bytes: u64,
     fc: LinearProj,
@@ -1207,6 +1719,48 @@ pub(crate) struct DFlash2Model {
 }
 
 impl DFlash2Model {
+    /// Called only by the MoE loader after target validation and before the
+    /// companion is published. Dense loaders retain the captured unset-off
+    /// policy. Runtime hardware, dtype, shape and gradient guards still apply.
+    pub(crate) fn configure_moe_execution(
+        &mut self,
+        target: &crate::models::qwen3_5_moe::Qwen3_5MoeConfig,
+    ) {
+        let target_profile = [
+            target.hidden_size,
+            target.num_layers,
+            target.num_experts,
+            target.num_experts_per_tok,
+            target
+                .moe_intermediate_size
+                .unwrap_or(target.intermediate_size),
+        ];
+        let supported = self.config.supports_moe_execution_defaults(target_profile);
+        let source_conv_supported = self.config.supports_source_conv(target_profile);
+        // Also safe if a future internal caller changes policy after tracing:
+        // erase captured graphs without clearing a prior fail-closed latch.
+        self.invalidate_compiled();
+        self.execution_policy = self
+            .execution_policy
+            .with_moe_profile(supported)
+            .with_source_conv_profile(source_conv_supported);
+        for layer in &mut self.layers {
+            layer.attention.tensor_attention_enabled = self.execution_policy.tensor_attention();
+            layer.attention_conv.source_enabled = self.execution_policy.source_conv();
+            layer.mlp_conv.source_enabled = self.execution_policy.source_conv();
+        }
+    }
+
+    /// Target weight replacement must also release draft tapes, which capture
+    /// that target's embedding and output head as immutable constants.
+    pub(crate) fn invalidate_compiled(&self) {
+        crate::compiled_graph::erase_compiled_graphs_matching(
+            0xffff_ffff_ffff_0000,
+            COMPILED_DRAFT_TAG | ((self.compiled.id & 0xffff_ffff) << 16),
+        );
+        self.compiled.prepared.store(false, Ordering::Relaxed);
+    }
+
     pub(crate) fn max_position_embeddings(&self) -> usize {
         self.config.max_position_embeddings
     }
@@ -1352,6 +1906,15 @@ impl DFlash2Model {
         fused_context: &MxArray,
         base: i32,
     ) -> Result<Vec<(MxArray, MxArray)>> {
+        self.project_context_rows(fused_context, base, None)
+    }
+
+    fn project_context_rows(
+        &self,
+        fused_context: &MxArray,
+        base: i32,
+        retained_rows: Option<i64>,
+    ) -> Result<Vec<(MxArray, MxArray)>> {
         let Some(context_kv) = self.context_kv.as_ref().filter(|_| {
             fused_context
                 .shape_at(1)
@@ -1360,7 +1923,15 @@ impl DFlash2Model {
             return self
                 .layers
                 .iter()
-                .map(|layer| layer.attention.project_context(fused_context, base))
+                .map(|layer| {
+                    if retained_rows.is_some() {
+                        layer
+                            .attention
+                            .project_context_rows(fused_context, base, retained_rows)
+                    } else {
+                        layer.attention.project_context(fused_context, base)
+                    }
+                })
                 .collect();
         };
         let Some(first) = self.layers.first() else {
@@ -1377,14 +1948,21 @@ impl DFlash2Model {
         let mut values = Vec::with_capacity(self.layers.len());
         for (layer, pair) in self.layers.iter().zip(parts.as_chunks::<2>().0) {
             let attention = &layer.attention;
-            let normed = attention.k_norm.forward(&pair[0].reshape(&[
-                pair[0].shape_at(0)?,
-                pair[0].shape_at(1)?,
+            let key_prefix = retained_rows
+                .map(|rows| pair[0].slice_axis(1, 0, rows))
+                .transpose()?;
+            let key_rows = key_prefix.as_ref().unwrap_or(&pair[0]);
+            let normed = attention.k_norm.forward(&key_rows.reshape(&[
+                key_rows.shape_at(0)?,
+                key_rows.shape_at(1)?,
                 attention.num_kv_heads,
                 attention.head_dim,
             ])?)?;
             keys.push(normed.transpose(Some(&[0, 2, 1, 3]))?);
-            values.push(attention.finish_values(&pair[1])?);
+            let value_prefix = retained_rows
+                .map(|rows| pair[1].slice_axis(1, 0, rows))
+                .transpose()?;
+            values.push(attention.finish_values(value_prefix.as_ref().unwrap_or(&pair[1]))?);
         }
         let roped = first.attention.rope.forward(
             &MxArray::concatenate_many(keys.iter().collect(), Some(1))?,
@@ -1408,7 +1986,7 @@ impl DFlash2Model {
         context: &mut DFlash2ContextCache,
     ) -> Result<MxArray> {
         let embedded = target_embedding.forward(block_ids)?;
-        let mut pending: Option<(MxArray, MxArray)> = None;
+        let mut pending: Option<DraftLayerOutput> = None;
         let DFlash2ContextCache {
             layers: windows,
             mask_memo,
@@ -1418,7 +1996,7 @@ impl DFlash2Model {
         for (layer, window) in self.layers.iter().zip(windows.iter_mut()) {
             let context_base = logical_len.saturating_sub(window.len() as i32);
             let input = match &pending {
-                Some((hidden, delta)) => DraftResidual::Pending(hidden, delta),
+                Some(output) => output.as_input(),
                 None => DraftResidual::Hidden(&embedded),
             };
             let next = layer.forward(
@@ -1432,11 +2010,184 @@ impl DFlash2Model {
             pending = Some(next);
         }
         match &pending {
-            Some((hidden, delta)) => {
-                Ok(DecoderLayer::add_residual_norm(&self.norm, hidden, delta)?.1)
-            }
+            Some(output) => Ok(output.hidden_and_normalized(&self.norm)?.1),
             None => self.norm.forward(&embedded),
         }
+    }
+
+    /// Compile the complete greedy proposal, including the target head and
+    /// selector. Position, anchor, mask, window views and their full owners
+    /// are inputs. The only host-dependent branches are model constants and
+    /// proposal width/mask/confidence modes encoded in the function id.
+    fn propose_compiled(
+        &self,
+        target_embedding: &Embedding,
+        target_lm_head: Option<&LinearProj>,
+        context: &mut DFlash2ContextCache,
+        block: &MxArray,
+        with_confidence: bool,
+    ) -> Result<Option<(MxArray, Option<MxArray>)>> {
+        if self.compiled.disabled.load(Ordering::Relaxed)
+            || !unsafe { sys::mlx_metal_is_available() }
+            || unsafe { sys::mlx_default_device() } != 1
+            || self.selector.top_k > 64
+            || self.layers.is_empty()
+            || context.layers.len() != self.layers.len()
+        {
+            return Ok(None);
+        }
+        let rows = block.shape_at(1)?;
+        if !(2..=256).contains(&rows) || block.shape_at(0)? != 1 {
+            return Ok(None);
+        }
+        let live = context.layers[0].len();
+        // An empty window has no full buffer owner; keep the eager path.
+        if live == 0 || context.layers.iter().any(|w| w.len() != live) {
+            return Ok(None);
+        }
+        let mut inputs = vec![
+            block.clone(),
+            MxArray::from_int32(&[context.logical_len], &[1])?,
+        ];
+        let mask = memo_sliding_mask(
+            &mut context.mask_memo,
+            context.logical_len,
+            rows,
+            context.logical_len - live as i32,
+            live + rows,
+            self.config.sliding_window as i64,
+        )?;
+        let has_mask = mask.is_some();
+        if let Some(mask) = mask {
+            let heads = self.layers[0].attention.num_heads;
+            if self
+                .layers
+                .iter()
+                .any(|layer| layer.attention.num_heads != heads)
+            {
+                return Ok(None);
+            }
+            let broadcast_mask = mask.broadcast_to(&[1, heads, rows, live + rows])?;
+            inputs.extend([mask, broadcast_mask]);
+        }
+        let windows_at = inputs.len();
+        for window in &context.layers {
+            let (Some(keys), Some(values)) = (&window.keys, &window.values) else {
+                return Ok(None);
+            };
+            if window.end + rows > window.capacity()?
+                || keys.dtype()? != DType::BFloat16
+                || values.dtype()? != DType::BFloat16
+                || keys.shape_at(0)? != 1
+            {
+                return Ok(None);
+            }
+            inputs.extend([
+                keys.clone(),
+                values.clone(),
+                keys.slice_axis(2, window.start, window.end + rows)?,
+                values.slice_axis(2, window.start, window.end + rows)?,
+            ]);
+        }
+        let fn_id = COMPILED_DRAFT_TAG
+            | ((self.compiled.id & 0xffff_ffff) << 16)
+            | ((has_mask as u64) << 9)
+            | ((with_confidence as u64) << 8)
+            | (rows - 1) as u64;
+        let cache_output_at = 1 + usize::from(with_confidence);
+        let mut builder =
+            |args: &[MxArray]| -> Result<Vec<MxArray>> {
+                #[cfg(test)]
+                self.compiled.traces.fetch_add(1, Ordering::Relaxed);
+                let embedded = target_embedding.forward(&args[0])?;
+                let mut pending: Option<DraftLayerOutput> = None;
+                let mut buffers = Vec::with_capacity(self.layers.len() * 2);
+                for (i, layer) in self.layers.iter().enumerate() {
+                    let input = match &pending {
+                        Some(output) => output.as_input(),
+                        None => DraftResidual::Hidden(&embedded),
+                    };
+                    let at = windows_at + i * 4;
+                    let (output, keys, values) = layer.forward_compiled(
+                        input,
+                        &args[at..at + 4],
+                        &args[1],
+                        has_mask.then(|| &args[2]),
+                        has_mask.then(|| &args[3]),
+                        self.merged_rows(),
+                    )?;
+                    pending = Some(output);
+                    buffers.extend([keys, values]);
+                }
+                let output =
+                    pending.ok_or_else(|| Error::from_reason("compiled draft has no layers"))?;
+                let hidden = output.hidden_and_normalized(&self.norm)?.1;
+                let logits = match target_lm_head {
+                    Some(head) => head.forward_logits(&hidden)?,
+                    None => target_embedding.as_linear(&hidden)?,
+                };
+                let mut confidence = None;
+                let anchor = args[0].slice_axis(1, 0, 1)?.reshape(&[1])?;
+                let (path, _) = self.selector.select_with_anchor(
+                    &hidden.slice_axis(1, 1, rows)?,
+                    &logits.slice_axis(1, 1, rows)?,
+                    &anchor,
+                    0.0,
+                    true,
+                    with_confidence.then_some(&mut confidence),
+                    &mut rand::rng(),
+                )?;
+                let SelectorPath::Device(path) = path else {
+                    return Err(Error::from_reason(
+                        "compiled greedy draft returned a host path",
+                    ));
+                };
+                let mut outputs = vec![path];
+                if with_confidence {
+                    outputs.push(confidence.ok_or_else(|| {
+                        Error::from_reason("compiled draft confidence unavailable")
+                    })?);
+                }
+                outputs.extend(buffers);
+                Ok(outputs)
+            };
+        // Once invoked, a failure must reset the turn: an in-place primitive
+        // may already have recorded writes. Never retry the same prefix eager.
+        let outputs = crate::compiled_graph::invoke_compiled_graph(
+            fn_id,
+            &inputs.iter().collect::<Vec<_>>(),
+            cache_output_at + self.layers.len() * 2,
+            true,
+            &mut builder,
+        )?
+        .ok_or_else(|| Error::from_reason("compiled draft invocation failed"))?;
+        for (window, pair) in context
+            .layers
+            .iter()
+            .zip(outputs[cache_output_at..].chunks_exact(2))
+        {
+            if pair[0].shape()?.as_ref() != window.keys.as_ref().unwrap().shape()?.as_ref()
+                || pair[1].shape()?.as_ref() != window.values.as_ref().unwrap().shape()?.as_ref()
+                || pair[0].dtype()? != DType::BFloat16
+                || pair[1].dtype()? != DType::BFloat16
+            {
+                return Err(Error::from_reason(
+                    "compiled draft returned incompatible cache buffers",
+                ));
+            }
+        }
+        for (window, pair) in context
+            .layers
+            .iter_mut()
+            .zip(outputs[cache_output_at..].chunks_exact(2))
+        {
+            window.keys = Some(pair[0].clone());
+            window.values = Some(pair[1].clone());
+        }
+        Ok(Some((
+            outputs[0].clone(),
+            with_confidence.then(|| outputs[1].clone()),
+        )))
     }
 
     pub(crate) fn propose<R: Rng + ?Sized>(
@@ -1448,6 +2199,7 @@ impl DFlash2Model {
         max_len: usize,
         temperature: f64,
         device_path: bool,
+        mut confidence: Option<&mut Option<MxArray>>,
         rng: &mut R,
     ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
         let query_end = context
@@ -1463,6 +2215,36 @@ impl DFlash2Model {
         let phase_time = std::env::var("MLX_DFLASH2_PHASE_TIME").is_ok();
         let t0 = std::time::Instant::now();
         let block = MxArray::from_int32(&ids, &[1, ids.len() as i64])?;
+        let compile = device_path
+            && is_greedy_temperature(temperature)
+            && max_len == self.config.block_size
+            && unsafe { sys::mlx_default_device() } == 1
+            && self.execution_policy.compile_draft();
+        // Only full proposals compile: a budget-limited tail would otherwise
+        // pay for a new graph used once. The first full proposal runs eager
+        // and is explicitly evaluated below before prepared becomes true, so
+        // even a failed verification leaves materialized captured weights.
+        if compile && self.compiled.prepared.load(Ordering::Relaxed) {
+            match self.propose_compiled(
+                target_embedding,
+                target_lm_head,
+                context,
+                &block,
+                confidence.is_some(),
+            ) {
+                Ok(Some((path, probabilities))) => {
+                    if let Some(out) = confidence {
+                        *out = probabilities;
+                    }
+                    return Ok((SelectorPath::Device(path), Vec::new()));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.compiled.disabled.store(true, Ordering::Relaxed);
+                    return Err(error);
+                }
+            }
+        }
         let query_base = context.logical_len;
         let hidden = self.forward_hidden(target_embedding, &block, query_base, context)?;
         // The head runs on the whole block (anchor + proposals, 8 rows), the
@@ -1470,15 +2252,29 @@ impl DFlash2Model {
         // are dropped: at 7 rows the head took the per-row kernel and cost
         // more than at 8.
         let logits = match target_lm_head {
-            Some(head) => head.forward(&hidden)?,
+            Some(head) => head.forward_logits(&hidden)?,
             None => target_embedding.as_linear(&hidden)?,
         };
         let rows = max_len as i64 + 1;
         let hidden = hidden.slice_axis(1, 1, rows)?;
         let logits = logits.slice_axis(1, 1, rows)?;
-        let out = self
-            .selector
-            .select(&hidden, &logits, anchor, temperature, device_path, rng)?;
+        let out = self.selector.select(
+            &hidden,
+            &logits,
+            anchor,
+            temperature,
+            device_path,
+            confidence.as_deref_mut(),
+            rng,
+        )?;
+        if compile && !self.compiled.prepared.load(Ordering::Relaxed) {
+            // This one-time boundary also makes direct Rust callers safe when
+            // they propose again before consuming the previous path.
+            if let SelectorPath::Device(path) = &out.0 {
+                MxArray::eval_arrays(&[path])?;
+                self.compiled.prepared.store(true, Ordering::Relaxed);
+            }
+        }
         if phase_time {
             eprintln!("[dflash2-phase] draft-build: {:?}", t0.elapsed());
             let t = std::time::Instant::now();
@@ -1497,6 +2293,7 @@ impl DFlash2Model {
 pub(crate) fn tiny_dflash2_model_for_stepper_test(
     target: &super::config::Qwen3_5Config,
 ) -> Result<DFlash2Model> {
+    let execution_policy = DraftExecutionPolicy::capture();
     let hidden = target.hidden_size as usize;
     let head_dim = target.head_dim as usize;
     let config = DFlash2Config {
@@ -1559,6 +2356,7 @@ pub(crate) fn tiny_dflash2_model_for_stepper_test(
     };
     let grouped_conv = || -> Result<GroupedDynamicCausalConv> {
         Ok(GroupedDynamicCausalConv {
+            source_enabled: false,
             base_kernel: MxArray::random_normal(
                 &[2, config.conv_kernel_size as i64, hidden as i64],
                 0.0,
@@ -1574,6 +2372,7 @@ pub(crate) fn tiny_dflash2_model_for_stepper_test(
         })
     };
     let attention = DFlash2Attention {
+        tensor_attention_enabled: execution_policy.tensor_attention(),
         q_proj: linear(hidden, config.num_attention_heads * head_dim)?,
         k_proj: linear(hidden, config.num_key_value_heads * head_dim)?,
         v_proj: linear(hidden, config.num_key_value_heads * head_dim)?,
@@ -1601,6 +2400,7 @@ pub(crate) fn tiny_dflash2_model_for_stepper_test(
         mlp_conv: grouped_conv()?,
     };
     Ok(DFlash2Model {
+        execution_policy,
         fc: linear(hidden * config.target_layers.len(), hidden)?,
         hidden_norm: norm(hidden)?,
         norm: norm(hidden)?,
@@ -1616,6 +2416,7 @@ pub(crate) fn tiny_dflash2_model_for_stepper_test(
         config,
         weight_bytes: 0,
         context_kv: None,
+        compiled: CompiledDraft::default(),
     })
 }
 
@@ -1797,6 +2598,7 @@ fn grouped_conv(
     let hidden = config.hidden_size;
     let groups = hidden / config.conv_group_size;
     Ok(GroupedDynamicCausalConv {
+        source_enabled: false,
         base_kernel: required(
             params,
             &format!("{base}.{name}.base_kernel"),
@@ -1974,6 +2776,7 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
         Error::from_reason(format!("Failed to parse DFlash2 config.json: {error}"))
     })?;
     let config = DFlash2Config::from_raw(raw)?;
+    let execution_policy = DraftExecutionPolicy::capture();
     let tensor_path = resolve_safetensors(path)?;
     crate::engine::persistence::prewarm_checkpoint_pages(path);
     let mut params = load_safetensors_lazy(&tensor_path)?;
@@ -2008,6 +2811,7 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
         let base = format!("layers.{index}");
         let attention_base = format!("{base}.self_attn");
         let attention = DFlash2Attention {
+            tensor_attention_enabled: execution_policy.tensor_attention(),
             q_proj: draft_linear(
                 &mut params,
                 &format!("{attention_base}.q_proj"),
@@ -2122,13 +2926,25 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
             config.vocab_size,
             config.selector_rank,
         )?,
-        // Keep the published selector projection at its original precision.
-        hidden_projection: dense_linear(
-            &mut params,
-            "candidate_selector.hidden_projection",
-            hidden,
-            config.selector_rank,
-        )?,
+        // The diagnostic opt-in reproduces Splash's affine Q4/group64
+        // selector projection for matched-source performance/acceptance A/B.
+        // Ordinary loads preserve the published BF16 selector precision.
+        hidden_projection: if std::env::var("MLX_DFLASH2_SELECTOR_QUANT").is_ok_and(|v| v == "1") {
+            draft_linear(
+                &mut params,
+                "candidate_selector.hidden_projection",
+                hidden,
+                config.selector_rank,
+                &mut savings,
+            )?
+        } else {
+            dense_linear(
+                &mut params,
+                "candidate_selector.hidden_projection",
+                hidden,
+                config.selector_rank,
+            )?
+        },
         top_k: config.selector_top_k,
         rank: config.selector_rank,
         vocab_size: config.vocab_size,
@@ -2142,6 +2958,7 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
     }
     let weight_bytes = weight_bytes.saturating_sub(savings);
     let mut model = DFlash2Model {
+        execution_policy,
         config,
         weight_bytes,
         fc,
@@ -2150,6 +2967,7 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
         norm: final_norm,
         selector,
         context_kv: None,
+        compiled: CompiledDraft::default(),
     };
     model.merge_projections()?;
     let weight_bytes = model.weight_bytes;
@@ -2158,6 +2976,8 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
 
 #[cfg(test)]
 mod tests {
+    include!("dflash2_full_width_context_tests.rs");
+    include!("dflash2_execution_policy_tests.rs");
     use super::{
         CandidateSelector, DFlash2Config, DFlash2ContextCache, SelectorPath,
         normalized_selector_probs, parallel_query_ids,
@@ -2515,6 +3335,63 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "run with MLX_DFLASH2_SELECTOR_EDGES_FP32=1 to validate the opt-in production hook"]
+    fn selector_fp32_edges_hook_widens_native_bf16_unary() {
+        assert_eq!(
+            std::env::var("MLX_DFLASH2_SELECTOR_EDGES_FP32").as_deref(),
+            Ok("1")
+        );
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        let mut selector = test_selector(32, 16, 256, 64);
+        let predecessor = selector
+            .predecessor_codebook
+            .get_weight()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let successor = selector
+            .successor_codebook
+            .get_weight()
+            .astype(DType::BFloat16)
+            .unwrap();
+        selector.predecessor_codebook = Embedding::from_weight(&predecessor).unwrap();
+        selector.successor_codebook = Embedding::from_weight(&successor).unwrap();
+        let candidates = MxArray::from_int32(
+            &(0..112).map(|i| (i * 7 + 3) % 32).collect::<Vec<_>>(),
+            &[1, 7, 16],
+        )
+        .unwrap();
+        let unary = MxArray::random_normal(&[1, 7, 16], 0.0, 0.5, Some(DType::BFloat16)).unwrap();
+        let hidden = MxArray::random_normal(&[7, 1, 256], 0.0, 0.5, Some(DType::BFloat16)).unwrap();
+        let anchor = MxArray::from_int32(&[9], &[1]).unwrap();
+        let widened = unary.astype(DType::Float32).unwrap();
+        let expected = MxArray::from_handle(
+            unsafe {
+                mlx_sys::mlx_dflash2_selector_edges(
+                    candidates.as_raw_ptr(),
+                    widened.as_raw_ptr(),
+                    hidden.as_raw_ptr(),
+                    predecessor.as_raw_ptr(),
+                    successor.as_raw_ptr(),
+                    anchor.as_raw_ptr(),
+                )
+            },
+            "test selector FP32 edges",
+        )
+        .unwrap();
+        let actual = selector
+            .edge_scores(&candidates, &unary, &hidden, &anchor, 7)
+            .unwrap();
+        let actual = actual.to_float32().unwrap();
+        assert_eq!(actual.as_ref(), expected.to_float32().unwrap().as_ref());
+        assert!(
+            actual.iter().any(|v| v.to_bits() & 0xffff != 0),
+            "native BF16 fallback would erase low score bits"
+        );
+    }
+
     fn direct_fused_greedy(candidates: &MxArray, scores: &MxArray) -> Option<Vec<i32>> {
         if !unsafe { mlx_sys::mlx_metal_is_available() } {
             return None;
@@ -2841,13 +3718,13 @@ mod tests {
                 .unwrap();
 
         let (host_path, _) = selector
-            .select(&hidden, &logits, 3, 0.0, false, &mut rand::rng())
+            .select(&hidden, &logits, 3, 0.0, false, None, &mut rand::rng())
             .expect("host select");
         let SelectorPath::Host(host_ids) = host_path else {
             panic!("host walk must return host ids");
         };
         let (device_path, sparse) = selector
-            .select(&hidden, &logits, 3, 0.0, true, &mut rand::rng())
+            .select(&hidden, &logits, 3, 0.0, true, None, &mut rand::rng())
             .expect("device select");
         assert!(sparse.is_empty(), "greedy device walk emits no sparse rows");
         let SelectorPath::Device(ids) = device_path else {
@@ -2889,13 +3766,13 @@ mod tests {
         let logits = MxArray::from_float32(&flat, &[1, len, vocab as i64]).unwrap();
 
         let (host_path, _) = selector
-            .select(&hidden, &logits, 0, 0.0, false, &mut rand::rng())
+            .select(&hidden, &logits, 0, 0.0, false, None, &mut rand::rng())
             .unwrap();
         let SelectorPath::Host(host_ids) = host_path else {
             panic!("host walk must return host ids");
         };
         let (device_path, _) = selector
-            .select(&hidden, &logits, 0, 0.0, true, &mut rand::rng())
+            .select(&hidden, &logits, 0, 0.0, true, None, &mut rand::rng())
             .unwrap();
         let SelectorPath::Device(ids) = device_path else {
             panic!("greedy device walk must return device ids");
@@ -3090,6 +3967,7 @@ mod tests {
         let (hidden_size, group_size, kernel_size) = (64usize, 16i64, 2usize);
         let groups = hidden_size / group_size as usize;
         let conv = GroupedDynamicCausalConv {
+            source_enabled: false,
             base_kernel: MxArray::random_normal(
                 &[2, kernel_size as i64, hidden_size as i64],
                 0.0,
@@ -3320,6 +4198,94 @@ mod tests {
         model.norm.forward(&hidden).unwrap()
     }
 
+    #[test]
+    #[ignore = "run with MLX_DFLASH2_ATTENTION_NAX=1 to validate the production attention hook"]
+    fn draft_tensor_attention_serves_fused_query_layout_and_shared_hook() {
+        assert_eq!(
+            std::env::var("MLX_DFLASH2_ATTENTION_NAX").as_deref(),
+            Ok("1")
+        );
+        if !unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+            return;
+        }
+        use super::DFlash2Attention;
+        use crate::nn::{Linear, RMSNorm, RoPE};
+        let unused = || {
+            LinearProj::Standard(
+                Linear::from_weights(
+                    &MxArray::zeros(&[1, 1], Some(DType::BFloat16)).unwrap(),
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let norm = || {
+            RMSNorm::from_weight(
+                &MxArray::ones(&[128], Some(DType::BFloat16)).unwrap(),
+                Some(1e-6),
+            )
+            .unwrap()
+        };
+        let attention = DFlash2Attention {
+            tensor_attention_enabled: true,
+            q_proj: unused(),
+            k_proj: unused(),
+            v_proj: unused(),
+            o_proj: LinearProj::Standard(
+                Linear::from_weights(
+                    &MxArray::random_normal(&[4, 4096], 0.0, 0.02, Some(DType::BFloat16)).unwrap(),
+                    None,
+                )
+                .unwrap(),
+            ),
+            qkv_proj: None,
+            q_norm: norm(),
+            k_norm: norm(),
+            rope: RoPE::new(128, Some(false), Some(10_000_000.0), None),
+            num_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 128,
+            sliding_window: 2048,
+        };
+        let packed = |heads| {
+            MxArray::random_normal(&[1, 8, heads, 128], 0.0, 0.5, Some(DType::BFloat16)).unwrap()
+        };
+        let (queries, keys) = attention
+            .fused_qk_norm_rope(&packed(32), &packed(8), 32768)
+            .unwrap();
+        let values =
+            MxArray::random_normal(&[1, 8, 8, 128], 0.0, 0.5, Some(DType::BFloat16)).unwrap();
+        let mut raw = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                mlx_sys::mlx_dflash2_attention(
+                    queries.as_raw_ptr(),
+                    keys.as_raw_ptr(),
+                    values.as_raw_ptr(),
+                    std::ptr::null_mut(),
+                    1.0f32 / 128.0f32.sqrt(),
+                    &mut raw,
+                )
+            },
+            1,
+            "fused QK norm/RoPE outputs must satisfy the production tensor-op layout"
+        );
+        let raw = MxArray::from_handle(raw, "test draft tensor attention").unwrap();
+        let expected = attention
+            .o_proj
+            .forward(
+                &raw.transpose(Some(&[0, 2, 1, 3]))
+                    .unwrap()
+                    .reshape(&[1, 8, 4096])
+                    .unwrap(),
+            )
+            .unwrap();
+        let actual = attention
+            .attend_masked(&queries, &keys, &values, None)
+            .unwrap();
+        assert_eq!(bits(&actual), bits(&expected));
+    }
+
     /// A draft at the published Qwen3.8 attention geometry (hidden 5120,
     /// 32/8 heads of 128, affine Q4/g64 as `draft_linear` loads it) with
     /// random weights.
@@ -3346,6 +4312,7 @@ mod tests {
             .unwrap()
         };
         let conv = || GroupedDynamicCausalConv {
+            source_enabled: false,
             base_kernel: MxArray::random_normal(
                 &[2, 2, hidden as i64],
                 0.0,
@@ -3378,7 +4345,9 @@ mod tests {
             selector_top_k: 4,
             rope_theta: 10_000_000.0,
         };
+        let execution_policy = super::DraftExecutionPolicy::capture();
         super::DFlash2Model {
+            execution_policy,
             fc: quantized(hidden * 2, hidden),
             hidden_norm: norm(hidden as i64),
             norm: norm(hidden as i64),
@@ -3386,6 +4355,7 @@ mod tests {
             layers: (0..layers)
                 .map(|_| DFlash2Layer {
                     attention: DFlash2Attention {
+                        tensor_attention_enabled: execution_policy.tensor_attention(),
                         q_proj: quantized(hidden, (heads * head_dim) as usize),
                         k_proj: quantized(hidden, (kv_heads * head_dim) as usize),
                         v_proj: quantized(hidden, (kv_heads * head_dim) as usize),
@@ -3419,6 +4389,7 @@ mod tests {
             config,
             weight_bytes: 0,
             context_kv: None,
+            compiled: super::CompiledDraft::default(),
         }
     }
 
@@ -3691,6 +4662,227 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compiled_draft_replays_positions_windows_masks_and_buffer_compaction() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        let mut model = three_layer_tiny_draft();
+        model.config.sliding_window = 8;
+        model.selector.top_k = 16;
+        for layer in &mut model.layers {
+            layer.attention.sliding_window = 8;
+        }
+        let mut embedding = Embedding::from_weight(
+            &MxArray::random_normal(&[32, 64], 0.0, 0.5, Some(DType::BFloat16)).unwrap(),
+        )
+        .unwrap();
+        let mut previous_path = None;
+        for (case, (live, start, capacity, position, anchor)) in [
+            (3, 0, 16, 3, 7),
+            (5, 2, 24, 100, 19),
+            (7, 0, 16, 7, 2),
+            (7, 4, 32, 211, 23),
+            (3, 0, 16, 37, 4),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if case == 4 {
+                embedding
+                    .load_weight(
+                        &MxArray::random_normal(&[32, 64], 0.0, 0.7, Some(DType::BFloat16))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                model.invalidate_compiled();
+                assert!(!model.compiled.prepared.load(super::Ordering::Relaxed));
+            }
+            let mut eager = super::DFlash2ContextCache::new(&model.config);
+            let mut compiled = super::DFlash2ContextCache::new(&model.config);
+            eager.logical_len = position;
+            compiled.logical_len = position;
+            for (left, right) in eager.layers.iter_mut().zip(&mut compiled.layers) {
+                for is_key in [true, false] {
+                    let data = MxArray::random_normal(
+                        &[1, 2, capacity, 16],
+                        0.0,
+                        0.5,
+                        Some(DType::BFloat16),
+                    )
+                    .unwrap();
+                    let copy = data.deep_copy().unwrap();
+                    MxArray::eval_arrays(&[&data, &copy]).unwrap();
+                    if is_key {
+                        left.keys = Some(data);
+                        right.keys = Some(copy);
+                    } else {
+                        left.values = Some(data);
+                        right.values = Some(copy);
+                    }
+                }
+                left.start = start;
+                left.end = start + live;
+                right.start = start;
+                right.end = start + live;
+            }
+            let mut confidence = None;
+            let (expected, _) = model
+                .propose(
+                    &embedding,
+                    None,
+                    &mut eager,
+                    anchor,
+                    2,
+                    0.0,
+                    true,
+                    Some(&mut confidence),
+                    &mut rand::rng(),
+                )
+                .unwrap();
+            let super::SelectorPath::Device(expected) = expected else {
+                panic!("host selector");
+            };
+            // Force the eager run first: captured weights are materialized,
+            // exactly as the first proposal does for the production opt-in.
+            MxArray::eval_arrays(&[&expected]).unwrap();
+            let ids = MxArray::from_int32(&[anchor as i32, 0, 0], &[1, 3]).unwrap();
+            let (path, probability) = model
+                .propose_compiled(&embedding, None, &mut compiled, &ids, true)
+                .unwrap()
+                .unwrap();
+            MxArray::eval_arrays(&[&path]).unwrap();
+            assert_eq!(
+                path.to_int32().unwrap().as_ref(),
+                expected.to_int32().unwrap().as_ref(),
+                "case {case}"
+            );
+            assert_eq!(
+                probability.unwrap().to_float32().unwrap().as_ref(),
+                confidence.unwrap().to_float32().unwrap().as_ref(),
+                "confidence case {case}"
+            );
+            for (left, right) in eager.layers.iter().zip(&compiled.layers) {
+                assert_eq!(
+                    bits(left.keys.as_ref().unwrap()),
+                    bits(right.keys.as_ref().unwrap()),
+                    "K case {case}"
+                );
+                assert_eq!(
+                    bits(left.values.as_ref().unwrap()),
+                    bits(right.values.as_ref().unwrap()),
+                    "V case {case}"
+                );
+                assert_eq!((right.start, right.end), (start, start + live));
+            }
+            previous_path = Some(path);
+        }
+        drop(previous_path);
+        model
+            .compiled
+            .disabled
+            .store(true, super::Ordering::Relaxed);
+        model.invalidate_compiled();
+        assert!(model.compiled.disabled.load(super::Ordering::Relaxed));
+        assert_eq!(
+            model.compiled.traces.load(super::Ordering::Relaxed),
+            3,
+            "two mask modes plus one invalidated target weight variant"
+        );
+    }
+
+    #[test]
+    fn draft_window_tail_rejects_unrelated_view_before_any_write() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        let make = |rows| MxArray::zeros(&[1, 2, rows, 16], Some(DType::BFloat16)).unwrap();
+        let keys = make(16);
+        let values = make(16);
+        let unrelated = make(6);
+        let values_view = values.slice_axis(2, 2, 8).unwrap();
+        let block = MxArray::ones(&[1, 2, 3, 16], Some(DType::BFloat16)).unwrap();
+        let outputs = super::store_window_tail(
+            &[keys.clone(), values.clone(), unrelated, values_view],
+            &block,
+            &block,
+        )
+        .unwrap();
+        let error = MxArray::eval_arrays(&outputs.iter().collect::<Vec<_>>()).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid window alias"),
+            "{error}"
+        );
+        assert!(bits(&keys).iter().all(|&x| x == 0));
+        assert!(bits(&values).iter().all(|&x| x == 0));
+    }
+
+    #[test]
+    fn draft_window_tail_rejects_cross_aliased_blocks_before_any_write() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        let make = |rows| MxArray::zeros(&[1, 2, rows, 16], Some(DType::BFloat16)).unwrap();
+        for key_block_aliases_values in [true, false] {
+            let keys = make(16);
+            let values = make(16);
+            let keys_view = keys.slice_axis(2, 0, 8).unwrap();
+            let values_view = values.slice_axis(2, 0, 8).unwrap();
+            let block = MxArray::ones(&[1, 2, 3, 16], Some(DType::BFloat16)).unwrap();
+            let (key_block, value_block) = if key_block_aliases_values {
+                (values.slice_axis(2, 5, 8).unwrap(), block)
+            } else {
+                (block, keys.slice_axis(2, 5, 8).unwrap())
+            };
+            let outputs = super::store_window_tail(
+                &[keys.clone(), values.clone(), keys_view, values_view],
+                &key_block,
+                &value_block,
+            )
+            .unwrap();
+            let error = MxArray::eval_arrays(&outputs.iter().collect::<Vec<_>>()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("K/V geometry or ownership differs"),
+                "key_block_aliases_values={key_block_aliases_values}: {error}"
+            );
+            assert!(bits(&keys).iter().all(|&x| x == 0));
+            assert!(bits(&values).iter().all(|&x| x == 0));
+        }
+    }
+
+    #[test]
+    fn draft_window_tail_preserves_same_buffer_prefix_views() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        let make = |rows| MxArray::zeros(&[1, 2, rows, 16], Some(DType::BFloat16)).unwrap();
+        let keys = make(16);
+        let values = make(16);
+        let keys_view = keys.slice_axis(2, 0, 8).unwrap();
+        let values_view = values.slice_axis(2, 0, 8).unwrap();
+        let blocks = MxArray::ones(&[1, 2, 6, 16], Some(DType::BFloat16)).unwrap();
+        let key_block = blocks.slice_axis(2, 0, 3).unwrap();
+        let value_block = blocks.slice_axis(2, 3, 6).unwrap();
+        let outputs = super::store_window_tail(
+            &[keys.clone(), values.clone(), keys_view, values_view],
+            &key_block,
+            &value_block,
+        )
+        .unwrap();
+        MxArray::eval_arrays(&outputs.iter().collect::<Vec<_>>()).unwrap();
+        let mut expected = vec![0_u16; 2 * 16 * 16];
+        for head in 0..2 {
+            for row in 5..8 {
+                let at = (head * 16 + row) * 16;
+                expected[at..at + 16].fill(0x3f80);
+            }
+        }
+        assert_eq!(bits(&keys), expected);
+        assert_eq!(bits(&values), expected);
+    }
+
     /// `forward_hidden` fuses each residual sum into the next norm and shares
     /// one sliding mask across layers; with and without a mask (context
     /// shorter and longer than the window) it must equal the reference bits.
@@ -3731,5 +4923,93 @@ mod tests {
             cases += 1;
         }
         assert_eq!(cases, 3);
+    }
+}
+
+#[cfg(test)]
+mod adaptive_budget_tests {
+    use super::*;
+
+    #[test]
+    fn confidence_preserves_greedy_path_and_drives_lazy_budget() -> Result<()> {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        let candidates = MxArray::from_int32(&(0..7 * 16).collect::<Vec<_>>(), &[1, 7, 16])?;
+        let scores = (0..7 * 16 * 16)
+            .map(|i| ((i * 17 % 83) as f32 - 41.0) * 0.07)
+            .collect::<Vec<_>>();
+        let table = MxArray::from_float32(&scores, &[7, 16, 16])?;
+        let mut old = std::ptr::null_mut();
+        let mut path = std::ptr::null_mut();
+        let mut confidence = std::ptr::null_mut();
+        assert!(unsafe {
+            sys::mlx_dflash2_greedy_path(candidates.as_raw_ptr(), table.as_raw_ptr(), &mut old)
+        });
+        assert!(unsafe {
+            sys::mlx_dflash2_greedy_path_confidence(
+                candidates.as_raw_ptr(),
+                table.as_raw_ptr(),
+                &mut path,
+                &mut confidence,
+            )
+        });
+        let old = MxArray::from_handle(old, "old")?;
+        let path = MxArray::from_handle(path, "path")?;
+        let confidence = MxArray::from_handle(confidence, "confidence")?;
+        let params = crate::models::qwen3_5_moe::verify_budget::VerifyBudget::default()
+            .parameters(false, true);
+        let mut values = vec![params.acceptance.slope];
+        values.extend(params.acceptance.intercepts);
+        values.extend(params.costs);
+        values.push(0.0);
+        let parameters = MxArray::from_float32(&values, &[18])?;
+        let budget = MxArray::from_handle(
+            unsafe {
+                sys::mlx_dflash2_verify_budget(confidence.as_raw_ptr(), parameters.as_raw_ptr())
+            },
+            "budget",
+        )?;
+        // One root evaluation traverses selector -> confidence -> budget.
+        MxArray::eval_arrays(&[&old, &path, &budget])?;
+        assert_eq!(old.to_int32()?.as_ref(), path.to_int32()?.as_ref());
+        let confidence_values = confidence.to_float32()?;
+        let selected = path.to_int32()?;
+        let mut predecessor = 0;
+        for position in 0..7 {
+            let row =
+                &scores[(position * 16 + predecessor) * 16..(position * 16 + predecessor + 1) * 16];
+            let chosen = selected[position] as usize % 16;
+            let expected = 1.0 / row.iter().map(|v| (*v - row[chosen]).exp()).sum::<f32>();
+            assert!((confidence_values[position] - expected).abs() < 2e-6);
+            predecessor = chosen;
+        }
+        let mut expected = 1.0f32;
+        let mut survival = 1.0f32;
+        let mut best = expected / params.costs[1];
+        let mut rows = 1;
+        for position in 0..7 {
+            let q = confidence_values[position].clamp(1e-6, 1.0 - 1e-6);
+            let z = params.acceptance.slope * (q / (1.0 - q)).ln()
+                + params.acceptance.intercepts[position];
+            survival *= 1.0 / (1.0 + (-z).exp());
+            expected += survival;
+            let value = expected / params.costs[position + 2];
+            if value > best {
+                best = value;
+                rows = position + 2;
+            }
+        }
+        assert_eq!(budget.item_at_int32(0)?, rows as i32);
+        values[17] = 1.0;
+        let parameters = MxArray::from_float32(&values, &[18])?;
+        let all = MxArray::from_handle(
+            unsafe {
+                sys::mlx_dflash2_verify_budget(confidence.as_raw_ptr(), parameters.as_raw_ptr())
+            },
+            "all",
+        )?;
+        assert_eq!(all.item_at_int32(0)?, 8);
+        Ok(())
     }
 }

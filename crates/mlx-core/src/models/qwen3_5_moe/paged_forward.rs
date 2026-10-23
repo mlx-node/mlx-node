@@ -967,6 +967,11 @@ pub(crate) fn run_paged_decode_step(
             rope_position_offset,
             &mut None,
         )?;
+        crate::models::qwen3_5::paged_forward::maybe_submit_paged_decode_layer(
+            layer_idx,
+            num_layers,
+            &hidden_states,
+        );
     }
 
     let h = final_norm.forward(&hidden_states)?;
@@ -1044,6 +1049,11 @@ pub(crate) fn run_paged_step_with_hidden(
             rope_position_offset,
             &mut None,
         )?;
+        crate::models::qwen3_5::paged_forward::maybe_submit_paged_decode_layer(
+            layer_idx,
+            num_layers,
+            &hidden_states,
+        );
     }
 
     let h3 = final_norm.forward(&hidden_states)?;
@@ -1137,6 +1147,11 @@ pub(crate) fn run_paged_verify_step(
             rope_position_offset,
         )?;
         tape[layer_idx] = slot;
+        crate::models::qwen3_5::paged_forward::maybe_submit_paged_decode_layer(
+            layer_idx,
+            num_layers,
+            &hidden_states,
+        );
     }
 
     let hiddens = final_norm.forward(&hidden_states)?;
@@ -1241,6 +1256,7 @@ mod tests {
             persist_paged_cache: None,
             n_mtp_layers: 0,
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
         }
     }
 

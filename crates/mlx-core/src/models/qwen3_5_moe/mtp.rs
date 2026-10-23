@@ -897,6 +897,7 @@ mod tests {
             persist_paged_cache: None,
             n_mtp_layers: 1,
             qwen35_gguf_gdn_layout: None,
+            kv_format: None,
         }
     }
 

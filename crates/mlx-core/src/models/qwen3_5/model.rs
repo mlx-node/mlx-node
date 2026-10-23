@@ -382,12 +382,14 @@ pub struct Qwen3_5GenerationConfig {
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct Qwen35LoadOptions {
-    /// External z-lab DFlash2 checkpoint directory.
+    /// External DFlash2 checkpoint directory compatible with the target model.
     pub draft_model_path: Option<String>,
     /// Element format of the flat full-attention K/V cache: `'int8'`
     /// (per-token symmetric int8 rows with one fp32 scale each — half the
-    /// K/V memory and read bandwidth) or `'bf16'`. Unset: int8 on Metal with
-    /// 256-wide heads, BF16 elsewhere. The block-paged cache ignores it.
+    /// K/V memory and read bandwidth) or `'bf16'`. When neither this option
+    /// nor checkpoint config specifies a format, dense Qwen defaults to int8
+    /// on Metal with 256-wide heads and BF16 elsewhere; MoE defaults to BF16.
+    /// The block-paged cache ignores it.
     #[napi(ts_type = "'int8' | 'bf16' | undefined")]
     pub kv_format: Option<String>,
 }

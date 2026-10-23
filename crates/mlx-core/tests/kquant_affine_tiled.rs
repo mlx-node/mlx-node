@@ -230,6 +230,101 @@ fn worst_rel_to_exact(ours: &[u32], x: &MxArray, w: &Affine, n: i64) -> f64 {
     worst / peak
 }
 
+// Qwen35B DFlash2 shapes: merged QKV, merged gate/up, down, output,
+// target-tap fusion, cross-layer KV and dynamic convolution projection.
+const MOE_DRAFT_SHAPES: [(i64, i64); 7] = [
+    (2048, 6144),
+    (2048, 12288),
+    (6144, 2048),
+    (4096, 2048),
+    (16384, 2048),
+    (2048, 12288),
+    (2048, 512),
+];
+
+fn expected_affine_register(k: i64, n: i64) -> bool {
+    let eligible = n >= 2048 && n % 32 == 0 && k <= 8192;
+    let measured =
+        (k == 2048 && matches!(n, 6144 | 12288)) || (n == 2048 && matches!(k, 6144 | 4096));
+    eligible
+        && match std::env::var_os("MLX_KQUANT_REGISTER_AFFINE") {
+            None => measured,
+            Some(value) => value == "1",
+        }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "isolated AF4 register policy; compare unset, flag-off and flag-on processes"]
+fn affine_register_cpu_oracle() {
+    assert!(gpu_gen() >= 17);
+    let kq = affine_kquant(4, 64);
+    for (index, &(k, n)) in MOE_DRAFT_SHAPES.iter().enumerate() {
+        let enabled = expected_affine_register(k, n);
+        let w = Affine::new(&kq, n, k, 0xac10 + index as u32);
+        let t = tiled(&w.arrays, &kq);
+        for seed in [0xac70, 0xac71, 0xac72] {
+            let x = activation(&[8, k], seed, DType::BFloat16);
+            start_counting();
+            let (_, _, output) = read_output("affine register", qmm_tiled(&x, &t, &kq, GPU));
+            assert_eq!(family_count("qmv_sg8_t64"), u64::from(enabled));
+            stop_counting();
+            assert!(output.iter().all(|&value| bf16(value).is_finite()));
+            let error = worst_rel_to_exact(&output, &x, &w, n);
+            println!(
+                "affine_register={enabled} M=8 N={n} K={k} seed={seed} sampled_peak_error={error:.6}"
+            );
+            assert!(
+                error <= 0.005,
+                "AF4 output exceeds 0.5% of exact-product peak"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "bounded GPU microbenchmark; run with one GPU workload and alternate the flag"]
+fn affine_register_microbenchmark() {
+    assert!(gpu_gen() >= 17);
+    let kq = affine_kquant(4, 64);
+    for (index, &(k, n)) in MOE_DRAFT_SHAPES.iter().enumerate() {
+        let enabled = expected_affine_register(k, n);
+        let w = Affine::new(&kq, n, k, 0xac10 + index as u32);
+        let t = tiled(&w.arrays, &kq);
+        let x = activation(&[8, k], 0xac70, DType::BFloat16);
+        const BATCH: usize = 64;
+        let evaluate = || {
+            let mut outputs: Vec<_> = (0..BATCH).map(|_| qmm_tiled(&x, &t, &kq, GPU)).collect();
+            assert!(outputs.iter().all(|pointer| !pointer.is_null()));
+            let mut error = [0i8; 512];
+            let start = std::time::Instant::now();
+            assert!(unsafe {
+                mlx_sys::mlx_eval_with_error(
+                    outputs.as_mut_ptr(),
+                    outputs.len(),
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            });
+            let elapsed = start.elapsed().as_secs_f64() * 1e6 / BATCH as f64;
+            for output in outputs {
+                unsafe { mlx_sys::mlx_array_delete(output) };
+            }
+            elapsed
+        };
+        for _ in 0..10 {
+            evaluate();
+        }
+        let mut times: Vec<_> = (0..60).map(|_| evaluate()).collect();
+        times.sort_by(f64::total_cmp);
+        println!(
+            "affine_register={enabled} M=8 N={n} K={k} median_us={:.3} p10_us={:.3}",
+            times[30], times[6]
+        );
+    }
+}
+
 const ROW_MAJOR_FAMILIES: [&str; 11] = [
     "qmv",
     "qmv_fast",
@@ -535,4 +630,86 @@ fn affine_row_major_matmul_is_refused_on_metal() {
         "gpu dequantize",
         dequantize(&w.arrays, DType::BFloat16, &kq, GPU),
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "exclusive GPU, measured AF4 defaults and broad explicit opt-in dispatch"]
+fn affine_register_default_shape_allowlist_and_optout() {
+    assert!(gpu_gen() >= 17);
+    struct Restore(&'static str, Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.1 {
+                    Some(v) => std::env::set_var(self.0, v),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+    }
+    let flag = "MLX_KQUANT_REGISTER_AFFINE";
+    let _flag = Restore(flag, std::env::var_os(flag));
+    let _split = Restore(
+        "MLX_KQUANT_SG8_SPLIT_K",
+        std::env::var_os("MLX_KQUANT_SG8_SPLIT_K"),
+    );
+    unsafe { std::env::set_var("MLX_KQUANT_SG8_SPLIT_K", "0") };
+    let q = affine_kquant(4, 64);
+    for (index, (k, n, measured, eligible)) in [
+        (2048, 6144, true, true),
+        (2048, 12288, true, true),
+        (6144, 2048, true, true),
+        (4096, 2048, true, true),
+        (2048, 4096, false, true),
+        (8192, 2048, false, true),
+        (16384, 2048, false, false),
+        (2048, 512, false, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let w = Affine::new(&q, n, k, 0xad10 + index as u32);
+        let t = tiled(&w.arrays, &q);
+        let x = activation(&[8, k], 0xad70, DType::BFloat16);
+        let mut results = Vec::new();
+        for value in [None, Some("1"), Some("0"), Some("invalid")] {
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(flag, v),
+                    None => std::env::remove_var(flag),
+                }
+            }
+            let enabled = match value {
+                None => measured,
+                Some("1") => eligible,
+                _ => false,
+            };
+            assert_eq!(expected_affine_register(k, n), enabled);
+            start_counting();
+            let output = read_output("affine default allowlist", qmm_tiled(&x, &t, &q, GPU));
+            assert_eq!(
+                family_count("qmv_sg8_t64"),
+                u64::from(enabled),
+                "K{k} N{n} flag={value:?}"
+            );
+            stop_counting();
+            results.push(output);
+        }
+        assert_eq!(
+            results[0],
+            results[if measured { 1 } else { 2 }],
+            "unset must match the selected existing route K{k} N{n}"
+        );
+        assert_eq!(
+            results[2], results[3],
+            "unknown flag values remain disabled"
+        );
+        if !eligible {
+            assert_eq!(
+                results[1], results[2],
+                "explicit 1 must retain shape fallback"
+            );
+        }
+    }
 }

@@ -5,15 +5,7 @@
 use super::*;
 
 pub(super) fn fresh_moe_layer_caches(config: &Qwen3_5MoeConfig) -> Vec<Qwen3_5LayerCache> {
-    (0..config.num_layers as usize)
-        .map(|i| {
-            if config.is_linear_layer(i) {
-                Qwen3_5LayerCache::new_linear()
-            } else {
-                Qwen3_5LayerCache::new_full_attention()
-            }
-        })
-        .collect()
+    Qwen3_5LayerCache::fresh_layer_caches(&config.to_dense_config())
 }
 
 pub(super) struct MoeGdnPrefixCheckpoint {

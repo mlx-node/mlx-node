@@ -121,7 +121,8 @@ async fn qwen3_5_moe_cold_tier_restart_parity() {
         |model_dir, messages, config| async move {
             // Loaded fresh per instance and dropped when this future
             // completes, so instance 2 really starts from an empty hot cache.
-            let model = qwen3_5_moe_load_with_thread(&model_dir.to_string_lossy()).await?;
+            let model =
+                qwen3_5_moe_load_with_thread(&model_dir.to_string_lossy(), None, None).await?;
             model.chat_session_start(messages, Some(config)).await
         },
     )

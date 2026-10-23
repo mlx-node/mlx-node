@@ -1,0 +1,17 @@
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -750,8 +750,11 @@
+       }
+       ++trace_encoders_;
+     }
+-    encoder_ = NS::RetainPtr(
+-        buffer_->computeCommandEncoder(MTL::DispatchTypeConcurrent));
++    // Serial dispatch is an opt-in comparison with fixed-graph runtimes.
++    // Keep the usual resource bookkeeping and cross-encoder fences.
++    static const bool serial = env::get_var("MLX_METAL_SERIAL_ENCODER", 0) == 1;
++    encoder_ = NS::RetainPtr(buffer_->computeCommandEncoder(
++        serial ? MTL::DispatchTypeSerial : MTL::DispatchTypeConcurrent));
+     fence_ = NS::TransferPtr(device_.mtl_device()->newFence());
+   }
+   return encoder_.get();

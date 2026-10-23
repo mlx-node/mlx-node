@@ -44,13 +44,16 @@
 // Stale dirs are deliberately NOT deleted: they are live cargo cache for
 // other toolchains/branches, and deleting them forces a full MLX rebuild.
 import { readdirSync, readFileSync, statSync, type Stats } from 'node:fs';
-import { dirname, join, normalize } from 'node:path';
+import { join, normalize } from 'node:path';
 
 export interface MetallibCandidate {
-  /** `.../mlx-sys-<hash>/out/lib` — also holds paged_attn.metallib. */
+  /** Cargo OUT_DIR, including when CMake installs in its mlx-cmake child. */
+  outDir: string;
+  /** The MLX install directory — also holds paged_attn.metallib. */
   libDir: string;
   metallibPath: string;
   size: number;
+  metallibMtimeMs: number;
   /** Newest cargo activity observed for this build-script dir (ms). */
   rankMtimeMs: number;
 }
@@ -177,9 +180,9 @@ export interface MetallibBinding {
   bakedPath: string;
   /** `.../mlx-sys-<hash>/out` — OUT_DIR of the bound mlx-sys build (origin of paged_attn.metallib). */
   outDir: string;
-  /** `.../out/lib` — install dir holding both metallibs in either mode. */
+  /** `.../out/[mlx-cmake/]lib` — install dir holding both metallibs. */
   libDir: string;
-  /** `.../out/lib/mlx.metallib` — cmake-install copy of `bakedPath`; same file as `bakedPath` for 'prebuilt'. */
+  /** CMake install copy of `bakedPath`; same file as `bakedPath` for 'prebuilt'. */
   installCopyPath: string;
   /** `mlx-prebuilt-<mlx sha12>-<build key8>` for 'prebuilt'. */
   prebuiltTag?: string;
@@ -192,7 +195,8 @@ export interface MetallibBinding {
  * `kernels//` double slash comes from CMake joining a dir that already ends in
  * `/`; accept both forms.
  */
-const BAKED_METAL_PATH_RE = /^(\/.+\/mlx-sys-[0-9a-f]+\/out)\/build\/mlx\/backend\/metal\/kernels\/{1,2}mlx\.metallib$/;
+const BAKED_METAL_PATH_RE =
+  /^(\/.+\/mlx-sys-[0-9a-f]+\/out)(\/mlx-cmake)?\/build\/mlx\/backend\/metal\/kernels\/{1,2}mlx\.metallib$/;
 
 /**
  * METAL_PATH of a prebuilt libmlx.a: build.rs (`MLX_PREBUILT_EXPORT`) sets
@@ -276,7 +280,7 @@ export function extractBakedMetallibBinding(addonBinary: Buffer): MetallibBindin
           `paged_attn.metallib origin names ${pagedOutDir} — two different mlx-sys builds were linked.`,
       );
     }
-    const libDir = join(outDir, 'lib');
+    const libDir = join(outDir, sourceMatch[2] === undefined ? '' : 'mlx-cmake', 'lib');
     return {
       kind: 'source',
       // normalize() collapses the `kernels//mlx.metallib` double slash
@@ -465,7 +469,7 @@ export function selectMetallib(opts: {
           .join('\n'),
     );
   }
-  return { outDir: dirname(picked.libDir), libDir: picked.libDir, metallibPath: picked.metallibPath, source: 'scan' };
+  return { outDir: picked.outDir, libDir: picked.libDir, metallibPath: picked.metallibPath, source: 'scan' };
 }
 
 export interface SelectedPagedMetallib {
@@ -650,27 +654,39 @@ export function collectMetallibCandidates(targetRoot: string, triple: string, pr
     for (const dir of entries) {
       if (!dir.startsWith('mlx-sys-')) continue;
       const scriptDir = join(buildRoot, dir);
-      const libDir = join(scriptDir, 'out', 'lib');
-      const metallibPath = join(libDir, 'mlx.metallib');
-      // Dirs without a metallib are skipped; an uninspectable one throws
-      // (via statIfExists) rather than being mistaken for absent.
-      const metallibStat = statIfExists(metallibPath);
-      if (metallibStat === undefined) continue;
+      const outDir = join(scriptDir, 'out');
       // `invoked.timestamp` is rewritten when cargo (re)runs the build
       // script; the metallib/`output` mtimes cover reused cached outputs.
-      let rankMtimeMs = metallibStat.mtimeMs;
+      let scriptMtimeMs = 0;
       for (const probe of ['invoked.timestamp', 'output']) {
         // Probe files are optional; when absent the mtimes we have rank the
         // dir. Unreadable probes throw — they would corrupt the ranking.
         const probeStat = statIfExists(join(scriptDir, probe));
         if (probeStat !== undefined) {
-          rankMtimeMs = Math.max(rankMtimeMs, probeStat.mtimeMs);
+          scriptMtimeMs = Math.max(scriptMtimeMs, probeStat.mtimeMs);
         }
       }
-      candidates.push({ libDir, metallibPath, size: metallibStat.size, rankMtimeMs });
+      for (const libDir of [join(outDir, 'lib'), join(outDir, 'mlx-cmake', 'lib')]) {
+        const metallibPath = join(libDir, 'mlx.metallib');
+        // Dirs without a metallib are skipped; an uninspectable one throws
+        // (via statIfExists) rather than being mistaken for absent.
+        const metallibStat = statIfExists(metallibPath);
+        if (metallibStat === undefined) continue;
+        candidates.push({
+          outDir,
+          libDir,
+          metallibPath,
+          size: metallibStat.size,
+          metallibMtimeMs: metallibStat.mtimeMs,
+          rankMtimeMs: Math.max(scriptMtimeMs, metallibStat.mtimeMs),
+        });
+      }
     }
     if (candidates.length > 0) {
-      return candidates.sort((a, b) => b.rankMtimeMs - a.rankMtimeMs);
+      // A reused OUT_DIR can contain both layouts after switching between
+      // source and prebuilt builds. Its Cargo timestamps are identical, so
+      // use the artifact's own timestamp to order these fallback candidates.
+      return candidates.sort((a, b) => b.rankMtimeMs - a.rankMtimeMs || b.metallibMtimeMs - a.metallibMtimeMs);
     }
   }
   return [];

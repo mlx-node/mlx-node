@@ -1,0 +1,19 @@
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -60,6 +60,15 @@ class MLX_API CommandEncoder {
+   void retain_inputs(const array& arr);
+ 
+   void dispatch_threadgroups(MTL::Size grid_dims, MTL::Size group_dims);
++  // Register the argument buffer as an input before this dispatch.
++  void dispatch_threadgroups_indirect(
++      const MTL::Buffer* arguments,
++      size_t offset,
++      MTL::Size group_dims) {
++    maybeInsertBarrier();
++    ++buffer_ops_;
++    get_command_encoder()->dispatchThreadgroups(arguments, offset, group_dims);
++  }
+   void dispatch_threads(MTL::Size grid_dims, MTL::Size group_dims);
+   void maybeInsertBarrier();
+ 

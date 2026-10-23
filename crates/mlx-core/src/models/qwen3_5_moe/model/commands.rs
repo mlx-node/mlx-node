@@ -188,6 +188,7 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
 
     fn supports_scheduled_speculation(&self) -> bool {
         self.has_mtp_weights()
+            && self.dflash2.is_none()
             && self.paged_adapter.is_some()
             && self.config.recurrent_state_bytes() > 0
             && self.cached_rope_deltas.unwrap_or(0) == 0

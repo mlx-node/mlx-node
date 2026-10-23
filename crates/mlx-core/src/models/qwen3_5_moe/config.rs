@@ -131,6 +131,12 @@ pub struct Qwen3_5MoeConfig {
     #[serde(default)]
     #[napi(ts_type = "string | undefined")]
     pub qwen35_gguf_gdn_layout: Option<String>,
+
+    /// Flat full-attention cache format. MoE keeps BF16 by default;
+    /// `int8` enables per-row quantized K/V for compatible Metal heads.
+    #[serde(default)]
+    #[napi(ts_type = "string | undefined")]
+    pub kv_format: Option<String>,
 }
 
 fn default_linear_num_value_heads() -> i32 {
@@ -207,10 +213,12 @@ impl Qwen3_5MoeConfig {
             persist_paged_cache: None,
             n_mtp_layers: self.n_mtp_layers,
             qwen35_gguf_gdn_layout: self.qwen35_gguf_gdn_layout.clone(),
-            // The MoE caches are built BF16 explicitly; pin the dense view to
-            // the same so `kv_format()` never advertises a format they lack.
-            kv_format: Some("bf16".to_string()),
+            kv_format: self.kv_format.clone().or_else(|| Some("bf16".to_string())),
         }
+    }
+
+    pub fn kv_format(&self) -> crate::transformer::KvFormat {
+        self.to_dense_config().kv_format()
     }
 
     /// Number of full-attention layers, used to size the paged adapter

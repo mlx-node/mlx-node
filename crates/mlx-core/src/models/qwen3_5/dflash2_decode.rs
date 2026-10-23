@@ -59,7 +59,7 @@ fn dflash2_gdn_blob_enabled() -> bool {
         .is_none_or(|value| value.trim() != "0")
 }
 
-fn reusable_dflash2_prefix(
+pub(crate) fn reusable_dflash2_prefix(
     is_delta: bool,
     tokens: &[u32],
     prior_cached: usize,
@@ -97,7 +97,7 @@ fn flat_attention_frontier(inner: &Qwen35Inner) -> Option<usize> {
     frontiers.all(|frontier| frontier == first).then_some(first)
 }
 
-fn constrain_dflash2_context_params(
+pub(crate) fn constrain_dflash2_context_params(
     prompt_tokens: usize,
     target_capacity: i32,
     draft_capacity: usize,
@@ -114,7 +114,7 @@ fn constrain_dflash2_context_params(
     Ok(capacity)
 }
 
-fn dflash2_final_token_fits_context(logical_len: i32, capacity: usize) -> bool {
+pub(crate) fn dflash2_final_token_fits_context(logical_len: i32, capacity: usize) -> bool {
     usize::try_from(logical_len).is_ok_and(|logical_len| logical_len < capacity)
 }
 
@@ -125,7 +125,7 @@ const DFLASH2_KV_HEADROOM_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Growth step of the flat `KVCache`; a smaller look-ahead saves nothing.
 const DFLASH2_KV_MIN_AHEAD_ROWS: u64 = 256;
 
-fn dflash2_memory_snapshot() -> PagedPrefillMemorySnapshot {
+pub(crate) fn dflash2_memory_snapshot() -> PagedPrefillMemorySnapshot {
     let (mut active, mut cached, mut limit) = (0u64, 0u64, 0u64);
     // SAFETY: each probe writes one u64 through a valid pointer and reports
     // failure through its return code.
@@ -149,7 +149,7 @@ fn dflash2_memory_snapshot() -> PagedPrefillMemorySnapshot {
 
 /// Bytes the target KV reservation may claim, or `None` when the device
 /// limits cannot be read.
-fn dflash2_kv_budget_bytes(snapshot: PagedPrefillMemorySnapshot) -> Option<u64> {
+pub(crate) fn dflash2_kv_budget_bytes(snapshot: PagedPrefillMemorySnapshot) -> Option<u64> {
     live_prefill_headroom(snapshot)
         .selected_bytes
         .map(|headroom| headroom.saturating_sub(DFLASH2_KV_HEADROOM_RESERVE_BYTES) / 10 * 9)
@@ -158,7 +158,7 @@ fn dflash2_kv_budget_bytes(snapshot: PagedPrefillMemorySnapshot) -> Option<u64> 
 /// Bytes one token row costs across every full-attention K and V tensor:
 /// `head_dim x activation bytes` per (layer, head, tensor) for BF16 rows,
 /// `head_dim + 4` (int8 row plus its fp32 scale) for the int8 format.
-fn kv_row_bytes(
+pub(crate) fn kv_row_bytes(
     full_attention_layers: usize,
     kv_heads: i32,
     head_dim: i32,
@@ -177,7 +177,7 @@ fn kv_row_bytes(
 /// Growing a live buffer allocates the whole new buffer while the old one is
 /// still alive, so every prompt row is charged unless `resident_rows` already
 /// hold the whole turn.
-fn dflash2_kv_reserve_rows(
+pub(crate) fn dflash2_kv_reserve_rows(
     prompt_len: usize,
     max_new_tokens: i32,
     resident_rows: i64,
@@ -318,7 +318,7 @@ fn dflash2_cycle_transient(
 
 /// Decode-phase allocator free-pool ceiling for one DFlash2 turn: the
 /// transient estimate above through `cache_limit::decode_cache_limit`.
-fn dflash2_decode_cache_limit(
+pub(crate) fn dflash2_decode_cache_limit(
     config: &super::config::Qwen3_5Config,
     block_size: usize,
     context_rows: u64,
@@ -337,7 +337,7 @@ const SDPA_KEYS_PER_PARTITION: u64 = 64;
 
 /// Smallest full-attention buffer capacity, `None` without full-attention
 /// caches.
-fn min_fa_capacity(caches: &Option<Vec<Qwen3_5LayerCache>>) -> Result<Option<i64>> {
+pub(crate) fn min_fa_capacity(caches: &Option<Vec<Qwen3_5LayerCache>>) -> Result<Option<i64>> {
     let mut min = None;
     for cache in caches.iter().flatten() {
         if let Qwen3_5LayerCache::FullAttention(kv) = cache {
@@ -348,7 +348,10 @@ fn min_fa_capacity(caches: &Option<Vec<Qwen3_5LayerCache>>) -> Result<Option<i64
     Ok(min)
 }
 
-fn reserve_dflash2_target_kv(caches: &mut Option<Vec<Qwen3_5LayerCache>>, rows: i64) -> Result<()> {
+pub(crate) fn reserve_dflash2_target_kv(
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    rows: i64,
+) -> Result<()> {
     let caches = caches
         .as_mut()
         .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?;
@@ -448,6 +451,7 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             max_len,
             temperature,
             greedy_fast,
+            None,
             rng,
         )?;
         let (draft_ids, device_draft_ids) = match path {
@@ -2509,6 +2513,7 @@ mod tests {
                         DRAFT_LEN,
                         0.0,
                         true,
+                        None,
                         rng,
                     )?;
                     match path {

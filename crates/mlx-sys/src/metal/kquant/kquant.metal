@@ -5,6 +5,7 @@
 #include "mlx/backend/metal/kernels/steel/gemm/gemm.h"
 #include "mlx/backend/metal/kernels/quantized_utils.h"
 #include "kquant.h"
+#include "tiled_gather_m1.h"
 
 // Every kernel mlx_kquant_metal.cpp can request, prebuilt into
 // paged_attn.metallib. The host names must match kquant::kernels in
@@ -260,14 +261,25 @@ instantiate_kquant_types(float)
 instantiate_kquant_types(float16_t)
 #elif KQUANT_DTYPE == 2
 instantiate_kquant_types(bfloat16_t)
+instantiate_kernel("q4k_gather_t64_m1", kquant_tiled_gather_m1, 4)
+instantiate_kernel("q5k_gather_t64_m1", kquant_tiled_gather_m1, 5)
+instantiate_kernel("q6k_gather_t64_m1", kquant_tiled_gather_m1, 6)
 
 // M = 8 simdgroup-matrix qmv: bfloat16 only, and only the modes kq_sg8::format
 // decodes (q2k, q3k, iq4nl, iq3s8 and the grid modes take qmm_m8_nax or
 // qmv_wide).
 instantiate_kquant(q6k, qmv_sg8, bfloat16_t, 16, 6, 16, false, KQ_LINEAR, 0)
 instantiate_kquant(q4k, qmv_sg8, bfloat16_t, 32, 4, 8, true, KQ_LINEAR, 0)
+instantiate_kernel("q4k_qmv_sg8_t64_bfloat16_t_gs_32_b_4", kquant_qmv_sg8, bfloat16_t, 32, 4, 8, true, KQ_LINEAR, 0, true)
+instantiate_kernel("a4g64_qmv_sg8_t64_bfloat16_t_gs_64_b_4", kquant_qmv_sg8, bfloat16_t, 64, 4, 4, false, KQ_AFFINE, 0, true)
 instantiate_kquant(q5k, qmv_sg8, bfloat16_t, 32, 5, 8, true, KQ_LINEAR, 0)
 instantiate_kquant(iq4xs, qmv_sg8, bfloat16_t, 32, 4, 8, false, KQ_CODEBOOK, 0)
+instantiate_kquant(q6k, qmv_sg8_split, bfloat16_t, 16, 6, 16, false, KQ_LINEAR, 0)
+instantiate_kquant(q4k, qmv_sg8_split, bfloat16_t, 32, 4, 8, true, KQ_LINEAR, 0)
+instantiate_kernel("q4k_qmv_sg8_split_t64_bfloat16_t_gs_32_b_4", kquant_qmv_sg8_split, bfloat16_t, 32, 4, 8, true, KQ_LINEAR, 0, true)
+instantiate_kernel("a4g64_qmv_sg8_split_t64_bfloat16_t_gs_64_b_4", kquant_qmv_sg8_split, bfloat16_t, 64, 4, 4, false, KQ_AFFINE, 0, true)
+instantiate_kquant(q5k, qmv_sg8_split, bfloat16_t, 32, 5, 8, true, KQ_LINEAR, 0)
+instantiate_kquant(iq4xs, qmv_sg8_split, bfloat16_t, 32, 4, 8, false, KQ_CODEBOOK, 0)
 instantiate_kernel("kquant_qmv_sg8_prep_bfloat16_t_gs_16", kquant_qmv_sg8_prep, bfloat16_t, 16)
 instantiate_kernel("kquant_qmv_sg8_prep_bfloat16_t_gs_32", kquant_qmv_sg8_prep, bfloat16_t, 32)
 #else

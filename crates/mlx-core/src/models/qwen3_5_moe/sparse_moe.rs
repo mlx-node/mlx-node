@@ -17,6 +17,8 @@ pub struct SparseMoeBlock {
     num_experts: i32,
     num_experts_per_tok: i32,
     norm_topk_prob: bool,
+    source_residual_compatible: bool,
+    source_moe_policy: super::source_math_policy::SourceMoePolicy,
 }
 
 impl SparseMoeBlock {
@@ -63,10 +65,30 @@ impl SparseMoeBlock {
             num_experts,
             num_experts_per_tok,
             norm_topk_prob,
+            source_residual_compatible: source_residual_profile(config),
+            source_moe_policy: Default::default(),
         })
     }
 
+    pub(crate) fn configure_source_moe_policy(
+        &mut self,
+        policy: super::source_math_policy::SourceMoePolicy,
+    ) {
+        self.source_moe_policy = policy;
+    }
+
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
+        self.forward_with_budget(x, None)
+    }
+
+    /// The grouped path skips expert work outside the device-selected prefix.
+    /// Generic projections retain full evaluation; acceptance still caps the
+    /// committed prefix, while the physical verifier/cache shapes stay fixed.
+    pub fn forward_with_budget(
+        &self,
+        x: &MxArray,
+        row_budget: Option<&MxArray>,
+    ) -> Result<MxArray> {
         let shape = x.shape()?;
         if shape.len() != 3 {
             return Err(Error::from_reason(format!(
@@ -81,7 +103,47 @@ impl SparseMoeBlock {
         let k = self.num_experts_per_tok as i64;
 
         let x_flat = x.reshape(&[ne, hidden_size])?;
+        if let Some((router, shared)) = self.source_router_weights(x)? {
+            return self
+                .switch_mlp
+                .forward_grouped(
+                    &x_flat,
+                    &router,
+                    &shared,
+                    &self.shared_expert,
+                    self.num_experts_per_tok,
+                    self.norm_topk_prob,
+                    row_budget,
+                    true,
+                    true,
+                    None,
+                )?
+                .reshape(&[batch, seq_len, hidden_size]);
+        }
         let router_logits = self.gate.forward(&x_flat)?;
+
+        if self.num_experts_per_tok <= 8
+            && self
+                .switch_mlp
+                .supports_grouped(&self.shared_expert, &x_flat)?
+        {
+            let shared_logits = self.shared_expert_gate.forward(&x_flat)?;
+            return self
+                .switch_mlp
+                .forward_grouped(
+                    &x_flat,
+                    &router_logits,
+                    &shared_logits,
+                    &self.shared_expert,
+                    self.num_experts_per_tok,
+                    self.norm_topk_prob,
+                    row_budget,
+                    self.source_moe_policy.body,
+                    false,
+                    None,
+                )?
+                .reshape(&[batch, seq_len, hidden_size]);
+        }
 
         // Routing math (softmax-then-topk, optionally renormalized) is shared
         // with the gpt-oss / privacy-filter path via `moe::topk_from_logits`.
@@ -108,6 +170,80 @@ impl SparseMoeBlock {
 
         let output = expert_output.add(&shared_contribution)?;
         output.reshape(&[batch, seq_len, hidden_size])
+    }
+
+    /// Load-captured, M8-only arithmetic diagnostic. None preserves the
+    /// ordinary FFN+residual path; Some is already the residual-inclusive hidden.
+    pub(crate) fn forward_source_residual(
+        &self,
+        x: &MxArray,
+        residual: &MxArray,
+        row_budget: Option<&MxArray>,
+    ) -> Result<Option<MxArray>> {
+        if !self.source_moe_policy.residual
+            || !self.source_residual_compatible
+            || x.shape()?.as_ref() != [1, 8, 2048]
+            || residual.shape()?.as_ref() != x.shape()?.as_ref()
+            || x.dtype()? != crate::array::DType::BFloat16
+            || residual.dtype()? != crate::array::DType::BFloat16
+            || !unsafe { mlx_sys::mlx_splash_moe_source_residual_available() }
+            || !self
+                .switch_mlp
+                .supports_source_residual(&self.shared_expert)?
+        {
+            return Ok(None);
+        }
+        let flat = x.reshape(&[8, 2048])?;
+        let residual = residual.reshape(&[8, 2048])?;
+        let source_weights = self.source_router_weights(x)?;
+        let source_routing = source_weights.is_some();
+        let (logits, shared) = match source_weights {
+            Some(weights) => weights,
+            None => (
+                self.gate.forward(&flat)?,
+                self.shared_expert_gate.forward(&flat)?,
+            ),
+        };
+        if logits.dtype()? != crate::array::DType::BFloat16
+            || shared.dtype()? != crate::array::DType::BFloat16
+        {
+            return Ok(None);
+        }
+        self.switch_mlp
+            .forward_grouped(
+                &flat,
+                &logits,
+                &shared,
+                &self.shared_expert,
+                self.num_experts_per_tok,
+                self.norm_topk_prob,
+                row_budget,
+                self.source_moe_policy.body,
+                source_routing,
+                Some(&residual),
+            )?
+            .reshape(&[1, 8, 2048])
+            .map(Some)
+    }
+
+    /// The copied source router needs an exact, unquantized BF16 matrix. The
+    /// checkpoint's F32 router weights are exactly BF16-representable, so this
+    /// widens the existing operands without a duplicate F32 weight allocation.
+    /// Other shapes, biased/quantized gates, and devices keep native routing.
+    fn source_router_weights(&self, x: &MxArray) -> Result<Option<(MxArray, MxArray)>> {
+        if !self.source_moe_policy.routing
+            || !self.source_residual_compatible
+            || !self.norm_topk_prob
+            || x.shape()?.as_ref() != [1, 8, 2048]
+            || x.dtype()? != crate::array::DType::BFloat16
+            || !unsafe { mlx_sys::mlx_splash_moe_source_residual_available() }
+            || !self
+                .switch_mlp
+                .supports_source_residual(&self.shared_expert)?
+        {
+            return Ok(None);
+        }
+        source_router_weights_from_projections(&self.gate, &self.shared_expert_gate)
     }
 
     // ========== Weight getters (for training parameter extraction) ==========
@@ -223,5 +359,89 @@ impl SparseMoeBlock {
             gate_up: None,
         };
         self.shared_expert.finalize_gate_up()
+    }
+
+    pub(crate) fn finalize_grouped_layout(&mut self) -> Result<bool> {
+        if self.num_experts_per_tok > 8 {
+            return Ok(false);
+        }
+        self.switch_mlp.tile_grouped_layout(&self.shared_expert)
+    }
+}
+
+pub(super) fn source_residual_profile(config: &Qwen3_5MoeConfig) -> bool {
+    config.hidden_size == 2048
+        && config.num_layers == 40
+        && config.num_experts == 256
+        && config.num_experts_per_tok == 8
+        && config
+            .moe_intermediate_size
+            .unwrap_or(config.intermediate_size)
+            == 512
+        && config
+            .shared_expert_intermediate_size
+            .unwrap_or(config.intermediate_size)
+            == 512
+}
+
+fn source_router_weights_from_projections(
+    gate: &LinearProj,
+    shared_gate: &LinearProj,
+) -> Result<Option<(MxArray, MxArray)>> {
+    let (LinearProj::Standard(gate), LinearProj::Standard(shared)) = (gate, shared_gate) else {
+        return Ok(None);
+    };
+    if gate.is_quantized()
+        || shared.is_quantized()
+        || gate.get_bias().is_some()
+        || shared.get_bias().is_some()
+    {
+        return Ok(None);
+    }
+    let router = gate.get_weight();
+    let shared = shared.get_weight();
+    if router.shape()?.as_ref() != [256, 2048]
+        || shared.shape()?.as_ref() != [1, 2048]
+        || router.dtype()? != crate::array::DType::BFloat16
+        || shared.dtype()? != crate::array::DType::BFloat16
+    {
+        return Ok(None);
+    }
+    Ok(Some((router, shared)))
+}
+
+#[cfg(test)]
+mod source_router_tests {
+    use super::*;
+    use crate::array::DType;
+
+    fn gate(rows: u32, dtype: DType, bias: bool) -> Result<LinearProj> {
+        let mut gate = Linear::new(2048, rows, Some(bias))?;
+        gate.set_weight(&MxArray::zeros(&[rows as i64, 2048], Some(dtype))?)?;
+        Ok(LinearProj::Standard(gate))
+    }
+
+    #[test]
+    fn source_router_rejects_biased_wrong_shape_and_non_bf16_projections() -> Result<()> {
+        let router = gate(256, DType::BFloat16, false)?;
+        let shared = gate(1, DType::BFloat16, false)?;
+        let original = source_router_weights_from_projections(&router, &shared)?.unwrap();
+        assert_eq!(original.0.shape()?.as_ref(), [256, 2048]);
+        assert_eq!(original.1.shape()?.as_ref(), [1, 2048]);
+        for bad_router in [
+            gate(255, DType::BFloat16, false)?,
+            gate(256, DType::Float32, false)?,
+            gate(256, DType::BFloat16, true)?,
+        ] {
+            assert!(source_router_weights_from_projections(&bad_router, &shared)?.is_none());
+        }
+        for bad_shared in [
+            gate(2, DType::BFloat16, false)?,
+            gate(1, DType::Float32, false)?,
+            gate(1, DType::BFloat16, true)?,
+        ] {
+            assert!(source_router_weights_from_projections(&router, &bad_shared)?.is_none());
+        }
+        Ok(())
     }
 }

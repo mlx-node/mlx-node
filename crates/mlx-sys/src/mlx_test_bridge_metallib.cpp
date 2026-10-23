@@ -43,11 +43,24 @@ extern "C" bool mlx_test_bridge_metallib_check(const char *family,
     if (std::strcmp(family, "segmented_sdpa") == 0) {
       prefix = "mlx_node_sdpa_segmented";
       names = segmented_sdpa::metal_kernel_names();
-      build = [&d] {
+      build = [&d, &names] {
         int64_t built = 0;
         for (const auto &sp : segmented_sdpa::metal_kernel_specializations()) {
           segmented_sdpa::segmented_kernel(d, sp);
           ++built;
+        }
+        // These NAX-only experimental pipelines use separate complete names,
+        // without the legacy function-constant specialization record. Cover
+        // every FP32 partial shape and both bounded reducers explicitly.
+        if (metal::is_nax_available()) {
+          for (const auto &name : names) {
+            const bool fp32 = name.size() >= 5 &&
+                name.compare(name.size() - 5, 5, "_fp32") == 0;
+            const bool reducer = name.rfind("mlx_node_sdpa_segmented_reduce_256_", 0) == 0;
+            if (!fp32 && !reducer) continue;
+            fast::paged::get_prebuilt_kernel(d, "segmented_sdpa", "NAX pipeline check", name);
+            ++built;
+          }
         }
         return built;
       };
@@ -62,6 +75,21 @@ extern "C" bool mlx_test_bridge_metallib_check(const char *family,
           ++built;
         }
         return built;
+      };
+    } else if (std::strcmp(family, "splash_moe") == 0) {
+      prefix = "splash_moe_";
+      names = {"splash_moe_route", "splash_moe_group", "splash_moe_gather",
+          "splash_moe_gate_up_8", "splash_moe_gate_up_32",
+          "splash_moe_down_8", "splash_moe_down_32",
+          "splash_moe_gate_up_source_8", "splash_moe_down_source_8",
+          "splash_moe_combine", "splash_moe_probe_scatter",
+          "splash_moe_gather_sg8", "splash_moe_gate_up_sg8",
+          "splash_moe_down_sg8", "splash_moe_sg8_pack_probe"};
+      build = [&d, &names] {
+        if (!metal::is_nax_available()) return int64_t(0);
+        for (const auto& name : names)
+          fast::paged::get_prebuilt_kernel(d, "splash_moe", "grouped", name);
+        return int64_t(names.size());
       };
     } else {
       return false;

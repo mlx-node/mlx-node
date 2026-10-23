@@ -539,7 +539,7 @@ export interface SessionCapableModel {
    * MTP: whether the underlying native model can run speculative
    * decoding. Surfaced by `Qwen3_5Model` / `Qwen3_5MoeModel` (an MTP
    * head shipped in the checkpoint, or an external DFlash2 companion on
-   * dense Qwen3.5) and by
+   * dense or MoE Qwen3.5) and by
    * `Gemma4Model` (an external draft model — DSpark or Google gemma-4
    * assistant, auto-detected from the draft's config.json — attached
    * via `loadModel` / `loadSession` `draftModelPath`; NOT in-checkpoint
@@ -602,12 +602,17 @@ export interface SessionCapableModel {
    * `SendOptions.config` is the recommended path for callers that
    * just want speculative decoding "on with sensible defaults".
    *
-   * ## Qwen3.8 DFlash2 (`draftModelPath`)
+   * ## Qwen DFlash2 (`draftModelPath`)
    *
-   * A dense Qwen3.8 target can attach `z-lab/Qwen3.8-27B-DFlash2`. Its
+   * A dense Qwen3.8 target can attach `z-lab/Qwen3.8-27B-DFlash2`; a
+   * 35B-A3B MoE target can attach `incoai/Qwen3.6-35B-A3B-DFlash2`. The
    * checkpoint block size is 8 total target rows: one anchor plus seven
    * proposals. The full checkpoint width is used; `mtpDepth` is ignored.
-   * `mtpAdaptiveDepth` is also ignored for this fixed-width companion.
+   * For MoE targets, `mtpAdaptiveDepth: true` selects how many of those
+   * rows to verify using draft confidence and measured cycle cost. It skips
+   * routed expert work beyond that prefix and caps acceptance accordingly;
+   * physical cache shapes stay at eight rows. The default verifies all rows.
+   * Dense DFlash2 targets ignore `mtpAdaptiveDepth`.
    * Native MTP and other draft families retain their own adaptive policies.
    * DFlash2 uses flat target caches so hybrid GDN state can be rewound by
    * snapshot plus tape replay after verification.

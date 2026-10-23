@@ -6,9 +6,9 @@ use napi::bindgen_prelude::*;
 use super::arrays_cache::ArraysCache;
 use super::config::Qwen3_5Config;
 use super::gated_delta::{
-    GdnCompleteOut, GdnKernelTape, GdnPrefill, GdnPrologue, GdnTail, gated_delta_fused_complete,
-    gated_delta_fused_prefill, gated_delta_update, gated_delta_update_fused,
-    gated_delta_update_with_tape, prefill_fused_enabled,
+    GdnCompleteOut, GdnKernelTape, GdnPrefill, GdnPrologue, GdnTail, gated_delta_fused_prefill,
+    gated_delta_update, gated_delta_update_fused, gated_delta_update_with_tape,
+    prefill_fused_enabled,
 };
 use crate::models::quantized_linear::{DEFAULT_QUANT_MODE, LinearProj, QuantizedLinear};
 
@@ -178,6 +178,46 @@ impl GdnLayerTape {
     }
 }
 
+/// Only the target's small row-major pair: these modes use identical sg8
+/// per-column arithmetic at N32 and N64; never tile the merged 64 rows.
+fn merge_split_ba_m8(b: &LinearProj, a: &LinearProj) -> Result<Option<LinearProj>> {
+    let eligible = |projection: &LinearProj| -> Result<bool> {
+        let LinearProj::Quantized(q) = projection else {
+            return Ok(false);
+        };
+        Ok(
+            matches!((q.mode(), q.bits()), ("q4k", 4) | ("q5k", 5) | ("q6k", 6))
+                && q.get_weight().shape_at(0)? == 32
+                && q.get_weight().shape_at(1)? * 32 / i64::from(q.bits()) == 2048,
+        )
+    };
+    if !eligible(b)? || !eligible(a)? {
+        return Ok(None);
+    }
+    b.concat_rows(a)
+}
+
+fn project_split_ba_m8(
+    x: &MxArray,
+    merged: Option<&LinearProj>,
+) -> Result<Option<(MxArray, MxArray)>> {
+    let Some(merged) = merged else {
+        return Ok(None);
+    };
+    if x.ndim()? != 3
+        || x.dtype()? != DType::BFloat16
+        || x.shape_at(2)? != 2048
+        || x.size()? != 8 * 2048
+        || !unsafe { sys::mlx_metal_is_available() }
+        || unsafe { sys::mlx_default_device() } != 1
+    {
+        return Ok(None);
+    }
+    let output = merged.forward(x)?;
+    let parts = output.split_sections(&[32], -1)?;
+    Ok(Some((parts[0].clone(), parts[1].clone())))
+}
+
 /// GatedDeltaNet: Linear attention module using gated delta recurrence.
 ///
 /// This replaces standard attention in most layers of Qwen3.5.
@@ -191,6 +231,9 @@ pub struct GatedDeltaNet {
     // quantized matmul; no dense weight materialization is needed.
     split_in_proj_qkv_z: Option<(LinearProj, LinearProj)>,
     split_in_proj_b_a: Option<(LinearProj, LinearProj)>,
+    // N32+32 row-major K-quants use the same sg8 tier at M8 after merging.
+    // Wider prefill keeps the individual views because split-K follows N.
+    split_in_proj_b_a_m8: Option<LinearProj>,
     conv1d: Conv1d,       // depthwise conv, groups = conv_dim
     norm: RMSNormGated,   // per-head norm: weight dim = value_head_dim
     out_proj: LinearProj, // value_dim → hidden
@@ -312,6 +355,7 @@ impl GatedDeltaNet {
             in_proj_ba: LinearProj::Standard(in_proj_ba),
             split_in_proj_qkv_z: None,
             split_in_proj_b_a: None,
+            split_in_proj_b_a_m8: None,
             conv1d,
             norm,
             out_proj: LinearProj::Standard(out_proj),
@@ -375,6 +419,21 @@ impl GatedDeltaNet {
                 .flatten(),
         );
         MxArray::eval_arrays(&derived)?;
+        self.split_in_proj_b_a_m8 = None;
+        if let Some((b, a)) = self.split_in_proj_b_a.as_ref()
+            && !std::env::var("MLX_GDN_BA_FUSION").is_ok_and(|v| v == "0")
+            && let Some(merged) = merge_split_ba_m8(b, a)?
+        {
+            let b_key = b.amax_key().map(str::to_owned);
+            let a_key = a.amax_key().map(str::to_owned);
+            // Retain separate projections as views, so the resident bytes do
+            // not grow and every non-M8 forward keeps its original kernel.
+            self.split_in_proj_b_a = Some((
+                merged.slice_rows(0, 32)?.with_amax_key(b_key),
+                merged.slice_rows(32, 64)?.with_amax_key(a_key),
+            ));
+            self.split_in_proj_b_a_m8 = Some(merged);
+        }
         if self.split_in_proj_qkv_z.is_some() || self.split_in_proj_b_a.is_some() {
             self.in_proj_qkvz_ba_t = None;
             self.in_proj_qkvz_ba_q = None;
@@ -479,9 +538,36 @@ impl GatedDeltaNet {
         &self,
         x: &MxArray,
         mask: Option<&MxArray>,
+        cache: Option<&mut ArraysCache>,
+        use_kernel: bool,
+        tape_sink: Option<&mut Option<GdnLayerTape>>,
+    ) -> Result<MxArray> {
+        self.forward_with_tape_impl(x, mask, cache, use_kernel, tape_sink, None)
+    }
+
+    /// Explicit residual-inclusive output, with unchanged cache/tape ownership.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_source_residual_with_tape(
+        &self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut ArraysCache>,
+        use_kernel: bool,
+        tape_sink: Option<&mut Option<GdnLayerTape>>,
+        residual: &MxArray,
+    ) -> Result<MxArray> {
+        self.forward_with_tape_impl(x, mask, cache, use_kernel, tape_sink, Some(residual))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_tape_impl(
+        &self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
         mut cache: Option<&mut ArraysCache>,
         use_kernel: bool,
         mut tape_sink: Option<&mut Option<GdnLayerTape>>,
+        residual: Option<&MxArray>,
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
@@ -496,12 +582,22 @@ impl GatedDeltaNet {
             let combined = merged.forward(x)?; // [B, T, qkvz_dim + ba_dim]
             let parts = combined.split_sections(&[qkvz_dim], 2)?;
             Some((parts[0].clone(), parts[1].clone()))
+        } else if self.split_in_proj_qkv_z.is_none() && self.split_in_proj_b_a.is_none() {
+            crate::models::quantized_linear::mixed_projection_forward(
+                x,
+                &[&self.in_proj_qkvz, &self.in_proj_ba],
+            )?
+            .map(|outputs| (outputs[0].clone(), outputs[1].clone()))
         } else {
             None
         };
 
         let (qkv, z) = if let Some((qkv_proj, z_proj)) = &self.split_in_proj_qkv_z {
-            (qkv_proj.forward(x)?, z_proj.forward(x)?)
+            match crate::models::quantized_linear::mixed_projection_forward(x, &[qkv_proj, z_proj])?
+            {
+                Some(outputs) => (outputs[0].clone(), outputs[1].clone()),
+                None => (qkv_proj.forward(x)?, z_proj.forward(x)?),
+            }
         } else {
             let qkvz = if let Some((qkvz, _)) = &stacked {
                 qkvz.clone()
@@ -513,7 +609,10 @@ impl GatedDeltaNet {
         };
 
         let (b, a) = if let Some((b_proj, a_proj)) = &self.split_in_proj_b_a {
-            (b_proj.forward(x)?, a_proj.forward(x)?)
+            match project_split_ba_m8(x, self.split_in_proj_b_a_m8.as_ref())? {
+                Some(pair) => pair,
+                None => (b_proj.forward(x)?, a_proj.forward(x)?),
+            }
         } else {
             let ba = if let Some((_, ba)) = &stacked {
                 ba.clone()
@@ -569,7 +668,7 @@ impl GatedDeltaNet {
             if let Some(cache) = cache {
                 cache.set(1, state)?;
             }
-            return self.out_proj.forward(&gated);
+            return self.out_proj.forward_mixer_output(&gated, None, residual);
         }
 
         // Whole GDN core in ONE dispatch (prep + recurrence + gated norm +
@@ -587,6 +686,7 @@ impl GatedDeltaNet {
             use_kernel,
             batch,
             seq_len,
+            residual.is_none(),
         ) {
             if let Some(cache) = cache {
                 cache.set(
@@ -611,7 +711,18 @@ impl GatedDeltaNet {
                     final_conv: Some(complete.history),
                 });
             }
-            return self.out_proj.forward(&complete.out);
+            return self.out_proj.forward_mixer_output(
+                &complete.out,
+                complete.prepared_sg8.as_ref(),
+                residual,
+            );
+        }
+
+        // A deferred cache describes a physical state before its logical
+        // frontier. A generic fallback cannot consume it. Fail the turn closed;
+        // the stepper settles pending before choosing an ordinary verifier.
+        if cache.as_deref().and_then(|c| c.get(4)).is_some() {
+            return Err(Error::from_reason("deferred GDN complete kernel declined"));
         }
 
         // Fully-fused prep: conv + SiLU + q|k|v split + q/k L2-norm + decay/beta
@@ -765,7 +876,7 @@ impl GatedDeltaNet {
                         final_conv: None,
                     });
                 }
-                return self.out_proj.forward(&gated);
+                return self.out_proj.forward_mixer_output(&gated, None, residual);
             }
         }
 
@@ -854,7 +965,7 @@ impl GatedDeltaNet {
         let y_flat = y_normed.reshape(&[batch, seq_len, self.value_dim as i64])?;
 
         // Output projection
-        self.out_proj.forward(&y_flat)
+        self.out_proj.forward_mixer_output(&y_flat, None, residual)
     }
 
     /// The whole GDN core as one dispatch (`gated_delta_fused_complete`):
@@ -876,6 +987,7 @@ impl GatedDeltaNet {
         use_kernel: bool,
         batch: i64,
         seq_len: i64,
+        allow_native_prepared: bool,
     ) -> Option<GdnCompleteOut> {
         use crate::array::DType;
         if batch != 1
@@ -926,25 +1038,46 @@ impl GatedDeltaNet {
                 &zero_state
             }
         };
-        gated_delta_fused_complete(
-            &GdnPrologue {
-                qkv,
-                a,
-                b,
-                conv,
-                history: &history,
-                scale,
-                dt_bias,
-                history_dst: cache.and_then(|c| c.get(3)),
-            },
-            state,
-            &GdnTail {
-                z,
-                norm_weight: self.norm.weight(),
-                eps: self.norm.eps(),
-                state_dst: cache.and_then(|c| c.get(2)),
-            },
-        )
+        let prologue = GdnPrologue {
+            qkv,
+            a,
+            b,
+            conv,
+            history: &history,
+            scale,
+            dt_bias,
+            history_dst: cache.and_then(|c| c.get(3)),
+        };
+        let tail = GdnTail {
+            z,
+            norm_weight: self.norm.weight(),
+            eps: self.norm.eps(),
+            state_dst: cache.and_then(|c| c.get(2)),
+        };
+        // The source mixer packs its own Table16 operands. Avoid unused
+        // native SG8 siblings when that residual-inclusive path is requested.
+        let prepared = allow_native_prepared
+            && seq_len == 8
+            && self.num_v_heads == 32
+            && self.out_proj.supports_prepared_sg8()
+            && std::env::var("MLX_GDN_PREPARED_SG8").is_ok_and(|v| v == "1");
+        if let Some(cache) = cache.filter(|c| c.get(4).is_some()) {
+            let pending = [
+                cache.get(4)?,
+                cache.get(5)?,
+                cache.get(6)?,
+                cache.get(7)?,
+                cache.get(8)?,
+                cache.get(9)?,
+            ];
+            super::gated_delta::gated_delta_fused_complete_deferred(
+                &prologue, state, &tail, prepared, pending,
+            )
+        } else {
+            super::gated_delta::gated_delta_fused_complete_with_prepared(
+                &prologue, state, &tail, prepared,
+            )
+        }
     }
 
     /// The conv stage of [`prep_via_conv`]: depthwise conv (fused
@@ -1254,6 +1387,7 @@ impl GatedDeltaNet {
         self.in_proj_qkvz_ba_t = None;
         self.in_proj_qkvz_ba_q = None;
         self.split_in_proj_b_a = None;
+        self.split_in_proj_b_a_m8 = None;
         self.in_proj_ba.set_weight(w, "in_proj_ba")
     }
     pub fn set_conv1d_weight(&mut self, w: &MxArray, compute_dtype: DType) -> Result<()> {
@@ -1331,6 +1465,7 @@ impl GatedDeltaNet {
         self.in_proj_qkvz_ba_t = None;
         self.in_proj_qkvz_ba_q = None;
         self.split_in_proj_b_a = None;
+        self.split_in_proj_b_a_m8 = None;
         self.in_proj_ba.set_quantized(ql);
     }
     pub fn set_split_in_proj_qkv_z(&mut self, qkv: LinearProj, z: LinearProj) {
@@ -1342,6 +1477,7 @@ impl GatedDeltaNet {
         self.in_proj_qkvz_ba_t = None;
         self.in_proj_qkvz_ba_q = None;
         self.split_in_proj_b_a = Some((b, a));
+        self.split_in_proj_b_a_m8 = None;
     }
     pub fn set_quantized_out_proj(&mut self, ql: QuantizedLinear) {
         self.out_proj.set_quantized(ql);
@@ -1880,6 +2016,42 @@ mod tests {
         )
     }
 
+    #[test]
+    fn split_ba_m8_merge_is_bitwise_and_other_widths_keep_originals() -> Result<()> {
+        if !unsafe { sys::mlx_metal_is_available() } || unsafe { sys::mlx_default_device() } != 1 {
+            return Ok(());
+        }
+        let b = LinearProj::Quantized(q4k(32, 2048, 71));
+        let a = LinearProj::Quantized(q4k(32, 2048, 73));
+        let merged = merge_split_ba_m8(&b, &a)?.expect("target pair merges");
+        for m in [1, 7, 8, 33] {
+            let values = (0..m * 2048)
+                .map(|i| ((i as f32) * 0.031).sin() * 0.125)
+                .collect::<Vec<_>>();
+            let x = MxArray::from_float32(&values, &[1, m, 2048])?.astype(DType::BFloat16)?;
+            let result = project_split_ba_m8(&x, Some(&merged))?;
+            assert_eq!(result.is_some(), m == 8);
+            let original_b = b.forward(&x)?;
+            let original_a = a.forward(&x)?;
+            let (actual_b, actual_a) = result.unwrap_or((
+                merged.slice_rows(0, 32)?.forward(&x)?,
+                merged.slice_rows(32, 64)?.forward(&x)?,
+            ));
+            MxArray::eval_arrays(&[&actual_b, &actual_a, &original_b, &original_a])?;
+            assert_eq!(
+                actual_b.to_uint16_native()?,
+                original_b.to_uint16_native()?,
+                "b M{m}"
+            );
+            assert_eq!(
+                actual_a.to_uint16_native()?,
+                original_a.to_uint16_native()?,
+                "a M{m}"
+            );
+        }
+        Ok(())
+    }
+
     /// Kernel geometry on a 256-wide hidden (whole K-quant super-blocks) with
     /// q4k in_proj_qkvz (16384 rows) and in_proj_ba (96 rows); `tile_qkvz`
     /// repacks the qkvz into Tiled64 before it is installed, as the loader does.
@@ -2011,6 +2183,78 @@ mod tests {
                     diff <= 3e-2 * peak,
                     "T={t}: padded merge off by {diff} of peak {peak}"
                 );
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn source_mixer_gdn_fallback_preserves_cache_and_tape() -> Result<()> {
+        let net = kernel_geometry_net();
+        let mut reference = ArraysCache::new(2);
+        let mut fused = ArraysCache::new(2);
+        for rows in [1, 7, 8, 33, 8] {
+            let x = rand_bf16(&[1, rows, 64]);
+            let residual = rand_bf16(&[1, rows, 64]);
+            let mut reference_tape = None;
+            let mut fused_tape = None;
+            let delta = net.forward_with_tape(
+                &x,
+                None,
+                Some(&mut reference),
+                true,
+                Some(&mut reference_tape),
+            )?;
+            let hidden = net.forward_source_residual_with_tape(
+                &x,
+                None,
+                Some(&mut fused),
+                true,
+                Some(&mut fused_tape),
+                &residual,
+            )?;
+            assert_eq!(
+                hidden.to_uint16_native()?,
+                residual.add(&delta)?.to_uint16_native()?
+            );
+            for slot in 0..2 {
+                assert_eq!(
+                    reference
+                        .get(slot)
+                        .unwrap()
+                        .astype(DType::Float32)?
+                        .to_float32()?
+                        .as_ref(),
+                    fused
+                        .get(slot)
+                        .unwrap()
+                        .astype(DType::Float32)?
+                        .to_float32()?
+                        .as_ref()
+                );
+            }
+            assert_eq!(reference_tape.is_some(), fused_tape.is_some());
+            if let (Some(a), Some(b)) = (reference_tape, fused_tape) {
+                // Normalized q/k and recurrence inputs may be F32 in the
+                // generic fallback. Compare exact values without assuming
+                // every tape field has the activation's BF16 dtype.
+                for (left, right) in [
+                    (&a.qkv, &b.qkv),
+                    (&a.kernel.q, &b.kernel.q),
+                    (&a.kernel.k, &b.kernel.k),
+                    (&a.kernel.v, &b.kernel.v),
+                    (&a.kernel.g, &b.kernel.g),
+                    (&a.kernel.beta, &b.kernel.beta),
+                ] {
+                    let bits = |v: &MxArray| -> Result<Vec<u32>> {
+                        Ok(v.astype(DType::Float32)?
+                            .to_float32()?
+                            .iter()
+                            .map(|x| x.to_bits())
+                            .collect())
+                    };
+                    assert_eq!(left.dtype()?, right.dtype()?);
+                    assert_eq!(bits(left)?, bits(right)?);
+                }
             }
         }
         Ok(())

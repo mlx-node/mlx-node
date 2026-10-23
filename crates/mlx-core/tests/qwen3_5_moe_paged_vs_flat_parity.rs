@@ -167,10 +167,10 @@ async fn qwen3_5_moe_paged_vs_flat_greedy_token_parity() {
         Err(e) => panic!("failed to clone model dir for paged path: {e}"),
     };
 
-    let flat_model = Qwen3_5MoeModel::load(flat_dir.to_string_lossy().to_string())
+    let flat_model = Qwen3_5MoeModel::load(flat_dir.to_string_lossy().to_string(), None)
         .await
         .expect("failed to load flat-path Qwen3.5 MoE model");
-    let paged_model = Qwen3_5MoeModel::load(paged_dir.to_string_lossy().to_string())
+    let paged_model = Qwen3_5MoeModel::load(paged_dir.to_string_lossy().to_string(), None)
         .await
         .expect("failed to load paged-path Qwen3.5 MoE model");
     assert!(

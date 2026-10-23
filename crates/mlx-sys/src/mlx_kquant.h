@@ -352,7 +352,14 @@ bool tiled_tensor_op_tier(int M, int N, int K, int bits, bool affine);
 // The M from which a transposed x @ w.T of (K, N) leaves the matvec kernels
 // for the GEMM on this device (MLX's qmv batch limit by GPU generation and
 // shape, or MLX_QMM_SPLITK_MIN_M); 0 without Metal. For the route tests.
+// Shared policy/workspace for independently formatted projection segments.
+int tiled_projection_splits(int N, int K);
+bool tiled_projection_spread(const Stream& stream);
+array tiled_projection_counters(const Stream& stream, int tiles);
 int tiled_qmv_vector_limit(int K, int N);
+
+void prepared_sg8_matmul_eval(const std::vector<array>& inputs, array& out,
+                              const Stream& stream);
 
 class KQuantMatmul : public UnaryPrimitive {
 public:

@@ -9,11 +9,11 @@ name: MLX Prebuilt
 #
 # Flow after a submodule bump:
 #   1. pushing the gitlink change (`crates/mlx-sys/mlx`) — or a change to
-#      build.rs / cmake/ — on ANY branch runs this workflow, which uploads
+#      build.rs / cmake/ / patches/ / build_support/ — on ANY branch runs this workflow, which uploads
 #      `mlx-prebuilt-<mlx sha12>-<build key8>` with the tarball + its
 #      `.sha256`. The tag is derived by build.rs (`release_tag` in the
 #      exported manifest.json) from the submodule commit AND a hash of the
-#      portable cmake defines + `crates/mlx-sys/cmake/`, so the same inputs
+#      portable cmake defines + `crates/mlx-sys/{cmake,patches,build_support}/`, so the same inputs
 #      always name the same release and the first publisher wins;
 #   2. the same PR pastes the printed JSON into `mlx-prebuilt.json`
 #      (new `mlx_commit`, `release_tag`, `sha256`). Until then build.rs sees
@@ -41,6 +41,8 @@ on:
       - crates/mlx-sys/mlx
       - crates/mlx-sys/build.rs
       - crates/mlx-sys/cmake/**
+      - crates/mlx-sys/patches/**
+      - crates/mlx-sys/build_support/**
       - .github/workflows/mlx-prebuilt.yml
 
 # `contents: write` is needed to create the release + upload assets.
@@ -211,7 +213,7 @@ jobs:
           Prebuilt MLX C++ library for \`crates/mlx-sys\` — **not an application release**.
 
           - mlx fork commit: https://github.com/mlx-node/mlx/commit/$MLX_COMMIT
-          - cmake build key: \`$BUILD_KEY\` (portable defines + \`crates/mlx-sys/cmake/\` + build.rs key revision)
+          - cmake build key: \`$BUILD_KEY\` (portable defines + \`crates/mlx-sys/{cmake,patches,build_support}/\` + build.rs key revision)
           - built from mlx-node commit: $GITHUB_SHA
           - \`MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET\`
           - contents: \`lib/libmlx.a\`, \`lib/libjaccl.a\`, \`lib/mlx.metallib\`, \`include/**\`, \`manifest.json\`

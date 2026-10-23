@@ -19,6 +19,7 @@
 #include "mlx/backend/metal/utils.h"
 #include "mlx/utils.h"
 #include "mlx_paged_metallib.h"
+#include "mlx_kquant_register_plan.h"
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -30,6 +31,7 @@
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <unordered_map>
 
 namespace mlx::core::kquant {
@@ -165,7 +167,10 @@ std::string qmv_t64(Mode m, Dtype t, int k_splits, int rows) {
   concatenate(name, "_ks_", k_splits, "_rows_", rows);
   return name;
 }
-std::string qmv_sg8(Mode m) { return base(m, "qmv_sg8", kSg8Type); }
+std::string qmv_sg8(Mode m, bool tiled = false, bool split = false) {
+  return base(m, split ? (tiled ? "qmv_sg8_split_t64" : "qmv_sg8_split")
+                       : (tiled ? "qmv_sg8_t64" : "qmv_sg8"), kSg8Type);
+}
 // qmm_m8_nax: M <= 32 bfloat16 on the tensor op; 64-column tiles and at
 // most 8 K splits (kquant_m8_nax.h). The Tiled64 layout has the 8-, 16- and
 // 32-row tiers (kM8NaxRows; the tile's rows past M read as zeros) for the
@@ -336,12 +341,24 @@ std::vector<KernelName> metal_kernel_names() {
       add(qmm_m8_nax(m, true, rows), true);
     }
   }
+  // Head-only M8 instantiation stores the same tensor-op accumulator as F32.
+  add("q6k_head_f32_m8_nax_t64", true);
+  add("q4k_gather_t64_m1");
+  add("q5k_gather_t64_m1");
+  add("q6k_gather_t64_m1");
   std::vector<int> prep_group_sizes;
+  add(qmv_sg8(Mode::A4G64, true));
+  add(qmv_sg8(Mode::A4G64, true, true));
   for (Mode m : kModes) {
     if (!sg8_mode(m)) {
       continue;
     }
     add(qmv_sg8(m));
+    add(qmv_sg8(m, false, true));
+    if (m == Mode::Q4K) {
+      add(qmv_sg8(m, true));
+      add(qmv_sg8(m, true, true));
+    }
     int gs = default_group_size(m);
     if (std::find(prep_group_sizes.begin(), prep_group_sizes.end(), gs) ==
         prep_group_sizes.end()) {
@@ -629,27 +646,40 @@ bool use_qmv_sg8(const Operands &o, int M, int N) {
          o.biases.offset() % 4 == 0;
 }
 
-// Two dispatches: the prep packs x into MMA operand order with fp32 per-group
-// row sums, then qmv_sg8 runs over N / 32 threadgroups.
-void qmv_sg8(const Operands &o, int N, int K) {
-  array bt({K * 4}, uint32, nullptr, {});
-  array sums({(K / o.group_size) * 8}, float32, nullptr, {});
-  bt.set_data(allocator::malloc(bt.nbytes()));
-  sums.set_data(allocator::malloc(sums.nbytes()));
+// The prepared path consumes the exact existing bt/sums packing; a fused
+// producer may call it without a separate activation-preparation dispatch.
+int gpu_core_count(metal::Device &d);
+array m8_nax_counters(const Stream &s, int tiles);
+void qmv_sg8_prepared(const Operands &o, int N, int K,
+                      const array &bt, const array &sums) {
   auto &enc = metal::get_command_encoder(o.s);
-  enc.add_temporary(bt);
-  enc.add_temporary(sums);
-
-  auto prep = load_kernel(o.d, kernels::qmv_sg8_prep(o.group_size));
-  enc.set_compute_pipeline_state(prep);
-  enc.set_input_array(o.x, 0);
-  enc.set_output_array(bt, 1);
-  enc.set_output_array(sums, 2);
-  enc.set_bytes(K, 3);
-  enc.dispatch_threadgroups(MTL::Size((K / 32 + 3) / 4, 1, 1),
-                            MTL::Size(128, 1, 1));
-
-  auto kernel = get_kernel(o.d, "qmv_sg8", kernels::qmv_sg8(o.mode), 8, N, K);
+  const char* option = std::getenv("MLX_KQUANT_SG8_SPLIT_K");
+  const int splits = option && std::string_view(option) == "1"
+      ? sg8_register_splits(N,K,gpu_core_count(o.d)) : 1;
+  if (splits > 1) {
+    array partials({splits, 8, N}, float32, nullptr, {});
+    partials.set_data(allocator::malloc(partials.nbytes()));
+    enc.add_temporary(partials);
+    auto counters = m8_nax_counters(o.s, N / 32);
+    auto kernel = get_kernel(o.d, family_of("qmv_sg8_split", o.tiled),
+        kernels::qmv_sg8(o.mode, o.tiled, true), 8, N, K);
+    if (bridge_testing::counting)
+      bridge_testing::record("qmv_sg8_splits" + std::to_string(splits));
+    enc.set_compute_pipeline_state(kernel);
+    set_weights(enc, o.w, o.scales, o.biases);
+    enc.set_input_array(bt,3);
+    enc.set_input_array(sums,4);
+    enc.set_output_array(o.out,5);
+    enc.set_bytes(K,6);
+    enc.set_bytes(N,7);
+    enc.set_output_array(partials,8);
+    enc.set_output_array(counters,9);
+    enc.set_bytes(splits,10);
+    enc.dispatch_threadgroups(MTL::Size(N / 32, splits, 1), MTL::Size(128,1,1));
+    return;
+  }
+  auto kernel = get_kernel(o.d, family_of("qmv_sg8", o.tiled),
+                           kernels::qmv_sg8(o.mode, o.tiled), 8, N, K);
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, o.w, o.scales, o.biases);
   enc.set_input_array(bt, 3);
@@ -658,6 +688,30 @@ void qmv_sg8(const Operands &o, int N, int K) {
   enc.set_bytes(K, 6);
   enc.set_bytes(N, 7);
   enc.dispatch_threadgroups(MTL::Size(N / 32, 1, 1), MTL::Size(128, 1, 1));
+}
+
+// Two dispatches: the prep packs x into MMA operand order with fp32 per-group
+// row sums, then qmv_sg8 runs over N / 32 threadgroups.
+void qmv_sg8(const Operands &o, int N, int K) {
+  const int sum_group_size = o.mode == Mode::A4G64 ? 32 : o.group_size;
+  array bt({K * 4}, uint32, nullptr, {});
+  array sums({(K / sum_group_size) * 8}, float32, nullptr, {});
+  bt.set_data(allocator::malloc(bt.nbytes()));
+  sums.set_data(allocator::malloc(sums.nbytes()));
+  auto &enc = metal::get_command_encoder(o.s);
+  enc.add_temporary(bt);
+  enc.add_temporary(sums);
+
+  auto prep = load_kernel(o.d, kernels::qmv_sg8_prep(sum_group_size));
+  enc.set_compute_pipeline_state(prep);
+  enc.set_input_array(o.x, 0);
+  enc.set_output_array(bt, 1);
+  enc.set_output_array(sums, 2);
+  enc.set_bytes(K, 3);
+  enc.dispatch_threadgroups(MTL::Size((K / 32 + 3) / 4, 1, 1),
+                            MTL::Size(128, 1, 1));
+
+  qmv_sg8_prepared(o, N, K, bt, sums);
 }
 
 // GPU cores from the IORegistry `gpu-core-count` of the accelerator entry
@@ -712,6 +766,14 @@ int gpu_core_count(metal::Device &d) {
     return count ? count : 8;
   }();
   return cores;
+}
+
+// Source Splash policy: staged decode on Apple GPU family 10 or later,
+// at least 16 cores. The experiment is opt-in and applies only at physical M8.
+bool staged_decode_spread(metal::Device& d) {
+  const char* option = std::getenv("MLX_KQUANT_STAGED_SPREAD");
+  return option && std::string_view(option) == "1" &&
+      d.mtl_device()->supportsFamily(MTL::GPUFamilyApple10) && gpu_core_count(d) >= 16;
 }
 
 // K splits of a tensor-op dispatch (Splash LinearGguf.cpp decodeSplits,
@@ -849,6 +911,8 @@ void qmm_m8_nax(const Operands &o, int M, int N, int K) {
   enc.set_bytes(N, 8);
   enc.set_bytes(splits, 9);
   enc.set_bytes(M, 10);
+  const uint32_t spread = M == 8 && staged_decode_spread(o.d);
+  enc.set_bytes(spread, 11);
   enc.dispatch_threadgroups(MTL::Size(tiles, splits, 1), MTL::Size(64, 1, 1));
 }
 
@@ -1269,6 +1333,19 @@ int qmv_vector_limit(int K, int N, bool transpose, metal::Device &d) {
 
 } // namespace
 
+int tiled_projection_splits(int N, int K) {
+  auto& d = metal::device(Device::gpu);
+  return qmm_m8_nax_splits(Mode::Q4K, N, K, gpu_core_count(d), 8, 4);
+}
+
+bool tiled_projection_spread(const Stream& s) {
+  return staged_decode_spread(metal::device(s.device));
+}
+
+array tiled_projection_counters(const Stream& s, int tiles) {
+  return m8_nax_counters(s, tiles);
+}
+
 int tiled_qmv_vector_limit(int K, int N) {
   if (!is_available(Device::gpu)) {
     return 0;
@@ -1284,6 +1361,32 @@ bool tiled_tensor_op_tier(int M, int N, int K, int bits, bool affine) {
   }
   return m8_nax_grid_reaches_target(affine ? Mode::A4G64 : Mode::Q4K, M, N, K,
                                     bits, metal::device(Device::gpu));
+}
+
+// Internal prepared-input consumer. The producer retains ordinary x for
+// shape/provenance; only its already rounded SG8 operands are read by the GPU.
+void prepared_sg8_matmul_eval(const std::vector<array>& inputs, array& out,
+                              const Stream& s) {
+  if (inputs.size() != 6) throw std::invalid_argument("prepared SG8 input count");
+  auto& d = metal::device(s.device);
+  const int K = inputs[0].shape(-1), N = inputs[1].shape(0);
+  auto& enc = metal::get_command_encoder(s);
+  std::vector<array> a;
+  a.reserve(inputs.size());
+  for (const auto& input : inputs) {
+    if (input.flags().row_contiguous && input.offset() % 16 == 0) a.push_back(input);
+    else {
+      array copy(input.shape(), input.dtype(), nullptr, {});
+      copy.set_data(allocator::malloc(copy.nbytes()));
+      copy_gpu(input, copy, CopyType::General, s);
+      enc.add_temporary(copy);
+      a.push_back(std::move(copy));
+    }
+  }
+  out.set_data(allocator::malloc(out.nbytes()));
+  Operands o{a[0], a[1], a[2], a[3], out, 32, 4, Mode::Q4K, d, s, true};
+  bridge_testing::record("qmv_sg8_t64_prepared");
+  qmv_sg8_prepared(o, N, K, a[4], a[5]);
 }
 
 void KQuantMatmul::eval_gpu(const std::vector<array> &inputs, array &out) {
@@ -1313,6 +1416,31 @@ void KQuantMatmul::eval_gpu(const std::vector<array> &inputs, array &out) {
     if (!transpose_ || !non_batched) {
       throw std::runtime_error(
           "[quantized_matmul] The @t64 layout needs x @ w.T on a 2-D weight.");
+    }
+    // The four measured companion shapes use register MMA by default.
+    // Explicit 1 preserves the broader opt-in; 0 retains the staged route.
+    if (mode_ == Mode::A4G64 && M == 8 && N >= 2048 && N % 32 == 0 && K <= 8192 &&
+        d.get_architecture_gen() >= 17 && x.dtype() == bfloat16 &&
+        x.offset() % 8 == 0 && scales.offset() % 8 == 0 && biases.offset() % 8 == 0) {
+      const char* experiment = std::getenv("MLX_KQUANT_REGISTER_AFFINE");
+      const bool measured_shape =
+          (K == 2048 && (N == 6144 || N == 12288)) ||
+          (N == 2048 && (K == 6144 || K == 4096));
+      if ((!experiment && measured_shape) ||
+          (experiment && std::string_view(experiment) == "1")) {
+        qmv_sg8(o, N, K);
+        return;
+      }
+    }
+    // Keep this default limited to the measured target output projection.
+    // The Rust prepared-SG8 eligibility uses the same unset/1/0 policy.
+    if (mode_ == Mode::Q4K && M == 8 && N == 2048 && K == 4096 &&
+        use_qmv_sg8(o, M, N)) {
+      const char* experiment = std::getenv("MLX_KQUANT_REGISTER_OUTPUT");
+      if (!experiment || std::string_view(experiment) == "1") {
+        qmv_sg8(o, N, K);
+        return;
+      }
     }
     // The tensor-op tiers cover M = 8..32 ahead of the GEMM: at these
     // heights the GEMM's 64-row tiles stream the weights at 190-210 GB/s
@@ -1481,6 +1609,8 @@ extern "C" int mlx_gpu_core_count() { return 0; }
 namespace mlx::core::kquant {
 
 int tiled_qmv_vector_limit(int, int) { return 0; }
+int tiled_projection_splits(int, int) { return 1; }
+bool tiled_projection_spread(const Stream&) { return false; }
 bool tiled_tensor_op_tier(int, int, int, int, bool) { return false; }
 
 void KQuantMatmul::eval_gpu(const std::vector<array> &, array &) {

@@ -1,0 +1,41 @@
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -77,13 +77,14 @@
+   // GPU intervals with one another, never subtracts a CPU timestamp.
+   fprintf(
+       stderr,
+-      "[metal-command] {\"id\":%llu,\"stream\":%d,\"reason\":\"%s\","
++      "[metal-command] {\"id\":%llu,\"commandBuffer\":\"%p\",\"stream\":%d,\"reason\":\"%s\","
+       "\"dispatches\":%d,\"primitives\":%zu,\"resources\":%zu,"
+       "\"resourceBytes\":%zu,\"sizeUnits\":%zu,\"barriers\":%zu,"
+       "\"encoders\":%zu,\"waits\":%zu,\"signals\":%zu,"
+       "\"encodeStartCpu\":%.9f,\"submitCpu\":%.9f,\"gpuStart\":%.9f,"
+       "\"gpuEnd\":%.9f,\"status\":%lu}\n",
+       static_cast<unsigned long long>(record.id),
++      static_cast<void*>(cb),
+       record.stream,
+       record.reason,
+       record.dispatches,
+diff --git a/mlx/backend/metal/eval.cpp b/mlx/backend/metal/eval.cpp
+--- a/mlx/backend/metal/eval.cpp
++++ b/mlx/backend/metal/eval.cpp
+@@ -45,11 +45,15 @@
+         os << ">" << arr.dtype();
+         fprintf(
+             stderr,
+-            "[metal-op] %s %s\n",
++            "[metal-op] %s %s commandBuffer=%p stream=%d\n",
+             arr.primitive().name(),
+-            os.str().c_str());
++            os.str().c_str(),
++            static_cast<void*>(command_buffer),
++            s.index);
+       } else {
+-        fprintf(stderr, "[metal-op] %s\n", arr.primitive().name());
++        fprintf(stderr, "[metal-op] %s commandBuffer=%p stream=%d\n",
++                arr.primitive().name(), static_cast<void*>(command_buffer),
++                s.index);
+       }
+     }
+   }
