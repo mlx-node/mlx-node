@@ -167,6 +167,30 @@ pub(crate) fn load_all_safetensors(
     Ok(all_params)
 }
 
+/// The weight map a family build starts from. `Some(preload)`: the GGUF main
+/// map, then the derived symmetric biases (from `dir/config.json`), then the
+/// companion when `load_vision` — the order `load_all_safetensors` keeps. With
+/// `load_vision` false the companion stays in `preload` (Muse takes its draft
+/// from there).
+#[allow(dead_code)]
+pub(crate) fn load_checkpoint(
+    dir: &Path,
+    load_vision: bool,
+    preload: Option<&mut crate::utils::gguf_import::GgufPreload>,
+) -> Result<HashMap<String, MxArray>> {
+    let Some(preload) = preload else {
+        return load_all_safetensors(dir, load_vision);
+    };
+    let mut params = std::mem::take(&mut preload.main);
+    expand_symmetric_affine_biases(dir, &mut params)?;
+    if load_vision {
+        let companion = std::mem::take(&mut preload.companion);
+        info!("Appending {} GGUF companion tensors", companion.len());
+        params.extend(companion);
+    }
+    Ok(params)
+}
+
 /// Append the optional media sidecar emitted by converted VLM checkpoints.
 ///
 /// Keep this outside the single-vs-sharded branch so `load_vision=true` has

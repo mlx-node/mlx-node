@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::array::{DType, MxArray};
+use crate::engine::checkpoint_source::GGUF_SOURCE_FILE;
 use crate::models::quant_dispatch::{
     KQUANT_LAYOUT_KEY, KQuantLayout, SYMMETRIC_ZERO_POINT_KEY, kquant_tile_rows, kquant_tileable,
 };
@@ -6158,6 +6159,15 @@ async fn convert_gguf_to_safetensors_inner(
 /// instead of expanded to int8 codes. A v6 entry still loads through the
 /// legacy `iq3s`/bits-8 contract; the bump re-imports it at native size.
 const QWEN35_NATIVE_CACHE_FORMAT: u32 = 7;
+/// v8: asset-only entries (config, tokenizer, templates, `gguf-source.json`);
+/// the weights are read from the GGUF at every load.
+pub(crate) const NATIVE_GGUF_ASSETS_FORMAT: u32 = 8;
+
+/// Both formats are current for the sweep while v7 weight entries and v8
+/// asset entries coexist.
+fn native_gguf_format_is_current(format: u32) -> bool {
+    format == QWEN35_NATIVE_CACHE_FORMAT || format == NATIVE_GGUF_ASSETS_FORMAT
+}
 const NATIVE_GGUF_CACHE_DIR_ENV: &str = "MLX_NATIVE_GGUF_CACHE_DIR";
 
 fn native_gguf_cache_candidates_from(
@@ -6356,9 +6366,27 @@ fn qwen35_native_cache_is_current(
     expected_dtype: &str,
     required_files: &[&str],
 ) -> bool {
+    native_gguf_entry_is_current(
+        output_dir,
+        QWEN35_NATIVE_CACHE_FORMAT,
+        source_identity_digest,
+        asset_digest,
+        expected_dtype,
+        required_files,
+    )
+}
+
+fn native_gguf_entry_is_current(
+    output_dir: &Path,
+    format: u32,
+    source_identity_digest: &str,
+    asset_digest: &str,
+    expected_dtype: &str,
+    required_files: &[&str],
+) -> bool {
     let marker = output_dir.join(".complete");
     fs::read_to_string(marker).is_ok_and(|contents| {
-        contents.contains(&format!("format={QWEN35_NATIVE_CACHE_FORMAT}\n"))
+        contents.contains(&format!("format={format}\n"))
             && contents.contains(&format!(
                 "source_identity_sha256={source_identity_digest}\n"
             ))
@@ -7055,8 +7083,9 @@ fn native_gguf_entry_stale_reason(
             .find_map(|line| line.strip_prefix(key))
             .map(str::to_string)
     };
-    if field("format=").and_then(|value| value.parse::<u32>().ok())
-        != Some(QWEN35_NATIVE_CACHE_FORMAT)
+    if !field("format=")
+        .and_then(|value| value.parse::<u32>().ok())
+        .is_some_and(native_gguf_format_is_current)
     {
         return Some("outdated cache format");
     }
@@ -7929,13 +7958,20 @@ pub(crate) async fn prepare_gemma4_native_gguf(input: &Path) -> Result<PathBuf> 
 }
 
 pub(super) async fn prepare_gemma4_native_gguf_in(input: &Path, root: &Path) -> Result<PathBuf> {
+    let (input, companion) = native_gguf_preflight(input, NativeGgufFamily::Gemma4)?;
+    let root = initialize_native_gguf_cache_root(root)?;
+    prepare_native_gguf_inner(
+        &input,
+        &root,
+        NativeGgufFamily::Gemma4,
+        companion.as_deref(),
+    )
+    .await
+}
+
+fn gemma4_native_preflight(input: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
     let input = input.canonicalize()?;
-    let header = parse_gguf(&input)?;
-    if !is_gemma4_main_gguf(&header.metadata) {
-        return Err(Error::from_reason(
-            "Gemma4Model.load requires a Gemma4 text GGUF, not a media projector or another architecture",
-        ));
-    }
+    NativeGgufFamily::Gemma4.check_main_header(&parse_gguf(&input)?)?;
     let parent = input.parent().ok_or_else(|| {
         Error::from_reason(format!(
             "Gemma4 GGUF input '{}' has no parent directory",
@@ -7970,14 +8006,7 @@ pub(super) async fn prepare_gemma4_native_gguf_in(input: &Path, root: &Path) -> 
     } else {
         None
     };
-    let root = initialize_native_gguf_cache_root(root)?;
-    prepare_native_gguf_inner(
-        &input,
-        &root,
-        NativeGgufFamily::Gemma4,
-        companion.as_deref(),
-    )
-    .await
+    Ok((input, companion))
 }
 
 /// Prefer an explicitly paired draft, then the publisher's shared K-quant
@@ -8040,12 +8069,20 @@ pub(super) async fn prepare_muse_glimmer_native_gguf_in(
     input: &Path,
     root: &Path,
 ) -> Result<PathBuf> {
+    let (input, draft) = native_gguf_preflight(input, NativeGgufFamily::MuseGlimmer)?;
+    let root = initialize_native_gguf_cache_root(root)?;
+    prepare_native_gguf_inner(
+        &input,
+        &root,
+        NativeGgufFamily::MuseGlimmer,
+        draft.as_deref(),
+    )
+    .await
+}
+
+fn muse_glimmer_native_preflight(input: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
     let input = input.canonicalize()?;
-    if !is_muse_glimmer_main_gguf(&parse_gguf(&input)?.metadata) {
-        return Err(Error::from_reason(
-            "MuseGlimmerModel.load requires a Muse-Glimmer text GGUF, not a projector, draft or another architecture",
-        ));
-    }
+    NativeGgufFamily::MuseGlimmer.check_main_header(&parse_gguf(&input)?)?;
     let parent = input.parent().ok_or_else(|| {
         Error::from_reason(format!(
             "Muse-Glimmer GGUF input '{}' has no parent directory",
@@ -8068,14 +8105,7 @@ pub(super) async fn prepare_muse_glimmer_native_gguf_in(
             parent.to_string_lossy().into_owned(),
         )?;
     }
-    let root = initialize_native_gguf_cache_root(root)?;
-    prepare_native_gguf_inner(
-        &input,
-        &root,
-        NativeGgufFamily::MuseGlimmer,
-        draft.as_deref(),
-    )
-    .await
+    Ok((input, draft))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -8110,6 +8140,37 @@ pub fn release_native_gguf_lease(dir: String) {
 }
 
 impl NativeGgufFamily {
+    /// The main GGUF's architecture check. Dense Qwen3.5 has none here: the
+    /// import plan rejects what it cannot read.
+    pub(crate) fn check_main_header(self, header: &GgufFile) -> Result<()> {
+        let (ok, message) = match self {
+            Self::Qwen35 => (true, ""),
+            Self::Qwen35Moe => (
+                is_qwen35_moe_main_gguf(&header.metadata),
+                "Qwen3.5 MoE load requires a sparse 'qwen35moe' text GGUF; a dense qwen35, \
+                 projector, draft or another architecture cannot be loaded through this family",
+            ),
+            Self::Clef => (
+                is_clef_main_gguf(&header.metadata),
+                "CLEF load requires a decision-model GGUF (general.architecture=clef); a plain \
+                 backbone, projector, or another architecture cannot be loaded through this family",
+            ),
+            Self::Gemma4 => (
+                is_gemma4_main_gguf(&header.metadata),
+                "Gemma4Model.load requires a Gemma4 text GGUF, not a media projector or another architecture",
+            ),
+            Self::MuseGlimmer => (
+                is_muse_glimmer_main_gguf(&header.metadata),
+                "MuseGlimmerModel.load requires a Muse-Glimmer text GGUF, not a projector, draft or another architecture",
+            ),
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::from_reason(message))
+        }
+    }
+
     fn layout(self) -> &'static str {
         match self {
             Self::Qwen35 => "tiled",
@@ -8122,6 +8183,21 @@ impl NativeGgufFamily {
             Self::Clef => "clef-v1",
             Self::Gemma4 => "gemma4-text-dtype-v2",
             Self::MuseGlimmer => "muse-glimmer-packed-v1",
+        }
+    }
+
+    /// Files a published asset-only entry must contain for a hit.
+    fn required_asset_files(self) -> &'static [&'static str] {
+        match self {
+            Self::Clef => &[
+                "config.json",
+                "joint_head_config.json",
+                "tokenizer.json",
+                GGUF_SOURCE_FILE,
+            ],
+            Self::Qwen35 | Self::Qwen35Moe | Self::Gemma4 | Self::MuseGlimmer => {
+                &["config.json", GGUF_SOURCE_FILE]
+            }
         }
     }
 
@@ -8211,13 +8287,7 @@ async fn prepare_qwen35_moe_native_gguf_inner(
     input_path: &Path,
     cache_root: &Path,
 ) -> Result<PathBuf> {
-    let input_path = input_path.canonicalize()?;
-    if !is_qwen35_moe_main_gguf(&parse_gguf(&input_path)?.metadata) {
-        return Err(Error::from_reason(
-            "Qwen3.5 MoE load requires a sparse 'qwen35moe' text GGUF; a dense qwen35, \
-             projector, draft or another architecture cannot be loaded through this family",
-        ));
-    }
+    let (input_path, _) = native_gguf_preflight(input_path, NativeGgufFamily::Qwen35Moe)?;
     prepare_native_gguf_inner(&input_path, cache_root, NativeGgufFamily::Qwen35Moe, None).await
 }
 
@@ -8229,14 +8299,27 @@ async fn prepare_qwen35_moe_native_gguf_inner(
 /// directory satisfies every asset `load_clef_with_thread` requires.
 pub(crate) async fn prepare_clef_native_gguf(input_path: &Path) -> Result<PathBuf> {
     let cache_root = native_gguf_cache_root()?;
-    let input_path = input_path.canonicalize()?;
-    if !is_clef_main_gguf(&parse_gguf(&input_path)?.metadata) {
-        return Err(Error::from_reason(
-            "CLEF load requires a decision-model GGUF (general.architecture=clef); a plain \
-             backbone, projector, or another architecture cannot be loaded through this family",
-        ));
-    }
+    let (input_path, _) = native_gguf_preflight(input_path, NativeGgufFamily::Clef)?;
     prepare_native_gguf_inner(&input_path, &cache_root, NativeGgufFamily::Clef, None).await
+}
+
+/// Family checks that run before any cache work: the main GGUF's architecture,
+/// required sibling assets, and the companion pick (Gemma4 media projector,
+/// Muse-Glimmer DFlash draft). Returns the canonical main path.
+pub(crate) fn native_gguf_preflight(
+    input: &Path,
+    family: NativeGgufFamily,
+) -> Result<(PathBuf, Option<PathBuf>)> {
+    match family {
+        NativeGgufFamily::Qwen35 => Ok((input.canonicalize()?, None)),
+        NativeGgufFamily::Qwen35Moe | NativeGgufFamily::Clef => {
+            let input = input.canonicalize()?;
+            family.check_main_header(&parse_gguf(&input)?)?;
+            Ok((input, None))
+        }
+        NativeGgufFamily::Gemma4 => gemma4_native_preflight(input),
+        NativeGgufFamily::MuseGlimmer => muse_glimmer_native_preflight(input),
+    }
 }
 
 async fn prepare_native_gguf_inner(
@@ -8854,6 +8937,388 @@ async fn prepare_native_gguf_inner(
     // loader, which owns the reference from here on.
     provisional_lease.disarm();
     Ok(prepared_dir)
+}
+
+/// Prepare the asset-only entry for a GGUF load: `config.json` (t64 marks,
+/// layout tags, quant block), tokenizer, templates, `joint_head_config.json`
+/// and `gguf-source.json` — no weights. The headers are parsed once here and
+/// travel with the plans and identities to the loader.
+pub(crate) async fn prepare_gguf_assets(
+    input: &Path,
+    family: NativeGgufFamily,
+) -> Result<crate::engine::checkpoint_source::GgufCheckpoint> {
+    let root = native_gguf_cache_root()?;
+    prepare_gguf_assets_in(input, family, &root).await
+}
+
+pub(crate) async fn prepare_gguf_assets_in(
+    input: &Path,
+    family: NativeGgufFamily,
+    cache_root: &Path,
+) -> Result<crate::engine::checkpoint_source::GgufCheckpoint> {
+    use crate::engine::checkpoint_source::{
+        GgufCheckpoint, native_import_plans, open_gguf_source, write_gguf_source_json,
+    };
+
+    let (input, companion) = native_gguf_preflight(input, family)?;
+    let cache_root = initialize_native_gguf_cache_root(cache_root).map_err(|error| {
+        Error::from_reason(format!(
+            "Failed to create native GGUF cache root '{}': {error}",
+            cache_root.display()
+        ))
+    })?;
+    let cache_root = cache_root.as_path();
+    let main = open_gguf_source(&input)?;
+    let companion = companion.as_deref().map(open_gguf_source).transpose()?;
+    let input_path = main.0.clone();
+    let companion_path = companion.as_ref().map(|(path, _, _)| path.clone());
+    let source_identity_digest = main.2.source_identity.clone();
+    let companion_digest = companion
+        .as_ref()
+        .map(|(_, _, identity)| identity.source_identity.clone())
+        .unwrap_or_else(|| "none".to_string());
+    let sources_unchanged = || -> Result<bool> {
+        let stat = |path: &Path| {
+            fs::metadata(path).map_err(|error| {
+                Error::from_reason(format!(
+                    "Failed to restat GGUF path '{}': {error}",
+                    path.display()
+                ))
+            })
+        };
+        Ok(
+            source_file_identity_digest(&input_path, &stat(&input_path)?) == source_identity_digest
+                && match &companion_path {
+                    Some(path) => {
+                        source_file_identity_digest(path, &stat(path)?) == companion_digest
+                    }
+                    None => true,
+                },
+        )
+    };
+
+    let prism_contract = if family == NativeGgufFamily::Qwen35 {
+        prism_hadamard_config(&main.1)?
+    } else {
+        None
+    };
+    if prism_contract.is_some() && companion.is_some() {
+        return Err(Error::from_reason(
+            "prism.hadamard sources are text-only and cannot be paired with a companion GGUF",
+        ));
+    }
+    let (opts, main_plan, companion_plan) = native_import_plans(
+        family,
+        (&main.0, &main.1),
+        companion
+            .as_ref()
+            .map(|(path, header, _)| (path.as_path(), &**header)),
+    )?;
+
+    let metadata = fs::metadata(&input_path).map_err(|error| {
+        Error::from_reason(format!(
+            "Failed to stat GGUF path '{}': {error}",
+            input_path.display()
+        ))
+    })?;
+    if source_file_identity_digest(&input_path, &metadata) != source_identity_digest {
+        return Err(Error::from_reason(
+            "GGUF source changed during native preparation; retry the load",
+        ));
+    }
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let stem = input_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("model")
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(32)
+        .collect::<String>();
+    let parent = input_path.parent().unwrap_or(Path::new("."));
+    let asset_digest = qwen35_native_asset_digest(parent)?;
+    let layout = family.layout();
+    let cache_dtype = if prism_contract.is_some() {
+        "source"
+    } else {
+        "bf16"
+    };
+    let preparation_digest = if let Some(contract) = &prism_contract {
+        let contract_json = serde_json::to_string(contract).map_err(|e| {
+            Error::from_reason(format!("Failed to serialize prism.hadamard contract: {e}"))
+        })?;
+        Sha256::digest(format!(
+            "{asset_digest}:{layout}:prism-hadamard:{contract_json}"
+        ))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+    } else if family == NativeGgufFamily::Qwen35 {
+        asset_digest.clone()
+    } else {
+        Sha256::digest(format!("{asset_digest}:{layout}:{companion_digest}"))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let cache_key = format!(
+        "{stem}-{}-{modified}-v{NATIVE_GGUF_ASSETS_FORMAT}-{source_identity_digest}-{preparation_digest}",
+        metadata.len(),
+    );
+    let output_dir = cache_root.join(&cache_key);
+    let entry_is_current = |dir: &Path| {
+        native_gguf_entry_is_current(
+            dir,
+            NATIVE_GGUF_ASSETS_FORMAT,
+            &source_identity_digest,
+            &asset_digest,
+            cache_dtype,
+            family.required_asset_files(),
+        )
+    };
+    let checkpoint = |asset_dir: PathBuf| GgufCheckpoint {
+        asset_dir,
+        main: main.clone(),
+        companion: companion.clone(),
+        plans: (main_plan.clone(), companion_plan.clone()),
+        opts: opts.clone(),
+        family,
+        leased: true,
+    };
+
+    run_native_gguf_sweep(cache_root, &cache_key).await;
+
+    // Shared-lease hit before the exclusive lock: see prepare_native_gguf_inner.
+    if entry_is_current(&output_dir)
+        && native_gguf_lease_in_use(cache_root, &output_dir, Some(&cache_key))
+    {
+        if entry_is_current(&output_dir) {
+            native_gguf_stamp_mtime(&output_dir.join(".complete"));
+            return Ok(checkpoint(output_dir));
+        }
+        native_gguf_unlease_in_use(&output_dir);
+    }
+
+    let _process_lock = qwen35_native_prepare_mutex().lock().await;
+    let lock_path = cache_root.join(format!(".{cache_key}.lock"));
+    let lock_path_for_thread = lock_path.clone();
+    let _file_lock =
+        tokio::task::spawn_blocking(move || Qwen35NativeCacheLock::acquire(&lock_path_for_thread))
+            .await
+            .map_err(|error| {
+                Error::from_reason(format!(
+                    "Native GGUF cache lock task failed for '{}': {error}",
+                    lock_path.display()
+                ))
+            })?
+            .map_err(|error| {
+                Error::from_reason(format!(
+                    "Failed to lock native GGUF cache '{}': {error}",
+                    lock_path.display()
+                ))
+            })?;
+    if qwen35_native_asset_digest(parent)? != asset_digest {
+        return Err(Error::from_reason(
+            "GGUF sibling config/tokenizer assets changed while acquiring the native GGUF \
+             cache lock; retry the load",
+        ));
+    }
+    if !sources_unchanged()? {
+        return Err(Error::from_reason(
+            "GGUF source changed while acquiring the native cache lock; retry the load",
+        ));
+    }
+    if entry_is_current(&output_dir) {
+        if !native_gguf_lease_in_use_retry(cache_root, &output_dir, &cache_key) {
+            return Err(Error::from_reason(format!(
+                "Failed to lease native GGUF cache '{}' for the loaded model; retry the load",
+                output_dir.display()
+            )));
+        }
+        native_gguf_stamp_mtime(&output_dir.join(".complete"));
+        return Ok(checkpoint(output_dir));
+    }
+
+    // Keeps a concurrent same-process sweep off the staging dir until the
+    // lease below registers it.
+    let in_flight = InFlightPrepare::arm(cache_key.clone());
+    let staging_dir = cache_root.join(format!(
+        ".{cache_key}.staging-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let staged = (|| -> Result<()> {
+        fs::create_dir(&staging_dir).map_err(|error| {
+            Error::from_reason(format!(
+                "Failed to create native GGUF staging '{}': {error}",
+                staging_dir.display()
+            ))
+        })?;
+        super::gguf_plan::write_gguf_assets(
+            &main_plan,
+            companion_plan
+                .as_ref()
+                .zip(companion.as_ref())
+                .map(|(plan, (_, header, _))| (plan, &**header)),
+            &main.1,
+            &staging_dir,
+        )?;
+        write_gguf_source_json(
+            &staging_dir,
+            &main.2,
+            companion.as_ref().map(|(_, _, identity)| identity),
+        )?;
+        if qwen35_native_asset_digest(parent)? != asset_digest {
+            return Err(Error::from_reason(
+                "GGUF sibling config/tokenizer assets changed during native GGUF preparation; \
+                 discarded the staged assets, retry the load",
+            ));
+        }
+        if !sources_unchanged()? {
+            return Err(Error::from_reason(
+                "GGUF source changed during native preparation; discarded the staged assets, \
+                 retry the load",
+            ));
+        }
+        fs::write(
+            staging_dir.join(".complete"),
+            native_gguf_marker_text(
+                NATIVE_GGUF_ASSETS_FORMAT,
+                &input_path,
+                &source_identity_digest,
+                metadata.len(),
+                modified,
+                &asset_digest,
+                layout,
+                companion_path.as_deref(),
+                &companion_digest,
+                cache_dtype,
+            ),
+        )
+        .map_err(|error| {
+            Error::from_reason(format!(
+                "Failed to finalize native GGUF cache '{}': {error}",
+                output_dir.display()
+            ))
+        })
+    })();
+    if let Err(error) = staged {
+        fs::remove_dir_all(&staging_dir).ok();
+        return Err(error);
+    }
+
+    // An existing output_dir a loaded model still leases is kept and this load
+    // runs from staging (registry lease only).
+    let output_guard = output_dir
+        .exists()
+        .then(|| native_gguf_output_delete_guard(cache_root, &output_dir))
+        .flatten();
+    let prepared_dir = if output_dir.exists() && output_guard.is_none() {
+        staging_dir.clone()
+    } else {
+        if output_dir.exists() {
+            fs::remove_dir_all(&output_dir).map_err(|error| {
+                fs::remove_dir_all(&staging_dir).ok();
+                Error::from_reason(format!(
+                    "Failed to remove incomplete native GGUF cache '{}': {error}",
+                    output_dir.display()
+                ))
+            })?;
+        }
+        fs::rename(&staging_dir, &output_dir).map_err(|error| {
+            fs::remove_dir_all(&staging_dir).ok();
+            Error::from_reason(format!(
+                "Failed to publish native GGUF cache '{}' atomically: {error}",
+                output_dir.display()
+            ))
+        })?;
+        output_dir.clone()
+    };
+    drop(output_guard);
+
+    // Lease before the post-publish sweep, which deletes unleased same-pid
+    // staging dirs.
+    let provisional_lease = if prepared_dir == output_dir {
+        if !native_gguf_lease_in_use_retry(cache_root, &prepared_dir, &cache_key) {
+            return Err(Error::from_reason(format!(
+                "Failed to lease native GGUF cache '{}' for the loaded model; retry the load",
+                prepared_dir.display()
+            )));
+        }
+        PreparedDirLease::armed(prepared_dir.clone())
+    } else {
+        native_gguf_lease_in_use(cache_root, &prepared_dir, None);
+        PreparedDirLease::armed(prepared_dir.clone())
+    };
+    in_flight.disarm();
+    run_native_gguf_sweep(cache_root, &cache_key).await;
+    provisional_lease.disarm();
+    Ok(checkpoint(prepared_dir))
+}
+
+/// A sweep failure or panic never fails a load.
+async fn run_native_gguf_sweep(cache_root: &Path, cache_key: &str) {
+    let sweep_root = cache_root.to_path_buf();
+    let sweep_key = cache_key.to_string();
+    let swept = tokio::task::spawn_blocking(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sweep_native_gguf_cache(&sweep_root, &sweep_key);
+        }))
+    })
+    .await;
+    match swept {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => debug!("native GGUF cache sweep panicked; continuing the load"),
+        Err(error) => debug!("native GGUF cache sweep task failed: {error}"),
+    }
+}
+
+/// The `.complete` record the sweep re-derives staleness from. Raw display
+/// lines come last and are omitted when the OS bytes hold a newline, so a
+/// path cannot forge an earlier field line.
+#[allow(clippy::too_many_arguments)]
+fn native_gguf_marker_text(
+    format: u32,
+    source: &Path,
+    source_identity_digest: &str,
+    size: u64,
+    modified_ns: u128,
+    asset_digest: &str,
+    layout: &str,
+    companion: Option<&Path>,
+    companion_digest: &str,
+    dtype: &str,
+) -> String {
+    let source_hex = native_gguf_hex_encode(&native_gguf_os_bytes(source));
+    let companion_hex = companion
+        .map(|path| native_gguf_hex_encode(&native_gguf_os_bytes(path)))
+        .unwrap_or_else(|| "none".to_string());
+    let source_line = if native_gguf_os_bytes(source).contains(&b'\n') {
+        String::new()
+    } else {
+        format!("source={}\n", source.display())
+    };
+    let companion_line = match companion {
+        Some(path) if !native_gguf_os_bytes(path).contains(&b'\n') => {
+            format!("companion={}\n", path.display())
+        }
+        Some(_) => String::new(),
+        None => "companion=none\n".to_string(),
+    };
+    format!(
+        "format={format}\nsource_hex={source_hex}\nsource_identity_sha256={source_identity_digest}\nsize={size}\nmodified_ns={modified_ns}\nassets_sha256={asset_digest}\nlayout={layout}\ncompanion_hex={companion_hex}\ncompanion_sha256={companion_digest}\ndtype={dtype}\n{source_line}{companion_line}"
+    )
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
