@@ -1745,9 +1745,10 @@ export declare class Qwen35MoeModel {
   /**
    * Load a pretrained model from a directory, or a `.gguf` file.
    *
-   * A direct GGUF file is first converted into the lossless native-packed
-   * cache (mirroring the dense Qwen3.5 loader), and the cache directory is
-   * what the model thread reads.
+   * A direct GGUF file is read into memory and repacked on the model
+   * thread; only its non-weight assets (config, tokenizer) are written to
+   * the native GGUF asset directory, which the model reports as its assets
+   * path.
    */
   static load(path: string, options?: Qwen35LoadOptions | undefined | null): Promise<Qwen35MoeModel>;
   /** Generate text from a prompt token sequence. */
