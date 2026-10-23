@@ -42,9 +42,9 @@ mod source_math;
 
 // ── GGUF Constants ──────────────────────────────────────────────────────────
 
-const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in little-endian
-const GGUF_VERSION_3: u32 = 3;
-const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
+pub(super) const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in little-endian
+pub(super) const GGUF_VERSION_3: u32 = 3;
+pub(super) const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
 
 const GGUF_RUNTIME_ASSET_FILES: &[&str] = &[
     "tokenizer.json",
@@ -327,7 +327,7 @@ impl GgufTensorType {
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u32)]
-enum GgufValueType {
+pub(super) enum GgufValueType {
     Uint8 = 0,
     Int8 = 1,
     Uint16 = 2,
@@ -8404,7 +8404,7 @@ pub(crate) async fn prepare_gemma4_native_gguf(input: &Path) -> Result<PathBuf> 
     prepare_gemma4_native_gguf_in(input, &root).await
 }
 
-async fn prepare_gemma4_native_gguf_in(input: &Path, root: &Path) -> Result<PathBuf> {
+pub(super) async fn prepare_gemma4_native_gguf_in(input: &Path, root: &Path) -> Result<PathBuf> {
     let input = input.canonicalize()?;
     let header = parse_gguf(&input)?;
     if !is_gemma4_main_gguf(&header.metadata) {
@@ -8512,7 +8512,10 @@ pub(crate) async fn prepare_muse_glimmer_native_gguf(input: &Path) -> Result<Pat
     prepare_muse_glimmer_native_gguf_in(input, &root).await
 }
 
-async fn prepare_muse_glimmer_native_gguf_in(input: &Path, root: &Path) -> Result<PathBuf> {
+pub(super) async fn prepare_muse_glimmer_native_gguf_in(
+    input: &Path,
+    root: &Path,
+) -> Result<PathBuf> {
     let input = input.canonicalize()?;
     if !is_muse_glimmer_main_gguf(&parse_gguf(&input)?.metadata) {
         return Err(Error::from_reason(
@@ -8639,7 +8642,10 @@ pub async fn prepare_qwen35_native_gguf(input_path: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(test)]
-async fn prepare_qwen35_native_gguf_in(input_path: &Path, cache_root: &Path) -> Result<PathBuf> {
+pub(super) async fn prepare_qwen35_native_gguf_in(
+    input_path: &Path,
+    cache_root: &Path,
+) -> Result<PathBuf> {
     let cache_root = initialize_native_gguf_cache_root(cache_root).map_err(|error| {
         Error::from_reason(format!(
             "Failed to create native GGUF cache root '{}': {error}",
@@ -8664,7 +8670,7 @@ pub(crate) async fn prepare_qwen35_moe_native_gguf(input_path: &Path) -> Result<
 }
 
 #[cfg(test)]
-async fn prepare_qwen35_moe_native_gguf_in(
+pub(super) async fn prepare_qwen35_moe_native_gguf_in(
     input_path: &Path,
     cache_root: &Path,
 ) -> Result<PathBuf> {
@@ -9370,6 +9376,11 @@ impl Drop for SweepEnvVar {
 mod tests {
     use super::*;
     use crate::utils::gguf_kquant::{QK_K, q2k_code, repack_kquant};
+    use crate::utils::gguf_test_fixtures::{
+        build_minimal_gguf, build_qwen35_moe_fixture, complete_muse_glimmer_dflash_metadata,
+        gemma_native_fixture, gemma4v_mmproj_fixture, muse_glimmer_dflash_metadata,
+        muse_native_draft_fixture, muse_native_fixture,
+    };
 
     include!("gguf_source_math_import_tests.rs");
 
@@ -9391,108 +9402,6 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).ok();
         }
-    }
-
-    fn muse_native_fixture(source: &Path) -> PathBuf {
-        use crate::models::muse_glimmer::config::fixtures::{config_json, text_config_json};
-        fs::create_dir_all(source).unwrap();
-        let text = text_config_json(2)
-            .replace("6656", "256")
-            .replace("19968", "512")
-            .replace("\"num_attention_heads\": 32", "\"num_attention_heads\": 2");
-        fs::write(source.join("config.json"), config_json(&text)).unwrap();
-        fs::write(source.join("tokenizer.json"), "{}").unwrap();
-        let input = source.join("muse-Q4_K_M.gguf");
-        fs::write(
-            &input,
-            build_minimal_gguf(
-                &[(
-                    "general.architecture",
-                    GgufMetaValue::String("muse-glimmer".into()),
-                )],
-                &[
-                    (
-                        "blk.0.ffn_up.weight",
-                        &[256, 2],
-                        GgufTensorType::Q4K,
-                        &[0; 288],
-                    ),
-                    ("blk.0.attn_norm.weight", &[2], GgufTensorType::F32, &[0; 8]),
-                ],
-            ),
-        )
-        .unwrap();
-        input
-    }
-
-    fn muse_native_draft_fixture(path: &Path) {
-        let mut metadata = complete_muse_glimmer_dflash_metadata();
-        for (key, value) in [
-            ("dflash.block_count", 1),
-            ("dflash.block_size", 2),
-            ("dflash.embedding_length", 256),
-            ("dflash.feed_forward_length", 512),
-            ("dflash.attention.head_count", 2),
-            ("dflash.attention.head_count_kv", 1),
-            ("dflash.attention.key_length", 128),
-        ] {
-            metadata.insert(key.into(), GgufMetaValue::Uint32(value));
-        }
-        metadata.insert(
-            "dflash.target_layers".into(),
-            GgufMetaValue::ArrayI32(vec![1]),
-        );
-        let metadata: Vec<_> = metadata
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.clone()))
-            .collect();
-        let descriptors: [(&str, &[u64]); 14] = [
-            ("fc.weight", &[256, 256]),
-            ("enc.output_norm.weight", &[256]),
-            ("output_norm.weight", &[256]),
-            ("blk.0.attn_norm.weight", &[256]),
-            ("blk.0.ffn_norm.weight", &[256]),
-            ("blk.0.attn_q_norm.weight", &[128]),
-            ("blk.0.attn_k_norm.weight", &[128]),
-            ("blk.0.attn_q.weight", &[256, 256]),
-            ("blk.0.attn_k.weight", &[256, 128]),
-            ("blk.0.attn_v.weight", &[256, 128]),
-            ("blk.0.attn_output.weight", &[256, 256]),
-            ("blk.0.ffn_gate.weight", &[256, 512]),
-            ("blk.0.ffn_up.weight", &[256, 512]),
-            ("blk.0.ffn_down.weight", &[512, 256]),
-        ];
-        let data: Vec<_> = descriptors
-            .iter()
-            .map(|(_, dims)| {
-                let elements = dims.iter().product::<u64>() as usize;
-                vec![
-                    0_u8;
-                    if dims.len() == 2 {
-                        elements / 256 * 144
-                    } else {
-                        elements * 4
-                    }
-                ]
-            })
-            .collect();
-        let tensors: Vec<_> = descriptors
-            .iter()
-            .zip(&data)
-            .map(|((name, dims), data)| {
-                (
-                    *name,
-                    *dims,
-                    if dims.len() == 2 {
-                        GgufTensorType::Q4K
-                    } else {
-                        GgufTensorType::F32
-                    },
-                    data.as_slice(),
-                )
-            })
-            .collect();
-        fs::write(path, build_minimal_gguf(&metadata, &tensors)).unwrap();
     }
 
     #[test]
@@ -9718,104 +9627,6 @@ mod tests {
                 .reason
                 .contains("text GGUF")
         );
-    }
-
-    fn gemma_native_fixture(source: &Path) -> PathBuf {
-        fs::create_dir_all(source).unwrap();
-        fs::write(source.join("config.json"), r#"{"model_type":"gemma4_unified","text_config":{"num_hidden_layers":0},"vision_config":{}}"#).unwrap();
-        fs::write(source.join("tokenizer.json"), "{}").unwrap();
-        let input = source.join("gemma-with-a-long-enough-name-to-exercise-cache-key-length.gguf");
-        fs::write(
-            &input,
-            build_minimal_gguf(
-                &[(
-                    "general.architecture",
-                    GgufMetaValue::String("gemma4".into()),
-                )],
-                &[
-                    (
-                        "token_embd.weight",
-                        &[256, 2],
-                        GgufTensorType::Q6K,
-                        &[0; 420],
-                    ),
-                    ("output.weight", &[256, 2], GgufTensorType::Q4_0, &[0; 288]),
-                ],
-            ),
-        )
-        .unwrap();
-        fs::write(
-            source.join("mmproj-gemma.gguf"),
-            build_minimal_gguf(
-                &[
-                    ("general.architecture", GgufMetaValue::String("clip".into())),
-                    (
-                        "clip.vision.projector_type",
-                        GgufMetaValue::String("gemma4uv".into()),
-                    ),
-                ],
-                &[(
-                    "mm.input_projection.weight",
-                    &[2, 2],
-                    GgufTensorType::BF16,
-                    &[0; 8],
-                )],
-            ),
-        )
-        .unwrap();
-        input
-    }
-
-    /// A minimal `gemma4v` SigLIP tower mmproj written to `path`: the two
-    /// layout-relevant tensors (4-D conv patch kernel, 3-D position table),
-    /// one encoder block weight, the standardize pair, and the multimodal
-    /// projection. Conversion does not demand the full 356-tensor inventory,
-    /// so this exercises every code path the real `mmproj-BF16.gguf` drives.
-    fn gemma4v_mmproj_fixture(path: &Path) {
-        fs::write(
-            path,
-            build_minimal_gguf(
-                &[
-                    ("general.architecture", GgufMetaValue::String("clip".into())),
-                    (
-                        "clip.vision.projector_type",
-                        GgufMetaValue::String("gemma4v".into()),
-                    ),
-                ],
-                &[
-                    // ggml dims: [patch_w, patch_h, channels, hidden] → MLX
-                    // [1, 3, 2, 2] → input_proj [1, 12] after the fixup.
-                    (
-                        "v.patch_embd.weight",
-                        &[2, 2, 3, 1],
-                        GgufTensorType::F32,
-                        &[0; 48],
-                    ),
-                    // ggml dims: [hidden, positions, 2] → MLX [2, 2, 1].
-                    (
-                        "v.position_embd.weight",
-                        &[1, 2, 2],
-                        GgufTensorType::F32,
-                        &[0; 16],
-                    ),
-                    (
-                        "v.blk.0.attn_q.weight",
-                        &[2, 2],
-                        GgufTensorType::BF16,
-                        &[0; 8],
-                    ),
-                    ("v.std_bias", &[1], GgufTensorType::F32, &[0; 4]),
-                    ("v.std_scale", &[1], GgufTensorType::F32, &[0; 4]),
-                    (
-                        "mm.input_projection.weight",
-                        &[2, 2],
-                        GgufTensorType::BF16,
-                        &[0; 8],
-                    ),
-                ],
-            ),
-        )
-        .unwrap();
     }
 
     #[test]
@@ -10352,124 +10163,6 @@ mod tests {
         assert!(!cache.exists());
     }
 
-    fn build_minimal_gguf(
-        metadata: &[(&str, GgufMetaValue)],
-        tensors: &[(&str, &[u64], GgufTensorType, &[u8])],
-    ) -> Vec<u8> {
-        let mut buf = Vec::new();
-
-        // Magic
-        buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
-        // Version
-        buf.extend_from_slice(&GGUF_VERSION_3.to_le_bytes());
-        // Tensor count
-        buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-        // Metadata count
-        buf.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
-
-        // Write metadata KV pairs
-        for (key, value) in metadata {
-            // Key string: len(u64) + bytes
-            buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
-            buf.extend_from_slice(key.as_bytes());
-
-            match value {
-                GgufMetaValue::Uint32(v) => {
-                    buf.extend_from_slice(&(GgufValueType::Uint32 as u32).to_le_bytes());
-                    buf.extend_from_slice(&v.to_le_bytes());
-                }
-                GgufMetaValue::String(s) => {
-                    buf.extend_from_slice(&(GgufValueType::String as u32).to_le_bytes());
-                    buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
-                    buf.extend_from_slice(s.as_bytes());
-                }
-                GgufMetaValue::Float32(v) => {
-                    buf.extend_from_slice(&(GgufValueType::Float32 as u32).to_le_bytes());
-                    buf.extend_from_slice(&v.to_le_bytes());
-                }
-                GgufMetaValue::Int32(v) => {
-                    buf.extend_from_slice(&(GgufValueType::Int32 as u32).to_le_bytes());
-                    buf.extend_from_slice(&v.to_le_bytes());
-                }
-                GgufMetaValue::Bool(v) => {
-                    buf.extend_from_slice(&(GgufValueType::Bool as u32).to_le_bytes());
-                    buf.push(u8::from(*v));
-                }
-                GgufMetaValue::ArrayString(values) => {
-                    buf.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
-                    buf.extend_from_slice(&(GgufValueType::String as u32).to_le_bytes());
-                    buf.extend_from_slice(&(values.len() as u64).to_le_bytes());
-                    for v in values {
-                        buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
-                        buf.extend_from_slice(v.as_bytes());
-                    }
-                }
-                GgufMetaValue::ArrayI32(values) => {
-                    buf.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
-                    buf.extend_from_slice(&(GgufValueType::Int32 as u32).to_le_bytes());
-                    buf.extend_from_slice(&(values.len() as u64).to_le_bytes());
-                    for v in values {
-                        buf.extend_from_slice(&v.to_le_bytes());
-                    }
-                }
-                _ => panic!("Unsupported metadata type in test helper"),
-            }
-        }
-
-        // Compute tensor data: collect offsets
-        let alignment: u64 = GGUF_DEFAULT_ALIGNMENT;
-        let mut tensor_data_parts: Vec<&[u8]> = Vec::new();
-        let mut tensor_offsets: Vec<u64> = Vec::new();
-        let mut current_offset: u64 = 0;
-
-        for (_, _, _, data) in tensors {
-            // Align offset
-            let remainder = current_offset % alignment;
-            if remainder != 0 {
-                current_offset += alignment - remainder;
-            }
-            tensor_offsets.push(current_offset);
-            tensor_data_parts.push(data);
-            current_offset += data.len() as u64;
-        }
-
-        // Write tensor info descriptors
-        for (i, (name, dims, ttype, _)) in tensors.iter().enumerate() {
-            // Name string
-            buf.extend_from_slice(&(name.len() as u64).to_le_bytes());
-            buf.extend_from_slice(name.as_bytes());
-            // n_dims
-            buf.extend_from_slice(&(dims.len() as u32).to_le_bytes());
-            // dims
-            for d in *dims {
-                buf.extend_from_slice(&d.to_le_bytes());
-            }
-            // type
-            buf.extend_from_slice(&(*ttype as u32).to_le_bytes());
-            // offset
-            buf.extend_from_slice(&tensor_offsets[i].to_le_bytes());
-        }
-
-        // Pad to alignment for data section
-        let remainder = buf.len() as u64 % alignment;
-        if remainder != 0 {
-            let padding = alignment - remainder;
-            buf.extend(vec![0u8; padding as usize]);
-        }
-
-        // Write tensor data
-        let data_start = buf.len();
-        for (i, data) in tensor_data_parts.iter().enumerate() {
-            let target_offset = data_start + tensor_offsets[i] as usize;
-            while buf.len() < target_offset {
-                buf.push(0);
-            }
-            buf.extend_from_slice(data);
-        }
-
-        buf
-    }
-
     #[test]
     fn embedded_gpt2_tokenizer_preserves_decomposed_unicode_bytes() {
         let root = std::env::temp_dir().join(format!(
@@ -10668,46 +10361,6 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
-    /// Header of a structurally complete standalone `qwen35moe` checkpoint:
-    /// every key `validate_qwen35_standalone_geometry` and the MoE loader
-    /// require, with dims small enough to hand-write tensor payloads.
-    fn qwen35_moe_standalone_metadata() -> Vec<(&'static str, GgufMetaValue)> {
-        vec![
-            (
-                "general.architecture",
-                GgufMetaValue::String("qwen35moe".to_string()),
-            ),
-            ("qwen35moe.embedding_length", GgufMetaValue::Uint32(4)),
-            ("qwen35moe.block_count", GgufMetaValue::Uint32(2)),
-            ("qwen35moe.attention.head_count", GgufMetaValue::Uint32(2)),
-            (
-                "qwen35moe.attention.head_count_kv",
-                GgufMetaValue::Uint32(1),
-            ),
-            ("qwen35moe.attention.key_length", GgufMetaValue::Uint32(2)),
-            ("qwen35moe.rope.dimension_count", GgufMetaValue::Uint32(2)),
-            ("qwen35moe.expert_count", GgufMetaValue::Uint32(4)),
-            ("qwen35moe.expert_used_count", GgufMetaValue::Uint32(2)),
-            (
-                "qwen35moe.expert_feed_forward_length",
-                GgufMetaValue::Uint32(8),
-            ),
-            (
-                "qwen35moe.expert_shared_feed_forward_length",
-                GgufMetaValue::Uint32(8),
-            ),
-            ("qwen35moe.ssm.state_size", GgufMetaValue::Uint32(2)),
-            ("qwen35moe.ssm.inner_size", GgufMetaValue::Uint32(4)),
-            ("qwen35moe.ssm.time_step_rank", GgufMetaValue::Uint32(2)),
-            ("qwen35moe.ssm.group_count", GgufMetaValue::Uint32(1)),
-            ("qwen35moe.ssm.conv_kernel", GgufMetaValue::Uint32(4)),
-            (
-                "qwen35moe.full_attention_interval",
-                GgufMetaValue::Uint32(2),
-            ),
-        ]
-    }
-
     /// The MoE tensors of layer 0 in GGUF ne order (reversed from the MLX
     /// shape), one entry per rename-table infix.
     fn qwen35_moe_layer_zero_tensors()
@@ -10762,15 +10415,6 @@ mod tests {
                 vec![0; 8 * 4 * 2],
             ),
         ]
-    }
-
-    fn build_qwen35_moe_fixture(tensors: &[(&str, &[u64], GgufTensorType, Vec<u8>)]) -> Vec<u8> {
-        let metadata = qwen35_moe_standalone_metadata();
-        let descriptors: Vec<(&str, &[u64], GgufTensorType, &[u8])> = tensors
-            .iter()
-            .map(|(name, dims, ty, data)| (*name, *dims, *ty, data.as_slice()))
-            .collect();
-        build_minimal_gguf(&metadata, &descriptors)
     }
 
     /// A standalone sparse Qwen3.5 GGUF must synthesize a config the MoE
@@ -13858,44 +13502,6 @@ mod tests {
                 GgufMetaValue::String("muse-glimmer".to_string()),
             ),
         ])
-    }
-
-    fn muse_glimmer_dflash_metadata() -> HashMap<String, GgufMetaValue> {
-        HashMap::from([(
-            "general.architecture".to_string(),
-            GgufMetaValue::String("dflash".to_string()),
-        )])
-    }
-
-    fn complete_muse_glimmer_dflash_metadata() -> HashMap<String, GgufMetaValue> {
-        let mut metadata = muse_glimmer_dflash_metadata();
-        for (key, value) in [
-            ("dflash.block_count", 5),
-            ("dflash.block_size", 16),
-            ("dflash.embedding_length", 6656),
-            ("dflash.feed_forward_length", 1536),
-            ("dflash.attention.head_count", 8),
-            ("dflash.attention.head_count_kv", 2),
-            ("dflash.attention.key_length", 64),
-            ("dflash.attention.sliding_window", 2048),
-            ("dflash.context_length", 131_072),
-            ("tokenizer.ggml.mask_token_id", 201_818),
-        ] {
-            metadata.insert(key.to_string(), GgufMetaValue::Uint32(value));
-        }
-        metadata.insert(
-            "dflash.target_layers".to_string(),
-            GgufMetaValue::ArrayU32(vec![1, 8, 16]),
-        );
-        metadata.insert(
-            "dflash.attention.layer_norm_rms_epsilon".to_string(),
-            GgufMetaValue::Float32(1e-6),
-        );
-        metadata.insert(
-            "dflash.rope.freq_base".to_string(),
-            GgufMetaValue::Float32(10_000.0),
-        );
-        metadata
     }
 
     fn dflash_tensor(name: impl Into<String>, mlx_shape: &[u64]) -> GgufTensorInfo {

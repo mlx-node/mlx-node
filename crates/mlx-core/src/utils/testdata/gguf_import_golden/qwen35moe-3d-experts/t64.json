@@ -1,0 +1,4 @@
+[
+  "language_model.model.layers.0.mlp.shared_expert.gate_proj",
+  "language_model.model.lm_head"
+]

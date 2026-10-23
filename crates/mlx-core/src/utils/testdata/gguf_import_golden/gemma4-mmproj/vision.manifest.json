@@ -1,0 +1,10 @@
+{
+  "model.embed_vision.embedding_projection.weight": {
+    "dtype": "BF16",
+    "shape": [
+      4,
+      4
+    ],
+    "sha256": "4ba64432692763bf2a51554927db21498c181d2c96ba076daedd735c6e2cddb5"
+  }
+}

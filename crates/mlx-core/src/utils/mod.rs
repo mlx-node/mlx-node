@@ -17,6 +17,8 @@ pub mod gguf_kquant;
 pub(crate) mod gguf_plan;
 pub(crate) mod gguf_read;
 pub(crate) mod gguf_source;
+#[cfg(test)]
+pub(crate) mod gguf_test_fixtures;
 pub(crate) mod host;
 pub mod imatrix;
 pub mod pickle;

@@ -1,0 +1,57 @@
+{
+  "model.language_model.layers.0.input_layernorm.weight": {
+    "dtype": "BF16",
+    "shape": [
+      256
+    ],
+    "sha256": "55cfd32e0f3ed9915b7a060a6a6fc3be733a6c8bc1e49a308659544296b4a028"
+  },
+  "model.language_model.layers.0.mlp.down_proj.biases": {
+    "dtype": "F16",
+    "shape": [
+      256,
+      4
+    ],
+    "sha256": "067b7f18141ff66989b915698f1c543584adbf03d462722bfb3c87f62edfe8f7"
+  },
+  "model.language_model.layers.0.mlp.down_proj.scales": {
+    "dtype": "U8",
+    "shape": [
+      256,
+      32
+    ],
+    "sha256": "4d3b31d0466c0ad700c696c93e2af3b738bbd97cf85b3aae7bb6678bc65af03e"
+  },
+  "model.language_model.layers.0.mlp.down_proj.weight": {
+    "dtype": "U32",
+    "shape": [
+      256,
+      80
+    ],
+    "sha256": "b1aba93c20ad7ab2df05a5d9fb71b7910f03fbe63b832b6d1e30667074573c16"
+  },
+  "model.language_model.layers.0.mlp.up_proj.biases": {
+    "dtype": "F16",
+    "shape": [
+      64,
+      2
+    ],
+    "sha256": "103a196a62fe79e700d7e9c0a91b88ebf79dba1e64e858bd5a9214763c879797"
+  },
+  "model.language_model.layers.0.mlp.up_proj.scales": {
+    "dtype": "U8",
+    "shape": [
+      64,
+      16
+    ],
+    "sha256": "679991ac90eb51766b67c0fd2ef37abbd3b40603d01a3272713caded09f448df"
+  },
+  "model.language_model.layers.0.mlp.up_proj.weight": {
+    "dtype": "U32",
+    "shape": [
+      64,
+      32
+    ],
+    "sha256": "7fbd18b7c61bb2e8d9c6e4768a8c165619e289f5b1943ed32f030879e64c6f79"
+  }
+}
