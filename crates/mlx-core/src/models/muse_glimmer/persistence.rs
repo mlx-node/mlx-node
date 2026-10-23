@@ -80,8 +80,8 @@ pub(super) fn build_projection(
 /// layout here (a `t64` checkpoint tensor is built tiled as-is and not
 /// recorded), so the caller can drop their row-major map entries with
 /// `release_tiled_kquant_sources` once the owning layer is built. The plain `build_projection` discards the list:
-/// its callers (the DFlash draft, tests) hold small maps whose transient is
-/// not worth plumbing.
+/// its callers are the lm_head, the DFlash draft (whose whole map drops at
+/// the end of `load_dflash`) and tests.
 pub(super) fn build_projection_tiled(
     params: &HashMap<String, MxArray>,
     prefix: &str,
@@ -308,13 +308,9 @@ fn load_dflash(
             )?,
         ));
     }
-    Ok(Some(DFlashModel::from_loaded(
-        draft_config,
-        fc,
-        hidden_norm,
-        layers,
-        final_norm,
-    )))
+    let draft = DFlashModel::from_loaded(draft_config, fc, hidden_norm, layers, final_norm);
+    crate::array::memory::drop_and_free_released(params);
+    Ok(Some(draft))
 }
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
@@ -902,6 +898,77 @@ mod tests {
             MxArray::from_float32(&[value], &[1]).expect("create test tensor"),
         )]);
         save_safetensors(path, &mut tensors, None).expect("save test safetensors");
+    }
+
+    #[test]
+    fn dflash_draft_build_frees_its_map_only_under_the_guard() {
+        use super::load_dflash;
+        use crate::array::memory::{FreeReleasedSources, TEST_CLEAR_CACHE_CALLS};
+        use crate::models::muse_glimmer::config::{
+            MuseGlimmerConfig, MuseGlimmerDFlashConfig,
+            fixtures::{config_json, text_config_json},
+        };
+
+        let mut config =
+            MuseGlimmerConfig::from_json_str(&config_json(&text_config_json(4))).unwrap();
+        config.dflash_config = Some(MuseGlimmerDFlashConfig {
+            num_hidden_layers: 1,
+            block_size: 4,
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            sliding_window: 8,
+            max_position_embeddings: 64,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            target_layers: vec![0],
+            mask_token_id: 0,
+            causal: false,
+        });
+        let draft = || {
+            let matrix = |n: i64, k: i64| MxArray::zeros(&[n, k], None).unwrap();
+            let vector = |n: i64| MxArray::ones(&[n], None).unwrap();
+            let mut params = HashMap::from([
+                ("fc.weight".to_string(), matrix(8, 8)),
+                ("hidden_norm.weight".to_string(), vector(8)),
+                ("norm.weight".to_string(), vector(8)),
+            ]);
+            for (key, value) in [
+                ("self_attn.q_proj.weight", matrix(8, 8)),
+                ("self_attn.k_proj.weight", matrix(4, 8)),
+                ("self_attn.v_proj.weight", matrix(4, 8)),
+                ("self_attn.o_proj.weight", matrix(8, 8)),
+                ("self_attn.q_norm.weight", vector(4)),
+                ("self_attn.k_norm.weight", vector(4)),
+                ("mlp.gate_proj.weight", matrix(16, 8)),
+                ("mlp.up_proj.weight", matrix(16, 8)),
+                ("mlp.down_proj.weight", matrix(8, 16)),
+                ("input_layernorm.weight", vector(8)),
+                ("post_attention_layernorm.weight", vector(8)),
+            ] {
+                params.insert(format!("layers.0.{key}"), value);
+            }
+            params
+        };
+        let default = PerLayerQuant {
+            bits: 4,
+            group_size: 64,
+            mode: PerLayerMode::Affine,
+            input_amax: None,
+            layout: Default::default(),
+        };
+        let clears = |guard: bool| {
+            let _free = guard.then(|| FreeReleasedSources::enable(true));
+            let start = TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get);
+            let model = load_dflash(&config, Some(draft()), default, &HashMap::new()).unwrap();
+            assert!(model.is_some(), "draft not built");
+            TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get) - start
+        };
+        assert_eq!(clears(false), 0, "lazy-map draft build cleared the cache");
+        assert_eq!(clears(true), 1, "preload draft build kept its released map");
+        assert_eq!(clears(false), 0, "guard leaked past its scope");
     }
 
     #[test]

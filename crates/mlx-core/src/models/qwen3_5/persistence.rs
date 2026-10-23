@@ -1640,6 +1640,7 @@ fn apply_clef_residency(
                 byte_delta += group_bytes(params, &prefix) - packed_bytes;
             }
         }
+        crate::array::memory::free_released_sources();
     }
     if requantized > 0 {
         // The bf16 intermediates are dead once the int8 pair is evaluated.
@@ -6018,6 +6019,37 @@ mod tests {
                 "{key} shape"
             );
         }
+    }
+
+    #[test]
+    fn clef_residency_frees_each_unit_only_under_the_guard() {
+        use crate::array::memory::{FreeReleasedSources, TEST_CLEAR_CACHE_CALLS};
+        let label = "clef_residency_frees_each_unit_only_under_the_guard";
+        let Some((before, default_plq)) = clef_affine_fixture(label) else {
+            return;
+        };
+        let clears = |guard: bool| {
+            let _free = guard.then(|| FreeReleasedSources::enable(true));
+            let mut params = before.clone();
+            let mut per_layer_quant =
+                HashMap::from([("layers.0.linear_attn.out_proj".to_string(), clef_sym8_plq())]);
+            let start = TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get);
+            apply_clef_residency(
+                &mut params,
+                &mut per_layer_quant,
+                default_plq,
+                ClefResidency::Sym8,
+            )
+            .unwrap();
+            TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get) - start
+        };
+        assert_eq!(clears(false), 0, "lazy-map residency cleared the cache");
+        assert_eq!(
+            clears(true),
+            4,
+            "preload residency must clear once per unit (in_proj_ba, in_proj_qkvz, out_proj, mlp)"
+        );
+        assert_eq!(clears(false), 0, "guard leaked past its scope");
     }
 
     #[test]
