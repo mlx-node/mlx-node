@@ -964,40 +964,15 @@ pub fn release_tiled_kquant_sources(
             params.remove(&format!("{prefix}.{suffix}"));
         }
     }
-    if released && FREE_RELEASED_SOURCES.with(std::cell::Cell::get) {
-        crate::array::clear_cache();
-    }
-}
-
-thread_local! {
-    static FREE_RELEASED_SOURCES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// While alive, [`release_tiled_kquant_sources`] on this thread also returns
-/// the released buffers to the OS. Enable it for a build over a map whose
-/// arrays are all materialized up front (GGUF preload): nothing later in the
-/// build allocates source-sized buffers, so released sources would otherwise
-/// pile up in the MLX buffer cache (+5.4 GiB peak footprint on Qwen3.8-27B).
-/// A lazy safetensors map reuses them for the next layer's loads instead.
-#[must_use]
-pub struct FreeReleasedSources(bool);
-
-impl FreeReleasedSources {
-    pub fn enable(on: bool) -> Self {
-        Self(FREE_RELEASED_SOURCES.with(|flag| flag.replace(on)))
-    }
-}
-
-impl Drop for FreeReleasedSources {
-    fn drop(&mut self) {
-        FREE_RELEASED_SOURCES.with(|flag| flag.set(self.0));
+    if released {
+        crate::array::memory::free_released_sources();
     }
 }
 
 #[cfg(test)]
 mod release_sources_tests {
     use super::*;
-    use crate::array::memory::TEST_CLEAR_CACHE_CALLS;
+    use crate::array::memory::{FreeReleasedSources, TEST_CLEAR_CACHE_CALLS};
 
     fn release_one(params: &mut HashMap<String, MxArray>, prefix: &str) -> u32 {
         for suffix in ["weight", "scales", "biases"] {

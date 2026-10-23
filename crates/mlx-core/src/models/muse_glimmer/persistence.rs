@@ -637,7 +637,7 @@ fn load_inner(path: &Path, preload_input: Option<PreloadInput>) -> Result<(MuseG
     );
     let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
     let from_gguf = preload_input.is_some();
-    let _free_released = crate::models::quantized_linear::FreeReleasedSources::enable(from_gguf);
+    let _free_released = crate::array::memory::FreeReleasedSources::enable(from_gguf);
     let mut preload = preload_input
         .map(|input| preload_gguf(&input))
         .transpose()?;
@@ -808,7 +808,7 @@ pub(crate) async fn load_with_thread(model_path: &str) -> Result<MuseGlimmerMode
 }
 
 /// The caller releases `source`'s lease when this fails.
-async fn load_with_source(source: &CheckpointSource) -> Result<MuseGlimmerModel> {
+pub(crate) async fn load_with_source(source: &CheckpointSource) -> Result<MuseGlimmerModel> {
     let model_path = source.asset_dir().to_string_lossy().into_owned();
     let preload_input = match source {
         CheckpointSource::Dir(_) => None,

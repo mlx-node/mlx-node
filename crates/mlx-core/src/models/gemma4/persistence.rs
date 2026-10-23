@@ -2798,7 +2798,7 @@ impl Gemma4Inner {
         let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
 
         let _free_released =
-            crate::models::quantized_linear::FreeReleasedSources::enable(preload_input.is_some());
+            crate::array::memory::FreeReleasedSources::enable(preload_input.is_some());
         let (mut params, ple_shards) =
             load_gemma_weights(path, &config, preload_input, ple_shard_byte_budget())?;
 
@@ -3273,7 +3273,7 @@ impl Gemma4Model {
     }
 
     /// The caller releases `source`'s lease when this fails.
-    async fn load_with_source(
+    pub(crate) async fn load_with_source(
         source: &CheckpointSource,
         draft_model_path: Option<String>,
     ) -> Result<Self> {
