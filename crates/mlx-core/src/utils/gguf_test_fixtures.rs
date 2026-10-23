@@ -851,7 +851,7 @@ fn write_json(path: &Path, value: &serde_json::Value) {
     fs::write(path, text).unwrap();
 }
 
-async fn prepare_import_fixture(fixture: &ImportFixture, cache_root: &Path) -> PathBuf {
+pub(crate) async fn prepare_import_fixture(fixture: &ImportFixture, cache_root: &Path) -> PathBuf {
     use super::gguf::{
         prepare_gemma4_native_gguf_in, prepare_muse_glimmer_native_gguf_in,
         prepare_qwen35_moe_native_gguf_in, prepare_qwen35_native_gguf_in,

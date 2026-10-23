@@ -647,3 +647,422 @@ pub(crate) fn write_gguf_assets(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::utils::gguf::{
+        GgufConversionOptions, GgufTensorType, convert_gguf_to_safetensors, parse_gguf,
+    };
+    use crate::utils::gguf_test_fixtures::{
+        IMPORT_FIXTURE_NAMES, ImportFixture, ImportFixtureFamily, build_minimal_gguf,
+        fixture_payload, prepare_import_fixture, safetensors_manifest, sha256_hex, t64_prefixes,
+        write_import_fixture,
+    };
+
+    fn golden_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/utils/testdata/gguf_import_golden")
+    }
+
+    fn work_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("mlx-gguf-plan-{tag}-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(path).unwrap())
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// Writes fixture `name` and checks its bytes against the golden's
+    /// `fixture.json`, so a builder change cannot pass for a plan change.
+    fn checked_fixture(name: &str, dir: &Path) -> ImportFixture {
+        let fixture = write_import_fixture(name, dir);
+        let expected = read_json(&golden_root().join(name).join("fixture.json"));
+        assert_eq!(
+            expected["main"].as_str(),
+            Some(sha256_hex(&fs::read(&fixture.main).unwrap()).as_str()),
+            "{name}: fixture builder drifted from the golden"
+        );
+        let companion = fixture
+            .companion
+            .as_ref()
+            .map(|p| sha256_hex(&fs::read(p).unwrap()));
+        assert_eq!(
+            expected["companion"].as_str(),
+            companion.as_deref(),
+            "{name}: companion fixture drifted"
+        );
+        fixture
+    }
+
+    struct Planned {
+        gguf: GgufFile,
+        plan: ImportPlan,
+        companion: Option<(GgufFile, ImportPlan)>,
+    }
+
+    /// The plan native prepare's converter calls make: bf16, K-quant import,
+    /// sibling `config.json` authoritative when present, the companion with
+    /// the GGUF parent as its config source.
+    fn plan_like_prepare(
+        main: &Path,
+        native_qwen35_layout: bool,
+        companion: Option<(&Path, &str)>,
+    ) -> Planned {
+        let parent = main.parent().unwrap();
+        let opts = ImportOptions {
+            dtype: Some(DType::BFloat16),
+            import_k_quants: true,
+            native_qwen35_layout,
+            config_source_dir: parent
+                .join("config.json")
+                .is_file()
+                .then(|| parent.to_path_buf()),
+            ..Default::default()
+        };
+        let mut gguf = parse_gguf(main).unwrap();
+        annotate_gguf_header(&mut gguf);
+        let plan = plan_gguf_import(&gguf, main, &opts, OutputRole::Primary)
+            .unwrap_or_else(|e| panic!("plan {}: {}", main.display(), e.reason));
+        let companion = companion.map(|(path, filename)| {
+            let opts = ImportOptions {
+                dtype: Some(DType::BFloat16),
+                import_k_quants: true,
+                config_source_dir: Some(parent.to_path_buf()),
+                ..Default::default()
+            };
+            let mut gguf = parse_gguf(path).unwrap();
+            annotate_gguf_header(&mut gguf);
+            let plan = plan_gguf_import(
+                &gguf,
+                path,
+                &opts,
+                OutputRole::Companion {
+                    filename: filename.to_string(),
+                },
+            )
+            .unwrap_or_else(|e| panic!("plan {}: {}", path.display(), e.reason));
+            (gguf, plan)
+        });
+        Planned {
+            gguf,
+            plan,
+            companion,
+        }
+    }
+
+    fn companion_filename(family: ImportFixtureFamily) -> &'static str {
+        match family {
+            ImportFixtureFamily::MuseGlimmer => "draft.safetensors",
+            _ => "vision.safetensors",
+        }
+    }
+
+    fn plan_fixture(fixture: &ImportFixture) -> Planned {
+        let native = matches!(
+            fixture.family,
+            ImportFixtureFamily::Qwen35 | ImportFixtureFamily::Qwen35Moe
+        );
+        let filename = companion_filename(fixture.family);
+        plan_like_prepare(
+            &fixture.main,
+            native,
+            fixture.companion.as_deref().map(|p| (p, filename)),
+        )
+    }
+
+    fn write_planned_assets(planned: &Planned, out: &Path) {
+        fs::create_dir_all(out).unwrap();
+        write_gguf_assets(
+            &planned.plan,
+            planned.companion.as_ref().map(|(g, p)| (p, g)),
+            &planned.gguf,
+            out,
+        )
+        .unwrap_or_else(|e| panic!("write_gguf_assets: {}", e.reason));
+    }
+
+    /// Regular, non-hidden file names of `dir` that `keep` accepts.
+    fn file_names(dir: &Path, keep: impl Fn(&str) -> bool) -> BTreeSet<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.path().is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with('.') && keep(n))
+            .collect()
+    }
+
+    fn is_fixture_golden_asset(name: &str) -> bool {
+        name != "fixture.json" && name != "t64.json" && !name.ends_with(".manifest.json")
+    }
+
+    /// Byte equality of every asset file, and the same file set on both sides.
+    fn assert_assets_equal(
+        tag: &str,
+        golden: &Path,
+        out: &Path,
+        golden_keep: impl Fn(&str) -> bool,
+    ) {
+        let expected = file_names(golden, golden_keep);
+        let written = file_names(out, |n| !n.ends_with(".safetensors"));
+        assert_eq!(written, expected, "{tag}: asset file set");
+        for name in &expected {
+            let want = fs::read(golden.join(name)).unwrap();
+            let got = fs::read(out.join(name)).unwrap();
+            assert!(
+                got == want,
+                "{tag}: {name} differs ({} vs golden {} bytes)\n--- written\n{}\n--- golden\n{}",
+                got.len(),
+                want.len(),
+                String::from_utf8_lossy(&got),
+                String::from_utf8_lossy(&want)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn header_tiled_set_equals_base_golden() {
+        let work = work_dir("tiled");
+        for name in IMPORT_FIXTURE_NAMES {
+            let fixture = checked_fixture(name, &work.join("src").join(name));
+            let planned = plan_fixture(&fixture);
+            let golden: BTreeSet<String> =
+                serde_json::from_value(read_json(&golden_root().join(name).join("t64.json")))
+                    .unwrap();
+            assert!(!golden.is_empty(), "{name}: golden t64 set is empty");
+            assert_eq!(
+                planned.plan.tiled_prefixes, golden,
+                "{name}: header t64 set vs base golden"
+            );
+            assert_eq!(
+                planned.plan.tiled_gguf_names.len(),
+                golden.len(),
+                "{name}: tiled GGUF names {:?}",
+                planned.plan.tiled_gguf_names
+            );
+            // The converter's marks are what tile_kquant_weights_for_disk tiled.
+            let entry = prepare_import_fixture(&fixture, &work.join("cache").join(name)).await;
+            let live = t64_prefixes(&read_json(&entry.join("config.json")));
+            crate::utils::gguf::native_gguf_unlease_in_use(&entry);
+            assert_eq!(
+                planned.plan.tiled_prefixes, live,
+                "{name}: header t64 set vs the live disk tiler"
+            );
+        }
+        fs::remove_dir_all(&work).ok();
+    }
+
+    #[test]
+    fn planned_assets_equal_base_golden() {
+        let work = work_dir("assets");
+        for name in IMPORT_FIXTURE_NAMES {
+            let fixture = checked_fixture(name, &work.join("src").join(name));
+            let planned = plan_fixture(&fixture);
+            let out = work.join("out").join(name);
+            write_planned_assets(&planned, &out);
+            assert_assets_equal(
+                name,
+                &golden_root().join(name),
+                &out,
+                is_fixture_golden_asset,
+            );
+        }
+        fs::remove_dir_all(&work).ok();
+    }
+
+    #[tokio::test]
+    async fn converter_output_equals_base_golden() {
+        let work = work_dir("convert");
+        for name in IMPORT_FIXTURE_NAMES {
+            let fixture = checked_fixture(name, &work.join("src").join(name));
+            let entry = prepare_import_fixture(&fixture, &work.join("cache").join(name)).await;
+            let golden = golden_root().join(name);
+            let manifests = file_names(&golden, |n| n.ends_with(".manifest.json"));
+            let written = file_names(&entry, |n| n.ends_with(".safetensors"));
+            assert_eq!(
+                written
+                    .iter()
+                    .map(|n| n.replace(".safetensors", ".manifest.json"))
+                    .collect::<BTreeSet<_>>(),
+                manifests,
+                "{name}: safetensors file set"
+            );
+            for manifest in &manifests {
+                let stem = manifest.trim_end_matches(".manifest.json");
+                let want: BTreeMap<String, serde_json::Value> =
+                    serde_json::from_value(read_json(&golden.join(manifest))).unwrap();
+                let got: BTreeMap<String, serde_json::Value> = serde_json::from_value(
+                    safetensors_manifest(&entry.join(format!("{stem}.safetensors"))),
+                )
+                .unwrap();
+                assert_eq!(
+                    got.keys().collect::<Vec<_>>(),
+                    want.keys().collect::<Vec<_>>(),
+                    "{name}/{stem}: tensor names"
+                );
+                for (tensor, want) in &want {
+                    assert_eq!(&got[tensor], want, "{name}/{stem}: tensor {tensor}");
+                }
+            }
+            assert_assets_equal(name, &golden, &entry, is_fixture_golden_asset);
+            let t64: BTreeSet<String> =
+                serde_json::from_value(read_json(&golden.join("t64.json"))).unwrap();
+            assert_eq!(
+                t64_prefixes(&read_json(&entry.join("config.json"))),
+                t64,
+                "{name}: converter t64 marks"
+            );
+            crate::utils::gguf::native_gguf_unlease_in_use(&entry);
+        }
+        fs::remove_dir_all(&work).ok();
+    }
+
+    fn convert_options(fixture: &ImportFixture, out: &Path) -> GgufConversionOptions {
+        GgufConversionOptions {
+            input_path: fixture.main.to_string_lossy().into_owned(),
+            output_dir: out.to_string_lossy().into_owned(),
+            config_source_dir: Some(
+                fixture
+                    .main
+                    .parent()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            dtype: Some("bfloat16".to_string()),
+            verbose: None,
+            quantize: Some(false),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            output_filename: None,
+            vlm_key_prefix: None,
+            quant_mxfp: None,
+            import_k_quants: Some(true),
+            native_qwen35_layout: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn converter_tiler_drift_debug_asserts() {
+        assert!(
+            cfg!(debug_assertions),
+            "the tiler drift check is a debug assertion"
+        );
+        let work = work_dir("drift");
+        let fixture = checked_fixture("qwen35-dense-untied", &work.join("src/untied"));
+        let planned = plan_fixture(&fixture);
+        let tiled = planned.plan.tiled_prefixes.clone();
+        debug_assert_tiled_plan_matches(true, &planned.plan, &tiled);
+
+        let extra = "language_model.model.layers.7.mlp.gate_proj";
+        let mut drifted = planned.plan.clone();
+        drifted.tiled_prefixes.insert(extra.to_string());
+        drifted
+            .tiled_gguf_names
+            .insert("blk.7.ffn_gate.weight".to_string());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            debug_assert_tiled_plan_matches(true, &drifted, &tiled)
+        }))
+        .expect_err("an extra header prefix must trip the check");
+        let message = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(message.contains(extra), "panic names the prefix: {message}");
+        debug_assert_tiled_plan_matches(false, &drifted, &tiled);
+
+        // --vlm-key-prefix renames the keys the tiler reads, and --quantize
+        // skips both sides: the converter must not run the check for either.
+        let gemma = checked_fixture("gemma4-mmproj", &work.join("src/gemma"));
+        let out = work.join("out/vlm");
+        let mut options = convert_options(&gemma, &out);
+        options.vlm_key_prefix = Some(true);
+        convert_gguf_to_safetensors(options)
+            .await
+            .unwrap_or_else(|e| panic!("vlm-key-prefix convert: {}", e.reason));
+        let float_main = gemma.main.with_file_name("gemma4-float.gguf");
+        let up = fixture_payload(GgufTensorType::F32, 256 * 64, 7);
+        let norm = fixture_payload(GgufTensorType::F32, 256, 8);
+        fs::write(
+            &float_main,
+            build_minimal_gguf(
+                &[(
+                    "general.architecture",
+                    GgufMetaValue::String("gemma4".into()),
+                )],
+                &[
+                    ("blk.0.ffn_up.weight", &[256, 64], GgufTensorType::F32, &up),
+                    ("blk.0.attn_norm.weight", &[256], GgufTensorType::F32, &norm),
+                ],
+            ),
+        )
+        .unwrap();
+        let out = work.join("out/quantize");
+        let mut options = convert_options(&gemma, &out);
+        options.input_path = float_main.to_string_lossy().into_owned();
+        options.quantize = Some(true);
+        convert_gguf_to_safetensors(options)
+            .await
+            .unwrap_or_else(|e| panic!("--quantize convert: {}", e.reason));
+        assert!(t64_prefixes(&read_json(&out.join("config.json"))).is_empty());
+        fs::remove_dir_all(&work).ok();
+    }
+
+    /// `MLX_GATE_GOLDEN=<dir>` (real-file goldens) plus `gate1-files.txt` beside
+    /// it (or `MLX_GATE_FILES`); `MLX_GATE_ONLY=a,b` picks golden dirs. The
+    /// header-only plan of each real GGUF writes the golden assets byte for byte.
+    #[test]
+    #[ignore = "reads real GGUF headers; set MLX_GATE_GOLDEN"]
+    fn real_header_plan_matches_golden_config() {
+        let golden_root = PathBuf::from(
+            std::env::var_os("MLX_GATE_GOLDEN").expect("set MLX_GATE_GOLDEN=<golden dir>"),
+        );
+        let files = std::env::var_os("MLX_GATE_FILES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| golden_root.parent().unwrap().join("gate1-files.txt"));
+        let only: Option<BTreeSet<String>> = std::env::var("MLX_GATE_ONLY")
+            .ok()
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
+        let work = work_dir("real");
+        let mut checked = 0;
+        for line in fs::read_to_string(&files).unwrap().lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let cols: Vec<&str> = line.split('\t').collect();
+            let (dir, gguf, class, companion) = (cols[0], cols[1], cols[2], cols[3]);
+            if only.as_ref().is_some_and(|o| !o.contains(dir)) {
+                continue;
+            }
+            let native = matches!(class, "Qwen35Model" | "Qwen35MoeModel" | "ClefModel");
+            let filename = if class == "MuseGlimmerModel" {
+                "draft.safetensors"
+            } else {
+                "vision.safetensors"
+            };
+            let companion = (companion != "-").then(|| (Path::new(companion), filename));
+            let planned = plan_like_prepare(Path::new(gguf), native, companion);
+            let out = work.join(dir);
+            write_planned_assets(&planned, &out);
+            let golden = golden_root.join(dir);
+            assert_assets_equal(dir, &golden, &out, |n| {
+                !(n.starts_with("manifest") && n.ends_with(".json"))
+            });
+            println!(
+                "PLAN_OK {dir} t64={} files={}",
+                planned.plan.tiled_prefixes.len(),
+                file_names(&out, |_| true).len()
+            );
+            checked += 1;
+        }
+        fs::remove_dir_all(&work).ok();
+        assert!(checked > 0, "no golden rows matched");
+    }
+}
