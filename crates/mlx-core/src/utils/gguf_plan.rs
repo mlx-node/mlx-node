@@ -920,18 +920,16 @@ mod tests {
         fs::remove_dir_all(&work).ok();
     }
 
+    /// The options native prepare passes to the converter for `fixture`.
     fn convert_options(fixture: &ImportFixture, out: &Path) -> GgufConversionOptions {
+        let parent = fixture.main.parent().unwrap();
         GgufConversionOptions {
             input_path: fixture.main.to_string_lossy().into_owned(),
             output_dir: out.to_string_lossy().into_owned(),
-            config_source_dir: Some(
-                fixture
-                    .main
-                    .parent()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
+            config_source_dir: parent
+                .join("config.json")
+                .is_file()
+                .then(|| parent.to_string_lossy().into_owned()),
             dtype: Some("bfloat16".to_string()),
             verbose: None,
             quantize: Some(false),
@@ -944,16 +942,16 @@ mod tests {
             vlm_key_prefix: None,
             quant_mxfp: None,
             import_k_quants: Some(true),
-            native_qwen35_layout: None,
+            native_qwen35_layout: Some(matches!(
+                fixture.family,
+                ImportFixtureFamily::Qwen35 | ImportFixtureFamily::Qwen35Moe
+            )),
         }
     }
 
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn converter_tiler_drift_debug_asserts() {
-        assert!(
-            cfg!(debug_assertions),
-            "the tiler drift check is a debug assertion"
-        );
         let work = work_dir("drift");
         let fixture = checked_fixture("qwen35-dense-untied", &work.join("src/untied"));
         let planned = plan_fixture(&fixture);
@@ -978,15 +976,25 @@ mod tests {
         assert!(message.contains(extra), "panic names the prefix: {message}");
         debug_assert_tiled_plan_matches(false, &drifted, &tiled);
 
-        // --vlm-key-prefix renames the keys the tiler reads, and --quantize
-        // skips both sides: the converter must not run the check for either.
-        let gemma = checked_fixture("gemma4-mmproj", &work.join("src/gemma"));
+        // --vlm-key-prefix renames `lm_head.*`, so the tiler skips the lm_head
+        // the header plan tiles; --quantize skips both sides. The converter
+        // must not run the check for either.
         let out = work.join("out/vlm");
-        let mut options = convert_options(&gemma, &out);
+        let mut options = convert_options(&fixture, &out);
         options.vlm_key_prefix = Some(true);
         convert_gguf_to_safetensors(options)
             .await
             .unwrap_or_else(|e| panic!("vlm-key-prefix convert: {}", e.reason));
+        assert!(
+            planned
+                .plan
+                .tiled_prefixes
+                .contains("language_model.model.lm_head")
+                && !t64_prefixes(&read_json(&out.join("config.json")))
+                    .contains("language_model.model.lm_head"),
+            "the --vlm-key-prefix case no longer separates the plan from the tiler"
+        );
+        let gemma = checked_fixture("gemma4-mmproj", &work.join("src/gemma"));
         let float_main = gemma.main.with_file_name("gemma4-float.gguf");
         let up = fixture_payload(GgufTensorType::F32, 256 * 64, 7);
         let norm = fixture_payload(GgufTensorType::F32, 256, 8);
