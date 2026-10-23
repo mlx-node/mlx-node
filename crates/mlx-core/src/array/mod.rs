@@ -1,4 +1,5 @@
 // Existing submodules
+pub(crate) mod alloc;
 pub mod attention;
 pub mod banded_attention;
 mod handle;
