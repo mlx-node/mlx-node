@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 use crate::array::DType;
 use crate::utils::gguf::{
     GgufFile, NativeGgufFamily, native_gguf_unlease_in_use, parse_gguf, prepare_gguf_assets,
-    resolve_gemma4_gguf_source, resolve_muse_glimmer_gguf_source, source_file_identity_digest,
+    prepare_gguf_assets_in, resolve_gemma4_gguf_source, resolve_muse_glimmer_gguf_source,
+    source_file_identity_digest,
 };
 use crate::utils::gguf_import::PreloadInput;
 use crate::utils::gguf_plan::{
@@ -55,6 +56,15 @@ fn is_gguf_file(path: &Path) -> bool {
 
 impl CheckpointSource {
     pub(crate) async fn resolve(path: &Path, family: NativeGgufFamily) -> Result<Self> {
+        Self::resolve_in(path, family, None).await
+    }
+
+    /// `cache_root` None = the default asset root.
+    pub(crate) async fn resolve_in(
+        path: &Path,
+        family: NativeGgufFamily,
+        cache_root: Option<&Path>,
+    ) -> Result<Self> {
         if path.is_dir() && path.join(GGUF_SOURCE_FILE).is_file() {
             return Ok(Self::Gguf(Box::new(GgufCheckpoint::from_asset_dir(
                 path, family,
@@ -67,12 +77,14 @@ impl CheckpointSource {
             NativeGgufFamily::Gemma4 => resolve_gemma4_gguf_source(path)?,
             NativeGgufFamily::MuseGlimmer => resolve_muse_glimmer_gguf_source(path)?,
         };
-        match gguf {
-            Some(gguf) => Ok(Self::Gguf(Box::new(
-                prepare_gguf_assets(&gguf, family).await?,
-            ))),
-            None => Ok(Self::Dir(path.to_path_buf())),
-        }
+        let Some(gguf) = gguf else {
+            return Ok(Self::Dir(path.to_path_buf()));
+        };
+        let checkpoint = match cache_root {
+            Some(root) => prepare_gguf_assets_in(&gguf, family, root).await?,
+            None => prepare_gguf_assets(&gguf, family).await?,
+        };
+        Ok(Self::Gguf(Box::new(checkpoint)))
     }
 
     pub(crate) fn asset_dir(&self) -> &Path {
@@ -354,4 +366,401 @@ pub(crate) fn t64_prefixes(config: &Value) -> BTreeSet<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use crate::utils::gguf::{native_gguf_unlease_in_use, sweep_native_gguf_cache};
+    use crate::utils::gguf_test_fixtures::{
+        IMPORT_FIXTURE_NAMES, ImportFixture, ImportFixtureFamily, write_import_fixture,
+    };
+
+    fn work_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("mlx-ckpt-src-{tag}-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn golden_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/utils/testdata/gguf_import_golden")
+    }
+
+    fn family(fx: &ImportFixture) -> NativeGgufFamily {
+        match fx.family {
+            ImportFixtureFamily::Qwen35 => NativeGgufFamily::Qwen35,
+            ImportFixtureFamily::Qwen35Moe => NativeGgufFamily::Qwen35Moe,
+            ImportFixtureFamily::Gemma4 => NativeGgufFamily::Gemma4,
+            ImportFixtureFamily::MuseGlimmer => NativeGgufFamily::MuseGlimmer,
+        }
+    }
+
+    fn names(dir: &Path) -> BTreeSet<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn set_mtime(path: &Path, age_secs: u64) {
+        let time = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(time))
+            .unwrap();
+    }
+
+    const TWO_DAYS: u64 = 2 * 24 * 3600;
+
+    #[tokio::test]
+    async fn prepare_gguf_assets_writes_no_weights() {
+        let work = work_dir("assets");
+        for name in IMPORT_FIXTURE_NAMES {
+            let fx = write_import_fixture(name, &work.join("src").join(name));
+            let ckpt =
+                prepare_gguf_assets_in(&fx.main, family(&fx), &work.join("cache").join(name))
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: {}", e.reason));
+            let dir = ckpt.asset_dir.clone();
+            let entry = dir.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(entry.contains("-v8-"), "{name}: entry key {entry}");
+            let marker = fs::read_to_string(dir.join(".complete")).unwrap();
+            assert!(marker.starts_with("format=8\n"), "{name}: marker\n{marker}");
+
+            let files = names(&dir);
+            let weights: Vec<&String> = files
+                .iter()
+                .filter(|n| n.ends_with(".safetensors"))
+                .collect();
+            assert!(weights.is_empty(), "{name}: weight files {weights:?}");
+            for required in ["config.json", GGUF_SOURCE_FILE, ".complete"] {
+                assert!(
+                    files.contains(required),
+                    "{name}: no {required} in {files:?}"
+                );
+            }
+
+            let golden = golden_root().join(name);
+            let want: BTreeSet<String> = names(&golden)
+                .into_iter()
+                .filter(|n| {
+                    n != "fixture.json" && n != "t64.json" && !n.ends_with(".manifest.json")
+                })
+                .collect();
+            let got: BTreeSet<String> = files
+                .iter()
+                .filter(|n| !n.starts_with('.') && *n != GGUF_SOURCE_FILE)
+                .cloned()
+                .collect();
+            assert_eq!(got, want, "{name}: asset file set");
+            assert_eq!(
+                got.contains("tokenizer.json"),
+                golden.join("tokenizer.json").is_file(),
+                "{name}: tokenizer.json"
+            );
+            for file in &want {
+                assert!(
+                    fs::read(dir.join(file)).unwrap() == fs::read(golden.join(file)).unwrap(),
+                    "{name}: {file} differs from the base golden"
+                );
+            }
+            ckpt.check_asset_config()
+                .unwrap_or_else(|e| panic!("{name}: {}", e.reason));
+            native_gguf_unlease_in_use(&dir);
+        }
+        fs::remove_dir_all(&work).ok();
+    }
+
+    #[tokio::test]
+    async fn gguf_source_json_has_canonical_paths_and_identity() {
+        let work = work_dir("source-json");
+        for name in ["muse-draft", "qwen35-dense-untied"] {
+            let fx = write_import_fixture(name, &work.join("src").join(name));
+            let ckpt = prepare_gguf_assets_in(&fx.main, family(&fx), &work.join("cache"))
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {}", e.reason));
+            let record = read_gguf_source_json(&ckpt.asset_dir).unwrap();
+            let raw: Value =
+                serde_json::from_slice(&fs::read(ckpt.asset_dir.join(GGUF_SOURCE_FILE)).unwrap())
+                    .unwrap();
+
+            let expect = |path: &Path| {
+                let canonical = path.canonicalize().unwrap();
+                let header = parse_gguf(&canonical).unwrap();
+                file_identity(&canonical, &header, &fs::metadata(&canonical).unwrap()).unwrap()
+            };
+            let main = expect(&fx.main);
+            assert!(main.path.is_absolute(), "{name}: main path");
+            assert_eq!(record.main, main, "{name}: main identity");
+            assert_eq!(
+                raw["main"].as_str(),
+                main.path.to_str(),
+                "{name}: main path"
+            );
+            assert_eq!(ckpt.main.2, main, "{name}: checkpoint main identity");
+            match &fx.companion {
+                Some(companion) => {
+                    let companion = expect(companion);
+                    assert_eq!(
+                        record.companion.as_ref(),
+                        Some(&companion),
+                        "{name}: companion identity"
+                    );
+                    assert_eq!(
+                        raw["companion"].as_str(),
+                        companion.path.to_str(),
+                        "{name}: companion path"
+                    );
+                    assert!(raw["companion_identity"].is_object(), "{name}");
+                }
+                None => {
+                    assert!(record.companion.is_none(), "{name}: companion");
+                    assert!(raw["companion"].is_null(), "{name}: companion");
+                    assert!(raw["companion_identity"].is_null(), "{name}");
+                }
+            }
+            native_gguf_unlease_in_use(&ckpt.asset_dir);
+        }
+        fs::remove_dir_all(&work).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_prepare_assets_publish_one_entry() {
+        let work = work_dir("concurrent");
+        let fx = write_import_fixture("qwen35-dense-untied", &work.join("src"));
+        let cache = work.join("cache");
+        let (left, right) = tokio::join!(
+            prepare_gguf_assets_in(&fx.main, NativeGgufFamily::Qwen35, &cache),
+            prepare_gguf_assets_in(&fx.main, NativeGgufFamily::Qwen35, &cache)
+        );
+        let (left, right) = (left.unwrap(), right.unwrap());
+        assert_eq!(left.asset_dir, right.asset_dir);
+        assert!(left.asset_dir.join(".complete").is_file());
+        assert!(left.asset_dir.join(GGUF_SOURCE_FILE).is_file());
+        let entries = names(&cache);
+        let dirs: Vec<&String> = entries
+            .iter()
+            .filter(|n| !n.starts_with('.') && cache.join(n).is_dir())
+            .collect();
+        assert_eq!(dirs.len(), 1, "published entries {dirs:?}");
+        assert!(
+            !entries.iter().any(|n| n.contains(".staging-")),
+            "staging survived publication: {entries:?}"
+        );
+        native_gguf_unlease_in_use(&left.asset_dir);
+        native_gguf_unlease_in_use(&right.asset_dir);
+        fs::remove_dir_all(&work).ok();
+    }
+
+    // The std Mutex guard is held across awaits on purpose: it serializes the
+    // cap env and the sweep against other sweep tests for the whole test.
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn assets_lease_blocks_sweep() {
+        let _env_guard = crate::utils::gguf::sweep_env_lock().lock().unwrap();
+        let _env = crate::utils::gguf::SweepEnvVar::set_max_gb("0");
+        let work = work_dir("lease");
+        let fx = write_import_fixture("qwen35-dense-untied", &work.join("src"));
+        let cache = work.join("cache");
+        let ckpt = prepare_gguf_assets_in(&fx.main, NativeGgufFamily::Qwen35, &cache)
+            .await
+            .unwrap();
+        let dir = ckpt.asset_dir.clone();
+        assert!(ckpt.leased);
+        // Source changed and the marker aged: stale unless leased.
+        set_mtime(&fx.main, 3600);
+        set_mtime(&dir.join(".complete"), TWO_DAYS);
+        sweep_native_gguf_cache(&cache, "unrelated-key");
+        assert!(dir.is_dir(), "the sweep removed a leased asset entry");
+        native_gguf_unlease_in_use(&dir);
+        sweep_native_gguf_cache(&cache, "unrelated-key");
+        assert!(!dir.exists(), "the stale entry survived without its lease");
+        fs::remove_dir_all(&work).ok();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_keeps_v7_and_v8_until_cutover() {
+        let _env_guard = crate::utils::gguf::sweep_env_lock().lock().unwrap();
+        let _env = crate::utils::gguf::SweepEnvVar::set_max_gb("0");
+        let work = work_dir("formats");
+        let fx = write_import_fixture("qwen35-dense-untied", &work.join("src"));
+        let cache = work.join("cache");
+        let ckpt = prepare_gguf_assets_in(&fx.main, NativeGgufFamily::Qwen35, &cache)
+            .await
+            .unwrap();
+        let marker = fs::read_to_string(ckpt.asset_dir.join(".complete")).unwrap();
+        assert!(marker.starts_with("format=8\n"), "{marker}");
+        let entry = |format: u32| {
+            let dir = cache.join(format!(
+                "aged-1-1-v{format}-{}-{}",
+                "a".repeat(64),
+                "b".repeat(64)
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("config.json"), "{}").unwrap();
+            let path = dir.join(".complete");
+            fs::write(
+                &path,
+                marker.replacen("format=8\n", &format!("format={format}\n"), 1),
+            )
+            .unwrap();
+            set_mtime(&path, TWO_DAYS);
+            dir
+        };
+        let (v6, v7, v8) = (entry(6), entry(7), entry(8));
+        sweep_native_gguf_cache(&cache, "unrelated-key");
+        assert!(!v6.exists(), "an aged v6 entry must be swept (control)");
+        assert!(v7.is_dir(), "aged v7 entry swept before the cutover");
+        assert!(v8.is_dir(), "aged v8 entry swept");
+        native_gguf_unlease_in_use(&ckpt.asset_dir);
+        fs::remove_dir_all(&work).ok();
+    }
+
+    enum Want {
+        Gguf,
+        Dir,
+        Err(&'static str),
+    }
+
+    async fn check(path: &Path, fam: NativeGgufFamily, cache: &Path, want: Want, label: &str) {
+        let got = CheckpointSource::resolve_in(path, fam, Some(cache)).await;
+        match (got, want) {
+            (Ok(CheckpointSource::Dir(dir)), Want::Dir) => assert_eq!(dir, path, "{label}"),
+            (Ok(CheckpointSource::Gguf(ckpt)), Want::Gguf) => {
+                assert!(
+                    ckpt.asset_dir.join(GGUF_SOURCE_FILE).is_file(),
+                    "{label}: asset dir has no {GGUF_SOURCE_FILE}"
+                );
+                if path.is_dir() && path.join(GGUF_SOURCE_FILE).is_file() {
+                    assert_eq!(ckpt.asset_dir, path, "{label}: asset dir");
+                    assert!(!ckpt.leased, "{label}: a caller dir is not leased");
+                } else {
+                    assert!(ckpt.leased, "{label}: prepared entry lease");
+                    native_gguf_unlease_in_use(&ckpt.asset_dir);
+                }
+            }
+            (Err(e), Want::Err(text)) => {
+                assert!(e.reason.contains(text), "{label}: {}", e.reason)
+            }
+            (Ok(CheckpointSource::Dir(_)), _) => panic!("{label}: resolved to Dir"),
+            (Ok(CheckpointSource::Gguf(_)), _) => panic!("{label}: resolved to Gguf"),
+            (Err(e), _) => panic!("{label}: {}", e.reason),
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_source_resolve_table() {
+        use NativeGgufFamily::*;
+        let work = work_dir("resolve");
+        let cache = work.join("cache");
+        let plain = work.join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        fs::write(plain.join("config.json"), "{}").unwrap();
+        let mut qwen_assets = None;
+        for (name, fam, dir_scanned) in [
+            ("qwen35-dense-untied", Qwen35, false),
+            ("qwen35moe-3d-experts", Qwen35Moe, false),
+            ("gemma4-mmproj", Gemma4, true),
+            ("muse-draft", MuseGlimmer, true),
+        ] {
+            let src = work.join("src").join(name);
+            let fx = write_import_fixture(name, &src);
+            check(&fx.main, fam, &cache, Want::Gguf, &format!("{name}: .gguf")).await;
+            let ckpt = prepare_gguf_assets_in(&fx.main, fam, &cache).await.unwrap();
+            check(
+                &ckpt.asset_dir,
+                fam,
+                &cache,
+                Want::Gguf,
+                &format!("{name}: gguf-source dir"),
+            )
+            .await;
+            let scan = if dir_scanned { Want::Gguf } else { Want::Dir };
+            check(
+                &src,
+                fam,
+                &cache,
+                scan,
+                &format!("{name}: dir with one .gguf"),
+            )
+            .await;
+            check(
+                &plain,
+                fam,
+                &cache,
+                Want::Dir,
+                &format!("{name}: plain dir"),
+            )
+            .await;
+            if fam == Qwen35 {
+                qwen_assets = Some((fx.main.clone(), src.clone(), ckpt.asset_dir.clone()));
+            } else {
+                native_gguf_unlease_in_use(&ckpt.asset_dir);
+            }
+        }
+        // No CLEF fixture: a non-CLEF GGUF reaching the family's header check
+        // shows which branch ran.
+        let (qwen_gguf, qwen_src, qwen_assets) = qwen_assets.unwrap();
+        let clef = "CLEF load requires";
+        check(&qwen_gguf, Clef, &cache, Want::Err(clef), "clef: .gguf").await;
+        check(
+            &qwen_assets,
+            Clef,
+            &cache,
+            Want::Err(clef),
+            "clef: gguf-source dir",
+        )
+        .await;
+        check(
+            &qwen_src,
+            Clef,
+            &cache,
+            Want::Dir,
+            "clef: dir with one .gguf",
+        )
+        .await;
+        check(&plain, Clef, &cache, Want::Dir, "clef: plain dir").await;
+        native_gguf_unlease_in_use(&qwen_assets);
+        fs::remove_dir_all(&work).ok();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_identity_matches_prepare() {
+        let work = work_dir("identity");
+        let fx = write_import_fixture("muse-draft", &work.join("src"));
+        let ckpt =
+            prepare_gguf_assets_in(&fx.main, NativeGgufFamily::MuseGlimmer, &work.join("cache"))
+                .await
+                .unwrap();
+        let identity = |path: &Path| {
+            let canonical = path.canonicalize().unwrap();
+            let header = parse_gguf(&canonical).unwrap();
+            file_identity(&canonical, &header, &fs::metadata(&canonical).unwrap()).unwrap()
+        };
+        let main = identity(&fx.main);
+        let companion = identity(fx.companion.as_ref().unwrap());
+        assert_eq!(ckpt.main.2, main);
+        assert_eq!(ckpt.companion.as_ref().map(|c| &c.2), Some(&companion));
+        let input = ckpt.preload_input(true);
+        assert_eq!(input.main.2, main, "preload main identity");
+        assert_eq!(
+            input.companion.as_ref().map(|c| &c.2),
+            Some(&companion),
+            "preload companion identity"
+        );
+        // A later change must not leak into the snapshot taken at prepare.
+        set_mtime(&fx.main, 3600);
+        assert_ne!(identity(&fx.main), main, "mtime change kept the identity");
+        let input = ckpt.preload_input(true);
+        assert_eq!(input.main.2, main, "preload_input re-read the source");
+        native_gguf_unlease_in_use(&ckpt.asset_dir);
+        fs::remove_dir_all(&work).ok();
+    }
 }
