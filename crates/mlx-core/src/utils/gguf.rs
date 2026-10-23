@@ -5522,7 +5522,7 @@ fn capture_source_math_operands(
             .tensors
             .iter()
             .find(|tensor| name.matches_original(&tensor.name))
-            .unwrap();
+            .ok_or_else(|| Error::from_reason("Original source norm descriptor is missing"))?;
         let values = weights[&name.mapped].to_float32()?;
         tensors.push(source_math::OriginalTensor {
             mapped_name: name.mapped,

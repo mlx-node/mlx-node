@@ -350,8 +350,10 @@ fn decode_payload(bytes: &[u8], manifest: &Value) -> Result<Vec<(String, Vec<f32
             return Err(error(format!("tensor digest differs: {name}")));
         }
         let values: Vec<f32> = data
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         if values.iter().any(|value| !value.is_finite()) {
             return Err(error("nonfinite source norm"));

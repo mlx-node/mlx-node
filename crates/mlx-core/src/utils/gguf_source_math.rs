@@ -346,12 +346,12 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Exact IEEE BF16 round-to-nearest-even, including signed zero. Original
 /// operand bytes stay unchanged; these bytes witness their ordinary narrowing.
 pub(super) fn bf16_bytes(f32_bytes: &[u8]) -> Result<Vec<u8>> {
-    if f32_bytes.len() % 4 != 0 {
+    if !f32_bytes.len().is_multiple_of(4) {
         return Err(invalid("unaligned F32 payload"));
     }
     let mut output = Vec::with_capacity(f32_bytes.len() / 2);
-    for bytes in f32_bytes.chunks_exact(4) {
-        let bits = u32::from_le_bytes(bytes.try_into().unwrap());
+    for bytes in f32_bytes.as_chunks::<4>().0 {
+        let bits = u32::from_le_bytes(*bytes);
         if !f32::from_bits(bits).is_finite() {
             return Err(invalid("nonfinite source norm"));
         }
@@ -437,7 +437,10 @@ pub(super) fn validate(
             {
                 return Err(invalid("source operand payload digest/length mismatch"));
             }
-            let header_len = usize::try_from(u64::from_le_bytes(payload[..8].try_into().unwrap()))
+            let encoded: [u8; 8] = payload[..8]
+                .try_into()
+                .map_err(|_| invalid("invalid source operand payload header"))?;
+            let header_len = usize::try_from(u64::from_le_bytes(encoded))
                 .map_err(|_| invalid("payload header overflow"))?;
             let data_start = 8usize
                 .checked_add(header_len)

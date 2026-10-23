@@ -180,7 +180,7 @@ impl VerifyBudget {
             }
         }
         self.cycles += 1;
-        if self.cycles % REFIT_CYCLES == 0 && !self.labels.is_empty() {
+        if self.cycles.is_multiple_of(REFIT_CYCLES) && !self.labels.is_empty() {
             self.acceptance = fit(&self.ordered_labels(), self.acceptance);
         }
         Ok(())
@@ -255,8 +255,11 @@ fn solve(mut h: [Parameters; PARAMETERS], mut g: Parameters) -> Parameters {
         g.swap(column, pivot);
         for row in column + 1..PARAMETERS {
             let factor = h[row][column] / h[column][column];
-            for k in column..PARAMETERS {
-                h[row][k] -= factor * h[column][k];
+            let (pivot_rows, remaining_rows) = h.split_at_mut(row);
+            let pivot = &pivot_rows[column];
+            let current = &mut remaining_rows[0];
+            for (value, pivot) in current[column..].iter_mut().zip(&pivot[column..]) {
+                *value -= factor * pivot;
             }
             g[row] -= factor * g[column];
         }

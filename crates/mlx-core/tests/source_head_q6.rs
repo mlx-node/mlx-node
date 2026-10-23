@@ -8,13 +8,17 @@ use std::{
 const K: i64 = 2048;
 const N: i64 = 248320;
 fn words16(b: &[u8]) -> Vec<u16> {
-    b.chunks_exact(2)
-        .map(|x| u16::from_le_bytes(x.try_into().unwrap()))
+    b.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|x| u16::from_le_bytes(*x))
         .collect()
 }
 fn words32(b: &[u8]) -> Vec<u32> {
-    b.chunks_exact(4)
-        .map(|x| u32::from_le_bytes(x.try_into().unwrap()))
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|x| u32::from_le_bytes(*x))
         .collect()
 }
 fn create(b: &[u8], dtype: DType, shape: &[i64]) -> MxArray {
@@ -274,8 +278,10 @@ fn f64_gate(root: &Path, case: usize, actual: &[u32]) {
     for (name, limit) in [("oracle-stage.f64", 1e-5), ("oracle-exact.f64", 0.001)] {
         let refs: Vec<_> = std::fs::read(dir.join(name))
             .unwrap()
-            .chunks_exact(8)
-            .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| f64::from_le_bytes(*b))
             .collect();
         assert_eq!(refs.len(), indices.len());
         let (mut peak, mut error) = (0f64, 0f64);
@@ -283,7 +289,7 @@ fn f64_gate(root: &Path, case: usize, actual: &[u32]) {
             let mut index = index as usize;
             if case == 1 {
                 let col = index % N as usize;
-                index = if col % 64 == 0 {
+                index = if col.is_multiple_of(64) {
                     index + 1
                 } else if col % 64 == 1 {
                     index - 1

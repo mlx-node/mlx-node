@@ -167,10 +167,10 @@ impl DecoderLayer {
             attn_out,
             includes_residual,
         )?;
-        if let MLPType::MoE(moe) = &self.mlp {
-            if let Some(hidden) = moe.forward_source_residual(&normed, &h, row_budget)? {
-                return Ok((x, VerifyLayerOutput::Hidden(hidden)));
-            }
+        if let MLPType::MoE(moe) = &self.mlp
+            && let Some(hidden) = moe.forward_source_residual(&normed, &h, row_budget)?
+        {
+            return Ok((x, VerifyLayerOutput::Hidden(hidden)));
         }
         let mlp_out = match &self.mlp {
             MLPType::Dense(mlp) => mlp.forward(&normed)?,
@@ -274,10 +274,10 @@ impl DecoderLayer {
             attn_out,
             includes_residual,
         )?;
-        if let MLPType::MoE(moe) = &self.mlp {
-            if let Some(hidden) = moe.forward_source_residual(&normed, &h, None)? {
-                return Ok(hidden);
-            }
+        if let MLPType::MoE(moe) = &self.mlp
+            && let Some(hidden) = moe.forward_source_residual(&normed, &h, None)?
+        {
+            return Ok(hidden);
         }
         let mlp_out = match &self.mlp {
             MLPType::Dense(mlp) => mlp.forward(&normed)?,
@@ -331,10 +331,10 @@ impl DecoderLayer {
             attn_out,
             includes_residual,
         )?;
-        if let MLPType::MoE(moe) = &self.mlp {
-            if let Some(hidden) = moe.forward_source_residual(&normed, &h, None)? {
-                return Ok(hidden);
-            }
+        if let MLPType::MoE(moe) = &self.mlp
+            && let Some(hidden) = moe.forward_source_residual(&normed, &h, None)?
+        {
+            return Ok(hidden);
         }
         let mlp_out = match &self.mlp {
             MLPType::Dense(mlp) => mlp.forward(&normed)?,

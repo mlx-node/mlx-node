@@ -128,12 +128,8 @@ fn source_residual_combine_replay_keeps_hidden_meaning_and_finite_dead_rows() {
         assert_eq!(bits(&result[0]), bits(&combine(&a).unwrap()));
         let source = 0.25 + (seed % 3) as f32 * 0.125;
         let native = half::bf16::from_f32(128.0 + (seed % 3) as f32 * 0.125).to_f32() - 128.0;
-        for (row, got) in result[0]
-            .to_float32()
-            .unwrap()
-            .chunks_exact(2048)
-            .enumerate()
-        {
+        let values = result[0].to_float32().unwrap();
+        for (row, got) in values.as_chunks::<2048>().0.iter().enumerate() {
             let expected = if row >= live {
                 0.0
             } else if rows == 8 {

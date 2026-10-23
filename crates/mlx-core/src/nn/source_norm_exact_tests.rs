@@ -97,8 +97,10 @@ fn exact_source_fixture_bytes(
 fn exact_source_words(bytes: &[u8]) -> Vec<u16> {
     assert_eq!(bytes.len() % 2, 0);
     bytes
-        .chunks_exact(2)
-        .map(|x| u16::from_le_bytes([x[0], x[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|x| u16::from_le_bytes(*x))
         .collect()
 }
 
@@ -126,8 +128,10 @@ fn source_norm_splash_jit_matches_independent_source_bits() {
     let w = exact_source_fixture_bytes(&root, &manifest, "weight.f32");
     assert_eq!(w.len(), 8192);
     let weights: Vec<f32> = w
-        .chunks_exact(4)
-        .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|x| f32::from_le_bytes(*x))
         .collect();
     let cases = manifest["cases"].as_array().unwrap();
     assert_eq!(cases.len(), 26);
@@ -378,7 +382,7 @@ fn source_norm_splash_policy_epsilon_dtype_and_output_slots_fail_closed() {
     let wrong_weight = MxArray::zeros(&[64], Some(DType::Float32)).unwrap();
     let mut wrong_width = RMSNorm::from_weight(&wrong_weight, Some(1e-6)).unwrap();
     assert!(wrong_width.enable_source_f32_splash().is_err());
-    let mut shared_slot = 1usize as *mut sys::mlx_array;
+    let mut shared_slot = std::ptr::dangling_mut::<sys::mlx_array>();
     let slot = &mut shared_slot as *mut *mut sys::mlx_array;
     assert_eq!(
         unsafe {

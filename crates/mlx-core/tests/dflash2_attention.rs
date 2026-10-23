@@ -6,7 +6,7 @@ const D: usize = 128;
 const QH: usize = 32;
 const KH: usize = 8;
 const T: usize = 8;
-const SCALE: f32 = 0.08838834765;
+const SCALE: f32 = 0.088388346;
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn numbers(n: usize, mut seed: u32, scale: f32) -> Vec<f32> {
@@ -69,7 +69,7 @@ impl Fixture {
                         // Sliding window plus holes, with current rows always visible.
                         1 => {
                             c + 2048 > len - T + r
-                                && (c >= len - T || (c + r + seed as usize) % 7 != 0)
+                                && (c >= len - T || !(c + r + seed as usize).is_multiple_of(7))
                         }
                         // One visible key: the answer must exactly equal that value.
                         2 => {

@@ -1160,13 +1160,12 @@ impl CandidateSelector {
             // One custom dispatch replaces the per-position gather + reverse
             // + argmax + gather chain. Contract misses retain that lazy graph,
             // and either result stays device-resident into target verify.
-            if let Some(confidence) = confidence {
-                if let Some((path, probabilities)) =
+            if let Some(confidence) = confidence
+                && let Some((path, probabilities)) =
                     self.fused_greedy_path_confidence(&candidates, &scores)
-                {
-                    *confidence = Some(probabilities);
-                    return Ok((SelectorPath::Device(path), Vec::new()));
-                }
+            {
+                *confidence = Some(probabilities);
+                return Ok((SelectorPath::Device(path), Vec::new()));
             }
             let path = match self.fused_greedy_path(&candidates, &scores) {
                 Some(path) => path,
@@ -1268,7 +1267,7 @@ impl CandidateSelector {
             anchor_embedding
         };
         let edges = predecessors
-            .mul(&projected)?
+            .mul(projected)?
             .matmul(&successors.transpose(Some(&[0, 2, 1]))?)?;
         let scores = edges.add(&unary.reshape(&[length as i64, 1, self.top_k as i64])?)?;
         scores.astype(DType::Float32)
@@ -2164,10 +2163,15 @@ impl DFlash2Model {
         for (window, pair) in context
             .layers
             .iter()
-            .zip(outputs[cache_output_at..].chunks_exact(2))
+            .zip(outputs[cache_output_at..].as_chunks::<2>().0)
         {
-            if pair[0].shape()?.as_ref() != window.keys.as_ref().unwrap().shape()?.as_ref()
-                || pair[1].shape()?.as_ref() != window.values.as_ref().unwrap().shape()?.as_ref()
+            let (Some(keys), Some(values)) = (&window.keys, &window.values) else {
+                return Err(Error::from_reason(
+                    "compiled draft returned incompatible cache buffers",
+                ));
+            };
+            if pair[0].shape()?.as_ref() != keys.shape()?.as_ref()
+                || pair[1].shape()?.as_ref() != values.shape()?.as_ref()
                 || pair[0].dtype()? != DType::BFloat16
                 || pair[1].dtype()? != DType::BFloat16
             {
@@ -2179,7 +2183,7 @@ impl DFlash2Model {
         for (window, pair) in context
             .layers
             .iter_mut()
-            .zip(outputs[cache_output_at..].chunks_exact(2))
+            .zip(outputs[cache_output_at..].as_chunks::<2>().0)
         {
             window.keys = Some(pair[0].clone());
             window.values = Some(pair[1].clone());
@@ -2199,7 +2203,7 @@ impl DFlash2Model {
         max_len: usize,
         temperature: f64,
         device_path: bool,
-        mut confidence: Option<&mut Option<MxArray>>,
+        confidence: Option<&mut Option<MxArray>>,
         rng: &mut R,
     ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
         let query_end = context
@@ -2264,7 +2268,7 @@ impl DFlash2Model {
             anchor,
             temperature,
             device_path,
-            confidence.as_deref_mut(),
+            confidence,
             rng,
         )?;
         if compile && !self.compiled.prepared.load(Ordering::Relaxed) {

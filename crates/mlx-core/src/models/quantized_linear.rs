@@ -135,25 +135,26 @@ impl LinearProj {
         x: &MxArray,
         prepared: Option<&PreparedSg8>,
     ) -> Result<MxArray> {
-        if let (Self::Quantized(q), Some(prepared)) = (self, prepared) {
-            if q.supports_prepared_sg8() {
-                let mut output = std::ptr::null_mut();
-                let status = unsafe {
-                    mlx_sys::mlx_kquant_sg8_prepared(
-                        x.as_raw_ptr(),
-                        q.weight.as_raw_ptr(),
-                        q.scales.as_raw_ptr(),
-                        q.biases.as_ref().unwrap().as_raw_ptr(),
-                        prepared.packed.as_raw_ptr(),
-                        prepared.sums.as_raw_ptr(),
-                        &mut output,
-                    )
-                };
-                match status {
-                    1 => return MxArray::from_handle(output, "prepared_sg8"),
-                    0 => {}
-                    _ => return Err(Error::from_reason("Prepared SG8 construction failed")),
-                }
+        if let (Self::Quantized(q), Some(prepared)) = (self, prepared)
+            && q.supports_prepared_sg8()
+            && let Some(biases) = q.biases.as_ref()
+        {
+            let mut output = std::ptr::null_mut();
+            let status = unsafe {
+                mlx_sys::mlx_kquant_sg8_prepared(
+                    x.as_raw_ptr(),
+                    q.weight.as_raw_ptr(),
+                    q.scales.as_raw_ptr(),
+                    biases.as_raw_ptr(),
+                    prepared.packed.as_raw_ptr(),
+                    prepared.sums.as_raw_ptr(),
+                    &mut output,
+                )
+            };
+            match status {
+                1 => return MxArray::from_handle(output, "prepared_sg8"),
+                0 => {}
+                _ => return Err(Error::from_reason("Prepared SG8 construction failed")),
             }
         }
         self.forward(x)
@@ -168,10 +169,10 @@ impl LinearProj {
         prepared: Option<&PreparedSg8>,
         residual: Option<&MxArray>,
     ) -> Result<MxArray> {
-        if let (Self::Quantized(q), Some(residual)) = (self, residual) {
-            if let Some(hidden) = q.try_source_mixer_q4(x, residual)? {
-                return Ok(hidden);
-            }
+        if let (Self::Quantized(q), Some(residual)) = (self, residual)
+            && let Some(hidden) = q.try_source_mixer_q4(x, residual)?
+        {
+            return Ok(hidden);
         }
         let delta = self.forward_prepared_sg8(x, prepared)?;
         match residual {
@@ -214,10 +215,10 @@ impl LinearProj {
         match self {
             LinearProj::Standard(l) => l.forward(x),
             LinearProj::Quantized(l) => {
-                if l.source_head {
-                    if let Some(logits) = l.try_source_head(x)? {
-                        return Ok(logits);
-                    }
+                if l.source_head
+                    && let Some(logits) = l.try_source_head(x)?
+                {
+                    return Ok(logits);
                 }
                 l.forward(x)
             }
@@ -1914,7 +1915,9 @@ impl QuantizedLinear {
             return Ok(None);
         }
         self.validate_source_head()?;
-        let biases = self.biases.as_ref().expect("validated source head bases");
+        let biases = self.biases.as_ref().ok_or_else(|| {
+            Error::from_reason("source head requires plain Q6_K T64 H2048/V248320 packed operands")
+        })?;
         let output = unsafe {
             mlx_sys::mlx_source_head_q6(
                 x.as_raw_ptr(),

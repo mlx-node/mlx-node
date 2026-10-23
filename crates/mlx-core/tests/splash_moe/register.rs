@@ -126,7 +126,7 @@ fn register_raw_q4_q6_pack_and_sum_bits_match_native_contract() {
                     for half in 0..if bits == 6 { 2 } else { 1 } {
                         for row in 0..8 {
                             let mut partial = [0.0; 8];
-                            for fm in 0..8 {
+                            for (fm, slot) in partial.iter_mut().enumerate() {
                                 let start = row * k
                                     + u * 32
                                     + if bits == 4 {
@@ -134,7 +134,7 @@ fn register_raw_q4_q6_pack_and_sum_bits_match_native_contract() {
                                     } else {
                                         half * 16 + 2 * fm
                                     };
-                                partial[fm] = if bits == 4 {
+                                *slot = if bits == 4 {
                                     (input[start] + input[start + 1])
                                         + (input[start + 2] + input[start + 3])
                                 } else {
@@ -264,7 +264,7 @@ impl Fixture {
             .to_float32()
             .unwrap();
         let mut out = vec![0.0; x.len()];
-        for (r, input) in x.chunks_exact(H).enumerate() {
+        for (r, input) in x.as_chunks::<H>().0.iter().enumerate() {
             for slot in 0..=TOP {
                 let (e, j, c) = if slot == TOP {
                     (0, 3, shared[r])
@@ -575,7 +575,7 @@ fn mixed_router_oracle(f: &Fixture, arrays: &[MxArray]) -> Vec<f32> {
         .to_float32()
         .unwrap();
     let mut result = vec![0.0f32; x.len()];
-    for (r, input) in x.chunks_exact(H).enumerate() {
+    for (r, input) in x.as_chunks::<H>().0.iter().enumerate() {
         for slot in 0..=TOP {
             let (expert, j, coefficient, round_product) = if slot == TOP {
                 (0, 3, shared[r], shared_bf16)
