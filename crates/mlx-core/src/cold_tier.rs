@@ -495,7 +495,7 @@ pub(crate) struct ShardIdentity {
 }
 
 impl ShardIdentity {
-    fn from_metadata(meta: &fs::Metadata) -> Self {
+    pub(crate) fn from_metadata(meta: &fs::Metadata) -> Self {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;

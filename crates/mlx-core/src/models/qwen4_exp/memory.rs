@@ -434,23 +434,8 @@ pub(super) fn check_growth_headroom(mapped: bool) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn physical_memory() -> Result<u64> {
-    let mut bytes = 0u64;
-    let mut size = std::mem::size_of_val(&bytes);
-    if unsafe {
-        libc::sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&mut bytes as *mut u64).cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return Err(Error::from_reason(
-            "Cannot read physical memory for Qwen4 residency",
-        ));
-    }
-    Ok(bytes)
+    crate::utils::host::physical_memory()
+        .ok_or_else(|| Error::from_reason("Cannot read physical memory for Qwen4 residency"))
 }
 #[cfg(not(target_os = "macos"))]
 fn physical_memory() -> Result<u64> {

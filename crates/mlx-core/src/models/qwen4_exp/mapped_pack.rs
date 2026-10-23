@@ -234,10 +234,13 @@ fn lock_name(name: &str) -> String {
 /// Builder writes only: 74 GiB written through the page cache would evict
 /// the pages the running model reads. Reads must keep the page cache, the
 /// tier that serves warm re-reads; F_NOCACHE reads lost every warm row.
+#[cfg(target_os = "macos")]
 fn set_nocache(file: &File) {
     // SAFETY: `file` owns an open descriptor; F_NOCACHE only changes caching.
     unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
 }
+#[cfg(not(target_os = "macos"))]
+fn set_nocache(_file: &File) {}
 
 pub(super) struct LayerFile {
     file: File,

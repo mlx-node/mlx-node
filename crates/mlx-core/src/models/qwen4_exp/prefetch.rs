@@ -22,6 +22,7 @@
 //! the read-ahead would run on after the pool is dropped and ahead of the
 //! model's rows.
 use std::ffi::c_void;
+#[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -84,6 +85,7 @@ impl Issue for Pread {
         // 12.33 GiB/s).
         // SAFETY: the descriptor stays open for the mapping's lifetime and
         // F_RDAHEAD only sets its read-ahead policy.
+        #[cfg(target_os = "macos")]
         if unsafe { libc::fcntl(map.file().as_raw_fd(), libc::F_RDAHEAD, 0) } != 0 {
             tracing::debug!(
                 "qwen4 mapped pack stream: read-ahead stays on: {}",
@@ -141,9 +143,9 @@ fn cold_chunks(map: &Mmap) -> Vec<bool> {
     // page of it; mincore only reads.
     let rc = unsafe {
         libc::mincore(
-            map.as_ptr().cast::<c_void>(),
+            map.as_ptr().cast_mut().cast::<c_void>(),
             map.len(),
-            vec.as_mut_ptr().cast::<libc::c_char>(),
+            vec.as_mut_ptr().cast(),
         )
     };
     if rc != 0 {
@@ -329,9 +331,9 @@ pub(super) fn sampled_resident(map: &Mmap) -> bool {
         // byte per page of it; mincore only reads.
         let rc = unsafe {
             libc::mincore(
-                map.as_ptr().add(first * page).cast::<c_void>(),
+                map.as_ptr().add(first * page).cast_mut().cast::<c_void>(),
                 bytes,
-                vec.as_mut_ptr().cast::<libc::c_char>(),
+                vec.as_mut_ptr().cast(),
             )
         };
         if rc != 0 || vec[..count].iter().any(|flags| flags & 1 == 0) {
