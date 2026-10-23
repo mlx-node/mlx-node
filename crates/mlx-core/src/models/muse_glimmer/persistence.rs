@@ -80,8 +80,7 @@ pub(super) fn build_projection(
 /// layout here (a `t64` checkpoint tensor is built tiled as-is and not
 /// recorded), so the caller can drop their row-major map entries with
 /// `release_tiled_kquant_sources` once the owning layer is built. The plain `build_projection` discards the list:
-/// its callers are the lm_head, the DFlash draft (whose whole map drops at
-/// the end of `load_dflash`) and tests.
+/// its callers (the lm_head, tests) hold sources that stay in the map anyway.
 pub(super) fn build_projection_tiled(
     params: &HashMap<String, MxArray>,
     prefix: &str,
@@ -225,7 +224,9 @@ fn load_dflash(
     default: PerLayerQuant,
     overrides: &HashMap<String, PerLayerQuant>,
 ) -> Result<Option<DFlashModel>> {
-    let Some(params) = params else {
+    use crate::models::quantized_linear::release_tiled_kquant_sources;
+
+    let Some(mut params) = params else {
         return Ok(None);
     };
     let draft_config = config.dflash_config.clone().ok_or_else(|| {
@@ -233,84 +234,53 @@ fn load_dflash(
             "Muse-Glimmer has a DFlash draft but config.json has no dflash_config; reconvert the companion GGUF with --draft",
         )
     })?;
-    let fc = build_projection(&params, "fc", default, overrides)?;
-    let hidden_norm = norm(&params, "hidden_norm.weight", draft_config.rms_norm_eps)?;
-    let final_norm = norm(&params, "norm.weight", draft_config.rms_norm_eps)?;
+    let eps = draft_config.rms_norm_eps;
+    let mut tiled = Vec::<String>::new();
+    let fc = build_projection_tiled(&params, "fc", default, overrides, &mut tiled)?;
+    release_tiled_kquant_sources(&mut params, &mut tiled);
+    let hidden_norm = norm(&params, "hidden_norm.weight", eps)?;
+    let final_norm = norm(&params, "norm.weight", eps)?;
     let mut layers = Vec::with_capacity(draft_config.num_hidden_layers);
     for index in 0..draft_config.num_hidden_layers {
         let base = format!("layers.{index}");
-        let attention_base = format!("{base}.self_attn");
+        let attn = format!("{base}.self_attn");
+        let mlp = format!("{base}.mlp");
+        let mut proj = |prefix: String| -> Result<LinearProj> {
+            build_projection_tiled(&params, &prefix, default, overrides, &mut tiled)
+        };
         let attention = DFlashAttention::new(
             &draft_config,
-            build_projection(
-                &params,
-                &format!("{attention_base}.q_proj"),
-                default,
-                overrides,
-            )?,
-            build_projection(
-                &params,
-                &format!("{attention_base}.k_proj"),
-                default,
-                overrides,
-            )?,
-            build_projection(
-                &params,
-                &format!("{attention_base}.v_proj"),
-                default,
-                overrides,
-            )?,
-            build_projection(
-                &params,
-                &format!("{attention_base}.o_proj"),
-                default,
-                overrides,
-            )?,
-            norm(
-                &params,
-                &format!("{attention_base}.q_norm.weight"),
-                draft_config.rms_norm_eps,
-            )?,
-            norm(
-                &params,
-                &format!("{attention_base}.k_norm.weight"),
-                draft_config.rms_norm_eps,
-            )?,
+            proj(format!("{attn}.q_proj"))?,
+            proj(format!("{attn}.k_proj"))?,
+            proj(format!("{attn}.v_proj"))?,
+            proj(format!("{attn}.o_proj"))?,
+            norm(&params, &format!("{attn}.q_norm.weight"), eps)?,
+            norm(&params, &format!("{attn}.k_norm.weight"), eps)?,
         );
-        let mlp_base = format!("{base}.mlp");
         let mlp = MuseGlimmerMlp::new(
-            build_projection(
-                &params,
-                &format!("{mlp_base}.gate_proj"),
-                default,
-                overrides,
-            )?,
-            build_projection(&params, &format!("{mlp_base}.up_proj"), default, overrides)?,
-            build_projection(
-                &params,
-                &format!("{mlp_base}.down_proj"),
-                default,
-                overrides,
-            )?,
+            proj(format!("{mlp}.gate_proj"))?,
+            proj(format!("{mlp}.up_proj"))?,
+            proj(format!("{mlp}.down_proj"))?,
         );
         layers.push(DFlashLayer::new(
             attention,
             mlp,
-            norm(
-                &params,
-                &format!("{base}.input_layernorm.weight"),
-                draft_config.rms_norm_eps,
-            )?,
+            norm(&params, &format!("{base}.input_layernorm.weight"), eps)?,
             norm(
                 &params,
                 &format!("{base}.post_attention_layernorm.weight"),
-                draft_config.rms_norm_eps,
+                eps,
             )?,
         ));
+        release_tiled_kquant_sources(&mut params, &mut tiled);
     }
-    let draft = DFlashModel::from_loaded(draft_config, fc, hidden_norm, layers, final_norm);
-    crate::array::memory::drop_and_free_released(params);
-    Ok(Some(draft))
+    Ok(Some(DFlashModel::from_loaded(
+        draft_config,
+        fc,
+        hidden_norm,
+        layers,
+        final_norm,
+    )))
 }
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
@@ -901,77 +871,6 @@ mod tests {
     }
 
     #[test]
-    fn dflash_draft_build_frees_its_map_only_under_the_guard() {
-        use super::load_dflash;
-        use crate::array::memory::{FreeReleasedSources, TEST_CLEAR_CACHE_CALLS};
-        use crate::models::muse_glimmer::config::{
-            MuseGlimmerConfig, MuseGlimmerDFlashConfig,
-            fixtures::{config_json, text_config_json},
-        };
-
-        let mut config =
-            MuseGlimmerConfig::from_json_str(&config_json(&text_config_json(4))).unwrap();
-        config.dflash_config = Some(MuseGlimmerDFlashConfig {
-            num_hidden_layers: 1,
-            block_size: 4,
-            hidden_size: 8,
-            intermediate_size: 16,
-            num_attention_heads: 2,
-            num_key_value_heads: 1,
-            head_dim: 4,
-            sliding_window: 8,
-            max_position_embeddings: 64,
-            rms_norm_eps: 1e-6,
-            rope_theta: 10000.0,
-            target_layers: vec![0],
-            mask_token_id: 0,
-            causal: false,
-        });
-        let draft = || {
-            let matrix = |n: i64, k: i64| MxArray::zeros(&[n, k], None).unwrap();
-            let vector = |n: i64| MxArray::ones(&[n], None).unwrap();
-            let mut params = HashMap::from([
-                ("fc.weight".to_string(), matrix(8, 8)),
-                ("hidden_norm.weight".to_string(), vector(8)),
-                ("norm.weight".to_string(), vector(8)),
-            ]);
-            for (key, value) in [
-                ("self_attn.q_proj.weight", matrix(8, 8)),
-                ("self_attn.k_proj.weight", matrix(4, 8)),
-                ("self_attn.v_proj.weight", matrix(4, 8)),
-                ("self_attn.o_proj.weight", matrix(8, 8)),
-                ("self_attn.q_norm.weight", vector(4)),
-                ("self_attn.k_norm.weight", vector(4)),
-                ("mlp.gate_proj.weight", matrix(16, 8)),
-                ("mlp.up_proj.weight", matrix(16, 8)),
-                ("mlp.down_proj.weight", matrix(8, 16)),
-                ("input_layernorm.weight", vector(8)),
-                ("post_attention_layernorm.weight", vector(8)),
-            ] {
-                params.insert(format!("layers.0.{key}"), value);
-            }
-            params
-        };
-        let default = PerLayerQuant {
-            bits: 4,
-            group_size: 64,
-            mode: PerLayerMode::Affine,
-            input_amax: None,
-            layout: Default::default(),
-        };
-        let clears = |guard: bool| {
-            let _free = guard.then(|| FreeReleasedSources::enable(true));
-            let start = TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get);
-            let model = load_dflash(&config, Some(draft()), default, &HashMap::new()).unwrap();
-            assert!(model.is_some(), "draft not built");
-            TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get) - start
-        };
-        assert_eq!(clears(false), 0, "lazy-map draft build cleared the cache");
-        assert_eq!(clears(true), 1, "preload draft build kept its released map");
-        assert_eq!(clears(false), 0, "guard leaked past its scope");
-    }
-
-    #[test]
     fn target_and_dflash_quantization_namespaces_stay_distinct() {
         assert_eq!(
             quant_lookup_prefix("model.language_model.layers.0.self_attn.q_proj"),
@@ -1295,6 +1194,58 @@ mod tests {
         }
         source.release_lease();
         std::fs::remove_dir_all(&work).ok();
+    }
+
+    #[tokio::test]
+    async fn dflash_draft_releases_tiled_sources_per_layer_only_under_the_guard() {
+        use super::{draft_params, load_dflash};
+        use crate::array::memory::{FreeReleasedSources, TEST_CLEAR_CACHE_CALLS};
+        use crate::models::muse_glimmer::config::MuseGlimmerConfig;
+        use crate::models::quant_dispatch::{kquant_tiled_enabled, load_quant_settings_from_disk};
+        use crate::utils::gguf_import::GgufPreload;
+        use crate::utils::gguf_test_fixtures::write_import_fixture;
+
+        if !kquant_tiled_enabled() {
+            return;
+        }
+        let work =
+            std::env::temp_dir().join(format!("mlx-muse-draft-free-{}", uuid::Uuid::new_v4()));
+        let fx = write_import_fixture("muse-draft", &work.join("src"));
+        let source = resolve_muse_gguf(&fx.main, &work.join("cache")).await;
+        let ckpt = gguf_checkpoint(&source);
+        let config = MuseGlimmerConfig::from_path(&ckpt.asset_dir).unwrap();
+        let (bits, group_size, mode, overrides) =
+            load_quant_settings_from_disk(&ckpt.asset_dir, 4, 64).unwrap();
+        let default = PerLayerQuant {
+            bits,
+            group_size,
+            mode: mode.unwrap(),
+            input_amax: None,
+            layout: Default::default(),
+        };
+        let clears = |guard: bool| {
+            let mut preload = GgufPreload::load(&ckpt.preload_input(true)).unwrap();
+            let tie = config.text_config.tie_word_embeddings;
+            load_target_weights(&ckpt.asset_dir, tie, Some(&mut preload)).unwrap();
+            let draft = draft_params(
+                &ckpt.asset_dir,
+                Some(std::mem::take(&mut preload.companion)),
+            )
+            .unwrap();
+            let _free = guard.then(|| FreeReleasedSources::enable(true));
+            let start = TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get);
+            let model = load_dflash(&config, draft, default, &overrides).unwrap();
+            assert!(model.is_some(), "draft not built");
+            TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get) - start
+        };
+        let (dir, preload) = (clears(false), clears(true));
+        source.release_lease();
+        std::fs::remove_dir_all(&work).ok();
+        assert_eq!(dir, 0, "lazy-map draft build cleared the cache");
+        assert_eq!(
+            preload, 2,
+            "preload draft build must clear after fc and after its one layer"
+        );
     }
 
     #[tokio::test]

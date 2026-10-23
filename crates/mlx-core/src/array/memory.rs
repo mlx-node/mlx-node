@@ -61,8 +61,7 @@ pub(crate) static TEST_FREE_RELEASED_SITES: std::sync::Mutex<std::collections::B
 
 /// While alive, each build eval point on this thread that can free source
 /// arrays ([`materialize_weights`] chunks, `release_tiled_kquant_sources`,
-/// each CLEF residency unit, the end of the Muse-Glimmer DFlash draft build)
-/// also returns the freed buffers to the OS. Enable it for a build over a map
+/// each CLEF residency unit) also returns the freed buffers to the OS. Enable it for a build over a map
 /// whose arrays are all materialized up front (GGUF preload): nothing later in
 /// the build allocates source-sized buffers, so the freed sources would
 /// otherwise pile up in the MLX buffer cache until the build ends (+5.4 GiB
@@ -96,13 +95,6 @@ pub(crate) fn free_released_sources() {
     if FREE_RELEASED_SOURCES.with(std::cell::Cell::get) {
         clear_cache();
     }
-}
-
-/// Drop `sources` first, then [`free_released_sources`]: clearing before the
-/// drop frees nothing.
-pub(crate) fn drop_and_free_released<T>(sources: T) {
-    drop(sources);
-    free_released_sources();
 }
 
 /// Synchronize GPU — block until all pending GPU work completes
