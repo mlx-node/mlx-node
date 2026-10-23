@@ -237,9 +237,9 @@ bool table_in_library() {
 }
 
 array alloc_array(Shape shape, Dtype dtype) {
-  array a(std::move(shape), dtype, nullptr, {});
-  a.set_data(allocator::malloc(a.nbytes()));
-  return a;
+  size_t bytes = size_of(dtype);
+  for (auto d : shape) bytes *= size_t(d);
+  return array(allocator::malloc(bytes), std::move(shape), dtype);
 }
 #endif
 

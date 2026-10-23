@@ -59,10 +59,12 @@ mlx_array* mlx_array_alloc_uninit(const int64_t* shape,
       return nullptr;
     }
     const size_t bytes = numel * dtype.size();
-    array a(std::move(target), dtype, nullptr, {});
     auto data_owner = mlx::core::allocator::malloc(bytes);
     if (data_owner.buffer().ptr() == nullptr) return nullptr;
-    a.set_data(std::move(data_owner));
+    // The (data, shape, dtype) constructor makes an `available` leaf; a
+    // primitive-less array built with set_data stays `unscheduled` and eval
+    // throws on it.
+    array a(std::move(data_owner), std::move(target), dtype);
     void* data = a.data<void>();
     if (data == nullptr) return nullptr;
     *out_data = data;
