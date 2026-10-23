@@ -17,6 +17,9 @@ pub(crate) use crate::array::alloc::{DstPtrs, OutLayout};
 pub(crate) enum GpuRepackKind {
     Q4K,
     Q5K,
+    Q6K,
+    Iq4Xs,
+    Q3K,
 }
 
 /// Metal is available and `paged_attn.metallib` holds every repack kernel.
@@ -29,6 +32,9 @@ pub(crate) fn gpu_kind_for(t: GgufTensorType) -> Option<GpuRepackKind> {
     match t {
         GgufTensorType::Q4K => Some(GpuRepackKind::Q4K),
         GgufTensorType::Q5K => Some(GpuRepackKind::Q5K),
+        GgufTensorType::Q6K => Some(GpuRepackKind::Q6K),
+        GgufTensorType::IQ4XS => Some(GpuRepackKind::Iq4Xs),
+        GgufTensorType::Q3K => Some(GpuRepackKind::Q3K),
         _ => None,
     }
 }
@@ -38,6 +44,8 @@ pub(crate) fn gpu_kind_for(t: GgufTensorType) -> Option<GpuRepackKind> {
 pub(crate) fn band_offset_rule(kind: GpuRepackKind) -> usize {
     match kind {
         GpuRepackKind::Q4K | GpuRepackKind::Q5K => 16,
+        GpuRepackKind::Iq4Xs => 8,
+        GpuRepackKind::Q6K | GpuRepackKind::Q3K => 2,
     }
 }
 
@@ -46,6 +54,9 @@ fn kernel_id(kind: GpuRepackKind, layout: OutLayout) -> i32 {
     let base = match kind {
         GpuRepackKind::Q4K => 0,
         GpuRepackKind::Q5K => 2,
+        GpuRepackKind::Q6K => 4,
+        GpuRepackKind::Iq4Xs => 6,
+        GpuRepackKind::Q3K => 8,
     };
     base + i32::from(layout == OutLayout::Tiled64)
 }
@@ -197,6 +208,9 @@ fn kquant_format(kind: GpuRepackKind) -> crate::utils::gguf_kquant::KQuantFormat
     match kind {
         GpuRepackKind::Q4K => KQuantFormat::Q4K,
         GpuRepackKind::Q5K => KQuantFormat::Q5K,
+        GpuRepackKind::Q6K => KQuantFormat::Q6K,
+        GpuRepackKind::Iq4Xs => KQuantFormat::IQ4XS,
+        GpuRepackKind::Q3K => KQuantFormat::Q3K,
     }
 }
 
@@ -206,7 +220,23 @@ mod tests {
     use crate::models::quant_dispatch::kquant_tile_rows;
     use crate::utils::gguf_kquant::{KQuantScales, repack_kquant};
 
-    const KINDS: [GpuRepackKind; 2] = [GpuRepackKind::Q4K, GpuRepackKind::Q5K];
+    const KINDS: [GpuRepackKind; 5] = [
+        GpuRepackKind::Q4K,
+        GpuRepackKind::Q5K,
+        GpuRepackKind::Q6K,
+        GpuRepackKind::Iq4Xs,
+        GpuRepackKind::Q3K,
+    ];
+
+    fn gguf_type(kind: GpuRepackKind) -> GgufTensorType {
+        match kind {
+            GpuRepackKind::Q4K => GgufTensorType::Q4K,
+            GpuRepackKind::Q5K => GgufTensorType::Q5K,
+            GpuRepackKind::Q6K => GgufTensorType::Q6K,
+            GpuRepackKind::Iq4Xs => GgufTensorType::IQ4XS,
+            GpuRepackKind::Q3K => GgufTensorType::Q3K,
+        }
+    }
 
     /// On macOS the GPU path must be there; elsewhere the GPU tests skip.
     fn require_gpu() -> bool {
@@ -238,10 +268,7 @@ mod tests {
             name: "blk.0.ffn_down.weight".to_string(),
             n_dims: 2,
             dims: vec![k as u64, rows as u64],
-            tensor_type: match kind {
-                GpuRepackKind::Q4K => GgufTensorType::Q4K,
-                GpuRepackKind::Q5K => GgufTensorType::Q5K,
-            },
+            tensor_type: gguf_type(kind),
             offset: 0,
         }
     }
@@ -262,6 +289,21 @@ mod tests {
         arr
     }
 
+    /// A uint8 staging array of exactly `pad` garbage bytes, then `blocks`.
+    fn staging_exact(blocks: &[u8], pad: usize, seed: u64) -> MxArray {
+        let total = pad + blocks.len();
+        let (arr, ptr, bytes) = MxArray::alloc_uninit(&[total as i64], DType::Uint8).unwrap();
+        assert_eq!(bytes, total);
+        let junk = random_bytes(pad, seed ^ 0xBEEF);
+        // SAFETY: `ptr` addresses `total` writable bytes owned by `arr`, which
+        // has no GPU work yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(junk.as_ptr(), ptr.0, pad);
+            std::ptr::copy_nonoverlapping(blocks.as_ptr(), ptr.0.add(pad), blocks.len());
+        }
+        arr
+    }
+
     struct Bytes {
         weight: Vec<u32>,
         scales: Vec<u8>,
@@ -274,8 +316,16 @@ mod tests {
         MxArray::eval_arrays_with_context(&[&dst.weight, s, b], "gguf_gpu test").unwrap();
         Bytes {
             weight: dst.weight.to_uint32().unwrap().to_vec(),
-            scales: s.to_uint8().unwrap(),
+            scales: scale_bytes(s),
             biases: b.to_uint16_native().unwrap(),
+        }
+    }
+
+    fn scale_bytes(s: &MxArray) -> Vec<u8> {
+        if s.dtype().unwrap() == DType::Int8 {
+            s.to_int8().unwrap().into_iter().map(|v| v as u8).collect()
+        } else {
+            s.to_uint8().unwrap()
         }
     }
 
@@ -290,9 +340,14 @@ mod tests {
     ) -> Bytes {
         let format = kquant_format(kind);
         let arrays = repack_kquant(format, blocks, rows, k).unwrap();
+        assert_eq!(
+            matches!(arrays.scales, KQuantScales::Signed(_)),
+            format.scales_are_signed(),
+            "{kind:?} scales signedness"
+        );
         let scales = match arrays.scales {
             KQuantScales::Unsigned(v) => v,
-            KQuantScales::Signed(_) => panic!("{kind:?} scales are unsigned"),
+            KQuantScales::Signed(v) => v.into_iter().map(|x| x as u8).collect(),
         };
         if layout == OutLayout::RowMajor {
             return Bytes {
@@ -314,7 +369,7 @@ mod tests {
         MxArray::eval_arrays_with_context(&[&tw, &ts, &tb], "gguf_gpu oracle").unwrap();
         Bytes {
             weight: tw.to_uint32().unwrap().to_vec(),
-            scales: ts.to_uint8().unwrap(),
+            scales: scale_bytes(&ts),
             biases: tb.to_uint16_native().unwrap(),
         }
     }
@@ -353,18 +408,98 @@ mod tests {
     }
 
     fn whole_tensor(kind: GpuRepackKind, layout: OutLayout, rows: usize, k: usize) {
+        whole_tensor_at(kind, layout, rows, k, 32);
+    }
+
+    /// One band holding the whole tensor at staging byte `pad`.
+    fn whole_tensor_at(kind: GpuRepackKind, layout: OutLayout, rows: usize, k: usize, pad: usize) {
         let format = kquant_format(kind);
-        let blocks = random_bytes(rows * format.row_bytes(k), (rows * 131 + k) as u64);
+        let blocks = random_bytes(rows * format.row_bytes(k), (rows * 131 + k + pad) as u64);
         let info = tensor_info(kind, rows, k);
         let (dst, ptrs) = RepackDst::alloc(&info, layout).unwrap();
         assert_eq!((ptrs.rows, ptrs.k, ptrs.layout), (rows, k, layout));
-        let staging = staging_with(&blocks, 32, rows as u64);
-        let out =
-            gpu_repack_band(&staging, 32, kind, layout, k as u32, 0, rows as u32, dst).unwrap();
+        let staging = staging_with(&blocks, pad, rows as u64);
+        let out = gpu_repack_band(
+            &staging,
+            pad as u64,
+            kind,
+            layout,
+            k as u32,
+            0,
+            rows as u32,
+            dst,
+        )
+        .unwrap();
         assert_same(
             &read(&out),
             &oracle(kind, layout, &blocks, rows, k),
-            &format!("{kind:?} {layout:?} rows {rows} k {k}"),
+            &format!("{kind:?} {layout:?} rows {rows} k {k} offset {pad}"),
+        );
+    }
+
+    /// Row-major: rows {1, 3, 64, 130} x K {256, 768, 5120} (odd block counts
+    /// included) at an aligned offset and at the smallest offset the kernel
+    /// allows above it.
+    fn row_major_cases(kind: GpuRepackKind) {
+        let rule = band_offset_rule(kind);
+        for rows in [1, 3, 64, 130] {
+            for k in [256, 768, 5120] {
+                for pad in [32, 32 + rule] {
+                    whole_tensor_at(kind, OutLayout::RowMajor, rows, k, pad);
+                }
+            }
+        }
+    }
+
+    fn tiled_cases(kind: GpuRepackKind) {
+        let rule = band_offset_rule(kind);
+        for rows in [64, 192] {
+            for k in [768, 5120] {
+                for pad in [32, 32 + rule] {
+                    whole_tensor_at(kind, OutLayout::Tiled64, rows, k, pad);
+                }
+            }
+        }
+    }
+
+    /// Bands cut from one staging buffer starting at byte `pad`, so the band
+    /// offsets follow the row byte length (odd K-block counts give Q6_K/Q3_K
+    /// band offsets of 2 mod 4).
+    fn bands_of_one_staging(
+        kind: GpuRepackKind,
+        layout: OutLayout,
+        splits: &[usize],
+        k: usize,
+        pad: usize,
+    ) {
+        let format = kquant_format(kind);
+        let rows: usize = splits.iter().sum();
+        let row_bytes = format.row_bytes(k);
+        let blocks = random_bytes(rows * row_bytes, (rows * 11 + k + pad) as u64);
+        let staging = staging_with(&blocks, pad, 77);
+        let (mut dst, _) = RepackDst::alloc(&tensor_info(kind, rows, k), layout).unwrap();
+        let mut row0 = 0usize;
+        let mut offsets = Vec::new();
+        for band in splits {
+            let off = pad + row0 * row_bytes;
+            offsets.push(off % 4);
+            dst = gpu_repack_band(
+                &staging,
+                off as u64,
+                kind,
+                layout,
+                k as u32,
+                row0 as u32,
+                *band as u32,
+                dst,
+            )
+            .unwrap();
+            row0 += band;
+        }
+        assert_same(
+            &read(&dst),
+            &oracle(kind, layout, &blocks, rows, k),
+            &format!("{kind:?} {layout:?} bands {splits:?} k {k} offsets mod 4 {offsets:?}"),
         );
     }
 
@@ -413,6 +548,200 @@ mod tests {
             for k in [512, 5120] {
                 whole_tensor(GpuRepackKind::Q5K, OutLayout::Tiled64, rows, k);
             }
+        }
+    }
+
+    #[test]
+    fn gpu_q6k_row_matches_cpu_repacker() {
+        if !require_gpu() {
+            return;
+        }
+        row_major_cases(GpuRepackKind::Q6K);
+        bands_of_one_staging(GpuRepackKind::Q6K, OutLayout::RowMajor, &[3, 5, 1], 768, 2);
+    }
+
+    #[test]
+    fn gpu_q6k_t64_matches_cpu_tiled() {
+        if !require_gpu() {
+            return;
+        }
+        tiled_cases(GpuRepackKind::Q6K);
+        bands_of_one_staging(
+            GpuRepackKind::Q6K,
+            OutLayout::Tiled64,
+            &[64, 128, 64],
+            768,
+            2,
+        );
+    }
+
+    #[test]
+    fn gpu_iq4xs_row_matches_cpu_repacker() {
+        if !require_gpu() {
+            return;
+        }
+        row_major_cases(GpuRepackKind::Iq4Xs);
+        bands_of_one_staging(
+            GpuRepackKind::Iq4Xs,
+            OutLayout::RowMajor,
+            &[3, 5, 1],
+            768,
+            8,
+        );
+    }
+
+    #[test]
+    fn gpu_iq4xs_t64_matches_cpu_tiled() {
+        if !require_gpu() {
+            return;
+        }
+        tiled_cases(GpuRepackKind::Iq4Xs);
+        bands_of_one_staging(
+            GpuRepackKind::Iq4Xs,
+            OutLayout::Tiled64,
+            &[64, 128, 64],
+            768,
+            8,
+        );
+    }
+
+    #[test]
+    fn gpu_q3k_row_matches_cpu_repacker() {
+        if !require_gpu() {
+            return;
+        }
+        row_major_cases(GpuRepackKind::Q3K);
+        bands_of_one_staging(GpuRepackKind::Q3K, OutLayout::RowMajor, &[3, 5, 1], 768, 2);
+    }
+
+    #[test]
+    fn gpu_q3k_t64_matches_cpu_tiled() {
+        if !require_gpu() {
+            return;
+        }
+        tiled_cases(GpuRepackKind::Q3K);
+        bands_of_one_staging(
+            GpuRepackKind::Q3K,
+            OutLayout::Tiled64,
+            &[64, 128, 64],
+            768,
+            2,
+        );
+    }
+
+    /// Q6_K / Q3_K with an odd block count whose last block ends exactly at
+    /// the end of the staging array (byte length 2 mod 4): the band is
+    /// accepted and exact, and one byte less is rejected.
+    #[test]
+    fn gpu_tail_word_rounding_safe() {
+        if !require_gpu() {
+            return;
+        }
+        for kind in [GpuRepackKind::Q6K, GpuRepackKind::Q3K] {
+            let (rows, k) = (3usize, 768usize);
+            let format = kquant_format(kind);
+            let blocks = random_bytes(rows * format.row_bytes(k), 41);
+            for pad in [0usize, 2] {
+                let staging = staging_exact(&blocks, pad, 9);
+                let end = pad + blocks.len();
+                assert_eq!(staging.nbytes(), end);
+                let (dst, _) =
+                    RepackDst::alloc(&tensor_info(kind, rows, k), OutLayout::RowMajor).unwrap();
+                let out = gpu_repack_band(
+                    &staging,
+                    pad as u64,
+                    kind,
+                    OutLayout::RowMajor,
+                    k as u32,
+                    0,
+                    rows as u32,
+                    dst,
+                )
+                .unwrap_or_else(|e| panic!("{kind:?} band ending at byte {end}: {}", e.reason));
+                assert_same(
+                    &read(&out),
+                    &oracle(kind, OutLayout::RowMajor, &blocks, rows, k),
+                    &format!(
+                        "{kind:?} band ending at the staging end, offset {pad}, end % 4 = {}",
+                        end % 4
+                    ),
+                );
+                let short = staging_exact(&blocks[..blocks.len() - 1], pad, 9);
+                let (dst, _) =
+                    RepackDst::alloc(&tensor_info(kind, rows, k), OutLayout::RowMajor).unwrap();
+                let err = gpu_repack_band(
+                    &short,
+                    pad as u64,
+                    kind,
+                    OutLayout::RowMajor,
+                    k as u32,
+                    0,
+                    rows as u32,
+                    dst,
+                )
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("{kind:?}: a band one byte past the staging end was accepted")
+                });
+                assert!(
+                    err.reason.contains("past the end of the staging"),
+                    "{}",
+                    err.reason
+                );
+            }
+        }
+    }
+
+    /// Every kind accepts a band at its `band_offset_rule` and rejects one
+    /// at half of it: the Rust rule and the C++ table agree.
+    #[test]
+    fn gpu_band_offset_rule_matches_kernel_table() {
+        if !require_gpu() {
+            return;
+        }
+        for kind in KINDS {
+            let (rows, k) = (64usize, 256usize);
+            let rule = band_offset_rule(kind);
+            let blocks = random_bytes(rows * kquant_format(kind).row_bytes(k), 13);
+            let staging = staging_with(&blocks, 2 * rule, 13);
+            let (dst, _) =
+                RepackDst::alloc(&tensor_info(kind, rows, k), OutLayout::RowMajor).unwrap();
+            let ok = gpu_repack_band(
+                &staging,
+                (2 * rule) as u64,
+                kind,
+                OutLayout::RowMajor,
+                k as u32,
+                0,
+                rows as u32,
+                dst,
+            );
+            assert!(
+                ok.is_ok(),
+                "{kind:?} at offset {}: {:?}",
+                2 * rule,
+                ok.err()
+            );
+            let half = rule / 2;
+            let (dst, _) =
+                RepackDst::alloc(&tensor_info(kind, rows, k), OutLayout::RowMajor).unwrap();
+            let err = gpu_repack_band(
+                &staging,
+                (2 * rule - half) as u64,
+                kind,
+                OutLayout::RowMajor,
+                k as u32,
+                0,
+                rows as u32,
+                dst,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{kind:?} accepted offset {}", 2 * rule - half));
+            assert!(
+                err.reason.contains(&format!("not a multiple of {rule}")),
+                "{kind:?}: {}",
+                err.reason
+            );
         }
     }
 
@@ -552,6 +881,21 @@ mod tests {
         assert_eq!(b.shape().unwrap().to_vec(), vec![4, 64, 4]);
         assert_eq!(b.dtype().unwrap(), DType::Float16);
         assert!(RepackDst::alloc(&info, OutLayout::Tiled64).is_err());
+
+        let q6 = GgufTensorInfo {
+            name: "blk.0.attn_v.weight".to_string(),
+            n_dims: 2,
+            dims: vec![768, 128],
+            tensor_type: GgufTensorType::Q6K,
+            offset: 0,
+        };
+        let (dst, _) = RepackDst::alloc(&q6, OutLayout::Tiled64).unwrap();
+        assert_eq!(dst.weight.shape().unwrap().to_vec(), vec![128, 144]);
+        let s = dst.scales.as_ref().unwrap();
+        assert_eq!(s.shape().unwrap().to_vec(), vec![128, 48]);
+        assert_eq!(s.dtype().unwrap(), DType::Int8);
+        let b = dst.biases.as_ref().unwrap();
+        assert_eq!(b.shape().unwrap().to_vec(), vec![128, 3]);
     }
 }
 
@@ -570,7 +914,13 @@ pub(crate) mod bench {
         const ITERS: u32 = 4;
         let k = 5120u32;
         let mut failures = Vec::new();
-        for kind in [GpuRepackKind::Q4K, GpuRepackKind::Q5K] {
+        for kind in [
+            GpuRepackKind::Q4K,
+            GpuRepackKind::Q5K,
+            GpuRepackKind::Q6K,
+            GpuRepackKind::Iq4Xs,
+            GpuRepackKind::Q3K,
+        ] {
             for layout in [OutLayout::RowMajor, OutLayout::Tiled64] {
                 let id = kernel_id(kind, layout);
                 let row_bytes = kquant_format(kind).row_bytes(k as usize) as u64;

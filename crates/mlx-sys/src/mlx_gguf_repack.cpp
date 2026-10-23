@@ -38,13 +38,20 @@ struct KernelInfo {
   uint32_t offset_rule;     // staging byte offset of a band must be a multiple
   uint32_t threads_per_blk; // grid = blocks * threads_per_blk
   bool t64;
+  bool signed_scales;       // .scales int8 instead of uint8
 };
 
 constexpr KernelInfo kKernels[] = {
-    {"mlx_node_gguf_repack_q4k", 144, 32, 16, 4, 16, 8, false},
-    {"mlx_node_gguf_repack_q4k_t64", 144, 32, 16, 4, 16, 8, true},
-    {"mlx_node_gguf_repack_q5k", 176, 40, 16, 4, 16, 8, false},
-    {"mlx_node_gguf_repack_q5k_t64", 176, 40, 16, 4, 16, 8, true},
+    {"mlx_node_gguf_repack_q4k", 144, 32, 16, 4, 16, 8, false, false},
+    {"mlx_node_gguf_repack_q4k_t64", 144, 32, 16, 4, 16, 8, true, false},
+    {"mlx_node_gguf_repack_q5k", 176, 40, 16, 4, 16, 8, false, false},
+    {"mlx_node_gguf_repack_q5k_t64", 176, 40, 16, 4, 16, 8, true, false},
+    {"mlx_node_gguf_repack_q6k", 210, 48, 16, 2, 2, 8, false, true},
+    {"mlx_node_gguf_repack_q6k_t64", 210, 48, 16, 2, 2, 8, true, true},
+    {"mlx_node_gguf_repack_iq4xs", 136, 32, 8, 2, 8, 8, false, true},
+    {"mlx_node_gguf_repack_iq4xs_t64", 136, 32, 8, 2, 8, 8, true, true},
+    {"mlx_node_gguf_repack_q3k", 110, 24, 16, 2, 2, 2, false, true},
+    {"mlx_node_gguf_repack_q3k_t64", 110, 24, 16, 2, 2, 2, true, true},
 };
 constexpr int kKernelCount = int(sizeof(kKernels) / sizeof(kKernels[0]));
 
@@ -200,6 +207,10 @@ BandPlan plan_band(int kernel, uint32_t k, uint32_t row0, uint32_t rows,
     expect(row0 % kTileRows == 0 && rows % kTileRows == 0,
            "Tiled64 band rows must start and end on 64-row tiles");
   }
+  // Block byte offsets inside the kernels are 32-bit.
+  expect(src_offset % 4 + nb * info.block_bytes <=
+             std::numeric_limits<uint32_t>::max(),
+         "band bytes too large for one dispatch");
   BandPlan plan{};
   plan.params.src_off = src_offset;
   plan.params.nb = uint32_t(nb);
@@ -292,7 +303,8 @@ int32_t mlx_gguf_repack_band(mlx_array* staging, uint64_t src_offset,
     const auto& b = *reinterpret_cast<array*>(dst_b);
     const uint64_t kb = plan.params.kb;
     const uint64_t total = dst_rows(w, uint32, kb * info.weight_words, "weight");
-    expect(dst_rows(s, uint8, kb * info.scale_bytes, "scales") == total,
+    expect(dst_rows(s, info.signed_scales ? int8 : uint8, kb * info.scale_bytes,
+                    "scales") == total,
            "scales rows differ from weight rows");
     expect(dst_rows(b, float16, kb * info.bias_bytes / 2, "biases") == total,
            "biases rows differ from weight rows");
@@ -359,7 +371,8 @@ double mlx_gguf_repack_bench_gpu_seconds(int32_t kernel, uint64_t src_bytes,
     auto make_outs = [&] {
       return std::vector<array>{
           alloc_array({int32_t(rows), int32_t(kb * info.weight_words)}, uint32),
-          alloc_array({int32_t(rows), int32_t(kb * info.scale_bytes)}, uint8),
+          alloc_array({int32_t(rows), int32_t(kb * info.scale_bytes)},
+                      info.signed_scales ? int8 : uint8),
           alloc_array({int32_t(rows), int32_t(kb * info.bias_bytes / 2)}, float16)};
     };
     std::vector<std::vector<array>> outs;

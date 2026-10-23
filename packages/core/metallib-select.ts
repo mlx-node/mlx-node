@@ -98,6 +98,12 @@ export const GGUF_REPACK_KERNEL_MARKERS = [
   'mlx_node_gguf_repack_q4k_t64',
   'mlx_node_gguf_repack_q5k',
   'mlx_node_gguf_repack_q5k_t64',
+  'mlx_node_gguf_repack_q6k',
+  'mlx_node_gguf_repack_q6k_t64',
+  'mlx_node_gguf_repack_iq4xs',
+  'mlx_node_gguf_repack_iq4xs_t64',
+  'mlx_node_gguf_repack_q3k',
+  'mlx_node_gguf_repack_q3k_t64',
 ] as const;
 
 /**

@@ -1,6 +1,6 @@
 // GGUF raw blocks -> the K-quant runtime arrays (`.weight` uint32, `.scales`
-// uint8, `.biases` float16), row-major or Tiled64, for one band of rows of a
-// tensor. build.rs prebuilds this file into paged_attn.metallib; the host
+// uint8 / int8, `.biases` float16), row-major or Tiled64, for one band of rows
+// of a tensor. build.rs prebuilds this file into paged_attn.metallib; the host
 // names below must match the kernel table in mlx_gguf_repack.cpp, which
 // gguf_repack_metallib_names checks both ways.
 //
@@ -201,5 +201,302 @@ static inline void q5k_unit(const device uint4* b4, uint u, thread uint* o) {
     ulong oo = (tg * p.kb + s) * 64u + rr;
     ((device uint4*)scales)[oo] = k4_scales(h.y, h.z, h.w);
     ((device uint*)biases)[oo] = h.x;
+  }
+}
+
+// ---------------------------------------------------------------- 2-byte aligned blocks
+// Q6_K (210 B) and Q3_K (110 B) blocks start at byte offsets 0 or 2 mod 4.
+// `r` is the word-aligned base at or below the band start and `B` a block's
+// byte offset from it. `ldu` reads one extra word only when misaligned, and
+// that word ends inside the block; `ldh` is a 2-byte load. No read goes past
+// the band's last byte.
+
+static inline uint fun16(uint lo, uint hi, uint sh) {
+  return (uint)(((((ulong)hi) << 32) | (ulong)lo) >> sh);
+}
+
+// N words starting at the 2-aligned byte offset `off`.
+template <int N>
+static inline void ldu(const device uint* r, uint off, thread uint* o) {
+  uint i = off >> 2, sh = (off & 2u) << 3;
+  uint w[N + 1];
+#pragma unroll
+  for (int k = 0; k < N; k++) w[k] = r[i + k];
+  w[N] = sh ? r[i + N] : 0u;
+#pragma unroll
+  for (int k = 0; k < N; k++) o[k] = fun16(w[k], w[k + 1], sh);
+}
+
+// f16 bits at the 2-aligned byte offset `off`.
+static inline ushort ldh(const device uint* r, uint off) {
+  return ((const device ushort*)r)[off >> 1];
+}
+
+static inline const device uint* word_base(const device uchar* staging,
+                                           ulong src_off) {
+  return (const device uint*)(staging + (src_off & ~(ulong)3));
+}
+
+// 4 bytes (each 0..63) -> 24-bit LSB-first stream.
+static inline uint pack6x4(uint c) {
+  uint x = (c & 0x003F003Fu) | ((c & 0x3F003F00u) >> 2);
+  return (x & 0xFFFu) | ((x >> 4) & 0xFFF000u);
+}
+
+// 4 bytes (each 0..7) -> 12 bits.
+static inline uint pack3x4(uint c) {
+  uint x = (c & 0x00070007u) | ((c & 0x07000700u) >> 5);
+  return (x & 0x3Fu) | ((x >> 10) & 0xFC0u);
+}
+
+// Per byte: v (0..63) - 32 as int8.
+static inline uint sub32b(uint v) {
+  uint m = ~v & 0x20202020u;
+  return (v ^ 0x20202020u) | (m << 1) | (m << 2);
+}
+
+// Q6_K: ql @0 (128), qh @128 (64), scales @192 (16), d @208. Unit u -> 6 words.
+static inline void q6k_unit(const device uint* r, uint B, uint u,
+                            thread uint* o) {
+  uint hf = u >> 2, gi = u & 3u;
+  uint q[8], h[8];
+  ldu<8>(r, B + hf * 64u + (gi & 1u) * 32u, q);
+  ldu<8>(r, B + 128u + hf * 32u, h);
+  uint ns = (gi >> 1) * 4u, hs = gi * 2u;
+  uint g[8];
+#pragma unroll
+  for (int k = 0; k < 8; k++) {
+    g[k] = pack6x4(((q[k] >> ns) & 0x0F0F0F0Fu) |
+                   (((h[k] >> hs) & 0x03030303u) << 4));
+  }
+  o[0] = g[0] | (g[1] << 24);
+  o[1] = (g[1] >> 8) | (g[2] << 16);
+  o[2] = (g[2] >> 16) | (g[3] << 8);
+  o[3] = g[4] | (g[5] << 24);
+  o[4] = (g[5] >> 8) | (g[6] << 16);
+  o[5] = (g[6] >> 16) | (g[7] << 8);
+}
+
+static inline uint4 q6k_scales(const device uint* r, uint B) {
+  uint s[4];
+  ldu<4>(r, B + 192u, s);
+  return uint4(s[0], s[1], s[2], s[3]);
+}
+
+// Q3_K: hmask @0 (32), qs @32 (64), scales @96 (12), d @108.
+static inline uint4 q3k_scales(const device uint* r, uint B) {
+  uint s[3];
+  ldu<3>(r, B + 96u, s);
+  uint m = 0x0F0F0F0Fu, t = 0x03030303u;
+  return uint4(sub32b((s[0] & m) | ((s[2] & t) << 4)),
+               sub32b((s[1] & m) | (((s[2] >> 2) & t) << 4)),
+               sub32b(((s[0] >> 4) & m) | (((s[2] >> 4) & t) << 4)),
+               sub32b(((s[1] >> 4) & m) | (((s[2] >> 6) & t) << 4)));
+}
+
+// Q3_K half block hf (the 4 units that share their qs/hmask bytes) -> 12
+// words, unit-major.
+static inline void q3k_half(const device uint* r, uint B, uint hf,
+                            thread uint* o) {
+  uint q[8], h[8];
+  ldu<8>(r, B + 32u + hf * 32u, q);
+  ldu<8>(r, B, h);
+#pragma unroll
+  for (uint gr = 0; gr < 4; gr++) {
+    uint qs = 2u * gr, hs = 4u * hf + gr;
+    uint g[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) {
+      g[k] = pack3x4(((q[k] >> qs) & 0x03030303u) |
+                     (((h[k] >> hs) & 0x01010101u) << 2));
+    }
+    thread uint* w = o + 3u * gr;
+    w[0] = g[0] | (g[1] << 12) | (g[2] << 24);
+    w[1] = (g[2] >> 8) | (g[3] << 4) | (g[4] << 16) | (g[5] << 28);
+    w[2] = (g[5] >> 4) | (g[6] << 8) | (g[7] << 20);
+  }
+}
+
+// IQ4_XS: d @0, scales_h u16 @2, scales_l @4 (4), qs @8 (128); 34 words,
+// 8-byte aligned. Unit u -> 4 words.
+static inline uint4 iq4xs_unit(const device uint* r, uint b, uint u) {
+  const device uint2* p = (const device uint2*)(r + b * 34u + 2u + 4u * u);
+  uint2 x = p[0], y = p[1];
+  return uint4(nib8(x.x, x.y), nib8(y.x, y.y), nib8(x.x >> 4, x.y >> 4),
+               nib8(y.x >> 4, y.y >> 4));
+}
+
+// w0 = d | scales_h << 16, w1 = scales_l -> 8 int8 sub-scales.
+static inline uint2 iq4xs_scales(uint w0, uint w1) {
+  uint le = w1 & 0x0F0F0F0Fu, lo = (w1 >> 4) & 0x0F0F0F0Fu;
+  uint H = w0 >> 16;
+  uint x = H & 0xFFu;
+  x = (x | (x << 12)) & 0x000F000Fu;
+  x = (x | (x << 6)) & 0x03030303u;
+  uint y = (H >> 8) & 0xFFu;
+  y = (y | (y << 12)) & 0x000F000Fu;
+  y = (y | (y << 6)) & 0x03030303u;
+  return uint2(sub32b(il2(le, lo) | (x << 4)),
+               sub32b(il2(le >> 16, lo >> 16) | (y << 4)));
+}
+
+// ---------------------------------------------------------------- Q6_K
+// 210-byte blocks. One thread per 32-value unit: grid = nb * 8.
+
+[[kernel]] void mlx_node_gguf_repack_q6k(
+    const device uchar* staging [[buffer(0)]],
+    device uint* weight [[buffer(1)]],
+    device uchar* scales [[buffer(2)]],
+    device half* biases [[buffer(3)]],
+    constant GgufRepackParams& p [[buffer(4)]],
+    uint g [[thread_position_in_grid]]) {
+  if (g >= p.nb * 8u) return;
+  const device uint* r = word_base(staging, p.src_off);
+  uint b = g >> 3, u = g & 7u;
+  uint B = (uint)(p.src_off & 3ul) + b * 210u;
+  uint o[6];
+  q6k_unit(r, B, u, o);
+  ulong gb = (ulong)p.row0 * p.kb + b;
+  device uint2* w2 = (device uint2*)(weight + (gb * 8u + u) * 6u);
+  w2[0] = uint2(o[0], o[1]);
+  w2[1] = uint2(o[2], o[3]);
+  w2[2] = uint2(o[4], o[5]);
+  if (u == 0) {
+    ((device uint4*)scales)[gb] = q6k_scales(r, B);
+    ((device ushort*)biases)[gb] = ldh(r, B + 208u);
+  }
+}
+
+[[kernel]] void mlx_node_gguf_repack_q6k_t64(
+    const device uchar* staging [[buffer(0)]],
+    device uint* weight [[buffer(1)]],
+    device uchar* scales [[buffer(2)]],
+    device half* biases [[buffer(3)]],
+    constant GgufRepackParams& p [[buffer(4)]],
+    uint g [[thread_position_in_grid]]) {
+  if (g >= p.nb * 8u) return;
+  const device uint* r = word_base(staging, p.src_off);
+  uint rr = g & 63u, rest = g >> 6, U = rest % p.ku, T = rest / p.ku;
+  uint n = T * 64u + rr, s = U >> 3, u = U & 7u;
+  uint b = n * p.kb + s;
+  uint B = (uint)(p.src_off & 3ul) + b * 210u;
+  uint o[6];
+  q6k_unit(r, B, u, o);
+  ulong tg = (ulong)p.tile0 + T;
+  device uint2* w2 =
+      (device uint2*)(weight + ((ulong)p.tile0 * p.ku * 64u + g) * 6u);
+  w2[0] = uint2(o[0], o[1]);
+  w2[1] = uint2(o[2], o[3]);
+  w2[2] = uint2(o[4], o[5]);
+  if (u == 0) {
+    ulong oo = (tg * p.kb + s) * 64u + rr;
+    ((device uint4*)scales)[oo] = q6k_scales(r, B);
+    ((device ushort*)biases)[oo] = ldh(r, B + 208u);
+  }
+}
+
+// ---------------------------------------------------------------- IQ4_XS
+// 136-byte blocks (8-byte aligned). One thread per 32-value unit:
+// grid = nb * 8.
+
+[[kernel]] void mlx_node_gguf_repack_iq4xs(
+    const device uchar* staging [[buffer(0)]],
+    device uint* weight [[buffer(1)]],
+    device uchar* scales [[buffer(2)]],
+    device half* biases [[buffer(3)]],
+    constant GgufRepackParams& p [[buffer(4)]],
+    uint g [[thread_position_in_grid]]) {
+  if (g >= p.nb * 8u) return;
+  const device uint* r = (const device uint*)(staging + p.src_off);
+  uint b = g >> 3, u = g & 7u;
+  ulong gb = (ulong)p.row0 * p.kb + b;
+  ((device uint4*)weight)[gb * 8u + u] = iq4xs_unit(r, b, u);
+  if (u == 0) {
+    uint2 h = ((const device uint2*)r)[b * 17u];
+    ((device uint2*)scales)[gb] = iq4xs_scales(h.x, h.y);
+    ((device ushort*)biases)[gb] = (ushort)(h.x & 0xFFFFu);
+  }
+}
+
+[[kernel]] void mlx_node_gguf_repack_iq4xs_t64(
+    const device uchar* staging [[buffer(0)]],
+    device uint* weight [[buffer(1)]],
+    device uchar* scales [[buffer(2)]],
+    device half* biases [[buffer(3)]],
+    constant GgufRepackParams& p [[buffer(4)]],
+    uint g [[thread_position_in_grid]]) {
+  if (g >= p.nb * 8u) return;
+  const device uint* r = (const device uint*)(staging + p.src_off);
+  uint rr = g & 63u, rest = g >> 6, U = rest % p.ku, T = rest / p.ku;
+  uint n = T * 64u + rr, s = U >> 3, u = U & 7u;
+  uint b = n * p.kb + s;
+  ulong tg = (ulong)p.tile0 + T;
+  ((device uint4*)weight)[(ulong)p.tile0 * p.ku * 64u + g] =
+      iq4xs_unit(r, b, u);
+  if (u == 0) {
+    ulong oo = (tg * p.kb + s) * 64u + rr;
+    uint2 h = ((const device uint2*)r)[b * 17u];
+    ((device uint2*)scales)[oo] = iq4xs_scales(h.x, h.y);
+    ((device ushort*)biases)[oo] = (ushort)(h.x & 0xFFFFu);
+  }
+}
+
+// ---------------------------------------------------------------- Q3_K
+// 110-byte blocks. One thread per half block (4 units): grid = nb * 2.
+
+[[kernel]] void mlx_node_gguf_repack_q3k(
+    const device uchar* staging [[buffer(0)]],
+    device uint* weight [[buffer(1)]],
+    device uchar* scales [[buffer(2)]],
+    device half* biases [[buffer(3)]],
+    constant GgufRepackParams& p [[buffer(4)]],
+    uint g [[thread_position_in_grid]]) {
+  if (g >= p.nb * 2u) return;
+  const device uint* r = word_base(staging, p.src_off);
+  uint b = g >> 1, hf = g & 1u;
+  uint B = (uint)(p.src_off & 3ul) + b * 110u;
+  uint o[12];
+  q3k_half(r, B, hf, o);
+  ulong gb = (ulong)p.row0 * p.kb + b;
+  device uint4* w4 = (device uint4*)weight + (gb * 2u + hf) * 3u;
+  w4[0] = uint4(o[0], o[1], o[2], o[3]);
+  w4[1] = uint4(o[4], o[5], o[6], o[7]);
+  w4[2] = uint4(o[8], o[9], o[10], o[11]);
+  if (hf == 0) {
+    ((device uint4*)scales)[gb] = q3k_scales(r, B);
+    ((device ushort*)biases)[gb] = ldh(r, B + 108u);
+  }
+}
+
+// Tiled64, threads in tile order over half blocks: g -> rr = g % 64,
+// H = (g / 64) % (2 * kb), T = g / (128 * kb).
+[[kernel]] void mlx_node_gguf_repack_q3k_t64(
+    const device uchar* staging [[buffer(0)]],
+    device uint* weight [[buffer(1)]],
+    device uchar* scales [[buffer(2)]],
+    device half* biases [[buffer(3)]],
+    constant GgufRepackParams& p [[buffer(4)]],
+    uint g [[thread_position_in_grid]]) {
+  if (g >= p.nb * 2u) return;
+  const device uint* r = word_base(staging, p.src_off);
+  uint rr = g & 63u, rest = g >> 6, H = rest % (p.kb * 2u),
+       T = rest / (p.kb * 2u);
+  uint s = H >> 1, hf = H & 1u, n = T * 64u + rr, b = n * p.kb + s;
+  uint B = (uint)(p.src_off & 3ul) + b * 110u;
+  uint o[12];
+  q3k_half(r, B, hf, o);
+  ulong tg = (ulong)p.tile0 + T;
+#pragma unroll
+  for (uint gr = 0; gr < 4; gr++) {
+    device uint* w =
+        weight + ((tg * p.ku + s * 8u + hf * 4u + gr) * 64u + rr) * 3u;
+    w[0] = o[3u * gr];
+    w[1] = o[3u * gr + 1u];
+    w[2] = o[3u * gr + 2u];
+  }
+  if (hf == 0) {
+    ulong oo = (tg * p.kb + s) * 64u + rr;
+    ((device uint4*)scales)[oo] = q3k_scales(r, B);
+    ((device ushort*)biases)[oo] = ldh(r, B + 108u);
   }
 }
