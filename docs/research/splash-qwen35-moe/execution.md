@@ -6,6 +6,12 @@ and 10 full-attention layers. The official eight-row DFlash2 companion uses
 seven proposal positions. Source reference: Splash revision
 `1482f6bbc2abf12375332725302019594150b6cb`.
 
+The MLX-side hooks used here are direct commits on the fork's `fn-d1` branch,
+not parent-repo patches. A normal update publishes the fork commit and moves
+the `crates/mlx-sys/mlx` gitlink; CMake, bridge headers and Metal preambles all
+consume that checkout directly. Explicit prebuilt artifacts still require
+matching clean-commit and build-key provenance. See [MLX fork](../../mlx-fork.md).
+
 ## Execution and cache ownership
 
 MoE DFlash2 uses the whole-turn exclusive engine lane and flat target caches.

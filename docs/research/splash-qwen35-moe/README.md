@@ -169,8 +169,9 @@ it does not compare every unrecorded logit. Teacher-forced wall time was about
 build and is not a product throughput result. The frozen references, output
 hashes, and arrays are in `candidate-v8-compiled-draft-tf-abba`.
 
-The canonical v11 package was built against MLX source with the tracked patches,
-and its packaged addon and both metallibs were frozen together. Its full teacher
+The canonical v11 package was built against MLX source with the changes now carried
+as direct commits on the fork's `fn-d1` branch, and its packaged addon and both
+metallibs were frozen together. Its full teacher
 check reproduces the baseline on all 2047 measured positions: argmax agreement
 1, top-256-plus-tail KL 0, and mean NLL `1.4252860731302848`.
 Serial-encoder OFF/ON runs also have identical recorded continuation paths

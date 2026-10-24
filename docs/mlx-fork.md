@@ -8,14 +8,14 @@ MLX's public C++ API.
 ```
 ml-explore/mlx main  bebd6422f (2026-10-14)
         │
-        │  + 6 patches   fork main
+        │  + 11 patches  fork fn-d1
         ▼
-mlx-node/mlx         e68b9ba77  ◄── gitlink at crates/mlx-sys/mlx
+mlx-node/mlx         1cf8764f9  ◄── gitlink at crates/mlx-sys/mlx
 ```
 
-Commit hashes change on every rebase. Name a patch by its subject.
+Name a patch by its subject and use its commit hash for the exact gitlink.
 
-## The 6 patches
+## The 11 patches
 
 | #   | commit      | patch                                                                                                                                                                 | why it cannot live in mlx-node                                                                                                                                                                                                                                                                                                                                                                                                                                    | upstream candidate |
 | --- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
@@ -25,12 +25,16 @@ Commit hashes change on every rebase. Name a patch by its subject.
 | 4   | `bcad39304` | `MLX_METAL_COMMAND_TRACE`: 1 `[metal-command]` per command buffer, `[mlx-evaluation]` per eval; 2 + `[metal-op]`; 3 + dtypes                                          | Lives inside `CommandEncoder::commit` (`mlx/backend/metal/device.cpp`), the `gpu::eval` loop (`mlx/backend/metal/eval.cpp`) and `eval_impl` (`mlx/transforms.cpp`). MLX has no per-primitive callback                                                                                                                                                                                                                                                             | no (diagnostics)   |
 | 5   | `df35e4aa0` | Custom kernel library key computed by `fast::metal_kernel()`: fixed header and source hashed once per kernel function, only the generated signature per call          | `CustomKernel::eval_gpu` hashed the whole generated source on every evaluation (`mlx/backend/metal/custom_kernel.cpp`): 7% of the model thread on Qwen3.8 Flash Next decode (~600 custom kernel dispatches per token). The key is built where the source is generated (`mlx/backend/common/metal_kernel.cpp`), stored on the primitive and exposed as `CustomKernel::library_name()` (the DFlash2 selector probe in `mlx_dflash2.cpp` looks the library up by it) | yes                |
 | 6   | `e68b9ba77` | Barrier tracking: `prev_*` map each resource to the barrier epoch that recorded it; a barrier or `end_encoding` only bumps the epoch; `next_*` are per-dispatch lists | `CommandEncoder::maybeInsertBarrier` (`mlx/backend/metal/device.cpp`) swapped two `unordered_set`s and cleared one per dispatch; libc++ `clear()` zeroes a bucket array that never shrinks, 7% of the model thread as `__bzero` (still 1.3% with a bucket cap). Nothing is cleared on the dispatch path now; barriers and recorded resources are unchanged                                                                                                        | yes                |
+| 7   | `f67ebd421` | Indirect expert dispatch: `CommandEncoder::dispatch_threadgroups_indirect` for grouped MoE grids, with the argument buffer registered as an input                     | The operation lives in `CommandEncoder`, which owns the Metal encoder and its barrier and dispatch accounting                                                                                                                                                                                                                                                                                                                                                     | not proposed       |
+| 8   | `ba46defc6` | Command trace binding: command-buffer and stream tags join primitive trace lines to completed GPU commands                                                            | Lives in the existing `CommandEncoder::commit` and `gpu::eval` trace paths; diagnostics only                                                                                                                                                                                                                                                                                                                                                                      | no (diagnostics)   |
+| 9   | `14992add0` | `MLX_METAL_SERIAL_ENCODER=1` selects serial compute dispatch for controlled experiments; concurrent dispatch remains the default                                      | Encoder creation is inside `CommandEncoder`; resource bookkeeping, cross-encoder fences and stream ordering stay in the same implementation                                                                                                                                                                                                                                                                                                                       | not proposed       |
+| 10  | `7aa7d680b` | Sparse input budget: `set_input_array_with_budget` supplies an explicit storage-unit scheduling estimate; repeated or shared bindings restore the full charge         | The scheduling estimate and discount restoration live in `CommandEncoder`'s private input-binding state. Actual resource tracking, hazards, retention and memory limits remain there too                                                                                                                                                                                                                                                                          | not proposed       |
+| 11  | `1cf8764f9` | Persistent workspace: one bounded (16 slots/8 MiB) encoder-owned scratch profile, reused until encoder teardown                                                       | Workspace allocation, completion retention and cross-encoder fencing are `CommandEncoder` internals; ordinary resource bindings and fences remain authoritative                                                                                                                                                                                                                                                                                                   | not proposed       |
 
-The five patches under `crates/mlx-sys/patches/` are a separate parent-repo,
-build-time stack. `build.rs` applies them in filename order to a generated copy
-under Cargo's `OUT_DIR`; the submodule remains unchanged, and MLX, bridge
-headers, and generated Metal preambles consume that same patched tree. See the
-[patch inventory](../crates/mlx-sys/patches/README.md).
+All 11 patches are direct commits on the fork's `fn-d1` branch. `build.rs` uses
+the checked-out submodule directly for CMake, bridge headers, Metal kernels and
+generated preambles. There is no parent-repo patch stack or generated patched
+source tree.
 
 The bridge also prints `[mlx-compiled]` lines under `MLX_METAL_COMMAND_TRACE` ≥ 1
 (`crates/mlx-sys/src/mlx_compiled_graph.cpp`). That part is ours, not a patch.
@@ -85,26 +89,24 @@ specialization included.
 ## Bumping MLX
 
 ```
-fork    1. rebase the 6 patches on upstream main      work branch mlx-node/rebase-<date>
-parent  2. move the gitlink, fix API drift, yarn build:native
+fork    1. commit MLX changes on fn-d1 and publish the branch
+parent  2. move the gitlink to that commit, fix API drift, yarn build:native
         3. golden gates, every route                  must be equal, or attributed
         4. dev suites                                 cargo test, vp test
         5. metallib markers + canaries
         6. prebuilt MLX release + mlx-prebuilt.json   same PR
         7. benches, ABBA against the old addon
-fork    8. force-push it to fork main before the parent PR  (CI clones the gitlink)
 ```
 
-**1. Rebase.** In the fork clone (`origin` = ml-explore/mlx, `me` = mlx-node/mlx):
-`git fetch origin me`, `git switch -c mlx-node/rebase-<date> origin/main`, then cherry-pick
-the patches in order from `git log --reverse origin/main..me/main`. Fork `main` carries the
-patch stack; it does not mirror upstream. Drop a patch only when upstream has the same
-change. Check that the standalone CMake build passes with `CMAKE_OSX_DEPLOYMENT_TARGET=26.2`
-and builds the NAX kernels (no `NAX kernels require` warning). Step 8 is
-`git push --force-with-lease=main:<old me/main> me HEAD:main`.
+**1. Fork.** Make MLX changes as ordinary commits on `fn-d1` and publish that
+branch before the parent PR needs them. Drop a patch only when upstream has the
+same change. Check that the standalone CMake build passes with
+`CMAKE_OSX_DEPLOYMENT_TARGET=26.2` and builds the NAX kernels (no
+`NAX kernels require` warning).
 
 **2. Parent.** `git -C crates/mlx-sys/mlx checkout <new sha>`, then `yarn build:native`.
-Read the upstream diff for every MLX function the bridge calls. A new optional
+The parent change is the gitlink plus any API fixes; do not add parent-repo patch
+files. Read the upstream diff for every MLX function the bridge calls. A new optional
 parameter can compile silently with a wrong argument in its slot (this happened to
 `gather_qmm` when `global_scale` was added). Re-read the D=256 predicate in upstream
 `scaled_dot_product_attention.cpp` against `mlx_stream.cpp`.
@@ -187,9 +189,8 @@ GEMM accuracy on this machine changed.
 `.github/workflows/mlx-prebuilt.yml` (on any branch of this repo) and publishes release
 `mlx-prebuilt-<sha12>-<key8>`; paste the sha256 it prints into
 `crates/mlx-sys/mlx-prebuilt.json` in the same PR (see below). Until then every build of
-the PR compiles the patched source and reports why automatic prebuilt use was refused.
-The workflow needs the submodule commit reachable from the fork (step 8, or push the
-rebase branch to the fork first).
+the PR compiles the checked-out fork source and reports why automatic prebuilt use was
+refused. The workflow needs the submodule commit published on the fork (step 1).
 
 **7. Benches.** Same machine, cooled, ABBA order, old addon vs new:
 `scripts/benchmark-model.ts` (decode and prefill), `docs/research/splash-qwen38/benchmark.ts`
@@ -200,10 +201,10 @@ JIT compile to the first run after a bump.
 
 ## Prebuilt MLX
 
-`crates/mlx-sys/build.rs` links upstream MLX either from its own cmake build of the
-patched source tree generated from the submodule (~10 min per cargo profile) or from a
-**prebuilt artifact** downloaded once per machine. Only MLX itself is prebuilt: the bridge
-(`libmlx_ffi.a`), its preambles and `paged_attn.metallib` stay source-built.
+`crates/mlx-sys/build.rs` links MLX either from its own cmake build of the checked-out
+fork (~10 min per cargo profile) or from a **prebuilt artifact** downloaded once per
+machine. Only MLX itself is prebuilt: the bridge (`libmlx_ffi.a`), its preambles and
+`paged_attn.metallib` stay source-built.
 
 ```
 artifact (mlx-<triple>.tar.gz)        pin (crates/mlx-sys/mlx-prebuilt.json)
@@ -216,10 +217,12 @@ artifact (mlx-<triple>.tar.gz)        pin (crates/mlx-sys/mlx-prebuilt.json)
 
 `<key8>` is the first 8 hex of the **build key**: sha256 over the portable cmake defines
 (`portable_cmake_defines` in build.rs: everything but tool paths and the SDK root),
-`PREBUILT_BUILD_KEY_REVISION`, and every file under `crates/mlx-sys/cmake/`,
-`crates/mlx-sys/patches/`, and `crates/mlx-sys/build_support/`. A build-input change
-without a submodule move therefore names a new release, and a pin left on the old one is
-refused. Bump `PREBUILT_BUILD_KEY_REVISION` when artifact-shaping `build.rs` logic changes.
+`PREBUILT_BUILD_KEY_REVISION`, and every file under `crates/mlx-sys/cmake/`. Direct fork
+changes are covered by the submodule commit. `build_support/` affects the source-built
+bridge and remains a rebuild input, but does not shape the MLX artifact. A build-input
+change without a submodule move therefore names a new release, and a pin left on the old
+one is refused. Bump `PREBUILT_BUILD_KEY_REVISION` when artifact-shaping `build.rs` logic
+changes.
 
 Auto mode (default) uses the artifact only when all of these hold: target
 `aarch64-apple-darwin` with Metal, the pin has a non-empty `sha256`, the submodule HEAD
@@ -255,8 +258,8 @@ modes and never re-derives the cache location from the environment. In both mode
 (`target/<profile>/{,deps/}`): MLX loads a colocated metallib before the baked path, so
 the copy must track the libmlx that was linked.
 
-**Bump or build-input procedure.** Push the moved gitlink or a change to `build.rs`,
-`cmake/`, `patches/`, or `build_support/`: `.github/workflows/mlx-prebuilt.yml` runs on
+**Bump or build-input procedure.** Push the moved gitlink or a change to `build.rs` or
+`cmake/`: `.github/workflows/mlx-prebuilt.yml` runs on
 that push (any branch; `gh workflow run mlx-prebuilt.yml` also works once it is on main),
 builds with `MLX_PREBUILT_EXPORT`, tars the export dir, publishes release
 `mlx-prebuilt-<sha12>-<key8>` and prints the sha256 in the job summary. Then set
