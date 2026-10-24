@@ -2,7 +2,7 @@
 //! rows at a time, into destination buffers allocated up front
 //! (`mlx_gguf_repack.cpp`, kernels in `paged_attn.metallib`). The output bytes
 //! equal the CPU loader's: `KQuantRepacker` (then `kquant_tile_rows` for
-//! Tiled64) for the K-quants, `load_quantized_tensor` for Q8_0 and MXFP4.
+//! Tiled64) for the K-quants, `load_quantized_tensor` for Q4_0, Q8_0 and MXFP4.
 
 use crate::array::{DType, MxArray};
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType, symmetric_zero_point};
@@ -23,6 +23,7 @@ pub(crate) enum GpuRepackKind {
     Iq3S,
     Q8_0,
     Mxfp4,
+    Q4_0,
 }
 
 impl GpuRepackKind {
@@ -38,13 +39,14 @@ impl GpuRepackKind {
             Self::Iq3S => GgufTensorType::IQ3S,
             Self::Q8_0 => GgufTensorType::Q8_0,
             Self::Mxfp4 => GgufTensorType::MXFP4,
+            Self::Q4_0 => GgufTensorType::Q4_0,
         }
     }
 
-    /// Q8_0 and MXFP4 load as MLX affine / mxfp4 arrays: row-major only, no
-    /// `.biases`.
+    /// Q4_0, Q8_0 and MXFP4 load as MLX affine / mxfp4 arrays: row-major only,
+    /// no `.biases`.
     pub(crate) fn is_kquant(self) -> bool {
-        !matches!(self, Self::Q8_0 | Self::Mxfp4)
+        !matches!(self, Self::Q4_0 | Self::Q8_0 | Self::Mxfp4)
     }
 }
 
@@ -65,12 +67,13 @@ pub(crate) fn gpu_kind_for(t: GgufTensorType) -> Option<GpuRepackKind> {
         GgufTensorType::IQ3S => Some(GpuRepackKind::Iq3S),
         GgufTensorType::Q8_0 => Some(GpuRepackKind::Q8_0),
         GgufTensorType::MXFP4 => Some(GpuRepackKind::Mxfp4),
+        GgufTensorType::Q4_0 => Some(GpuRepackKind::Q4_0),
         _ => None,
     }
 }
 
-/// A band's staging byte offset must be a multiple of this (the kernel's
-/// widest source load).
+/// A band's staging byte offset must be a multiple of this. Q4_0 aligns its
+/// word loads down and uses 16-bit scale/tail loads, so 2 bytes suffice.
 pub(crate) fn band_offset_rule(kind: GpuRepackKind) -> usize {
     match kind {
         GpuRepackKind::Q4K | GpuRepackKind::Q5K => 16,
@@ -79,7 +82,8 @@ pub(crate) fn band_offset_rule(kind: GpuRepackKind) -> usize {
         | GpuRepackKind::Q3K
         | GpuRepackKind::Iq4Nl
         | GpuRepackKind::Iq3S
-        | GpuRepackKind::Q8_0 => 2,
+        | GpuRepackKind::Q8_0
+        | GpuRepackKind::Q4_0 => 2,
         GpuRepackKind::Mxfp4 => 1,
     }
 }
@@ -95,13 +99,14 @@ fn kernel_id(kind: GpuRepackKind, layout: OutLayout) -> Result<i32> {
         GpuRepackKind::Q3K => 8,
         GpuRepackKind::Iq4Nl => 10,
         GpuRepackKind::Iq3S => 12,
-        GpuRepackKind::Q8_0 | GpuRepackKind::Mxfp4 if tiled => {
+        GpuRepackKind::Q4_0 | GpuRepackKind::Q8_0 | GpuRepackKind::Mxfp4 if tiled => {
             return Err(Error::from_reason(format!(
                 "{kind:?} has no Tiled64 repack kernel"
             )));
         }
         GpuRepackKind::Q8_0 => return Ok(14),
         GpuRepackKind::Mxfp4 => return Ok(15),
+        GpuRepackKind::Q4_0 => return Ok(16),
     };
     Ok(base + i32::from(tiled))
 }
@@ -307,7 +312,7 @@ pub(crate) fn gpu_repack_band(
 
 /// Every GPU kind.
 #[cfg(test)]
-const ALL_KINDS: [GpuRepackKind; 9] = [
+const ALL_KINDS: [GpuRepackKind; 10] = [
     GpuRepackKind::Q4K,
     GpuRepackKind::Q5K,
     GpuRepackKind::Q6K,
@@ -317,6 +322,7 @@ const ALL_KINDS: [GpuRepackKind; 9] = [
     GpuRepackKind::Iq3S,
     GpuRepackKind::Q8_0,
     GpuRepackKind::Mxfp4,
+    GpuRepackKind::Q4_0,
 ];
 
 /// GGUF bytes of one row of `k` values.
@@ -334,7 +340,7 @@ mod tests {
     use crate::utils::gguf_kquant::{KQuantScales, repack_kquant};
     use std::collections::HashMap;
 
-    const KINDS: [GpuRepackKind; 9] = ALL_KINDS;
+    const KINDS: [GpuRepackKind; 10] = ALL_KINDS;
 
     /// On macOS the GPU path must be there; elsewhere the GPU tests skip.
     fn require_gpu() -> bool {
@@ -440,7 +446,7 @@ mod tests {
 
     /// The CPU oracle: `repack_kquant`, tiled with `kquant_tile_rows` for
     /// Tiled64 (the converter's `tile_kquant_weights_for_disk` units); for
-    /// Q8_0 / MXFP4 `load_quantized_tensor`.
+    /// Q4_0 / Q8_0 / MXFP4 `load_quantized_tensor`.
     fn oracle(
         kind: GpuRepackKind,
         layout: OutLayout,
@@ -830,6 +836,22 @@ mod tests {
     }
 
     #[test]
+    fn gpu_q4_0_matches_cpu() {
+        if !require_gpu() {
+            return;
+        }
+        let info = tensor_info(GpuRepackKind::Q4_0, 3, 288);
+        let (dst, ptrs) = RepackDst::alloc(&info, OutLayout::RowMajor).unwrap();
+        assert!(
+            dst.biases.is_none() && ptrs.biases.is_none(),
+            "Q4_0 has no .biases"
+        );
+        assert!(RepackDst::alloc(&info, OutLayout::Tiled64).is_err());
+        row_major_cases(GpuRepackKind::Q4_0);
+        bands_of_one_staging(GpuRepackKind::Q4_0, OutLayout::RowMajor, &[3, 5, 1], 288, 2);
+    }
+
+    #[test]
     fn gpu_q8_0_matches_cpu() {
         if !require_gpu() {
             return;
@@ -881,6 +903,7 @@ mod tests {
             GpuRepackKind::Iq4Nl,
             GpuRepackKind::Q8_0,
             GpuRepackKind::Mxfp4,
+            GpuRepackKind::Q4_0,
         ] {
             let rows = 3usize;
             let k = if kind.gguf_type().block_size() == 32 {

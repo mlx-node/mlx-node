@@ -1636,7 +1636,7 @@ mod tests {
         }
     }
 
-    const GPU_SPECS: usize = 9;
+    const GPU_SPECS: usize = 10;
     const TILED: [&str; 4] = [
         "blk.0.q4k.weight",
         "blk.0.q6k.weight",

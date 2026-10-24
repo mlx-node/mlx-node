@@ -10,7 +10,7 @@
 // tensor written in any order give the same arrays as one whole-tensor band.
 // Every output byte must equal the CPU loader: gguf_kquant.rs KQuantRepacker
 // (then kquant_tile_rows for Tiled64) for the K-quants, gguf.rs
-// load_quantized_tensor for Q8_0 and MXFP4.
+// load_quantized_tensor for Q4_0, Q8_0 and MXFP4.
 
 #include <metal_stdlib>
 
@@ -504,8 +504,8 @@ static inline uint2 iq4xs_scales(uint w0, uint w1) {
 }
 
 // ---------------------------------------------------------------- 32-value blocks
-// IQ4_NL (18 B), Q8_0 (34 B) and MXFP4 (17 B) blocks cover 32 values: one
-// thread per block, kb = ku = blocks per row.
+// Q4_0 / IQ4_NL (18 B), Q8_0 (34 B) and MXFP4 (17 B) blocks cover 32 values:
+// one thread per block, kb = ku = blocks per row.
 
 // `ldu` for a run that ends at the block's last byte: when misaligned the
 // extra word is read as a 2-byte load, so nothing past the run is read.
@@ -532,6 +532,23 @@ static inline uint4 iq4nl_block(const device uint* r, uint B) {
   uint q[4];
   ldu_end<4>(r, B + 2u, q);
   return nib32(q[0], q[1], q[2], q[3]);
+}
+
+// Q4_0: d @0, qs @2 (16). `.weight` codes match IQ4_NL, `.scales` = d
+// (float16), no `.biases`; the loader derives the symmetric offset later.
+[[kernel]] void mlx_node_gguf_repack_q4_0(
+    const device uchar* staging [[buffer(0)]],
+    device uint* weight [[buffer(1)]],
+    device half* scales [[buffer(2)]],
+    constant GgufRepackParams& p [[buffer(4)]],
+    uint g [[thread_position_in_grid]]) {
+  if (g >= p.nb) return;
+  const device uint* r = word_base(staging, p.src_off);
+  uint B = (uint)(p.src_off & 3ul) + g * 18u;
+  ulong gb = (ulong)p.row0 * p.kb + g;
+  uint4 w = iq4nl_block(r, B);
+  ((device uint4*)weight)[gb] = w;
+  ((device ushort*)scales)[gb] = ldh(r, B);
 }
 
 [[kernel]] void mlx_node_gguf_repack_iq4nl(

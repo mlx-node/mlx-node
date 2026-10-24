@@ -62,6 +62,7 @@ constexpr KernelInfo kKernels[] = {
     {"mlx_node_gguf_repack_iq3s_t64", 256, 110, 24, 16, 2, 2, 8, true, ST::U8},
     {"mlx_node_gguf_repack_q8_0", 32, 34, 8, 2, 0, 2, 1, false, ST::F16},
     {"mlx_node_gguf_repack_mxfp4", 32, 17, 4, 1, 0, 1, 1, false, ST::U8},
+    {"mlx_node_gguf_repack_q4_0", 32, 18, 4, 2, 0, 2, 1, false, ST::F16},
 };
 constexpr int kKernelCount = int(sizeof(kKernels) / sizeof(kKernels[0]));
 
@@ -296,7 +297,7 @@ bool mlx_gguf_repack_available() {
 // `dst_w` / `dst_s` / `dst_b` (the whole tensor's arrays, row-major or
 // Tiled64 per `kernel`). `*out_w` / `*out_s` / `*out_b` receive lazy arrays
 // sharing the destination buffers; the caller adopts them in place of the
-// destination handles. Kernels without `.biases` (Q8_0, MXFP4) take null
+// destination handles. Kernels without `.biases` (Q4_0, Q8_0, MXFP4) take null
 // `dst_b` and leave `*out_b` null (`out_b` may then be null). Returns 0, or
 // nonzero with a message in `err`.
 int32_t mlx_gguf_repack_band(mlx_array* staging, uint64_t src_offset,

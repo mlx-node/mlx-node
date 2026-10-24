@@ -27,7 +27,7 @@ const REQUIRED_MODELS: [&str; 8] = [
     "muse-30b",
     "clef-flash",
 ];
-const GPU_TYPES: [GgufTensorType; 9] = [
+const GPU_TYPES: [GgufTensorType; 10] = [
     GgufTensorType::Q4K,
     GgufTensorType::Q5K,
     GgufTensorType::Q6K,
@@ -37,6 +37,7 @@ const GPU_TYPES: [GgufTensorType; 9] = [
     GgufTensorType::IQ3S,
     GgufTensorType::Q8_0,
     GgufTensorType::MXFP4,
+    GgufTensorType::Q4_0,
 ];
 
 type Manifest = BTreeMap<String, Value>;
@@ -1222,7 +1223,16 @@ clef-flash\t/models/clef.gguf\tClefModel\t-\tmodel=775 joint_head=122\n";
                 "{tensor_type:?} lost its GPU kind"
             );
         }
-        assert!(gpu_kind_for(GgufTensorType::Q4_0).is_none());
+        for tensor_type in [
+            GgufTensorType::Q4_1,
+            GgufTensorType::Q5_0,
+            GgufTensorType::Q5_1,
+        ] {
+            assert!(
+                gpu_kind_for(tensor_type).is_none(),
+                "{tensor_type:?} must retain its CPU route"
+            );
+        }
         let header = synthetic_header(vec![
             tensor("blk.0.ffn_gate.weight", &[256, 64], GgufTensorType::Q4K, 0),
             tensor(
@@ -1259,8 +1269,8 @@ clef-flash\t/models/clef.gguf\tClefModel\t-\tmodel=775 joint_head=122\n";
         ]);
         let plan = synthetic_plan(&["blk.1.ffn_down.weight"]);
         let expected = expected_routes("synthetic routes", &header, &plan, file_len(&header));
-        assert_eq!(expected.gpu_tensors, 3);
-        assert_eq!(expected.cpu_tensors, 4);
+        assert_eq!(expected.gpu_tensors, 4);
+        assert_eq!(expected.cpu_tensors, 3);
         assert!(expected.bytes > 0);
         let planned = planned_routes("synthetic routes", &header, &plan, file_len(&header));
         assert!(matches!(planned.routes[0], Route::Gpu(..)));
@@ -1270,6 +1280,7 @@ clef-flash\t/models/clef.gguf\tClefModel\t-\tmodel=775 joint_head=122\n";
             "the two-byte-misaligned Q4_K tensor must fall back to CPU"
         );
         assert!(matches!(planned.routes[3], Route::Gpu(..)));
+        assert!(matches!(planned.routes[4], Route::Gpu(..)));
     }
 
     #[test]
