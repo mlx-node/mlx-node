@@ -280,7 +280,8 @@ pub async fn calibrate_activation_amax_raw(
         // input_amax for its mxfp8 attn/GDN sites (agentworld etc.).
         "qwen3_5_moe" => {
             let model =
-                crate::models::qwen3_5_moe::persistence::load_with_thread(&model_path).await?;
+                crate::models::qwen3_5_moe::persistence::load_with_thread(&model_path, None, None)
+                    .await?;
             prefill_and_persist(&model_path, || async {
                 crate::model_thread::send_and_await(&model.thread, |reply| {
                     Qwen35MoeFamilyCommand::CalibratePrefillRaw {

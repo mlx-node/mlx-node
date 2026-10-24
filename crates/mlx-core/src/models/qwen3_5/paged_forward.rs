@@ -59,7 +59,11 @@ fn bytes_to_mib(bytes: f64) -> f64 {
 /// These callers are eager paged AR/MTP forwards; prefill and traced/training
 /// graphs keep their existing submission boundaries. Hidden-state dependencies
 /// include the layer's attention and cache writes, so no cache is published early.
-fn maybe_submit_paged_decode_layer(layer_idx: usize, num_layers: usize, hidden: &MxArray) {
+pub(crate) fn maybe_submit_paged_decode_layer(
+    layer_idx: usize,
+    num_layers: usize,
+    hidden: &MxArray,
+) {
     static EARLY_LAYERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let early_layers = *EARLY_LAYERS.get_or_init(|| {
         std::env::var("MLX_QWEN35_DECODE_EARLY_EVAL_LAYERS")

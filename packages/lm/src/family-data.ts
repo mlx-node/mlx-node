@@ -433,6 +433,7 @@ export const MODEL_FAMILY_DATA = [
     ggufArchitectures: ['qwen35moe'],
     ggufDiscovery: { variants: 'qwen35-xl' },
     match: { rawModelTypes: ['qwen3_5_moe'] },
+    acceptsDraftModel: true,
     coldRestoreEligible: true,
     streamOpts: { recordModelPath: true },
     traits: { reasoning: true, fallbackContextWindow: 262144 },

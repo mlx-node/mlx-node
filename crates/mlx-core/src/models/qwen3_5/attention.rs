@@ -31,7 +31,7 @@ use crate::transformer::paged_policy::{
 use napi::bindgen_prelude::*;
 
 use super::config::Qwen3_5Config;
-use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
+use crate::models::quantized_linear::{LinearProj, PreparedSg8, QuantizedLinear};
 
 /// Widest segmented SDPA query chunk this device supports for `gqa`; 0 when
 /// segmented SDPA is not supported here. Errors when its prebuilt kernels are
@@ -162,6 +162,58 @@ fn verify_shapeless_geometry(seq_len: i64, gqa: i64, head_dim: i32, device_max_q
     tail >= 1 && seq_len - tail <= vector_max_q
 }
 
+/// Gate while attention is a `[B,T,H,D]` view, before flattening heads.
+/// The compiled elementwise op writes row-contiguous output for these
+/// independently strided inputs, so its final reshape is a view. Flattening
+/// transposed attention first would materialize a separate reorder at T > 1.
+fn gate_verify_output(
+    gate: &MxArray,
+    output: &MxArray,
+    batch: i64,
+    seq_len: i64,
+    heads: i64,
+    head_dim: i64,
+) -> Result<MxArray> {
+    let gate = gate.reshape(&[batch, seq_len, heads, head_dim])?;
+    let output = output.transpose(Some(&[0, 2, 1, 3]))?;
+    Activations::sigmoid_mul_compiled(&gate, &output)?.reshape(&[batch, seq_len, heads * head_dim])
+}
+
+/// Optional producer-prepared native SG8 inputs. Unsupported shapes return to
+/// the existing gate; an evaluation error must propagate through fail-closed
+/// model recovery rather than retrying after a partially evaluated graph.
+fn gate_verify_output_prepared(
+    gate: &MxArray,
+    output: &MxArray,
+) -> Result<Option<(MxArray, PreparedSg8)>> {
+    if !std::env::var("MLX_ATTENTION_PREPARED_SG8").is_ok_and(|v| v == "1") {
+        return Ok(None);
+    }
+    let mut values = std::ptr::null_mut();
+    let mut packed = std::ptr::null_mut();
+    let mut sums = std::ptr::null_mut();
+    let result = unsafe {
+        mlx_sys::mlx_attention_sg8_prepare(
+            gate.as_raw_ptr(),
+            output.as_raw_ptr(),
+            &mut values,
+            &mut packed,
+            &mut sums,
+        )
+    };
+    match result {
+        0 => Ok(None),
+        1 if !values.is_null() && !packed.is_null() && !sums.is_null() => Ok(Some((
+            MxArray::from_handle(values, "attention SG8 values")?,
+            PreparedSg8 {
+                packed: MxArray::from_handle(packed, "attention SG8 packed")?,
+                sums: MxArray::from_handle(sums, "attention SG8 sums")?,
+            },
+        ))),
+        _ => Err(Error::from_reason("attention SG8 preparation failed")),
+    }
+}
+
 /// Qwen3.5 full attention with gating and partial RoPE.
 ///
 /// Key differences from standard Qwen3 attention:
@@ -176,6 +228,8 @@ pub struct Qwen3_5Attention {
 
     q_norm: RMSNorm, // [head_dim]
     k_norm: RMSNorm, // [head_dim]
+    // Alternate load-captured operands; native norm parameters remain intact.
+    source_qk: Option<(MxArray, MxArray, MxArray)>,
 
     rope: RoPE,
     /// Optional M-RoPE for VLM mode (3D position encoding: temporal, height, width)
@@ -389,6 +443,125 @@ fn select_cache_hit_prefill_plan(
 }
 
 impl Qwen3_5Attention {
+    pub(crate) fn validate_source_qk_weights(
+        &self,
+        q: &MxArray,
+        k: &MxArray,
+        frequencies: &MxArray,
+    ) -> Result<()> {
+        if self.num_heads != 16
+            || self.num_kv_heads != 2
+            || self.head_dim != 256
+            || self.mrope.is_some()
+            || self.rope.traditional
+            || self.rope.dims != 64
+            || self.rope.base.to_bits() != 10_000_000_f32.to_bits()
+            || self.rope.scale.to_bits() != 1_f32.to_bits()
+            || self.q_norm.eps_f32().to_bits() != 1e-6_f32.to_bits()
+            || self.k_norm.eps_f32().to_bits() != 1e-6_f32.to_bits()
+            || q.shape()?.as_ref() != [256]
+            || k.shape()?.as_ref() != [256]
+            || frequencies.shape()?.as_ref() != [32]
+            || q.dtype()? != DType::Float32
+            || k.dtype()? != DType::Float32
+            || frequencies.dtype()? != DType::Float32
+        {
+            return Err(Error::from_reason(
+                "source QK weights require measured text attention geometry and F32 operands",
+            ));
+        }
+        Ok(())
+    }
+
+    // The loader validates all layers before this infallible publication.
+    pub(crate) fn install_source_qk_weights(
+        &mut self,
+        q: MxArray,
+        k: MxArray,
+        frequencies: MxArray,
+    ) {
+        self.source_qk = Some((q, k, frequencies));
+    }
+
+    fn try_source_qk_norm_rope(
+        &self,
+        queries: &MxArray,
+        keys: &MxArray,
+        offsets: &MxArray,
+    ) -> Result<Option<(MxArray, MxArray)>> {
+        let Some((q_weight, k_weight, frequencies)) = &self.source_qk else {
+            return Ok(None);
+        };
+        if self.mrope.is_some()
+            || self.rope.traditional
+            || queries.shape()?.as_ref() != [1, 8, 16, 256]
+            || keys.shape()?.as_ref() != [1, 8, 2, 256]
+            || queries.dtype()? != DType::BFloat16
+            || keys.dtype()? != DType::BFloat16
+            || !unsafe { mlx_sys::mlx_source_qk_norm_rope_available() }
+        {
+            return Ok(None);
+        }
+        let (mut q, mut k) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let ok = unsafe {
+            mlx_sys::mlx_source_qk_norm_rope(
+                queries.as_raw_ptr(),
+                keys.as_raw_ptr(),
+                q_weight.as_raw_ptr(),
+                k_weight.as_raw_ptr(),
+                frequencies.as_raw_ptr(),
+                offsets.as_raw_ptr(),
+                &mut q,
+                &mut k,
+            )
+        };
+        if !ok || q.is_null() || k.is_null() {
+            unsafe {
+                if !q.is_null() {
+                    mlx_sys::mlx_array_delete(q);
+                }
+                if !k.is_null() {
+                    mlx_sys::mlx_array_delete(k);
+                }
+            }
+            // Selected source arithmetic never retries a native attention or
+            // mutates a KV frontier a second time after factory failure.
+            return Err(Error::from_reason(
+                "source QK norm/RoPE factory rejected selected inputs",
+            ));
+        }
+        let q = MxArray::from_handle(q, "source_qk:q")?;
+        let k = MxArray::from_handle(k, "source_qk:k")?;
+        Ok(Some((q, k)))
+    }
+
+    fn project_verify_output(
+        &self,
+        gate: &MxArray,
+        output: &MxArray,
+        batch: i64,
+        seq_len: i64,
+        residual: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        // Source Table16 prep has its own layout. Do not create a native pack
+        // that the source consumer cannot use.
+        if residual.is_none()
+            && self.o_proj.supports_prepared_sg8()
+            && let Some((values, prepared)) = gate_verify_output_prepared(gate, output)?
+        {
+            return self.o_proj.forward_prepared_sg8(&values, Some(&prepared));
+        }
+        let values = gate_verify_output(
+            gate,
+            output,
+            batch,
+            seq_len,
+            i64::from(self.num_heads),
+            i64::from(self.head_dim),
+        )?;
+        self.o_proj.forward_mixer_output(&values, None, residual)
+    }
+
     /// Unfused causal SDPA constructs its mask from host-side prefix lengths.
     /// Such a trace cannot be reused as the prefix grows. Keep
     /// shapeless replay only when every query chunk uses the fused primitive.
@@ -480,6 +653,7 @@ impl Qwen3_5Attention {
             o_proj: LinearProj::Standard(o_proj),
             q_norm,
             k_norm,
+            source_qk: None,
             rope,
             mrope: None,
             num_heads,
@@ -559,6 +733,49 @@ impl Qwen3_5Attention {
         Ok((self.k_proj.forward(x)?, self.v_proj.forward(x)?))
     }
 
+    /// One dispatch for heterogeneous quantized Q/gate, K and V. A merged
+    /// K/V projection remains one segment, preserving its split-K reduction.
+    fn project_mixer(
+        &self,
+        x: &MxArray,
+        batch: i64,
+        seq_len: i64,
+    ) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
+        if self.q_proj.has_q_gate_block_layout() {
+            let fused = if let Some((merged, _)) = &self.kv_proj {
+                crate::models::quantized_linear::mixed_projection_forward(
+                    x,
+                    &[&self.q_proj, merged],
+                )?
+            } else {
+                crate::models::quantized_linear::mixed_projection_forward(
+                    x,
+                    &[&self.q_proj, &self.k_proj, &self.v_proj],
+                )?
+            };
+            if let Some(outputs) = fused {
+                let hd = i64::from(self.num_heads * self.head_dim);
+                let qg = outputs[0].split_sections(&[hd], 2)?;
+                let queries = qg[0].reshape(&[
+                    batch,
+                    seq_len,
+                    i64::from(self.num_heads),
+                    i64::from(self.head_dim),
+                ])?;
+                let (keys, values) = if let Some((_, k_rows)) = &self.kv_proj {
+                    let kv = outputs[1].split_sections(&[*k_rows], 2)?;
+                    (kv[0].clone(), kv[1].clone())
+                } else {
+                    (outputs[1].clone(), outputs[2].clone())
+                };
+                return Ok((queries, qg[1].clone(), keys, values));
+            }
+        }
+        let (queries, gate) = self.project_q_gate(x, batch, seq_len)?;
+        let (keys, values) = self.project_kv(x)?;
+        Ok((queries, gate, keys, values))
+    }
+
     /// Merge `k_proj` + `v_proj` into one packed quantized projection when both
     /// are merge-compatible (`LinearProj::concat_rows`). The originals are
     /// replaced by row-slice views of the merged buffer, so per-projection
@@ -601,16 +818,33 @@ impl Qwen3_5Attention {
         cache: Option<&mut KVCache>,
         position_ids: Option<&MxArray>,
     ) -> Result<MxArray> {
+        self.forward_impl(x, mask, cache, position_ids, None)
+    }
+
+    /// Returns residual-inclusive hidden state; callers must not add again.
+    pub(crate) fn forward_source_residual(
+        &self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut KVCache>,
+        position_ids: Option<&MxArray>,
+        residual: &MxArray,
+    ) -> Result<MxArray> {
+        self.forward_impl(x, mask, cache, position_ids, Some(residual))
+    }
+
+    fn forward_impl(
+        &self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut KVCache>,
+        position_ids: Option<&MxArray>,
+        residual: Option<&MxArray>,
+    ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
 
-        // Project queries (2x width for gating), split into per-head
-        // queries [B,T,H,D] and flat gate [B,T,H*D]. See `project_q_gate`.
-        let (queries, gate) = self.project_q_gate(x, batch, seq_len)?;
-
-        // Project keys and values (one merged matmul when `finalize_kv_proj`
-        // packed the two quantized projections into `kv_proj`).
-        let (keys, values) = self.project_kv(x)?;
+        let (queries, gate, keys, values) = self.project_mixer(x, batch, seq_len)?;
 
         // Reshape to head format: [B, T, H, D]
         // queries already in [B, T, H, D] from per-head split above
@@ -627,58 +861,72 @@ impl Qwen3_5Attention {
             self.head_dim as i64,
         ])?;
 
-        // Apply QK normalization (operates on last dim)
-        let queries = self.q_norm.forward(&queries)?;
-        let keys = self.k_norm.forward(&keys)?;
-
-        // Apply RoPE: either M-RoPE (VLM) or standard scalar offset (text-only)
-        let (queries, keys) = if let (Some(pos_ids), Some(mrope)) = (position_ids, &self.mrope) {
-            // M-RoPE: compute cos/sin from 3D position IDs [3, B, T].
-            // Qwen3.5-VL uses the INTERLEAVED (stride-3) per-frequency axis
-            // selector, NOT PaddleOCR-VL's contiguous-chunk (sectioned) one.
-            let (cos, sin) = mrope.forward(&queries, pos_ids)?;
-            // Transpose to [B, H, T, D] for the rotary apply.
-            let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
-            let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
-            let (q_out, k_out) = apply_multimodal_rotary_pos_emb_interleaved(
-                &q_t,
-                &k_t,
-                &cos,
-                &sin,
-                mrope.mrope_section_arr().to_vec(),
-            )?;
-            // Transpose back to [B, T, H, D]
-            let q_out = q_out.transpose(Some(&[0, 2, 1, 3]))?;
-            let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;
-            (q_out, k_out)
+        let source_pair =
+            if self.source_qk.is_some() && position_ids.is_none() && batch == 1 && seq_len == 8 {
+                let offset = cache.as_ref().map_or(0, |c| c.get_offset());
+                let offsets = MxArray::from_int32(&[offset], &[1])?;
+                self.try_source_qk_norm_rope(&queries, &keys, &offsets)?
+            } else {
+                None
+            };
+        let (queries, keys) = if let Some(pair) = source_pair {
+            pair
         } else {
-            // Standard scalar-offset RoPE (text-only path).
-            //
-            // `fast::rope` varies the rotation position along axis -2 of its
-            // input, so it must see the [B, H, T, D] layout (token axis at
-            // -2) — matching mlx-lm's `self.rope(x.transpose(0, 2, 1, 3),
-            // offset)`. Applying it on [B, T, H, D] rotates along the HEAD
-            // axis instead: every token in a multi-token forward gets the
-            // same angle (offset + head_index), collapsing per-token
-            // positions. Transpose in, rotate, transpose back (the extra
-            // transposes are views; qwen3.5's partial rotary
-            // (rope_dims < head_dim) takes the rope kernel's copying
-            // `dims_ < D` branch either way, so the transposed input costs a
-            // strided rather than vector copy — the same price mlx-lm pays).
-            let offset = cache.as_ref().map_or(0, |c| c.get_offset());
-            let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
-            let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
-            let q_rot = self.rope.forward(&q_t, Some(offset))?;
-            let k_rot = self.rope.forward(&k_t, Some(offset))?;
-            (
-                q_rot.transpose(Some(&[0, 2, 1, 3]))?,
-                k_rot.transpose(Some(&[0, 2, 1, 3]))?,
-            )
-        };
+            // Apply QK normalization (operates on last dim)
+            let queries = self.q_norm.forward(&queries)?;
+            let keys = self.k_norm.forward(&keys)?;
 
-        // Transpose to [B, H, T, D] for KVCache and SDPA
-        let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
-        let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
+            // Apply RoPE: either M-RoPE (VLM) or standard scalar offset (text-only)
+            let (queries, keys) = if let (Some(pos_ids), Some(mrope)) = (position_ids, &self.mrope)
+            {
+                // M-RoPE: compute cos/sin from 3D position IDs [3, B, T].
+                // Qwen3.5-VL uses the INTERLEAVED (stride-3) per-frequency axis
+                // selector, NOT PaddleOCR-VL's contiguous-chunk (sectioned) one.
+                let (cos, sin) = mrope.forward(&queries, pos_ids)?;
+                // Transpose to [B, H, T, D] for the rotary apply.
+                let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
+                let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
+                let (q_out, k_out) = apply_multimodal_rotary_pos_emb_interleaved(
+                    &q_t,
+                    &k_t,
+                    &cos,
+                    &sin,
+                    mrope.mrope_section_arr().to_vec(),
+                )?;
+                // Transpose back to [B, T, H, D]
+                let q_out = q_out.transpose(Some(&[0, 2, 1, 3]))?;
+                let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;
+                (q_out, k_out)
+            } else {
+                // Standard scalar-offset RoPE (text-only path).
+                //
+                // `fast::rope` varies the rotation position along axis -2 of its
+                // input, so it must see the [B, H, T, D] layout (token axis at
+                // -2) — matching mlx-lm's `self.rope(x.transpose(0, 2, 1, 3),
+                // offset)`. Applying it on [B, T, H, D] rotates along the HEAD
+                // axis instead: every token in a multi-token forward gets the
+                // same angle (offset + head_index), collapsing per-token
+                // positions. Transpose in, rotate, transpose back (the extra
+                // transposes are views; qwen3.5's partial rotary
+                // (rope_dims < head_dim) takes the rope kernel's copying
+                // `dims_ < D` branch either way, so the transposed input costs a
+                // strided rather than vector copy — the same price mlx-lm pays).
+                let offset = cache.as_ref().map_or(0, |c| c.get_offset());
+                let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
+                let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
+                let q_rot = self.rope.forward(&q_t, Some(offset))?;
+                let k_rot = self.rope.forward(&k_t, Some(offset))?;
+                (
+                    q_rot.transpose(Some(&[0, 2, 1, 3]))?,
+                    k_rot.transpose(Some(&[0, 2, 1, 3]))?,
+                )
+            };
+
+            // Transpose to [B, H, T, D] for KVCache and SDPA
+            let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
+            let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
+            (queries, keys)
+        };
         let values = values.transpose(Some(&[0, 2, 1, 3]))?;
 
         // An int8 cache quantizes the block on write and reads the int8 rows
@@ -693,7 +941,9 @@ impl Qwen3_5Attention {
             let output =
                 output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
             let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
-            return self.o_proj.forward(&gated_output);
+            return self
+                .o_proj
+                .forward_mixer_output(&gated_output, None, residual);
         }
 
         // Update KV cache (expects [B, H, T, D])
@@ -777,7 +1027,8 @@ impl Qwen3_5Attention {
         let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
 
         // Output projection
-        self.o_proj.forward(&gated_output)
+        self.o_proj
+            .forward_mixer_output(&gated_output, None, residual)
     }
 
     /// SDPA of `queries` `[B, Hq, T, D]` over an int8 `KVCache` after
@@ -920,11 +1171,29 @@ impl Qwen3_5Attention {
         x: &MxArray,
         io: &mut AttentionVerifyIo<'_>,
     ) -> Result<MxArray> {
+        self.forward_verify_impl(x, io, None)
+    }
+
+    /// Explicit residual-inclusive output, including native shape fallbacks.
+    pub(crate) fn forward_verify_source_residual(
+        &self,
+        x: &MxArray,
+        io: &mut AttentionVerifyIo<'_>,
+        residual: &MxArray,
+    ) -> Result<MxArray> {
+        self.forward_verify_impl(x, io, Some(residual))
+    }
+
+    fn forward_verify_impl(
+        &self,
+        x: &MxArray,
+        io: &mut AttentionVerifyIo<'_>,
+        residual: Option<&MxArray>,
+    ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
 
-        let (queries, gate) = self.project_q_gate(x, batch, seq_len)?;
-        let (keys, values) = self.project_kv(x)?;
+        let (queries, gate, keys, values) = self.project_mixer(x, batch, seq_len)?;
         let keys = keys.reshape(&[
             batch,
             seq_len,
@@ -939,7 +1208,10 @@ impl Qwen3_5Attention {
         ])?;
         // One dispatch for q_norm + k_norm + rope(q) + rope(k), bit-identical
         // to the four-op chain below (its fallback).
-        let (queries, new_keys) = match self.fused_qk_norm_rope(&queries, &keys, io.rope_offsets) {
+        let source_pair = self.try_source_qk_norm_rope(&queries, &keys, io.rope_offsets)?;
+        let (queries, new_keys) = match source_pair
+            .or_else(|| self.fused_qk_norm_rope(&queries, &keys, io.rope_offsets))
+        {
             Some(fused) => fused,
             None => {
                 let queries = self.q_norm.forward(&queries)?;
@@ -982,11 +1254,7 @@ impl Qwen3_5Attention {
                 };
                 let output = segmented_sdpa_int8(&queries, &prefix, &new, self.scale, true)?;
                 *io.out_kv = Some(VerifyKvOut::Int8(new));
-                let output = output.transpose(Some(&[0, 2, 1, 3]))?;
-                let output =
-                    output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
-                let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
-                return self.o_proj.forward(&gated_output);
+                return self.project_verify_output(&gate, &output, batch, seq_len, residual);
             }
         };
         *io.out_kv = Some(VerifyKvOut::Bf16(new_keys.clone(), new_values.clone()));
@@ -1073,10 +1341,7 @@ impl Qwen3_5Attention {
             )?
         };
 
-        let output = output.transpose(Some(&[0, 2, 1, 3]))?;
-        let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
-        let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
-        self.o_proj.forward(&gated_output)
+        self.project_verify_output(&gate, &output, batch, seq_len, residual)
     }
 
     /// Forward pass routed through the block-paged KV adapter.
@@ -1134,12 +1399,7 @@ impl Qwen3_5Attention {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
 
-        // Project queries (2x width for gating), split into per-head
-        // queries / flat gate (matches forward(); see `project_q_gate`).
-        let (queries, gate) = self.project_q_gate(x, batch, seq_len)?;
-
-        // K/V projections + reshape to per-head layout.
-        let (keys, values) = self.project_kv(x)?;
+        let (queries, gate, keys, values) = self.project_mixer(x, batch, seq_len)?;
         let keys = keys.reshape(&[
             batch,
             seq_len,
@@ -1916,10 +2176,9 @@ impl Qwen3_5Attention {
             let mut value_rows = Vec::with_capacity(rows.len());
             for row in 0..rows.len() {
                 let x_row = x.slice_axis(0, row as i64, row as i64 + 1)?;
-                let (query, gate) = self.project_q_gate(&x_row, 1, seq_len)?;
+                let (query, gate, key_raw, value_raw) = self.project_mixer(&x_row, 1, seq_len)?;
                 query_rows.push(self.q_norm.forward(&query)?);
                 gate_rows.push(gate);
-                let (key_raw, value_raw) = self.project_kv(&x_row)?;
                 let key = key_raw.reshape(&[
                     1,
                     seq_len,
@@ -1941,9 +2200,8 @@ impl Qwen3_5Attention {
                 MxArray::concatenate_many(value_rows.iter().collect(), Some(0))?,
             )
         } else {
-            let (queries, gate) = self.project_q_gate(x, batch, seq_len)?;
+            let (queries, gate, key_raw, value_raw) = self.project_mixer(x, batch, seq_len)?;
             let queries = self.q_norm.forward(&queries)?;
-            let (key_raw, value_raw) = self.project_kv(x)?;
             let keys = self.k_norm.forward(&key_raw.reshape(&[
                 batch,
                 seq_len,
@@ -2081,10 +2339,20 @@ impl Qwen3_5Attention {
         self.o_proj.set_bias(b, "o_proj")
     }
     pub fn set_q_norm_weight(&mut self, w: &MxArray, compute_dtype: DType) -> Result<()> {
+        if self.source_qk.is_some() {
+            return Err(Error::from_reason(
+                "source QK norm operands are immutable; load a new model to change weights",
+            ));
+        }
         self.q_norm
             .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)
     }
     pub fn set_k_norm_weight(&mut self, w: &MxArray, compute_dtype: DType) -> Result<()> {
+        if self.source_qk.is_some() {
+            return Err(Error::from_reason(
+                "source QK norm operands are immutable; load a new model to change weights",
+            ));
+        }
         self.k_norm
             .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)
     }
@@ -2226,6 +2494,12 @@ impl Qwen3_5Attention {
         )
     }
 }
+
+#[cfg(test)]
+mod gate_layout_tests;
+
+#[cfg(test)]
+mod target_schedule_tests;
 
 #[cfg(test)]
 mod kv_int8_tests;
@@ -5200,6 +5474,68 @@ mod tests {
     }
 
     #[test]
+    fn mixed_projection_dense_attention_hook_preserves_q_gate_and_kv_views() -> Result<()> {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        let mut cfg = tiny_cfg();
+        cfg.hidden_size = 1024;
+        cfg.head_dim = 64;
+        cfg.num_heads = 4;
+        cfg.num_kv_heads = 2;
+        let make = |n: i64, seed: u32| -> Result<QuantizedLinear> {
+            let k = 1024;
+            let mut state = seed;
+            let mut next = || {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                state
+            };
+            let w = (0..n * k / 8).map(|_| next()).collect::<Vec<_>>();
+            let scales = (0..n * k / 16)
+                .map(|_| (next() % 48 + 1) as u8)
+                .collect::<Vec<_>>();
+            let biases = vec![0x1800u16; (n * k / 128) as usize];
+            let mut q = QuantizedLinear::new(
+                MxArray::from_uint32(&w, &[n, k / 8])?,
+                MxArray::from_uint8(&scales, &[n, k / 16])?,
+                Some(MxArray::from_float16(&biases, &[n, k / 128])?),
+                None,
+                32,
+                4,
+                "q4k".to_string(),
+            );
+            assert!(q.tile_kquant_layout()?);
+            Ok(q)
+        };
+        for merged_kv in [false, true] {
+            let mut attention = Qwen3_5Attention::new(&cfg)?;
+            attention.set_quantized_q_proj(make(512, 17)?);
+            attention.set_quantized_k_proj(make(128, 23)?);
+            attention.set_quantized_v_proj(make(128, 29)?);
+            attention.finalize_q_gate_block()?;
+            if merged_kv {
+                attention.finalize_kv_proj()?;
+            }
+            let x = MxArray::from_float32(
+                &(0..8192)
+                    .map(|i| ((i as f32) * 0.017).sin())
+                    .collect::<Vec<_>>(),
+                &[1, 8, 1024],
+            )?
+            .astype(DType::BFloat16)?;
+            let (q, g, k, v) = attention.project_mixer(&x, 1, 8)?;
+            let (rq, rg) = attention.project_q_gate(&x, 1, 8)?;
+            let (rk, rv) = attention.project_kv(&x)?;
+            MxArray::eval_arrays(&[&q, &g, &k, &v, &rq, &rg, &rk, &rv])?;
+            for (actual, expected) in [(&q, &rq), (&g, &rg), (&k, &rk), (&v, &rv)] {
+                assert_eq!(actual.shape()?.as_ref(), expected.shape()?.as_ref());
+                assert_eq!(actual.to_uint16_native()?, expected.to_uint16_native()?);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn q4k_quantized_q_gate_block_matches_native_h4_with_bias() -> Result<()> {
         use crate::utils::gguf_kquant::{KQuantFormat, KQuantScales, repack_kquant};
 
@@ -5374,6 +5710,161 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+    #[test]
+    fn source_mixer_attention_fallback_preserves_bf16_kv_frontier() -> Result<()> {
+        let cfg = tiny_cfg();
+        let mut attention = Qwen3_5Attention::new(&cfg)?;
+        let bf = |shape: &[i64], seed: usize| -> Result<MxArray> {
+            let n = shape.iter().product::<i64>() as usize;
+            MxArray::from_float32(
+                &(0..n)
+                    .map(|i| ((i * 7 + seed) % 37) as f32 * 0.015625 - 0.25)
+                    .collect::<Vec<_>>(),
+                shape,
+            )?
+            .astype(DType::BFloat16)
+        };
+        attention.set_q_proj_weight(&bf(&[64, 32], 3)?)?;
+        attention.set_k_proj_weight(&bf(&[16, 32], 7)?)?;
+        attention.set_v_proj_weight(&bf(&[16, 32], 11)?)?;
+        attention.set_o_proj_weight(&bf(&[32, 32], 17)?)?;
+        let norm = MxArray::ones(&[8], Some(DType::BFloat16))?;
+        attention.set_q_norm_weight(&norm, DType::BFloat16)?;
+        attention.set_k_norm_weight(&norm, DType::BFloat16)?;
+        let mut reference = KVCache::new();
+        let mut fused = KVCache::new();
+        for rows in [1, 7, 8, 33, 8] {
+            let x = bf(&[1, rows, 32], rows as usize)?;
+            let residual = bf(&[1, rows, 32], rows as usize + 19)?;
+            let delta = attention.forward(&x, None, Some(&mut reference), None)?;
+            let hidden =
+                attention.forward_source_residual(&x, None, Some(&mut fused), None, &residual)?;
+            assert_eq!(
+                hidden.to_uint16_native()?,
+                residual.add(&delta)?.to_uint16_native()?
+            );
+            assert_eq!(reference.get_offset(), fused.get_offset());
+            for (a, b) in [
+                (reference.keys_ref().unwrap(), fused.keys_ref().unwrap()),
+                (reference.values_ref().unwrap(), fused.values_ref().unwrap()),
+            ] {
+                // Only the committed prefix is initialized in spare-capacity buffers.
+                let end = reference.get_offset() as i64;
+                assert_eq!(
+                    a.slice_axis(2, 0, end)?.to_uint16_native()?,
+                    b.slice_axis(2, 0, end)?.to_uint16_native()?
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn source_qk_operands_preserve_native_fallback_and_eager_kv_frontier() -> Result<()> {
+        if !unsafe { mlx_sys::mlx_source_qk_norm_rope_available() } {
+            return Ok(());
+        }
+        let mut cfg = tiny_cfg();
+        cfg.head_dim = 256;
+        cfg.num_heads = 16;
+        cfg.num_kv_heads = 2;
+        cfg.partial_rotary_factor = 0.25;
+        cfg.rope_theta = 10_000_000.0;
+        cfg.rms_norm_eps = 1e-6;
+        let mut attn = Qwen3_5Attention::new(&cfg)?;
+        let bf = |shape: &[i64], seed: usize| -> Result<MxArray> {
+            let count = shape.iter().product::<i64>() as usize;
+            MxArray::from_float32(
+                &(0..count)
+                    .map(|i| (((i * 7 + seed) % 41) as f32 - 20.0) * 0.0078125)
+                    .collect::<Vec<_>>(),
+                shape,
+            )?
+            .astype(DType::BFloat16)
+        };
+        attn.set_q_proj_weight(&bf(&[8192, 32], 3)?)?;
+        attn.set_k_proj_weight(&bf(&[512, 32], 5)?)?;
+        attn.set_v_proj_weight(&bf(&[512, 32], 7)?)?;
+        attn.set_o_proj_weight(&bf(&[32, 4096], 11)?)?;
+        let source_q = MxArray::from_float32(
+            &(0..256)
+                .map(|i| 1.0 + (i % 17) as f32 * 0.00031)
+                .collect::<Vec<_>>(),
+            &[256],
+        )?;
+        let source_k = MxArray::from_float32(
+            &(0..256)
+                .map(|i| 1.0 + (i % 23) as f32 * 0.00037)
+                .collect::<Vec<_>>(),
+            &[256],
+        )?;
+        let frequencies = MxArray::from_float32(
+            &(0..32)
+                .map(|i| 10_000_000_f32.powf(-(i as f32) / 32.0))
+                .collect::<Vec<_>>(),
+            &[32],
+        )?;
+        attn.set_q_norm_weight(&source_q, DType::BFloat16)?;
+        attn.set_k_norm_weight(&source_k, DType::BFloat16)?;
+        let original_q = attn.get_q_norm_weight().to_uint16_native()?;
+        let original_k = attn.get_k_norm_weight().to_uint16_native()?;
+        attn.validate_source_qk_weights(&source_q, &source_k, &frequencies)?;
+        let mut native_cache = KVCache::new();
+        let mut selected_cache = KVCache::new();
+        for rows in [1, 7, 33] {
+            let x = bf(&[1, rows, 32], rows as usize)?;
+            attn.source_qk = None;
+            let native = attn.forward(&x, None, Some(&mut native_cache), None)?;
+            attn.install_source_qk_weights(source_q.clone(), source_k.clone(), frequencies.clone());
+            let selected = attn.forward(&x, None, Some(&mut selected_cache), None)?;
+            assert_eq!(native.to_uint16_native()?, selected.to_uint16_native()?);
+            assert_eq!(native_cache.get_offset(), selected_cache.get_offset());
+            let end = selected_cache.get_offset() as i64;
+            assert_eq!(
+                native_cache
+                    .keys_ref()
+                    .unwrap()
+                    .slice_axis(2, 0, end)?
+                    .to_uint16_native()?,
+                selected_cache
+                    .keys_ref()
+                    .unwrap()
+                    .slice_axis(2, 0, end)?
+                    .to_uint16_native()?
+            );
+        }
+        assert_eq!(attn.get_q_norm_weight().to_uint16_native()?, original_q);
+        assert_eq!(attn.get_k_norm_weight().to_uint16_native()?, original_k);
+        assert!(attn.set_q_norm_weight(&source_q, DType::BFloat16).is_err());
+        assert!(attn.set_k_norm_weight(&source_k, DType::BFloat16).is_err());
+        assert!(attn.source_qk.is_some());
+        let x = bf(&[1, 8, 32], 29)?;
+        let before = selected_cache.get_offset();
+        let (queries, _, keys, _) = attn.project_mixer(&x, 1, 8)?;
+        let keys = keys.reshape(&[1, 8, 2, 256])?;
+        let offsets = MxArray::from_int32(&[before], &[1])?;
+        let (_, expected_keys) = attn
+            .try_source_qk_norm_rope(&queries, &keys, &offsets)?
+            .expect("strict T8 must select source QK");
+        let invalid = offsets.astype(DType::Float32)?;
+        assert!(
+            attn.try_source_qk_norm_rope(&queries, &keys, &invalid)
+                .is_err()
+        );
+        let result = attn.forward(&x, None, Some(&mut selected_cache), None)?;
+        result.eval();
+        assert_eq!(selected_cache.get_offset(), before + 8);
+        assert_eq!(
+            selected_cache
+                .keys_ref()
+                .unwrap()
+                .slice_axis(2, before as i64, (before + 8) as i64)?
+                .to_uint16_native()?,
+            expected_keys.to_uint16_native()?
+        );
+        assert_eq!(attn.get_q_norm_weight().to_uint16_native()?, original_q);
         Ok(())
     }
 }

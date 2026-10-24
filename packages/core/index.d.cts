@@ -1711,18 +1711,16 @@ export declare class Qwen35MoeModel {
    */
   hasBlockPagedCache(): boolean;
   /**
-   * Native admission width for plain text autoregressive turns. MTP and
-   * multimodal turns remain ordered barriers and do not enter the batched
-   * decode lane.
+   * Native admission width for plain text autoregressive turns. Native
+   * MTP, DFlash2 and multimodal turns retain their speculative or exclusive
+   * admission policy instead of using this plain autoregressive width.
    */
   maxConcurrentSequences(): number;
   /**
-   * Whether this checkpoint shipped an MTP head (module loaded by
-   * `persistence::apply_weights_moe_inner`). Snapshotted at load time from
-   * `Qwen35MoeInner::has_mtp_weights()` so the TS `ChatSession` can
-   * auto-default `enableMtp = true` for MTP-capable checkpoints without
-   * dispatching a command into the model thread. Mirrors
-   * `Qwen3_5Model::has_mtp_weights`.
+   * Whether this instance has a native MTP head or a loaded DFlash2
+   * companion. Snapshotted at load time so the TS `ChatSession` can
+   * auto-default `enableMtp = true` without dispatching a command into the
+   * model thread. Mirrors `Qwen3_5Model::has_mtp_weights`.
    *
    * Note: this only reports weight availability. Whether the
    * speculative-decode path actually runs on a given call also requires
@@ -1751,7 +1749,7 @@ export declare class Qwen35MoeModel {
    * cache (mirroring the dense Qwen3.5 loader), and the cache directory is
    * what the model thread reads.
    */
-  static load(path: string): Promise<Qwen35MoeModel>;
+  static load(path: string, options?: Qwen35LoadOptions | undefined | null): Promise<Qwen35MoeModel>;
   /** Generate text from a prompt token sequence. */
   generate(promptTokens: MxArray, config: Qwen35MoeGenerationConfig): Promise<Qwen35MoeGenerationResult>;
   /**
@@ -5095,13 +5093,15 @@ export interface Qwen35GenerationResult {
 }
 
 export interface Qwen35LoadOptions {
-  /** External z-lab DFlash2 checkpoint directory. */
+  /** External DFlash2 checkpoint directory compatible with the target model. */
   draftModelPath?: string;
   /**
    * Element format of the flat full-attention K/V cache: `'int8'`
    * (per-token symmetric int8 rows with one fp32 scale each — half the
-   * K/V memory and read bandwidth) or `'bf16'`. Unset: int8 on Metal with
-   * 256-wide heads, BF16 elsewhere. The block-paged cache ignores it.
+   * K/V memory and read bandwidth) or `'bf16'`. When neither this option
+   * nor checkpoint config specifies a format, dense Qwen defaults to int8
+   * on Metal with 256-wide heads and BF16 elsewhere; MoE defaults to BF16.
+   * The block-paged cache ignores it.
    */
   kvFormat?: 'int8' | 'bf16' | undefined;
 }
@@ -5207,6 +5207,11 @@ export interface Qwen35MoeConfig {
    * packed weights.
    */
   qwen35GgufGdnLayout?: string | undefined;
+  /**
+   * Flat full-attention cache format. MoE keeps BF16 by default;
+   * `int8` enables per-row quantized K/V for compatible Metal heads.
+   */
+  kvFormat?: string | undefined;
 }
 
 /** Generation configuration for Qwen3.5 MoE */
@@ -5690,7 +5695,7 @@ export interface SchedulerStats {
  * would otherwise report a finite, plausible number measured on the wrong
  * text.
  *
- * `kv_format` (`"int8"` / `"bf16"`; unset = the load default) selects the dense qwen3_5
+ * `kv_format` (`"int8"` / `"bf16"`; unset = the load default) selects the Qwen dense or MoE
  * candidate's flat K/V cache format, so the int8 cache can be scored against
  * the same teacher cache as the BF16 one.
  */

@@ -67,6 +67,50 @@ fn penalized_greedy_accept(
     unreachable!("the bonus row has no corresponding draft")
 }
 
+/// Budgeted greedy acceptance never reads target rows outside the valid prefix.
+/// The final valid row can label one further draft, but its prediction must be
+/// emitted as the boundary because its own cache slot is not part of the prefix.
+fn accept_device_budgeted_greedy(
+    logits: &MxArray,
+    proposal: &mut DsparkProposal,
+    budget: &MxArray,
+) -> Result<(usize, u32, usize, usize)> {
+    let draft_len = proposal.draft_len()?;
+    if logits.ndim()? != 3
+        || logits.shape_at(0)? != 1
+        || logits.shape_at(1)? != (draft_len + 1) as i64
+        || budget.dtype()? != DType::Int32
+        || budget.size()? != 1
+    {
+        return Err(Error::from_reason(
+            "invalid device verification budget contract",
+        ));
+    }
+    let argmax = logits.argmax(-1, None)?;
+    MxArray::eval_arrays_with_context(&[&argmax, budget], "speculative_budgeted_greedy_accept")?;
+    let rows = usize::try_from(budget.item_at_int32(0)?)
+        .map_err(|_| Error::from_reason("negative device verification row budget"))?;
+    if rows == 0 || rows > draft_len + 1 {
+        return Err(Error::from_reason(
+            "device verification budget exceeds physical rows",
+        ));
+    }
+    proposal.materialize_draft_ids()?;
+    let mut raw_matches = 0;
+    while raw_matches < rows.min(draft_len)
+        && argmax.item_at_int32(raw_matches)? == proposal.draft_ids[raw_matches]
+    {
+        raw_matches += 1;
+    }
+    let accepted = raw_matches.min(rows - 1);
+    Ok((
+        accepted,
+        argmax.item_at_int32(accepted)? as u32,
+        rows,
+        raw_matches,
+    ))
+}
+
 /// Shared whole-turn and scheduler acceptance. Probability/penalty work stays
 /// on device; only proposal and boundary token ids cross to the engine.
 ///
@@ -907,12 +951,30 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         // Acceptance: `k` accepted drafts (prefix of `draft_ids`) + ONE
         // boundary token (bonus on full accept, residual on rejection).
         profiler.begin("dspark_accept");
+        let mut device_budget_observation = None;
         let accept_res = if force_think_end {
             // Force the verify graph before retaining its anchor's cache state.
             logits.eval();
             Ok((0, tracker.forced_token_id()?))
         } else if tf_ids.is_some() {
             tf.accept(&logits, &mut proposal, generated)
+        } else if let Some(budget) = step.device_verification_budget() {
+            let temperature = p.sampling_config.and_then(|c| c.temperature).unwrap_or(1.0);
+            if !sampling::is_greedy_temperature(temperature)
+                || p.repetition_penalty != 1.0
+                || p.presence_penalty != 0.0
+                || p.frequency_penalty != 0.0
+            {
+                return Err(Error::from_reason(
+                    "device verification budgeting requires unpenalized greedy acceptance",
+                ));
+            }
+            accept_device_budgeted_greedy(&logits, &mut proposal, budget).map(
+                |(k, token, rows, raw)| {
+                    device_budget_observation = Some((rows, raw));
+                    (k, token)
+                },
+            )
         } else {
             accept_dspark_proposal(&logits, &mut proposal, hist, p, rng)
         };
@@ -999,6 +1061,20 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         };
         profiler.end();
         commit_res?;
+        let device_budget_observation = match device_budget_observation {
+            Some((rows, raw_matches)) => {
+                // Charge this cycle's committed GPU work before host-only emission.
+                // Boundary submission includes the rollback and draft-context roots.
+                let boundary = MxArray::from_int32(&[boundary_id as i32], &[1])?;
+                profiler.begin("dspark_eval_boundary");
+                step.eval_boundary(&boundary);
+                profiler.end();
+                crate::array::synchronize();
+                let milliseconds = cycle_started_at.elapsed().as_secs_f64() * 1000.0;
+                Some((rows, raw_matches, milliseconds))
+            }
+            None => None,
+        };
         if tf.is_forcing() {
             tf.end_cycle(cycle_started_at.elapsed());
         }
@@ -1133,6 +1209,9 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         last_in_cache = emit_count <= kept_drafts;
 
         if let Some(kind) = stop {
+            if let Some((rows, raw_matches, milliseconds)) = device_budget_observation {
+                step.observe_device_verification(rows, raw_matches, milliseconds)?;
+            }
             match kind {
                 CycleStop::Length => {
                     if reason.is_empty() {
@@ -1149,10 +1228,15 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
 
         // Continue: the boundary becomes the next cycle's anchor.
         anchor = boundary_id;
-        let y_arr = MxArray::from_int32(&[boundary_id as i32], &[1])?;
-        profiler.begin("dspark_eval_boundary");
-        step.eval_boundary(&y_arr);
-        profiler.end();
+        if device_budget_observation.is_none() {
+            let y_arr = MxArray::from_int32(&[boundary_id as i32], &[1])?;
+            profiler.begin("dspark_eval_boundary");
+            step.eval_boundary(&y_arr);
+            profiler.end();
+        }
+        if let Some((rows, raw_matches, milliseconds)) = device_budget_observation {
+            step.observe_device_verification(rows, raw_matches, milliseconds)?;
+        }
         profiler.end();
     }
 
@@ -1547,6 +1631,13 @@ mod tests {
         EvalBoundary {
             token: i32,
         },
+        ObserveDeviceVerification {
+            rows: usize,
+            raw_matches: usize,
+            milliseconds_bits: u64,
+            synchronize_calls: u32,
+            committed_state_available: bool,
+        },
     }
 
     /// Canned per-cycle script.
@@ -1632,6 +1723,9 @@ mod tests {
         /// Emit `device_draft_ids` instead of host ids — exercises the
         /// engine's `verify_device` dispatch and post-eval materialization.
         emit_device_proposals: bool,
+        device_budget_enabled: bool,
+        verify_row_budget: Option<MxArray>,
+        pending_committed_state: RefCell<Option<MxArray>>,
         ledger: Rc<RefCell<Vec<Call>>>,
     }
 
@@ -1713,7 +1807,7 @@ mod tests {
             &mut self,
             anchor_id: u32,
             max_len: usize,
-            _params: &ChatParams,
+            params: &ChatParams,
             _rng: &mut dyn rand::Rng,
         ) -> Result<DsparkProposal> {
             if self.ar_fallback {
@@ -1727,6 +1821,9 @@ mod tests {
                 max_len,
             });
             let script = self.script();
+            self.verify_row_budget = (self.device_budget_enabled && params.mtp_adaptive_depth)
+                .then(|| MxArray::from_int32(&[script.draft_ids.len() as i32 + 1], &[1]))
+                .transpose()?;
             let draft_dists = script
                 .draft_dists
                 .iter()
@@ -1771,11 +1868,46 @@ mod tests {
             self.scripted_verify_output(len)
         }
 
+        fn device_verification_budget(&self) -> Option<&MxArray> {
+            self.verify_row_budget.as_ref()
+        }
+
+        fn observe_device_verification(
+            &mut self,
+            rows: usize,
+            raw_matches: usize,
+            milliseconds: f64,
+        ) -> Result<()> {
+            let pending = self
+                .pending_committed_state
+                .take()
+                .ok_or_else(|| Error::from_reason("mock observation has no committed state"))?;
+            let committed_state_available =
+                unsafe { mlx_sys::mlx_array_is_available(pending.as_raw_ptr()) };
+            let synchronize_calls =
+                crate::array::memory::TEST_SYNCHRONIZE_CALLS.with(|calls| calls.get());
+            self.ledger
+                .borrow_mut()
+                .push(Call::ObserveDeviceVerification {
+                    rows,
+                    raw_matches,
+                    milliseconds_bits: milliseconds.to_bits(),
+                    synchronize_calls,
+                    committed_state_available,
+                });
+            self.verify_row_budget = None;
+            Ok(())
+        }
+
         fn commit(&mut self, keep: usize, total_written: usize) -> Result<()> {
             self.ledger.borrow_mut().push(Call::Commit {
                 keep,
                 total: total_written,
             });
+            if self.verify_row_budget.is_some() {
+                let pending = MxArray::from_int32(&[keep as i32], &[1])?.add_scalar(1.0)?;
+                *self.pending_committed_state.borrow_mut() = Some(pending);
+            }
             self.cursor.set(self.cursor.get() + 1);
             Ok(())
         }
@@ -1804,7 +1936,12 @@ mod tests {
         }
 
         fn eval_boundary(&self, token: &MxArray) {
-            token.eval();
+            let pending = self.pending_committed_state.borrow();
+            if let Some(pending) = pending.as_ref() {
+                MxArray::async_eval_arrays(&[token, pending]);
+            } else {
+                token.eval();
+            }
             let id = token.item_at_int32(0).unwrap_or(-1);
             self.ledger
                 .borrow_mut()
@@ -1840,6 +1977,7 @@ mod tests {
         draft_block_size: Option<usize>,
         /// Forwarded to the stepper — proposals carry `device_draft_ids`.
         emit_device_proposals: bool,
+        device_budget_enabled: bool,
         ledger: Rc<RefCell<Vec<Call>>>,
         begin_calls: Cell<usize>,
         /// `block_size` observed by `begin_dspark_decode` (setup plumbing).
@@ -1859,6 +1997,7 @@ mod tests {
                 reserve_exhausted_from: None,
                 draft_block_size: None,
                 emit_device_proposals: false,
+                device_budget_enabled: false,
                 ledger: Rc::new(RefCell::new(Vec::new())),
                 begin_calls: Cell::new(0),
                 seen_block_size: Cell::new(usize::MAX),
@@ -1889,6 +2028,11 @@ mod tests {
         /// dispatch `verify_device` and materialize ids post-eval.
         fn with_device_proposals(mut self) -> Self {
             self.emit_device_proposals = true;
+            self
+        }
+
+        fn with_device_budget(mut self) -> Self {
+            self.device_budget_enabled = true;
             self
         }
 
@@ -1998,6 +2142,9 @@ mod tests {
                 reserve_exhausted_from: self.reserve_exhausted_from,
                 reserve_calls: Cell::new(0),
                 emit_device_proposals: self.emit_device_proposals,
+                device_budget_enabled: self.device_budget_enabled,
+                verify_row_budget: None,
+                pending_committed_state: RefCell::new(None),
                 ledger: Rc::clone(&self.ledger),
             })
         }
@@ -2381,6 +2528,99 @@ mod tests {
         );
         let (_, _, cycles) = out.acceptance.expect("fixed DSpark cycle profiled");
         assert_eq!(cycles, 1);
+    }
+
+    #[test]
+    fn device_budget_observation_settles_commit_without_changing_fixed_schedule() {
+        fn observations(ledger: &[Call]) -> Vec<(usize, usize, f64, u32, bool)> {
+            ledger
+                .iter()
+                .filter_map(|call| match call {
+                    Call::ObserveDeviceVerification {
+                        rows,
+                        raw_matches,
+                        milliseconds_bits,
+                        synchronize_calls,
+                        committed_state_available,
+                    } => Some((
+                        *rows,
+                        *raw_matches,
+                        f64::from_bits(*milliseconds_bits),
+                        *synchronize_calls,
+                        *committed_state_available,
+                    )),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let scripts = vec![
+            CycleScript::greedy(vec![4, 5], vec![4, 5, 6]),
+            CycleScript::greedy(vec![7, 8], vec![7, 8, 9]),
+        ];
+        let mut backend = MockDsparkBackend::greedy(16, scripts.clone()).with_device_budget();
+        let mut params = greedy_params();
+        params.max_new_tokens = 7;
+        params.mtp_depth = 2;
+        params.mtp_adaptive_depth = true;
+        crate::array::memory::TEST_SYNCHRONIZE_CALLS.with(|calls| calls.set(0));
+        let out = drive_turn(&mut backend, params.clone(), 3, 15, 2);
+
+        assert_eq!(out.generated, vec![3, 4, 5, 6, 7, 8, 9]);
+        let observed = observations(&out.ledger);
+        assert_eq!(observed.len(), 2);
+        for (index, &(rows, raw_matches, milliseconds, synchronizes, available)) in
+            observed.iter().enumerate()
+        {
+            assert_eq!((rows, raw_matches), (3, 2));
+            assert!(milliseconds.is_finite() && milliseconds > 0.0);
+            assert_eq!(synchronizes, index as u32 + 1);
+            assert!(
+                available,
+                "cycle {index} observed an unfinished committed root"
+            );
+        }
+        let first_observation = out
+            .ledger
+            .iter()
+            .position(|call| matches!(call, Call::ObserveDeviceVerification { .. }))
+            .expect("first observation");
+        let second_proposal = out
+            .ledger
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| matches!(call, Call::Propose { .. }))
+            .nth(1)
+            .map(|(index, _)| index)
+            .expect("second proposal");
+        assert!(first_observation < second_proposal);
+        crate::array::memory::TEST_SYNCHRONIZE_CALLS.with(|calls| assert_eq!(calls.get(), 2));
+
+        // The terminal path uses the same committed-state boundary and must
+        // not leave its observation for finish or a later turn.
+        let mut stopping =
+            MockDsparkBackend::greedy(16, vec![scripts[0].clone()]).with_device_budget();
+        crate::array::memory::TEST_SYNCHRONIZE_CALLS.with(|calls| calls.set(0));
+        let stopped = drive_turn(&mut stopping, params, 3, 6, 2);
+        assert_eq!(stopped.generated, vec![3, 4, 5, 6]);
+        assert_eq!(stopped.finish_reason, "stop");
+        let observed = observations(&stopped.ledger);
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].3, 1);
+        assert!(observed[0].4);
+
+        // A fixed-depth request on the same stepper adds neither an adaptive
+        // synchronization nor an observation.
+        let mut fixed =
+            MockDsparkBackend::greedy(16, vec![scripts[0].clone()]).with_device_budget();
+        let mut fixed_params = greedy_params();
+        fixed_params.max_new_tokens = 4;
+        fixed_params.mtp_depth = 2;
+        crate::array::memory::TEST_SYNCHRONIZE_CALLS.with(|calls| calls.set(0));
+        let fixed = drive_turn(&mut fixed, fixed_params, 3, 15, 2);
+        assert_eq!(fixed.generated, vec![3, 4, 5, 6]);
+        assert!(observations(&fixed.ledger).is_empty());
+        crate::array::memory::TEST_SYNCHRONIZE_CALLS.with(|calls| assert_eq!(calls.get(), 0));
     }
 
     // ---- 1. emission order + per-cycle commit ledger ---------------------
@@ -3711,5 +3951,75 @@ mod tests {
         let (mean, _, cycles) = out.acceptance.expect("cycle recorded with k = 0");
         assert!(mean.abs() < 1e-9, "zero accepted drafts");
         assert_eq!(cycles, 1);
+    }
+}
+
+#[cfg(test)]
+mod device_budget_tests {
+    use super::*;
+
+    #[test]
+    fn budget_caps_retention_but_labels_last_valid_row() -> Result<()> {
+        // Every proposed id matches, including masked rows whose values must
+        // never affect the retention frontier or training labels.
+        let mut data = vec![-10.0f32; 8 * 16];
+        for row in 0..8 {
+            data[row * 16 + row + 1] = 10.0;
+        }
+        let logits = MxArray::from_float32(&data, &[1, 8, 16])?;
+        for rows in 1..=8 {
+            let mut proposal = DsparkProposal {
+                draft_ids: Vec::new(),
+                device_draft_ids: Some(MxArray::from_int32(&[1, 2, 3, 4, 5, 6, 7], &[7])?),
+                draft_dists: Vec::new(),
+                draft_sparse_dists: Vec::new(),
+                keep_probabilities: None,
+            };
+            let budget = MxArray::from_int32(&[rows], &[1])?;
+            let (accepted, boundary, observed_rows, raw) =
+                accept_device_budgeted_greedy(&logits, &mut proposal, &budget)?;
+            assert_eq!(accepted, rows as usize - 1);
+            assert_eq!(boundary, rows as u32);
+            assert_eq!(observed_rows, rows as usize);
+            assert_eq!(raw, (rows as usize).min(7));
+            assert_eq!(
+                proposal.draft_len()?,
+                7,
+                "physical rollback width must remain eight"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn budgeted_rejection_and_invalid_budgets_fail_before_commit() -> Result<()> {
+        let mut data = vec![-10.0f32; 8 * 16];
+        for row in 0..8 {
+            data[row * 16 + if row == 2 { 11 } else { row + 1 }] = 10.0;
+        }
+        let logits = MxArray::from_float32(&data, &[1, 8, 16])?;
+        let mut proposal = DsparkProposal {
+            draft_ids: vec![1, 2, 3, 4, 5, 6, 7],
+            device_draft_ids: None,
+            draft_dists: Vec::new(),
+            draft_sparse_dists: Vec::new(),
+            keep_probabilities: None,
+        };
+        let budget = MxArray::from_int32(&[4], &[1])?;
+        assert_eq!(
+            accept_device_budgeted_greedy(&logits, &mut proposal, &budget)?,
+            (2, 11, 4, 2)
+        );
+        for invalid in [-1, 0, 9] {
+            assert!(
+                accept_device_budgeted_greedy(
+                    &logits,
+                    &mut proposal,
+                    &MxArray::from_int32(&[invalid], &[1])?
+                )
+                .is_err()
+            );
+        }
+        Ok(())
     }
 }

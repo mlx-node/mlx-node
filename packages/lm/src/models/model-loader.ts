@@ -55,19 +55,21 @@ export interface LoadModelOptions {
    * runs on the flat KV-cache path, so the target checkpoint must not
    * explicitly enable `use_block_paged_cache`.
    *
-   * Dense `qwen3_5` accepts a z-lab `DFlash2DraftModel` companion such as
-   * `z-lab/Qwen3.8-27B-DFlash2`. It shares the Qwen3.8 target embedding and
+   * `qwen3_5` and `qwen3_5_moe` accept a matching `DFlash2DraftModel`
+   * companion, such as `z-lab/Qwen3.8-27B-DFlash2` for dense targets or
+   * `incoai/Qwen3.6-35B-A3B-DFlash2` for 35B-A3B MoE. It shares the target embedding and
    * LM head, validates all companion tensors at load time, and takes
    * precedence over an inline target MTP head. Other model families reject
    * this option.
    */
   draftModelPath?: string;
   /**
-   * Flat full-attention K/V cache format for dense `qwen3_5` targets:
+   * Flat full-attention K/V cache format for `qwen3_5` and `qwen3_5_moe` targets:
    * `'int8'` — per-token symmetric int8 rows with one fp32 scale each,
    * halving K/V memory and read bandwidth at a small, measured quality
    * cost — or `'bf16'`. Unset: int8 on Metal with 256-wide heads (the
-   * geometry the int8 kernels serve), bf16 elsewhere. The block-paged cache
+   * geometry the int8 kernels serve), bf16 elsewhere. MoE defaults to bf16.
+   * The block-paged cache
    * ignores it; other model families reject it.
    */
   kvFormat?: 'int8' | 'bf16';
@@ -135,7 +137,13 @@ const LOADER_BINDINGS = {
     nativeModelClass: NativeQwen35Model,
   },
   qwen3_5_moe: {
-    load: (modelPath: string) => Qwen35MoeModel.load(modelPath),
+    load: (modelPath: string, options?: LoadModelOptions) =>
+      Qwen35MoeModel.load(
+        modelPath,
+        options?.draftModelPath === undefined && options?.kvFormat === undefined
+          ? null
+          : { draftModelPath: options.draftModelPath, kvFormat: options.kvFormat },
+      ),
     nativeModelClass: NativeQwen35MoeModel,
   },
   qwen4_exp: {
@@ -202,7 +210,7 @@ function requireFamilyData(modelType: ModelType) {
 
 /**
  * Dispatch a load through the registry, validating draft-capable families.
- * `draftModelPath` reaches only gemma4 and dense qwen3_5; every other family
+ * `draftModelPath` reaches gemma4, qwen3_5 and qwen3_5_moe; every other family
  * rejects it loudly instead of silently ignoring speculative-decode intent.
  */
 function dispatchLoad(
@@ -217,13 +225,13 @@ function dispatchLoad(
   }
   if (options?.draftModelPath !== undefined && requireFamilyData(modelType).acceptsDraftModel !== true) {
     throw new Error(
-      `draftModelPath (speculative-decoding draft) is only supported by gemma4 and qwen3_5 models; ` +
+      `draftModelPath (speculative-decoding draft) is only supported by gemma4, qwen3_5 and qwen3_5_moe models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }
-  if (options?.kvFormat !== undefined && modelType !== 'qwen3_5') {
+  if (options?.kvFormat !== undefined && modelType !== 'qwen3_5' && modelType !== 'qwen3_5_moe') {
     throw new Error(
-      `kvFormat (flat K/V cache format) is only supported by dense qwen3_5 models; ` +
+      `kvFormat (flat K/V cache format) is only supported by qwen3_5 and qwen3_5_moe models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }
@@ -240,12 +248,13 @@ function dispatchLoad(
  * (Qianfan-OCR / InternVL). Use `instanceof` to narrow the returned type.
  *
  * `options.draftModelPath` attaches an external draft checkpoint for
- * speculative decoding — gemma4 and dense qwen3_5 only; every other family
+ * speculative decoding — gemma4, qwen3_5 and qwen3_5_moe; every other family
  * rejects it.
  * Without the option, Gemma4 loads `<modelPath>/draft/` automatically when
  * that embedded checkpoint is present.
  * Qwen also discovers `draft/` or a shared `qwen3.8-27b-dflash2` directory
- * beside a Qwen3.8-27B target. Set `autoLoadDraft: false` to disable discovery.
+ * beside a Qwen3.8-27B target, or `qwen3.6-35b-a3b-dflash2` beside a
+ * Qwen3.6-35B-A3B target. Set `autoLoadDraft: false` to disable discovery.
  */
 export async function loadModel(modelPath: string, options?: LoadModelOptions): Promise<LoadableModel> {
   const modelType = await detectModelType(modelPath);
@@ -270,7 +279,7 @@ export async function loadModel(modelPath: string, options?: LoadModelOptions): 
  *     `new ChatSession(model)` directly.
  *
  * `options.draftModelPath` attaches an external draft checkpoint for
- * speculative decoding — gemma4 and dense qwen3_5 only; every other family
+ * speculative decoding — gemma4, qwen3_5 and qwen3_5_moe; every other family
  * rejects it.
  * Without the option, Gemma4 loads `<modelPath>/draft/` automatically when
  * that embedded checkpoint is present.

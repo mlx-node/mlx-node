@@ -24,6 +24,7 @@
 
 #include "kquant_mode.h"
 #include "kquant_grid.h"
+#include "kquant_split_reduce.h"
 
 using namespace metal;
 using namespace mpp::tensor_ops;
@@ -647,29 +648,8 @@ METAL_FUNC void stage32(
 
 // --- split-K reduction (Splash split_reduce.h) ---------------------------
 
-// True in every thread of the threadgroup that arrives last at `counter`.
-METAL_FUNC bool split_arrive_last(
-    device atomic_uint* counter,
-    uint splits,
-    uint thread_index,
-    threadgroup uint* arrival) {
-  threadgroup_barrier(mem_flags::mem_device);
-  if (thread_index == 0) {
-    atomic_thread_fence(
-        mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-    *arrival = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
-    atomic_thread_fence(
-        mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
-  return *arrival == splits - 1;
-}
-
-METAL_FUNC void split_release(device atomic_uint* counter, uint thread_index) {
-  if (thread_index == 0) {
-    atomic_store_explicit(counter, 0u, memory_order_relaxed);
-  }
-}
+using kq_split::split_arrive_last;
+using kq_split::split_release;
 
 // One step of x, the threadgroup's shared A operand: the rows x kStep
 // bfloat16 block at input `k0` as rows * 4 chunks of 8 values (one uint4),
@@ -716,6 +696,13 @@ struct ARows {
   }
 };
 
+// Splash gguf_staged_tile.h: a golden-ratio column-tile offset spreads
+// input fetches over this split's K partition. Expert tiles do not use it.
+METAL_FUNC uint staged_first_step(uint tile, uint begin, uint end, uint spread) {
+  if (!spread) return begin;
+  return begin + uint(ulong((tile * 40503u) & 0xFFFFu) * (end - begin) >> 16);
+}
+
 } // namespace kq_m8
 
 // Grid (N / 64, splits) of 64 threads. x is [M][K] bfloat16 with M <= rows,
@@ -734,19 +721,21 @@ template <
     int kind,
     int scale_shift,
     bool tiled = false,
-    int rows = 8>
+    int rows = 8,
+    typename Out = T>
 [[kernel, max_total_threads_per_threadgroup(64)]] void kquant_qmm_m8_nax(
     const device uint32_t* w [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
     const device half* biases [[buffer(2)]],
     device T* x [[buffer(3)]],
-    device T* y [[buffer(4)]],
+    device Out* y [[buffer(4)]],
     device coherent(device) float* partials [[buffer(5)]],
     device atomic_uint* counters [[buffer(6)]],
     const constant int& in_vec_size [[buffer(7)]],
     const constant int& out_vec_size [[buffer(8)]],
     const constant int& num_splits [[buffer(9)]],
     const constant int& num_rows [[buffer(10)]],
+    const constant uint& spread [[buffer(11)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
@@ -791,6 +780,7 @@ template <
   const uint per = (K / kStep) / splits;
   const uint step_begin = group.y * per;
   const uint step_end = step_begin + per;
+  const uint step_first = staged_first_step(group.x, step_begin, step_end, spread);
   const uint column0 = group.x * kTileCols + simd_group * kCols;
   const uint n = column0 + simd_lane;
   threadgroup half* my = stage + simd_group * 2 * kStage;
@@ -827,31 +817,37 @@ template <
   const device uint32_t* row = unit_base<bits, tiled>(w, n, K);
   constexpr uint stride = unit_stride<bits, tiled>();
   CoefCursor<F, tiled, scale_shift, group_size> coefs(scales, biases, n, K);
-  W cur = Codes<F>::load(row, step_begin, stride);
-  Coef cc = coefs.at(step_begin);
+  W cur = Codes<F>::load(row, step_first, stride);
+  Coef cc = coefs.at(step_first);
   if constexpr (is_grid<F>()) {
-    cur.sc = coefs.companion(step_begin);
+    cur.sc = coefs.companion(step_first);
   }
-  ARows<rows, T> xa = ARows<rows, T>::load(x, K, M, step_begin * kStep, tid);
-  for (uint step = step_begin; step < step_end; ++step) {
-    threadgroup half* buf = my + (step & 1) * kStage;
+  ARows<rows, T> xa = ARows<rows, T>::load(x, K, M, step_first * kStep, tid);
+  uint step = step_first;
+  for (uint walked = 0; walked < per; ++walked) {
+    // The two buffers alternate in traversal order, including at the wrap.
+    // With spreading disabled this is the original monotonic step parity.
+    const uint buffer = (spread ? walked : step) & 1;
+    threadgroup half* buf = my + buffer * kStage;
     stage32<F, scale_shift>(cur, cc, tl, buf + simd_lane * kStep, grid);
-    xa.store(astage + (step & 1) * kRows * kStep, tid);
+    xa.store(astage + buffer * kRows * kStep, tid);
     // The A stage is the threadgroup's, so the step barrier is too.
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (step + 1 < step_end) {
-      cur = Codes<F>::load(row, step + 1, stride);
-      cc = coefs.at(step + 1);
+    const uint next = step + 1 < step_end ? step + 1 : step_begin;
+    if (walked + 1 < per) {
+      cur = Codes<F>::load(row, next, stride);
+      cc = coefs.at(next);
       if constexpr (is_grid<F>()) {
-        cur.sc = coefs.companion(step + 1);
+        cur.sc = coefs.companion(next);
       }
-      xa = ARows<rows, T>::load(x, K, M, (step + 1) * kStep, tid);
+      xa = ARows<rows, T>::load(x, K, M, next * kStep, tid);
     }
-    if (step & 1) {
+    if (buffer) {
       op.run(a1, b1, acc);
     } else {
       op.run(a0, b0, acc);
     }
+    step = next;
   }
 
   // index[0] is the column, index[1] the row.
@@ -863,7 +859,7 @@ template <
       }
       const auto idx = acc.get_multidimensional_index(i);
       if (uint(idx[1]) < M) {
-        y[uint(idx[1]) * N + column0 + uint(idx[0])] = T(float(acc[i]));
+        y[uint(idx[1]) * N + column0 + uint(idx[0])] = Out(float(acc[i]));
       }
     }
     return;
@@ -898,7 +894,7 @@ template <
     for (uint s = 0; s < splits; ++s) {
       total += s == split ? float(acc[i]) : partials[at(s, row_, col)];
     }
-    y[row_ * N + column0 + col] = T(total);
+    y[row_ * N + column0 + col] = Out(total);
   }
   split_release(counters + group.x, tid);
 }

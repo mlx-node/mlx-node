@@ -610,9 +610,12 @@ describe('createInferenceHost — a tokenized host still answers the supervisor'
 });
 
 describe('createInferenceHost — out-of-band loadModel', () => {
-  it('finds a newly downloaded shared draft before applying the target config overlay', async () => {
-    const name = 'qwen3.8-27b-mxfp4-mlx';
+  it.each([
+    ['qwen3_5', 'qwen3.8-27b-mxfp4-mlx', 'qwen3.8-27b-dflash2'],
+    ['qwen3_5_moe', 'qwen3.6-35b-a3b-q4-k-mlx', 'qwen3.6-35b-a3b-dflash2'],
+  ])('finds a new %s draft before applying the target config overlay', async (family, name, draftName) => {
     const modelsDir = await makeModelsDir([name]);
+    await writeFile(join(modelsDir, name, 'config.json'), JSON.stringify({ model_type: family }));
     const calls: Array<{ path: string; options?: LoadModelOptions }> = [];
     const host = await start({
       modelsDir,
@@ -621,7 +624,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
         return fakeModel();
       },
     });
-    const draft = join(modelsDir, 'qwen3.8-27b-dflash2');
+    const draft = join(modelsDir, draftName);
     await mkdir(draft);
     await writeFile(join(draft, 'config.json'), JSON.stringify({ architectures: ['DFlash2DraftModel'] }));
     await writeFile(join(draft, 'model.safetensors'), 'weights');

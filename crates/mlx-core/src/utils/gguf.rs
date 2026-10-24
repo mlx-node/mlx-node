@@ -37,6 +37,9 @@ use crate::quant::prism_hadamard::PrismHadamardConfig;
 use crate::utils::gguf_kquant::{KQuantArrays, KQuantFormat, KQuantRepacker, KQuantScales};
 use crate::utils::safetensors::save_safetensors;
 
+#[path = "gguf_source_math.rs"]
+mod source_math;
+
 // ── GGUF Constants ──────────────────────────────────────────────────────────
 
 const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in little-endian
@@ -5430,10 +5433,140 @@ fn apply_gguf_awq_prescaling(
     Ok(())
 }
 
+/// Capture only the measured structural operand contract. Unsupported native
+/// checkpoints still convert successfully with an explicit unavailable record.
+fn capture_source_math_operands(
+    identity: source_math::ImportIdentity,
+    gguf: &GgufFile,
+    weights: &HashMap<String, MxArray>,
+    inline_mtp_index: Option<u64>,
+) -> Result<source_math::Preservation> {
+    let mut config = extract_config(&gguf.metadata);
+    // The GGUF block count may include an inline MTP block. Use the same
+    // already-validated main decoder count as the converter's final config.
+    apply_qwen35_inline_mtp_config(&mut config, inline_mtp_index);
+    let number = |key: &str| {
+        config
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let geometry = source_math::Geometry {
+        architecture: gguf
+            .metadata
+            .get("general.architecture")
+            .and_then(GgufMetaValue::as_str)
+            .unwrap_or("")
+            .into(),
+        hidden_size: number("hidden_size"),
+        layers: number("num_hidden_layers"),
+        attention_heads: number("num_attention_heads"),
+        kv_heads: number("num_key_value_heads"),
+        head_dim: number("head_dim"),
+        full_attention_interval: number("full_attention_interval"),
+        experts: number("num_experts"),
+        top_k: number("num_experts_per_tok"),
+        expert_width: number("moe_intermediate_size"),
+    };
+    if geometry.architecture != "qwen35moe" {
+        return Err(Error::from_reason(
+            "Source operand request is only valid for Qwen3.5 MoE",
+        ));
+    }
+    if !geometry.supported() {
+        return Ok(source_math::Preservation::unavailable(
+            identity,
+            geometry,
+            "unsupported_geometry",
+        )?);
+    }
+    let expected = source_math::expected_tensors();
+    // Refuse partial capability before reading any values. A differently
+    // quantized or incomplete norm set remains a valid native-only import.
+    for name in &expected {
+        let descriptors: Vec<_> = gguf
+            .tensors
+            .iter()
+            .filter(|tensor| name.matches_original(&tensor.name))
+            .collect();
+        if descriptors.len() != 1
+            || descriptors[0].tensor_type != GgufTensorType::F32
+            || descriptors[0].n_dims != 1
+            || descriptors[0].dims != [name.width as u64]
+        {
+            return Ok(source_math::Preservation::unavailable(
+                identity,
+                geometry,
+                "original_f32_norm_set_unavailable",
+            )?);
+        }
+        if gguf_name_to_hf_for_metadata(&descriptors[0].name, &gguf.metadata).as_deref()
+            != Some(name.mapped.as_str())
+        {
+            return Err(Error::from_reason(
+                "Source operand mapping changed without schema update",
+            ));
+        }
+        let array = weights
+            .get(&name.mapped)
+            .ok_or_else(|| Error::from_reason("Mapped source norm is missing"))?;
+        if array.dtype()? != DType::Float32 || array.shape()?.as_ref() != [name.width as i64] {
+            return Err(Error::from_reason(
+                "Mapped original source norm changed precision or shape",
+            ));
+        }
+    }
+    let mut tensors = Vec::with_capacity(expected.len());
+    for name in expected {
+        let descriptor = gguf
+            .tensors
+            .iter()
+            .find(|tensor| name.matches_original(&tensor.name))
+            .ok_or_else(|| Error::from_reason("Original source norm descriptor is missing"))?;
+        let values = weights[&name.mapped].to_float32()?;
+        tensors.push(source_math::OriginalTensor {
+            mapped_name: name.mapped,
+            original_name: descriptor.name.clone(),
+            original_shape: descriptor.dims.clone(),
+            original_byte_offset: gguf
+                .data_offset
+                .checked_add(descriptor.offset)
+                .ok_or_else(|| Error::from_reason("Original source norm range overflow"))?,
+            f32_bytes: values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        });
+    }
+    Ok(source_math::Preservation::capture(
+        identity, geometry, tensors,
+    )?)
+}
+
 #[napi]
 pub async fn convert_gguf_to_safetensors(
     options: GgufConversionOptions,
 ) -> Result<GgufConversionResult> {
+    convert_gguf_to_safetensors_inner(options, None).await
+}
+
+// Only native MoE preparation requests preservation; the public converter,
+// other families and secondary companion conversion retain their old output.
+async fn convert_gguf_to_safetensors_inner(
+    options: GgufConversionOptions,
+    source_operands: Option<source_math::ImportIdentity>,
+) -> Result<GgufConversionResult> {
+    if source_operands.is_some()
+        && (options.dtype.as_deref() != Some("bfloat16")
+            || options.quantize.unwrap_or(false)
+            || options.imatrix_path.is_some()
+            || options.output_filename.is_some()
+            || options.native_qwen35_layout != Some(true))
+    {
+        return Err(Error::from_reason(
+            "Source operand preservation requires the native BF16 primary MoE import",
+        ));
+    }
     let input_path = PathBuf::from(&options.input_path);
     let output_dir = PathBuf::from(&options.output_dir);
     let config_source_dir = options.config_source_dir.as_deref().map(PathBuf::from);
@@ -5897,6 +6030,12 @@ pub async fn convert_gguf_to_safetensors(
     // precision instead of being rounded by the backbone's --dtype.
     let clef_head = extract_clef_head_assets(&mut weights, &gguf)?;
 
+    let preserved_source_operands = source_operands
+        .map(|identity| {
+            capture_source_math_operands(identity, &gguf, &weights, qwen35_inline_mtp_index)
+        })
+        .transpose()?;
+
     // Optional dtype conversion (only for non-quantized weights)
     if let Some(dtype_str) = &options.dtype {
         let target_dtype = match dtype_str.as_str() {
@@ -5930,6 +6069,29 @@ pub async fn convert_gguf_to_safetensors(
                     let converted = convert_tensor_dtype(arr, target_dtype)?;
                     weights.insert(key, converted);
                 }
+            }
+        }
+    }
+
+    // Validate the same ordinary BF16 values that will be serialized. No
+    // source operand is inserted into or substituted in the weights map.
+    if let Some(preserved) = &preserved_source_operands {
+        for (name, expected) in preserved.native_digests() {
+            let native = weights
+                .get(name)
+                .ok_or_else(|| Error::from_reason("Missing preserved native norm"))?;
+            if native.dtype()? != DType::BFloat16 {
+                return Err(Error::from_reason("Preserved native norm is not BF16"));
+            }
+            let values = native.astype(DType::Float32)?.to_float32()?;
+            let bytes: Vec<u8> = values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+            if source_math::sha256(&source_math::bf16_bytes(&bytes)?) != expected {
+                return Err(Error::from_reason(format!(
+                    "Native BF16 norm differs from preserved original F32: {name}"
+                )));
             }
         }
     }
@@ -6433,6 +6595,10 @@ pub async fn convert_gguf_to_safetensors(
         info!(
             "Skipping config.json and tokenizer writes for secondary output file: {safetensors_filename}"
         );
+    }
+
+    if let Some(preserved) = preserved_source_operands {
+        preserved.publish(&output_dir)?;
     }
 
     // Build source format description
@@ -8422,7 +8588,7 @@ impl NativeGgufFamily {
             Self::Qwen35 => "tiled",
             // A distinct string keeps the sparse family's cache key from
             // aliasing the dense one on the same source filename.
-            Self::Qwen35Moe => "tiled-moe-v1",
+            Self::Qwen35Moe => source_math::LAYOUT,
             // CLEF shares the dense Qwen3.5 tiled GDN layout; the tag keeps
             // its head-bearing staging output from aliasing a plain qwen35
             // conversion of a (hypothetical) same-named file.
@@ -8640,6 +8806,12 @@ async fn prepare_native_gguf_inner(
     // plus the required payloads (and the companion file when one is
     // paired) — the exact check the publish path used before handing the
     // dir to a loader.
+    let source_operands_identity =
+        (family == NativeGgufFamily::Qwen35Moe).then(|| source_math::ImportIdentity {
+            source_stat_path_sha256: source_identity_digest.clone(),
+            source_bytes: metadata.len(),
+            assets_sha256: asset_digest.clone(),
+        });
     let entry_is_current = |dir: &Path| {
         qwen35_native_cache_is_current(
             dir,
@@ -8648,6 +8820,9 @@ async fn prepare_native_gguf_inner(
             cache_dtype,
             family.required_files(),
         ) && (companion.is_none() || dir.join(family.companion_filename()).is_file())
+            && source_operands_identity
+                .as_ref()
+                .is_none_or(|identity| source_math::cache_is_current(dir, identity))
     };
 
     // Sweep stale/orphaned siblings once per prepare. The sweep needs no
@@ -8842,24 +9017,27 @@ async fn prepare_native_gguf_inner(
                 std::process::id(),
                 uuid::Uuid::new_v4().simple()
             ));
-            let conversion = convert_gguf_to_safetensors(GgufConversionOptions {
-                input_path: input_path.to_string_lossy().into_owned(),
-                output_dir: staging_dir.to_string_lossy().into_owned(),
-                config_source_dir,
-                dtype: Some("bfloat16".to_string()),
-                verbose: Some(true),
-                quantize: Some(false),
-                quant_bits: None,
-                quant_group_size: None,
-                quant_mode: None,
-                quant_recipe: None,
-                imatrix_path: None,
-                output_filename: None,
-                vlm_key_prefix: None,
-                quant_mxfp: None,
-                import_k_quants: Some(true),
-                native_qwen35_layout: Some(native_qwen35_layout),
-            })
+            let conversion = convert_gguf_to_safetensors_inner(
+                GgufConversionOptions {
+                    input_path: input_path.to_string_lossy().into_owned(),
+                    output_dir: staging_dir.to_string_lossy().into_owned(),
+                    config_source_dir,
+                    dtype: Some("bfloat16".to_string()),
+                    verbose: Some(true),
+                    quantize: Some(false),
+                    quant_bits: None,
+                    quant_group_size: None,
+                    quant_mode: None,
+                    quant_recipe: None,
+                    imatrix_path: None,
+                    output_filename: None,
+                    vlm_key_prefix: None,
+                    quant_mxfp: None,
+                    import_k_quants: Some(true),
+                    native_qwen35_layout: Some(native_qwen35_layout),
+                },
+                source_operands_identity.clone(),
+            )
             .await;
             if let Err(error) = conversion {
                 fs::remove_dir_all(&staging_dir).ok();
@@ -8959,11 +9137,25 @@ async fn prepare_native_gguf_inner(
                 Some(_) => String::new(),
                 None => "companion=none\n".to_string(),
             };
+            let source_operands_marker = if let Some(identity) = &source_operands_identity {
+                let digest = match source_math::validate(&staging_dir, identity, None) {
+                    Ok(digest) => digest,
+                    Err(error) => {
+                        fs::remove_dir_all(&staging_dir).ok();
+                        return Err(Error::from_reason(format!(
+                            "Failed to finalize source operand capability: {error}"
+                        )));
+                    }
+                };
+                format!("source_operands_schema=1\nsource_operands_manifest_sha256={digest}\n")
+            } else {
+                String::new()
+            };
             let marker = staging_dir.join(".complete");
             if let Err(error) = fs::write(
                 marker,
                 format!(
-                    "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource_hex={source_hex}\nsource_identity_sha256={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout={layout}\ncompanion_hex={companion_hex}\ncompanion_sha256={companion_digest}\ndtype={cache_dtype}\n{source_line}{companion_line}",
+                    "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource_hex={source_hex}\nsource_identity_sha256={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout={layout}\ncompanion_hex={companion_hex}\ncompanion_sha256={companion_digest}\ndtype={cache_dtype}\n{source_line}{companion_line}{source_operands_marker}",
                     source_identity_digest,
                     metadata.len(),
                     modified,
@@ -9178,6 +9370,8 @@ impl Drop for SweepEnvVar {
 mod tests {
     use super::*;
     use crate::utils::gguf_kquant::{QK_K, q2k_code, repack_kquant};
+
+    include!("gguf_source_math_import_tests.rs");
 
     struct GemmaNativeTestDir(PathBuf);
 
@@ -10680,7 +10874,7 @@ mod tests {
         );
 
         let marker = fs::read_to_string(output.join(".complete")).unwrap();
-        assert!(marker.contains("layout=tiled-moe-v1\n"));
+        assert!(marker.contains(&format!("layout={}\n", source_math::LAYOUT)));
 
         fs::remove_dir_all(root).ok();
     }
@@ -10731,7 +10925,7 @@ mod tests {
         assert!(
             fs::read_to_string(sparse.join(".complete"))
                 .unwrap()
-                .contains("layout=tiled-moe-v1\n")
+                .contains(&format!("layout={}\n", source_math::LAYOUT))
         );
         assert!(
             fs::read_to_string(dense.join(".complete"))
@@ -11142,7 +11336,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("real checkpoint conversion failed: {}", error.reason));
 
         let marker = fs::read_to_string(output.join(".complete")).unwrap();
-        assert!(marker.contains("layout=tiled-moe-v1\n"));
+        assert!(marker.contains(&format!("layout={}\n", source_math::LAYOUT)));
 
         let config: serde_json::Value =
             serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();

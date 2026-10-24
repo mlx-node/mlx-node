@@ -1404,6 +1404,9 @@ impl Qwen35Inner {
         // earlier params, and erasing when nothing changed is a harmless
         // registry scan.
         self.erase_compiled_verifies();
+        if let Some(draft) = &self.dflash2 {
+            draft.invalidate_compiled();
+        }
         result
     }
 

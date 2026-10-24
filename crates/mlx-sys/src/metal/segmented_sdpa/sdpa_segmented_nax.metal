@@ -49,7 +49,8 @@ struct BoolTag {
 
 } // namespace sdpa_nax
 
-template <typename T, int D, int M, int N, typename KV = T>
+template <typename T, int D, int M, int N, typename KV = T,
+          typename Partial = T>
 [[kernel, max_total_threads_per_threadgroup(256)]] void
 segmented_sdpa_verify_nax_2pass_1(
     device T* queries [[buffer(0)]],
@@ -57,7 +58,7 @@ segmented_sdpa_verify_nax_2pass_1(
     device KV* prefix_values [[buffer(2)]],
     device KV* new_keys [[buffer(3)]],
     device KV* new_values [[buffer(4)]],
-    device T* out [[buffer(5)]],
+    device Partial* out [[buffer(5)]],
     device float* sums [[buffer(6)]],
     device float* maxs [[buffer(7)]],
     const constant int& prefix_n [[buffer(8)]],
@@ -72,6 +73,8 @@ segmented_sdpa_verify_nax_2pass_1(
     const device float* new_key_scales [[buffer(17)]],
     const device float* new_value_scales [[buffer(18)]],
     const constant long* scale_strides [[buffer(19)]],
+    const constant int& flat_grid [[buffer(20)]],
+    const constant int& page_splits [[buffer(21)]],
     threadgroup float* scratch [[threadgroup(0)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
@@ -94,12 +97,19 @@ segmented_sdpa_verify_nax_2pass_1(
   threadgroup atomic_uint* rescale =
       reinterpret_cast<threadgroup atomic_uint*>(prev_scale + M);
 
-  const int kv_head_idx = tid.x;
+  // Exact scheduling-only permutation: head is still the fastest axis.
+  const uint kv_heads = flat_grid ? tpg.x / uint(partitions) : tpg.x;
+  const int kv_head_idx = flat_grid ? int(tid.x % kv_heads) : int(tid.x);
   const int batch_idx = tid.y;
-  const int block_idx = tid.z;
-  const int num_q_heads = tpg.x * gqa;
+  const int block_idx = flat_grid ? int(tid.x / kv_heads) : int(tid.z);
+  const int num_q_heads = int(kv_heads) * gqa;
   const int n = prefix_n + new_n;
-  const int chunk = (n + partitions - 1) / partitions;
+  // Keep whole N-key tiles inside a split, as Splash partitions Page32
+  // units. N=32 for the target M64 kernel; N64 aligns to two Page32 units.
+  // Partitions and output slots stay fixed; newly empty groups write zeros.
+  const int chunk = page_splits
+      ? int((((long(n) + N - 1) / N + partitions - 1) / partitions) * N)
+      : (n + partitions - 1) / partitions;
   const int kstart = block_idx * chunk;
   const int kend = min(n, kstart + chunk);
 
@@ -232,7 +242,10 @@ segmented_sdpa_verify_nax_2pass_1(
         } else {
           const vec<T, 4> p = vec<T, 4>(e);
           p4[j] = p;
-          local_sum += float(p.x) + float(p.y) + float(p.z) + float(p.w);
+          if constexpr (is_same_v<Partial, float>)
+            local_sum += e.x + e.y + e.z + e.w;
+          else
+            local_sum += float(p.x) + float(p.y) + float(p.z) + float(p.w);
         }
       }
       local_sum += simd_shuffle_xor(local_sum, ushort(1));
@@ -316,7 +329,7 @@ segmented_sdpa_verify_nax_2pass_1(
   // head are contiguous at stride partitions * D. index[0] is the column,
   // index[1] the row.
   const long o_base = long(batch_idx * num_q_heads + gqa * kv_head_idx) * rows;
-  device T* partial = out + (o_base * partitions + block_idx) * D;
+  device Partial* partial = out + (o_base * partitions + block_idx) * D;
   const long row_stride = long(partitions) * D;
 #pragma unroll
   for (ushort i = 0; i < running.get_capacity(); ++i) {
@@ -324,7 +337,7 @@ segmented_sdpa_verify_nax_2pass_1(
       continue;
     }
     const auto idx = running.get_multidimensional_index(i);
-    partial[long(idx[1]) * row_stride + idx[0]] = T(running[i]);
+    partial[long(idx[1]) * row_stride + idx[0]] = Partial(running[i]);
   }
   if (softmax_lane && c0 == 0) {
     const long o_offset = o_base + m;
@@ -364,3 +377,170 @@ instantiate_sdpa_nax(56, 32)
 instantiate_sdpa_nax(56, 64)
 instantiate_sdpa_nax(64, 32)
 instantiate_sdpa_nax(64, 64)
+
+// Source-style reduction precision: FP32 partial numerators and unrounded
+// FP32 probability sums. Query, KV, probabilities and final output remain BF16.
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m8_n32_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 8, 32, bfloat, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 8, 32, bfloat, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256_m8_n32_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 8, 32, int8_t, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 8, 32, int8_t, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m8_n64_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 8, 64, bfloat, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 8, 64, bfloat, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256_m8_n64_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 8, 64, int8_t, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 8, 64, int8_t, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m16_n32_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 16, 32, bfloat, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 16, 32, bfloat, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256_m16_n32_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 16, 32, int8_t, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 16, 32, int8_t, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m16_n64_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 16, 64, bfloat, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 16, 64, bfloat, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256_m16_n64_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 16, 64, int8_t, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 16, 64, int8_t, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m24_n32_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 24, 32, bfloat, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 24, 32, bfloat, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256_m24_n32_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 24, 32, int8_t, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 24, 32, int8_t, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m24_n64_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 24, 64, bfloat, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 24, 64, bfloat, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256_m24_n64_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 24, 64, int8_t, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 24, 64, int8_t, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m32_n32_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 32, 32, bfloat, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 32, 32, bfloat, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256_m32_n32_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 32, 32, int8_t, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 32, 32, int8_t, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m32_n64_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 32, 64, bfloat, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 32, 64, bfloat, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256_m32_n64_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 32, 64, int8_t, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 32, 64, int8_t, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m40_n32_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 40, 32, bfloat, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 40, 32, bfloat, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256_m40_n32_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 40, 32, int8_t, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 40, 32, int8_t, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m40_n64_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 40, 64, bfloat, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 40, 64, bfloat, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256_m40_n64_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 40, 64, int8_t, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 40, 64, int8_t, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m48_n32_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 48, 32, bfloat, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 48, 32, bfloat, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256_m48_n32_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 48, 32, int8_t, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 48, 32, int8_t, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m48_n64_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 48, 64, bfloat, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 48, 64, bfloat, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256_m48_n64_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 48, 64, int8_t, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 48, 64, int8_t, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m56_n32_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 56, 32, bfloat, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 56, 32, bfloat, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256_m56_n32_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 56, 32, int8_t, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 56, 32, int8_t, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m56_n64_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 56, 64, bfloat, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 56, 64, bfloat, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256_m56_n64_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 56, 64, int8_t, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 56, 64, int8_t, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m64_n32_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 64, 32, bfloat, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 64, 32, bfloat, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256_m64_n32_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 64, 32, int8_t, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 64, 32, int8_t, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_bf16_256_m64_n64_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 64, 64, bfloat, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 64, 64, bfloat, float>;
+template [[host_name("mlx_node_sdpa_segmented_verify_nax_2pass_1_int8_256_m64_n64_fp32")]] [[kernel]]
+decltype(segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 64, 64, int8_t, float>) segmented_sdpa_verify_nax_2pass_1<bfloat, 256, 64, 64, int8_t, float>;
+
+// Adapted from Splash's splash_attention_combine_splits (Apache-2.0).
+// One 256-thread group serves one [batch, query head, query row]. Each
+// thread owns one output dimension. Statistics are shared; numerator and
+// denominator retain ascending split order. This experiment deliberately
+// keeps native BF16 partials to isolate reduction scheduling from precision.
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void mlx_node_sdpa_segmented_reduce_256_bf16_256(
+    device const bfloat* partials [[buffer(0)]],
+    device const float* sums [[buffer(1)]],
+    device const float* maxs [[buffer(2)]],
+    device bfloat* output [[buffer(3)]],
+    constant int& blocks [[buffer(4)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint3 groups [[threadgroups_per_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint D = 256, MaximumSplits = 1024;
+  threadgroup float weights[MaximumSplits];
+  threadgroup float maxima[8];
+  const ulong row = ulong(group.x) * groups.y + group.y;
+  partials += row * blocks * D;
+  sums += row * blocks;
+  maxs += row * blocks;
+  output += row * D;
+  float local_maximum = -INFINITY;
+  // The current planner uses multiples of32; the tail guards also support
+  // an arbitrary bounded split count if a later planner adopts one.
+  for (uint split = thread_index; split < uint(blocks); split += D)
+    local_maximum = max(local_maximum, maxs[split]);
+  const float group_maximum = simd_max(local_maximum);
+  if (lane == 0) maxima[simd_group] = group_maximum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float maximum = simd_max(lane < 8 ? maxima[lane] : -INFINITY);
+  for (uint split = thread_index; split < uint(blocks); split += D) {
+    // Empty partitions have zero sums. Avoid exp(-inf - -inf) and avoid
+    // allowing an empty partition's partial data into the numerator.
+    weights[split] = sums[split] > 0.0f
+        ? fast::exp(maxs[split] - maximum) : 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float numerator = 0.0f, denominator = 0.0f;
+  for (uint split = 0; split < uint(blocks); ++split) {
+    const float weight = weights[split];
+    if (weight == 0.0f) continue;
+    numerator += weight * float(partials[ulong(split) * D + thread_index]);
+    denominator += weight * sums[split];
+  }
+  output[thread_index] = bfloat(denominator > 0.0f
+      ? numerator / denominator : 0.0f);
+}
+
+// FP32 input partials, the same bounded ordered reduction and BF16 output.
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void mlx_node_sdpa_segmented_reduce_256_fp32_256(
+    device const float* partials [[buffer(0)]],
+    device const float* sums [[buffer(1)]],
+    device const float* maxs [[buffer(2)]],
+    device bfloat* output [[buffer(3)]],
+    constant int& blocks [[buffer(4)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint3 groups [[threadgroups_per_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint D = 256, MaximumSplits = 1024;
+  threadgroup float weights[MaximumSplits];
+  threadgroup float maxima[8];
+  const ulong row = ulong(group.x) * groups.y + group.y;
+  partials += row * blocks * D;
+  sums += row * blocks;
+  maxs += row * blocks;
+  output += row * D;
+  float local_maximum = -INFINITY;
+  // The current planner uses multiples of32; the tail guards also support
+  // an arbitrary bounded split count if a later planner adopts one.
+  for (uint split = thread_index; split < uint(blocks); split += D)
+    local_maximum = max(local_maximum, maxs[split]);
+  const float group_maximum = simd_max(local_maximum);
+  if (lane == 0) maxima[simd_group] = group_maximum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float maximum = simd_max(lane < 8 ? maxima[lane] : -INFINITY);
+  for (uint split = thread_index; split < uint(blocks); split += D) {
+    // Empty partitions have zero sums. Avoid exp(-inf - -inf) and avoid
+    // allowing an empty partition's partial data into the numerator.
+    weights[split] = sums[split] > 0.0f
+        ? fast::exp(maxs[split] - maximum) : 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float numerator = 0.0f, denominator = 0.0f;
+  for (uint split = 0; split < uint(blocks); ++split) {
+    const float weight = weights[split];
+    if (weight == 0.0f) continue;
+    numerator += weight * float(partials[ulong(split) * D + thread_index]);
+    denominator += weight * sums[split];
+  }
+  output[thread_index] = bfloat(denominator > 0.0f
+      ? numerator / denominator : 0.0f);
+}

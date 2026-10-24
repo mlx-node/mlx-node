@@ -227,6 +227,25 @@ describe('extractBakedMetallibBinding', () => {
     expect(binding?.outDir).toBe(BAKED_DIR_A);
   });
 
+  it('binds the patched-source CMake child without changing the Cargo OUT_DIR', () => {
+    const path = bakedPathFor(`${BAKED_DIR_A}/mlx-cmake`);
+    expect(extractBakedMetallibBinding(fakeAddon([path, `${BAKED_DIR_A}/paged_attn.metallib`]))).toEqual({
+      kind: 'source',
+      outDir: BAKED_DIR_A,
+      libDir: `${BAKED_DIR_A}/mlx-cmake/lib`,
+      bakedPath: `${BAKED_DIR_A}/mlx-cmake/build/mlx/backend/metal/kernels/mlx.metallib`,
+      installCopyPath: `${BAKED_DIR_A}/mlx-cmake/lib/mlx.metallib`,
+    });
+    expect(() => extractBakedMetallibBinding(fakeAddon([path, bakedPathFor(BAKED_DIR_A)]))).toThrow(
+      /distinct METAL_PATH/,
+    );
+    expect(() =>
+      extractBakedMetallibBinding(
+        fakeAddon([path, `/repo/target/${TRIPLE}/release/build/mlx-sys-bbbb2222/out/paged_attn.metallib`]),
+      ),
+    ).toThrow(/two different mlx-sys builds/);
+  });
+
   it('returns undefined when no METAL_PATH is baked (e.g. Metal-less build)', () => {
     expect(extractBakedMetallibBinding(fakeAddon(['Failed to load metallib: ', '.metallib>']))).toBeUndefined();
   });
@@ -359,6 +378,76 @@ describe('selectMetallib', () => {
     });
     expect(picked.source).toBe('baked');
     expect(picked.metallibPath).toBe(baked);
+  });
+
+  it('ships nested CMake source artifacts and ignores stale legacy copies in the same OUT_DIR', () => {
+    const rel = `${TRIPLE}/release/build/mlx-sys-aaaa1111`;
+    const outDir = join(root, rel, 'out');
+    const libDir = join(outDir, 'mlx-cmake', 'lib');
+    const baked = bakedPathFor(join(outDir, 'mlx-cmake'), false);
+    const install = join(libDir, 'mlx.metallib');
+    mkdirSync(join(outDir, 'mlx-cmake', 'build', 'mlx', 'backend', 'metal', 'kernels'), { recursive: true });
+    mkdirSync(libDir, { recursive: true });
+    writeFileSync(baked, 'current-source');
+    writeFileSync(install, 'current-source');
+    addOutDir(rel, 'stale-prebuilt', 0);
+    writeFileSync(join(outDir, 'lib', 'paged_attn.metallib'), 'stale-bridge');
+    writeFileSync(join(outDir, 'paged_attn.metallib'), 'current-bridge');
+    writeFileSync(join(libDir, 'paged_attn.metallib'), 'current-bridge');
+    const opts = {
+      addonBinary: fakeAddon([baked, join(outDir, 'paged_attn.metallib')]),
+      addonPath: 'fake.node',
+      targetRoot: root,
+      triple: TRIPLE,
+      profile: 'release',
+      strict: true,
+    };
+    expect(selectMetallib(opts)).toEqual({ source: 'baked', outDir, libDir, metallibPath: baked });
+    expect(selectPagedMetallib({ outDir, libDir }).contents.toString()).toBe('current-bridge');
+    rmSync(baked);
+    expect(selectMetallib(opts).metallibPath).toBe(install);
+    rmSync(install);
+    expect(() => selectMetallib(opts)).toThrow(/neither that file nor its install copy .* exists/);
+  });
+
+  it('rejects a mismatched nested CMake install copy', () => {
+    const outDir = join(root, TRIPLE, 'release', 'build', 'mlx-sys-aaaa1111', 'out');
+    const libDir = join(outDir, 'mlx-cmake', 'lib');
+    const kernels = join(outDir, 'mlx-cmake', 'build', 'mlx', 'backend', 'metal', 'kernels');
+    mkdirSync(libDir, { recursive: true });
+    mkdirSync(kernels, { recursive: true });
+    const baked = join(kernels, 'mlx.metallib');
+    writeFileSync(baked, 'current-source');
+    writeFileSync(join(libDir, 'mlx.metallib'), 'stale-install');
+    expect(() =>
+      selectMetallib({
+        addonBinary: fakeAddon([baked]),
+        addonPath: 'fake.node',
+        targetRoot: root,
+        triple: TRIPLE,
+        profile: 'release',
+      }),
+    ).toThrow(/not byte-identical/);
+  });
+
+  it('fallback finds the nested CMake layout and preserves the paged library OUT_DIR', () => {
+    const rel = `${TRIPLE}/release/build/mlx-sys-aaaa1111`;
+    const outDir = join(root, rel, 'out');
+    const libDir = join(outDir, 'mlx-cmake', 'lib');
+    const metallibPath = join(libDir, 'mlx.metallib');
+    addOutDir(rel, 'stale-legacy', 7);
+    mkdirSync(libDir, { recursive: true });
+    writeFileSync(metallibPath, 'current-nested');
+    writeFileSync(join(root, rel, 'invoked.timestamp'), 'shared cargo timestamp');
+    expect(
+      selectMetallib({
+        addonBinary: fakeAddon(['no baked path']),
+        addonPath: 'fake.node',
+        targetRoot: root,
+        triple: TRIPLE,
+        profile: 'release',
+      }),
+    ).toEqual({ source: 'scan', outDir, libDir, metallibPath });
   });
 
   it('REJECTS a diverged out/lib install copy: baked file and install copy must be byte-identical', () => {

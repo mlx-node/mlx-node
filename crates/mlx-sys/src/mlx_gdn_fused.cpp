@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -49,27 +50,51 @@ struct GdnFusedParams {
   int a_stride_c;
   int b_stride_t;
   int b_stride_c;
+  int pending_T;
 };
 
 MTL::ComputePipelineState* gdn_fused_pipeline(metal::Device& device, int dk,
-                                              int dv, bool complete) {
+                                              int dv, bool complete, bool scan8 = false, bool prepared = false, bool t8_storage = false, bool deferred = false) {
   const std::string name =
       complete ? "mlx_node_gdn_fused_complete" : "mlx_node_gdn_fused_step";
   const std::string lib_name =
-      name + "_dk" + std::to_string(dk) + "_dv" + std::to_string(dv);
-  auto* library = device.get_library(lib_name, [dk, dv, complete] {
+      name + "_dk" + std::to_string(dk) + "_dv" + std::to_string(dv) + (scan8 ? "_scan8" : "") + (prepared ? "_sg8" : "") + (t8_storage ? "_t8_storage" : "") + (deferred ? "_deferred" : "");
+  auto* library = device.get_library(lib_name, [dk, dv, complete, scan8, prepared, t8_storage, deferred] {
     return std::string(metal::utils()) + "\n#define GDN_FUSED_N_PER_T " +
         std::to_string(dk / 32) + "\n#define GDN_FUSED_DV " +
         std::to_string(dv) + "\n#define GDN_FUSED_COMPLETE " +
-        (complete ? "1" : "0") + "\n" + kGdnFusedBody;
+        (complete ? "1" : "0") + "\n#define GDN_FUSED_SCAN8 " +
+        (scan8 ? "1" : "0") + "\n#define GDN_FUSED_PREPARED " +
+        (prepared ? "1" : "0") + "\n#define GDN_FUSED_T8_STORAGE " +
+        (t8_storage ? "1" : "0") + "\n#define GDN_FUSED_DEFERRED " +
+        (deferred ? "1" : "0") + "\n" + kGdnFusedBody;
   });
   auto* pipeline = device.get_kernel(name, library);
   if (pipeline->threadExecutionWidth() != 32 ||
-      pipeline->maxTotalThreadsPerThreadgroup() < NS::UInteger(8 * dv)) {
+      pipeline->maxTotalThreadsPerThreadgroup() < NS::UInteger(scan8 ? 256 : 8 * dv)) {
     throw std::runtime_error(
         "gdn fused pipeline cannot hold one value head per threadgroup");
   }
   return pipeline;
+}
+
+// Pending tape is explicit graph data. Output state/history always mean the
+// settled prior prefix, never the speculative current window, on every replay.
+void validate_deferred(const std::vector<array>& a, int hk, int dk, int dv,
+                       bool has_dst, bool has_history_dst) {
+  auto check = [](bool ok) { if (!ok) throw std::invalid_argument("GDN deferred replay contract"); };
+  check(a.size() == size_t(16 + int(has_dst) + int(has_history_dst)));
+  check(a[0].ndim() == 3 && a[0].shape(0) == 1 && a[0].shape(1) >= 1 && a[0].shape(1) <= 16);
+  check(a[7].ndim() == 4 && a[7].shape(0) == 1 && a[7].shape(2) == dv && a[7].shape(3) == dk);
+  const int hv = a[7].shape(1), width = 2 * hk * dk + hv * dv;
+  check(dk == 128 && dv == 128 && hk > 0 && hv % hk == 0 && a[0].shape(2) == width);
+  check(a[10].ndim() == 4 && a[10].shape(0) == 1);
+  const int t = a[10].shape(1);
+  check(t >= 1 && t <= 16 && a[10].shape() == Shape{1,t,hk,dk});
+  check(a[11].shape() == Shape{1,t,hv,dv} && a[12].shape() == Shape{1,t,hv} && a[13].shape() == a[12].shape());
+  check(a[14].shape() == Shape{1,t,width} && a[15].shape() == Shape{1});
+  check(a[10].dtype() == bfloat16 && a[11].dtype() == bfloat16 && a[12].dtype() == float32 &&
+        a[13].dtype() == bfloat16 && a[14].dtype() == bfloat16 && a[15].dtype() == int32);
 }
 
 // Shared host side of both kernels. `Layout` fixes the input order:
@@ -81,7 +106,7 @@ MTL::ComputePipelineState* gdn_fused_pipeline(metal::Device& device, int dk,
 class GdnFused : public fast::Custom {
  public:
   GdnFused(Stream stream, bool complete, int dk, int dv, float eps,
-           bool has_dst, bool has_history_dst)
+           bool has_dst, bool has_history_dst, bool allow_scan8 = false, bool prepared = false, bool allow_t8_storage = false, bool deferred = false)
       : Custom(stream,
                [](std::vector<array>) -> std::vector<array> {
                  throw std::runtime_error("GdnFused has no fallback");
@@ -91,7 +116,7 @@ class GdnFused : public fast::Custom {
         dv_(dv),
         eps_(eps),
         has_dst_(has_dst),
-        has_history_dst_(has_history_dst) {}
+        has_history_dst_(has_history_dst), allow_scan8_(allow_scan8), prepared_(prepared), allow_t8_storage_(allow_t8_storage), deferred_(deferred) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
     throw std::runtime_error("GdnFused requires Metal");
@@ -100,10 +125,31 @@ class GdnFused : public fast::Custom {
   void eval_gpu(const std::vector<array>& inputs,
                 std::vector<array>& outputs) override {
     bridge_testing::record(complete_ ? "gdn_fused_complete" : "gdn_fused_step");
+    if (deferred_) {
+      validate_deferred(inputs, outputs[2].shape(2), dk_, dv_, has_dst_, has_history_dst_);
+      bridge_testing::record("gdn_fused_deferred");
+      // Check the actual evaluated allocations before any destination write.
+      const int destinations = 16;
+      for (size_t dst = destinations; dst < inputs.size(); ++dst) {
+        for (size_t other = 0; other < dst; ++other) {
+          if (inputs[dst].buffer().ptr() == inputs[other].buffer().ptr())
+            throw std::invalid_argument("GDN deferred destination aliases a live input");
+        }
+      }
+    }
     auto& stream = this->stream();
     auto& device = metal::device(stream.device);
     auto& encoder = metal::get_command_encoder(stream);
-    auto* pipeline = gdn_fused_pipeline(device, dk_, dv_, complete_);
+    const bool scan8 = allow_scan8_ && complete_ && dk_ == 128 && dv_ == 128 &&
+        inputs[0].shape(1) == 8;
+    if (prepared_ && (!complete_ || inputs[0].shape(1) != 8 || dk_ != 128 || dv_ != 128))
+      throw std::invalid_argument("prepared GDN replay must retain eight rows");
+    // Select from replay inputs, not the first trace's width. Non-eight
+    // rows retain the original general storage bounds and schedule.
+    const bool t8_storage = allow_t8_storage_ && complete_ && inputs[0].shape(1) == 8;
+    auto* pipeline = gdn_fused_pipeline(device, dk_, dv_, complete_, scan8, prepared_, t8_storage, deferred_);
+    if (t8_storage) bridge_testing::record("gdn_t8_storage");
+    if (prepared_) bridge_testing::record("gdn_sg8_producer");
 
     // Every copy is encoded before this kernel's pipeline and bindings:
     // the copy kernels rebind the encoder's buffer table.
@@ -126,8 +172,8 @@ class GdnFused : public fast::Custom {
     }
     GdnFusedParams params{};
     std::vector<array> bound;
-    bound.reserve(fixed);
-    for (int i = 0; i < fixed; ++i) {
+    bound.reserve(fixed + (deferred_ ? 6 : 0));
+    for (int i = 0; i < fixed + (deferred_ ? 6 : 0); ++i) {
       // The split views stay strided; everything else binds row-contiguous.
       const bool strided = i == z_at || (complete_ && (i == 0 || i == 1 || i == 2 || i == 4));
       bound.push_back(strided ? inputs[i] : contiguous(inputs[i]));
@@ -149,7 +195,7 @@ class GdnFused : public fast::Custom {
 
     auto& out = outputs[0];
     out.set_data(allocator::malloc(out.nbytes()));
-    int extra = fixed;
+    int extra = fixed + (deferred_ ? 6 : 0);
     auto place = [&](array& o, bool in_place, const char* what) {
       if (!in_place) {
         o.set_data(allocator::malloc(o.nbytes()));
@@ -173,6 +219,7 @@ class GdnFused : public fast::Custom {
     params.z_stride_b = int(z.strides(0));
     params.z_stride_t = int(z.strides(1));
     params.eps = eps_;
+    params.pending_T = deferred_ ? inputs[10].shape(1) : 0;
 
     encoder.set_compute_pipeline_state(pipeline);
     int slot = 0;
@@ -182,10 +229,13 @@ class GdnFused : public fast::Custom {
     for (auto& o : outputs) {
       encoder.set_output_array(o, slot++);
     }
-    encoder.set_bytes(params, slot);
+    encoder.set_bytes(params, slot++);
+    if (deferred_) {
+      for (int i = 10; i < 16; ++i) encoder.set_input_array(bound[i], slot++);
+    }
     encoder.dispatch_threadgroups(
         MTL::Size(size_t(state.shape(0)) * size_t(params.hv), 1, 1),
-        MTL::Size(size_t(8) * size_t(dv_), 1, 1));
+        MTL::Size(scan8 ? 256 : size_t(8) * size_t(dv_), 1, 1));
     encoder.add_temporaries(std::move(copies));
   }
 
@@ -199,7 +249,8 @@ class GdnFused : public fast::Custom {
     const auto& o = static_cast<const GdnFused&>(other);
     return complete_ == o.complete_ && dk_ == o.dk_ && dv_ == o.dv_ &&
         eps_ == o.eps_ && has_dst_ == o.has_dst_ &&
-        has_history_dst_ == o.has_history_dst_;
+        has_history_dst_ == o.has_history_dst_ && allow_scan8_ == o.allow_scan8_ &&
+        prepared_ == o.prepared_ && allow_t8_storage_ == o.allow_t8_storage_ && deferred_ == o.deferred_;
   }
 
  protected:
@@ -209,6 +260,10 @@ class GdnFused : public fast::Custom {
   float eps_;
   bool has_dst_;
   bool has_history_dst_;
+  bool allow_scan8_;
+  bool prepared_;
+  bool allow_t8_storage_;
+  bool deferred_;
 };
 
 class GdnFusedStep final : public GdnFused {
@@ -228,17 +283,24 @@ class GdnFusedStep final : public GdnFused {
 class GdnFusedComplete final : public GdnFused {
  public:
   GdnFusedComplete(Stream stream, int hk, int dk, int dv, float eps,
-                   bool has_dst, bool has_history_dst)
-      : GdnFused(stream, true, dk, dv, eps, has_dst, has_history_dst),
+                   bool has_dst, bool has_history_dst, bool allow_scan8, bool prepared = false, bool allow_t8_storage = false, bool deferred = false)
+      : GdnFused(stream, true, dk, dv, eps, has_dst, has_history_dst, allow_scan8, prepared, allow_t8_storage, deferred),
         hk_(hk) {}
 
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    if (deferred_) validate_deferred(inputs, hk_, dk_, dv_, has_dst_, has_history_dst_);
     const auto& qkv = inputs[0];
     const auto& state = inputs[7];
     const int T = qkv.shape(1), hv = state.shape(1);
-    return {Shape{1, T, hv * dv_}, state.shape(), Shape{1, T, hk_, dk_},
+    std::vector<Shape> shapes{Shape{1, T, hv * dv_}, state.shape(), Shape{1, T, hk_, dk_},
             Shape{1, T, hk_, dk_}, Shape{1, T, hv, dv_}, Shape{1, T, hv},
             Shape{1, T, hv}, inputs[4].shape()};
+    if (prepared_) {
+      if (T != 8) throw std::invalid_argument("prepared GDN shape must retain eight rows");
+      shapes.push_back(Shape{hv * dv_ * 4});
+      shapes.push_back(Shape{hv * dv_ / 32 * 8});
+    }
+    return shapes;
   }
 
   bool is_equivalent(const Primitive& other) const override {
@@ -246,7 +308,11 @@ class GdnFusedComplete final : public GdnFused {
         hk_ == static_cast<const GdnFusedComplete&>(other).hk_;
   }
 
-  DEFINE_NAME(GdnFusedComplete)
+  // Stable diagnostic identity for the selected deferred-settlement graph.
+  // Equality, output storage, bindings and arithmetic remain unchanged.
+  const char* name() const override {
+    return deferred_ ? "GdnFusedCompleteDeferred" : "GdnFusedComplete";
+  }
 
  private:
   int hk_;
@@ -388,16 +454,16 @@ extern "C" bool mlx_gdn_fused_step(mlx_array* q, mlx_array* k, mlx_array* v,
 // beta [1, T, Hv] bf16, next_history [3, W] bf16 — bit-identical to
 // `mlx_qwen4_gdn_prepare(mean_eps, beta_input_dtype)` followed by
 // `mlx_gdn_fused_step`. Returns false when off-contract.
-extern "C" bool mlx_gdn_fused_complete(mlx_array* qkv, mlx_array* a,
+static bool gdn_fused_complete(mlx_array* qkv, mlx_array* a,
                                        mlx_array* b, mlx_array* conv,
                                        mlx_array* history, mlx_array* scale,
                                        mlx_array* dt, mlx_array* state,
                                        mlx_array* z, mlx_array* w, float eps,
                                        mlx_array* state_dst,
                                        mlx_array* history_dst,
-                                       mlx_array** outputs) {
+                                       mlx_array** outputs, bool prepared, mlx_array* const* pending = nullptr) {
   if (outputs) {
-    for (int i = 0; i < 8; ++i) outputs[i] = nullptr;
+    for (int i = 0; i < (prepared ? 10 : 8); ++i) outputs[i] = nullptr;
   }
 #ifdef MLX_NODE_METAL_ENABLED
   try {
@@ -424,6 +490,7 @@ extern "C" bool mlx_gdn_fused_complete(mlx_array* qkv, mlx_array* a,
     expect(xa.shape(0) == 1 && sa.shape(0) == 1, "batch must be 1");
     expect(Dk == 128 && Dv == 128, "Dk and Dv must be 128");
     expect(T >= 1 && T <= Dv / 8, "T must be 1..=Dv/8");
+    expect(!prepared || T == 8, "prepared operands require eight rows");
     expect((W - Hv * Dv) > 0 && (W - Hv * Dv) % (2 * Dk) == 0, "qkv width");
     const int Hk = (W - Hv * Dv) / (2 * Dk);
     expect(Hv % Hk == 0, "Hv must be a multiple of Hk");
@@ -438,6 +505,12 @@ extern "C" bool mlx_gdn_fused_complete(mlx_array* qkv, mlx_array* a,
            "prologue dtypes");
     auto dst = check_tail(sa, za, wa, 1, T, Hv, Dv, Dk, eps, state_dst);
     std::vector<array> inputs{xa, aa, ba, ca, ha, sca, dta, sa, za, wa};
+    if (pending) {
+      for (int i = 0; i < 6; ++i) {
+        expect(pending[i] != nullptr, "null deferred input");
+        inputs.push_back(*reinterpret_cast<array*>(pending[i]));
+      }
+    }
     if (dst) inputs.push_back(*dst);
     if (history_dst) {
       const auto& hd = *reinterpret_cast<array*>(history_dst);
@@ -445,19 +518,34 @@ extern "C" bool mlx_gdn_fused_complete(mlx_array* qkv, mlx_array* a,
              "history_dst must match the history");
       inputs.push_back(hd);
     }
+    if (pending) validate_deferred(inputs, Hk, Dk, Dv, dst.has_value(), history_dst != nullptr);
     auto stream = default_stream(Device::gpu);
-    gdn_fused_pipeline(metal::device(stream.device), Dk, Dv, true);
+    const char* scan_env = std::getenv("MLX_GDN_SCAN8");
+    const bool allow_scan8 = scan_env && std::string(scan_env) == "1";
+    const char* storage_env = std::getenv("MLX_GDN_T8_STORAGE");
+    const bool allow_t8_storage = storage_env && std::string(storage_env) == "1";
+    gdn_fused_pipeline(metal::device(stream.device), Dk, Dv, true, allow_scan8 && T == 8, prepared, allow_t8_storage && T == 8, pending != nullptr);
     auto primitive = std::make_shared<GdnFusedComplete>(
-        stream, Hk, Dk, Dv, eps, dst.has_value(), history_dst != nullptr);
-    auto result = array::make_arrays(
-        {Shape{1, T, Hv * Dv}, sa.shape(), Shape{1, T, Hk, Dk},
+        stream, Hk, Dk, Dv, eps, dst.has_value(), history_dst != nullptr, allow_scan8, prepared, allow_t8_storage, pending != nullptr);
+    std::vector<Shape> shapes{Shape{1, T, Hv * Dv}, sa.shape(), Shape{1, T, Hk, Dk},
          Shape{1, T, Hk, Dk}, Shape{1, T, Hv, Dv}, Shape{1, T, Hv},
-         Shape{1, T, Hv}, ha.shape()},
-        {bfloat16, float32, bfloat16, bfloat16, bfloat16, float32, bfloat16,
-         bfloat16},
-        primitive, std::move(inputs));
-    for (int i = 0; i < 8; ++i) {
-      outputs[i] = reinterpret_cast<mlx_array*>(new array(std::move(result[i])));
+         Shape{1, T, Hv}, ha.shape()};
+    std::vector<Dtype> types{bfloat16, float32, bfloat16, bfloat16, bfloat16,
+         float32, bfloat16, bfloat16};
+    if (prepared) {
+      shapes.push_back(Shape{Hv * Dv * 4}); types.push_back(uint32);
+      shapes.push_back(Shape{Hv * Dv / 32 * 8}); types.push_back(float32);
+    }
+    auto result = array::make_arrays(std::move(shapes), std::move(types), primitive, std::move(inputs));
+    // Publish only after every allocation succeeds. On failure the caller sees
+    // the original all-null result, and RAII releases any staged handles.
+    std::vector<std::unique_ptr<array>> handles;
+    handles.reserve(result.size());
+    for (auto& value : result) {
+      handles.push_back(std::make_unique<array>(std::move(value)));
+    }
+    for (size_t i = 0; i < handles.size(); ++i) {
+      outputs[i] = reinterpret_cast<mlx_array*>(handles[i].release());
     }
     return true;
   } catch (const std::exception& e) {
@@ -469,4 +557,35 @@ extern "C" bool mlx_gdn_fused_complete(mlx_array* qkv, mlx_array* a,
   (void)state; (void)z; (void)w; (void)eps; (void)state_dst; (void)history_dst;
   return false;
 #endif
+}
+
+extern "C" bool mlx_gdn_fused_complete(mlx_array* qkv, mlx_array* a,
+    mlx_array* b, mlx_array* conv, mlx_array* history, mlx_array* scale,
+    mlx_array* dt, mlx_array* state, mlx_array* z, mlx_array* w, float eps,
+    mlx_array* state_dst, mlx_array* history_dst, mlx_array** outputs) {
+  return gdn_fused_complete(qkv, a, b, conv, history, scale, dt, state, z, w,
+      eps, state_dst, history_dst, outputs, false);
+}
+
+extern "C" bool mlx_gdn_fused_complete_prepared(mlx_array* qkv, mlx_array* a,
+    mlx_array* b, mlx_array* conv, mlx_array* history, mlx_array* scale,
+    mlx_array* dt, mlx_array* state, mlx_array* z, mlx_array* w, float eps,
+    mlx_array* state_dst, mlx_array* history_dst, mlx_array** outputs) {
+  return gdn_fused_complete(qkv, a, b, conv, history, scale, dt, state, z, w,
+      eps, state_dst, history_dst, outputs, true);
+}
+
+// Optional prior prefix is graph input data, not captured host state. The Rust
+// stepper validates keep in 0..=pending_T before constructing the scalar.
+extern "C" bool mlx_gdn_fused_complete_deferred(mlx_array* qkv, mlx_array* a,
+    mlx_array* b, mlx_array* conv, mlx_array* history, mlx_array* scale,
+    mlx_array* dt, mlx_array* state, mlx_array* z, mlx_array* w, float eps,
+    mlx_array* state_dst, mlx_array* history_dst, mlx_array* const* pending,
+    bool prepared, mlx_array** outputs) {
+  if (!pending) {
+    if (outputs) for (int i = 0; i < (prepared ? 10 : 8); ++i) outputs[i] = nullptr;
+    return false;
+  }
+  return gdn_fused_complete(qkv, a, b, conv, history, scale, dt, state, z, w,
+      eps, state_dst, history_dst, outputs, prepared, pending);
 }

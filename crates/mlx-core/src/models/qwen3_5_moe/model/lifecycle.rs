@@ -65,6 +65,8 @@ impl Qwen35MoeInner {
 
         Ok(Self {
             config,
+            source_moe_policy: Default::default(),
+            source_norm_identity: None,
             turn_cancel: None,
             layer_kinds,
             embedding,
@@ -74,6 +76,13 @@ impl Qwen35MoeInner {
             caches: None,
             tokenizer: None,
             fa_idx,
+            dflash2: None,
+            dflash2_context: None,
+            dflash2_turn_state: None,
+            dflash2_flat_lane_authoritative: false,
+            dflash2_owner_key: None,
+            dflash2_compiled_verify_disabled: false,
+            dflash2_verify_budget: super::super::verify_budget::VerifyBudget::default(),
             vision_encoder: None,
             image_processor: None,
             spatial_merge_size: None,
@@ -597,6 +606,14 @@ impl Qwen35MoeInner {
         model_path: &str,
         weights: &crate::array::memory::WeightsResident,
     ) -> Option<crate::transformer::paged_kv_cache_adapter::ColdTierContext> {
+        // The ordinary fingerprint omits source-norm payload/math identity.
+        // This diagnostic never restores or publishes SSD state under it.
+        if self.source_norm_identity.is_some() {
+            return None;
+        }
+        if self.source_moe_policy.active() {
+            return None;
+        }
         let adapter = self.paged_adapter.as_ref()?;
         let manager = crate::cold_tier::global_cold_cache()?;
         let pool = adapter.layer_kv_pool();
@@ -711,7 +728,9 @@ impl Qwen35MoeInner {
                 if self.config.is_linear_layer(i) {
                     Qwen3_5LayerCache::new_linear()
                 } else {
-                    Qwen3_5LayerCache::new_full_attention()
+                    Qwen3_5LayerCache::new_full_attention_with(
+                        self.config.to_dense_config().kv_format(),
+                    )
                 }
             })
             .collect();
@@ -814,8 +833,15 @@ impl Qwen35MoeInner {
         Ok(rows_prefilled)
     }
 
-    /// Clear cached token history, image key, and rope deltas.
+    /// Discard external-draft state whenever another cache lane takes ownership.
+    pub(super) fn invalidate_dflash2_context(&mut self) {
+        self.dflash2_context = None;
+        self.dflash2_turn_state = None;
+        self.dflash2_flat_lane_authoritative = false;
+    }
+
     fn clear_reuse_state(&mut self) {
+        self.invalidate_dflash2_context();
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_paged_image_token_positions.clear();
@@ -851,5 +877,233 @@ impl Qwen35MoeInner {
         self.caches = None;
         self.clear_reuse_state();
         self.flat_mtp_caches_desynced = false;
+    }
+}
+
+impl Qwen35MoeInner {
+    pub(super) fn erase_compiled_verifies(&self) {
+        crate::compiled_graph::erase_compiled_graphs_matching(
+            forward::COMPILED_VERIFY_ERASE_MASK,
+            forward::COMPILED_VERIFY_TAG | ((self.model_id & 0x00FF_FFFF) << 8),
+        );
+    }
+}
+
+impl Drop for Qwen35MoeInner {
+    fn drop(&mut self) {
+        self.erase_compiled_verifies();
+    }
+}
+
+impl Qwen35MoeInner {
+    /// Loader-only: install before weights are published or any graph/cache exists.
+    pub(crate) fn configure_source_moe_policy(
+        &mut self,
+        policy: super::super::source_math_policy::SourceMoePolicy,
+    ) {
+        for layer in &mut self.layers {
+            layer.configure_source_mixer(policy.mixer);
+            if let super::super::decoder_layer::MLPType::MoE(moe) = &mut layer.mlp {
+                moe.configure_source_moe_policy(policy);
+            }
+        }
+        self.source_moe_policy = policy;
+    }
+}
+
+#[cfg(test)]
+mod source_mixer_profile_tests {
+    #[test]
+    fn source_mixer_profile_rejects_unmeasured_geometry_before_loading() {
+        let mut cfg = super::super::paged_construction_tests::tiny_paged_forward_moe_cfg();
+        let policy = super::super::super::source_math_policy::SourceMoePolicy::default()
+            .with_mixer_value(Some(std::ffi::OsStr::new("1")));
+        assert!(policy.validate_mixer_profile(&cfg).is_err());
+        cfg.hidden_size = 2048;
+        cfg.num_layers = 40;
+        cfg.num_experts = 256;
+        cfg.num_experts_per_tok = 8;
+        cfg.moe_intermediate_size = Some(512);
+        cfg.num_heads = 16;
+        cfg.num_kv_heads = 2;
+        cfg.head_dim = 256;
+        cfg.linear_num_key_heads = 16;
+        cfg.linear_num_value_heads = 32;
+        cfg.linear_key_head_dim = 128;
+        cfg.linear_value_head_dim = 128;
+        cfg.full_attention_interval = 4;
+        policy.validate_mixer_profile(&cfg).unwrap();
+        for field in 0..12 {
+            let mut bad = cfg.clone();
+            match field {
+                0 => bad.hidden_size = 1024,
+                1 => bad.num_layers = 41,
+                2 => bad.num_experts = 128,
+                3 => bad.num_experts_per_tok = 4,
+                4 => bad.moe_intermediate_size = Some(256),
+                5 => bad.num_heads = 8,
+                6 => bad.num_kv_heads = 1,
+                7 => bad.head_dim = 128,
+                8 => bad.linear_num_key_heads = 8,
+                9 => bad.linear_num_value_heads = 48,
+                10 => bad.linear_key_head_dim = 64,
+                _ => bad.full_attention_interval = 3,
+            }
+            assert!(policy.validate_mixer_profile(&bad).is_err());
+            super::super::super::source_math_policy::SourceMoePolicy::default()
+                .validate_mixer_profile(&bad)
+                .unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod source_mixer_mtp_target_tests {
+    use super::*;
+    use crate::array::DType;
+    use crate::models::qwen3_5::layer_cache::{replay_mtp_snapshot_to, snapshot_all_mtp};
+    use crate::models::qwen3_5_moe::source_math_policy::SourceMoePolicy;
+
+    fn values(a: &MxArray) -> Vec<u32> {
+        a.astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect()
+    }
+    fn cache_values(caches: &[Qwen3_5LayerCache]) -> Vec<(i32, Vec<Vec<u32>>)> {
+        caches
+            .iter()
+            .map(|cache| {
+                let arrays = match cache {
+                    Qwen3_5LayerCache::Linear(c) => [c.get(0), c.get(1)]
+                        .into_iter()
+                        .flatten()
+                        .map(values)
+                        .collect(),
+                    Qwen3_5LayerCache::FullAttention(c) => [c.keys_ref(), c.values_ref()]
+                        .into_iter()
+                        .flatten()
+                        .map(|a| values(&a.slice_axis(2, 0, c.get_offset() as i64).unwrap()))
+                        .collect(),
+                };
+                (cache.offset(), arrays)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn source_mixer_eager_mtp_target_fallback_preserves_tape_and_partial_accept() -> Result<()> {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        // Test the exact eager-MTP main-stack entry point with H2048/T8 so
+        // the mixer request is selected. Tiny standard projections force
+        // the native fallback; this is not source-kernel arithmetic proof.
+        let mut cfg = super::super::paged_construction_tests::tiny_paged_forward_moe_cfg();
+        cfg.hidden_size = 2048;
+        cfg.vocab_size = 32;
+        cfg.num_layers = 2;
+        cfg.full_attention_interval = 2;
+        cfg.intermediate_size = 16;
+        cfg.moe_intermediate_size = Some(16);
+        cfg.shared_expert_intermediate_size = Some(16);
+        cfg.num_experts = 2;
+        cfg.num_experts_per_tok = 1;
+        cfg.use_block_paged_cache = Some(false);
+        cfg.n_mtp_layers = 0;
+        let mut inner = Qwen35MoeInner::new(cfg.clone())?;
+        super::super::paged_construction_tests::cast_moe_inner_weights_bf16(&mut inner);
+        let on = SourceMoePolicy::default().with_mixer_value(Some(std::ffi::OsStr::new("1")));
+        let mut native = Some(fresh_moe_layer_caches(&cfg));
+        let mut selected = Some(fresh_moe_layer_caches(&cfg));
+        let prime = MxArray::from_uint32(&[2, 3, 5], &[1, 3])?;
+        for (policy, caches) in [
+            (SourceMoePolicy::default(), &mut native),
+            (on, &mut selected),
+        ] {
+            inner.configure_source_moe_policy(policy);
+            let y = forward::forward_pre_norm_inner(
+                &prime,
+                &inner.embedding,
+                &mut inner.layers,
+                caches,
+                inner.fa_idx,
+            )?;
+            y.eval();
+        }
+        assert_eq!(
+            cache_values(native.as_ref().unwrap()),
+            cache_values(selected.as_ref().unwrap())
+        );
+        for (cycle, keep) in [1usize, 3, 8].into_iter().enumerate() {
+            let tokens = (0..8)
+                .map(|i| ((i + cycle * 3 + 7) % 32) as u32)
+                .collect::<Vec<_>>();
+            let ids = MxArray::from_uint32(&tokens, &[1, 8])?;
+            let mut reference = None;
+            for (policy, caches) in [
+                (SourceMoePolicy::default(), &mut native),
+                (on, &mut selected),
+            ] {
+                inner.configure_source_moe_policy(policy);
+                let snapshot = snapshot_all_mtp(caches.as_ref().unwrap(), false)?;
+                let mut tape = Vec::new();
+                let output = forward::eager_verify_step(
+                    &mut inner.layers,
+                    caches,
+                    &inner.final_norm,
+                    &inner.lm_head,
+                    inner.fa_idx,
+                    &ids,
+                    &inner.embedding,
+                    Some(&mut tape),
+                )?;
+                let layer_tape = tape[0].as_ref().expect("linear target tape");
+                assert!(tape[1].is_none(), "full attention has no GDN tape");
+                let observed = (
+                    values(&output.logits),
+                    values(&output.hiddens),
+                    values(&layer_tape.qkv),
+                    values(&layer_tape.kernel.q),
+                    values(&layer_tape.kernel.k),
+                    values(&layer_tape.kernel.v),
+                    values(&layer_tape.kernel.g),
+                    values(&layer_tape.kernel.beta),
+                );
+                if let Some(want) = &reference {
+                    assert_eq!(&observed, want);
+                } else {
+                    reference = Some(observed);
+                }
+                replay_mtp_snapshot_to(
+                    caches.as_mut().unwrap(),
+                    &snapshot,
+                    &tape,
+                    keep,
+                    false,
+                    "source mixer MTP target test",
+                )?;
+            }
+            assert_eq!(
+                cache_values(native.as_ref().unwrap()),
+                cache_values(selected.as_ref().unwrap())
+            );
+            assert_eq!(
+                selected.as_ref().unwrap()[inner.fa_idx].offset(),
+                3 + [1, 3, 8][..=cycle].iter().sum::<i32>()
+            );
+        }
+        // Session recovery resets cache state but retains the immutable
+        // per-loaded-model arithmetic request and its target-layer flags.
+        inner.configure_source_moe_policy(on);
+        inner.caches = selected;
+        inner.reset_caches_sync()?;
+        assert_eq!(inner.source_moe_policy, on);
+        inner.discard_moe_paged_session();
+        assert_eq!(inner.source_moe_policy, on);
+        Ok(())
     }
 }

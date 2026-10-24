@@ -8,6 +8,12 @@ export const QWEN38_DFLASH2 = {
   sizeGb: 3.85,
 } as const;
 
+export const QWEN36_MOE_DFLASH2 = {
+  label: 'DFlash2',
+  hfRepo: 'incoai/Qwen3.6-35B-A3B-DFlash2',
+  sizeGb: 1.1,
+} as const;
+
 function regularFile(path: string): boolean {
   try {
     const stat = statSync(path);
@@ -58,13 +64,30 @@ export function isDFlash2Companion(path: string): boolean {
   return isDFlash2DraftDirectory(path) && regularFile(join(path, 'model.safetensors'));
 }
 
+function hasMoeDFlash2Geometry(path: string): boolean {
+  try {
+    const config = JSON.parse(readFileSync(join(path, 'config.json'), 'utf8')) as {
+      hidden_size?: unknown;
+      num_target_layers?: unknown;
+    } | null;
+    return config?.hidden_size === 2048 && config.num_target_layers === 40;
+  } catch {
+    return false;
+  }
+}
+
+function isEmbeddedDFlash2Companion(path: string, requireMoeGeometry: boolean): boolean {
+  return isDFlash2Companion(path) && (!requireMoeGeometry || hasMoeDFlash2Geometry(path));
+}
+
 /**
- * Prefer a target's explicit `draft/`, then the shared Qwen3.8-27B companion in
- * its models directory. Shared pairing requires the Qwen3.8-27B target name;
- * Qwen3.5, MoE models and unrelated renamed checkpoints must not acquire it.
+ * Prefer a target's explicit `draft/`, then its family's shared companion.
+ * Shared pairing requires the released target name. Renamed or fine-tuned
+ * targets can opt in with `draft/` or an explicit draftModelPath; geometry
+ * compatibility alone does not establish a trained companion pairing.
  */
 export function findDFlash2Draft(modelPath: string, modelType: string, modelsDir?: string): string | undefined {
-  if (modelType !== 'qwen3_5') return undefined;
+  if (modelType !== 'qwen3_5' && modelType !== 'qwen3_5_moe') return undefined;
   const isGguf = modelPath.toLowerCase().endsWith('.gguf');
   // Discovery records the lexical symlink path, and the recorded model path
   // must stay lexical, so searches run against BOTH the lexical dir and the
@@ -81,16 +104,26 @@ export function findDFlash2Draft(modelPath: string, modelType: string, modelsDir
   }
   const modelDir = isGguf ? dirname(modelPath) : modelPath;
   const resolvedDir = isGguf ? dirname(resolved) : resolved;
+  // A standalone GGUF's directory can be a shared store, so its generic
+  // `draft/` has no target ownership. MoE discovery admits only the released
+  // MoE geometry there; repository and directory drafts remain explicit.
+  const standaloneMoe = isGguf && modelType === 'qwen3_5_moe' && !regularFile(join(modelDir, 'config.json'));
   const embedded = join(modelDir, 'draft');
-  if (isDFlash2Companion(embedded)) return embedded;
+  if (isEmbeddedDFlash2Companion(embedded, standaloneMoe)) return embedded;
   if (resolvedDir !== modelDir) {
+    const resolvedStandaloneMoe =
+      isGguf && modelType === 'qwen3_5_moe' && !regularFile(join(resolvedDir, 'config.json'));
     const resolvedEmbedded = join(resolvedDir, 'draft');
-    if (isDFlash2Companion(resolvedEmbedded)) return resolvedEmbedded;
+    if (isEmbeddedDFlash2Companion(resolvedEmbedded, resolvedStandaloneMoe)) return resolvedEmbedded;
   }
 
-  const targetName = /(?:^|[-_.])qwen3[._-]8[-_.]27b(?:[-_.]|$)/i;
+  const targetName =
+    modelType === 'qwen3_5_moe'
+      ? /(?:^|[-_.])qwen3[._-]6[-_.]35b[-_.]a3b(?:[-_.]|$)/i
+      : /(?:^|[-_.])qwen3[._-]8[-_.]27b(?:[-_.]|$)/i;
   if (!targetName.test(basename(modelPath)) && !(isGguf && targetName.test(basename(modelDir)))) return undefined;
-  const slug = QWEN38_DFLASH2.hfRepo.split('/')[1].toLowerCase();
+  const companion = modelType === 'qwen3_5_moe' ? QWEN36_MOE_DFLASH2 : QWEN38_DFLASH2;
+  const slug = companion.hfRepo.split('/')[1].toLowerCase();
   const roots = modelsDir === undefined ? [isGguf ? modelDir : dirname(modelDir)] : [modelsDir];
   // The linked target's own directory and its parent get the same searches —
   // a companion shipped beside the real file attaches identically to a

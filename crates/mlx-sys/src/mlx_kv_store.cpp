@@ -195,6 +195,97 @@ class KvStoreRows final : public fast::Custom {
   bool bound_;
 };
 
+// A draft proposal writes into the reserved tail of each live window. The
+// window views are explicit graph inputs, so both their physical offset and
+// live length change on a shapeless replay without baking host offsets into
+// the tape. Return full buffers as well as views to preserve the dependency
+// from the proposal store to the next accepted-context append.
+class KvStoreWindowTail final : public fast::Custom {
+ public:
+  explicit KvStoreWindowTail(Stream stream)
+      : Custom(stream, [](std::vector<array>) -> std::vector<array> {
+          throw std::runtime_error("KvStoreWindowTail has no fallback");
+        }) {}
+  DEFINE_NAME(KvStoreWindowTail)
+  bool is_equivalent(const Primitive&) const override { return true; }
+  std::vector<Shape> output_shapes(const std::vector<array>& in) override {
+    return {in[0].shape(), in[1].shape(), in[2].shape(), in[3].shape()};
+  }
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("KvStoreWindowTail requires Metal");
+  }
+  void eval_gpu(const std::vector<array>& in, std::vector<array>& out) override {
+    // Validate every destination before recording any write. A malformed
+    // replay fails closed rather than partially overwriting a prefix.
+    for (int i = 0; i < 2; ++i) {
+      const auto& full = in[i];
+      const auto& view = in[2 + i];
+      const auto& block = in[4 + i];
+      if (full.ndim() != 4 || view.ndim() != 4 || block.ndim() != 4) {
+        throw std::invalid_argument("KvStoreWindowTail: replay rank changed");
+      }
+      const auto row_bytes = size_t(full.shape(3)) * full.itemsize();
+      if (full.dtype() != bfloat16 || view.dtype() != bfloat16 ||
+          block.dtype() != bfloat16 || full.shape(0) != 1 ||
+          !full.flags().row_contiguous || full.shape(0) != view.shape(0) ||
+          full.shape(1) != view.shape(1) || full.shape(3) != view.shape(3) ||
+          full.shape(0) != block.shape(0) || full.shape(1) != block.shape(1) ||
+          full.shape(3) != block.shape(3) || block.shape(2) < 1 ||
+          block.shape(2) > view.shape(2) ||
+          full.buffer().ptr() != view.buffer().ptr() ||
+          view.strides() != full.strides() || view.offset() < full.offset() ||
+          row_bytes == 0 || (view.offset() - full.offset()) % row_bytes != 0 ||
+          (view.offset() - full.offset()) / row_bytes + view.shape(2) >
+              size_t(full.shape(2)) ||
+          full.buffer().ptr() == block.buffer().ptr()) {
+        throw std::invalid_argument("KvStoreWindowTail: invalid window alias or block");
+      }
+    }
+    // K and V copies share a dispatch; neither source may alias the other destination.
+    if (in[0].buffer().ptr() == in[1].buffer().ptr() ||
+        in[0].buffer().ptr() == in[5].buffer().ptr() ||
+        in[1].buffer().ptr() == in[4].buffer().ptr() ||
+        in[2].shape() != in[3].shape() || in[4].shape() != in[5].shape()) {
+      throw std::invalid_argument("KvStoreWindowTail: K/V geometry or ownership differs");
+    }
+    for (int i = 0; i < 4; ++i) out[i].copy_shared_buffer(in[i]);
+    KvStoreParams p{};
+    p.tensors = 2;
+    p.rows = in[4].shape(2);
+    p.offset = in[2].shape(2) - p.rows;
+    p.batch = 1;
+    p.heads = in[4].shape(1);
+    uint32_t max_elems = 0;
+    for (int i = 0; i < 2; ++i) {
+      p.dims[i] = in[4 + i].shape(3);
+      p.itemsize[i] = in[4 + i].itemsize();
+      p.elems[i] = in[4 + i].size();
+      max_elems = std::max(max_elems, p.elems[i]);
+      for (int a = 0; a < 4; ++a) {
+        p.src_strides[i][a] = in[4 + i].strides(a);
+        p.dst_strides[i][a] = in[2 + i].strides(a);
+      }
+    }
+    auto& encoder = metal::get_command_encoder(stream());
+    encoder.set_compute_pipeline_state(kv_store_pipeline(metal::device(stream().device), false));
+    for (int i = 0; i < kMaxBoundTensors; ++i) {
+      const int j = i % 2;
+      encoder.set_output_array(out[2 + j], i);
+      encoder.set_input_array(in[4 + j], kMaxBoundTensors + i);
+    }
+    encoder.set_bytes(p, 2 * kMaxBoundTensors);
+    // Full aliases are returned too; make their write dependency visible to
+    // command-buffer hazard tracking even though the kernel addresses views.
+    encoder.set_output_array(out[0], 9);
+    encoder.set_output_array(out[1], 9);
+    encoder.dispatch_threads(MTL::Size(max_elems, 2, 1), MTL::Size(256, 1, 1));
+  }
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override {
+    throw std::runtime_error("KvStoreWindowTail is inference-only");
+  }
+};
+
 void expect(bool ok, const char* what) {
   if (!ok) {
     throw std::invalid_argument(std::string("mlx_kv_store_rows: ") + what);
@@ -282,6 +373,49 @@ extern "C" bool mlx_kv_store_rows(int32_t tensors, mlx_array* const* dst,
   }
 #else
   (void)tensors; (void)dst; (void)src; (void)offsets;
+  return false;
+#endif
+}
+
+// Inputs: full K/V buffers, live-plus-reserve K/V views, new K/V rows.
+// Outputs: full K/V aliases followed by their written attention views.
+extern "C" bool mlx_kv_store_window_tail(mlx_array* const* args, mlx_array** out) {
+  for (int i = 0; out && i < 4; ++i) out[i] = nullptr;
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    expect(args && out && metal::is_available() && default_device() == Device::gpu,
+           "window tail requires Metal and non-null arguments");
+    std::vector<array> inputs;
+    for (int i = 0; i < 6; ++i) {
+      expect(args[i], "null window tail input");
+      const auto& a = *reinterpret_cast<array*>(args[i]);
+      expect(a.ndim() == 4 && a.dtype() == bfloat16 && a.shape(0) == 1,
+             "window tail requires BF16 [1,H,T,D]");
+      inputs.push_back(a);
+    }
+    for (int i = 0; i < 2; ++i) {
+      expect(inputs[i].shape(1) == inputs[2+i].shape(1) &&
+                 inputs[i].shape(3) == inputs[2+i].shape(3) &&
+                 inputs[i].shape(1) == inputs[4+i].shape(1) &&
+                 inputs[i].shape(3) == inputs[4+i].shape(3) &&
+                 inputs[4+i].shape(2) > 0 &&
+                 inputs[4+i].shape(2) <= inputs[2+i].shape(2),
+             "window tail geometry mismatch");
+    }
+    std::vector<Shape> shapes;
+    for (int i = 0; i < 4; ++i) shapes.push_back(inputs[i].shape());
+    auto outputs = array::make_arrays(std::move(shapes),
+        std::vector<Dtype>(4, bfloat16),
+        std::make_shared<KvStoreWindowTail>(default_stream(Device::gpu)), std::move(inputs));
+    for (int i = 0; i < 4; ++i)
+      out[i] = reinterpret_cast<mlx_array*>(new array(std::move(outputs[i])));
+    return true;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "mlx_kv_store_window_tail: %s\n", e.what());
+    return false;
+  }
+#else
+  (void)args;
   return false;
 #endif
 }

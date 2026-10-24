@@ -95,6 +95,7 @@ fn tiny_mtp_config() -> Qwen3_5MoeConfig {
         persist_paged_cache: None,
         n_mtp_layers: 1,
         qwen35_gguf_gdn_layout: None,
+        kv_format: None,
     }
 }
 
@@ -228,7 +229,7 @@ pub async fn run_synthetic_mtp_gate(mode_label: &str) {
     }
     println!("synthetic MoE+MTP checkpoint created at {ckpt_path}");
 
-    let mtp_model = Qwen3_5MoeModel::load(ckpt_path.clone())
+    let mtp_model = Qwen3_5MoeModel::load(ckpt_path.clone(), None)
         .await
         .expect("failed to load synthetic checkpoint (MTP run)");
     assert!(
@@ -238,7 +239,7 @@ pub async fn run_synthetic_mtp_gate(mode_label: &str) {
          (`create_random_qwen35_moe_checkpoint_sync`) or the \
          `mtp_num_hidden_layers` config round-trip (`save_model_sync`) regressed"
     );
-    let ar_model = Qwen3_5MoeModel::load(ckpt_path)
+    let ar_model = Qwen3_5MoeModel::load(ckpt_path, None)
         .await
         .expect("failed to load synthetic checkpoint (AR reference)");
 

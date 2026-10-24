@@ -125,6 +125,7 @@ impl PagedBackend for Qwen35MoeInner {
         _extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<Self::PrefixState> {
+        self.invalidate_dflash2_context();
         // The `prepare_turn_…` + `prepare_moe_gdn_prefix_state` block that
         // opens a MoE paged turn.
         self.paged_finalize_failed = false;
