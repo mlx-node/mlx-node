@@ -39,35 +39,40 @@ async function readOverrideConfig(overridePath: string): Promise<Record<string, 
 }
 
 describe('PagedConfigOverrideManager persist-paged-cache', () => {
-  it.each([true, false])(
-    'applies persistence=%s to a prepared Muse GGUF without changing its cache',
-    async (persist) => {
-      const sourceConfig = { model_type: 'muse_glimmer', use_block_paged_cache: false, persist_paged_cache: !persist };
-      const prepared = await makeModelDir(sourceConfig);
-      await writeFile(join(prepared, 'draft.safetensors'), 'draft weights');
-      const input = join(prepared, 'Muse-Glimmer-Q4_K_M.gguf');
-      const prepare = vi.spyOn(core, 'prepareMuseGlimmerGguf').mockResolvedValue(prepared);
-      const manager = new PagedConfigOverrideManager();
-      cleanups.push(() => manager.cleanup());
+  it.each([true, false])('muse overlay keeps gguf-source.json and has_dflash with persistence=%s', async (persist) => {
+    const sourceConfig = { model_type: 'muse_glimmer', use_block_paged_cache: false, persist_paged_cache: !persist };
+    const prepared = await makeModelDir(sourceConfig);
+    const input = join(prepared, 'Muse-Glimmer-Q4_K_M.gguf');
+    const ggufSource = {
+      main: input,
+      companion: join(prepared, 'dflash-kquant.gguf'),
+      main_identity: { source_identity: '1'.repeat(64), header_digest: 'a'.repeat(64) },
+      companion_identity: { source_identity: '2'.repeat(64), header_digest: 'b'.repeat(64) },
+    };
+    await writeFile(join(prepared, 'gguf-source.json'), JSON.stringify(ggufSource), 'utf-8');
+    await writeFile(join(prepared, 'draft.safetensors'), 'draft weights');
+    const prepare = vi.spyOn(core, 'prepareMuseGlimmerGguf').mockResolvedValue(prepared);
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
 
-      const resolved = await manager.resolve(input, 'muse_glimmer', persist);
-      expect(prepare).toHaveBeenCalledWith(input);
-      expect(resolved).not.toBe(prepared);
-      expect(await readOverrideConfig(resolved)).toMatchObject({
-        use_block_paged_cache: true,
-        persist_paged_cache: persist,
-      });
-      expect(await readFile(join(resolved, 'draft.safetensors'), 'utf8')).toBe('draft weights');
-      expect(await readOverrideConfig(prepared)).toEqual(sourceConfig);
-      expect(await manager.resolve(input, 'muse_glimmer', persist)).toBe(resolved);
-    },
-  );
+    const resolved = await manager.resolve(input, 'muse_glimmer', persist);
+    expect(prepare).toHaveBeenCalledWith(input);
+    expect(resolved).not.toBe(prepared);
+    expect(await readOverrideConfig(resolved)).toMatchObject({
+      use_block_paged_cache: true,
+      persist_paged_cache: persist,
+    });
+    expect(JSON.parse(await readFile(join(resolved, 'gguf-source.json'), 'utf8'))).toEqual(ggufSource);
+    expect(await readFile(join(resolved, 'draft.safetensors'), 'utf8')).toBe('draft weights');
+    expect(await readOverrideConfig(prepared)).toEqual(sourceConfig);
+    expect(await manager.resolve(input, 'muse_glimmer', persist)).toBe(resolved);
+  });
 
-  // Codex round-6: each resolve of a muse_glimmer .gguf acquires one prepared-dir
-  // lease reference. `claimPreparedLease` hands references out one per load
-  // attempt, and `cleanup()` releases whatever was never claimed — otherwise a
-  // resolve whose load never ran would pin a multi-GB cache entry for the
-  // process lifetime.
+  // Each resolve of a muse_glimmer .gguf acquires one prepared-asset lease
+  // reference. `claimPreparedLease` hands references out one per load attempt,
+  // and `cleanup()` releases whatever was never claimed — otherwise a resolve
+  // whose load never ran would keep the lazy assets protected from stale/debris
+  // cleanup for the process lifetime.
   it('hands out one prepared lease per resolve attempt and releases unclaimed ones on cleanup', async () => {
     const prepared = await makeModelDir({ model_type: 'muse_glimmer', use_block_paged_cache: false });
     const input = join(prepared, 'Muse-Glimmer-Q4_K_M.gguf');
@@ -108,7 +113,7 @@ describe('PagedConfigOverrideManager persist-paged-cache', () => {
     expect(release).toHaveBeenCalledWith(prepared);
   });
 
-  it('does not prepare GGUF weights for an unmanaged family', async () => {
+  it('does not prepare Muse GGUF assets for an unmanaged family', async () => {
     const prepare = vi.spyOn(core, 'prepareMuseGlimmerGguf');
     const manager = new PagedConfigOverrideManager({ modelTypes: ['qwen3_5'] });
     cleanups.push(() => manager.cleanup());

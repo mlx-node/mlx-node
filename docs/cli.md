@@ -415,17 +415,20 @@ unified vision/audio checkpoint, also keep its matching `mmproj-*.gguf` there.
 For example, `Gemma4Model.load('.cache/models/gemma-4-12b-it-qat-q4_0-gguf')`
 loads Google's QAT checkpoint without a separate conversion command.
 
-The first load creates an application cache, preserving supported quantized weights
-in packed form and preparing the media companion in the same transaction.
+Every load reads the GGUF directly and repacks its supported quantized tensors
+into MLX layouts in memory, including the media companion when media is enabled.
+A small asset directory holds only config/tokenizer/template files and
+`gguf-source.json`; it does not hold a packed-weight copy of the model.
 Supported source types are F32/F16/BF16, the affine blocks Q4_0, Q4_1, Q5_0,
 Q5_1 and Q8_0, MXFP4, the K/IQ formats Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
 IQ4_NL and IQ4_XS, and the grid formats IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS,
 IQ2_S, IQ3_XXS and IQ3_S (so every Unsloth `UD-IQ*` / `UD-Q2_K_XL` mix loads
 at ggml's byte size).
-Later loads reuse it. `MLX_NATIVE_GGUF_CACHE_DIR` overrides the cache directory;
-source files are not modified. Changes to the source, companion, or tokenizer
-assets invalidate the cache. A directory with multiple text GGUFs requires an
-explicit filename. Existing SafeTensors directories keep their usual load path.
+Later loads reuse the small asset directory, not converted weights.
+`MLX_NATIVE_GGUF_CACHE_DIR` overrides that asset root; source files are not
+modified. Changes to the source, companion, or tokenizer assets invalidate
+asset reuse. A directory with multiple text GGUFs requires an explicit filename.
+Existing SafeTensors directories keep their usual load path.
 
 The agent model picker lists Gemma GGUF variants by filename stem and excludes
 media projectors and draft files. The QAT 12B checkpoint mixes Q4_0 projections
@@ -454,17 +457,20 @@ const model = await MuseGlimmerModel.load(
 
 A directory containing one primary GGUF also works; multiple targets require
 an explicit filename. Existing SafeTensors directories retain their normal
-load path. The first load prepares a native cache with packed quantized
-weights, preserving each tensor's source K format. Later loads reuse it;
-`MLX_NATIVE_GGUF_CACHE_DIR` overrides its location.
+load path. Every load reads the source GGUF and repacks each tensor in memory,
+preserving its source K format. Only a small config/tokenizer asset directory
+is reused between loads; `MLX_NATIVE_GGUF_CACHE_DIR` overrides that asset root.
 
-An optional DFlash companion is validated and cached with the target. Selection
-prefers `dflash-<target-filename>`, then the shared `dflash-kquant.gguf`, then
-a single remaining `dflash-*.gguf`. Ambiguous companions produce an error.
-Changes to the source, companion, or tokenizer assets invalidate the cache.
-Agent paging and persistence settings apply to an isolated config over this
-cache; downloaded files are not modified. Muse's runtime currently supports
-text input, and neither draft files nor `mmproj` projectors appear as models.
+An optional DFlash companion is validated and recorded with the target, then
+read and repacked alongside it when present. Selection prefers
+`dflash-<target-filename>`, then the shared `dflash-kquant.gguf`, then a single
+remaining `dflash-*.gguf`. Ambiguous companions produce an error. Changes to
+the source, companion, or tokenizer assets invalidate asset reuse. Agent paging
+and persistence settings apply to an isolated config overlay of the asset dir;
+its `gguf-source.json` symlink keeps the target and DFlash source metadata
+attached, and downloaded files are not modified. Muse's runtime currently
+supports text input, and neither draft files nor `mmproj` projectors appear as
+models.
 
 To rerun the optional inference regression against a downloaded checkpoint:
 
@@ -888,8 +894,9 @@ the repos carry. The same repo serves every platform — Apple Silicon and Linux
 NVIDIA CUDA alike — and the wizard passes each entry's `--assets-repo`
 (`Qwen/Qwen3.8-27B`, `Qwen/Qwen-AgentWorld-35B-A3B`,
 `unsloth/gemma-4-26B-A4B-it`) so the tokenizer sidecars land beside the weights.
-K-quants are repacked losslessly into MLX layout on first load (the native GGUF
-cache), and Qwen3.8-27B's MTP layer is converted inline from its final GGUF
+K-quants are read directly and repacked losslessly into MLX layout in memory on
+every load; only small config/tokenizer assets are cached, not another packed
+checkpoint. Qwen3.8-27B's MTP layer is imported inline from its final GGUF
 block (the repo's separate `MTP/*.gguf` is not downloaded — nothing pairs a
 GGUF MTP sidecar) so speculative decoding activates automatically;
 the Qwen3.8-27B default therefore carries no separate `draft` companion (the
@@ -925,18 +932,27 @@ Leading positionals pass through to the agent binary and run without spawning th
 
 ### Native caches
 
-GGUF-backed loads (Qwen3.8, Gemma 4, Muse-Glimmer and the other GGUF families)
-and the Qwen3.8 mapped expert pack (`~/Library/Caches/mlx-node/qwen4-packed` on macOS, `~/.cache/mlx-node/qwen4-packed` elsewhere) write into per-user native caches.
-Both self-maintain on the next load: stale or orphaned entries are removed
-under per-key locks, and live writers are never disturbed — deleting a cache
-directory yourself is only needed to reclaim space immediately. A Qwen3.8 pack
-whose source volume is unplugged is kept until the volume returns, and is then
-checked against its source again.
+Direct GGUF loads for Qwen3.5/3.6/3.8 dense and MoE, CLEF, Gemma 4, and
+Muse-Glimmer keep small per-checkpoint asset entries under
+`~/Library/Caches/mlx-node/native-gguf` on macOS (`~/.cache/mlx-node/native-gguf`
+elsewhere). These entries contain config/tokenizer/template files and
+`gguf-source.json`, not packed weights: the original GGUF and any companion are
+read and repacked in memory on every load. Leases protect assets that can still
+be read lazily, while stale/debris cleanup runs under per-key locks.
+
+The Qwen3.8 Flash Next mapped expert pack remains a separate cache at
+`~/Library/Caches/mlx-node/qwen4-packed` on macOS (`~/.cache/mlx-node/qwen4-packed`
+elsewhere), with its existing mapped-pack behavior. Stale or orphaned entries
+are removed without disturbing live writers; deleting a cache directory yourself
+is only needed to reclaim space immediately. A Flash Next pack whose source
+volume is unplugged is kept until the volume returns, and is then checked
+against its source again.
 
 | Env var                        | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MLX_NATIVE_GGUF_CACHE_DIR`    | Override the native GGUF cache location (packed weights, extracted tokenizer assets, companions)                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `MLX_NATIVE_GGUF_CACHE_MAX_GB` | Cap its total size, in GiB (fractional allowed). `<=0`, unset or unparseable = unlimited. Least-recently-used entries evict under a 24 h grace; a conversion that still cannot fit is not published — the load reads it from its staging directory instead, and a later reload reuses that staged result instead of re-converting. A refused load keeps a per-pid fallback dir that never counts toward the cap and outlives every sweep while the process lives (tokenizer sidecars keep a `.mlx-qwen4-assets-live-{identity}-{pid}` twin of it) |
+| `MLX_NATIVE_GGUF_CACHE_DIR`    | Override the native GGUF asset root (config/tokenizer/template files and `gguf-source.json`). This does not relocate the Flash Next mapped expert pack.                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `MLX_GGUF_PAGE_CACHE`          | Direct GGUF preload reads only: `auto` (default) uses the OS page cache unless the planned read is larger than half physical RAM; `on` always uses it; `off` requests a bypass for load reads. Bypassing does not evict pages already cached. Flash Next mapped expert reads keep their existing behavior. |
+| `MLX_NATIVE_GGUF_CACHE_MAX_GB` | Legacy cap-only setting for remaining packed-weight conversion entries and extracted native sidecars, in GiB (fractional allowed). `<=0`, unset or unparseable = unlimited. Least-recently-used entries evict under a 24 h grace; a conversion that still cannot fit is not published — the load reads it from its staging directory instead, and a later reload reuses that staged result instead of re-converting. A refused load keeps a per-pid fallback dir that never counts toward the cap and outlives every sweep while the process lives (tokenizer sidecars keep a `.mlx-qwen4-assets-live-{identity}-{pid}` twin of it) |
 
 ## Dashboard
 

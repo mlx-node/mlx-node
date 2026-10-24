@@ -727,6 +727,66 @@ mod tests {
         fs::remove_dir_all(&work).ok();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overlay_dir_config_wins_over_asset_config() {
+        let work = work_dir("overlay-config");
+        let fx = write_import_fixture("muse-draft", &work.join("src"));
+        let prepared =
+            prepare_gguf_assets_in(&fx.main, NativeGgufFamily::MuseGlimmer, &work.join("cache"))
+                .await
+                .unwrap();
+        let overlay = work.join("overlay");
+        fs::create_dir(&overlay).unwrap();
+        fs::copy(
+            prepared.asset_dir.join("config.json"),
+            overlay.join("config.json"),
+        )
+        .unwrap();
+        for entry in fs::read_dir(&prepared.asset_dir).unwrap() {
+            let source = entry.unwrap().path();
+            let name = source.file_name().unwrap();
+            if name == "config.json" || !source.is_file() {
+                continue;
+            }
+            std::os::unix::fs::symlink(&source, overlay.join(name)).unwrap();
+        }
+
+        // The prepared config is no longer a valid description of the import;
+        // only the unchanged overlay copy agrees with the plan.
+        let mut asset_config: Value =
+            serde_json::from_slice(&fs::read(prepared.asset_dir.join("config.json")).unwrap())
+                .unwrap();
+        asset_config["quantization"]["overlay_must_win"] = json!({ "layout": "t64" });
+        fs::write(
+            prepared.asset_dir.join("config.json"),
+            serde_json::to_vec_pretty(&asset_config).unwrap(),
+        )
+        .unwrap();
+
+        let resolved = CheckpointSource::resolve_in(
+            &overlay,
+            NativeGgufFamily::MuseGlimmer,
+            Some(&work.join("cache")),
+        )
+        .await
+        .unwrap();
+        let CheckpointSource::Gguf(ckpt) = &resolved else {
+            panic!("the Muse overlay resolved to a plain directory");
+        };
+        assert_eq!(ckpt.asset_dir, overlay);
+        assert!(!ckpt.leased, "the prepared lease stays with the caller");
+        ckpt.check_asset_config().unwrap_or_else(|error| {
+            panic!("the overlay config was not authoritative: {}", error.reason)
+        });
+        assert!(
+            ckpt.preload_input(true).companion.is_some(),
+            "the overlay lost the DFlash companion recorded by gguf-source.json"
+        );
+        native_gguf_unlease_in_use(&prepared.asset_dir);
+        fs::remove_dir_all(&work).ok();
+    }
+
     #[tokio::test]
     async fn checkpoint_identity_matches_prepare() {
         let work = work_dir("identity");

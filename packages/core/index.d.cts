@@ -4823,9 +4823,12 @@ export interface PhaseProfile {
 export declare function preflightMuseDflashGguf(inputPath: string, targetConfigDir: string): void;
 
 /**
- * Prepare a Muse-Glimmer GGUF target and its optional DFlash companion in the
- * native cache without loading the model. Hosts can apply per-session config
- * overrides to this directory without modifying sources or repacking weights.
+ * Prepare a leased, small asset directory for a Muse-Glimmer GGUF target
+ * without loading or repacking weights. It holds config/tokenizer/template
+ * assets and `gguf-source.json`, which records the target and optional DFlash
+ * companion; it holds no packed-weight files. Hosts can apply per-session
+ * config overlays without modifying sources, but must preserve that source
+ * record. Each returned directory carries one lease reference.
  */
 export declare function prepareMuseGlimmerGguf(modelPath: string): Promise<string>;
 
@@ -5548,12 +5551,13 @@ export interface RecResult {
 }
 
 /**
- * Release ONE lease reference `prepare_*`/`assets` took on `dir`. Model
- * loaders already release on failed init; this binding exists for hosts
- * that transform the prepared path (config overlays) before handing a
- * different directory to the loader — their load failure must reach this
- * release or the prepared entry pins against the cap for the process
- * lifetime. Unleasing an unleased path is a no-op.
+ * Release ONE lease reference `prepare_*`/`assets` took on `dir`. Leases
+ * protect small asset dirs from stale/debris cleanup while config, tokenizer,
+ * or template files can still be read lazily; they do not own packed weights.
+ * Model loaders already release on failed init. Hosts that transform the
+ * prepared path (config overlays) before handing a different directory to the
+ * loader must release this attempt's reference on load failure or keep the
+ * assets leased for the process lifetime. Unleasing an unleased path is a no-op.
  */
 export declare function releaseNativeGgufLease(dir: string): void;
 

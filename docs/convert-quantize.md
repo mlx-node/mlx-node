@@ -416,8 +416,9 @@ Rules (`tile_kquant_weights_for_disk`, `gguf.rs`):
   `N % 64 == 0` and `K % 256 == 0`. Embeddings, tied heads, router gates, `in_proj_a/b`,
   3-D expert stacks and odd widths stay row-major; odd widths are not padded on disk (the
   GDN loader pads `in_proj_ba` at load). A checkpoint may mix both.
-- The native GGUF cache format is v6 for this; v5 entries (row-major) are not aliased and
-  still load, permuting at load.
+- Explicit GGUF → SafeTensors conversion writes the tiled weights to the requested output.
+  Direct GGUF loading instead applies the same per-tensor marks from its small asset
+  `config.json` while repacking in memory on every load; it writes no tiled-weight cache.
 
 Loader side: `PerLayerQuant::layout` (`KQuantLayout::{RowMajor, Tiled64}`) is validated in
 `resolve_kquant_group` against the shape (a `t64` marker on a 3-D stack or an odd width
