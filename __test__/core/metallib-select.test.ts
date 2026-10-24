@@ -741,7 +741,7 @@ describe('selectPagedMetallib / assertPagedMetallibIntegrity', () => {
   it('integrity gate: rejects a paged library without the segmented SDPA / mixed-affine kernels', () => {
     // The K-quant-only library of the previous build.
     expect(() => assertPagedMetallibIntegrity(pagedLibrary(KQUANT), { path: 'x', minBytes: 1 })).toThrow(
-      new RegExp(`missing segmented SDPA / mixed-affine kernel\\(s\\) ${BRIDGE_KERNEL_MARKERS.join(', ')}`),
+      `missing segmented SDPA / mixed-affine kernel(s) or GGUF repack kernel(s) ${BRIDGE_KERNEL_MARKERS.join(', ')}`,
     );
     for (const dropped of BRIDGE_KERNEL_MARKERS) {
       const library = pagedLibrary(PREBUILT.filter((name) => name !== dropped));

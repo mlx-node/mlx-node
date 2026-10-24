@@ -589,7 +589,14 @@ export function assertPagedMetallibIntegrity(metallib: Buffer, opts: { path: str
         `containing mlx-sys-*/out dir.`,
     );
   }
-  const missingBridge = BRIDGE_KERNEL_MARKERS.filter((name) => !metallib.includes(name));
+  const missingBridge = BRIDGE_KERNEL_MARKERS.filter((name) => {
+    if ((GGUF_REPACK_KERNEL_MARKERS as readonly string[]).includes(name)) {
+      // Base repack names also prefix their _t64 variants, so substring checks
+      // can hide a missing base kernel. Repack symbols are exact NUL-delimited names.
+      return !metallib.includes(`\0${name}\0`, 'latin1');
+    }
+    return !metallib.includes(name);
+  });
   if (missingBridge.length > 0) {
     throw new Error(
       `[build.ts metallib gate] ${opts.path} is missing segmented SDPA / mixed-affine kernel(s) or ` +
