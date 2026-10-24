@@ -2467,19 +2467,27 @@ pub(crate) mod gate {
         }
     }
 
+    fn manifest_entry(a: &MxArray) -> serde_json::Value {
+        let shape: Vec<i64> = a.shape().unwrap().to_vec();
+        serde_json::json!({
+            "dtype": st_dtype(a.dtype().unwrap()),
+            "shape": shape,
+            "sha256": sha256_hex(&tensor_bytes(a)),
+        })
+    }
+
     pub(crate) fn manifest(map: &HashMap<String, MxArray>) -> BTreeMap<String, serde_json::Value> {
         map.iter()
-            .map(|(name, a)| {
-                let shape: Vec<i64> = a.shape().unwrap().to_vec();
-                (
-                    name.clone(),
-                    serde_json::json!({
-                        "dtype": st_dtype(a.dtype().unwrap()),
-                        "shape": shape,
-                        "sha256": sha256_hex(&tensor_bytes(a)),
-                    }),
-                )
-            })
+            .map(|(name, a)| (name.clone(), manifest_entry(a)))
+            .collect()
+    }
+
+    /// Hash a weight map without retaining its tensors after each entry.
+    pub(crate) fn manifest_owned(
+        map: HashMap<String, MxArray>,
+    ) -> BTreeMap<String, serde_json::Value> {
+        map.into_iter()
+            .map(|(name, a)| (name, manifest_entry(&a)))
             .collect()
     }
 
@@ -2624,4 +2632,15 @@ pub(crate) mod gate {
         }
         assert_eq!(bad, 0, "tensors differ from the golden");
     }
+
+    /// Phase 1 G1: every listed real model, Auto vs CpuOnly vs baseline golden,
+    /// followed by the four source bit-flip cases on the 27B model.
+    #[test]
+    #[ignore = "reads every real G1 GGUF; set MLX_GATE_LIST and MLX_GATE_GOLDEN"]
+    fn gate1_whole_model() {
+        super::gate1::run();
+    }
 }
+
+#[cfg(test)]
+mod gate1;
