@@ -383,8 +383,9 @@ fn eval(h: *mut mlx_sys::mlx_array) {
     let mut buf = [0i8; 512];
     let mut hs = [h];
     // SAFETY: live handle; `buf` receives the error text.
-    let ok =
-        unsafe { mlx_sys::mlx_eval_with_error(hs.as_mut_ptr(), 1, buf.as_mut_ptr(), buf.len()) };
+    let ok = unsafe {
+        mlx_sys::mlx_eval_with_error(hs.as_mut_ptr(), 1, buf.as_mut_ptr().cast(), buf.len())
+    };
     if !ok {
         let bytes: Vec<u8> = buf
             .iter()

@@ -9,13 +9,14 @@ MLX's public C++ API.
 ml-explore/mlx main  bebd6422f (2026-10-14)
         │
         │  + 10 patches  fork fn-d1
+        │  + 1 patch     local CUDA fix
         ▼
-mlx-node/mlx         7aa7d680b  ◄── gitlink at crates/mlx-sys/mlx
+mlx-node/mlx         281135222  ◄── gitlink at crates/mlx-sys/mlx
 ```
 
 Name a patch by its subject and use its commit hash for the exact gitlink.
 
-## The 10 patches
+## The 11 patches
 
 | #   | commit      | patch                                                                                                                                                                 | why it cannot live in mlx-node                                                                                                                                                                                                                                                                                                                                                                                                                                    | upstream candidate |
 | --- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
@@ -29,11 +30,14 @@ Name a patch by its subject and use its commit hash for the exact gitlink.
 | 8   | `ba46defc6` | Command trace binding: command-buffer and stream tags join primitive trace lines to completed GPU commands                                                            | Lives in the existing `CommandEncoder::commit` and `gpu::eval` trace paths; diagnostics only                                                                                                                                                                                                                                                                                                                                                                      | no (diagnostics)   |
 | 9   | `14992add0` | `MLX_METAL_SERIAL_ENCODER=1` selects serial compute dispatch for controlled experiments; concurrent dispatch remains the default                                      | Encoder creation is inside `CommandEncoder`; resource bookkeeping, cross-encoder fences and stream ordering stay in the same implementation                                                                                                                                                                                                                                                                                                                       | not proposed       |
 | 10  | `7aa7d680b` | Sparse input budget: `set_input_array_with_budget` supplies an explicit storage-unit scheduling estimate; repeated or shared bindings restore the full charge         | The scheduling estimate and discount restoration live in `CommandEncoder`'s private input-binding state. Actual resource tracking, hazards, retention and memory limits remain there too                                                                                                                                                                                                                                                                          | not proposed       |
+| 11  | `e0dcc863e` | Pass explicit `CompileOptions::Data` zero at both CUDA `CustomKernel` construction sites | `std::make_shared` cannot deduce the type of a braced `{}` argument; zero preserves the default safe math mode and completes patch 1's `output_shapes` support on CUDA. The constructor and call sites are inside MLX. This is our local fork commit, not an upstream `ml-explore/mlx` commit | yes |
 
-The active pin has 10 direct commits from the fork's `fn-d1` branch. The
-retired workspace commit remains an inactive descendant on that branch; moving the
-gitlink to its parent does not rewrite `fn-d1`. `build.rs` uses the checked-out
-submodule directly for CMake, bridge headers, Metal kernels and generated preambles.
+The active pin merges the 10 direct commits from the fork's `fn-d1` branch with
+our local CUDA constructor fix `e0dcc863e`, which is not an upstream
+`ml-explore/mlx` change. The retired workspace commit remains an inactive
+descendant on `fn-d1`; moving the gitlink to its parent does not rewrite that
+branch. `build.rs` uses the checked-out submodule directly for CMake, bridge
+headers, Metal kernels and generated preambles.
 There is no parent-repo patch stack or generated patched source tree.
 
 The bridge also prints `[mlx-compiled]` lines under `MLX_METAL_COMMAND_TRACE` ≥ 1

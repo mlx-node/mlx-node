@@ -347,6 +347,7 @@ pub(super) fn sampled_resident(map: &Mmap) -> bool {
 mod tests {
     use super::*;
     use std::fs::File;
+    #[cfg(target_os = "macos")]
     use std::os::fd::AsRawFd;
     use std::path::PathBuf;
 
@@ -365,15 +366,18 @@ mod tests {
         }
     }
 
-    /// Written through F_NOCACHE, so no page of it is in the page cache.
-    fn cold_file(path: &PathBuf, pages: usize) -> File {
+    /// Fresh pack file; macOS writes bypass the page cache for cold-cache tests.
+    fn test_file(path: &PathBuf, pages: usize) -> File {
         let file = File::options()
             .read(true)
             .write(true)
             .create_new(true)
             .open(path)
             .unwrap();
-        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+        #[cfg(target_os = "macos")]
+        unsafe {
+            libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1)
+        };
         let page = page_size();
         let chunk: Vec<u8> = (0..page * 4).map(|i| (i * 7 % 251) as u8).collect();
         let mut offset = 0;
@@ -391,7 +395,7 @@ mod tests {
             .map(|layer| {
                 Some(["gate", "up", "down"].map(|part| {
                     let path = dir.0.join(format!("blk.{layer}.{part}"));
-                    Mmap::map(cold_file(&path, pages), 0, pages * page_size()).unwrap()
+                    Mmap::map(test_file(&path, pages), 0, pages * page_size()).unwrap()
                 }))
             })
             .collect()
@@ -403,9 +407,9 @@ mod tests {
         let mut vec = vec![0u8; pages];
         let rc = unsafe {
             libc::mincore(
-                map.as_ptr().cast::<c_void>(),
+                map.as_ptr().cast_mut().cast(),
                 map.len(),
-                vec.as_mut_ptr().cast::<libc::c_char>(),
+                vec.as_mut_ptr().cast(),
             )
         };
         assert_eq!(rc, 0);
@@ -540,12 +544,13 @@ mod tests {
     /// MUTATION: drop the resident-chunk skip in `Pread::fetch`
     /// -> no chunk is skipped and "the resident chunks were read again"
     /// fails.
+    #[cfg(target_os = "macos")]
     #[test]
     fn resident_chunks_are_skipped_and_the_holes_between_them_read() {
         let dir = Temp::new();
         let pages = (4 * CHUNK) / page_size();
         let path = dir.0.join("holes");
-        let map = Mmap::map(cold_file(&path, pages), 0, pages * page_size()).unwrap();
+        let map = Mmap::map(test_file(&path, pages), 0, pages * page_size()).unwrap();
         let cached = File::open(&path).unwrap();
         let mut buf = vec![0u8; CHUNK];
         for chunk in [1usize, 3] {
@@ -581,7 +586,7 @@ mod tests {
         let dir = Temp::new();
         let pages = (4 * CHUNK) / page_size();
         let path = dir.0.join("warm");
-        let map = Mmap::map(cold_file(&path, pages), 0, pages * page_size()).unwrap();
+        let map = Mmap::map(test_file(&path, pages), 0, pages * page_size()).unwrap();
         let mut buf = vec![0u8; 4 * CHUNK];
         File::open(&path)
             .unwrap()
@@ -624,6 +629,7 @@ mod tests {
     /// MUTATION: drop the F_RDAHEAD fcntl in `Pread::fetch`
     /// -> the kernel reads ahead of the last chunk and "the kernel read
     /// ahead past the stop" fails.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_fetch_stops_between_two_chunks() {
         READ_CHUNKS.with(|read| read.set(0));
@@ -632,7 +638,7 @@ mod tests {
         let pages = (32 * CHUNK) / page_size();
         let map = Arc::new(
             Mmap::map(
-                cold_file(&dir.0.join("long"), pages),
+                test_file(&dir.0.join("long"), pages),
                 0,
                 pages * page_size(),
             )
@@ -713,21 +719,24 @@ mod tests {
         assert!(recorder.stopped_mid_file.load(Ordering::Acquire));
         assert!(recorder.fetched().len() < 12, "the stream did not finish");
 
-        let pages = (3 * CHUNK) / page_size();
-        let map = Mmap::map(
-            cold_file(&dir.0.join("stopped"), pages),
-            0,
-            pages * page_size(),
-        )
-        .unwrap();
-        Pread.fetch(&map, &AtomicBool::new(true), &AtomicUsize::new(0));
-        assert_eq!(
-            resident_fraction(&map),
-            0.0,
-            "a stopped fetch reads nothing"
-        );
-        Pread.fetch(&map, &AtomicBool::new(false), &AtomicUsize::new(0));
-        assert_eq!(resident_fraction(&map), 1.0);
+        #[cfg(target_os = "macos")]
+        {
+            let pages = (3 * CHUNK) / page_size();
+            let map = Mmap::map(
+                test_file(&dir.0.join("stopped"), pages),
+                0,
+                pages * page_size(),
+            )
+            .unwrap();
+            Pread.fetch(&map, &AtomicBool::new(true), &AtomicUsize::new(0));
+            assert_eq!(
+                resident_fraction(&map),
+                0.0,
+                "a stopped fetch reads nothing"
+            );
+            Pread.fetch(&map, &AtomicBool::new(false), &AtomicUsize::new(0));
+            assert_eq!(resident_fraction(&map), 1.0);
+        }
     }
 
     /// The stream yields to the model's row reads: while rows are pending
@@ -735,6 +744,7 @@ mod tests {
     /// and a pool dropped while it yields still returns at once.
     /// MUTATION: drop the wait on `rows` in `Pread::fetch` ->
     /// "the stream read on while rows were pending" fails.
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_stream_yields_to_pending_row_reads() {
         let dir = Temp::new();
@@ -771,6 +781,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     fn resident_bytes() -> u64 {
         let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
@@ -791,6 +802,7 @@ mod tests {
     /// page of every file resident, the sampled check tells the cold pack
     /// from the warm one, and nothing of the files is mapped into this
     /// process by the read (the banks' own mapping must stay untouched).
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_stream_makes_the_pack_resident_against_the_page_cache() {
         let dir = Temp::new();

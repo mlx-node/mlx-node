@@ -159,8 +159,9 @@ fn qmm(
 fn eval(handle: *mut mlx_sys::mlx_array) {
     let mut error = [0i8; 512];
     let mut handle = handle;
-    let ok =
-        unsafe { mlx_sys::mlx_eval_with_error(&mut handle, 1, error.as_mut_ptr(), error.len()) };
+    let ok = unsafe {
+        mlx_sys::mlx_eval_with_error(&mut handle, 1, error.as_mut_ptr().cast(), error.len())
+    };
     assert!(ok, "qmm eval failed");
 }
 
@@ -462,7 +463,7 @@ fn draft_affine_q4_small_m_qmm() {
                     mlx_sys::mlx_eval_with_error(
                         handles.as_mut_ptr(),
                         handles.len(),
-                        error.as_mut_ptr(),
+                        error.as_mut_ptr().cast(),
                         error.len(),
                     )
                 };

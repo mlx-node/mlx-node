@@ -87,7 +87,12 @@ fn eval_all(hs: &mut [*mut mlx_sys::mlx_array]) {
     let mut buf = [0i8; 512];
     // SAFETY: live handles; `buf` receives the error text.
     let ok = unsafe {
-        mlx_sys::mlx_eval_with_error(hs.as_mut_ptr(), hs.len(), buf.as_mut_ptr(), buf.len())
+        mlx_sys::mlx_eval_with_error(
+            hs.as_mut_ptr(),
+            hs.len(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
     };
     assert!(ok, "qmm eval failed");
     for &h in hs.iter() {

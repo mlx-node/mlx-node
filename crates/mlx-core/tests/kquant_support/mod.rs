@@ -325,7 +325,7 @@ fn eval(handle: *mut mlx_sys::mlx_array) -> Result<(), String> {
     let mut buf = [0i8; 512];
     let mut h = handle;
     // SAFETY: `handle` is live; `buf` is the error sink.
-    let ok = unsafe { mlx_sys::mlx_eval_with_error(&mut h, 1, buf.as_mut_ptr(), buf.len()) };
+    let ok = unsafe { mlx_sys::mlx_eval_with_error(&mut h, 1, buf.as_mut_ptr().cast(), buf.len()) };
     if ok {
         return Ok(());
     }
