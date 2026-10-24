@@ -35,9 +35,7 @@ use crate::utils::gguf_read::{
     ALIGN, CHUNK_BYTES, PageCacheMode, READ_THREADS, ReadAt, Reader, SLOT_BYTES, SLOTS, Window,
     log_load_start, maybe_log_slow_disk, plan_reads, sampled_resident_fraction, set_nocache,
 };
-#[cfg(test)]
-use crate::utils::gguf_source::{GGUF_IMPORT_CONTRACT, GgufIdentity};
-use crate::utils::gguf_source::{GgufFileHandle, GgufFileIdentity, GgufSourceSet};
+use crate::utils::gguf_source::{GgufFileHandle, GgufFileIdentity, GgufIdentity, GgufSourceSet};
 use crate::utils::host::physical_memory;
 
 pub(crate) const CPU_THREADS: usize = 8;
@@ -1327,6 +1325,15 @@ impl PreloadInput {
             flip: None,
         }
     }
+
+    /// Every GGUF this load names, read or not: the companion is part of the
+    /// checkpoint even when this load skips it.
+    pub(crate) fn identity(&self) -> GgufIdentity {
+        GgufIdentity::new(
+            &self.main.2,
+            self.companion.as_ref().map(|(_, _, identity, _)| identity),
+        )
+    }
 }
 
 pub(crate) struct GgufPreload {
@@ -1445,13 +1452,7 @@ impl GgufPreload {
             clef_head,
             ple_shards,
             #[cfg(test)]
-            identity: GgufIdentity {
-                files: std::iter::once(main_identity)
-                    .chain(input.companion.as_ref().map(|(_, _, identity, _)| identity))
-                    .cloned()
-                    .collect(),
-                contract: GGUF_IMPORT_CONTRACT,
-            },
+            identity: input.identity(),
             stats,
         })
     }

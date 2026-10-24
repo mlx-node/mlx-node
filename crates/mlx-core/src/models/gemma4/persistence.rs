@@ -8,7 +8,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
-use crate::cold_tier::{CheckpointLoadGuard, resolve_persist_cold};
+use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard, resolve_persist_cold};
 use crate::engine::checkpoint_source::{CheckpointSource, GGUF_SOURCE_FILE};
 use crate::engine::persistence::{
     KeyRule, RenameSpec, WRAPPER_STRIP_PREFIXES, apply_rename_spec, cast_f32_tensors_to_bf16,
@@ -2795,14 +2795,16 @@ impl Gemma4Inner {
         // fail-closed gate before this loader attaches persistence.
         let persist_cold =
             resolve_persist_cold("gemma4", persist_env.as_deref(), config.persist_paged_cache);
-        let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
+        let gguf_identity = preload_input.as_ref().map(PreloadInput::identity);
+        let checkpoint_files = CheckpointFiles::new(path, gguf_identity.as_ref());
+        let mut checkpoint_load = CheckpointLoadGuard::before_read(checkpoint_files, persist_cold);
 
         let _free_released =
             crate::array::memory::FreeReleasedSources::enable(preload_input.is_some());
         let (mut params, ple_shards) =
             load_gemma_weights(path, &config, preload_input, ple_shard_byte_budget())?;
 
-        checkpoint_load.record_mmap();
+        checkpoint_load.record_read();
 
         // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval
         // of any mmap-backed weight (FP8 dequant in `dequant_fp8_weights`,
@@ -3047,7 +3049,7 @@ impl Gemma4Inner {
             // The gemma4 context additionally carries a `ColdSidecarPolicy`, so
             // attaching it also arms the reconcile-down restore and the
             // auxiliary-state obligation the sliding prefill discharges.
-            if let Some(ctx) = inner.build_cold_tier_context(model_path, &weights_resident) {
+            if let Some(ctx) = inner.build_cold_tier_context(checkpoint_files, &weights_resident) {
                 if checkpoint_load.stable_after_fingerprint() {
                     inner.attach_cold_tier(ctx, &weights_resident);
                 } else {

@@ -10,7 +10,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
-use crate::cold_tier::{CheckpointLoadGuard, resolve_persist_cold};
+use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard, resolve_persist_cold};
 use crate::engine::checkpoint_source::CheckpointSource;
 use crate::engine::persistence::{
     KeyRule, RenameSpec, WRAPPER_STRIP_PREFIXES, apply_rename_spec, dequant_fp8_weights,
@@ -1880,7 +1880,10 @@ pub(crate) async fn load_with_source(
                     config.persist_paged_cache,
                 ) && source_norm_request.is_none()
                     && !source_moe_policy.active();
-                let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
+                let gguf_identity = preload_input.as_ref().map(PreloadInput::identity);
+                let checkpoint_files = CheckpointFiles::new(path, gguf_identity.as_ref());
+                let mut checkpoint_load =
+                    CheckpointLoadGuard::before_read(checkpoint_files, persist_cold);
 
                 let _free_released =
                     crate::array::memory::FreeReleasedSources::enable(preload_input.is_some());
@@ -1891,7 +1894,7 @@ pub(crate) async fn load_with_source(
                 // the WHOLE load-to-fingerprint span so a mid-load
                 // model-directory swap can never bind the OLD weights to a NEW
                 // revision's fingerprint.
-                checkpoint_load.record_mmap();
+                checkpoint_load.record_read();
 
                 // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval
                 // of any mmap-backed weight (FP8 dequant + MTP-norm probe in
@@ -2270,7 +2273,8 @@ pub(crate) async fn load_with_source(
                 // identity read is enforced by the compiler rather than by
                 // this call order.
                 if persist_cold
-                    && let Some(ctx) = inner.build_cold_tier_context(&model_path, &weights_resident)
+                    && let Some(ctx) =
+                        inner.build_cold_tier_context(checkpoint_files, &weights_resident)
                 {
                     if checkpoint_load.stable_after_fingerprint() {
                         inner.attach_cold_tier(ctx, &weights_resident);

@@ -20,6 +20,7 @@ use napi_derive::napi;
 use sha2::{Digest, Sha256};
 
 use crate::array::memory::WeightsResident;
+use crate::utils::gguf_source::GgufIdentity;
 
 static GLOBAL: OnceLock<Option<Arc<ColdCacheManager>>> = OnceLock::new();
 
@@ -515,6 +516,68 @@ impl ShardIdentity {
             }
         }
     }
+
+    fn fingerprint_component(&self) -> Vec<u8> {
+        let mut out = self.len.to_le_bytes().to_vec();
+        #[cfg(unix)]
+        {
+            out.extend_from_slice(&self.dev.to_le_bytes());
+            out.extend_from_slice(&self.ino.to_le_bytes());
+            out.extend_from_slice(&self.mtime.to_le_bytes());
+            out.extend_from_slice(&self.mtime_nsec.to_le_bytes());
+        }
+        #[cfg(not(unix))]
+        {
+            let nanos = self
+                .mtime
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            out.extend_from_slice(&nanos.to_le_bytes());
+        }
+        out
+    }
+}
+
+/// The files a load takes its weights from: the `.safetensors` shards of a
+/// directory, or the GGUF files a preload read (main, then companion).
+#[derive(Clone, Copy)]
+pub(crate) enum CheckpointFiles<'a> {
+    Dir(&'a Path),
+    Gguf(&'a GgufIdentity),
+}
+
+impl<'a> CheckpointFiles<'a> {
+    pub(crate) fn new(dir: &'a Path, gguf: Option<&'a GgufIdentity>) -> Self {
+        gguf.map_or(Self::Dir(dir), Self::Gguf)
+    }
+
+    pub(crate) fn label(&self) -> std::path::Display<'a> {
+        match *self {
+            Self::Dir(dir) => dir.display(),
+            Self::Gguf(identity) => identity
+                .files
+                .first()
+                .map_or(Path::new(""), |file| file.path.as_path())
+                .display(),
+        }
+    }
+
+    fn snapshot(&self) -> Option<HashMap<String, ShardIdentity>> {
+        match *self {
+            Self::Dir(dir) => snapshot_shard_identities(dir),
+            Self::Gguf(identity) => identity
+                .files
+                .iter()
+                .map(|file| {
+                    let meta = fs::metadata(&file.path).ok()?;
+                    Some((
+                        file.path.to_string_lossy().into_owned(),
+                        ShardIdentity::from_metadata(&meta),
+                    ))
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Snapshot the on-disk identity of every top-level `.safetensors` shard in
@@ -581,29 +644,25 @@ pub(crate) fn shard_identities_stable(
 }
 
 pub(crate) struct CheckpointLoadGuard<'a> {
-    path: &'a Path,
+    files: CheckpointFiles<'a>,
     enabled: bool,
-    before_mmap: Option<HashMap<String, ShardIdentity>>,
-    at_mmap: Option<HashMap<String, ShardIdentity>>,
+    before_read: Option<HashMap<String, ShardIdentity>>,
+    after_read: Option<HashMap<String, ShardIdentity>>,
 }
 
 impl<'a> CheckpointLoadGuard<'a> {
-    pub(crate) fn before_mmap(path: &'a Path, enabled: bool) -> Self {
+    pub(crate) fn before_read(files: CheckpointFiles<'a>, enabled: bool) -> Self {
         Self {
-            path,
+            files,
             enabled,
-            before_mmap: if enabled {
-                snapshot_shard_identities(path)
-            } else {
-                None
-            },
-            at_mmap: None,
+            before_read: if enabled { files.snapshot() } else { None },
+            after_read: None,
         }
     }
 
-    pub(crate) fn record_mmap(&mut self) {
-        self.at_mmap = if self.enabled {
-            snapshot_shard_identities(self.path)
+    pub(crate) fn record_read(&mut self) {
+        self.after_read = if self.enabled {
+            self.files.snapshot()
         } else {
             None
         };
@@ -611,11 +670,7 @@ impl<'a> CheckpointLoadGuard<'a> {
 
     pub(crate) fn stable_after_fingerprint(&self) -> bool {
         self.enabled
-            && shard_identities_stable(
-                &self.before_mmap,
-                &self.at_mmap,
-                &snapshot_shard_identities(self.path),
-            )
+            && shard_identities_stable(&self.before_read, &self.after_read, &self.files.snapshot())
     }
 }
 
@@ -740,7 +795,7 @@ pub(crate) struct ColdTierGeometry {
 /// empty `materialize_weights(&[])` cannot launder the ordering.
 pub(crate) fn build_model_fingerprint(
     model_type: &str,
-    model_path: &str,
+    files: CheckpointFiles<'_>,
     config_json: Option<&[u8]>,
     geometry: &ColdTierGeometry,
     weights: &WeightsResident,
@@ -749,27 +804,62 @@ pub(crate) fn build_model_fingerprint(
     // about to read, so fail safe rather than bind KV to unread weights.
     if weights.bytes() == 0 {
         tracing::warn!(
-            "cold-tier persistence disabled for {model_path}: the weight-materialization \
+            "cold-tier persistence disabled for {}: the weight-materialization \
              witness covers {} arrays / {} bytes, so the shard bytes this identity reads \
              are not provably the bytes the model runs",
+            files.label(),
             weights.arrays(),
             weights.bytes(),
         );
         return None;
     }
 
-    let dir = Path::new(model_path);
+    let mut components: Vec<Vec<u8>> = vec![model_type.as_bytes().to_vec()];
+    if let Some(cfg) = config_json {
+        components.push(cfg.to_vec());
+    }
+    match files {
+        CheckpointFiles::Dir(dir) => push_dir_identity(dir, &mut components)?,
+        CheckpointFiles::Gguf(identity) => push_gguf_identity(identity, &mut components)?,
+    }
 
+    components.push(geometry.block_size.to_le_bytes().to_vec());
+    components.push(geometry.num_layers.to_le_bytes().to_vec());
+    components.push(geometry.num_kv_heads.to_le_bytes().to_vec());
+    components.push(geometry.head_size.to_le_bytes().to_vec());
+    components.push(geometry.cache_dtype.clone().into_bytes());
+
+    Some(ColdCacheFingerprint::from_components(
+        components.iter().map(|c| c.as_slice()),
+    ))
+}
+
+/// The weights were read from these GGUFs at load (the preload's open and
+/// after-read fstat matched the prepare-time identity), so the identity binds
+/// the import contract, each file's prepare identity and header digest, and
+/// its stat now. A full data digest would read every weight byte again.
+fn push_gguf_identity(identity: &GgufIdentity, components: &mut Vec<Vec<u8>>) -> Option<()> {
+    if identity.files.is_empty() {
+        return None;
+    }
+    components.push(b"cold-identity:gguf:v1\0".to_vec());
+    components.push(identity.contract.as_bytes().to_vec());
+    for file in &identity.files {
+        let meta = fs::metadata(&file.path).ok()?;
+        components.push(file.path.as_os_str().as_encoded_bytes().to_vec());
+        components.push(file.source_identity.as_bytes().to_vec());
+        components.push(file.header_digest.to_vec());
+        components.push(ShardIdentity::from_metadata(&meta).fingerprint_component());
+    }
+    Some(())
+}
+
+fn push_dir_identity(dir: &Path, components: &mut Vec<Vec<u8>>) -> Option<()> {
     // Deterministic (sorted) shard enumeration. A missing/unreadable directory
     // or an empty shard set means there is no weight content to bind to.
     let shard_names = shard_file_names(dir)?;
     if shard_names.is_empty() {
         return None;
-    }
-
-    let mut components: Vec<Vec<u8>> = vec![model_type.as_bytes().to_vec()];
-    if let Some(cfg) = config_json {
-        components.push(cfg.to_vec());
     }
 
     let manifest = read_download_manifest(dir);
@@ -828,16 +918,7 @@ pub(crate) fn build_model_fingerprint(
         components.push(b"index.json\0".to_vec());
         components.push(index_bytes);
     }
-
-    components.push(geometry.block_size.to_le_bytes().to_vec());
-    components.push(geometry.num_layers.to_le_bytes().to_vec());
-    components.push(geometry.num_kv_heads.to_le_bytes().to_vec());
-    components.push(geometry.head_size.to_le_bytes().to_vec());
-    components.push(geometry.cache_dtype.clone().into_bytes());
-
-    Some(ColdCacheFingerprint::from_components(
-        components.iter().map(|c| c.as_slice()),
-    ))
+    Some(())
 }
 
 /// Sorted file names of every top-level `.safetensors` shard in `dir`.
@@ -1158,15 +1239,15 @@ mod tests {
         let stable = unique_tmp("checkpoint-guard-stable");
         std::fs::create_dir_all(&stable).unwrap();
         std::fs::write(stable.join("model.safetensors"), b"one").unwrap();
-        let mut guard = CheckpointLoadGuard::before_mmap(&stable, true);
-        guard.record_mmap();
+        let mut guard = CheckpointLoadGuard::before_read(CheckpointFiles::Dir(&stable), true);
+        guard.record_read();
         assert!(guard.stable_after_fingerprint());
         let _ = std::fs::remove_dir_all(&stable);
 
         let omitted = unique_tmp("checkpoint-guard-omitted");
         std::fs::create_dir_all(&omitted).unwrap();
         std::fs::write(omitted.join("model.safetensors"), b"one").unwrap();
-        let guard = CheckpointLoadGuard::before_mmap(&omitted, true);
+        let guard = CheckpointLoadGuard::before_read(CheckpointFiles::Dir(&omitted), true);
         assert!(!guard.stable_after_fingerprint());
         let _ = std::fs::remove_dir_all(&omitted);
 
@@ -1174,9 +1255,10 @@ mod tests {
         std::fs::create_dir_all(&before_changed).unwrap();
         let shard = before_changed.join("model.safetensors");
         std::fs::write(&shard, b"one").unwrap();
-        let mut guard = CheckpointLoadGuard::before_mmap(&before_changed, true);
+        let mut guard =
+            CheckpointLoadGuard::before_read(CheckpointFiles::Dir(&before_changed), true);
         std::fs::write(&shard, b"different-length").unwrap();
-        guard.record_mmap();
+        guard.record_read();
         assert!(!guard.stable_after_fingerprint());
         let _ = std::fs::remove_dir_all(&before_changed);
 
@@ -1184,23 +1266,24 @@ mod tests {
         std::fs::create_dir_all(&after_changed).unwrap();
         let shard = after_changed.join("model.safetensors");
         std::fs::write(&shard, b"one").unwrap();
-        let mut guard = CheckpointLoadGuard::before_mmap(&after_changed, true);
-        guard.record_mmap();
+        let mut guard =
+            CheckpointLoadGuard::before_read(CheckpointFiles::Dir(&after_changed), true);
+        guard.record_read();
         std::fs::write(&shard, b"different-length").unwrap();
         assert!(!guard.stable_after_fingerprint());
         let _ = std::fs::remove_dir_all(&after_changed);
 
         let missing = unique_tmp("checkpoint-guard-missing");
         let _ = std::fs::remove_dir_all(&missing);
-        let mut guard = CheckpointLoadGuard::before_mmap(&missing, true);
-        guard.record_mmap();
+        let mut guard = CheckpointLoadGuard::before_read(CheckpointFiles::Dir(&missing), true);
+        guard.record_read();
         assert!(!guard.stable_after_fingerprint());
 
         let disabled = unique_tmp("checkpoint-guard-disabled");
-        let mut guard = CheckpointLoadGuard::before_mmap(&disabled, false);
+        let mut guard = CheckpointLoadGuard::before_read(CheckpointFiles::Dir(&disabled), false);
         std::fs::create_dir_all(&disabled).unwrap();
         std::fs::write(disabled.join("model.safetensors"), b"one").unwrap();
-        guard.record_mmap();
+        guard.record_read();
         assert!(!guard.stable_after_fingerprint());
         let _ = std::fs::remove_dir_all(&disabled);
     }
@@ -1364,7 +1447,7 @@ mod tests {
         let config = br#"{"model_type":"qwen3","hidden_size":1024}"#;
         build_model_fingerprint(
             "qwen3",
-            dir.to_str().unwrap(),
+            CheckpointFiles::Dir(dir),
             Some(config),
             &geometry(),
             weights,
@@ -2216,6 +2299,225 @@ mod tests {
 
         drop(manager);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn write_gguf_file(path: &Path, arch: &str, seed: u8) {
+        let data = [seed; 64];
+        let bytes = crate::utils::gguf_test_fixtures::build_minimal_gguf(
+            &[(
+                "general.architecture",
+                crate::utils::gguf::GgufMetaValue::String(arch.to_string()),
+            )],
+            &[(
+                "a.weight",
+                &[16],
+                crate::utils::gguf::GgufTensorType::F32,
+                &data,
+            )],
+        );
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn gguf_file_identity(path: &Path) -> crate::utils::gguf_source::GgufFileIdentity {
+        let header = crate::utils::gguf::parse_gguf(path).unwrap();
+        crate::utils::gguf_source::file_identity(path, &header, &std::fs::metadata(path).unwrap())
+            .unwrap()
+    }
+
+    fn build_gguf(identity: &GgufIdentity) -> Option<ColdCacheFingerprint> {
+        build_model_fingerprint(
+            "qwen3_5",
+            CheckpointFiles::Gguf(identity),
+            Some(br#"{"model_type":"qwen3_5"}"#),
+            &geometry(),
+            &materialized(),
+        )
+    }
+
+    fn gguf_dir(tag: &str) -> PathBuf {
+        let dir = unique_tmp(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn gguf_fingerprint_is_some_for_asset_dir_without_safetensors() {
+        let dir = gguf_dir("gguf-fp-asset-dir");
+        let asset = dir.join("asset");
+        std::fs::create_dir_all(&asset).unwrap();
+        std::fs::write(asset.join("config.json"), b"{}").unwrap();
+        let main = dir.join("main.gguf");
+        write_gguf_file(&main, "qwen35", 1);
+        let identity = GgufIdentity::new(&gguf_file_identity(&main), None);
+
+        assert!(
+            build(&asset).is_none(),
+            "an asset dir has no shard, so the Dir identity stays off"
+        );
+        let files = CheckpointFiles::new(&asset, Some(&identity));
+        assert!(
+            build_model_fingerprint("qwen3_5", files, Some(b"{}"), &geometry(), &materialized())
+                .is_some(),
+            "a GGUF load must get a fingerprint from its GGUF files"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gguf_fingerprint_stable_across_reopen() {
+        let dir = gguf_dir("gguf-fp-reopen");
+        let main = dir.join("main.gguf");
+        let companion = dir.join("mmproj.gguf");
+        write_gguf_file(&main, "qwen35", 1);
+        write_gguf_file(&companion, "clip", 2);
+        let first = build_gguf(&GgufIdentity::new(
+            &gguf_file_identity(&main),
+            Some(&gguf_file_identity(&companion)),
+        ))
+        .expect("first load");
+        let second = build_gguf(&GgufIdentity::new(
+            &gguf_file_identity(&main),
+            Some(&gguf_file_identity(&companion)),
+        ))
+        .expect("second load");
+        assert_eq!(
+            first, second,
+            "two loads of unchanged GGUFs must share the fingerprint"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gguf_fingerprint_changes_on_touch() {
+        let dir = gguf_dir("gguf-fp-touch");
+        let main = dir.join("main.gguf");
+        write_gguf_file(&main, "qwen35", 1);
+        let identity = GgufIdentity::new(&gguf_file_identity(&main), None);
+        let before = build_gguf(&identity).expect("before");
+        let mtime = std::fs::metadata(&main).unwrap().modified().unwrap();
+        set_shard_mtime(&main, mtime - std::time::Duration::from_secs(10));
+        let after = build_gguf(&identity).expect("after");
+        assert_ne!(before, after, "a touched GGUF must change the fingerprint");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gguf_fingerprint_changes_on_len() {
+        let dir = gguf_dir("gguf-fp-len");
+        let main = dir.join("main.gguf");
+        write_gguf_file(&main, "qwen35", 1);
+        let identity = GgufIdentity::new(&gguf_file_identity(&main), None);
+        let before = build_gguf(&identity).expect("before");
+        let mtime = std::fs::metadata(&main).unwrap().modified().unwrap();
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::options().append(true).open(&main).unwrap();
+            file.write_all(&[0u8; 32]).unwrap();
+        }
+        set_shard_mtime(&main, mtime);
+        let after = build_gguf(&identity).expect("after");
+        assert_ne!(
+            before, after,
+            "a GGUF of another length must change the fingerprint"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gguf_fingerprint_changes_on_companion_change() {
+        let dir = gguf_dir("gguf-fp-companion");
+        let main = dir.join("main.gguf");
+        let first = dir.join("mmproj-a.gguf");
+        let second = dir.join("mmproj-b.gguf");
+        write_gguf_file(&main, "qwen35", 1);
+        write_gguf_file(&first, "clip", 2);
+        write_gguf_file(&second, "clip", 3);
+        let main_identity = gguf_file_identity(&main);
+        let with_first = build_gguf(&GgufIdentity::new(
+            &main_identity,
+            Some(&gguf_file_identity(&first)),
+        ))
+        .expect("first companion");
+        let with_second = build_gguf(&GgufIdentity::new(
+            &main_identity,
+            Some(&gguf_file_identity(&second)),
+        ))
+        .expect("second companion");
+        let without = build_gguf(&GgufIdentity::new(&main_identity, None)).expect("no companion");
+        assert_ne!(
+            with_first, with_second,
+            "another companion must change the fingerprint"
+        );
+        assert_ne!(
+            with_first, without,
+            "dropping the companion must change the fingerprint"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gguf_fingerprint_changes_on_header_byte() {
+        let dir = gguf_dir("gguf-fp-header");
+        let main = dir.join("main.gguf");
+        write_gguf_file(&main, "qwen35", 1);
+        let identity = GgufIdentity::new(&gguf_file_identity(&main), None);
+        write_gguf_file(&main, "qwen36", 1);
+        let rewritten = gguf_file_identity(&main);
+        assert_ne!(
+            rewritten.header_digest, identity.files[0].header_digest,
+            "the rewrite must change a header byte"
+        );
+        let mut same_stat = identity.clone();
+        same_stat.files[0].header_digest = rewritten.header_digest;
+        assert_ne!(
+            build_gguf(&identity).expect("old header"),
+            build_gguf(&same_stat).expect("new header"),
+            "a GGUF with another header must change the fingerprint"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gguf_guard_detects_swap_between_snapshots() {
+        let dir = gguf_dir("gguf-guard-swap");
+        let main = dir.join("main.gguf");
+        let companion = dir.join("mmproj.gguf");
+        write_gguf_file(&main, "qwen35", 1);
+        write_gguf_file(&companion, "clip", 2);
+        let identity = GgufIdentity::new(
+            &gguf_file_identity(&main),
+            Some(&gguf_file_identity(&companion)),
+        );
+        let files = CheckpointFiles::Gguf(&identity);
+
+        let mut guard = CheckpointLoadGuard::before_read(files, true);
+        guard.record_read();
+        assert!(
+            guard.stable_after_fingerprint(),
+            "unchanged GGUFs are stable"
+        );
+
+        let swap = |path: &Path, arch: &str| {
+            let staged = path.with_extension("staged");
+            write_gguf_file(&staged, arch, 9);
+            std::fs::rename(&staged, path).unwrap();
+        };
+        let mut guard = CheckpointLoadGuard::before_read(files, true);
+        swap(&companion, "clip");
+        guard.record_read();
+        assert!(
+            !guard.stable_after_fingerprint(),
+            "a companion swapped during the load must keep cold persistence off"
+        );
+
+        let mut guard = CheckpointLoadGuard::before_read(files, true);
+        guard.record_read();
+        swap(&main, "qwen35");
+        assert!(
+            !guard.stable_after_fingerprint(),
+            "a main GGUF swapped after the read must keep cold persistence off"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

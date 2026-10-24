@@ -5,7 +5,7 @@ use std::sync::Arc;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::cold_tier::{CheckpointLoadGuard, resolve_persist_cold};
+use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard, resolve_persist_cold};
 use crate::engine::checkpoint_source::CheckpointSource;
 use crate::engine::persistence::{
     KeyRule, RenameSpec, apply_rename_spec, load_checkpoint, parse_generation_defaults,
@@ -601,7 +601,9 @@ fn load_inner(path: &Path, preload_input: Option<PreloadInput>) -> Result<(MuseG
         persist_env.as_deref(),
         config.persist_paged_cache,
     );
-    let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
+    let gguf_identity = preload_input.as_ref().map(PreloadInput::identity);
+    let checkpoint_files = CheckpointFiles::new(path, gguf_identity.as_ref());
+    let mut checkpoint_load = CheckpointLoadGuard::before_read(checkpoint_files, persist_cold);
     let from_gguf = preload_input.is_some();
     let _free_released = crate::array::memory::FreeReleasedSources::enable(from_gguf);
     let mut preload = preload_input
@@ -613,7 +615,7 @@ fn load_inner(path: &Path, preload_input: Option<PreloadInput>) -> Result<(MuseG
         preload.as_mut(),
     )?;
     let preloaded_draft = preload.map(|mut preload| std::mem::take(&mut preload.companion));
-    checkpoint_load.record_mmap();
+    checkpoint_load.record_read();
     if persist_cold {
         crate::engine::persistence::prewarm_checkpoint_pages(path);
     }
@@ -748,8 +750,11 @@ fn load_inner(path: &Path, preload_input: Option<PreloadInput>) -> Result<(MuseG
     inner.row_exact_decode_projections =
         requires_row_exact_decode_projections(top_mode, &overrides);
     if let Some(weights_resident) = weights_resident.as_ref()
-        && let Some(context) =
-            inner.build_cold_tier_context(&path.to_string_lossy(), weights_resident)
+        && let Some(context) = inner.build_cold_tier_context(
+            &path.to_string_lossy(),
+            checkpoint_files,
+            weights_resident,
+        )
     {
         if checkpoint_load.stable_after_fingerprint() {
             inner.attach_cold_tier(context, weights_resident);

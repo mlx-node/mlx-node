@@ -22,7 +22,7 @@ use napi::bindgen_prelude::*;
 use tracing::info;
 
 use crate::array::{DType, MxArray};
-use crate::cold_tier::{CheckpointLoadGuard, resolve_persist_cold};
+use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard, resolve_persist_cold};
 use crate::engine::persistence::{
     KeyRule, RenameSpec, apply_rename_spec, cast_f32_tensors_to_bf16, dequant_fp8_block_scale,
     dequant_fp8_weights, load_all_safetensors, prewarm_checkpoint_pages,
@@ -296,13 +296,14 @@ impl K2Inner {
             persist_env.as_deref(),
             config.persist_paged_cache,
         );
-        let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
+        let mut checkpoint_load =
+            CheckpointLoadGuard::before_read(CheckpointFiles::Dir(path), persist_cold);
 
         let (quant_bits, quant_group_size, top_level_mode, per_layer_quant) =
             load_quant_settings_from_disk(path, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE)?;
 
         let mut params = load_all_safetensors(path, false)?;
-        checkpoint_load.record_mmap();
+        checkpoint_load.record_read();
 
         // Watchdog pre-warm before the FIRST GPU eval on mmap-backed
         // weights (FP8 dequant is the first touch on the raw checkpoint).

@@ -347,6 +347,7 @@ impl MuseGlimmerInner {
     pub(crate) fn build_cold_tier_context(
         &self,
         model_path: &str,
+        files: crate::cold_tier::CheckpointFiles<'_>,
         weights: &crate::array::memory::WeightsResident,
     ) -> Option<ColdTierContext> {
         let coordinator = self.paged.as_ref().map(|paged| &paged.coordinator)?;
@@ -365,7 +366,7 @@ impl MuseGlimmerInner {
         };
         match crate::cold_tier::build_model_fingerprint(
             "muse_glimmer",
-            model_path,
+            files,
             Some(&config_json),
             &pool_geometry,
             weights,
@@ -377,7 +378,8 @@ impl MuseGlimmerInner {
             }),
             None => {
                 tracing::warn!(
-                    "cold-tier persistence disabled for {model_path}: could not establish a complete model fingerprint"
+                    "cold-tier persistence disabled for {}: could not establish a complete model fingerprint",
+                    files.label()
                 );
                 None
             }

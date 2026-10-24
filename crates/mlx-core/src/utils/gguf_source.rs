@@ -9,7 +9,6 @@ use sha2::{Digest, Sha256};
 use crate::cold_tier::ShardIdentity;
 use crate::utils::gguf::{GgufFile, source_file_identity_digest};
 
-#[cfg(test)]
 pub(crate) const GGUF_IMPORT_CONTRACT: &str = "gguf-import:v8";
 
 pub(crate) struct GgufFileHandle {
@@ -33,11 +32,19 @@ pub(crate) struct GgufFileIdentity {
     pub header_digest: [u8; 32],
 }
 
-#[cfg(test)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct GgufIdentity {
     pub files: Vec<GgufFileIdentity>,
     pub contract: &'static str,
+}
+
+impl GgufIdentity {
+    pub(crate) fn new(main: &GgufFileIdentity, companion: Option<&GgufFileIdentity>) -> Self {
+        Self {
+            files: std::iter::once(main).chain(companion).cloned().collect(),
+            contract: GGUF_IMPORT_CONTRACT,
+        }
+    }
 }
 
 fn changed_since_prepare(path: &Path) -> Error {
@@ -123,13 +130,10 @@ impl GgufSourceSet {
 
     #[cfg(test)]
     pub(crate) fn identity(&self) -> GgufIdentity {
-        GgufIdentity {
-            files: std::iter::once(&self.main)
-                .chain(self.companion.as_ref())
-                .map(|h| h.identity.clone())
-                .collect(),
-            contract: GGUF_IMPORT_CONTRACT,
-        }
+        GgufIdentity::new(
+            &self.main.identity,
+            self.companion.as_ref().map(|h| &h.identity),
+        )
     }
 
     #[cfg(test)]

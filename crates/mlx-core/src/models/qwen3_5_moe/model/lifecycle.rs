@@ -603,7 +603,7 @@ impl Qwen35MoeInner {
     /// read before that pass can describe bytes the model never runs.
     pub(crate) fn build_cold_tier_context(
         &self,
-        model_path: &str,
+        files: crate::cold_tier::CheckpointFiles<'_>,
         weights: &crate::array::memory::WeightsResident,
     ) -> Option<crate::transformer::paged_kv_cache_adapter::ColdTierContext> {
         // The ordinary fingerprint omits source-norm payload/math identity.
@@ -638,7 +638,7 @@ impl Qwen35MoeInner {
         };
         match crate::cold_tier::build_model_fingerprint(
             "qwen3_5_moe",
-            model_path,
+            files,
             Some(&config_json),
             &pool_geometry,
             weights,
@@ -652,8 +652,9 @@ impl Qwen35MoeInner {
             ),
             None => {
                 tracing::warn!(
-                    "cold-tier persistence disabled for {model_path}: could not establish a \
-                     content fingerprint (unreadable or missing weight shard)"
+                    "cold-tier persistence disabled for {}: could not establish a \
+                     content fingerprint (unreadable or missing weight shard)",
+                    files.label()
                 );
                 None
             }

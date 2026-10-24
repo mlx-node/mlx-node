@@ -18,7 +18,7 @@ use crate::array::MxArray;
 // is shared with every other family that attaches a `ColdTierContext`.
 #[cfg(test)]
 use crate::cold_tier::parse_bool_env;
-use crate::cold_tier::{CheckpointLoadGuard, resolve_persist_cold};
+use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard, resolve_persist_cold};
 use crate::engine::persistence::{
     KeyRule, RenameSpec, apply_rename_spec, load_all_safetensors, prewarm_checkpoint_pages,
 };
@@ -603,7 +603,8 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                         persist_env.as_deref(),
                         config.persist_paged_cache,
                     );
-                    let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
+                    let mut checkpoint_load =
+                        CheckpointLoadGuard::before_read(CheckpointFiles::Dir(path), persist_cold);
 
                     // Load weights (mmap)
                     let mapped_params = load_safetensors_mapped(path)?;
@@ -615,7 +616,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                     // (a separate process reinstalling a different same-shaped
                     // revision) can never bind the OLD weights to the NEW
                     // revision's fingerprint.
-                    checkpoint_load.record_mmap();
+                    checkpoint_load.record_read();
 
                     // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU
                     // eval of any mmap-backed weight (the per-layer `set_weight`

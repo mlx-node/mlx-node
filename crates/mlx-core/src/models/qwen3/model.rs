@@ -1336,7 +1336,7 @@ impl Qwen3Inner {
         };
         match crate::cold_tier::build_model_fingerprint(
             "qwen3",
-            model_path,
+            crate::cold_tier::CheckpointFiles::Dir(std::path::Path::new(model_path)),
             config_json.as_deref(),
             &geometry,
             weights,
