@@ -161,44 +161,8 @@ async fn original_f32_preservation_keeps_main_safetensors_bytes_exact() {
         1
     );
 }
-#[tokio::test]
-#[ignore = "bounded native CPU cache transaction; run in a fresh process"]
-async fn source_operand_cache_concurrent_hit_and_corrupt_leased_entry_recovery() {
-    let temp = GemmaNativeTestDir::new();
-    let input = source_operand_fixture(temp.path());
-    let root = temp.path().join("cache");
-    let (a, b) = tokio::join!(
-        prepare_qwen35_moe_native_gguf_in(&input, &root),
-        prepare_qwen35_moe_native_gguf_in(&input, &root)
-    );
-    let a = a.unwrap();
-    let b = b.unwrap();
-    assert_eq!(a, b);
-    let identity = source_operand_identity(&input);
-    assert!(source_math::cache_is_current(&a, &identity));
-    let main = fs::read(a.join("model.safetensors")).unwrap();
-    let hit = prepare_qwen35_moe_native_gguf_in(&input, &root)
-        .await
-        .unwrap();
-    assert_eq!(a, hit);
-    let private = a.join(".mlx-source-math/weights.safetensors");
-    fs::remove_file(&private).unwrap();
-    assert!(!source_math::cache_is_current(&a, &identity));
-    let rebuilt = prepare_qwen35_moe_native_gguf_in(&input, &root)
-        .await
-        .unwrap();
-    // The old leased path must not be replaced underneath existing readers.
-    assert_ne!(a, rebuilt);
-    assert!(!private.exists());
-    assert!(source_math::cache_is_current(&rebuilt, &identity));
-    assert_eq!(main, fs::read(rebuilt.join("model.safetensors")).unwrap());
-    for dir in [&a, &b, &hit, &rebuilt] {
-        native_gguf_unlease_in_use(dir);
-    }
-}
 #[test]
 fn source_operand_layout_change_is_moe_only() {
-    assert_eq!(QWEN35_NATIVE_CACHE_FORMAT, 7);
     assert_eq!(NativeGgufFamily::Qwen35.layout(), "tiled");
     assert_eq!(NativeGgufFamily::Qwen35Moe.layout(), source_math::LAYOUT);
     assert_eq!(NativeGgufFamily::Clef.layout(), "clef-v1");

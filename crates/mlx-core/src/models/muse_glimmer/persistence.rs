@@ -1159,11 +1159,11 @@ mod tests {
         use crate::models::muse_glimmer::config::MuseGlimmerConfig;
         use crate::utils::gguf_import::GgufPreload;
         use crate::utils::gguf_import::gate::manifest;
-        use crate::utils::gguf_test_fixtures::{prepare_import_fixture, write_import_fixture};
+        use crate::utils::gguf_test_fixtures::{convert_import_fixture, write_import_fixture};
 
         let work = std::env::temp_dir().join(format!("mlx-muse-norms-{}", uuid::Uuid::new_v4()));
         let fx = write_import_fixture("muse-draft", &work.join("src"));
-        let converted = prepare_import_fixture(&fx, &work.join("old-cache")).await;
+        let converted = convert_import_fixture(&fx, &work.join("converted")).await;
         let tie = MuseGlimmerConfig::from_path(&converted)
             .unwrap()
             .text_config
@@ -1259,11 +1259,11 @@ mod tests {
         use crate::models::muse_glimmer::config::MuseGlimmerConfig;
         use crate::utils::gguf_import::GgufPreload;
         use crate::utils::gguf_import::gate::manifest;
-        use crate::utils::gguf_test_fixtures::{prepare_import_fixture, write_import_fixture};
+        use crate::utils::gguf_test_fixtures::{convert_import_fixture, write_import_fixture};
 
         let work = std::env::temp_dir().join(format!("mlx-muse-draft-{}", uuid::Uuid::new_v4()));
         let fx = write_import_fixture("muse-draft", &work.join("src"));
-        let converted = prepare_import_fixture(&fx, &work.join("old-cache")).await;
+        let converted = convert_import_fixture(&fx, &work.join("converted")).await;
         let want = manifest(
             &draft_params(&converted, None)
                 .unwrap()

@@ -851,31 +851,73 @@ fn write_json(path: &Path, value: &serde_json::Value) {
     fs::write(path, text).unwrap();
 }
 
-pub(crate) async fn prepare_import_fixture(fixture: &ImportFixture, cache_root: &Path) -> PathBuf {
-    use super::gguf::{
-        prepare_gemma4_native_gguf_in, prepare_muse_glimmer_native_gguf_in,
-        prepare_qwen35_moe_native_gguf_in, prepare_qwen35_native_gguf_in,
+/// Convert a fixture through the retained `mlx convert` oracle, without the
+/// native asset cache or a lease.
+pub(crate) async fn convert_import_fixture(fixture: &ImportFixture, output_dir: &Path) -> PathBuf {
+    use super::gguf::{GgufConversionOptions, convert_gguf_to_safetensors};
+
+    let parent = fixture.main.parent().unwrap();
+    let options = |input: &Path,
+                   config_source_dir: Option<String>,
+                   output_filename: Option<&str>,
+                   native_qwen35_layout: Option<bool>| {
+        GgufConversionOptions {
+            input_path: input.to_string_lossy().into_owned(),
+            output_dir: output_dir.to_string_lossy().into_owned(),
+            config_source_dir,
+            dtype: Some("bfloat16".to_string()),
+            verbose: None,
+            quantize: Some(false),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            output_filename: output_filename.map(str::to_string),
+            vlm_key_prefix: None,
+            quant_mxfp: None,
+            import_k_quants: Some(true),
+            native_qwen35_layout,
+        }
     };
-    let prepared = match fixture.family {
-        ImportFixtureFamily::Qwen35 => {
-            prepare_qwen35_native_gguf_in(&fixture.main, cache_root).await
-        }
-        ImportFixtureFamily::Qwen35Moe => {
-            prepare_qwen35_moe_native_gguf_in(&fixture.main, cache_root).await
-        }
-        ImportFixtureFamily::Gemma4 => {
-            prepare_gemma4_native_gguf_in(&fixture.main, cache_root).await
-        }
-        ImportFixtureFamily::MuseGlimmer => {
-            prepare_muse_glimmer_native_gguf_in(&fixture.main, cache_root).await
-        }
-    };
-    prepared.unwrap_or_else(|error| panic!("prepare {}: {}", fixture.name, error.reason))
+    let config_source_dir = parent
+        .join("config.json")
+        .is_file()
+        .then(|| parent.to_string_lossy().into_owned());
+    convert_gguf_to_safetensors(options(
+        &fixture.main,
+        config_source_dir,
+        None,
+        Some(matches!(
+            fixture.family,
+            ImportFixtureFamily::Qwen35 | ImportFixtureFamily::Qwen35Moe
+        )),
+    ))
+    .await
+    .unwrap_or_else(|error| panic!("convert {}: {}", fixture.name, error.reason));
+
+    if let Some(companion) = &fixture.companion {
+        let filename = match fixture.family {
+            ImportFixtureFamily::MuseGlimmer => "draft.safetensors",
+            ImportFixtureFamily::Qwen35
+            | ImportFixtureFamily::Qwen35Moe
+            | ImportFixtureFamily::Gemma4 => "vision.safetensors",
+        };
+        convert_gguf_to_safetensors(options(
+            companion,
+            Some(parent.to_string_lossy().into_owned()),
+            Some(filename),
+            None,
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("convert {} companion: {}", fixture.name, error.reason));
+    }
+    output_dir.to_path_buf()
 }
 
-/// With `MLX_CAPTURE_FIXTURE_GOLDEN=<dir>`, prepares every import fixture
-/// through today's native prepare (which runs `convert_gguf_to_safetensors`)
-/// and writes, per fixture: every non-weight file of the entry, one
+/// With `MLX_CAPTURE_FIXTURE_GOLDEN=<dir>`, converts every import fixture
+/// through the explicit converter oracle and writes, per fixture: every
+/// non-weight file of the entry, one
 /// `<stem>.manifest.json` per safetensors file, `t64.json`, and
 /// `fixture.json` (sha256 of the fixture GGUFs, to catch builder drift).
 #[tokio::test]
@@ -887,7 +929,7 @@ async fn capture_base_fixture_goldens() {
     let work = std::env::temp_dir().join(format!("mlx-fixture-golden-{}", uuid::Uuid::new_v4()));
     for name in IMPORT_FIXTURE_NAMES {
         let fixture = write_import_fixture(name, &work.join("src").join(name));
-        let entry = prepare_import_fixture(&fixture, &work.join("cache").join(name)).await;
+        let entry = convert_import_fixture(&fixture, &work.join("cache").join(name)).await;
         let out = out_root.join(name);
         if out.exists() {
             fs::remove_dir_all(&out).unwrap();
@@ -936,7 +978,6 @@ async fn capture_base_fixture_goldens() {
             &out.join("fixture.json"),
             &serde_json::to_value(sources).unwrap(),
         );
-        super::gguf::native_gguf_unlease_in_use(&entry);
         println!("captured {name}: {} files", files.len());
     }
     fs::remove_dir_all(&work).ok();

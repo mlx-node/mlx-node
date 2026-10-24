@@ -1744,8 +1744,8 @@ mod checkpoint_tests {
     use crate::utils::gguf::{GgufMetaValue, GgufTensorType, NativeGgufFamily};
     use crate::utils::gguf_import::{GgufPreload, gate::manifest};
     use crate::utils::gguf_test_fixtures::{
-        ImportFixture, ImportFixtureFamily, build_minimal_gguf, fixture_bytes, fixture_payload,
-        prepare_import_fixture,
+        ImportFixture, ImportFixtureFamily, build_minimal_gguf, convert_import_fixture,
+        fixture_bytes, fixture_payload,
     };
 
     fn write_gguf(
@@ -1833,7 +1833,7 @@ mod checkpoint_tests {
         let work = std::env::temp_dir().join(format!("mlx-load-ckpt-{}", uuid::Uuid::new_v4()));
         let fx = q4_0_main_q4_1_mmproj(&work.join("src"));
 
-        let converted = prepare_import_fixture(&fx, &work.join("old-cache")).await;
+        let converted = convert_import_fixture(&fx, &work.join("converted")).await;
         let want = manifest(&load_all_safetensors(&converted, true).unwrap());
 
         let source = CheckpointSource::resolve_in(
@@ -1879,7 +1879,6 @@ mod checkpoint_tests {
         for (name, want) in &want {
             assert_eq!(&got[name], want, "tensor {name}");
         }
-        crate::utils::gguf::native_gguf_unlease_in_use(&converted);
         source.release_lease();
         fs::remove_dir_all(&work).ok();
     }

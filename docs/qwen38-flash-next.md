@@ -243,16 +243,14 @@ releases write, are removed automatically once idle for one hour and unlocked
 (a non-blocking lock on their `budget` file), with or without a manifest; any
 other name under that prefix is kept. The same
 maintenance sweeps stale entries of the native GGUF cache under a 24 h grace
-and per-entry locks; `.mlx-qwen4-assets-v2-*` tokenizer sidecars are exempt
-from orphan removal and their markers are re-stamped on use, so they are only
-collected by the `MLX_NATIVE_GGUF_CACHE_MAX_GB` least-recently-used cap.
+and per-entry locks. Valid `.mlx-qwen4-assets-v2-*` tokenizer sidecars are
+exempt from orphan removal and retained; their markers are re-stamped on use.
 
 A breached SSD-read safety limit reclaims the allocator freelist and re-polls
 before erroring.
 
 | Setting                        | Behavior                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MLX_NATIVE_GGUF_CACHE_MAX_GB` | Legacy cap-only setting for remaining packed-weight conversion entries and extracted tokenizer sidecars, in GiB; least-recently-used eviction under a 24 h grace, with atomic root-wide admission at publish (a conversion that cannot fit loads from its staging dir instead; a later reload reuses that staged result rather than re-converting, and the refused dir is a per-pid load output the sweep keeps while the process lives). Unset, `<=0` or unparseable means unlimited. |
 | `QWEN4_EXP_REAL_MODEL`         | Opt-in real-model tests (ignored by default): the Qwen3.8 GGUF path.                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `QWEN4_EXP_REAL_INPUTS`        | Their prompts: a `{name, tokenIds}` case list from `oxnode scripts/benchmark-fixture.ts fetch --fixture qwen38 --output inputs.json`.                                                                                                                                                                                                                                                                                                                                       |
 | `QWEN4_EXP_REAL_AUX`           | The MTP checkpoint dir the slot tests attach.                                                                                                                                                                                                                                                                                                                                                                                                                               |

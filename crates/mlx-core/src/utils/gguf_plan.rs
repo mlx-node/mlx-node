@@ -662,7 +662,7 @@ mod tests {
     };
     use crate::utils::gguf_test_fixtures::{
         IMPORT_FIXTURE_NAMES, ImportFixture, ImportFixtureFamily, build_minimal_gguf,
-        fixture_payload, prepare_import_fixture, safetensors_manifest, sha256_hex, t64_prefixes,
+        convert_import_fixture, fixture_payload, safetensors_manifest, sha256_hex, t64_prefixes,
         write_import_fixture,
     };
 
@@ -848,9 +848,8 @@ mod tests {
                 planned.plan.tiled_gguf_names
             );
             // The converter's marks are what tile_kquant_weights_for_disk tiled.
-            let entry = prepare_import_fixture(&fixture, &work.join("cache").join(name)).await;
+            let entry = convert_import_fixture(&fixture, &work.join("cache").join(name)).await;
             let live = t64_prefixes(&read_json(&entry.join("config.json")));
-            crate::utils::gguf::native_gguf_unlease_in_use(&entry);
             assert_eq!(
                 planned.plan.tiled_prefixes, live,
                 "{name}: header t64 set vs the live disk tiler"
@@ -882,7 +881,7 @@ mod tests {
         let work = work_dir("convert");
         for name in IMPORT_FIXTURE_NAMES {
             let fixture = checked_fixture(name, &work.join("src").join(name));
-            let entry = prepare_import_fixture(&fixture, &work.join("cache").join(name)).await;
+            let entry = convert_import_fixture(&fixture, &work.join("cache").join(name)).await;
             let golden = golden_root().join(name);
             let manifests = file_names(&golden, |n| n.ends_with(".manifest.json"));
             let written = file_names(&entry, |n| n.ends_with(".safetensors"));
@@ -919,7 +918,6 @@ mod tests {
                 t64,
                 "{name}: converter t64 marks"
             );
-            crate::utils::gguf::native_gguf_unlease_in_use(&entry);
         }
         fs::remove_dir_all(&work).ok();
     }

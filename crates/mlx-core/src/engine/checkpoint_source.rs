@@ -552,14 +552,13 @@ mod tests {
         fs::remove_dir_all(&work).ok();
     }
 
-    // The std Mutex guard is held across awaits on purpose: it serializes the
-    // cap env and the sweep against other sweep tests for the whole test.
+    // The std Mutex guard is held across awaits on purpose: it serializes
+    // sidecar and sweep tests whose try-lock outcomes are timing-dependent.
     #[allow(clippy::await_holding_lock)]
     #[cfg(unix)]
     #[tokio::test]
     async fn assets_lease_blocks_sweep() {
         let _env_guard = crate::utils::gguf::sweep_env_lock().lock().unwrap();
-        let _env = crate::utils::gguf::SweepEnvVar::set_max_gb("0");
         let work = work_dir("lease");
         let fx = write_import_fixture("qwen35-dense-untied", &work.join("src"));
         let cache = work.join("cache");
@@ -582,9 +581,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[cfg(unix)]
     #[tokio::test]
-    async fn sweep_keeps_v7_and_v8_until_cutover() {
+    async fn sweep_removes_v7_and_keeps_v8_after_cutover() {
         let _env_guard = crate::utils::gguf::sweep_env_lock().lock().unwrap();
-        let _env = crate::utils::gguf::SweepEnvVar::set_max_gb("0");
         let work = work_dir("formats");
         let fx = write_import_fixture("qwen35-dense-untied", &work.join("src"));
         let cache = work.join("cache");
@@ -613,8 +611,8 @@ mod tests {
         let (v6, v7, v8) = (entry(6), entry(7), entry(8));
         sweep_native_gguf_cache(&cache, "unrelated-key");
         assert!(!v6.exists(), "an aged v6 entry must be swept (control)");
-        assert!(v7.is_dir(), "aged v7 entry swept before the cutover");
-        assert!(v8.is_dir(), "aged v8 entry swept");
+        assert!(!v7.exists(), "an aged v7 weight entry must be swept");
+        assert!(v8.is_dir(), "a healthy aged v8 asset entry must survive");
         native_gguf_unlease_in_use(&ckpt.asset_dir);
         fs::remove_dir_all(&work).ok();
     }

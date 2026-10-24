@@ -6142,31 +6142,13 @@ async fn convert_gguf_to_safetensors_inner(
     })
 }
 
-/// Prepare the lossless native-packed cache used when a Qwen3.5/3.8 model is
-/// loaded from a GGUF file path. Quantized source blocks are only repacked;
-/// they are never expanded into a dense floating-point weight tensor. Native
-/// F32 norms/biases are narrowed to BF16 so they do not promote inference
-/// activations away from the model's BF16 execution/cache dtype.
-///
-/// v6: the primary conversion stores eligible 2-D K-quant linears in the
-/// 64-row tiled layout (`tile_kquant_weights_for_disk`, config `layout=t64`).
-/// The format is part of the cache directory key, so a v5 entry (row-major
-/// bytes, no marker) is never aliased by a v6 reader — both load correctly,
-/// each by its own config, but the bump makes a fresh cache take the
-/// permute-free path.
-///
-/// v7: IQ3_S is imported packed (3 words per 32-value unit, in-kernel grid)
-/// instead of expanded to int8 codes. A v6 entry still loads through the
-/// legacy `iq3s`/bits-8 contract; the bump re-imports it at native size.
-const QWEN35_NATIVE_CACHE_FORMAT: u32 = 7;
-/// v8: asset-only entries (config, tokenizer, templates, `gguf-source.json`);
-/// the weights are read from the GGUF at every load.
+/// v8 native GGUF entries contain only runtime assets and source records;
+/// weights are read from the GGUF at every load. Older weight entries are
+/// stale and age out through the normal sweep grace and lease rules.
 pub(crate) const NATIVE_GGUF_ASSETS_FORMAT: u32 = 8;
 
-/// Both formats are current for the sweep while v7 weight entries and v8
-/// asset entries coexist.
 fn native_gguf_format_is_current(format: u32) -> bool {
-    format == QWEN35_NATIVE_CACHE_FORMAT || format == NATIVE_GGUF_ASSETS_FORMAT
+    format == NATIVE_GGUF_ASSETS_FORMAT
 }
 const NATIVE_GGUF_CACHE_DIR_ENV: &str = "MLX_NATIVE_GGUF_CACHE_DIR";
 
@@ -6209,7 +6191,7 @@ fn initialize_native_gguf_cache_root(root: &Path) -> std::io::Result<PathBuf> {
     root.canonicalize()
 }
 
-/// Writable application cache shared by native GGUF weights and runtime assets.
+/// Writable application cache for native GGUF runtime assets.
 pub(crate) fn native_gguf_cache_root() -> Result<PathBuf> {
     let override_root = std::env::var_os(NATIVE_GGUF_CACHE_DIR_ENV).map(PathBuf::from);
     let candidates = native_gguf_cache_candidates_from(
@@ -6359,23 +6341,6 @@ impl Drop for Qwen35NativeCacheLock {
     }
 }
 
-fn qwen35_native_cache_is_current(
-    output_dir: &Path,
-    source_identity_digest: &str,
-    asset_digest: &str,
-    expected_dtype: &str,
-    required_files: &[&str],
-) -> bool {
-    native_gguf_entry_is_current(
-        output_dir,
-        QWEN35_NATIVE_CACHE_FORMAT,
-        source_identity_digest,
-        asset_digest,
-        expected_dtype,
-        required_files,
-    )
-}
-
 fn native_gguf_entry_is_current(
     output_dir: &Path,
     format: u32,
@@ -6404,41 +6369,18 @@ fn native_gguf_entry_is_current(
 /// fresher than this may belong to a concurrent load on another machine's
 /// clock or a writer that has not published its marker yet.
 const NATIVE_GGUF_SWEEP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-const NATIVE_GGUF_CACHE_MAX_GB_ENV: &str = "MLX_NATIVE_GGUF_CACHE_MAX_GB";
-const NATIVE_GGUF_ONE_GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 const NATIVE_GGUF_ASSETS_PREFIX: &str = ".mlx-qwen4-assets-v2-";
 const NATIVE_GGUF_ASSETS_TMP_PREFIX: &str = ".mlx-qwen4-assets-tmp-";
-/// `.mlx-qwen4-assets-live-{identity}-{pid}`: a cap-refused tokenizer
-/// sidecar publish promoted to a deterministic same-pid name so later loads
-/// in this process reuse it (the uuid temp name could never be found again).
-/// It is a load output, so the sweep keeps it while the pid lives AND the
-/// lease registry holds a reference — never counted toward the cap, never
-/// age-deleted. Releasing the last reference (a failed load's unlease) makes
-/// it reclaimable; dead-pid dirs are debris either way, so a refused
-/// fallback is bounded by the shorter of lease lifetime and pid lifetime.
+/// `.mlx-qwen4-assets-live-{identity}-{pid}`: a tokenizer sidecar that
+/// could not replace a leased output, promoted to a deterministic same-pid
+/// name so later loads in this process reuse it. It is a load output, so the
+/// sweep keeps it while the pid lives and its lease registry holds a
+/// reference. Releasing the last reference makes it reclaimable; dead-pid
+/// dirs are debris either way.
 const NATIVE_GGUF_ASSETS_LIVE_PREFIX: &str = ".mlx-qwen4-assets-live-";
 const NATIVE_GGUF_STAGING_INFIX: &str = ".staging-";
 const NATIVE_GGUF_WRITE_PROBE_PREFIX: &str = ".write-probe-";
 const NATIVE_GGUF_LOCK_SUFFIX: &str = ".lock";
-/// Root-wide admission lock for the size cap: one flock serializes the whole
-/// count→evict→publish critical section across processes, so two prepares on
-/// different keys cannot each publish under the cap while jointly exceeding
-/// it. The name already matches the sweep's unconditional keep rule
-/// (`starts_with('.') && ends_with(".lock")`), and the file is never
-/// unlinked: flock mutual exclusion depends on a stable inode.
-const NATIVE_GGUF_CAP_LOCK_NAME: &str = ".mlx-native-gguf-cap.lock";
-
-/// Optional total size cap for the whole native-GGUF cache root. Parsed like
-/// `cache_limit.rs`'s GiB knobs: a finite float > 0 enables an LRU eviction;
-/// `<=0`, unset or unparseable means unlimited.
-pub(crate) fn native_gguf_cache_cap_bytes() -> Option<u64> {
-    let raw = std::env::var(NATIVE_GGUF_CACHE_MAX_GB_ENV).ok()?;
-    match raw.trim().parse::<f64>() {
-        Ok(gib) if gib.is_finite() && gib > 0.0 => Some((gib * NATIVE_GGUF_ONE_GIB).round() as u64),
-        _ => None,
-    }
-}
-
 /// Conservative age check: only a readable timestamp strictly older than the
 /// grace window counts. Unreadable or future mtimes are NOT old.
 fn native_gguf_mtime_older(
@@ -6620,7 +6562,7 @@ fn native_gguf_path_from_os_bytes(bytes: &[u8]) -> Option<PathBuf> {
 
 /// Strict cache-key contract for a plain entry directory:
 /// `{stem}-{len}-{modified}-v{fmt}-{src digest}-{prep digest}` (see the
-/// `cache_key` construction in `prepare_native_gguf_inner`). Parsed from the
+/// `cache_key` construction in `prepare_gguf_assets_in`). Parsed from the
 /// right so hyphens inside the stem are safe. The format digit run is NOT
 /// pinned: entries from older format versions keep `-v{old}-...` and must
 /// still qualify so the sweep can remove them as "outdated cache format".
@@ -6641,7 +6583,7 @@ fn native_gguf_is_entry_name(name: &str) -> bool {
         return false;
     };
     // The producer sanitizes stems to `[A-Za-z0-9_-]` truncated at 32 chars
-    // (`prepare_native_gguf_inner`): the ownership gate must match that
+    // (`prepare_gguf_assets_in`): the ownership gate must match that
     // grammar exactly or an unrelated dir like `report.txt-1-1-v7-<64hex>-
     // <64hex>` would pass the strict-tail check and be deleted as ours.
     let is_producer_stem = |stem: &str| {
@@ -6696,9 +6638,8 @@ fn native_gguf_try_entry_lock(_cache_root: &Path, _key: &str) -> Option<Option<f
 // ── In-use sidecar leases ──────────────────────────────────────────────────
 // A published `.mlx-qwen4-assets-v2-*` dir handed to a loaded model stays in
 // use for the process lifetime: the model opens `tokenizer.json` lazily on
-// first request, possibly days after `assets_in` returned. Recency stamping
-// only marks prepare hits, so an LRU eviction could otherwise delete the
-// directory out from under a running model. The registry below is the
+// first request, possibly days after `assets_in` returned. The registry and
+// shared flock below keep that live model's directory protected. The registry is the
 // in-process guard (a held shared flock cannot exclude a same-process
 // deleter on every platform); the `Option<fs::File>` each entry retains is
 // the cross-process guard — a LOCK_SH on the sidecar's `{key}.lease`
@@ -6827,7 +6768,7 @@ impl Drop for InFlightPrepare {
 /// caller intends to hand to the loader, and releases it on drop unless
 /// `disarm` ran. A prepare cancelled at the post-publish sweep await must
 /// not leave a registered reference — the pinned dir (published or staging
-/// fallback) would otherwise stay cap-exempt for the process lifetime.
+/// fallback) would otherwise stay protected for the process lifetime.
 struct PreparedDirLease {
     dir: PathBuf,
     armed: bool,
@@ -6852,7 +6793,7 @@ impl Drop for PreparedDirLease {
     }
 }
 
-/// Test-only pause inside `prepare_native_gguf_inner`: fires after the
+/// Test-only pause inside `prepare_gguf_assets_in`: fires after the
 /// provisional lease registers and before the post-publish sweep — and only
 /// for the prepare running against the expected cache root, so a parallel
 /// cargo-test prepare on a different root cannot steal the pause. The
@@ -7165,8 +7106,7 @@ fn native_gguf_entry_stale_reason(
 /// handed to a loaded model) is skipped before the flock is even tried —
 /// the registry covers same-process deleters and its retained LOCK_SH makes
 /// the try-flock fail for foreign processes too, so every caller of this
-/// function (the sweep's stale pass and the capped-LRU passes in both the
-/// sweep and `native_gguf_publish_with_cap`) gets the exclusion for free.
+/// function (the stale and staging sweep passes) gets the exclusion for free.
 /// `still_deletable` runs AFTER the lock is won — a cache hit stamps its
 /// marker under the same lock file, so a recency snapshot taken before the
 /// flock cannot prove the entry is still dead once we hold it. The guards
@@ -7237,8 +7177,8 @@ fn native_gguf_object_recency(dir: &Path, marker_name: &str) -> Option<std::time
         .ok()
 }
 
-/// Touch `.complete` on a verified cache hit so the capped-LRU sweep treats
-/// the entry as recently used.
+/// Touch `.complete` on a verified hit so the stale sweep retains the
+/// 24-hour recency grace.
 fn native_gguf_stamp_mtime(path: &Path) {
     if let Ok(file) = OpenOptions::new().write(true).open(path) {
         file.set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
@@ -7246,192 +7186,17 @@ fn native_gguf_stamp_mtime(path: &Path) {
     }
 }
 
-/// Evict least-recently-used eligible directories until `fits` accepts the
-/// remaining root total — the sweep uses `fits = total <= cap`, admission
-/// `total + incoming <= cap`. Each `(path, recency, lock_key, marker)` entry
-/// faces the same gates as the stale sweep: a snapshot recency inside the
-/// mtime grace is skipped, and `native_gguf_locked_remove` re-derives the
-/// recency under the won entry flock because a concurrent cache hit
-/// re-stamps the marker under that same lock. A held lock means a live
-/// writer or an open/flock failure, so the entry counts but is left in
-/// place. Shared by `sweep_native_gguf_cache` and the publish-admission
-/// critical section so their eviction eligibility can never drift. The
-/// caller is responsible for withholding `"complete"`-marker sidecar dirs
-/// from `lru` whenever `native_gguf_sidecar_mutex` could not be taken —
-/// see `native_gguf_publish_with_cap`.
-/// Returns `(reclaimed_bytes, remaining_total)`.
-fn native_gguf_evict_lru(
-    cache_root: &Path,
-    mut lru: Vec<(PathBuf, Option<std::time::SystemTime>, String, &'static str)>,
-    now: std::time::SystemTime,
-    mut total: u64,
-    fits: impl Fn(u64) -> bool,
-) -> (u64, u64) {
-    let mut reclaimed = 0_u64;
-    lru.sort_by_key(|(_, recency, _, _)| *recency);
-    for (path, recency, key, marker) in lru {
-        if fits(total) {
-            break;
-        }
-        if !native_gguf_mtime_older(recency, now) {
-            continue;
-        }
-        let bytes =
-            native_gguf_locked_remove(cache_root, &path, &key, "over cache size cap", |dir| {
-                native_gguf_mtime_older(
-                    native_gguf_object_recency(dir, marker),
-                    std::time::SystemTime::now(),
-                )
-            });
-        reclaimed = reclaimed.saturating_add(bytes);
-        total = total.saturating_sub(bytes);
-    }
-    (reclaimed, total)
-}
-
-/// Publish `staging_dir` as `output_dir` under the configured total cap,
-/// holding `cache_root`'s admission flock across the count→evict→rename
-/// section. Runs on a blocking thread. Returns the directory the caller
-/// hands to the loader: `output_dir` on a published admission, or
-/// `staging_dir` itself when eligible LRU eviction cannot make `incoming`
-/// bytes fit — the staged conversion is complete, so refusing only chooses
-/// where it is read from; the refused fallback is bounded by its lease —
-/// reclaimed by the staging sweep once the last registry reference is
-/// released, or by the dead-pid gate at the latest on process exit.
-///
-/// Sidecar eviction needs the same in-process exclusion as the sweep's
-/// deletion: BSD flock is per-process, so the per-sidecar lock inside
-/// `native_gguf_locked_remove` cannot exclude a concurrent same-process
-/// `assets_in` mid hit-check — this pass could evict the very dir it is
-/// about to return. `native_gguf_sidecar_mutex` is therefore try-locked
-/// before the LRU pass: taken, no `assets_in` is between its checks and a
-/// returned path, so sidecars are evictable; busy (an `assets_in` is
-/// active, or this very call is running inside `assets_in`'s publish
-/// section — a re-lock would deadlock, and mid-sidecar-work callers must
-/// not evict other sidecars anyway) or poisoned, `"complete"`-marker
-/// candidates are withheld from this pass. Admission may then refuse, which
-/// the caller's live_dir/staging fallback already handles. Plain
-/// `".complete"` entries evict either way: same-process prepares serialize
-/// on the tokio prepare mutex and other processes on the per-key flock.
-pub(crate) fn native_gguf_publish_with_cap(
-    cache_root: &Path,
-    staging_dir: &Path,
-    output_dir: &Path,
-    cap: u64,
-) -> std::io::Result<PathBuf> {
-    let _cap_lock = Qwen35NativeCacheLock::acquire(&cache_root.join(NATIVE_GGUF_CAP_LOCK_NAME))?;
-    // Only a prior interrupted/corrupt build can occupy this exact path
-    // (format and asset digests are in the key, so a current cache is never
-    // replaced). Remove it inside the section so the freed bytes are
-    // accounted before admission is decided. A live `.{key}.lease` or an
-    // in-use registration means a loaded model owns the dir — keep it and
-    // return the staging path, exactly as an unreadable root refuses below.
-    let _output_guard = if output_dir.exists() {
-        match native_gguf_output_delete_guard(cache_root, output_dir) {
-            Some(guard) => Some(guard),
-            None => return Ok(staging_dir.to_path_buf()),
-        }
-    } else {
-        None
-    };
-    if output_dir.exists() {
-        fs::remove_dir_all(output_dir)?;
-    }
-    let incoming = native_gguf_path_bytes(staging_dir);
-    // Count every published byte the sweep's cap pass would count: entry
-    // dirs matching the cache-key grammar and `.mlx-qwen4-assets-v2-*`
-    // sidecars. All other names — lock files, staging dirs, write probes,
-    // assets temps, foreign tooling — are skipped exactly as the sweep
-    // skips them. `symlink_metadata` classifies with no-follow: a symlinked
-    // dir is foreign. `staging_dir`/`output_dir` cannot appear under this
-    // grammar (dot-name / already removed) but are excluded explicitly so
-    // the intent is local.
-    let now = std::time::SystemTime::now();
-    let mut lru: Vec<(PathBuf, Option<std::time::SystemTime>, String, &'static str)> = Vec::new();
-    let mut total = 0_u64;
-    let Ok(entries) = fs::read_dir(cache_root) else {
-        // Fail closed without touching anything: an unreadable root means
-        // the count cannot be trusted, so publish is refused and the load
-        // reads from staging rather than sailing past the cap.
-        return Ok(staging_dir.to_path_buf());
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path == staging_dir || path == output_dir {
-            continue;
-        }
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !meta.is_dir() {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        let (key, marker) = if !name.starts_with('.') && native_gguf_is_entry_name(&name) {
-            (name, ".complete")
-        } else if name.starts_with(NATIVE_GGUF_ASSETS_PREFIX)
-            && native_gguf_is_hex64(&name[NATIVE_GGUF_ASSETS_PREFIX.len()..])
-        {
-            (name, "complete")
-        } else {
-            continue;
-        };
-        let recency = native_gguf_object_recency(&path, marker);
-        total = total.saturating_add(native_gguf_path_bytes(&path));
-        lru.push((path, recency, key, marker));
-    }
-    // try_lock covers both failure modes conservatively: WouldBlock means a
-    // same-process `assets_in` (or this call running inside one's publish
-    // section) may still be between its hit check and first use, and a
-    // poisoned mutex is not proof of exclusion either. The binding is held
-    // through the eviction pass so the exclusion ends only when the pass
-    // does. Busy → sidecars are counted but not evictable this pass.
-    let _sidecar_guard = native_gguf_sidecar_mutex().try_lock().ok();
-    if _sidecar_guard.is_none() {
-        lru.retain(|(_, _, _, marker)| *marker != "complete");
-    }
-    let admits = |total: u64| total.saturating_add(incoming) <= cap;
-    if !admits(total) {
-        let (_, remaining) = native_gguf_evict_lru(cache_root, lru, now, total, admits);
-        total = remaining;
-    }
-    if !admits(total) {
-        debug!(
-            "native GGUF cache cap {cap} bytes cannot admit {} bytes into '{}'; \
-             loading from the staged directory instead of publishing",
-            incoming,
-            cache_root.display()
-        );
-        return Ok(staging_dir.to_path_buf());
-    }
-    fs::rename(staging_dir, output_dir)?;
-    Ok(output_dir.to_path_buf())
-}
-
-/// In-process exclusion between `assets_in` (tokenizer-sidecar load and
-/// publish in `models::qwen4_exp::gguf`) and every deletion path that can
-/// remove sidecar dirs: both this sweep's removals AND the publish
-/// admission's LRU eviction inside `native_gguf_publish_with_cap`. The
-/// per-object flocks cover other processes but not this one: BSD flock is
-/// per-process, so `native_gguf_try_entry_lock` trivially wins against an
-/// fd held by the same process — without this mutex either deleter could
-/// remove a sidecar dir between `assets_in`'s hit check and the caller's
-/// first use. The lock order stays acyclic: `assets_in` takes this mutex
-/// → its per-sidecar flock → the cap flock inside
-/// `native_gguf_publish_with_cap`; the sweep and the admission path only
-/// ever try-lock this mutex (the sweep skips its whole pass on contention,
-/// admission merely withholds sidecars from that pass's eviction — never
-/// blocking a caller); the prepare path takes the tokio prepare mutex →
-/// key flock → cap flock and try-locks this mutex only inside the
-/// publish's admission section.
+/// In-process exclusion between `assets_in` in `models::qwen4_exp::gguf`
+/// and sweep deletion. Per-object flocks cover other processes but not this
+/// one on BSD, where a second fd in the same process can acquire a lock
+/// already held. `assets_in` takes this mutex before its sidecar flock; the
+/// sweep try-locks it and skips its pass on contention.
 pub(crate) fn native_gguf_sidecar_mutex() -> &'static std::sync::Mutex<()> {
     static MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     MUTEX.get_or_init(|| std::sync::Mutex::new(()))
 }
 
-/// Sweep stale, orphaned and over-capital entries from the native GGUF cache
+/// Sweep stale and orphaned entries from the native GGUF cache
 /// root. Runs under the process mutex and the caller's per-key lock; every
 /// gate is conservative so a load can never be broken by the sweep and every
 /// failure is logged and swallowed by the caller. The sweep is best-effort
@@ -7457,13 +7222,6 @@ pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
     let now = std::time::SystemTime::now();
     let mut reclaimed = 0_u64;
     let mut digests = NativeGgufSweepDigests::default();
-    // (path, recency, lock key, recency marker name) for directories that
-    // count toward the cap. The lock key resolves through
-    // `native_gguf_lock_name`: `.{key}.lock` for plain entries and
-    // `{name}.lock` for dot-prefixed asset sidecars.
-    let mut lru: Vec<(PathBuf, Option<std::time::SystemTime>, String, &'static str)> = Vec::new();
-    let mut total = 0_u64;
-
     for name in names {
         let path = cache_root.join(&name);
         let meta = match fs::symlink_metadata(&path) {
@@ -7500,7 +7258,7 @@ pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                 // pid is the canonical `std::process::id()` rendering
                 // (nonzero, no leading zeros, within `pid_t` range —
                 // `native_gguf_valid_pid`), and `-g{n}` is the generation a
-                // second same-identity refusal lands on while an earlier
+                // second same-identity fallback lands on while an earlier
                 // live dir stays leased. The producer emits only the base
                 // name or the canonical `-g2`..`-g63` (the 1..64 scan starts
                 // at the base name), so a `-g` tail outside that exact range
@@ -7521,8 +7279,7 @@ pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                     })
                     .unwrap_or(suffix);
                 // A live pid means a load output this process still reads:
-                // keep it while the lease registry holds a reference — never
-                // counted toward the cap, never age-deleted. Our pid with no
+                // keep it while the lease registry holds a reference. Our pid with no
                 // surviving lease is reclaimable through the in-use delete
                 // guard; a foreign live pid's lease state is not visible to
                 // this registry, so pid liveness stays its whole gate.
@@ -7544,14 +7301,8 @@ pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
             if name.starts_with(NATIVE_GGUF_ASSETS_PREFIX)
                 && native_gguf_is_hex64(&name[NATIVE_GGUF_ASSETS_PREFIX.len()..])
             {
-                // Live tokenizer sidecars are never orphan-deleted; they only
-                // leave through the capped-LRU pass below. The dot-prefixed
-                // name is the lock key so a held `assets_in` reader lock
-                // blocks eviction.
-                let bytes = native_gguf_path_bytes(&path);
-                total = total.saturating_add(bytes);
-                let recency = native_gguf_object_recency(&path, "complete");
-                lru.push((path, recency, name, "complete"));
+                // Published tokenizer sidecars are retained rather than
+                // orphan-deleted without a source-identity policy.
                 continue;
             }
             if name.starts_with('.')
@@ -7574,15 +7325,14 @@ pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                 };
                 let dead = native_gguf_pid_dead(pid);
                 // A live-pid staging dir carrying `.complete` is a LOAD
-                // OUTPUT: a cap-refused publish hands it to a loader that
+                // OUTPUT: a leased-output fallback hands it to a loader that
                 // reopens its files later in the process, so a live pid
                 // alone must keep it — the lease state of a FOREIGN pid's
                 // dir is not visible to this registry. For our OWN pid the
                 // registry lease is the live leg: `native_gguf_locked_remove`
                 // refuses removal while any reference remains, and an
                 // unleased `.complete` dir — the lease a failed load
-                // released — is reclaimable debris rather than a permanently
-                // cap-exempt conversion. Markerless live-pid dirs are
+                // released — is reclaimable debris. Markerless live-pid dirs are
                 // removable only as mid-write/failed debris — aged AND
                 // markerless. Dead-pid dirs delete regardless of the marker:
                 // their owner is gone, so nothing can still read from them.
@@ -7622,14 +7372,12 @@ pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                 // Any other dot-directory is tooling we do not own; leave it.
                 continue;
             }
-            // Anything that is not a cache-key-shaped name is foreign tooling:
-            // it is neither deleted nor counted toward the cap (it is not
-            // evictable, so counting it would over-evict real entries).
+            // Anything that is not a cache-key-shaped name is foreign tooling,
+            // not an owned entry the sweep may delete.
             if !native_gguf_is_entry_name(&name) {
                 continue;
             }
             if name == current_key {
-                total = total.saturating_add(native_gguf_path_bytes(&path));
                 continue;
             }
             if let Some(reason) = native_gguf_entry_stale_reason(&path, &mut digests) {
@@ -7648,11 +7396,6 @@ pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                     continue;
                 }
             }
-            let bytes = native_gguf_path_bytes(&path);
-            total = total.saturating_add(bytes);
-            let recency = native_gguf_object_recency(&path, ".complete");
-            lru.push((path, recency, name, ".complete"));
-            continue;
         }
 
         // Loose files: interrupted write probes only; every other file in the
@@ -7666,20 +7409,6 @@ pub(crate) fn sweep_native_gguf_cache(cache_root: &Path, current_key: &str) {
                 reclaimed += native_gguf_remove_logged(&path, "abandoned write probe");
             }
         }
-    }
-
-    // Optional total cap: evict least-recently-used eligible directories until
-    // the root fits. The mtime grace and the lock gate apply exactly as in the
-    // stale sweep, and the current key never enters the eviction list. The
-    // sidecar mutex is held (or its poison recovered) for the whole pass, so
-    // `"complete"`-marker sidecars stay fully evictable here — unlike the
-    // publish-admission call site, which withholds them when try-lock fails.
-    if let Some(cap) = native_gguf_cache_cap_bytes()
-        && total > cap
-    {
-        let (evicted, _) =
-            native_gguf_evict_lru(cache_root, lru, now, total, |remaining| remaining <= cap);
-        reclaimed = reclaimed.saturating_add(evicted);
     }
 
     if reclaimed > 0 {
@@ -7952,19 +7681,6 @@ fn gemma4_native_mmproj(input: &Path, kind: Gemma4MmprojKind) -> Result<Option<P
 /// source directory remains read-only; the matching media projector —
 /// required for unified media configs, opportunistic for a plain
 /// `vision_config` — is converted in the same transaction as the text model.
-#[cfg(test)]
-pub(super) async fn prepare_gemma4_native_gguf_in(input: &Path, root: &Path) -> Result<PathBuf> {
-    let (input, companion) = native_gguf_preflight(input, NativeGgufFamily::Gemma4)?;
-    let root = initialize_native_gguf_cache_root(root)?;
-    prepare_native_gguf_inner(
-        &input,
-        &root,
-        NativeGgufFamily::Gemma4,
-        companion.as_deref(),
-    )
-    .await
-}
-
 fn gemma4_native_preflight(input: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
     let input = input.canonicalize()?;
     NativeGgufFamily::Gemma4.check_main_header(&parse_gguf(&input)?)?;
@@ -8054,22 +7770,6 @@ fn muse_glimmer_native_draft(input: &Path) -> Result<Option<PathBuf>> {
             exact.display()
         ))),
     }
-}
-
-#[cfg(test)]
-pub(super) async fn prepare_muse_glimmer_native_gguf_in(
-    input: &Path,
-    root: &Path,
-) -> Result<PathBuf> {
-    let (input, draft) = native_gguf_preflight(input, NativeGgufFamily::MuseGlimmer)?;
-    let root = initialize_native_gguf_cache_root(root)?;
-    prepare_native_gguf_inner(
-        &input,
-        &root,
-        NativeGgufFamily::MuseGlimmer,
-        draft.as_deref(),
-    )
-    .await
 }
 
 fn muse_glimmer_native_preflight(input: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
@@ -8199,86 +7899,6 @@ impl NativeGgufFamily {
             }
         }
     }
-
-    fn companion_filename(self) -> &'static str {
-        match self {
-            Self::MuseGlimmer => "draft.safetensors",
-            Self::Qwen35 | Self::Qwen35Moe | Self::Clef | Self::Gemma4 => "vision.safetensors",
-        }
-    }
-
-    /// Files a published staging entry must contain for a cache hit to be
-    /// honored — the marker alone does not witness them, and a truncated or
-    /// half-deleted entry would otherwise keep failing at load with no
-    /// self-healing rebuild.
-    fn required_files(self) -> &'static [&'static str] {
-        match self {
-            Self::Clef => &[
-                "model.safetensors",
-                "config.json",
-                "joint_head.safetensors",
-                "joint_head_config.json",
-                "tokenizer.json",
-            ],
-            Self::Qwen35 | Self::Qwen35Moe | Self::Gemma4 | Self::MuseGlimmer => {
-                &["model.safetensors", "config.json"]
-            }
-        }
-    }
-}
-
-fn native_gguf_companion_digest(companion: Option<&Path>) -> Result<String> {
-    companion
-        .map(|path| fs::metadata(path).map(|metadata| source_file_identity_digest(path, &metadata)))
-        .transpose()
-        .map(|digest| digest.unwrap_or_else(|| "none".to_string()))
-        .map_err(Into::into)
-}
-
-pub async fn prepare_qwen35_native_gguf(input_path: &Path) -> Result<PathBuf> {
-    let cache_root = native_gguf_cache_root()?;
-    prepare_qwen35_native_gguf_inner(input_path, &cache_root).await
-}
-
-#[cfg(test)]
-pub(super) async fn prepare_qwen35_native_gguf_in(
-    input_path: &Path,
-    cache_root: &Path,
-) -> Result<PathBuf> {
-    let cache_root = initialize_native_gguf_cache_root(cache_root).map_err(|error| {
-        Error::from_reason(format!(
-            "Failed to create native GGUF cache root '{}': {error}",
-            cache_root.display()
-        ))
-    })?;
-    prepare_qwen35_native_gguf_inner(input_path, &cache_root).await
-}
-
-async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) -> Result<PathBuf> {
-    prepare_native_gguf_inner(input_path, cache_root, NativeGgufFamily::Qwen35, None).await
-}
-
-#[cfg(test)]
-pub(super) async fn prepare_qwen35_moe_native_gguf_in(
-    input_path: &Path,
-    cache_root: &Path,
-) -> Result<PathBuf> {
-    let cache_root = initialize_native_gguf_cache_root(cache_root).map_err(|error| {
-        Error::from_reason(format!(
-            "Failed to create native GGUF cache root '{}': {error}",
-            cache_root.display()
-        ))
-    })?;
-    prepare_qwen35_moe_native_gguf_inner(input_path, &cache_root).await
-}
-
-#[cfg(test)]
-async fn prepare_qwen35_moe_native_gguf_inner(
-    input_path: &Path,
-    cache_root: &Path,
-) -> Result<PathBuf> {
-    let (input_path, _) = native_gguf_preflight(input_path, NativeGgufFamily::Qwen35Moe)?;
-    prepare_native_gguf_inner(&input_path, cache_root, NativeGgufFamily::Qwen35Moe, None).await
 }
 
 /// Family checks that run before any cache work: the main GGUF's architecture,
@@ -8298,623 +7918,6 @@ pub(crate) fn native_gguf_preflight(
         NativeGgufFamily::Gemma4 => gemma4_native_preflight(input),
         NativeGgufFamily::MuseGlimmer => muse_glimmer_native_preflight(input),
     }
-}
-
-async fn prepare_native_gguf_inner(
-    input_path: &Path,
-    cache_root: &Path,
-    family: NativeGgufFamily,
-    companion: Option<&Path>,
-) -> Result<PathBuf> {
-    let input_path = input_path.canonicalize().map_err(|error| {
-        Error::from_reason(format!(
-            "Failed to canonicalize GGUF path '{}': {error}",
-            input_path.display()
-        ))
-    })?;
-    let metadata = fs::metadata(&input_path).map_err(|error| {
-        Error::from_reason(format!(
-            "Failed to stat GGUF path '{}': {error}",
-            input_path.display()
-        ))
-    })?;
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let stem = input_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("model")
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .take(32)
-        .collect::<String>();
-    let parent = input_path.parent().unwrap_or(Path::new("."));
-    let source_identity_digest = source_file_identity_digest(&input_path, &metadata);
-    let asset_digest = qwen35_native_asset_digest(parent)?;
-    let companion_digest = native_gguf_companion_digest(companion)?;
-    // Both Qwen3.5 families preserve llama.cpp's tiled GDN order, so they share
-    // the conversion option; only the dense family keeps its historical
-    // preparation digest.
-    let native_qwen35_layout = matches!(
-        family,
-        NativeGgufFamily::Qwen35 | NativeGgufFamily::Qwen35Moe | NativeGgufFamily::Clef
-    );
-    let layout = family.layout();
-    let prism_contract = if family == NativeGgufFamily::Qwen35 {
-        prism_hadamard_config(&parse_gguf(&input_path)?)?
-    } else {
-        None
-    };
-    if prism_contract.is_some() && companion.is_some() {
-        return Err(Error::from_reason(
-            "prism.hadamard sources are text-only and cannot be paired with a companion GGUF",
-        ));
-    }
-    let cache_dtype = if prism_contract.is_some() {
-        "source"
-    } else {
-        "bf16"
-    };
-    // Bound the filename even when the main and companion both have long
-    // names/identities. Keep the two source fingerprints in the marker too.
-    let preparation_digest = if let Some(contract) = &prism_contract {
-        let contract_json = serde_json::to_string(contract).map_err(|e| {
-            Error::from_reason(format!("Failed to serialize prism.hadamard contract: {e}"))
-        })?;
-        Sha256::digest(format!(
-            "{asset_digest}:{layout}:prism-hadamard:{contract_json}"
-        ))
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-    } else if family == NativeGgufFamily::Qwen35 {
-        // Preserve existing Qwen cache keys and avoid an unrelated reimport.
-        asset_digest.clone()
-    } else {
-        Sha256::digest(format!("{asset_digest}:{layout}:{companion_digest}"))
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
-    };
-    let cache_key = format!(
-        "{stem}-{}-{modified}-v{QWEN35_NATIVE_CACHE_FORMAT}-{source_identity_digest}-{preparation_digest}",
-        metadata.len(),
-    );
-    let output_dir = cache_root.join(&cache_key);
-
-    // The verified-current predicate is shared by the hit fast-path, the
-    // under-lock hit, and the same-pid staging reuse below: marker identity
-    // plus the required payloads (and the companion file when one is
-    // paired) — the exact check the publish path used before handing the
-    // dir to a loader.
-    let source_operands_identity =
-        (family == NativeGgufFamily::Qwen35Moe).then(|| source_math::ImportIdentity {
-            source_stat_path_sha256: source_identity_digest.clone(),
-            source_bytes: metadata.len(),
-            assets_sha256: asset_digest.clone(),
-        });
-    let entry_is_current = |dir: &Path| {
-        qwen35_native_cache_is_current(
-            dir,
-            &source_identity_digest,
-            &asset_digest,
-            cache_dtype,
-            family.required_files(),
-        ) && (companion.is_none() || dir.join(family.companion_filename()).is_file())
-            && source_operands_identity
-                .as_ref()
-                .is_none_or(|identity| source_math::cache_is_current(dir, identity))
-    };
-
-    // Sweep stale/orphaned siblings once per prepare. The sweep needs no
-    // locks of its own — every decision behind native_gguf_locked_remove
-    // re-derives state under the per-entry try-flock and skips on busy —
-    // so it runs before the exclusive path: a cache hit on a contended key
-    // must sweep too, and it can no longer reach the under-lock sweep.
-    // A sweep failure or panic must never fail a load, so it runs on a
-    // blocking thread behind catch_unwind.
-    {
-        let sweep_root = cache_root.to_path_buf();
-        let sweep_key = cache_key.clone();
-        let swept = tokio::task::spawn_blocking(move || {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                sweep_native_gguf_cache(&sweep_root, &sweep_key);
-            }))
-        })
-        .await;
-        match swept {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => debug!("native GGUF cache sweep panicked; continuing the load"),
-            Err(error) => debug!("native GGUF cache sweep task failed: {error}"),
-        }
-    }
-
-    // Hit fast-path BEFORE the exclusive lock: loaded models hold a
-    // process-lifetime LOCK_SH on this key's sentinel, so an unconditional
-    // LOCK_EX here would block a second process sharing the cache until the
-    // first exits — an unbounded hang, not a serialization delay. A shared
-    // lease suffices for a verified hit: winning SH proves no deleter or
-    // publisher holds EX, the registered lease then keeps the dir for the
-    // model's lifetime, and the recheck under the lease catches a dir that
-    // vanished before the lease landed. A foreign-held EX (writer or
-    // deleter) fails the lease — fall through to the exclusive path, which
-    // spins on the same lock and rechecks current-ness under it. Runs
-    // without the prepare mutex: same-process prepare concurrency on a hit
-    // adds only registrations, and the registry handles those.
-    if entry_is_current(&output_dir)
-        && native_gguf_lease_in_use(cache_root, &output_dir, Some(&cache_key))
-    {
-        if entry_is_current(&output_dir) {
-            // Stamp the marker mtime so the capped-LRU sweep treats this
-            // verified hit as recently used instead of a deletion candidate.
-            native_gguf_stamp_mtime(&output_dir.join(".complete"));
-            return Ok(output_dir);
-        }
-        // The dir vanished or changed before the lease landed: release the
-        // stale registration (it would pin the lock file against same-key
-        // republishes) and take the exclusive path.
-        native_gguf_unlease_in_use(&output_dir);
-    }
-
-    // The process lock closes the same-process flock ambiguity on BSD/macOS;
-    // the persistent per-key flock extends serialization across processes.
-    // Both are acquired before the marker check, so a queued caller observes
-    // the cache the first caller just published instead of converting twice.
-    let _process_lock = qwen35_native_prepare_mutex().lock().await;
-    let lock_path = cache_root.join(format!(".{cache_key}.lock"));
-    let lock_path_for_thread = lock_path.clone();
-    let _file_lock =
-        tokio::task::spawn_blocking(move || Qwen35NativeCacheLock::acquire(&lock_path_for_thread))
-            .await
-            .map_err(|error| {
-                Error::from_reason(format!(
-                    "Native GGUF cache lock task failed for '{}': {error}",
-                    lock_path.display()
-                ))
-            })?
-            .map_err(|error| {
-                Error::from_reason(format!(
-                    "Failed to lock native GGUF cache '{}': {error}",
-                    lock_path.display()
-                ))
-            })?;
-
-    let locked_asset_digest = qwen35_native_asset_digest(parent)?;
-    if locked_asset_digest != asset_digest
-        || native_gguf_companion_digest(companion)? != companion_digest
-    {
-        return Err(Error::from_reason(
-            "GGUF sibling config/tokenizer assets changed while acquiring the native GGUF \
-             cache lock; retry the load"
-                .to_string(),
-        ));
-    }
-    let locked_metadata = fs::metadata(&input_path).map_err(|error| {
-        Error::from_reason(format!(
-            "Failed to restat GGUF path '{}' after acquiring the native cache lock: {error}",
-            input_path.display()
-        ))
-    })?;
-    if source_file_identity_digest(&input_path, &locked_metadata) != source_identity_digest {
-        return Err(Error::from_reason(
-            "GGUF source changed while acquiring the native cache lock; retry the load".to_string(),
-        ));
-    }
-
-    if entry_is_current(&output_dir) {
-        // Lease before returning: the loader may first open tokenizer.json
-        // days later and an LRU eviction would delete the dir out from under
-        // it. The lease pins the separate `.{key}.lease` sentinel — sharing
-        // the writer lock would block every same-key republish, since BSD
-        // flock is per-open-description and a retained SH defeats this
-        // process's own EX try-locks too. The writer lock is held, so a
-        // `false` can only be a sentinel open/flock failure: fail the load
-        // rather than return a directory nothing protects from eviction.
-        if !native_gguf_lease_in_use_retry(cache_root, &output_dir, &cache_key) {
-            return Err(Error::from_reason(format!(
-                "Failed to lease native GGUF cache '{}' for the loaded model; retry the load",
-                output_dir.display()
-            )));
-        }
-        // Stamp the marker mtime so the capped-LRU sweep treats this verified
-        // hit as recently used instead of a deletion candidate.
-        native_gguf_stamp_mtime(&output_dir.join(".complete"));
-        return Ok(output_dir);
-    }
-
-    // Before converting, look for a staging directory this process already
-    // completed: a cap-refused publish returns its staging dir to the
-    // loader, and the next load misses the entry key again — without reuse
-    // every reload re-converts and retains ANOTHER multi-GB copy (live-pid
-    // staging dirs are never counted toward the cap, and the sweep keeps a
-    // completed one while this pid lives). Only same-pid dirs are eligible:
-    // a live foreign-pid dir belongs to a peer mid-write, and a dead-pid dir
-    // can be swept mid-load — the sweep reaps both under the entry lock we
-    // currently hold.
-    let staging_prefix = format!(".{cache_key}{NATIVE_GGUF_STAGING_INFIX}");
-    let staging_hit = fs::read_dir(cache_root)
-        .ok()
-        .into_iter()
-        .flatten()
-        .flatten()
-        .find_map(|entry| {
-            let name = entry.file_name().to_str()?.to_string();
-            let suffix = name.strip_prefix(&staging_prefix)?;
-            if native_gguf_writer_pid_suffix(suffix) != Some(std::process::id()) {
-                return None;
-            }
-            let path = entry.path();
-            // `symlink_metadata` classifies no-follow: a staging-named
-            // symlink is foreign and never a reuse candidate.
-            if !(fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir())
-                && entry_is_current(&path))
-            {
-                return None;
-            }
-            // Lease before trusting the path: an unleased same-pid `.complete`
-            // dir is sweep debris — a concurrent prepare's pre-mutex sweep
-            // can delete it between this check and the lease. Registry-only
-            // (staging names own no sentinel), rechecked under the lease.
-            let _ = native_gguf_lease_in_use(cache_root, &path, None);
-            if entry_is_current(&path) {
-                Some(path)
-            } else {
-                native_gguf_unlease_in_use(&path);
-                None
-            }
-        });
-    // A reused staging dir is returned as-is and NEVER republished:
-    // `native_gguf_publish_with_cap` would `rename` it to `output_dir`,
-    // moving the path out from under an in-process model that an earlier
-    // load already handed this same path to and that still opens its files
-    // later — unlink-under-mmap protects only already-open mappings, not
-    // future opens of the moved path. Forgoing the promotion costs cap
-    // space but correctness for live readers wins.
-    //
-    // Arm this key as in-flight BEFORE the conversion path below: from here
-    // until the provisional lease registers, a concurrent same-process sweep
-    // sees the key in-flight and cannot delete the completed-but-unleased
-    // staging output. The flock and process mutex cannot close that gap —
-    // the pre-mutex sweep takes neither, and macOS flock does not exclude
-    // same-process fds.
-    let in_flight = InFlightPrepare::arm(cache_key.clone());
-    let staging_dir = match staging_hit {
-        Some(dir) => {
-            // The reuse candidate carries its registry lease from the scan
-            // above — the same hand-off the hit fast-path uses for published
-            // entries.
-            return Ok(dir);
-        }
-        None => {
-            // `Some(dir)` means an explicitly authoritative config source to the
-            // converter. A standalone GGUF has no config by design, so pass `None` in
-            // that case: the converter still uses the GGUF parent for optional assets,
-            // while allowing config/tokenizer reconstruction from header metadata.
-            let has_sibling_config = parent.join("config.json").is_file();
-            let config_source_dir =
-                has_sibling_config.then(|| parent.to_string_lossy().into_owned());
-            let staging_dir = cache_root.join(format!(
-                ".{cache_key}.staging-{}-{}",
-                std::process::id(),
-                uuid::Uuid::new_v4().simple()
-            ));
-            let conversion = convert_gguf_to_safetensors_inner(
-                GgufConversionOptions {
-                    input_path: input_path.to_string_lossy().into_owned(),
-                    output_dir: staging_dir.to_string_lossy().into_owned(),
-                    config_source_dir,
-                    dtype: Some("bfloat16".to_string()),
-                    verbose: Some(true),
-                    quantize: Some(false),
-                    quant_bits: None,
-                    quant_group_size: None,
-                    quant_mode: None,
-                    quant_recipe: None,
-                    imatrix_path: None,
-                    output_filename: None,
-                    vlm_key_prefix: None,
-                    quant_mxfp: None,
-                    import_k_quants: Some(true),
-                    native_qwen35_layout: Some(native_qwen35_layout),
-                },
-                source_operands_identity.clone(),
-            )
-            .await;
-            if let Err(error) = conversion {
-                fs::remove_dir_all(&staging_dir).ok();
-                return Err(error);
-            }
-
-            if let Some(companion) = companion {
-                let result = convert_gguf_to_safetensors(GgufConversionOptions {
-                    input_path: companion.to_string_lossy().into_owned(),
-                    output_dir: staging_dir.to_string_lossy().into_owned(),
-                    config_source_dir: Some(parent.to_string_lossy().into_owned()),
-                    dtype: Some("bfloat16".to_string()),
-                    verbose: Some(true),
-                    quantize: Some(false),
-                    quant_bits: None,
-                    quant_group_size: None,
-                    quant_mode: None,
-                    quant_recipe: None,
-                    imatrix_path: None,
-                    output_filename: Some(family.companion_filename().to_string()),
-                    vlm_key_prefix: None,
-                    quant_mxfp: None,
-                    import_k_quants: Some(true),
-                    native_qwen35_layout: None,
-                })
-                .await;
-                if let Err(error) = result {
-                    fs::remove_dir_all(&staging_dir).ok();
-                    return Err(error);
-                }
-            }
-
-            let final_asset_digest = match qwen35_native_asset_digest(parent) {
-                Ok(digest) => digest,
-                Err(error) => {
-                    fs::remove_dir_all(&staging_dir).ok();
-                    return Err(error);
-                }
-            };
-            if final_asset_digest != asset_digest
-                || native_gguf_companion_digest(companion).as_ref().ok() != Some(&companion_digest)
-            {
-                fs::remove_dir_all(&staging_dir).ok();
-                return Err(Error::from_reason(
-                    "GGUF sibling config/tokenizer assets changed during native GGUF preparation; \
-                     discarded the staged cache, retry the load"
-                        .to_string(),
-                ));
-            }
-            let final_metadata = match fs::metadata(&input_path) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    fs::remove_dir_all(&staging_dir).ok();
-                    return Err(Error::from_reason(format!(
-                        "Failed to restat GGUF path '{}' after native preparation: {error}",
-                        input_path.display()
-                    )));
-                }
-            };
-            if source_file_identity_digest(&input_path, &final_metadata) != source_identity_digest {
-                fs::remove_dir_all(&staging_dir).ok();
-                return Err(Error::from_reason(
-                    "GGUF source changed during native preparation; discarded the staged cache, \
-                     retry the load"
-                        .to_string(),
-                ));
-            }
-            // Record the companion's canonical path (or `none`) so the sweep can
-            // recompute its identity digest; entries published before this field
-            // existed fail verification and rebuild once they age out.
-            let companion_path = companion
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "none".to_string());
-            // `source`/`companion` are `Path::display` text: a newline truncates the
-            // field and non-UTF-8 bytes are lossy, so the sweep could stat the wrong
-            // file and delete a healthy entry. The hex twins carry the raw OS bytes
-            // (Unix; lossy-text bytes elsewhere) and are preferred at parse time.
-            // Every authoritative field precedes the raw display lines, which are
-            // written last — and a raw line is omitted entirely when its OS bytes
-            // contain a newline. A newline is the only byte that can forge a record
-            // line: a path holding "\nsource_hex=evil" would inject an earlier
-            // authoritative-looking line that first-match field parsing would
-            // honor, so with no raw line written there is nothing to inject into.
-            let source_hex = native_gguf_hex_encode(&native_gguf_os_bytes(&input_path));
-            let companion_hex = companion
-                .map(|path| native_gguf_hex_encode(&native_gguf_os_bytes(path)))
-                .unwrap_or_else(|| "none".to_string());
-            let source_line = if native_gguf_os_bytes(&input_path).contains(&b'\n') {
-                String::new()
-            } else {
-                format!("source={}\n", input_path.display())
-            };
-            let companion_line = match companion {
-                Some(path) if !native_gguf_os_bytes(path).contains(&b'\n') => {
-                    format!("companion={companion_path}\n")
-                }
-                Some(_) => String::new(),
-                None => "companion=none\n".to_string(),
-            };
-            let source_operands_marker = if let Some(identity) = &source_operands_identity {
-                let digest = match source_math::validate(&staging_dir, identity, None) {
-                    Ok(digest) => digest,
-                    Err(error) => {
-                        fs::remove_dir_all(&staging_dir).ok();
-                        return Err(Error::from_reason(format!(
-                            "Failed to finalize source operand capability: {error}"
-                        )));
-                    }
-                };
-                format!("source_operands_schema=1\nsource_operands_manifest_sha256={digest}\n")
-            } else {
-                String::new()
-            };
-            let marker = staging_dir.join(".complete");
-            if let Err(error) = fs::write(
-                marker,
-                format!(
-                    "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource_hex={source_hex}\nsource_identity_sha256={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout={layout}\ncompanion_hex={companion_hex}\ncompanion_sha256={companion_digest}\ndtype={cache_dtype}\n{source_line}{companion_line}{source_operands_marker}",
-                    source_identity_digest,
-                    metadata.len(),
-                    modified,
-                    asset_digest
-                ),
-            ) {
-                fs::remove_dir_all(&staging_dir).ok();
-                return Err(Error::from_reason(format!(
-                    "Failed to finalize native GGUF cache '{}': {error}",
-                    output_dir.display()
-                )));
-            }
-            staging_dir
-        }
-    };
-    // The format and asset digest are part of the directory key, so a current
-    // cache is never replaced. Only a prior interrupted/corrupt build can
-    // occupy this exact path; remove it while both locks are held, then publish
-    // the complete staging directory with one atomic rename.
-    //
-    // With a cap configured, remnant removal, the aggregate count, admission
-    // LRU eviction and the rename run as one critical section under the
-    // root-wide admission flock: two prepares on different keys each hold
-    // only their own per-key lock, so without the shared section both could
-    // publish "under the cap" while jointly exceeding it. The flock is
-    // BLOCKING — unlike the packed cache's skip-on-busy, the staged dir is
-    // the load output itself, so the load cannot skip; it only decides
-    // where the bytes land. Blocking is bounded because publish runs once
-    // per conversion and the section is a fast scan + rename. Lock order
-    // stays acyclic: process mutex → per-key flock → admission flock (the
-    // sweep never takes the admission flock; it only removes).
-    let prepared_dir = if let Some(cap) = native_gguf_cache_cap_bytes() {
-        let root = cache_root.to_path_buf();
-        let staging = staging_dir.clone();
-        let output = output_dir.clone();
-        tokio::task::spawn_blocking(move || {
-            native_gguf_publish_with_cap(&root, &staging, &output, cap)
-        })
-        .await
-        .map_err(|error| {
-            fs::remove_dir_all(&staging_dir).ok();
-            Error::from_reason(format!(
-                "Failed to publish native GGUF cache '{}': {error}",
-                output_dir.display()
-            ))
-        })?
-        .map_err(|error| {
-            fs::remove_dir_all(&staging_dir).ok();
-            Error::from_reason(format!(
-                "Failed to publish native GGUF cache '{}': {error}",
-                output_dir.display()
-            ))
-        })?
-    } else {
-        // Same lease guard as the capped publish: an existing output_dir a
-        // loaded model still leases is kept, and the load proceeds from
-        // staging (its name owns no sentinel — the registry leg alone pins
-        // it while this process lives).
-        let uncapped_guard = output_dir
-            .exists()
-            .then(|| native_gguf_output_delete_guard(cache_root, &output_dir))
-            .flatten();
-        let prepared = if output_dir.exists() && uncapped_guard.is_none() {
-            staging_dir.clone()
-        } else {
-            if output_dir.exists() {
-                fs::remove_dir_all(&output_dir).map_err(|error| {
-                    fs::remove_dir_all(&staging_dir).ok();
-                    Error::from_reason(format!(
-                        "Failed to remove incomplete native GGUF cache '{}': {error}",
-                        output_dir.display()
-                    ))
-                })?;
-            }
-            fs::rename(&staging_dir, &output_dir).map_err(|error| {
-                fs::remove_dir_all(&staging_dir).ok();
-                Error::from_reason(format!(
-                    "Failed to publish native GGUF cache '{}' atomically: {error}",
-                    output_dir.display()
-                ))
-            })?;
-            output_dir.clone()
-        };
-        drop(uncapped_guard);
-        prepared
-    };
-
-    // Lease the returned dir BEFORE the post-publish sweep: the sweep's
-    // same-pid `.complete` staging gate deletes unleased staging dirs, so a
-    // cap-refused `prepared_dir` must already carry its registry reference
-    // when the sweep runs. A published entry pins its own `.{key}.lease`
-    // sentinel — never the writer lock, or the held SH would brick same-key
-    // republishes (flock is per-open-description, so it excludes this
-    // process too); a cap-refused staging dir registers without a sentinel
-    // (its name owns no lock file). A failed keyed lease fails the load —
-    // never hand a model a directory the sweep can remove.
-    let provisional_lease = if prepared_dir == output_dir {
-        if !native_gguf_lease_in_use_retry(cache_root, &prepared_dir, &cache_key) {
-            return Err(Error::from_reason(format!(
-                "Failed to lease native GGUF cache '{}' for the loaded model; retry the load",
-                prepared_dir.display()
-            )));
-        }
-        PreparedDirLease::armed(prepared_dir.clone())
-    } else {
-        // Staging/live fallback dirs own no sentinel — registry-only.
-        native_gguf_lease_in_use(cache_root, &prepared_dir, None);
-        PreparedDirLease::armed(prepared_dir.clone())
-    };
-    // The registered lease now protects `prepared_dir`: drop the in-flight
-    // conversion flag so a sweep may reclaim this dir only via the lease
-    // gates. (An in-flight arm without a following lease — impossible: the
-    // exclusive path always reaches this block before returning.)
-    in_flight.disarm();
-
-    // Deterministic pause for the cancellation regression: prepare parks
-    // here holding an armed lease until the test aborts the task. The sleep
-    // yields the executor, so the abort lands while the lease is armed. The
-    // hook is consumed only by the root the test armed it for.
-    #[cfg(all(test, unix))]
-    {
-        let armed_pause = {
-            let mut pause = POST_LEASE_SWEEP_PAUSE
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            // The guard must not live across the sleep await — the prepare
-            // future stays Send only while no lock guard is borrowed.
-            if pause
-                .as_ref()
-                .is_some_and(|(root, _)| *root == cache_root.to_path_buf())
-            {
-                pause.take()
-            } else {
-                None
-            }
-        };
-        if let Some((_, at_pause)) = armed_pause {
-            let _ = at_pause.send(());
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        }
-    }
-
-    // Re-run the sweep now that the new entry's bytes are on disk: the
-    // pre-conversion sweep could not account for them, so the cap must be
-    // enforced again. The published key is exempt from cap eviction, and a
-    // refused publish is harmless here: a live-pid staging dir never counts
-    // toward the cap, and a completed one (the load output) is protected by
-    // the armed lease registered above — if this await is cancelled the
-    // guard's Drop releases it rather than leaking a cap-exempt dir.
-    {
-        let sweep_root = cache_root.to_path_buf();
-        let sweep_key = cache_key.clone();
-        let swept = tokio::task::spawn_blocking(move || {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                sweep_native_gguf_cache(&sweep_root, &sweep_key);
-            }))
-        })
-        .await;
-        match swept {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => debug!("native GGUF cache sweep panicked; continuing the load"),
-            Err(error) => debug!("native GGUF cache sweep task failed: {error}"),
-        }
-    }
-    // The lease survives the return: the caller hands `prepared_dir` to the
-    // loader, which owns the reference from here on.
-    provisional_lease.disarm();
-    Ok(prepared_dir)
 }
 
 /// Prepare the asset-only entry for a GGUF load: `config.json` (t64 marks,
@@ -9076,7 +8079,8 @@ pub(crate) async fn prepare_gguf_assets_in(
 
     run_native_gguf_sweep(cache_root, &cache_key).await;
 
-    // Shared-lease hit before the exclusive lock: see prepare_native_gguf_inner.
+    // Shared-lease hit before the exclusive lock: lease and recheck a verified
+    // hit without blocking other processes for the model's lifetime.
     if entry_is_current(&output_dir)
         && native_gguf_lease_in_use(cache_root, &output_dir, Some(&cache_key))
     {
@@ -9242,6 +8246,28 @@ pub(crate) async fn prepare_gguf_assets_in(
         PreparedDirLease::armed(prepared_dir.clone())
     };
     in_flight.disarm();
+
+    #[cfg(all(test, unix))]
+    {
+        let armed_pause = {
+            let mut pause = POST_LEASE_SWEEP_PAUSE
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if pause
+                .as_ref()
+                .is_some_and(|(root, _)| *root == cache_root.to_path_buf())
+            {
+                pause.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, at_pause)) = armed_pause {
+            let _ = at_pause.send(());
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    }
+
     run_native_gguf_sweep(cache_root, &cache_key).await;
     provisional_lease.disarm();
     Ok(checkpoint(prepared_dir))
@@ -9303,42 +8329,12 @@ fn native_gguf_marker_text(
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
-/// Serialize tests that mutate `MLX_NATIVE_GGUF_CACHE_MAX_GB` across the
-/// crate: the prepare mutex only serializes code inside
-/// `prepare_native_gguf_inner`, not the env writes around it. Shared with
-/// `models::qwen4_exp::gguf` asset-sidecar tests.
+/// Serialize sweep and sidecar tests whose try-lock and skip outcomes are
+/// timing-dependent. Shared with `models::qwen4_exp::gguf` sidecar tests.
 #[cfg(all(test, unix))]
 pub(crate) fn sweep_env_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
-}
-
-/// RAII guard restoring `MLX_NATIVE_GGUF_CACHE_MAX_GB` on drop; pair with
-/// `sweep_env_lock` for the whole test.
-#[cfg(all(test, unix))]
-pub(crate) struct SweepEnvVar(Option<std::ffi::OsString>);
-
-#[cfg(all(test, unix))]
-impl SweepEnvVar {
-    pub(crate) fn set_max_gb(value: &str) -> Self {
-        let prior = std::env::var_os(NATIVE_GGUF_CACHE_MAX_GB_ENV);
-        unsafe {
-            std::env::set_var(NATIVE_GGUF_CACHE_MAX_GB_ENV, value);
-        }
-        Self(prior)
-    }
-}
-
-#[cfg(all(test, unix))]
-impl Drop for SweepEnvVar {
-    fn drop(&mut self) {
-        unsafe {
-            match &self.0 {
-                Some(prior) => std::env::set_var(NATIVE_GGUF_CACHE_MAX_GB_ENV, prior),
-                None => std::env::remove_var(NATIVE_GGUF_CACHE_MAX_GB_ENV),
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -9352,6 +8348,30 @@ mod tests {
     };
 
     include!("gguf_source_math_import_tests.rs");
+
+    async fn prepare_asset_dir_for_test(
+        input: &Path,
+        family: NativeGgufFamily,
+        root: &Path,
+    ) -> Result<PathBuf> {
+        Ok(prepare_gguf_assets_in(input, family, root).await?.asset_dir)
+    }
+
+    async fn prepare_qwen35_asset_dir_for_test(input: &Path, root: &Path) -> Result<PathBuf> {
+        prepare_asset_dir_for_test(input, NativeGgufFamily::Qwen35, root).await
+    }
+
+    async fn prepare_qwen35_moe_asset_dir_for_test(input: &Path, root: &Path) -> Result<PathBuf> {
+        prepare_asset_dir_for_test(input, NativeGgufFamily::Qwen35Moe, root).await
+    }
+
+    async fn prepare_gemma4_asset_dir_for_test(input: &Path, root: &Path) -> Result<PathBuf> {
+        prepare_asset_dir_for_test(input, NativeGgufFamily::Gemma4, root).await
+    }
+
+    async fn prepare_muse_glimmer_asset_dir_for_test(input: &Path, root: &Path) -> Result<PathBuf> {
+        prepare_asset_dir_for_test(input, NativeGgufFamily::MuseGlimmer, root).await
+    }
 
     struct GemmaNativeTestDir(PathBuf);
 
@@ -9470,12 +8490,13 @@ mod tests {
         let input = muse_native_fixture(&source);
         let source_config = fs::read(source.join("config.json")).unwrap();
         let cache = root.path().join("cache");
-        let plain = prepare_muse_glimmer_native_gguf_in(&input, &cache)
+        let plain_ckpt = prepare_gguf_assets_in(&input, NativeGgufFamily::MuseGlimmer, &cache)
             .await
             .unwrap();
-        let params =
-            super::super::safetensors::load_safetensors_lazy(plain.join("model.safetensors"))
-                .unwrap();
+        let plain = plain_ckpt.asset_dir.clone();
+        let preload =
+            crate::utils::gguf_import::GgufPreload::load(&plain_ckpt.preload_input(false)).unwrap();
+        let params = preload.main;
         let prefix = "model.language_model.layers.0.mlp.up_proj";
         assert_eq!(
             params[&format!("{prefix}.weight")].dtype().unwrap(),
@@ -9495,9 +8516,9 @@ mod tests {
             serde_json::from_slice(&fs::read(plain.join("config.json")).unwrap()).unwrap();
         assert_eq!(config["quantization"]["mode"], "q4k");
         assert_eq!(config["muse_glimmer_gguf_rope_layout"], "interleaved");
-        assert!(!plain.join("draft.safetensors").exists());
+        assert!(plain_ckpt.companion.is_none());
         assert_eq!(
-            prepare_muse_glimmer_native_gguf_in(&input, &cache)
+            prepare_muse_glimmer_asset_dir_for_test(&input, &cache)
                 .await
                 .unwrap(),
             plain
@@ -9505,24 +8526,28 @@ mod tests {
 
         let draft = source.join("dflash-kquant.gguf");
         muse_native_draft_fixture(&draft);
-        let with_draft = prepare_muse_glimmer_native_gguf_in(&input, &cache)
+        let with_draft_ckpt = prepare_gguf_assets_in(&input, NativeGgufFamily::MuseGlimmer, &cache)
             .await
             .unwrap();
+        let with_draft = with_draft_ckpt.asset_dir.clone();
         assert_ne!(with_draft, plain);
-        assert!(with_draft.join("draft.safetensors").is_file());
+        let draft_preload =
+            crate::utils::gguf_import::GgufPreload::load(&with_draft_ckpt.preload_input(true))
+                .unwrap();
+        assert!(!draft_preload.companion.is_empty());
         let config: serde_json::Value =
             serde_json::from_slice(&fs::read(with_draft.join("config.json")).unwrap()).unwrap();
         assert_eq!(config["dflash_config"]["num_hidden_layers"], 1);
-        assert!(!with_draft.join("vision.safetensors").exists());
-        fs::remove_file(with_draft.join("draft.safetensors")).unwrap();
+        fs::remove_file(with_draft.join("gguf-source.json")).unwrap();
         // A still-leased entry is a load output: damaging it does not make
-        // it replaceable, so republish refuses and the load reads a fresh
-        // staging conversion that carries the repaired payload.
-        let refusal = prepare_muse_glimmer_native_gguf_in(&input, &cache)
+        // it replaceable, so publish falls back to a fresh staged asset dir.
+        let refusal_ckpt = prepare_gguf_assets_in(&input, NativeGgufFamily::MuseGlimmer, &cache)
             .await
             .unwrap();
+        let refusal = refusal_ckpt.asset_dir.clone();
         assert_ne!(refusal, with_draft);
-        assert!(refusal.join("draft.safetensors").is_file());
+        assert!(refusal_ckpt.companion.is_some());
+        assert!(refusal.join("gguf-source.json").is_file());
         // The staging load output is leased like a published dir; release
         // this attempt's references so the test leaves nothing pinned.
         native_gguf_unlease_in_use(&refusal);
@@ -9532,21 +8557,21 @@ mod tests {
         // target-plus-draft cache. Source assets remain untouched throughout.
         fs::write(&draft, fs::read(&draft).unwrap()).unwrap();
         assert_ne!(
-            prepare_muse_glimmer_native_gguf_in(&input, &cache)
+            prepare_muse_glimmer_asset_dir_for_test(&input, &cache)
                 .await
                 .unwrap(),
             with_draft
         );
         fs::remove_file(&draft).unwrap();
         assert_eq!(
-            prepare_muse_glimmer_native_gguf_in(&input, &cache)
+            prepare_muse_glimmer_asset_dir_for_test(&input, &cache)
                 .await
                 .unwrap(),
             plain
         );
         fs::write(source.join("tokenizer.json"), "[]").unwrap();
         assert_ne!(
-            prepare_muse_glimmer_native_gguf_in(&input, &cache)
+            prepare_muse_glimmer_asset_dir_for_test(&input, &cache)
                 .await
                 .unwrap(),
             plain
@@ -9561,7 +8586,7 @@ mod tests {
         let cache = root.path().join("cache");
         fs::remove_file(root.path().join("tokenizer.json")).unwrap();
         assert!(
-            prepare_muse_glimmer_native_gguf_in(&input, &cache)
+            prepare_muse_glimmer_asset_dir_for_test(&input, &cache)
                 .await
                 .unwrap_err()
                 .reason
@@ -9582,7 +8607,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            prepare_muse_glimmer_native_gguf_in(&input, &cache)
+            prepare_muse_glimmer_asset_dir_for_test(&input, &cache)
                 .await
                 .unwrap_err()
                 .reason
@@ -9590,7 +8615,7 @@ mod tests {
         );
         assert!(!cache.exists());
         assert!(
-            prepare_muse_glimmer_native_gguf_in(&draft, &cache)
+            prepare_muse_glimmer_asset_dir_for_test(&draft, &cache)
                 .await
                 .unwrap_err()
                 .reason
@@ -9658,10 +8683,13 @@ mod tests {
         let input = gemma_native_fixture(&source);
         let original = fs::read(&input).unwrap();
         let cache = root.path().join("cache");
-        let output = prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap();
-        let params =
-            crate::utils::safetensors::load_safetensors_lazy(output.join("model.safetensors"))
-                .unwrap();
+        let output_ckpt = prepare_gguf_assets_in(&input, NativeGgufFamily::Gemma4, &cache)
+            .await
+            .unwrap();
+        let output = output_ckpt.asset_dir.clone();
+        let preload =
+            crate::utils::gguf_import::GgufPreload::load(&output_ckpt.preload_input(true)).unwrap();
+        let params = preload.main;
         assert_eq!(
             params["model.embed_tokens.weight"].dtype().unwrap(),
             DType::Uint32
@@ -9688,23 +8716,26 @@ mod tests {
         );
         assert!(config.get("qwen35_gguf_gdn_layout").is_none());
         assert_eq!(config["text_config"]["dtype"], "bfloat16");
-        let media =
-            crate::utils::safetensors::load_safetensors_lazy(output.join("vision.safetensors"))
-                .unwrap();
+        let media = preload.companion;
         assert!(media.contains_key("model.embed_vision.embedding_projection.weight"));
         assert_eq!(fs::read(&input).unwrap(), original);
         assert!(!source.join("model.safetensors").exists());
         assert_eq!(
-            prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+            prepare_gemma4_asset_dir_for_test(&input, &cache)
+                .await
+                .unwrap(),
             output
         );
-        fs::remove_file(output.join("vision.safetensors")).unwrap();
-        // A still-leased entry is a load output: republish refuses while the
-        // lease stands, so the load reads a fresh staging conversion that
-        // carries the repaired payload.
-        let refusal = prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap();
+        fs::remove_file(output.join("gguf-source.json")).unwrap();
+        // A still-leased entry is a load output: publish falls back to fresh
+        // staged assets rather than replacing the leased directory.
+        let refusal_ckpt = prepare_gguf_assets_in(&input, NativeGgufFamily::Gemma4, &cache)
+            .await
+            .unwrap();
+        let refusal = refusal_ckpt.asset_dir.clone();
         assert_ne!(refusal, output);
-        assert!(refusal.join("vision.safetensors").is_file());
+        assert!(refusal_ckpt.companion.is_some());
+        assert!(refusal.join("gguf-source.json").is_file());
         // The staging load output is leased like a published dir; release
         // this attempt's references so the test leaves nothing pinned.
         native_gguf_unlease_in_use(&refusal);
@@ -9714,11 +8745,15 @@ mod tests {
         let mut bytes = fs::read(&companion).unwrap();
         *bytes.last_mut().unwrap() = 1;
         fs::write(&companion, bytes).unwrap();
-        let changed = prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap();
+        let changed = prepare_gemma4_asset_dir_for_test(&input, &cache)
+            .await
+            .unwrap();
         assert_ne!(changed, output);
         fs::write(source.join("tokenizer.json"), "[]").unwrap();
         assert_ne!(
-            prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+            prepare_gemma4_asset_dir_for_test(&input, &cache)
+                .await
+                .unwrap(),
             changed
         );
     }
@@ -9747,13 +8782,16 @@ mod tests {
             config["text_config"] = serde_json::json!({"num_hidden_layers": 0});
             fs::write(source.join("config.json"), config.to_string()).unwrap();
             let cache = root.path().join(format!("cache-{index}"));
-            let output = prepare_gemma4_native_gguf_in(&input, &cache)
+            let output_ckpt = prepare_gguf_assets_in(&input, NativeGgufFamily::Gemma4, &cache)
                 .await
                 .unwrap_or_else(|error| panic!("config {config}: {error}"));
-            assert!(output.join("model.safetensors").is_file());
-            assert!(!output.join("vision.safetensors").exists());
+            let output = output_ckpt.asset_dir.clone();
+            assert!(output_ckpt.companion.is_none());
+            assert!(output.join("gguf-source.json").is_file());
             assert_eq!(
-                prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+                prepare_gemma4_asset_dir_for_test(&input, &cache)
+                    .await
+                    .unwrap(),
                 output
             );
         }
@@ -9775,17 +8813,22 @@ mod tests {
             fs::write(source.join("config.json"), config.to_string()).unwrap();
             let cache = root.path().join(format!("cache-{index}"));
 
-            // Even a valid unused projector must not be converted or affect
-            // the cache identity of the text checkpoint.
-            let output = prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap();
-            assert!(!output.join("vision.safetensors").exists());
+            // Even a valid unused projector must not be loaded or affect the
+            // asset identity of the text checkpoint.
+            let output_ckpt = prepare_gguf_assets_in(&input, NativeGgufFamily::Gemma4, &cache)
+                .await
+                .unwrap();
+            let output = output_ckpt.asset_dir.clone();
+            assert!(output_ckpt.companion.is_none());
             fs::copy(
                 source.join("mmproj-gemma.gguf"),
                 source.join("mmproj-other.gguf"),
             )
             .unwrap();
             assert_eq!(
-                prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+                prepare_gemma4_asset_dir_for_test(&input, &cache)
+                    .await
+                    .unwrap(),
                 output
             );
 
@@ -9796,10 +8839,12 @@ mod tests {
             ));
             fs::write(exact, b"not a GGUF").unwrap();
             assert_eq!(
-                prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+                prepare_gemma4_asset_dir_for_test(&input, &cache)
+                    .await
+                    .unwrap(),
                 output
             );
-            assert!(!output.join("vision.safetensors").exists());
+            assert!(output_ckpt.companion.is_none());
         }
     }
 
@@ -9829,8 +8874,8 @@ mod tests {
         // `unsloth/gemma-4-26B-A4B-it-GGUF` shape: the sibling config.json keeps
         // a SigLIP `vision_config`, the text GGUF carries text tensors only, and
         // `mmproj-BF16.gguf` declares `clip.vision.projector_type = "gemma4v"`.
-        // The tower converts into `vision.safetensors` and the cache records
-        // the companion identity. The fixture's gemma4uv file stays in place
+        // The tower loads into the companion preload and the asset marker
+        // records its identity. The fixture's gemma4uv file stays in place
         // to prove a unified media projector beside a plain config is ignored.
         let root = GemmaNativeTestDir::new();
         let source = root.path().join("source");
@@ -9843,17 +8888,19 @@ mod tests {
         gemma4v_mmproj_fixture(&source.join("mmproj-BF16.gguf"));
 
         let cache = root.path().join("cache");
-        let output = prepare_gemma4_native_gguf_in(&input, &cache)
+        let output_ckpt = prepare_gguf_assets_in(&input, NativeGgufFamily::Gemma4, &cache)
             .await
             .unwrap_or_else(|error| {
                 panic!(
-                    "a gemma4v-paired Gemma4 checkpoint must convert: {}",
+                    "a gemma4v-paired Gemma4 checkpoint must load: {}",
                     error.reason
                 )
             });
-        let media =
-            crate::utils::safetensors::load_safetensors_lazy(output.join("vision.safetensors"))
-                .unwrap();
+        let output = output_ckpt.asset_dir.clone();
+        let preload =
+            crate::utils::gguf_import::GgufPreload::load(&output_ckpt.preload_input(true)).unwrap();
+        let media = preload.companion;
+        assert!(!media.is_empty());
         for key in [
             "model.vision_tower.patch_embedder.input_proj.weight",
             "model.vision_tower.patch_embedder.position_embedding_table",
@@ -9885,7 +8932,9 @@ mod tests {
             "the gemma4v companion must be recorded in the cache marker"
         );
         assert_eq!(
-            prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+            prepare_gemma4_asset_dir_for_test(&input, &cache)
+                .await
+                .unwrap(),
             output
         );
     }
@@ -9929,17 +8978,18 @@ mod tests {
         .unwrap();
 
         let cache = root.path().join("cache");
-        let output = prepare_gemma4_native_gguf_in(&input, &cache)
+        let output_ckpt = prepare_gguf_assets_in(&input, NativeGgufFamily::Gemma4, &cache)
             .await
             .unwrap_or_else(|error| {
                 panic!(
-                    "a vision-declaring text-only Gemma4 checkpoint must convert: {}",
+                    "a vision-declaring text-only Gemma4 checkpoint must load: {}",
                     error.reason
                 )
             });
+        let output = output_ckpt.asset_dir.clone();
         assert!(
-            !output.join("vision.safetensors").exists(),
-            "no supported projector was present, so no media sidecar may be published"
+            output_ckpt.companion.is_none(),
+            "no supported projector was present, so no media companion may be selected"
         );
         let marker = fs::read_to_string(output.join(".complete")).unwrap();
         assert!(
@@ -9948,7 +8998,9 @@ mod tests {
         );
         // The unsupported projector must not change the cache identity either.
         assert_eq!(
-            prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+            prepare_gemma4_asset_dir_for_test(&input, &cache)
+                .await
+                .unwrap(),
             output
         );
     }
@@ -9966,7 +9018,7 @@ mod tests {
         gemma4v_mmproj_fixture(&source.join("mmproj-BF16.gguf"));
         let cache = root.path().join("cache-unified");
         assert!(
-            prepare_gemma4_native_gguf_in(&input, &cache)
+            prepare_gemma4_asset_dir_for_test(&input, &cache)
                 .await
                 .unwrap_err()
                 .reason
@@ -9987,8 +9039,11 @@ mod tests {
         )
         .unwrap();
         let cache = root.path().join("cache-plain");
-        let output = prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap();
-        assert!(!output.join("vision.safetensors").exists());
+        let output_ckpt = prepare_gguf_assets_in(&input, NativeGgufFamily::Gemma4, &cache)
+            .await
+            .unwrap();
+        let output = output_ckpt.asset_dir.clone();
+        assert!(output_ckpt.companion.is_none());
         let marker = fs::read_to_string(output.join(".complete")).unwrap();
         assert!(marker.contains("companion_sha256=none\n"));
     }
@@ -10095,7 +9150,7 @@ mod tests {
                 config["text_config"] = serde_json::json!({"num_hidden_layers": 0});
                 fs::write(source.join("config.json"), config.to_string()).unwrap();
                 let cache = root.path().join("cache");
-                let error = prepare_gemma4_native_gguf_in(&input, &cache)
+                let error = prepare_gemma4_asset_dir_for_test(&input, &cache)
                     .await
                     .unwrap_err();
                 assert!(
@@ -10115,7 +9170,7 @@ mod tests {
         let cache = root.path().join("cache");
         fs::remove_file(source.join("mmproj-gemma.gguf")).unwrap();
         assert!(
-            prepare_gemma4_native_gguf_in(&input, &cache)
+            prepare_gemma4_asset_dir_for_test(&input, &cache)
                 .await
                 .unwrap_err()
                 .reason
@@ -10123,7 +9178,7 @@ mod tests {
         );
         fs::remove_file(source.join("tokenizer.json")).unwrap();
         assert!(
-            prepare_gemma4_native_gguf_in(&input, &cache)
+            prepare_gemma4_asset_dir_for_test(&input, &cache)
                 .await
                 .unwrap_err()
                 .reason
@@ -10296,7 +9351,7 @@ mod tests {
         fs::write(&input, data).unwrap();
         let cache_root = root.join("native-cache");
 
-        let output = prepare_qwen35_native_gguf_in(&input, &cache_root)
+        let output = prepare_qwen35_asset_dir_for_test(&input, &cache_root)
             .await
             .unwrap_or_else(|error| {
                 panic!(
@@ -10322,9 +9377,10 @@ mod tests {
             config["layer_types"],
             serde_json::json!(["linear_attention"])
         );
-        assert!(output.join("model.safetensors").is_file());
+        assert!(output.join("gguf-source.json").is_file());
+        assert!(!output.join("model.safetensors").exists());
         let marker = fs::read_to_string(output.join(".complete")).unwrap();
-        assert!(marker.contains(&format!("format={QWEN35_NATIVE_CACHE_FORMAT}\n")));
+        assert!(marker.contains(&format!("format={NATIVE_GGUF_ASSETS_FORMAT}\n")));
         assert!(marker.contains("assets_sha256="));
 
         fs::remove_dir_all(root).ok();
@@ -10412,7 +9468,7 @@ mod tests {
         fs::write(&input, build_qwen35_moe_fixture(&tensors)).unwrap();
         let cache_root = root.join("native-cache");
 
-        let output = prepare_qwen35_moe_native_gguf_in(&input, &cache_root)
+        let output_ckpt = prepare_gguf_assets_in(&input, NativeGgufFamily::Qwen35Moe, &cache_root)
             .await
             .unwrap_or_else(|error| {
                 panic!(
@@ -10420,6 +9476,7 @@ mod tests {
                     error.reason
                 )
             });
+        let output = output_ckpt.asset_dir.clone();
 
         let config: serde_json::Value =
             serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
@@ -10443,13 +9500,14 @@ mod tests {
         );
         assert_eq!(config["qwen35_gguf_gdn_layout"], serde_json::json!("tiled"));
 
-        let params =
-            crate::utils::safetensors::load_safetensors_lazy(output.join("model.safetensors"))
+        let preload =
+            crate::utils::gguf_import::GgufPreload::load(&output_ckpt.preload_input(false))
                 .unwrap();
+        let params = preload.main;
         let shape = |key: &str| {
             params
                 .get(key)
-                .unwrap_or_else(|| panic!("{key} missing from the native-packed cache"))
+                .unwrap_or_else(|| panic!("{key} missing from the GGUF preload"))
                 .shape()
                 .unwrap()
                 .to_vec()
@@ -10501,11 +9559,6 @@ mod tests {
             NativeGgufFamily::Qwen35.layout(),
             NativeGgufFamily::Qwen35Moe.layout()
         );
-        assert_eq!(
-            NativeGgufFamily::Qwen35.companion_filename(),
-            NativeGgufFamily::Qwen35Moe.companion_filename()
-        );
-
         let root = std::env::temp_dir().join(format!(
             "mlx-node-qwen35moe-cache-key-{}-{}",
             std::process::id(),
@@ -10523,12 +9576,12 @@ mod tests {
         .unwrap();
         let cache_root = root.join("native-cache");
 
-        let sparse = prepare_qwen35_moe_native_gguf_in(&input, &cache_root)
+        let sparse = prepare_qwen35_moe_asset_dir_for_test(&input, &cache_root)
             .await
             .unwrap();
         // The dense entry point accepts any GGUF path, so this exercises the
         // key itself rather than a header rejection.
-        let dense = prepare_qwen35_native_gguf_in(&input, &cache_root)
+        let dense = prepare_qwen35_asset_dir_for_test(&input, &cache_root)
             .await
             .unwrap();
         assert_ne!(
@@ -10575,7 +9628,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = prepare_qwen35_moe_native_gguf_in(&input, &root.join("native-cache"))
+        let error = prepare_qwen35_moe_asset_dir_for_test(&input, &root.join("native-cache"))
             .await
             .expect_err("a dense qwen35 header must not load through the sparse family");
         assert!(error.reason.contains("qwen35moe"));
@@ -10758,12 +9811,18 @@ mod tests {
         .unwrap();
 
         let gguf = parse_gguf(&input).unwrap();
-        let output = prepare_qwen35_moe_native_gguf_in(&input, &root.join("native-cache"))
-            .await
-            .unwrap();
-        let params =
-            crate::utils::safetensors::load_safetensors_lazy(output.join("model.safetensors"))
+        let output_ckpt = prepare_gguf_assets_in(
+            &input,
+            NativeGgufFamily::Qwen35Moe,
+            &root.join("native-cache"),
+        )
+        .await
+        .unwrap();
+        let output = output_ckpt.asset_dir.clone();
+        let preload =
+            crate::utils::gguf_import::GgufPreload::load(&output_ckpt.preload_input(false))
                 .unwrap();
+        let params = preload.main;
 
         let weight = &params["model.layers.0.mlp.switch_mlp.down_proj.weight"];
         assert_eq!(weight.dtype().unwrap(), DType::Uint32);
@@ -10928,12 +9987,11 @@ mod tests {
         assert_eq!(config["vocab_size"], serde_json::json!(248320));
     }
 
-    /// Full conversion of the real checkpoint into the native cache. Slow
-    /// (21 GiB in, the same in safetensors out) and only meaningful on the
-    /// machine that holds the file, hence `#[ignore]`.
+    /// Full direct import of the real checkpoint. Slow and only meaningful on
+    /// the machine that holds the file, hence `#[ignore]`.
     #[tokio::test]
     #[ignore = "requires the official Qwen-AgentWorld-35B-A3B GGUF (MLX_TEST_QWEN35_MOE_GGUF)"]
-    async fn real_qwen35_moe_gguf_prepares_the_native_cache() {
+    async fn real_qwen35_moe_gguf_prepares_assets_and_preload() {
         let input = PathBuf::from(
             std::env::var("MLX_TEST_QWEN35_MOE_GGUF")
                 .expect("set MLX_TEST_QWEN35_MOE_GGUF to the UD-Q4_K_XL checkpoint"),
@@ -10944,9 +10002,10 @@ mod tests {
         );
         fs::create_dir_all(&cache_root).unwrap();
 
-        let output = prepare_qwen35_moe_native_gguf_in(&input, &cache_root)
+        let output_ckpt = prepare_gguf_assets_in(&input, NativeGgufFamily::Qwen35Moe, &cache_root)
             .await
-            .unwrap_or_else(|error| panic!("real checkpoint conversion failed: {}", error.reason));
+            .unwrap_or_else(|error| panic!("real checkpoint preparation failed: {}", error.reason));
+        let output = output_ckpt.asset_dir.clone();
 
         let marker = fs::read_to_string(output.join(".complete")).unwrap();
         assert!(marker.contains(&format!("layout={}\n", source_math::LAYOUT)));
@@ -10978,13 +10037,14 @@ mod tests {
             shape
         };
 
-        let params =
-            crate::utils::safetensors::load_safetensors_lazy(output.join("model.safetensors"))
+        let preload =
+            crate::utils::gguf_import::GgufPreload::load(&output_ckpt.preload_input(false))
                 .unwrap();
+        let params = preload.main;
         let shape = |key: &str| {
             params
                 .get(key)
-                .unwrap_or_else(|| panic!("{key} missing from the converted cache"))
+                .unwrap_or_else(|| panic!("{key} missing from the GGUF preload"))
                 .shape()
                 .unwrap()
                 .to_vec()
@@ -11240,13 +10300,14 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&source, fs::Permissions::from_mode(0o555)).unwrap();
-        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root).await;
+        let prepared = prepare_qwen35_asset_dir_for_test(&input, &cache_root).await;
         fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
         let output = prepared.unwrap();
 
         assert!(output.starts_with(cache_root.canonicalize().unwrap()));
         assert!(!source.join(".mlx-node-native").exists());
-        assert!(output.join("model.safetensors").is_file());
+        assert!(output.join("gguf-source.json").is_file());
+        assert!(!output.join("model.safetensors").exists());
         fs::remove_dir_all(root).ok();
     }
 
@@ -11284,7 +10345,7 @@ mod tests {
         .unwrap();
         let cache_root = root.join("native-cache");
 
-        let standalone = prepare_qwen35_native_gguf_in(&input, &cache_root)
+        let standalone = prepare_qwen35_asset_dir_for_test(&input, &cache_root)
             .await
             .unwrap();
         fs::write(
@@ -11292,7 +10353,7 @@ mod tests {
             r#"{"model_type":"qwen3_5","asset_sentinel":1}"#,
         )
         .unwrap();
-        let added = prepare_qwen35_native_gguf_in(&input, &cache_root)
+        let added = prepare_qwen35_asset_dir_for_test(&input, &cache_root)
             .await
             .unwrap();
         fs::write(
@@ -11300,7 +10361,7 @@ mod tests {
             r#"{"model_type":"qwen3_5","asset_sentinel":2}"#,
         )
         .unwrap();
-        let edited_same_size = prepare_qwen35_native_gguf_in(&input, &cache_root)
+        let edited_same_size = prepare_qwen35_asset_dir_for_test(&input, &cache_root)
             .await
             .unwrap();
 
@@ -11373,10 +10434,10 @@ mod tests {
         );
         let cache_root = root.join("native-cache");
 
-        let left = prepare_qwen35_native_gguf_in(&left_input, &cache_root)
+        let left = prepare_qwen35_asset_dir_for_test(&left_input, &cache_root)
             .await
             .unwrap();
-        let right = prepare_qwen35_native_gguf_in(&right_input, &cache_root)
+        let right = prepare_qwen35_asset_dir_for_test(&right_input, &cache_root)
             .await
             .unwrap();
         assert_ne!(
@@ -11437,7 +10498,7 @@ mod tests {
         let original_metadata = fs::metadata(&input).unwrap();
         let original_modified = original_metadata.modified().unwrap();
         let cache_root = root.join("native-cache");
-        let original = prepare_qwen35_native_gguf_in(&input, &cache_root)
+        let original = prepare_qwen35_asset_dir_for_test(&input, &cache_root)
             .await
             .unwrap();
 
@@ -11452,7 +10513,7 @@ mod tests {
         assert_eq!(replacement_metadata.len(), original_metadata.len());
         assert_eq!(replacement_metadata.modified().unwrap(), original_modified);
 
-        let replaced = prepare_qwen35_native_gguf_in(&input, &cache_root)
+        let replaced = prepare_qwen35_asset_dir_for_test(&input, &cache_root)
             .await
             .unwrap();
         assert_ne!(
@@ -11472,54 +10533,6 @@ mod tests {
             source_identity(&original_marker),
             source_identity(&replaced_marker)
         );
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[tokio::test]
-    async fn concurrent_qwen35_native_prepares_publish_one_complete_cache() {
-        let root = std::env::temp_dir().join(format!(
-            "mlx-node-qwen35-concurrent-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("config.json"), r#"{"model_type":"qwen3_5"}"#).unwrap();
-        let input = root.join("model.gguf");
-        fs::write(
-            &input,
-            build_minimal_gguf(
-                &[
-                    (
-                        "general.architecture",
-                        GgufMetaValue::String("qwen35".to_string()),
-                    ),
-                    ("qwen35.block_count", GgufMetaValue::Uint32(1)),
-                ],
-                &[("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0])],
-            ),
-        )
-        .unwrap();
-        let cache_root = root.join("native-cache");
-
-        let (left, right) = tokio::join!(
-            prepare_qwen35_native_gguf_in(&input, &cache_root),
-            prepare_qwen35_native_gguf_in(&input, &cache_root)
-        );
-        let left = left.unwrap();
-        let right = right.unwrap();
-        assert_eq!(left, right);
-        assert!(left.join("model.safetensors").is_file());
-        assert!(left.join("config.json").is_file());
-        assert!(left.join(".complete").is_file());
-        let staged = fs::read_dir(&cache_root)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().contains(".staging-"))
-            .count();
-        assert_eq!(staged, 0, "no staging directory may survive publication");
         fs::remove_dir_all(root).ok();
     }
 
@@ -15664,26 +14677,47 @@ mod tests {
     }
 
     #[test]
-    fn native_cache_format_is_bumped_for_the_tiled_layout() {
-        // v5 caches hold row-major K-quant bytes with no `layout` marker; v6
-        // ones hold tiled bytes WITH it; v7 ones hold packed IQ3_S. The
-        // format is part of the directory key, so no reader ever opens an
-        // older entry by accident.
-        assert_eq!(QWEN35_NATIVE_CACHE_FORMAT, 7);
+    fn native_assets_format_is_v8_and_rejects_weight_entries() {
+        assert_eq!(NATIVE_GGUF_ASSETS_FORMAT, 8);
         let root = std::env::temp_dir().join(format!(
             "mlx-node-native-cache-format-{}",
             std::process::id()
         ));
         fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("config.json"), "{}").unwrap();
+        for format in [5, 6, 7] {
+            fs::write(
+                root.join(".complete"),
+                format!(
+                    "format={format}\nsource=x\nsource_identity_sha256=abc\nsize=1\nmodified_ns=1\nassets_sha256=def\nlayout=tiled\ncompanion_sha256=none\ndtype=bf16\n"
+                ),
+            )
+            .unwrap();
+            assert!(
+                !native_gguf_entry_is_current(
+                    &root,
+                    NATIVE_GGUF_ASSETS_FORMAT,
+                    "abc",
+                    "def",
+                    "bf16",
+                    &["config.json"],
+                ),
+                "v{format} weight entries must not satisfy the asset reader"
+            );
+        }
         fs::write(
             root.join(".complete"),
-            "format=5\nsource=x\nsource_identity_sha256=abc\nsize=1\nmodified_ns=1\nassets_sha256=def\nlayout=tiled\ncompanion_sha256=none\ndtype=bf16\n",
+            "format=8\nsource=x\nsource_identity_sha256=abc\nsize=1\nmodified_ns=1\nassets_sha256=def\nlayout=tiled\ncompanion_sha256=none\ndtype=bf16\n",
         )
         .unwrap();
-        assert!(
-            !qwen35_native_cache_is_current(&root, "abc", "def", "bf16", &["model.safetensors"]),
-            "a v5 marker must not satisfy the current reader"
-        );
+        assert!(native_gguf_entry_is_current(
+            &root,
+            NATIVE_GGUF_ASSETS_FORMAT,
+            "abc",
+            "def",
+            "bf16",
+            &["config.json"],
+        ));
         fs::remove_dir_all(&root).ok();
     }
 
@@ -17787,7 +16821,7 @@ mod tests {
         let root = prism_temp_dir("native-cache");
         let input = write_prism_gguf(&root, &prism_metadata(), &prism_tensors());
         let cache_root = root.join("native-cache");
-        let output = prepare_qwen35_native_gguf_in(&input, &cache_root)
+        let output = prepare_qwen35_asset_dir_for_test(&input, &cache_root)
             .await
             .unwrap_or_else(|e| panic!("native preparation must succeed: {}", e.reason));
         let marker = fs::read_to_string(output.join(".complete")).unwrap();
@@ -17796,28 +16830,7 @@ mod tests {
             serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
         assert!(config.get("prism_hadamard").is_some());
         assert_eq!(config["qwen35_gguf_gdn_layout"], serde_json::json!("tiled"));
-
-        let companion = root.join("mmproj.gguf");
-        fs::write(
-            &companion,
-            build_minimal_gguf(
-                &[(
-                    "general.architecture",
-                    GgufMetaValue::String("clip".to_string()),
-                )],
-                &[],
-            ),
-        )
-        .unwrap();
-        let err = prepare_native_gguf_inner(
-            &input,
-            &cache_root,
-            NativeGgufFamily::Qwen35,
-            Some(companion.as_path()),
-        )
-        .await
-        .expect_err("a prism.hadamard source must reject a companion GGUF");
-        assert!(err.reason.contains("text-only"), "{}", err.reason);
+        assert!(output.join("gguf-source.json").is_file());
         fs::remove_dir_all(&root).ok();
     }
 
@@ -17968,24 +16981,22 @@ mod tests {
     /// else under the root is foreign and must survive the sweep.
     #[cfg(unix)]
     fn native_sweep_entry_name(stem: &str) -> String {
-        format!("{stem}-1-1-v7-{}-{}", "a".repeat(64), "b".repeat(64))
+        format!("{stem}-1-1-v8-{}-{}", "a".repeat(64), "b".repeat(64))
     }
 
     // The std Mutex guard must stay held across the awaits below: it
-    // serializes the `MLX_NATIVE_GGUF_CACHE_MAX_GB` env mutation against sweep
-    // tests on other threads for the whole test, and `#[tokio::test]`'s
-    // current-thread runtime cannot deadlock on it.
+    // serializes sidecar and sweep tests on other threads for the whole test,
+    // and `#[tokio::test]`'s current-thread runtime cannot deadlock on it.
     #[allow(clippy::await_holding_lock)]
     #[cfg(unix)]
     #[tokio::test]
     async fn native_gguf_sweep_removes_stale_orphans_and_keeps_live_entries() {
         let _env_guard = sweep_env_lock().lock().unwrap();
-        let _env = SweepEnvVar::set_max_gb("0");
         let root = NativeSweepTestDir::new("mixed");
         let input = root.source();
         let cache_root = root.path().join("cache");
 
-        let live = prepare_qwen35_native_gguf_in(&input, &cache_root)
+        let live = prepare_qwen35_asset_dir_for_test(&input, &cache_root)
             .await
             .unwrap();
 
@@ -17997,7 +17008,7 @@ mod tests {
         fs::write(
             &orphan_marker,
             format!(
-                "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_identity_sha256=x\nsize=1\nmodified_ns=1\nassets_sha256=x\nlayout=tiled\ncompanion=none\ncompanion_sha256=none\ndtype=bf16\n",
+                "format={NATIVE_GGUF_ASSETS_FORMAT}\nsource={}\nsource_identity_sha256=x\nsize=1\nmodified_ns=1\nassets_sha256=x\nlayout=tiled\ncompanion=none\ncompanion_sha256=none\ndtype=bf16\n",
                 root.path().join("missing.gguf").display()
             ),
         )
@@ -18010,17 +17021,17 @@ mod tests {
         fs::write(
             fresh_orphan.join(".complete"),
             format!(
-                "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_identity_sha256=x\nsize=1\nmodified_ns=1\nassets_sha256=x\nlayout=tiled\ncompanion=none\ncompanion_sha256=none\ndtype=bf16\n",
+                "format={NATIVE_GGUF_ASSETS_FORMAT}\nsource={}\nsource_identity_sha256=x\nsize=1\nmodified_ns=1\nassets_sha256=x\nlayout=tiled\ncompanion=none\ncompanion_sha256=none\ndtype=bf16\n",
                 root.path().join("missing-fresh.gguf").display()
             ),
         )
         .unwrap();
 
-        // Format mismatch: a pre-format-7 marker is stale once aged.
-        let outdated = cache_root.join(native_sweep_entry_name("outdated"));
+        // Legacy v7 weight entries are stale once aged.
+        let outdated = cache_root.join(native_sweep_entry_name("outdated").replace("-v8-", "-v7-"));
         fs::create_dir_all(&outdated).unwrap();
         let outdated_marker = outdated.join(".complete");
-        fs::write(&outdated_marker, native_sweep_marker(&input, 6, None, true)).unwrap();
+        fs::write(&outdated_marker, native_sweep_marker(&input, 7, None, true)).unwrap();
         native_sweep_age_file(&outdated_marker);
 
         // Pre-fix marker without `companion=`: unverifiable → stale once aged.
@@ -18029,7 +17040,7 @@ mod tests {
         let unverifiable_marker = unverifiable.join(".complete");
         fs::write(
             &unverifiable_marker,
-            native_sweep_marker(&input, QWEN35_NATIVE_CACHE_FORMAT, None, false),
+            native_sweep_marker(&input, NATIVE_GGUF_ASSETS_FORMAT, None, false),
         )
         .unwrap();
         native_sweep_age_file(&unverifiable_marker);
@@ -18040,7 +17051,7 @@ mod tests {
         let healthy_marker = healthy.join(".complete");
         fs::write(
             &healthy_marker,
-            native_sweep_marker(&input, QWEN35_NATIVE_CACHE_FORMAT, None, true),
+            native_sweep_marker(&input, NATIVE_GGUF_ASSETS_FORMAT, None, true),
         )
         .unwrap();
         native_sweep_age_file(&healthy_marker);
@@ -18059,7 +17070,7 @@ mod tests {
         fs::write(
             &held_marker,
             format!(
-                "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_identity_sha256=x\nsize=1\nmodified_ns=1\nassets_sha256=x\nlayout=tiled\ncompanion=none\ncompanion_sha256=none\ndtype=bf16\n",
+                "format={NATIVE_GGUF_ASSETS_FORMAT}\nsource={}\nsource_identity_sha256=x\nsize=1\nmodified_ns=1\nassets_sha256=x\nlayout=tiled\ncompanion=none\ncompanion_sha256=none\ndtype=bf16\n",
                 root.path().join("missing-held.gguf").display()
             ),
         )
@@ -18214,10 +17225,9 @@ mod tests {
         fs::create_dir_all(&assets_sidecar).unwrap();
         fs::write(assets_sidecar.join("complete"), b"1").unwrap();
         native_sweep_age_file(&assets_sidecar.join("complete"));
-        // A cap-refused sidecar publish promoted to `assets-live`: a load
-        // output, so a live pid keeps it while its lease reference stands —
-        // however old, never counted, never deleted — while a dead pid's
-        // copy is orphaned debris either way.
+        // An `assets-live` fallback is a load output: a live pid keeps it
+        // while its lease reference stands, while a dead pid's copy is
+        // orphaned debris either way.
         let live_assets = cache_root.join(format!(
             ".mlx-qwen4-assets-live-{}-{}",
             "e".repeat(64),
@@ -18288,13 +17298,13 @@ mod tests {
         native_sweep_age_dir(&foreign);
         // A markerless, aged plain directory whose name is NOT cache-key
         // shaped is foreign data (e.g. MLX_NATIVE_GGUF_CACHE_DIR pointed at
-        // a shared dir): never deleted and never counted toward the cap.
+        // a shared dir): never deleted.
         let photos = cache_root.join("my-photos");
         fs::create_dir_all(&photos).unwrap();
         fs::write(photos.join("pic.jpg"), b"x").unwrap();
         native_sweep_age_dir(&photos);
 
-        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
+        let prepared = prepare_qwen35_asset_dir_for_test(&input, &cache_root)
             .await
             .unwrap();
         assert_eq!(prepared, live, "the current cache must remain a hit");
@@ -18352,19 +17362,17 @@ mod tests {
         drop(held_lock);
     }
 
-    // Env-var serialization guard held across awaits: same rationale as the
-    // sweep test above.
+    // Hold the sweep/sidecar test lock across awaits to serialize try-lock checks.
     #[allow(clippy::await_holding_lock)]
     #[cfg(unix)]
     #[tokio::test]
     async fn native_gguf_sweep_cache_hit_stamps_marker_recency() {
         let _env_guard = sweep_env_lock().lock().unwrap();
-        let _env = SweepEnvVar::set_max_gb("0");
         let root = NativeSweepTestDir::new("stamp");
         let input = root.source();
         let cache_root = root.path().join("cache");
 
-        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
+        let prepared = prepare_qwen35_asset_dir_for_test(&input, &cache_root)
             .await
             .unwrap();
         let marker = prepared.join(".complete");
@@ -18376,87 +17384,17 @@ mod tests {
             .set_times(fs::FileTimes::new().set_modified(old))
             .unwrap();
 
-        let hit = prepare_qwen35_native_gguf_in(&input, &cache_root)
+        let hit = prepare_qwen35_asset_dir_for_test(&input, &cache_root)
             .await
             .unwrap();
         assert_eq!(hit, prepared);
         let stamped = fs::metadata(&marker).unwrap().modified().unwrap();
         assert!(
             stamped > old + std::time::Duration::from_secs(60),
-            "a verified cache hit must refresh the marker mtime for LRU"
+            "a verified hit must refresh the stale-sweep recency grace"
         );
         let contents = fs::read_to_string(&marker).unwrap();
         assert!(contents.contains("companion=none\n"), "{contents}");
-    }
-
-    // Env-var serialization guard held across awaits: same rationale as the
-    // sweep tests above.
-    #[allow(clippy::await_holding_lock)]
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn native_gguf_sweep_evicts_lru_under_size_cap() {
-        let _env_guard = sweep_env_lock().lock().unwrap();
-        let _env = SweepEnvVar::set_max_gb("0.000001");
-        let root = NativeSweepTestDir::new("cap");
-        let input = root.source();
-        let cache_root = root.path().join("cache");
-
-        // A healthy, valid, aged sibling entry is cap-evictable.
-        let old_entry = cache_root.join(native_sweep_entry_name("oldentry"));
-        fs::create_dir_all(&old_entry).unwrap();
-        fs::write(old_entry.join("model.safetensors"), vec![0_u8; 2048]).unwrap();
-        let old_marker = old_entry.join(".complete");
-        fs::write(
-            &old_marker,
-            native_sweep_marker(&input, QWEN35_NATIVE_CACHE_FORMAT, None, true),
-        )
-        .unwrap();
-        native_sweep_age_file(&old_marker);
-
-        // An aged assets sidecar counts toward the cap and is evictable too.
-        let assets_sidecar = cache_root.join(format!(".mlx-qwen4-assets-v2-{}", "d".repeat(64)));
-        fs::create_dir_all(&assets_sidecar).unwrap();
-        fs::write(assets_sidecar.join("tokenizer.json"), vec![0_u8; 2048]).unwrap();
-        let complete = assets_sidecar.join("complete");
-        fs::write(&complete, b"1").unwrap();
-        native_sweep_age_file(&complete);
-
-        // A foreign (non-key-shaped) directory never counts toward the cap
-        // and is never evicted, however old it is.
-        let foreign = cache_root.join("my-photos");
-        fs::create_dir_all(&foreign).unwrap();
-        fs::write(foreign.join("pic.jpg"), vec![0_u8; 2048]).unwrap();
-        native_sweep_age_dir(&foreign);
-        // Aged asset-prefixed dirs whose suffixes do not match the producer
-        // shapes are foreign too: the sweep must not fabricate a lock and
-        // LRU-delete them, and must not count them toward the cap.
-        let foreign_assets = cache_root.join(".mlx-qwen4-assets-v2-garbage");
-        fs::create_dir_all(&foreign_assets).unwrap();
-        fs::write(foreign_assets.join("x"), vec![0_u8; 2048]).unwrap();
-        native_sweep_age_dir(&foreign_assets);
-        let foreign_assets_tmp = cache_root.join(".mlx-qwen4-assets-tmp-not-a-uuid");
-        fs::create_dir_all(&foreign_assets_tmp).unwrap();
-        fs::write(foreign_assets_tmp.join("x"), vec![0_u8; 2048]).unwrap();
-        native_sweep_age_dir(&foreign_assets_tmp);
-
-        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
-            .await
-            .unwrap();
-        assert!(prepared.exists(), "the current key is never cap-evicted");
-        assert!(
-            !old_entry.exists(),
-            "the oldest healthy entry must be evicted to fit the cap"
-        );
-        assert!(
-            !assets_sidecar.exists(),
-            "aged assets sidecars are included in the capped-LRU accounting"
-        );
-        assert!(
-            foreign.exists(),
-            "foreign directories are neither evicted nor counted toward the cap"
-        );
-        assert!(foreign_assets.exists());
-        assert!(foreign_assets_tmp.exists());
     }
 
     /// A recency snapshot taken before the entry flock cannot prove the
@@ -18505,13 +17443,10 @@ mod tests {
     }
 
     /// A published sidecar handed to a loaded model stays in use for the
-    /// process lifetime — the model reopens `tokenizer.json` lazily, long
-    /// after `assets_in` stamped its last recency. Leased dirs must survive
-    /// `native_gguf_locked_remove` and the capped-LRU pass while an
-    /// identical unleased dir is evicted.
+    /// process lifetime because the model can reopen `tokenizer.json` lazily.
     #[cfg(unix)]
     #[test]
-    fn native_gguf_in_use_sidecar_survives_locked_remove_and_lru() {
+    fn native_gguf_in_use_sidecar_survives_locked_remove() {
         let root = NativeSweepTestDir::new("inuse");
         let cache_root = root.path().join("cache");
         fs::create_dir_all(&cache_root).unwrap();
@@ -18541,36 +17476,7 @@ mod tests {
         // The unleased twin is deletable through the same path.
         assert!(native_gguf_locked_remove(&cache_root, &dir_b, &name_b, "test", still_stale) > 0);
         assert!(!dir_b.exists());
-        // The capped-LRU pass skips the leased dir while reclaiming enough
-        // from other entries to fit — the recheck keeps it even though its
-        // marker reads older than the sweep grace.
-        let other = cache_root.join(native_sweep_entry_name("victim"));
-        fs::create_dir_all(&other).unwrap();
-        fs::write(other.join("model.safetensors"), vec![0_u8; 2048]).unwrap();
-        let other_marker = other.join(".complete");
-        fs::write(&other_marker, b"stale-shape").unwrap();
-        native_sweep_age_file(&other_marker);
-        let now = std::time::SystemTime::now();
-        let lru = vec![
-            (
-                dir_a.clone(),
-                native_gguf_object_recency(&dir_a, "complete"),
-                name_a.clone(),
-                "complete",
-            ),
-            (
-                other.clone(),
-                native_gguf_object_recency(&other, ".complete"),
-                other.file_name().unwrap().to_str().unwrap().to_string(),
-                ".complete",
-            ),
-        ];
-        let total = native_gguf_path_bytes(&dir_a) + native_gguf_path_bytes(&other);
-        let (reclaimed, _) = native_gguf_evict_lru(&cache_root, lru, now, total, |t| t <= 1024);
-        assert!(dir_a.exists(), "an in-use sidecar is not LRU-evictable");
-        assert!(!other.exists());
-        assert!(reclaimed >= 2048);
-        // Once the lease is released the same dir evicts normally.
+        // Releasing the lease makes the sidecar deletable.
         native_gguf_unlease_in_use(&dir_a);
         assert!(!native_gguf_in_use(&dir_a));
         assert!(native_gguf_locked_remove(&cache_root, &dir_a, &name_a, "test", still_stale) > 0);
@@ -18638,140 +17544,71 @@ mod tests {
         );
     }
 
-    // Env-var serialization guard held across awaits: same rationale as the
-    // sweep tests above.
+    /// A damaged leased output is not replaced. The fresh staged assets are
+    /// leased through the post-publish sweep and become reclaimable after the
+    /// staging reference and the original keyed lease are released.
     #[allow(clippy::await_holding_lock)]
     #[cfg(unix)]
     #[tokio::test]
-    async fn native_gguf_cap_lock_file_survives_sweeps() {
+    async fn native_gguf_leased_output_staging_fallback_follows_lease() {
         let _env_guard = sweep_env_lock().lock().unwrap();
-        let _env = SweepEnvVar::set_max_gb("1");
-        let root = NativeSweepTestDir::new("caplock");
+        let root = NativeSweepTestDir::new("leased-staging");
         let input = root.source();
         let cache_root = root.path().join("cache");
 
-        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
+        let output_ckpt = prepare_gguf_assets_in(&input, NativeGgufFamily::Qwen35, &cache_root)
             .await
             .unwrap();
-        assert!(
-            !prepared
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with('.'),
-            "a roomy cap must still publish the entry dir"
-        );
-        let cap_lock = cache_root.join(NATIVE_GGUF_CAP_LOCK_NAME);
-        // Even aged far beyond the mtime grace, the admission lock file is
-        // neither deleted nor counted: the keep rule is unconditional and
-        // flock mutual exclusion depends on the stable inode.
-        native_sweep_age_file(&cap_lock);
-        sweep_native_gguf_cache(&cache_root, "no-such-key");
-        assert!(cap_lock.is_file());
-        assert!(prepared.join(".complete").is_file());
-    }
+        let output = output_ckpt.asset_dir.clone();
+        assert!(output_ckpt.leased);
+        fs::remove_file(output.join("gguf-source.json")).unwrap();
 
-    /// When the cap cannot admit the converted bytes even after LRU
-    /// eviction, publish is refused but the load still succeeds: it reads
-    /// the completed conversion straight from the staging directory, which
-    /// the dead-pid staging sweep reclaims once this process exits.
-    #[allow(clippy::await_holding_lock)]
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn native_gguf_cap_admission_refusal_loads_from_staging() {
-        let _env_guard = sweep_env_lock().lock().unwrap();
-        let _env = SweepEnvVar::set_max_gb("0.0000001");
-        let root = NativeSweepTestDir::new("refuse");
-        let input = root.source();
-        let cache_root = root.path().join("cache");
-
-        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
+        let fallback_ckpt = prepare_gguf_assets_in(&input, NativeGgufFamily::Qwen35, &cache_root)
             .await
             .unwrap();
-        let name = prepared.file_name().unwrap().to_str().unwrap();
+        let staged = fallback_ckpt.asset_dir.clone();
+        assert_ne!(staged, output);
+        let name = staged.file_name().unwrap().to_str().unwrap();
         assert!(
             name.starts_with('.') && name.contains(NATIVE_GGUF_STAGING_INFIX),
-            "a refused publish must return the staging dir, got {}",
-            prepared.display()
+            "a leased output must fall back to staging, got {}",
+            staged.display()
         );
+        assert!(staged.join("gguf-source.json").is_file());
+        assert!(staged.join(".complete").is_file());
+        assert!(output.is_dir());
         assert!(
-            prepared.join(".complete").is_file(),
-            "the staged conversion is load-ready"
+            !output.join("gguf-source.json").exists(),
+            "the damaged but leased output was replaced"
         );
-        let entry_name = &name[1..name.find(NATIVE_GGUF_STAGING_INFIX).unwrap()];
-        assert!(native_gguf_is_entry_name(entry_name), "{entry_name}");
-        assert!(
-            !cache_root.join(entry_name).exists(),
-            "nothing may be published over the cap"
-        );
-        // The load model keeps its lease for the process lifetime; the test
-        // must not leave the reference behind for other tests.
-        native_gguf_unlease_in_use(&prepared);
-    }
 
-    /// Codex round-7 regression: a refused publish hands the loader a
-    /// completed staging dir that never counts toward the cap. When a
-    /// downstream init failure releases that reference, the dir is
-    /// reclaimable debris — not a permanently cap-exempt conversion the
-    /// sweep keeps until pid death.
-    #[allow(clippy::await_holding_lock)]
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn native_gguf_unleased_refusal_staging_is_reclaimed() {
-        let _env_guard = sweep_env_lock().lock().unwrap();
-        let _env = SweepEnvVar::set_max_gb("0.0000001");
-        let root = NativeSweepTestDir::new("release-refusal");
-        let input = root.source();
-        let cache_root = root.path().join("cache");
-
-        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
-            .await
-            .unwrap();
-        assert!(
-            prepared
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .contains(NATIVE_GGUF_STAGING_INFIX),
-            "a refused publish must return the staging dir"
-        );
-        // The post-publish sweep runs AFTER the lease registers: an extra
-        // sweep with the reference still held must keep the load output.
         sweep_native_gguf_cache(&cache_root, "no-such-key");
         assert!(
-            prepared.join(".complete").is_file(),
-            "a leased refused staging dir must survive the sweep while the pid lives"
+            staged.join(".complete").is_file(),
+            "a leased staging fallback must survive the sweep"
         );
-        // The load failure path: give the attempt's reference back.
-        native_gguf_unlease_in_use(&prepared);
-        assert!(!native_gguf_in_use_dir(&prepared));
+        native_gguf_unlease_in_use(&staged);
+        assert!(!native_gguf_in_use_dir(&staged));
+        native_gguf_unlease_in_use(&output);
         sweep_native_gguf_cache(&cache_root, "no-such-key");
         assert!(
-            !prepared.exists(),
-            "an unleased refused staging dir must be reclaimable while the pid lives"
+            !staged.exists(),
+            "an unleased staging fallback must be reclaimable"
         );
     }
 
-    /// Codex round-9 regression: the provisional lease registers before the
-    /// post-publish sweep so the sweep cannot delete a refused staging dir —
-    /// but a task cancelled at that await must not leak the reference either.
-    /// `PreparedDirLease`'s Drop releases it, so an aborted prepare leaves no
-    /// cap-exempt pin.
+    /// A task cancelled after provisional leasing but before the post-publish
+    /// sweep must release that lease through `PreparedDirLease`'s Drop.
     #[allow(clippy::await_holding_lock)]
     #[cfg(unix)]
     #[tokio::test]
     async fn native_gguf_aborted_prepare_releases_provisional_lease() {
         let _env_guard = sweep_env_lock().lock().unwrap();
-        let _env = SweepEnvVar::set_max_gb("0.0000001");
         let root = NativeSweepTestDir::new("abort-lease");
         let input = root.source();
         let cache_root = root.path().join("cache");
 
         let (at_pause, paused) = std::sync::mpsc::sync_channel::<()>(1);
-        // The hook key must match the canonical root prepare works with —
-        // the dir does not exist yet, so create it before canonicalizing.
         fs::create_dir_all(&cache_root).unwrap();
         *POST_LEASE_SWEEP_PAUSE
             .lock()
@@ -18781,24 +17618,16 @@ mod tests {
         let prepare_input = input.clone();
         let prepare_root = cache_root.clone();
         let task = tokio::spawn(async move {
-            prepare_qwen35_native_gguf_in(&prepare_input, &prepare_root).await
+            prepare_qwen35_asset_dir_for_test(&prepare_input, &prepare_root).await
         });
-        // The prepare parked exactly once: after its provisional lease, before
-        // the post-publish sweep await. The wait runs on the blocking pool so
-        // this single-threaded runtime keeps driving the spawned prepare.
         let reached = tokio::task::spawn_blocking(move || {
             paused.recv_timeout(std::time::Duration::from_secs(30))
         })
         .await
         .expect("pause waiter task failed");
         assert!(reached.is_ok(), "prepare must reach the post-lease pause");
-        // Abort while the prepare is suspended in the armed-lease window: the
-        // runtime drops the future, and `PreparedDirLease` must unlease.
         task.abort();
         let outcome = task.await;
-        // The pause's sleep makes the abort deterministic: only a cancelled
-        // JoinError may satisfy this test — a completed or failed prepare
-        // never exercises the drop path.
         assert!(
             outcome
                 .as_ref()
@@ -18807,28 +17636,19 @@ mod tests {
             "the armed-lease abort must surface as a cancelled task: {outcome:?}"
         );
 
-        // Whatever directory the aborted attempt prepared, no reference may
-        // survive it — the registry must be clean of same-pid entries.
-        let staged = fs::read_dir(&cache_root)
+        let dir = fs::read_dir(&cache_root)
             .unwrap()
             .flatten()
-            .filter(|entry| entry.path().is_dir())
-            .find(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.contains(NATIVE_GGUF_STAGING_INFIX))
-            })
-            .map(|entry| entry.path());
-        let dir = staged.expect("the aborted prepare staged a conversion");
+            .map(|entry| entry.path())
+            .find(|path| path.is_dir())
+            .expect("the aborted prepare published or staged an asset dir");
         assert!(
             !native_gguf_in_use_dir(&dir),
             "an aborted prepare must not leave a registered lease"
         );
-        sweep_native_gguf_cache(&cache_root, "no-such-key");
         assert!(
-            !dir.exists(),
-            "an unleased refused staging dir is reclaimable"
+            native_gguf_in_use_delete_guard(&dir).is_some(),
+            "the aborted prepare's delete guard must be winnable"
         );
     }
 
@@ -18843,7 +17663,6 @@ mod tests {
     #[tokio::test]
     async fn native_gguf_sweep_keeps_staging_of_in_flight_key() {
         let _env_guard = sweep_env_lock().lock().unwrap();
-        let _env = SweepEnvVar::set_max_gb("0");
         let root = NativeSweepTestDir::new("in-flight");
         let cache_root = root.path().join("cache");
         fs::create_dir_all(&cache_root).unwrap();
@@ -18879,7 +17698,6 @@ mod tests {
     #[tokio::test]
     async fn native_gguf_sweep_drops_unleased_assets_live_dir() {
         let _env_guard = sweep_env_lock().lock().unwrap();
-        let _env = SweepEnvVar::set_max_gb("0");
         let root = NativeSweepTestDir::new("live-unlease");
         let cache_root = root.path().join("cache");
         fs::create_dir_all(&cache_root).unwrap();
@@ -18914,69 +17732,6 @@ mod tests {
         native_gguf_unlease_in_use(&still_leased);
     }
 
-    /// A cap-refused publish hands the loader a completed staging dir that
-    /// never counts toward the cap and is never swept while its lease holds.
-    /// The next prepare misses the entry key again, so it must REUSE the
-    /// verified same-pid staging dir — not stage a second conversion and
-    /// leak another copy per reload — and must NOT republish it: renaming a
-    /// path a live load already holds would break readers that still open
-    /// its files later (unlink-under-mmap covers only already-open files),
-    /// so the entry name stays absent even when cap space exists.
-    #[allow(clippy::await_holding_lock)]
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn native_gguf_cap_refused_staging_is_reused_not_duplicated() {
-        let _env_guard = sweep_env_lock().lock().unwrap();
-        let _env = SweepEnvVar::set_max_gb("0.0000001");
-        let root = NativeSweepTestDir::new("reuse");
-        let input = root.source();
-        let cache_root = root.path().join("cache");
-
-        let first = prepare_qwen35_native_gguf_in(&input, &cache_root)
-            .await
-            .unwrap();
-        assert!(
-            first
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .contains(NATIVE_GGUF_STAGING_INFIX),
-            "the tiny cap must refuse the first publish, got {}",
-            first.display()
-        );
-        // With headroom for a republish, a reused staging dir must STILL be
-        // returned in place: publish would move the path out from under any
-        // in-process model already loading from it.
-        drop(_env);
-        let _env = SweepEnvVar::set_max_gb("64");
-        let second = prepare_qwen35_native_gguf_in(&input, &cache_root)
-            .await
-            .unwrap();
-        assert_eq!(
-            second, first,
-            "a verified same-pid staging dir is reused, not duplicated"
-        );
-        let name = first.file_name().unwrap().to_str().unwrap();
-        let entry_name: String = name[1..name.find(NATIVE_GGUF_STAGING_INFIX).unwrap()].to_string();
-        assert!(native_gguf_is_entry_name(&entry_name), "{entry_name}");
-        assert!(
-            !cache_root.join(&entry_name).exists(),
-            "a reused staging dir is never republished, even with cap space"
-        );
-        let staging_count = fs::read_dir(&cache_root)
-            .unwrap()
-            .flatten()
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.contains(NATIVE_GGUF_STAGING_INFIX))
-            })
-            .count();
-        assert_eq!(staging_count, 1, "no second staging dir may accumulate");
-    }
-
     /// `Path::display` truncates at a newline and lossy-mangles non-UTF-8
     /// names, so a `source=` text field can point at a file that does not
     /// exist — the sweep would then delete a healthy entry as "source GGUF
@@ -19002,7 +17757,7 @@ mod tests {
         let assets = qwen35_native_asset_digest(canonical.parent().unwrap()).unwrap();
         let source_hex = native_gguf_hex_encode(&native_gguf_os_bytes(&canonical));
         let marker = format!(
-            "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_hex={source_hex}\nsource_identity_sha256={identity}\nsize={}\nmodified_ns=1\nassets_sha256={assets}\nlayout=tiled\ncompanion=none\ncompanion_hex=none\ncompanion_sha256=none\ndtype=bf16\n",
+            "format={NATIVE_GGUF_ASSETS_FORMAT}\nsource={}\nsource_hex={source_hex}\nsource_identity_sha256={identity}\nsize={}\nmodified_ns=1\nassets_sha256={assets}\nlayout=tiled\ncompanion=none\ncompanion_hex=none\ncompanion_sha256=none\ndtype=bf16\n",
             canonical.display(),
             meta.len(),
         );
@@ -19053,7 +17808,6 @@ mod tests {
     #[tokio::test]
     async fn native_gguf_marker_omits_raw_lines_that_could_inject_records() {
         let _env_guard = sweep_env_lock().lock().unwrap();
-        let _env = SweepEnvVar::set_max_gb("0");
         let root = NativeSweepTestDir::new("inject");
         let input = root.source();
         let cache_root = root.path().join("cache");
@@ -19066,7 +17820,7 @@ mod tests {
         ));
         fs::rename(&input, &hostile).unwrap();
 
-        let prepared = prepare_qwen35_native_gguf_in(&hostile, &cache_root)
+        let prepared = prepare_qwen35_asset_dir_for_test(&hostile, &cache_root)
             .await
             .unwrap();
         let marker = fs::read_to_string(prepared.join(".complete")).unwrap();
@@ -19095,165 +17849,6 @@ mod tests {
             None,
             "the real source still verifies through its hex twin"
         );
-    }
-
-    /// Admission evicts the least-recently-used eligible siblings needed to
-    /// fit the incoming conversion — under the admission flock, so the
-    /// counted bytes and the rename are one atomic decision.
-    #[allow(clippy::await_holding_lock)]
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn native_gguf_cap_admission_evicts_lru_to_publish() {
-        let _env_guard = sweep_env_lock().lock().unwrap();
-        let _env = SweepEnvVar::set_max_gb("64");
-        let root = NativeSweepTestDir::new("admit");
-        let input = root.source();
-        let cache_root = root.path().join("cache");
-
-        // Measure one conversion's real on-disk size first; the sibling and
-        // the cap are sized so admission MUST evict to publish.
-        let measured = prepare_qwen35_native_gguf_in(&input, &cache_root)
-            .await
-            .unwrap();
-        let incoming = native_gguf_path_bytes(&measured);
-        fs::remove_dir_all(&measured).unwrap();
-
-        let sibling = cache_root.join(native_sweep_entry_name("lru"));
-        fs::create_dir_all(&sibling).unwrap();
-        fs::write(sibling.join("model.safetensors"), vec![0_u8; 4096]).unwrap();
-        fs::write(
-            sibling.join(".complete"),
-            native_sweep_marker(&input, QWEN35_NATIVE_CACHE_FORMAT, None, true),
-        )
-        .unwrap();
-        native_sweep_age_file(&sibling.join(".complete"));
-        let sibling_bytes = native_gguf_path_bytes(&sibling);
-        // sibling alone fits (the pre-conversion sweep keeps it), sibling +
-        // incoming does not (admission must evict), incoming alone fits.
-        let cap_bytes = sibling_bytes + incoming - 1;
-        unsafe {
-            std::env::set_var(
-                NATIVE_GGUF_CACHE_MAX_GB_ENV,
-                format!("{}", cap_bytes as f64 / NATIVE_GGUF_ONE_GIB),
-            );
-        }
-
-        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
-            .await
-            .unwrap();
-        assert_eq!(prepared, measured, "admission must publish the entry");
-        assert!(prepared.join(".complete").is_file());
-        assert!(
-            !sibling.exists(),
-            "the aged LRU sibling must be evicted to admit the publish"
-        );
-        assert!(prepared.exists());
-    }
-
-    /// A sibling whose `.{key}.lock` a live writer holds is never evictable:
-    /// admission must refuse the publish rather than delete a locked entry.
-    #[allow(clippy::await_holding_lock)]
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn native_gguf_cap_admission_never_evicts_a_held_entry_lock() {
-        let _env_guard = sweep_env_lock().lock().unwrap();
-        let _env = SweepEnvVar::set_max_gb("64");
-        let root = NativeSweepTestDir::new("held");
-        let input = root.source();
-        let cache_root = root.path().join("cache");
-
-        let measured = prepare_qwen35_native_gguf_in(&input, &cache_root)
-            .await
-            .unwrap();
-        let incoming = native_gguf_path_bytes(&measured);
-        fs::remove_dir_all(&measured).unwrap();
-
-        let sibling_name = native_sweep_entry_name("locked");
-        let sibling = cache_root.join(&sibling_name);
-        fs::create_dir_all(&sibling).unwrap();
-        fs::write(sibling.join("model.safetensors"), vec![0_u8; 4096]).unwrap();
-        fs::write(
-            sibling.join(".complete"),
-            native_sweep_marker(&input, QWEN35_NATIVE_CACHE_FORMAT, None, true),
-        )
-        .unwrap();
-        native_sweep_age_file(&sibling.join(".complete"));
-        let sibling_bytes = native_gguf_path_bytes(&sibling);
-        let held_lock =
-            Qwen35NativeCacheLock::acquire(&cache_root.join(format!(".{sibling_name}.lock")))
-                .unwrap();
-        // Same shape as the eviction test: eviction would admit, but the
-        // held lock must protect the sibling — so publish is refused.
-        let cap_bytes = sibling_bytes + incoming - 1;
-        unsafe {
-            std::env::set_var(
-                NATIVE_GGUF_CACHE_MAX_GB_ENV,
-                format!("{}", cap_bytes as f64 / NATIVE_GGUF_ONE_GIB),
-            );
-        }
-
-        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root)
-            .await
-            .unwrap();
-        let name = prepared.file_name().unwrap().to_str().unwrap();
-        assert!(
-            name.starts_with('.') && name.contains(NATIVE_GGUF_STAGING_INFIX),
-            "a locked sibling forces the staged-dir fallback, got {}",
-            prepared.display()
-        );
-        assert!(prepared.join(".complete").is_file());
-        assert!(
-            sibling.exists(),
-            "an entry under a held writer lock is never evicted"
-        );
-        let entry_name = &name[1..name.find(NATIVE_GGUF_STAGING_INFIX).unwrap()];
-        assert!(native_gguf_is_entry_name(entry_name), "{entry_name}");
-        assert!(
-            !cache_root.join(entry_name).exists(),
-            "nothing may be published over the cap"
-        );
-        drop(held_lock);
-    }
-
-    /// A published dir a loaded model still leases is never removed to make
-    /// room for a same-key republish: `native_gguf_publish_with_cap` keeps
-    /// it and hands the load the staging dir — the same refusal an
-    /// unreadable root produces. Once the lease drops, the same publish
-    /// replaces the dir normally.
-    #[cfg(unix)]
-    #[test]
-    fn native_gguf_publish_with_cap_preserves_a_leased_output_dir() {
-        let _env_guard = sweep_env_lock().lock().unwrap();
-        let root = NativeSweepTestDir::new("leased-output");
-        let cache_root = root.path().join("cache");
-        fs::create_dir_all(&cache_root).unwrap();
-
-        let entry_name = native_sweep_entry_name("leased");
-        let output = cache_root.join(&entry_name);
-        fs::create_dir_all(&output).unwrap();
-        fs::write(output.join(".complete"), b"marker").unwrap();
-
-        let staging = cache_root.join(format!(".{entry_name}-staging-leased"));
-        fs::create_dir_all(&staging).unwrap();
-        fs::write(staging.join("model.safetensors"), vec![0_u8; 64]).unwrap();
-        fs::write(staging.join(".complete"), b"marker").unwrap();
-
-        // Admission always fits — only the lease leg is under test.
-        let cap = u64::MAX;
-        assert!(native_gguf_lease_in_use(
-            &cache_root,
-            &output,
-            Some(&entry_name)
-        ));
-
-        let refused = native_gguf_publish_with_cap(&cache_root, &staging, &output, cap).unwrap();
-        assert_eq!(refused, staging, "a leased output dir refuses the publish");
-        assert!(output.join(".complete").is_file());
-
-        native_gguf_unlease_in_use(&output);
-        let published = native_gguf_publish_with_cap(&cache_root, &staging, &output, cap).unwrap();
-        assert_eq!(published, output);
-        assert!(output.join("model.safetensors").is_file());
     }
 
     /// A keyed lease whose `.lease` sentinel cannot be opened fails closed:
@@ -19322,66 +17917,5 @@ mod tests {
             native_gguf_in_use_delete_guard(&output).is_some(),
             "the last released reference drops the lease"
         );
-    }
-
-    /// A busy `native_gguf_sidecar_mutex` means a same-process `assets_in`
-    /// may be between its sidecar hit check and first use — and its
-    /// per-sidecar flock cannot exclude this process's eviction (BSD flock
-    /// is per-process). Admission must therefore withhold `"complete"`-marker
-    /// sidecar dirs from the LRU pass and refuse the publish instead of
-    /// evicting a possibly in-use dir; once the mutex frees, the same
-    /// admission evicts it.
-    #[cfg(unix)]
-    #[test]
-    fn native_gguf_cap_admission_keeps_busy_sidecars() {
-        let _env_guard = sweep_env_lock().lock().unwrap();
-        let root = NativeSweepTestDir::new("busy-sidecar");
-        let cache_root = root.path().join("cache");
-        fs::create_dir_all(&cache_root).unwrap();
-
-        // An oversized, aged sidecar the LRU pass would evict first if it
-        // were eligible — recency sorts oldest first and no other evictable
-        // entry can make the publish fit.
-        let sidecar_name = format!("{NATIVE_GGUF_ASSETS_PREFIX}{}", "c".repeat(64));
-        let sidecar = cache_root.join(&sidecar_name);
-        fs::create_dir_all(&sidecar).unwrap();
-        fs::write(sidecar.join("tokenizer.json"), vec![0_u8; 4096]).unwrap();
-        fs::write(sidecar.join("complete"), b"1").unwrap();
-        native_sweep_age_file(&sidecar.join("complete"));
-        let sidecar_bytes = native_gguf_path_bytes(&sidecar);
-
-        let staging = cache_root.join(format!(".staging-tmp-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&staging).unwrap();
-        fs::write(staging.join("model.safetensors"), vec![0_u8; 128]).unwrap();
-        let output = cache_root.join(native_sweep_entry_name("admitted"));
-        let incoming = native_gguf_path_bytes(&staging);
-        // incoming alone admits; sidecar + incoming does not — publish can
-        // only succeed by evicting the sidecar.
-        let cap = sidecar_bytes + incoming - 1;
-        assert!(incoming <= cap);
-
-        let held = native_gguf_sidecar_mutex()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let prepared = native_gguf_publish_with_cap(&cache_root, &staging, &output, cap).unwrap();
-        assert_eq!(
-            prepared, staging,
-            "with the sidecar mutex held, admission must refuse rather than evict"
-        );
-        assert!(
-            sidecar.join("complete").is_file(),
-            "a possibly in-use sidecar must survive the admission pass"
-        );
-        drop(held);
-
-        // Mutex free: no same-process `assets_in` is active, so the aged
-        // sidecar is an ordinary LRU eviction again.
-        let prepared = native_gguf_publish_with_cap(&cache_root, &staging, &output, cap).unwrap();
-        assert_eq!(
-            prepared, output,
-            "admission must evict the now-safe sidecar"
-        );
-        assert!(!sidecar.exists());
-        assert!(output.join("model.safetensors").is_file());
     }
 }

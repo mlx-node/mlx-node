@@ -2584,11 +2584,11 @@ mod tests {
         use crate::engine::persistence::load_all_safetensors;
         use crate::utils::gguf::NativeGgufFamily;
         use crate::utils::gguf_import::gate::manifest;
-        use crate::utils::gguf_test_fixtures::{prepare_import_fixture, write_import_fixture};
+        use crate::utils::gguf_test_fixtures::{convert_import_fixture, write_import_fixture};
 
         let work = std::env::temp_dir().join(format!("mlx-moe-preload-{}", uuid::Uuid::new_v4()));
         let fx = write_import_fixture("qwen35moe-3d-experts", &work.join("src"));
-        let converted = prepare_import_fixture(&fx, &work.join("old-cache")).await;
+        let converted = convert_import_fixture(&fx, &work.join("converted")).await;
         let want = manifest(&load_all_safetensors(&converted, false).unwrap());
 
         let source = CheckpointSource::resolve_in(
