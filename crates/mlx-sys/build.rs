@@ -3,9 +3,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[path = "build_support/mlx_patches.rs"]
-mod mlx_patches;
-
 #[path = "build_support/metal_cache.rs"]
 mod metal_cache;
 use metal_cache::{AirJob, air_is_current, air_stamp};
@@ -520,7 +517,7 @@ fn link_clang_runtime(cxx_compiler: &str) {
 // Prebuilt MLX
 // =============================================================================
 //
-// The upstream-MLX cmake build (static lib + headers + mlx.metallib) takes
+// The MLX cmake build (static lib + headers + mlx.metallib) takes
 // ~10 minutes per cargo profile and changes only when the submodule pin
 // moves. `mlx-prebuilt.json` pins a GitHub Release holding that build output
 // for the current pin; when the checked-out submodule matches the pin, the
@@ -622,9 +619,9 @@ fn prebuilt_cache_root(manifest_dir: &Path) -> PathBuf {
 /// `mlx-prebuilt-<mlx sha12>-<build key8>`. The release is keyed by every
 /// input that shapes the artifact: the submodule commit and the build key
 /// (`prebuilt_build_key`). Changing a portable cmake define or a file under
-/// `cmake/`, `patches/`, or `build_support/` without moving the submodule
-/// therefore names a NEW release, and a pin that still names the old one falls
-/// back to the source build instead of linking an artifact built from other inputs.
+/// `cmake/` without moving the submodule therefore names a NEW release, and a
+/// pin that still names the old one falls back to the source build instead of
+/// linking an artifact built from other inputs.
 fn release_tag_for(commit: &str, build_key: &str) -> String {
     format!(
         "mlx-prebuilt-{}-{}",
@@ -709,9 +706,9 @@ fn portable_cmake_defines(
 const PREBUILT_BUILD_KEY_REVISION: u32 = 2;
 
 /// sha256 over the portable cmake defines, every file under
-/// `crates/mlx-sys/cmake/`, the tracked MLX source patches and helper, and
-/// `PREBUILT_BUILD_KEY_REVISION`. Together with the submodule commit this is
-/// everything that decides the artifact's bytes, up to the toolchain.
+/// `crates/mlx-sys/cmake/`, and `PREBUILT_BUILD_KEY_REVISION`. Together with
+/// the submodule commit this is everything that decides the artifact's bytes,
+/// up to the toolchain.
 fn prebuilt_build_key(manifest_dir: &Path, defines: &[(String, String)]) -> io::Result<String> {
     let mut canonical = format!("revision={PREBUILT_BUILD_KEY_REVISION}\n");
     for (key, value) in defines {
@@ -720,9 +717,7 @@ fn prebuilt_build_key(manifest_dir: &Path, defines: &[(String, String)]) -> io::
     // Recursive, like the workflow's `cmake/**` trigger: a new include under
     // a subdirectory must move the key, or the publisher keeps the old asset.
     let mut files = Vec::new();
-    for directory in ["cmake", "patches", "build_support"] {
-        walk_files(&manifest_dir.join(directory), &mut files)?;
-    }
+    walk_files(&manifest_dir.join("cmake"), &mut files)?;
     files.sort();
     for file in files {
         let rel = file
@@ -988,8 +983,8 @@ fn resolve_mlx_source(
             );
         }
         if build_metal && let Some(arch) = triple.strip_suffix("-apple-darwin") {
-            // The tracked Metal patches extend CommandEncoder's layout and
-            // API. An explicit directory must not bypass their ABI identity.
+            // Direct fork commits extend CommandEncoder's layout and API. An
+            // explicit directory must not bypass their ABI identity.
             let (head, dirty) = submodule_state(mlx_dir).unwrap_or_else(|error| {
                 panic!("mlx-sys: cannot validate explicit Metal prebuilt: {error}")
             });
@@ -1247,7 +1242,6 @@ fn main() -> io::Result<()> {
     // re-run this script or a restored target keeps a prebuilt whose key no
     // longer matches.
     println!("cargo:rerun-if-changed=cmake");
-    println!("cargo:rerun-if-changed=patches");
     println!("cargo:rerun-if-changed=build_support");
     // The deployment-target floor participates in both the CMake configure
     // and the paged-attn metallib compile; changing it must re-run this
@@ -1295,10 +1289,6 @@ fn main() -> io::Result<()> {
     // `paged_attn_metallib_path` lookup will throw if the metallib is
     // not findable.
     let out_dir_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-    // Keep the submodule clean. MLX and the bridge consume the same patched
-    // source tree; the original checkout still identifies the upstream pin.
-    let mlx_source_dir =
-        mlx_patches::prepare(&mlx_dir, &manifest_dir.join("patches"), &out_dir_path)?;
     // Resolved once: it probes the host (`sw_vers`).
     let deployment_target = is_macos.then(macos_deployment_target);
     let paged_metallib_path = if build_metal {
@@ -1308,7 +1298,7 @@ fn main() -> io::Result<()> {
         assert_nax_buildable(deployment_target);
         Some(compile_paged_attn_metallib(
             &manifest_dir,
-            &mlx_source_dir,
+            &mlx_dir,
             &out_dir_path,
             deployment_target,
         ))
@@ -1387,7 +1377,7 @@ fn main() -> io::Result<()> {
             });
             let (dst, defines, sentinel) = build_mlx_from_source(
                 &manifest_dir,
-                &mlx_source_dir,
+                &mlx_dir,
                 &out_dir_path,
                 build_metal,
                 &target_os,
@@ -1554,7 +1544,7 @@ fn main() -> io::Result<()> {
         }
     }
 
-    let include_source = mlx_source_dir.join("mlx");
+    let include_source = mlx_dir.join("mlx");
     let include_generated = mlx_root.join("include");
 
     let mut bridge = cc::Build::new();
@@ -1563,7 +1553,7 @@ fn main() -> io::Result<()> {
         .warnings(false)
         .define("MLX_STATIC", None)
         .include(&include_source)
-        .include(&mlx_source_dir);
+        .include(&mlx_dir);
 
     if build_metal || target_os == "linux" {
         bridge.define("MLX_NODE_GPU_ENABLED", None);
@@ -1586,7 +1576,7 @@ fn main() -> io::Result<()> {
             "MLX_NODE_PAGED_ATTN_METALLIB",
             format!("\"{}\"", paged_origin.display()).as_str(),
         );
-        build_bridge_preambles(&mut bridge, &mlx_source_dir, &src_dir, &out_dir_path)?;
+        build_bridge_preambles(&mut bridge, &mlx_dir, &src_dir, &out_dir_path)?;
     }
 
     if is_macos {
@@ -1673,9 +1663,22 @@ fn build_mlx_from_source(
     export_release_tag: Option<String>,
 ) -> (PathBuf, Vec<(String, String)>, Option<String>) {
     let mut cfg = cmake::Config::new(mlx_dir);
-    // A separate build directory avoids stale CMake source paths from builds
-    // that compiled the submodule directly, before source patches were added.
-    cfg.out_dir(out_dir.join("mlx-cmake"));
+    let cmake_out = out_dir.join("mlx-cmake");
+    let cache = cmake_out.join("CMakeCache.txt");
+    if let Ok(text) = std::fs::read_to_string(cache) {
+        let cached_source = text
+            .lines()
+            .find_map(|line| line.strip_prefix("CMAKE_HOME_DIRECTORY:INTERNAL="));
+        if cached_source.is_some_and(|source| {
+            std::fs::canonicalize(source).ok() != std::fs::canonicalize(mlx_dir).ok()
+        }) {
+            // A cache configured for the removed generated tree cannot be
+            // reconfigured for the direct checkout. Preserve later direct caches.
+            std::fs::remove_dir_all(&cmake_out)
+                .expect("Failed to clear stale MLX CMake build directory");
+        }
+    }
+    cfg.out_dir(cmake_out);
     let mut defines =
         portable_cmake_defines(build_metal, target_os, target_arch, deployment_target);
     let mut define = |key: &str, value: &str| defines.push((key.to_string(), value.to_string()));

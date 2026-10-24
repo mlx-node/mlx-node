@@ -15,18 +15,11 @@ impl Fixture {
                 .unwrap()
                 .as_nanos()
         ));
-        for directory in [
-            "cmake",
-            "patches",
-            "build_support",
-            "mlx",
-            "artifact/lib",
-            "artifact/include/mlx",
-        ] {
+        for directory in ["cmake", "mlx", "artifact/lib", "artifact/include/mlx"] {
             std::fs::create_dir_all(root.join(directory)).unwrap();
         }
         std::fs::write(root.join("mlx/CMakeLists.txt"), "fixture\n").unwrap();
-        std::fs::write(root.join("patches/encoder.patch"), "encoder ABI v1\n").unwrap();
+        std::fs::write(root.join("cmake/build-input.cmake"), "build input v1\n").unwrap();
         std::fs::write(root.join("artifact/lib/libmlx.a"), []).unwrap();
         for arguments in [
             vec!["init", "-q"],
@@ -119,7 +112,7 @@ impl Drop for Fixture {
 
 // Run this environment-owning build-script test in its own process.
 #[test]
-fn explicit_metal_prebuilt_requires_current_source_and_patch_identity() {
+fn explicit_metal_prebuilt_requires_current_source_and_build_key() {
     let fixture = Fixture::new();
     assert!(
         std::panic::catch_unwind(|| fixture.resolve()).is_err(),
@@ -136,13 +129,13 @@ fn explicit_metal_prebuilt_requires_current_source_and_patch_identity() {
     }
     fixture.manifest(None);
     std::fs::write(
-        fixture.root.join("patches/encoder.patch"),
-        "encoder ABI v2\n",
+        fixture.root.join("cmake/build-input.cmake"),
+        "build input v2\n",
     )
     .unwrap();
     assert!(
         std::panic::catch_unwind(|| fixture.resolve()).is_err(),
-        "old encoder layout accepted after patch changed"
+        "old build inputs accepted after cmake changed"
     );
     fixture.manifest(None);
     assert!(matches!(fixture.resolve(), MlxSource::Prebuilt { .. }));

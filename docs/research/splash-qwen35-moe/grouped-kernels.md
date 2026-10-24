@@ -30,8 +30,8 @@ the CPU. `MLX_SPLASH_MOE_INDIRECT=1` instead dispatches exactly the live expert
 tiles. Grouping writes both three-dimensional grids beside the tile count;
 the two projections bind that buffer as an input and retain its storage with
 their other workspaces. The MLX encoder extension preserves its normal hazard
-barrier and dispatch accounting. This experiment requires the local MLX
-`device.h` change as well as the matching bridge and Metal library.
+barrier and dispatch accounting. This experiment requires direct fork commit
+`f67ebd421` (`device.h`) as well as the matching bridge and Metal library.
 
 An optional device int32 budget retains the physical output shape and the
 physical-row precision policy. Only live routed rows enter route/group work;
