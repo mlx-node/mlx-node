@@ -112,10 +112,7 @@ interface ModelFileInventory {
  * `'other'` (skipped, same as sockets/fifos — a broken link admits
  * nothing) and non-symlink entries keep their `Dirent` answer unchanged.
  */
-export async function resolveDirentKind(
-  dir: string,
-  entry: Dirent,
-): Promise<'file' | 'dir' | 'other'> {
+export async function resolveDirentKind(dir: string, entry: Dirent): Promise<'file' | 'dir' | 'other'> {
   if (!entry.isSymbolicLink()) {
     if (entry.isFile()) return 'file';
     if (entry.isDirectory()) return 'dir';
