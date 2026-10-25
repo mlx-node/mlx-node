@@ -27,7 +27,7 @@ const REQUIRED_MODELS: [&str; 8] = [
     "muse-30b",
     "clef-flash",
 ];
-const GPU_TYPES: [GgufTensorType; 10] = [
+const GPU_TYPES: [GgufTensorType; 11] = [
     GgufTensorType::Q4K,
     GgufTensorType::Q5K,
     GgufTensorType::Q6K,
@@ -38,6 +38,7 @@ const GPU_TYPES: [GgufTensorType; 10] = [
     GgufTensorType::Q8_0,
     GgufTensorType::MXFP4,
     GgufTensorType::Q4_0,
+    GgufTensorType::Q5_1,
 ];
 
 type Manifest = BTreeMap<String, Value>;
@@ -1223,11 +1224,7 @@ clef-flash\t/models/clef.gguf\tClefModel\t-\tmodel=775 joint_head=122\n";
                 "{tensor_type:?} lost its GPU kind"
             );
         }
-        for tensor_type in [
-            GgufTensorType::Q4_1,
-            GgufTensorType::Q5_0,
-            GgufTensorType::Q5_1,
-        ] {
+        for tensor_type in [GgufTensorType::Q4_1, GgufTensorType::Q5_0] {
             assert!(
                 gpu_kind_for(tensor_type).is_none(),
                 "{tensor_type:?} must retain its CPU route"

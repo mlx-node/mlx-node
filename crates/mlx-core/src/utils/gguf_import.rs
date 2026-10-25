@@ -549,7 +549,10 @@ impl Seek for OffsetReader<'_> {
 fn alloc_dst(t: &GgufTensorInfo, route: Route, probe: &ImportProbe) -> Result<Dst> {
     Ok(match route {
         Route::Gpu(_, layout) | Route::CpuKQuant(layout) => {
-            let (dst, ptrs) = RepackDst::alloc(t, layout)?;
+            let (dst, ptrs) = match route {
+                Route::Gpu(kind, _) => RepackDst::alloc_for_kind(t, kind, layout)?,
+                _ => RepackDst::alloc(t, layout)?,
+            };
             for a in std::iter::once(&dst.weight)
                 .chain(dst.scales.as_ref())
                 .chain(dst.biases.as_ref())
@@ -1636,7 +1639,7 @@ mod tests {
         }
     }
 
-    const GPU_SPECS: usize = 10;
+    const GPU_SPECS: usize = 11;
     const TILED: [&str; 4] = [
         "blk.0.q4k.weight",
         "blk.0.q6k.weight",
@@ -1813,6 +1816,55 @@ mod tests {
         );
         assert!(raw.ple_shards.is_none());
         assert!(raw.stats.bytes >= fx.handle.len - fx.handle.header.data_offset);
+    }
+
+    #[test]
+    fn q5_1_source_flip_changes_no_collateral_tensor() {
+        if !require_gpu() {
+            return;
+        }
+        let bytes = build_gguf(
+            &[("general.architecture", GgufMetaValue::String("test".into()))],
+            &[
+                ("blk.0.q5_1.weight", vec![96, 5], Q5_1),
+                ("blk.0.q8_0.weight", vec![96, 4], Q8_0),
+            ],
+            32,
+            511,
+        );
+        let fx = open_fixture("q5-1-flip", &bytes);
+        let plan = plan(&[]);
+        let clean = read_with(
+            &fx,
+            &plan,
+            RepackBackend::Auto,
+            &small_slots(SLOTS),
+            &ImportProbe::default(),
+        )
+        .unwrap();
+        assert_eq!(clean.stats.gpu_tensors, 2, "Q5_1 and Q8_0 GPU routes");
+        assert_maps_equal(&clean.map, &oracle(&fx, &plan), "Q5_1 flip baseline");
+        let probe = ImportProbe {
+            flip: Some(("blk.0.q5_1.weight".to_string(), 8, 0)),
+            ..ImportProbe::default()
+        };
+        let flipped =
+            read_with(&fx, &plan, RepackBackend::Auto, &small_slots(SLOTS), &probe).unwrap();
+        let before = gate::manifest(&clean.map);
+        let after = gate::manifest(&flipped.map);
+        assert_eq!(
+            before.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>()
+        );
+        let changed: Vec<&String> = before
+            .keys()
+            .filter(|key| before[*key] != after[*key])
+            .collect();
+        assert_eq!(
+            changed,
+            vec!["blk.0.q5_1.weight"],
+            "the Q5_1 qs flip changed an unexpected tensor or companion"
+        );
     }
 
     #[test]

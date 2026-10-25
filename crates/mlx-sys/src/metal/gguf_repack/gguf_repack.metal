@@ -10,7 +10,8 @@
 // tensor written in any order give the same arrays as one whole-tensor band.
 // Every output byte must equal the CPU loader: gguf_kquant.rs KQuantRepacker
 // (then kquant_tile_rows for Tiled64) for the K-quants, gguf.rs
-// load_quantized_tensor for Q4_0, Q8_0 and MXFP4.
+// load_quantized_tensor for Q4_0, Q5_1, Q8_0 and MXFP4. The separate
+// Q8_0-bias kernel also materializes qwen4_exp's derived bias bank.
 
 #include <metal_stdlib>
 
@@ -666,6 +667,51 @@ static inline uint4 iq3s_scales(const device uint* r, uint B) {
   }
 }
 
+// ---------------------------------------------------------------- Q5_1
+// 24-byte blocks: d @0, m @2, qh @4 (32 bits), qs @8 (16 bytes).
+// Eight 5-bit codes occupy 40 bits; four groups make the five output words.
+static inline ulong q5_1_8codes(uint n, uint h) {
+  ulong t = 0;
+#pragma unroll
+  for (uint i = 0; i < 8; i++) {
+    t |= (ulong)(((n >> (4u * i)) & 0xFu) | (((h >> i) & 1u) << 4))
+        << (5u * i);
+  }
+  return t;
+}
+
+// Value j is qs[j]'s low nibble plus qh[j]; value j+16 is its high nibble
+// plus qh[j+16]. `.scales` = d and `.biases` = m, both raw float16.
+// All source accesses are 16-bit loads or word loads aligned down from a
+// 2-byte offset. `ldu_end` keeps the last qs load inside the staging band.
+[[kernel]] void mlx_node_gguf_repack_q5_1(
+    const device uchar* staging [[buffer(0)]],
+    device uint* weight [[buffer(1)]],
+    device half* scales [[buffer(2)]],
+    device half* biases [[buffer(3)]],
+    constant GgufRepackParams& p [[buffer(4)]],
+    uint g [[thread_position_in_grid]]) {
+  if (g >= p.nb) return;
+  const device uint* r = word_base(staging, p.src_off);
+  uint B = (uint)(p.src_off & 3ul) + g * 24u;
+  uint h[1], q[4];
+  ldu<1>(r, B + 4u, h);
+  ldu_end<4>(r, B + 8u, q);
+  ulong x0 = q5_1_8codes(nib8(q[0], q[1]), h[0]);
+  ulong x1 = q5_1_8codes(nib8(q[2], q[3]), h[0] >> 8);
+  ulong x2 = q5_1_8codes(nib8(q[0] >> 4, q[1] >> 4), h[0] >> 16);
+  ulong x3 = q5_1_8codes(nib8(q[2] >> 4, q[3] >> 4), h[0] >> 24);
+  ulong gb = (ulong)p.row0 * p.kb + g;
+  device uint* w = weight + gb * 5u;
+  w[0] = (uint)x0;
+  w[1] = (uint)(x0 >> 32) | (uint)(x1 << 8);
+  w[2] = (uint)(x1 >> 24) | (uint)(x2 << 16);
+  w[3] = (uint)(x2 >> 16) | (uint)(x3 << 24);
+  w[4] = (uint)(x3 >> 8);
+  ((device ushort*)scales)[gb] = ldh(r, B);
+  ((device ushort*)biases)[gb] = ldh(r, B + 2u);
+}
+
 // ---------------------------------------------------------------- Q8_0
 // 34-byte blocks: d @0, qs @2 (32 int8). MLX affine 8-bit: `.weight` = qs
 // bytes ^ 0x80, `.scales` = d (float16), no `.biases`.
@@ -686,6 +732,38 @@ static inline uint4 iq3s_scales(const device uint* r, uint B) {
   w4[0] = uint4(q[0], q[1], q[2], q[3]) ^ 0x80808080u;
   w4[1] = uint4(q[4], q[5], q[6], q[7]) ^ 0x80808080u;
   ((device ushort*)scales)[gb] = ldh(r, B);
+}
+
+// qwen4_exp expert banks materialize the symmetric offset that the ordinary
+// Q8_0 importer deliberately omits. Read d from the source and evaluate in
+// float, matching derived_symmetric_bias_bits: f16(-128 * f32(d)).
+static inline ushort q8_0_derived_bias(const device uint* r, uint B) {
+  ushort bits = ldh(r, B);
+  // The CPU arithmetic quiets NaNs and keeps their sign and payload; Metal's
+  // arithmetic conversion would canonicalize the payload instead.
+  if ((bits & 0x7FFFu) > 0x7C00u) return bits | 0x0200u;
+  half d = as_type<half>(bits);
+  return as_type<ushort>(half(-128.0f * float(d)));
+}
+
+[[kernel]] void mlx_node_gguf_repack_q8_0_bias(
+    const device uchar* staging [[buffer(0)]],
+    device uint* weight [[buffer(1)]],
+    device half* scales [[buffer(2)]],
+    device half* biases [[buffer(3)]],
+    constant GgufRepackParams& p [[buffer(4)]],
+    uint g [[thread_position_in_grid]]) {
+  if (g >= p.nb) return;
+  const device uint* r = word_base(staging, p.src_off);
+  uint B = (uint)(p.src_off & 3ul) + g * 34u;
+  uint q[8];
+  ldu_end<8>(r, B + 2u, q);
+  ulong gb = (ulong)p.row0 * p.kb + g;
+  device uint4* w4 = (device uint4*)weight + gb * 2u;
+  w4[0] = uint4(q[0], q[1], q[2], q[3]) ^ 0x80808080u;
+  w4[1] = uint4(q[4], q[5], q[6], q[7]) ^ 0x80808080u;
+  ((device ushort*)scales)[gb] = ldh(r, B);
+  ((device ushort*)biases)[gb] = q8_0_derived_bias(r, B);
 }
 
 // ---------------------------------------------------------------- MXFP4
