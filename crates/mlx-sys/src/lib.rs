@@ -3212,6 +3212,21 @@ unsafe extern "C-unwind" {
         dtype: i32,
         out_data: *mut *mut std::ffi::c_void,
     ) -> *mut mlx_array;
+    /// Native Metal allocation with a CPU-visible pointer and a last-array
+    /// lease (`mlx_array_alloc.cpp`). Null on unsupported builds or failure;
+    /// `release_fn(ctx)` is not invoked on a null return.
+    pub fn mlx_array_alloc_purgeable(
+        shape: *const i64,
+        ndim: usize,
+        dtype: i32,
+        out_data: *mut *mut std::ffi::c_void,
+        release_fn: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+        ctx: *mut std::ffi::c_void,
+    ) -> *mut mlx_array;
+    /// Set purgeability on an array's existing Metal allocation. `state` is 2
+    /// (non-volatile), 3 (volatile), or 4 (empty); returns the previous state,
+    /// or -1 on unsupported builds and invalid handles/states. Never evaluates.
+    pub fn mlx_array_set_purgeable_state(handle: *mut mlx_array, state: i32) -> i32;
     // Ops pinned to the CPU device per call (the default device is untouched).
     // Null on error.
     pub fn mlx_array_astype_cpu(handle: *mut mlx_array, dtype: i32) -> *mut mlx_array;

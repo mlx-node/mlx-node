@@ -1375,10 +1375,7 @@ impl Store {
         // briefly under the same safety limit before refusing.
         super::memory::check_active_memory_budget(
             cache_limit,
-            || {
-                crate::array::memory::get_active_memory()
-                    - crate::array::mapped_array_bytes() as f64
-            },
+            crate::array::memory::anonymous_active_memory,
             crate::array::memory::clear_cache,
             std::thread::sleep,
         )?;

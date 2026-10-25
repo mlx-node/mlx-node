@@ -389,6 +389,14 @@ pub fn get_active_memory() -> f64 {
     if rc != 0 { 0.0 } else { v as f64 }
 }
 
+/// Active MLX allocations that admission cannot reclaim on demand: total
+/// active bytes minus file-backed mappings and volatile/empty anonymous banks.
+pub(crate) fn anonymous_active_memory() -> f64 {
+    let reclaimable = crate::array::mapped_array_bytes()
+        .saturating_add(crate::array::purgeable::reclaimable_purgeable_bytes());
+    (get_active_memory() as u64).saturating_sub(reclaimable) as f64
+}
+
 /// Get cache memory size in bytes.
 /// Internal Rust-only function — use memoryCleanupThreshold config for
 /// memory-based cleanup. Returns 0.0 if the shim caught an exception.

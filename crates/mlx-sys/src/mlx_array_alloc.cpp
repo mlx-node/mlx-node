@@ -6,6 +6,10 @@
 #include "mlx_common.h"
 #include "mlx/primitives.h"
 
+#ifdef MLX_NODE_METAL_ENABLED
+#include "mlx/backend/metal/device.h"
+#endif
+
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
@@ -75,6 +79,100 @@ mlx_array* mlx_array_alloc_uninit(const int64_t* shape,
   } catch (...) {
     return nullptr;
   }
+}
+
+// A native Metal allocation with a CPU-visible pointer and a lease invoked
+// after the last array sharing it dies. Null on unsupported builds or failure;
+// `release_fn(ctx)` is not invoked on a null return.
+mlx_array* mlx_array_alloc_purgeable(const int64_t* shape,
+                                     size_t ndim,
+                                     int32_t dtype_code,
+                                     void** out_data,
+                                     void (*release_fn)(void*),
+                                     void* ctx) {
+  if (out_data) *out_data = nullptr;
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!out_data || (ndim > 0 && !shape) || !known_dtype_code(dtype_code)) {
+      return nullptr;
+    }
+    auto dtype = to_mlx_dtype(dtype_code);
+    mlx::core::Shape target;
+    target.reserve(ndim);
+    size_t numel = 1;
+    for (size_t i = 0; i < ndim; ++i) {
+      if (shape[i] <= 0 ||
+          shape[i] > std::numeric_limits<mlx::core::ShapeElem>::max()) {
+        return nullptr;
+      }
+      const size_t d = static_cast<size_t>(shape[i]);
+      if (numel > std::numeric_limits<size_t>::max() / d) return nullptr;
+      numel *= d;
+      target.push_back(static_cast<mlx::core::ShapeElem>(shape[i]));
+    }
+    if (numel > std::numeric_limits<size_t>::max() / dtype.size()) {
+      return nullptr;
+    }
+    const size_t bytes = numel * dtype.size();
+    auto armed = std::make_shared<bool>(false);
+    mlx::core::allocator::Deleter deleter =
+        [release_fn, ctx, armed](mlx::core::allocator::Buffer b) {
+          if (b.ptr()) {
+            static_cast<MTL::Buffer*>(b.ptr())->setPurgeableState(
+                MTL::PurgeableStateNonVolatile);
+          }
+          mlx::core::allocator::allocator().free(b);
+          if (*armed && release_fn) release_fn(ctx);
+        };
+    auto buffer = mlx::core::allocator::allocator().malloc(bytes);
+    if (buffer.ptr() == nullptr) return nullptr;
+    mlx::core::allocator::Data data_owner(buffer, std::move(deleter));
+    array a(std::move(data_owner), std::move(target), dtype);
+    void* data = a.data<void>();
+    if (data == nullptr) return nullptr;
+    *out_data = data;
+    auto handle = wrap(std::move(a));
+    *armed = true;
+    return handle;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "[MLX] array_alloc_purgeable: %s\n", e.what());
+    return nullptr;
+  } catch (...) {
+    return nullptr;
+  }
+#else
+  (void)shape;
+  (void)ndim;
+  (void)dtype_code;
+  (void)release_fn;
+  (void)ctx;
+  return nullptr;
+#endif
+}
+
+// Set purgeability on the array's existing Metal allocation. Returns the
+// previous state (2 non-volatile, 3 volatile, 4 empty), or -1 on unsupported
+// builds and invalid handles/states. Never evaluates or replaces the array.
+int32_t mlx_array_set_purgeable_state(mlx_array* handle, int32_t state) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!handle || state < MTL::PurgeableStateNonVolatile ||
+        state > MTL::PurgeableStateEmpty) {
+      return -1;
+    }
+    auto& a = *reinterpret_cast<array*>(handle);
+    if (a.buffer().ptr() == nullptr) return -1;
+    auto* buffer = static_cast<MTL::Buffer*>(a.buffer().ptr());
+    return static_cast<int32_t>(buffer->setPurgeableState(
+        static_cast<MTL::PurgeableState>(state)));
+  } catch (...) {
+    return -1;
+  }
+#else
+  (void)handle;
+  (void)state;
+  return -1;
+#endif
 }
 
 mlx_array* mlx_array_astype_cpu(mlx_array* handle, int32_t dtype_code) {

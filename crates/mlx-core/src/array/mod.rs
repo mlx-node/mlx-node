@@ -6,6 +6,7 @@ mod handle;
 pub mod kv_int8;
 pub mod mask;
 pub mod padding;
+pub(crate) mod purgeable;
 
 // New submodules (decomposed from this file)
 mod comparison;
