@@ -754,6 +754,10 @@ pub struct Store {
     wide_routes: HashMap<usize, Vec<u32>>,
     deferred_reduction_layer: Option<usize>,
     slot_capacity: Option<usize>,
+    /// Gate-derived ceiling for direct partial banks. Its presence also keeps
+    /// load reconciliation from replacing the live-pressure plan with the
+    /// older bootstrap rule.
+    slot_bank_budget: Option<u64>,
     slot_bytes: u64,
     pub slot_upload_bytes: u64,
     pub slot_hits: u64,
@@ -910,6 +914,7 @@ impl Store {
             wide_routes: HashMap::new(),
             deferred_reduction_layer: None,
             slot_capacity: None,
+            slot_bank_budget: None,
             slot_bytes: 0,
             slot_upload_bytes: 0,
             slot_hits: 0,
@@ -1261,6 +1266,7 @@ impl Store {
     pub(super) fn set_cache_limit(&mut self, bytes: u64) {
         self.cache_limit = bytes;
         self.plan.budget = bytes;
+        self.slot_bank_budget = None;
     }
     pub fn descriptor(&self, name: &str) -> Result<&Tensor> {
         self.tensors
@@ -1344,7 +1350,7 @@ impl Store {
         let staging_bytes = total * 3;
         self.evict_to(self.cache_limit.saturating_sub(staging_bytes))?;
         super::memory::maintain_freelist(self.plan.physical_bytes);
-        if self.plan.direct {
+        if self.plan.direct || self.slot_bank_budget.is_some() {
             super::memory::admit_direct(staging_bytes)?;
         } else {
             super::memory::admit(staging_bytes)?;
@@ -3627,7 +3633,7 @@ mod mapped_tests {
     }
 
     #[test]
-    fn direct_gguf_full_gate_refusal_keeps_the_existing_slot_path() {
+    fn direct_gguf_full_gate_refusal_selects_bounded_partial_slots() {
         if !crate::utils::gguf_gpu::gpu_repack_available() {
             return;
         }
@@ -3636,15 +3642,20 @@ mod mapped_tests {
         write_fixture(&gguf);
         let mut store = Store::open_fixture(&gguf, Some(&temp.0.join("cache"))).unwrap();
         store.prepare_mapped_pack_at(&temp.0.join("pack")).unwrap();
-        store.slot_capacity = Some(2);
+        let anonymous_budget = 512 << 20;
         let handled = store
             .select_direct_residency_with(
                 EXPERTS,
                 0,
-                &mut |plan, _, _, _| {
-                    plan.mapped_bank_budget = 1;
-                    plan.live_non_reclaimable = 9;
-                    Err(err("simulated full-bank refusal"))
+                &mut |plan, _, _, bank_bytes| {
+                    plan.budget = anonymous_budget;
+                    plan.mapped_bank_budget = bank_bytes * 2 / EXPERTS as u64;
+                    plan.live_non_reclaimable = 40 << 30;
+                    plan.available_bytes = Some(88 << 30);
+                    plan.physical_bytes = Some(128 << 30);
+                    Err(err(
+                        "simulated full-bank refusal beside a 40 GiB live-pressure row",
+                    ))
                 },
                 &mut |_| panic!("a refused gate must not allocate"),
             )
@@ -3655,13 +3666,251 @@ mod mapped_tests {
         assert_eq!(store.slot_bytes, 0);
         assert_eq!(store.cache_bytes, 0);
         assert_eq!(store.expert_slot_capacity(EXPERTS, 2).unwrap(), 2);
-        assert_eq!(store.plan.mapped_bank_budget, 1);
-        assert_eq!(store.plan.live_non_reclaimable, 9);
-        assert_eq!(store.plan.mapped_pack_files, 3);
+        let bank_budget = store.plan.mapped_bank_budget;
+        assert_eq!(store.slot_bank_budget, Some(bank_budget));
+        assert_eq!(store.plan.budget, anonymous_budget + bank_budget);
+        assert!(store.planned_slot_bytes().unwrap() <= bank_budget);
+        assert_eq!(store.plan.live_non_reclaimable, 40 << 30);
+        assert_eq!(store.plan.mapped_pack_files, 0);
+        assert_eq!(store.plan.direct_bytes, 0);
+        assert_eq!(store.plan.direct_layers, 0);
         assert!(matches!(
             store.live.fallback(),
-            Some(Fallback::LoadGate { budget: 1, .. })
+            Some(Fallback::LoadGate { budget, .. }) if budget == bank_budget
         ));
+    }
+
+    /// Real fixture inference through the partial direct fill path. The gate
+    /// rows are injected so the two capacities and the 40/20 GiB pressure
+    /// cases are deterministic; they are not real-model throughput rows.
+    #[test]
+    fn direct_partial_slot_text_matches_mapped_at_two_capacities() {
+        use super::super::{config, decoder};
+        use crate::utils::gguf_test_fixtures::build_minimal_gguf;
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp");
+        let source_path = fixture.join("model.gguf");
+        let source = parse_gguf(&source_path).unwrap();
+        let source_bytes = fs::read(&source_path).unwrap();
+        let mut raw_config: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.join("config.json")).unwrap()).unwrap();
+        // The stock fixture's 16-wide routed down projection cannot hold any
+        // GGUF block format. Keep every other tensor and widen only routed
+        // experts to 32, where Q5_1 exercises mapped and direct banks.
+        raw_config["text_config"]["moe_intermediate_size"] = 32.into();
+        let base_config = config::Config::parse(&raw_config).unwrap();
+        let experts = base_config.num_experts;
+        let mut tensors = Vec::new();
+        for tensor in &source.tensors {
+            if let Some((layer, part)) = routed_expert_tensor(&tensor.name) {
+                let mut data = Vec::new();
+                for block in 0..experts * 32 {
+                    data.extend(half::f16::from_f32(0.015625).to_bits().to_le_bytes());
+                    data.extend(half::f16::from_f32(-0.25).to_bits().to_le_bytes());
+                    for byte in 0..20 {
+                        data.push((block * 29 + byte * 17 + layer * 31 + part * 43) as u8);
+                    }
+                }
+                tensors.push((
+                    tensor.name.clone(),
+                    vec![32, 32, experts as u64],
+                    GgufTensorType::Q5_1,
+                    data,
+                ));
+            } else {
+                let start = usize::try_from(source.data_offset + tensor.offset).unwrap();
+                let end = start + usize::try_from(tensor.data_size().unwrap()).unwrap();
+                tensors.push((
+                    tensor.name.clone(),
+                    tensor.dims.clone(),
+                    tensor.tensor_type,
+                    source_bytes[start..end].to_vec(),
+                ));
+            }
+        }
+        let mut metadata = vec![
+            (
+                "general.architecture",
+                GgufMetaValue::String("qwen4exp".into()),
+            ),
+            (
+                "qwen4exp.expert_count",
+                GgufMetaValue::Uint32(experts as u32),
+            ),
+            (
+                "qwen4exp.expert_used_count",
+                GgufMetaValue::Uint32(base_config.num_experts_per_tok as u32),
+            ),
+        ];
+        for key in [
+            "qwen4exp.ple.layer_multipliers",
+            "qwen4exp.ple.head_vocab_sizes",
+            "qwen4exp.ple.head_offsets",
+        ] {
+            let value = match &source.metadata[key] {
+                GgufMetaValue::ArrayU64(values) => GgufMetaValue::ArrayU64(values.clone()),
+                GgufMetaValue::ArrayI64(values) => GgufMetaValue::ArrayI64(values.clone()),
+                GgufMetaValue::ArrayU32(values) => GgufMetaValue::ArrayU32(values.clone()),
+                GgufMetaValue::ArrayI32(values) => GgufMetaValue::ArrayI32(values.clone()),
+                _ => panic!("fixture {key} is not an integer array"),
+            };
+            metadata.push((key, value));
+        }
+        let descriptors: Vec<_> = tensors
+            .iter()
+            .map(|(name, dims, ty, data)| (name.as_str(), dims.as_slice(), *ty, data.as_slice()))
+            .collect();
+        let temp = Temp::new();
+        let path = temp.0.join("quantized-fixture.gguf");
+        fs::write(&path, build_minimal_gguf(&metadata, &descriptors)).unwrap();
+        let make_store = || Store::open_fixture(&path, Some(&temp.0.join("unused-cache"))).unwrap();
+        let prepare_small_pack = |store: &mut Store, dir: &Path| {
+            let mut routed: Vec<(usize, usize, String, Tensor)> = store
+                .tensors
+                .iter()
+                .filter_map(|(name, tensor)| {
+                    routed_expert_tensor(name)
+                        .map(|(layer, part)| (layer, part, name.clone(), tensor.clone()))
+                })
+                .collect();
+            routed.sort_by_key(|row| (row.0, row.1));
+            let sources: Vec<RoutedExpertSource> = routed
+                .into_iter()
+                .map(|(_, _, name, tensor)| RoutedExpertSource { name, tensor })
+                .collect();
+            let sources: Vec<&dyn super::super::mapped_pack::ExpertSource> = sources
+                .iter()
+                .map(|source| source as &dyn super::super::mapped_pack::ExpertSource)
+                .collect();
+            let packed = store.packed.as_ref().unwrap();
+            let (pack, _) = super::super::mapped_pack::MappedPack::open_or_build(
+                dir,
+                packed.identity().unwrap(),
+                Some(packed.manifest()),
+                &sources,
+            )
+            .unwrap();
+            store.plan.mapped_pack_files = pack.len();
+            store.mapped = Some(pack);
+        };
+        let prompt = [3u32, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4];
+        let store = make_store();
+        let mut mapped = decoder::Decoder::new(base_config.clone(), store).unwrap();
+        mapped.register_cache_limit();
+        prepare_small_pack(&mut mapped.weights, &temp.0.join("mapped-pack"));
+        mapped.weights.select_mapped_residency(0).unwrap();
+        assert!(
+            mapped.weights.plan.mapped,
+            "mapped pack files={}, mapped object={}, budget={}",
+            mapped.weights.plan.mapped_pack_files,
+            mapped.weights.mapped.is_some(),
+            mapped.weights.plan.mapped_bank_budget,
+        );
+        mapped.weights.prepare_fixture_hot().unwrap();
+        mapped.weights.publish_live();
+        mapped.residency_changed();
+        mapped.weights.begin_turn().unwrap();
+        let mut logits = mapped.prefill_prompt(&prompt).unwrap();
+        let mut expected = Vec::new();
+        for step in 0..6 {
+            let id = super::super::tests::argmax(&logits);
+            expected.push(id);
+            if step < 5 {
+                logits = mapped.step(id).unwrap();
+            }
+        }
+        assert!(mapped.weights.plan.mapped);
+
+        for (capacity, live_gib) in [(2usize, 40u64), (3, 20)] {
+            let store = make_store();
+            let mut decoder = decoder::Decoder::new(base_config.clone(), store).unwrap();
+            decoder.register_cache_limit();
+            let anonymous_budget = 512 << 20;
+            let handled = decoder
+                .weights
+                .select_direct_residency_with(
+                    experts,
+                    0,
+                    &mut |plan, _, _, bank_bytes| {
+                        plan.budget = anonymous_budget;
+                        plan.mapped_bank_budget = bank_bytes * capacity as u64 / experts as u64;
+                        plan.live_non_reclaimable = live_gib << 30;
+                        plan.available_bytes = Some((128 - live_gib) << 30);
+                        plan.physical_bytes = Some(128 << 30);
+                        Err(err("injected partial-capacity gate row"))
+                    },
+                    &mut |_| panic!("partial selection must not allocate full banks"),
+                )
+                .unwrap();
+            assert!(handled);
+            let bank_budget = decoder.weights.plan.mapped_bank_budget;
+            assert!(bank_budget > 0);
+            assert!(!decoder.weights.plan.direct && !decoder.weights.plan.mapped);
+            assert_eq!(decoder.weights.plan.partial_expert_slots, capacity);
+            assert_eq!(decoder.weights.slot_capacity, Some(capacity));
+            assert_eq!(decoder.weights.slot_bank_budget, Some(bank_budget));
+            assert_eq!(decoder.weights.plan.mapped_pack_files, 0);
+            assert_eq!(decoder.weights.plan.live_non_reclaimable, live_gib << 30);
+            assert!(decoder.weights.planned_slot_bytes().unwrap() <= bank_budget);
+            decoder.weights.prepare_fixture_hot().unwrap();
+            decoder.weights.publish_live();
+            decoder.residency_changed();
+            assert_eq!(
+                decoder.weights.cache_budget(),
+                anonymous_budget + bank_budget
+            );
+
+            decoder.weights.begin_turn().unwrap();
+            let mut logits = decoder.prefill_prompt(&prompt).unwrap();
+            let unique = decoder
+                .weights
+                .wide_routes
+                .values()
+                .map(Vec::len)
+                .sum::<usize>() as u64;
+            assert!(unique > 0);
+            assert_eq!(
+                decoder.weights.slot_misses, unique,
+                "last-assignment expert chunks re-read an expert during prefill"
+            );
+            assert!(decoder.weights.slot_bytes <= bank_budget);
+            assert!(!decoder.weights.direct_read_windows.is_empty());
+            assert!(
+                decoder
+                    .weights
+                    .direct_read_windows
+                    .iter()
+                    .all(|&(offset, len)| len <= 8 << 20 && offset % (16 << 10) == 0)
+            );
+            assert_eq!(decoder.weights.packed_hits, 0);
+            let mut actual = Vec::new();
+            for step in 0..6 {
+                let id = super::super::tests::argmax(&logits);
+                actual.push(id);
+                if step < 5 {
+                    logits = decoder.step(id).unwrap();
+                }
+            }
+            assert_eq!(actual, expected, "capacity {capacity}, live {live_gib} GiB");
+            assert_eq!(
+                decoder.weights.slots.len(),
+                decoder.config.num_hidden_layers
+            );
+            assert!(
+                decoder
+                    .weights
+                    .device_slots_ready(decoder.config.num_hidden_layers)
+            );
+            assert!(decoder.weights.slot_bytes <= bank_budget);
+            assert!(decoder.weights.cache_bytes <= decoder.weights.cache_limit);
+            assert!(decoder.weights.peak_cache_bytes <= decoder.weights.cache_limit);
+            eprintln!(
+                "synthetic pressure row (not a real-model benchmark): live={live_gib} GiB, capacity={capacity}, prefill unique misses={unique}, slot bytes={}, text={actual:?}",
+                decoder.weights.slot_bytes,
+            );
+        }
     }
 
     #[test]
@@ -3806,6 +4055,30 @@ mod mapped_tests {
         eprintln!(
             "P3.0-d Q5_1 parity: {compared} bank bytes, eviction + volatile + explicit Empty refill"
         );
+    }
+
+    #[test]
+    fn direct_gguf_partial_source_error_invalidates_changed_source() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("partial-source-error.gguf");
+        write_fixture(&gguf);
+        let mut store = open_slots(&temp, &gguf, "partial-source-error-pack", 2, true);
+        store.expert_slots(0, EXPERTS, 2, &[0, 1]).unwrap();
+        let held = temp.0.join("partial-source-error.held");
+        fs::rename(&gguf, &held).unwrap();
+        let error = store.expert_slots(0, EXPERTS, 2, &[2, 3]).err().unwrap();
+        assert!(error.reason.contains("Failed to stat GGUF"), "{error}");
+        assert!(!store.device_slots_ready(1));
+
+        fs::rename(&held, &gguf).unwrap();
+        let before = store.bytes_read;
+        let error = store.expert_slots(0, EXPERTS, 2, &[2, 3]).err().unwrap();
+        assert!(error.reason.contains("changed since open"), "{error}");
+        assert_eq!(store.bytes_read, before);
+        assert!(!store.device_slots_ready(1));
     }
 
     #[test]

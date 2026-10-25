@@ -60,8 +60,14 @@ prefill waits only for the layer it is about to consume. Canonically ordered
 split GGUFs use the same path, including a metadata-only first shard: aligned
 read windows may cross shard boundaries, and every shard's identity and tensor
 bounds are checked before publication. Full direct banks have no misses or LRU
-replacement; below the full-bank gate the existing bounded LRU slot path
-remains in force. Unsupported source layouts keep the mapped path.
+replacement. Below the full-bank gate, the gate's remaining bank budget sizes
+and caps a partial slot capacity instead of reverting to the older bootstrap
+capacity rule. Partial misses use the same direct-GGUF GPU fill pipeline and
+8 MiB read bound. Prefill keeps its last-assignment expert groups, whose expert
+sets are disjoint, so a cold window reads each selected expert at most once per
+layer. `direct` still denotes the full identity-resident plan; partial direct
+fills report `direct: false`, `mapped: false`, and `mappedPackFiles: 0`.
+Unsupported source layouts keep the mapped path.
 
 For A/B, `MLX_QWEN4_RESIDENCY=mapped` selects the old behavior; it is also the
 fallback for unsupported inputs. With a complete mapped expert pack
@@ -217,8 +223,8 @@ weight LRU. Only selected cold experts are read. Every source read and its
 F32-equivalent size are capped at 64 MiB; bank preparation accounts for both
 imported chunks and their destination.
 
-P3.1 retains mapped-pack creation for A/B before residency selection, even
-when direct residency is eligible; pack deletion is a separate later phase.
+P3.1 and P3.2 retain mapped-pack creation for A/B before residency selection,
+even when direct residency is eligible; pack deletion is a separate later phase.
 The routed expert tensors of a GGUF checkpoint are kept as a mapped expert
 pack under `~/Library/Caches/mlx-node/qwen4-packed` on macOS (`~/.cache/mlx-node/qwen4-packed` elsewhere):
 `.mlx-qwen4-mapped-v3-<identity>/`, one file per `(layer, tensor)` whose three
@@ -266,9 +272,30 @@ exempt from orphan removal and retained; their markers are re-stamped on use.
 A breached SSD-read safety limit reclaims the allocator freelist and re-polls
 before erroring.
 
+### Partial-capacity route replay
+
+The test-only replay reads schema v1 `qwen4_exp_expert_route_trace` JSONL with
+explicit line/schema validation, applies the production last-assignment prefill
+grouping and per-layer LRU rules, and reports target and prefill-plus-target
+miss bytes per output token. It accepts an optional `lru-results.json` from the
+P3.0-c `replay_lru.py` tool for field-by-field comparison.
+
+The P3.0-c real capture was blocked by host memory and produced **no valid
+real-model traces**. No real capacity table or 40 GiB-hog throughput result is
+claimed here. The checked replay expectations use clearly labeled synthetic
+traces; fixture inference separately checks two capacities, bounded banks,
+completion, refill, and source errors without representing itself as a real
+model benchmark. A future valid capture can be replayed with the ignored
+`real_trace_partial_replay` test and the variables below.
+
 | Setting                    | Behavior                                                                                                                              |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `MLX_QWEN4_RESIDENCY`      | `mapped` preserves the old mapped-pack path for A/B. Unset/other values use full direct residency when eligible.                       |
+| `MLX_QWEN4_RESIDENCY`      | `mapped` preserves the old mapped-pack path for A/B. Unset/other values use gate-selected full or partial direct residency when eligible. |
+| `QWEN4_EXP_ROUTE_TRACE`   | A valid P3.0-c JSONL route trace for the ignored partial replay test.                                                                   |
+| `QWEN4_EXP_REPLAY_CAPACITIES` | Comma-separated replay capacities (default `128,192,256,384,512`).                                                                  |
+| `QWEN4_EXP_REPLAY_SLOT_COST` | Bytes charged per unique missing `(layer, expert)` (default 8 MiB).                                                                    |
+| `QWEN4_EXP_REPLAY_EXPECTED` | Optional P3.0-c `lru-results.json`; every replay field must match.                                                                     |
+| `QWEN4_EXP_REPLAY_LABEL`  | Capture label selecting one expected row when the results contain multiple captures.                                                    |
 | `QWEN4_EXP_REAL_MODEL`     | Opt-in real-model tests (ignored by default): the Qwen3.8 GGUF path.                                                                  |
 | `QWEN4_EXP_REAL_INPUTS`   | Their prompts: a `{name, tokenIds}` case list from `oxnode scripts/benchmark-fixture.ts fetch --fixture qwen38 --output inputs.json`. |
 | `QWEN4_EXP_REAL_AUX`      | The MTP checkpoint dir the slot tests attach.                                                                                         |

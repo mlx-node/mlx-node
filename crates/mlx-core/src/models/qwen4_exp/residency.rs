@@ -274,7 +274,7 @@ impl Store {
     }
 
     pub(in super::super) fn prepare_hot(&mut self) -> Result<()> {
-        if self.plan.direct {
+        if self.plan.direct || self.slot_bank_budget.is_some() {
             self.prepare_hot_with_policy(&mut super::super::memory::admit_direct, &mut |_| Ok(()))
         } else {
             self.prepare_hot_with_policy(
@@ -326,7 +326,11 @@ impl Store {
         // MLX allocation counters. Reconcile against live headroom before IO.
         // A direct plan already contains its allocated banks and uses the
         // full-bank gate; the slot bootstrap rule would shrink it incorrectly.
-        if self.cache_bytes == 0 && self.plan.available_bytes.is_some() && !self.plan.direct {
+        if self.cache_bytes == 0
+            && self.plan.available_bytes.is_some()
+            && !self.plan.direct
+            && self.slot_bank_budget.is_none()
+        {
             refresh(&mut self.plan)?;
             self.cache_limit = self.plan.budget;
         }
@@ -365,8 +369,10 @@ impl Store {
             self.plan.partial_expert_slots = 0;
         }
         crate::array::memory::synchronize_and_clear_cache();
-        refresh(&mut self.plan)?;
-        self.cache_limit = self.plan.budget;
+        if self.slot_bank_budget.is_none() {
+            refresh(&mut self.plan)?;
+            self.cache_limit = self.plan.budget;
+        }
         if !self.plan.direct {
             self.slot_capacity = None;
         }
@@ -856,7 +862,7 @@ impl Store {
                 if compatible && bytes <= MAX_READ_BYTES * 3 {
                     // Pairing is optional; existing projections remain
                     // valid when transient concatenation cannot be admitted.
-                    let admitted = if self.plan.direct {
+                    let admitted = if self.plan.direct || self.slot_bank_budget.is_some() {
                         super::super::memory::admit_direct(bytes)
                     } else {
                         super::super::memory::admit(bytes)

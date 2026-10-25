@@ -14,6 +14,8 @@ mod packed_cache;
 mod paged;
 mod prefetch;
 mod route_plan;
+#[cfg(test)]
+mod route_replay;
 mod row_fetch;
 mod tripwire;
 mod weights;

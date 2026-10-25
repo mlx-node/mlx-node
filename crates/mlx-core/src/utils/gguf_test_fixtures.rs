@@ -273,6 +273,30 @@ pub(crate) fn build_minimal_gguf(
                     buf.extend_from_slice(&v.to_le_bytes());
                 }
             }
+            GgufMetaValue::ArrayU32(values) => {
+                buf.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+                buf.extend_from_slice(&(GgufValueType::Uint32 as u32).to_le_bytes());
+                buf.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                for v in values {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            GgufMetaValue::ArrayU64(values) => {
+                buf.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+                buf.extend_from_slice(&(GgufValueType::Uint64 as u32).to_le_bytes());
+                buf.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                for v in values {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            GgufMetaValue::ArrayI64(values) => {
+                buf.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+                buf.extend_from_slice(&(GgufValueType::Int64 as u32).to_le_bytes());
+                buf.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                for v in values {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+            }
             _ => panic!("Unsupported metadata type in test helper"),
         }
     }

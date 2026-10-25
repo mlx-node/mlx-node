@@ -206,6 +206,9 @@ pub(super) fn mapped_plan(
 ) -> Result<()> {
     let desired = mapped_desired(dense_bytes);
     let anonymous_need = desired.saturating_add(pool_bytes);
+    // A refused full bank leaves this anonymous budget available to the
+    // partial-slot selector; the gate's bank budget completes its ceiling.
+    plan.budget = desired;
     // A bootstrap snapshot exists only on the live macOS host; fixtures and
     // other platforms take the desired budget without a gate.
     let gate = match plan.physical_bytes {

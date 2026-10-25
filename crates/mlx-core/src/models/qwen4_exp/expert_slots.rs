@@ -882,7 +882,7 @@ impl Store {
     /// Returns true when direct eligibility was decided, including a gate
     /// refusal that must use slots rather than silently trying another full
     /// residency mode. False leaves the old mapped selector in charge.
-    pub(super) fn select_direct_residency_with(
+    pub(in super::super) fn select_direct_residency_with(
         &mut self,
         experts: usize,
         pool_bytes: u64,
@@ -934,6 +934,7 @@ impl Store {
         let original_cache_limit = self.cache_limit;
         let original_draft_budget = self.draft_bank_budget;
         let original_slot_capacity = self.slot_capacity;
+        let original_slot_bank_budget = self.slot_bank_budget;
         let original_slot_bytes = self.slot_bytes;
         let original_cache_bytes = self.cache_bytes;
         let mut candidate = self.plan.clone();
@@ -943,13 +944,37 @@ impl Store {
             pool_bytes,
             bank_bytes,
         ) {
-            self.plan.mapped_bank_budget = candidate.mapped_bank_budget;
-            self.plan.live_non_reclaimable = candidate.live_non_reclaimable;
-            tracing::warn!("qwen4 residency: slot path, {error}");
+            let bank_budget = candidate.mapped_bank_budget;
+            self.plan = candidate;
+            self.plan.mapped = false;
+            self.plan.direct = false;
+            self.plan.direct_bytes = 0;
+            self.plan.direct_layers = 0;
+            self.plan.mapped_bytes = 0;
+            // The pack remains available for explicit mapped A/B, but this
+            // eligible partial path fills every slot directly from GGUF.
+            self.plan.mapped_pack_files = 0;
+            self.plan.budget = self.plan.budget.saturating_add(bank_budget);
+            self.cache_limit = self.plan.budget;
+            self.draft_bank_budget = 0;
+            self.slot_capacity = None;
+            self.slot_bank_budget = Some(bank_budget);
+            let top = self
+                .metadata
+                .get("qwen4exp.expert_used_count")
+                .and_then(GgufMetaValue::as_u64)
+                .unwrap_or(0) as usize;
+            self.plan.partial_expert_slots = self.expert_slot_capacity(experts, top)?;
             self.live.set_fallback(Fallback::LoadGate {
                 pack: bank_bytes,
-                budget: candidate.mapped_bank_budget,
+                budget: bank_budget,
             });
+            self.live.store(&self.plan);
+            tracing::warn!(
+                "qwen4 residency: partial direct slots, {error}; {} slots within a {:.1} GiB bank budget",
+                self.plan.partial_expert_slots,
+                bank_budget as f64 / (1u64 << 30) as f64,
+            );
             return Ok(true);
         }
         candidate.mapped = false;
@@ -967,6 +992,7 @@ impl Store {
         self.cache_limit = self.plan.budget;
         self.draft_bank_budget = draft_bank;
         self.slot_capacity = Some(experts);
+        self.slot_bank_budget = None;
         let allocated = (|| -> Result<()> {
             admit(bank_bytes.saturating_add((DIRECT_READ_BYTES * DIRECT_STAGING_SLOTS) as u64))?;
             for &layer in &layers {
@@ -986,6 +1012,7 @@ impl Store {
             self.cache_limit = original_cache_limit;
             self.draft_bank_budget = original_draft_budget;
             self.slot_capacity = original_slot_capacity;
+            self.slot_bank_budget = original_slot_bank_budget;
             return Err(error);
         }
         self.direct_slow_source = false;
@@ -1124,6 +1151,7 @@ impl Store {
         self.cache_limit = self.plan.budget;
         self.draft_bank_budget = draft_bank;
         self.slot_capacity = Some(experts);
+        self.slot_bank_budget = None;
         self.plan.mapped_bytes = bytes;
         self.plan.partial_expert_slots = experts;
         self.mapped_experts = mapped;
@@ -1296,7 +1324,7 @@ impl Store {
     /// cannot stage keeps its drafts on the row reader for the process; the
     /// load goes on.
     pub(in super::super) fn finish_load(&mut self) -> Result<()> {
-        if self.plan.direct {
+        if self.plan.direct || self.slot_bank_budget.is_some() {
             self.finish_load_with(&mut super::super::memory::admit_direct)
         } else {
             self.finish_load_with(&mut super::super::memory::admit)
@@ -1604,6 +1632,7 @@ impl Store {
         self.pending_touch.clear();
         self.mapped_pass_start = None;
         self.slot_capacity = None;
+        self.slot_bank_budget = None;
         self.slot_reclaim_since = None;
         crate::array::memory::synchronize();
         let mut plan = self.plan.clone();
@@ -1839,6 +1868,17 @@ impl Store {
                 / routed.saturating_add(largest_layer) as u128;
             auxiliary_cap.min(staging_cap).min(experts as u128) as usize
         };
+        let capacity = if let Some(bank_budget) = self.slot_bank_budget {
+            let gate_capacity = if routed == 0 {
+                0
+            } else {
+                (bank_budget as u128 * experts as u128 / routed as u128).min(experts as u128)
+                    as usize
+            };
+            capacity.min(gate_capacity)
+        } else {
+            capacity
+        };
         let capacity = if capacity < top { 0 } else { capacity };
         self.slot_capacity = Some(capacity);
         Ok(capacity)
@@ -2023,7 +2063,14 @@ impl Store {
         let mut slots = if let Some(slots) = self.slots.remove(&layer) {
             slots
         } else {
-            let mut admit = |bytes| super::super::memory::admit(bytes);
+            let direct_gate = self.slot_bank_budget.is_some();
+            let mut admit = |bytes| {
+                if direct_gate {
+                    super::super::memory::admit_direct(bytes)
+                } else {
+                    super::super::memory::admit(bytes)
+                }
+            };
             match self.new_expert_slots(layer, experts, capacity, &mut admit)? {
                 Some(slots) => slots,
                 None => return Ok(None),
@@ -2982,6 +3029,35 @@ mod tests {
             [94, 100, 106, 112, 125, 149],
             "draft banks declined"
         );
+    }
+
+    /// The gate, not the old bootstrap budget, bounds partial banks on the
+    /// released 48-layer geometry. No bank payload is allocated by this check.
+    #[test]
+    fn gate_sized_partial_capacity_tracks_the_full_bank_shortfall() {
+        let Some((mut store, layers)) = draft_bank_store(None) else {
+            return;
+        };
+        let routed: u64 = layers.iter().sum();
+        assert_eq!(routed, 78_538_342_400);
+        let anonymous = super::super::super::memory::mapped_desired(
+            FIXED_BANK_BYTES.saturating_add(3_040_870_400),
+        );
+        for (bank_budget, expected) in [(routed - 1, 511), (72 << 30, 503), (40 << 30, 279)] {
+            store.cache_limit = anonymous.saturating_add(bank_budget);
+            store.plan.budget = store.cache_limit;
+            store.slot_bank_budget = Some(bank_budget);
+            store.slot_capacity = None;
+            store.mtp_banks_declined = false;
+            let capacity = store.expert_slot_capacity(512, 10).unwrap();
+            assert_eq!(capacity, expected, "bank budget {bank_budget}");
+            let planned = store.planned_slot_bytes().unwrap();
+            assert!(planned <= bank_budget);
+            assert!(planned > bank_budget.saturating_sub(routed / 512));
+            assert_eq!(store.plan.budget, anonymous + bank_budget);
+        }
+        assert_eq!(store.bytes_read, 0);
+        assert_eq!(store.slot_bytes, 0);
     }
 
     /// A slot count cached with no room for the draft banks beside it: the
