@@ -6793,6 +6793,24 @@ impl Drop for PreparedDirLease {
     }
 }
 
+/// Keyed by canonical input so parallel tests cannot consume each other's hook.
+#[cfg(test)]
+static NATIVE_GGUF_POST_PLAN_TEST_HOOKS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, fn(&Path)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn run_native_gguf_post_plan_test_hook(input: &Path) {
+    let hook = NATIVE_GGUF_POST_PLAN_TEST_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(input)
+        .copied();
+    if let Some(hook) = hook {
+        hook(input);
+    }
+}
+
 /// Test-only pause inside `prepare_gguf_assets_in`: fires after the
 /// provisional lease registers and before the post-publish sweep — and only
 /// for the prepare running against the expected cache root, so a parallel
@@ -7988,6 +8006,8 @@ pub(crate) async fn prepare_gguf_assets_in(
             "prism.hadamard sources are text-only and cannot be paired with a companion GGUF",
         ));
     }
+    let parent = input_path.parent().unwrap_or(Path::new("."));
+    let asset_digest = qwen35_native_asset_digest(parent)?;
     let (opts, main_plan, companion_plan) = native_import_plans(
         family,
         (&main.0, &main.1),
@@ -7995,6 +8015,14 @@ pub(crate) async fn prepare_gguf_assets_in(
             .as_ref()
             .map(|(path, header, _)| (path.as_path(), &**header)),
     )?;
+    #[cfg(test)]
+    run_native_gguf_post_plan_test_hook(&input_path);
+    if qwen35_native_asset_digest(parent)? != asset_digest {
+        return Err(Error::from_reason(
+            "GGUF sibling config/tokenizer assets changed during native import planning; retry \
+             the load",
+        ));
+    }
 
     let metadata = fs::metadata(&input_path).map_err(|error| {
         Error::from_reason(format!(
@@ -8027,8 +8055,6 @@ pub(crate) async fn prepare_gguf_assets_in(
         })
         .take(32)
         .collect::<String>();
-    let parent = input_path.parent().unwrap_or(Path::new("."));
-    let asset_digest = qwen35_native_asset_digest(parent)?;
     let layout = family.layout();
     let cache_dtype = if prism_contract.is_some() {
         "source"
@@ -8344,7 +8370,7 @@ mod tests {
     use crate::utils::gguf_test_fixtures::{
         build_minimal_gguf, build_qwen35_moe_fixture, complete_muse_glimmer_dflash_metadata,
         gemma_native_fixture, gemma4v_mmproj_fixture, muse_glimmer_dflash_metadata,
-        muse_native_draft_fixture, muse_native_fixture,
+        muse_native_draft_fixture, muse_native_fixture, write_import_fixture,
     };
 
     include!("gguf_source_math_import_tests.rs");
@@ -10377,6 +10403,156 @@ mod tests {
             serde_json::from_slice(&fs::read(edited_same_size.join("config.json")).unwrap())
                 .unwrap();
         assert_eq!(config["asset_sentinel"], serde_json::json!(2));
+        fs::remove_dir_all(root).ok();
+    }
+
+    fn install_post_plan_test_hook(input: &Path, hook: fn(&Path)) -> PathBuf {
+        let input = input.canonicalize().unwrap();
+        NATIVE_GGUF_POST_PLAN_TEST_HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(input.clone(), hook);
+        input
+    }
+
+    fn remove_post_plan_test_hook(input: &Path) {
+        NATIVE_GGUF_POST_PLAN_TEST_HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(input);
+    }
+
+    fn assert_no_completed_native_entries(cache_root: &Path) {
+        let completed: Vec<PathBuf> = fs::read_dir(cache_root)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.join(".complete").is_file())
+            .collect();
+        assert!(
+            completed.is_empty(),
+            "planning race published completed entries: {completed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn qwen35_native_cache_rejects_config_change_during_import_planning() {
+        fn replace_config(input: &Path) {
+            let path = input.parent().unwrap().join("config.json");
+            let mut config: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(config["asset_sentinel"], serde_json::json!(1));
+            config["asset_sentinel"] = serde_json::json!(2);
+            fs::write(path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-qwen35-plan-config-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = root.join("source");
+        let cache_root = root.join("cache");
+        let fixture = write_import_fixture("qwen35-dense-tied", &source);
+        let config_path = source.join("config.json");
+        let mut config_a: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        config_a["asset_sentinel"] = serde_json::json!(1);
+        fs::write(&config_path, serde_json::to_vec_pretty(&config_a).unwrap()).unwrap();
+        let mut config_b = config_a.clone();
+        config_b["asset_sentinel"] = serde_json::json!(2);
+        assert_eq!(
+            crate::engine::checkpoint_source::t64_prefixes(&config_a),
+            crate::engine::checkpoint_source::t64_prefixes(&config_b),
+            "the race fixture must not make check_asset_config reject the mismatch"
+        );
+
+        let hook_input = install_post_plan_test_hook(&fixture.main, replace_config);
+        let outcome =
+            prepare_gguf_assets_in(&fixture.main, NativeGgufFamily::Qwen35, &cache_root).await;
+        remove_post_plan_test_hook(&hook_input);
+        let error = match outcome {
+            Ok(checkpoint) => {
+                native_gguf_unlease_in_use(&checkpoint.asset_dir);
+                fs::remove_dir_all(&root).ok();
+                panic!("config replacement during planning must be rejected");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .reason
+                .contains("changed during native import planning; retry the load"),
+            "unexpected error: {}",
+            error.reason
+        );
+        assert_no_completed_native_entries(&cache_root);
+        let live_config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(live_config, config_b);
+
+        let retried = prepare_gguf_assets_in(&fixture.main, NativeGgufFamily::Qwen35, &cache_root)
+            .await
+            .unwrap();
+        retried.check_asset_config().unwrap();
+        let cached_config: serde_json::Value =
+            serde_json::from_slice(&fs::read(retried.asset_dir.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(cached_config["asset_sentinel"], serde_json::json!(2));
+        let asset_digest = qwen35_native_asset_digest(&source).unwrap();
+        let marker = fs::read_to_string(retried.asset_dir.join(".complete")).unwrap();
+        assert!(marker.contains(&format!("assets_sha256={asset_digest}\n")));
+        native_gguf_unlease_in_use(&retried.asset_dir);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn qwen35_native_cache_rejects_asset_set_change_during_import_planning() {
+        fn add_generation_config(input: &Path) {
+            fs::write(
+                input.parent().unwrap().join("generation_config.json"),
+                r#"{"eos_token_id":17}"#,
+            )
+            .unwrap();
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-qwen35-plan-assets-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = root.join("source");
+        let cache_root = root.join("cache");
+        let fixture = write_import_fixture("qwen35-dense-tied", &source);
+        assert!(!source.join("generation_config.json").exists());
+
+        let hook_input = install_post_plan_test_hook(&fixture.main, add_generation_config);
+        let outcome =
+            prepare_gguf_assets_in(&fixture.main, NativeGgufFamily::Qwen35, &cache_root).await;
+        remove_post_plan_test_hook(&hook_input);
+        let error = match outcome {
+            Ok(checkpoint) => {
+                native_gguf_unlease_in_use(&checkpoint.asset_dir);
+                fs::remove_dir_all(&root).ok();
+                panic!("runtime asset discovery changes must be rejected");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .reason
+                .contains("changed during native import planning; retry the load"),
+            "unexpected error: {}",
+            error.reason
+        );
+        assert_no_completed_native_entries(&cache_root);
+
+        let retried = prepare_gguf_assets_in(&fixture.main, NativeGgufFamily::Qwen35, &cache_root)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(retried.asset_dir.join("generation_config.json")).unwrap(),
+            br#"{"eos_token_id":17}"#
+        );
+        native_gguf_unlease_in_use(&retried.asset_dir);
         fs::remove_dir_all(root).ok();
     }
 
