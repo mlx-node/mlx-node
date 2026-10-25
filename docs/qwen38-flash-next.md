@@ -50,13 +50,28 @@ and caps weights at 75% of physical RAM. Anonymous inactive and compressed
 memory do not count as available. The budget is reconciled after tokenizer and
 page-pool creation; growth rechecks headroom.
 
-With a complete mapped expert pack (below), the load maps every routed expert
-in place when the live host holds the whole pack beside what stays anonymous:
-the pack's sections back the expert banks as no-copy Metal buffers, slot id
-is expert id, and no expert is ever copied, missed or staged during a turn.
-The weight budget then covers only what stays anonymous — fixed projection
-banks and 2 GiB of row/staging room, through which auxiliary (MTP/vision)
-rows stream like token rows — and the routed experts are clean page cache: the Metal
+For a supported GGUF checkpoint, the load first offers the routed experts
+full direct residency: anonymous banks at the checkpoint's full expert count,
+with slot id equal to expert id. The same live-memory gate as the mapped path
+must admit the whole bank set. Eight reader threads fill every layer's three
+banks from the main GGUF shard set through the GPU repack pipeline, in layer order and
+with at most 8 MiB per read window and four staging buffers. A cold layer-major
+prefill waits only for the layer it is about to consume. Canonically ordered
+split GGUFs use the same path, including a metadata-only first shard: aligned
+read windows may cross shard boundaries, and every shard's identity and tensor
+bounds are checked before publication. Full direct banks have no misses or LRU
+replacement; below the full-bank gate the existing bounded LRU slot path
+remains in force. Unsupported source layouts keep the mapped path.
+
+For A/B, `MLX_QWEN4_RESIDENCY=mapped` selects the old behavior; it is also the
+fallback for unsupported inputs. With a complete mapped expert pack
+(below), the load maps every routed expert in place when the live host holds
+the whole pack beside what stays anonymous: the pack's sections back the
+expert banks as no-copy Metal buffers, slot id is expert id, and no expert is
+copied, missed or staged during a turn. The weight budget then covers only
+what stays anonymous — fixed projection banks and 2 GiB of row/staging room,
+through which auxiliary (MTP/vision) rows stream like token rows — and the
+routed experts are clean page cache: the Metal
 driver wires the banks a command buffer binds and releases them about a
 second after the turn, so the process holds no expert memory between turns
 and the OS may evict the pages. The decision is a byte budget for mapped
@@ -202,6 +217,8 @@ weight LRU. Only selected cold experts are read. Every source read and its
 F32-equivalent size are capped at 64 MiB; bank preparation accounts for both
 imported chunks and their destination.
 
+P3.1 retains mapped-pack creation for A/B before residency selection, even
+when direct residency is eligible; pack deletion is a separate later phase.
 The routed expert tensors of a GGUF checkpoint are kept as a mapped expert
 pack under `~/Library/Caches/mlx-node/qwen4-packed` on macOS (`~/.cache/mlx-node/qwen4-packed` elsewhere):
 `.mlx-qwen4-mapped-v3-<identity>/`, one file per `(layer, tensor)` whose three
@@ -249,9 +266,10 @@ exempt from orphan removal and retained; their markers are re-stamped on use.
 A breached SSD-read safety limit reclaims the allocator freelist and re-polls
 before erroring.
 
-| Setting                   | Behavior                                                                                                                              |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `QWEN4_EXP_REAL_MODEL`    | Opt-in real-model tests (ignored by default): the Qwen3.8 GGUF path.                                                                  |
+| Setting                    | Behavior                                                                                                                              |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `MLX_QWEN4_RESIDENCY`      | `mapped` preserves the old mapped-pack path for A/B. Unset/other values use full direct residency when eligible.                       |
+| `QWEN4_EXP_REAL_MODEL`     | Opt-in real-model tests (ignored by default): the Qwen3.8 GGUF path.                                                                  |
 | `QWEN4_EXP_REAL_INPUTS`   | Their prompts: a `{name, tokenIds}` case list from `oxnode scripts/benchmark-fixture.ts fetch --fixture qwen38 --output inputs.json`. |
 | `QWEN4_EXP_REAL_AUX`      | The MTP checkpoint dir the slot tests attach.                                                                                         |
 | `QWEN4_EXP_REAL_STEPS`    | Greedy decode steps per case (default 256).                                                                                           |
@@ -262,12 +280,15 @@ before erroring.
 Run them with `QWEN4_EXP_REAL_MODEL=... QWEN4_EXP_REAL_INPUTS=... cargo test -p mlx-core --lib real_ -- --ignored --test-threads=1 --nocapture`.
 
 `residencyInfo()` reports the admitted bytes, hot inventory, resident banks,
-expert-slot capacity (the expert count in mapped mode), the number of tensors
-served from the mapped pack (`mappedPackFiles`), whether experts are mapped in
-place (`mapped`, with `mappedBytes`; `weightBudgetBytes`,
-`partialExpertSlots` and both follow a mid-session fallback), the bank budget
-and live memory of the residency decision (`mappedBankBudgetBytes`,
-`liveNonReclaimableBytes`), why the slot path serves the experts
+expert-slot capacity (the expert count in mapped or full direct mode), the
+number of tensors served from the mapped pack (`mappedPackFiles`, zero on the
+direct path), whether experts are mapped in place (`mapped`, with
+`mappedBytes`), whether they use anonymous direct banks (`direct`, with
+`directBytes`), and the layered fill progress (`directLayers`,
+`directFilledLayers`, `directFillInProgress`). `weightBudgetBytes` and
+`partialExpertSlots` follow a mid-session fallback. The bank budget and live
+memory of the residency decision are `mappedBankBudgetBytes` (the same gate
+for both full modes) and `liveNonReclaimableBytes`; why the slot path serves the experts
 (`fallbackReason`, with `fallbackReadBytes` or `fallbackSlowSteps`), the
 prefill window, and the live decoded-row counters (`decodedRowLookups`,
 `decodedRowMisses`, `decodedRowHitRate`, `decodedRowEvictions`,

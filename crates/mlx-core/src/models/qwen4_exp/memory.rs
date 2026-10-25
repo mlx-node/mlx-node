@@ -23,6 +23,13 @@ pub(super) struct Plan {
     /// Every routed expert is addressed in place through the mapped pack:
     /// no slot banks, no mid-turn staging, no wired-limit context.
     pub mapped: bool,
+    /// Every routed expert has an anonymous direct-GGUF bank at identity
+    /// capacity. Direct and mapped residency are mutually exclusive.
+    pub direct: bool,
+    /// Anonymous bytes allocated for direct expert banks.
+    pub direct_bytes: u64,
+    /// Routed layers in the direct fill schedule.
+    pub direct_layers: usize,
     /// Bytes of pack sections backing live arrays; MLX counts them in
     /// `active_memory`, so budgets subtract them.
     pub mapped_bytes: u64,
@@ -163,6 +170,9 @@ pub(super) fn plan(hot_bytes: u64) -> Result<Plan> {
         partial_expert_slots: 0,
         mapped_pack_files: 0,
         mapped: false,
+        direct: false,
+        direct_bytes: 0,
+        direct_layers: 0,
         mapped_bytes: 0,
         mapped_bank_budget: 0,
         live_non_reclaimable: 0,
@@ -225,6 +235,9 @@ pub(super) fn mapped_plan(
     }
     plan.budget = desired;
     plan.mapped = true;
+    plan.direct = false;
+    plan.direct_bytes = 0;
+    plan.direct_layers = 0;
     Ok(())
 }
 
@@ -294,6 +307,9 @@ pub(super) fn slot_fallback_plan_with(
             << 30,
     );
     plan.mapped = false;
+    plan.direct = false;
+    plan.direct_bytes = 0;
+    plan.direct_layers = 0;
     plan.mapped_bytes = 0;
     plan.mapped_bank_budget = 0;
     plan.partial_expert_slots = 0;
@@ -394,6 +410,25 @@ pub(super) fn admit(bytes: u64) -> Result<()> {
             bytes as f64 / (1u64 << 30) as f64,
             available as f64 / (1u64 << 30) as f64,
             system_reserve(physical) as f64 / (1u64 << 30) as f64
+        )));
+    }
+    Ok(())
+}
+
+/// Admit one actual direct-residency allocation against the same live-memory
+/// budget as the full-bank gate. Unlike slot admission, this does not add the
+/// bootstrap system reserve a second time or count banks already allocated by
+/// this process as anonymous need.
+pub(super) fn admit_direct(bytes: u64) -> Result<()> {
+    let host = host_memory()?;
+    let budget = mapped_gate(&host, 0, MAPPED_MARGIN).bank_budget;
+    if bytes > budget {
+        return Err(Error::from_reason(format!(
+            "Qwen4 direct residency admission refused: requested {:.1} GiB, the host leaves {:.1} GiB beside {:.1} GiB live memory and a {:.0} GiB margin",
+            bytes as f64 / (1u64 << 30) as f64,
+            budget as f64 / (1u64 << 30) as f64,
+            host.non_reclaimable() as f64 / (1u64 << 30) as f64,
+            MAPPED_MARGIN as f64 / (1u64 << 30) as f64,
         )));
     }
     Ok(())
@@ -693,7 +728,7 @@ mod tests {
         assert_eq!(mapped_gate(&quiet, u64::MAX, 0).bank_budget, 0);
     }
 
-    fn plan_without_snapshot() -> Plan {
+    pub(super) fn plan_without_snapshot() -> Plan {
         Plan {
             budget: 73 << 30,
             hot_bytes: 83_631_869_440,
@@ -703,6 +738,9 @@ mod tests {
             partial_expert_slots: 442,
             mapped_pack_files: 144,
             mapped: false,
+            direct: false,
+            direct_bytes: 0,
+            direct_layers: 0,
             mapped_bytes: 0,
             mapped_bank_budget: 0,
             live_non_reclaimable: 0,
@@ -1068,6 +1106,9 @@ mod tests {
             partial_expert_slots: 0,
             mapped_pack_files: 0,
             mapped: false,
+            direct: false,
+            direct_bytes: 0,
+            direct_layers: 0,
             mapped_bytes: 0,
             mapped_bank_budget: 0,
             live_non_reclaimable: 0,
@@ -1219,15 +1260,17 @@ pub(super) fn scheduled_state_budget(pool_bytes: u64, prefill_scratch: u64) -> u
 /// again whenever the plan changes (a mapped process that moved to slots
 /// has a smaller allowance than the one its load admitted).
 pub(super) fn prefill_window(c: &super::config::Config, plan: &Plan) -> usize {
+    let anonymous_budget = plan.budget.saturating_sub(plan.direct_bytes);
     let live = match (plan.available_bytes, plan.physical_bytes) {
-        (Some(a), Some(p)) => a.saturating_sub(plan.budget + system_reserve(p) + (2 << 30)),
-        _ => plan.budget / 16,
+        (Some(a), Some(p)) => a.saturating_sub(anonymous_budget + system_reserve(p) + (2 << 30)),
+        _ => anonymous_budget / 16,
     };
-    // The mapped budget holds no experts, so it does not scale the scratch.
-    let allowance = if plan.mapped {
+    // Full direct and mapped budgets hold the experts separately, so neither
+    // scales the scratch allowance with their total bank bytes.
+    let allowance = if plan.mapped || plan.direct {
         (2 << 30).min(live)
     } else {
-        (plan.budget / 16).min(2 << 30).min(live)
+        (anonymous_budget / 16).min(2 << 30).min(live)
     };
     let mut window = super::MAX_PREFILL_CHUNK;
     while window > 1 && prefill_scratch(c, window) > allowance {
@@ -1282,6 +1325,26 @@ fn flash_next_config() -> super::config::Config {
         "eos_token_id": 248044
     }))
     .unwrap()
+}
+
+#[test]
+fn direct_prefill_window_excludes_the_full_bank_bytes_from_anonymous_scratch() {
+    let c = flash_next_config();
+    let mut direct = tests::plan_without_snapshot();
+    direct.available_bytes = Some(112 << 30);
+    direct.physical_bytes = Some(128 << 30);
+    direct.budget = 80 << 30;
+    direct.direct = true;
+    direct.direct_bytes = 73 << 30;
+    direct.direct_layers = 48;
+    let mut mapped = direct.clone();
+    mapped.direct = false;
+    mapped.direct_bytes = 0;
+    mapped.direct_layers = 0;
+    mapped.mapped = true;
+    mapped.budget = 7 << 30;
+    assert_eq!(prefill_window(&c, &direct), prefill_window(&c, &mapped));
+    assert_eq!(prefill_window(&c, &direct), super::MAX_PREFILL_CHUNK);
 }
 
 #[test]

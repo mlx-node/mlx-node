@@ -368,7 +368,7 @@ pub struct Qwen4ExpResidencyInfo {
     /// and the MTP expert banks built at load.
     pub resident_bank_bytes: f64,
     /// Shared slot capacity for the routed layers at bootstrap (the expert
-    /// count in mapped mode).
+    /// count in mapped or full direct mode).
     pub partial_expert_slots: u32,
     /// Routed expert tensors the slot path reads by range from the mapped
     /// pack; 0 means every expert read is imported from the checkpoint.
@@ -376,13 +376,22 @@ pub struct Qwen4ExpResidencyInfo {
     /// Every routed expert is addressed in place through the mapped pack;
     /// the weight budget then covers dense banks and rows only.
     pub mapped: bool,
+    /// Every routed expert has an anonymous bank filled directly from GGUF,
+    /// with slot id equal to expert id. Never true together with `mapped`.
+    pub direct: bool,
+    /// Anonymous bytes allocated to direct expert banks.
+    pub direct_bytes: f64,
+    /// Routed layers in the direct schedule and layers whose fill completed.
+    pub direct_layers: u32,
+    pub direct_filled_layers: u32,
+    /// A direct layered fill is still running.
+    pub direct_fill_in_progress: bool,
     /// Pack bytes backing live arrays in mapped mode (clean page cache the
     /// Metal driver wires while a command buffer binds them).
     pub mapped_bytes: f64,
-    /// Bytes of mapped banks the host could hold beside what stays anonymous
-    /// when the residency was chosen: physical RAM minus a margin, the live
-    /// non-reclaimable memory below and the anonymous need. The pack maps
-    /// when this covers every bank.
+    /// Bytes of mapped or direct banks the host could hold beside what stays
+    /// anonymous when residency was chosen: physical RAM minus a margin, the
+    /// live non-reclaimable memory below and the anonymous need.
     pub mapped_bank_budget_bytes: f64,
     /// Wired, compressed and other processes' anonymous memory when the
     /// residency was chosen.
@@ -489,9 +498,9 @@ impl Qwen4ExpModel {
                 let pool_guard = Some(crate::cache_limit::coordinator().register_pool(pool_bytes));
                 decoder.register_cache_limit();
                 decoder.weights.prepare_mapped_pack()?;
-                decoder.weights.select_mapped_residency(pool_bytes)?;
+                decoder.weights.select_residency(pool_bytes)?;
                 decoder.weights.prepare_hot()?;
-                decoder.weights.finish_load();
+                decoder.weights.finish_load()?;
                 decoder.weights.publish_live();
                 // Register the final reconciled budget, rather than retaining
                 // the pre-pool estimate in the process-wide allocator policy.
@@ -616,6 +625,11 @@ impl Qwen4ExpModel {
             partial_expert_slots: live.partial_expert_slots.load(Ordering::Acquire) as u32,
             mapped_pack_files: self.residency.mapped_pack_files as u32,
             mapped: live.mapped.load(Ordering::Acquire),
+            direct: live.direct.load(Ordering::Acquire),
+            direct_bytes: live.direct_bytes.load(Ordering::Acquire) as f64,
+            direct_layers: live.direct_layers.load(Ordering::Acquire) as u32,
+            direct_filled_layers: live.direct_filled_layers.load(Ordering::Acquire) as u32,
+            direct_fill_in_progress: live.direct_fill_in_progress.load(Ordering::Acquire),
             mapped_bytes: live.mapped_bytes.load(Ordering::Acquire) as f64,
             mapped_bank_budget_bytes: live.mapped_bank_budget.load(Ordering::Acquire) as f64,
             live_non_reclaimable_bytes: live.live_non_reclaimable.load(Ordering::Acquire) as f64,

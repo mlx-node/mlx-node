@@ -5476,7 +5476,7 @@ export interface Qwen4ExpResidencyInfo {
   residentBankBytes: number;
   /**
    * Shared slot capacity for the routed layers at bootstrap (the expert
-   * count in mapped mode).
+   * count in mapped or full direct mode).
    */
   partialExpertSlots: number;
   /**
@@ -5490,15 +5490,26 @@ export interface Qwen4ExpResidencyInfo {
    */
   mapped: boolean;
   /**
+   * Every routed expert has an anonymous bank filled directly from GGUF,
+   * with slot id equal to expert id. Never true together with `mapped`.
+   */
+  direct: boolean;
+  /** Anonymous bytes allocated to direct expert banks. */
+  directBytes: number;
+  /** Routed layers in the direct schedule and layers whose fill completed. */
+  directLayers: number;
+  directFilledLayers: number;
+  /** A direct layered fill is still running. */
+  directFillInProgress: boolean;
+  /**
    * Pack bytes backing live arrays in mapped mode (clean page cache the
    * Metal driver wires while a command buffer binds them).
    */
   mappedBytes: number;
   /**
-   * Bytes of mapped banks the host could hold beside what stays anonymous
-   * when the residency was chosen: physical RAM minus a margin, the live
-   * non-reclaimable memory below and the anonymous need. The pack maps
-   * when this covers every bank.
+   * Bytes of mapped or direct banks the host could hold beside what stays
+   * anonymous when residency was chosen: physical RAM minus a margin, the
+   * live non-reclaimable memory below and the anonymous need.
    */
   mappedBankBudgetBytes: number;
   /**

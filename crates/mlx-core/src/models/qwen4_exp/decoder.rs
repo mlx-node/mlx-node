@@ -2346,8 +2346,8 @@ impl Decoder {
     }
 
     /// Whether a prompt of `suffix` new tokens runs as one layer-major
-    /// group: the turn opened over a streaming pack, the carried window path
-    /// serves it, every window is a tentative-eligible slice, and the W
+    /// group: the turn opened over a streaming pack or a direct fill, the
+    /// carried window path serves it, every window is a tentative-eligible slice, and the W
     /// residual streams fit beside the mapped turn floor. Read at admission
     /// and again at execution: a trip applied in between runs the prompt one
     /// window at a time.
@@ -2361,7 +2361,9 @@ impl Decoder {
         if let Some(pin) = self.group_pin {
             return pin;
         }
-        if !self.weights.plan.mapped || !self.weights.streaming_pass() || slice < 256 {
+        let filling = (self.weights.plan.mapped && self.weights.streaming_pass())
+            || self.weights.direct_fill_pass();
+        if !filling || slice < 256 {
             return false;
         }
         let Ok(host) = super::memory::host_memory() else {

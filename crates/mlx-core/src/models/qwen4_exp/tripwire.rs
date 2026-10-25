@@ -110,6 +110,11 @@ impl Fallback {
 /// may change the residency between passes.
 pub struct Live {
     pub mapped: AtomicBool,
+    pub direct: AtomicBool,
+    pub direct_bytes: AtomicU64,
+    pub direct_layers: AtomicU64,
+    pub direct_filled_layers: AtomicU64,
+    pub direct_fill_in_progress: AtomicBool,
     pub mapped_bytes: AtomicU64,
     pub weight_budget: AtomicU64,
     pub partial_expert_slots: AtomicU64,
@@ -129,6 +134,11 @@ impl Default for Live {
     fn default() -> Self {
         Self {
             mapped: AtomicBool::new(false),
+            direct: AtomicBool::new(false),
+            direct_bytes: AtomicU64::new(0),
+            direct_layers: AtomicU64::new(0),
+            direct_filled_layers: AtomicU64::new(0),
+            direct_fill_in_progress: AtomicBool::new(false),
             mapped_bytes: AtomicU64::new(0),
             weight_budget: AtomicU64::new(0),
             partial_expert_slots: AtomicU64::new(0),
@@ -153,6 +163,15 @@ impl Live {
     }
     pub fn store(&self, plan: &super::memory::Plan) {
         self.mapped.store(plan.mapped, Ordering::Release);
+        self.direct.store(plan.direct, Ordering::Release);
+        self.direct_bytes
+            .store(plan.direct_bytes, Ordering::Release);
+        self.direct_layers
+            .store(plan.direct_layers as u64, Ordering::Release);
+        if !plan.direct {
+            self.direct_filled_layers.store(0, Ordering::Release);
+            self.direct_fill_in_progress.store(false, Ordering::Release);
+        }
         self.mapped_bytes
             .store(plan.mapped_bytes, Ordering::Release);
         self.weight_budget.store(plan.budget, Ordering::Release);

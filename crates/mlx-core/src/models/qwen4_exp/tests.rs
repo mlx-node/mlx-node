@@ -40,8 +40,18 @@ pub(super) fn argmax(logits: &MxArray) -> u32 {
         .unwrap()
 }
 
-/// The served load: the mapped pack with `pool_bytes` of paged KV beside it.
+/// The served load with `pool_bytes` of paged KV beside it.
 pub(super) fn go_live(decoder: &mut decoder::Decoder, pool_bytes: u64) {
+    decoder.register_cache_limit();
+    decoder.weights.prepare_mapped_pack().unwrap();
+    decoder.weights.select_residency(pool_bytes).unwrap();
+    decoder.weights.prepare_hot().unwrap();
+    decoder.weights.start_direct_fill().unwrap();
+    decoder.weights.publish_live();
+    decoder.residency_changed();
+}
+
+pub(super) fn go_live_mapped(decoder: &mut decoder::Decoder, pool_bytes: u64) {
     decoder.register_cache_limit();
     decoder.weights.prepare_mapped_pack().unwrap();
     decoder.weights.select_mapped_residency(pool_bytes).unwrap();
@@ -2139,7 +2149,7 @@ fn tiny_decoder() -> (decoder::Decoder, media::Vision) {
 /// pack stream).
 fn inner_over(mut decoder: decoder::Decoder, vision: media::Vision, has_mtp: bool) -> Inner {
     if has_mtp {
-        decoder.weights.finish_fixture_load();
+        decoder.weights.finish_fixture_load().unwrap();
     }
     let tokenizer_dir = Temp::new();
     let tokenizer_path = tokenizer_dir.0.join("tokenizer.json");
@@ -2745,7 +2755,7 @@ fn the_load_builds_the_draft_banks_only_with_the_head() {
 
     let mut text_only = weights::Store::open_fixture(&fixture(), None).unwrap();
     let before = text_only.plan.resident_bank_bytes.load(Ordering::Relaxed);
-    text_only.finish_fixture_load();
+    text_only.finish_fixture_load().unwrap();
     assert_eq!(text_only.mtp_bank_bytes().unwrap(), 0);
     assert_eq!(
         text_only.plan.resident_bank_bytes.load(Ordering::Relaxed),
@@ -7804,8 +7814,9 @@ fn real_model_greedy_argmax_matches_expected() {
     let mut decoder = decoder::Decoder::new(config, store).unwrap();
     go_live(&mut decoder, 0);
     eprintln!(
-        "greedy residency: mapped={} slots={} budget={:.1} GiB window={}",
+        "greedy residency: mapped={} direct={} slots={} budget={:.1} GiB window={}",
         decoder.weights.plan.mapped,
+        decoder.weights.plan.direct,
         decoder.weights.plan.partial_expert_slots,
         decoder.weights.plan.budget as f64 / (1u64 << 30) as f64,
         decoder.prefill_chunk_size
@@ -7817,6 +7828,10 @@ fn real_model_greedy_argmax_matches_expected() {
         "residency".into(),
         serde_json::json!({
             "mapped": decoder.weights.plan.mapped,
+            "direct": decoder.weights.plan.direct,
+            "directBytes": decoder.weights.plan.direct_bytes,
+            "directLayers": decoder.weights.plan.direct_layers,
+            "directFilledLayers": decoder.weights.live.direct_filled_layers.load(Ordering::Acquire),
             "slots": decoder.weights.plan.partial_expert_slots,
         }),
     );
@@ -7926,7 +7941,7 @@ fn real_model_verify_rows_match_ar_steps() {
     let adapter = super::paged::create(&config).unwrap();
     let pool_bytes = adapter.bytes_per_block().unwrap() * u64::from(adapter.block_capacity());
     decoder.paged = Some(adapter);
-    go_live(&mut decoder, pool_bytes);
+    go_live_mapped(&mut decoder, pool_bytes);
     assert!(
         decoder.weights.plan.mapped,
         "the live host refused the pack"
@@ -8382,6 +8397,19 @@ fn group_prompt() -> Vec<u32> {
         .collect()
 }
 
+#[test]
+fn direct_fill_progress_enables_the_layer_major_group_gate() {
+    let mut decoder = group_fixture_decoder(256, 1);
+    decoder.weights.plan.direct = true;
+    decoder.weights.set_direct_fill_pass_for_test(true);
+    assert!(decoder.group_mode(600));
+    decoder.weights.set_direct_fill_pass_for_test(false);
+    assert!(!decoder.group_mode(600));
+    decoder.weights.set_direct_fill_pass_for_test(true);
+    decoder.weights.plan.direct = false;
+    assert!(!decoder.group_mode(600));
+}
+
 fn f32s(a: &MxArray) -> Vec<f32> {
     a.astype(crate::array::DType::Float32)
         .unwrap()
@@ -8774,7 +8802,7 @@ fn real_model_group_matches_window_at_a_time_on_a_cold_pack() {
     let adapter = super::paged::create(&config).unwrap();
     let pool_bytes = adapter.bytes_per_block().unwrap() * u64::from(adapter.block_capacity());
     decoder.paged = Some(adapter);
-    go_live(&mut decoder, pool_bytes);
+    go_live_mapped(&mut decoder, pool_bytes);
     assert!(
         decoder.weights.plan.mapped,
         "the live host refused the pack"
@@ -8935,7 +8963,7 @@ fn real_model_forced_trip_between_sweeps_switches_after_the_frontier_eval() {
     let adapter = super::paged::create(&config).unwrap();
     let pool_bytes = adapter.bytes_per_block().unwrap() * u64::from(adapter.block_capacity());
     decoder.paged = Some(adapter);
-    go_live(&mut decoder, pool_bytes);
+    go_live_mapped(&mut decoder, pool_bytes);
     assert!(
         decoder.weights.plan.mapped,
         "the live host refused the pack"

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use napi::{Error, Result};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use super::row_fetch::{Fetcher, Job};
 use super::tripwire::{Fallback, Live, Tripwire};
@@ -159,81 +160,277 @@ impl Tensor {
     }
 }
 
-/// The single main GGUF whose identity guards direct expert fills. Split
-/// checkpoints keep the established mapped-pack/checkpoint reader.
+/// One main-checkpoint shard in declared split order. `base` is aligned so
+/// the direct window planner can address the whole set without losing the
+/// per-file alignment required by uncached reads. Auxiliary checkpoints are
+/// deliberately not part of this set.
+#[derive(Clone)]
+struct DirectGgufShard {
+    path: PathBuf,
+    identity: String,
+    len: u64,
+    base: u64,
+}
+
+/// The main GGUF shard set whose identities guard direct expert fills.
 #[derive(Clone)]
 pub(super) struct DirectGgufSource {
-    path: PathBuf,
+    shards: Vec<DirectGgufShard>,
     identity: String,
     len: u64,
 }
 
 impl DirectGgufSource {
-    fn new(path: &Path) -> Result<Self> {
-        let path = path.canonicalize().map_err(err)?;
-        let meta = fs::metadata(&path).map_err(err)?;
+    fn set_identity(shards: &[DirectGgufShard]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"qwen4-direct-gguf-v1");
+        for (ordinal, shard) in shards.iter().enumerate() {
+            hasher.update((ordinal as u64).to_le_bytes());
+            hasher.update(shard.base.to_le_bytes());
+            let path = shard.path.as_os_str().as_encoded_bytes();
+            hasher.update((path.len() as u64).to_le_bytes());
+            hasher.update(path);
+            hasher.update((shard.identity.len() as u64).to_le_bytes());
+            hasher.update(shard.identity.as_bytes());
+        }
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn new(paths: &[PathBuf]) -> Result<Self> {
+        if paths.is_empty() {
+            return Err(err("Qwen4 direct GGUF source has no shards"));
+        }
+        let mut shards = Vec::with_capacity(paths.len());
+        let mut seen = HashSet::new();
+        let mut next_base = 0u64;
+        for path in paths {
+            let path = path.canonicalize().map_err(err)?;
+            if !seen.insert(path.clone()) {
+                return Err(err(format!(
+                    "GGUF split set contains duplicate shard '{}'",
+                    path.display()
+                )));
+            }
+            let meta = fs::metadata(&path).map_err(err)?;
+            let base = next_base;
+            let len = meta.len();
+            next_base = base
+                .checked_add(len)
+                .and_then(|end| end.checked_next_multiple_of(crate::utils::gguf_read::ALIGN))
+                .ok_or_else(|| err("Qwen4 direct GGUF logical size overflow"))?;
+            shards.push(DirectGgufShard {
+                identity: source_file_identity_digest(&path, &meta),
+                path,
+                len,
+                base,
+            });
+        }
+        let last = shards
+            .last()
+            .ok_or_else(|| err("Qwen4 direct GGUF source has no shards"))?;
+        let len = last
+            .base
+            .checked_add(last.len)
+            .ok_or_else(|| err("Qwen4 direct GGUF logical size overflow"))?;
+        let identity = Self::set_identity(&shards);
         Ok(Self {
-            identity: source_file_identity_digest(&path, &meta),
-            len: meta.len(),
-            path,
+            shards,
+            identity,
+            len,
         })
     }
 
+    fn has_path(&self, path: &Path) -> bool {
+        self.shards.iter().any(|shard| shard.path == path)
+    }
+
+    fn open_files(&self) -> Result<Vec<File>> {
+        self.shards
+            .iter()
+            .map(|shard| {
+                File::open(&shard.path).map_err(|error| {
+                    err(format!(
+                        "Failed to open GGUF '{}': {error}",
+                        shard.path.display()
+                    ))
+                })
+            })
+            .collect()
+    }
+
     fn verify_path(&self) -> Result<()> {
-        let live = fs::metadata(&self.path).map_err(|e| {
-            err(format!(
-                "Failed to stat GGUF '{}': {e}",
-                self.path.display()
-            ))
-        })?;
-        if live.len() < self.len {
-            return Err(err(format!(
-                "GGUF '{}' is truncated: expected {} bytes, found {}",
-                self.path.display(),
-                self.len,
-                live.len()
-            )));
+        let mut live_shards = Vec::with_capacity(self.shards.len());
+        for expected in &self.shards {
+            let live = fs::metadata(&expected.path).map_err(|e| {
+                err(format!(
+                    "Failed to stat GGUF '{}': {e}",
+                    expected.path.display()
+                ))
+            })?;
+            if live.len() < expected.len {
+                return Err(err(format!(
+                    "GGUF '{}' is truncated: expected {} bytes, found {}",
+                    expected.path.display(),
+                    expected.len,
+                    live.len()
+                )));
+            }
+            let identity = source_file_identity_digest(&expected.path, &live);
+            if live.len() != expected.len || identity != expected.identity {
+                return Err(err(format!(
+                    "GGUF '{}' changed since open; retry the request",
+                    expected.path.display()
+                )));
+            }
+            live_shards.push(DirectGgufShard {
+                identity,
+                path: expected.path.clone(),
+                len: live.len(),
+                base: expected.base,
+            });
         }
-        if live.len() != self.len || source_file_identity_digest(&self.path, &live) != self.identity
-        {
-            return Err(err(format!(
-                "GGUF '{}' changed since open; retry the request",
-                self.path.display()
-            )));
+        if Self::set_identity(&live_shards) != self.identity {
+            return Err(err("GGUF split set changed since open; retry the request"));
         }
         Ok(())
     }
 
-    fn verify(&self, file: &File) -> Result<()> {
-        let live = fs::metadata(&self.path).map_err(|e| {
-            err(format!(
-                "Failed to stat GGUF '{}': {e}",
-                self.path.display()
-            ))
-        })?;
-        let held = file.metadata().map_err(|e| {
-            err(format!(
-                "Failed to stat open GGUF '{}': {e}",
-                self.path.display()
-            ))
-        })?;
-        if live.len() < self.len && live.dev() == held.dev() && live.ino() == held.ino() {
-            return Err(err(format!(
-                "GGUF '{}' is truncated: expected {} bytes, found {}",
-                self.path.display(),
-                self.len,
-                live.len()
-            )));
+    fn verify(&self, files: &[&File]) -> Result<()> {
+        if files.len() != self.shards.len() {
+            return Err(err("Qwen4 direct GGUF shard set is incomplete"));
         }
-        if live.len() != self.len
-            || held.len() != self.len
-            || source_file_identity_digest(&self.path, &live) != self.identity
-            || source_file_identity_digest(&self.path, &held) != self.identity
+        for (expected, file) in self.shards.iter().zip(files) {
+            let live = fs::metadata(&expected.path).map_err(|e| {
+                err(format!(
+                    "Failed to stat GGUF '{}': {e}",
+                    expected.path.display()
+                ))
+            })?;
+            let held = file.metadata().map_err(|e| {
+                err(format!(
+                    "Failed to stat open GGUF '{}': {e}",
+                    expected.path.display()
+                ))
+            })?;
+            if live.len() < expected.len && live.dev() == held.dev() && live.ino() == held.ino() {
+                return Err(err(format!(
+                    "GGUF '{}' is truncated: expected {} bytes, found {}",
+                    expected.path.display(),
+                    expected.len,
+                    live.len()
+                )));
+            }
+            if live.len() != expected.len
+                || held.len() != expected.len
+                || source_file_identity_digest(&expected.path, &live) != expected.identity
+                || source_file_identity_digest(&expected.path, &held) != expected.identity
+            {
+                return Err(err(format!(
+                    "GGUF '{}' changed since open; retry the request",
+                    expected.path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Positional reads over the aligned logical shard address space. A window
+/// may cross a shard boundary; only the virtual alignment gap is synthesized.
+pub(super) struct DirectGgufReader<'a> {
+    source: &'a DirectGgufSource,
+    files: &'a [&'a File],
+}
+
+impl<'a> DirectGgufReader<'a> {
+    pub(super) fn new(source: &'a DirectGgufSource, files: &'a [&'a File]) -> Result<Self> {
+        if files.len() != source.shards.len() {
+            return Err(err("Qwen4 direct GGUF shard set is incomplete"));
+        }
+        Ok(Self { source, files })
+    }
+}
+
+impl crate::utils::gguf_read::ReadAt for DirectGgufReader<'_> {
+    fn read_exact_at(&self, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let last_path = &self.source.shards[self.source.shards.len() - 1].path;
+        let end = off.checked_add(buf.len() as u64).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "GGUF shard '{}': logical read offset overflows",
+                    last_path.display()
+                ),
+            )
+        })?;
+        if end > self.source.len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "GGUF shard '{}': logical read ends at {end}, beyond {} bytes",
+                    last_path.display(),
+                    self.source.len
+                ),
+            ));
+        }
+        let mut index = match self
+            .source
+            .shards
+            .binary_search_by(|shard| shard.base.cmp(&off))
         {
-            return Err(err(format!(
-                "GGUF '{}' changed since open; retry the request",
-                self.path.display()
-            )));
+            Ok(index) => index,
+            Err(index) => index.saturating_sub(1),
+        };
+        let mut offset = off;
+        let mut remaining = buf;
+        while !remaining.is_empty() {
+            let shard = self.source.shards.get(index).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "GGUF shard '{}': split set ended early",
+                        last_path.display()
+                    ),
+                )
+            })?;
+            if offset < shard.base {
+                let n = (shard.base - offset).min(remaining.len() as u64) as usize;
+                remaining[..n].fill(0);
+                offset += n as u64;
+                remaining = &mut remaining[n..];
+                continue;
+            }
+            let shard_end = shard.base + shard.len;
+            if offset >= shard_end {
+                index += 1;
+                continue;
+            }
+            let in_shard = offset - shard.base;
+            let n = (shard.len - in_shard).min(remaining.len() as u64) as usize;
+            std::os::unix::fs::FileExt::read_exact_at(
+                self.files[index],
+                &mut remaining[..n],
+                in_shard,
+            )
+            .map_err(|error| {
+                if self.source.shards.len() == 1 {
+                    error
+                } else {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!("GGUF shard '{}': {error}", shard.path.display()),
+                    )
+                }
+            })?;
+            offset += n as u64;
+            remaining = &mut remaining[n..];
         }
         Ok(())
     }
@@ -527,6 +724,13 @@ pub struct Store {
     draft_bank_budget: u64,
     paired_banks: HashMap<(String, String), Arc<Weight>>,
     slots: HashMap<usize, expert_slots::ExpertSlots>,
+    direct_fill: Option<expert_slots::DirectFill>,
+    direct_fill_remaining: usize,
+    direct_error: Option<String>,
+    /// This turn admitted a layer-major prefill beside a direct fill.
+    direct_fill_pass: bool,
+    /// A slow source keeps its filled banks instead of purging them at idle.
+    direct_slow_source: bool,
     slot_reclaim_since: Option<std::time::Instant>,
     mapped_experts: HashMap<usize, expert_slots::MappedExperts>,
     /// Start of the last forward pass in mapped mode (bank re-wire gate).
@@ -598,7 +802,7 @@ struct SafeDescriptor {
 
 impl Store {
     pub(super) fn check_forward_headroom(&self) -> Result<()> {
-        let mapped = self.plan.mapped;
+        let mapped = self.plan.mapped || self.plan.direct;
         self.check_forward_headroom_with(|| super::memory::check_growth_headroom(mapped))
     }
 
@@ -673,6 +877,9 @@ impl Store {
                 partial_expert_slots: 0,
                 mapped_pack_files: 0,
                 mapped: false,
+                direct: false,
+                direct_bytes: 0,
+                direct_layers: 0,
                 mapped_bytes: 0,
                 mapped_bank_budget: 0,
                 live_non_reclaimable: 0,
@@ -683,6 +890,11 @@ impl Store {
             draft_bank_budget: 0,
             paired_banks: HashMap::new(),
             slots: HashMap::new(),
+            direct_fill: None,
+            direct_fill_remaining: 0,
+            direct_error: None,
+            direct_fill_pass: false,
+            direct_slow_source: false,
             slot_reclaim_since: None,
             mapped_experts: HashMap::new(),
             mapped_pass_start: None,
@@ -942,9 +1154,6 @@ impl Store {
         if count == 0 || count > 1024 {
             return Err(err("Invalid GGUF split count"));
         }
-        let direct_source = (count == 1)
-            .then(|| DirectGgufSource::new(first))
-            .transpose()?;
         if initial
             .metadata
             .get("split.no")
@@ -964,14 +1173,19 @@ impl Store {
         }
         let paths = crate::utils::gguf::resolve_gguf_shards(first, count)?;
         self.metadata = initial.metadata.clone();
-        for (i, path) in paths.into_iter().enumerate() {
+        for (i, path) in paths.iter().enumerate() {
             let i = i as u32;
             let g = if i == 0 {
                 None
             } else {
-                Some(parse_gguf(&path)?)
+                Some(parse_gguf(path)?)
             };
             let g = g.as_ref().unwrap_or(&initial);
+            crate::utils::gguf_source::check_tensor_bounds(
+                g,
+                fs::metadata(path).map_err(err)?.len(),
+                path,
+            )?;
             if g.metadata
                 .get("split.no")
                 .and_then(GgufMetaValue::as_u32)
@@ -1027,10 +1241,12 @@ impl Store {
         {
             return Err(err("GGUF split tensor count mismatch"));
         }
-        if let Some(source) = direct_source {
-            source.verify(&File::open(&source.path).map_err(err)?)?;
-            self.gguf_source = Some(source);
-        }
+        let source = DirectGgufSource::new(&paths)?;
+        source.verify_path()?;
+        let files = source.open_files()?;
+        let file_refs: Vec<&File> = files.iter().collect();
+        source.verify(&file_refs)?;
+        self.gguf_source = Some(source);
         Ok(())
     }
     #[cfg(test)]
@@ -1128,7 +1344,11 @@ impl Store {
         let staging_bytes = total * 3;
         self.evict_to(self.cache_limit.saturating_sub(staging_bytes))?;
         super::memory::maintain_freelist(self.plan.physical_bytes);
-        super::memory::admit(staging_bytes)?;
+        if self.plan.direct {
+            super::memory::admit_direct(staging_bytes)?;
+        } else {
+            super::memory::admit(staging_bytes)?;
+        }
         let subset: Vec<_> = indices.iter().map(|&i| requests[i].clone()).collect();
         let verified = self
             .mapped
@@ -1439,7 +1659,7 @@ impl Store {
         lookup: bool,
         prepared: Option<super::packed_cache::VerifiedChunk>,
     ) -> Result<Arc<Weight>> {
-        let mapped = self.plan.mapped;
+        let mapped = self.plan.mapped || self.plan.direct;
         self.read_impl_with(name, start, rows, lookup, prepared, || {
             super::memory::check_growth_headroom(mapped)
         })
@@ -2870,6 +3090,134 @@ mod mapped_tests {
         fs::write(path, b).unwrap();
     }
 
+    fn write_split_fixture_layout(
+        dir: &Path,
+        label: &str,
+        shards: usize,
+        layers: usize,
+        experts: usize,
+        parts: &[Part; 3],
+    ) -> Vec<PathBuf> {
+        write_split_fixture_layout_with_empty_first(
+            dir, label, shards, layers, experts, parts, false,
+        )
+    }
+
+    fn write_split_fixture_layout_with_empty_first(
+        dir: &Path,
+        label: &str,
+        shards: usize,
+        layers: usize,
+        experts: usize,
+        parts: &[Part; 3],
+        empty_first: bool,
+    ) -> Vec<PathBuf> {
+        assert!(shards > 1);
+        let paths: Vec<PathBuf> = (1..=shards)
+            .map(|ordinal| dir.join(format!("{label}-{ordinal:05}-of-{shards:05}.gguf")))
+            .collect();
+        let mut assignments = vec![Vec::new(); shards];
+        for (index, (layer, part)) in (0..layers)
+            .flat_map(|layer| (0..parts.len()).map(move |part| (layer, part)))
+            .enumerate()
+        {
+            let target = if empty_first {
+                (index % (shards - 1)) + 1
+            } else {
+                index % shards
+            };
+            assignments[target].push((layer, part));
+        }
+        let string = |bytes: &mut Vec<u8>, value: &str| {
+            bytes.extend((value.len() as u64).to_le_bytes());
+            bytes.extend(value.bytes());
+        };
+        let mut state = 0x2545_f491u32;
+        for (shard, assigned) in assignments.into_iter().enumerate() {
+            let mut b = b"GGUF".to_vec();
+            b.extend(3u32.to_le_bytes());
+            b.extend((assigned.len() as u64).to_le_bytes());
+            b.extend(7u64.to_le_bytes());
+            string(&mut b, "general.architecture");
+            b.extend(8u32.to_le_bytes());
+            string(&mut b, "qwen4exp");
+            for (key, value) in [
+                ("split.no", shard as u64),
+                ("split.count", shards as u64),
+                ("split.tensors.count", (layers * parts.len()) as u64),
+                ("qwen4exp.expert_count", experts as u64),
+                ("qwen4exp.expert_used_count", 2),
+            ] {
+                string(&mut b, key);
+                b.extend(10u32.to_le_bytes());
+                b.extend(value.to_le_bytes());
+            }
+            string(&mut b, "general.alignment");
+            b.extend(4u32.to_le_bytes());
+            b.extend(32u32.to_le_bytes());
+            let mut offset = 0u64;
+            for &(layer, part) in &assigned {
+                let (name, rows, width, ty, row_bytes) = parts[part];
+                string(&mut b, &name.replace("blk.0.", &format!("blk.{layer}.")));
+                b.extend(3u32.to_le_bytes());
+                for d in [width as u64, rows as u64, experts as u64] {
+                    b.extend(d.to_le_bytes());
+                }
+                b.extend(ty.to_le_bytes());
+                b.extend(offset.to_le_bytes());
+                offset += (experts * rows * row_bytes) as u64;
+            }
+            while !b.len().is_multiple_of(32) {
+                b.push(0);
+            }
+            for _ in 0..offset {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                b.push((state >> 24) as u8);
+            }
+            fs::write(&paths[shard], b).unwrap();
+        }
+        paths
+    }
+
+    fn open_split_slots(
+        temp: &Temp,
+        label: &str,
+        parts: &[Part; 3],
+        layers: usize,
+        shards: usize,
+    ) -> (Store, Vec<PathBuf>) {
+        let paths = write_split_fixture_layout(&temp.0, label, shards, layers, EXPERTS, parts);
+        let mut store =
+            Store::open_fixture(&paths[0], Some(&temp.0.join(format!("{label}-cache")))).unwrap();
+        store
+            .prepare_mapped_pack_at(&temp.0.join(format!("{label}-pack")))
+            .unwrap();
+        store.slot_capacity = Some(EXPERTS);
+        (store, paths)
+    }
+
+    fn assert_split_read_windows(store: &Store) {
+        let source = store.gguf_source.as_ref().unwrap();
+        assert!(source.shards.len() > 1);
+        assert!(!store.direct_read_windows.is_empty());
+        let mut crossed = false;
+        for &(off, len) in &store.direct_read_windows {
+            let len = len as u64;
+            assert!(len <= 8 << 20 && off % (16 << 10) == 0);
+            for shard in &source.shards {
+                let actual_start = off.max(shard.base);
+                let actual_end = (off + len).min(shard.base + shard.len);
+                if actual_start < actual_end {
+                    assert_eq!((actual_start - shard.base) % (16 << 10), 0);
+                }
+                if off < shard.base && off + len > shard.base {
+                    crossed = true;
+                }
+            }
+        }
+        assert!(crossed, "no direct read window crossed a shard boundary");
+    }
+
     fn encoded(weight: &Weight) -> (Vec<u8>, i32, i32, String) {
         let (arrays, data) = super::super::packed_cache::encode_weight(weight).unwrap();
         let mut tagged = serde_json::to_vec(&arrays).unwrap();
@@ -2984,6 +3332,28 @@ mod mapped_tests {
         store
     }
 
+    fn open_full(temp: &Temp, gguf: &Path, pack: &str, layers: usize, experts: usize) -> Store {
+        let mut store =
+            Store::open_fixture(gguf, Some(&temp.0.join(format!("{pack}-cache")))).unwrap();
+        store.prepare_mapped_pack_at(&temp.0.join(pack)).unwrap();
+        let handled = store
+            .select_direct_residency_with(experts, 0, &mut memory::mapped_plan, &mut |_| Ok(()))
+            .unwrap();
+        assert!(
+            handled,
+            "the single-file fixture must take direct selection"
+        );
+        assert!(store.plan.direct && !store.plan.mapped);
+        assert_eq!(store.plan.direct_layers, layers);
+        assert_eq!(store.plan.partial_expert_slots, experts);
+        assert_eq!(store.plan.mapped_pack_files, 0);
+        assert_eq!(store.plan.mapped_bytes, 0);
+        assert_eq!(store.plan.direct_bytes, store.slot_bytes);
+        assert_eq!(store.cache_bytes, store.slot_bytes);
+        assert_eq!(store.slots.len(), layers);
+        store
+    }
+
     fn raw_fill_bytes(store: &Store, parts: &[Part; 3], ids: &[u32]) -> u64 {
         ids.iter()
             .flat_map(|&expert| {
@@ -3008,11 +3378,23 @@ mod mapped_tests {
         ids: &[u32],
         local: &[u32],
     ) -> Vec<u8> {
+        assert_banks_match_pack_layer(store, 0, parts, banks, ids, local)
+    }
+
+    fn assert_banks_match_pack_layer(
+        store: &Store,
+        layer: usize,
+        parts: &[Part; 3],
+        banks: &[Arc<Weight>; 3],
+        ids: &[u32],
+        local: &[u32],
+    ) -> Vec<u8> {
         let pack = store.mapped.as_ref().unwrap();
         let mut all = Vec::new();
         for (position, &expert) in ids.iter().enumerate() {
             for (part, &(name, rows, ..)) in parts.iter().enumerate() {
-                let request = (name.to_owned(), expert as usize * rows, rows);
+                let name = name.replace("blk.0.", &format!("blk.{layer}."));
+                let request = (name.clone(), expert as usize * rows, rows);
                 let expected = pack
                     .read_batch(std::slice::from_ref(&request))
                     .unwrap()
@@ -3054,6 +3436,331 @@ mod mapped_tests {
             }
         }
         all
+    }
+
+    #[test]
+    fn direct_gguf_split_reader_preserves_bytes_gaps_and_bounds() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let paths = write_split_fixture_layout_with_empty_first(
+            &temp.0,
+            "split-reader",
+            4,
+            2,
+            EXPERTS,
+            &PARTS,
+            true,
+        );
+        assert!(parse_gguf(&paths[0]).unwrap().tensors.is_empty());
+        let source = DirectGgufSource::new(&paths).unwrap();
+        let files = source.open_files().unwrap();
+        let refs: Vec<&File> = files.iter().collect();
+        let reader = DirectGgufReader::new(&source, &refs).unwrap();
+        let mut actual = vec![0u8; source.len as usize];
+        crate::utils::gguf_read::ReadAt::read_exact_at(&reader, &mut actual, 0).unwrap();
+        for (index, shard) in source.shards.iter().enumerate() {
+            let begin = shard.base as usize;
+            let end = begin + shard.len as usize;
+            assert_eq!(&actual[begin..end], fs::read(&paths[index]).unwrap());
+            if let Some(next) = source.shards.get(index + 1) {
+                assert!(
+                    actual[end..next.base as usize]
+                        .iter()
+                        .all(|&byte| byte == 0)
+                );
+            }
+        }
+        let error =
+            crate::utils::gguf_read::ReadAt::read_exact_at(&reader, &mut [0u8; 2], source.len - 1)
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn direct_gguf_split_formats_match_mapped_and_cross_shards() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        for (label, parts) in [
+            ("split-q4k-q5-1", &PARTS),
+            ("split-q5k", &Q5K_PARTS),
+            ("split-q8-bias", &Q8_PARTS),
+        ] {
+            let (mut store, _) = open_split_slots(&temp, label, parts, 2, 3);
+            let ids: Vec<u32> = (0..EXPERTS as u32).collect();
+            for layer in 0..2 {
+                let (banks, local, _) = store
+                    .expert_slots(layer, EXPERTS, 2, &ids)
+                    .unwrap()
+                    .unwrap();
+                assert_banks_match_pack_layer(&store, layer, parts, &banks, &ids, &local);
+            }
+            assert_eq!(store.packed_hits, 0, "{label}: direct reads used the pack");
+            assert_split_read_windows(&store);
+        }
+    }
+
+    #[test]
+    fn direct_gguf_split_full_capacity_and_refill_match_mapped() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let paths = write_split_fixture_layout_with_empty_first(
+            &temp.0,
+            "split-full",
+            4,
+            2,
+            EXPERTS,
+            &PARTS,
+            true,
+        );
+        let mut store = open_full(&temp, &paths[0], "split-full-pack", 2, EXPERTS);
+        let ids: Vec<u32> = (0..EXPERTS as u32).collect();
+        store.activate_expert_slots().unwrap();
+        for refill in 0..2 {
+            for layer in 0..2 {
+                let (banks, local, capacity) = store
+                    .expert_slots(layer, EXPERTS, 2, &ids)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(capacity, EXPERTS);
+                assert_eq!(local, ids);
+                assert_banks_match_pack_layer(&store, layer, &PARTS, &banks, &ids, &local);
+            }
+            assert!(store.device_slots_ready(2));
+            assert_eq!(store.slot_misses, 0);
+            assert_eq!(store.packed_hits, 0);
+            assert!(store.plan.direct && !store.plan.mapped);
+            assert_eq!(store.plan.mapped_pack_files, 0);
+            assert_eq!(store.plan.direct_layers, 2);
+            assert_eq!(store.plan.direct_bytes, store.slot_bytes);
+            if refill == 0 {
+                store.purge_expert_slots().unwrap();
+                store.activate_expert_slots().unwrap();
+            }
+        }
+        assert_eq!(store.slot_upload_bytes, 2 * store.slot_bytes);
+        assert_split_read_windows(&store);
+    }
+
+    #[test]
+    fn direct_gguf_split_source_failures_name_the_failed_shard() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let (mut flipped, paths) = open_split_slots(&temp, "split-flip", &PARTS, 1, 3);
+        let parsed = parse_gguf(&paths[1]).unwrap();
+        let tensor = parsed.tensors.first().unwrap();
+        let at = (parsed.data_offset + tensor.offset) as usize + 8;
+        let mut bytes = fs::read(&paths[1]).unwrap();
+        bytes[at] ^= 0x20;
+        fs::write(&paths[1], bytes).unwrap();
+        let error = flipped.expert_slots(0, EXPERTS, 2, &[0]).err().unwrap();
+        assert!(error.reason.contains("changed since open"), "{error}");
+        assert!(
+            error.reason.contains("split-flip-00002-of-00003.gguf"),
+            "{error}"
+        );
+        assert!(!flipped.device_slots_ready(1));
+
+        let (mut missing, paths) = open_split_slots(&temp, "split-missing", &PARTS, 1, 3);
+        fs::remove_file(&paths[2]).unwrap();
+        let error = missing.expert_slots(0, EXPERTS, 2, &[0]).err().unwrap();
+        assert!(error.reason.contains("Failed to stat GGUF"), "{error}");
+        assert!(
+            error.reason.contains("split-missing-00003-of-00003.gguf"),
+            "{error}"
+        );
+        assert!(!missing.device_slots_ready(1));
+
+        let (mut truncated, paths) = open_split_slots(&temp, "split-truncated", &PARTS, 1, 3);
+        let len = fs::metadata(&paths[1]).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&paths[1])
+            .unwrap()
+            .set_len(len - 1)
+            .unwrap();
+        let error = truncated.expert_slots(0, EXPERTS, 2, &[0]).err().unwrap();
+        assert!(error.reason.contains("truncated"), "{error}");
+        assert!(
+            error.reason.contains("split-truncated-00002-of-00003.gguf"),
+            "{error}"
+        );
+        assert!(!truncated.device_slots_ready(1));
+    }
+
+    #[test]
+    fn direct_gguf_incomplete_or_reordered_splits_fail_before_residency() {
+        let temp = Temp::new();
+        let paths = write_split_fixture_layout(&temp.0, "split-incomplete", 3, 1, EXPERTS, &PARTS);
+        fs::remove_file(&paths[1]).unwrap();
+        let error = match Store::open_fixture(&paths[0], Some(&temp.0.join("incomplete-cache"))) {
+            Ok(_) => panic!("an incomplete split set was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.reason.contains("Expected one GGUF split"), "{error}");
+        assert!(
+            error.reason.contains("split-incomplete-00002-of-00003"),
+            "{error}"
+        );
+
+        let paths = write_split_fixture_layout(&temp.0, "split-reordered", 3, 1, EXPERTS, &PARTS);
+        let held = temp.0.join("split-reordered.held");
+        fs::rename(&paths[0], &held).unwrap();
+        fs::rename(&paths[1], &paths[0]).unwrap();
+        fs::rename(&held, &paths[1]).unwrap();
+        let error = match Store::open_fixture(&paths[0], Some(&temp.0.join("reordered-cache"))) {
+            Ok(_) => panic!("a reordered split set was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error.reason.contains("Inconsistent GGUF split metadata")
+                || error.reason.contains("Open the first GGUF split"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn direct_gguf_full_gate_refusal_keeps_the_existing_slot_path() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("full-gate-refusal.gguf");
+        write_fixture(&gguf);
+        let mut store = Store::open_fixture(&gguf, Some(&temp.0.join("cache"))).unwrap();
+        store.prepare_mapped_pack_at(&temp.0.join("pack")).unwrap();
+        store.slot_capacity = Some(2);
+        let handled = store
+            .select_direct_residency_with(
+                EXPERTS,
+                0,
+                &mut |plan, _, _, _| {
+                    plan.mapped_bank_budget = 1;
+                    plan.live_non_reclaimable = 9;
+                    Err(err("simulated full-bank refusal"))
+                },
+                &mut |_| panic!("a refused gate must not allocate"),
+            )
+            .unwrap();
+        assert!(handled);
+        assert!(!store.plan.direct && !store.plan.mapped);
+        assert!(store.slots.is_empty());
+        assert_eq!(store.slot_bytes, 0);
+        assert_eq!(store.cache_bytes, 0);
+        assert_eq!(store.expert_slot_capacity(EXPERTS, 2).unwrap(), 2);
+        assert_eq!(store.plan.mapped_bank_budget, 1);
+        assert_eq!(store.plan.live_non_reclaimable, 9);
+        assert_eq!(store.plan.mapped_pack_files, 3);
+        assert!(matches!(
+            store.live.fallback(),
+            Some(Fallback::LoadGate { budget: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn direct_gguf_full_capacity_fills_layers_with_identity_and_refills_empty() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        const LAYERS: usize = 3;
+        let temp = Temp::new();
+        let gguf = temp.0.join("full-capacity.gguf");
+        write_fixture_layers(&gguf, LAYERS);
+        let mut store = open_full(&temp, &gguf, "full-capacity-pack", LAYERS, EXPERTS);
+        let source_bytes: u64 = store
+            .tensors
+            .iter()
+            .filter(|(name, _)| name.contains("_exps.weight"))
+            .map(|(_, tensor)| tensor.bytes)
+            .sum();
+        let ids: Vec<u32> = (0..EXPERTS as u32).collect();
+        assert!(!store.device_slots_ready(LAYERS));
+        assert!(store.prefill_device_slots_ready(LAYERS));
+        store.activate_expert_slots().unwrap();
+        assert!(store.direct_fill_pass());
+        for layer in [1, 2, 0] {
+            let (banks, local, capacity) = store
+                .expert_slots(layer, EXPERTS, 2, &ids)
+                .unwrap()
+                .unwrap();
+            assert_eq!(capacity, EXPERTS);
+            assert_eq!(local, ids);
+            assert_banks_match_pack_layer(&store, layer, &PARTS, &banks, &ids, &local);
+        }
+        assert!(store.device_slots_ready(LAYERS));
+        assert_eq!(store.slot_misses, 0);
+        assert_eq!(store.packed_hits, 0);
+        assert_eq!(store.bytes_read, source_bytes);
+        assert_eq!(store.slot_upload_bytes, store.slot_bytes);
+        assert_eq!(store.cache_bytes, store.slot_bytes);
+        assert_eq!(
+            store.live.direct_filled_layers.load(Ordering::Acquire),
+            LAYERS as u64
+        );
+        assert!(!store.direct_read_windows.is_empty());
+        assert!(
+            store
+                .direct_read_windows
+                .iter()
+                .all(|&(off, len)| len <= 8 << 20 && off % (16 << 10) == 0)
+        );
+        assert!(
+            store
+                .commit_device_routes(&[0, 1, 2], &[0, 1, 2], 1)
+                .unwrap()
+        );
+
+        let allocated = store.slot_bytes;
+        let first_upload = store.slot_upload_bytes;
+        store.purge_expert_slots().unwrap();
+        assert!(!store.device_slots_ready(LAYERS));
+        store.activate_expert_slots().unwrap();
+        assert!(store.direct_fill_pass());
+        let before = store.bytes_read;
+        for layer in 0..LAYERS {
+            let (banks, local, _) = store
+                .expert_slots(layer, EXPERTS, 2, &ids)
+                .unwrap()
+                .unwrap();
+            assert_eq!(local, ids);
+            assert_banks_match_pack_layer(&store, layer, &PARTS, &banks, &ids, &local);
+        }
+        assert_eq!(store.bytes_read, before + source_bytes);
+        assert_eq!(store.slot_upload_bytes, first_upload + allocated);
+        assert_eq!(store.slot_bytes, allocated);
+        assert_eq!(store.cache_bytes, allocated);
+        assert_eq!(store.slot_misses, 0);
+        assert!(store.device_slots_ready(LAYERS));
+    }
+
+    #[test]
+    fn direct_gguf_full_fill_error_stays_unpublished_and_rejects_changed_source() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("full-source-error.gguf");
+        write_fixture(&gguf);
+        let mut store = open_full(&temp, &gguf, "full-source-error-pack", 1, EXPERTS);
+        let held = temp.0.join("full-source-error.held");
+        fs::rename(&gguf, &held).unwrap();
+        store.start_direct_fill().unwrap();
+        let error = store.expert_slots(0, EXPERTS, 2, &[0]).err().unwrap();
+        assert!(error.reason.contains("Failed to open GGUF"), "{error}");
+        assert!(!store.device_slots_ready(1));
+        fs::rename(&held, &gguf).unwrap();
+        store.activate_expert_slots().unwrap();
+        let error = store.expert_slots(0, EXPERTS, 2, &[0]).err().unwrap();
+        assert!(error.reason.contains("changed since open"), "{error}");
+        assert_eq!(store.slot_misses, 0);
+        assert!(!store.device_slots_ready(1));
     }
 
     #[test]
@@ -3777,15 +4484,17 @@ mod mapped_tests {
                 "{dir}: the gate charges the bank"
             );
             let mut seen = Vec::new();
-            store.finish_load_with(&mut |_| {
-                // A pack fetch issued before the build starts within this wait.
-                let deadline = Instant::now() + Duration::from_millis(100);
-                while gate.started.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                seen.push(gate.started.load(Ordering::Acquire));
-                Ok(())
-            });
+            store
+                .finish_load_with(&mut |_| {
+                    // A pack fetch issued before the build starts within this wait.
+                    let deadline = Instant::now() + Duration::from_millis(100);
+                    while gate.started.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    seen.push(gate.started.load(Ordering::Acquire));
+                    Ok(())
+                })
+                .unwrap();
             assert_eq!(seen.is_empty(), !head, "{dir}: the build admits its banks");
             assert!(
                 seen.iter().all(|&started| started == 0),
@@ -3822,10 +4531,12 @@ mod mapped_tests {
         write_fixture(&gguf);
         let (mut store, gate, ..) = mapped_load(&temp, &gguf, "mapped", true);
         let mut admissions = 0;
-        store.finish_load_with(&mut |_| {
-            admissions += 1;
-            Err(err("simulated headroom loss at load"))
-        });
+        store
+            .finish_load_with(&mut |_| {
+                admissions += 1;
+                Err(err("simulated headroom loss at load"))
+            })
+            .unwrap();
         assert!(admissions >= 1);
         assert!(store.mtp_banks_declined);
         assert_eq!(store.mtp_bank_bytes().unwrap(), 0);

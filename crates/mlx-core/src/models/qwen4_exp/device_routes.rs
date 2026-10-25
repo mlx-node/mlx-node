@@ -256,7 +256,7 @@ impl Decoder {
     /// put one-row routes on the R-row tape.
     pub(super) fn verify_routes_on_device(&self) -> bool {
         self.gguf()
-            && self.weights.plan.mapped
+            && (self.weights.plan.mapped || self.weights.plan.direct)
             && self.config.hidden_size == 2560
             && self.config.moe_intermediate_size == 640
             && self.config.num_experts == 512
