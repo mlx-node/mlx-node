@@ -227,6 +227,7 @@ fn route_for(t: &GgufTensorInfo, plan: &ImportPlan, gpu: bool) -> Result<Route> 
 /// A tensor's destination while its bands arrive.
 enum Dst {
     Empty,
+    Consumed,
     Repack {
         dst: Option<RepackDst>,
         ptrs: DstPtrs,
@@ -258,6 +259,7 @@ struct ImportGuard<'p> {
     slots: Vec<(MxArray, SendPtr<u8>)>,
     states: Vec<TensorState>,
     gpu: bool,
+    consuming: bool,
     probe: &'p ImportProbe,
 }
 
@@ -265,6 +267,10 @@ impl Drop for ImportGuard<'_> {
     fn drop(&mut self) {
         if self.gpu {
             Stream::default(DeviceType::Gpu).synchronize();
+        } else if self.consuming {
+            // Consumers use the default device even when source repacking
+            // ran entirely on the CPU (including CPU-only builds).
+            synchronize();
         }
         self.probe.event(ImportEvent::GpuSynced);
         self.probe.freed.store(true, Ordering::Release);
@@ -604,6 +610,113 @@ fn alloc_dst(t: &GgufTensorInfo, route: Route, probe: &ImportProbe) -> Result<Ds
     })
 }
 
+fn collect_tensor(
+    t: &GgufTensorInfo,
+    dst: Dst,
+    map: &mut HashMap<String, MxArray>,
+    ple_shards: &mut Option<(String, Vec<MxArray>, usize)>,
+) -> Result<()> {
+    match dst {
+        Dst::Repack { dst: Some(dst), .. } => {
+            let prefix = t.name.strip_suffix(".weight").unwrap_or(&t.name);
+            let RepackDst {
+                weight,
+                scales,
+                biases,
+            } = dst;
+            map.insert(t.name.clone(), weight);
+            if let Some(s) = scales {
+                map.insert(format!("{prefix}.scales"), s);
+            }
+            if let Some(b) = biases {
+                map.insert(format!("{prefix}.biases"), b);
+            }
+        }
+        Dst::Dense { array, .. } => {
+            map.insert(t.name.clone(), array);
+        }
+        Dst::Ple {
+            shards,
+            rows_per_shard,
+        } => {
+            *ple_shards = Some((
+                t.name.clone(),
+                shards.into_iter().map(|(a, _)| a).collect(),
+                rows_per_shard,
+            ));
+        }
+        Dst::Done(arrays) => map.extend(arrays),
+        Dst::Consumed => {}
+        Dst::Empty | Dst::Whole(_) | Dst::Repack { dst: None, .. } => {
+            return Err(Error::from_reason(format!(
+                "GGUF tensor '{}' was not fully read",
+                t.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+type TensorConsumer<'a> = dyn FnMut(HashMap<String, MxArray>) -> Result<()> + 'a;
+
+/// Groups become available only after their last window's GPU and CPU work
+/// completes. Moving their destinations out lets subsequent reads reuse the
+/// source buffers after the model-specific consumer has finished with them.
+struct ConsumeGroups<'a> {
+    groups: Vec<Vec<usize>>,
+    ready: Vec<Vec<usize>>,
+    consume: &'a mut TensorConsumer<'a>,
+}
+
+impl ConsumeGroups<'_> {
+    fn plan(&mut self, windows: &[Window], tensors: usize) -> Result<()> {
+        let mut last = vec![0; tensors];
+        for (w, window) in windows.iter().enumerate() {
+            for band in &window.bands {
+                last[band.tensor] = w;
+            }
+        }
+        self.ready = vec![Vec::new(); windows.len()];
+        let mut seen = HashSet::new();
+        for (group, indices) in self.groups.iter().enumerate() {
+            let mut end = 0;
+            for &i in indices {
+                if i >= tensors || !seen.insert(i) {
+                    return Err(Error::from_reason("invalid GGUF consumer group"));
+                }
+                end = end.max(last[i]);
+            }
+            if !indices.is_empty() {
+                self.ready[end].push(group);
+            }
+        }
+        Ok(())
+    }
+
+    fn complete(&mut self, w: usize, header: &GgufFile, states: &mut [TensorState]) -> Result<()> {
+        for group in std::mem::take(&mut self.ready[w]) {
+            let mut map = HashMap::new();
+            let mut ple = None;
+            for &i in &self.groups[group] {
+                if states[i].bands_left != 0 {
+                    return Err(Error::from_reason(
+                        "GGUF consumer received an incomplete tensor",
+                    ));
+                }
+                let dst = std::mem::replace(&mut states[i].dst, Dst::Consumed);
+                collect_tensor(&header.tensors[i], dst, &mut map, &mut ple)?;
+            }
+            if ple.is_some() {
+                return Err(Error::from_reason(
+                    "GGUF consumer cannot take row-sharded tensors",
+                ));
+            }
+            (self.consume)(map)?;
+        }
+        Ok(())
+    }
+}
+
 /// Read every tensor of `h` into its final arrays (model thread only).
 pub(crate) fn read_gguf_tensors(
     h: &GgufFileHandle,
@@ -632,6 +745,19 @@ pub(crate) fn read_gguf_tensors_with(
     mode: PageCacheMode,
     cfg: &ReadConfig,
     probe: &ImportProbe,
+) -> Result<RawTensors> {
+    read_gguf_tensors_consuming(src, h, plan, backend, mode, cfg, probe, None)
+}
+
+fn read_gguf_tensors_consuming(
+    src: &dyn ReadAt,
+    h: &GgufFileHandle,
+    plan: &ImportPlan,
+    backend: RepackBackend,
+    mode: PageCacheMode,
+    cfg: &ReadConfig,
+    probe: &ImportProbe,
+    mut consumer: Option<&mut ConsumeGroups<'_>>,
 ) -> Result<RawTensors> {
     let started = Instant::now();
     let header: &GgufFile = &h.header;
@@ -662,6 +788,10 @@ pub(crate) fn read_gguf_tensors_with(
             header.tensors[i].name
         )));
     }
+    if let Some(consumer) = consumer.as_mut() {
+        consumer.plan(&windows, header.tensors.len())?;
+    }
+
     let gpu_tensors = routes
         .iter()
         .filter(|r| matches!(r, Route::Gpu(..)))
@@ -685,6 +815,7 @@ pub(crate) fn read_gguf_tensors_with(
             })
             .collect(),
         gpu: gpu_tensors > 0,
+        consuming: consumer.is_some(),
         probe,
     };
     let slot_len = windows.iter().map(|w| w.len).max().unwrap_or(0);
@@ -735,49 +866,13 @@ pub(crate) fn read_gguf_tensors_with(
             cfg,
             probe,
         };
-        run.all()
+        run.all(consumer)
     })?;
 
     let mut map = HashMap::new();
     let mut ple_shards = None;
     for (t, state) in header.tensors.iter().zip(std::mem::take(&mut guard.states)) {
-        match state.dst {
-            Dst::Repack { dst: Some(dst), .. } => {
-                let prefix = t.name.strip_suffix(".weight").unwrap_or(&t.name);
-                let RepackDst {
-                    weight,
-                    scales,
-                    biases,
-                } = dst;
-                map.insert(t.name.clone(), weight);
-                if let Some(s) = scales {
-                    map.insert(format!("{prefix}.scales"), s);
-                }
-                if let Some(b) = biases {
-                    map.insert(format!("{prefix}.biases"), b);
-                }
-            }
-            Dst::Dense { array, .. } => {
-                map.insert(t.name.clone(), array);
-            }
-            Dst::Ple {
-                shards,
-                rows_per_shard,
-            } => {
-                ple_shards = Some((
-                    t.name.clone(),
-                    shards.into_iter().map(|(a, _)| a).collect(),
-                    rows_per_shard,
-                ));
-            }
-            Dst::Done(arrays) => map.extend(arrays),
-            Dst::Empty | Dst::Whole(_) | Dst::Repack { dst: None, .. } => {
-                return Err(Error::from_reason(format!(
-                    "GGUF tensor '{}' was not fully read",
-                    t.name
-                )));
-            }
-        }
+        collect_tensor(t, state.dst, &mut map, &mut ple_shards)?;
     }
     drop(guard);
     if let Some(secs) = timing.first_gib_secs {
@@ -832,7 +927,7 @@ impl Run<'_, '_, '_> {
 
     /// Window `w + slots - 1` reuses the slot of window `w - 1`, so it is
     /// issued only after window `w - 1` completed.
-    fn all(&mut self) -> Result<Timing> {
+    fn all(&mut self, mut consumer: Option<&mut ConsumeGroups<'_>>) -> Result<Timing> {
         let n = self.windows.len();
         let slots = self.guard.slots.len();
         let mut timing = Timing {
@@ -851,6 +946,9 @@ impl Run<'_, '_, '_> {
         for w in 0..n {
             if w > 0 {
                 self.complete(w - 1, &std::mem::take(&mut pending))?;
+                if let Some(consumer) = consumer.as_mut() {
+                    consumer.complete(w - 1, self.header, &mut self.guard.states)?;
+                }
             }
             let next = w + slots - 1;
             if next < n {
@@ -868,6 +966,10 @@ impl Run<'_, '_, '_> {
             MxArray::async_eval_arrays(&refs);
         }
         self.complete(n - 1, &pending)?;
+        drop(pending);
+        if let Some(consumer) = consumer.as_mut() {
+            consumer.complete(n - 1, self.header, &mut self.guard.states)?;
+        }
         Ok(timing)
     }
 
@@ -1196,7 +1298,7 @@ pub(crate) fn transform_imported(
     plan: &ImportPlan,
     opts: &ImportOptions,
 ) -> Result<ImportedWeights> {
-    transform_imported_with_before_dtype(raw, gguf, plan, opts, |_| Ok(()))
+    transform_imported_part(raw, gguf, plan, opts, true, |_| Ok(()))
 }
 
 /// Run `before_dtype` after remapping, layout fixups and CLEF extraction, but
@@ -1206,6 +1308,20 @@ pub(crate) fn transform_imported_with_before_dtype<F>(
     gguf: &GgufFile,
     plan: &ImportPlan,
     opts: &ImportOptions,
+    before_dtype: F,
+) -> Result<ImportedWeights>
+where
+    F: FnOnce(&HashMap<String, MxArray>) -> Result<()>,
+{
+    transform_imported_part(raw, gguf, plan, opts, true, before_dtype)
+}
+
+fn transform_imported_part<F>(
+    raw: HashMap<String, MxArray>,
+    gguf: &GgufFile,
+    plan: &ImportPlan,
+    opts: &ImportOptions,
+    extract_head: bool,
     before_dtype: F,
 ) -> Result<ImportedWeights>
 where
@@ -1230,7 +1346,11 @@ where
 
     // After the GDN fixups (which only touch `linear_attn.*` keys) and before
     // the dtype pass, so head tensors keep their stored f32/f16 precision.
-    let clef_head = extract_clef_head_assets(&mut weights, gguf)?;
+    let clef_head = if extract_head {
+        extract_clef_head_assets(&mut weights, gguf)?
+    } else {
+        None
+    };
 
     before_dtype(&weights)?;
 
@@ -1362,12 +1482,42 @@ fn add_stats(total: &mut LoadStats, part: &LoadStats) {
 }
 
 impl GgufPreload {
+    /// GGUF's usual 2-D conv is reshaped to [C,K,1] by import. An unusual
+    /// unsanitized 3-D conv makes sanitize's norm shift a whole-checkpoint
+    /// decision; retain the ordinary path for that layout rather than deciding
+    /// norms independently in layers that do not carry a conv (or final_norm).
+    pub(crate) fn clef_layers_sanitize_independently(header: &GgufFile) -> bool {
+        header.tensors.iter().all(|tensor| {
+            let key = gguf_name_to_hf_for_metadata(&tensor.name, &header.metadata);
+            !key.is_some_and(|key| key.contains("conv1d.weight"))
+                || tensor.dims.len() <= 2
+                || tensor.dims.first() == Some(&1)
+        })
+    }
+
     /// Model thread only.
     pub(crate) fn load(input: &PreloadInput) -> Result<Self> {
         Self::load_with(input, RepackBackend::Auto)
     }
 
     pub(crate) fn load_with(input: &PreloadInput, backend: RepackBackend) -> Result<Self> {
+        Self::load_consuming(input, backend, None)
+    }
+
+    /// Stream complete backbone layers to CLEF's residency pass. Tables and
+    /// the complete decision head still take the ordinary preload path.
+    pub(crate) fn load_clef(
+        input: &PreloadInput,
+        consume: &mut TensorConsumer<'_>,
+    ) -> Result<Self> {
+        Self::load_consuming(input, RepackBackend::Auto, Some(consume))
+    }
+
+    fn load_consuming(
+        input: &PreloadInput,
+        backend: RepackBackend,
+        mut consume: Option<&mut TensorConsumer<'_>>,
+    ) -> Result<Self> {
         let started = Instant::now();
         let mode = PageCacheMode::from_env()?;
         let (main_path, main_header, main_identity, main_plan) = &input.main;
@@ -1382,7 +1532,45 @@ impl GgufPreload {
             flip: input.flip.clone(),
             ..ImportProbe::default()
         };
-        let raw = read_gguf_tensors_with(
+        let streaming = consume.is_some();
+        let mut groups = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+        if streaming {
+            for (i, tensor) in main_header.tensors.iter().enumerate() {
+                // Use the mapped key so MTP tensors and the decision head are
+                // never confused with backbone layers, even in a shared blk.* namespace.
+                if let Some(key) = gguf_name_to_hf_for_metadata(&tensor.name, &main_header.metadata)
+                {
+                    let key = crate::models::mtp_drafter::strip_wrapper_prefix(&key);
+                    if let Some(rest) = key.strip_prefix("layers.")
+                        && let Some((layer, _)) = rest.split_once('.')
+                        && let Ok(layer) = layer.parse::<usize>()
+                    {
+                        groups.entry(layer).or_default().push(i);
+                    }
+                }
+            }
+        }
+        let mut transform = |map| {
+            let mut imported = transform_imported_part(
+                map,
+                main_header,
+                main_plan,
+                &input.opts,
+                false,
+                |_| Ok(()),
+            )?;
+            materialize(&mut imported.weights, &imported.views)?;
+            match consume.as_deref_mut() {
+                Some(consume) => consume(imported.weights),
+                None => unreachable!("consumer groups require a callback"),
+            }
+        };
+        let mut consumer = ConsumeGroups {
+            groups: groups.into_values().collect(),
+            ready: Vec::new(),
+            consume: &mut transform,
+        };
+        let raw = read_gguf_tensors_consuming(
             &set.main.file,
             &set.main,
             main_plan,
@@ -1390,6 +1578,7 @@ impl GgufPreload {
             mode,
             &ReadConfig::default(),
             &main_probe,
+            streaming.then_some(&mut consumer),
         )?;
         let mut stats = raw.stats.clone();
         let ImportedWeights {
@@ -1791,6 +1980,93 @@ mod tests {
             cfg,
             probe,
         )
+    }
+
+    #[test]
+    fn consumed_groups_are_complete_before_reuse_and_equal_full_read() {
+        require_gpu();
+        let fx = every_type_fixture();
+        let plan = plan(&TILED);
+        let want = oracle(&fx, &plan);
+        for backend in [RepackBackend::Auto, RepackBackend::CpuOnly] {
+            let probe = ImportProbe {
+                record: true,
+                ..ImportProbe::default()
+            };
+            let mut consumed = HashMap::new();
+            let mut calls = 0;
+            let mut consume = |map: HashMap<String, MxArray>| {
+                // Reading every byte here checks the GPU/CPU completion
+                // boundary, including tensors spanning multiple ring slots.
+                for (key, array) in &map {
+                    assert_eq!(le_bytes(array), le_bytes(&want[key]), "{key}");
+                }
+                assert!(!probe.freed.load(Ordering::Acquire));
+                calls += 1;
+                consumed.extend(map);
+                Ok(())
+            };
+            let mut groups = ConsumeGroups {
+                groups: vec![vec![0, 1, 2], vec![3, 4], vec![12, 13, 14, 15]],
+                ready: Vec::new(),
+                consume: &mut consume,
+            };
+            let raw = read_gguf_tensors_consuming(
+                &fx.handle.file,
+                &fx.handle,
+                &plan,
+                backend,
+                PageCacheMode::On,
+                &small_slots(2),
+                &probe,
+                Some(&mut groups),
+            )
+            .unwrap();
+            assert!(consumed.keys().all(|key| !raw.map.contains_key(key)));
+            consumed.extend(raw.map);
+            assert_eq!(calls, 3);
+            assert_maps_equal(&consumed, &want, "streamed groups");
+            assert_eq!(
+                guard_tail(&probe.events.lock().unwrap()),
+                GUARD_ORDER.to_vec()
+            );
+        }
+    }
+
+    #[test]
+    fn consumer_failure_quiesces_readers_and_gpu_before_freeing() {
+        require_gpu();
+        let fx = every_type_fixture();
+        let probe = ImportProbe {
+            record: true,
+            ..ImportProbe::default()
+        };
+        let mut mock = MockRead::new(&fx.handle.file, &probe);
+        mock.sleep_ms = 10;
+        let mut fail = |_| Err(Error::from_reason("injected residency failure"));
+        let mut groups = ConsumeGroups {
+            groups: vec![vec![0]],
+            ready: Vec::new(),
+            consume: &mut fail,
+        };
+        let err = read_gguf_tensors_consuming(
+            &mock,
+            &fx.handle,
+            &plan(&TILED),
+            RepackBackend::Auto,
+            PageCacheMode::On,
+            &small_slots(SLOTS),
+            &probe,
+            Some(&mut groups),
+        )
+        .err()
+        .expect("residency failure must abort preload");
+        assert!(err.reason.contains("injected residency failure"));
+        assert_eq!(mock.after_free.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            guard_tail(&probe.events.lock().unwrap()),
+            GUARD_ORDER.to_vec()
+        );
     }
 
     #[test]
@@ -2317,6 +2593,61 @@ mod tests {
         for (name, want) in want {
             assert_eq!(&got[name], want, "{label}: tensor {name}");
         }
+    }
+
+    #[test]
+    fn streamed_backbone_transform_equals_full_preload() {
+        let work = import_work_dir("streamed-backbone");
+        let fx = write_import_fixture("qwen35-dense-untied", &work);
+        let input = fixture_input(&fx, false);
+        let full = GgufPreload::load(&input).unwrap();
+        let mut streamed = HashMap::new();
+        let mut calls = 0;
+        let rest = GgufPreload::load_clef(&input, &mut |layer| {
+            assert!(layer.keys().all(|key| key.starts_with("model.layers.")));
+            calls += 1;
+            streamed.extend(layer);
+            Ok(())
+        })
+        .unwrap();
+        assert!(calls > 0, "backbone was not streamed");
+        assert!(
+            rest.main
+                .keys()
+                .all(|key| !key.starts_with("model.layers."))
+        );
+        streamed.extend(rest.main);
+        assert_maps_equal(&streamed, &full.main, "streamed transformed backbone");
+        assert_eq!(rest.identity, full.identity);
+        assert_eq!(rest.stats.bytes, full.stats.bytes);
+        assert_eq!(rest.stats.gpu_tensors, full.stats.gpu_tensors);
+        assert_eq!(rest.stats.cpu_tensors, full.stats.cpu_tensors);
+        fs::remove_dir_all(work).unwrap();
+    }
+
+    #[test]
+    fn streamed_preload_rechecks_source_after_residency() {
+        let work = import_work_dir("streamed-recheck");
+        let fx = write_import_fixture("qwen35-dense-untied", &work);
+        let input = fixture_input(&fx, false);
+        let mut changed = false;
+        let err = GgufPreload::load_clef(&input, &mut |_| {
+            if !changed {
+                let file = fs::OpenOptions::new().write(true).open(&fx.main).unwrap();
+                file.set_len(file.metadata().unwrap().len() + 1).unwrap();
+                changed = true;
+            }
+            Ok(())
+        })
+        .err()
+        .expect("a source changed during residency must be rejected");
+        assert!(changed, "residency callback did not run");
+        assert!(
+            err.reason.contains("changed during the load"),
+            "{}",
+            err.reason
+        );
+        fs::remove_dir_all(work).unwrap();
     }
 
     #[test]

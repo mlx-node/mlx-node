@@ -61,7 +61,7 @@ pub(crate) static TEST_FREE_RELEASED_SITES: std::sync::Mutex<std::collections::B
 
 /// While alive, each build eval point on this thread that can free source
 /// arrays ([`materialize_weights`] chunks, `release_tiled_kquant_sources`,
-/// each CLEF residency unit) also returns the freed buffers to the OS. Enable it for a build over a map
+/// eager CLEF residency units) also returns the freed buffers to the OS. Enable it for a build over a map
 /// whose arrays are all materialized up front (GGUF preload): nothing later in
 /// the build allocates source-sized buffers, so the freed sources would
 /// otherwise pile up in the MLX buffer cache until the build ends (+5.4 GiB

@@ -1548,6 +1548,20 @@ fn apply_clef_residency(
     HashMap<String, crate::quant::prism_hadamard::HadamardTransform>,
     i64,
 )> {
+    apply_clef_residency_impl(params, per_layer_quant, default_plq, residency, true)
+}
+
+type ClefTransforms = HashMap<String, crate::quant::prism_hadamard::HadamardTransform>;
+
+/// With `finish=false`, the enclosing GGUF import owns the final synchronize
+/// and clear. Retain released source/scratch buffers for subsequent layers.
+fn apply_clef_residency_impl(
+    params: &mut HashMap<String, MxArray>,
+    per_layer_quant: &mut HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+    residency: ClefResidency,
+    finish: bool,
+) -> Result<(ClefTransforms, i64)> {
     let mut transforms = HashMap::new();
     let mut byte_delta = 0i64;
     if !is_quantized_checkpoint(params) {
@@ -1640,11 +1654,9 @@ fn apply_clef_residency(
                 byte_delta += group_bytes(params, &prefix) - packed_bytes;
             }
         }
-        crate::array::memory::free_released_sources();
-    }
-    if requantized > 0 {
-        // The bf16 intermediates are dead once the int8 pair is evaluated.
-        crate::array::memory::synchronize_and_clear_cache();
+        if finish {
+            crate::array::memory::free_released_sources();
+        }
     }
     if requantized + dequantized > 0 {
         info!(
@@ -1698,6 +1710,7 @@ fn apply_weights_inner(
         _has_vision,
         prism,
         None,
+        None,
     )
     .map(drop)
 }
@@ -1738,6 +1751,9 @@ fn apply_weights_inner_with_residency(
     //     lm_head stay packed: the lookup/gather paths already read packed
     //     rows directly.
     clef: Option<ClefResidency>,
+    // Streaming GGUF residency is already reflected in params and its byte
+    // count. Carry its rotations into installation without requantizing again.
+    prepared_clef: Option<ClefTransforms>,
 ) -> Result<(PlainFp8Residency, i64)> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
@@ -1783,7 +1799,10 @@ fn apply_weights_inner_with_residency(
                     "CLEF decision models do not support prism_hadamard checkpoints",
                 ));
             }
-            apply_clef_residency(params, &mut per_layer_quant, default_plq, residency)?
+            match prepared_clef {
+                Some(transforms) => (transforms, 0),
+                None => apply_clef_residency(params, &mut per_layer_quant, default_plq, residency)?,
+            }
         }
         None => (HashMap::new(), 0),
     };
@@ -2704,6 +2723,14 @@ async fn load_with_thread_impl(
                 let mut checkpoint_load =
                     CheckpointLoadGuard::before_read(checkpoint_files, persist_cold);
 
+                // Parse quantization metadata before sanitizing: the sanitize
+                // pass may fuse matching GDN split buffers, and it must retain
+                // them as two projections when their declared packing profiles
+                // differ even if their physical array shapes happen to match.
+                let quant_cfg = select_quantization_block(&raw)?;
+                let (quant_bits, quant_group_size, top_level_mode, mut per_layer_quant) =
+                    parse_quant_settings(quant_cfg, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE)?;
+
                 // Load all weights. MTPLX-compatible artifacts can store the MTP
                 // module in an external sidecar (usually `mtp.safetensors`) instead
                 // of embedding it in the main model shards. When present, prefer
@@ -2711,7 +2738,64 @@ async fn load_with_thread_impl(
                 // cannot leave duplicate `mtp.*` entries racing during sanitize.
                 let _free_released =
                     crate::array::memory::FreeReleasedSources::enable(preload_input.is_some());
-                let mut preload = preload_input.as_ref().map(GgufPreload::load).transpose()?;
+                let mut streamed_params = HashMap::new();
+                let mut clef_layers_finalized = 0usize;
+                let mut prepared_clef = None;
+                let mut preload = match preload_input.as_ref() {
+                    Some(input)
+                        if clef
+                            && GgufPreload::clef_layers_sanitize_independently(&input.main.1) =>
+                    {
+                        if prism_config.is_some() {
+                            return Err(Error::from_reason(
+                                "CLEF decision models do not support prism_hadamard checkpoints",
+                            ));
+                        }
+                        let mut transforms = HashMap::new();
+                        let preload = GgufPreload::load_clef(input, &mut |mut layer| {
+                            // Identical source expansion and sanitize order to
+                            // load_checkpoint + the ordinary CLEF load. Keep a
+                            // whole layer together for split GDN and mixed MLPs.
+                            crate::engine::persistence::expand_symmetric_affine_biases(
+                                path, &mut layer,
+                            )?;
+                            let mut layer =
+                                sanitize_weights(layer, &config, &per_layer_quant, false)?;
+                            let default_mode =
+                                resolve_default_mode(top_level_mode, is_mxfp8_checkpoint(&layer));
+                            let default_plq =
+                                default_per_layer_quant(quant_bits, quant_group_size, default_mode);
+                            let residency =
+                                resolve_clef_residency(is_quantized_checkpoint(&layer), unsafe {
+                                    mlx_sys::mlx_metal_is_nax_available()
+                                });
+                            clef_layers_finalized += 1;
+                            let (rotations, _) = apply_clef_residency_impl(
+                                &mut layer,
+                                &mut per_layer_quant,
+                                default_plq,
+                                residency,
+                                clef_layers_finalized.is_multiple_of(4),
+                            )?;
+                            // Only the bf16 fallback needs a separate eval to
+                            // release its lazy source graph before the next layer.
+                            if residency == ClefResidency::Bf16 {
+                                let arrays: Vec<&MxArray> = layer.values().collect();
+                                MxArray::eval_arrays_with_context(
+                                    &arrays,
+                                    "CLEF streamed residency",
+                                )?;
+                            }
+                            transforms.extend(rotations);
+                            streamed_params.extend(layer);
+                            Ok(())
+                        })?;
+                        prepared_clef = Some(transforms);
+                        Some(preload)
+                    }
+                    Some(input) => Some(GgufPreload::load(input)?),
+                    None => None,
+                };
                 if let Some(preload) = preload.as_ref() {
                     let stats = &preload.stats;
                     info!(
@@ -2847,14 +2931,6 @@ async fn load_with_thread_impl(
                     (raw_params, None)
                 };
 
-                // Parse quantization metadata before sanitizing: the sanitize
-                // pass may fuse matching GDN split buffers, and it must retain
-                // them as two projections when their declared packing profiles
-                // differ even if their physical array shapes happen to match.
-                let quant_cfg = select_quantization_block(&raw)?;
-                let (quant_bits, quant_group_size, top_level_mode, mut per_layer_quant) =
-                    parse_quant_settings(quant_cfg, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE)?;
-
                 // Sanitize weights
                 let mut params = sanitize_weights(
                     text_raw_params,
@@ -2862,6 +2938,9 @@ async fn load_with_thread_impl(
                     &per_layer_quant,
                     prism_config.is_some(),
                 )?;
+                // These arrays already passed source expansion, sanitization
+                // and residency; never run those transforms a second time.
+                params.extend(streamed_params);
                 let quantized = is_quantized_checkpoint(&params);
                 info!(
                     "Sanitized to {} parameters (quantized={})",
@@ -2971,10 +3050,11 @@ async fn load_with_thread_impl(
                     has_vision,
                     prism_runtime.as_ref(),
                     clef_residency,
+                    prepared_clef,
                 )?;
-                // The CLEF pre-pass swapped packed backbone groups for int8 or
-                // bf16 arrays; the pre-installation count above saw the
-                // packed sizes.
+                // A Dir load's CLEF pre-pass replaced packed groups with int8
+                // or bf16. Streamed GGUF arrays were counted after residency,
+                // so their installation returns a zero delta.
                 let text_weight_bytes = (text_weight_bytes as i64)
                     .saturating_add(clef_byte_delta)
                     .max(0) as u64;
@@ -3855,6 +3935,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .expect_err("the intentionally partial checkpoint must fail completeness validation");
         assert!(
@@ -4130,6 +4211,7 @@ mod tests {
             Some(PerLayerMode::Affine),
             &per_layer_quant,
             false,
+            None,
             None,
             None,
         )
@@ -5865,6 +5947,43 @@ mod tests {
     }
 
     #[test]
+    fn clef_streaming_retains_global_norm_shift_for_unsanitized_conv() {
+        use crate::utils::gguf::{GgufFile, GgufMetaValue, GgufTensorInfo, GgufTensorType};
+        let mut header = GgufFile {
+            version: 3,
+            tensor_count: 1,
+            alignment: 32,
+            data_offset: 0,
+            metadata: HashMap::from([(
+                "general.architecture".into(),
+                GgufMetaValue::String("clef".into()),
+            )]),
+            tensors: vec![GgufTensorInfo {
+                name: "blk.0.ssm_conv1d.weight".into(),
+                n_dims: 2,
+                dims: vec![4, 128],
+                tensor_type: GgufTensorType::F32,
+                offset: 0,
+            }],
+        };
+        assert!(
+            GgufPreload::clef_layers_sanitize_independently(&header),
+            "2-D GGUF conv is normalized by import"
+        );
+        header.tensors[0].n_dims = 3;
+        header.tensors[0].dims = vec![1, 4, 128];
+        assert!(
+            GgufPreload::clef_layers_sanitize_independently(&header),
+            "already-sanitized conv"
+        );
+        header.tensors[0].dims = vec![4, 1, 128];
+        assert!(
+            !GgufPreload::clef_layers_sanitize_independently(&header),
+            "norm shift must stay global"
+        );
+    }
+
+    #[test]
     fn clef_residency_defaults_to_sym8_only_with_nax() {
         use ClefResidency::*;
         assert_eq!(resolve_clef_residency(true, true), Sym8);
@@ -6026,34 +6145,103 @@ mod tests {
     }
 
     #[test]
-    fn clef_residency_frees_each_unit_only_under_the_guard() {
+    fn clef_streamed_residency_reuses_buffers_and_matches_full_map() {
         use crate::array::memory::{FreeReleasedSources, TEST_CLEAR_CACHE_CALLS};
-        let label = "clef_residency_frees_each_unit_only_under_the_guard";
-        let Some((before, default_plq)) = clef_affine_fixture(label) else {
+        let label = "clef_streamed_residency_reuses_buffers_and_matches_full_map";
+        let Some((mut before, default_plq)) = clef_affine_fixture(label) else {
             return;
         };
-        let clears = |guard: bool| {
-            let _free = guard.then(|| FreeReleasedSources::enable(true));
-            let mut params = before.clone();
-            let mut per_layer_quant =
-                HashMap::from([("layers.0.linear_attn.out_proj".to_string(), clef_sym8_plq())]);
-            let start = TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get);
-            apply_clef_residency(
-                &mut params,
-                &mut per_layer_quant,
-                default_plq,
-                ClefResidency::Sym8,
-            )
-            .unwrap();
-            TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get) - start
-        };
-        assert_eq!(clears(false), 0, "lazy-map residency cleared the cache");
-        assert_eq!(
-            clears(true),
-            4,
-            "preload residency must clear once per unit (in_proj_ba, in_proj_qkvz, out_proj, mlp)"
+        // A second complete layer, with one Hadamard-eligible projection.
+        for (key, value) in before.clone() {
+            if key.starts_with("layers.0.") {
+                before.insert(key.replacen("layers.0.", "layers.1.", 1), value);
+            }
+        }
+        let dense = clef_dense_or_skip(label, 64, 1024, 71).unwrap();
+        insert_affine_group(
+            &mut before,
+            "layers.1.linear_attn.in_proj_qkvz",
+            &dense,
+            8,
+            32,
         );
-        assert_eq!(clears(false), 0, "guard leaked past its scope");
+        for residency in [ClefResidency::Sym8, ClefResidency::Bf16] {
+            let source_quant = HashMap::from([
+                ("layers.0.linear_attn.out_proj".to_string(), clef_sym8_plq()),
+                ("layers.1.linear_attn.out_proj".to_string(), clef_sym8_plq()),
+            ]);
+            let mut full = before.clone();
+            let mut full_quant = source_quant.clone();
+            let (full_rotations, full_delta) =
+                apply_clef_residency(&mut full, &mut full_quant, default_plq, residency).unwrap();
+            let mut streamed = before.clone();
+            let mut streamed_quant = source_quant;
+            let mut rotations = HashMap::new();
+            let mut delta = 0;
+            {
+                let _free = FreeReleasedSources::enable(true);
+                let start = TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get);
+                for layer in ["layers.0.", "layers.1."] {
+                    let keys: Vec<_> = streamed
+                        .keys()
+                        .filter(|k| k.starts_with(layer))
+                        .cloned()
+                        .collect();
+                    let mut part = keys
+                        .into_iter()
+                        .map(|key| {
+                            let array = streamed.remove(&key).unwrap();
+                            (key, array)
+                        })
+                        .collect();
+                    let (part_rotations, part_delta) = apply_clef_residency_impl(
+                        &mut part,
+                        &mut streamed_quant,
+                        default_plq,
+                        residency,
+                        false,
+                    )
+                    .unwrap();
+                    MxArray::eval_arrays_with_context(&part.values().collect::<Vec<_>>(), label)
+                        .unwrap();
+                    rotations.extend(part_rotations);
+                    delta += part_delta;
+                    streamed.extend(part);
+                }
+                assert_eq!(
+                    TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get),
+                    start,
+                    "streaming must retain scratch for subsequent source reads"
+                );
+                crate::array::memory::free_released_sources();
+                assert_eq!(
+                    TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get),
+                    start + 1,
+                    "the outer preload guard must still protect installation"
+                );
+            }
+            let start = TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get);
+            crate::array::memory::free_released_sources();
+            assert_eq!(
+                TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get),
+                start,
+                "guard leaked"
+            );
+            assert_eq!(streamed_quant, full_quant);
+            assert_eq!(delta, full_delta);
+            assert_eq!(
+                crate::utils::gguf_import::gate::manifest(&streamed),
+                crate::utils::gguf_import::gate::manifest(&full)
+            );
+            assert_eq!(rotations.len(), full_rotations.len());
+            for (key, rotation) in rotations {
+                assert_eq!(rotation.block_size, full_rotations[&key].block_size);
+                assert_eq!(
+                    rotation.signs.to_float32().unwrap().to_vec(),
+                    full_rotations[&key].signs.to_float32().unwrap().to_vec()
+                );
+            }
+        }
     }
 
     #[test]
@@ -6291,6 +6479,7 @@ mod tests {
             false,
             None,
             Some(ClefResidency::Sym8),
+            None,
         )
         .expect_err("the intentionally partial checkpoint must fail completeness validation");
         assert!(
@@ -6522,6 +6711,7 @@ mod tests {
             false,
             None,
             Some(ClefResidency::Sym8),
+            None,
         )
         .expect_err("the intentionally partial checkpoint must fail completeness validation");
         assert!(
@@ -6888,6 +7078,7 @@ mod tests {
             false,
             None,
             Some(ClefResidency::Sym8),
+            None,
         )
         .expect_err("the intentionally partial checkpoint must fail completeness validation");
         assert!(
