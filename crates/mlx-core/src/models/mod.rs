@@ -101,7 +101,7 @@ mod free_released_wiring_tests {
                         .map(drop)
                 }
                 NativeGgufFamily::Qwen35Moe => {
-                    super::qwen3_5_moe::persistence::load_with_source(&source)
+                    super::qwen3_5_moe::persistence::load_with_source(&source, None, None)
                         .await
                         .map(drop)
                 }

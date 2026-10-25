@@ -5748,7 +5748,7 @@ async fn convert_gguf_to_safetensors_inner(
                         identity,
                         &gguf,
                         weights,
-                        qwen35_inline_mtp_index,
+                        qwen35_inline_mtp_index(&gguf)?,
                     )
                 })
                 .transpose()?;

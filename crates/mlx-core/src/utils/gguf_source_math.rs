@@ -6,7 +6,9 @@
 //! so the marker can safely bind the manifest without a digest cycle.
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
+#[cfg(test)]
+use std::io::Read;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,7 @@ const PAYLOAD: &str = "weights.safetensors";
 const CONTRACT: &str = "qwen35moe-original-f32-norms-v1";
 const MAPPING: &str = "gguf-qwen35moe-hf-v1";
 const MAX_MANIFEST: u64 = 128 * 1024;
+#[cfg(test)]
 const MAX_PAYLOAD: u64 = 1024 * 1024;
 const EXPECTED_BYTES: usize = 684_032;
 
@@ -363,6 +366,7 @@ pub(super) fn bf16_bytes(f32_bytes: &[u8]) -> Result<Vec<u8>> {
     }
     Ok(output)
 }
+#[cfg(test)]
 fn bounded_read(path: &Path, maximum: u64) -> Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() || metadata.len() > maximum {
@@ -377,6 +381,7 @@ fn bounded_read(path: &Path, maximum: u64) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+#[cfg(test)]
 fn private_directory(root: &Path) -> Result<std::path::PathBuf> {
     let dir = root.join(PRIVATE_DIR);
     if !fs::symlink_metadata(&dir)?.file_type().is_dir() {
@@ -386,6 +391,7 @@ fn private_directory(root: &Path) -> Result<std::path::PathBuf> {
 }
 /// Validate owned small bytes on a cache hit. Never follow a path supplied by
 /// the manifest; filenames and tensor set are fixed by this schema.
+#[cfg(test)]
 pub(super) fn validate(
     root: &Path,
     identity: &ImportIdentity,
@@ -488,6 +494,7 @@ pub(super) fn validate(
 }
 /// Marker parsing is exact and rejects duplicate declarations. An old native
 /// directory remains native-only; it cannot satisfy this new-layout cache hit.
+#[cfg(test)]
 pub(super) fn cache_is_current(root: &Path, identity: &ImportIdentity) -> bool {
     let Ok(marker) = bounded_read(&root.join(".complete"), 32 * 1024) else {
         return false;

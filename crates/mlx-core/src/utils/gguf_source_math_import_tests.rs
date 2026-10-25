@@ -1,4 +1,6 @@
 // Included in gguf::tests so fixtures exercise the real converter/cache path.
+use crate::utils::gguf_test_fixtures::qwen35_moe_standalone_metadata;
+
 fn source_operand_fixture(root: &Path) -> PathBuf {
     source_operand_fixture_with_inline_mtp(root, false)
 }
