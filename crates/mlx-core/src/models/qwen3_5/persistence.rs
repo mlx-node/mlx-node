@@ -1562,6 +1562,26 @@ fn apply_clef_residency_impl(
     residency: ClefResidency,
     finish: bool,
 ) -> Result<(ClefTransforms, i64)> {
+    let mut signs_by_width = HashMap::new();
+    apply_clef_residency_with_signs(
+        params,
+        per_layer_quant,
+        default_plq,
+        residency,
+        finish,
+        &mut signs_by_width,
+    )
+}
+
+/// The caller owns `signs_by_width` so streamed layers share one sign array per K.
+fn apply_clef_residency_with_signs(
+    params: &mut HashMap<String, MxArray>,
+    per_layer_quant: &mut HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+    residency: ClefResidency,
+    finish: bool,
+    signs_by_width: &mut HashMap<i64, MxArray>,
+) -> Result<(ClefTransforms, i64)> {
     let mut transforms = HashMap::new();
     let mut byte_delta = 0i64;
     if !is_quantized_checkpoint(params) {
@@ -1590,7 +1610,6 @@ fn apply_clef_residency_impl(
     let mut rotated = 0usize;
     let mut dequantized = 0usize;
     let mut kept: Vec<String> = Vec::new();
-    let mut signs_by_width: HashMap<i64, MxArray> = HashMap::new();
     for unit in clef_residency_units(&prefixes) {
         if unit[0] == "embedding" || unit[0] == "lm_head" {
             continue;
@@ -1626,7 +1645,7 @@ fn apply_clef_residency_impl(
         for (prefix, dense) in decoded {
             let packed_bytes = group_bytes(params, &prefix);
             if unit_sym8 {
-                let transform = clef_sym8_transform(dense.shape_at(1)?, &mut signs_by_width)?;
+                let transform = clef_sym8_transform(dense.shape_at(1)?, signs_by_width)?;
                 // Rotate in f32: `apply` computes in f32 and casts back to
                 // its input dtype, so a bf16 input would round the rotated
                 // weight to bf16 before the int8 quantizer sees it.
@@ -2752,6 +2771,7 @@ async fn load_with_thread_impl(
                             ));
                         }
                         let mut transforms = HashMap::new();
+                        let mut signs_by_width = HashMap::new();
                         let preload = GgufPreload::load_clef(input, &mut |mut layer| {
                             // Identical source expansion and sanitize order to
                             // load_checkpoint + the ordinary CLEF load. Keep a
@@ -2770,13 +2790,14 @@ async fn load_with_thread_impl(
                                     mlx_sys::mlx_metal_is_nax_available()
                                 });
                             clef_layers_finalized += 1;
-                            let (rotations, _) = apply_clef_residency_impl(
+                            let (rotations, _) = apply_clef_residency_with_signs(
                                 &mut layer,
                                 &mut per_layer_quant,
                                 default_plq,
                                 residency,
                                 clef_layers_finalized == 2
                                     || clef_layers_finalized.is_multiple_of(4),
+                                &mut signs_by_width,
                             )?;
                             // Only the bf16 fallback needs a separate eval to
                             // release its lazy source graph before the next layer.
@@ -6141,6 +6162,92 @@ mod tests {
                 a.shape().unwrap().as_ref(),
                 b.shape().unwrap().as_ref(),
                 "{key} shape"
+            );
+        }
+    }
+
+    #[test]
+    fn clef_streamed_residency_shares_signs_across_invocations() {
+        let label = "clef_streamed_residency_shares_signs_across_invocations";
+        let Some(dense) = clef_dense_or_skip(label, 64, 1024, 71) else {
+            return;
+        };
+        let mut source = HashMap::new();
+        for prefix in [
+            "layers.0.linear_attn.in_proj_qkvz",
+            "layers.1.linear_attn.in_proj_qkvz",
+        ] {
+            insert_affine_group(&mut source, prefix, &dense, 8, 32);
+        }
+        let default_plq = default_per_layer_quant(8, 32, PerLayerMode::Affine);
+        let mut full = source.clone();
+        let mut full_quant = HashMap::new();
+        let (full_rotations, full_delta) =
+            apply_clef_residency(&mut full, &mut full_quant, default_plq, ClefResidency::Sym8)
+                .unwrap();
+
+        let mut streamed = source;
+        let mut streamed_quant = HashMap::new();
+        let mut signs_by_width = HashMap::new();
+        let mut rotations = HashMap::new();
+        let mut invocation_signs = Vec::new();
+        let mut delta = 0;
+        for layer in [0, 1] {
+            let layer_prefix = format!("layers.{layer}.");
+            let keys: Vec<_> = streamed
+                .keys()
+                .filter(|key| key.starts_with(&layer_prefix))
+                .cloned()
+                .collect();
+            let mut part = keys
+                .into_iter()
+                .map(|key| {
+                    let array = streamed.remove(&key).unwrap();
+                    (key, array)
+                })
+                .collect();
+            let prefix = format!("{layer_prefix}linear_attn.in_proj_qkvz");
+            let (part_rotations, part_delta) = apply_clef_residency_with_signs(
+                &mut part,
+                &mut streamed_quant,
+                default_plq,
+                ClefResidency::Sym8,
+                false,
+                &mut signs_by_width,
+            )
+            .unwrap();
+            MxArray::eval_arrays_with_context(&part.values().collect::<Vec<_>>(), label).unwrap();
+            invocation_signs.push(part_rotations[&prefix].signs.clone());
+            rotations.extend(part_rotations);
+            delta += part_delta;
+            streamed.extend(part);
+        }
+
+        assert_eq!(invocation_signs.len(), 2);
+        assert_eq!(invocation_signs[0].shape_at(0).unwrap(), 1024);
+        assert_eq!(invocation_signs[1].shape_at(0).unwrap(), 1024);
+        assert_eq!(signs_by_width.len(), 1);
+        assert_eq!(
+            invocation_signs[0].as_raw_ptr(),
+            invocation_signs[1].as_raw_ptr(),
+            "streamed invocations must reuse sign storage for repeated K"
+        );
+        assert_eq!(streamed_quant, full_quant);
+        assert_eq!(delta, full_delta);
+        assert_eq!(
+            crate::utils::gguf_import::gate::manifest(&streamed),
+            crate::utils::gguf_import::gate::manifest(&full)
+        );
+        assert_eq!(rotations.len(), full_rotations.len());
+        for (key, rotation) in rotations {
+            assert_eq!(rotation.block_size, full_rotations[&key].block_size);
+            assert_eq!(
+                rotation.gdn_permutation,
+                full_rotations[&key].gdn_permutation
+            );
+            assert_eq!(
+                rotation.signs.to_float32().unwrap().to_vec(),
+                full_rotations[&key].signs.to_float32().unwrap().to_vec()
             );
         }
     }
