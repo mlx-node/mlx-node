@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 const DIRECT_READ_BYTES: usize = 8 << 20;
 const DIRECT_STAGING_SLOTS: usize = 4;
+pub(in super::super) const DIRECT_STAGING_BYTES: u64 =
+    (DIRECT_READ_BYTES * DIRECT_STAGING_SLOTS) as u64;
 const SLOT_RECLAIM_FALLBACK: Duration = Duration::from_secs(30);
 
 /// The fused expert kernels' bank contract (K-quant gate/up, affine down).
@@ -145,6 +147,22 @@ impl Tensor {
 }
 
 impl ExpertSlots {
+    fn suspended_bank_bytes(&self) -> Result<u64> {
+        if !self.suspended {
+            return Ok(0);
+        }
+        let Some(storage) = &self.storage else {
+            return Ok(0);
+        };
+        storage.iter().try_fold(0u64, |total, slot| {
+            slot.storage.iter().try_fold(total, |total, bank| {
+                total
+                    .checked_add(bank.nbytes() as u64)
+                    .ok_or_else(|| err("Qwen4 suspended bank size overflow"))
+            })
+        })
+    }
+
     fn activate(&mut self) -> Result<()> {
         if !self.suspended {
             return Ok(());
@@ -1023,7 +1041,17 @@ impl Store {
         Ok(())
     }
 
+    fn check_activation_refusal(&self) -> Result<()> {
+        if let Some(error) = &self.activation_error {
+            return Err(err(format!(
+                "Qwen4 expert bank activation refused: {error}"
+            )));
+        }
+        Ok(())
+    }
+
     fn wait_direct_layer(&mut self, layer: usize) -> Result<()> {
+        self.check_activation_refusal()?;
         if self
             .slots
             .get(&layer)
@@ -1110,17 +1138,45 @@ impl Store {
     }
 
     pub(in super::super) fn activate_expert_slots(&mut self) -> Result<()> {
+        self.activate_expert_slots_with(&mut super::super::memory::admit_direct)
+    }
+
+    pub(in super::super) fn activate_expert_slots_with(
+        &mut self,
+        admit: &mut impl FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
         if self
             .slot_reclaim_since
             .is_some_and(|since| since.elapsed() >= SLOT_RECLAIM_FALLBACK)
         {
             self.purge_expert_slots()?;
         }
+        let retrying_activation_refusal = self.activation_error.is_some();
+        // Suspended banks are still reclaimable in the live host sample;
+        // active banks are already counted there and must not be admitted again.
+        let suspended_bytes = self.slots.values().try_fold(0u64, |total, slots| {
+            total
+                .checked_add(slots.suspended_bank_bytes()?)
+                .ok_or_else(|| err("Qwen4 suspended bank total overflows u64"))
+        })?;
+        if suspended_bytes > 0 {
+            let bytes = suspended_bytes
+                .checked_add(DIRECT_STAGING_BYTES)
+                .ok_or_else(|| err("Qwen4 activation admission overflows u64"))?;
+            if let Err(error) = admit(bytes) {
+                self.activation_error = Some(error.reason.clone());
+                return Err(error);
+            }
+            self.activation_error = None;
+        }
         for slots in self.slots.values_mut() {
             slots.activate()?;
         }
         self.slot_reclaim_since = None;
-        self.start_direct_fill()?;
+        // An activation retry must not erase an unrelated asynchronous worker error.
+        if !retrying_activation_refusal || self.direct_error.is_none() {
+            self.start_direct_fill()?;
+        }
         self.direct_fill_pass =
             self.plan.direct && self.slots.values().any(|slots| !slots.identity_ready());
         Ok(())
@@ -1166,6 +1222,25 @@ impl Store {
     /// before the first turn of an idle model.
     pub(in super::super) fn begin_turn(&mut self) -> Result<()> {
         self.activate_expert_slots()
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn begin_turn_with(
+        &mut self,
+        admit: &mut impl FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        self.activate_expert_slots_with(admit)
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn slot_suspend_states_for_test(&self) -> Vec<(usize, bool, bool)> {
+        let mut states: Vec<_> = self
+            .slots
+            .iter()
+            .map(|(&layer, slots)| (layer, slots.suspended, slots.purge_requested))
+            .collect();
+        states.sort_unstable_by_key(|&(layer, ..)| layer);
+        states
     }
 
     pub(in super::super) fn expert_slot_capacity(
@@ -1400,6 +1475,9 @@ impl Store {
         top: usize,
         ids: &[u32],
     ) -> Result<Option<([Arc<Weight>; 3], Vec<u32>, usize)>> {
+        if !self.plan.direct {
+            self.check_activation_refusal()?;
+        }
         let capacity = self.expert_slot_capacity(experts, top)?;
         let wanted: HashSet<u32> = ids.iter().copied().collect();
         if capacity == 0 || wanted.len() > capacity {
