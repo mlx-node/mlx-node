@@ -406,20 +406,31 @@ struct CpuPool {
     cap: usize,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CPU_POOL_SPAWN_FAILURE_AT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl CpuPool {
     fn start<'s>(scope: &'s std::thread::Scope<'s, '_>, threads: usize, cap: usize) -> Self {
-        let shared = Arc::new(PoolShared {
-            state: Mutex::new(PoolState::default()),
-            changed: Condvar::new(),
-        });
-        for _ in 0..threads.max(1) {
-            let shared = Arc::clone(&shared);
+        // Keep the owner live during startup so a spawn panic closes earlier workers.
+        let pool = Self {
+            shared: Arc::new(PoolShared {
+                state: Mutex::new(PoolState::default()),
+                changed: Condvar::new(),
+            }),
+            cap: cap.max(1),
+        };
+        for _index in 0..threads.max(1) {
+            let shared = Arc::clone(&pool.shared);
+            #[cfg(test)]
+            if CPU_POOL_SPAWN_FAILURE_AT.with(|failure| failure.get()) == Some(_index) {
+                panic!("injected CpuPool spawn failure");
+            }
             scope.spawn(move || cpu_worker(&shared));
         }
-        Self {
-            shared,
-            cap: cap.max(1),
-        }
+        pool
     }
 
     fn error(state: &PoolState) -> Result<()> {
@@ -1673,6 +1684,25 @@ mod tests {
     use std::collections::BTreeMap;
 
     const MIB: usize = 1 << 20;
+
+    #[test]
+    fn cpu_pool_second_spawn_panic_closes_first_worker() {
+        let (done, finished) = std::sync::mpsc::channel();
+        let helper = std::thread::spawn(move || {
+            CPU_POOL_SPAWN_FAILURE_AT.with(|failure| failure.set(Some(1)));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::thread::scope(|scope| {
+                    CpuPool::start(scope, 2, 1);
+                });
+            }));
+            let _ = done.send(result.is_err());
+        });
+        let panicked = finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("CpuPool startup deadlocked after the second spawn panic");
+        helper.join().expect("CpuPool startup helper panicked");
+        assert!(panicked, "second CpuPool spawn panic did not propagate");
+    }
 
     fn random_bytes(n: usize, seed: u64) -> Vec<u8> {
         let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;

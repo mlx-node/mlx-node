@@ -322,6 +322,12 @@ pub(crate) struct Reader<'s> {
     chunk: usize,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static READER_SPAWN_FAILURE_AT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl<'s> Reader<'s> {
     pub(crate) fn start(
         scope: &'s std::thread::Scope<'s, '_>,
@@ -330,20 +336,25 @@ impl<'s> Reader<'s> {
         threads: usize,
         chunk: usize,
     ) -> Self {
-        let shared = Arc::new(Shared {
-            state: Mutex::new(State::default()),
-            changed: Condvar::new(),
-            stop: AtomicBool::new(false),
-        });
-        for _ in 0..threads.max(1) {
-            let shared = Arc::clone(&shared);
-            scope.spawn(move || worker(&shared, src, path));
-        }
-        Self {
-            shared,
+        // Keep the owner live during startup so a spawn panic closes earlier workers.
+        let reader = Self {
+            shared: Arc::new(Shared {
+                state: Mutex::new(State::default()),
+                changed: Condvar::new(),
+                stop: AtomicBool::new(false),
+            }),
             path,
             chunk: chunk.max(1),
+        };
+        for _index in 0..threads.max(1) {
+            let shared = Arc::clone(&reader.shared);
+            #[cfg(test)]
+            if READER_SPAWN_FAILURE_AT.with(|failure| failure.get()) == Some(_index) {
+                panic!("injected Reader spawn failure");
+            }
+            scope.spawn(move || worker(&shared, src, path));
         }
+        reader
     }
 
     pub(crate) fn submit(&self, ticket: u64, dst: SendPtr<u8>, dst_len: usize, file_off: u64) {
@@ -790,6 +801,27 @@ mod tests {
             buf.copy_from_slice(src);
             Ok(())
         }
+    }
+
+    #[test]
+    fn reader_second_spawn_panic_closes_first_worker() {
+        let (done, finished) = std::sync::mpsc::channel();
+        let helper = std::thread::spawn(move || {
+            let src = Bytes(Vec::new());
+            let path = PathBuf::from("/reader-startup.gguf");
+            READER_SPAWN_FAILURE_AT.with(|failure| failure.set(Some(1)));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::thread::scope(|scope| {
+                    Reader::start(scope, &src, &path, 2, CHUNK_BYTES);
+                });
+            }));
+            let _ = done.send(result.is_err());
+        });
+        let panicked = finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("Reader startup deadlocked after the second spawn panic");
+        helper.join().expect("Reader startup helper panicked");
+        assert!(panicked, "second Reader spawn panic did not propagate");
     }
 
     #[test]
