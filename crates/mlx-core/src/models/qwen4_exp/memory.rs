@@ -23,6 +23,8 @@ pub(super) struct Plan {
     /// Every routed expert has an anonymous direct-GGUF bank at identity
     /// capacity.
     pub direct: bool,
+    /// A full-bank refusal selected partial slots under the direct gate.
+    pub partial_direct_gate: bool,
     /// Anonymous bytes allocated for direct expert banks.
     pub direct_bytes: u64,
     /// Routed layers in the direct fill schedule.
@@ -34,6 +36,12 @@ pub(super) struct Plan {
     pub live_non_reclaimable: u64,
 }
 
+impl Plan {
+    pub(super) fn use_direct_turn_floor(&self) -> bool {
+        self.direct || self.partial_direct_gate
+    }
+}
+
 /// LRU rows (token, PLE and streamed auxiliary MTP/vision rows), paired banks
 /// and import staging beside full direct banks. A resident draft bank must be
 /// included in `direct_desired` before the gate is evaluated.
@@ -42,7 +50,7 @@ const DIRECT_LRU_BYTES: u64 = 2 << 30;
 /// other processes that allocate during a pass. A refusal selects bounded
 /// partial slots instead of allocating the full identity bank set.
 pub(super) const DIRECT_MARGIN: u64 = 4 << 30;
-/// Minimum free plus file-cache memory during a full direct turn. The load
+/// Minimum free plus file-cache memory during a direct-gated turn. The load
 /// gate owns admission; this floor only refuses growth near the kernel's
 /// critical level.
 pub(super) const DIRECT_TURN_FLOOR: u64 = 2 << 30;
@@ -132,6 +140,7 @@ pub(super) fn plan(hot_bytes: u64) -> Result<Plan> {
         resident_bank_bytes: Arc::default(),
         partial_expert_slots: 0,
         direct: false,
+        partial_direct_gate: false,
         direct_bytes: 0,
         direct_layers: 0,
         bank_budget: 0,
@@ -299,9 +308,12 @@ pub(super) fn maintain_freelist(physical: Option<u64>) {
     }
 }
 
-pub(super) fn check_growth_headroom(full_residency: bool) -> Result<()> {
-    let host = host_memory()?;
-    let floor = if full_residency {
+pub(super) fn check_growth_headroom(direct_gate: bool) -> Result<()> {
+    check_growth_headroom_with(&host_memory()?, direct_gate)
+}
+
+pub(super) fn check_growth_headroom_with(host: &HostMemory, direct_gate: bool) -> Result<()> {
+    let floor = if direct_gate {
         DIRECT_TURN_FLOOR
     } else {
         system_reserve(host.physical)
@@ -524,6 +536,7 @@ mod tests {
             resident_bank_bytes: Arc::default(),
             partial_expert_slots: 442,
             direct: false,
+            partial_direct_gate: false,
             direct_bytes: 0,
             direct_layers: 0,
             bank_budget: 0,
@@ -569,6 +582,7 @@ mod tests {
             resident_bank_bytes: Arc::default(),
             partial_expert_slots: 0,
             direct: false,
+            partial_direct_gate: false,
             direct_bytes: 0,
             direct_layers: 0,
             bank_budget: 0,
@@ -719,7 +733,14 @@ pub(super) fn scheduled_state_budget(pool_bytes: u64, prefill_scratch: u64) -> u
 pub(super) fn prefill_window(c: &super::config::Config, plan: &Plan) -> usize {
     let anonymous_budget = plan.budget.saturating_sub(plan.direct_bytes);
     let live = match (plan.available_bytes, plan.physical_bytes) {
-        (Some(a), Some(p)) => a.saturating_sub(anonymous_budget + system_reserve(p) + (2 << 30)),
+        (Some(a), Some(p)) => {
+            let reserve = if plan.partial_direct_gate {
+                DIRECT_TURN_FLOOR
+            } else {
+                system_reserve(p) + (2 << 30)
+            };
+            a.saturating_sub(anonymous_budget + reserve)
+        }
         _ => anonymous_budget / 16,
     };
     // Full direct budgets hold experts separately, so their total bank bytes
@@ -745,7 +766,7 @@ pub(super) fn prefill_window(c: &super::config::Config, plan: &Plan) -> usize {
 /// pair then fits and the `2 * row + 2 * draft_16k > budget` assertion fails.
 /// The released Flash Next geometry (Qwen3.8 Flash Next).
 #[cfg(test)]
-fn flash_next_config() -> super::config::Config {
+pub(super) fn flash_next_config() -> super::config::Config {
     super::config::Config::parse(&serde_json::json!({
         "model_type": "qwen4_exp_text",
         "hidden_size": 2560,

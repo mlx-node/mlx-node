@@ -869,6 +869,7 @@ impl Store {
             let bank_budget = candidate.bank_budget;
             self.plan = candidate;
             self.plan.direct = false;
+            self.plan.partial_direct_gate = true;
             self.plan.direct_bytes = 0;
             self.plan.direct_layers = 0;
             self.plan.budget = self.plan.budget.saturating_add(bank_budget);
@@ -895,6 +896,7 @@ impl Store {
             return Ok(true);
         }
         candidate.direct = true;
+        candidate.partial_direct_gate = false;
         candidate.direct_bytes = bank_bytes;
         candidate.direct_layers = layers.len();
         candidate.partial_expert_slots = experts;
@@ -2417,6 +2419,95 @@ mod tests {
             assert!(planned > bank_budget.saturating_sub(routed / 512));
             assert_eq!(store.plan.budget, anonymous + bank_budget);
         }
+        assert_eq!(store.bytes_read, 0);
+        assert_eq!(store.slot_bytes, 0);
+    }
+
+    #[test]
+    fn partial_gate_released_geometry_preserves_execution_reserves() {
+        use super::super::super::memory;
+
+        let Some((mut store, layers)) = draft_bank_store(None) else {
+            return;
+        };
+        store.tensors.retain(|name, _| !name.starts_with("mtp."));
+        let routed = layers.iter().sum::<u64>();
+        assert_eq!(routed, 78_538_342_400);
+        let host_at = |available: u64| memory::HostMemory {
+            physical: 128 << 30,
+            free: available,
+            file: 0,
+            anonymous: (128u64 << 30) - available - (20 << 30),
+            purgeable: 0,
+            wired: 13 << 30,
+            compressor: 7 << 30,
+        };
+        let host = host_at(84 << 30);
+        assert_eq!(host.available(), 84 << 30);
+        assert_eq!(host.non_reclaimable(), 44 << 30);
+        let pool = 1365u64 * 786_432;
+        let anonymous = memory::direct_desired(FIXED_BANK_BYTES);
+        assert_eq!(anonymous, 7 << 30);
+        let gate = memory::bank_gate(&host, anonymous + pool, memory::DIRECT_MARGIN);
+        assert_eq!(gate.bank_budget, 77_309_673_472);
+        assert!(gate.bank_budget < routed);
+        let budget = anonymous + gate.bank_budget;
+        assert_eq!(budget, 84_825_866_240);
+
+        store.cache_limit = budget;
+        store.plan.budget = budget;
+        store.plan.available_bytes = Some(host.available());
+        store.plan.physical_bytes = Some(host.physical);
+        store.plan.bank_budget = gate.bank_budget;
+        store.plan.live_non_reclaimable = gate.non_reclaimable;
+        store.plan.partial_direct_gate = true;
+        store.slot_bank_budget = Some(gate.bank_budget);
+        store.slot_capacity = None;
+        store.mtp_banks_declined = false;
+        let capacity = store.expert_slot_capacity(512, 10).unwrap();
+        assert_eq!(capacity, 502);
+        store.plan.partial_expert_slots = capacity;
+        let planned = store.planned_slot_bytes().unwrap();
+        assert_eq!(planned, 77_004_390_400);
+        assert!(!store.plan.direct);
+        assert!(store.plan.use_direct_turn_floor());
+
+        let c = memory::flash_next_config();
+        let scratch = memory::prefill_scratch(&c, 1024);
+        assert_eq!(scratch, 1_988_100_096);
+        assert_eq!(memory::prefill_window(&c, &store.plan), 1024);
+        let mut ordinary = store.plan.clone();
+        ordinary.partial_direct_gate = false;
+        assert!(!ordinary.use_direct_turn_floor());
+        assert_eq!(memory::prefill_window(&c, &ordinary), 1);
+
+        let post_available = host.available() - FIXED_BANK_BYTES - planned;
+        assert_eq!(post_available, 7_944_761_856);
+        let post = host_at(post_available);
+        memory::check_growth_headroom_with(&post, store.plan.use_direct_turn_floor()).unwrap();
+        let after_scratch = host_at(post_available - scratch);
+        memory::check_growth_headroom_with(&after_scratch, store.plan.use_direct_turn_floor())
+            .unwrap();
+        let below_direct_floor = host_at(memory::DIRECT_TURN_FLOOR - 1);
+        assert!(
+            memory::check_growth_headroom_with(
+                &below_direct_floor,
+                store.plan.use_direct_turn_floor()
+            )
+            .is_err()
+        );
+        assert!(
+            memory::check_growth_headroom_with(&post, ordinary.use_direct_turn_floor()).is_err()
+        );
+        memory::check_growth_headroom_with(&host_at(16 << 30), ordinary.use_direct_turn_floor())
+            .unwrap();
+        assert!(
+            memory::check_growth_headroom_with(
+                &host_at((16 << 30) - 1),
+                ordinary.use_direct_turn_floor()
+            )
+            .is_err()
+        );
         assert_eq!(store.bytes_read, 0);
         assert_eq!(store.slot_bytes, 0);
     }

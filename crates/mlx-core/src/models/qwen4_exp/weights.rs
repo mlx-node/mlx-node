@@ -759,7 +759,9 @@ struct SafeDescriptor {
 
 impl Store {
     pub(super) fn check_forward_headroom(&self) -> Result<()> {
-        self.check_forward_headroom_with(|| super::memory::check_growth_headroom(self.plan.direct))
+        self.check_forward_headroom_with(|| {
+            super::memory::check_growth_headroom(self.plan.use_direct_turn_floor())
+        })
     }
 
     fn check_forward_headroom_with(&self, check: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -832,6 +834,7 @@ impl Store {
                 resident_bank_bytes: Default::default(),
                 partial_expert_slots: 0,
                 direct: false,
+                partial_direct_gate: false,
                 direct_bytes: 0,
                 direct_layers: 0,
                 bank_budget: 0,
@@ -1468,9 +1471,9 @@ impl Store {
         rows: usize,
         lookup: bool,
     ) -> Result<Arc<Weight>> {
-        let direct = self.plan.direct;
+        let direct_gate = self.plan.use_direct_turn_floor();
         self.read_impl_with(name, start, rows, lookup, || {
-            super::memory::check_growth_headroom(direct)
+            super::memory::check_growth_headroom(direct_gate)
         })
     }
 
@@ -3044,6 +3047,7 @@ mod direct_tests {
             Store::open_fixture(gguf, Some(&temp.0.join(format!("{label}-cache")))).unwrap();
         store.slot_capacity = Some(capacity);
         store.direct_gguf = direct;
+        assert!(!store.plan.partial_direct_gate);
         store
     }
 
@@ -3058,6 +3062,7 @@ mod direct_tests {
             "the single-file fixture must take direct selection"
         );
         assert!(store.plan.direct);
+        assert!(!store.plan.partial_direct_gate);
         assert_eq!(store.plan.direct_layers, layers);
         assert_eq!(store.plan.partial_expert_slots, experts);
         assert_eq!(store.plan.direct_bytes, store.slot_bytes);
@@ -3335,6 +3340,7 @@ mod direct_tests {
             .unwrap();
         assert!(handled);
         assert!(!store.plan.direct);
+        assert!(store.plan.partial_direct_gate);
         assert!(store.slots.is_empty());
         assert_eq!(store.slot_bytes, 0);
         assert_eq!(store.cache_bytes, 0);
@@ -3350,6 +3356,64 @@ mod direct_tests {
             store.live.fallback(),
             Some(Fallback::LoadGate { budget, .. }) if budget == bank_budget
         ));
+    }
+
+    #[test]
+    fn direct_gguf_zero_bank_gate_refusal_marks_partial_gate() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("zero-bank-gate-refusal.gguf");
+        write_fixture(&gguf);
+        let mut store = Store::open_fixture(&gguf, Some(&temp.0.join("cache"))).unwrap();
+        let anonymous_budget = 512 << 20;
+        let handled = store
+            .select_direct_residency_with(
+                EXPERTS,
+                0,
+                &mut |plan, _, _, _| {
+                    plan.budget = anonymous_budget;
+                    plan.bank_budget = 0;
+                    Err(err("injected zero-bank full-gate refusal"))
+                },
+                &mut |_| panic!("a refused gate must not allocate"),
+            )
+            .unwrap();
+        assert!(handled);
+        assert!(!store.plan.direct);
+        assert!(store.plan.partial_direct_gate);
+        assert!(store.plan.use_direct_turn_floor());
+        assert_eq!(store.plan.budget, anonymous_budget);
+        assert_eq!(store.plan.bank_budget, 0);
+        assert_eq!(store.slot_bank_budget, Some(0));
+        assert_eq!(store.plan.partial_expert_slots, 0);
+    }
+
+    #[test]
+    fn direct_gguf_allocation_rollback_restores_ordinary_gate_marker() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("full-allocation-rollback.gguf");
+        write_fixture(&gguf);
+        let mut store = Store::open_fixture(&gguf, Some(&temp.0.join("cache"))).unwrap();
+        let original_budget = store.plan.budget;
+        let original_cache_limit = store.cache_limit;
+        let error = store
+            .select_direct_residency_with(EXPERTS, 0, &mut memory::direct_plan, &mut |_| {
+                Err(err("injected full-bank allocation refusal"))
+            })
+            .unwrap_err();
+        assert!(error.reason.contains("full-bank allocation refusal"));
+        assert!(!store.plan.direct);
+        assert!(!store.plan.partial_direct_gate);
+        assert!(!store.plan.use_direct_turn_floor());
+        assert_eq!(store.plan.budget, original_budget);
+        assert_eq!(store.cache_limit, original_cache_limit);
+        assert!(store.slot_bank_budget.is_none());
+        assert!(store.slots.is_empty());
     }
 
     /// Real fixture inference through the partial direct fill path. The gate
