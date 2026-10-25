@@ -13,6 +13,7 @@
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx_paged_metallib.h"
+#include "mlx_splash_moe_workspace.h"
 #endif
 
 #include <array>
@@ -233,12 +234,12 @@ void GroupedMoe::eval_gpu(const std::vector<array> &inputs, array &out) {
       !register_experts && !probe && !profile) {
     // Borrow immutable descriptors, then copy handles locally for ordinary
     // tracked bindings. Never donate, expose, replace Data, or add_temporary.
-    static const std::vector<metal::CommandEncoder::WorkspaceSpec> specs = {
+    static const std::vector<persistent_workspace::Spec> specs = {
       {{72},uint32},{{72},float32},{{65,2},uint32},{{7},uint32},
       {{520},uint32},{{72},uint32},{{520,2048},bfloat16},
       {{520,512},bfloat16},{{520,2048},bfloat16}};
     static_assert(sizeof(SplashMoeTileCount)==7*sizeof(uint32_t));
-    workspace=enc.try_workspace(0x53504c4153480001ULL,specs);
+    workspace=persistent_workspace::try_workspace(s,enc,0x53504c4153480001ULL,specs);
     if(workspace) bridge_testing::record("splash_moe_workspace");
   }
   auto scratch = [&](size_t slot, Shape shape, Dtype dtype) {

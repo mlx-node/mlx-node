@@ -11,8 +11,8 @@
   their own acceptance measurement.
 - The source port follows Splash `1482f6bbc2abf12375332725302019594150b6cb`;
   its Apache-2.0 attribution remains in `THIRD_PARTY_NOTICES`.
-- MLX hooks are 11 direct commits on `mlx-node/mlx` branch `fn-d1`, pinned
-  through `1cf8764f9`. CMake, bridge headers, Metal kernels, and preambles use
+- The active MLX pin has 10 direct commits from `mlx-node/mlx` branch `fn-d1`, pinned
+  through `7aa7d680b`. CMake, bridge headers, Metal kernels, and preambles use
   that checkout directly: there is no parent-repo build-time patch stack or
   generated patched source tree. Prebuilts must match the clean commit and
   build key. See the [MLX fork guide](../mlx-fork.md).

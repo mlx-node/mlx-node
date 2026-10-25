@@ -8,14 +8,14 @@ MLX's public C++ API.
 ```
 ml-explore/mlx main  bebd6422f (2026-10-14)
         │
-        │  + 11 patches  fork fn-d1
+        │  + 10 patches  fork fn-d1
         ▼
-mlx-node/mlx         1cf8764f9  ◄── gitlink at crates/mlx-sys/mlx
+mlx-node/mlx         7aa7d680b  ◄── gitlink at crates/mlx-sys/mlx
 ```
 
 Name a patch by its subject and use its commit hash for the exact gitlink.
 
-## The 11 patches
+## The 10 patches
 
 | #   | commit      | patch                                                                                                                                                                 | why it cannot live in mlx-node                                                                                                                                                                                                                                                                                                                                                                                                                                    | upstream candidate |
 | --- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
@@ -29,15 +29,39 @@ Name a patch by its subject and use its commit hash for the exact gitlink.
 | 8   | `ba46defc6` | Command trace binding: command-buffer and stream tags join primitive trace lines to completed GPU commands                                                            | Lives in the existing `CommandEncoder::commit` and `gpu::eval` trace paths; diagnostics only                                                                                                                                                                                                                                                                                                                                                                      | no (diagnostics)   |
 | 9   | `14992add0` | `MLX_METAL_SERIAL_ENCODER=1` selects serial compute dispatch for controlled experiments; concurrent dispatch remains the default                                      | Encoder creation is inside `CommandEncoder`; resource bookkeeping, cross-encoder fences and stream ordering stay in the same implementation                                                                                                                                                                                                                                                                                                                       | not proposed       |
 | 10  | `7aa7d680b` | Sparse input budget: `set_input_array_with_budget` supplies an explicit storage-unit scheduling estimate; repeated or shared bindings restore the full charge         | The scheduling estimate and discount restoration live in `CommandEncoder`'s private input-binding state. Actual resource tracking, hazards, retention and memory limits remain there too                                                                                                                                                                                                                                                                          | not proposed       |
-| 11  | `1cf8764f9` | Persistent workspace: one bounded (16 slots/8 MiB) encoder-owned scratch profile, reused until encoder teardown                                                       | Workspace allocation, completion retention and cross-encoder fencing are `CommandEncoder` internals; ordinary resource bindings and fences remain authoritative                                                                                                                                                                                                                                                                                                   | not proposed       |
 
-All 11 patches are direct commits on the fork's `fn-d1` branch. `build.rs` uses
-the checked-out submodule directly for CMake, bridge headers, Metal kernels and
-generated preambles. There is no parent-repo patch stack or generated patched
-source tree.
+The active pin has 10 direct commits from the fork's `fn-d1` branch. The
+retired workspace commit remains an inactive descendant on that branch; moving the
+gitlink to its parent does not rewrite `fn-d1`. `build.rs` uses the checked-out
+submodule directly for CMake, bridge headers, Metal kernels and generated preambles.
+There is no parent-repo patch stack or generated patched source tree.
 
 The bridge also prints `[mlx-compiled]` lines under `MLX_METAL_COMMAND_TRACE` ≥ 1
 (`crates/mlx-sys/src/mlx_compiled_graph.cpp`). That part is ours, not a patch.
+
+The persistent grouped-MoE workspace is parent bridge code, not an MLX patch:
+`crates/mlx-sys/src/mlx_splash_moe_workspace.{h,cpp}` keeps one validated profile
+(16 slots, 8 MiB total) per execution thread and `Stream`. `GroupedMoe` remains the
+only production acquisition path and captures `MLX_SPLASH_MOE_WORKSPACE` when the
+primitive is constructed. Shapeless replay still recomputes eligibility and uses
+fresh temporaries for ineligible shapes. The helper is restricted to the serial
+grouped-MoE path because the public MLX API does not expose encoder concurrency
+state.
+
+The pool owns slots through an internal null-primitive array and pins them with
+`CommandEncoder::retain_inputs` on every acquisition. Slots use ordinary tracked
+input/output bindings for barriers and cross-encoder fences; they are never
+`add_temporary` allocations, donated, rebound, or exposed as public outputs.
+`drain(Stream)` synchronizes a live encoder before erasing its profile, and
+`clear_streams_and_workspaces()` synchronizes every live profile stream before MLX
+encoder teardown and pool teardown, including global encoders left by worker
+`clear_streams()`. Profiles whose encoders were destroyed by ordinary
+`clear_streams()` are reaped at the next first acquisition or cleanup call; the
+encoder destructor has already synchronized them. Exception paths propagate
+without a local synchronize so `eval_impl` can signal and finalize dependency
+streams before waiting. Natural worker exit is covered by the same completion
+pins and encoder destructor synchronization. The old fork API and its
+private-field test hook are gone.
 
 ## What lives in mlx-node instead
 
