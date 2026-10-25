@@ -657,14 +657,15 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::utils::gguf::{
-        GgufConversionOptions, GgufTensorType, convert_gguf_to_safetensors, parse_gguf,
-    };
+    use crate::utils::gguf::parse_gguf;
+    #[cfg(debug_assertions)]
+    use crate::utils::gguf::{GgufConversionOptions, GgufTensorType, convert_gguf_to_safetensors};
     use crate::utils::gguf_test_fixtures::{
-        IMPORT_FIXTURE_NAMES, ImportFixture, ImportFixtureFamily, build_minimal_gguf,
-        convert_import_fixture, fixture_payload, safetensors_manifest, sha256_hex, t64_prefixes,
-        write_import_fixture,
+        IMPORT_FIXTURE_NAMES, ImportFixture, ImportFixtureFamily, convert_import_fixture,
+        safetensors_manifest, sha256_hex, t64_prefixes, write_import_fixture,
     };
+    #[cfg(debug_assertions)]
+    use crate::utils::gguf_test_fixtures::{build_minimal_gguf, fixture_payload};
 
     fn golden_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/utils/testdata/gguf_import_golden")
@@ -923,6 +924,7 @@ mod tests {
     }
 
     /// The options native prepare passes to the converter for `fixture`.
+    #[cfg(debug_assertions)]
     fn convert_options(fixture: &ImportFixture, out: &Path) -> GgufConversionOptions {
         let parent = fixture.main.parent().unwrap();
         GgufConversionOptions {

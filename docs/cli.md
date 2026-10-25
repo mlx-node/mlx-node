@@ -948,10 +948,10 @@ also sweeps idle, unlocked directories from the retired
 idle grace, and nonblocking legacy locks bound that cleanup; no replacement
 cache directory is created.
 
-| Env var                     | Effect                                                                                                                                                                                                                                                                                                     |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MLX_NATIVE_GGUF_CACHE_DIR` | Override the native GGUF asset root (config/tokenizer/template files and `gguf-source.json`).                                                                                                                                                                                 |
-| `MLX_GGUF_PAGE_CACHE`       | Direct GGUF load reads: `auto` (default) uses the OS page cache unless the planned read is larger than half physical RAM; `on` always uses it; `off` requests a bypass for load reads. Bypassing does not evict pages already cached.                                   |
+| Env var                     | Effect                                                                                                                                                                                                                                |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MLX_NATIVE_GGUF_CACHE_DIR` | Override the native GGUF asset root (config/tokenizer/template files and `gguf-source.json`).                                                                                                                                         |
+| `MLX_GGUF_PAGE_CACHE`       | Direct GGUF load reads: `auto` (default) uses the OS page cache unless the planned read is larger than half physical RAM; `on` always uses it; `off` requests a bypass for load reads. Bypassing does not evict pages already cached. |
 
 ## Dashboard
 
