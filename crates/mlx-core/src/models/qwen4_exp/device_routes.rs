@@ -120,7 +120,7 @@ impl Decoder {
         }
         let Some(base) = base else {
             return Err(Error::from_reason(
-                "Qwen4 prefill group routes lost their mapped banks",
+                "Qwen4 prefill group routes lost their expert banks",
             ));
         };
         drop(output);
@@ -128,20 +128,17 @@ impl Decoder {
     }
 
     /// Complete a tentative pass and check its tape: `outputs` (the logits
-    /// and every residual stream), the tape, every state array and the
-    /// group's pending bank touches evaluate together, the pool writes after
-    /// them, then the routes are checked against the unchanged host mapping.
+    /// and every residual stream), the tape and every state array evaluate
+    /// together, then routes are checked against the unchanged host mapping.
     pub(super) fn commit_tentative(
         &mut self,
         outputs: &[&MxArray],
         routes: &[(usize, MxArray)],
     ) -> Result<bool> {
         let tape = MxArray::concatenate_many(routes.iter().map(|(_, ids)| ids).collect(), Some(0))?;
-        let touches = self.weights.take_pending_touches();
         let mut completed = outputs.to_vec();
         completed.push(&tape);
         completed.extend(self.pending_state_arrays());
-        completed.extend(touches.iter());
         MxArray::eval_arrays_with_context(&completed, "qwen4::prefill_device_routes::commit")?;
         if let Some(adapter) = &mut self.paged {
             adapter
@@ -249,14 +246,14 @@ impl Decoder {
         Ok(Some(out))
     }
 
-    /// Every mapped expert has a bank row, so a verify pass reads no expert
-    /// and its routes can wait for the pass end. Slot banks keep the host
+    /// Full direct banks have every expert, so a verify pass reads no expert
+    /// and its routes can wait for the pass end. Partial banks keep host
     /// routes: a verify pass loads the experts it misses. The shapes are the
     /// row kernels': a layer whose rows fall back to the one-row MoE would
     /// put one-row routes on the R-row tape.
     pub(super) fn verify_routes_on_device(&self) -> bool {
         self.gguf()
-            && (self.weights.plan.mapped || self.weights.plan.direct)
+            && self.weights.plan.direct
             && self.config.hidden_size == 2560
             && self.config.moe_intermediate_size == 640
             && self.config.num_experts == 512

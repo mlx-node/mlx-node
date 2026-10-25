@@ -940,18 +940,18 @@ elsewhere). These entries contain config/tokenizer/template files and
 read and repacked in memory on every load. Leases protect assets that can still
 be read lazily, while stale/debris cleanup runs under per-key locks.
 
-The Qwen3.8 Flash Next mapped expert pack remains a separate cache at
-`~/Library/Caches/mlx-node/qwen4-packed` on macOS (`~/.cache/mlx-node/qwen4-packed`
-elsewhere), with its existing mapped-pack behavior. Stale or orphaned entries
-are removed without disturbing live writers; deleting a cache directory yourself
-is only needed to reclaim space immediately. A Flash Next pack whose source
-volume is unplugged is kept until the volume returns, and is then checked
-against its source again.
+Qwen3.8 Flash Next reads and repacks routed experts directly from GGUF into
+anonymous banks; it writes no derived weight pack. For one release, its load
+also sweeps idle, unlocked directories from the retired
+`~/Library/Caches/mlx-node/qwen4-packed` cache on macOS
+(`~/.cache/mlx-node/qwen4-packed` elsewhere). Exact legacy names, a one-hour
+idle grace, and nonblocking legacy locks bound that cleanup; no replacement
+cache directory is created.
 
 | Env var                     | Effect                                                                                                                                                                                                                                                                                                     |
 | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MLX_NATIVE_GGUF_CACHE_DIR` | Override the native GGUF asset root (config/tokenizer/template files and `gguf-source.json`). This does not relocate the Flash Next mapped expert pack.                                                                                                                                                    |
-| `MLX_GGUF_PAGE_CACHE`       | Direct GGUF preload reads only: `auto` (default) uses the OS page cache unless the planned read is larger than half physical RAM; `on` always uses it; `off` requests a bypass for load reads. Bypassing does not evict pages already cached. Flash Next mapped expert reads keep their existing behavior. |
+| `MLX_NATIVE_GGUF_CACHE_DIR` | Override the native GGUF asset root (config/tokenizer/template files and `gguf-source.json`).                                                                                                                                                                                 |
+| `MLX_GGUF_PAGE_CACHE`       | Direct GGUF load reads: `auto` (default) uses the OS page cache unless the planned read is larger than half physical RAM; `on` always uses it; `off` requests a bypass for load reads. Bypassing does not evict pages already cached.                                   |
 
 ## Dashboard
 

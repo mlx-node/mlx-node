@@ -2635,15 +2635,6 @@ pub type MlxGraphBuilder = unsafe extern "C" fn(
 ) -> bool;
 
 unsafe extern "C" {
-    /// Exclusive mutable expert-slot transaction. The caller must evaluate all
-    /// lazy readers of destination banks before recycling slots.
-    pub fn mlx_qwen4_copy_weight_rows(
-        destinations: *mut *mut mlx_array,
-        sources: *mut *mut mlx_array,
-        slots: *const u32,
-        arrays: usize,
-        updates: usize,
-    ) -> bool;
     pub fn mlx_qwen4_gather_pages(
         keys: *mut mlx_array,
         values: *mut mlx_array,
@@ -3160,21 +3151,8 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
-    // Array over caller-owned storage (`mlx_mapped.cpp`). Null when the Metal
-    // driver refuses a no-copy buffer over `ptr`; never an array over copied
-    // bytes. `release_fn(ctx)` runs once when the last array sharing the
-    // storage is dropped, and does not run on a null return.
-    pub fn mlx_array_from_mapped(
-        ptr: *mut std::ffi::c_void,
-        bytes: usize,
-        shape: *const i64,
-        ndim: usize,
-        dtype: i32,
-        release_fn: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
-        ctx: *mut std::ffi::c_void,
-    ) -> *mut mlx_array;
-    // Null unless the array is available (a mapped array, or an evaluated
-    // array that was already waited on); never waits and never throws.
+    // Null unless the array is available and already waited on; never waits
+    // and never throws.
     pub fn mlx_array_data_ptr(handle: *mut mlx_array) -> *const std::ffi::c_void;
 }
 

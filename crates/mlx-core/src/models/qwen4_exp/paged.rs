@@ -188,8 +188,7 @@ impl PagedBackend for Inner {
     }
     fn paged_prefill(&mut self, tokens: &[u32], _: &Prefix, stream: Stream) -> Result<MxArray> {
         let _context = crate::stream::StreamContext::new(stream);
-        // Group mode is read again here: a trip applied since admission runs
-        // the whole-prompt row one window at a time below.
+        // Group mode follows the direct-fill state at execution time.
         if self.media_prefill.is_none() && self.decoder.group_mode(tokens.len()) {
             let seq = self.active_seq.unwrap_or(0);
             let (windows, tail) = self.decoder.group_windows(tokens);
@@ -207,8 +206,7 @@ impl PagedBackend for Inner {
             return logits.squeeze(Some(&[1]));
         }
         let mut logits = None;
-        // Read before every pass: a pass that leaves the mapped path shrinks
-        // the window for the passes after it.
+        // Read the admitted window before every pass.
         let mut start = 0;
         while start < tokens.len() {
             let window = self.decoder.prefill_slice_size();
@@ -327,9 +325,6 @@ impl HybridSchedulerBackend for Inner {
     type StepExecutor<'a> = HybridStepExecutor<'a, Self>;
     const SCHEDULER_NAME: &'static str = "qwen4_exp";
     fn scheduler_wired_bytes(&self) -> Option<usize> {
-        if self.decoder.weights.plan.mapped {
-            return None;
-        }
         let pages = self.decoder.paged.as_ref().map_or(Some(0), |p| {
             p.bytes_per_block()
                 .ok()?

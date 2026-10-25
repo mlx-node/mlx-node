@@ -5475,23 +5475,13 @@ export interface Qwen4ExpResidencyInfo {
    */
   residentBankBytes: number;
   /**
-   * Shared slot capacity for the routed layers at bootstrap (the expert
-   * count in mapped or full direct mode).
+   * Shared partial-slot capacity, or the expert count at full direct
+   * identity residency.
    */
   partialExpertSlots: number;
   /**
-   * Routed expert tensors the slot path reads by range from the mapped
-   * pack; 0 means every expert read is imported from the checkpoint.
-   */
-  mappedPackFiles: number;
-  /**
-   * Every routed expert is addressed in place through the mapped pack;
-   * the weight budget then covers dense banks and rows only.
-   */
-  mapped: boolean;
-  /**
    * Every routed expert has an anonymous bank filled directly from GGUF,
-   * with slot id equal to expert id. Never true together with `mapped`.
+   * with slot id equal to expert id.
    */
   direct: boolean;
   /** Anonymous bytes allocated to direct expert banks. */
@@ -5502,35 +5492,18 @@ export interface Qwen4ExpResidencyInfo {
   /** A direct layered fill is still running. */
   directFillInProgress: boolean;
   /**
-   * Pack bytes backing live arrays in mapped mode (clean page cache the
-   * Metal driver wires while a command buffer binds them).
+   * Bytes of direct banks the host could hold beside what stays anonymous
+   * when residency was chosen: physical RAM minus a margin, the live
+   * non-reclaimable memory below and the anonymous need.
    */
-  mappedBytes: number;
-  /**
-   * Bytes of mapped or direct banks the host could hold beside what stays
-   * anonymous when residency was chosen: physical RAM minus a margin, the
-   * live non-reclaimable memory below and the anonymous need.
-   */
-  mappedBankBudgetBytes: number;
+  bankBudgetBytes: number;
   /**
    * Wired, compressed and other processes' anonymous memory when the
    * residency was chosen.
    */
   liveNonReclaimableBytes: number;
-  /**
-   * Why the slot path serves the experts although the pack exists: the
-   * load gate, or a mapped turn that read over twice the pack from SSD or
-   * ran eight consecutive passes over ten times their median (over the
-   * fastest larger pass while they have no median of their own).
-   */
+  /** Present when the full-bank load gate selected partial direct slots. */
   fallbackReason?: string;
-  fallbackReadBytes?: number;
-  fallbackSlowSteps?: number;
-  /**
-   * Tokens the request held when it left the mapped path between two of
-   * its passes; absent for the load gate.
-   */
-  fallbackTokenIndex?: number;
   /**
    * Token/PLE rows asked of the decoded-row LRU since load, and the ones
    * it had to import.

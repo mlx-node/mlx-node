@@ -19,87 +19,6 @@ const DIRECT_READ_BYTES: usize = 8 << 20;
 const DIRECT_STAGING_SLOTS: usize = 4;
 const SLOT_RECLAIM_FALLBACK: Duration = Duration::from_secs(30);
 
-/// The driver unwires a bound file-backed bank ~1.15 s after its last use and
-/// re-wires resident pages at 12-17 ms/GiB, one command buffer at a time. A
-/// forward pass that starts later than that after the previous one (the first
-/// decode step after prefill, any slow step) wires 78 GiB layer by layer, and
-/// layer 0 is idle long enough to unwire again before the pass ends: measured
-/// 0.4-0.6 tokens/s until something breaks the cycle. One eval reading one
-/// element of every mapped bank gives them all the same last use first.
-const MAPPED_WIRE_GAP: Duration = Duration::from_millis(900);
-/// Under the driver's ~1.15 s unwire timer and the 900 ms gap above.
-const KEEP_WIRED_EVERY: Duration = Duration::from_millis(700);
-
-/// One layer's routed experts addressed in place: the pack's sections as
-/// no-copy banks, slot id == expert id, so nothing is ever copied, missed
-/// or overwritten and no reader lease is needed.
-pub(super) struct MappedExperts {
-    banks: [Arc<Weight>; 3],
-    pub(super) maps: [Arc<crate::array::Mmap>; 3],
-    experts: usize,
-}
-
-/// Whether every probe of every mapped bank file is in the page cache: the
-/// pack's own evidence behind the process-wide SSD count.
-fn pack_resident(mapped: &HashMap<usize, MappedExperts>) -> bool {
-    mapped
-        .values()
-        .flat_map(|experts| experts.maps.iter())
-        .all(|map| super::super::prefetch::sampled_resident(map))
-}
-
-impl MappedExperts {
-    fn open(
-        files: [&super::super::mapped_pack::LayerFile; 3],
-        experts: usize,
-    ) -> Result<(Self, u64)> {
-        let mut bytes = 0u64;
-        let mut parts = Vec::with_capacity(3);
-        for file in files {
-            let h = &file.header;
-            if h.experts as usize != experts {
-                return Err(err(format!(
-                    "Mapped pack {} holds {} experts, the checkpoint {experts}",
-                    h.name, h.experts
-                )));
-            }
-            bytes += h.sections.iter().map(|s| s.length).sum::<u64>();
-            let (map, mut arrays) = file.map_sections()?;
-            let biases = if arrays.len() == 3 {
-                arrays.pop()
-            } else {
-                None
-            };
-            let scales = arrays.pop();
-            let values = arrays
-                .pop()
-                .ok_or_else(|| err(format!("Mapped pack {} has no values section", h.name)))?;
-            parts.push((
-                Arc::new(Weight {
-                    values,
-                    dense_bf16: None,
-                    scales,
-                    biases,
-                    group: h.group,
-                    bits: h.bits,
-                    mode: h.mode.clone(),
-                }),
-                map,
-            ));
-        }
-        let [(gate, gate_map), (up, up_map), (down, down_map)] = <[_; 3]>::try_from(parts)
-            .map_err(|_| err("Mapped layer needs gate, up and down banks"))?;
-        Ok((
-            Self {
-                banks: [gate, up, down],
-                maps: [gate_map, up_map, down_map],
-                experts,
-            },
-            bytes,
-        ))
-    }
-}
-
 /// The fused expert kernels' bank contract (K-quant gate/up, affine down).
 fn fused_bank_modes(banks: &[Arc<Weight>; 3]) -> bool {
     matches!(banks[0].mode.as_str(), "q4k" | "q5k")
@@ -175,17 +94,6 @@ impl Weight {
             ..self.clone()
         };
         Ok((template.clone(), SlotBank { template, storage }))
-    }
-
-    fn arrays(&self) -> Vec<&MxArray> {
-        [
-            Some(&self.values),
-            self.scales.as_ref(),
-            self.biases.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
     }
 }
 
@@ -513,7 +421,7 @@ impl DirectFill {
         jobs: Vec<DirectLayerJob>,
         source: DirectGgufSource,
         rows: Arc<AtomicUsize>,
-        live: Arc<super::super::tripwire::Live>,
+        live: Arc<super::super::live::Live>,
     ) -> Result<Self> {
         let (sender, receiver) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -853,35 +761,32 @@ impl Store {
     }
 
     fn full_residency(&self) -> bool {
-        self.plan.mapped || self.plan.direct
+        self.plan.direct
     }
 
-    /// Select full direct residency when this source supports it; otherwise
-    /// retain mapped-pack selection for A/B and unsupported source layouts.
+    /// Select full or partial direct GGUF residency. Unsupported sources keep
+    /// the existing bounded per-row checkpoint importer.
     pub(in super::super) fn select_residency(&mut self, pool_bytes: u64) -> Result<()> {
-        let mapped_ab = std::env::var("MLX_QWEN4_RESIDENCY")
-            .is_ok_and(|value| value.eq_ignore_ascii_case("mapped"));
         let experts = self
             .metadata
             .get("qwen4exp.expert_count")
             .and_then(GgufMetaValue::as_u64)
             .unwrap_or(0) as usize;
-        if !mapped_ab
-            && self.select_direct_residency_with(
-                experts,
-                pool_bytes,
-                &mut super::super::memory::mapped_plan,
-                &mut super::super::memory::admit_direct,
-            )?
-        {
-            return Ok(());
+        let direct = self.select_direct_residency_with(
+            experts,
+            pool_bytes,
+            &mut super::super::memory::direct_plan,
+            &mut super::super::memory::admit_direct,
+        )?;
+        if !direct {
+            self.slot_capacity = Some(0);
+            self.plan.partial_expert_slots = 0;
         }
-        self.select_mapped_residency(pool_bytes)
+        Ok(())
     }
 
     /// Returns true when direct eligibility was decided, including a gate
-    /// refusal that must use slots rather than silently trying another full
-    /// residency mode. False leaves the old mapped selector in charge.
+    /// refusal that must use partial slots. False keeps per-row imports.
     pub(in super::super) fn select_direct_residency_with(
         &mut self,
         experts: usize,
@@ -894,7 +799,6 @@ impl Store {
             || !crate::engine::persistence::compiled_forward_backend_available()
             || !self.slots.is_empty()
             || !self.banks.is_empty()
-            || self.plan.mapped
             || self.plan.direct
             || self.gguf_source.is_none()
         {
@@ -944,16 +848,11 @@ impl Store {
             pool_bytes,
             bank_bytes,
         ) {
-            let bank_budget = candidate.mapped_bank_budget;
+            let bank_budget = candidate.bank_budget;
             self.plan = candidate;
-            self.plan.mapped = false;
             self.plan.direct = false;
             self.plan.direct_bytes = 0;
             self.plan.direct_layers = 0;
-            self.plan.mapped_bytes = 0;
-            // The pack remains available for explicit mapped A/B, but this
-            // eligible partial path fills every slot directly from GGUF.
-            self.plan.mapped_pack_files = 0;
             self.plan.budget = self.plan.budget.saturating_add(bank_budget);
             self.cache_limit = self.plan.budget;
             self.draft_bank_budget = 0;
@@ -966,7 +865,7 @@ impl Store {
                 .unwrap_or(0) as usize;
             self.plan.partial_expert_slots = self.expert_slot_capacity(experts, top)?;
             self.live.set_fallback(Fallback::LoadGate {
-                pack: bank_bytes,
+                bank_bytes,
                 budget: bank_budget,
             });
             self.live.store(&self.plan);
@@ -977,12 +876,9 @@ impl Store {
             );
             return Ok(true);
         }
-        candidate.mapped = false;
         candidate.direct = true;
         candidate.direct_bytes = bank_bytes;
         candidate.direct_layers = layers.len();
-        candidate.mapped_bytes = 0;
-        candidate.mapped_pack_files = 0;
         candidate.partial_expert_slots = experts;
         candidate.budget = candidate
             .budget
@@ -1024,148 +920,11 @@ impl Store {
             "qwen4 direct GGUF residency: {} layers x {experts} experts, {:.1} GiB anonymous banks within a {:.1} GiB bank budget ({:.1} GiB live host memory), {:.1} GiB total weight budget",
             layers.len(),
             bank_bytes as f64 / (1u64 << 30) as f64,
-            self.plan.mapped_bank_budget as f64 / (1u64 << 30) as f64,
+            self.plan.bank_budget as f64 / (1u64 << 30) as f64,
             self.plan.live_non_reclaimable as f64 / (1u64 << 30) as f64,
             self.cache_limit as f64 / (1u64 << 30) as f64,
         );
         Ok(true)
-    }
-
-    /// Map every routed expert of every layer from the pack when the pack is
-    /// complete and the live host holds it beside what stays anonymous
-    /// (memory::mapped_plan), replacing the slot budget by one for dense
-    /// banks and auxiliary rows only. Any failure leaves the slot path in
-    /// charge. `pool_bytes` is the paged KV pool created before this
-    /// decision.
-    pub(in super::super) fn select_mapped_residency(&mut self, pool_bytes: u64) -> Result<()> {
-        let Some(experts) = self
-            .metadata
-            .get("qwen4exp.expert_count")
-            .and_then(GgufMetaValue::as_u64)
-        else {
-            return Ok(());
-        };
-        self.select_mapped_residency_with(
-            experts as usize,
-            pool_bytes,
-            &mut super::super::memory::mapped_plan,
-        )
-    }
-
-    pub(super) fn select_mapped_residency_with(
-        &mut self,
-        experts: usize,
-        pool_bytes: u64,
-        plan: &mut impl FnMut(&mut super::super::memory::Plan, u64, u64, u64) -> Result<()>,
-    ) -> Result<()> {
-        if !self.gguf
-            || experts == 0
-            || !crate::engine::persistence::compiled_forward_backend_available()
-            || !self.slots.is_empty()
-            || !self.banks.is_empty()
-        {
-            return Ok(());
-        }
-        let Some(pack) = &self.mapped else {
-            return Ok(());
-        };
-        let layers: std::collections::BTreeSet<usize> = self
-            .tensors
-            .keys()
-            .filter(|name| !super::residency::is_auxiliary(name))
-            .filter_map(|name| super::routed_expert_tensor(name).map(|(layer, _)| layer))
-            .collect();
-        if layers.is_empty() {
-            return Ok(());
-        }
-        let names = |layer: usize| {
-            ["gate", "up", "down"].map(|part| format!("blk.{layer}.ffn_{part}_exps.weight"))
-        };
-        let complete = layers.iter().all(|&layer| {
-            names(layer).iter().all(|name| {
-                pack.file(name)
-                    .is_some_and(|file| file.header.experts as usize == experts)
-            })
-        });
-        if !complete {
-            return Ok(());
-        }
-        let pack_bytes: u64 = layers
-            .iter()
-            .flat_map(|&layer| names(layer))
-            .filter_map(|name| pack.file(&name))
-            .flat_map(|file| file.header.sections.iter().map(|s| s.length))
-            .sum();
-        let dense = self.fixed_projection_bytes()?;
-        // The Q8 draft banks are anonymous MLX memory built at load: a mapped
-        // host must hold them beside the dense banks.
-        let draft_bank = self.mtp_bank_estimate()?;
-        let mut candidate = self.plan.clone();
-        if let Err(e) = plan(
-            &mut candidate,
-            dense.saturating_add(draft_bank),
-            pool_bytes,
-            pack_bytes,
-        ) {
-            self.plan.mapped_bank_budget = candidate.mapped_bank_budget;
-            self.plan.live_non_reclaimable = candidate.live_non_reclaimable;
-            tracing::warn!("qwen4 residency: slot path, {e}");
-            self.live.set_fallback(Fallback::LoadGate {
-                pack: pack_bytes,
-                budget: candidate.mapped_bank_budget,
-            });
-            return Ok(());
-        }
-        let mut mapped = HashMap::with_capacity(layers.len());
-        let mut bytes = 0u64;
-        for &layer in &layers {
-            let [gate, up, down] = names(layer);
-            let files = [&gate, &up, &down].map(|name| pack.file(name));
-            let [Some(gate), Some(up), Some(down)] = files else {
-                return Ok(());
-            };
-            match MappedExperts::open([gate, up, down], experts) {
-                Ok((layer_banks, layer_bytes)) => {
-                    bytes += layer_bytes;
-                    mapped.insert(layer, layer_banks);
-                }
-                Err(e) => {
-                    tracing::warn!("qwen4 mapped residency unavailable, using slots: {e}");
-                    return Ok(());
-                }
-            }
-        }
-        self.plan = candidate;
-        let files = (0..=layers.last().copied().unwrap_or(0))
-            .map(|layer| mapped.get(&layer).map(|experts| experts.maps.clone()))
-            .collect();
-        match super::super::prefetch::Pool::new(
-            files,
-            super::super::prefetch::Pread,
-            super::super::prefetch::WORKERS,
-            Arc::clone(&self.rows_pending),
-        ) {
-            Ok(pool) => self.prefetch = Some(pool),
-            Err(e) => tracing::warn!("qwen4 mapped pack stream unavailable: {e}"),
-        }
-        self.cache_limit = self.plan.budget;
-        self.draft_bank_budget = draft_bank;
-        self.slot_capacity = Some(experts);
-        self.slot_bank_budget = None;
-        self.plan.mapped_bytes = bytes;
-        self.plan.partial_expert_slots = experts;
-        self.mapped_experts = mapped;
-        self.live.store(&self.plan);
-        tracing::info!(
-            "qwen4 mapped residency: {} layers x {experts} experts, {:.1} GiB mapped within a {:.1} GiB bank budget ({:.1} GiB live host memory), {:.1} GiB budget for dense banks, rows and {:.2} GiB of draft banks",
-            layers.len(),
-            bytes as f64 / (1u64 << 30) as f64,
-            self.plan.mapped_bank_budget as f64 / (1u64 << 30) as f64,
-            self.plan.live_non_reclaimable as f64 / (1u64 << 30) as f64,
-            self.cache_limit as f64 / (1u64 << 30) as f64,
-            draft_bank as f64 / (1u64 << 30) as f64
-        );
-        Ok(())
     }
 
     /// Publish the residency the load settled on.
@@ -1320,9 +1079,8 @@ impl Store {
     }
 
     /// The load settled on its residency and read the dense banks: build the
-    /// MTP head's draft banks, then start the pack stream. A head the host
-    /// cannot stage keeps its drafts on the row reader for the process; the
-    /// load goes on.
+    /// MTP head's draft banks, then start any direct expert fill. A head the
+    /// host cannot stage keeps its drafts on the row reader for the process.
     pub(in super::super) fn finish_load(&mut self) -> Result<()> {
         if self.plan.direct || self.slot_bank_budget.is_some() {
             self.finish_load_with(&mut super::super::memory::admit_direct)
@@ -1348,40 +1106,7 @@ impl Store {
                 "Qwen4 MTP expert banks unavailable; drafts read expert rows"
             );
         }
-        self.start_pack_stream();
         self.start_direct_fill()
-    }
-
-    /// The load picked the mapped plan and read the dense banks: stream the
-    /// pack into the page cache, so a request that arrives after the stream
-    /// finds it resident. Nothing is wired by it and the live-memory gate's
-    /// inputs do not move (file pages are reclaimable).
-    pub(in super::super) fn start_pack_stream(&self) {
-        if self.plan.mapped
-            && let Some(pool) = &self.prefetch
-            && !pool.sampled_resident()
-        {
-            pool.start();
-        }
-    }
-
-    /// A turn opens over the mapped pack: a pack that is not fully resident
-    /// gets a stream unless one runs already, and the turn's first pass
-    /// streams instead of touching every bank.
-    fn stream_for_turn(&mut self) {
-        self.streaming_pass = false;
-        if !self.plan.mapped {
-            return;
-        }
-        let Some(pool) = &self.prefetch else {
-            return;
-        };
-        if pool.streaming() {
-            self.streaming_pass = true;
-        } else if !pool.sampled_resident() {
-            pool.start();
-            self.streaming_pass = true;
-        }
     }
 
     pub(in super::super) fn activate_expert_slots(&mut self) -> Result<()> {
@@ -1413,7 +1138,7 @@ impl Store {
     }
 
     fn suspend_expert_slots(&mut self, force_empty: bool) -> Result<()> {
-        if self.plan.mapped || (self.plan.direct && self.direct_slow_source) {
+        if self.plan.direct && self.direct_slow_source {
             return Ok(());
         }
         if self.plan.direct && self.slots.values().any(|slots| !slots.identity_ready()) {
@@ -1437,366 +1162,10 @@ impl Store {
         Ok(())
     }
 
-    /// The first turn of a measurement window opens: a trip whose switch
-    /// failed at its pass moves the process to the slot path first, then the
-    /// window's SSD count and slow streak begin. Returns the fallback applied.
-    pub(in super::super) fn begin_turn(&mut self) -> Result<Option<Fallback>> {
-        let applied = self.apply_fallback()?;
-        self.activate_expert_slots()?;
-        self.tripwire
-            .begin_turn(super::super::memory::process_disk_reads());
-        Ok(applied)
-    }
-
-    /// A turn opens beside turns already open: residency is one per store,
-    /// so an armed trip moves every open turn to slots here; the window they
-    /// share keeps its baseline. Returns the fallback applied.
-    pub(in super::super) fn apply_fallback(&mut self) -> Result<Option<Fallback>> {
-        match self.tripwire.take() {
-            Some(why) if self.plan.mapped => {
-                self.leave_mapped(&why)?;
-                Ok(Some(why))
-            }
-            _ => {
-                self.stream_for_turn();
-                Ok(None)
-            }
-        }
-    }
-
-    /// One main-network pass over `rows` rows took `elapsed`. A pass that
-    /// trips the wire is the last mapped one: the store leaves the mapped
-    /// path here, between two passes of the same request, and the request
-    /// goes on over slot banks with its state intact (the pass's arrays hold
-    /// their own leases on the mapping). Returns the fallback applied; a
-    /// switch that fails leaves the trip armed for the next turn to open.
-    pub(in super::super) fn observe_pass(
-        &mut self,
-        rows: usize,
-        elapsed: Duration,
-    ) -> Result<Option<Fallback>> {
-        self.observe_pass_at(rows, elapsed, super::super::memory::process_disk_reads())
-    }
-
-    pub(in super::super) fn observe_pass_at(
-        &mut self,
-        rows: usize,
-        elapsed: Duration,
-        reads: u64,
-    ) -> Result<Option<Fallback>> {
-        if !self.plan.mapped {
-            return Ok(None);
-        }
-        let mapped = &self.mapped_experts;
-        let Some(why) = self
-            .tripwire
-            .observe(rows, elapsed, reads, self.plan.mapped_bytes, || {
-                pack_resident(mapped)
-            })
-            .cloned()
-        else {
-            return Ok(None);
-        };
-        tracing::warn!(
-            "qwen4 residency: mapped turn thrashes ({why}); the request goes on over slots"
-        );
-        match self.apply_fallback() {
-            Ok(applied) => Ok(applied),
-            Err(error) => {
-                self.tripwire.rearm(why);
-                Err(error)
-            }
-        }
-    }
-
-    /// A layer sweep of a prefill group ended: the SSD rule alone is checked
-    /// here (the slow-pass rules see the group's windows after it). Returns
-    /// whether a trip is held, this one or an earlier one not yet applied.
-    pub(in super::super) fn observe_sweep(&mut self) -> bool {
-        if !self.plan.mapped {
-            return self.tripwire.tripped().is_some();
-        }
-        let mapped = &self.mapped_experts;
-        if let Some(why) = self.tripwire.observe_ssd(
-            super::super::memory::process_disk_reads(),
-            self.plan.mapped_bytes,
-            || pack_resident(mapped),
-        ) {
-            tracing::warn!(
-                "qwen4 residency: mapped turn thrashes ({why}); the group goes on over slots after this sweep"
-            );
-        }
-        self.tripwire.tripped().is_some()
-    }
-
-    /// Apply a trip held by `observe_sweep` (or armed earlier) now that
-    /// nothing lazy reads a mapped bank: the store leaves the mapped path and
-    /// the request goes on over slots. Without a held trip nothing changes;
-    /// a switch that fails leaves the trip armed for the next turn to open.
-    pub(in super::super) fn apply_held_trip(&mut self) -> Result<Option<Fallback>> {
-        let Some(why) = self.tripwire.take() else {
-            return Ok(None);
-        };
-        if !self.plan.mapped {
-            return Ok(None);
-        }
-        match self.leave_mapped(&why) {
-            Ok(()) => Ok(Some(why)),
-            Err(error) => {
-                self.tripwire.rearm(why);
-                Err(error)
-            }
-        }
-    }
-
-    /// A layer-major prefill group of more than one window starts: its
-    /// bank touches run asynchronously and keep going after the stream ends,
-    /// until `end_group`.
-    pub(in super::super) fn begin_group(&mut self) {
-        self.group_in_progress = true;
-    }
-
-    /// The group ended, committed or not: touches issued since
-    /// `begin_group` and not taken by a commit are dropped.
-    pub(in super::super) fn end_group(&mut self) {
-        self.group_in_progress = false;
-        self.pending_touch.clear();
-    }
-
-    /// The arrays of the asynchronous touches since the last take; a group
-    /// commit evaluates them with its frontier.
-    pub(in super::super) fn take_pending_touches(&mut self) -> Vec<MxArray> {
-        std::mem::take(&mut self.pending_touch)
-    }
-
-    /// The turn opened over a pack that streams (or streamed) into the page
-    /// cache: its first pass runs beside the stream.
-    pub(in super::super) fn streaming_pass(&self) -> bool {
-        self.streaming_pass
-    }
-
-    /// Whether the pack stream's threads exist.
-    #[cfg(test)]
-    pub(in super::super) fn pack_stream_alive(&self) -> bool {
-        self.prefetch.is_some()
-    }
-
-    #[cfg(test)]
-    pub(in super::super) fn group_in_progress(&self) -> bool {
-        self.group_in_progress
-    }
-
-    #[cfg(test)]
-    pub(in super::super) fn pending_touches(&self) -> usize {
-        self.pending_touch.len()
-    }
-
-    #[cfg(test)]
-    pub(in super::super) fn tripwire_mut(&mut self) -> &mut super::super::tripwire::Tripwire {
-        &mut self.tripwire
-    }
-
-    /// Hold `why` as a sweep or pass would have tripped it; the store
-    /// applies it where it applies a real trip.
-    #[cfg(test)]
-    pub(in super::super) fn trip(&mut self, why: Fallback) {
-        self.tripwire.rearm(why);
-    }
-
-    /// Drop the mapped banks and run the slot path from here on: the slot
-    /// budget from the live host, banks built lazily by `expert_slots`, the
-    /// dense banks and rows already held kept.
-    fn leave_mapped(&mut self, why: &Fallback) -> Result<()> {
-        self.leave_mapped_with(
-            why,
-            &mut super::super::memory::host_memory,
-            &mut std::thread::sleep,
-        )
-    }
-
-    /// The banks go first: their pages stay wired until the driver lets go
-    /// of them, and a budget read while they are counts the pack against
-    /// the slots for the life of the process.
-    pub(super) fn leave_mapped_with(
-        &mut self,
-        why: &Fallback,
-        host: &mut dyn FnMut() -> Result<super::super::memory::HostMemory>,
-        sleep: &mut dyn FnMut(Duration),
-    ) -> Result<()> {
-        let experts = self.mapped_experts.values().next().map(|m| m.experts);
-        self.prefetch = None;
-        self.mapped_experts.clear();
-        self.draft_bank_budget = 0;
-        self.streaming_pass = false;
-        self.last_touch = None;
-        self.pending_touch.clear();
-        self.mapped_pass_start = None;
-        self.slot_capacity = None;
-        self.slot_bank_budget = None;
-        self.slot_reclaim_since = None;
-        crate::array::memory::synchronize();
-        let mut plan = self.plan.clone();
-        super::super::memory::slot_fallback_plan_with(&mut plan, self.cache_bytes, host, sleep);
-        self.plan = plan;
-        self.cache_limit = self.plan.budget;
-        if let (Some(experts), Some(top)) = (
-            experts,
-            self.metadata
-                .get("qwen4exp.expert_used_count")
-                .and_then(GgufMetaValue::as_u64),
-        ) {
-            self.plan.partial_expert_slots = self.expert_slot_capacity(experts, top as usize)?;
-        }
-        self.live.set_fallback(why.clone());
-        self.live.store(&self.plan);
-        tracing::warn!(
-            "qwen4 residency: mapped -> slots ({why}); {:.1} GiB slot budget, {} slots",
-            self.cache_limit as f64 / (1u64 << 30) as f64,
-            self.plan.partial_expert_slots
-        );
-        Ok(())
-    }
-
-    /// Called at the start of every forward pass (layer 0's MoE). `main` is
-    /// false for a pass that reads no mapped bank (the MTP head runs its own
-    /// experts); such a pass must leave the stamp alone, or a run of drafts
-    /// hides the gap the next main pass has to re-wire for.
-    pub(in super::super) fn wire_mapped_banks(&mut self, main: bool) -> Result<()> {
-        self.wire_mapped_banks_at(Instant::now(), main).map(|_| ())
-    }
-
-    /// Returns whether the banks were touched. A stale pass while the pack
-    /// streams does not touch: the touch binds every bank at once, so the
-    /// driver would fault the whole pack in on the model thread at its own
-    /// rate before layer 0 runs; the stream is ahead of the layers instead.
-    pub(super) fn wire_mapped_banks_at(&mut self, now: Instant, main: bool) -> Result<bool> {
-        if !self.plan.mapped || !main {
-            return Ok(false);
-        }
-        let stale = self
-            .mapped_pass_start
-            .is_none_or(|start| now.saturating_duration_since(start) > MAPPED_WIRE_GAP);
-        self.mapped_pass_start = Some(now);
-        if !stale {
-            return Ok(false);
-        }
-        if self.streaming_pass {
-            if self.prefetch.as_ref().is_some_and(|pool| pool.streaming()) {
-                self.last_touch = Some(now);
-                return Ok(false);
-            }
-            self.streaming_pass = false;
-        }
-        let elapsed = self.touch_banks(usize::MAX)?;
-        if elapsed > Duration::from_millis(50) {
-            tracing::debug!("qwen4 mapped banks wired in {elapsed:.1?}");
-        }
-        self.mapped_pass_start = Some(now + elapsed);
-        Ok(true)
-    }
-
-    /// Layer `layer` of a pass starts. While the pack streams or a prefill
-    /// group runs, the banks of the layers already run are touched every
-    /// `KEEP_WIRED_EVERY` so the driver keeps them wired through the long
-    /// first window: it unwires a bank idle for ~1.15 s, and re-wiring all of
-    /// them at the next window cost about a second with the GPU idle. Layers
-    /// past `layer` are not touched: their pages may still be cold.
-    pub(in super::super) fn keep_wired(&mut self, layer: usize, main: bool) -> Result<()> {
-        self.keep_wired_at(Instant::now(), layer, main)
-    }
-
-    pub(super) fn keep_wired_at(&mut self, now: Instant, layer: usize, main: bool) -> Result<()> {
-        if !main || !self.plan.mapped || !(self.streaming_pass || self.group_in_progress) {
-            return Ok(());
-        }
-        if self
-            .last_touch
-            .is_some_and(|last| now.saturating_duration_since(last) < KEEP_WIRED_EVERY)
-        {
-            return Ok(());
-        }
-        self.last_touch = Some(now);
-        let elapsed = self.touch_banks(layer)?;
-        tracing::debug!("qwen4 mapped banks through layer {layer} kept wired in {elapsed:.1?}");
-        if !self.prefetch.as_ref().is_some_and(|pool| pool.streaming()) {
-            self.streaming_pass = false;
-        }
-        Ok(())
-    }
-
-    /// The mapped store's stream over the same files through `issue`.
-    #[cfg(test)]
-    pub(super) fn pool_with(&mut self, issue: impl super::super::prefetch::Issue) {
-        let last = self.mapped_experts.keys().max().copied().unwrap_or(0);
-        let files = (0..=last)
-            .map(|layer| self.mapped_experts.get(&layer).map(|e| e.maps.clone()))
-            .collect();
-        self.prefetch = Some(
-            super::super::prefetch::Pool::new(files, issue, 2, Arc::clone(&self.rows_pending))
-                .unwrap(),
-        );
-    }
-
-    /// One eval reading one element of every bank of the layers up to
-    /// `through`, which binds them in a single command buffer. Inside a
-    /// prefill group the eval would wait behind the queued sweeps (51-258 ms
-    /// measured), so the read is submitted asynchronously and its arrays
-    /// wait for the group commit.
-    fn touch_banks(&mut self, through: usize) -> Result<Duration> {
-        #[cfg(test)]
-        {
-            let mut layers: Vec<usize> = self
-                .mapped_experts
-                .keys()
-                .copied()
-                .filter(|&layer| layer <= through)
-                .collect();
-            layers.sort_unstable();
-            self.touches.push(layers);
-        }
-        let mut groups: Vec<(DType, Vec<MxArray>)> = Vec::new();
-        for (_, mapped) in self
-            .mapped_experts
-            .iter()
-            .filter(|(layer, _)| **layer <= through)
-        {
-            for bank in &mapped.banks {
-                for array in [
-                    Some(&bank.values),
-                    bank.scales.as_ref(),
-                    bank.biases.as_ref(),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    let corner = array.slice(&[0, 0], &[1, 1])?;
-                    let dtype = corner.dtype()?;
-                    match groups.iter_mut().find(|(d, _)| *d == dtype) {
-                        Some((_, list)) => list.push(corner),
-                        None => groups.push((dtype, vec![corner])),
-                    }
-                }
-            }
-        }
-        let touched = groups
-            .iter()
-            .map(|(_, list)| MxArray::concatenate_many(list.iter().collect(), Some(0)))
-            .collect::<Result<Vec<_>>>()?;
-        let started = Instant::now();
-        if self.group_in_progress {
-            #[cfg(test)]
-            self.touches_async.push(true);
-            MxArray::async_eval_arrays(&touched.iter().collect::<Vec<_>>());
-            self.pending_touch.extend(touched);
-        } else {
-            #[cfg(test)]
-            self.touches_async.push(false);
-            MxArray::eval_arrays_with_context(
-                &touched.iter().collect::<Vec<_>>(),
-                "qwen4::mapped::wire",
-            )?;
-        }
-        Ok(started.elapsed())
+    /// Activate reclaimable banks and resume any unpublished direct layers
+    /// before the first turn of an idle model.
+    pub(in super::super) fn begin_turn(&mut self) -> Result<()> {
+        self.activate_expert_slots()
     }
 
     pub(in super::super) fn expert_slot_capacity(
@@ -1903,7 +1272,7 @@ impl Store {
         if !self.direct_gguf {
             return false;
         }
-        if self.plan.mapped || !gpu_repack_available() {
+        if !gpu_repack_available() {
             return false;
         }
         let Some(source) = &self.gguf_source else {
@@ -1931,7 +1300,7 @@ impl Store {
             .and_then(GgufMetaValue::as_u64)
             .unwrap_or(0);
         let planned = match self.slot_capacity {
-            Some(capacity) if !self.plan.mapped && experts > 0 => {
+            Some(capacity) if experts > 0 => {
                 (self.slot_routed_bytes()? as u128 * capacity as u128 / experts as u128) as u64
             }
             _ => 0,
@@ -1954,23 +1323,20 @@ impl Store {
         let [r0, r1, r2] = rows;
         let rows = [r0?, r1?, r2?];
         let direct = self.direct_layer(&names);
-        let prototypes: Vec<Arc<Weight>> = if direct {
-            names
-                .iter()
-                .zip(rows)
-                .map(|(name, rows)| {
-                    self.descriptor(name)?
-                        .direct_weight(name, rows)
-                        .map(Arc::new)
-                })
-                .collect::<Result<_>>()?
-        } else {
-            vec![
-                self.read(&names[0], 0, rows[0])?,
-                self.read(&names[1], 0, rows[1])?,
-                self.read(&names[2], 0, rows[2])?,
-            ]
-        };
+        if !direct {
+            // Unsupported layouts retain the decoder's bounded per-row CPU
+            // importer rather than constructing another weight-pack format.
+            return Ok(None);
+        }
+        let prototypes: Vec<Arc<Weight>> = names
+            .iter()
+            .zip(rows)
+            .map(|(name, rows)| {
+                self.descriptor(name)?
+                    .direct_weight(name, rows)
+                    .map(Arc::new)
+            })
+            .collect::<Result<_>>()?;
         if prototypes.iter().any(|w| w.scales.is_none()) {
             return Ok(None);
         }
@@ -2052,14 +1418,6 @@ impl Store {
             self.slot_hits += wanted.len() as u64;
             return Ok(Some((slots.banks.clone(), ids.to_vec(), experts)));
         }
-        if self.plan.mapped {
-            let mapped = self
-                .mapped_experts
-                .get(&layer)
-                .ok_or_else(|| err("Qwen4 mapped layer has no expert banks"))?;
-            self.slot_hits += wanted.len() as u64;
-            return Ok(Some((mapped.banks.clone(), ids.to_vec(), mapped.experts)));
-        }
         let mut slots = if let Some(slots) = self.slots.remove(&layer) {
             slots
         } else {
@@ -2098,8 +1456,7 @@ impl Store {
             // for this call. Duplicate requested ids resolve to one slot.
             for missing in missing.chunks(8) {
                 let mut chosen = Vec::new();
-                let mut requests = Vec::new();
-                for &expert in missing {
+                for _ in missing {
                     let slot = slots
                         .occupants
                         .iter()
@@ -2111,44 +1468,10 @@ impl Store {
                         .map(|(s, _)| s)
                         .ok_or_else(|| err("Qwen4 expert slot reservation exhausted"))?;
                     chosen.push(slot);
-                    for part in 0..3 {
-                        requests.push((
-                            slots.names[part].clone(),
-                            expert as usize * slots.rows[part],
-                            slots.rows[part],
-                        ));
-                    }
                 }
-                if slots.direct {
-                    if let Err(error) = self.fill_direct_chunk(&mut slots, missing, &chosen) {
-                        slots.invalidate_transaction();
-                        return Err(error);
-                    }
-                } else {
-                    let mut destinations = Vec::new();
-                    for bank in &slots.banks {
-                        destinations.extend(bank.arrays().iter().map(|a| a.as_raw_ptr()));
-                    }
-                    let imported = self.read_expert_batch(&requests)?;
-                    let mut sources: Vec<_> = imported
-                        .iter()
-                        .flat_map(|w| w.arrays().into_iter().map(|a| a.as_raw_ptr()))
-                        .collect();
-                    let slots_u32: Vec<_> = chosen.iter().map(|&s| s as u32).collect();
-                    let ok = {
-                        unsafe {
-                            mlx_sys::mlx_qwen4_copy_weight_rows(
-                                destinations.as_mut_ptr(),
-                                sources.as_mut_ptr(),
-                                slots_u32.as_ptr(),
-                                destinations.len(),
-                                missing.len(),
-                            )
-                        }
-                    };
-                    if !ok {
-                        return Err(err("Qwen4 expert slot transaction failed"));
-                    }
+                if let Err(error) = self.fill_direct_chunk(&mut slots, missing, &chosen) {
+                    slots.invalidate_transaction();
+                    return Err(error);
                 }
                 for (&expert, &slot) in missing.iter().zip(&chosen) {
                     if let Some(old) = slots.occupants[slot] {
@@ -2208,9 +1531,6 @@ impl Store {
                     .is_some_and(ExpertSlots::identity_ready)
             });
         }
-        if self.plan.mapped {
-            return (0..layers).all(|layer| self.mapped_experts.contains_key(&layer));
-        }
         (0..layers).all(|layer| {
             self.slots.get(&layer).is_some_and(|slots| {
                 !slots.suspended && slots.occupants.first().is_some_and(Option::is_some)
@@ -2231,13 +1551,6 @@ impl Store {
                 self.slots.get(&layer).is_some_and(|slots| {
                     !slots.suspended && slots.direct && fused_bank_modes(&slots.banks)
                 })
-            });
-        }
-        if self.plan.mapped {
-            return (0..layers).all(|layer| {
-                self.mapped_experts
-                    .get(&layer)
-                    .is_some_and(|mapped| fused_bank_modes(&mapped.banks))
             });
         }
         (0..layers).all(|layer| {
@@ -2280,14 +1593,6 @@ impl Store {
             let local = ids.reshape(&[-1])?.astype(DType::Uint32)?;
             return Ok((slots.banks.clone(), local, slots.mapping.len()));
         }
-        if self.plan.mapped {
-            let mapped = self
-                .mapped_experts
-                .get(&layer)
-                .ok_or_else(|| err("Qwen4 tentative prefill has no mapped bank"))?;
-            let local = ids.reshape(&[-1])?.astype(DType::Uint32)?;
-            return Ok((mapped.banks.clone(), local, mapped.experts));
-        }
         let count = self
             .slots
             .get(&layer)
@@ -2324,13 +1629,6 @@ impl Store {
             };
             let local = ids.reshape(&[-1])?.astype(DType::Uint32)?;
             return Ok(Some((slots.banks.clone(), local)));
-        }
-        if self.plan.mapped {
-            let Some(mapped) = self.mapped_experts.get(&layer) else {
-                return Ok(None);
-            };
-            let local = ids.reshape(&[-1])?.astype(DType::Uint32)?;
-            return Ok(Some((mapped.banks.clone(), local)));
         }
         let Some(slots) = self.slots.get_mut(&layer).filter(|s| !s.suspended) else {
             return Ok(None);
@@ -2388,20 +1686,6 @@ impl Store {
                 if selected.iter().any(|&e| e as usize >= slots.mapping.len()) {
                     return Err(err(
                         "Qwen4 device route names an expert outside the direct banks",
-                    ));
-                }
-                self.slot_hits += selected.iter().collect::<HashSet<_>>().len() as u64;
-            }
-            return Ok(true);
-        }
-        if self.plan.mapped {
-            for &(layer, selected) in entries {
-                let Some(mapped) = self.mapped_experts.get(&layer) else {
-                    return Ok(false);
-                };
-                if selected.iter().any(|&e| e as usize >= mapped.experts) {
-                    return Err(err(
-                        "Qwen4 device route names an expert outside the mapped pack",
                     ));
                 }
                 self.slot_hits += selected.iter().collect::<HashSet<_>>().len() as u64;
@@ -2493,7 +1777,7 @@ impl Store {
         reduced: &MxArray,
     ) -> Result<()> {
         if self.full_residency() {
-            return MxArray::eval_arrays_with_context(&[reduced], "qwen4::mapped::complete_window");
+            return MxArray::eval_arrays_with_context(&[reduced], "qwen4::direct::complete_window");
         }
         if let Some(slots) = self.slots.get_mut(&layer) {
             // Complete every outstanding reader, including independent earlier
@@ -2841,7 +2125,6 @@ mod tests {
             layers.push(bytes);
         }
         store.plan.hot_bytes = layers.iter().sum::<u64>() + FIXED_BANK_BYTES;
-        store.plan.mapped = false;
         store.draft_bank_budget = 0;
         for (name, rows, width) in DRAFT_HEADS {
             store.tensors.insert(
@@ -2898,8 +2181,8 @@ mod tests {
         Ok(())
     }
 
-    /// A mapped MTP turn installs the Q8 draft banks; a trip then sizes the
-    /// slots from the fallback budget while they stay pinned. Every layer's
+    /// A direct MTP load installs the Q8 draft banks; partial slots then fit
+    /// beside them while they stay pinned. Every layer's
     /// slot bank is built with only LRU rows evictable, so the last one needs
     /// the banks, all slots and its staging inside the budget.
     #[test]
@@ -3040,7 +2323,7 @@ mod tests {
         };
         let routed: u64 = layers.iter().sum();
         assert_eq!(routed, 78_538_342_400);
-        let anonymous = super::super::super::memory::mapped_desired(
+        let anonymous = super::super::super::memory::direct_desired(
             FIXED_BANK_BYTES.saturating_add(3_040_870_400),
         );
         for (bank_budget, expected) in [(routed - 1, 511), (72 << 30, 503), (40 << 30, 279)] {
@@ -3120,11 +2403,11 @@ mod tests {
 
     /// The gate_up draft bank takes f32 sides (+0.2 GiB) only where they fit
     /// and keeps the f16 layout otherwise, never declining a bank the f16
-    /// build would take: below a 22.66 GiB slot allowance, beside a mapped
+    /// build would take: below a 22.66 GiB slot allowance, beside a direct
     /// plan that charged the f16 layout, or with only the f16 staging left.
     /// The reserve never holds less than the build.
     /// MUTATIONS: only the f32 layout -> 22 GiB; the slot allowance beside a
-    /// mapped charge -> the f16 charge; no f16 retry -> the f16 staging.
+    /// direct charge -> the f16 charge; no f16 retry -> the f16 staging.
     #[test]
     fn draft_banks_take_f32_sides_only_where_they_fit() {
         let Some((mut store, _)) = draft_bank_store(None) else {
@@ -3160,7 +2443,7 @@ mod tests {
         store.cache_limit = 40 << 30;
         for (charged, built) in [(F16_BANKS, &f16), (F32_GATE_UP, &f32)] {
             store.draft_bank_budget = charged;
-            let why = format!("a mapped plan charged {charged}");
+            let why = format!("a direct plan charged {charged}");
             assert_eq!(store.mtp_bank_estimate().unwrap(), charged, "{why}");
             assert_eq!(&layout(&store), built, "{why}");
         }
@@ -3176,92 +2459,6 @@ mod tests {
         store.slot_bytes += 1;
         assert_eq!(layout(&store), None);
         assert_eq!(store.bytes_read, 0);
-    }
-    /// The same fallback on the released checkpoint: a mapped load with the
-    /// MTP head attached installs the draft banks (the load's call), a trip
-    /// leaves mapped mode on a 128 GiB host snapshot that leaves a 16 GiB slot
-    /// budget, and the next turn builds every layer's slot bank. Opt-in:
-    /// `QWEN4_EXP_REAL_MODEL=<gguf> QWEN4_EXP_REAL_AUX=<MTP checkpoint dir>
-    /// QWEN4_EXP_REAL_INPUTS=<inputs.json> cargo test -p mlx-core --lib
-    /// real_fallback_slots_beside_draft_banks -- --ignored --nocapture`
-    #[test]
-    #[ignore = "real checkpoint: QWEN4_EXP_REAL_MODEL, QWEN4_EXP_REAL_INPUTS, QWEN4_EXP_REAL_AUX; --test-threads=1"]
-    fn real_fallback_slots_beside_draft_banks() {
-        use super::super::super::tests::{argmax, go_live, real_prompt};
-        use super::super::super::{auxiliary, decoder::Decoder, gguf, memory::HostMemory};
-        let model = std::env::var("QWEN4_EXP_REAL_MODEL").expect("QWEN4_EXP_REAL_MODEL");
-        let aux = std::env::var("QWEN4_EXP_REAL_AUX").expect("QWEN4_EXP_REAL_AUX");
-        let inputs = std::env::var("QWEN4_EXP_REAL_INPUTS").expect("QWEN4_EXP_REAL_INPUTS");
-        let mut prompt = real_prompt(Path::new(&inputs), "6k");
-        prompt.truncate(8);
-        let mut store = Store::open(Path::new(&model)).unwrap();
-        let mut config = gguf::config(&store).unwrap();
-        auxiliary::attach(&mut store, &mut config, Path::new(&aux)).unwrap();
-        let mut decoder = Decoder::new(config, store).unwrap();
-        go_live(&mut decoder, 0);
-        assert!(
-            decoder.weights.plan.mapped,
-            "the live host refused the pack"
-        );
-        let draft = decoder.weights.prepare_mtp_expert_banks().unwrap();
-        assert_eq!(
-            draft, 3_040_870_400,
-            "the mapped plan admits the draft banks with f32 gate_up sides"
-        );
-        let turn = |decoder: &mut Decoder| -> Result<Vec<u32>> {
-            decoder.reset();
-            decoder.weights.begin_turn()?;
-            let mut logits = decoder.prefill_chunk(&prompt, None, true)?;
-            let mut text = Vec::new();
-            for _ in 0..16 {
-                let id = argmax(&logits);
-                text.push(id);
-                logits = decoder.step(id)?;
-            }
-            Ok(text)
-        };
-        let mapped = turn(&mut decoder).unwrap();
-        assert!(
-            decoder.weights.plan.mapped,
-            "the mapped turn tripped by itself"
-        );
-        let host = HostMemory {
-            physical: 128 << 30,
-            free: 36 << 30,
-            ..Default::default()
-        };
-        decoder
-            .weights
-            .leave_mapped_with(
-                &Fallback::SsdReads { read: 0, mapped: 0 },
-                &mut || Ok(host),
-                &mut |_| {},
-            )
-            .unwrap();
-        decoder.residency_changed();
-        assert_eq!(decoder.weights.cache_limit, 16 << 30);
-        let slots = decoder.weights.plan.partial_expert_slots;
-        let held = decoder.weights.cache_bytes;
-        eprintln!(
-            "fallback: {slots} slots, 16 GiB budget, {:.3} GiB banks ({:.3} GiB draft), {:.3} GiB held",
-            decoder.weights.bank_bytes as f64 / (1u64 << 30) as f64,
-            decoder.weights.mtp_bank_bytes().unwrap() as f64 / (1u64 << 30) as f64,
-            held as f64 / (1u64 << 30) as f64
-        );
-        let fallback = turn(&mut decoder)
-            .unwrap_or_else(|e| panic!("the slot turn failed at {slots} slots: {e}"));
-        assert_eq!(
-            decoder.weights.slots.len(),
-            48,
-            "every layer built its slots"
-        );
-        assert!(decoder.weights.cache_bytes <= decoder.weights.cache_limit);
-        assert_eq!(mapped, fallback, "the slot turn gives the mapped text");
-        eprintln!(
-            "slot bytes {:.3} GiB, cache {:.3} GiB",
-            decoder.weights.slot_bytes as f64 / (1u64 << 30) as f64,
-            decoder.weights.cache_bytes as f64 / (1u64 << 30) as f64
-        );
     }
     /// The released checkpoint loaded on the slot path at a forced budget:
     /// `prepare_hot` caches the slot count, the load's call admits
@@ -3293,7 +2490,6 @@ mod tests {
             decoder.weights.prepare_fixture_hot().unwrap();
             decoder.weights.publish_live();
             decoder.residency_changed();
-            assert!(!decoder.weights.plan.mapped);
             assert_eq!(decoder.weights.cache_limit, limit);
             let slots = decoder.weights.plan.partial_expert_slots;
             assert_eq!(decoder.weights.slot_capacity, Some(slots));

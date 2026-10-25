@@ -32,6 +32,21 @@ mlx_array* wrap(array a) {
 
 extern "C" {
 
+// Return settled storage without waiting. Do not inspect a pending event:
+// doing so can clear a GPU error that the next wait must report.
+const void* mlx_array_data_ptr(mlx_array* handle) {
+  try {
+    if (handle == nullptr) return nullptr;
+    auto* arr = reinterpret_cast<array*>(handle);
+    const bool settled = arr->status() == array::Status::available ||
+        (arr->status() == array::Status::evaluated && !arr->event().valid());
+    if (!settled || arr->buffer().ptr() == nullptr) return nullptr;
+    return arr->data<void>();
+  } catch (...) {
+    return nullptr;
+  }
+}
+
 // A row-contiguous array of `shape` / `dtype` over a fresh, uninitialized
 // allocator buffer; `*out_data` receives its CPU-visible storage pointer.
 // Null (and `*out_data` null) on a bad shape or dtype, or when the allocator

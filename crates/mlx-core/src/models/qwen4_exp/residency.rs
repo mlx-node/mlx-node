@@ -262,7 +262,7 @@ impl Store {
     }
 
     /// Fixed projections with their dense compute copies: the hot set minus
-    /// routed experts, what the mapped budget must hold as banks.
+    /// routed experts, which the direct gate holds beside expert banks.
     pub(super) fn fixed_projection_bytes(&self) -> Result<u64> {
         self.tensors
             .iter()
@@ -390,9 +390,9 @@ impl Store {
         // Fixed projections get at most a quarter, leaving most RAM for experts.
         let mut names = Vec::new();
         let mut bytes = 0u64;
-        // The mapped budget holds no experts: banks may take all but the
-        // LRU room memory::mapped_desired reserved.
-        let cap = if self.plan.mapped || self.plan.direct {
+        // Full direct experts are gated separately: fixed banks may take all
+        // but the LRU room memory::direct_desired reserved.
+        let cap = if self.plan.direct {
             self.cache_limit
                 .saturating_sub(self.slot_bytes)
                 .saturating_sub(2 << 30)
@@ -605,8 +605,8 @@ impl Store {
             .collect()
     }
 
-    /// What the draft banks may take: the mapped plan's charge for them, or
-    /// the slot path's auxiliary allowance.
+    /// What the draft banks may take: the direct plan's charge for them, or
+    /// the partial path's auxiliary allowance.
     fn mtp_bank_allowance(&self) -> Result<u64> {
         if self.draft_bank_budget > 0 {
             Ok(self.draft_bank_budget)
@@ -615,7 +615,7 @@ impl Store {
         }
     }
 
-    /// Anonymous bytes the draft banks take once built: what a mapped plan
+    /// Anonymous bytes the draft banks take once built: what a direct plan
     /// charges beside the dense banks while the MTP head is attached, so the
     /// live-memory gate and the bank admission see the same number. The f32
     /// sides only when the allowance holds them, as in the admission.
@@ -1635,7 +1635,7 @@ mod tests {
                     .keys()
                     .all(|n| is_fixed_projection(n, &s.tensors[n]))
             );
-            let loaded = (s.bytes_read, s.packed_bytes_read);
+            let loaded = s.bytes_read;
             let mut control =
                 Store::open_metadata(&path, Some(&Store::fixture_pack_root())).unwrap();
             for name in names {
@@ -1658,7 +1658,7 @@ mod tests {
                     assert_eq!(&*got, &*want, "partial bank changed {name}, row {start}");
                 }
             }
-            assert_eq!((s.bytes_read, s.packed_bytes_read), loaded);
+            assert_eq!(s.bytes_read, loaded);
             let expert = s
                 .tensors
                 .keys()
@@ -1689,7 +1689,7 @@ mod tests {
                     .all(|name| is_fixed_projection(name, &s.tensors[name]))
             );
             assert!(!s.banks.is_empty());
-            let reads = (s.bytes_read, s.packed_hits, s.packed_bytes_read);
+            let reads = s.bytes_read;
             let mut reference =
                 Store::open_metadata(&path, Some(&Store::fixture_pack_root())).unwrap();
             for name in s.banks.keys().cloned().collect::<Vec<_>>() {
@@ -1713,7 +1713,7 @@ mod tests {
                 }
                 assert!(s.read(&name, rows, 1).is_err());
             }
-            assert_eq!((s.bytes_read, s.packed_hits, s.packed_bytes_read), reads);
+            assert_eq!(s.bytes_read, reads);
             for name in [
                 "token_embd.weight",
                 "embed_tokens.weight",
