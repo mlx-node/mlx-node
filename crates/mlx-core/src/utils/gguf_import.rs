@@ -1570,13 +1570,19 @@ impl GgufPreload {
             ready: Vec::new(),
             consume: &mut transform,
         };
+        // CLEF keeps read slots alive through streamed residency. A slightly
+        // smaller slot bounds peak memory while preserving read overlap.
+        let read_config = ReadConfig {
+            slot_bytes: if streaming { 63 << 20 } else { SLOT_BYTES },
+            ..ReadConfig::default()
+        };
         let raw = read_gguf_tensors_consuming(
             &set.main.file,
             &set.main,
             main_plan,
             backend,
             mode,
-            &ReadConfig::default(),
+            &read_config,
             &main_probe,
             streaming.then_some(&mut consumer),
         )?;

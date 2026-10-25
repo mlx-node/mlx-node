@@ -2775,7 +2775,8 @@ async fn load_with_thread_impl(
                                 &mut per_layer_quant,
                                 default_plq,
                                 residency,
-                                clef_layers_finalized.is_multiple_of(4),
+                                clef_layers_finalized == 2
+                                    || clef_layers_finalized.is_multiple_of(4),
                             )?;
                             // Only the bf16 fallback needs a separate eval to
                             // release its lazy source graph before the next layer.
