@@ -736,12 +736,11 @@ static inline ulong q5_1_8codes(uint n, uint h) {
 
 // qwen4_exp expert banks materialize the symmetric offset that the ordinary
 // Q8_0 importer deliberately omits. Read d from the source and evaluate in
-// float, matching derived_symmetric_bias_bits: f16(-128 * f32(d)).
+// float, matching qwen4_exp's MLX f16 multiply: f16(-128 * f32(d)).
 static inline ushort q8_0_derived_bias(const device uint* r, uint B) {
   ushort bits = ldh(r, B);
-  // The CPU arithmetic quiets NaNs and keeps their sign and payload; Metal's
-  // arithmetic conversion would canonicalize the payload instead.
-  if ((bits & 0x7FFFu) > 0x7C00u) return bits | 0x0200u;
+  // qwen4_exp's MLX f16 multiply canonicalizes every NaN to +qNaN.
+  if ((bits & 0x7FFFu) > 0x7C00u) return 0x7E00u;
   half d = as_type<half>(bits);
   return as_type<ushort>(half(-128.0f * float(d)));
 }

@@ -420,6 +420,7 @@ impl HybridSchedulerBackend for Inner {
     }
     fn scheduled_turn_closed(&mut self, seq: SeqId) {
         self.open_turns.remove(&seq);
+        self.close_turn_if_idle();
     }
     fn scheduler_prefill_slice_tokens(&self) -> u32 {
         self.decoder.prefill_slice_size() as u32

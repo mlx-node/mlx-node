@@ -2,7 +2,17 @@
 //! mutated only after their last lazy reader has completed. The ordinary LRU
 //! supplies bounded misses and releases imported chunks after the slot copy.
 use super::*;
+use crate::array::alloc::{OutLayout, SendPtr};
+use crate::array::purgeable::{PurgeableBank, PurgeableState};
+use crate::utils::gguf_gpu::{
+    GpuRepackKind, RepackDst, band_offset_rule, gpu_kind_for, gpu_repack_available, gpu_repack_band,
+};
+use crate::utils::gguf_read::{ALIGN, READ_THREADS, Reader, Window, plan_reads};
 use std::time::{Duration, Instant};
+
+const DIRECT_READ_BYTES: usize = 8 << 20;
+const DIRECT_STAGING_SLOTS: usize = 4;
+const SLOT_RECLAIM_FALLBACK: Duration = Duration::from_secs(30);
 
 /// The driver unwires a bound file-backed bank ~1.15 s after its last use and
 /// re-wires resident pages at 12-17 ms/GiB, one command buffer at a time. A
@@ -96,8 +106,27 @@ fn fused_bank_modes(banks: &[Arc<Weight>; 3]) -> bool {
             .all(|w| w.group == 32 && w.scales.is_some() && w.biases.is_some())
 }
 
+struct SlotBank {
+    template: Weight,
+    storage: Vec<PurgeableBank>,
+}
+
+impl SlotBank {
+    fn set_purgeable(&self, state: PurgeableState) -> Result<bool> {
+        let mut empty = false;
+        for bank in &self.storage {
+            empty |= bank.set_purgeable(state)? == PurgeableState::Empty;
+        }
+        Ok(empty)
+    }
+}
+
 pub(super) struct ExpertSlots {
     banks: [Arc<Weight>; 3],
+    storage: Option<[SlotBank; 3]>,
+    direct: bool,
+    suspended: bool,
+    purge_requested: bool,
     names: [String; 3],
     rows: [usize; 3],
     occupants: Vec<Option<u32>>,
@@ -109,6 +138,7 @@ pub(super) struct ExpertSlots {
 }
 
 impl Weight {
+    #[cfg(not(target_os = "macos"))]
     fn empty_slots(&self, capacity: usize) -> Result<Self> {
         let allocate = |a: &MxArray| {
             let shape = a.shape()?;
@@ -122,6 +152,26 @@ impl Weight {
             ..self.clone()
         })
     }
+    #[cfg(target_os = "macos")]
+    fn purgeable_slots(&self, capacity: usize) -> Result<(Self, SlotBank)> {
+        let mut storage = Vec::with_capacity(3);
+        let mut allocate = |a: &MxArray| -> Result<MxArray> {
+            let shape = a.shape()?;
+            let bank = PurgeableBank::new(&[shape[0] * capacity as i64, shape[1]], a.dtype()?)?;
+            let array = bank.array().clone();
+            storage.push(bank);
+            Ok(array)
+        };
+        let template = Self {
+            values: allocate(&self.values)?,
+            dense_bf16: None,
+            scales: self.scales.as_ref().map(&mut allocate).transpose()?,
+            biases: self.biases.as_ref().map(&mut allocate).transpose()?,
+            ..self.clone()
+        };
+        Ok((template.clone(), SlotBank { template, storage }))
+    }
+
     fn arrays(&self) -> Vec<&MxArray> {
         [
             Some(&self.values),
@@ -134,7 +184,322 @@ impl Weight {
     }
 }
 
+impl Tensor {
+    fn direct_kind(&self) -> Option<(GgufTensorType, GpuRepackKind)> {
+        let Encoding::Gguf(ty) = &self.encoding else {
+            return None;
+        };
+        let kind = match ty {
+            GgufTensorType::Q8_0 => GpuRepackKind::Q8_0Bias,
+            GgufTensorType::Q5_1 => GpuRepackKind::Q5_1,
+            _ if ty.k_quant_format().is_some() => gpu_kind_for(*ty)?,
+            _ => return None,
+        };
+        Some((*ty, kind))
+    }
+
+    fn direct_weight(&self, name: &str, rows: usize) -> Result<Weight> {
+        let (ty, kind) = self
+            .direct_kind()
+            .ok_or_else(|| err(format!("{name} has no direct GGUF repack")))?;
+        let info = GgufTensorInfo {
+            name: name.into(),
+            n_dims: 2,
+            dims: vec![self.width()? as u64, rows as u64],
+            tensor_type: ty,
+            offset: 0,
+        };
+        let (dst, _) = RepackDst::alloc_for_kind(&info, kind, OutLayout::RowMajor)?;
+        let (group, bits, mode) = if let Some(format) = ty.k_quant_format() {
+            (
+                format.group_size() as i32,
+                format.bits() as i32,
+                format.mlx_mode(),
+            )
+        } else {
+            (32, if ty == GgufTensorType::Q5_1 { 5 } else { 8 }, "affine")
+        };
+        Ok(Weight {
+            values: dst.weight,
+            dense_bf16: None,
+            scales: dst.scales,
+            biases: dst.biases,
+            group,
+            bits,
+            mode: mode.into(),
+        })
+    }
+}
+
+impl ExpertSlots {
+    fn activate(&mut self) -> Result<()> {
+        if !self.suspended {
+            return Ok(());
+        }
+        let mut empty = std::mem::take(&mut self.purge_requested);
+        if let Some(storage) = &self.storage {
+            for bank in storage {
+                empty |= bank.set_purgeable(PurgeableState::NonVolatile)?;
+            }
+        }
+        if empty {
+            if let Some(storage) = &self.storage {
+                self.banks = storage
+                    .each_ref()
+                    .map(|bank| Arc::new(bank.template.clone()));
+            }
+            self.invalidate_all();
+        }
+        self.suspended = false;
+        Ok(())
+    }
+
+    fn suspend(&mut self, force_empty: bool) -> Result<()> {
+        let Some(storage) = &self.storage else {
+            return Ok(());
+        };
+        for bank in storage {
+            bank.set_purgeable(PurgeableState::Volatile)?;
+            if force_empty {
+                bank.set_purgeable(PurgeableState::Empty)?;
+            }
+        }
+        self.purge_requested |= force_empty;
+        self.suspended = true;
+        Ok(())
+    }
+
+    fn invalidate_all(&mut self) {
+        self.occupants.fill(None);
+        self.mapping.fill(None);
+        self.device_mapping = None;
+        self.ages.fill(0);
+        self.tick = 0;
+    }
+
+    fn invalidate_transaction(&mut self) {
+        // A direct fill writes destinations in place. On any error, no bank
+        // from this layer may publish a mixture of old and new source bytes.
+        self.invalidate_all();
+    }
+}
+
+struct DirectRequest {
+    part: usize,
+    slot: usize,
+    rows: usize,
+    k: usize,
+    kind: GpuRepackKind,
+}
+
+struct DirectRun<'r, 's> {
+    reader: &'r Reader<'s>,
+    requests: &'r [DirectRequest],
+    windows: &'r [Window],
+    staging: &'r [(MxArray, SendPtr<u8>)],
+    slots: &'r mut ExpertSlots,
+}
+
+impl DirectRun<'_, '_> {
+    fn submit(&self, w: usize) {
+        let (_, ptr) = &self.staging[w % self.staging.len()];
+        let window = &self.windows[w];
+        self.reader
+            .submit(w as u64, *ptr, window.len, window.file_off);
+    }
+
+    fn complete(&self, _w: usize, outputs: &[MxArray]) -> Result<()> {
+        let refs: Vec<&MxArray> = outputs.iter().collect();
+        MxArray::eval_arrays_with_context(&refs, "qwen4::slots::direct_gguf_window")
+    }
+
+    fn all(&mut self) -> Result<()> {
+        let n = self.windows.len();
+        let slots = self.staging.len();
+        if n == 0 {
+            return Err(err("Qwen4 direct GGUF fill has no read windows"));
+        }
+        for w in 0..(slots - 1).min(n) {
+            self.submit(w);
+        }
+        let mut pending: Vec<MxArray> = Vec::new();
+        for w in 0..n {
+            if w > 0 {
+                self.complete(w - 1, &std::mem::take(&mut pending))?;
+            }
+            let next = w + slots - 1;
+            if next < n {
+                self.submit(next);
+            }
+            self.reader.wait(w as u64)?;
+            pending = self.window(w)?;
+            let refs: Vec<&MxArray> = pending.iter().collect();
+            MxArray::async_eval_arrays(&refs);
+        }
+        self.complete(n - 1, &pending)
+    }
+
+    fn window(&mut self, w: usize) -> Result<Vec<MxArray>> {
+        let (staging, _) = &self.staging[w % self.staging.len()];
+        let mut outputs = Vec::new();
+        for band in &self.windows[w].bands {
+            let request = &self.requests[band.tensor];
+            let current = Arc::clone(&self.slots.banks[request.part]);
+            let destination_shape = current.values.shape()?.to_vec();
+            let dst = RepackDst {
+                weight: current.values.clone(),
+                scales: current.scales.clone(),
+                biases: current.biases.clone(),
+            };
+            let row0 = request
+                .slot
+                .checked_mul(request.rows)
+                .and_then(|row| row.checked_add(band.row0))
+                .and_then(|row| u32::try_from(row).ok())
+                .ok_or_else(|| err("Qwen4 direct GGUF destination row exceeds u32"))?;
+            let k = u32::try_from(request.k)
+                .map_err(|_| err("Qwen4 direct GGUF row width exceeds u32"))?;
+            let rows = u32::try_from(band.rows)
+                .map_err(|_| err("Qwen4 direct GGUF band rows exceed u32"))?;
+            let next = gpu_repack_band(
+                staging,
+                band.src_off as u64,
+                request.kind,
+                OutLayout::RowMajor,
+                k,
+                row0,
+                rows,
+                dst,
+            )
+            .map_err(|error| {
+                err(format!(
+                    "Qwen4 direct GGUF {} slot {} band row {} + {} (dst {destination_shape:?}, k {k}): {error}",
+                    self.slots.names[request.part], request.slot, row0, rows
+                ))
+            })?;
+            outputs.push(next.weight.clone());
+            outputs.extend(next.scales.iter().cloned());
+            outputs.extend(next.biases.iter().cloned());
+            let mut weight = current.as_ref().clone();
+            weight.values = next.weight;
+            weight.scales = next.scales;
+            weight.biases = next.biases;
+            self.slots.banks[request.part] = Arc::new(weight);
+        }
+        Ok(outputs)
+    }
+}
+
 impl Store {
+    fn fill_direct_chunk(
+        &mut self,
+        slots: &mut ExpertSlots,
+        experts: &[u32],
+        chosen: &[usize],
+    ) -> Result<()> {
+        let source = self
+            .gguf_source
+            .clone()
+            .ok_or_else(|| err("Qwen4 direct GGUF fill has no main source"))?;
+        source.verify_path()?;
+        let file = self.file(&source.path).map_err(|error| {
+            err(format!(
+                "Failed to open GGUF '{}': {error}",
+                source.path.display()
+            ))
+        })?;
+        source.verify(&file)?;
+        let mut requests = Vec::with_capacity(experts.len() * 3);
+        let mut infos = Vec::with_capacity(experts.len() * 3);
+        let mut source_bytes = 0u64;
+        let mut bank_bytes = 0u64;
+        for (&expert, &slot) in experts.iter().zip(chosen) {
+            for part in 0..3 {
+                let tensor = self.descriptor(&slots.names[part])?.clone();
+                let (ty, kind) = tensor
+                    .direct_kind()
+                    .ok_or_else(|| err("Qwen4 direct GGUF fill lost its repack route"))?;
+                let rows = slots.rows[part];
+                let start = expert as usize * rows;
+                let (offset, bytes) = tensor.range(start, rows)?;
+                source_bytes += bytes;
+                bank_bytes += tensor.runtime_bytes()? / tensor.shape[0] as u64;
+                infos.push(GgufTensorInfo {
+                    name: slots.names[part].clone(),
+                    n_dims: 2,
+                    dims: vec![tensor.width()? as u64, rows as u64],
+                    tensor_type: ty,
+                    offset,
+                });
+                requests.push(DirectRequest {
+                    part,
+                    slot,
+                    rows,
+                    k: tensor.width()?,
+                    kind,
+                });
+            }
+        }
+        let header = GgufFile {
+            version: 3,
+            tensor_count: infos.len() as u64,
+            metadata: HashMap::new(),
+            tensors: infos,
+            alignment: 32,
+            data_offset: 0,
+        };
+        let windows = plan_reads(&header, source.len, DIRECT_READ_BYTES, &|_| 1)?;
+        let slot_len = windows.iter().map(|w| w.len).max().unwrap_or(0);
+        // Keep the aligned backing allocations alive until the GPU stream drains.
+        let mut _staging_owners = Vec::with_capacity(DIRECT_STAGING_SLOTS.min(windows.len()));
+        let mut staging = Vec::with_capacity(DIRECT_STAGING_SLOTS.min(windows.len()));
+        for _ in 0..DIRECT_STAGING_SLOTS.min(windows.len()) {
+            let allocation = slot_len
+                .checked_add(ALIGN as usize)
+                .ok_or_else(|| err("Qwen4 direct GGUF staging size overflows usize"))?;
+            let bank = PurgeableBank::new(&[allocation as i64], DType::Uint8)?;
+            let base = bank.data_ptr();
+            let padding = (ALIGN as usize - (base.0 as usize % ALIGN as usize)) % ALIGN as usize;
+            let array = bank
+                .array()
+                .slice_axis(0, padding as i64, (padding + slot_len) as i64)?;
+            let ptr = SendPtr(base.0.wrapping_add(padding));
+            if !(ptr.0 as usize).is_multiple_of(ALIGN as usize) {
+                return Err(err("Qwen4 direct GGUF staging is not 16 KiB aligned"));
+            }
+            _staging_owners.push(bank);
+            staging.push((array, ptr));
+        }
+        let result = std::thread::scope(|scope| {
+            let reader = Reader::start(
+                scope,
+                file.as_ref(),
+                &source.path,
+                READ_THREADS,
+                DIRECT_READ_BYTES,
+            );
+            let mut run = DirectRun {
+                reader: &reader,
+                requests: &requests,
+                windows: &windows,
+                staging: &staging,
+                slots,
+            };
+            run.all()
+        });
+        // A failed window may already have encoded earlier bands. Finish them
+        // before the caller unpublishes every destination in this transaction.
+        crate::array::memory::synchronize();
+        result?;
+        source.verify(&file)?;
+        #[cfg(test)]
+        self.direct_read_windows
+            .extend(windows.iter().map(|w| (w.file_off, w.len)));
+        self.bytes_read += source_bytes;
+        self.slot_upload_bytes += bank_bytes;
+        Ok(())
+    }
+
     pub(super) fn auxiliary_cache_allowance(&self) -> Result<u64> {
         let auxiliary = self
             .tensors
@@ -347,11 +712,56 @@ impl Store {
         }
     }
 
+    pub(in super::super) fn activate_expert_slots(&mut self) -> Result<()> {
+        if self
+            .slot_reclaim_since
+            .is_some_and(|since| since.elapsed() >= SLOT_RECLAIM_FALLBACK)
+        {
+            self.purge_expert_slots()?;
+        }
+        for slots in self.slots.values_mut() {
+            slots.activate()?;
+        }
+        self.slot_reclaim_since = None;
+        Ok(())
+    }
+
+    /// Between turns, complete every bank reader before making slot storage
+    /// reclaimable. Explicit Empty is the fallback when automatic reclaim is
+    /// unavailable or a probe needs a guaranteed refill.
+    pub(in super::super) fn reclaim_expert_slots(&mut self) -> Result<()> {
+        self.suspend_expert_slots(false)
+    }
+
+    pub(in super::super) fn purge_expert_slots(&mut self) -> Result<()> {
+        self.suspend_expert_slots(true)
+    }
+
+    fn suspend_expert_slots(&mut self, force_empty: bool) -> Result<()> {
+        if self.plan.mapped {
+            return Ok(());
+        }
+        self.complete_device_readers()?;
+        crate::array::memory::synchronize();
+        for slots in self.slots.values_mut() {
+            slots.suspend(force_empty)?;
+        }
+        self.slot_reclaim_since = if force_empty {
+            None
+        } else if self.slots.values().any(|slots| slots.storage.is_some()) {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        Ok(())
+    }
+
     /// The first turn of a measurement window opens: a trip whose switch
     /// failed at its pass moves the process to the slot path first, then the
     /// window's SSD count and slow streak begin. Returns the fallback applied.
     pub(in super::super) fn begin_turn(&mut self) -> Result<Option<Fallback>> {
         let applied = self.apply_fallback()?;
+        self.activate_expert_slots()?;
         self.tripwire
             .begin_turn(super::super::memory::process_disk_reads());
         Ok(applied)
@@ -541,6 +951,7 @@ impl Store {
         self.pending_touch.clear();
         self.mapped_pass_start = None;
         self.slot_capacity = None;
+        self.slot_reclaim_since = None;
         crate::array::memory::synchronize();
         let mut plan = self.plan.clone();
         super::super::memory::slot_fallback_plan_with(&mut plan, self.cache_bytes, host, sleep);
@@ -794,6 +1205,31 @@ impl Store {
             })
     }
 
+    pub(super) fn direct_layer(&self, names: &[String; 3]) -> bool {
+        #[cfg(test)]
+        if !self.direct_gguf {
+            return false;
+        }
+        if self.plan.mapped || !gpu_repack_available() {
+            return false;
+        }
+        let Some(source) = &self.gguf_source else {
+            return false;
+        };
+        names.iter().all(|name| {
+            self.descriptor(name).is_ok_and(|tensor| {
+                tensor.path == source.path
+                    && tensor.direct_kind().is_some_and(|(_, kind)| {
+                        let rule = band_offset_rule(kind) as u64;
+                        tensor.offset.is_multiple_of(rule)
+                            && tensor.row_bytes().is_ok_and(|n| {
+                                n <= DIRECT_READ_BYTES as u64 && n.is_multiple_of(rule)
+                            })
+                    })
+            })
+        })
+    }
+
     /// Every layer's slot bank at the cached capacity, built or not.
     pub(super) fn planned_slot_bytes(&self) -> Result<u64> {
         let experts = self
@@ -843,11 +1279,24 @@ impl Store {
                 .map(|n| self.descriptor(n).map(|d| d.shape[1]));
             let [r0, r1, r2] = rows;
             let rows = [r0?, r1?, r2?];
-            let prototypes = [
-                self.read(&names[0], 0, rows[0])?,
-                self.read(&names[1], 0, rows[1])?,
-                self.read(&names[2], 0, rows[2])?,
-            ];
+            let direct = self.direct_layer(&names);
+            let prototypes: Vec<Arc<Weight>> = if direct {
+                names
+                    .iter()
+                    .zip(rows)
+                    .map(|(name, rows)| {
+                        self.descriptor(name)?
+                            .direct_weight(name, rows)
+                            .map(Arc::new)
+                    })
+                    .collect::<Result<_>>()?
+            } else {
+                vec![
+                    self.read(&names[0], 0, rows[0])?,
+                    self.read(&names[1], 0, rows[1])?,
+                    self.read(&names[2], 0, rows[2])?,
+                ]
+            };
             if prototypes.iter().any(|w| w.scales.is_none()) {
                 return Ok(None);
             }
@@ -858,16 +1307,41 @@ impl Store {
             self.evict_to(self.cache_limit.saturating_sub(bytes + MAX_READ_BYTES * 3))?;
             super::super::memory::maintain_freelist(self.plan.physical_bytes);
             super::super::memory::admit(bytes + MAX_READ_BYTES * 3)?;
-            let banks = [
-                Arc::new(prototypes[0].empty_slots(capacity)?),
-                Arc::new(prototypes[1].empty_slots(capacity)?),
-                Arc::new(prototypes[2].empty_slots(capacity)?),
-            ];
+            #[cfg(target_os = "macos")]
+            let (banks, storage) = {
+                let mut banks = Vec::with_capacity(3);
+                let mut storage = Vec::with_capacity(3);
+                for prototype in &prototypes {
+                    let (bank, owner) = prototype.purgeable_slots(capacity)?;
+                    banks.push(Arc::new(bank));
+                    storage.push(owner);
+                }
+                let banks: [Arc<Weight>; 3] = banks
+                    .try_into()
+                    .map_err(|_| err("Qwen4 slot bank count mismatch"))?;
+                let storage: [SlotBank; 3] = storage
+                    .try_into()
+                    .map_err(|_| err("Qwen4 slot storage count mismatch"))?;
+                (banks, Some(storage))
+            };
+            #[cfg(not(target_os = "macos"))]
+            let (banks, storage) = {
+                let banks = [
+                    Arc::new(prototypes[0].empty_slots(capacity)?),
+                    Arc::new(prototypes[1].empty_slots(capacity)?),
+                    Arc::new(prototypes[2].empty_slots(capacity)?),
+                ];
+                (banks, None)
+            };
             self.slot_bytes += bytes;
             self.cache_bytes += bytes;
             self.peak_cache_bytes = self.peak_cache_bytes.max(self.cache_bytes);
             ExpertSlots {
                 banks,
+                storage,
+                direct,
+                suspended: false,
+                purge_requested: false,
                 names,
                 rows,
                 occupants: vec![None; capacity],
@@ -878,6 +1352,7 @@ impl Store {
                 readers: Vec::new(),
             }
         };
+        slots.activate()?;
         let result = (|| -> Result<_> {
             let mut missing: Vec<u32> = wanted
                 .iter()
@@ -898,10 +1373,6 @@ impl Store {
             // All wanted slots, including newly loaded misses, remain protected
             // for this call. Duplicate requested ids resolve to one slot.
             for missing in missing.chunks(8) {
-                let mut destinations = Vec::new();
-                for bank in &slots.banks {
-                    destinations.extend(bank.arrays().iter().map(|a| a.as_raw_ptr()));
-                }
                 let mut chosen = Vec::new();
                 let mut requests = Vec::new();
                 for &expert in missing {
@@ -924,25 +1395,36 @@ impl Store {
                         ));
                     }
                 }
-                let imported = self.read_expert_batch(&requests)?;
-                let mut sources: Vec<_> = imported
-                    .iter()
-                    .flat_map(|w| w.arrays().into_iter().map(|a| a.as_raw_ptr()))
-                    .collect();
-                let slots_u32: Vec<_> = chosen.iter().map(|&s| s as u32).collect();
-                let ok = {
-                    unsafe {
-                        mlx_sys::mlx_qwen4_copy_weight_rows(
-                            destinations.as_mut_ptr(),
-                            sources.as_mut_ptr(),
-                            slots_u32.as_ptr(),
-                            destinations.len(),
-                            missing.len(),
-                        )
+                if slots.direct {
+                    if let Err(error) = self.fill_direct_chunk(&mut slots, missing, &chosen) {
+                        slots.invalidate_transaction();
+                        return Err(error);
                     }
-                };
-                if !ok {
-                    return Err(err("Qwen4 expert slot transaction failed"));
+                } else {
+                    let mut destinations = Vec::new();
+                    for bank in &slots.banks {
+                        destinations.extend(bank.arrays().iter().map(|a| a.as_raw_ptr()));
+                    }
+                    let imported = self.read_expert_batch(&requests)?;
+                    let mut sources: Vec<_> = imported
+                        .iter()
+                        .flat_map(|w| w.arrays().into_iter().map(|a| a.as_raw_ptr()))
+                        .collect();
+                    let slots_u32: Vec<_> = chosen.iter().map(|&s| s as u32).collect();
+                    let ok = {
+                        unsafe {
+                            mlx_sys::mlx_qwen4_copy_weight_rows(
+                                destinations.as_mut_ptr(),
+                                sources.as_mut_ptr(),
+                                slots_u32.as_ptr(),
+                                destinations.len(),
+                                missing.len(),
+                            )
+                        }
+                    };
+                    if !ok {
+                        return Err(err("Qwen4 expert slot transaction failed"));
+                    }
                 }
                 for (&expert, &slot) in missing.iter().zip(&chosen) {
                     if let Some(old) = slots.occupants[slot] {
@@ -998,7 +1480,11 @@ impl Store {
         if self.plan.mapped {
             return (0..layers).all(|layer| self.mapped_experts.contains_key(&layer));
         }
-        (0..layers).all(|layer| self.slots.contains_key(&layer))
+        (0..layers).all(|layer| {
+            self.slots.get(&layer).is_some_and(|slots| {
+                !slots.suspended && slots.occupants.first().is_some_and(Option::is_some)
+            })
+        })
     }
 
     pub(in super::super) fn note_prefill_routes(&mut self, layer: usize, ids: Vec<u32>) {
@@ -1018,7 +1504,8 @@ impl Store {
         }
         (0..layers).all(|layer| {
             self.slots.get(&layer).is_some_and(|slots| {
-                slots.occupants.first().is_some_and(Option::is_some)
+                !slots.suspended
+                    && slots.occupants.first().is_some_and(Option::is_some)
                     && self.wide_routes.get(&layer).is_some_and(|ids| {
                         !ids.is_empty()
                             && ids.iter().all(|&id| {
@@ -1085,7 +1572,7 @@ impl Store {
             let local = ids.reshape(&[-1])?.astype(DType::Uint32)?;
             return Ok(Some((mapped.banks.clone(), local)));
         }
-        let Some(slots) = self.slots.get_mut(&layer) else {
+        let Some(slots) = self.slots.get_mut(&layer).filter(|s| !s.suspended) else {
             return Ok(None);
         };
         if slots.device_mapping.is_none() {
@@ -1144,7 +1631,7 @@ impl Store {
             return Ok(true);
         }
         for &(layer, selected) in entries {
-            let Some(slots) = self.slots.get(&layer) else {
+            let Some(slots) = self.slots.get(&layer).filter(|s| !s.suspended) else {
                 return Ok(false);
             };
             if selected.iter().any(|&e| {
@@ -1305,6 +1792,10 @@ mod tests {
                 layer,
                 ExpertSlots {
                     banks: [weight.clone(), weight.clone(), weight.clone()],
+                    storage: None,
+                    direct: false,
+                    suspended: false,
+                    purge_requested: false,
                     names: ["gate".into(), "up".into(), "down".into()],
                     rows: [1; 3],
                     occupants: vec![Some(layer as u32)],
@@ -1343,6 +1834,10 @@ mod tests {
             0,
             ExpertSlots {
                 banks: [bank.clone(), bank.clone(), bank],
+                storage: None,
+                direct: false,
+                suspended: false,
+                purge_requested: false,
                 names: Default::default(),
                 rows: [1; 3],
                 occupants: vec![Some(0)],
@@ -1387,6 +1882,10 @@ mod tests {
             1,
             ExpertSlots {
                 banks: previous,
+                storage: None,
+                direct: false,
+                suspended: false,
+                purge_requested: false,
                 names: Default::default(),
                 rows: [1; 3],
                 occupants: vec![Some(0)],

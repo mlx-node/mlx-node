@@ -391,7 +391,7 @@ fn row_bytes(kind: GpuRepackKind, k: usize) -> usize {
 mod tests {
     use super::*;
     use crate::models::quant_dispatch::kquant_tile_rows;
-    use crate::utils::gguf::{GgufFile, derived_symmetric_bias_bits, load_quantized_tensor};
+    use crate::utils::gguf::{GgufFile, load_quantized_tensor};
     use crate::utils::gguf_kquant::{KQuantScales, repack_kquant};
     use std::collections::HashMap;
 
@@ -501,7 +501,7 @@ mod tests {
 
     /// The untouched CPU oracle: `repack_kquant`, tiled with
     /// `kquant_tile_rows` for Tiled64, or `load_quantized_tensor`. Q8_0Bias
-    /// derives its extra bank with `derived_symmetric_bias_bits`.
+    /// derives its extra bank with qwen4_exp's actual `mul_scalar(-128)`.
     fn oracle(
         kind: GpuRepackKind,
         layout: OutLayout,
@@ -578,12 +578,7 @@ mod tests {
         let scales = scale_bytes(s);
         let biases = match kind {
             GpuRepackKind::Q5_1 => b.unwrap().to_uint16_native().unwrap(),
-            GpuRepackKind::Q8_0Bias => scales
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| derived_symmetric_bias_bits(u16::from_le_bytes(*c), 128))
-                .collect(),
+            GpuRepackKind::Q8_0Bias => s.mul_scalar(-128.).unwrap().to_uint16_native().unwrap(),
             _ => Vec::new(),
         };
         Bytes {

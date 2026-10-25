@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Seek, SeekFrom};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -19,7 +19,7 @@ use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::QuantizedLinear;
 use crate::utils::gguf::{
     GgufFile, GgufLoadOptions, GgufMetaValue, GgufTensorInfo, GgufTensorType, load_gguf_tensor,
-    parse_gguf, symmetric_zero_point,
+    parse_gguf, source_file_identity_digest, symmetric_zero_point,
 };
 
 #[path = "expert_slots.rs"]
@@ -156,6 +156,86 @@ impl Tensor {
             }
             Encoding::Safe(_) => false,
         })
+    }
+}
+
+/// The single main GGUF whose identity guards direct expert fills. Split
+/// checkpoints keep the established mapped-pack/checkpoint reader.
+#[derive(Clone)]
+pub(super) struct DirectGgufSource {
+    path: PathBuf,
+    identity: String,
+    len: u64,
+}
+
+impl DirectGgufSource {
+    fn new(path: &Path) -> Result<Self> {
+        let path = path.canonicalize().map_err(err)?;
+        let meta = fs::metadata(&path).map_err(err)?;
+        Ok(Self {
+            identity: source_file_identity_digest(&path, &meta),
+            len: meta.len(),
+            path,
+        })
+    }
+
+    fn verify_path(&self) -> Result<()> {
+        let live = fs::metadata(&self.path).map_err(|e| {
+            err(format!(
+                "Failed to stat GGUF '{}': {e}",
+                self.path.display()
+            ))
+        })?;
+        if live.len() < self.len {
+            return Err(err(format!(
+                "GGUF '{}' is truncated: expected {} bytes, found {}",
+                self.path.display(),
+                self.len,
+                live.len()
+            )));
+        }
+        if live.len() != self.len || source_file_identity_digest(&self.path, &live) != self.identity
+        {
+            return Err(err(format!(
+                "GGUF '{}' changed since open; retry the request",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn verify(&self, file: &File) -> Result<()> {
+        let live = fs::metadata(&self.path).map_err(|e| {
+            err(format!(
+                "Failed to stat GGUF '{}': {e}",
+                self.path.display()
+            ))
+        })?;
+        let held = file.metadata().map_err(|e| {
+            err(format!(
+                "Failed to stat open GGUF '{}': {e}",
+                self.path.display()
+            ))
+        })?;
+        if live.len() < self.len && live.dev() == held.dev() && live.ino() == held.ino() {
+            return Err(err(format!(
+                "GGUF '{}' is truncated: expected {} bytes, found {}",
+                self.path.display(),
+                self.len,
+                live.len()
+            )));
+        }
+        if live.len() != self.len
+            || held.len() != self.len
+            || source_file_identity_digest(&self.path, &live) != self.identity
+            || source_file_identity_digest(&self.path, &held) != self.identity
+        {
+            return Err(err(format!(
+                "GGUF '{}' changed since open; retry the request",
+                self.path.display()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -447,6 +527,7 @@ pub struct Store {
     draft_bank_budget: u64,
     paired_banks: HashMap<(String, String), Arc<Weight>>,
     slots: HashMap<usize, expert_slots::ExpertSlots>,
+    slot_reclaim_since: Option<std::time::Instant>,
     mapped_experts: HashMap<usize, expert_slots::MappedExperts>,
     /// Start of the last forward pass in mapped mode (bank re-wire gate).
     mapped_pass_start: Option<std::time::Instant>,
@@ -480,6 +561,11 @@ pub struct Store {
     pub packed_hits: u64,
     pub packed_bytes_read: u64,
     mapped: Option<super::mapped_pack::MappedPack>,
+    gguf_source: Option<DirectGgufSource>,
+    #[cfg(test)]
+    direct_gguf: bool,
+    #[cfg(test)]
+    direct_read_windows: Vec<(u64, usize)>,
     /// One open descriptor per checkpoint file; row reads `pread` through it.
     files: HashMap<PathBuf, Arc<File>>,
     rows: Option<Fetcher>,
@@ -597,6 +683,7 @@ impl Store {
             draft_bank_budget: 0,
             paired_banks: HashMap::new(),
             slots: HashMap::new(),
+            slot_reclaim_since: None,
             mapped_experts: HashMap::new(),
             mapped_pass_start: None,
             prefetch: None,
@@ -622,6 +709,11 @@ impl Store {
             packed_hits: 0,
             packed_bytes_read: 0,
             mapped: None,
+            gguf_source: None,
+            #[cfg(test)]
+            direct_gguf: true,
+            #[cfg(test)]
+            direct_read_windows: Vec::new(),
             files: HashMap::new(),
             rows: None,
             rows_pending: Arc::default(),
@@ -850,6 +942,9 @@ impl Store {
         if count == 0 || count > 1024 {
             return Err(err("Invalid GGUF split count"));
         }
+        let direct_source = (count == 1)
+            .then(|| DirectGgufSource::new(first))
+            .transpose()?;
         if initial
             .metadata
             .get("split.no")
@@ -931,6 +1026,10 @@ impl Store {
             && total != self.tensors.len() as u64
         {
             return Err(err("GGUF split tensor count mismatch"));
+        }
+        if let Some(source) = direct_source {
+            source.verify(&File::open(&source.path).map_err(err)?)?;
+            self.gguf_source = Some(source);
         }
         Ok(())
     }
@@ -2692,11 +2791,27 @@ mod mapped_tests {
     }
 
     const EXPERTS: usize = 5;
-    const PARTS: [(&str, usize, usize, u32, usize); 3] = [
+    type Part = (&'static str, usize, usize, u32, usize);
+    const PARTS: [Part; 3] = [
         // (name, rows per expert, width, GGUF type, block bytes per row)
         ("blk.0.ffn_gate_exps.weight", 32, 256, 12, 144),
         ("blk.0.ffn_up_exps.weight", 32, 256, 12, 144),
         ("blk.0.ffn_down_exps.weight", 128, 64, 7, 48),
+    ];
+    const Q8_PARTS: [Part; 3] = [
+        PARTS[0],
+        PARTS[1],
+        ("blk.0.ffn_down_exps.weight", 128, 64, 8, 68),
+    ];
+    const Q5K_PARTS: [Part; 3] = [
+        ("blk.0.ffn_gate_exps.weight", 32, 256, 13, 176),
+        ("blk.0.ffn_up_exps.weight", 32, 256, 13, 176),
+        PARTS[2],
+    ];
+    const FLASH_PARTS: [Part; 3] = [
+        ("blk.0.ffn_gate_exps.weight", 640, 2560, 12, 1440),
+        ("blk.0.ffn_up_exps.weight", 640, 2560, 12, 1440),
+        ("blk.0.ffn_down_exps.weight", 2560, 640, 7, 480),
     ];
 
     /// Three routed expert tensors of one layer: Q4_K gate/up and Q5_1 down,
@@ -2707,30 +2822,42 @@ mod mapped_tests {
 
     /// The same three tensors for layers `0..layers`.
     fn write_fixture_layers(path: &Path, layers: usize) {
+        write_fixture_layout(path, layers, EXPERTS, &PARTS, 0, 0);
+    }
+
+    fn write_fixture_layout(
+        path: &Path,
+        layers: usize,
+        experts: usize,
+        parts: &[Part; 3],
+        header_pad: usize,
+        trailing: usize,
+    ) {
         let string = |bytes: &mut Vec<u8>, value: &str| {
             bytes.extend((value.len() as u64).to_le_bytes());
             bytes.extend(value.bytes());
         };
         let mut b = b"GGUF".to_vec();
         b.extend(3u32.to_le_bytes());
-        b.extend(((PARTS.len() * layers) as u64).to_le_bytes());
+        b.extend(((parts.len() * layers) as u64).to_le_bytes());
         b.extend(1u64.to_le_bytes());
         string(&mut b, "general.architecture");
         b.extend(8u32.to_le_bytes());
         string(&mut b, "qwen4exp");
         let mut offset = 0u64;
         for layer in 0..layers {
-            for (name, rows, width, ty, row_bytes) in PARTS {
+            for (name, rows, width, ty, row_bytes) in parts {
                 string(&mut b, &name.replace("blk.0.", &format!("blk.{layer}.")));
                 b.extend(3u32.to_le_bytes());
-                for d in [width as u64, rows as u64, EXPERTS as u64] {
+                for d in [*width as u64, *rows as u64, experts as u64] {
                     b.extend(d.to_le_bytes());
                 }
                 b.extend(ty.to_le_bytes());
                 b.extend(offset.to_le_bytes());
-                offset += (EXPERTS * rows * row_bytes) as u64;
+                offset += (experts * *rows * *row_bytes) as u64;
             }
         }
+        b.resize(b.len() + header_pad, 0);
         while !b.len().is_multiple_of(32) {
             b.push(0);
         }
@@ -2739,6 +2866,7 @@ mod mapped_tests {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             b.push((state >> 24) as u8);
         }
+        b.resize(b.len() + trailing, 0x5a);
         fs::write(path, b).unwrap();
     }
 
@@ -2844,6 +2972,323 @@ mod mapped_tests {
         assert_eq!(
             super::routed_expert_tensor("nextn.0.ffn_gate_exps.weight"),
             None
+        );
+    }
+
+    fn open_slots(temp: &Temp, gguf: &Path, pack: &str, capacity: usize, direct: bool) -> Store {
+        let mut store =
+            Store::open_fixture(gguf, Some(&temp.0.join(format!("{pack}-cache")))).unwrap();
+        store.prepare_mapped_pack_at(&temp.0.join(pack)).unwrap();
+        store.slot_capacity = Some(capacity);
+        store.direct_gguf = direct;
+        store
+    }
+
+    fn raw_fill_bytes(store: &Store, parts: &[Part; 3], ids: &[u32]) -> u64 {
+        ids.iter()
+            .flat_map(|&expert| {
+                parts.iter().map(move |&(name, rows, ..)| {
+                    store
+                        .descriptor(name)
+                        .unwrap()
+                        .range(expert as usize * rows, rows)
+                        .unwrap()
+                        .1
+                })
+            })
+            .sum()
+    }
+
+    /// Compare every value/scale/bias byte of every requested filled slot with
+    /// the existing mapped-pack `read_batch` record for that expert.
+    fn assert_banks_match_pack(
+        store: &Store,
+        parts: &[Part; 3],
+        banks: &[Arc<Weight>; 3],
+        ids: &[u32],
+        local: &[u32],
+    ) -> Vec<u8> {
+        let pack = store.mapped.as_ref().unwrap();
+        let mut all = Vec::new();
+        for (position, &expert) in ids.iter().enumerate() {
+            for (part, &(name, rows, ..)) in parts.iter().enumerate() {
+                let request = (name.to_owned(), expert as usize * rows, rows);
+                let expected = pack
+                    .read_batch(std::slice::from_ref(&request))
+                    .unwrap()
+                    .unwrap()
+                    .remove(0);
+                let actual = banks[part]
+                    .slice_rows(local[position] as usize * rows, rows)
+                    .unwrap();
+                let (arrays, data) = super::super::packed_cache::encode_weight(&actual).unwrap();
+                assert_eq!(arrays, expected.header.arrays, "{name} expert {expert}");
+                assert_eq!(data.len(), expected.data.len(), "{name} expert {expert}");
+                let mut base = 0;
+                for (array, info) in expected.header.arrays.iter().enumerate() {
+                    let end = base + info.bytes;
+                    if let Some(i) = data[base..end]
+                        .iter()
+                        .zip(&expected.data[base..end])
+                        .position(|(a, b)| a != b)
+                    {
+                        panic!(
+                            "{name} expert {expert} array {array} byte {}: actual {:02x?}, expected {:02x?}",
+                            base + i,
+                            &data[base + i..(base + i + 2).min(end)],
+                            &expected.data[base + i..(base + i + 2).min(end)]
+                        );
+                    }
+                    base = end;
+                }
+                assert_eq!(
+                    (actual.group, actual.bits, actual.mode.as_str()),
+                    (
+                        expected.header.group,
+                        expected.header.bits,
+                        expected.header.mode.as_str()
+                    ),
+                    "{name} expert {expert}"
+                );
+                all.extend(data);
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn direct_gguf_q5_1_slots_match_pack_eviction_and_purge_refill() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("q5_1.gguf");
+        write_fixture_layout(&gguf, 1, EXPERTS, &PARTS, 32, 17);
+        let mut store = open_slots(&temp, &gguf, "q5_1-pack", 2, true);
+        let ids = [0u32, 1];
+        let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        let mut compared = assert_banks_match_pack(&store, &PARTS, &banks, &ids, &local).len();
+        assert_eq!(
+            store.packed_hits, 0,
+            "direct fills bypassed the pack reader"
+        );
+        let first_fill = raw_fill_bytes(&store, &PARTS, &ids);
+        assert_eq!(store.bytes_read, first_fill);
+
+        // One miss evicts expert 0 and reuses its bank; expert 1 stays warm.
+        let next = [2u32, 1];
+        let one_fill = raw_fill_bytes(&store, &PARTS, &[2]);
+        let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &next).unwrap().unwrap();
+        assert_eq!(local, [0, 1], "the LRU bank was reused");
+        compared += assert_banks_match_pack(&store, &PARTS, &banks, &next, &local).len();
+        assert_eq!(store.bytes_read, first_fill + one_fill);
+
+        // Volatile banks either survive or take the same Empty refill path;
+        // explicit Empty guarantees the fallback and requires a full refill.
+        store.reclaim_expert_slots().unwrap();
+        let before = store.bytes_read;
+        let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &next).unwrap().unwrap();
+        compared += assert_banks_match_pack(&store, &PARTS, &banks, &next, &local).len();
+        assert!((store.bytes_read - before) <= first_fill);
+        store.purge_expert_slots().unwrap();
+        let before = store.bytes_read;
+        let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &next).unwrap().unwrap();
+        compared += assert_banks_match_pack(&store, &PARTS, &banks, &next, &local).len();
+        assert_eq!(store.bytes_read, before + first_fill);
+        assert!(store.device_slots_ready(1));
+        eprintln!(
+            "P3.0-d Q5_1 parity: {compared} bank bytes, eviction + volatile + explicit Empty refill"
+        );
+    }
+
+    #[test]
+    fn direct_gguf_idle_fallback_forces_a_fresh_fill() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("idle-fallback.gguf");
+        write_fixture(&gguf);
+        let mut store = open_slots(&temp, &gguf, "idle-fallback-pack", EXPERTS, true);
+        let ids = [0u32, 1];
+        store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        let first_fill = raw_fill_bytes(&store, &PARTS, &ids);
+        store.reclaim_expert_slots().unwrap();
+        store.slot_reclaim_since = Some(Instant::now() - Duration::from_secs(31));
+        store.activate_expert_slots().unwrap();
+        let before = store.bytes_read;
+        let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        assert_banks_match_pack(&store, &PARTS, &banks, &ids, &local);
+        assert_eq!(store.bytes_read, before + first_fill);
+        assert!(store.slot_reclaim_since.is_none());
+    }
+
+    #[test]
+    fn direct_gguf_source_flips_match_pack_for_q5_1_and_q8_0_bias() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        for (label, parts, flip) in [
+            ("q5_1", &PARTS, 8usize),
+            ("q5_k", &Q5K_PARTS, 8),
+            ("q8_0", &Q8_PARTS, 1),
+        ] {
+            let gguf = temp.0.join(format!("{label}-flip.gguf"));
+            write_fixture_layout(&gguf, 1, EXPERTS, parts, 64, 13);
+            let mut before = open_slots(&temp, &gguf, &format!("{label}-before"), EXPERTS, true);
+            let ids = [0u32];
+            let (banks, local, _) = before.expert_slots(0, EXPERTS, 1, &ids).unwrap().unwrap();
+            let before = assert_banks_match_pack(&before, parts, &banks, &ids, &local);
+
+            let parsed = parse_gguf(&gguf).unwrap();
+            let tensor = parsed
+                .tensors
+                .iter()
+                .find(|t| t.name == "blk.0.ffn_down_exps.weight")
+                .unwrap();
+            let at = (parsed.data_offset + tensor.offset) as usize + flip;
+            let mut bytes = fs::read(&gguf).unwrap();
+            bytes[at] ^= 0x20;
+            fs::write(&gguf, &bytes).unwrap();
+            let mut after = open_slots(&temp, &gguf, &format!("{label}-after"), EXPERTS, true);
+            let (banks, local, _) = after.expert_slots(0, EXPERTS, 1, &ids).unwrap().unwrap();
+            let after_bytes = assert_banks_match_pack(&after, parts, &banks, &ids, &local);
+            assert_ne!(before, after_bytes, "{label}: source flip had no effect");
+
+            // A source that changes after open is never mixed with the old
+            // identity, even though the mapped pack still exists.
+            let mut bytes = fs::read(&gguf).unwrap();
+            bytes[at + 1] ^= 0x04;
+            fs::write(&gguf, &bytes).unwrap();
+            let error = after.expert_slots(0, EXPERTS, 1, &[1]).err().unwrap();
+            assert!(error.reason.contains("changed since open"), "{error}");
+            assert!(!after.device_slots_ready(1));
+        }
+    }
+
+    #[test]
+    fn direct_gguf_missing_and_truncated_sources_fail_without_stale_slots() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        for truncated in [false, true] {
+            let temp = Temp::new();
+            let gguf = temp.0.join("source-error.gguf");
+            write_fixture(&gguf);
+            let mut store = open_slots(&temp, &gguf, "source-error-pack", EXPERTS, true);
+            if truncated {
+                let len = fs::metadata(&gguf).unwrap().len();
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&gguf)
+                    .unwrap()
+                    .set_len(len - 1)
+                    .unwrap();
+            } else {
+                fs::remove_file(&gguf).unwrap();
+            }
+            let error = store.expert_slots(0, EXPERTS, 2, &[0, 1]).err().unwrap();
+            if truncated {
+                assert!(error.reason.contains("truncated"), "{error}");
+            } else {
+                assert!(error.reason.contains("Failed to stat GGUF"), "{error}");
+            }
+            assert!(error.reason.contains("source-error.gguf"), "{error}");
+            assert!(!store.device_slots_ready(1));
+            assert!(store.direct_read_windows.is_empty());
+        }
+    }
+
+    #[test]
+    fn direct_gguf_kernel_unaligned_offsets_keep_the_mapped_route() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("unaligned.gguf");
+        write_fixture(&gguf);
+        let mut store = open_slots(&temp, &gguf, "unaligned-pack", EXPERTS, true);
+        let names = ["gate", "up", "down"].map(|part| format!("blk.0.ffn_{part}_exps.weight"));
+        store.tensors.get_mut(&names[0]).unwrap().offset += 1;
+        assert!(!store.direct_layer(&names));
+    }
+
+    #[test]
+    fn direct_gguf_flash_geometry_matches_pack_and_layers_reads_at_8mib() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        const EXPERTS: usize = 8;
+        let temp = Temp::new();
+        let gguf = temp.0.join("flash-geometry.gguf");
+        write_fixture_layout(&gguf, 1, EXPERTS, &FLASH_PARTS, 0, 0);
+        let mut store = open_slots(&temp, &gguf, "flash-geometry-pack", EXPERTS, true);
+        let ids: Vec<u32> = (0..EXPERTS as u32).collect();
+        let (banks, local, _) = store.expert_slots(0, EXPERTS, 8, &ids).unwrap().unwrap();
+        let compared = assert_banks_match_pack(&store, &FLASH_PARTS, &banks, &ids, &local).len();
+        assert_eq!(store.bytes_read, 24_576_000);
+        assert_eq!(store.slot_upload_bytes, store.slot_bytes);
+        assert!(store.direct_read_windows.len() > 1);
+        assert!(
+            store
+                .direct_read_windows
+                .iter()
+                .all(|&(off, len)| len <= 8 << 20 && off % (16 << 10) == 0),
+            "{:?}",
+            store.direct_read_windows
+        );
+        eprintln!(
+            "P3.0-d Flash geometry parity: {compared} bank bytes in {} aligned windows",
+            store.direct_read_windows.len()
+        );
+    }
+
+    /// Two seconds per reader of the same explicit Empty/refill transaction.
+    /// The direct path must not be slower than the mapped slot path.
+    #[test]
+    #[ignore = "2s per path purge/fill A/B probe; run with --nocapture"]
+    fn direct_gguf_purge_fill_probe_2s() {
+        const EXPERTS: usize = 8;
+        let temp = Temp::new();
+        let gguf = temp.0.join("purge-fill-probe.gguf");
+        write_fixture_layout(&gguf, 1, EXPERTS, &FLASH_PARTS, 0, 0);
+        let ids: Vec<u32> = (0..EXPERTS as u32).collect();
+        let mut results = Vec::new();
+        for direct in [true, false] {
+            let mut store = open_slots(&temp, &gguf, "purge-fill-probe-pack", EXPERTS, direct);
+            store.expert_slots(0, EXPERTS, 8, &ids).unwrap().unwrap();
+            // Warm both source and destination before measuring.
+            store.purge_expert_slots().unwrap();
+            store.expert_slots(0, EXPERTS, 8, &ids).unwrap().unwrap();
+            let cycle_bytes = store.slot_bytes;
+            let started = Instant::now();
+            let mut cycles = 0u64;
+            while started.elapsed() < Duration::from_secs(2) {
+                store.purge_expert_slots().unwrap();
+                store.expert_slots(0, EXPERTS, 8, &ids).unwrap().unwrap();
+                cycles += 1;
+            }
+            let elapsed = started.elapsed();
+            assert!(cycles > 0);
+            results.push((direct, cycle_bytes, cycles, elapsed));
+        }
+        for (direct, bytes, cycles, elapsed) in &results {
+            let ms = elapsed.as_secs_f64() * 1000.0 / *cycles as f64;
+            let mibs =
+                (*bytes as f64 * *cycles as f64) / elapsed.as_secs_f64() / (1u64 << 20) as f64;
+            eprintln!(
+                "P3.0-d 2s probe {}: {bytes} B/cycle, {cycles} cycles, {elapsed:?}, {ms:.3} ms/cycle, {mibs:.1} MiB/s",
+                if *direct { "direct" } else { "mapped" }
+            );
+        }
+        let (_, _, direct_cycles, direct_elapsed) = results[0];
+        let (_, _, mapped_cycles, mapped_elapsed) = results[1];
+        let direct_ms = direct_elapsed.as_secs_f64() * 1000.0 / direct_cycles as f64;
+        let mapped_ms = mapped_elapsed.as_secs_f64() * 1000.0 / mapped_cycles as f64;
+        assert!(
+            direct_ms <= mapped_ms,
+            "direct purge/fill regressed: {direct_ms:.3} ms vs mapped {mapped_ms:.3} ms"
         );
     }
 

@@ -85,6 +85,15 @@ impl Inner {
             }
         }
     }
+
+    fn close_turn_if_idle(&mut self) {
+        if self.open_turns.is_empty()
+            && !self.exclusive_turn
+            && let Err(error) = self.decoder.weights.reclaim_expert_slots()
+        {
+            tracing::warn!("qwen4 residency: slot banks were not made reclaimable: {error}");
+        }
+    }
 }
 struct Step<'a>(&'a mut Inner);
 impl DecodeStep for Step<'_> {
@@ -315,6 +324,9 @@ impl ChatBackend for Inner {
             self.open_turn(true);
         }
         self.decoder.cancelled = flag;
+        if self.decoder.cancelled.is_none() {
+            self.close_turn_if_idle();
+        }
     }
     fn prefill(&mut self, tokens: &[u32], stream: Stream) -> Result<MxArray> {
         if tokens.len().saturating_add(self.decoder.history.len())
