@@ -1551,14 +1551,10 @@ impl GgufPreload {
             }
         }
         let mut transform = |map| {
-            let mut imported = transform_imported_part(
-                map,
-                main_header,
-                main_plan,
-                &input.opts,
-                false,
-                |_| Ok(()),
-            )?;
+            let mut imported =
+                transform_imported_part(map, main_header, main_plan, &input.opts, false, |_| {
+                    Ok(())
+                })?;
             materialize(&mut imported.weights, &imported.views)?;
             match consume.as_deref_mut() {
                 Some(consume) => consume(imported.weights),

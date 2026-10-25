@@ -6,9 +6,9 @@
 //! so the marker can safely bind the manifest without a digest cycle.
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
 #[cfg(test)]
 use std::io::Read;
+use std::io::{self, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
