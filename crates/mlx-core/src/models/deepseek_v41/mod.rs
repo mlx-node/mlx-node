@@ -3,8 +3,10 @@
 
 pub mod attention;
 pub mod cache;
+pub mod compressor;
 pub mod config;
 pub mod engram_hash;
+pub mod indexer;
 pub mod ops;
 
 #[cfg(test)]
