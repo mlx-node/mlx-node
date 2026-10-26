@@ -5,17 +5,17 @@ mod auxiliary;
 mod config;
 mod decoder;
 mod gguf;
-mod mapped_pack;
+mod live;
 mod math;
 mod media;
 mod memory;
 mod mtp;
 mod packed_cache;
 mod paged;
-mod prefetch;
 mod route_plan;
+#[cfg(test)]
+mod route_replay;
 mod row_fetch;
-mod tripwire;
 mod weights;
 
 const MAX_PREFILL_CHUNK: usize = 1024;
@@ -57,7 +57,7 @@ struct Inner {
     media_prefill: Option<media::Prepared>,
     _pool_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
     /// Scheduled turns admitted and not yet finished; the first to open
-    /// after the set emptied starts a tripwire window, every open adds its
+    /// after the set emptied starts a live window, every open adds its
     /// turn to the one in progress.
     open_turns: std::collections::HashSet<u32>,
     /// A whole turn of the exclusive lane is open (its cancel flag is
@@ -66,23 +66,21 @@ struct Inner {
 }
 
 impl Inner {
-    /// A turn opens. A trip whose mid-turn switch failed moves the process to
-    /// the slot path here, before any pass of the turn; the first turn of a
-    /// window also starts the window's SSD count and slow streak. The prefill
-    /// window follows the plan in force.
+    /// The first turn after an idle gap activates reclaimable banks and
+    /// resumes their direct fill. Admissions beside an open turn share it.
     fn open_turn(&mut self, first: bool) {
-        let applied = if first {
-            self.decoder.weights.begin_turn()
-        } else {
-            self.decoder.weights.apply_fallback()
-        };
-        match applied {
-            Ok(Some(_)) => self.decoder.residency_changed(),
-            Ok(None) => self.decoder.refresh_prefill_window(),
-            Err(error) => {
-                tracing::warn!("qwen4 residency: slot fallback not applied: {error}");
-                self.decoder.refresh_prefill_window();
-            }
+        if first && let Err(error) = self.decoder.weights.begin_turn() {
+            tracing::warn!("qwen4 residency: direct banks not activated: {error}");
+        }
+        self.decoder.refresh_prefill_window();
+    }
+
+    fn close_turn_if_idle(&mut self) {
+        if self.open_turns.is_empty()
+            && !self.exclusive_turn
+            && let Err(error) = self.decoder.weights.reclaim_expert_slots()
+        {
+            tracing::warn!("qwen4 residency: slot banks were not made reclaimable: {error}");
         }
     }
 }
@@ -294,14 +292,8 @@ impl ChatBackend for Inner {
     fn eval_caches(&self) -> Result<()> {
         Ok(())
     }
-    /// Mapped experts are file-backed: a wired limit does not pin them and
-    /// only delays their unwiring after the turn (3.2 s vs 1.2 s measured).
     fn wired_limit_bytes(&self) -> Option<usize> {
-        if self.decoder.weights.plan.mapped {
-            None
-        } else {
-            Some(usize::MAX)
-        }
+        Some(usize::MAX)
     }
     /// The exclusive lane installs its flag once per whole turn and clears
     /// it after; the scheduler installs one per admission and prefill slice
@@ -315,6 +307,9 @@ impl ChatBackend for Inner {
             self.open_turn(true);
         }
         self.decoder.cancelled = flag;
+        if self.decoder.cancelled.is_none() {
+            self.close_turn_if_idle();
+        }
     }
     fn prefill(&mut self, tokens: &[u32], stream: Stream) -> Result<MxArray> {
         if tokens.len().saturating_add(self.decoder.history.len())
@@ -355,36 +350,28 @@ pub struct Qwen4ExpResidencyInfo {
     /// Assembled matrices actually pinned right now: partial projection banks
     /// and the MTP expert banks built at load.
     pub resident_bank_bytes: f64,
-    /// Shared slot capacity for the routed layers at bootstrap (the expert
-    /// count in mapped mode).
+    /// Shared partial-slot capacity, or the expert count at full direct
+    /// identity residency.
     pub partial_expert_slots: u32,
-    /// Routed expert tensors the slot path reads by range from the mapped
-    /// pack; 0 means every expert read is imported from the checkpoint.
-    pub mapped_pack_files: u32,
-    /// Every routed expert is addressed in place through the mapped pack;
-    /// the weight budget then covers dense banks and rows only.
-    pub mapped: bool,
-    /// Pack bytes backing live arrays in mapped mode (clean page cache the
-    /// Metal driver wires while a command buffer binds them).
-    pub mapped_bytes: f64,
-    /// Bytes of mapped banks the host could hold beside what stays anonymous
-    /// when the residency was chosen: physical RAM minus a margin, the live
-    /// non-reclaimable memory below and the anonymous need. The pack maps
-    /// when this covers every bank.
-    pub mapped_bank_budget_bytes: f64,
+    /// Every routed expert has an anonymous bank filled directly from GGUF,
+    /// with slot id equal to expert id.
+    pub direct: bool,
+    /// Anonymous bytes allocated to direct expert banks.
+    pub direct_bytes: f64,
+    /// Routed layers in the direct schedule and layers whose fill completed.
+    pub direct_layers: u32,
+    pub direct_filled_layers: u32,
+    /// A direct layered fill is still running.
+    pub direct_fill_in_progress: bool,
+    /// Bytes of direct banks the host could hold beside what stays anonymous
+    /// when residency was chosen: physical RAM minus a margin, the live
+    /// non-reclaimable memory below and the anonymous need.
+    pub bank_budget_bytes: f64,
     /// Wired, compressed and other processes' anonymous memory when the
     /// residency was chosen.
     pub live_non_reclaimable_bytes: f64,
-    /// Why the slot path serves the experts although the pack exists: the
-    /// load gate, or a mapped turn that read over twice the pack from SSD or
-    /// ran eight consecutive passes over ten times their median (over the
-    /// fastest larger pass while they have no median of their own).
+    /// Present when the full-bank load gate selected partial direct slots.
     pub fallback_reason: Option<String>,
-    pub fallback_read_bytes: Option<f64>,
-    pub fallback_slow_steps: Option<u32>,
-    /// Tokens the request held when it left the mapped path between two of
-    /// its passes; absent for the load gate.
-    pub fallback_token_index: Option<u32>,
     /// Token/PLE rows asked of the decoded-row LRU since load, and the ones
     /// it had to import.
     pub decoded_row_lookups: f64,
@@ -419,7 +406,7 @@ pub struct Qwen4ExpModel {
     has_mtp: bool,
     paged_capacity: u32,
     residency: memory::Plan,
-    live: Arc<tripwire::Live>,
+    live: Arc<live::Live>,
     lookup: Arc<weights::LookupStats>,
     supports_images: bool,
 }
@@ -476,10 +463,9 @@ impl Qwen4ExpModel {
                 decoder.paged = Some(adapter);
                 let pool_guard = Some(crate::cache_limit::coordinator().register_pool(pool_bytes));
                 decoder.register_cache_limit();
-                decoder.weights.prepare_mapped_pack()?;
-                decoder.weights.select_mapped_residency(pool_bytes)?;
+                decoder.weights.select_residency(pool_bytes)?;
                 decoder.weights.prepare_hot()?;
-                decoder.weights.finish_load();
+                decoder.weights.finish_load()?;
                 decoder.weights.publish_live();
                 // Register the final reconciled budget, rather than retaining
                 // the pre-pool estimate in the process-wide allocator policy.
@@ -602,20 +588,14 @@ impl Qwen4ExpModel {
                 .resident_bank_bytes
                 .load(std::sync::atomic::Ordering::Relaxed) as f64,
             partial_expert_slots: live.partial_expert_slots.load(Ordering::Acquire) as u32,
-            mapped_pack_files: self.residency.mapped_pack_files as u32,
-            mapped: live.mapped.load(Ordering::Acquire),
-            mapped_bytes: live.mapped_bytes.load(Ordering::Acquire) as f64,
-            mapped_bank_budget_bytes: live.mapped_bank_budget.load(Ordering::Acquire) as f64,
+            direct: live.direct.load(Ordering::Acquire),
+            direct_bytes: live.direct_bytes.load(Ordering::Acquire) as f64,
+            direct_layers: live.direct_layers.load(Ordering::Acquire) as u32,
+            direct_filled_layers: live.direct_filled_layers.load(Ordering::Acquire) as u32,
+            direct_fill_in_progress: live.direct_fill_in_progress.load(Ordering::Acquire),
+            bank_budget_bytes: live.bank_budget.load(Ordering::Acquire) as f64,
             live_non_reclaimable_bytes: live.live_non_reclaimable.load(Ordering::Acquire) as f64,
             fallback_reason: fallback.as_ref().map(ToString::to_string),
-            fallback_read_bytes: fallback
-                .as_ref()
-                .and_then(tripwire::Fallback::read_bytes)
-                .map(|n| n as f64),
-            fallback_slow_steps: fallback.as_ref().and_then(tripwire::Fallback::slow_steps),
-            fallback_token_index: Some(live.fallback_token_index.load(Ordering::Acquire))
-                .filter(|&index| index != tripwire::NO_TOKEN_INDEX)
-                .map(|index| u32::try_from(index).unwrap_or(u32::MAX)),
             decoded_row_lookups: lookups as f64,
             decoded_row_misses: misses as f64,
             decoded_row_hit_rate: if lookups == 0 {

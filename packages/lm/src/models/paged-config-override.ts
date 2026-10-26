@@ -54,12 +54,13 @@ export class PagedConfigOverrideManager {
   private readonly preserveEmbeddedGemmaDraft: boolean;
   private readonly overrides = new Map<string, Promise<string>>();
   /**
-   * Override path → the prepared native-cache dirs its weights resolve to.
-   * `prepare` leases one reference per resolve attempt, so the map holds a
-   * list: two resolves of the same source produce two references even though
-   * the prepared dir is identical. The loader releases on its own init
-   * failure, and `claimPreparedLease` hands each reference to the host so a
-   * failed `loadModelFn` can give it back.
+   * Override path → the prepared GGUF asset dirs its symlinks reference.
+   * These small dirs hold config/tokenizer assets and `gguf-source.json`, not
+   * packed weights. `prepare` leases one reference per resolve attempt, so the
+   * map holds a list: two resolves of the same source produce two references
+   * even though the prepared dir is identical. The loader releases on its own
+   * init failure, and `claimPreparedLease` hands each reference to the host so
+   * a failed `loadModelFn` can give it back.
    */
   private readonly preparedLeases = new Map<string, string[]>();
   private readonly activeResolves = new Set<Promise<string>>();
@@ -122,11 +123,11 @@ export class PagedConfigOverrideManager {
       }
       if (modelType !== 'muse_glimmer' || !this.modelTypes.has(modelType)) return modelPath;
       // A symlink to the GGUF would canonicalize back to the original config.
-      // Prepare once, then overlay the packed cache so paging/persistence
-      // directives reach the loader and the DFlash sidecar stays attached.
-      // `prepare` leases the cache dir against the cap; a resolve failure must
-      // release this attempt's reference — the loader is never reached, so the
-      // lease would pin a multi-GB entry for the process lifetime.
+      // Prepare once, then overlay the small asset dir so paging/persistence
+      // directives reach the loader and the DFlash source record stays attached.
+      // `prepare` protects the assets from stale/debris cleanup with a lease;
+      // a resolve failure must release this attempt's reference — the loader is
+      // never reached, so the lease would protect them for the process lifetime.
       const prepared = await prepareMuseGlimmerGguf(sourcePath);
       let resolved: string;
       try {
@@ -136,7 +137,7 @@ export class PagedConfigOverrideManager {
         throw error;
       }
       // Ownership survives resolve: the overlay still serves the prepared
-      // weights, so the lease stays held — `claimPreparedLease` hands the
+      // assets, so the lease stays held — `claimPreparedLease` hands the
       // pair to the loader so its own failure can release this reference.
       // One entry per resolve attempt: a memoized overlay can serve several
       // attempts, each carrying its own reference.
@@ -223,11 +224,11 @@ export class PagedConfigOverrideManager {
   }
 
   /**
-   * Return one prepared native-cache dir whose lease `resolvedPath` carries,
+   * Return one prepared GGUF asset dir whose lease `resolvedPath` carries,
    * and drop this manager's ownership of that reference. The host calls this
-   * once per resolved load attempt: a successful model keeps the lease for
-   * its lifetime; a failed load must call `releaseNativeGgufLease` on the
-   * returned dir so the reference this resolve acquired is given back.
+   * once per resolved load attempt: a successful model keeps its lazy assets
+   * leased for its lifetime; a failed load must call `releaseNativeGgufLease`
+   * on the returned dir so the reference this resolve acquired is given back.
    */
   claimPreparedLease(resolvedPath: string): string | undefined {
     const leases = this.preparedLeases.get(resolvedPath);
@@ -251,8 +252,8 @@ export class PagedConfigOverrideManager {
     await Promise.allSettled(this.overrides.values());
     this.overrides.clear();
     // Any reference still here was never claimed by a load attempt — no
-    // loader owns it, so release it rather than pinning the cache entry
-    // against the cap until process exit.
+    // loader owns it, so release it rather than keeping the lazy assets
+    // protected from stale/debris cleanup until process exit.
     for (const leases of this.preparedLeases.values()) {
       for (const prepared of leases) releaseNativeGgufLease(prepared);
     }

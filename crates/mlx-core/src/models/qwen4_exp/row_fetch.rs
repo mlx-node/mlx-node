@@ -42,8 +42,8 @@ pub(super) struct Fetcher {
     shared: Arc<(Mutex<State>, Condvar)>,
     stop: Arc<AtomicBool>,
     /// Rows queued, being read by a worker, or being read by the taker:
-    /// the reads the SSD still owes the model. Shared with the mapped
-    /// pack's stream, which yields while it is above zero.
+    /// the reads the SSD still owes the model. Direct expert fills yield
+    /// while it is above zero.
     pending: Arc<AtomicUsize>,
     workers: Vec<JoinHandle<()>>,
 }

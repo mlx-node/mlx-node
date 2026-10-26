@@ -358,6 +358,7 @@ fn compile_paged_attn_metallib(
         "segmented_sdpa/sdpa_segmented.metal",
         "segmented_sdpa/sdpa_segmented_nax.metal",
         "affine_mixed/affine_qmv_wide_mixed.metal",
+        "gguf_repack/gguf_repack.metal",
     ] {
         let args = vec![
             "-x".to_string(),
@@ -642,9 +643,12 @@ fn portable_cmake_defines(
 ) -> Vec<(String, String)> {
     let mut defines: Vec<(String, String)> = Vec::new();
     let mut define = |key: &str, value: &str| defines.push((key.to_string(), value.to_string()));
-    // CMakeCache.txt from an older mlx-sys may still name the deleted
-    // metal-residency/overlay.cmake; configure fails until it is cleared.
-    define("CMAKE_PROJECT_INCLUDE", "");
+    // A stale macOS CMakeCache.txt may still name the deleted
+    // metal-residency/overlay.cmake. Keep the existing empty define so the
+    // macOS prebuilt build key stays unchanged.
+    if target_os == "macos" {
+        define("CMAKE_PROJECT_INCLUDE", "");
+    }
     define("MLX_BUILD_TESTS", "OFF");
     define("MLX_BUILD_EXAMPLES", "OFF");
     define("MLX_BUILD_BENCHMARKS", "OFF");
@@ -1522,7 +1526,9 @@ fn main() -> io::Result<()> {
             .unwrap_or_else(|_| "/usr/local/cuda".into());
         println!("cargo:rustc-link-search=native={cuda_path}/lib64");
         println!("cargo:rustc-link-search=native={cuda_path}/lib64/stubs");
-        for l in ["cudart", "cublas", "cublasLt", "cufft", "nvrtc", "cuda"] {
+        for l in [
+            "cudart", "cublas", "cublasLt", "cufft", "cusolver", "nvrtc", "cuda",
+        ] {
             println!("cargo:rustc-link-lib=dylib={l}");
         }
         // cuDNN: MLX 9.x uses the split cuDNN. The umbrella `cudnn` shim
@@ -1760,6 +1766,11 @@ fn build_mlx_from_source(
     // the same list can be written into an exported artifact's manifest.
     for (key, value) in &defines {
         cfg.define(key, value);
+    }
+    if target_os == "linux" {
+        // An empty -D value names the working directory during project().
+        // Remove a stale macOS-only include from reused Linux caches instead.
+        cfg.configure_arg("-UCMAKE_PROJECT_INCLUDE");
     }
     let dst = cfg.build();
     (dst, defines, sentinel)

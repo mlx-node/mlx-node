@@ -1,8 +1,8 @@
 use super::{config::Config, weights::Store};
 use crate::utils::gguf::{
-    GgufMetaValue, native_gguf_cache_cap_bytes, native_gguf_cache_root, native_gguf_lease_in_use,
-    native_gguf_lease_in_use_retry, native_gguf_publish_with_cap, native_gguf_sidecar_mutex,
-    native_gguf_unlease_in_use, source_file_identity_digest, write_embedded_gpt2_tokenizer,
+    GgufMetaValue, native_gguf_cache_root, native_gguf_lease_in_use,
+    native_gguf_lease_in_use_retry, native_gguf_sidecar_mutex, native_gguf_unlease_in_use,
+    source_file_identity_digest, write_embedded_gpt2_tokenizer,
 };
 use napi::{Error, Result};
 use serde_json::{Value, json};
@@ -195,9 +195,8 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
     // sweep's `native_gguf_try_entry_lock` would trivially win against this
     // process's own fd, deleting the dir between the hit check and first
     // use. `native_gguf_sidecar_mutex` closes both gaps; the sweep only
-    // try-locks it and skips its pass on contention. Lock order matches
-    // `prepare_native_gguf_inner`: process mutex → sidecar flock → cap
-    // flock. A std Mutex held across a blocking flock is fine here —
+    // try-locks it and skips its pass on contention. Lock order is process
+    // mutex → sidecar flock. A std Mutex held across a blocking flock is fine here —
     // `assets_in` is synchronous by design — and a poisoned mutex still
     // serializes.
     let _process_lock = native_gguf_sidecar_mutex()
@@ -210,11 +209,11 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
     let identity = source_file_identity_digest(&source, &metadata);
     let dir_name = format!(".mlx-qwen4-assets-v2-{identity}");
     let dir = root.join(&dir_name);
-    // A cap-refused publish lands at this deterministic same-pid name instead
-    // of `dir`: the uuid temp it replaces could never be found again, and the
-    // sweep's `assets-live` grammar keeps it unconditionally while this pid
-    // lives (never counted toward the cap, never age-deleted) — it is a load
-    // output. The live dir has no lock of its own; the `{dir_name}.lock`
+    // A sidecar that cannot replace a leased `dir` lands at this
+    // deterministic same-pid name instead: the uuid temp it replaces could
+    // never be found again, and the sweep's `assets-live` grammar protects it
+    // while this pid and its lease live. The live dir has no lock of its own;
+    // the `{dir_name}.lock`
     // guard below serializes every check/rename touching it in this process
     // because only the sidecar for `identity` can ever produce it.
     let live_dir_name = format!(
@@ -233,10 +232,8 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
     const ASSETS_LOCK_RETRIES: u32 = 40;
     const ASSETS_LOCK_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
     // The hit path never needs the exclusive lock: a `complete` dir is a
-    // load output a model may keep opening for the whole process lifetime
-    // (recency stamping only marks hits, so an idle-but-live model would
-    // otherwise watch the capped LRU sweep delete its tokenizer dir out
-    // from under it), so the hit leases `dir` — registered in-process and
+    // load output a model may keep opening for the whole process lifetime,
+    // so the hit leases `dir` — registered in-process and
     // pinned cross-process by a LOCK_SH on the sidecar lock file, which
     // every deleter's LOCK_EX try-flock loses to. Winning SH before any
     // deleter's EX means the dir cannot be mid-delete now; a recheck under
@@ -271,7 +268,7 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
             root.join(format!("{live_dir_name}-g{generation}"))
         };
         if candidate.join("complete").exists() {
-            // The completed refused publish from an earlier load in this
+            // The completed live fallback from an earlier load in this
             // process; reuse it rather than rebuilding (and rather than
             // republishing — moving the path out from under a live reader).
             // Live dirs have no lock file, so this lease is registry-only.
@@ -293,7 +290,7 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
         }
     }
     // Contention here is not an ordinary cache miss: a busy sidecar lock can
-    // be a capped-cache sweep mid-`remove_dir_all` on this very directory.
+    // be a sweep mid-`remove_dir_all` on this very directory.
     // Publishing unguarded could land `rename(temp, dir)` while the sweep's
     // delete is in flight, returning a path that no longer exists. Spin
     // briefly — a sweep's delete is short — and publish only under the lock.
@@ -333,7 +330,7 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
     // publish guard below refuses a leased dir, and an unleased markerless
     // dir is debris the publish may replace.
     //
-    // Fallback for a refused publish: rename `temp` onto the first
+    // Fallback when `dir` cannot be replaced: rename `temp` onto the first
     // generation of the per-pid live name that is not leased. A completed
     // live dir would have hit the reuse check above, so an existing
     // unleased one is debris and is replaced; a leased one is kept and the
@@ -380,26 +377,7 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
         .map_err(|e| Error::from_reason(e.to_string()))?;
         std::fs::write(temp.join("complete"), b"1")
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        // With a cap configured the rename runs inside the shared
-        // count→evict→publish section: admission counts the root under the
-        // root-wide flock, so a sidecar cannot land between a sibling
-        // conversion's admission count and its entry rename. Refusal
-        // returns `Ok(temp)`, which the caller promotes to `live_dir` — a
-        // name the next load can find and the sweep keeps while this pid
-        // lives, unlike the uuid temp it replaced (age-deleted at 24 h even
-        // mid-load). The cap lock nests inside the sidecar lock, matching
-        // `prepare_native_gguf_inner`'s key-lock → admission-flock order.
-        if let Some(cap) = native_gguf_cache_cap_bytes() {
-            let published = native_gguf_publish_with_cap(root, &temp, &dir, cap)
-                .map_err(|e| Error::from_reason(e.to_string()))?;
-            if published == temp {
-                // Admission refused — or `dir` is still leased. Either way
-                // the temp promotes to the first unleased live generation.
-                return promote_live(&temp);
-            }
-            return Ok(published);
-        }
-        // Uncapped: a markerless `dir` a model still leases is promoted past
+        // A markerless `dir` a model still leases is promoted past
         // rather than replaced — the lease probe needs no entry lock, which
         // `_guard` already holds. An unleased remnant is debris removed under
         // the guard: rename over a nonempty dir fails with EEXIST, and the
@@ -421,8 +399,7 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
         Ok(dir.clone())
     })();
     // Remove the temp in every outcome that did not rename it away (to `dir`
-    // or `live_dir`); a refusal never returns the temp path itself anymore,
-    // so a surviving `Ok(temp)` result cannot occur.
+    // or `live_dir`); no success path returns the temp itself.
     if result.as_ref().is_ok_and(|path| *path != temp) || result.is_err() {
         let _ = std::fs::remove_dir_all(&temp);
     }
@@ -548,7 +525,7 @@ mod tests {
         assert_eq!(assets_in(&source, &store, &config, &cache).unwrap(), dir);
         assert!(
             fs::metadata(&marker).unwrap().modified().unwrap() > stale,
-            "cache hits must refresh the complete marker for LRU recency"
+            "cache hits must refresh the complete marker recency"
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -599,7 +576,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// A busy sidecar lock is not an ordinary cache miss: it can be a capped
+    /// A busy sidecar lock is not an ordinary cache miss: it can be a
     /// sweep mid-`remove_dir_all` on the very directory a publish would land
     /// in. `assets_in` must spin on the lock and fail loudly rather than
     /// publishing unguarded into a possible mid-delete (which could return a
@@ -659,16 +636,11 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// With `MLX_NATIVE_GGUF_CACHE_MAX_GB` set the sidecar publish runs the
-    /// shared cap-admission section instead of a bare rename: a cap that
-    /// cannot fit the sidecar refuses admission and the completed temp is
-    /// promoted to `.mlx-qwen4-assets-live-{identity}-{pid}` — a name later
-    /// loads in this process reuse, kept unconditionally by the sweep while
-    /// the pid lives — while a roomy cap still publishes under the
-    /// versioned name.
+    /// Marker loss on leased outputs promotes fresh sidecars to the base
+    /// live name and then the next generation, never deleting either lease.
     #[test]
-    fn assets_in_publish_respects_the_cache_cap() {
-        use crate::utils::gguf::{SweepEnvVar, sweep_env_lock};
+    fn qwen4_sidecar_promotes_live_when_leased() {
+        use crate::utils::gguf::sweep_env_lock;
         let _env_guard = sweep_env_lock().lock().unwrap();
         let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
         let cache = root.join("cache");
@@ -677,53 +649,7 @@ mod tests {
         fs::write(&source, b"weights").unwrap();
         let (store, config) = tokenizer_fixture();
 
-        // Tiny cap: admission refuses, the temp is promoted to the per-pid
-        // live dir, and nothing is published under the versioned name.
-        let _env = SweepEnvVar::set_max_gb("0.0000001");
-        let refused = assets_in(&source, &store, &config, &cache).unwrap();
-        let refused_name = refused.file_name().unwrap().to_string_lossy();
-        assert!(
-            refused_name.starts_with(".mlx-qwen4-assets-live-")
-                && refused_name.ends_with(&std::process::id().to_string()),
-            "a refused admission returns the per-pid live dir, got {}",
-            refused.display()
-        );
-        assert!(refused.join("complete").is_file());
-        assert!(
-            fs::read_dir(&cache).unwrap().flatten().all(|entry| !entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".mlx-qwen4-assets-v2-")
-                || entry.file_name().to_string_lossy().ends_with(".lock")),
-            "no sidecar dir may be published over the cap"
-        );
-
-        // Later loads in this process reuse the completed live dir — even
-        // with a roomy cap, the completed refusal is never republished under
-        // the versioned name while a live reader may hold the path.
-        let reused = assets_in(&source, &store, &config, &cache).unwrap();
-        assert_eq!(reused, refused);
-        drop(_env);
-        let _env = SweepEnvVar::set_max_gb("64");
-        assert_eq!(
-            assets_in(&source, &store, &config, &cache).unwrap(),
-            refused,
-            "a completed live dir is a hit, never republished"
-        );
-        assert!(
-            fs::read_dir(&cache).unwrap().flatten().all(|entry| !entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".mlx-qwen4-assets-v2-")
-                || entry.file_name().to_string_lossy().ends_with(".lock")),
-            "the versioned sidecar name stays unpublished while the live dir is served"
-        );
-
-        // Roomy cap: the normal publish path still lands for a fresh source.
-        let other = root.join("other.gguf");
-        fs::write(&other, b"other-weights").unwrap();
-        let published = assets_in(&other, &store, &config, &cache).unwrap();
-        assert_eq!(published.parent(), Some(cache.as_path()));
+        let published = assets_in(&source, &store, &config, &cache).unwrap();
         assert!(
             published
                 .file_name()
@@ -731,44 +657,23 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".mlx-qwen4-assets-v2-")
         );
-        assert!(published.join("complete").is_file());
-        fs::remove_dir_all(root).unwrap();
-    }
+        fs::remove_file(published.join("complete")).unwrap();
 
-    /// Marker loss proves damage, not disuse: a leased live dir whose
-    /// `complete` marker was deleted must survive the next republish, which
-    /// lands on the next `-g{n}` generation instead of deleting the path a
-    /// loaded model still holds. The same rule covers a leased markerless
-    /// `dir` — the publish guard refuses it into the live name too.
-    #[test]
-    fn assets_in_marker_loss_never_deletes_a_leased_dir() {
-        use crate::utils::gguf::{SweepEnvVar, sweep_env_lock};
-        let _env_guard = sweep_env_lock().lock().unwrap();
-        let _env = SweepEnvVar::set_max_gb("0.0000001");
-        let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
-        let cache = root.join("cache");
-        fs::create_dir_all(&cache).unwrap();
-        let source = root.join("model.gguf");
-        fs::write(&source, b"weights").unwrap();
-        let (store, config) = tokenizer_fixture();
-
-        // First load lands on the per-pid live name under the tiny cap and
-        // stays leased for the process lifetime.
         let live = assets_in(&source, &store, &config, &cache).unwrap();
+        let live_name = live.file_name().unwrap().to_string_lossy();
         assert!(
-            live.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with(".mlx-qwen4-assets-live-"),
-            "cap-refused publish promotes to the live dir, got {}",
+            live_name.starts_with(".mlx-qwen4-assets-live-")
+                && live_name.ends_with(&std::process::id().to_string()),
+            "a leased versioned output must promote to the base live dir, got {}",
             live.display()
         );
         assert!(live.join("complete").is_file());
+        assert!(
+            published.exists(),
+            "the markerless but leased versioned dir was deleted"
+        );
 
-        // External damage: the marker goes away while the lease stands.
         fs::remove_file(live.join("complete")).unwrap();
-
-        // The rebuild must keep the leased path and land on generation 2.
         let rebuilt = assets_in(&source, &store, &config, &cache).unwrap();
         assert!(
             rebuilt
@@ -776,19 +681,15 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .ends_with(&format!("-{}-g2", std::process::id())),
-            "a second refusal lands on the next live generation, got {}",
+            "a leased base live dir must promote to generation 2, got {}",
             rebuilt.display()
         );
         assert!(rebuilt.join("complete").is_file());
-        assert!(
-            live.exists(),
-            "a markerless but still-leased live dir is never deleted"
-        );
-
-        // A third load reuses the completed generation-2 dir.
+        assert!(live.exists(), "the markerless leased live dir was deleted");
         assert_eq!(
             assets_in(&source, &store, &config, &cache).unwrap(),
-            rebuilt
+            rebuilt,
+            "a completed live generation must be reused"
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -801,11 +702,6 @@ mod tests {
     fn assets_in_never_returns_a_sidecar_its_lease_could_not_pin() {
         use crate::utils::gguf::sweep_env_lock;
         let _env_guard = sweep_env_lock().lock().unwrap();
-        // Uncapped so the keyed-lease path is exercised: a tiny cap would
-        // promote to a registry-only live dir and return successfully.
-        unsafe {
-            std::env::remove_var("MLX_NATIVE_GGUF_CACHE_MAX_GB");
-        }
         let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
         let cache = root.join("cache");
         fs::create_dir_all(&cache).unwrap();
@@ -840,9 +736,8 @@ mod tests {
     /// the winner already returned.
     #[test]
     fn assets_in_serializes_concurrent_same_process_loads() {
-        use crate::utils::gguf::{SweepEnvVar, sweep_env_lock};
+        use crate::utils::gguf::sweep_env_lock;
         let _env_guard = sweep_env_lock().lock().unwrap();
-        let _env = SweepEnvVar::set_max_gb("0");
         let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
         let cache = root.join("cache");
         fs::create_dir_all(&cache).unwrap();
@@ -887,17 +782,13 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// The shared `native_gguf_sidecar_mutex` closes the same-process gap
-    /// the sidecar flock cannot: BSD flock is per-process, so the sweep's
-    /// `native_gguf_try_entry_lock` would win against this process's own fd
-    /// and delete a published sidecar between `assets_in`'s hit check and
-    /// the caller's first use. Holding the mutex must make
-    /// `sweep_native_gguf_cache` skip entirely — it only try-locks — and
-    /// the eviction must land once the mutex frees.
+    /// Holding the sidecar mutex makes the sweep skip even same-process
+    /// dead-pid cleanup; releasing it allows the normal debris pass.
     #[test]
     fn assets_in_survives_concurrent_in_process_sweep() {
         use crate::utils::gguf::{
-            SweepEnvVar, native_gguf_sidecar_mutex, sweep_env_lock, sweep_native_gguf_cache,
+            native_gguf_sidecar_mutex, native_gguf_unlease_in_use, sweep_env_lock,
+            sweep_native_gguf_cache,
         };
         let _env_guard = sweep_env_lock().lock().unwrap();
         let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
@@ -906,49 +797,31 @@ mod tests {
         let source = root.join("model.gguf");
         fs::write(&source, b"weights").unwrap();
         let (store, config) = tokenizer_fixture();
-
-        // Publish the versioned sidecar under a roomy cap, then shrink the
-        // cap below its size and age the recency marker past the 24h sweep
-        // grace: a deletion candidate through the capped-LRU pass.
-        let _env = SweepEnvVar::set_max_gb("64");
         let dir = assets_in(&source, &store, &config, &cache).unwrap();
         assert!(dir.join("complete").is_file());
-        let _env = SweepEnvVar::set_max_gb("0.0000001");
-        let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 3600);
-        OpenOptions::new()
-            .write(true)
-            .open(dir.join("complete"))
-            .unwrap()
-            .set_modified(stale)
-            .unwrap();
 
-        // While the mutex is held the sweep must skip: try_lock reports
-        // WouldBlock on a held std Mutex even from the same thread, so the
-        // call returns at once and the deletion candidate survives.
+        let debris = cache.join(format!(
+            ".mlx-qwen4-assets-live-{}-{}",
+            "d".repeat(64),
+            i32::MAX
+        ));
+        fs::create_dir_all(&debris).unwrap();
+        fs::write(debris.join("complete"), b"1").unwrap();
+
         let sidecar_guard = native_gguf_sidecar_mutex()
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         sweep_native_gguf_cache(&cache, "no-such-key");
         assert!(
-            dir.join("complete").is_file(),
+            debris.exists(),
             "the sweep must skip while a sidecar publish could be in flight"
         );
         drop(sidecar_guard);
 
-        // The returned dir is now leased as in-use (a loaded model may hold
-        // the path for the whole process lifetime): the sweep's capped-LRU
-        // pass skips it even unlocked.
         sweep_native_gguf_cache(&cache, "no-such-key");
-        assert!(
-            dir.join("complete").is_file(),
-            "an in-use leased sidecar survives the capped-LRU sweep"
-        );
-
-        // Releasing the lease restores normal eviction: the next pass
-        // deletes the aged dir.
+        assert!(!debris.exists(), "dead-pid debris must be reclaimed");
+        assert!(dir.join("complete").is_file());
         native_gguf_unlease_in_use(&dir);
-        sweep_native_gguf_cache(&cache, "no-such-key");
-        assert!(!dir.exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

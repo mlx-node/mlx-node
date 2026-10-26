@@ -958,10 +958,68 @@ pub fn release_tiled_kquant_sources(
     params: &mut HashMap<String, MxArray>,
     tiled: &mut Vec<String>,
 ) {
+    let released = !tiled.is_empty();
     for prefix in tiled.drain(..) {
         for suffix in ["weight", "scales", "biases"] {
             params.remove(&format!("{prefix}.{suffix}"));
         }
+    }
+    if released {
+        crate::array::memory::free_released_sources();
+    }
+}
+
+#[cfg(test)]
+mod release_sources_tests {
+    use super::*;
+    use crate::array::memory::{FreeReleasedSources, TEST_CLEAR_CACHE_CALLS};
+
+    fn release_one(params: &mut HashMap<String, MxArray>, prefix: &str) -> u32 {
+        for suffix in ["weight", "scales", "biases"] {
+            params.insert(
+                format!("{prefix}.{suffix}"),
+                MxArray::from_float32(&[1.0], &[1]).unwrap(),
+            );
+        }
+        let before = TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get);
+        release_tiled_kquant_sources(params, &mut vec![prefix.to_string()]);
+        assert!(params.is_empty(), "{prefix}: sources not released");
+        TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get) - before
+    }
+
+    #[test]
+    fn released_sources_leave_the_cache_only_under_the_guard() {
+        let mut params = HashMap::new();
+        assert_eq!(
+            release_one(&mut params, "dir"),
+            0,
+            "lazy-map release cleared the cache"
+        );
+        {
+            let _free = FreeReleasedSources::enable(true);
+            assert_eq!(
+                release_one(&mut params, "preload"),
+                1,
+                "preload release kept the cache"
+            );
+            let before = TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get);
+            release_tiled_kquant_sources(&mut params, &mut Vec::new());
+            assert_eq!(TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get), before);
+            {
+                let _off = FreeReleasedSources::enable(false);
+                assert_eq!(release_one(&mut params, "nested-off"), 0);
+            }
+            assert_eq!(
+                release_one(&mut params, "restored"),
+                1,
+                "inner guard did not restore"
+            );
+        }
+        assert_eq!(
+            release_one(&mut params, "after"),
+            0,
+            "guard leaked past its scope"
+        );
     }
 }
 

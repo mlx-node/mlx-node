@@ -17,12 +17,14 @@ demand for the joint head's option-embedding gather. Tied output embeddings
 are unsupported.
 
 A decision-model GGUF (`general.architecture: clef`) loads directly through
-`ClefModel.load`. Conversion splits the `dec.*` / `decision.*` tensors into
-`joint_head.safetensors` and synthesizes `joint_head_config.json` beside the
-backbone `model.safetensors`, cached under the shared native-GGUF staging
-directory. The joint head itself must sit in affine ggml blocks (the
-published files keep every head weight in Q8_0); a K-quant head weight is
-rejected at conversion.
+`ClefModel.load`. Each load reads the backbone and head from the GGUF and
+repacks them in memory, splitting the `dec.*` / `decision.*` tensors into the
+in-memory joint head. The small native-GGUF asset directory holds config and
+tokenizer files, the synthesized `joint_head_config.json`, and
+`gguf-source.json`; it does not contain `model.safetensors` or
+`joint_head.safetensors`. The joint head itself must sit in affine ggml blocks
+(the published files keep every head weight in Q8_0); a K-quant head weight is
+rejected.
 
 ### Residency
 

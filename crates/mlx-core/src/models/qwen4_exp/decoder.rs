@@ -228,7 +228,7 @@ pub struct Decoder {
     /// Tentative commits taken, each with the windows it covered.
     #[cfg(test)]
     pub(super) tentative_commits: Vec<usize>,
-    /// Every (rows, elapsed) sample handed to the tripwire, in order.
+    /// Every (rows, elapsed) sample handed to the live, in order.
     #[cfg(test)]
     pub(super) pass_samples: Vec<(usize, std::time::Duration)>,
     /// Runs after every layer sweep of a group, with the layer; tests trip
@@ -252,7 +252,7 @@ impl Decoder {
             Some(crate::cache_limit::coordinator().register(self.weights.cache_budget()));
     }
 
-    /// The prefill window follows the plan in force (mapped or fallback).
+    /// The prefill window follows the residency plan in force.
     pub fn refresh_prefill_window(&mut self) {
         let window = super::memory::prefill_window(&self.config, &self.weights.plan);
         #[cfg(test)]
@@ -271,26 +271,12 @@ impl Decoder {
         self.refresh_prefill_window();
     }
 
-    /// One main-network pass over `rows` rows took `elapsed`. A pass that
-    /// trips the wire moves the store to slots before the next one; the
-    /// request goes on with its state intact, and `residencyInfo()` records
-    /// the position it left the mapped path at.
+    /// Record a completed pass and run the test admission hook.
     pub(super) fn observe_pass(&mut self, rows: usize, elapsed: std::time::Duration) {
         #[cfg(test)]
         self.pass_samples.push((rows, elapsed));
-        match self.weights.observe_pass(rows, elapsed) {
-            Ok(None) => {}
-            Ok(Some(_)) => {
-                self.weights
-                    .live
-                    .fallback_token_index
-                    .store(self.history.len() as u64, Ordering::Release);
-                self.residency_changed();
-            }
-            Err(error) => {
-                tracing::warn!("qwen4 residency: slot fallback not applied: {error}")
-            }
-        }
+        #[cfg(not(test))]
+        let _ = (rows, elapsed);
         #[cfg(test)]
         if let Some(mut hook) = self.after_pass.take() {
             hook(self);
@@ -1410,12 +1396,6 @@ impl Decoder {
         }
     }
     fn moe(&mut self, x: &MxArray, i: usize) -> Result<MxArray> {
-        let main = self.gguf();
-        if i == 0 {
-            self.weights.wire_mapped_banks(main)?;
-        } else {
-            self.weights.keep_wired(i, main)?;
-        }
         let c = self.config.clone();
         let p = format!("layers.{i}.mlp");
         let g = format!("blk.{i}");
@@ -1637,21 +1617,15 @@ impl Decoder {
         ))
     }
 
-    /// `moe` over a `[1, R, H]` verify window: the routes of all rows stay on
-    /// the device over the mapped pack, otherwise one routing readback, then
-    /// the routed and shared experts through the row-batched slot kernels.
-    /// Without those kernels every row runs the single-row MoE.
+    /// `moe` over a `[1, R, H]` verify window: full direct banks keep all
+    /// routes on the device; partial banks use one routing readback, then the
+    /// row-batched slot kernels. Without those kernels rows run singly.
     fn moe_rows(&mut self, x: &MxArray, i: usize) -> Result<MxArray> {
         let rows = x.shape_at(1)?;
         if rows == 1 {
             return self.moe(x, i);
         }
         let main = self.gguf();
-        if i == 0 {
-            self.weights.wire_mapped_banks(main)?;
-        } else {
-            self.weights.keep_wired(i, main)?;
-        }
         let c = self.config.clone();
         if main {
             let logits = self.linear_rows(
@@ -2286,7 +2260,7 @@ impl Decoder {
                     tokens.len() * self.config.num_experts_per_tok,
                 )? {
                     return Err(Error::from_reason(
-                        "Qwen4 verification routes lost their mapped banks",
+                        "Qwen4 verification routes lost their expert banks",
                     ));
                 }
             }
@@ -2295,8 +2269,6 @@ impl Decoder {
         self.rotary_tables.get_mut().clear();
         match result {
             Ok(verified) => {
-                // Only after the route commit: a pass that trips the wire
-                // drops the mapped banks the tape is checked against.
                 self.observe_pass(tokens.len(), started.elapsed());
                 Ok(verified)
             }
@@ -2346,11 +2318,9 @@ impl Decoder {
     }
 
     /// Whether a prompt of `suffix` new tokens runs as one layer-major
-    /// group: the turn opened over a streaming pack, the carried window path
-    /// serves it, every window is a tentative-eligible slice, and the W
-    /// residual streams fit beside the mapped turn floor. Read at admission
-    /// and again at execution: a trip applied in between runs the prompt one
-    /// window at a time.
+    /// group: a direct fill is still publishing banks, every window is a
+    /// tentative-eligible slice, and the residual streams fit beside the
+    /// direct turn floor.
     pub(super) fn group_mode(&self, suffix: usize) -> bool {
         let slice = self.prefill_slice_size().max(1);
         let windows = suffix / slice + usize::from(suffix % slice >= 256);
@@ -2361,7 +2331,8 @@ impl Decoder {
         if let Some(pin) = self.group_pin {
             return pin;
         }
-        if !self.weights.plan.mapped || !self.weights.streaming_pass() || slice < 256 {
+        let filling = self.weights.direct_fill_pass();
+        if !filling || slice < 256 {
             return false;
         }
         let Ok(host) = super::memory::host_memory() else {
@@ -2369,14 +2340,13 @@ impl Decoder {
         };
         let need = 22_400 * suffix as u64
             + super::memory::prefill_scratch(&self.config, super::MAX_PREFILL_CHUNK)
-            + super::memory::MAPPED_TURN_FLOOR;
+            + super::memory::DIRECT_TURN_FLOOR;
         need <= host.available()
     }
 
     /// A whole prompt: one layer-major group and its tail in group mode,
     /// else one window at a time with the next window's rows requested while
-    /// this one runs. The window is read before every pass: a pass that
-    /// leaves the mapped path shrinks it for the passes after it.
+    /// this one runs. The admitted window is read before every pass.
     pub fn prefill_prompt(&mut self, tokens: &[u32]) -> Result<MxArray> {
         if self.group_mode(tokens.len()) {
             let (windows, tail) = self.group_windows(tokens);
@@ -2429,7 +2399,6 @@ impl Decoder {
                     .eval_pending_pool_writes()
                     .map_err(Error::from_reason)?;
             }
-            self.weights.begin_group();
         }
         let started = std::time::Instant::now();
         let result = self.prefill_group_with_device_routes(
@@ -2439,7 +2408,6 @@ impl Decoder {
             project_logits && tail.is_empty(),
         );
         self.rotary_tables.get_mut().clear();
-        self.weights.end_group();
         let logits = match result {
             Ok(logits) => logits,
             Err(error) => {
@@ -2573,54 +2541,6 @@ impl Decoder {
         Ok(())
     }
 
-    /// A trip is held at the end of a sweep: the group's frontier (every
-    /// stream, the tape so far, the caches, the pending touches) is evaluated
-    /// and committed first, so nothing lazy reads a mapped bank, then the
-    /// store leaves the mapped path and the remaining sweeps run plain on
-    /// slots over the same partition.
-    fn switch_mid_group(&mut self, streams: &[MxArray], base: usize) -> Result<()> {
-        let outputs: Vec<&MxArray> = streams.iter().collect();
-        match self.device_routes.take() {
-            Some(routes) => {
-                if !self.commit_tentative(&outputs, &routes)? {
-                    return Err(Error::from_reason(
-                        "Qwen4 prefill group routes lost their mapped banks",
-                    ));
-                }
-            }
-            None => {
-                let touches = self.weights.take_pending_touches();
-                let mut completed = outputs;
-                completed.extend(self.pending_state_arrays());
-                completed.extend(touches.iter());
-                MxArray::eval_arrays_with_context(&completed, "qwen4::group::frontier")?;
-                if let Some(adapter) = &mut self.paged {
-                    adapter
-                        .eval_pending_pool_writes()
-                        .map_err(Error::from_reason)?;
-                }
-            }
-        }
-        self.note("qwen4::group::frontier");
-        self.note("qwen4::group::trip");
-        match self.weights.apply_held_trip() {
-            Ok(Some(_)) => {
-                self.note("qwen4::group::switch");
-                self.weights.end_group();
-                self.weights
-                    .live
-                    .fallback_token_index
-                    .store(base as u64, Ordering::Release);
-                self.residency_changed();
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!("qwen4 residency: slot fallback not applied: {error}")
-            }
-        }
-        Ok(())
-    }
-
     /// One pass over `windows`, `for layer { for window }`. A group of one
     /// window is the window-major pass; a group of more runs every window of
     /// a layer before the next layer, each window at its own cursor, so the
@@ -2642,9 +2562,9 @@ impl Decoder {
             .ok_or_else(|| Error::from_reason("Qwen4 prefill group has no windows"))?;
         let total: usize = windows.iter().map(|w| w.len()).sum();
         let layers = self.config.num_hidden_layers;
-        let mut submit_span = self.decode_submit_span();
-        let mut async_window = windows.iter().all(|w| w.len() > 8) && self.async_device_prefill();
-        let mut defer_final = self.deferred_forward_completion();
+        let submit_span = self.decode_submit_span();
+        let async_window = windows.iter().all(|w| w.len() > 8) && self.async_device_prefill();
+        let defer_final = self.deferred_forward_completion();
         if windows
             .iter()
             .any(|w| w.is_empty() || w.len() > super::MAX_PREFILL_CHUNK)
@@ -2859,13 +2779,6 @@ impl Decoder {
                 if let Some(mut hook) = self.after_sweep.take() {
                     hook(self, i);
                     self.after_sweep = Some(hook);
-                }
-                if self.weights.observe_sweep() {
-                    self.switch_mid_group(&streams, base)?;
-                    submit_span = self.decode_submit_span();
-                    async_window =
-                        windows.iter().all(|w| w.len() > 8) && self.async_device_prefill();
-                    defer_final = self.deferred_forward_completion();
                 }
             }
         }

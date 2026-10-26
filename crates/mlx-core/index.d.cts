@@ -1745,9 +1745,10 @@ export declare class Qwen35MoeModel {
   /**
    * Load a pretrained model from a directory, or a `.gguf` file.
    *
-   * A direct GGUF file is first converted into the lossless native-packed
-   * cache (mirroring the dense Qwen3.5 loader), and the cache directory is
-   * what the model thread reads.
+   * A direct GGUF file is read into memory and repacked on the model
+   * thread; only its non-weight assets (config, tokenizer) are written to
+   * the native GGUF asset directory, which the model reports as its assets
+   * path.
    */
   static load(path: string, options?: Qwen35LoadOptions | undefined | null): Promise<Qwen35MoeModel>;
   /** Generate text from a prompt token sequence. */
@@ -4822,9 +4823,12 @@ export interface PhaseProfile {
 export declare function preflightMuseDflashGguf(inputPath: string, targetConfigDir: string): void;
 
 /**
- * Prepare a Muse-Glimmer GGUF target and its optional DFlash companion in the
- * native cache without loading the model. Hosts can apply per-session config
- * overrides to this directory without modifying sources or repacking weights.
+ * Prepare a leased, small asset directory for a Muse-Glimmer GGUF target
+ * without loading or repacking weights. It holds config/tokenizer/template
+ * assets and `gguf-source.json`, which records the target and optional DFlash
+ * companion; it holds no packed-weight files. Hosts can apply per-session
+ * config overlays without modifying sources, but must preserve that source
+ * record. Each returned directory carries one lease reference.
  */
 export declare function prepareMuseGlimmerGguf(modelPath: string): Promise<string>;
 
@@ -5471,51 +5475,35 @@ export interface Qwen4ExpResidencyInfo {
    */
   residentBankBytes: number;
   /**
-   * Shared slot capacity for the routed layers at bootstrap (the expert
-   * count in mapped mode).
+   * Shared partial-slot capacity, or the expert count at full direct
+   * identity residency.
    */
   partialExpertSlots: number;
   /**
-   * Routed expert tensors the slot path reads by range from the mapped
-   * pack; 0 means every expert read is imported from the checkpoint.
+   * Every routed expert has an anonymous bank filled directly from GGUF,
+   * with slot id equal to expert id.
    */
-  mappedPackFiles: number;
+  direct: boolean;
+  /** Anonymous bytes allocated to direct expert banks. */
+  directBytes: number;
+  /** Routed layers in the direct schedule and layers whose fill completed. */
+  directLayers: number;
+  directFilledLayers: number;
+  /** A direct layered fill is still running. */
+  directFillInProgress: boolean;
   /**
-   * Every routed expert is addressed in place through the mapped pack;
-   * the weight budget then covers dense banks and rows only.
+   * Bytes of direct banks the host could hold beside what stays anonymous
+   * when residency was chosen: physical RAM minus a margin, the live
+   * non-reclaimable memory below and the anonymous need.
    */
-  mapped: boolean;
-  /**
-   * Pack bytes backing live arrays in mapped mode (clean page cache the
-   * Metal driver wires while a command buffer binds them).
-   */
-  mappedBytes: number;
-  /**
-   * Bytes of mapped banks the host could hold beside what stays anonymous
-   * when the residency was chosen: physical RAM minus a margin, the live
-   * non-reclaimable memory below and the anonymous need. The pack maps
-   * when this covers every bank.
-   */
-  mappedBankBudgetBytes: number;
+  bankBudgetBytes: number;
   /**
    * Wired, compressed and other processes' anonymous memory when the
    * residency was chosen.
    */
   liveNonReclaimableBytes: number;
-  /**
-   * Why the slot path serves the experts although the pack exists: the
-   * load gate, or a mapped turn that read over twice the pack from SSD or
-   * ran eight consecutive passes over ten times their median (over the
-   * fastest larger pass while they have no median of their own).
-   */
+  /** Present when the full-bank load gate selected partial direct slots. */
   fallbackReason?: string;
-  fallbackReadBytes?: number;
-  fallbackSlowSteps?: number;
-  /**
-   * Tokens the request held when it left the mapped path between two of
-   * its passes; absent for the load gate.
-   */
-  fallbackTokenIndex?: number;
   /**
    * Token/PLE rows asked of the decoded-row LRU since load, and the ones
    * it had to import.
@@ -5547,12 +5535,13 @@ export interface RecResult {
 }
 
 /**
- * Release ONE lease reference `prepare_*`/`assets` took on `dir`. Model
- * loaders already release on failed init; this binding exists for hosts
- * that transform the prepared path (config overlays) before handing a
- * different directory to the loader — their load failure must reach this
- * release or the prepared entry pins against the cap for the process
- * lifetime. Unleasing an unleased path is a no-op.
+ * Release ONE lease reference `prepare_*`/`assets` took on `dir`. Leases
+ * protect small asset dirs from stale/debris cleanup while config, tokenizer,
+ * or template files can still be read lazily; they do not own packed weights.
+ * Model loaders already release on failed init. Hosts that transform the
+ * prepared path (config overlays) before handing a different directory to the
+ * loader must release this attempt's reference on load failure or keep the
+ * assets leased for the process lifetime. Unleasing an unleased path is a no-op.
  */
 export declare function releaseNativeGgufLease(dir: string): void;
 

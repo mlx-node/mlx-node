@@ -112,10 +112,7 @@ interface ModelFileInventory {
  * `'other'` (skipped, same as sockets/fifos — a broken link admits
  * nothing) and non-symlink entries keep their `Dirent` answer unchanged.
  */
-export async function resolveDirentKind(
-  dir: string,
-  entry: Dirent,
-): Promise<'file' | 'dir' | 'other'> {
+export async function resolveDirentKind(dir: string, entry: Dirent): Promise<'file' | 'dir' | 'other'> {
   if (!entry.isSymbolicLink()) {
     if (entry.isFile()) return 'file';
     if (entry.isDirectory()) return 'dir';
@@ -323,8 +320,8 @@ export async function discoverLocalChatModels(
   const appendGguf = async (name: string, metadataRoot: string, scopeName: string): Promise<void> => {
     const path = join(metadataRoot, name);
     try {
-      // `resolveDirentKind` admits a symlinked `.gguf`, but the loader
-      // canonicalizes the path it is handed (`prepare_native_gguf_inner`), so
+      // `resolveDirentKind` admits a symlinked `.gguf`, but native preflight
+      // canonicalizes it before preparing the separate small asset dir, so
       // every check that looks BESIDE the file — family detection's sibling
       // config.json, the `requiresAssets` gate, discovery metadata — must run
       // against the resolved target's directory, not the link's. `realpath`

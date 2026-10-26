@@ -167,6 +167,29 @@ pub(crate) fn load_all_safetensors(
     Ok(all_params)
 }
 
+/// The weight map a family build starts from. `Some(preload)`: the GGUF main
+/// map, then the derived symmetric biases (from `dir/config.json`), then the
+/// companion when `load_vision` — the order `load_all_safetensors` keeps. With
+/// `load_vision` false the companion stays in `preload` (Muse takes its draft
+/// from there).
+pub(crate) fn load_checkpoint(
+    dir: &Path,
+    load_vision: bool,
+    preload: Option<&mut crate::utils::gguf_import::GgufPreload>,
+) -> Result<HashMap<String, MxArray>> {
+    let Some(preload) = preload else {
+        return load_all_safetensors(dir, load_vision);
+    };
+    let mut params = std::mem::take(&mut preload.main);
+    expand_symmetric_affine_biases(dir, &mut params)?;
+    if load_vision {
+        let companion = std::mem::take(&mut preload.companion);
+        info!("Appending {} GGUF companion tensors", companion.len());
+        params.extend(companion);
+    }
+    Ok(params)
+}
+
 /// Append the optional media sidecar emitted by converted VLM checkpoints.
 ///
 /// Keep this outside the single-vs-sharded branch so `load_vision=true` has
@@ -1711,5 +1734,152 @@ mod rename_spec_tests {
         assert_eq!(dt("layers.0.q_proj.scales"), DType::Float32);
         assert_eq!(dt("layers.0.expert_bias"), DType::Float32);
         assert_eq!(dt("norm.weight"), DType::BFloat16);
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    use crate::engine::checkpoint_source::CheckpointSource;
+    use crate::utils::gguf::{GgufMetaValue, GgufTensorType, NativeGgufFamily};
+    use crate::utils::gguf_import::{GgufPreload, gate::manifest};
+    use crate::utils::gguf_test_fixtures::{
+        ImportFixture, ImportFixtureFamily, build_minimal_gguf, convert_import_fixture,
+        fixture_bytes, fixture_payload,
+    };
+
+    fn write_gguf(
+        path: &Path,
+        arch: &[(&str, GgufMetaValue)],
+        tensors: &[(&str, &[u64], GgufTensorType)],
+    ) {
+        let data: Vec<Vec<u8>> = tensors
+            .iter()
+            .enumerate()
+            .map(|(i, (_, dims, ty))| {
+                let elements = dims.iter().product::<u64>() as usize;
+                let seed = 700 + i as u64;
+                if *ty != GgufTensorType::Q4_1 {
+                    return fixture_payload(*ty, elements, seed);
+                }
+                let mut data = fixture_bytes(seed, elements / 32 * 20);
+                for block in data.as_chunks_mut::<20>().0 {
+                    block[..2].copy_from_slice(&half::f16::from_f32(0.01).to_bits().to_le_bytes());
+                    block[2..4]
+                        .copy_from_slice(&half::f16::from_f32(-0.05).to_bits().to_le_bytes());
+                }
+                data
+            })
+            .collect();
+        let descriptors: Vec<(&str, &[u64], GgufTensorType, &[u8])> = tensors
+            .iter()
+            .zip(&data)
+            .map(|((name, dims, ty), bytes)| (*name, *dims, *ty, bytes.as_slice()))
+            .collect();
+        fs::write(path, build_minimal_gguf(arch, &descriptors)).unwrap();
+    }
+
+    /// Gemma main imported from Q4_0 (zero point 8, the config's top-level
+    /// default) beside an mmproj whose Q4_1 tensor stores its own biases. A
+    /// secondary output cannot carry a symmetric type, so this is the pairing
+    /// in which the derived-bias order is observable.
+    fn q4_0_main_q4_1_mmproj(dir: &Path) -> ImportFixture {
+        use GgufTensorType::*;
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            r#"{"model_type":"gemma4_unified","text_config":{"num_hidden_layers":0},"vision_config":{}}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("tokenizer.json"), "{}").unwrap();
+        let main = dir.join("gemma-q4_0.gguf");
+        write_gguf(
+            &main,
+            &[(
+                "general.architecture",
+                GgufMetaValue::String("gemma4".into()),
+            )],
+            &[
+                ("token_embd.weight", &[256, 64], Q6K),
+                ("output.weight", &[256, 64], Q4_0),
+                ("blk.0.attn_norm.weight", &[256], F32),
+                ("blk.0.ffn_up.weight", &[256, 64], Q4_0),
+                ("blk.0.ffn_down.weight", &[256, 64], Q4_0),
+                ("blk.0.attn_q.weight", &[256, 32], Q4_0),
+            ],
+        );
+        let companion = dir.join("mmproj-gemma.gguf");
+        write_gguf(
+            &companion,
+            &[
+                ("general.architecture", GgufMetaValue::String("clip".into())),
+                (
+                    "clip.vision.projector_type",
+                    GgufMetaValue::String("gemma4uv".into()),
+                ),
+            ],
+            &[("mm.input_projection.weight", &[64, 32], Q4_1)],
+        );
+        ImportFixture {
+            name: "gemma-q4_0-q4_1-mmproj",
+            family: ImportFixtureFamily::Gemma4,
+            main,
+            companion: Some(companion),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_checkpoint_preload_equals_dir_load() {
+        let work = std::env::temp_dir().join(format!("mlx-load-ckpt-{}", uuid::Uuid::new_v4()));
+        let fx = q4_0_main_q4_1_mmproj(&work.join("src"));
+
+        let converted = convert_import_fixture(&fx, &work.join("converted")).await;
+        let want = manifest(&load_all_safetensors(&converted, true).unwrap());
+
+        let source = CheckpointSource::resolve_in(
+            &fx.main,
+            NativeGgufFamily::Gemma4,
+            Some(&work.join("cache")),
+        )
+        .await
+        .unwrap();
+        let CheckpointSource::Gguf(ckpt) = &source else {
+            panic!("the GGUF resolved to a plain directory");
+        };
+        ckpt.check_asset_config().unwrap();
+        let mut preload = GgufPreload::load(&ckpt.preload_input(true)).unwrap();
+        let loaded = load_checkpoint(&ckpt.asset_dir, true, Some(&mut preload));
+        assert!(
+            loaded.is_ok(),
+            "load_checkpoint refused the pair: {}",
+            loaded
+                .as_ref()
+                .err()
+                .map(|e| e.reason.as_str())
+                .unwrap_or_default()
+        );
+        let got = manifest(&loaded.unwrap());
+        assert!(preload.companion.is_empty(), "companion left behind");
+
+        for key in [
+            "model.layers.0.mlp.up_proj.biases",
+            "model.embed_vision.embedding_projection.biases",
+        ] {
+            assert!(
+                want.contains_key(key),
+                "dir load has no {key}: {:?}",
+                want.keys()
+            );
+        }
+        assert_eq!(
+            got.keys().collect::<Vec<_>>(),
+            want.keys().collect::<Vec<_>>(),
+            "tensor names"
+        );
+        for (name, want) in &want {
+            assert_eq!(&got[name], want, "tensor {name}");
+        }
+        source.release_lease();
+        fs::remove_dir_all(&work).ok();
     }
 }

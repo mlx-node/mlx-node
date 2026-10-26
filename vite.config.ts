@@ -108,6 +108,8 @@ export default defineConfig({
       '/crates/mlx-sys/mlx',
       // Byte-for-byte upstream excerpts; kquant_ggml_parity verifies them verbatim.
       '/crates/mlx-core/vendor',
+      // Generated converter outputs; parity tests compare their raw bytes.
+      '/crates/mlx-core/src/utils/testdata/gguf_import_golden',
       '**/*.metal.inc',
     ],
   },

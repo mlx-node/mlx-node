@@ -1,25 +1,26 @@
 //! Bounded, positional SSD reads. Descriptors never create MLX arrays. Only
 //! selected expert matrices and embedding rows are read on cache misses.
 //! Admitted hot banks can be prepared once; PLE stays row-addressable. Routed
-//! experts of a GGUF checkpoint also live in the mapped expert pack.
+//! GGUF experts fill anonymous banks directly from the source checkpoint.
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Seek, SeekFrom};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use napi::{Error, Result};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
+use super::live::{Fallback, Live};
 use super::row_fetch::{Fetcher, Job};
-use super::tripwire::{Fallback, Live, Tripwire};
 use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::QuantizedLinear;
 use crate::utils::gguf::{
     GgufFile, GgufLoadOptions, GgufMetaValue, GgufTensorInfo, GgufTensorType, load_gguf_tensor,
-    parse_gguf, symmetric_zero_point,
+    parse_gguf, source_file_identity_digest, symmetric_zero_point,
 };
 
 #[path = "expert_slots.rs"]
@@ -31,9 +32,7 @@ pub const CACHE_BYTES: u64 = 8 << 30;
 pub(super) const MAX_READ_BYTES: u64 = 64 << 20;
 const MAX_HEADER_BYTES: u64 = 16 << 20;
 /// Reader threads for token/PLE rows: 17 random 90 B-2.7 KB reads per token.
-/// A layer-major prefill asks for a whole prompt's rows at once while the
-/// pack stream yields to them: 32 readers finish a 6k prompt's 58,718 rows
-/// in 0.27 s beside the stream, 4 in 1.17 s.
+/// Direct expert fills yield while these rows are pending.
 const ROW_READERS: usize = 32;
 
 /// Decoded-row LRU and reader-thread counters, shared with `residencyInfo()`.
@@ -135,27 +134,281 @@ impl Tensor {
         }
         Ok((self.offset + self.row_bytes()? * start as u64, bytes))
     }
-    /// Quantized multi-row GGUF matrices the mapped pack can hold; sparse
-    /// embedding/PLE rows are cheap to unpack and never packed.
-    fn packable(&self, name: &str, start: usize, rows: usize) -> Result<bool> {
-        let (_, bytes) = self.range(start, rows)?;
-        Ok(match self.encoding {
-            Encoding::Gguf(ty) => {
-                rows > 1
-                    && bytes >= 4096
-                    && (ty.k_quant_format().is_some()
-                        || matches!(
-                            ty,
-                            GgufTensorType::Q4_0
-                                | GgufTensorType::Q4_1
-                                | GgufTensorType::Q5_1
-                                | GgufTensorType::Q8_0
-                        ))
-                    && name != "per_layer_token_embd.weight"
-                    && name != "token_embd.weight"
+}
+
+/// One main-checkpoint shard in declared split order. `base` is aligned so
+/// the direct window planner can address the whole set without losing the
+/// per-file alignment required by uncached reads. Auxiliary checkpoints are
+/// deliberately not part of this set.
+#[derive(Clone)]
+struct DirectGgufShard {
+    path: PathBuf,
+    identity: String,
+    len: u64,
+    base: u64,
+}
+
+/// The main GGUF shard set whose identities guard direct expert fills.
+#[derive(Clone)]
+pub(super) struct DirectGgufSource {
+    shards: Vec<DirectGgufShard>,
+    identity: String,
+    len: u64,
+}
+
+impl DirectGgufSource {
+    fn set_identity(shards: &[DirectGgufShard]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"qwen4-direct-gguf-v1");
+        for (ordinal, shard) in shards.iter().enumerate() {
+            hasher.update((ordinal as u64).to_le_bytes());
+            hasher.update(shard.base.to_le_bytes());
+            let path = shard.path.as_os_str().as_encoded_bytes();
+            hasher.update((path.len() as u64).to_le_bytes());
+            hasher.update(path);
+            hasher.update((shard.identity.len() as u64).to_le_bytes());
+            hasher.update(shard.identity.as_bytes());
+        }
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn new(paths: &[PathBuf]) -> Result<Self> {
+        if paths.is_empty() {
+            return Err(err("Qwen4 direct GGUF source has no shards"));
+        }
+        let mut shards = Vec::with_capacity(paths.len());
+        let mut seen = HashSet::new();
+        let mut next_base = 0u64;
+        for path in paths {
+            let path = path.canonicalize().map_err(err)?;
+            if !seen.insert(path.clone()) {
+                return Err(err(format!(
+                    "GGUF split set contains duplicate shard '{}'",
+                    path.display()
+                )));
             }
-            Encoding::Safe(_) => false,
+            let meta = fs::metadata(&path).map_err(err)?;
+            let base = next_base;
+            let len = meta.len();
+            next_base = base
+                .checked_add(len)
+                .and_then(|end| end.checked_next_multiple_of(crate::utils::gguf_read::ALIGN))
+                .ok_or_else(|| err("Qwen4 direct GGUF logical size overflow"))?;
+            shards.push(DirectGgufShard {
+                identity: source_file_identity_digest(&path, &meta),
+                path,
+                len,
+                base,
+            });
+        }
+        let last = shards
+            .last()
+            .ok_or_else(|| err("Qwen4 direct GGUF source has no shards"))?;
+        let len = last
+            .base
+            .checked_add(last.len)
+            .ok_or_else(|| err("Qwen4 direct GGUF logical size overflow"))?;
+        let identity = Self::set_identity(&shards);
+        Ok(Self {
+            shards,
+            identity,
+            len,
         })
+    }
+
+    fn has_path(&self, path: &Path) -> bool {
+        self.shards.iter().any(|shard| shard.path == path)
+    }
+
+    fn open_files(&self) -> Result<Vec<File>> {
+        self.shards
+            .iter()
+            .map(|shard| {
+                File::open(&shard.path).map_err(|error| {
+                    err(format!(
+                        "Failed to open GGUF '{}': {error}",
+                        shard.path.display()
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn verify_path(&self) -> Result<()> {
+        let mut live_shards = Vec::with_capacity(self.shards.len());
+        for expected in &self.shards {
+            let live = fs::metadata(&expected.path).map_err(|e| {
+                err(format!(
+                    "Failed to stat GGUF '{}': {e}",
+                    expected.path.display()
+                ))
+            })?;
+            if live.len() < expected.len {
+                return Err(err(format!(
+                    "GGUF '{}' is truncated: expected {} bytes, found {}",
+                    expected.path.display(),
+                    expected.len,
+                    live.len()
+                )));
+            }
+            let identity = source_file_identity_digest(&expected.path, &live);
+            if live.len() != expected.len || identity != expected.identity {
+                return Err(err(format!(
+                    "GGUF '{}' changed since open; retry the request",
+                    expected.path.display()
+                )));
+            }
+            live_shards.push(DirectGgufShard {
+                identity,
+                path: expected.path.clone(),
+                len: live.len(),
+                base: expected.base,
+            });
+        }
+        if Self::set_identity(&live_shards) != self.identity {
+            return Err(err("GGUF split set changed since open; retry the request"));
+        }
+        Ok(())
+    }
+
+    fn verify(&self, files: &[&File]) -> Result<()> {
+        if files.len() != self.shards.len() {
+            return Err(err("Qwen4 direct GGUF shard set is incomplete"));
+        }
+        for (expected, file) in self.shards.iter().zip(files) {
+            let live = fs::metadata(&expected.path).map_err(|e| {
+                err(format!(
+                    "Failed to stat GGUF '{}': {e}",
+                    expected.path.display()
+                ))
+            })?;
+            let held = file.metadata().map_err(|e| {
+                err(format!(
+                    "Failed to stat open GGUF '{}': {e}",
+                    expected.path.display()
+                ))
+            })?;
+            if live.len() < expected.len && live.dev() == held.dev() && live.ino() == held.ino() {
+                return Err(err(format!(
+                    "GGUF '{}' is truncated: expected {} bytes, found {}",
+                    expected.path.display(),
+                    expected.len,
+                    live.len()
+                )));
+            }
+            if live.len() != expected.len
+                || held.len() != expected.len
+                || source_file_identity_digest(&expected.path, &live) != expected.identity
+                || source_file_identity_digest(&expected.path, &held) != expected.identity
+            {
+                return Err(err(format!(
+                    "GGUF '{}' changed since open; retry the request",
+                    expected.path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Positional reads over the aligned logical shard address space. A window
+/// may cross a shard boundary; only the virtual alignment gap is synthesized.
+pub(super) struct DirectGgufReader<'a> {
+    source: &'a DirectGgufSource,
+    files: &'a [&'a File],
+}
+
+impl<'a> DirectGgufReader<'a> {
+    pub(super) fn new(source: &'a DirectGgufSource, files: &'a [&'a File]) -> Result<Self> {
+        if files.len() != source.shards.len() {
+            return Err(err("Qwen4 direct GGUF shard set is incomplete"));
+        }
+        Ok(Self { source, files })
+    }
+}
+
+impl crate::utils::gguf_read::ReadAt for DirectGgufReader<'_> {
+    fn read_exact_at(&self, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let last_path = &self.source.shards[self.source.shards.len() - 1].path;
+        let end = off.checked_add(buf.len() as u64).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "GGUF shard '{}': logical read offset overflows",
+                    last_path.display()
+                ),
+            )
+        })?;
+        if end > self.source.len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "GGUF shard '{}': logical read ends at {end}, beyond {} bytes",
+                    last_path.display(),
+                    self.source.len
+                ),
+            ));
+        }
+        let mut index = match self
+            .source
+            .shards
+            .binary_search_by(|shard| shard.base.cmp(&off))
+        {
+            Ok(index) => index,
+            Err(index) => index.saturating_sub(1),
+        };
+        let mut offset = off;
+        let mut remaining = buf;
+        while !remaining.is_empty() {
+            let shard = self.source.shards.get(index).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "GGUF shard '{}': split set ended early",
+                        last_path.display()
+                    ),
+                )
+            })?;
+            if offset < shard.base {
+                let n = (shard.base - offset).min(remaining.len() as u64) as usize;
+                remaining[..n].fill(0);
+                offset += n as u64;
+                remaining = &mut remaining[n..];
+                continue;
+            }
+            let shard_end = shard.base + shard.len;
+            if offset >= shard_end {
+                index += 1;
+                continue;
+            }
+            let in_shard = offset - shard.base;
+            let n = (shard.len - in_shard).min(remaining.len() as u64) as usize;
+            std::os::unix::fs::FileExt::read_exact_at(
+                self.files[index],
+                &mut remaining[..n],
+                in_shard,
+            )
+            .map_err(|error| {
+                if self.source.shards.len() == 1 {
+                    error
+                } else {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!("GGUF shard '{}': {error}", shard.path.display()),
+                    )
+                }
+            })?;
+            offset += n as u64;
+            remaining = &mut remaining[n..];
+        }
+        Ok(())
     }
 }
 
@@ -442,33 +695,27 @@ pub struct Store {
     banks: HashMap<String, Arc<Weight>>,
     bank_bytes: u64,
     mtp_banks_declined: bool,
-    /// Draft-bank bytes the mapped plan budgeted beside the dense banks; the
-    /// bank admission honours them, the slot path leaves them at zero.
+    /// Draft-bank bytes the direct plan budgeted beside the dense banks; the
+    /// bank admission honours them, the partial path leaves them at zero.
     draft_bank_budget: u64,
     paired_banks: HashMap<(String, String), Arc<Weight>>,
     slots: HashMap<usize, expert_slots::ExpertSlots>,
-    mapped_experts: HashMap<usize, expert_slots::MappedExperts>,
-    /// Start of the last forward pass in mapped mode (bank re-wire gate).
-    mapped_pass_start: Option<std::time::Instant>,
-    prefetch: Option<super::prefetch::Pool>,
-    /// The turn opened while the pack streams: its passes do not touch, and
-    /// the layers already run are kept wired instead.
-    streaming_pass: bool,
-    last_touch: Option<std::time::Instant>,
-    /// A layer-major prefill group runs: the banks of the layers already
-    /// swept are kept wired until it commits, through asynchronous touches
-    /// whose arrays wait in `pending_touch` for that commit.
-    group_in_progress: bool,
-    pending_touch: Vec<MxArray>,
-    /// Layers covered by every bank touch, in order.
-    #[cfg(test)]
-    pub(in super::super) touches: Vec<Vec<usize>>,
-    /// Whether each touch in `touches` was submitted asynchronously.
-    #[cfg(test)]
-    pub(in super::super) touches_async: Vec<bool>,
+    direct_fill: Option<expert_slots::DirectFill>,
+    direct_fill_remaining: usize,
+    direct_error: Option<String>,
+    activation_error: Option<String>,
+    /// This turn admitted a layer-major prefill beside a direct fill.
+    direct_fill_pass: bool,
+    /// A slow source keeps its filled banks instead of purging them at idle.
+    direct_slow_source: bool,
+    slot_reclaim_since: Option<std::time::Instant>,
     wide_routes: HashMap<usize, Vec<u32>>,
     deferred_reduction_layer: Option<usize>,
     slot_capacity: Option<usize>,
+    /// Gate-derived ceiling for direct partial banks. Its presence also keeps
+    /// load reconciliation from replacing the live-pressure plan with the
+    /// older bootstrap rule.
+    slot_bank_budget: Option<u64>,
     slot_bytes: u64,
     pub slot_upload_bytes: u64,
     pub slot_hits: u64,
@@ -476,15 +723,16 @@ pub struct Store {
     growth_bytes: u64,
     pub bytes_read: u64,
     pub peak_cache_bytes: u64,
-    packed: Option<super::packed_cache::PackedCache>,
-    pub packed_hits: u64,
-    pub packed_bytes_read: u64,
-    mapped: Option<super::mapped_pack::MappedPack>,
+    gguf_source: Option<DirectGgufSource>,
+    #[cfg(test)]
+    direct_gguf: bool,
+    #[cfg(test)]
+    direct_read_windows: Vec<(u64, usize)>,
     /// One open descriptor per checkpoint file; row reads `pread` through it.
     files: HashMap<PathBuf, Arc<File>>,
     rows: Option<Fetcher>,
     /// Rows the reader threads or the model thread still have to read;
-    /// the mapped pack's stream yields while it is above zero.
+    /// direct expert fills yield while it is above zero.
     rows_pending: Arc<AtomicUsize>,
     #[cfg(test)]
     pub(in super::super) row_readers: bool,
@@ -497,7 +745,6 @@ pub struct Store {
     pub(in super::super) vector_windows: Vec<(i64, u64)>,
     pub lookup: Arc<LookupStats>,
     pub live: Arc<Live>,
-    tripwire: Tripwire,
     window_banks: HashMap<u64, WindowBank>,
     row_bank: HashMap<(String, usize, usize), u64>,
     next_window_bank: u64,
@@ -512,8 +759,9 @@ struct SafeDescriptor {
 
 impl Store {
     pub(super) fn check_forward_headroom(&self) -> Result<()> {
-        let mapped = self.plan.mapped;
-        self.check_forward_headroom_with(|| super::memory::check_growth_headroom(mapped))
+        self.check_forward_headroom_with(|| {
+            super::memory::check_growth_headroom(self.plan.use_direct_turn_floor())
+        })
     }
 
     fn check_forward_headroom_with(&self, check: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -585,10 +833,11 @@ impl Store {
                 physical_bytes: None,
                 resident_bank_bytes: Default::default(),
                 partial_expert_slots: 0,
-                mapped_pack_files: 0,
-                mapped: false,
-                mapped_bytes: 0,
-                mapped_bank_budget: 0,
+                direct: false,
+                partial_direct_gate: false,
+                direct_bytes: 0,
+                direct_layers: 0,
+                bank_budget: 0,
                 live_non_reclaimable: 0,
             },
             banks: HashMap::new(),
@@ -597,20 +846,17 @@ impl Store {
             draft_bank_budget: 0,
             paired_banks: HashMap::new(),
             slots: HashMap::new(),
-            mapped_experts: HashMap::new(),
-            mapped_pass_start: None,
-            prefetch: None,
-            streaming_pass: false,
-            last_touch: None,
-            group_in_progress: false,
-            pending_touch: Vec::new(),
-            #[cfg(test)]
-            touches: Vec::new(),
-            #[cfg(test)]
-            touches_async: Vec::new(),
+            direct_fill: None,
+            direct_fill_remaining: 0,
+            direct_error: None,
+            activation_error: None,
+            direct_fill_pass: false,
+            direct_slow_source: false,
+            slot_reclaim_since: None,
             wide_routes: HashMap::new(),
             deferred_reduction_layer: None,
             slot_capacity: None,
+            slot_bank_budget: None,
             slot_bytes: 0,
             slot_upload_bytes: 0,
             slot_hits: 0,
@@ -618,10 +864,11 @@ impl Store {
             growth_bytes: 0,
             bytes_read: 0,
             peak_cache_bytes: 0,
-            packed: None,
-            packed_hits: 0,
-            packed_bytes_read: 0,
-            mapped: None,
+            gguf_source: None,
+            #[cfg(test)]
+            direct_gguf: true,
+            #[cfg(test)]
+            direct_read_windows: Vec::new(),
             files: HashMap::new(),
             rows: None,
             rows_pending: Arc::default(),
@@ -633,7 +880,6 @@ impl Store {
             vector_windows: Vec::new(),
             lookup: Arc::default(),
             live: Arc::default(),
-            tripwire: Tripwire::default(),
             window_banks: HashMap::new(),
             row_bank: HashMap::new(),
             next_window_bank: 0,
@@ -647,12 +893,9 @@ impl Store {
             return Err(err("No model tensors found"));
         }
         if s.gguf {
-            let files = s.tensors.values().map(|t| t.path.clone()).collect();
-            s.packed = match root {
-                Some(root) => super::packed_cache::PackedCache::new_at(root, files),
-                None => super::packed_cache::PackedCache::new(path, files),
-            }
-            .ok();
+            let root =
+                root.map_or_else(|| super::packed_cache::cache_root(path), Path::to_path_buf);
+            super::packed_cache::sweep_old_packs(&root);
         }
         Ok(s)
     }
@@ -869,14 +1112,19 @@ impl Store {
         }
         let paths = crate::utils::gguf::resolve_gguf_shards(first, count)?;
         self.metadata = initial.metadata.clone();
-        for (i, path) in paths.into_iter().enumerate() {
+        for (i, path) in paths.iter().enumerate() {
             let i = i as u32;
             let g = if i == 0 {
                 None
             } else {
-                Some(parse_gguf(&path)?)
+                Some(parse_gguf(path)?)
             };
             let g = g.as_ref().unwrap_or(&initial);
+            crate::utils::gguf_source::check_tensor_bounds(
+                g,
+                fs::metadata(path).map_err(err)?.len(),
+                path,
+            )?;
             if g.metadata
                 .get("split.no")
                 .and_then(GgufMetaValue::as_u32)
@@ -932,6 +1180,12 @@ impl Store {
         {
             return Err(err("GGUF split tensor count mismatch"));
         }
+        let source = DirectGgufSource::new(&paths)?;
+        source.verify_path()?;
+        let files = source.open_files()?;
+        let file_refs: Vec<&File> = files.iter().collect();
+        source.verify(&file_refs)?;
+        self.gguf_source = Some(source);
         Ok(())
     }
     #[cfg(test)]
@@ -946,6 +1200,7 @@ impl Store {
     pub(super) fn set_cache_limit(&mut self, bytes: u64) {
         self.cache_limit = bytes;
         self.plan.budget = bytes;
+        self.slot_bank_budget = None;
     }
     pub fn descriptor(&self, name: &str) -> Result<&Tensor> {
         self.tensors
@@ -984,141 +1239,18 @@ impl Store {
         Ok(())
     }
     pub fn read(&mut self, name: &str, start: usize, rows: usize) -> Result<Arc<Weight>> {
-        self.read_impl(name, start, rows, false, None)
+        self.read_impl(name, start, rows, false)
     }
 
-    /// Preload only the already selected expert group. At most 64 MiB of
-    /// verified CPU payloads coexist; MLX imports and all Store/slot mutations
-    /// stay on the inference thread in original request order. Whole-expert
-    /// batches of packed tensors come from the mapped pack by range; anything
-    /// else is imported from the checkpoint.
+    /// Import a bounded group through the ordinary checkpoint reader.
     fn read_expert_batch(
         &mut self,
         requests: &[(String, usize, usize)],
     ) -> Result<Vec<Arc<Weight>>> {
-        if self.mapped.is_none() {
-            return requests
-                .iter()
-                .map(|(name, start, rows)| self.read(name, *start, *rows))
-                .collect();
-        }
-        let mut indices = Vec::new();
-        let mut total = 0u64;
-        for (i, (name, start, rows)) in requests.iter().enumerate() {
-            if self.banks.contains_key(name)
-                || self.cache.contains_key(&(name.clone(), *start, *rows))
-            {
-                continue;
-            }
-            let d = self.descriptor(name)?;
-            if d.packable(name, *start, *rows)? {
-                let bytes = (d.runtime_bytes()? / d.rows()? as u64).saturating_mul(*rows as u64);
-                total = total.saturating_add(bytes);
-                indices.push(i);
-            }
-        }
-        if total > MAX_READ_BYTES || indices.len() > 24 || indices.len() < 2 {
-            return requests
-                .iter()
-                .map(|(name, start, rows)| self.read(name, *start, *rows))
-                .collect();
-        }
-        // Packed payload, imported arrays and upload staging coexist. Charge
-        // the actual bounded batch, rather than reserving three maximum-size
-        // reads even for a few small cache misses.
-        let staging_bytes = total * 3;
-        self.evict_to(self.cache_limit.saturating_sub(staging_bytes))?;
-        super::memory::maintain_freelist(self.plan.physical_bytes);
-        super::memory::admit(staging_bytes)?;
-        let subset: Vec<_> = indices.iter().map(|&i| requests[i].clone()).collect();
-        let verified = self
-            .mapped
-            .as_ref()
-            .map(|pack| pack.read_batch(&subset))
-            .transpose()?
-            .flatten();
-        let mut prepared: Vec<_> = (0..requests.len()).map(|_| None).collect();
-        if let Some(chunks) = verified {
-            for (i, chunk) in indices.into_iter().zip(chunks) {
-                prepared[i] = Some(chunk);
-            }
-        }
         requests
             .iter()
-            .zip(prepared)
-            .map(|((name, start, rows), chunk)| self.read_impl(name, *start, *rows, false, chunk))
+            .map(|(name, start, rows)| self.read(name, *start, *rows))
             .collect()
-    }
-
-    /// Open the mapped expert pack, building whatever is missing from the
-    /// checkpoint. A failure leaves the checkpoint reader in charge; it
-    /// never fails the load.
-    pub(in super::super) fn prepare_mapped_pack(&mut self) -> Result<()> {
-        let dir = match &self.packed {
-            Some(packed) if self.gguf => packed.mapped_dir().to_path_buf(),
-            _ => return Ok(()),
-        };
-        self.prepare_mapped_pack_at(&dir)
-    }
-
-    fn prepare_mapped_pack_at(&mut self, dir: &Path) -> Result<()> {
-        let Some(packed) = &self.packed else {
-            return Ok(());
-        };
-        let Some(identity) = packed.identity() else {
-            return Ok(());
-        };
-        let mut routed: Vec<(usize, usize, String, Tensor)> = Vec::new();
-        for (name, tensor) in &self.tensors {
-            let Some((layer, part)) = routed_expert_tensor(name) else {
-                continue;
-            };
-            if tensor.shape.len() != 3
-                || tensor.shape[0] == 0
-                || !tensor.packable(name, 0, tensor.shape[1])?
-            {
-                continue;
-            }
-            routed.push((layer, part, name.clone(), tensor.clone()));
-        }
-        if routed.is_empty() {
-            return Ok(());
-        }
-        routed.sort_by_key(|r| (r.0, r.1));
-        let sources: Vec<RoutedExpertSource> = routed
-            .into_iter()
-            .map(|(_, _, name, tensor)| RoutedExpertSource { name, tensor })
-            .collect();
-        let dyn_sources: Vec<&dyn super::mapped_pack::ExpertSource> = sources
-            .iter()
-            .map(|s| s as &dyn super::mapped_pack::ExpertSource)
-            .collect();
-        let started = std::time::Instant::now();
-        match super::mapped_pack::MappedPack::open_or_build(
-            dir,
-            identity,
-            Some(packed.manifest()),
-            &dyn_sources,
-        ) {
-            Ok((pack, report)) => {
-                tracing::info!(
-                    "qwen4 mapped pack: {} opened, {} built, {} unavailable in {:.1} s at {}",
-                    report.opened,
-                    report.built,
-                    report.skipped,
-                    started.elapsed().as_secs_f64(),
-                    pack.dir().display()
-                );
-                self.plan.mapped_pack_files = pack.len();
-                self.mapped = Some(pack);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "qwen4 mapped pack unavailable, importing experts from the checkpoint: {e}"
-                );
-            }
-        }
-        Ok(())
     }
 
     /// Gather a bounded lookup window, sharing duplicate rows. Decoded rows
@@ -1153,7 +1285,7 @@ impl Store {
                 if miss {
                     LookupStats::count(&self.lookup.misses);
                 }
-                let row = self.read_impl(name, id, 1, true, None)?.dense_pending()?;
+                let row = self.read_impl(name, id, 1, true)?.dense_pending()?;
                 let slot = rows.len();
                 rows.push(row);
                 if miss {
@@ -1338,11 +1470,10 @@ impl Store {
         start: usize,
         rows: usize,
         lookup: bool,
-        prepared: Option<super::packed_cache::VerifiedChunk>,
     ) -> Result<Arc<Weight>> {
-        let mapped = self.plan.mapped;
-        self.read_impl_with(name, start, rows, lookup, prepared, || {
-            super::memory::check_growth_headroom(mapped)
+        let direct_gate = self.plan.use_direct_turn_floor();
+        self.read_impl_with(name, start, rows, lookup, || {
+            super::memory::check_growth_headroom(direct_gate)
         })
     }
 
@@ -1352,7 +1483,6 @@ impl Store {
         start: usize,
         rows: usize,
         lookup: bool,
-        prepared: Option<super::packed_cache::VerifiedChunk>,
         growth_check: impl FnOnce() -> Result<()>,
     ) -> Result<Arc<Weight>> {
         if let Some(bank) = self.banks.get(name) {
@@ -1375,33 +1505,20 @@ impl Store {
         // briefly under the same safety limit before refusing.
         super::memory::check_active_memory_budget(
             cache_limit,
-            || {
-                crate::array::memory::get_active_memory()
-                    - crate::array::mapped_array_bytes() as f64
-            },
+            crate::array::memory::anonymous_active_memory,
             crate::array::memory::clear_cache,
             std::thread::sleep,
         )?;
         super::memory::maintain_freelist(self.plan.physical_bytes);
-        // Mapped experts never pass through here, so growth_bytes holds only
-        // anonymous bytes: token/PLE rows, MTP/vision weights and fallback
-        // projection chunks still consume the system reserve in mapped mode.
+        // Full direct experts do not pass through this per-row importer;
+        // token/PLE rows, auxiliary weights and fallback projection chunks
+        // still consume the applicable headroom reserve.
         if cfg!(target_os = "macos") && self.growth_bytes >= 256 << 20 {
             growth_check()?;
             self.growth_bytes = 0;
         }
         self.evict_to(cache_limit.saturating_sub(MAX_READ_BYTES * 3))?;
-        let prepared = prepared
-            .map(super::packed_cache::VerifiedChunk::into_weight)
-            .transpose()?;
-        let prepared_hit = prepared.is_some();
-        let weight = if let Some((weight, bytes)) = prepared {
-            self.packed_hits += 1;
-            self.packed_bytes_read += bytes;
-            weight
-        } else {
-            self.import_rows(&d, name, start, rows)?
-        };
+        let weight = self.import_rows(&d, name, start, rows)?;
         let arrays: Vec<_> = [
             Some(&weight.values),
             weight.scales.as_ref(),
@@ -1413,9 +1530,7 @@ impl Store {
         if !lookup {
             MxArray::eval_arrays_with_context(&arrays, "qwen4::weights::loaded")?;
         }
-        if !prepared_hit {
-            self.bytes_read += bytes;
-        }
+        self.bytes_read += bytes;
         self.retain_read(name, key, weight, lookup, rows)
     }
 
@@ -1819,7 +1934,7 @@ impl Store {
 }
 
 /// `blk.{layer}.ffn_{gate|up|down}_exps.weight` -> `(layer, part)`.
-fn routed_expert_tensor(name: &str) -> Option<(usize, usize)> {
+pub(super) fn routed_expert_tensor(name: &str) -> Option<(usize, usize)> {
     let (layer, rest) = name.strip_prefix("blk.")?.split_once('.')?;
     let layer = layer.parse::<usize>().ok()?;
     let part = [
@@ -1830,33 +1945,6 @@ fn routed_expert_tensor(name: &str) -> Option<(usize, usize)> {
     .iter()
     .position(|p| *p == rest)?;
     Some((layer, part))
-}
-
-/// One routed expert tensor as the mapped-pack builder imports it.
-struct RoutedExpertSource {
-    name: String,
-    tensor: Tensor,
-}
-
-impl super::mapped_pack::ExpertSource for RoutedExpertSource {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn experts(&self) -> usize {
-        self.tensor.shape[0]
-    }
-    fn rows_per_expert(&self) -> usize {
-        self.tensor.shape[1]
-    }
-    fn width(&self) -> usize {
-        self.tensor.shape[2]
-    }
-    fn import(&self, expert: usize) -> Result<super::mapped_pack::ExpertRecord> {
-        let rows = self.rows_per_expert();
-        super::mapped_pack::ExpertRecord::from_weight(
-            &self.tensor.import_rows(expert * rows, rows)?,
-        )
-    }
 }
 
 #[cfg(test)]
@@ -1993,10 +2081,10 @@ mod cache_tests {
     }
 
     #[test]
-    fn mapped_store_keeps_the_forward_headroom_guard() {
+    fn direct_store_keeps_the_forward_headroom_guard() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp");
         let mut production = Store::open_metadata(&path, None).unwrap();
-        production.plan.mapped = true;
+        production.plan.direct = true;
         let checked = std::cell::Cell::new(0);
         let unavailable = || {
             checked.set(checked.get() + 1);
@@ -2006,27 +2094,27 @@ mod cache_tests {
         assert_eq!(
             checked.get(),
             1,
-            "mapped store skipped the forward headroom check"
+            "direct store skipped the forward headroom check"
         );
     }
 
-    /// Only the routed experts are file-backed in mapped mode; every other
+    /// Full direct experts bypass the row importer; every other
     /// read is anonymous growth and keeps the 256 MiB system-headroom recheck.
     #[test]
-    fn mapped_store_rechecks_growth_headroom_for_anonymous_rows() {
+    fn direct_store_rechecks_growth_headroom_for_anonymous_rows() {
         if !cfg!(target_os = "macos") {
             return;
         }
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp");
         let mut store = Store::open_metadata(&path, None).unwrap();
-        store.plan.mapped = true;
+        store.plan.direct = true;
         let checked = std::cell::Cell::new(0);
         let unavailable = || {
             checked.set(checked.get() + 1);
             Err(err("simulated exhausted system headroom"))
         };
         let row = store
-            .read_impl_with("embed_tokens.weight", 0, 1, false, None, unavailable)
+            .read_impl_with("embed_tokens.weight", 0, 1, false, unavailable)
             .unwrap();
         assert_eq!(
             checked.get(),
@@ -2036,14 +2124,13 @@ mod cache_tests {
         assert_eq!(
             store.growth_bytes,
             row.bytes().unwrap(),
-            "mapped mode must charge anonymous rows as growth"
+            "direct mode must charge anonymous rows as growth"
         );
         store.growth_bytes = 256 << 20;
-        let error =
-            match store.read_impl_with("embed_tokens.weight", 1, 1, false, None, unavailable) {
-                Ok(_) => panic!("mapped store ignored exhausted growth headroom"),
-                Err(error) => error,
-            };
+        let error = match store.read_impl_with("embed_tokens.weight", 1, 1, false, unavailable) {
+            Ok(_) => panic!("direct store ignored exhausted growth headroom"),
+            Err(error) => error,
+        };
         assert!(error.reason.contains("simulated"), "{}", error.reason);
         assert_eq!(checked.get(), 1);
         assert_eq!(
@@ -2057,7 +2144,7 @@ mod cache_tests {
                 .contains_key(&("embed_tokens.weight".to_string(), 1, 1))
         );
         store
-            .read_impl_with("embed_tokens.weight", 1, 1, false, None, || Ok(()))
+            .read_impl_with("embed_tokens.weight", 1, 1, false, || Ok(()))
             .unwrap();
         assert_eq!(
             store.growth_bytes,
@@ -2672,18 +2759,18 @@ mod cache_tests {
 }
 
 #[cfg(test)]
-mod mapped_tests {
+mod direct_tests {
     use super::*;
     use crate::models::qwen4_exp::memory;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::{Condvar, Mutex};
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::time::{Duration, Instant};
 
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
             let path =
-                std::env::temp_dir().join(format!("qwen4-mapped-store-{}", uuid::Uuid::new_v4()));
+                std::env::temp_dir().join(format!("qwen4-direct-store-{}", uuid::Uuid::new_v4()));
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }
@@ -2695,11 +2782,27 @@ mod mapped_tests {
     }
 
     const EXPERTS: usize = 5;
-    const PARTS: [(&str, usize, usize, u32, usize); 3] = [
+    type Part = (&'static str, usize, usize, u32, usize);
+    const PARTS: [Part; 3] = [
         // (name, rows per expert, width, GGUF type, block bytes per row)
         ("blk.0.ffn_gate_exps.weight", 32, 256, 12, 144),
         ("blk.0.ffn_up_exps.weight", 32, 256, 12, 144),
         ("blk.0.ffn_down_exps.weight", 128, 64, 7, 48),
+    ];
+    const Q8_PARTS: [Part; 3] = [
+        PARTS[0],
+        PARTS[1],
+        ("blk.0.ffn_down_exps.weight", 128, 64, 8, 68),
+    ];
+    const Q5K_PARTS: [Part; 3] = [
+        ("blk.0.ffn_gate_exps.weight", 32, 256, 13, 176),
+        ("blk.0.ffn_up_exps.weight", 32, 256, 13, 176),
+        PARTS[2],
+    ];
+    const FLASH_PARTS: [Part; 3] = [
+        ("blk.0.ffn_gate_exps.weight", 640, 2560, 12, 1440),
+        ("blk.0.ffn_up_exps.weight", 640, 2560, 12, 1440),
+        ("blk.0.ffn_down_exps.weight", 2560, 640, 7, 480),
     ];
 
     /// Three routed expert tensors of one layer: Q4_K gate/up and Q5_1 down,
@@ -2710,30 +2813,42 @@ mod mapped_tests {
 
     /// The same three tensors for layers `0..layers`.
     fn write_fixture_layers(path: &Path, layers: usize) {
+        write_fixture_layout(path, layers, EXPERTS, &PARTS, 0, 0);
+    }
+
+    fn write_fixture_layout(
+        path: &Path,
+        layers: usize,
+        experts: usize,
+        parts: &[Part; 3],
+        header_pad: usize,
+        trailing: usize,
+    ) {
         let string = |bytes: &mut Vec<u8>, value: &str| {
             bytes.extend((value.len() as u64).to_le_bytes());
             bytes.extend(value.bytes());
         };
         let mut b = b"GGUF".to_vec();
         b.extend(3u32.to_le_bytes());
-        b.extend(((PARTS.len() * layers) as u64).to_le_bytes());
+        b.extend(((parts.len() * layers) as u64).to_le_bytes());
         b.extend(1u64.to_le_bytes());
         string(&mut b, "general.architecture");
         b.extend(8u32.to_le_bytes());
         string(&mut b, "qwen4exp");
         let mut offset = 0u64;
         for layer in 0..layers {
-            for (name, rows, width, ty, row_bytes) in PARTS {
+            for (name, rows, width, ty, row_bytes) in parts {
                 string(&mut b, &name.replace("blk.0.", &format!("blk.{layer}.")));
                 b.extend(3u32.to_le_bytes());
-                for d in [width as u64, rows as u64, EXPERTS as u64] {
+                for d in [*width as u64, *rows as u64, experts as u64] {
                     b.extend(d.to_le_bytes());
                 }
                 b.extend(ty.to_le_bytes());
                 b.extend(offset.to_le_bytes());
-                offset += (EXPERTS * rows * row_bytes) as u64;
+                offset += (experts * *rows * *row_bytes) as u64;
             }
         }
+        b.resize(b.len() + header_pad, 0);
         while !b.len().is_multiple_of(32) {
             b.push(0);
         }
@@ -2742,100 +2857,179 @@ mod mapped_tests {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             b.push((state >> 24) as u8);
         }
+        b.resize(b.len() + trailing, 0x5a);
         fs::write(path, b).unwrap();
     }
 
+    fn write_split_fixture_layout(
+        dir: &Path,
+        label: &str,
+        shards: usize,
+        layers: usize,
+        experts: usize,
+        parts: &[Part; 3],
+    ) -> Vec<PathBuf> {
+        write_split_fixture_layout_with_empty_first(
+            dir, label, shards, layers, experts, parts, false,
+        )
+    }
+
+    fn write_split_fixture_layout_with_empty_first(
+        dir: &Path,
+        label: &str,
+        shards: usize,
+        layers: usize,
+        experts: usize,
+        parts: &[Part; 3],
+        empty_first: bool,
+    ) -> Vec<PathBuf> {
+        assert!(shards > 1);
+        let paths: Vec<PathBuf> = (1..=shards)
+            .map(|ordinal| dir.join(format!("{label}-{ordinal:05}-of-{shards:05}.gguf")))
+            .collect();
+        let mut assignments = vec![Vec::new(); shards];
+        for (index, (layer, part)) in (0..layers)
+            .flat_map(|layer| (0..parts.len()).map(move |part| (layer, part)))
+            .enumerate()
+        {
+            let target = if empty_first {
+                (index % (shards - 1)) + 1
+            } else {
+                index % shards
+            };
+            assignments[target].push((layer, part));
+        }
+        let string = |bytes: &mut Vec<u8>, value: &str| {
+            bytes.extend((value.len() as u64).to_le_bytes());
+            bytes.extend(value.bytes());
+        };
+        let mut state = 0x2545_f491u32;
+        for (shard, assigned) in assignments.into_iter().enumerate() {
+            let mut b = b"GGUF".to_vec();
+            b.extend(3u32.to_le_bytes());
+            b.extend((assigned.len() as u64).to_le_bytes());
+            b.extend(7u64.to_le_bytes());
+            string(&mut b, "general.architecture");
+            b.extend(8u32.to_le_bytes());
+            string(&mut b, "qwen4exp");
+            for (key, value) in [
+                ("split.no", shard as u64),
+                ("split.count", shards as u64),
+                ("split.tensors.count", (layers * parts.len()) as u64),
+                ("qwen4exp.expert_count", experts as u64),
+                ("qwen4exp.expert_used_count", 2),
+            ] {
+                string(&mut b, key);
+                b.extend(10u32.to_le_bytes());
+                b.extend(value.to_le_bytes());
+            }
+            string(&mut b, "general.alignment");
+            b.extend(4u32.to_le_bytes());
+            b.extend(32u32.to_le_bytes());
+            let mut offset = 0u64;
+            for &(layer, part) in &assigned {
+                let (name, rows, width, ty, row_bytes) = parts[part];
+                string(&mut b, &name.replace("blk.0.", &format!("blk.{layer}.")));
+                b.extend(3u32.to_le_bytes());
+                for d in [width as u64, rows as u64, experts as u64] {
+                    b.extend(d.to_le_bytes());
+                }
+                b.extend(ty.to_le_bytes());
+                b.extend(offset.to_le_bytes());
+                offset += (experts * rows * row_bytes) as u64;
+            }
+            while !b.len().is_multiple_of(32) {
+                b.push(0);
+            }
+            for _ in 0..offset {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                b.push((state >> 24) as u8);
+            }
+            fs::write(&paths[shard], b).unwrap();
+        }
+        paths
+    }
+
+    fn open_split_slots(
+        temp: &Temp,
+        label: &str,
+        parts: &[Part; 3],
+        layers: usize,
+        shards: usize,
+    ) -> (Store, Vec<PathBuf>) {
+        let paths = write_split_fixture_layout(&temp.0, label, shards, layers, EXPERTS, parts);
+        let mut store =
+            Store::open_fixture(&paths[0], Some(&temp.0.join(format!("{label}-cache")))).unwrap();
+        store.slot_capacity = Some(EXPERTS);
+        (store, paths)
+    }
+
+    fn assert_split_read_windows(store: &Store) {
+        let source = store.gguf_source.as_ref().unwrap();
+        assert!(source.shards.len() > 1);
+        assert!(!store.direct_read_windows.is_empty());
+        let mut crossed = false;
+        for &(off, len) in &store.direct_read_windows {
+            let len = len as u64;
+            assert!(len <= 8 << 20 && off % (16 << 10) == 0);
+            for shard in &source.shards {
+                let actual_start = off.max(shard.base);
+                let actual_end = (off + len).min(shard.base + shard.len);
+                if actual_start < actual_end {
+                    assert_eq!((actual_start - shard.base) % (16 << 10), 0);
+                }
+                if off < shard.base && off + len > shard.base {
+                    crossed = true;
+                }
+            }
+        }
+        assert!(crossed, "no direct read window crossed a shard boundary");
+    }
+
     fn encoded(weight: &Weight) -> (Vec<u8>, i32, i32, String) {
-        let (arrays, data) = super::super::packed_cache::encode_weight(weight).unwrap();
-        let mut tagged = serde_json::to_vec(&arrays).unwrap();
-        tagged.extend(data);
-        (tagged, weight.group, weight.bits, weight.mode.clone())
+        let mut data = Vec::new();
+        for array in [
+            Some(&weight.values),
+            weight.scales.as_ref(),
+            weight.biases.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let dtype = array.dtype().unwrap();
+            data.extend(format!("{dtype:?}:{:?};", array.shape().unwrap().to_vec()).as_bytes());
+            match dtype {
+                DType::Uint32 => data.extend(
+                    array
+                        .to_uint32()
+                        .unwrap()
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes()),
+                ),
+                DType::Float32 => data.extend(
+                    array
+                        .to_float32()
+                        .unwrap()
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes()),
+                ),
+                DType::Float16 | DType::BFloat16 => data.extend(
+                    array
+                        .to_uint16_native()
+                        .unwrap()
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes()),
+                ),
+                DType::Uint8 => data.extend(array.to_uint8().unwrap()),
+                DType::Int8 => data.extend(array.to_int8().unwrap().into_iter().map(|v| v as u8)),
+                other => panic!("unsupported test oracle dtype {other:?}"),
+            }
+        }
+        (data, weight.group, weight.bits, weight.mode.clone())
     }
 
     #[test]
-    fn mapped_pack_matches_the_checkpoint_and_feeds_the_slot_batch() {
-        let temp = Temp::new();
-        let gguf = temp.0.join("experts.gguf");
-        write_fixture(&gguf);
-        let root = temp.0.join("cache");
-        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
-        // Every record comes from the GGUF importer.
-        let from_gguf = temp.0.join("from-gguf");
-        store.prepare_mapped_pack_at(&from_gguf).unwrap();
-        assert_eq!(store.plan.mapped_pack_files, 3);
-        let mapped = store.mapped.take().unwrap();
-        // Oracle: the ordinary reader, expert by expert, encoded as a chunk.
-        for (name, rows, _, _, _) in PARTS {
-            let file = mapped.file(name).unwrap();
-            let h = &file.header;
-            assert_eq!(h.experts as usize, EXPERTS);
-            assert_eq!(h.rows_per_expert as usize, rows);
-            let mut expected: Vec<Vec<u8>> = vec![Vec::new(); h.sections.len()];
-            for expert in 0..EXPERTS {
-                let w = store.read(name, expert * rows, rows).unwrap();
-                let (arrays, data) = super::super::packed_cache::encode_weight(&w).unwrap();
-                assert_eq!(arrays.len(), h.sections.len());
-                let mut cursor = 0;
-                for (part, a) in arrays.iter().enumerate() {
-                    expected[part].extend_from_slice(&data[cursor..cursor + a.bytes]);
-                    cursor += a.bytes;
-                }
-                assert_eq!(
-                    (w.group, w.bits, w.mode.as_str()),
-                    (h.group, h.bits, h.mode.as_str())
-                );
-            }
-            let whole = file.read_range(0, EXPERTS).unwrap();
-            for (s, section) in h.sections.iter().enumerate() {
-                assert_eq!(section.offset % super::super::mapped_pack::PAGE, 0);
-                assert_eq!(section.length % super::super::mapped_pack::PAGE, 0);
-                assert_eq!(whole[s], expected[s], "{name} section {s}");
-            }
-        }
-        // A second build is byte-identical.
-        let again = temp.0.join("again");
-        store.prepare_mapped_pack_at(&again).unwrap();
-        for (name, ..) in PARTS {
-            let file_name = format!("{name}.mapped");
-            assert_eq!(
-                fs::read(from_gguf.join(&file_name)).unwrap(),
-                fs::read(again.join(&file_name)).unwrap(),
-                "{name}: the second build differs from the first"
-            );
-        }
-        // The slot batch through the range reader equals the checkpoint
-        // reader.
-        let requests: Vec<_> = [4usize, 0, 2]
-            .into_iter()
-            .flat_map(|expert| PARTS.map(|(name, rows, ..)| (name.to_owned(), expert * rows, rows)))
-            .collect();
-        store.evict_to(0).unwrap();
-        assert_eq!(store.cache.len(), 0);
-        let reads = store.mapped.as_ref().unwrap().reads();
-        let packed_hits = store.packed_hits;
-        let via_pack: Vec<_> = store
-            .read_expert_batch(&requests)
-            .unwrap()
-            .iter()
-            .map(|w| encoded(w))
-            .collect();
-        let pack = store.mapped.take().unwrap();
-        assert_eq!(pack.reads(), reads + 9);
-        assert_eq!(
-            store.packed_hits,
-            packed_hits + 9,
-            "range reads are prepared hits"
-        );
-        store.evict_to(0).unwrap();
-        let via_checkpoint: Vec<_> = store
-            .read_expert_batch(&requests)
-            .unwrap()
-            .iter()
-            .map(|w| encoded(w))
-            .collect();
-        assert_eq!(store.packed_hits, packed_hits + 9);
-        assert_eq!(via_pack, via_checkpoint);
-        store.mapped = Some(pack);
+    fn routed_expert_names_are_the_only_direct_bank_sources() {
         assert_eq!(
             super::routed_expert_tensor("blk.47.ffn_down_exps.weight"),
             Some((47, 2))
@@ -2850,679 +3044,1145 @@ mod mapped_tests {
         );
     }
 
-    /// Runs the calling test in a child process. The wired limit is
-    /// process-wide: while a sibling test's scheduled turn holds one, the
-    /// driver wires this test's mmap-backed banks and the freshly built pack
-    /// is never cold. Returns `true` inside the child, `false` in the parent
-    /// after the child passed.
-    fn in_child(name: &str) -> bool {
-        const CHILD: &str = "MLX_QWEN4_STREAM_CHILD";
-        if std::env::var_os(CHILD).is_some_and(|v| v == name) {
-            return true;
-        }
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", name])
-            .env(CHILD, name)
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("test result: ok. 1 passed"),
-            "{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        false
-    }
-
-    /// A stream issue that holds every fetch until released, then reads the
-    /// file as the real one does: the stream stays "running" for as long as
-    /// a test needs.
-    #[derive(Default)]
-    struct Gate {
-        released: Mutex<bool>,
-        ready: Condvar,
-        started: AtomicUsize,
-    }
-    impl Gate {
-        fn release(&self) {
-            *self.released.lock().unwrap() = true;
-            self.ready.notify_all();
-        }
-    }
-    impl super::super::prefetch::Issue for Arc<Gate> {
-        fn fetch(&self, map: &crate::array::Mmap, stop: &AtomicBool, rows: &AtomicUsize) {
-            self.started.fetch_add(1, Ordering::AcqRel);
-            let mut released = self.released.lock().unwrap();
-            // Polled: a pool dropped by a failing test stops the worker
-            // without a release, and nothing signals `ready` then.
-            while !*released && !stop.load(Ordering::Acquire) {
-                released = self
-                    .ready
-                    .wait_timeout(released, Duration::from_millis(10))
-                    .unwrap()
-                    .0;
-            }
-            drop(released);
-            super::super::prefetch::Pread.fetch(map, stop, rows);
-        }
-    }
-
-    fn mapped_store(temp: &Temp, gguf: &Path, dir: &str) -> Store {
-        let root = temp.0.join("cache");
-        let mut store = Store::open_fixture(gguf, Some(&root)).unwrap();
-        store.prepare_mapped_pack_at(&temp.0.join(dir)).unwrap();
-        store
-            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
-                plan.budget = 1 << 30;
-                plan.mapped = true;
-                Ok(())
-            })
-            .unwrap();
-        assert!(store.plan.mapped);
-        assert!(
-            !store.prefetch.as_ref().unwrap().sampled_resident(),
-            "a freshly built pack (F_NOCACHE writes) is cold"
-        );
-        store
-    }
-
-    fn wait_resident(store: &Store) {
-        let pool = store.prefetch.as_ref().unwrap();
-        pool.wait_idle();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !pool.sampled_resident() {
-            assert!(Instant::now() < deadline, "the stream did not land in 10 s");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    /// The load picked the mapped plan: after the dense banks the cold pack
-    /// streams; a turn that opens over the stream starts no second one and
-    /// its stale first pass does not touch; once the pack is resident and
-    /// the stream over, a stale pass touches, a pass inside the gap and a
-    /// pass that reads no mapped bank (which also leaves the stamp alone) do
-    /// not; slot mode never touches and never streams.
-    /// MUTATION: drop the `streaming_pass` early return of
-    /// `wire_mapped_banks_at` -> "a stale pass over a cold pack streams
-    /// instead of touching" fails.
-    #[test]
-    fn a_cold_mapped_load_streams_after_the_dense_banks_and_a_stale_pass_does_not_touch() {
-        if !in_child(
-            "models::qwen4_exp::weights::mapped_tests::a_cold_mapped_load_streams_after_the_dense_banks_and_a_stale_pass_does_not_touch",
-        ) {
-            return;
-        }
-        let temp = Temp::new();
-        let gguf = temp.0.join("experts.gguf");
-        write_fixture(&gguf);
-        let t0 = Instant::now();
-        let mut slots = Store::open_fixture(&gguf, Some(&temp.0.join("cache"))).unwrap();
-        slots.start_pack_stream();
-        assert!(slots.prefetch.is_none(), "slot mode has no stream");
-        assert!(slots.begin_turn().unwrap().is_none());
-        assert!(!slots.streaming_pass);
-        assert!(
-            !slots.wire_mapped_banks_at(t0, true).unwrap(),
-            "slot mode never touches"
-        );
-
-        let mut store = mapped_store(&temp, &gguf, "mapped");
-        let gate = Arc::new(Gate::default());
-        store.pool_with(Arc::clone(&gate));
-        store.start_pack_stream();
-        assert!(
-            store.prefetch.as_ref().unwrap().streaming(),
-            "the load-time stream runs"
-        );
-        assert!(!store.streaming_pass, "no turn is open yet");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while gate.started.load(Ordering::Acquire) == 0 {
-            assert!(Instant::now() < deadline, "no worker started");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(store.begin_turn().unwrap().is_none());
-        assert!(store.streaming_pass, "the turn opened over the stream");
-        assert!(
-            !store.wire_mapped_banks_at(t0, true).unwrap(),
-            "a stale pass over a cold pack streams instead of touching"
-        );
-        assert!(store.touches.is_empty());
-        gate.release();
-        wait_resident(&store);
-        assert!(
-            !store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(100), true)
-                .unwrap(),
-            "within the pass"
-        );
-        store
-            .keep_wired_at(t0 + Duration::from_millis(800), 0, true)
-            .unwrap();
-        assert_eq!(
-            store.touches,
-            vec![vec![0]],
-            "the streaming pass keeps layer 0 wired"
-        );
-        assert!(!store.streaming_pass, "the stream is over");
-        assert!(
-            !store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(850), true)
-                .unwrap()
-        );
-        assert!(
-            store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(1800), true)
-                .unwrap(),
-            "a stale pass over a resident pack touches"
-        );
-        assert_eq!(store.touches.len(), 2);
-        assert!(
-            !store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(1850), true)
-                .unwrap()
-        );
-        let stamp = store.mapped_pass_start;
-        assert!(stamp.is_some());
-        for ms in [2600, 3400] {
-            assert!(
-                !store
-                    .wire_mapped_banks_at(t0 + Duration::from_millis(ms), false)
-                    .unwrap(),
-                "a pass that reads no mapped bank never touches"
-            );
-            assert_eq!(
-                store.mapped_pass_start, stamp,
-                "a pass that reads no mapped bank must not refresh the stamp"
-            );
-        }
-        assert!(
-            store
-                .wire_mapped_banks_at(t0 + Duration::from_millis(4200), true)
-                .unwrap(),
-            "the main pass after a run of drafts sees the gap since the last main pass"
-        );
-        assert!(store.begin_turn().unwrap().is_none());
-        assert!(
-            !store.streaming_pass && !store.prefetch.as_ref().unwrap().streaming(),
-            "a turn over a resident pack starts no stream"
-        );
-    }
-
-    /// While the pack streams, the layer hooks touch the banks of the
-    /// layers already run, at most every 700 ms, never the layers ahead
-    /// (their pages may be cold), never for a pass that reads no mapped bank,
-    /// and not once the stream is over.
-    /// MUTATION: `keep_wired_at` touches every layer
-    /// -> "layers 6..7 are not bound yet" fails.
-    #[test]
-    fn keep_wired_touches_only_bound_layers_every_700ms() {
-        if !in_child(
-            "models::qwen4_exp::weights::mapped_tests::keep_wired_touches_only_bound_layers_every_700ms",
-        ) {
-            return;
-        }
-        let temp = Temp::new();
-        let gguf = temp.0.join("experts.gguf");
-        write_fixture_layers(&gguf, 8);
-        let mut store = mapped_store(&temp, &gguf, "mapped");
-        assert_eq!(store.mapped_experts.len(), 8);
-        let gate = Arc::new(Gate::default());
-        store.pool_with(Arc::clone(&gate));
-        let t0 = Instant::now();
-        assert!(store.begin_turn().unwrap().is_none());
-        assert!(store.streaming_pass);
-        assert!(!store.wire_mapped_banks_at(t0, true).unwrap());
-        store
-            .keep_wired_at(t0 + Duration::from_millis(100), 5, true)
-            .unwrap();
-        assert!(store.touches.is_empty(), "100 ms after the pass start");
-        store
-            .keep_wired_at(t0 + Duration::from_millis(800), 5, true)
-            .unwrap();
-        assert_eq!(
-            store.touches,
-            vec![vec![0, 1, 2, 3, 4, 5]],
-            "layers 6..7 are not bound yet"
-        );
-        store
-            .keep_wired_at(t0 + Duration::from_millis(900), 7, true)
-            .unwrap();
-        assert_eq!(store.touches.len(), 1, "100 ms after the last touch");
-        store
-            .keep_wired_at(t0 + Duration::from_millis(1600), 7, false)
-            .unwrap();
-        assert_eq!(store.touches.len(), 1, "a pass that reads no mapped bank");
-        assert!(store.streaming_pass);
-        gate.release();
-        wait_resident(&store);
-        store
-            .keep_wired_at(t0 + Duration::from_millis(1600), 7, true)
-            .unwrap();
-        assert_eq!(store.touches.len(), 2);
-        assert_eq!(store.touches[1], (0..8).collect::<Vec<_>>());
-        assert!(!store.streaming_pass, "the stream is over");
-        store
-            .keep_wired_at(t0 + Duration::from_millis(2400), 7, true)
-            .unwrap();
-        assert_eq!(store.touches.len(), 2, "no streaming pass, no touch");
-        assert_eq!(
-            store.touches_async,
-            vec![false, false],
-            "outside a group every touch is a synchronous eval"
-        );
-    }
-
-    /// A layer-major group keeps the banks of the layers already swept
-    /// wired after the stream ends, through asynchronous touches whose arrays
-    /// wait for the group commit; a warm one-window turn (no group) touches
-    /// nothing once the stream is over.
-    /// MUTATION: `keep_wired_at` keeps the
-    /// `!streaming_pass` early return -> "the group keeps touching after the
-    /// stream" fails.
-    /// MUTATION: `touch_banks` evaluates synchronously
-    /// inside a group -> "asynchronous inside the group" fails.
-    #[test]
-    fn keep_wired_runs_through_a_group_only_and_touches_async() {
-        if !in_child(
-            "models::qwen4_exp::weights::mapped_tests::keep_wired_runs_through_a_group_only_and_touches_async",
-        ) {
-            return;
-        }
-        let temp = Temp::new();
-        let gguf = temp.0.join("experts.gguf");
-        write_fixture_layers(&gguf, 8);
-        let mut store = mapped_store(&temp, &gguf, "mapped");
-        let gate = Arc::new(Gate::default());
-        store.pool_with(Arc::clone(&gate));
-        let t0 = Instant::now();
-        assert!(store.begin_turn().unwrap().is_none());
-        assert!(store.streaming_pass);
-        assert!(!store.wire_mapped_banks_at(t0, true).unwrap());
-        store.begin_group();
-        store
-            .keep_wired_at(t0 + Duration::from_millis(800), 3, true)
-            .unwrap();
-        assert_eq!(store.touches, vec![vec![0, 1, 2, 3]]);
-        assert_eq!(
-            store.touches_async,
-            vec![true],
-            "asynchronous inside the group"
-        );
-        let pending = store.pending_touches();
-        assert!(pending > 0, "the touch's arrays wait for the commit");
-        gate.release();
-        wait_resident(&store);
-        store
-            .keep_wired_at(t0 + Duration::from_millis(1600), 5, true)
-            .unwrap();
-        assert_eq!(store.touches.len(), 2);
-        assert_eq!(store.touches[1], vec![0, 1, 2, 3, 4, 5]);
-        assert!(!store.streaming_pass, "the stream is over");
-        store
-            .keep_wired_at(t0 + Duration::from_millis(2400), 7, true)
-            .unwrap();
-        assert_eq!(
-            store.touches.len(),
-            3,
-            "the group keeps touching after the stream"
-        );
-        assert_eq!(store.touches[2], (0..8).collect::<Vec<_>>());
-        assert_eq!(store.touches_async, vec![true, true, true]);
-        assert_eq!(store.pending_touches(), 3 * pending);
-        let taken = store.take_pending_touches();
-        assert_eq!(taken.len(), 3 * pending);
-        assert_eq!(store.pending_touches(), 0);
-        MxArray::eval_arrays(&taken.iter().collect::<Vec<_>>()).unwrap();
-        store.end_group();
-        assert!(!store.group_in_progress());
-        store
-            .keep_wired_at(t0 + Duration::from_millis(3200), 7, true)
-            .unwrap();
-        assert_eq!(store.touches.len(), 3, "no group, no stream: no touch");
-        // A warm turn over the resident pack: no stream, no group, no touch.
-        assert!(store.begin_turn().unwrap().is_none());
-        assert!(!store.streaming_pass);
-        store
-            .keep_wired_at(t0 + Duration::from_millis(4000), 7, true)
-            .unwrap();
-        assert_eq!(store.touches.len(), 3);
-    }
-
-    /// `observe_sweep` holds a trip and applies nothing: the
-    /// store stays mapped until `apply_held_trip`, which leaves the mapped
-    /// path, drops the pack stream and reports the symptom once; without a
-    /// held trip it changes nothing.
-    /// MUTATION (store side): `observe_sweep` calls
-    /// `observe_pass_at` -> "held, not applied" fails.
-    #[test]
-    fn observe_sweep_holds_the_trip_and_apply_held_trip_switches() {
-        if !in_child(
-            "models::qwen4_exp::weights::mapped_tests::observe_sweep_holds_the_trip_and_apply_held_trip_switches",
-        ) {
-            return;
-        }
-        let temp = Temp::new();
-        let gguf = temp.0.join("experts.gguf");
-        write_fixture(&gguf);
-        let mut store = mapped_store(&temp, &gguf, "mapped");
-        store.start_pack_stream();
-        wait_resident(&store);
-        assert!(store.begin_turn().unwrap().is_none());
-        assert!(!store.observe_sweep(), "nothing read since the turn opened");
-        assert!(store.apply_held_trip().unwrap().is_none());
-        assert!(store.plan.mapped);
-        let mapped = store.plan.mapped_bytes;
-        // Another reader in the process pushes the count past twice the
-        // pack while the pack stays resident: no trip, the count restarts.
-        let base = store.tripwire_mut().turn_start_reads();
-        assert!(
-            store
-                .observe_pass_at(1, Duration::from_millis(25), base + 3 * mapped)
-                .unwrap()
-                .is_none()
-        );
-        assert!(store.plan.mapped && store.tripwire_mut().tripped().is_none());
-        assert_eq!(store.tripwire_mut().turn_start_reads(), base + 3 * mapped);
-        store.trip(super::super::tripwire::Fallback::SsdReads {
-            read: 3 * mapped,
-            mapped,
-        });
-        assert!(store.observe_sweep(), "the trip is reported");
-        assert!(store.plan.mapped, "held, not applied");
-        assert!(store.prefetch.is_some());
-        assert!(store.observe_sweep(), "and reported again until applied");
-        let applied = store.apply_held_trip().unwrap();
-        assert!(matches!(
-            applied,
-            Some(super::super::tripwire::Fallback::SsdReads { .. })
-        ));
-        assert!(!store.plan.mapped, "the store left the mapped path");
-        assert!(store.mapped_experts.is_empty());
-        assert!(store.prefetch.is_none(), "the pack stream is gone");
-        assert!(store.apply_held_trip().unwrap().is_none(), "applied once");
-        assert!(!store.observe_sweep());
-    }
-
-    /// The tripwire's SSD count starts at the turn: the pack bytes the
-    /// load-time stream read before it are below the baseline, and the turn
-    /// over a pack the stream made resident starts no stream of its own.
-    #[test]
-    fn a_streaming_turn_keeps_the_tripwire_baseline() {
-        if !in_child(
-            "models::qwen4_exp::weights::mapped_tests::a_streaming_turn_keeps_the_tripwire_baseline",
-        ) {
-            return;
-        }
-        let temp = Temp::new();
-        let gguf = temp.0.join("experts.gguf");
-        write_fixture(&gguf);
-        let mut store = mapped_store(&temp, &gguf, "mapped");
-        let before = memory::process_disk_reads();
-        store.start_pack_stream();
-        wait_resident(&store);
-        let after = memory::process_disk_reads();
-        assert!(
-            after >= before + store.plan.mapped_bytes,
-            "the stream read the pack from disk ({} B over {} B)",
-            after - before,
-            store.plan.mapped_bytes
-        );
-        assert!(store.begin_turn().unwrap().is_none());
-        assert!(
-            store.tripwire_mut().turn_start_reads() >= after,
-            "the stream's bytes are not charged to the turn"
-        );
-        assert!(!store.streaming_pass);
-    }
-
-    /// A load up to its last step: the fixture MTP head attached (or not)
-    /// before the gate, the mapped plan, a held pack stream and the dense
-    /// banks. Returns the gate's anonymous need and the draft bank estimate.
-    fn mapped_load(
-        temp: &Temp,
-        gguf: &Path,
-        dir: &str,
-        head: bool,
-    ) -> (Store, Arc<Gate>, u64, u64) {
+    fn open_slots(temp: &Temp, gguf: &Path, label: &str, capacity: usize, direct: bool) -> Store {
         let mut store =
-            Store::open_fixture(gguf, Some(&temp.0.join(format!("{dir}-cache")))).unwrap();
-        if head {
-            let aux = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/qwen4-exp/bf16/paged");
-            store
-                .attach_auxiliary(Store::open_fixture(&aux, None).unwrap())
-                .unwrap();
-        }
-        let estimate = store.mtp_bank_estimate().unwrap();
-        assert_eq!(estimate > 0, head, "the fixture head has routed experts");
-        store.prepare_mapped_pack_at(&temp.0.join(dir)).unwrap();
-        let mut charged = 0;
+            Store::open_fixture(gguf, Some(&temp.0.join(format!("{label}-cache")))).unwrap();
+        store.slot_capacity = Some(capacity);
+        store.direct_gguf = direct;
+        assert!(!store.plan.partial_direct_gate);
         store
-            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, need, _, _| {
-                charged = need;
-                plan.budget = 1 << 30;
-                plan.mapped = true;
-                Ok(())
-            })
-            .unwrap();
-        assert!(store.plan.mapped);
-        let gate = Arc::new(Gate::default());
-        store.pool_with(Arc::clone(&gate));
-        store.prepare_fixture_hot().unwrap();
-        (store, gate, charged, estimate)
     }
 
-    /// With the MTP head attached the load builds the draft banks the
-    /// gate charged before any pack fetch starts, then streams the pack,
-    /// whether or not a turn will ever ask for MTP; without the head it only
-    /// streams.
+    fn open_full(temp: &Temp, gguf: &Path, label: &str, layers: usize, experts: usize) -> Store {
+        let mut store =
+            Store::open_fixture(gguf, Some(&temp.0.join(format!("{label}-cache")))).unwrap();
+        let handled = store
+            .select_direct_residency_with(experts, 0, &mut memory::direct_plan, &mut |_| Ok(()))
+            .unwrap();
+        assert!(
+            handled,
+            "the single-file fixture must take direct selection"
+        );
+        assert!(store.plan.direct);
+        assert!(!store.plan.partial_direct_gate);
+        assert_eq!(store.plan.direct_layers, layers);
+        assert_eq!(store.plan.partial_expert_slots, experts);
+        assert_eq!(store.plan.direct_bytes, store.slot_bytes);
+        assert_eq!(store.cache_bytes, store.slot_bytes);
+        assert_eq!(store.slots.len(), layers);
+        store
+    }
+
+    fn raw_fill_bytes(store: &Store, parts: &[Part; 3], ids: &[u32]) -> u64 {
+        ids.iter()
+            .flat_map(|&expert| {
+                parts.iter().map(move |&(name, rows, ..)| {
+                    store
+                        .descriptor(name)
+                        .unwrap()
+                        .range(expert as usize * rows, rows)
+                        .unwrap()
+                        .1
+                })
+            })
+            .sum()
+    }
+
+    /// Compare every value/scale/bias byte of every requested filled slot
+    /// with the ordinary CPU checkpoint importer for that expert.
+    fn assert_banks_match_checkpoint(
+        store: &Store,
+        parts: &[Part; 3],
+        banks: &[Arc<Weight>; 3],
+        ids: &[u32],
+        local: &[u32],
+    ) -> Vec<u8> {
+        assert_banks_match_checkpoint_layer(store, 0, parts, banks, ids, local)
+    }
+
+    fn assert_banks_match_checkpoint_layer(
+        store: &Store,
+        layer: usize,
+        parts: &[Part; 3],
+        banks: &[Arc<Weight>; 3],
+        ids: &[u32],
+        local: &[u32],
+    ) -> Vec<u8> {
+        let mut all = Vec::new();
+        for (position, &expert) in ids.iter().enumerate() {
+            for (part, &(name, rows, ..)) in parts.iter().enumerate() {
+                let name = name.replace("blk.0.", &format!("blk.{layer}."));
+                let expected = store
+                    .descriptor(&name)
+                    .unwrap()
+                    .import_rows(expert as usize * rows, rows)
+                    .unwrap();
+                let actual = banks[part]
+                    .slice_rows(local[position] as usize * rows, rows)
+                    .unwrap();
+                let actual = encoded(&actual);
+                assert_eq!(actual, encoded(&expected), "{name} expert {expert}");
+                all.extend(actual.0);
+            }
+        }
+        all
+    }
+
     #[test]
-    fn the_load_builds_the_draft_banks_before_the_pack_stream_starts() {
-        if !in_child(
-            "models::qwen4_exp::weights::mapped_tests::the_load_builds_the_draft_banks_before_the_pack_stream_starts",
-        ) {
+    fn direct_gguf_split_reader_preserves_bytes_gaps_and_bounds() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
             return;
         }
         let temp = Temp::new();
-        let gguf = temp.0.join("experts.gguf");
-        write_fixture(&gguf);
-        for (head, dir) in [(true, "head"), (false, "plain")] {
-            let (mut store, gate, charged, estimate) = mapped_load(&temp, &gguf, dir, head);
-            let dense = store.fixed_projection_bytes().unwrap();
-            assert_eq!(
-                charged,
-                dense + estimate,
-                "{dir}: the gate charges the bank"
-            );
-            let mut seen = Vec::new();
-            store.finish_load_with(&mut |_| {
-                // A pack fetch issued before the build starts within this wait.
-                let deadline = Instant::now() + Duration::from_millis(100);
-                while gate.started.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                seen.push(gate.started.load(Ordering::Acquire));
-                Ok(())
-            });
-            assert_eq!(seen.is_empty(), !head, "{dir}: the build admits its banks");
-            assert!(
-                seen.iter().all(|&started| started == 0),
-                "{dir}: no pack fetch started before the build ({seen:?})"
-            );
-            assert_eq!(
-                store.mtp_bank_bytes().unwrap(),
-                estimate,
-                "{dir}: the load built the banks the gate charged"
-            );
-            assert!(
-                store.prefetch.as_ref().unwrap().streaming(),
-                "{dir}: the pack streams after the build"
-            );
-            gate.release();
-            wait_resident(&store);
+        let paths = write_split_fixture_layout_with_empty_first(
+            &temp.0,
+            "split-reader",
+            4,
+            2,
+            EXPERTS,
+            &PARTS,
+            true,
+        );
+        assert!(parse_gguf(&paths[0]).unwrap().tensors.is_empty());
+        let source = DirectGgufSource::new(&paths).unwrap();
+        let files = source.open_files().unwrap();
+        let refs: Vec<&File> = files.iter().collect();
+        let reader = DirectGgufReader::new(&source, &refs).unwrap();
+        let mut actual = vec![0u8; source.len as usize];
+        crate::utils::gguf_read::ReadAt::read_exact_at(&reader, &mut actual, 0).unwrap();
+        for (index, shard) in source.shards.iter().enumerate() {
+            let begin = shard.base as usize;
+            let end = begin + shard.len as usize;
+            assert_eq!(&actual[begin..end], fs::read(&paths[index]).unwrap());
+            if let Some(next) = source.shards.get(index + 1) {
+                assert!(
+                    actual[end..next.base as usize]
+                        .iter()
+                        .all(|&byte| byte == 0)
+                );
+            }
         }
+        let error =
+            crate::utils::gguf_read::ReadAt::read_exact_at(&reader, &mut [0u8; 2], source.len - 1)
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
-    /// A load whose host refuses the draft banks still loads: the pack
-    /// streams, the drafts stay on the row reader and nothing retries.
-    /// MUTATION: `finish_load_with` returns the
-    /// build's error before the stream -> "the declined load still streams"
-    /// fails.
     #[test]
-    fn a_load_that_cannot_stage_the_draft_banks_still_loads_and_never_retries() {
-        if !in_child(
-            "models::qwen4_exp::weights::mapped_tests::a_load_that_cannot_stage_the_draft_banks_still_loads_and_never_retries",
-        ) {
+    fn direct_gguf_split_formats_match_checkpoint_and_cross_shards() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
             return;
         }
         let temp = Temp::new();
-        let gguf = temp.0.join("experts.gguf");
-        write_fixture(&gguf);
-        let (mut store, gate, ..) = mapped_load(&temp, &gguf, "mapped", true);
-        let mut admissions = 0;
-        store.finish_load_with(&mut |_| {
-            admissions += 1;
-            Err(err("simulated headroom loss at load"))
-        });
-        assert!(admissions >= 1);
-        assert!(store.mtp_banks_declined);
-        assert_eq!(store.mtp_bank_bytes().unwrap(), 0);
-        assert!(
-            store.prefetch.as_ref().unwrap().streaming(),
-            "the declined load still streams the pack"
-        );
-        assert_eq!(
-            store
-                .prepare_mtp_expert_banks_with(&mut |_| Ok(()))
-                .unwrap(),
-            0,
-            "a declined head is never built later"
-        );
-        assert_eq!(store.mtp_bank_bytes().unwrap(), 0);
-        gate.release();
-        wait_resident(&store);
+        for (label, parts) in [
+            ("split-q4k-q5-1", &PARTS),
+            ("split-q5k", &Q5K_PARTS),
+            ("split-q8-bias", &Q8_PARTS),
+        ] {
+            let (mut store, _) = open_split_slots(&temp, label, parts, 2, 3);
+            let ids: Vec<u32> = (0..EXPERTS as u32).collect();
+            for layer in 0..2 {
+                let (banks, local, _) = store
+                    .expert_slots(layer, EXPERTS, 2, &ids)
+                    .unwrap()
+                    .unwrap();
+                assert_banks_match_checkpoint_layer(&store, layer, parts, &banks, &ids, &local);
+            }
+            assert_split_read_windows(&store);
+        }
     }
 
-    /// With the MTP head attached, the mapped plan's anonymous need carries
-    /// the Q8 draft banks beside the dense banks, the allowance admits that
-    /// bank once the plan is mapped, and leaving the mapped path drops it.
-    /// MUTATION: pass `dense` alone to the gate -> the gate sees
-    /// the dense bytes without the bank and the first assertion fails.
     #[test]
-    fn mapped_plan_charges_the_draft_bank_while_the_mtp_head_is_attached() {
+    fn direct_gguf_split_full_capacity_and_refill_match_checkpoint() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let _host = memory::scoped_fixture_host();
         let temp = Temp::new();
-        let gguf = temp.0.join("experts.gguf");
-        write_fixture(&gguf);
-        let root = temp.0.join("cache");
-        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
-        let aux =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp/bf16/paged");
-        store
-            .attach_auxiliary(Store::open_fixture(&aux, None).unwrap())
-            .unwrap();
-        let bank = store.mtp_bank_estimate().unwrap();
-        assert!(bank > 0, "the fixture head has routed experts");
-        let dense = store.fixed_projection_bytes().unwrap();
-        let dir = temp.0.join("mapped");
-        store.prepare_mapped_pack_at(&dir).unwrap();
-        let mut charged = None;
-        store
-            .select_mapped_residency_with(EXPERTS, 1 << 30, &mut |plan, need, _, _| {
-                charged = Some(need);
-                plan.budget = super::super::memory::mapped_desired(need);
-                plan.mapped = true;
-                Ok(())
-            })
-            .unwrap();
-        assert!(store.plan.mapped);
-        assert_eq!(
-            charged,
-            Some(dense + bank),
-            "the gate's anonymous need carries the draft bank"
+        let paths = write_split_fixture_layout_with_empty_first(
+            &temp.0,
+            "split-full",
+            4,
+            2,
+            EXPERTS,
+            &PARTS,
+            true,
         );
+        let mut store = open_full(&temp, &paths[0], "split-full-direct", 2, EXPERTS);
+        let ids: Vec<u32> = (0..EXPERTS as u32).collect();
+        store.activate_expert_slots().unwrap();
+        for refill in 0..2 {
+            for layer in 0..2 {
+                let (banks, local, capacity) = store
+                    .expert_slots(layer, EXPERTS, 2, &ids)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(capacity, EXPERTS);
+                assert_eq!(local, ids);
+                assert_banks_match_checkpoint_layer(&store, layer, &PARTS, &banks, &ids, &local);
+            }
+            assert!(store.device_slots_ready(2));
+            assert_eq!(store.slot_misses, 0);
+            assert!(store.plan.direct);
+            assert_eq!(store.plan.direct_layers, 2);
+            assert_eq!(store.plan.direct_bytes, store.slot_bytes);
+            if refill == 0 {
+                store.purge_expert_slots().unwrap();
+                store.activate_expert_slots().unwrap();
+            }
+        }
+        assert_eq!(store.slot_upload_bytes, 2 * store.slot_bytes);
+        assert_split_read_windows(&store);
+    }
+
+    #[test]
+    fn direct_gguf_split_source_failures_name_the_failed_shard() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let (mut flipped, paths) = open_split_slots(&temp, "split-flip", &PARTS, 1, 3);
+        let parsed = parse_gguf(&paths[1]).unwrap();
+        let tensor = parsed.tensors.first().unwrap();
+        let at = (parsed.data_offset + tensor.offset) as usize + 8;
+        let mut bytes = fs::read(&paths[1]).unwrap();
+        bytes[at] ^= 0x20;
+        fs::write(&paths[1], bytes).unwrap();
+        let error = flipped.expert_slots(0, EXPERTS, 2, &[0]).err().unwrap();
+        assert!(error.reason.contains("changed since open"), "{error}");
         assert!(
-            store.auxiliary_cache_allowance().unwrap() >= bank,
-            "the mapped budget admits the bank it charged"
+            error.reason.contains("split-flip-00002-of-00003.gguf"),
+            "{error}"
         );
-        let slot_rule = store
-            .tensors
-            .iter()
-            .filter(|(name, _)| super::residency::is_auxiliary(name))
-            .map(|(_, t)| t.runtime_bytes().unwrap())
-            .sum::<u64>()
-            .min(store.cache_limit / 8)
-            .max(MAX_READ_BYTES * 6);
-        store
-            .leave_mapped_with(
-                &Fallback::LoadGate { pack: 0, budget: 0 },
-                &mut super::super::memory::host_memory,
-                &mut |_| {},
+        assert!(!flipped.device_slots_ready(1));
+
+        let (mut missing, paths) = open_split_slots(&temp, "split-missing", &PARTS, 1, 3);
+        fs::remove_file(&paths[2]).unwrap();
+        let error = missing.expert_slots(0, EXPERTS, 2, &[0]).err().unwrap();
+        assert!(error.reason.contains("Failed to stat GGUF"), "{error}");
+        assert!(
+            error.reason.contains("split-missing-00003-of-00003.gguf"),
+            "{error}"
+        );
+        assert!(!missing.device_slots_ready(1));
+
+        let (mut truncated, paths) = open_split_slots(&temp, "split-truncated", &PARTS, 1, 3);
+        let len = fs::metadata(&paths[1]).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&paths[1])
+            .unwrap()
+            .set_len(len - 1)
+            .unwrap();
+        let error = truncated.expert_slots(0, EXPERTS, 2, &[0]).err().unwrap();
+        assert!(error.reason.contains("truncated"), "{error}");
+        assert!(
+            error.reason.contains("split-truncated-00002-of-00003.gguf"),
+            "{error}"
+        );
+        assert!(!truncated.device_slots_ready(1));
+    }
+
+    #[test]
+    fn direct_gguf_incomplete_or_reordered_splits_fail_before_residency() {
+        let temp = Temp::new();
+        let paths = write_split_fixture_layout(&temp.0, "split-incomplete", 3, 1, EXPERTS, &PARTS);
+        fs::remove_file(&paths[1]).unwrap();
+        let error = match Store::open_fixture(&paths[0], Some(&temp.0.join("incomplete-cache"))) {
+            Ok(_) => panic!("an incomplete split set was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.reason.contains("Expected one GGUF split"), "{error}");
+        assert!(
+            error.reason.contains("split-incomplete-00002-of-00003"),
+            "{error}"
+        );
+
+        let paths = write_split_fixture_layout(&temp.0, "split-reordered", 3, 1, EXPERTS, &PARTS);
+        let held = temp.0.join("split-reordered.held");
+        fs::rename(&paths[0], &held).unwrap();
+        fs::rename(&paths[1], &paths[0]).unwrap();
+        fs::rename(&held, &paths[1]).unwrap();
+        let error = match Store::open_fixture(&paths[0], Some(&temp.0.join("reordered-cache"))) {
+            Ok(_) => panic!("a reordered split set was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error.reason.contains("Inconsistent GGUF split metadata")
+                || error.reason.contains("Open the first GGUF split"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn direct_gguf_full_gate_refusal_selects_bounded_partial_slots() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("full-gate-refusal.gguf");
+        write_fixture(&gguf);
+        let mut store = Store::open_fixture(&gguf, Some(&temp.0.join("cache"))).unwrap();
+        let anonymous_budget = 512 << 20;
+        let handled = store
+            .select_direct_residency_with(
+                EXPERTS,
+                0,
+                &mut |plan, _, _, bank_bytes| {
+                    plan.budget = anonymous_budget;
+                    plan.bank_budget = bank_bytes * 2 / EXPERTS as u64;
+                    plan.live_non_reclaimable = 40 << 30;
+                    plan.available_bytes = Some(88 << 30);
+                    plan.physical_bytes = Some(128 << 30);
+                    Err(err(
+                        "simulated full-bank refusal beside a 40 GiB live-pressure row",
+                    ))
+                },
+                &mut |_| panic!("a refused gate must not allocate"),
             )
             .unwrap();
-        assert!(!store.plan.mapped);
+        assert!(handled);
+        assert!(!store.plan.direct);
+        assert!(store.plan.partial_direct_gate);
+        assert!(store.slots.is_empty());
+        assert_eq!(store.slot_bytes, 0);
+        assert_eq!(store.cache_bytes, 0);
+        assert_eq!(store.expert_slot_capacity(EXPERTS, 2).unwrap(), 2);
+        let bank_budget = store.plan.bank_budget;
+        assert_eq!(store.slot_bank_budget, Some(bank_budget));
+        assert_eq!(store.plan.budget, anonymous_budget + bank_budget);
+        assert!(store.planned_slot_bytes().unwrap() <= bank_budget);
+        assert_eq!(store.plan.live_non_reclaimable, 40 << 30);
+        assert_eq!(store.plan.direct_bytes, 0);
+        assert_eq!(store.plan.direct_layers, 0);
+        assert!(matches!(
+            store.live.fallback(),
+            Some(Fallback::LoadGate { budget, .. }) if budget == bank_budget
+        ));
+    }
+
+    #[test]
+    fn direct_gguf_zero_bank_gate_refusal_marks_partial_gate() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("zero-bank-gate-refusal.gguf");
+        write_fixture(&gguf);
+        let mut store = Store::open_fixture(&gguf, Some(&temp.0.join("cache"))).unwrap();
+        let anonymous_budget = 512 << 20;
+        let handled = store
+            .select_direct_residency_with(
+                EXPERTS,
+                0,
+                &mut |plan, _, _, _| {
+                    plan.budget = anonymous_budget;
+                    plan.bank_budget = 0;
+                    Err(err("injected zero-bank full-gate refusal"))
+                },
+                &mut |_| panic!("a refused gate must not allocate"),
+            )
+            .unwrap();
+        assert!(handled);
+        assert!(!store.plan.direct);
+        assert!(store.plan.partial_direct_gate);
+        assert!(store.plan.use_direct_turn_floor());
+        assert_eq!(store.plan.budget, anonymous_budget);
+        assert_eq!(store.plan.bank_budget, 0);
+        assert_eq!(store.slot_bank_budget, Some(0));
+        assert_eq!(store.plan.partial_expert_slots, 0);
+    }
+
+    #[test]
+    fn direct_gguf_allocation_rollback_restores_ordinary_gate_marker() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("full-allocation-rollback.gguf");
+        write_fixture(&gguf);
+        let mut store = Store::open_fixture(&gguf, Some(&temp.0.join("cache"))).unwrap();
+        let original_budget = store.plan.budget;
+        let original_cache_limit = store.cache_limit;
+        let error = store
+            .select_direct_residency_with(EXPERTS, 0, &mut memory::direct_plan, &mut |_| {
+                Err(err("injected full-bank allocation refusal"))
+            })
+            .unwrap_err();
+        assert!(error.reason.contains("full-bank allocation refusal"));
+        assert!(!store.plan.direct);
+        assert!(!store.plan.partial_direct_gate);
+        assert!(!store.plan.use_direct_turn_floor());
+        assert_eq!(store.plan.budget, original_budget);
+        assert_eq!(store.cache_limit, original_cache_limit);
+        assert!(store.slot_bank_budget.is_none());
+        assert!(store.slots.is_empty());
+    }
+
+    /// Real fixture inference through the partial direct fill path. The gate
+    /// rows are injected so the two capacities and the 40/20 GiB pressure
+    /// cases are deterministic; they are not real-model throughput rows.
+    #[test]
+    fn direct_partial_slot_text_matches_cpu_import_at_two_capacities() {
+        use super::super::decoder;
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let _host = memory::scoped_fixture_host();
+        let temp = Temp::new();
+        let path = temp.0.join("quantized-fixture.gguf");
+        let base_config = super::super::tests::write_direct_gguf_fixture(&path);
+        let experts = base_config.num_experts;
+        let make_store = || Store::open_fixture(&path, Some(&temp.0.join("unused-cache"))).unwrap();
+        let prompt = [3u32, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4];
+        // Oracle: the same checkpoint through the bounded per-row CPU
+        // importer, with no direct slots or derived pack involved.
+        let store = make_store();
+        let mut oracle = decoder::Decoder::new(base_config.clone(), store).unwrap();
+        oracle.register_cache_limit();
+        oracle.weights.prepare_fixture_hot().unwrap();
+        oracle.weights.slot_capacity = Some(0);
+        oracle.weights.publish_live();
+        oracle.residency_changed();
+        oracle.weights.begin_turn().unwrap();
+        let mut logits = oracle.prefill_prompt(&prompt).unwrap();
+        let mut expected = Vec::new();
+        for step in 0..6 {
+            let id = super::super::tests::argmax(&logits);
+            expected.push(id);
+            if step < 5 {
+                logits = oracle.step(id).unwrap();
+            }
+        }
+
+        for (capacity, live_gib) in [(2usize, 40u64), (3, 20)] {
+            let store = make_store();
+            let mut decoder = decoder::Decoder::new(base_config.clone(), store).unwrap();
+            decoder.register_cache_limit();
+            let anonymous_budget = 512 << 20;
+            let handled = decoder
+                .weights
+                .select_direct_residency_with(
+                    experts,
+                    0,
+                    &mut |plan, _, _, bank_bytes| {
+                        plan.budget = anonymous_budget;
+                        plan.bank_budget = bank_bytes * capacity as u64 / experts as u64;
+                        plan.live_non_reclaimable = live_gib << 30;
+                        plan.available_bytes = Some((128 - live_gib) << 30);
+                        plan.physical_bytes = Some(128 << 30);
+                        Err(err("injected partial-capacity gate row"))
+                    },
+                    &mut |_| panic!("partial selection must not allocate full banks"),
+                )
+                .unwrap();
+            assert!(handled);
+            let bank_budget = decoder.weights.plan.bank_budget;
+            assert!(bank_budget > 0);
+            assert!(!decoder.weights.plan.direct);
+            assert_eq!(decoder.weights.plan.partial_expert_slots, capacity);
+            assert_eq!(decoder.weights.slot_capacity, Some(capacity));
+            assert_eq!(decoder.weights.slot_bank_budget, Some(bank_budget));
+            assert_eq!(decoder.weights.plan.live_non_reclaimable, live_gib << 30);
+            assert!(decoder.weights.planned_slot_bytes().unwrap() <= bank_budget);
+            decoder.weights.prepare_fixture_hot().unwrap();
+            decoder.weights.publish_live();
+            decoder.residency_changed();
+            assert_eq!(
+                decoder.weights.cache_budget(),
+                anonymous_budget + bank_budget
+            );
+
+            decoder.weights.begin_turn().unwrap();
+            let mut logits = decoder.prefill_prompt(&prompt).unwrap();
+            let unique = decoder
+                .weights
+                .wide_routes
+                .values()
+                .map(Vec::len)
+                .sum::<usize>() as u64;
+            assert!(unique > 0);
+            assert_eq!(
+                decoder.weights.slot_misses, unique,
+                "last-assignment expert chunks re-read an expert during prefill"
+            );
+            assert!(decoder.weights.slot_bytes <= bank_budget);
+            assert!(!decoder.weights.direct_read_windows.is_empty());
+            assert!(
+                decoder
+                    .weights
+                    .direct_read_windows
+                    .iter()
+                    .all(|&(offset, len)| len <= 8 << 20 && offset % (16 << 10) == 0)
+            );
+            let mut actual = Vec::new();
+            for step in 0..6 {
+                let id = super::super::tests::argmax(&logits);
+                actual.push(id);
+                if step < 5 {
+                    logits = decoder.step(id).unwrap();
+                }
+            }
+            assert_eq!(actual, expected, "capacity {capacity}, live {live_gib} GiB");
+            assert_eq!(
+                decoder.weights.slots.len(),
+                decoder.config.num_hidden_layers
+            );
+            assert!(
+                decoder
+                    .weights
+                    .device_slots_ready(decoder.config.num_hidden_layers)
+            );
+            assert!(decoder.weights.slot_bytes <= bank_budget);
+            assert!(decoder.weights.cache_bytes <= decoder.weights.cache_limit);
+            assert!(decoder.weights.peak_cache_bytes <= decoder.weights.cache_limit);
+            eprintln!(
+                "synthetic pressure row (not a real-model benchmark): live={live_gib} GiB, capacity={capacity}, prefill unique misses={unique}, slot bytes={}, text={actual:?}",
+                decoder.weights.slot_bytes,
+            );
+        }
+    }
+
+    #[test]
+    fn direct_gguf_full_capacity_fills_layers_with_identity_and_refills_empty() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let _host = memory::scoped_fixture_host();
+        const LAYERS: usize = 3;
+        let temp = Temp::new();
+        let gguf = temp.0.join("full-capacity.gguf");
+        write_fixture_layers(&gguf, LAYERS);
+        let mut store = open_full(&temp, &gguf, "full-capacity-direct", LAYERS, EXPERTS);
+        let source_bytes: u64 = store
+            .tensors
+            .iter()
+            .filter(|(name, _)| name.contains("_exps.weight"))
+            .map(|(_, tensor)| tensor.bytes)
+            .sum();
+        let ids: Vec<u32> = (0..EXPERTS as u32).collect();
+        assert!(!store.device_slots_ready(LAYERS));
+        assert!(store.prefill_device_slots_ready(LAYERS));
+        store.activate_expert_slots().unwrap();
+        assert!(store.direct_fill_pass());
+        for layer in [1, 2, 0] {
+            let (banks, local, capacity) = store
+                .expert_slots(layer, EXPERTS, 2, &ids)
+                .unwrap()
+                .unwrap();
+            assert_eq!(capacity, EXPERTS);
+            assert_eq!(local, ids);
+            assert_banks_match_checkpoint_layer(&store, layer, &PARTS, &banks, &ids, &local);
+        }
+        assert!(store.device_slots_ready(LAYERS));
+        assert_eq!(store.slot_misses, 0);
+        assert_eq!(store.bytes_read, source_bytes);
+        assert_eq!(store.slot_upload_bytes, store.slot_bytes);
+        assert_eq!(store.cache_bytes, store.slot_bytes);
         assert_eq!(
-            store.auxiliary_cache_allowance().unwrap(),
-            slot_rule,
-            "the slot path keeps its own allowance rule"
+            store.live.direct_filled_layers.load(Ordering::Acquire),
+            LAYERS as u64
+        );
+        assert!(!store.direct_read_windows.is_empty());
+        assert!(
+            store
+                .direct_read_windows
+                .iter()
+                .all(|&(off, len)| len <= 8 << 20 && off % (16 << 10) == 0)
+        );
+        assert!(
+            store
+                .commit_device_routes(&[0, 1, 2], &[0, 1, 2], 1)
+                .unwrap()
+        );
+
+        let allocated = store.slot_bytes;
+        let first_upload = store.slot_upload_bytes;
+        store.purge_expert_slots().unwrap();
+        assert!(!store.device_slots_ready(LAYERS));
+        store.activate_expert_slots().unwrap();
+        assert!(store.direct_fill_pass());
+        let before = store.bytes_read;
+        for layer in 0..LAYERS {
+            let (banks, local, _) = store
+                .expert_slots(layer, EXPERTS, 2, &ids)
+                .unwrap()
+                .unwrap();
+            assert_eq!(local, ids);
+            assert_banks_match_checkpoint_layer(&store, layer, &PARTS, &banks, &ids, &local);
+        }
+        assert_eq!(store.bytes_read, before + source_bytes);
+        assert_eq!(store.slot_upload_bytes, first_upload + allocated);
+        assert_eq!(store.slot_bytes, allocated);
+        assert_eq!(store.cache_bytes, allocated);
+        assert_eq!(store.slot_misses, 0);
+        assert!(store.device_slots_ready(LAYERS));
+    }
+
+    fn begin_turn_scripted(
+        store: &mut Store,
+        cached: f64,
+        outcomes: Vec<Result<()>>,
+    ) -> (Result<()>, Vec<String>) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut outcomes = outcomes.into_iter();
+        let mut admit = {
+            let events = Rc::clone(&events);
+            move |bytes| {
+                events.borrow_mut().push(format!("admit:{bytes}"));
+                outcomes.next().expect("unexpected activation admission")
+            }
+        };
+        let mut cache_size = {
+            let events = Rc::clone(&events);
+            move || {
+                events.borrow_mut().push("cache".into());
+                cached
+            }
+        };
+        let mut reclaim = {
+            let events = Rc::clone(&events);
+            move || events.borrow_mut().push("reclaim".into())
+        };
+        let result = store.begin_turn_with_reclaim(&mut admit, &mut cache_size, &mut reclaim);
+        let events = events.borrow().clone();
+        (result, events)
+    }
+
+    #[test]
+    fn direct_gguf_full_purge_reactivates_only_after_fresh_admission() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        const LAYERS: usize = 2;
+        let temp = Temp::new();
+        let gguf = temp.0.join("full-purge-admission.gguf");
+        write_fixture_layers(&gguf, LAYERS);
+        let mut store = open_full(&temp, &gguf, "full-purge-admission-direct", LAYERS, EXPERTS);
+        let ids: Vec<u32> = (0..EXPERTS as u32).collect();
+        store.activate_expert_slots().unwrap();
+        for layer in 0..LAYERS {
+            store.expert_slots(layer, EXPERTS, 2, &ids).unwrap();
+        }
+        // Join the completed worker so a refused activation cannot be confused
+        // with the preceding load's fill handle.
+        store.start_direct_fill().unwrap();
+        assert!(store.direct_fill.is_none());
+
+        let source_bytes = store.bytes_read;
+        let allocated = store.slot_bytes;
+        let expected_admission = allocated + expert_slots::DIRECT_STAGING_BYTES;
+        store.purge_expert_slots().unwrap();
+        let purge_state = store.slot_suspend_states_for_test();
+        assert!(
+            purge_state
+                .iter()
+                .all(|&(_, suspended, purged)| suspended && purged)
+        );
+        let before_reads = store.bytes_read;
+        let before_upload = store.slot_upload_bytes;
+        let before_windows = store.direct_read_windows.len();
+        let before_filled = store.live.direct_filled_layers.load(Ordering::Acquire);
+
+        let (result, events) = begin_turn_scripted(
+            &mut store,
+            1.0,
+            vec![
+                Err(err("injected full activation pressure A")),
+                Err(err("injected full activation pressure B")),
+            ],
+        );
+        let error = result.unwrap_err();
+        assert!(error.reason.contains("full activation pressure B"));
+        assert_eq!(
+            events,
+            vec![
+                format!("admit:{expected_admission}"),
+                "cache".into(),
+                "reclaim".into(),
+                format!("admit:{expected_admission}"),
+            ]
+        );
+        assert_eq!(
+            store.activation_error.as_deref(),
+            Some("injected full activation pressure B")
+        );
+        assert_eq!(store.slot_suspend_states_for_test(), purge_state);
+        assert!(store.direct_fill.is_none());
+        assert_eq!(store.direct_fill_remaining, 0);
+        assert!(!store.direct_fill_pass());
+        assert!(!store.live.direct_fill_in_progress.load(Ordering::Acquire));
+        assert_eq!(store.bytes_read, before_reads);
+        assert_eq!(store.slot_upload_bytes, before_upload);
+        assert_eq!(store.direct_read_windows.len(), before_windows);
+        assert_eq!(
+            store.live.direct_filled_layers.load(Ordering::Acquire),
+            before_filled
+        );
+
+        let error = store.expert_slots(0, EXPERTS, 2, &ids).err().unwrap();
+        assert!(error.reason.contains("expert bank activation refused"));
+        assert!(error.reason.contains("full activation pressure B"));
+        assert_eq!(store.slot_suspend_states_for_test(), purge_state);
+        assert_eq!(store.bytes_read, before_reads);
+        assert_eq!(store.slot_upload_bytes, before_upload);
+        assert_eq!(store.direct_read_windows.len(), before_windows);
+
+        let (result, events) = begin_turn_scripted(
+            &mut store,
+            1.0,
+            vec![Err(err("transient full activation refusal")), Ok(())],
+        );
+        result.unwrap();
+        assert_eq!(
+            events,
+            vec![
+                format!("admit:{expected_admission}"),
+                "cache".into(),
+                "reclaim".into(),
+                format!("admit:{expected_admission}"),
+            ]
+        );
+        assert!(store.activation_error.is_none());
+        for layer in 0..LAYERS {
+            let (banks, local, capacity) = store
+                .expert_slots(layer, EXPERTS, 2, &ids)
+                .unwrap()
+                .unwrap();
+            assert_eq!(capacity, EXPERTS);
+            assert_eq!(local, ids);
+            assert_banks_match_checkpoint_layer(&store, layer, &PARTS, &banks, &ids, &local);
+        }
+        assert!(store.device_slots_ready(LAYERS));
+        assert_eq!(store.bytes_read, before_reads + source_bytes);
+        assert_eq!(store.slot_upload_bytes, before_upload + allocated);
+        assert_eq!(store.slot_bytes, allocated);
+        assert_eq!(store.cache_bytes, allocated);
+        assert_eq!(store.slot_misses, 0);
+        assert_eq!(
+            store.live.direct_filled_layers.load(Ordering::Acquire),
+            LAYERS as u64
+        );
+        let (result, events) = begin_turn_scripted(&mut store, 1.0, Vec::new());
+        result.unwrap();
+        assert!(events.is_empty());
+
+        // A successful activation retry clears its own refusal, never an
+        // unrelated asynchronous worker failure.
+        store.purge_expert_slots().unwrap();
+        let mut zero_cache_bytes = Vec::new();
+        let error = store
+            .begin_turn_with(&mut |bytes| {
+                zero_cache_bytes.push(bytes);
+                Err(err("second full activation refusal"))
+            })
+            .unwrap_err();
+        assert!(error.reason.contains("second full activation refusal"));
+        assert_eq!(zero_cache_bytes, [expected_admission]);
+        assert_eq!(
+            store.activation_error.as_deref(),
+            Some("second full activation refusal")
+        );
+        store.direct_error = Some("unrelated asynchronous worker error".into());
+        let before_worker_error_reads = store.bytes_read;
+        let (result, events) = begin_turn_scripted(
+            &mut store,
+            1.0,
+            vec![Err(err("transient full worker activation refusal")), Ok(())],
+        );
+        result.unwrap();
+        assert_eq!(
+            events,
+            vec![
+                format!("admit:{expected_admission}"),
+                "cache".into(),
+                "reclaim".into(),
+                format!("admit:{expected_admission}"),
+            ]
+        );
+        assert!(store.activation_error.is_none());
+        assert_eq!(
+            store.direct_error.as_deref(),
+            Some("unrelated asynchronous worker error")
+        );
+        assert!(store.direct_fill.is_none());
+        let error = store.expert_slots(0, EXPERTS, 2, &ids).err().unwrap();
+        assert!(error.reason.contains("unrelated asynchronous worker error"));
+        assert_eq!(store.bytes_read, before_worker_error_reads);
+    }
+
+    #[test]
+    fn direct_gguf_full_fill_error_stays_unpublished_and_rejects_changed_source() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("full-source-error.gguf");
+        write_fixture(&gguf);
+        let mut store = open_full(&temp, &gguf, "full-source-error-direct", 1, EXPERTS);
+        let held = temp.0.join("full-source-error.held");
+        fs::rename(&gguf, &held).unwrap();
+        store.start_direct_fill().unwrap();
+        let error = store.expert_slots(0, EXPERTS, 2, &[0]).err().unwrap();
+        assert!(error.reason.contains("Failed to open GGUF"), "{error}");
+        assert!(!store.device_slots_ready(1));
+        fs::rename(&held, &gguf).unwrap();
+        store.activate_expert_slots().unwrap();
+        let error = store.expert_slots(0, EXPERTS, 2, &[0]).err().unwrap();
+        assert!(error.reason.contains("changed since open"), "{error}");
+        assert_eq!(store.slot_misses, 0);
+        assert!(!store.device_slots_ready(1));
+    }
+
+    #[test]
+    fn direct_gguf_q5_1_slots_match_cpu_import_eviction_and_purge_refill() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("q5_1.gguf");
+        write_fixture_layout(&gguf, 1, EXPERTS, &PARTS, 32, 17);
+        let mut store = open_slots(&temp, &gguf, "q5_1-direct", 2, true);
+        let ids = [0u32, 1];
+        let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        let mut compared =
+            assert_banks_match_checkpoint(&store, &PARTS, &banks, &ids, &local).len();
+        let first_fill = raw_fill_bytes(&store, &PARTS, &ids);
+        assert_eq!(store.bytes_read, first_fill);
+
+        // One miss evicts expert 0 and reuses its bank; expert 1 stays warm.
+        let next = [2u32, 1];
+        let one_fill = raw_fill_bytes(&store, &PARTS, &[2]);
+        let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &next).unwrap().unwrap();
+        assert_eq!(local, [0, 1], "the LRU bank was reused");
+        compared += assert_banks_match_checkpoint(&store, &PARTS, &banks, &next, &local).len();
+        assert_eq!(store.bytes_read, first_fill + one_fill);
+
+        // Volatile banks either survive or take the same Empty refill path;
+        // explicit Empty guarantees the fallback and requires a full refill.
+        store.reclaim_expert_slots().unwrap();
+        let before = store.bytes_read;
+        let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &next).unwrap().unwrap();
+        compared += assert_banks_match_checkpoint(&store, &PARTS, &banks, &next, &local).len();
+        assert!((store.bytes_read - before) <= first_fill);
+        store.purge_expert_slots().unwrap();
+        let before = store.bytes_read;
+        let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &next).unwrap().unwrap();
+        compared += assert_banks_match_checkpoint(&store, &PARTS, &banks, &next, &local).len();
+        assert_eq!(store.bytes_read, before + first_fill);
+        assert!(store.device_slots_ready(1));
+        eprintln!(
+            "P3.0-d Q5_1 parity: {compared} bank bytes, eviction + volatile + explicit Empty refill"
         );
     }
 
-    /// Mapped mode on the fixture pack: identity routing, capacity == experts,
-    /// never a miss or an upload, bank bytes and kernel reads identical to
-    /// the chunk-built banks, leases inert, out-of-range ids refused.
     #[test]
-    fn mapped_residency_addresses_every_expert_in_place_without_misses() {
+    fn direct_gguf_partial_purge_demand_respects_activation_refusal_and_retry() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
         let temp = Temp::new();
-        let gguf = temp.0.join("experts.gguf");
+        let gguf = temp.0.join("partial-purge-admission.gguf");
         write_fixture(&gguf);
-        let root = temp.0.join("cache");
-        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
-        let dir = temp.0.join("mapped");
-        store.prepare_mapped_pack_at(&dir).unwrap();
-        assert_eq!(store.plan.mapped_pack_files, 3);
-        // Oracle banks: every expert through the ordinary reader, in id order.
-        let oracle: Vec<Arc<Weight>> = PARTS
-            .iter()
-            .map(|(name, rows, ..)| {
-                let chunks: Vec<_> = (0..EXPERTS)
-                    .map(|e| store.read(name, e * *rows, *rows).unwrap())
-                    .collect();
-                Arc::new(Weight::concatenate_rows(&chunks).unwrap())
-            })
-            .collect();
-        store.evict_to(0).unwrap();
-        let expected_bytes: u64 = PARTS
-            .iter()
-            .map(|(name, ..)| {
-                let h = &store.mapped.as_ref().unwrap().file(name).unwrap().header;
-                h.sections.iter().map(|s| s.length).sum::<u64>()
-            })
-            .sum();
-        let before = store.cache_bytes;
-        store
-            .select_mapped_residency_with(EXPERTS, 1 << 30, &mut |plan, dense, pool, pack| {
-                // The fixture holds routed experts only; the gate sees
-                // the pool it was given and the pack's section bytes.
-                assert_eq!((dense, pool), (0, 1 << 30));
-                assert_eq!(pack, expected_bytes);
-                plan.budget = 1 << 30;
-                plan.mapped = true;
-                Ok(())
-            })
-            .unwrap();
-        assert!(store.plan.mapped);
-        assert_eq!(store.plan.mapped_bytes, expected_bytes);
-        assert_eq!(store.plan.partial_expert_slots, EXPERTS);
-        assert_eq!(store.cache_limit, 1 << 30);
-        assert_eq!(store.expert_slot_capacity(EXPERTS, 2).unwrap(), EXPERTS);
-        assert!(store.device_slots_ready(1) && store.prefill_device_slots_ready(1));
-        assert!(!store.device_slots_ready(2));
-        assert_eq!(store.cache_bytes, before, "mapped banks are not anonymous");
-        assert_eq!(store.slot_bytes, 0);
+        let mut store = open_slots(&temp, &gguf, "partial-purge-admission-direct", 2, true);
+        let ids = [0u32, 1];
+        store.expert_slots(0, EXPERTS, 2, &ids).unwrap();
+        let first_fill = raw_fill_bytes(&store, &PARTS, &ids);
+        assert_eq!(store.bytes_read, first_fill);
+        let allocated = store.slot_bytes;
+        let expected_admission = allocated + expert_slots::DIRECT_STAGING_BYTES;
 
+        store.purge_expert_slots().unwrap();
+        let purge_state = store.slot_suspend_states_for_test();
+        let before_reads = store.bytes_read;
+        let before_upload = store.slot_upload_bytes;
+        let before_windows = store.direct_read_windows.len();
+        let before_misses = store.slot_misses;
+        let before_cache = store.cache_bytes;
+        let (result, events) = begin_turn_scripted(
+            &mut store,
+            1.0,
+            vec![
+                Err(err("injected partial activation pressure A")),
+                Err(err("injected partial activation pressure B")),
+            ],
+        );
+        let error = result.unwrap_err();
+        assert!(error.reason.contains("partial activation pressure B"));
+        assert_eq!(
+            events,
+            vec![
+                format!("admit:{expected_admission}"),
+                "cache".into(),
+                "reclaim".into(),
+                format!("admit:{expected_admission}"),
+            ]
+        );
+        assert_eq!(
+            store.activation_error.as_deref(),
+            Some("injected partial activation pressure B")
+        );
+        assert_eq!(store.slot_suspend_states_for_test(), purge_state);
+        assert!(store.direct_fill.is_none());
+        assert_eq!(store.bytes_read, before_reads);
+        assert_eq!(store.slot_upload_bytes, before_upload);
+        assert_eq!(store.direct_read_windows.len(), before_windows);
+        assert_eq!(store.slot_misses, before_misses);
+
+        let error = store.expert_slots(0, EXPERTS, 2, &ids).err().unwrap();
+        assert!(error.reason.contains("expert bank activation refused"));
+        assert!(error.reason.contains("partial activation pressure B"));
+        assert_eq!(store.slot_suspend_states_for_test(), purge_state);
+        assert_eq!(store.bytes_read, before_reads);
+        assert_eq!(store.slot_upload_bytes, before_upload);
+        assert_eq!(store.direct_read_windows.len(), before_windows);
+        assert_eq!(store.slot_misses, before_misses);
+
+        let (result, events) = begin_turn_scripted(
+            &mut store,
+            1.0,
+            vec![Err(err("transient partial activation refusal")), Ok(())],
+        );
+        result.unwrap();
+        assert_eq!(
+            events,
+            vec![
+                format!("admit:{expected_admission}"),
+                "cache".into(),
+                "reclaim".into(),
+                format!("admit:{expected_admission}"),
+            ]
+        );
+        assert!(store.activation_error.is_none());
+        let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        assert_eq!(local, ids);
+        assert_banks_match_checkpoint(&store, &PARTS, &banks, &ids, &local);
+        assert_eq!(store.bytes_read, before_reads + first_fill);
+        assert_eq!(store.slot_upload_bytes, before_upload + allocated);
+        assert_eq!(store.slot_bytes, allocated);
+        assert_eq!(store.cache_bytes, before_cache);
+        assert_eq!(store.slot_misses, before_misses + ids.len() as u64);
+        assert!(store.device_slots_ready(1));
+        let (result, events) = begin_turn_scripted(&mut store, 1.0, Vec::new());
+        result.unwrap();
+        assert!(events.is_empty());
+
+        store.purge_expert_slots().unwrap();
+        let before_zero_cache_reads = store.bytes_read;
+        let (result, events) = begin_turn_scripted(
+            &mut store,
+            0.0,
+            vec![Err(err("partial zero-cache activation refusal"))],
+        );
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .reason
+                .contains("partial zero-cache activation refusal")
+        );
+        assert_eq!(
+            events,
+            vec![format!("admit:{expected_admission}"), "cache".into()]
+        );
+        assert_eq!(
+            store.activation_error.as_deref(),
+            Some("partial zero-cache activation refusal")
+        );
+        assert_eq!(store.bytes_read, before_zero_cache_reads);
+
+        let (result, events) = begin_turn_scripted(&mut store, 1.0, vec![Ok(())]);
+        result.unwrap();
+        assert_eq!(events, vec![format!("admit:{expected_admission}")]);
+        assert!(store.activation_error.is_none());
+        assert_eq!(store.bytes_read, before_zero_cache_reads);
+    }
+
+    #[test]
+    fn direct_gguf_partial_source_error_invalidates_changed_source() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("partial-source-error.gguf");
+        write_fixture(&gguf);
+        let mut store = open_slots(&temp, &gguf, "partial-source-error-direct", 2, true);
+        store.expert_slots(0, EXPERTS, 2, &[0, 1]).unwrap();
+        let held = temp.0.join("partial-source-error.held");
+        fs::rename(&gguf, &held).unwrap();
+        let error = store.expert_slots(0, EXPERTS, 2, &[2, 3]).err().unwrap();
+        assert!(error.reason.contains("Failed to stat GGUF"), "{error}");
+        assert!(!store.device_slots_ready(1));
+
+        fs::rename(&held, &gguf).unwrap();
+        let before = store.bytes_read;
+        let error = store.expert_slots(0, EXPERTS, 2, &[2, 3]).err().unwrap();
+        assert!(error.reason.contains("changed since open"), "{error}");
+        assert_eq!(store.bytes_read, before);
+        assert!(!store.device_slots_ready(1));
+    }
+
+    #[test]
+    fn direct_gguf_idle_fallback_forces_a_fresh_fill() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let _host = memory::scoped_fixture_host();
+        let temp = Temp::new();
+        let gguf = temp.0.join("idle-fallback.gguf");
+        write_fixture(&gguf);
+        let mut store = open_slots(&temp, &gguf, "idle-fallback-direct", EXPERTS, true);
+        let ids = [0u32, 1];
+        store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        let first_fill = raw_fill_bytes(&store, &PARTS, &ids);
+        store.reclaim_expert_slots().unwrap();
+        store.slot_reclaim_since = Some(Instant::now() - Duration::from_secs(31));
+        store.activate_expert_slots().unwrap();
+        let before = store.bytes_read;
+        let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        assert_banks_match_checkpoint(&store, &PARTS, &banks, &ids, &local);
+        assert_eq!(store.bytes_read, before + first_fill);
+        assert!(store.slot_reclaim_since.is_none());
+    }
+
+    #[test]
+    fn direct_gguf_source_flips_match_cpu_import_for_q5_1_and_q8_0_bias() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        for (label, parts, flip) in [
+            ("q5_1", &PARTS, 8usize),
+            ("q5_k", &Q5K_PARTS, 8),
+            ("q8_0", &Q8_PARTS, 1),
+        ] {
+            let gguf = temp.0.join(format!("{label}-flip.gguf"));
+            write_fixture_layout(&gguf, 1, EXPERTS, parts, 64, 13);
+            let mut before = open_slots(&temp, &gguf, &format!("{label}-before"), EXPERTS, true);
+            let ids = [0u32];
+            let (banks, local, _) = before.expert_slots(0, EXPERTS, 1, &ids).unwrap().unwrap();
+            let before = assert_banks_match_checkpoint(&before, parts, &banks, &ids, &local);
+
+            let parsed = parse_gguf(&gguf).unwrap();
+            let tensor = parsed
+                .tensors
+                .iter()
+                .find(|t| t.name == "blk.0.ffn_down_exps.weight")
+                .unwrap();
+            let at = (parsed.data_offset + tensor.offset) as usize + flip;
+            let mut bytes = fs::read(&gguf).unwrap();
+            bytes[at] ^= 0x20;
+            fs::write(&gguf, &bytes).unwrap();
+            let mut after = open_slots(&temp, &gguf, &format!("{label}-after"), EXPERTS, true);
+            let (banks, local, _) = after.expert_slots(0, EXPERTS, 1, &ids).unwrap().unwrap();
+            let after_bytes = assert_banks_match_checkpoint(&after, parts, &banks, &ids, &local);
+            assert_ne!(before, after_bytes, "{label}: source flip had no effect");
+
+            // A source that changes after open is never mixed with the old
+            // identity across repeated direct fills.
+            let mut bytes = fs::read(&gguf).unwrap();
+            bytes[at + 1] ^= 0x04;
+            fs::write(&gguf, &bytes).unwrap();
+            let error = after.expert_slots(0, EXPERTS, 1, &[1]).err().unwrap();
+            assert!(error.reason.contains("changed since open"), "{error}");
+            assert!(!after.device_slots_ready(1));
+        }
+    }
+
+    #[test]
+    fn direct_gguf_missing_and_truncated_sources_fail_without_stale_slots() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        for truncated in [false, true] {
+            let temp = Temp::new();
+            let gguf = temp.0.join("source-error.gguf");
+            write_fixture(&gguf);
+            let mut store = open_slots(&temp, &gguf, "source-error-direct", EXPERTS, true);
+            if truncated {
+                let len = fs::metadata(&gguf).unwrap().len();
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&gguf)
+                    .unwrap()
+                    .set_len(len - 1)
+                    .unwrap();
+            } else {
+                fs::remove_file(&gguf).unwrap();
+            }
+            let error = store.expert_slots(0, EXPERTS, 2, &[0, 1]).err().unwrap();
+            if truncated {
+                assert!(error.reason.contains("truncated"), "{error}");
+            } else {
+                assert!(error.reason.contains("Failed to stat GGUF"), "{error}");
+            }
+            assert!(error.reason.contains("source-error.gguf"), "{error}");
+            assert!(!store.device_slots_ready(1));
+            assert!(store.direct_read_windows.is_empty());
+        }
+    }
+
+    #[test]
+    fn direct_gguf_kernel_unaligned_offsets_use_cpu_import() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("unaligned.gguf");
+        write_fixture(&gguf);
+        let mut store = open_slots(&temp, &gguf, "unaligned-direct", EXPERTS, true);
+        let names = ["gate", "up", "down"].map(|part| format!("blk.0.ffn_{part}_exps.weight"));
+        store.tensors.get_mut(&names[0]).unwrap().offset += 1;
+        assert!(!store.direct_layer(&names));
+        assert!(store.expert_slots(0, EXPERTS, 2, &[0]).unwrap().is_none());
+        store.select_residency(0).unwrap();
+        assert_eq!(store.plan.partial_expert_slots, 0);
+        assert_eq!(store.slot_capacity, Some(0));
+    }
+
+    #[test]
+    fn direct_gguf_flash_geometry_matches_checkpoint_and_layers_reads_at_8mib() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        const EXPERTS: usize = 8;
+        let temp = Temp::new();
+        let gguf = temp.0.join("flash-geometry.gguf");
+        write_fixture_layout(&gguf, 1, EXPERTS, &FLASH_PARTS, 0, 0);
+        let mut store = open_slots(&temp, &gguf, "flash-geometry-direct", EXPERTS, true);
+        let ids: Vec<u32> = (0..EXPERTS as u32).collect();
+        let (banks, local, _) = store.expert_slots(0, EXPERTS, 8, &ids).unwrap().unwrap();
+        let compared =
+            assert_banks_match_checkpoint(&store, &FLASH_PARTS, &banks, &ids, &local).len();
+        assert_eq!(store.bytes_read, 24_576_000);
+        assert_eq!(store.slot_upload_bytes, store.slot_bytes);
+        assert!(store.direct_read_windows.len() > 1);
+        assert!(
+            store
+                .direct_read_windows
+                .iter()
+                .all(|&(off, len)| len <= 8 << 20 && off % (16 << 10) == 0),
+            "{:?}",
+            store.direct_read_windows
+        );
+        eprintln!(
+            "P3.0-d Flash geometry parity: {compared} bank bytes in {} aligned windows",
+            store.direct_read_windows.len()
+        );
+    }
+
+    #[test]
+    fn direct_full_banks_preserve_identity_routing_and_kernel_results() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("identity.gguf");
+        write_fixture(&gguf);
+        let mut store = open_full(&temp, &gguf, "identity-direct", 1, EXPERTS);
+        store.activate_expert_slots().unwrap();
         let ids = [4u32, 0, 2, 2, 1, 3];
         let (banks, local, capacity) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
-        assert_eq!(local, ids, "slot id must be the expert id");
+        assert_eq!(local, ids);
         assert_eq!(capacity, EXPERTS);
         let device = MxArray::from_uint32(&ids, &[2, 3]).unwrap();
         let (_, device_local) = store.device_expert_slots(0, &device).unwrap().unwrap();
@@ -3530,38 +4190,13 @@ mod mapped_tests {
         let (_, safe, count) = store.prefill_device_expert_slots(0, &device).unwrap();
         assert_eq!(&*safe.to_uint32().unwrap(), &ids);
         assert_eq!(count, EXPERTS);
-        for round in 0..3 {
-            assert!(
-                store.commit_device_routes(&[0, 0, 0], &ids, 2).unwrap(),
-                "round {round}"
-            );
+        for _ in 0..3 {
+            assert!(store.commit_device_routes(&[0, 0, 0], &ids, 2).unwrap());
         }
         assert_eq!(store.slot_misses, 0);
-        assert_eq!(store.slot_upload_bytes, 0);
-        // 5 unique ids in the window, then 2 + 1 + 2 unique per committed tape.
         assert_eq!(store.slot_hits, 5 + 3 * 5);
-        assert!(store.slots.is_empty(), "the slot machinery stays unused");
+        assert_eq!(store.slot_upload_bytes, store.slot_bytes);
 
-        // The mapped banks are the pack's bytes: the same arrays the chunk
-        // reader builds, byte for byte, with the same quantization geometry.
-        for (part, (name, rows, ..)) in PARTS.iter().enumerate() {
-            let bank = &banks[part];
-            assert!(!bank.values.storage_ptr().is_null(), "{name} is not mapped");
-            assert_eq!(
-                encoded(bank),
-                encoded(&oracle[part]),
-                "{name}: mapped bank differs from the chunk-built bank"
-            );
-            for e in [0usize, 2, 4] {
-                assert_eq!(
-                    encoded(&bank.slice_rows(e * rows, *rows).unwrap()),
-                    encoded(&store.read(name, e * rows, *rows).unwrap()),
-                    "{name} expert {e}"
-                );
-            }
-        }
-        // A kernel reading the mapped buffers equals the same kernel on the
-        // anonymous copy of the same bytes.
         let x = MxArray::from_float32(
             &(0..6 * 256)
                 .map(|n| ((n % 97) as f32 - 48.) / 64.)
@@ -3572,25 +4207,35 @@ mod mapped_tests {
         .astype(DType::BFloat16)
         .unwrap();
         let selected = MxArray::from_uint32(&ids, &[6]).unwrap();
-        let mapped_out = banks[0].gather_rows(&x, &selected, EXPERTS, false).unwrap();
-        let anonymous_out = oracle[0]
-            .gather_rows(&x, &selected, EXPERTS, false)
-            .unwrap();
-        // Bit patterns: the pseudo-random fixture codes decode to NaNs too.
-        let bits = |a: &MxArray| {
-            a.to_float32()
+        let bits = |array: &MxArray| {
+            array
+                .to_float32()
                 .unwrap()
                 .iter()
-                .map(|v| v.to_bits())
-                .collect::<Vec<u32>>()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
         };
-        assert_eq!(bits(&mapped_out), bits(&anonymous_out));
-        // Leases are inert: nothing is retained, completion still evaluates.
-        store.finish_expert_slots(0, &mapped_out).unwrap();
-        store.defer_expert_reduction(0, &mapped_out).unwrap();
-        assert_eq!(store.deferred_reduction_layer, None);
-        store.complete_device_readers().unwrap();
-        store.complete_expert_window(0, &anonymous_out).unwrap();
+        for (part, &(name, rows, ..)) in PARTS.iter().enumerate() {
+            let chunks: Vec<_> = (0..EXPERTS)
+                .map(|expert| {
+                    store
+                        .descriptor(name)
+                        .unwrap()
+                        .import_rows(expert * rows, rows)
+                        .map(Arc::new)
+                })
+                .collect::<Result<_>>()
+                .unwrap();
+            let oracle = Weight::concatenate_rows(&chunks).unwrap();
+            assert_eq!(encoded(&banks[part]), encoded(&oracle), "{name}");
+            if part == 0 {
+                let actual = banks[0].gather_rows(&x, &selected, EXPERTS, false).unwrap();
+                let expected = oracle.gather_rows(&x, &selected, EXPERTS, false).unwrap();
+                assert_eq!(bits(&actual), bits(&expected));
+                store.finish_expert_slots(0, &actual).unwrap();
+                store.complete_expert_window(0, &expected).unwrap();
+            }
+        }
         assert!(
             store
                 .expert_slots(0, EXPERTS, 2, &[EXPERTS as u32])
@@ -3601,454 +4246,87 @@ mod mapped_tests {
                 .commit_device_routes(&[0], &[EXPERTS as u32, 0], 2)
                 .is_err()
         );
-        assert!(store.device_expert_slots(1, &device).unwrap().is_none());
     }
 
-    /// A pack whose header page was damaged is refused at open and rebuilt
-    /// before anything is mapped; a pack whose expert count disagrees with
-    /// the checkpoint keeps the slot path.
     #[test]
-    fn mapped_residency_refuses_a_damaged_or_mismatched_pack() {
-        let temp = Temp::new();
-        let gguf = temp.0.join("experts.gguf");
-        write_fixture(&gguf);
-        let root = temp.0.join("cache");
-        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
-        let dir = temp.0.join("mapped");
-        store.prepare_mapped_pack_at(&dir).unwrap();
-        let name = PARTS[1].0;
-        let header = store
-            .mapped
-            .as_ref()
-            .unwrap()
-            .file(name)
-            .unwrap()
-            .header
-            .clone();
-        store.mapped = None;
-        // Flip one hex digit of a section checksum inside the header JSON:
-        // still valid JSON, still a 64-char digest, only the page checksum
-        // can tell.
-        let path = dir.join(format!("{name}.mapped"));
-        let mut bytes = fs::read(&path).unwrap();
-        let sha = header.sections[0].sha256.as_bytes();
-        let at = bytes[..super::super::mapped_pack::PAGE as usize]
-            .windows(sha.len())
-            .position(|w| w == sha)
-            .unwrap();
-        bytes[at] = if bytes[at] == b'0' { b'1' } else { b'0' };
-        fs::write(&path, &bytes).unwrap();
-        let opened = fs::metadata(&path).unwrap().len();
-        store.prepare_mapped_pack_at(&dir).unwrap();
-        let rebuilt = store.mapped.as_ref().unwrap().file(name).unwrap();
-        assert_eq!(
-            rebuilt.header, header,
-            "{name} must be rebuilt from the sources"
-        );
-        assert_eq!(fs::metadata(&path).unwrap().len(), opened);
-        assert_ne!(
-            fs::read(&path).unwrap()[at],
-            bytes[at],
-            "the damaged page must not survive"
-        );
-        store
-            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
-                plan.budget = 1 << 30;
-                plan.mapped = true;
-                Ok(())
-            })
-            .unwrap();
-        assert!(store.plan.mapped);
-
-        let mut other = Store::open_fixture(&gguf, Some(&root)).unwrap();
-        other.prepare_mapped_pack_at(&dir).unwrap();
-        other
-            .select_mapped_residency_with(EXPERTS + 1, 0, &mut |_, _, _, _| {
-                panic!("an incomplete pack must not be admitted")
-            })
-            .unwrap();
-        assert!(!other.plan.mapped);
-        assert_eq!(other.plan.mapped_bytes, 0);
-        assert!(other.mapped_experts.is_empty());
-    }
-
-    /// The live-memory gate says no: the store stays on slots, maps nothing,
-    /// keeps its slot budget and reports the refusal with the gate's budget.
-    #[test]
-    fn a_refused_gate_keeps_the_slot_path_and_reports_the_bank_budget() {
-        let temp = Temp::new();
-        let gguf = temp.0.join("experts.gguf");
-        write_fixture(&gguf);
-        let root = temp.0.join("cache");
-        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
-        store
-            .prepare_mapped_pack_at(&temp.0.join("mapped"))
-            .unwrap();
-        let budget_before = store.plan.budget;
-        let limit_before = store.cache_limit;
-        let mut seen_pack = 0;
-        store
-            .select_mapped_residency_with(EXPERTS, 1 << 30, &mut |plan, _, _, pack| {
-                seen_pack = pack;
-                plan.mapped_bank_budget = pack - 1;
-                plan.live_non_reclaimable = 40 << 30;
-                plan.budget = 1;
-                plan.mapped = true;
-                Err(err("mapped banks need more than the host leaves"))
-            })
-            .unwrap();
-        assert!(seen_pack > 0);
-        assert!(!store.plan.mapped);
-        assert!(store.mapped_experts.is_empty() && store.prefetch.is_none());
-        assert_eq!(
-            (store.plan.budget, store.cache_limit),
-            (budget_before, limit_before)
-        );
-        assert_eq!(store.plan.mapped_bank_budget, seen_pack - 1);
-        assert_eq!(store.plan.live_non_reclaimable, 40 << 30);
-        assert_eq!(
-            store.live.fallback(),
-            Some(Fallback::LoadGate {
-                pack: seen_pack,
-                budget: seen_pack - 1
-            })
-        );
-        assert_eq!(store.expert_slot_capacity(EXPERTS, 2).unwrap(), EXPERTS);
-        assert!(store.slots.is_empty(), "slots are built by the first turn");
-    }
-
-    /// A pass that trips the wire is the request's last mapped one: the
-    /// store leaves the mapped path between that pass and the next (banks
-    /// unmapped, read-ahead released, the slot budget taken from the live
-    /// host, slots built on demand, the reason published) and the same
-    /// request's next pass maps its expert ids through slots.
-    ///
-    /// The pack stays cold behind a held stream, so the SSD count is
-    /// corroborated by the pack's own sample.
-    ///
-    /// MUTATION: `observe_pass_at` logs the trip and returns
-    /// `Ok(None)` without `apply_fallback`; the request finishes mapped.
-    #[test]
-    fn a_trip_observed_mid_turn_leaves_the_mapped_path_at_that_pass() {
-        let temp = Temp::new();
-        let gguf = temp.0.join("experts.gguf");
-        write_fixture(&gguf);
-        let mut store = mapped_store(&temp, &gguf, "mapped");
-        let gate = Arc::new(Gate::default());
-        store.pool_with(Arc::clone(&gate));
-        let mapped = store.plan.mapped_bytes;
-        assert!(store.begin_turn().unwrap().is_none());
-        let base = store.tripwire_mut().turn_start_reads();
-        let ids = [4u32, 0, 2];
-        let (banks, _, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
-        let mapped_bank = Arc::as_ptr(&banks[0]);
-        // Passes 1..k read the pack once between them: mapped throughout.
-        for pass in 1..=4u64 {
-            assert!(
-                store
-                    .observe_pass_at(1, Duration::from_millis(25), base + pass * mapped / 4)
-                    .unwrap()
-                    .is_none(),
-                "pass {pass}"
-            );
-            assert!(store.plan.mapped);
-            let (same, _, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
-            assert_eq!(Arc::as_ptr(&same[0]), mapped_bank);
+    fn direct_full_load_writes_no_derived_weight_pack() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
         }
-        // Pass k+1 crosses twice the pack: the store leaves mapped mode now.
-        let why = store
-            .observe_pass_at(1, Duration::from_millis(25), base + 2 * mapped + 1)
-            .unwrap()
-            .expect("the tripping pass applies the switch");
-        assert_eq!(
-            why,
-            Fallback::SsdReads {
-                read: 2 * mapped + 1,
-                mapped
-            }
-        );
-        assert!(!store.plan.mapped);
-        assert_eq!(store.plan.mapped_bytes, 0);
-        assert!(store.mapped_experts.is_empty() && store.prefetch.is_none());
-        assert_eq!(store.cache_limit, store.plan.budget);
-        assert!(store.cache_limit >= store.cache_bytes + MAX_READ_BYTES * 3);
-        assert!(!store.live.mapped.load(Ordering::Acquire));
-        assert_eq!(store.live.fallback(), Some(why));
-        assert_eq!(
-            store.tripwire_mut().turn_start_reads(),
-            base,
-            "the window in progress keeps its baseline"
-        );
-        let (slots, local, capacity) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
-        assert_ne!(Arc::as_ptr(&slots[0]), mapped_bank, "anonymous slot banks");
-        assert_eq!(capacity, EXPERTS);
-        assert_eq!(local.len(), ids.len());
-        assert!(store.slot_bytes > 0 && store.slots.contains_key(&0));
-        // Later passes of the same request and the next turn change nothing.
+        let temp = Temp::new();
+        let gguf = temp.0.join("no-pack.gguf");
+        write_fixture(&gguf);
+        let cache = temp.0.join("fresh-research-cache");
+        let mut store = Store::open_fixture(&gguf, Some(&cache)).unwrap();
         assert!(
             store
-                .observe_pass_at(1, Duration::from_millis(25), base + 3 * mapped)
+                .select_direct_residency_with(EXPERTS, 0, &mut memory::direct_plan, &mut |_| Ok(()))
                 .unwrap()
-                .is_none()
         );
-        assert!(store.begin_turn().unwrap().is_none(), "applied once");
-        assert!(!store.plan.mapped);
-    }
-
-    /// The per-pass bookkeeping of a mapped turn (two `Instant::now`, the
-    /// process disk-read counter, the tripwire's median and reference scan)
-    /// costs microseconds, not the 0.3 ms per token that would show in a
-    /// 20 ms decode step. Prints the median and p99 per pass.
-    #[test]
-    #[ignore = "release microbenchmark; run with --nocapture"]
-    fn per_pass_bookkeeping_costs_microseconds() {
-        let mapped = 73u64 << 30;
-        let mut wire = Tripwire::default();
-        wire.begin_turn(memory::process_disk_reads());
-        for window in [12_000u64, 900, 850, 800, 820, 810] {
-            wire.observe(1024, Duration::from_millis(window), 0, mapped, || false);
-        }
-        for _ in 0..64 {
-            wire.observe(1, Duration::from_millis(25), 0, mapped, || false);
-        }
-        let mut costs: Vec<Duration> = (0..4096)
-            .map(|_| {
-                let started = std::time::Instant::now();
-                let reads = memory::process_disk_reads();
-                let elapsed = started.elapsed();
-                assert!(wire.observe(1, elapsed, reads, mapped, || false).is_none());
-                wire.observe(4, Duration::from_millis(30), reads, mapped, || false);
-                started.elapsed()
-            })
+        store.activate_expert_slots().unwrap();
+        let ids: Vec<u32> = (0..EXPERTS as u32).collect();
+        let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
+        assert_banks_match_checkpoint(&store, &PARTS, &banks, &ids, &local);
+        assert!(
+            !cache.exists(),
+            "the direct load created a weight-pack root"
+        );
+        let entries: Vec<_> = fs::read_dir(&temp.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
             .collect();
-        costs.sort_unstable();
-        let median = costs[costs.len() / 2];
-        let p99 = costs[costs.len() * 99 / 100];
-        eprintln!(
-            "per-pass bookkeeping: median {median:.1?}, p99 {p99:.1?}, max {:.1?}",
-            costs[costs.len() - 1]
-        );
-        assert!(median < Duration::from_micros(300), "median {median:?}");
+        assert_eq!(entries.len(), 1, "unexpected derived files: {entries:?}");
+        assert!(entries[0].to_string_lossy().ends_with(".gguf"));
     }
 
-    /// A trip taken through the wire directly (its switch did not run at
-    /// the pass) stays armed: the next turn to open applies it, banks
-    /// unmapped, the slot budget taken from the live host, slots built on
-    /// demand, the reason published.
     #[test]
-    fn a_tripped_mapped_store_runs_its_next_turn_on_slots() {
-        let temp = Temp::new();
-        let gguf = temp.0.join("experts.gguf");
-        write_fixture(&gguf);
-        let root = temp.0.join("cache");
-        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
-        store
-            .prepare_mapped_pack_at(&temp.0.join("mapped"))
-            .unwrap();
-        store
-            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
-                plan.budget = 1 << 30;
-                plan.mapped = true;
-                Ok(())
-            })
-            .unwrap();
-        assert!(store.plan.mapped && store.live.mapped.load(Ordering::Acquire));
-        let mapped = store.plan.mapped_bytes;
-        assert!(store.begin_turn().unwrap().is_none(), "nothing tripped yet");
-        let ids = [4u32, 0, 2];
-        let (banks, _, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
-        let mapped_bank = Arc::as_ptr(&banks[0]);
-        store.trip(Fallback::SsdReads {
-            read: 2 * mapped + 1,
-            mapped,
-        });
-        // The turn that tripped keeps its mapped banks.
-        assert!(store.plan.mapped);
-        let (same, _, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
-        assert_eq!(Arc::as_ptr(&same[0]), mapped_bank);
-        assert!(store.live.fallback().is_none());
-
-        let why = store
-            .begin_turn()
-            .unwrap()
-            .expect("the next turn applies the fallback");
-        assert_eq!(
-            why,
-            Fallback::SsdReads {
-                read: 2 * mapped + 1,
-                mapped
-            }
-        );
-        assert!(!store.plan.mapped);
-        assert_eq!(store.plan.mapped_bytes, 0);
-        assert!(store.mapped_experts.is_empty() && store.prefetch.is_none());
-        assert_eq!(store.cache_limit, store.plan.budget);
-        assert!(store.cache_limit >= store.cache_bytes + MAX_READ_BYTES * 3);
-        assert_eq!(store.expert_slot_capacity(EXPERTS, 2).unwrap(), EXPERTS);
-        assert!(!store.live.mapped.load(Ordering::Acquire));
-        assert_eq!(store.live.fallback(), Some(why));
-        assert!(
-            !store
-                .wire_mapped_banks_at(std::time::Instant::now(), true)
-                .unwrap(),
-            "a slot store never touches banks"
-        );
-        let (slots, local, capacity) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
-        assert_ne!(Arc::as_ptr(&slots[0]), mapped_bank, "anonymous slot banks");
-        assert_eq!(capacity, EXPERTS);
-        assert_eq!(local.len(), ids.len());
-        assert!(store.slot_bytes > 0 && store.slots.contains_key(&0));
-        assert!(store.begin_turn().unwrap().is_none(), "applied once");
-    }
-
-    /// A turn admitted while another is open applies a trip without starting
-    /// a window: the store leaves mapped mode (every open turn runs on slots
-    /// from its next pass) and the SSD baseline of the window in progress
-    /// stays.
-    ///
-    /// MUTATION: `apply_fallback` returns `Ok(None)` without
-    /// leaving; the store stays mapped.
-    #[test]
-    fn an_admission_beside_an_open_turn_applies_the_trip_and_keeps_the_window() {
-        const SENTINEL: u64 = u64::MAX - 1;
-        let temp = Temp::new();
-        let gguf = temp.0.join("experts.gguf");
-        write_fixture(&gguf);
-        let root = temp.0.join("cache");
-        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
-        store
-            .prepare_mapped_pack_at(&temp.0.join("mapped"))
-            .unwrap();
-        store
-            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
-                plan.budget = 1 << 30;
-                plan.mapped = true;
-                Ok(())
-            })
-            .unwrap();
-        assert!(store.begin_turn().unwrap().is_none());
-        let mapped = store.plan.mapped_bytes;
-        let ids = [4u32, 0, 2];
-        let (banks, _, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
-        let mapped_bank = Arc::as_ptr(&banks[0]);
-        store.trip(Fallback::SsdReads {
-            read: 2 * mapped + 1,
-            mapped,
-        });
-        store.tripwire_mut().begin_turn(SENTINEL);
-        let why = store
-            .apply_fallback()
-            .unwrap()
-            .expect("the admission applies the trip");
-        assert_eq!(
-            why,
-            Fallback::SsdReads {
-                read: 2 * mapped + 1,
-                mapped
-            }
-        );
-        assert!(!store.plan.mapped && store.mapped_experts.is_empty() && store.prefetch.is_none());
-        assert_eq!(store.cache_limit, store.plan.budget);
-        assert_eq!(store.plan.mapped_bytes, 0);
-        assert_eq!(
-            store.tripwire_mut().turn_start_reads(),
-            SENTINEL,
-            "the window in progress keeps its baseline"
-        );
-        assert_eq!(store.live.fallback(), Some(why));
-        let (slots, _, capacity) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
-        assert_ne!(Arc::as_ptr(&slots[0]), mapped_bank, "anonymous slot banks");
-        assert_eq!(capacity, EXPERTS);
-        assert!(store.apply_fallback().unwrap().is_none(), "applied once");
-    }
-
-    /// The slot budget is sized after the banks are released: the host is
-    /// read with the store's maps already dropped, from the sample after
-    /// wired memory settles, and that budget is the one the store keeps.
-    #[test]
-    fn leaving_mapped_mode_releases_the_banks_before_sizing_the_slots() {
-        use super::super::memory::HostMemory;
-        let temp = Temp::new();
-        let gguf = temp.0.join("experts.gguf");
-        write_fixture(&gguf);
-        let root = temp.0.join("cache");
-        let mut store = Store::open_fixture(&gguf, Some(&root)).unwrap();
-        store
-            .prepare_mapped_pack_at(&temp.0.join("mapped"))
-            .unwrap();
-        store
-            .select_mapped_residency_with(EXPERTS, 0, &mut |plan, _, _, _| {
-                plan.budget = 1 << 30;
-                plan.mapped = true;
-                Ok(())
-            })
-            .unwrap();
-        assert!(store.plan.mapped);
-        store.plan.physical_bytes = Some(128 << 30);
-        store.plan.hot_bytes = 83 << 30;
-        let map = Arc::clone(&store.mapped_experts[&0].maps[0]);
-        let holders = Arc::strong_count(&map);
-        assert!(holders >= 2, "the store holds the mapping: {holders}");
-        let wired = HostMemory {
-            physical: 128 << 30,
-            free: 1 << 30,
-            file: 20 << 30,
-            anonymous: 30 << 30,
-            purgeable: 0,
-            wired: 50 << 30,
-            compressor: 10 << 30,
-            uncompressed: 10 << 30,
-            swapped: 0,
-            faults: 1,
-        };
-        let released = |faults: u64| HostMemory {
-            file: 54 << 30,
-            wired: 16 << 30,
-            faults,
-            ..wired
-        };
-        let mut samples = std::collections::VecDeque::from([
-            wired,
-            released(2),
-            released(3),
-            released(4),
-            released(5),
-            released(6),
-        ]);
-        let mut seen = Vec::new();
-        let mut slept = 0;
-        let why = Fallback::SsdReads {
-            read: 3 << 30,
-            mapped: 1 << 30,
-        };
-        store
-            .leave_mapped_with(
-                &why,
-                &mut || {
-                    seen.push(Arc::strong_count(&map));
-                    Ok(samples.pop_front().expect("more samples than polls"))
-                },
-                &mut |_| slept += 1,
-            )
-            .unwrap();
-        assert_eq!(seen.len(), 6);
-        assert!(
-            seen.iter().all(|&n| n < holders),
-            "sampled while the store still held its banks: {seen:?} of {holders}"
-        );
-        assert_eq!(slept, 5);
-        assert!(!store.plan.mapped && store.mapped_experts.is_empty() && store.prefetch.is_none());
-        assert_eq!(store.plan.available_bytes, Some(released(6).available()));
-        assert_eq!(store.plan.budget, 35 << 30, "sized from the released host");
-        assert_eq!(store.cache_limit, store.plan.budget);
-        assert_eq!(store.live.fallback(), Some(why));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while Arc::strong_count(&map) > 1 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the pack mapping outlived the fallback"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1));
+    fn direct_load_admits_draft_banks_before_starting_expert_fill() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
         }
+        let temp = Temp::new();
+        let gguf = temp.0.join("draft-order.gguf");
+        write_fixture(&gguf);
+        let mut store = Store::open_fixture(&gguf, Some(&temp.0.join("draft-cache"))).unwrap();
+        let aux =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp/bf16/paged");
+        store
+            .attach_auxiliary(Store::open_fixture(&aux, None).unwrap())
+            .unwrap();
+        let estimate = store.mtp_bank_estimate().unwrap();
+        let dense = store.fixed_projection_bytes().unwrap();
+        assert!(estimate > 0);
+        let mut charged = None;
+        assert!(
+            store
+                .select_direct_residency_with(
+                    EXPERTS,
+                    1 << 30,
+                    &mut |plan, need, pool, banks| {
+                        charged = Some((need, pool, banks));
+                        memory::direct_plan(plan, need, pool, banks)
+                    },
+                    &mut |_| Ok(()),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            charged,
+            Some((dense + estimate, 1 << 30, store.plan.direct_bytes))
+        );
+        assert_eq!(store.draft_bank_budget, estimate);
+        store.prepare_fixture_hot().unwrap();
+        let live = Arc::clone(&store.live);
+        store
+            .finish_load_with(&mut |_| {
+                assert!(!live.direct_fill_in_progress.load(Ordering::Acquire));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(store.mtp_bank_bytes().unwrap(), estimate);
+        assert!(
+            store.direct_fill.is_some(),
+            "the direct fill starts after the draft banks"
+        );
     }
 }

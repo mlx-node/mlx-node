@@ -8,7 +8,7 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::{DType, MxArray};
-use crate::cold_tier::{CheckpointLoadGuard, resolve_persist_cold};
+use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard, resolve_persist_cold};
 use crate::engine::persistence::{
     KeyRule, RenameSpec, apply_rename_spec, cast_f32_tensors_to_bf16, dequant_fp8_weights,
     load_all_safetensors, prewarm_checkpoint_pages,
@@ -1237,7 +1237,8 @@ impl Lfm2Inner {
         let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
         let persist_cold =
             resolve_persist_cold(family, persist_env.as_deref(), config.persist_paged_cache);
-        let mut checkpoint_load = CheckpointLoadGuard::before_mmap(path, persist_cold);
+        let mut checkpoint_load =
+            CheckpointLoadGuard::before_read(CheckpointFiles::Dir(path), persist_cold);
 
         // Quantization settings (read straight from config.json's
         // `quantization` block). For dense bf16 checkpoints these are the
@@ -1248,7 +1249,7 @@ impl Lfm2Inner {
 
         // Load safetensors
         let mut params = load_all_safetensors(path, false)?;
-        checkpoint_load.record_mmap();
+        checkpoint_load.record_read();
 
         // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval of any
         // mmap-backed weight (FP8 dequant in `dequant_fp8_weights`, the tensor

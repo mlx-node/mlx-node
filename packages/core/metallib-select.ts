@@ -89,10 +89,37 @@ export const KQUANT_KERNEL_MARKERS = [
 ] as const;
 
 /**
- * Segmented SDPA (mlx_segmented_sdpa.cpp) and mixed BF16 x F32-sidecar affine
- * `qmv_wide` (mlx_affine_mixed_qmm.cpp) kernels, also loaded from
- * paged_attn.metallib with no JIT fallback: every one either dispatcher can
- * request.
+ * GGUF repack kernels (mlx_gguf_repack.cpp kernel table), loaded from
+ * paged_attn.metallib with no JIT fallback: every name of the table, which the
+ * Rust test gguf_repack_metallib_names compares with this list both ways.
+ */
+export const GGUF_REPACK_KERNEL_MARKERS = [
+  'mlx_node_gguf_repack_q4k',
+  'mlx_node_gguf_repack_q4k_t64',
+  'mlx_node_gguf_repack_q5k',
+  'mlx_node_gguf_repack_q5k_t64',
+  'mlx_node_gguf_repack_q6k',
+  'mlx_node_gguf_repack_q6k_t64',
+  'mlx_node_gguf_repack_iq4xs',
+  'mlx_node_gguf_repack_iq4xs_t64',
+  'mlx_node_gguf_repack_q3k',
+  'mlx_node_gguf_repack_q3k_t64',
+  'mlx_node_gguf_repack_iq4nl',
+  'mlx_node_gguf_repack_iq4nl_t64',
+  'mlx_node_gguf_repack_iq3s',
+  'mlx_node_gguf_repack_iq3s_t64',
+  'mlx_node_gguf_repack_q8_0',
+  'mlx_node_gguf_repack_mxfp4',
+  'mlx_node_gguf_repack_q4_0',
+  'mlx_node_gguf_repack_q5_1',
+  'mlx_node_gguf_repack_q8_0_bias',
+] as const;
+
+/**
+ * Segmented SDPA (mlx_segmented_sdpa.cpp), mixed BF16 x F32-sidecar affine
+ * `qmv_wide` (mlx_affine_mixed_qmm.cpp) and GGUF repack (mlx_gguf_repack.cpp)
+ * kernels, also loaded from paged_attn.metallib with no JIT fallback: every one
+ * the dispatchers can request.
  */
 export const BRIDGE_KERNEL_MARKERS = [
   'mlx_node_sdpa_segmented_bf16_256',
@@ -105,6 +132,7 @@ export const BRIDGE_KERNEL_MARKERS = [
   'mlx_node_affine_qmv_wide_mixed_q8g32_nv6',
   'mlx_node_affine_qmv_wide_mixed_q8g32_nv7',
   'mlx_node_affine_qmv_wide_mixed_q8g32_nv8',
+  ...GGUF_REPACK_KERNEL_MARKERS,
 ] as const;
 
 /** The K-quant NAX kernels. */
@@ -564,11 +592,19 @@ export function assertPagedMetallibIntegrity(metallib: Buffer, opts: { path: str
         `containing mlx-sys-*/out dir.`,
     );
   }
-  const missingBridge = BRIDGE_KERNEL_MARKERS.filter((name) => !metallib.includes(name));
+  const missingBridge = BRIDGE_KERNEL_MARKERS.filter((name) => {
+    if ((GGUF_REPACK_KERNEL_MARKERS as readonly string[]).includes(name)) {
+      // Base repack names also prefix their _t64 variants, so substring checks
+      // can hide a missing base kernel. Repack symbols are exact NUL-delimited names.
+      return !metallib.includes(`\0${name}\0`, 'latin1');
+    }
+    return !metallib.includes(name);
+  });
   if (missingBridge.length > 0) {
     throw new Error(
-      `[build.ts metallib gate] ${opts.path} is missing segmented SDPA / mixed-affine kernel(s) ` +
-        `${missingBridge.join(', ')} — mlx_segmented_sdpa.cpp and mlx_affine_mixed_qmm.cpp load ` +
+      `[build.ts metallib gate] ${opts.path} is missing segmented SDPA / mixed-affine kernel(s) or ` +
+        `GGUF repack kernel(s) ${missingBridge.join(', ')} — mlx_segmented_sdpa.cpp, ` +
+        `mlx_affine_mixed_qmm.cpp and mlx_gguf_repack.cpp load ` +
         `them from this library and have no JIT fallback. It was built by an older ` +
         `mlx-sys/build.rs. Re-run the native build; if it persists, remove the containing ` +
         `mlx-sys-*/out dir.`,

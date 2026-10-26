@@ -49,6 +49,54 @@ pub fn clear_cache() {
     }
 }
 
+thread_local! {
+    static FREE_RELEASED_SOURCES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Files whose [`FreeReleasedSources::enable`] ran with `on = true`, so a test
+/// can check that every GGUF loader turns the guard on.
+#[cfg(test)]
+pub(crate) static TEST_FREE_RELEASED_SITES: std::sync::Mutex<std::collections::BTreeSet<&str>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// While alive, each build eval point on this thread that can free source
+/// arrays ([`materialize_weights`] chunks, `release_tiled_kquant_sources`,
+/// eager CLEF residency units) also returns the freed buffers to the OS. Enable it for a build over a map
+/// whose arrays are all materialized up front (GGUF preload): nothing later in
+/// the build allocates source-sized buffers, so the freed sources would
+/// otherwise pile up in the MLX buffer cache until the build ends (+5.4 GiB
+/// peak footprint on Qwen3.8-27B, +0.7 GiB on Qwen3.6-35B-A3B). A lazy
+/// safetensors map reuses them for the next loads instead.
+#[must_use]
+pub struct FreeReleasedSources(bool);
+
+impl FreeReleasedSources {
+    #[track_caller]
+    pub fn enable(on: bool) -> Self {
+        #[cfg(test)]
+        if on {
+            TEST_FREE_RELEASED_SITES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(std::panic::Location::caller().file());
+        }
+        Self(FREE_RELEASED_SOURCES.with(|flag| flag.replace(on)))
+    }
+}
+
+impl Drop for FreeReleasedSources {
+    fn drop(&mut self) {
+        FREE_RELEASED_SOURCES.with(|flag| flag.set(self.0));
+    }
+}
+
+/// Call after a build eval point that may have freed source arrays.
+pub(crate) fn free_released_sources() {
+    if FREE_RELEASED_SOURCES.with(std::cell::Cell::get) {
+        clear_cache();
+    }
+}
+
 /// Synchronize GPU — block until all pending GPU work completes
 pub fn synchronize() {
     #[cfg(test)]
@@ -341,6 +389,13 @@ pub fn get_active_memory() -> f64 {
     if rc != 0 { 0.0 } else { v as f64 }
 }
 
+/// Active MLX allocations that admission cannot reclaim on demand: total
+/// active bytes minus volatile/empty anonymous banks.
+pub(crate) fn anonymous_active_memory() -> f64 {
+    let reclaimable = crate::array::purgeable::reclaimable_purgeable_bytes();
+    (get_active_memory() as u64).saturating_sub(reclaimable) as f64
+}
+
 /// Get cache memory size in bytes.
 /// Internal Rust-only function — use memoryCleanupThreshold config for
 /// memory-based cleanup. Returns 0.0 if the shim caught an exception.
@@ -488,6 +543,7 @@ fn eval_weight_materialize_chunk(
         chunk_bytes as f64 / (1u64 << 20) as f64,
         elapsed_ms(chunk_start),
     ));
+    free_released_sources();
     Ok(())
 }
 
@@ -666,6 +722,23 @@ mod tests {
             (0, 0),
             "an empty pass read no shard bytes, so its witness must not claim coverage"
         );
+    }
+
+    #[test]
+    fn materialize_frees_sources_only_under_the_guard() {
+        use crate::array::{DType, MxArray};
+
+        let clears = |guard: bool| {
+            let _free = guard.then(|| FreeReleasedSources::enable(true));
+            let a = MxArray::zeros(&[8], Some(DType::Float32)).unwrap();
+            let lazy = a.add(&a).unwrap();
+            let before = TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get);
+            materialize_weights(&[&lazy]).unwrap();
+            TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get) - before
+        };
+        assert_eq!(clears(false), 0, "lazy-map materialize cleared the cache");
+        assert_eq!(clears(true), 1, "preload materialize kept the cache");
+        assert_eq!(clears(false), 0, "guard leaked past its scope");
     }
 
     /// The witness has to describe the pass truthfully: a witness that

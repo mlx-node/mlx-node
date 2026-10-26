@@ -597,32 +597,16 @@ impl Qwen3_5Model {
             .map(|value| crate::transformer::KvFormat::parse(Some(value)))
             .transpose()
             .map_err(|message| Error::from_reason(format!("Qwen3.5 load: {message}")))?;
-        let source = std::path::Path::new(&path);
-        if source.is_file()
-            && source
-                .extension()
-                .and_then(|value| value.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
-        {
-            let cache = crate::utils::gguf::prepare_qwen35_native_gguf(source).await?;
-            // prepare leases `cache` for the loaded model's lifetime; a
-            // failed init must release that reference or the entry is pinned
-            // against the cache cap for the rest of the process.
-            return match persistence::load_with_thread(
-                &cache.to_string_lossy(),
-                draft_model_path,
-                kv_format,
-            )
-            .await
-            {
-                Ok(model) => Ok(model),
-                Err(error) => {
-                    crate::utils::gguf::native_gguf_unlease_in_use(&cache);
-                    Err(error)
-                }
-            };
+        let source = crate::engine::checkpoint_source::CheckpointSource::resolve(
+            std::path::Path::new(&path),
+            crate::utils::gguf::NativeGgufFamily::Qwen35,
+        )
+        .await?;
+        let loaded = persistence::load_with_source(&source, draft_model_path, kv_format).await;
+        if loaded.is_err() {
+            source.release_lease();
         }
-        persistence::load_with_thread(&path, draft_model_path, kv_format).await
+        loaded
     }
 
     /// Generate text from a prompt token sequence.

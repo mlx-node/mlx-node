@@ -513,7 +513,7 @@ impl Lfm2Inner {
         };
         crate::cold_tier::build_model_fingerprint(
             family,
-            model_path,
+            crate::cold_tier::CheckpointFiles::Dir(std::path::Path::new(model_path)),
             Some(&config_json),
             &pool_geometry,
             weights,

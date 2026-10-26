@@ -262,7 +262,7 @@ impl Store {
     }
 
     /// Fixed projections with their dense compute copies: the hot set minus
-    /// routed experts, what the mapped budget must hold as banks.
+    /// routed experts, which the direct gate holds beside expert banks.
     pub(super) fn fixed_projection_bytes(&self) -> Result<u64> {
         self.tensors
             .iter()
@@ -274,10 +274,14 @@ impl Store {
     }
 
     pub(in super::super) fn prepare_hot(&mut self) -> Result<()> {
-        self.prepare_hot_with_policy(
-            &mut super::super::memory::admit,
-            &mut super::super::memory::refresh_plan,
-        )
+        if self.plan.direct || self.slot_bank_budget.is_some() {
+            self.prepare_hot_with_policy(&mut super::super::memory::admit_direct, &mut |_| Ok(()))
+        } else {
+            self.prepare_hot_with_policy(
+                &mut super::super::memory::admit,
+                &mut super::super::memory::refresh_plan,
+            )
+        }
     }
 
     #[cfg(test)]
@@ -313,14 +317,20 @@ impl Store {
         if !self.banks.is_empty() {
             return Ok(());
         }
-        if !self.slots.is_empty() {
+        if !self.slots.is_empty() && !self.plan.direct {
             return Err(err(
                 "Qwen4 bank residency must be prepared before expert execution",
             ));
         }
         // Pool creation happens after metadata bootstrap and is invisible to
         // MLX allocation counters. Reconcile against live headroom before IO.
-        if self.cache_bytes == 0 && self.plan.available_bytes.is_some() {
+        // A direct plan already contains its allocated banks and uses the
+        // full-bank gate; the slot bootstrap rule would shrink it incorrectly.
+        if self.cache_bytes == 0
+            && self.plan.available_bytes.is_some()
+            && !self.plan.direct
+            && self.slot_bank_budget.is_none()
+        {
             refresh(&mut self.plan)?;
             self.cache_limit = self.plan.budget;
         }
@@ -330,7 +340,11 @@ impl Store {
         }
         // Admit the whole set before reading any payload, then recheck live
         // headroom during growth in case another application starts allocating.
-        admit(self.cache_limit)?;
+        // Direct banks were admitted and allocated by the full-bank selector;
+        // dense banks are admitted individually below to avoid double count.
+        if !self.plan.direct {
+            admit(self.cache_limit)?;
+        }
         if self.prepare_banks(names, admit)? && admit(super::super::memory::WORKING_BYTES).is_ok() {
             return Ok(());
         }
@@ -348,14 +362,20 @@ impl Store {
         self.protected_bytes = 0;
         self.bank_bytes = 0;
         self.mtp_banks_declined = false;
-        self.cache_bytes = 0;
+        self.cache_bytes = if self.plan.direct { self.slot_bytes } else { 0 };
         self.growth_bytes = 0;
         self.plan.resident_bank_bytes.store(0, Ordering::Relaxed);
-        self.plan.partial_expert_slots = 0;
+        if !self.plan.direct {
+            self.plan.partial_expert_slots = 0;
+        }
         crate::array::memory::synchronize_and_clear_cache();
-        refresh(&mut self.plan)?;
-        self.cache_limit = self.plan.budget;
-        self.slot_capacity = None;
+        if self.slot_bank_budget.is_none() {
+            refresh(&mut self.plan)?;
+            self.cache_limit = self.plan.budget;
+        }
+        if !self.plan.direct {
+            self.slot_capacity = None;
+        }
         let names = self.projection_bank_names()?;
         if !self.prepare_banks(names, admit)? {
             return Err(err(
@@ -370,10 +390,12 @@ impl Store {
         // Fixed projections get at most a quarter, leaving most RAM for experts.
         let mut names = Vec::new();
         let mut bytes = 0u64;
-        // The mapped budget holds no experts: banks may take all but the
-        // LRU room memory::mapped_desired reserved.
-        let cap = if self.plan.mapped {
-            self.cache_limit.saturating_sub(2 << 30)
+        // Full direct experts are gated separately: fixed banks may take all
+        // but the LRU room memory::direct_desired reserved.
+        let cap = if self.plan.direct {
+            self.cache_limit
+                .saturating_sub(self.slot_bytes)
+                .saturating_sub(2 << 30)
         } else {
             self.cache_limit / 4
         };
@@ -583,8 +605,8 @@ impl Store {
             .collect()
     }
 
-    /// What the draft banks may take: the mapped plan's charge for them, or
-    /// the slot path's auxiliary allowance.
+    /// What the draft banks may take: the direct plan's charge for them, or
+    /// the partial path's auxiliary allowance.
     fn mtp_bank_allowance(&self) -> Result<u64> {
         if self.draft_bank_budget > 0 {
             Ok(self.draft_bank_budget)
@@ -593,7 +615,7 @@ impl Store {
         }
     }
 
-    /// Anonymous bytes the draft banks take once built: what a mapped plan
+    /// Anonymous bytes the draft banks take once built: what a direct plan
     /// charges beside the dense banks while the MTP head is attached, so the
     /// live-memory gate and the bank admission see the same number. The f32
     /// sides only when the allowance holds them, as in the admission.
@@ -840,7 +862,12 @@ impl Store {
                 if compatible && bytes <= MAX_READ_BYTES * 3 {
                     // Pairing is optional; existing projections remain
                     // valid when transient concatenation cannot be admitted.
-                    if super::super::memory::admit(bytes).is_err() {
+                    let admitted = if self.plan.direct || self.slot_bank_budget.is_some() {
+                        super::super::memory::admit_direct(bytes)
+                    } else {
+                        super::super::memory::admit(bytes)
+                    };
+                    if admitted.is_err() {
                         return Ok((self.linear(first, x)?, self.linear(second, x)?));
                     }
                     let joined = Arc::new(Weight::concatenate_rows(&[a.clone(), b.clone()])?);
@@ -1555,7 +1582,8 @@ mod tests {
                 } else {
                     Ok(())
                 }
-            });
+            })
+            .unwrap();
             assert_eq!(seen[..2], [staging(wide), staging(narrow)], "built={built}");
             if built {
                 assert_eq!(s.mtp_bank_bytes().unwrap(), narrow + down);
@@ -1607,7 +1635,7 @@ mod tests {
                     .keys()
                     .all(|n| is_fixed_projection(n, &s.tensors[n]))
             );
-            let loaded = (s.bytes_read, s.packed_bytes_read);
+            let loaded = s.bytes_read;
             let mut control =
                 Store::open_metadata(&path, Some(&Store::fixture_pack_root())).unwrap();
             for name in names {
@@ -1630,7 +1658,7 @@ mod tests {
                     assert_eq!(&*got, &*want, "partial bank changed {name}, row {start}");
                 }
             }
-            assert_eq!((s.bytes_read, s.packed_bytes_read), loaded);
+            assert_eq!(s.bytes_read, loaded);
             let expert = s
                 .tensors
                 .keys()
@@ -1661,7 +1689,7 @@ mod tests {
                     .all(|name| is_fixed_projection(name, &s.tensors[name]))
             );
             assert!(!s.banks.is_empty());
-            let reads = (s.bytes_read, s.packed_hits, s.packed_bytes_read);
+            let reads = s.bytes_read;
             let mut reference =
                 Store::open_metadata(&path, Some(&Store::fixture_pack_root())).unwrap();
             for name in s.banks.keys().cloned().collect::<Vec<_>>() {
@@ -1685,7 +1713,7 @@ mod tests {
                 }
                 assert!(s.read(&name, rows, 1).is_err());
             }
-            assert_eq!((s.bytes_read, s.packed_hits, s.packed_bytes_read), reads);
+            assert_eq!(s.bytes_read, reads);
             for name in [
                 "token_embd.weight",
                 "embed_tokens.weight",

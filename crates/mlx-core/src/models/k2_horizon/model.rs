@@ -384,7 +384,7 @@ impl K2Inner {
         };
         match crate::cold_tier::build_model_fingerprint(
             "k2_horizon",
-            model_path,
+            crate::cold_tier::CheckpointFiles::Dir(std::path::Path::new(model_path)),
             config_json.as_deref(),
             &geometry,
             weights,

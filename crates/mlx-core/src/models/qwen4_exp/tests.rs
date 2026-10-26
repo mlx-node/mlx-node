@@ -40,14 +40,108 @@ pub(super) fn argmax(logits: &MxArray) -> u32 {
         .unwrap()
 }
 
-/// The served load: the mapped pack with `pool_bytes` of paged KV beside it.
+/// The served load with `pool_bytes` of paged KV beside it.
 pub(super) fn go_live(decoder: &mut decoder::Decoder, pool_bytes: u64) {
     decoder.register_cache_limit();
-    decoder.weights.prepare_mapped_pack().unwrap();
-    decoder.weights.select_mapped_residency(pool_bytes).unwrap();
+    decoder.weights.select_residency(pool_bytes).unwrap();
     decoder.weights.prepare_hot().unwrap();
+    decoder.weights.start_direct_fill().unwrap();
     decoder.weights.publish_live();
     decoder.residency_changed();
+}
+
+/// Small direct-ready Qwen4 checkpoint: the stock tensors plus Q5_1 routed
+/// experts and a minimal embedded tokenizer. The returned config matches the
+/// widened routed geometry used by the GGUF metadata.
+pub(super) fn write_direct_gguf_fixture(path: &Path) -> config::Config {
+    use crate::utils::gguf::{GgufMetaValue, GgufTensorType, parse_gguf};
+    use crate::utils::gguf_test_fixtures::build_minimal_gguf;
+
+    let fixture = fixture().join("bf16/paged");
+    let source_path = fixture.join("model.gguf");
+    let source = parse_gguf(&source_path).unwrap();
+    let source_bytes = std::fs::read(&source_path).unwrap();
+    let mut raw_config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.join("config.json")).unwrap()).unwrap();
+    raw_config["text_config"]["moe_intermediate_size"] = 32.into();
+    let config = config::Config::parse(&raw_config).unwrap();
+    let experts = config.num_experts;
+    let mut tensors = Vec::new();
+    for tensor in &source.tensors {
+        if let Some((layer, part)) = weights::routed_expert_tensor(&tensor.name) {
+            let mut data = Vec::new();
+            for block in 0..experts * 32 {
+                data.extend(half::f16::from_f32(0.015625).to_bits().to_le_bytes());
+                data.extend(half::f16::from_f32(-0.25).to_bits().to_le_bytes());
+                for byte in 0..20 {
+                    data.push((block * 29 + byte * 17 + layer * 31 + part * 43) as u8);
+                }
+            }
+            tensors.push((
+                tensor.name.clone(),
+                vec![32, 32, experts as u64],
+                GgufTensorType::Q5_1,
+                data,
+            ));
+        } else {
+            let start = usize::try_from(source.data_offset + tensor.offset).unwrap();
+            let end = start + usize::try_from(tensor.data_size().unwrap()).unwrap();
+            tensors.push((
+                tensor.name.clone(),
+                tensor.dims.clone(),
+                tensor.tensor_type,
+                source_bytes[start..end].to_vec(),
+            ));
+        }
+    }
+    let mut metadata: Vec<(String, GgufMetaValue)> = source
+        .metadata
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    for (key, value) in [
+        (
+            "qwen4exp.expert_count",
+            GgufMetaValue::Uint32(experts as u32),
+        ),
+        (
+            "qwen4exp.expert_feed_forward_length",
+            GgufMetaValue::Uint32(32),
+        ),
+        (
+            "qwen4exp.expert_used_count",
+            GgufMetaValue::Uint32(config.num_experts_per_tok as u32),
+        ),
+        ("tokenizer.ggml.model", GgufMetaValue::String("gpt2".into())),
+        (
+            "tokenizer.ggml.tokens",
+            GgufMetaValue::ArrayString(vec!["old".into()]),
+        ),
+        (
+            "tokenizer.ggml.token_type",
+            GgufMetaValue::ArrayI32(vec![1]),
+        ),
+        (
+            "tokenizer.ggml.merges",
+            GgufMetaValue::ArrayString(Vec::new()),
+        ),
+    ] {
+        if let Some((_, current)) = metadata.iter_mut().find(|(name, _)| name == key) {
+            *current = value;
+        } else {
+            metadata.push((key.into(), value));
+        }
+    }
+    let metadata: Vec<_> = metadata
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.clone()))
+        .collect();
+    let descriptors: Vec<_> = tensors
+        .iter()
+        .map(|(name, dims, ty, data)| (name.as_str(), dims.as_slice(), *ty, data.as_slice()))
+        .collect();
+    std::fs::write(path, build_minimal_gguf(&metadata, &descriptors)).unwrap();
+    config
 }
 
 /// The prompt in `prefill_slice_size` chunks; the logits of the last one.
@@ -1111,6 +1205,96 @@ impl Drop for Temp {
     }
 }
 
+/// Production load, not the real-checkpoint memory oracle: the child gets a
+/// fresh HOME and asset root, builds its small direct banks, and leaves no
+/// derived weight-pack directory or file behind.
+#[test]
+fn flash_next_load_writes_no_derived_weight_pack() {
+    const CHILD: &str = "MLX_QWEN4_NO_PACK_CHILD";
+    const MODEL: &str = "MLX_QWEN4_NO_PACK_MODEL";
+    if std::env::var_os(CHILD).is_some() {
+        let model_path = std::env::var(MODEL).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let model = Qwen4ExpModel::load(model_path, None).await.unwrap();
+                let initial = model.residency_info();
+                assert!(initial.direct);
+                assert!(initial.direct_layers > 0);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    let current = model.residency_info();
+                    if current.direct_filled_layers == current.direct_layers
+                        && !current.direct_fill_in_progress
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "direct fill did not finish"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            });
+        return;
+    }
+    if !crate::utils::gguf_gpu::gpu_repack_available() {
+        return;
+    }
+    let temp = Temp::new();
+    let model = temp.0.join("direct.gguf");
+    write_direct_gguf_fixture(&model);
+    let home = temp.0.join("fresh-research-home");
+    let assets = home.join("native-gguf");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "models::qwen4_exp::tests::flash_next_load_writes_no_derived_weight_pack",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env(MODEL, &model)
+        .env(memory::FIXTURE_HOST_ENV, "1")
+        .env("HOME", &home)
+        .env("MLX_NATIVE_GGUF_CACHE_DIR", &assets)
+        .env_remove("MLX_QWEN4_RESIDENCY")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child load failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        assets.exists(),
+        "the small non-weight asset sidecar was not used"
+    );
+    assert!(!home.join("Library/Caches/mlx-node/qwen4-packed").exists());
+    let mut observed = Vec::new();
+    let mut pending = vec![home.clone()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy();
+            assert!(
+                !name.starts_with(".mlx-qwen4-mapped-") && !name.starts_with(".mlx-qwen4-packed-"),
+                "derived weight pack written at {}",
+                path.display()
+            );
+            if path.is_dir() {
+                pending.push(path.clone());
+            } else {
+                observed.push(path.strip_prefix(&home).unwrap().display().to_string());
+            }
+        }
+    }
+    observed.sort();
+    eprintln!("fresh Flash Next load wrote non-weight assets only: {observed:?}");
+}
+
 fn gguf_string(bytes: &mut Vec<u8>, s: &str) {
     bytes.extend_from_slice(&(s.len() as u64).to_le_bytes());
     bytes.extend_from_slice(s.as_bytes());
@@ -2139,7 +2323,7 @@ fn tiny_decoder() -> (decoder::Decoder, media::Vision) {
 /// pack stream).
 fn inner_over(mut decoder: decoder::Decoder, vision: media::Vision, has_mtp: bool) -> Inner {
     if has_mtp {
-        decoder.weights.finish_fixture_load();
+        decoder.weights.finish_fixture_load().unwrap();
     }
     let tokenizer_dir = Temp::new();
     let tokenizer_path = tokenizer_dir.0.join("tokenizer.json");
@@ -2354,86 +2538,6 @@ fn scheduled_owner_switch_does_not_inherit_another_requests_cancellation() {
     assert!(inner.decoder.check_cancelled().is_err());
 }
 
-/// Scheduled turns overlap on one model, and residency and the tripwire
-/// window are per model: the first turn to open on an idle model starts the
-/// window (disk baseline, slow streak), later admissions join it, a finish
-/// beside an open turn keeps it, and the first admission after the set
-/// empties starts a new one. The exclusive lane's flag pair is one window.
-///
-/// MUTATION: `scheduled_turn_opened` passes `first = true` for
-/// every admission; the second admission re-baselines and the SENTINEL
-/// assertions fail.
-#[test]
-fn scheduled_turns_share_one_tripwire_window_until_the_last_one_closes() {
-    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
-    use std::time::Duration;
-    const SENTINEL: u64 = u64::MAX - 1;
-    let mut inner = tiny_inner();
-    let poison = |inner: &mut Inner| {
-        let wire = inner.decoder.weights.tripwire_mut();
-        wire.begin_turn(SENTINEL);
-        for _ in 0..8 {
-            wire.observe(1, Duration::from_millis(25), SENTINEL, 0, || false);
-        }
-        for _ in 0..3 {
-            wire.observe(1, Duration::from_millis(2_400), SENTINEL, 0, || false);
-        }
-        assert_eq!((wire.turn_start_reads(), wire.slow_streak()), (SENTINEL, 3));
-    };
-    let window = |inner: &mut Inner| {
-        let wire = inner.decoder.weights.tripwire_mut();
-        (wire.turn_start_reads(), wire.slow_streak())
-    };
-    poison(&mut inner);
-    inner.scheduled_turn_opened(1);
-    let (base, streak) = window(&mut inner);
-    assert_ne!(base, SENTINEL, "the first admission starts a window");
-    assert_eq!(streak, 0);
-    poison(&mut inner);
-    inner.scheduled_turn_opened(2);
-    assert_eq!(
-        window(&mut inner),
-        (SENTINEL, 3),
-        "a second admission joins the window"
-    );
-    inner.scheduled_turn_closed(1);
-    assert_eq!(
-        window(&mut inner),
-        (SENTINEL, 3),
-        "a finish beside an open turn keeps the window"
-    );
-    inner.scheduled_turn_closed(2);
-    assert!(inner.open_turns.is_empty());
-    assert_eq!(window(&mut inner), (SENTINEL, 3), "a close never baselines");
-    inner.scheduled_turn_opened(3);
-    assert_ne!(
-        window(&mut inner).0,
-        SENTINEL,
-        "the set emptied: a new window"
-    );
-    assert_eq!(window(&mut inner).1, 0);
-    inner.scheduled_turn_closed(3);
-    poison(&mut inner);
-    inner.set_turn_cancel_flag(Some(Arc::new(AtomicBool::new(false))));
-    assert_ne!(
-        window(&mut inner).0,
-        SENTINEL,
-        "an exclusive turn is a window"
-    );
-    poison(&mut inner);
-    inner.set_turn_cancel_flag(Some(Arc::new(AtomicBool::new(false))));
-    assert_eq!(
-        window(&mut inner),
-        (SENTINEL, 3),
-        "a flag re-installed inside the turn is the same window"
-    );
-    inner.set_turn_cancel_flag(None);
-    assert_eq!(window(&mut inner), (SENTINEL, 3));
-    inner.set_turn_cancel_flag(Some(Arc::new(AtomicBool::new(false))));
-    assert_ne!(window(&mut inner).0, SENTINEL, "the next exclusive turn");
-    inner.set_turn_cancel_flag(None);
-}
-
 /// Two owned turns admitted back to back overlap on the scheduler: both are
 /// open at once, and the set is empty once both finished, so the close runs
 /// on the normal finish path.
@@ -2512,7 +2616,6 @@ fn a_turn_opens_with_the_prefill_window_of_the_plan_in_force() {
     );
     assert!(admitted >= 4);
     let mut plan = inner.decoder.weights.plan.clone();
-    plan.mapped = false;
     plan.available_bytes = None;
     plan.physical_bytes = None;
     plan.budget = 16 * memory::prefill_scratch(&config, admitted / 4);
@@ -2535,7 +2638,7 @@ fn a_turn_opens_with_the_prefill_window_of_the_plan_in_force() {
 
 /// Rows of every prefill pass over `prompt` when the admitted window is cut
 /// from `wide` to `narrow` after the first pass, as a pass that leaves the
-/// mapped path does through `Decoder::residency_changed`.
+/// plan change does through `Decoder::residency_changed`.
 fn prefill_pass_rows(
     inner: &mut Inner,
     paged: bool,
@@ -2577,8 +2680,8 @@ fn prefill_pass_rows(
         .unwrap()
 }
 
-/// A mapped prefill that trips mid-prompt leaves the rest of the prompt a
-/// smaller window (the slot allowance's), and every pass after the switch
+/// A prefill whose admitted plan narrows mid-prompt uses the smaller
+/// window for every later pass
 /// must take it: the whole-prompt loops read the admitted slice before each
 /// pass instead of once before the loop.
 ///
@@ -2745,7 +2848,7 @@ fn the_load_builds_the_draft_banks_only_with_the_head() {
 
     let mut text_only = weights::Store::open_fixture(&fixture(), None).unwrap();
     let before = text_only.plan.resident_bank_bytes.load(Ordering::Relaxed);
-    text_only.finish_fixture_load();
+    text_only.finish_fixture_load().unwrap();
     assert_eq!(text_only.mtp_bank_bytes().unwrap(), 0);
     assert_eq!(
         text_only.plan.resident_bank_bytes.load(Ordering::Relaxed),
@@ -7781,7 +7884,7 @@ fn row_batched_decode_kernels_match_single_row_calls_bit_for_bit() {
 }
 
 /// Greedy decode of `QWEN4_EXP_REAL_STEPS` tokens (default 256) per
-/// `QWEN4_EXP_REAL_CASES` case on the mapped pack. Each case's argmax must
+/// `QWEN4_EXP_REAL_CASES` case with direct GGUF residency. Each argmax must
 /// equal `QWEN4_EXP_REAL_EXPECTED` (the `QWEN4_EXP_REAL_OUT` of an earlier
 /// run); this run writes its own `QWEN4_EXP_REAL_OUT`. `QWEN4_EXP_REAL_INPUTS`
 /// is `{name, tokenIds}` cases from `oxnode scripts/benchmark-fixture.ts
@@ -7804,8 +7907,8 @@ fn real_model_greedy_argmax_matches_expected() {
     let mut decoder = decoder::Decoder::new(config, store).unwrap();
     go_live(&mut decoder, 0);
     eprintln!(
-        "greedy residency: mapped={} slots={} budget={:.1} GiB window={}",
-        decoder.weights.plan.mapped,
+        "greedy residency: direct={} slots={} budget={:.1} GiB window={}",
+        decoder.weights.plan.direct,
         decoder.weights.plan.partial_expert_slots,
         decoder.weights.plan.budget as f64 / (1u64 << 30) as f64,
         decoder.prefill_chunk_size
@@ -7816,7 +7919,10 @@ fn real_model_greedy_argmax_matches_expected() {
     out.insert(
         "residency".into(),
         serde_json::json!({
-            "mapped": decoder.weights.plan.mapped,
+            "direct": decoder.weights.plan.direct,
+            "directBytes": decoder.weights.plan.direct_bytes,
+            "directLayers": decoder.weights.plan.direct_layers,
+            "directFilledLayers": decoder.weights.live.direct_filled_layers.load(Ordering::Acquire),
             "slots": decoder.weights.plan.partial_expert_slots,
         }),
     );
@@ -7824,9 +7930,7 @@ fn real_model_greedy_argmax_matches_expected() {
     for case in real_cases() {
         let prompt = real_prompt(Path::new(&inputs), &case);
         decoder.reset();
-        if decoder.weights.begin_turn().unwrap().is_some() {
-            eprintln!("greedy WARNING: a slot fallback was applied before {case}");
-        }
+        decoder.weights.begin_turn().unwrap();
         let group = decoder.group_mode(prompt.len());
         let mut logits = decoder.prefill_prompt(&prompt).unwrap();
         let mut tokens = Vec::with_capacity(steps);
@@ -7838,14 +7942,14 @@ fn real_model_greedy_argmax_matches_expected() {
             }
         }
         eprintln!(
-            "greedy {case}: prompt={} as {} mapped={} slots={} tokens={:?}",
+            "greedy {case}: prompt={} as {} direct={} slots={} tokens={:?}",
             prompt.len(),
             if group {
                 "one layer-major group"
             } else {
                 "windows"
             },
-            decoder.weights.plan.mapped,
+            decoder.weights.plan.direct,
             decoder.weights.plan.partial_expert_slots,
             &tokens[..16.min(tokens.len())]
         );
@@ -7900,15 +8004,11 @@ fn real_model_greedy_argmax_matches_expected() {
     );
 }
 
-/// Real-model verify against AR on the mapped pack, paged as served: owner 1
-/// decodes greedy AR steps; owner 2 runs 32 teacher-forced verifies of three
-/// of those tokens beside owner 3's one- and two-row verifies, a third of
-/// which reject a poisoned draft. Every verified row of an accepted
-/// prefix carries the AR step's logits bits, no layer reads its routes
-/// through `read_routes`, and both owners then continue AR exactly. A verify
-/// that trips the wire keeps those bits and checks its tape against the
-/// mapped banks before the store moves to slots, where the next verify reads
-/// every layer's routes back, with the same bits.
+/// Real-model verify against AR with full direct banks, paged as served:
+/// owner 1 decodes greedy AR steps; owner 2 runs teacher-forced verifies of
+/// three tokens beside owner 3's one- and two-row verifies, including
+/// poisoned-draft rejection. Accepted rows carry the AR logits bits, no layer
+/// reads routes back, and both owners continue AR exactly.
 #[test]
 #[ignore = "real checkpoint: QWEN4_EXP_REAL_MODEL, QWEN4_EXP_REAL_INPUTS; --test-threads=1"]
 fn real_model_verify_rows_match_ar_steps() {
@@ -7928,8 +8028,8 @@ fn real_model_verify_rows_match_ar_steps() {
     decoder.paged = Some(adapter);
     go_live(&mut decoder, pool_bytes);
     assert!(
-        decoder.weights.plan.mapped,
-        "the live host refused the pack"
+        decoder.weights.plan.direct,
+        "the live host refused full direct banks"
     );
     let mut inner = inner_over(decoder, vision, false);
     let layers = config.num_hidden_layers;
@@ -8038,7 +8138,7 @@ fn real_model_verify_rows_match_ar_steps() {
     assert_eq!(
         inner.decoder.route_readbacks - readbacks,
         0,
-        "a mapped verify read its routes back through read_routes"
+        "a full-direct verify read its routes back through read_routes"
     );
     let hit = inner.decoder.weights.slot_hits - hits;
     assert!(
@@ -8054,91 +8154,6 @@ fn real_model_verify_rows_match_ar_steps() {
             "owner {seq} does not continue AR exactly after its verifies"
         );
     }
-
-    // The wire takes this verify's own pass as the eighth slow 3-row pass.
-    inner.activate_paged_seq(2).unwrap();
-    let front = front2 + 1;
-    let mapped = inner.decoder.weights.plan.mapped_bytes;
-    let wire = inner.decoder.weights.tripwire_mut();
-    *wire = tripwire::Tripwire::default();
-    let reads = memory::process_disk_reads();
-    wire.begin_turn(reads);
-    for _ in 0..8 {
-        wire.observe(
-            3,
-            std::time::Duration::from_micros(1),
-            reads,
-            mapped,
-            || false,
-        );
-    }
-    for _ in 0..7 {
-        wire.observe(3, std::time::Duration::from_secs(1), reads, mapped, || {
-            false
-        });
-    }
-    assert!(wire.tripped().is_none() && wire.slow_streak() == 7);
-    let readbacks = inner.decoder.route_readbacks;
-    let verified = inner
-        .verify_mtp(&[ScheduledVerifyRow {
-            seq_id: 2,
-            first_position: (prompt.len() + front) as u32,
-            tokens: tokens[front..front + 3].to_vec(),
-            speculative: true,
-        }])
-        .expect("a verify that trips the wire must keep its mapped rows");
-    assert!(
-        !inner.decoder.weights.plan.mapped
-            && matches!(
-                inner.decoder.weights.live.fallback(),
-                Some(tripwire::Fallback::SlowSteps { rows: 3, .. })
-            ),
-        "the primed verify did not trip the wire"
-    );
-    assert_eq!(
-        inner.decoder.route_readbacks, readbacks,
-        "the tripping verify read its routes back through read_routes"
-    );
-    for j in 0..3 {
-        assert!(
-            bits(&verified.slice_axis(0, j, j + 1).unwrap()) == ar[front + j as usize],
-            "the tripping verify row {j} differs from AR step {}",
-            front + j as usize
-        );
-    }
-    inner
-        .commit_mtp(&[ScheduledVerifyCommit { seq_id: 2, keep: 3 }])
-        .unwrap()
-        .remove(0)
-        .unwrap();
-
-    let front = front + 3;
-    let readbacks = inner.decoder.route_readbacks;
-    let verified = inner
-        .verify_mtp(&[ScheduledVerifyRow {
-            seq_id: 2,
-            first_position: (prompt.len() + front) as u32,
-            tokens: tokens[front..front + 3].to_vec(),
-            speculative: true,
-        }])
-        .unwrap();
-    assert_eq!(
-        inner.decoder.route_readbacks - readbacks,
-        layers as u64,
-        "a verify over slots must read every layer's routes on the host"
-    );
-    for j in 0..3 {
-        assert!(
-            bits(&verified.slice_axis(0, j, j + 1).unwrap()) == ar[front + j as usize],
-            "the slot verify row {j} differs from AR step {}",
-            front + j as usize
-        );
-    }
-    inner
-        .commit_mtp(&[ScheduledVerifyCommit { seq_id: 2, keep: 3 }])
-        .unwrap()
-        .remove(0)
-        .unwrap();
 }
 
 fn xorshift(seed: u32) -> impl FnMut() -> u32 {
@@ -8357,8 +8372,8 @@ fn mixer_act_split_keeps_the_one_simdgroup_chain_bit_for_bit() {
 
 // ---- layer-major prefill groups ----------------------------------------------
 // The fixture fails the tentative gate (hidden 32, BF16 experts), so these
-// run the plain path; `real_model_group_matches_window_at_a_time_on_a_cold_pack`
-// proves the tentative/mapped group on the real checkpoint.
+// run the plain path; `real_model_group_matches_window_at_a_time_during_direct_fill`
+// proves the tentative/direct group on the real checkpoint.
 
 /// A paged GGUF fixture decoder whose admitted window is `width` tokens.
 fn group_fixture_decoder(width: usize, seq: u32) -> decoder::Decoder {
@@ -8380,6 +8395,19 @@ fn group_prompt() -> Vec<u32> {
     (0..53)
         .map(|i| ((i * 13 + i / 4) % 61 + 2) as u32)
         .collect()
+}
+
+#[test]
+fn direct_fill_progress_enables_the_layer_major_group_gate() {
+    let mut decoder = group_fixture_decoder(256, 1);
+    decoder.weights.plan.direct = true;
+    decoder.weights.set_direct_fill_pass_for_test(true);
+    assert!(decoder.group_mode(600));
+    decoder.weights.set_direct_fill_pass_for_test(false);
+    assert!(!decoder.group_mode(600));
+    decoder.weights.set_direct_fill_pass_for_test(true);
+    decoder.weights.plan.direct = false;
+    assert!(!decoder.group_mode(600));
 }
 
 fn f32s(a: &MxArray) -> Vec<f32> {
@@ -8550,74 +8578,11 @@ fn a_group_records_its_windows_up_front_and_the_tail_records_itself() {
     assert_eq!(decoder.history, prompt);
 }
 
-/// A trip held at the end of a sweep: the group's frontier is evaluated
-/// first, the store then leaves the mapped path (here: nothing to leave, the
-/// trip is consumed), and the remaining sweeps finish with the same bytes.
-/// `apply_held_trip` itself is proven on a mapped store in
-/// `weights::mapped_tests::observe_sweep_holds_the_trip_and_apply_held_trip_switches`.
-/// MUTATION: `switch_mid_group` applies the trip
-/// before the frontier eval -> "the frontier is evaluated before" fails.
-#[test]
-fn a_trip_between_sweeps_evaluates_the_group_before_the_switch_and_finishes() {
-    use super::tripwire::Fallback;
-    let prompt = group_prompt();
-    let mut tripped = group_fixture_decoder(16, 1);
-    let mut plain = group_fixture_decoder(16, 2);
-    tripped.after_sweep = Some(Box::new(|d, layer| {
-        if layer == 1 {
-            d.weights.trip(Fallback::SsdReads {
-                read: 3000,
-                mapped: 1000,
-            });
-        }
-    }));
-    let (windows, tail) = tripped.group_windows(&prompt);
-    let (logits, _) = tripped.prefill_group(&windows, tail, true, false).unwrap();
-    let (expected, _) = plain.prefill_group(&windows, tail, true, false).unwrap();
-    assert_eq!(f32s(&logits), f32s(&expected), "logits");
-    assert_eq!(frontier_bytes(&tripped), frontier_bytes(&plain));
-    let log = tripped.submit_log.borrow().clone();
-    let at = |event: &str| {
-        log.iter()
-            .position(|e| e == event)
-            .unwrap_or_else(|| panic!("{event} in {log:?}"))
-    };
-    assert!(
-        at("qwen4::group::frontier") < at("qwen4::group::trip"),
-        "the frontier is evaluated before the store may leave the mapped path: {log:?}"
-    );
-    assert_eq!(
-        log.iter()
-            .filter(|e| *e == "qwen4::group::frontier")
-            .count(),
-        1,
-        "one switch per group"
-    );
-    assert_eq!(
-        log[..at("qwen4::group::frontier")]
-            .iter()
-            .filter(|e| *e == "qwen4::batch::mlp")
-            .count(),
-        6,
-        "sweeps 0 and 1 of three windows ran before the frontier eval"
-    );
-    assert!(
-        !log.contains(&"qwen4::group::switch".to_owned()),
-        "the fixture store is not mapped: nothing to leave"
-    );
-    assert!(
-        tripped.weights.tripwire_mut().tripped().is_none(),
-        "the held trip was consumed"
-    );
-    assert!(!tripped.weights.group_in_progress());
-    assert_eq!(tripped.weights.pending_touches(), 0);
-}
-
 /// The whole-prompt step follows group mode: never on the plain
 /// fixture store, and with group mode pinned on only for a suffix of more
 /// than one window.
 /// MUTATION: the `paged.rs` hook returns true -> "the
-/// fixture store is not mapped" fails.
+/// fixture has no direct fill" fails.
 #[test]
 fn the_whole_prompt_hook_follows_group_mode() {
     use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
@@ -8625,7 +8590,7 @@ fn the_whole_prompt_hook_follows_group_mode() {
     inner.decoder.prefill_chunk_size = 16;
     assert!(
         !inner.scheduler_whole_prompt_prefill(53, 0),
-        "the fixture store is not mapped"
+        "the fixture has no direct fill"
     );
     inner.decoder.group_pin = Some(true);
     assert!(inner.scheduler_whole_prompt_prefill(53, 0));
@@ -8645,12 +8610,12 @@ fn the_whole_prompt_hook_follows_group_mode() {
     assert!(!inner.scheduler_whole_prompt_prefill(53, 0));
 }
 
-/// The tripwire sees one sample per window (the group's time shared by
+/// The pass log sees one sample per window (the group's time shared by
 /// rows) and the tail pass its own, after the group.
 /// MUTATION: `group_windows` keeps the short final
 /// window in the group -> no tail pass; "the tail runs after the group" fails.
 #[test]
-fn a_group_feeds_the_tripwire_one_sample_per_window_and_the_tail_its_own() {
+fn a_group_records_one_pass_sample_per_window_and_the_tail() {
     let prompt = group_prompt();
     let mut decoder = group_fixture_decoder(16, 1);
     let (windows, tail) = decoder.group_windows(&prompt);
@@ -8696,8 +8661,6 @@ fn cancel_between_two_sweeps_resets_the_decoder() {
     assert!(decoder.caches.iter().all(|c| c.arrays().count() == 0));
     assert!(decoder.last_chunk_hidden.is_empty());
     assert!(!decoder.deferred_state_submission());
-    assert!(!decoder.weights.group_in_progress());
-    assert_eq!(decoder.weights.pending_touches(), 0);
 }
 
 /// The `paged_prefill` dispatch. With group mode pinned on, the paged
@@ -8751,16 +8714,12 @@ fn observe_mtp_after_a_group_gives_the_same_draft_cache() {
     assert_eq!(grouped.4, windowed.4, "logits");
 }
 
-/// The tentative/mapped group on the real checkpoint: with the pack's pages
-/// out of the page cache the turn opens over a streaming pack and runs the
-/// prompt as one group with one tentative commit; a second run over the now
-/// resident pack runs one window at a time with one commit per full window.
-/// Logits, every cache array, every pool K/V position and the hidden views
-/// are byte-equal. Runs the first `QWEN4_EXP_REAL_CASES` case (`6k` by
-/// default) and needs a cold pack.
+/// A full-direct layer-major group and a window-at-a-time run produce the
+/// same logits, cache arrays, pool K/V positions and hidden views. The fill
+/// gate selects the group for the first run; the second uses plain windows.
 #[test]
 #[ignore = "real checkpoint: QWEN4_EXP_REAL_MODEL, QWEN4_EXP_REAL_INPUTS; --test-threads=1"]
-fn real_model_group_matches_window_at_a_time_on_a_cold_pack() {
+fn real_model_group_matches_window_at_a_time_during_direct_fill() {
     let model = std::env::var("QWEN4_EXP_REAL_MODEL").expect("QWEN4_EXP_REAL_MODEL");
     let inputs = std::env::var("QWEN4_EXP_REAL_INPUTS").expect("QWEN4_EXP_REAL_INPUTS");
     let case = real_cases()
@@ -8776,8 +8735,8 @@ fn real_model_group_matches_window_at_a_time_on_a_cold_pack() {
     decoder.paged = Some(adapter);
     go_live(&mut decoder, pool_bytes);
     assert!(
-        decoder.weights.plan.mapped,
-        "the live host refused the pack"
+        decoder.weights.plan.direct,
+        "the live host refused full direct banks"
     );
     let full = (0..config.num_hidden_layers)
         .filter(|&i| !config.linear(i))
@@ -8813,16 +8772,12 @@ fn real_model_group_matches_window_at_a_time_on_a_cold_pack() {
             adapter.begin_request(seq).unwrap();
             adapter.allocate_suffix_blocks(prompt.len() as u32).unwrap();
         }
-        assert!(
-            decoder.weights.begin_turn().unwrap().is_none(),
-            "{run}: a slot fallback was applied"
-        );
+        decoder.weights.begin_turn().unwrap();
+        decoder
+            .weights
+            .set_direct_fill_pass_for_test(run == "group");
         let group = decoder.group_mode(prompt.len());
-        assert_eq!(
-            group,
-            run == "group",
-            "{run}: group mode follows the stream (cold pack for the first run, resident for the second)"
-        );
+        assert_eq!(group, run == "group", "{run}: direct-fill group gate");
         decoder.tentative_commits.clear();
         let started = std::time::Instant::now();
         let logits = decoder.prefill_prompt(&prompt).unwrap();
@@ -8843,16 +8798,12 @@ fn real_model_group_matches_window_at_a_time_on_a_cold_pack() {
             );
         }
         eprintln!(
-            "group vs windows {case} {run}: {} tokens = {} windows + {} tail in {elapsed:.2?}, commits {commits:?}, mapped {}",
+            "group vs windows {case} {run}: {} tokens = {} windows + {} tail in {elapsed:.2?}, commits {commits:?}",
             prompt.len(),
             windows.len(),
             tail.len(),
-            decoder.weights.plan.mapped
         );
-        assert!(
-            decoder.weights.plan.mapped,
-            "{run}: the store stayed mapped"
-        );
+        assert!(decoder.weights.plan.direct);
         runs.push(capture(&decoder, &logits));
     }
     assert_eq!(runs[0].len(), runs[1].len());
@@ -8866,194 +8817,5 @@ fn real_model_group_matches_window_at_a_time_on_a_cold_pack() {
     eprintln!(
         "group vs windows {case}: {} arrays byte-equal between the group and the window-at-a-time run",
         runs[0].len()
-    );
-}
-
-/// A trip forced between two sweeps of a real-model group on a cold
-/// pack: the frontier is evaluated and the tape committed before the store
-/// leaves the mapped path, the group finishes plain on slots with the group
-/// base as the fallback position, the pack stream is gone, and no lazy pool
-/// write is discarded. The same decoder then serves the prompt again one
-/// window at a time on the same slots. Both texts equal the
-/// `QWEN4_EXP_REAL_EXPECTED` reference: the slot path runs every window's
-/// expert groups through the window's kernel, so layers carried from the
-/// mapped sweeps and layers computed on slots of any count give one bit
-/// stream. Needs a cold pack.
-#[test]
-#[ignore = "real checkpoint: QWEN4_EXP_REAL_MODEL, QWEN4_EXP_REAL_INPUTS, QWEN4_EXP_REAL_EXPECTED; --test-threads=1"]
-fn real_model_forced_trip_between_sweeps_switches_after_the_frontier_eval() {
-    use super::tripwire::Fallback;
-    use tracing_subscriber::prelude::*;
-    let model = std::env::var("QWEN4_EXP_REAL_MODEL").expect("QWEN4_EXP_REAL_MODEL");
-    let inputs = std::env::var("QWEN4_EXP_REAL_INPUTS").expect("QWEN4_EXP_REAL_INPUTS");
-    let prompt = real_prompt(Path::new(&inputs), "6k");
-    let expected: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(std::env::var("QWEN4_EXP_REAL_EXPECTED").expect("QWEN4_EXP_REAL_EXPECTED"))
-            .unwrap(),
-    )
-    .unwrap();
-    let reference: Vec<u32> = expected["cases"]["6k"]["reference"]["argmax"]
-        .as_array()
-        .expect("QWEN4_EXP_REAL_EXPECTED has a 6k reference argmax")
-        .iter()
-        .take(9)
-        .map(|t| t.as_u64().unwrap() as u32)
-        .collect();
-    struct Warnings(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            struct Message(String);
-            impl tracing::field::Visit for Message {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    if field.name() == "message" {
-                        self.0 = format!("{value:?}");
-                    }
-                }
-            }
-            if *event.metadata().level() == tracing::Level::WARN {
-                let mut message = Message(String::new());
-                event.record(&mut message);
-                self.0.lock().unwrap().push(message.0);
-            }
-        }
-    }
-    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let _capture = tracing_subscriber::registry()
-        .with(Warnings(warnings.clone()))
-        .set_default();
-    let store = weights::Store::open(Path::new(&model)).unwrap();
-    let config = gguf::config(&store).unwrap();
-    let mut decoder = decoder::Decoder::new(config.clone(), store).unwrap();
-    let adapter = super::paged::create(&config).unwrap();
-    let pool_bytes = adapter.bytes_per_block().unwrap() * u64::from(adapter.block_capacity());
-    decoder.paged = Some(adapter);
-    go_live(&mut decoder, pool_bytes);
-    assert!(
-        decoder.weights.plan.mapped,
-        "the live host refused the pack"
-    );
-    {
-        let adapter = decoder.paged.as_mut().unwrap();
-        adapter.begin_request(1).unwrap();
-        adapter.allocate_suffix_blocks(prompt.len() as u32).unwrap();
-    }
-    assert!(decoder.weights.begin_turn().unwrap().is_none());
-    assert!(
-        decoder.group_mode(prompt.len()),
-        "the pack must be cold (its pages evicted from the page cache) for the turn to open over the stream"
-    );
-    let mapped_bytes = decoder.weights.plan.mapped_bytes;
-    decoder.after_sweep = Some(Box::new(move |d, layer| {
-        if layer == 5 {
-            d.weights.trip(Fallback::SsdReads {
-                read: 3 * mapped_bytes,
-                mapped: mapped_bytes,
-            });
-        }
-    }));
-    let started = std::time::Instant::now();
-    let logits = decoder.prefill_prompt(&prompt).unwrap();
-    let elapsed = started.elapsed();
-    let log = decoder.submit_log.borrow().clone();
-    let at = |event: &str| {
-        log.iter()
-            .position(|e| e == event)
-            .unwrap_or_else(|| panic!("{event} in {log:?}"))
-    };
-    assert!(
-        at("qwen4::routes::commit") < at("qwen4::group::frontier")
-            && at("qwen4::group::frontier") < at("qwen4::group::trip")
-            && at("qwen4::group::trip") < at("qwen4::group::switch"),
-        "tape commit -> frontier evaluated -> trip -> switch: {:?}",
-        log.iter()
-            .filter(|e| e.starts_with("qwen4::group") || e.starts_with("qwen4::routes"))
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        !decoder.weights.plan.mapped,
-        "the store left the mapped path"
-    );
-    assert!(
-        !decoder.weights.pack_stream_alive(),
-        "the pack stream is gone"
-    );
-    assert_eq!(
-        decoder
-            .weights
-            .live
-            .fallback_token_index
-            .load(Ordering::Acquire),
-        0,
-        "the fallback position is the group base"
-    );
-    assert!(
-        decoder.tentative_commits.is_empty(),
-        "the mid-group commit closed the transaction; the end of the group commits nothing"
-    );
-    assert_eq!(decoder.history, prompt);
-    let decode = |decoder: &mut decoder::Decoder, logits: &MxArray| -> Vec<u32> {
-        let mut token = argmax(logits);
-        let mut text = vec![token];
-        for _ in 0..8 {
-            token = argmax(&decoder.step(token).unwrap());
-            text.push(token);
-        }
-        text
-    };
-    let tripped = decode(&mut decoder, &logits);
-    let slots = decoder.weights.plan.partial_expert_slots;
-    eprintln!(
-        "forced trip: group with a trip after sweep 5 in {elapsed:.2?}; slots {slots}; first tokens {tripped:?}"
-    );
-    let warnings = warnings.lock().unwrap().clone();
-    eprintln!("forced trip warnings: {warnings:?}");
-    decoder.after_sweep = None;
-    decoder.reset();
-    {
-        let adapter = decoder.paged.as_mut().unwrap();
-        adapter.release_request().unwrap();
-        adapter.begin_request(2).unwrap();
-        adapter.allocate_suffix_blocks(prompt.len() as u32).unwrap();
-    }
-    let fallback = decoder.weights.begin_turn().unwrap();
-    let group = decoder.group_mode(prompt.len());
-    decoder.tentative_commits.clear();
-    let started = std::time::Instant::now();
-    let logits = decoder.prefill_prompt(&prompt).unwrap();
-    let elapsed = started.elapsed();
-    assert_eq!(decoder.history, prompt);
-    let plain = decode(&mut decoder, &logits);
-    eprintln!(
-        "forced trip slots {slots} tripped {tripped:?} plain {plain:?} reference {reference:?} equal {} group_mode {group} slots_after {} mapped {} fallback {fallback:?} plain_prefill {elapsed:.2?}",
-        tripped == plain,
-        decoder.weights.plan.partial_expert_slots,
-        decoder.weights.plan.mapped
-    );
-    assert!(!group, "the plain rerun runs one window at a time");
-    assert_eq!(
-        tripped, reference,
-        "the tripped run (mapped sweeps 0-5, slots after) gives the mapped reference text"
-    );
-    assert_eq!(
-        plain, reference,
-        "the plain slot rerun at {slots} slots gives the mapped reference text"
-    );
-    assert!(
-        warnings.iter().any(|w| w.contains("mapped -> slots")),
-        "the capture sees the switch's own warning: {warnings:?}"
-    );
-    assert!(
-        !warnings
-            .iter()
-            .any(|w| w.contains("discarded an unevaluated native write")),
-        "no lazy pool write is discarded: {warnings:?}"
     );
 }

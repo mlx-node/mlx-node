@@ -472,9 +472,10 @@ impl Qwen3_5MoeModel {
 
     /// Load a pretrained model from a directory, or a `.gguf` file.
     ///
-    /// A direct GGUF file is first converted into the lossless native-packed
-    /// cache (mirroring the dense Qwen3.5 loader), and the cache directory is
-    /// what the model thread reads.
+    /// A direct GGUF file is read into memory and repacked on the model
+    /// thread; only its non-weight assets (config, tokenizer) are written to
+    /// the native GGUF asset directory, which the model reports as its assets
+    /// path.
     #[napi]
     pub async fn load(
         path: String,
@@ -488,31 +489,16 @@ impl Qwen3_5MoeModel {
             .map(|value| crate::transformer::KvFormat::parse(Some(value)))
             .transpose()
             .map_err(|message| Error::from_reason(format!("Qwen3.5 MoE load: {message}")))?;
-        let source = std::path::Path::new(&path);
-        if source.is_file()
-            && source
-                .extension()
-                .and_then(|value| value.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
-        {
-            let cache = crate::utils::gguf::prepare_qwen35_moe_native_gguf(source).await?;
-            // A failed init must release the lease prepare took (see the
-            // dense loader for why the dir would otherwise pin forever).
-            return match persistence::load_with_thread(
-                &cache.to_string_lossy(),
-                draft_model_path,
-                kv_format,
-            )
-            .await
-            {
-                Ok(model) => Ok(model),
-                Err(error) => {
-                    crate::utils::gguf::native_gguf_unlease_in_use(&cache);
-                    Err(error)
-                }
-            };
+        let source = crate::engine::checkpoint_source::CheckpointSource::resolve(
+            std::path::Path::new(&path),
+            crate::utils::gguf::NativeGgufFamily::Qwen35Moe,
+        )
+        .await?;
+        let loaded = persistence::load_with_source(&source, draft_model_path, kv_format).await;
+        if loaded.is_err() {
+            source.release_lease();
         }
-        persistence::load_with_thread(&path, draft_model_path, kv_format).await
+        loaded
     }
 
     /// Generate text from a prompt token sequence.

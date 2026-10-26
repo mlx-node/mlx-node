@@ -1,16 +1,17 @@
 // Existing submodules
+pub(crate) mod alloc;
 pub mod attention;
 pub mod banded_attention;
 mod handle;
 pub mod kv_int8;
 pub mod mask;
 pub mod padding;
+pub(crate) mod purgeable;
 
 // New submodules (decomposed from this file)
 mod comparison;
 mod creation;
 mod data;
-pub mod mapped;
 pub mod memory;
 mod ops;
 mod random;
@@ -21,8 +22,13 @@ mod shape;
 pub use attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 pub use banded_attention::banded_attention;
 pub(crate) use handle::{MxHandle, check_handle};
-pub use mapped::{Mmap, mapped_array_bytes, page_size};
 pub use padding::{PaddedSequences, pad_float_sequences, pad_sequences};
+
+pub fn page_size() -> usize {
+    // SAFETY: sysconf has no preconditions.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(size).unwrap_or(16384)
+}
 
 // Re-exports from memory submodule (used across the crate)
 pub use memory::{

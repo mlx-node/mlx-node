@@ -21,6 +21,7 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageDeclarationsPath = join(__dirname, 'index.d.cts');
+const packageJsBindingPath = join(__dirname, 'index.cjs');
 const crateDeclarationsPath = join(__dirname, '../../crates/mlx-core/index.d.cts');
 
 async function assertDeclarationCopiesMatch(phase: string): Promise<void> {
@@ -35,6 +36,17 @@ async function assertDeclarationCopiesMatch(phase: string): Promise<void> {
     );
   }
 }
+
+// Linux NAPI output omits target-gated macOS exports. Preserve the committed
+// cross-platform binding surface instead of replacing it with that subset.
+const preservedLinuxBindings =
+  process.platform === 'linux'
+    ? await Promise.all(
+        [packageDeclarationsPath, packageJsBindingPath].map(
+          async (path) => [path, await readFile(path, 'utf8')] as const,
+        ),
+      )
+    : null;
 
 // Both paths are published/reviewed surfaces. Check the committed inputs
 // before generation so an already-stale package copy cannot be hidden when
@@ -69,6 +81,9 @@ for (const output of outputs) {
   }
 }
 
+if (preservedLinuxBindings) {
+  await Promise.all(preservedLinuxBindings.map(([path, contents]) => writeFile(path, contents)));
+}
 await assertDeclarationCopiesMatch('after native generation');
 
 const metalBuild = process.platform === 'darwin' && process.env.MLX_DISABLE_METAL == null;

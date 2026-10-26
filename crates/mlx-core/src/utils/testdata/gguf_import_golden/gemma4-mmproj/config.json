@@ -1,0 +1,74 @@
+{
+  "model_type": "gemma4_unified",
+  "text_config": {
+    "num_hidden_layers": 0,
+    "dtype": "bfloat16"
+  },
+  "vision_config": {},
+  "quantization": {
+    "bits": 4,
+    "group_size": 32,
+    "mode": "q4k",
+    "language_model.model.embed_tokens": {
+      "bits": 6,
+      "group_size": 16,
+      "mode": "q6k"
+    },
+    "language_model.model.layers.0.mlp.down_proj": {
+      "bits": 5,
+      "group_size": 32,
+      "mode": "q5k",
+      "layout": "t64"
+    },
+    "language_model.model.layers.0.mlp.up_proj": {
+      "bits": 4,
+      "group_size": 32,
+      "mode": "q4k",
+      "layout": "t64"
+    },
+    "language_model.model.layers.0.self_attn.q_proj": {
+      "bits": 4,
+      "group_size": 32,
+      "mode": "q4k"
+    },
+    "language_model.model.lm_head": {
+      "bits": 4,
+      "group_size": 32,
+      "mode": "affine",
+      "symmetric_zero_point": 8
+    }
+  },
+  "quantization_config": {
+    "bits": 4,
+    "group_size": 32,
+    "mode": "q4k",
+    "language_model.model.embed_tokens": {
+      "bits": 6,
+      "group_size": 16,
+      "mode": "q6k"
+    },
+    "language_model.model.layers.0.mlp.down_proj": {
+      "bits": 5,
+      "group_size": 32,
+      "mode": "q5k",
+      "layout": "t64"
+    },
+    "language_model.model.layers.0.mlp.up_proj": {
+      "bits": 4,
+      "group_size": 32,
+      "mode": "q4k",
+      "layout": "t64"
+    },
+    "language_model.model.layers.0.self_attn.q_proj": {
+      "bits": 4,
+      "group_size": 32,
+      "mode": "q4k"
+    },
+    "language_model.model.lm_head": {
+      "bits": 4,
+      "group_size": 32,
+      "mode": "affine",
+      "symmetric_zero_point": 8
+    }
+  }
+}

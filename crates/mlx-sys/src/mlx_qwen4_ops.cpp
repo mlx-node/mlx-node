@@ -955,57 +955,6 @@ bool mlx_qwen4_route_sort(mlx_array *ids, int experts, mlx_array **order,
   }
 }
 
-// The caller owns these mutable slot banks exclusively and evaluates its last
-// bank-dependent output before reusing a slot. Validate all copies first, then
-// finish GPU work before touching shared CPU-visible storage. Sources retain
-// their arrays throughout the transaction. No caller may publish a new mapping
-// until this operation succeeds.
-bool mlx_qwen4_copy_weight_rows(mlx_array **destinations, mlx_array **sources,
-                                const uint32_t *slots, size_t arrays,
-                                size_t updates) {
-  try {
-    if (!destinations || !sources || !slots || !arrays || !updates ||
-        arrays > 12 || updates > 16)
-      return false;
-    std::vector<array> ready;
-    for (size_t a = 0; a < arrays; ++a) {
-      if (!destinations[a])
-        return false;
-      auto &d = *reinterpret_cast<array *>(destinations[a]);
-      if (d.ndim() != 2 || !d.flags().row_contiguous)
-        return false;
-      ready.push_back(d);
-      for (size_t u = 0; u < updates; ++u) {
-        if (!sources[u * arrays + a])
-          return false;
-        auto &s = *reinterpret_cast<array *>(sources[u * arrays + a]);
-        if (s.ndim() != 2 || !s.flags().row_contiguous ||
-            s.dtype() != d.dtype() || s.shape(1) != d.shape(1) ||
-            s.shape(0) <= 0)
-          return false;
-        if ((uint64_t(slots[u]) + 1) * uint64_t(s.shape(0)) >
-            uint64_t(d.shape(0)))
-          return false;
-        ready.push_back(s);
-      }
-    }
-    mlx::core::eval(ready);
-    mlx::core::synchronize(mlx::core::default_stream(mlx::core::Device::gpu));
-    for (size_t a = 0; a < arrays; ++a) {
-      auto &d = *reinterpret_cast<array *>(destinations[a]);
-      for (size_t u = 0; u < updates; ++u) {
-        auto &s = *reinterpret_cast<array *>(sources[u * arrays + a]);
-        std::memcpy(d.data<char>() + size_t(slots[u]) * s.nbytes(),
-                    s.data<char>(), s.nbytes());
-      }
-    }
-    return true;
-  } catch (const std::exception &e) {
-    std::cerr << "Qwen4 expert slot update: " << e.what() << std::endl;
-    return false;
-  }
-}
-
 bool mlx_qwen4_gather_pages(mlx_array *keys, mlx_array *values,
                             mlx_array *slots, int heads, int dim,
                             int block_size, mlx_array **out_keys,

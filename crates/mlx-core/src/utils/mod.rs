@@ -10,7 +10,16 @@ pub mod foreign_weights;
 pub mod functional;
 pub mod gemma_quant_repack;
 pub mod gguf;
+pub(crate) mod gguf_cpu_repack;
+pub(crate) mod gguf_gpu;
+pub(crate) mod gguf_import;
 pub mod gguf_kquant;
+pub(crate) mod gguf_plan;
+pub(crate) mod gguf_read;
+pub(crate) mod gguf_source;
+#[cfg(test)]
+pub(crate) mod gguf_test_fixtures;
+pub(crate) mod host;
 pub mod imatrix;
 pub mod pickle;
 pub mod safetensors;

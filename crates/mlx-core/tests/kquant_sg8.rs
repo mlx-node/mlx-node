@@ -343,7 +343,7 @@ fn eval_all(handles: &mut [*mut mlx_sys::mlx_array]) {
         mlx_sys::mlx_eval_with_error(
             handles.as_mut_ptr(),
             handles.len(),
-            buf.as_mut_ptr(),
+            buf.as_mut_ptr().cast(),
             buf.len(),
         )
     };
