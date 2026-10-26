@@ -334,6 +334,20 @@ fn submit_refuses_bad_reads() {
 }
 
 #[test]
+fn recheck_sees_atomic_replace() {
+    let t = Temp::new();
+    let (a, b) = (t.0.join("a.gguf"), t.0.join("b.gguf"));
+    std::fs::write(&a, [1u8; 64]).unwrap();
+    std::fs::write(&b, [2u8; 64]).unwrap();
+    let set = ShardSet::open(&[&a]).unwrap();
+    set.recheck().unwrap();
+    std::fs::rename(&b, &a).unwrap();
+    assert!(set.recheck().is_err(), "replaced path passed recheck");
+    std::fs::remove_file(&a).unwrap();
+    assert!(set.recheck().is_err(), "missing path passed recheck");
+}
+
+#[test]
 fn threads_env_range() {
     assert_eq!(threads_from(None).unwrap(), DEFAULT_THREADS);
     assert_eq!(threads_from(Some("")).unwrap(), DEFAULT_THREADS);
@@ -347,6 +361,7 @@ fn threads_env_range() {
 /// Independent MXFP4 -> MLX `mxfp4` packing: codes `j` / `j + 16` are the
 /// low / high nibble of byte `1 + j`, 8 codes per u32 LSB first; byte 0 is
 /// the E8M0 scale.
+#[cfg(target_os = "macos")]
 fn ref_mxfp4(blocks: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let mut w = Vec::with_capacity(blocks.len() / 17 * 16);
     let mut s = Vec::with_capacity(blocks.len() / 17);
@@ -368,12 +383,14 @@ fn ref_mxfp4(blocks: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (w, s)
 }
 
+#[cfg(target_os = "macos")]
 struct RealProj {
     shard: usize,
     data_offset: u64,
     info: crate::utils::gguf::GgufTensorInfo,
 }
 
+#[cfg(target_os = "macos")]
 impl RealProj {
     fn rows(&self) -> usize {
         self.info.mlx_shape()[1] as usize
@@ -386,6 +403,7 @@ impl RealProj {
     }
 }
 
+#[cfg(target_os = "macos")]
 struct VecBank {
     w: Vec<u32>,
     s: Vec<u8>,
@@ -394,6 +412,7 @@ struct VecBank {
     sn: usize,
 }
 
+#[cfg(target_os = "macos")]
 impl VecBank {
     fn new(slots: usize, rows: usize, k: usize) -> Self {
         let (wn, sn) = (rows * k / 8, rows * k / 32);
@@ -419,6 +438,7 @@ impl VecBank {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn disk_bytes_read() -> u64 {
     // SAFETY: rusage_info_v4 is plain integers; all-zero is valid.
     let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
@@ -436,6 +456,7 @@ fn disk_bytes_read() -> u64 {
 
 /// `(resident, total)` pages of `extents` in the page cache (expert shards
 /// only; nothing is touched).
+#[cfg(target_os = "macos")]
 fn resident_pages(shards: &ShardSet, extents: &[Extent]) -> (usize, usize) {
     // SAFETY: plain sysconf query.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
@@ -481,6 +502,7 @@ fn resident_pages(shards: &ShardSet, extents: &[Extent]) -> (usize, usize) {
 /// repack for 64 random experts; then a decode-shaped run (6 misses x 40
 /// layers, barrier per layer) prints the rate; then a `mincore` probe of the
 /// last layer's extents. Shard 8 is never opened.
+#[cfg(target_os = "macos")]
 #[test]
 #[ignore = "needs DSV41_DIR with the real DeepSeek-V4.1 shards"]
 fn real_smoke() {

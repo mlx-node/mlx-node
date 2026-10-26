@@ -12,6 +12,8 @@ pub mod indexer;
 pub mod model;
 pub mod moe;
 pub mod ops;
+pub mod rows;
+pub mod store;
 
 #[cfg(test)]
 mod test_fixture;

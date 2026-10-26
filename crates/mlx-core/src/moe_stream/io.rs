@@ -113,14 +113,16 @@ impl ShardSet {
         self.shards.get(shard).map(|s| &s.file)
     }
 
-    /// Fails when any shard changed (size, inode, mtime) since `open`.
+    /// Fails when any shard changed (size, inode, mtime) since `open`, by
+    /// its descriptor or by its path (an atomic replace keeps the old inode
+    /// open).
     pub fn recheck(&self) -> Result<()> {
         for s in &self.shards {
-            let meta = s
-                .file
-                .metadata()
-                .map_err(|e| bad(format!("stat '{}': {e}", s.path.display())))?;
-            if ShardIdentity::from_metadata(&meta) != s.stat {
+            let stat = |m: std::io::Result<std::fs::Metadata>| {
+                m.map(|m| ShardIdentity::from_metadata(&m))
+                    .map_err(|e| bad(format!("stat '{}': {e}", s.path.display())))
+            };
+            if stat(s.file.metadata())? != s.stat || stat(std::fs::metadata(&s.path))? != s.stat {
                 return Err(bad(format!(
                     "'{}' changed since it was opened",
                     s.path.display()
@@ -145,6 +147,38 @@ impl ShardSet {
             )));
         }
         Ok(())
+    }
+
+    /// The bytes of `e`, read as whole `ALIGN` pages into `buf` (pages past
+    /// the file end excepted) so `F_NOCACHE` leaves no page cached.
+    pub fn read_aligned<'b>(&self, e: Extent, buf: &'b mut AlignedBuf) -> Result<&'b [u8]> {
+        self.check(&e)?;
+        self.window(e, buf, |err| {
+            bad(format!(
+                "read {} bytes at {} of shard {}: {err}",
+                e.len, e.offset, e.shard
+            ))
+        })
+    }
+
+    fn window<'b>(
+        &self,
+        e: Extent,
+        buf: &'b mut AlignedBuf,
+        io_err: impl Fn(std::io::Error) -> Error,
+    ) -> Result<&'b [u8]> {
+        let len = usize::try_from(e.len).map_err(|_| bad("extent length exceeds usize"))?;
+        let start = e.offset - e.offset % ALIGN as u64;
+        let end = (e.offset + e.len)
+            .checked_next_multiple_of(ALIGN as u64)
+            .ok_or_else(|| bad("extent end overflows"))?
+            .min(self.shards[e.shard].len);
+        let window = usize::try_from(end - start).map_err(|_| bad("read window size"))?;
+        let head = (e.offset - start) as usize;
+        let bytes = buf.get(window)?;
+        self.read_at_least(e.shard, bytes, start, head + len)
+            .map_err(io_err)?;
+        Ok(&bytes[head..head + len])
     }
 
     /// Fills `buf` from `offset`; the file may end early, but not before
@@ -524,13 +558,23 @@ fn next_job(shared: &Shared) -> Option<Job> {
 /// left ~83 % of its pages in the page cache.
 const ALIGN: usize = 16 << 10;
 
-struct AlignedBuf {
+/// A reusable `ALIGN`-aligned read buffer.
+pub struct AlignedBuf {
     ptr: *mut u8,
     cap: usize,
 }
 
+// SAFETY: the buffer owns its allocation; nothing else aliases it.
+unsafe impl Send for AlignedBuf {}
+
+impl Default for AlignedBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AlignedBuf {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             ptr: std::ptr::null_mut(),
             cap: 0,
@@ -619,20 +663,10 @@ fn run(shards: &ShardSet, read: &Read, buf: &mut AlignedBuf) -> Result<(u64, u64
             Ok((e.len, t0.elapsed().as_nanos() as u64, 0))
         }
         Sink::Slot { repack, slot } => {
-            let start = e.offset - e.offset % ALIGN as u64;
-            let end = (e.offset + e.len)
-                .checked_next_multiple_of(ALIGN as u64)
-                .ok_or_else(|| bad("extent end overflows"))?
-                .min(shards.shards[e.shard].len);
-            let window = usize::try_from(end - start).map_err(|_| bad("read window size"))?;
-            let head = (e.offset - start) as usize;
-            let bytes = buf.get(window)?;
-            shards
-                .read_at_least(e.shard, bytes, start, head + len)
-                .map_err(io_err)?;
+            let bytes = shards.window(e, buf, io_err)?;
             let read_ns = t0.elapsed().as_nanos() as u64;
             let t1 = Instant::now();
-            repack.write(*slot, &bytes[head..head + len])?;
+            repack.write(*slot, bytes)?;
             Ok((e.len, read_ns, t1.elapsed().as_nanos() as u64))
         }
     }

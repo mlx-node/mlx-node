@@ -10,6 +10,7 @@ use super::config::DeepseekV41Config;
 use super::model::fp32_site;
 use super::moe::{Moe, Routes};
 use super::ops::{hc_mixes, hc_post, hc_pre};
+use super::store::Dense;
 use crate::array::MxArray;
 
 /// FFN rows per chunk: the routed scratch is `rows x k x (2 inter + dim)`.
@@ -17,7 +18,7 @@ pub const FFN_CHUNK_ROWS: i64 = 256;
 
 pub enum Attn {
     Window(WindowAttention),
-    Compressed(CompressedAttention),
+    Compressed(Box<CompressedAttention>),
 }
 
 /// `hc_{attn,ffn}_{fn,base,scale}` (f32).
@@ -31,9 +32,9 @@ impl HcWeights {
     fn from_gguf(
         layer: usize,
         tag: &str,
-        get: &mut impl FnMut(&str) -> Result<MxArray>,
+        get: &mut impl FnMut(&str) -> Result<Dense>,
     ) -> Result<Self> {
-        let mut t = |s: &str| get(&format!("blk.{layer}.hc_{tag}_{s}.weight"));
+        let mut t = |s: &str| get(&format!("blk.{layer}.hc_{tag}_{s}.weight"))?.array();
         Ok(Self {
             fn_: t("fn")?,
             base: t("base")?,
@@ -62,20 +63,22 @@ impl Block {
         layer: usize,
         fq: FakeQuant,
         moe: Moe,
-        mut get: impl FnMut(&str) -> Result<MxArray>,
+        mut get: impl FnMut(&str) -> Result<Dense>,
     ) -> Result<Self> {
         let attn = if cfg.compress_ratios[layer] == 0 {
             let w = super::attention::AttentionWeights::from_gguf(layer, &mut get)?;
             Attn::Window(WindowAttention::new(cfg, layer, w, fq)?)
         } else {
-            Attn::Compressed(CompressedAttention::from_gguf(cfg, layer, fq, &mut get)?)
+            Attn::Compressed(Box::new(CompressedAttention::from_gguf(
+                cfg, layer, fq, &mut get,
+            )?))
         };
         Ok(Self {
             layer,
             attn,
             moe,
-            attn_norm: get(&format!("blk.{layer}.attn_norm.weight"))?,
-            ffn_norm: get(&format!("blk.{layer}.ffn_norm.weight"))?,
+            attn_norm: get(&format!("blk.{layer}.attn_norm.weight"))?.array()?,
+            ffn_norm: get(&format!("blk.{layer}.ffn_norm.weight"))?.array()?,
             hc_attn: HcWeights::from_gguf(layer, "attn", &mut get)?,
             hc_ffn: HcWeights::from_gguf(layer, "ffn", &mut get)?,
             eps: cfg.norm_eps,

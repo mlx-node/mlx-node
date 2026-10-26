@@ -6,6 +6,7 @@ use napi::{Error, Result};
 
 use super::attention::linear;
 use super::ops::engram_gate;
+use super::store::Dense;
 use crate::array::MxArray;
 use crate::utils::gguf::decode_mxfp8_rows;
 
@@ -15,9 +16,10 @@ pub fn row_bytes(head_dim: usize) -> usize {
 }
 
 /// Where table rows come from: decoded rows `[ids.len(), head_dim]` (f32,
-/// exact) for global row ids of the one GGUF table.
+/// exact) for global row ids of the one GGUF table, laid out `[pos][col]`
+/// for engram layer `layer` (its index in the engram layer list).
 pub trait EngramRows {
-    fn rows(&self, ids: &[u32]) -> Result<Vec<f32>>;
+    fn rows(&self, layer: usize, ids: &[u32]) -> Result<Vec<f32>>;
 }
 
 /// The whole table held in memory (tiny fixture). The real 203 GB table is
@@ -43,7 +45,7 @@ impl ResidentTable {
 }
 
 impl EngramRows for ResidentTable {
-    fn rows(&self, ids: &[u32]) -> Result<Vec<f32>> {
+    fn rows(&self, _layer: usize, ids: &[u32]) -> Result<Vec<f32>> {
         let rb = row_bytes(self.head_dim);
         let n_rows = self.raw.len() / rb;
         let mut out = vec![0f32; ids.len() * self.head_dim];
@@ -66,7 +68,7 @@ impl EngramRows for ResidentTable {
 /// One engram layer's weights: `wkv` `[dim * (hc + 1), cols * head_dim]`,
 /// `gate` `[hc, dim]` (the stored `q_weight * k_weight` product).
 pub struct Engram {
-    wkv: MxArray,
+    wkv: Dense,
     gate: MxArray,
     dim: i64,
     hc: i64,
@@ -79,11 +81,11 @@ impl Engram {
         dim: usize,
         hc: usize,
         eps: f32,
-        mut get: impl FnMut(&str) -> Result<MxArray>,
+        mut get: impl FnMut(&str) -> Result<Dense>,
     ) -> Result<Self> {
         Ok(Self {
             wkv: get(&format!("blk.{layer}.engram_kv.weight"))?,
-            gate: get(&format!("blk.{layer}.engram_gate.weight"))?,
+            gate: get(&format!("blk.{layer}.engram_gate.weight"))?.array()?,
             dim: dim as i64,
             hc: hc as i64,
             eps,

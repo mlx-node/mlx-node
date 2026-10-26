@@ -11,6 +11,7 @@ use super::compressor::{Compressor, CompressorWeights};
 use super::config::DeepseekV41Config;
 use super::indexer::{CandidateRole, Indexer, IndexerWeights, chunk_rows};
 use super::ops::{apply_partial_rope, fp4_roundtrip, fp8_roundtrip, inv_freqs, rope_tables};
+use super::store::{Dense, Weight};
 use crate::array::{DType, MxArray};
 
 /// Block size of the fp8 activation round trips (`model.py` `fp8_block_size`).
@@ -47,39 +48,39 @@ impl FakeQuant {
 
 /// One layer's attention weights, f32, torch layout (`[out, in]`).
 pub struct AttentionWeights {
-    pub wq_a: MxArray,
+    pub wq_a: Dense,
     pub q_norm: MxArray,
-    pub wq_b: MxArray,
-    pub wkv: MxArray,
+    pub wq_b: Dense,
+    pub wkv: Dense,
     pub kv_norm: MxArray,
     /// `[o_groups * o_lora_rank, n_heads * head_dim / o_groups]`
-    pub wo_a: MxArray,
-    pub wo_b: MxArray,
+    pub wo_a: Dense,
+    pub wo_b: Dense,
     /// `[n_heads]`
     pub sink: MxArray,
 }
 
 impl AttentionWeights {
     /// Reads `blk.<layer>.attn_*` through `get` (GGUF name -> dense f32).
-    pub fn from_gguf(layer: usize, mut get: impl FnMut(&str) -> Result<MxArray>) -> Result<Self> {
+    pub fn from_gguf(layer: usize, mut get: impl FnMut(&str) -> Result<Dense>) -> Result<Self> {
         let mut t = |s: &str| get(&format!("blk.{layer}.{s}.weight"));
         Ok(Self {
             wq_a: t("attn_q_a")?,
-            q_norm: t("attn_q_a_norm")?,
+            q_norm: t("attn_q_a_norm")?.array()?,
             wq_b: t("attn_q_b")?,
             wkv: t("attn_kv")?,
-            kv_norm: t("attn_kv_a_norm")?,
+            kv_norm: t("attn_kv_a_norm")?.array()?,
             wo_a: t("attn_output_a")?,
             wo_b: t("attn_output_b")?,
-            sink: t("attn_sinks")?,
+            sink: t("attn_sinks")?.array()?,
         })
     }
 }
 
 /// `F.linear(x.float(), W).to(x.dtype)` (oracle A8).
-pub(crate) fn linear(x: &MxArray, w: &MxArray) -> Result<MxArray> {
+pub(crate) fn linear(x: &MxArray, w: &impl Weight) -> Result<MxArray> {
     x.astype(DType::Float32)?
-        .matmul(&w.astype(DType::Float32)?.transpose(Some(&[1, 0]))?)?
+        .matmul(&w.f32()?.transpose(Some(&[1, 0]))?)?
         .astype(x.dtype()?)
 }
 
@@ -230,6 +231,7 @@ impl WindowAttention {
         let wa = self
             .w
             .wo_a
+            .f32()?
             .astype(act)?
             .astype(DType::Float32)?
             .reshape(&[g, self.o_lora, width])?
@@ -339,7 +341,7 @@ impl CompressedAttention {
         cfg: &DeepseekV41Config,
         layer: usize,
         fq: FakeQuant,
-        mut get: impl FnMut(&str) -> Result<MxArray>,
+        mut get: impl FnMut(&str) -> Result<Dense>,
     ) -> Result<Self> {
         let ratio = cfg.compress_ratios.get(layer).copied().unwrap_or(0);
         if ratio == 0 {

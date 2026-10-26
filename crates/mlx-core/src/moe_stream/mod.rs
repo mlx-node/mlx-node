@@ -3,5 +3,6 @@
 //! expert bank slots. Family-neutral; the bank and the stores live with their
 //! callers.
 
+pub mod bank;
 pub mod io;
 pub mod repack;

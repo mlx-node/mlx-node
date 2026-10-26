@@ -9,14 +9,17 @@
 //! share the kernel.
 
 use std::ffi::CString;
+use std::sync::Arc;
 
 use napi::{Error, Result};
 
 use super::attention::linear;
 use super::config::DeepseekV41Config;
 use super::ops::{route_select, router_scores, swiglu};
+use super::store::Dense;
 use crate::array::alloc::OutLayout;
 use crate::array::{DType, MxArray};
+use crate::moe_stream::bank::StagingBank;
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 use crate::utils::gguf_cpu_repack::decode_affine_band_into;
 use crate::utils::gguf_gpu::RepackDst;
@@ -101,9 +104,12 @@ pub struct MoeWeights {
     pub gate: ExpertBank,
     pub up: ExpertBank,
     pub down: ExpertBank,
-    pub shared_gate: MxArray,
-    pub shared_up: MxArray,
-    pub shared_down: MxArray,
+    pub shared_gate: Dense,
+    pub shared_up: Dense,
+    pub shared_down: Dense,
+    /// Streamed experts: `gate`/`up`/`down` are this bank's arrays, whose
+    /// slot `e` must hold this layer's expert `e` before a gather.
+    pub stream: Option<Arc<StagingBank>>,
 }
 
 impl MoeWeights {
@@ -111,16 +117,17 @@ impl MoeWeights {
     /// tensor as an array, `bank` a routed-expert tensor as an `ExpertBank`.
     pub fn from_gguf(
         layer: usize,
-        mut dense: impl FnMut(&str) -> Result<MxArray>,
+        mut dense: impl FnMut(&str) -> Result<Dense>,
         mut bank: impl FnMut(&str) -> Result<ExpertBank>,
     ) -> Result<Self> {
         let n = |s: &str| format!("blk.{layer}.{s}.weight");
         let bias = dense(&format!("blk.{layer}.exp_probs_b.bias"))?
+            .array()?
             .astype(DType::Float32)?
             .to_float32()?
             .to_vec();
         Ok(Self {
-            router: dense(&n("ffn_gate_inp"))?,
+            router: dense(&n("ffn_gate_inp"))?.array()?,
             bias,
             gate: bank(&n("ffn_gate_exps"))?,
             up: bank(&n("ffn_up_exps"))?,
@@ -128,6 +135,7 @@ impl MoeWeights {
             shared_gate: dense(&n("ffn_gate_shexp"))?,
             shared_up: dense(&n("ffn_up_shexp"))?,
             shared_down: dense(&n("ffn_down_shexp"))?,
+            stream: None,
         })
     }
 }
@@ -172,6 +180,7 @@ impl Routes {
 /// The FFN of one layer.
 pub struct Moe {
     w: MoeWeights,
+    layer: usize,
     n_experts: usize,
     k: usize,
     route_scale: f32,
@@ -206,6 +215,7 @@ impl Moe {
             }
         }
         Ok(Self {
+            layer,
             n_experts: n,
             k: cfg.n_activated_experts,
             route_scale: cfg.route_scale,
@@ -263,6 +273,13 @@ impl Moe {
             )));
         }
         let (ids, w) = routes.by_expert();
+        if let Some(st) = &self.w.stream {
+            let mut used = ids.clone();
+            used.sort_unstable();
+            used.dedup();
+            st.fill(self.layer, &used)?;
+            st.assert_tags(self.layer, &used);
+        }
         let ids = MxArray::from_uint32(&ids, &[rows, k])?;
         let w = MxArray::from_float32(&w, &[rows, k, 1, 1])?;
         let xe = x.reshape(&[rows, 1, 1, dim])?;

@@ -5,6 +5,7 @@
 
 use super::attention::FakeQuant;
 use super::engram::ResidentTable;
+use super::store::Dense;
 use super::model::{Model, Trace, record_fp32_sites};
 use super::moe::ExpertBank;
 use super::test_fixture::{Npz, TinyGguf, read, rel_l2};
@@ -26,7 +27,7 @@ fn near_edge_run(case: &str, mode: &str) -> bool {
     case == "pad" && mode == "fp32_on"
 }
 
-fn mode_of(m: &str) -> (DType, FakeQuant) {
+pub(super) fn mode_of(m: &str) -> (DType, FakeQuant) {
     let dt = if m.starts_with("bf16") { DType::BFloat16 } else { DType::Float32 };
     (dt, if m.ends_with("_on") { FakeQuant::ON } else { FakeQuant::OFF })
 }
@@ -58,7 +59,7 @@ fn q8_affine(g: &TinyGguf, name: &str) -> napi::Result<MxArray> {
     MxArray::from_handle(h, "q8_0 affine dequantize")
 }
 
-fn tiny(g: &TinyGguf, act: DType, fq: FakeQuant, affine: bool) -> Model {
+pub(super) fn tiny(g: &TinyGguf, act: DType, fq: FakeQuant, affine: bool) -> Model {
     let cfg = DeepseekV41Config::from_gguf(&g.gguf).unwrap();
     let (_, table) = g.raw("per_layer_token_embd.weight");
     let table = ResidentTable::new(table, cfg.engram.as_ref().unwrap().head_dim).unwrap();
@@ -66,16 +67,16 @@ fn tiny(g: &TinyGguf, act: DType, fq: FakeQuant, affine: bool) -> Model {
         let (info, raw) = g.raw(n);
         ExpertBank::from_mxfp4(info, &raw)
     };
-    let get = |n: &str| if affine { q8_affine(g, n) } else { g.dense(n) };
-    Model::from_gguf(cfg, act, fq, get, bank, Some(Box::new(table))).unwrap()
+    let get = |n: &str| if affine { q8_affine(g, n) } else { g.dense(n) }.map(Dense::from);
+    Model::from_gguf(cfg, act, fq, get, bank, Some(Box::new(table)), None).unwrap()
 }
 
-fn case_ids(npz: &Npz, case: &str) -> Vec<u32> {
+pub(super) fn case_ids(npz: &Npz, case: &str) -> Vec<u32> {
     npz.get(&format!("ids.{case}")).1.iter().map(|&x| x as u32).collect()
 }
 
 /// The oracle's call split of a case (decode teacher-forced).
-fn split(case: &str) -> Vec<usize> {
+pub(super) fn split(case: &str) -> Vec<usize> {
     match case {
         "c2" => std::iter::once(12).chain(std::iter::repeat_n(1, 12)).collect(),
         "c3" => vec![1; 24],
@@ -84,7 +85,7 @@ fn split(case: &str) -> Vec<usize> {
 }
 
 /// Logits of every position `[24 * VOCAB]` and one trace per call.
-fn run(m: &Model, ids: &[u32], sizes: &[usize]) -> (Vec<f32>, Vec<Trace>) {
+pub(super) fn run(m: &Model, ids: &[u32], sizes: &[usize]) -> (Vec<f32>, Vec<Trace>) {
     let mut sess = m.new_session();
     let (mut out, mut traces, mut at) = (Vec::new(), Vec::new(), 0);
     for &n in sizes {

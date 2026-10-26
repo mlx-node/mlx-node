@@ -8,6 +8,7 @@ use napi::{Error, Result};
 use super::attention::{FakeQuant, linear, rms_norm};
 use super::cache::{Candidates, TopK};
 use super::ops::{apply_partial_rope, fp4_roundtrip};
+use super::store::Dense;
 use crate::array::{DType, MxArray};
 
 /// `fp4_block_size`: indexer q / k round trips use ue8m0 scales per 32.
@@ -17,10 +18,10 @@ const FP4_BLOCK: i64 = 32;
 pub const INDEX_CHUNK_BYTES: usize = 256 << 20;
 
 pub struct IndexerWeights {
-    pub wq_b: MxArray,
-    pub weights_proj: MxArray,
+    pub wq_b: Dense,
+    pub weights_proj: Dense,
     /// Index-key owners (kv source layers) only.
-    pub wk: Option<MxArray>,
+    pub wk: Option<Dense>,
     pub k_norm: Option<MxArray>,
 }
 
@@ -28,14 +29,18 @@ impl IndexerWeights {
     pub fn from_gguf(
         layer: usize,
         owns_k: bool,
-        mut get: impl FnMut(&str) -> Result<MxArray>,
+        mut get: impl FnMut(&str) -> Result<Dense>,
     ) -> Result<Self> {
         let mut t = |s: &str| get(&format!("blk.{layer}.indexer.{s}.weight"));
         Ok(Self {
             wq_b: t("attn_q_b")?,
             weights_proj: t("proj")?,
             wk: if owns_k { Some(t("attn_k")?) } else { None },
-            k_norm: if owns_k { Some(t("k_norm")?) } else { None },
+            k_norm: if owns_k {
+                Some(t("k_norm")?.array()?)
+            } else {
+                None
+            },
         })
     }
 }

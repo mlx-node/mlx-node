@@ -33,7 +33,8 @@ fn bank(f: &Fix, name: &str) -> Result<ExpertBank> {
 }
 
 fn moe(f: &Fix, layer: usize) -> Moe {
-    let w = MoeWeights::from_gguf(layer, |n| f.gguf.dense(n), |n| bank(f, n)).unwrap();
+    let w =
+        MoeWeights::from_gguf(layer, |n| f.gguf.dense(n).map(Dense::from), |n| bank(f, n)).unwrap();
     Moe::new(&f.cfg, layer, w).unwrap()
 }
 
@@ -315,7 +316,8 @@ fn refuses_bad_inputs() {
     );
     let mut cfg = f.cfg.clone();
     cfg.n_shared_experts = 2;
-    let w = MoeWeights::from_gguf(0, |n| f.gguf.dense(n), |n| bank(&f, n)).unwrap();
+    let w =
+        MoeWeights::from_gguf(0, |n| f.gguf.dense(n).map(Dense::from), |n| bank(&f, n)).unwrap();
     assert!(Moe::new(&cfg, 0, w).is_err(), "2 shared experts");
     let m = moe(&f, 0);
     let x = input(&f, "c1.fp32_on", 0);

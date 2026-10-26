@@ -8,6 +8,7 @@ mod window {
     use crate::models::deepseek_v41::cache::WindowCache;
     use crate::models::deepseek_v41::config::DeepseekV41Config;
     use crate::models::deepseek_v41::ops::{inv_freqs, rope_tables};
+    use crate::models::deepseek_v41::store::Dense;
     use crate::models::deepseek_v41::test_fixture::{Npz, TinyGguf, read, rel_l2};
 
     const LAYERS: [usize; 2] = [0, 1];
@@ -29,7 +30,7 @@ mod window {
     }
 
     fn attn(f: &Fix, layer: usize, fq: FakeQuant) -> WindowAttention {
-        let w = AttentionWeights::from_gguf(layer, |n| f.gguf.dense(n)).unwrap();
+        let w = AttentionWeights::from_gguf(layer, |n| f.gguf.dense(n).map(Dense::from)).unwrap();
         WindowAttention::new(&f.cfg, layer, w, fq).unwrap()
     }
 
@@ -185,7 +186,7 @@ mod window {
     #[test]
     fn refuses_compressed_layers_and_gaps() {
         let f = fix();
-        let w = AttentionWeights::from_gguf(2, |n| f.gguf.dense(n)).unwrap();
+        let w = AttentionWeights::from_gguf(2, |n| f.gguf.dense(n).map(Dense::from)).unwrap();
         assert!(WindowAttention::new(&f.cfg, 2, w, FakeQuant::ON).is_err());
         let a = attn(&f, 0, FakeQuant::ON);
         let mut cache = WindowCache::new(f.cfg.window_size);
@@ -214,6 +215,7 @@ mod compressed {
         INDEX_CHUNK_BYTES, chunk_rows, index_row_bytes, topk_lowest,
     };
     use crate::models::deepseek_v41::ops::fp4_roundtrip;
+    use crate::models::deepseek_v41::store::Dense;
     use crate::models::deepseek_v41::test_fixture::{Npz, TinyGguf, read, rel_l2};
 
     const LAYERS: [usize; 6] = [2, 3, 4, 5, 6, 7];
@@ -244,7 +246,9 @@ mod compressed {
     }
 
     fn layer(f: &Fix, l: usize, fq: FakeQuant) -> CompressedAttention {
-        let mut a = CompressedAttention::from_gguf(&f.cfg, l, fq, |n| f.gguf.dense(n)).unwrap();
+        let mut a =
+            CompressedAttention::from_gguf(&f.cfg, l, fq, |n| f.gguf.dense(n).map(Dense::from))
+                .unwrap();
         a.export_scores = true;
         a
     }
@@ -565,7 +569,11 @@ mod compressed {
     fn refuses_window_layers_and_out_of_order_sources() {
         let f = fix();
         assert!(
-            CompressedAttention::from_gguf(&f.cfg, 0, FakeQuant::ON, |n| f.gguf.dense(n)).is_err()
+            CompressedAttention::from_gguf(&f.cfg, 0, FakeQuant::ON, |n| f
+                .gguf
+                .dense(n)
+                .map(Dense::from))
+            .is_err()
         );
         let a = layer(&f, 3, FakeQuant::ON);
         let mut win = WindowCache::new(f.cfg.window_size);

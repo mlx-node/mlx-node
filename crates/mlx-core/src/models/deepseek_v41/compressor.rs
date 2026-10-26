@@ -5,12 +5,13 @@
 use napi::{Error, Result};
 
 use super::attention::{linear, rms_norm};
+use super::store::Dense;
 use crate::array::{DType, MxArray};
 
 pub struct CompressorWeights {
-    pub wkv: MxArray,
+    pub wkv: Dense,
     /// ratio > 1 only
-    pub wgate: Option<MxArray>,
+    pub wgate: Option<Dense>,
     pub norm: MxArray,
 }
 
@@ -18,13 +19,13 @@ impl CompressorWeights {
     pub fn from_gguf(
         layer: usize,
         ratio: u32,
-        mut get: impl FnMut(&str) -> Result<MxArray>,
+        mut get: impl FnMut(&str) -> Result<Dense>,
     ) -> Result<Self> {
         let mut t = |s: &str| get(&format!("blk.{layer}.attn_compressor_{s}.weight"));
         Ok(Self {
             wkv: t("kv")?,
             wgate: if ratio > 1 { Some(t("gate")?) } else { None },
-            norm: t("norm")?,
+            norm: t("norm")?.array()?,
         })
     }
 }

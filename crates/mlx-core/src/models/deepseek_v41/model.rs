@@ -3,6 +3,7 @@
 //! final norm, f32 head. One call is layer-outer over all its rows.
 
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use napi::{Error, Result};
 
@@ -14,7 +15,9 @@ use super::engram::{Engram, EngramRows};
 use super::engram_hash::EngramHasher;
 use super::moe::{ExpertBank, Moe, MoeWeights, Routes};
 use super::ops::hc_pre;
+use super::store::{Dense, Weight};
 use crate::array::{DType, MxArray};
+use crate::moe_stream::bank::StagingBank;
 
 thread_local! {
     static SITES: RefCell<Option<Vec<(&'static str, usize, DType)>>> = const { RefCell::new(None) };
@@ -71,30 +74,33 @@ pub struct Session {
 pub struct Model {
     pub cfg: DeepseekV41Config,
     act: DType,
-    embed: MxArray,
+    embed: Dense,
     blocks: Vec<Block>,
     engrams: Vec<Option<(usize, Engram)>>,
     hasher: Option<EngramHasher>,
     table: Option<Box<dyn EngramRows>>,
     norm: MxArray,
-    head: MxArray,
+    head: Dense,
 }
 
 impl Model {
-    /// `get` returns a dense GGUF tensor as an array, `bank` a routed-expert
-    /// tensor; `table` serves engram rows. `act` is the activation dtype.
+    /// `get` returns a dense GGUF tensor, `bank` a routed-expert tensor
+    /// (with `stream`: that projection of the shared staging bank); `table`
+    /// serves engram rows. `act` is the activation dtype.
     pub fn from_gguf(
         cfg: DeepseekV41Config,
         act: DType,
         fq: FakeQuant,
-        mut get: impl FnMut(&str) -> Result<MxArray>,
+        mut get: impl FnMut(&str) -> Result<Dense>,
         mut bank: impl FnMut(&str) -> Result<ExpertBank>,
         table: Option<Box<dyn EngramRows>>,
+        stream: Option<Arc<StagingBank>>,
     ) -> Result<Self> {
         let mut blocks = Vec::with_capacity(cfg.n_layers);
         let mut engrams = Vec::with_capacity(cfg.n_layers);
         for l in 0..cfg.n_layers {
-            let mw = MoeWeights::from_gguf(l, &mut get, &mut bank)?;
+            let mut mw = MoeWeights::from_gguf(l, &mut get, &mut bank)?;
+            mw.stream = stream.clone();
             let moe = Moe::new(&cfg, l, mw)?;
             blocks.push(Block::from_gguf(&cfg, l, fq, moe, &mut get)?);
             let e = cfg
@@ -118,7 +124,7 @@ impl Model {
         Ok(Self {
             act,
             embed: get("token_embd.weight")?,
-            norm: get("output_norm.weight")?,
+            norm: get("output_norm.weight")?.array()?,
             head: get("output.weight")?,
             blocks,
             engrams,
@@ -199,7 +205,7 @@ impl Model {
         let tok = MxArray::from_uint32(ids, &[s])?;
         let mut h = self
             .embed
-            .take(&tok, 0)?
+            .rows(&tok)?
             .astype(self.act)?
             .reshape(&[s, 1, dim])?
             .broadcast_to(&[s, hc, dim])?;
@@ -225,7 +231,7 @@ impl Model {
                     .chunks(n * cols)
                     .flat_map(|p| p[e * cols..(e + 1) * cols].iter().copied())
                     .collect();
-                h = eng.forward(&h, &table.rows(&ids)?)?;
+                h = eng.forward(&h, &table.rows(*e, &ids)?)?;
             }
             let src = match self.cfg.kv_src[l] {
                 Some(k) if self.cfg.compress_ratios[l] != 0 => sess.sources[k].as_mut(),
@@ -259,9 +265,37 @@ impl Model {
         let x = rms_norm(&hc_pre(&h, &pre_mix)?, &self.norm, self.cfg.norm_eps)?
             .astype(DType::Float32)?;
         fp32_site("head_input", self.cfg.n_layers, &x)?;
-        let logits = x.matmul(&self.head.astype(DType::Float32)?.transpose(Some(&[1, 0]))?)?;
+        let logits = self.head_logits(&x)?;
         MxArray::eval_arrays_with_context(&[&logits], "deepseek_v41 head")?;
         sess.tokens = all;
         Ok(logits)
     }
+
+    /// f32 logits of `x [s, dim]` (f32). A quantized head is dequantized
+    /// `HEAD_CHUNK` vocab rows at a time.
+    fn head_logits(&self, x: &MxArray) -> Result<MxArray> {
+        let w = match &self.head {
+            Dense::Array(a) => {
+                return x.matmul(&a.astype(DType::Float32)?.transpose(Some(&[1, 0]))?);
+            }
+            q => q,
+        };
+        let vocab = w.shape_at(0)?;
+        let mut parts = Vec::new();
+        let mut lo = 0;
+        while lo < vocab {
+            let hi = (lo + HEAD_CHUNK).min(vocab);
+            let p = x.matmul(&w.row_range(lo, hi)?.f32()?.transpose(Some(&[1, 0]))?)?;
+            MxArray::eval_arrays_with_context(&[&p], "deepseek_v41 head chunk")?;
+            parts.push(p);
+            lo = hi;
+        }
+        match parts.len() {
+            1 => Ok(parts.swap_remove(0)),
+            _ => MxArray::concatenate_many(parts.iter().collect(), Some(1)),
+        }
+    }
 }
+
+/// Vocab rows per dequantized head chunk (16384 x 5120 f32 = 320 MiB).
+const HEAD_CHUNK: i64 = 16384;
