@@ -327,6 +327,9 @@ pub struct CompressedAttention {
     indexer: Option<Indexer>,
     /// Largest scratch chunk so far (indexer scores, sparse attention).
     scratch_peak: AtomicUsize,
+    /// Return the index scores from `forward` (diagnostics and tests only:
+    /// `s * T` host floats per call).
+    pub export_scores: bool,
 }
 
 impl CompressedAttention {
@@ -388,6 +391,7 @@ impl CompressedAttention {
             compressor,
             indexer,
             scratch_peak: AtomicUsize::new(0),
+            export_scores: false,
         })
     }
 
@@ -409,7 +413,9 @@ impl CompressedAttention {
     /// (this layer's own when it is the source, appended here; else already
     /// advanced by the source in this forward). `shared` carries the index
     /// source's top-k and the candidate blocks down the stack. Returns the
-    /// output and, at an index source, the scores before the final top-k.
+    /// output and, at an index source with `export_scores`, the scores before
+    /// the final top-k. Source positions are checked before any cache moves;
+    /// a later failure can leave the window advanced (reset the session).
     pub fn forward(
         &self,
         x: &MxArray,
@@ -425,6 +431,17 @@ impl CompressedAttention {
         if src.ratio != self.ratio {
             return Err(bad(format!("source ratio {} != {}", src.ratio, self.ratio)));
         }
+        let want = if self.compressor.is_some() {
+            start
+        } else {
+            end
+        };
+        if src.len != want {
+            return Err(bad(format!(
+                "source cache at {}, call at {start}+{s}",
+                src.len
+            )));
+        }
         let (cos, sin) = self.core.rope(start, s)?;
         let (qr, q) = self.core.query(x, &cos, &sin)?;
         let kv = self.core.quant_kv(&self.core.kv_rotated(x, &cos, &sin)?)?;
@@ -437,9 +454,6 @@ impl CompressedAttention {
         let mut ckv = src.kv.clone();
         let mut latent = None;
         if let Some(comp) = &self.compressor {
-            if src.len != start {
-                return Err(bad(format!("source cache at {}, call at {start}", src.len)));
-            }
             let g0 = src.rows();
             latent = comp.forward(x, start, &mut tail)?.map(|l| (g0, l));
             if let (Some(ix), Some((g0, l))) = (&self.indexer, &latent)
@@ -451,11 +465,6 @@ impl CompressedAttention {
                     &ix.index_keys(l, &c, &sn)?,
                 )?);
             }
-        } else if src.len != end {
-            return Err(bad(format!(
-                "source cache at {}, consumer at {end}",
-                src.len
-            )));
         }
 
         let mut scores = None;
@@ -480,9 +489,10 @@ impl CompressedAttention {
                     ik,
                     &mut shared.candidates,
                     &mut peak,
+                    self.export_scores,
                 )?;
                 self.scratch_peak.fetch_max(peak, Ordering::Relaxed);
-                scores = Some(sc);
+                scores = sc;
                 tk
             };
             shared.topk = Some(topk);

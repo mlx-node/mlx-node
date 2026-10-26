@@ -96,10 +96,13 @@ impl Compressor {
         let hd = kv.shape_at(1)?;
         let rows = |a: &MxArray, lo: i64, hi: i64| a.slice(&[lo, 0], &[hi, hd]);
         let (new_kv, new_score) = if rem > 0 {
-            (
-                Some(rows(&kv, total - rem, total)?),
-                Some(rows(&score, total - rem, total)?),
-            )
+            // independent copies: a slice view would pin the whole projections
+            let (k, sc) = (
+                rows(&kv, total - rem, total)?.deep_copy()?,
+                rows(&score, total - rem, total)?.deep_copy()?,
+            );
+            MxArray::eval_arrays_with_context(&[&k, &sc], "deepseek_v41 compressor tail")?;
+            (Some(k), Some(sc))
         } else {
             (None, None)
         };

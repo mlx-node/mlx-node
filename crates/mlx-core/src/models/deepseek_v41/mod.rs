@@ -7,6 +7,7 @@ pub mod compressor;
 pub mod config;
 pub mod engram_hash;
 pub mod indexer;
+pub mod moe;
 pub mod ops;
 
 #[cfg(test)]

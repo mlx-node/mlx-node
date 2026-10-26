@@ -189,7 +189,8 @@ impl Indexer {
     /// rows `x`/`qr` `[s, *]` at positions `start..`, `-inf` past each row's
     /// visible count and, for a candidate consumer, outside the kept blocks.
     /// A candidate source publishes its kept blocks into `cands`. Returns the
-    /// host scores `[s * T]` and the selection.
+    /// selection and, only when `keep_scores` (diagnostics: `s * T` floats),
+    /// the host scores `[s * T]`.
     #[allow(clippy::too_many_arguments)]
     pub fn select(
         &self,
@@ -201,7 +202,8 @@ impl Indexer {
         index_k: &MxArray,
         cands: &mut Option<Candidates>,
         scratch_peak: &mut usize,
-    ) -> Result<(Vec<f32>, TopK)> {
+        keep_scores: bool,
+    ) -> Result<(Option<Vec<f32>>, TopK)> {
         let s = x.shape_at(0)? as usize;
         let t = index_k.shape_at(0)? as usize;
         let ratio = self.ratio;
@@ -211,7 +213,7 @@ impl Indexer {
             )));
         }
         let kk = self.topk.min(t);
-        let mut scores = Vec::with_capacity(s * t);
+        let mut scores = keep_scores.then(|| Vec::with_capacity(s * t));
         let mut ids = Vec::with_capacity(s * kk);
         let mut keep_all = Vec::new();
         let n_blocks = match self.role {
@@ -287,7 +289,9 @@ impl Indexer {
                 let mut pick = topk_lowest(&v, kk);
                 pick.sort_unstable();
                 ids.extend(pick.iter().map(|&j| if j < vis { j as i32 } else { -1 }));
-                scores.extend(v);
+                if let Some(sc) = scores.as_mut() {
+                    sc.extend(v);
+                }
             }
             lo = hi;
         }

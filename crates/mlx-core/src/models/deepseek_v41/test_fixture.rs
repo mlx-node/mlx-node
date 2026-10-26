@@ -6,7 +6,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 use crate::array::MxArray;
-use crate::utils::gguf::{GgufFile, GgufTensorType, parse_gguf};
+use crate::utils::gguf::{GgufFile, GgufTensorInfo, GgufTensorType, parse_gguf};
 
 pub(super) fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -28,7 +28,8 @@ impl TinyGguf {
         Self { path, gguf }
     }
 
-    pub fn dense(&self, name: &str) -> napi::Result<MxArray> {
+    /// A tensor's header and its data bytes as stored.
+    pub fn raw(&self, name: &str) -> (&GgufTensorInfo, Vec<u8>) {
         let t = self
             .gguf
             .tensors
@@ -38,8 +39,13 @@ impl TinyGguf {
         let mut f = std::fs::File::open(&self.path).unwrap();
         f.seek(SeekFrom::Start(self.gguf.data_offset + t.offset))
             .unwrap();
-        let mut raw = vec![0u8; t.data_size()? as usize];
+        let mut raw = vec![0u8; t.data_size().unwrap() as usize];
         f.read_exact(&mut raw).unwrap();
+        (t, raw)
+    }
+
+    pub fn dense(&self, name: &str) -> napi::Result<MxArray> {
+        let (t, raw) = self.raw(name);
         let vals: Vec<f32> = match t.tensor_type {
             GgufTensorType::F32 => raw
                 .as_chunks::<4>()

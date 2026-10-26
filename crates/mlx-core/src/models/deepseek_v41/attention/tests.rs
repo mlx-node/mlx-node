@@ -244,7 +244,9 @@ mod compressed {
     }
 
     fn layer(f: &Fix, l: usize, fq: FakeQuant) -> CompressedAttention {
-        CompressedAttention::from_gguf(&f.cfg, l, fq, |n| f.gguf.dense(n)).unwrap()
+        let mut a = CompressedAttention::from_gguf(&f.cfg, l, fq, |n| f.gguf.dense(n)).unwrap();
+        a.export_scores = true;
+        a
     }
 
     fn row<'a>(f: &'a Fix, key: &str, i: usize) -> &'a [f32] {
@@ -571,6 +573,21 @@ mod compressed {
         let x = f.npz.rows("c1.fp32_on.L3.x", 0, 3);
         let e = a.forward(&x, 0, &mut win, &mut src, &mut ForwardShared::default());
         assert!(e.is_err(), "consumer before its source");
+        assert_eq!(win.len(), 0, "a refused call must not advance the window");
+        // retry after the source ran: the refused call left nothing behind
+        let mut shared = ForwardShared::default();
+        let s2 = layer(&f, 2, FakeQuant::ON);
+        let x2 = f.npz.rows("c1.fp32_on.L2.x", 0, 3);
+        s2.forward(
+            &x2,
+            0,
+            &mut WindowCache::new(f.cfg.window_size),
+            &mut src,
+            &mut shared,
+        )
+        .unwrap();
+        a.forward(&x, 0, &mut win, &mut src, &mut shared).unwrap();
+        assert_eq!(win.len(), 3);
         let mut src1 = CompressedCache::new(1);
         let a2 = layer(&f, 2, FakeQuant::ON);
         let mut win2 = WindowCache::new(f.cfg.window_size);
