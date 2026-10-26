@@ -89,6 +89,9 @@ impl Tensor {
                 GgufTensorType::PQ2_0 => {
                     return Err(err("Qwen4 does not support PQ2_0 tensor residency"));
                 }
+                GgufTensorType::MXFP8 => {
+                    return Err(err("Qwen4 does not support MXFP8 tensor residency"));
+                }
             },
         };
         n.checked_mul(num)

@@ -119,6 +119,15 @@ typedef struct {
     uint8_t qs[QK_MXFP4/2];
 } block_mxfp4;
 
+// llama.cpp PR #30817 (head b72050d03) ggml-common.h:221-227. Type 43 is not
+// in upstream ggml; the PR is the only definition (DeepSeek-V4.1 engram table).
+// MXFP8 (OCP MX): 32 E4M3 (fn) values sharing one E8M0 scale, value = e4m3(q[j]) * 2^(e - 127)
+#define QK_MXFP8 32
+typedef struct {
+    uint8_t e;          // E8M0
+    uint8_t qs[QK_MXFP8]; // E4M3 (fn) codes
+} block_mxfp8;
+
 // ggml-common.h:378-384
 // (Almost) "true" 2-bit quantization.
 // Due to the need to use blocks as per ggml design, it ends up using
@@ -196,6 +205,7 @@ typedef union {
 #define GGML_Q2K_BLOCK_BYTES 84
 #define GGML_Q5_0_BLOCK_BYTES 22
 #define GGML_MXFP4_BLOCK_BYTES 17
+#define GGML_MXFP8_BLOCK_BYTES 33
 #define GGML_Q4K_BLOCK_BYTES 144
 #define GGML_Q5K_BLOCK_BYTES 176
 #define GGML_Q6K_BLOCK_BYTES 210
@@ -269,6 +279,12 @@ void dequantize_row_iq1_m(const block_iq1_m *x, float *y, int64_t k);
 // ggml-impl.h:477 — verbatim (`ggml_e8m0_to_fp32_half`), exported so the
 // parity gate can state the E8M0 decode it compares against.
 float ggml_ref_e8m0_to_fp32_half(uint8_t x);
+
+// llama.cpp PR #30817 ggml-quants.c dequantize_row_mxfp8 (diff hunk @@ -586 +615)
+// and ggml-impl.h ggml_e4m3_to_fp32 (hunk @@ -564 +564) — verbatim; the scale
+// is upstream ggml-impl.h:439 ggml_e8m0_to_fp32. Exported for the MXFP8 gate.
+void dequantize_row_mxfp8(const block_mxfp8 *x, float *y, int64_t k);
+float ggml_ref_e4m3_to_fp32(uint8_t x);
 
 #ifdef __cplusplus
 }

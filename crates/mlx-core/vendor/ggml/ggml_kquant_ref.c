@@ -17,6 +17,7 @@
 #include "ggml_kquant_ref.h"
 
 #include <assert.h>
+#include <math.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -39,6 +40,7 @@ _Static_assert(offsetof(block_q5_0, qh) == GGML_Q5_0_QH_OFFSET, "q5_0 qh");
 _Static_assert(offsetof(block_q5_0, qs) == GGML_Q5_0_QS_OFFSET, "q5_0 qs");
 _Static_assert(sizeof(block_mxfp4) == GGML_MXFP4_BLOCK_BYTES, "mxfp4 block size");
 _Static_assert(offsetof(block_mxfp4, qs) == GGML_MXFP4_QS_OFFSET, "mxfp4 qs");
+_Static_assert(sizeof(block_mxfp8) == GGML_MXFP8_BLOCK_BYTES, "mxfp8 block size");
 _Static_assert(sizeof(block_iq2_xxs) == GGML_IQ2XXS_BLOCK_BYTES, "iq2_xxs block size");
 _Static_assert(sizeof(block_iq2_xs) == GGML_IQ2XS_BLOCK_BYTES, "iq2_xs block size");
 _Static_assert(sizeof(block_iq2_s) == GGML_IQ2S_BLOCK_BYTES, "iq2_s block size");
@@ -62,6 +64,63 @@ _Static_assert(offsetof(block_iq3_s, scales) == 106, "iq3_s scales");
 #define GGML_RESTRICT restrict
 #define GGML_FP16_TO_FP32(x) ggml_ref_fp16_to_fp32(x)
 #define GGML_E8M0_TO_FP32_HALF(x) ggml_e8m0_to_fp32_half(x)
+#define GGML_E8M0_TO_FP32(x) ggml_e8m0_to_fp32(x)
+
+// ===== ggml-impl.h:439 ======================================================
+static inline float ggml_e8m0_to_fp32(uint8_t x) {
+    uint32_t bits;  // Stores the raw bit representation of the float
+
+    // Handle special case for minimum exponent (denormalized float)
+    if (x == 0) {
+        // Bit pattern for 2^(-127):
+        // - Sign bit: 0 (positive)
+        // - Exponent: 0 (denormalized number)
+        // - Mantissa: 0x400000 (0.5 in fractional form)
+        // Value = 0.5 * 2^(-126) = 2^(-127)
+        bits = 0x00400000;
+    }
+    // note: disabled as we don't need to handle NaNs
+    //// Handle special case for NaN (all bits set)
+    //else if (x == 0xFF) {
+    //    // Standard quiet NaN pattern:
+    //    // - Sign bit: 0
+    //    // - Exponent: all 1s (0xFF)
+    //    // - Mantissa: 0x400000 (quiet NaN flag)
+    //    bits = 0x7FC00000;
+    //}
+    // Normalized values (most common case)
+    else {
+        // Construct normalized float by shifting exponent into position:
+        // - Exponent field: 8 bits (positions 30-23)
+        // - Mantissa: 0 (implicit leading 1)
+        // Value = 2^(x - 127)
+        bits = (uint32_t) x << 23;
+    }
+
+    float result;  // Final float value
+                   // Safely reinterpret bit pattern as float without type-punning issues
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+// ===== llama.cpp PR #30817 ggml-impl.h (hunk @@ -564,6 +564,50 @@) =========
+// E4M3 (fn): signed, 4 exp bits (bias=7), 3 mantissa bits, no inf, 0x7F/0xFF = NaN (used by MXFP8)
+static inline float ggml_e4m3_to_fp32(uint8_t x) {
+    const int sign = x & 0x80;
+    const int exp  = (x >> 3) & 0xF;
+    const int man  = x & 0x7;
+    float v;
+    if (exp == 0xF && man == 0x7) {
+        v = NAN;
+    } else if (exp == 0) {
+        v = ldexpf((float) man, -9);
+    } else {
+        v = ldexpf((float) (8 + man), exp - 10);
+    }
+    return sign ? -v : v;
+}
+
+float ggml_ref_e4m3_to_fp32(uint8_t x) { return ggml_e4m3_to_fp32(x); }
 
 // ===== ggml-impl.h:477 ======================================================
 // Equal to ggml_e8m0_to_fp32/2
@@ -241,6 +300,24 @@ void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_REST
 
             y[i*qk + j + 0   ] = x0*d;
             y[i*qk + j + qk/2] = x1*d;
+        }
+    }
+}
+
+// ===== llama.cpp PR #30817 ggml-quants.c (hunk @@ -586,6 +615,23 @@) =========
+void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP8;
+
+    assert(k % qk == 0);
+
+    const int64_t nb = k / qk;
+
+    for (int64_t i = 0; i < nb; i++) {
+        // exact: e4m3 * 2^(e-127) is representable in fp32 for every code and scale
+        const float d = x[i].e == 0xFF ? NAN : GGML_E8M0_TO_FP32(x[i].e);
+
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = ggml_e4m3_to_fp32(x[i].qs[j])*d;
         }
     }
 }
