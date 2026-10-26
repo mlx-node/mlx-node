@@ -1147,6 +1147,19 @@ impl Store {
         &mut self,
         admit: &mut impl FnMut(u64) -> Result<()>,
     ) -> Result<()> {
+        self.activate_expert_slots_with_reclaim(
+            admit,
+            &mut || crate::array::memory::get_cache_memory(),
+            &mut || crate::array::memory::clear_cache(),
+        )
+    }
+
+    fn activate_expert_slots_with_reclaim(
+        &mut self,
+        admit: &mut impl FnMut(u64) -> Result<()>,
+        cache_size: &mut impl FnMut() -> f64,
+        reclaim: &mut impl FnMut(),
+    ) -> Result<()> {
         if self
             .slot_reclaim_since
             .is_some_and(|since| since.elapsed() >= SLOT_RECLAIM_FALLBACK)
@@ -1165,7 +1178,12 @@ impl Store {
             let bytes = suspended_bytes
                 .checked_add(DIRECT_STAGING_BYTES)
                 .ok_or_else(|| err("Qwen4 activation admission overflows u64"))?;
-            if let Err(error) = admit(bytes) {
+            let mut admitted = admit(bytes);
+            if admitted.is_err() && cache_size() > 0.0 {
+                reclaim();
+                admitted = admit(bytes);
+            }
+            if let Err(error) = admitted {
                 self.activation_error = Some(error.reason.clone());
                 return Err(error);
             }
@@ -1231,7 +1249,17 @@ impl Store {
         &mut self,
         admit: &mut impl FnMut(u64) -> Result<()>,
     ) -> Result<()> {
-        self.activate_expert_slots_with(admit)
+        self.activate_expert_slots_with_reclaim(admit, &mut || 0.0, &mut || {})
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn begin_turn_with_reclaim(
+        &mut self,
+        admit: &mut impl FnMut(u64) -> Result<()>,
+        cache_size: &mut impl FnMut() -> f64,
+        reclaim: &mut impl FnMut(),
+    ) -> Result<()> {
+        self.activate_expert_slots_with_reclaim(admit, cache_size, reclaim)
     }
 
     #[cfg(test)]

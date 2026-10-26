@@ -2762,6 +2762,8 @@ mod cache_tests {
 mod direct_tests {
     use super::*;
     use crate::models::qwen4_exp::memory;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::time::{Duration, Instant};
 
     struct Temp(PathBuf);
@@ -3614,6 +3616,36 @@ mod direct_tests {
         assert!(store.device_slots_ready(LAYERS));
     }
 
+    fn begin_turn_scripted(
+        store: &mut Store,
+        cached: f64,
+        outcomes: Vec<Result<()>>,
+    ) -> (Result<()>, Vec<String>) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut outcomes = outcomes.into_iter();
+        let mut admit = {
+            let events = Rc::clone(&events);
+            move |bytes| {
+                events.borrow_mut().push(format!("admit:{bytes}"));
+                outcomes.next().expect("unexpected activation admission")
+            }
+        };
+        let mut cache_size = {
+            let events = Rc::clone(&events);
+            move || {
+                events.borrow_mut().push("cache".into());
+                cached
+            }
+        };
+        let mut reclaim = {
+            let events = Rc::clone(&events);
+            move || events.borrow_mut().push("reclaim".into())
+        };
+        let result = store.begin_turn_with_reclaim(&mut admit, &mut cache_size, &mut reclaim);
+        let events = events.borrow().clone();
+        (result, events)
+    }
+
     #[test]
     fn direct_gguf_full_purge_reactivates_only_after_fresh_admission() {
         if !crate::utils::gguf_gpu::gpu_repack_available() {
@@ -3649,18 +3681,28 @@ mod direct_tests {
         let before_windows = store.direct_read_windows.len();
         let before_filled = store.live.direct_filled_layers.load(Ordering::Acquire);
 
-        let mut pressured_bytes = Vec::new();
-        let error = store
-            .begin_turn_with(&mut |bytes| {
-                pressured_bytes.push(bytes);
-                Err(err("injected full activation pressure"))
-            })
-            .unwrap_err();
-        assert!(error.reason.contains("full activation pressure"));
-        assert_eq!(pressured_bytes, [expected_admission]);
+        let (result, events) = begin_turn_scripted(
+            &mut store,
+            1.0,
+            vec![
+                Err(err("injected full activation pressure A")),
+                Err(err("injected full activation pressure B")),
+            ],
+        );
+        let error = result.unwrap_err();
+        assert!(error.reason.contains("full activation pressure B"));
+        assert_eq!(
+            events,
+            vec![
+                format!("admit:{expected_admission}"),
+                "cache".into(),
+                "reclaim".into(),
+                format!("admit:{expected_admission}"),
+            ]
+        );
         assert_eq!(
             store.activation_error.as_deref(),
-            Some("injected full activation pressure")
+            Some("injected full activation pressure B")
         );
         assert_eq!(store.slot_suspend_states_for_test(), purge_state);
         assert!(store.direct_fill.is_none());
@@ -3677,20 +3719,27 @@ mod direct_tests {
 
         let error = store.expert_slots(0, EXPERTS, 2, &ids).err().unwrap();
         assert!(error.reason.contains("expert bank activation refused"));
-        assert!(error.reason.contains("full activation pressure"));
+        assert!(error.reason.contains("full activation pressure B"));
         assert_eq!(store.slot_suspend_states_for_test(), purge_state);
         assert_eq!(store.bytes_read, before_reads);
         assert_eq!(store.slot_upload_bytes, before_upload);
         assert_eq!(store.direct_read_windows.len(), before_windows);
 
-        let mut quiet_bytes = Vec::new();
-        store
-            .begin_turn_with(&mut |bytes| {
-                quiet_bytes.push(bytes);
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(quiet_bytes, [expected_admission]);
+        let (result, events) = begin_turn_scripted(
+            &mut store,
+            1.0,
+            vec![Err(err("transient full activation refusal")), Ok(())],
+        );
+        result.unwrap();
+        assert_eq!(
+            events,
+            vec![
+                format!("admit:{expected_admission}"),
+                "cache".into(),
+                "reclaim".into(),
+                format!("admit:{expected_admission}"),
+            ]
+        );
         assert!(store.activation_error.is_none());
         for layer in 0..LAYERS {
             let (banks, local, capacity) = store
@@ -3711,21 +3760,43 @@ mod direct_tests {
             store.live.direct_filled_layers.load(Ordering::Acquire),
             LAYERS as u64
         );
-        store
-            .begin_turn_with(&mut |_| -> Result<()> {
-                panic!("active banks must not be admitted again")
-            })
-            .unwrap();
+        let (result, events) = begin_turn_scripted(&mut store, 1.0, Vec::new());
+        result.unwrap();
+        assert!(events.is_empty());
 
         // A successful activation retry clears its own refusal, never an
         // unrelated asynchronous worker failure.
         store.purge_expert_slots().unwrap();
-        store
-            .begin_turn_with(&mut |_| Err(err("second full activation refusal")))
+        let mut zero_cache_bytes = Vec::new();
+        let error = store
+            .begin_turn_with(&mut |bytes| {
+                zero_cache_bytes.push(bytes);
+                Err(err("second full activation refusal"))
+            })
             .unwrap_err();
+        assert!(error.reason.contains("second full activation refusal"));
+        assert_eq!(zero_cache_bytes, [expected_admission]);
+        assert_eq!(
+            store.activation_error.as_deref(),
+            Some("second full activation refusal")
+        );
         store.direct_error = Some("unrelated asynchronous worker error".into());
         let before_worker_error_reads = store.bytes_read;
-        store.begin_turn_with(&mut |_| Ok(())).unwrap();
+        let (result, events) = begin_turn_scripted(
+            &mut store,
+            1.0,
+            vec![Err(err("transient full worker activation refusal")), Ok(())],
+        );
+        result.unwrap();
+        assert_eq!(
+            events,
+            vec![
+                format!("admit:{expected_admission}"),
+                "cache".into(),
+                "reclaim".into(),
+                format!("admit:{expected_admission}"),
+            ]
+        );
         assert!(store.activation_error.is_none());
         assert_eq!(
             store.direct_error.as_deref(),
@@ -3825,15 +3896,29 @@ mod direct_tests {
         let before_windows = store.direct_read_windows.len();
         let before_misses = store.slot_misses;
         let before_cache = store.cache_bytes;
-        let mut pressured_bytes = Vec::new();
-        let error = store
-            .begin_turn_with(&mut |bytes| {
-                pressured_bytes.push(bytes);
-                Err(err("injected partial activation pressure"))
-            })
-            .unwrap_err();
-        assert!(error.reason.contains("partial activation pressure"));
-        assert_eq!(pressured_bytes, [expected_admission]);
+        let (result, events) = begin_turn_scripted(
+            &mut store,
+            1.0,
+            vec![
+                Err(err("injected partial activation pressure A")),
+                Err(err("injected partial activation pressure B")),
+            ],
+        );
+        let error = result.unwrap_err();
+        assert!(error.reason.contains("partial activation pressure B"));
+        assert_eq!(
+            events,
+            vec![
+                format!("admit:{expected_admission}"),
+                "cache".into(),
+                "reclaim".into(),
+                format!("admit:{expected_admission}"),
+            ]
+        );
+        assert_eq!(
+            store.activation_error.as_deref(),
+            Some("injected partial activation pressure B")
+        );
         assert_eq!(store.slot_suspend_states_for_test(), purge_state);
         assert!(store.direct_fill.is_none());
         assert_eq!(store.bytes_read, before_reads);
@@ -3843,21 +3928,28 @@ mod direct_tests {
 
         let error = store.expert_slots(0, EXPERTS, 2, &ids).err().unwrap();
         assert!(error.reason.contains("expert bank activation refused"));
-        assert!(error.reason.contains("partial activation pressure"));
+        assert!(error.reason.contains("partial activation pressure B"));
         assert_eq!(store.slot_suspend_states_for_test(), purge_state);
         assert_eq!(store.bytes_read, before_reads);
         assert_eq!(store.slot_upload_bytes, before_upload);
         assert_eq!(store.direct_read_windows.len(), before_windows);
         assert_eq!(store.slot_misses, before_misses);
 
-        let mut quiet_bytes = Vec::new();
-        store
-            .begin_turn_with(&mut |bytes| {
-                quiet_bytes.push(bytes);
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(quiet_bytes, [expected_admission]);
+        let (result, events) = begin_turn_scripted(
+            &mut store,
+            1.0,
+            vec![Err(err("transient partial activation refusal")), Ok(())],
+        );
+        result.unwrap();
+        assert_eq!(
+            events,
+            vec![
+                format!("admit:{expected_admission}"),
+                "cache".into(),
+                "reclaim".into(),
+                format!("admit:{expected_admission}"),
+            ]
+        );
         assert!(store.activation_error.is_none());
         let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
         assert_eq!(local, ids);
@@ -3868,11 +3960,38 @@ mod direct_tests {
         assert_eq!(store.cache_bytes, before_cache);
         assert_eq!(store.slot_misses, before_misses + ids.len() as u64);
         assert!(store.device_slots_ready(1));
-        store
-            .begin_turn_with(&mut |_| -> Result<()> {
-                panic!("active partial banks must not be admitted again")
-            })
-            .unwrap();
+        let (result, events) = begin_turn_scripted(&mut store, 1.0, Vec::new());
+        result.unwrap();
+        assert!(events.is_empty());
+
+        store.purge_expert_slots().unwrap();
+        let before_zero_cache_reads = store.bytes_read;
+        let (result, events) = begin_turn_scripted(
+            &mut store,
+            0.0,
+            vec![Err(err("partial zero-cache activation refusal"))],
+        );
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .reason
+                .contains("partial zero-cache activation refusal")
+        );
+        assert_eq!(
+            events,
+            vec![format!("admit:{expected_admission}"), "cache".into()]
+        );
+        assert_eq!(
+            store.activation_error.as_deref(),
+            Some("partial zero-cache activation refusal")
+        );
+        assert_eq!(store.bytes_read, before_zero_cache_reads);
+
+        let (result, events) = begin_turn_scripted(&mut store, 1.0, vec![Ok(())]);
+        result.unwrap();
+        assert_eq!(events, vec![format!("admit:{expected_admission}")]);
+        assert!(store.activation_error.is_none());
+        assert_eq!(store.bytes_read, before_zero_cache_reads);
     }
 
     #[test]
