@@ -1,6 +1,6 @@
 {
   "name": "@mlx-node/rerank",
-  "version": "0.0.16",
+  "version": "0.0.17",
   "description": "Native reranking on Apple Silicon",
   "license": "MIT",
   "repository": {
