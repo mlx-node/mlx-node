@@ -423,3 +423,6 @@ fn real_header_inventory() {
         assert_eq!(checked, 1043);
     }
 }
+
+// S9 tiny end-to-end gates
+include!("tests_model.rs");

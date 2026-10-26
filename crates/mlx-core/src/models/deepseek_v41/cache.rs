@@ -7,6 +7,7 @@ use crate::array::MxArray;
 /// The sliding-window KV of one layer: the last `window` rows (post-RoPE,
 /// after the fp8 round trip), kept in position order. The reference keeps
 /// the same rows in a ring with position `p` in slot `p % window`.
+#[derive(Clone)]
 pub struct WindowCache {
     window: usize,
     rows: Option<MxArray>,
@@ -101,6 +102,7 @@ pub struct ForwardShared {
 /// The compressed state a KV source layer owns, read by every layer that
 /// uses it: compressed KV rows (post RoPE, after the latent round trip),
 /// index keys (when the source owns them) and the compressor's tail.
+#[derive(Clone)]
 pub struct CompressedCache {
     pub ratio: usize,
     /// Positions consumed so far.

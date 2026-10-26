@@ -120,6 +120,7 @@ impl Compressor {
         let e = score.sub(&score.max(Some(&[1]), Some(true))?)?.exp()?;
         let p = e.div(&e.sum(Some(&[1]), Some(true))?)?;
         let pooled = kv.mul(&p)?.sum(Some(&[1]), Some(false))?;
+        super::model::fp32_site("compressor_ratio2", usize::MAX, &pooled)?;
         Ok(Some(rms_norm(
             &pooled.astype(x.dtype()?)?,
             &self.w.norm,

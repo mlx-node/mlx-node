@@ -104,6 +104,14 @@ impl Npz {
                 words.map(f32::from_le_bytes).collect()
             } else if header.contains("'descr': '<i4'") {
                 words.map(|w| i32::from_le_bytes(w) as f32).collect()
+            } else if header.contains("'descr': '<u2'") {
+                // bf16 bit patterns (`<key>@bf16`), widened exactly
+                let halves = data.as_chunks::<2>().0.iter();
+                halves
+                    .map(|&h| f32::from_bits(u32::from(u16::from_le_bytes(h)) << 16))
+                    .collect()
+            } else if header.contains("'descr': '|b1'") {
+                data.iter().map(|&b| f32::from(b)).collect()
             } else {
                 panic!("{key}: unsupported dtype in {header}")
             };

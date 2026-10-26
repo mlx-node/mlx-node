@@ -263,6 +263,7 @@ fn rows_independent_of_call_split() {
                         k: m.k,
                         ids: routes.ids[span.clone()].to_vec(),
                         weights: routes.weights[span].to_vec(),
+                        biased: Vec::new(),
                     };
                     let got = read(&m.routed(&xs, &same).unwrap());
                     let want = &all[lo * per_row..hi * per_row];
@@ -292,6 +293,7 @@ fn by_expert_keeps_pairs() {
         k: 3,
         ids: vec![7, 2, 5, 0, 9, 1],
         weights: vec![0.7, 0.2, 0.5, 0.0, 0.9, 0.1],
+        biased: Vec::new(),
     };
     let (ids, w) = r.by_expert();
     assert_eq!(ids, vec![2, 5, 7, 0, 1, 9]);

@@ -44,6 +44,14 @@ impl ExpertBank {
                 info.mlx_shape()
             )));
         }
+        let want = info.data_size()?;
+        if blocks.len() as u64 != want {
+            return Err(bad(format!(
+                "{}: {} payload bytes, the header says {want}",
+                info.name,
+                blocks.len()
+            )));
+        }
         let (dst, ptrs) = RepackDst::alloc(info, OutLayout::RowMajor)?;
         decode_affine_band_into(info.tensor_type, blocks, 0, ptrs.rows, ptrs.k, &ptrs)?;
         let scales = dst
@@ -131,6 +139,9 @@ pub struct Routes {
     pub k: usize,
     pub ids: Vec<u32>,
     pub weights: Vec<f32>,
+    /// Router scores + bias `[rows * n_experts]` (f32) the picks came from
+    /// (diagnostics: the near-tie margin of each row).
+    pub biased: Vec<f32>,
 }
 
 impl Routes {
@@ -205,10 +216,17 @@ impl Moe {
         })
     }
 
+    /// Experts per row.
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
     /// `Gate.forward`: f32 logits, `sqrt(softplus)`, top-k of scores + bias on
     /// the host (one sync), weights from the unbiased scores.
     pub fn route(&self, x: &MxArray) -> Result<Routes> {
-        let scores = router_scores(&linear(&x.astype(DType::Float32)?, &self.w.router)?)?;
+        let logits = linear(&x.astype(DType::Float32)?, &self.w.router)?;
+        super::model::fp32_site("router_logits", usize::MAX, &logits)?;
+        let scores = router_scores(&logits)?;
         let s = scores.to_float32()?.to_vec();
         let n = self.n_experts;
         let biased: Vec<f32> = s
@@ -221,6 +239,7 @@ impl Moe {
             k: self.k,
             ids,
             weights,
+            biased,
         })
     }
 
@@ -230,7 +249,13 @@ impl Moe {
     pub fn routed(&self, x: &MxArray, routes: &Routes) -> Result<MxArray> {
         let (rows, dim) = (x.shape_at(0)?, x.shape_at(1)?);
         let k = self.k as i64;
-        if routes.k != self.k || routes.rows() as i64 != rows {
+        let n = self.n_experts as u32;
+        if routes.k != self.k
+            || routes.ids.len() != routes.weights.len()
+            || routes.rows() as i64 != rows
+            || routes.ids.len() != routes.rows() * routes.k
+            || routes.ids.iter().any(|&e| e >= n)
+        {
             return Err(bad(format!(
                 "routes for {} rows x {} do not fit {rows} rows x {k}",
                 routes.rows(),
@@ -270,6 +295,7 @@ impl Moe {
             y = y.add(&col.astype(DType::Float32)?)?;
         }
         y = y.add(&self.shared(x)?.astype(DType::Float32)?)?;
+        super::model::fp32_site("moe_sum", usize::MAX, &y)?;
         Ok((y.astype(x.dtype()?)?, routes))
     }
 }

@@ -92,6 +92,7 @@ pub(crate) fn rms_norm(x: &MxArray, w: &MxArray, eps: f32) -> Result<MxArray> {
         .add_scalar(f64::from(eps))?
         .sqrt()?
         .reciprocal()?;
+    super::model::fp32_site("rms_norm", usize::MAX, &r)?;
     w.astype(DType::Float32)?
         .mul(&xf.mul(&r)?)?
         .astype(x.dtype()?)
@@ -299,6 +300,7 @@ pub(crate) fn sparse_sink_attention(
             .astype(DType::Float32)?;
         let sc = qc.matmul(&g.transpose(Some(&[0, 2, 1]))?)?;
         let sc = valid.where_(&sc, &neg_inf)?.mul_scalar(f64::from(scale))?;
+        super::model::fp32_site("attn_scores", usize::MAX, &sc)?;
         let m = sc.max(Some(&[-1]), Some(true))?.maximum(&floor)?;
         let p = sc.sub(&m)?.exp()?;
         let den = p.sum(Some(&[-1]), Some(true))?.add(&sink.sub(&m)?.exp()?)?;
