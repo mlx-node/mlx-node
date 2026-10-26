@@ -1,3 +1,29 @@
+function hasDigits(value: string): boolean {
+  if (value.length === 0) return false;
+  for (const char of value) {
+    if (char < '0' || char > '9') return false;
+  }
+  return true;
+}
+
+/** Accept the bare version and grok-branded banner emitted by supported agents. */
+export function hasAgentVersionBanner(banner: string): boolean {
+  const trimmed = banner.trim();
+  const value = trimmed.startsWith('grok ') ? trimmed.slice('grok '.length) : trimmed;
+  const separator = value.indexOf(' ');
+  const version = separator === -1 ? value : value.slice(0, separator);
+  const parts = version.split('.');
+  const third = parts[2] ?? '';
+  return (
+    parts.length >= 3 &&
+    hasDigits(parts[0]) &&
+    hasDigits(parts[1]) &&
+    third.length > 0 &&
+    third[0] >= '0' &&
+    third[0] <= '9'
+  );
+}
+
 /** Exercise the packaged CLI through the same launcher used by coding agents. */
 import { execFileSync } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -28,7 +54,7 @@ export async function verifyBundledCli(appPath: string): Promise<void> {
       timeout: 30_000,
       maxBuffer: 256 * 1024,
     }).trim();
-    if (!/^\d+\.\d+\.\d+/.test(version)) throw new Error(`The packaged agent did not report its version: ${version}`);
+    if (!hasAgentVersionBanner(version)) throw new Error(`The packaged agent did not report its version: ${version}`);
     // These enter the download modules and instantiate Keyring without reading
     // credentials or downloading anything. delegate --help never imports it.
     for (const args of [['download'], ['download', 'model'], ['download', 'dataset']]) {
