@@ -2,6 +2,8 @@
 //! (Unsloth UD-Q4_K_XL: MXFP4 experts, Q8_0 / F32 dense, MXFP8 engram table).
 
 pub mod config;
+pub mod engram_hash;
+pub mod ops;
 
 #[cfg(test)]
 mod tests;

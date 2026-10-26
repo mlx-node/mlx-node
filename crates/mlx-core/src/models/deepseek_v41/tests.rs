@@ -166,11 +166,12 @@ fn config_refuses_bad_metadata() {
     }
 }
 
-fn open_nocache(path: &std::path::Path) -> std::fs::File {
-    use std::os::fd::AsRawFd;
+pub(super) fn open_nocache(path: &std::path::Path) -> std::fs::File {
     let f = std::fs::File::open(path).unwrap();
     // SAFETY: valid descriptor; both flags only change caching / readahead.
+    #[cfg(target_os = "macos")]
     unsafe {
+        use std::os::fd::AsRawFd;
         assert_eq!(libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1), 0);
         assert_eq!(libc::fcntl(f.as_raw_fd(), libc::F_RDAHEAD, 0), 0);
     }
