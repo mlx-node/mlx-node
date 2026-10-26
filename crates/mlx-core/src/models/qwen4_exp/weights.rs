@@ -3197,6 +3197,7 @@ mod direct_tests {
         if !crate::utils::gguf_gpu::gpu_repack_available() {
             return;
         }
+        let _host = memory::scoped_fixture_host();
         let temp = Temp::new();
         let paths = write_split_fixture_layout_with_empty_first(
             &temp.0,
@@ -3427,6 +3428,7 @@ mod direct_tests {
         if !crate::utils::gguf_gpu::gpu_repack_available() {
             return;
         }
+        let _host = memory::scoped_fixture_host();
         let temp = Temp::new();
         let path = temp.0.join("quantized-fixture.gguf");
         let base_config = super::super::tests::write_direct_gguf_fixture(&path);
@@ -3546,6 +3548,7 @@ mod direct_tests {
         if !crate::utils::gguf_gpu::gpu_repack_available() {
             return;
         }
+        let _host = memory::scoped_fixture_host();
         const LAYERS: usize = 3;
         let temp = Temp::new();
         let gguf = temp.0.join("full-capacity.gguf");
@@ -4023,6 +4026,7 @@ mod direct_tests {
         if !crate::utils::gguf_gpu::gpu_repack_available() {
             return;
         }
+        let _host = memory::scoped_fixture_host();
         let temp = Temp::new();
         let gguf = temp.0.join("idle-fallback.gguf");
         write_fixture(&gguf);

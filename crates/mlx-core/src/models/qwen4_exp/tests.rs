@@ -1256,6 +1256,7 @@ fn flash_next_load_writes_no_derived_weight_pack() {
         ])
         .env(CHILD, "1")
         .env(MODEL, &model)
+        .env(memory::FIXTURE_HOST_ENV, "1")
         .env("HOME", &home)
         .env("MLX_NATIVE_GGUF_CACHE_DIR", &assets)
         .env_remove("MLX_QWEN4_RESIDENCY")

@@ -86,6 +86,56 @@ impl HostMemory {
     }
 }
 
+#[cfg(test)]
+pub(super) const FIXTURE_HOST_ENV: &str = "MLX_QWEN4_FIXTURE_HOST";
+
+#[cfg(test)]
+thread_local! {
+    static TEST_HOST: std::cell::Cell<Option<HostMemory>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) struct TestHostGuard(Option<HostMemory>);
+
+#[cfg(test)]
+impl Drop for TestHostGuard {
+    fn drop(&mut self) {
+        TEST_HOST.with(|host| host.set(self.0));
+    }
+}
+
+/// A constrained host whose tiny direct fixtures fit the unchanged reserves.
+#[cfg(test)]
+fn fixture_host() -> HostMemory {
+    HostMemory {
+        physical: 16 << 30,
+        free: 8 << 30,
+        file: 4 << 30,
+        anonymous: 1 << 30,
+        purgeable: 0,
+        wired: 2 << 30,
+        compressor: 1 << 30,
+    }
+}
+
+#[cfg(test)]
+fn scoped_test_host(host: HostMemory) -> TestHostGuard {
+    TestHostGuard(TEST_HOST.with(|current| current.replace(Some(host))))
+}
+
+#[cfg(test)]
+pub(super) fn scoped_fixture_host() -> TestHostGuard {
+    scoped_test_host(fixture_host())
+}
+
+#[cfg(test)]
+fn test_host_override() -> Option<HostMemory> {
+    TEST_HOST
+        .with(|host| host.get())
+        .or_else(|| std::env::var_os(FIXTURE_HOST_ENV).map(|_| fixture_host()))
+}
+
 /// The residency decision as a byte budget for anonymous direct banks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct BankGate {
@@ -328,11 +378,19 @@ pub(super) fn check_growth_headroom_with(host: &HostMemory, direct_gate: bool) -
 
 #[cfg(target_os = "macos")]
 fn physical_memory() -> Result<u64> {
+    #[cfg(test)]
+    if let Some(host) = test_host_override() {
+        return Ok(host.physical);
+    }
     crate::utils::host::physical_memory()
         .ok_or_else(|| Error::from_reason("Cannot read physical memory for Qwen4 residency"))
 }
 #[cfg(not(target_os = "macos"))]
 fn physical_memory() -> Result<u64> {
+    #[cfg(test)]
+    if let Some(host) = test_host_override() {
+        return Ok(host.physical);
+    }
     Ok(0)
 }
 
@@ -376,6 +434,10 @@ fn available_memory() -> Result<u64> {
 
 #[cfg(target_os = "macos")]
 pub(super) fn host_memory() -> Result<HostMemory> {
+    #[cfg(test)]
+    if let Some(host) = test_host_override() {
+        return Ok(host);
+    }
     unsafe extern "C" {
         fn mach_host_self() -> libc::mach_port_t;
         static mach_task_self_: libc::mach_port_t;
@@ -418,6 +480,10 @@ pub(super) fn host_memory() -> Result<HostMemory> {
 
 #[cfg(not(target_os = "macos"))]
 pub(super) fn host_memory() -> Result<HostMemory> {
+    #[cfg(test)]
+    if let Some(host) = test_host_override() {
+        return Ok(host);
+    }
     Err(Error::from_reason(
         "Qwen4 larger-cache admission is currently available only on macOS",
     ))
@@ -463,6 +529,45 @@ mod tests {
         assert!(!fits_with_headroom(16 << 30, (32 << 30) - 1, 16 << 30));
         assert!(!fits_with_headroom(32 << 30, 40 << 30, 16 << 30));
         assert!(!fits_with_headroom(u64::MAX, u64::MAX, 16 << 30));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn constrained_fixture_host_preserves_real_memory_gates() {
+        let busy = coherent(HostMemory {
+            physical: 8 << 30,
+            free: 4 << 30,
+            file: 0,
+            anonymous: 1 << 30,
+            purgeable: 0,
+            wired: 2 << 30,
+            compressor: 1 << 30,
+        });
+        let fixture = coherent(fixture_host());
+        let tiny = 256 << 20;
+        let _fixture = scoped_test_host(fixture);
+        let planned = plan(1).unwrap();
+        assert_eq!(planned.budget, 2 << 30);
+        assert_eq!(planned.available_bytes, Some(12 << 30));
+        assert_eq!(planned.physical_bytes, Some(16 << 30));
+        let mut direct = planned.clone();
+        direct_plan(&mut direct, 1, 1 << 30, tiny).unwrap();
+        assert!(direct.direct);
+        assert_eq!(direct.bank_budget, 4 << 30);
+        admit_direct(tiny).unwrap();
+
+        {
+            let _busy = scoped_test_host(busy);
+            let error = plan(1).unwrap_err();
+            assert!(error.reason.contains("no whole GiB for weights"));
+            let mut refused = plan_without_snapshot();
+            refused.physical_bytes = Some(busy.physical);
+            let error = direct_plan(&mut refused, 1, 1 << 30, tiny).unwrap_err();
+            assert!(error.reason.contains("host leaves 0.0 GiB"));
+            let error = admit_direct(tiny).unwrap_err();
+            assert!(error.reason.contains("host leaves 0.0 GiB"));
+        }
+        admit_direct(tiny).unwrap();
     }
 
     fn gib(n: f64) -> u64 {
