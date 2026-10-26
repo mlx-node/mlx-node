@@ -184,6 +184,12 @@ impl Model {
         if s == 0 {
             return Err(Error::from_reason("deepseek_v41: empty call"));
         }
+        let rows = self.embed.shape_at(0)?;
+        if let Some(bad) = ids.iter().find(|&&id| i64::from(id) >= rows) {
+            return Err(Error::from_reason(format!(
+                "deepseek_v41: token id {bad} outside the {rows}-row embedding"
+            )));
+        }
         let mut all = sess.tokens.clone();
         all.extend_from_slice(ids);
         let hash = self.hasher.as_ref().map(|h| h.rows(&all, start));

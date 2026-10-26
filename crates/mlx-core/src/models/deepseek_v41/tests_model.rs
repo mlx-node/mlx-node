@@ -318,6 +318,12 @@ fn invariants_cancel_restores() {
     let stop_at = |l: usize| move |x: usize| x == l;
     let err = m.forward(&mut sess, &ids[..12], Some(&stop_at(3)), None);
     assert!(err.is_err() && sess.tokens.is_empty());
+    let vocab = DeepseekV41Config::from_gguf(&g.gguf).unwrap().vocab_size as u32;
+    for bad in [vocab, u32::MAX] {
+        let err = m.forward(&mut sess, &[ids[0], bad], None, None).err().unwrap();
+        assert!(err.reason.contains("outside the"), "{}", err.reason);
+        assert!(sess.tokens.is_empty());
+    }
     let mut out = read(&m.forward(&mut sess, &ids[..12], None, None).unwrap());
     for p in 12..24 {
         // layer 6 runs after the KV source 5 advanced its compressed cache
