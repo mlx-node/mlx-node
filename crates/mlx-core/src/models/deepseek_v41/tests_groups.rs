@@ -4,6 +4,8 @@
 // streamed through the store (cache 0). mlx-node runs in f32 (DECISIONS S13a-1): gates are §3 vs ora32
 // with the ora16 run as the floor. Included into `tests.rs` so filters read
 // `deepseek_v41::tests::real_groups_<case>`. Run with `MLX_ENABLE_TF32=0`.
+// The long rung dumps streams at group-boundary layers only (DECISIONS
+// S13b-1): a layer's stream is gated where its golden exists.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -127,6 +129,90 @@ impl GFile {
     }
 }
 
+fn gfile(d: &std::path::Path, c: usize, l: usize) -> GFile {
+    GFile::open(d.join(format!("c{c:03}/L{l:02}.npz")))
+}
+
+/// The golden (ora32, ora16) stream leaving layer `l`: `L{l}.out`, else the
+/// next layer's input (`engram_in` at an engram layer, whose `x_in` is after
+/// the engram; `x_in` otherwise). `None` when neither is dumped.
+fn gold_stream(
+    d32: &std::path::Path,
+    d16: &std::path::Path,
+    c: usize,
+    l: usize,
+    n_layers: usize,
+    eng: &[usize],
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    let (mut a, mut b) = (gfile(d32, c, l), gfile(d16, c, l));
+    if a.has("out") {
+        return Some((a.get("out").f, b.get("out").f));
+    }
+    if l + 1 >= n_layers {
+        return None;
+    }
+    let key = if eng.contains(&(l + 1)) {
+        "engram_in"
+    } else {
+        "x_in"
+    };
+    let (mut a, mut b) = (gfile(d32, c, l + 1), gfile(d16, c, l + 1));
+    a.has(key).then(|| (a.get(key).f, b.get(key).f))
+}
+
+/// The golden (ora32, ora16) pre-mix leaving layer `l`: `L{l}.next_pre_mix`,
+/// else `L{l+1}.pre_mix_in`.
+fn gold_pre_mix(
+    d32: &std::path::Path,
+    d16: &std::path::Path,
+    c: usize,
+    l: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let (mut a, mut b) = (gfile(d32, c, l), gfile(d16, c, l));
+    if a.has("next_pre_mix") {
+        return (a.get("next_pre_mix").f, b.get("next_pre_mix").f);
+    }
+    let (mut a, mut b) = (gfile(d32, c, l + 1), gfile(d16, c, l + 1));
+    (a.get("pre_mix_in").f, b.get("pre_mix_in").f)
+}
+
+/// The seams `gold_stream` / `gold_pre_mix` fall back on: wherever both sides
+/// are dumped, `out(l)` equals the next layer's input and `next_pre_mix(l)`
+/// equals `pre_mix_in(l + 1)` bitwise, in both passes. Returns the seams checked.
+fn check_seams(dirs: [&std::path::Path; 2], c: usize, n_layers: usize, eng: &[usize]) -> usize {
+    let mut n = 0;
+    for d in dirs {
+        for l in 0..n_layers - 1 {
+            let (mut a, mut b) = (gfile(d, c, l), gfile(d, c, l + 1));
+            let key = if eng.contains(&(l + 1)) {
+                "engram_in"
+            } else {
+                "x_in"
+            };
+            if !(a.has("out") && b.has(key)) {
+                continue;
+            }
+            let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+            assert_eq!(
+                bits(a.get("out").f),
+                bits(b.get(key).f),
+                "{}: out L{l} vs {key} L{}",
+                d.display(),
+                l + 1
+            );
+            assert_eq!(
+                bits(a.get("next_pre_mix").f),
+                bits(b.get("pre_mix_in").f),
+                "{}: next_pre_mix L{l} vs pre_mix_in L{}",
+                d.display(),
+                l + 1
+            );
+            n += 1;
+        }
+    }
+    n
+}
+
 fn real_shards() -> Vec<PathBuf> {
     let dir = PathBuf::from(std::env::var("DSV41_DIR").expect("DSV41_DIR"));
     let mut v: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -222,7 +308,7 @@ fn set_of(v: &[i64]) -> BTreeSet<i64> {
     v.iter().copied().filter(|&x| x >= 0).collect()
 }
 
-fn real_groups(case: &str) {
+fn real_groups(case: &str, groups: &[(usize, usize)]) {
     const GIB: f64 = (1u64 << 30) as f64;
     assert_eq!(
         std::env::var("MLX_ENABLE_TF32").as_deref(),
@@ -240,8 +326,7 @@ fn real_groups(case: &str) {
     let res: Value =
         serde_json::from_slice(&std::fs::read(d32.join("result.json")).unwrap()).unwrap();
     let n_calls = res["calls"].as_array().unwrap().len();
-    let lfile =
-        |d: &PathBuf, c: usize, l: usize| GFile::open(d.join(format!("c{c:03}/L{l:02}.npz")));
+    let lfile = |d: &PathBuf, c: usize, l: usize| gfile(d, c, l);
     // (start, ids, golden engram rows [pos][engram layer][col], per-layer local ids)
     let mut calls: Vec<(usize, Vec<u32>, Vec<i64>)> = Vec::new();
     for c in 0..n_calls {
@@ -271,6 +356,15 @@ fn real_groups(case: &str) {
     let (n_e, cols) = (hasher.n_layers(), hasher.n_cols());
     let eng_layers = cfg.engram.as_ref().unwrap().layers.clone();
     let cand = cfg.candidate.clone();
+    // a case whose dumps skip some layer's stream must show the fallback seams
+    // hold where it can be seen (S13b-1)
+    if (0..cfg.n_layers).any(|l| !lfile(&d32, 0, l).has("out")) {
+        let n: usize = (0..n_calls)
+            .map(|c| check_seams([&d32, &d16], c, cfg.n_layers, &eng_layers))
+            .sum();
+        assert!(n > 0, "no seam to check the stream fallback on");
+        println!("stream fallback: {n} seams bitwise (out == next input, next_pre_mix == pre_mix_in)");
+    }
     println!(
         "real_groups {case}: {n_calls} calls, {} positions; load {load_s:.1} s; f32, fake quant on, cache 0",
         calls.iter().map(|c| c.1.len()).sum::<usize>()
@@ -287,7 +381,7 @@ fn real_groups(case: &str) {
     println!(
         "group  layer  relL2(mlx,ora32)  floor(ora16,ora32)  r(L)   worst pos err/bound  window-KV elements off by an fp8 step (rows of each call)"
     );
-    for &(g0, g1) in &REAL_GROUPS {
+    for &(g0, g1) in groups {
         let gt = std::time::Instant::now();
         // no top-k is injected: every group's first compressed layer is an index source
         if cfg.compress_ratios[g0] != 0 {
@@ -313,10 +407,12 @@ fn real_groups(case: &str) {
         let mut sess = m.new_session();
         // per layer over all calls: Σ(mlx-ora32)², Σ(ora16-ora32)², Σ ora32²
         let mut acc = vec![[0f64; 3]; g1 - g0];
+        let mut has_stream = vec![false; g1 - g0];
         let mut worst = vec![0f64; g1 - g0];
         let mut kv_flips = vec![0usize; g1 - g0];
         let mut flipped: BTreeSet<usize> = BTreeSet::new();
         let mut pm_worst = 0f64;
+        let mut mix_worst = 0f64;
         // max per-position floor over rows where the oracle's bf16 run picked
         // another route set (per layer), and the rows gated against it
         // (layer index, label, err, own bound); leaving pre-mix sums / rows
@@ -369,6 +465,7 @@ fn real_groups(case: &str) {
                     keep,
                 });
             }
+            let mut last_stream: Option<(Vec<f32>, (Vec<f32>, Vec<f32>))> = None;
             let mut trace = Trace {
                 keep_out: true,
                 ..Default::default()
@@ -405,8 +502,12 @@ fn real_groups(case: &str) {
 
             for (i, l) in (g0..g1).enumerate() {
                 let (mut f32g, mut f16g) = (lfile(&d32, c, l), lfile(&d16, c, l));
-                let (o32, o16) = (f32g.get("out").f, f16g.get("out").f);
+                let gold = gold_stream(&d32, &d16, c, l, cfg.n_layers, &eng_layers);
+                has_stream[i] = gold.is_some();
                 let got = read(&trace.out[i]);
+                if l == g1 - 1 {
+                    last_stream = Some((got.clone(), gold.clone().expect("golden stream at a group's last layer")));
+                }
                 assert_eq!(got.len(), s * row, "L{l} stream");
                 if !got.iter().all(|v| v.is_finite()) {
                     fails.push(format!("L{l} call {c}: NaN/Inf"));
@@ -432,11 +533,14 @@ fn real_groups(case: &str) {
                         kv_flips[i] += n;
                     }
                 }
-                for ((&a, &b), &z) in got.iter().zip(&o32).zip(&o16) {
-                    let (a, b, z) = (f64::from(a), f64::from(b), f64::from(z));
-                    acc[i][0] += (a - b) * (a - b);
-                    acc[i][1] += (z - b) * (z - b);
-                    acc[i][2] += b * b;
+                if let Some((o32, o16)) = &gold {
+                    assert_eq!((o32.len(), o16.len()), (s * row, s * row), "L{l} golden stream");
+                    for ((&a, &b), &z) in got.iter().zip(o32).zip(o16) {
+                        let (a, b, z) = (f64::from(a), f64::from(b), f64::from(z));
+                        acc[i][0] += (a - b) * (a - b);
+                        acc[i][1] += (z - b) * (z - b);
+                        acc[i][2] += b * b;
+                    }
                 }
 
                 // routes: top-k of router scores + bias
@@ -489,7 +593,13 @@ fn real_groups(case: &str) {
 
                 // stream rule (§3) per position; a row that took an excused
                 // route flip at or before this layer is deferred (S13a-6)
+                let (o32, o16) = gold.as_ref().map_or((&[][..], &[][..]), |(a, b)| {
+                    (a.as_slice(), b.as_slice())
+                });
                 for (p, &ora_flip) in ora_row_flip.iter().enumerate() {
+                    if gold.is_none() {
+                        break;
+                    }
                     let w = p * row..(p + 1) * row;
                     let e = rel_l2(&got[w.clone()], &o32[w.clone()]);
                     let fl = rel_l2(&o16[w.clone()], &o32[w.clone()]);
@@ -602,9 +712,8 @@ fn real_groups(case: &str) {
             // per-row stream bound are counted and printed
             {
                 let lw = g1 - 1;
-                let (mut f32g, mut f16g) = (lfile(&d32, c, lw), lfile(&d16, c, lw));
                 let got = read(&pm_out);
-                let (o32, o16) = (f32g.get("next_pre_mix").f, f16g.get("next_pre_mix").f);
+                let (o32, o16) = gold_pre_mix(&d32, &d16, c, lw);
                 assert_eq!(
                     (got.len(), o32.len(), o16.len()),
                     (s * hc, s * hc, s * hc),
@@ -628,6 +737,35 @@ fn real_groups(case: &str) {
                     pm_acc[1] += (z - b) * (z - b);
                     pm_acc[2] += b * b;
                 }
+                // DECISIONS S13b-2 (S13a-2 codex): per token, the stream the
+                // next block's attention reads, `hc_pre(out, next_pre_mix)`
+                // = sum_j pre[j] x[j] (`model.py` Block.hc_pre), gated by §3's
+                // stream rule; a row that took an excused route flip in the
+                // group gets the S13a-6 bound of the group's last layer
+                let (xs, (x32, x16)) = last_stream.take().unwrap();
+                let mix = |pm: &[f32], x: &[f32], p: usize| -> Vec<f32> {
+                    (0..dim)
+                        .map(|d| {
+                            (0..hc)
+                                .map(|j| f64::from(pm[p * hc + j]) * f64::from(x[(p * hc + j) * dim + d]))
+                                .sum::<f64>() as f32
+                        })
+                        .collect()
+                };
+                for p in 0..s {
+                    let (a, b, z) = (mix(&got, &xs, p), mix(&o32, &x32, p), mix(&o16, &x16, p));
+                    let e = rel_l2(&a, &b);
+                    let bound = (2.0 * rel_l2(&z, &b)).max(1e-3);
+                    let what = format!("L{lw} call {c} pos {}: next-block input hc_pre relL2", start + p);
+                    if flipped.contains(&(start + p)) {
+                        deferred.push((g1 - 1 - g0, what, e, bound));
+                        continue;
+                    }
+                    mix_worst = mix_worst.max(e / bound);
+                    if e.is_nan() || e > bound {
+                        fails.push(format!("{what} {e:.3e} > {bound:.3e}"));
+                    }
+                }
             }
         }
         let pm_r = (pm_acc[0] / pm_acc[2]).sqrt() / ((pm_acc[1] / pm_acc[2]).sqrt()).max(1e-6);
@@ -648,9 +786,19 @@ fn real_groups(case: &str) {
                 ));
             }
         }
-        // error-curve rule (§3) over the group's layers, all calls
-        let mut prev: Option<f64> = None;
+        // error-curve rule (§3) over the group's layers with a golden stream,
+        // all calls; across n ungated steps the per-step 0.25 bounds the rise
+        // by 0.25 n, the only part of it the dumps can show (S13b-3)
+        let mut prev: Option<(usize, f64)> = None;
         for (i, l) in (g0..g1).enumerate() {
+            if !has_stream[i] {
+                println!(
+                    "{g0:>2}..{:<2}  L{l:02}   (no golden stream)                                        {}",
+                    g1 - 1,
+                    kv_flips[i]
+                );
+                continue;
+            }
             let rel = (acc[i][0] / acc[i][2]).sqrt();
             let fl = (acc[i][1] / acc[i][2]).sqrt();
             let r = rel / fl.max(1e-6);
@@ -663,15 +811,20 @@ fn real_groups(case: &str) {
             if r > 2.0 {
                 fails.push(format!("L{l}: r {r:.3} > 2"));
             }
-            if let Some(p) = prev
-                && r - p > 0.25
+            if let Some((pl, p)) = prev
+                && r - p > 0.25 * (l - pl) as f64
             {
-                fails.push(format!("L{l}: r step {:.3} > 0.25", r - p));
+                fails.push(format!(
+                    "L{l}: r rise {:.3} over {} steps > {:.2}",
+                    r - p,
+                    l - pl,
+                    0.25 * (l - pl) as f64
+                ));
             }
-            prev = Some(r);
+            prev = Some((l, r));
         }
         println!(
-            "group {g0}..{} done in {:.1} s (injected kv sources {ext:?}, candidates {cand_ext:?}); next pre-mix r {pm_r:.4}, worst pos err/bound {pm_worst:.4}, rows over the per-row bound {pm_rows_over:?}; {} excused-flip row checks, worst err/bound {def_worst:.4}",
+            "group {g0}..{} done in {:.1} s (injected kv sources {ext:?}, candidates {cand_ext:?}); next pre-mix r {pm_r:.4}, worst pos err/bound {pm_worst:.4}, rows over the per-row bound {pm_rows_over:?}; next-block input worst pos err/bound {mix_worst:.4}; {} excused-flip row checks, worst err/bound {def_worst:.4}",
             g1 - 1,
             gt.elapsed().as_secs_f64(),
             deferred.len()
@@ -702,10 +855,20 @@ fn real_groups(case: &str) {
         }
     }
     assert!(sites.get("router").is_some_and(|s| s.rows > 0));
+    let eng_groups = groups
+        .iter()
+        .filter(|&&(a, b)| (a..b).any(|l| eng_layers.contains(&l)))
+        .count();
     assert_eq!(
         engram_checked,
-        2 * n_calls,
-        "engram rows checked in groups [1] and [14..19]"
+        eng_groups * n_calls,
+        "engram rows checked in every group with an engram layer"
+    );
+    assert!(
+        groups.iter().all(|&(a, b)| (a..b).any(|l| {
+            (0..n_calls).all(|c| gold_stream(&d32, &d16, c, l, cfg.n_layers, &eng_layers).is_some())
+        })),
+        "a group without any golden stream layer"
     );
     let st = store.bank.stats();
     println!(
@@ -726,25 +889,34 @@ fn real_groups(case: &str) {
 #[test]
 #[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12 goldens), MLX_ENABLE_TF32=0, MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~160 GB read"]
 fn real_groups_p32k8_en() {
-    real_groups("p32k8-en");
+    real_groups("p32k8-en", &REAL_GROUPS);
 }
 
 #[test]
 #[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12 goldens), MLX_ENABLE_TF32=0, MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~160 GB read"]
 fn real_groups_p32k8_zh() {
-    real_groups("p32k8-zh");
+    real_groups("p32k8-zh", &REAL_GROUPS);
 }
 
 #[test]
 #[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12 goldens), MLX_ENABLE_TF32=0, MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~160 GB read"]
 fn real_groups_p32k8_code() {
-    real_groups("p32k8-code");
+    real_groups("p32k8-code", &REAL_GROUPS);
 }
 
 #[test]
 #[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12 goldens), MLX_ENABLE_TF32=0, MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~311 GB read"]
 fn real_groups_p160k8_en() {
-    real_groups("p160k8-en");
+    real_groups("p160k8-en", &REAL_GROUPS);
+}
+
+/// Long rung (P = 1100, index top-k live): groups `[2..7]`, `[20..23]`,
+/// `[24..27]`; streams gated at the dumped boundary layers 2, 7 (via L08's
+/// input), 20, 23, 24, 27.
+#[test]
+#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12e goldens), MLX_ENABLE_TF32=0, MLX_DSV41_EXPERT_CACHE_GB=0; ~20 GiB, ~117 GB read"]
+fn real_groups_long() {
+    real_groups("p1100k4-en", &[(2, 8), (20, 24), (24, 28)]);
 }
 
 #[test]
