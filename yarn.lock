@@ -1045,7 +1045,7 @@ __metadata:
     "@mlx-node/dashboard": "workspace:*"
     "@mlx-node/lm": "workspace:*"
     "@mlx-node/server": "workspace:*"
-    "@napi-rs/image": "npm:1.15.0"
+    "@napi-rs/image": "npm:1.16.0"
     "@types/node": "catalog:"
     app-builder-lib: "npm:26.18.0"
     electron: "npm:45.0.0"
@@ -1226,9 +1226,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/image-android-arm64@npm:1.15.0":
-  version: 1.15.0
-  resolution: "@napi-rs/image-android-arm64@npm:1.15.0"
+"@napi-rs/image-android-arm64@npm:1.16.0":
+  version: 1.16.0
+  resolution: "@napi-rs/image-android-arm64@npm:1.16.0"
   conditions: os=android & cpu=arm64
   languageName: node
   linkType: hard
@@ -1240,9 +1240,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/image-darwin-arm64@npm:1.15.0":
-  version: 1.15.0
-  resolution: "@napi-rs/image-darwin-arm64@npm:1.15.0"
+"@napi-rs/image-darwin-arm64@npm:1.16.0":
+  version: 1.16.0
+  resolution: "@napi-rs/image-darwin-arm64@npm:1.16.0"
   conditions: os=darwin & cpu=arm64
   languageName: node
   linkType: hard
@@ -1254,9 +1254,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/image-darwin-x64@npm:1.15.0":
-  version: 1.15.0
-  resolution: "@napi-rs/image-darwin-x64@npm:1.15.0"
+"@napi-rs/image-darwin-x64@npm:1.16.0":
+  version: 1.16.0
+  resolution: "@napi-rs/image-darwin-x64@npm:1.16.0"
   conditions: os=darwin & cpu=x64
   languageName: node
   linkType: hard
@@ -1268,9 +1268,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/image-freebsd-x64@npm:1.15.0":
-  version: 1.15.0
-  resolution: "@napi-rs/image-freebsd-x64@npm:1.15.0"
+"@napi-rs/image-freebsd-x64@npm:1.16.0":
+  version: 1.16.0
+  resolution: "@napi-rs/image-freebsd-x64@npm:1.16.0"
   conditions: os=freebsd & cpu=x64
   languageName: node
   linkType: hard
@@ -1282,9 +1282,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/image-linux-arm-gnueabihf@npm:1.15.0":
-  version: 1.15.0
-  resolution: "@napi-rs/image-linux-arm-gnueabihf@npm:1.15.0"
+"@napi-rs/image-linux-arm-gnueabihf@npm:1.16.0":
+  version: 1.16.0
+  resolution: "@napi-rs/image-linux-arm-gnueabihf@npm:1.16.0"
   conditions: os=linux & cpu=arm
   languageName: node
   linkType: hard
@@ -1296,9 +1296,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/image-linux-arm64-gnu@npm:1.15.0":
-  version: 1.15.0
-  resolution: "@napi-rs/image-linux-arm64-gnu@npm:1.15.0"
+"@napi-rs/image-linux-arm64-gnu@npm:1.16.0":
+  version: 1.16.0
+  resolution: "@napi-rs/image-linux-arm64-gnu@npm:1.16.0"
   conditions: os=linux & cpu=arm64 & libc=glibc
   languageName: node
   linkType: hard
@@ -1310,9 +1310,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/image-linux-arm64-musl@npm:1.15.0":
-  version: 1.15.0
-  resolution: "@napi-rs/image-linux-arm64-musl@npm:1.15.0"
+"@napi-rs/image-linux-arm64-musl@npm:1.16.0":
+  version: 1.16.0
+  resolution: "@napi-rs/image-linux-arm64-musl@npm:1.16.0"
   conditions: os=linux & cpu=arm64 & libc=musl
   languageName: node
   linkType: hard
@@ -1324,9 +1324,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/image-linux-x64-gnu@npm:1.15.0":
-  version: 1.15.0
-  resolution: "@napi-rs/image-linux-x64-gnu@npm:1.15.0"
+"@napi-rs/image-linux-x64-gnu@npm:1.16.0":
+  version: 1.16.0
+  resolution: "@napi-rs/image-linux-x64-gnu@npm:1.16.0"
   conditions: os=linux & cpu=x64 & libc=glibc
   languageName: node
   linkType: hard
@@ -1338,9 +1338,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/image-linux-x64-musl@npm:1.15.0":
-  version: 1.15.0
-  resolution: "@napi-rs/image-linux-x64-musl@npm:1.15.0"
+"@napi-rs/image-linux-x64-musl@npm:1.16.0":
+  version: 1.16.0
+  resolution: "@napi-rs/image-linux-x64-musl@npm:1.16.0"
   conditions: os=linux & cpu=x64 & libc=musl
   languageName: node
   linkType: hard
@@ -1363,9 +1363,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/image-win32-arm64-msvc@npm:1.15.0":
-  version: 1.15.0
-  resolution: "@napi-rs/image-win32-arm64-msvc@npm:1.15.0"
+"@napi-rs/image-win32-arm64-msvc@npm:1.16.0":
+  version: 1.16.0
+  resolution: "@napi-rs/image-win32-arm64-msvc@npm:1.16.0"
   conditions: os=win32 & cpu=arm64
   languageName: node
   linkType: hard
@@ -1377,9 +1377,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/image-win32-ia32-msvc@npm:1.15.0":
-  version: 1.15.0
-  resolution: "@napi-rs/image-win32-ia32-msvc@npm:1.15.0"
+"@napi-rs/image-win32-ia32-msvc@npm:1.16.0":
+  version: 1.16.0
+  resolution: "@napi-rs/image-win32-ia32-msvc@npm:1.16.0"
   conditions: os=win32 & cpu=ia32
   languageName: node
   linkType: hard
@@ -1391,9 +1391,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/image-win32-x64-msvc@npm:1.15.0":
-  version: 1.15.0
-  resolution: "@napi-rs/image-win32-x64-msvc@npm:1.15.0"
+"@napi-rs/image-win32-x64-msvc@npm:1.16.0":
+  version: 1.16.0
+  resolution: "@napi-rs/image-win32-x64-msvc@npm:1.16.0"
   conditions: os=win32 & cpu=x64
   languageName: node
   linkType: hard
@@ -1446,22 +1446,22 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/image@npm:1.15.0":
-  version: 1.15.0
-  resolution: "@napi-rs/image@npm:1.15.0"
+"@napi-rs/image@npm:1.16.0":
+  version: 1.16.0
+  resolution: "@napi-rs/image@npm:1.16.0"
   dependencies:
-    "@napi-rs/image-android-arm64": "npm:1.15.0"
-    "@napi-rs/image-darwin-arm64": "npm:1.15.0"
-    "@napi-rs/image-darwin-x64": "npm:1.15.0"
-    "@napi-rs/image-freebsd-x64": "npm:1.15.0"
-    "@napi-rs/image-linux-arm-gnueabihf": "npm:1.15.0"
-    "@napi-rs/image-linux-arm64-gnu": "npm:1.15.0"
-    "@napi-rs/image-linux-arm64-musl": "npm:1.15.0"
-    "@napi-rs/image-linux-x64-gnu": "npm:1.15.0"
-    "@napi-rs/image-linux-x64-musl": "npm:1.15.0"
-    "@napi-rs/image-win32-arm64-msvc": "npm:1.15.0"
-    "@napi-rs/image-win32-ia32-msvc": "npm:1.15.0"
-    "@napi-rs/image-win32-x64-msvc": "npm:1.15.0"
+    "@napi-rs/image-android-arm64": "npm:1.16.0"
+    "@napi-rs/image-darwin-arm64": "npm:1.16.0"
+    "@napi-rs/image-darwin-x64": "npm:1.16.0"
+    "@napi-rs/image-freebsd-x64": "npm:1.16.0"
+    "@napi-rs/image-linux-arm-gnueabihf": "npm:1.16.0"
+    "@napi-rs/image-linux-arm64-gnu": "npm:1.16.0"
+    "@napi-rs/image-linux-arm64-musl": "npm:1.16.0"
+    "@napi-rs/image-linux-x64-gnu": "npm:1.16.0"
+    "@napi-rs/image-linux-x64-musl": "npm:1.16.0"
+    "@napi-rs/image-win32-arm64-msvc": "npm:1.16.0"
+    "@napi-rs/image-win32-ia32-msvc": "npm:1.16.0"
+    "@napi-rs/image-win32-x64-msvc": "npm:1.16.0"
   dependenciesMeta:
     "@napi-rs/image-android-arm64":
       optional: true
@@ -1487,7 +1487,7 @@ __metadata:
       optional: true
     "@napi-rs/image-win32-x64-msvc":
       optional: true
-  checksum: 10c0/077ae012f673d70cda693290f21e0d6aba96f82094b7a603a0333c88b05b1a50a35c44f81c1947f3663b5c61c3fdfef600535ea9e3b508d32d810d9e4c0aa6a3
+  checksum: 10c0/a6d2523eced4064ffaae518e75c47733af6bd9664e3f4a792a76855f86ffab3d95a2436ece67ee508540f0bb84f1fa51b0705e996b5cf621e1ffd86d030fc8e6
   languageName: node
   linkType: hard
 
