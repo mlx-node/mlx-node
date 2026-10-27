@@ -5365,24 +5365,30 @@ pub struct GgufConversionResult {
     pub source_format: String,
 }
 
-pub(crate) fn write_embedded_gpt2_tokenizer(
+/// HF 1017 `tokenizer.json`'s `pre_tokenizer`, verbatim: the GGUF
+/// `tokenizer.ggml.pre = "joyai-llm"` vocabulary (DeepSeek-V4.1) splits digits
+/// in runs of 3 and CJK/kana runs before the word split.
+const JOYAI_LLM_PRE_TOKENIZER: &str = r##"{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"\\p{N}{1,3}"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"[一-龥぀-ゟ゠-ヿ]+"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]}"##;
+
+/// The HF `tokenizer.json` of a GGUF-embedded GPT-2 BPE vocabulary, or `None`
+/// when the GGUF carries none.
+pub(crate) fn embedded_gpt2_tokenizer_json(
     metadata: &HashMap<String, GgufMetaValue>,
-    output_dir: &Path,
-) -> Result<bool> {
+) -> Result<Option<serde_json::Value>> {
     let Some(GgufMetaValue::String(model)) = metadata.get("tokenizer.ggml.model") else {
-        return Ok(false);
+        return Ok(None);
     };
     if model != "gpt2" {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(GgufMetaValue::ArrayString(tokens)) = metadata.get("tokenizer.ggml.tokens") else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(GgufMetaValue::ArrayI32(types)) = metadata.get("tokenizer.ggml.token_type") else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(GgufMetaValue::ArrayString(merges)) = metadata.get("tokenizer.ggml.merges") else {
-        return Ok(false);
+        return Ok(None);
     };
     if tokens.len() != types.len() {
         return Err(Error::from_reason(format!(
@@ -5394,7 +5400,15 @@ pub(crate) fn write_embedded_gpt2_tokenizer(
 
     let mut vocab = serde_json::Map::new();
     let mut added = Vec::new();
+    // `tokenizers` gives an added token absent from the model vocab the next
+    // free id past the vocab, not its own: a special row below the last normal
+    // row (DeepSeek-V4.1's BOS/EOS/pad at 0..2) must also be a vocab entry, as
+    // in HF's tokenizer.json.
+    let last_normal = types.iter().rposition(|&t| t == 1).unwrap_or(0);
     for (id, (token, token_type)) in tokens.iter().zip(types).enumerate() {
+        if matches!(*token_type, 3 | 4) && id < last_normal {
+            vocab.insert(token.clone(), serde_json::json!(id));
+        }
         match *token_type {
             // GGML_TOKEN_TYPE_NORMAL
             1 => {
@@ -5416,16 +5430,13 @@ pub(crate) fn write_embedded_gpt2_tokenizer(
         }
     }
 
-    let tokenizer = serde_json::json!({
-        "version": "1.0",
-        "truncation": null,
-        "padding": null,
-        "added_tokens": added,
-        // GGUF's embedded GPT-2 vocabulary and merges operate on the original
-        // byte sequence. No standard metadata here declares Unicode
-        // normalization, so synthesizing NFC would change decomposed prompts.
-        "normalizer": null,
-        "pre_tokenizer": {
+    let pre_tokenizer = match metadata.get("tokenizer.ggml.pre") {
+        Some(GgufMetaValue::String(pre)) if pre == "joyai-llm" => {
+            serde_json::from_str(JOYAI_LLM_PRE_TOKENIZER).map_err(|error| {
+                Error::from_reason(format!("joyai-llm pre-tokenizer JSON: {error}"))
+            })?
+        }
+        _ => serde_json::json!({
             "type": "Sequence",
             "pretokenizers": [
                 {
@@ -5441,7 +5452,18 @@ pub(crate) fn write_embedded_gpt2_tokenizer(
                     "use_regex": false
                 }
             ]
-        },
+        }),
+    };
+    let tokenizer = serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": added,
+        // GGUF's embedded GPT-2 vocabulary and merges operate on the original
+        // byte sequence. No standard metadata here declares Unicode
+        // normalization, so synthesizing NFC would change decomposed prompts.
+        "normalizer": null,
+        "pre_tokenizer": pre_tokenizer,
         "post_processor": {
             "type": "ByteLevel",
             "add_prefix_space": false,
@@ -5467,6 +5489,19 @@ pub(crate) fn write_embedded_gpt2_tokenizer(
             "merges": merges
         }
     });
+    Ok(Some(tokenizer))
+}
+
+pub(crate) fn write_embedded_gpt2_tokenizer(
+    metadata: &HashMap<String, GgufMetaValue>,
+    output_dir: &Path,
+) -> Result<bool> {
+    let Some(tokenizer) = embedded_gpt2_tokenizer_json(metadata)? else {
+        return Ok(false);
+    };
+    let Some(GgufMetaValue::ArrayString(tokens)) = metadata.get("tokenizer.ggml.tokens") else {
+        return Ok(false);
+    };
     let bytes = serde_json::to_vec(&tokenizer).map_err(|error| {
         Error::from_reason(format!("Failed to serialize GGUF tokenizer: {error}"))
     })?;
@@ -18343,5 +18378,72 @@ mod tests {
             "tiny engram table: {} rows x {} decoded, Rust == C",
             t.dims[1], t.dims[0]
         );
+    }
+
+    /// Real file, shard 1 KV only (F_NOCACHE): the GGUF-embedded `joyai-llm`
+    /// tokenizer encodes 50 EN/ZH/JA/code/emoji/digit/special strings to the
+    /// same ids as HF 1017 `tokenizer.json` (`DSV41_HF_TOKENIZER`) and as the
+    /// python `tokenizers` run that wrote `DSV41_TOK_CASES`; its pre-tokenizer
+    /// is HF's verbatim.
+    #[test]
+    #[ignore = "real DeepSeek-V4.1 shard 1 KV; DSV41_DIR, DSV41_HF_TOKENIZER, DSV41_TOK_CASES"]
+    fn joyai_tokenizer_matches_hf() {
+        let dir = PathBuf::from(std::env::var("DSV41_DIR").unwrap());
+        let path = dir.join("DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf");
+        let file = crate::moe_stream::io::open_nocache(&path).unwrap();
+        let g = parse_gguf_reader(std::io::BufReader::new(file)).unwrap();
+        assert_eq!(
+            g.metadata
+                .get("tokenizer.ggml.pre")
+                .and_then(GgufMetaValue::as_str),
+            Some("joyai-llm")
+        );
+        let ours = embedded_gpt2_tokenizer_json(&g.metadata).unwrap().unwrap();
+        let hf_path = std::env::var("DSV41_HF_TOKENIZER").unwrap();
+        let hf_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&hf_path).unwrap()).unwrap();
+        assert_eq!(
+            ours["pre_tokenizer"], hf_json["pre_tokenizer"],
+            "pre_tokenizer"
+        );
+        let ours = tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&ours).unwrap()).unwrap();
+        let hf = tokenizers::Tokenizer::from_file(&hf_path).unwrap();
+        let (Some(GgufMetaValue::ArrayString(tokens)), Some(GgufMetaValue::ArrayI32(types))) = (
+            g.metadata.get("tokenizer.ggml.tokens"),
+            g.metadata.get("tokenizer.ggml.token_type"),
+        ) else {
+            panic!("tokenizer arrays");
+        };
+        let mut specials = 0;
+        for (id, (t, ty)) in tokens.iter().zip(types).enumerate() {
+            if matches!(*ty, 3 | 4) {
+                assert_eq!(ours.token_to_id(t), Some(id as u32), "special {t:?}");
+                assert_eq!(hf.token_to_id(t), Some(id as u32), "HF special {t:?}");
+                specials += 1;
+            }
+        }
+        assert_eq!(ours.get_vocab_size(true), hf.get_vocab_size(true));
+        let cases: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::env::var("DSV41_TOK_CASES").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let cases = cases["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 50);
+        let mut n = 0;
+        for c in cases {
+            let text = c["text"].as_str().unwrap();
+            let want: Vec<u32> = c["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect();
+            let a = ours.encode(text, false).unwrap().get_ids().to_vec();
+            let b = hf.encode(text, false).unwrap().get_ids().to_vec();
+            assert_eq!(b, want, "HF (rust) vs python on {text:?}");
+            assert_eq!(a, want, "GGUF-embedded vs HF on {text:?}");
+            n += a.len();
+        }
+        println!("joyai tokenizer: {specials} special ids, 50 strings, {n} ids bitwise == HF 1017");
     }
 }

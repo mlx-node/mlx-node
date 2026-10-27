@@ -2582,16 +2582,29 @@ impl Qwen3Tokenizer {
             // high/max and minimal as explicit aliases only for that template.
             let qwen38 = template_str.contains("resolved_reasoning_effort")
                 && template_str.contains("xhigh");
+            // The DeepSeek-V4.1 template raises on any effort outside
+            // low/medium/high/max (or 1-100); `none` is its chat mode, which
+            // `enable_thinking` below already selects.
+            let ds41 = template_str.contains("effort_map") && template_str.contains("｜DSML｜");
             let effort = if qwen38 {
-                match effort {
+                Some(match effort {
                     "minimal" => "low",
                     "high" | "max" => "xhigh",
                     value => value,
+                })
+            } else if ds41 {
+                match effort {
+                    "none" => None,
+                    "minimal" => Some("low"),
+                    "xhigh" => Some("max"),
+                    value => Some(value),
                 }
             } else {
-                effort
+                Some(effort)
             };
-            ctx_map.insert("reasoning_effort".into(), minijinja::Value::from(effort));
+            if let Some(effort) = effort {
+                ctx_map.insert("reasoning_effort".into(), minijinja::Value::from(effort));
+            }
         }
         ctx_map.insert(
             "enable_thinking".to_string(),
@@ -2727,11 +2740,15 @@ impl Qwen3Tokenizer {
 
         // Load chat template from tokenizer_config.json (in same directory)
         let chat_template = Self::load_chat_template(tokenizer_path);
+        Ok(Self::from_tokenizer(tokenizer, chat_template))
+    }
 
+    /// A tokenizer built in memory (e.g. a GGUF-embedded vocabulary) with the
+    /// checkpoint's chat template; the rest as [`Self::load_from_file_sync`].
+    pub(crate) fn from_tokenizer(tokenizer: Tokenizer, chat_template: Option<String>) -> Self {
         let (think_end_id, think_end_str) = Self::detect_think_end(&tokenizer);
         let control_markers = Self::detect_control_markers(&tokenizer);
-
-        Ok(Self {
+        Self {
             tokenizer: Arc::new(tokenizer),
             pad_token_id: ENDOFTEXT_TOKEN_ID,
             eos_token_id: IM_END_TOKEN_ID,
@@ -2740,7 +2757,7 @@ impl Qwen3Tokenizer {
             think_end_id,
             think_end_str,
             control_markers,
-        })
+        }
     }
 
     /// Returns true if the tokenizer has a chat template loaded.
@@ -5581,6 +5598,60 @@ mod tests {
             KNOWN_UNRENDERABLE_FAMILIES.len(),
         );
         eprintln!("{}", report.join("\n"));
+    }
+
+    /// DeepSeek-V4.1's chat template lives in its GGUF (Unsloth port of
+    /// DS41), not in a checkpoint directory, so the template is committed
+    /// beside its HF render (`render_fixture.py` over a directory holding it as
+    /// `chat_template.jinja`) and compared without a model cache.
+    #[test]
+    fn hf_fixture_deepseek_v41_gguf_template() {
+        let template = include_str!("tokenizer/fixtures/hf/deepseek-v4.1-06cada875e3a.jinja");
+        assert_eq!(sha256_prefix(template), "06cada875e3a");
+        let hf = include_str!("tokenizer/fixtures/hf/deepseek-v4.1-06cada875e3a.txt");
+        let ours = render_separator_probe(template).unwrap();
+        if ours != hf {
+            let offset = first_difference(&ours, hf);
+            panic!(
+                "deepseek-v4.1 diverges from HuggingFace at byte {offset}.\n  ours: {:?}\n  HF:   {:?}",
+                &ours[offset.saturating_sub(40)..(offset + 40).min(ours.len())],
+                &hf[offset.saturating_sub(40)..(offset + 40).min(hf.len())],
+            );
+        }
+        // the template raises outside low/medium/high/max: `none` is chat mode
+        let user = &separator_probe_messages()[..1];
+        let render = |effort: &str, thinking: bool| {
+            Qwen3Tokenizer::render_chat_template_jinja2_with_content_order(
+                template,
+                user,
+                None,
+                true,
+                Some(thinking),
+                BOS_PROBE,
+                EOS_PROBE,
+                MultimodalContentOrder::TextThenMedia,
+                None,
+                RenderContextOptions {
+                    reasoning_effort: Some(effort.to_string()),
+                    current_date: Some(PROBE_DATE.to_string()),
+                    reasoning_strength: None,
+                    preserve_thinking: false,
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            render("none", false),
+            "<｜begin▁of▁sentence｜><｜User｜>weather in Paris?<｜Assistant｜></think>"
+        );
+        for (effort, budget) in [("minimal", 50), ("medium", 62), ("xhigh", 100)] {
+            let out = render(effort, true);
+            assert!(
+                out.contains(&format!("Reasoning Effort: {budget} ")),
+                "{effort}: {out}"
+            );
+            assert!(out.ends_with("<｜Assistant｜><think>"), "{effort}: {out}");
+        }
     }
 
     /// First byte at which two strings differ; `min(len)` when one is a prefix.
