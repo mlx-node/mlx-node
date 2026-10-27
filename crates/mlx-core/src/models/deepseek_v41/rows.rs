@@ -4,11 +4,13 @@
 //! on up to 8 threads (decode) or 32 (prefill).
 
 use std::path::Path;
+use std::sync::atomic::Ordering;
 
 use napi::{Error, Result};
 
 use super::config::EngramConfig;
 use super::engram::{EngramRows, row_bytes};
+use super::stats::{ENGRAM_BYTES, ENGRAM_NS};
 use crate::moe_stream::io::{AlignedBuf, Extent, ShardSet};
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType, decode_mxfp8_rows};
 
@@ -91,6 +93,9 @@ impl EngramRows for PreadTable {
         uniq.dedup();
         let (rb, hd) = (row_bytes(self.head_dim), self.head_dim);
         let mut dec = vec![0f32; uniq.len() * hd];
+        let t0 = std::time::Instant::now();
+        let bytes = std::sync::atomic::AtomicU64::new(0);
+        let bytes = &bytes;
         let threads = if ids.len() <= 2 * self.cols { 8 } else { 32 };
         let per = uniq.len().div_ceil(threads).max(1);
         std::thread::scope(|sc| {
@@ -106,7 +111,9 @@ impl EngramRows for PreadTable {
                                 offset: self.base + u64::from(r) * rb as u64,
                                 len: rb as u64,
                             };
-                            decode_mxfp8_rows(self.shard.read_aligned(e, &mut buf)?, o)?;
+                            let w = self.shard.read_aligned(e, &mut buf)?;
+                            decode_mxfp8_rows(w, o)?;
+                            bytes.fetch_add(window_len(e), Ordering::Relaxed);
                         }
                         Ok(())
                     })
@@ -115,6 +122,8 @@ impl EngramRows for PreadTable {
             jobs.into_iter()
                 .try_for_each(|j| j.join().unwrap_or_else(|_| Err(bad("reader panicked"))))
         })?;
+        ENGRAM_BYTES.fetch_add(bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+        ENGRAM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let mut out = vec![0f32; ids.len() * hd];
         for (&id, o) in ids.iter().zip(out.chunks_mut(hd)) {
             let k = uniq.binary_search(&id).map_err(|_| bad("lost row"))?;
@@ -122,4 +131,12 @@ impl EngramRows for PreadTable {
         }
         Ok(out)
     }
+}
+
+/// Bytes of the 16 KiB-aligned window `read_aligned` reads for `e` (the
+/// file-end clip is ignored: table rows sit far from the shard end).
+fn window_len(e: Extent) -> u64 {
+    const ALIGN: u64 = 16 << 10;
+    let start = e.offset - e.offset % ALIGN;
+    (e.offset + e.len).next_multiple_of(ALIGN) - start
 }

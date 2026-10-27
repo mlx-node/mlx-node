@@ -237,7 +237,12 @@ impl Moe {
         let logits = linear(&x.astype(DType::Float32)?, &self.w.router)?;
         super::model::fp32_site("router_logits", usize::MAX, &logits)?;
         let scores = router_scores(&logits)?;
+        let t = std::time::Instant::now();
         let s = scores.to_float32()?.to_vec();
+        super::stats::ROUTER_WAIT_NS.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let n = self.n_experts;
         let biased: Vec<f32> = s
             .iter()

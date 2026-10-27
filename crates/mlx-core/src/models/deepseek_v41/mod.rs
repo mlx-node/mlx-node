@@ -8,12 +8,15 @@ pub mod compressor;
 pub mod config;
 pub mod engram;
 pub mod engram_hash;
+pub mod generate;
 pub mod indexer;
 pub mod model;
 pub mod moe;
 pub mod ops;
 pub mod rows;
+pub mod stats;
 pub mod store;
+pub mod trace;
 
 #[cfg(test)]
 mod test_fixture;

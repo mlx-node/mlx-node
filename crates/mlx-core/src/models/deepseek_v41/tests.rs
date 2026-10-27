@@ -429,3 +429,6 @@ include!("tests_model.rs");
 
 // S13 real layer groups vs the S12 goldens
 include!("tests_groups.rs");
+
+// S14a real end to end vs the S12 goldens
+include!("tests_e2e.rs");
