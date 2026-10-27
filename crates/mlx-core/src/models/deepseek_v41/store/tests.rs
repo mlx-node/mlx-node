@@ -15,8 +15,12 @@ use crate::models::deepseek_v41::test_fixture::{Npz, TinyGguf, fixture, read};
 use crate::models::deepseek_v41::tests::{case_ids, mode_of, run, split, tiny};
 
 fn tiny_store(mode: &str) -> Store {
+    tiny_dense(mode, DenseMode::Exact)
+}
+
+fn tiny_dense(mode: &str, dense: DenseMode) -> Store {
     let (act, fq) = mode_of(mode);
-    Store::open(&[fixture("tiny-q8_0.gguf")], act, fq).unwrap()
+    Store::open_dense(&[fixture("tiny-q8_0.gguf")], act, fq, CachePlan::Off, dense).unwrap()
 }
 
 fn bits(v: &[f32]) -> Vec<u32> {
@@ -149,11 +153,12 @@ fn row_range_checked() {
 
 fn cached_store(mode: &str, slots: usize) -> Store {
     let (act, fq) = mode_of(mode);
-    Store::open_with(
+    Store::open_dense(
         &[fixture("tiny-q8_0.gguf")],
         act,
         fq,
         CachePlan::Slots(slots),
+        DenseMode::Exact,
     )
     .unwrap()
 }
@@ -593,11 +598,12 @@ fn tiny_cache_admit_turns() {
         cache_cap: Some(1 << 30),
         ..Default::default()
     };
-    let store = Store::open_with(
+    let store = Store::open_dense(
         &[fixture("tiny-q8_0.gguf")],
         act,
         fq,
         CachePlan::Admit(limits),
+        DenseMode::Exact,
     )
     .unwrap();
     assert!(store.cache_slots() > 0, "{:?}", store.admission());
@@ -624,4 +630,125 @@ fn tiny_cache_admit_turns() {
         store.dense_bytes + store.bank.resident_bytes().unwrap()
     );
     store.end_turn().unwrap();
+}
+
+/// D-41 (stage P0) on the tiny file: `F32` == `Exact` bitwise (fp32 fq
+/// on/off, bf16, c1-c3); `Q8` and `Mixed` within G9.1's fq-off bound of
+/// the oracle (1e-4) and not bitwise `Exact` (the quantized matmul runs);
+/// fq on is printed only (a 1e-6 change flips near-edge fp8 codes, S7-5:
+/// Mixed c2 2.7e-2); resident dense bytes == the scan's prediction.
+#[test]
+fn tiny_dense_modes() {
+    let npz = Npz::open("oracle.npz");
+    for mode in ["fp32_on", "fp32_off", "bf16_on"] {
+        let (exact, f32s) = (
+            tiny_dense(mode, DenseMode::Exact),
+            tiny_dense(mode, DenseMode::F32),
+        );
+        for case in ["c1", "c2", "c3"] {
+            let ids = case_ids(&npz, case);
+            let (a, _) = run(&exact.model, &ids, &split(case));
+            let (b, _) = run(&f32s.model, &ids, &split(case));
+            assert_eq!(bits(&a), bits(&b), "{case} {mode}: F32 != Exact");
+        }
+    }
+    for dense in [DenseMode::Q8, DenseMode::Mixed] {
+        for (mode, tol) in [("fp32_off", 1e-4f32), ("fp32_on", f32::INFINITY)] {
+            let (st, exact) = (tiny_dense(mode, dense), tiny_dense(mode, DenseMode::Exact));
+            let mut differs = false;
+            for case in ["c1", "c2", "c3"] {
+                let ids = case_ids(&npz, case);
+                let (got, _) = run(&st.model, &ids, &split(case));
+                let (ex, _) = run(&exact.model, &ids, &split(case));
+                differs |= bits(&got) != bits(&ex);
+                let want = &npz.get(&format!("{case}.{mode}.logits")).1;
+                let d = got
+                    .iter()
+                    .zip(want)
+                    .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                println!("{dense:?} {case} {mode}: max|dlogit| vs oracle {d:e} (gate {tol:e})");
+                assert!(d < tol, "{dense:?} {case} {mode}: max|dlogit| {d:e}");
+            }
+            assert!(
+                differs,
+                "{dense:?} {mode}: bitwise Exact, quantized matmul not used"
+            );
+        }
+    }
+    for dense in [
+        DenseMode::Exact,
+        DenseMode::F32,
+        DenseMode::Q8,
+        DenseMode::Mixed,
+    ] {
+        let st = tiny_dense("fp32_on", dense);
+        let size = model_size(&[fixture("tiny-q8_0.gguf")], dense).unwrap();
+        println!("{dense:?}: dense resident {} B", st.dense_bytes);
+        assert_eq!(st.dense_bytes, size.dense, "{dense:?}");
+    }
+}
+
+/// `Dense::Qmm`: `mm_t` == x @ f32()^T within f32 accumulation noise, the
+/// f32 form == the exact dequantization bitwise, grouped == per group.
+#[test]
+fn tiny_qmm_dense_ops() {
+    let g = TinyGguf::open();
+    let name = "blk.0.attn_output_a.weight";
+    let (info, raw) = g.raw(name);
+    let (dst, ptrs) = RepackDst::alloc(info, OutLayout::RowMajor).unwrap();
+    decode_affine_band_into(info.tensor_type, &raw, 0, ptrs.rows, ptrs.k, &ptrs).unwrap();
+    let (w, scales) = (dst.weight, dst.scales.unwrap());
+    let s = scales.astype(DType::Float32).unwrap();
+    let b = s.mul_scalar(-128.0).unwrap();
+    let q8 = Dense::Q8 {
+        w: w.clone(),
+        scales: scales.clone(),
+    };
+    let qmm = Dense::Qmm {
+        w,
+        scales: s,
+        biases: b,
+    };
+    let (f_ex, f_q) = (q8.f32().unwrap(), qmm.f32().unwrap());
+    assert_eq!(
+        bits(&read(&f_ex)),
+        bits(&read(&f_q)),
+        "Qmm f32 form != exact dequant"
+    );
+    let (rows, k) = (qmm.shape_at(0).unwrap(), qmm.shape_at(1).unwrap());
+    let xs: Vec<f32> = (0..3 * k)
+        .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
+        .collect();
+    let x = MxArray::from_float32(&xs, &[3, k]).unwrap();
+    let want = read(&q8.mm_t(&x).unwrap());
+    let got = read(&qmm.mm_t(&x).unwrap());
+    let (num, den) = got.iter().zip(&want).fold((0f64, 0f64), |(n, d), (a, b)| {
+        (n + f64::from(a - b).powi(2), d + f64::from(*b).powi(2))
+    });
+    let rel = (num / den).sqrt();
+    println!("Qmm mm_t relL2 vs f32 {rel:e} ({rows} x {k})");
+    assert!(rel < 1e-5, "{rel}");
+    let ng = 2;
+    let xg = MxArray::from_float32(
+        &xs.iter().chain(&xs).copied().collect::<Vec<_>>(),
+        &[ng, 3, k],
+    )
+    .unwrap();
+    let grouped = read(&qmm.grouped_qmm_t(&xg, ng).unwrap().unwrap());
+    let per = rows / ng;
+    for i in 0..ng {
+        let part = read(
+            &qmm.row_range(i * per, (i + 1) * per)
+                .unwrap()
+                .mm_t(&x)
+                .unwrap(),
+        );
+        let n = part.len();
+        assert_eq!(
+            bits(&grouped[i as usize * n..(i as usize + 1) * n]),
+            bits(&part),
+            "group {i}"
+        );
+    }
+    assert!(q8.grouped_qmm_t(&xg, ng).unwrap().is_none());
 }

@@ -1,6 +1,7 @@
 //! Store v1: the model straight from the GGUF shards. Dense tensors are read
 //! once by aligned `F_NOCACHE` `pread` and kept resident (Q8_0 as MLX affine
-//! 8-bit codes + f16 scales, dequantized to f32 at each use; F32 as is);
+//! 8-bit codes multiplied by `quantized_matmul` by default, or in the exact
+//! f32 forms, `DenseMode`; F32 as is);
 //! routed experts stream per layer into the shared bank (staging + global
 //! cache, sized by `CachePlan`); engram rows come from `PreadTable`.
 //!
@@ -43,6 +44,11 @@ fn bad(msg: impl std::fmt::Display) -> Error {
 /// Something `linear` can use as an f32 `[out, in]` weight.
 pub trait Weight {
     fn f32(&self) -> Result<MxArray>;
+
+    /// `x @ W^T` for an f32 `x`.
+    fn mm_t(&self, x: &MxArray) -> Result<MxArray> {
+        x.matmul(&self.f32()?.transpose(Some(&[1, 0]))?)
+    }
 }
 
 impl Weight for MxArray {
@@ -54,10 +60,105 @@ impl Weight for MxArray {
 /// A dense weight: an array, or Q8_0 as MLX affine 8-bit (`w` `[rows, k /
 /// 4]` uint32 codes q + 128, `scales` `[rows, k / 32]` f16). The f32 form
 /// (`scale * code - 128 * scale` = `d * q`, exact) is built at each use
-/// and never kept.
+/// and never kept. `Qmm` holds the same codes with f32 scales and biases
+/// (`-128 * scale`, exact) and multiplies by `quantized_matmul` (D-41 (b):
+/// other rounding than the f32 path); its f32 form is the exact one.
 pub enum Dense {
     Array(MxArray),
-    Q8 { w: MxArray, scales: MxArray },
+    Q8 {
+        w: MxArray,
+        scales: MxArray,
+    },
+    Qmm {
+        w: MxArray,
+        scales: MxArray,
+        biases: MxArray,
+    },
+}
+
+/// How Q8_0 matrices are held (D-41, stage P0; env `MLX_DSV41_DENSE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenseMode {
+    /// Codes + f16 scales, f32 built at each use (S11).
+    Exact,
+    /// f32 built once at load: bitwise == `Exact`. The embedding stays
+    /// codes (rows only).
+    F32,
+    /// `quantized_matmul` on the codes (embedding: codes, rows only).
+    Q8,
+    /// f32 for attention, compressor, indexer and head; `Q8` for the rest.
+    Mixed,
+}
+
+pub const DENSE_ENV: &str = "MLX_DSV41_DENSE";
+
+/// What one Q8_0 tensor becomes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Form {
+    Codes,
+    F32,
+    Qmm,
+}
+
+impl DenseMode {
+    /// The production default: fastest decode at the auto budget with greedy
+    /// ids == `Exact` (DECISIONS P0-2). `Exact` stays the reference for tests.
+    pub const DEFAULT: Self = Self::Q8;
+
+    /// `MLX_DSV41_DENSE` = `exact` | `f32` | `q8` | `mixed`; unset or empty
+    /// = `DEFAULT`; anything else is refused.
+    pub fn from_env() -> Result<Self> {
+        match std::env::var(DENSE_ENV).ok().as_deref().map(str::trim) {
+            None | Some("") => Ok(Self::DEFAULT),
+            Some("exact") => Ok(Self::Exact),
+            Some("f32") => Ok(Self::F32),
+            Some("q8") => Ok(Self::Q8),
+            Some("mixed") => Ok(Self::Mixed),
+            Some(v) => Err(bad(format!(
+                "{DENSE_ENV}={v}: want exact, f32, q8 or mixed"
+            ))),
+        }
+    }
+
+    /// Bitwise equal to the reference f32 path (`Exact`).
+    pub fn exact(self) -> bool {
+        matches!(self, Self::Exact | Self::F32)
+    }
+
+    /// Hash-file suffix of runs in this mode ("" for the exact ones).
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Exact | Self::F32 => "",
+            Self::Q8 => ".q8",
+            Self::Mixed => ".mixed",
+        }
+    }
+
+    fn form(self, name: &str) -> Form {
+        let attn_or_head =
+            name == "output.weight" || name.contains(".attn_") || name.contains(".indexer.");
+        match self {
+            _ if name == "token_embd.weight" => Form::Codes,
+            Self::Exact => Form::Codes,
+            Self::F32 => Form::F32,
+            Self::Q8 => Form::Qmm,
+            Self::Mixed if attn_or_head => Form::F32,
+            Self::Mixed => Form::Qmm,
+        }
+    }
+
+    /// Resident bytes of one dense tensor in this mode.
+    fn resident(self, t: &GgufTensorInfo) -> Result<u64> {
+        if t.tensor_type != GgufTensorType::Q8_0 {
+            return t.data_size();
+        }
+        let n: u64 = t.dims.iter().product();
+        Ok(match self.form(&t.name) {
+            Form::Codes => n + n / 16,
+            Form::F32 => 4 * n,
+            Form::Qmm => n + n / 4,
+        })
+    }
 }
 
 impl From<MxArray> for Dense {
@@ -69,6 +170,10 @@ impl From<MxArray> for Dense {
 fn dequant_q8(w: &MxArray, scales: &MxArray) -> Result<MxArray> {
     let s = scales.astype(DType::Float32)?;
     let b = s.mul_scalar(-128.0)?;
+    dequant_affine8(w, &s, &b)
+}
+
+fn dequant_affine8(w: &MxArray, s: &MxArray, b: &MxArray) -> Result<MxArray> {
     let mode = CString::new("affine").map_err(|e| bad(e.to_string()))?;
     // SAFETY: live arrays for the call; the bridge returns a new array or null.
     let h = unsafe {
@@ -85,11 +190,38 @@ fn dequant_q8(w: &MxArray, scales: &MxArray) -> Result<MxArray> {
     MxArray::from_handle(h, "deepseek_v41 q8_0 dequantize")
 }
 
+/// `x @ W^T` on affine 8-bit codes (group 32); `W` may carry batch axes.
+fn qmm_t(x: &MxArray, w: &MxArray, s: &MxArray, b: &MxArray) -> Result<MxArray> {
+    let mode = CString::new("affine").map_err(|e| bad(e.to_string()))?;
+    // SAFETY: live arrays for the call; the bridge returns a new array or null.
+    let h = unsafe {
+        mlx_sys::mlx_quantized_matmul(
+            x.as_raw_ptr(),
+            w.as_raw_ptr(),
+            s.as_raw_ptr(),
+            b.as_raw_ptr(),
+            true,
+            32,
+            8,
+            mode.as_ptr(),
+        )
+    };
+    MxArray::from_handle(h, "deepseek_v41 q8_0 quantized_matmul")
+}
+
 impl Weight for Dense {
     fn f32(&self) -> Result<MxArray> {
         match self {
             Self::Array(a) => a.astype(DType::Float32),
             Self::Q8 { w, scales } => dequant_q8(w, scales),
+            Self::Qmm { w, scales, biases } => dequant_affine8(w, scales, biases),
+        }
+    }
+
+    fn mm_t(&self, x: &MxArray) -> Result<MxArray> {
+        match self {
+            Self::Qmm { w, scales, biases } => qmm_t(x, w, scales, biases),
+            _ => x.matmul(&self.f32()?.transpose(Some(&[1, 0]))?),
         }
     }
 }
@@ -99,7 +231,9 @@ impl Dense {
     pub fn array(self) -> Result<MxArray> {
         match self {
             Self::Array(a) => Ok(a),
-            Self::Q8 { .. } => Err(bad("Q8_0 tensor where an f32 array is expected")),
+            Self::Q8 { .. } | Self::Qmm { .. } => {
+                Err(bad("Q8_0 tensor where an f32 array is expected"))
+            }
         }
     }
 
@@ -107,8 +241,10 @@ impl Dense {
     pub fn shape_at(&self, axis: u32) -> Result<i64> {
         match self {
             Self::Array(a) => a.shape_at(axis),
-            Self::Q8 { w, scales } if axis + 1 == w.ndim()? => Ok(scales.shape_at(axis)? * 32),
-            Self::Q8 { w, .. } => w.shape_at(axis),
+            Self::Q8 { w, scales } | Self::Qmm { w, scales, .. } if axis + 1 == w.ndim()? => {
+                Ok(scales.shape_at(axis)? * 32)
+            }
+            Self::Q8 { w, .. } | Self::Qmm { w, .. } => w.shape_at(axis),
         }
     }
 
@@ -117,6 +253,11 @@ impl Dense {
         match self {
             Self::Array(a) => a.take(idx, 0),
             Self::Q8 { w, scales } => dequant_q8(&w.take(idx, 0)?, &scales.take(idx, 0)?),
+            Self::Qmm { w, scales, biases } => dequant_affine8(
+                &w.take(idx, 0)?,
+                &scales.take(idx, 0)?,
+                &biases.take(idx, 0)?,
+            ),
         }
     }
 
@@ -129,13 +270,29 @@ impl Dense {
                 w: cut(w)?,
                 scales: cut(scales)?,
             },
+            Self::Qmm { w, scales, biases } => Self::Qmm {
+                w: cut(w)?,
+                scales: cut(scales)?,
+                biases: cut(biases)?,
+            },
         })
+    }
+
+    /// `x [g, s, k] @ W_i^T` for `g` equal row groups `W_i` of a `Qmm`
+    /// weight (`[g, s, rows / g]`); `None` for the other forms.
+    pub fn grouped_qmm_t(&self, x: &MxArray, g: i64) -> Result<Option<MxArray>> {
+        let Self::Qmm { w, scales, biases } = self else {
+            return Ok(None);
+        };
+        let r = |a: &MxArray| a.reshape(&[g, a.shape_at(0)? / g, a.shape_at(1)?]);
+        Ok(Some(qmm_t(x, &r(w)?, &r(scales)?, &r(biases)?)?))
     }
 
     pub fn nbytes(&self) -> usize {
         match self {
             Self::Array(a) => a.nbytes(),
             Self::Q8 { w, scales } => w.nbytes() + scales.nbytes(),
+            Self::Qmm { w, scales, biases } => w.nbytes() + scales.nbytes() + biases.nbytes(),
         }
     }
 }
@@ -182,6 +339,7 @@ pub struct Store {
     pub size: ModelSize,
     /// Seconds to allocate the bank at load (no page touched yet).
     pub bank_alloc_s: f64,
+    pub dense_mode: DenseMode,
     plan: CachePlan,
     turn: Mutex<TurnState>,
 }
@@ -197,12 +355,23 @@ impl Store {
         Self::open_with(paths, act, fq, CachePlan::Off)
     }
 
-    /// `paths` are every shard in order (shard 0 holds the metadata).
+    /// `paths` are every shard in order (shard 0 holds the metadata); dense
+    /// mode from `MLX_DSV41_DENSE` (`DenseMode::from_env`).
     pub fn open_with(
         paths: &[PathBuf],
         act: DType,
         fq: FakeQuant,
         plan: CachePlan,
+    ) -> Result<Self> {
+        Self::open_dense(paths, act, fq, plan, DenseMode::from_env()?)
+    }
+
+    pub fn open_dense(
+        paths: &[PathBuf],
+        act: DType,
+        fq: FakeQuant,
+        plan: CachePlan,
+        mode: DenseMode,
     ) -> Result<Self> {
         let Scan {
             where_,
@@ -210,8 +379,7 @@ impl Store {
             layers,
             size,
             bank_need,
-            dense_need,
-        } = scan(paths)?;
+        } = scan(paths, mode)?;
         let find = |n: &str| {
             where_
                 .get(n)
@@ -229,7 +397,7 @@ impl Store {
                 let slots = if let CachePlan::Slots(n) = plan { n } else { 0 };
                 if let Some(h) = host_memory() {
                     let free = h.physical.saturating_sub(h.non_reclaimable());
-                    let need = bank_need + slots as u64 * size.slot + dense_need;
+                    let need = bank_need + slots as u64 * size.slot + size.dense;
                     if need + RESERVE > free {
                         return Err(bad(format!(
                             "load needs {} GiB + {} GiB reserve, host has {} GiB free",
@@ -265,11 +433,28 @@ impl Store {
                 GgufTensorType::Q8_0 => {
                     let (dst, ptrs) = RepackDst::alloc(info, OutLayout::RowMajor)?;
                     decode_affine_band_into(info.tensor_type, raw, 0, ptrs.rows, ptrs.k, &ptrs)?;
-                    Dense::Q8 {
-                        w: dst.weight,
-                        scales: dst
-                            .scales
+                    let (w, scales) = (
+                        dst.weight,
+                        dst.scales
                             .ok_or_else(|| bad("Q8_0 repack gave no scales"))?,
+                    );
+                    match mode.form(n) {
+                        Form::Codes => Dense::Q8 { w, scales },
+                        Form::F32 => {
+                            let a = dequant_q8(&w, &scales)?;
+                            MxArray::eval_arrays_with_context(&[&a], "deepseek_v41 f32 dense")?;
+                            Dense::Array(a)
+                        }
+                        Form::Qmm => {
+                            let s = scales.astype(DType::Float32)?;
+                            let b = s.mul_scalar(-128.0)?;
+                            MxArray::eval_arrays_with_context(&[&s, &b], "deepseek_v41 q8 scales")?;
+                            Dense::Qmm {
+                                w,
+                                scales: s,
+                                biases: b,
+                            }
+                        }
                     }
                 }
                 GgufTensorType::F32 => {
@@ -318,6 +503,7 @@ impl Store {
             dense_bytes,
             size,
             bank_alloc_s,
+            dense_mode: mode,
             plan,
             turn: Mutex::new(TurnState {
                 admission,
@@ -448,10 +634,9 @@ struct Scan {
     layers: Vec<Vec<ExpertTensor>>,
     size: ModelSize,
     bank_need: u64,
-    dense_need: u64,
 }
 
-fn scan(paths: &[PathBuf]) -> Result<Scan> {
+fn scan(paths: &[PathBuf], mode: DenseMode) -> Result<Scan> {
     let mut where_: HashMap<String, Located> = HashMap::new();
     let mut cfg = None;
     for (i, p) in paths.iter().enumerate() {
@@ -485,14 +670,14 @@ fn scan(paths: &[PathBuf]) -> Result<Scan> {
         .iter()
         .map(|t| t.info.data_size())
         .sum::<Result<u64>>()?;
-    let dense_need: u64 = where_
+    let dense_resident: u64 = where_
         .values()
         .filter(|(_, _, t)| is_dense(&t.name))
-        .map(|(_, _, t)| t.data_size())
+        .map(|(_, _, t)| mode.resident(t))
         .sum::<Result<u64>>()?;
     let n_experts = cfg.n_routed_experts as u64;
     let size = ModelSize {
-        dense: dense_need,
+        dense: dense_resident,
         slot: bank_need / n_experts.max(1),
         n_experts,
         ctx: cfg.context_length.min(CTX_LIMIT) as u64,
@@ -503,14 +688,13 @@ fn scan(paths: &[PathBuf]) -> Result<Scan> {
         layers,
         size,
         bank_need,
-        dense_need,
     })
 }
 
 /// The admission's model sizes from the shard headers alone (no tensor
-/// data read, nothing allocated).
-pub fn model_size(paths: &[PathBuf]) -> Result<ModelSize> {
-    Ok(scan(paths)?.size)
+/// data read, nothing allocated); `dense` = resident bytes in `mode`.
+pub fn model_size(paths: &[PathBuf], mode: DenseMode) -> Result<ModelSize> {
+    Ok(scan(paths, mode)?.size)
 }
 
 /// Read at load: everything but routed experts, the engram table and the

@@ -17,7 +17,7 @@ use crate::array::MxArray;
 pub const FFN_CHUNK_ROWS: i64 = 256;
 
 pub enum Attn {
-    Window(WindowAttention),
+    Window(Box<WindowAttention>),
     Compressed(Box<CompressedAttention>),
 }
 
@@ -67,7 +67,7 @@ impl Block {
     ) -> Result<Self> {
         let attn = if cfg.compress_ratios[layer] == 0 {
             let w = super::attention::AttentionWeights::from_gguf(layer, &mut get)?;
-            Attn::Window(WindowAttention::new(cfg, layer, w, fq)?)
+            Attn::Window(Box::new(WindowAttention::new(cfg, layer, w, fq)?))
         } else {
             Attn::Compressed(Box::new(CompressedAttention::from_gguf(
                 cfg, layer, fq, &mut get,

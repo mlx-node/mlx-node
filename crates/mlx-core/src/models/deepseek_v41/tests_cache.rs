@@ -8,7 +8,7 @@
 // `DSV41_GOLDEN`, `DSV41_DIR`; `DSV41_CACHE_OUT` gets `<name>.json`.
 
 use super::generate::generate_probed;
-use super::store::{CachePlan, model_size};
+use super::store::{CachePlan, DenseMode, model_size};
 use crate::moe_stream::budget::{CACHE_ENV, Limits, Own, admit, working_set};
 
 /// Steps per turn after the first call of the turn (turn 1's first call is
@@ -30,8 +30,9 @@ fn s16_store(plan: CachePlan) -> Store {
     let t0 = std::time::Instant::now();
     let s = Store::open_with(&real_shards(), DType::Float32, FakeQuant::ON, plan).unwrap();
     println!(
-        "load {:.1} s; dense read {} B, resident {} B; bank {:.3} GiB ({} cache slots) allocated in {:.3} s; admission {}",
+        "load {:.1} s; dense mode {:?}; dense read {} B, resident {} B; bank {:.3} GiB ({} cache slots) allocated in {:.3} s; admission {}",
         t0.elapsed().as_secs_f64(),
+        s.dense_mode,
         s.dense_read,
         s.dense_bytes,
         s.bank.nbytes() as f64 / S16_GIB,
@@ -329,10 +330,15 @@ fn real_cache_inv(name: &str, plan: CachePlan, turns: &[usize], empty_after_firs
         "ids": ids,
         "hashes": hashes,
     });
-    let base_name = "s16-cache-inv-c0";
-    if name == "c0" {
-        // the first 32 calls are S14a's greedy_en calls: same bits
-        let p = golden_root().join("hashes/greedy-p32k8-en.json");
+    // non-exact dense modes (D-41) keep their own baselines; F32 is gated
+    // on the exact ones
+    let tag = store.dense_mode.tag();
+    let base_name = format!("s16-cache-inv-c0{tag}");
+    let base_path = golden_root().join(format!("hashes/{base_name}.json"));
+    if name == "c0" || (!tag.is_empty() && !base_path.exists()) {
+        // the first 32 calls are S14a's greedy_en calls: same bits (a
+        // non-exact mode's first run becomes its cache-invariance baseline)
+        let p = golden_root().join(format!("hashes/greedy-p32k8-en{tag}.json"));
         let g: Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
         let old: Vec<String> = g["hashes"]
             .as_array()
@@ -344,17 +350,17 @@ fn real_cache_inv(name: &str, plan: CachePlan, turns: &[usize], empty_after_firs
         if old[..n] != hashes[..n] {
             let first = (0..n).find(|&i| old[i] != hashes[i]).unwrap();
             fails.push(format!(
-                "c0 differs from S14a greedy_en at call {first} of {n} (logits hash)"
+                "{name}{tag} differs from greedy_en{tag} at call {first} of {n} (logits hash)"
             ));
         } else {
-            println!("c0 == S14a greedy_en hashes for the first {n} calls (bitwise)");
+            println!("{name}{tag} == greedy_en{tag} hashes for the first {n} calls (bitwise)");
         }
-        store_hashes(base_name, doc.clone(), &mut fails);
+        store_hashes(&base_name, doc.clone(), &mut fails);
     } else {
-        let p = golden_root().join(format!("hashes/{base_name}.json"));
-        let base: Value =
-            serde_json::from_slice(&std::fs::read(&p).expect("run real_cache_inv_c0 first"))
-                .unwrap();
+        let base: Value = serde_json::from_slice(
+            &std::fs::read(&base_path).expect("run real_cache_inv_c0 first"),
+        )
+        .unwrap();
         assert_eq!(base["prompt_ids"], doc["prompt_ids"]);
         // a shorter run is a prefix of c0's turns (same turn boundaries)
         let bt = base["turns"].as_array().unwrap();
@@ -377,7 +383,7 @@ fn real_cache_inv(name: &str, plan: CachePlan, turns: &[usize], empty_after_firs
             .filter(|&i| bh.get(i).and_then(Value::as_str) != hashes.get(i).map(String::as_str))
             .collect();
         if diff.is_empty() {
-            println!("{name}: {n_calls} logits hashes == c0 (bitwise)");
+            println!("{name}: {n_calls} logits hashes == {base_name} (bitwise)");
         } else {
             fails.push(format!(
                 "{name}: logits hashes differ from c0 at calls {diff:?}"
@@ -391,6 +397,7 @@ fn real_cache_inv(name: &str, plan: CachePlan, turns: &[usize], empty_after_firs
     let decode = s16_decode_terms(&dec_c, dec_wall, dec_n);
     let out = serde_json::json!({
         "name": name,
+        "dense_mode": format!("{:?}", store.dense_mode),
         "plan": format!("{:?}", store.plan()),
         "cache_slots": store.cache_slots(),
         "bank_bytes": store.bank.nbytes(),
@@ -470,7 +477,9 @@ fn real_cache_inv_auto() {
 #[ignore = "real shard headers; MLX_DSV41_ADMIT_ONLY=1; < 1 GiB"]
 fn real_admit_dry_run() {
     assert_eq!(s16_env("MLX_DSV41_ADMIT_ONLY").as_deref(), Some("1"));
-    let size = model_size(&real_shards()).unwrap();
+    let mode = DenseMode::from_env().unwrap();
+    let size = model_size(&real_shards(), mode).unwrap();
+    println!("dense mode {mode:?}");
     let limits = Limits::from_env().unwrap();
     let h = crate::utils::host::host_memory().expect("host memory");
     let ws = working_set();
@@ -486,6 +495,7 @@ fn real_admit_dry_run() {
     );
     let t = &a.terms;
     let doc = serde_json::json!({
+        "dense_mode": format!("{mode:?}"),
         "n_auto_gib": n_auto,
         "cache_slots": a.cache_slots,
         "slot_bytes": a.slot,

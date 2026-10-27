@@ -392,7 +392,15 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
     }
 
     let t0 = std::time::Instant::now();
-    let mut store = Store::open(&real_shards(), DType::Float32, FakeQuant::ON).unwrap();
+    // the group gates hold the exact f32 path (DECISIONS P0-2)
+    let mut store = Store::open_dense(
+        &real_shards(),
+        DType::Float32,
+        FakeQuant::ON,
+        CachePlan::Off,
+        DenseMode::Exact,
+    )
+    .unwrap();
     store.model.export_scores(true);
     let load_s = t0.elapsed().as_secs_f64();
     let m = &store.model;

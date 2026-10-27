@@ -79,9 +79,7 @@ impl AttentionWeights {
 
 /// `F.linear(x.float(), W).to(x.dtype)` (oracle A8).
 pub(crate) fn linear(x: &MxArray, w: &impl Weight) -> Result<MxArray> {
-    x.astype(DType::Float32)?
-        .matmul(&w.f32()?.transpose(Some(&[1, 0]))?)?
-        .astype(x.dtype()?)
+    w.mm_t(&x.astype(DType::Float32)?)?.astype(x.dtype()?)
 }
 
 /// `RMSNorm.forward`: f32 statistics, `weight * (x * rsqrt(var + eps))`.
@@ -228,18 +226,23 @@ impl WindowAttention {
         let g = self.o_groups;
         let width = self.n_heads * self.head_dim / g;
         let o = self.quant_o(&o.reshape(&[s, g, width])?)?;
-        let wa = self
-            .w
-            .wo_a
-            .f32()?
-            .astype(act)?
-            .astype(DType::Float32)?
-            .reshape(&[g, self.o_lora, width])?
-            .transpose(Some(&[0, 2, 1]))?;
-        let y = o
-            .astype(DType::Float32)?
-            .transpose(Some(&[1, 0, 2]))?
-            .matmul(&wa)?
+        let o = o.astype(DType::Float32)?.transpose(Some(&[1, 0, 2]))?;
+        // a `Qmm` wo_a is not rounded to the activation dtype first (D-41 (b))
+        let y = match self.w.wo_a.grouped_qmm_t(&o, g)? {
+            Some(y) => y,
+            None => {
+                let wa = self
+                    .w
+                    .wo_a
+                    .f32()?
+                    .astype(act)?
+                    .astype(DType::Float32)?
+                    .reshape(&[g, self.o_lora, width])?
+                    .transpose(Some(&[0, 2, 1]))?;
+                o.matmul(&wa)?
+            }
+        };
+        let y = y
             .transpose(Some(&[1, 0, 2]))?
             .reshape(&[s, g * self.o_lora])?
             .astype(act)?;

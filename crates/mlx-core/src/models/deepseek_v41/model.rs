@@ -407,16 +407,20 @@ impl Model {
         }
     }
 
-    /// f32 logits of `x [s, dim]` (f32). A quantized head is dequantized
-    /// `HEAD_CHUNK` vocab rows at a time.
+    /// f32 logits of `x [s, dim]` (f32). A Q8_0 head is dequantized
+    /// `HEAD_CHUNK` vocab rows at a time; an f32 head larger than one chunk
+    /// takes the same chunks (bitwise == the dequantized one); a `Qmm` head
+    /// is one `quantized_matmul`.
     fn head_logits(&self, x: &MxArray) -> Result<MxArray> {
-        let w = match &self.head {
-            Dense::Array(a) => {
+        let w = &self.head;
+        let vocab = w.shape_at(0)?;
+        match w {
+            Dense::Array(a) if vocab <= HEAD_CHUNK => {
                 return x.matmul(&a.astype(DType::Float32)?.transpose(Some(&[1, 0]))?);
             }
-            q => q,
-        };
-        let vocab = w.shape_at(0)?;
+            Dense::Qmm { .. } => return w.mm_t(x),
+            _ => {}
+        }
         let mut parts = Vec::new();
         let mut lo = 0;
         while lo < vocab {

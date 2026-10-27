@@ -119,8 +119,9 @@ fn e2e_store() -> Store {
     let t0 = std::time::Instant::now();
     let s = Store::open(&real_shards(), DType::Float32, FakeQuant::ON).unwrap();
     println!(
-        "load {:.1} s; dense read {} B, resident {} B",
+        "load {:.1} s; dense mode {:?}; dense read {} B, resident {} B",
         t0.elapsed().as_secs_f64(),
+        s.dense_mode,
         s.dense_read,
         s.dense_bytes
     );
@@ -512,6 +513,27 @@ fn real_e2e_greedy(case: &str) {
         fails.push(format!("non-finite logits in calls {bad_calls:?}"));
     }
     let same_prompt = prompt == gd.prompt;
+    let tag = store.dense_mode.tag();
+    if !tag.is_empty() {
+        // D-41 (b)/(c): the 32 greedy ids == the exact path's stored ids
+        let p = golden_root().join(format!("hashes/greedy-{case}.json"));
+        let ex: Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+        assert_eq!(ex["prompt_ids"], serde_json::json!(prompt));
+        let want: Vec<u32> = ex["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u32)
+            .collect();
+        match (0..want.len().max(g.argmax.len())).find(|&i| want.get(i) != g.argmax.get(i)) {
+            None => println!("P0 greedy ids == the exact path's {} ids", want.len()),
+            Some(i) => fails.push(format!(
+                "P0 greedy ids differ from the exact path at step {i}: {:?} vs {:?}",
+                g.argmax.get(i),
+                want.get(i)
+            )),
+        }
+    }
     let mut parted = None;
     if same_prompt {
         for (j, (&got, &want)) in g.argmax.iter().zip(&gd.greedy).enumerate() {
@@ -540,7 +562,7 @@ fn real_e2e_greedy(case: &str) {
     );
     check_io(&g, g.argmax.len(), store.model.cfg.n_layers, &mut fails);
     // EN keeps its logits for the chunk-7 gate, bound to the baseline by sha256
-    let keep = case == "p32k8-en" && same_prompt;
+    let keep = case == "p32k8-en" && same_prompt && tag.is_empty();
     let b: Vec<u8> = if keep {
         rows.iter().flat_map(|x| x.to_le_bytes()).collect()
     } else {
@@ -548,7 +570,7 @@ fn real_e2e_greedy(case: &str) {
     };
     let logits_sha = keep.then(|| hex_sha(&rows));
     let fresh = store_hashes(
-        &format!("greedy-{case}"),
+        &format!("greedy-{case}{tag}"),
         serde_json::json!({
             "prompt_ids": prompt,
             "ids": g.argmax,
@@ -595,6 +617,10 @@ fn real_e2e_chunk7_en() {
     // spread at that position); greedy ids exact; hashes bitwise once stored
     let env = self_noise("p32k8-en");
     let store = e2e_store();
+    assert!(
+        store.dense_mode.exact(),
+        "the chunk-7 golden is the exact path's: MLX_DSV41_DENSE=exact (DECISIONS P0-2)"
+    );
     let vocab = store.model.cfg.vocab_size;
     let p = gd.prompt.len();
     let mut sess = store.model.new_session();

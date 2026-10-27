@@ -89,7 +89,10 @@ fn real_compute(t: usize) {
         .map(|x| x.as_u64().unwrap() as u32)
         .collect();
     assert_eq!(ids.len(), t);
-    let store = e2e_store();
+    let mut store = e2e_store();
+    // the greedy step after a T-token prefill is measured one token past the
+    // D-24 limit at T = 16K, which the product refuses (S16b codex)
+    store.model.ctx_limit = store.model.ctx_limit.map(|l| l.max(t + 1));
     let m = &store.model;
     let (hc, dim, n_layers) = (m.cfg.hc_mult, m.cfg.dim, m.cfg.n_layers);
     crate::array::synchronize();
