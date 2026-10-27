@@ -67,6 +67,43 @@ fn gold(case: &str) -> Gold {
     }
 }
 
+/// DECISIONS S14a-5/6: the oracle against itself on one case (fp32, fake
+/// quant on): 1-ulp perturbations of the embedding output (`pert`, `pertup`,
+/// `rnd1..3`) and the call split 7 + 1 x 25 (`split7`), from
+/// `oracle/s14a_control.py`, reduced by `diag/s14a/envelope.py` into
+/// `<case>/selfnoise.json`. Every field is a max over those samples.
+struct SelfNoise {
+    /// per position: `KL(ora32 || sample)` (1-ulp samples)
+    kl: Vec<f64>,
+    /// rows whose top-1 differs from ora32's (1-ulp samples)
+    top1_flips: usize,
+    /// per layer: error-curve `r_s(L)` (1-ulp samples)
+    r: Vec<f64>,
+    /// per layer `L >= 1`: `r_s(L) - r_s(L - 1)` (1-ulp samples; `[0]` = 0)
+    step: Vec<f64>,
+    /// per position: logits relL2 vs ora32 (1-ulp samples and `split7`)
+    row: Vec<f64>,
+}
+
+fn self_noise(case: &str) -> Option<SelfNoise> {
+    let p = golden_root().join(case).join("selfnoise.json");
+    let v: Value = serde_json::from_slice(&std::fs::read(p).ok()?).unwrap();
+    let f = |k: &str| -> Vec<f64> {
+        v[k].as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap())
+            .collect()
+    };
+    Some(SelfNoise {
+        kl: f("kl"),
+        top1_flips: v["top1_flips"].as_u64().unwrap() as usize,
+        r: f("r"),
+        step: f("step"),
+        row: f("row"),
+    })
+}
+
 fn e2e_store() -> Store {
     assert_eq!(
         std::env::var("MLX_ENABLE_TF32").as_deref(),
@@ -183,7 +220,8 @@ fn finish(name: &str, fails: &[String]) {
 /// G14.1: the oracle's calls teacher-forced (prompt + its fp32 greedy ids):
 /// per position `KL(ora32 || mlx) <= max(2 KL(ora32 || ora16), 1e-4)`, top-1
 /// mismatches only near ties (§3 / S13a), error-curve rule on every layer's
-/// stream.
+/// stream. With the case's `selfnoise.json` each bound also admits 2 x the
+/// oracle's own 1-ulp spread (DECISIONS S14a-5).
 fn real_e2e_tf(case: &str) {
     let gd = gold(case);
     let store = e2e_store();
@@ -193,8 +231,20 @@ fn real_e2e_tf(case: &str) {
     let vocab = cfg.vocab_size;
     let steps = gd.calls.len() - 1;
     let force: Vec<u32> = gd.calls[1..].iter().map(|c| c.1[0]).collect();
+    // S14a-5: with the case's self-noise envelope every bound is the larger of
+    // the §3 bound and 2 x the oracle's own 1-ulp spread; the §3 verdict is printed
+    let env = self_noise(case);
+    println!(
+        "{case}: self-noise envelope {}",
+        if env.is_some() {
+            "found (S14a-5 bounds)"
+        } else {
+            "absent (§3 bounds)"
+        }
+    );
     let mut sess = store.model.new_session();
     let mut fails = Vec::new();
+    let mut as_written = Vec::new();
     let mut acc = vec![[0f64; 3]; cfg.n_layers];
     let (mut worst_kl, mut excused) = (0f64, Vec::new());
     let mut hook = |c: &Call| -> napi::Result<()> {
@@ -208,8 +258,16 @@ fn real_e2e_tf(case: &str) {
             let w = p * vocab..(p + 1) * vocab;
             let (a, b, z) = (&got[w.clone()], &l32[w.clone()], &l16[w]);
             let (k_m, k_f) = (kl(b, a), kl(b, z));
-            let bound = (2.0 * k_f).max(1e-4);
+            let b3 = (2.0 * k_f).max(1e-4);
+            let bound = env.as_ref().map_or(b3, |e| b3.max(2.0 * e.kl[start + p]));
             worst_kl = worst_kl.max(k_m / bound);
+            if k_m.is_nan() || k_m > b3 {
+                as_written.push(format!(
+                    "G14.1 call {} pos {}: KL {k_m:e} > {b3:e}",
+                    c.index,
+                    start + p
+                ));
+            }
             if k_m.is_nan() || k_m > bound {
                 fails.push(format!(
                     "G14.1 call {} pos {}: KL {k_m:e} > {bound:e}",
@@ -257,16 +315,27 @@ fn real_e2e_tf(case: &str) {
     )
     .unwrap();
     let mut prev: Option<f64> = None;
-    println!("layer  relL2(mlx,ora32)  floor(ora16,ora32)  r(L)");
+    println!("layer  relL2(mlx,ora32)  floor(ora16,ora32)  r(L)  r bound  step bound");
     for (l, a) in acc.iter().enumerate() {
         let (e, f) = ((a[0] / a[2]).sqrt(), (a[1] / a[2]).sqrt());
         let r = e / f.max(1e-6);
-        println!("L{l:02}  {e:.3e}  {f:.3e}  {r:.3}");
+        let (rb, sb) = env.as_ref().map_or((2.0, 0.25), |n| {
+            (2f64.max(2.0 * n.r[l]), 0.25f64.max(2.0 * n.step[l]))
+        });
+        println!("L{l:02}  {e:.3e}  {f:.3e}  {r:.3}  {rb:.3}  {sb:.3}");
         if r.is_nan() || r > 2.0 {
-            fails.push(format!("error curve L{l}: r {r}"));
+            as_written.push(format!("error curve L{l}: r {r}"));
         }
-        if let Some(p) = prev.filter(|&p| r - p > 0.25) {
-            fails.push(format!("error curve step L{l}: {p} -> {r}"));
+        if r.is_nan() || r > rb {
+            fails.push(format!("error curve L{l}: r {r} > {rb}"));
+        }
+        if let Some(p) = prev {
+            if r - p > 0.25 {
+                as_written.push(format!("error curve step L{l}: {p} -> {r}"));
+            }
+            if r - p > sb {
+                fails.push(format!("error curve step L{l}: {p} -> {r} > {sb}"));
+            }
         }
         prev = Some(r);
     }
@@ -277,14 +346,27 @@ fn real_e2e_tf(case: &str) {
         g.argmax,
         gd.greedy
     );
-    // §3: more than 1 % of a site's rows excused also fails
+    // §3: more than 1 % of a site's rows excused also fails; S14a-5: or more
+    // rows than the oracle's own 1-ulp runs flip, whichever is larger
     let n_rows: usize = gd.calls.iter().map(|c| c.1.len()).sum();
-    if excused.len() as f64 > 0.01 * n_rows as f64 {
-        fails.push(format!(
+    let cap = 0.01 * n_rows as f64;
+    if excused.len() as f64 > cap {
+        as_written.push(format!(
             "G14.1 top-1 excused {} of {n_rows} rows > 1 % (§3 site cap)",
             excused.len()
         ));
     }
+    let cap = env.as_ref().map_or(cap, |n| cap.max(n.top1_flips as f64));
+    if excused.len() as f64 > cap {
+        fails.push(format!(
+            "G14.1 top-1 excused {} of {n_rows} rows > cap {cap}",
+            excused.len()
+        ));
+    }
+    for f in &as_written {
+        println!("§3 as written: FAIL {f}");
+    }
+    println!("§3 as written: {} failures", as_written.len());
     check_io(&g, gd.calls.len(), cfg.n_layers, &mut fails);
     finish(&format!("real_e2e_tf {case}"), &fails);
 }
@@ -485,9 +567,10 @@ fn real_e2e_greedy(case: &str) {
 }
 
 /// G14.3: the EN prompt in calls of 7 + 8 greedy steps vs the whole-prompt
-/// greedy run (`hashes/greedy-p32k8-en.logits.f32`): every row within 1e-5
-/// relL2 while the inputs agree, same greedy ids except near ties; the
-/// per-call logits hashes are the chunk-7 golden (later builds: bitwise).
+/// greedy run (`hashes/greedy-p32k8-en.logits.f32`): every row within
+/// `max(1e-5, 2 x` the oracle's own 1-ulp / call-split spread at that
+/// position`)` relL2 (DECISIONS S14a-6), greedy ids exact; the per-call logits
+/// hashes are the chunk-7 golden (later builds: bitwise).
 #[test]
 #[ignore = "real 9 shards + S12 goldens + greedy-p32k8-en logits; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
 fn real_e2e_chunk7_en() {
@@ -508,6 +591,9 @@ fn real_e2e_chunk7_en() {
         Some(hex_sha(&whole).as_str()),
         "whole-prompt logits file does not match its baseline"
     );
+    // S14a-6: rows within max(1e-5, 2 x the oracle's own 1-ulp / call-split
+    // spread at that position); greedy ids exact; hashes bitwise once stored
+    let env = self_noise("p32k8-en");
     let store = e2e_store();
     let vocab = store.model.cfg.vocab_size;
     let p = gd.prompt.len();
@@ -540,6 +626,7 @@ fn real_e2e_chunk7_en() {
     let whole_pick =
         |j: usize| super::generate::argmax(&whole[(p - 1 + j) * vocab..(p + j) * vocab]);
     let mut worst = 0f64;
+    let mut as_written = 0usize;
     let n_rows = rows.len() / vocab;
     for r in 0..n_rows {
         let (a, b) = (
@@ -547,33 +634,31 @@ fn real_e2e_chunk7_en() {
             &whole[r * vocab..(r + 1) * vocab],
         );
         let e = rel_l2(a, b);
-        worst = worst.max(e);
-        if e.is_nan() || e > 1e-5 {
-            fails.push(format!("G14.3a row {r}: relL2 {e:e} vs whole prompt"));
+        let bound = env.as_ref().map_or(1e-5, |n| 1e-5f64.max(2.0 * n.row[r]));
+        worst = worst.max(e / bound);
+        println!("row {r}: relL2 {e:.3e} vs whole prompt, bound {bound:.3e}");
+        as_written += usize::from(e.is_nan() || e > 1e-5);
+        if e.is_nan() || e > bound {
+            fails.push(format!(
+                "G14.3a row {r}: relL2 {e:e} vs whole prompt > {bound:e}"
+            ));
         }
         if r + 1 >= p {
+            // greedy ids must equal the whole-prompt run's (no near-tie excuse)
             let j = r + 1 - p;
             let got = g.argmax[j];
             if got != whole_pick(j) {
-                // greedy site: the whole run's own rows are the reference;
-                // the oracle's bf16/fp32 rows give the noise floor where they exist
-                let msg = format!("G14.3a step {j}: {got} vs whole-prompt {}", whole_pick(j));
-                match gd.calls.get(j) {
-                    Some((_, ids, l32, l16)) => {
-                        let w = (ids.len() - 1) * vocab..ids.len() * vocab;
-                        match pick_ok(got, &l32[w.clone()], &l16[w]) {
-                            Ok(_) => println!("{msg}: near tie, comparison stops"),
-                            Err(e) => fails.push(format!("{msg}: {e}")),
-                        }
-                    }
-                    None => fails.push(msg),
-                }
+                fails.push(format!(
+                    "G14.3a step {j}: {got} vs whole-prompt {}",
+                    whole_pick(j)
+                ));
                 break;
             }
         }
     }
+    println!("§3 as written (1e-5): {as_written} of {n_rows} rows over");
     println!(
-        "real_e2e_chunk7_en: {} calls, {n_rows} rows, worst relL2 vs whole prompt {worst:e}; ids {:?}",
+        "real_e2e_chunk7_en: {} calls, {n_rows} rows, worst relL2 / bound {worst:.3}; ids {:?}",
         hashes.len(),
         g.argmax
     );
