@@ -81,6 +81,9 @@ pub struct Model {
     table: Option<Box<dyn EngramRows>>,
     norm: MxArray,
     head: Dense,
+    /// Context limit a call may reach (session tokens + call ids); the store
+    /// sets the admitted context (D-24), `None` = no limit.
+    pub ctx_limit: Option<usize>,
 }
 
 impl Model {
@@ -133,6 +136,7 @@ impl Model {
             hasher,
             table,
             cfg,
+            ctx_limit: None,
         })
     }
 
@@ -222,6 +226,14 @@ impl Model {
         let (hc, dim) = (self.cfg.hc_mult as i64, self.cfg.dim as i64);
         if s == 0 {
             return Err(Error::from_reason("deepseek_v41: empty call"));
+        }
+        if let Some(limit) = self.ctx_limit
+            && start + ids.len() > limit
+        {
+            return Err(Error::from_reason(format!(
+                "deepseek_v41: {start} + {} tokens exceed the {limit}-token context limit",
+                ids.len()
+            )));
         }
         let rows = self.embed.shape_at(0)?;
         if let Some(bad) = ids.iter().find(|&&id| i64::from(id) >= rows) {

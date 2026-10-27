@@ -48,7 +48,10 @@ pub fn read_trace(r: impl BufRead) -> Result<RouteTrace> {
             .map_err(|e| bad(e.to_string()))?,
     )
     .map_err(|e| bad(format!("header: {e}")))?;
-    if head["kind"] != "qwen4_exp_expert_route_trace" || field(&head, "schema_version")? != 1 {
+    // the S14a traces written before S14a-2 carry the family's own kind
+    let kind_ok = head["kind"] == "qwen4_exp_expert_route_trace"
+        || head["kind"] == "deepseek_v41_expert_route_trace";
+    if !kind_ok || field(&head, "schema_version")? != 1 {
         return Err(bad(format!("not a schema-1 route trace: {head}")));
     }
     let mut t = RouteTrace {
@@ -101,6 +104,8 @@ pub struct Replayed {
     pub decode_hits: u64,
     /// Experts read from SSD (staging and victims).
     pub reads: u64,
+    /// Of `reads`, those of decode steps.
+    pub decode_reads: u64,
 }
 
 impl Replayed {
@@ -116,6 +121,37 @@ impl Replayed {
 /// Replays `steps` (a run from a fresh bank) on `cache`, with staging tags
 /// as the bank keeps them.
 pub fn replay(cache: &mut Cache, experts: usize, steps: &[Step]) -> Replayed {
+    replay_pinned(cache, experts, steps, &[])
+}
+
+/// `replay` with whole layers resident: every expert of a layer with
+/// `pinned[layer]` is a hit and never enters `cache` (D-42 layer-pinned and
+/// hybrid arms; `&[]` pins nothing).
+pub fn replay_pinned(
+    cache: &mut Cache,
+    experts: usize,
+    steps: &[Step],
+    pinned: &[bool],
+) -> Replayed {
+    run(cache, experts, steps, pinned, None)
+}
+
+/// Expert reads per layer of a staging-only replay (cache 0): `(all,
+/// decode)`. The layer-pinned arm pins the layers with the most decode reads.
+pub fn reads_per_layer(t: &RouteTrace) -> Vec<(u64, u64)> {
+    let mut out = vec![(0, 0); t.layers];
+    let mut c = Cache::lru(0, t.layers, t.experts);
+    run(&mut c, t.experts, &t.steps, &[], Some(&mut out));
+    out
+}
+
+fn run(
+    cache: &mut Cache,
+    experts: usize,
+    steps: &[Step],
+    pinned: &[bool],
+    mut per_layer: Option<&mut Vec<(u64, u64)>>,
+) -> Replayed {
     let mut tags: Vec<Option<(usize, u32)>> = vec![None; experts];
     let mut out = Replayed::default();
     for s in steps {
@@ -123,27 +159,46 @@ pub fn replay(cache: &mut Cache, experts: usize, steps: &[Step]) -> Replayed {
         want.sort_unstable();
         want.dedup();
         let decode = decode_step(s.rows);
+        let n = want.len() as u64;
+        out.uses += n;
+        if decode {
+            out.decode_uses += n;
+        }
+        if pinned.get(s.layer).copied().unwrap_or(false) {
+            out.hits += n;
+            if decode {
+                out.decode_hits += n;
+            }
+            continue;
+        }
         let (epoch, src) = cache.plan(s.layer, &want, decode);
+        let mut reads = 0;
         for (&e, x) in want.iter().zip(&src) {
             match *x {
                 Source::Hit(_) => out.hits += 1,
                 Source::Victim(c) => {
                     cache.commit(c, s.layer, e);
-                    out.reads += 1;
+                    reads += 1;
                 }
                 Source::Staging => {
                     if tags[e as usize] != Some((s.layer, e)) {
                         tags[e as usize] = Some((s.layer, e));
-                        out.reads += 1;
+                        reads += 1;
                     }
                 }
             }
         }
+        out.reads += reads;
         if decode {
-            out.decode_uses += want.len() as u64;
+            out.decode_reads += reads;
             out.decode_hits += src.iter().filter(|x| matches!(x, Source::Hit(_))).count() as u64;
         }
-        out.uses += want.len() as u64;
+        if let Some(p) = per_layer.as_deref_mut() {
+            p[s.layer].0 += reads;
+            if decode {
+                p[s.layer].1 += reads;
+            }
+        }
         cache.complete(epoch);
     }
     out
@@ -153,6 +208,34 @@ pub fn replay(cache: &mut Cache, experts: usize, steps: &[Step]) -> Replayed {
 pub fn replay_lru(t: &RouteTrace, slots: usize) -> Replayed {
     let mut c = Cache::lru(slots, t.layers, t.experts);
     replay(&mut c, t.experts, &t.steps)
+}
+
+/// `replay` of a whole trace on a fresh LFU-decay cache (`half_life` in
+/// expert uses).
+pub fn replay_lfu(t: &RouteTrace, slots: usize, half_life: f64) -> Replayed {
+    let mut c = Cache::lfu_decay(slots, t.layers, t.experts, half_life);
+    replay(&mut c, t.experts, &t.steps)
+}
+
+/// D-42 hybrid: `pinned` layers fully resident (each costs `experts` slots),
+/// the remaining slots a global cache (LFU-decay with `half_life`, else LRU).
+/// `None` when the pinned layers alone do not fit in `slots`.
+pub fn replay_hybrid(
+    t: &RouteTrace,
+    slots: usize,
+    pinned: &[usize],
+    half_life: Option<f64>,
+) -> Option<Replayed> {
+    let rest = slots.checked_sub(pinned.len() * t.experts)?;
+    let mut mask = vec![false; t.layers];
+    for &l in pinned {
+        *mask.get_mut(l)? = true;
+    }
+    let mut c = match half_life {
+        Some(h) => Cache::lfu_decay(rest, t.layers, t.experts, h),
+        None => Cache::lru(rest, t.layers, t.experts),
+    };
+    Some(replay_pinned(&mut c, t.experts, &t.steps, &mask))
 }
 
 #[cfg(test)]

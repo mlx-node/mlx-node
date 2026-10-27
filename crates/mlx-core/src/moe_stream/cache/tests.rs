@@ -214,3 +214,92 @@ fn empty_clears_directory() {
     let (_, src) = c.plan(0, &[1, 2], false);
     assert_eq!(src, vec![Source::Staging; 2]);
 }
+
+/// LFU-decay picks the slot with the lowest decayed use count, checked
+/// against a direct f64 reference (every score x 2^(-1/h) per use, +1 on
+/// the touched slot) across several rescales of the inflated scores.
+#[test]
+fn lfu_decay_orders_by_decayed_count() {
+    let h = 37.0;
+    let mut p = LfuDecay::new(h);
+    let mut want = [None::<f64>; 8];
+    let mut r = Rng(5);
+    let decay = (-1.0f64 / h).exp2();
+    for i in 0..60_000u32 {
+        // skewed: low slots used more often
+        let s = (r.below(8) * r.below(8) / 7) as u32;
+        for v in want.iter_mut().flatten() {
+            *v *= decay;
+        }
+        *want[s as usize].get_or_insert(0.0) += 1.0;
+        p.touch(s);
+        if r.below(500) == 0 {
+            let f = r.below(8) as u32;
+            p.forget(f);
+            want[f as usize] = None;
+        }
+        let got = p.victim(&|_| true);
+        let min = want.iter().flatten().copied().fold(f64::INFINITY, f64::min);
+        match got {
+            Some(g) => {
+                let v = want[g as usize].expect("victim is a forgotten slot");
+                assert!(
+                    v <= min * (1.0 + 1e-9) + 1e-300,
+                    "tick {i}: victim {g} score {v} > min {min}"
+                );
+            }
+            None => assert!(want.iter().all(Option::is_none)),
+        }
+        // `ok` filters: the pick is the lowest accepted score
+        if let Some(g) = got {
+            let other = p.victim(&|s| s != g);
+            if let Some(o) = other {
+                assert_ne!(o, g);
+                let rest = want
+                    .iter()
+                    .enumerate()
+                    .filter(|&(s, _)| s as u32 != g)
+                    .filter_map(|(_, v)| *v)
+                    .fold(f64::INFINITY, f64::min);
+                assert!(want[o as usize].unwrap() <= rest * (1.0 + 1e-9) + 1e-300);
+            }
+        }
+    }
+    assert!(p.base > 0, "no rescale happened");
+}
+
+/// A long-unused slot loses to a recently used one once its count has
+/// decayed below; LRU-like at a short half-life, LFU-like at a long one.
+#[test]
+fn lfu_decay_half_life_trades_frequency_for_recency() {
+    for (h, want) in [(1.0, 0u32), (1e6, 1u32)] {
+        let mut p = LfuDecay::new(h);
+        for _ in 0..10 {
+            p.touch(0);
+        }
+        p.touch(1);
+        for _ in 0..8 {
+            p.touch(2);
+        }
+        // short half-life: slot 0's 10 uses are old, slot 1's single use is
+        // newer -> the oldest (0) goes first; long half-life: plain counts
+        // 10 / 1 / 8 -> slot 1 goes first
+        assert_eq!(p.victim(&|s| s != 2), Some(want), "half-life {h}");
+    }
+}
+
+#[test]
+fn bijection_after_1e5_random_ops_lfu_decay() {
+    let mut r = Rng(0x2545_f491_4f6c_dd1d);
+    for &(slots, layers, n, k, h) in &[(16, 8, 12, 6, 50.0), (240, 40, 384, 6, 240.0 * 16.0)] {
+        let mut c = Cache::lfu_decay(slots, layers, n as usize, h);
+        for i in 0..100_000 {
+            step(&mut c, &mut r, layers, n, k);
+            if i % 997 == 0 {
+                c.check().unwrap();
+            }
+        }
+        c.check().unwrap();
+        assert!(c.occupied() <= slots);
+    }
+}

@@ -59,6 +59,87 @@ impl Policy for Lru {
     }
 }
 
+/// Least frequently used with exponential decay: each use adds 1 to the
+/// slot's score, scores halve every `half_life` uses (all slots' uses
+/// together); the victim is the lowest score (lowest slot on ties).
+/// Scores are kept inflated by `2^((tick - base) / half_life)`, which keeps
+/// their order; `base` moves forward before the factor overflows.
+pub struct LfuDecay {
+    half_life: f64,
+    tick: u64,
+    base: u64,
+    score: Vec<Option<f64>>,
+    order: BTreeSet<(u64, u32)>,
+}
+
+/// Inflation exponent at which every score is rescaled (2^512 stays far
+/// from f64 overflow after any number of adds).
+const LFU_RESCALE: f64 = 512.0;
+
+impl LfuDecay {
+    pub fn new(half_life: f64) -> Self {
+        assert!(
+            half_life.is_finite() && half_life > 0.0,
+            "LfuDecay half-life {half_life}"
+        );
+        Self {
+            half_life,
+            tick: 0,
+            base: 0,
+            score: Vec::new(),
+            order: BTreeSet::new(),
+        }
+    }
+
+    /// Scores of positive f64 compare like their bit patterns.
+    fn key(v: f64) -> u64 {
+        v.to_bits()
+    }
+
+    fn rescale(&mut self) {
+        let shift = (LFU_RESCALE * self.half_life).floor() as u64;
+        self.base += shift;
+        let f = (-(shift as f64) / self.half_life).exp2();
+        self.order.clear();
+        for (s, v) in self.score.iter_mut().enumerate() {
+            if let Some(v) = v {
+                *v *= f;
+                self.order.insert((Self::key(*v), s as u32));
+            }
+        }
+    }
+}
+
+impl Policy for LfuDecay {
+    fn touch(&mut self, slot: u32) {
+        self.tick += 1;
+        if (self.tick - self.base) as f64 / self.half_life > LFU_RESCALE {
+            self.rescale();
+        }
+        let s = slot as usize;
+        if self.score.len() <= s {
+            self.score.resize(s + 1, None);
+        }
+        let add = ((self.tick - self.base) as f64 / self.half_life).exp2();
+        if let Some(v) = self.score[s] {
+            self.order.remove(&(Self::key(v), slot));
+        }
+        let v = self.score[s].unwrap_or(0.0) + add;
+        self.score[s] = Some(v);
+        self.order.insert((Self::key(v), slot));
+    }
+
+    fn forget(&mut self, slot: u32) {
+        if let Some(v) = self.score.get_mut(slot as usize).and_then(Option::take) {
+            self.order.remove(&(Self::key(v), slot));
+        }
+    }
+
+    fn victim(&self, ok: &dyn Fn(u32) -> bool) -> Option<u32> {
+        self.order.iter().map(|&(_, s)| s).find(|&s| ok(s))
+    }
+}
+
 /// Where one wanted expert of a layer step is served from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -100,6 +181,16 @@ impl Cache {
 
     pub fn lru(slots: usize, n_layers: usize, n_experts: usize) -> Self {
         Self::new(slots, n_layers, n_experts, Box::new(Lru::default()))
+    }
+
+    /// [`LfuDecay`] with `half_life` in expert uses.
+    pub fn lfu_decay(slots: usize, n_layers: usize, n_experts: usize, half_life: f64) -> Self {
+        Self::new(
+            slots,
+            n_layers,
+            n_experts,
+            Box::new(LfuDecay::new(half_life)),
+        )
     }
 
     pub fn slots(&self) -> usize {

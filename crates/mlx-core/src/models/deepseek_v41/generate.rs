@@ -59,11 +59,32 @@ pub fn generate(
     keep_out: bool,
     hook: &mut dyn FnMut(&Call) -> Result<()>,
 ) -> Result<Generated> {
+    generate_probed(
+        store, sess, prompt, chunk, steps, force, keep_out, None, hook,
+    )
+}
+
+/// `generate` with `probe` called after every layer of every call (as
+/// `Model::forward`'s `cancel`: `true` cancels the call).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_probed(
+    store: &Store,
+    sess: &mut Session,
+    prompt: &[u32],
+    chunk: Option<usize>,
+    steps: usize,
+    force: Option<&[u32]>,
+    keep_out: bool,
+    probe: Option<&dyn Fn(usize) -> bool>,
+    hook: &mut dyn FnMut(&Call) -> Result<()>,
+) -> Result<Generated> {
     if prompt.is_empty() || chunk == Some(0) || force.is_some_and(|f| f.len() < steps) {
         return Err(Error::from_reason("deepseek_v41 generate: bad arguments"));
     }
     store.begin_turn()?;
-    let out = run(store, sess, prompt, chunk, steps, force, keep_out, hook);
+    let out = run(
+        store, sess, prompt, chunk, steps, force, keep_out, probe, hook,
+    );
     let end = store.end_turn();
     let out = out?;
     end?;
@@ -79,6 +100,7 @@ fn run(
     steps: usize,
     force: Option<&[u32]>,
     keep_out: bool,
+    probe: Option<&dyn Fn(usize) -> bool>,
     hook: &mut dyn FnMut(&Call) -> Result<()>,
 ) -> Result<Generated> {
     let m = &store.model;
@@ -106,7 +128,7 @@ fn run(
             keep_out,
             ..Default::default()
         };
-        let logits = m.forward(sess, &ids, None, Some(&mut trace))?;
+        let logits = m.forward(sess, &ids, probe, Some(&mut trace))?;
         let v = logits.shape_at(1)?;
         let last = logits
             .slice(&[ids.len() as i64 - 1, 0], &[ids.len() as i64, v])?

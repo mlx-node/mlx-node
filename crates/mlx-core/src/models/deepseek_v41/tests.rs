@@ -435,3 +435,6 @@ include!("tests_e2e.rs");
 
 // S14c compute memory vs prompt length (real)
 include!("tests_compute.rs");
+
+// S16b real cache invariance, auto admission, Empty on real data
+include!("tests_cache.rs");

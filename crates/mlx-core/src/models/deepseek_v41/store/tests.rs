@@ -341,6 +341,9 @@ fn tiny_cache_bank_switch_mid_session() {
     let held = store.bank.arrays(0).unwrap();
     let err = store.set_cache_slots(8).unwrap_err().to_string();
     assert!(err.contains("still holds the old bank"), "{err}");
+    // a retry while the old buffers are still held is refused too (S16a codex)
+    let err = store.set_cache_slots(8).unwrap_err().to_string();
+    assert!(err.contains("still holds the old bank"), "retry: {err}");
     let mut s2 = store.model.new_session();
     assert!(
         store.model.forward(&mut s2, &ids[..1], None, None).is_err(),
@@ -354,6 +357,46 @@ fn tiny_cache_bank_switch_mid_session() {
     assert_eq!(bits(&again), bits(&want));
 }
 
+/// A call past the admitted context (session + ids) is refused before the
+/// session changes (S16a codex: the admission budgets KV / compute for the
+/// context limit only).
+#[test]
+fn tiny_store_refuses_past_context_limit() {
+    let npz = Npz::open("oracle.npz");
+    let ids = case_ids(&npz, "c1");
+    let mut store = cached_store("fp32_on", 0);
+    let cfg_ctx = store.model.cfg.context_length;
+    assert_eq!(store.model.ctx_limit, Some(cfg_ctx.min(super::CTX_LIMIT)));
+    store.model.ctx_limit = Some(4);
+    let mut sess = store.model.new_session();
+    store
+        .model
+        .forward(&mut sess, &ids[..3], None, None)
+        .unwrap();
+    let Err(err) = store.model.forward(&mut sess, &ids[3..5], None, None) else {
+        panic!("a call past the context limit ran");
+    };
+    let err = err.to_string();
+    assert!(err.contains("context limit"), "{err}");
+    assert!(
+        store
+            .model
+            .forward_last(&mut sess, &ids[3..5], None, None)
+            .is_err()
+    );
+    assert_eq!(sess.tokens.len(), 3, "refused call changed the session");
+    store
+        .model
+        .forward(&mut sess, &ids[3..4], None, None)
+        .unwrap();
+    assert!(
+        store
+            .model
+            .forward(&mut sess, &ids[4..5], None, None)
+            .is_err()
+    );
+}
+
 /// The admission's `own` is this store's dense + bank bytes only (bank
 /// volatile between turns), not the process-wide MLX count: another
 /// model's arrays stay `others` (S15 codex).
@@ -361,18 +404,29 @@ fn tiny_cache_bank_switch_mid_session() {
 fn tiny_cache_own_is_this_model_only() {
     let store = cached_store("fp32_on", 16);
     let (dense, bank) = (store.dense_bytes, store.bank.nbytes());
+    let npz = Npz::open("oracle.npz");
+    let ids = case_ids(&npz, "c1");
     store.begin_turn().unwrap();
-    let in_turn = store.own();
+    let mut sess = store.model.new_session();
+    store.model.forward(&mut sess, &ids, None, None).unwrap();
+    let in_turn = store.own().unwrap();
     let other = MxArray::zeros(&[16 << 20], Some(DType::Float32)).unwrap();
     other.eval();
     assert_eq!(
-        store.own(),
+        store.own().unwrap(),
         in_turn,
         "another model's arrays counted as own"
     );
-    assert_eq!(in_turn.bytes(), dense + bank);
+    // own = dense + the bank's resident pages (S16b-1: not its size)
+    let resident = store.bank.resident_bytes().unwrap();
+    assert!(resident > 0 && resident <= bank, "{resident} of {bank}");
+    assert_eq!(in_turn.bytes(), dense + resident);
     store.end_turn().unwrap();
-    assert_eq!(store.own().bytes(), dense, "a volatile bank counted as own");
+    assert_eq!(
+        store.own().unwrap().bytes(),
+        dense,
+        "a volatile bank counted as own"
+    );
     drop(other);
 }
 
@@ -523,4 +577,51 @@ fn real_load_smoke() {
     }));
     assert!(stale.is_err(), "stale gather did not panic");
     println!("stale gather panicked as expected");
+}
+
+/// `CachePlan::Admit`: the re-admission at a turn start runs with the bank
+/// non-volatile and counts its resident pages as own (S16b-1: a bank the GPU
+/// used stays wired while volatile, so `host_used` keeps it); a forced
+/// `Empty` between turns keeps the admission (no switch) and clears the
+/// directory.
+#[test]
+fn tiny_cache_admit_turns() {
+    let npz = Npz::open("oracle.npz");
+    let ids = case_ids(&npz, "c1");
+    let (act, fq) = mode_of("fp32_on");
+    let limits = crate::moe_stream::budget::Limits {
+        cache_cap: Some(1 << 30),
+        ..Default::default()
+    };
+    let store = Store::open_with(
+        &[fixture("tiny-q8_0.gguf")],
+        act,
+        fq,
+        CachePlan::Admit(limits),
+    )
+    .unwrap();
+    assert!(store.cache_slots() > 0, "{:?}", store.admission());
+    let mut sess = store.model.new_session();
+    store.bank.test_force_empty(true);
+    store.begin_turn().unwrap();
+    store
+        .model
+        .forward(&mut sess, &ids[..4], None, None)
+        .unwrap();
+    store.end_turn().unwrap();
+    store.bank.test_force_empty(false);
+    store.begin_turn().unwrap();
+    assert!(store.bank.in_turn());
+    assert_eq!(store.bank.with_cache_dir(|c| c.occupied()), 0);
+    assert!(store.switches().is_empty(), "{:?}", store.switches());
+    store
+        .model
+        .forward(&mut sess, &ids[4..5], None, None)
+        .unwrap();
+    let own = store.own().unwrap();
+    assert_eq!(
+        own.bytes(),
+        store.dense_bytes + store.bank.resident_bytes().unwrap()
+    );
+    store.end_turn().unwrap();
 }

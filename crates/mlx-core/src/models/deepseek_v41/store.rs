@@ -180,6 +180,8 @@ pub struct Store {
     /// Bytes of the resident dense arrays.
     pub dense_bytes: u64,
     pub size: ModelSize,
+    /// Seconds to allocate the bank at load (no page touched yet).
+    pub bank_alloc_s: f64,
     plan: CachePlan,
     turn: Mutex<TurnState>,
 }
@@ -202,51 +204,18 @@ impl Store {
         fq: FakeQuant,
         plan: CachePlan,
     ) -> Result<Self> {
-        let mut where_: HashMap<String, Located> = HashMap::new();
-        let mut cfg = None;
-        for (i, p) in paths.iter().enumerate() {
-            let g = header(p)?;
-            for t in &g.tensors {
-                where_.insert(t.name.clone(), (i, g.data_offset, t.clone()));
-            }
-            if i == 0 {
-                cfg = Some(DeepseekV41Config::from_gguf(&g)?);
-            }
-        }
-        let cfg = cfg.ok_or_else(|| bad("no shards"))?;
+        let Scan {
+            where_,
+            cfg,
+            layers,
+            size,
+            bank_need,
+            dense_need,
+        } = scan(paths)?;
         let find = |n: &str| {
             where_
                 .get(n)
                 .ok_or_else(|| bad(format!("tensor '{n}' missing")))
-        };
-        let mut layers = Vec::with_capacity(cfg.n_layers);
-        for l in 0..cfg.n_layers {
-            let mut v = Vec::with_capacity(PROJS.len());
-            for p in PROJS {
-                let (shard, data_offset, info) = find(&format!("blk.{l}.{p}.weight"))?.clone();
-                v.push(ExpertTensor {
-                    shard,
-                    data_offset,
-                    info,
-                });
-            }
-            layers.push(v);
-        }
-        let bank_need: u64 = layers[0]
-            .iter()
-            .map(|t| t.info.data_size())
-            .sum::<Result<u64>>()?;
-        let dense_need: u64 = where_
-            .values()
-            .filter(|(_, _, t)| is_dense(&t.name))
-            .map(|(_, _, t)| t.data_size())
-            .sum::<Result<u64>>()?;
-        let n_experts = cfg.n_routed_experts as u64;
-        let size = ModelSize {
-            dense: dense_need,
-            slot: bank_need / n_experts.max(1),
-            n_experts,
-            ctx: cfg.context_length.min(CTX_LIMIT) as u64,
         };
         let (cache_slots, admission) = match &plan {
             CachePlan::Admit(limits) => {
@@ -274,11 +243,13 @@ impl Store {
             }
         };
         let shards = Arc::new(ShardSet::open(paths)?);
+        let t_bank = Instant::now();
         let bank = Arc::new(StagingBank::with_cache(
             IoPool::from_env(Arc::clone(&shards))?,
             layers,
             cache_slots,
         )?);
+        let bank_alloc_s = t_bank.elapsed().as_secs_f64();
         let (mut dense_read, mut dense_bytes) = (0u64, 0u64);
         let mut buf = AlignedBuf::new();
         let get = |n: &str| -> Result<Dense> {
@@ -326,7 +297,7 @@ impl Store {
             }
             None => None,
         };
-        let model =
+        let mut model =
             match Model::from_gguf(cfg, act, fq, get, bank_of, table, Some(Arc::clone(&bank))) {
                 Ok(m) => m,
                 Err(e) => {
@@ -336,6 +307,8 @@ impl Store {
                     return Err(e);
                 }
             };
+        // the admission's KV / compute terms hold up to this context only
+        model.ctx_limit = Some(size.ctx as usize);
         let guard =
             coordinator().register_with_cache_limit(dense_bytes + bank.nbytes(), Some(POOL_LIMIT));
         Ok(Self {
@@ -344,6 +317,7 @@ impl Store {
             dense_read,
             dense_bytes,
             size,
+            bank_alloc_s,
             plan,
             turn: Mutex::new(TurnState {
                 admission,
@@ -376,17 +350,20 @@ impl Store {
         self.turn().switches.clone()
     }
 
-    /// This model's bytes for the admission: dense arrays + bank (volatile
-    /// between turns, so outside `host_used`). Process-wide MLX counters
-    /// would also hold other loaded models, which must stay `others`; KV,
-    /// scratch and the shared pool are left in `others` (conservative).
-    pub fn own(&self) -> Own {
-        let bank = self.bank.nbytes();
-        Own {
-            active: self.dense_bytes + bank,
+    /// This model's bytes inside `host_used`: dense arrays + the bank's
+    /// resident pages, read while the bank is non-volatile (`begin_turn`
+    /// re-admits after `NonVolatile`). A volatile bank the GPU has used stays
+    /// wired, so `host_used` keeps it (S16b-1); between turns the resident
+    /// pages are reported as volatile. Process-wide MLX counters would also
+    /// hold other loaded models, which must stay `others`; KV, scratch and
+    /// the shared pool are left in `others` (conservative).
+    pub fn own(&self) -> Result<Own> {
+        let resident = self.bank.resident_bytes()?;
+        Ok(Own {
+            active: self.dense_bytes + resident,
             pool: 0,
-            volatile: if self.bank.in_turn() { 0 } else { bank },
-        }
+            volatile: if self.bank.in_turn() { 0 } else { resident },
+        })
     }
 
     fn switch(&self, t: &mut TurnState, slots: usize) -> Result<()> {
@@ -420,13 +397,27 @@ impl Store {
             && t.wired.is_none()
         {
             let cur = t.admission.ok_or_else(|| bad("no admission"))?;
-            let h = host_memory().ok_or_else(|| bad("no host memory reading for admission"))?;
-            let next = match readmit(&cur, &self.size, limits, &h, &self.own(), working_set())? {
-                Turn::Keep => cur,
-                Turn::StagingOnly(a) | Turn::Rebuild(a) => {
-                    self.switch(&mut t, a.cache_slots as usize)?;
-                    tracing::info!("deepseek_v41 re-admission: {a}");
-                    a
+            // non-volatile first: its resident pages are then in `host_used`
+            // for certain and counted as own (allocates nothing)
+            self.bank.begin_turn()?;
+            let next = (|| {
+                let h = host_memory().ok_or_else(|| bad("no host memory reading for admission"))?;
+                let next = match readmit(&cur, &self.size, limits, &h, &self.own()?, working_set())?
+                {
+                    Turn::Keep => cur,
+                    Turn::StagingOnly(a) | Turn::Rebuild(a) => {
+                        self.switch(&mut t, a.cache_slots as usize)?;
+                        tracing::info!("deepseek_v41 re-admission: {a}");
+                        a
+                    }
+                };
+                Ok(next)
+            })();
+            let next = match next {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = self.bank.end_turn();
+                    return Err(e);
                 }
             };
             t.admission = Some(next);
@@ -447,6 +438,79 @@ impl Store {
         t.wired = None;
         self.bank.end_turn()
     }
+}
+
+/// The shard headers: where each tensor is, the config, the expert tensors
+/// per layer and the sizes the admission needs.
+struct Scan {
+    where_: HashMap<String, Located>,
+    cfg: DeepseekV41Config,
+    layers: Vec<Vec<ExpertTensor>>,
+    size: ModelSize,
+    bank_need: u64,
+    dense_need: u64,
+}
+
+fn scan(paths: &[PathBuf]) -> Result<Scan> {
+    let mut where_: HashMap<String, Located> = HashMap::new();
+    let mut cfg = None;
+    for (i, p) in paths.iter().enumerate() {
+        let g = header(p)?;
+        for t in &g.tensors {
+            where_.insert(t.name.clone(), (i, g.data_offset, t.clone()));
+        }
+        if i == 0 {
+            cfg = Some(DeepseekV41Config::from_gguf(&g)?);
+        }
+    }
+    let cfg = cfg.ok_or_else(|| bad("no shards"))?;
+    let mut layers = Vec::with_capacity(cfg.n_layers);
+    for l in 0..cfg.n_layers {
+        let mut v = Vec::with_capacity(PROJS.len());
+        for p in PROJS {
+            let n = format!("blk.{l}.{p}.weight");
+            let (shard, data_offset, info) = where_
+                .get(&n)
+                .ok_or_else(|| bad(format!("tensor '{n}' missing")))?
+                .clone();
+            v.push(ExpertTensor {
+                shard,
+                data_offset,
+                info,
+            });
+        }
+        layers.push(v);
+    }
+    let bank_need: u64 = layers[0]
+        .iter()
+        .map(|t| t.info.data_size())
+        .sum::<Result<u64>>()?;
+    let dense_need: u64 = where_
+        .values()
+        .filter(|(_, _, t)| is_dense(&t.name))
+        .map(|(_, _, t)| t.data_size())
+        .sum::<Result<u64>>()?;
+    let n_experts = cfg.n_routed_experts as u64;
+    let size = ModelSize {
+        dense: dense_need,
+        slot: bank_need / n_experts.max(1),
+        n_experts,
+        ctx: cfg.context_length.min(CTX_LIMIT) as u64,
+    };
+    Ok(Scan {
+        where_,
+        cfg,
+        layers,
+        size,
+        bank_need,
+        dense_need,
+    })
+}
+
+/// The admission's model sizes from the shard headers alone (no tensor
+/// data read, nothing allocated).
+pub fn model_size(paths: &[PathBuf]) -> Result<ModelSize> {
+    Ok(scan(paths)?.size)
 }
 
 /// Read at load: everything but routed experts, the engram table and the

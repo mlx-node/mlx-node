@@ -18,7 +18,7 @@ use napi::{Error, Result};
 use super::cache::{Cache, Source};
 use super::io::{Extent, IoPool, Priority, Read};
 use super::repack::SlotRepack;
-use crate::array::purgeable::{PurgeableBank, PurgeableState};
+use crate::array::purgeable::{BankWatch, PurgeableBank, PurgeableState};
 use crate::array::{DType, MxArray};
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 
@@ -80,6 +80,8 @@ struct Inner {
     tags: Vec<Option<(usize, u32)>>,
     cache: Cache,
     in_turn: bool,
+    /// Buffers of banks dropped by `rebuild` that an array may still hold.
+    retired: Vec<BankWatch>,
 }
 
 pub struct StagingBank {
@@ -174,6 +176,7 @@ impl StagingBank {
                 tags: vec![None; n],
                 cache: Cache::lru(cache_slots, layers.len(), n),
                 in_turn: true,
+                retired: Vec::new(),
             }),
             layers,
             n_experts: n,
@@ -207,6 +210,16 @@ impl StagingBank {
             .iter()
             .map(|p| (p.w.nbytes() + p.s.nbytes()) as u64)
             .sum()
+    }
+
+    /// Bytes of every bank resident in RAM now.
+    pub fn resident_bytes(&self) -> Result<u64> {
+        let g = lock(&self.inner);
+        let mut n = 0;
+        for p in &g.proj {
+            n += p.w.resident_bytes()? + p.s.resident_bytes()?;
+        }
+        Ok(n)
     }
 
     /// Projection `p`'s (codes, scales) arrays.
@@ -313,11 +326,15 @@ impl StagingBank {
             .iter()
             .flat_map(|p| [p.w.watch(), p.s.watch()])
             .collect();
+        // kept across failed rebuilds: every retired buffer must be gone
+        // before any new bank is allocated
+        g.retired.extend(watches);
         g.proj = Vec::new();
         g.tags.fill(None);
         g.cache = Cache::lru(0, self.layers.len(), self.n_experts);
         crate::array::clear_cache();
-        if watches.iter().any(|w| w.alive()) {
+        g.retired.retain(|w| w.alive());
+        if !g.retired.is_empty() {
             return Err(bad(
                 "an array still holds the old bank; a second bank is not allocated",
             ));
