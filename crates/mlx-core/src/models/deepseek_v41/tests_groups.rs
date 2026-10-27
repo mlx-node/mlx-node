@@ -44,12 +44,18 @@ impl GFile {
 
     fn has(&self, key: &str) -> bool {
         let (a, b) = (format!("{key}.npy"), format!("{key}@bf16.npy"));
-        self.0.file_names().any(|n| matches!(n, Ok(n) if n == a || n == b))
+        self.0
+            .file_names()
+            .any(|n| matches!(n, Ok(n) if n == a || n == b))
     }
 
     fn get(&mut self, key: &str) -> GArr {
         let plain = format!("{key}.npy");
-        let name = if self.0.file_names().any(|n| matches!(n, Ok(n) if n == plain)) {
+        let name = if self
+            .0
+            .file_names()
+            .any(|n| matches!(n, Ok(n) if n == plain))
+        {
             plain
         } else {
             format!("{key}@bf16.npy")
@@ -80,7 +86,12 @@ impl GFile {
         let d = &b[h0 + hlen..];
         let (mut f, mut i) = (Vec::new(), Vec::new());
         if header.contains("'descr': '<f4'") {
-            f = d.as_chunks::<4>().0.iter().map(|&w| f32::from_le_bytes(w)).collect();
+            f = d
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&w| f32::from_le_bytes(w))
+                .collect();
         } else if header.contains("'descr': '<u2'") && name.ends_with("@bf16.npy") {
             f = d
                 .as_chunks::<2>()
@@ -96,7 +107,12 @@ impl GFile {
                 .map(|&w| i64::from(i32::from_le_bytes(w)))
                 .collect();
         } else if header.contains("'descr': '<i8'") {
-            i = d.as_chunks::<8>().0.iter().map(|&w| i64::from_le_bytes(w)).collect();
+            i = d
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|&w| i64::from_le_bytes(w))
+                .collect();
         } else if header.contains("'descr': '|b1'") {
             i = d.iter().map(|&x| i64::from(x)).collect();
         } else {
@@ -123,29 +139,73 @@ fn real_shards() -> Vec<PathBuf> {
     v
 }
 
-/// One selection row vs ora32 (§3): equal sets pass; otherwise the row is
-/// excused iff `m32 < 2 g` at ora32's last kept / first dropped entry
-/// (scores from ora32 and ora16). Returns `Ok(None)` when equal,
-/// `Ok(Some((m32, g, swapped)))` when excused (`swapped` = entries of ora32's
-/// set that mlx-node dropped), `Err` otherwise.
+/// One selection row vs ora32 (§3). mlx-node's raw ids (`-1` = empty) must be
+/// distinct, in `[0, n)` and as many as ora32's, else `Err("malformed …")`
+/// (never excused). Equal sets pass. Otherwise the row is excused iff
+/// `m32 < 2 g'` at ora32's last kept / first dropped entry AND mlx-node's set
+/// is a top-k of the ora32 scores with each entry moved by at most
+/// `2 max(|ora16 - ora32| of that entry, G)` (so only entries inside the
+/// oracle's noise band may trade places). `G` = the median `|ora16 - ora32|`
+/// over ora32's top 2k entries, `g' = max(g, G)` (DECISIONS S13a-8: the two
+/// cutoff entries alone underestimate the row's noise). Returns `Ok(None)`
+/// when equal, `Ok(Some((m32, g', swapped)))` when excused, `Err` otherwise.
 fn sel_row(
-    got: &BTreeSet<i64>,
+    got_raw: &[i64],
     want: &BTreeSet<i64>,
     s32: &[f32],
     s16: &[f32],
     k: usize,
 ) -> std::result::Result<Option<(f32, f32, usize)>, String> {
-    if got == want {
+    let n = s32.len() as i64;
+    let got = set_of(got_raw);
+    let valid = got_raw.iter().filter(|&&x| x >= 0).count();
+    if valid != got.len() || got.iter().any(|&x| x >= n) || got.len() != want.len() {
+        return Err(format!(
+            "malformed selection {got_raw:?} (n {n}) vs {want:?}"
+        ));
+    }
+    if got == *want {
         return Ok(None);
     }
     if k == 0 || k >= s32.len() {
-        return Err(format!("nothing dropped (k {k}, n {}): {got:?} vs {want:?}", s32.len()));
+        return Err(format!(
+            "nothing dropped (k {k}, n {n}): {got:?} vs {want:?}"
+        ));
     }
-    let (tie, m32, g) = router_near_tie(s32, s16, k);
-    if tie {
-        Ok(Some((m32, g, want.difference(got).count())))
+    // per-entry bf16 drift; equal scores (incl. both ±inf) have none
+    let drift = |e: usize| {
+        if s32[e] == s16[e] {
+            0.0
+        } else {
+            (s16[e] - s32[e]).abs()
+        }
+    };
+    let (_, m32, g) = router_near_tie(s32, s16, k);
+    let mut order: Vec<usize> = (0..s32.len()).collect();
+    order.sort_by(|&i, &j| s32[j].total_cmp(&s32[i]).then(i.cmp(&j)));
+    let mut top: Vec<f32> = order[..(2 * k).min(order.len())]
+        .iter()
+        .map(|&e| drift(e))
+        .filter(|d| d.is_finite())
+        .collect();
+    top.sort_by(f32::total_cmp);
+    let big_g = top.get(top.len() / 2).copied().unwrap_or(0.0);
+    let g_eff = g.max(big_g);
+    let tol = |e: usize| 2.0 * drift(e).max(big_g);
+    let low_in = got
+        .iter()
+        .map(|&a| s32[a as usize] + tol(a as usize))
+        .fold(f32::INFINITY, f32::min);
+    let high_out = (0..s32.len())
+        .filter(|&r| !got.contains(&(r as i64)))
+        .map(|r| s32[r] - tol(r))
+        .fold(f32::NEG_INFINITY, f32::max);
+    if m32 < 2.0 * g_eff && low_in >= high_out {
+        Ok(Some((m32, g_eff, want.difference(&got).count())))
     } else {
-        Err(format!("m32 {m32:e} g {g:e}: {got:?} vs {want:?}"))
+        Err(format!(
+            "m32 {m32:e} g {g:e} G {big_g:e} band {low_in:e} vs {high_out:e}: {got:?} vs {want:?}"
+        ))
     }
 }
 
@@ -180,7 +240,8 @@ fn real_groups(case: &str) {
     let res: Value =
         serde_json::from_slice(&std::fs::read(d32.join("result.json")).unwrap()).unwrap();
     let n_calls = res["calls"].as_array().unwrap().len();
-    let lfile = |d: &PathBuf, c: usize, l: usize| GFile::open(d.join(format!("c{c:03}/L{l:02}.npz")));
+    let lfile =
+        |d: &PathBuf, c: usize, l: usize| GFile::open(d.join(format!("c{c:03}/L{l:02}.npz")));
     // (start, ids, golden engram rows [pos][engram layer][col], per-layer local ids)
     let mut calls: Vec<(usize, Vec<u32>, Vec<i64>)> = Vec::new();
     for c in 0..n_calls {
@@ -191,7 +252,11 @@ fn real_groups(case: &str) {
         let start = f.get("start_pos").i[0] as usize;
         let want = calls.last().map_or(0, |(s, i, _)| s + i.len());
         assert_eq!(start, want, "call {c} start");
-        calls.push((start, ids.iter().map(|&x| x as u32).collect(), f.get("hash_ids").i));
+        calls.push((
+            start,
+            ids.iter().map(|&x| x as u32).collect(),
+            f.get("hash_ids").i,
+        ));
     }
 
     let t0 = std::time::Instant::now();
@@ -226,7 +291,11 @@ fn real_groups(case: &str) {
         let gt = std::time::Instant::now();
         // no top-k is injected: every group's first compressed layer is an index source
         if cfg.compress_ratios[g0] != 0 {
-            assert_eq!(cfg.topk_src[g0], Some(g0), "group {g0}..{g1} needs an injected top-k");
+            assert_eq!(
+                cfg.topk_src[g0],
+                Some(g0),
+                "group {g0}..{g1} needs an injected top-k"
+            );
         }
         let mut ext: BTreeSet<usize> = BTreeSet::new();
         for l in g0..g1 {
@@ -237,15 +306,23 @@ fn real_groups(case: &str) {
                 _ => {}
             }
         }
-        let cand_ext = cand.as_ref().map(|c| c.source_layer).filter(|&cs| {
-            cs < g0 && (g0..g1).any(|l| l > cs && cfg.topk_src[l] == Some(l))
-        });
+        let cand_ext = cand
+            .as_ref()
+            .map(|c| c.source_layer)
+            .filter(|&cs| cs < g0 && (g0..g1).any(|l| l > cs && cfg.topk_src[l] == Some(l)));
         let mut sess = m.new_session();
         // per layer over all calls: Σ(mlx-ora32)², Σ(ora16-ora32)², Σ ora32²
         let mut acc = vec![[0f64; 3]; g1 - g0];
         let mut worst = vec![0f64; g1 - g0];
         let mut kv_flips = vec![0usize; g1 - g0];
         let mut flipped: BTreeSet<usize> = BTreeSet::new();
+        let mut pm_worst = 0f64;
+        // max per-position floor over rows where the oracle's bf16 run picked
+        // another route set (per layer), and the rows gated against it
+        // (layer index, label, err, own bound); leaving pre-mix sums / rows
+        let mut ora_flip_floor = vec![0f64; g1 - g0];
+        let (mut pm_acc, mut pm_rows_over) = ([0f64; 3], Vec::<String>::new());
+        let mut deferred: Vec<(usize, String, f64, f64)> = Vec::new();
         for (c, (start, ids, hash)) in calls.iter().enumerate() {
             let (s, end) = (ids.len(), start + ids.len());
             let mut first = lfile(&d32, c, g0);
@@ -260,7 +337,10 @@ fn real_groups(case: &str) {
             let h = MxArray::from_float32(&x.f, &[s as i64, hc as i64, dim as i64]).unwrap();
             let pre = MxArray::from_float32(&pm.f, &[s as i64, hc as i64]).unwrap();
             for &k in &ext {
-                assert_eq!(cfg.compress_ratios[k], 1, "injected ratio-2 source needs its tail");
+                assert_eq!(
+                    cfg.compress_ratios[k], 1,
+                    "injected ratio-2 source needs its tail"
+                );
                 let mut f = lfile(&d32, c, k);
                 let kv = f.get("state_compress_kv");
                 let t = kv.shape[1];
@@ -293,20 +373,24 @@ fn real_groups(case: &str) {
                 keep_out: true,
                 ..Default::default()
             };
-            m.forward_layers(
-                &mut sess,
-                ids,
-                g0..g1,
-                h,
-                pre,
-                shared,
-                Some(&probe),
-                Some(&mut trace),
-            )
-            .unwrap_or_else(|e| panic!("group {g0}..{g1} call {c}: {e}"));
+            let (_, pm_out) = m
+                .forward_layers(
+                    &mut sess,
+                    ids,
+                    g0..g1,
+                    h,
+                    pre,
+                    shared,
+                    Some(&probe),
+                    Some(&mut trace),
+                )
+                .unwrap_or_else(|e| panic!("group {g0}..{g1} call {c}: {e}"));
             let cache = get_cache_memory();
             max_cache.set(max_cache.get().max(cache));
-            assert!(cache <= 2.0 * GIB, "MLX cache {cache} B after group {g0}..{g1} call {c}");
+            assert!(
+                cache <= 2.0 * GIB,
+                "MLX cache {cache} B after group {g0}..{g1} call {c}"
+            );
 
             if (g0..g1).any(|l| eng_layers.contains(&l)) {
                 assert_eq!(trace.engram_rows.len(), s * n_e * cols);
@@ -326,19 +410,6 @@ fn real_groups(case: &str) {
                 assert_eq!(got.len(), s * row, "L{l} stream");
                 if !got.iter().all(|v| v.is_finite()) {
                     fails.push(format!("L{l} call {c}: NaN/Inf"));
-                }
-                for p in 0..s {
-                    let w = p * row..(p + 1) * row;
-                    let e = rel_l2(&got[w.clone()], &o32[w.clone()]);
-                    let fl = rel_l2(&o16[w.clone()], &o32[w.clone()]);
-                    let bound = (2.0 * fl).max(1e-3);
-                    worst[i] = worst[i].max(e / bound);
-                    if e > bound {
-                        fails.push(format!(
-                            "L{l} call {c} pos {}: stream relL2 {e:.3e} > {bound:.3e}",
-                            start + p
-                        ));
-                    }
                 }
                 // window KV after the fp8 round trip: rows whose codes differ
                 // from the oracle's (one e4m3 step is >= 1/16 relative)
@@ -376,12 +447,22 @@ fn real_groups(case: &str) {
                 let ne = bias32.len();
                 let idx16 = f16g.get("router_idx").i;
                 let site = sites.entry("router").or_default();
+                let mut ora_row_flip = vec![false; s];
                 for p in 0..s {
                     let w = p * r.k..(p + 1) * r.k;
-                    site.ora_flips += usize::from(set_of(&idx32.i[w.clone()]) != set_of(&idx16[w]));
-                    let got: BTreeSet<i64> =
-                        r.ids[p * r.k..(p + 1) * r.k].iter().map(|&x| i64::from(x)).collect();
-                    let want: BTreeSet<i64> = idx32.i[p * r.k..(p + 1) * r.k].iter().copied().collect();
+                    ora_row_flip[p] = set_of(&idx32.i[w.clone()]) != set_of(&idx16[w]);
+                    site.ora_flips += usize::from(ora_row_flip[p]);
+                    let got: Vec<i64> = r.ids[p * r.k..(p + 1) * r.k]
+                        .iter()
+                        .map(|&x| i64::from(x))
+                        .collect();
+                    let want: BTreeSet<i64> =
+                        idx32.i[p * r.k..(p + 1) * r.k].iter().copied().collect();
+                    assert_eq!(
+                        want.len(),
+                        r.k,
+                        "L{l} pos {p}: ora32 route ids not distinct"
+                    );
                     let b32: Vec<f32> = (0..ne).map(|e| sc32[p * ne + e] + bias32[e]).collect();
                     let b16: Vec<f32> = (0..ne).map(|e| sc16[p * ne + e] + bias16[e]).collect();
                     site.rows += 1;
@@ -394,14 +475,36 @@ fn real_groups(case: &str) {
                         Ok(Some((m32, g, sw))) => {
                             flipped.insert(start + p);
                             site.excused.push(format!(
-                                "router L{l} pos {} m32 {m32:e} g {g:e} swapped {sw}",
+                                "router L{l} pos {} m32 {m32:e} g' {g:e} swapped {sw}",
                                 start + p
                             ))
                         }
-                        Err(e) if flipped.contains(&(start + p)) => {
-                            site.excused.push(format!("router L{l} pos {} cascade: {e}", start + p))
+                        Err(e) if flipped.contains(&(start + p)) && !e.starts_with("malformed") => {
+                            site.excused
+                                .push(format!("router L{l} pos {} cascade: {e}", start + p))
                         }
                         Err(e) => fails.push(format!("router L{l} pos {}: {e}", start + p)),
+                    }
+                }
+
+                // stream rule (§3) per position; a row that took an excused
+                // route flip at or before this layer is deferred (S13a-6)
+                for (p, &ora_flip) in ora_row_flip.iter().enumerate() {
+                    let w = p * row..(p + 1) * row;
+                    let e = rel_l2(&got[w.clone()], &o32[w.clone()]);
+                    let fl = rel_l2(&o16[w.clone()], &o32[w.clone()]);
+                    let bound = (2.0 * fl).max(1e-3);
+                    if ora_flip {
+                        ora_flip_floor[i] = ora_flip_floor[i].max(fl);
+                    }
+                    let what = format!("L{l} call {c} pos {}: stream relL2", start + p);
+                    if flipped.contains(&(start + p)) {
+                        deferred.push((i, what, e, bound));
+                        continue;
+                    }
+                    worst[i] = worst[i].max(e / bound);
+                    if e.is_nan() || e > bound {
+                        fails.push(format!("{what} {e:.3e} > {bound:.3e}"));
                     }
                 }
 
@@ -420,9 +523,8 @@ fn real_groups(case: &str) {
                     };
                     let scored = trace.index_scores[i].as_ref();
                     for p in 0..s {
-                        let got: BTreeSet<i64> = tk.ids[p * tk.k..(p + 1) * tk.k]
+                        let got: Vec<i64> = tk.ids[p * tk.k..(p + 1) * tk.k]
                             .iter()
-                            .filter(|&&x| x >= 0)
                             .map(|&x| i64::from(x))
                             .collect();
                         let want: BTreeSet<i64> = gk.i[p * tk.k..(p + 1) * tk.k]
@@ -432,7 +534,8 @@ fn real_groups(case: &str) {
                             .collect();
                         site.rows += 1;
                         let kw = p * tk.k..(p + 1) * tk.k;
-                        site.ora_flips += usize::from(set_of(&gk.i[kw.clone()]) != set_of(&gk16[kw]));
+                        site.ora_flips +=
+                            usize::from(set_of(&gk.i[kw.clone()]) != set_of(&gk16[kw]));
                         let w = p * t..(p + 1) * t;
                         let (a, b) = if tk.k > 0 {
                             (&sc32[w.clone()], &sc16[w])
@@ -442,7 +545,7 @@ fn real_groups(case: &str) {
                         match sel_row(&got, &want, a, b, tk.k) {
                             Ok(None) => {}
                             Ok(Some((m32, g, sw))) => site.excused.push(format!(
-                                "index_topk L{l} pos {} m32 {m32:e} g {g:e} swapped {sw}",
+                                "index_topk L{l} pos {} m32 {m32:e} g' {g:e} swapped {sw}",
                                 start + p
                             )),
                             Err(e) => {
@@ -467,8 +570,10 @@ fn real_groups(case: &str) {
                     let site = sites.entry("candidates").or_default();
                     let k = cand.as_ref().unwrap().topk_blocks.min(nb);
                     for p in 0..s {
-                        let got: BTreeSet<i64> =
-                            (0..nb).filter(|&b| cd.keep[p * nb + b]).map(|b| b as i64).collect();
+                        let got: Vec<i64> = (0..nb)
+                            .filter(|&b| cd.keep[p * nb + b])
+                            .map(|b| b as i64)
+                            .collect();
                         let want: BTreeSet<i64> = (0..nb)
                             .filter(|&b| mask.i[p * t + b * cd.block_size] != 0)
                             .map(|b| b as i64)
@@ -480,13 +585,67 @@ fn real_groups(case: &str) {
                         match sel_row(&got, &want, &b32.f[w.clone()], &b16.f[w], k) {
                             Ok(None) => {}
                             Ok(Some((m32, g, sw))) => site.excused.push(format!(
-                                "candidates L{l} pos {} m32 {m32:e} g {g:e} swapped {sw}",
+                                "candidates L{l} pos {} m32 {m32:e} g' {g:e} swapped {sw}",
                                 start + p
                             )),
                             Err(e) => fails.push(format!("candidates L{l} pos {}: {e}", start + p)),
                         }
                     }
                 }
+            }
+
+            // the pre-mix leaving the group (the next group / the head reads
+            // it; the next group is fed the oracle's). DECISIONS S13a-8: its
+            // per-row floor (4 numbers) is too noisy to gate a row, so the
+            // gate is §3's error-curve form over all rows and calls,
+            // r = relL2(mlx, ora32) / relL2(ora16, ora32) <= 2; rows over the
+            // per-row stream bound are counted and printed
+            {
+                let lw = g1 - 1;
+                let (mut f32g, mut f16g) = (lfile(&d32, c, lw), lfile(&d16, c, lw));
+                let got = read(&pm_out);
+                let (o32, o16) = (f32g.get("next_pre_mix").f, f16g.get("next_pre_mix").f);
+                assert_eq!(
+                    (got.len(), o32.len(), o16.len()),
+                    (s * hc, s * hc, s * hc),
+                    "L{lw} next pre-mix"
+                );
+                if !got.iter().all(|v| v.is_finite()) {
+                    fails.push(format!("L{lw} call {c}: next pre-mix NaN/Inf"));
+                }
+                for p in 0..s {
+                    let w = p * hc..(p + 1) * hc;
+                    let e = rel_l2(&got[w.clone()], &o32[w.clone()]);
+                    let bound = (2.0 * rel_l2(&o16[w.clone()], &o32[w])).max(1e-3);
+                    pm_worst = pm_worst.max(e / bound);
+                    if e > bound {
+                        pm_rows_over.push(format!("pos {} {:.2}", start + p, e / bound));
+                    }
+                }
+                for ((&a, &b), &z) in got.iter().zip(&o32).zip(&o16) {
+                    let (a, b, z) = (f64::from(a), f64::from(b), f64::from(z));
+                    pm_acc[0] += (a - b) * (a - b);
+                    pm_acc[1] += (z - b) * (z - b);
+                    pm_acc[2] += b * b;
+                }
+            }
+        }
+        let pm_r = (pm_acc[0] / pm_acc[2]).sqrt() / ((pm_acc[1] / pm_acc[2]).sqrt()).max(1e-6);
+        if pm_r.is_nan() || pm_r > 2.0 {
+            fails.push(format!("L{} next pre-mix: r {pm_r:.3} > 2", g1 - 1));
+        }
+        // DECISIONS S13a-6: a row that took an excused route flip may differ
+        // from ora32 as much as the oracle's own bf16 run does on the rows
+        // where it flipped a route at that layer (S9-3), and no more
+        let mut def_worst = 0f64;
+        for (i, what, e, bound) in &deferred {
+            let fl = ora_flip_floor[*i];
+            let b = bound.max(2.0 * fl);
+            def_worst = def_worst.max(e / b);
+            if e.is_nan() || *e > b {
+                fails.push(format!(
+                    "{what} {e:.3e} > {b:.3e} (excused-flip row; own bound {bound:.3e})"
+                ));
             }
         }
         // error-curve rule (§3) over the group's layers, all calls
@@ -512,9 +671,10 @@ fn real_groups(case: &str) {
             prev = Some(r);
         }
         println!(
-            "group {g0}..{} done in {:.1} s (injected kv sources {ext:?}, candidates {cand_ext:?})",
+            "group {g0}..{} done in {:.1} s (injected kv sources {ext:?}, candidates {cand_ext:?}); next pre-mix r {pm_r:.4}, worst pos err/bound {pm_worst:.4}, rows over the per-row bound {pm_rows_over:?}; {} excused-flip row checks, worst err/bound {def_worst:.4}",
             g1 - 1,
-            gt.elapsed().as_secs_f64()
+            gt.elapsed().as_secs_f64(),
+            deferred.len()
         );
     }
 
@@ -530,7 +690,11 @@ fn real_groups(case: &str) {
             "site {name}: {} rows, {n} excused ({:.3} %; as-written 1 % cap {}), oracle bf16 flips {}, cap {cap:.1}",
             st.rows,
             100.0 * n as f64 / st.rows.max(1) as f64,
-            if n as f64 <= 0.01 * st.rows as f64 { "PASS" } else { "FAIL" },
+            if n as f64 <= 0.01 * st.rows as f64 {
+                "PASS"
+            } else {
+                "FAIL"
+            },
             st.ora_flips
         );
         if n as f64 > cap {
@@ -538,7 +702,11 @@ fn real_groups(case: &str) {
         }
     }
     assert!(sites.get("router").is_some_and(|s| s.rows > 0));
-    assert_eq!(engram_checked, 2 * n_calls, "engram rows checked in groups [1] and [14..19]");
+    assert_eq!(
+        engram_checked,
+        2 * n_calls,
+        "engram rows checked in groups [1] and [14..19]"
+    );
     let st = store.bank.stats();
     println!(
         "bank: {} slots read, {:.2} GB in {:.1} s; max MLX cache {:.3} GiB; peak active {:.3} GiB; wall {:.1} s",
@@ -577,4 +745,36 @@ fn real_groups_p32k8_code() {
 #[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12 goldens), MLX_ENABLE_TF32=0, MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~311 GB read"]
 fn real_groups_p160k8_en() {
     real_groups("p160k8-en");
+}
+
+#[test]
+fn sel_row_excuses_only_noise_band_swaps() {
+    let w = |v: &[i64]| v.iter().copied().collect::<BTreeSet<i64>>();
+    // k 2: a cutoff swap inside the bf16 drift is excused
+    let (s32, s16) = ([10.0, 5.0, 4.999, -100.0], [10.0, 5.01, 4.98, -100.0]);
+    assert!(matches!(
+        sel_row(&[0, 2], &w(&[0, 1]), &s32, &s16, 2),
+        Ok(Some((_, _, 1)))
+    ));
+    // the same near tie cannot excuse dropping the top entry
+    assert!(sel_row(&[1, 2], &w(&[0, 1]), &s32, &s16, 2).is_err());
+    assert!(sel_row(&[1, 3], &w(&[0, 1]), &s32, &s16, 2).is_err());
+    // malformed: duplicate, out of range, short
+    for bad in [&[0, 0][..], &[0, 4], &[0, -1]] {
+        let e = sel_row(bad, &w(&[0, 1]), &s32, &s16, 2).unwrap_err();
+        assert!(e.starts_with("malformed"), "{e}");
+    }
+    // the cutoff pair's own drift is small but the row's is not (S13a-8)
+    let (t32, t16) = ([10.0, 5.0, 4.99, 3.0], [10.05, 5.001, 4.991, 3.05]);
+    assert!(matches!(
+        sel_row(&[0, 2], &w(&[0, 1]), &t32, &t16, 2),
+        Ok(Some((_, _, 1)))
+    ));
+    // no near tie at the cutoff: not excused
+    let s16b = [10.0, 5.0, 4.999, -100.0];
+    assert!(sel_row(&[0, 2], &w(&[0, 1]), &s32, &s16b, 2).is_err());
+    assert!(matches!(
+        sel_row(&[1, 0], &w(&[0, 1]), &s32, &s16, 2),
+        Ok(None)
+    ));
 }
