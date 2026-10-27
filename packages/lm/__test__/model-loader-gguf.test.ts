@@ -4,7 +4,15 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { detectModelType, loadModel, MuseGlimmerModel, Qwen35Model, Qwen35MoeModel, Qwen4ExpModel } from '@mlx-node/lm';
+import {
+  DeepseekV41Model,
+  detectModelType,
+  loadModel,
+  MuseGlimmerModel,
+  Qwen35Model,
+  Qwen35MoeModel,
+  Qwen4ExpModel,
+} from '@mlx-node/lm';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -90,6 +98,16 @@ describe('standalone GGUF model detection', () => {
     expect(loadSpy).toHaveBeenLastCalledWith(modelPath, { draftModelPath: '/moe-draft', kvFormat: 'int8' });
     await loadModel(modelPath, { autoLoadDraft: false });
     expect(loadSpy).toHaveBeenLastCalledWith(modelPath, null);
+  });
+
+  it('detects DeepSeek-V4.1 GGUF and loads it by path alone', async () => {
+    const { modelPath } = await writeStandaloneGguf('deepseek41');
+    expect(await detectModelType(modelPath)).toBe('deepseek_v41');
+    const loaded = {} as DeepseekV41Model;
+    const loadSpy = vi.spyOn(DeepseekV41Model, 'load').mockResolvedValue(loaded);
+    await expect(loadModel(modelPath)).resolves.toBe(loaded);
+    expect(loadSpy).toHaveBeenLastCalledWith(modelPath);
+    await expect(loadModel(modelPath, { draftModelPath: '/draft' })).rejects.toThrow('only supported by gemma4');
   });
 
   it('detects Qwen3.8-Flash-Next as its own architecture', async () => {

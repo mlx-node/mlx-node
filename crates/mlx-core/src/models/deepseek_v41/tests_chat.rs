@@ -98,6 +98,7 @@ fn tiny_chat_lane_continues_session() {
         image_cache_key: 0,
     });
     inner.set_turn_cancel_flag(None);
+    assert_eq!(inner.turn_ids(), Some((p1.clone(), generated.to_vec())));
     let saved: Vec<u32> = p1.iter().chain(&generated).copied().collect();
     assert_eq!(inner.cached_token_history(), saved.as_slice());
 

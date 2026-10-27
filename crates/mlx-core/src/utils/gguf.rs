@@ -5405,6 +5405,14 @@ pub(crate) fn embedded_gpt2_tokenizer_json(
     // row (DeepSeek-V4.1's BOS/EOS/pad at 0..2) must also be a vocab entry, as
     // in HF's tokenizer.json.
     let last_normal = types.iter().rposition(|&t| t == 1).unwrap_or(0);
+    // joyai-llm (DeepSeek-V4.1): USER_DEFINED rows (`<think>`, `</think>`,
+    // DSML markers) are `special: false` in HF's tokenizer.json, so a
+    // skip-special decode keeps them and the reasoning split can find
+    // `</think>` in the text.
+    let joyai = matches!(
+        metadata.get("tokenizer.ggml.pre"),
+        Some(GgufMetaValue::String(pre)) if pre == "joyai-llm"
+    );
     for (id, (token, token_type)) in tokens.iter().zip(types).enumerate() {
         if matches!(*token_type, 3 | 4) && id < last_normal {
             vocab.insert(token.clone(), serde_json::json!(id));
@@ -5424,7 +5432,7 @@ pub(crate) fn embedded_gpt2_tokenizer_json(
                 "lstrip": false,
                 "rstrip": false,
                 "normalized": false,
-                "special": true
+                "special": !(joyai && *token_type == 4)
             })),
             _ => {}
         }
@@ -18423,6 +18431,27 @@ mod tests {
             }
         }
         assert_eq!(ours.get_vocab_size(true), hf.get_vocab_size(true));
+        // USER_DEFINED rows decode like HF's (not skipped): the reasoning
+        // split finds `</think>` in a skip-special decode (S17 codex [high]).
+        for (id, ty) in types.iter().enumerate() {
+            if *ty == 4 {
+                let ids = [id as u32];
+                assert_eq!(
+                    ours.decode(&ids, true).unwrap(),
+                    hf.decode(&ids, true).unwrap(),
+                    "decode {:?}",
+                    tokens[id]
+                );
+            }
+        }
+        let think_end = ours.token_to_id("</think>").unwrap();
+        let text = [
+            ours.encode("reasoning", false).unwrap().get_ids(),
+            &[think_end],
+            ours.encode("answer", false).unwrap().get_ids(),
+        ]
+        .concat();
+        assert_eq!(ours.decode(&text, true).unwrap(), "reasoning</think>answer");
         let cases: serde_json::Value = serde_json::from_slice(
             &std::fs::read(std::env::var("DSV41_TOK_CASES").unwrap()).unwrap(),
         )

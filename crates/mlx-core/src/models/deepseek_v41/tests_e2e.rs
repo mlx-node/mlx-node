@@ -733,6 +733,52 @@ fn real_e2e_greedy_code() {
     real_e2e_greedy("p32k8-code");
 }
 
+/// S18 CLI-vs-Rust gate: `DSV41_IDS` = the CLI's JSON (`$I/tools/ds-run.ts`:
+/// `prompt_ids` = its rendered prompt, `output_ids` = its greedy output). The
+/// product path (`forward_last`, the engine's T=0 sampler, dense mode from the
+/// env as in the CLI) greedy-decodes from the same prompt; ids must be equal.
+/// Expert cache 0 here, the CLI's auto cache there (D-13: same bits).
+#[test]
+#[ignore = "real 9 shards + DSV41_IDS (ds-run.ts JSON); MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=0; ~19 GiB"]
+fn real_e2e_greedy_from_ids() {
+    let doc: Value =
+        serde_json::from_slice(&std::fs::read(std::env::var_os("DSV41_IDS").expect("DSV41_IDS")).unwrap())
+            .unwrap();
+    let ids = |k: &str| -> Vec<u32> {
+        doc[k]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| u32::try_from(x.as_u64().unwrap()).unwrap())
+            .collect()
+    };
+    let (prompt, want) = (ids("prompt_ids"), ids("output_ids"));
+    assert!(!prompt.is_empty() && !want.is_empty());
+    let store = e2e_store();
+    let mut sess = store.model.new_session();
+    let greedy = crate::sampling::SamplingConfig {
+        temperature: Some(0.0),
+        top_k: None,
+        top_p: None,
+        min_p: None,
+    };
+    let mut got: Vec<u32> = Vec::new();
+    let t0 = std::time::Instant::now();
+    while got.len() < want.len() {
+        let call = if got.is_empty() { prompt.clone() } else { vec![*got.last().unwrap()] };
+        let logits = store.model.forward_last(&mut sess, &call, None, None).unwrap();
+        let y = crate::sampling::sample(&logits, Some(greedy)).unwrap();
+        y.eval();
+        got.push(y.item_at_int32(0).unwrap() as u32);
+        if got.len() == 1 {
+            println!("ttft {:.2} s ({} prompt ids)", t0.elapsed().as_secs_f64(), prompt.len());
+        }
+    }
+    println!("dense mode {:?}; {} ids in {:.1} s", store.dense_mode, got.len(), t0.elapsed().as_secs_f64());
+    println!("cli  {want:?}\nrust {got:?}");
+    assert_eq!(got, want, "CLI output ids != Rust greedy from the CLI's prompt ids");
+}
+
 #[test]
 fn argmax_takes_the_lowest_index_on_ties() {
     assert_eq!(super::generate::argmax(&[1.0, 3.0, 3.0, -1.0]), 1);

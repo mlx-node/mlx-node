@@ -12,6 +12,7 @@ use napi_derive::napi;
 
 use super::attention::FakeQuant;
 use super::model::{Session, Trace};
+use super::stats::{self, Counters};
 use super::store::{CachePlan, Store};
 use crate::array::{DType, MxArray};
 use crate::engine::backend::{ChatBackend, DecodeStep, ResetScope, SaveStateArgs, TurnSetup};
@@ -100,7 +101,7 @@ pub(crate) fn gguf_tokenizer(first: &Path) -> Result<(Qwen3Tokenizer, u32)> {
 }
 
 /// Admission and bank state as of the last turn edge (host values only).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Residency {
     pub admission: Option<Admission>,
     /// Bank pages resident after the last turn made the bank volatile: a
@@ -108,6 +109,21 @@ pub(crate) struct Residency {
     pub bank_resident: u64,
     pub switches: u32,
     pub in_turn: bool,
+    /// The last saved turn: its rendered prompt ids and generated ids.
+    pub turn_ids: Option<(Vec<u32>, Vec<u32>)>,
+}
+
+/// One turn's timings and counters for the `MLX_DSV41_STATS` line.
+struct TurnStats {
+    t0: std::time::Instant,
+    c0: Counters,
+    swap0: Option<u64>,
+    level_min: Option<u64>,
+    prompt: usize,
+    ttft_s: f64,
+    decode_s: Vec<f64>,
+    /// Counters and clock at the end of the prefill (decode-only terms).
+    dec0: Option<(Counters, std::time::Instant)>,
 }
 
 /// One call seen by a test probe: start position, ids, engram row ids.
@@ -122,6 +138,7 @@ pub(crate) struct Inner {
     cancel: Option<Arc<AtomicBool>>,
     in_turn: bool,
     residency: Arc<Mutex<Residency>>,
+    turn_stats: Option<TurnStats>,
     /// Test hook: every forward call, and per prefill the index of its call
     /// and the session's whole prompt (history + call ids).
     pub(crate) probe: Option<(Vec<ProbeCall>, Vec<(usize, Vec<u32>)>)>,
@@ -159,6 +176,7 @@ impl Inner {
             cancel: None,
             in_turn: false,
             residency,
+            turn_stats: None,
             probe: None,
         };
         inner.publish(None);
@@ -202,6 +220,84 @@ impl Inner {
         self.publish(Some(resident));
     }
 
+    /// The last saved turn's (prompt ids, generated ids).
+    #[cfg(test)]
+    pub(crate) fn turn_ids(&self) -> Option<(Vec<u32>, Vec<u32>)> {
+        let r = self
+            .residency
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        r.turn_ids.clone()
+    }
+
+    /// With `MLX_DSV41_STATS` set: evaluates the call's logits (timing) and
+    /// appends one stats line for the turn so far, with decode-only terms.
+    fn emit_stats(&mut self, logits: &MxArray, prefill: bool, t_call: std::time::Instant) {
+        let Some(ts) = self.turn_stats.as_mut() else {
+            return;
+        };
+        logits.eval();
+        let dt = t_call.elapsed().as_secs_f64();
+        let c_now = Counters::now(&self.store.bank);
+        if prefill {
+            ts.ttft_s = ts.t0.elapsed().as_secs_f64();
+            ts.dec0 = Some((c_now, std::time::Instant::now()));
+        } else {
+            ts.decode_s.push(dt);
+        }
+        let (lvl, swap) = stats::host_pressure();
+        ts.level_min = match (ts.level_min, lvl) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let c = c_now.since(&ts.c0);
+        let (_, peak, _) = stats::rusage();
+        let swap_d = swap.zip(ts.swap0).map_or(0, |(a, b)| a as i64 - b as i64);
+        let mut line = stats::line(
+            "chat",
+            ts.prompt,
+            1 + ts.decode_s.len(),
+            ts.ttft_s,
+            &ts.decode_s,
+            &c,
+            ts.t0.elapsed().as_secs_f64(),
+            c.fill_bytes + c.engram_bytes,
+            self.store.cache_slots(),
+            peak,
+            swap_d,
+            ts.level_min,
+        );
+        if let (Some((cd0, td0)), Some(obj)) = (ts.dec0, line.as_object_mut()) {
+            let d = c_now.since(&cd0);
+            let n = ts.decode_s.len().max(1) as f64;
+            let wall = td0.elapsed().as_secs_f64();
+            let (io, eng) = (d.fill_ns as f64 * 1e-9, d.engram_ns as f64 * 1e-9);
+            obj.insert("decode_tok".into(), ts.decode_s.len().into());
+            obj.insert(
+                "decode_tok_s_mean".into(),
+                (ts.decode_s.len() as f64 / wall.max(1e-9)).into(),
+            );
+            obj.insert("decode_t_c_ms".into(), ((wall - io - eng) * 1e3 / n).into());
+            obj.insert("decode_t_io_ms".into(), (io * 1e3 / n).into());
+            obj.insert("decode_t_engram_ms".into(), (eng * 1e3 / n).into());
+            obj.insert(
+                "decode_t_router_wait_ms".into(),
+                (d.router_ns as f64 * 1e-6 / n).into(),
+            );
+            obj.insert(
+                "decode_h".into(),
+                (d.hits as f64 / d.uses.max(1) as f64).into(),
+            );
+            obj.insert(
+                "decode_read_gbps".into(),
+                (d.fill_bytes as f64 / 1e9 / io.max(1e-9)).into(),
+            );
+        }
+        if let Err(e) = stats::emit(&line) {
+            tracing::warn!("deepseek_v41 stats: {e}");
+        }
+    }
+
     /// One call on the session: f32 logits of its last row `[1, vocab]`.
     fn call(&mut self, ids: &[u32], cancel: Option<&dyn Fn(usize) -> bool>) -> Result<MxArray> {
         let start = self.sess.tokens.len();
@@ -226,7 +322,10 @@ impl DecodeStep for Step<'_> {
     }
 
     fn forward_with_token(&mut self, _ids: &MxArray, token: u32) -> Result<(MxArray, bool)> {
-        Ok((self.0.call(&[token], None)?, false))
+        let t = std::time::Instant::now();
+        let logits = self.0.call(&[token], None)?;
+        self.0.emit_stats(&logits, false, t);
+        Ok((logits, false))
     }
 }
 
@@ -275,6 +374,13 @@ impl ChatBackend for Inner {
     }
 
     fn save_cache_state(&mut self, args: SaveStateArgs<'_>) {
+        {
+            let mut r = self
+                .residency
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            r.turn_ids = Some((args.save_tokens.to_vec(), args.generated_tokens.to_vec()));
+        }
         if args.reuse_cache {
             self.saved = self.sess.tokens.clone();
         } else {
@@ -307,6 +413,17 @@ impl ChatBackend for Inner {
             let full = self.sess.tokens.iter().chain(tokens).copied().collect();
             prompts.push((calls.len(), full));
         }
+        let t0 = std::time::Instant::now();
+        self.turn_stats = std::env::var_os("MLX_DSV41_STATS").map(|_| TurnStats {
+            t0,
+            c0: Counters::now(&self.store.bank),
+            swap0: stats::host_pressure().1,
+            level_min: None,
+            prompt: tokens.len(),
+            ttft_s: 0.0,
+            decode_s: Vec::new(),
+            dec0: None,
+        });
         self.begin()?;
         let _ctx = StreamContext::new(stream);
         let flag = self.cancel.clone();
@@ -314,6 +431,10 @@ impl ChatBackend for Inner {
         let out = self.call(tokens, Some(&cancel));
         match out {
             Err(_) if cancel(0) => Err(Error::from_reason("prefill cancelled")),
+            Ok(logits) => {
+                self.emit_stats(&logits, true, t0);
+                Ok(logits)
+            }
             o => o,
         }
     }
@@ -326,6 +447,15 @@ impl ChatBackend for Inner {
     fn begin_decode(&mut self, _turn: &TurnSetup<'_>) -> Result<Step<'_>> {
         Ok(Step(self))
     }
+}
+
+/// The last saved turn of the session (S18 CLI-vs-Rust id gate).
+#[napi(object)]
+pub struct DeepseekV41TurnTokenIds {
+    /// The rendered prompt the turn was given (whole conversation).
+    pub prompt_ids: Vec<u32>,
+    /// The generated ids, the stop token included when one ended the turn.
+    pub output_ids: Vec<u32>,
 }
 
 #[napi(object)]
@@ -425,9 +555,22 @@ impl DeepseekV41Model {
         false
     }
 
+    /// Prompt and generated ids of the last completed turn, if any.
+    #[napi]
+    pub fn last_turn_token_ids(&self) -> Option<DeepseekV41TurnTokenIds> {
+        let r = self
+            .residency
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        r.turn_ids.as_ref().map(|(p, o)| DeepseekV41TurnTokenIds {
+            prompt_ids: p.clone(),
+            output_ids: o.clone(),
+        })
+    }
+
     #[napi]
     pub fn residency_info(&self) -> DeepseekV41ResidencyInfo {
-        let r = *self
+        let r = self
             .residency
             .lock()
             .unwrap_or_else(PoisonError::into_inner);

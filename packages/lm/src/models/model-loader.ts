@@ -4,6 +4,7 @@
  */
 
 import {
+  DeepseekV41Model as NativeDeepseekV41Model,
   Gemma4Model as NativeGemma4Model,
   ggufArchitecture,
   HarrierModel,
@@ -26,6 +27,7 @@ import { findDFlash2Draft } from '../draft-companion.js';
 import { familyDataFor, type ModelType, type TrainableFamilyId } from '../family-data.js';
 import { detectModelType as detectLocalModelType } from '../model-detection.js';
 import {
+  DeepseekV41Model,
   Gemma4Model,
   K2HorizonModel,
   Lfm2Model,
@@ -153,6 +155,10 @@ const LOADER_BINDINGS = {
         options?.auxiliaryModelPath === undefined ? null : { auxiliaryModelPath: options.auxiliaryModelPath },
       ),
     nativeModelClass: NativeQwen4ExpModel,
+  },
+  deepseek_v41: {
+    load: (modelPath: string) => DeepseekV41Model.load(modelPath),
+    nativeModelClass: NativeDeepseekV41Model,
   },
   lfm2: {
     load: (modelPath: string) => Lfm2Model.load(modelPath),

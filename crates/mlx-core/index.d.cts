@@ -89,6 +89,8 @@ export declare class DeepseekV41Model {
   contextLimits(): DeepseekV41ContextLimits;
   maxConcurrentSequences(): number;
   hasBlockPagedCache(): boolean;
+  /** Prompt and generated ids of the last completed turn, if any. */
+  lastTurnTokenIds(): DeepseekV41TurnTokenIds | null;
   residencyInfo(): DeepseekV41ResidencyInfo;
   /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
   schedulerStats(): Promise<SchedulerStats>;
@@ -3585,6 +3587,14 @@ export interface DeepseekV41ResidencyInfo {
    * numerics were gated with it off.
    */
   tf32: boolean;
+}
+
+/** The last saved turn of the session (S18 CLI-vs-Rust id gate). */
+export interface DeepseekV41TurnTokenIds {
+  /** The rendered prompt the turn was given (whole conversation). */
+  promptIds: Array<number>;
+  /** The generated ids, the stop token included when one ended the turn. */
+  outputIds: Array<number>;
 }
 
 /** Document element - either a table or paragraph */
