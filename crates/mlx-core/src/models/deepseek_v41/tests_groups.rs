@@ -6,6 +6,14 @@
 // `deepseek_v41::tests::real_groups_<case>`. Run with `MLX_ENABLE_TF32=0`.
 // The long rung dumps streams at group-boundary layers only (DECISIONS
 // S13b-1): a layer's stream is gated where its golden exists.
+// Selection gates (DECISIONS S13b-5, diag/JUDGE.md): each group's first layer
+// (exact oracle input) carries the hard checks G1 `r(L_first) <= 0.07`, G2
+// router / index / candidate rows equal or §3 near ties, excused rows <=
+// max(3, 1 % of that layer's rows), and G3 every compressed-KV / index-K
+// source state within 1e-4 of its elements of the oracle's, per call. Route
+// differences at depth >= 1 are printed, not failed (the oracle against itself
+// at 1 ulp fails a per-row rule there); such a row keeps the per-row stream
+// rule with the S13a-6 bound.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -295,13 +303,37 @@ fn sel_row(
     }
 }
 
-/// Rows of one selection site, the excused ones, and the rows where the
-/// oracle's own bf16 run picks another set than its fp32 run.
+/// Rows of one selection site, the excused ones, the depth >= 1 route
+/// differences that are not near ties (printed only, DECISIONS S13b-5), and
+/// the rows where the oracle's own bf16 run picks another set than its fp32 run.
 #[derive(Default)]
 struct Site {
     rows: usize,
     excused: Vec<String>,
+    deep: Vec<String>,
     ora_flips: usize,
+}
+
+/// G3 (DECISIONS S13b-5): a source state's elements off the oracle's by more
+/// than `1e-3` relative (non-finite counts as off). Returns (off, elements);
+/// `Err` when the row counts differ.
+fn state_off(mine: &[f32], ora: &[f32], hd: usize) -> std::result::Result<(usize, usize), String> {
+    if mine.len() != ora.len() || !mine.len().is_multiple_of(hd) {
+        return Err(format!(
+            "rows mine {} ora {} (width {hd})",
+            mine.len() as f64 / hd as f64,
+            ora.len() / hd
+        ));
+    }
+    let off = mine
+        .iter()
+        .zip(ora)
+        .filter(|&(&a, &b)| {
+            let d = (a - b).abs();
+            d.is_nan() || d > 1e-3 * b.abs().max(1e-3)
+        })
+        .count();
+    Ok((off, mine.len()))
 }
 
 fn set_of(v: &[i64]) -> BTreeSet<i64> {
@@ -419,6 +451,10 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
         let mut ora_flip_floor = vec![0f64; g1 - g0];
         let (mut pm_acc, mut pm_rows_over) = ([0f64; 3], Vec::<String>::new());
         let mut deferred: Vec<(usize, String, f64, f64)> = Vec::new();
+        // G2: per site, (rows, excused rows) at the group's first layer;
+        // G3: (states checked, worst off fraction, its label)
+        let mut first_sel: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        let mut g3 = (0usize, 0f64, String::new());
         for (c, (start, ids, hash)) in calls.iter().enumerate() {
             let (s, end) = (ids.len(), start + ids.len());
             let mut first = lfile(&d32, c, g0);
@@ -501,6 +537,7 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
             }
 
             for (i, l) in (g0..g1).enumerate() {
+                let depth = l - g0;
                 let (mut f32g, mut f16g) = (lfile(&d32, c, l), lfile(&d16, c, l));
                 let gold = gold_stream(&d32, &d16, c, l, cfg.n_layers, &eng_layers);
                 has_stream[i] = gold.is_some();
@@ -531,6 +568,46 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
                             .filter(|(x, y)| (*x - *y).abs() > 1e-3 * y.abs().max(1e-3))
                             .count();
                         kv_flips[i] += n;
+                    }
+                }
+                // G3: this group's own compressed-KV / index-K source state
+                // after the call vs the oracle's (diag/mutation/diag_harness.patch)
+                if cfg.kv_src[l] == Some(l) && cfg.compress_ratios[l] != 0 {
+                    let src = sess.sources[l]
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("L{l} call {c}: no source state"));
+                    assert!(f32g.has("state_compress_kv"), "L{l}: golden state_compress_kv");
+                    for (name, mine, key) in [
+                        ("compressed kv", src.kv.as_ref(), "state_compress_kv"),
+                        ("index-K", src.index_k.as_ref(), "state_index_k"),
+                    ] {
+                        let what = format!("G3 L{l} call {c} {name}");
+                        let o = match (mine, f32g.has(key)) {
+                            (None, false) => continue,
+                            (Some(_), true) => f32g.get(key),
+                            (m, _) => {
+                                fails.push(format!(
+                                    "{what}: mlx-node has it {}, golden has it {}",
+                                    m.is_some(),
+                                    !m.is_some()
+                                ));
+                                continue;
+                            }
+                        };
+                        let mine = read(mine.unwrap());
+                        match state_off(&mine, &o.f, o.shape[2] as usize) {
+                            Err(e) => fails.push(format!("{what}: {e}")),
+                            Ok((off, n)) => {
+                                g3.0 += 1;
+                                let frac = off as f64 / n.max(1) as f64;
+                                if frac >= g3.1 {
+                                    g3 = (g3.0, frac, format!("{what} {off}/{n}"));
+                                }
+                                if off as f64 > 1e-4 * n as f64 {
+                                    fails.push(format!("{what}: {off}/{n} elements off > 1e-4"));
+                                }
+                            }
+                        }
                     }
                 }
                 if let Some((o32, o16)) = &gold {
@@ -570,29 +647,37 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
                     let b32: Vec<f32> = (0..ne).map(|e| sc32[p * ne + e] + bias32[e]).collect();
                     let b16: Vec<f32> = (0..ne).map(|e| sc16[p * ne + e] + bias16[e]).collect();
                     site.rows += 1;
-                    // DECISIONS S13a-5: a row whose own routes already took
-                    // an excused near tie earlier in the group carries a state
-                    // the oracle never had; from then on its stream rule gates
-                    // it and its route differences count toward the cap
+                    // DECISIONS S13b-5: G2 at the first layer; at depth >= 1 a
+                    // difference is printed and the row gets the S13a-6 bound
                     match sel_row(&got, &want, &b32, &b16, r.k) {
                         Ok(None) => {}
+                        Err(e) if e.starts_with("malformed") => {
+                            fails.push(format!("router L{l} pos {}: {e}", start + p))
+                        }
                         Ok(Some((m32, g, sw))) => {
                             flipped.insert(start + p);
+                            if depth == 0 {
+                                first_sel.entry("router").or_default().1 += 1;
+                            }
                             site.excused.push(format!(
                                 "router L{l} pos {} m32 {m32:e} g' {g:e} swapped {sw}",
                                 start + p
                             ))
                         }
-                        Err(e) if flipped.contains(&(start + p)) && !e.starts_with("malformed") => {
-                            site.excused
-                                .push(format!("router L{l} pos {} cascade: {e}", start + p))
+                        Err(e) if depth > 0 => {
+                            flipped.insert(start + p);
+                            site.deep.push(format!("router L{l} pos {}: {e}", start + p))
                         }
-                        Err(e) => fails.push(format!("router L{l} pos {}: {e}", start + p)),
+                        Err(e) => fails.push(format!("G2 router L{l} pos {}: {e}", start + p)),
                     }
                 }
+                if depth == 0 {
+                    first_sel.entry("router").or_default().0 += s;
+                }
 
-                // stream rule (§3) per position; a row that took an excused
-                // route flip at or before this layer is deferred (S13a-6)
+                // stream rule (§3) per position; a row whose routes differ
+                // from ora32 at or before this layer (excused near tie, or any
+                // depth >= 1 difference, S13b-5) is deferred (S13a-6)
                 let (o32, o16) = gold.as_ref().map_or((&[][..], &[][..]), |(a, b)| {
                     (a.as_slice(), b.as_slice())
                 });
@@ -620,6 +705,9 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
 
                 // index top-k at index sources (golden ids carry the window offset)
                 if let Some(tk) = &trace.topk[i] {
+                    // index sources are group starts in every group list (G2)
+                    assert_eq!(depth, 0, "L{l}: index source inside group {g0}..{g1}");
+                    first_sel.entry("index_topk").or_default().0 += s;
                     let t = end / cfg.compress_ratios[l] as usize;
                     let gk = f32g.get("index_topk");
                     let off = f32g.get("attn_kv_len").i[0] - t as i64;
@@ -654,14 +742,17 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
                         };
                         match sel_row(&got, &want, a, b, tk.k) {
                             Ok(None) => {}
-                            Ok(Some((m32, g, sw))) => site.excused.push(format!(
-                                "index_topk L{l} pos {} m32 {m32:e} g' {g:e} swapped {sw}",
-                                start + p
-                            )),
+                            Ok(Some((m32, g, sw))) => {
+                                first_sel.entry("index_topk").or_default().1 += 1;
+                                site.excused.push(format!(
+                                    "index_topk L{l} pos {} m32 {m32:e} g' {g:e} swapped {sw}",
+                                    start + p
+                                ))
+                            }
                             Err(e) => {
                                 let mine = scored.map(|v| v[p * t..(p + 1) * t].to_vec());
                                 fails.push(format!(
-                                    "index_topk L{l} pos {}: {e}; mlx scores {mine:?}",
+                                    "G2 index_topk L{l} pos {}: {e}; mlx scores {mine:?}",
                                     start + p
                                 ))
                             }
@@ -671,6 +762,8 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
 
                 // candidate blocks at the candidate source
                 if let Some(cd) = &trace.candidates[i] {
+                    assert_eq!(depth, 0, "L{l}: candidate source inside group {g0}..{g1}");
+                    first_sel.entry("candidates").or_default().0 += s;
                     let mask = f32g.get("cand_mask");
                     let (b32, b16) = (f32g.get("cand_block_scores"), f16g.get("cand_block_scores"));
                     let t = mask.shape[2] as usize;
@@ -694,11 +787,14 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
                         let w = p * nb..(p + 1) * nb;
                         match sel_row(&got, &want, &b32.f[w.clone()], &b16.f[w], k) {
                             Ok(None) => {}
-                            Ok(Some((m32, g, sw))) => site.excused.push(format!(
-                                "candidates L{l} pos {} m32 {m32:e} g' {g:e} swapped {sw}",
-                                start + p
-                            )),
-                            Err(e) => fails.push(format!("candidates L{l} pos {}: {e}", start + p)),
+                            Ok(Some((m32, g, sw))) => {
+                                first_sel.entry("candidates").or_default().1 += 1;
+                                site.excused.push(format!(
+                                    "candidates L{l} pos {} m32 {m32:e} g' {g:e} swapped {sw}",
+                                    start + p
+                                ))
+                            }
+                            Err(e) => fails.push(format!("G2 candidates L{l} pos {}: {e}", start + p)),
                         }
                     }
                 }
@@ -790,8 +886,12 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
         // all calls; across n ungated steps the per-step 0.25 bounds the rise
         // by 0.25 n, the only part of it the dumps can show (S13b-3)
         let mut prev: Option<(usize, f64)> = None;
+        let mut r_first = f64::NAN;
         for (i, l) in (g0..g1).enumerate() {
             if !has_stream[i] {
+                if i == 0 {
+                    fails.push(format!("G1 L{l}: no golden stream at the group's first layer"));
+                }
                 println!(
                     "{g0:>2}..{:<2}  L{l:02}   (no golden stream)                                        {}",
                     g1 - 1,
@@ -811,6 +911,14 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
             if r > 2.0 {
                 fails.push(format!("L{l}: r {r:.3} > 2"));
             }
+            // G1 (DECISIONS S13b-5): the first layer runs on the oracle's own
+            // input, so only f32 rounding and quantizer midpoints may move it
+            if i == 0 {
+                r_first = r;
+                if r.is_nan() || r > 0.07 {
+                    fails.push(format!("G1 L{l}: r(L_first) {r:.4} > 0.07"));
+                }
+            }
             if let Some((pl, p)) = prev
                 && r - p > 0.25 * (l - pl) as f64
             {
@@ -823,6 +931,33 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
             }
             prev = Some((l, r));
         }
+        let n_src = (g0..g1)
+            .filter(|&l| cfg.kv_src[l] == Some(l) && cfg.compress_ratios[l] != 0)
+            .count();
+        assert!(
+            g3.0 >= n_src * n_calls,
+            "G3 ran {} times, want >= {} (group {g0}..{g1})",
+            g3.0,
+            n_src * n_calls
+        );
+        // G2 (DECISIONS S13b-5): excused near ties at the first layer
+        let mut g2 = Vec::new();
+        for (name, &(rows, n)) in &first_sel {
+            let cap = 3f64.max(0.01 * rows as f64);
+            g2.push(format!("{name} {n}/{rows} (cap {cap:.1})"));
+            if n as f64 > cap {
+                fails.push(format!(
+                    "G2 L{g0} {name}: {n} excused rows > max(3, 1 % of {rows})"
+                ));
+            }
+        }
+        println!(
+            "group {g0}..{} first layer: G1 r {r_first:.4} (<= 0.07); G2 excused {g2:?}; G3 {} source states, worst {} ({:.2e}, <= 1e-4)",
+            g1 - 1,
+            g3.0,
+            if g3.2.is_empty() { "-" } else { g3.2.as_str() },
+            g3.1
+        );
         println!(
             "group {g0}..{} done in {:.1} s (injected kv sources {ext:?}, candidates {cand_ext:?}); next pre-mix r {pm_r:.4}, worst pos err/bound {pm_worst:.4}, rows over the per-row bound {pm_rows_over:?}; next-block input worst pos err/bound {mix_worst:.4}; {} excused-flip row checks, worst err/bound {def_worst:.4}",
             g1 - 1,
@@ -831,28 +966,23 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
         );
     }
 
+    // DECISIONS S13b-5: no whole-site cap (S13a-2 dropped); the first-layer
+    // cap is G2 above. Totals are printed for the record.
     for (name, st) in &sites {
         for e in &st.excused {
             println!("excused near tie: {e}");
         }
-        // DECISIONS S13a-2: the §3 1 % cap, or a tenth of the oracle's own
-        // bf16-vs-fp32 flips at the site, whichever is larger
-        let n = st.excused.len();
-        let cap = (st.rows as f64 * 0.01).max(st.ora_flips as f64 * 0.1);
+        for e in &st.deep {
+            println!("depth >= 1 route difference (printed, S13a-6 row): {e}");
+        }
         println!(
-            "site {name}: {} rows, {n} excused ({:.3} %; as-written 1 % cap {}), oracle bf16 flips {}, cap {cap:.1}",
+            "site {name}: {} rows, {} excused near ties + {} depth >= 1 differences ({:.3} %), oracle bf16 flips {}",
             st.rows,
-            100.0 * n as f64 / st.rows.max(1) as f64,
-            if n as f64 <= 0.01 * st.rows as f64 {
-                "PASS"
-            } else {
-                "FAIL"
-            },
+            st.excused.len(),
+            st.deep.len(),
+            100.0 * (st.excused.len() + st.deep.len()) as f64 / st.rows.max(1) as f64,
             st.ora_flips
         );
-        if n as f64 > cap {
-            fails.push(format!("site {name}: {n} excused > cap {cap:.1}"));
-        }
     }
     assert!(sites.get("router").is_some_and(|s| s.rows > 0));
     let eng_groups = groups
@@ -949,4 +1079,14 @@ fn sel_row_excuses_only_noise_band_swaps() {
         sel_row(&[1, 0], &w(&[0, 1]), &s32, &s16, 2),
         Ok(None)
     ));
+}
+
+#[test]
+fn state_off_counts_g3_elements() {
+    let ora = [1.0f32, 0.5, -0.25, 0.0];
+    assert_eq!(state_off(&ora, &ora, 2), Ok((0, 4)));
+    // one fp4-step flip, one NaN, one tiny move inside 1e-3 relative
+    let mine = [1.0005f32, 0.5625, f32::NAN, 0.0];
+    assert_eq!(state_off(&mine, &ora, 2), Ok((2, 4)));
+    assert!(state_off(&mine[..2], &ora, 2).is_err());
 }
