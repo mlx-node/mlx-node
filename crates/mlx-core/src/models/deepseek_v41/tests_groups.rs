@@ -303,6 +303,21 @@ fn sel_row(
     }
 }
 
+/// mlx-node's route ids of one row must be the top-k of its own `scores +
+/// bias` in rank order, ties to the lowest id (`ops::route_select`), at every
+/// depth: a depth >= 1 difference from ora32 is only excused as noise when
+/// mlx-node picked what its own scores say (S13b-5 codex).
+fn route_self_check(got: &[i64], biased: &[f32], k: usize) -> std::result::Result<(), String> {
+    let mut order: Vec<usize> = (0..biased.len()).collect();
+    order.sort_by(|&i, &j| biased[j].total_cmp(&biased[i]).then(i.cmp(&j)));
+    let own: Vec<i64> = order.iter().take(k).map(|&e| e as i64).collect();
+    if got == own.as_slice() {
+        Ok(())
+    } else {
+        Err(format!("ids {got:?} are not the top-{k} of their own scores {own:?}"))
+    }
+}
+
 /// Rows of one selection site, the excused ones, the depth >= 1 route
 /// differences that are not near ties (printed only, DECISIONS S13b-5), and
 /// the rows where the oracle's own bf16 run picks another set than its fp32 run.
@@ -627,6 +642,7 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
                 let (sc32, sc16) = (f32g.get("router_scores").f, f16g.get("router_scores").f);
                 let ne = bias32.len();
                 let idx16 = f16g.get("router_idx").i;
+                assert_eq!(r.biased.len(), s * ne, "L{l}: mlx router scores");
                 let site = sites.entry("router").or_default();
                 let mut ora_row_flip = vec![false; s];
                 for p in 0..s {
@@ -647,6 +663,9 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
                     let b32: Vec<f32> = (0..ne).map(|e| sc32[p * ne + e] + bias32[e]).collect();
                     let b16: Vec<f32> = (0..ne).map(|e| sc16[p * ne + e] + bias16[e]).collect();
                     site.rows += 1;
+                    if let Err(e) = route_self_check(&got, &r.biased[p * ne..(p + 1) * ne], r.k) {
+                        fails.push(format!("router L{l} pos {}: {e}", start + p));
+                    }
                     // DECISIONS S13b-5: G2 at the first layer; at depth >= 1 a
                     // difference is printed and the row gets the S13a-6 bound
                     match sel_row(&got, &want, &b32, &b16, r.k) {
@@ -1079,6 +1098,17 @@ fn sel_row_excuses_only_noise_band_swaps() {
         sel_row(&[1, 0], &w(&[0, 1]), &s32, &s16, 2),
         Ok(None)
     ));
+}
+
+#[test]
+fn route_self_check_rejects_ids_off_their_own_scores() {
+    let b = [0.5f32, 0.9, 0.1, 0.9, -2.0];
+    // rank order, ties to the lowest id (route_select)
+    assert!(route_self_check(&[1, 3], &b, 2).is_ok());
+    assert!(route_self_check(&[3, 1], &b, 2).is_err());
+    // the S13b-5 codex example: a top expert replaced by the lowest-scoring one
+    assert!(route_self_check(&[1, 4], &b, 2).is_err());
+    assert!(route_self_check(&[1], &b, 2).is_err());
 }
 
 #[test]
