@@ -266,7 +266,16 @@ impl Store {
             }
             None => None,
         };
-        let model = Model::from_gguf(cfg, act, fq, get, bank_of, table, Some(Arc::clone(&bank)))?;
+        let model =
+            match Model::from_gguf(cfg, act, fq, get, bank_of, table, Some(Arc::clone(&bank))) {
+                Ok(m) => m,
+                Err(e) => {
+                    // the partial model is gone; keep its buffers out of MLX's free pool
+                    drop(bank);
+                    crate::array::clear_cache();
+                    return Err(e);
+                }
+            };
         let guard =
             coordinator().register_with_cache_limit(dense_bytes + bank.nbytes(), Some(POOL_LIMIT));
         Ok(Self {

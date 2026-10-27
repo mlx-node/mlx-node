@@ -67,8 +67,8 @@ pub struct Trace {
 #[derive(Clone)]
 pub struct Session {
     pub tokens: Vec<u32>,
-    wins: Vec<WindowCache>,
-    sources: Vec<Option<CompressedCache>>,
+    pub(crate) wins: Vec<WindowCache>,
+    pub(crate) sources: Vec<Option<CompressedCache>>,
 }
 
 pub struct Model {
@@ -203,7 +203,7 @@ impl Model {
             t.engram_rows = h.clone();
         }
         let tok = MxArray::from_uint32(ids, &[s])?;
-        let mut h = self
+        let h = self
             .embed
             .rows(&tok)?
             .astype(self.act)?
@@ -214,16 +214,49 @@ impl Model {
             .iter_mut()
             .step_by(hc as usize)
             .for_each(|v| *v = 1.0);
-        let mut pre_mix = MxArray::from_float32(&one_hot, &[s, hc])?;
+        let pre_mix = MxArray::from_float32(&one_hot, &[s, hc])?;
         let mut shared = ForwardShared::default();
-        for (l, blk) in self.blocks.iter().enumerate() {
+        let (h, pre_mix) = self.run_layers(
+            sess,
+            start,
+            hash.as_deref(),
+            0..self.cfg.n_layers,
+            (h, pre_mix),
+            &mut shared,
+            cancel,
+            trace,
+        )?;
+        let x = rms_norm(&hc_pre(&h, &pre_mix)?, &self.norm, self.cfg.norm_eps)?
+            .astype(DType::Float32)?;
+        fp32_site("head_input", self.cfg.n_layers, &x)?;
+        let logits = self.head_logits(&x)?;
+        MxArray::eval_arrays_with_context(&[&logits], "deepseek_v41 head")?;
+        sess.tokens = all;
+        Ok(logits)
+    }
+
+    /// Layers `layers` of one call at `start` on the stream `h` `[s, hc,
+    /// dim]` with `pre_mix` `[s, hc]`; `hash` holds the call's engram rows.
+    #[allow(clippy::too_many_arguments)]
+    fn run_layers(
+        &self,
+        sess: &mut Session,
+        start: usize,
+        hash: Option<&[u32]>,
+        layers: std::ops::Range<usize>,
+        (mut h, mut pre_mix): (MxArray, MxArray),
+        shared: &mut ForwardShared,
+        cancel: Option<&dyn Fn(usize) -> bool>,
+        mut trace: Option<&mut Trace>,
+    ) -> Result<(MxArray, MxArray)> {
+        for l in layers {
+            let blk = &self.blocks[l];
             if cancel.is_some_and(|c| c(l)) {
                 return Err(Error::from_reason(format!(
                     "deepseek_v41: cancelled before layer {l}"
                 )));
             }
-            if let (Some((e, eng)), Some(rows), Some(table)) =
-                (&self.engrams[l], &hash, &self.table)
+            if let (Some((e, eng)), Some(rows), Some(table)) = (&self.engrams[l], hash, &self.table)
             {
                 let n = self.hasher.as_ref().map_or(1, |x| x.n_layers());
                 let cols = self.hasher.as_ref().map_or(0, |x| x.n_cols());
@@ -238,7 +271,7 @@ impl Model {
                 _ => None,
             };
             let (x, pm, routes, scores) =
-                blk.forward(&h, start, &pre_mix, &mut sess.wins[l], src, &mut shared)?;
+                blk.forward(&h, start, &pre_mix, &mut sess.wins[l], src, shared)?;
             MxArray::eval_arrays_with_context(&[&x, &pm], "deepseek_v41 block")?;
             (h, pre_mix) = (x, pm);
             if let Some(t) = trace.as_deref_mut() {
@@ -262,13 +295,66 @@ impl Model {
                 }
             }
         }
-        let x = rms_norm(&hc_pre(&h, &pre_mix)?, &self.norm, self.cfg.norm_eps)?
-            .astype(DType::Float32)?;
-        fp32_site("head_input", self.cfg.n_layers, &x)?;
-        let logits = self.head_logits(&x)?;
-        MxArray::eval_arrays_with_context(&[&logits], "deepseek_v41 head")?;
-        sess.tokens = all;
-        Ok(logits)
+        Ok((h, pre_mix))
+    }
+
+    /// Test seam (layer groups vs oracle dumps): runs only `layers` of the
+    /// call `ids` on an injected stream `h` `[s, hc, dim]` (activation dtype)
+    /// and `pre_mix` `[s, hc]` (f32), with `shared` as handed down by the
+    /// earlier layers; KV sources outside `layers` must already hold this
+    /// call's state in `sess`. Returns the stream and the next pre-mix (no
+    /// head). A failed call restores the session.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_layers(
+        &self,
+        sess: &mut Session,
+        ids: &[u32],
+        layers: std::ops::Range<usize>,
+        h: MxArray,
+        pre_mix: MxArray,
+        mut shared: ForwardShared,
+        cancel: Option<&dyn Fn(usize) -> bool>,
+        mut trace: Option<&mut Trace>,
+    ) -> Result<(MxArray, MxArray)> {
+        let before = sess.clone();
+        let (s, start) = (ids.len() as i64, sess.tokens.len());
+        let (hc, dim) = (self.cfg.hc_mult as i64, self.cfg.dim as i64);
+        let want = [s, hc, dim];
+        if s == 0 || layers.is_empty() || layers.end > self.cfg.n_layers {
+            return Err(Error::from_reason(format!(
+                "deepseek_v41: layers {layers:?} for {s} ids"
+            )));
+        }
+        if h.shape()?.as_ref() != want || pre_mix.shape()?.as_ref() != [s, hc] {
+            return Err(Error::from_reason("deepseek_v41: injected stream shape"));
+        }
+        let mut all = sess.tokens.clone();
+        all.extend_from_slice(ids);
+        let hash = self.hasher.as_ref().map(|x| x.rows(&all, start));
+        if let (Some(t), Some(x)) = (trace.as_deref_mut(), &hash) {
+            t.engram_rows = x.clone();
+        }
+        let out = self.run_layers(
+            sess,
+            start,
+            hash.as_deref(),
+            layers,
+            (h, pre_mix),
+            &mut shared,
+            cancel,
+            trace,
+        );
+        match out {
+            Ok(v) => {
+                sess.tokens = all;
+                Ok(v)
+            }
+            Err(e) => {
+                *sess = before;
+                Err(e)
+            }
+        }
     }
 
     /// f32 logits of `x [s, dim]` (f32). A quantized head is dequantized

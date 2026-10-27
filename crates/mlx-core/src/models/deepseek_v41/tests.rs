@@ -426,3 +426,6 @@ fn real_header_inventory() {
 
 // S9 tiny end-to-end gates
 include!("tests_model.rs");
+
+// S13 real layer groups vs the S12 goldens
+include!("tests_groups.rs");

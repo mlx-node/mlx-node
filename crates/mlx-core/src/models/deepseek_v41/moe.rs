@@ -286,7 +286,13 @@ impl Moe {
         let g = self.w.gate.gather(&xe, &ids)?;
         let u = self.w.up.gather(&xe, &ids)?;
         let h = swiglu(&g, &u, self.limit, Some(&w), x.dtype()?)?;
-        self.w.down.gather(&h, &ids)?.reshape(&[rows, k, dim])
+        let out = self.w.down.gather(&h, &ids)?.reshape(&[rows, k, dim])?;
+        if self.w.stream.is_some() {
+            // the bank's slots may be refilled by the next fill: no lazy
+            // gather may outlive this call
+            MxArray::eval_arrays_with_context(&[&out], "deepseek_v41 routed gather")?;
+        }
+        Ok(out)
     }
 
     /// The shared expert (`Expert.forward` without weights) in `x`'s dtype.
