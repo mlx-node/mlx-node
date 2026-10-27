@@ -12,11 +12,12 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use napi::{Error, Result};
 
 use super::cache::{Cache, CacheMode, Source};
-use super::io::{Extent, IoPool, Priority, Read};
+use super::io::{Extent, IoPool, IoStats, Priority, Read, Ticket};
 use super::repack::SlotRepack;
 use crate::array::purgeable::{BankWatch, PurgeableBank, PurgeableState};
 use crate::array::{DType, MxArray};
@@ -60,21 +61,94 @@ pub struct BankStats {
     /// Staging copies moved into cache slots at turn ends (no read).
     pub promoted: usize,
     pub promote_ns: u64,
+    /// Time the caller was blocked waiting for reads (`ns` minus what
+    /// overlapped GPU work in a split step).
+    pub wait_ns: u64,
+    /// Layer steps whose reads overlapped GPU work (`prepare_split`), and
+    /// those among them whose overlapped pass also gathered ready experts.
+    pub split_steps: usize,
+    pub split_mixed: usize,
 }
 
 /// Where one layer step's experts are: `slots[i]` is the bank slot of
 /// `experts[i]`; `arrays` are the bank's (codes, scales) per projection.
+/// `reading` (sorted) = experts whose slots are still being read
+/// (`prepare_split` before `Pending::finish`).
 pub struct Prepared {
     pub layer: usize,
     pub experts: Vec<u32>,
     pub slots: Vec<u32>,
     pub arrays: Vec<(MxArray, MxArray)>,
     pub epoch: u64,
+    pub reading: Vec<u32>,
 }
 
 impl Prepared {
     pub fn slot(&self, e: u32) -> Option<u32> {
         self.experts.binary_search(&e).ok().map(|i| self.slots[i])
+    }
+
+    /// `e`'s slot is being read (no gather may use it before `finish`).
+    pub fn is_reading(&self, e: u32) -> bool {
+        self.reading.binary_search(&e).is_ok()
+    }
+}
+
+/// The reads of one `prepare_split` step. `finish` waits for them and
+/// publishes the slots; dropping it unfinished waits for them too and
+/// leaves the slots unpublished (staging tags cleared, victims released).
+pub struct Pending<'a> {
+    bank: &'a StagingBank,
+    ticket: Option<Ticket>,
+    layer: usize,
+    staging: Vec<u32>,
+    victims: Vec<(u32, u32)>,
+}
+
+impl Pending<'_> {
+    /// Blocks until every read is in, then tags the staging slots and
+    /// commits the victims. A failed read publishes nothing.
+    pub fn finish(mut self) -> Result<()> {
+        let Some(ticket) = self.ticket.take() else {
+            return Ok(());
+        };
+        let t = Instant::now();
+        let io = ticket.wait();
+        let waited = t.elapsed().as_nanos() as u64;
+        let bank = self.bank;
+        let mut g = lock(&bank.inner);
+        let io: IoStats = match io {
+            Ok(io) => io,
+            Err(err) => {
+                self.victims.iter().for_each(|&(_, c)| g.cache.release(c));
+                return Err(err);
+            }
+        };
+        for &e in &self.staging {
+            g.tags[e as usize] = Some((self.layer, e));
+        }
+        for &(e, c) in &self.victims {
+            g.cache.commit(c, self.layer, e);
+        }
+        drop(g);
+        let mut st = lock(&bank.stats);
+        st.fills += 1;
+        st.slots += self.staging.len() + self.victims.len();
+        st.bytes += io.bytes;
+        st.ns += io.ns;
+        st.wait_ns += waited;
+        Ok(())
+    }
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            // the slots stay unpublished: wait so no read outlives the step
+            drop(ticket);
+            let mut g = lock(&self.bank.inner);
+            self.victims.iter().for_each(|&(_, c)| g.cache.release(c));
+        }
     }
 }
 
@@ -93,6 +167,7 @@ pub struct StagingBank {
     layers: Vec<Vec<ExpertTensor>>,
     n_experts: usize,
     mode: CacheMode,
+    split: AtomicBool,
     inner: Mutex<Inner>,
     stats: Mutex<BankStats>,
     /// Test hook: no reads (a gather then meets stale tags).
@@ -195,6 +270,7 @@ impl StagingBank {
             layers,
             n_experts: n,
             mode,
+            split: AtomicBool::new(false),
             stats: Mutex::new(BankStats::default()),
             skip_fill: AtomicBool::new(false),
             #[cfg(test)]
@@ -448,6 +524,26 @@ impl StagingBank {
         uses: &[u32],
         decode: bool,
     ) -> Result<Prepared> {
+        let (mut p, pending) = self.prepare_split(layer, experts, uses, decode)?;
+        if let Some(pending) = pending {
+            pending.finish()?;
+        }
+        p.reading.clear();
+        Ok(p)
+    }
+
+    /// `prepare` that returns once the reads are queued: `Prepared.reading`
+    /// lists the experts still being read and the `Pending` (None when
+    /// nothing is read) must be finished before a gather uses their slots.
+    /// Gathers on the other slots may run meanwhile: the reads write only
+    /// slots no gather of this step or an unfinished earlier one uses.
+    pub fn prepare_split(
+        &self,
+        layer: usize,
+        experts: &[u32],
+        uses: &[u32],
+        decode: bool,
+    ) -> Result<(Prepared, Option<Pending<'_>>)> {
         let mut g = lock(&self.inner);
         self.check_step(&g, layer, experts)?;
         if !uses.is_empty() && uses.len() != experts.len() {
@@ -486,6 +582,8 @@ impl StagingBank {
                 }
             });
         }
+        let mut pending = None;
+        let mut reading = Vec::new();
         if self.skip_fill.load(Ordering::Relaxed) {
             victims.iter().for_each(|&(_, c)| g.cache.release(c));
         } else if !staging.is_empty() || !victims.is_empty() {
@@ -499,31 +597,38 @@ impl StagingBank {
             for &(e, c) in &victims {
                 self.reads(&g, layer, e, (n + c) as usize, &mut reads)?;
             }
-            let io = match self.submit(reads) {
-                Ok(io) => io,
+            // SAFETY: every slot read is untagged (staging) or an unmapped
+            // victim (cache), so no gather passes the slot checks on it until
+            // `Pending::finish`; earlier GPU work was drained above, and a
+            // `Pending` (finished or dropped) waits for the batch before the
+            // bank can be used for another step.
+            let ticket = match unsafe { self.pool.submit(reads, Priority::High) } {
+                Ok(t) => t,
                 Err(err) => {
                     victims.iter().for_each(|&(_, c)| g.cache.release(c));
                     return Err(err);
                 }
             };
-            for &e in &staging {
-                g.tags[e as usize] = Some((layer, e));
-            }
-            for &(e, c) in &victims {
-                g.cache.commit(c, layer, e);
-            }
-            let mut st = lock(&self.stats);
-            st.fills += 1;
-            st.slots += staging.len() + victims.len();
-            st.bytes += io.bytes;
-            st.ns += io.ns;
+            reading = staging
+                .iter()
+                .chain(victims.iter().map(|(e, _)| e))
+                .copied()
+                .collect();
+            reading.sort_unstable();
+            pending = Some(Pending {
+                bank: self,
+                ticket: Some(ticket),
+                layer,
+                staging,
+                victims,
+            });
         }
         {
             let mut st = lock(&self.stats);
             st.uses += experts.len();
             st.hits += hits;
         }
-        Ok(Prepared {
+        let p = Prepared {
             layer,
             experts: experts.to_vec(),
             slots,
@@ -533,7 +638,53 @@ impl StagingBank {
                 .map(|p| (p.w.array().clone(), p.s.array().clone()))
                 .collect(),
             epoch,
-        })
+            reading,
+        };
+        Ok((p, pending))
+    }
+
+    /// Counts one step whose reads overlapped GPU work (`mixed`: ready
+    /// experts were gathered meanwhile, not only the shared expert).
+    pub fn note_split(&self, mixed: bool) {
+        let mut st = lock(&self.stats);
+        st.split_steps += 1;
+        st.split_mixed += usize::from(mixed);
+    }
+
+    /// Whether decode steps overlap their reads with the gathers of the
+    /// slots they already hold (`MLX_DSV41_SPLIT`, stage P3).
+    pub fn split(&self) -> bool {
+        self.split.load(Ordering::Relaxed)
+    }
+
+    pub fn set_split(&self, on: bool) {
+        self.split.store(on, Ordering::Relaxed);
+    }
+
+    /// Test hook: forgets every staging tag and cache entry (as an `Empty`
+    /// bank), so the next steps read every expert again.
+    #[cfg(test)]
+    pub fn test_forget_all(&self) {
+        self.test_forget_where(|_, _| true);
+    }
+
+    /// Test hook: forgets the staging tags and cache entries of the
+    /// `(layer, expert)` pairs `f` picks (their next use is a read).
+    #[cfg(test)]
+    pub fn test_forget_where(&self, f: impl Fn(usize, u32) -> bool) {
+        let mut g = lock(&self.inner);
+        crate::array::synchronize();
+        for t in g.tags.iter_mut() {
+            if t.is_some_and(|(l, e)| f(l, e)) {
+                *t = None;
+            }
+        }
+        let gone: Vec<u32> = (0..g.cache.slots() as u32)
+            .filter(|&s| g.cache.occ(s).is_some_and(|(l, e)| f(l, e)))
+            .collect();
+        for s in gone {
+            g.cache.release(s);
+        }
     }
 
     /// The gathers of step `epoch` (and every earlier one) are evaluated.
@@ -545,17 +696,30 @@ impl StagingBank {
     /// expert of `p.layer`: a gather on a stale slot would compute with
     /// another layer's (or discarded) weights.
     pub fn assert_slots(&self, p: &Prepared) {
+        self.assert_slots_where(p, |_| true);
+    }
+
+    /// `assert_slots` for the experts not in `p.reading`.
+    pub fn assert_ready_slots(&self, p: &Prepared) {
+        self.assert_slots_where(p, |e| !p.is_reading(e));
+    }
+
+    fn assert_slots_where(&self, p: &Prepared, check: impl Fn(u32) -> bool) {
         let n = self.n_experts as u32;
         let stale = {
             let g = lock(&self.inner);
-            p.experts.iter().zip(&p.slots).find_map(|(&e, &s)| {
-                let held = if s < n {
-                    (s == e).then(|| g.tags[s as usize]).flatten()
-                } else {
-                    g.cache.occ(s - n)
-                };
-                (held != Some((p.layer, e))).then_some((e, s, held))
-            })
+            p.experts
+                .iter()
+                .zip(&p.slots)
+                .filter(|(e, _)| check(**e))
+                .find_map(|(&e, &s)| {
+                    let held = if s < n {
+                        (s == e).then(|| g.tags[s as usize]).flatten()
+                    } else {
+                        g.cache.occ(s - n)
+                    };
+                    (held != Some((p.layer, e))).then_some((e, s, held))
+                })
         };
         assert!(
             stale.is_none(),

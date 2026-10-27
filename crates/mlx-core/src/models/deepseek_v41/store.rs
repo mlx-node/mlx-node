@@ -107,6 +107,20 @@ pub fn cache_mode_from_env() -> Result<CacheMode> {
     }
 }
 
+/// Decode steps overlap expert reads with GPU work (stage P3): `on`
+/// (default) | `off`.
+pub const SPLIT_ENV: &str = "MLX_DSV41_SPLIT";
+
+/// `MLX_DSV41_SPLIT`; unset or empty = on (DECISIONS P3); anything else
+/// than on / off is refused.
+pub fn split_from_env() -> Result<bool> {
+    match std::env::var(SPLIT_ENV).ok().as_deref().map(str::trim) {
+        None | Some("") | Some("on") => Ok(true),
+        Some("off") => Ok(false),
+        Some(v) => Err(bad(format!("{SPLIT_ENV}={v}: want on or off"))),
+    }
+}
+
 /// What one Q8_0 tensor becomes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Form {
@@ -446,6 +460,7 @@ impl Store {
             cache_slots,
             cache_mode,
         )?);
+        bank.set_split(split_from_env()?);
         let bank_alloc_s = t_bank.elapsed().as_secs_f64();
         let (mut dense_read, mut dense_bytes) = (0u64, 0u64);
         let mut buf = AlignedBuf::new();

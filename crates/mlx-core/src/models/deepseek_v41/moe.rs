@@ -319,19 +319,7 @@ impl Moe {
         match &self.w.experts {
             Experts::Resident(banks) => run(banks, &ids),
             Experts::Stream(st) => {
-                let mut sorted = ids.clone();
-                sorted.sort_unstable();
-                let (mut used, mut uses) = (Vec::new(), Vec::<u32>::new());
-                for e in sorted {
-                    if used.last() == Some(&e) {
-                        if let Some(c) = uses.last_mut() {
-                            *c += 1;
-                        }
-                    } else {
-                        used.push(e);
-                        uses.push(1);
-                    }
-                }
+                let (used, uses) = distinct_uses(&ids);
                 let p = st.prepare(self.layer, &used, &uses, decode_step(rows as usize))?;
                 st.assert_slots(&p);
                 let slot_ids: Vec<u32> = ids
@@ -372,19 +360,137 @@ impl Moe {
     /// dtype. Also returns the routes.
     pub fn forward(&self, x: &MxArray) -> Result<(MxArray, Routes)> {
         let routes = self.route(x)?;
-        let r = self.routed(x, &routes)?;
         let (rows, dim) = (x.shape_at(0)?, x.shape_at(1)?);
+        let (cols, shared) = match &self.w.experts {
+            Experts::Stream(st) if st.split() && rows == 1 => self.split_step(x, &routes, st)?,
+            _ => {
+                let r = self.routed(x, &routes)?;
+                let cols = (0..self.k as i64)
+                    .map(|j| {
+                        r.slice(&[0, j, 0], &[rows, j + 1, dim])?
+                            .reshape(&[rows, dim])
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (cols, self.shared(x)?)
+            }
+        };
         let mut y = MxArray::zeros(&[rows, dim], Some(DType::Float32))?;
-        for j in 0..self.k as i64 {
-            let col = r
-                .slice(&[0, j, 0], &[rows, j + 1, dim])?
-                .reshape(&[rows, dim])?;
+        for col in &cols {
             y = y.add(&col.astype(DType::Float32)?)?;
         }
-        y = y.add(&self.shared(x)?.astype(DType::Float32)?)?;
+        y = y.add(&shared.astype(DType::Float32)?)?;
         super::model::fp32_site("moe_sum", usize::MAX, &y)?;
         Ok((y.astype(x.dtype()?)?, routes))
     }
+
+    /// One decode row (stage P3): queue the reads of the missed experts,
+    /// run pass A (shared expert + the experts whose slots are ready) on the
+    /// GPU while they land, then pass B (the missed experts). Each (row, k)
+    /// output is its own `gather_qmv` (S8-4: batch-independent), so the
+    /// columns, returned in ascending expert id, equal `routed`'s bitwise.
+    fn split_step(
+        &self,
+        x: &MxArray,
+        routes: &Routes,
+        st: &StagingBank,
+    ) -> Result<(Vec<MxArray>, MxArray)> {
+        let dim = x.shape_at(1)?;
+        if routes.k != self.k || routes.rows() != 1 || routes.ids.len() != self.k {
+            return Err(bad(format!(
+                "split step: routes for {} rows x {}, want 1 x {}",
+                routes.rows(),
+                routes.k,
+                self.k
+            )));
+        }
+        let n = self.n_experts as u32;
+        if routes.ids.iter().any(|&e| e >= n) {
+            return Err(bad("split step: expert id out of range"));
+        }
+        let (ids, w) = routes.by_expert();
+        let (used, uses) = distinct_uses(&ids);
+        let (p, pending) = st.prepare_split(self.layer, &used, &uses, true)?;
+        let xe = x.reshape(&[1, 1, 1, dim])?;
+        let pass = |cols: &[usize]| -> Result<Option<MxArray>> {
+            if cols.is_empty() {
+                return Ok(None);
+            }
+            let m = cols.len() as i64;
+            let slot_ids = cols
+                .iter()
+                .map(|&j| {
+                    p.slot(ids[j])
+                        .ok_or_else(|| bad(format!("expert {} not prepared", ids[j])))
+                })
+                .collect::<Result<Vec<u32>>>()?;
+            let sw: Vec<f32> = cols.iter().map(|&j| w[j]).collect();
+            let sw = MxArray::from_float32(&sw, &[1, m, 1, 1])?;
+            let sid = MxArray::from_uint32(&slot_ids, &[1, m])?;
+            let bank = |i: usize| ExpertBank {
+                weight: p.arrays[i].0.clone(),
+                scales: p.arrays[i].1.clone(),
+            };
+            let g = bank(0).gather(&xe, &sid)?;
+            let u = bank(1).gather(&xe, &sid)?;
+            let h = swiglu(&g, &u, self.limit, Some(&sw), x.dtype()?)?;
+            Ok(Some(bank(2).gather(&h, &sid)?.reshape(&[1, m, dim])?))
+        };
+        let (ready, late): (Vec<usize>, Vec<usize>) =
+            (0..self.k).partition(|&j| !p.is_reading(ids[j]));
+        let shared = self.shared(x)?;
+        st.assert_ready_slots(&p);
+        let a = pass(&ready)?;
+        if let Some(pending) = pending {
+            let mut first: Vec<&MxArray> = vec![&shared];
+            first.extend(a.as_ref());
+            MxArray::async_eval_arrays(&first);
+            st.note_split(a.is_some());
+            pending.finish()?;
+        }
+        st.assert_slots(&p);
+        let b = pass(&late)?;
+        let mut all: Vec<&MxArray> = vec![&shared];
+        all.extend(a.as_ref());
+        all.extend(b.as_ref());
+        // slots may be refilled or evicted by the next step: no lazy gather
+        // may outlive this call
+        MxArray::eval_arrays_with_context(&all, "deepseek_v41 split gather")?;
+        st.done(p.epoch);
+        let mut cols = Vec::with_capacity(self.k);
+        for j in 0..self.k {
+            let (src, at) = match ready.binary_search(&j) {
+                Ok(i) => (&a, i),
+                Err(_) => (&b, late.binary_search(&j).unwrap_or(0)),
+            };
+            let src = src
+                .as_ref()
+                .ok_or_else(|| bad("split step: missing pass output"))?;
+            let at = at as i64;
+            cols.push(
+                src.slice(&[0, at, 0], &[1, at + 1, dim])?
+                    .reshape(&[1, dim])?,
+            );
+        }
+        Ok((cols, shared))
+    }
+}
+
+/// Distinct sorted experts of `ids` and how many entries use each.
+fn distinct_uses(ids: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    let mut sorted = ids.to_vec();
+    sorted.sort_unstable();
+    let (mut used, mut uses) = (Vec::new(), Vec::<u32>::new());
+    for e in sorted {
+        if used.last() == Some(&e) {
+            if let Some(c) = uses.last_mut() {
+                *c += 1;
+            }
+        } else {
+            used.push(e);
+            uses.push(1);
+        }
+    }
+    (used, uses)
 }
 
 #[cfg(test)]

@@ -21,6 +21,8 @@ pub struct Counters {
     pub fill_bytes: u64,
     /// Experts read into slots (misses; all projections of one counted once).
     pub fill_slots: u64,
+    /// Time blocked on expert reads (< `fill_ns` when reads overlap GPU work).
+    pub fill_wait_ns: u64,
     /// Expert uses (distinct experts per layer step) and cache hits among them.
     pub uses: u64,
     pub hits: u64,
@@ -36,6 +38,7 @@ impl Counters {
             fill_ns: b.ns,
             fill_bytes: b.bytes,
             fill_slots: b.slots as u64,
+            fill_wait_ns: b.wait_ns,
             uses: b.uses as u64,
             hits: b.hits as u64,
         }
@@ -49,6 +52,7 @@ impl Counters {
             fill_ns: self.fill_ns - before.fill_ns,
             fill_bytes: self.fill_bytes - before.fill_bytes,
             fill_slots: self.fill_slots - before.fill_slots,
+            fill_wait_ns: self.fill_wait_ns - before.fill_wait_ns,
             uses: self.uses - before.uses,
             hits: self.hits - before.hits,
         }
@@ -181,6 +185,7 @@ pub fn line(
         "read_gbps": c.fill_bytes as f64 / 1e9 / io_s.max(1e-9),
         "t_c_ms": (wall_s - io_s - eng_s) * 1e3 / toks,
         "t_io_ms": io_s * 1e3 / toks,
+        "t_io_wait_ms": c.fill_wait_ns as f64 * 1e-6 / toks,
         "t_engram_ms": eng_s * 1e3 / toks,
         "t_router_wait_ms": c.router_ns as f64 * 1e-6 / toks,
         "bytes_read_total": bytes_read_total,

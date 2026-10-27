@@ -498,6 +498,33 @@ fn seeded_turn_end_promotes_valid_staging_copies() {
     assert!(l.promote_staged(&|_, _| true).is_empty());
 }
 
+/// Turn-end promotion with more valid staging copies than cache slots keeps
+/// the most recently used ones (P2 codex finding: it kept the oldest).
+#[test]
+fn seeded_promotion_over_capacity_keeps_newest() {
+    let mut c = Cache::lru(2, 1, 8).with_mode(CacheMode::Seeded);
+    let (e1, src) = c.plan_step(0, &[1, 2], &[], true, &|_| false);
+    for (s, e) in src.iter().zip([1, 2]) {
+        if let Source::Victim(v) = *s {
+            c.commit(v, 0, e);
+        }
+    }
+    c.complete(e1);
+    // staging serves 3, then 4, then 5 (cache full of 1, 2: no victims
+    // eligible while 1, 2 are wanted, so they go to staging)
+    for e in [3u32, 4, 5] {
+        let (ep, src) = c.plan_step(0, &[1, 2, e], &[], true, &|_| true);
+        assert_eq!(src[2], Source::Staging, "{e}");
+        c.complete(ep);
+    }
+    let moved = c.promote_staged(&|_, _| true);
+    assert_eq!(
+        moved.iter().map(|m| (m.1, m.2)).collect::<Vec<_>>(),
+        vec![(0, 4), (0, 5)]
+    );
+    c.check().unwrap();
+}
+
 /// A `Seeded` prefill seed takes a free slot or one of its own layer's
 /// residents (LRU among them), never another layer's: the same prefill pass
 /// may still hit those.

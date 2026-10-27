@@ -240,6 +240,60 @@ fn tiny_cache_bitwise_any_size() {
     }
 }
 
+/// Stage P3: decode steps that overlap their reads with pass A (shared
+/// expert + ready experts) give logits bitwise equal to the unsplit step,
+/// for staging only and cache sizes 6 / 64 under both cache rules; the
+/// split path ran with ready experts in pass A (S = 64) and without (S = 0).
+#[test]
+fn tiny_cache_split_bitwise() {
+    let npz = Npz::open("oracle.npz");
+    for mode in ["fp32_on", "bf16_on"] {
+        for (slots, cm) in [0, 6, 64]
+            .into_iter()
+            .flat_map(|s| [(s, CacheMode::Seeded), (s, CacheMode::Lru)])
+        {
+            let off = cached_store_in(mode, slots, cm);
+            let on = cached_store_in(mode, slots, cm);
+            off.bank.set_split(false);
+            on.bank.set_split(true);
+            for case in ["c1", "c2", "c3"] {
+                let ids = case_ids(&npz, case);
+                let (a, _) = run(&off.model, &ids, &split(case));
+                let (b, _) = run(&on.model, &ids, &split(case));
+                assert_eq!(
+                    bits(&b),
+                    bits(&a),
+                    "{mode} S={slots} {cm:?} {case}: split != unsplit"
+                );
+            }
+            let (so, sn) = (off.bank.stats(), on.bank.stats());
+            assert_eq!(so.split_steps, 0, "{mode} S={slots}: split off still split");
+            assert_eq!(
+                (so.uses, so.hits, so.slots),
+                (sn.uses, sn.hits, sn.slots),
+                "{mode} S={slots} {cm:?}: split changed the cache decisions"
+            );
+            assert!(sn.split_steps > 0, "{mode} S={slots} {cm:?}: no split step");
+            if slots == 64 {
+                assert!(
+                    sn.split_mixed > 0,
+                    "{mode} S=64 {cm:?}: pass A never had ready experts"
+                );
+            }
+            on.bank.with_cache_dir(|c| c.check()).unwrap();
+            pool_ok(mode);
+            println!(
+                "{mode} S={slots} {cm:?}: bitwise; split steps {} (mixed {}), reads {}, wait {} us of io {} us",
+                sn.split_steps,
+                sn.split_mixed,
+                sn.slots,
+                sn.wait_ns / 1000,
+                sn.ns / 1000
+            );
+        }
+    }
+}
+
 /// `MLX_DSV41_TEST_FORCE_EMPTY` hook: the bank is `Empty` between turn 1
 /// and turn 2; turn 2 forgets every slot, re-reads, and its logits are
 /// bitwise those of a store whose bank stayed (volatile, not purged).

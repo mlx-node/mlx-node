@@ -72,6 +72,7 @@ fn s16_decode_terms(c: &Counters, wall: f64, n: usize) -> Value {
         "t_tok_s": wall / n,
         "t_c_s": (wall - io - eng) / n,
         "t_io_s": io / n,
+        "t_io_wait_s": c.fill_wait_ns as f64 * 1e-9 / n,
         "t_engram_s": eng / n,
         "t_router_s": router / n,
         "bw_bytes_s": c.fill_bytes as f64 / io.max(1e-9),
@@ -91,6 +92,7 @@ fn s16_sum(a: &Counters, b: &Counters) -> Counters {
         fill_ns: a.fill_ns + b.fill_ns,
         fill_bytes: a.fill_bytes + b.fill_bytes,
         fill_slots: a.fill_slots + b.fill_slots,
+        fill_wait_ns: a.fill_wait_ns + b.fill_wait_ns,
         uses: a.uses + b.uses,
         hits: a.hits + b.hits,
     }
@@ -554,4 +556,142 @@ fn real_admit_dry_run() {
     }
     let active = crate::array::get_active_memory();
     assert!(active < S16_GIB, "dry run allocated {active} B");
+}
+
+/// Stage P3 timing: split (reads overlap pass A) vs unsplit decode of one
+/// token at a fixed state, all-hit (its experts cached), mixed (~30 % of
+/// the (layer, expert) pairs forgotten first, about the auto budget's decode
+/// h) and all-miss (every tag and cache entry forgotten first), interleaved
+/// per rep (ABBA). After
+/// the p32k8-en prompt at the S15 auto admission, the session is cloned and
+/// the same greedy token decoded again each time: every logits row must be
+/// bitwise equal (split on/off, hit/miss). `DSV41_SPLIT_REPS` (default 6).
+#[test]
+#[ignore = "real 9 shards + S12 goldens; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=<N_auto>; ~18 GiB + N_auto, ~4.5 GB read per all-miss token"]
+fn real_split_timing() {
+    assert!(s16_env(CACHE_ENV).is_some(), "{CACHE_ENV} = N_auto (cap)");
+    let reps: usize = s16_env("DSV41_SPLIT_REPS").map_or(6, |v| v.parse().unwrap());
+    let gd = gold("p32k8-en");
+    let limits = Limits::from_env().unwrap();
+    let store = s16_store(CachePlan::Admit(limits));
+    let vocab = store.model.cfg.vocab_size;
+    store.begin_turn().unwrap();
+    let mut sess = store.model.new_session();
+    let logits = store.model.forward(&mut sess, &gd.prompt, None, None).unwrap();
+    let v = read(&logits);
+    let tok = super::generate::argmax(&v[v.len() - vocab..]);
+    let base = sess.clone();
+    let step = |on: bool| -> (f64, String, crate::moe_stream::bank::BankStats) {
+        store.bank.set_split(on);
+        let mut s = base.clone();
+        let b0 = store.bank.stats();
+        let t0 = std::time::Instant::now();
+        let l = store.model.forward(&mut s, &[tok], None, None).unwrap();
+        let row = read(&l);
+        let dt = t0.elapsed().as_secs_f64();
+        let b = store.bank.stats();
+        let d = crate::moe_stream::bank::BankStats {
+            uses: b.uses - b0.uses,
+            hits: b.hits - b0.hits,
+            slots: b.slots - b0.slots,
+            bytes: b.bytes - b0.bytes,
+            ns: b.ns - b0.ns,
+            wait_ns: b.wait_ns - b0.wait_ns,
+            split_steps: b.split_steps - b0.split_steps,
+            split_mixed: b.split_mixed - b0.split_mixed,
+            ..Default::default()
+        };
+        (dt, hex_sha(&row[row.len() - vocab..]), d)
+    };
+    // warm: every expert of this token read into the cache (none left to a
+    // staging copy, so all-hit means cache hits only)
+    store.bank.test_forget_all();
+    let (_, want, _) = step(false);
+    let mut fails = Vec::new();
+    let mut rows: Vec<Value> = Vec::new();
+    let mut t: std::collections::BTreeMap<(&str, bool), Vec<f64>> = Default::default();
+    for r in 0..reps {
+        let order = if r % 2 == 0 { [false, true] } else { [true, false] };
+        for kind in ["hit", "mixed", "miss"] {
+            for on in order {
+                match kind {
+                    "miss" => store.bank.test_forget_all(),
+                    "mixed" => store
+                        .bank
+                        .test_forget_where(|l, e| (l * 131 + e as usize * 7) % 10 < 3),
+                    _ => {}
+                }
+                let (dt, h, d) = step(on);
+                if h != want {
+                    fails.push(format!("rep {r} {kind} split={on}: logits {h} != {want}"));
+                }
+                let ok = match kind {
+                    "hit" => d.slots == 0 && d.hits == d.uses,
+                    "mixed" => d.slots > 0 && d.hits > 0 && d.hits + d.slots <= d.uses,
+                    _ => d.slots == d.uses && d.hits == 0,
+                };
+                if !ok {
+                    fails.push(format!(
+                        "rep {r} {kind} split={on}: uses {} hits {} reads {} (not all-{kind})",
+                        d.uses, d.hits, d.slots
+                    ));
+                }
+                if on != (d.split_steps > 0) && kind != "hit" {
+                    fails.push(format!("rep {r} miss split={on}: {} split steps", d.split_steps));
+                }
+                t.entry((kind, on)).or_default().push(dt);
+                rows.push(serde_json::json!({
+                    "rep": r, "kind": kind, "split": on, "s": dt, "uses": d.uses, "hits": d.hits,
+                    "reads": d.slots, "bytes": d.bytes, "io_ms": d.ns as f64 * 1e-6,
+                    "wait_ms": d.wait_ns as f64 * 1e-6, "split_steps": d.split_steps,
+                    "split_mixed": d.split_mixed,
+                }));
+                println!(
+                    "p3 rep {r} {kind:4} split={:<5} {:.1} ms ({:.2} tok/s) reads {} io {:.1} ms wait {:.1} ms split steps {}",
+                    on,
+                    dt * 1e3,
+                    1.0 / dt,
+                    d.slots,
+                    d.ns as f64 * 1e-6,
+                    d.wait_ns as f64 * 1e-6,
+                    d.split_steps
+                );
+            }
+        }
+    }
+    store.end_turn().unwrap();
+    let med = |k: &str, on: bool| s16_median(&t[&(k, on)]);
+    let mut summary = serde_json::Map::new();
+    for kind in ["hit", "mixed", "miss"] {
+        let (off, on) = (med(kind, false), med(kind, true));
+        println!(
+            "p3 {kind}: median off {:.1} ms ({:.3} tok/s) on {:.1} ms ({:.3} tok/s) -> {:+.2} %",
+            off * 1e3,
+            1.0 / off,
+            on * 1e3,
+            1.0 / on,
+            (off / on - 1.0) * 100.0
+        );
+        summary.insert(
+            kind.into(),
+            serde_json::json!({"off_s": off, "on_s": on, "off_tok_s": 1.0 / off, "on_tok_s": 1.0 / on,
+                "gain_pct": (off / on - 1.0) * 100.0}),
+        );
+    }
+    let out = serde_json::json!({
+        "cache_slots": store.cache_slots(),
+        "token": tok,
+        "hash": want,
+        "reps": reps,
+        "summary": summary,
+        "rows": rows,
+    });
+    if let Some(dir) = s16_env("DSV41_CACHE_OUT") {
+        std::fs::write(
+            PathBuf::from(dir).join("p3-split.json"),
+            serde_json::to_vec_pretty(&out).unwrap(),
+        )
+        .unwrap();
+    }
+    finish("real_split_timing", &fails);
 }

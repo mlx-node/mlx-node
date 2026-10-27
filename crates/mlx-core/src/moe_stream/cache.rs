@@ -227,7 +227,8 @@ impl Cache {
 
     /// Turn end (`Seeded`; all GPU work complete): every `(layer, e)` this turn
     /// served from staging that `valid` says its staging slot still holds and
-    /// the cache does not, gets a victim, most recently used last. Returns
+    /// the cache does not, gets a victim, most recently used last (the most
+    /// recent `slots` of them when more are valid). Returns
     /// `(slot, layer, e)` per placement, already mapped: the caller copies
     /// staging slot `e` into cache slot `slot` before any gather.
     pub fn promote_staged(&mut self, valid: &dyn Fn(usize, u32) -> bool) -> Vec<(u32, usize, u32)> {
@@ -244,13 +245,17 @@ impl Cache {
             return out;
         }
         used.sort_unstable();
+        let n = self.n_experts;
+        used.retain(|&(_, k)| {
+            self.lookup(k / n, (k % n) as u32).is_none() && valid(k / n, (k % n) as u32)
+        });
+        // each placement is a victim of this epoch: at most `slots` fit, so
+        // keep the most recently used ones
+        let drop = used.len().saturating_sub(self.occ.len());
         self.epoch += 1;
         let epoch = self.epoch;
-        for (_, k) in used {
-            let (layer, e) = (k / self.n_experts, (k % self.n_experts) as u32);
-            if self.lookup(layer, e).is_some() || !valid(layer, e) {
-                continue;
-            }
+        for (_, k) in used.drain(drop..) {
+            let (layer, e) = (k / n, (k % n) as u32);
             let Some(v) = self.victim(layer, &[]) else {
                 break;
             };

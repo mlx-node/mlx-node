@@ -279,6 +279,10 @@ impl Inner {
             );
             obj.insert("decode_t_c_ms".into(), ((wall - io - eng) * 1e3 / n).into());
             obj.insert("decode_t_io_ms".into(), (io * 1e3 / n).into());
+            obj.insert(
+                "decode_t_io_wait_ms".into(),
+                (d.fill_wait_ns as f64 * 1e-6 / n).into(),
+            );
             obj.insert("decode_t_engram_ms".into(), (eng * 1e3 / n).into());
             obj.insert(
                 "decode_t_router_wait_ms".into(),
