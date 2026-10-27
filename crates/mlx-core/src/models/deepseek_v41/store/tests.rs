@@ -751,4 +751,31 @@ fn tiny_qmm_dense_ops() {
         );
     }
     assert!(q8.grouped_qmm_t(&xg, ng).unwrap().is_none());
+    // P0 codex: bf16 activations round wo_a to bf16 (reference) on every form;
+    // f32 activations take the Qmm product
+    use crate::models::deepseek_v41::attention::grouped_wo_a;
+    let width = k;
+    let lora = per;
+    let bf = grouped_wo_a(&qmm, &xg, ng, lora, width, DType::BFloat16).unwrap();
+    let bf_exact = grouped_wo_a(&q8, &xg, ng, lora, width, DType::BFloat16).unwrap();
+    assert_eq!(
+        bits(&read(&bf)),
+        bits(&read(&bf_exact)),
+        "bf16 wo_a rounding"
+    );
+    let f = grouped_wo_a(&qmm, &xg, ng, lora, width, DType::Float32).unwrap();
+    assert_eq!(bits(&read(&f)), bits(&grouped), "f32 Qmm wo_a");
+    // P0 codex: header-derived resident sizes are checked
+    let mut huge = info.clone();
+    huge.dims = vec![32, 1u64 << 59];
+    for mode in [
+        DenseMode::Exact,
+        DenseMode::F32,
+        DenseMode::Q8,
+        DenseMode::Mixed,
+    ] {
+        assert!(mode.resident(&huge).is_err(), "{mode:?} overflow");
+    }
+    huge.dims = vec![32, 1u64 << 57];
+    assert!(DenseMode::F32.resident(&huge).is_err(), "f32 4n overflow");
 }

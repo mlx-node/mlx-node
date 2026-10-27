@@ -851,6 +851,7 @@ module.exports.ChatSessionCall = nativeBinding.ChatSessionCall;
 module.exports.ChatStreamHandle = nativeBinding.ChatStreamHandle;
 module.exports.ClefCancellation = nativeBinding.ClefCancellation;
 module.exports.ClefModel = nativeBinding.ClefModel;
+module.exports.DeepseekV41Model = nativeBinding.DeepseekV41Model;
 module.exports.DocLayoutModel = nativeBinding.DocLayoutModel;
 module.exports.PPDocLayoutV3Model = nativeBinding.PPDocLayoutV3Model;
 module.exports.DocOrientationModel = nativeBinding.DocOrientationModel;

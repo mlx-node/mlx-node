@@ -4,6 +4,7 @@
 pub mod attention;
 pub mod block;
 pub mod cache;
+pub mod chat;
 pub mod compressor;
 pub mod config;
 pub mod engram;

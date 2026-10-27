@@ -438,3 +438,6 @@ include!("tests_compute.rs");
 
 // S16b real cache invariance, auto admission, Empty on real data
 include!("tests_cache.rs");
+
+// S17 product chat lane (tiny + real).
+include!("tests_chat.rs");

@@ -152,12 +152,13 @@ impl DenseMode {
         if t.tensor_type != GgufTensorType::Q8_0 {
             return t.data_size();
         }
-        let n: u64 = t.dims.iter().product();
-        Ok(match self.form(&t.name) {
-            Form::Codes => n + n / 16,
-            Form::F32 => 4 * n,
-            Form::Qmm => n + n / 4,
-        })
+        let n = t.num_elements()?;
+        let r = match self.form(&t.name) {
+            Form::Codes => n.checked_add(n / 16),
+            Form::F32 => n.checked_mul(4),
+            Form::Qmm => n.checked_add(n / 4),
+        };
+        r.ok_or_else(|| bad(format!("{}: resident size overflows u64", t.name)))
     }
 }
 
@@ -670,11 +671,13 @@ fn scan(paths: &[PathBuf], mode: DenseMode) -> Result<Scan> {
         .iter()
         .map(|t| t.info.data_size())
         .sum::<Result<u64>>()?;
-    let dense_resident: u64 = where_
+    let dense_resident = where_
         .values()
         .filter(|(_, _, t)| is_dense(&t.name))
-        .map(|(_, _, t)| mode.resident(t))
-        .sum::<Result<u64>>()?;
+        .try_fold(0u64, |acc, (_, _, t)| {
+            acc.checked_add(mode.resident(t)?)
+                .ok_or_else(|| bad("dense resident bytes overflow u64"))
+        })?;
     let n_experts = cfg.n_routed_experts as u64;
     let size = ModelSize {
         dense: dense_resident,

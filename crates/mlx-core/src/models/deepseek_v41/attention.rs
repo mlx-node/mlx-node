@@ -227,21 +227,7 @@ impl WindowAttention {
         let width = self.n_heads * self.head_dim / g;
         let o = self.quant_o(&o.reshape(&[s, g, width])?)?;
         let o = o.astype(DType::Float32)?.transpose(Some(&[1, 0, 2]))?;
-        // a `Qmm` wo_a is not rounded to the activation dtype first (D-41 (b))
-        let y = match self.w.wo_a.grouped_qmm_t(&o, g)? {
-            Some(y) => y,
-            None => {
-                let wa = self
-                    .w
-                    .wo_a
-                    .f32()?
-                    .astype(act)?
-                    .astype(DType::Float32)?
-                    .reshape(&[g, self.o_lora, width])?
-                    .transpose(Some(&[0, 2, 1]))?;
-                o.matmul(&wa)?
-            }
-        };
+        let y = grouped_wo_a(&self.w.wo_a, &o, g, self.o_lora, width, act)?;
         let y = y
             .transpose(Some(&[1, 0, 2]))?
             .reshape(&[s, g * self.o_lora])?
@@ -561,6 +547,32 @@ impl CompressedAttention {
         }
         Ok((out, scores))
     }
+}
+
+/// `o [g, s, width] (f32) @ wo_a_i^T` per group. A `Qmm` weight skips the
+/// reference's activation-dtype rounding of wo_a, so it serves f32
+/// activations only (rounding to f32 is the identity); other activation
+/// dtypes take the rounded f32 weight.
+pub(crate) fn grouped_wo_a(
+    wo_a: &Dense,
+    o: &MxArray,
+    g: i64,
+    o_lora: i64,
+    width: i64,
+    act: DType,
+) -> Result<MxArray> {
+    if act == DType::Float32
+        && let Some(y) = wo_a.grouped_qmm_t(o, g)?
+    {
+        return Ok(y);
+    }
+    let wa = wo_a
+        .f32()?
+        .astype(act)?
+        .astype(DType::Float32)?
+        .reshape(&[g, o_lora, width])?
+        .transpose(Some(&[0, 2, 1]))?;
+    o.matmul(&wa)
 }
 
 #[cfg(test)]
