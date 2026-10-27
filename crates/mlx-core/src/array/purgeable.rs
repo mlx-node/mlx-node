@@ -71,6 +71,15 @@ unsafe extern "C" fn release_bank(ctx: *mut c_void) {
     unsafe { Arc::decrement_strong_count(ctx.cast::<BankShared>()) };
 }
 
+/// Whether any array still shares a dropped bank's buffer.
+pub(crate) struct BankWatch(std::sync::Weak<BankShared>);
+
+impl BankWatch {
+    pub(crate) fn alive(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+}
+
 /// One anonymous no-copy Metal allocation and its MLX array.
 ///
 /// Complete GPU reads before making a bank volatile. Before any subsequent CPU
@@ -155,6 +164,11 @@ impl PurgeableBank {
 
     pub(crate) fn nbytes(&self) -> usize {
         self.shared.nbytes
+    }
+
+    /// Outlives the bank: alive until the last array on its buffer dies.
+    pub(crate) fn watch(&self) -> BankWatch {
+        BankWatch(Arc::downgrade(&self.shared))
     }
 
     /// Synchronously change Metal's purgeability and return the previous (or,

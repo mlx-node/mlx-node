@@ -1,13 +1,19 @@
 //! Store v1: the model straight from the GGUF shards. Dense tensors are read
 //! once by aligned `F_NOCACHE` `pread` and kept resident (Q8_0 as MLX affine
 //! 8-bit codes + f16 scales, dequantized to f32 at each use; F32 as is);
-//! routed experts stream per layer into the shared staging bank; engram rows
-//! come from `PreadTable`.
+//! routed experts stream per layer into the shared bank (staging + global
+//! cache, sized by `CachePlan`); engram rows come from `PreadTable`.
+//!
+//! A turn is `begin_turn` .. `end_turn`: with `CachePlan::Admit` the start
+//! re-admits (S15) and may drop the bank to staging-only or rebuild it, then
+//! holds a wired-limit lease of fixed + cache bytes until the end, when the
+//! bank becomes volatile.
 
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use napi::{Error, Result};
 
@@ -20,7 +26,11 @@ use crate::array::alloc::OutLayout;
 use crate::array::{DType, MxArray};
 use crate::cache_limit::{CacheLimitGuard, coordinator};
 use crate::moe_stream::bank::{ExpertTensor, StagingBank};
+use crate::moe_stream::budget::{
+    Admission, Limits, ModelSize, Own, Turn, admit, readmit, working_set,
+};
 use crate::moe_stream::io::{AlignedBuf, Extent, IoPool, ShardSet, open_nocache};
+use crate::stream::WiredLimitContext;
 use crate::utils::gguf::{GgufFile, GgufTensorInfo, GgufTensorType, parse_gguf_reader};
 use crate::utils::gguf_cpu_repack::decode_affine_band_into;
 use crate::utils::gguf_gpu::RepackDst;
@@ -140,6 +150,27 @@ const ENGRAM_TABLE: &str = "per_layer_token_embd.weight";
 const RESERVE: u64 = 16 << 30;
 /// MLX free-buffer pool ceiling (D-33).
 pub const POOL_LIMIT: usize = 1 << 30;
+/// v1 context limit (D-24): the admission's KV / compute terms use it.
+pub const CTX_LIMIT: usize = 16_384;
+
+/// How many cache slots the bank gets.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CachePlan {
+    /// Staging only, no admission.
+    Off,
+    /// Exactly this many cache slots, no admission (tests).
+    Slots(usize),
+    /// S15 admission at load and at every turn start.
+    Admit(Limits),
+}
+
+struct TurnState {
+    admission: Option<Admission>,
+    wired: Option<WiredLimitContext>,
+    guard: CacheLimitGuard,
+    /// Bank switches: (cache slots, seconds to free the old bank and allocate).
+    switches: Vec<(usize, f64)>,
+}
 
 pub struct Store {
     pub model: Model,
@@ -148,7 +179,9 @@ pub struct Store {
     pub dense_read: u64,
     /// Bytes of the resident dense arrays.
     pub dense_bytes: u64,
-    _guard: CacheLimitGuard,
+    pub size: ModelSize,
+    plan: CachePlan,
+    turn: Mutex<TurnState>,
 }
 
 fn header(path: &Path) -> Result<GgufFile> {
@@ -157,8 +190,18 @@ fn header(path: &Path) -> Result<GgufFile> {
 }
 
 impl Store {
-    /// `paths` are every shard in order (shard 0 holds the metadata).
+    /// Staging only (`CachePlan::Off`).
     pub fn open(paths: &[PathBuf], act: DType, fq: FakeQuant) -> Result<Self> {
+        Self::open_with(paths, act, fq, CachePlan::Off)
+    }
+
+    /// `paths` are every shard in order (shard 0 holds the metadata).
+    pub fn open_with(
+        paths: &[PathBuf],
+        act: DType,
+        fq: FakeQuant,
+        plan: CachePlan,
+    ) -> Result<Self> {
         let mut where_: HashMap<String, Located> = HashMap::new();
         let mut cfg = None;
         for (i, p) in paths.iter().enumerate() {
@@ -198,21 +241,43 @@ impl Store {
             .filter(|(_, _, t)| is_dense(&t.name))
             .map(|(_, _, t)| t.data_size())
             .sum::<Result<u64>>()?;
-        if let Some(h) = host_memory() {
-            let free = h.physical.saturating_sub(h.non_reclaimable());
-            if bank_need + dense_need + RESERVE > free {
-                return Err(bad(format!(
-                    "load needs {} GiB + {} GiB reserve, host has {} GiB free",
-                    (bank_need + dense_need) >> 30,
-                    RESERVE >> 30,
-                    free >> 30
-                )));
+        let n_experts = cfg.n_routed_experts as u64;
+        let size = ModelSize {
+            dense: dense_need,
+            slot: bank_need / n_experts.max(1),
+            n_experts,
+            ctx: cfg.context_length.min(CTX_LIMIT) as u64,
+        };
+        let (cache_slots, admission) = match &plan {
+            CachePlan::Admit(limits) => {
+                let h = host_memory().ok_or_else(|| bad("no host memory reading for admission"))?;
+                // nothing of this model exists yet: every byte in use is others'
+                let a = admit(&size, limits, &h, &Own::default(), working_set())?;
+                tracing::info!("deepseek_v41 admission at load: {a}");
+                (a.cache_slots as usize, Some(a))
             }
-        }
+            CachePlan::Off | CachePlan::Slots(_) => {
+                let slots = if let CachePlan::Slots(n) = plan { n } else { 0 };
+                if let Some(h) = host_memory() {
+                    let free = h.physical.saturating_sub(h.non_reclaimable());
+                    let need = bank_need + slots as u64 * size.slot + dense_need;
+                    if need + RESERVE > free {
+                        return Err(bad(format!(
+                            "load needs {} GiB + {} GiB reserve, host has {} GiB free",
+                            need >> 30,
+                            RESERVE >> 30,
+                            free >> 30
+                        )));
+                    }
+                }
+                (slots, None)
+            }
+        };
         let shards = Arc::new(ShardSet::open(paths)?);
-        let bank = Arc::new(StagingBank::new(
+        let bank = Arc::new(StagingBank::with_cache(
             IoPool::from_env(Arc::clone(&shards))?,
             layers,
+            cache_slots,
         )?);
         let (mut dense_read, mut dense_bytes) = (0u64, 0u64);
         let mut buf = AlignedBuf::new();
@@ -251,12 +316,7 @@ impl Store {
             Ok(d)
         };
         let bank_of = |n: &str| -> Result<ExpertBank> {
-            let p = PROJS
-                .iter()
-                .position(|p| n.ends_with(&format!(".{p}.weight")))
-                .ok_or_else(|| bad(format!("{n} is not an expert tensor")))?;
-            let (weight, scales) = bank.arrays(p)?;
-            Ok(ExpertBank { weight, scales })
+            Err(bad(format!("{n}: routed experts stream through the bank")))
         };
         let table = match &cfg.engram {
             Some(ec) => {
@@ -283,8 +343,109 @@ impl Store {
             bank,
             dense_read,
             dense_bytes,
-            _guard: guard,
+            size,
+            plan,
+            turn: Mutex::new(TurnState {
+                admission,
+                wired: None,
+                guard,
+                switches: Vec::new(),
+            }),
         })
+    }
+
+    fn turn(&self) -> MutexGuard<'_, TurnState> {
+        self.turn.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn plan(&self) -> &CachePlan {
+        &self.plan
+    }
+
+    pub fn cache_slots(&self) -> usize {
+        self.bank.cache_slots()
+    }
+
+    /// The admission in force (`CachePlan::Admit` only).
+    pub fn admission(&self) -> Option<Admission> {
+        self.turn().admission
+    }
+
+    /// Every bank switch so far: (cache slots, seconds).
+    pub fn switches(&self) -> Vec<(usize, f64)> {
+        self.turn().switches.clone()
+    }
+
+    /// This model's bytes for the admission: dense arrays + bank (volatile
+    /// between turns, so outside `host_used`). Process-wide MLX counters
+    /// would also hold other loaded models, which must stay `others`; KV,
+    /// scratch and the shared pool are left in `others` (conservative).
+    pub fn own(&self) -> Own {
+        let bank = self.bank.nbytes();
+        Own {
+            active: self.dense_bytes + bank,
+            pool: 0,
+            volatile: if self.bank.in_turn() { 0 } else { bank },
+        }
+    }
+
+    fn switch(&self, t: &mut TurnState, slots: usize) -> Result<()> {
+        let t0 = Instant::now();
+        self.bank.rebuild(slots)?;
+        t.guard = coordinator()
+            .register_with_cache_limit(self.dense_bytes + self.bank.nbytes(), Some(POOL_LIMIT));
+        let s = t0.elapsed().as_secs_f64();
+        tracing::info!("deepseek_v41 bank switch to {slots} cache slots in {s:.2} s");
+        t.switches.push((slots, s));
+        Ok(())
+    }
+
+    /// Drops the bank and allocates one with `slots` cache slots (between
+    /// turns; the old bank's buffers must be gone first, `StagingBank::rebuild`).
+    pub fn set_cache_slots(&self, slots: usize) -> Result<()> {
+        let mut t = self.turn();
+        if t.wired.is_some() {
+            return Err(bad("bank switch inside a turn"));
+        }
+        self.switch(&mut t, slots)
+    }
+
+    /// Turn start: re-admit (`CachePlan::Admit`), switch the bank if the
+    /// admission says so, take the wired-limit lease, make the bank
+    /// non-volatile (forgetting every slot if Metal emptied it). Errs when
+    /// the fixed working set alone no longer fits.
+    pub fn begin_turn(&self) -> Result<()> {
+        let mut t = self.turn();
+        if let CachePlan::Admit(limits) = &self.plan
+            && t.wired.is_none()
+        {
+            let cur = t.admission.ok_or_else(|| bad("no admission"))?;
+            let h = host_memory().ok_or_else(|| bad("no host memory reading for admission"))?;
+            let next = match readmit(&cur, &self.size, limits, &h, &self.own(), working_set())? {
+                Turn::Keep => cur,
+                Turn::StagingOnly(a) | Turn::Rebuild(a) => {
+                    self.switch(&mut t, a.cache_slots as usize)?;
+                    tracing::info!("deepseek_v41 re-admission: {a}");
+                    a
+                }
+            };
+            t.admission = Some(next);
+            t.wired = Some(WiredLimitContext::bounded(
+                usize::try_from(next.wired_limit()).unwrap_or(usize::MAX),
+                Vec::new(),
+            ));
+        }
+        self.bank.begin_turn()?;
+        Ok(())
+    }
+
+    /// Turn end (after the turn's last eval): release the wired lease, make
+    /// the bank volatile.
+    pub fn end_turn(&self) -> Result<()> {
+        let mut t = self.turn();
+        crate::array::synchronize();
+        t.wired = None;
+        self.bank.end_turn()
     }
 }
 

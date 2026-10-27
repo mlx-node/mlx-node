@@ -1,18 +1,24 @@
 //! The shared expert bank: per projection one `PurgeableBank` pair (`w`
 //! uint32 E2M1 codes, `s` uint8 E8M0 scales) of `[slots, rows, k / 8]` /
 //! `[slots, rows, k / 32]`, used by every layer. Slots `0..n_experts` are
-//! staging (slot = expert id). Each slot carries a `(layer, expert)` tag
-//! that is cleared before a refill and set only after every projection's
-//! read finished.
+//! staging (slot = expert id), tagged `(layer, expert)`: a tag is cleared
+//! before a refill and set only after every projection's read finished.
+//! Slots `n_experts..` are the global cache ([`Cache`] directory).
+//!
+//! Between turns the banks are `Volatile`; the first use of a turn makes
+//! them `NonVolatile` again and, when Metal emptied any of them, forgets
+//! every tag and cache entry before a gather can read the slots. A bank of
+//! another cache size is allocated only after the old one is gone.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use napi::{Error, Result};
 
+use super::cache::{Cache, Source};
 use super::io::{Extent, IoPool, Priority, Read};
 use super::repack::SlotRepack;
-use crate::array::purgeable::PurgeableBank;
+use crate::array::purgeable::{PurgeableBank, PurgeableState};
 use crate::array::{DType, MxArray};
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 
@@ -41,31 +47,92 @@ struct Proj {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BankStats {
-    /// `fill` calls that read anything.
+    /// Layer steps that read anything.
     pub fills: usize,
     /// Slots (experts) read, all projections of one expert counted once.
     pub slots: usize,
     pub bytes: u64,
     pub ns: u64,
+    /// Expert uses (distinct experts per layer step).
+    pub uses: usize,
+    /// Uses served from a cache slot.
+    pub hits: usize,
+}
+
+/// Where one layer step's experts are: `slots[i]` is the bank slot of
+/// `experts[i]`; `arrays` are the bank's (codes, scales) per projection.
+pub struct Prepared {
+    pub layer: usize,
+    pub experts: Vec<u32>,
+    pub slots: Vec<u32>,
+    pub arrays: Vec<(MxArray, MxArray)>,
+    pub epoch: u64,
+}
+
+impl Prepared {
+    pub fn slot(&self, e: u32) -> Option<u32> {
+        self.experts.binary_search(&e).ok().map(|i| self.slots[i])
+    }
+}
+
+struct Inner {
+    proj: Vec<Proj>,
+    tags: Vec<Option<(usize, u32)>>,
+    cache: Cache,
+    in_turn: bool,
 }
 
 pub struct StagingBank {
     pool: IoPool,
-    proj: Vec<Proj>,
     /// `[layer][projection]`
     layers: Vec<Vec<ExpertTensor>>,
-    tags: Mutex<Vec<Option<(usize, u32)>>>,
+    n_experts: usize,
+    inner: Mutex<Inner>,
     stats: Mutex<BankStats>,
-    /// Test hook: `fill` does nothing (a gather then meets stale tags).
+    /// Test hook: no reads (a gather then meets stale tags).
     pub skip_fill: AtomicBool,
+    #[cfg(test)]
+    force_empty: AtomicBool,
+}
+
+fn alloc(first: &[ExpertTensor], slots: i64) -> Result<Vec<Proj>> {
+    let mut proj = Vec::with_capacity(first.len());
+    for t in first {
+        let shape = t.info.mlx_shape();
+        let (rows, k) = (shape[1], shape[2]);
+        let w = PurgeableBank::new(&[slots, rows, k / 8], DType::Uint32)?;
+        let s = PurgeableBank::new(&[slots, rows, k / 32], DType::Uint8)?;
+        // SAFETY: both banks hold exactly `slots * rows * k / 8` u32 and
+        // `slots * rows * k / 32` bytes and live as long as `repack` (both in
+        // `Proj`); slots are written only under the bank lock.
+        let repack = unsafe {
+            SlotRepack::mxfp4(
+                w.data_ptr().0.cast(),
+                s.data_ptr().0,
+                slots as usize,
+                rows as usize,
+                k as usize,
+            )
+        }?;
+        proj.push(Proj { w, s, repack });
+    }
+    Ok(proj)
 }
 
 impl StagingBank {
-    /// One bank per projection, `n_experts` staging slots, for the expert
-    /// tensors `layers[layer][projection]` (same shape in every layer).
+    /// Staging only (no cache slots).
     pub fn new(pool: IoPool, layers: Vec<Vec<ExpertTensor>>) -> Result<Self> {
+        Self::with_cache(pool, layers, 0)
+    }
+
+    /// One bank per projection of `n_experts + cache_slots` slots for the
+    /// expert tensors `layers[layer][projection]` (same shape in every layer).
+    pub fn with_cache(
+        pool: IoPool,
+        layers: Vec<Vec<ExpertTensor>>,
+        cache_slots: usize,
+    ) -> Result<Self> {
         let first = layers.first().ok_or_else(|| bad("no layers"))?;
-        let mut proj = Vec::with_capacity(first.len());
         let mut n_experts = 0;
         for (p, t) in first.iter().enumerate() {
             let shape = t.info.mlx_shape();
@@ -93,40 +160,50 @@ impl StagingBank {
                     )));
                 }
             }
-            let (n, rows, k) = (shape[0], shape[1], shape[2]);
-            if p > 0 && n != n_experts {
+            if p > 0 && shape[0] != n_experts {
                 return Err(bad("projections differ in expert count"));
             }
-            n_experts = n;
-            let w = PurgeableBank::new(&[n, rows, k / 8], DType::Uint32)?;
-            let s = PurgeableBank::new(&[n, rows, k / 32], DType::Uint8)?;
-            // SAFETY: both banks hold exactly `n * rows * k / 8` u32 and
-            // `n * rows * k / 32` bytes and live as long as `repack` (both in
-            // `Proj`); slots are written only by `fill` under the tag lock.
-            let repack = unsafe {
-                SlotRepack::mxfp4(
-                    w.data_ptr().0.cast(),
-                    s.data_ptr().0,
-                    n as usize,
-                    rows as usize,
-                    k as usize,
-                )
-            }?;
-            proj.push(Proj { w, s, repack });
+            n_experts = shape[0];
         }
+        let n = n_experts as usize;
+        let proj = alloc(first, n_experts + cache_slots as i64)?;
         Ok(Self {
             pool,
-            proj,
+            inner: Mutex::new(Inner {
+                proj,
+                tags: vec![None; n],
+                cache: Cache::lru(cache_slots, layers.len(), n),
+                in_turn: true,
+            }),
             layers,
-            tags: Mutex::new(vec![None; n_experts as usize]),
+            n_experts: n,
             stats: Mutex::new(BankStats::default()),
             skip_fill: AtomicBool::new(false),
+            #[cfg(test)]
+            force_empty: AtomicBool::new(false),
         })
+    }
+
+    pub fn n_experts(&self) -> usize {
+        self.n_experts
+    }
+
+    pub fn cache_slots(&self) -> usize {
+        lock(&self.inner).cache.slots()
+    }
+
+    /// Bytes of one slot of every projection (MLX layout).
+    pub fn slot_bytes(&self) -> u64 {
+        self.layers[0]
+            .iter()
+            .map(|t| t.info.data_size().unwrap_or(0) / self.n_experts as u64)
+            .sum()
     }
 
     /// Bytes of every bank.
     pub fn nbytes(&self) -> u64 {
-        self.proj
+        lock(&self.inner)
+            .proj
             .iter()
             .map(|p| (p.w.nbytes() + p.s.nbytes()) as u64)
             .sum()
@@ -134,80 +211,317 @@ impl StagingBank {
 
     /// Projection `p`'s (codes, scales) arrays.
     pub fn arrays(&self, p: usize) -> Result<(MxArray, MxArray)> {
-        let pr = self
+        let g = lock(&self.inner);
+        let pr = g
             .proj
             .get(p)
-            .ok_or_else(|| bad(format!("projection {p} of {}", self.proj.len())))?;
+            .ok_or_else(|| bad(format!("projection {p} of {}", g.proj.len())))?;
         Ok((pr.w.array().clone(), pr.s.array().clone()))
     }
 
     pub fn tags(&self) -> Vec<Option<(usize, u32)>> {
-        lock(&self.tags).clone()
+        lock(&self.inner).tags.clone()
     }
 
     pub fn stats(&self) -> BankStats {
         *lock(&self.stats)
     }
 
-    /// Reads every expert of `experts` whose slot does not hold `layer`'s
-    /// copy. Waits for all GPU work first, so no running kernel reads a slot
-    /// being refilled; graphs built on the bank must be evaluated before the
-    /// next `fill`. A failed read leaves the slots untagged.
+    /// Runs `f` on the cache directory (diagnostics, tests).
+    pub fn with_cache_dir<T>(&self, f: impl FnOnce(&Cache) -> T) -> T {
+        f(&lock(&self.inner).cache)
+    }
+
+    fn begin(&self, g: &mut Inner) -> Result<bool> {
+        let mut emptied = false;
+        for p in &g.proj {
+            for b in [&p.w, &p.s] {
+                emptied |= b.set_purgeable(PurgeableState::NonVolatile)? == PurgeableState::Empty;
+            }
+        }
+        if emptied {
+            g.tags.fill(None);
+            g.cache.clear();
+        }
+        g.in_turn = true;
+        Ok(emptied)
+    }
+
+    /// Between `begin_turn` (or the first use) and `end_turn`: non-volatile.
+    pub fn in_turn(&self) -> bool {
+        lock(&self.inner).in_turn
+    }
+
+    /// Makes the banks `NonVolatile` for a turn. Returns whether Metal had
+    /// discarded any of them (every tag and cache entry is then forgotten).
+    pub fn begin_turn(&self) -> Result<bool> {
+        let mut g = lock(&self.inner);
+        if g.in_turn {
+            return Ok(false);
+        }
+        self.begin(&mut g)
+    }
+
+    /// After the turn's last eval: the banks become `Volatile` (the system
+    /// may reclaim them until the next turn).
+    pub fn end_turn(&self) -> Result<()> {
+        let mut g = lock(&self.inner);
+        if !g.in_turn {
+            return Ok(());
+        }
+        crate::array::synchronize();
+        g.cache.complete_all();
+        let state = if self.empty_between_turns() {
+            PurgeableState::Empty
+        } else {
+            PurgeableState::Volatile
+        };
+        g.in_turn = false;
+        for p in &g.proj {
+            p.w.set_purgeable(state)?;
+            p.s.set_purgeable(state)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn empty_between_turns(&self) -> bool {
+        self.force_empty.load(Ordering::Relaxed)
+            || std::env::var_os("MLX_DSV41_TEST_FORCE_EMPTY").is_some_and(|v| v == "1")
+    }
+
+    #[cfg(not(test))]
+    fn empty_between_turns(&self) -> bool {
+        false
+    }
+
+    /// Test hook: `end_turn` empties the banks instead of making them volatile.
+    #[cfg(test)]
+    pub fn test_force_empty(&self, on: bool) {
+        self.force_empty.store(on, Ordering::Relaxed);
+    }
+
+    /// Drops the banks and allocates new ones with `cache_slots` cache
+    /// slots, after the old buffers are gone from MLX (refuses while any
+    /// array still holds one; the bank then has no slots until a rebuild
+    /// succeeds).
+    pub fn rebuild(&self, cache_slots: usize) -> Result<()> {
+        let mut g = lock(&self.inner);
+        crate::array::synchronize();
+        let watches: Vec<_> = g
+            .proj
+            .iter()
+            .flat_map(|p| [p.w.watch(), p.s.watch()])
+            .collect();
+        g.proj = Vec::new();
+        g.tags.fill(None);
+        g.cache = Cache::lru(0, self.layers.len(), self.n_experts);
+        crate::array::clear_cache();
+        if watches.iter().any(|w| w.alive()) {
+            return Err(bad(
+                "an array still holds the old bank; a second bank is not allocated",
+            ));
+        }
+        g.proj = alloc(&self.layers[0], (self.n_experts + cache_slots) as i64)?;
+        g.cache = Cache::lru(cache_slots, self.layers.len(), self.n_experts);
+        g.in_turn = true;
+        Ok(())
+    }
+
+    fn reads(
+        &self,
+        g: &Inner,
+        layer: usize,
+        e: u32,
+        slot: usize,
+        out: &mut Vec<Read>,
+    ) -> Result<()> {
+        for (t, p) in self.layers[layer].iter().zip(&g.proj) {
+            let ext = Extent::expert(t.shard, t.data_offset, &t.info, e as usize)?;
+            out.push(Read::slot(ext, &p.repack, slot));
+        }
+        Ok(())
+    }
+
+    fn submit(&self, reads: Vec<Read>) -> Result<super::io::IoStats> {
+        // SAFETY: every slot read is untagged (staging) or an unmapped victim
+        // (cache), so no gather passes the slot checks on it until the reads
+        // are done; GPU work was drained and the bank lock is held.
+        unsafe { self.pool.submit(reads, Priority::High) }?.wait()
+    }
+
+    fn check_step(&self, g: &Inner, layer: usize, experts: &[u32]) -> Result<()> {
+        if layer >= self.layers.len() {
+            return Err(bad(format!("layer {layer} of {}", self.layers.len())));
+        }
+        if g.proj.is_empty() {
+            return Err(bad("no bank (a rebuild failed)"));
+        }
+        if let Some(&e) = experts.iter().find(|&&e| e as usize >= self.n_experts) {
+            return Err(bad(format!("expert {e} of {}", self.n_experts)));
+        }
+        if experts.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(bad("experts must be sorted and distinct"));
+        }
+        Ok(())
+    }
+
+    /// Slots for one layer step's distinct, sorted `experts`: cache hits
+    /// in place; with `decode`, misses read into cache victims; the rest
+    /// into staging slots whose tag is not `(layer, e)`. Drains the GPU
+    /// before any CPU write. Graphs built on the returned arrays must be
+    /// evaluated, then `done(epoch)`, before the next step may evict them.
+    pub fn prepare(&self, layer: usize, experts: &[u32], decode: bool) -> Result<Prepared> {
+        let mut g = lock(&self.inner);
+        self.check_step(&g, layer, experts)?;
+        if !g.in_turn {
+            self.begin(&mut g)?;
+        }
+        let n = self.n_experts as u32;
+        let (epoch, src) = g.cache.plan(layer, experts, decode);
+        let (mut slots, mut staging, mut victims, mut hits) =
+            (Vec::new(), Vec::new(), Vec::new(), 0);
+        for (&e, s) in experts.iter().zip(&src) {
+            slots.push(match *s {
+                Source::Hit(c) => {
+                    hits += 1;
+                    n + c
+                }
+                Source::Victim(c) => {
+                    victims.push((e, c));
+                    n + c
+                }
+                Source::Staging => {
+                    if g.tags[e as usize] != Some((layer, e)) {
+                        staging.push(e);
+                    }
+                    e
+                }
+            });
+        }
+        if self.skip_fill.load(Ordering::Relaxed) {
+            victims.iter().for_each(|&(_, c)| g.cache.release(c));
+        } else if !staging.is_empty() || !victims.is_empty() {
+            crate::array::synchronize();
+            g.cache.complete_all();
+            let mut reads = Vec::new();
+            for &e in &staging {
+                g.tags[e as usize] = None;
+                self.reads(&g, layer, e, e as usize, &mut reads)?;
+            }
+            for &(e, c) in &victims {
+                self.reads(&g, layer, e, (n + c) as usize, &mut reads)?;
+            }
+            let io = match self.submit(reads) {
+                Ok(io) => io,
+                Err(err) => {
+                    victims.iter().for_each(|&(_, c)| g.cache.release(c));
+                    return Err(err);
+                }
+            };
+            for &e in &staging {
+                g.tags[e as usize] = Some((layer, e));
+            }
+            for &(e, c) in &victims {
+                g.cache.commit(c, layer, e);
+            }
+            let mut st = lock(&self.stats);
+            st.fills += 1;
+            st.slots += staging.len() + victims.len();
+            st.bytes += io.bytes;
+            st.ns += io.ns;
+        }
+        {
+            let mut st = lock(&self.stats);
+            st.uses += experts.len();
+            st.hits += hits;
+        }
+        Ok(Prepared {
+            layer,
+            experts: experts.to_vec(),
+            slots,
+            arrays: g
+                .proj
+                .iter()
+                .map(|p| (p.w.array().clone(), p.s.array().clone()))
+                .collect(),
+            epoch,
+        })
+    }
+
+    /// The gathers of step `epoch` (and every earlier one) are evaluated.
+    pub fn done(&self, epoch: u64) {
+        lock(&self.inner).cache.complete(epoch);
+    }
+
+    /// Panics (release builds too) unless every slot of `p` holds its
+    /// expert of `p.layer`: a gather on a stale slot would compute with
+    /// another layer's (or discarded) weights.
+    pub fn assert_slots(&self, p: &Prepared) {
+        let n = self.n_experts as u32;
+        let stale = {
+            let g = lock(&self.inner);
+            p.experts.iter().zip(&p.slots).find_map(|(&e, &s)| {
+                let held = if s < n {
+                    (s == e).then(|| g.tags[s as usize]).flatten()
+                } else {
+                    g.cache.occ(s - n)
+                };
+                (held != Some((p.layer, e))).then_some((e, s, held))
+            })
+        };
+        assert!(
+            stale.is_none(),
+            "moe_stream bank: gather of layer {} on stale slot {stale:?}",
+            p.layer
+        );
+    }
+
+    /// Reads every expert of `experts` into its staging slot unless the
+    /// slot holds `layer`'s copy (no cache). Waits for all GPU work first;
+    /// graphs built on the bank must be evaluated before the next `fill`.
     pub fn fill(&self, layer: usize, experts: &[u32]) -> Result<()> {
         if self.skip_fill.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let src = self
-            .layers
-            .get(layer)
-            .ok_or_else(|| bad(format!("layer {layer} of {}", self.layers.len())))?;
-        let mut tags = lock(&self.tags);
-        let mut missing: Vec<u32> = Vec::new();
-        for &e in experts {
-            let slot = tags
-                .get(e as usize)
-                .ok_or_else(|| bad(format!("expert {e} of {}", tags.len())))?;
-            if *slot != Some((layer, e)) && !missing.contains(&e) {
-                missing.push(e);
-            }
+        let mut want = experts.to_vec();
+        want.sort_unstable();
+        want.dedup();
+        let mut g = lock(&self.inner);
+        self.check_step(&g, layer, &want)?;
+        if !g.in_turn {
+            self.begin(&mut g)?;
         }
-        if missing.is_empty() {
+        want.retain(|&e| g.tags[e as usize] != Some((layer, e)));
+        if want.is_empty() {
             return Ok(());
         }
         crate::array::synchronize();
-        let mut reads = Vec::with_capacity(missing.len() * src.len());
-        for &e in &missing {
-            tags[e as usize] = None;
-            for (t, p) in src.iter().zip(&self.proj) {
-                let ext = Extent::expert(t.shard, t.data_offset, &t.info, e as usize)?;
-                reads.push(Read::slot(ext, &p.repack, e as usize));
-            }
+        let mut reads = Vec::new();
+        for &e in &want {
+            g.tags[e as usize] = None;
+            self.reads(&g, layer, e, e as usize, &mut reads)?;
         }
-        // SAFETY: the slots belong to this bank and are untagged, so no gather
-        // passes `assert_tags` on them until the reads are done; GPU work was
-        // drained above and the tag lock is held for the whole fill.
-        let io = unsafe { self.pool.submit(reads, Priority::High) }?.wait()?;
-        for &e in &missing {
-            tags[e as usize] = Some((layer, e));
+        let io = self.submit(reads)?;
+        for &e in &want {
+            g.tags[e as usize] = Some((layer, e));
         }
         let mut st = lock(&self.stats);
         st.fills += 1;
-        st.slots += missing.len();
+        st.slots += want.len();
         st.bytes += io.bytes;
         st.ns += io.ns;
         Ok(())
     }
 
-    /// Panics (release builds too) unless every slot of `experts` holds
-    /// `layer`'s expert: a gather on a stale slot would compute with another
-    /// layer's weights.
+    /// Panics unless every staging slot of `experts` holds `layer`'s expert.
     pub fn assert_tags(&self, layer: usize, experts: &[u32]) {
         let stale = {
-            let tags = lock(&self.tags);
+            let g = lock(&self.inner);
             experts
                 .iter()
-                .find(|&&e| tags.get(e as usize).copied().flatten() != Some((layer, e)))
-                .map(|&e| (e, tags.get(e as usize).copied().flatten()))
+                .find(|&&e| g.tags.get(e as usize).copied().flatten() != Some((layer, e)))
+                .map(|&e| (e, g.tags.get(e as usize).copied().flatten()))
         };
         assert!(
             stale.is_none(),

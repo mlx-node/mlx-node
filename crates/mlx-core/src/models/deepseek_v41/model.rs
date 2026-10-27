@@ -13,7 +13,7 @@ use super::cache::{Candidates, CompressedCache, ForwardShared, TopK, WindowCache
 use super::config::DeepseekV41Config;
 use super::engram::{Engram, EngramRows};
 use super::engram_hash::EngramHasher;
-use super::moe::{ExpertBank, Moe, MoeWeights, Routes};
+use super::moe::{ExpertBank, Experts, Moe, MoeWeights, Routes};
 use super::ops::hc_pre;
 use super::store::{Dense, Weight};
 use crate::array::{DType, MxArray};
@@ -85,8 +85,8 @@ pub struct Model {
 
 impl Model {
     /// `get` returns a dense GGUF tensor, `bank` a routed-expert tensor
-    /// (with `stream`: that projection of the shared staging bank); `table`
-    /// serves engram rows. `act` is the activation dtype.
+    /// (not called with `stream`: every layer then gathers from that shared
+    /// bank); `table` serves engram rows. `act` is the activation dtype.
     pub fn from_gguf(
         cfg: DeepseekV41Config,
         act: DType,
@@ -99,8 +99,10 @@ impl Model {
         let mut blocks = Vec::with_capacity(cfg.n_layers);
         let mut engrams = Vec::with_capacity(cfg.n_layers);
         for l in 0..cfg.n_layers {
-            let mut mw = MoeWeights::from_gguf(l, &mut get, &mut bank)?;
-            mw.stream = stream.clone();
+            let mw = match &stream {
+                Some(st) => MoeWeights::with_experts(l, &mut get, Experts::Stream(Arc::clone(st)))?,
+                None => MoeWeights::from_gguf(l, &mut get, &mut bank)?,
+            };
             let moe = Moe::new(&cfg, l, mw)?;
             blocks.push(Block::from_gguf(&cfg, l, fq, moe, &mut get)?);
             let e = cfg

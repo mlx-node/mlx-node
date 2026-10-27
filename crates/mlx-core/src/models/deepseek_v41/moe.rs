@@ -20,6 +20,7 @@ use super::store::Dense;
 use crate::array::alloc::OutLayout;
 use crate::array::{DType, MxArray};
 use crate::moe_stream::bank::StagingBank;
+use crate::moe_stream::cache::decode_step;
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 use crate::utils::gguf_cpu_repack::decode_affine_band_into;
 use crate::utils::gguf_gpu::RepackDst;
@@ -95,21 +96,25 @@ impl ExpertBank {
     }
 }
 
+/// Routed-expert weights of one layer.
+pub enum Experts {
+    /// Whole `[n_experts, out, in]` banks (gate, up, down).
+    Resident([ExpertBank; 3]),
+    /// The shared streaming bank: its projections' arrays are taken per
+    /// layer step, after the step's slots are prepared.
+    Stream(Arc<StagingBank>),
+}
+
 /// One layer's FFN weights. Dense tensors (router, shared expert) come in
 /// as plain arrays; the router bias is kept on the host.
 pub struct MoeWeights {
     /// `[n_experts, dim]`
     pub router: MxArray,
     pub bias: Vec<f32>,
-    pub gate: ExpertBank,
-    pub up: ExpertBank,
-    pub down: ExpertBank,
+    pub experts: Experts,
     pub shared_gate: Dense,
     pub shared_up: Dense,
     pub shared_down: Dense,
-    /// Streamed experts: `gate`/`up`/`down` are this bank's arrays, whose
-    /// slot `e` must hold this layer's expert `e` before a gather.
-    pub stream: Option<Arc<StagingBank>>,
 }
 
 impl MoeWeights {
@@ -117,8 +122,23 @@ impl MoeWeights {
     /// tensor as an array, `bank` a routed-expert tensor as an `ExpertBank`.
     pub fn from_gguf(
         layer: usize,
-        mut dense: impl FnMut(&str) -> Result<Dense>,
+        dense: impl FnMut(&str) -> Result<Dense>,
         mut bank: impl FnMut(&str) -> Result<ExpertBank>,
+    ) -> Result<Self> {
+        let n = |s: &str| format!("blk.{layer}.{s}.weight");
+        let experts = Experts::Resident([
+            bank(&n("ffn_gate_exps"))?,
+            bank(&n("ffn_up_exps"))?,
+            bank(&n("ffn_down_exps"))?,
+        ]);
+        Self::with_experts(layer, dense, experts)
+    }
+
+    /// The dense part from `dense`, routed experts as given.
+    pub fn with_experts(
+        layer: usize,
+        mut dense: impl FnMut(&str) -> Result<Dense>,
+        experts: Experts,
     ) -> Result<Self> {
         let n = |s: &str| format!("blk.{layer}.{s}.weight");
         let bias = dense(&format!("blk.{layer}.exp_probs_b.bias"))?
@@ -129,13 +149,10 @@ impl MoeWeights {
         Ok(Self {
             router: dense(&n("ffn_gate_inp"))?.array()?,
             bias,
-            gate: bank(&n("ffn_gate_exps"))?,
-            up: bank(&n("ffn_up_exps"))?,
-            down: bank(&n("ffn_down_exps"))?,
+            experts,
             shared_gate: dense(&n("ffn_gate_shexp"))?,
             shared_up: dense(&n("ffn_up_shexp"))?,
             shared_down: dense(&n("ffn_down_shexp"))?,
-            stream: None,
         })
     }
 }
@@ -207,11 +224,23 @@ impl Moe {
                 cfg.dim
             )));
         }
-        for (what, b) in [("gate", &w.gate), ("up", &w.up), ("down", &w.down)] {
-            if b.n_experts()? != n {
-                return Err(bad(format!(
-                    "layer {layer}: {what} bank is not {n} experts"
-                )));
+        match &w.experts {
+            Experts::Resident(banks) => {
+                for (what, b) in ["gate", "up", "down"].iter().zip(banks) {
+                    if b.n_experts()? != n {
+                        return Err(bad(format!(
+                            "layer {layer}: {what} bank is not {n} experts"
+                        )));
+                    }
+                }
+            }
+            Experts::Stream(st) => {
+                if st.n_experts() != n {
+                    return Err(bad(format!(
+                        "layer {layer}: streaming bank of {} experts, not {n}",
+                        st.n_experts()
+                    )));
+                }
             }
         }
         Ok(Self {
@@ -278,26 +307,46 @@ impl Moe {
             )));
         }
         let (ids, w) = routes.by_expert();
-        if let Some(st) = &self.w.stream {
-            let mut used = ids.clone();
-            used.sort_unstable();
-            used.dedup();
-            st.fill(self.layer, &used)?;
-            st.assert_tags(self.layer, &used);
-        }
-        let ids = MxArray::from_uint32(&ids, &[rows, k])?;
         let w = MxArray::from_float32(&w, &[rows, k, 1, 1])?;
         let xe = x.reshape(&[rows, 1, 1, dim])?;
-        let g = self.w.gate.gather(&xe, &ids)?;
-        let u = self.w.up.gather(&xe, &ids)?;
-        let h = swiglu(&g, &u, self.limit, Some(&w), x.dtype()?)?;
-        let out = self.w.down.gather(&h, &ids)?.reshape(&[rows, k, dim])?;
-        if self.w.stream.is_some() {
-            // the bank's slots may be refilled by the next fill: no lazy
-            // gather may outlive this call
-            MxArray::eval_arrays_with_context(&[&out], "deepseek_v41 routed gather")?;
+        let run = |banks: &[ExpertBank], slot_ids: &[u32]| -> Result<MxArray> {
+            let ids = MxArray::from_uint32(slot_ids, &[rows, k])?;
+            let g = banks[0].gather(&xe, &ids)?;
+            let u = banks[1].gather(&xe, &ids)?;
+            let h = swiglu(&g, &u, self.limit, Some(&w), x.dtype()?)?;
+            banks[2].gather(&h, &ids)?.reshape(&[rows, k, dim])
+        };
+        match &self.w.experts {
+            Experts::Resident(banks) => run(banks, &ids),
+            Experts::Stream(st) => {
+                let mut used = ids.clone();
+                used.sort_unstable();
+                used.dedup();
+                let p = st.prepare(self.layer, &used, decode_step(rows as usize))?;
+                st.assert_slots(&p);
+                let slot_ids: Vec<u32> = ids
+                    .iter()
+                    .map(|&e| {
+                        p.slot(e)
+                            .ok_or_else(|| bad(format!("expert {e} not prepared")))
+                    })
+                    .collect::<Result<_>>()?;
+                let banks: Vec<ExpertBank> = p
+                    .arrays
+                    .iter()
+                    .map(|(weight, scales)| ExpertBank {
+                        weight: weight.clone(),
+                        scales: scales.clone(),
+                    })
+                    .collect();
+                let out = run(&banks, &slot_ids)?;
+                // slots may be refilled or evicted by the next step: no lazy
+                // gather may outlive this call
+                MxArray::eval_arrays_with_context(&[&out], "deepseek_v41 routed gather")?;
+                st.done(p.epoch);
+                Ok(out)
+            }
         }
-        Ok(out)
     }
 
     /// The shared expert (`Expert.forward` without weights) in `x`'s dtype.

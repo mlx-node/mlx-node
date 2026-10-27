@@ -10,7 +10,7 @@ use super::*;
 use crate::array::{get_active_memory, get_cache_memory, set_cache_limit};
 use crate::models::deepseek_v41::engram::{EngramRows, ResidentTable};
 use crate::models::deepseek_v41::engram_hash::EngramHasher;
-use crate::models::deepseek_v41::model::Trace;
+use crate::models::deepseek_v41::model::{Session, Trace};
 use crate::models::deepseek_v41::test_fixture::{Npz, TinyGguf, fixture, read};
 use crate::models::deepseek_v41::tests::{case_ids, mode_of, run, split, tiny};
 
@@ -144,6 +144,275 @@ fn row_range_checked() {
             assert!(t.rows(e, &bad).is_err(), "row below column 0");
         }
         assert!(t.rows(e, &ids[..cols - 1]).is_err(), "partial position");
+    }
+}
+
+fn cached_store(mode: &str, slots: usize) -> Store {
+    let (act, fq) = mode_of(mode);
+    Store::open_with(
+        &[fixture("tiny-q8_0.gguf")],
+        act,
+        fq,
+        CachePlan::Slots(slots),
+    )
+    .unwrap()
+}
+
+/// Logits of `ids` fed in calls of `sizes` on `sess`.
+fn calls(store: &Store, sess: &mut Session, ids: &[u32], sizes: &[usize]) -> Vec<f32> {
+    let (mut out, mut at) = (Vec::new(), 0);
+    for &n in sizes {
+        out.extend(read(
+            &store
+                .model
+                .forward(sess, &ids[at..at + n], None, None)
+                .unwrap(),
+        ));
+        at += n;
+    }
+    out
+}
+
+fn pool_ok(what: &str) {
+    let c = get_cache_memory();
+    assert!(
+        c <= 2.0 * (1u64 << 30) as f64,
+        "{what}: MLX cache {c} B > 2 GiB"
+    );
+}
+
+/// Cache sizes 1 / 6 / 16 / 64 slots (12 experts x 8 layers = 96 pairs;
+/// 1-16 exercise victims and the staging fallback, 64 hits):
+/// logits bitwise == the staging-only store (S11) for c1, c2, c3 run one
+/// after another on one store (later cases start from a warm cache).
+#[test]
+fn tiny_cache_bitwise_any_size() {
+    let npz = Npz::open("oracle.npz");
+    for mode in ["fp32_on", "bf16_on"] {
+        let reference = tiny_store(mode);
+        let want: Vec<Vec<f32>> = ["c1", "c2", "c3"]
+            .iter()
+            .map(|c| run(&reference.model, &case_ids(&npz, c), &split(c)).0)
+            .collect();
+        for slots in [1, 6, 16, 64] {
+            let store = cached_store(mode, slots);
+            assert_eq!(store.cache_slots(), slots);
+            for (case, want) in ["c1", "c2", "c3"].iter().zip(&want) {
+                let before = store.bank.stats();
+                let (got, _) = run(&store.model, &case_ids(&npz, case), &split(case));
+                let st = store.bank.stats();
+                assert_eq!(
+                    bits(&got),
+                    bits(want),
+                    "{mode} S={slots} {case}: cache != staging-only"
+                );
+                store.bank.with_cache_dir(|c| c.check()).unwrap();
+                pool_ok(case);
+                println!(
+                    "{mode} S={slots} {case}: bitwise; uses {} hits {} reads {} occupied {}",
+                    st.uses - before.uses,
+                    st.hits - before.hits,
+                    st.slots - before.slots,
+                    store.bank.with_cache_dir(|c| c.occupied())
+                );
+            }
+            let st = store.bank.stats();
+            // one decode token wants up to 6 experts x 8 layers = 48 slots:
+            // smaller LRU caches thrash (0 hits), 64 must hit
+            if slots == 64 {
+                assert!(st.hits > 0, "{mode} S={slots}: decode never hit the cache");
+            }
+            assert_eq!(store.bank.with_cache_dir(|c| c.occupied()), slots.min(96));
+        }
+    }
+}
+
+/// `MLX_DSV41_TEST_FORCE_EMPTY` hook: the bank is `Empty` between turn 1
+/// and turn 2; turn 2 forgets every slot, re-reads, and its logits are
+/// bitwise those of a store whose bank stayed (volatile, not purged).
+#[test]
+fn tiny_cache_forced_empty_between_turns() {
+    let npz = Npz::open("oracle.npz");
+    let ids = case_ids(&npz, "c2");
+    let (t1, t2): (Vec<usize>, Vec<usize>) = (
+        std::iter::once(12)
+            .chain(std::iter::repeat_n(1, 6))
+            .collect(),
+        vec![1; 6],
+    );
+    let turns = |store: &Store, empty: bool| {
+        store.bank.test_force_empty(empty);
+        let mut sess = store.model.new_session();
+        store.begin_turn().unwrap();
+        let a = calls(store, &mut sess, &ids, &t1);
+        store.end_turn().unwrap();
+        let occupied = store.bank.with_cache_dir(|c| c.occupied());
+        store.begin_turn().unwrap();
+        let after_begin = (
+            store.bank.with_cache_dir(|c| c.occupied()),
+            store.bank.tags().iter().flatten().count(),
+        );
+        let before = store.bank.stats();
+        let b = calls(store, &mut sess, &ids[18..], &t2);
+        let reads = store.bank.stats().slots - before.slots;
+        store.end_turn().unwrap();
+        (a, b, occupied, after_begin, reads)
+    };
+    let reference = tiny_store("fp32_on");
+    let want = calls(
+        &reference,
+        &mut reference.model.new_session(),
+        &ids,
+        &split("c2"),
+    );
+    let (a0, b0, occ0, begin0, reads0) = turns(&cached_store("fp32_on", 64), false);
+    let (a1, b1, occ1, begin1, reads1) = turns(&cached_store("fp32_on", 64), true);
+    assert_eq!(bits(&[a0.clone(), b0.clone()].concat()), bits(&want));
+    assert_eq!(bits(&a1), bits(&a0));
+    assert_eq!(
+        bits(&b1),
+        bits(&b0),
+        "turn 2 after Empty != turn 2 of a kept bank"
+    );
+    assert!(occ0 > 0 && occ1 > 0);
+    assert_eq!(begin1, (0, 0), "Empty bank kept directory entries or tags");
+    assert!(
+        begin0.0 > 0,
+        "a volatile bank lost its directory without being purged"
+    );
+    assert!(
+        reads1 > reads0,
+        "turn 2 after Empty did not re-read ({reads1} vs {reads0})"
+    );
+    println!(
+        "Empty: turn-2 reads {reads1} vs {reads0} kept; directory {occ1} -> {}",
+        begin1.0
+    );
+}
+
+/// Drop to staging-only mid-session, then back to a cache: logits bitwise
+/// == staging-only throughout; the MLX pool stays <= 2 GiB after every
+/// switch; a rebuild is refused while an array holds the old bank.
+#[test]
+fn tiny_cache_bank_switch_mid_session() {
+    let npz = Npz::open("oracle.npz");
+    let ids = case_ids(&npz, "c2");
+    let turns: [Vec<usize>; 3] = [
+        std::iter::once(12)
+            .chain(std::iter::repeat_n(1, 4))
+            .collect(),
+        vec![1; 4],
+        vec![1; 4],
+    ];
+    let reference = tiny_store("fp32_on");
+    let want = calls(
+        &reference,
+        &mut reference.model.new_session(),
+        &ids,
+        &split("c2"),
+    );
+    let store = cached_store("fp32_on", 64);
+    let full = store.bank.nbytes();
+    let mut sess = store.model.new_session();
+    let (mut got, mut at) = (Vec::new(), 0);
+    for (i, sizes) in turns.iter().enumerate() {
+        let n: usize = sizes.iter().sum();
+        store.begin_turn().unwrap();
+        got.extend(calls(&store, &mut sess, &ids[at..at + n], sizes));
+        store.end_turn().unwrap();
+        at += n;
+        match i {
+            0 => {
+                store.set_cache_slots(0).unwrap();
+                assert_eq!(store.cache_slots(), 0);
+                assert!(store.bank.nbytes() < full);
+            }
+            1 => {
+                store.set_cache_slots(64).unwrap();
+                assert_eq!(store.bank.nbytes(), full);
+            }
+            _ => {}
+        }
+        pool_ok(&format!("switch after turn {i}"));
+    }
+    assert_eq!(bits(&got), bits(&want), "bank switches changed the logits");
+    assert_eq!(store.switches().len(), 2);
+
+    let held = store.bank.arrays(0).unwrap();
+    let err = store.set_cache_slots(8).unwrap_err().to_string();
+    assert!(err.contains("still holds the old bank"), "{err}");
+    let mut s2 = store.model.new_session();
+    assert!(
+        store.model.forward(&mut s2, &ids[..1], None, None).is_err(),
+        "no bank, yet a forward ran"
+    );
+    drop(held);
+    store.set_cache_slots(8).unwrap();
+    pool_ok("rebuild after the refused one");
+    let mut s3 = store.model.new_session();
+    let again = calls(&store, &mut s3, &ids, &split("c2"));
+    assert_eq!(bits(&again), bits(&want));
+}
+
+/// The admission's `own` is this store's dense + bank bytes only (bank
+/// volatile between turns), not the process-wide MLX count: another
+/// model's arrays stay `others` (S15 codex).
+#[test]
+fn tiny_cache_own_is_this_model_only() {
+    let store = cached_store("fp32_on", 16);
+    let (dense, bank) = (store.dense_bytes, store.bank.nbytes());
+    store.begin_turn().unwrap();
+    let in_turn = store.own();
+    let other = MxArray::zeros(&[16 << 20], Some(DType::Float32)).unwrap();
+    other.eval();
+    assert_eq!(
+        store.own(),
+        in_turn,
+        "another model's arrays counted as own"
+    );
+    assert_eq!(in_turn.bytes(), dense + bank);
+    store.end_turn().unwrap();
+    assert_eq!(store.own().bytes(), dense, "a volatile bank counted as own");
+    drop(other);
+}
+
+/// `replay` on a run's own routes gives the live bank's hits and reads.
+#[test]
+fn tiny_cache_replay_matches_live() {
+    use crate::moe_stream::replay::{Step, replay};
+    let npz = Npz::open("oracle.npz");
+    for slots in [0, 1, 6, 16, 64] {
+        let store = cached_store("fp32_on", slots);
+        let mut steps = Vec::new();
+        for case in ["c1", "c2", "c3"] {
+            let (_, traces) = run(&store.model, &case_ids(&npz, case), &split(case));
+            for t in &traces {
+                for (layer, r) in t.routes.iter().enumerate() {
+                    steps.push(Step {
+                        layer,
+                        rows: r.rows(),
+                        ids: r.ids.clone(),
+                    });
+                }
+            }
+        }
+        let cfg = &store.model.cfg;
+        let mut c = crate::moe_stream::cache::Cache::lru(slots, cfg.n_layers, cfg.n_routed_experts);
+        let r = replay(&mut c, cfg.n_routed_experts, &steps);
+        let st = store.bank.stats();
+        assert_eq!(
+            (r.uses, r.hits, r.reads),
+            (st.uses as u64, st.hits as u64, st.slots as u64),
+            "S={slots}: replay != live"
+        );
+        println!(
+            "S={slots}: uses {} hits {} reads {} (h {:.3}, decode h {:.3})",
+            r.uses,
+            r.hits,
+            r.reads,
+            r.h(),
+            r.decode_h()
+        );
     }
 }
 

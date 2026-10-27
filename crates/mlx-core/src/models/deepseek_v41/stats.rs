@@ -21,6 +21,9 @@ pub struct Counters {
     pub fill_bytes: u64,
     /// Experts read into slots (misses; all projections of one counted once).
     pub fill_slots: u64,
+    /// Expert uses (distinct experts per layer step) and cache hits among them.
+    pub uses: u64,
+    pub hits: u64,
 }
 
 impl Counters {
@@ -33,6 +36,8 @@ impl Counters {
             fill_ns: b.ns,
             fill_bytes: b.bytes,
             fill_slots: b.slots as u64,
+            uses: b.uses as u64,
+            hits: b.hits as u64,
         }
     }
 
@@ -44,6 +49,8 @@ impl Counters {
             fill_ns: self.fill_ns - before.fill_ns,
             fill_bytes: self.fill_bytes - before.fill_bytes,
             fill_slots: self.fill_slots - before.fill_slots,
+            uses: self.uses - before.uses,
+            hits: self.hits - before.hits,
         }
     }
 }
@@ -166,9 +173,9 @@ pub fn line(
         "ttft_s": ttft_s,
         "prefill_tok_s": prompt_tok as f64 / ttft_s.max(1e-9),
         "decode_tok_s_median": if med > 0.0 { 1.0 / med } else { 0.0 },
-        // cache 0 (S14a): every use is a staging fill
-        "hit_rate_uses": 0.0,
-        "hit_rate_bytes": 0.0,
+        // every expert has the same size: byte and use hit rates are equal
+        "hit_rate_uses": c.hits as f64 / c.uses.max(1) as f64,
+        "hit_rate_bytes": c.hits as f64 / c.uses.max(1) as f64,
         "miss_gb_per_tok": c.fill_bytes as f64 / 1e9 / toks,
         "read_gbps": c.fill_bytes as f64 / 1e9 / io_s.max(1e-9),
         "t_c_ms": (wall_s - io_s - eng_s) * 1e3 / toks,
@@ -182,6 +189,6 @@ pub fn line(
         "mlx_cache_gib": crate::array::get_cache_memory() / GIB,
         "swapout_delta_mib": swapout_delta as f64 / (1u64 << 20) as f64,
         "memstatus_min": memstatus_min,
-        "cold": true,
+        "cold": c.hits == 0,
     })
 }

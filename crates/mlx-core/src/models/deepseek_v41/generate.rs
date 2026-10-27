@@ -1,7 +1,7 @@
-//! Greedy generation from token ids on the store (expert cache 0: every
-//! layer's experts come through the staging bank). Each call's routes go
-//! to the route trace, and a stats line per generated token to the stats
-//! file (see `stats`, `trace`).
+//! Greedy generation from token ids on the store, as one turn
+//! (`Store::begin_turn` .. `end_turn`). Each call's routes go to the route
+//! trace, and a stats line per generated token to the stats file (see
+//! `stats`, `trace`).
 
 use napi::{Error, Result};
 use serde_json::Value;
@@ -59,10 +59,29 @@ pub fn generate(
     keep_out: bool,
     hook: &mut dyn FnMut(&Call) -> Result<()>,
 ) -> Result<Generated> {
-    let m = &store.model;
     if prompt.is_empty() || chunk == Some(0) || force.is_some_and(|f| f.len() < steps) {
         return Err(Error::from_reason("deepseek_v41 generate: bad arguments"));
     }
+    store.begin_turn()?;
+    let out = run(store, sess, prompt, chunk, steps, force, keep_out, hook);
+    let end = store.end_turn();
+    let out = out?;
+    end?;
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run(
+    store: &Store,
+    sess: &mut Session,
+    prompt: &[u32],
+    chunk: Option<usize>,
+    steps: usize,
+    force: Option<&[u32]>,
+    keep_out: bool,
+    hook: &mut dyn FnMut(&Call) -> Result<()>,
+) -> Result<Generated> {
+    let m = &store.model;
     let n_experts = m.cfg.n_routed_experts;
     let k = m.cfg.n_activated_experts;
     let mut rt = RouteTrace::from_env(prompt.len(), m.cfg.n_layers, n_experts, k)
@@ -134,7 +153,7 @@ pub fn generate(
             &c,
             t0.elapsed().as_secs_f64(),
             store.dense_read + c.fill_bytes + c.engram_bytes,
-            0,
+            store.cache_slots(),
             peak,
             swap_d,
             level_min,
