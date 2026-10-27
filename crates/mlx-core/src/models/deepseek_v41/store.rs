@@ -30,6 +30,7 @@ use crate::moe_stream::bank::{ExpertTensor, StagingBank};
 use crate::moe_stream::budget::{
     Admission, Limits, ModelSize, Own, Turn, admit, readmit, working_set,
 };
+use crate::moe_stream::cache::CacheMode;
 use crate::moe_stream::io::{AlignedBuf, Extent, IoPool, ShardSet, open_nocache};
 use crate::stream::WiredLimitContext;
 use crate::utils::gguf::{GgufFile, GgufTensorInfo, GgufTensorType, parse_gguf_reader};
@@ -91,6 +92,20 @@ pub enum DenseMode {
 }
 
 pub const DENSE_ENV: &str = "MLX_DSV41_DENSE";
+
+/// Expert cache rules (stage P2): `seeded` (default) | `lru` (S16a).
+pub const CACHE_MODE_ENV: &str = "MLX_DSV41_CACHE_MODE";
+
+/// `MLX_DSV41_CACHE_MODE`; unset or empty = `CacheMode::default()`
+/// (`Seeded`, DECISIONS P2); anything else is refused.
+pub fn cache_mode_from_env() -> Result<CacheMode> {
+    match std::env::var(CACHE_MODE_ENV).ok().as_deref().map(str::trim) {
+        None | Some("") => Ok(CacheMode::default()),
+        Some("seeded") => Ok(CacheMode::Seeded),
+        Some("lru") => Ok(CacheMode::Lru),
+        Some(v) => Err(bad(format!("{CACHE_MODE_ENV}={v}: want seeded or lru"))),
+    }
+}
 
 /// What one Q8_0 tensor becomes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,12 +382,24 @@ impl Store {
         Self::open_dense(paths, act, fq, plan, DenseMode::from_env()?)
     }
 
+    /// Cache rules from `MLX_DSV41_CACHE_MODE` (`cache_mode_from_env`).
     pub fn open_dense(
         paths: &[PathBuf],
         act: DType,
         fq: FakeQuant,
         plan: CachePlan,
         mode: DenseMode,
+    ) -> Result<Self> {
+        Self::open_full(paths, act, fq, plan, mode, cache_mode_from_env()?)
+    }
+
+    pub fn open_full(
+        paths: &[PathBuf],
+        act: DType,
+        fq: FakeQuant,
+        plan: CachePlan,
+        mode: DenseMode,
+        cache_mode: CacheMode,
     ) -> Result<Self> {
         let Scan {
             where_,
@@ -413,10 +440,11 @@ impl Store {
         };
         let shards = Arc::new(ShardSet::open(paths)?);
         let t_bank = Instant::now();
-        let bank = Arc::new(StagingBank::with_cache(
+        let bank = Arc::new(StagingBank::with_mode(
             IoPool::from_env(Arc::clone(&shards))?,
             layers,
             cache_slots,
+            cache_mode,
         )?);
         let bank_alloc_s = t_bank.elapsed().as_secs_f64();
         let (mut dense_read, mut dense_bytes) = (0u64, 0u64);

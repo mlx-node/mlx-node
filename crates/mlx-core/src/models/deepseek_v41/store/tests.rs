@@ -152,13 +152,18 @@ fn row_range_checked() {
 }
 
 fn cached_store(mode: &str, slots: usize) -> Store {
+    cached_store_in(mode, slots, CacheMode::default())
+}
+
+fn cached_store_in(mode: &str, slots: usize, cache_mode: CacheMode) -> Store {
     let (act, fq) = mode_of(mode);
-    Store::open_dense(
+    Store::open_full(
         &[fixture("tiny-q8_0.gguf")],
         act,
         fq,
         CachePlan::Slots(slots),
         DenseMode::Exact,
+        cache_mode,
     )
     .unwrap()
 }
@@ -199,8 +204,11 @@ fn tiny_cache_bitwise_any_size() {
             .iter()
             .map(|c| run(&reference.model, &case_ids(&npz, c), &split(c)).0)
             .collect();
-        for slots in [1, 6, 16, 64] {
-            let store = cached_store(mode, slots);
+        for (slots, cm) in [1, 6, 16, 64]
+            .into_iter()
+            .flat_map(|s| [(s, CacheMode::Seeded), (s, CacheMode::Lru)])
+        {
+            let store = cached_store_in(mode, slots, cm);
             assert_eq!(store.cache_slots(), slots);
             for (case, want) in ["c1", "c2", "c3"].iter().zip(&want) {
                 let before = store.bank.stats();
@@ -209,12 +217,12 @@ fn tiny_cache_bitwise_any_size() {
                 assert_eq!(
                     bits(&got),
                     bits(want),
-                    "{mode} S={slots} {case}: cache != staging-only"
+                    "{mode} S={slots} {cm:?} {case}: cache != staging-only"
                 );
                 store.bank.with_cache_dir(|c| c.check()).unwrap();
                 pool_ok(case);
                 println!(
-                    "{mode} S={slots} {case}: bitwise; uses {} hits {} reads {} occupied {}",
+                    "{mode} S={slots} {cm:?} {case}: bitwise; uses {} hits {} reads {} occupied {}",
                     st.uses - before.uses,
                     st.hits - before.hits,
                     st.slots - before.slots,
@@ -440,8 +448,11 @@ fn tiny_cache_own_is_this_model_only() {
 fn tiny_cache_replay_matches_live() {
     use crate::moe_stream::replay::{Step, replay};
     let npz = Npz::open("oracle.npz");
-    for slots in [0, 1, 6, 16, 64] {
-        let store = cached_store("fp32_on", slots);
+    for (slots, cm) in [0, 1, 6, 16, 64]
+        .into_iter()
+        .flat_map(|s| [(s, CacheMode::Seeded), (s, CacheMode::Lru)])
+    {
+        let store = cached_store_in("fp32_on", slots, cm);
         let mut steps = Vec::new();
         for case in ["c1", "c2", "c3"] {
             let (_, traces) = run(&store.model, &case_ids(&npz, case), &split(case));
@@ -456,16 +467,17 @@ fn tiny_cache_replay_matches_live() {
             }
         }
         let cfg = &store.model.cfg;
-        let mut c = crate::moe_stream::cache::Cache::lru(slots, cfg.n_layers, cfg.n_routed_experts);
+        let mut c = crate::moe_stream::cache::Cache::lru(slots, cfg.n_layers, cfg.n_routed_experts)
+            .with_mode(cm);
         let r = replay(&mut c, cfg.n_routed_experts, &steps);
         let st = store.bank.stats();
         assert_eq!(
             (r.uses, r.hits, r.reads),
             (st.uses as u64, st.hits as u64, st.slots as u64),
-            "S={slots}: replay != live"
+            "S={slots} {cm:?}: replay != live"
         );
         println!(
-            "S={slots}: uses {} hits {} reads {} (h {:.3}, decode h {:.3})",
+            "S={slots} {cm:?}: uses {} hits {} reads {} (h {:.3}, decode h {:.3})",
             r.uses,
             r.hits,
             r.reads,

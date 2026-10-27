@@ -15,7 +15,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use napi::{Error, Result};
 
-use super::cache::{Cache, Source};
+use super::cache::{Cache, CacheMode, Source};
 use super::io::{Extent, IoPool, Priority, Read};
 use super::repack::SlotRepack;
 use crate::array::purgeable::{BankWatch, PurgeableBank, PurgeableState};
@@ -57,6 +57,9 @@ pub struct BankStats {
     pub uses: usize,
     /// Uses served from a cache slot.
     pub hits: usize,
+    /// Staging copies moved into cache slots at turn ends (no read).
+    pub promoted: usize,
+    pub promote_ns: u64,
 }
 
 /// Where one layer step's experts are: `slots[i]` is the bank slot of
@@ -89,6 +92,7 @@ pub struct StagingBank {
     /// `[layer][projection]`
     layers: Vec<Vec<ExpertTensor>>,
     n_experts: usize,
+    mode: CacheMode,
     inner: Mutex<Inner>,
     stats: Mutex<BankStats>,
     /// Test hook: no reads (a gather then meets stale tags).
@@ -127,12 +131,22 @@ impl StagingBank {
         Self::with_cache(pool, layers, 0)
     }
 
-    /// One bank per projection of `n_experts + cache_slots` slots for the
-    /// expert tensors `layers[layer][projection]` (same shape in every layer).
+    /// `with_mode` under `CacheMode::Lru` (S16a).
     pub fn with_cache(
         pool: IoPool,
         layers: Vec<Vec<ExpertTensor>>,
         cache_slots: usize,
+    ) -> Result<Self> {
+        Self::with_mode(pool, layers, cache_slots, CacheMode::Lru)
+    }
+
+    /// One bank per projection of `n_experts + cache_slots` slots for the
+    /// expert tensors `layers[layer][projection]` (same shape in every layer).
+    pub fn with_mode(
+        pool: IoPool,
+        layers: Vec<Vec<ExpertTensor>>,
+        cache_slots: usize,
+        mode: CacheMode,
     ) -> Result<Self> {
         let first = layers.first().ok_or_else(|| bad("no layers"))?;
         let mut n_experts = 0;
@@ -174,12 +188,13 @@ impl StagingBank {
             inner: Mutex::new(Inner {
                 proj,
                 tags: vec![None; n],
-                cache: Cache::lru(cache_slots, layers.len(), n),
+                cache: Cache::lru(cache_slots, layers.len(), n).with_mode(mode),
                 in_turn: true,
                 retired: Vec::new(),
             }),
             layers,
             n_experts: n,
+            mode,
             stats: Mutex::new(BankStats::default()),
             skip_fill: AtomicBool::new(false),
             #[cfg(test)]
@@ -189,6 +204,10 @@ impl StagingBank {
 
     pub fn n_experts(&self) -> usize {
         self.n_experts
+    }
+
+    pub fn mode(&self) -> CacheMode {
+        self.mode
     }
 
     pub fn cache_slots(&self) -> usize {
@@ -256,6 +275,7 @@ impl StagingBank {
             g.tags.fill(None);
             g.cache.clear();
         }
+        g.cache.new_turn();
         g.in_turn = true;
         Ok(emptied)
     }
@@ -284,6 +304,37 @@ impl StagingBank {
         }
         crate::array::synchronize();
         g.cache.complete_all();
+        let n = self.n_experts;
+        let total = n + g.cache.slots();
+        let t0 = std::time::Instant::now();
+        let inner = &mut *g;
+        let tags = &inner.tags;
+        let moved = inner
+            .cache
+            .promote_staged(&|l, e| tags[e as usize] == Some((l, e)));
+        for &(slot, _, e) in &moved {
+            for p in &inner.proj {
+                for b in [&p.w, &p.s] {
+                    let sb = b.nbytes() / total;
+                    // SAFETY: both ranges lie inside the bank (slot e < n and
+                    // n + slot < total, `sb` = one slot's bytes), they do not
+                    // overlap, the GPU is idle (synchronize above) and the
+                    // bank lock is held; the bank is non-volatile in a turn.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            b.data_ptr().0.add(e as usize * sb),
+                            b.data_ptr().0.add((n + slot as usize) * sb),
+                            sb,
+                        );
+                    }
+                }
+            }
+        }
+        if !moved.is_empty() {
+            let mut st = lock(&self.stats);
+            st.promoted += moved.len();
+            st.promote_ns += t0.elapsed().as_nanos() as u64;
+        }
         let state = if self.empty_between_turns() {
             PurgeableState::Empty
         } else {
@@ -340,7 +391,7 @@ impl StagingBank {
             ));
         }
         g.proj = alloc(&self.layers[0], (self.n_experts + cache_slots) as i64)?;
-        g.cache = Cache::lru(cache_slots, self.layers.len(), self.n_experts);
+        g.cache = Cache::lru(cache_slots, self.layers.len(), self.n_experts).with_mode(self.mode);
         g.in_turn = true;
         Ok(())
     }
@@ -385,17 +436,36 @@ impl StagingBank {
 
     /// Slots for one layer step's distinct, sorted `experts`: cache hits
     /// in place; with `decode`, misses read into cache victims; the rest
-    /// into staging slots whose tag is not `(layer, e)`. Drains the GPU
-    /// before any CPU write. Graphs built on the returned arrays must be
-    /// evaluated, then `done(epoch)`, before the next step may evict them.
-    pub fn prepare(&self, layer: usize, experts: &[u32], decode: bool) -> Result<Prepared> {
+    /// into staging slots whose tag is not `(layer, e)`. `uses[i]` = rows
+    /// using `experts[i]` (`CacheMode::Seeded` prefill order; may be empty).
+    /// Drains the GPU before any CPU write. Graphs built on the returned
+    /// arrays must be evaluated, then `done(epoch)`, before the next step may
+    /// evict them.
+    pub fn prepare(
+        &self,
+        layer: usize,
+        experts: &[u32],
+        uses: &[u32],
+        decode: bool,
+    ) -> Result<Prepared> {
         let mut g = lock(&self.inner);
         self.check_step(&g, layer, experts)?;
+        if !uses.is_empty() && uses.len() != experts.len() {
+            return Err(bad(format!(
+                "{} use counts for {} experts",
+                uses.len(),
+                experts.len()
+            )));
+        }
         if !g.in_turn {
             self.begin(&mut g)?;
         }
         let n = self.n_experts as u32;
-        let (epoch, src) = g.cache.plan(layer, experts, decode);
+        let inner = &mut *g;
+        let tags = &inner.tags;
+        let (epoch, src) = inner.cache.plan_step(layer, experts, uses, decode, &|e| {
+            tags[e as usize] == Some((layer, e))
+        });
         let (mut slots, mut staging, mut victims, mut hits) =
             (Vec::new(), Vec::new(), Vec::new(), 0);
         for (&e, s) in experts.iter().zip(&src) {

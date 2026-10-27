@@ -8,7 +8,7 @@ use std::io::BufRead;
 use napi::{Error, Result};
 use serde_json::Value;
 
-use super::cache::{Cache, Source, decode_step};
+use super::cache::{Cache, CacheMode, Source, decode_step};
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("moe_stream replay: {msg}"))
@@ -109,6 +109,18 @@ pub struct Replayed {
 }
 
 impl Replayed {
+    /// Counts of two runs together.
+    pub fn plus(self, o: Self) -> Self {
+        Self {
+            uses: self.uses + o.uses,
+            hits: self.hits + o.hits,
+            decode_uses: self.decode_uses + o.decode_uses,
+            decode_hits: self.decode_hits + o.decode_hits,
+            reads: self.reads + o.reads,
+            decode_reads: self.decode_reads + o.decode_reads,
+        }
+    }
+
     pub fn h(&self) -> f64 {
         self.hits as f64 / self.uses.max(1) as f64
     }
@@ -122,6 +134,72 @@ impl Replayed {
 /// as the bank keeps them.
 pub fn replay(cache: &mut Cache, experts: usize, steps: &[Step]) -> Replayed {
     replay_pinned(cache, experts, steps, &[])
+}
+
+/// `replay` of consecutive turns on one cache and one set of staging tags
+/// (between turns `Cache::promote_staged` and `Cache::new_turn`, as the
+/// bank's turn end and start); one result per turn.
+pub fn replay_turns(cache: &mut Cache, experts: usize, turns: &[&[Step]]) -> Vec<Replayed> {
+    let mut tags = vec![None; experts];
+    turns
+        .iter()
+        .enumerate()
+        .map(|(i, steps)| {
+            if i > 0 {
+                // the bank's turn end, then its turn start
+                let tg = &tags;
+                cache.complete_all();
+                cache.promote_staged(&|l, e| tg[e as usize] == Some((l, e)));
+                cache.new_turn();
+            }
+            run_tagged(cache, &mut tags, steps, &[], None)
+        })
+        .collect()
+}
+
+/// Per decode token (`layers` consecutive decode steps): (uses, cache
+/// hits, reads) of each decode token of `turns`, replayed on `cache` from a
+/// fresh bank with the bank's turn end / start between turns (as
+/// `replay_turns`).
+pub fn per_token(
+    cache: &mut Cache,
+    experts: usize,
+    layers: usize,
+    turns: &[&[Step]],
+) -> Vec<(u64, u64, u64)> {
+    let mut tags = vec![None; experts];
+    let mut out: Vec<(u64, u64, u64)> = Vec::new();
+    for (i, steps) in turns.iter().enumerate() {
+        if i > 0 {
+            let tg = &tags;
+            cache.complete_all();
+            cache.promote_staged(&|l, e| tg[e as usize] == Some((l, e)));
+            cache.new_turn();
+        }
+        let mut in_tok = 0;
+        for s in steps.iter() {
+            let r = run_tagged(cache, &mut tags, std::slice::from_ref(s), &[], None);
+            if !decode_step(s.rows) {
+                in_tok = 0;
+                continue;
+            }
+            if in_tok == 0 {
+                out.push((0, 0, 0));
+            }
+            if let Some(t) = out.last_mut() {
+                t.0 += r.uses;
+                t.1 += r.hits;
+                t.2 += r.reads;
+            }
+            in_tok = (in_tok + 1) % layers.max(1);
+        }
+    }
+    out
+}
+
+/// A fresh cache of `slots` slots under `mode` (LRU eviction).
+pub fn cache_for(t: &RouteTrace, slots: usize, mode: CacheMode) -> Cache {
+    Cache::lru(slots, t.layers, t.experts).with_mode(mode)
 }
 
 /// `replay` with whole layers resident: every expert of a layer with
@@ -150,14 +228,34 @@ fn run(
     experts: usize,
     steps: &[Step],
     pinned: &[bool],
-    mut per_layer: Option<&mut Vec<(u64, u64)>>,
+    per_layer: Option<&mut Vec<(u64, u64)>>,
 ) -> Replayed {
     let mut tags: Vec<Option<(usize, u32)>> = vec![None; experts];
+    run_tagged(cache, &mut tags, steps, pinned, per_layer)
+}
+
+fn run_tagged(
+    cache: &mut Cache,
+    tags: &mut [Option<(usize, u32)>],
+    steps: &[Step],
+    pinned: &[bool],
+    mut per_layer: Option<&mut Vec<(u64, u64)>>,
+) -> Replayed {
     let mut out = Replayed::default();
     for s in steps {
-        let mut want = s.ids.clone();
-        want.sort_unstable();
-        want.dedup();
+        let mut sorted = s.ids.clone();
+        sorted.sort_unstable();
+        let (mut want, mut uses) = (Vec::new(), Vec::<u32>::new());
+        for e in sorted {
+            if want.last() == Some(&e) {
+                if let Some(c) = uses.last_mut() {
+                    *c += 1;
+                }
+            } else {
+                want.push(e);
+                uses.push(1);
+            }
+        }
         let decode = decode_step(s.rows);
         let n = want.len() as u64;
         out.uses += n;
@@ -171,7 +269,13 @@ fn run(
             }
             continue;
         }
-        let (epoch, src) = cache.plan(s.layer, &want, decode);
+        let layer = s.layer;
+        let (epoch, src) = {
+            let tg = &*tags;
+            cache.plan_step(layer, &want, &uses, decode, &|e| {
+                tg[e as usize] == Some((layer, e))
+            })
+        };
         let mut reads = 0;
         for (&e, x) in want.iter().zip(&src) {
             match *x {

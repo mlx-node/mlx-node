@@ -173,9 +173,10 @@ pub fn line(
         "ttft_s": ttft_s,
         "prefill_tok_s": prompt_tok as f64 / ttft_s.max(1e-9),
         "decode_tok_s_median": if med > 0.0 { 1.0 / med } else { 0.0 },
-        // every expert has the same size: byte and use hit rates are equal
+        // cache hits per use; bytes: every use served without a read (cache
+        // hits and still-valid staging copies; all experts have one size)
         "hit_rate_uses": c.hits as f64 / c.uses.max(1) as f64,
-        "hit_rate_bytes": c.hits as f64 / c.uses.max(1) as f64,
+        "hit_rate_bytes": 1.0 - c.fill_slots as f64 / c.uses.max(1) as f64,
         "miss_gb_per_tok": c.fill_bytes as f64 / 1e9 / toks,
         "read_gbps": c.fill_bytes as f64 / 1e9 / io_s.max(1e-9),
         "t_c_ms": (wall_s - io_s - eng_s) * 1e3 / toks,

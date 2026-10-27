@@ -147,6 +147,8 @@ fn real_cache_inv(name: &str, plan: CachePlan, turns: &[usize], empty_after_firs
     let mut route_lines: Vec<String> = Vec::new();
     let (mut dec_c, mut dec_wall, mut dec_n) = (Counters::default(), 0.0, 0usize);
     let mut turn3: Option<Value> = None;
+    // bank (uses, hits, slots read) after every call
+    let mut per_call: Vec<(u64, u64, u64)> = Vec::new();
     for (ti, &steps) in turns.iter().enumerate() {
         store.bank.test_force_empty(empty_after_first && ti == 0);
         let switches_before = store.switches().len();
@@ -177,6 +179,8 @@ fn real_cache_inv(name: &str, plan: CachePlan, turns: &[usize], empty_after_firs
                 let v = read(c.logits);
                 let row = &v[v.len() - vocab..];
                 hashes.push(hex_sha(row));
+                let b = store.bank.stats();
+                per_call.push((b.uses as u64, b.hits as u64, b.slots as u64));
                 if !v.iter().all(|x| x.is_finite()) {
                     bad_calls.push(first_call + c.index);
                 }
@@ -289,25 +293,23 @@ fn real_cache_inv(name: &str, plan: CachePlan, turns: &[usize], empty_after_firs
     );
     let slots = store.cache_slots();
     let replayed = if store.switches().is_empty() {
-        let mut c = crate::moe_stream::cache::Cache::lru(slots, n_layers, n_experts);
-        let r1 = crate::moe_stream::replay::replay(&mut c, n_experts, &turn_steps[0]);
-        let rest: Vec<_> = turn_steps[1..].concat();
-        let r2 = if empty_after_first {
-            let mut c2 = crate::moe_stream::cache::Cache::lru(slots, n_layers, n_experts);
-            crate::moe_stream::replay::replay(&mut c2, n_experts, &rest)
+        use crate::moe_stream::replay::{Replayed, replay_turns};
+        let mode = store.bank.mode();
+        let mk = || crate::moe_stream::cache::Cache::lru(slots, n_layers, n_experts).with_mode(mode);
+        let sum = |v: Vec<Replayed>| v.into_iter().fold(Replayed::default(), Replayed::plus);
+        let turns_s: Vec<&[crate::moe_stream::replay::Step]> =
+            turn_steps.iter().map(Vec::as_slice).collect();
+        let (r1, r2) = if empty_after_first {
+            // the bank forgot every slot and tag between turn 1 and 2
+            (
+                sum(replay_turns(&mut mk(), n_experts, &turns_s[..1])),
+                sum(replay_turns(&mut mk(), n_experts, &turns_s[1..])),
+            )
         } else {
             // one cache and one set of staging tags across every turn
-            let mut c2 = crate::moe_stream::cache::Cache::lru(slots, n_layers, n_experts);
-            let all: Vec<_> = turn_steps.concat();
-            let r = crate::moe_stream::replay::replay(&mut c2, n_experts, &all);
-            crate::moe_stream::replay::Replayed {
-                uses: r.uses - r1.uses,
-                hits: r.hits - r1.hits,
-                decode_uses: r.decode_uses - r1.decode_uses,
-                decode_hits: r.decode_hits - r1.decode_hits,
-                reads: r.reads - r1.reads,
-                decode_reads: r.decode_reads - r1.decode_reads,
-            }
+            let mut v = replay_turns(&mut mk(), n_experts, &turns_s);
+            let rest = v.split_off(1);
+            (sum(v), sum(rest))
         };
         let rep = (r1.uses + r2.uses, r1.hits + r2.hits, r1.reads + r2.reads);
         if rep != live {
@@ -391,6 +393,19 @@ fn real_cache_inv(name: &str, plan: CachePlan, turns: &[usize], empty_after_firs
         }
     }
 
+    // P2: the first 16 decode tokens (calls 1..=16; call 0 is the prompt)
+    let first16 = {
+        let at = |i: usize| per_call.get(i).copied().unwrap_or_default();
+        let (a, b) = (at(0), at(16.min(per_call.len().saturating_sub(1))));
+        let (u, h, r) = (b.0 - a.0, b.1 - a.1, b.2 - a.2);
+        serde_json::json!({
+            "tokens": 16.min(per_call.len().saturating_sub(1)),
+            "uses": u, "hits": h, "reads": r,
+            "h": h as f64 / u.max(1) as f64,
+            "byte_h": 1.0 - r as f64 / u.max(1) as f64,
+        })
+    };
+    println!("{name}: first 16 decode tokens {first16} (cache mode {:?})", store.bank.mode());
     let (_, swap1) = super::stats::host_pressure();
     let swap_d = swap1.zip(swap0).map_or(0, |(a, b)| a as i64 - b as i64);
     let fp_peak = sampler.finish();
@@ -409,6 +424,8 @@ fn real_cache_inv(name: &str, plan: CachePlan, turns: &[usize], empty_after_firs
         "switches": store.switches(),
         "turns": turns_doc,
         "decode_terms": decode,
+        "cache_mode": format!("{:?}", store.bank.mode()),
+        "first16": first16,
         "turn3_terms": turn3,
         "live": {"uses": live.0, "hits": live.1, "reads": live.2},
         "replay": replayed.map(|r| serde_json::json!({"uses": r.0, "hits": r.1, "reads": r.2})),
@@ -469,6 +486,18 @@ fn real_cache_inv_auto() {
     assert!(s16_env("MLX_DSV41_ADMIT_ONLY").is_none());
     let limits = Limits::from_env().unwrap();
     real_cache_inv("auto", CachePlan::Admit(limits), &S16_TURNS, true);
+}
+
+/// P2: `real_cache_inv_auto` with the bank kept (volatile, not emptied)
+/// between turns, so the first 16 decode tokens see what turn 1's prefill
+/// seeded; hashes == c0 (bitwise) as in every cache run.
+#[test]
+#[ignore = "real 9 shards + c0 hashes; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=<N_auto>; ~18 GiB + N_auto"]
+fn real_cache_keep_auto() {
+    assert!(s16_env(CACHE_ENV).is_some(), "{CACHE_ENV} = N_auto (cap)");
+    assert!(s16_env("MLX_DSV41_ADMIT_ONLY").is_none());
+    let limits = Limits::from_env().unwrap();
+    real_cache_inv("keep", CachePlan::Admit(limits), &S16_TURNS, false);
 }
 
 /// The admission this host gives right now, from the shard headers alone:

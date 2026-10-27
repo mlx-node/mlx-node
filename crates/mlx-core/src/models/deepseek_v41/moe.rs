@@ -319,10 +319,20 @@ impl Moe {
         match &self.w.experts {
             Experts::Resident(banks) => run(banks, &ids),
             Experts::Stream(st) => {
-                let mut used = ids.clone();
-                used.sort_unstable();
-                used.dedup();
-                let p = st.prepare(self.layer, &used, decode_step(rows as usize))?;
+                let mut sorted = ids.clone();
+                sorted.sort_unstable();
+                let (mut used, mut uses) = (Vec::new(), Vec::<u32>::new());
+                for e in sorted {
+                    if used.last() == Some(&e) {
+                        if let Some(c) = uses.last_mut() {
+                            *c += 1;
+                        }
+                    } else {
+                        used.push(e);
+                        uses.push(1);
+                    }
+                }
+                let p = st.prepare(self.layer, &used, &uses, decode_step(rows as usize))?;
                 st.assert_slots(&p);
                 let slot_ids: Vec<u32> = ids
                     .iter()

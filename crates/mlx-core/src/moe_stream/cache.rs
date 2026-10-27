@@ -6,6 +6,7 @@
 //! among slots that hold no expert of the step's wanted set and whose last
 //! GPU use is complete. Pure host bookkeeping: the bank owns the bytes.
 
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
 
 const NONE: u32 = u32::MAX;
@@ -140,6 +141,25 @@ impl Policy for LfuDecay {
     }
 }
 
+/// What enters the cache besides decode misses (stage P2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CacheMode {
+    /// Decode misses only; prefill misses are staged, and a decode miss is
+    /// read into a victim even when its staging copy is still valid (S16a).
+    Lru,
+    /// `Lru`, plus: each layer places up to `slots / layers` of its prefill
+    /// misses per turn in victims (most-used rows first, then lowest id;
+    /// a free slot or one holding the same layer's expert, never another
+    /// layer's resident); a
+    /// decode miss whose staging slot still holds it is served from there
+    /// without a read, and at the turn's end those staging copies that are
+    /// still valid move into victims ([`Cache::promote_staged`], a copy, no
+    /// read), so the next turn finds them although its prefill refills
+    /// staging.
+    #[default]
+    Seeded,
+}
+
 /// Where one wanted expert of a layer step is served from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -162,6 +182,13 @@ pub struct Cache {
     epoch: u64,
     completed: u64,
     policy: Box<dyn Policy>,
+    mode: CacheMode,
+    /// Prefill misses placed in victims this turn, per layer (`Seeded`).
+    seeded: Vec<usize>,
+    /// Per `(layer, expert)`: tick of its last decode use served from
+    /// staging this turn (0 = none; `Seeded`).
+    staged_at: Vec<u64>,
+    staged_tick: u64,
 }
 
 impl Cache {
@@ -176,7 +203,65 @@ impl Cache {
             epoch: 0,
             completed: 0,
             policy,
+            mode: CacheMode::Lru,
+            seeded: vec![0; n_layers],
+            staged_at: vec![0; n_layers * n_experts],
+            staged_tick: 0,
         }
+    }
+
+    pub fn with_mode(mut self, mode: CacheMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn mode(&self) -> CacheMode {
+        self.mode
+    }
+
+    /// A new turn: every layer's prefill seeding quota is full again.
+    pub fn new_turn(&mut self) {
+        self.seeded.fill(0);
+        self.staged_at.fill(0);
+    }
+
+    /// Turn end (`Seeded`; all GPU work complete): every `(layer, e)` this turn
+    /// served from staging that `valid` says its staging slot still holds and
+    /// the cache does not, gets a victim, most recently used last. Returns
+    /// `(slot, layer, e)` per placement, already mapped: the caller copies
+    /// staging slot `e` into cache slot `slot` before any gather.
+    pub fn promote_staged(&mut self, valid: &dyn Fn(usize, u32) -> bool) -> Vec<(u32, usize, u32)> {
+        let mut used: Vec<(u64, usize)> = self
+            .staged_at
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| **t > 0)
+            .map(|(k, &t)| (t, k))
+            .collect();
+        self.staged_at.fill(0);
+        let mut out = Vec::new();
+        if self.occ.is_empty() || used.is_empty() {
+            return out;
+        }
+        used.sort_unstable();
+        self.epoch += 1;
+        let epoch = self.epoch;
+        for (_, k) in used {
+            let (layer, e) = (k / self.n_experts, (k % self.n_experts) as u32);
+            if self.lookup(layer, e).is_some() || !valid(layer, e) {
+                continue;
+            }
+            let Some(v) = self.victim(layer, &[]) else {
+                break;
+            };
+            self.unmap(v);
+            self.last_use[v as usize] = epoch;
+            self.commit(v, layer, e);
+            out.push((v, layer, e));
+        }
+        // the copies are host work done before the next step
+        self.completed = self.epoch;
+        out
     }
 
     pub fn lru(slots: usize, n_layers: usize, n_experts: usize) -> Self {
@@ -250,6 +335,31 @@ impl Cache {
     /// miss gets a victim when `decode` (else, or with no victim left, its
     /// staging slot). `wanted` holds distinct expert ids.
     pub fn plan(&mut self, layer: usize, wanted: &[u32], decode: bool) -> (u64, Vec<Source>) {
+        self.plan_step(layer, wanted, &[], decode, &|_| false)
+    }
+
+    /// `plan` with the `Seeded` rules: `uses[i]` = rows of the step that use
+    /// `wanted[i]` (prefill seeding order; empty = all equal), `staged(e)` =
+    /// the staging slot of `e` holds this layer's copy. Under `Lru` both are
+    /// ignored and this is `plan`.
+    pub fn plan_step(
+        &mut self,
+        layer: usize,
+        wanted: &[u32],
+        uses: &[u32],
+        decode: bool,
+        staged: &dyn Fn(u32) -> bool,
+    ) -> (u64, Vec<Source>) {
+        debug_assert!(
+            wanted.windows(2).all(|w| w[0] < w[1]),
+            "moe_stream cache: wanted must be sorted and distinct"
+        );
+        assert!(
+            uses.is_empty() || uses.len() == wanted.len(),
+            "moe_stream cache: {} use counts for {} experts",
+            uses.len(),
+            wanted.len()
+        );
         self.epoch += 1;
         let epoch = self.epoch;
         let mut out: Vec<Source> = wanted
@@ -263,27 +373,65 @@ impl Cache {
                 None => Source::Staging,
             })
             .collect();
-        if !decode || self.occ.is_empty() {
+        let seeded = self.mode == CacheMode::Seeded;
+        if self.occ.is_empty() || (!decode && !seeded) {
             return (epoch, out);
         }
-        for src in out.iter_mut().filter(|s| **s == Source::Staging) {
-            let Some(v) = self.victim(layer, wanted) else {
+        let mut miss = Vec::new();
+        for i in 0..wanted.len() {
+            if out[i] != Source::Staging {
+                continue;
+            }
+            if decode && seeded && staged(wanted[i]) {
+                let k = self.key(layer, wanted[i]);
+                self.staged_tick += 1;
+                self.staged_at[k] = self.staged_tick;
+            } else {
+                miss.push(i);
+            }
+        }
+        let take = if decode {
+            miss.len()
+        } else {
+            miss.sort_by_key(|&i| (Reverse(uses.get(i).copied().unwrap_or(0)), i));
+            let quota = self.occ.len() / self.n_layers.max(1);
+            quota.saturating_sub(self.seeded[layer]).min(miss.len())
+        };
+        for &i in &miss[..take] {
+            let Some(v) = self.victim_where(layer, wanted, !decode) else {
                 break;
             };
             self.unmap(v);
             self.last_use[v as usize] = epoch;
-            *src = Source::Victim(v);
+            out[i] = Source::Victim(v);
+            if !decode {
+                self.seeded[layer] += 1;
+            }
         }
         (epoch, out)
     }
 
     fn victim(&mut self, layer: usize, wanted: &[u32]) -> Option<u32> {
+        self.victim_where(layer, wanted, false)
+    }
+
+    /// `own_layer`: an occupied victim must hold an expert of `layer` (a
+    /// prefill seed never evicts another layer's resident, which this very
+    /// prefill pass may still hit).
+    fn victim_where(&mut self, layer: usize, wanted: &[u32], own_layer: bool) -> Option<u32> {
         let (epoch, completed) = (self.epoch, self.completed);
+        // `wanted` is sorted (callers' contract, asserted in tests)
         let ok = |s: u32| {
             let s = s as usize;
             self.last_use[s] <= completed
                 && self.last_use[s] < epoch
-                && !matches!(self.occ[s], Some((l, e)) if l as usize == layer && wanted.contains(&e))
+                && match self.occ[s] {
+                    Some((l, e)) => {
+                        l as usize == layer && wanted.binary_search(&e).is_err()
+                            || l as usize != layer && !own_layer
+                    }
+                    None => true,
+                }
         };
         if let Some(i) = self.free.iter().rposition(|&s| ok(s)) {
             return Some(self.free.remove(i));

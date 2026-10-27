@@ -289,6 +289,10 @@ impl Inner {
                 (d.hits as f64 / d.uses.max(1) as f64).into(),
             );
             obj.insert(
+                "decode_h_bytes".into(),
+                (1.0 - d.fill_slots as f64 / d.uses.max(1) as f64).into(),
+            );
+            obj.insert(
                 "decode_read_gbps".into(),
                 (d.fill_bytes as f64 / 1e9 / io.max(1e-9)).into(),
             );
