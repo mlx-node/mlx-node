@@ -277,6 +277,14 @@ fn real_e2e_tf(case: &str) {
         g.argmax,
         gd.greedy
     );
+    // §3: more than 1 % of a site's rows excused also fails
+    let n_rows: usize = gd.calls.iter().map(|c| c.1.len()).sum();
+    if excused.len() as f64 > 0.01 * n_rows as f64 {
+        fails.push(format!(
+            "G14.1 top-1 excused {} of {n_rows} rows > 1 % (§3 site cap)",
+            excused.len()
+        ));
+    }
     check_io(&g, gd.calls.len(), cfg.n_layers, &mut fails);
     finish(&format!("real_e2e_tf {case}"), &fails);
 }
@@ -504,7 +512,7 @@ fn real_e2e_chunk7_en() {
     let vocab = store.model.cfg.vocab_size;
     let p = gd.prompt.len();
     let mut sess = store.model.new_session();
-    let (mut hashes, mut rows) = (Vec::new(), Vec::<f32>::new());
+    let (mut hashes, mut rows, mut bad_calls) = (Vec::new(), Vec::<f32>::new(), Vec::new());
     let g = generate(
         &store,
         &mut sess,
@@ -517,11 +525,17 @@ fn real_e2e_chunk7_en() {
             let v = read(c.logits);
             hashes.push(hex_sha(&v));
             rows.extend_from_slice(&v);
+            if !v.iter().all(|x| x.is_finite()) {
+                bad_calls.push(c.index);
+            }
             Ok(())
         },
     )
     .unwrap();
     let mut fails = Vec::new();
+    if !bad_calls.is_empty() {
+        fails.push(format!("non-finite logits in calls {bad_calls:?}"));
+    }
     // whole-run picks: argmax of row p-1, then of each step row
     let whole_pick =
         |j: usize| super::generate::argmax(&whole[(p - 1 + j) * vocab..(p + j) * vocab]);
