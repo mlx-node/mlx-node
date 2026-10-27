@@ -335,6 +335,26 @@ fn invariants_cancel_restores() {
     assert!(clean.iter().zip(&out).all(|(x, y)| x.to_bits() == y.to_bits()));
 }
 
+/// S14c: `forward_last` returns the last row of `forward`'s logits (the head
+/// GEMM has another M, so within 1e-6) and leaves the same session: the next
+/// call's logits are bitwise equal.
+#[test]
+fn forward_last_is_the_last_row() {
+    let (g, npz) = (TinyGguf::open(), Npz::open("oracle.npz"));
+    let m = tiny(&g, DType::Float32, FakeQuant::ON, false);
+    let ids = case_ids(&npz, "c2");
+    let (mut a, mut b) = (m.new_session(), m.new_session());
+    let full = read(&m.forward(&mut a, &ids[..23], None, None).unwrap());
+    let last = m.forward_last(&mut b, &ids[..23], None, None).unwrap();
+    assert_eq!(last.shape().unwrap().as_ref(), [1, VOCAB as i64]);
+    let r = rel_l2(&read(&last), &full[22 * VOCAB..]);
+    println!("forward_last vs forward row 22: relL2 {r:e}");
+    assert!(r <= 1e-6, "{r:e}");
+    let na = read(&m.forward(&mut a, &ids[23..], None, None).unwrap());
+    let nb = read(&m.forward(&mut b, &ids[23..], None, None).unwrap());
+    assert!(na.iter().zip(&nb).all(|(x, y)| x.to_bits() == y.to_bits()));
+}
+
 /// G9.3: routes, engram rows, index top-k and candidate blocks equal the
 /// oracle's bit for bit (f32 modes; every f32 boundary is >= 10x its noise).
 #[test]

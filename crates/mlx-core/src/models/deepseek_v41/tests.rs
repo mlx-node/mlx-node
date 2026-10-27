@@ -432,3 +432,6 @@ include!("tests_groups.rs");
 
 // S14a real end to end vs the S12 goldens
 include!("tests_e2e.rs");
+
+// S14c compute memory vs prompt length (real)
+include!("tests_compute.rs");

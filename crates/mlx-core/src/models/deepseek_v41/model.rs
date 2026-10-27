@@ -171,11 +171,41 @@ impl Model {
         trace: Option<&mut Trace>,
     ) -> Result<MxArray> {
         let before = sess.clone();
-        let out = self.forward_inner(sess, ids, cancel, trace);
+        let out = self.forward_inner(sess, ids, cancel, trace, false);
         if out.is_err() {
             *sess = before;
         }
         out
+    }
+
+    /// `forward`, but only the last row's f32 logits `[1, vocab]` (a prompt
+    /// prefill: no `[ids.len(), vocab]` logits block).
+    pub fn forward_last(
+        &self,
+        sess: &mut Session,
+        ids: &[u32],
+        cancel: Option<&dyn Fn(usize) -> bool>,
+        trace: Option<&mut Trace>,
+    ) -> Result<MxArray> {
+        let before = sess.clone();
+        let out = self.forward_inner(sess, ids, cancel, trace, true);
+        if out.is_err() {
+            *sess = before;
+        }
+        out
+    }
+
+    /// Largest scratch chunk any compressed attention has used (indexer
+    /// scores, sparse attention), bytes.
+    pub fn scratch_peak(&self) -> usize {
+        self.blocks
+            .iter()
+            .filter_map(|b| match &b.attn {
+                super::block::Attn::Compressed(c) => Some(c.scratch_peak()),
+                super::block::Attn::Window(_) => None,
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     fn forward_inner(
@@ -184,6 +214,7 @@ impl Model {
         ids: &[u32],
         cancel: Option<&dyn Fn(usize) -> bool>,
         mut trace: Option<&mut Trace>,
+        last_only: bool,
     ) -> Result<MxArray> {
         let (s, start) = (ids.len() as i64, sess.tokens.len());
         let (hc, dim) = (self.cfg.hc_mult as i64, self.cfg.dim as i64);
@@ -228,6 +259,11 @@ impl Model {
         )?;
         let x = rms_norm(&hc_pre(&h, &pre_mix)?, &self.norm, self.cfg.norm_eps)?
             .astype(DType::Float32)?;
+        let x = if last_only {
+            x.slice(&[s - 1, 0], &[s, dim])?
+        } else {
+            x
+        };
         fp32_site("head_input", self.cfg.n_layers, &x)?;
         let logits = self.head_logits(&x)?;
         MxArray::eval_arrays_with_context(&[&logits], "deepseek_v41 head")?;
