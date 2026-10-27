@@ -983,6 +983,16 @@ pub(crate) trait ChatBackend {
         None
     }
 
+    /// Session token limit the family itself enforces on every forward, or
+    /// `None`. The generic flat turn caps `max_new_tokens` at
+    /// `limit + 1 - prompt` with it (a length exit never forwards its last
+    /// token), so a turn at the limit ends with `length` instead of a failed
+    /// forward. Families without a native limit leave the TS context
+    /// preflight in charge.
+    fn context_token_limit(&self) -> Option<usize> {
+        None
+    }
+
     /// Byte budget for the turn's `WiredLimitContext`, or `None` for NO
     /// context at all.
     ///

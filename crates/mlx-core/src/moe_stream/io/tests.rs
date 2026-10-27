@@ -19,6 +19,9 @@ const K: usize = 256;
 const ABS: u64 = 1600;
 const PER: usize = OUT * K / 32 * 17;
 const SENTINEL: u8 = 0xAB;
+/// Repack bands per slot read: the production size (one band for these
+/// small experts) and 50-row bands (6 bands, 5 of them for helpers).
+const BANDS: [usize; 2] = [REPACK_BAND_BYTES, 50 * K / 32 * 17];
 
 struct Temp(PathBuf);
 impl Temp {
@@ -171,10 +174,16 @@ fn expert_reads(f: &Fixture, b: &Bank) -> Vec<Read> {
 
 #[test]
 fn slots_match_loader_and_gpu_repack() {
+    for band in BANDS {
+        slots_match(band);
+    }
+}
+
+fn slots_match(band: usize) {
     let f = fixture();
     let want = references(&f);
     let shards = Arc::new(ShardSet::open(&[&f.path]).unwrap());
-    let pool = IoPool::new(Arc::clone(&shards), 3).unwrap();
+    let pool = IoPool::with_band_bytes(Arc::clone(&shards), 3, band).unwrap();
     let b = bank(&f);
     let mut reads = expert_reads(&f, &b);
     assert_eq!(reads[0].extent.offset, ABS);
@@ -227,10 +236,16 @@ fn assert_unpublished(b: &Bank, want: &[(Vec<u8>, Vec<u8>)], failed: &[usize]) {
 
 #[test]
 fn short_read_fails_and_leaves_slot_unwritten() {
+    for band in BANDS {
+        short_read(band);
+    }
+}
+
+fn short_read(band: usize) {
     let f = fixture();
     let want = references(&f);
     let shards = Arc::new(ShardSet::open(&[&f.path]).unwrap());
-    let pool = IoPool::new(Arc::clone(&shards), 4).unwrap();
+    let pool = IoPool::with_band_bytes(Arc::clone(&shards), 4, band).unwrap();
     let b = bank(&f);
     std::fs::OpenOptions::new()
         .write(true)
@@ -252,12 +267,18 @@ fn short_read_fails_and_leaves_slot_unwritten() {
 
 #[test]
 fn eio_fails_and_leaves_slot_unwritten() {
+    for band in BANDS {
+        eio(band);
+    }
+}
+
+fn eio(band: usize) {
     let f = fixture();
     let want = references(&f);
     let shards = Arc::new(ShardSet::open(&[&f.path]).unwrap());
     // Inside expert 3's 16 KiB-padded window only (one expert > one page).
     *lock(&shards.fault) = Some((0, ABS + 3 * PER as u64 + 12_000));
-    let pool = IoPool::new(Arc::clone(&shards), 4).unwrap();
+    let pool = IoPool::with_band_bytes(Arc::clone(&shards), 4, band).unwrap();
     let b = bank(&f);
     // SAFETY: `b` outlives the ticket; one read per slot.
     let err = unsafe { pool.submit(expert_reads(&f, &b), Priority::Low) }
@@ -498,14 +519,10 @@ fn resident_pages(shards: &ShardSet, extents: &[Extent]) -> (usize, usize) {
     (resident, pages)
 }
 
-/// Real shards 2-7 (`DSV41_DIR`): pool slots == plain `pread` + independent
-/// repack for 64 random experts; then a decode-shaped run (6 misses x 40
-/// layers, barrier per layer) prints the rate; then a `mincore` probe of the
-/// last layer's extents. Shard 8 is never opened.
+/// Shards 2-7 of `DSV41_DIR` (never shard 8) and every layer's
+/// gate / up / down expert tensors.
 #[cfg(target_os = "macos")]
-#[test]
-#[ignore = "needs DSV41_DIR with the real DeepSeek-V4.1 shards"]
-fn real_smoke() {
+fn real_layers() -> (Vec<PathBuf>, Arc<ShardSet>, Vec<[RealProj; 3]>) {
     let dir = PathBuf::from(std::env::var("DSV41_DIR").expect("DSV41_DIR"));
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
         .unwrap()
@@ -552,6 +569,18 @@ fn real_smoke() {
         .into_values()
         .map(|ps| ps.map(|p| p.expect("gate/up/down per layer")))
         .collect();
+    (paths, shards, layers)
+}
+
+/// Real shards 2-7 (`DSV41_DIR`): pool slots == plain `pread` + independent
+/// repack for 64 random experts; then a decode-shaped run (6 misses x 40
+/// layers, barrier per layer) prints the rate; then a `mincore` probe of the
+/// last layer's extents. Shard 8 is never opened.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs DSV41_DIR with the real DeepSeek-V4.1 shards"]
+fn real_smoke() {
+    let (paths, shards, layers) = real_layers();
     let pool = IoPool::from_env(Arc::clone(&shards)).unwrap();
     println!(
         "real_smoke: {} reader threads, profile debug_assertions={}",
@@ -700,4 +729,89 @@ fn real_smoke() {
         "real_smoke mincore: last layer's 18 extents {before_res} of {pages} pages resident before the reads, \
          {resident} after"
     );
+}
+
+/// P1 rates of the pool (`MLX_MOE_STREAM_IO_THREADS`) on real shards 2-7,
+/// read + repack into host slots, barrier per layer step, every (layer,
+/// expert) read at most once per process until the permutation wraps:
+/// K = 2 misses per layer for 3 tokens, then all-miss tokens (K = 6) back
+/// to back for `DSV41_P1_SUSTAIN_S` seconds (default 20). Prints one JSON
+/// line per part.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs DSV41_DIR with the real DeepSeek-V4.1 shards"]
+fn real_pool_rates() {
+    let (_, shards, layers) = real_layers();
+    let pool = IoPool::from_env(Arc::clone(&shards)).unwrap();
+    let sustain: f64 = std::env::var("DSV41_P1_SUSTAIN_S")
+        .ok()
+        .map_or(20.0, |v| v.parse().unwrap());
+    let mut rng = 0x00F1_u64;
+    let mut perm: Vec<Vec<usize>> = (0..layers.len())
+        .map(|_| {
+            let mut p: Vec<usize> = (0..384).collect();
+            for i in (1..p.len()).rev() {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                p.swap(i, (rng % (i as u64 + 1)) as usize);
+            }
+            p
+        })
+        .collect();
+    let mut used = vec![0usize; layers.len()];
+    let banks: Vec<VecBank> = (0..3)
+        .map(|p| VecBank::new(6, layers[0][p].rows(), layers[0][p].k()))
+        .collect();
+    let mut token = |k: usize| -> (u64, f64) {
+        let (mut bytes, mut ns) = (0u64, 0u64);
+        for (l, ps) in layers.iter().enumerate() {
+            let mut reads = Vec::new();
+            for slot in 0..k {
+                let e = perm[l][used[l] % 384];
+                used[l] += 1;
+                if used[l] % 384 == 0 {
+                    perm[l].rotate_left(1);
+                }
+                for p in 0..3 {
+                    reads.push(Read::slot(ps[p].extent(e), &banks[p].repack, slot));
+                }
+            }
+            // SAFETY: `banks` outlive the ticket; one read per slot.
+            let st = unsafe { pool.submit(reads, Priority::High) }
+                .unwrap()
+                .wait()
+                .unwrap();
+            bytes += st.bytes;
+            ns += st.ns;
+        }
+        (bytes, ns as f64 * 1e-9)
+    };
+    for (k, part, limit) in [(2usize, "k2", 0.0), (6, "sustained", sustain)] {
+        let (d0, t0) = (disk_bytes_read(), Instant::now());
+        let (mut bytes, mut io_s, mut per) = (0u64, 0f64, Vec::new());
+        while if limit > 0.0 {
+            t0.elapsed().as_secs_f64() < limit
+        } else {
+            per.len() < 3
+        } {
+            let (b, s) = token(k);
+            bytes += b;
+            io_s += s;
+            per.push(s);
+        }
+        let wall = t0.elapsed().as_secs_f64();
+        let disk = disk_bytes_read() - d0;
+        per.sort_by(f64::total_cmp);
+        println!(
+            "real_pool_rates {}",
+            serde_json::json!({
+                "part": part, "threads": pool.threads(), "k_per_layer": k, "tokens": per.len(),
+                "gb": bytes as f64 / 1e9, "wall_s": wall, "io_s": io_s,
+                "gbps_io": bytes as f64 / 1e9 / io_s, "gbps_wall": bytes as f64 / 1e9 / wall,
+                "token_io_s_median": per[per.len() / 2], "token_io_s_max": per[per.len() - 1],
+                "disk_gb": disk as f64 / 1e9,
+            })
+        );
+    }
 }

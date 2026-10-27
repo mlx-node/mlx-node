@@ -2,15 +2,17 @@
 //!
 //! Every shard is read through one `O_RDONLY` descriptor with `F_NOCACHE` and
 //! `F_RDAHEAD 0` (macOS); nothing here maps a file. The reader that finishes
-//! an MXFP4 extent repacks it straight into its slot. A failed or short read
-//! fails its ticket and never runs the repack, so the slot's bytes stay as
-//! they were and the caller does not publish it.
+//! an MXFP4 extent repacks it straight into its slot, in row bands that idle
+//! readers help with. A failed or short read fails its ticket and never runs
+//! the repack, so the slot's bytes stay as they were and the caller does not
+//! publish it.
 
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -26,6 +28,10 @@ pub const THREADS_ENV: &str = "MLX_MOE_STREAM_IO_THREADS";
 pub const DEFAULT_THREADS: usize = 12;
 pub const MIN_THREADS: usize = 4;
 pub const MAX_THREADS: usize = 18;
+/// GGUF bytes per repack band of one slot read: a 6.27 MB expert matrix is
+/// repacked as 6 bands, so the bands after the read run on idle readers
+/// instead of adding one whole-matrix repack to the layer step.
+pub const REPACK_BAND_BYTES: usize = 1 << 20;
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("moe_stream io: {msg}"))
@@ -403,9 +409,80 @@ impl Drop for Ticket {
     }
 }
 
-struct Job {
+struct ReadJob {
     batch: Arc<Batch>,
     read: Read,
+}
+
+enum Job {
+    Read(ReadJob),
+    /// Help with the row bands of a slot read whose bytes are in.
+    Band(Arc<Bands>),
+}
+
+/// The repack of one slot read, split into row bands. The reader that
+/// owns the bytes takes bands too and waits until every band is done
+/// before its buffer is reused, so `src` outlives every band.
+struct Bands {
+    repack: SlotRepack,
+    slot: usize,
+    src: SendPtr<u8>,
+    row_bytes: usize,
+    rows: usize,
+    rows_per_band: usize,
+    n: usize,
+    next: AtomicUsize,
+    repack_ns: AtomicU64,
+    state: Mutex<(usize, Option<String>)>,
+    done: Condvar,
+}
+
+impl Bands {
+    /// Runs bands until none is left to take.
+    fn help(&self) {
+        loop {
+            let i = self.next.fetch_add(1, Ordering::Relaxed);
+            if i >= self.n {
+                return;
+            }
+            let t = Instant::now();
+            let row0 = i * self.rows_per_band;
+            let rows = self.rows_per_band.min(self.rows - row0);
+            // SAFETY: `src` holds `rows * row_bytes` bytes until every band
+            // is done (the reader waits in `wait`); bands are disjoint.
+            let blocks = unsafe {
+                std::slice::from_raw_parts(
+                    self.src.0.add(row0 * self.row_bytes),
+                    rows * self.row_bytes,
+                )
+            };
+            let out = catch_unwind(AssertUnwindSafe(|| {
+                self.repack.write_rows(self.slot, row0, rows, blocks)
+            }))
+            .unwrap_or_else(|_| Err(bad("repack panicked")));
+            self.repack_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let mut st = lock(&self.state);
+            st.0 += 1;
+            if let Err(e) = out {
+                st.1.get_or_insert(e.reason);
+            }
+            if st.0 == self.n {
+                self.done.notify_all();
+            }
+        }
+    }
+
+    fn wait(&self) -> Result<u64> {
+        let mut st = lock(&self.state);
+        while st.0 < self.n {
+            st = self.done.wait(st).unwrap_or_else(PoisonError::into_inner);
+        }
+        match st.1.take() {
+            Some(e) => Err(Error::from_reason(e)),
+            None => Ok(self.repack_ns.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -419,6 +496,7 @@ struct Shared {
     shards: Arc<ShardSet>,
     queue: Mutex<Queues>,
     ready: Condvar,
+    band_bytes: usize,
 }
 
 /// Persistent reader threads over one [`ShardSet`].
@@ -449,13 +527,26 @@ impl IoPool {
     }
 
     pub fn new(shards: Arc<ShardSet>, threads: usize) -> Result<Self> {
+        Self::with_band_bytes(shards, threads, REPACK_BAND_BYTES)
+    }
+
+    /// `band_bytes`: GGUF bytes per repack band (tests use small bands).
+    pub fn with_band_bytes(
+        shards: Arc<ShardSet>,
+        threads: usize,
+        band_bytes: usize,
+    ) -> Result<Self> {
         if threads == 0 || threads > MAX_THREADS {
             return Err(bad(format!("{threads} reader threads")));
+        }
+        if band_bytes == 0 {
+            return Err(bad("repack band of 0 bytes"));
         }
         let shared = Arc::new(Shared {
             shards,
             queue: Mutex::new(Queues::default()),
             ready: Condvar::new(),
+            band_bytes,
         });
         let mut pool = Self {
             shared,
@@ -519,9 +610,11 @@ impl IoPool {
                 Priority::High => &mut q.high,
                 Priority::Low => &mut q.low,
             };
-            dq.extend(reads.into_iter().map(|read| Job {
-                batch: Arc::clone(&batch),
-                read,
+            dq.extend(reads.into_iter().map(|read| {
+                Job::Read(ReadJob {
+                    batch: Arc::clone(&batch),
+                    read,
+                })
             }));
             drop(q);
             self.shared.ready.notify_all();
@@ -624,16 +717,65 @@ impl Drop for AlignedBuf {
 fn worker(shared: &Shared) {
     let mut buf = AlignedBuf::new();
     while let Some(job) = next_job(shared) {
-        let out = catch_unwind(AssertUnwindSafe(|| {
-            run(&shared.shards, &job.read, &mut buf)
-        }))
-        .unwrap_or_else(|_| Err(bad("reader panicked")));
+        let job = match job {
+            Job::Band(b) => {
+                b.help();
+                continue;
+            }
+            Job::Read(job) => job,
+        };
+        let out = catch_unwind(AssertUnwindSafe(|| run(shared, &job.read, &mut buf)))
+            .unwrap_or_else(|_| Err(bad("reader panicked")));
         job.batch.finish(out);
     }
 }
 
+/// Repack of a slot read whose bytes are in: one band inline, else bands
+/// that idle readers take from the front of the high queue while this
+/// reader takes them too; returns when every band is done.
+fn repack_bands(shared: &Shared, repack: &SlotRepack, slot: usize, bytes: &[u8]) -> Result<u64> {
+    let row_bytes = repack.row_bytes();
+    let rows = repack.rows_per_slot();
+    let rows_per_band = (shared.band_bytes / row_bytes).clamp(1, rows);
+    let n = rows.div_ceil(rows_per_band);
+    if n == 1 {
+        let t = Instant::now();
+        repack.write(slot, bytes)?;
+        return Ok(t.elapsed().as_nanos() as u64);
+    }
+    if bytes.len() != rows * row_bytes {
+        return Err(bad(format!(
+            "{} bytes for a slot of {rows} rows of {row_bytes}",
+            bytes.len()
+        )));
+    }
+    let bands = Arc::new(Bands {
+        repack: *repack,
+        slot,
+        src: SendPtr(bytes.as_ptr().cast_mut()),
+        row_bytes,
+        rows,
+        rows_per_band,
+        n,
+        next: AtomicUsize::new(0),
+        repack_ns: AtomicU64::new(0),
+        state: Mutex::new((0, None)),
+        done: Condvar::new(),
+    });
+    {
+        let mut q = lock(&shared.queue);
+        for _ in 1..n {
+            q.high.push_front(Job::Band(Arc::clone(&bands)));
+        }
+    }
+    shared.ready.notify_all();
+    bands.help();
+    bands.wait()
+}
+
 /// `(bytes, read_ns, repack_ns)`.
-fn run(shards: &ShardSet, read: &Read, buf: &mut AlignedBuf) -> Result<(u64, u64, u64)> {
+fn run(shared: &Shared, read: &Read, buf: &mut AlignedBuf) -> Result<(u64, u64, u64)> {
+    let shards = &shared.shards;
     let e = read.extent;
     let len = usize::try_from(e.len).map_err(|_| bad("extent length exceeds usize"))?;
     let t0 = Instant::now();
@@ -665,9 +807,8 @@ fn run(shards: &ShardSet, read: &Read, buf: &mut AlignedBuf) -> Result<(u64, u64
         Sink::Slot { repack, slot } => {
             let bytes = shards.window(e, buf, io_err)?;
             let read_ns = t0.elapsed().as_nanos() as u64;
-            let t1 = Instant::now();
-            repack.write(*slot, bytes)?;
-            Ok((e.len, read_ns, t1.elapsed().as_nanos() as u64))
+            let repack_ns = repack_bands(shared, repack, *slot, bytes)?;
+            Ok((e.len, read_ns, repack_ns))
         }
     }
 }

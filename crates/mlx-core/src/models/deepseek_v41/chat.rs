@@ -393,6 +393,11 @@ impl ChatBackend for Inner {
         Ok(())
     }
 
+    /// The store's admitted context (D-24): `Model::forward` refuses past it.
+    fn context_token_limit(&self) -> Option<usize> {
+        self.store.model.ctx_limit
+    }
+
     /// `None`: the engine's own context would request the whole recommended
     /// working set; the store holds a lease bounded by the admission instead
     /// (`fixed + cache`, taken in `Store::begin_turn`).

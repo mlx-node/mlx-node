@@ -169,6 +169,41 @@ fn tiny_chat_lane_continues_session() {
     );
     assert_eq!(prompts.len(), 2);
     assert!(s17_check_engram(&inner) >= 2);
+
+    // a turn at the store's context limit ends with `length`, it does not
+    // fail a forward past the limit (S18 codex)
+    let one = |inner: &mut super::chat::Inner, n: i32| {
+        inner.reset_caches(ResetScope::Command).unwrap();
+        inner.probe = Some((Vec::new(), Vec::new()));
+        let cfg = crate::engine::types::ChatConfig {
+            max_new_tokens: Some(n),
+            temperature: Some(0.0),
+            reasoning_effort: Some("none".into()),
+            ..Default::default()
+        };
+        crate::engine::session::session_start(inner, vec![s17_msg("user", "hello")], cfg, &flag)
+    };
+    let free = one(&mut inner, 6).unwrap();
+    let prompt = inner.probe.as_ref().unwrap().1[0].1.len();
+    let saved_limit = inner.store.model.ctx_limit;
+    inner.store.model.ctx_limit = Some(prompt + 2);
+    let capped = one(&mut inner, 6).unwrap();
+    inner.store.model.ctx_limit = Some(prompt - 1);
+    assert!(one(&mut inner, 6).is_err(), "a prompt over the limit must fail");
+    inner.store.model.ctx_limit = saved_limit;
+    println!(
+        "ctx cap: prompt {prompt}, limit {}: {} tokens ({}) vs {} unlimited ({})",
+        prompt + 2,
+        capped.num_tokens,
+        capped.finish_reason,
+        free.num_tokens,
+        free.finish_reason
+    );
+    if free.num_tokens >= 3 {
+        assert_eq!((capped.num_tokens, capped.finish_reason.as_str()), (3, "length"));
+    } else {
+        assert_eq!(capped.num_tokens, free.num_tokens);
+    }
 }
 
 /// Real 9 shards, expert cache 0: two engine turns in chat mode (turn 1 one

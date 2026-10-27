@@ -1153,7 +1153,12 @@ fn chat_turn_core<B: ChatBackend>(
     let turn_plan = admitted.plan;
     let reuse_cache = p.reuse_cache;
     let report_perf = p.report_performance;
-    let max_new_tokens = p.max_new_tokens;
+    let max_new_tokens = match backend.context_token_limit() {
+        Some(limit) => p
+            .max_new_tokens
+            .min(i32::try_from((limit + 1).saturating_sub(tokens.len())).unwrap_or(i32::MAX)),
+        None => p.max_new_tokens,
+    };
     let media = MediaInputs {
         images: &images,
         audio: &audio,
