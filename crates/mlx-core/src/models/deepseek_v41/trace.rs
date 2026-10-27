@@ -28,7 +28,9 @@ impl RouteTrace {
         };
         let mut out = std::io::BufWriter::new(std::fs::File::create(p)?);
         let head = json!({
-            "kind": "deepseek_v41_expert_route_trace",
+            // the kind `qwen4_exp/route_replay.rs` reads: the same schema and
+            // replay tool serve both families
+            "kind": "qwen4_exp_expert_route_trace",
             "schema_version": 1,
             "mode": "ar",
             "prompt_tokens": prompt_tokens.to_string(),

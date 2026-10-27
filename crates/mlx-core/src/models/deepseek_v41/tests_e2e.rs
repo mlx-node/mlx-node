@@ -97,14 +97,14 @@ fn log_softmax(row: &[f32]) -> Vec<f64> {
     row.iter().map(|&x| f64::from(x) - lz).collect()
 }
 
-/// KL(p || q) of two logit rows.
+/// KL(p || q) of two logit rows; NaN when either row is not all finite.
 fn kl(p: &[f32], q: &[f32]) -> f64 {
+    if !p.iter().chain(q).all(|v| v.is_finite()) {
+        return f64::NAN;
+    }
     let (lp, lq) = (log_softmax(p), log_softmax(q));
-    lp.iter()
-        .zip(&lq)
-        .map(|(&a, &b)| a.exp() * (a - b))
-        .sum::<f64>()
-        .max(0.0)
+    let s: f64 = lp.iter().zip(&lq).map(|(&a, &b)| a.exp() * (a - b)).sum();
+    if s.is_finite() { s.max(0.0) } else { f64::NAN }
 }
 
 fn hex_sha(v: &[f32]) -> String {
@@ -201,6 +201,9 @@ fn real_e2e_tf(case: &str) {
         let (start, ids, l32, l16) = &gd.calls[c.index];
         assert_eq!((c.start, c.ids), (*start, &ids[..]), "call {}", c.index);
         let got = read(c.logits);
+        if !got.iter().all(|v| v.is_finite()) {
+            fails.push(format!("call {}: non-finite logits", c.index));
+        }
         for p in 0..ids.len() {
             let w = p * vocab..(p + 1) * vocab;
             let (a, b, z) = (&got[w.clone()], &l32[w.clone()], &l16[w]);
@@ -355,9 +358,11 @@ fn prompt_ids(gd: &Gold) -> Vec<u32> {
     }
 }
 
-/// Stores `doc` at `hashes/<name>.json`; when a stored run with the same
-/// prompt exists, its `hashes` must match bitwise.
-fn store_hashes(name: &str, doc: Value, fails: &mut Vec<String>) {
+/// Stores `doc` at `hashes/<name>.json` as the baseline, only for a run with
+/// no failure and no stored baseline; a stored baseline with the same prompt
+/// is never replaced and its `hashes` must match bitwise. Returns whether
+/// `doc` became the baseline.
+fn store_hashes(name: &str, doc: Value, fails: &mut Vec<String>) -> bool {
     let dir = golden_root().join("hashes");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("{name}.json"));
@@ -369,11 +374,16 @@ fn store_hashes(name: &str, doc: Value, fails: &mut Vec<String>) {
             } else {
                 println!("{name}: logits hashes == stored run (bitwise)");
             }
-            return;
+            return false;
         }
+    }
+    if !fails.is_empty() {
+        println!("{name}: failed run, no baseline written");
+        return false;
     }
     std::fs::write(&p, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
     println!("{name}: hashes written to {}", p.display());
+    true
 }
 
 /// G14.2: 32 greedy tokens from the prompt; the first ones the oracle made
@@ -387,7 +397,7 @@ fn real_e2e_greedy(case: &str) {
     let store = e2e_store();
     let vocab = store.model.cfg.vocab_size;
     let mut sess = store.model.new_session();
-    let (mut hashes, mut rows) = (Vec::new(), Vec::<f32>::new());
+    let (mut hashes, mut rows, mut bad_calls) = (Vec::new(), Vec::<f32>::new(), Vec::new());
     let g = generate(
         &store,
         &mut sess,
@@ -400,11 +410,17 @@ fn real_e2e_greedy(case: &str) {
             let v = read(c.logits);
             hashes.push(hex_sha(&v[v.len() - vocab..]));
             rows.extend_from_slice(&v);
+            if !v.iter().all(|x| x.is_finite()) {
+                bad_calls.push(c.index);
+            }
             Ok(())
         },
     )
     .unwrap();
     let mut fails = Vec::new();
+    if !bad_calls.is_empty() {
+        fails.push(format!("non-finite logits in calls {bad_calls:?}"));
+    }
     let same_prompt = prompt == gd.prompt;
     let mut parted = None;
     if same_prompt {
@@ -432,23 +448,31 @@ fn real_e2e_greedy(case: &str) {
             d[d.len() / 2]
         }
     );
-    store_hashes(
+    check_io(&g, g.argmax.len(), store.model.cfg.n_layers, &mut fails);
+    // EN keeps its logits for the chunk-7 gate, bound to the baseline by sha256
+    let keep = case == "p32k8-en" && same_prompt;
+    let b: Vec<u8> = if keep {
+        rows.iter().flat_map(|x| x.to_le_bytes()).collect()
+    } else {
+        Vec::new()
+    };
+    let logits_sha = keep.then(|| hex_sha(&rows));
+    let fresh = store_hashes(
         &format!("greedy-{case}"),
         serde_json::json!({
             "prompt_ids": prompt,
             "ids": g.argmax,
             "hashes": hashes,
+            "logits_sha256": logits_sha,
             "oracle_prefix_match": same_prompt && parted.is_none(),
             "parted": parted,
             "stats": g.stats,
         }),
         &mut fails,
     );
-    if case == "p32k8-en" && same_prompt {
-        let b: Vec<u8> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
+    if fresh && keep {
         std::fs::write(golden_root().join("hashes/greedy-p32k8-en.logits.f32"), b).unwrap();
     }
-    check_io(&g, g.argmax.len(), store.model.cfg.n_layers, &mut fails);
     finish(&format!("real_e2e_greedy {case}"), &fails);
 }
 
@@ -467,6 +491,15 @@ fn real_e2e_chunk7_en() {
         .iter()
         .map(|&b| f32::from_le_bytes(b))
         .collect();
+    let manifest: Value = serde_json::from_slice(
+        &std::fs::read(golden_root().join("hashes/greedy-p32k8-en.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["logits_sha256"].as_str(),
+        Some(hex_sha(&whole).as_str()),
+        "whole-prompt logits file does not match its baseline"
+    );
     let store = e2e_store();
     let vocab = store.model.cfg.vocab_size;
     let p = gd.prompt.len();
@@ -530,12 +563,12 @@ fn real_e2e_chunk7_en() {
         hashes.len(),
         g.argmax
     );
+    check_io(&g, hashes.len(), store.model.cfg.n_layers, &mut fails);
     store_hashes(
         "chunk7-p32k8-en",
         serde_json::json!({"prompt_ids": gd.prompt, "chunk": 7, "ids": g.argmax, "hashes": hashes}),
         &mut fails,
     );
-    check_io(&g, hashes.len(), store.model.cfg.n_layers, &mut fails);
     finish("real_e2e_chunk7_en", &fails);
 }
 
@@ -579,4 +612,8 @@ fn real_e2e_greedy_code() {
 fn argmax_takes_the_lowest_index_on_ties() {
     assert_eq!(super::generate::argmax(&[1.0, 3.0, 3.0, -1.0]), 1);
     assert_eq!(super::generate::argmax(&[f32::NEG_INFINITY]), 0);
+    // a non-finite logit anywhere never reads as KL 0
+    assert!(kl(&[0.0, 1.0, f32::NAN], &[0.0, 1.0, 2.0]).is_nan());
+    assert!(kl(&[0.0, 1.0, 2.0], &[0.0, f32::INFINITY, 2.0]).is_nan());
+    assert!(kl(&[0.0, 1.0, 2.0], &[0.0, 1.0, 2.0]) < 1e-12);
 }
