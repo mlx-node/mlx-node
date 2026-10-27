@@ -4,5 +4,6 @@
 //! callers.
 
 pub mod bank;
+pub mod budget;
 pub mod io;
 pub mod repack;
