@@ -446,6 +446,13 @@ impl Store {
         mode: DenseMode,
         cache_mode: CacheMode,
     ) -> Result<Self> {
+        // env switches are validated before anything is allocated (a refusal
+        // after the bank exists would leave it in MLX's free pool; P5 codex)
+        let (split, prefetch, skip) = (
+            split_from_env()?,
+            PrefetchMode::from_env()?,
+            skip_from_env()?,
+        );
         let Scan {
             where_,
             cfg,
@@ -500,8 +507,8 @@ impl Store {
             cache_mode,
             staging,
         )?);
-        bank.set_split(split_from_env()?);
-        bank.set_prefetch_mode(PrefetchMode::from_env()?);
+        bank.set_split(split);
+        bank.set_prefetch_mode(prefetch);
         let bank_alloc_s = t_bank.elapsed().as_secs_f64();
         let (mut dense_read, mut dense_bytes) = (0u64, 0u64);
         let mut buf = AlignedBuf::new();
@@ -579,7 +586,7 @@ impl Store {
             };
         // the admission's KV / compute terms hold up to this context only
         model.ctx_limit = Some(size.ctx as usize);
-        model.layer_skip = skip_from_env()?;
+        model.layer_skip = skip;
         let guard =
             coordinator().register_with_cache_limit(dense_bytes + bank.nbytes(), Some(POOL_LIMIT));
         Ok(Self {
