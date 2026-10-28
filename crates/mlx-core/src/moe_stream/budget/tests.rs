@@ -59,6 +59,23 @@ fn admit_at(others: u64, own: u64, limits: &Limits) -> Result<Admission> {
     admit(&model(), limits, &h, &o, WS)
 }
 
+/// The staging rule written out by hand: a second layer when the cache does
+/// not need its bytes, or when at least `SECOND_STAGING_MIN_CACHE` is left.
+fn layers_by_hand(budget: u64, cap: Option<u64>, ws: u64) -> u64 {
+    let (one, two) = (fixed_by_hand(1, ws), fixed_by_hand(2, ws));
+    let cache1 = (budget - one).min(cap.unwrap_or(u64::MAX)) / E * E;
+    if two + cache1 <= budget || (two <= budget && budget - two >= SECOND_STAGING_MIN_CACHE) {
+        2
+    } else {
+        1
+    }
+}
+
+/// Others' bytes that leave exactly `cache` after two staging layers.
+fn others_for_room2(cache: u64) -> u64 {
+    PHYS - RESERVE - fixed_by_hand(2, WS) - cache
+}
+
 #[test]
 fn terms_match_the_s14c_input() {
     let t = Terms::new(&model(), WS);
@@ -81,10 +98,11 @@ fn today_others_50() {
     let live = PHYS - 50 * G - RESERVE;
     assert_eq!(a.live, live);
     assert_eq!(a.others, 50 * G);
-    assert_eq!(a.fixed, fixed_by_hand(1, WS));
-    assert_eq!(a.cache_slots, (live - fixed_by_hand(1, WS)) / E);
+    let layers = layers_by_hand(live, None, WS);
+    assert_eq!(a.staging_layers, layers);
+    assert_eq!(a.fixed, fixed_by_hand(layers, WS));
+    assert_eq!(a.cache_slots, (live - fixed_by_hand(layers, WS)) / E);
     assert_eq!(a.bound, Bound::Live);
-    assert_eq!(a.staging_layers, 1);
     assert_eq!(a.wired_limit(), a.fixed + a.cache_slots * E);
     assert!(a.live - a.wired_limit() < E);
 }
@@ -95,15 +113,17 @@ fn quiet_others_25_and_ws_bound() {
     let q = admit_at(25 * G, 0, &Limits::default()).unwrap();
     println!("quiet: {q}");
     let live = PHYS - 25 * G - RESERVE;
-    assert_eq!(q.cache_slots, (live - fixed_by_hand(1, WS)) / E);
+    assert_eq!(q.staging_layers, 2);
+    assert_eq!(q.cache_slots, (live - fixed_by_hand(2, WS)) / E);
     assert_eq!(q.bound, Bound::Live);
-    assert!(gib(q.cache_bytes()) > 50.0, "no 64 GiB cap needed here");
+    assert!(gib(q.cache_bytes()) > 40.0, "no 64 GiB cap needed here");
     // others below physical - reserve - ws: cache = ws - fixed
     let w = admit_at(5 * G, 0, &Limits::default()).unwrap();
     println!("ws-bound: {w}");
     assert_eq!(w.bound, Bound::WorkingSet);
-    assert_eq!(w.cache_slots, (WS - fixed_by_hand(1, WS)) / E);
-    assert!(gib(w.cache_bytes()) > 64.0, "D-40: no 64 GiB cap");
+    assert_eq!(w.staging_layers, 2);
+    assert_eq!(w.cache_slots, (WS - fixed_by_hand(2, WS)) / E);
+    assert!(gib(w.cache_bytes()) > 60.0, "no 64 GiB cap");
     assert!(w.wired_limit() <= WS);
 }
 
@@ -135,29 +155,24 @@ fn never_over_ws_or_live() {
     let mut n = 0;
     for ws in [WS, 96 * G, 48 * G] {
         for cap in [None, Some(0), Some(4 * G), Some(1000 * G)] {
-            for staging in [StagingPref::Auto, StagingPref::One, StagingPref::Two] {
-                let limits = Limits {
-                    cache_cap: cap,
-                    staging,
-                    ..Limits::default()
-                };
-                for q in 0..=480u64 {
-                    let others = q * G / 4;
-                    let (h, o) = at(others, 3 * G);
-                    let live = PHYS.saturating_sub(others + RESERVE);
-                    let one = fixed_by_hand(1, ws);
-                    match admit(&model(), &limits, &h, &o, ws) {
-                        Ok(a) => {
-                            n += 1;
-                            assert!(a.wired_limit() <= ws && a.wired_limit() <= live, "{a}");
-                            assert_eq!(a.fixed, fixed_by_hand(a.staging_layers, ws));
-                            assert!(cap.is_none_or(|c| a.cache_bytes() <= c), "{a}");
-                            if staging == StagingPref::One {
-                                assert_eq!(a.staging_layers, 1);
-                            }
-                        }
-                        Err(_) => assert!(one > live.min(ws), "refused with room"),
+            let limits = Limits {
+                cache_cap: cap,
+                ..Limits::default()
+            };
+            for q in 0..=480u64 {
+                let others = q * G / 4;
+                let (h, o) = at(others, 3 * G);
+                let live = PHYS.saturating_sub(others + RESERVE);
+                let one = fixed_by_hand(1, ws);
+                match admit(&model(), &limits, &h, &o, ws) {
+                    Ok(a) => {
+                        n += 1;
+                        assert!(a.wired_limit() <= ws && a.wired_limit() <= live, "{a}");
+                        assert_eq!(a.fixed, fixed_by_hand(a.staging_layers, ws));
+                        assert_eq!(a.staging_layers, layers_by_hand(a.budget(), cap, ws), "{a}");
+                        assert!(cap.is_none_or(|c| a.cache_bytes() <= c), "{a}");
                     }
+                    Err(_) => assert!(one > live.min(ws), "refused with room"),
                 }
             }
         }
@@ -168,35 +183,32 @@ fn never_over_ws_or_live() {
 #[test]
 fn env_only_lowers() {
     let base = admit_at(50 * G, 0, &Limits::default()).unwrap();
-    let big = Limits::from_values(Some("1000"), None, None).unwrap();
+    let big = Limits::from_values(Some("1000"), None).unwrap();
     assert_eq!(admit_at(50 * G, 0, &big).unwrap(), base);
-    let four = Limits::from_values(Some("4"), None, None).unwrap();
+    let four = Limits::from_values(Some("4"), None).unwrap();
     let a = admit_at(50 * G, 0, &four).unwrap();
     assert_eq!((a.cache_slots, a.bound), ((4 * G) / E, Bound::Env));
-    let zero = Limits::from_values(Some("0"), None, None).unwrap();
+    let zero = Limits::from_values(Some("0"), None).unwrap();
     assert_eq!(admit_at(50 * G, 0, &zero).unwrap().cache_slots, 0);
-    let half = Limits::from_values(Some("0.5"), None, None).unwrap();
+    let half = Limits::from_values(Some("0.5"), None).unwrap();
     assert_eq!(half.cache_cap, Some(G / 2));
     // the reserve only grows
-    let r8 = Limits::from_values(None, Some("8"), None).unwrap();
+    let r8 = Limits::from_values(None, Some("8")).unwrap();
     assert_eq!(r8.reserve, RESERVE);
-    let r22 = Limits::from_values(None, Some("22"), None).unwrap();
+    let r22 = Limits::from_values(None, Some("22")).unwrap();
     assert_eq!(r22.reserve, 22 * G);
     let a22 = admit_at(50 * G, 0, &r22).unwrap();
+    let budget = PHYS - 50 * G - 22 * G;
+    let layers = layers_by_hand(budget, None, WS);
+    assert_eq!(a22.staging_layers, layers);
+    assert_eq!(a22.cache_slots, (budget - fixed_by_hand(layers, WS)) / E);
     assert_eq!(
-        a22.cache_slots,
-        (PHYS - 50 * G - 22 * G - fixed_by_hand(1, WS)) / E
-    );
-    assert_eq!(
-        Limits::from_values(Some(" "), None, None).unwrap(),
+        Limits::from_values(Some(" "), None).unwrap(),
         Limits::default()
     );
     for v in ["-1", "abc", "nan", "inf", "1e9"] {
-        assert!(Limits::from_values(Some(v), None, None).is_err(), "{v}");
-        assert!(Limits::from_values(None, Some(v), None).is_err(), "{v}");
-    }
-    for v in ["0", "3", "two"] {
-        assert!(Limits::from_values(None, None, Some(v)).is_err(), "{v}");
+        assert!(Limits::from_values(Some(v), None).is_err(), "{v}");
+        assert!(Limits::from_values(None, Some(v)).is_err(), "{v}");
     }
 }
 
@@ -284,48 +296,119 @@ fn grows_only_by_grow_min() {
     assert!(r.cache_bytes() >= load.cache_bytes() + GROW_MIN);
 }
 
+/// The second staging layer: free when a capped cache leaves its bytes;
+/// paid with cache only while `SECOND_STAGING_MIN_CACHE` is left (one slot
+/// either side of the edge); never when it does not fit.
 #[test]
-fn two_layer_staging_when_it_fits_after_the_cache() {
-    // auto cache fills the budget: no room for a second layer
-    let a = admit_at(50 * G, 0, &Limits::default()).unwrap();
-    assert_eq!(a.staging_layers, 1);
-    // cache capped by env: the second layer fits after it
-    let capped = Limits {
-        cache_cap: Some(8 * G),
-        ..Limits::default()
-    };
-    let c = admit_at(50 * G, 0, &capped).unwrap();
-    println!("capped: {c}");
-    assert_eq!(c.staging_layers, 2);
-    assert_eq!(c.fixed, fixed_by_hand(2, WS));
-    assert_eq!(c.wired_limit(), fixed_by_hand(2, WS) + (8 * G / E) * E);
-    // ... unless the caller asked for one
-    let one = Limits {
-        staging: StagingPref::One,
-        ..capped
-    };
-    assert_eq!(admit_at(50 * G, 0, &one).unwrap().staging_layers, 1);
-    // asked for two: the second layer comes before the cache
-    let two = Limits {
-        staging: StagingPref::Two,
-        ..Limits::default()
-    };
-    let t = admit_at(50 * G, 0, &two).unwrap();
-    assert_eq!(t.staging_layers, 2);
+fn second_staging_layer_rule() {
+    let l = Limits::default();
+    let x = SECOND_STAGING_MIN_CACHE;
+    // at the edge: exactly X left after two layers
+    let at_x = admit_at(others_for_room2(x), 0, &l).unwrap();
+    println!("edge: {at_x}");
+    assert_eq!((at_x.staging_layers, at_x.cache_slots), (2, x / E));
+    let above = admit_at(others_for_room2(x + E), 0, &l).unwrap();
+    assert_eq!((above.staging_layers, above.cache_slots), (2, (x + E) / E));
+    // one slot short of X: one layer, and its bytes go to the cache
+    let below = admit_at(others_for_room2(x - E), 0, &l).unwrap();
+    println!("below: {below}");
+    assert_eq!(below.staging_layers, 1);
     assert_eq!(
-        t.cache_slots,
-        (PHYS - 50 * G - RESERVE - fixed_by_hand(2, WS)) / E
+        below.cache_slots,
+        (x - E + fixed_by_hand(2, WS) - fixed_by_hand(1, WS)) / E
     );
-    // ... and falls back to one when two do not fit
+    // a cap that leaves room for the second layer gets it for free
+    let small = others_for_room2(x - E);
+    for cap in [0, 4 * G, x - E - 384 * E] {
+        let capped = Limits {
+            cache_cap: Some(cap),
+            ..l
+        };
+        let c = admit_at(small, 0, &capped).unwrap();
+        assert_eq!((c.staging_layers, c.cache_slots), (2, cap / E), "cap {cap}");
+        assert_eq!(c.bound, Bound::Env);
+    }
+    // a cap above what two layers leave (X - 1 slot): one layer, cache = cap
+    let capped = Limits {
+        cache_cap: Some(x + E),
+        ..l
+    };
+    let c = admit_at(small, 0, &capped).unwrap();
+    assert_eq!((c.staging_layers, c.cache_slots), (1, (x + E) / E));
+    // two layers do not fit at all: one layer, the cache takes what is left
     let edge = PHYS - RESERVE - fixed_by_hand(1, WS) - G;
-    let f = admit_at(edge, 0, &two).unwrap();
+    let f = admit_at(edge, 0, &l).unwrap();
     assert_eq!((f.staging_layers, f.cache_slots), (1, G / E));
-    // a two-layer bank that no longer fits drops to staging-only on one layer
-    let (h, o) = at(edge, 0);
-    let Turn::StagingOnly(s) = readmit(&c, &model(), &capped, &h, &o, WS).unwrap() else {
+}
+
+/// Re-admission across the rule's edge: a one-layer bank moves to two
+/// layers only through a rebuild (others shrank by the second layer + the
+/// grow step); a two-layer bank that no longer fits drops to one layer,
+/// cache 0, and comes back as the rule says.
+#[test]
+fn readmit_across_the_staging_edge() {
+    let (l, m) = (Limits::default(), model());
+    let x = SECOND_STAGING_MIN_CACHE;
+    let one = admit_at(others_for_room2(x - E), 2 * G, &l).unwrap();
+    assert_eq!(one.staging_layers, 1);
+    // others shrink a little: two layers would now be granted, but the
+    // cache would not grow by GROW_MIN, so the bank is kept
+    let (h, o) = at(others_for_room2(x + 4 * G), 2 * G);
+    assert_eq!(readmit(&one, &m, &l, &h, &o, WS).unwrap(), Turn::Keep);
+    // others shrink by the second layer + GROW_MIN: two layers, larger cache
+    let shrink = fixed_by_hand(2, WS) - fixed_by_hand(1, WS) + GROW_MIN + E;
+    let (h, o) = at(others_for_room2(x - E) - shrink, 2 * G);
+    let Turn::Rebuild(two) = readmit(&one, &m, &l, &h, &o, WS).unwrap() else {
+        panic!("expected rebuild");
+    };
+    println!("1 -> 2: {two}");
+    assert_eq!(two.staging_layers, 2);
+    assert!(two.cache_bytes() >= one.cache_bytes() + GROW_MIN);
+    // others grow past the keep slack: one layer, cache 0
+    let (h, o) = at(others_for_room2(x - E) - shrink + 3 * G + KEEP_SLACK, 2 * G);
+    let Turn::StagingOnly(s) = readmit(&two, &m, &l, &h, &o, WS).unwrap() else {
         panic!("expected staging-only");
     };
     assert_eq!((s.staging_layers, s.cache_slots), (1, 0));
+    assert_eq!(s.wired_limit(), fixed_by_hand(1, WS));
+    // and back below X: a one-layer bank
+    let (h, o) = at(others_for_room2(x - E), 2 * G);
+    let Turn::Rebuild(r) = readmit(&s, &m, &l, &h, &o, WS).unwrap() else {
+        panic!("expected rebuild");
+    };
+    assert_eq!(r, one);
+}
+
+/// Host sizes the product meets: a quiet 96 GB Mac (Metal working set ~72
+/// GiB) and a 64 GB one (refused: the fixed set does not fit).
+#[test]
+fn smaller_hosts() {
+    let quiet = |physical: u64| HostMemory {
+        physical,
+        wired: 20 * G,
+        ..Default::default()
+    };
+    let ws96 = 72 * G;
+    let a = admit(
+        &model(),
+        &Limits::default(),
+        &quiet(96 * G),
+        &Own::default(),
+        ws96,
+    )
+    .unwrap();
+    println!("96 GB: {a}");
+    let budget = (96 * G - 20 * G - RESERVE).min(ws96);
+    assert_eq!(a.staging_layers, layers_by_hand(budget, None, ws96));
+    assert!(a.wired_limit() <= budget);
+    let e = admit(
+        &model(),
+        &Limits::default(),
+        &quiet(64 * G),
+        &Own::default(),
+        48 * G,
+    );
+    assert!(e.unwrap_err().to_string().contains("vs budget"));
 }
 
 #[test]

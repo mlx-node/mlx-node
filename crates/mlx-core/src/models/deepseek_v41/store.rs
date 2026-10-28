@@ -86,23 +86,6 @@ pub enum DenseMode {
     Exact,
 }
 
-/// Staging layers of a bank opened without an admission
-/// (`MLX_DSV41_STAGING_LAYERS` = 1 or 2; unset: 1).
-pub fn staging_from_env() -> Result<usize> {
-    match std::env::var(crate::moe_stream::budget::STAGING_ENV)
-        .ok()
-        .as_deref()
-        .map(str::trim)
-    {
-        None | Some("") | Some("1") => Ok(1),
-        Some("2") => Ok(2),
-        Some(v) => Err(bad(format!(
-            "{}={v}: want 1 or 2",
-            crate::moe_stream::budget::STAGING_ENV
-        ))),
-    }
-}
-
 /// What one Q8_0 tensor becomes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Form {
@@ -297,9 +280,9 @@ pub enum CachePlan {
     /// gate of a product load).
     #[cfg(test)]
     Off,
-    /// Exactly this many cache slots, no admission (tests).
+    /// Exactly these cache slots and staging layers, no admission (tests).
     #[cfg(test)]
-    Slots(usize),
+    Slots { cache: usize, staging: usize },
     /// S15 admission at load and at every turn start.
     Admit(Limits),
 }
@@ -375,9 +358,6 @@ impl Store {
         plan: CachePlan,
         mode: DenseMode,
     ) -> Result<Self> {
-        // validated before anything is allocated: a refusal after the bank
-        // exists would leave it in MLX's free pool
-        let staging_env = staging_from_env()?;
         let Scan {
             where_,
             cfg,
@@ -389,27 +369,21 @@ impl Store {
                 .get(n)
                 .ok_or_else(|| bad(format!("tensor '{n}' missing")))
         };
-        let (cache_slots, admission) = match &plan {
+        let (cache_slots, staging, admission) = match &plan {
             CachePlan::Admit(limits) => {
                 let (h, ws) = host_reading()?;
                 // nothing of this model exists yet: every byte in use is others'
                 let a = admit(&size, limits, &h, &Own::default(), ws)?;
                 tracing::info!("deepseek_v41 admission at load: {a}");
-                (a.cache_slots as usize, Some(a))
+                (a.cache_slots as usize, a.staging_layers as usize, Some(a))
             }
             #[cfg(test)]
-            CachePlan::Off => (0, None),
+            CachePlan::Off => (0, 1, None),
             #[cfg(test)]
-            CachePlan::Slots(n) => (*n, None),
+            CachePlan::Slots { cache, staging } => (*cache, *staging, None),
         };
         let shards = Arc::new(ShardSet::open(paths)?);
         let t_bank = Instant::now();
-        // the admission's second staging layer comes only after the cache it
-        // would otherwise shrink (S15-5); without an admission, the env
-        let staging = match &admission {
-            Some(a) => a.staging_layers as usize,
-            None => staging_env,
-        };
         let bank = Arc::new(StagingBank::with_staging(
             IoPool::new(Arc::clone(&shards), DEFAULT_THREADS)?,
             layers,

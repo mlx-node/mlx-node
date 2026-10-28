@@ -9,6 +9,8 @@
 //! live   = physical - others - reserve
 //! fixed  = dense + staging x layers + 1.2 (KV(ctx) + compute(ctx)) + io(ctx) + driver + pool
 //! cache  = floor_to_slots(min(live - fixed, ws - fixed, env))
+//! layers = 2 when the cache does not need the second layer's bytes, or when
+//!          the cache left after it is >= SECOND_STAGING_MIN_CACHE; else 1
 //! ```
 
 use napi::{Error, Result};
@@ -17,7 +19,6 @@ use crate::utils::host::HostMemory;
 
 pub const CACHE_ENV: &str = "MLX_DSV41_EXPERT_CACHE_GB";
 pub const RESERVE_ENV: &str = "MLX_DSV41_ADMIT_RESERVE_GB";
-pub const STAGING_ENV: &str = "MLX_DSV41_STAGING_LAYERS";
 
 const GIB: u64 = 1 << 30;
 /// Host memory left to other processes (D-40).
@@ -40,6 +41,10 @@ const KV_PER_ROW: u64 = 6_400;
 pub const KEEP_SLACK: u64 = 2 * GIB;
 /// A kept cache is rebuilt larger only when the admission grew by this much.
 pub const GROW_MIN: u64 = 8 * GIB;
+/// The second staging layer (prefill read-ahead) takes its bytes from the
+/// cache only while this much cache is left; below it decode slows by more
+/// than 5 % (internal-SSD read rate; a slower drive raises the bar).
+pub const SECOND_STAGING_MIN_CACHE: u64 = 17 * GIB;
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("moe_stream budget: {msg}"))
@@ -62,23 +67,12 @@ pub struct ModelSize {
     pub ctx: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum StagingPref {
-    /// Second staging layer only when it fits after the cache.
-    #[default]
-    Auto,
-    One,
-    /// Second staging layer before the cache, when it fits.
-    Two,
-}
-
 /// The env knobs: the cache cap can only lower the cache, the reserve can
 /// only grow.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Limits {
     pub reserve: u64,
     pub cache_cap: Option<u64>,
-    pub staging: StagingPref,
 }
 
 impl Default for Limits {
@@ -86,7 +80,6 @@ impl Default for Limits {
         Self {
             reserve: RESERVE,
             cache_cap: None,
-            staging: StagingPref::Auto,
         }
     }
 }
@@ -99,11 +92,7 @@ fn gib_value(name: &str, raw: &str) -> Result<u64> {
 }
 
 impl Limits {
-    pub fn from_values(
-        cache_gb: Option<&str>,
-        reserve_gb: Option<&str>,
-        staging: Option<&str>,
-    ) -> Result<Self> {
+    pub fn from_values(cache_gb: Option<&str>, reserve_gb: Option<&str>) -> Result<Self> {
         fn set(v: Option<&str>) -> Option<&str> {
             v.filter(|s| !s.trim().is_empty())
         }
@@ -112,26 +101,12 @@ impl Limits {
             Some(v) => gib_value(RESERVE_ENV, v)?.max(RESERVE),
             None => RESERVE,
         };
-        let staging = match set(staging).map(str::trim) {
-            None => StagingPref::Auto,
-            Some("1") => StagingPref::One,
-            Some("2") => StagingPref::Two,
-            Some(v) => return Err(bad(format!("{STAGING_ENV}={v:?}: expected 1 or 2"))),
-        };
-        Ok(Self {
-            reserve,
-            cache_cap,
-            staging,
-        })
+        Ok(Self { reserve, cache_cap })
     }
 
     pub fn from_env() -> Result<Self> {
         let get = |k| std::env::var(k).ok();
-        Self::from_values(
-            get(CACHE_ENV).as_deref(),
-            get(RESERVE_ENV).as_deref(),
-            get(STAGING_ENV).as_deref(),
-        )
+        Self::from_values(get(CACHE_ENV).as_deref(), get(RESERVE_ENV).as_deref())
     }
 }
 
@@ -321,30 +296,24 @@ pub fn admit(
             gib(limits.reserve),
         )));
     }
+    let cap = limits.cache_cap.unwrap_or(u64::MAX);
+    let cache1 = (budget - one).min(cap) / m.slot * m.slot;
     let two = terms.fixed(2);
-    let mut layers = if limits.staging == StagingPref::Two && two <= budget {
-        2
-    } else {
-        1
-    };
-    let room = budget - terms.fixed(layers);
-    let (mut cache, mut bound) = (
-        room,
-        if live <= ws {
-            Bound::Live
+    let layers =
+        if two + cache1 <= budget || (two <= budget && budget - two >= SECOND_STAGING_MIN_CACHE) {
+            2
         } else {
-            Bound::WorkingSet
-        },
-    );
-    if let Some(cap) = limits.cache_cap
-        && cap < cache
-    {
-        (cache, bound) = (cap, Bound::Env);
-    }
+            1
+        };
+    let room = budget - terms.fixed(layers);
+    let (cache, bound) = if cap < room {
+        (cap, Bound::Env)
+    } else if live <= ws {
+        (room, Bound::Live)
+    } else {
+        (room, Bound::WorkingSet)
+    };
     let cache_slots = cache / m.slot;
-    if limits.staging == StagingPref::Auto && terms.fixed(2) + cache_slots * m.slot <= budget {
-        layers = 2;
-    }
     Ok(Admission {
         physical: host.physical,
         host_used,

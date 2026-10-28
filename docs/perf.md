@@ -268,12 +268,11 @@ Read at load. Bad values are refused (the load fails, nothing is clamped); none 
 model thread always computes f32 matmuls in true f32, whatever `MLX_ENABLE_TF32` says (see
 [models.md](models.md#deepseek-v41-flash)).
 
-| Var                          | Effect                                                                                                                                                                                                                  |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MLX_DSV41_EXPERT_CACHE_GB`  | Upper bound for the expert cache in GiB (decimals ok). It only lowers the size the admission picks; `0` = staging only (no cache).                                                                                      |
-| `MLX_DSV41_ADMIT_RESERVE_GB` | Memory kept free for other apps by the admission (default 12 GiB; only raises).                                                                                                                                         |
-| `MLX_DSV41_STAGING_LAYERS`   | `1` or `2` prefill staging layers. Unset: a second layer only when it fits after the cache. `2` takes it before the cache (6.72 GiB less cache, cold prefill TTFT measured vs one layer: 1K -34 %, 8K -5 %); `1` never. |
-| `MLX_DSV41_STATS=<file>`     | Diagnostics: append one JSON stats line per call (TTFT, hit rates, read GB/s, decode t_c / t_io / router wait, peak footprint). Bits unchanged.                                                                         |
+| Var                          | Effect                                                                                                                                          |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MLX_DSV41_EXPERT_CACHE_GB`  | Upper bound for the expert cache in GiB (decimals ok). It only lowers the size the admission picks; `0` = staging only (no cache).              |
+| `MLX_DSV41_ADMIT_RESERVE_GB` | Memory kept free for other apps by the admission (default 12 GiB; only raises).                                                                 |
+| `MLX_DSV41_STATS=<file>`     | Diagnostics: append one JSON stats line per call (TTFT, hit rates, read GB/s, decode t_c / t_io / router wait, peak footprint). Bits unchanged. |
 
 Measured product table (P7, 2026-10-28; M5 Max 128 GB, internal SSD;
 `@mlx-node/lm` `ChatSession`, greedy, chat mode, 32 new tokens, all defaults;
@@ -294,6 +293,27 @@ free-buffer pool <= 1.0 GiB, swap +0 in every run. For scale: before the
 streaming work (no NEON repack, no seeding, no read overlap, no row skip) cold
 TTFT was 69 s at 1K and 213 s at 8K; with a 20-21 GiB cache decode measured
 2.6-3.0 tok/s and 16K TTFT 163.7 s.
+
+Second staging layer (2026-10-29, same driver with 128 new tokens + a 63-id follow-up turn for 1K and 64 tokens for
+8K; one prompt per fresh process, arms interleaved ABBA; other apps held 52-67 GiB and drifted between runs, so each
+row gives the cache that run got; output ids identical in every run). The second layer costs 6.72 GiB of cache. It is
+granted when at least 17 GiB of cache is left after it (or when a capped cache leaves room for it): the smallest
+measured cache where decode lost no more than 5 %.
+
+| Cache left with 2 layers | 1 layer: cache GiB, decode ms/tok | 2 layers: cache GiB, decode ms/tok | Decode change (follow-up turn) |
+| ------------------------ | --------------------------------- | ---------------------------------- | ------------------------------ |
+| 0                        | 6.72; 489, 455                    | 0; 531, 520                        | +11 % (+10 %)                  |
+| 5.48                     | 12.20; 404                        | 5.48; 467, 463                     | +15 % (+24 %)                  |
+| 16.6                     | 22.10; 369                        | 16.60; 381                         | +3 % (+3 %)                    |
+
+| Prompt, cold                  | 1 layer TTFT s                    | 2 layers TTFT s                   | Change                     |
+| ----------------------------- | --------------------------------- | --------------------------------- | -------------------------- |
+| 1K                            | 27.39, 27.46, 28.77, 26.26, 27.16 | 19.28, 19.31, 19.61, 20.46, 18.81 | -27 to -31 % (block means) |
+| 8K                            | 93.49                             | 83.18, 78.77                      | -11 to -16 %               |
+| follow-up turn (63 ids, warm) | 6.49, 6.88, 7.21, 6.97, 6.77      | 7.60, 7.55, 7.79, 7.77, 7.49      | +0.6 to +1.1 s             |
+
+The follow-up turn is slower with 2 layers at every cache size: the read-ahead reads 864-923 experts the 63 rows
+never use.
 
 ## MTP speculative decoding
 

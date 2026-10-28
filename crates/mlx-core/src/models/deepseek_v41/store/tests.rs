@@ -157,7 +157,10 @@ fn cached_store(mode: &str, slots: usize) -> Store {
         &[fixture("tiny-q8_0.gguf")],
         act,
         fq,
-        CachePlan::Slots(slots),
+        CachePlan::Slots {
+            cache: slots,
+            staging: 1,
+        },
         DenseMode::Exact,
     )
     .unwrap()

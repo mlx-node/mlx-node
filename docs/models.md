@@ -163,13 +163,14 @@ How it fits in memory:
 load    dense weights (attention, router, shared experts, head; Q8_0 codes) ─► resident, ~9.9 GiB
         expert bank = [staging slots | cache slots], one buffer per projection, purgeable between turns
         cache size = admission at load: min(RAM - other apps - 12 GiB, GPU working set) - fixed
+        staging    = 2 layers when >= 17 GiB of cache is left after the second (6.72 GiB), else 1
 token   attention ─► router ─► expert ids to the CPU (one sync per layer)
         decode : cached experts are used in place; misses are read (pread, no page cache,
                  12 reader threads, ~12.3 GB/s) and repacked (MXFP4) into cache slots;
                  the GPU starts on the ready experts while the misses are read
         prefill: layer by layer over the whole prompt; the experts any row needs are read
                  once per layer; with 2 staging layers the next layer's experts are read
-                 ahead from a router prediction
+                 ahead from a router prediction (1K TTFT -30 %, 8K -11..-16 %)
         long prompts: layers 20-39 compute only the rows later layers read (same bits)
 ```
 

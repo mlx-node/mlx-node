@@ -6,7 +6,8 @@
 // and, with the phase profile on (`stats::set_profiling`, evals at phase
 // edges), the time split. Arms (`DSV41_PREFILL_ARMS`, interleaved ABBA per
 // rep) must give bitwise equal last-row logits per T. `DSV41_PREFILL_SLOTS`
-// replaces the admission by a fixed cache size. Run with
+// (+ `DSV41_PREFILL_STAGING`, default 1) replaces the admission by a fixed
+// bank. Run with
 // `MLX_DSV41_EXPERT_CACHE_GB=<N_auto>`, `DSV41_PROMPTS`.
 
 fn p4_prompt(t: usize) -> Vec<u32> {
@@ -59,11 +60,11 @@ fn real_prefill_timing() {
         p => panic!("DSV41_PREFILL_PROFILE={p}"),
     };
     let prompts: Vec<(usize, Vec<u32>)> = ts.iter().map(|&t| (t, p4_prompt(t))).collect();
-    // `DSV41_PREFILL_SLOTS`: exactly this many cache slots, staging layers
-    // from `MLX_DSV41_STAGING_LAYERS` (no admission: the A/B of a second
-    // staging layer when the host's admission would not give one)
     let plan = match s16_env("DSV41_PREFILL_SLOTS") {
-        Some(n) => CachePlan::Slots(n.parse().unwrap()),
+        Some(n) => CachePlan::Slots {
+            cache: n.parse().unwrap(),
+            staging: s16_env("DSV41_PREFILL_STAGING").map_or(1, |v| v.parse().unwrap()),
+        },
         None => CachePlan::Admit(Limits::from_env().unwrap()),
     };
     let store = s16_store(plan);

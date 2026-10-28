@@ -489,7 +489,15 @@ fn real_cache_inv_c4() {
     let slots = (4.0 * S16_GIB / EXPERT_BYTES as f64) as usize;
     // 16 calls (plan): at 228 slots < 240 experts per token LRU thrashes, so
     // every use is a read
-    real_cache_inv("c4", CachePlan::Slots(slots), &S16_TURNS[..2], false);
+    real_cache_inv(
+        "c4",
+        CachePlan::Slots {
+            cache: slots,
+            staging: 1,
+        },
+        &S16_TURNS[..2],
+        false,
+    );
 }
 
 /// S15 admission at load and every turn (`MLX_DSV41_EXPERT_CACHE_GB` = the
