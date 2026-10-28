@@ -440,6 +440,12 @@ int32_t mlx_set_cache_limit(uint64_t limit, uint64_t* out_old_limit) {
   }
 }
 
+// TF32 for f32 GEMM/SDPA dispatch encoded on the calling thread:
+// -1 follows MLX_ENABLE_TF32, 0 forces true f32, 1 allows TF32.
+void mlx_set_thread_tf32(int32_t mode) {
+  mlx::core::env::set_thread_tf32(mode);
+}
+
 // Get the number of bytes in an array without evaluating it
 // This is much faster than calling shape() which triggers evaluation
 size_t mlx_array_nbytes(mlx_array* handle) {

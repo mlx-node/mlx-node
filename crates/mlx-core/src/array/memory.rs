@@ -462,6 +462,18 @@ pub fn set_cache_limit(limit: f64) -> Result<f64, SetCacheLimitError> {
     }
 }
 
+/// TF32 for f32 GEMM/SDPA ops this thread encodes: `None` follows
+/// `MLX_ENABLE_TF32`, `Some(false)` forces true f32 (NAX GPUs otherwise run
+/// f32 GEMMs with M > 1 in TF32), `Some(true)` allows TF32.
+pub fn set_thread_tf32(mode: Option<bool>) {
+    let m = match mode {
+        None => -1,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    unsafe { sys::mlx_set_thread_tf32(m) }
+}
+
 /// Clear MLX's compiler cache (traced computation graphs)
 /// Call this after autograd operations to release traced graph memory
 /// Returns true on success, false on failure (error details printed to stderr)
