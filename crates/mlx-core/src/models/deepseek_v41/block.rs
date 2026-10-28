@@ -10,6 +10,7 @@ use super::config::DeepseekV41Config;
 use super::model::fp32_site;
 use super::moe::{Moe, Routes};
 use super::ops::{hc_mixes, hc_post, hc_pre};
+use super::stats::{Phase, prof_end, prof_start};
 use super::store::Dense;
 use crate::array::MxArray;
 
@@ -117,9 +118,12 @@ impl Block {
         win: &mut WindowCache,
         src: Option<&mut CompressedCache>,
         shared: &mut ForwardShared,
+        next: Option<&Moe>,
     ) -> Result<(MxArray, MxArray, Routes, Option<Vec<f32>>)> {
+        let tp = prof_start();
         let (attn_pre, attn_post, attn_comb) = self.mixes(x, &self.hc_attn)?;
         let a = rms_norm(&hc_pre(x, pre_mix)?, &self.attn_norm, self.eps)?;
+        prof_end(Phase::Hc, tp, &[&attn_pre, &attn_post, &attn_comb, &a])?;
         let (a, scores) = match (&self.attn, src) {
             (Attn::Window(w), _) => (w.forward(&a, start, win)?, None),
             (Attn::Compressed(c), Some(src)) => c.forward(&a, start, win, src, shared)?,
@@ -130,11 +134,19 @@ impl Block {
                 )));
             }
         };
+        let tp = prof_start();
         let x = hc_post(&a, x, &attn_post, &attn_comb)?;
 
         let (ffn_pre, ffn_post, ffn_comb) = self.mixes(&x, &self.hc_ffn)?;
         let f = rms_norm(&hc_pre(&x, &attn_pre)?, &self.ffn_norm, self.eps)?;
+        prof_end(Phase::Hc, tp, &[&x, &ffn_pre, &ffn_post, &ffn_comb, &f])?;
         let (s, dim) = (f.shape_at(0)?, f.shape_at(1)?);
+        // stage P4: the next layer's experts are read while this one computes
+        if let Some(nx) = next
+            && s > 1
+        {
+            nx.prefetch_from(&f)?;
+        }
         let mut outs = Vec::new();
         let mut routes = Routes {
             k: self.moe.k(),
@@ -153,11 +165,14 @@ impl Block {
             outs.push(y);
             lo = hi;
         }
+        self.moe.end_layer();
         let f = match outs.len() {
             1 => outs.swap_remove(0),
             _ => MxArray::concatenate_many(outs.iter().collect(), Some(0))?,
         };
+        let tp = prof_start();
         let x = hc_post(&f, &x, &ffn_post, &ffn_comb)?;
+        prof_end(Phase::Hc, tp, &[&x])?;
         Ok((x, ffn_pre, routes, scores))
     }
 }

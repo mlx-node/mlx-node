@@ -11,6 +11,117 @@ pub(crate) static ROUTER_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static ENGRAM_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static ENGRAM_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Time split of a forward (`MLX_DSV41_PROFILE=1`, stage P4). Each phase
+/// evaluates its outputs before its clock stops, so phases do not overlap
+/// and their sum is the GPU + host time of the layers (values unchanged:
+/// an eval does not change bits). Off: no eval, no clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// Engram rows (read + mix).
+    Engram,
+    /// HC mixes, norms, `hc_pre` / `hc_post`.
+    Hc,
+    /// Attention projections (q, kv, compressor, index keys, `wo_a`/`wo_b`).
+    AttnProj,
+    /// Indexer scores + host top-k.
+    Indexer,
+    /// Sparse sink attention core.
+    Sparse,
+    /// Router GEMM + ids to the host.
+    Router,
+    /// Expert slots: plan + reads (blocked time).
+    Fill,
+    /// Routed expert gathers.
+    Routed,
+    /// Shared expert + the f32 sum.
+    Shared,
+    /// Final norm + head.
+    Head,
+}
+
+pub const PHASES: [Phase; 10] = [
+    Phase::Engram,
+    Phase::Hc,
+    Phase::AttnProj,
+    Phase::Indexer,
+    Phase::Sparse,
+    Phase::Router,
+    Phase::Fill,
+    Phase::Routed,
+    Phase::Shared,
+    Phase::Head,
+];
+
+static PHASE_NS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+/// 0 = not read yet, 1 = off, 2 = on.
+static PROFILE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// `MLX_DSV41_PROFILE=1` (read once per process; `set_profiling` overrides).
+pub fn profiling() -> bool {
+    match PROFILE.load(Ordering::Relaxed) {
+        0 => {
+            let on = std::env::var("MLX_DSV41_PROFILE").is_ok_and(|v| v == "1");
+            PROFILE.store(1 + u8::from(on), Ordering::Relaxed);
+            on
+        }
+        v => v == 2,
+    }
+}
+
+/// Turns the phase split on or off for this process (tests, benches).
+pub fn set_profiling(on: bool) {
+    PROFILE.store(1 + u8::from(on), Ordering::Relaxed);
+}
+
+/// A phase clock when profiling (the GPU is drained first, so the phase
+/// does not pay for lazy work queued before it).
+pub(crate) fn prof_start() -> Option<std::time::Instant> {
+    profiling().then(|| {
+        crate::array::synchronize();
+        std::time::Instant::now()
+    })
+}
+
+/// Evaluates `outs` and adds the time since `t` to `phase` (no-op when
+/// `t` is `None`).
+pub(crate) fn prof_end(
+    phase: Phase,
+    t: Option<std::time::Instant>,
+    outs: &[&crate::array::MxArray],
+) -> napi::Result<()> {
+    if let Some(t) = t {
+        if !outs.is_empty() {
+            crate::array::MxArray::eval_arrays_with_context(outs, "deepseek_v41 profile")?;
+        }
+        crate::array::synchronize();
+        PHASE_NS[phase as usize].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Seconds per phase so far (monotonic, process-wide).
+pub fn phase_seconds() -> [f64; 10] {
+    std::array::from_fn(|i| PHASE_NS[i].load(Ordering::Relaxed) as f64 * 1e-9)
+}
+
+impl Phase {
+    pub fn name(self) -> &'static str {
+        match self {
+            Phase::Engram => "engram",
+            Phase::Hc => "hc",
+            Phase::AttnProj => "attn_proj",
+            Phase::Indexer => "indexer",
+            Phase::Sparse => "sparse_attn",
+            Phase::Router => "router",
+            Phase::Fill => "fill",
+            Phase::Routed => "routed",
+            Phase::Shared => "shared",
+            Phase::Head => "head",
+        }
+    }
+}
+
 /// Wait counters and read bytes so far (monotonic, process-wide).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Counters {
@@ -26,6 +137,10 @@ pub struct Counters {
     /// Expert uses (distinct experts per layer step) and cache hits among them.
     pub uses: u64,
     pub hits: u64,
+    /// Experts read ahead (stage P4) that no route used (inside `fill_slots`).
+    pub prefetch_unused: u64,
+    /// The bank's staging layers now (not a counter).
+    pub staging_layers: u64,
 }
 
 impl Counters {
@@ -41,6 +156,8 @@ impl Counters {
             fill_wait_ns: b.wait_ns,
             uses: b.uses as u64,
             hits: b.hits as u64,
+            prefetch_unused: b.prefetch_unused as u64,
+            staging_layers: bank.staging_layers() as u64,
         }
     }
 
@@ -55,6 +172,8 @@ impl Counters {
             fill_wait_ns: self.fill_wait_ns - before.fill_wait_ns,
             uses: self.uses - before.uses,
             hits: self.hits - before.hits,
+            prefetch_unused: self.prefetch_unused - before.prefetch_unused,
+            staging_layers: self.staging_layers,
         }
     }
 }
@@ -180,7 +299,9 @@ pub fn line(
         // cache hits per use; bytes: every use served without a read (cache
         // hits and still-valid staging copies; all experts have one size)
         "hit_rate_uses": c.hits as f64 / c.uses.max(1) as f64,
-        "hit_rate_bytes": 1.0 - c.fill_slots as f64 / c.uses.max(1) as f64,
+        // (reads ahead no route used are not uses: `prefetch_unused_slots`)
+        "hit_rate_bytes": 1.0 - c.fill_slots.saturating_sub(c.prefetch_unused) as f64 / c.uses.max(1) as f64,
+        "prefetch_unused_slots": c.prefetch_unused,
         "miss_gb_per_tok": c.fill_bytes as f64 / 1e9 / toks,
         "read_gbps": c.fill_bytes as f64 / 1e9 / io_s.max(1e-9),
         "t_c_ms": (wall_s - io_s - eng_s) * 1e3 / toks,
@@ -190,7 +311,7 @@ pub fn line(
         "t_router_wait_ms": c.router_ns as f64 * 1e-6 / toks,
         "bytes_read_total": bytes_read_total,
         "cache_slots": cache_slots,
-        "staging_layers": 1,
+        "staging_layers": c.staging_layers,
         "peak_footprint_gib": peak_footprint as f64 / GIB,
         "mlx_cache_gib": crate::array::get_cache_memory() / GIB,
         "swapout_delta_mib": swapout_delta as f64 / (1u64 << 20) as f64,

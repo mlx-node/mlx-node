@@ -845,3 +845,152 @@ fn tiny_qmm_dense_ops() {
     huge.dims = vec![32, 1u64 << 57];
     assert!(DenseMode::F32.resident(&huge).is_err(), "f32 4n overflow");
 }
+
+/// Stage P4: a bank with two staging layers and the next-layer prefetch
+/// (off / pred / all) gives the one-staging-layer store's logits bitwise
+/// (c1-c3, S in {0, 6, 64} x {Seeded, Lru}); a cold one-call prefill reads
+/// every used (layer, expert) once plus the prefetched ones no route used,
+/// never twice (a prefill seed of a staged expert is copied, not re-read).
+#[test]
+fn tiny_prefetch_bitwise() {
+    use crate::moe_stream::bank::PrefetchMode;
+    let npz = Npz::open("oracle.npz");
+    let c1 = case_ids(&npz, "c1");
+    for mode in ["fp32_on", "bf16_on"] {
+        for (slots, cm) in [0, 6, 64]
+            .into_iter()
+            .flat_map(|s| [(s, CacheMode::Seeded), (s, CacheMode::Lru)])
+        {
+            let reference = cached_store_in(mode, slots, cm);
+            let want: Vec<Vec<f32>> = ["c1", "c2", "c3"]
+                .iter()
+                .map(|case| run(&reference.model, &case_ids(&npz, case), &split(case)).0)
+                .collect();
+            for pm in [PrefetchMode::Off, PrefetchMode::Pred, PrefetchMode::All] {
+                let s = cached_store_in(mode, slots, cm);
+                s.bank.rebuild_staging(slots, 2).unwrap();
+                s.bank.set_prefetch_mode(pm);
+                assert_eq!(s.bank.staging_layers(), 2);
+                let mut sess = s.model.new_session();
+                let mut tr = Trace::default();
+                s.model
+                    .forward(&mut sess, &c1, None, Some(&mut tr))
+                    .unwrap();
+                let st = s.bank.stats();
+                let used: usize = tr
+                    .routes
+                    .iter()
+                    .map(|r| r.ids.iter().collect::<BTreeSet<_>>().len())
+                    .sum();
+                assert_eq!(
+                    st.slots,
+                    used + st.prefetch_unused,
+                    "{mode} S={slots} {cm:?} {pm:?}: reads {} != used {used} + unused prefetch {}",
+                    st.slots,
+                    st.prefetch_unused
+                );
+                assert!(st.prefetch_unused <= st.prefetch_slots);
+                assert_eq!(st.prefetch_slots > 0, pm != PrefetchMode::Off, "{pm:?}");
+                for (i, case) in ["c1", "c2", "c3"].iter().enumerate() {
+                    let (got, _) = run(&s.model, &case_ids(&npz, case), &split(case));
+                    assert_eq!(
+                        bits(&got),
+                        bits(&want[i]),
+                        "{mode} S={slots} {cm:?} {pm:?} {case}: 2 staging layers != 1"
+                    );
+                }
+                s.bank.with_cache_dir(|c| c.check()).unwrap();
+                assert_eq!(s.bank.reads_in_flight(), 0);
+                pool_ok(mode);
+                println!(
+                    "{mode} S={slots} {cm:?} {pm:?}: bitwise; cold c1 reads {} = used {used} + unused {} (prefetched {}, copied {})",
+                    st.slots, st.prefetch_unused, st.prefetch_slots, st.promoted
+                );
+            }
+        }
+    }
+}
+
+/// Stage P4: `replay_turns_staged` with two staging layers gives the live
+/// bank's (uses, hits, reads) without prefetch. With prefetch only the uses
+/// are equal: a read ahead overwrites a same-half staging copy of layer
+/// `l - 2` that a later decode step could have reused, so that step takes
+/// a cache victim and the cache evolves differently (not modelled).
+#[test]
+fn tiny_replay_two_staging_layers() {
+    use crate::moe_stream::bank::PrefetchMode;
+    use crate::moe_stream::replay::{Replayed, Step, replay_turns_staged};
+    let npz = Npz::open("oracle.npz");
+    for (slots, cm) in [0, 6, 64]
+        .into_iter()
+        .flat_map(|s| [(s, CacheMode::Seeded), (s, CacheMode::Lru)])
+    {
+        for pm in [PrefetchMode::Off, PrefetchMode::Pred, PrefetchMode::All] {
+            let store = cached_store_in("fp32_on", slots, cm);
+            store.bank.rebuild_staging(slots, 2).unwrap();
+            store.bank.set_prefetch_mode(pm);
+            let mut steps = Vec::new();
+            for case in ["c1", "c2", "c3"] {
+                let (_, traces) = run(&store.model, &case_ids(&npz, case), &split(case));
+                for t in &traces {
+                    for (layer, r) in t.routes.iter().enumerate() {
+                        steps.push(Step {
+                            layer,
+                            rows: r.rows(),
+                            ids: r.ids.clone(),
+                        });
+                    }
+                }
+            }
+            let cfg = &store.model.cfg;
+            let mut c =
+                crate::moe_stream::cache::Cache::lru(slots, cfg.n_layers, cfg.n_routed_experts)
+                    .with_mode(cm);
+            let r = replay_turns_staged(&mut c, cfg.n_routed_experts, 2, &[&steps])
+                .into_iter()
+                .fold(Replayed::default(), Replayed::plus);
+            let st = store.bank.stats();
+            let net = (st.slots - st.prefetch_unused) as u64;
+            assert_eq!(r.uses, st.uses as u64, "S={slots} {cm:?} {pm:?}: uses");
+            if pm == PrefetchMode::Off {
+                assert_eq!(
+                    (r.hits, r.reads),
+                    (st.hits as u64, net),
+                    "S={slots} {cm:?}: replay != live"
+                );
+            }
+            println!(
+                "S={slots} {cm:?} {pm:?}: uses {} hits replay {} live {} reads replay {} live net {net} (+{} unused prefetch)",
+                r.uses, r.hits, st.hits, r.reads, st.prefetch_unused
+            );
+        }
+    }
+}
+
+/// P3 codex: a `Pending` kept past its step (its `Prepared` dropped) must
+/// not let a rebuild free the slots its reads still write: the rebuild
+/// waits for every read in flight.
+#[test]
+fn tiny_rebuild_waits_for_reads_in_flight() {
+    let s = cached_store_in("fp32_on", 0, CacheMode::Seeded);
+    s.bank.test_delay_reads(300);
+    let (p, pending) = s.bank.prepare_split(0, &[0, 1, 2], &[], false).unwrap();
+    assert!(pending.is_some() && s.bank.reads_in_flight() == 1);
+    drop(p);
+    let t0 = Instant::now();
+    s.bank.rebuild(0).unwrap();
+    let waited = t0.elapsed();
+    assert_eq!(s.bank.reads_in_flight(), 0, "rebuild left a read in flight");
+    assert!(
+        waited.as_millis() >= 250,
+        "rebuild returned after {waited:?}, before the delayed reads"
+    );
+    drop(pending);
+    s.bank.test_delay_reads(0);
+    let npz = Npz::open("oracle.npz");
+    let reference = cached_store_in("fp32_on", 0, CacheMode::Seeded);
+    let case = "c2";
+    let (want, _) = run(&reference.model, &case_ids(&npz, case), &split(case));
+    let (got, _) = run(&s.model, &case_ids(&npz, case), &split(case));
+    assert_eq!(bits(&got), bits(&want));
+}

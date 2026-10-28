@@ -11,6 +11,7 @@ use super::compressor::{Compressor, CompressorWeights};
 use super::config::DeepseekV41Config;
 use super::indexer::{CandidateRole, Indexer, IndexerWeights, chunk_rows};
 use super::ops::{apply_partial_rope, fp4_roundtrip, fp8_roundtrip, inv_freqs, rope_tables};
+use super::stats::{Phase, prof_end, prof_start};
 use super::store::{Dense, Weight};
 use crate::array::{DType, MxArray};
 
@@ -196,6 +197,7 @@ impl WindowAttention {
     /// this chunk's KV to `cache` (any chunk size, any `start`).
     pub fn forward(&self, x: &MxArray, start: usize, cache: &mut WindowCache) -> Result<MxArray> {
         let s = x.shape_at(0)? as usize;
+        let tp = prof_start();
         let (cos, sin) = self.rope(start, s)?;
         let (_, q) = self.query(x, &cos, &sin)?;
         let kv = self.quant_kv(&self.kv_rotated(x, &cos, &sin)?)?;
@@ -204,6 +206,8 @@ impl WindowAttention {
         for p in start..start + s {
             push_window_row(&mut idx, p, first, self.window);
         }
+        prof_end(Phase::AttnProj, tp, &[&q, &keys, &cos, &sin])?;
+        let tp = prof_start();
         let mut peak = 0;
         let o = sparse_sink_attention(
             &q,
@@ -214,8 +218,12 @@ impl WindowAttention {
             self.scale,
             &mut peak,
         )?;
+        prof_end(Phase::Sparse, tp, &[&o])?;
+        let tp = prof_start();
         let o = apply_partial_rope(&o, self.rope_dim, &cos, &sin, true)?;
-        self.output(&o)
+        let y = self.output(&o)?;
+        prof_end(Phase::AttnProj, tp, &[&y])?;
+        Ok(y)
     }
 
     /// Grouped `wo_a` (block-diagonal, held in the activation dtype as the
@@ -435,6 +443,7 @@ impl CompressedAttention {
                 src.len
             )));
         }
+        let tp = prof_start();
         let (cos, sin) = self.core.rope(start, s)?;
         let (qr, q) = self.core.query(x, &cos, &sin)?;
         let kv = self.core.quant_kv(&self.core.kv_rotated(x, &cos, &sin)?)?;
@@ -460,6 +469,13 @@ impl CompressedAttention {
             }
         }
 
+        {
+            let mut outs = vec![&qr, &q, &keys, &cos, &sin];
+            outs.extend(latent.as_ref().map(|(_, l)| l));
+            outs.extend(index_k.as_ref());
+            prof_end(Phase::AttnProj, tp, &outs)?;
+        }
+        let tp = prof_start();
         let mut scores = None;
         if let Some(ix) = &self.indexer {
             let topk = if t == 0 {
@@ -490,7 +506,9 @@ impl CompressedAttention {
             };
             shared.topk = Some(topk);
         }
+        prof_end(Phase::Indexer, tp, &[])?;
 
+        let tp = prof_start();
         if let Some((g0, l)) = latent {
             let (c, sn) = self.group_rope(g0, l.shape_at(0)? as usize)?;
             let l = apply_partial_rope(&l, self.rope_dim, &c, &sn, false)?;
@@ -526,6 +544,12 @@ impl CompressedAttention {
             }
             _ => keys,
         };
+        {
+            let mut outs = vec![&all];
+            outs.extend(ckv.as_ref());
+            prof_end(Phase::AttnProj, tp, &outs)?;
+        }
+        let tp = prof_start();
         let mut peak = 0;
         let o = sparse_sink_attention(
             &q,
@@ -537,8 +561,11 @@ impl CompressedAttention {
             &mut peak,
         )?;
         self.scratch_peak.fetch_max(peak, Ordering::Relaxed);
+        prof_end(Phase::Sparse, tp, &[&o])?;
+        let tp = prof_start();
         let o = apply_partial_rope(&o, self.rope_dim, &cos, &sin, true)?;
         let out = self.core.output(&o)?;
+        prof_end(Phase::AttnProj, tp, &[&out])?;
         if self.compressor.is_some() {
             src.tail = tail;
             src.index_k = index_k;

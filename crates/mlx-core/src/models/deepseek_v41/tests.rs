@@ -441,3 +441,6 @@ include!("tests_cache.rs");
 
 // S17 product chat lane (tiny + real).
 include!("tests_chat.rs");
+
+// Stage P4 prefill timing (real, ignored).
+include!("tests_prefill.rs");

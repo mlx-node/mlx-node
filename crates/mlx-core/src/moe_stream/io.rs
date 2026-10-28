@@ -77,6 +77,9 @@ pub struct ShardSet {
     shards: Vec<Shard>,
     #[cfg(test)]
     fault: Mutex<Option<(usize, u64)>>,
+    /// Test hook: every read sleeps this many ms first.
+    #[cfg(test)]
+    pub(crate) delay_ms: std::sync::atomic::AtomicU64,
 }
 
 impl ShardSet {
@@ -99,6 +102,8 @@ impl ShardSet {
             shards,
             #[cfg(test)]
             fault: Mutex::new(None),
+            #[cfg(test)]
+            delay_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -196,6 +201,10 @@ impl ShardSet {
         offset: u64,
         need: usize,
     ) -> std::io::Result<()> {
+        #[cfg(test)]
+        std::thread::sleep(std::time::Duration::from_millis(
+            self.delay_ms.load(std::sync::atomic::Ordering::Relaxed),
+        ));
         #[cfg(test)]
         if let Some((s, at)) = *lock(&self.fault)
             && s == shard
@@ -406,6 +415,27 @@ impl Ticket {
 impl Drop for Ticket {
     fn drop(&mut self) {
         drop(self.batch.wait());
+    }
+}
+
+/// Waits for a batch without its ticket (the owner of the destinations
+/// keeps one per batch in flight, so it never frees them under a read).
+#[derive(Clone)]
+pub struct BatchWatch(Arc<Batch>);
+
+impl BatchWatch {
+    pub fn wait(&self) {
+        drop(self.0.wait());
+    }
+
+    pub fn done(&self) -> bool {
+        lock(&self.0.state).remaining == 0
+    }
+}
+
+impl Ticket {
+    pub fn watch(&self) -> BatchWatch {
+        BatchWatch(Arc::clone(&self.batch))
     }
 }
 

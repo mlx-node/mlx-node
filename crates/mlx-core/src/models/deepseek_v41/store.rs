@@ -26,7 +26,7 @@ use super::rows::PreadTable;
 use crate::array::alloc::OutLayout;
 use crate::array::{DType, MxArray};
 use crate::cache_limit::{CacheLimitGuard, coordinator};
-use crate::moe_stream::bank::{ExpertTensor, StagingBank};
+use crate::moe_stream::bank::{ExpertTensor, PrefetchMode, StagingBank};
 use crate::moe_stream::budget::{
     Admission, Limits, ModelSize, Own, Turn, admit, readmit, working_set,
 };
@@ -113,6 +113,23 @@ pub const SPLIT_ENV: &str = "MLX_DSV41_SPLIT";
 
 /// `MLX_DSV41_SPLIT`; unset or empty = on (DECISIONS P3); anything else
 /// than on / off is refused.
+/// Staging layers of a bank opened without an admission
+/// (`MLX_DSV41_STAGING_LAYERS` = 1 or 2; unset: 1).
+pub fn staging_from_env() -> Result<usize> {
+    match std::env::var(crate::moe_stream::budget::STAGING_ENV)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        None | Some("") | Some("1") => Ok(1),
+        Some("2") => Ok(2),
+        Some(v) => Err(bad(format!(
+            "{}={v}: want 1 or 2",
+            crate::moe_stream::budget::STAGING_ENV
+        ))),
+    }
+}
+
 pub fn split_from_env() -> Result<bool> {
     match std::env::var(SPLIT_ENV).ok().as_deref().map(str::trim) {
         None | Some("") | Some("on") => Ok(true),
@@ -439,7 +456,9 @@ impl Store {
                 let slots = if let CachePlan::Slots(n) = plan { n } else { 0 };
                 if let Some(h) = host_memory() {
                     let free = h.physical.saturating_sub(h.non_reclaimable());
-                    let need = bank_need + slots as u64 * size.slot + size.dense;
+                    let need = bank_need * staging_from_env()? as u64
+                        + slots as u64 * size.slot
+                        + size.dense;
                     if need + RESERVE > free {
                         return Err(bad(format!(
                             "load needs {} GiB + {} GiB reserve, host has {} GiB free",
@@ -454,13 +473,21 @@ impl Store {
         };
         let shards = Arc::new(ShardSet::open(paths)?);
         let t_bank = Instant::now();
-        let bank = Arc::new(StagingBank::with_mode(
+        // the admission's second staging layer comes only after the cache it
+        // would otherwise shrink (S15-5); without an admission, the env
+        let staging = match &admission {
+            Some(a) => a.staging_layers as usize,
+            None => staging_from_env()?,
+        };
+        let bank = Arc::new(StagingBank::with_staging(
             IoPool::from_env(Arc::clone(&shards))?,
             layers,
             cache_slots,
             cache_mode,
+            staging,
         )?);
         bank.set_split(split_from_env()?);
+        bank.set_prefetch_mode(PrefetchMode::from_env()?);
         let bank_alloc_s = t_bank.elapsed().as_secs_f64();
         let (mut dense_read, mut dense_bytes) = (0u64, 0u64);
         let mut buf = AlignedBuf::new();
@@ -596,9 +623,9 @@ impl Store {
         })
     }
 
-    fn switch(&self, t: &mut TurnState, slots: usize) -> Result<()> {
+    fn switch(&self, t: &mut TurnState, slots: usize, staging: usize) -> Result<()> {
         let t0 = Instant::now();
-        self.bank.rebuild(slots)?;
+        self.bank.rebuild_staging(slots, staging)?;
         t.guard = coordinator()
             .register_with_cache_limit(self.dense_bytes + self.bank.nbytes(), Some(POOL_LIMIT));
         let s = t0.elapsed().as_secs_f64();
@@ -614,7 +641,8 @@ impl Store {
         if t.wired.is_some() {
             return Err(bad("bank switch inside a turn"));
         }
-        self.switch(&mut t, slots)
+        let staging = self.bank.staging_layers();
+        self.switch(&mut t, slots, staging)
     }
 
     /// Turn start: re-admit (`CachePlan::Admit`), switch the bank if the
@@ -636,7 +664,7 @@ impl Store {
                 {
                     Turn::Keep => cur,
                     Turn::StagingOnly(a) | Turn::Rebuild(a) => {
-                        self.switch(&mut t, a.cache_slots as usize)?;
+                        self.switch(&mut t, a.cache_slots as usize, a.staging_layers as usize)?;
                         tracing::info!("deepseek_v41 re-admission: {a}");
                         a
                     }

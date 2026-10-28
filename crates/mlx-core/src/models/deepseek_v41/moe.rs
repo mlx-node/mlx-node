@@ -16,6 +16,7 @@ use napi::{Error, Result};
 use super::attention::linear;
 use super::config::DeepseekV41Config;
 use super::ops::{route_select, router_scores, swiglu};
+use super::stats::{Phase, prof_end, prof_start};
 use super::store::Dense;
 use crate::array::alloc::OutLayout;
 use crate::array::{DType, MxArray};
@@ -263,6 +264,7 @@ impl Moe {
     /// `Gate.forward`: f32 logits, `sqrt(softplus)`, top-k of scores + bias on
     /// the host (one sync), weights from the unbiased scores.
     pub fn route(&self, x: &MxArray) -> Result<Routes> {
+        let tp = prof_start();
         let logits = linear(&x.astype(DType::Float32)?, &self.w.router)?;
         super::model::fp32_site("router_logits", usize::MAX, &logits)?;
         let scores = router_scores(&logits)?;
@@ -279,12 +281,55 @@ impl Moe {
             .map(|(i, &v)| v + self.w.bias[i % n])
             .collect();
         let (ids, weights) = route_select(&biased, &s, n, self.k, self.route_scale, self.norm);
+        prof_end(Phase::Router, tp, &[])?;
         Ok(Routes {
             k: self.k,
             ids,
             weights,
             biased,
         })
+    }
+
+    /// Stage P4: reads ahead the experts this layer will likely use, from
+    /// `x [rows, dim]` (the previous layer's FFN input) through this layer's
+    /// router (`PrefetchMode::Pred`, union over rows) or every expert
+    /// (`All`), while the previous layer computes. Only a prediction: the
+    /// layer's own routes still decide (an unused expert is a wasted read,
+    /// a missed one is read by the layer's step). Returns the experts queued.
+    pub fn prefetch_from(&self, x: &MxArray) -> Result<usize> {
+        use crate::moe_stream::bank::PrefetchMode;
+        let Experts::Stream(st) = &self.w.experts else {
+            return Ok(0);
+        };
+        let mode = st.prefetch_mode();
+        if mode == PrefetchMode::Off || st.staging_layers() < 2 {
+            return Ok(0);
+        }
+        let want: Vec<u32> = match mode {
+            PrefetchMode::All => (0..self.n_experts as u32).collect(),
+            _ => {
+                let (rows, dim) = (x.shape_at(0)?, x.shape_at(1)?);
+                let mut seen = vec![false; self.n_experts];
+                let mut lo = 0;
+                while lo < rows {
+                    let hi = (lo + super::block::FFN_CHUNK_ROWS).min(rows);
+                    let r = self.route(&x.slice(&[lo, 0], &[hi, dim])?)?;
+                    r.ids.iter().for_each(|&e| seen[e as usize] = true);
+                    lo = hi;
+                }
+                (0..self.n_experts as u32)
+                    .filter(|&e| seen[e as usize])
+                    .collect()
+            }
+        };
+        st.prefetch_layer(self.layer, &want)
+    }
+
+    /// Every step of this layer ran (stage P4 prefetch accounting).
+    pub fn end_layer(&self) {
+        if let Experts::Stream(st) = &self.w.experts {
+            st.end_layer(self.layer);
+        }
     }
 
     /// Routed experts of `x [rows, dim]` -> `[rows, k, dim]` in `x`'s dtype,
@@ -320,7 +365,10 @@ impl Moe {
             Experts::Resident(banks) => run(banks, &ids),
             Experts::Stream(st) => {
                 let (used, uses) = distinct_uses(&ids);
+                let tp = prof_start();
                 let p = st.prepare(self.layer, &used, &uses, decode_step(rows as usize))?;
+                prof_end(Phase::Fill, tp, &[])?;
+                let tp = prof_start();
                 st.assert_slots(&p);
                 let slot_ids: Vec<u32> = ids
                     .iter()
@@ -341,6 +389,7 @@ impl Moe {
                 // slots may be refilled or evicted by the next step: no lazy
                 // gather may outlive this call
                 MxArray::eval_arrays_with_context(&[&out], "deepseek_v41 routed gather")?;
+                prof_end(Phase::Routed, tp, &[])?;
                 st.done(p.epoch);
                 Ok(out)
             }
@@ -374,13 +423,16 @@ impl Moe {
                 (cols, self.shared(x)?)
             }
         };
+        let tp = prof_start();
         let mut y = MxArray::zeros(&[rows, dim], Some(DType::Float32))?;
         for col in &cols {
             y = y.add(&col.astype(DType::Float32)?)?;
         }
         y = y.add(&shared.astype(DType::Float32)?)?;
         super::model::fp32_site("moe_sum", usize::MAX, &y)?;
-        Ok((y.astype(x.dtype()?)?, routes))
+        let y = y.astype(x.dtype()?)?;
+        prof_end(Phase::Shared, tp, &[&y])?;
+        Ok((y, routes))
     }
 
     /// One decode row (stage P3): queue the reads of the missed experts,

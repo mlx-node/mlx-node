@@ -1,9 +1,14 @@
 //! The shared expert bank: per projection one `PurgeableBank` pair (`w`
 //! uint32 E2M1 codes, `s` uint8 E8M0 scales) of `[slots, rows, k / 8]` /
-//! `[slots, rows, k / 32]`, used by every layer. Slots `0..n_experts` are
-//! staging (slot = expert id), tagged `(layer, expert)`: a tag is cleared
+//! `[slots, rows, k / 32]`, used by every layer. Slots `0..L * n_experts`
+//! are `L` staging layers (1 or 2; layer `l` stages expert `e` in slot
+//! `(l % L) * n_experts + e`), tagged `(layer, expert)`: a tag is cleared
 //! before a refill and set only after every projection's read finished.
-//! Slots `n_experts..` are the global cache ([`Cache`] directory).
+//! Slots `L * n_experts..` are the global cache ([`Cache`] directory). With
+//! two staging layers a prefill reads the next layer's predicted experts
+//! into the other half while this layer computes (stage P4, `prefetch_layer`).
+//! Every read in flight is watched: a rebuild, a turn end or a later step
+//! waits for it before the slots it writes can be freed or reused.
 //!
 //! Between turns the banks are `Volatile`; the first use of a turn makes
 //! them `NonVolatile` again and, when Metal emptied any of them, forgets
@@ -17,7 +22,7 @@ use std::time::Instant;
 use napi::{Error, Result};
 
 use super::cache::{Cache, CacheMode, Source};
-use super::io::{Extent, IoPool, IoStats, Priority, Read, Ticket};
+use super::io::{BatchWatch, Extent, IoPool, IoStats, Priority, Read, Ticket};
 use super::repack::SlotRepack;
 use crate::array::purgeable::{BankWatch, PurgeableBank, PurgeableState};
 use crate::array::{DType, MxArray};
@@ -29,6 +34,35 @@ fn bad(msg: impl std::fmt::Display) -> Error {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What a prefill reads ahead for the next layer (stage P4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefetchMode {
+    Off = 0,
+    /// The next layer's router on this layer's FFN input (union over rows).
+    Pred = 1,
+    /// Every expert of the next layer.
+    All = 2,
+}
+
+impl PrefetchMode {
+    /// `MLX_DSV41_PREFETCH` = `off` | `pred` | `all` (unset: `pred`; it acts
+    /// only with two staging layers).
+    pub fn from_env() -> Result<Self> {
+        match std::env::var("MLX_DSV41_PREFETCH")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            None | Some("") | Some("pred") => Ok(Self::Pred),
+            Some("off") => Ok(Self::Off),
+            Some("all") => Ok(Self::All),
+            Some(v) => Err(bad(format!(
+                "MLX_DSV41_PREFETCH={v:?}: expected off, pred or all"
+            ))),
+        }
+    }
 }
 
 /// One layer's routed-expert tensor of one projection (`[n, rows, k]` MXFP4).
@@ -68,6 +102,10 @@ pub struct BankStats {
     /// those among them whose overlapped pass also gathered ready experts.
     pub split_steps: usize,
     pub split_mixed: usize,
+    /// Experts read ahead into the second staging layer (stage P4), and
+    /// those among them the layer's routes then did not use.
+    pub prefetch_slots: usize,
+    pub prefetch_unused: usize,
 }
 
 /// Where one layer step's experts are: `slots[i]` is the bank slot of
@@ -124,8 +162,10 @@ impl Pending<'_> {
                 return Err(err);
             }
         };
+        let n = bank.n_experts;
         for &e in &self.staging {
-            g.tags[e as usize] = Some((self.layer, e));
+            let s = g.stage(self.layer, e, n);
+            g.tags[s] = Some((self.layer, e));
         }
         for &(e, c) in &self.victims {
             g.cache.commit(c, self.layer, e);
@@ -152,13 +192,55 @@ impl Drop for Pending<'_> {
     }
 }
 
+/// A next-layer read in flight (`prefetch_layer`).
+struct Ahead {
+    layer: usize,
+    experts: Vec<u32>,
+    ticket: Ticket,
+}
+
 struct Inner {
     proj: Vec<Proj>,
+    /// Staging layers (1 or 2).
+    staging: usize,
     tags: Vec<Option<(usize, u32)>>,
     cache: Cache,
     in_turn: bool,
     /// Buffers of banks dropped by `rebuild` that an array may still hold.
     retired: Vec<BankWatch>,
+    /// Every read batch submitted and maybe not done (slot writes).
+    inflight: Vec<BatchWatch>,
+    /// Next-layer reads in flight (not in `inflight`: a step of an earlier
+    /// layer must not wait for them); settled by their layer's step or a
+    /// lifecycle operation.
+    ahead: Vec<Ahead>,
+    /// Per layer: the prefetched experts no step of it has used yet.
+    ahead_left: Vec<(usize, Vec<u32>)>,
+}
+
+impl Inner {
+    /// Staging slot of `(layer, e)`.
+    fn stage(&self, layer: usize, e: u32, n: usize) -> usize {
+        (layer % self.staging) * n + e as usize
+    }
+
+    /// First cache slot (bank index of cache slot 0).
+    fn base(&self, n: usize) -> u32 {
+        (self.staging * n) as u32
+    }
+
+    /// Blocks until every read in flight is done (their slots may then be
+    /// freed or rewritten).
+    fn drain(&mut self) {
+        for w in self.inflight.drain(..) {
+            w.wait();
+        }
+    }
+
+    fn watch(&mut self, t: &Ticket) {
+        self.inflight.retain(|w| !w.done());
+        self.inflight.push(t.watch());
+    }
 }
 
 pub struct StagingBank {
@@ -168,12 +250,39 @@ pub struct StagingBank {
     n_experts: usize,
     mode: CacheMode,
     split: AtomicBool,
+    prefetch: std::sync::atomic::AtomicU8,
     inner: Mutex<Inner>,
     stats: Mutex<BankStats>,
     /// Test hook: no reads (a gather then meets stale tags).
     pub skip_fill: AtomicBool,
     #[cfg(test)]
     force_empty: AtomicBool,
+}
+
+/// Copies bank slot `from` into slot `to` in every projection (`total` =
+/// the bank's slots). The caller holds the bank lock, the GPU is idle on
+/// both slots and `to` is no gather's until it is committed.
+fn copy_slot(proj: &[Proj], total: usize, from: usize, to: usize) {
+    assert!(
+        from < total && to < total && from != to,
+        "copy_slot {from} -> {to} of {total}"
+    );
+    for p in proj {
+        for b in [&p.w, &p.s] {
+            let sb = b.nbytes() / total;
+            // SAFETY: both ranges lie inside the bank (`from`, `to` < total,
+            // `sb` = one slot's bytes) and do not overlap (from != to); no
+            // GPU work or read touches them (caller's contract) and the bank
+            // is non-volatile in a turn.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    b.data_ptr().0.add(from * sb),
+                    b.data_ptr().0.add(to * sb),
+                    sb,
+                );
+            }
+        }
+    }
 }
 
 fn alloc(first: &[ExpertTensor], slots: i64) -> Result<Vec<Proj>> {
@@ -215,14 +324,29 @@ impl StagingBank {
         Self::with_mode(pool, layers, cache_slots, CacheMode::Lru)
     }
 
-    /// One bank per projection of `n_experts + cache_slots` slots for the
-    /// expert tensors `layers[layer][projection]` (same shape in every layer).
+    /// `with_staging` with one staging layer.
     pub fn with_mode(
         pool: IoPool,
         layers: Vec<Vec<ExpertTensor>>,
         cache_slots: usize,
         mode: CacheMode,
     ) -> Result<Self> {
+        Self::with_staging(pool, layers, cache_slots, mode, 1)
+    }
+
+    /// One bank per projection of `staging * n_experts + cache_slots` slots
+    /// for the expert tensors `layers[layer][projection]` (same shape in
+    /// every layer); `staging` = 1 or 2 staging layers.
+    pub fn with_staging(
+        pool: IoPool,
+        layers: Vec<Vec<ExpertTensor>>,
+        cache_slots: usize,
+        mode: CacheMode,
+        staging: usize,
+    ) -> Result<Self> {
+        if !(1..=2).contains(&staging) {
+            return Err(bad(format!("{staging} staging layers (1 or 2)")));
+        }
         let first = layers.first().ok_or_else(|| bad("no layers"))?;
         let mut n_experts = 0;
         for (p, t) in first.iter().enumerate() {
@@ -257,20 +381,25 @@ impl StagingBank {
             n_experts = shape[0];
         }
         let n = n_experts as usize;
-        let proj = alloc(first, n_experts + cache_slots as i64)?;
+        let proj = alloc(first, (staging * n + cache_slots) as i64)?;
         Ok(Self {
             pool,
             inner: Mutex::new(Inner {
                 proj,
-                tags: vec![None; n],
+                staging,
+                tags: vec![None; staging * n],
                 cache: Cache::lru(cache_slots, layers.len(), n).with_mode(mode),
                 in_turn: true,
                 retired: Vec::new(),
+                inflight: Vec::new(),
+                ahead: Vec::new(),
+                ahead_left: Vec::new(),
             }),
             layers,
             n_experts: n,
             mode,
             split: AtomicBool::new(false),
+            prefetch: std::sync::atomic::AtomicU8::new(PrefetchMode::Off as u8),
             stats: Mutex::new(BankStats::default()),
             skip_fill: AtomicBool::new(false),
             #[cfg(test)]
@@ -379,32 +508,26 @@ impl StagingBank {
             return Ok(());
         }
         crate::array::synchronize();
+        self.settle_ahead(&mut g, |_| true);
+        self.close_ahead_locked(&mut g, |_| true);
+        g.drain();
         g.cache.complete_all();
         let n = self.n_experts;
-        let total = n + g.cache.slots();
         let t0 = std::time::Instant::now();
         let inner = &mut *g;
         let tags = &inner.tags;
+        let stage = |l: usize, e: u32| (l % inner.staging) * n + e as usize;
         let moved = inner
             .cache
-            .promote_staged(&|l, e| tags[e as usize] == Some((l, e)));
-        for &(slot, _, e) in &moved {
-            for p in &inner.proj {
-                for b in [&p.w, &p.s] {
-                    let sb = b.nbytes() / total;
-                    // SAFETY: both ranges lie inside the bank (slot e < n and
-                    // n + slot < total, `sb` = one slot's bytes), they do not
-                    // overlap, the GPU is idle (synchronize above) and the
-                    // bank lock is held; the bank is non-volatile in a turn.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            b.data_ptr().0.add(e as usize * sb),
-                            b.data_ptr().0.add((n + slot as usize) * sb),
-                            sb,
-                        );
-                    }
-                }
-            }
+            .promote_staged(&|l, e| tags[stage(l, e)] == Some((l, e)));
+        let base = inner.base(n) as usize;
+        for &(slot, l, e) in &moved {
+            copy_slot(
+                &inner.proj,
+                base + inner.cache.slots(),
+                stage(l, e),
+                base + slot as usize,
+            );
         }
         if !moved.is_empty() {
             let mut st = lock(&self.stats);
@@ -441,13 +564,25 @@ impl StagingBank {
         self.force_empty.store(on, Ordering::Relaxed);
     }
 
-    /// Drops the banks and allocates new ones with `cache_slots` cache
-    /// slots, after the old buffers are gone from MLX (refuses while any
-    /// array still holds one; the bank then has no slots until a rebuild
-    /// succeeds).
+    /// `rebuild_staging` with the current staging layers.
     pub fn rebuild(&self, cache_slots: usize) -> Result<()> {
+        let staging = lock(&self.inner).staging;
+        self.rebuild_staging(cache_slots, staging)
+    }
+
+    /// Drops the banks and allocates new ones with `staging` staging layers
+    /// and `cache_slots` cache slots, after every read in flight is done and
+    /// the old buffers are gone from MLX (refuses while any array still holds
+    /// one; the bank then has no slots until a rebuild succeeds).
+    pub fn rebuild_staging(&self, cache_slots: usize, staging: usize) -> Result<()> {
+        if !(1..=2).contains(&staging) {
+            return Err(bad(format!("{staging} staging layers (1 or 2)")));
+        }
         let mut g = lock(&self.inner);
         crate::array::synchronize();
+        self.settle_ahead(&mut g, |_| true);
+        self.close_ahead_locked(&mut g, |_| true);
+        g.drain();
         let watches: Vec<_> = g
             .proj
             .iter()
@@ -466,7 +601,12 @@ impl StagingBank {
                 "an array still holds the old bank; a second bank is not allocated",
             ));
         }
-        g.proj = alloc(&self.layers[0], (self.n_experts + cache_slots) as i64)?;
+        g.staging = staging;
+        g.tags = vec![None; staging * self.n_experts];
+        g.proj = alloc(
+            &self.layers[0],
+            (staging * self.n_experts + cache_slots) as i64,
+        )?;
         g.cache = Cache::lru(cache_slots, self.layers.len(), self.n_experts).with_mode(self.mode);
         g.in_turn = true;
         Ok(())
@@ -556,31 +696,71 @@ impl StagingBank {
         if !g.in_turn {
             self.begin(&mut g)?;
         }
-        let n = self.n_experts as u32;
+        // an earlier step's reads (a `Pending` kept past its step) must be in
+        // before this step re-plans their slots; a prefetch is tagged here
+        // (this layer's and older ones; a later layer's stays in flight)
+        let t_ahead = Instant::now();
+        let had_ahead = g.ahead.iter().any(|a| a.layer <= layer);
+        self.settle_ahead(&mut g, |l| l <= layer);
+        let ahead_wait = if had_ahead {
+            t_ahead.elapsed().as_nanos() as u64
+        } else {
+            0
+        };
+        g.drain();
+        self.close_ahead_locked(&mut g, |l| l < layer);
+        for (l, left) in g.ahead_left.iter_mut() {
+            if *l == layer {
+                left.retain(|e| experts.binary_search(e).is_err());
+            }
+        }
+        let n = self.n_experts;
+        let base = g.base(n);
         let inner = &mut *g;
         let tags = &inner.tags;
+        let staging_n = inner.staging;
+        let stage = |e: u32| (layer % staging_n) * n + e as usize;
         let (epoch, src) = inner.cache.plan_step(layer, experts, uses, decode, &|e| {
-            tags[e as usize] == Some((layer, e))
+            tags[stage(e)] == Some((layer, e))
         });
-        let (mut slots, mut staging, mut victims, mut hits) =
-            (Vec::new(), Vec::new(), Vec::new(), 0);
+        let (mut slots, mut staging, mut victims, mut copies, mut hits) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0);
         for (&e, s) in experts.iter().zip(&src) {
             slots.push(match *s {
                 Source::Hit(c) => {
                     hits += 1;
-                    n + c
+                    base + c
                 }
                 Source::Victim(c) => {
-                    victims.push((e, c));
-                    n + c
+                    // a prefill seed whose staging copy is valid (a prefetch
+                    // or an earlier chunk) is copied, never read twice
+                    if staging_n == 2 && !decode && g.tags[stage(e)] == Some((layer, e)) {
+                        copies.push((e, c));
+                    } else {
+                        victims.push((e, c));
+                    }
+                    base + c
                 }
                 Source::Staging => {
-                    if g.tags[e as usize] != Some((layer, e)) {
+                    if g.tags[stage(e)] != Some((layer, e)) {
                         staging.push(e);
                     }
-                    e
+                    stage(e) as u32
                 }
             });
+        }
+        if !copies.is_empty() {
+            crate::array::synchronize();
+            g.cache.complete_all();
+            let t0 = Instant::now();
+            let total = base as usize + g.cache.slots();
+            for &(e, c) in &copies {
+                copy_slot(&g.proj, total, stage(e), (base + c) as usize);
+                g.cache.commit(c, layer, e);
+            }
+            let mut st = lock(&self.stats);
+            st.promoted += copies.len();
+            st.promote_ns += t0.elapsed().as_nanos() as u64;
         }
         let mut pending = None;
         let mut reading = Vec::new();
@@ -591,17 +771,17 @@ impl StagingBank {
             g.cache.complete_all();
             let mut reads = Vec::new();
             for &e in &staging {
-                g.tags[e as usize] = None;
-                self.reads(&g, layer, e, e as usize, &mut reads)?;
+                g.tags[stage(e)] = None;
+                self.reads(&g, layer, e, stage(e), &mut reads)?;
             }
             for &(e, c) in &victims {
-                self.reads(&g, layer, e, (n + c) as usize, &mut reads)?;
+                self.reads(&g, layer, e, (base + c) as usize, &mut reads)?;
             }
             // SAFETY: every slot read is untagged (staging) or an unmapped
             // victim (cache), so no gather passes the slot checks on it until
-            // `Pending::finish`; earlier GPU work was drained above, and a
-            // `Pending` (finished or dropped) waits for the batch before the
-            // bank can be used for another step.
+            // `Pending::finish`; earlier GPU work was drained above, every
+            // earlier read is in (`drain`), and the batch is watched until it
+            // is done (`Inner::inflight`: a rebuild or turn end waits for it).
             let ticket = match unsafe { self.pool.submit(reads, Priority::High) } {
                 Ok(t) => t,
                 Err(err) => {
@@ -609,6 +789,7 @@ impl StagingBank {
                     return Err(err);
                 }
             };
+            g.watch(&ticket);
             reading = staging
                 .iter()
                 .chain(victims.iter().map(|(e, _)| e))
@@ -627,6 +808,7 @@ impl StagingBank {
             let mut st = lock(&self.stats);
             st.uses += experts.len();
             st.hits += hits;
+            st.wait_ns += ahead_wait;
         }
         let p = Prepared {
             layer,
@@ -641,6 +823,123 @@ impl StagingBank {
             reading,
         };
         Ok((p, pending))
+    }
+
+    /// Stage P4: reads `layer`'s `experts` (sorted, distinct; a prediction)
+    /// into its staging half at low priority, while the previous layer still
+    /// computes. Skips experts already cached or staged; a later step of
+    /// `layer` finds them tagged (no second read). No-op unless the bank has
+    /// two staging layers and prefetch is on. The target half was last used
+    /// by layer `layer - 2`, whose gathers are evaluated (every step's are
+    /// before `done`); the GPU is drained first anyway. Returns the experts
+    /// queued.
+    pub fn prefetch_layer(&self, layer: usize, experts: &[u32]) -> Result<usize> {
+        if !self.prefetch() || self.skip_fill.load(Ordering::Relaxed) {
+            return Ok(0);
+        }
+        let mut g = lock(&self.inner);
+        if g.staging < 2 {
+            return Ok(0);
+        }
+        self.check_step(&g, layer, experts)?;
+        if !g.in_turn {
+            self.begin(&mut g)?;
+        }
+        // a read ahead of this layer already, or of a layer writing the same
+        // half (`layer - 2` and older), is settled first; the previous
+        // layer's (other half) stays in flight
+        self.settle_ahead(&mut g, |l| l == layer || l + 1 < layer);
+        let n = self.n_experts;
+        let want: Vec<u32> = experts
+            .iter()
+            .copied()
+            .filter(|&e| {
+                g.cache.lookup(layer, e).is_none()
+                    && g.tags[g.stage(layer, e, n)] != Some((layer, e))
+            })
+            .collect();
+        if want.is_empty() {
+            return Ok(0);
+        }
+        crate::array::synchronize();
+        g.cache.complete_all();
+        let mut reads = Vec::new();
+        for &e in &want {
+            let s = g.stage(layer, e, n);
+            g.tags[s] = None;
+            self.reads(&g, layer, e, s, &mut reads)?;
+        }
+        // SAFETY: the slots are untagged (no gather passes the slot checks on
+        // them), no GPU work reads them (drained above; this half's last
+        // layer is done), and the batch is watched until done.
+        let ticket = unsafe { self.pool.submit(reads, Priority::Low) }?;
+        let k = want.len();
+        g.ahead.push(Ahead {
+            layer,
+            experts: want,
+            ticket,
+        });
+        lock(&self.stats).prefetch_slots += k;
+        Ok(k)
+    }
+
+    /// Waits for the prefetches in flight of the layers `pick` selects and
+    /// tags their slots; a failed prefetch tags nothing (a later step reads
+    /// those experts).
+    fn settle_ahead(&self, g: &mut Inner, pick: impl Fn(usize) -> bool) {
+        let n = self.n_experts;
+        let (now, keep): (Vec<Ahead>, Vec<Ahead>) = std::mem::take(&mut g.ahead)
+            .into_iter()
+            .partition(|a| pick(a.layer));
+        g.ahead = keep;
+        for a in now {
+            match a.ticket.wait() {
+                Ok(io) => {
+                    for &e in &a.experts {
+                        let s = g.stage(a.layer, e, n);
+                        g.tags[s] = Some((a.layer, e));
+                    }
+                    {
+                        let mut st = lock(&self.stats);
+                        st.fills += 1;
+                        st.slots += a.experts.len();
+                        st.bytes += io.bytes;
+                        st.ns += io.ns;
+                    }
+                    match g.ahead_left.iter_mut().find(|(l, _)| *l == a.layer) {
+                        Some((_, left)) => {
+                            left.extend(&a.experts);
+                            left.sort_unstable();
+                            left.dedup();
+                        }
+                        None => g.ahead_left.push((a.layer, a.experts)),
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("moe_stream prefetch of layer {} failed: {err}", a.layer)
+                }
+            }
+        }
+    }
+
+    /// Counts the prefetched experts no step used, for the layers `pick`
+    /// selects (no more steps of them can come).
+    fn close_ahead_locked(&self, g: &mut Inner, pick: impl Fn(usize) -> bool) {
+        let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut g.ahead_left)
+            .into_iter()
+            .partition(|(l, _)| pick(*l));
+        g.ahead_left = keep;
+        let unused: usize = done.iter().map(|(_, left)| left.len()).sum();
+        if unused > 0 {
+            lock(&self.stats).prefetch_unused += unused;
+        }
+    }
+
+    /// The forward finished `layer` (every step of it ran): its unused
+    /// prefetched experts are counted now.
+    pub fn end_layer(&self, layer: usize) {
+        let mut g = lock(&self.inner);
+        self.close_ahead_locked(&mut g, |l| l == layer);
     }
 
     /// Counts one step whose reads overlapped GPU work (`mixed`: ready
@@ -661,6 +960,56 @@ impl StagingBank {
         self.split.store(on, Ordering::Relaxed);
     }
 
+    /// Whether prefill reads the next layer's experts ahead (stage P4,
+    /// `MLX_DSV41_PREFETCH`; needs a second staging layer).
+    pub fn prefetch(&self) -> bool {
+        self.prefetch_mode() != PrefetchMode::Off
+    }
+
+    pub fn prefetch_mode(&self) -> PrefetchMode {
+        match self.prefetch.load(Ordering::Relaxed) {
+            1 => PrefetchMode::Pred,
+            2 => PrefetchMode::All,
+            _ => PrefetchMode::Off,
+        }
+    }
+
+    /// `on` = `PrefetchMode::Pred`.
+    pub fn set_prefetch(&self, on: bool) {
+        self.set_prefetch_mode(if on {
+            PrefetchMode::Pred
+        } else {
+            PrefetchMode::Off
+        });
+    }
+
+    pub fn set_prefetch_mode(&self, m: PrefetchMode) {
+        self.prefetch.store(m as u8, Ordering::Relaxed);
+    }
+
+    /// Staging layers in the bank.
+    pub fn staging_layers(&self) -> usize {
+        lock(&self.inner).staging
+    }
+
+    /// Test hook: every expert read sleeps `ms` first.
+    #[cfg(test)]
+    pub fn test_delay_reads(&self, ms: u64) {
+        self.pool
+            .shards()
+            .delay_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read batches submitted and not yet done.
+    pub fn reads_in_flight(&self) -> usize {
+        lock(&self.inner)
+            .inflight
+            .iter()
+            .filter(|w| !w.done())
+            .count()
+    }
+
     /// Test hook: forgets every staging tag and cache entry (as an `Empty`
     /// bank), so the next steps read every expert again.
     #[cfg(test)]
@@ -674,6 +1023,9 @@ impl StagingBank {
     pub fn test_forget_where(&self, f: impl Fn(usize, u32) -> bool) {
         let mut g = lock(&self.inner);
         crate::array::synchronize();
+        self.settle_ahead(&mut g, |_| true);
+        self.close_ahead_locked(&mut g, |_| true);
+        g.drain();
         for t in g.tags.iter_mut() {
             if t.is_some_and(|(l, e)| f(l, e)) {
                 *t = None;
@@ -705,18 +1057,21 @@ impl StagingBank {
     }
 
     fn assert_slots_where(&self, p: &Prepared, check: impl Fn(u32) -> bool) {
-        let n = self.n_experts as u32;
+        let n = self.n_experts;
         let stale = {
             let g = lock(&self.inner);
+            let base = g.base(n);
             p.experts
                 .iter()
                 .zip(&p.slots)
                 .filter(|(e, _)| check(**e))
                 .find_map(|(&e, &s)| {
-                    let held = if s < n {
-                        (s == e).then(|| g.tags[s as usize]).flatten()
+                    let held = if s < base {
+                        (s as usize == g.stage(p.layer, e, n))
+                            .then(|| g.tags[s as usize])
+                            .flatten()
                     } else {
-                        g.cache.occ(s - n)
+                        g.cache.occ(s - base)
                     };
                     (held != Some((p.layer, e))).then_some((e, s, held))
                 })
@@ -743,19 +1098,24 @@ impl StagingBank {
         if !g.in_turn {
             self.begin(&mut g)?;
         }
-        want.retain(|&e| g.tags[e as usize] != Some((layer, e)));
+        let n = self.n_experts;
+        self.settle_ahead(&mut g, |_| true);
+        g.drain();
+        want.retain(|&e| g.tags[g.stage(layer, e, n)] != Some((layer, e)));
         if want.is_empty() {
             return Ok(());
         }
         crate::array::synchronize();
         let mut reads = Vec::new();
         for &e in &want {
-            g.tags[e as usize] = None;
-            self.reads(&g, layer, e, e as usize, &mut reads)?;
+            let s = g.stage(layer, e, n);
+            g.tags[s] = None;
+            self.reads(&g, layer, e, s, &mut reads)?;
         }
         let io = self.submit(reads)?;
         for &e in &want {
-            g.tags[e as usize] = Some((layer, e));
+            let s = g.stage(layer, e, n);
+            g.tags[s] = Some((layer, e));
         }
         let mut st = lock(&self.stats);
         st.fills += 1;
@@ -769,10 +1129,12 @@ impl StagingBank {
     pub fn assert_tags(&self, layer: usize, experts: &[u32]) {
         let stale = {
             let g = lock(&self.inner);
+            let n = self.n_experts;
+            let at = |e: u32| g.tags.get(g.stage(layer, e, n)).copied().flatten();
             experts
                 .iter()
-                .find(|&&e| g.tags.get(e as usize).copied().flatten() != Some((layer, e)))
-                .map(|&e| (e, g.tags.get(e as usize).copied().flatten()))
+                .find(|&&e| at(e) != Some((layer, e)))
+                .map(|&e| (e, at(e)))
         };
         assert!(
             stale.is_none(),

@@ -271,6 +271,7 @@ impl Model {
             cancel,
             trace,
         )?;
+        let tp = super::stats::prof_start();
         let x = rms_norm(&hc_pre(&h, &pre_mix)?, &self.norm, self.cfg.norm_eps)?
             .astype(DType::Float32)?;
         let x = if last_only {
@@ -281,6 +282,7 @@ impl Model {
         fp32_site("head_input", self.cfg.n_layers, &x)?;
         let logits = self.head_logits(&x)?;
         MxArray::eval_arrays_with_context(&[&logits], "deepseek_v41 head")?;
+        super::stats::prof_end(super::stats::Phase::Head, tp, &[])?;
         sess.tokens = all;
         Ok(logits)
     }
@@ -299,6 +301,7 @@ impl Model {
         cancel: Option<&dyn Fn(usize) -> bool>,
         mut trace: Option<&mut Trace>,
     ) -> Result<(MxArray, MxArray)> {
+        let end = layers.end;
         for l in layers {
             let blk = &self.blocks[l];
             if cancel.is_some_and(|c| c(l)) {
@@ -314,14 +317,17 @@ impl Model {
                     .chunks(n * cols)
                     .flat_map(|p| p[e * cols..(e + 1) * cols].iter().copied())
                     .collect();
+                let tp = super::stats::prof_start();
                 h = eng.forward(&h, &table.rows(*e, &ids)?)?;
+                super::stats::prof_end(super::stats::Phase::Engram, tp, &[&h])?;
             }
             let src = match self.cfg.kv_src[l] {
                 Some(k) if self.cfg.compress_ratios[l] != 0 => sess.sources[k].as_mut(),
                 _ => None,
             };
+            let next = (l + 1 < end).then(|| &self.blocks[l + 1].moe);
             let (x, pm, routes, scores) =
-                blk.forward(&h, start, &pre_mix, &mut sess.wins[l], src, shared)?;
+                blk.forward(&h, start, &pre_mix, &mut sess.wins[l], src, shared, next)?;
             MxArray::eval_arrays_with_context(&[&x, &pm], "deepseek_v41 block")?;
             (h, pre_mix) = (x, pm);
             if let Some(t) = trace.as_deref_mut() {

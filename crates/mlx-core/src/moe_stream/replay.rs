@@ -140,7 +140,21 @@ pub fn replay(cache: &mut Cache, experts: usize, steps: &[Step]) -> Replayed {
 /// (between turns `Cache::promote_staged` and `Cache::new_turn`, as the
 /// bank's turn end and start); one result per turn.
 pub fn replay_turns(cache: &mut Cache, experts: usize, turns: &[&[Step]]) -> Vec<Replayed> {
-    let mut tags = vec![None; experts];
+    replay_turns_staged(cache, experts, 1, turns)
+}
+
+/// `replay_turns` on a bank of `staging` staging layers (layer `l` stages
+/// in half `l % staging`; with two, a prefill seed whose staging copy is
+/// valid is copied, not read, as the bank does). Next-layer prefetch reads
+/// are not modelled: live reads = these + the bank's `prefetch_unused`.
+pub fn replay_turns_staged(
+    cache: &mut Cache,
+    experts: usize,
+    staging: usize,
+    turns: &[&[Step]],
+) -> Vec<Replayed> {
+    let staging = staging.max(1);
+    let mut tags = vec![None; staging * experts];
     turns
         .iter()
         .enumerate()
@@ -149,10 +163,12 @@ pub fn replay_turns(cache: &mut Cache, experts: usize, turns: &[&[Step]]) -> Vec
                 // the bank's turn end, then its turn start
                 let tg = &tags;
                 cache.complete_all();
-                cache.promote_staged(&|l, e| tg[e as usize] == Some((l, e)));
+                cache.promote_staged(&|l, e| {
+                    tg[(l % staging) * experts + e as usize] == Some((l, e))
+                });
                 cache.new_turn();
             }
-            run_tagged(cache, &mut tags, steps, &[], None)
+            run_tagged_staged(cache, &mut tags, staging, steps, &[], None)
         })
         .collect()
 }
@@ -239,8 +255,21 @@ fn run_tagged(
     tags: &mut [Option<(usize, u32)>],
     steps: &[Step],
     pinned: &[bool],
+    per_layer: Option<&mut Vec<(u64, u64)>>,
+) -> Replayed {
+    run_tagged_staged(cache, tags, 1, steps, pinned, per_layer)
+}
+
+fn run_tagged_staged(
+    cache: &mut Cache,
+    tags: &mut [Option<(usize, u32)>],
+    staging: usize,
+    steps: &[Step],
+    pinned: &[bool],
     mut per_layer: Option<&mut Vec<(u64, u64)>>,
 ) -> Replayed {
+    let experts = tags.len() / staging;
+    let at = |layer: usize, e: u32| (layer % staging) * experts + e as usize;
     let mut out = Replayed::default();
     for s in steps {
         let mut sorted = s.ids.clone();
@@ -273,7 +302,7 @@ fn run_tagged(
         let (epoch, src) = {
             let tg = &*tags;
             cache.plan_step(layer, &want, &uses, decode, &|e| {
-                tg[e as usize] == Some((layer, e))
+                tg[at(layer, e)] == Some((layer, e))
             })
         };
         let mut reads = 0;
@@ -282,11 +311,13 @@ fn run_tagged(
                 Source::Hit(_) => out.hits += 1,
                 Source::Victim(c) => {
                     cache.commit(c, s.layer, e);
-                    reads += 1;
+                    if !(staging == 2 && !decode && tags[at(layer, e)] == Some((layer, e))) {
+                        reads += 1;
+                    }
                 }
                 Source::Staging => {
-                    if tags[e as usize] != Some((s.layer, e)) {
-                        tags[e as usize] = Some((s.layer, e));
+                    if tags[at(layer, e)] != Some((s.layer, e)) {
+                        tags[at(layer, e)] = Some((s.layer, e));
                         reads += 1;
                     }
                 }
