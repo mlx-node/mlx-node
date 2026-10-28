@@ -3557,7 +3557,7 @@ export interface DeepseekV41ContextLimits {
   trainedWindowTokens: number;
 }
 
-/** The load-time and latest per-turn S15 admission, and the expert bank. */
+/** The load-time and latest per-turn admission, and the expert bank. */
 export interface DeepseekV41ResidencyInfo {
   denseBytes: number;
   physicalBytes?: number;
@@ -3582,7 +3582,7 @@ export interface DeepseekV41ResidencyInfo {
   inTurn: boolean;
 }
 
-/** The last saved turn of the session (S18 CLI-vs-Rust id gate). */
+/** The last saved turn of the session (prompt and output ids). */
 export interface DeepseekV41TurnTokenIds {
   /** The rendered prompt the turn was given (whole conversation). */
   promptIds: Array<number>;

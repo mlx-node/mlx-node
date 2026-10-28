@@ -5,7 +5,7 @@
 //! cache, sized by `CachePlan`); engram rows come from `PreadTable`.
 //!
 //! A turn is `begin_turn` .. `end_turn`: with `CachePlan::Admit` the start
-//! re-admits (S15) and may drop the bank to staging-only or rebuild it, then
+//! re-admits and may drop the bank to staging-only or rebuild it, then
 //! holds a wired-limit lease of fixed + cache bytes until the end, when the
 //! bank becomes volatile.
 
@@ -60,8 +60,8 @@ impl Weight for MxArray {
 /// 4]` uint32 codes q + 128, `scales` `[rows, k / 32]` f16). The f32 form
 /// (`scale * code - 128 * scale` = `d * q`, exact) is built at each use
 /// and never kept. `Qmm` holds the same codes with f32 scales and biases
-/// (`-128 * scale`, exact) and multiplies by `quantized_matmul` (D-41 (b):
-/// other rounding than the f32 path); its f32 form is the exact one.
+/// (`-128 * scale`, exact) and multiplies by `quantized_matmul` (other
+/// rounding than the f32 path); its f32 form is the exact one.
 pub enum Dense {
     Array(MxArray),
     Q8 {
@@ -268,9 +268,9 @@ type Located = (usize, u64, GgufTensorInfo);
 /// Expert projections in bank order.
 const PROJS: [&str; 3] = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"];
 const ENGRAM_TABLE: &str = "per_layer_token_embd.weight";
-/// MLX free-buffer pool ceiling (D-33).
+/// MLX free-buffer pool ceiling.
 pub const POOL_LIMIT: usize = 1 << 30;
-/// v1 context limit (D-24): the admission's KV / compute terms use it.
+/// v1 context limit: the admission's KV / compute terms use it.
 pub const CTX_LIMIT: usize = 16_384;
 
 /// How many cache slots the bank gets.
@@ -283,7 +283,7 @@ pub enum CachePlan {
     /// Exactly these cache slots and staging layers, no admission (tests).
     #[cfg(test)]
     Slots { cache: usize, staging: usize },
-    /// S15 admission at load and at every turn start.
+    /// Admission at load and at every turn start.
     Admit(Limits),
 }
 
@@ -509,7 +509,7 @@ impl Store {
     /// This model's bytes inside `host_used`: dense arrays + the bank's
     /// resident pages, read while the bank is non-volatile (`begin_turn`
     /// re-admits after `NonVolatile`). A volatile bank the GPU has used stays
-    /// wired, so `host_used` keeps it (S16b-1); between turns the resident
+    /// wired, so `host_used` keeps it; between turns the resident
     /// pages are reported as volatile. Process-wide MLX counters would also
     /// hold other loaded models, which must stay `others`; KV, scratch and
     /// the shared pool are left in `others` (conservative).

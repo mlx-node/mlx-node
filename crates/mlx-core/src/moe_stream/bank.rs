@@ -6,7 +6,7 @@
 //! before a refill and set only after every projection's read finished.
 //! Slots `L * n_experts..` are the global cache ([`Cache`] directory). With
 //! two staging layers a prefill reads the next layer's predicted experts
-//! into the other half while this layer computes (stage P4, `prefetch_layer`).
+//! into the other half while this layer computes (`prefetch_layer`).
 //! Every read in flight is watched: a rebuild, a turn end or a later step
 //! waits for it before the slots it writes can be freed or reused.
 //!
@@ -73,7 +73,7 @@ pub struct BankStats {
     /// those among them whose overlapped pass also gathered ready experts.
     pub split_steps: usize,
     pub split_mixed: usize,
-    /// Experts read ahead into the second staging layer (stage P4), and
+    /// Experts read ahead into the second staging layer, and
     /// those among them the layer's routes then did not use.
     pub prefetch_slots: usize,
     pub prefetch_unused: usize,
@@ -653,7 +653,7 @@ impl StagingBank {
         // before this step re-plans their slots; every prefetch but the next
         // layer's (the other half) is tagged here, before this step writes:
         // after a cancelled forward a read ahead of a later layer of this
-        // half can still be in flight (P4 codex [high])
+        // half can still be in flight
         let t_ahead = Instant::now();
         let had_ahead = g.ahead.iter().any(|a| a.layer != layer + 1);
         self.settle_ahead(&mut g, |l| l != layer + 1);
@@ -780,7 +780,7 @@ impl StagingBank {
         Ok((p, pending))
     }
 
-    /// Stage P4: reads `layer`'s `experts` (sorted, distinct; a prediction)
+    /// Reads `layer`'s `experts` (sorted, distinct; a prediction)
     /// into its staging half at low priority, while the previous layer still
     /// computes. Skips experts already cached or staged; a later step of
     /// `layer` finds them tagged (no second read). No-op unless the bank has

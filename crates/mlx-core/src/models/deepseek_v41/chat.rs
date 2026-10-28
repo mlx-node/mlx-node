@@ -1,5 +1,5 @@
 //! Product chat lane: one flat whole-turn session on its own model thread
-//! (D-21). The store's S15 admission runs at load and at every turn start
+//! The store's admission runs at load and at every turn start
 //! (`Store::begin_turn`), and its bounded wired lease covers the turn.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
@@ -377,7 +377,7 @@ impl ChatBackend for Inner {
 
     /// The session keeps every forwarded token (`Session::tokens`), which the
     /// engram hash of the next call reads: a hit continues on the same
-    /// history (D-27), anything else replays the whole prompt.
+    /// history, anything else replays the whole prompt.
     fn verify_cache_prefix(&self, tokens: &[u32], reuse: bool) -> usize {
         let h = &self.saved;
         if reuse
@@ -412,7 +412,7 @@ impl ChatBackend for Inner {
         Ok(())
     }
 
-    /// The store's admitted context (D-24): `Model::forward` refuses past it.
+    /// The store's admitted context: `Model::forward` refuses past it.
     fn context_token_limit(&self) -> Option<usize> {
         self.store.model.ctx_limit
     }
@@ -473,7 +473,7 @@ impl ChatBackend for Inner {
     }
 }
 
-/// The last saved turn of the session (S18 CLI-vs-Rust id gate).
+/// The last saved turn of the session (prompt and output ids).
 #[napi(object)]
 pub struct DeepseekV41TurnTokenIds {
     /// The rendered prompt the turn was given (whole conversation).
@@ -489,7 +489,7 @@ pub struct DeepseekV41ContextLimits {
     pub trained_window_tokens: u32,
 }
 
-/// The load-time and latest per-turn S15 admission, and the expert bank.
+/// The load-time and latest per-turn admission, and the expert bank.
 #[napi(object)]
 pub struct DeepseekV41ResidencyInfo {
     pub dense_bytes: f64,

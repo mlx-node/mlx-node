@@ -23,7 +23,7 @@ thread_local! {
     static SITES: RefCell<Option<Vec<(&'static str, usize, DType)>>> = const { RefCell::new(None) };
 }
 
-/// Records `a`'s dtype at a §3 fp32 site while `record_fp32_sites` is on.
+/// Records `a`'s dtype at a reference fp32 site while `record_fp32_sites` is on.
 pub(crate) fn fp32_site(site: &'static str, layer: usize, a: &MxArray) -> Result<()> {
     if SITES.with(|s| s.borrow().is_none()) {
         return Ok(());
@@ -82,7 +82,7 @@ pub struct Model {
     norm: MxArray,
     head: Dense,
     /// Context limit a call may reach (session tokens + call ids); the store
-    /// sets the admitted context (D-24), `None` = no limit.
+    /// sets the admitted context, `None` = no limit.
     pub ctx_limit: Option<usize>,
     /// Long-prompt layer skip in `forward_last` (bitwise, see `skip_from`);
     /// tests turn it off to compare.
@@ -149,7 +149,7 @@ impl Model {
         })
     }
 
-    /// Stage P5: the first row of layer `l`'s output that anyone reads when
+    /// The first row of layer `l`'s output that anyone reads when
     /// only the call's last row needs logits (`s` rows). From the last
     /// layer that compresses its own KV (`z`, the last compressor and
     /// index-key owner) on, a layer's per-row output feeds only the next
@@ -157,8 +157,8 @@ impl Model {
     /// each layer below it 127 (window - 1) more, so layer `l >= z` needs
     /// `1 + (n_layers - 1 - l) * (window - 1)` rows. The compressor, index
     /// keys and window KV take every row's INPUT, never a skipped output,
-    /// so the session state and every later call are unchanged (oracle
-    /// proof: DECISIONS P5-1). 0 = all rows.
+    /// so the session state and every later call are unchanged. 0 = all
+    /// rows.
     pub fn skip_from(&self, l: usize, s: usize) -> usize {
         let c = &self.cfg;
         let Some(z) = (0..c.n_layers).filter(|&k| c.kv_src[k] == Some(k)).max() else {

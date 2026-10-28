@@ -480,7 +480,7 @@ fn seeded_turn_end_promotes_valid_staging_copies() {
 }
 
 /// Turn-end promotion with more valid staging copies than cache slots keeps
-/// the most recently used ones (P2 codex finding: it kept the oldest).
+/// the most recently used ones, not the oldest.
 #[test]
 fn seeded_promotion_over_capacity_keeps_newest() {
     let mut c = Cache::lru(2, 1, 8);

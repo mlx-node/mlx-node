@@ -3,7 +3,7 @@ use super::*;
 const G: u64 = 1 << 30;
 /// Gate+up+down MXFP4 bytes of one expert (real file).
 const E: u64 = 18_800_640;
-/// Measured dense arrays (S11 real smoke: 8.536 GiB).
+/// Measured dense arrays (real smoke: 8.536 GiB).
 const DENSE: u64 = 9_165_803_968;
 /// Measured Metal `max_recommended_working_set_size` on the 128 GiB host.
 const WS: u64 = 115_448_725_504;
@@ -109,7 +109,7 @@ fn today_others_50() {
 
 #[test]
 fn quiet_others_25_and_ws_bound() {
-    // live (91 GiB) < ws (107.52 GiB) at others 25: live binds (S15-1)
+    // live (91 GiB) < ws (107.52 GiB) at others 25: live binds
     let q = admit_at(25 * G, 0, &Limits::default()).unwrap();
     println!("quiet: {q}");
     let live = PHYS - 25 * G - RESERVE;

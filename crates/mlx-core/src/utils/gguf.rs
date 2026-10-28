@@ -18241,7 +18241,7 @@ mod tests {
     }
 
     /// Every E4M3 code under scales e in {0, 1, 120, 127, 134, 254, 255}:
-    /// Rust == the vendored C reference and the S2b oracle vectors (gguf-py)
+    /// Rust == the vendored C reference and the oracle vectors (gguf-py)
     /// bit for bit, except NaN, where only NaN-ness is compared. e = 0xFF decodes the whole block to NaN.
     #[test]
     fn mxfp8_codes_match_c_reference_and_oracle_vectors() {
@@ -18432,7 +18432,7 @@ mod tests {
         }
         assert_eq!(ours.get_vocab_size(true), hf.get_vocab_size(true));
         // USER_DEFINED rows decode like HF's (not skipped): the reasoning
-        // split finds `</think>` in a skip-special decode (S17 codex [high]).
+        // split finds `</think>` in a skip-special decode.
         for (id, ty) in types.iter().enumerate() {
             if *ty == 4 {
                 let ids = [id as u32];

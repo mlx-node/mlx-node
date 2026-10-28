@@ -318,7 +318,7 @@ impl Moe {
         st.prefetch_layer(self.layer, &want)
     }
 
-    /// Every step of this layer ran (stage P4 prefetch accounting).
+    /// Every step of this layer ran (read-ahead accounting).
     pub fn end_layer(&self) {
         if let Experts::Stream(st) = &self.w.experts {
             st.end_layer(self.layer);
@@ -428,10 +428,10 @@ impl Moe {
         Ok((y, routes))
     }
 
-    /// One decode row (stage P3): queue the reads of the missed experts,
+    /// One decode row: queue the reads of the missed experts,
     /// run pass A (shared expert + the experts whose slots are ready) on the
     /// GPU while they land, then pass B (the missed experts). Each (row, k)
-    /// output is its own `gather_qmv` (S8-4: batch-independent), so the
+    /// output is its own `gather_qmv` (batch-independent), so the
     /// columns, returned in ascending expert id, equal `routed`'s bitwise.
     fn split_step(
         &self,

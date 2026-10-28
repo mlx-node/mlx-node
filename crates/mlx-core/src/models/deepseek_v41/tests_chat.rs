@@ -1,11 +1,11 @@
-// S17 product chat lane. Tiny: the backend continues a session on its own
+// Product chat lane. Tiny: the backend continues a session on its own
 // history (engram rows and logits == a fresh prompt), cancels a prefill
 // without touching the session, and runs whole turns through the engine with
 // the GGUF template. Real (`continued_turn_engram_ids`): two engine turns in
 // chat mode on the 9 shards; the second is a prefix hit whose engram rows equal
 // the fresh prompt's.
 
-fn s17_template() -> String {
+fn chat_template_fixture() -> String {
     std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/tokenizer/fixtures/hf/deepseek-v4.1-06cada875e3a.jinja"
@@ -13,13 +13,13 @@ fn s17_template() -> String {
     .unwrap()
 }
 
-fn s17_msg(role: &str, content: &str) -> crate::tokenizer::ChatMessage {
+fn chat_msg(role: &str, content: &str) -> crate::tokenizer::ChatMessage {
     serde_json::from_value(serde_json::json!({"role": role, "content": content})).unwrap()
 }
 
 /// The tiny GGUF's embedded tokenizer (it carries no template) with the
 /// DeepSeek-V4.1 GGUF template.
-fn s17_tiny_inner() -> super::chat::Inner {
+fn tiny_inner() -> super::chat::Inner {
     use crate::utils::gguf::embedded_gpt2_tokenizer_json;
     let (act, fq) = mode_of("fp32_off");
     let path = fixture("tiny-q8_0.gguf");
@@ -34,7 +34,7 @@ fn s17_tiny_inner() -> super::chat::Inner {
     let g = parse_gguf(&path).unwrap();
     let json = embedded_gpt2_tokenizer_json(&g.metadata).unwrap().unwrap();
     let tok = tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&json).unwrap()).unwrap();
-    let tok = crate::tokenizer::Qwen3Tokenizer::from_tokenizer(tok, Some(s17_template()));
+    let tok = crate::tokenizer::Qwen3Tokenizer::from_tokenizer(tok, Some(chat_template_fixture()));
     let mut inner = super::chat::Inner::new(store, tok, 1, Default::default());
     inner.probe = Some((Vec::new(), Vec::new()));
     inner
@@ -42,7 +42,7 @@ fn s17_tiny_inner() -> super::chat::Inner {
 
 /// Every call's engram rows equal the rows a fresh prompt of the session's
 /// whole history computes at those positions. Returns the checked calls.
-fn s17_check_engram(inner: &super::chat::Inner) -> usize {
+fn check_engram(inner: &super::chat::Inner) -> usize {
     let cfg = inner.store.model.cfg.engram.as_ref().unwrap();
     let h = super::engram_hash::EngramHasher::new(cfg).unwrap();
     let (calls, prompts) = inner.probe.as_ref().unwrap();
@@ -75,11 +75,11 @@ fn tiny_chat_lane_continues_session() {
     use crate::stream::Stream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    let mut inner = s17_tiny_inner();
+    let mut inner = tiny_inner();
     let flag = Arc::new(AtomicBool::new(false));
     let p1: Vec<u32> = vec![0, 507, 40, 41, 42, 43, 44, 508, 510];
     let generated = [45u32, 46];
-    let p2_tail: Vec<u32> = vec![47, 1, 507, 48, 49, 508, 510];
+    let decode_tail: Vec<u32> = vec![47, 1, 507, 48, 49, 508, 510];
 
     // turn 1: prompt + two one-token calls, then save (reuse)
     inner.set_turn_cancel_flag(Some(Arc::clone(&flag)));
@@ -103,7 +103,7 @@ fn tiny_chat_lane_continues_session() {
     assert_eq!(inner.cached_token_history(), saved.as_slice());
 
     // turn 2: a hit continues on the saved history
-    let full: Vec<u32> = saved.iter().chain(&p2_tail).copied().collect();
+    let full: Vec<u32> = saved.iter().chain(&decode_tail).copied().collect();
     assert_eq!(inner.verify_cache_prefix(&full, true), saved.len());
     assert_eq!(inner.verify_cache_prefix(&full, false), 0);
     assert_eq!(inner.verify_cache_prefix(&saved, true), 0, "exact match is a miss");
@@ -111,14 +111,14 @@ fn tiny_chat_lane_continues_session() {
     // a cancelled prefill leaves the session as it was
     flag.store(true, Ordering::Relaxed);
     inner.set_turn_cancel_flag(Some(Arc::clone(&flag)));
-    let err = inner.prefill(&p2_tail, Stream::generation()).err().unwrap();
+    let err = inner.prefill(&decode_tail, Stream::generation()).err().unwrap();
     assert_eq!(err.reason, "prefill cancelled");
     assert_eq!(inner.verify_cache_prefix(&full, true), saved.len());
     inner.set_turn_cancel_flag(None);
     flag.store(false, Ordering::Relaxed);
 
     inner.set_turn_cancel_flag(Some(Arc::clone(&flag)));
-    let cont = read(&inner.prefill(&p2_tail, Stream::generation()).unwrap());
+    let cont = read(&inner.prefill(&decode_tail, Stream::generation()).unwrap());
     inner.set_turn_cancel_flag(None);
     inner.reset_caches(ResetScope::Command).unwrap();
     assert!(inner.cached_token_history().is_empty());
@@ -133,11 +133,11 @@ fn tiny_chat_lane_continues_session() {
     assert!(rel < 1e-4, "{rel}");
     let (calls, _) = inner.probe.as_ref().unwrap();
     let cont_call = &calls[calls.len() - 2];
-    assert_eq!((cont_call.0, cont_call.1.as_slice()), (saved.len(), p2_tail.as_slice()));
+    assert_eq!((cont_call.0, cont_call.1.as_slice()), (saved.len(), decode_tail.as_slice()));
     let fresh_rows = &calls[calls.len() - 1].2;
     let w = fresh_rows.len() / full.len();
     assert_eq!(cont_call.2, fresh_rows[saved.len() * w..], "engram rows");
-    assert_eq!(s17_check_engram(&inner), 6);
+    assert_eq!(check_engram(&inner), 6);
 
     // whole turns through the engine (greedy, chat mode)
     inner.reset_caches(ResetScope::Command).unwrap();
@@ -150,14 +150,14 @@ fn tiny_chat_lane_continues_session() {
     };
     let r1 = crate::engine::session::session_start(
         &mut inner,
-        vec![s17_msg("user", "hello")],
+        vec![chat_msg("user", "hello")],
         cfg.clone(),
         &flag,
     )
     .unwrap();
-    let mut m2 = vec![s17_msg("user", "hello")];
-    m2.push(s17_msg("assistant", &r1.text));
-    m2.push(s17_msg("user", "more"));
+    let mut m2 = vec![chat_msg("user", "hello")];
+    m2.push(chat_msg("assistant", &r1.text));
+    m2.push(chat_msg("user", "more"));
     let r2 = crate::engine::session::session_continue(&mut inner, m2, cfg, &flag).unwrap();
     let (_, prompts) = inner.probe.as_ref().unwrap();
     println!(
@@ -168,10 +168,10 @@ fn tiny_chat_lane_continues_session() {
         prompts[1].1.len()
     );
     assert_eq!(prompts.len(), 2);
-    assert!(s17_check_engram(&inner) >= 2);
+    assert!(check_engram(&inner) >= 2);
 
     // a turn at the store's context limit ends with `length`, it does not
-    // fail a forward past the limit (S18 codex)
+    // fail a forward past the limit
     let one = |inner: &mut super::chat::Inner, n: i32| {
         inner.reset_caches(ResetScope::Command).unwrap();
         inner.probe = Some((Vec::new(), Vec::new()));
@@ -181,7 +181,7 @@ fn tiny_chat_lane_continues_session() {
             reasoning_effort: Some("none".into()),
             ..Default::default()
         };
-        crate::engine::session::session_start(inner, vec![s17_msg("user", "hello")], cfg, &flag)
+        crate::engine::session::session_start(inner, vec![chat_msg("user", "hello")], cfg, &flag)
     };
     let free = one(&mut inner, 6).unwrap();
     let prompt = inner.probe.as_ref().unwrap().1[0].1.len();
@@ -238,7 +238,7 @@ fn continued_turn_engram_ids() {
     };
     let r1 = crate::engine::session::session_start(
         &mut inner,
-        vec![s17_msg("user", "Hi")],
+        vec![chat_msg("user", "Hi")],
         cfg.clone(),
         &flag,
     )
@@ -246,9 +246,9 @@ fn continued_turn_engram_ids() {
     let saved = crate::engine::backend::ChatBackend::cached_token_history(&inner).to_vec();
     let m2 = || {
         vec![
-            s17_msg("user", "Hi"),
-            s17_msg("assistant", &r1.text),
-            s17_msg("user", "Bye"),
+            chat_msg("user", "Hi"),
+            chat_msg("assistant", &r1.text),
+            chat_msg("user", "Bye"),
         ]
     };
     let tok = crate::engine::backend::ChatBackend::tokenizer(&inner).unwrap();
@@ -285,6 +285,6 @@ fn continued_turn_engram_ids() {
     println!(
         "continued_turn_engram_ids: {} delta rows x {w} engram ids == fresh; {} calls checked",
         ids.len(),
-        s17_check_engram(&inner)
+        check_engram(&inner)
     );
 }

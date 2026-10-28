@@ -25,8 +25,8 @@ fn uv(v: &Value) -> Vec<usize> {
         .collect()
 }
 
-/// The tiny GGUF's config equals the oracle's release `config.json` (S2b
-/// `oracle.json` header.config), field by field.
+/// The tiny GGUF's config equals the oracle's release `config.json`
+/// (`oracle.json` header.config), field by field.
 #[test]
 fn config_tiny_matches_oracle() {
     let c = tiny_config();
@@ -480,23 +480,23 @@ fn tf32_scope_is_per_thread() {
     }
 }
 
-// S9 tiny end-to-end gates
+// tiny end-to-end gates
 include!("tests_model.rs");
 
-// S13 real layer groups vs the S12 goldens
+// real layer groups vs the oracle goldens
 include!("tests_groups.rs");
 
-// S14a real end to end vs the S12 goldens
+// real end to end vs the oracle goldens
 include!("tests_e2e.rs");
 
-// S14c compute memory vs prompt length (real)
+// compute memory vs prompt length (real)
 include!("tests_compute.rs");
 
-// S16b real cache invariance, auto admission, Empty on real data
+// real cache invariance, auto admission, Empty on real data
 include!("tests_cache.rs");
 
-// S17 product chat lane (tiny + real).
+// product chat lane (tiny + real).
 include!("tests_chat.rs");
 
-// Stage P4 prefill timing (real, ignored).
+// prefill timing (real, ignored).
 include!("tests_prefill.rs");

@@ -18,11 +18,10 @@ use crate::utils::gguf_gpu::RepackDst;
 const VOCAB: usize = 512;
 const CASES: [&str; 4] = ["c1", "c2", "c3", "pad"];
 
-/// pad fp32_on: the ORACLE sits on fp8 code edges (`oracle/s9_pad_probe.py`:
-/// a 1e-6 relative change of the L0 `o` or L1 `kv` round-trip input flips
+/// pad fp32_on: the ORACLE sits on fp8 code edges (a 1e-6 relative change of the L0 `o` or L1 `kv` round-trip input flips
 /// its L5 row-21 index top-k to mlx-node's), so that run's floats differ
 /// from L1 on (router weights ~1e-4) and its selections from L5 on: those
-/// are reported, not gated (plan S7 near-edge excuse).
+/// are reported, not gated (near-edge excuse).
 fn near_edge_run(case: &str, mode: &str) -> bool {
     case == "pad" && mode == "fp32_on"
 }
@@ -147,19 +146,19 @@ fn f32_logits_gate(mode: &str, tol: f32) {
     }
 }
 
-/// G9.1 f32, fake quant off: every position of c1-c3 and pad within 1e-4.
+/// f32, fake quant off: every position of c1-c3 and pad within 1e-4.
 #[test]
 fn tiny_logits_f32_fq_off() {
     f32_logits_gate("fp32_off", 1e-4);
 }
 
-/// G9.1 f32, fake quant on: within 1e-3 (near-edge fp8 codes, S7-5).
+/// f32, fake quant on: within 1e-3 (near-edge fp8 codes).
 #[test]
 fn tiny_logits_f32_fq_on() {
     f32_logits_gate("fp32_on", 1e-3);
 }
 
-/// §3 near-tie test of one route row: `m32` = the f32 margin between the
+/// Near-tie test of one route row: `m32` = the f32 margin between the
 /// last kept and first dropped expert, `g` = the larger bf16-vs-f32 drift of
 /// those two scores; a mismatch is a near tie iff `m32 < 2 g`.
 fn router_near_tie(s32: &[f32], s16: &[f32], k: usize) -> (bool, f32, f32) {
@@ -171,12 +170,12 @@ fn router_near_tie(s32: &[f32], s16: &[f32], k: usize) -> (bool, f32, f32) {
     (m32 < 2.0 * g, m32, g)
 }
 
-/// G9.1 bf16. Routing: up to the first layer where mlx-node's bf16 route
-/// sets differ from the oracle's bf16 ones, every differing row is a §3
+/// bf16. Routing: up to the first layer where mlx-node's bf16 route
+/// sets differ from the oracle's bf16 ones, every differing row is a
 /// near tie (margins from mlx-node's own f32 run, which equals the oracle's
-/// f32 within G9.1). Floats: a case with no route difference has logits
+/// f32 within the f32 bounds above). Floats: a case with no route difference has logits
 /// relL2 and mean KL vs the oracle's fp32 run within 2x the oracle's own
-/// bf16-vs-fp32 drift (§3); after an excused flip, within 2x the largest
+/// bf16-vs-fp32 drift; after an excused flip, within 2x the largest
 /// oracle drift of the mode (its own flipped cases). At least one case is
 /// gated on the per-case floor.
 #[test]
@@ -253,9 +252,9 @@ fn tiny_logits_bf16_within_floor() {
     assert!(gated >= 1, "no case gated on floats");
 }
 
-/// G9.2: the production Q8_0 load (affine 8-bit + bias plane, MLX
+/// The production Q8_0 load (affine 8-bit + bias plane, MLX
 /// dequantize) gives the host `d * q` weights bit for bit, so the model on
-/// it gives the same logits as G9.1's, bit for bit, in every case.
+/// it gives the same logits as the f32 load, bit for bit, in every case.
 #[test]
 fn tiny_q8_0_affine_load_matches() {
     let (g, npz) = (TinyGguf::open(), Npz::open("oracle.npz"));
@@ -280,7 +279,7 @@ fn tiny_q8_0_affine_load_matches() {
     println!("{n_q8} Q8_0 tensors bitwise");
 }
 
-/// G9.3: a new session (reset) replaying a sequence equals the first run
+/// A new session (reset) replaying a sequence equals the first run
 /// bit for bit, also after the model served another sequence.
 #[test]
 fn invariants_reset_replay_bitwise() {
@@ -296,7 +295,7 @@ fn invariants_reset_replay_bitwise() {
     }
 }
 
-/// G9.3: chunk sizes {1, 7, all} agree within 1e-5 (relL2 per position) in
+/// Chunk sizes {1, 7, all} agree within 1e-5 (relL2 per position) in
 /// f32 with fake quant off; fake quant on is printed (near-edge codes).
 #[test]
 fn invariants_chunk_sizes() {
@@ -319,7 +318,7 @@ fn invariants_chunk_sizes() {
     }
 }
 
-/// G9.3: a call cancelled (or failing) mid-stack leaves no partial layer
+/// A call cancelled (or failing) mid-stack leaves no partial layer
 /// state: the session continues bit for bit as if the call never happened.
 #[test]
 fn invariants_cancel_restores() {
@@ -347,7 +346,7 @@ fn invariants_cancel_restores() {
     assert!(clean.iter().zip(&out).all(|(x, y)| x.to_bits() == y.to_bits()));
 }
 
-/// S14c: `forward_last` returns the last row of `forward`'s logits (the head
+/// `forward_last` returns the last row of `forward`'s logits (the head
 /// GEMM has another M, so within 1e-6) and leaves the same session: the next
 /// call's logits are bitwise equal.
 #[test]
@@ -367,7 +366,7 @@ fn forward_last_is_the_last_row() {
     assert!(na.iter().zip(&nb).all(|(x, y)| x.to_bits() == y.to_bits()));
 }
 
-/// G9.3: routes, engram rows, index top-k and candidate blocks equal the
+/// Routes, engram rows, index top-k and candidate blocks equal the
 /// oracle's bit for bit (f32 modes; every f32 boundary is >= 10x its noise).
 #[test]
 fn invariants_routes_rows_topk_match_oracle() {
@@ -432,10 +431,10 @@ fn invariants_routes_rows_topk_match_oracle() {
     }
 }
 
-/// G9.4: in bf16 mode every §3 fp32 site is recorded, always as f32.
+/// In bf16 mode every reference fp32 site is recorded, always as f32.
 #[test]
 fn fp32_sites_stay_f32_in_bf16() {
-    // §3: MoE sum, hc mixes, compressor ratio 2, head input, RMSNorm, router
+    // the reference's fp32 sites: MoE sum, hc mixes, compressor ratio 2, head input, RMSNorm, router
     // logits, attention scores
     const SITES: [&str; 7] = [
         "attn_scores",

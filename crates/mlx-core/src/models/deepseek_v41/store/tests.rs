@@ -28,7 +28,7 @@ fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
 }
 
-/// Store (pread dense, streamed experts, pread engram rows) == the S9
+/// Store (pread dense, streamed experts, pread engram rows) == the
 /// resident model on the same affine dense values: bitwise logits for a
 /// prefill (c1), a decode (c3) and a chunked split (c2).
 #[test]
@@ -192,7 +192,7 @@ fn pool_ok(what: &str) {
 
 /// Cache sizes 1 / 6 / 16 / 64 slots (12 experts x 8 layers = 96 pairs;
 /// 1-16 exercise victims and the staging fallback, 64 hits):
-/// logits bitwise == the staging-only store (S11) for c1, c2, c3 run one
+/// logits bitwise == the staging-only store for c1, c2, c3 run one
 /// after another on one store (later cases start from a warm cache).
 #[test]
 fn tiny_cache_bitwise_any_size() {
@@ -236,7 +236,7 @@ fn tiny_cache_bitwise_any_size() {
     }
 }
 
-/// Stage P3: decode steps that overlap their reads with pass A (shared
+/// Decode steps that overlap their reads with pass A (shared
 /// expert + ready experts) give logits bitwise equal to the unsplit step,
 /// for staging only and cache sizes 6 / 64 under both cache rules; the
 /// split path ran with ready experts in pass A (S = 64) and without (S = 0).
@@ -401,7 +401,7 @@ fn tiny_cache_bank_switch_mid_session() {
     let held = store.bank.arrays(0).unwrap();
     let err = store.set_cache_slots(8).unwrap_err().to_string();
     assert!(err.contains("still holds the old bank"), "{err}");
-    // a retry while the old buffers are still held is refused too (S16a codex)
+    // a retry while the old buffers are still held is refused too
     let err = store.set_cache_slots(8).unwrap_err().to_string();
     assert!(err.contains("still holds the old bank"), "retry: {err}");
     let mut s2 = store.model.new_session();
@@ -418,8 +418,8 @@ fn tiny_cache_bank_switch_mid_session() {
 }
 
 /// A call past the admitted context (session + ids) is refused before the
-/// session changes (S16a codex: the admission budgets KV / compute for the
-/// context limit only).
+/// session changes (the admission budgets KV / compute for the context
+/// limit only).
 #[test]
 fn tiny_store_refuses_past_context_limit() {
     let npz = Npz::open("oracle.npz");
@@ -459,7 +459,7 @@ fn tiny_store_refuses_past_context_limit() {
 
 /// The admission's `own` is this store's dense + bank bytes only (bank
 /// volatile between turns), not the process-wide MLX count: another
-/// model's arrays stay `others` (S15 codex).
+/// model's arrays stay `others`.
 #[test]
 fn tiny_cache_own_is_this_model_only() {
     let store = cached_store("fp32_on", 16);
@@ -477,7 +477,7 @@ fn tiny_cache_own_is_this_model_only() {
         in_turn,
         "another model's arrays counted as own"
     );
-    // own = dense + the bank's resident pages (S16b-1: not its size)
+    // own = dense + the bank's resident pages, not its size
     let resident = store.bank.resident_bytes().unwrap();
     assert!(resident > 0 && resident <= bank, "{resident} of {bank}");
     assert_eq!(in_turn.bytes(), dense + resident);
@@ -640,7 +640,7 @@ fn real_load_smoke() {
 }
 
 /// `CachePlan::Admit`: the re-admission at a turn start runs with the bank
-/// non-volatile and counts its resident pages as own (S16b-1: a bank the GPU
+/// non-volatile and counts its resident pages as own (a bank the GPU
 /// used stays wired while volatile, so `host_used` keeps it); a forced
 /// `Empty` between turns keeps the admission (no switch) and clears the
 /// directory.
@@ -695,7 +695,7 @@ fn tiny_cache_admit_turns() {
     store.end_turn().unwrap();
 }
 
-/// `Q8` within G9.1's fq-off bound of the oracle (1e-4) and not bitwise
+/// `Q8` within the fake-quant-off bound of the oracle (1e-4) and not bitwise
 /// `Exact` (the quantized matmul runs); fq on is printed only (a 1e-6 change
 /// flips near-edge fp8 codes); resident dense bytes == the scan's
 /// prediction.
@@ -797,7 +797,7 @@ fn tiny_qmm_dense_ops() {
         );
     }
     assert!(q8.grouped_qmm_t(&xg, ng).unwrap().is_none());
-    // P0 codex: bf16 activations round wo_a to bf16 (reference) on every form;
+    // bf16 activations round wo_a to bf16 (reference) on every form;
     // f32 activations take the Qmm product
     use crate::models::deepseek_v41::attention::grouped_wo_a;
     let width = k;
@@ -811,7 +811,7 @@ fn tiny_qmm_dense_ops() {
     );
     let f = grouped_wo_a(&qmm, &xg, ng, lora, width, DType::Float32).unwrap();
     assert_eq!(bits(&read(&f)), bits(&grouped), "f32 Qmm wo_a");
-    // P0 codex: header-derived resident sizes are checked
+    // header-derived resident sizes are checked
     let mut huge = info.clone();
     huge.dims = vec![32, 1u64 << 59];
     for mode in [DenseMode::Exact, DenseMode::Q8] {
@@ -901,7 +901,7 @@ fn tiny_short_call_reads_nothing_ahead() {
     );
 }
 
-/// Stage P4: `replay_turns_staged` with two staging layers gives the live
+/// `replay_turns_staged` with two staging layers gives the live
 /// bank's (uses, hits, reads) without prefetch. With prefetch only the uses
 /// are equal: a read ahead overwrites a same-half staging copy of layer
 /// `l - 2` that a later decode step could have reused, so that step takes
@@ -953,7 +953,7 @@ fn tiny_replay_two_staging_layers() {
     }
 }
 
-/// P3 codex: a `Pending` kept past its step (its `Prepared` dropped) must
+/// A `Pending` kept past its step (its `Prepared` dropped) must
 /// not let a rebuild free the slots its reads still write: the rebuild
 /// waits for every read in flight.
 #[test]
@@ -981,7 +981,7 @@ fn tiny_rebuild_waits_for_reads_in_flight() {
     assert_eq!(bits(&got), bits(&want));
 }
 
-/// P4 codex [high]: a forward cancelled before layer 2 leaves layer 2's read
+/// A forward cancelled before layer 2 leaves layer 2's read
 /// ahead (staging half 0) unsettled; the retry's layer-0 step writes the same
 /// half. Every step now settles every read ahead but the next layer's
 /// before it writes, so the retry's logits equal a clean store's bitwise
@@ -1034,7 +1034,7 @@ fn session_bits(sess: &Session) -> Vec<Vec<u32>> {
     out
 }
 
-/// Stage P5: the last-row prefill with the long-prompt layer skip gives
+/// The last-row prefill with the long-prompt layer skip gives
 /// the unskipped call's last logits row, the session state after it and
 /// three decode steps bitwise, on the resident model and on the streamed
 /// store (S in {0, 64}, two staging layers + read-ahead), fp32 / bf16. Row

@@ -1,6 +1,6 @@
-// Stage P4 prefill timing on the 9 shards: cold prompts of T ids
+// Prefill timing on the 9 shards: cold prompts of T ids
 // (`$DSV41_PROMPTS/compute-<T>.json`, `DSV41_PREFILL_TS`, default
-// 256,1024,8192) at the S15 auto admission, every tag and cache entry
+// 256,1024,8192) at the auto admission, every tag and cache entry
 // forgotten before each prompt (cold: every used expert is read once).
 // Per prompt: TTFT (`forward_last` + last row to the host), the expert reads
 // and, with the phase profile on (`stats::set_profiling`, evals at phase
@@ -10,7 +10,7 @@
 // bank. Run with
 // `MLX_DSV41_EXPERT_CACHE_GB=<N_auto>`, `DSV41_PROMPTS`.
 
-fn p4_prompt(t: usize) -> Vec<u32> {
+fn compute_prompt(t: usize) -> Vec<u32> {
     let dir = PathBuf::from(std::env::var("DSV41_PROMPTS").expect("DSV41_PROMPTS"));
     let pj: Value =
         serde_json::from_slice(&std::fs::read(dir.join(format!("compute-{t}.json"))).unwrap())
@@ -27,7 +27,7 @@ fn p4_prompt(t: usize) -> Vec<u32> {
 
 /// Sets arm `name` on the store (`base` = the store as opened; `off`,
 /// `pred` = the next-layer read ahead).
-fn p4_arm(store: &Store, name: &str) {
+fn prefill_arm(store: &Store, name: &str) {
     match name {
         "base" => {}
         "off" => store.bank.set_prefetch(false),
@@ -39,40 +39,40 @@ fn p4_arm(store: &Store, name: &str) {
 #[test]
 #[ignore = "real 9 shards + $DSV41_PROMPTS; MLX_DSV41_EXPERT_CACHE_GB=<N_auto>; ~19 GiB + N_auto + compute(T); ~0.3 TB read per prompt"]
 fn real_prefill_timing() {
-    assert!(s16_env(CACHE_ENV).is_some(), "{CACHE_ENV} = N_auto (cap)");
-    let ts: Vec<usize> = s16_env("DSV41_PREFILL_TS")
+    assert!(test_env(CACHE_ENV).is_some(), "{CACHE_ENV} = N_auto (cap)");
+    let ts: Vec<usize> = test_env("DSV41_PREFILL_TS")
         .unwrap_or_else(|| "256,1024,8192".into())
         .split(',')
         .map(|v| v.trim().parse().unwrap())
         .collect();
-    let arms: Vec<String> = s16_env("DSV41_PREFILL_ARMS")
+    let arms: Vec<String> = test_env("DSV41_PREFILL_ARMS")
         .unwrap_or_else(|| "base".into())
         .split(',')
         .map(|v| v.trim().to_owned())
         .collect();
-    let reps: usize = s16_env("DSV41_PREFILL_REPS").map_or(1, |v| v.parse().unwrap());
+    let reps: usize = test_env("DSV41_PREFILL_REPS").map_or(1, |v| v.parse().unwrap());
     // "both": a plain run (TTFT) and a profiled run (split) per (T, arm)
-    let prof = s16_env("DSV41_PREFILL_PROFILE").unwrap_or_else(|| "both".into());
+    let prof = test_env("DSV41_PREFILL_PROFILE").unwrap_or_else(|| "both".into());
     let profs: Vec<bool> = match prof.as_str() {
         "both" => vec![false, true],
         "on" => vec![true],
         "off" => vec![false],
         p => panic!("DSV41_PREFILL_PROFILE={p}"),
     };
-    let prompts: Vec<(usize, Vec<u32>)> = ts.iter().map(|&t| (t, p4_prompt(t))).collect();
-    let plan = match s16_env("DSV41_PREFILL_SLOTS") {
+    let prompts: Vec<(usize, Vec<u32>)> = ts.iter().map(|&t| (t, compute_prompt(t))).collect();
+    let plan = match test_env("DSV41_PREFILL_SLOTS") {
         Some(n) => CachePlan::Slots {
             cache: n.parse().unwrap(),
-            staging: s16_env("DSV41_PREFILL_STAGING").map_or(1, |v| v.parse().unwrap()),
+            staging: test_env("DSV41_PREFILL_STAGING").map_or(1, |v| v.parse().unwrap()),
         },
         None => CachePlan::Admit(Limits::from_env().unwrap()),
     };
-    let store = s16_store(plan);
+    let store = real_store(plan);
     let m = &store.model;
     let (n_layers, n_exp) = (m.cfg.n_layers, m.cfg.n_routed_experts);
     let vocab = m.cfg.vocab_size;
     store.begin_turn().unwrap();
-    println!("touch bank {:.2} s", s16_touch_bank(&store));
+    println!("touch bank {:.2} s", touch_bank(&store));
     let mut fails: Vec<String> = Vec::new();
     let mut rows: Vec<Value> = Vec::new();
     let mut want: std::collections::BTreeMap<usize, String> = Default::default();
@@ -85,7 +85,7 @@ fn real_prefill_timing() {
             }
             for arm in &order {
                 for &pf in &profs {
-                    p4_arm(&store, arm);
+                    prefill_arm(&store, arm);
                     super::stats::set_profiling(pf);
                     store.bank.test_forget_all();
                     crate::array::synchronize();
@@ -157,13 +157,13 @@ fn real_prefill_timing() {
                         "hits": c.hits, "uses": c.uses,
                         "split": split, "phase_sum_s": phase_sum,
                         "other_s": if pf { dt - phase_sum } else { 0.0 },
-                        "mlx_cache_gib": crate::array::get_cache_memory() / S16_GIB,
-                        "footprint_gib": super::stats::rusage().0 as f64 / S16_GIB,
+                        "mlx_cache_gib": crate::array::get_cache_memory() / GIB_F64,
+                        "footprint_gib": super::stats::rusage().0 as f64 / GIB_F64,
                     });
                     println!("p4 prefill {v}");
                     rows.push(v);
-                    if crate::array::get_cache_memory() > 2.0 * S16_GIB {
-                        fails.push(format!("T={t}: MLX cache > 2 GiB (rule 11)"));
+                    if crate::array::get_cache_memory() > 2.0 * GIB_F64 {
+                        fails.push(format!("T={t}: MLX cache > 2 GiB"));
                     }
                 }
             }
@@ -172,7 +172,7 @@ fn real_prefill_timing() {
     store.end_turn().unwrap();
     let mut summary = serde_json::Map::new();
     for ((t, arm, pf), v) in &ttft {
-        let med = s16_median(v);
+        let med = median_f64(v);
         println!(
             "p4 T={t} arm={arm} profile={pf}: median TTFT {med:.2} s ({:.1} tok/s) over {}",
             *t as f64 / med,
@@ -190,8 +190,8 @@ fn real_prefill_timing() {
         "summary": summary,
         "rows": rows,
     });
-    if let Some(dir) = s16_env("DSV41_CACHE_OUT") {
-        let name = s16_env("DSV41_PREFILL_NAME").unwrap_or_else(|| "p4-prefill".into());
+    if let Some(dir) = test_env("DSV41_CACHE_OUT") {
+        let name = test_env("DSV41_PREFILL_NAME").unwrap_or_else(|| "p4-prefill".into());
         std::fs::write(
             PathBuf::from(dir).join(format!("{name}.json")),
             serde_json::to_vec_pretty(&out).unwrap(),
@@ -202,7 +202,7 @@ fn real_prefill_timing() {
 }
 
 /// Host argmax, ties to the lowest index (the engine's T=0 pick).
-fn p5_argmax(v: &[f32]) -> u32 {
+fn argmax_row(v: &[f32]) -> u32 {
     let mut best = 0;
     for (i, &x) in v.iter().enumerate() {
         if x > v[best] {
@@ -212,7 +212,7 @@ fn p5_argmax(v: &[f32]) -> u32 {
     best as u32
 }
 
-// Stage P5 gate: per prompt T (`DSV41_SKIP_TS`, default 4096,8192), the
+// Long-prompt layer skip gate: per prompt T (`DSV41_SKIP_TS`, default 4096,8192), the
 // last-row prefill with the long-prompt layer skip off and on
 // (`DSV41_SKIP_ARMS`, default off,on, order reversed per T: ABBA), each cold
 // (every tag and cache entry forgotten), then `DSV41_SKIP_DECODE` (default
@@ -222,32 +222,32 @@ fn p5_argmax(v: &[f32]) -> u32 {
 #[test]
 #[ignore = "real 9 shards + $DSV41_PROMPTS; MLX_DSV41_EXPERT_CACHE_GB=<N_auto>; ~19 GiB + N_auto + compute(T); ~0.3 TB read per prompt"]
 fn real_skip_bitwise() {
-    assert!(s16_env(CACHE_ENV).is_some(), "{CACHE_ENV} = N_auto (cap)");
-    let ts: Vec<usize> = s16_env("DSV41_SKIP_TS")
+    assert!(test_env(CACHE_ENV).is_some(), "{CACHE_ENV} = N_auto (cap)");
+    let ts: Vec<usize> = test_env("DSV41_SKIP_TS")
         .unwrap_or_else(|| "4096,8192".into())
         .split(',')
         .map(|v| v.trim().parse().unwrap())
         .collect();
-    let arms: Vec<String> = s16_env("DSV41_SKIP_ARMS")
+    let arms: Vec<String> = test_env("DSV41_SKIP_ARMS")
         .unwrap_or_else(|| "off,on".into())
         .split(',')
         .map(|v| v.trim().to_owned())
         .collect();
-    let n_dec: usize = s16_env("DSV41_SKIP_DECODE").map_or(64, |v| v.parse().unwrap());
+    let n_dec: usize = test_env("DSV41_SKIP_DECODE").map_or(64, |v| v.parse().unwrap());
     // phase split of the decode steps (evals at phase edges; bits unchanged)
-    let dec_prof = s16_env("DSV41_SKIP_DECODE_PROFILE").is_some_and(|v| v == "1");
-    let mut store = s16_store(CachePlan::Admit(Limits::from_env().unwrap()));
+    let dec_prof = test_env("DSV41_SKIP_DECODE_PROFILE").is_some_and(|v| v == "1");
+    let mut store = real_store(CachePlan::Admit(Limits::from_env().unwrap()));
     // the split decode step reads and gathers without phase clocks
     if dec_prof {
         store.bank.set_split(false);
     }
     let (n_layers, vocab) = (store.model.cfg.n_layers, store.model.cfg.vocab_size);
     store.begin_turn().unwrap();
-    println!("touch bank {:.2} s", s16_touch_bank(&store));
+    println!("touch bank {:.2} s", touch_bank(&store));
     let mut fails: Vec<String> = Vec::new();
     let mut rows: Vec<Value> = Vec::new();
     for (ti, &t) in ts.iter().enumerate() {
-        let ids = p4_prompt(t);
+        let ids = compute_prompt(t);
         // the admitted context is the v1 limit; a 16K prompt's decode steps
         // pass it (compute is the prompt's; KV grows by ~6 KiB per token)
         let limit = store.model.ctx_limit;
@@ -283,7 +283,7 @@ fn real_skip_bitwise() {
             let c = Counters::now(&store.bank).since(&c0);
             let ffn_rows: usize = trace.routes.iter().map(|r| r.rows()).sum();
             let mut hashes = vec![hex_sha(&row[row.len() - vocab..])];
-            let mut picks = vec![p5_argmax(&row[row.len() - vocab..])];
+            let mut picks = vec![argmax_row(&row[row.len() - vocab..])];
             let d0 = Counters::now(&store.bank);
             let ph0 = super::stats::phase_seconds();
             super::stats::set_profiling(dec_prof);
@@ -295,7 +295,7 @@ fn real_skip_bitwise() {
                 let r = read(&store.model.forward_last(&mut sess, &[id], None, None).unwrap());
                 step_ms.push(ts.elapsed().as_secs_f64() * 1e3);
                 hashes.push(hex_sha(&r[r.len() - vocab..]));
-                picks.push(p5_argmax(&r[r.len() - vocab..]));
+                picks.push(argmax_row(&r[r.len() - vocab..]));
             }
             let dec_s = t1.elapsed().as_secs_f64();
             super::stats::set_profiling(false);
@@ -331,13 +331,13 @@ fn real_skip_bitwise() {
                 "engram_gb": c.engram_bytes as f64 / 1e9,
                 "prefill_hash": hashes[0], "last_decode_hash": hashes.last(),
                 "ids": picks,
-                "mlx_cache_gib": crate::array::get_cache_memory() / S16_GIB,
-                "footprint_gib": super::stats::rusage().0 as f64 / S16_GIB,
+                "mlx_cache_gib": crate::array::get_cache_memory() / GIB_F64,
+                "footprint_gib": super::stats::rusage().0 as f64 / GIB_F64,
             });
             println!("p5 skip {v}");
             rows.push(v);
-            if crate::array::get_cache_memory() > 2.0 * S16_GIB {
-                fails.push(format!("T={t}: MLX cache > 2 GiB (rule 11)"));
+            if crate::array::get_cache_memory() > 2.0 * GIB_F64 {
+                fails.push(format!("T={t}: MLX cache > 2 GiB"));
             }
         }
         store.model.ctx_limit = limit;
@@ -349,8 +349,8 @@ fn real_skip_bitwise() {
         "admission": store.admission().map(|a| a.to_string()),
         "rows": rows,
     });
-    if let Some(dir) = s16_env("DSV41_CACHE_OUT") {
-        let name = s16_env("DSV41_SKIP_NAME").unwrap_or_else(|| "p5-skip".into());
+    if let Some(dir) = test_env("DSV41_CACHE_OUT") {
+        let name = test_env("DSV41_SKIP_NAME").unwrap_or_else(|| "p5-skip".into());
         std::fs::write(
             PathBuf::from(dir).join(format!("{name}.json")),
             serde_json::to_vec_pretty(&out).unwrap(),

@@ -1,6 +1,5 @@
-// S14a real end to end on the 9 shards (expert cache 0) vs the S12 goldens
-// (`$DSV41_GOLDEN/<case>/{fp32,bf16}`). mlx-node runs in f32 (DECISIONS
-// S13a-1, S14a-1). Per-step logits hashes go to `$DSV41_GOLDEN/hashes/`.
+// Real end to end on the 9 shards (expert cache 0) vs the oracle goldens
+// (`$DSV41_GOLDEN/<case>/{fp32,bf16}`). mlx-node runs in f32. Per-step logits hashes go to `$DSV41_GOLDEN/hashes/`.
 // Run with `MLX_DSV41_EXPERT_CACHE_GB=0`,
 // `MLX_DSV41_STATS`, `DSV41_ROUTE_TRACE`, `DSV41_DENSE`.
 
@@ -15,7 +14,7 @@ struct Gold {
     prompt: Vec<u32>,
     greedy: Vec<u32>,
     calls: Vec<(usize, Vec<u32>, Vec<f32>, Vec<f32>)>,
-    /// Template special-token ids of the case (S12a-4).
+    /// Template special-token ids of the case.
     special: BTreeSet<u32>,
 }
 
@@ -67,10 +66,9 @@ fn gold(case: &str) -> Gold {
     }
 }
 
-/// DECISIONS S14a-5/6: the oracle against itself on one case (fp32, fake
+/// The oracle against itself on one case (fp32, fake
 /// quant on): 1-ulp perturbations of the embedding output (`pert`, `pertup`,
-/// `rnd1..3`) and the call split 7 + 1 x 25 (`split7`), from
-/// `oracle/s14a_control.py`, reduced by `diag/s14a/envelope.py` into
+/// `rnd1..3`) and the call split 7 + 1 x 25 (`split7`), reduced into
 /// `<case>/selfnoise.json`. Every field is a max over those samples.
 struct SelfNoise {
     /// per position: `KL(ora32 || sample)` (1-ulp samples)
@@ -122,7 +120,7 @@ fn e2e_store_in(mode: DenseMode) -> Store {
     assert_eq!(
         std::env::var("MLX_DSV41_EXPERT_CACHE_GB").as_deref(),
         Ok("0"),
-        "S14a runs at expert cache 0 (rule 12)"
+        "the end-to-end gates run at expert cache 0"
     );
     set_cache_limit(POOL_LIMIT as f64).unwrap();
     let t0 = std::time::Instant::now();
@@ -164,8 +162,8 @@ fn hex_sha(v: &[f32]) -> String {
         .collect()
 }
 
-/// §3 greedy site: `got` vs ora32's pick at one logits row; `Ok(None)` equal,
-/// `Ok(Some(..))` an excused near tie (S13a rules), `Err` otherwise.
+/// Greedy site: `got` vs ora32's pick at one logits row; `Ok(None)` equal,
+/// `Ok(Some(..))` an excused near tie, `Err` otherwise.
 fn pick_ok(
     got: u32,
     l32: &[f32],
@@ -175,7 +173,7 @@ fn pick_ok(
     sel_row(&[i64::from(got)], &want, l32, l16, 1)
 }
 
-/// G14.4: route trace + stats written, and expert bytes == misses x E
+/// Route trace + stats written, and expert bytes == misses x E
 /// (+ <= 0.5 % page-window widening).
 fn check_io(g: &Generated, n_calls: usize, n_layers: usize, fails: &mut Vec<String>) {
     let c = &g.counters;
@@ -192,7 +190,7 @@ fn check_io(g: &Generated, n_calls: usize, n_layers: usize, fails: &mut Vec<Stri
         c.engram_ns as f64 * 1e-9
     );
     if !(1.0..=1.005).contains(&ratio) {
-        fails.push(format!("G14.4 expert bytes ratio {ratio}"));
+        fails.push(format!("io expert bytes ratio {ratio}"));
     }
     let lines = |var: &str| {
         std::env::var_os(var).map(|p| {
@@ -205,13 +203,13 @@ fn check_io(g: &Generated, n_calls: usize, n_layers: usize, fails: &mut Vec<Stri
     let trace = lines("DSV41_ROUTE_TRACE");
     if trace != Some(1 + n_calls * n_layers) {
         fails.push(format!(
-            "G14.4 route trace lines {trace:?}, want {}",
+            "io route trace lines {trace:?}, want {}",
             1 + n_calls * n_layers
         ));
     }
     let st = lines("MLX_DSV41_STATS");
     if st.is_none_or(|n| n < g.argmax.len()) {
-        fails.push(format!("G14.4 stats lines {st:?} < {}", g.argmax.len()));
+        fails.push(format!("io stats lines {st:?} < {}", g.argmax.len()));
     }
     println!("stats: {}", g.stats);
 }
@@ -228,11 +226,11 @@ fn finish(name: &str, fails: &[String]) {
     assert!(fails.is_empty(), "{} failures (first above)", fails.len());
 }
 
-/// G14.1: the oracle's calls teacher-forced (prompt + its fp32 greedy ids):
+/// The oracle's calls teacher-forced (prompt + its fp32 greedy ids):
 /// per position `KL(ora32 || mlx) <= max(2 KL(ora32 || ora16), 1e-4)`, top-1
-/// mismatches only near ties (§3 / S13a), error-curve rule on every layer's
+/// mismatches only near ties, error-curve rule on every layer's
 /// stream. With the case's `selfnoise.json` each bound also admits 2 x the
-/// oracle's own 1-ulp spread (DECISIONS S14a-5).
+/// oracle's own 1-ulp spread.
 fn real_e2e_tf(case: &str) {
     let gd = gold(case);
     let store = e2e_store();
@@ -242,15 +240,15 @@ fn real_e2e_tf(case: &str) {
     let vocab = cfg.vocab_size;
     let steps = gd.calls.len() - 1;
     let force: Vec<u32> = gd.calls[1..].iter().map(|c| c.1[0]).collect();
-    // S14a-5: with the case's self-noise envelope every bound is the larger of
-    // the §3 bound and 2 x the oracle's own 1-ulp spread; the §3 verdict is printed
+    // with the case's self-noise envelope every bound is the larger of
+    // the quality-rule bound and 2 x the oracle's own 1-ulp spread; the quality-rule verdict is printed
     let env = self_noise(case);
     println!(
         "{case}: self-noise envelope {}",
         if env.is_some() {
-            "found (S14a-5 bounds)"
+            "found (self-noise bounds)"
         } else {
-            "absent (§3 bounds)"
+            "absent (quality-rule bounds)"
         }
     );
     let mut sess = store.model.new_session();
@@ -274,14 +272,14 @@ fn real_e2e_tf(case: &str) {
             worst_kl = worst_kl.max(k_m / bound);
             if k_m.is_nan() || k_m > b3 {
                 as_written.push(format!(
-                    "G14.1 call {} pos {}: KL {k_m:e} > {b3:e}",
+                    "teacher-forced call {} pos {}: KL {k_m:e} > {b3:e}",
                     c.index,
                     start + p
                 ));
             }
             if k_m.is_nan() || k_m > bound {
                 fails.push(format!(
-                    "G14.1 call {} pos {}: KL {k_m:e} > {bound:e}",
+                    "teacher-forced call {} pos {}: KL {k_m:e} > {bound:e}",
                     c.index,
                     start + p
                 ));
@@ -290,7 +288,7 @@ fn real_e2e_tf(case: &str) {
                 Ok(None) => {}
                 Ok(Some(t)) => excused.push(format!("call {} pos {}: {t:?}", c.index, start + p)),
                 Err(e) => fails.push(format!(
-                    "G14.1 top-1 call {} pos {}: {e}",
+                    "teacher-forced top-1 call {} pos {}: {e}",
                     c.index,
                     start + p
                 )),
@@ -357,37 +355,37 @@ fn real_e2e_tf(case: &str) {
         g.argmax,
         gd.greedy
     );
-    // §3: more than 1 % of a site's rows excused also fails; S14a-5: or more
+    // quality rule: more than 1 % of a site's rows excused also fails; or more
     // rows than the oracle's own 1-ulp runs flip, whichever is larger
     let n_rows: usize = gd.calls.iter().map(|c| c.1.len()).sum();
     let cap = 0.01 * n_rows as f64;
     if excused.len() as f64 > cap {
         as_written.push(format!(
-            "G14.1 top-1 excused {} of {n_rows} rows > 1 % (§3 site cap)",
+            "teacher-forced top-1 excused {} of {n_rows} rows > 1 % (site cap)",
             excused.len()
         ));
     }
     let cap = env.as_ref().map_or(cap, |n| cap.max(n.top1_flips as f64));
     if excused.len() as f64 > cap {
         fails.push(format!(
-            "G14.1 top-1 excused {} of {n_rows} rows > cap {cap}",
+            "teacher-forced top-1 excused {} of {n_rows} rows > cap {cap}",
             excused.len()
         ));
     }
     for f in &as_written {
-        println!("§3 as written: FAIL {f}");
+        println!("quality rule as written: FAIL {f}");
     }
-    println!("§3 as written: {} failures", as_written.len());
+    println!("quality rule as written: {} failures", as_written.len());
     check_io(&g, gd.calls.len(), cfg.n_layers, &mut fails);
     finish(&format!("real_e2e_tf {case}"), &fails);
 }
 
-/// G14.5 (§3 quality rule) on the EN prompt, teacher-forced over the prompt:
+/// The quality rule on the EN prompt, teacher-forced over the prompt:
 /// `|NLL_mlx - NLL_ora32| <= 2 |NLL_ora16 - NLL_ora32| + 0.01` on all targets
 /// and on user-text targets; oracle fp32 NLL <= 3.0 and top-1 >= 40 % on
-/// user-text targets (S12a-4: template role tokens are never targets).
+/// user-text targets (template role tokens are never targets).
 #[test]
-#[ignore = "real 9 shards + S12 goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
+#[ignore = "real 9 shards + oracle goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
 fn real_e2e_nll_en() {
     let gd = gold("p32k8-en");
     let store = e2e_store();
@@ -441,10 +439,10 @@ fn real_e2e_nll_en() {
             (m - a).abs()
         );
         if (m - a).is_nan() || (m - a).abs() > bound {
-            fails.push(format!("G14.5 {name}: |{m} - {a}| > {bound}"));
+            fails.push(format!("nll {name}: |{m} - {a}| > {bound}"));
         }
         if user_only && !(a <= 3.0 && top1 >= 0.4) {
-            fails.push(format!("G14.5 oracle quality {name}: NLL {a} top-1 {top1}"));
+            fails.push(format!("nll oracle quality {name}: NLL {a} top-1 {top1}"));
         }
     }
     check_io(&g, 1, store.model.cfg.n_layers, &mut fails);
@@ -487,7 +485,7 @@ fn store_hashes(name: &str, doc: Value, fails: &mut Vec<String>) -> bool {
     true
 }
 
-/// G14.2: 32 greedy tokens from the prompt; the first ones the oracle made
+/// 32 greedy tokens from the prompt; the first ones the oracle made
 /// (prefill + 8 steps) must match it except a near tie (after which the
 /// texts part and nothing more is compared). Ids + per-step logits hashes
 /// go to `hashes/greedy-<case>.json`; EN also keeps its logits (all prompt
@@ -525,7 +523,7 @@ fn real_e2e_greedy(case: &str) {
     let same_prompt = prompt == gd.prompt;
     let tag = store.dense_mode.tag();
     if !tag.is_empty() {
-        // D-41 (b)/(c): the 32 greedy ids == the exact path's stored ids
+        // the 32 greedy ids == the exact path's stored ids
         let p = golden_root().join(format!("hashes/greedy-{case}.json"));
         let ex: Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
         assert_eq!(ex["prompt_ids"], serde_json::json!(prompt));
@@ -536,9 +534,9 @@ fn real_e2e_greedy(case: &str) {
             .map(|x| x.as_u64().unwrap() as u32)
             .collect();
         match (0..want.len().max(g.argmax.len())).find(|&i| want.get(i) != g.argmax.get(i)) {
-            None => println!("P0 greedy ids == the exact path's {} ids", want.len()),
+            None => println!("greedy ids == the exact path's {} ids", want.len()),
             Some(i) => fails.push(format!(
-                "P0 greedy ids differ from the exact path at step {i}: {:?} vs {:?}",
+                "greedy ids differ from the exact path at step {i}: {:?} vs {:?}",
                 g.argmax.get(i),
                 want.get(i)
             )),
@@ -554,7 +552,7 @@ fn real_e2e_greedy(case: &str) {
             let r = (ids.len() - 1) * vocab..ids.len() * vocab;
             match pick_ok(got, &l32[r.clone()], &l16[r]) {
                 Ok(t) => parted = Some(format!("step {j}: {got} vs {want} excused {t:?}")),
-                Err(e) => fails.push(format!("G14.2 step {j}: {got} vs oracle {want}: {e}")),
+                Err(e) => fails.push(format!("greedy step {j}: {got} vs oracle {want}: {e}")),
             }
             break;
         }
@@ -598,13 +596,13 @@ fn real_e2e_greedy(case: &str) {
     finish(&format!("real_e2e_greedy {case}"), &fails);
 }
 
-/// G14.3: the EN prompt in calls of 7 + 8 greedy steps vs the whole-prompt
+/// The EN prompt in calls of 7 + 8 greedy steps vs the whole-prompt
 /// greedy run (`hashes/greedy-p32k8-en.logits.f32`): every row within
 /// `max(1e-5, 2 x` the oracle's own 1-ulp / call-split spread at that
-/// position`)` relL2 (DECISIONS S14a-6), greedy ids exact; the per-call logits
+/// position`)` relL2, greedy ids exact; the per-call logits
 /// hashes are the chunk-7 golden (later builds: bitwise).
 #[test]
-#[ignore = "real 9 shards + S12 goldens + greedy-p32k8-en logits; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
+#[ignore = "real 9 shards + oracle goldens + greedy-p32k8-en logits; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
 fn real_e2e_chunk7_en() {
     let gd = gold("p32k8-en");
     let whole: Vec<f32> = std::fs::read(golden_root().join("hashes/greedy-p32k8-en.logits.f32"))
@@ -623,7 +621,7 @@ fn real_e2e_chunk7_en() {
         Some(hex_sha(&whole).as_str()),
         "whole-prompt logits file does not match its baseline"
     );
-    // S14a-6: rows within max(1e-5, 2 x the oracle's own 1-ulp / call-split
+    // rows within max(1e-5, 2 x the oracle's own 1-ulp / call-split
     // spread at that position); greedy ids exact; hashes bitwise once stored
     let env = self_noise("p32k8-en");
     // the chunk-7 golden is the exact path's
@@ -673,7 +671,7 @@ fn real_e2e_chunk7_en() {
         as_written += usize::from(e.is_nan() || e > 1e-5);
         if e.is_nan() || e > bound {
             fails.push(format!(
-                "G14.3a row {r}: relL2 {e:e} vs whole prompt > {bound:e}"
+                "chunked row {r}: relL2 {e:e} vs whole prompt > {bound:e}"
             ));
         }
         if r + 1 >= p {
@@ -682,14 +680,14 @@ fn real_e2e_chunk7_en() {
             let got = g.argmax[j];
             if got != whole_pick(j) {
                 fails.push(format!(
-                    "G14.3a step {j}: {got} vs whole-prompt {}",
+                    "chunked step {j}: {got} vs whole-prompt {}",
                     whole_pick(j)
                 ));
                 break;
             }
         }
     }
-    println!("§3 as written (1e-5): {as_written} of {n_rows} rows over");
+    println!("quality rule as written (1e-5): {as_written} of {n_rows} rows over");
     println!(
         "real_e2e_chunk7_en: {} calls, {n_rows} rows, worst relL2 / bound {worst:.3}; ids {:?}",
         hashes.len(),
@@ -705,46 +703,46 @@ fn real_e2e_chunk7_en() {
 }
 
 #[test]
-#[ignore = "real 9 shards + S12 goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
+#[ignore = "real 9 shards + oracle goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
 fn real_e2e_tf_en() {
     real_e2e_tf("p32k8-en");
 }
 
 #[test]
-#[ignore = "real 9 shards + S12 goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
+#[ignore = "real 9 shards + oracle goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
 fn real_e2e_tf_zh() {
     real_e2e_tf("p32k8-zh");
 }
 
 #[test]
-#[ignore = "real 9 shards + S12 goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
+#[ignore = "real 9 shards + oracle goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
 fn real_e2e_tf_code() {
     real_e2e_tf("p32k8-code");
 }
 
 #[test]
-#[ignore = "real 9 shards + S12 goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
+#[ignore = "real 9 shards + oracle goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
 fn real_e2e_greedy_en() {
     real_e2e_greedy("p32k8-en");
 }
 
 #[test]
-#[ignore = "real 9 shards + S12 goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
+#[ignore = "real 9 shards + oracle goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
 fn real_e2e_greedy_zh() {
     real_e2e_greedy("p32k8-zh");
 }
 
 #[test]
-#[ignore = "real 9 shards + S12 goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
+#[ignore = "real 9 shards + oracle goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
 fn real_e2e_greedy_code() {
     real_e2e_greedy("p32k8-code");
 }
 
-/// S18 CLI-vs-Rust gate: `DSV41_IDS` = the CLI's JSON (`$I/tools/ds-run.ts`:
+/// CLI-vs-Rust gate: `DSV41_IDS` = the CLI's JSON (a `ChatSession` run:
 /// `prompt_ids` = its rendered prompt, `output_ids` = its greedy output). The
 /// product path (`forward_last`, the engine's T=0 sampler, dense mode from the
 /// env as in the CLI) greedy-decodes from the same prompt; ids must be equal.
-/// Expert cache 0 here, the CLI's auto cache there (D-13: same bits).
+/// Expert cache 0 here, the CLI's auto cache there (same bits).
 #[test]
 #[ignore = "real 9 shards + DSV41_IDS (ds-run.ts JSON); MLX_DSV41_EXPERT_CACHE_GB=0; ~19 GiB"]
 fn real_e2e_greedy_from_ids() {

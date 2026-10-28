@@ -245,7 +245,7 @@ impl Indexer {
         while lo < s {
             let hi = (lo + rows).min(s);
             if hi <= from {
-                // stage P5: no later reader needs these query rows; same
+                // no later reader needs these query rows; same
                 // chunk grid, so the computed rows keep their bits
                 let n = hi - lo;
                 ids.extend(std::iter::repeat_n(-1, n * kk));

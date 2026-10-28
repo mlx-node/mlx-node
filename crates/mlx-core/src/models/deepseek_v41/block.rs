@@ -45,7 +45,7 @@ pub(crate) fn set_test_read_ahead_rows(n: usize) {
 
 /// `rows`, or the test cap on every row-chunk loop (FFN, sparse attention,
 /// indexer) of this thread: tiny prompts fit one chunk otherwise, which
-/// leaves the stage-P5 chunk skip nothing to skip.
+/// leaves the long-prompt chunk skip nothing to skip.
 pub(crate) fn chunk_cap(rows: usize) -> usize {
     #[cfg(test)]
     {
@@ -155,7 +155,7 @@ impl Block {
     /// `x` `[s, hc, dim]` at `start..start + s` with `pre_mix` `[s, hc]` ->
     /// (`x`, this FFN's `pre` for the next block, the routes, the index
     /// scores when the attention exports them). `src` is the
-    /// layer's KV source cache (compressed layers only). Stage P5: output
+    /// layer's KV source cache (compressed layers only). Output
     /// rows below `from` are not needed by anyone; the attention and FFN
     /// chunks that hold only such rows are skipped (their output rows are
     /// stale, never read), every other op still runs on all `s` rows so a

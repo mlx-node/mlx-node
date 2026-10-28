@@ -1,4 +1,4 @@
-//! Admission of the expert cache (D-15 as amended by D-40): how many cache
+//! Admission of the expert cache: how many cache
 //! slots fit next to the fixed working set, from one host reading passed in
 //! as a value, and the per-turn re-check that drops the whole cache bank to
 //! staging-only when other processes grew (purgeable state is per whole
@@ -21,15 +21,15 @@ pub const CACHE_ENV: &str = "MLX_DSV41_EXPERT_CACHE_GB";
 pub const RESERVE_ENV: &str = "MLX_DSV41_ADMIT_RESERVE_GB";
 
 const GIB: u64 = 1 << 30;
-/// Host memory left to other processes (D-40).
+/// Host memory left to other processes.
 pub const RESERVE: u64 = 12 * GIB;
-/// MLX free-buffer pool allowance (D-33 caps it at 1 GiB, gate at 2 GiB).
+/// MLX free-buffer pool allowance (the pool is capped at 1 GiB).
 pub const POOL: u64 = 2 * GIB;
 const DRIVER_MIN: u64 = 4 * GIB;
 const IO_BASE: u64 = GIB / 4;
 const IO_PER_ROW: u64 = 40 << 10;
-/// S14c chord through T = 1K / 8K of the MLX prefill scratch (f32
-/// activations, `logs/s14c/fit.json`); bounds the 16K point from above.
+/// Chord through T = 1K / 8K of the measured MLX prefill scratch (f32
+/// activations); bounds the 16K point from above.
 /// Last-row logits only (`Model::forward_last`): a caller that keeps
 /// `[T, vocab]` f32 logits (`generate.rs`, test driver) needs T x 0.5 MB more.
 const COMPUTE_BASE: u64 = 1_134_024_803;

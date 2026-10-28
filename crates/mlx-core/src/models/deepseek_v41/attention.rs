@@ -199,8 +199,8 @@ impl WindowAttention {
         self.forward_from(x, start, cache, 0)
     }
 
-    /// `forward` whose query rows below `from` are not needed by anyone
-    /// (stage P5): their attention chunks are skipped and give zeros. Every
+    /// `forward` whose query rows below `from` are not needed by anyone:
+    /// their attention chunks are skipped and give zeros. Every
     /// row's KV is still appended.
     pub fn forward_from(
         &self,
@@ -452,8 +452,8 @@ impl CompressedAttention {
         self.forward_from(x, start, win, src, shared, 0)
     }
 
-    /// `forward` whose query rows below `from` are not needed by anyone
-    /// (stage P5): their indexer and attention chunks are skipped (top-k
+    /// `forward` whose query rows below `from` are not needed by anyone:
+    /// their indexer and attention chunks are skipped (top-k
     /// `-1`, no candidate block, zero output). The compressor and the index
     /// keys still take every row.
     pub fn forward_from(

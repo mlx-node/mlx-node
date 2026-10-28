@@ -23,7 +23,7 @@ pub trait EngramRows {
 }
 
 /// The whole table held in memory (tiny fixture). The real 203 GB table is
-/// read by row (S11), never held or mapped.
+/// read by row, never held or mapped.
 pub struct ResidentTable {
     raw: Vec<u8>,
     head_dim: usize,

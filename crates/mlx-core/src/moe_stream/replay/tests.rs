@@ -110,8 +110,8 @@ fn decode_tokens(t: &RouteTrace) -> u64 {
         .count() as u64
 }
 
-/// Predicted decode tok/s `1 / (t_c - saved + miss_bytes / BW + t_engram)`
-/// (D-42); `saved` = router waits of pinned layers (upper bound).
+/// Predicted decode tok/s `1 / (t_c - saved + miss_bytes / BW + t_engram)`;
+/// `saved` = router waits of pinned layers (upper bound).
 fn tok_s(tm: &Terms, r: &Replayed, n_dec: u64, pinned: usize, layers: usize) -> (f64, f64) {
     let miss = r.decode_reads as f64 * EXPERT_BYTES / n_dec.max(1) as f64;
     let base = tm.t_c + miss / tm.bw + tm.t_engram;
@@ -119,7 +119,7 @@ fn tok_s(tm: &Terms, r: &Replayed, n_dec: u64, pinned: usize, layers: usize) -> 
     (1.0 / base, 1.0 / (base - saved).max(1e-9))
 }
 
-/// S16b / D-42: h vs cache size on the real route traces in `DSV41_TRACES`
+/// h vs cache size on the real route traces in `DSV41_TRACES`
 /// for the arms global LRU, global LFU-decay (half-life 16 / 64 / 256
 /// tokens), layer-pinned (whole layers with the most staging-only decode
 /// reads in the OTHER traces, rest streamed with cache 0) and hybrid (k
@@ -177,7 +177,7 @@ fn real_traces() {
     let mut md = String::new();
     let mut js = Vec::new();
     md.push_str(&format!(
-        "# S16b replay h table (D-42 arms)\n\nTraces: {}. Expert = {EXPERT_BYTES} B; one pinned layer = {experts} slots = {:.2} GiB. h = byte hit rate over every expert use; dec-h = over decode steps only (the decode speed term). Prefill misses are staged, not cached (S16a-1), so every run starts decode with an empty cache. LFU half-life in tokens ({uses_per_token} uses each); HYB hl 0 = LRU on the unpinned slots, k 0 = the better global arm. Pinned layers ranked by staging-only decode reads in the OTHER traces (all traces for the mix). Predicted tok/s = 1/(t_c + decode misses x E / BW / tokens + t_engram){}; `sync` = also minus the router wait of the pinned layers (upper bound). Saved host syncs per token = PIN N / HYB k (a pinned layer needs no router -> read wait).\n\n",
+        "# replay h table\n\nTraces: {}. Expert = {EXPERT_BYTES} B; one pinned layer = {experts} slots = {:.2} GiB. h = byte hit rate over every expert use; dec-h = over decode steps only (the decode speed term). Prefill misses are staged, not cached (S16a-1), so every run starts decode with an empty cache. LFU half-life in tokens ({uses_per_token} uses each); HYB hl 0 = LRU on the unpinned slots, k 0 = the better global arm. Pinned layers ranked by staging-only decode reads in the OTHER traces (all traces for the mix). Predicted tok/s = 1/(t_c + decode misses x E / BW / tokens + t_engram){}; `sync` = also minus the router wait of the pinned layers (upper bound). Saved host syncs per token = PIN N / HYB k (a pinned layer needs no router -> read wait).\n\n",
         names.join(", "),
         experts as f64 * EXPERT_BYTES / GIB,
         match &tm {
@@ -299,12 +299,16 @@ fn real_traces() {
     if let Some((l, f, h)) = checkpoint {
         let near = l < 0.3;
         md.push_str(&format!(
-            "Checkpoint (plan S16b, OPEN O-5): {} at 24 GiB decode h LRU {l:.3}, LFU {f:.3}, hybrid {h:.3}{}\n",
+            "Checkpoint: {} at 24 GiB decode h LRU {l:.3}, LFU {f:.3}, hybrid {h:.3}{}\n",
             traces[0].0,
-            if near { " -> BELOW 0.3 (near uniform)" } else { " (>= 0.3)" }
+            if near {
+                " -> BELOW 0.3 (near uniform)"
+            } else {
+                " (>= 0.3)"
+            }
         ));
         println!(
-            "O-5 checkpoint: 24 GiB decode h LRU {l:.3} LFU {f:.3} hybrid {h:.3} near_uniform={near}"
+            "checkpoint: 24 GiB decode h LRU {l:.3} LFU {f:.3} hybrid {h:.3} near_uniform={near}"
         );
     }
     print!("{md}");

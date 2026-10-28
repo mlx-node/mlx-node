@@ -129,7 +129,7 @@ pub struct Counters {
     /// Expert uses (distinct experts per layer step) and cache hits among them.
     pub uses: u64,
     pub hits: u64,
-    /// Experts read ahead (stage P4) that no route used (inside `fill_slots`).
+    /// Experts read ahead that no route used (inside `fill_slots`).
     pub prefetch_unused: u64,
     /// The bank's staging layers now (not a counter).
     pub staging_layers: u64,
@@ -259,7 +259,7 @@ pub fn emit(line: &Value) -> std::io::Result<()> {
     writeln!(f, "{line}")
 }
 
-/// The plan's stats line (S14a) from one generation's numbers.
+/// The stats line from one generation's numbers.
 #[allow(clippy::too_many_arguments)]
 pub fn line(
     stage: &str,

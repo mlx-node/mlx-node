@@ -1,4 +1,4 @@
-// S14c compute memory vs prompt length. A staging-only (expert cache 0)
+// Compute memory vs prompt length. A staging-only (expert cache 0)
 // prefill of a real prompt of T ids (`$DSV41_PROMPTS/compute-<T>.json`) with
 // last-row logits (`forward_last`, the product prefill), then one greedy
 // step. Records the peak footprint (sampled every 2 ms), MLX peak active
@@ -91,7 +91,7 @@ fn real_compute(t: usize) {
     assert_eq!(ids.len(), t);
     let mut store = e2e_store();
     // the greedy step after a T-token prefill is measured one token past the
-    // D-24 limit at T = 16K, which the product refuses (S16b codex)
+    // context limit at T = 16K, which the product refuses
     store.model.ctx_limit = store.model.ctx_limit.map(|l| l.max(t + 1));
     let m = &store.model;
     let (hc, dim, n_layers) = (m.cfg.hc_mult, m.cfg.dim, m.cfg.n_layers);
@@ -149,7 +149,7 @@ fn real_compute(t: usize) {
     for (what, v) in [("prefill", pool_prefill), ("step", pool_end)] {
         if v > 2.0 * GIB {
             fails.push(format!(
-                "MLX cache {:.2} GiB after the {what} (rule 11)",
+                "MLX cache {:.2} GiB after the {what}",
                 v / GIB
             ));
         }

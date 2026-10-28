@@ -274,7 +274,7 @@ model thread always computes f32 matmuls in true f32, whatever `MLX_ENABLE_TF32`
 | `MLX_DSV41_ADMIT_RESERVE_GB` | Memory kept free for other apps by the admission (default 12 GiB; only raises).                                                                 |
 | `MLX_DSV41_STATS=<file>`     | Diagnostics: append one JSON stats line per call (TTFT, hit rates, read GB/s, decode t_c / t_io / router wait, peak footprint). Bits unchanged. |
 
-Measured product table (P7, 2026-10-28; M5 Max 128 GB, internal SSD;
+Measured product table (2026-10-28; M5 Max 128 GB, internal SSD;
 `@mlx-node/lm` `ChatSession`, greedy, chat mode, 32 new tokens, all defaults;
 each prompt cold in a fresh process after
 20 min idle; expert cache = the load admission's auto size, here small because

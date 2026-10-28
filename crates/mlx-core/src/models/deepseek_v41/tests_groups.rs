@@ -1,19 +1,19 @@
-// S13 real layer groups vs the S12 oracle goldens (`$DSV41_GOLDEN/<case>/{fp32,bf16}/cNNN/LNN.npz`).
+// Real layer groups vs the oracle goldens (`$DSV41_GOLDEN/<case>/{fp32,bf16}/cNNN/LNN.npz`).
 // Each group starts from the oracle fp32 stream + pre-mix at its first layer, gets the oracle's state of
 // every KV / candidate source outside the group for every call, and runs on the real file with experts
-// streamed through the store (cache 0). mlx-node runs in f32 (DECISIONS S13a-1): gates are §3 vs ora32
+// streamed through the store (cache 0). mlx-node runs in f32: gates are the quality rule vs ora32
 // with the ora16 run as the floor. Included into `tests.rs` so filters read
 // `deepseek_v41::tests::real_groups_<case>`.
-// The long rung dumps streams at group-boundary layers only (DECISIONS
-// S13b-1): a layer's stream is gated where its golden exists.
-// Selection gates (DECISIONS S13b-5, diag/JUDGE.md): each group's first layer
+// The long rung dumps streams at group-boundary layers only: a
+// layer's stream is gated where its golden exists.
+// Selection gates: each group's first layer
 // (exact oracle input) carries the hard checks G1 `r(L_first) <= 0.07`, G2
-// router / index / candidate rows equal or §3 near ties, excused rows <=
+// router / index / candidate rows equal or near ties, excused rows <=
 // max(3, 1 % of that layer's rows), and G3 every compressed-KV / index-K
 // source state within 1e-4 of its elements of the oracle's, per call. Route
 // differences at depth >= 1 are printed, not failed (the oracle against itself
 // at 1 ulp fails a per-row rule there); such a row keeps the per-row stream
-// rule with the S13a-6 bound.
+// rule with the flipped-row bound.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -233,14 +233,14 @@ fn real_shards() -> Vec<PathBuf> {
     v
 }
 
-/// One selection row vs ora32 (§3). mlx-node's raw ids (`-1` = empty) must be
+/// One selection row vs ora32. mlx-node's raw ids (`-1` = empty) must be
 /// distinct, in `[0, n)` and as many as ora32's, else `Err("malformed …")`
 /// (never excused). Equal sets pass. Otherwise the row is excused iff
 /// `m32 < 2 g'` at ora32's last kept / first dropped entry AND mlx-node's set
 /// is a top-k of the ora32 scores with each entry moved by at most
 /// `2 max(|ora16 - ora32| of that entry, G)` (so only entries inside the
 /// oracle's noise band may trade places). `G` = the median `|ora16 - ora32|`
-/// over ora32's top 2k entries, `g' = max(g, G)` (DECISIONS S13a-8: the two
+/// over ora32's top 2k entries, `g' = max(g, G)` (the two
 /// cutoff entries alone underestimate the row's noise). Returns `Ok(None)`
 /// when equal, `Ok(Some((m32, g', swapped)))` when excused, `Err` otherwise.
 fn sel_row(
@@ -306,7 +306,7 @@ fn sel_row(
 /// mlx-node's route ids of one row must be the top-k of its own `scores +
 /// bias` in rank order, ties to the lowest id (`ops::route_select`), at every
 /// depth: a depth >= 1 difference from ora32 is only excused as noise when
-/// mlx-node picked what its own scores say (S13b-5 codex).
+/// mlx-node picked what its own scores say.
 fn route_self_check(got: &[i64], biased: &[f32], k: usize) -> std::result::Result<(), String> {
     let mut order: Vec<usize> = (0..biased.len()).collect();
     order.sort_by(|&i, &j| biased[j].total_cmp(&biased[i]).then(i.cmp(&j)));
@@ -319,7 +319,7 @@ fn route_self_check(got: &[i64], biased: &[f32], k: usize) -> std::result::Resul
 }
 
 /// Rows of one selection site, the excused ones, the depth >= 1 route
-/// differences that are not near ties (printed only, DECISIONS S13b-5), and
+/// differences that are not near ties (printed only), and
 /// the rows where the oracle's own bf16 run picks another set than its fp32 run.
 #[derive(Default)]
 struct Site {
@@ -329,7 +329,7 @@ struct Site {
     ora_flips: usize,
 }
 
-/// G3 (DECISIONS S13b-5): a source state's elements off the oracle's by more
+/// G3: a source state's elements off the oracle's by more
 /// than `1e-3` relative (non-finite counts as off). Returns (off, elements);
 /// `Err` when the row counts differ.
 fn state_off(mine: &[f32], ora: &[f32], hd: usize) -> std::result::Result<(usize, usize), String> {
@@ -360,7 +360,7 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
     assert_eq!(
         std::env::var("MLX_DSV41_EXPERT_CACHE_GB").as_deref(),
         Ok("0"),
-        "S13 runs at expert cache 0 (rule 12)"
+        "the group gates run at expert cache 0"
     );
     set_cache_limit(POOL_LIMIT as f64).unwrap();
     let root = PathBuf::from(std::env::var("DSV41_GOLDEN").expect("DSV41_GOLDEN")).join(case);
@@ -387,7 +387,7 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
     }
 
     let t0 = std::time::Instant::now();
-    // the group gates hold the exact f32 path (DECISIONS P0-2)
+    // the group gates hold the exact f32 path
     let mut store = Store::open_dense(
         &real_shards(),
         DType::Float32,
@@ -407,7 +407,7 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
     let eng_layers = cfg.engram.as_ref().unwrap().layers.clone();
     let cand = cfg.candidate.clone();
     // a case whose dumps skip some layer's stream must show the fallback seams
-    // hold where it can be seen (S13b-1)
+    // hold where it can be seen
     if (0..cfg.n_layers).any(|l| !lfile(&d32, 0, l).has("out")) {
         let n: usize = (0..n_calls)
             .map(|c| check_seams([&d32, &d16], c, cfg.n_layers, &eng_layers))
@@ -589,7 +589,7 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
                     }
                 }
                 // G3: this group's own compressed-KV / index-K source state
-                // after the call vs the oracle's (diag/mutation/diag_harness.patch)
+                // after the call vs the oracle's
                 if cfg.kv_src[l] == Some(l) && cfg.compress_ratios[l] != 0 {
                     let src = sess.sources[l]
                         .as_ref()
@@ -669,8 +669,8 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
                     if let Err(e) = route_self_check(&got, &r.biased[p * ne..(p + 1) * ne], r.k) {
                         fails.push(format!("router L{l} pos {}: {e}", start + p));
                     }
-                    // DECISIONS S13b-5: G2 at the first layer; at depth >= 1 a
-                    // difference is printed and the row gets the S13a-6 bound
+                    // G2 at the first layer; at depth >= 1 a
+                    // difference is printed and the row gets the flipped-row bound
                     match sel_row(&got, &want, &b32, &b16, r.k) {
                         Ok(None) => {}
                         Err(e) if e.starts_with("malformed") => {
@@ -697,9 +697,9 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
                     first_sel.entry("router").or_default().0 += s;
                 }
 
-                // stream rule (§3) per position; a row whose routes differ
+                // stream rule per position; a row whose routes differ
                 // from ora32 at or before this layer (excused near tie, or any
-                // depth >= 1 difference, S13b-5) is deferred (S13a-6)
+                // depth >= 1 difference) is deferred to the flipped-row bound
                 let (o32, o16) = gold.as_ref().map_or((&[][..], &[][..]), |(a, b)| {
                     (a.as_slice(), b.as_slice())
                 });
@@ -823,9 +823,9 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
             }
 
             // the pre-mix leaving the group (the next group / the head reads
-            // it; the next group is fed the oracle's). DECISIONS S13a-8: its
+            // it; the next group is fed the oracle's). Its
             // per-row floor (4 numbers) is too noisy to gate a row, so the
-            // gate is §3's error-curve form over all rows and calls,
+            // gate is the quality rule's error-curve form over all rows and calls,
             // r = relL2(mlx, ora32) / relL2(ora16, ora32) <= 2; rows over the
             // per-row stream bound are counted and printed
             {
@@ -855,11 +855,11 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
                     pm_acc[1] += (z - b) * (z - b);
                     pm_acc[2] += b * b;
                 }
-                // DECISIONS S13b-2 (S13a-2 codex): per token, the stream the
+                // per token, the stream the
                 // next block's attention reads, `hc_pre(out, next_pre_mix)`
-                // = sum_j pre[j] x[j] (`model.py` Block.hc_pre), gated by §3's
+                // = sum_j pre[j] x[j] (`model.py` Block.hc_pre), gated by the quality rule's
                 // stream rule; a row that took an excused route flip in the
-                // group gets the S13a-6 bound of the group's last layer
+                // group gets the flipped-row bound of the group's last layer
                 let (xs, (x32, x16)) = last_stream.take().unwrap();
                 let mix = |pm: &[f32], x: &[f32], p: usize| -> Vec<f32> {
                     (0..dim)
@@ -890,9 +890,9 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
         if pm_r.is_nan() || pm_r > 2.0 {
             fails.push(format!("L{} next pre-mix: r {pm_r:.3} > 2", g1 - 1));
         }
-        // DECISIONS S13a-6: a row that took an excused route flip may differ
+        // the flipped-row bound: a row that took an excused route flip may differ
         // from ora32 as much as the oracle's own bf16 run does on the rows
-        // where it flipped a route at that layer (S9-3), and no more
+        // where it flipped a route at that layer, and no more
         let mut def_worst = 0f64;
         for (i, what, e, bound) in &deferred {
             let fl = ora_flip_floor[*i];
@@ -904,9 +904,9 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
                 ));
             }
         }
-        // error-curve rule (§3) over the group's layers with a golden stream,
+        // error-curve rule over the group's layers with a golden stream,
         // all calls; across n ungated steps the per-step 0.25 bounds the rise
-        // by 0.25 n, the only part of it the dumps can show (S13b-3)
+        // by 0.25 n, the only part of it the dumps can show
         let mut prev: Option<(usize, f64)> = None;
         let mut r_first = f64::NAN;
         for (i, l) in (g0..g1).enumerate() {
@@ -933,7 +933,7 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
             if r > 2.0 {
                 fails.push(format!("L{l}: r {r:.3} > 2"));
             }
-            // G1 (DECISIONS S13b-5): the first layer runs on the oracle's own
+            // G1: the first layer runs on the oracle's own
             // input, so only f32 rounding and quantizer midpoints may move it
             if i == 0 {
                 r_first = r;
@@ -962,7 +962,7 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
             g3.0,
             n_src * n_calls
         );
-        // G2 (DECISIONS S13b-5): excused near ties at the first layer
+        // G2: excused near ties at the first layer
         let mut g2 = Vec::new();
         for (name, &(rows, n)) in &first_sel {
             let cap = 3f64.max(0.01 * rows as f64);
@@ -988,14 +988,14 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
         );
     }
 
-    // DECISIONS S13b-5: no whole-site cap (S13a-2 dropped); the first-layer
+    // no whole-site cap; the first-layer
     // cap is G2 above. Totals are printed for the record.
     for (name, st) in &sites {
         for e in &st.excused {
             println!("excused near tie: {e}");
         }
         for e in &st.deep {
-            println!("depth >= 1 route difference (printed, S13a-6 row): {e}");
+            println!("depth >= 1 route difference (printed, flipped-row bound): {e}");
         }
         println!(
             "site {name}: {} rows, {} excused near ties + {} depth >= 1 differences ({:.3} %), oracle bf16 flips {}",
@@ -1039,25 +1039,25 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
 }
 
 #[test]
-#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12 goldens), MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~160 GB read"]
+#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (oracle goldens), MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~160 GB read"]
 fn real_groups_p32k8_en() {
     real_groups("p32k8-en", &REAL_GROUPS);
 }
 
 #[test]
-#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12 goldens), MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~160 GB read"]
+#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (oracle goldens), MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~160 GB read"]
 fn real_groups_p32k8_zh() {
     real_groups("p32k8-zh", &REAL_GROUPS);
 }
 
 #[test]
-#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12 goldens), MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~160 GB read"]
+#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (oracle goldens), MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~160 GB read"]
 fn real_groups_p32k8_code() {
     real_groups("p32k8-code", &REAL_GROUPS);
 }
 
 #[test]
-#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12 goldens), MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~311 GB read"]
+#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (oracle goldens), MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~311 GB read"]
 fn real_groups_p160k8_en() {
     real_groups("p160k8-en", &REAL_GROUPS);
 }
@@ -1066,7 +1066,7 @@ fn real_groups_p160k8_en() {
 /// `[24..27]`; streams gated at the dumped boundary layers 2, 7 (via L08's
 /// input), 20, 23, 24, 27.
 #[test]
-#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12e goldens), MLX_DSV41_EXPERT_CACHE_GB=0; ~20 GiB, ~117 GB read"]
+#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (oracle goldens), MLX_DSV41_EXPERT_CACHE_GB=0; ~20 GiB, ~117 GB read"]
 fn real_groups_long() {
     real_groups("p1100k4-en", &[(2, 8), (20, 24), (24, 28)]);
 }
@@ -1088,7 +1088,7 @@ fn sel_row_excuses_only_noise_band_swaps() {
         let e = sel_row(bad, &w(&[0, 1]), &s32, &s16, 2).unwrap_err();
         assert!(e.starts_with("malformed"), "{e}");
     }
-    // the cutoff pair's own drift is small but the row's is not (S13a-8)
+    // the cutoff pair's own drift is small but the row's is not
     let (t32, t16) = ([10.0, 5.0, 4.99, 3.0], [10.05, 5.001, 4.991, 3.05]);
     assert!(matches!(
         sel_row(&[0, 2], &w(&[0, 1]), &t32, &t16, 2),
@@ -1109,7 +1109,7 @@ fn route_self_check_rejects_ids_off_their_own_scores() {
     // rank order, ties to the lowest id (route_select)
     assert!(route_self_check(&[1, 3], &b, 2).is_ok());
     assert!(route_self_check(&[3, 1], &b, 2).is_err());
-    // the S13b-5 codex example: a top expert replaced by the lowest-scoring one
+    // a top expert replaced by the lowest-scoring one
     assert!(route_self_check(&[1, 4], &b, 2).is_err());
     assert!(route_self_check(&[1], &b, 2).is_err());
 }
