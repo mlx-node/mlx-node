@@ -38,7 +38,7 @@
     "@std/toml": "npm:@jsr/std__toml@^1.0.11",
     "@types/node": "^26.4.0",
     "octokit": "^5.0.5",
-    "openai": "7.45.0",
+    "openai": "7.45.1",
     "oxc-parser": "^0.156.0",
     "prettier": "^3.9.6",
     "typescript": "^7.0.2",
