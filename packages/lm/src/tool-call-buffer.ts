@@ -30,6 +30,7 @@ export class ToolCallTagBuffer {
     '<|turn>',
     '<turn|>',
     '<|tool_call_start|>',
+    '<｜DSML｜ calls>',
   ] as const;
 
   private pendingText = '';

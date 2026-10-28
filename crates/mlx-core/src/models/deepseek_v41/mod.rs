@@ -7,6 +7,7 @@ pub mod cache;
 pub mod chat;
 pub mod compressor;
 pub mod config;
+mod dsml;
 pub mod engram;
 pub mod engram_hash;
 #[cfg(test)]

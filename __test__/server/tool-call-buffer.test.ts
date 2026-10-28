@@ -107,6 +107,32 @@ describe('ToolCallTagBuffer', () => {
     expect(recoverSuppressedToolCallText('<|tool_call_start|>[f()]')).toBe('');
   });
 
+  it('suppresses a DeepSeek-V4.1 DSML block at every split point', () => {
+    // encoding.py's V41_TOOL_CALL_OUTPUT content (after </think>).
+    const content =
+      'summary\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="lookup">\n' +
+      '<｜DSML｜ parameter name="query" string="true">value</｜DSML｜ parameter>\n' +
+      '</｜DSML｜ invoke>\n</｜DSML｜ calls>';
+    for (let cut = 0; cut <= content.length; cut++) {
+      const buffer = new ToolCallTagBuffer();
+      const first = buffer.push(content.slice(0, cut));
+      const second = buffer.push(content.slice(cut));
+      const released = first.safeText + second.safeText + buffer.flush();
+      // The newline run before the tag is released; the final parsed text
+      // (`summary`) is a substring of it, so the done-path adds nothing.
+      expect(released + first.cleanPrefix + second.cleanPrefix).toBe('summary\n\n');
+      expect(buffer.suppressed).toBe(true);
+    }
+    // One chunk per character, as a byte-level stream may deliver it.
+    const buffer = new ToolCallTagBuffer();
+    let released = '';
+    for (const ch of content) {
+      const pushed = buffer.push(ch);
+      released += pushed.safeText + pushed.cleanPrefix;
+    }
+    expect(released + buffer.flush()).toBe('summary\n\n');
+  });
+
   it('drops the LFM2 echoed call body during tools-disallowed recovery', () => {
     // The echo is capped by a second end sentinel: recovery must drop
     // through the LAST end, not leak the `[f()]` echo as visible text.

@@ -138,9 +138,24 @@ const reply = await session.send('Explain in one sentence why the sky is blue.',
 
 Scope: text only, inference only, one sequence per model (flat whole-turn
 lane, no paged cache, no scheduler), context capped at 16,384 tokens, no MTP or
-draft model. `reasoningEffort` maps to the template's effort levels (`none` =
-chat mode, `minimal` → `low`, `xhigh` → `max`). DSML tool calls come back as
-text; they are not parsed into tool-call events yet.
+draft model. `reasoningEffort` maps to the reference encoder's scores (`none` =
+chat mode, `minimal`/`low` = 50, `medium`/`high`/`xhigh` = 75, `max` = 100).
+
+Tools: pass `tools` as for any family. Tool prompts are byte-equal to the
+model's `encoding.py` goldens and to deepseek-recipe's dsv41 encoder on the
+tested cases (tool schemas, `<tool_result>` blocks, reasoning kept in history
+once tools are present); there is no `tool_choice`. The model's DSML block
+(`<｜DSML｜ calls>…</｜DSML｜ calls>`) comes back as `toolCalls`
+(`finishReason: 'tool_calls'`), cut at the emitted `</think>` / `｜DSML｜` ids:
+`string="true"` values are strings, `string="false"` values JSON (a value that
+is not JSON gives that call `invalid_json`; broken markup gives one
+`parse_error` call carrying the raw block). Text the model writes after the
+block is dropped, as the recipe's parser does. A literal marker in caller text
+(`<｜User｜>`, `<think>`, `｜DSML｜`, …) is replaced by a space before
+rendering, so it never becomes a control token. Several invokes in one turn
+come back as several calls; `ChatSession` serves one call per turn, so it then
+refuses `send` and `sendToolResult` until `reset()` or `primeHistory()` +
+`startFromHistory*()` with every result resolved.
 
 How it fits in memory:
 

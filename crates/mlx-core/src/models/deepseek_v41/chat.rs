@@ -15,9 +15,12 @@ use super::model::{Session, Trace};
 use super::stats::{self, Counters};
 use super::store::{CachePlan, Store};
 use crate::array::{DType, MxArray};
-use crate::engine::backend::{ChatBackend, DecodeStep, ResetScope, SaveStateArgs, TurnSetup};
+use crate::engine::backend::{
+    ChatBackend, DecodeStep, FinalizeArgs, ResetScope, SaveStateArgs, TurnSetup,
+};
 use crate::engine::model_command::{ModelCommand, handle_model_command};
 use crate::engine::params::ThinkingPolicy;
+use crate::engine::types::ChatResult;
 use crate::model_thread::{LoopControl, ModelThread};
 use crate::moe_stream::budget::{Admission, Limits};
 use crate::stream::{Stream, StreamContext};
@@ -134,6 +137,7 @@ pub(crate) struct Inner {
     sess: Session,
     tokenizer: Arc<Qwen3Tokenizer>,
     eos: u32,
+    dsml: Option<u32>,
     saved: Vec<u32>,
     cancel: Option<Arc<AtomicBool>>,
     in_turn: bool,
@@ -167,11 +171,13 @@ impl Inner {
         residency: Arc<Mutex<Residency>>,
     ) -> Self {
         let sess = store.model.new_session();
+        let dsml = tokenizer.token_to_id(super::dsml::DSML.to_string());
         let mut inner = Self {
             store,
             sess,
             tokenizer: Arc::new(tokenizer),
             eos,
+            dsml,
             saved: Vec::new(),
             cancel: None,
             in_turn: false,
@@ -356,6 +362,11 @@ impl ChatBackend for Inner {
 
     fn cached_token_history(&self) -> &[u32] {
         &self.saved
+    }
+
+    /// DSML tool calls, split at the emitted `</think>` and `｜DSML｜` ids.
+    fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
+        super::dsml::finalize(args, self.dsml)
     }
 
     fn reset_caches(&mut self, _scope: ResetScope) -> Result<()> {
