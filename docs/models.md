@@ -128,10 +128,9 @@ the first one. The tokenizer and chat template come from the GGUF header; no
 other files are needed and nothing is written to disk.
 
 ```typescript
-import { loadModel, ChatSession } from '@mlx-node/lm';
+import { loadSession } from '@mlx-node/lm';
 
-const model = await loadModel('/models/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf');
-const session = new ChatSession(model);
+const session = await loadSession('/models/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf');
 const reply = await session.send('Explain in one sentence why the sky is blue.', {
   config: { temperature: 0, maxNewTokens: 64, reasoningEffort: 'none' },
 });
@@ -163,8 +162,12 @@ Output does not depend on the cache: each (row, expert) output is computed on
 its own and summed in a fixed order, so any cache size, cache policy, read
 order or row skip gives bitwise the same logits as the staging-only path. The
 math follows the DeepSeek 1017 reference (fp32 router, activation fake-quant at
-the reference's sites). For reference-exact numerics set `MLX_ENABLE_TF32=0`
-before the process's first matmul; the load does not change it for you.
+the reference's sites). The default dense path (`MLX_DSV41_DENSE=q8`) runs
+`quantized_matmul` on the Q8_0 codes, so its rounding differs from the
+reference (its greedy ids were checked equal to the reference's on the test
+prompts). For reference-exact numerics set both `MLX_DSV41_DENSE=exact` and
+`MLX_ENABLE_TF32=0` before the process's first matmul; the load does not change
+TF32 for you.
 
 The admission runs again at every turn. If other apps grew, the expert cache is
 dropped to staging only (never shrunk in place); if memory came back, it is
