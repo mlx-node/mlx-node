@@ -201,3 +201,140 @@ fn real_prefill_timing() {
     }
     finish("real_prefill_timing", &fails);
 }
+
+/// Host argmax, ties to the lowest index (the engine's T=0 pick).
+fn p5_argmax(v: &[f32]) -> u32 {
+    let mut best = 0;
+    for (i, &x) in v.iter().enumerate() {
+        if x > v[best] {
+            best = i;
+        }
+    }
+    best as u32
+}
+
+// Stage P5 gate: per prompt T (`DSV41_SKIP_TS`, default 4096,8192), the
+// last-row prefill with the long-prompt layer skip off and on
+// (`DSV41_SKIP_ARMS`, default off,on, order reversed per T: ABBA), each cold
+// (every tag and cache entry forgotten), then `DSV41_SKIP_DECODE` (default
+// 64) greedy one-token steps on the same session. Every arm's prefill
+// logits row, decode logits rows and ids must equal the first arm's
+// bitwise. Prints TTFT, decode tok/s, FFN rows computed and expert reads.
+#[test]
+#[ignore = "real 9 shards + $DSV41_PROMPTS; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=<N_auto>; ~19 GiB + N_auto + compute(T); ~0.3 TB read per prompt"]
+fn real_skip_bitwise() {
+    assert!(s16_env(CACHE_ENV).is_some(), "{CACHE_ENV} = N_auto (cap)");
+    let ts: Vec<usize> = s16_env("DSV41_SKIP_TS")
+        .unwrap_or_else(|| "4096,8192".into())
+        .split(',')
+        .map(|v| v.trim().parse().unwrap())
+        .collect();
+    let arms: Vec<String> = s16_env("DSV41_SKIP_ARMS")
+        .unwrap_or_else(|| "off,on".into())
+        .split(',')
+        .map(|v| v.trim().to_owned())
+        .collect();
+    let n_dec: usize = s16_env("DSV41_SKIP_DECODE").map_or(64, |v| v.parse().unwrap());
+    let mut store = s16_store(CachePlan::Admit(Limits::from_env().unwrap()));
+    let (n_layers, vocab) = (store.model.cfg.n_layers, store.model.cfg.vocab_size);
+    store.begin_turn().unwrap();
+    println!("touch bank {:.2} s", s16_touch_bank(&store));
+    let mut fails: Vec<String> = Vec::new();
+    let mut rows: Vec<Value> = Vec::new();
+    for (ti, &t) in ts.iter().enumerate() {
+        let ids = p4_prompt(t);
+        // the admitted context is the v1 limit; a 16K prompt's decode steps
+        // pass it (compute is the prompt's; KV grows by ~6 KiB per token)
+        let limit = store.model.ctx_limit;
+        if limit.is_some_and(|l| t + n_dec > l) {
+            store.model.ctx_limit = Some(t + n_dec);
+        }
+        let mut order = arms.clone();
+        if ti % 2 == 1 {
+            order.reverse();
+        }
+        let mut want: Option<(Vec<String>, Vec<u32>)> = None;
+        for arm in &order {
+            store.model.layer_skip = match arm.as_str() {
+                "on" => true,
+                "off" => false,
+                a => panic!("unknown arm {a}"),
+            };
+            let froms: Vec<usize> = (0..n_layers)
+                .map(|l| if store.model.layer_skip { store.model.skip_from(l, t) } else { 0 })
+                .collect();
+            store.bank.test_forget_all();
+            crate::array::synchronize();
+            let c0 = Counters::now(&store.bank);
+            let mut sess = store.model.new_session();
+            let mut trace = super::model::Trace::default();
+            let t0 = std::time::Instant::now();
+            let l = store
+                .model
+                .forward_last(&mut sess, &ids, None, Some(&mut trace))
+                .unwrap();
+            let row = read(&l);
+            let ttft = t0.elapsed().as_secs_f64();
+            let c = Counters::now(&store.bank).since(&c0);
+            let ffn_rows: usize = trace.routes.iter().map(|r| r.rows()).sum();
+            let mut hashes = vec![hex_sha(&row[row.len() - vocab..])];
+            let mut picks = vec![p5_argmax(&row[row.len() - vocab..])];
+            let t1 = std::time::Instant::now();
+            for _ in 0..n_dec {
+                let id = *picks.last().unwrap();
+                let r = read(&store.model.forward_last(&mut sess, &[id], None, None).unwrap());
+                hashes.push(hex_sha(&r[r.len() - vocab..]));
+                picks.push(p5_argmax(&r[r.len() - vocab..]));
+            }
+            let dec_s = t1.elapsed().as_secs_f64();
+            match &want {
+                None => want = Some((hashes.clone(), picks.clone())),
+                Some((wh, wp)) => {
+                    if wh[0] != hashes[0] {
+                        fails.push(format!("T={t} arm {arm}: prefill logits {} != {}", hashes[0], wh[0]));
+                    }
+                    let bad = wh.iter().zip(&hashes).skip(1).filter(|(a, b)| a != b).count();
+                    if bad > 0 || wp != &picks {
+                        fails.push(format!("T={t} arm {arm}: {bad} of {n_dec} decode rows differ, ids equal {}", wp == &picks));
+                    }
+                }
+            }
+            let v = json!({
+                "T": t, "arm": arm, "ttft_s": ttft, "prefill_tok_s": t as f64 / ttft,
+                "decode_tokens": n_dec, "decode_s": dec_s,
+                "decode_tok_s": n_dec as f64 / dec_s.max(1e-9),
+                "ffn_rows": ffn_rows, "ffn_rows_full": n_layers * t,
+                "skip_from": froms,
+                "read_experts": c.fill_slots, "read_gb": c.fill_bytes as f64 / 1e9,
+                "io_s": c.fill_ns as f64 * 1e-9, "io_wait_s": c.fill_wait_ns as f64 * 1e-9,
+                "engram_gb": c.engram_bytes as f64 / 1e9,
+                "prefill_hash": hashes[0], "last_decode_hash": hashes.last(),
+                "ids": picks,
+                "mlx_cache_gib": crate::array::get_cache_memory() / S16_GIB,
+                "footprint_gib": super::stats::rusage().0 as f64 / S16_GIB,
+            });
+            println!("p5 skip {v}");
+            rows.push(v);
+            if crate::array::get_cache_memory() > 2.0 * S16_GIB {
+                fails.push(format!("T={t}: MLX cache > 2 GiB (rule 11)"));
+            }
+        }
+        store.model.ctx_limit = limit;
+    }
+    store.end_turn().unwrap();
+    let out = json!({
+        "cache_slots": store.cache_slots(),
+        "staging_layers": store.bank.staging_layers(),
+        "admission": store.admission().map(|a| a.to_string()),
+        "rows": rows,
+    });
+    if let Some(dir) = s16_env("DSV41_CACHE_OUT") {
+        let name = s16_env("DSV41_SKIP_NAME").unwrap_or_else(|| "p5-skip".into());
+        std::fs::write(
+            PathBuf::from(dir).join(format!("{name}.json")),
+            serde_json::to_vec_pretty(&out).unwrap(),
+        )
+        .unwrap();
+    }
+    finish("real_skip_bitwise", &fails);
+}

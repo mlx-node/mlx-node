@@ -130,6 +130,20 @@ pub fn staging_from_env() -> Result<usize> {
     }
 }
 
+/// Long-prompt layer skip in the last-row prefill (stage P5): `on`
+/// (default) | `off`.
+pub const SKIP_ENV: &str = "MLX_DSV41_SKIP";
+
+/// `MLX_DSV41_SKIP`; unset or empty = on (DECISIONS P5); anything else than
+/// on / off is refused.
+pub fn skip_from_env() -> Result<bool> {
+    match std::env::var(SKIP_ENV).ok().as_deref().map(str::trim) {
+        None | Some("") | Some("on") => Ok(true),
+        Some("off") => Ok(false),
+        Some(v) => Err(bad(format!("{SKIP_ENV}={v}: want on or off"))),
+    }
+}
+
 pub fn split_from_env() -> Result<bool> {
     match std::env::var(SPLIT_ENV).ok().as_deref().map(str::trim) {
         None | Some("") | Some("on") => Ok(true),
@@ -565,6 +579,7 @@ impl Store {
             };
         // the admission's KV / compute terms hold up to this context only
         model.ctx_limit = Some(size.ctx as usize);
+        model.layer_skip = skip_from_env()?;
         let guard =
             coordinator().register_with_cache_limit(dense_bytes + bank.nbytes(), Some(POOL_LIMIT));
         Ok(Self {

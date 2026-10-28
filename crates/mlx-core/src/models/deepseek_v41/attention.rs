@@ -196,6 +196,19 @@ impl WindowAttention {
     /// `x` `[s, dim]` at positions `start..start + s` -> `[s, dim]`; appends
     /// this chunk's KV to `cache` (any chunk size, any `start`).
     pub fn forward(&self, x: &MxArray, start: usize, cache: &mut WindowCache) -> Result<MxArray> {
+        self.forward_from(x, start, cache, 0)
+    }
+
+    /// `forward` whose query rows below `from` are not needed by anyone
+    /// (stage P5): their attention chunks are skipped and give zeros. Every
+    /// row's KV is still appended.
+    pub fn forward_from(
+        &self,
+        x: &MxArray,
+        start: usize,
+        cache: &mut WindowCache,
+        from: usize,
+    ) -> Result<MxArray> {
         let s = x.shape_at(0)? as usize;
         let tp = prof_start();
         let (cos, sin) = self.rope(start, s)?;
@@ -217,6 +230,7 @@ impl WindowAttention {
             &self.w.sink,
             self.scale,
             &mut peak,
+            from,
         )?;
         prof_end(Phase::Sparse, tp, &[&o])?;
         let tp = prof_start();
@@ -258,6 +272,10 @@ pub fn sparse_row_bytes(kmax: usize, h: usize, d: usize) -> usize {
 /// in the denominator only, P cast to the activation dtype before `P @ V`.
 /// Rows go in chunks of at most 256 within `SPARSE_CHUNK_BYTES`, each
 /// evaluated before the next; `peak` records the largest chunk's bytes.
+/// A chunk whose rows all sit below `from` is not computed (zeros): the
+/// chunk grid stays the same, so a computed row's bits do not depend on
+/// `from`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sparse_sink_attention(
     q: &MxArray,
     keys: &MxArray,
@@ -266,6 +284,7 @@ pub(crate) fn sparse_sink_attention(
     sink: &MxArray,
     scale: f32,
     peak: &mut usize,
+    from: usize,
 ) -> Result<MxArray> {
     let act = q.dtype()?;
     let (s, h, d) = (q.shape_at(0)? as usize, q.shape_at(1)?, q.shape_at(2)?);
@@ -276,7 +295,7 @@ pub(crate) fn sparse_sink_attention(
     }
     let kf = keys.astype(DType::Float32)?;
     let row = sparse_row_bytes(kmax, h as usize, d as usize);
-    let rows = chunk_rows(row, SPARSE_CHUNK_BYTES);
+    let rows = super::block::chunk_cap(chunk_rows(row, SPARSE_CHUNK_BYTES));
     let neg_inf = MxArray::from_float32(&[f32::NEG_INFINITY], &[1])?;
     let floor = MxArray::from_float32(&[-1e30], &[1])?;
     let zero = MxArray::from_int32(&[0], &[1])?;
@@ -286,6 +305,11 @@ pub(crate) fn sparse_sink_attention(
     while lo < s {
         let hi = (lo + rows).min(s);
         let c = (hi - lo) as i64;
+        if hi <= from {
+            outs.push(MxArray::zeros(&[c, h, d], Some(act))?);
+            lo = hi;
+            continue;
+        }
         *peak = (*peak).max((hi - lo) * row);
         let part = &idx[lo * kmax..hi * kmax];
         let gid: Vec<i32> = part.iter().map(|&j| j.max(0)).collect();
@@ -425,6 +449,22 @@ impl CompressedAttention {
         src: &mut CompressedCache,
         shared: &mut ForwardShared,
     ) -> Result<(MxArray, Option<Vec<f32>>)> {
+        self.forward_from(x, start, win, src, shared, 0)
+    }
+
+    /// `forward` whose query rows below `from` are not needed by anyone
+    /// (stage P5): their indexer and attention chunks are skipped (top-k
+    /// `-1`, no candidate block, zero output). The compressor and the index
+    /// keys still take every row.
+    pub fn forward_from(
+        &self,
+        x: &MxArray,
+        start: usize,
+        win: &mut WindowCache,
+        src: &mut CompressedCache,
+        shared: &mut ForwardShared,
+        from: usize,
+    ) -> Result<(MxArray, Option<Vec<f32>>)> {
         let s = x.shape_at(0)? as usize;
         let end = start + s;
         let t = end / self.ratio;
@@ -499,6 +539,7 @@ impl CompressedAttention {
                     &mut shared.candidates,
                     &mut peak,
                     self.export_scores,
+                    from,
                 )?;
                 self.scratch_peak.fetch_max(peak, Ordering::Relaxed);
                 scores = sc;
@@ -559,6 +600,7 @@ impl CompressedAttention {
             &self.core.w.sink,
             self.core.scale,
             &mut peak,
+            from,
         )?;
         self.scratch_peak.fetch_max(peak, Ordering::Relaxed);
         prof_end(Phase::Sparse, tp, &[&o])?;

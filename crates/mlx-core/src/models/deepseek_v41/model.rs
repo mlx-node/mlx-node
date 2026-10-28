@@ -84,6 +84,9 @@ pub struct Model {
     /// Context limit a call may reach (session tokens + call ids); the store
     /// sets the admitted context (D-24), `None` = no limit.
     pub ctx_limit: Option<usize>,
+    /// Stage P5 long-prompt layer skip in `forward_last` (bitwise, see
+    /// `skip_from`); `MLX_DSV41_SKIP=off` turns it off (A/B).
+    pub layer_skip: bool,
 }
 
 impl Model {
@@ -137,7 +140,30 @@ impl Model {
             table,
             cfg,
             ctx_limit: None,
+            layer_skip: true,
         })
+    }
+
+    /// Stage P5: the first row of layer `l`'s output that anyone reads when
+    /// only the call's last row needs logits (`s` rows). From the last
+    /// layer that compresses its own KV (`z`, the last compressor and
+    /// index-key owner) on, a layer's per-row output feeds only the next
+    /// layers' queries and their window KV: the last layer needs 1 row,
+    /// each layer below it 127 (window - 1) more, so layer `l >= z` needs
+    /// `1 + (n_layers - 1 - l) * (window - 1)` rows. The compressor, index
+    /// keys and window KV take every row's INPUT, never a skipped output,
+    /// so the session state and every later call are unchanged (oracle
+    /// proof: DECISIONS P5-1). 0 = all rows.
+    pub fn skip_from(&self, l: usize, s: usize) -> usize {
+        let c = &self.cfg;
+        let Some(z) = (0..c.n_layers).filter(|&k| c.kv_src[k] == Some(k)).max() else {
+            return 0;
+        };
+        if l < z || l >= c.n_layers || c.window_size == 0 {
+            return 0;
+        }
+        let need = 1 + (c.n_layers - 1 - l) * (c.window_size - 1);
+        s.saturating_sub(need)
     }
 
     /// Index sources return their scores into `Trace::index_scores`
@@ -270,6 +296,7 @@ impl Model {
             &mut shared,
             cancel,
             trace,
+            last_only && self.layer_skip,
         )?;
         let tp = super::stats::prof_start();
         let x = rms_norm(&hc_pre(&h, &pre_mix)?, &self.norm, self.cfg.norm_eps)?
@@ -300,8 +327,11 @@ impl Model {
         shared: &mut ForwardShared,
         cancel: Option<&dyn Fn(usize) -> bool>,
         mut trace: Option<&mut Trace>,
+        skip: bool,
     ) -> Result<(MxArray, MxArray)> {
         let end = layers.end;
+        let s = h.shape_at(0)? as usize;
+        let from = |l: usize| if skip { self.skip_from(l, s) } else { 0 };
         for l in layers {
             let blk = &self.blocks[l];
             if cancel.is_some_and(|c| c(l)) {
@@ -325,9 +355,17 @@ impl Model {
                 Some(k) if self.cfg.compress_ratios[l] != 0 => sess.sources[k].as_mut(),
                 _ => None,
             };
-            let next = (l + 1 < end).then(|| &self.blocks[l + 1].moe);
-            let (x, pm, routes, scores) =
-                blk.forward(&h, start, &pre_mix, &mut sess.wins[l], src, shared, next)?;
+            let next = (l + 1 < end).then(|| (&self.blocks[l + 1].moe, from(l + 1)));
+            let (x, pm, routes, scores) = blk.forward(
+                &h,
+                start,
+                &pre_mix,
+                &mut sess.wins[l],
+                src,
+                shared,
+                next,
+                from(l),
+            )?;
             MxArray::eval_arrays_with_context(&[&x, &pm], "deepseek_v41 block")?;
             (h, pre_mix) = (x, pm);
             if let Some(t) = trace.as_deref_mut() {
@@ -400,6 +438,7 @@ impl Model {
             &mut shared,
             cancel,
             trace,
+            false,
         );
         match out {
             Ok(v) => {

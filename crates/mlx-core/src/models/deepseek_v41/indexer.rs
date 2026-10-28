@@ -208,6 +208,7 @@ impl Indexer {
         cands: &mut Option<Candidates>,
         scratch_peak: &mut usize,
         keep_scores: bool,
+        from: usize,
     ) -> Result<(Option<Vec<f32>>, TopK)> {
         let s = x.shape_at(0)? as usize;
         let t = index_k.shape_at(0)? as usize;
@@ -238,11 +239,23 @@ impl Indexer {
             }
             _ => None,
         };
-        let rows = chunk_rows(self.row_bytes(t), INDEX_CHUNK_BYTES);
+        let rows = super::block::chunk_cap(chunk_rows(self.row_bytes(t), INDEX_CHUNK_BYTES));
         let (wx, wq, wr) = (x.shape_at(1)?, qr.shape_at(1)?, cos.shape_at(1)?);
         let mut lo = 0;
         while lo < s {
             let hi = (lo + rows).min(s);
+            if hi <= from {
+                // stage P5: no later reader needs these query rows; same
+                // chunk grid, so the computed rows keep their bits
+                let n = hi - lo;
+                ids.extend(std::iter::repeat_n(-1, n * kk));
+                keep_all.extend(std::iter::repeat_n(false, n * n_blocks));
+                if let Some(sc) = scores.as_mut() {
+                    sc.extend(std::iter::repeat_n(f32::NEG_INFINITY, n * t));
+                }
+                lo = hi;
+                continue;
+            }
             *scratch_peak = (*scratch_peak).max((hi - lo) * self.row_bytes(t));
             let r = |a: &MxArray, w: i64| a.slice(&[lo as i64, 0], &[hi as i64, w]);
             let sc =

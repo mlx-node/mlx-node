@@ -17,6 +17,31 @@ use crate::array::MxArray;
 /// FFN rows per chunk: the routed scratch is `rows x k x (2 inter + dim)`.
 pub const FFN_CHUNK_ROWS: i64 = 256;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_CHUNK_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `rows`, or the test cap on every row-chunk loop (FFN, sparse attention,
+/// indexer) of this thread: tiny prompts fit one chunk otherwise, which
+/// leaves the stage-P5 chunk skip nothing to skip.
+pub(crate) fn chunk_cap(rows: usize) -> usize {
+    #[cfg(test)]
+    {
+        let c = TEST_CHUNK_ROWS.with(|c| c.get());
+        if c > 0 {
+            return rows.min(c);
+        }
+    }
+    rows
+}
+
+/// Test hook for `chunk_cap` (this thread; 0 = off).
+#[cfg(test)]
+pub(crate) fn set_test_chunk_rows(n: usize) {
+    TEST_CHUNK_ROWS.with(|c| c.set(n));
+}
+
 pub enum Attn {
     Window(Box<WindowAttention>),
     Compressed(Box<CompressedAttention>),
@@ -109,7 +134,13 @@ impl Block {
     /// `x` `[s, hc, dim]` at `start..start + s` with `pre_mix` `[s, hc]` ->
     /// (`x`, this FFN's `pre` for the next block, the routes, the index
     /// scores when the attention exports them). `src` is the
-    /// layer's KV source cache (compressed layers only).
+    /// layer's KV source cache (compressed layers only). Stage P5: output
+    /// rows below `from` are not needed by anyone; the attention and FFN
+    /// chunks that hold only such rows are skipped (their output rows are
+    /// stale, never read), every other op still runs on all `s` rows so a
+    /// needed row's bits do not depend on `from`. `next` is the next
+    /// layer's FFN and its own `from` (read-ahead prediction rows).
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         x: &MxArray,
@@ -118,15 +149,18 @@ impl Block {
         win: &mut WindowCache,
         src: Option<&mut CompressedCache>,
         shared: &mut ForwardShared,
-        next: Option<&Moe>,
+        next: Option<(&Moe, usize)>,
+        from: usize,
     ) -> Result<(MxArray, MxArray, Routes, Option<Vec<f32>>)> {
         let tp = prof_start();
         let (attn_pre, attn_post, attn_comb) = self.mixes(x, &self.hc_attn)?;
         let a = rms_norm(&hc_pre(x, pre_mix)?, &self.attn_norm, self.eps)?;
         prof_end(Phase::Hc, tp, &[&attn_pre, &attn_post, &attn_comb, &a])?;
         let (a, scores) = match (&self.attn, src) {
-            (Attn::Window(w), _) => (w.forward(&a, start, win)?, None),
-            (Attn::Compressed(c), Some(src)) => c.forward(&a, start, win, src, shared)?,
+            (Attn::Window(w), _) => (w.forward_from(&a, start, win, from)?, None),
+            (Attn::Compressed(c), Some(src)) => {
+                c.forward_from(&a, start, win, src, shared, from)?
+            }
             (Attn::Compressed(_), None) => {
                 return Err(napi::Error::from_reason(format!(
                     "layer {}: compressed attention without its source cache",
@@ -142,10 +176,13 @@ impl Block {
         prof_end(Phase::Hc, tp, &[&x, &ffn_pre, &ffn_post, &ffn_comb, &f])?;
         let (s, dim) = (f.shape_at(0)?, f.shape_at(1)?);
         // stage P4: the next layer's experts are read while this one computes
-        if let Some(nx) = next
+        if let Some((nx, nfrom)) = next
             && s > 1
         {
-            nx.prefetch_from(&f)?;
+            // from the first FFN chunk the next layer will run
+            let chunk = chunk_cap(FFN_CHUNK_ROWS as usize) as i64;
+            let lo = (nfrom as i64 / chunk * chunk).min(s - 1);
+            nx.prefetch_from(&f.slice(&[lo, 0], &[s, dim])?)?;
         }
         let mut outs = Vec::new();
         let mut routes = Routes {
@@ -154,9 +191,15 @@ impl Block {
             weights: Vec::new(),
             biased: Vec::new(),
         };
+        let chunk = chunk_cap(FFN_CHUNK_ROWS as usize) as i64;
         let mut lo = 0;
         while lo < s {
-            let hi = (lo + FFN_CHUNK_ROWS).min(s);
+            let hi = (lo + chunk).min(s);
+            if hi as usize <= from {
+                outs.push(MxArray::zeros(&[hi - lo, dim], Some(f.dtype()?))?);
+                lo = hi;
+                continue;
+            }
             let (y, r) = self.moe.forward(&f.slice(&[lo, 0], &[hi, dim])?)?;
             MxArray::eval_arrays_with_context(&[&y], "deepseek_v41 ffn chunk")?;
             routes.ids.extend(r.ids);

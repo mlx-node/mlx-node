@@ -697,11 +697,13 @@ impl StagingBank {
             self.begin(&mut g)?;
         }
         // an earlier step's reads (a `Pending` kept past its step) must be in
-        // before this step re-plans their slots; a prefetch is tagged here
-        // (this layer's and older ones; a later layer's stays in flight)
+        // before this step re-plans their slots; every prefetch but the next
+        // layer's (the other half) is tagged here, before this step writes:
+        // after a cancelled forward a read ahead of a later layer of this
+        // half can still be in flight (P4 codex [high])
         let t_ahead = Instant::now();
-        let had_ahead = g.ahead.iter().any(|a| a.layer <= layer);
-        self.settle_ahead(&mut g, |l| l <= layer);
+        let had_ahead = g.ahead.iter().any(|a| a.layer != layer + 1);
+        self.settle_ahead(&mut g, |l| l != layer + 1);
         let ahead_wait = if had_ahead {
             t_ahead.elapsed().as_nanos() as u64
         } else {
@@ -845,10 +847,10 @@ impl StagingBank {
         if !g.in_turn {
             self.begin(&mut g)?;
         }
-        // a read ahead of this layer already, or of a layer writing the same
-        // half (`layer - 2` and older), is settled first; the previous
-        // layer's (other half) stays in flight
-        self.settle_ahead(&mut g, |l| l == layer || l + 1 < layer);
+        // every read ahead but the previous layer's (the other half) is
+        // settled first: this layer's, older ones and, after a cancelled
+        // forward, later ones writing the same half
+        self.settle_ahead(&mut g, |l| l + 1 != layer);
         let n = self.n_experts;
         let want: Vec<u32> = experts
             .iter()

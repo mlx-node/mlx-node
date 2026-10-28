@@ -994,3 +994,131 @@ fn tiny_rebuild_waits_for_reads_in_flight() {
     let (got, _) = run(&s.model, &case_ids(&npz, case), &split(case));
     assert_eq!(bits(&got), bits(&want));
 }
+
+/// P4 codex [high]: a forward cancelled before layer 2 leaves layer 2's read
+/// ahead (staging half 0) unsettled; the retry's layer-0 step writes the same
+/// half. Every step now settles every read ahead but the next layer's
+/// before it writes, so the retry's logits equal a clean store's bitwise
+/// (old rule `l <= layer`: layer 2 tagged slots that layer 0 had refilled).
+#[test]
+fn tiny_cancel_retry_settles_read_ahead() {
+    use crate::moe_stream::bank::PrefetchMode;
+    let npz = Npz::open("oracle.npz");
+    let c1 = case_ids(&npz, "c1");
+    let reference = cached_store_in("fp32_on", 0, CacheMode::Seeded);
+    let mut rs = reference.model.new_session();
+    let want = bits(&read(
+        &reference.model.forward(&mut rs, &c1, None, None).unwrap(),
+    ));
+    for pm in [PrefetchMode::Pred, PrefetchMode::All] {
+        let s = cached_store_in("fp32_on", 0, CacheMode::Seeded);
+        s.bank.rebuild_staging(0, 2).unwrap();
+        s.bank.set_prefetch_mode(pm);
+        let mut sess = s.model.new_session();
+        let cancel = |l: usize| l == 2;
+        assert!(
+            s.model
+                .forward(&mut sess, &c1, Some(&cancel), None)
+                .is_err()
+        );
+        assert!(
+            sess.tokens.is_empty(),
+            "cancelled call restores the session"
+        );
+        // let the orphaned read ahead land before the retry refills half 0
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let got = bits(&read(&s.model.forward(&mut sess, &c1, None, None).unwrap()));
+        assert_eq!(got, want, "{pm:?}: retry after a cancel != clean store");
+        assert_eq!(s.bank.reads_in_flight(), 0);
+    }
+}
+
+/// Bits of a session's state: window rows, compressed KV / index keys.
+fn session_bits(sess: &Session) -> Vec<Vec<u32>> {
+    let mut out = Vec::new();
+    for w in &sess.wins {
+        out.push(w.rows().map(|r| bits(&read(r))).unwrap_or_default());
+    }
+    for c in sess.sources.iter().flatten() {
+        out.push(vec![c.len as u32]);
+        for a in [&c.kv, &c.index_k] {
+            out.push(a.as_ref().map(|r| bits(&read(r))).unwrap_or_default());
+        }
+    }
+    out
+}
+
+/// Stage P5: the last-row prefill with the long-prompt layer skip gives
+/// the unskipped call's last logits row, the session state after it and
+/// three decode steps bitwise, on the resident model and on the streamed
+/// store (S in {0, 64}, two staging layers + read-ahead), fp32 / bf16. Row
+/// chunks are capped at 1 and 4 rows on this thread so the 24-row prompt
+/// has chunks to skip (tiny: zone from layer 5, rows needed 15 / 8 / 1).
+#[test]
+fn tiny_layer_skip_bitwise() {
+    use crate::models::deepseek_v41::block::set_test_chunk_rows;
+    use crate::moe_stream::bank::PrefetchMode;
+    let (g, npz) = (TinyGguf::open(), Npz::open("oracle.npz"));
+    let c1 = case_ids(&npz, "c1");
+    let s = c1.len();
+    let check = |m: &mut Model, what: &str| {
+        let n = m.cfg.n_layers;
+        let froms: Vec<usize> = (0..n).map(|l| m.skip_from(l, s)).collect();
+        assert_eq!(froms[n - 1], s - 1, "{what}: last layer needs one row");
+        let mut out = Vec::new();
+        for skip in [false, true] {
+            m.layer_skip = skip;
+            let mut sess = m.new_session();
+            let mut tr = Trace::default();
+            let last = bits(&read(
+                &m.forward_last(&mut sess, &c1, None, Some(&mut tr)).unwrap(),
+            ));
+            let after = session_bits(&sess);
+            let rows: usize = tr.routes.iter().map(|r| r.rows()).sum();
+            let dec: Vec<Vec<u32>> = [5u32, 77, 300]
+                .iter()
+                .map(|&id| {
+                    bits(&read(
+                        &m.forward_last(&mut sess, &[id], None, None).unwrap(),
+                    ))
+                })
+                .collect();
+            out.push((last, after, dec, rows, session_bits(&sess)));
+        }
+        let (a, b) = (&out[0], &out[1]);
+        assert_eq!(a.0, b.0, "{what}: prefill last row");
+        assert_eq!(a.1, b.1, "{what}: state after the prefill");
+        assert_eq!(a.2, b.2, "{what}: decode steps");
+        assert_eq!(a.4, b.4, "{what}: state after decode");
+        assert!(
+            b.3 < a.3,
+            "{what}: skip ran {} FFN rows, unskipped {}",
+            b.3,
+            a.3
+        );
+        println!(
+            "{what}: bitwise; FFN rows {} -> {}, from {froms:?}",
+            a.3, b.3
+        );
+    };
+    for mode in ["fp32_on", "bf16_on"] {
+        let (act, fq) = mode_of(mode);
+        for cap in [1usize, 4] {
+            set_test_chunk_rows(cap);
+            let mut resident = tiny(&g, act, fq, true);
+            check(&mut resident, &format!("{mode} cap {cap} resident"));
+            for slots in [0usize, 64] {
+                let mut st = cached_store_in(mode, slots, CacheMode::Seeded);
+                st.bank.rebuild_staging(slots, 2).unwrap();
+                st.bank.set_prefetch_mode(PrefetchMode::Pred);
+                check(
+                    &mut st.model,
+                    &format!("{mode} cap {cap} S={slots} 2 staging pred"),
+                );
+                assert_eq!(st.bank.reads_in_flight(), 0);
+            }
+        }
+        set_test_chunk_rows(0);
+        pool_ok(mode);
+    }
+}
