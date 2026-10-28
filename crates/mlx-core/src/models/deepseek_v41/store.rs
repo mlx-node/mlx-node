@@ -293,9 +293,12 @@ pub const CTX_LIMIT: usize = 16_384;
 /// How many cache slots the bank gets.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CachePlan {
-    /// Staging only, no admission.
+    /// Staging only, no admission (tests: the admission is the one memory
+    /// gate of a product load).
+    #[cfg(test)]
     Off,
     /// Exactly this many cache slots, no admission (tests).
+    #[cfg(test)]
     Slots(usize),
     /// S15 admission at load and at every turn start.
     Admit(Limits),
@@ -349,6 +352,7 @@ fn header(path: &Path) -> Result<GgufFile> {
 
 impl Store {
     /// Staging only (`CachePlan::Off`).
+    #[cfg(test)]
     pub fn open(paths: &[PathBuf], act: DType, fq: FakeQuant) -> Result<Self> {
         Self::open_with(paths, act, fq, CachePlan::Off)
     }
@@ -393,7 +397,9 @@ impl Store {
                 tracing::info!("deepseek_v41 admission at load: {a}");
                 (a.cache_slots as usize, Some(a))
             }
+            #[cfg(test)]
             CachePlan::Off => (0, None),
+            #[cfg(test)]
             CachePlan::Slots(n) => (*n, None),
         };
         let shards = Arc::new(ShardSet::open(paths)?);
