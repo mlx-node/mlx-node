@@ -312,8 +312,10 @@ measured cache where decode lost no more than 5 %.
 | 8K                            | 93.49                             | 83.18, 78.77                      | -11 to -16 %               |
 | follow-up turn (63 ids, warm) | 6.49, 6.88, 7.21, 6.97, 6.77      | 7.60, 7.55, 7.79, 7.77, 7.49      | +0.6 to +1.1 s             |
 
-The follow-up turn is slower with 2 layers at every cache size: the read-ahead reads 864-923 experts the 63 rows
-never use.
+The follow-up turn was slower with 2 layers at every cache size: the read-ahead read 864-923 experts the 63 rows
+never used. Calls of fewer than 256 rows now read nothing ahead (cold, one process, 2-layer bank, no read-ahead vs
+read-ahead: 64 rows 7.39, 7.46 vs 7.69, 7.70 s; 256 rows 14.58, 14.56 vs 13.68, 13.69 s; 1K 26.35 vs 17.73 s). With
+that floor the follow-up measured 7.22 s (2 layers, cache 0; no expert read ahead) and the 1K prompt 18.51 s.
 
 ## MTP speculative decoding
 

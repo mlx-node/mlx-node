@@ -170,7 +170,8 @@ token   attention ─► router ─► expert ids to the CPU (one sync per layer
                  the GPU starts on the ready experts while the misses are read
         prefill: layer by layer over the whole prompt; the experts any row needs are read
                  once per layer; with 2 staging layers the next layer's experts are read
-                 ahead from a router prediction (1K TTFT -30 %, 8K -11..-16 %)
+                 ahead from a router prediction for calls of 256+ rows (1K TTFT -30 %,
+                 8K -11..-16 %)
         long prompts: layers 20-39 compute only the rows later layers read (same bits)
 ```
 
