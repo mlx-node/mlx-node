@@ -129,6 +129,85 @@ pub(crate) const MUSE_GLIMMER_CONTROL_MARKERS: &[&str] = &[
     "<|patch|>",
 ];
 
+/// DeepSeek-V4.1's control-marker vocabulary: every named added token of the
+/// checkpoint's tokenizer, in id order (the 1223 `<｜place▁holder▁no▁N｜>` rows
+/// are omitted: inert ids that forge nothing).
+///
+/// The template prints caller text verbatim, and the added-token matcher turns
+/// a literal `<｜User｜>`, `<｜Assistant｜>`, `<｜end▁of▁sentence｜>`, `<think>`,
+/// `</think>` or `｜DSML｜` in it into the real id, so a user or tool message
+/// could close its own turn, open an assistant turn or forge a tool call.
+/// deepseek-recipe encodes caller text without the added vocabulary instead;
+/// the session continuation re-encodes the rendered suffix as text, so that
+/// provenance cannot survive here and the markers are neutralised like every
+/// other family's.
+///
+/// [`Qwen3Tokenizer::detect_control_markers`] hands this list out only when the
+/// V4 fingerprint (`<｜User｜>`, `<｜Assistant｜>`, `｜DSML｜`,
+/// `<｜latest_reminder｜>`) fully resolves.
+pub(crate) const DEEPSEEK_V41_CONTROL_MARKERS: &[&str] = &[
+    "<｜begin▁of▁sentence｜>",
+    "<｜end▁of▁sentence｜>",
+    "<｜▁pad▁｜>",
+    "<｜System｜>",
+    "<｜fim▁hole｜>",
+    "<｜fim▁begin｜>",
+    "<｜fim▁end｜>",
+    "<｜User｜>",
+    "<｜Assistant｜>",
+    "<|EOT|>",
+    "<｜tool▁calls▁begin｜>",
+    "<｜tool▁calls▁end｜>",
+    "<｜tool▁call▁begin｜>",
+    "<｜tool▁call▁end｜>",
+    "<｜tool▁outputs▁begin｜>",
+    "<｜tool▁outputs▁end｜>",
+    "<｜tool▁output▁begin｜>",
+    "<｜tool▁output▁end｜>",
+    "<｜tool▁sep｜>",
+    "<｜begin▁of▁repo▁name｜>",
+    "<｜end▁of▁repo▁name｜>",
+    "<｜begin▁of▁file▁name｜>",
+    "<｜end▁of▁file▁name｜>",
+    "<｜begin▁of▁file｜>",
+    "<｜end▁of▁file｜>",
+    "<think>",
+    "</think>",
+    "｜DSML｜",
+    "<｜begin▁sys｜>",
+    "<｜end▁sys｜>",
+    "<｜latest_reminder｜>",
+    "<｜action｜>",
+    "<｜query｜>",
+    "<｜authority｜>",
+    "<｜domain｜>",
+    "<｜task｜>",
+    "<｜political｜>",
+    "<｜entity｜>",
+    "<｜title｜>",
+    "<｜safety｜>",
+    "<｜answer｜>",
+    "<｜search｜>",
+    "<dsml:",
+    "</dsml:",
+    "<｜search▁begin｜>",
+    "<｜search▁end｜>",
+    "<｜extracted_url｜>",
+    "<｜read_url｜>",
+    "<｜end_of_query｜>",
+    "<｜rl_image_pad｜>",
+    "<｜rl_image_start｜>",
+    "<｜deepseek_image｜>",
+    "<｜/polygon｜>",
+    "<｜polygon｜>",
+    "<｜/point｜>",
+    "<｜point｜>",
+    "<｜/box｜>",
+    "<｜box｜>",
+    "<｜/ref｜>",
+    "<｜ref｜>",
+];
+
 /// K2-Horizon's control-marker vocabulary — every *named* added token in the
 /// shipped `tokenizer.json`, in id order.
 ///
@@ -1696,8 +1775,9 @@ impl Qwen3Tokenizer {
                         // uses: `detect_control_markers` hands out
                         // `MUSE_GLIMMER_CONTROL_MARKERS` for a vocabulary
                         // carrying all 15 Muse markers, `K2_CONTROL_MARKERS`
-                        // for one carrying the four `ifm` specials, and `&[]`
-                        // for everyone else. The gate is
+                        // for one carrying the four `ifm` specials,
+                        // `DEEPSEEK_V41_CONTROL_MARKERS` for the V4 fingerprint,
+                        // and `&[]` for everyone else. The gate is
                         // written out rather than left implicit in an empty loop
                         // because the rule below is ATEM's wire grammar, not a
                         // universal one — a name with a space is perfectly legal for
@@ -2447,6 +2527,15 @@ impl Qwen3Tokenizer {
                 .map_err(|e| format!("Template syntax config error: {e}"))?,
         );
         Self::install_template_helpers(&mut env);
+        // DeepSeek-V4.1 (GGUF template): effort, tool schemas and float
+        // spelling follow deepseek-recipe's dsv41 encoder, which the template
+        // alone does not.
+        let ds41 = template_str.contains("effort_map") && template_str.contains("｜DSML｜");
+        if ds41 {
+            env.add_filter("tojson", |value: minijinja::Value| -> String {
+                to_json_cpython_floats(&value).unwrap_or_else(|| "null".to_string())
+            });
+        }
 
         // Neutralize HuggingFace `{% generation %}` / `{% endgeneration %}`
         // block tags before parsing — minijinja doesn't implement them, and
@@ -2477,8 +2566,14 @@ impl Qwen3Tokenizer {
 
                     let mut func = serde_json::Map::new();
                     func.insert("name".to_string(), serde_json::json!(tool.function.name));
-                    if let Some(desc) = &tool.function.description {
-                        func.insert("description".to_string(), serde_json::json!(desc));
+                    match &tool.function.description {
+                        Some(desc) => {
+                            func.insert("description".to_string(), serde_json::json!(desc));
+                        }
+                        None if ds41 => {
+                            func.insert("description".to_string(), serde_json::json!(""));
+                        }
+                        None => {}
                     }
                     if let Some(params) = &tool.function.parameters {
                         let mut params_obj = serde_json::Map::new();
@@ -2501,6 +2596,8 @@ impl Qwen3Tokenizer {
                             "parameters".to_string(),
                             serde_json::Value::Object(params_obj),
                         );
+                    } else if ds41 {
+                        func.insert("parameters".to_string(), serde_json::json!({}));
                     }
 
                     obj.insert("function".to_string(), serde_json::Value::Object(func));
@@ -2582,10 +2679,10 @@ impl Qwen3Tokenizer {
             // high/max and minimal as explicit aliases only for that template.
             let qwen38 = template_str.contains("resolved_reasoning_effort")
                 && template_str.contains("xhigh");
-            // The DeepSeek-V4.1 template raises on any effort outside
-            // low/medium/high/max (or 1-100); `none` is its chat mode, which
+            // DeepSeek-V4.1 scores efforts 50 / 75 / 100 (deepseek-recipe:
+            // minimal|low, medium|high|xhigh, max); the template's own
+            // `medium` = 62 is not the model's. `none` is its chat mode, which
             // `enable_thinking` below already selects.
-            let ds41 = template_str.contains("effort_map") && template_str.contains("｜DSML｜");
             let effort = if qwen38 {
                 Some(match effort {
                     "minimal" => "low",
@@ -2595,9 +2692,9 @@ impl Qwen3Tokenizer {
             } else if ds41 {
                 match effort {
                     "none" => None,
-                    "minimal" => Some("low"),
-                    "xhigh" => Some("max"),
-                    value => Some(value),
+                    "minimal" | "low" => Some("low"),
+                    "max" => Some("max"),
+                    _ => Some("high"),
                 }
             } else {
                 Some(effort)
@@ -3109,6 +3206,17 @@ impl Qwen3Tokenizer {
         {
             return K2_CONTROL_MARKERS;
         }
+        if [
+            "<｜User｜>",
+            "<｜Assistant｜>",
+            "｜DSML｜",
+            "<｜latest_reminder｜>",
+        ]
+        .iter()
+        .all(|marker| tokenizer.token_to_id(marker).is_some())
+        {
+            return DEEPSEEK_V41_CONTROL_MARKERS;
+        }
         &[]
     }
 
@@ -3337,6 +3445,79 @@ impl serde_json::ser::Formatter for PythonDefaultFormatter {
     ) -> std::io::Result<()> {
         writer.write_all(b": ")
     }
+}
+
+/// [`PythonDefaultFormatter`] plus CPython's spelling of a float below `1e-4`
+/// (`1e-05`, `2.5e-08`, where ryu writes `0.00001`, `2.5e-8`): the one bound
+/// the default formatter leaves. Port of deepseek-recipe's
+/// `PythonStyleFormatter::write_f64` (`deepseek-recipe-core/src/json.rs`, MIT),
+/// registered as `tojson` for the DeepSeek-V4.1 template only, whose reference
+/// encoder writes it.
+struct CpythonFloatFormatter;
+
+impl serde_json::ser::Formatter for CpythonFloatFormatter {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        PythonDefaultFormatter.begin_array_value(writer, first)
+    }
+
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        PythonDefaultFormatter.begin_object_key(writer, first)
+    }
+
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        PythonDefaultFormatter.begin_object_value(writer)
+    }
+
+    fn write_f64<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        value: f64,
+    ) -> std::io::Result<()> {
+        let mut buf = Vec::with_capacity(32);
+        serde_json::ser::CompactFormatter.write_f64(&mut buf, value)?;
+        if !buf.contains(&b'e') {
+            let (sign, rest): (&[u8], &[u8]) = match buf.strip_prefix(b"-") {
+                Some(rest) => (b"-", rest),
+                None => (b"", &buf),
+            };
+            if let Some(fraction) = rest.strip_prefix(b"0.") {
+                let zeros = fraction.iter().take_while(|&&b| b == b'0').count();
+                if let [first_digit, rest_digits @ ..] = &fraction[zeros..]
+                    && zeros >= 4
+                {
+                    writer.write_all(sign)?;
+                    writer.write_all(std::slice::from_ref(first_digit))?;
+                    if !rest_digits.is_empty() {
+                        writer.write_all(b".")?;
+                        writer.write_all(rest_digits)?;
+                    }
+                    return write!(writer, "e-{:02}", zeros + 1);
+                }
+            }
+        } else if let [mantissa @ .., b'e', b'-', digit] = buf.as_slice() {
+            writer.write_all(mantissa)?;
+            return write!(writer, "e-0{}", *digit as char);
+        }
+        writer.write_all(&buf)
+    }
+}
+
+fn to_json_cpython_floats(value: &minijinja::Value) -> Option<String> {
+    let mut buf = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, CpythonFloatFormatter);
+    value.serialize(&mut ser).ok()?;
+    String::from_utf8(buf).ok()
 }
 
 /// Serialize `value` with [`PythonDefaultFormatter`].
@@ -5618,7 +5799,8 @@ mod tests {
                 &hf[offset.saturating_sub(40)..(offset + 40).min(hf.len())],
             );
         }
-        // the template raises outside low/medium/high/max: `none` is chat mode
+        // deepseek-recipe's scores (the template's own medium = 62 is not the
+        // model's); `none` is chat mode
         let user = &separator_probe_messages()[..1];
         let render = |effort: &str, thinking: bool| {
             Qwen3Tokenizer::render_chat_template_jinja2_with_content_order(
@@ -5644,7 +5826,14 @@ mod tests {
             render("none", false),
             "<｜begin▁of▁sentence｜><｜User｜>weather in Paris?<｜Assistant｜></think>"
         );
-        for (effort, budget) in [("minimal", 50), ("medium", 62), ("xhigh", 100)] {
+        for (effort, budget) in [
+            ("minimal", 50),
+            ("low", 50),
+            ("medium", 75),
+            ("high", 75),
+            ("xhigh", 75),
+            ("max", 100),
+        ] {
             let out = render(effort, true);
             assert!(
                 out.contains(&format!("Reasoning Effort: {budget} ")),
