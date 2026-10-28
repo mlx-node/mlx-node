@@ -48,10 +48,7 @@ pub fn read_trace(r: impl BufRead) -> Result<RouteTrace> {
             .map_err(|e| bad(e.to_string()))?,
     )
     .map_err(|e| bad(format!("header: {e}")))?;
-    // the S14a traces written before S14a-2 carry the family's own kind
-    let kind_ok = head["kind"] == "qwen4_exp_expert_route_trace"
-        || head["kind"] == "deepseek_v41_expert_route_trace";
-    if !kind_ok || field(&head, "schema_version")? != 1 {
+    if head["kind"] != "qwen4_exp_expert_route_trace" || field(&head, "schema_version")? != 1 {
         return Err(bad(format!("not a schema-1 route trace: {head}")));
     }
     let mut t = RouteTrace {
@@ -219,7 +216,7 @@ pub fn cache_for(t: &RouteTrace, slots: usize) -> Cache {
 }
 
 /// `replay` with whole layers resident: every expert of a layer with
-/// `pinned[layer]` is a hit and never enters `cache` (D-42 layer-pinned and
+/// `pinned[layer]` is a hit and never enters `cache` (layer-pinned and
 /// hybrid arms; `&[]` pins nothing).
 pub fn replay_pinned(
     cache: &mut Cache,
@@ -352,7 +349,7 @@ pub fn replay_lfu(t: &RouteTrace, slots: usize, half_life: f64) -> Replayed {
     replay(&mut c, t.experts, &t.steps)
 }
 
-/// D-42 hybrid: `pinned` layers fully resident (each costs `experts` slots),
+/// Hybrid: `pinned` layers fully resident (each costs `experts` slots),
 /// the remaining slots a global cache (LFU-decay with `half_life`, else LRU).
 /// `None` when the pinned layers alone do not fit in `slots`.
 pub fn replay_hybrid(
