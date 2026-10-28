@@ -3,7 +3,7 @@
 // every KV / candidate source outside the group for every call, and runs on the real file with experts
 // streamed through the store (cache 0). mlx-node runs in f32 (DECISIONS S13a-1): gates are §3 vs ora32
 // with the ora16 run as the floor. Included into `tests.rs` so filters read
-// `deepseek_v41::tests::real_groups_<case>`. Run with `MLX_ENABLE_TF32=0`.
+// `deepseek_v41::tests::real_groups_<case>`.
 // The long rung dumps streams at group-boundary layers only (DECISIONS
 // S13b-1): a layer's stream is gated where its golden exists.
 // Selection gates (DECISIONS S13b-5, diag/JUDGE.md): each group's first layer
@@ -357,11 +357,6 @@ fn set_of(v: &[i64]) -> BTreeSet<i64> {
 
 fn real_groups(case: &str, groups: &[(usize, usize)]) {
     const GIB: f64 = (1u64 << 30) as f64;
-    assert_eq!(
-        std::env::var("MLX_ENABLE_TF32").as_deref(),
-        Ok("0"),
-        "f32 GEMMs must not be TF32 (DECISIONS S5-1)"
-    );
     assert_eq!(
         std::env::var("MLX_DSV41_EXPERT_CACHE_GB").as_deref(),
         Ok("0"),
@@ -1044,25 +1039,25 @@ fn real_groups(case: &str, groups: &[(usize, usize)]) {
 }
 
 #[test]
-#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12 goldens), MLX_ENABLE_TF32=0, MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~160 GB read"]
+#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12 goldens), MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~160 GB read"]
 fn real_groups_p32k8_en() {
     real_groups("p32k8-en", &REAL_GROUPS);
 }
 
 #[test]
-#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12 goldens), MLX_ENABLE_TF32=0, MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~160 GB read"]
+#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12 goldens), MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~160 GB read"]
 fn real_groups_p32k8_zh() {
     real_groups("p32k8-zh", &REAL_GROUPS);
 }
 
 #[test]
-#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12 goldens), MLX_ENABLE_TF32=0, MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~160 GB read"]
+#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12 goldens), MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~160 GB read"]
 fn real_groups_p32k8_code() {
     real_groups("p32k8-code", &REAL_GROUPS);
 }
 
 #[test]
-#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12 goldens), MLX_ENABLE_TF32=0, MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~311 GB read"]
+#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12 goldens), MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB, ~311 GB read"]
 fn real_groups_p160k8_en() {
     real_groups("p160k8-en", &REAL_GROUPS);
 }
@@ -1071,7 +1066,7 @@ fn real_groups_p160k8_en() {
 /// `[24..27]`; streams gated at the dumped boundary layers 2, 7 (via L08's
 /// input), 20, 23, 24, 27.
 #[test]
-#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12e goldens), MLX_ENABLE_TF32=0, MLX_DSV41_EXPERT_CACHE_GB=0; ~20 GiB, ~117 GB read"]
+#[ignore = "needs DSV41_DIR (9 real shards), DSV41_GOLDEN (S12e goldens), MLX_DSV41_EXPERT_CACHE_GB=0; ~20 GiB, ~117 GB read"]
 fn real_groups_long() {
     real_groups("p1100k4-en", &[(2, 8), (20, 24), (24, 28)]);
 }

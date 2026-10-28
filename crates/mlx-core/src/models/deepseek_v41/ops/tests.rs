@@ -387,13 +387,7 @@ fn sinkhorn_matches_reference() {
 /// `Block.hc_mixes` / `hc_pre` / `hc_post`, rel 1e-6.
 #[test]
 fn hc_ops_match_f64_reference() {
-    if crate::test_support::f32_gemm_tf32_degraded() {
-        eprintln!(
-            "skipping hc_ops_match_f64_reference: f32 GEMM runs in TF32 on this host \
-             (MLX_ENABLE_TF32 defaults to 1 on NAX GPUs); export MLX_ENABLE_TF32=0 to run it"
-        );
-        return;
-    }
+    crate::models::deepseek_v41::test_fixture::exact_f32();
     let (n, hc, d) = (3usize, 4usize, 64usize);
     let mix = (2 + hc) * hc;
     let x = lcg(11, n * hc * d, 2.0);

@@ -1,7 +1,6 @@
 //! MoE vs the oracle (`moe.npz`: MoE input after `ffn_norm`, router ids /
 //! weights and output of every layer, one 24-row prefill per run; bf16 runs
-//! also carry `out32` = the same MoE on the same input in f32). Run with
-//! `MLX_ENABLE_TF32=0` (f32 GEMMs are TF32 by default on NAX GPUs).
+//! also carry `out32` = the same MoE on the same input in f32).
 
 use std::ffi::CString;
 

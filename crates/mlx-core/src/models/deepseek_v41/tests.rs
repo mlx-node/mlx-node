@@ -424,6 +424,62 @@ fn real_header_inventory() {
     }
 }
 
+/// `Model::from_gguf` sets true f32 GEMMs on its own thread only: a thread
+/// that never set it follows `MLX_ENABLE_TF32` (TF32 on NAX GPUs by default)
+/// exactly like one that asked for TF32.
+#[test]
+fn tf32_scope_is_per_thread() {
+    use crate::array::set_thread_tf32;
+    fn canary_err() -> f32 {
+        let (m, k, n) = (8usize, 64usize, 64usize);
+        let xv: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32 * 0.9173 + 0.37).sin()) * 1.5)
+            .collect();
+        let wv: Vec<f32> = (0..k * n)
+            .map(|i| ((i as f32 * 0.5711 + 0.71).sin()) * 0.5)
+            .collect();
+        let x = MxArray::from_float32(&xv, &[m as i64, k as i64]).unwrap();
+        let w = MxArray::from_float32(&wv, &[k as i64, n as i64]).unwrap();
+        let y = x.matmul(&w).unwrap();
+        y.eval();
+        let yv = y.to_float32().unwrap();
+        let mut err = 0.0f32;
+        for r in 0..m {
+            for c in 0..n {
+                let acc: f64 = (0..k)
+                    .map(|i| xv[r * k + i] as f64 * wv[i * n + c] as f64)
+                    .sum();
+                err = err.max((yv[r * n + c] - acc as f32).abs());
+            }
+        }
+        err
+    }
+    let fresh = std::thread::spawn(canary_err).join().unwrap();
+    let asked = std::thread::spawn(|| {
+        set_thread_tf32(Some(true));
+        canary_err()
+    })
+    .join()
+    .unwrap();
+    let g = TinyGguf::open();
+    // the opener already set this thread; the model must set it by itself
+    set_thread_tf32(None);
+    drop(tiny(&g, DType::Float32, FakeQuant::ON, false));
+    let here = canary_err();
+    let env_on = std::env::var_os("MLX_ENABLE_TF32").is_none_or(|v| v != "0");
+    println!("canary max err: model thread {here:e}, fresh thread {fresh:e}, TF32 asked {asked:e}");
+    assert!(here <= 1e-4, "model thread is not true f32: {here:e}");
+    if env_on {
+        assert_eq!(
+            fresh.to_bits(),
+            asked.to_bits(),
+            "a fresh thread did not follow MLX_ENABLE_TF32"
+        );
+    } else {
+        assert!(fresh <= 1e-4, "{fresh:e}");
+    }
+}
+
 // S9 tiny end-to-end gates
 include!("tests_model.rs");
 

@@ -84,8 +84,8 @@ pub struct Model {
     /// Context limit a call may reach (session tokens + call ids); the store
     /// sets the admitted context (D-24), `None` = no limit.
     pub ctx_limit: Option<usize>,
-    /// Stage P5 long-prompt layer skip in `forward_last` (bitwise, see
-    /// `skip_from`); `MLX_DSV41_SKIP=off` turns it off (A/B).
+    /// Long-prompt layer skip in `forward_last` (bitwise, see `skip_from`);
+    /// tests turn it off to compare.
     pub layer_skip: bool,
 }
 
@@ -93,6 +93,8 @@ impl Model {
     /// `get` returns a dense GGUF tensor, `bank` a routed-expert tensor
     /// (not called with `stream`: every layer then gathers from that shared
     /// bank); `table` serves engram rows. `act` is the activation dtype.
+    /// The calling thread runs every later call of this model: it is set to
+    /// true f32 GEMMs here.
     pub fn from_gguf(
         cfg: DeepseekV41Config,
         act: DType,
@@ -102,6 +104,9 @@ impl Model {
         table: Option<Box<dyn EngramRows>>,
         stream: Option<Arc<StagingBank>>,
     ) -> Result<Self> {
+        // the reference's f32 sites need true f32; NAX GPUs run f32 GEMMs in
+        // TF32 under MLX's default unless the thread opts out
+        crate::array::set_thread_tf32(Some(false));
         let mut blocks = Vec::with_capacity(cfg.n_layers);
         let mut engrams = Vec::with_capacity(cfg.n_layers);
         for l in 0..cfg.n_layers {

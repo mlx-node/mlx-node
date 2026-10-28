@@ -8,6 +8,13 @@ use std::path::PathBuf;
 use crate::array::MxArray;
 use crate::utils::gguf::{GgufFile, GgufTensorInfo, GgufTensorType, parse_gguf};
 
+/// True f32 GEMMs on this thread, as `Model::from_gguf` sets for a model
+/// thread; the fixture openers call it, so component tests compare with the
+/// reference in true f32 on NAX GPUs too.
+pub(super) fn exact_f32() {
+    crate::array::set_thread_tf32(Some(false));
+}
+
 pub(super) fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/deepseek-v41")
@@ -23,6 +30,7 @@ pub(super) struct TinyGguf {
 
 impl TinyGguf {
     pub fn open() -> Self {
+        exact_f32();
         let path = fixture("tiny-q8_0.gguf");
         let gguf = parse_gguf(&path).unwrap();
         Self { path, gguf }
@@ -73,6 +81,7 @@ pub(super) struct Npz(pub HashMap<String, (Vec<i64>, Vec<f32>)>);
 
 impl Npz {
     pub fn open(name: &str) -> Self {
+        exact_f32();
         let f = std::fs::File::open(fixture(name)).unwrap();
         let mut z = zip::ZipArchive::new(f).unwrap();
         let mut out = HashMap::new();

@@ -1,7 +1,6 @@
 //! Window attention vs the oracle (`attn_window.npz`: attention input and
 //! output of the ratio-0 layers 0-1 per case, the kv / `o` fake-quant
-//! inputs and outputs, the window ring after the last call). f32 only; run
-//! with `MLX_ENABLE_TF32=0` (f32 GEMMs are TF32 by default on NAX GPUs).
+//! inputs and outputs, the window ring after the last call). f32 only.
 
 mod window {
     use crate::models::deepseek_v41::attention::{AttentionWeights, FakeQuant, WindowAttention};

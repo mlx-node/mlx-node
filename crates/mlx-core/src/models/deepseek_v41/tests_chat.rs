@@ -3,7 +3,7 @@
 // without touching the session, and runs whole turns through the engine with
 // the GGUF template. Real (`continued_turn_engram_ids`): two engine turns in
 // chat mode on the 9 shards; the second is a prefix hit whose engram rows equal
-// the fresh prompt's. Run with `MLX_ENABLE_TF32=0`.
+// the fresh prompt's.
 
 fn s17_template() -> String {
     std::fs::read_to_string(concat!(
@@ -211,11 +211,10 @@ fn tiny_chat_lane_continues_session() {
 /// whose call starts at the saved history and whose engram rows equal those
 /// of the fresh turn-2 prompt (the template's own render, tokenized).
 #[test]
-#[ignore = "real 9 shards; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=0 DSV41_DIR; ~18 GiB"]
+#[ignore = "real 9 shards; MLX_DSV41_EXPERT_CACHE_GB=0 DSV41_DIR; ~18 GiB"]
 fn continued_turn_engram_ids() {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
-    assert_eq!(std::env::var("MLX_ENABLE_TF32").as_deref(), Ok("0"), "S5-1");
     assert_eq!(std::env::var("MLX_DSV41_EXPERT_CACHE_GB").as_deref(), Ok("0"));
     crate::array::set_cache_limit(super::store::POOL_LIMIT as f64).unwrap();
     let dir = std::path::PathBuf::from(std::env::var("DSV41_DIR").unwrap());

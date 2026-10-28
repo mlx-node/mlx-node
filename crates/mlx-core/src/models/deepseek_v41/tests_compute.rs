@@ -5,7 +5,7 @@
 // bytes, KV bytes, the HC carry and the attention scratch to
 // `$DSV41_COMPUTE_OUT/compute-<T>.json`; `compute(T) = peak - after load -
 // KV(T)` is fitted out of repo (`tools/s14c/fit.py`). Run with
-// `MLX_ENABLE_TF32=0`, `MLX_DSV41_EXPERT_CACHE_GB=0`, `MLX_DSV41_STATS`.
+// `MLX_DSV41_EXPERT_CACHE_GB=0`, `MLX_DSV41_STATS`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -251,19 +251,19 @@ fn real_compute(t: usize) {
 }
 
 #[test]
-#[ignore = "real 9 shards + $DSV41_PROMPTS; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=0; ~20 GiB"]
+#[ignore = "real 9 shards + $DSV41_PROMPTS; MLX_DSV41_EXPERT_CACHE_GB=0; ~20 GiB"]
 fn real_compute_1k() {
     real_compute(1024);
 }
 
 #[test]
-#[ignore = "real 9 shards + $DSV41_PROMPTS; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=0; ~25 GiB"]
+#[ignore = "real 9 shards + $DSV41_PROMPTS; MLX_DSV41_EXPERT_CACHE_GB=0; ~25 GiB"]
 fn real_compute_8k() {
     real_compute(8192);
 }
 
 #[test]
-#[ignore = "real 9 shards + $DSV41_PROMPTS; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=0; ~35 GiB"]
+#[ignore = "real 9 shards + $DSV41_PROMPTS; MLX_DSV41_EXPERT_CACHE_GB=0; ~35 GiB"]
 fn real_compute_16k() {
     real_compute(16384);
 }
