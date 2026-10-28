@@ -177,7 +177,7 @@ fn real_traces() {
     let mut md = String::new();
     let mut js = Vec::new();
     md.push_str(&format!(
-        "# replay h table\n\nTraces: {}. Expert = {EXPERT_BYTES} B; one pinned layer = {experts} slots = {:.2} GiB. h = byte hit rate over every expert use; dec-h = over decode steps only (the decode speed term). Prefill misses are staged, not cached (S16a-1), so every run starts decode with an empty cache. LFU half-life in tokens ({uses_per_token} uses each); HYB hl 0 = LRU on the unpinned slots, k 0 = the better global arm. Pinned layers ranked by staging-only decode reads in the OTHER traces (all traces for the mix). Predicted tok/s = 1/(t_c + decode misses x E / BW / tokens + t_engram){}; `sync` = also minus the router wait of the pinned layers (upper bound). Saved host syncs per token = PIN N / HYB k (a pinned layer needs no router -> read wait).\n\n",
+        "# replay h table\n\nTraces: {}. Expert = {EXPERT_BYTES} B; one pinned layer = {experts} slots = {:.2} GiB. h = byte hit rate over every expert use; dec-h = over decode steps only (the decode speed term). Prefill misses seed the cache within each layer's quota, as the bank does. LFU half-life in tokens ({uses_per_token} uses each); HYB hl 0 = LRU on the unpinned slots, k 0 = the better global arm. Pinned layers ranked by staging-only decode reads in the OTHER traces (all traces for the mix). Predicted tok/s = 1/(t_c + decode misses x E / BW / tokens + t_engram){}; `sync` = also minus the router wait of the pinned layers (upper bound). Saved host syncs per token = PIN N / HYB k (a pinned layer needs no router -> read wait).\n\n",
         names.join(", "),
         experts as f64 * EXPERT_BYTES / GIB,
         match &tm {
