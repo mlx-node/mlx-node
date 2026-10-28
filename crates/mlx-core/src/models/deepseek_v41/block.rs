@@ -16,10 +16,31 @@ use crate::array::MxArray;
 
 /// FFN rows per chunk: the routed scratch is `rows x k x (2 inter + dim)`.
 pub const FFN_CHUNK_ROWS: i64 = 256;
+/// Fewest rows of a call that read the next layer's experts ahead: a shorter
+/// call's predicted union reads more unused experts than the overlap saves.
+const READ_AHEAD_MIN_ROWS: usize = 256;
 
 #[cfg(test)]
 thread_local! {
     static TEST_CHUNK_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_READ_AHEAD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn read_ahead_min_rows() -> usize {
+    #[cfg(test)]
+    {
+        let n = TEST_READ_AHEAD_ROWS.with(|c| c.get());
+        if n > 0 {
+            return n;
+        }
+    }
+    READ_AHEAD_MIN_ROWS
+}
+
+/// Test hook for the read-ahead row floor (this thread; 0 = the product's).
+#[cfg(test)]
+pub(crate) fn set_test_read_ahead_rows(n: usize) {
+    TEST_READ_AHEAD_ROWS.with(|c| c.set(n));
 }
 
 /// `rows`, or the test cap on every row-chunk loop (FFN, sparse attention,
@@ -175,9 +196,9 @@ impl Block {
         let f = rms_norm(&hc_pre(&x, &attn_pre)?, &self.ffn_norm, self.eps)?;
         prof_end(Phase::Hc, tp, &[&x, &ffn_pre, &ffn_post, &ffn_comb, &f])?;
         let (s, dim) = (f.shape_at(0)?, f.shape_at(1)?);
-        // stage P4: the next layer's experts are read while this one computes
+        // the next layer's experts are read while this one computes
         if let Some((nx, nfrom)) = next
-            && s > 1
+            && s as usize >= read_ahead_min_rows().max(2)
         {
             // from the first FFN chunk the next layer will run
             let chunk = chunk_cap(FFN_CHUNK_ROWS as usize) as i64;

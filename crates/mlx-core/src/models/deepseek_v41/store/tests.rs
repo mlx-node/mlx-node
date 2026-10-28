@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use super::*;
 use crate::array::{get_active_memory, get_cache_memory, set_cache_limit};
+use crate::models::deepseek_v41::block::set_test_read_ahead_rows;
 use crate::models::deepseek_v41::engram::{EngramRows, ResidentTable};
 use crate::models::deepseek_v41::engram_hash::EngramHasher;
 use crate::models::deepseek_v41::model::{Session, Trace};
@@ -825,6 +826,7 @@ fn tiny_qmm_dense_ops() {
 /// never twice (a prefill seed of a staged expert is copied, not re-read).
 #[test]
 fn tiny_prefetch_bitwise() {
+    set_test_read_ahead_rows(2);
     let npz = Npz::open("oracle.npz");
     let c1 = case_ids(&npz, "c1");
     for mode in ["fp32_on", "bf16_on"] {
@@ -879,6 +881,26 @@ fn tiny_prefetch_bitwise() {
     }
 }
 
+/// A call shorter than the product's read-ahead row floor reads nothing
+/// ahead on a two-layer bank (its predicted union would mostly go unused).
+#[test]
+fn tiny_short_call_reads_nothing_ahead() {
+    let npz = Npz::open("oracle.npz");
+    let c1 = case_ids(&npz, "c1");
+    let s = cached_store("fp32_on", 6);
+    s.bank.rebuild_staging(6, 2).unwrap();
+    s.bank.set_prefetch(true);
+    let mut sess = s.model.new_session();
+    s.model.forward(&mut sess, &c1, None, None).unwrap();
+    assert!(c1.len() > 1);
+    assert_eq!(
+        s.bank.stats().prefetch_slots,
+        0,
+        "{} rows read ahead",
+        c1.len()
+    );
+}
+
 /// Stage P4: `replay_turns_staged` with two staging layers gives the live
 /// bank's (uses, hits, reads) without prefetch. With prefetch only the uses
 /// are equal: a read ahead overwrites a same-half staging copy of layer
@@ -887,6 +909,7 @@ fn tiny_prefetch_bitwise() {
 #[test]
 fn tiny_replay_two_staging_layers() {
     use crate::moe_stream::replay::{Replayed, Step, replay_turns_staged};
+    set_test_read_ahead_rows(2);
     let npz = Npz::open("oracle.npz");
     for slots in [0, 6, 64] {
         for pm in [false, true] {
@@ -965,6 +988,7 @@ fn tiny_rebuild_waits_for_reads_in_flight() {
 /// (old rule `l <= layer`: layer 2 tagged slots that layer 0 had refilled).
 #[test]
 fn tiny_cancel_retry_settles_read_ahead() {
+    set_test_read_ahead_rows(2);
     let npz = Npz::open("oracle.npz");
     let c1 = case_ids(&npz, "c1");
     let reference = cached_store("fp32_on", 0);
@@ -1019,6 +1043,7 @@ fn session_bits(sess: &Session) -> Vec<Vec<u32>> {
 #[test]
 fn tiny_layer_skip_bitwise() {
     use crate::models::deepseek_v41::block::set_test_chunk_rows;
+    set_test_read_ahead_rows(2);
     let (g, npz) = (TinyGguf::open(), Npz::open("oracle.npz"));
     let c1 = case_ids(&npz, "c1");
     let s = c1.len();
