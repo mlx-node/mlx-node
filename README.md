@@ -77,6 +77,7 @@ See [docs/models.md](docs/models.md) for loading options and model-specific beha
 | ---------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------- |
 | General          | Qwen3, Qwen3.5/3.6 Dense and MoE, Gemma4, LFM2, LFM2.5, Nemotron 3.5 Lightning | Qwen models support GRPO and SFT; others inference-only          |
 | SSD              | [Qwen3.8-Flash-Next](docs/qwen38-flash-next.md)                                | Text, images, native MTP, paged cache; inference-only            |
+| SSD              | [DeepSeek V4.1 Flash](docs/models.md#deepseek-v41-flash)                       | Split GGUF, experts read from the SSD per token; text only       |
 | Vision           | Qwen3.5/3.6 VLM, Gemma4 VLM, PaddleOCR-VL, Qianfan OCR, PP-StructureV3         | General vision, OCR, and document processing                     |
 | Audio            | Qwen3-ASR                                                                      | Offline, streaming, and meeting transcription                    |
 | Speech synthesis | [Qwen3-TTS](docs/tts.md)                                                       | Streaming CustomVoice and Base voice cloning via `@mlx-node/tts` |

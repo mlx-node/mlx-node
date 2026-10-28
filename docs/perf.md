@@ -262,6 +262,46 @@ in memory on every load. Their native cache entries are small asset directories
 | `MLX_RESIDENCY_SET_MAX_PCT` | Upstream MLX: one residency set's size, as % of the recommended working set (default 5). Splits wired memory across sets, never changes how much is wired; `<= 0` or `>= 100` = one set (`mlx/utils.h:205-218`)                 |
 | `MLX_RESIDENCY_DEBUG=1`     | Upstream MLX: log each residency set as it is created                                                                                                                                                                           |
 
+### DeepSeek V4.1 Flash (SSD streaming)
+
+Read at load. Bad values are refused (the load fails, nothing is clamped); none of them changes output bits except
+`MLX_DSV41_DENSE` (see [models.md](models.md#deepseek-v41-flash)).
+
+| Var                            | Effect                                                                                                                                                                                                                                              |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MLX_DSV41_EXPERT_CACHE_GB`    | Upper bound for the expert cache in GiB (decimals ok). It only lowers the size the admission picks; `0` = staging only (no cache).                                                                                                                  |
+| `MLX_DSV41_ADMIT_RESERVE_GB`   | Memory kept free for other apps by the admission (default 12 GiB; only raises).                                                                                                                                                                     |
+| `MLX_DSV41_STAGING_LAYERS`     | `1` or `2` prefill staging layers. Unset: a second layer only when it fits after the cache. `2` takes it before the cache (6.72 GiB less cache, cold prefill TTFT measured vs one layer: 1K -34 %, 8K -5 %); `1` never.                             |
+| `MLX_DSV41_PREFETCH`           | With 2 staging layers: `pred` (default) reads the next layer's experts ahead from its router's prediction; `all` reads all 384; `off` none.                                                                                                         |
+| `MLX_DSV41_CACHE_MODE`         | `seeded` (default): a prefill places some of its misses per layer into the cache and the cache is kept across turns; `lru`: plain global LRU (A/B only).                                                                                            |
+| `MLX_DSV41_SPLIT`              | `on` (default): a decode step starts the GPU on the shared and cached experts while the misses are read; `off` = one pass after all reads.                                                                                                          |
+| `MLX_DSV41_SKIP`               | `on` (default): on long prompts layers 20-39 compute only the rows later layers read (exact); `off` computes every row.                                                                                                                             |
+| `MLX_DSV41_DENSE`              | Dense weights: `q8` (default, `quantized_matmul` on the Q8_0 codes, ~9.9 GiB), `exact` (f32 built per use, the reference path), `f32` (f32 resident, ~29 GiB, bitwise `exact`), `mixed`. `q8` has different rounding than `exact` (oracle-checked). |
+| `MLX_MOE_STREAM_IO_THREADS`    | Expert reader threads, 4-18 (default 12; 8-16 within 1 %).                                                                                                                                                                                          |
+| `MLX_DSV41_STATS=<file>`       | Append one JSON stats line per call (TTFT, hit rates, read GB/s, decode t_c / t_io / router wait, peak footprint).                                                                                                                                  |
+| `MLX_DSV41_PROFILE=1`          | Phase split of each forward (drains the GPU at phase edges: slower, same bits).                                                                                                                                                                     |
+| `MLX_DSV41_ROUTE_TRACE=<file>` | Write the expert route trace (the `qwen4_exp` trace schema) for cache replays.                                                                                                                                                                      |
+
+Measured product table (P7, 2026-10-28; M5 Max 128 GB, internal SSD;
+`@mlx-node/lm` `ChatSession`, greedy, chat mode, 32 new tokens,
+`MLX_ENABLE_TF32=0`, all defaults; each prompt cold in a fresh process after
+20 min idle; expert cache = the load admission's auto size, here small because
+other apps held ~69 GiB):
+
+| Prompt           | Load s | TTFT s | Prefill tok/s | Decode tok/s | Decode byte hit rate | Cache GiB (slots) | Peak footprint GiB | Read GB (run) |
+| ---------------- | ------ | ------ | ------------- | ------------ | -------------------- | ----------------- | ------------------ | ------------- |
+| 64               | 6.3    | 7.89   | 8.1           | 2.090        | 0.292                | 6.09 (348)        | 23.58              | 360           |
+| turn 2 (+63 ids) | —      | 6.83   | 9.2           | 2.486        | 0.339                | 6.09 (348)        | 23.58              | (same run)    |
+| 1K               | 5.9    | 26.45  | 38.7          | 2.497        | 0.332                | 6.69 (382)        | 25.21              | 308           |
+| 8K               | 5.9    | 87.67  | 93.4          | 2.228        | 0.315                | 6.22 (355)        | 29.73              | 349           |
+
+Decode terms per token: compute 157-219 ms, expert reads 241-258 ms at
+12.6-12.9 GB/s (raw SSD ceiling 12.8-13.1 GB/s), router wait 36-59 ms. MLX
+free-buffer pool <= 1.0 GiB, swap +0 in every run. For scale: before the
+streaming work (no NEON repack, no seeding, no read overlap, no row skip) cold
+TTFT was 69 s at 1K and 213 s at 8K; with a 20-21 GiB cache decode measured
+2.6-3.0 tok/s and 16K TTFT 163.7 s.
+
 ## MTP speculative decoding
 
 Qwen3.5 / Qwen3.6 MTP (Multi-Token Prediction) speculative decoding adds
