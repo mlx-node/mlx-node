@@ -235,6 +235,8 @@ fn real_skip_bitwise() {
         .map(|v| v.trim().to_owned())
         .collect();
     let n_dec: usize = s16_env("DSV41_SKIP_DECODE").map_or(64, |v| v.parse().unwrap());
+    // phase split of the decode steps (evals at phase edges; bits unchanged)
+    let dec_prof = s16_env("DSV41_SKIP_DECODE_PROFILE").is_some_and(|v| v == "1");
     let mut store = s16_store(CachePlan::Admit(Limits::from_env().unwrap()));
     let (n_layers, vocab) = (store.model.cfg.n_layers, store.model.cfg.vocab_size);
     store.begin_turn().unwrap();
@@ -279,14 +281,27 @@ fn real_skip_bitwise() {
             let ffn_rows: usize = trace.routes.iter().map(|r| r.rows()).sum();
             let mut hashes = vec![hex_sha(&row[row.len() - vocab..])];
             let mut picks = vec![p5_argmax(&row[row.len() - vocab..])];
+            let d0 = Counters::now(&store.bank);
+            let ph0 = super::stats::phase_seconds();
+            super::stats::set_profiling(dec_prof);
             let t1 = std::time::Instant::now();
+            let mut step_ms: Vec<f64> = Vec::with_capacity(n_dec);
             for _ in 0..n_dec {
                 let id = *picks.last().unwrap();
+                let ts = std::time::Instant::now();
                 let r = read(&store.model.forward_last(&mut sess, &[id], None, None).unwrap());
+                step_ms.push(ts.elapsed().as_secs_f64() * 1e3);
                 hashes.push(hex_sha(&r[r.len() - vocab..]));
                 picks.push(p5_argmax(&r[r.len() - vocab..]));
             }
             let dec_s = t1.elapsed().as_secs_f64();
+            super::stats::set_profiling(false);
+            let d = Counters::now(&store.bank).since(&d0);
+            let ph1 = super::stats::phase_seconds();
+            let dec_split: serde_json::Map<String, Value> = super::stats::PHASES
+                .iter()
+                .map(|p| (p.name().to_owned(), json!(ph1[*p as usize] - ph0[*p as usize])))
+                .collect();
             match &want {
                 None => want = Some((hashes.clone(), picks.clone())),
                 Some((wh, wp)) => {
@@ -303,6 +318,9 @@ fn real_skip_bitwise() {
                 "T": t, "arm": arm, "ttft_s": ttft, "prefill_tok_s": t as f64 / ttft,
                 "decode_tokens": n_dec, "decode_s": dec_s,
                 "decode_tok_s": n_dec as f64 / dec_s.max(1e-9),
+                "decode_uses": d.uses, "decode_hits": d.hits, "decode_reads": d.fill_slots,
+                "decode_io_wait_s": d.fill_wait_ns as f64 * 1e-9,
+                "decode_profile": dec_prof, "decode_split_s": dec_split, "decode_step_ms": step_ms,
                 "ffn_rows": ffn_rows, "ffn_rows_full": n_layers * t,
                 "skip_from": froms,
                 "read_experts": c.fill_slots, "read_gb": c.fill_bytes as f64 / 1e9,
