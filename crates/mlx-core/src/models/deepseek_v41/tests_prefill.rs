@@ -238,6 +238,11 @@ fn real_skip_bitwise() {
     // phase split of the decode steps (evals at phase edges; bits unchanged)
     let dec_prof = s16_env("DSV41_SKIP_DECODE_PROFILE").is_some_and(|v| v == "1");
     let mut store = s16_store(CachePlan::Admit(Limits::from_env().unwrap()));
+    // the split decode step (P3) reads and gathers without phase clocks
+    assert!(
+        !dec_prof || !store.bank.split(),
+        "DSV41_SKIP_DECODE_PROFILE=1 needs MLX_DSV41_SPLIT=off"
+    );
     let (n_layers, vocab) = (store.model.cfg.n_layers, store.model.cfg.vocab_size);
     store.begin_turn().unwrap();
     println!("touch bank {:.2} s", s16_touch_bank(&store));
