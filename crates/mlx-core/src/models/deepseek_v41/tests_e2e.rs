@@ -626,7 +626,7 @@ fn real_e2e_chunk7_en() {
     // S14a-6: rows within max(1e-5, 2 x the oracle's own 1-ulp / call-split
     // spread at that position); greedy ids exact; hashes bitwise once stored
     let env = self_noise("p32k8-en");
-    // the chunk-7 golden is the exact path's (DECISIONS P0-2)
+    // the chunk-7 golden is the exact path's
     let store = e2e_store_in(DenseMode::Exact);
     let vocab = store.model.cfg.vocab_size;
     let p = gd.prompt.len();

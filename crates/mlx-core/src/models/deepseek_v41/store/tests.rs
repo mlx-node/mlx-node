@@ -693,7 +693,7 @@ fn tiny_cache_admit_turns() {
 
 /// `Q8` within G9.1's fq-off bound of the oracle (1e-4) and not bitwise
 /// `Exact` (the quantized matmul runs); fq on is printed only (a 1e-6 change
-/// flips near-edge fp8 codes, S7-5); resident dense bytes == the scan's
+/// flips near-edge fp8 codes); resident dense bytes == the scan's
 /// prediction.
 #[test]
 fn tiny_dense_modes() {
