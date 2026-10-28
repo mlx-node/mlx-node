@@ -9,6 +9,7 @@ pub mod compressor;
 pub mod config;
 pub mod engram;
 pub mod engram_hash;
+#[cfg(test)]
 pub mod generate;
 pub mod indexer;
 pub mod model;
@@ -17,6 +18,7 @@ pub mod ops;
 pub mod rows;
 pub mod stats;
 pub mod store;
+#[cfg(test)]
 pub mod trace;
 
 #[cfg(test)]

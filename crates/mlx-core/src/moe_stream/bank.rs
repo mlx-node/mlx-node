@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use napi::{Error, Result};
 
-use super::cache::{Cache, CacheMode, Source};
+use super::cache::{Cache, Source};
 use super::io::{BatchWatch, Extent, IoPool, IoStats, Priority, Read, Ticket};
 use super::repack::SlotRepack;
 use crate::array::purgeable::{BankWatch, PurgeableBank, PurgeableState};
@@ -34,35 +34,6 @@ fn bad(msg: impl std::fmt::Display) -> Error {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// What a prefill reads ahead for the next layer (stage P4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PrefetchMode {
-    Off = 0,
-    /// The next layer's router on this layer's FFN input (union over rows).
-    Pred = 1,
-    /// Every expert of the next layer.
-    All = 2,
-}
-
-impl PrefetchMode {
-    /// `MLX_DSV41_PREFETCH` = `off` | `pred` | `all` (unset: `pred`; it acts
-    /// only with two staging layers).
-    pub fn from_env() -> Result<Self> {
-        match std::env::var("MLX_DSV41_PREFETCH")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-        {
-            None | Some("") | Some("pred") => Ok(Self::Pred),
-            Some("off") => Ok(Self::Off),
-            Some("all") => Ok(Self::All),
-            Some(v) => Err(bad(format!(
-                "MLX_DSV41_PREFETCH={v:?}: expected off, pred or all"
-            ))),
-        }
-    }
 }
 
 /// One layer's routed-expert tensor of one projection (`[n, rows, k]` MXFP4).
@@ -248,9 +219,8 @@ pub struct StagingBank {
     /// `[layer][projection]`
     layers: Vec<Vec<ExpertTensor>>,
     n_experts: usize,
-    mode: CacheMode,
     split: AtomicBool,
-    prefetch: std::sync::atomic::AtomicU8,
+    prefetch: AtomicBool,
     inner: Mutex<Inner>,
     stats: Mutex<BankStats>,
     /// Test hook: no reads (a gather then meets stale tags).
@@ -315,23 +285,13 @@ impl StagingBank {
         Self::with_cache(pool, layers, 0)
     }
 
-    /// `with_mode` under `CacheMode::Lru` (S16a).
+    /// `with_staging` with one staging layer.
     pub fn with_cache(
         pool: IoPool,
         layers: Vec<Vec<ExpertTensor>>,
         cache_slots: usize,
     ) -> Result<Self> {
-        Self::with_mode(pool, layers, cache_slots, CacheMode::Lru)
-    }
-
-    /// `with_staging` with one staging layer.
-    pub fn with_mode(
-        pool: IoPool,
-        layers: Vec<Vec<ExpertTensor>>,
-        cache_slots: usize,
-        mode: CacheMode,
-    ) -> Result<Self> {
-        Self::with_staging(pool, layers, cache_slots, mode, 1)
+        Self::with_staging(pool, layers, cache_slots, 1)
     }
 
     /// One bank per projection of `staging * n_experts + cache_slots` slots
@@ -341,7 +301,6 @@ impl StagingBank {
         pool: IoPool,
         layers: Vec<Vec<ExpertTensor>>,
         cache_slots: usize,
-        mode: CacheMode,
         staging: usize,
     ) -> Result<Self> {
         if !(1..=2).contains(&staging) {
@@ -388,7 +347,7 @@ impl StagingBank {
                 proj,
                 staging,
                 tags: vec![None; staging * n],
-                cache: Cache::lru(cache_slots, layers.len(), n).with_mode(mode),
+                cache: Cache::lru(cache_slots, layers.len(), n),
                 in_turn: true,
                 retired: Vec::new(),
                 inflight: Vec::new(),
@@ -397,9 +356,8 @@ impl StagingBank {
             }),
             layers,
             n_experts: n,
-            mode,
             split: AtomicBool::new(false),
-            prefetch: std::sync::atomic::AtomicU8::new(PrefetchMode::Off as u8),
+            prefetch: AtomicBool::new(false),
             stats: Mutex::new(BankStats::default()),
             skip_fill: AtomicBool::new(false),
             #[cfg(test)]
@@ -409,10 +367,6 @@ impl StagingBank {
 
     pub fn n_experts(&self) -> usize {
         self.n_experts
-    }
-
-    pub fn mode(&self) -> CacheMode {
-        self.mode
     }
 
     pub fn cache_slots(&self) -> usize {
@@ -550,7 +504,6 @@ impl StagingBank {
     #[cfg(test)]
     fn empty_between_turns(&self) -> bool {
         self.force_empty.load(Ordering::Relaxed)
-            || std::env::var_os("MLX_DSV41_TEST_FORCE_EMPTY").is_some_and(|v| v == "1")
     }
 
     #[cfg(not(test))]
@@ -607,7 +560,7 @@ impl StagingBank {
             &self.layers[0],
             (staging * self.n_experts + cache_slots) as i64,
         )?;
-        g.cache = Cache::lru(cache_slots, self.layers.len(), self.n_experts).with_mode(self.mode);
+        g.cache = Cache::lru(cache_slots, self.layers.len(), self.n_experts);
         g.in_turn = true;
         Ok(())
     }
@@ -953,7 +906,7 @@ impl StagingBank {
     }
 
     /// Whether decode steps overlap their reads with the gathers of the
-    /// slots they already hold (`MLX_DSV41_SPLIT`, stage P3).
+    /// slots they already hold.
     pub fn split(&self) -> bool {
         self.split.load(Ordering::Relaxed)
     }
@@ -962,31 +915,15 @@ impl StagingBank {
         self.split.store(on, Ordering::Relaxed);
     }
 
-    /// Whether prefill reads the next layer's experts ahead (stage P4,
-    /// `MLX_DSV41_PREFETCH`; needs a second staging layer).
+    /// Whether a prefill reads the next layer's experts ahead, picked by
+    /// that layer's router on this layer's FFN input (needs a second staging
+    /// layer).
     pub fn prefetch(&self) -> bool {
-        self.prefetch_mode() != PrefetchMode::Off
+        self.prefetch.load(Ordering::Relaxed)
     }
 
-    pub fn prefetch_mode(&self) -> PrefetchMode {
-        match self.prefetch.load(Ordering::Relaxed) {
-            1 => PrefetchMode::Pred,
-            2 => PrefetchMode::All,
-            _ => PrefetchMode::Off,
-        }
-    }
-
-    /// `on` = `PrefetchMode::Pred`.
     pub fn set_prefetch(&self, on: bool) {
-        self.set_prefetch_mode(if on {
-            PrefetchMode::Pred
-        } else {
-            PrefetchMode::Off
-        });
-    }
-
-    pub fn set_prefetch_mode(&self, m: PrefetchMode) {
-        self.prefetch.store(m as u8, Ordering::Relaxed);
+        self.prefetch.store(on, Ordering::Relaxed);
     }
 
     /// Staging layers in the bank.

@@ -116,6 +116,20 @@ fn busy_others_95_refuses() {
     assert!(msg.contains("others 95.00 GiB"), "{msg}");
 }
 
+/// A small host (a 16 GiB machine, nothing else running) refuses the real
+/// model at load: the reserve and the fixed set never fit, so nothing is
+/// allocated and nothing swaps.
+#[test]
+fn small_host_refuses() {
+    let h = HostMemory {
+        physical: 16 * G,
+        wired: 3 * G,
+        ..Default::default()
+    };
+    let e = admit(&model(), &Limits::default(), &h, &Own::default(), 12 * G).unwrap_err();
+    assert!(e.to_string().contains("vs budget"), "{e}");
+}
+
 #[test]
 fn never_over_ws_or_live() {
     let mut n = 0;

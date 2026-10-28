@@ -30,9 +30,9 @@ fn reads_schema_1() {
     assert!(read_trace(&b"{\"kind\":\"other\"}\n"[..]).is_err());
 }
 
-/// Hand-counted: prefill stages 3 + 3 experts; with cache slots decode step
-/// 1 misses all 4 (victims, staging tags unused), step 2 hits 1, 7, 5 and
-/// misses 6.
+/// Hand-counted: prefill reads 3 + 3 experts; with 16 slots (quota 8 per
+/// layer) all six are seeded, so decode step 1 hits 1, 4, 5 and misses 7
+/// (a victim), step 2 hits all 4.
 #[test]
 fn replay_counts_by_hand() {
     let t = read_trace(TRACE.as_bytes()).unwrap();
@@ -41,8 +41,8 @@ fn replay_counts_by_hand() {
     // 0 slots: decode stages too; only expert 7 is not already staged for its layer
     assert_eq!(none.reads, 6 + 1);
     let big = replay_lru(&t, 16);
-    assert_eq!((big.hits, big.decode_hits, big.reads), (3, 3, 6 + 4 + 1));
-    assert!((big.decode_h() - 3.0 / 8.0).abs() < 1e-12);
+    assert_eq!((big.hits, big.decode_hits, big.reads), (7, 7, 6 + 1));
+    assert!((big.decode_h() - 7.0 / 8.0).abs() < 1e-12);
     // 1 slot: each decode step keeps one victim; the next step's wanted set
     // never evicts its own hit
     let one = replay_lru(&t, 1);
@@ -320,7 +320,7 @@ fn real_traces() {
     }
 }
 
-/// Hand-counted `Seeded` on the 2-layer trace with 4 slots (quota 2 per
+/// Hand-counted seeding on the 2-layer trace with 4 slots (quota 2 per
 /// layer): prefill seeds the two most-used experts of each layer (layer 0:
 /// 2 (2 rows), then 1; layer 1: 5, then 4), so decode step 1 hits 1 and 4,
 /// 5 and misses 7 (victim); step 2 hits 7, 1, 5 and serves 6 from its
@@ -329,7 +329,7 @@ fn real_traces() {
 #[test]
 fn seeded_counts_by_hand() {
     let t = read_trace(TRACE.as_bytes()).unwrap();
-    let mut c = cache_for(&t, 4, CacheMode::Seeded);
+    let mut c = cache_for(&t, 4);
     let r = replay(&mut c, t.experts, &t.steps);
     // reads: prefill 3 + 3, decode 7 only
     assert_eq!(
@@ -338,114 +338,11 @@ fn seeded_counts_by_hand() {
         "{r:?}"
     );
     let v = replay_turns(
-        &mut cache_for(&t, 4, CacheMode::Seeded),
+        &mut cache_for(&t, 4),
         t.experts,
         &[&t.steps[..2], &t.steps[2..]],
     );
     assert_eq!(v[0].plus(v[1]), r);
-    let tok = per_token(
-        &mut cache_for(&t, 4, CacheMode::Seeded),
-        t.experts,
-        t.layers,
-        &[&t.steps],
-    );
+    let tok = per_token(&mut cache_for(&t, 4), t.experts, t.layers, &[&t.steps]);
     assert_eq!(tok, vec![(4, 3, 1), (4, 3, 0)]);
-    // Lru on the same trace: decode step 1 misses all 4
-    let l = replay(&mut cache_for(&t, 4, CacheMode::Lru), t.experts, &t.steps);
-    assert_eq!(l, replay_lru(&t, 4));
-    assert!(r.decode_hits > l.decode_hits, "{r:?} vs {l:?}");
-}
-
-/// P2: `Lru` vs `Seeded` on the real route traces in `DSV41_TRACES`
-/// (`DSV41_SEED_SET`, comma list) at cache sizes in GiB (`DSV41_SEED_GIB`):
-/// first-16-decode-token cache h and byte h (uses served without a read),
-/// whole-run decode reads per token, predicted decode tok/s with P1's terms
-/// (`t_c` 222 ms, BW 12.3 GB/s; DECISIONS P1-3/4). Writes `DSV41_SEED_OUT`
-/// (markdown). `DSV41_SEED_TURNS` = calls per turn (the rest is one more
-/// turn; turn ends promote as the bank does), `DSV41_SEED_SLOTS` = extra
-/// sizes in slots. Skips without `DSV41_TRACES`.
-#[test]
-fn real_seed_table() {
-    let Some(dir) = std::env::var_os("DSV41_TRACES") else {
-        println!("DSV41_TRACES unset: skipped");
-        return;
-    };
-    let dir = std::path::PathBuf::from(dir);
-    let names: Vec<String> = std::env::var("DSV41_SEED_SET")
-        .unwrap_or_else(|_| "p1-auto-B-1,s14-greedy-zh,s14-greedy-code".into())
-        .split(',')
-        .map(str::to_owned)
-        .collect();
-    let gibs: Vec<f64> = std::env::var("DSV41_SEED_GIB")
-        .unwrap_or_else(|_| "6.864,16,24.9,35.67,48".into())
-        .split(',')
-        .map(|v| v.parse().unwrap())
-        .collect();
-    let (t_c, bw) = (0.222, 12.3e9);
-    let mut md = format!(
-        "# P2 seeding replay table\n\nTraces: {}. Expert = {EXPERT_BYTES} B. first16 = decode tokens 1..16 of the run: h = cache hits / uses, bh = byte h = 1 - reads / uses. dec reads/tok over every decode token. Predicted tok/s = 1/(t_c + reads x E / BW) with t_c {:.0} ms, BW {:.1} GB/s (P1).\n\n| trace | GiB | slots | Lru first16 h / bh | Seeded first16 h / bh | gain (bh pts) | Lru dec reads/tok | Seeded | pred tok/s Lru | Seeded |\n|---|---|---|---|---|---|---|---|---|---|\n",
-        names.join(", "),
-        t_c * 1e3,
-        bw / 1e9
-    );
-    for n in &names {
-        let f = std::fs::File::open(dir.join(format!("{n}.jsonl")))
-            .unwrap_or_else(|e| panic!("{n}: {e}"));
-        let t = read_trace(std::io::BufReader::new(f)).unwrap();
-        // calls per turn (`DSV41_SEED_TURNS`, e.g. 8,8,32): turn ends promote
-        let mut turns: Vec<&[Step]> = Vec::new();
-        let mut at = 0;
-        if let Ok(v) = std::env::var("DSV41_SEED_TURNS") {
-            for c in v.split(',') {
-                let n = c.parse::<usize>().unwrap() * t.layers;
-                turns.push(&t.steps[at..at + n]);
-                at += n;
-            }
-        }
-        turns.push(&t.steps[at..]);
-        let mut sizes: Vec<(f64, usize)> = gibs
-            .iter()
-            .map(|&g| (g, (g * GIB / EXPERT_BYTES).floor() as usize))
-            .collect();
-        if let Ok(v) = std::env::var("DSV41_SEED_SLOTS") {
-            sizes.extend(v.split(',').map(|x| {
-                let n: usize = x.parse().unwrap();
-                (n as f64 * EXPERT_BYTES / GIB, n)
-            }));
-        }
-        for &(g, slots) in &sizes {
-            let row = |mode| {
-                let tok = per_token(&mut cache_for(&t, slots, mode), t.experts, t.layers, &turns);
-                let f16 = tok
-                    .iter()
-                    .take(16)
-                    .fold((0, 0, 0), |a, x| (a.0 + x.0, a.1 + x.1, a.2 + x.2));
-                let all = tok.iter().fold(0, |a, x| a + x.2);
-                let rpt = all as f64 / tok.len().max(1) as f64;
-                (
-                    f16.1 as f64 / f16.0.max(1) as f64,
-                    1.0 - f16.2 as f64 / f16.0.max(1) as f64,
-                    rpt,
-                    1.0 / (t_c + rpt * EXPERT_BYTES / bw),
-                )
-            };
-            let (l, s) = (row(CacheMode::Lru), row(CacheMode::Seeded));
-            md.push_str(&format!(
-                "| {n} | {g:.2} | {slots} | {:.3} / {:.3} | {:.3} / {:.3} | {:+.1} | {:.1} | {:.1} | {:.2} | {:.2} |\n",
-                l.0,
-                l.1,
-                s.0,
-                s.1,
-                (s.1 - l.1) * 100.0,
-                l.2,
-                s.2,
-                l.3,
-                s.3
-            ));
-        }
-    }
-    println!("{md}");
-    if let Some(p) = std::env::var_os("DSV41_SEED_OUT") {
-        std::fs::write(p, &md).unwrap();
-    }
 }

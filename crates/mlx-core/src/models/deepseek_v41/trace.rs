@@ -1,4 +1,4 @@
-//! Route trace (`MLX_DSV41_ROUTE_TRACE=<file>`): JSONL in the
+//! Route trace (test harness, `DSV41_ROUTE_TRACE=<file>`): JSONL in the
 //! `qwen4_exp/route_replay.rs` schema v1 (a header line, then one `routes`
 //! event per layer of every call; `pass` = call, `entry` = layer order).
 
@@ -16,14 +16,14 @@ pub struct RouteTrace {
 }
 
 impl RouteTrace {
-    /// Opens `$MLX_DSV41_ROUTE_TRACE` when set (truncates it).
+    /// Opens `$DSV41_ROUTE_TRACE` when set (truncates it).
     pub fn from_env(
         prompt_tokens: usize,
         layers: usize,
         experts: usize,
         top_k: usize,
     ) -> std::io::Result<Option<Self>> {
-        let Some(p) = std::env::var_os("MLX_DSV41_ROUTE_TRACE") else {
+        let Some(p) = std::env::var_os("DSV41_ROUTE_TRACE") else {
             return Ok(None);
         };
         let mut out = std::io::BufWriter::new(std::fs::File::create(p)?);

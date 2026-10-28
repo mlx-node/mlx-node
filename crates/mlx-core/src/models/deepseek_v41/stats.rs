@@ -11,7 +11,7 @@ pub(crate) static ROUTER_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static ENGRAM_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static ENGRAM_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// Time split of a forward (`MLX_DSV41_PROFILE=1`, stage P4). Each phase
+/// Time split of a forward (tests: `set_profiling`). Each phase
 /// evaluates its outputs before its clock stops, so phases do not overlap
 /// and their sum is the GPU + host time of the layers (values unchanged:
 /// an eval does not change bits). Off: no eval, no clock.
@@ -54,24 +54,16 @@ pub const PHASES: [Phase; 10] = [
 
 static PHASE_NS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
-/// 0 = not read yet, 1 = off, 2 = on.
-static PROFILE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static PROFILE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// `MLX_DSV41_PROFILE=1` (read once per process; `set_profiling` overrides).
 pub fn profiling() -> bool {
-    match PROFILE.load(Ordering::Relaxed) {
-        0 => {
-            let on = std::env::var("MLX_DSV41_PROFILE").is_ok_and(|v| v == "1");
-            PROFILE.store(1 + u8::from(on), Ordering::Relaxed);
-            on
-        }
-        v => v == 2,
-    }
+    PROFILE.load(Ordering::Relaxed)
 }
 
-/// Turns the phase split on or off for this process (tests, benches).
+/// Turns the phase split on or off for this process.
+#[cfg(test)]
 pub fn set_profiling(on: bool) {
-    PROFILE.store(1 + u8::from(on), Ordering::Relaxed);
+    PROFILE.store(on, Ordering::Relaxed);
 }
 
 /// A phase clock when profiling (the GPU is drained first, so the phase

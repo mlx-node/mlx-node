@@ -7,7 +7,7 @@
 // edges), the time split. Arms (`DSV41_PREFILL_ARMS`, interleaved ABBA per
 // rep) must give bitwise equal last-row logits per T. `DSV41_PREFILL_SLOTS`
 // replaces the admission by a fixed cache size. Run with
-// `MLX_ENABLE_TF32=0`, `MLX_DSV41_EXPERT_CACHE_GB=<N_auto>`, `DSV41_PROMPTS`.
+// `MLX_DSV41_EXPERT_CACHE_GB=<N_auto>`, `DSV41_PROMPTS`.
 
 fn p4_prompt(t: usize) -> Vec<u32> {
     let dir = PathBuf::from(std::env::var("DSV41_PROMPTS").expect("DSV41_PROMPTS"));
@@ -24,21 +24,19 @@ fn p4_prompt(t: usize) -> Vec<u32> {
     ids
 }
 
-/// Sets arm `name` on the store (P4: `base` = the store as opened; `off`,
-/// `pred`, `all` = the next-layer prefetch mode).
+/// Sets arm `name` on the store (`base` = the store as opened; `off`,
+/// `pred` = the next-layer read ahead).
 fn p4_arm(store: &Store, name: &str) {
-    use crate::moe_stream::bank::PrefetchMode;
     match name {
         "base" => {}
-        "off" => store.bank.set_prefetch_mode(PrefetchMode::Off),
-        "pred" => store.bank.set_prefetch_mode(PrefetchMode::Pred),
-        "all" => store.bank.set_prefetch_mode(PrefetchMode::All),
+        "off" => store.bank.set_prefetch(false),
+        "pred" => store.bank.set_prefetch(true),
         a => panic!("unknown arm {a}"),
     }
 }
 
 #[test]
-#[ignore = "real 9 shards + $DSV41_PROMPTS; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=<N_auto>; ~19 GiB + N_auto + compute(T); ~0.3 TB read per prompt"]
+#[ignore = "real 9 shards + $DSV41_PROMPTS; MLX_DSV41_EXPERT_CACHE_GB=<N_auto>; ~19 GiB + N_auto + compute(T); ~0.3 TB read per prompt"]
 fn real_prefill_timing() {
     assert!(s16_env(CACHE_ENV).is_some(), "{CACHE_ENV} = N_auto (cap)");
     let ts: Vec<usize> = s16_env("DSV41_PREFILL_TS")
@@ -221,7 +219,7 @@ fn p5_argmax(v: &[f32]) -> u32 {
 // logits row, decode logits rows and ids must equal the first arm's
 // bitwise. Prints TTFT, decode tok/s, FFN rows computed and expert reads.
 #[test]
-#[ignore = "real 9 shards + $DSV41_PROMPTS; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=<N_auto>; ~19 GiB + N_auto + compute(T); ~0.3 TB read per prompt"]
+#[ignore = "real 9 shards + $DSV41_PROMPTS; MLX_DSV41_EXPERT_CACHE_GB=<N_auto>; ~19 GiB + N_auto + compute(T); ~0.3 TB read per prompt"]
 fn real_skip_bitwise() {
     assert!(s16_env(CACHE_ENV).is_some(), "{CACHE_ENV} = N_auto (cap)");
     let ts: Vec<usize> = s16_env("DSV41_SKIP_TS")
@@ -238,11 +236,10 @@ fn real_skip_bitwise() {
     // phase split of the decode steps (evals at phase edges; bits unchanged)
     let dec_prof = s16_env("DSV41_SKIP_DECODE_PROFILE").is_some_and(|v| v == "1");
     let mut store = s16_store(CachePlan::Admit(Limits::from_env().unwrap()));
-    // the split decode step (P3) reads and gathers without phase clocks
-    assert!(
-        !dec_prof || !store.bank.split(),
-        "DSV41_SKIP_DECODE_PROFILE=1 needs MLX_DSV41_SPLIT=off"
-    );
+    // the split decode step reads and gathers without phase clocks
+    if dec_prof {
+        store.bank.set_split(false);
+    }
     let (n_layers, vocab) = (store.model.cfg.n_layers, store.model.cfg.vocab_size);
     store.begin_turn().unwrap();
     println!("touch bank {:.2} s", s16_touch_bank(&store));

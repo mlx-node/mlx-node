@@ -368,17 +368,6 @@ fn recheck_sees_atomic_replace() {
     assert!(set.recheck().is_err(), "missing path passed recheck");
 }
 
-#[test]
-fn threads_env_range() {
-    assert_eq!(threads_from(None).unwrap(), DEFAULT_THREADS);
-    assert_eq!(threads_from(Some("")).unwrap(), DEFAULT_THREADS);
-    assert_eq!(threads_from(Some("4")).unwrap(), 4);
-    assert_eq!(threads_from(Some(" 18 ")).unwrap(), 18);
-    for bad in ["3", "19", "0", "x", "-4"] {
-        assert!(threads_from(Some(bad)).is_err(), "{bad}");
-    }
-}
-
 /// Independent MXFP4 -> MLX `mxfp4` packing: codes `j` / `j + 16` are the
 /// low / high nibble of byte `1 + j`, 8 codes per u32 LSB first; byte 0 is
 /// the E8M0 scale.
@@ -581,7 +570,7 @@ fn real_layers() -> (Vec<PathBuf>, Arc<ShardSet>, Vec<[RealProj; 3]>) {
 #[ignore = "needs DSV41_DIR with the real DeepSeek-V4.1 shards"]
 fn real_smoke() {
     let (paths, shards, layers) = real_layers();
-    let pool = IoPool::from_env(Arc::clone(&shards)).unwrap();
+    let pool = IoPool::new(Arc::clone(&shards), DEFAULT_THREADS).unwrap();
     println!(
         "real_smoke: {} reader threads, profile debug_assertions={}",
         pool.threads(),
@@ -731,7 +720,7 @@ fn real_smoke() {
     );
 }
 
-/// P1 rates of the pool (`MLX_MOE_STREAM_IO_THREADS`) on real shards 2-7,
+/// Rates of the pool (`DSV41_IO_THREADS`, default 12) on real shards 2-7,
 /// read + repack into host slots, barrier per layer step, every (layer,
 /// expert) read at most once per process until the permutation wraps:
 /// K = 2 misses per layer for 3 tokens, then all-miss tokens (K = 6) back
@@ -742,7 +731,8 @@ fn real_smoke() {
 #[ignore = "needs DSV41_DIR with the real DeepSeek-V4.1 shards"]
 fn real_pool_rates() {
     let (_, shards, layers) = real_layers();
-    let pool = IoPool::from_env(Arc::clone(&shards)).unwrap();
+    let threads = std::env::var("DSV41_IO_THREADS").map_or(DEFAULT_THREADS, |v| v.parse().unwrap());
+    let pool = IoPool::new(Arc::clone(&shards), threads).unwrap();
     let sustain: f64 = std::env::var("DSV41_P1_SUSTAIN_S")
         .ok()
         .map_or(20.0, |v| v.parse().unwrap());

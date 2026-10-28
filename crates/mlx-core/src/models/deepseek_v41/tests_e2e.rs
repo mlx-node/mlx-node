@@ -1,8 +1,8 @@
 // S14a real end to end on the 9 shards (expert cache 0) vs the S12 goldens
 // (`$DSV41_GOLDEN/<case>/{fp32,bf16}`). mlx-node runs in f32 (DECISIONS
 // S13a-1, S14a-1). Per-step logits hashes go to `$DSV41_GOLDEN/hashes/`.
-// Run with `MLX_ENABLE_TF32=0`, `MLX_DSV41_EXPERT_CACHE_GB=0`,
-// `MLX_DSV41_STATS`, `MLX_DSV41_ROUTE_TRACE`.
+// Run with `MLX_DSV41_EXPERT_CACHE_GB=0`,
+// `MLX_DSV41_STATS`, `DSV41_ROUTE_TRACE`, `DSV41_DENSE`.
 
 use super::generate::{Call, Generated, generate};
 
@@ -104,12 +104,21 @@ fn self_noise(case: &str) -> Option<SelfNoise> {
     })
 }
 
+/// Dense mode of a real run: `DSV41_DENSE` = `exact` | `q8` (unset: `q8`,
+/// the product's).
+fn real_dense() -> DenseMode {
+    match std::env::var("DSV41_DENSE").ok().as_deref().map(str::trim) {
+        None | Some("") | Some("q8") => DenseMode::Q8,
+        Some("exact") => DenseMode::Exact,
+        Some(v) => panic!("DSV41_DENSE={v}: want exact or q8"),
+    }
+}
+
 fn e2e_store() -> Store {
-    assert_eq!(
-        std::env::var("MLX_ENABLE_TF32").as_deref(),
-        Ok("0"),
-        "DECISIONS S5-1"
-    );
+    e2e_store_in(real_dense())
+}
+
+fn e2e_store_in(mode: DenseMode) -> Store {
     assert_eq!(
         std::env::var("MLX_DSV41_EXPERT_CACHE_GB").as_deref(),
         Ok("0"),
@@ -117,7 +126,8 @@ fn e2e_store() -> Store {
     );
     set_cache_limit(POOL_LIMIT as f64).unwrap();
     let t0 = std::time::Instant::now();
-    let s = Store::open(&real_shards(), DType::Float32, FakeQuant::ON).unwrap();
+    let s = Store::open_dense(&real_shards(), DType::Float32, FakeQuant::ON, CachePlan::Off, mode)
+        .unwrap();
     println!(
         "load {:.1} s; dense mode {:?}; dense read {} B, resident {} B",
         t0.elapsed().as_secs_f64(),
@@ -192,7 +202,7 @@ fn check_io(g: &Generated, n_calls: usize, n_layers: usize, fails: &mut Vec<Stri
                 .count()
         })
     };
-    let trace = lines("MLX_DSV41_ROUTE_TRACE");
+    let trace = lines("DSV41_ROUTE_TRACE");
     if trace != Some(1 + n_calls * n_layers) {
         fails.push(format!(
             "G14.4 route trace lines {trace:?}, want {}",
@@ -377,7 +387,7 @@ fn real_e2e_tf(case: &str) {
 /// and on user-text targets; oracle fp32 NLL <= 3.0 and top-1 >= 40 % on
 /// user-text targets (S12a-4: template role tokens are never targets).
 #[test]
-#[ignore = "real 9 shards + S12 goldens; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
+#[ignore = "real 9 shards + S12 goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
 fn real_e2e_nll_en() {
     let gd = gold("p32k8-en");
     let store = e2e_store();
@@ -594,7 +604,7 @@ fn real_e2e_greedy(case: &str) {
 /// position`)` relL2 (DECISIONS S14a-6), greedy ids exact; the per-call logits
 /// hashes are the chunk-7 golden (later builds: bitwise).
 #[test]
-#[ignore = "real 9 shards + S12 goldens + greedy-p32k8-en logits; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
+#[ignore = "real 9 shards + S12 goldens + greedy-p32k8-en logits; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
 fn real_e2e_chunk7_en() {
     let gd = gold("p32k8-en");
     let whole: Vec<f32> = std::fs::read(golden_root().join("hashes/greedy-p32k8-en.logits.f32"))
@@ -616,11 +626,8 @@ fn real_e2e_chunk7_en() {
     // S14a-6: rows within max(1e-5, 2 x the oracle's own 1-ulp / call-split
     // spread at that position); greedy ids exact; hashes bitwise once stored
     let env = self_noise("p32k8-en");
-    let store = e2e_store();
-    assert!(
-        store.dense_mode.exact(),
-        "the chunk-7 golden is the exact path's: MLX_DSV41_DENSE=exact (DECISIONS P0-2)"
-    );
+    // the chunk-7 golden is the exact path's (DECISIONS P0-2)
+    let store = e2e_store_in(DenseMode::Exact);
     let vocab = store.model.cfg.vocab_size;
     let p = gd.prompt.len();
     let mut sess = store.model.new_session();
@@ -698,37 +705,37 @@ fn real_e2e_chunk7_en() {
 }
 
 #[test]
-#[ignore = "real 9 shards + S12 goldens; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
+#[ignore = "real 9 shards + S12 goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
 fn real_e2e_tf_en() {
     real_e2e_tf("p32k8-en");
 }
 
 #[test]
-#[ignore = "real 9 shards + S12 goldens; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
+#[ignore = "real 9 shards + S12 goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
 fn real_e2e_tf_zh() {
     real_e2e_tf("p32k8-zh");
 }
 
 #[test]
-#[ignore = "real 9 shards + S12 goldens; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
+#[ignore = "real 9 shards + S12 goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
 fn real_e2e_tf_code() {
     real_e2e_tf("p32k8-code");
 }
 
 #[test]
-#[ignore = "real 9 shards + S12 goldens; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
+#[ignore = "real 9 shards + S12 goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
 fn real_e2e_greedy_en() {
     real_e2e_greedy("p32k8-en");
 }
 
 #[test]
-#[ignore = "real 9 shards + S12 goldens; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
+#[ignore = "real 9 shards + S12 goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
 fn real_e2e_greedy_zh() {
     real_e2e_greedy("p32k8-zh");
 }
 
 #[test]
-#[ignore = "real 9 shards + S12 goldens; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
+#[ignore = "real 9 shards + S12 goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~17 GiB"]
 fn real_e2e_greedy_code() {
     real_e2e_greedy("p32k8-code");
 }
@@ -739,7 +746,7 @@ fn real_e2e_greedy_code() {
 /// env as in the CLI) greedy-decodes from the same prompt; ids must be equal.
 /// Expert cache 0 here, the CLI's auto cache there (D-13: same bits).
 #[test]
-#[ignore = "real 9 shards + DSV41_IDS (ds-run.ts JSON); MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=0; ~19 GiB"]
+#[ignore = "real 9 shards + DSV41_IDS (ds-run.ts JSON); MLX_DSV41_EXPERT_CACHE_GB=0; ~19 GiB"]
 fn real_e2e_greedy_from_ids() {
     let doc: Value =
         serde_json::from_slice(&std::fs::read(std::env::var_os("DSV41_IDS").expect("DSV41_IDS")).unwrap())

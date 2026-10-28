@@ -3559,8 +3559,6 @@ export interface DeepseekV41ContextLimits {
 
 /** The load-time and latest per-turn S15 admission, and the expert bank. */
 export interface DeepseekV41ResidencyInfo {
-  /** `exact`, `f32`, `q8` or `mixed` (`MLX_DSV41_DENSE`). */
-  denseMode: string;
   denseBytes: number;
   physicalBytes?: number;
   /** Other processes' (and other models') bytes at the last admission. */
@@ -3582,11 +3580,6 @@ export interface DeepseekV41ResidencyInfo {
   bankResidentAfterTurnBytes: number;
   bankSwitches: number;
   inTurn: boolean;
-  /**
-   * MLX TF32 GEMMs (`MLX_ENABLE_TF32`, process-wide); the reference
-   * numerics were gated with it off.
-   */
-  tf32: boolean;
 }
 
 /** The last saved turn of the session (S18 CLI-vs-Rust id gate). */

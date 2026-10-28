@@ -1,4 +1,4 @@
-// Store v1 gates. Run with `MLX_ENABLE_TF32=0` (DECISIONS S5-1).
+// Store v1 gates.
 
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -152,18 +152,13 @@ fn row_range_checked() {
 }
 
 fn cached_store(mode: &str, slots: usize) -> Store {
-    cached_store_in(mode, slots, CacheMode::default())
-}
-
-fn cached_store_in(mode: &str, slots: usize, cache_mode: CacheMode) -> Store {
     let (act, fq) = mode_of(mode);
-    Store::open_full(
+    Store::open_dense(
         &[fixture("tiny-q8_0.gguf")],
         act,
         fq,
         CachePlan::Slots(slots),
         DenseMode::Exact,
-        cache_mode,
     )
     .unwrap()
 }
@@ -204,11 +199,8 @@ fn tiny_cache_bitwise_any_size() {
             .iter()
             .map(|c| run(&reference.model, &case_ids(&npz, c), &split(c)).0)
             .collect();
-        for (slots, cm) in [1, 6, 16, 64]
-            .into_iter()
-            .flat_map(|s| [(s, CacheMode::Seeded), (s, CacheMode::Lru)])
-        {
-            let store = cached_store_in(mode, slots, cm);
+        for slots in [1, 6, 16, 64] {
+            let store = cached_store(mode, slots);
             assert_eq!(store.cache_slots(), slots);
             for (case, want) in ["c1", "c2", "c3"].iter().zip(&want) {
                 let before = store.bank.stats();
@@ -217,12 +209,12 @@ fn tiny_cache_bitwise_any_size() {
                 assert_eq!(
                     bits(&got),
                     bits(want),
-                    "{mode} S={slots} {cm:?} {case}: cache != staging-only"
+                    "{mode} S={slots} {case}: cache != staging-only"
                 );
                 store.bank.with_cache_dir(|c| c.check()).unwrap();
                 pool_ok(case);
                 println!(
-                    "{mode} S={slots} {cm:?} {case}: bitwise; uses {} hits {} reads {} occupied {}",
+                    "{mode} S={slots} {case}: bitwise; uses {} hits {} reads {} occupied {}",
                     st.uses - before.uses,
                     st.hits - before.hits,
                     st.slots - before.slots,
@@ -248,12 +240,9 @@ fn tiny_cache_bitwise_any_size() {
 fn tiny_cache_split_bitwise() {
     let npz = Npz::open("oracle.npz");
     for mode in ["fp32_on", "bf16_on"] {
-        for (slots, cm) in [0, 6, 64]
-            .into_iter()
-            .flat_map(|s| [(s, CacheMode::Seeded), (s, CacheMode::Lru)])
-        {
-            let off = cached_store_in(mode, slots, cm);
-            let on = cached_store_in(mode, slots, cm);
+        for slots in [0, 6, 64] {
+            let off = cached_store(mode, slots);
+            let on = cached_store(mode, slots);
             off.bank.set_split(false);
             on.bank.set_split(true);
             for case in ["c1", "c2", "c3"] {
@@ -263,7 +252,7 @@ fn tiny_cache_split_bitwise() {
                 assert_eq!(
                     bits(&b),
                     bits(&a),
-                    "{mode} S={slots} {cm:?} {case}: split != unsplit"
+                    "{mode} S={slots} {case}: split != unsplit"
                 );
             }
             let (so, sn) = (off.bank.stats(), on.bank.stats());
@@ -271,19 +260,19 @@ fn tiny_cache_split_bitwise() {
             assert_eq!(
                 (so.uses, so.hits, so.slots),
                 (sn.uses, sn.hits, sn.slots),
-                "{mode} S={slots} {cm:?}: split changed the cache decisions"
+                "{mode} S={slots}: split changed the cache decisions"
             );
-            assert!(sn.split_steps > 0, "{mode} S={slots} {cm:?}: no split step");
+            assert!(sn.split_steps > 0, "{mode} S={slots}: no split step");
             if slots == 64 {
                 assert!(
                     sn.split_mixed > 0,
-                    "{mode} S=64 {cm:?}: pass A never had ready experts"
+                    "{mode} S=64: pass A never had ready experts"
                 );
             }
             on.bank.with_cache_dir(|c| c.check()).unwrap();
             pool_ok(mode);
             println!(
-                "{mode} S={slots} {cm:?}: bitwise; split steps {} (mixed {}), reads {}, wait {} us of io {} us",
+                "{mode} S={slots}: bitwise; split steps {} (mixed {}), reads {}, wait {} us of io {} us",
                 sn.split_steps,
                 sn.split_mixed,
                 sn.slots,
@@ -294,7 +283,7 @@ fn tiny_cache_split_bitwise() {
     }
 }
 
-/// `MLX_DSV41_TEST_FORCE_EMPTY` hook: the bank is `Empty` between turn 1
+/// `test_force_empty` hook: the bank is `Empty` between turn 1
 /// and turn 2; turn 2 forgets every slot, re-reads, and its logits are
 /// bitwise those of a store whose bank stayed (volatile, not purged).
 #[test]
@@ -502,11 +491,8 @@ fn tiny_cache_own_is_this_model_only() {
 fn tiny_cache_replay_matches_live() {
     use crate::moe_stream::replay::{Step, replay};
     let npz = Npz::open("oracle.npz");
-    for (slots, cm) in [0, 1, 6, 16, 64]
-        .into_iter()
-        .flat_map(|s| [(s, CacheMode::Seeded), (s, CacheMode::Lru)])
-    {
-        let store = cached_store_in("fp32_on", slots, cm);
+    for slots in [0, 1, 6, 16, 64] {
+        let store = cached_store("fp32_on", slots);
         let mut steps = Vec::new();
         for case in ["c1", "c2", "c3"] {
             let (_, traces) = run(&store.model, &case_ids(&npz, case), &split(case));
@@ -521,17 +507,16 @@ fn tiny_cache_replay_matches_live() {
             }
         }
         let cfg = &store.model.cfg;
-        let mut c = crate::moe_stream::cache::Cache::lru(slots, cfg.n_layers, cfg.n_routed_experts)
-            .with_mode(cm);
+        let mut c = crate::moe_stream::cache::Cache::lru(slots, cfg.n_layers, cfg.n_routed_experts);
         let r = replay(&mut c, cfg.n_routed_experts, &steps);
         let st = store.bank.stats();
         assert_eq!(
             (r.uses, r.hits, r.reads),
             (st.uses as u64, st.hits as u64, st.slots as u64),
-            "S={slots} {cm:?}: replay != live"
+            "S={slots}: replay != live"
         );
         println!(
-            "S={slots} {cm:?}: uses {} hits {} reads {} (h {:.3}, decode h {:.3})",
+            "S={slots}: uses {} hits {} reads {} (h {:.3}, decode h {:.3})",
             r.uses,
             r.hits,
             r.reads,
@@ -660,6 +645,14 @@ fn tiny_cache_admit_turns() {
     let npz = Npz::open("oracle.npz");
     let ids = case_ids(&npz, "c1");
     let (act, fq) = mode_of("fp32_on");
+    // a quiet 128 GiB host: the tiny admission must not depend on how much
+    // memory the test host has free
+    let quiet = crate::utils::host::HostMemory {
+        physical: 128 << 30,
+        wired: 24 << 30,
+        ..Default::default()
+    };
+    super::TEST_HOST.with(|h| h.set(Some((quiet, 100 << 30))));
     let limits = crate::moe_stream::budget::Limits {
         cache_cap: Some(1 << 30),
         ..Default::default()
@@ -698,55 +691,38 @@ fn tiny_cache_admit_turns() {
     store.end_turn().unwrap();
 }
 
-/// D-41 (stage P0) on the tiny file: `F32` == `Exact` bitwise (fp32 fq
-/// on/off, bf16, c1-c3); `Q8` and `Mixed` within G9.1's fq-off bound of
-/// the oracle (1e-4) and not bitwise `Exact` (the quantized matmul runs);
-/// fq on is printed only (a 1e-6 change flips near-edge fp8 codes, S7-5:
-/// Mixed c2 2.7e-2); resident dense bytes == the scan's prediction.
+/// `Q8` within G9.1's fq-off bound of the oracle (1e-4) and not bitwise
+/// `Exact` (the quantized matmul runs); fq on is printed only (a 1e-6 change
+/// flips near-edge fp8 codes, S7-5); resident dense bytes == the scan's
+/// prediction.
 #[test]
 fn tiny_dense_modes() {
     let npz = Npz::open("oracle.npz");
-    for mode in ["fp32_on", "fp32_off", "bf16_on"] {
-        let (exact, f32s) = (
+    for (mode, tol) in [("fp32_off", 1e-4f32), ("fp32_on", f32::INFINITY)] {
+        let (st, exact) = (
+            tiny_dense(mode, DenseMode::Q8),
             tiny_dense(mode, DenseMode::Exact),
-            tiny_dense(mode, DenseMode::F32),
         );
+        let mut differs = false;
         for case in ["c1", "c2", "c3"] {
             let ids = case_ids(&npz, case);
-            let (a, _) = run(&exact.model, &ids, &split(case));
-            let (b, _) = run(&f32s.model, &ids, &split(case));
-            assert_eq!(bits(&a), bits(&b), "{case} {mode}: F32 != Exact");
+            let (got, _) = run(&st.model, &ids, &split(case));
+            let (ex, _) = run(&exact.model, &ids, &split(case));
+            differs |= bits(&got) != bits(&ex);
+            let want = &npz.get(&format!("{case}.{mode}.logits")).1;
+            let d = got
+                .iter()
+                .zip(want)
+                .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+            println!("Q8 {case} {mode}: max|dlogit| vs oracle {d:e} (gate {tol:e})");
+            assert!(d < tol, "Q8 {case} {mode}: max|dlogit| {d:e}");
         }
+        assert!(
+            differs,
+            "Q8 {mode}: bitwise Exact, quantized matmul not used"
+        );
     }
-    for dense in [DenseMode::Q8, DenseMode::Mixed] {
-        for (mode, tol) in [("fp32_off", 1e-4f32), ("fp32_on", f32::INFINITY)] {
-            let (st, exact) = (tiny_dense(mode, dense), tiny_dense(mode, DenseMode::Exact));
-            let mut differs = false;
-            for case in ["c1", "c2", "c3"] {
-                let ids = case_ids(&npz, case);
-                let (got, _) = run(&st.model, &ids, &split(case));
-                let (ex, _) = run(&exact.model, &ids, &split(case));
-                differs |= bits(&got) != bits(&ex);
-                let want = &npz.get(&format!("{case}.{mode}.logits")).1;
-                let d = got
-                    .iter()
-                    .zip(want)
-                    .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
-                println!("{dense:?} {case} {mode}: max|dlogit| vs oracle {d:e} (gate {tol:e})");
-                assert!(d < tol, "{dense:?} {case} {mode}: max|dlogit| {d:e}");
-            }
-            assert!(
-                differs,
-                "{dense:?} {mode}: bitwise Exact, quantized matmul not used"
-            );
-        }
-    }
-    for dense in [
-        DenseMode::Exact,
-        DenseMode::F32,
-        DenseMode::Q8,
-        DenseMode::Mixed,
-    ] {
+    for dense in [DenseMode::Exact, DenseMode::Q8] {
         let st = tiny_dense("fp32_on", dense);
         let size = model_size(&[fixture("tiny-q8_0.gguf")], dense).unwrap();
         println!("{dense:?}: dense resident {} B", st.dense_bytes);
@@ -834,42 +810,31 @@ fn tiny_qmm_dense_ops() {
     // P0 codex: header-derived resident sizes are checked
     let mut huge = info.clone();
     huge.dims = vec![32, 1u64 << 59];
-    for mode in [
-        DenseMode::Exact,
-        DenseMode::F32,
-        DenseMode::Q8,
-        DenseMode::Mixed,
-    ] {
+    for mode in [DenseMode::Exact, DenseMode::Q8] {
         assert!(mode.resident(&huge).is_err(), "{mode:?} overflow");
     }
-    huge.dims = vec![32, 1u64 << 57];
-    assert!(DenseMode::F32.resident(&huge).is_err(), "f32 4n overflow");
 }
 
-/// Stage P4: a bank with two staging layers and the next-layer prefetch
-/// (off / pred / all) gives the one-staging-layer store's logits bitwise
-/// (c1-c3, S in {0, 6, 64} x {Seeded, Lru}); a cold one-call prefill reads
+/// A bank with two staging layers, with and without the next-layer read
+/// ahead, gives the one-staging-layer store's logits bitwise (c1-c3,
+/// S in {0, 6, 64}); a cold one-call prefill reads
 /// every used (layer, expert) once plus the prefetched ones no route used,
 /// never twice (a prefill seed of a staged expert is copied, not re-read).
 #[test]
 fn tiny_prefetch_bitwise() {
-    use crate::moe_stream::bank::PrefetchMode;
     let npz = Npz::open("oracle.npz");
     let c1 = case_ids(&npz, "c1");
     for mode in ["fp32_on", "bf16_on"] {
-        for (slots, cm) in [0, 6, 64]
-            .into_iter()
-            .flat_map(|s| [(s, CacheMode::Seeded), (s, CacheMode::Lru)])
-        {
-            let reference = cached_store_in(mode, slots, cm);
+        for slots in [0, 6, 64] {
+            let reference = cached_store(mode, slots);
             let want: Vec<Vec<f32>> = ["c1", "c2", "c3"]
                 .iter()
                 .map(|case| run(&reference.model, &case_ids(&npz, case), &split(case)).0)
                 .collect();
-            for pm in [PrefetchMode::Off, PrefetchMode::Pred, PrefetchMode::All] {
-                let s = cached_store_in(mode, slots, cm);
+            for pm in [false, true] {
+                let s = cached_store(mode, slots);
                 s.bank.rebuild_staging(slots, 2).unwrap();
-                s.bank.set_prefetch_mode(pm);
+                s.bank.set_prefetch(pm);
                 assert_eq!(s.bank.staging_layers(), 2);
                 let mut sess = s.model.new_session();
                 let mut tr = Trace::default();
@@ -885,25 +850,25 @@ fn tiny_prefetch_bitwise() {
                 assert_eq!(
                     st.slots,
                     used + st.prefetch_unused,
-                    "{mode} S={slots} {cm:?} {pm:?}: reads {} != used {used} + unused prefetch {}",
+                    "{mode} S={slots} prefetch {pm}: reads {} != used {used} + unused prefetch {}",
                     st.slots,
                     st.prefetch_unused
                 );
                 assert!(st.prefetch_unused <= st.prefetch_slots);
-                assert_eq!(st.prefetch_slots > 0, pm != PrefetchMode::Off, "{pm:?}");
+                assert_eq!(st.prefetch_slots > 0, pm, "prefetch {pm}");
                 for (i, case) in ["c1", "c2", "c3"].iter().enumerate() {
                     let (got, _) = run(&s.model, &case_ids(&npz, case), &split(case));
                     assert_eq!(
                         bits(&got),
                         bits(&want[i]),
-                        "{mode} S={slots} {cm:?} {pm:?} {case}: 2 staging layers != 1"
+                        "{mode} S={slots} prefetch {pm} {case}: 2 staging layers != 1"
                     );
                 }
                 s.bank.with_cache_dir(|c| c.check()).unwrap();
                 assert_eq!(s.bank.reads_in_flight(), 0);
                 pool_ok(mode);
                 println!(
-                    "{mode} S={slots} {cm:?} {pm:?}: bitwise; cold c1 reads {} = used {used} + unused {} (prefetched {}, copied {})",
+                    "{mode} S={slots} prefetch {pm}: bitwise; cold c1 reads {} = used {used} + unused {} (prefetched {}, copied {})",
                     st.slots, st.prefetch_unused, st.prefetch_slots, st.promoted
                 );
             }
@@ -918,17 +883,13 @@ fn tiny_prefetch_bitwise() {
 /// a cache victim and the cache evolves differently (not modelled).
 #[test]
 fn tiny_replay_two_staging_layers() {
-    use crate::moe_stream::bank::PrefetchMode;
     use crate::moe_stream::replay::{Replayed, Step, replay_turns_staged};
     let npz = Npz::open("oracle.npz");
-    for (slots, cm) in [0, 6, 64]
-        .into_iter()
-        .flat_map(|s| [(s, CacheMode::Seeded), (s, CacheMode::Lru)])
-    {
-        for pm in [PrefetchMode::Off, PrefetchMode::Pred, PrefetchMode::All] {
-            let store = cached_store_in("fp32_on", slots, cm);
+    for slots in [0, 6, 64] {
+        for pm in [false, true] {
+            let store = cached_store("fp32_on", slots);
             store.bank.rebuild_staging(slots, 2).unwrap();
-            store.bank.set_prefetch_mode(pm);
+            store.bank.set_prefetch(pm);
             let mut steps = Vec::new();
             for case in ["c1", "c2", "c3"] {
                 let (_, traces) = run(&store.model, &case_ids(&npz, case), &split(case));
@@ -944,23 +905,22 @@ fn tiny_replay_two_staging_layers() {
             }
             let cfg = &store.model.cfg;
             let mut c =
-                crate::moe_stream::cache::Cache::lru(slots, cfg.n_layers, cfg.n_routed_experts)
-                    .with_mode(cm);
+                crate::moe_stream::cache::Cache::lru(slots, cfg.n_layers, cfg.n_routed_experts);
             let r = replay_turns_staged(&mut c, cfg.n_routed_experts, 2, &[&steps])
                 .into_iter()
                 .fold(Replayed::default(), Replayed::plus);
             let st = store.bank.stats();
             let net = (st.slots - st.prefetch_unused) as u64;
-            assert_eq!(r.uses, st.uses as u64, "S={slots} {cm:?} {pm:?}: uses");
-            if pm == PrefetchMode::Off {
+            assert_eq!(r.uses, st.uses as u64, "S={slots} prefetch {pm}: uses");
+            if !pm {
                 assert_eq!(
                     (r.hits, r.reads),
                     (st.hits as u64, net),
-                    "S={slots} {cm:?}: replay != live"
+                    "S={slots}: replay != live"
                 );
             }
             println!(
-                "S={slots} {cm:?} {pm:?}: uses {} hits replay {} live {} reads replay {} live net {net} (+{} unused prefetch)",
+                "S={slots} prefetch {pm}: uses {} hits replay {} live {} reads replay {} live net {net} (+{} unused prefetch)",
                 r.uses, r.hits, st.hits, r.reads, st.prefetch_unused
             );
         }
@@ -972,7 +932,7 @@ fn tiny_replay_two_staging_layers() {
 /// waits for every read in flight.
 #[test]
 fn tiny_rebuild_waits_for_reads_in_flight() {
-    let s = cached_store_in("fp32_on", 0, CacheMode::Seeded);
+    let s = cached_store("fp32_on", 0);
     s.bank.test_delay_reads(300);
     let (p, pending) = s.bank.prepare_split(0, &[0, 1, 2], &[], false).unwrap();
     assert!(pending.is_some() && s.bank.reads_in_flight() == 1);
@@ -988,7 +948,7 @@ fn tiny_rebuild_waits_for_reads_in_flight() {
     drop(pending);
     s.bank.test_delay_reads(0);
     let npz = Npz::open("oracle.npz");
-    let reference = cached_store_in("fp32_on", 0, CacheMode::Seeded);
+    let reference = cached_store("fp32_on", 0);
     let case = "c2";
     let (want, _) = run(&reference.model, &case_ids(&npz, case), &split(case));
     let (got, _) = run(&s.model, &case_ids(&npz, case), &split(case));
@@ -1002,18 +962,17 @@ fn tiny_rebuild_waits_for_reads_in_flight() {
 /// (old rule `l <= layer`: layer 2 tagged slots that layer 0 had refilled).
 #[test]
 fn tiny_cancel_retry_settles_read_ahead() {
-    use crate::moe_stream::bank::PrefetchMode;
     let npz = Npz::open("oracle.npz");
     let c1 = case_ids(&npz, "c1");
-    let reference = cached_store_in("fp32_on", 0, CacheMode::Seeded);
+    let reference = cached_store("fp32_on", 0);
     let mut rs = reference.model.new_session();
     let want = bits(&read(
         &reference.model.forward(&mut rs, &c1, None, None).unwrap(),
     ));
-    for pm in [PrefetchMode::Pred, PrefetchMode::All] {
-        let s = cached_store_in("fp32_on", 0, CacheMode::Seeded);
+    {
+        let s = cached_store("fp32_on", 0);
         s.bank.rebuild_staging(0, 2).unwrap();
-        s.bank.set_prefetch_mode(pm);
+        s.bank.set_prefetch(true);
         let mut sess = s.model.new_session();
         let cancel = |l: usize| l == 2;
         assert!(
@@ -1028,7 +987,7 @@ fn tiny_cancel_retry_settles_read_ahead() {
         // let the orphaned read ahead land before the retry refills half 0
         std::thread::sleep(std::time::Duration::from_millis(200));
         let got = bits(&read(&s.model.forward(&mut sess, &c1, None, None).unwrap()));
-        assert_eq!(got, want, "{pm:?}: retry after a cancel != clean store");
+        assert_eq!(got, want, "retry after a cancel != clean store");
         assert_eq!(s.bank.reads_in_flight(), 0);
     }
 }
@@ -1057,7 +1016,6 @@ fn session_bits(sess: &Session) -> Vec<Vec<u32>> {
 #[test]
 fn tiny_layer_skip_bitwise() {
     use crate::models::deepseek_v41::block::set_test_chunk_rows;
-    use crate::moe_stream::bank::PrefetchMode;
     let (g, npz) = (TinyGguf::open(), Npz::open("oracle.npz"));
     let c1 = case_ids(&npz, "c1");
     let s = c1.len();
@@ -1108,9 +1066,9 @@ fn tiny_layer_skip_bitwise() {
             let mut resident = tiny(&g, act, fq, true);
             check(&mut resident, &format!("{mode} cap {cap} resident"));
             for slots in [0usize, 64] {
-                let mut st = cached_store_in(mode, slots, CacheMode::Seeded);
+                let mut st = cached_store(mode, slots);
                 st.bank.rebuild_staging(slots, 2).unwrap();
-                st.bank.set_prefetch_mode(PrefetchMode::Pred);
+                st.bank.set_prefetch(true);
                 check(
                     &mut st.model,
                     &format!("{mode} cap {cap} S={slots} 2 staging pred"),

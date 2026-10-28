@@ -1,7 +1,6 @@
 //! Store v1: the model straight from the GGUF shards. Dense tensors are read
 //! once by aligned `F_NOCACHE` `pread` and kept resident (Q8_0 as MLX affine
-//! 8-bit codes multiplied by `quantized_matmul` by default, or in the exact
-//! f32 forms, `DenseMode`; F32 as is);
+//! 8-bit codes multiplied by `quantized_matmul`; F32 as is);
 //! routed experts stream per layer into the shared bank (staging + global
 //! cache, sized by `CachePlan`); engram rows come from `PreadTable`.
 //!
@@ -26,17 +25,16 @@ use super::rows::PreadTable;
 use crate::array::alloc::OutLayout;
 use crate::array::{DType, MxArray};
 use crate::cache_limit::{CacheLimitGuard, coordinator};
-use crate::moe_stream::bank::{ExpertTensor, PrefetchMode, StagingBank};
+use crate::moe_stream::bank::{ExpertTensor, StagingBank};
 use crate::moe_stream::budget::{
     Admission, Limits, ModelSize, Own, Turn, admit, readmit, working_set,
 };
-use crate::moe_stream::cache::CacheMode;
-use crate::moe_stream::io::{AlignedBuf, Extent, IoPool, ShardSet, open_nocache};
+use crate::moe_stream::io::{AlignedBuf, DEFAULT_THREADS, Extent, IoPool, ShardSet, open_nocache};
 use crate::stream::WiredLimitContext;
 use crate::utils::gguf::{GgufFile, GgufTensorInfo, GgufTensorType, parse_gguf_reader};
 use crate::utils::gguf_cpu_repack::decode_affine_band_into;
 use crate::utils::gguf_gpu::RepackDst;
-use crate::utils::host::host_memory;
+use crate::utils::host::{HostMemory, host_memory};
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("deepseek_v41 store: {msg}"))
@@ -77,42 +75,17 @@ pub enum Dense {
     },
 }
 
-/// How Q8_0 matrices are held (D-41, stage P0; env `MLX_DSV41_DENSE`).
+/// How Q8_0 matrices are held.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DenseMode {
-    /// Codes + f16 scales, f32 built at each use (S11).
-    Exact,
-    /// f32 built once at load: bitwise == `Exact`. The embedding stays
-    /// codes (rows only).
-    F32,
     /// `quantized_matmul` on the codes (embedding: codes, rows only).
     Q8,
-    /// f32 for attention, compressor, indexer and head; `Q8` for the rest.
-    Mixed,
+    /// Codes + f16 scales, f32 built at each use: the reference's f32 math,
+    /// for the bitwise tests.
+    #[cfg(test)]
+    Exact,
 }
 
-pub const DENSE_ENV: &str = "MLX_DSV41_DENSE";
-
-/// Expert cache rules (stage P2): `seeded` (default) | `lru` (S16a).
-pub const CACHE_MODE_ENV: &str = "MLX_DSV41_CACHE_MODE";
-
-/// `MLX_DSV41_CACHE_MODE`; unset or empty = `CacheMode::default()`
-/// (`Seeded`, DECISIONS P2); anything else is refused.
-pub fn cache_mode_from_env() -> Result<CacheMode> {
-    match std::env::var(CACHE_MODE_ENV).ok().as_deref().map(str::trim) {
-        None | Some("") => Ok(CacheMode::default()),
-        Some("seeded") => Ok(CacheMode::Seeded),
-        Some("lru") => Ok(CacheMode::Lru),
-        Some(v) => Err(bad(format!("{CACHE_MODE_ENV}={v}: want seeded or lru"))),
-    }
-}
-
-/// Decode steps overlap expert reads with GPU work (stage P3): `on`
-/// (default) | `off`.
-pub const SPLIT_ENV: &str = "MLX_DSV41_SPLIT";
-
-/// `MLX_DSV41_SPLIT`; unset or empty = on (DECISIONS P3); anything else
-/// than on / off is refused.
 /// Staging layers of a bank opened without an admission
 /// (`MLX_DSV41_STAGING_LAYERS` = 1 or 2; unset: 1).
 pub fn staging_from_env() -> Result<usize> {
@@ -130,80 +103,29 @@ pub fn staging_from_env() -> Result<usize> {
     }
 }
 
-/// Long-prompt layer skip in the last-row prefill (stage P5): `on`
-/// (default) | `off`.
-pub const SKIP_ENV: &str = "MLX_DSV41_SKIP";
-
-/// `MLX_DSV41_SKIP`; unset or empty = on (DECISIONS P5); anything else than
-/// on / off is refused.
-pub fn skip_from_env() -> Result<bool> {
-    match std::env::var(SKIP_ENV).ok().as_deref().map(str::trim) {
-        None | Some("") | Some("on") => Ok(true),
-        Some("off") => Ok(false),
-        Some(v) => Err(bad(format!("{SKIP_ENV}={v}: want on or off"))),
-    }
-}
-
-pub fn split_from_env() -> Result<bool> {
-    match std::env::var(SPLIT_ENV).ok().as_deref().map(str::trim) {
-        None | Some("") | Some("on") => Ok(true),
-        Some("off") => Ok(false),
-        Some(v) => Err(bad(format!("{SPLIT_ENV}={v}: want on or off"))),
-    }
-}
-
 /// What one Q8_0 tensor becomes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Form {
     Codes,
-    F32,
     Qmm,
 }
 
 impl DenseMode {
-    /// The production default: fastest decode at the auto budget with greedy
-    /// ids == `Exact` (DECISIONS P0-2). `Exact` stays the reference for tests.
-    pub const DEFAULT: Self = Self::Q8;
-
-    /// `MLX_DSV41_DENSE` = `exact` | `f32` | `q8` | `mixed`; unset or empty
-    /// = `DEFAULT`; anything else is refused.
-    pub fn from_env() -> Result<Self> {
-        match std::env::var(DENSE_ENV).ok().as_deref().map(str::trim) {
-            None | Some("") => Ok(Self::DEFAULT),
-            Some("exact") => Ok(Self::Exact),
-            Some("f32") => Ok(Self::F32),
-            Some("q8") => Ok(Self::Q8),
-            Some("mixed") => Ok(Self::Mixed),
-            Some(v) => Err(bad(format!(
-                "{DENSE_ENV}={v}: want exact, f32, q8 or mixed"
-            ))),
-        }
-    }
-
-    /// Bitwise equal to the reference f32 path (`Exact`).
-    pub fn exact(self) -> bool {
-        matches!(self, Self::Exact | Self::F32)
-    }
-
-    /// Hash-file suffix of runs in this mode ("" for the exact ones).
+    /// Hash-file suffix of runs in this mode ("" for the exact one).
     pub fn tag(self) -> &'static str {
         match self {
-            Self::Exact | Self::F32 => "",
             Self::Q8 => ".q8",
-            Self::Mixed => ".mixed",
+            #[cfg(test)]
+            Self::Exact => "",
         }
     }
 
     fn form(self, name: &str) -> Form {
-        let attn_or_head =
-            name == "output.weight" || name.contains(".attn_") || name.contains(".indexer.");
         match self {
             _ if name == "token_embd.weight" => Form::Codes,
-            Self::Exact => Form::Codes,
-            Self::F32 => Form::F32,
             Self::Q8 => Form::Qmm,
-            Self::Mixed if attn_or_head => Form::F32,
-            Self::Mixed => Form::Qmm,
+            #[cfg(test)]
+            Self::Exact => Form::Codes,
         }
     }
 
@@ -215,7 +137,6 @@ impl DenseMode {
         let n = t.num_elements()?;
         let r = match self.form(&t.name) {
             Form::Codes => n.checked_add(n / 16),
-            Form::F32 => n.checked_mul(4),
             Form::Qmm => n.checked_add(n / 4),
         };
         r.ok_or_else(|| bad(format!("{}: resident size overflows u64", t.name)))
@@ -364,8 +285,6 @@ type Located = (usize, u64, GgufTensorInfo);
 /// Expert projections in bank order.
 const PROJS: [&str; 3] = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"];
 const ENGRAM_TABLE: &str = "per_layer_token_embd.weight";
-/// Free host memory left after the load (D-15 reserve).
-const RESERVE: u64 = 16 << 30;
 /// MLX free-buffer pool ceiling (D-33).
 pub const POOL_LIMIT: usize = 1 << 30;
 /// v1 context limit (D-24): the admission's KV / compute terms use it.
@@ -405,6 +324,24 @@ pub struct Store {
     turn: Mutex<TurnState>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The host reading the admission sees on this thread instead of the
+    /// real one, so tiny tests do not depend on the test host's free memory.
+    pub(super) static TEST_HOST: std::cell::Cell<Option<(HostMemory, u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Host memory and the Metal working set for an admission.
+fn host_reading() -> Result<(HostMemory, u64)> {
+    #[cfg(test)]
+    if let Some(r) = TEST_HOST.with(std::cell::Cell::get) {
+        return Ok(r);
+    }
+    let h = host_memory().ok_or_else(|| bad("no host memory reading for admission"))?;
+    Ok((h, working_set()))
+}
+
 fn header(path: &Path) -> Result<GgufFile> {
     parse_gguf_reader(std::io::BufReader::new(open_nocache(path)?))
         .map_err(|e| bad(format!("'{}': {e}", path.display())))
@@ -417,17 +354,16 @@ impl Store {
     }
 
     /// `paths` are every shard in order (shard 0 holds the metadata); dense
-    /// mode from `MLX_DSV41_DENSE` (`DenseMode::from_env`).
+    /// Q8_0 as `DenseMode::Q8`.
     pub fn open_with(
         paths: &[PathBuf],
         act: DType,
         fq: FakeQuant,
         plan: CachePlan,
     ) -> Result<Self> {
-        Self::open_dense(paths, act, fq, plan, DenseMode::from_env()?)
+        Self::open_dense(paths, act, fq, plan, DenseMode::Q8)
     }
 
-    /// Cache rules from `MLX_DSV41_CACHE_MODE` (`cache_mode_from_env`).
     pub fn open_dense(
         paths: &[PathBuf],
         act: DType,
@@ -435,30 +371,14 @@ impl Store {
         plan: CachePlan,
         mode: DenseMode,
     ) -> Result<Self> {
-        Self::open_full(paths, act, fq, plan, mode, cache_mode_from_env()?)
-    }
-
-    pub fn open_full(
-        paths: &[PathBuf],
-        act: DType,
-        fq: FakeQuant,
-        plan: CachePlan,
-        mode: DenseMode,
-        cache_mode: CacheMode,
-    ) -> Result<Self> {
-        // env switches are validated before anything is allocated (a refusal
-        // after the bank exists would leave it in MLX's free pool; P5 codex)
-        let (split, prefetch, skip) = (
-            split_from_env()?,
-            PrefetchMode::from_env()?,
-            skip_from_env()?,
-        );
+        // validated before anything is allocated: a refusal after the bank
+        // exists would leave it in MLX's free pool
+        let staging_env = staging_from_env()?;
         let Scan {
             where_,
             cfg,
             layers,
             size,
-            bank_need,
         } = scan(paths, mode)?;
         let find = |n: &str| {
             where_
@@ -467,30 +387,14 @@ impl Store {
         };
         let (cache_slots, admission) = match &plan {
             CachePlan::Admit(limits) => {
-                let h = host_memory().ok_or_else(|| bad("no host memory reading for admission"))?;
+                let (h, ws) = host_reading()?;
                 // nothing of this model exists yet: every byte in use is others'
-                let a = admit(&size, limits, &h, &Own::default(), working_set())?;
+                let a = admit(&size, limits, &h, &Own::default(), ws)?;
                 tracing::info!("deepseek_v41 admission at load: {a}");
                 (a.cache_slots as usize, Some(a))
             }
-            CachePlan::Off | CachePlan::Slots(_) => {
-                let slots = if let CachePlan::Slots(n) = plan { n } else { 0 };
-                if let Some(h) = host_memory() {
-                    let free = h.physical.saturating_sub(h.non_reclaimable());
-                    let need = bank_need * staging_from_env()? as u64
-                        + slots as u64 * size.slot
-                        + size.dense;
-                    if need + RESERVE > free {
-                        return Err(bad(format!(
-                            "load needs {} GiB + {} GiB reserve, host has {} GiB free",
-                            need >> 30,
-                            RESERVE >> 30,
-                            free >> 30
-                        )));
-                    }
-                }
-                (slots, None)
-            }
+            CachePlan::Off => (0, None),
+            CachePlan::Slots(n) => (*n, None),
         };
         let shards = Arc::new(ShardSet::open(paths)?);
         let t_bank = Instant::now();
@@ -498,17 +402,16 @@ impl Store {
         // would otherwise shrink (S15-5); without an admission, the env
         let staging = match &admission {
             Some(a) => a.staging_layers as usize,
-            None => staging_from_env()?,
+            None => staging_env,
         };
         let bank = Arc::new(StagingBank::with_staging(
-            IoPool::from_env(Arc::clone(&shards))?,
+            IoPool::new(Arc::clone(&shards), DEFAULT_THREADS)?,
             layers,
             cache_slots,
-            cache_mode,
             staging,
         )?);
-        bank.set_split(split);
-        bank.set_prefetch_mode(prefetch);
+        bank.set_split(true);
+        bank.set_prefetch(true);
         let bank_alloc_s = t_bank.elapsed().as_secs_f64();
         let (mut dense_read, mut dense_bytes) = (0u64, 0u64);
         let mut buf = AlignedBuf::new();
@@ -532,11 +435,6 @@ impl Store {
                     );
                     match mode.form(n) {
                         Form::Codes => Dense::Q8 { w, scales },
-                        Form::F32 => {
-                            let a = dequant_q8(&w, &scales)?;
-                            MxArray::eval_arrays_with_context(&[&a], "deepseek_v41 f32 dense")?;
-                            Dense::Array(a)
-                        }
                         Form::Qmm => {
                             let s = scales.astype(DType::Float32)?;
                             let b = s.mul_scalar(-128.0)?;
@@ -586,7 +484,6 @@ impl Store {
             };
         // the admission's KV / compute terms hold up to this context only
         model.ctx_limit = Some(size.ctx as usize);
-        model.layer_skip = skip;
         let guard =
             coordinator().register_with_cache_limit(dense_bytes + bank.nbytes(), Some(POOL_LIMIT));
         Ok(Self {
@@ -681,9 +578,8 @@ impl Store {
             // for certain and counted as own (allocates nothing)
             self.bank.begin_turn()?;
             let next = (|| {
-                let h = host_memory().ok_or_else(|| bad("no host memory reading for admission"))?;
-                let next = match readmit(&cur, &self.size, limits, &h, &self.own()?, working_set())?
-                {
+                let (h, ws) = host_reading()?;
+                let next = match readmit(&cur, &self.size, limits, &h, &self.own()?, ws)? {
                     Turn::Keep => cur,
                     Turn::StagingOnly(a) | Turn::Rebuild(a) => {
                         self.switch(&mut t, a.cache_slots as usize, a.staging_layers as usize)?;
@@ -727,7 +623,6 @@ struct Scan {
     cfg: DeepseekV41Config,
     layers: Vec<Vec<ExpertTensor>>,
     size: ModelSize,
-    bank_need: u64,
 }
 
 fn scan(paths: &[PathBuf], mode: DenseMode) -> Result<Scan> {
@@ -783,7 +678,6 @@ fn scan(paths: &[PathBuf], mode: DenseMode) -> Result<Scan> {
         cfg,
         layers,
         size,
-        bank_need,
     })
 }
 

@@ -162,22 +162,23 @@ Output does not depend on the cache: each (row, expert) output is computed on
 its own and summed in a fixed order, so any cache size, cache policy, read
 order or row skip gives bitwise the same logits as the staging-only path. The
 math follows the DeepSeek 1017 reference (fp32 router, activation fake-quant at
-the reference's sites). The default dense path (`MLX_DSV41_DENSE=q8`) runs
-`quantized_matmul` on the Q8_0 codes, so its rounding differs from the
-reference (its greedy ids were checked equal to the reference's on the test
-prompts). For reference-exact numerics set both `MLX_DSV41_DENSE=exact` and
-`MLX_ENABLE_TF32=0` before the process's first matmul; the load does not change
-TF32 for you.
+the reference's sites). The dense weights run `quantized_matmul` on the Q8_0
+codes, so their rounding differs from the reference's f32 dequantization (the
+greedy ids were checked equal to the reference's on the test prompts). The
+model thread computes its f32 matmuls in true f32 whatever `MLX_ENABLE_TF32`
+says: NAX GPUs (M5) otherwise run them in TF32, which the reference's f32
+router and mixing sites do not tolerate. Other models in the same process keep
+MLX's setting.
 
 The admission runs again at every turn. If other apps grew, the expert cache is
 dropped to staging only (never shrunk in place); if memory came back, it is
 rebuilt larger. Between turns the bank is purgeable, so the OS can take it back.
-`model.residencyInfo()` reports the dense mode, the cache size and slot count,
+`model.residencyInfo()` reports the dense bytes, the cache size and slot count,
 the staging layers, the fixed bytes and what other apps used at the last
 admission. Tuning switches are listed in [perf.md](perf.md#deepseek-v41-flash-ssd-streaming).
 
 Measured on an M5 Max (128 GB, internal SSD), product path (`ChatSession`,
-greedy, chat mode, 32 new tokens, `MLX_ENABLE_TF32=0`), each prompt cold in a
+greedy, chat mode, 32 new tokens), each prompt cold in a
 fresh process, auto budget. Other apps held ~69 GiB, so the admission gave the
 expert cache only ~6-7 GiB:
 

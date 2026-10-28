@@ -24,9 +24,8 @@ use crate::array::alloc::SendPtr;
 use crate::cold_tier::ShardIdentity;
 use crate::utils::gguf::GgufTensorInfo;
 
-pub const THREADS_ENV: &str = "MLX_MOE_STREAM_IO_THREADS";
+/// Reader threads of the product pool (8-16 read within 1 % of each other).
 pub const DEFAULT_THREADS: usize = 12;
-pub const MIN_THREADS: usize = 4;
 pub const MAX_THREADS: usize = 18;
 /// GGUF bytes per repack band of one slot read: a 6.27 MB expert matrix is
 /// repacked as 6 bands, so the bands after the read run on idle readers
@@ -535,27 +534,7 @@ pub struct IoPool {
     workers: Vec<JoinHandle<()>>,
 }
 
-/// Thread count from the env value: [`DEFAULT_THREADS`] when unset.
-pub fn threads_from(value: Option<&str>) -> Result<usize> {
-    let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) else {
-        return Ok(DEFAULT_THREADS);
-    };
-    match raw.parse::<usize>() {
-        Ok(n) if (MIN_THREADS..=MAX_THREADS).contains(&n) => Ok(n),
-        _ => Err(bad(format!(
-            "{THREADS_ENV}={raw:?}: expected {MIN_THREADS}..={MAX_THREADS}"
-        ))),
-    }
-}
-
 impl IoPool {
-    pub fn from_env(shards: Arc<ShardSet>) -> Result<Self> {
-        Self::new(
-            shards,
-            threads_from(std::env::var(THREADS_ENV).ok().as_deref())?,
-        )
-    }
-
     pub fn new(shards: Arc<ShardSet>, threads: usize) -> Result<Self> {
         Self::with_band_bytes(shards, threads, REPACK_BAND_BYTES)
     }

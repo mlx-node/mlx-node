@@ -290,38 +290,31 @@ impl Moe {
         })
     }
 
-    /// Stage P4: reads ahead the experts this layer will likely use, from
+    /// Reads ahead the experts this layer will likely use, from
     /// `x [rows, dim]` (the previous layer's FFN input) through this layer's
-    /// router (`PrefetchMode::Pred`, union over rows) or every expert
-    /// (`All`), while the previous layer computes. Only a prediction: the
-    /// layer's own routes still decide (an unused expert is a wasted read,
-    /// a missed one is read by the layer's step). Returns the experts queued.
+    /// router (union over rows), while the previous layer computes. Only a
+    /// prediction: the layer's own routes still decide (an unused expert is
+    /// a wasted read, a missed one is read by the layer's step). Returns the
+    /// experts queued.
     pub fn prefetch_from(&self, x: &MxArray) -> Result<usize> {
-        use crate::moe_stream::bank::PrefetchMode;
         let Experts::Stream(st) = &self.w.experts else {
             return Ok(0);
         };
-        let mode = st.prefetch_mode();
-        if mode == PrefetchMode::Off || st.staging_layers() < 2 {
+        if !st.prefetch() || st.staging_layers() < 2 {
             return Ok(0);
         }
-        let want: Vec<u32> = match mode {
-            PrefetchMode::All => (0..self.n_experts as u32).collect(),
-            _ => {
-                let (rows, dim) = (x.shape_at(0)?, x.shape_at(1)?);
-                let mut seen = vec![false; self.n_experts];
-                let mut lo = 0;
-                while lo < rows {
-                    let hi = (lo + super::block::FFN_CHUNK_ROWS).min(rows);
-                    let r = self.route(&x.slice(&[lo, 0], &[hi, dim])?)?;
-                    r.ids.iter().for_each(|&e| seen[e as usize] = true);
-                    lo = hi;
-                }
-                (0..self.n_experts as u32)
-                    .filter(|&e| seen[e as usize])
-                    .collect()
-            }
-        };
+        let (rows, dim) = (x.shape_at(0)?, x.shape_at(1)?);
+        let mut seen = vec![false; self.n_experts];
+        let mut lo = 0;
+        while lo < rows {
+            let hi = (lo + super::block::FFN_CHUNK_ROWS).min(rows);
+            let r = self.route(&x.slice(&[lo, 0], &[hi, dim])?)?;
+            r.ids.iter().for_each(|&e| seen[e as usize] = true);
+            lo = hi;
+        }
+        let want: Vec<u32> = (0..self.n_experts as u32)
+            .filter(|&e| seen[e as usize])
+            .collect();
         st.prefetch_layer(self.layer, &want)
     }
 

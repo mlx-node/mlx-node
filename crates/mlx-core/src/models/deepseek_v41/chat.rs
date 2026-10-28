@@ -146,8 +146,8 @@ pub(crate) struct Inner {
 
 impl Inner {
     /// The product load: every shard of `path`, f32 activations with the
-    /// reference fake quant, dense mode from `MLX_DSV41_DENSE` (q8 by
-    /// default), S15 admission from the environment (auto budget, D-40).
+    /// reference fake quant, Q8_0 dense through `quantized_matmul`, the
+    /// admission from the environment (auto budget).
     pub(crate) fn load(path: &Path, residency: Arc<Mutex<Residency>>) -> Result<Self> {
         let paths = shard_paths(path)?;
         let (tokenizer, eos) = gguf_tokenizer(&paths[0])?;
@@ -481,8 +481,6 @@ pub struct DeepseekV41ContextLimits {
 /// The load-time and latest per-turn S15 admission, and the expert bank.
 #[napi(object)]
 pub struct DeepseekV41ResidencyInfo {
-    /// `exact`, `f32`, `q8` or `mixed` (`MLX_DSV41_DENSE`).
-    pub dense_mode: String,
     pub dense_bytes: f64,
     pub physical_bytes: Option<f64>,
     /// Other processes' (and other models') bytes at the last admission.
@@ -500,9 +498,6 @@ pub struct DeepseekV41ResidencyInfo {
     pub bank_resident_after_turn_bytes: f64,
     pub bank_switches: u32,
     pub in_turn: bool,
-    /// MLX TF32 GEMMs (`MLX_ENABLE_TF32`, process-wide); the reference
-    /// numerics were gated with it off.
-    pub tf32: bool,
 }
 
 /// DeepSeek-V4.1 Flash (GGUF `deepseek41`) with SSD-streamed routed experts:
@@ -511,7 +506,7 @@ pub struct DeepseekV41ResidencyInfo {
 pub struct DeepseekV41Model {
     thread: ModelThread<ModelCommand>,
     limits: (u32, u32),
-    dense: (String, u64),
+    dense_bytes: u64,
     residency: Arc<Mutex<Residency>>,
 }
 
@@ -528,7 +523,7 @@ impl DeepseekV41Model {
                 let inner = Inner::load(Path::new(&model_path), shared)?;
                 let s = &inner.store;
                 let limits = (s.size.ctx as u32, s.model.cfg.context_length as u32);
-                let dense = (format!("{:?}", s.dense_mode).to_lowercase(), s.dense_bytes);
+                let dense = s.dense_bytes;
                 Ok((inner, (limits, dense)))
             },
             |inner: &mut Inner, rx| match rx.blocking_recv() {
@@ -545,7 +540,7 @@ impl DeepseekV41Model {
         Ok(Self {
             thread,
             limits,
-            dense,
+            dense_bytes: dense,
             residency,
         })
     }
@@ -589,8 +584,7 @@ impl DeepseekV41Model {
             .unwrap_or_else(PoisonError::into_inner);
         let a = r.admission;
         DeepseekV41ResidencyInfo {
-            dense_mode: self.dense.0.clone(),
-            dense_bytes: self.dense.1 as f64,
+            dense_bytes: self.dense_bytes as f64,
             physical_bytes: a.map(|a| a.physical as f64),
             others_bytes: a.map(|a| a.others as f64),
             fixed_bytes: a.map(|a| a.fixed as f64),
@@ -601,7 +595,6 @@ impl DeepseekV41Model {
             bank_resident_after_turn_bytes: r.bank_resident as f64,
             bank_switches: r.switches,
             in_turn: r.in_turn,
-            tf32: std::env::var_os("MLX_ENABLE_TF32").is_none_or(|v| v != "0"),
         }
     }
 }

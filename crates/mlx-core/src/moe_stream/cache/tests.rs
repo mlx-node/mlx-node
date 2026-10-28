@@ -42,7 +42,7 @@ fn step(c: &mut Cache, r: &mut Rng, layers: usize, n: u32, k: usize) {
         match *s {
             Source::Hit(slot) => assert_eq!(Some(slot), *b, "hit of an unmapped expert"),
             Source::Victim(slot) => {
-                assert!(decode && b.is_none(), "victim for a hit or in prefill");
+                assert!(b.is_none(), "victim for a hit");
                 assert!(c.occ(slot).is_none(), "victim still mapped");
             }
             Source::Staging => assert!(b.is_none()),
@@ -210,9 +210,6 @@ fn empty_clears_directory() {
         src.iter().all(|s| matches!(s, Source::Victim(_))),
         "{src:?}"
     );
-    // prefill never takes victims
-    let (_, src) = c.plan(0, &[1, 2], false);
-    assert_eq!(src, vec![Source::Staging; 2]);
 }
 
 /// LFU-decay picks the slot with the lowest decayed use count, checked
@@ -304,13 +301,12 @@ fn bijection_after_1e5_random_ops_lfu_decay() {
     }
 }
 
-/// `Seeded` prefill: at most `slots / layers` victims per layer per turn,
-/// most-used experts first (ties to the lowest id); `Lru` prefill takes
-/// none; `new_turn` refills the quota.
+/// Prefill: at most `slots / layers` victims per layer per turn, most-used
+/// experts first (ties to the lowest id); `new_turn` refills the quota.
 #[test]
 fn seeded_prefill_quota_by_use_count() {
     // 8 slots, 2 layers: quota 4 per layer per turn
-    let mut c = Cache::lru(8, 2, 12).with_mode(CacheMode::Seeded);
+    let mut c = Cache::lru(8, 2, 12);
     let w = [1, 2, 3, 4, 5, 6];
     let uses = [3, 1, 5, 1, 2, 1];
     let (e1, src) = c.plan_step(0, &w, &uses, false, &|_| false);
@@ -351,41 +347,31 @@ fn seeded_prefill_quota_by_use_count() {
         "{src:?}"
     );
     c.check().unwrap();
-    // Lru: prefill never takes a victim
-    let mut l = Cache::lru(8, 2, 12);
-    let (_, src) = l.plan_step(0, &w, &uses, false, &|_| false);
-    assert!(src.iter().all(|s| *s == Source::Staging));
     // fewer slots than layers: quota 0
-    let mut z = Cache::lru(1, 2, 12).with_mode(CacheMode::Seeded);
+    let mut z = Cache::lru(1, 2, 12);
     let (_, src) = z.plan_step(0, &w, &uses, false, &|_| false);
     assert!(src.iter().all(|s| *s == Source::Staging));
 }
 
-/// `Seeded` decode: a miss whose staging slot holds it stays `Staging` (no
-/// victim, no read); `Lru` reads it into a victim as before.
+/// Decode: a miss whose staging slot holds it stays `Staging` (no victim,
+/// no read); one whose staging slot does not hold it takes a victim.
 #[test]
 fn seeded_decode_uses_valid_staging_copy() {
     let staged = |e: u32| e == 2;
-    let mut s = Cache::lru(8, 2, 12).with_mode(CacheMode::Seeded);
+    let mut s = Cache::lru(8, 2, 12);
     let (_, src) = s.plan_step(0, &[1, 2, 3], &[], true, &staged);
     assert!(matches!(src[0], Source::Victim(_)));
     assert_eq!(src[1], Source::Staging);
     assert!(matches!(src[2], Source::Victim(_)));
-    let mut l = Cache::lru(8, 2, 12);
-    let (_, src) = l.plan_step(0, &[1, 2, 3], &[], true, &staged);
-    assert!(
-        src.iter().all(|x| matches!(x, Source::Victim(_))),
-        "{src:?}"
-    );
 }
 
-/// The 1e5-op bijection run under `Seeded` (prefill victims, staged
+/// The 1e5-op bijection run with seeding (prefill victims, staged
 /// decode misses), checking the per-layer per-turn quota.
 #[test]
 fn bijection_after_1e5_random_ops_seeded() {
     let mut r = Rng(0x2545_f491_4f6c_dd1d);
     for &(slots, layers, n, k) in &[(1, 3, 12, 6), (16, 8, 12, 6), (240, 40, 384, 6)] {
-        let mut c = Cache::lru(slots, layers, n as usize).with_mode(CacheMode::Seeded);
+        let mut c = Cache::lru(slots, layers, n as usize);
         let quota = slots / layers;
         let mut seeded = vec![0usize; layers];
         for i in 0..100_000 {
@@ -459,12 +445,12 @@ fn bijection_after_1e5_random_ops_seeded() {
     }
 }
 
-/// Turn end under `Seeded`: a decode use served from staging moves into a
+/// Turn end: a decode use served from staging moves into a
 /// victim when its staging copy is still valid; invalid copies, pairs the
 /// cache already holds, and a second call (the list is per turn) give none.
 #[test]
 fn seeded_turn_end_promotes_valid_staging_copies() {
-    let mut c = Cache::lru(4, 2, 8).with_mode(CacheMode::Seeded);
+    let mut c = Cache::lru(4, 2, 8);
     let (e1, src) = c.plan_step(0, &[1, 2, 3], &[], true, &|e| e != 1);
     assert!(matches!(src[0], Source::Victim(_)));
     assert_eq!(&src[1..], &[Source::Staging, Source::Staging]);
@@ -491,18 +477,13 @@ fn seeded_turn_end_promotes_valid_staging_copies() {
         src.iter().all(|s| matches!(s, Source::Victim(_))),
         "{src:?}"
     );
-    // Lru never records staged uses
-    let mut l = Cache::lru(4, 2, 8);
-    let (e3, _) = l.plan_step(0, &[2], &[], true, &|_| true);
-    l.complete(e3);
-    assert!(l.promote_staged(&|_, _| true).is_empty());
 }
 
 /// Turn-end promotion with more valid staging copies than cache slots keeps
 /// the most recently used ones (P2 codex finding: it kept the oldest).
 #[test]
 fn seeded_promotion_over_capacity_keeps_newest() {
-    let mut c = Cache::lru(2, 1, 8).with_mode(CacheMode::Seeded);
+    let mut c = Cache::lru(2, 1, 8);
     let (e1, src) = c.plan_step(0, &[1, 2], &[], true, &|_| false);
     for (s, e) in src.iter().zip([1, 2]) {
         if let Source::Victim(v) = *s {
@@ -525,13 +506,13 @@ fn seeded_promotion_over_capacity_keeps_newest() {
     c.check().unwrap();
 }
 
-/// A `Seeded` prefill seed takes a free slot or one of its own layer's
+/// A prefill seed takes a free slot or one of its own layer's
 /// residents (LRU among them), never another layer's: the same prefill pass
 /// may still hit those.
 #[test]
 fn seeded_prefill_never_evicts_other_layers() {
     // 4 slots, 2 layers: quota 2
-    let mut c = Cache::lru(4, 2, 8).with_mode(CacheMode::Seeded);
+    let mut c = Cache::lru(4, 2, 8);
     for (layer, w) in [(1, [1, 2, 3]), (0, [4, 5, 6])] {
         let (ep, src) = c.plan_step(layer, &w[..2], &[], true, &|_| false);
         for (&e, s) in w.iter().zip(&src) {
@@ -560,7 +541,7 @@ fn seeded_prefill_never_evicts_other_layers() {
         "layer 0's LRU resident should have made room"
     );
     // only layer-1 residents (and the busy step's own hits) left for layer 0: staged
-    let mut d = Cache::lru(2, 2, 8).with_mode(CacheMode::Seeded);
+    let mut d = Cache::lru(2, 2, 8);
     let (ep, src) = d.plan_step(1, &[1, 2], &[], true, &|_| false);
     for (&e, s) in [1, 2].iter().zip(&src) {
         if let Source::Victim(v) = *s {

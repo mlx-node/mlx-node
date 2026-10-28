@@ -4,7 +4,7 @@
 // admission (with the bank forced `Empty` between turn 1 and 2). Every call's
 // last-row logits hash must equal the cache-0 run's (bitwise); the live hit /
 // read counts must equal a replay of the run's own route trace. Run with
-// `MLX_ENABLE_TF32=0`, `MLX_DSV41_EXPERT_CACHE_GB`, `MLX_DSV41_ROUTE_TRACE`,
+// `MLX_DSV41_EXPERT_CACHE_GB`, `DSV41_ROUTE_TRACE`, `DSV41_DENSE`,
 // `DSV41_GOLDEN`, `DSV41_DIR`; `DSV41_CACHE_OUT` gets `<name>.json`.
 
 use super::generate::generate_probed;
@@ -21,14 +21,10 @@ fn s16_env(k: &str) -> Option<String> {
 }
 
 fn s16_store(plan: CachePlan) -> Store {
-    assert_eq!(
-        s16_env("MLX_ENABLE_TF32").as_deref(),
-        Some("0"),
-        "DECISIONS S5-1"
-    );
     set_cache_limit(POOL_LIMIT as f64).unwrap();
     let t0 = std::time::Instant::now();
-    let s = Store::open_with(&real_shards(), DType::Float32, FakeQuant::ON, plan).unwrap();
+    let s = Store::open_dense(&real_shards(), DType::Float32, FakeQuant::ON, plan, real_dense())
+        .unwrap();
     println!(
         "load {:.1} s; dense mode {:?}; dense read {} B, resident {} B; bank {:.3} GiB ({} cache slots) allocated in {:.3} s; admission {}",
         t0.elapsed().as_secs_f64(),
@@ -111,7 +107,7 @@ fn s16_median(v: &[f64]) -> f64 {
 fn real_cache_inv(name: &str, plan: CachePlan, turns: &[usize], empty_after_first: bool) {
     let gd = gold("p32k8-en");
     let trace_path =
-        PathBuf::from(s16_env("MLX_DSV41_ROUTE_TRACE").expect("MLX_DSV41_ROUTE_TRACE"));
+        PathBuf::from(s16_env("DSV41_ROUTE_TRACE").expect("DSV41_ROUTE_TRACE"));
     let (_, swap0) = super::stats::host_pressure();
     let sampler = FootprintMax::start();
     let store = s16_store(plan);
@@ -298,8 +294,8 @@ fn real_cache_inv(name: &str, plan: CachePlan, turns: &[usize], empty_after_firs
     );
     let staging = store.bank.staging_layers();
     println!(
-        "staging layers {staging}, prefetch {:?}: read ahead {}, unused {}",
-        store.bank.prefetch_mode(),
+        "staging layers {staging}, prefetch {}: read ahead {}, unused {}",
+        store.bank.prefetch(),
         st.prefetch_slots - stats0.prefetch_slots,
         st.prefetch_unused - stats0.prefetch_unused
     );
@@ -311,9 +307,7 @@ fn real_cache_inv(name: &str, plan: CachePlan, turns: &[usize], empty_after_firs
                             t: &[&[crate::moe_stream::replay::Step]]| {
             replay_turns_staged(c, n, staging, t)
         };
-        let mode = store.bank.mode();
-        let mk =
-            || crate::moe_stream::cache::Cache::lru(slots, n_layers, n_experts).with_mode(mode);
+        let mk = || crate::moe_stream::cache::Cache::lru(slots, n_layers, n_experts);
         let sum = |v: Vec<Replayed>| v.into_iter().fold(Replayed::default(), Replayed::plus);
         let turns_s: Vec<&[crate::moe_stream::replay::Step]> =
             turn_steps.iter().map(Vec::as_slice).collect();
@@ -428,10 +422,7 @@ fn real_cache_inv(name: &str, plan: CachePlan, turns: &[usize], empty_after_firs
             "byte_h": 1.0 - r as f64 / u.max(1) as f64,
         })
     };
-    println!(
-        "{name}: first 16 decode tokens {first16} (cache mode {:?})",
-        store.bank.mode()
-    );
+    println!("{name}: first 16 decode tokens {first16}");
     let (_, swap1) = super::stats::host_pressure();
     let swap_d = swap1.zip(swap0).map_or(0, |(a, b)| a as i64 - b as i64);
     let fp_peak = sampler.finish();
@@ -450,7 +441,6 @@ fn real_cache_inv(name: &str, plan: CachePlan, turns: &[usize], empty_after_firs
         "switches": store.switches(),
         "turns": turns_doc,
         "decode_terms": decode,
-        "cache_mode": format!("{:?}", store.bank.mode()),
         "first16": first16,
         "turn3_terms": turn3,
         "live": {"uses": live.0, "hits": live.1, "reads": live.2},
@@ -486,14 +476,14 @@ fn s16_cache_gb(want: &str) {
 }
 
 #[test]
-#[ignore = "real 9 shards + S12 goldens; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=0; ~18 GiB"]
+#[ignore = "real 9 shards + S12 goldens; MLX_DSV41_EXPERT_CACHE_GB=0; ~18 GiB"]
 fn real_cache_inv_c0() {
     s16_cache_gb("0");
     real_cache_inv("c0", CachePlan::Off, &S16_TURNS, false);
 }
 
 #[test]
-#[ignore = "real 9 shards + c0 hashes; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=4; ~22 GiB"]
+#[ignore = "real 9 shards + c0 hashes; MLX_DSV41_EXPERT_CACHE_GB=4; ~22 GiB"]
 fn real_cache_inv_c4() {
     s16_cache_gb("4");
     let slots = (4.0 * S16_GIB / EXPERT_BYTES as f64) as usize;
@@ -506,10 +496,10 @@ fn real_cache_inv_c4() {
 /// dry run's N_auto as a cap, so the guard cap holds), bank `Empty` between
 /// turn 1 and 2.
 #[test]
-#[ignore = "real 9 shards + c0 hashes; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=<N_auto>; ~18 GiB + N_auto"]
+#[ignore = "real 9 shards + c0 hashes; MLX_DSV41_EXPERT_CACHE_GB=<N_auto>; ~18 GiB + N_auto"]
 fn real_cache_inv_auto() {
     assert!(s16_env(CACHE_ENV).is_some(), "{CACHE_ENV} = N_auto (cap)");
-    assert!(s16_env("MLX_DSV41_ADMIT_ONLY").is_none());
+    assert!(s16_env("DSV41_ADMIT_ONLY").is_none());
     let limits = Limits::from_env().unwrap();
     real_cache_inv("auto", CachePlan::Admit(limits), &S16_TURNS, true);
 }
@@ -518,10 +508,10 @@ fn real_cache_inv_auto() {
 /// between turns, so the first 16 decode tokens see what turn 1's prefill
 /// seeded; hashes == c0 (bitwise) as in every cache run.
 #[test]
-#[ignore = "real 9 shards + c0 hashes; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=<N_auto>; ~18 GiB + N_auto"]
+#[ignore = "real 9 shards + c0 hashes; MLX_DSV41_EXPERT_CACHE_GB=<N_auto>; ~18 GiB + N_auto"]
 fn real_cache_keep_auto() {
     assert!(s16_env(CACHE_ENV).is_some(), "{CACHE_ENV} = N_auto (cap)");
-    assert!(s16_env("MLX_DSV41_ADMIT_ONLY").is_none());
+    assert!(s16_env("DSV41_ADMIT_ONLY").is_none());
     let limits = Limits::from_env().unwrap();
     real_cache_inv("keep", CachePlan::Admit(limits), &S16_TURNS, false);
 }
@@ -529,10 +519,10 @@ fn real_cache_keep_auto() {
 /// The admission this host gives right now, from the shard headers alone:
 /// every term and the cache size N_auto (GiB). Allocates nothing.
 #[test]
-#[ignore = "real shard headers; MLX_DSV41_ADMIT_ONLY=1; < 1 GiB"]
+#[ignore = "real shard headers; DSV41_ADMIT_ONLY=1; < 1 GiB"]
 fn real_admit_dry_run() {
-    assert_eq!(s16_env("MLX_DSV41_ADMIT_ONLY").as_deref(), Some("1"));
-    let mode = DenseMode::from_env().unwrap();
+    assert_eq!(s16_env("DSV41_ADMIT_ONLY").as_deref(), Some("1"));
+    let mode = real_dense();
     let size = model_size(&real_shards(), mode).unwrap();
     println!("dense mode {mode:?}");
     let limits = Limits::from_env().unwrap();
@@ -591,7 +581,7 @@ fn real_admit_dry_run() {
 /// the same greedy token decoded again each time: every logits row must be
 /// bitwise equal (split on/off, hit/miss). `DSV41_SPLIT_REPS` (default 6).
 #[test]
-#[ignore = "real 9 shards + S12 goldens; MLX_ENABLE_TF32=0 MLX_DSV41_EXPERT_CACHE_GB=<N_auto>; ~18 GiB + N_auto, ~4.5 GB read per all-miss token"]
+#[ignore = "real 9 shards + S12 goldens; MLX_DSV41_EXPERT_CACHE_GB=<N_auto>; ~18 GiB + N_auto, ~4.5 GB read per all-miss token"]
 fn real_split_timing() {
     assert!(s16_env(CACHE_ENV).is_some(), "{CACHE_ENV} = N_auto (cap)");
     let reps: usize = s16_env("DSV41_SPLIT_REPS").map_or(6, |v| v.parse().unwrap());

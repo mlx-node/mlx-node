@@ -1,5 +1,5 @@
-//! Offline replay of route traces (`MLX_DSV41_ROUTE_TRACE` JSONL, schema
-//! v1 of `qwen4_exp/route_replay.rs`) through the same [`Cache::plan`] and
+//! Offline replay of route traces (JSONL, schema v1 of
+//! `qwen4_exp/route_replay.rs`) through the same [`Cache::plan`] and
 //! staging-tag rules the bank uses, so a replayed hit count is the live one
 //! for the same routes and cache size.
 
@@ -8,7 +8,7 @@ use std::io::BufRead;
 use napi::{Error, Result};
 use serde_json::Value;
 
-use super::cache::{Cache, CacheMode, Source, decode_step};
+use super::cache::{Cache, Source, decode_step};
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("moe_stream replay: {msg}"))
@@ -213,9 +213,9 @@ pub fn per_token(
     out
 }
 
-/// A fresh cache of `slots` slots under `mode` (LRU eviction).
-pub fn cache_for(t: &RouteTrace, slots: usize, mode: CacheMode) -> Cache {
-    Cache::lru(slots, t.layers, t.experts).with_mode(mode)
+/// A fresh cache of `slots` slots (LRU eviction).
+pub fn cache_for(t: &RouteTrace, slots: usize) -> Cache {
+    Cache::lru(slots, t.layers, t.experts)
 }
 
 /// `replay` with whole layers resident: every expert of a layer with

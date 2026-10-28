@@ -1,8 +1,10 @@
 //! The global expert cache directory: `S` cache slots shared by every
 //! layer. `dir[layer][expert] -> slot` and `occ[slot] -> (layer, expert)`
 //! stay a bijection. A layer step asks [`Cache::plan`] where each wanted
-//! expert is served from: a cache hit, a victim slot to read into (decode),
-//! or its staging slot. A victim is a free slot, else the policy's pick
+//! expert is served from: a cache hit, a victim slot to read into, or its
+//! staging slot. A decode miss whose staging slot still holds it is served
+//! from there, and at the turn's end those copies move into victims
+//! ([`Cache::promote_staged`]). A victim is a free slot, else the policy's pick
 //! among slots that hold no expert of the step's wanted set and whose last
 //! GPU use is complete. Pure host bookkeeping: the bank owns the bytes.
 
@@ -141,25 +143,6 @@ impl Policy for LfuDecay {
     }
 }
 
-/// What enters the cache besides decode misses (stage P2).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CacheMode {
-    /// Decode misses only; prefill misses are staged, and a decode miss is
-    /// read into a victim even when its staging copy is still valid (S16a).
-    Lru,
-    /// `Lru`, plus: each layer places up to `slots / layers` of its prefill
-    /// misses per turn in victims (most-used rows first, then lowest id;
-    /// a free slot or one holding the same layer's expert, never another
-    /// layer's resident); a
-    /// decode miss whose staging slot still holds it is served from there
-    /// without a read, and at the turn's end those staging copies that are
-    /// still valid move into victims ([`Cache::promote_staged`], a copy, no
-    /// read), so the next turn finds them although its prefill refills
-    /// staging.
-    #[default]
-    Seeded,
-}
-
 /// Where one wanted expert of a layer step is served from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -182,11 +165,10 @@ pub struct Cache {
     epoch: u64,
     completed: u64,
     policy: Box<dyn Policy>,
-    mode: CacheMode,
-    /// Prefill misses placed in victims this turn, per layer (`Seeded`).
+    /// Prefill misses placed in victims this turn, per layer.
     seeded: Vec<usize>,
     /// Per `(layer, expert)`: tick of its last decode use served from
-    /// staging this turn (0 = none; `Seeded`).
+    /// staging this turn (0 = none).
     staged_at: Vec<u64>,
     staged_tick: u64,
 }
@@ -203,20 +185,10 @@ impl Cache {
             epoch: 0,
             completed: 0,
             policy,
-            mode: CacheMode::Lru,
             seeded: vec![0; n_layers],
             staged_at: vec![0; n_layers * n_experts],
             staged_tick: 0,
         }
-    }
-
-    pub fn with_mode(mut self, mode: CacheMode) -> Self {
-        self.mode = mode;
-        self
-    }
-
-    pub fn mode(&self) -> CacheMode {
-        self.mode
     }
 
     /// A new turn: every layer's prefill seeding quota is full again.
@@ -225,7 +197,7 @@ impl Cache {
         self.staged_at.fill(0);
     }
 
-    /// Turn end (`Seeded`; all GPU work complete): every `(layer, e)` this turn
+    /// Turn end (all GPU work complete): every `(layer, e)` this turn
     /// served from staging that `valid` says its staging slot still holds and
     /// the cache does not, gets a victim, most recently used last (the most
     /// recent `slots` of them when more are valid). Returns
@@ -337,16 +309,18 @@ impl Cache {
     }
 
     /// One layer step: a new epoch; every hit is stamped first, then each
-    /// miss gets a victim when `decode` (else, or with no victim left, its
-    /// staging slot). `wanted` holds distinct expert ids.
+    /// decode miss gets a victim, and a prefill step places up to
+    /// `slots / layers` misses per layer and turn in victims (most-used rows
+    /// first, then lowest id; a free slot or the same layer's resident, never
+    /// another layer's); the rest, or a miss with no victim left, use the
+    /// staging slot. `wanted` holds distinct expert ids.
     pub fn plan(&mut self, layer: usize, wanted: &[u32], decode: bool) -> (u64, Vec<Source>) {
         self.plan_step(layer, wanted, &[], decode, &|_| false)
     }
 
-    /// `plan` with the `Seeded` rules: `uses[i]` = rows of the step that use
+    /// `plan` with the seeding rules: `uses[i]` = rows of the step that use
     /// `wanted[i]` (prefill seeding order; empty = all equal), `staged(e)` =
-    /// the staging slot of `e` holds this layer's copy. Under `Lru` both are
-    /// ignored and this is `plan`.
+    /// the staging slot of `e` holds this layer's copy.
     pub fn plan_step(
         &mut self,
         layer: usize,
@@ -378,8 +352,7 @@ impl Cache {
                 None => Source::Staging,
             })
             .collect();
-        let seeded = self.mode == CacheMode::Seeded;
-        if self.occ.is_empty() || (!decode && !seeded) {
+        if self.occ.is_empty() {
             return (epoch, out);
         }
         let mut miss = Vec::new();
@@ -387,7 +360,7 @@ impl Cache {
             if out[i] != Source::Staging {
                 continue;
             }
-            if decode && seeded && staged(wanted[i]) {
+            if decode && staged(wanted[i]) {
                 let k = self.key(layer, wanted[i]);
                 self.staged_tick += 1;
                 self.staged_at[k] = self.staged_tick;
