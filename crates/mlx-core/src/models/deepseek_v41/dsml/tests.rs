@@ -229,6 +229,25 @@ fn invokes_and_values() {
     assert_eq!(args(&calls[3]), "{}");
 }
 
+/// The block closes only at block scope: a close tag the model emits inside
+/// a parameter value is the value's text (encoding.py reads a value up to its
+/// own close).
+#[test]
+fn close_tag_inside_a_value() {
+    let c = "</think><｜DSML｜ calls>\n<｜DSML｜ invoke name=\"note\">\n\
+        <｜DSML｜ parameter name=\"text\" string=\"true\">Document </｜DSML｜ calls> here\
+        </｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    let (tok, ids) = case(c);
+    let (text, calls, _) = parse(&tok, &ids, true);
+    assert_eq!(text, "");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].status, "ok");
+    assert_eq!(
+        calls[0].arguments,
+        json!({"text": "Document </｜DSML｜ calls> here"})
+    );
+}
+
 #[test]
 fn malformed_block_is_one_parse_error() {
     for bad in [

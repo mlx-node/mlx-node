@@ -97,53 +97,59 @@ pub(crate) fn parse_turn(
     (text, calls, thinking.filter(|_| include_reasoning))
 }
 
-/// Content before the first `\n*<｜DSML｜ calls>` and the block's calls. An
-/// unclosed block (length stop) parses to no call and stays in the text.
+/// Content before the first `\n*<｜DSML｜ calls>` and the block's calls. The
+/// block closes at the first close tag outside a parameter value. Malformed
+/// markup fails the whole block (one `parse_error`, as `encoding.py` raises);
+/// a duplicate parameter or a `string="false"` value that is not JSON fails
+/// only its invoke; an unclosed block (length stop) stays in the text.
 fn parse_content(m: &Marked) -> (String, Vec<ToolCallResult>) {
     let open = m.tag("<｜DSML｜ calls>");
     let close = m.tag("</｜DSML｜ calls>");
     let Some(at) = m.text.find(&open) else {
         return (m.restore(&m.text), Vec::new());
     };
-    let body = at + open.len();
-    let Some(len) = m.text[body..].find(&close) else {
-        return (m.restore(&m.text), Vec::new());
-    };
-    let raw = m.restore(&m.text[at..body + len + close.len()]);
-    let pre = m.text[..at].trim_end_matches('\n');
-    (
-        m.restore(pre),
-        parse_block(m, &m.text[body..body + len], raw),
-    )
-}
-
-/// The invokes of one closed block. Malformed markup fails the whole block
-/// (one `parse_error`, as `encoding.py` raises); a duplicate parameter or a
-/// `string="false"` value that is not JSON fails only its invoke.
-fn parse_block(m: &Marked, body: &str, raw: String) -> Vec<ToolCallResult> {
-    match parse_invokes(m, body) {
-        Ok(calls) => calls,
-        Err(e) => vec![ToolCallResult::parse_error(
-            String::new(),
-            raw.clone(),
-            format!("DSML tool calls: {e}"),
-            raw,
-        )],
+    let pre = m.restore(m.text[..at].trim_end_matches('\n'));
+    let body = &m.text[at + open.len()..];
+    match parse_invokes(m, body, &close) {
+        Ok(calls) => (pre, calls),
+        Err(e) => match body.find(&close) {
+            Some(len) => {
+                let raw = m.restore(&m.text[at..at + open.len() + len + close.len()]);
+                let call = ToolCallResult::parse_error(
+                    String::new(),
+                    raw.clone(),
+                    format!("DSML tool calls: {e}"),
+                    raw,
+                );
+                (pre, vec![call])
+            }
+            None => (m.restore(&m.text), Vec::new()),
+        },
     }
 }
 
-fn parse_invokes(m: &Marked, body: &str) -> std::result::Result<Vec<ToolCallResult>, String> {
+fn parse_invokes(
+    m: &Marked,
+    body: &str,
+    close: &str,
+) -> std::result::Result<Vec<ToolCallResult>, String> {
     let inv_open = m.tag("<｜DSML｜ invoke name=\"");
     let inv_close = m.tag("</｜DSML｜ invoke>");
     let par_open = m.tag("<｜DSML｜ parameter name=\"");
     let par_close = m.tag("</｜DSML｜ parameter>");
     let mut calls = Vec::new();
     let mut rest = body.trim_start_matches(is_ws);
-    while !rest.is_empty() {
+    loop {
+        if rest.starts_with(close) {
+            return Ok(calls);
+        }
         let start = rest;
-        let r = rest
-            .strip_prefix(&inv_open)
-            .ok_or_else(|| format!("expected an invoke at {:?}", m.restore(head(rest))))?;
+        let r = rest.strip_prefix(&inv_open).ok_or_else(|| {
+            format!(
+                "expected an invoke or the block close at {:?}",
+                m.restore(head(rest))
+            )
+        })?;
         let (name, mut r) = r
             .split_once("\">")
             .ok_or_else(|| "unterminated invoke name".to_string())?;
@@ -200,7 +206,6 @@ fn parse_invokes(m: &Marked, body: &str) -> std::result::Result<Vec<ToolCallResu
         });
         rest = r.trim_start_matches(is_ws);
     }
-    Ok(calls)
 }
 
 fn head(s: &str) -> &str {
