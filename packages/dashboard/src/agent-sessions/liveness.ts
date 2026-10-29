@@ -56,12 +56,16 @@ export function readActiveRegistry(agentHome: string, alive: (pid: number) => bo
   return { ok: true, ids };
 }
 
+/** Our own writes (path → the mtime we produced), which say nothing about grok. */
+export type OwnWrites = ReadonlyMap<string, number>;
+
 /**
  * grok `session_last_activity`: newest mtime of the session dir's own regular
  * files (not recursive, symlinks ignored), else the dir's mtime. `null` when the
- * dir is unreadable.
+ * dir is unreadable. A file whose mtime is still exactly one we produced is
+ * skipped, so our rename does not make the session look busy for 30 s.
  */
-export function newestFileMtimeMs(dir: string): number | null {
+export function newestFileMtimeMs(dir: string, ownWrites?: OwnWrites): number | null {
   let names: string[];
   try {
     names = readdirSync(dir);
@@ -69,15 +73,22 @@ export function newestFileMtimeMs(dir: string): number | null {
     return null;
   }
   let newest: number | null = null;
+  let sawFile = false;
   for (const name of names) {
     try {
-      const st = lstatSync(join(dir, name));
-      if (st.isFile() && (newest === null || st.mtimeMs > newest)) newest = st.mtimeMs;
+      const path = join(dir, name);
+      const st = lstatSync(path);
+      if (!st.isFile()) continue;
+      sawFile = true;
+      if (ownWrites?.get(path) === st.mtimeMs) continue;
+      if (newest === null || st.mtimeMs > newest) newest = st.mtimeMs;
     } catch {
       // Vanished between readdir and lstat.
     }
   }
   if (newest !== null) return newest;
+  // Only our own writes: the dir mtime moved with our rename and means nothing.
+  if (sawFile) return 0;
   try {
     return lstatSync(dir).mtimeMs;
   } catch {
@@ -100,6 +111,7 @@ export interface OwnLivenessInput {
   id: string;
   dir: string;
   openTurn: boolean;
+  ownWrites?: OwnWrites;
 }
 
 /** Rules 1, 3 and 4 for one session (rule 2, ancestors, is the caller's walk). */
@@ -114,7 +126,7 @@ export function ownLiveness(
   } else if (registry.ids.has(s.id)) {
     return { live: true, reason: 'registered', sessionId: s.id };
   }
-  const newest = newestFileMtimeMs(s.dir);
+  const newest = newestFileMtimeMs(s.dir, s.ownWrites);
   if (newest === null) return failClosed ? { live: true, reason: 'recent-write', sessionId: s.id } : NOT_LIVE;
   const age = now - newest;
   if (age < RECENT_WRITE_MS) return { live: true, reason: 'recent-write', sessionId: s.id };

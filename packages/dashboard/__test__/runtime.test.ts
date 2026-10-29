@@ -404,6 +404,7 @@ describe('dashboard runtime — worker death', () => {
       modelsDir,
       tracesDir,
       cacheRoot: undefined,
+      agentHome: join(base, 'agent'),
     });
 
     try {
@@ -458,6 +459,7 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
       modelsDir,
       tracesDir,
       cacheRoot: undefined,
+      agentHome: join(base, 'agent'),
     });
   }
 
@@ -545,6 +547,7 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
       modelsDir,
       tracesDir,
       cacheRoot: undefined,
+      agentHome: join(base, 'agent'),
     });
 
     try {

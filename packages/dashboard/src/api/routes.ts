@@ -32,6 +32,12 @@ import {
   handleModels,
   handleCodingAgentModels,
 } from './handlers/models.js';
+import {
+  handleSessionDelete,
+  handleSessionDetail,
+  handleSessionRename,
+  handleSessionsList,
+} from './handlers/sessions.js';
 
 /** Which thread answers a route. */
 export type RouteThread = 'main' | 'worker';
@@ -113,4 +119,8 @@ export const ROUTES: Route[] = [
   workerRoute('GET', '/api/cache', handleCacheGet),
   workerRoute('DELETE', '/api/cache', handleCacheDelete),
   workerRoute('POST', '/api/ingest', handleIngest),
+  workerRoute('GET', '/api/sessions', handleSessionsList),
+  workerRoute('GET', '/api/sessions/:id', handleSessionDetail),
+  workerRoute('PATCH', '/api/sessions/:id', handleSessionRename),
+  workerRoute('DELETE', '/api/sessions/:id', handleSessionDelete),
 ];

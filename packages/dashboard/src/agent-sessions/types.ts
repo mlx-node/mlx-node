@@ -111,3 +111,14 @@ export interface SessionDetailResponse {
   transcriptError?: string;
   resumeCommand: string;
 }
+
+/** `PATCH /api/sessions/:id` body `{title}`; `title` is the sanitized title as stored. */
+export interface SessionRenameResponse {
+  id: string;
+  title: string;
+}
+
+/** `DELETE /api/sessions/:id`: the session first, then its subagent children. */
+export interface SessionDeleteResponse {
+  deleted: string[];
+}

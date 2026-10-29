@@ -1,6 +1,6 @@
 # Dashboard (Control Panel window)
 
-Browse local models, inference metrics, and the
+Browse local models, `mlx agent` sessions, inference metrics, and the
 paged-attention cold cache. It ships inside `@mlx-node/dashboard` and is the Control Panel
 window of the **mlx-node desktop app** — open it from the tray.
 
@@ -51,12 +51,13 @@ const runtime = createDashboardRuntime({ modelsDir, dbPath });
 
 ## Pages
 
-| Page     | Content                                                                         | Actions                                                                  |
-| -------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| Overview | Stat tiles (models/disk, cache size + hit rate, active downloads)               | —                                                                        |
-| Models   | Local table: name, family, quant, size, ctx window                              | delete; install from the recommended catalog (live port-pushed progress) |
-| Metrics  | Tokens/day (in/out/cached), tok/s + TTFT per model, MTP acceptance, model share | date range                                                               |
-| Cache    | Cold-tier disk usage vs quota, entry count + age histogram, hit/miss trend      | clear all, evict older-than-N-days                                       |
+| Page     | Content                                                                                                   | Actions                                                                  |
+| -------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| Overview | Stat tiles (models/disk, cache size + hit rate, active downloads)                                         | —                                                                        |
+| Models   | Local table: name, family, quant, size, ctx window                                                        | delete; install from the recommended catalog (live port-pushed progress) |
+| Sessions | `mlx agent` sessions: list (search, directory filter), detail with transcript, per-turn charts, subagents | copy resume command, rename, delete (refused while live)                 |
+| Metrics  | Tokens/day (in/out/cached), tok/s + TTFT per model, MTP acceptance, model share                           | date range                                                               |
+| Cache    | Cold-tier disk usage vs quota, entry count + age histogram, hit/miss trend                                | clear all, evict older-than-N-days                                       |
 
 Every catalog entry installs its Unsloth UD-Q4_K_XL GGUF (one variant out of
 the repo's dozens) plus the base-model tokenizer sidecars fetched from the
@@ -85,6 +86,7 @@ All state lives on disk; SQLite is only an index.
 | Disposable SQLite index         | `~/.mlx-node/dashboard.db`                                                                          | Index over the JSONL above; **rebuilt on next start if deleted** |
 | Local models                    | `--models-dir` → `MLX_MODELS_DIR` → `modelsDir` in `~/.mlx-node/config.json` → `~/.mlx-node/models` | Model list, size on disk, family/quant/ctx from `config.json`    |
 | Cold tier (paged prefix blocks) | `~/.mlx-node/cache/paged/v1/` (`MLX_COLD_CACHE_DIR` override)                                       | Cache page scan + management                                     |
+| `mlx agent` sessions            | `<agentHome>/sessions/<encoded cwd>/<id>/` (`agentHome` = `GROK_HOME` or `~/.mlx-agent`)            | Sessions page; read from files on each call, never indexed       |
 
 The SQLite index is **disposable**: deleting `dashboard.db` loses nothing — it is
 rebuilt from the JSONL on next start. Ingest runs on boot, then incrementally by
@@ -93,6 +95,47 @@ file mtime every 30 s (plus a manual `POST /api/ingest`). Trace files older than
 
 Trace records are metadata-only: every field is a number, a small enumerated
 string, or an identifier — never prompt content, tool arguments, or model output.
+
+## Sessions
+
+Read straight from the grok-build session folders on the database worker. No
+SQLite table: each call re-lists the folders and reuses parsed `summary.json`,
+`meta.json` and `updates.jsonl` while their (mtime, size) is unchanged.
+
+```
+<agentHome>/
+  active_sessions.json            TUI registry {session_id, pid}; read only, no lock
+  sessions/<encoded cwd>/<id>/
+    summary.json                  title, cwd, model, kind; rename rewrites it
+    updates.jsonl                 transcript + turn_completed metrics (rewinds applied)
+    subagents/<child>/meta.json   the ONLY parent -> child link
+```
+
+- List: top-level sessions only. Subagent children, `headless` runs and empty
+  husks are left out; a child is reachable from its parent's detail page.
+- Rename does what grok's `/rename` does to a dormant session: `generated_title`,
+  `session_summary` only while it is empty, `title_is_manual: true`,
+  `updated_at`, plus `title_refresh_idx = 2`. Title: 1..100 characters after
+  removing control and bidi characters and trimming. Written as temp file +
+  fsync + rename, pretty JSON like serde.
+- Delete removes the session folder and its subagent children (followed through
+  `meta.json` whose `parent_session_id` matches, looked up by id in every cwd
+  folder). Like grok it leaves forks, `prompt_history.jsonl`,
+  `session_search.sqlite` and the cwd folder alone.
+
+Write guards (all answer 409 and change nothing; checked again right before the write):
+
+| Guard        | Rule                                                                                                                                                                         |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| registered   | the id, or any subagent ancestor, is in `active_sessions.json` with a live pid (`kill(pid, 0)`, EPERM = alive)                                                               |
+| recent write | any regular file in the session folder changed in the last 30 s (ACP and `-p` runs never register); our own rename does not count                                            |
+| open turn    | the transcript ends inside a turn and was written in the last 10 min                                                                                                         |
+| unreadable   | `active_sessions.json` cannot be parsed                                                                                                                                      |
+| containment  | the folder must be a real `<sessions>/<cwd>/<id>` directory (no symlink at either level, realpath inside the sessions root); ids with `/`, `\`, NUL or a leading `.` are 400 |
+
+grok's `*.lock` files are never opened: grok blocks on `LOCK_EX`, so a lock held
+from Node would stall the agent. An idle ACP/headless process holding a session
+with no recent writes cannot be detected without those locks.
 
 ## Persist paged cache (`persistPagedCache`)
 
@@ -157,6 +200,7 @@ restored on a hot-cache miss before falling back to a normal prefill.
 | `MLX_COLD_CAPTURE_BLOCKS_PER_TURN` | Blocks one turn's cold-tier capture walk may persist. Default `128` (2048 tokens at block size 16). Raising it covers a long prompt in fewer turns at the cost of turn tail. |
 | `MLX_COLD_CAPTURE_BUDGET_MS`       | Wall-clock ceiling on one capture walk. Default `250`. A walk that hits it warns and ratchets less than configured.                                                          |
 | `MLX_MODELS_DIR`                   | Local models directory when `--models-dir` is omitted.                                                                                                                       |
+| `GROK_HOME`                        | `mlx agent` config home read by the Sessions page (`agentHome` runtime option overrides). Default `~/.mlx-agent`.                                                            |
 
 ## Security model
 
@@ -173,7 +217,7 @@ class of bug is deleted rather than mitigated. What remains:
 - **`app://` serves only inside the bundle.** A miss under `/assets/` returns 404
   rather than falling back to `index.html`, so a stale or mis-copied bundle fails
   loudly instead of returning HTML labelled `text/javascript`.
-- **Mutations are still the dangerous part** — model delete, cache clear —
+- **Mutations are still the dangerous part** — model delete, cache clear, session rename/delete —
   and they are reachable by anything that gets the port. The port is minted
   by MAIN, transferred once to the Control Panel window it created, and consumed on receipt.
 
@@ -195,14 +239,18 @@ over a port.
 
 `GET /health` returns `{ status, modelsDir, tracesDir }`.
 
-| Route                       | Method       | Purpose                                                                    |
-| --------------------------- | ------------ | -------------------------------------------------------------------------- |
-| `/api/models`               | GET          | Local models: name, path, family, quant, size, ctx window                  |
-| `/api/models/:name`         | DELETE       | Delete a model dir (path-checked)                                          |
-| `/api/catalog`              | GET          | Recommended catalog + installed/installable state                          |
-| `/api/catalog/updates`      | GET          | Upstream sha per catalog repo; the page joins it against `/api/catalog`    |
-| `/api/downloads`            | GET / POST   | List active jobs / start a catalog download                                |
-| `/api/downloads/:id/events` | GET          | Not served over the port — use `runtime.subscribe(jobId, fn)`; answers 503 |
-| `/api/metrics/overview`     | GET          | Aggregates: tokens/day, tok/s + TTFT, MTP acceptance, share                |
-| `/api/cache`                | GET / DELETE | Cold-tier scan / clear all or evict older-than-N-days                      |
-| `/api/ingest`               | POST         | Trigger an incremental rescan                                              |
+| Route                       | Method       | Purpose                                                                                |
+| --------------------------- | ------------ | -------------------------------------------------------------------------------------- |
+| `/api/models`               | GET          | Local models: name, path, family, quant, size, ctx window                              |
+| `/api/models/:name`         | DELETE       | Delete a model dir (path-checked)                                                      |
+| `/api/catalog`              | GET          | Recommended catalog + installed/installable state                                      |
+| `/api/catalog/updates`      | GET          | Upstream sha per catalog repo; the page joins it against `/api/catalog`                |
+| `/api/downloads`            | GET / POST   | List active jobs / start a catalog download                                            |
+| `/api/downloads/:id/events` | GET          | Not served over the port — use `runtime.subscribe(jobId, fn)`; answers 503             |
+| `/api/metrics/overview`     | GET          | Aggregates: tokens/day, tok/s + TTFT, MTP acceptance, share                            |
+| `/api/cache`                | GET / DELETE | Cold-tier scan / clear all or evict older-than-N-days                                  |
+| `/api/ingest`               | POST         | Trigger an incremental rescan                                                          |
+| `/api/sessions`             | GET          | `?q=&cwd=&limit=&offset=` → `{sessions, total, cwds}`; limit 1..500, default 100       |
+| `/api/sessions/:id`         | GET          | `{session, transcript, turns, transcriptError?, resumeCommand}`; subagent ids work too |
+| `/api/sessions/:id`         | PATCH        | Body `{title}` → `{id, title}`; 400 bad title, 404, 409 live/recent/changed            |
+| `/api/sessions/:id`         | DELETE       | `{deleted: [id, ...children]}`; 404, 409 when it or any child is live                  |

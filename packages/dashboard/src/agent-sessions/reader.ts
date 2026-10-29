@@ -8,7 +8,7 @@
 
 import { type Dirent, lstatSync, readdirSync, readFileSync, type Stats } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 
 import {
   type ActiveRegistry,
@@ -148,6 +148,7 @@ export class AgentSessionsReader {
   private readonly metas = new Map<string, Cached<SubagentMeta | null>>();
   private readonly stats = new Map<string, Cached<UpdateStats>>();
   private readonly transcripts = new Map<string, Cached<ParsedUpdates>>();
+  private readonly ownWrites = new Map<string, number>();
 
   constructor(options: AgentSessionsReaderOptions) {
     this.agentHome = options.agentHome;
@@ -334,7 +335,7 @@ export class AgentSessionsReader {
       const ref = index.sessions.get(cur);
       if (ref !== undefined) {
         const verdict = ownLiveness(
-          { id: cur, dir: ref.dir, openTurn: this.updateStats(ref).openTurn },
+          { id: cur, dir: ref.dir, openTurn: this.updateStats(ref).openTurn, ownWrites: this.ownWrites },
           registry,
           now,
           failClosed,
@@ -346,6 +347,26 @@ export class AgentSessionsReader {
       cur = index.parentOf.get(cur)?.parentId;
     }
     return NOT_LIVE;
+  }
+
+  /** Record a file the dashboard itself just wrote, so the recent-write rule skips it. */
+  noteOwnWrite(path: string): void {
+    try {
+      this.ownWrites.set(path, lstatSync(path).mtimeMs);
+    } catch {
+      this.ownWrites.delete(path);
+    }
+  }
+
+  /** Drop every cached parse and own-write mark under a session dir after we changed it. */
+  invalidate(dir: string): void {
+    const prefix = dir.endsWith(sep) ? dir : dir + sep;
+    for (const cache of [this.summaries, this.metas, this.stats, this.transcripts, this.ownWrites] as Map<
+      string,
+      unknown
+    >[]) {
+      for (const key of cache.keys()) if (key.startsWith(prefix)) cache.delete(key);
+    }
   }
 
   private row(ref: SessionRef, index: SessionIndex, registry: ActiveRegistry, now: number): SessionRow {

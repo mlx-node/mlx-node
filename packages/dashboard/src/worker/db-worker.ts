@@ -14,6 +14,7 @@
 
 import { parentPort, receiveMessageOnPort, workerData, type MessagePort } from 'node:worker_threads';
 
+import { AgentSessionsReader } from '../agent-sessions/reader.js';
 import type { IngestSummary, WorkerApiContext } from '../api/context.js';
 import { dispatchWorker } from '../api/dispatch.js';
 import { failure, toFailure, type ApiResponse } from '../api/errors.js';
@@ -30,7 +31,7 @@ function requireParentPort(): MessagePort {
 }
 const port = requireParentPort();
 
-const { dbPath, modelsDir, tracesDir, cacheRoot, withdrawPort } = workerData as DbWorkerBoot;
+const { dbPath, modelsDir, tracesDir, cacheRoot, agentHome, withdrawPort } = workerData as DbWorkerBoot;
 
 /**
  * Requests the transport thread stopped waiting for before this thread reached
@@ -113,7 +114,15 @@ const drainIngest = async (): Promise<void> => {
   }
 };
 
-const ctx: WorkerApiContext = { dash, modelsDir, tracesDir, cacheRoot, runIngest };
+const ctx: WorkerApiContext = {
+  dash,
+  modelsDir,
+  tracesDir,
+  cacheRoot,
+  agentHome,
+  runIngest,
+  agentSessions: new AgentSessionsReader({ agentHome }),
+};
 
 /**
  * Post a reply, or — when the payload defeats the structured clone algorithm (a

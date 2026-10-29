@@ -25,6 +25,19 @@ export {
 } from './api/dispatch.js';
 export { ROUTES, type Route, type RouteThread } from './api/routes.js';
 export type { MetricsOverview } from './api/handlers/metrics.js';
+export type {
+  SessionDeleteResponse,
+  SessionDetail,
+  SessionDetailResponse,
+  SessionListQuery,
+  SessionListResponse,
+  SessionRenameResponse,
+  SessionRow,
+  SessionTokens,
+  SubagentRef,
+  TranscriptEntry,
+  TurnMetric,
+} from './agent-sessions/types.js';
 export { type ColdCacheDiskInfo, clearColdCache, evictOlderThan, scanColdCache } from './cache.js';
 export { type CatalogItem, catalogSlug, catalogWithState } from './catalog.js';
 export { type DashboardDb, openDashboardDb } from './db/open.js';

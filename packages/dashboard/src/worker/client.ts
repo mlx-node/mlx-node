@@ -119,6 +119,7 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
       modelsDir: opts.modelsDir,
       tracesDir: opts.tracesDir,
       cacheRoot: opts.cacheRoot,
+      agentHome: opts.agentHome,
       withdrawPort: withdrawals.port2,
     } satisfies DbWorkerBoot,
     transferList: [withdrawals.port2],
