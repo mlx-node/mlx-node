@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   truncateSync,
@@ -27,7 +28,7 @@ import {
   MAX_UPDATES_BYTES,
   resumeCommand,
 } from '../src/agent-sessions/reader.js';
-import { deleteSession, renameSession } from '../src/agent-sessions/writes.js';
+import { deleteSession, renameSession, sweepTombstones, TOMBSTONE_PREFIX } from '../src/agent-sessions/writes.js';
 
 const FIXTURE_HOME = fileURLToPath(new URL('./fixtures/grok-sessions/home', import.meta.url));
 const NOW = Date.parse('2026-10-29T12:00:00Z');
@@ -456,6 +457,114 @@ describe('liveness', () => {
     symlinkSync(join(home, 'active_sessions.json'), join(dir, 'link'));
     expect(newestFileMtimeMs(dir)).toBe(NOW - DAY);
     expect(newestFileMtimeMs(join(dir, 'missing'))).toBeNull();
+  });
+});
+
+describe('deleteSession', () => {
+  const OTHER = '%2FUsers%2Fdev%2Fother';
+  const WORKTREE = '%2FUsers%2Fdev%2F.mlx-agent%2Fworktrees%2Fproj%2Fsubagent-01a20000-0000-7000-8000-00000000000c';
+
+  function tombstones(): string[] {
+    const root = join(home, 'sessions');
+    return readdirSync(root).flatMap((cwd) => {
+      try {
+        return readdirSync(join(root, cwd))
+          .filter((n) => n.startsWith(TOMBSTONE_PREFIX))
+          .map((n) => join(root, cwd, n));
+      } catch {
+        return [];
+      }
+    });
+  }
+
+  it('a folder that cannot be fully removed is already gone from every scan, and a later delete finishes it', () => {
+    const assets = join(sessionDir(OTHER, M), 'assets');
+    mkdirSync(assets);
+    writeFileSync(join(assets, 'image.png'), 'x');
+    setMtimes(home, NOW - DAY);
+    chmodSync(assets, 0o000);
+    const r = reader();
+    try {
+      expect(deleteSession(r, M)).toEqual({ deleted: [M] });
+      expect(existsSync(sessionDir(OTHER, M))).toBe(false);
+      const left = tombstones();
+      expect(left).toHaveLength(1);
+      expect(existsSync(join(left[0]!, 'summary.json'))).toBe(false);
+      expect(r.scan().sessions.has(M)).toBe(false);
+      expect(r.scan().unreadable).toEqual([]);
+      expect(r.list().sessions.map((s) => s.id)).not.toContain(M);
+      expect(sweepTombstones(r.sessionsRoot)).toEqual(left);
+    } finally {
+      for (const t of tombstones()) chmodSync(join(t, 'assets'), 0o755);
+      if (existsSync(assets)) chmodSync(assets, 0o755);
+    }
+    // Any later delete retries the leftover.
+    expect([...deleteSession(r, P).deleted].sort()).toEqual([P, C1, C2, G].sort());
+    expect(tombstones()).toEqual([]);
+  });
+
+  it('a rename that fails part way keeps the requested session and the failed folder whole', () => {
+    const worktree = join(home, 'sessions', WORKTREE);
+    chmodSync(worktree, 0o555);
+    const r = reader();
+    let error: unknown;
+    try {
+      // Deepest first: G goes, C2 cannot be renamed, C1 and P are never touched.
+      deleteSession(r, P);
+    } catch (err) {
+      error = err;
+    } finally {
+      chmodSync(worktree, 0o755);
+    }
+    expect(existsSync(sessionDir(PROJ, G))).toBe(false);
+    expect(existsSync(join(sessionDir(WORKTREE, C2), 'summary.json'))).toBe(true);
+    expect((error as Error).message).toMatch(new RegExp(`Could not delete session ${C2}.*already deleted: ${G}`));
+    expect(tombstones()).toEqual([]);
+    const index = r.scan();
+    for (const sid of [P, C1, C2]) expect(index.sessions.has(sid)).toBe(true);
+    expect(r.list().sessions.map((s) => s.id)).toContain(P);
+    expect(r.detail(C1)!.session.subagents.map((s) => [s.id, s.exists])).toEqual([[G, false]]);
+
+    expect([...deleteSession(r, P).deleted].sort()).toEqual([P, C1, C2].sort());
+    for (const [folder, sid] of [
+      [PROJ, P],
+      [PROJ, C1],
+      [WORKTREE, C2],
+    ] as const) {
+      expect(existsSync(sessionDir(folder, sid))).toBe(false);
+    }
+  });
+
+  it('a crash after the child renames leaves the parent indexed and the tombstones to the next delete', () => {
+    // What a delete of P that died after renaming G and C2 leaves on disk.
+    const projDir = join(home, 'sessions', PROJ);
+    const gTomb = join(projDir, `${TOMBSTONE_PREFIX}g`);
+    const c2Tomb = join(home, 'sessions', WORKTREE, `${TOMBSTONE_PREFIX}c2`);
+    renameSync(sessionDir(PROJ, G), gTomb);
+    renameSync(sessionDir(WORKTREE, C2), c2Tomb);
+    // Look-alikes the sweep must leave alone.
+    const outside = mkdtempSync(join(tmpdir(), 'grok-outside-'));
+    writeFileSync(join(outside, 'keep.txt'), 'keep');
+    symlinkSync(outside, join(projDir, `${TOMBSTONE_PREFIX}link`));
+    writeFileSync(join(projDir, `${TOMBSTONE_PREFIX}file`), 'x');
+    try {
+      const r = reader();
+      const index = r.scan();
+      expect(index.sessions.has(G)).toBe(false);
+      expect(index.sessions.has(C2)).toBe(false);
+      expect(index.unreadable).toEqual([]);
+      expect(r.list().sessions.map((s) => s.id)).toContain(P);
+      expect(r.liveness(P, true).live).toBe(false);
+
+      expect([...deleteSession(r, P).deleted].sort()).toEqual([P, C1].sort());
+      expect(existsSync(gTomb)).toBe(false);
+      expect(existsSync(c2Tomb)).toBe(false);
+      expect(readFileSync(join(outside, 'keep.txt'), 'utf8')).toBe('keep');
+      expect(lstatSync(join(projDir, `${TOMBSTONE_PREFIX}link`)).isSymbolicLink()).toBe(true);
+      expect(existsSync(join(projDir, `${TOMBSTONE_PREFIX}file`))).toBe(true);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });
 

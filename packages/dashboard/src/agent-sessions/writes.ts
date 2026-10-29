@@ -12,9 +12,11 @@
 import { randomUUID } from 'node:crypto';
 import {
   closeSync,
+  type Dirent,
   fsyncSync,
   lstatSync,
   openSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -174,6 +176,19 @@ function assertNotLive(reader: AgentSessionsReader, index: SessionIndex, ids: st
   }
 }
 
+function fsyncDir(dir: string): void {
+  try {
+    const fd = openSync(dir, 'r');
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    // Best effort, as for grok on filesystems that refuse a directory fsync.
+  }
+}
+
 /** grok `write_bytes_atomic`: unique sibling temp, fsync, rename over, fsync the dir. */
 export function writeFileAtomic(path: string, data: string): void {
   const tmp = `${path}.${randomUUID()}.tmp`;
@@ -197,16 +212,7 @@ export function writeFileAtomic(path: string, data: string): void {
     }
     throw err;
   }
-  try {
-    const dirFd = openSync(dirname(path), 'r');
-    try {
-      fsyncSync(dirFd);
-    } finally {
-      closeSync(dirFd);
-    }
-  } catch {
-    // Best effort, as for grok on filesystems that refuse a directory fsync.
-  }
+  fsyncDir(dirname(path));
 }
 
 function sameFile(a: Stats, b: Stats): boolean {
@@ -283,14 +289,88 @@ export function renameSession(
 }
 
 /**
+ * Prefix of a session folder that a delete has renamed away. A dot name is
+ * skipped by our scan and by grok's `RelocationView` and stale-session cleanup,
+ * so the session is gone the moment the rename lands, however the removal fares.
+ */
+export const TOMBSTONE_PREFIX = '.deleting-';
+
+/** `true` once the tombstone is gone. */
+function removeTombstone(path: string): boolean {
+  try {
+    // First: grok's `find_local_child_for_remote_in_root` does not skip dot names.
+    unlinkSync(join(path, 'summary.json'));
+  } catch {
+    // Absent, or the removal below reports it.
+  }
+  try {
+    rmSync(path, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Remove every `<sessionsRoot>/<cwd>/.deleting-*` folder left by an earlier
+ * delete that failed or crashed part way, with the same containment rules as a
+ * session folder. Returns the tombstones that are still there.
+ */
+export function sweepTombstones(sessionsRoot: string): string[] {
+  let realRoot: string;
+  let cwdEntries: Dirent[];
+  try {
+    realRoot = realpathSync(sessionsRoot);
+    cwdEntries = readdirSync(sessionsRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const left: string[] = [];
+  for (const cwdEntry of cwdEntries) {
+    if (!cwdEntry.isDirectory() || cwdEntry.name.startsWith('.')) continue;
+    const cwdDir = join(sessionsRoot, cwdEntry.name);
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(cwdDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.name.startsWith(TOMBSTONE_PREFIX) || !entry.isDirectory()) continue;
+      const path = join(cwdDir, entry.name);
+      let real: string;
+      try {
+        real = realpathSync(path);
+      } catch {
+        continue;
+      }
+      const cwdSt = lstatOrNull(cwdDir);
+      const st = lstatOrNull(path);
+      if (cwdSt === null || cwdSt.isSymbolicLink() || !cwdSt.isDirectory()) continue;
+      if (st === null || st.isSymbolicLink() || !st.isDirectory()) continue;
+      if (real !== join(realRoot, cwdEntry.name, entry.name)) continue;
+      if (!removeTombstone(path)) left.push(path);
+    }
+  }
+  return left;
+}
+
+/**
  * grok `delete_session_history` removes the one session folder. We also remove
  * its subagent children, found only through `<session>/subagents/<child>/meta.json`
  * whose `parent_session_id` names the parent (never through `subagent_spawned`
  * lines: forks copy `updates.jsonl`), each child looked up by id across every
  * cwd folder. Refused as a whole when any of them is live.
+ *
+ * Each folder is first renamed to a tombstone in its own cwd folder, deepest
+ * child first and the requested session last, so a failure or crash part way
+ * leaves the requested session indexed for a retry and never a half-removed
+ * folder that no scan finds. Tombstones that cannot be removed now are retried
+ * by every later delete.
  */
 export function deleteSession(reader: AgentSessionsReader, id: string): SessionDeleteResponse {
   assertSessionIdShape(id);
+  sweepTombstones(reader.sessionsRoot);
   const index = reader.scan();
   const root = index.sessions.get(id);
   if (root === undefined) throw new SessionWriteError('not-found', `Session ${id} not found`);
@@ -301,13 +381,29 @@ export function deleteSession(reader: AgentSessionsReader, id: string): SessionD
   const dirs = targets.map((t) => containedSessionDir(reader.sessionsRoot, t));
   assertNotLive(reader, index, ids);
 
-  // Children first, so a failure part way leaves the parent to retry from.
-  for (let i = dirs.length - 1; i >= 0; i--) {
-    try {
-      rmSync(dirs[i]!, { recursive: true, force: true });
-    } finally {
-      reader.invalidate(dirs[i]!);
+  const tombstones: string[] = [];
+  try {
+    for (let i = dirs.length - 1; i >= 0; i--) {
+      const dir = dirs[i]!;
+      const tombstone = join(dirname(dir), `${TOMBSTONE_PREFIX}${randomUUID()}`);
+      try {
+        renameSync(dir, tombstone);
+      } catch (err) {
+        const done = ids.slice(i + 1);
+        throw new Error(
+          `Could not delete session ${ids[i]}: ${(err as Error).message}` +
+            (done.length > 0 ? ` (already deleted: ${done.join(', ')}); retry to finish` : ''),
+          { cause: err },
+        );
+      } finally {
+        reader.invalidate(dir);
+      }
+      tombstones.push(tombstone);
+      // The parent's rename must not reach disk before its children's.
+      fsyncDir(dirname(dir));
     }
+  } finally {
+    for (const tombstone of tombstones) removeTombstone(tombstone);
   }
   return { deleted: ids };
 }

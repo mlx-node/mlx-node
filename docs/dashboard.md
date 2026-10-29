@@ -122,6 +122,15 @@ SQLite table: each call re-lists the folders and reuses parsed `summary.json`,
   `meta.json` whose `parent_session_id` matches, looked up by id in every cwd
   folder). Like grok it leaves forks, `prompt_history.jsonl`,
   `session_search.sqlite` and the cwd folder alone.
+- Delete first renames each folder to `<cwd>/.deleting-<uuid>`, deepest child
+  first and the requested session last, then removes those folders. Dot names are
+  skipped by our scan and by grok, so the rename is the delete:
+
+  ```
+  rename fails part way   -> requested session still listed; retry deletes the rest
+  crash between renames   -> same; the renamed children are just gone
+  removal fails (EACCES)  -> 200; .deleting-* stays, invisible, retried on the next delete
+  ```
 
 Write guards (all answer 409 and change nothing; checked again right before the write):
 
