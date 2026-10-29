@@ -17,7 +17,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MessageChannel } from 'node:worker_threads';
 
@@ -162,6 +162,26 @@ describe('GET /api/sessions/:id', () => {
     expect(body.turns).toHaveLength(2);
     // The temp home is not the default one, so the command names it.
     expect(body.resumeCommand).toBe(`cd '/Users/dev/proj' && GROK_HOME='${home}' mlx agent --resume ${P}`);
+  });
+
+  it('names the absolute home when the dashboard got a relative GROK_HOME', async () => {
+    const rel = relative(process.cwd(), home);
+    expect(rel.startsWith('/')).toBe(false);
+    const relRuntime = createDashboardRuntime({
+      dbPath: ':memory:',
+      tracesDir: join(base, 'traces'),
+      modelsDir: join(base, 'models'),
+      agentHome: rel,
+    });
+    try {
+      expect(relRuntime.agentHome).toBe(home);
+      const res = await relRuntime.call({ method: 'GET', path: `/api/sessions/${P}` });
+      expect(res.ok ? (res.body as { resumeCommand: string }).resumeCommand : res).toBe(
+        `cd '/Users/dev/proj' && GROK_HOME='${home}' mlx agent --resume ${P}`,
+      );
+    } finally {
+      await relRuntime.close();
+    }
   });
 
   it('serves hidden subagent children with a link back to the parent', async () => {

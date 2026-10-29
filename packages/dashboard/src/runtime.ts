@@ -17,7 +17,7 @@
  */
 
 import { existsSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { agentConfigDir } from '@mlx-node/agent/paths';
@@ -126,7 +126,9 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
   const modelsDir = opts.modelsDir ?? defaultModelsDir();
   const tracesDir = opts.tracesDir ?? metricsTraceDir();
   const cacheRoot = opts.cacheRoot;
-  const agentHome = opts.agentHome ?? agentConfigDir();
+  // Absolute: the resume command `cd`s into the session cwd before setting
+  // GROK_HOME, and grok uses it verbatim, so a relative home would point elsewhere.
+  const agentHome = resolve(opts.agentHome ?? agentConfigDir());
 
   // Kept on this thread: one `mkdir` at construction is not the blocking problem,
   // and an unwritable location stays a synchronous, actionable throw from the
