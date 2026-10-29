@@ -137,14 +137,16 @@ Write guards (all answer 409 and change nothing; checked again right before the 
 | Guard        | Rule                                                                                                                                                                         |
 | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | registered   | the id, or any subagent ancestor, is in `active_sessions.json` with a live pid (`kill(pid, 0)`, EPERM = alive)                                                               |
-| recent write | any regular file in the session folder changed in the last 30 s (ACP and `-p` runs never register); our own rename does not count                                            |
+| recent write | any regular file in the session folder changed in the last 30 s (backup for mlx-agent < v0.3.0, where ACP and `-p` runs never register); our own rename does not count       |
 | open turn    | the transcript ends inside a turn and was written in the last 10 min                                                                                                         |
 | unreadable   | `active_sessions.json` cannot be parsed                                                                                                                                      |
 | containment  | the folder must be a real `<sessions>/<cwd>/<id>` directory (no symlink at either level, realpath inside the sessions root); ids with `/`, `\`, NUL or a leading `.` are 400 |
 
 grok's `*.lock` files are never opened: grok blocks on `LOCK_EX`, so a lock held
-from Node would stall the agent. An idle ACP/headless process holding a session
-with no recent writes cannot be detected without those locks.
+from Node would stall the agent. From mlx-agent v0.3.0 every resident session
+(TUI, `-p`, ACP, subagents) has a row in `active_sessions.json`, so an idle holder
+is detected. With an older binary, an idle ACP/headless holder with no recent
+writes cannot be detected.
 
 ## Persist paged cache (`persistPagedCache`)
 

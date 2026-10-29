@@ -346,8 +346,8 @@ export class AgentSessionsReader {
   }
 
   /**
-   * Live verdict for `id` and its subagent ancestors (children run inside the
-   * parent's process and never register). `failClosed` turns an unreadable
+   * Live verdict for `id` and its subagent ancestors (older mlx-agent binaries
+   * never register subagent children). `failClosed` turns an unreadable
    * registry or session dir, an ancestor whose summary does not index, or an
    * unlistable folder into "live", for write guards.
    */

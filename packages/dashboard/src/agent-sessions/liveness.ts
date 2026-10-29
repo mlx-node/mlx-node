@@ -7,9 +7,9 @@
 import { lstatSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-/** A write this recent may be from a process that never registered (ACP, headless `-p`). */
+/** A write this recent may be from a pre-v0.3.0 mlx-agent, where ACP and headless `-p` never register. */
 export const RECENT_WRITE_MS = 30_000;
-/** An unterminated turn this recent may be a headless/ACP run inside a long tool call. */
+/** An unterminated turn this recent may be such an unregistered run inside a long tool call. */
 export const OPEN_TURN_MS = 10 * 60_000;
 
 export type ActiveRegistry = { ok: true; ids: Set<string> } | { ok: false; error: string };
@@ -26,8 +26,9 @@ export function isPidAlive(pid: number): boolean {
 }
 
 /**
- * Session ids registered in `<agentHome>/active_sessions.json` by a live pid. Only
- * the TUI registers. Read without grok's lock; grok writes it tmp+rename. A
+ * Session ids registered in `<agentHome>/active_sessions.json` by a live pid. From
+ * mlx-agent v0.3.0 every resident session registers (TUI, `-p`, ACP, subagents);
+ * older binaries register only TUI sessions. Read without grok's lock; grok writes it tmp+rename. A
  * missing or empty file is an empty registry; any other failure is reported so a
  * write guard can fail closed.
  */
