@@ -304,8 +304,6 @@ function Marker({ entry }: { entry: Entry<'model'> | Entry<'turn-end'> }) {
 
 export interface TranscriptProps {
   entries: TranscriptEntry[];
-  /** Subagent child ids whose folder is known to be gone; those rows are not linked. */
-  missingChildren?: ReadonlySet<string>;
 }
 
 /**
@@ -314,7 +312,7 @@ export interface TranscriptProps {
  * rows linking to the child session, and thin markers for model switches and
  * turn ends.
  */
-export function Transcript({ entries, missingChildren }: TranscriptProps) {
+export function Transcript({ entries }: TranscriptProps) {
   return (
     <div className="space-y-3">
       {entries.map((entry, i) => {
@@ -329,7 +327,7 @@ export function Transcript({ entries, missingChildren }: TranscriptProps) {
           case 'plan':
             return <PlanEntry key={i} entry={entry} />;
           case 'subagent':
-            return <SubagentEntry key={i} entry={entry} linkable={missingChildren?.has(entry.childId) !== true} />;
+            return <SubagentEntry key={i} entry={entry} linkable={entry.exists === true} />;
           case 'model':
           case 'turn-end':
             return <Marker key={i} entry={entry} />;

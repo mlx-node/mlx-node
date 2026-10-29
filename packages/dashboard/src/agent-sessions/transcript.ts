@@ -350,7 +350,9 @@ export function parseUpdates(text: string): ParsedUpdates {
         case 'user_message_chunk': {
           const meta = isRecord(update._meta) ? update._meta : {};
           if (str(meta.modelId) !== null) model = meta.modelId as string;
-          if (meta.hostTurn === true || meta.hideFromScrollback === true) break;
+          openTurn = true;
+          // grok's pager shows hostTurn echoes (slash commands); hostTurn only exempts them from rewind counting.
+          if (meta.hideFromScrollback === true) break;
           const content = update.content;
           const displayText =
             isRecord(content) && content.type === 'text' && isRecord(content._meta)
@@ -360,7 +362,6 @@ export function parseUpdates(text: string): ParsedUpdates {
           if (body === '') break;
           const promptIndex = isUsize(meta.promptIndex) ? meta.promptIndex : null;
           const interjection = meta.interjection === true;
-          openTurn = true;
           const prev = last();
           if (
             prev?.kind === 'user' &&

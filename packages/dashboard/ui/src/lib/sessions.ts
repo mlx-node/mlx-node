@@ -1,6 +1,7 @@
 import { toast } from 'sonner';
 
 import { DashboardApiError } from './api';
+import type { TurnMetric } from './types';
 
 /** Display title: the stored title, or the id when the session never got one. */
 export function sessionTitle(session: { id: string; title: string }): string {
@@ -29,4 +30,19 @@ export function copyResumeCommand(command: string): void {
     () => toast.success('Resume command copied', { description: command }),
     () => toast.error('Failed to copy to clipboard'),
   );
+}
+
+export interface TurnTokenBars {
+  uncached: number;
+  cached: number;
+  output: number;
+}
+
+/**
+ * Disjoint stack segments for one turn. grok's `inputTokens` already includes
+ * the cache reads, so stacking `cachedTokens` on top would count them twice.
+ */
+export function turnTokenBars(t: Pick<TurnMetric, 'inputTokens' | 'cachedTokens' | 'outputTokens'>): TurnTokenBars {
+  const cached = Math.min(t.cachedTokens, t.inputTokens);
+  return { uncached: t.inputTokens - cached, cached, output: t.outputTokens };
 }

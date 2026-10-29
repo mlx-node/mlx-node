@@ -26,7 +26,7 @@ import {
 import { basename, dirname, join } from 'node:path';
 
 import { type LiveVerdict, OPEN_TURN_MS, RECENT_WRITE_MS } from './liveness.js';
-import type { AgentSessionsReader, SessionIndex, SessionRef } from './reader.js';
+import { type AgentSessionsReader, type SessionIndex, type SessionRef, subagentDescendants } from './reader.js';
 import type { SessionDeleteResponse, SessionRenameResponse } from './types.js';
 
 /** grok `MAX_TITLE_SCALARS`, counted after the control strip and trim. */
@@ -291,16 +291,7 @@ export function deleteSession(reader: AgentSessionsReader, id: string): SessionD
   const root = index.sessions.get(id);
   if (root === undefined) throw new SessionWriteError('not-found', `Session ${id} not found`);
 
-  const targets: SessionRef[] = [root];
-  const seen = new Set([id]);
-  for (let i = 0; i < targets.length; i++) {
-    for (const link of index.childrenOf.get(targets[i]!.id) ?? []) {
-      if (seen.has(link.childId)) continue;
-      seen.add(link.childId);
-      const child = index.sessions.get(link.childId);
-      if (child !== undefined) targets.push(child);
-    }
-  }
+  const targets: SessionRef[] = [root, ...subagentDescendants(index, id)];
   const ids = targets.map((t) => t.id);
   assertNotLive(reader, index, ids);
   const dirs = targets.map((t) => containedSessionDir(reader.sessionsRoot, t));

@@ -11,6 +11,7 @@
 
 import { MessageChannel } from 'node:worker_threads';
 
+import { turnTokenBars } from '@/lib/sessions';
 import type {
   SessionDeleteResponse,
   SessionDetail as SessionDetailData,
@@ -140,8 +141,17 @@ function detailBody(overrides: Partial<SessionDetailData> = {}, transcript?: Tra
         type: 'explore',
         description: 'Explore the cache',
         status: 'completed',
+        exists: true,
       },
-      { kind: 'subagent', ts, childId: GONE_CHILD_ID, type: 'general', description: 'Old helper', status: 'failed' },
+      {
+        kind: 'subagent',
+        ts,
+        childId: GONE_CHILD_ID,
+        type: 'general',
+        description: 'Old helper',
+        status: 'failed',
+        exists: false,
+      },
       { kind: 'assistant', ts, text: 'Done. See `planner.rs`.' },
       { kind: 'turn-end', ts, stopReason: 'end_turn', elapsedMs: 4_000 },
     ],
@@ -388,6 +398,41 @@ describe('Sessions page', () => {
     expect(writeText).toHaveBeenCalledWith(RESUME);
   });
 
+  it('drops a directory filter once the served directories no longer list it', async () => {
+    const other = row({ id: LIVE_ID, title: 'Only one here', cwd: '/work/other', subagentCount: 0 });
+    await mountList({
+      'GET /sessions': [
+        { body: listBody() },
+        { body: { sessions: [other], total: 1, cwds: ['/work/mlx-node', '/work/other'] } },
+        { body: { sessions: [], total: 0, cwds: ['/work/mlx-node'] } },
+        { body: { sessions: [row({})], total: 1, cwds: ['/work/mlx-node'] } },
+      ],
+      [`DELETE /sessions/${LIVE_ID}`]: { body: { deleted: [LIVE_ID] } },
+    });
+    const trigger = mounted!.container.querySelector<HTMLElement>('[aria-label="Filter by directory"]')!;
+    await act(async () => {
+      trigger.focus();
+      trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    });
+    const option = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find(
+      (o) => o.textContent === '/work/other',
+    );
+    await act(async () => {
+      option!.focus();
+      option!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    });
+    await settle();
+    expect(calls.at(-1)!.path).toContain('cwd=%2Fwork%2Fother');
+
+    await click(actionIn(rowOf(LIVE_ID), 'Delete'));
+    await click(dialogButton('Delete'));
+    await settle();
+
+    expect(calls.at(-1)!.path).not.toContain('cwd=');
+    expect(trigger.textContent).toBe('All directories');
+    expect(rowOf(PARENT_ID)).toBeTruthy();
+  });
+
   it('says how many sessions the cap left out', async () => {
     await mountList({ 'GET /sessions': { body: { ...listBody(), total: 640 } } });
     expect(mounted!.text()).toContain('Showing the newest 2 of 640 matching sessions');
@@ -442,6 +487,18 @@ describe('Session detail page', () => {
     expect(childLinks).toHaveLength(2);
     expect(mounted!.container.querySelector(`a[href="/sessions/${GONE_CHILD_ID}"]`)).toBeNull();
     expect(mounted!.text()).toContain('folder missing');
+  });
+
+  it('does not link a transcript subagent row whose child the server says is gone', async () => {
+    // A fork copies the source's spawn lines; those children are not in its `subagents`.
+    const ts = Date.UTC(2026, 9, 20, 10);
+    const fork = detailBody({ kind: 'fork', subagents: [], subagentCount: 0 }, [
+      { kind: 'subagent', ts, childId: CHILD_ID, type: 'explore', description: 'Copied spawn', exists: false },
+      { kind: 'subagent', ts, childId: GONE_CHILD_ID, type: 'explore', description: 'Live spawn', exists: true },
+    ]);
+    await mountDetail(PARENT_ID, { [`GET /sessions/${PARENT_ID}`]: { body: fork } }, 'Copied spawn');
+    expect(mounted!.container.querySelector(`a[href="/sessions/${CHILD_ID}"]`)).toBeNull();
+    expect(mounted!.container.querySelector(`a[href="/sessions/${GONE_CHILD_ID}"]`)).toBeTruthy();
   });
 
   it('links a subagent child back to its parent', async () => {
@@ -504,6 +561,20 @@ describe('Session detail page', () => {
       'not found',
     );
     expect(text).toContain(`Session ${PARENT_ID} not found`);
+  });
+});
+
+describe('turnTokenBars', () => {
+  it('splits the prompt into uncached and cached so the stack sums to input + output', () => {
+    // A real turn: grok's inputTokens already includes the cache reads.
+    const bars = turnTokenBars({ inputTokens: 332_055, cachedTokens: 288_974, outputTokens: 5_661 });
+    expect(bars).toEqual({ uncached: 43_081, cached: 288_974, output: 5_661 });
+    expect(bars.uncached + bars.cached + bars.output).toBe(332_055 + 5_661);
+    expect(turnTokenBars({ inputTokens: 10, cachedTokens: 25, outputTokens: 1 })).toEqual({
+      uncached: 0,
+      cached: 10,
+      output: 1,
+    });
   });
 });
 

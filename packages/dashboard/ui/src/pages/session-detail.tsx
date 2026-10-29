@@ -5,7 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { AXIS_TICK, ChartCard, TOOLTIP_CONTENT_STYLE } from '@/lib/chart';
 import { formatCount, formatNumber, formatRelativeTime } from '@/lib/format';
-import { copyResumeCommand, isoMs, LIVE_HINT, sessionTitle } from '@/lib/sessions';
+import { copyResumeCommand, isoMs, LIVE_HINT, sessionTitle, turnTokenBars, type TurnTokenBars } from '@/lib/sessions';
 import type { SessionDetail as SessionDetailData, SessionDetailResponse, TurnMetric } from '@/lib/types';
 import { useJson } from '@/lib/use-api';
 import { AlertCircle, ArrowLeft, Copy, FileWarning, GitBranch, Inbox } from 'lucide-react';
@@ -33,20 +33,15 @@ function mean(values: number[]): number | null {
   return values.reduce((a, b) => a + b, 0) / values.length;
 }
 
-interface TurnPoint {
+interface TurnPoint extends TurnTokenBars {
   turn: number;
-  input: number;
-  output: number;
-  cached: number;
   decodeTps: number | null;
 }
 
 function toPoints(turns: TurnMetric[]): TurnPoint[] {
   return turns.map((t, i) => ({
+    ...turnTokenBars(t),
     turn: i + 1,
-    input: t.inputTokens,
-    output: t.outputTokens,
-    cached: t.cachedTokens,
     decodeTps: isFiniteNumber(t.decodeTps) ? t.decodeTps : null,
   }));
 }
@@ -85,12 +80,7 @@ export default function SessionDetail() {
     return { input, output, cached, avgDecode, avgTtft };
   }, [turns]);
 
-  const missingChildren = useMemo(
-    () => new Set((session?.subagents ?? []).filter((s) => !s.exists).map((s) => s.id)),
-    [session],
-  );
-
-  const hasTokenData = points.some((p) => p.input + p.output + p.cached > 0);
+  const hasTokenData = points.some((p) => p.uncached + p.cached + p.output > 0);
   const hasDecodeData = points.some((p) => p.decodeTps !== null);
 
   return (
@@ -204,7 +194,7 @@ export default function SessionDetail() {
           {(hasTokenData || hasDecodeData) && (
             <div className="grid gap-4 lg:grid-cols-2">
               {hasTokenData && (
-                <ChartCard title="Tokens per turn" subtitle="Input, output, and cached tokens by turn">
+                <ChartCard title="Tokens per turn" subtitle="Prompt (uncached and cached) and output tokens by turn">
                   <ResponsiveContainer width="100%" height="100%">
                     <BarChart data={points} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
                       <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" vertical={false} />
@@ -227,10 +217,18 @@ export default function SessionDetail() {
                         formatter={(value) => <span className="text-foreground">{value}</span>}
                       />
                       <Bar
-                        dataKey="input"
+                        dataKey="uncached"
                         stackId="tokens"
-                        name="Input"
+                        name="Input (uncached)"
                         fill="var(--viz-input)"
+                        stroke="var(--color-card)"
+                        strokeWidth={1}
+                      />
+                      <Bar
+                        dataKey="cached"
+                        stackId="tokens"
+                        name="Input (cached)"
+                        fill="var(--viz-cached)"
                         stroke="var(--color-card)"
                         strokeWidth={1}
                       />
@@ -239,14 +237,6 @@ export default function SessionDetail() {
                         stackId="tokens"
                         name="Output"
                         fill="var(--viz-output)"
-                        stroke="var(--color-card)"
-                        strokeWidth={1}
-                      />
-                      <Bar
-                        dataKey="cached"
-                        stackId="tokens"
-                        name="Cached"
-                        fill="var(--viz-cached)"
                         stroke="var(--color-card)"
                         strokeWidth={1}
                         radius={[4, 4, 0, 0]}
@@ -310,7 +300,7 @@ export default function SessionDetail() {
                   No messages in this session.
                 </div>
               ) : (
-                <Transcript entries={data.transcript} missingChildren={missingChildren} />
+                <Transcript entries={data.transcript} />
               )}
             </CardContent>
           </Card>

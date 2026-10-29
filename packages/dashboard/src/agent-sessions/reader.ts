@@ -80,7 +80,8 @@ interface Cached<T> extends Stamp {
 
 interface UpdateStats {
   tokens: SessionTokens | null;
-  openTurn: boolean;
+  /** `null` when `updates.jsonl` could not be parsed (too large, unreadable). */
+  openTurn: boolean | null;
 }
 
 type UpdatesResult = { ok: true; parsed: ParsedUpdates } | { ok: false; error: string };
@@ -303,9 +304,15 @@ export class AgentSessionsReader {
       subagents,
     };
     const updates = this.updates(ref, true);
+    // Forks copy `updates.jsonl`, so a spawn line can name a child that was never ours or is gone.
+    const transcript = updates.ok
+      ? updates.parsed.transcript.map((e) =>
+          e.kind === 'subagent' ? { ...e, exists: index.sessions.has(e.childId) } : e,
+        )
+      : [];
     return {
       session,
-      transcript: updates.ok ? updates.parsed.transcript : [],
+      transcript,
       turns: updates.ok ? updates.parsed.turns : [],
       ...(updates.ok ? {} : { transcriptError: updates.error }),
       resumeCommand: resumeCommand(s.cwd, id, this.agentHome, this.defaultAgentHome),
@@ -334,8 +341,10 @@ export class AgentSessionsReader {
       visited.add(cur);
       const ref = index.sessions.get(cur);
       if (ref !== undefined) {
+        // An unparsed transcript may hide an open turn: write guards assume one.
+        const openTurn = this.updateStats(ref).openTurn ?? failClosed;
         const verdict = ownLiveness(
-          { id: cur, dir: ref.dir, openTurn: this.updateStats(ref).openTurn, ownWrites: this.ownWrites },
+          { id: cur, dir: ref.dir, openTurn, ownWrites: this.ownWrites },
           registry,
           now,
           failClosed,
@@ -383,7 +392,7 @@ export class AgentSessionsReader {
       live: this.livenessIn(index, ref.id, registry, now, false).live,
       kind: s.sessionKind,
       parentId: parentIdOf(ref, index),
-      subagentCount: index.childrenOf.get(ref.id)?.length ?? 0,
+      subagentCount: subagentDescendants(index, ref.id).length,
       tokens: this.updateStats(ref).tokens,
     };
   }
@@ -414,7 +423,7 @@ export class AgentSessionsReader {
       if (fresh(hit, st)) return hit!.value;
     }
     const result = this.updates(ref, false);
-    return result.ok ? statsOf(result.parsed) : { tokens: null, openTurn: false };
+    return result.ok ? statsOf(result.parsed) : { tokens: null, openTurn: null };
   }
 
   /** Parse `updates.jsonl`, refreshing the stats cache; `keep` also retains the transcript. */
@@ -448,6 +457,27 @@ export class AgentSessionsReader {
     }
     return { ok: true, parsed };
   }
+}
+
+/**
+ * Every indexed session under `id` through subagent `meta.json` links, breadth
+ * first, skipping children whose folder is gone. This is what delete removes.
+ */
+export function subagentDescendants(index: SessionIndex, id: string): SessionRef[] {
+  const out: SessionRef[] = [];
+  const seen = new Set([id]);
+  const queue = [id];
+  for (let i = 0; i < queue.length; i++) {
+    for (const link of index.childrenOf.get(queue[i]!) ?? []) {
+      if (seen.has(link.childId)) continue;
+      seen.add(link.childId);
+      const child = index.sessions.get(link.childId);
+      if (child === undefined) continue;
+      out.push(child);
+      queue.push(child.id);
+    }
+  }
+  return out;
 }
 
 /** `null` = no file; an `Error` = present but unusable. */

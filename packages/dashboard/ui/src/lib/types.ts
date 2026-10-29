@@ -403,6 +403,8 @@ export type TranscriptEntry =
       durationMs?: number;
       tokens?: number;
       error?: string;
+      /** Set by the detail route; only `true` may be linked. */
+      exists?: boolean;
     }
   | { kind: 'model'; ts: number; modelId: string }
   | { kind: 'turn-end'; ts: number; stopReason: string; elapsedMs?: number; error?: string };

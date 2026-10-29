@@ -81,6 +81,13 @@ export default function Sessions() {
   // the cap has no row to read it from, and the served list ignores the filters.
   const cwdOptions = sessions.data?.cwds ?? [];
 
+  // A delete can empty the selected directory; the Select would then show a
+  // blank trigger while the request still filters by it.
+  const servedCwds = sessions.data?.cwds;
+  useEffect(() => {
+    if (cwd !== 'all' && servedCwds !== undefined && !servedCwds.includes(cwd)) setCwd('all');
+  }, [cwd, servedCwds]);
+
   const openRename = (session: SessionRow): void => {
     setConflict(null);
     setRenameValue(session.title);

@@ -265,6 +265,7 @@ describe('parseUpdates', () => {
       { kind: 'user', ts: 0, text: 'legacy hello', promptIndex: null },
       { kind: 'assistant', ts: 0, text: 'legacy reply' },
       { kind: 'user', ts: 1791643279008, text: '/review live', promptIndex: 0 },
+      { kind: 'user', ts: 1791643279009, text: 'host echo', promptIndex: null },
       { kind: 'assistant', ts: 1791643279011, text: 'live reply' },
       { kind: 'user', ts: 1791643279012, text: 'also check tests', promptIndex: null, interjection: true },
       { kind: 'assistant', ts: 1791643279013, text: 'after interjection' },
@@ -291,6 +292,39 @@ describe('parseUpdates', () => {
     );
     expect(parsed.openTurn).toBe(true);
     expect(parsed.transcript[1]).toMatchObject({ kind: 'tool', input: 'sleep 600', status: 'pending' });
+  });
+
+  it('shows a slash command echoed as a host turn above its output, as the grok pager does', () => {
+    const parsed = parseUpdates(
+      [
+        acp({
+          sessionUpdate: 'user_message_chunk',
+          content: { type: 'text', text: '/context' },
+          _meta: { hostTurn: true },
+        }),
+        acp({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'Context: 12k tokens' },
+          _meta: { hostTurn: true },
+        }),
+        xai({ sessionUpdate: 'turn_completed', prompt_id: 'h1', stop_reason: 'end_turn' }),
+        '',
+      ].join('\n'),
+    );
+    expect(parsed.transcript.map((e) => [e.kind, 'text' in e ? e.text : null])).toEqual([
+      ['user', '/context'],
+      ['assistant', 'Context: 12k tokens'],
+      ['turn-end', null],
+    ]);
+  });
+
+  it('a hidden or host-turn prompt opens a turn before any tool call', () => {
+    for (const meta of [{ hostTurn: true }, { hideFromScrollback: true, promptIndex: 0 }]) {
+      const parsed = parseUpdates(
+        `${acp({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'go' }, _meta: meta })}\n`,
+      );
+      expect(parsed.openTurn).toBe(true);
+    }
   });
 
   it('chips binary tool output instead of dumping it', () => {

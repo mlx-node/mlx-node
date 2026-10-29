@@ -1,6 +1,7 @@
 import {
   appendFileSync,
   cpSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -8,6 +9,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  truncateSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs';
@@ -18,7 +20,13 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import { isPidAlive, newestFileMtimeMs, readActiveRegistry } from '../src/agent-sessions/liveness.js';
-import { AgentSessionsReader, type AgentSessionsReaderOptions, resumeCommand } from '../src/agent-sessions/reader.js';
+import {
+  AgentSessionsReader,
+  type AgentSessionsReaderOptions,
+  MAX_UPDATES_BYTES,
+  resumeCommand,
+} from '../src/agent-sessions/reader.js';
+import { deleteSession } from '../src/agent-sessions/writes.js';
 
 const FIXTURE_HOME = fileURLToPath(new URL('./fixtures/grok-sessions/home', import.meta.url));
 const NOW = Date.parse('2026-10-29T12:00:00Z');
@@ -259,6 +267,27 @@ describe('AgentSessionsReader.detail', () => {
     expect(detail.transcriptError).toBeUndefined();
   });
 
+  it('subagentCount is every nested child delete would remove, not the direct meta links', () => {
+    rmSync(sessionDir(PROJ, G), { recursive: true });
+    const r = reader();
+    // Direct links are C1, C2 and the missing GONE; G under C1 is now gone too.
+    expect(r.list().sessions.find((s) => s.id === P)!.subagentCount).toBe(2);
+    expect(r.detail(C1)!.session.subagentCount).toBe(0);
+    expect(deleteSession(r, P).deleted).toEqual([P, C1, C2]);
+  });
+
+  it('marks each transcript subagent row with whether its child session exists', () => {
+    rmSync(sessionDir(PROJ, C1), { recursive: true });
+    const rows = reader()
+      .detail(P)!
+      .transcript.filter((e) => e.kind === 'subagent')
+      .map((e) => [e.childId, e.exists]);
+    expect(rows).toEqual([
+      [C1, false],
+      [C2, true],
+    ]);
+  });
+
   it('serves hidden children with a parent link; resumed subagents do not claim their source as parent', () => {
     const r = reader();
     expect(r.detail(C1)!.session).toMatchObject({
@@ -353,6 +382,20 @@ describe('liveness', () => {
     // A terminated turn this recent is not live.
     setMtimes(sessionDir(PROJ, P), NOW - 5 * 60_000);
     expect(reader().liveness(P, true).live).toBe(false);
+  });
+
+  it('an unterminated turn behind an unparsable transcript counts for write guards only', () => {
+    const dir = sessionDir('%2Ftmp%2Fscratch', H);
+    // Sparse: stat says too large to parse, nothing is written.
+    truncateSync(join(dir, 'updates.jsonl'), MAX_UPDATES_BYTES + 1);
+    setMtimes(dir, NOW - 2 * 60_000);
+    expect(reader().liveness(H, true)).toEqual({ live: true, reason: 'open-turn', sessionId: H });
+    expect(reader().liveness(H, false).live).toBe(false);
+    expect(() => deleteSession(reader(), H)).toThrow(/turn in progress/);
+    expect(existsSync(dir)).toBe(true);
+    // Idle past the open-turn window, it can be deleted like a parsed one.
+    setMtimes(dir, NOW - 11 * 60_000);
+    expect(reader().liveness(H, true).live).toBe(false);
   });
 
   it('readActiveRegistry: missing or empty file is an empty registry', () => {
