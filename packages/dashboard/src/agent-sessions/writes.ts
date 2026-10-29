@@ -158,6 +158,10 @@ function liveMessage(id: string, verdict: LiveVerdict): string {
       return `Session ${id} has a turn in progress or interrupted${who} (written in the last ${OPEN_TURN_MS / 60_000} min); retry later`;
     case 'registry-unreadable':
       return `Cannot read active_sessions.json, so session ${id} may be in use; refusing to modify it`;
+    case 'ancestry-unknown':
+      return verdict.sessionId === null || verdict.sessionId === id
+        ? `A folder under the sessions root cannot be listed, so session ${id} may belong to a running parent; refusing to modify it`
+        : `Session ${id} was spawned by ${verdict.sessionId}, whose summary cannot be read, so it may be in use; refusing to modify it`;
     default:
       return `Session ${id} was written in the last ${RECENT_WRITE_MS / 1000} s${who} and may be in use; retry shortly`;
   }

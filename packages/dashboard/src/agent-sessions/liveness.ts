@@ -96,7 +96,7 @@ export function newestFileMtimeMs(dir: string, ownWrites?: OwnWrites): number | 
   }
 }
 
-export type LiveReason = 'registered' | 'recent-write' | 'open-turn' | 'registry-unreadable';
+export type LiveReason = 'registered' | 'recent-write' | 'open-turn' | 'registry-unreadable' | 'ancestry-unknown';
 
 export interface LiveVerdict {
   live: boolean;

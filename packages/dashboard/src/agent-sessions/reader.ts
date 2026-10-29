@@ -67,6 +67,13 @@ export interface SessionIndex {
   /** child id → link, from `<parent>/subagents/<child>/meta.json`. */
   parentOf: Map<string, ChildLink>;
   childrenOf: Map<string, ChildLink[]>;
+  /**
+   * child id → every session folder name with a `subagents/<child>/` dir, whether
+   * or not its summary or meta parses. Write guards walk this, not `parentOf`.
+   */
+  spawnedBy: Map<string, Set<string>>;
+  /** Folders under the sessions root that exist but cannot be listed: ancestry is unknown. */
+  unreadable: string[];
 }
 
 interface Stamp {
@@ -96,6 +103,17 @@ function readDirents(dir: string): Dirent[] {
   try {
     return readdirSync(dir, { withFileTypes: true });
   } catch {
+    return [];
+  }
+}
+
+/** Like `readDirents`, but a folder that exists and cannot be listed goes to `unreadable`. */
+function readDirentsNoted(dir: string, unreadable: string[]): Dirent[] {
+  try {
+    return readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT' && code !== 'ENOTDIR') unreadable.push(dir);
     return [];
   }
 }
@@ -162,6 +180,8 @@ export class AgentSessionsReader {
   /** Walk `<sessionsRoot>/<encodedCwd>/<id>/summary.json` like grok's `RelocationView`. */
   scan(): SessionIndex {
     const candidates = new Map<string, { dir: string; summaryPath: string; st: Stats }[]>();
+    const spawnedBy = new Map<string, Set<string>>();
+    const unreadable: string[] = [];
     let cwdEntries: Dirent[];
     try {
       cwdEntries = readdirSync(this.sessionsRoot, { withFileTypes: true });
@@ -172,9 +192,15 @@ export class AgentSessionsReader {
     for (const cwdEntry of cwdEntries) {
       if (!cwdEntry.isDirectory()) continue;
       const cwdDir = join(this.sessionsRoot, cwdEntry.name);
-      for (const entry of readDirents(cwdDir)) {
+      for (const entry of readDirentsNoted(cwdDir, unreadable)) {
         if (entry.name.startsWith('.') || !entry.isDirectory()) continue;
         const dir = join(cwdDir, entry.name);
+        for (const sub of readDirentsNoted(join(dir, 'subagents'), unreadable)) {
+          if (!sub.isDirectory() || sub.name === entry.name) continue;
+          const parents = spawnedBy.get(sub.name);
+          if (parents === undefined) spawnedBy.set(sub.name, new Set([entry.name]));
+          else parents.add(entry.name);
+        }
         const summaryPath = join(dir, 'summary.json');
         const st = regularFile(summaryPath);
         if (st === null) continue;
@@ -228,7 +254,7 @@ export class AgentSessionsReader {
     for (const key of this.stats.keys()) if (!liveUpdates.has(key)) this.stats.delete(key);
     for (const key of this.transcripts.keys()) if (!liveUpdates.has(key)) this.transcripts.delete(key);
 
-    return { sessions, ambiguous, parentOf, childrenOf };
+    return { sessions, ambiguous, parentOf, childrenOf, spawnedBy, unreadable };
   }
 
   list(query: SessionListQuery = {}): SessionListResponse {
@@ -322,7 +348,8 @@ export class AgentSessionsReader {
   /**
    * Live verdict for `id` and its subagent ancestors (children run inside the
    * parent's process and never register). `failClosed` turns an unreadable
-   * registry or session dir into "live", for write guards.
+   * registry or session dir, an ancestor whose summary does not index, or an
+   * unlistable folder into "live", for write guards.
    */
   liveness(id: string, failClosed: boolean, index: SessionIndex = this.scan()): LiveVerdict {
     return this.livenessIn(index, id, readActiveRegistry(this.agentHome, this.alive), this.now(), failClosed);
@@ -335,10 +362,11 @@ export class AgentSessionsReader {
     now: number,
     failClosed: boolean,
   ): LiveVerdict {
-    const visited = new Set<string>();
-    let cur: string | undefined = id;
-    while (cur !== undefined && !visited.has(cur)) {
-      visited.add(cur);
+    if (failClosed && index.unreadable.length > 0) return { live: true, reason: 'ancestry-unknown', sessionId: id };
+    const visited = new Set([id]);
+    const queue = [id];
+    for (let i = 0; i < queue.length; i++) {
+      const cur = queue[i]!;
       const ref = index.sessions.get(cur);
       if (ref !== undefined) {
         // An unparsed transcript may hide an open turn: write guards assume one.
@@ -352,8 +380,15 @@ export class AgentSessionsReader {
         if (verdict.live) return verdict;
       } else if (registry.ok && registry.ids.has(cur)) {
         return { live: true, reason: 'registered', sessionId: cur };
+      } else if (failClosed && cur !== id) {
+        // A real folder spawned this chain but its summary does not index (corrupt, ambiguous, absent).
+        return { live: true, reason: 'ancestry-unknown', sessionId: cur };
       }
-      cur = index.parentOf.get(cur)?.parentId;
+      for (const parent of index.spawnedBy.get(cur) ?? []) {
+        if (visited.has(parent)) continue;
+        visited.add(parent);
+        queue.push(parent);
+      }
     }
     return NOT_LIVE;
   }

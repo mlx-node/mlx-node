@@ -1,5 +1,6 @@
 import {
   appendFileSync,
+  chmodSync,
   cpSync,
   existsSync,
   lstatSync,
@@ -26,7 +27,7 @@ import {
   MAX_UPDATES_BYTES,
   resumeCommand,
 } from '../src/agent-sessions/reader.js';
-import { deleteSession } from '../src/agent-sessions/writes.js';
+import { deleteSession, renameSession } from '../src/agent-sessions/writes.js';
 
 const FIXTURE_HOME = fileURLToPath(new URL('./fixtures/grok-sessions/home', import.meta.url));
 const NOW = Date.parse('2026-10-29T12:00:00Z');
@@ -396,6 +397,42 @@ describe('liveness', () => {
     // Idle past the open-turn window, it can be deleted like a parsed one.
     setMtimes(dir, NOW - 11 * 60_000);
     expect(reader().liveness(H, true).live).toBe(false);
+  });
+
+  it('a parent whose summary does not parse still guards its subagent chain', () => {
+    writeFileSync(join(sessionDir(PROJ, P), 'summary.json'), '{"info": ');
+    register([{ session_id: P, pid: LIVE_PID }]);
+    const r = reader();
+    expect(r.scan().sessions.has(P)).toBe(false);
+    expect(r.liveness(C1, true)).toEqual({ live: true, reason: 'registered', sessionId: P });
+    expect(r.liveness(G, true)).toEqual({ live: true, reason: 'registered', sessionId: P });
+    expect(r.liveness(G, false)).toEqual({ live: true, reason: 'registered', sessionId: P });
+    expect(() => renameSession(r, G, 'Renamed')).toThrow(/open in a running mlx agent \(via parent/);
+    expect(() => deleteSession(r, C1)).toThrow(/open in a running mlx agent \(via parent/);
+    expect(existsSync(sessionDir(PROJ, C1))).toBe(true);
+    expect(existsSync(sessionDir(PROJ, G))).toBe(true);
+
+    // Unregistered, the parent's state is unknowable: guards refuse, display does not claim live.
+    rmSync(join(home, 'active_sessions.json'));
+    expect(r.liveness(G, true)).toEqual({ live: true, reason: 'ancestry-unknown', sessionId: P });
+    expect(r.liveness(G, false).live).toBe(false);
+    expect(() => deleteSession(r, C1)).toThrow(/spawned by .*summary cannot be read/);
+    expect(existsSync(sessionDir(PROJ, G))).toBe(true);
+  });
+
+  it('a session folder that cannot be listed fails every write guard closed', () => {
+    const subagents = join(sessionDir(PROJ, P), 'subagents');
+    chmodSync(subagents, 0o000);
+    try {
+      const r = reader();
+      expect(r.scan().unreadable).toEqual([subagents]);
+      expect(r.liveness(M, true)).toEqual({ live: true, reason: 'ancestry-unknown', sessionId: M });
+      expect(r.liveness(M, false).live).toBe(false);
+      expect(() => deleteSession(r, G)).toThrow(/cannot be listed/);
+      expect(existsSync(sessionDir(PROJ, G))).toBe(true);
+    } finally {
+      chmodSync(subagents, 0o755);
+    }
   });
 
   it('readActiveRegistry: missing or empty file is an empty registry', () => {
