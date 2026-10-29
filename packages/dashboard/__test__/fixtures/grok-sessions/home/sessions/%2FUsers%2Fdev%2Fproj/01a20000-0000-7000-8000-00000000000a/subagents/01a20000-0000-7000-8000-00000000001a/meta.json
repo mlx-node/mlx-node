@@ -1,0 +1,14 @@
+{
+  "subagent_id": "01a20000-0000-7000-8000-00000000001a",
+  "attempt_id": "at1.x",
+  "parent_session_id": "some-other-parent",
+  "child_session_id": "01a20000-0000-7000-8000-00000000001a",
+  "subagent_type": "general-purpose",
+  "description": "Foreign meta",
+  "prompt": "You are researching the project.",
+  "status": "completed",
+  "started_at": "2026-10-10T14:49:25Z",
+  "effective_context_source": "new",
+  "child_cwd": "/Users/dev/proj",
+  "effective_model_id": "Qwen3.8-27B-UD-Q4_K_M"
+}

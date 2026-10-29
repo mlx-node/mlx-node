@@ -1,0 +1,14 @@
+{
+  "subagent_id": "01a20000-0000-7000-8000-00000000000c",
+  "attempt_id": "at1.x",
+  "parent_session_id": "01a20000-0000-7000-8000-00000000000a",
+  "child_session_id": "01a20000-0000-7000-8000-00000000000c",
+  "subagent_type": "codex:codex-rescue",
+  "description": "Trace paged attention",
+  "prompt": "You are researching the project.",
+  "status": "running",
+  "started_at": "2026-10-10T14:49:25.000002Z",
+  "effective_context_source": "new",
+  "child_cwd": "/Users/dev/.mlx-agent/worktrees/proj/subagent-01a20000-0000-7000-8000-00000000000c",
+  "effective_model_id": "Qwen3.8-27B-UD-Q4_K_M"
+}
