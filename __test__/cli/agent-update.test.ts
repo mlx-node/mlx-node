@@ -79,13 +79,13 @@ describe('probeAgentInstall', () => {
     const root = mkdtempSync(join(tmpdir(), 'probe-'));
     try {
       mkdirBin(root);
-      writeFileSync(versioned(root, 'mlx-agent-v0.2.0'), 'v020');
-      writeFileSync(`${managedAgentBinPath(root)}.tag`, 'mlx-agent-v0.2.0');
+      writeFileSync(versioned(root, 'mlx-agent-v0.3.0'), 'v030');
+      writeFileSync(`${managedAgentBinPath(root)}.tag`, 'mlx-agent-v0.3.0');
       const probe = probeAgentInstall(root, {}, root);
       expect(probe).toMatchObject({
         source: 'managed',
-        path: versioned(root, 'mlx-agent-v0.2.0'),
-        managedTag: 'mlx-agent-v0.2.0',
+        path: versioned(root, 'mlx-agent-v0.3.0'),
+        managedTag: 'mlx-agent-v0.3.0',
       });
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -141,16 +141,16 @@ describe('probeAgentInstall', () => {
     const root = mkdtempSync(join(tmpdir(), 'probe-'));
     try {
       mkdirBin(root);
-      writeFileSync(versioned(root, 'mlx-agent-v0.2.0'), 'v020');
       writeFileSync(versioned(root, 'mlx-agent-v0.3.0'), 'v030');
-      writeFileSync(`${managedAgentBinPath(root)}.tag`, 'mlx-agent-v0.3.0');
-      const probe = probeAgentInstall(root, { [MLX_AGENT_TAG_ENV]: 'mlx-agent-v0.2.0' }, root);
+      writeFileSync(versioned(root, 'mlx-agent-v0.4.0'), 'v040');
+      writeFileSync(`${managedAgentBinPath(root)}.tag`, 'mlx-agent-v0.4.0');
+      const probe = probeAgentInstall(root, { [MLX_AGENT_TAG_ENV]: 'mlx-agent-v0.3.0' }, root);
       // The pin selects its exact release even though the pointer names a newer one.
       expect(probe).toMatchObject({
         source: 'managed',
-        path: versioned(root, 'mlx-agent-v0.2.0'),
-        managedTag: 'mlx-agent-v0.3.0',
-        effectiveTag: 'mlx-agent-v0.2.0',
+        path: versioned(root, 'mlx-agent-v0.3.0'),
+        managedTag: 'mlx-agent-v0.4.0',
+        effectiveTag: 'mlx-agent-v0.3.0',
       });
       // A cache-hit pin must be leased too: another process's sweep can
       // delete the binary between this probe and the actual spawn.
@@ -164,22 +164,22 @@ describe('probeAgentInstall', () => {
     const root = mkdtempSync(join(tmpdir(), 'probe-'));
     try {
       mkdirBin(root);
-      writeFileSync(versioned(root, 'mlx-agent-v0.3.0'), 'v030');
-      writeFileSync(`${managedAgentBinPath(root)}.tag`, 'mlx-agent-v0.3.0');
+      writeFileSync(versioned(root, 'mlx-agent-v0.4.0'), 'v040');
+      writeFileSync(`${managedAgentBinPath(root)}.tag`, 'mlx-agent-v0.4.0');
       // The packaged app bundles exactly the pinned release, but the
       // managed cache lacks it — a managed miss must not trigger a
       // download when the bundle already carries that tag (offline
       // launches would fail for nothing).
       const bundled = join(root, 'app', 'native', `mlx-agent${EXE}`);
       mkdirSync(dirname(bundled), { recursive: true });
-      writeFileSync(bundled, 'bundled-v020');
-      writeFileSync(`${bundled}.tag`, 'mlx-agent-v0.2.0');
-      const probe = probeAgentInstall(root, { [MLX_AGENT_TAG_ENV]: 'mlx-agent-v0.2.0' }, root, bundled);
+      writeFileSync(bundled, 'bundled-v030');
+      writeFileSync(`${bundled}.tag`, 'mlx-agent-v0.3.0');
+      const probe = probeAgentInstall(root, { [MLX_AGENT_TAG_ENV]: 'mlx-agent-v0.3.0' }, root, bundled);
       expect(probe).toMatchObject({
         source: 'bundled',
         path: bundled,
-        bundledTag: 'mlx-agent-v0.2.0',
-        effectiveTag: 'mlx-agent-v0.2.0',
+        bundledTag: 'mlx-agent-v0.3.0',
+        effectiveTag: 'mlx-agent-v0.3.0',
       });
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -235,12 +235,12 @@ describe('resolveAgentBinary', () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-resolve-'));
     try {
       mkdirBin(home);
-      writeFileSync(versioned(home, 'mlx-agent-v0.2.0'), 'v020');
-      writeFileSync(`${managedAgentBinPath(home)}.tag`, 'mlx-agent-v0.3.0');
-      const env = { [MLX_AGENT_TAG_ENV]: 'mlx-agent-v0.2.0' };
+      writeFileSync(versioned(home, 'mlx-agent-v0.3.0'), 'v030');
+      writeFileSync(`${managedAgentBinPath(home)}.tag`, 'mlx-agent-v0.4.0');
+      const env = { [MLX_AGENT_TAG_ENV]: 'mlx-agent-v0.3.0' };
       // `home` doubles as a non-repo root so the vendored probe stays cold.
       const bin = await resolveAgentBinary(home, env, home);
-      expect(bin).toBe(versioned(home, 'mlx-agent-v0.2.0'));
+      expect(bin).toBe(versioned(home, 'mlx-agent-v0.3.0'));
       // The serialized lease survives — it is what a concurrent unpinned
       // sweep consults before deleting this binary.
       expect(existsSync(`${bin}.lease-${process.pid}`)).toBe(true);
@@ -314,12 +314,12 @@ describe('resolveAgentBinary', () => {
     const home = mkdtempSync(join(tmpdir(), 'agent-resolve-'));
     try {
       mkdirBin(home);
-      writeFileSync(versioned(home, 'mlx-agent-v0.3.0'), 'v030');
-      writeFileSync(`${managedAgentBinPath(home)}.tag`, 'mlx-agent-v0.3.0');
-      process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.2.0';
+      writeFileSync(versioned(home, 'mlx-agent-v0.4.0'), 'v040');
+      writeFileSync(`${managedAgentBinPath(home)}.tag`, 'mlx-agent-v0.4.0');
+      process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.3.0';
 
       const file = join(home, 'agent-bin');
-      writeFileSync(file, 'v020');
+      writeFileSync(file, 'v030');
       const packed = spawnSync('tar', ['-czf', '-', '-C', home, 'agent-bin']);
       rmSync(file, { force: true });
       expect(packed.status).toBe(0);
@@ -332,9 +332,9 @@ describe('resolveAgentBinary', () => {
       });
 
       const bin = await resolveAgentBinary(home, process.env, home);
-      expect(bin).toBe(versioned(home, 'mlx-agent-v0.2.0'));
+      expect(bin).toBe(versioned(home, 'mlx-agent-v0.3.0'));
       // A pinned download is a side-install: the unpinned pointer is untouched.
-      expect(readFileSync(`${managedAgentBinPath(home)}.tag`, 'utf-8')).toBe('mlx-agent-v0.3.0');
+      expect(readFileSync(`${managedAgentBinPath(home)}.tag`, 'utf-8')).toBe('mlx-agent-v0.4.0');
       // Freshly downloaded managed binaries carry the same locked lease as
       // cache hits — a concurrent updater's sweep must see it before spawn.
       expect(existsSync(`${bin}.lease-${process.pid}`)).toBe(true);
@@ -472,18 +472,18 @@ describe('downloadAgentBinary', () => {
       // A pinned side-install on a pointer-less legacy install leaves no
       // .tag — the unversioned base is still the resolvable default and
       // must survive the sweep.
-      process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.2.0';
-      mockMirrors(makeTarball(home, 'v020'));
-      await downloadAgentBinary(dest, 'mlx-agent-v0.2.0');
+      process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.3.0';
+      mockMirrors(makeTarball(home, 'v030'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
       expect(existsSync(dest)).toBe(true);
-      expect(existsSync(versionedName('mlx-agent-v0.2.0'))).toBe(true);
+      expect(existsSync(versionedName('mlx-agent-v0.3.0'))).toBe(true);
 
       // With the pointer now live, an $MLX_AGENT_BIN that selects exactly
       // the base path protects it — sweeping would break the user's pin.
       delete process.env[MLX_AGENT_TAG_ENV];
       process.env[MLX_AGENT_BIN_ENV] = dest;
-      mockMirrors(makeTarball(home, 'v030'));
-      await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
+      mockMirrors(makeTarball(home, 'v040'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.4.0');
       expect(existsSync(dest)).toBe(true);
       expect(readFileSync(dest, 'utf-8')).toBe('legacy-binary');
 
@@ -493,8 +493,8 @@ describe('downloadAgentBinary', () => {
       const link = join(home, 'agent-link');
       symlinkSync(dest, link);
       process.env[MLX_AGENT_BIN_ENV] = link;
-      mockMirrors(makeTarball(home, 'v040'));
-      await downloadAgentBinary(dest, 'mlx-agent-v0.4.0');
+      mockMirrors(makeTarball(home, 'v050'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.5.0');
       expect(existsSync(dest)).toBe(true);
       expect(readFileSync(dest, 'utf-8')).toBe('legacy-binary');
     } finally {
@@ -578,21 +578,21 @@ describe('downloadAgentBinary', () => {
       const dest = managedAgentBinPath(home);
       const versionedName = (tag: string) => join(dirname(dest), `${tag}${process.platform === 'win32' ? '.exe' : ''}`);
 
-      // Active release: v0.3.0.
+      // Active release: v0.4.0.
       delete process.env[MLX_AGENT_TAG_ENV];
-      mockMirrors(makeTarball(home, 'v030'));
-      await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
-      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.3.0');
+      mockMirrors(makeTarball(home, 'v040'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.4.0');
+      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.4.0');
 
-      // A pinned launch fetches v0.2.0 — it must not repoint the default or
+      // A pinned launch fetches v0.3.0 — it must not repoint the default or
       // sweep the active release.
-      process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.2.0';
-      mockMirrors(makeTarball(home, 'v020'));
-      const path = await downloadAgentBinary(dest, 'mlx-agent-v0.2.0');
-      expect(path).toBe(versionedName('mlx-agent-v0.2.0'));
-      expect(readFileSync(path, 'utf-8')).toBe('v020');
-      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.3.0');
-      expect(existsSync(versionedName('mlx-agent-v0.3.0'))).toBe(true);
+      process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.3.0';
+      mockMirrors(makeTarball(home, 'v030'));
+      const path = await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
+      expect(path).toBe(versionedName('mlx-agent-v0.3.0'));
+      expect(readFileSync(path, 'utf-8')).toBe('v030');
+      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.4.0');
+      expect(existsSync(versionedName('mlx-agent-v0.4.0'))).toBe(true);
     } finally {
       if (saved === undefined) delete process.env[MLX_AGENT_TAG_ENV];
       else process.env[MLX_AGENT_TAG_ENV] = saved;
@@ -608,33 +608,33 @@ describe('downloadAgentBinary', () => {
       const versionedName = (tag: string) => join(dirname(dest), `${tag}${process.platform === 'win32' ? '.exe' : ''}`);
 
       delete process.env[MLX_AGENT_TAG_ENV];
+      mockMirrors(makeTarball(home, 'v040'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.4.0');
+
+      // Side-install v0.3.0 for a pin.
+      process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.3.0';
       mockMirrors(makeTarball(home, 'v030'));
       await downloadAgentBinary(dest, 'mlx-agent-v0.3.0');
 
-      // Side-install v0.2.0 for a pin.
-      process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.2.0';
-      mockMirrors(makeTarball(home, 'v020'));
-      await downloadAgentBinary(dest, 'mlx-agent-v0.2.0');
-
-      // Later unpinned update to v0.4.0: the pointer's previous target
-      // (v0.3.0) survives as the rollback release. The side-installed
-      // v0.2.0 survives too — its lease names this (live) process, so a
+      // Later unpinned update to v0.5.0: the pointer's previous target
+      // (v0.4.0) survives as the rollback release. The side-installed
+      // v0.3.0 survives too — its lease names this (live) process, so a
       // sweep must not delete a binary a pinned launch can still resolve.
       delete process.env[MLX_AGENT_TAG_ENV];
-      mockMirrors(makeTarball(home, 'v040'));
-      await downloadAgentBinary(dest, 'mlx-agent-v0.4.0');
-      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.4.0');
+      mockMirrors(makeTarball(home, 'v050'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.5.0');
+      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.5.0');
+      expect(existsSync(versionedName('mlx-agent-v0.5.0'))).toBe(true);
       expect(existsSync(versionedName('mlx-agent-v0.4.0'))).toBe(true);
       expect(existsSync(versionedName('mlx-agent-v0.3.0'))).toBe(true);
-      expect(existsSync(versionedName('mlx-agent-v0.2.0'))).toBe(true);
 
       // A lease whose pinner is dead no longer protects the binary: the
       // next sweep removes both it and the stale lease.
       const staleBin = versionedName('mlx-agent-v0.1.0');
       writeFileSync(staleBin, 'v010');
       writeFileSync(`${staleBin}.lease-999999`, '');
-      mockMirrors(makeTarball(home, 'v050'));
-      await downloadAgentBinary(dest, 'mlx-agent-v0.5.0');
+      mockMirrors(makeTarball(home, 'v060'));
+      await downloadAgentBinary(dest, 'mlx-agent-v0.6.0');
       expect(existsSync(staleBin)).toBe(false);
       expect(existsSync(`${staleBin}.lease-999999`)).toBe(false);
     } finally {
@@ -1224,31 +1224,31 @@ describe('downloadAgentBinary', () => {
     try {
       delete process.env[MLX_AGENT_TAG_ENV];
       const dest = managedAgentBinPath(home);
-      const tar = makeTarball(home, 'v020');
+      const tar = makeTarball(home, 'v030');
       const sha = createHash('sha256').update(tar).digest('hex');
-      // The R2 pointer names v0.3.0 and its presence probe answers — but the
+      // The R2 pointer names v0.4.0 and its presence probe answers — but the
       // archive 404s when the real download GETs it (assets yanked between
       // resolve and fetch, the race presence probes cannot close). GitHub
-      // latest offers v0.2.0, which must carry the launch.
+      // latest offers v0.3.0, which must carry the launch.
       let badArchiveGets = 0;
       fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
         const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
         if (u.endsWith('.sha256')) return new Response(sha);
-        if (u.includes('releases/latest')) return new Response(JSON.stringify({ tag_name: 'mlx-agent-v0.2.0' }));
+        if (u.includes('releases/latest')) return new Response(JSON.stringify({ tag_name: 'mlx-agent-v0.3.0' }));
         if (u.endsWith('.tar.gz')) {
-          if (u.includes('mlx-agent-v0.3.0')) {
+          if (u.includes('mlx-agent-v0.4.0')) {
             badArchiveGets += 1;
             return badArchiveGets === 1 ? new Response('probe-ok') : new Response('nope', { status: 404 });
           }
           return new Response(new Uint8Array(tar));
         }
-        if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.3.0');
+        if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.4.0');
         return new Response('nope', { status: 404 });
       });
       const path = await downloadAgentBinary(dest, undefined, {});
-      expect(path).toBe(versioned(home, 'mlx-agent-v0.2.0'));
-      expect(readFileSync(path, 'utf-8')).toBe('v020');
-      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.2.0');
+      expect(path).toBe(versioned(home, 'mlx-agent-v0.3.0'));
+      expect(readFileSync(path, 'utf-8')).toBe('v030');
+      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.3.0');
     } finally {
       if (saved === undefined) delete process.env[MLX_AGENT_TAG_ENV];
       else process.env[MLX_AGENT_TAG_ENV] = saved;
@@ -1262,21 +1262,21 @@ describe('downloadAgentBinary', () => {
     try {
       delete process.env[MLX_AGENT_TAG_ENV];
       const dest = managedAgentBinPath(home);
-      const tar = makeTarball(home, 'v030');
+      const tar = makeTarball(home, 'v040');
       const sha = createHash('sha256').update(tar).digest('hex');
       fetchSpy.mockImplementation(async (url: RequestInfo | URL) => {
         const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
         if (u.endsWith('.sha256')) return new Response(sha);
-        if (u.includes('releases/latest')) return new Response(JSON.stringify({ tag_name: 'mlx-agent-v0.2.9' }));
+        if (u.includes('releases/latest')) return new Response(JSON.stringify({ tag_name: 'mlx-agent-v0.3.9' }));
         if (u.endsWith('.tar.gz')) return new Response(new Uint8Array(tar));
-        if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.3.0');
+        if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.4.0');
         return new Response('nope', { status: 404 });
       });
-      // Candidates v0.3.0, v0.2.9, v0.2.0 — only v0.3.0 beats the v0.2.9
+      // Candidates v0.4.0, v0.3.9, v0.3.0 — only v0.4.0 beats the v0.3.9
       // floor; the walk must land there, never on an older complete release.
-      const path = await downloadAgentBinary(dest, undefined, {}, 'mlx-agent-v0.2.9');
-      expect(path).toBe(versioned(home, 'mlx-agent-v0.3.0'));
-      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.3.0');
+      const path = await downloadAgentBinary(dest, undefined, {}, 'mlx-agent-v0.3.9');
+      expect(path).toBe(versioned(home, 'mlx-agent-v0.4.0'));
+      expect(readFileSync(`${dest}.tag`, 'utf-8')).toBe('mlx-agent-v0.4.0');
     } finally {
       if (saved === undefined) delete process.env[MLX_AGENT_TAG_ENV];
       else process.env[MLX_AGENT_TAG_ENV] = saved;
@@ -1339,10 +1339,10 @@ describe('resolveReleaseTag', () => {
       const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
       if (u.endsWith('.sha256')) return new Response(DIGEST);
       if (u.endsWith('.tar.gz')) return new Response('archive-bytes');
-      if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.3.0');
+      if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.4.0');
       return new Response('nope', { status: 404 });
     });
-    await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.3.0');
+    await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.4.0');
   });
 
   it('falls through to GitHub latest when the R2 tag has no release assets', async () => {
@@ -1354,9 +1354,9 @@ describe('resolveReleaseTag', () => {
       if (u.endsWith('.sha256')) return new Response(DIGEST);
       if (u.endsWith('.tar.gz')) return new Response('archive-bytes');
       if (u.includes('dl.portato.si')) return new Response('mlx-agent-v9.9.9');
-      return githubLatest('mlx-agent-v0.3.0');
+      return githubLatest('mlx-agent-v0.4.0');
     });
-    await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.3.0');
+    await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.4.0');
   });
 
   it('falls through to GitHub when the R2 tag checksum is empty or malformed', async () => {
@@ -1369,9 +1369,9 @@ describe('resolveReleaseTag', () => {
         if (u.endsWith('.sha256')) return new Response(DIGEST);
         if (u.endsWith('.tar.gz')) return new Response('archive-bytes');
         if (u.includes('dl.portato.si')) return new Response('mlx-agent-v9.9.9');
-        return githubLatest('mlx-agent-v0.3.0');
+        return githubLatest('mlx-agent-v0.4.0');
       });
-      await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.3.0');
+      await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.4.0');
     }
   });
 
@@ -1383,9 +1383,9 @@ describe('resolveReleaseTag', () => {
       if (u.includes('mlx-agent-v9.9.9') && u.endsWith('.tar.gz')) return new Response('nope', { status: 404 });
       if (u.endsWith('.tar.gz')) return new Response('archive-bytes');
       if (u.includes('dl.portato.si')) return new Response('mlx-agent-v9.9.9');
-      return githubLatest('mlx-agent-v0.3.0');
+      return githubLatest('mlx-agent-v0.4.0');
     });
-    await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.3.0');
+    await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.4.0');
   });
 
   it('falls back to the minimum when no discovered tag is installable', async () => {
@@ -1394,8 +1394,8 @@ describe('resolveReleaseTag', () => {
       // Neither mirror can produce a checksum for the tags they name.
       if (u.endsWith('.sha256')) return new Response('nope', { status: 404 });
       if (u.endsWith('.tar.gz')) return new Response('archive-bytes');
-      if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.3.0');
-      return githubLatest('mlx-agent-v0.3.0');
+      if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.4.0');
+      return githubLatest('mlx-agent-v0.4.0');
     });
     await expect(resolveReleaseTag()).resolves.toBe(MLX_AGENT_MIN_RELEASE);
   });
@@ -1406,9 +1406,9 @@ describe('resolveReleaseTag', () => {
       if (u.endsWith('.sha256')) return new Response(DIGEST);
       if (u.endsWith('.tar.gz')) return new Response('archive-bytes');
       if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.1.0');
-      return githubLatest('mlx-agent-v0.3.0');
+      return githubLatest('mlx-agent-v0.4.0');
     });
-    await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.3.0');
+    await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.4.0');
   });
 
   it('falls through to GitHub when the R2 latest pointer streams past the byte cap', async () => {
@@ -1416,7 +1416,7 @@ describe('resolveReleaseTag', () => {
       const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
       if (u.endsWith('.sha256')) return new Response(DIGEST);
       if (u.endsWith('.tar.gz')) return new Response('archive-bytes');
-      if (u.includes('github.com')) return githubLatest('mlx-agent-v0.3.0');
+      if (u.includes('github.com')) return githubLatest('mlx-agent-v0.4.0');
       // A hostile R2 streams an unbounded body before the tag can be read;
       // the cap rejects it instead of buffering it all.
       return new Response(
@@ -1428,7 +1428,7 @@ describe('resolveReleaseTag', () => {
         }),
       );
     });
-    expect(await resolveReleaseTag()).toBe('mlx-agent-v0.3.0');
+    expect(await resolveReleaseTag()).toBe('mlx-agent-v0.4.0');
   });
 
   it('prefers the newer GitHub latest over a lagging but installable R2 pointer', async () => {
@@ -1436,12 +1436,12 @@ describe('resolveReleaseTag', () => {
       const u = url instanceof URL ? url.href : typeof url === 'string' ? url : url.url;
       if (u.endsWith('.sha256')) return new Response(DIGEST);
       if (u.endsWith('.tar.gz')) return new Response('archive-bytes');
-      // Mirror order is not version order: R2 still names the older v0.2.0
-      // while GitHub's latest is v0.3.0 — the newest verified tag must win.
-      if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.2.0');
-      return githubLatest('mlx-agent-v0.3.0');
+      // Mirror order is not version order: R2 still names the older v0.3.0
+      // while GitHub's latest is v0.4.0 — the newest verified tag must win.
+      if (u.includes('dl.portato.si')) return new Response('mlx-agent-v0.3.0');
+      return githubLatest('mlx-agent-v0.4.0');
     });
-    await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.3.0');
+    await expect(resolveReleaseTag()).resolves.toBe('mlx-agent-v0.4.0');
   });
 
   it('falls back to the minimum when every discovered tag is below it', async () => {
@@ -1518,17 +1518,17 @@ describe('agentUpdateStatus', () => {
   it('requests the pinned tag when a different release is cached', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'agent-pin-'));
     const saved = process.env[MLX_AGENT_TAG_ENV];
-    process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.2.0';
+    process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.3.0';
     try {
       const managed = join(dir, 'mlx-agent');
-      // Cache holds the newer v0.3.0, but the pin wants exactly v0.2.0 —
+      // Cache holds the newer v0.4.0, but the pin wants exactly v0.3.0 —
       // an exact pin makes that an update (downgrade included).
       const s = await agentUpdateStatus({
-        probe: status({ managedTag: 'mlx-agent-v0.3.0', effectiveTag: 'mlx-agent-v0.3.0' }),
-        resolveTag: async () => 'mlx-agent-v0.2.0',
+        probe: status({ managedTag: 'mlx-agent-v0.4.0', effectiveTag: 'mlx-agent-v0.4.0' }),
+        resolveTag: async () => 'mlx-agent-v0.3.0',
         managedPath: managed,
       });
-      expect(s.latest).toBe('mlx-agent-v0.2.0');
+      expect(s.latest).toBe('mlx-agent-v0.3.0');
       expect(s.updateAvailable).toBe(true);
     } finally {
       if (saved === undefined) delete process.env[MLX_AGENT_TAG_ENV];
@@ -1540,14 +1540,14 @@ describe('agentUpdateStatus', () => {
   it('is satisfied when the pinned release is already cached', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'agent-pin-'));
     const saved = process.env[MLX_AGENT_TAG_ENV];
-    process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.2.0';
+    process.env[MLX_AGENT_TAG_ENV] = 'mlx-agent-v0.3.0';
     try {
       const managed = join(dir, 'mlx-agent');
       const exe = process.platform === 'win32' ? '.exe' : '';
-      writeFileSync(join(dir, `mlx-agent-v0.2.0${exe}`), 'v020');
+      writeFileSync(join(dir, `mlx-agent-v0.3.0${exe}`), 'v030');
       const s = await agentUpdateStatus({
-        probe: status({ managedTag: 'mlx-agent-v0.3.0', effectiveTag: 'mlx-agent-v0.2.0' }),
-        resolveTag: async () => 'mlx-agent-v0.2.0',
+        probe: status({ managedTag: 'mlx-agent-v0.4.0', effectiveTag: 'mlx-agent-v0.3.0' }),
+        resolveTag: async () => 'mlx-agent-v0.3.0',
         managedPath: managed,
       });
       expect(s.updateAvailable).toBe(false);

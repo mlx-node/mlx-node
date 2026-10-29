@@ -3,7 +3,7 @@
  */
 
 /**
- * Shape guards for the LOADING tree of the Models list page.
+ * Shape guards for the LOADING tree of the Models and Sessions list pages.
  *
  * The page used to answer `loading` with a bare stack of grey bars and then
  * swap in a `<Table>` that carries a `<TableHeader>` the bars never reserved:
@@ -26,9 +26,18 @@
  * environment stays `node`.
  */
 
-import type { CatalogResponse, DownloadsResponse, LocalModel, ModelsResponse } from '@/lib/types';
+import type {
+  CatalogResponse,
+  DownloadsResponse,
+  LocalModel,
+  ModelsResponse,
+  SessionListResponse,
+  SessionRow,
+} from '@/lib/types';
 import Models from '@/pages/models';
+import Sessions from '@/pages/sessions';
 import { act, createElement, type ReactElement } from 'react';
+import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
 import { renderPage, type RenderedPage, stubApi } from './render.js';
@@ -238,5 +247,73 @@ describe('Models page — the loading tree holds the loaded page’s box', () =>
     expect(loading.skeletons).toBeGreaterThan(0);
     expect(loaded.catalogCards).toBe(3);
     expect(loading.catalogCards).toBe(loaded.catalogCards);
+  });
+});
+
+function sessionRow(overrides: Partial<SessionRow>): SessionRow {
+  return {
+    id: '019a0000-0000-7000-8000-000000000001',
+    title: 'Refactor the planner',
+    cwd: '/work/mlx-node',
+    model: 'qwen3.8-27b',
+    branch: 'main',
+    createdAt: '2026-10-20T09:30:00.000Z',
+    lastActiveAt: '2026-10-20T11:00:00.000Z',
+    messageCount: 42,
+    live: false,
+    kind: null,
+    parentId: null,
+    subagentCount: 0,
+    tokens: { input: 1_000, output: 2_000, cached: 0 },
+    ...overrides,
+  };
+}
+
+function sessionsRoutes(): Record<string, unknown> {
+  const sessions: SessionListResponse = {
+    sessions: [
+      sessionRow({}),
+      sessionRow({ id: '019a0000-0000-7000-8000-000000000002', title: 'Bump MLX', live: true, tokens: null }),
+    ],
+    total: 2,
+    cwds: ['/work/mlx-node'],
+  };
+  return { '/sessions': sessions };
+}
+
+describe('Sessions page — the loading tree holds the loaded page’s box', () => {
+  function page(): ReactElement {
+    return createElement(MemoryRouter, null, createElement(Sessions));
+  }
+
+  it('renders the same column headers while loading as it does when loaded', async () => {
+    const { loading, loaded } = await shapesAcrossLoad(page(), sessionsRoutes(), (text) =>
+      text.includes('Refactor the planner'),
+    );
+    expect(loading.skeletons).toBeGreaterThan(0);
+    expect(loaded.heads).toEqual(['Session', 'Directory', 'Model', 'Branch', 'Last active', 'Messages', 'Tokens', '']);
+    expect(loading.heads).toEqual(loaded.heads);
+  });
+
+  it('gives every placeholder row the cells a real row has', async () => {
+    // `table-fixed` with percentage widths: the header solves the grid, and a
+    // short placeholder row would be laid out differently from a real one.
+    const { loading, loaded } = await shapesAcrossLoad(page(), sessionsRoutes(), (text) =>
+      text.includes('Refactor the planner'),
+    );
+    expect(loading.skeletons).toBeGreaterThan(0);
+    expect(new Set(loaded.rowWidths)).toEqual(new Set([8]));
+    expect(new Set(loading.rowWidths)).toEqual(new Set(loaded.rowWidths));
+  });
+
+  it('gives each placeholder cell its loaded cell’s classes', async () => {
+    const cellClasses = (container: HTMLElement): string[] =>
+      [...(container.querySelector('tbody tr')?.querySelectorAll('td') ?? [])].map((td) => td.className);
+    restoreApi = stubApi(sessionsRoutes());
+    mounted = await renderPage(page(), () => true);
+    const loading = cellClasses(mounted.container);
+    expect(mounted.container.querySelectorAll('[data-slot="skeleton"]').length).toBeGreaterThan(0);
+    await walkToLoaded(mounted, (text) => text.includes('Refactor the planner'));
+    expect(loading).toEqual(cellClasses(mounted.container));
   });
 });

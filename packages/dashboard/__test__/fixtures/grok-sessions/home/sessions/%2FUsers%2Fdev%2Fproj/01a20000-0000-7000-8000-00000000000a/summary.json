@@ -1,0 +1,29 @@
+{
+  "info": {
+    "id": "01a20000-0000-7000-8000-00000000000a",
+    "cwd": "/Users/dev/proj"
+  },
+  "agent_id": "ag1.0000",
+  "attempt_id": "at1.0000",
+  "session_summary": "Research the project",
+  "created_at": "2026-10-10T14:41:17.006303Z",
+  "updated_at": "2026-10-11T05:01:39.955782Z",
+  "num_messages": 12,
+  "num_chat_messages": 6,
+  "current_model_id": "Qwen3.8-27B-UD-Q4_K_M",
+  "next_trace_turn": 1,
+  "chat_format_version": 1,
+  "grok_home": "/Users/dev/.mlx-agent",
+  "generated_title": "Research the project layout",
+  "last_active_at": "2026-10-20T10:00:00.000001Z",
+  "git_root_dir": "/Users/dev/proj/",
+  "git_remotes": [
+    "git@example.com:dev/proj.git"
+  ],
+  "head_commit": "e5282a8dccf1636e62b5df12e79a7b18f63d5af1",
+  "head_branch": "main",
+  "agent_name": "grok-build-plan",
+  "sandbox_profile": "off",
+  "last_turn_summary": "Planned the work",
+  "last_turn_summary_prompt_id": "5e4f8f96"
+}

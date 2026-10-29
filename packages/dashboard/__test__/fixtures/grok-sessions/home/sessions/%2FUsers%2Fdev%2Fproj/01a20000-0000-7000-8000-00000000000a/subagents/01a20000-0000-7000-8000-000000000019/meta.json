@@ -1,0 +1,14 @@
+{
+  "subagent_id": "01a20000-0000-7000-8000-000000000019",
+  "attempt_id": "at1.x",
+  "parent_session_id": "01a20000-0000-7000-8000-00000000000a",
+  "child_session_id": "01a20000-0000-7000-8000-000000000019",
+  "subagent_type": "general-purpose",
+  "description": "Deleted child",
+  "prompt": "You are researching the project.",
+  "status": "failed",
+  "started_at": "2026-10-10T14:49:25.000003Z",
+  "effective_context_source": "new",
+  "child_cwd": "/Users/dev/proj",
+  "effective_model_id": "Qwen3.8-27B-UD-Q4_K_M"
+}

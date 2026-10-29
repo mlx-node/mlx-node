@@ -24,6 +24,7 @@ export interface DbWorkerBootstrap {
   modelsDir: string;
   tracesDir: string;
   cacheRoot: string | undefined;
+  agentHome: string;
 }
 
 /**

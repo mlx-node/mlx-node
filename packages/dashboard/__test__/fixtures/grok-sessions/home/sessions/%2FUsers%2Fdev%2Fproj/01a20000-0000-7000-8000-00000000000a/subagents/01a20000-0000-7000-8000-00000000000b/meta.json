@@ -1,0 +1,19 @@
+{
+  "subagent_id": "01a20000-0000-7000-8000-00000000000b",
+  "attempt_id": "at1.x",
+  "parent_session_id": "01a20000-0000-7000-8000-00000000000a",
+  "child_session_id": "01a20000-0000-7000-8000-00000000000b",
+  "subagent_type": "general-purpose",
+  "description": "Trace the decode loop",
+  "prompt": "You are researching the project.",
+  "status": "completed",
+  "started_at": "2026-10-10T14:49:25.000001Z",
+  "effective_context_source": "new",
+  "child_cwd": "/Users/dev/proj",
+  "effective_model_id": "Qwen3.8-27B-UD-Q4_K_M",
+  "completed_at": "2026-10-10T14:49:30Z",
+  "duration_ms": 5000,
+  "tool_calls": 3,
+  "turns": 1,
+  "error": null
+}

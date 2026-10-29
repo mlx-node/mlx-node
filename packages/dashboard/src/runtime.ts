@@ -17,8 +17,10 @@
  */
 
 import { existsSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { agentConfigDir } from '@mlx-node/agent/paths';
 
 import type { IngestSummary, MainApiContext } from './api/context.js';
 import { dispatchMain, isApiPath, routeThreadFor } from './api/dispatch.js';
@@ -44,6 +46,8 @@ export interface DashboardRuntimeOptions {
   modelsDir?: string;
   tracesDir?: string;
   cacheRoot?: string;
+  /** grok-build (`mlx agent`) config home for the Sessions API. Default `agentConfigDir()`. */
+  agentHome?: string;
   /**
    * Override the database worker's entry module. Packaging needs this: under
    * Electron the worker must load from an unpacked path outside the asar archive.
@@ -74,6 +78,7 @@ export interface DashboardRuntime {
   readonly modelsDir: string;
   readonly tracesDir: string;
   readonly cacheRoot: string | undefined;
+  readonly agentHome: string;
   /**
    * What THIS thread owns, for a transport that dispatches its own main-thread
    * routes. The database is deliberately absent — it lives on the worker and is
@@ -121,6 +126,9 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
   const modelsDir = opts.modelsDir ?? defaultModelsDir();
   const tracesDir = opts.tracesDir ?? metricsTraceDir();
   const cacheRoot = opts.cacheRoot;
+  // Absolute: the resume command `cd`s into the session cwd before setting
+  // GROK_HOME, and grok uses it verbatim, so a relative home would point elsewhere.
+  const agentHome = resolve(opts.agentHome ?? agentConfigDir());
 
   // Kept on this thread: one `mkdir` at construction is not the blocking problem,
   // and an unwritable location stays a synchronous, actionable throw from the
@@ -140,6 +148,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     modelsDir,
     tracesDir,
     cacheRoot,
+    agentHome,
   });
   const downloads = new DownloadManager({ modelsDir });
 
@@ -188,6 +197,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     modelsDir,
     tracesDir,
     cacheRoot,
+    agentHome,
     context,
     async call(c: ApiCall, signal?: AbortSignal): Promise<ApiResponse> {
       if (signal?.aborted) {

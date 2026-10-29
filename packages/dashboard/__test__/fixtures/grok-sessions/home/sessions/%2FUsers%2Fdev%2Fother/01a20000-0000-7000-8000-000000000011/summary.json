@@ -1,0 +1,20 @@
+{
+  "info": {
+    "id": "01a20000-0000-7000-8000-000000000011",
+    "cwd": "/Users/dev/other"
+  },
+  "agent_id": "ag1.0000",
+  "attempt_id": "at1.0000",
+  "session_summary": "Dormant title",
+  "created_at": "2026-10-10T14:41:17.006303Z",
+  "updated_at": "2026-10-11T05:01:39.955782Z",
+  "num_messages": 12,
+  "num_chat_messages": 6,
+  "current_model_id": "Qwen3.8-27B-UD-Q4_K_M",
+  "next_trace_turn": 1,
+  "chat_format_version": 1,
+  "grok_home": "/Users/dev/.mlx-agent",
+  "generated_title": "Renamed session",
+  "title_is_manual": true,
+  "last_active_at": "2026-10-20T10:00:00.000002Z"
+}

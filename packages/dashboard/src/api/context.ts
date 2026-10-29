@@ -14,6 +14,7 @@
  * pins it to a thread — `routes.ts` cannot put it on the other one.
  */
 
+import type { AgentSessionsReader } from '../agent-sessions/reader.js';
 import type { CodingAgentsService } from '../coding-agents.js';
 import type { DashboardDb } from '../db/open.js';
 import type { DownloadManager } from '../download.js';
@@ -36,6 +37,10 @@ export interface WorkerApiContext extends ApiPaths {
   dash: DashboardDb;
   /** Serialized incremental rescan (traces). */
   runIngest: () => Promise<IngestSummary>;
+  /** grok-build (`mlx agent`) config home; sessions live under `<agentHome>/sessions`. */
+  agentHome: string;
+  /** Long-lived so its parse caches survive between calls. */
+  agentSessions: AgentSessionsReader;
 }
 
 /** The transport thread's context: it alone holds the download manager. */
