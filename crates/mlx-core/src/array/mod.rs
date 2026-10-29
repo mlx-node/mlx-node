@@ -37,7 +37,7 @@ pub use memory::{
     get_cache_memory, get_peak_memory, heavy_cleanup, maybe_clear_cache_for_paged_step,
     maybe_eval_clear_for_paged_prefill_layer, paged_decode_cache_clear_interval,
     paged_prefill_chunk_size, paged_prefill_eval_interval, reset_peak_memory, set_cache_limit,
-    set_memory_limit, synchronize, synchronize_and_clear_cache,
+    set_memory_limit, set_thread_tf32, synchronize, synchronize_and_clear_cache,
 };
 
 use mlx_sys as sys;

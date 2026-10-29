@@ -77,6 +77,102 @@ export declare class ClefModel {
 }
 
 /**
+ * DeepSeek-V4.1 Flash (GGUF `deepseek41`) with SSD-streamed routed experts:
+ * text-only chat, one session at a time, on one owned model thread.
+ */
+export declare class DeepseekV41Model {
+  /**
+   * `model_path`: any shard of the split GGUF, its directory, or a
+   * single-file GGUF.
+   */
+  static load(modelPath: string): Promise<DeepseekV41Model>;
+  contextLimits(): DeepseekV41ContextLimits;
+  maxConcurrentSequences(): number;
+  hasBlockPagedCache(): boolean;
+  /** Prompt and generated ids of the last completed turn, if any. */
+  lastTurnTokenIds(): DeepseekV41TurnTokenIds | null;
+  residencyInfo(): DeepseekV41ResidencyInfo;
+  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
+  schedulerStats(): Promise<SchedulerStats>;
+  /**
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
+   */
+  resetCaches(): Promise<void>;
+  /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
+  /**
+   * Start a new chat session.
+   *
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
+   */
+  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
+   * can cancel the queued/running turn; the reply arrives via
+   * `call.result()`. A cancelled turn rejects `result()` with
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
+   */
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
+   */
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
+   */
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinueTool(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /** Streaming variant of `chatSessionStart`. */
+  chatStreamSessionStart(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinue`. */
+  chatStreamSessionContinue(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinueTool`. */
+  chatStreamSessionContinueTool(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+}
+
+/**
  * PP-DocLayoutV3 full model for document layout analysis.
  *
  * Combines HGNetV2 backbone, hybrid encoder, and RT-DETR decoder
@@ -3453,6 +3549,45 @@ export declare function createRandomQwen3Checkpoint(config: Qwen3Config, savePat
 export interface DecodeBatchOccupancyBucket {
   occupancy: number;
   steps: number;
+}
+
+export interface DeepseekV41ContextLimits {
+  /** min(GGUF context, 16384): the v1 limit the admission budgets for. */
+  effectiveWindowTokens: number;
+  trainedWindowTokens: number;
+}
+
+/** The load-time and latest per-turn admission, and the expert bank. */
+export interface DeepseekV41ResidencyInfo {
+  denseBytes: number;
+  physicalBytes?: number;
+  /** Other processes' (and other models') bytes at the last admission. */
+  othersBytes?: number;
+  /**
+   * Fixed working set: dense, staging, KV and compute at the context
+   * limit, I/O buffers, driver and MLX pool reserves.
+   */
+  fixedBytes?: number;
+  expertCacheSlots?: number;
+  expertCacheBytes?: number;
+  stagingLayers?: number;
+  /** Bounded wired-limit request of each turn (`fixed + cache`). */
+  wiredLimitBytes?: number;
+  /**
+   * Bank pages still resident after the last turn made the bank volatile;
+   * non-zero while another live wired lease keeps them wired.
+   */
+  bankResidentAfterTurnBytes: number;
+  bankSwitches: number;
+  inTurn: boolean;
+}
+
+/** The last saved turn of the session (prompt and output ids). */
+export interface DeepseekV41TurnTokenIds {
+  /** The rendered prompt the turn was given (whole conversation). */
+  promptIds: Array<number>;
+  /** The generated ids, the stop token included when one ended the turn. */
+  outputIds: Array<number>;
 }
 
 /** Document element - either a table or paragraph */

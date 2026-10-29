@@ -37,6 +37,10 @@ export { Qwen4ExpModel } from './stream.js';
 export type { Qwen4ExpContextLimits, Qwen4ExpLoadOptions, Qwen4ExpResidencyInfo } from '@mlx-node/core';
 export type { Qwen35MoeConfig } from '@mlx-node/core';
 
+// DeepSeek-V4.1 Flash (GGUF, SSD-streamed experts)
+export { DeepseekV41Model } from './stream.js';
+export type { DeepseekV41ContextLimits, DeepseekV41ResidencyInfo, DeepseekV41TurnTokenIds } from '@mlx-node/core';
+
 // Nemotron H models
 //
 // The config/limits types ship alongside the class for the same reason

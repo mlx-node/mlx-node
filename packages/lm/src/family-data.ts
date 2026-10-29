@@ -176,6 +176,15 @@ export const K2_SAMPLING_DEFAULTS: ChatConfig = {
   repetitionPenalty: 1.0,
 };
 
+/** DeepSeek-V4.1 model card: temperature 1.0, top_p 1.0. */
+export const DEEPSEEK_V41_SAMPLING_DEFAULTS: ChatConfig = {
+  temperature: 1.0,
+  topP: 1.0,
+  minP: 0.0,
+  presencePenalty: 0.0,
+  repetitionPenalty: 1.0,
+};
+
 /**
  * Sampling defaults + per-model output cap. A per-request client value still
  * wins: `ChatSession.mergeConfig` treats per-call config as an overlay on top
@@ -453,6 +462,22 @@ export const MODEL_FAMILY_DATA = [
     ggufDiscovery: { variants: 'all', split: true },
     traits: { reasoning: true, fallbackContextWindow: 262144 },
     launchPreset: { sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding, maxOutputTokens: 8192 },
+  },
+  {
+    id: 'deepseek_v41',
+    kind: 'loadable',
+    match: { rawModelTypes: ['deepseek_v41'] },
+    /**
+     * The template and tokenizer live inside the GGUF (no `tokenizer.json`
+     * beside it), so no path-backed `applyChatTemplate`; the native side
+     * enforces the context limit.
+     */
+    streamOpts: { recordModelPath: false },
+    ggufArchitectures: ['deepseek41'],
+    ggufDiscovery: { variants: 'all', split: true },
+    /** v1 context limit (min(GGUF context, 16384)). */
+    traits: { reasoning: true, fallbackContextWindow: 16384 },
+    launchPreset: { sampling: DEEPSEEK_V41_SAMPLING_DEFAULTS, maxOutputTokens: 8192 },
   },
   {
     id: 'lfm2',

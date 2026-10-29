@@ -1,6 +1,6 @@
 # MLX-Node: High-Performance ML Framework for Node.js
 
-MLX-Node brings Apple's MLX library to Node.js with Metal GPU acceleration (plus experimental NVIDIA CUDA inference) through a Rust/NAPI/C++ bridge. It supports inference (Qwen3, Qwen3.5, Gemma4, LFM2.5, Nemotron 3.5 Lightning), training (GRPO, SFT), vision-language models, document processing (PaddleOCR-VL, PP-\* pipelines), and embeddings (Harrier).
+MLX-Node brings Apple's MLX library to Node.js with Metal GPU acceleration (plus experimental NVIDIA CUDA inference) through a Rust/NAPI/C++ bridge. It supports inference (Qwen3, Qwen3.5, Gemma4, LFM2.5, Nemotron 3.5 Lightning, DeepSeek V4.1 Flash with SSD expert streaming), training (GRPO, SFT), vision-language models, document processing (PaddleOCR-VL, PP-\* pipelines), and embeddings (Harrier).
 
 ## References
 
@@ -22,7 +22,7 @@ There are already some wild used inference implementations for your reference:
 - [docs/vllm-speculative-alignment.md](docs/vllm-speculative-alignment.md) — Speculative × paged KV vs vLLM: adopted laws, permanent divergences (with reopen triggers), and the remaining alignment ladder
 - [docs/paged-cache.md](docs/paged-cache.md) — Block-paged KV cache support matrix and parity gates
 - [docs/ffi-cpp.md](docs/ffi-cpp.md) — C++ FFI bridge, compiled Qwen3.5 forward paths, Metal shaders
-- [docs/mlx-fork.md](docs/mlx-fork.md) — The MLX submodule: the 10 direct patches on `fn-d1` and why each stays, what moved into mlx-node, how to bump the pin (golden gates)
+- [docs/mlx-fork.md](docs/mlx-fork.md) — The MLX submodule: the 12 fork patches and why each stays, what moved into mlx-node, how to bump the pin (golden gates)
 - [docs/perf.md](docs/perf.md) — Profiling, env-var inventory, GPU arch detection, quantization
 - [docs/cli.md](docs/cli.md) — `mlx download`, `mlx convert`, `mlx launch claude`
 - [docs/convert-quantize.md](docs/convert-quantize.md) — Convert/quantize internals: on-disk formats, recipe decision engine, GGUF import, provenance, gotchas
@@ -60,7 +60,7 @@ oxnode <file.ts>                                 # run a TS file (NOT tsx)
 
 - Primary platform: macOS / Apple Silicon (Metal) — full inference + training + VLM
 - Experimental: Linux aarch64 (glibc) + NVIDIA CUDA — **inference-only preview**. Qwen3.6 dense/MoE validated on GB10 / DGX Spark (`sm_121`, CUDA 13.0) via device-agnostic eager fallbacks (no custom CUDA kernels; paged-attn forced off; perf below Apple Silicon). Training, other model families, and x86_64 Linux are untested. See README "Platform Support" + `docs/cuda-poc-benchmark.md`.
-- Concurrent chat inference is per-family, not global. Sessions on one eligible **paged** Qwen3, LFM2, Qwen3.5 dense/MoE, Gemma4, Muse-Glimmer, or Nemotron 3.5 Lightning (`nemotron_h`) model overlap in a continuous-batching scheduler on that model's single `"mlx-model"` OS thread. Qwen3.5 dense and MoE need `MLX_CONTINUOUS_BATCHING=1`; the rest are on by default, and `MLX_SERVE_FORCE_SERIAL=1` rolls any of them back to whole-turn for A/B. `nemotron_h` shares the scheduler but **not** the fused decode: any quantized checkpoint (the only published one included) sets `row_exact_decode_projections`, so its decode step is N serial single-row forwards, bit-identical to serial but paying N weight streams. Everything else still runs one whole turn at a time in the exclusive/barrier lane: flat-cache models, Gemma4 media and MTP/DSpark owners, nemotron_h MTP turns, training, save, and reset. One `ChatSession` always allows only one turn in flight. Different loaded models run in parallel, one model thread each (MLX state is thread-local; residual coupling is the process-wide Metal allocator pool and wired limit). See `docs/concurrent-inference.md`.
+- Concurrent chat inference is per-family, not global. Sessions on one eligible **paged** Qwen3, LFM2, Qwen3.5 dense/MoE, Gemma4, Muse-Glimmer, or Nemotron 3.5 Lightning (`nemotron_h`) model overlap in a continuous-batching scheduler on that model's single `"mlx-model"` OS thread. Qwen3.5 dense and MoE need `MLX_CONTINUOUS_BATCHING=1`; the rest are on by default, and `MLX_SERVE_FORCE_SERIAL=1` rolls any of them back to whole-turn for A/B. `nemotron_h` shares the scheduler but **not** the fused decode: any quantized checkpoint (the only published one included) sets `row_exact_decode_projections`, so its decode step is N serial single-row forwards, bit-identical to serial but paying N weight streams. Everything else still runs one whole turn at a time in the exclusive/barrier lane: flat-cache models (incl. DeepSeek V4.1 Flash, one sequence), Gemma4 media and MTP/DSpark owners, nemotron_h MTP turns, training, save, and reset. One `ChatSession` always allows only one turn in flight. Different loaded models run in parallel, one model thread each (MLX state is thread-local; residual coupling is the process-wide Metal allocator pool and wired limit). See `docs/concurrent-inference.md`.
 
 ---
 

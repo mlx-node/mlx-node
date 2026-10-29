@@ -175,6 +175,14 @@ fn dense_dtype(t: GgufTensorType) -> Option<DType> {
 
 fn route_for(t: &GgufTensorInfo, plan: &ImportPlan, gpu: bool) -> Result<Route> {
     let ty = t.tensor_type;
+    if ty == GgufTensorType::MXFP8 {
+        // Refused at planning: Route::Whole would allocate the whole payload
+        // (202 GB for the one real MXFP8 table) before load_gguf_tensor sees it.
+        return Err(Error::from_reason(format!(
+            "MXFP8 tensor '{}' is gather-only and cannot be imported",
+            t.name
+        )));
+    }
     if let Some((name, rows)) = &plan.ple_shard
         && *name == t.name
     {
@@ -1840,6 +1848,21 @@ mod tests {
             strict_asset_copies: false,
             muse_secondary: false,
             ple_shard: None,
+        }
+    }
+
+    #[test]
+    fn mxfp8_refused_at_route_planning() {
+        let t = GgufTensorInfo {
+            name: "per_layer_token_embd.weight".into(),
+            n_dims: 2,
+            dims: vec![256, 768_022_850],
+            tensor_type: MXFP8,
+            offset: 0,
+        };
+        for gpu in [false, true] {
+            let err = route_for(&t, &plan(&[]), gpu).err().unwrap();
+            assert!(err.reason.contains("gather-only"), "{err}");
         }
     }
 

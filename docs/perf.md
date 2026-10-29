@@ -71,20 +71,20 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 
 ### Compile / decode control
 
-| Var                                      | Effect                                                                                                                                                                                                                                                                                                                                                                 |
-| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ~~`MLX_NO_COMPILE=1`~~                   | **REMOVED (dead).** The Qwen3.5 compiled C++ forward path this var gated was deleted in the chat-engine refactor (`ee88b92b`). The former switch is unrelated to the current eligible DFlash compiled verifier. Nothing reads this var today.                                                                                                                          |
-| ~~`MLX_EVAL_ALL_CACHES=1`~~              | **REMOVED (dead).** Token-only eval is the only strategy; nothing reads this var today.                                                                                                                                                                                                                                                                                |
-| `MLX_WEIGHT_MATERIALIZE_CHUNK_MB`        | Weight-loading chunk size                                                                                                                                                                                                                                                                                                                                              |
-| `MLX_GDN_KERNEL=perstep\|chunked_ops`    | Controls the retained device-agnostic/CUDA recurrence path: eligible long, unmasked non-Metal prefill uses chunked ops by default; `perstep` selects the serial ops reference. Decode and masked calls retain per-step behavior. Metal always uses its per-step kernel; the native Metal chunked experiment and its `chunked` selector were removed.                   |
-| `MLX_LFM2_PAGED_PREFILL_PAGED_ATTENTION` | Opt-in (default off): multi-turn LFM2 cache-hit prefill tries the graph-native paged-attention bridge (gather_kv_for_prefill_chunk) before read_kv_range, skipping the forced per-layer pool sync. Held opt-in pending a stable-checkpoint paged-vs-flat gate (fused-vs-masked-SDPA ~1-ULP divergence)                                                                 |
-| `MLX_LFM2_FUSED_BATCH_DECODE`            | Opt-in (default off): LFM2 multi-row decode waves run one fused `[N,1]` forward instead of the default row-exact wave (per-row N=1 forwards, bit-identical to serial). Fused M=N GEMM tiles round differently than M=1 and the carried ShortConv state amplifies the ULP diff into occasional greedy near-tie flips                                                    |
-| `MLX_BONSAI_HOIST_METADATA=1`            | Experimental, default off: materialize rotated PQ2 projection scales/biases in FP32 once at load. Rotated projections promote their transformed inputs to FP32 (the 16-bit residual stream a normal Prism load produces), so outputs propagate FP32; adds about 0.8 GB for Bonsai 2 27B. No stable speedup is claimed.                                                 |
-| `MLX_BONSAI_SHARE_HADAMARD=1`            | Experimental, default off: reuse identical signed Hadamard transforms within one paged Qwen3.5 decode step. Cache entries retain input/sign owners and are cleared on return or error; flat inference and prefill do not retain entries.                                                                                                                               |
-| `MLX_QMM_SPLITK_MIN_M`                   | Diagnostic override for the quantized-matmul vector/GEMM boundary: M ≥ this many rows takes `qmm`/split-k instead of `qmv`/`qmv_wide`. Read by MLX's affine/fp path (fork patch, [mlx-fork.md](mlx-fork.md)) and by the K-quant and mixed-affine dispatchers. A/B tuning only; the golden gates refuse it.                                                             |
-| `MLX_KQUANT_SMALL_M_BENCH=1`             | Body-level opt-in for the `#[ignore]`d `kquant_small_m_bench` integration test: exact-shape K/IQ small-M quantized-matmul timings (MLP + lm_head shapes, M sweep). Run `MLX_KQUANT_SMALL_M_BENCH=1 cargo test -p mlx-core --test kquant_small_m_bench -- --ignored --test-threads=1 --nocapture` (serial — the two benches share the GPU).                             |
-| `MLX_METAL_COMMAND_TRACE=1\|2\|3`        | Diagnostic (fork patch); any value ≥ 1 enables it. 1: `[metal-command]` per command buffer (with `dispatches`, `primitives`), `[mlx-evaluation]` per eval, `[mlx-compiled]` per compiled call. 2: plus `[metal-op] <primitive>` per primitive. 3: plus dtypes. Perturbs timing. See [trace interpretation](research/splash-qwen38.md#command-trace).                   |
-| `MLX_ENABLE_TF32=0`                      | Upstream MLX (`mlx/utils.h:226`, default on): run f32 matmul/SDPA in true f32 instead of TF32. The Qwen3.8 Flash Next runtime reads it too (`qwen4_exp/mod.rs` `tf32_enabled`): with `0` its tentative device expert prefill (`device_routes.rs`) and paired shared-expert NAX projection (`residency.rs`) are skipped, since those kernels refuse a TF32-off process. |
+| Var                                      | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| ~~`MLX_NO_COMPILE=1`~~                   | **REMOVED (dead).** The Qwen3.5 compiled C++ forward path this var gated was deleted in the chat-engine refactor (`ee88b92b`). The former switch is unrelated to the current eligible DFlash compiled verifier. Nothing reads this var today.                                                                                                                                                                                                                            |
+| ~~`MLX_EVAL_ALL_CACHES=1`~~              | **REMOVED (dead).** Token-only eval is the only strategy; nothing reads this var today.                                                                                                                                                                                                                                                                                                                                                                                  |
+| `MLX_WEIGHT_MATERIALIZE_CHUNK_MB`        | Weight-loading chunk size                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `MLX_GDN_KERNEL=perstep\|chunked_ops`    | Controls the retained device-agnostic/CUDA recurrence path: eligible long, unmasked non-Metal prefill uses chunked ops by default; `perstep` selects the serial ops reference. Decode and masked calls retain per-step behavior. Metal always uses its per-step kernel; the native Metal chunked experiment and its `chunked` selector were removed.                                                                                                                     |
+| `MLX_LFM2_PAGED_PREFILL_PAGED_ATTENTION` | Opt-in (default off): multi-turn LFM2 cache-hit prefill tries the graph-native paged-attention bridge (gather_kv_for_prefill_chunk) before read_kv_range, skipping the forced per-layer pool sync. Held opt-in pending a stable-checkpoint paged-vs-flat gate (fused-vs-masked-SDPA ~1-ULP divergence)                                                                                                                                                                   |
+| `MLX_LFM2_FUSED_BATCH_DECODE`            | Opt-in (default off): LFM2 multi-row decode waves run one fused `[N,1]` forward instead of the default row-exact wave (per-row N=1 forwards, bit-identical to serial). Fused M=N GEMM tiles round differently than M=1 and the carried ShortConv state amplifies the ULP diff into occasional greedy near-tie flips                                                                                                                                                      |
+| `MLX_BONSAI_HOIST_METADATA=1`            | Experimental, default off: materialize rotated PQ2 projection scales/biases in FP32 once at load. Rotated projections promote their transformed inputs to FP32 (the 16-bit residual stream a normal Prism load produces), so outputs propagate FP32; adds about 0.8 GB for Bonsai 2 27B. No stable speedup is claimed.                                                                                                                                                   |
+| `MLX_BONSAI_SHARE_HADAMARD=1`            | Experimental, default off: reuse identical signed Hadamard transforms within one paged Qwen3.5 decode step. Cache entries retain input/sign owners and are cleared on return or error; flat inference and prefill do not retain entries.                                                                                                                                                                                                                                 |
+| `MLX_QMM_SPLITK_MIN_M`                   | Diagnostic override for the quantized-matmul vector/GEMM boundary: M ≥ this many rows takes `qmm`/split-k instead of `qmv`/`qmv_wide`. Read by MLX's affine/fp path (fork patch, [mlx-fork.md](mlx-fork.md)) and by the K-quant and mixed-affine dispatchers. A/B tuning only; the golden gates refuse it.                                                                                                                                                               |
+| `MLX_KQUANT_SMALL_M_BENCH=1`             | Body-level opt-in for the `#[ignore]`d `kquant_small_m_bench` integration test: exact-shape K/IQ small-M quantized-matmul timings (MLP + lm_head shapes, M sweep). Run `MLX_KQUANT_SMALL_M_BENCH=1 cargo test -p mlx-core --test kquant_small_m_bench -- --ignored --test-threads=1 --nocapture` (serial — the two benches share the GPU).                                                                                                                               |
+| `MLX_METAL_COMMAND_TRACE=1\|2\|3`        | Diagnostic (fork patch); any value ≥ 1 enables it. 1: `[metal-command]` per command buffer (with `dispatches`, `primitives`), `[mlx-evaluation]` per eval, `[mlx-compiled]` per compiled call. 2: plus `[metal-op] <primitive>` per primitive. 3: plus dtypes. Perturbs timing. See [trace interpretation](research/splash-qwen38.md#command-trace).                                                                                                                     |
+| `MLX_ENABLE_TF32=0`                      | Upstream MLX (`mlx/utils.h:226`, default on): run f32 matmul/SDPA in true f32 instead of TF32. The DeepSeek V4.1 Flash model thread ignores it (always true f32, `set_thread_tf32`, fork patch). The Qwen3.8 Flash Next runtime reads it too (`qwen4_exp/mod.rs` `tf32_enabled`): with `0` its tentative device expert prefill (`device_routes.rs`) and paired shared-expert NAX projection (`residency.rs`) are skipped, since those kernels refuse a TF32-off process. |
 
 Three Metal routes added with the tiled K-quant work are fixed: 2-D K-quant weights
 with N % 64 == 0 and K % 256 == 0 run in the 64-row tiled layout (`@t64` mode
@@ -261,6 +261,61 @@ in memory on every load. Their native cache entries are small asset directories
 | `MLX_GPU_HEADROOM_GB`       | Headroom term in the auto-sizing formula                                                                                                                                                                                        |
 | `MLX_RESIDENCY_SET_MAX_PCT` | Upstream MLX: one residency set's size, as % of the recommended working set (default 5). Splits wired memory across sets, never changes how much is wired; `<= 0` or `>= 100` = one set (`mlx/utils.h:205-218`)                 |
 | `MLX_RESIDENCY_DEBUG=1`     | Upstream MLX: log each residency set as it is created                                                                                                                                                                           |
+
+### DeepSeek V4.1 Flash (SSD streaming)
+
+Read at load. Bad values are refused (the load fails, nothing is clamped); none of them changes output bits. The
+model thread always computes f32 matmuls in true f32, whatever `MLX_ENABLE_TF32` says (see
+[models.md](models.md#deepseek-v41-flash)).
+
+| Var                          | Effect                                                                                                                                          |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MLX_DSV41_EXPERT_CACHE_GB`  | Upper bound for the expert cache in GiB (decimals ok). It only lowers the size the admission picks; `0` = staging only (no cache).              |
+| `MLX_DSV41_ADMIT_RESERVE_GB` | Memory kept free for other apps by the admission (default 12 GiB; only raises).                                                                 |
+| `MLX_DSV41_STATS=<file>`     | Diagnostics: append one JSON stats line per call (TTFT, hit rates, read GB/s, decode t_c / t_io / router wait, peak footprint). Bits unchanged. |
+
+Measured product table (2026-10-28; M5 Max 128 GB, internal SSD;
+`@mlx-node/lm` `ChatSession`, greedy, chat mode, 32 new tokens, all defaults;
+each prompt cold in a fresh process after
+20 min idle; expert cache = the load admission's auto size, here small because
+other apps held ~69 GiB):
+
+| Prompt           | Load s | TTFT s | Prefill tok/s | Decode tok/s | Decode byte hit rate | Cache GiB (slots) | Peak footprint GiB | Read GB (run) |
+| ---------------- | ------ | ------ | ------------- | ------------ | -------------------- | ----------------- | ------------------ | ------------- |
+| 64               | 6.3    | 7.89   | 8.1           | 2.090        | 0.292                | 6.09 (348)        | 23.58              | 360           |
+| turn 2 (+63 ids) | —      | 6.83   | 9.2           | 2.486        | 0.339                | 6.09 (348)        | 23.58              | (same run)    |
+| 1K               | 5.9    | 26.45  | 38.7          | 2.497        | 0.332                | 6.69 (382)        | 25.21              | 308           |
+| 8K               | 5.9    | 87.67  | 93.4          | 2.228        | 0.315                | 6.22 (355)        | 29.73              | 349           |
+
+Decode terms per token: compute 157-219 ms, expert reads 241-258 ms at
+12.6-12.9 GB/s (raw SSD ceiling 12.8-13.1 GB/s), router wait 36-59 ms. MLX
+free-buffer pool <= 1.0 GiB, swap +0 in every run. For scale: before the
+streaming work (no NEON repack, no seeding, no read overlap, no row skip) cold
+TTFT was 69 s at 1K and 213 s at 8K; with a 20-21 GiB cache decode measured
+2.6-3.0 tok/s and 16K TTFT 163.7 s.
+
+Second staging layer (2026-10-29, same driver with 128 new tokens + a 63-id follow-up turn for 1K and 64 tokens for
+8K; one prompt per fresh process, arms interleaved ABBA; other apps held 52-67 GiB and drifted between runs, so each
+row gives the cache that run got; output ids identical in every run). The second layer costs 6.72 GiB of cache. It is
+granted when at least 17 GiB of cache is left after it (or when a capped cache leaves room for it): the smallest
+measured cache where decode lost no more than 5 %.
+
+| Cache left with 2 layers | 1 layer: cache GiB, decode ms/tok | 2 layers: cache GiB, decode ms/tok | Decode change (follow-up turn) |
+| ------------------------ | --------------------------------- | ---------------------------------- | ------------------------------ |
+| 0                        | 6.72; 489, 455                    | 0; 531, 520                        | +11 % (+10 %)                  |
+| 5.48                     | 12.20; 404                        | 5.48; 467, 463                     | +15 % (+24 %)                  |
+| 16.6                     | 22.10; 369                        | 16.60; 381                         | +3 % (+3 %)                    |
+
+| Prompt, cold                  | 1 layer TTFT s                    | 2 layers TTFT s                   | Change                     |
+| ----------------------------- | --------------------------------- | --------------------------------- | -------------------------- |
+| 1K                            | 27.39, 27.46, 28.77, 26.26, 27.16 | 19.28, 19.31, 19.61, 20.46, 18.81 | -27 to -31 % (block means) |
+| 8K                            | 93.49                             | 83.18, 78.77                      | -11 to -16 %               |
+| follow-up turn (63 ids, warm) | 6.49, 6.88, 7.21, 6.97, 6.77      | 7.60, 7.55, 7.79, 7.77, 7.49      | +0.6 to +1.1 s             |
+
+The follow-up turn was slower with 2 layers at every cache size: the read-ahead read 864-923 experts the 63 rows
+never used. Calls of fewer than 256 rows now read nothing ahead (cold, one process, 2-layer bank, no read-ahead vs
+read-ahead: 64 rows 7.39, 7.46 vs 7.69, 7.70 s; 256 rows 14.58, 14.56 vs 13.68, 13.69 s; 1K 26.35 vs 17.73 s). With
+that floor the follow-up measured 7.22 s (2 layers, cache 0; no expert read ahead) and the 1K prompt 18.51 s.
 
 ## MTP speculative decoding
 

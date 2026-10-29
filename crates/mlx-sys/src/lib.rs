@@ -690,6 +690,7 @@ unsafe extern "C-unwind" {
     pub fn mlx_set_memory_limit(limit: u64, out_old_limit: *mut u64) -> i32;
     pub fn mlx_get_memory_limit(out_value: *mut u64) -> i32;
     pub fn mlx_set_cache_limit(limit: u64, out_old_limit: *mut u64) -> i32;
+    pub fn mlx_set_thread_tf32(mode: i32);
     pub fn mlx_array_nbytes(handle: *mut mlx_array) -> usize;
 
     // Total physical system memory in bytes (Apple Silicon: unified memory

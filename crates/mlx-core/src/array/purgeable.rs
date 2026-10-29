@@ -71,6 +71,15 @@ unsafe extern "C" fn release_bank(ctx: *mut c_void) {
     unsafe { Arc::decrement_strong_count(ctx.cast::<BankShared>()) };
 }
 
+/// Whether any array still shares a dropped bank's buffer.
+pub(crate) struct BankWatch(std::sync::Weak<BankShared>);
+
+impl BankWatch {
+    pub(crate) fn alive(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+}
+
 /// One anonymous no-copy Metal allocation and its MLX array.
 ///
 /// Complete GPU reads before making a bank volatile. Before any subsequent CPU
@@ -155,6 +164,42 @@ impl PurgeableBank {
 
     pub(crate) fn nbytes(&self) -> usize {
         self.shared.nbytes
+    }
+
+    /// Bytes of the bank's pages resident in RAM now (`mincore`; every byte
+    /// where `mincore` is not available).
+    pub(crate) fn resident_bytes(&self) -> Result<u64> {
+        #[cfg(target_os = "macos")]
+        {
+            let page = super::page_size();
+            let mut status = vec![0u8; self.shared.nbytes.div_ceil(page)];
+            // SAFETY: the pointer is the page-aligned start of the live bank
+            // and the length its size; mincore writes one byte per page.
+            let rc = unsafe {
+                libc::mincore(
+                    self.data.0.cast::<c_void>(),
+                    self.shared.nbytes,
+                    status.as_mut_ptr().cast(),
+                )
+            };
+            if rc != 0 {
+                return Err(Error::from_reason(format!(
+                    "purgeable bank: mincore failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            let pages = status.iter().filter(|&&v| v & 1 != 0).count();
+            Ok((pages * page).min(self.shared.nbytes) as u64)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(self.shared.nbytes as u64)
+        }
+    }
+
+    /// Outlives the bank: alive until the last array on its buffer dies.
+    pub(crate) fn watch(&self) -> BankWatch {
+        BankWatch(Arc::downgrade(&self.shared))
     }
 
     /// Synchronously change Metal's purgeability and return the previous (or,

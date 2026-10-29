@@ -90,6 +90,9 @@ pub enum GgufTensorType {
     IQ1M = 29,
     BF16 = 30,
     MXFP4 = 39,
+    /// llama.cpp PR #30817 `GGML_TYPE_MXFP8 = 43`: 32 E4M3 codes under one
+    /// E8M0 scale (`block_mxfp8`, 33 bytes). Gather-only: no whole-tensor load.
+    MXFP8 = 43,
     PQ2_0 = 142,
 }
 
@@ -119,6 +122,7 @@ impl GgufTensorType {
             29 => Some(Self::IQ1M),
             30 => Some(Self::BF16),
             39 => Some(Self::MXFP4),
+            43 => Some(Self::MXFP8),
             142 => Some(Self::PQ2_0),
             _ => None,
         }
@@ -141,6 +145,8 @@ impl GgufTensorType {
             Self::Q8_0 => 34, // 2 byte scale + 32 bytes
             // One E8M0 shared exponent + 16 bytes of E2M1 nibbles.
             Self::MXFP4 => 17,
+            // One E8M0 scale byte + 32 E4M3 code bytes.
+            Self::MXFP8 => 33,
             // 16 (sc, min) nibble pairs + 64 bytes of 2-bit codes + f16 d +
             // f16 dmin for 256 values.
             Self::Q2K => 84,
@@ -179,7 +185,7 @@ impl GgufTensorType {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::MXFP4 => 32,
-            Self::IQ4NL => 32,
+            Self::IQ4NL | Self::MXFP8 => 32,
             Self::PQ2_0 => 128,
             Self::Q2K
             | Self::Q3K
@@ -252,12 +258,13 @@ impl GgufTensorType {
             | Self::Q5_1
             | Self::Q8_0
             | Self::MXFP4
+            | Self::MXFP8
             | Self::PQ2_0 => None,
         }
     }
 
     /// Every type `from_u32` recognizes, for the header rejection message.
-    const ALL: [Self; 24] = [
+    const ALL: [Self; 25] = [
         Self::F32,
         Self::F16,
         Self::Q4_0,
@@ -281,6 +288,7 @@ impl GgufTensorType {
         Self::IQ1M,
         Self::BF16,
         Self::MXFP4,
+        Self::MXFP8,
         Self::PQ2_0,
     ];
 
@@ -319,6 +327,7 @@ impl GgufTensorType {
             Self::IQ1M => "IQ1_M",
             Self::BF16 => "BF16",
             Self::MXFP4 => "MXFP4",
+            Self::MXFP8 => "MXFP8",
             Self::PQ2_0 => "PQ2_0",
         }
     }
@@ -679,8 +688,11 @@ pub fn parse_gguf<P: AsRef<Path>>(path: P) -> Result<GgufFile> {
     let path = path.as_ref();
     let file = fs::File::open(path)
         .map_err(|e| Error::from_reason(format!("Failed to open GGUF file: {e}")))?;
-    let mut reader = BufReader::new(file);
+    parse_gguf_reader(BufReader::new(file))
+}
 
+/// [`parse_gguf`] over an already opened reader (e.g. an `F_NOCACHE` file).
+pub(crate) fn parse_gguf_reader(mut reader: impl Read + Seek) -> Result<GgufFile> {
     // Read header
     let magic = read_u32(&mut reader)
         .map_err(|e| Error::from_reason(format!("Failed to read GGUF magic: {e}")))?;
@@ -1012,6 +1024,7 @@ pub fn symmetric_zero_point(ty: GgufTensorType) -> Option<i32> {
         GgufTensorType::Q5_1
         | GgufTensorType::Q4_1
         | GgufTensorType::MXFP4
+        | GgufTensorType::MXFP8
         | GgufTensorType::PQ2_0
         | GgufTensorType::F32
         | GgufTensorType::F16
@@ -1114,6 +1127,63 @@ pub fn mxfp4_repack_block(block: &[u8], words: &mut [u32; 4]) -> u8 {
     }
     pack_block_codes_lsb_first(&codes, 4, words);
     e
+}
+
+/// `ggml_e8m0_to_fp32` (ggml-impl.h:439): `2^(x - 127)`, 0 is the subnormal
+/// `2^-127`; 0xFF gives +inf (callers that treat it as NaN check first).
+pub fn e8m0_to_f32(x: u8) -> f32 {
+    f32::from_bits(if x == 0 {
+        0x0040_0000
+    } else {
+        u32::from(x) << 23
+    })
+}
+
+/// `ggml_e4m3_to_fp32` (llama.cpp PR #30817 ggml-impl.h): E4M3 fn, bias 7, no
+/// inf, 0x7F / 0xFF are NaN. Every value is a small integer times a normal
+/// power of two, so the products are exact.
+pub fn e4m3_to_f32(x: u8) -> f32 {
+    let exp = i32::from((x >> 3) & 0xF);
+    let man = (x & 0x7) as f32;
+    let pow2 = |k: i32| f32::from_bits(((k + 127) as u32) << 23);
+    let v = if exp == 0xF && x & 0x7 == 0x7 {
+        f32::NAN
+    } else if exp == 0 {
+        man * pow2(-9)
+    } else {
+        (8.0 + man) * pow2(exp - 10)
+    };
+    if x & 0x80 != 0 { -v } else { v }
+}
+
+/// `dequantize_row_mxfp8` (llama.cpp PR #30817 ggml-quants.c): decode whole
+/// 33-byte MXFP8 blocks (E8M0 scale, 32 E4M3 codes) into `out`, 32 values per
+/// block. A scale byte of 0xFF decodes the block to NaN.
+pub fn decode_mxfp8_rows(blocks: &[u8], out: &mut [f32]) -> Result<()> {
+    const BLOCK: usize = 33;
+    if !blocks.len().is_multiple_of(BLOCK) || out.len() != blocks.len() / BLOCK * 32 {
+        return Err(Error::from_reason(format!(
+            "MXFP8 decode: {} bytes are not whole blocks for {} values",
+            blocks.len(),
+            out.len()
+        )));
+    }
+    for (b, y) in blocks
+        .as_chunks::<BLOCK>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<32>().0)
+    {
+        let d = if b[0] == 0xFF {
+            f32::NAN
+        } else {
+            e8m0_to_f32(b[0])
+        };
+        for (&q, o) in b[1..].iter().zip(y) {
+            *o = e4m3_to_f32(q) * d;
+        }
+    }
+    Ok(())
 }
 
 /// Load a quantized tensor (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, MXFP4) into its MLX
@@ -1672,6 +1742,14 @@ pub(crate) fn load_gguf_tensor(
     tensor: &GgufTensorInfo,
     options: GgufLoadOptions,
 ) -> Result<Vec<(String, MxArray)>> {
+    if tensor.tensor_type == GgufTensorType::MXFP8 {
+        // Checked before any read: the only MXFP8 tensor in the wild is a
+        // 202 GB engram table that is gathered row by row.
+        return Err(Error::from_reason(format!(
+            "MXFP8 tensor '{}' is gather-only: read its rows with decode_mxfp8_rows, never as a whole tensor",
+            tensor.name
+        )));
+    }
     if let Some(format) = tensor.tensor_type.k_quant_format() {
         if options.import_k_quants {
             load_kquant_repack(reader, gguf, tensor, format)
@@ -3766,6 +3844,9 @@ impl SourceQuantProfile {
                 symmetric_zero_point: None,
                 layout: KQuantLayout::RowMajor,
             }),
+            // Gather-only rows (the DeepSeek-V4.1 engram table); no MLX
+            // quantized layout, and `load_gguf_tensor` refuses a whole load.
+            GgufTensorType::MXFP8 => None,
             GgufTensorType::PQ2_0 => Some(Self {
                 bits: 2,
                 group_size: 128,
@@ -5284,24 +5365,30 @@ pub struct GgufConversionResult {
     pub source_format: String,
 }
 
-pub(crate) fn write_embedded_gpt2_tokenizer(
+/// HF 1017 `tokenizer.json`'s `pre_tokenizer`, verbatim: the GGUF
+/// `tokenizer.ggml.pre = "joyai-llm"` vocabulary (DeepSeek-V4.1) splits digits
+/// in runs of 3 and CJK/kana runs before the word split.
+const JOYAI_LLM_PRE_TOKENIZER: &str = r##"{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"\\p{N}{1,3}"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"[一-龥぀-ゟ゠-ヿ]+"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]}"##;
+
+/// The HF `tokenizer.json` of a GGUF-embedded GPT-2 BPE vocabulary, or `None`
+/// when the GGUF carries none.
+pub(crate) fn embedded_gpt2_tokenizer_json(
     metadata: &HashMap<String, GgufMetaValue>,
-    output_dir: &Path,
-) -> Result<bool> {
+) -> Result<Option<serde_json::Value>> {
     let Some(GgufMetaValue::String(model)) = metadata.get("tokenizer.ggml.model") else {
-        return Ok(false);
+        return Ok(None);
     };
     if model != "gpt2" {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(GgufMetaValue::ArrayString(tokens)) = metadata.get("tokenizer.ggml.tokens") else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(GgufMetaValue::ArrayI32(types)) = metadata.get("tokenizer.ggml.token_type") else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(GgufMetaValue::ArrayString(merges)) = metadata.get("tokenizer.ggml.merges") else {
-        return Ok(false);
+        return Ok(None);
     };
     if tokens.len() != types.len() {
         return Err(Error::from_reason(format!(
@@ -5313,7 +5400,23 @@ pub(crate) fn write_embedded_gpt2_tokenizer(
 
     let mut vocab = serde_json::Map::new();
     let mut added = Vec::new();
+    // `tokenizers` gives an added token absent from the model vocab the next
+    // free id past the vocab, not its own: a special row below the last normal
+    // row (DeepSeek-V4.1's BOS/EOS/pad at 0..2) must also be a vocab entry, as
+    // in HF's tokenizer.json.
+    let last_normal = types.iter().rposition(|&t| t == 1).unwrap_or(0);
+    // joyai-llm (DeepSeek-V4.1): USER_DEFINED rows (`<think>`, `</think>`,
+    // DSML markers) are `special: false` in HF's tokenizer.json, so a
+    // skip-special decode keeps them and the reasoning split can find
+    // `</think>` in the text.
+    let joyai = matches!(
+        metadata.get("tokenizer.ggml.pre"),
+        Some(GgufMetaValue::String(pre)) if pre == "joyai-llm"
+    );
     for (id, (token, token_type)) in tokens.iter().zip(types).enumerate() {
+        if matches!(*token_type, 3 | 4) && id < last_normal {
+            vocab.insert(token.clone(), serde_json::json!(id));
+        }
         match *token_type {
             // GGML_TOKEN_TYPE_NORMAL
             1 => {
@@ -5329,22 +5432,19 @@ pub(crate) fn write_embedded_gpt2_tokenizer(
                 "lstrip": false,
                 "rstrip": false,
                 "normalized": false,
-                "special": true
+                "special": !(joyai && *token_type == 4)
             })),
             _ => {}
         }
     }
 
-    let tokenizer = serde_json::json!({
-        "version": "1.0",
-        "truncation": null,
-        "padding": null,
-        "added_tokens": added,
-        // GGUF's embedded GPT-2 vocabulary and merges operate on the original
-        // byte sequence. No standard metadata here declares Unicode
-        // normalization, so synthesizing NFC would change decomposed prompts.
-        "normalizer": null,
-        "pre_tokenizer": {
+    let pre_tokenizer = match metadata.get("tokenizer.ggml.pre") {
+        Some(GgufMetaValue::String(pre)) if pre == "joyai-llm" => {
+            serde_json::from_str(JOYAI_LLM_PRE_TOKENIZER).map_err(|error| {
+                Error::from_reason(format!("joyai-llm pre-tokenizer JSON: {error}"))
+            })?
+        }
+        _ => serde_json::json!({
             "type": "Sequence",
             "pretokenizers": [
                 {
@@ -5360,7 +5460,18 @@ pub(crate) fn write_embedded_gpt2_tokenizer(
                     "use_regex": false
                 }
             ]
-        },
+        }),
+    };
+    let tokenizer = serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": added,
+        // GGUF's embedded GPT-2 vocabulary and merges operate on the original
+        // byte sequence. No standard metadata here declares Unicode
+        // normalization, so synthesizing NFC would change decomposed prompts.
+        "normalizer": null,
+        "pre_tokenizer": pre_tokenizer,
         "post_processor": {
             "type": "ByteLevel",
             "add_prefix_space": false,
@@ -5386,6 +5497,19 @@ pub(crate) fn write_embedded_gpt2_tokenizer(
             "merges": merges
         }
     });
+    Ok(Some(tokenizer))
+}
+
+pub(crate) fn write_embedded_gpt2_tokenizer(
+    metadata: &HashMap<String, GgufMetaValue>,
+    output_dir: &Path,
+) -> Result<bool> {
+    let Some(tokenizer) = embedded_gpt2_tokenizer_json(metadata)? else {
+        return Ok(false);
+    };
+    let Some(GgufMetaValue::ArrayString(tokens)) = metadata.get("tokenizer.ggml.tokens") else {
+        return Ok(false);
+    };
     let bytes = serde_json::to_vec(&tokenizer).map_err(|error| {
         Error::from_reason(format!("Failed to serialize GGUF tokenizer: {error}"))
     })?;
@@ -18093,5 +18217,262 @@ mod tests {
             native_gguf_in_use_delete_guard(&output).is_some(),
             "the last released reference drops the lease"
         );
+    }
+
+    // ── MXFP8 (ggml type 43, llama.cpp PR #30817) ──────────────────────────
+
+    unsafe extern "C" {
+        fn dequantize_row_mxfp8(x: *const u8, y: *mut f32, k: i64);
+        fn ggml_ref_e4m3_to_fp32(x: u8) -> f32;
+    }
+
+    fn mxfp8_c(blocks: &[u8]) -> Vec<f32> {
+        let mut y = vec![0f32; blocks.len() / 33 * 32];
+        // SAFETY: `blocks` holds whole 33-byte block_mxfp8 structs (alignment 1)
+        // and `y` has 32 floats per block.
+        unsafe { dequantize_row_mxfp8(blocks.as_ptr(), y.as_mut_ptr(), y.len() as i64) };
+        y
+    }
+
+    fn deepseek_v41_fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/deepseek-v41")
+            .join(name)
+    }
+
+    /// Every E4M3 code under scales e in {0, 1, 120, 127, 134, 254, 255}:
+    /// Rust == the vendored C reference and the oracle vectors (gguf-py)
+    /// bit for bit, except NaN, where only NaN-ness is compared. e = 0xFF decodes the whole block to NaN.
+    #[test]
+    fn mxfp8_codes_match_c_reference_and_oracle_vectors() {
+        let ops: serde_json::Value =
+            serde_json::from_slice(&fs::read(deepseek_v41_fixture("ops.json")).unwrap()).unwrap();
+        let blocks = ops["mxfp8_blocks"].as_array().unwrap();
+        let mut seen: HashMap<u8, HashSet<u8>> = HashMap::new();
+        let (mut values, mut nans) = (0usize, 0usize);
+        for b in blocks {
+            let e = b["e"].as_u64().unwrap() as u8;
+            let codes: Vec<u8> = b["codes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c.as_u64().unwrap() as u8)
+                .collect();
+            let want: Vec<u32> = b["f32_bits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| u32::from_str_radix(h.as_str().unwrap(), 16).unwrap())
+                .collect();
+            assert_eq!((codes.len(), want.len()), (32, 32));
+            let mut raw = vec![e];
+            raw.extend_from_slice(&codes);
+            let mut rust = vec![0f32; 32];
+            decode_mxfp8_rows(&raw, &mut rust).unwrap();
+            let c = mxfp8_c(&raw);
+            for j in 0..32 {
+                // NaN sign / payload follows operand order (-NaN * NaN), not a value
+                assert!(
+                    rust[j].to_bits() == c[j].to_bits() || (rust[j].is_nan() && c[j].is_nan()),
+                    "e {e} code {:#04x}: Rust {:#010x} vs C {:#010x}",
+                    codes[j],
+                    rust[j].to_bits(),
+                    c[j].to_bits()
+                );
+                let w = f32::from_bits(want[j]);
+                if w.is_nan() {
+                    assert!(rust[j].is_nan(), "e {e} code {:#04x}: want NaN", codes[j]);
+                    nans += 1;
+                } else {
+                    assert_eq!(rust[j].to_bits(), want[j], "e {e} code {:#04x}", codes[j]);
+                }
+                if e == 0xFF {
+                    assert!(rust[j].is_nan(), "scale 0xFF must decode to NaN");
+                }
+                values += 1;
+            }
+            seen.entry(e).or_default().extend(codes);
+        }
+        for e in [0u8, 1, 127, 254, 255] {
+            assert_eq!(
+                seen.get(&e).map(HashSet::len),
+                Some(256),
+                "scale {e}: all 256 codes"
+            );
+        }
+        for x in 0..=255u8 {
+            let (r, c) = (e4m3_to_f32(x), unsafe { ggml_ref_e4m3_to_fp32(x) });
+            assert_eq!(r.to_bits(), c.to_bits(), "e4m3 {x:#04x}");
+        }
+        assert_eq!(e8m0_to_f32(0).to_bits(), 0x0040_0000);
+        assert_eq!(e8m0_to_f32(127), 1.0);
+        assert_eq!(e8m0_to_f32(254).to_bits(), 0x7F00_0000);
+        println!("mxfp8: {values} values ({nans} NaN) over scales {:?}", {
+            let mut k: Vec<_> = seen.keys().copied().collect();
+            k.sort_unstable();
+            k
+        });
+    }
+
+    #[test]
+    fn mxfp8_type_geometry_and_refusals() {
+        let t = GgufTensorType::from_u32(43).unwrap();
+        assert_eq!(t, GgufTensorType::MXFP8);
+        assert_eq!((t.type_size(), t.block_size(), t.name()), (33, 32, "MXFP8"));
+        assert!(t.is_quantized());
+        assert!(!t.is_mlx_affine_quantized() && !t.is_mlx_mxfp4_quantized());
+        assert!(t.k_quant_format().is_none());
+        assert!(SourceQuantProfile::for_gguf_type(t).is_none());
+        assert!(symmetric_zero_point(t).is_none());
+        assert!(GgufTensorType::recognized_list().contains("MXFP8(43)"));
+        // the real engram table: [256, 768,022,850] -> 202,758,032,400 bytes
+        let info = GgufTensorInfo {
+            name: "per_layer_token_embd.weight".into(),
+            n_dims: 2,
+            dims: vec![256, 768_022_850],
+            tensor_type: t,
+            offset: 0,
+        };
+        assert_eq!(info.data_size().unwrap(), 202_758_032_400);
+        let mut out = vec![0f32; 32];
+        assert!(
+            decode_mxfp8_rows(&[0u8; 32], &mut out).is_err(),
+            "partial block"
+        );
+        assert!(
+            decode_mxfp8_rows(&[0u8; 66], &mut out).is_err(),
+            "wrong output length"
+        );
+    }
+
+    struct NoRead;
+    impl Read for NoRead {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("a gather-only MXFP8 tensor must be refused before any read")
+        }
+    }
+    impl Seek for NoRead {
+        fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
+            panic!("a gather-only MXFP8 tensor must be refused before any seek")
+        }
+    }
+
+    /// The tiny fixture's engram table: a whole-tensor load is refused before
+    /// any byte is read, and its rows decode identically in Rust and C.
+    #[test]
+    fn mxfp8_tiny_engram_table_gather_only_and_rows_match_c() {
+        let path = deepseek_v41_fixture("tiny-q8_0.gguf");
+        let gguf = parse_gguf(&path).unwrap();
+        let t = gguf
+            .tensors
+            .iter()
+            .find(|t| t.name == "per_layer_token_embd.weight")
+            .unwrap();
+        assert_eq!(t.tensor_type, GgufTensorType::MXFP8);
+        let Err(err) = load_gguf_tensor(&mut NoRead, &gguf, t, GgufLoadOptions::default()) else {
+            panic!("a whole MXFP8 load must be refused");
+        };
+        assert!(err.reason.contains("gather-only"), "{}", err.reason);
+        let bytes = fs::read(&path).unwrap();
+        let start = (gguf.data_offset + t.offset) as usize;
+        let raw = &bytes[start..start + t.data_size().unwrap() as usize];
+        let mut rust = vec![0f32; raw.len() / 33 * 32];
+        decode_mxfp8_rows(raw, &mut rust).unwrap();
+        let c = mxfp8_c(raw);
+        assert_eq!(rust.len() as u64, t.num_elements().unwrap());
+        assert!(rust.iter().zip(&c).all(|(a, b)| a.to_bits() == b.to_bits()));
+        assert!(rust.iter().all(|x| x.is_finite()));
+        println!(
+            "tiny engram table: {} rows x {} decoded, Rust == C",
+            t.dims[1], t.dims[0]
+        );
+    }
+
+    /// Real file, shard 1 KV only (F_NOCACHE): the GGUF-embedded `joyai-llm`
+    /// tokenizer encodes 50 EN/ZH/JA/code/emoji/digit/special strings to the
+    /// same ids as HF 1017 `tokenizer.json` (`DSV41_HF_TOKENIZER`) and as the
+    /// python `tokenizers` run that wrote `DSV41_TOK_CASES`; its pre-tokenizer
+    /// is HF's verbatim.
+    #[test]
+    #[ignore = "real DeepSeek-V4.1 shard 1 KV; DSV41_DIR, DSV41_HF_TOKENIZER, DSV41_TOK_CASES"]
+    fn joyai_tokenizer_matches_hf() {
+        let dir = PathBuf::from(std::env::var("DSV41_DIR").unwrap());
+        let path = dir.join("DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf");
+        let file = crate::moe_stream::io::open_nocache(&path).unwrap();
+        let g = parse_gguf_reader(std::io::BufReader::new(file)).unwrap();
+        assert_eq!(
+            g.metadata
+                .get("tokenizer.ggml.pre")
+                .and_then(GgufMetaValue::as_str),
+            Some("joyai-llm")
+        );
+        let ours = embedded_gpt2_tokenizer_json(&g.metadata).unwrap().unwrap();
+        let hf_path = std::env::var("DSV41_HF_TOKENIZER").unwrap();
+        let hf_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&hf_path).unwrap()).unwrap();
+        assert_eq!(
+            ours["pre_tokenizer"], hf_json["pre_tokenizer"],
+            "pre_tokenizer"
+        );
+        let ours = tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&ours).unwrap()).unwrap();
+        let hf = tokenizers::Tokenizer::from_file(&hf_path).unwrap();
+        let (Some(GgufMetaValue::ArrayString(tokens)), Some(GgufMetaValue::ArrayI32(types))) = (
+            g.metadata.get("tokenizer.ggml.tokens"),
+            g.metadata.get("tokenizer.ggml.token_type"),
+        ) else {
+            panic!("tokenizer arrays");
+        };
+        let mut specials = 0;
+        for (id, (t, ty)) in tokens.iter().zip(types).enumerate() {
+            if matches!(*ty, 3 | 4) {
+                assert_eq!(ours.token_to_id(t), Some(id as u32), "special {t:?}");
+                assert_eq!(hf.token_to_id(t), Some(id as u32), "HF special {t:?}");
+                specials += 1;
+            }
+        }
+        assert_eq!(ours.get_vocab_size(true), hf.get_vocab_size(true));
+        // USER_DEFINED rows decode like HF's (not skipped): the reasoning
+        // split finds `</think>` in a skip-special decode.
+        for (id, ty) in types.iter().enumerate() {
+            if *ty == 4 {
+                let ids = [id as u32];
+                assert_eq!(
+                    ours.decode(&ids, true).unwrap(),
+                    hf.decode(&ids, true).unwrap(),
+                    "decode {:?}",
+                    tokens[id]
+                );
+            }
+        }
+        let think_end = ours.token_to_id("</think>").unwrap();
+        let text = [
+            ours.encode("reasoning", false).unwrap().get_ids(),
+            &[think_end],
+            ours.encode("answer", false).unwrap().get_ids(),
+        ]
+        .concat();
+        assert_eq!(ours.decode(&text, true).unwrap(), "reasoning</think>answer");
+        let cases: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::env::var("DSV41_TOK_CASES").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let cases = cases["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 50);
+        let mut n = 0;
+        for c in cases {
+            let text = c["text"].as_str().unwrap();
+            let want: Vec<u32> = c["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect();
+            let a = ours.encode(text, false).unwrap().get_ids().to_vec();
+            let b = hf.encode(text, false).unwrap().get_ids().to_vec();
+            assert_eq!(b, want, "HF (rust) vs python on {text:?}");
+            assert_eq!(a, want, "GGUF-embedded vs HF on {text:?}");
+            n += a.len();
+        }
+        println!("joyai tokenizer: {specials} special ids, 50 strings, {n} ids bitwise == HF 1017");
     }
 }

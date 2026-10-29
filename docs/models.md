@@ -22,8 +22,9 @@ All language wrappers share a uniform `ChatSession<M>` surface (`send` / `sendSt
 | **Muse-Glimmer**           |     yes      |     yes     |     —      | Text decoder; Q4_K import; DFlash; hybrid paged AR                               |
 | **LFM2.5**                 |     yes      |     yes     |     —      | Hybrid conv + attention                                                          |
 | **Nemotron 3.5 Lightning** |     yes      |     yes     |     —      | Hybrid Mamba-2 + MoE + attention; native MTP; inference-only                     |
+| **DeepSeek V4.1 Flash**    |      —       |     yes     |     —      | Split GGUF; routed experts stream from the SSD; text only; 16,384-token context  |
 
-`Qwen3Model | Qwen35Model | Qwen35MoeModel` is the public `TrainableModel` union in `@mlx-node/lm` — Qwen3.8-Flash-Next, Gemma4, Muse-Glimmer, LFM2.5, and Nemotron 3.5 Lightning are inference-only.
+`Qwen3Model | Qwen35Model | Qwen35MoeModel` is the public `TrainableModel` union in `@mlx-node/lm` — Qwen3.8-Flash-Next, Gemma4, Muse-Glimmer, LFM2.5, Nemotron 3.5 Lightning, and DeepSeek V4.1 Flash are inference-only.
 
 See [Qwen3.8-Flash-Next](qwen38-flash-next.md) for SSD loading, memory budgets,
 the first-split GGUF path, auxiliary MTP/vision weights, and supported media.
@@ -101,7 +102,7 @@ const result = await pipeline.analyze(imageBuffer);
 Every role-aware turn sends the full structured history to native code. The checkpoint-provided chat template renders that history, and native KV reuse is allowed only when the rendered token sequence exactly extends the committed cache. A template mismatch safely falls back to full prefill; Rust never manufactures user/tool wire-format strings.
 
 All generative wrappers (Qwen3, Qwen3.5 Dense, Qwen3.5 MoE, Qwen3.8-Flash-Next, Gemma4,
-Muse-Glimmer, LFM2.5, Nemotron 3.5 Lightning, and the VLM
+Muse-Glimmer, LFM2.5, Nemotron 3.5 Lightning, DeepSeek V4.1 Flash, and the VLM
 `QianfanOCRModel`) structurally satisfy `SessionCapableModel` — any of
 them can be passed to `new ChatSession(model)`.
 
@@ -117,6 +118,98 @@ for await (const event of session.sendStream('Hello!')) {
 ```
 
 The streaming bridge is implemented in `packages/lm/src/stream.ts`: native callback-based methods are captured at module load and re-exposed as `AsyncGenerator` via `_runChatStream`.
+
+## DeepSeek V4.1 Flash
+
+The `deepseek_v41` runtime (`DeepseekV41Model`) runs DeepSeek-V4.1-Flash-1017 from
+the Unsloth split GGUF ([`unsloth/DeepSeek-V4.1-Flash-1017-GGUF`](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF),
+`UD-Q4_K_XL`, 9 files, ~500 GB). Keep all nine files in one directory and pass
+the first one. The tokenizer and chat template come from the GGUF header; no
+other files are needed and nothing is written to disk.
+
+```typescript
+import { loadSession } from '@mlx-node/lm';
+
+const session = await loadSession('/models/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf');
+const reply = await session.send('Explain in one sentence why the sky is blue.', {
+  config: { temperature: 0, maxNewTokens: 64, reasoningEffort: 'none' },
+});
+```
+
+Scope: text only, inference only, one sequence per model (flat whole-turn
+lane, no paged cache, no scheduler), context capped at 16,384 tokens, no MTP or
+draft model. `reasoningEffort` maps to the reference encoder's scores (`none` =
+chat mode, `minimal`/`low` = 50, `medium`/`high`/`xhigh` = 75, `max` = 100).
+
+Tools: pass `tools` as for any family. Tool prompts are byte-equal to the
+model's `encoding.py` goldens and to deepseek-recipe's dsv41 encoder on the
+tested cases (tool schemas, `<tool_result>` blocks, reasoning kept in history
+once tools are present); there is no `tool_choice`. The model's DSML block
+(`<｜DSML｜ calls>…</｜DSML｜ calls>`) comes back as `toolCalls`
+(`finishReason: 'tool_calls'`), cut at the emitted `</think>` / `｜DSML｜` ids:
+`string="true"` values are strings, `string="false"` values JSON (a value that
+is not JSON gives that call `invalid_json`; broken markup gives one
+`parse_error` call carrying the raw block). Text the model writes after the
+block is dropped, as the recipe's parser does. A literal marker in caller text
+(`<｜User｜>`, `<think>`, `｜DSML｜`, …) is replaced by a space before
+rendering, so it never becomes a control token. Several invokes in one turn
+come back as several calls; `ChatSession` serves one call per turn, so it then
+refuses `send` and `sendToolResult` until `reset()` or `primeHistory()` +
+`startFromHistory*()` with every result resolved.
+
+How it fits in memory:
+
+```
+load    dense weights (attention, router, shared experts, head; Q8_0 codes) ─► resident, ~9.9 GiB
+        expert bank = [staging slots | cache slots], one buffer per projection, purgeable between turns
+        cache size = admission at load: min(RAM - other apps - 12 GiB, GPU working set) - fixed
+        staging    = 2 layers when >= 17 GiB of cache is left after the second (6.72 GiB), else 1
+token   attention ─► router ─► expert ids to the CPU (one sync per layer)
+        decode : cached experts are used in place; misses are read (pread, no page cache,
+                 12 reader threads, ~12.3 GB/s) and repacked (MXFP4) into cache slots;
+                 the GPU starts on the ready experts while the misses are read
+        prefill: layer by layer over the whole prompt; the experts any row needs are read
+                 once per layer; with 2 staging layers the next layer's experts are read
+                 ahead from a router prediction for calls of 256+ rows (1K TTFT -30 %,
+                 8K -11..-16 %)
+        long prompts: layers 20-39 compute only the rows later layers read (same bits)
+```
+
+Output does not depend on the cache: each (row, expert) output is computed on
+its own and summed in a fixed order, so any cache size, cache policy, read
+order or row skip gives bitwise the same logits as the staging-only path. The
+math follows the DeepSeek 1017 reference (fp32 router, activation fake-quant at
+the reference's sites). The dense weights run `quantized_matmul` on the Q8_0
+codes, so their rounding differs from the reference's f32 dequantization (the
+greedy ids were checked equal to the reference's on the test prompts). The
+model thread computes its f32 matmuls in true f32 whatever `MLX_ENABLE_TF32`
+says: NAX GPUs (M5) otherwise run them in TF32, which the reference's f32
+router and mixing sites do not tolerate. Other models in the same process keep
+MLX's setting.
+
+The admission runs again at every turn. If other apps grew, the expert cache is
+dropped to staging only (never shrunk in place); if memory came back, it is
+rebuilt larger. Between turns the bank is purgeable, so the OS can take it back.
+`model.residencyInfo()` reports the dense bytes, the cache size and slot count,
+the staging layers, the fixed bytes and what other apps used at the last
+admission. Tuning switches are listed in [perf.md](perf.md#deepseek-v41-flash-ssd-streaming).
+
+Measured on an M5 Max (128 GB, internal SSD), product path (`ChatSession`,
+greedy, chat mode, 32 new tokens), each prompt cold in a
+fresh process, auto budget. Other apps held ~69 GiB, so the admission gave the
+expert cache only ~6-7 GiB:
+
+| Prompt              | Load  | TTFT    | Decode     | Expert cache | Peak footprint |
+| ------------------- | ----- | ------- | ---------- | ------------ | -------------- |
+| 64 tokens           | 6.3 s | 7.89 s  | 2.09 tok/s | 6.09 GiB     | 23.6 GiB       |
+| turn 2 (+63 tokens) |       | 6.83 s  | 2.49 tok/s | 6.09 GiB     | 23.6 GiB       |
+| 1K tokens           | 5.9 s | 26.45 s | 2.50 tok/s | 6.69 GiB     | 25.2 GiB       |
+| 8K tokens           | 5.9 s | 87.67 s | 2.23 tok/s | 6.22 GiB     | 29.7 GiB       |
+
+Decode grows with the cache: with ~20-24 GiB of cache (other apps ~50-55 GiB)
+it measured 2.6-3.0 tok/s. Every miss costs one expert read at ~12.6 GB/s, so
+the SSD read rate sets the decode floor. See [perf.md](perf.md#deepseek-v41-flash-ssd-streaming)
+for the full row set.
 
 ## Qwen3.8 DFlash2
 

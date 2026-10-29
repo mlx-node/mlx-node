@@ -1,0 +1,6216 @@
+{
+ "fixture": {
+  "tiny-q8_0.gguf": "58b68066d419782ea04277e6f5b5314fbf37d24cafa8d95c2b8c1d80c46bd8e0",
+  "ops.json": "f31ae24d8be9f193e07fda75c105deb2fe5336f7819f48dd2f7a1e9a5928a5a2",
+  "oracle.npz": "af893b08df27d09a3209394e090813924a020ae2279d8de4edf50d5b0873969e"
+ },
+ "generator": "$I/oracle/make_tiny.py (S2a + S2b OVERRIDES), converter PR #30817 b72050d03 + Q8_0 requant",
+ "weights": "tiny-q8_0.gguf dequantized to f32 (A7, A10); config = release inference/config.json (== GGUF KV)",
+ "cases": {
+  "c1": {
+   "ids": "ids.c1",
+   "prefill": 24,
+   "decode_forced": 0
+  },
+  "c2": {
+   "ids": "ids.c2",
+   "prefill": 12,
+   "decode_forced": 12
+  },
+  "c3": {
+   "ids": "ids.c3",
+   "prefill": 1,
+   "decode_forced": 23
+  },
+  "pad": {
+   "ids": "ids.pad",
+   "prefill": 24,
+   "decode_forced": 0
+  }
+ },
+ "modes": {
+  "fp32_on": {
+   "dtype": "fp32",
+   "fake_quant": "on"
+  },
+  "fp32_off": {
+   "dtype": "fp32",
+   "fake_quant": "off"
+  },
+  "bf16_on": {
+   "dtype": "bf16",
+   "fake_quant": "on"
+  },
+  "bf16_off": {
+   "dtype": "bf16",
+   "fake_quant": "off"
+  }
+ },
+ "header": {
+  "adaptations": {
+   "A1": "block weights materialized per call then dropped, buffers kept",
+   "A2": "routed experts materialized one at a time",
+   "A3": "engram rows fetched by id, activation dtype (lossless)",
+   "A4": "head in 8192-row chunks, embed by row id, all positions returned",
+   "A5": "dumps through hooks",
+   "A6": "image_processor/vision stubbed, text only, no DSpark/MTP",
+   "A7": "every weight dequantized to f32 at load; linear() always takes F.linear",
+   "A8": "linear = F.linear(x.float(), W).to(x.dtype); bf16 mode holds embed rows + wo_a in bf16",
+   "A9": "topk = stable descending sort + first k (exact ties -> lowest index)"
+  },
+  "ref_sha256": {
+   "model.py": "e5decd76fe70fd56ef2f10124d245c6f64fb6a0003cc9068a1d3182a168b8d2d",
+   "engram.py": "11f35ecbead8150c35aa002b3d180ef290b05a25afe883a11884f94d476d3897",
+   "kernel.py": "1236c3507019ed176f5dba5e04bcea58867cf654818c6cf138ed4845398c2455",
+   "config.json": "2e84f45cf1dac8c7fcbb200e96667d4b913275690668ed496f24c7747207a809"
+  },
+  "act_dtype": "torch.float32",
+  "mode": "stream",
+  "fake_quant": {
+   "kv": true,
+   "latent": true,
+   "idx_q": true,
+   "idx_k": true,
+   "o": true
+  },
+  "kernel_stub_sha256": "caabd545b3ab2a7f90373a54ffa8197cd02661381159146002e3ff5cdb303ddf",
+  "config": {
+   "vocab_size": 512,
+   "dim": 64,
+   "moe_inter_dim": 32,
+   "n_layers": 8,
+   "n_mtp_layers": 3,
+   "dspark_block_size": 3,
+   "dspark_noise_token_id": 506,
+   "dspark_target_layer_ids": [
+    5,
+    6,
+    7
+   ],
+   "dspark_markov_rank": 48,
+   "dspark_n_routed_experts": 12,
+   "dspark_n_activated_experts": 5,
+   "n_heads": 6,
+   "n_routed_experts": 12,
+   "n_shared_experts": 1,
+   "n_activated_experts": 6,
+   "score_func": "sqrtsoftplus",
+   "route_scale": 1.5,
+   "swiglu_limit": 10.0,
+   "q_lora_rank": 128,
+   "head_dim": 96,
+   "rope_head_dim": 16,
+   "norm_eps": 1e-20,
+   "o_groups": 2,
+   "o_lora_rank": 112,
+   "window_size": 8,
+   "kv_source_layers": [
+    2,
+    5
+   ],
+   "index_source_layers": [
+    2,
+    5,
+    7
+   ],
+   "original_seq_len": 16,
+   "rope_theta": 10000.0,
+   "rope_factor": 16,
+   "beta_fast": 32,
+   "beta_slow": 1,
+   "index_n_heads": 7,
+   "index_head_dim": 160,
+   "index_topk": 4,
+   "candidate_source_layer": 5,
+   "candidate_topk_blocks": 3,
+   "candidate_block_size": 5,
+   "hc_mult": 4,
+   "hc_sinkhorn_iters": 20,
+   "hc_eps": 1e-06,
+   "engram_layer_ids": [
+    1,
+    2
+   ],
+   "engram_vocab_size": 101,
+   "engram_num_embeddings": [
+    660,
+    864
+   ],
+   "engram_max_ngram_size": 4,
+   "engram_pad_id": 2,
+   "engram_compressed_vocab_size": 402,
+   "dtype": "fp8",
+   "expert_dtype": "fp4",
+   "compress_rope_theta": 160000.0,
+   "compress_ratios": [
+    0,
+    0,
+    2,
+    2,
+    2,
+    1,
+    1,
+    1,
+    0,
+    0,
+    0
+   ],
+   "vision_n_layers": 0,
+   "vision_dim": 80,
+   "vision_n_heads": 5,
+   "vision_inter_dim": 176,
+   "vision_patch_size": 14,
+   "vision_downsample_ratio": 3,
+   "vision_max_n_token": 1024,
+   "vision_min_pixels": 295936,
+   "vision_max_wh_ratio": null,
+   "image_token_id": 511,
+   "engram_n_heads": 2,
+   "engram_head_dim": 192,
+   "vision_rope_theta": 10000
+  },
+  "dump_set": "short",
+  "stream_layers": []
+ },
+ "dtypes_per_site": {
+  "fp32_on": {
+   "tensors": {
+    "hash_ids": "torch.int64",
+    "x_in": "torch.float32",
+    "pre_mix_in": "torch.float32",
+    "attn_pre": "torch.float32",
+    "attn_post": "torch.float32",
+    "attn_comb": "torch.float32",
+    "attn_topk_idxs": "torch.int32",
+    "attn_kv_len": "torch.int64",
+    "attn_proj": "torch.float32",
+    "state_window_kv": "torch.float32",
+    "attn_out": "torch.float32",
+    "ffn_pre": "torch.float32",
+    "ffn_post": "torch.float32",
+    "ffn_comb": "torch.float32",
+    "router_scores": "torch.float32",
+    "router_bias": "torch.float32",
+    "router_w": "torch.float32",
+    "router_idx": "torch.int64",
+    "moe_out": "torch.float32",
+    "out": "torch.float32",
+    "next_pre_mix": "torch.float32",
+    "clamp_hits": "torch.int64",
+    "engram_in": "torch.float32",
+    "engram_out": "torch.float32",
+    "index_score": "torch.float32",
+    "index_topk": "torch.int32",
+    "state_compress_kv": "torch.float32",
+    "state_kv_tail": "torch.float32",
+    "state_score_tail": "torch.float32",
+    "state_index_k": "torch.float32",
+    "state_topk": "torch.int32",
+    "cand_block_scores": "torch.float32",
+    "cand_mask": "torch.bool",
+    "final_h": "torch.float32",
+    "final_norm": "torch.float32"
+   },
+   "fake_quant_sites": {
+    "kv": "torch.float32",
+    "o": "torch.float32",
+    "idx_k": "torch.float32",
+    "idx_q": "torch.float32",
+    "latent": "torch.float32"
+   }
+  },
+  "fp32_off": {
+   "tensors": {
+    "hash_ids": "torch.int64",
+    "x_in": "torch.float32",
+    "pre_mix_in": "torch.float32",
+    "attn_pre": "torch.float32",
+    "attn_post": "torch.float32",
+    "attn_comb": "torch.float32",
+    "attn_topk_idxs": "torch.int32",
+    "attn_kv_len": "torch.int64",
+    "attn_proj": "torch.float32",
+    "state_window_kv": "torch.float32",
+    "attn_out": "torch.float32",
+    "ffn_pre": "torch.float32",
+    "ffn_post": "torch.float32",
+    "ffn_comb": "torch.float32",
+    "router_scores": "torch.float32",
+    "router_bias": "torch.float32",
+    "router_w": "torch.float32",
+    "router_idx": "torch.int64",
+    "moe_out": "torch.float32",
+    "out": "torch.float32",
+    "next_pre_mix": "torch.float32",
+    "clamp_hits": "torch.int64",
+    "engram_in": "torch.float32",
+    "engram_out": "torch.float32",
+    "index_score": "torch.float32",
+    "index_topk": "torch.int32",
+    "state_compress_kv": "torch.float32",
+    "state_kv_tail": "torch.float32",
+    "state_score_tail": "torch.float32",
+    "state_index_k": "torch.float32",
+    "state_topk": "torch.int32",
+    "cand_block_scores": "torch.float32",
+    "cand_mask": "torch.bool",
+    "final_h": "torch.float32",
+    "final_norm": "torch.float32"
+   },
+   "fake_quant_sites": {
+    "kv": "torch.float32",
+    "o": "torch.float32",
+    "idx_k": "torch.float32",
+    "idx_q": "torch.float32",
+    "latent": "torch.float32"
+   }
+  },
+  "bf16_on": {
+   "tensors": {
+    "hash_ids": "torch.int64",
+    "x_in": "torch.bfloat16",
+    "pre_mix_in": "torch.float32",
+    "attn_pre": "torch.float32",
+    "attn_post": "torch.float32",
+    "attn_comb": "torch.float32",
+    "attn_topk_idxs": "torch.int32",
+    "attn_kv_len": "torch.int64",
+    "attn_proj": "torch.bfloat16",
+    "state_window_kv": "torch.bfloat16",
+    "attn_out": "torch.bfloat16",
+    "ffn_pre": "torch.float32",
+    "ffn_post": "torch.float32",
+    "ffn_comb": "torch.float32",
+    "router_scores": "torch.float32",
+    "router_bias": "torch.float32",
+    "router_w": "torch.float32",
+    "router_idx": "torch.int64",
+    "moe_out": "torch.bfloat16",
+    "out": "torch.bfloat16",
+    "next_pre_mix": "torch.float32",
+    "clamp_hits": "torch.int64",
+    "engram_in": "torch.bfloat16",
+    "engram_out": "torch.bfloat16",
+    "index_score": "torch.bfloat16",
+    "index_topk": "torch.int32",
+    "state_compress_kv": "torch.bfloat16",
+    "state_kv_tail": "torch.float32",
+    "state_score_tail": "torch.float32",
+    "state_index_k": "torch.bfloat16",
+    "state_topk": "torch.int32",
+    "cand_block_scores": "torch.bfloat16",
+    "cand_mask": "torch.bool",
+    "final_h": "torch.bfloat16",
+    "final_norm": "torch.bfloat16"
+   },
+   "fake_quant_sites": {
+    "kv": "torch.bfloat16",
+    "o": "torch.bfloat16",
+    "idx_k": "torch.bfloat16",
+    "idx_q": "torch.bfloat16",
+    "latent": "torch.bfloat16"
+   }
+  },
+  "bf16_off": {
+   "tensors": {
+    "hash_ids": "torch.int64",
+    "x_in": "torch.bfloat16",
+    "pre_mix_in": "torch.float32",
+    "attn_pre": "torch.float32",
+    "attn_post": "torch.float32",
+    "attn_comb": "torch.float32",
+    "attn_topk_idxs": "torch.int32",
+    "attn_kv_len": "torch.int64",
+    "attn_proj": "torch.bfloat16",
+    "state_window_kv": "torch.bfloat16",
+    "attn_out": "torch.bfloat16",
+    "ffn_pre": "torch.float32",
+    "ffn_post": "torch.float32",
+    "ffn_comb": "torch.float32",
+    "router_scores": "torch.float32",
+    "router_bias": "torch.float32",
+    "router_w": "torch.float32",
+    "router_idx": "torch.int64",
+    "moe_out": "torch.bfloat16",
+    "out": "torch.bfloat16",
+    "next_pre_mix": "torch.float32",
+    "clamp_hits": "torch.int64",
+    "engram_in": "torch.bfloat16",
+    "engram_out": "torch.bfloat16",
+    "index_score": "torch.bfloat16",
+    "index_topk": "torch.int32",
+    "state_compress_kv": "torch.bfloat16",
+    "state_kv_tail": "torch.float32",
+    "state_score_tail": "torch.float32",
+    "state_index_k": "torch.bfloat16",
+    "state_topk": "torch.int32",
+    "cand_block_scores": "torch.bfloat16",
+    "cand_mask": "torch.bool",
+    "final_h": "torch.bfloat16",
+    "final_norm": "torch.bfloat16"
+   },
+   "fake_quant_sites": {
+    "kv": "torch.bfloat16",
+    "o": "torch.bfloat16",
+    "idx_k": "torch.bfloat16",
+    "idx_q": "torch.bfloat16",
+    "latent": "torch.bfloat16"
+   }
+  }
+ },
+ "runs": {
+  "c1.fp32_on": {
+   "calls": [
+    {
+     "start": 0,
+     "n": 24,
+     "logits_sha256": "9a53a5070d1f2d119d7d0772235b0c4ca9db28f757ee69a62d2c56b3344b0ddf",
+     "last_sha256": "0fa826dc23566069129cd420617b8dac5f388c7083cb316af81b9e03543334c4",
+     "argmax_last": 446
+    }
+   ],
+   "generated_argmax": [
+    446
+   ],
+   "wall_s": 0.188
+  },
+  "c1.fp32_off": {
+   "calls": [
+    {
+     "start": 0,
+     "n": 24,
+     "logits_sha256": "b0a471908636328e59d800b4a1aa20771acbfb158894f2d4c3b115ebfc6f7539",
+     "last_sha256": "4a20c5b9c16901089d90ec6d3116250dd399d0cecfdc84f352a841b8181052a2",
+     "argmax_last": 446
+    }
+   ],
+   "generated_argmax": [
+    446
+   ],
+   "wall_s": 0.187
+  },
+  "c1.bf16_on": {
+   "calls": [
+    {
+     "start": 0,
+     "n": 24,
+     "logits_sha256": "942ea4819a939ac69103a0fd1094a1d6c7c3d48199bfcae964bfd76e16003994",
+     "last_sha256": "0689b9a6f73de4b6bdb8d51f1bede222b0f32877b6dd1d767de24a76106c766a",
+     "argmax_last": 446
+    }
+   ],
+   "generated_argmax": [
+    446
+   ],
+   "wall_s": 0.219
+  },
+  "c1.bf16_off": {
+   "calls": [
+    {
+     "start": 0,
+     "n": 24,
+     "logits_sha256": "11b1bcf6a3d72ef293ff0527c7afe6a6e730a3ceeea0174d2186d0f8953b75cc",
+     "last_sha256": "042ae9e25555cc2660e0de3a0d50643b528c2baa37b7030ca8fa729c67cc7397",
+     "argmax_last": 446
+    }
+   ],
+   "generated_argmax": [
+    446
+   ],
+   "wall_s": 0.189
+  },
+  "c2.fp32_on": {
+   "calls": [
+    {
+     "start": 0,
+     "n": 12,
+     "logits_sha256": "3b570b140057d92b3e8588473c13e05aa299ca453efad198e52dcd3e1bfefc84",
+     "last_sha256": "1aad1421550c5040db53070faaa0ad8fbdea6acd35edcdad4fadcbb7ac630d38",
+     "argmax_last": 382
+    },
+    {
+     "start": 12,
+     "n": 1,
+     "logits_sha256": "0560f6c0966c8c0724f55a079eb4dfe4f1588986e956fe3cea9c2bc31fd843b9",
+     "last_sha256": "0560f6c0966c8c0724f55a079eb4dfe4f1588986e956fe3cea9c2bc31fd843b9",
+     "argmax_last": 290
+    },
+    {
+     "start": 13,
+     "n": 1,
+     "logits_sha256": "058371fec49b0531fddcf42f4435b835843ba5ba654e2171662a55c466bfc433",
+     "last_sha256": "058371fec49b0531fddcf42f4435b835843ba5ba654e2171662a55c466bfc433",
+     "argmax_last": 290
+    },
+    {
+     "start": 14,
+     "n": 1,
+     "logits_sha256": "99d0a1c03098dbc82b5c54b5476697b45ae8d7aa77e47c065cce47c8a46de757",
+     "last_sha256": "99d0a1c03098dbc82b5c54b5476697b45ae8d7aa77e47c065cce47c8a46de757",
+     "argmax_last": 254
+    },
+    {
+     "start": 15,
+     "n": 1,
+     "logits_sha256": "9e2ff8dd8c586e6971eb5f607cf6c3577fc3519ac424c4a6acfb6344fb619cbe",
+     "last_sha256": "9e2ff8dd8c586e6971eb5f607cf6c3577fc3519ac424c4a6acfb6344fb619cbe",
+     "argmax_last": 416
+    },
+    {
+     "start": 16,
+     "n": 1,
+     "logits_sha256": "3175443a42e72d7f89a58acb18282aa7fa66fa5d793f81219571de83eeac6784",
+     "last_sha256": "3175443a42e72d7f89a58acb18282aa7fa66fa5d793f81219571de83eeac6784",
+     "argmax_last": 446
+    },
+    {
+     "start": 17,
+     "n": 1,
+     "logits_sha256": "f49d27257dd770f72b646bcbaee464500ecd68da0471c2685d2b12c38318b30f",
+     "last_sha256": "f49d27257dd770f72b646bcbaee464500ecd68da0471c2685d2b12c38318b30f",
+     "argmax_last": 57
+    },
+    {
+     "start": 18,
+     "n": 1,
+     "logits_sha256": "7134f1682c68ff6d41e19effdd0db2be8df1fa7367cd6567a0eb3716f149133b",
+     "last_sha256": "7134f1682c68ff6d41e19effdd0db2be8df1fa7367cd6567a0eb3716f149133b",
+     "argmax_last": 133
+    },
+    {
+     "start": 19,
+     "n": 1,
+     "logits_sha256": "8c9d3de26b57cefe94d723c89ec79b2ded3f11fc1895d79c4acb2e45671f6d74",
+     "last_sha256": "8c9d3de26b57cefe94d723c89ec79b2ded3f11fc1895d79c4acb2e45671f6d74",
+     "argmax_last": 298
+    },
+    {
+     "start": 20,
+     "n": 1,
+     "logits_sha256": "6ff7d121e33728118a2b017a40b888138aa24d790010303bdd94c521572e13b3",
+     "last_sha256": "6ff7d121e33728118a2b017a40b888138aa24d790010303bdd94c521572e13b3",
+     "argmax_last": 379
+    },
+    {
+     "start": 21,
+     "n": 1,
+     "logits_sha256": "a0e109b5fd0980ae1fbb0c5ad1779dd21005de51e8a9b230b11fca236e3541d0",
+     "last_sha256": "a0e109b5fd0980ae1fbb0c5ad1779dd21005de51e8a9b230b11fca236e3541d0",
+     "argmax_last": 26
+    },
+    {
+     "start": 22,
+     "n": 1,
+     "logits_sha256": "fab47b6d1dd41b3e1d8a2c6230a284506f5dc9f893ad7cc000a8c234e419f85a",
+     "last_sha256": "fab47b6d1dd41b3e1d8a2c6230a284506f5dc9f893ad7cc000a8c234e419f85a",
+     "argmax_last": 423
+    },
+    {
+     "start": 23,
+     "n": 1,
+     "logits_sha256": "3783a519f0830219a038205de5e6a4e724895b4e84ee4c0e3d61c0227de9668e",
+     "last_sha256": "3783a519f0830219a038205de5e6a4e724895b4e84ee4c0e3d61c0227de9668e",
+     "argmax_last": 446
+    }
+   ],
+   "generated_argmax": [
+    382,
+    290,
+    290,
+    254,
+    416,
+    446,
+    57,
+    133,
+    298,
+    379,
+    26,
+    423,
+    446
+   ],
+   "wall_s": 0.359
+  },
+  "c2.fp32_off": {
+   "calls": [
+    {
+     "start": 0,
+     "n": 12,
+     "logits_sha256": "db34c68e5d6229d263c25b72b03cb39ccd6dbd6d9daded1a814fe4e3057dd335",
+     "last_sha256": "502030c5df1af14cb90ee7a7cfff572f5e4264a942e89fba056e58ecee65097b",
+     "argmax_last": 382
+    },
+    {
+     "start": 12,
+     "n": 1,
+     "logits_sha256": "b0cab24e2d89438bc890c11ba5325e4f55f7ae99a8c33a3a9861251cbe8a9962",
+     "last_sha256": "b0cab24e2d89438bc890c11ba5325e4f55f7ae99a8c33a3a9861251cbe8a9962",
+     "argmax_last": 29
+    },
+    {
+     "start": 13,
+     "n": 1,
+     "logits_sha256": "35e85adff2bd79400412ed1fc10a77d8ccfdc807d9cfc3cbb0c1a7deb3b052b9",
+     "last_sha256": "35e85adff2bd79400412ed1fc10a77d8ccfdc807d9cfc3cbb0c1a7deb3b052b9",
+     "argmax_last": 290
+    },
+    {
+     "start": 14,
+     "n": 1,
+     "logits_sha256": "a1b88e0cb6aefbf451b7e575ceb7fa2a56fdc0fd890526ff01ec6486808fe61e",
+     "last_sha256": "a1b88e0cb6aefbf451b7e575ceb7fa2a56fdc0fd890526ff01ec6486808fe61e",
+     "argmax_last": 254
+    },
+    {
+     "start": 15,
+     "n": 1,
+     "logits_sha256": "495adfa42bcb9500c89f2a90150d2f9c28dc54364980113966258c371596b794",
+     "last_sha256": "495adfa42bcb9500c89f2a90150d2f9c28dc54364980113966258c371596b794",
+     "argmax_last": 416
+    },
+    {
+     "start": 16,
+     "n": 1,
+     "logits_sha256": "67857b0d68db14d0a659f2b01f58a699061eb88df2a0b7349919aa57bafb406c",
+     "last_sha256": "67857b0d68db14d0a659f2b01f58a699061eb88df2a0b7349919aa57bafb406c",
+     "argmax_last": 446
+    },
+    {
+     "start": 17,
+     "n": 1,
+     "logits_sha256": "be3e30b9333aa734f0992cd21f50226d6578a8718b6f295a088f3013ad78cfa6",
+     "last_sha256": "be3e30b9333aa734f0992cd21f50226d6578a8718b6f295a088f3013ad78cfa6",
+     "argmax_last": 57
+    },
+    {
+     "start": 18,
+     "n": 1,
+     "logits_sha256": "b2135ce784e3ea34e1dd7428de694060a9b7187ec03df2dd7da08563e0606ea5",
+     "last_sha256": "b2135ce784e3ea34e1dd7428de694060a9b7187ec03df2dd7da08563e0606ea5",
+     "argmax_last": 133
+    },
+    {
+     "start": 19,
+     "n": 1,
+     "logits_sha256": "fff72baac3b7a749b3231154420d460725ece0db6c05f5a7a1196779497f766e",
+     "last_sha256": "fff72baac3b7a749b3231154420d460725ece0db6c05f5a7a1196779497f766e",
+     "argmax_last": 70
+    },
+    {
+     "start": 20,
+     "n": 1,
+     "logits_sha256": "e5e4eaa44378bac64263b15f1fcc1bcf7219daf7e3ac4d9c67b49806196f1fa0",
+     "last_sha256": "e5e4eaa44378bac64263b15f1fcc1bcf7219daf7e3ac4d9c67b49806196f1fa0",
+     "argmax_last": 379
+    },
+    {
+     "start": 21,
+     "n": 1,
+     "logits_sha256": "dba8444726c456245840ab0e19adeb13d270cbea0d16e6d9dcd20f8ec257cc57",
+     "last_sha256": "dba8444726c456245840ab0e19adeb13d270cbea0d16e6d9dcd20f8ec257cc57",
+     "argmax_last": 26
+    },
+    {
+     "start": 22,
+     "n": 1,
+     "logits_sha256": "34a29536779ab829a0c7e581cd4e1528576385b35790dec79305fad03fc89773",
+     "last_sha256": "34a29536779ab829a0c7e581cd4e1528576385b35790dec79305fad03fc89773",
+     "argmax_last": 423
+    },
+    {
+     "start": 23,
+     "n": 1,
+     "logits_sha256": "ea48e8208ffd9b2b8587d5e8975a94d52714980cd5c2fa60efdc4ddb92104dc8",
+     "last_sha256": "ea48e8208ffd9b2b8587d5e8975a94d52714980cd5c2fa60efdc4ddb92104dc8",
+     "argmax_last": 446
+    }
+   ],
+   "generated_argmax": [
+    382,
+    29,
+    290,
+    254,
+    416,
+    446,
+    57,
+    133,
+    70,
+    379,
+    26,
+    423,
+    446
+   ],
+   "wall_s": 0.352
+  },
+  "c2.bf16_on": {
+   "calls": [
+    {
+     "start": 0,
+     "n": 12,
+     "logits_sha256": "4cefbf1ec3493809dd64ae7bb9aa1ec473829622210cd8e181f61eee30af12b1",
+     "last_sha256": "45c83e16067be7e75dff40c106ebe40edfb756fabd91ecc1c3bfe1ba63591473",
+     "argmax_last": 382
+    },
+    {
+     "start": 12,
+     "n": 1,
+     "logits_sha256": "4fb85a1cf917be69aa7e27a9e3fe764d61365932281bc90b5d480e2352c9ab2a",
+     "last_sha256": "4fb85a1cf917be69aa7e27a9e3fe764d61365932281bc90b5d480e2352c9ab2a",
+     "argmax_last": 290
+    },
+    {
+     "start": 13,
+     "n": 1,
+     "logits_sha256": "2741ec02494768c95e12526eeb3305866d029566f0871dd36112316a9a73811a",
+     "last_sha256": "2741ec02494768c95e12526eeb3305866d029566f0871dd36112316a9a73811a",
+     "argmax_last": 290
+    },
+    {
+     "start": 14,
+     "n": 1,
+     "logits_sha256": "43615f1f3c775508f5a449b9dc62c5f884841bc103ff030671f102b6adb40118",
+     "last_sha256": "43615f1f3c775508f5a449b9dc62c5f884841bc103ff030671f102b6adb40118",
+     "argmax_last": 254
+    },
+    {
+     "start": 15,
+     "n": 1,
+     "logits_sha256": "baf39778b2dddf7df420a9be73886488bd1b927565f3fc092e46934dc4c9a0f6",
+     "last_sha256": "baf39778b2dddf7df420a9be73886488bd1b927565f3fc092e46934dc4c9a0f6",
+     "argmax_last": 262
+    },
+    {
+     "start": 16,
+     "n": 1,
+     "logits_sha256": "6c0ab4ac74a7dabd2f8e07d2f1b7b6b5dcf97442f346c47df9f66718728eee80",
+     "last_sha256": "6c0ab4ac74a7dabd2f8e07d2f1b7b6b5dcf97442f346c47df9f66718728eee80",
+     "argmax_last": 446
+    },
+    {
+     "start": 17,
+     "n": 1,
+     "logits_sha256": "3006e470079c3478e005591f63ba51654a97d6f98e388d9cb5a673c1e4290382",
+     "last_sha256": "3006e470079c3478e005591f63ba51654a97d6f98e388d9cb5a673c1e4290382",
+     "argmax_last": 57
+    },
+    {
+     "start": 18,
+     "n": 1,
+     "logits_sha256": "7fe78a89c454a3057cdcb933bef02833b5b30a51fea1e3809370eec492fb1e3d",
+     "last_sha256": "7fe78a89c454a3057cdcb933bef02833b5b30a51fea1e3809370eec492fb1e3d",
+     "argmax_last": 133
+    },
+    {
+     "start": 19,
+     "n": 1,
+     "logits_sha256": "62d575f92880a41b2d7925febf2edfc964aa246148486d295223cc074ada7366",
+     "last_sha256": "62d575f92880a41b2d7925febf2edfc964aa246148486d295223cc074ada7366",
+     "argmax_last": 70
+    },
+    {
+     "start": 20,
+     "n": 1,
+     "logits_sha256": "c18985b4730abc8e16954fb51dba63e760e1fad61c3c37f6f13fecd430a4e40c",
+     "last_sha256": "c18985b4730abc8e16954fb51dba63e760e1fad61c3c37f6f13fecd430a4e40c",
+     "argmax_last": 379
+    },
+    {
+     "start": 21,
+     "n": 1,
+     "logits_sha256": "10d7450001ff05b9fe87edf0d17c1c99016fa3f76c1167c3ecdd2b8fa118f030",
+     "last_sha256": "10d7450001ff05b9fe87edf0d17c1c99016fa3f76c1167c3ecdd2b8fa118f030",
+     "argmax_last": 26
+    },
+    {
+     "start": 22,
+     "n": 1,
+     "logits_sha256": "a62b137a396a4a5912f00336e0e599979fdba1e4ddb02a1d51256f0f9c27f019",
+     "last_sha256": "a62b137a396a4a5912f00336e0e599979fdba1e4ddb02a1d51256f0f9c27f019",
+     "argmax_last": 423
+    },
+    {
+     "start": 23,
+     "n": 1,
+     "logits_sha256": "153a9f00f33afe41d0c95459f71d12f9a5f5320436a5c70243056e95ce7b5483",
+     "last_sha256": "153a9f00f33afe41d0c95459f71d12f9a5f5320436a5c70243056e95ce7b5483",
+     "argmax_last": 446
+    }
+   ],
+   "generated_argmax": [
+    382,
+    290,
+    290,
+    254,
+    262,
+    446,
+    57,
+    133,
+    70,
+    379,
+    26,
+    423,
+    446
+   ],
+   "wall_s": 0.372
+  },
+  "c2.bf16_off": {
+   "calls": [
+    {
+     "start": 0,
+     "n": 12,
+     "logits_sha256": "3f01e02e1fc57f7cfac5d27dc66826a5b95a382f7903a47e83e10ed5fd0ab4ef",
+     "last_sha256": "621cb2f944cb3539e3078fd7602e58fd2d3b2c743f72a91204113c56316b057a",
+     "argmax_last": 382
+    },
+    {
+     "start": 12,
+     "n": 1,
+     "logits_sha256": "2cab08cddc7edb8be1fa02bcc6802f3afe1f41889aead828e4f2a6ff86cd2a54",
+     "last_sha256": "2cab08cddc7edb8be1fa02bcc6802f3afe1f41889aead828e4f2a6ff86cd2a54",
+     "argmax_last": 29
+    },
+    {
+     "start": 13,
+     "n": 1,
+     "logits_sha256": "4a2cfef425f4973084745e5b539ccc99017cbab1d9877145558cbdfce3890772",
+     "last_sha256": "4a2cfef425f4973084745e5b539ccc99017cbab1d9877145558cbdfce3890772",
+     "argmax_last": 290
+    },
+    {
+     "start": 14,
+     "n": 1,
+     "logits_sha256": "f9af2f2c1a19128dab99cf8dc325423d30ae035aacc6a765f76c77c372994a09",
+     "last_sha256": "f9af2f2c1a19128dab99cf8dc325423d30ae035aacc6a765f76c77c372994a09",
+     "argmax_last": 254
+    },
+    {
+     "start": 15,
+     "n": 1,
+     "logits_sha256": "3fa5aece48e6e1004d4c44b2fe632614a70b2fb2b20bb211b25dfcfd8123890e",
+     "last_sha256": "3fa5aece48e6e1004d4c44b2fe632614a70b2fb2b20bb211b25dfcfd8123890e",
+     "argmax_last": 416
+    },
+    {
+     "start": 16,
+     "n": 1,
+     "logits_sha256": "08c7162d7e2c4d4106828be36b5527c6f9b364aa593c75b75ef320aa82635ea2",
+     "last_sha256": "08c7162d7e2c4d4106828be36b5527c6f9b364aa593c75b75ef320aa82635ea2",
+     "argmax_last": 446
+    },
+    {
+     "start": 17,
+     "n": 1,
+     "logits_sha256": "8d1911c8ca0b50ea9686f16976b0983f05a4ae0aebd69e1412748f162d599aff",
+     "last_sha256": "8d1911c8ca0b50ea9686f16976b0983f05a4ae0aebd69e1412748f162d599aff",
+     "argmax_last": 57
+    },
+    {
+     "start": 18,
+     "n": 1,
+     "logits_sha256": "c2c5e6c041c58179f70b1e7893c628b3f6b24160648a12c92599db6b5846855c",
+     "last_sha256": "c2c5e6c041c58179f70b1e7893c628b3f6b24160648a12c92599db6b5846855c",
+     "argmax_last": 133
+    },
+    {
+     "start": 19,
+     "n": 1,
+     "logits_sha256": "dfdb36f38b94bb44409437d4ef60033b6c36a6ab06451aedccc30bc7ac1f39ad",
+     "last_sha256": "dfdb36f38b94bb44409437d4ef60033b6c36a6ab06451aedccc30bc7ac1f39ad",
+     "argmax_last": 70
+    },
+    {
+     "start": 20,
+     "n": 1,
+     "logits_sha256": "e005f80b45e67bf350f62877268a2a403e917826d68d01377d02cd90e8598808",
+     "last_sha256": "e005f80b45e67bf350f62877268a2a403e917826d68d01377d02cd90e8598808",
+     "argmax_last": 379
+    },
+    {
+     "start": 21,
+     "n": 1,
+     "logits_sha256": "31de3c964376cf44d451567e7f1d12471b0fadc37dcf00df80726ed9bc4e7297",
+     "last_sha256": "31de3c964376cf44d451567e7f1d12471b0fadc37dcf00df80726ed9bc4e7297",
+     "argmax_last": 26
+    },
+    {
+     "start": 22,
+     "n": 1,
+     "logits_sha256": "df2b270398327373a7fa2bc213899619e618cffec10484d9b5e6cb455b7d8752",
+     "last_sha256": "df2b270398327373a7fa2bc213899619e618cffec10484d9b5e6cb455b7d8752",
+     "argmax_last": 423
+    },
+    {
+     "start": 23,
+     "n": 1,
+     "logits_sha256": "d3dfbfdf79b8a5e117723c9ef0b17e47c3e11640229e589bc53a44c546b1f00e",
+     "last_sha256": "d3dfbfdf79b8a5e117723c9ef0b17e47c3e11640229e589bc53a44c546b1f00e",
+     "argmax_last": 446
+    }
+   ],
+   "generated_argmax": [
+    382,
+    29,
+    290,
+    254,
+    416,
+    446,
+    57,
+    133,
+    70,
+    379,
+    26,
+    423,
+    446
+   ],
+   "wall_s": 0.365
+  },
+  "c3.fp32_on": {
+   "calls": [
+    {
+     "start": 0,
+     "n": 1,
+     "logits_sha256": "8597f87367eb2e7e8e544312ae6e2cf5c424f8ceb6b6a51d74db60d6adc400d2",
+     "last_sha256": "8597f87367eb2e7e8e544312ae6e2cf5c424f8ceb6b6a51d74db60d6adc400d2",
+     "argmax_last": 26
+    },
+    {
+     "start": 1,
+     "n": 1,
+     "logits_sha256": "ae15f7bbbdeea5dac318269396a1b4ddf0b84669d3cc7ac89495d4fe5698a681",
+     "last_sha256": "ae15f7bbbdeea5dac318269396a1b4ddf0b84669d3cc7ac89495d4fe5698a681",
+     "argmax_last": 305
+    },
+    {
+     "start": 2,
+     "n": 1,
+     "logits_sha256": "8c9ec6b400de27ea71641d657bb56bedc6a030b7174b71054a86f68ade5a4a23",
+     "last_sha256": "8c9ec6b400de27ea71641d657bb56bedc6a030b7174b71054a86f68ade5a4a23",
+     "argmax_last": 211
+    },
+    {
+     "start": 3,
+     "n": 1,
+     "logits_sha256": "b2040bef15116c71c058ddd2b57123290a1c5709df8ce1d9d2bd569bfc7023ad",
+     "last_sha256": "b2040bef15116c71c058ddd2b57123290a1c5709df8ce1d9d2bd569bfc7023ad",
+     "argmax_last": 446
+    },
+    {
+     "start": 4,
+     "n": 1,
+     "logits_sha256": "7b7625c522ea255f2fe7cd8d102cbf627b2f03e82d3c2051c1c1c4976124b4c8",
+     "last_sha256": "7b7625c522ea255f2fe7cd8d102cbf627b2f03e82d3c2051c1c1c4976124b4c8",
+     "argmax_last": 295
+    },
+    {
+     "start": 5,
+     "n": 1,
+     "logits_sha256": "9a957578bb304d4eed0dd0cdee58ef5d9b943835383ba41c5e9902d7c01acc01",
+     "last_sha256": "9a957578bb304d4eed0dd0cdee58ef5d9b943835383ba41c5e9902d7c01acc01",
+     "argmax_last": 298
+    },
+    {
+     "start": 6,
+     "n": 1,
+     "logits_sha256": "db5484083ef085ff95b644a419665e95c5c1c2913a515f80463fb672483f5262",
+     "last_sha256": "db5484083ef085ff95b644a419665e95c5c1c2913a515f80463fb672483f5262",
+     "argmax_last": 182
+    },
+    {
+     "start": 7,
+     "n": 1,
+     "logits_sha256": "5b6dc5318a7936cc239d913a4a295a63a0e12ad5a87701337eace3c07fa798b2",
+     "last_sha256": "5b6dc5318a7936cc239d913a4a295a63a0e12ad5a87701337eace3c07fa798b2",
+     "argmax_last": 148
+    },
+    {
+     "start": 8,
+     "n": 1,
+     "logits_sha256": "d839ecaff834e8b8d066396906050974d663c23de20376ba6385a3d9b540fb5f",
+     "last_sha256": "d839ecaff834e8b8d066396906050974d663c23de20376ba6385a3d9b540fb5f",
+     "argmax_last": 213
+    },
+    {
+     "start": 9,
+     "n": 1,
+     "logits_sha256": "116077bec31a68632457054db92ed00eb383176da775aef9daa10cce8ac764ba",
+     "last_sha256": "116077bec31a68632457054db92ed00eb383176da775aef9daa10cce8ac764ba",
+     "argmax_last": 306
+    },
+    {
+     "start": 10,
+     "n": 1,
+     "logits_sha256": "c24152a96804aea47b0c35f77cae79e6f612be2cc7a5cfa9a3e3c22284198e18",
+     "last_sha256": "c24152a96804aea47b0c35f77cae79e6f612be2cc7a5cfa9a3e3c22284198e18",
+     "argmax_last": 507
+    },
+    {
+     "start": 11,
+     "n": 1,
+     "logits_sha256": "eb8d0c1418ebe97534167ba298ac91ec78da3a8378042be9774b12a9fa70bab4",
+     "last_sha256": "eb8d0c1418ebe97534167ba298ac91ec78da3a8378042be9774b12a9fa70bab4",
+     "argmax_last": 382
+    },
+    {
+     "start": 12,
+     "n": 1,
+     "logits_sha256": "0560f6c0966c8c0724f55a079eb4dfe4f1588986e956fe3cea9c2bc31fd843b9",
+     "last_sha256": "0560f6c0966c8c0724f55a079eb4dfe4f1588986e956fe3cea9c2bc31fd843b9",
+     "argmax_last": 290
+    },
+    {
+     "start": 13,
+     "n": 1,
+     "logits_sha256": "058371fec49b0531fddcf42f4435b835843ba5ba654e2171662a55c466bfc433",
+     "last_sha256": "058371fec49b0531fddcf42f4435b835843ba5ba654e2171662a55c466bfc433",
+     "argmax_last": 290
+    },
+    {
+     "start": 14,
+     "n": 1,
+     "logits_sha256": "99d0a1c03098dbc82b5c54b5476697b45ae8d7aa77e47c065cce47c8a46de757",
+     "last_sha256": "99d0a1c03098dbc82b5c54b5476697b45ae8d7aa77e47c065cce47c8a46de757",
+     "argmax_last": 254
+    },
+    {
+     "start": 15,
+     "n": 1,
+     "logits_sha256": "9e2ff8dd8c586e6971eb5f607cf6c3577fc3519ac424c4a6acfb6344fb619cbe",
+     "last_sha256": "9e2ff8dd8c586e6971eb5f607cf6c3577fc3519ac424c4a6acfb6344fb619cbe",
+     "argmax_last": 416
+    },
+    {
+     "start": 16,
+     "n": 1,
+     "logits_sha256": "3175443a42e72d7f89a58acb18282aa7fa66fa5d793f81219571de83eeac6784",
+     "last_sha256": "3175443a42e72d7f89a58acb18282aa7fa66fa5d793f81219571de83eeac6784",
+     "argmax_last": 446
+    },
+    {
+     "start": 17,
+     "n": 1,
+     "logits_sha256": "f49d27257dd770f72b646bcbaee464500ecd68da0471c2685d2b12c38318b30f",
+     "last_sha256": "f49d27257dd770f72b646bcbaee464500ecd68da0471c2685d2b12c38318b30f",
+     "argmax_last": 57
+    },
+    {
+     "start": 18,
+     "n": 1,
+     "logits_sha256": "7134f1682c68ff6d41e19effdd0db2be8df1fa7367cd6567a0eb3716f149133b",
+     "last_sha256": "7134f1682c68ff6d41e19effdd0db2be8df1fa7367cd6567a0eb3716f149133b",
+     "argmax_last": 133
+    },
+    {
+     "start": 19,
+     "n": 1,
+     "logits_sha256": "8c9d3de26b57cefe94d723c89ec79b2ded3f11fc1895d79c4acb2e45671f6d74",
+     "last_sha256": "8c9d3de26b57cefe94d723c89ec79b2ded3f11fc1895d79c4acb2e45671f6d74",
+     "argmax_last": 298
+    },
+    {
+     "start": 20,
+     "n": 1,
+     "logits_sha256": "6ff7d121e33728118a2b017a40b888138aa24d790010303bdd94c521572e13b3",
+     "last_sha256": "6ff7d121e33728118a2b017a40b888138aa24d790010303bdd94c521572e13b3",
+     "argmax_last": 379
+    },
+    {
+     "start": 21,
+     "n": 1,
+     "logits_sha256": "a0e109b5fd0980ae1fbb0c5ad1779dd21005de51e8a9b230b11fca236e3541d0",
+     "last_sha256": "a0e109b5fd0980ae1fbb0c5ad1779dd21005de51e8a9b230b11fca236e3541d0",
+     "argmax_last": 26
+    },
+    {
+     "start": 22,
+     "n": 1,
+     "logits_sha256": "fab47b6d1dd41b3e1d8a2c6230a284506f5dc9f893ad7cc000a8c234e419f85a",
+     "last_sha256": "fab47b6d1dd41b3e1d8a2c6230a284506f5dc9f893ad7cc000a8c234e419f85a",
+     "argmax_last": 423
+    },
+    {
+     "start": 23,
+     "n": 1,
+     "logits_sha256": "3783a519f0830219a038205de5e6a4e724895b4e84ee4c0e3d61c0227de9668e",
+     "last_sha256": "3783a519f0830219a038205de5e6a4e724895b4e84ee4c0e3d61c0227de9668e",
+     "argmax_last": 446
+    }
+   ],
+   "generated_argmax": [
+    26,
+    305,
+    211,
+    446,
+    295,
+    298,
+    182,
+    148,
+    213,
+    306,
+    507,
+    382,
+    290,
+    290,
+    254,
+    416,
+    446,
+    57,
+    133,
+    298,
+    379,
+    26,
+    423,
+    446
+   ],
+   "wall_s": 0.509
+  },
+  "c3.fp32_off": {
+   "calls": [
+    {
+     "start": 0,
+     "n": 1,
+     "logits_sha256": "eedf65f78a41caeb90349992af4ecbf449cabce9a5fc8e7ff6a0809a35c34abc",
+     "last_sha256": "eedf65f78a41caeb90349992af4ecbf449cabce9a5fc8e7ff6a0809a35c34abc",
+     "argmax_last": 26
+    },
+    {
+     "start": 1,
+     "n": 1,
+     "logits_sha256": "de4744da08a0deb31d5c34fb640fe617464ff5a17d61e17980c0f9139742b777",
+     "last_sha256": "de4744da08a0deb31d5c34fb640fe617464ff5a17d61e17980c0f9139742b777",
+     "argmax_last": 305
+    },
+    {
+     "start": 2,
+     "n": 1,
+     "logits_sha256": "1f431f38ace8756c7ad165e83c821f44e0360c2c95b206af7bab0f7a91055217",
+     "last_sha256": "1f431f38ace8756c7ad165e83c821f44e0360c2c95b206af7bab0f7a91055217",
+     "argmax_last": 211
+    },
+    {
+     "start": 3,
+     "n": 1,
+     "logits_sha256": "4c29569560c4c97480ed7f3062d34c280b88ef8e9ec64fde33cb2dc4f4dc0b8a",
+     "last_sha256": "4c29569560c4c97480ed7f3062d34c280b88ef8e9ec64fde33cb2dc4f4dc0b8a",
+     "argmax_last": 446
+    },
+    {
+     "start": 4,
+     "n": 1,
+     "logits_sha256": "92fa51d3e47f6bcc40ae1cf33bcbd96ed92b0d286c310aed2f58191108fc059d",
+     "last_sha256": "92fa51d3e47f6bcc40ae1cf33bcbd96ed92b0d286c310aed2f58191108fc059d",
+     "argmax_last": 295
+    },
+    {
+     "start": 5,
+     "n": 1,
+     "logits_sha256": "0787309bfe5eb3ff5bcb5253173c34f311b1388614e14b9f14ac3352d9a39b0c",
+     "last_sha256": "0787309bfe5eb3ff5bcb5253173c34f311b1388614e14b9f14ac3352d9a39b0c",
+     "argmax_last": 298
+    },
+    {
+     "start": 6,
+     "n": 1,
+     "logits_sha256": "862756c6f4a95e71a5a40f22141f3bc3766e7d28900436b639db16f92d7fe152",
+     "last_sha256": "862756c6f4a95e71a5a40f22141f3bc3766e7d28900436b639db16f92d7fe152",
+     "argmax_last": 182
+    },
+    {
+     "start": 7,
+     "n": 1,
+     "logits_sha256": "46b125a5ffd9876b6afaa8b5c4fc3db3e42cac9513583e7d16baf93092dc8e2c",
+     "last_sha256": "46b125a5ffd9876b6afaa8b5c4fc3db3e42cac9513583e7d16baf93092dc8e2c",
+     "argmax_last": 148
+    },
+    {
+     "start": 8,
+     "n": 1,
+     "logits_sha256": "bb5e5894b16b240833462040b3d877c17bc2097e7ab660c063e9187f62bd7435",
+     "last_sha256": "bb5e5894b16b240833462040b3d877c17bc2097e7ab660c063e9187f62bd7435",
+     "argmax_last": 213
+    },
+    {
+     "start": 9,
+     "n": 1,
+     "logits_sha256": "1eb9e8df1c7b6cf8017887fd3e36273ff5818e8bb7eae031a424e307f75906d8",
+     "last_sha256": "1eb9e8df1c7b6cf8017887fd3e36273ff5818e8bb7eae031a424e307f75906d8",
+     "argmax_last": 306
+    },
+    {
+     "start": 10,
+     "n": 1,
+     "logits_sha256": "910b1383c511e32d4288261d66321a332310c3bb6f43a8669a97ffe5ab14ae32",
+     "last_sha256": "910b1383c511e32d4288261d66321a332310c3bb6f43a8669a97ffe5ab14ae32",
+     "argmax_last": 507
+    },
+    {
+     "start": 11,
+     "n": 1,
+     "logits_sha256": "d212e04094e37bbd3f6aa30206ba68f8ff293a64ba8802327526dca98b4cc1de",
+     "last_sha256": "d212e04094e37bbd3f6aa30206ba68f8ff293a64ba8802327526dca98b4cc1de",
+     "argmax_last": 382
+    },
+    {
+     "start": 12,
+     "n": 1,
+     "logits_sha256": "6b51dafe0eb662ef46feda8ade1ac4ccfcbeb34a2f2df94abb4d014c97aa0d55",
+     "last_sha256": "6b51dafe0eb662ef46feda8ade1ac4ccfcbeb34a2f2df94abb4d014c97aa0d55",
+     "argmax_last": 29
+    },
+    {
+     "start": 13,
+     "n": 1,
+     "logits_sha256": "fa1b582a948689fd08b57e4e8195b6674363e70289c817a2bdd429ed66b158db",
+     "last_sha256": "fa1b582a948689fd08b57e4e8195b6674363e70289c817a2bdd429ed66b158db",
+     "argmax_last": 290
+    },
+    {
+     "start": 14,
+     "n": 1,
+     "logits_sha256": "8da5b43e4dc1897fbd722d9781313fb418ea9dba24551f3988c9cb4eb4714b68",
+     "last_sha256": "8da5b43e4dc1897fbd722d9781313fb418ea9dba24551f3988c9cb4eb4714b68",
+     "argmax_last": 254
+    },
+    {
+     "start": 15,
+     "n": 1,
+     "logits_sha256": "970bf6c4cc889ed2a68e7a349fa3ca6ef9499be842be8b3dc94427eef1e06933",
+     "last_sha256": "970bf6c4cc889ed2a68e7a349fa3ca6ef9499be842be8b3dc94427eef1e06933",
+     "argmax_last": 416
+    },
+    {
+     "start": 16,
+     "n": 1,
+     "logits_sha256": "5da97d63906a94cf027b3c1c99618955ce1f0825c948a51ff2360d80129363c6",
+     "last_sha256": "5da97d63906a94cf027b3c1c99618955ce1f0825c948a51ff2360d80129363c6",
+     "argmax_last": 446
+    },
+    {
+     "start": 17,
+     "n": 1,
+     "logits_sha256": "3b0cf93487b771fdcaa4820aa96064311c9fab8d2b8015b3aee5f71a425437b5",
+     "last_sha256": "3b0cf93487b771fdcaa4820aa96064311c9fab8d2b8015b3aee5f71a425437b5",
+     "argmax_last": 57
+    },
+    {
+     "start": 18,
+     "n": 1,
+     "logits_sha256": "255b6e30697138b108ddd3048d04007759246691d8aebf931b78d3d8895ab58b",
+     "last_sha256": "255b6e30697138b108ddd3048d04007759246691d8aebf931b78d3d8895ab58b",
+     "argmax_last": 133
+    },
+    {
+     "start": 19,
+     "n": 1,
+     "logits_sha256": "b08a8fa0b688e434b028e209b4b32bddec134177b473873a5ab35fffe0a10f8c",
+     "last_sha256": "b08a8fa0b688e434b028e209b4b32bddec134177b473873a5ab35fffe0a10f8c",
+     "argmax_last": 70
+    },
+    {
+     "start": 20,
+     "n": 1,
+     "logits_sha256": "906051da88a572acafdd1d99183520efe3e6557741ac513ae1c9e012eea62c82",
+     "last_sha256": "906051da88a572acafdd1d99183520efe3e6557741ac513ae1c9e012eea62c82",
+     "argmax_last": 379
+    },
+    {
+     "start": 21,
+     "n": 1,
+     "logits_sha256": "40adb41f555f42ab6e82ee21ffb60d01e8eb198cd8b6ce1061dd0231ce2bd9b5",
+     "last_sha256": "40adb41f555f42ab6e82ee21ffb60d01e8eb198cd8b6ce1061dd0231ce2bd9b5",
+     "argmax_last": 26
+    },
+    {
+     "start": 22,
+     "n": 1,
+     "logits_sha256": "3bf7cdc872bcc4e0545ae2b31a3afdb94fdd7b8614dc82695227f68282a2e93a",
+     "last_sha256": "3bf7cdc872bcc4e0545ae2b31a3afdb94fdd7b8614dc82695227f68282a2e93a",
+     "argmax_last": 423
+    },
+    {
+     "start": 23,
+     "n": 1,
+     "logits_sha256": "45a55613f29412af8279014a81e94e2f692785c579615d53dddc88438f4fb3e2",
+     "last_sha256": "45a55613f29412af8279014a81e94e2f692785c579615d53dddc88438f4fb3e2",
+     "argmax_last": 446
+    }
+   ],
+   "generated_argmax": [
+    26,
+    305,
+    211,
+    446,
+    295,
+    298,
+    182,
+    148,
+    213,
+    306,
+    507,
+    382,
+    29,
+    290,
+    254,
+    416,
+    446,
+    57,
+    133,
+    70,
+    379,
+    26,
+    423,
+    446
+   ],
+   "wall_s": 0.517
+  },
+  "c3.bf16_on": {
+   "calls": [
+    {
+     "start": 0,
+     "n": 1,
+     "logits_sha256": "dc6593d45554d9cbfc2d275ba91d7f638791c6a86f1d8d7861834f1f1ea13d10",
+     "last_sha256": "dc6593d45554d9cbfc2d275ba91d7f638791c6a86f1d8d7861834f1f1ea13d10",
+     "argmax_last": 26
+    },
+    {
+     "start": 1,
+     "n": 1,
+     "logits_sha256": "d1725f524a6b4ff656967faaa695889e519c891fe462e6b7fe2d8a8543c38f69",
+     "last_sha256": "d1725f524a6b4ff656967faaa695889e519c891fe462e6b7fe2d8a8543c38f69",
+     "argmax_last": 305
+    },
+    {
+     "start": 2,
+     "n": 1,
+     "logits_sha256": "0b35941ed5cafb8ce2864525cf1c22b2667b9a2ca03ab5e72d074f7399610335",
+     "last_sha256": "0b35941ed5cafb8ce2864525cf1c22b2667b9a2ca03ab5e72d074f7399610335",
+     "argmax_last": 211
+    },
+    {
+     "start": 3,
+     "n": 1,
+     "logits_sha256": "a29b88923f77c7dd4306fe68be76f074d78e6f9124f9b86972b243fe377433ed",
+     "last_sha256": "a29b88923f77c7dd4306fe68be76f074d78e6f9124f9b86972b243fe377433ed",
+     "argmax_last": 446
+    },
+    {
+     "start": 4,
+     "n": 1,
+     "logits_sha256": "2f0b265efd2797e416b98ad45451715fbb8b4438e462bf6a17322671cc1b6d39",
+     "last_sha256": "2f0b265efd2797e416b98ad45451715fbb8b4438e462bf6a17322671cc1b6d39",
+     "argmax_last": 295
+    },
+    {
+     "start": 5,
+     "n": 1,
+     "logits_sha256": "ca6bacb2904b4feb92d567e8fa5115ab50bb6ffc6871920605d747744b31e1d9",
+     "last_sha256": "ca6bacb2904b4feb92d567e8fa5115ab50bb6ffc6871920605d747744b31e1d9",
+     "argmax_last": 298
+    },
+    {
+     "start": 6,
+     "n": 1,
+     "logits_sha256": "4558ef414f281fe709c16fb415ccfc529f02ce1df8aecb2316abd15e7865f715",
+     "last_sha256": "4558ef414f281fe709c16fb415ccfc529f02ce1df8aecb2316abd15e7865f715",
+     "argmax_last": 182
+    },
+    {
+     "start": 7,
+     "n": 1,
+     "logits_sha256": "7cde9655c5a9f103011a40f9efed4798f1b0a24cee836c03010fdbfb0df436cf",
+     "last_sha256": "7cde9655c5a9f103011a40f9efed4798f1b0a24cee836c03010fdbfb0df436cf",
+     "argmax_last": 148
+    },
+    {
+     "start": 8,
+     "n": 1,
+     "logits_sha256": "40b2f4dfd8cdf9452ecdc23c7147f9176c9b709fec1015e738edae6968e923eb",
+     "last_sha256": "40b2f4dfd8cdf9452ecdc23c7147f9176c9b709fec1015e738edae6968e923eb",
+     "argmax_last": 213
+    },
+    {
+     "start": 9,
+     "n": 1,
+     "logits_sha256": "08a257ced5a056f0337b5f1144732c3aced30dd034e90390f621e00c962df474",
+     "last_sha256": "08a257ced5a056f0337b5f1144732c3aced30dd034e90390f621e00c962df474",
+     "argmax_last": 306
+    },
+    {
+     "start": 10,
+     "n": 1,
+     "logits_sha256": "901269c1178d04599fbd1ccf95fc4155afa31a5fcd6b7e07d984fcf84da06887",
+     "last_sha256": "901269c1178d04599fbd1ccf95fc4155afa31a5fcd6b7e07d984fcf84da06887",
+     "argmax_last": 507
+    },
+    {
+     "start": 11,
+     "n": 1,
+     "logits_sha256": "63bdb4793b6860a09072d230327eed49607c411f10a77176c4207431099c670b",
+     "last_sha256": "63bdb4793b6860a09072d230327eed49607c411f10a77176c4207431099c670b",
+     "argmax_last": 382
+    },
+    {
+     "start": 12,
+     "n": 1,
+     "logits_sha256": "c3f890287e7d9a4aaf14736a4cfd045c661226d71d0a133e8c301ba5aa0455dc",
+     "last_sha256": "c3f890287e7d9a4aaf14736a4cfd045c661226d71d0a133e8c301ba5aa0455dc",
+     "argmax_last": 290
+    },
+    {
+     "start": 13,
+     "n": 1,
+     "logits_sha256": "cdde44592c6be150803071f5c987d0083bc6300193c31937b39e7acb14d7bd62",
+     "last_sha256": "cdde44592c6be150803071f5c987d0083bc6300193c31937b39e7acb14d7bd62",
+     "argmax_last": 290
+    },
+    {
+     "start": 14,
+     "n": 1,
+     "logits_sha256": "5550740887af4dfbb7e69c0eb603ae1a85d887e8d420c08bf7d119a961a2cc1e",
+     "last_sha256": "5550740887af4dfbb7e69c0eb603ae1a85d887e8d420c08bf7d119a961a2cc1e",
+     "argmax_last": 254
+    },
+    {
+     "start": 15,
+     "n": 1,
+     "logits_sha256": "9244c73b4e40422cda82d3d8f8b5cb6b8d1c70c2144acd11d46b00f6c2082aaf",
+     "last_sha256": "9244c73b4e40422cda82d3d8f8b5cb6b8d1c70c2144acd11d46b00f6c2082aaf",
+     "argmax_last": 262
+    },
+    {
+     "start": 16,
+     "n": 1,
+     "logits_sha256": "5783754430f65c13d9c33a0a47a66e3d536cfcbf61d89fd30301d53b37f6da07",
+     "last_sha256": "5783754430f65c13d9c33a0a47a66e3d536cfcbf61d89fd30301d53b37f6da07",
+     "argmax_last": 446
+    },
+    {
+     "start": 17,
+     "n": 1,
+     "logits_sha256": "dcae15daf36d5be000692f158065f70c746c9e55f2308809a13fe658eb13dfc5",
+     "last_sha256": "dcae15daf36d5be000692f158065f70c746c9e55f2308809a13fe658eb13dfc5",
+     "argmax_last": 57
+    },
+    {
+     "start": 18,
+     "n": 1,
+     "logits_sha256": "f199c4a9141cc8c7418bba53b1baff44fbee83875a80bfa4334d312bf61939e2",
+     "last_sha256": "f199c4a9141cc8c7418bba53b1baff44fbee83875a80bfa4334d312bf61939e2",
+     "argmax_last": 133
+    },
+    {
+     "start": 19,
+     "n": 1,
+     "logits_sha256": "09fbce9ee8e0f5bd6e614b159320c8700a9a478ff0fb086d8ae68d199d89f079",
+     "last_sha256": "09fbce9ee8e0f5bd6e614b159320c8700a9a478ff0fb086d8ae68d199d89f079",
+     "argmax_last": 70
+    },
+    {
+     "start": 20,
+     "n": 1,
+     "logits_sha256": "f8916d8f8d9775e67620816fe4cd8b2562f8033e00dd62b0cbdb7b330ada1c6c",
+     "last_sha256": "f8916d8f8d9775e67620816fe4cd8b2562f8033e00dd62b0cbdb7b330ada1c6c",
+     "argmax_last": 379
+    },
+    {
+     "start": 21,
+     "n": 1,
+     "logits_sha256": "f209eb1cd7e79fba325d694b988d1f8557897bf415c31e6fba16587dcf56f51f",
+     "last_sha256": "f209eb1cd7e79fba325d694b988d1f8557897bf415c31e6fba16587dcf56f51f",
+     "argmax_last": 26
+    },
+    {
+     "start": 22,
+     "n": 1,
+     "logits_sha256": "b00488d8731d37c246810664548fb198fdfed0af0f41eaeac45538764b4e06c9",
+     "last_sha256": "b00488d8731d37c246810664548fb198fdfed0af0f41eaeac45538764b4e06c9",
+     "argmax_last": 423
+    },
+    {
+     "start": 23,
+     "n": 1,
+     "logits_sha256": "6ba69a69330a2e618e42d068fac218d5e2782600dfb65b87c9fe6e8b69990ff2",
+     "last_sha256": "6ba69a69330a2e618e42d068fac218d5e2782600dfb65b87c9fe6e8b69990ff2",
+     "argmax_last": 446
+    }
+   ],
+   "generated_argmax": [
+    26,
+    305,
+    211,
+    446,
+    295,
+    298,
+    182,
+    148,
+    213,
+    306,
+    507,
+    382,
+    290,
+    290,
+    254,
+    262,
+    446,
+    57,
+    133,
+    70,
+    379,
+    26,
+    423,
+    446
+   ],
+   "wall_s": 0.54
+  },
+  "c3.bf16_off": {
+   "calls": [
+    {
+     "start": 0,
+     "n": 1,
+     "logits_sha256": "11fdcb6671a9c75ba9de371fe4bdc66d75826240dd51b77b4ccb3c48dbcdf763",
+     "last_sha256": "11fdcb6671a9c75ba9de371fe4bdc66d75826240dd51b77b4ccb3c48dbcdf763",
+     "argmax_last": 26
+    },
+    {
+     "start": 1,
+     "n": 1,
+     "logits_sha256": "519c308064a45ec46d6b65c1ced3ceeced5e9dc706766a4cca60174fe328d70f",
+     "last_sha256": "519c308064a45ec46d6b65c1ced3ceeced5e9dc706766a4cca60174fe328d70f",
+     "argmax_last": 305
+    },
+    {
+     "start": 2,
+     "n": 1,
+     "logits_sha256": "a2f1395f2c37979c36e657d9035a109dca2cef7eee4432c6d8b6cec699cbaf52",
+     "last_sha256": "a2f1395f2c37979c36e657d9035a109dca2cef7eee4432c6d8b6cec699cbaf52",
+     "argmax_last": 211
+    },
+    {
+     "start": 3,
+     "n": 1,
+     "logits_sha256": "82fe5becceb561e9b3cf9ec73c7cff12e81f635a0dc5a14a90118635ab15b186",
+     "last_sha256": "82fe5becceb561e9b3cf9ec73c7cff12e81f635a0dc5a14a90118635ab15b186",
+     "argmax_last": 446
+    },
+    {
+     "start": 4,
+     "n": 1,
+     "logits_sha256": "af713d46f205b55672b2ac7a69249d65d5a4bcf132d950ab5ee86f4e403c13c3",
+     "last_sha256": "af713d46f205b55672b2ac7a69249d65d5a4bcf132d950ab5ee86f4e403c13c3",
+     "argmax_last": 295
+    },
+    {
+     "start": 5,
+     "n": 1,
+     "logits_sha256": "83238583417d19a9eadec04a0f5c908ad3482e21f0f093768a121773ccb58d20",
+     "last_sha256": "83238583417d19a9eadec04a0f5c908ad3482e21f0f093768a121773ccb58d20",
+     "argmax_last": 298
+    },
+    {
+     "start": 6,
+     "n": 1,
+     "logits_sha256": "15161385c10cc400163ec56bdb9550815f4fbaf7c382841d6b63df96ad79e8e5",
+     "last_sha256": "15161385c10cc400163ec56bdb9550815f4fbaf7c382841d6b63df96ad79e8e5",
+     "argmax_last": 182
+    },
+    {
+     "start": 7,
+     "n": 1,
+     "logits_sha256": "86c047722cc7b0d14825748d97545af1f91aa15ff2271e8f92b9a51bd1b787fa",
+     "last_sha256": "86c047722cc7b0d14825748d97545af1f91aa15ff2271e8f92b9a51bd1b787fa",
+     "argmax_last": 148
+    },
+    {
+     "start": 8,
+     "n": 1,
+     "logits_sha256": "bd30421d339769d4eedb7503f392fb8a4f6fbb886c543c0ed3a8a1af98236c53",
+     "last_sha256": "bd30421d339769d4eedb7503f392fb8a4f6fbb886c543c0ed3a8a1af98236c53",
+     "argmax_last": 213
+    },
+    {
+     "start": 9,
+     "n": 1,
+     "logits_sha256": "daaf94e6134f4ceff62959a6cc4eab151d9827e40bd0cdf03190c531bb1836b1",
+     "last_sha256": "daaf94e6134f4ceff62959a6cc4eab151d9827e40bd0cdf03190c531bb1836b1",
+     "argmax_last": 306
+    },
+    {
+     "start": 10,
+     "n": 1,
+     "logits_sha256": "c5f4b4f686da4a56aa966e41fdcce1b53600bc47990cdd3c97715fd34355db36",
+     "last_sha256": "c5f4b4f686da4a56aa966e41fdcce1b53600bc47990cdd3c97715fd34355db36",
+     "argmax_last": 507
+    },
+    {
+     "start": 11,
+     "n": 1,
+     "logits_sha256": "8521b71a2c127426245ff5f1cbfbcd2e9df44cca1ac7b6b9698e2bc85d5f469a",
+     "last_sha256": "8521b71a2c127426245ff5f1cbfbcd2e9df44cca1ac7b6b9698e2bc85d5f469a",
+     "argmax_last": 382
+    },
+    {
+     "start": 12,
+     "n": 1,
+     "logits_sha256": "c9d12a5a8bd4c32b0fc4488e98de565c9ecb98fb86a8fba1d7dcbcecd25b4c7a",
+     "last_sha256": "c9d12a5a8bd4c32b0fc4488e98de565c9ecb98fb86a8fba1d7dcbcecd25b4c7a",
+     "argmax_last": 29
+    },
+    {
+     "start": 13,
+     "n": 1,
+     "logits_sha256": "2550f5fb2c4ee7a3b64026a95296e5ee088cc7c11bc36ba2f8e597e4718f492e",
+     "last_sha256": "2550f5fb2c4ee7a3b64026a95296e5ee088cc7c11bc36ba2f8e597e4718f492e",
+     "argmax_last": 290
+    },
+    {
+     "start": 14,
+     "n": 1,
+     "logits_sha256": "64b24cb4eaec2d66c5f10e742c33e07c0f3eab76c5cf324739721c539ed7788c",
+     "last_sha256": "64b24cb4eaec2d66c5f10e742c33e07c0f3eab76c5cf324739721c539ed7788c",
+     "argmax_last": 254
+    },
+    {
+     "start": 15,
+     "n": 1,
+     "logits_sha256": "0d7f67ceb72398c8ba5764eb1374a4e4e5ccd994948695a9fee4aab21fe59d99",
+     "last_sha256": "0d7f67ceb72398c8ba5764eb1374a4e4e5ccd994948695a9fee4aab21fe59d99",
+     "argmax_last": 262
+    },
+    {
+     "start": 16,
+     "n": 1,
+     "logits_sha256": "2469b9f6e1335bec2380a7dd589be090e371e21c3edeeae4273a5a00ab639397",
+     "last_sha256": "2469b9f6e1335bec2380a7dd589be090e371e21c3edeeae4273a5a00ab639397",
+     "argmax_last": 446
+    },
+    {
+     "start": 17,
+     "n": 1,
+     "logits_sha256": "5db1f5e313bacb44802bb72a76758817ee5dbd0503aac14e1b91f0983b72f29f",
+     "last_sha256": "5db1f5e313bacb44802bb72a76758817ee5dbd0503aac14e1b91f0983b72f29f",
+     "argmax_last": 57
+    },
+    {
+     "start": 18,
+     "n": 1,
+     "logits_sha256": "11fdfe8ce08aec4ff96e58db09b866fe5fddda78d237416817dea57925fcfa4e",
+     "last_sha256": "11fdfe8ce08aec4ff96e58db09b866fe5fddda78d237416817dea57925fcfa4e",
+     "argmax_last": 133
+    },
+    {
+     "start": 19,
+     "n": 1,
+     "logits_sha256": "63879a7d431f88821f71063c390517afdb8491976433c1544aa97e85511fff5b",
+     "last_sha256": "63879a7d431f88821f71063c390517afdb8491976433c1544aa97e85511fff5b",
+     "argmax_last": 298
+    },
+    {
+     "start": 20,
+     "n": 1,
+     "logits_sha256": "74cd7ede40819123cd4de1301e35024f54bc3e018d1b205853cd32a8948f3764",
+     "last_sha256": "74cd7ede40819123cd4de1301e35024f54bc3e018d1b205853cd32a8948f3764",
+     "argmax_last": 379
+    },
+    {
+     "start": 21,
+     "n": 1,
+     "logits_sha256": "862d02cbc24bde593c577348bdad40c8b2c300b28bd583f07c4dc908a89907d4",
+     "last_sha256": "862d02cbc24bde593c577348bdad40c8b2c300b28bd583f07c4dc908a89907d4",
+     "argmax_last": 26
+    },
+    {
+     "start": 22,
+     "n": 1,
+     "logits_sha256": "9cd2bcbe3cb3d324ab706eac31c26c5635c0bac19b3e0eb47009e0323fae9b21",
+     "last_sha256": "9cd2bcbe3cb3d324ab706eac31c26c5635c0bac19b3e0eb47009e0323fae9b21",
+     "argmax_last": 423
+    },
+    {
+     "start": 23,
+     "n": 1,
+     "logits_sha256": "8a7d666f7bbc68175e0fba7f56403783afdf57b6a112dc72616a763ca68d711c",
+     "last_sha256": "8a7d666f7bbc68175e0fba7f56403783afdf57b6a112dc72616a763ca68d711c",
+     "argmax_last": 446
+    }
+   ],
+   "generated_argmax": [
+    26,
+    305,
+    211,
+    446,
+    295,
+    298,
+    182,
+    148,
+    213,
+    306,
+    507,
+    382,
+    29,
+    290,
+    254,
+    262,
+    446,
+    57,
+    133,
+    298,
+    379,
+    26,
+    423,
+    446
+   ],
+   "wall_s": 0.525
+  },
+  "pad.fp32_on": {
+   "calls": [
+    {
+     "start": 0,
+     "n": 24,
+     "logits_sha256": "430bd79adc884cd4d6765048d0e7578124ec98af066cf7003d0d7a9692f37101",
+     "last_sha256": "07f5c9d38fa5fea68028d4a61673c50fcb07a8b1377b2f5f985ecaa335ca6965",
+     "argmax_last": 95
+    }
+   ],
+   "generated_argmax": [
+    95
+   ],
+   "wall_s": 0.198
+  },
+  "pad.fp32_off": {
+   "calls": [
+    {
+     "start": 0,
+     "n": 24,
+     "logits_sha256": "af2bfca9d527a907ad1bcc92b35e10491c2eb3c5e965761b6469d3c4adbbc3e5",
+     "last_sha256": "0ab2950093e65122046145bf41c139ff435dd6bca8e29fa1a2948b70e13c7aff",
+     "argmax_last": 95
+    }
+   ],
+   "generated_argmax": [
+    95
+   ],
+   "wall_s": 0.194
+  },
+  "pad.bf16_on": {
+   "calls": [
+    {
+     "start": 0,
+     "n": 24,
+     "logits_sha256": "b5efe6d101da6a1ff0300e67763e9ed0513ae5ba2964bbb9c2396a9c93b6ac67",
+     "last_sha256": "6a2ba1808c65f3713c3054fb166cd7356c298a36f5269de3f60ed2cc237f38ea",
+     "argmax_last": 95
+    }
+   ],
+   "generated_argmax": [
+    95
+   ],
+   "wall_s": 0.196
+  },
+  "pad.bf16_off": {
+   "calls": [
+    {
+     "start": 0,
+     "n": 24,
+     "logits_sha256": "6f788495b43dab4eafbe6cd28f91e97ceb7b1bc6d823dd7f49b47095a0ebd076",
+     "last_sha256": "cbe5d379d6126bc3177069a3fc462f300e7c64d77fe714dc4139be7e011844ea",
+     "argmax_last": 95
+    }
+   ],
+   "generated_argmax": [
+    95
+   ],
+   "wall_s": 0.19
+  }
+ },
+ "g22_coverage": {
+  "f32_close_boundaries": {
+   "fp32_on": {
+    "near": [],
+    "worst": {
+     "ratio": 86.86011904761905,
+     "site": "indexer",
+     "layer": 7,
+     "pos": 21,
+     "m32": 0.0003261677920818329,
+     "g": 3.7550926208496094e-06
+    }
+   },
+   "fp32_off": {
+    "near": [],
+    "worst": {
+     "ratio": 497.8333333333333,
+     "site": "candidate",
+     "layer": 5,
+     "pos": 23,
+     "m32": 0.0056972503662109375,
+     "g": 1.1444091796875e-05
+    }
+   }
+  },
+  "f32_exact_ties": {
+   "fp32_on": [
+    {
+     "site": "indexer",
+     "layer": 2,
+     "pos": 9,
+     "pair": [
+      2,
+      3
+     ]
+    }
+   ],
+   "fp32_off": [
+    {
+     "site": "indexer",
+     "layer": 2,
+     "pos": 9,
+     "pair": [
+      2,
+      3
+     ]
+    },
+    {
+     "site": "indexer",
+     "layer": 2,
+     "pos": 14,
+     "pair": [
+      0,
+      2
+     ]
+    }
+   ]
+  },
+  "clamp_hits_per_layer[up<-lim,up>lim,gate>lim]": [
+   [
+    0,
+    0,
+    0
+   ],
+   [
+    0,
+    0,
+    0
+   ],
+   [
+    0,
+    0,
+    0
+   ],
+   [
+    21,
+    51,
+    61
+   ],
+   [
+    0,
+    0,
+    0
+   ],
+   [
+    0,
+    0,
+    0
+   ],
+   [
+    6,
+    14,
+    0
+   ],
+   [
+    0,
+    0,
+    0
+   ]
+  ],
+  "clamp_hit": true,
+  "biased_ne_unbiased_rows": 84,
+  "router_rows": 192,
+  "biased_frac": 0.4375,
+  "window_wrapped": true,
+  "indexer_selective_rows": {
+   "2": 15,
+   "5": 20,
+   "7": 20
+  },
+  "candidate": {
+   "rows_with_reachable_dropped": 9,
+   "shape": [
+    24,
+    24
+   ]
+  },
+  "ngram": {
+   "main": {
+    "start_blocked": 6,
+    "pad_in_lookback": 0,
+    "pad_tokens": 0,
+    "collapsed_ids": [
+     201,
+     223,
+     303,
+     306,
+     308,
+     365,
+     369,
+     374,
+     379,
+     423,
+     425,
+     466
+    ]
+   },
+   "pad": {
+    "start_blocked": 6,
+    "pad_in_lookback": 9,
+    "pad_tokens": 3,
+    "collapsed_ids": [
+     223,
+     298,
+     305,
+     306,
+     308,
+     367,
+     370,
+     371,
+     382,
+     398,
+     466,
+     495
+    ]
+   }
+  },
+  "near_ties": {
+   "c1": {
+    "by_site": {
+     "router": {
+      "boundaries": 192,
+      "near": 39,
+      "exact": 0,
+      "worst": {
+       "ratio": 0.010716623790950919,
+       "site": "router",
+       "layer": 6,
+       "call": 0,
+       "row": 13,
+       "m32": 0.000277101993560791,
+       "g": 0.012928605079650879,
+       "near": true,
+       "exact": false,
+       "pair": [
+        3,
+        0
+       ]
+      }
+     },
+     "indexer": {
+      "boundaries": 55,
+      "near": 42,
+      "exact": 1,
+      "worst": {
+       "ratio": 0.0,
+       "site": "indexer",
+       "layer": 2,
+       "call": 0,
+       "row": 9,
+       "m32": 0.0,
+       "g": 0.0,
+       "near": false,
+       "exact": true,
+       "pair": [
+        2,
+        3
+       ]
+      }
+     },
+     "candidate": {
+      "boundaries": 9,
+      "near": 8,
+      "exact": 0,
+      "worst": {
+       "ratio": 0.12065808906253196,
+       "site": "candidate",
+       "layer": 5,
+       "call": 0,
+       "row": 15,
+       "m32": 1.4063386917114258,
+       "g": 5.827784538269043,
+       "near": true,
+       "exact": false,
+       "pair": [
+        2,
+        1
+       ]
+      }
+     },
+     "argmax": {
+      "boundaries": 24,
+      "near": 8,
+      "exact": 0,
+      "worst": {
+       "ratio": 0.15525886906233893,
+       "site": "argmax",
+       "layer": -1,
+       "call": 0,
+       "row": 20,
+       "m32": 0.024847984313964844,
+       "g": 0.08002114295959473,
+       "near": true,
+       "exact": false,
+       "pair": [
+        379,
+        298
+       ]
+      }
+     }
+    },
+    "near_rows": [
+     {
+      "site": "router",
+      "layer": 0,
+      "call": 0,
+      "row": 1,
+      "m32": 0.0024725794792175293,
+      "g": 0.004014730453491211,
+      "near": true,
+      "exact": false,
+      "pair": [
+       2,
+       1
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 1,
+      "call": 0,
+      "row": 4,
+      "m32": 0.012239933013916016,
+      "g": 0.009233176708221436,
+      "near": true,
+      "exact": false,
+      "pair": [
+       11,
+       2
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 1,
+      "call": 0,
+      "row": 5,
+      "m32": 0.0015396475791931152,
+      "g": 0.003239929676055908,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       11
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 1,
+      "call": 0,
+      "row": 15,
+      "m32": 0.009841740131378174,
+      "g": 0.00794517993927002,
+      "near": true,
+      "exact": false,
+      "pair": [
+       11,
+       0
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 1,
+      "call": 0,
+      "row": 21,
+      "m32": 0.0037328004837036133,
+      "g": 0.0023190975189208984,
+      "near": true,
+      "exact": false,
+      "pair": [
+       5,
+       8
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 2,
+      "call": 0,
+      "row": 14,
+      "m32": 0.0005298256874084473,
+      "g": 0.006356954574584961,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       1
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 2,
+      "call": 0,
+      "row": 15,
+      "m32": 0.04439401626586914,
+      "g": 0.02721226215362549,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       6
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 2,
+      "call": 0,
+      "row": 17,
+      "m32": 0.010286331176757812,
+      "g": 0.007118940353393555,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       5
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 2,
+      "call": 0,
+      "row": 20,
+      "m32": 0.02261340618133545,
+      "g": 0.02019655704498291,
+      "near": true,
+      "exact": false,
+      "pair": [
+       5,
+       3
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 11,
+      "m32": 0.22949552536010742,
+      "g": 0.506757378578186,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       5
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 12,
+      "m32": 0.03188514709472656,
+      "g": 0.5823554992675781,
+      "near": true,
+      "exact": false,
+      "pair": [
+       0,
+       3
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 13,
+      "m32": 0.6245462894439697,
+      "g": 0.7330136299133301,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       2
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 14,
+      "m32": 0.057982154190540314,
+      "g": 0.1734631583094597,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       0
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 15,
+      "m32": 0.3521077632904053,
+      "g": 0.6230144500732422,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       4
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 17,
+      "m32": 0.025571346282958984,
+      "g": 0.40014004707336426,
+      "near": true,
+      "exact": false,
+      "pair": [
+       1,
+       8
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 19,
+      "m32": 0.9483294486999512,
+      "g": 0.5523762702941895,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       8
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 20,
+      "m32": 0.16219520568847656,
+      "g": 0.51377272605896,
+      "near": true,
+      "exact": false,
+      "pair": [
+       9,
+       6
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 21,
+      "m32": 0.4530940651893616,
+      "g": 0.6066635847091675,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       4
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 22,
+      "m32": 0.07225203514099121,
+      "g": 1.3209779262542725,
+      "near": true,
+      "exact": false,
+      "pair": [
+       6,
+       3
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 23,
+      "m32": 0.43254756927490234,
+      "g": 0.9411401748657227,
+      "near": true,
+      "exact": false,
+      "pair": [
+       1,
+       7
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 3,
+      "call": 0,
+      "row": 2,
+      "m32": 0.011359691619873047,
+      "g": 0.005822658538818359,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       10
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 3,
+      "call": 0,
+      "row": 6,
+      "m32": 0.004737138748168945,
+      "g": 0.0036675333976745605,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       4
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 3,
+      "call": 0,
+      "row": 15,
+      "m32": 0.009690284729003906,
+      "g": 0.01060187816619873,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       6
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 3,
+      "call": 0,
+      "row": 19,
+      "m32": 0.001490473747253418,
+      "g": 0.00851738452911377,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       4
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 3,
+      "call": 0,
+      "row": 22,
+      "m32": 0.008646368980407715,
+      "g": 0.00781482458114624,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       0
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 4,
+      "call": 0,
+      "row": 15,
+      "m32": 0.0070534348487854,
+      "g": 0.15979772806167603,
+      "near": true,
+      "exact": false,
+      "pair": [
+       2,
+       8
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 4,
+      "call": 0,
+      "row": 19,
+      "m32": 0.15820562839508057,
+      "g": 0.17248445749282837,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       0
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 2,
+      "m32": 0.0008372068405151367,
+      "g": 0.008132398128509521,
+      "near": true,
+      "exact": false,
+      "pair": [
+       6,
+       5
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 6,
+      "m32": 0.0037407875061035156,
+      "g": 0.006569862365722656,
+      "near": true,
+      "exact": false,
+      "pair": [
+       2,
+       8
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 13,
+      "m32": 0.0010225772857666016,
+      "g": 0.002294600009918213,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       4
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 15,
+      "m32": 0.23321694135665894,
+      "g": 0.12818646430969238,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       2
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 16,
+      "m32": 0.0039046406745910645,
+      "g": 0.007386505603790283,
+      "near": true,
+      "exact": false,
+      "pair": [
+       11,
+       6
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 19,
+      "m32": 0.03900134563446045,
+      "g": 0.036758244037628174,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       5
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 20,
+      "m32": 0.0020152926445007324,
+      "g": 0.01724010705947876,
+      "near": true,
+      "exact": false,
+      "pair": [
+       8,
+       5
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 23,
+      "m32": 0.004607021808624268,
+      "g": 0.015602588653564453,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       4
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 0,
+      "row": 8,
+      "m32": 0.5802516937255859,
+      "g": 0.3980412483215332,
+      "near": true,
+      "exact": false,
+      "pair": [
+       0,
+       8
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 0,
+      "row": 10,
+      "m32": 0.3453025817871094,
+      "g": 0.5163164138793945,
+      "near": true,
+      "exact": false,
+      "pair": [
+       5,
+       9
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 0,
+      "row": 11,
+      "m32": 0.022273778915405273,
+      "g": 0.753894567489624,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       2
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 0,
+      "row": 12,
+      "m32": 0.1364274024963379,
+      "g": 0.15551471710205078,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       0
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 0,
+      "row": 13,
+      "m32": 0.35938215255737305,
+      "g": 0.5609226226806641,
+      "near": true,
+      "exact": false,
+      "pair": [
+       9,
+       5
+      ]
+     }
+    ]
+   },
+   "c2": {
+    "by_site": {
+     "router": {
+      "boundaries": 192,
+      "near": 41,
+      "exact": 0,
+      "worst": {
+       "ratio": 0.010714318644942971,
+       "site": "router",
+       "layer": 6,
+       "call": 2,
+       "row": 0,
+       "m32": 0.0002770423889160156,
+       "g": 0.012928605079650879,
+       "near": true,
+       "exact": false,
+       "pair": [
+        3,
+        0
+       ]
+      }
+     },
+     "indexer": {
+      "boundaries": 55,
+      "near": 42,
+      "exact": 1,
+      "worst": {
+       "ratio": 0.0,
+       "site": "indexer",
+       "layer": 2,
+       "call": 0,
+       "row": 9,
+       "m32": 0.0,
+       "g": 0.0,
+       "near": false,
+       "exact": true,
+       "pair": [
+        2,
+        3
+       ]
+      }
+     },
+     "argmax": {
+      "boundaries": 24,
+      "near": 9,
+      "exact": 0,
+      "worst": {
+       "ratio": 0.16709047129733295,
+       "site": "argmax",
+       "layer": -1,
+       "call": 1,
+       "row": 0,
+       "m32": 0.02597522735595703,
+       "g": 0.0777280330657959,
+       "near": true,
+       "exact": false,
+       "pair": [
+        290,
+        29
+       ]
+      }
+     },
+     "candidate": {
+      "boundaries": 9,
+      "near": 8,
+      "exact": 0,
+      "worst": {
+       "ratio": 0.12065798749639169,
+       "site": "candidate",
+       "layer": 5,
+       "call": 4,
+       "row": 0,
+       "m32": 1.4063377380371094,
+       "g": 5.827785491943359,
+       "near": true,
+       "exact": false,
+       "pair": [
+        2,
+        1
+       ]
+      }
+     }
+    },
+    "near_rows": [
+     {
+      "site": "router",
+      "layer": 0,
+      "call": 0,
+      "row": 1,
+      "m32": 0.0024725794792175293,
+      "g": 0.004014730453491211,
+      "near": true,
+      "exact": false,
+      "pair": [
+       2,
+       1
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 1,
+      "call": 0,
+      "row": 4,
+      "m32": 0.01223987340927124,
+      "g": 0.00923311710357666,
+      "near": true,
+      "exact": false,
+      "pair": [
+       11,
+       2
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 1,
+      "call": 0,
+      "row": 5,
+      "m32": 0.0015395879745483398,
+      "g": 0.003239929676055908,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       11
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 11,
+      "m32": 0.22949552536010742,
+      "g": 0.5067574977874756,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       5
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 3,
+      "call": 0,
+      "row": 2,
+      "m32": 0.011359751224517822,
+      "g": 0.005822658538818359,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       10
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 3,
+      "call": 0,
+      "row": 6,
+      "m32": 0.004737257957458496,
+      "g": 0.0036674141883850098,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       4
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 2,
+      "m32": 0.0008371472358703613,
+      "g": 0.008132398128509521,
+      "near": true,
+      "exact": false,
+      "pair": [
+       6,
+       5
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 6,
+      "m32": 0.003740847110748291,
+      "g": 0.006569802761077881,
+      "near": true,
+      "exact": false,
+      "pair": [
+       2,
+       8
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 0,
+      "row": 8,
+      "m32": 0.580251932144165,
+      "g": 0.3980417251586914,
+      "near": true,
+      "exact": false,
+      "pair": [
+       0,
+       8
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 0,
+      "row": 10,
+      "m32": 0.34530210494995117,
+      "g": 0.5163149833679199,
+      "near": true,
+      "exact": false,
+      "pair": [
+       5,
+       9
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 0,
+      "row": 11,
+      "m32": 0.02227306365966797,
+      "g": 0.7538948059082031,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       2
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 6,
+      "call": 0,
+      "row": 6,
+      "m32": 0.00032699108123779297,
+      "g": 0.008798420429229736,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       10
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 7,
+      "call": 0,
+      "row": 0,
+      "m32": 0.001030266284942627,
+      "g": 0.0036146044731140137,
+      "near": true,
+      "exact": false,
+      "pair": [
+       5,
+       4
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 7,
+      "call": 0,
+      "row": 3,
+      "m32": 0.016897201538085938,
+      "g": 0.02174931764602661,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       0
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 7,
+      "call": 0,
+      "row": 4,
+      "m32": 0.00289994478225708,
+      "g": 0.022147297859191895,
+      "near": true,
+      "exact": false,
+      "pair": [
+       5,
+       9
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 7,
+      "call": 0,
+      "row": 11,
+      "m32": 0.017833352088928223,
+      "g": 0.02997976541519165,
+      "near": true,
+      "exact": false,
+      "pair": [
+       5,
+       9
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 7,
+      "call": 0,
+      "row": 5,
+      "m32": 0.2626769542694092,
+      "g": 0.33405494689941406,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       1
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 7,
+      "call": 0,
+      "row": 6,
+      "m32": 0.20972633361816406,
+      "g": 0.18395185470581055,
+      "near": true,
+      "exact": false,
+      "pair": [
+       6,
+       3
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 7,
+      "call": 0,
+      "row": 7,
+      "m32": 0.029048800468444824,
+      "g": 0.27341657876968384,
+      "near": true,
+      "exact": false,
+      "pair": [
+       2,
+       1
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 7,
+      "call": 0,
+      "row": 8,
+      "m32": 0.15304207801818848,
+      "g": 0.29889893531799316,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       8
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 7,
+      "call": 0,
+      "row": 11,
+      "m32": 0.09213709831237793,
+      "g": 0.07155537605285645,
+      "near": true,
+      "exact": false,
+      "pair": [
+       8,
+       2
+      ]
+     },
+     {
+      "site": "argmax",
+      "layer": -1,
+      "call": 0,
+      "row": 0,
+      "m32": 0.08166193962097168,
+      "g": 0.04500150680541992,
+      "near": true,
+      "exact": false,
+      "pair": [
+       26,
+       492
+      ]
+     },
+     {
+      "site": "argmax",
+      "layer": -1,
+      "call": 0,
+      "row": 2,
+      "m32": 0.13057279586791992,
+      "g": 0.07289242744445801,
+      "near": true,
+      "exact": false,
+      "pair": [
+       211,
+       185
+      ]
+     },
+     {
+      "site": "argmax",
+      "layer": -1,
+      "call": 0,
+      "row": 6,
+      "m32": 0.09519314765930176,
+      "g": 0.05011296272277832,
+      "near": true,
+      "exact": false,
+      "pair": [
+       182,
+       305
+      ]
+     },
+     {
+      "site": "argmax",
+      "layer": -1,
+      "call": 0,
+      "row": 7,
+      "m32": 0.10675740242004395,
+      "g": 0.08705306053161621,
+      "near": true,
+      "exact": false,
+      "pair": [
+       148,
+       446
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 1,
+      "row": 0,
+      "m32": 0.03188610076904297,
+      "g": 0.5823554992675781,
+      "near": true,
+      "exact": false,
+      "pair": [
+       0,
+       3
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 1,
+      "row": 0,
+      "m32": 0.1364269256591797,
+      "g": 0.15551424026489258,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       0
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 7,
+      "call": 1,
+      "row": 0,
+      "m32": 0.010967731475830078,
+      "g": 0.010625898838043213,
+      "near": true,
+      "exact": false,
+      "pair": [
+       8,
+       5
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 7,
+      "call": 1,
+      "row": 0,
+      "m32": 0.11195719242095947,
+      "g": 0.11577630043029785,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       1
+      ]
+     },
+     {
+      "site": "argmax",
+      "layer": -1,
+      "call": 1,
+      "row": 0,
+      "m32": 0.02597522735595703,
+      "g": 0.0777280330657959,
+      "near": true,
+      "exact": false,
+      "pair": [
+       290,
+       29
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 2,
+      "row": 0,
+      "m32": 0.6245462894439697,
+      "g": 0.7330136299133301,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       2
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 2,
+      "row": 0,
+      "m32": 0.0010222196578979492,
+      "g": 0.0022943615913391113,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       4
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 2,
+      "row": 0,
+      "m32": 0.35938262939453125,
+      "g": 0.5609216690063477,
+      "near": true,
+      "exact": false,
+      "pair": [
+       9,
+       5
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 6,
+      "call": 2,
+      "row": 0,
+      "m32": 0.0002770423889160156,
+      "g": 0.012928605079650879,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       0
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 7,
+      "call": 2,
+      "row": 0,
+      "m32": 0.08708131313323975,
+      "g": 0.3864477872848511,
+      "near": true,
+      "exact": false,
+      "pair": [
+       10,
+       11
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 2,
+      "call": 3,
+      "row": 0,
+      "m32": 0.000529944896697998,
+      "g": 0.006357073783874512,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       1
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 3,
+      "row": 0,
+      "m32": 0.05798215791583061,
+      "g": 0.1734631545841694,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       0
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 3,
+      "row": 0,
+      "m32": 0.12897157669067383,
+      "g": 0.18938350677490234,
+      "near": true,
+      "exact": false,
+      "pair": [
+       0,
+       4
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 7,
+      "call": 3,
+      "row": 0,
+      "m32": 0.015226364135742188,
+      "g": 0.02514481544494629,
+      "near": true,
+      "exact": false,
+      "pair": [
+       0,
+       7
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 7,
+      "call": 3,
+      "row": 0,
+      "m32": 0.04196922481060028,
+      "g": 0.11554145812988281,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       4
+      ]
+     }
+    ]
+   },
+   "c3": {
+    "by_site": {
+     "router": {
+      "boundaries": 192,
+      "near": 42,
+      "exact": 0,
+      "worst": {
+       "ratio": 0.018949462663687806,
+       "site": "router",
+       "layer": 6,
+       "call": 13,
+       "row": 0,
+       "m32": 0.0002770423889160156,
+       "g": 0.007310032844543457,
+       "near": true,
+       "exact": false,
+       "pair": [
+        3,
+        0
+       ]
+      }
+     },
+     "argmax": {
+      "boundaries": 24,
+      "near": 8,
+      "exact": 0,
+      "worst": {
+       "ratio": 0.17142111896925985,
+       "site": "argmax",
+       "layer": -1,
+       "call": 15,
+       "row": 0,
+       "m32": 0.23346567153930664,
+       "g": 0.6809711456298828,
+       "near": true,
+       "exact": false,
+       "pair": [
+        416,
+        384
+       ]
+      }
+     },
+     "indexer": {
+      "boundaries": 55,
+      "near": 43,
+      "exact": 1,
+      "worst": {
+       "ratio": 0.0,
+       "site": "indexer",
+       "layer": 2,
+       "call": 9,
+       "row": 0,
+       "m32": 0.0,
+       "g": 0.0,
+       "near": false,
+       "exact": true,
+       "pair": [
+        2,
+        3
+       ]
+      }
+     },
+     "candidate": {
+      "boundaries": 9,
+      "near": 9,
+      "exact": 0,
+      "worst": {
+       "ratio": 0.10792602563434495,
+       "site": "candidate",
+       "layer": 5,
+       "call": 15,
+       "row": 0,
+       "m32": 1.4063377380371094,
+       "g": 6.515285491943359,
+       "near": true,
+       "exact": false,
+       "pair": [
+        2,
+        1
+       ]
+      }
+     }
+    },
+    "near_rows": [
+     {
+      "site": "router",
+      "layer": 7,
+      "call": 0,
+      "row": 0,
+      "m32": 0.0010305047035217285,
+      "g": 0.0036147236824035645,
+      "near": true,
+      "exact": false,
+      "pair": [
+       5,
+       4
+      ]
+     },
+     {
+      "site": "argmax",
+      "layer": -1,
+      "call": 0,
+      "row": 0,
+      "m32": 0.08166193962097168,
+      "g": 0.045001983642578125,
+      "near": true,
+      "exact": false,
+      "pair": [
+       26,
+       492
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 0,
+      "call": 1,
+      "row": 0,
+      "m32": 0.002472400665283203,
+      "g": 0.004014730453491211,
+      "near": true,
+      "exact": false,
+      "pair": [
+       2,
+       1
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 3,
+      "call": 2,
+      "row": 0,
+      "m32": 0.011359572410583496,
+      "g": 0.0062999725341796875,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       10
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 2,
+      "row": 0,
+      "m32": 0.0008373260498046875,
+      "g": 0.008688688278198242,
+      "near": true,
+      "exact": false,
+      "pair": [
+       6,
+       5
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 7,
+      "call": 2,
+      "row": 0,
+      "m32": 0.03348064422607422,
+      "g": 0.017868518829345703,
+      "near": true,
+      "exact": false,
+      "pair": [
+       11,
+       0
+      ]
+     },
+     {
+      "site": "argmax",
+      "layer": -1,
+      "call": 2,
+      "row": 0,
+      "m32": 0.13057374954223633,
+      "g": 0.08655643463134766,
+      "near": true,
+      "exact": false,
+      "pair": [
+       211,
+       185
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 7,
+      "call": 3,
+      "row": 0,
+      "m32": 0.01689755916595459,
+      "g": 0.016837894916534424,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       0
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 1,
+      "call": 4,
+      "row": 0,
+      "m32": 0.012239813804626465,
+      "g": 0.009233176708221436,
+      "near": true,
+      "exact": false,
+      "pair": [
+       11,
+       2
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 7,
+      "call": 4,
+      "row": 0,
+      "m32": 0.002899765968322754,
+      "g": 0.018413662910461426,
+      "near": true,
+      "exact": false,
+      "pair": [
+       5,
+       9
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 1,
+      "call": 5,
+      "row": 0,
+      "m32": 0.0015394091606140137,
+      "g": 0.0032399892807006836,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       11
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 7,
+      "call": 5,
+      "row": 0,
+      "m32": 0.26267576217651367,
+      "g": 0.3496720790863037,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       1
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 3,
+      "call": 6,
+      "row": 0,
+      "m32": 0.00473707914352417,
+      "g": 0.0032349228858947754,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       4
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 6,
+      "row": 0,
+      "m32": 0.0037407875061035156,
+      "g": 0.008362293243408203,
+      "near": true,
+      "exact": false,
+      "pair": [
+       2,
+       8
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 6,
+      "call": 6,
+      "row": 0,
+      "m32": 0.0003274679183959961,
+      "g": 0.007537901401519775,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       10
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 7,
+      "call": 6,
+      "row": 0,
+      "m32": 0.20972609519958496,
+      "g": 0.16832518577575684,
+      "near": true,
+      "exact": false,
+      "pair": [
+       6,
+       3
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 7,
+      "call": 7,
+      "row": 0,
+      "m32": 0.029048800468444824,
+      "g": 0.28343015909194946,
+      "near": true,
+      "exact": false,
+      "pair": [
+       2,
+       1
+      ]
+     },
+     {
+      "site": "argmax",
+      "layer": -1,
+      "call": 7,
+      "row": 0,
+      "m32": 0.10675621032714844,
+      "g": 0.10905313491821289,
+      "near": true,
+      "exact": false,
+      "pair": [
+       148,
+       446
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 8,
+      "row": 0,
+      "m32": 0.5802516937255859,
+      "g": 0.483978271484375,
+      "near": true,
+      "exact": false,
+      "pair": [
+       0,
+       8
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 7,
+      "call": 8,
+      "row": 0,
+      "m32": 0.15304183959960938,
+      "g": 0.23319244384765625,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       8
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 9,
+      "row": 0,
+      "m32": 0.24148547649383545,
+      "g": 0.1676955223083496,
+      "near": true,
+      "exact": false,
+      "pair": [
+       0,
+       5
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 10,
+      "row": 0,
+      "m32": 0.34530162811279297,
+      "g": 0.5475664138793945,
+      "near": true,
+      "exact": false,
+      "pair": [
+       5,
+       9
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 7,
+      "call": 10,
+      "row": 0,
+      "m32": 0.9003386497497559,
+      "g": 0.6778774261474609,
+      "near": true,
+      "exact": false,
+      "pair": [
+       5,
+       9
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 11,
+      "row": 0,
+      "m32": 0.22949540615081787,
+      "g": 0.5067576169967651,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       5
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 11,
+      "row": 0,
+      "m32": 0.022273778915405273,
+      "g": 0.7226464748382568,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       2
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 7,
+      "call": 11,
+      "row": 0,
+      "m32": 0.017833292484283447,
+      "g": 0.02580249309539795,
+      "near": true,
+      "exact": false,
+      "pair": [
+       5,
+       9
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 7,
+      "call": 11,
+      "row": 0,
+      "m32": 0.09213697910308838,
+      "g": 0.0949941873550415,
+      "near": true,
+      "exact": false,
+      "pair": [
+       8,
+       2
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 12,
+      "row": 0,
+      "m32": 0.03188610076904297,
+      "g": 0.5823554992675781,
+      "near": true,
+      "exact": false,
+      "pair": [
+       0,
+       3
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 12,
+      "row": 0,
+      "m32": 0.1364269256591797,
+      "g": 0.12426424026489258,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       0
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 7,
+      "call": 12,
+      "row": 0,
+      "m32": 0.010967731475830078,
+      "g": 0.009815812110900879,
+      "near": true,
+      "exact": false,
+      "pair": [
+       8,
+       5
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 7,
+      "call": 12,
+      "row": 0,
+      "m32": 0.11195719242095947,
+      "g": 0.10015130043029785,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       1
+      ]
+     },
+     {
+      "site": "argmax",
+      "layer": -1,
+      "call": 12,
+      "row": 0,
+      "m32": 0.02597522735595703,
+      "g": 0.06528639793395996,
+      "near": true,
+      "exact": false,
+      "pair": [
+       290,
+       29
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 13,
+      "row": 0,
+      "m32": 0.6245462894439697,
+      "g": 0.7330136299133301,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       2
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 13,
+      "row": 0,
+      "m32": 0.0010222196578979492,
+      "g": 0.0038451552391052246,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       4
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 13,
+      "row": 0,
+      "m32": 0.35938262939453125,
+      "g": 0.45154666900634766,
+      "near": true,
+      "exact": false,
+      "pair": [
+       9,
+       5
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 6,
+      "call": 13,
+      "row": 0,
+      "m32": 0.0002770423889160156,
+      "g": 0.007310032844543457,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       0
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 7,
+      "call": 13,
+      "row": 0,
+      "m32": 0.08708131313323975,
+      "g": 0.3786352872848511,
+      "near": true,
+      "exact": false,
+      "pair": [
+       10,
+       11
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 2,
+      "call": 14,
+      "row": 0,
+      "m32": 0.000529944896697998,
+      "g": 0.006357073783874512,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       1
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 14,
+      "row": 0,
+      "m32": 0.05798215791583061,
+      "g": 0.1734631545841694,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       0
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 5,
+      "call": 14,
+      "row": 0,
+      "m32": 0.12897157669067383,
+      "g": 0.18938350677490234,
+      "near": true,
+      "exact": false,
+      "pair": [
+       0,
+       4
+      ]
+     }
+    ]
+   },
+   "pad": {
+    "by_site": {
+     "router": {
+      "boundaries": 192,
+      "near": 49,
+      "exact": 0,
+      "worst": {
+       "ratio": 0.021249087610141753,
+       "site": "router",
+       "layer": 7,
+       "call": 0,
+       "row": 19,
+       "m32": 0.0020787715911865234,
+       "g": 0.04891437292098999,
+       "near": true,
+       "exact": false,
+       "pair": [
+        6,
+        0
+       ]
+      }
+     },
+     "indexer": {
+      "boundaries": 55,
+      "near": 37,
+      "exact": 1,
+      "worst": {
+       "ratio": 0.0,
+       "site": "indexer",
+       "layer": 2,
+       "call": 0,
+       "row": 12,
+       "m32": 0.0,
+       "g": 0.0,
+       "near": false,
+       "exact": true,
+       "pair": [
+        0,
+        3
+       ]
+      }
+     },
+     "candidate": {
+      "boundaries": 9,
+      "near": 7,
+      "exact": 0,
+      "worst": {
+       "ratio": 0.010409203719369845,
+       "site": "candidate",
+       "layer": 5,
+       "call": 0,
+       "row": 16,
+       "m32": 0.0984048843383789,
+       "g": 4.726820945739746,
+       "near": true,
+       "exact": false,
+       "pair": [
+        0,
+        1
+       ]
+      }
+     },
+     "argmax": {
+      "boundaries": 24,
+      "near": 9,
+      "exact": 0,
+      "worst": {
+       "ratio": 0.01814611849083287,
+       "site": "argmax",
+       "layer": -1,
+       "call": 0,
+       "row": 3,
+       "m32": 0.0034263134002685547,
+       "g": 0.09440898895263672,
+       "near": true,
+       "exact": false,
+       "pair": [
+        492,
+        133
+       ]
+      }
+     }
+    },
+    "near_rows": [
+     {
+      "site": "router",
+      "layer": 1,
+      "call": 0,
+      "row": 8,
+      "m32": 0.008638143539428711,
+      "g": 0.0046111345291137695,
+      "near": true,
+      "exact": false,
+      "pair": [
+       5,
+       9
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 1,
+      "call": 0,
+      "row": 10,
+      "m32": 0.005115211009979248,
+      "g": 0.00799548625946045,
+      "near": true,
+      "exact": false,
+      "pair": [
+       1,
+       0
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 1,
+      "call": 0,
+      "row": 14,
+      "m32": 0.009544134140014648,
+      "g": 0.005515694618225098,
+      "near": true,
+      "exact": false,
+      "pair": [
+       5,
+       0
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 1,
+      "call": 0,
+      "row": 21,
+      "m32": 0.002122163772583008,
+      "g": 0.0026099085807800293,
+      "near": true,
+      "exact": false,
+      "pair": [
+       11,
+       2
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 2,
+      "call": 0,
+      "row": 1,
+      "m32": 0.011695563793182373,
+      "g": 0.008353471755981445,
+      "near": true,
+      "exact": false,
+      "pair": [
+       10,
+       9
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 2,
+      "call": 0,
+      "row": 10,
+      "m32": 0.0024077296257019043,
+      "g": 0.041935622692108154,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       9
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 2,
+      "call": 0,
+      "row": 14,
+      "m32": 0.0003135204315185547,
+      "g": 0.0020249485969543457,
+      "near": true,
+      "exact": false,
+      "pair": [
+       2,
+       5
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 2,
+      "call": 0,
+      "row": 15,
+      "m32": 0.0030688047409057617,
+      "g": 0.013662457466125488,
+      "near": true,
+      "exact": false,
+      "pair": [
+       2,
+       3
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 2,
+      "call": 0,
+      "row": 21,
+      "m32": 0.04369097948074341,
+      "g": 0.04515427350997925,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       1
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 2,
+      "call": 0,
+      "row": 22,
+      "m32": 0.0011413097381591797,
+      "g": 0.0045432448387146,
+      "near": true,
+      "exact": false,
+      "pair": [
+       5,
+       2
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 15,
+      "m32": 0.3728938102722168,
+      "g": 1.1259751319885254,
+      "near": true,
+      "exact": false,
+      "pair": [
+       6,
+       2
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 16,
+      "m32": 0.9891886711120605,
+      "g": 0.7547721862792969,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       1
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 18,
+      "m32": 0.36237049102783203,
+      "g": 1.138448715209961,
+      "near": true,
+      "exact": false,
+      "pair": [
+       1,
+       4
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 19,
+      "m32": 0.001163482666015625,
+      "g": 0.7355384826660156,
+      "near": true,
+      "exact": false,
+      "pair": [
+       6,
+       4
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 20,
+      "m32": 1.6484923362731934,
+      "g": 1.0916173458099365,
+      "near": true,
+      "exact": false,
+      "pair": [
+       8,
+       6
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 21,
+      "m32": 1.7908339500427246,
+      "g": 1.7995715141296387,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       1
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 22,
+      "m32": 0.35779762268066406,
+      "g": 0.3019838333129883,
+      "near": true,
+      "exact": false,
+      "pair": [
+       8,
+       2
+      ]
+     },
+     {
+      "site": "indexer",
+      "layer": 2,
+      "call": 0,
+      "row": 23,
+      "m32": 0.39077138900756836,
+      "g": 1.4635753631591797,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       4
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 3,
+      "call": 0,
+      "row": 1,
+      "m32": 0.015868425369262695,
+      "g": 0.02251654863357544,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       4
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 3,
+      "call": 0,
+      "row": 4,
+      "m32": 0.010206401348114014,
+      "g": 0.0066138505935668945,
+      "near": true,
+      "exact": false,
+      "pair": [
+       0,
+       7
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 3,
+      "call": 0,
+      "row": 5,
+      "m32": 0.00895237922668457,
+      "g": 0.009309887886047363,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       10
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 3,
+      "call": 0,
+      "row": 11,
+      "m32": 0.003261744976043701,
+      "g": 0.013126552104949951,
+      "near": true,
+      "exact": false,
+      "pair": [
+       10,
+       9
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 3,
+      "call": 0,
+      "row": 16,
+      "m32": 0.014637410640716553,
+      "g": 0.011890709400177002,
+      "near": true,
+      "exact": false,
+      "pair": [
+       9,
+       10
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 4,
+      "call": 0,
+      "row": 1,
+      "m32": 0.006131172180175781,
+      "g": 0.0033333897590637207,
+      "near": true,
+      "exact": false,
+      "pair": [
+       10,
+       4
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 4,
+      "call": 0,
+      "row": 2,
+      "m32": 0.006064713001251221,
+      "g": 0.01894587278366089,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       8
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 4,
+      "call": 0,
+      "row": 5,
+      "m32": 0.0017242431640625,
+      "g": 0.014973580837249756,
+      "near": true,
+      "exact": false,
+      "pair": [
+       0,
+       2
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 4,
+      "call": 0,
+      "row": 8,
+      "m32": 0.0014886260032653809,
+      "g": 0.0029671788215637207,
+      "near": true,
+      "exact": false,
+      "pair": [
+       2,
+       8
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 4,
+      "call": 0,
+      "row": 10,
+      "m32": 0.007950365543365479,
+      "g": 0.03609102964401245,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       5
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 4,
+      "call": 0,
+      "row": 14,
+      "m32": 0.022284090518951416,
+      "g": 0.011971831321716309,
+      "near": true,
+      "exact": false,
+      "pair": [
+       1,
+       10
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 4,
+      "call": 0,
+      "row": 16,
+      "m32": 0.06476324796676636,
+      "g": 0.16120046377182007,
+      "near": true,
+      "exact": false,
+      "pair": [
+       1,
+       2
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 4,
+      "call": 0,
+      "row": 17,
+      "m32": 0.0028887391090393066,
+      "g": 0.0024181008338928223,
+      "near": true,
+      "exact": false,
+      "pair": [
+       11,
+       10
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 4,
+      "call": 0,
+      "row": 20,
+      "m32": 0.004782974720001221,
+      "g": 0.004788219928741455,
+      "near": true,
+      "exact": false,
+      "pair": [
+       10,
+       1
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 2,
+      "m32": 0.008853495121002197,
+      "g": 0.006652474403381348,
+      "near": true,
+      "exact": false,
+      "pair": [
+       7,
+       8
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 3,
+      "m32": 0.012797653675079346,
+      "g": 0.008625149726867676,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       11
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 9,
+      "m32": 0.001980602741241455,
+      "g": 0.0050506591796875,
+      "near": true,
+      "exact": false,
+      "pair": [
+       5,
+       9
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 10,
+      "m32": 0.005911767482757568,
+      "g": 0.03174090385437012,
+      "near": true,
+      "exact": false,
+      "pair": [
+       9,
+       5
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 16,
+      "m32": 0.02488839626312256,
+      "g": 0.17916566133499146,
+      "near": true,
+      "exact": false,
+      "pair": [
+       6,
+       5
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 17,
+      "m32": 0.0143510103225708,
+      "g": 0.011716485023498535,
+      "near": true,
+      "exact": false,
+      "pair": [
+       4,
+       0
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 19,
+      "m32": 0.019376695156097412,
+      "g": 0.014120519161224365,
+      "near": true,
+      "exact": false,
+      "pair": [
+       3,
+       11
+      ]
+     },
+     {
+      "site": "router",
+      "layer": 5,
+      "call": 0,
+      "row": 21,
+      "m32": 0.03943765163421631,
+      "g": 0.02444911003112793,
+      "near": true,
+      "exact": false,
+      "pair": [
+       10,
+       3
+      ]
+     }
+    ]
+   }
+  },
+  "checks": {
+   "clamp_hit": true,
+   "biased_ne_unbiased>=20%": true,
+   "window_wrapped": true,
+   "topk_selective": true,
+   "candidate_mask_not_all_true": true,
+   "start_blocked>=1": true,
+   "pad_blocked>=1": true,
+   "no_f32_near_ties(m32>=10g_split)": true
+  }
+ },
+ "g23_mapping": {
+  "ok": true,
+  "names_only_release": [],
+  "names_only_gguf": [],
+  "tensors_bitwise": 476,
+  "tensors_total": 476,
+  "tensors_differ": [],
+  "engram_gate_product_bitwise": {
+   "layers.1.engram.q_weight": true,
+   "layers.2.engram.q_weight": true
+  },
+  "engram_tables_bitwise": {
+   "layers.1.engram.embed.weight": true,
+   "layers.2.engram.embed.weight": true
+  },
+  "config_diff": {},
+  "token_map_equal": true,
+  "multipliers_equal": true,
+  "gguf": {
+   "gguf_types": {
+    "MXFP4": 24,
+    "MXFP8": 1,
+    "F32": 198
+   },
+   "engram_gate_layers": [
+    1,
+    2
+   ],
+   "n_tensors": 223
+  },
+  "g23_logits": {
+   "c1.fp32_on": {
+    "equal": true,
+    "n_calls": 1,
+    "sha_last": "d4d8508c5df43af08e5a5289cd541c3615f6c850abc80e2369a44541a92dc2d8"
+   },
+   "c2.fp32_on": {
+    "equal": true,
+    "n_calls": 13,
+    "sha_last": "6080387c7afe4b82e687442bd8ff2e22955d77be4be787059f6b6bd9d60b4a98"
+   },
+   "c1.fp32_off": {
+    "equal": true,
+    "n_calls": 1,
+    "sha_last": "7682c61d62aee8186061b7f0e65c2de6a53dee4a822a42b47c299d30b080207d"
+   },
+   "c2.fp32_off": {
+    "equal": true,
+    "n_calls": 13,
+    "sha_last": "778bb53cfae63fb5b3a8078ff89080cfff66e5778a60108e602b7fc83bacca1a"
+   },
+   "c1.bf16_on": {
+    "equal": true,
+    "n_calls": 1,
+    "sha_last": "28e7473913a8bc7bd1ac8f9afe4c00af509db08fc7ffc79783fef7f12d786784"
+   },
+   "c2.bf16_on": {
+    "equal": true,
+    "n_calls": 13,
+    "sha_last": "bf52962b0ccd114e81117be8e8b6b4d841dba6f06b810c1ed5f3c379e0c9a881"
+   }
+  }
+ },
+ "g25_sites": {
+  "kv": {
+   "max_dlogit": 2.253420114517212,
+   "pass_logits": true
+  },
+  "latent": {
+   "max_dlogit": 0.19562482833862305,
+   "pass_logits": true
+  },
+  "idx_q": {
+   "max_dlogit": 1.6955418586730957,
+   "pass_logits": true,
+   "index_score_max_d": {
+    "2": 2.907602071762085,
+    "5": 2.682345390319824,
+    "7": 7.301100254058838
+   },
+   "pass_index_score": true
+  },
+  "idx_k": {
+   "max_dlogit": 0.2589860260486603,
+   "pass_logits": true,
+   "index_score_max_d": {
+    "2": 2.547496795654297,
+    "5": 2.0373401641845703,
+    "7": 1.2688008546829224
+   },
+   "pass_index_score": true
+  },
+  "o": {
+   "max_dlogit": 1.3410613536834717,
+   "pass_logits": true
+  }
+ },
+ "npz_index": {
+  "c1.fp32_on.logits": [
+   "float32",
+   [
+    24,
+    512
+   ]
+  ],
+  "c1.fp32_on.router_idx": [
+   "int32",
+   [
+    8,
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_on.hash_ids": [
+   "int32",
+   [
+    24,
+    2,
+    6
+   ]
+  ],
+  "c1.fp32_on.L0.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_on.L0.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    8
+   ]
+  ],
+  "c1.fp32_on.L0.out": [
+   "float32",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.fp32_on.L1.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_on.L1.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    8
+   ]
+  ],
+  "c1.fp32_on.L1.out": [
+   "float32",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.fp32_on.L2.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_on.L2.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.fp32_on.L2.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "c1.fp32_on.L2.out": [
+   "float32",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.fp32_on.L3.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_on.L3.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.fp32_on.L3.out": [
+   "float32",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.fp32_on.L4.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_on.L4.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.fp32_on.L4.out": [
+   "float32",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.fp32_on.L5.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_on.L5.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.fp32_on.L5.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "c1.fp32_on.L5.cand_mask": [
+   "bool",
+   [
+    24,
+    24
+   ]
+  ],
+  "c1.fp32_on.L5.out": [
+   "float32",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.fp32_on.L6.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_on.L6.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.fp32_on.L6.out": [
+   "float32",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.fp32_on.L7.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_on.L7.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.fp32_on.L7.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "c1.fp32_on.L7.out": [
+   "float32",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.fp32_off.logits": [
+   "float32",
+   [
+    24,
+    512
+   ]
+  ],
+  "c1.fp32_off.router_idx": [
+   "int32",
+   [
+    8,
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_off.hash_ids": [
+   "int32",
+   [
+    24,
+    2,
+    6
+   ]
+  ],
+  "c1.fp32_off.L0.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_off.L0.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    8
+   ]
+  ],
+  "c1.fp32_off.L0.out": [
+   "float32",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.fp32_off.L1.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_off.L1.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    8
+   ]
+  ],
+  "c1.fp32_off.L1.out": [
+   "float32",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.fp32_off.L2.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_off.L2.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.fp32_off.L2.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "c1.fp32_off.L2.out": [
+   "float32",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.fp32_off.L3.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_off.L3.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.fp32_off.L3.out": [
+   "float32",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.fp32_off.L4.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_off.L4.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.fp32_off.L4.out": [
+   "float32",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.fp32_off.L5.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_off.L5.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.fp32_off.L5.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "c1.fp32_off.L5.cand_mask": [
+   "bool",
+   [
+    24,
+    24
+   ]
+  ],
+  "c1.fp32_off.L5.out": [
+   "float32",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.fp32_off.L6.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_off.L6.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.fp32_off.L6.out": [
+   "float32",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.fp32_off.L7.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.fp32_off.L7.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.fp32_off.L7.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "c1.fp32_off.L7.out": [
+   "float32",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.bf16_on.logits": [
+   "float32",
+   [
+    24,
+    512
+   ]
+  ],
+  "c1.bf16_on.router_idx": [
+   "int32",
+   [
+    8,
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_on.hash_ids": [
+   "int32",
+   [
+    24,
+    2,
+    6
+   ]
+  ],
+  "c1.bf16_on.L0.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_on.L0.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    8
+   ]
+  ],
+  "c1.bf16_on.L0.out@bf16": [
+   "uint16",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.bf16_on.L1.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_on.L1.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    8
+   ]
+  ],
+  "c1.bf16_on.L1.out@bf16": [
+   "uint16",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.bf16_on.L2.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_on.L2.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.bf16_on.L2.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "c1.bf16_on.L2.out@bf16": [
+   "uint16",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.bf16_on.L3.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_on.L3.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.bf16_on.L3.out@bf16": [
+   "uint16",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.bf16_on.L4.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_on.L4.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.bf16_on.L4.out@bf16": [
+   "uint16",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.bf16_on.L5.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_on.L5.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.bf16_on.L5.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "c1.bf16_on.L5.cand_mask": [
+   "bool",
+   [
+    24,
+    24
+   ]
+  ],
+  "c1.bf16_on.L5.out@bf16": [
+   "uint16",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.bf16_on.L6.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_on.L6.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.bf16_on.L6.out@bf16": [
+   "uint16",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.bf16_on.L7.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_on.L7.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.bf16_on.L7.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "c1.bf16_on.L7.out@bf16": [
+   "uint16",
+   [
+    24,
+    4,
+    64
+   ]
+  ],
+  "c1.bf16_off.logits": [
+   "float32",
+   [
+    24,
+    512
+   ]
+  ],
+  "c1.bf16_off.router_idx": [
+   "int32",
+   [
+    8,
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_off.hash_ids": [
+   "int32",
+   [
+    24,
+    2,
+    6
+   ]
+  ],
+  "c1.bf16_off.L0.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_off.L0.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    8
+   ]
+  ],
+  "c1.bf16_off.L1.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_off.L1.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    8
+   ]
+  ],
+  "c1.bf16_off.L2.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_off.L2.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.bf16_off.L2.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "c1.bf16_off.L3.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_off.L3.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.bf16_off.L4.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_off.L4.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.bf16_off.L5.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_off.L5.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.bf16_off.L5.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "c1.bf16_off.L5.cand_mask": [
+   "bool",
+   [
+    24,
+    24
+   ]
+  ],
+  "c1.bf16_off.L6.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_off.L6.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.bf16_off.L7.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "c1.bf16_off.L7.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "c1.bf16_off.L7.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "c2.fp32_on.logits": [
+   "float32",
+   [
+    24,
+    512
+   ]
+  ],
+  "c2.fp32_on.router_idx": [
+   "int32",
+   [
+    8,
+    24,
+    6
+   ]
+  ],
+  "c2.fp32_off.logits": [
+   "float32",
+   [
+    24,
+    512
+   ]
+  ],
+  "c2.fp32_off.router_idx": [
+   "int32",
+   [
+    8,
+    24,
+    6
+   ]
+  ],
+  "c2.bf16_on.logits": [
+   "float32",
+   [
+    24,
+    512
+   ]
+  ],
+  "c2.bf16_on.router_idx": [
+   "int32",
+   [
+    8,
+    24,
+    6
+   ]
+  ],
+  "c2.bf16_off.logits": [
+   "float32",
+   [
+    24,
+    512
+   ]
+  ],
+  "c2.bf16_off.router_idx": [
+   "int32",
+   [
+    8,
+    24,
+    6
+   ]
+  ],
+  "c3.fp32_on.logits": [
+   "float32",
+   [
+    24,
+    512
+   ]
+  ],
+  "c3.fp32_on.router_idx": [
+   "int32",
+   [
+    8,
+    24,
+    6
+   ]
+  ],
+  "c3.fp32_off.logits": [
+   "float32",
+   [
+    24,
+    512
+   ]
+  ],
+  "c3.fp32_off.router_idx": [
+   "int32",
+   [
+    8,
+    24,
+    6
+   ]
+  ],
+  "c3.bf16_on.logits": [
+   "float32",
+   [
+    24,
+    512
+   ]
+  ],
+  "c3.bf16_on.router_idx": [
+   "int32",
+   [
+    8,
+    24,
+    6
+   ]
+  ],
+  "c3.bf16_off.logits": [
+   "float32",
+   [
+    24,
+    512
+   ]
+  ],
+  "c3.bf16_off.router_idx": [
+   "int32",
+   [
+    8,
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_on.logits": [
+   "float32",
+   [
+    24,
+    512
+   ]
+  ],
+  "pad.fp32_on.router_idx": [
+   "int32",
+   [
+    8,
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_on.hash_ids": [
+   "int32",
+   [
+    24,
+    2,
+    6
+   ]
+  ],
+  "pad.fp32_on.L0.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_on.L0.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    8
+   ]
+  ],
+  "pad.fp32_on.L1.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_on.L1.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    8
+   ]
+  ],
+  "pad.fp32_on.L2.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_on.L2.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.fp32_on.L2.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "pad.fp32_on.L3.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_on.L3.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.fp32_on.L4.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_on.L4.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.fp32_on.L5.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_on.L5.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.fp32_on.L5.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "pad.fp32_on.L5.cand_mask": [
+   "bool",
+   [
+    24,
+    24
+   ]
+  ],
+  "pad.fp32_on.L6.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_on.L6.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.fp32_on.L7.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_on.L7.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.fp32_on.L7.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "pad.fp32_off.logits": [
+   "float32",
+   [
+    24,
+    512
+   ]
+  ],
+  "pad.fp32_off.router_idx": [
+   "int32",
+   [
+    8,
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_off.hash_ids": [
+   "int32",
+   [
+    24,
+    2,
+    6
+   ]
+  ],
+  "pad.fp32_off.L0.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_off.L0.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    8
+   ]
+  ],
+  "pad.fp32_off.L1.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_off.L1.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    8
+   ]
+  ],
+  "pad.fp32_off.L2.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_off.L2.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.fp32_off.L2.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "pad.fp32_off.L3.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_off.L3.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.fp32_off.L4.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_off.L4.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.fp32_off.L5.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_off.L5.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.fp32_off.L5.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "pad.fp32_off.L5.cand_mask": [
+   "bool",
+   [
+    24,
+    24
+   ]
+  ],
+  "pad.fp32_off.L6.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_off.L6.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.fp32_off.L7.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.fp32_off.L7.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.fp32_off.L7.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "pad.bf16_on.logits": [
+   "float32",
+   [
+    24,
+    512
+   ]
+  ],
+  "pad.bf16_on.router_idx": [
+   "int32",
+   [
+    8,
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_on.hash_ids": [
+   "int32",
+   [
+    24,
+    2,
+    6
+   ]
+  ],
+  "pad.bf16_on.L0.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_on.L0.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    8
+   ]
+  ],
+  "pad.bf16_on.L1.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_on.L1.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    8
+   ]
+  ],
+  "pad.bf16_on.L2.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_on.L2.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.bf16_on.L2.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "pad.bf16_on.L3.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_on.L3.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.bf16_on.L4.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_on.L4.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.bf16_on.L5.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_on.L5.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.bf16_on.L5.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "pad.bf16_on.L5.cand_mask": [
+   "bool",
+   [
+    24,
+    24
+   ]
+  ],
+  "pad.bf16_on.L6.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_on.L6.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.bf16_on.L7.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_on.L7.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.bf16_on.L7.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "pad.bf16_off.logits": [
+   "float32",
+   [
+    24,
+    512
+   ]
+  ],
+  "pad.bf16_off.router_idx": [
+   "int32",
+   [
+    8,
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_off.hash_ids": [
+   "int32",
+   [
+    24,
+    2,
+    6
+   ]
+  ],
+  "pad.bf16_off.L0.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_off.L0.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    8
+   ]
+  ],
+  "pad.bf16_off.L1.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_off.L1.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    8
+   ]
+  ],
+  "pad.bf16_off.L2.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_off.L2.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.bf16_off.L2.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "pad.bf16_off.L3.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_off.L3.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.bf16_off.L4.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_off.L4.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.bf16_off.L5.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_off.L5.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.bf16_off.L5.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "pad.bf16_off.L5.cand_mask": [
+   "bool",
+   [
+    24,
+    24
+   ]
+  ],
+  "pad.bf16_off.L6.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_off.L6.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.bf16_off.L7.router_w": [
+   "float32",
+   [
+    24,
+    6
+   ]
+  ],
+  "pad.bf16_off.L7.attn_topk_idxs": [
+   "int32",
+   [
+    24,
+    12
+   ]
+  ],
+  "pad.bf16_off.L7.index_topk": [
+   "int32",
+   [
+    24,
+    4
+   ]
+  ],
+  "ids.c1": [
+   "int32",
+   [
+    24
+   ]
+  ],
+  "ids.c2": [
+   "int32",
+   [
+    24
+   ]
+  ],
+  "ids.c3": [
+   "int32",
+   [
+    24
+   ]
+  ],
+  "ids.pad": [
+   "int32",
+   [
+    24
+   ]
+  ]
+ }
+}

@@ -948,6 +948,13 @@ also sweeps idle, unlocked directories from the retired
 idle grace, and nonblocking legacy locks bound that cleanup; no replacement
 cache directory is created.
 
+DeepSeek V4.1 Flash builds its tokenizer and chat template in memory from the
+first split's header and streams routed experts from the GGUF on every token
+(`F_NOCACHE` reads into anonymous banks); it writes no cache entry and no
+derived weights. Download the nine `UD-Q4_K_XL` splits (~500 GB) with
+`mlx download model -m unsloth/DeepSeek-V4.1-Flash-1017-GGUF -g "*UD-Q4_K_XL*"`
+to an internal SSD: decode speed follows the read rate.
+
 | Env var                     | Effect                                                                                                                                                                                                                                |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `MLX_NATIVE_GGUF_CACHE_DIR` | Override the native GGUF asset root (config/tokenizer/template files and `gguf-source.json`).                                                                                                                                         |

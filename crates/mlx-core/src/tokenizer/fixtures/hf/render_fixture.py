@@ -140,6 +140,7 @@ def slug(name: str) -> str:
     on the template's sha256, so a wrong guess here costs nothing but a rename."""
     n = name.lower()
     for family in (
+        "deepseek-v4.1",
         "muse-glimmer",
         "nemotron-3.5-lightning",
         "lfm2.5-1.2b-thinking",
