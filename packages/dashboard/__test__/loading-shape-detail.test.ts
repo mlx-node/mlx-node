@@ -3,8 +3,8 @@
  */
 
 /**
- * Structural guards for the loading → loaded swap on the Cache and Metrics
- * pages.
+ * Structural guards for the loading → loaded swap on the Cache, Session detail
+ * and Metrics pages.
  *
  * A skeleton is only doing its job if it occupies the SAME box as the content it
  * stands in for; otherwise every request that lands nudges the page and the whole
@@ -24,10 +24,12 @@
 import { MessageChannel } from 'node:worker_threads';
 
 import { categoryChartHeight } from '@/lib/chart';
-import type { CacheResponse, MetricsOverviewResponse } from '@/lib/types';
+import type { CacheResponse, MetricsOverviewResponse, SessionDetailResponse } from '@/lib/types';
 import Cache from '@/pages/cache';
 import Metrics from '@/pages/metrics';
+import SessionDetail from '@/pages/session-detail';
 import { createElement, type ReactElement } from 'react';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { bindEventTargetPort } from '../src/rpc/port.js';
@@ -211,6 +213,83 @@ describe('Cache page — a health counter loads into the box it will occupy', ()
     expect(subs).toHaveLength(CACHE_TILES);
     expect(allCarry(values, 'h-[1lh]')).toBe(true);
     expect(allCarry(subs, 'h-[1lh]')).toBe(true);
+  });
+});
+
+const SESSION_ID = '019a0000-0000-7000-8000-000000000001';
+
+function sessionRoutes(): Record<string, unknown> {
+  // No model, no kind, not live, no turns: the badge row stays hidden, which is
+  // the variant the loading header is shaped to match.
+  const detail: SessionDetailResponse = {
+    session: {
+      id: SESSION_ID,
+      title: 'Refactor the paged cache',
+      cwd: '/Users/dev/workspace/mlx-node',
+      model: null,
+      branch: 'main',
+      createdAt: '2026-07-20T09:30:00.000Z',
+      lastActiveAt: '2026-07-20T11:00:00.000Z',
+      messageCount: 2,
+      live: false,
+      kind: null,
+      parentId: null,
+      subagentCount: 0,
+      tokens: null,
+      gitRoot: null,
+      headCommit: null,
+      remotes: [],
+      agentName: null,
+      reasoningEffort: null,
+      lastTurnSummary: null,
+      parent: null,
+      subagents: [],
+    },
+    transcript: [],
+    turns: [],
+    resumeCommand: `cd '/Users/dev/workspace/mlx-node' && mlx agent --resume ${SESSION_ID}`,
+  };
+  return { [`/sessions/${SESSION_ID}`]: detail };
+}
+
+function sessionPage(): ReactElement {
+  return createElement(
+    MemoryRouter,
+    { initialEntries: [`/sessions/${SESSION_ID}`] },
+    createElement(Routes, null, createElement(Route, { path: '/sessions/:id', element: createElement(SessionDetail) })),
+  );
+}
+
+describe('Session detail — the loading header is the loaded header', () => {
+  it('gives the title bar the title element’s own classes', async () => {
+    // By class, not by tag: the loaded title is an `h1` and the loading one a
+    // `div`, and it is the classes that decide the box either way.
+    const title = '.text-2xl.tracking-tight';
+    const loading = await whileLoading(sessionPage(), 'Sessions', (page) => classesOf(page, title));
+    const loaded = await whenLoaded(sessionPage(), sessionRoutes(), 'Refactor the paged cache', (page) =>
+      classesOf(page, title),
+    );
+    expect(loading).toEqual(loaded);
+    expect(loading).toHaveLength(1);
+  });
+
+  it('keeps the meta line in the same typographic element in both states', async () => {
+    const meta = '.text-muted-foreground.flex.flex-wrap.text-sm';
+    const loading = await whileLoading(sessionPage(), 'Sessions', (page) => classesOf(page, meta));
+    const loaded = await whenLoaded(sessionPage(), sessionRoutes(), 'Refactor the paged cache', (page) =>
+      classesOf(page, meta),
+    );
+    expect(loading).toEqual(loaded);
+    expect(loading).toHaveLength(1);
+  });
+
+  it('stands in for the title, the meta line and the button — and for nothing else', async () => {
+    const { title, all } = await whileLoading(sessionPage(), 'Sessions', (page) => ({
+      title: classesOf(page, '.text-2xl > [data-slot="skeleton"]'),
+      all: classesOf(page, '[data-slot="skeleton"]'),
+    }));
+    expect(allCarry(title, 'h-[1lh]')).toBe(true);
+    expect(all).toHaveLength(3);
   });
 });
 

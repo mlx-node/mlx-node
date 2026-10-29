@@ -20,12 +20,15 @@
 
 import { NOW_QUANTUM_MS, stableNow } from '@/lib/stable-now';
 import Metrics from '@/pages/metrics';
+import Sessions, { sessionsPath } from '@/pages/sessions';
 import { createElement, type ReactElement } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import type { ApiCall } from '../src/runtime.js';
 import { renderPage, stubApi, type RenderedPage } from './render.js';
+
+const EMPTY_SESSIONS = { sessions: [], total: 0, cwds: [] };
 
 const EMPTY_METRICS = {
   tokensByDay: [],
@@ -79,7 +82,10 @@ describe('request paths survive a remount', () => {
 
   async function pathsAcrossTwoMounts(element: ReactElement, settled: (t: string) => boolean, match: RegExp) {
     const calls: string[] = [];
-    dispose = stubApi({ '/metrics/overview': EMPTY_METRICS }, { onCall: (call: ApiCall) => calls.push(call.path) });
+    dispose = stubApi(
+      { '/metrics/overview': EMPTY_METRICS, '/sessions': EMPTY_SESSIONS },
+      { onCall: (call: ApiCall) => calls.push(call.path) },
+    );
 
     const first = await renderPage(createElement(MemoryRouter, null, element), settled);
     first.unmount();
@@ -101,5 +107,24 @@ describe('request paths survive a remount', () => {
 
     expect(paths.length).toBeGreaterThanOrEqual(2);
     expect(new Set(paths).size).toBe(1);
+  });
+  it('asks for the same sessions list on a second visit', async () => {
+    const paths = await pathsAcrossTwoMounts(
+      createElement(Sessions),
+      (text) => text.includes('No agent sessions yet'),
+      /\/api\/sessions/,
+    );
+
+    expect(paths.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(paths).size).toBe(1);
+  });
+
+  it('builds the sessions path from the filters alone', () => {
+    vi.setSystemTime(T0);
+    const before = sessionsPath({ query: 'cache', cwd: '/work' });
+    vi.setSystemTime(T0 + NOW_QUANTUM_MS * 3);
+    expect(sessionsPath({ query: 'cache', cwd: '/work' })).toBe(before);
+    expect(before).toBe('/sessions?q=cache&cwd=%2Fwork&limit=500');
+    expect(sessionsPath({ query: '', cwd: 'all' })).toBe('/sessions?limit=500');
   });
 });

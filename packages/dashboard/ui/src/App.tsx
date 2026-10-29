@@ -7,7 +7,9 @@ import CodingAgents from '@/pages/coding-agents';
 import Metrics from '@/pages/metrics';
 import Models from '@/pages/models';
 import Overview from '@/pages/overview';
-import { Boxes, Bot, HardDrive, LayoutDashboard, type LucideIcon, TrendingUp } from 'lucide-react';
+import SessionDetail from '@/pages/session-detail';
+import Sessions from '@/pages/sessions';
+import { Boxes, Bot, HardDrive, LayoutDashboard, type LucideIcon, MessagesSquare, TrendingUp } from 'lucide-react';
 import { type CSSProperties, useLayoutEffect, useRef, useState } from 'react';
 import { BrowserRouter, Navigate, NavLink, Outlet, Route, Routes, useLocation } from 'react-router-dom';
 
@@ -22,6 +24,7 @@ const NAV_ITEMS: NavItem[] = [
   { to: '/', label: 'Overview', icon: LayoutDashboard, end: true },
   { to: '/models', label: 'Models', icon: Boxes },
   { to: '/coding-agents', label: 'Coding Agents', icon: Bot },
+  { to: '/sessions', label: 'Sessions', icon: MessagesSquare },
   { to: '/metrics', label: 'Metrics', icon: TrendingUp },
   { to: '/cache', label: 'Cache', icon: HardDrive },
 ];
@@ -197,6 +200,8 @@ export default function App() {
             <Route index element={<Overview />} />
             <Route path="models" element={<Models />} />
             <Route path="coding-agents" element={<CodingAgents />} />
+            <Route path="sessions" element={<Sessions />} />
+            <Route path="sessions/:id" element={<SessionDetail />} />
             <Route path="metrics" element={<Metrics />} />
             <Route path="cache" element={<Cache />} />
           </Route>
