@@ -721,11 +721,19 @@ fn cancel_before_the_first_chunk_keeps_the_resumed_state() -> Result<()> {
 /// a shuffled order on one model. Every step is a whole turn followed by
 /// forced-keep cycles with random keeps in 1..=8; each equals the same step
 /// of that session run alone on its own model, where every resume is live.
+/// Both the turn and its cycles must run the compiled verify, so a silent
+/// fall back to the eager verify fails the test.
 #[test]
 fn interleaved_sessions_with_random_keeps_match_serial_sessions() -> Result<()> {
-    if !metal_is_default_device() {
+    if !metal_is_default_device()
+        || !crate::engine::persistence::compiled_forward_backend_available()
+    {
         return Ok(());
     }
+    assert!(
+        std::env::var_os("MLX_DISABLE_COMPILE").is_none(),
+        "the compiled int8 verify needs MLX_DISABLE_COMPILE unset"
+    );
     const SESSIONS: usize = 4;
     const STEPS: usize = 3;
     let tokenizer = tokenizer();
@@ -769,13 +777,23 @@ fn interleaved_sessions_with_random_keeps_match_serial_sessions() -> Result<()> 
         let seed = (session * STEPS + step) as u32;
         let want_trace = run_live_extension(reference, &keeps[session][step], seed, false)?;
 
+        Qwen35Inner::take_dflash2_compiled_test_counts();
         let (got, events) = capture_prefix_events(|| turn(&mut inner, &tokenizer, &prompt));
         let got = got?;
+        assert!(
+            Qwen35Inner::take_dflash2_compiled_test_counts().0 > 0,
+            "{label}: the turn ran the compiled verify"
+        );
         if events[0]["hit_kind"] == "E" {
             end_hits += 1;
         }
         assert_eq!(outcome(&got, &inner), want_outcome, "{label}: X1 turn");
         let got_trace = run_live_extension(&mut inner, &keeps[session][step], seed, false)?;
+        assert!(
+            Qwen35Inner::take_dflash2_compiled_test_counts().0 >= keeps[session][step].len(),
+            "{label}: every forced cycle ran the compiled verify"
+        );
+        assert!(!inner.dflash2_compiled_verify_disabled, "{label}");
         assert_trace_eq(&got_trace, &want_trace, &format!("{label}: X1 cycles"));
         assert_eq!(
             inner.cached_token_history, serial[session].cached_token_history,
