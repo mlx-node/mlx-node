@@ -316,3 +316,53 @@ fn owner_release_keeps_the_flat_live_state() -> Result<()> {
     assert!(live_state(&inner)? == reference_state, "X1 after release");
     Ok(())
 }
+
+/// A continuous-batching activation hands the flat caches to a scheduled
+/// sequence. It parks the DFlash2 end state first, whether the scheduler
+/// installs the owner's history before activating (a resumed preempted turn)
+/// or after (an admission). X0 for the parked buffers; X1 for the DFlash2
+/// turn resumed on them against the same two turns run back to back.
+#[test]
+fn scheduled_activation_parks_the_dflash2_end_state() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let tokenizer = tokenizer();
+    let first = first_prompt(5);
+    let mut reference = fixture(0xDFA5_1606);
+    run_tiny_dflash_turn(&mut reference, &tokenizer, &first, true, 12)?;
+    let second = extend(&reference.cached_token_history, &[4, 5, 6]);
+    let reference_cached = run_tiny_dflash_turn(&mut reference, &tokenizer, &second, true, 12)?;
+    let reference_state = live_state(&reference)?;
+
+    for order in ["activate_first", "install_first"] {
+        let mut inner = fixture(0xDFA5_1606);
+        inner.initialize_paged_adapter()?;
+        run_tiny_dflash_turn(&mut inner, &tokenizer, &first, true, 12)?;
+        let before = live_state(&inner)?;
+        let owner = vec![1u32, 2, 3];
+        if order == "activate_first" {
+            HybridSchedulerBackend::activate_scheduled_recurrent(&mut inner, 3)?;
+            HybridSchedulerBackend::install_owner_state(&mut inner, 3, &owner);
+        } else {
+            HybridSchedulerBackend::install_owner_state(&mut inner, 3, &owner);
+            HybridSchedulerBackend::activate_scheduled_recurrent(&mut inner, 3)?;
+        }
+        assert_eq!(inner.active_scheduled_seq, Some(3), "{order}");
+        assert_eq!(inner.cached_token_history, owner, "{order}");
+        assert_end_hit(&inner, &before.0, order);
+
+        HybridSchedulerBackend::release_scheduled_recurrent_for(&mut inner, 3);
+        assert_parked_round_trip(&mut inner, &before, order)?;
+        let resumed = run_tiny_dflash_turn(&mut inner, &tokenizer, &second, true, 12)?;
+        assert_eq!(
+            resumed.cached_tokens, reference_cached.cached_tokens,
+            "{order}"
+        );
+        assert!(
+            live_state(&inner)? == reference_state,
+            "{order}: X1 resumed turn"
+        );
+    }
+    Ok(())
+}

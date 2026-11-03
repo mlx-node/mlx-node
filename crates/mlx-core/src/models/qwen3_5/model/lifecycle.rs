@@ -512,6 +512,11 @@ impl Qwen35Inner {
                 "Qwen3.5 sequence {seq_id}: recurrent-state live-unit cap reached"
             )));
         }
+        if self.active_scheduled_seq.is_none() {
+            // The flat caches may hold a DFlash2 turn's state; the scheduled
+            // sequence is about to replace them.
+            crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
+        }
         self.park_active_scheduled_recurrent()?;
         self.caches = Some(
             self.scheduled_recurrent

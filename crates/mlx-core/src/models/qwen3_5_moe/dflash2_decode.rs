@@ -1843,6 +1843,36 @@ mod tests {
         assert_parked_end(&mut inner, &before, "paged AR")
     }
 
+    /// A continuous-batching activation hands the flat caches to a
+    /// scheduled sequence and parks the DFlash2 end state first, whether the
+    /// owner's history is installed before the activation or after (X0).
+    #[test]
+    fn scheduled_activation_parks_the_dflash2_end_state() -> Result<()> {
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
+        for order in ["activate_first", "install_first"] {
+            let mut inner = tiny_dflash_inner(0xDFA5_3614);
+            inner.initialize_paged_adapter()?;
+            run_tiny_dflash_turn(&mut inner, &tokenizer, &owner_prompt(5), true, 2)?;
+            let before = live_state(&inner)?;
+            let owner = vec![1u32, 2, 3];
+            if order == "activate_first" {
+                HybridSchedulerBackend::activate_scheduled_recurrent(&mut inner, 3)?;
+                HybridSchedulerBackend::install_owner_state(&mut inner, 3, &owner);
+            } else {
+                HybridSchedulerBackend::install_owner_state(&mut inner, 3, &owner);
+                HybridSchedulerBackend::activate_scheduled_recurrent(&mut inner, 3)?;
+            }
+            assert_eq!(inner.cached_token_history, owner, "{order}");
+            HybridSchedulerBackend::release_scheduled_recurrent_for(&mut inner, 3);
+            assert_parked_end(&mut inner, &before, order)?;
+        }
+        Ok(())
+    }
+
     /// A prefix-miss reset parks the state and keeps the history (X0); a
     /// command reset, a full cache reset and a weight update each empty the
     /// store.
