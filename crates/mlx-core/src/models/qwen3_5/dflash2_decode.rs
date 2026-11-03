@@ -140,12 +140,6 @@ pub(crate) fn dflash2_kv_headroom_for(budget: u64) -> u64 {
     budget.div_ceil(9).saturating_mul(10)
 }
 
-/// Bytes the target KV reservation may claim, or `None` when the device
-/// limits cannot be read.
-pub(crate) fn dflash2_kv_budget_bytes(snapshot: PagedPrefillMemorySnapshot) -> Option<u64> {
-    dflash2_kv_headroom_bytes(snapshot).map(dflash2_kv_budget_of)
-}
-
 /// Bytes one token row costs across every full-attention K and V tensor:
 /// `head_dim x activation bytes` per (layer, head, tensor) for BF16 rows,
 /// `head_dim + 4` (int8 row plus its fp32 scale) for the int8 format.
@@ -906,6 +900,11 @@ pub(crate) mod tests {
     use crate::nn::Linear;
     use crate::stream::{Stream, StreamContext};
     use rand::SeedableRng;
+
+    /// The turn's KV budget for a memory snapshot.
+    fn kv_budget(snapshot: PagedPrefillMemorySnapshot) -> Option<u64> {
+        dflash2_kv_headroom_bytes(snapshot).map(dflash2_kv_budget_of)
+    }
 
     impl Qwen35DFlash2Stepper<'_> {
         fn frontier(&self) -> Option<SpecFrontier> {
@@ -2291,26 +2290,23 @@ pub(crate) mod tests {
             paged_pool_allocated_bytes: Some(5 * GIB),
         };
         // min(200, 95% of 100) - 30 active - 5 pool - 2 reserve = 58 GiB; 90% usable.
-        assert_eq!(dflash2_kv_budget_bytes(snapshot), Some(58 * GIB / 10 * 9));
+        assert_eq!(kv_budget(snapshot), Some(58 * GIB / 10 * 9));
         let lower_mlx_limit = PagedPrefillMemorySnapshot {
             allocator_limit_bytes: Some(60 * GIB),
             ..snapshot
         };
-        assert_eq!(
-            dflash2_kv_budget_bytes(lower_mlx_limit),
-            Some(23 * GIB / 10 * 9)
-        );
+        assert_eq!(kv_budget(lower_mlx_limit), Some(23 * GIB / 10 * 9));
         let exhausted = PagedPrefillMemorySnapshot {
             allocator_active_bytes: Some(96 * GIB),
             ..snapshot
         };
-        assert_eq!(dflash2_kv_budget_bytes(exhausted), Some(0));
+        assert_eq!(kv_budget(exhausted), Some(0));
         let unreadable = PagedPrefillMemorySnapshot {
             allocator_active_bytes: None,
             allocator_limit_bytes: None,
             ..snapshot
         };
-        assert_eq!(dflash2_kv_budget_bytes(unreadable), None);
+        assert_eq!(kv_budget(unreadable), None);
     }
 
     #[test]
@@ -2370,7 +2366,7 @@ pub(crate) mod tests {
             .selected_bytes
             .expect("fake limits are readable");
         assert_eq!(headroom, 16 * GIB);
-        let budget = dflash2_kv_budget_bytes(snapshot);
+        let budget = kv_budget(snapshot);
         let rows = dflash2_kv_reserve_rows(100_000, 200_000, resident, QWEN38_ROW_BYTES, budget)
             .expect("valid reservation input")
             .expect("budget admits look-ahead");
