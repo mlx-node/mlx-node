@@ -8,8 +8,9 @@
 //! `ChatConfig.tools` is still in scope.
 //!
 //! Deliberate differences from vLLM:
-//! - A property with no recognizable type is left exactly as the parser
-//!   produced it (vLLM treats it as `string`).
+//! - A property with no recognizable type, or an `anyOf` / `oneOf` with an
+//!   untyped choice (`$ref`, `{}`), is left exactly as the parser produced
+//!   it (vLLM treats it as `string`).
 //! - An `object` / `array` candidate must parse to that container kind (vLLM
 //!   accepts any JSON there).
 //! - A typed `null` stays `null` (vLLM turns it into the string `"null"` under
@@ -213,10 +214,12 @@ fn schema_types(schema: &Value) -> Option<TypeSet> {
         }
         for key in ["anyOf", "oneOf"] {
             if let Some(Value::Array(choices)) = schema.get(key) {
-                choices
-                    .iter()
-                    .filter_map(resolve)
-                    .for_each(|c| set.0 |= c.0);
+                // An untyped choice (`$ref`, `{}`) admits anything, so the
+                // union is unknown; dropping it would shrink `Option<Enum>`
+                // to null-only and rewrite valid strings.
+                for choice in choices {
+                    set.0 |= resolve(choice)?.0;
+                }
             }
         }
         let mut resolved = (set.0 != 0).then_some(set);
@@ -802,6 +805,31 @@ mod tests {
         assert_eq!(
             schema_types(&json!({"type": "integer", "allOf": [{"type": "string"}]})),
             None
+        );
+    }
+
+    #[test]
+    fn untyped_any_of_choice_leaves_values_as_parsed() {
+        let option_enum = json!({"anyOf": [{"$ref": "#/$defs/Mode"}, {"type": "null"}]});
+        assert_eq!(schema_types(&option_enum), None);
+        assert_eq!(
+            schema_types(&json!({"oneOf": [{}, {"type": "integer"}]})),
+            None
+        );
+        let props = r##"{"mode": {"anyOf": [{"$ref": "#/$defs/Mode"}, {"type": "null"}]}}"##;
+        assert_eq!(
+            parse_and_coerce(
+                props,
+                r#"<tool_call>{"name":"t","arguments":{"mode":"true"}}</tool_call>"#
+            ),
+            json!({"mode": "true"})
+        );
+        assert_eq!(
+            parse_and_coerce(
+                props,
+                "<tool_call>\n<function=t>\n<parameter=mode>\n1\n</parameter>\n</function>\n</tool_call>"
+            ),
+            json!({"mode": "1"})
         );
     }
 
