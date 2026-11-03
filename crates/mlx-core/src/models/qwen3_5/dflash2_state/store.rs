@@ -319,10 +319,25 @@ impl Shortfall {
     }
 }
 
+/// A resume point that eviction removed: whole-block chain hashes plus the
+/// tokens past the last whole block, enough to tell a later prompt it would
+/// have resumed there.
+struct EvictedPoint {
+    block_size: u32,
+    salt: u64,
+    depth: usize,
+    chain: Vec<u64>,
+    tail: Vec<u32>,
+}
+
+/// Evicted resume points remembered for miss attribution, newest last.
+const EVICTED_POINTS: usize = 64;
+
 pub(crate) struct HybridStateStore<B: Backing> {
     block_size: u32,
     state_budget: u64,
     entries: Vec<Entry<B>>,
+    evicted: std::collections::VecDeque<EvictedPoint>,
     next_id: EntryId,
     tick: u64,
 }
@@ -339,6 +354,7 @@ impl<B: Backing> HybridStateStore<B> {
             block_size: block_size.max(1),
             state_budget,
             entries: Vec::new(),
+            evicted: std::collections::VecDeque::new(),
             next_id: 1,
             tick: 0,
         }
@@ -499,6 +515,41 @@ impl<B: Backing> HybridStateStore<B> {
         best.map(|(hit, _)| hit)
     }
 
+    /// The deepest evicted resume point `b < |P|` whose lineage equals
+    /// `P[..b]`, 0 when there is none. Whole blocks compare by chain hash.
+    pub(crate) fn evicted_depth(&self, prompt: Lineage<'_>) -> usize {
+        let key = self.prompt_key(prompt);
+        self.evicted
+            .iter()
+            .filter(|point| {
+                let floor = point.chain.len() * point.block_size as usize;
+                point.depth < key.tokens.len()
+                    && point.block_size == key.block_size
+                    && point.salt == key.salt
+                    && key.chain.get(..point.chain.len()) == Some(&point.chain[..])
+                    && key.tokens[floor..point.depth] == point.tail[..]
+            })
+            .map(|point| point.depth)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn remember_evicted(&mut self, idx: usize, depth: usize) {
+        let entry = &self.entries[idx];
+        let blocks = depth / entry.block_size as usize;
+        let point = EvictedPoint {
+            block_size: entry.block_size,
+            salt: entry.salt,
+            depth,
+            chain: entry.chain[..blocks.min(entry.chain.len())].to_vec(),
+            tail: entry.tokens[blocks * entry.block_size as usize..depth].to_vec(),
+        };
+        if self.evicted.len() == EVICTED_POINTS {
+            self.evicted.pop_front();
+        }
+        self.evicted.push_back(point);
+    }
+
     fn shortfall(&self, need: Reservation, kv_free: u64) -> Shortfall {
         let bytes = self.bytes();
         Shortfall {
@@ -582,6 +633,9 @@ impl<B: Backing> HybridStateStore<B> {
             if !((short.state && frees_state) || (short.kv && kv_plan.is_some())) {
                 continue;
             }
+            let end_depth = entry.tokens.len();
+            self.remember_evicted(idx, end_depth);
+            let entry = &mut self.entries[idx];
             entry.end = None;
             if kv_plan.is_some()
                 && let Some(kv) = entry.kv.as_mut()
@@ -607,6 +661,10 @@ impl<B: Backing> HybridStateStore<B> {
                 if !((short.state && entry.state_bytes > 0) || (short.kv && entry.kv_bytes > 0)) {
                     continue;
                 }
+                let points: Vec<usize> = entry.resume_points().map(|(_, depth)| depth).collect();
+                for depth in points {
+                    self.remember_evicted(idx, depth);
+                }
                 self.entries.remove(idx);
                 if ends {
                     report.dropped_ends += 1;
@@ -623,9 +681,10 @@ impl<B: Backing> HybridStateStore<B> {
         Ok(report)
     }
 
-    /// Drops every entry (`ResetScope::Command`).
+    /// Drops every entry and every remembered eviction (`ResetScope::Command`).
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
+        self.evicted.clear();
     }
 }
 
@@ -1224,6 +1283,71 @@ mod tests {
         assert!(r.satisfied);
         assert_eq!(store.bytes().entries, 1);
         assert!(fx.drain().is_empty());
+    }
+
+    /// Eviction remembers each resume point it removes: a demotion the end
+    /// state, a drop every point the entry held. A prompt on that lineage
+    /// reports the deepest one; another lineage, another salt, or a prompt
+    /// no longer than the point reports 0, and a command reset forgets them.
+    #[test]
+    fn evicted_resume_points_are_remembered_per_lineage() {
+        let fx = Fixture::new();
+        // Room for one end state and both anchors.
+        let mut small = Store::with_state_budget(BS, GDN + 2 * ANCHOR);
+        let a = lineage(1, 100);
+        let b = lineage(2, 70);
+        small
+            .insert(Lineage::text(&a, 0), fx.end("a", &a, Some(64), 0))
+            .unwrap();
+        small
+            .insert(Lineage::text(&b, 0), fx.end("b", &b, Some(48), 0))
+            .unwrap();
+        let next = |tokens: &[u32]| [tokens, &[7, 7]].concat();
+        assert_eq!(small.evicted_depth(Lineage::text(&next(&a), 0)), 0);
+
+        let state = |state_bytes| Reservation {
+            state_bytes,
+            kv_bytes: 0,
+        };
+        // a's end state goes first (LRU): its anchor stays.
+        small.evict_for(state(0), u64::MAX, None).unwrap();
+        assert_eq!(fx.drain(), ["drop end a", "shrink a 64"]);
+        assert_eq!(small.evicted_depth(Lineage::text(&next(&a), 0)), 100);
+        assert_eq!(small.evicted_depth(Lineage::text(&a, 0)), 0, "b < |P|");
+        assert_eq!(small.evicted_depth(Lineage::text(&next(&a), 1)), 0, "salt");
+        assert_eq!(small.evicted_depth(Lineage::text(&next(&b), 0)), 0);
+        let rerender = fork(&a, 80, 100, 9);
+        assert_eq!(small.evicted_depth(Lineage::text(&rerender, 0)), 0);
+
+        // Dropping everything remembers b's end state and both anchors.
+        small
+            .evict_for(state(u64::MAX / 2), u64::MAX, None)
+            .unwrap();
+        assert_eq!(small.bytes().entries, 0);
+        assert_eq!(small.evicted_depth(Lineage::text(&rerender, 0)), 64);
+        assert_eq!(small.evicted_depth(Lineage::text(&next(&b), 0)), 70);
+        assert_eq!(
+            small.evicted_depth(Lineage::text(&fork(&b, 50, 70, 9), 0)),
+            48
+        );
+
+        small.clear();
+        assert_eq!(small.evicted_depth(Lineage::text(&next(&b), 0)), 0);
+
+        for seed in 0..EVICTED_POINTS as u32 + 1 {
+            let c = lineage(10 + seed, 40);
+            small
+                .insert(Lineage::text(&c, 0), fx.capture("c", 32))
+                .unwrap();
+            small
+                .evict_for(state(u64::MAX / 2), u64::MAX, None)
+                .unwrap();
+        }
+        assert_eq!(small.evicted.len(), EVICTED_POINTS);
+        let oldest = [&lineage(10, 40)[..32], &[1, 2]].concat();
+        assert_eq!(small.evicted_depth(Lineage::text(&oldest, 0)), 0);
+        let newest = [&lineage(10 + EVICTED_POINTS as u32, 40)[..32], &[1, 2]].concat();
+        assert_eq!(small.evicted_depth(Lineage::text(&newest, 0)), 32);
     }
 
     #[test]

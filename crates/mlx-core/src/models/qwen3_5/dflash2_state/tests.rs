@@ -539,6 +539,16 @@ fn tiny_budgets_complete_every_turn() -> Result<()> {
             let (result, events) = capture_prefix_events(|| turn(&mut inner, &tokenizer, &prompt));
             let result = result?;
             assert!(result.num_tokens > 0, "{name}: KV turn {index} completes");
+            if index > 0 {
+                assert_eq!(
+                    (
+                        events[0]["hit_kind"].as_str(),
+                        events[0]["miss_reason"].as_str()
+                    ),
+                    ("none", "evicted"),
+                    "{name}: KV turn {index}: the previous turn evicted this session's state"
+                );
+            }
             assert_eq!(events[0]["store_entries"], "0", "{name}: KV turn {index}");
             assert_eq!(inner.dflash2_states.store.bytes().entries, 0, "{name}");
             histories[session] = inner.cached_token_history.clone();

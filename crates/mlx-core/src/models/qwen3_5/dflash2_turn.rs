@@ -863,8 +863,17 @@ fn observe_prefix<T: DFlash2Target>(
     seen: PrefixSeen,
     tokens: &[u32],
     reuse_cache: bool,
+    salt: u64,
     resume: &Resume,
 ) -> PrefixObservation {
+    let evicted_depth = if reuse_cache {
+        target
+            .dflash2_states()
+            .store
+            .evicted_depth(Lineage::text(tokens, salt))
+    } else {
+        0
+    };
     let classification = target.prefix_tracker().ledger.classify(&TurnObservation {
         prompt: tokens,
         reuse_cache,
@@ -877,7 +886,7 @@ fn observe_prefix<T: DFlash2Target>(
         dropped: seen.dropped,
         store: StoreView {
             deepest: resume.store,
-            evicted_depth: 0,
+            evicted_depth,
         },
     });
     PrefixObservation {
@@ -981,7 +990,14 @@ pub(crate) fn dflash2_chat_turn<T: DFlash2Target + DsparkBackend>(
     };
     let cached_prefix = resume.used.tokens;
     target.dflash2_states_mut().live_salt = params.cache_salt;
-    let observed = observe_prefix(target, seen, &tokens, params.reuse_cache, &resume);
+    let observed = observe_prefix(
+        target,
+        seen,
+        &tokens,
+        params.reuse_cache,
+        params.cache_salt,
+        &resume,
+    );
     let prefill = tokens[cached_prefix..].to_vec();
     let mut capture = observed
         .replay_point
