@@ -361,6 +361,50 @@ describe('mapRequest', () => {
     expect(config.tools).toBeUndefined();
   });
 
+  describe('forced tool_choice renders without thinking', () => {
+    const tools = [
+      { type: 'function' as const, name: 'session_title' },
+      { type: 'function' as const, name: 'other' },
+    ];
+    const thinkingOff = { reasoningEffort: 'none', thinkingTokenBudget: 0, includeReasoning: false };
+
+    it('named function (title side-call shape) disables thinking, even over an explicit effort', () => {
+      const { config } = mapRequest({
+        model: 'local',
+        input: 'Deepresearch this project',
+        max_output_tokens: 100,
+        tools,
+        tool_choice: { type: 'function', name: 'session_title' },
+        reasoning: { effort: 'high' },
+      });
+      expect(config.tools!.map((t) => t.function.name)).toEqual(['session_title']);
+      expect(config).toMatchObject(thinkingOff);
+    });
+
+    it('required disables thinking and keeps every tool', () => {
+      const { config } = mapRequest({ model: 'local', input: 'Hello', tools, tool_choice: 'required' });
+      expect(config.tools).toHaveLength(2);
+      expect(config).toMatchObject(thinkingOff);
+    });
+
+    it.each([
+      ['auto', 'auto' as const],
+      ['none', 'none' as const],
+      ['absent', undefined],
+    ])('%s leaves thinking settings untouched', (_label, toolChoice) => {
+      const { config } = mapRequest({
+        model: 'local',
+        input: 'Hello',
+        tools,
+        ...(toolChoice ? { tool_choice: toolChoice } : {}),
+        reasoning: { effort: 'high' },
+      });
+      expect(config.reasoningEffort).toBe('high');
+      expect(config.thinkingTokenBudget).toBeUndefined();
+      expect(config.includeReasoning).toBeUndefined();
+    });
+  });
+
   it('prepends prior messages and sets reuseCache', () => {
     const priorMessages = [
       { role: 'user' as const, content: 'First message' },

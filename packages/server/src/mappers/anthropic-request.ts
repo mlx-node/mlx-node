@@ -12,7 +12,7 @@ import type {
   SystemBlock,
 } from '../types-anthropic.js';
 import { anthropicToolUseIdToInternal } from './anthropic-response.js';
-import { applyExtraBodyMtpOverrides, validateCacheSalt } from './request.js';
+import { applyExtraBodyMtpOverrides, disableThinkingForForcedToolCall, validateCacheSalt } from './request.js';
 
 export interface MappedAnthropicRequest {
   messages: ChatMessage[];
@@ -486,11 +486,15 @@ export function mapAnthropicRequest(
         );
       }
       config.tools = matched.map(mapTool);
+      disableThinkingForForcedToolCall(config);
     } else {
       // `tool_choice` is undefined, `{type:'auto'}`, or `{type:'any'}` — all
-      // three semantically mean "let the model pick from any tool", so we
-      // forward the full tools array.
+      // three let the model pick from any tool, so we forward the full tools
+      // array. `any` still forces a call.
       config.tools = req.tools.map(mapTool);
+      if (toolChoice?.type === 'any') {
+        disableThinkingForForcedToolCall(config);
+      }
     }
   }
 
