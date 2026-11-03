@@ -317,7 +317,9 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   };
 }
 
-const DEFAULT_AGENT_LOG_FILTER = 'mlx_core::inference=info,mlx_core::decode=info';
+// `Targets` picks the longest matching target, so the crate-wide `warn` floors
+// never mask the more specific `info` directives regardless of order.
+const DEFAULT_AGENT_LOG_FILTER = 'mlx_core=warn,mlx_paged_attn=warn,mlx_core::inference=info,mlx_core::decode=info';
 
 export interface AgentTracingSetupOptions {
   /** @internal Hermetic environment seam for tests. */
@@ -429,6 +431,29 @@ export function withDefaultModel(passthrough: string[], defaultModelId: string):
     return passthrough;
   }
   return ['-m', defaultModelId, ...passthrough];
+}
+
+const DISABLE_WEB_SEARCH_FLAG = '--disable-web-search';
+
+/**
+ * `mlx serve` rejects grok's server-side `web_search` tool type, so every
+ * served launch turns it off (subagents inherit the flag). The flag is a clap
+ * `SetTrue`, which errors when repeated, so a user-supplied one is kept as is.
+ */
+export function withWebSearchDisabled(argv: string[]): string[] {
+  return collectAgentOptionNames(argv).has(DISABLE_WEB_SEARCH_FLAG) ? argv : [DISABLE_WEB_SEARCH_FLAG, ...argv];
+}
+
+/** The `-m`/`--model` value in option-name position, if any. */
+export function agentModelArg(argv: readonly string[]): string | undefined {
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i]!;
+    if (token === '--') return undefined;
+    if (token.startsWith('--model=')) return token.slice('--model='.length) || undefined;
+    if ((token === '-m' || token === '--model') && i + 1 < argv.length) return argv[i + 1];
+    if (agentOptionConsumesNext(argv, i)) i++;
+  }
+  return undefined;
 }
 
 /** The default model id grok's `[models]` table persisted. */
@@ -687,11 +712,15 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     models.map((m) => m.name),
     persisted,
   );
-  const agentArgv = withDefaultModel(scan.passthrough, modelId);
+  const agentArgv = withWebSearchDisabled(withDefaultModel(scan.passthrough, modelId));
+  const requestedModel = agentModelArg(agentArgv);
+  const preloadModel =
+    requestedModel !== undefined && models.some((m) => m.name === requestedModel) ? requestedModel : undefined;
 
   process.exitCode = await launch({
     argv: agentArgv,
     modelsDir,
     needsServer: true,
+    ...(preloadModel !== undefined ? { preloadModel } : {}),
   });
 }

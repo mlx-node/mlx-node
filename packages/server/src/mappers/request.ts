@@ -7,6 +7,17 @@ import type { ContentPart, ResponsesAPIRequest, ResponsesToolDefinition } from '
 
 export const MAX_CACHE_SALT_BYTES = 256;
 
+/**
+ * A forced tool call (named function, `required`, or Anthropic `any`) is
+ * rendered with thinking off: callers pair it with a small output cap, and
+ * thinking spends that cap before the call is emitted (finish=length, no call).
+ */
+export function disableThinkingForForcedToolCall(config: ChatConfig): void {
+  config.reasoningEffort = 'none';
+  config.thinkingTokenBudget = 0;
+  config.includeReasoning = false;
+}
+
 export function validateCacheSalt(cacheSalt: unknown): asserts cacheSalt is string {
   if (typeof cacheSalt !== 'string') {
     throw new Error('cache_salt must be a string');
@@ -304,9 +315,13 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
       const matched = req.tools.filter((t) => t.name === targetName);
       if (matched.length > 0) {
         config.tools = matched.map(mapTool);
+        disableThinkingForForcedToolCall(config);
       }
     } else {
       config.tools = req.tools.map(mapTool);
+      if (req.tool_choice === 'required') {
+        disableThinkingForForcedToolCall(config);
+      }
     }
   }
   if (priorMessages && priorMessages.length > 0) {

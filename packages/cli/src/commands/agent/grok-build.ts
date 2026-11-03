@@ -22,7 +22,18 @@
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync, type Stats } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+  type Stats,
+} from 'node:fs';
 import { connect, createServer, type Server } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -43,7 +54,7 @@ export const MLX_AGENT_RELEASE_REPO = 'mlx-node/grok-build';
  * `latest` pointer is unreachable. Bump only when a release is REQUIRED —
  * resolving `latest` handles ordinary upgrades with no code change here.
  */
-export const MLX_AGENT_MIN_RELEASE = 'mlx-agent-v0.3.0';
+export const MLX_AGENT_MIN_RELEASE = 'mlx-agent-v0.3.2';
 
 /** Options for {@link launchGrokAgent}. */
 export interface GrokAgentLaunchOptions {
@@ -58,6 +69,8 @@ export interface GrokAgentLaunchOptions {
    * (`--system-prompt-override --help`) is data, not a one-shot.
    */
   needsServer?: boolean;
+  /** Discovered model the spawned `mlx serve` starts loading at boot (`--preload`). */
+  preloadModel?: string;
   /** Test seam: custom spawn for the agent binary. */
   spawnAgent?: (bin: string, argv: string[], opts: SpawnOptions) => ChildProcess;
   /** Test seam: custom spawn for `mlx serve`. */
@@ -1682,9 +1695,10 @@ async function spawnInferenceServer(
     'serve',
     '--port',
     '0',
-    '--auth-token',
-    token,
+    // `=` form: a base64url token can start with `-`, which parseArgs reads as a flag.
+    `--auth-token=${token}`,
     ...(opts.modelsDir ? ['--models-dir', opts.modelsDir] : []),
+    ...(opts.preloadModel !== undefined ? ['--preload', opts.preloadModel] : []),
   ];
   const child = (opts.spawnServe ?? ((argv, so) => spawn(process.execPath, argv, so)))(serveArgv, {
     stdio: ['ignore', 'pipe', 'inherit'],
@@ -1739,6 +1753,14 @@ function waitForServe(child: ChildProcess, timeoutMs: number): Promise<string> {
 }
 
 /**
+ * Grok's xAI media tools (`image_gen`, `image_edit`, `image_to_video` +
+ * `reference_to_video`) post to the xAI API base URL, which a served launch
+ * points at `mlx serve`; it has no media endpoints. Each env var outranks
+ * `[features]` in grok's flag ladder; a value the user already exported wins.
+ */
+export const LOCAL_BACKEND_DISABLED_TOOL_ENV = ['GROK_IMAGE_GEN', 'GROK_IMAGE_EDIT', 'GROK_VIDEO_GEN'] as const;
+
+/**
  * Boot the inference host and exec the Grok Build binary over it.
  * Resolves with the agent's exit code; `run()` maps it to process.exitCode.
  */
@@ -1758,12 +1780,15 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
   }
 
   const env = { ...process.env };
+  // grok's exit hint prints this as the resume command; the bare `grok` is not on PATH.
+  env.GROK_RESUME_COMMAND ??= 'mlx agent';
   if (serve) {
     env.GROK_MODELS_BASE_URL = serve.url;
     env.GROK_CLI_CHAT_PROXY_BASE_URL = serve.url;
     env.GROK_XAI_API_BASE_URL = serve.url;
     env.XAI_API_KEY = serve.token || 'mlx-local';
     env.GROK_DISABLE_AUTOUPDATER = '1';
+    for (const name of LOCAL_BACKEND_DISABLED_TOOL_ENV) env[name] ??= '0';
   }
 
   const spawnAgent = opts.spawnAgent ?? ((b, a, so) => spawn(b, a, so));

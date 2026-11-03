@@ -167,6 +167,12 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
 
     fn paged_adapter(&self) -> Option<&PagedKVCacheAdapter>;
     fn paged_adapter_mut(&mut self) -> Option<&mut PagedKVCacheAdapter>;
+    /// Frees memory the family holds outside the page pool after the pool
+    /// grow's headroom probe declined. Returns whether anything was freed,
+    /// in which case admission retries the grow once.
+    fn release_memory_for_pool_grow(&mut self) -> bool {
+        false
+    }
     fn scheduler_cache_available(&self) -> bool {
         self.paged_adapter().is_some()
     }
@@ -2368,7 +2374,15 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return Ok(None);
         };
         if !adapter.try_grow_pool(needed) {
-            return Ok(None);
+            if !self.inner.release_memory_for_pool_grow() {
+                return Ok(None);
+            }
+            let Some(adapter) = self.inner.paged_adapter_mut() else {
+                return Ok(None);
+            };
+            if !adapter.try_grow_pool(needed) {
+                return Ok(None);
+            }
         }
         self.inner.scheduler_cache_snapshot()
     }
@@ -3330,7 +3344,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::engine::backend::ChatBackend;
     use crate::engine::plan::{DecoderPlan, MediaCapabilities, TurnPath, TurnPlan, TurnRequest};
@@ -4463,6 +4477,50 @@ mod tests {
             4 + needed,
             "grow target min(16, max(2*4, 4+{needed})) covers blocks plus state"
         );
+    }
+
+    /// Swaps `inner`'s paged adapter for the growable fixture, makes the
+    /// headroom probe decline its first call only, and reserves one block
+    /// past the free pool with no live turns. Returns whether admission
+    /// admitted, the pool's blocks after, and `inner`.
+    pub(crate) fn reserve_past_a_declined_grow<B: HybridSchedulerBackend>(
+        mut inner: B,
+    ) -> (bool, u32, B) {
+        let mut adapter = tiny_growable_paged_adapter();
+        let probes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls = Arc::clone(&probes);
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(move |requested| {
+            if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(4)
+            } else {
+                Ok(requested)
+            }
+        })));
+        *inner.paged_adapter_mut().expect("paged adapter") = adapter;
+        let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("scheduler snapshot")
+            .expect("paged adapter present");
+        assert_eq!(snapshot.blocks.total_blocks, 4);
+        assert!(!state.scheduler.has_live_turns());
+        let charge = snapshot.blocks.free_blocks + 1;
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
+            .expect("reserve");
+        let total = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("post-reserve snapshot")
+            .expect("paged adapter present")
+            .blocks
+            .total_blocks;
+        (
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            total,
+            state.inner,
+        )
     }
 
     #[test]

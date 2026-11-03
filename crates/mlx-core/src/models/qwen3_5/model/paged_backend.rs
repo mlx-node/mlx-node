@@ -752,9 +752,14 @@ impl Qwen35Inner {
         // The DFlash2 context belongs to that flat mirror, so discard it at
         // the same ownership boundary. In particular, a future equal-length
         // prompt must not mistake this stale draft K/V for the paged prefix.
+        // An exact DFlash2 state parks instead, taking the history with it so
+        // the paged GDN `last_history` arm cannot adopt the caches left here.
+        crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
         self.paged_full_attn_caches_dirty = true;
+        self.dflash2_prefix
+            .note_drop("paged_whole_turn", DropKind::Dirtied);
         let mut constrained_args = WholeTurnArgs {
             tokens: args.tokens,
             tokenizer: args.tokenizer,

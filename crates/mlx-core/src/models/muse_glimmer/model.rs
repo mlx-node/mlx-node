@@ -42,7 +42,7 @@ use super::config::{LayerKind, MuseGlimmerConfig};
 use super::decoder_layer::MuseGlimmerDecoderLayer;
 use super::dflash::DFlashModel;
 use super::kv_cache::PagedWindowSlot;
-use super::output_parser::ResponseTemplate;
+use super::output_parser::{ParsedToolCall, ResponseTemplate};
 use super::stream_guard::{GuardOutcome, StreamGuard};
 
 #[path = "scheduler.rs"]
@@ -1664,10 +1664,7 @@ impl ChatBackend for MuseGlimmerInner {
         let tool_calls: Vec<ToolCallResult> = parsed
             .tool_calls
             .into_iter()
-            .map(|call| {
-                let raw = call.arguments.to_string();
-                ToolCallResult::ok(call.name, call.arguments, raw)
-            })
+            .map(ParsedToolCall::into_tool_call_result)
             .collect();
         let finish_reason = if tool_calls.is_empty() {
             args.finish_reason

@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from 'vite-plus/test';
 
 import type { GrokAgentLaunchOptions } from '../../packages/cli/src/commands/agent/grok-build.js';
 import {
+  agentModelArg,
   type AgentRunDeps,
   chooseDefaultModel,
   configureAgentTracing,
@@ -15,6 +16,7 @@ import {
   run,
   scanAgentArgs,
   withDefaultModel,
+  withWebSearchDisabled,
 } from '../../packages/cli/src/commands/agent/index.js';
 
 describe('scanAgentArgs', () => {
@@ -295,7 +297,10 @@ describe('scanAgentArgs', () => {
     });
 
     it('treats agent -h/--help as a one-shot — the binary prints subcommand help and exits', () => {
-      for (const argv of [['agent', '--help'], ['agent', '-h']]) {
+      for (const argv of [
+        ['agent', '--help'],
+        ['agent', '-h'],
+      ]) {
         const scan = scanAgentArgs(argv);
         expect(scan.grokOneShot).toBe(true);
         // Not mlx-level help: the binary prints the agent subcommand's own help.
@@ -360,7 +365,7 @@ describe('configureAgentTracing', () => {
       const expectedDir = join(home, '.mlx-node', 'logs', 'agent', '2026-07-14T01-02-03-456Z-pid-4242');
       const expectedFile = join(expectedDir, 'inference.log');
       expect(logFile).toBe(expectedFile);
-      expect(env.MLX_NODE_LOG).toBe('mlx_core::inference=info,mlx_core::decode=info');
+      expect(env.MLX_NODE_LOG).toBe('mlx_core=warn,mlx_paged_attn=warn,mlx_core::inference=info,mlx_core::decode=info');
       expect(env.MLX_NODE_LOG_FILE).toBe(expectedFile);
       expect(statSync(expectedDir).mode & 0o777).toBe(0o700);
       expect(statSync(expectedFile).mode & 0o777).toBe(0o600);
@@ -374,7 +379,7 @@ describe('configureAgentTracing', () => {
       const env: NodeJS.ProcessEnv = {};
       const logFile = configureAgentTracing({ trace: false, traceDir }, { env, announce: () => {} });
       expect(logFile).toBe(join(traceDir, 'inference.log'));
-      expect(env.MLX_NODE_LOG).toBe('mlx_core::inference=info,mlx_core::decode=info');
+      expect(env.MLX_NODE_LOG).toBe('mlx_core=warn,mlx_paged_attn=warn,mlx_core::inference=info,mlx_core::decode=info');
       expect(env.MLX_NODE_LOG_FILE).toBe(logFile);
       expect(statSync(traceDir).mode & 0o777).toBe(0o700);
       expect(statSync(logFile!).mode & 0o777).toBe(0o600);
@@ -494,6 +499,37 @@ describe('withDefaultModel', () => {
   });
 });
 
+describe('withWebSearchDisabled', () => {
+  it('prepends the flag so mlx serve never receives the server-side web_search tool', () => {
+    expect(withWebSearchDisabled(['-m', 'x', '-p', 'hi'])).toEqual(['--disable-web-search', '-m', 'x', '-p', 'hi']);
+  });
+
+  it('keeps a user-supplied flag single (clap rejects a repeated SetTrue flag)', () => {
+    const argv = ['-m', 'x', '--disable-web-search'];
+    expect(withWebSearchDisabled(argv)).toEqual(argv);
+  });
+
+  it('does not count the flag as a consumed value or after --', () => {
+    expect(withWebSearchDisabled(['--system-prompt-override', '--disable-web-search'])[0]).toBe('--disable-web-search');
+    expect(withWebSearchDisabled(['--', '--disable-web-search'])).toEqual([
+      '--disable-web-search',
+      '--',
+      '--disable-web-search',
+    ]);
+  });
+});
+
+describe('agentModelArg', () => {
+  it('reads -m, --model and --model= in option-name position only', () => {
+    expect(agentModelArg(['-m', 'a', '-p', 'hi'])).toBe('a');
+    expect(agentModelArg(['--disable-web-search', '--model', 'b'])).toBe('b');
+    expect(agentModelArg(['--model=c'])).toBe('c');
+    expect(agentModelArg(['--system-prompt-override', '-m', 'p'])).toBeUndefined();
+    expect(agentModelArg(['--', '-m', 'a'])).toBeUndefined();
+    expect(agentModelArg(['-c'])).toBeUndefined();
+  });
+});
+
 /**
  * Shared agent-dir expansion (re-exported from `@mlx-node/agent/paths`):
  * lone `~` and leading `~/` expand, `file://` URLs resolve, `~user` and
@@ -591,7 +627,7 @@ describe('run() argv routing', () => {
     expect(calls.discover).toHaveLength(1);
     expect(calls.wizard).toHaveLength(0);
     expect(calls.launch).toHaveLength(1);
-    expect(calls.launch[0]!.argv).toEqual(['-m', 'fake-model', 'agent']);
+    expect(calls.launch[0]!.argv).toEqual(['--disable-web-search', '-m', 'fake-model', 'agent']);
     expect(calls.launch[0]!.needsServer).toBe(true);
     expect(calls.launch[0]!.modelsDir).toBe('/fake/models');
   });
@@ -691,7 +727,9 @@ describe('run() argv routing', () => {
       deps.resolveModelsDir = (explicit) => {
         // This dependency is resolved after the tracing setup, so observing
         // both values here guards the required ordering.
-        expect(process.env.MLX_NODE_LOG).toBe('mlx_core::inference=info,mlx_core::decode=info');
+        expect(process.env.MLX_NODE_LOG).toBe(
+          'mlx_core=warn,mlx_paged_attn=warn,mlx_core::inference=info,mlx_core::decode=info',
+        );
         expect(process.env.MLX_NODE_LOG_FILE).toBe(join(logDir, 'inference.log'));
         return baseResolve(explicit);
       };
@@ -699,7 +737,7 @@ describe('run() argv routing', () => {
       await run(['--trace-dir', logDir, '-p', 'hi'], deps);
 
       expect(calls.launch).toHaveLength(1);
-      expect(calls.launch[0]!.argv).toEqual(['-m', 'fake-model', '-p', 'hi']);
+      expect(calls.launch[0]!.argv).toEqual(['--disable-web-search', '-m', 'fake-model', '-p', 'hi']);
       expect(errorSpy.mock.calls.flat().join('\n')).toContain(
         `mlx agent: inference log ${join(logDir, 'inference.log')}`,
       );
@@ -770,9 +808,27 @@ describe('run() argv routing', () => {
     expect(calls.discover).toHaveLength(1);
     expect(calls.wizard).toHaveLength(0);
     expect(calls.launch).toHaveLength(1);
-    expect(calls.launch[0]!.argv).toEqual(['-m', 'fake-model', '-p', 'hi']);
+    expect(calls.launch[0]!.argv).toEqual(['--disable-web-search', '-m', 'fake-model', '-p', 'hi']);
     expect(calls.launch[0]!.modelsDir).toBe('/fake/models');
     expect(calls.launch[0]!.needsServer).toBe(true);
+  });
+
+  it('preloads the -m model only when it is a discovered local model', async () => {
+    const fresh = makeDeps();
+    await run(['-p', 'hi'], fresh.deps);
+    expect(fresh.calls.launch[0]!.preloadModel).toBe('fake-model');
+
+    const explicit = makeDeps([[fakeModel('fake-model'), fakeModel('other')]]);
+    await run(['--model', 'other'], explicit.deps);
+    expect(explicit.calls.launch[0]!.preloadModel).toBe('other');
+
+    const unknown = makeDeps();
+    await run(['--model', 'remote-only'], unknown.deps);
+    expect(unknown.calls.launch[0]!.preloadModel).toBeUndefined();
+
+    const resumed = makeDeps();
+    await run(['-c'], resumed.deps);
+    expect(resumed.calls.launch[0]!.preloadModel).toBeUndefined();
   });
 
   it('keeps the server path when --help is the VALUE of --system-prompt-override', async () => {
@@ -782,7 +838,15 @@ describe('run() argv routing', () => {
     await run(['--system-prompt-override', '--help', '-p', 'hi'], deps);
     expect(calls.discover).toHaveLength(1);
     expect(calls.launch).toHaveLength(1);
-    expect(calls.launch[0]!.argv).toEqual(['-m', 'fake-model', '--system-prompt-override', '--help', '-p', 'hi']);
+    expect(calls.launch[0]!.argv).toEqual([
+      '--disable-web-search',
+      '-m',
+      'fake-model',
+      '--system-prompt-override',
+      '--help',
+      '-p',
+      'hi',
+    ]);
     expect(calls.launch[0]!.needsServer).toBe(true);
   });
 
@@ -791,14 +855,14 @@ describe('run() argv routing', () => {
     await run(['--models-dir', '/x', '-p', 'hi'], deps);
     expect(calls.discover).toEqual(['/x']);
     expect(calls.launch[0]!.modelsDir).toBe('/x');
-    expect(calls.launch[0]!.argv).toEqual(['-m', 'fake-model', '-p', 'hi']);
+    expect(calls.launch[0]!.argv).toEqual(['--disable-web-search', '-m', 'fake-model', '-p', 'hi']);
   });
 
   it('keeps an explicit --model untouched (no injection)', async () => {
     const { deps, calls } = makeDeps();
     await run(['--model', 'other', '-p', 'hi'], deps);
     expect(calls.launch).toHaveLength(1);
-    expect(calls.launch[0]!.argv).toEqual(['--model', 'other', '-p', 'hi']);
+    expect(calls.launch[0]!.argv).toEqual(['--disable-web-search', '--model', 'other', '-p', 'hi']);
   });
 
   it('suppresses -m injection for session-carrying runs (the binary restores the saved model)', async () => {
@@ -815,7 +879,7 @@ describe('run() argv routing', () => {
       const { deps, calls } = makeDeps();
       await run(argv, deps);
       expect(calls.launch).toHaveLength(1);
-      expect(calls.launch[0]!.argv).toEqual(argv);
+      expect(calls.launch[0]!.argv).toEqual(['--disable-web-search', ...argv]);
     }
   });
 
@@ -825,7 +889,7 @@ describe('run() argv routing', () => {
     expect(calls.wizard).toHaveLength(1);
     expect(calls.discover).toHaveLength(2);
     expect(calls.launch).toHaveLength(1);
-    expect(calls.launch[0]!.argv).toEqual(['-m', 'downloaded-model', '-p', 'hi']);
+    expect(calls.launch[0]!.argv).toEqual(['--disable-web-search', '-m', 'downloaded-model', '-p', 'hi']);
   });
 
   it('keeps non-subcommand flags on the wizard path with zero models', async () => {
@@ -833,7 +897,7 @@ describe('run() argv routing', () => {
     await run(['--effort', 'high'], deps);
     expect(calls.wizard).toHaveLength(1);
     expect(calls.launch).toHaveLength(1);
-    expect(calls.launch[0]!.argv).toEqual(['-m', 'downloaded-model', '--effort', 'high']);
+    expect(calls.launch[0]!.argv).toEqual(['--disable-web-search', '-m', 'downloaded-model', '--effort', 'high']);
   });
 
   it('exits 1 when the wizard throws instead of launching', async () => {
@@ -917,7 +981,7 @@ describe('run() argv routing', () => {
         const { deps, calls } = makeDeps(twoModels());
         deps.readPersistedDefault = () => readPersistedDefaultModel(agentDir);
         await run(['-p', 'hi'], deps);
-        expect(calls.launch[0]!.argv).toEqual(['-m', 'model-b', '-p', 'hi']);
+        expect(calls.launch[0]!.argv).toEqual(['--disable-web-search', '-m', 'model-b', '-p', 'hi']);
       });
     });
 
@@ -926,7 +990,7 @@ describe('run() argv routing', () => {
         const { deps, calls } = makeDeps(twoModels());
         deps.readPersistedDefault = () => readPersistedDefaultModel(agentDir);
         await run(['-p', 'hi'], deps);
-        expect(calls.launch[0]!.argv).toEqual(['-m', 'model-a', '-p', 'hi']);
+        expect(calls.launch[0]!.argv).toEqual(['--disable-web-search', '-m', 'model-a', '-p', 'hi']);
       });
     });
 

@@ -54,7 +54,10 @@ impl Qwen35Inner {
         // longer reflect the conversation. A later streaming dense-MTP fallback
         // must rebuild the flat caches before decoding. See
         // `paged_full_attn_caches_dirty`.
+        crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
         self.paged_full_attn_caches_dirty = true;
+        self.dflash2_prefix
+            .note_drop("paged_turn_sync_core", DropKind::Dirtied);
 
         let prompt_token_count = tokens.len() as u32;
         let sampling_config = p.sampling_config;
@@ -627,7 +630,7 @@ impl Qwen35Inner {
         self.preflight_paged_context(tokens.len(), &mut p)?;
 
         let (vision_encoder, img_proc) =
-            match (self.vision_encoder.clone(), self.image_processor.as_ref()) {
+            match (self.vision_encoder.clone(), self.image_processor.clone()) {
                 (Some(enc), Some(proc)) => (enc, proc),
                 _ => {
                     return Err(Error::from_reason(
@@ -639,7 +642,10 @@ impl Qwen35Inner {
         // This paged turn writes full-attention K/V into the paged adapter pool,
         // leaving the flat `self.caches` full-attention slots stale. A later
         // dense-MTP fallback must rebuild them first.
+        crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
         self.paged_full_attn_caches_dirty = true;
+        self.dflash2_prefix
+            .note_drop("vision_paged_turn_sync_core", DropKind::Dirtied);
 
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
@@ -1005,7 +1011,7 @@ impl Qwen35Inner {
         self.preflight_paged_context(tokens.len(), &mut p)?;
 
         let (vision_encoder, img_proc) =
-            match (self.vision_encoder.clone(), self.image_processor.as_ref()) {
+            match (self.vision_encoder.clone(), self.image_processor.clone()) {
                 (Some(enc), Some(proc)) => (enc, proc),
                 _ => {
                     return Err(Error::from_reason(
@@ -1014,7 +1020,10 @@ impl Qwen35Inner {
                 }
             };
 
+        crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
         self.paged_full_attn_caches_dirty = true;
+        self.dflash2_prefix
+            .note_drop("vision_paged_turn_stream_core", DropKind::Dirtied);
 
         let include_reasoning = p.include_reasoning;
         let think_end_id = tokenizer.think_end_id();
@@ -1463,7 +1472,10 @@ impl Qwen35Inner {
         // pool, NOT the flat `self.caches`, so a later streaming dense-MTP
         // fallback must rebuild the flat caches before decoding. See
         // `paged_full_attn_caches_dirty`.
+        crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
         self.paged_full_attn_caches_dirty = true;
+        self.dflash2_prefix
+            .note_drop("paged_turn_stream_core", DropKind::Dirtied);
 
         let prompt_token_count = tokens.len() as u32;
         let sampling_config = p.sampling_config;

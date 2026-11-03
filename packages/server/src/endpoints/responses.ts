@@ -57,7 +57,6 @@ import {
 import { sanitizeJsonString, stringifyStrictJson } from '../strict-json.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { mergeTimingUsageExtensions, resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
-import type { TracedChatConfig } from '../turn-trace.js';
 import {
   createVisibility,
   endJson,
@@ -66,6 +65,7 @@ import {
   type TransportVisibility,
   writeFallbackErrorSSE,
 } from '../transport-visibility.js';
+import type { TracedChatConfig } from '../turn-trace.js';
 import type {
   FunctionCallOutputItem,
   MessageOutputItem,
@@ -811,9 +811,7 @@ async function handleStreamingNativeWithAbort(
             // Model-generated JSON ships verbatim — sanitize so the inner
             // arguments document stays strictly parseable for clients.
             arguments:
-              typeof tc.arguments === 'string'
-                ? sanitizeJsonString(tc.arguments)
-                : stringifyStrictJson(tc.arguments),
+              typeof tc.arguments === 'string' ? sanitizeJsonString(tc.arguments) : stringifyStrictJson(tc.arguments),
             status: 'completed',
           };
           outputItems.push(fcItem);
@@ -2611,19 +2609,18 @@ export async function handleCreateResponse(
             maybeWarnPromptCacheKeyIneligible(effectivePromptCacheKey);
           }
 
-          // H2 pre-dispatch disconnect check (non-streaming only). A
-          // client that vanished while this request was parked behind the
-          // per-model mutex must not burn a whole prefill+decode budget
-          // producing a JSON body nobody can receive. Checked BEFORE the
-          // session lease so no warm entry is consumed and no native
+          // H2 pre-dispatch disconnect check, streaming and non-streaming.
+          // A client that vanished while this request was parked behind the
+          // per-model mutex must not start a native turn: even an
+          // immediately-cancelled stream still resets the session and runs
+          // native cache resets / the first prefill chunk. Checked BEFORE
+          // the session lease so no warm entry is consumed and no native
           // state is touched — the early return composes with the permit
           // lifecycle exactly like the binding-changed return above (the
           // pre-dispatch permit was already consumed atomically by
           // `withExclusive`, and the handler's outer `finally` release is
-          // an idempotent no-op after that handoff). Streaming keeps its
-          // existing paths: the signal fast-aborts `_runChatStream` and
-          // the SSE drain loop breaks on `clientAborted` at loop-top.
-          if (mappedBody.stream !== true && abortController.signal.aborted) {
+          // an idempotent no-op after that handoff).
+          if (streamSignal.aborted) {
             return;
           }
 

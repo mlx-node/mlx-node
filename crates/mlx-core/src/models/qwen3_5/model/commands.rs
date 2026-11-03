@@ -250,6 +250,10 @@ impl HybridSchedulerBackend for Qwen35Inner {
         self.paged_adapter.as_mut()
     }
 
+    fn release_memory_for_pool_grow(&mut self) -> bool {
+        crate::models::qwen3_5::dflash2_turn::evict_parked_dflash2_for_pool_grow(self)
+    }
+
     fn supports_scheduled_speculation(&self) -> bool {
         self.has_mtp_weights()
             && self.paged_adapter.is_some()
@@ -355,6 +359,16 @@ impl HybridSchedulerBackend for Qwen35Inner {
 
     fn replace_cached_token_history(&mut self, history: Vec<u32>) {
         self.cached_token_history = history;
+    }
+
+    /// The scheduler installs the owner's history before it activates the
+    /// sequence on some paths, so a DFlash2 state parks here first: without
+    /// its history it is no longer exact.
+    fn install_owner_state(&mut self, _seq_id: SeqId, state: &Self::OwnerState) {
+        if self.active_scheduled_seq.is_none() {
+            crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
+        }
+        self.cached_token_history = state.clone();
     }
 
     fn owner_tokens(state: &Self::OwnerState) -> &[u32] {

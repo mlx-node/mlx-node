@@ -1260,8 +1260,71 @@ pub(crate) fn gated_delta_fused_prefill(
     )))
 }
 
+/// What [`gated_delta_split_at`] hands from one segment to the next: the f32
+/// recurrent state and, for an entry whose prologue runs the conv
+/// ([`gated_delta_fused_complete`]), the `[3, W]` conv history. `None` is
+/// the entry's own zero init.
+#[derive(Clone)]
+pub(crate) struct GdnCarry {
+    pub state: Option<MxArray>,
+    pub history: Option<MxArray>,
+}
+
+pub(crate) struct GdnSplit {
+    /// Every segment's output rows, concatenated along axis 1.
+    pub y: MxArray,
+    pub carry: GdnCarry,
+    /// The carry after rows `[0, c)`, one per split row, in order.
+    pub captured: Vec<GdnCarry>,
+}
+
+/// Runs one recurrence entry over a `t`-row window as segments split at
+/// `rows` (strictly increasing, each in `1..=t`), giving each segment the
+/// carry the previous segment returned. `segment(start, end, carry)` runs
+/// the production entry on rows `[start, end)` and returns its output rows
+/// (row axis 1) and the carry after `end`. The carry must stay f32: the
+/// recurrence is bitwise equal to the unsplit dispatch only because the
+/// kernels carry the same f32 state in registers across rows.
+pub(crate) fn gated_delta_split_at(
+    t: usize,
+    rows: &[usize],
+    init: GdnCarry,
+    mut segment: impl FnMut(usize, usize, &GdnCarry) -> Result<(MxArray, GdnCarry)>,
+) -> Result<GdnSplit> {
+    if t == 0
+        || rows.first().is_some_and(|&c| c == 0)
+        || rows.last().is_some_and(|&c| c > t)
+        || rows.windows(2).any(|w| w[0] >= w[1])
+    {
+        return Err(Error::from_reason(format!(
+            "gated_delta_split_at: rows {rows:?} must be strictly increasing within 1..={t}"
+        )));
+    }
+    let mut carry = init;
+    let mut ys = Vec::with_capacity(rows.len() + 1);
+    let mut captured = Vec::with_capacity(rows.len());
+    let mut start = 0;
+    for &c in rows {
+        let (y, next) = segment(start, c, &carry)?;
+        ys.push(y);
+        carry = next;
+        captured.push(carry.clone());
+        start = c;
+    }
+    if start < t {
+        let (y, next) = segment(start, t, &carry)?;
+        ys.push(y);
+        carry = next;
+    }
+    let y = match ys.as_slice() {
+        [y] => y.clone(),
+        _ => MxArray::concatenate_many(ys.iter().collect(), Some(1))?,
+    };
+    Ok(GdnSplit { y, carry, captured })
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The env-override parser maps strings → [`GdnKernel`] (tested env-free, race-free).
@@ -1484,7 +1547,7 @@ mod tests {
     /// head widths (Dv = 128, Dk = 128): the FFI checks
     /// `maxTotalThreadsPerThreadgroup >= 8 * dv` when the pipeline is built,
     /// so the entry itself reports decline — a device limit, not test input.
-    fn fused_step_launches() -> bool {
+    pub(crate) fn fused_step_launches() -> bool {
         if !unsafe { sys::mlx_metal_is_available() } {
             return false;
         }
@@ -1511,7 +1574,7 @@ mod tests {
     /// The same launch check for the complete pipeline (prep folded in):
     /// `gdn_fused_pipeline(..., complete = true)` applies the identical
     /// threadgroup test, so a device that declines one declines both.
-    fn fused_complete_launches() -> bool {
+    pub(crate) fn fused_complete_launches() -> bool {
         if !unsafe { sys::mlx_metal_is_available() } {
             return false;
         }
@@ -2379,7 +2442,7 @@ mod tests {
     /// Whether this device launches the fused-prefill pipeline: same
     /// threadgroup contract as `gdn_fused_step` (8 * Dv threads per value
     /// head), so the FFI entry itself reports decline.
-    fn fused_prefill_launches() -> bool {
+    pub(crate) fn fused_prefill_launches() -> bool {
         if !unsafe { sys::mlx_metal_is_available() } {
             return false;
         }
@@ -2673,6 +2736,492 @@ mod tests {
                 fused / unfused
             );
         }
+    }
+
+    /// Production prefill geometry (Hk = 16, Hv = 48, Dk = Dv = 128): the
+    /// pre-norm conv-output views and gate/z views the layer hands the
+    /// recurrence, plus the q/k the unfused chain normalizes once per chunk.
+    struct SplitWindow {
+        q_raw: MxArray,
+        k_raw: MxArray,
+        v: MxArray,
+        a: MxArray,
+        b: MxArray,
+        z: MxArray,
+        q_n: MxArray,
+        k_n: MxArray,
+    }
+
+    struct SplitWeights {
+        w: MxArray,
+        a_log: MxArray,
+        dt_bias: MxArray,
+        wq: MxArray,
+        wk: MxArray,
+    }
+
+    const SPLIT_HK: i64 = 16;
+    const SPLIT_HV: i64 = 48;
+    const SPLIT_D: i64 = 128;
+
+    fn split_weights() -> SplitWeights {
+        let inv_scale = (SPLIT_D as f64).powf(-0.5);
+        SplitWeights {
+            w: rand_bf16(&[SPLIT_D]).add_scalar(1.0).unwrap(),
+            a_log: rand_f32(&[SPLIT_HV]),
+            dt_bias: rand_f32(&[SPLIT_HV]),
+            wq: MxArray::full(
+                &[SPLIT_D],
+                Either::A(inv_scale * inv_scale),
+                Some(DType::BFloat16),
+            )
+            .unwrap(),
+            wk: MxArray::full(&[SPLIT_D], Either::A(inv_scale), Some(DType::BFloat16)).unwrap(),
+        }
+    }
+
+    fn split_window(t: usize, wt: &SplitWeights) -> SplitWindow {
+        let (hk, hv, d, ti) = (SPLIT_HK, SPLIT_HV, SPLIT_D, t as i64);
+        let conv = rand_gate(&[1, ti, 2 * hk * d + hv * d]);
+        let q_raw = conv
+            .slice_axis(2, 0, hk * d)
+            .unwrap()
+            .reshape(&[1, ti, hk, d])
+            .unwrap();
+        let k_raw = conv
+            .slice_axis(2, hk * d, 2 * hk * d)
+            .unwrap()
+            .reshape(&[1, ti, hk, d])
+            .unwrap();
+        let v = conv
+            .slice_axis(2, 2 * hk * d, 2 * hk * d + hv * d)
+            .unwrap()
+            .reshape(&[1, ti, hv, d])
+            .unwrap();
+        let ba = rand_bf16(&[1, ti, 2 * hv + 32]);
+        let z = rand_gate(&[1, ti, 2 * hk * d + 2 * hv * d + 96])
+            .slice_axis(2, 2 * hk * d + hv * d, 2 * hk * d + 2 * hv * d)
+            .unwrap();
+        let q_n = crate::nn::rms_norm_scaled(&q_raw, &wt.wq, 1e-6).unwrap();
+        let k_n = crate::nn::rms_norm_scaled(&k_raw, &wt.wk, 1e-6).unwrap();
+        SplitWindow {
+            q_raw,
+            k_raw,
+            v,
+            a: ba.slice_axis(2, hv, 2 * hv).unwrap(),
+            b: ba.slice_axis(2, 0, hv).unwrap(),
+            z,
+            q_n,
+            k_n,
+        }
+    }
+
+    fn seg(x: &MxArray, s: usize, e: usize) -> MxArray {
+        x.slice_axis(1, s as i64, e as i64).unwrap()
+    }
+
+    fn state_carry(state: MxArray) -> GdnCarry {
+        GdnCarry {
+            state: Some(state),
+            history: None,
+        }
+    }
+
+    /// `gated_delta_fused_prefill` on rows `[s, e)` (any T >= 1).
+    fn fused_prefill_segment(
+        win: &SplitWindow,
+        wt: &SplitWeights,
+        tiled: bool,
+        s: usize,
+        e: usize,
+        carry: &GdnCarry,
+    ) -> Result<(MxArray, GdnCarry)> {
+        let (a, b, z) = (seg(&win.a, s, e), seg(&win.b, s, e), seg(&win.z, s, e));
+        let (out, state) = gated_delta_fused_prefill(
+            &seg(&win.q_raw, s, e),
+            &seg(&win.k_raw, s, e),
+            &seg(&win.v, s, e),
+            carry.state.as_ref(),
+            &GdnPrefill {
+                a: &a,
+                b: &b,
+                a_log: &wt.a_log,
+                dt_bias: &wt.dt_bias,
+                wq: &wt.wq,
+                wk: &wt.wk,
+                qk_eps: 1e-6,
+                tiled,
+                tail: GdnTail {
+                    z: &z,
+                    norm_weight: &wt.w,
+                    eps: 1e-6,
+                    state_dst: None,
+                },
+            },
+        )?
+        .ok_or_else(|| Error::from_reason("fused prefill declined"))?;
+        Ok((out, state_carry(state)))
+    }
+
+    /// The unfused `gated_delta_update` chain on rows `[s, e)`: the per-step
+    /// kernel on q/k normalized once over the whole window. Output rows are
+    /// the pre-tail `y` `[1, T, Hv, Dv]`.
+    fn chain_segment(
+        win: &SplitWindow,
+        wt: &SplitWeights,
+        tiled: bool,
+        s: usize,
+        e: usize,
+        carry: &GdnCarry,
+    ) -> Result<(MxArray, GdnCarry)> {
+        let (y, state) = gated_delta_update_with_tape(
+            &seg(&win.q_n, s, e),
+            &seg(&win.k_n, s, e),
+            &seg(&win.v, s, e),
+            &seg(&win.a, s, e),
+            &seg(&win.b, s, e),
+            &wt.a_log,
+            &wt.dt_bias,
+            carry.state.as_ref(),
+            None,
+            true,
+            tiled,
+            None,
+            None,
+        )?;
+        Ok((y, state_carry(state)))
+    }
+
+    /// A mix of entries chosen per segment length: the fused prefill for a
+    /// segment of at least 64 rows, the unfused chain plus the unfused tail
+    /// below. Not the layer's routing, which picks one entry for the whole
+    /// window: the fused prefill from 64 rows, the fused tail
+    /// (`gated_delta_update_fused`) for windows of at most 32 rows, and the
+    /// chain for 33..=63 rows. Splitting across entries is bitwise only
+    /// because they agree on any segment.
+    fn routed_segment(
+        win: &SplitWindow,
+        wt: &SplitWeights,
+        tiled: bool,
+        s: usize,
+        e: usize,
+        carry: &GdnCarry,
+    ) -> Result<(MxArray, GdnCarry)> {
+        if e - s >= 64 {
+            return fused_prefill_segment(win, wt, tiled, s, e, carry);
+        }
+        let (y, next) = chain_segment(win, wt, tiled, s, e, carry)?;
+        Ok((unfused_tail(&y, &seg(&win.z, s, e), &wt.w, 1e-6), next))
+    }
+
+    fn assert_carry_bits(label: &str, want: &GdnCarry, got: &GdnCarry) {
+        for (part, w, g) in [
+            ("state", &want.state, &got.state),
+            ("history", &want.history, &got.history),
+        ] {
+            match (w, g) {
+                (Some(w), Some(g)) => {
+                    assert_eq!(w.dtype().unwrap(), g.dtype().unwrap(), "{label} {part}");
+                    assert_eq!(
+                        w.shape().unwrap().as_ref(),
+                        g.shape().unwrap().as_ref(),
+                        "{label} {part}"
+                    );
+                    assert_eq!(max_ulps(w, g), 0, "{label} {part} differs");
+                }
+                (None, None) => {}
+                _ => panic!("{label} {part}: carry presence differs"),
+            }
+        }
+    }
+
+    /// Checks one entry against its own unsplit dispatch: splitting at each
+    /// row alone and at every row at once gives the same output rows and
+    /// final carry bit for bit, and the carry captured at `c` equals the
+    /// final carry of the entry run on rows `[0, c)` only.
+    fn assert_split_identity(
+        label: &str,
+        t: usize,
+        cuts: &[usize],
+        init: &GdnCarry,
+        segment: &mut dyn FnMut(usize, usize, &GdnCarry) -> Result<(MxArray, GdnCarry)>,
+    ) {
+        let whole = gated_delta_split_at(t, &[], init.clone(), &mut *segment).unwrap();
+        assert!(whole.captured.is_empty());
+        let prefix: Vec<GdnCarry> = cuts
+            .iter()
+            .map(|&c| segment(0, c, init).unwrap().1)
+            .collect();
+        let mut plans: Vec<Vec<usize>> = cuts.iter().map(|&c| vec![c]).collect();
+        plans.push(cuts.to_vec());
+        for plan in plans {
+            let split = gated_delta_split_at(t, &plan, init.clone(), &mut *segment).unwrap();
+            let tag = format!("{label} T={t} rows={plan:?}");
+            assert_eq!(
+                whole.y.shape().unwrap().as_ref(),
+                split.y.shape().unwrap().as_ref(),
+                "{tag} y shape"
+            );
+            assert_eq!(whole.y.dtype().unwrap(), split.y.dtype().unwrap(), "{tag}");
+            let y_ulps = max_ulps(&whole.y, &split.y);
+            eprintln!("GDN_SPLIT {tag}: y_ulps={y_ulps}");
+            assert_eq!(y_ulps, 0, "{tag} y rows differ");
+            assert_carry_bits(&format!("{tag} final"), &whole.carry, &split.carry);
+            assert_eq!(split.captured.len(), plan.len(), "{tag}");
+            for (c, got) in plan.iter().zip(&split.captured) {
+                let i = cuts.iter().position(|x| x == c).unwrap();
+                assert_carry_bits(&format!("{tag} captured@{c}"), &prefix[i], got);
+            }
+        }
+    }
+
+    fn split_cuts(t: usize) -> Vec<usize> {
+        let mut cuts: Vec<usize> = [1, 16, 31, 32, 33, 63, 64, t - 1]
+            .into_iter()
+            .filter(|&c| c < t)
+            .collect();
+        cuts.dedup();
+        cuts
+    }
+
+    /// Splitting the recurrence dispatch at capture rows is bitwise free on
+    /// every prompt entry: the fused prefill, the unfused chain, and the
+    /// layer's routing (fused for >= 64-row segments, chain + tail below),
+    /// for zero (`None`) and random carried f32 states.
+    #[test]
+    fn split_recurrence_matches_unsplit_bit_for_bit() {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return;
+        }
+        let fused = fused_prefill_launches();
+        if !fused {
+            eprintln!("SKIP fused prefill split: this device cannot launch the fused prefill");
+        }
+        let wt = split_weights();
+        for (t, tiled) in [(65usize, true), (65, false), (2048, true)] {
+            let win = split_window(t, &wt);
+            let cuts = split_cuts(t);
+            let random = state_carry(rand_f32(&[1, SPLIT_HV, SPLIT_D, SPLIT_D]));
+            let zero = GdnCarry {
+                state: None,
+                history: None,
+            };
+            for (init_name, init) in [("zero", &zero), ("random", &random)] {
+                let tag = |path: &str| format!("{path} tiled={tiled} init={init_name}");
+                assert_split_identity(&tag("chain"), t, &cuts, init, &mut |s, e, c| {
+                    chain_segment(&win, &wt, tiled, s, e, c)
+                });
+                if fused {
+                    assert_split_identity(&tag("fused_prefill"), t, &cuts, init, &mut |s, e, c| {
+                        fused_prefill_segment(&win, &wt, tiled, s, e, c)
+                    });
+                    // The routed split against the unsplit fused prefill:
+                    // only bitwise because the fused prefill equals the
+                    // chain + tail on any segment it is handed.
+                    let whole = gated_delta_split_at(t, &[], init.clone(), |s, e, c| {
+                        fused_prefill_segment(&win, &wt, tiled, s, e, c)
+                    })
+                    .unwrap();
+                    let routed = gated_delta_split_at(t, &cuts, init.clone(), |s, e, c| {
+                        routed_segment(&win, &wt, tiled, s, e, c)
+                    })
+                    .unwrap();
+                    let y_ulps = max_ulps(&whole.y, &routed.y);
+                    eprintln!("GDN_SPLIT {} T={t}: y_ulps={y_ulps}", tag("routed"));
+                    assert_eq!(y_ulps, 0, "{} T={t} gated rows differ", tag("routed"));
+                    assert_carry_bits(&tag("routed final"), &whole.carry, &routed.carry);
+                }
+            }
+        }
+    }
+
+    /// `gated_delta_update_fused` on rows `[s, e)`: the fused tail the layer
+    /// runs a capture window of at most 32 rows through, segment by segment.
+    fn fused_tail_segment(
+        win: &SplitWindow,
+        wt: &SplitWeights,
+        tiled: bool,
+        s: usize,
+        e: usize,
+        carry: &GdnCarry,
+    ) -> Result<(MxArray, GdnCarry)> {
+        let z = seg(&win.z, s, e);
+        let (out, state) = gated_delta_update_fused(
+            &seg(&win.q_n, s, e),
+            &seg(&win.k_n, s, e),
+            &seg(&win.v, s, e),
+            &seg(&win.a, s, e),
+            &seg(&win.b, s, e),
+            &wt.a_log,
+            &wt.dt_bias,
+            carry.state.as_ref(),
+            None,
+            true,
+            tiled,
+            None,
+            GdnTail {
+                z: &z,
+                norm_weight: &wt.w,
+                eps: 1e-6,
+                state_dst: None,
+            },
+            None,
+        )?
+        .ok_or_else(|| Error::from_reason("fused tail declined"))?;
+        Ok((out, state_carry(state)))
+    }
+
+    /// The fused tail split at every row of a 17..=32-row window (the
+    /// short prefill tails and the prepared-gate windows a capture can land
+    /// in) gives the unsplit dispatch's gated rows and final state bit for
+    /// bit, and each captured state equals the window truncated there.
+    #[test]
+    fn split_fused_tail_matches_unsplit_bit_for_bit() {
+        if !fused_step_launches() {
+            eprintln!("SKIP fused tail split: this device cannot launch the fused GDN step");
+            return;
+        }
+        let wt = split_weights();
+        for (t, tiled) in [(17usize, true), (24, false), (32, true), (32, false)] {
+            let win = split_window(t, &wt);
+            let cuts: Vec<usize> = (1..t).collect();
+            let random = state_carry(rand_f32(&[1, SPLIT_HV, SPLIT_D, SPLIT_D]));
+            let zero = GdnCarry {
+                state: None,
+                history: None,
+            };
+            for (init_name, init) in [("zero", &zero), ("random", &random)] {
+                assert_split_identity(
+                    &format!("fused_tail tiled={tiled} init={init_name}"),
+                    t,
+                    &cuts,
+                    init,
+                    &mut |s, e, c| fused_tail_segment(&win, &wt, tiled, s, e, c),
+                );
+            }
+        }
+    }
+
+    /// The fused-complete entry (prep + recurrence + tail, the decode/verify
+    /// geometry, T <= 16) split at every row: the conv history is carried
+    /// with the f32 state, and both match the unsplit dispatch bit for bit.
+    #[test]
+    fn split_complete_matches_unsplit_bit_for_bit() {
+        if !(fused_step_launches() && fused_complete_launches()) {
+            eprintln!("SKIP fused complete split: this device cannot launch the fused GDN kernels");
+            return;
+        }
+        let (hk, hv, d, t) = (SPLIT_HK, SPLIT_HV, SPLIT_D, 16usize);
+        let w_dim = 2 * hk * d + hv * d;
+        let conv = MxArray::random_normal(&[w_dim, 4], 0.0, 0.2, Some(DType::Float32)).unwrap();
+        let scale = MxArray::random_normal(&[hv], -0.5, 0.2, Some(DType::Float32)).unwrap();
+        let dt = rand_f32(&[hv]);
+        let w = rand_bf16(&[d]).add_scalar(1.0).unwrap();
+        let qkvz = rand_gate(&[1, t as i64, w_dim + hv * d]);
+        let qkv = qkvz.slice_axis(2, 0, w_dim).unwrap();
+        let z = qkvz.slice_axis(2, w_dim, w_dim + hv * d).unwrap();
+        let ba = rand_bf16(&[1, t as i64, 2 * hv + 32]);
+        let b = ba.slice_axis(2, 0, hv).unwrap();
+        let a = ba.slice_axis(2, hv, 2 * hv).unwrap();
+        let mut segment = |s: usize, e: usize, carry: &GdnCarry| -> Result<(MxArray, GdnCarry)> {
+            let (qkv, a, b, z) = (seg(&qkv, s, e), seg(&a, s, e), seg(&b, s, e), seg(&z, s, e));
+            let out = gated_delta_fused_complete(
+                &GdnPrologue {
+                    qkv: &qkv,
+                    a: &a,
+                    b: &b,
+                    conv: &conv,
+                    history: carry.history.as_ref().unwrap(),
+                    scale: &scale,
+                    dt_bias: &dt,
+                    history_dst: None,
+                },
+                carry.state.as_ref().unwrap(),
+                &GdnTail {
+                    z: &z,
+                    norm_weight: &w,
+                    eps: 1e-6,
+                    state_dst: None,
+                },
+            )
+            .ok_or_else(|| Error::from_reason("fused complete declined"))?;
+            Ok((
+                out.out,
+                GdnCarry {
+                    state: Some(out.state),
+                    history: Some(out.history),
+                },
+            ))
+        };
+        let cuts: Vec<usize> = (1..t).collect();
+        for (init_name, init) in [
+            (
+                "zero",
+                GdnCarry {
+                    state: Some(MxArray::zeros(&[1, hv, d, d], Some(DType::Float32)).unwrap()),
+                    history: Some(MxArray::zeros(&[3, w_dim], Some(DType::BFloat16)).unwrap()),
+                },
+            ),
+            (
+                "random",
+                GdnCarry {
+                    state: Some(rand_f32(&[1, hv, d, d])),
+                    history: Some(rand_bf16(&[3, w_dim])),
+                },
+            ),
+        ] {
+            assert_split_identity(
+                &format!("fused_complete init={init_name}"),
+                t,
+                &cuts,
+                &init,
+                &mut segment,
+            );
+        }
+    }
+
+    /// A split row at the window end adds no segment and captures the final
+    /// carry; out-of-range or unordered rows are refused before any segment
+    /// runs.
+    #[test]
+    fn split_rows_contract() {
+        let mut calls = Vec::new();
+        let unit = |s: usize, e: usize| {
+            MxArray::full(
+                &[1, (e - s) as i64],
+                Either::A(s as f64),
+                Some(DType::Float32),
+            )
+            .unwrap()
+        };
+        let mut segment = |s: usize, e: usize, _: &GdnCarry| -> Result<(MxArray, GdnCarry)> {
+            calls.push((s, e));
+            Ok((unit(s, e), state_carry(unit(0, e))))
+        };
+        let none = || GdnCarry {
+            state: None,
+            history: None,
+        };
+        let split = gated_delta_split_at(5, &[2, 5], none(), &mut segment).unwrap();
+        assert_eq!(split.y.shape().unwrap().as_ref(), [1, 5]);
+        assert_eq!(split.captured.len(), 2);
+        assert_eq!(
+            split.captured[1]
+                .state
+                .as_ref()
+                .unwrap()
+                .shape()
+                .unwrap()
+                .as_ref(),
+            [1, 5]
+        );
+        assert_carry_bits("end row", &split.captured[1], &split.carry);
+        for bad in [&[0usize][..], &[6], &[3, 3], &[4, 2]] {
+            assert!(gated_delta_split_at(5, bad, none(), &mut segment).is_err());
+        }
+        assert!(gated_delta_split_at(0, &[], none(), &mut segment).is_err());
+        drop(segment);
+        assert_eq!(calls, [(0, 2), (2, 5)]);
     }
 }
 

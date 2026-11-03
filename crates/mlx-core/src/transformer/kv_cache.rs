@@ -646,6 +646,54 @@ impl KVCache {
         self.keys.as_ref().map_or(Ok(0), |keys| keys.shape_at(2))
     }
 
+    /// Copy rows `[0:offset]` into fresh, evaluated buffers of `capacity`
+    /// rows and release the old ones. The copy is evaluated before the old
+    /// buffers are dropped, so the transient is the new buffers' size.
+    pub(crate) fn compact(&mut self, capacity: i64) -> Result<()> {
+        let used = i64::from(self.offset);
+        if capacity < used {
+            return Err(Error::from_reason(format!(
+                "KV cache compaction to {capacity} rows would drop used rows (offset {used})"
+            )));
+        }
+        if self.keys.is_none() || self.capacity()? == capacity {
+            return Ok(());
+        }
+        let copy = |buffer: &MxArray| -> Result<MxArray> {
+            let mut shape = buffer.shape()?.as_ref().to_vec();
+            shape[2] = capacity - used;
+            let spare = MxArray::zeros(&shape, Some(buffer.dtype()?))?;
+            if used == 0 {
+                return Ok(spare);
+            }
+            let rows = buffer.slice_axis(2, 0, used)?;
+            if capacity == used {
+                rows.deep_copy()
+            } else {
+                MxArray::concatenate(&rows, &spare, 2)
+            }
+        };
+        let fresh = [
+            &self.keys,
+            &self.values,
+            &self.key_scales,
+            &self.value_scales,
+        ]
+        .map(|buffer| buffer.as_ref().map(copy).transpose());
+        let [keys, values, key_scales, value_scales] = fresh;
+        let (keys, values, key_scales, value_scales) = (keys?, values?, key_scales?, value_scales?);
+        let arrays: Vec<&MxArray> = [&keys, &values, &key_scales, &value_scales]
+            .into_iter()
+            .flatten()
+            .collect();
+        MxArray::eval_arrays(&arrays)?;
+        self.keys = keys;
+        self.values = values;
+        self.key_scales = key_scales;
+        self.value_scales = value_scales;
+        Ok(())
+    }
+
     /// Replace the buffers with `buffer[0:keep_rows]` (the whole buffer when
     /// `None`) followed by `new_k` / `new_v` (and, in int8 mode, the matching
     /// scale rows), or with the new buffers alone before the first allocation

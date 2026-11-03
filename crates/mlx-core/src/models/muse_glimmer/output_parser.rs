@@ -397,6 +397,19 @@ pub struct ParsedToolCall {
     /// A JSON object. Key order is the order the model emitted the parameters
     /// in (`serde_json` is built with `preserve_order`).
     pub arguments: serde_json::Value,
+    /// `(key, value text)` per parameter, in emission order: verbatim, or the
+    /// decoded text when the model wrote a JSON string literal. The
+    /// JSON-everything `arguments` cannot tell `700` from `"700"`; schema
+    /// coercion reads this instead.
+    pub raw_values: Vec<(String, String)>,
+}
+
+impl ParsedToolCall {
+    pub(crate) fn into_tool_call_result(self) -> crate::tools::ToolCallResult {
+        let raw = self.arguments.to_string();
+        crate::tools::ToolCallResult::ok(self.name, self.arguments, raw)
+            .with_raw_argument_text(self.raw_values.into_iter().collect())
+    }
 }
 
 /// One generated assistant turn, plus the PROVENANCE of its control markers.
@@ -763,11 +776,12 @@ fn skip_whitespace(body: &str, from: usize) -> usize {
 /// Build one call's arguments from `<atem:parameter>` tags, but only if they
 /// consume the complete body. `None` means the closed invoke was malformed and
 /// must not become an executable call.
-fn parse_arguments(tag: &Regex, body: &str) -> Option<serde_json::Value> {
+fn parse_arguments(tag: &Regex, body: &str) -> Option<(serde_json::Value, Vec<(String, String)>)> {
     // `serde_json::Map` is `preserve_order`-backed: insertion order IS the
     // model's emission order, which some tools are sensitive to and which a
     // sorted map would quietly destroy.
     let mut map = serde_json::Map::new();
+    let mut raw_values = Vec::new();
     let mut pos = 0;
     loop {
         pos = skip_whitespace(body, pos);
@@ -783,10 +797,18 @@ fn parse_arguments(tag: &Regex, body: &str) -> Option<serde_json::Value> {
         if map.contains_key(key.as_str()) {
             return None;
         }
-        map.insert(key.as_str().to_owned(), parse_value(value.as_str()));
+        let parsed = parse_value(value.as_str());
+        // A JSON string literal's coercion input is its decoded text; bare
+        // text decodes to itself.
+        let raw = match &parsed {
+            serde_json::Value::String(s) => s.clone(),
+            _ => value.as_str().to_owned(),
+        };
+        map.insert(key.as_str().to_owned(), parsed);
+        raw_values.push((key.as_str().to_owned(), raw));
         pos = whole.end();
     }
-    Some(serde_json::Value::Object(map))
+    Some((serde_json::Value::Object(map), raw_values))
 }
 
 /// Fill a single-valued text channel, first segment wins.
@@ -1550,13 +1572,16 @@ impl ResponseTemplate {
             if close_end > body_end {
                 break;
             }
-            let Some(arguments) = parse_arguments(tag, &body[whole.end()..close_start]) else {
+            let Some((arguments, raw_values)) =
+                parse_arguments(tag, &body[whole.end()..close_start])
+            else {
                 valid = false;
                 break;
             };
             parsed.push(ParsedToolCall {
                 name: name.as_str().to_owned(),
                 arguments,
+                raw_values,
             });
             // Every close marker is non-empty (checked at construction), so this
             // is strictly past `pos` and the scan cannot spin.
@@ -1857,6 +1882,120 @@ mod tests {
         assert_eq!(tc.arguments["city"], serde_json::json!("Paris"));
         assert_eq!(tc.arguments["days"], serde_json::json!(3));
         assert_eq!(tc.arguments["metric"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn raw_values_let_the_tool_schema_decide_scalar_types() {
+        use crate::tokenizer::{FunctionDefinition, FunctionParameters, ToolDefinition};
+        use crate::tools::{ToolArgSchemas, ToolCallResult};
+
+        let out = spec().parse_asserting_every_marker_shape_is_a_token(
+            " to=read_file<|message|><atem:function_calls>\n\
+             <atem:invoke name=\"read_file\">\n\
+             <atem:parameter name=\"label\">700</atem:parameter>\n\
+             <atem:parameter name=\"limit\">700</atem:parameter>\n\
+             <atem:parameter name=\"body\">{\"a\": 1}</atem:parameter>\n\
+             </atem:invoke>\n</atem:function_calls><|eot|>",
+        );
+        assert_eq!(
+            out.tool_calls[0].raw_values,
+            vec![
+                ("label".to_string(), "700".to_string()),
+                ("limit".to_string(), "700".to_string()),
+                ("body".to_string(), "{\"a\": 1}".to_string()),
+            ]
+        );
+        let to_results = |calls: Vec<ParsedToolCall>| -> Vec<ToolCallResult> {
+            calls
+                .into_iter()
+                .map(ParsedToolCall::into_tool_call_result)
+                .collect()
+        };
+
+        let mut unschematized = to_results(out.tool_calls.clone());
+        crate::tools::coerce_tool_calls(None, &mut unschematized);
+        assert_eq!(
+            unschematized[0].arguments,
+            serde_json::json!({"label": 700, "limit": 700, "body": {"a": 1}})
+        );
+
+        let schemas = ToolArgSchemas::from_config(&crate::engine::types::ChatConfig {
+            tools: Some(vec![ToolDefinition {
+                r#type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: "read_file".to_string(),
+                    description: None,
+                    parameters: Some(FunctionParameters {
+                        r#type: "object".to_string(),
+                        properties: Some(
+                            r#"{"label": {"type": "string"}, "limit": {"type": "integer"},
+                                "body": {"type": "string"}}"#
+                                .to_string(),
+                        ),
+                        required: None,
+                    }),
+                },
+            }]),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut typed = to_results(out.tool_calls);
+        schemas.coerce_calls(&mut typed);
+        assert_eq!(
+            typed[0].arguments,
+            serde_json::json!({"label": "700", "limit": 700, "body": "{\"a\": 1}"})
+        );
+    }
+
+    #[test]
+    fn json_string_literal_values_are_coerced_from_their_decoded_text() {
+        use crate::tokenizer::{FunctionDefinition, FunctionParameters, ToolDefinition};
+        use crate::tools::ToolArgSchemas;
+
+        let out = spec().parse_asserting_every_marker_shape_is_a_token(
+            " to=edit<|message|><atem:function_calls>\n\
+             <atem:invoke name=\"edit\">\n\
+             <atem:parameter name=\"path\">\"/tmp/a.rs\"</atem:parameter>\n\
+             <atem:parameter name=\"content\">\"line one\\nline two\"</atem:parameter>\n\
+             <atem:parameter name=\"limit\">\"700\"</atem:parameter>\n\
+             <atem:parameter name=\"label\">700</atem:parameter>\n\
+             </atem:invoke>\n</atem:function_calls><|eot|>",
+        );
+        let schemas = ToolArgSchemas::from_config(&crate::engine::types::ChatConfig {
+            tools: Some(vec![ToolDefinition {
+                r#type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: "edit".to_string(),
+                    description: None,
+                    parameters: Some(FunctionParameters {
+                        r#type: "object".to_string(),
+                        properties: Some(
+                            r#"{"path": {"type": "string"}, "content": {"type": "string"},
+                                "limit": {"type": "integer"}, "label": {"type": "string"}}"#
+                                .to_string(),
+                        ),
+                        required: None,
+                    }),
+                },
+            }]),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut calls: Vec<_> = out
+            .tool_calls
+            .into_iter()
+            .map(ParsedToolCall::into_tool_call_result)
+            .collect();
+        schemas.coerce_calls(&mut calls);
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({
+                "path": "/tmp/a.rs",
+                "content": "line one\nline two",
+                "limit": 700,
+                "label": "700"
+            })
+        );
     }
 
     #[test]

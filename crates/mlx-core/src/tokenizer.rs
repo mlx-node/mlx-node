@@ -444,6 +444,7 @@ pub struct Qwen3Tokenizer {
     /// top of the generic ChatML set. Empty for every family that has none —
     /// see [`Qwen3Tokenizer::detect_control_markers`].
     control_markers: &'static [&'static str],
+    generation_suffixes: Arc<crate::engine::gen_prompt::GenerationSuffixCache>,
 }
 
 const MISSING_CHAT_TEMPLATE_ERROR: &str = "Model-provided chat template not found: expected \
@@ -551,6 +552,7 @@ impl Qwen3Tokenizer {
                     think_end_id,
                     think_end_str,
                     control_markers,
+                    generation_suffixes: Arc::default(),
                 })
             })
             .await
@@ -1236,6 +1238,7 @@ impl Qwen3Tokenizer {
             think_end_id,
             think_end_str,
             control_markers,
+            generation_suffixes: Arc::default(),
         })
     }
 
@@ -2854,6 +2857,7 @@ impl Qwen3Tokenizer {
             think_end_id,
             think_end_str,
             control_markers,
+            generation_suffixes: Arc::default(),
         }
     }
 
@@ -2977,19 +2981,91 @@ impl Qwen3Tokenizer {
                 "thinkingTokenBudget must be non-negative",
             ));
         }
+        let inputs = RenderInputs::from_config(config, preserve_thinking);
         self.render_chat_template_sync_with_content_order(
             messages,
             Some(add_generation_prompt),
             config.tools.as_deref(),
-            crate::engine::params::resolve_enable_thinking(config),
+            inputs.enable_thinking,
             MultimodalContentOrder::TextThenMedia,
             None,
-            RenderContextOptions {
-                reasoning_effort: config.reasoning_effort.clone(),
-                preserve_thinking,
-                ..Default::default()
-            },
+            inputs.render_ctx,
         )
+    }
+
+    /// The tokens a `config` render appends for `add_generation_prompt`, probed by
+    /// rendering a fixed one-user-message conversation with and without it.
+    /// `None` when the render without the prompt is not a strict token prefix of
+    /// the render with it.
+    pub(crate) fn generation_suffix(
+        &self,
+        config: &crate::engine::types::ChatConfig,
+    ) -> Result<Option<Arc<[u32]>>> {
+        self.generation_suffix_for(&RenderInputs::from_config(config, false))
+    }
+
+    /// Makes `generation_suffix(config)` answer `suffix` without a render.
+    #[cfg(test)]
+    pub(crate) fn seed_generation_suffix(
+        &self,
+        config: &crate::engine::types::ChatConfig,
+        suffix: &[u32],
+    ) {
+        self.generation_suffixes
+            .lock()
+            .expect("generation suffix cache")
+            .insert(
+                RenderInputs::from_config(config, false),
+                Some(Arc::from(suffix)),
+            );
+    }
+
+    pub(crate) fn generation_suffix_for(
+        &self,
+        inputs: &RenderInputs,
+    ) -> Result<Option<Arc<[u32]>>> {
+        if let Some(hit) = self
+            .generation_suffixes
+            .lock()
+            .map_err(|_| Error::from_reason("generation suffix cache poisoned"))?
+            .get(inputs)
+        {
+            return Ok(hit.clone());
+        }
+        let probe = [ChatMessage {
+            role: "user".to_string(),
+            content: "Hello".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: None,
+            audio: None,
+        }];
+        let render = |add_generation_prompt: bool| -> Result<Vec<u32>> {
+            let text = self.render_chat_template_sync_with_content_order(
+                &probe,
+                Some(add_generation_prompt),
+                None,
+                inputs.enable_thinking,
+                MultimodalContentOrder::TextThenMedia,
+                None,
+                inputs.render_ctx.clone(),
+            )?;
+            Ok(Self::encode_internal(&self.tokenizer, text, Some(false))?
+                .get_ids()
+                .to_vec())
+        };
+        let suffix = crate::engine::gen_prompt::generation_suffix_from_renders(
+            &render(true)?,
+            &render(false)?,
+        );
+        self.generation_suffixes
+            .lock()
+            .map_err(|_| Error::from_reason("generation suffix cache poisoned"))?
+            .insert(inputs.clone(), suffix.clone());
+        Ok(suffix)
     }
 
     pub(crate) fn apply_chat_template_with_config(
@@ -3158,6 +3234,7 @@ impl Clone for Qwen3Tokenizer {
             think_end_id: self.think_end_id,
             think_end_str: self.think_end_str.clone(),
             control_markers: self.control_markers,
+            generation_suffixes: self.generation_suffixes.clone(),
         }
     }
 }
@@ -3297,7 +3374,7 @@ pub enum MultimodalContentOrder {
 /// `control_markers` FIRST. On a Muse-Glimmer vocabulary a literal `<|start|>`
 /// here forges a turn inside the system prefix exactly as one in `content` would;
 /// the prefix is simply a place no untrusted string reaches today.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RenderContextOptions {
     /// Validated effort forwarded separately from enable_thinking and the numeric cap.
     pub reasoning_effort: Option<String>,
@@ -3364,6 +3441,33 @@ pub(crate) struct RenderContextOptions {
     /// (PR #109); see the comment on that key in
     /// [`Qwen3Tokenizer::render_chat_template_jinja2_with_content_order`].
     pub preserve_thinking: bool,
+}
+
+/// Everything except the messages and the tools that a config-driven render
+/// passes to the template. [`Qwen3Tokenizer::render_chat_template_with_config`]
+/// renders from this value, so it is also the whole cache key of
+/// [`Qwen3Tokenizer::generation_suffix_for`]: a render input added here can
+/// never be served a suffix probed without it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RenderInputs {
+    pub render_ctx: RenderContextOptions,
+    pub enable_thinking: Option<bool>,
+}
+
+impl RenderInputs {
+    pub(crate) fn from_config(
+        config: &crate::engine::types::ChatConfig,
+        preserve_thinking: bool,
+    ) -> Self {
+        Self {
+            render_ctx: RenderContextOptions {
+                reasoning_effort: config.reasoning_effort.clone(),
+                preserve_thinking,
+                ..Default::default()
+            },
+            enable_thinking: crate::engine::params::resolve_enable_thinking(config),
+        }
+    }
 }
 
 /// Python `json.dumps` default separators: `", "` between items and `": "` after
@@ -3777,6 +3881,7 @@ pub(crate) fn audio_test_tokenizer() -> Qwen3Tokenizer {
         think_end_id: None,
         think_end_str: None,
         control_markers: &[],
+        generation_suffixes: Arc::default(),
     }
 }
 

@@ -1694,12 +1694,15 @@ impl QianfanOCRModel {
         })?;
 
         let config = config.unwrap_or_default();
+        let tool_schemas = crate::tools::ToolArgSchemas::from_config(&config);
 
-        crate::model_thread::send_and_await(thread, |reply| QianfanOCRCmd::ChatSessionStart {
-            messages,
-            config,
-            reply,
-            cancelled: Arc::new(AtomicBool::new(false)),
+        crate::engine::napi_glue::send_chat_and_await(thread, tool_schemas, |reply| {
+            QianfanOCRCmd::ChatSessionStart {
+                messages,
+                config,
+                reply,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }
         })
         .await
     }
@@ -1717,17 +1720,20 @@ impl QianfanOCRModel {
         let thread = self.thread.as_ref().ok_or_else(|| {
             Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
         })?;
+        let config = config.unwrap_or_default();
+        let tool_schemas = crate::tools::ToolArgSchemas::from_config(&config);
         let cancelled = Arc::new(AtomicBool::new(false));
         let (reply, result_rx) = tokio::sync::oneshot::channel();
         thread.send(QianfanOCRCmd::ChatSessionStart {
             messages,
-            config: config.unwrap_or_default(),
+            config,
             reply,
             cancelled: Arc::clone(&cancelled),
         })?;
         Ok(ChatSessionCall {
             cancelled,
             result_rx: std::sync::Mutex::new(Some(result_rx)),
+            tool_schemas,
         })
     }
 
@@ -1747,12 +1753,15 @@ impl QianfanOCRModel {
         })?;
 
         let config = config.unwrap_or_default();
+        let tool_schemas = crate::tools::ToolArgSchemas::from_config(&config);
 
-        crate::model_thread::send_and_await(thread, |reply| QianfanOCRCmd::ChatSessionContinue {
-            messages,
-            config,
-            reply,
-            cancelled: Arc::new(AtomicBool::new(false)),
+        crate::engine::napi_glue::send_chat_and_await(thread, tool_schemas, |reply| {
+            QianfanOCRCmd::ChatSessionContinue {
+                messages,
+                config,
+                reply,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }
         })
         .await
     }
@@ -1768,17 +1777,20 @@ impl QianfanOCRModel {
         let thread = self.thread.as_ref().ok_or_else(|| {
             Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
         })?;
+        let config = config.unwrap_or_default();
+        let tool_schemas = crate::tools::ToolArgSchemas::from_config(&config);
         let cancelled = Arc::new(AtomicBool::new(false));
         let (reply, result_rx) = tokio::sync::oneshot::channel();
         thread.send(QianfanOCRCmd::ChatSessionContinue {
             messages,
-            config: config.unwrap_or_default(),
+            config,
             reply,
             cancelled: Arc::clone(&cancelled),
         })?;
         Ok(ChatSessionCall {
             cancelled,
             result_rx: std::sync::Mutex::new(Some(result_rx)),
+            tool_schemas,
         })
     }
 
@@ -1796,8 +1808,9 @@ impl QianfanOCRModel {
         })?;
 
         let config = config.unwrap_or_default();
+        let tool_schemas = crate::tools::ToolArgSchemas::from_config(&config);
 
-        crate::model_thread::send_and_await(thread, |reply| {
+        crate::engine::napi_glue::send_chat_and_await(thread, tool_schemas, |reply| {
             QianfanOCRCmd::ChatSessionContinueTool {
                 messages,
                 config,
@@ -1819,17 +1832,20 @@ impl QianfanOCRModel {
         let thread = self.thread.as_ref().ok_or_else(|| {
             Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
         })?;
+        let config = config.unwrap_or_default();
+        let tool_schemas = crate::tools::ToolArgSchemas::from_config(&config);
         let cancelled = Arc::new(AtomicBool::new(false));
         let (reply, result_rx) = tokio::sync::oneshot::channel();
         thread.send(QianfanOCRCmd::ChatSessionContinueTool {
             messages,
-            config: config.unwrap_or_default(),
+            config,
             reply,
             cancelled: Arc::clone(&cancelled),
         })?;
         Ok(ChatSessionCall {
             cancelled,
             result_rx: std::sync::Mutex::new(Some(result_rx)),
+            tool_schemas,
         })
     }
 
@@ -1850,8 +1866,9 @@ impl QianfanOCRModel {
         })?;
 
         let config = config.unwrap_or_default();
+        let tool_schemas = crate::tools::ToolArgSchemas::from_config(&config);
 
-        let plumbing = crate::engine::napi_glue::start_chat_stream(callback);
+        let plumbing = crate::engine::napi_glue::start_chat_stream(callback, tool_schemas);
 
         thread.send(QianfanOCRCmd::ChatStreamSessionStart {
             messages,
@@ -1880,8 +1897,9 @@ impl QianfanOCRModel {
         })?;
 
         let config = config.unwrap_or_default();
+        let tool_schemas = crate::tools::ToolArgSchemas::from_config(&config);
 
-        let plumbing = crate::engine::napi_glue::start_chat_stream(callback);
+        let plumbing = crate::engine::napi_glue::start_chat_stream(callback, tool_schemas);
 
         thread.send(QianfanOCRCmd::ChatStreamSessionContinue {
             messages,
@@ -1909,8 +1927,9 @@ impl QianfanOCRModel {
         })?;
 
         let config = config.unwrap_or_default();
+        let tool_schemas = crate::tools::ToolArgSchemas::from_config(&config);
 
-        let plumbing = crate::engine::napi_glue::start_chat_stream(callback);
+        let plumbing = crate::engine::napi_glue::start_chat_stream(callback, tool_schemas);
 
         thread.send(QianfanOCRCmd::ChatStreamSessionContinueTool {
             messages,

@@ -115,7 +115,8 @@ macro_rules! chat_napi_surface {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
-                $crate::model_thread::send_and_await(thread, |reply| {
+                let tool_schemas = $crate::tools::ToolArgSchemas::from_config(&config);
+                $crate::engine::napi_glue::send_chat_and_await(thread, tool_schemas, |reply| {
                     <$thread_cmd>::from_chat($crate::engine::cmd::ChatCmd::SessionStart {
                         messages,
                         config,
@@ -144,6 +145,7 @@ macro_rules! chat_napi_surface {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
+                let tool_schemas = $crate::tools::ToolArgSchemas::from_config(&config);
                 let cancelled = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
                 let (reply, result_rx) = ::tokio::sync::oneshot::channel();
                 thread.send(<$thread_cmd>::from_chat(
@@ -157,6 +159,7 @@ macro_rules! chat_napi_surface {
                 Ok($crate::engine::types::ChatSessionCall {
                     cancelled,
                     result_rx: ::std::sync::Mutex::new(::std::option::Option::Some(result_rx)),
+                    tool_schemas,
                 })
             }
 
@@ -175,7 +178,8 @@ macro_rules! chat_napi_surface {
                 $crate::models::chat_napi::chat_napi_continuation_media_guard!(messages);
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
-                $crate::model_thread::send_and_await(thread, |reply| {
+                let tool_schemas = $crate::tools::ToolArgSchemas::from_config(&config);
+                $crate::engine::napi_glue::send_chat_and_await(thread, tool_schemas, |reply| {
                     <$thread_cmd>::from_chat($crate::engine::cmd::ChatCmd::SessionContinue {
                         messages,
                         config,
@@ -200,6 +204,7 @@ macro_rules! chat_napi_surface {
                 $crate::models::chat_napi::chat_napi_continuation_media_guard!(messages);
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
+                let tool_schemas = $crate::tools::ToolArgSchemas::from_config(&config);
                 let cancelled = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
                 let (reply, result_rx) = ::tokio::sync::oneshot::channel();
                 thread.send(<$thread_cmd>::from_chat(
@@ -213,6 +218,7 @@ macro_rules! chat_napi_surface {
                 Ok($crate::engine::types::ChatSessionCall {
                     cancelled,
                     result_rx: ::std::sync::Mutex::new(::std::option::Option::Some(result_rx)),
+                    tool_schemas,
                 })
             }
 
@@ -228,7 +234,8 @@ macro_rules! chat_napi_surface {
                 $crate::models::chat_napi::chat_napi_continuation_media_guard!(messages);
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
-                $crate::model_thread::send_and_await(thread, |reply| {
+                let tool_schemas = $crate::tools::ToolArgSchemas::from_config(&config);
+                $crate::engine::napi_glue::send_chat_and_await(thread, tool_schemas, |reply| {
                     <$thread_cmd>::from_chat($crate::engine::cmd::ChatCmd::SessionContinueTool {
                         messages,
                         config,
@@ -253,6 +260,7 @@ macro_rules! chat_napi_surface {
                 $crate::models::chat_napi::chat_napi_continuation_media_guard!(messages);
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
+                let tool_schemas = $crate::tools::ToolArgSchemas::from_config(&config);
                 let cancelled = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
                 let (reply, result_rx) = ::tokio::sync::oneshot::channel();
                 thread.send(<$thread_cmd>::from_chat(
@@ -266,6 +274,7 @@ macro_rules! chat_napi_surface {
                 Ok($crate::engine::types::ChatSessionCall {
                     cancelled,
                     result_rx: ::std::sync::Mutex::new(::std::option::Option::Some(result_rx)),
+                    tool_schemas,
                 })
             }
 
@@ -280,8 +289,9 @@ macro_rules! chat_napi_surface {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
+                let tool_schemas = $crate::tools::ToolArgSchemas::from_config(&config);
 
-                let plumbing = $crate::engine::napi_glue::start_chat_stream(callback);
+                let plumbing = $crate::engine::napi_glue::start_chat_stream(callback, tool_schemas);
                 thread.send(<$thread_cmd>::from_chat(
                     $crate::engine::cmd::ChatCmd::StreamSessionStart {
                         messages,
@@ -306,8 +316,9 @@ macro_rules! chat_napi_surface {
                 $crate::models::chat_napi::chat_napi_continuation_media_guard!(messages);
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
+                let tool_schemas = $crate::tools::ToolArgSchemas::from_config(&config);
 
-                let plumbing = $crate::engine::napi_glue::start_chat_stream(callback);
+                let plumbing = $crate::engine::napi_glue::start_chat_stream(callback, tool_schemas);
                 thread.send(<$thread_cmd>::from_chat(
                     $crate::engine::cmd::ChatCmd::StreamSessionContinue {
                         messages,
@@ -332,8 +343,9 @@ macro_rules! chat_napi_surface {
                 $crate::models::chat_napi::chat_napi_continuation_media_guard!(messages);
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
+                let tool_schemas = $crate::tools::ToolArgSchemas::from_config(&config);
 
-                let plumbing = $crate::engine::napi_glue::start_chat_stream(callback);
+                let plumbing = $crate::engine::napi_glue::start_chat_stream(callback, tool_schemas);
                 thread.send(<$thread_cmd>::from_chat(
                     $crate::engine::cmd::ChatCmd::StreamSessionContinueTool {
                         messages,

@@ -682,3 +682,39 @@ fn caller_markers_never_become_control_ids() {
     }
     assert!(clean.contains(&tok.token_to_id("<｜User｜>".into()).unwrap()));
 }
+
+/// DSML types every value itself (`string="true"` is the model saying
+/// string), so calls carry no `raw_argument_text` and schema coercion keeps
+/// any value the schema admits.
+#[test]
+fn string_attribute_types_survive_schema_coercion() {
+    let c = "</think><｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n\
+        <｜DSML｜ parameter name=\"either\" string=\"true\">5</｜DSML｜ parameter>\n\
+        <｜DSML｜ parameter name=\"text\" string=\"true\"> null </｜DSML｜ parameter>\n\
+        <｜DSML｜ parameter name=\"n\" string=\"true\">7</｜DSML｜ parameter>\n\
+        <｜DSML｜ parameter name=\"label\" string=\"false\">3</｜DSML｜ parameter>\n\
+        </｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    let (tok, ids) = case(c);
+    let (_, mut calls, _) = parse(&tok, &ids, true);
+    assert!(calls[0].raw_argument_text.is_none());
+    let schemas = crate::tools::ToolArgSchemas::from_config(&config(
+        None,
+        vec![tool(
+            "f",
+            None,
+            json!({
+                "either": {"type": ["integer", "string"]},
+                "text": {"type": ["string", "null"]},
+                "n": {"type": "integer"},
+                "label": {"type": "string"},
+            }),
+            &[],
+        )],
+    ))
+    .unwrap();
+    schemas.coerce_calls(&mut calls);
+    assert_eq!(
+        calls[0].arguments,
+        json!({"either": "5", "text": " null ", "n": 7, "label": "3"})
+    );
+}

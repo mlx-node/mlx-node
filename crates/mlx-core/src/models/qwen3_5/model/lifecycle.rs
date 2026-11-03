@@ -51,6 +51,9 @@ impl Qwen35Inner {
             None
         };
 
+        let dflash2_prefix = PrefixTracker::new(config.paged_block_size());
+        let dflash2_states =
+            crate::models::qwen3_5::dflash2_state::flat::FlatStates::new(config.paged_block_size());
         Ok(Self {
             config,
             turn_cancel: None,
@@ -64,6 +67,8 @@ impl Qwen35Inner {
             dflash2: None,
             dflash2_context: None,
             dflash2_turn_state: None,
+            dflash2_prefix,
+            dflash2_states,
             caches: None,
             tokenizer: None,
             vision_encoder: None,
@@ -132,7 +137,7 @@ impl Qwen35Inner {
                  cache requires at least one attention layer",
             ));
         }
-        let block_size = self.config.paged_block_size.unwrap_or(16);
+        let block_size = self.config.paged_block_size();
         let head_size = self.config.head_dim as u32;
         let num_kv_heads = self.config.num_kv_heads as u32;
         let max_seq_len = self.config.max_position_embeddings as u32;
@@ -424,6 +429,9 @@ impl Qwen35Inner {
         self.caches = None;
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
+        self.dflash2_states.clear();
+        self.dflash2_prefix
+            .note_drop("reset_caches_sync", DropKind::Invalidated);
         self.scheduled_recurrent = RecurrentStateTable::stage2();
         self.scheduled_mtp = Default::default();
         self.active_scheduled_seq = None;
@@ -503,6 +511,11 @@ impl Qwen35Inner {
             return Err(Error::from_reason(format!(
                 "Qwen3.5 sequence {seq_id}: recurrent-state live-unit cap reached"
             )));
+        }
+        if self.active_scheduled_seq.is_none() {
+            // The flat caches may hold a DFlash2 turn's state; the scheduled
+            // sequence is about to replace them.
+            crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
         }
         self.park_active_scheduled_recurrent()?;
         self.caches = Some(

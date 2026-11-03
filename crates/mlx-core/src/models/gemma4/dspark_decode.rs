@@ -40,6 +40,7 @@ use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::params::{ChatParams, generated_capacity_hint};
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::engine::spec_paged::{SpecPagedCache, VerifyTicket};
+use crate::models::forward::PREFILL_CANCELLED;
 use crate::stream::{Stream, StreamContext};
 
 use super::assistant_decode::{AssistantTurnState, Gemma4AssistantStepper};
@@ -821,6 +822,13 @@ impl Gemma4Inner {
         } else {
             0
         };
+        if self
+            .turn_cancel
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(Error::from_reason(PREFILL_CANCELLED));
+        }
         let (prefill_tokens, cached_prefix_len): (Vec<u32>, usize) = if is_delta {
             (tokens[prior_cached_len..].to_vec(), prior_cached_len)
         } else {

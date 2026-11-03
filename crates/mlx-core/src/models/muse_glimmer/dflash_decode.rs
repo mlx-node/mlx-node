@@ -22,6 +22,7 @@ use crate::stream::{Stream, StreamContext};
 
 use super::dflash::DFlashContextCache;
 use super::model::MuseGlimmerInner;
+use crate::models::forward::PREFILL_CANCELLED;
 
 pub(crate) struct DFlashTurnState {
     context: DFlashContextCache,
@@ -234,6 +235,12 @@ impl DsparkBackend for MuseGlimmerInner {
 }
 
 impl MuseGlimmerInner {
+    fn turn_cancelled(&self) -> bool {
+        self.turn_cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     fn dflash_prefill(
         &mut self,
         tokens: &[u32],
@@ -269,13 +276,8 @@ impl MuseGlimmerInner {
         let mut offset = 0usize;
         let mut last_logits = None;
         while offset < tokens.len() {
-            if offset > 0
-                && self
-                    .turn_cancel
-                    .as_ref()
-                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
-            {
-                return Err(Error::from_reason("prefill cancelled"));
+            if self.turn_cancelled() {
+                return Err(Error::from_reason(PREFILL_CANCELLED));
             }
             let end = (offset + super::model::PREFILL_STEP_SIZE as usize).min(tokens.len());
             let chunk = tokens[offset..end]
@@ -375,6 +377,9 @@ impl MuseGlimmerInner {
             verified_hit,
             retained_context_len,
         );
+        if self.turn_cancelled() {
+            return Err(Error::from_reason(PREFILL_CANCELLED));
+        }
         let prefill = if cached_prefix > 0 {
             tokens[cached_prefix..].to_vec()
         } else {
@@ -537,7 +542,11 @@ impl MuseGlimmerInner {
 
 #[cfg(test)]
 mod tests {
-    use super::reusable_dflash_prefix;
+    use super::*;
+    use crate::engine::plan::{
+        DecoderPlan, MediaCapabilities, MediaInputs, SpeculativeKind, TurnPlan,
+    };
+    use crate::engine::types::ChatConfig;
 
     #[test]
     fn continuation_reuses_only_a_matching_retained_dflash_context() {
@@ -546,5 +555,68 @@ mod tests {
         assert_eq!(reusable_dflash_prefix(true, 14, 10, 0, Some(9)), 0);
         assert_eq!(reusable_dflash_prefix(false, 14, 0, 10, Some(10)), 10);
         assert_eq!(reusable_dflash_prefix(false, 14, 0, 10, Some(9)), 0);
+    }
+
+    /// A cancel raised before the prefill keeps the live session: no reset
+    /// and no prefill chunk.
+    #[test]
+    fn cancel_before_prefill_keeps_the_session_and_runs_no_chunk() {
+        let Some(mut inner) =
+            crate::models::muse_glimmer::model::scheduled_dflash::tests::seeded_inner(0xD1F5_0001)
+        else {
+            return;
+        };
+        ChatBackend::reset_caches(&mut inner, ResetScope::PrefixMiss).expect("flat caches");
+        ChatBackend::set_turn_cancel_flag(
+            &mut inner,
+            Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                true,
+            ))),
+        );
+
+        let err = inner
+            .dflash_prefill(&[1, 2, 3], 0, Stream::generation())
+            .err()
+            .expect("a cancelled prefill must not run its first chunk");
+        assert_eq!(err.reason, PREFILL_CANCELLED);
+        assert!(inner.caches.iter().all(|cache| cache.get_offset() == 0));
+
+        inner.cached_token_history = vec![9, 9, 9];
+        let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
+        let config = ChatConfig {
+            temperature: Some(0.0),
+            max_new_tokens: Some(1),
+            ..ChatConfig::default()
+        };
+        let params = ChatBackend::resolve_params(&inner, &config);
+        let thinking = ChatBackend::thinking_setup(&inner, &config);
+        let mut args = WholeTurnArgs {
+            tokens: &[1, 2, 3],
+            tokenizer: &tokenizer,
+            eos_id: u32::MAX,
+            config: &config,
+            params: &params,
+            thinking,
+            plan: TurnPlan {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                use_paged_attention: false,
+                decoder: DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+            },
+            sink: None,
+            cancelled: None,
+            media: MediaInputs {
+                images: &[],
+                audio: &[],
+            },
+        };
+        let err = match inner.dflash_chat_turn(&mut args) {
+            Ok(_) => panic!("a turn cancelled before its prefill must not complete"),
+            Err(e) => e,
+        };
+        assert_eq!(err.reason, PREFILL_CANCELLED);
+        assert_eq!(inner.cached_token_history, [9, 9, 9], "no reset");
+        assert!(inner.caches.iter().all(|cache| cache.get_offset() == 0));
     }
 }

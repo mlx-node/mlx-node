@@ -3,6 +3,8 @@
 use super::*;
 
 use crate::models::forward as fwd;
+use crate::models::qwen3_5::gated_delta_net::{GdnCapturePlan, GdnLayerTape, gdn_cells};
+use crate::models::qwen3_5::model::DFlash2TargetForward;
 
 // Distinct family tag; per-instance ids and format/destination bits bound every
 // graph variant. Lifecycle erases these tapes before weights change or unload.
@@ -290,7 +292,10 @@ pub(crate) enum DFlash2LogitsSpan {
     LastRow,
 }
 
-/// Capture residual taps and recurrent rollback tape for the MoE DFlash2 verifier.
+/// Capture residual taps and recurrent rollback tape for the MoE DFlash2
+/// verifier. `capture` (prefill only: no tape) also returns the GDN state at
+/// each of its chunk rows, one `GdnCell` per row; every other output keeps
+/// the bits of the uncaptured forward.
 pub(crate) fn forward_dflash2_with_taps(
     inner: &mut Qwen35MoeInner,
     input_ids: &MxArray,
@@ -298,12 +303,14 @@ pub(crate) fn forward_dflash2_with_taps(
     record_tape: bool,
     logits_span: DFlash2LogitsSpan,
     gdn_dst: Option<&crate::models::qwen3_5::gdn_blob::GdnDestinations>,
-) -> Result<(
-    MxArray,
-    Vec<MxArray>,
-    Vec<Option<crate::models::qwen3_5::gated_delta_net::GdnLayerTape>>,
-)> {
-    forward_dflash2_with_budget(
+    capture: Option<&GdnCapturePlan<'_>>,
+) -> Result<DFlash2TargetForward> {
+    if record_tape && capture.is_some() {
+        return Err(Error::from_reason(
+            "DFlash2 GDN capture runs on the prefill forward, which records no tape",
+        ));
+    }
+    forward_dflash2_target(
         inner,
         input_ids,
         tap_layers,
@@ -311,6 +318,7 @@ pub(crate) fn forward_dflash2_with_taps(
         logits_span,
         gdn_dst,
         None,
+        capture,
     )
 }
 
@@ -324,14 +332,34 @@ pub(crate) fn forward_dflash2_with_budget(
     logits_span: DFlash2LogitsSpan,
     gdn_dst: Option<&crate::models::qwen3_5::gdn_blob::GdnDestinations>,
     row_budget: Option<&MxArray>,
-) -> Result<(
-    MxArray,
-    Vec<MxArray>,
-    Vec<Option<crate::models::qwen3_5::gated_delta_net::GdnLayerTape>>,
-)> {
+) -> Result<(MxArray, Vec<MxArray>, Vec<Option<GdnLayerTape>>)> {
+    let (logits, taps, tape, _) = forward_dflash2_target(
+        inner,
+        input_ids,
+        tap_layers,
+        record_tape,
+        logits_span,
+        gdn_dst,
+        row_budget,
+        None,
+    )?;
+    Ok((logits, taps, tape))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_dflash2_target(
+    inner: &mut Qwen35MoeInner,
+    input_ids: &MxArray,
+    tap_layers: &[usize],
+    record_tape: bool,
+    logits_span: DFlash2LogitsSpan,
+    gdn_dst: Option<&crate::models::qwen3_5::gdn_blob::GdnDestinations>,
+    row_budget: Option<&MxArray>,
+    capture: Option<&GdnCapturePlan<'_>>,
+) -> Result<DFlash2TargetForward> {
     if record_tape && matches!(logits_span, DFlash2LogitsSpan::All) {
         match forward_dflash2_compiled(inner, input_ids, tap_layers, gdn_dst, row_budget, None) {
-            Ok(Some(out)) => return Ok(out),
+            Ok(Some((logits, taps, tape))) => return Ok((logits, taps, tape, Vec::new())),
             Ok(None) => {}
             Err(error) => {
                 inner.dflash2_compiled_verify_disabled = true;
@@ -354,6 +382,7 @@ pub(crate) fn forward_dflash2_with_budget(
     let mut tape = std::iter::repeat_with(|| None)
         .take(inner.layers.len())
         .collect::<Vec<_>>();
+    let mut captured = Vec::new();
     for index in 0..inner.layers.len() {
         let cache = inner.caches.as_mut().map(|caches| &mut caches[index]);
         hidden = if record_tape {
@@ -367,6 +396,12 @@ pub(crate) fn forward_dflash2_with_budget(
                 Some(&mut slot),
             )?;
             tape[index] = slot;
+            hidden
+        } else if let Some(plan) = capture {
+            let (hidden, layer) = inner.layers[index].forward_captured(&hidden, cache, plan)?;
+            if inner.layers[index].is_linear() {
+                captured.push(layer);
+            }
             hidden
         } else {
             inner.layers[index].forward(&hidden, None, cache, None, true)?
@@ -408,7 +443,11 @@ pub(crate) fn forward_dflash2_with_budget(
     };
     let normalized = inner.final_norm.forward(&hidden)?;
     let logits = project_logits_from_hidden(&normalized, &inner.lm_head, &inner.embedding)?;
-    Ok((logits, taps, tape))
+    let cells = match capture {
+        Some(plan) => gdn_cells(plan, captured)?,
+        None => Vec::new(),
+    };
+    Ok((logits, taps, tape, cells))
 }
 
 /// Deferred recurrent state is private to the exclusive stepper. There is no
@@ -512,7 +551,6 @@ fn forward_dflash2_compiled(
 > {
     use crate::models::qwen3_5::attention::{VerifyKvOut, VerifyPrefix};
     use crate::models::qwen3_5::gated_delta::GdnKernelTape;
-    use crate::models::qwen3_5::gated_delta_net::GdnLayerTape;
     use crate::models::qwen3_5_moe::decoder_layer::{LayerVerifyIo, VerifyResidual};
     use crate::transformer::KvFormat;
 

@@ -10,11 +10,16 @@ import { parseLocalJson } from '../../packages/agent/src/delegate.js';
 import { agentConfigDir } from '../../packages/agent/src/paths.js';
 import {
   leasePinnedManaged,
+  LOCAL_BACKEND_DISABLED_TOOL_ENV,
   managedAgentBinPath,
   probeAgentInstall,
   serveBannerBaseUrl,
 } from '../../packages/cli/src/commands/agent/grok-build.js';
-import { chooseDefaultModel, readPersistedDefaultModel } from '../../packages/cli/src/commands/agent/index.js';
+import {
+  chooseDefaultModel,
+  readPersistedDefaultModel,
+  withWebSearchDisabled,
+} from '../../packages/cli/src/commands/agent/index.js';
 import { DELEGATE_DEFAULT_ARGS } from '../../packages/cli/src/commands/delegate.js';
 import {
   DETECTION_SYSTEM,
@@ -92,24 +97,47 @@ function entrypointArgs(entrypoint: 'agent' | 'delegate'): string[] {
   return entrypoint === 'delegate' ? DELEGATE_DEFAULT_ARGS : ['--permission-mode', 'auto'];
 }
 
-/**
- * Shape of every per-case agent invocation, for reports. `<…>` placeholders
- * are filled at spawn time; the inference host runs separately as
- * `mlx serve --port 0 --auth-token <token>`.
- */
-export function cliInvocation(_root: string, entrypoint: 'agent' | 'delegate'): string[] {
-  return [
-    '<mlx-agent>',
+/** Per-case agent argv, with the served-launch flags `mlx agent` adds. */
+function caseArgv(model: string, entrypoint: 'agent' | 'delegate', promptFile: string, cwd: string): string[] {
+  return withWebSearchDisabled([
     '-m',
-    '<default model>',
+    model,
     ...entrypointArgs(entrypoint),
     '--prompt-file',
-    '<prompt file>',
+    promptFile,
     '--output-format',
     'streaming-messages-json',
     '--cwd',
-    '<workspace>',
-  ];
+    cwd,
+  ]);
+}
+
+/** `mlx serve` argv; `--preload` matches the launcher's preload of the `-m` model. */
+export function serveInvocation(cliEntry: string, token: string, modelsDir: string, model: string): string[] {
+  return [cliEntry, 'serve', '--port', '0', `--auth-token=${token}`, '--models-dir', modelsDir, '--preload', model];
+}
+
+/** Agent env pointing grok at `mlx serve`, with the launcher's media-tool switches. */
+export function agentLaunchEnv(serveUrl: string, token: string, base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...base,
+    GROK_MODELS_BASE_URL: serveUrl,
+    GROK_CLI_CHAT_PROXY_BASE_URL: serveUrl,
+    GROK_XAI_API_BASE_URL: serveUrl,
+    XAI_API_KEY: token,
+    GROK_DISABLE_AUTOUPDATER: '1',
+  };
+  for (const name of LOCAL_BACKEND_DISABLED_TOOL_ENV) env[name] ??= '0';
+  return env;
+}
+
+/**
+ * Shape of every per-case agent invocation, for reports. `<…>` placeholders
+ * are filled at spawn time; the inference host runs separately as
+ * `mlx serve --port 0 --auth-token <token> --preload <default model>`.
+ */
+export function cliInvocation(_root: string, entrypoint: 'agent' | 'delegate'): string[] {
+  return ['<mlx-agent>', ...caseArgv('<default model>', entrypoint, '<prompt file>', '<workspace>')];
 }
 
 export interface PromptOutcome {
@@ -194,11 +222,9 @@ export class AgentCli {
     if (this.closing) throw new Error('Evaluation stopped.');
     this.serveToken = randomBytes(24).toString('base64url');
     const cliEntry = join(this.root, 'packages', 'cli', 'dist', 'cli.js');
-    const serve = spawn(
-      process.execPath,
-      [cliEntry, 'serve', '--port', '0', '--auth-token', this.serveToken, '--models-dir', modelsDir],
-      { stdio: ['ignore', 'pipe', 'pipe'] },
-    );
+    const serve = spawn(process.execPath, serveInvocation(cliEntry, this.serveToken, modelsDir, this.modelId), {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     this.child = serve;
     serve.stdout!.on('data', (chunk: Buffer) => appendFileSync(join(this.output, 'serve.log'), chunk));
     serve.stderr!.on('data', (chunk: Buffer) => appendFileSync(join(this.output, 'serve.log'), chunk));
@@ -210,14 +236,7 @@ export class AgentCli {
       throw new Error('Evaluation stopped.');
     }
 
-    this.agentEnv = {
-      ...process.env,
-      GROK_MODELS_BASE_URL: this.serveUrl,
-      GROK_CLI_CHAT_PROXY_BASE_URL: this.serveUrl,
-      GROK_XAI_API_BASE_URL: this.serveUrl,
-      XAI_API_KEY: this.serveToken,
-      GROK_DISABLE_AUTOUPDATER: '1',
-    };
+    this.agentEnv = agentLaunchEnv(this.serveUrl, this.serveToken, process.env);
     return { model: { id: this.modelId, provider: 'mlx' } };
   }
 
@@ -267,17 +286,7 @@ export class AgentCli {
     const promptFile = join(this.output, 'prompts', `${runId}.txt`);
     await mkdir(join(this.output, 'prompts'), { recursive: true });
     await writeFile(promptFile, message);
-    const argv = [
-      '-m',
-      this.modelId,
-      ...entrypointArgs(this.entrypoint),
-      '--prompt-file',
-      promptFile,
-      '--output-format',
-      'streaming-messages-json',
-      '--cwd',
-      this.cwd,
-    ];
+    const argv = caseArgv(this.modelId, this.entrypoint, promptFile, this.cwd);
     const child = spawn(this.bin, argv, {
       cwd: this.cwd,
       env: this.agentEnv,
@@ -369,8 +378,7 @@ export class AgentCli {
   private stopChild(child?: ChildProcess): Promise<void> {
     // Signal kills (e.g. OOM) leave exitCode null — the termination lives in
     // signalCode, and without this the 'close' listener below never fires.
-    if (child === undefined || child.exitCode !== null || child.signalCode !== null)
-      return Promise.resolve();
+    if (child === undefined || child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
     return new Promise<void>((done) => {
       const force = setTimeout(() => child.kill('SIGKILL'), 10_000);
       child.once('close', () => {

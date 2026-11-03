@@ -46,6 +46,7 @@ use crate::engine::{
 };
 use crate::models::qwen3_5::config::Qwen3_5Config;
 use crate::models::qwen3_5::decoder_layer::DecoderLayer;
+use crate::models::qwen3_5::dflash2_state::trace::{DropKind, PrefixTracker, reset_drop_site};
 #[cfg(test)]
 use crate::models::qwen3_5::gdn_checkpoint_store::{
     GDN_PREFIX_CHECKPOINTS_PER_OWNER, GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER,
@@ -88,8 +89,8 @@ mod training;
 use self::chat_backend::resolve_qwen35_chat_params;
 pub(crate) use self::commands::{Qwen35Cmd, Qwen35FamilyCommand};
 pub(crate) use self::forward::{
-    DFlash2LogitsSpan, PREFILL_STEP_SIZE, async_eval_layer_caches, eval_layer_caches,
-    forward_dflash2_with_taps, partition_prefill_chunks,
+    DFlash2LogitsSpan, DFlash2TargetForward, PREFILL_STEP_SIZE, async_eval_layer_caches,
+    eval_layer_caches, forward_dflash2_with_taps, partition_prefill_chunks,
 };
 use self::forward::{
     chunked_prefill, chunked_prefill_with_hidden, eager_verify_step, forward_inner,
@@ -105,14 +106,14 @@ use self::paged_backend::{Qwen35PrefixState, StreamSender};
 use self::state::configure_paged_mtp_profiler;
 use self::state::{
     ChatDecodeInputs, DenseGdnCheckpointStoreTrace, DenseGdnHistoryCheckpoint,
-    DenseGdnPrefixCheckpoint, DenseGdnPrefixPreparation, TokenPrefixMismatchTrace,
-    apply_qwen35_dense_planned_decoder, begin_paged_mtp_profiler, clone_dense_linear_layer_caches,
-    dense_paged_frontier_skew, dense_paged_linear_caches_ready, fresh_dense_layer_caches,
-    qwen35_dense_media_plan, qwen35_dense_session_media,
-    qwen35_dense_session_media_matches_payloads, token_prefix_mismatch_trace,
+    DenseGdnPrefixCheckpoint, DenseGdnPrefixPreparation, apply_qwen35_dense_planned_decoder,
+    begin_paged_mtp_profiler, clone_dense_linear_layer_caches, dense_paged_frontier_skew,
+    dense_paged_linear_caches_ready, fresh_dense_layer_caches, qwen35_dense_media_plan,
+    qwen35_dense_session_media, qwen35_dense_session_media_matches_payloads,
 };
 pub(crate) use self::state::{
-    arrays_bits_equal_for_test, constrain_paged_context_params, qwen35_dense_vision_active,
+    TokenPrefixMismatchTrace, arrays_bits_equal_for_test, constrain_paged_context_params,
+    qwen35_dense_vision_active, token_prefix_mismatch_trace,
 };
 use crate::vision::qwen::cache::{VisionCache, VisionCacheInner, vlm_prepare_vision_features};
 
@@ -166,7 +167,9 @@ pub(crate) struct Qwen35Inner {
     /// precedence over the target checkpoint's inline one-layer MTP head.
     pub(crate) dflash2: Option<crate::models::qwen3_5::dflash2::DFlash2Model>,
     pub(crate) dflash2_context: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
-    pub(crate) dflash2_turn_state: Option<crate::models::qwen3_5::dflash2_decode::DFlash2TurnState>,
+    pub(crate) dflash2_turn_state: Option<crate::models::qwen3_5::dflash2_turn::DFlash2TurnState>,
+    pub(crate) dflash2_prefix: PrefixTracker,
+    pub(crate) dflash2_states: crate::models::qwen3_5::dflash2_state::flat::FlatStates,
     /// Latched when the compiled DFlash2 verify graph fails at trace or
     /// replay — the failure mode is structural, so the stepper stays on the
     /// eager path for the rest of the model's lifetime.
@@ -870,3 +873,6 @@ mod paged_gdn_frontier_tests;
 
 #[cfg(test)]
 mod mtp_gate_state_tests;
+
+#[cfg(test)]
+mod dflash2_park_tests;

@@ -1496,12 +1496,24 @@ impl DraftKvWindow {
     }
 }
 
+/// One segment's draft K/V for every layer, projected at `base` and not yet
+/// stored: `(keys, values)` per layer as `[B, HK, rows, D]`.
+pub(crate) struct ProjectedContext {
+    base: i32,
+    rows: i64,
+    kv: Vec<(MxArray, MxArray)>,
+}
+
 pub(crate) struct DFlash2ContextCache {
     layers: Vec<DraftKvWindow>,
     /// The sliding mask depends only on the window/block geometry, which
     /// repeats once the window is full, so it is built once and reused.
     mask_memo: SlidingMaskMemo,
     logical_len: i32,
+    /// Position one past the newest row the windows hold. `record_only`
+    /// advances `logical_len` alone, so the windows do not end at
+    /// `logical_len` until enough later rows are appended.
+    kv_end: i32,
     /// Exact token prefix represented by every layer cache above.
     ///
     /// A length alone is not cache provenance: an unrelated paged request can
@@ -1523,6 +1535,7 @@ impl DFlash2ContextCache {
                 .collect(),
             mask_memo: None,
             logical_len: 0,
+            kv_end: 0,
             token_history: Vec::new(),
         }
     }
@@ -1534,6 +1547,18 @@ impl DFlash2ContextCache {
         base: i32,
         token_ids: &[u32],
     ) -> Result<()> {
+        let projected = self.project(model, fused_context, base)?;
+        self.append_projected(projected, token_ids)
+    }
+
+    /// Every layer's draft K/V for `fused_context` rows at `base`, the
+    /// context's next position; `append_projected` stores them.
+    pub(crate) fn project(
+        &self,
+        model: &DFlash2Model,
+        fused_context: &MxArray,
+        base: i32,
+    ) -> Result<ProjectedContext> {
         if base != self.logical_len {
             return Err(Error::from_reason(format!(
                 "DFlash2 context append starts at {base}, expected {}",
@@ -1547,21 +1572,39 @@ impl DFlash2ContextCache {
                 self.logical_len
             )));
         }
-        let rows = fused_context.shape_at(1)? as usize;
+        Ok(ProjectedContext {
+            base,
+            rows: fused_context.shape_at(1)?,
+            kv: model.project_context(fused_context, base)?,
+        })
+    }
+
+    pub(crate) fn append_projected(
+        &mut self,
+        projected: ProjectedContext,
+        token_ids: &[u32],
+    ) -> Result<()> {
+        if projected.base != self.logical_len {
+            return Err(Error::from_reason(format!(
+                "DFlash2 context append starts at {}, expected {}",
+                projected.base, self.logical_len
+            )));
+        }
+        let rows = projected.rows as usize;
         if rows != token_ids.len() {
             return Err(Error::from_reason(format!(
                 "DFlash2 context append has {rows} hidden rows for {} token ids",
                 token_ids.len()
             )));
         }
-        for ((keys, values), window) in model
-            .project_context(fused_context, base)?
-            .iter()
-            .zip(self.layers.iter_mut())
-        {
-            window.append(keys, values)?;
+        if projected.kv.len() != self.layers.len() {
+            return Err(Error::from_reason(format!(
+                "DFlash2 context append projected {} layers for {} windows",
+                projected.kv.len(),
+                self.layers.len()
+            )));
         }
-        self.logical_len = self
+        let next = self
             .logical_len
             .checked_add(i32::try_from(rows).map_err(|_| {
                 Error::from_reason(format!(
@@ -1569,8 +1612,98 @@ impl DFlash2ContextCache {
                 ))
             })?)
             .ok_or_else(|| Error::from_reason("DFlash2 context length overflow"))?;
+        for ((keys, values), window) in projected.kv.iter().zip(self.layers.iter_mut()) {
+            window.append(keys, values)?;
+        }
+        self.logical_len = next;
+        self.kv_end = next;
         self.token_history.extend_from_slice(token_ids);
         Ok(())
+    }
+
+    /// The window as it stands once rows `[.., c)` are appended, taken while
+    /// `chunk` (projected at this context's next position, `chunk_tokens`
+    /// its ids) is not yet appended: each window's newest rows, then the
+    /// chunk's rows below `c`. A compact, evaluated deep copy with logical
+    /// length `c` and provenance `[.., c)`. Evaluated here because a later
+    /// append that overruns the window stores its rows in place over the
+    /// rows this reads.
+    pub(crate) fn snapshot_window_at(
+        &self,
+        c: i32,
+        chunk: &ProjectedContext,
+        chunk_tokens: &[u32],
+    ) -> Result<DFlash2ContextCache> {
+        if chunk.base != self.logical_len
+            || usize::try_from(self.logical_len).ok() != Some(self.token_history.len())
+            || chunk.kv.len() != self.layers.len()
+            || usize::try_from(chunk.rows).ok() != Some(chunk_tokens.len())
+        {
+            return Err(Error::from_reason(
+                "DFlash2 window snapshot chunk does not continue this context",
+            ));
+        }
+        let from_chunk = i64::from(c) - i64::from(chunk.base);
+        if !(0..=chunk.rows).contains(&from_chunk) {
+            return Err(Error::from_reason(format!(
+                "DFlash2 window snapshot at {c} is outside the chunk [{}, {})",
+                chunk.base,
+                i64::from(chunk.base) + chunk.rows
+            )));
+        }
+        let mut layers = Vec::with_capacity(self.layers.len());
+        let mut arrays = Vec::with_capacity(2 * self.layers.len());
+        for (window, (chunk_keys, chunk_values)) in self.layers.iter().zip(&chunk.kv) {
+            let rows = window.window.min(i64::from(c));
+            let chunk_rows = from_chunk.min(rows);
+            let ring_rows = rows - chunk_rows;
+            if ring_rows > 0 && (self.kv_end != self.logical_len || window.len() < ring_rows) {
+                return Err(Error::from_reason(format!(
+                    "DFlash2 window snapshot at {c} needs {ring_rows} rows below {} that the draft window does not hold",
+                    chunk.base
+                )));
+            }
+            let mut snapshot = DraftKvWindow::new(window.window, window.reserve);
+            if rows > 0 {
+                let ring = window.view();
+                let take = |chunk_rows_array: &MxArray, ring_part: Option<&MxArray>| {
+                    let tail =
+                        chunk_rows_array.slice_axis(2, from_chunk - chunk_rows, from_chunk)?;
+                    let joined = match ring_part {
+                        Some(ring_part) if ring_rows > 0 => {
+                            let live = ring_part.shape_at(2)?;
+                            let head = ring_part.slice_axis(2, live - ring_rows, live)?;
+                            if chunk_rows > 0 {
+                                MxArray::concatenate(&head, &tail, 2)?
+                            } else {
+                                head
+                            }
+                        }
+                        _ => tail,
+                    };
+                    joined.deep_copy()
+                };
+                snapshot.keys = Some(take(chunk_keys, ring.as_ref().map(|(k, _)| k))?);
+                snapshot.values = Some(take(chunk_values, ring.as_ref().map(|(_, v)| v))?);
+                snapshot.end = rows;
+            }
+            layers.push(snapshot);
+        }
+        for window in &layers {
+            window.collect_arrays(&mut arrays);
+        }
+        if !arrays.is_empty() {
+            MxArray::eval_arrays(&arrays)?;
+        }
+        let mut token_history = self.token_history.clone();
+        token_history.extend_from_slice(&chunk_tokens[..from_chunk as usize]);
+        Ok(DFlash2ContextCache {
+            layers,
+            mask_memo: None,
+            logical_len: c,
+            kv_end: c,
+            token_history,
+        })
     }
 
     /// Project a full eight-row verifier block, then store only its retained
@@ -1622,6 +1755,7 @@ impl DFlash2ContextCache {
             window.append(keys, values)?;
         }
         self.logical_len = next;
+        self.kv_end = next;
         self.token_history.extend_from_slice(token_ids);
         Ok(())
     }
@@ -1648,6 +1782,11 @@ impl DFlash2ContextCache {
         self.logical_len
     }
 
+    #[cfg(test)]
+    pub(crate) fn window_views(&self) -> Vec<Option<(MxArray, MxArray)>> {
+        self.layers.iter().map(DraftKvWindow::view).collect()
+    }
+
     pub(crate) fn token_history(&self) -> &[u32] {
         &self.token_history
     }
@@ -1666,6 +1805,36 @@ impl DFlash2ContextCache {
         } else {
             MxArray::eval_arrays(&arrays)
         }
+    }
+
+    /// An evaluated copy with the same buffer layout that shares no buffer
+    /// with `self`: the windows store rows in place, so a snapshot installed
+    /// as a live context must not alias the one kept for later resumes.
+    pub(crate) fn deep_copy(&self) -> Result<DFlash2ContextCache> {
+        let copy = |buffer: &Option<MxArray>| buffer.as_ref().map(MxArray::deep_copy).transpose();
+        let layers = self
+            .layers
+            .iter()
+            .map(|window| {
+                Ok(DraftKvWindow {
+                    keys: copy(&window.keys)?,
+                    values: copy(&window.values)?,
+                    start: window.start,
+                    end: window.end,
+                    window: window.window,
+                    reserve: window.reserve,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let copied = DFlash2ContextCache {
+            layers,
+            mask_memo: None,
+            logical_len: self.logical_len,
+            kv_end: self.kv_end,
+            token_history: self.token_history.clone(),
+        };
+        copied.eval()?;
+        Ok(copied)
     }
 }
 
@@ -1811,13 +1980,15 @@ impl DFlash2Model {
     /// `k|v` for the context append. The merge needs K-quant projections
     /// whose widths are whole Tiled64 tiles ([`kquant_rows_merge`]) and
     /// agreeing packed formats; otherwise the separate projections stay.
-    /// Below the GEMM threshold the tiled kernels decode and reduce each
-    /// output row the same way at any width except the M = 8 tensor-op
-    /// route's split-K count, which follows N (`qmm_m8_nax_splits`), so a
-    /// merged block of 8 rows may differ from the separate projections in
-    /// the last bf16 bit. Per-layer merges turn the originals into row views
-    /// of the merged buffer (no extra bytes); the cross-layer `k|v` merge is
-    /// an extra resident copy, counted in `weight_bytes`.
+    /// The merged and separate projections are not bit-equal in general: the
+    /// kernel tier and its split-K follow both the row count M and the width
+    /// N, so at the published Qwen3.8 draft geometry on an M5 Max the merged
+    /// context `k|v` differs from the per-layer projections at 1 and at 8
+    /// rows. A draft K/V row's bits depend on the route and width it was
+    /// projected at; only the same (route, width) reproduces it. Per-layer
+    /// merges turn the originals into row views of the merged buffer (no
+    /// extra bytes); the cross-layer `k|v` merge is an extra resident copy,
+    /// counted in `weight_bytes`.
     fn merge_projections(&mut self) -> Result<()> {
         let merge_rows = |first: &LinearProj, widths: &[i64]| -> bool {
             match first {
@@ -4664,6 +4835,568 @@ mod tests {
                 assert_bits_match(&bits(v), want_v, exact, &label("context values"));
             }
         }
+    }
+
+    /// A draft at the published Qwen3.8 DFlash2 geometry, merged as
+    /// `load_dflash2` merges it: five layers (merged context `k|v` of
+    /// N = 10240) fed by five 5120-wide target taps (fc `[5120, 25600]`).
+    fn qwen38_geometry_draft() -> super::DFlash2Model {
+        let mut model = quantized_draft_model(5, 256);
+        model.config.target_layers = vec![5, 19, 33, 47, 61];
+        model.config.target_num_layers = 64;
+        let fc =
+            MxArray::random_normal(&[5120, 5 * 5120], 0.0, 0.02, Some(DType::BFloat16)).unwrap();
+        model.fc = LinearProj::Quantized(super::quantize_draft_weight(&fc, "probe fc").unwrap());
+        model.merge_projections().unwrap();
+        model
+    }
+
+    /// Row-major bits of per-layer `[1, HK, T, D]` context K/V: row `t` is
+    /// the contiguous slice `[t * width, (t + 1) * width)` holding every
+    /// layer's K then V heads.
+    fn context_rows(pairs: &[(MxArray, MxArray)]) -> (Vec<u16>, usize) {
+        let mut parts = Vec::new();
+        for (keys, values) in pairs {
+            for array in [keys, values] {
+                let rows = array.shape_at(2).unwrap();
+                let width = array.shape_at(1).unwrap() * array.shape_at(3).unwrap();
+                parts.push(
+                    array
+                        .transpose(Some(&[0, 2, 1, 3]))
+                        .unwrap()
+                        .reshape(&[rows, width])
+                        .unwrap(),
+                );
+            }
+        }
+        let joined = MxArray::concatenate_many(parts.iter().collect(), Some(1)).unwrap();
+        let width = joined.shape_at(1).unwrap() as usize;
+        (bits(&joined), width)
+    }
+
+    /// Partition `widths` into classes whose shared rows are bit-identical
+    /// (`rows[i]` holds whole rows of `width` elements; `suffix` compares
+    /// the newest shared rows, else the oldest).
+    fn bit_classes(widths: &[i64], rows: &[Vec<u16>], suffix: bool) -> Vec<Vec<i64>> {
+        let agree = |a: &[u16], b: &[u16]| {
+            let m = a.len().min(b.len());
+            if suffix {
+                a[a.len() - m..] == b[b.len() - m..]
+            } else {
+                a[..m] == b[..m]
+            }
+        };
+        let mut classes: Vec<(usize, Vec<i64>)> = Vec::new();
+        for (index, &width) in widths.iter().enumerate() {
+            match classes
+                .iter_mut()
+                .find(|(first, _)| agree(&rows[*first], &rows[index]))
+            {
+                Some((_, members)) => members.push(width),
+                None => classes.push((index, vec![width])),
+            }
+        }
+        classes.into_iter().map(|(_, members)| members).collect()
+    }
+
+    /// Whether a row's draft K/V bits depend on (i) the append width M,
+    /// (ii) the projection route (per-layer above `merged_rows()`, merged
+    /// `context_kv` at or below it, full-width eight-row prefix), (iii) the
+    /// row's slot in its block, (iv) the values of the other (padding) rows.
+    ///
+    /// Slot and padding never matter on any GPU: every kernel reduces a row
+    /// alone. Width does: the kernel tier follows M (`qmv_t64` at 1,
+    /// `qmv_wide_t64`, the tensor-op tier, then `qmm_t_splitk`, whose split
+    /// count is `512 / (32 * ceil(M / 32))` clamped to whole K groups), so
+    /// the fc runs unsplit from M = 33 and each layer's `k|v` (N = 1024)
+    /// from M = 257. A cold-prefill tail append narrower than that is not
+    /// bit-reproducible at another width, and a rebuilt window must project
+    /// each segment at its recorded (route, width), padding allowed. Which
+    /// widths differ depends on the GPU's kernel tiers and core count, so
+    /// that part is asserted on the calibrated host only (gen 17 NAX, 40
+    /// cores) and only printed elsewhere.
+    #[test]
+    fn draft_context_kv_bits_follow_append_width_not_slot_or_padding() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            eprintln!("skipping: Metal only");
+            return;
+        }
+        unsafe { mlx_sys::mlx_seed(0x51_0001) };
+        let model = qwen38_geometry_draft();
+        assert!(model.context_kv.is_some(), "cross-layer k|v merge");
+        assert_eq!(model.merged_rows(), 8);
+        let n = 2048i64;
+        let taps = (0..5)
+            .map(|_| {
+                MxArray::random_normal(&[1, n, 5120], 0.0, 0.5, Some(DType::BFloat16)).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let tap_rows = |from: i64, to: i64| {
+            taps.iter()
+                .map(|tap| tap.slice_axis(1, from, to).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let base = 40_000i32;
+        let fused_all = model.fuse_context(&taps).unwrap();
+        let widths = [
+            1i64, 2, 3, 7, 8, 9, 15, 16, 17, 32, 33, 64, 65, 128, 129, 224, 225, 255, 256, 257,
+            288, 548, 1024, 1500, 2047, 2048,
+        ];
+
+        // (i) Width alone: fc over taps rows [0, M); projection of fixed
+        // fused rows [0, M); end to end as a cold prefill tail append makes
+        // it (rows [n - M, n) appended at their absolute positions).
+        let mut fc = Vec::new();
+        let mut projection = Vec::new();
+        let mut tail = Vec::new();
+        for &width in &widths {
+            fc.push(bits(&model.fuse_context(&tap_rows(0, width)).unwrap()));
+            projection.push(
+                context_rows(
+                    &model
+                        .project_context(&fused_all.slice_axis(1, 0, width).unwrap(), base)
+                        .unwrap(),
+                )
+                .0,
+            );
+            let start = n - width;
+            let mut context = DFlash2ContextCache::new(&model.config);
+            context
+                .record_only(&vec![0; (base as i64 + start) as usize])
+                .unwrap();
+            context
+                .append(
+                    &model,
+                    &model.fuse_context(&tap_rows(start, n)).unwrap(),
+                    base + start as i32,
+                    &vec![1; width as usize],
+                )
+                .unwrap();
+            let views = context
+                .layers
+                .iter()
+                .map(|window| window.view().unwrap())
+                .collect::<Vec<_>>();
+            tail.push(context_rows(&views).0);
+        }
+        let fc_classes = bit_classes(&widths, &fc, false);
+        let projection_classes = bit_classes(&widths, &projection, false);
+        let tail_classes = bit_classes(&widths, &tail, true);
+        eprintln!("probe (i) fc width classes: {fc_classes:?}");
+        eprintln!("probe (i) projection width classes: {projection_classes:?}");
+        eprintln!("probe (i) end-to-end tail width classes: {tail_classes:?}");
+
+        // (ii) Routes at <= 8 rows: merged exact width (dense commit and a
+        // short prefill tail), full-width eight-row prefix (MoE commit),
+        // per-layer exact width (no merge), per-layer at 9 and 2048 rows.
+        let width_index = |width: i64| widths.iter().position(|&w| w == width).unwrap();
+        let (_, row) = context_rows(
+            &model
+                .project_context(&fused_all.slice_axis(1, 0, 1).unwrap(), base)
+                .unwrap(),
+        );
+        let mut route_table = Vec::new();
+        for keep in 1..=8i64 {
+            let fused = fused_all.slice_axis(1, 0, keep).unwrap();
+            let merged = context_rows(&model.project_context(&fused, base).unwrap()).0;
+            let full_width = context_rows(
+                &model
+                    .project_context_rows(&fused_all.slice_axis(1, 0, 8).unwrap(), base, Some(keep))
+                    .unwrap(),
+            )
+            .0;
+            let per_layer = context_rows(
+                &model
+                    .layers
+                    .iter()
+                    .map(|layer| layer.attention.project_context(&fused, base).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .0;
+            let rows = keep as usize * row;
+            let per_layer_9 = &projection[width_index(9)][..rows];
+            let per_layer_2048 = &projection[width_index(2048)][..rows];
+            route_table.push((
+                keep,
+                merged == full_width,
+                merged == per_layer,
+                per_layer == per_layer_9,
+                per_layer == per_layer_2048,
+            ));
+        }
+        eprintln!(
+            "probe (ii) keep: merged==full_width, merged==per_layer, per_layer==per_layer@9, per_layer==per_layer@2048: {route_table:?}"
+        );
+
+        // (iii) Slot: one row at slot p of an M-row block, its absolute
+        // position held fixed (base - p), other rows unchanged.
+        let slot_widths = [8i64, 16, 32, 64, 256];
+        let mut slot_table = Vec::new();
+        for &width in &slot_widths {
+            let others_fused = fused_all.slice_axis(1, 100, 100 + width).unwrap();
+            let others_taps = tap_rows(100, 100 + width);
+            let x_fused = fused_all.slice_axis(1, 5, 6).unwrap();
+            let x_taps = tap_rows(5, 6);
+            let place = |others: &MxArray, x: &MxArray, slot: i64| {
+                let mut parts = Vec::new();
+                if slot > 0 {
+                    parts.push(others.slice_axis(1, 0, slot).unwrap());
+                }
+                parts.push(x.clone());
+                if slot + 1 < width {
+                    parts.push(others.slice_axis(1, slot + 1, width).unwrap());
+                }
+                MxArray::concatenate_many(parts.iter().collect(), Some(1)).unwrap()
+            };
+            let mut projected = Vec::new();
+            let mut fused_end_to_end = Vec::new();
+            for slot in [0, 1, width / 2, width - 1] {
+                let at = base - slot as i32;
+                let pick =
+                    |rows: Vec<u16>| rows[slot as usize * row..(slot as usize + 1) * row].to_vec();
+                projected.push(pick(
+                    context_rows(
+                        &model
+                            .project_context(&place(&others_fused, &x_fused, slot), at)
+                            .unwrap(),
+                    )
+                    .0,
+                ));
+                let block_taps = others_taps
+                    .iter()
+                    .zip(&x_taps)
+                    .map(|(others, x)| place(others, x, slot))
+                    .collect::<Vec<_>>();
+                fused_end_to_end.push(pick(
+                    context_rows(
+                        &model
+                            .project_context(&model.fuse_context(&block_taps).unwrap(), at)
+                            .unwrap(),
+                    )
+                    .0,
+                ));
+            }
+            slot_table.push((
+                width,
+                projected.windows(2).all(|pair| pair[0] == pair[1]),
+                fused_end_to_end.windows(2).all(|pair| pair[0] == pair[1]),
+            ));
+        }
+        eprintln!(
+            "probe (iii) M: projection slot-invariant, end-to-end slot-invariant: {slot_table:?}"
+        );
+
+        // (iv) Padding: retained rows [0, k) of an M-row block, the rest
+        // the real rows, zeros, or large random rows.
+        let mut padding_table = Vec::new();
+        for &width in &slot_widths {
+            for keep in [1, width / 2, width - 1] {
+                let variants = [0u8, 1, 2];
+                let pad = |source: &MxArray, variant: u8| -> MxArray {
+                    let rows = width - keep;
+                    let shape = [1, rows, source.shape_at(2).unwrap()];
+                    let padding = match variant {
+                        0 => source.slice_axis(1, keep, width).unwrap(),
+                        1 => MxArray::zeros(&shape, Some(DType::BFloat16)).unwrap(),
+                        _ => {
+                            MxArray::random_normal(&shape, 0.0, 8.0, Some(DType::BFloat16)).unwrap()
+                        }
+                    };
+                    MxArray::concatenate(&source.slice_axis(1, 0, keep).unwrap(), &padding, 1)
+                        .unwrap()
+                };
+                let retained = keep as usize * row;
+                let mut projected = Vec::new();
+                let mut fused_end_to_end = Vec::new();
+                for variant in variants {
+                    projected.push(
+                        context_rows(
+                            &model
+                                .project_context(
+                                    &pad(&fused_all.slice_axis(1, 0, width).unwrap(), variant),
+                                    base,
+                                )
+                                .unwrap(),
+                        )
+                        .0[..retained]
+                            .to_vec(),
+                    );
+                    let padded_taps = tap_rows(0, width)
+                        .iter()
+                        .map(|tap| pad(tap, variant))
+                        .collect::<Vec<_>>();
+                    fused_end_to_end.push(
+                        context_rows(
+                            &model
+                                .project_context(&model.fuse_context(&padded_taps).unwrap(), base)
+                                .unwrap(),
+                        )
+                        .0[..retained]
+                            .to_vec(),
+                    );
+                }
+                padding_table.push((
+                    width,
+                    keep,
+                    projected.windows(2).all(|pair| pair[0] == pair[1]),
+                    fused_end_to_end.windows(2).all(|pair| pair[0] == pair[1]),
+                ));
+            }
+        }
+        eprintln!(
+            "probe (iv) M, keep: projection padding-invariant, end-to-end padding-invariant: {padding_table:?}"
+        );
+
+        assert!(
+            slot_table
+                .iter()
+                .all(|&(_, projected, fused)| projected && fused),
+            "a row's draft K/V must not depend on its slot: {slot_table:?}"
+        );
+        assert!(
+            padding_table
+                .iter()
+                .all(|&(_, _, projected, fused)| projected && fused),
+            "a row's draft K/V must not depend on the other rows: {padding_table:?}"
+        );
+        let class_of = |classes: &[Vec<i64>], width: i64| {
+            classes
+                .iter()
+                .position(|class| class.contains(&width))
+                .unwrap()
+        };
+        let width_changes_bits = tail_classes.len() > 1;
+        let per_layer_classes = widths
+            .iter()
+            .filter(|&&width| width > model.merged_rows())
+            .map(|&width| class_of(&projection_classes, width))
+            .collect::<std::collections::BTreeSet<_>>();
+        let segment_key = if per_layer_classes.len() > 1 {
+            "(route, width)"
+        } else {
+            "route class"
+        };
+        eprintln!(
+            "probe decision: (1) a changed append width changes draft K/V bits: {}; (2) the segment map needs {segment_key}",
+            if width_changes_bits { "yes" } else { "no" }
+        );
+
+        let calibrated = unsafe {
+            mlx_sys::mlx_gpu_architecture_gen() == 17
+                && mlx_sys::mlx_metal_is_nax_available()
+                && mlx_sys::mlx_gpu_core_count() == 40
+        };
+        if !calibrated {
+            return;
+        }
+        assert!(
+            width_changes_bits && per_layer_classes.len() > 1,
+            "the tiled kernels' reduction follows M: a width-independent draft projection \
+             would let a rebuilt window ignore append widths"
+        );
+        assert_eq!(
+            fc_classes,
+            [
+                vec![1],
+                vec![2, 3, 7],
+                vec![8, 9, 15, 16, 17, 32],
+                vec![
+                    33, 64, 65, 128, 129, 224, 225, 255, 256, 257, 288, 548, 1024, 1500, 2047, 2048
+                ],
+            ]
+        );
+        assert_eq!(
+            projection_classes,
+            [
+                vec![1],
+                vec![2, 3, 7, 9],
+                vec![8],
+                vec![15, 16, 17, 32],
+                vec![33, 64],
+                vec![65],
+                vec![128],
+                vec![129, 224, 225, 255, 256],
+                vec![257, 288, 548, 1024, 1500, 2047, 2048],
+            ]
+        );
+        assert_eq!(
+            tail_classes,
+            [
+                vec![1],
+                vec![2, 3, 7],
+                vec![8],
+                vec![9],
+                vec![15, 16, 17, 32],
+                vec![33, 64],
+                vec![65],
+                vec![128],
+                vec![129, 224, 225, 255, 256],
+                vec![257, 288, 548, 1024, 1500, 2047, 2048],
+            ]
+        );
+        // keep: merged == full-width prefix, merged == per-layer,
+        // per-layer == per-layer at 9 rows, per-layer == per-layer at 2048.
+        let mut want_routes = vec![(1, false, false, false, false)];
+        want_routes.extend((2..=7).map(|keep| (keep, false, true, true, false)));
+        want_routes.push((8, true, false, true, false));
+        assert_eq!(route_table, want_routes);
+    }
+
+    fn window_bits(context: &DFlash2ContextCache) -> Vec<(i64, Vec<u16>, Vec<u16>)> {
+        context
+            .window_views()
+            .iter()
+            .map(|view| match view {
+                Some((keys, values)) => (keys.shape_at(2).unwrap(), bits(keys), bits(values)),
+                None => (0, Vec::new(), Vec::new()),
+            })
+            .collect()
+    }
+
+    /// The first `rows` rows of a projected segment, as a narrower append of
+    /// the same projection (same widths, so the same bits).
+    fn projected_prefix(projected: &super::ProjectedContext, rows: i64) -> super::ProjectedContext {
+        super::ProjectedContext {
+            base: projected.base,
+            rows,
+            kv: projected
+                .kv
+                .iter()
+                .map(|(keys, values)| {
+                    (
+                        keys.slice_axis(2, 0, rows).unwrap(),
+                        values.slice_axis(2, 0, rows).unwrap(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// A window snapshot at every row `c` of a chunked append schedule (mid
+    /// chunk, at a chunk edge, at a chunk start, below and above the window,
+    /// from a chunk wider than the window) is bit for bit the window of a
+    /// reference context that appended exactly rows `[.., c)` with the same
+    /// projected widths, carries length `c` and provenance `[.., c)`, shares
+    /// no buffer with the live windows, and keeps its bits while the live
+    /// context appends on, including over-window appends that store in place
+    /// over the rows it was read from.
+    #[test]
+    fn window_snapshot_matches_ring_of_exact_appends() {
+        let mut model = three_layer_tiny_draft();
+        model.config.sliding_window = 12;
+        let window_rows = 11i64;
+        let widths = [5i64, 9, 4, 13, 6, 1, 2];
+        let total = widths.iter().sum::<i64>();
+        let fused = (0..widths.len())
+            .map(|i| {
+                MxArray::random_normal(&[1, widths[i], 64], 0.0, 1.0, Some(DType::BFloat16))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let tokens: Vec<u32> = (0..total as u32).map(|t| 3 + t % 23).collect();
+        let mut checked = 0;
+        for c in 0..=total {
+            let mut live = DFlash2ContextCache::new(&model.config);
+            let mut reference = DFlash2ContextCache::new(&model.config);
+            let mut snapshot = None;
+            let mut base = 0i64;
+            for (chunk, &width) in fused.iter().zip(&widths) {
+                let chunk_tokens = &tokens[base as usize..(base + width) as usize];
+                let projected = live.project(&model, chunk, base as i32).unwrap();
+                // A boundary row is taken at the end of the chunk before it
+                // when odd, at the start of the chunk after it when even.
+                let in_chunk = if c % 2 == 0 {
+                    base <= c && (c < base + width || c == total && c == base + width)
+                } else {
+                    base < c && c <= base + width
+                };
+                if snapshot.is_none() && in_chunk {
+                    let taken = live
+                        .snapshot_window_at(c as i32, &projected, chunk_tokens)
+                        .unwrap();
+                    let from_chunk = c - base;
+                    if from_chunk > 0 {
+                        reference
+                            .append_projected(
+                                projected_prefix(&projected, from_chunk),
+                                &chunk_tokens[..from_chunk as usize],
+                            )
+                            .unwrap();
+                    }
+                    snapshot = Some((taken, window_bits(&reference)));
+                } else if snapshot.is_none() {
+                    reference
+                        .append_projected(projected_prefix(&projected, width), chunk_tokens)
+                        .unwrap();
+                }
+                live.append_projected(projected, chunk_tokens).unwrap();
+                live.eval().unwrap();
+                if let Some((taken, _)) = &snapshot {
+                    let mut owned = Vec::new();
+                    taken.collect_arrays(&mut owned);
+                    let mut live_arrays = Vec::new();
+                    live.collect_arrays(&mut live_arrays);
+                    for array in &owned {
+                        for other in &live_arrays {
+                            assert!(
+                                !unsafe {
+                                    mlx_sys::mlx_array_aliases(
+                                        array.as_raw_ptr(),
+                                        other.as_raw_ptr(),
+                                    )
+                                },
+                                "c={c}: snapshot shares a live window buffer"
+                            );
+                        }
+                    }
+                }
+                base += width;
+            }
+            let (taken, want) = snapshot.expect("every c lies in a chunk");
+            assert_eq!(taken.logical_len(), c as i32, "c={c}: length");
+            assert_eq!(taken.token_history(), &tokens[..c as usize], "c={c}");
+            let got = window_bits(&taken);
+            for (layer, ((rows, keys, values), (want_rows, want_keys, want_values))) in
+                got.iter().zip(&want).enumerate()
+            {
+                assert_eq!(*rows, c.min(window_rows), "c={c} layer {layer}: rows");
+                assert_eq!(rows, want_rows, "c={c} layer {layer}: reference rows");
+                assert!(keys == want_keys, "c={c} layer {layer}: keys");
+                assert!(values == want_values, "c={c} layer {layer}: values");
+            }
+            for window in &taken.layers {
+                if let Some(keys) = &window.keys {
+                    assert_eq!(keys.shape_at(2).unwrap(), window.len(), "c={c}: compact");
+                }
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, total + 1);
+    }
+
+    /// A snapshot never reads rows the windows skipped: after `record_only`
+    /// leaves the windows short of the chunk, a snapshot that needs rows
+    /// below the chunk fails, and one inside the chunk's own rows succeeds.
+    /// Rows outside the chunk are refused too.
+    #[test]
+    fn window_snapshot_refuses_rows_the_windows_skipped() {
+        let mut model = three_layer_tiny_draft();
+        model.config.sliding_window = 8;
+        let rows =
+            |t: i64| MxArray::random_normal(&[1, t, 64], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
+        let mut context = DFlash2ContextCache::new(&model.config);
+        context.append(&model, &rows(10), 0, &[1; 10]).unwrap();
+        context.record_only(&[2; 3]).unwrap();
+        let chunk = context.project(&model, &rows(9), 13).unwrap();
+        assert!(context.snapshot_window_at(15, &chunk, &[3; 9]).is_err());
+        assert!(context.snapshot_window_at(13, &chunk, &[3; 9]).is_err());
+        assert!(context.snapshot_window_at(22, &chunk, &[3; 9]).is_ok());
+        assert!(context.snapshot_window_at(12, &chunk, &[3; 9]).is_err());
+        assert!(context.snapshot_window_at(23, &chunk, &[3; 9]).is_err());
+        let mut fresh = DFlash2ContextCache::new(&model.config);
+        fresh.append(&model, &rows(10), 0, &[1; 10]).unwrap();
+        let chunk = fresh.project(&model, &rows(9), 10).unwrap();
+        assert!(fresh.snapshot_window_at(12, &chunk, &[3; 9]).is_ok());
     }
 
     #[test]

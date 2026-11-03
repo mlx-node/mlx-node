@@ -1010,6 +1010,56 @@ describe('mapAnthropicRequest', () => {
     expect(config.tools).toHaveLength(2);
   });
 
+  describe('forced tool_choice renders without thinking', () => {
+    const titleTools = [
+      { name: 'session_title', input_schema: { type: 'object', properties: { title: { type: 'string' } } } },
+      { name: 'other', input_schema: {} },
+    ];
+    const thinkingOff = { reasoningEffort: 'none', thinkingTokenBudget: 0, includeReasoning: false };
+
+    it('named tool (title side-call shape) disables thinking, even over an explicit effort', () => {
+      const { config } = mapAnthropicRequest({
+        model: 'local',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'Deepresearch this project' }],
+        tools: titleTools,
+        tool_choice: { type: 'tool', name: 'session_title' },
+        extra_body: { reasoning_effort: 'high' },
+      });
+      expect(config.tools!.map((t) => t.function.name)).toEqual(['session_title']);
+      expect(config).toMatchObject(thinkingOff);
+    });
+
+    it('any disables thinking and keeps every tool', () => {
+      const { config } = mapAnthropicRequest({
+        model: 'local',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'Hello' }],
+        tools: titleTools,
+        tool_choice: { type: 'any' },
+      });
+      expect(config.tools).toHaveLength(2);
+      expect(config).toMatchObject(thinkingOff);
+    });
+
+    it.each([
+      ['auto', { type: 'auto' as const }],
+      ['absent', undefined],
+    ])('%s leaves thinking settings untouched', (_label, toolChoice) => {
+      const { config } = mapAnthropicRequest({
+        model: 'local',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'Hello' }],
+        tools: titleTools,
+        ...(toolChoice ? { tool_choice: toolChoice } : {}),
+        extra_body: { reasoning_effort: 'high' },
+      });
+      expect(config.reasoningEffort).toBe('high');
+      expect(config.thinkingTokenBudget).toBeUndefined();
+      expect(config.includeReasoning).toBeUndefined();
+    });
+  });
+
   it('accepts non-empty stop_sequences and threads them out as stopSequences', () => {
     // `stop_sequences` is now carried out of the mapper (on the widened
     // return) so a downstream consumer can honour the stop strings. It must

@@ -107,6 +107,11 @@ describe('parseServeArgs', () => {
     expect(() => parseServeArgs(['--port', '70000'])).toThrow(/Invalid --port/);
   });
 
+  it('maps --preload and leaves it unset by default', () => {
+    expect(parseServeArgs(['--preload', 'qwen']).preload).toBe('qwen');
+    expect(parseServeArgs([]).preload).toBeUndefined();
+  });
+
   it('treats --log-dir as implying --verbose', () => {
     expect(parseServeArgs(['--log-dir', '/tmp/mlx-serve-logs']).logDir).toBe('/tmp/mlx-serve-logs');
   });
@@ -175,6 +180,46 @@ describe('mlx serve — end to end', () => {
     // alive in the listener list and swallow the next Ctrl+C.
     expect(listenersOf('SIGINT').filter((l) => !sigintBefore.has(l))).toEqual([]);
     expect(listenersOf('SIGTERM').filter((l) => !sigtermBefore.has(l))).toEqual([]);
+  });
+
+  it('starts loading the --preload model at boot and keeps serving when that load fails', async () => {
+    const modelsDir = await makeModelsDir(['alpha', 'beta']);
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const errors: string[] = [];
+    vi.spyOn(console, 'error').mockImplementation((line: unknown) => {
+      errors.push(String(line));
+    });
+    const loads: string[] = [];
+    const exitCodes: number[] = [];
+    const sigintBefore = new Set(listenersOf('SIGINT'));
+
+    await run(['--port', '0', '--models-dir', modelsDir, '--preload', 'beta'], {
+      hostOverrides: {
+        disableStore: true,
+        sweepOrphanTempRoots: false,
+        pagedModelTypes: [],
+        loadModel: async (path: string) => {
+          loads.push(path);
+          throw new Error('weights unreadable');
+        },
+      },
+      exit: (code) => exitCodes.push(code),
+      onReady: async (host: InferenceHost) => {
+        for (let i = 0; i < 200 && errors.length === 0; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(loads).toEqual([expect.stringMatching(/[/\\]beta$/)]);
+        expect(errors).toEqual(['[mlx] preload of "beta" failed: weights unreadable']);
+        expect((await fetch(`${host.url}/health`)).status).toBe(200);
+
+        const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
+        added[0]!('SIGINT');
+        for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      },
+    });
+    expect(exitCodes).toEqual([0]);
   });
 
   it('reports a models dir with nothing in it instead of starting', async () => {
