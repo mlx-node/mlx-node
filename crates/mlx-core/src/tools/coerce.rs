@@ -212,17 +212,21 @@ fn schema_types(schema: &Value) -> Option<TypeSet> {
         if let Some(Value::Array(members)) = schema.get("enum") {
             members.iter().for_each(|m| set.insert_value_kind(m));
         }
+        let mut resolved = (set.0 != 0).then_some(set);
         for key in ["anyOf", "oneOf"] {
             if let Some(Value::Array(choices)) = schema.get(key) {
                 // An untyped choice (`$ref`, `{}`) admits anything, so the
-                // union is unknown; dropping it would shrink `Option<Enum>`
-                // to null-only and rewrite valid strings.
-                for choice in choices {
-                    set.0 |= resolve(choice)?.0;
+                // union adds no constraint; dropping it would shrink
+                // `Option<Enum>` to null-only and rewrite valid strings.
+                let union = choices
+                    .iter()
+                    .map(resolve)
+                    .try_fold(TypeSet::default(), |u, c| c.map(|c| TypeSet(u.0 | c.0)));
+                if let Some(union) = union {
+                    resolved = Some(resolved.map_or(union, |r| r.intersect(union)));
                 }
             }
         }
-        let mut resolved = (set.0 != 0).then_some(set);
         if let Some(Value::Array(branches)) = schema.get("allOf") {
             for branch in branches.iter().filter_map(resolve) {
                 resolved = Some(resolved.map_or(branch, |r| r.intersect(branch)));
@@ -328,9 +332,9 @@ fn is_integer_literal(raw: &str) -> bool {
 /// through `properties` and `items`. A scalar the schema already admits is
 /// kept as typed.
 fn coerce_value(value: &mut Value, schema: &Value) {
-    let Some(schema_obj) = schema.as_object() else {
+    if !schema.is_object() {
         return;
-    };
+    }
     let types = schema_types(schema);
     if !value.is_object() && !value.is_array() && types.is_some_and(|t| t.admits(value)) {
         return;
@@ -346,14 +350,22 @@ fn coerce_value(value: &mut Value, schema: &Value) {
             }
         }
         Value::Object(map) => {
-            if let Some(Value::Object(props)) = schema_obj.get("properties") {
-                coerce_map(map, props);
+            let mut nodes = Vec::new();
+            container_schemas(schema, TypeSet::OBJECT, &mut nodes);
+            for node in nodes {
+                if let Some(Value::Object(props)) = node.get("properties") {
+                    coerce_map(map, props);
+                }
             }
         }
         Value::Array(items) => {
-            if let Some(item_schema @ Value::Object(_)) = schema_obj.get("items") {
-                for item in items {
-                    coerce_value(item, item_schema);
+            let mut nodes = Vec::new();
+            container_schemas(schema, TypeSet::ARRAY, &mut nodes);
+            for node in nodes {
+                if let Some(item_schema @ Value::Object(_)) = node.get("items") {
+                    for item in items.iter_mut() {
+                        coerce_value(item, item_schema);
+                    }
                 }
             }
         }
@@ -363,6 +375,31 @@ fn coerce_value(value: &mut Value, schema: &Value) {
                 if coerced != *value && (types.has(TypeSet::STRING) || !coerced.is_string()) {
                     *value = coerced;
                 }
+            }
+        }
+    }
+}
+
+/// The schema nodes whose `properties` / `items` apply to a container of
+/// kind `bit`: the node, every `allOf` branch, and the one `anyOf` / `oneOf`
+/// choice admitting that kind (none when several do, as the match is unknown).
+fn container_schemas<'a>(schema: &'a Value, bit: u8, out: &mut Vec<&'a Map<String, Value>>) {
+    let Some(obj) = schema.as_object() else {
+        return;
+    };
+    out.push(obj);
+    if let Some(Value::Array(branches)) = obj.get("allOf") {
+        for branch in branches {
+            container_schemas(branch, bit, out);
+        }
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(Value::Array(choices)) = obj.get(key) {
+            let mut fitting = choices
+                .iter()
+                .filter(|c| schema_types(c).is_some_and(|t| t.has(bit)));
+            if let (Some(only), None) = (fitting.next(), fitting.next()) {
+                container_schemas(only, bit, out);
             }
         }
     }
@@ -821,6 +858,58 @@ mod tests {
         assert_eq!(
             schema_types(&json!({"type": "integer", "allOf": [{"type": "string"}]})),
             None
+        );
+    }
+
+    #[test]
+    fn sibling_type_intersects_any_of_and_one_of() {
+        let string = types(json!({"type": "string"}));
+        assert_eq!(
+            types(json!({"type": "string", "anyOf": [{"type": "string"}, {"type": "integer"}]})),
+            string
+        );
+        assert_eq!(
+            types(
+                json!({"type": ["string", "integer"], "oneOf": [{"type": "string"}, {"type": "null"}]})
+            ),
+            string
+        );
+        assert_eq!(
+            types(json!({"type": "string", "anyOf": [{"$ref": "#/$defs/x"}, {"type": "null"}]})),
+            string
+        );
+        let props =
+            r#"{"id": {"type": "string", "anyOf": [{"type": "string"}, {"type": "integer"}]}}"#;
+        assert_eq!(
+            parse_and_coerce(
+                props,
+                "<tool_call>\n<function=t>\n<parameter=id>\n00042\n</parameter>\n</function>\n</tool_call>"
+            ),
+            json!({"id": "00042"})
+        );
+    }
+
+    #[test]
+    fn containers_inside_combinators_coerce_their_children() {
+        let props = r#"{"opts": {"anyOf": [{"type": "object", "properties": {"limit": {"type": "integer"}}}, {"type": "null"}]},
+            "ids": {"oneOf": [{"type": "array", "items": {"type": "integer"}}, {"type": "null"}]},
+            "both": {"allOf": [{"type": "object", "properties": {"a": {"type": "integer"}}},
+                               {"properties": {"b": {"type": "boolean"}}}]},
+            "ambiguous": {"anyOf": [{"type": "object", "properties": {"n": {"type": "integer"}}},
+                                    {"type": "object", "properties": {"n": {"type": "string"}}}]}}"#;
+        assert_eq!(
+            parse_and_coerce(
+                props,
+                concat!(
+                    "<tool_call>\n<function=t>\n",
+                    "<parameter=opts>\n{\"limit\": \"7\"}\n</parameter>\n",
+                    "<parameter=ids>\n[\"1\", \"2\"]\n</parameter>\n",
+                    "<parameter=both>\n{\"a\": \"3\", \"b\": \"true\"}\n</parameter>\n",
+                    "<parameter=ambiguous>\n{\"n\": \"5\"}\n</parameter>\n",
+                    "</function>\n</tool_call>"
+                )
+            ),
+            json!({"opts": {"limit": 7}, "ids": [1, 2], "both": {"a": 3, "b": true}, "ambiguous": {"n": "5"}})
         );
     }
 
