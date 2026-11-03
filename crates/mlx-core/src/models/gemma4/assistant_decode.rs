@@ -28,6 +28,7 @@ use napi::bindgen_prelude::*;
 use crate::array::{DType, MxArray};
 use crate::engine::backend::{DsparkProposal, DsparkStepper, DsparkVerifyOutput};
 use crate::engine::params::ChatParams;
+use crate::models::forward::PREFILL_CANCELLED;
 use crate::sampling;
 use crate::stream::{Stream, StreamContext};
 
@@ -368,17 +369,14 @@ impl Gemma4Inner {
                 };
                 let mut offset: i64 = 0;
                 while offset < prefill_len {
-                    // Cooperative-cancel checkpoint (H1b) at every chunk
-                    // boundary after the first chunk (a one-chunk prefill is
-                    // the single-shot case and stays uncancellable). The Err
-                    // rides `flat_draft_chat_turn`'s `draft_fail_closed` arm.
-                    if offset > 0
-                        && inner
-                            .turn_cancel
-                            .as_ref()
-                            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+                    // The Err rides `flat_draft_chat_turn`'s
+                    // `draft_fail_closed` arm.
+                    if inner
+                        .turn_cancel
+                        .as_ref()
+                        .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
                     {
-                        return Err(Error::from_reason("prefill cancelled"));
+                        return Err(Error::from_reason(PREFILL_CANCELLED));
                     }
                     let end = if prefill_len - offset > GEMMA4_PREFILL_STEP_SIZE {
                         offset + GEMMA4_PREFILL_STEP_SIZE
@@ -973,5 +971,38 @@ mod tests {
         .expect("the turn after a cancelled stream must succeed");
         assert_eq!(res.finish_reason, "length");
         assert_eq!(res.num_tokens, 3);
+    }
+
+    /// A cancel raised before the prefill keeps the live session: no reset
+    /// and no prefill chunk.
+    #[test]
+    fn cancel_before_prefill_keeps_the_session_and_runs_no_chunk() {
+        let mut inner = tiny_inner_with_assistant_draft();
+        ChatBackend::set_turn_cancel_flag(
+            &mut inner,
+            Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+        );
+        let tokens: Vec<u32> = vec![0, 1, 2, 3];
+
+        let err = inner
+            .assistant_prefill_with_hidden(&tokens, 0, Stream::generation())
+            .err()
+            .expect("a cancelled prefill must not run its first chunk");
+        assert_eq!(err.reason, PREFILL_CANCELLED);
+        let caches = inner.caches.as_ref().expect("prefill initializes caches");
+        assert!(caches.iter().all(|cache| cache.get_offset() == 0));
+
+        inner.cached_token_history = vec![9, 9, 9];
+        let err = run_tiny_flat_draft_turn(
+            &mut inner,
+            &tiny_qwen_tokenizer(),
+            &tokens,
+            &tiny_turn_config(Some(1), 1),
+        )
+        .expect_err("a turn cancelled before its prefill must not complete");
+        assert_eq!(err.reason, PREFILL_CANCELLED);
+        assert_eq!(inner.cached_token_history, [9, 9, 9], "no reset");
+        let caches = inner.caches.as_ref().expect("caches survive");
+        assert!(caches.iter().all(|cache| cache.get_offset() == 0));
     }
 }

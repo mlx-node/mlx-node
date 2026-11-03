@@ -27,6 +27,7 @@ use super::layer_cache::{
     snapshot_all_mtp,
 };
 use super::model::{PREFILL_STEP_SIZE, Qwen35Inner};
+use crate::models::forward::PREFILL_CANCELLED;
 
 pub(crate) struct DFlash2TurnState {
     context: DFlash2ContextCache,
@@ -745,6 +746,12 @@ impl DsparkBackend for Qwen35Inner {
 }
 
 impl Qwen35Inner {
+    fn turn_cancelled(&self) -> bool {
+        self.turn_cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     fn dflash2_prefill(
         &mut self,
         tokens: &[u32],
@@ -790,13 +797,8 @@ impl Qwen35Inner {
         let mut offset = 0usize;
         let mut last_logits = None;
         while offset < tokens.len() {
-            if offset > 0
-                && self
-                    .turn_cancel
-                    .as_ref()
-                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
-            {
-                return Err(Error::from_reason("prefill cancelled"));
+            if self.turn_cancelled() {
+                return Err(Error::from_reason(PREFILL_CANCELLED));
             }
             let end = (offset + PREFILL_STEP_SIZE as usize).min(tokens.len());
             let chunk = tokens[offset..end]
@@ -1022,6 +1024,9 @@ impl Qwen35Inner {
             flat_attention_frontier(self),
             flat_lane_authoritative,
         );
+        if self.turn_cancelled() {
+            return Err(Error::from_reason(PREFILL_CANCELLED));
+        }
         let prefill = if cached_prefix > 0 {
             tokens[cached_prefix..].to_vec()
         } else {
@@ -2633,5 +2638,132 @@ mod tests {
         // Seeds whose tiny drafts ignore the anchor would hide a wrong-anchor
         // proposal; this one does not.
         assert_cycle_scheduling_is_bit_exact(32, 0xDFA5_2208)
+    }
+
+    /// A cancel raised before the prefill keeps the live session: no Command
+    /// reset and no prefill chunk.
+    #[test]
+    fn cancel_before_prefill_keeps_the_session_and_runs_no_chunk() {
+        let mut inner = tiny_dflash_inner(0xDFA5_2209);
+        reset_flat_fixture(&mut inner);
+        ChatBackend::set_turn_cancel_flag(
+            &mut inner,
+            Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                true,
+            ))),
+        );
+
+        let err = inner
+            .dflash2_prefill(&[1, 2, 3, 4], 0, Stream::generation())
+            .err()
+            .expect("a cancelled prefill must not run its first chunk");
+        assert_eq!(err.reason, PREFILL_CANCELLED);
+        assert_eq!(flat_attention_frontier(&inner), Some(0));
+
+        reset_flat_fixture(&mut inner);
+        inner.cached_token_history = vec![9, 9, 9];
+        let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
+        let config = ChatConfig {
+            temperature: Some(0.0),
+            max_new_tokens: Some(1),
+            ..ChatConfig::default()
+        };
+        let params = ChatBackend::resolve_params(&inner, &config);
+        let thinking = ChatBackend::thinking_setup(&inner, &config);
+        let mut args = WholeTurnArgs {
+            tokens: &[1, 2, 3, 4],
+            tokenizer: &tokenizer,
+            eos_id: u32::MAX,
+            config: &config,
+            params: &params,
+            thinking,
+            plan: crate::engine::plan::TurnPlan {
+                is_delta: false,
+                input_media: crate::engine::plan::MediaCapabilities::NONE,
+                context_media: crate::engine::plan::MediaCapabilities::NONE,
+                use_paged_attention: false,
+                decoder: crate::engine::plan::DecoderPlan::Speculative(
+                    crate::engine::plan::SpeculativeKind::DraftModel,
+                ),
+            },
+            sink: None,
+            cancelled: None,
+            media: crate::engine::plan::MediaInputs {
+                images: &[],
+                audio: &[],
+            },
+        };
+        let err = match inner.dflash2_chat_turn(&mut args) {
+            Ok(_) => panic!("a turn cancelled before its prefill must not complete"),
+            Err(e) => e,
+        };
+        assert_eq!(err.reason, PREFILL_CANCELLED);
+        assert_eq!(inner.cached_token_history, [9, 9, 9], "no Command reset");
+        assert_eq!(flat_attention_frontier(&inner), Some(0), "no prefill chunk");
+    }
+
+    /// A cancel raised before a prefix-hit delta prefill keeps the committed
+    /// turn instead of reaching the prefill's fail-closed Command reset.
+    #[test]
+    fn cancel_before_delta_prefill_keeps_the_committed_turn() {
+        let mut inner = tiny_dflash_inner(0xDFA5_220A);
+        reset_flat_fixture(&mut inner);
+        let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
+        let config = ChatConfig {
+            temperature: Some(0.0),
+            max_new_tokens: Some(1),
+            ..ChatConfig::default()
+        };
+        let params = ChatBackend::resolve_params(&inner, &config);
+        let plan = |is_delta| crate::engine::plan::TurnPlan {
+            is_delta,
+            input_media: crate::engine::plan::MediaCapabilities::NONE,
+            context_media: crate::engine::plan::MediaCapabilities::NONE,
+            use_paged_attention: false,
+            decoder: crate::engine::plan::DecoderPlan::Speculative(
+                crate::engine::plan::SpeculativeKind::DraftModel,
+            ),
+        };
+        let run = |inner: &mut Qwen35Inner, tokens: &[u32], is_delta| {
+            let mut args = WholeTurnArgs {
+                tokens,
+                tokenizer: &tokenizer,
+                eos_id: u32::MAX,
+                config: &config,
+                params: &params,
+                thinking: ChatBackend::thinking_setup(inner, &config),
+                plan: plan(is_delta),
+                sink: None,
+                cancelled: None,
+                media: crate::engine::plan::MediaInputs {
+                    images: &[],
+                    audio: &[],
+                },
+            };
+            inner.dflash2_chat_turn(&mut args).map(|_| ())
+        };
+
+        run(&mut inner, &[1, 2, 3, 4], false).expect("uncancelled first turn");
+        let history = inner.cached_token_history.clone();
+        let frontier = flat_attention_frontier(&inner);
+        assert_eq!(frontier, Some(history.len()));
+
+        ChatBackend::set_turn_cancel_flag(
+            &mut inner,
+            Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                true,
+            ))),
+        );
+        let mut next = history.clone();
+        next.push(5);
+        let err = run(&mut inner, &next, true).expect_err("cancelled delta turn");
+        assert_eq!(err.reason, PREFILL_CANCELLED);
+        assert_eq!(inner.cached_token_history, history, "no fail-closed reset");
+        assert_eq!(
+            flat_attention_frontier(&inner),
+            frontier,
+            "no prefill chunk"
+        );
+        assert!(inner.dflash2_context.is_some(), "draft context kept");
     }
 }

@@ -23,6 +23,7 @@ use super::layer_cache::{
     snapshot_all_mtp,
 };
 use super::model::{PREFILL_STEP_SIZE, Qwen35MoeInner};
+use crate::models::forward::PREFILL_CANCELLED;
 use crate::models::qwen3_5::dflash2::DFlash2ContextCache;
 use crate::models::qwen3_5::gdn_blob::GdnStateBlobs;
 
@@ -716,6 +717,12 @@ impl DsparkBackend for Qwen35MoeInner {
 }
 
 impl Qwen35MoeInner {
+    fn turn_cancelled(&self) -> bool {
+        self.turn_cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     fn dflash2_prefill(
         &mut self,
         tokens: &[u32],
@@ -761,13 +768,8 @@ impl Qwen35MoeInner {
         let mut offset = 0usize;
         let mut last_logits = None;
         while offset < tokens.len() {
-            if offset > 0
-                && self
-                    .turn_cancel
-                    .as_ref()
-                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
-            {
-                return Err(Error::from_reason("prefill cancelled"));
+            if self.turn_cancelled() {
+                return Err(Error::from_reason(PREFILL_CANCELLED));
             }
             let end = (offset + PREFILL_STEP_SIZE as usize).min(tokens.len());
             let chunk = tokens[offset..end]
@@ -993,6 +995,9 @@ impl Qwen35MoeInner {
             flat_attention_frontier(self),
             flat_lane_authoritative,
         );
+        if self.turn_cancelled() {
+            return Err(Error::from_reason(PREFILL_CANCELLED));
+        }
         let prefill = if cached_prefix > 0 {
             tokens[cached_prefix..].to_vec()
         } else {
@@ -2131,5 +2136,67 @@ mod tests {
             inner = tiny_deferred_inner(0xDEF0_3502);
         }
         Ok(())
+    }
+
+    /// A cancel raised before the prefill keeps the live session: no Command
+    /// reset and no prefill chunk.
+    #[test]
+    fn cancel_before_prefill_keeps_the_session_and_runs_no_chunk() {
+        let mut inner = tiny_dflash_inner(0xDFA5_3509);
+        reset_flat_fixture(&mut inner);
+        ChatBackend::set_turn_cancel_flag(
+            &mut inner,
+            Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                true,
+            ))),
+        );
+
+        let err = inner
+            .dflash2_prefill(&[1, 2, 3, 4], 0, Stream::generation())
+            .err()
+            .expect("a cancelled prefill must not run its first chunk");
+        assert_eq!(err.reason, PREFILL_CANCELLED);
+        assert_eq!(flat_attention_frontier(&inner), Some(0));
+
+        reset_flat_fixture(&mut inner);
+        inner.cached_token_history = vec![9, 9, 9];
+        let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
+        let config = ChatConfig {
+            temperature: Some(0.0),
+            max_new_tokens: Some(1),
+            ..ChatConfig::default()
+        };
+        let params = ChatBackend::resolve_params(&inner, &config);
+        let thinking = ChatBackend::thinking_setup(&inner, &config);
+        let mut args = WholeTurnArgs {
+            tokens: &[1, 2, 3, 4],
+            tokenizer: &tokenizer,
+            eos_id: u32::MAX,
+            config: &config,
+            params: &params,
+            thinking,
+            plan: crate::engine::plan::TurnPlan {
+                is_delta: false,
+                input_media: crate::engine::plan::MediaCapabilities::NONE,
+                context_media: crate::engine::plan::MediaCapabilities::NONE,
+                use_paged_attention: false,
+                decoder: crate::engine::plan::DecoderPlan::Speculative(
+                    crate::engine::plan::SpeculativeKind::DraftModel,
+                ),
+            },
+            sink: None,
+            cancelled: None,
+            media: crate::engine::plan::MediaInputs {
+                images: &[],
+                audio: &[],
+            },
+        };
+        let err = match inner.dflash2_chat_turn(&mut args) {
+            Ok(_) => panic!("a turn cancelled before its prefill must not complete"),
+            Err(e) => e,
+        };
+        assert_eq!(err.reason, PREFILL_CANCELLED);
+        assert_eq!(inner.cached_token_history, [9, 9, 9], "no Command reset");
+        assert_eq!(flat_attention_frontier(&inner), Some(0), "no prefill chunk");
     }
 }
