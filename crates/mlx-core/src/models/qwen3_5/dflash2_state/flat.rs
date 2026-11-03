@@ -216,6 +216,19 @@ pub(crate) fn split_flat_caches(
     (FlatKv { layers }, FlatEnd { linear, context })
 }
 
+/// The full-attention half of moved flat caches; the GDN slots are dropped.
+pub(crate) fn flat_attention_kv(caches: Vec<Qwen3_5LayerCache>) -> FlatKv {
+    let layers = caches
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, cache)| match cache {
+            Qwen3_5LayerCache::FullAttention(kv) => Some((index, kv)),
+            Qwen3_5LayerCache::Linear(_) => None,
+        })
+        .collect();
+    FlatKv { layers }
+}
+
 /// Reassembles the per-layer caches in decoder order, plus the draft window.
 pub(crate) fn join_flat_caches(
     kv: FlatKv,

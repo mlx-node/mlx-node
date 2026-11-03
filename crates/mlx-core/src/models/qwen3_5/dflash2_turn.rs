@@ -35,7 +35,8 @@ use super::dflash2_decode::{
     min_fa_capacity, reserve_dflash2_target_kv, reusable_dflash2_prefix,
 };
 use super::dflash2_state::flat::{
-    FlatAnchor, FlatBacking, FlatStates, join_flat_anchor, join_flat_caches, split_flat_caches,
+    FlatAnchor, FlatBacking, FlatStates, flat_attention_kv, join_flat_anchor, join_flat_caches,
+    split_flat_caches,
 };
 use super::dflash2_state::store::{
     Anchor, Backing, EntryParts, EvictReport, HybridStateStore, Lineage, Reservation, StoreHit,
@@ -535,10 +536,58 @@ pub(crate) fn reserve_dflash2_turn_kv<T: DFlash2Target>(
     Ok(evicted)
 }
 
+/// Parks the live anchor of a turn cancelled after its prefill started, with
+/// the full-attention caches trimmed to its row: the prefill and decode only
+/// write rows past the resume point, so an anchor at or below it still
+/// resumes exactly. Returns whether the anchor parked; the caller drops the
+/// rest of the live state either way.
+fn park_cancelled_dflash2_anchor<T: DFlash2Target>(target: &mut T, resume: usize) -> bool {
+    let Some(anchor) = target.dflash2_states_mut().live_anchor.take() else {
+        return false;
+    };
+    let row = anchor.row;
+    let lineage = anchor.state.window.token_history().to_vec();
+    let exact = row > 0
+        && row <= resume
+        && lineage.len() == row
+        && target.flat_lane_authoritative()
+        && ChatBackend::cached_token_history(target).get(..row) == Some(lineage.as_slice())
+        && flat_attention_frontier(target).is_some_and(|frontier| frontier >= row);
+    if !exact {
+        return false;
+    }
+    let Some(caches) = target.caches_mut().take() else {
+        return false;
+    };
+    let mut kv = flat_attention_kv(caches);
+    kv.trim(row);
+    let salt = target.dflash2_states().live_salt;
+    let parts = EntryParts {
+        end: None,
+        anchor: Some(anchor),
+        kv: Some(kv),
+    };
+    match target
+        .dflash2_states_mut()
+        .store
+        .insert(Lineage::text(&lineage, salt), parts)
+    {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(
+                target: "mlx_core::inference",
+                "DFlash2 cancel dropped the {row}-token anchor: {error}"
+            );
+            false
+        }
+    }
+}
+
 /// A turn that failed after its resume was resolved. A user cancel drops
 /// only the live state the turn was building, or nothing when the prefill
-/// stopped before its first chunk; parked states, the paged prefix cache and
-/// the paged lane's other requests' blocks stay. Any other error fails closed.
+/// stopped before its first chunk; the live anchor at or below the resume
+/// point parks first. Parked states, the paged prefix cache and the paged
+/// lane's other requests' blocks stay. Any other error fails closed.
 fn dflash2_turn_failed<T: DFlash2Target>(target: &mut T, error: Error, resume: usize) -> Error {
     if error.reason != PREFILL_CANCELLED {
         return dflash2_fail_closed(target, error);
@@ -553,6 +602,7 @@ fn dflash2_turn_failed<T: DFlash2Target>(target: &mut T, error: Error, resume: u
     target
         .prefix_tracker_mut()
         .note_drop("dflash2_cancelled", DropKind::Invalidated);
+    park_cancelled_dflash2_anchor(target, resume);
     if let Err(drop_error) = drop_live_dflash2_state(target) {
         tracing::warn!(
             target: "mlx_core::inference",

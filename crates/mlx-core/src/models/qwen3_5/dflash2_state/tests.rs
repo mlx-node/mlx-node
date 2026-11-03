@@ -676,6 +676,90 @@ fn cancel_mid_prefill_keeps_parked_states_restorable() -> Result<()> {
     Ok(())
 }
 
+/// X0 + X1: a user cancel after the first prefill chunk of a resumed turn
+/// parks the resumed session's anchor C(R) with the full-attention rows below
+/// it, since the prefill only writes past its resume point. The anchor and
+/// those rows keep every bit (X0), and the retried turn resumes on them at R
+/// exactly as on a hand-installed copy of the same capture (X1: output,
+/// state, forced cycles). Both resume kinds: B's parked end state and B's
+/// own live state.
+#[test]
+fn cancel_after_a_resume_parks_the_resumed_anchor() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let tokenizer = suffixed_tokenizer();
+    let chunk = crate::models::qwen3_5::model::PREFILL_STEP_SIZE as u32;
+    for name in FIXTURES {
+        let b1 = cat(&[&body(2, 37), &SUFFIX]);
+        let mut reference = long_fixture(name);
+        turn(&mut reference, &tokenizer, &b1)?;
+        let b2 = cat(&[&reference.cached_token_history, &body(7, chunk + 9)]);
+        let mut anchor = Vec::new();
+        anchor_arrays(
+            reference
+                .dflash2_states
+                .live_anchor
+                .as_ref()
+                .expect("B1 captured C(R)"),
+            &mut anchor,
+        );
+        let want_anchor = array_fingerprints(anchor)?;
+        let want_rows = kv_rows(live_attention(&reference), R)?;
+        assert_eq!(install_capture_by_hand(&mut reference)?, R, "{name}");
+        let want = turn(&mut reference, &tokenizer, &b2)?;
+        assert_eq!(want.cached_tokens as usize, R, "{name}: live hit at R");
+        let want_outcome = outcome(&want, &reference);
+        let want_state = live_state(&reference)?;
+        let want_trace = run_live_extension(&mut reference, &KEEPS, 5, true)?;
+
+        for resumed in ["E", "live"] {
+            let case = format!("{name} {resumed}");
+            let mut inner = long_fixture(name);
+            turn(&mut inner, &tokenizer, &b1)?;
+            if resumed == "E" {
+                turn(&mut inner, &tokenizer, &body(3, 33))?;
+            }
+            cancelled_turn(&mut inner, &tokenizer, &b2, 1);
+            assert!(inner.cached_token_history.is_empty(), "{case}");
+            assert!(inner.dflash2_states.live_anchor.is_none(), "{case}");
+            let entry = parked(&inner, &b1[..R]);
+            assert_eq!(
+                (entry.kind(), entry.depth(), entry.tokens()),
+                (HitKind::Capture, R, &b1[..R]),
+                "{case}"
+            );
+            let mut anchor = Vec::new();
+            anchor_arrays(entry.anchor().expect("parked anchor"), &mut anchor);
+            assert!(
+                array_fingerprints(anchor)? == want_anchor,
+                "{case}: X0 anchor"
+            );
+            let kv = entry.kv().expect("parked KV");
+            assert!(
+                kv.layers()
+                    .iter()
+                    .all(|(_, kv)| kv.get_offset() as usize == R),
+                "{case}: KV trimmed to R"
+            );
+            assert!(
+                kv_rows(kv.layers().iter().map(|(_, kv)| kv), R)? == want_rows,
+                "{case}: X0 KV rows below R"
+            );
+            assert_no_parked_alias(&inner, &case);
+
+            let (got, events) = capture_prefix_events(|| turn(&mut inner, &tokenizer, &b2));
+            let got = got?;
+            assert_eq!(events[0]["hit_kind"], "C", "{case}: {events:?}");
+            assert_eq!(outcome(&got, &inner), want_outcome, "{case}: X1 turn");
+            assert!(live_state(&inner)? == want_state, "{case}: X1 state");
+            let got_trace = run_live_extension(&mut inner, &KEEPS, 5, true)?;
+            assert_trace_eq(&got_trace, &want_trace, &format!("{case}: X1 cycles"));
+        }
+    }
+    Ok(())
+}
+
 /// X1: a cancel the prefill sees before its first chunk, after the turn
 /// moved B's parked end state in, keeps that state live and A's parked; B's
 /// retried turn resumes on it as a live hit, equal to the run without the
