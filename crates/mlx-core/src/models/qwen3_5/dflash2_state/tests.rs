@@ -316,7 +316,7 @@ fn paged_ar_turn(
     }
 }
 
-/// (a) X1: A1 B1 A2 against A1 A2. B1's miss parks A1's end state and A2
+/// X1: A1 B1 A2 against A1 A2. B1's miss parks A1's end state and A2
 /// resumes on it. A2's output and every buffer of its state, then forced-keep
 /// cycles (per-cycle logits, caches, frontier) and a continuation draft on
 /// that state, equal the run where A1's state stayed live.
@@ -353,7 +353,7 @@ fn end_state_resume_matches_live_continuation() -> Result<()> {
     Ok(())
 }
 
-/// (b) X0 + X1: A1's parked end state, demoted to its anchor C(R) under
+/// X0 + X1: A1's parked end state, demoted to its anchor C(R) under
 /// state-budget pressure, keeps the anchor and the KV rows `[0, R)` bit for
 /// bit. A re-rendered A2' that diverges after R then resumes on it exactly
 /// as on a hand-installed deep copy of the same capture that never entered
@@ -430,7 +430,7 @@ fn demoted_anchor_resume_matches_a_hand_installed_capture() -> Result<()> {
     Ok(())
 }
 
-/// (c) X1: a paged AR turn on A1's lineage between two DFlash2 turns parks
+/// X1: a paged AR turn on A1's lineage between two DFlash2 turns parks
 /// A1's end state, and the next DFlash2 turn resumes on it exactly as the
 /// same turn right after A1, with A1's state live.
 #[test]
@@ -481,7 +481,7 @@ impl Drop for BudgetOverride {
     }
 }
 
-/// (d) A state budget that holds about one parked state, then no KV
+/// A state budget that holds about one parked state, then no KV
 /// headroom at all: every turn of four interleaved sessions completes, and
 /// after every turn's reserve the store fits the budget. Under the state
 /// budget the alternating sessions still resume on their parked end states.
@@ -591,7 +591,7 @@ fn cancelled_turn(
     error
 }
 
-/// (e) A cancel between prefill chunks fails the turn after its armed
+/// A cancel between prefill chunks fails the turn after its armed
 /// capture C(R) was taken in the first chunk: the capture is not published,
 /// the turn's live state is dropped, and the session parked before the turn
 /// keeps its end state and anchor. The same prompt without the cancel arms
@@ -717,7 +717,7 @@ fn cancel_before_the_first_chunk_keeps_the_resumed_state() -> Result<()> {
     Ok(())
 }
 
-/// (f) X1 on the compiled int8 verify: four sessions, three steps each, in
+/// X1 on the compiled int8 verify: four sessions, three steps each, in
 /// a shuffled order on one model. Every step is a whole turn followed by
 /// forced-keep cycles with random keeps in 1..=8; each equals the same step
 /// of that session run alone on its own model, where every resume is live.
@@ -804,7 +804,7 @@ fn interleaved_sessions_with_random_keeps_match_serial_sessions() -> Result<()> 
     Ok(())
 }
 
-/// (g) A parked entry owns its buffers: another session's whole turn, a
+/// A parked entry owns its buffers: another session's whole turn, a
 /// capture resume and an end-state resume included, leaves every array of
 /// every other parked entry bit for bit as it was (whole KV buffers, past
 /// their offsets too), and no parked array shares a buffer with the live
@@ -892,7 +892,7 @@ fn teacher_forced(
     Ok(rows)
 }
 
-/// (h) X3: A2' resumed at the parked anchor C(R) against A2' prefilled cold,
+/// X3: A2' resumed at the parked anchor C(R) against A2' prefilled cold,
 /// both teacher-forced through one verify of a fixed continuation: every
 /// logit within [`X3_LOGIT_TOL`], and the greedy token equal on every row
 /// whose cold top-2 margin exceeds twice it.

@@ -1980,13 +1980,15 @@ impl DFlash2Model {
     /// `k|v` for the context append. The merge needs K-quant projections
     /// whose widths are whole Tiled64 tiles ([`kquant_rows_merge`]) and
     /// agreeing packed formats; otherwise the separate projections stay.
-    /// Below the GEMM threshold the tiled kernels decode and reduce each
-    /// output row the same way at any width except the M = 8 tensor-op
-    /// route's split-K count, which follows N (`qmm_m8_nax_splits`), so a
-    /// merged block of 8 rows may differ from the separate projections in
-    /// the last bf16 bit. Per-layer merges turn the originals into row views
-    /// of the merged buffer (no extra bytes); the cross-layer `k|v` merge is
-    /// an extra resident copy, counted in `weight_bytes`.
+    /// The merged and separate projections are not bit-equal in general: the
+    /// kernel tier and its split-K follow both the row count M and the width
+    /// N, so at the published Qwen3.8 draft geometry on an M5 Max the merged
+    /// context `k|v` differs from the per-layer projections at 1 and at 8
+    /// rows. A draft K/V row's bits depend on the route and width it was
+    /// projected at; only the same (route, width) reproduces it. Per-layer
+    /// merges turn the originals into row views of the merged buffer (no
+    /// extra bytes); the cross-layer `k|v` merge is an extra resident copy,
+    /// counted in `weight_bytes`.
     fn merge_projections(&mut self) -> Result<()> {
         let merge_rows = |first: &LinearProj, widths: &[i64]| -> bool {
             match first {
@@ -4902,16 +4904,17 @@ mod tests {
     /// `context_kv` at or below it, full-width eight-row prefix), (iii) the
     /// row's slot in its block, (iv) the values of the other (padding) rows.
     ///
-    /// Slot and padding never matter: every tiled kernel reduces a row
+    /// Slot and padding never matter on any GPU: every kernel reduces a row
     /// alone. Width does: the kernel tier follows M (`qmv_t64` at 1,
     /// `qmv_wide_t64`, the tensor-op tier, then `qmm_t_splitk`, whose split
     /// count is `512 / (32 * ceil(M / 32))` clamped to whole K groups), so
     /// the fc runs unsplit from M = 33 and each layer's `k|v` (N = 1024)
     /// from M = 257. A cold-prefill tail append narrower than that is not
     /// bit-reproducible at another width, and a rebuilt window must project
-    /// each segment at its recorded (route, width), padding allowed. The
-    /// exact partition is pinned on the calibrated host only (gen 17 NAX,
-    /// 40 cores): below the split-K tier it follows the core count.
+    /// each segment at its recorded (route, width), padding allowed. Which
+    /// widths differ depends on the GPU's kernel tiers and core count, so
+    /// that part is asserted on the calibrated host only (gen 17 NAX, 40
+    /// cores) and only printed elsewhere.
     #[test]
     fn draft_context_kv_bits_follow_append_width_not_slot_or_padding() {
         if !unsafe { mlx_sys::mlx_metal_is_available() } {
@@ -5174,12 +5177,8 @@ mod tests {
             "route class"
         };
         eprintln!(
-            "S1.0 decision: (1) a changed append width changes draft K/V bits: {}; (2) the segment map needs {segment_key}",
+            "probe decision: (1) a changed append width changes draft K/V bits: {}; (2) the segment map needs {segment_key}",
             if width_changes_bits { "yes" } else { "no" }
-        );
-        assert!(
-            width_changes_bits && per_layer_classes.len() > 1,
-            "the tiled kernels' reduction follows M; a width-independent draft projection changes the S1.3/S2 decision"
         );
 
         let calibrated = unsafe {
@@ -5190,6 +5189,11 @@ mod tests {
         if !calibrated {
             return;
         }
+        assert!(
+            width_changes_bits && per_layer_classes.len() > 1,
+            "the tiled kernels' reduction follows M: a width-independent draft projection \
+             would let a rebuilt window ignore append widths"
+        );
         assert_eq!(
             fc_classes,
             [
