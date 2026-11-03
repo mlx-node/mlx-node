@@ -1941,6 +1941,22 @@ describe('launchGrokAgent server gating', () => {
     }
   });
 
+  it('names mlx agent as the resume command, keeping a user override', async () => {
+    const saved = process.env.GROK_RESUME_COMMAND;
+    try {
+      delete process.env.GROK_RESUME_COMMAND;
+      await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent });
+      expect(spawnAgent.envs[0]!.GROK_RESUME_COMMAND).toBe('mlx agent');
+
+      process.env.GROK_RESUME_COMMAND = 'my-wrapper';
+      await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent });
+      expect(spawnAgent.envs[1]!.GROK_RESUME_COMMAND).toBe('my-wrapper');
+    } finally {
+      if (saved === undefined) delete process.env.GROK_RESUME_COMMAND;
+      else process.env.GROK_RESUME_COMMAND = saved;
+    }
+  });
+
   it('kills the serve child when readiness fails', async () => {
     // No banner line — the child lives but never reports a port. The
     // rejection must still reap it, or `mlx agent` leaves an orphan serve

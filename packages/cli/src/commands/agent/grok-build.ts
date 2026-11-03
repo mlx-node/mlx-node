@@ -1780,6 +1780,8 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
   }
 
   const env = { ...process.env };
+  // grok's exit hint prints this as the resume command; the bare `grok` is not on PATH.
+  env.GROK_RESUME_COMMAND ??= 'mlx agent';
   if (serve) {
     env.GROK_MODELS_BASE_URL = serve.url;
     env.GROK_CLI_CHAT_PROXY_BASE_URL = serve.url;
