@@ -1324,7 +1324,7 @@ pub(crate) fn gated_delta_split_at(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The env-override parser maps strings → [`GdnKernel`] (tested env-free, race-free).
@@ -1547,7 +1547,7 @@ mod tests {
     /// head widths (Dv = 128, Dk = 128): the FFI checks
     /// `maxTotalThreadsPerThreadgroup >= 8 * dv` when the pipeline is built,
     /// so the entry itself reports decline — a device limit, not test input.
-    fn fused_step_launches() -> bool {
+    pub(crate) fn fused_step_launches() -> bool {
         if !unsafe { sys::mlx_metal_is_available() } {
             return false;
         }
@@ -1574,7 +1574,7 @@ mod tests {
     /// The same launch check for the complete pipeline (prep folded in):
     /// `gdn_fused_pipeline(..., complete = true)` applies the identical
     /// threadgroup test, so a device that declines one declines both.
-    fn fused_complete_launches() -> bool {
+    pub(crate) fn fused_complete_launches() -> bool {
         if !unsafe { sys::mlx_metal_is_available() } {
             return false;
         }
@@ -2442,7 +2442,7 @@ mod tests {
     /// Whether this device launches the fused-prefill pipeline: same
     /// threadgroup contract as `gdn_fused_step` (8 * Dv threads per value
     /// head), so the FFI entry itself reports decline.
-    fn fused_prefill_launches() -> bool {
+    pub(crate) fn fused_prefill_launches() -> bool {
         if !unsafe { sys::mlx_metal_is_available() } {
             return false;
         }

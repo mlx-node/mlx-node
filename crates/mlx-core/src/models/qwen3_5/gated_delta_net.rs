@@ -2867,10 +2867,21 @@ mod tests {
     /// takes the same route.
     #[test]
     fn capture_keeps_route_bits_and_owns_state() -> Result<()> {
-        if !gdn_prepare_backend_probe() || !prefill_fused_enabled() {
+        use crate::models::qwen3_5::gated_delta::tests::{
+            fused_complete_launches, fused_prefill_launches, fused_step_launches,
+        };
+        if !gdn_prepare_backend_probe() {
             eprintln!("SKIP capture_keeps_route_bits_and_owns_state: no fused GDN kernels");
             return Ok(());
         }
+        // Each fused route's entry declines when its pipeline cannot hold a
+        // value head per threadgroup on this GPU; the forward then falls back.
+        let host_runs = |route: GdnRoute| match route {
+            GdnRoute::FusedPrefill => prefill_fused_enabled() && fused_prefill_launches(),
+            GdnRoute::Complete => fused_complete_launches(),
+            GdnRoute::FusedTail => fused_step_launches(),
+            GdnRoute::Chain => true,
+        };
         let cases: [(bool, usize, &[usize], GdnRoute); 7] = [
             (
                 false,
@@ -2885,7 +2896,7 @@ mod tests {
             (false, 40, &[1, 3, 32, 39, 40], GdnRoute::Chain),
             (true, 63, &[1, 16, 32, 62, 63], GdnRoute::Chain),
         ];
-        for (tiled, t, rows, route) in cases {
+        for (tiled, t, rows, intended) in cases {
             let net = capture_net(tiled);
             for warm in [false, true] {
                 let tag = format!("tiled={tiled} T={t} warm={warm}");
@@ -2899,7 +2910,14 @@ mod tests {
                 take_gdn_routes();
                 let mut plain = copy_cache(&base);
                 let out_plain = net.forward(&x, None, Some(&mut plain), true)?;
-                assert_eq!(take_gdn_routes(), [route], "{tag}: uncaptured route");
+                let host_route = take_gdn_routes();
+                if host_runs(intended) {
+                    assert_eq!(host_route, [intended], "{tag}: uncaptured route");
+                } else {
+                    assert_eq!(host_route.len(), 1, "{tag}: uncaptured route");
+                    assert_ne!(host_route, [intended], "{tag}: declined route ran");
+                }
+                let route = host_route[0];
                 let mut live = copy_cache(&base);
                 let (out, captured) = net.forward_captured(
                     &x,
