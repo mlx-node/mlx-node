@@ -114,7 +114,7 @@ function caseArgv(model: string, entrypoint: 'agent' | 'delegate', promptFile: s
 
 /** `mlx serve` argv; `--preload` matches the launcher's preload of the `-m` model. */
 export function serveInvocation(cliEntry: string, token: string, modelsDir: string, model: string): string[] {
-  return [cliEntry, 'serve', '--port', '0', '--auth-token', token, '--models-dir', modelsDir, '--preload', model];
+  return [cliEntry, 'serve', '--port', '0', `--auth-token=${token}`, '--models-dir', modelsDir, '--preload', model];
 }
 
 /** Agent env pointing grok at `mlx serve`, with the launcher's media-tool switches. */

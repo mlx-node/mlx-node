@@ -1695,8 +1695,8 @@ async function spawnInferenceServer(
     'serve',
     '--port',
     '0',
-    '--auth-token',
-    token,
+    // `=` form: a base64url token can start with `-`, which parseArgs reads as a flag.
+    `--auth-token=${token}`,
     ...(opts.modelsDir ? ['--models-dir', opts.modelsDir] : []),
     ...(opts.preloadModel !== undefined ? ['--preload', opts.preloadModel] : []),
   ];

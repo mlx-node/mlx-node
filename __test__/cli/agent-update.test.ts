@@ -47,6 +47,7 @@ import {
   type AgentInstallProbe,
 } from '../../packages/cli/src/commands/agent/grok-build.js';
 import { run } from '../../packages/cli/src/commands/agent/index.js';
+import { parseServeArgs } from '../../packages/cli/src/commands/serve.js';
 
 const MANAGED = { source: 'managed', path: '/m/mlx-agent' } satisfies Partial<AgentInstallProbe>;
 
@@ -1894,6 +1895,16 @@ describe('launchGrokAgent server gating', () => {
     expect(code).toBe(0);
     expect(spawnServe).not.toHaveBeenCalled();
     expect(spawnAgent.envs[0]!.GROK_MODELS_BASE_URL).toBeUndefined();
+  });
+
+  it('passes the auth token as one --auth-token=<tok> arg so a leading dash still parses', async () => {
+    await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent });
+    const serveArgv: string[] = spawnServe.mock.calls[0]![0];
+    const tokenArg = serveArgv.find((a) => a.startsWith('--auth-token'));
+    expect(tokenArg).toMatch(/^--auth-token=.+/);
+    const token = tokenArg!.slice('--auth-token='.length);
+    expect(parseServeArgs(serveArgv.slice(2)).authToken).toBe(token);
+    expect(parseServeArgs(['--port', '0', '--auth-token=-dashFirst']).authToken).toBe('-dashFirst');
   });
 
   it('asks the spawned serve to preload the chosen model', async () => {
