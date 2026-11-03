@@ -1310,7 +1310,7 @@ impl Qwen35Inner {
     /// Apply gradients to model weights (SGD or AdamW delta application).
     ///
     /// Direct field access on Qwen35Inner — no locks needed.
-    fn apply_gradients_inner(
+    pub(crate) fn apply_gradients_inner(
         &mut self,
         gradients: HashMap<String, &MxArray>,
         learning_rate: f64,
@@ -1407,6 +1407,7 @@ impl Qwen35Inner {
         if let Some(draft) = &self.dflash2 {
             draft.invalidate_compiled();
         }
+        self.dflash2_states.clear();
         result
     }
 

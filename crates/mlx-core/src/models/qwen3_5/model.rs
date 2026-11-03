@@ -89,8 +89,8 @@ mod training;
 use self::chat_backend::resolve_qwen35_chat_params;
 pub(crate) use self::commands::{Qwen35Cmd, Qwen35FamilyCommand};
 pub(crate) use self::forward::{
-    DFlash2LogitsSpan, PREFILL_STEP_SIZE, async_eval_layer_caches, eval_layer_caches,
-    forward_dflash2_with_taps, partition_prefill_chunks,
+    DFlash2LogitsSpan, DFlash2TargetForward, PREFILL_STEP_SIZE, async_eval_layer_caches,
+    eval_layer_caches, forward_dflash2_with_taps, partition_prefill_chunks,
 };
 use self::forward::{
     chunked_prefill, chunked_prefill_with_hidden, eager_verify_step, forward_inner,
@@ -169,6 +169,7 @@ pub(crate) struct Qwen35Inner {
     pub(crate) dflash2_context: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
     pub(crate) dflash2_turn_state: Option<crate::models::qwen3_5::dflash2_turn::DFlash2TurnState>,
     pub(crate) dflash2_prefix: PrefixTracker,
+    pub(crate) dflash2_states: crate::models::qwen3_5::dflash2_state::flat::FlatStates,
     /// Latched when the compiled DFlash2 verify graph fails at trace or
     /// replay — the failure mode is structural, so the stepper stays on the
     /// eager path for the rest of the model's lifetime.
@@ -872,3 +873,6 @@ mod paged_gdn_frontier_tests;
 
 #[cfg(test)]
 mod mtp_gate_state_tests;
+
+#[cfg(test)]
+mod dflash2_park_tests;

@@ -3,6 +3,7 @@
 use super::*;
 
 use crate::models::forward as fwd;
+use crate::models::qwen3_5::gated_delta_net::{GdnCapturePlan, GdnCell, GdnLayerTape, gdn_cells};
 
 /// Default prefill chunk size (tokens per chunk).
 /// Matches Python mlx-lm's `prefill_step_size` default of 2048.
@@ -422,6 +423,15 @@ pub(crate) enum DFlash2LogitsSpan {
     LastRow,
 }
 
+/// [`forward_dflash2_with_taps`]'s output: logits, the residual taps in
+/// `tap_layers` order, the per-layer GDN tape and the captured GDN cells.
+pub(crate) type DFlash2TargetForward = (
+    MxArray,
+    Vec<MxArray>,
+    Vec<Option<GdnLayerTape>>,
+    Vec<GdnCell>,
+);
+
 /// Target forward used by the external DFlash2 stepper. Captures post-layer
 /// residuals in the companion checkpoint's declared order and optionally
 /// records the GDN recurrence tape needed to roll a speculative verify block
@@ -431,6 +441,10 @@ pub(crate) enum DFlash2LogitsSpan {
 /// in layer order (the DFlash2 spare blob rows), makes the compiled verify
 /// write each layer's window-final state there and report it as the tape's
 /// `final_state` / `final_conv`; the eager path ignores it.
+///
+/// `capture` (prefill only: no tape) also returns the GDN state at each of
+/// its chunk rows, one [`GdnCell`] per row; every other output keeps the
+/// bits of the uncaptured forward.
 pub(crate) fn forward_dflash2_with_taps(
     inner: &mut Qwen35Inner,
     input_ids: &MxArray,
@@ -438,18 +452,20 @@ pub(crate) fn forward_dflash2_with_taps(
     record_tape: bool,
     logits_span: DFlash2LogitsSpan,
     gdn_dst: Option<&crate::models::qwen3_5::gdn_blob::GdnDestinations>,
-) -> Result<(
-    MxArray,
-    Vec<MxArray>,
-    Vec<Option<crate::models::qwen3_5::gated_delta_net::GdnLayerTape>>,
-)> {
+    capture: Option<&GdnCapturePlan<'_>>,
+) -> Result<DFlash2TargetForward> {
+    if record_tape && capture.is_some() {
+        return Err(Error::from_reason(
+            "DFlash2 GDN capture runs on the prefill forward, which records no tape",
+        ));
+    }
     // The compiled verify path replays the whole decode forward as one fused
     // MLX tape — see `forward_dflash2_compiled` for the contract. It only
     // covers the speculative-verify shape (B=1, tape recorded, all-rows
     // logits); anything else stays on the eager path below.
     if record_tape && matches!(logits_span, DFlash2LogitsSpan::All) {
         match forward_dflash2_compiled(inner, input_ids, tap_layers, gdn_dst) {
-            Ok(Some(out)) => return Ok(out),
+            Ok(Some((logits, taps, tape))) => return Ok((logits, taps, tape, Vec::new())),
             Ok(None) => {}
             Err(e) => {
                 // Trace/replay failures leave the caches untouched (all cache
@@ -474,6 +490,7 @@ pub(crate) fn forward_dflash2_with_taps(
         .collect::<Vec<_>>();
     let layer_probe = std::env::var("MLX_DFLASH2_VERIFY_LAYERS").is_ok();
     let mut probe_t = std::time::Instant::now();
+    let mut captured = Vec::new();
     for index in 0..inner.layers.len() {
         let cache = inner.caches.as_mut().map(|caches| &mut caches[index]);
         hidden = if record_tape {
@@ -487,6 +504,12 @@ pub(crate) fn forward_dflash2_with_taps(
                 Some(&mut slot),
             )?;
             tape[index] = slot;
+            hidden
+        } else if let Some(plan) = capture {
+            let (hidden, layer) = inner.layers[index].forward_captured(&hidden, cache, plan)?;
+            if inner.layers[index].is_linear() {
+                captured.push(layer);
+            }
             hidden
         } else {
             inner.layers[index].forward(&hidden, None, cache, None, true)?
@@ -533,7 +556,11 @@ pub(crate) fn forward_dflash2_with_taps(
     };
     let normalized = inner.final_norm.forward(&hidden)?;
     let logits = project_logits_from_hidden(&normalized, &inner.lm_head, &inner.embedding)?;
-    Ok((logits, taps, tape))
+    let cells = match capture {
+        Some(plan) => gdn_cells(plan, captured)?,
+        None => Vec::new(),
+    };
+    Ok((logits, taps, tape, cells))
 }
 
 /// Compiled-graph variant of the DFlash2 verify forward (the
@@ -594,7 +621,6 @@ fn forward_dflash2_compiled(
     use crate::models::qwen3_5::attention::{VerifyKvOut, VerifyPrefix};
     use crate::models::qwen3_5::decoder_layer::{DecoderLayer, LayerVerifyIo, VerifyResidual};
     use crate::models::qwen3_5::gated_delta::GdnKernelTape;
-    use crate::models::qwen3_5::gated_delta_net::GdnLayerTape;
     use crate::transformer::KvFormat;
 
     if inner.dflash2_compiled_verify_disabled {

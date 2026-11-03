@@ -82,8 +82,16 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
+        if scope == ResetScope::PrefixMiss {
+            // The park takes the history with the state; this scope keeps it.
+            let history = self.cached_token_history.clone();
+            if crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self) {
+                self.cached_token_history = history;
+            }
+        }
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
+        self.dflash2_states.live_anchor = None;
         self.dflash2_prefix
             .note_drop(reset_drop_site(scope), DropKind::Invalidated);
         match scope {

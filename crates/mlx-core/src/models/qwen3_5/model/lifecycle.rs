@@ -52,6 +52,8 @@ impl Qwen35Inner {
         };
 
         let dflash2_prefix = PrefixTracker::new(config.paged_block_size());
+        let dflash2_states =
+            crate::models::qwen3_5::dflash2_state::flat::FlatStates::new(config.paged_block_size());
         Ok(Self {
             config,
             turn_cancel: None,
@@ -66,6 +68,7 @@ impl Qwen35Inner {
             dflash2_context: None,
             dflash2_turn_state: None,
             dflash2_prefix,
+            dflash2_states,
             caches: None,
             tokenizer: None,
             vision_encoder: None,
@@ -426,6 +429,7 @@ impl Qwen35Inner {
         self.caches = None;
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
+        self.dflash2_states.clear();
         self.dflash2_prefix
             .note_drop("reset_caches_sync", DropKind::Invalidated);
         self.scheduled_recurrent = RecurrentStateTable::stage2();

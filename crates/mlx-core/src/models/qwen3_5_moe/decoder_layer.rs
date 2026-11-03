@@ -7,7 +7,7 @@ use napi::bindgen_prelude::*;
 
 use super::attention::Qwen3_5Attention;
 use super::config::Qwen3_5MoeConfig;
-use super::gated_delta_net::GatedDeltaNet;
+use super::gated_delta_net::{GatedDeltaNet, GdnCapturePlan, GdnLayerCapture};
 use super::layer_cache::Qwen3_5LayerCache;
 use super::sparse_moe::SparseMoeBlock;
 use crate::models::quantized_linear::{MLPVariant, QuantizedLinear};
@@ -268,6 +268,46 @@ impl DecoderLayer {
             }
         };
 
+        self.finish_layer(x, attn_out, includes_residual)
+    }
+
+    /// Unmasked text-prefill forward ([`Self::forward`] with no mask or
+    /// M-RoPE positions) that also captures this layer's GDN state at every
+    /// row of `plan`. Full-attention layers capture nothing.
+    pub(crate) fn forward_captured(
+        &mut self,
+        x: &MxArray,
+        cache: Option<&mut Qwen3_5LayerCache>,
+        plan: &GdnCapturePlan<'_>,
+    ) -> Result<(MxArray, Vec<GdnLayerCapture>)> {
+        let normed = self.input_layernorm.forward(x)?;
+        let includes_residual = self.source_mixer_rows(x)?;
+        let (attn_out, captured) = match &mut self.attn {
+            AttentionType::Linear(gdn) => {
+                let ac = cache.and_then(|c| c.as_arrays_cache_mut());
+                gdn.forward_captured(&normed, ac, true, includes_residual.then_some(x), plan)?
+            }
+            AttentionType::Full(attn) => {
+                let kvc = cache.and_then(|c| c.as_kv_cache_mut());
+                let out = if includes_residual {
+                    attn.forward_source_residual(&normed, None, kvc, None, x)?
+                } else {
+                    attn.forward(&normed, None, kvc, None)?
+                };
+                (out, Vec::new())
+            }
+        };
+        Ok((self.finish_layer(x, attn_out, includes_residual)?, captured))
+    }
+
+    /// Post-attention half of the layer: residual + norm, then the MLP or
+    /// expert block and its residual.
+    fn finish_layer(
+        &self,
+        x: &MxArray,
+        attn_out: MxArray,
+        includes_residual: bool,
+    ) -> Result<MxArray> {
         let (h, normed) = Self::finish_mixer(
             &self.post_attention_layernorm,
             x,
@@ -325,23 +365,7 @@ impl DecoderLayer {
             }
         };
 
-        let (h, normed) = Self::finish_mixer(
-            &self.post_attention_layernorm,
-            x,
-            attn_out,
-            includes_residual,
-        )?;
-        if let MLPType::MoE(moe) = &self.mlp
-            && let Some(hidden) = moe.forward_source_residual(&normed, &h, None)?
-        {
-            return Ok(hidden);
-        }
-        let mlp_out = match &self.mlp {
-            MLPType::Dense(mlp) => mlp.forward(&normed)?,
-            MLPType::MoE(moe) => moe.forward(&normed)?,
-        };
-
-        h.add(&mlp_out)
+        self.finish_layer(x, attn_out, includes_residual)
     }
 
     /// Paged-or-flat dispatch for the MoE decoder layer.

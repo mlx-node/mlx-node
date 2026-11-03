@@ -6,11 +6,115 @@ use napi::bindgen_prelude::*;
 use super::arrays_cache::ArraysCache;
 use super::config::Qwen3_5Config;
 use super::gated_delta::{
-    GdnCompleteOut, GdnKernelTape, GdnPrefill, GdnPrologue, GdnTail, gated_delta_fused_prefill,
-    gated_delta_update, gated_delta_update_fused, gated_delta_update_with_tape,
-    prefill_fused_enabled,
+    GdnCarry, GdnCompleteOut, GdnKernelTape, GdnPrefill, GdnPrologue, GdnTail,
+    gated_delta_fused_complete_deferred, gated_delta_fused_complete_with_prepared,
+    gated_delta_fused_prefill, gated_delta_split_at, gated_delta_update, gated_delta_update_fused,
+    gated_delta_update_with_tape, prefill_fused_enabled,
 };
-use crate::models::quantized_linear::{DEFAULT_QUANT_MODE, LinearProj, QuantizedLinear};
+use crate::models::quantized_linear::{
+    DEFAULT_QUANT_MODE, LinearProj, PreparedSg8, QuantizedLinear,
+};
+
+/// Chunk-relative rows at which a prefill forward captures every GDN layer's
+/// state: strictly increasing, each in `1..=T`. Only the recurrence dispatch
+/// is split at these rows; projections, conv and taps still run over the
+/// whole chunk, so the chunk's outputs and caches keep their bits.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GdnCapturePlan<'a> {
+    pub rows: &'a [usize],
+}
+
+/// One GDN layer's state after chunk rows `[0, c)`: the conv history
+/// `[1, K-1, W]` and the f32 recurrent state `[1, Hv, Dv, Dk]`. Both are
+/// fresh buffers: no cache slot, state blob or later chunk can write them.
+#[derive(Clone)]
+pub(crate) struct GdnLayerCapture {
+    pub conv: MxArray,
+    pub rec: MxArray,
+}
+
+/// Every GDN layer's state after chunk rows `[0, row)`, in layer order.
+#[derive(Clone)]
+pub(crate) struct GdnCell {
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub row: usize,
+    pub conv: Vec<MxArray>,
+    pub rec: Vec<MxArray>,
+}
+
+/// One [`GdnCell`] per plan row from the per-layer captures (linear layers
+/// in order, one capture per plan row each).
+pub(crate) fn gdn_cells(
+    plan: &GdnCapturePlan<'_>,
+    layers: Vec<Vec<GdnLayerCapture>>,
+) -> Result<Vec<GdnCell>> {
+    let mut cells: Vec<GdnCell> = plan
+        .rows
+        .iter()
+        .map(|&row| GdnCell {
+            row,
+            conv: Vec::with_capacity(layers.len()),
+            rec: Vec::with_capacity(layers.len()),
+        })
+        .collect();
+    for layer in layers {
+        if layer.len() != cells.len() {
+            return Err(Error::from_reason(format!(
+                "GDN capture: a layer captured {} states for {} rows",
+                layer.len(),
+                cells.len()
+            )));
+        }
+        for (cell, capture) in cells.iter_mut().zip(layer) {
+            cell.conv.push(capture.conv);
+            cell.rec.push(capture.rec);
+        }
+    }
+    Ok(cells)
+}
+
+#[cfg(test)]
+thread_local! {
+    // Recurrence routes the GDN forwards took on this thread, in order.
+    static GDN_ROUTES: std::cell::RefCell<Vec<GdnRoute>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GdnRoute {
+    FusedPrefill,
+    Complete,
+    FusedTail,
+    Chain,
+}
+
+#[cfg(test)]
+fn note_route(route: GdnRoute) {
+    GDN_ROUTES.with(|routes| routes.borrow_mut().push(route));
+}
+
+#[cfg(test)]
+pub(crate) fn take_gdn_routes() -> Vec<GdnRoute> {
+    GDN_ROUTES.with(|routes| routes.take())
+}
+
+/// Rows `[start, end)` of a `[B, T, ...]` window.
+fn window_rows(x: &MxArray, start: usize, end: usize) -> Result<MxArray> {
+    x.slice_axis(1, start as i64, end as i64)
+}
+
+/// Collects each split row's carried recurrent state.
+fn captured_states(captured: Vec<GdnCarry>) -> Result<Vec<MxArray>> {
+    captured
+        .into_iter()
+        .map(|carry| {
+            carry
+                .state
+                .ok_or_else(|| Error::from_reason("GDN capture: a split row carried no state"))
+        })
+        .collect()
+}
 
 /// Per-GDN-layer tape recorded during the eager MTP verify forward.
 ///
@@ -284,8 +388,28 @@ pub struct GatedDeltaNet {
 /// shared chain to finish (the fused kernel declined after the conv already
 /// ran — the conv work is not redone).
 enum PrefillPrep {
-    Fused { gated: MxArray, state: MxArray },
-    Raw { q: MxArray, k: MxArray, v: MxArray },
+    Fused {
+        gated: MxArray,
+        state: MxArray,
+        captured: Vec<MxArray>,
+    },
+    Raw {
+        q: MxArray,
+        k: MxArray,
+        v: MxArray,
+    },
+}
+
+/// The complete fused core's output for the layer: the gated rows, the new
+/// state and conv history, and the per-split-row states. A split run has no
+/// kernel tape and no prepared SG8 operands.
+struct CompleteRun {
+    out: MxArray,
+    prepared_sg8: Option<PreparedSg8>,
+    state: MxArray,
+    history: MxArray,
+    tape: Option<GdnKernelTape>,
+    captured: Vec<MxArray>,
 }
 
 impl GatedDeltaNet {
@@ -542,7 +666,7 @@ impl GatedDeltaNet {
         use_kernel: bool,
         tape_sink: Option<&mut Option<GdnLayerTape>>,
     ) -> Result<MxArray> {
-        self.forward_with_tape_impl(x, mask, cache, use_kernel, tape_sink, None)
+        self.forward_with_tape_impl(x, mask, cache, use_kernel, tape_sink, None, None)
     }
 
     /// Explicit residual-inclusive output, with unchanged cache/tape ownership.
@@ -556,7 +680,83 @@ impl GatedDeltaNet {
         tape_sink: Option<&mut Option<GdnLayerTape>>,
         residual: &MxArray,
     ) -> Result<MxArray> {
-        self.forward_with_tape_impl(x, mask, cache, use_kernel, tape_sink, Some(residual))
+        self.forward_with_tape_impl(x, mask, cache, use_kernel, tape_sink, Some(residual), None)
+    }
+
+    /// Unmasked batch-1 prefill forward (no tape) that also captures the
+    /// layer state at every row of `plan`. Output and cache are bit-identical
+    /// to the uncaptured forward: each route runs the entry the whole window
+    /// takes on the split segments, carrying the f32 state between them.
+    pub(crate) fn forward_captured(
+        &self,
+        x: &MxArray,
+        cache: Option<&mut ArraysCache>,
+        use_kernel: bool,
+        residual: Option<&MxArray>,
+        plan: &GdnCapturePlan<'_>,
+    ) -> Result<(MxArray, Vec<GdnLayerCapture>)> {
+        let mut captured = Vec::with_capacity(plan.rows.len());
+        let out = self.forward_with_tape_impl(
+            x,
+            None,
+            cache,
+            use_kernel,
+            None,
+            residual,
+            Some((plan, &mut captured)),
+        )?;
+        Ok((out, captured))
+    }
+
+    /// The conv history after chunk row `c`: the raw conv-input rows
+    /// `[c - (K-1), c)`, reaching into the incoming history when `c < K-1`.
+    /// This is what the conv slot holds after a forward of rows `[0, c)`.
+    fn conv_history_at(
+        &self,
+        qkv: &MxArray,
+        incoming: Option<&MxArray>,
+        c: usize,
+    ) -> Result<MxArray> {
+        let keep = (self.conv_kernel_dim - 1) as i64;
+        let c = c as i64;
+        let rows = if c >= keep {
+            qkv.slice_axis(1, c - keep, c)?
+        } else {
+            let prior = match incoming {
+                Some(history) => history.clone(),
+                None => MxArray::zeros(&[1, keep, self.conv_dim as i64], Some(qkv.dtype()?))?,
+            };
+            MxArray::concatenate(&prior.slice_axis(1, c, keep)?, &qkv.slice_axis(1, 0, c)?, 1)?
+        };
+        rows.deep_copy()
+    }
+
+    /// Hands `capture` one [`GdnLayerCapture`] per plan row from the states
+    /// the split recurrence carried at those rows.
+    fn record_captures(
+        &self,
+        capture: Option<(&GdnCapturePlan<'_>, &mut Vec<GdnLayerCapture>)>,
+        qkv: &MxArray,
+        incoming: Option<&MxArray>,
+        states: Vec<MxArray>,
+    ) -> Result<()> {
+        let Some((plan, out)) = capture else {
+            return Ok(());
+        };
+        if states.len() != plan.rows.len() {
+            return Err(Error::from_reason(format!(
+                "GDN capture: {} states for {} rows",
+                states.len(),
+                plan.rows.len()
+            )));
+        }
+        for (&c, state) in plan.rows.iter().zip(states) {
+            out.push(GdnLayerCapture {
+                conv: self.conv_history_at(qkv, incoming, c)?,
+                rec: state.deep_copy()?,
+            });
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -568,9 +768,24 @@ impl GatedDeltaNet {
         use_kernel: bool,
         mut tape_sink: Option<&mut Option<GdnLayerTape>>,
         residual: Option<&MxArray>,
+        capture: Option<(&GdnCapturePlan<'_>, &mut Vec<GdnLayerCapture>)>,
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
+        let rows = capture
+            .as_ref()
+            .map(|(plan, _)| plan.rows)
+            .filter(|rows| !rows.is_empty());
+        if rows.is_some()
+            && (batch != 1
+                || mask.is_some()
+                || tape_sink.is_some()
+                || cache.as_deref().and_then(|c| c.get(4)).is_some())
+        {
+            return Err(Error::from_reason(
+                "GDN state capture needs an unmasked batch-1 window with no tape or deferred state",
+            ));
+        }
 
         // When the stacked weight is available, do one matmul + one split.
         let qkvz_dim = (self.key_dim * 2 + self.value_dim * 2) as i64;
@@ -643,6 +858,7 @@ impl GatedDeltaNet {
         } else {
             None
         };
+        let incoming_conv = rows.and(conv_state.clone());
 
         // Prompt-window fusion: one dispatch for the whole GDN core of an
         // unmasked batch-1 `T >= 64` window — bit-identical to the
@@ -660,14 +876,23 @@ impl GatedDeltaNet {
                 use_kernel,
                 batch,
                 seq_len,
+                rows,
             )?
         } else {
             None
         };
-        if let Some(PrefillPrep::Fused { gated, state }) = prefill_prep {
+        if let Some(PrefillPrep::Fused {
+            gated,
+            state,
+            captured,
+        }) = prefill_prep
+        {
             if let Some(cache) = cache {
                 cache.set(1, state)?;
             }
+            #[cfg(test)]
+            note_route(GdnRoute::FusedPrefill);
+            self.record_captures(capture, &qkv, incoming_conv.as_ref(), captured)?;
             return self.out_proj.forward_mixer_output(&gated, None, residual);
         }
 
@@ -687,7 +912,8 @@ impl GatedDeltaNet {
             batch,
             seq_len,
             residual.is_none(),
-        ) {
+            rows,
+        )? {
             if let Some(cache) = cache {
                 cache.set(
                     0,
@@ -699,12 +925,17 @@ impl GatedDeltaNet {
                 )?;
                 cache.set(1, complete.state)?;
             }
-            if let (Some(sink), Some(qkv)) = (tape_sink.take(), tape_qkv) {
+            #[cfg(test)]
+            note_route(GdnRoute::Complete);
+            self.record_captures(capture, &qkv, incoming_conv.as_ref(), complete.captured)?;
+            if let (Some(sink), Some(qkv), Some(kernel)) =
+                (tape_sink.take(), tape_qkv, complete.tape)
+            {
                 // The kernel's own history output (not the reshaped cache
                 // view): a sibling of the gated output, so it is evaluated
                 // with it and a full accept can adopt it in place.
                 *sink = Some(GdnLayerTape {
-                    kernel: complete.tape,
+                    kernel,
                     qkv,
                     conv_kernel_dim: self.conv_kernel_dim,
                     final_state: None,
@@ -834,37 +1065,116 @@ impl GatedDeltaNet {
 
         // Run gated delta recurrence
         let recurrent_state = cache.as_deref().and_then(|c| c.get(1));
+        let seq = seq_len as usize;
 
         // Fused tail: recurrence + gated norm + z gate in one dispatch (the
         // production decode/verify geometry). Slot 2 of the cache, when a
         // caller provides it, is the buffer the new state is written into.
         {
             let mut kernel_sink: Option<GdnKernelTape> = None;
-            let fused = gated_delta_update_fused(
-                &q,
-                &k,
-                &v,
-                &a,
-                &b,
-                &self.a_log,
-                &self.dt_bias,
-                recurrent_state,
-                mask,
-                use_kernel,
-                self.tiled_gguf_layout,
-                precomputed.as_ref().map(|(d, b)| (d, b)),
-                GdnTail {
-                    z: &z,
-                    norm_weight: self.norm.weight(),
-                    eps: self.norm.eps(),
-                    state_dst: cache.as_deref().and_then(|c| c.get(2)),
-                },
-                tape_sink.is_some().then_some(&mut kernel_sink),
-            )?;
-            if let Some((gated, new_state)) = fused {
+            let fused = match rows {
+                None => gated_delta_update_fused(
+                    &q,
+                    &k,
+                    &v,
+                    &a,
+                    &b,
+                    &self.a_log,
+                    &self.dt_bias,
+                    recurrent_state,
+                    mask,
+                    use_kernel,
+                    self.tiled_gguf_layout,
+                    precomputed.as_ref().map(|(d, b)| (d, b)),
+                    GdnTail {
+                        z: &z,
+                        norm_weight: self.norm.weight(),
+                        eps: self.norm.eps(),
+                        state_dst: cache.as_deref().and_then(|c| c.get(2)),
+                    },
+                    tape_sink.is_some().then_some(&mut kernel_sink),
+                )?
+                .map(|out| (out, Vec::new())),
+                // The whole window would be off the fused tail's T <= 32
+                // contract, so its segments must stay on the chain too.
+                Some(_) if seq > 32 => None,
+                Some(rows) => {
+                    // The first segment meets every contract the whole window
+                    // does except its length, so its decline is the window's.
+                    let mut declined = false;
+                    let split = gated_delta_split_at(
+                        seq,
+                        rows,
+                        GdnCarry {
+                            state: recurrent_state.cloned(),
+                            history: None,
+                        },
+                        |s, e, carry| {
+                            let r = |x: &MxArray| window_rows(x, s, e);
+                            let gates = match &precomputed {
+                                Some((d, b)) => Some((r(d)?, r(b)?)),
+                                None => None,
+                            };
+                            let z = r(&z)?;
+                            let out = gated_delta_update_fused(
+                                &r(&q)?,
+                                &r(&k)?,
+                                &r(&v)?,
+                                &r(&a)?,
+                                &r(&b)?,
+                                &self.a_log,
+                                &self.dt_bias,
+                                carry.state.as_ref(),
+                                None,
+                                use_kernel,
+                                self.tiled_gguf_layout,
+                                gates.as_ref().map(|(d, b)| (d, b)),
+                                GdnTail {
+                                    z: &z,
+                                    norm_weight: self.norm.weight(),
+                                    eps: self.norm.eps(),
+                                    state_dst: (e == seq)
+                                        .then(|| cache.as_deref().and_then(|c| c.get(2)))
+                                        .flatten(),
+                                },
+                                None,
+                            )?;
+                            match out {
+                                Some((gated, state)) => Ok((
+                                    gated,
+                                    GdnCarry {
+                                        state: Some(state),
+                                        history: None,
+                                    },
+                                )),
+                                None => {
+                                    declined = s == 0;
+                                    Err(Error::from_reason(
+                                        "fused GDN tail declined a capture segment",
+                                    ))
+                                }
+                            }
+                        },
+                    );
+                    match split {
+                        Ok(split) => {
+                            let state = split.carry.state.ok_or_else(|| {
+                                Error::from_reason("GDN capture: the split carried no state")
+                            })?;
+                            Some(((split.y, state), captured_states(split.captured)?))
+                        }
+                        Err(_) if declined => None,
+                        Err(error) => return Err(error),
+                    }
+                }
+            };
+            if let Some(((gated, new_state), captured)) = fused {
                 if let Some(cache) = cache {
                     cache.set(1, new_state)?;
                 }
+                #[cfg(test)]
+                note_route(GdnRoute::FusedTail);
+                self.record_captures(capture, &qkv, incoming_conv.as_ref(), captured)?;
                 if let (Some(sink), Some(kernel), Some(qkv)) =
                     (tape_sink.take(), kernel_sink, tape_qkv)
                 {
@@ -880,7 +1190,57 @@ impl GatedDeltaNet {
             }
         }
 
-        let (y, new_state) = if tape_sink.is_some() {
+        let (y, new_state) = if let Some(rows) = rows {
+            // `gated_delta_update` is this call with untiled heads.
+            let split = gated_delta_split_at(
+                seq,
+                rows,
+                GdnCarry {
+                    state: recurrent_state.cloned(),
+                    history: None,
+                },
+                |s, e, carry| {
+                    let r = |x: &MxArray| window_rows(x, s, e);
+                    let gates = match &precomputed {
+                        Some((d, b)) => Some((r(d)?, r(b)?)),
+                        None => None,
+                    };
+                    let (y, state) = gated_delta_update_with_tape(
+                        &r(&q)?,
+                        &r(&k)?,
+                        &r(&v)?,
+                        &r(&a)?,
+                        &r(&b)?,
+                        &self.a_log,
+                        &self.dt_bias,
+                        carry.state.as_ref(),
+                        None,
+                        use_kernel,
+                        self.tiled_gguf_layout,
+                        gates.as_ref().map(|(d, b)| (d, b)),
+                        None,
+                    )?;
+                    Ok((
+                        y,
+                        GdnCarry {
+                            state: Some(state),
+                            history: None,
+                        },
+                    ))
+                },
+            )?;
+            let state = split
+                .carry
+                .state
+                .ok_or_else(|| Error::from_reason("GDN capture: the split carried no state"))?;
+            self.record_captures(
+                capture,
+                &qkv,
+                incoming_conv.as_ref(),
+                captured_states(split.captured)?,
+            )?;
+            (split.y, state)
+        } else if tape_sink.is_some() {
             // Record the per-step kernel inputs into a local sink, then fold
             // them (plus the recorded qkv) into the layer tape below.
             let mut kernel_sink: Option<GdnKernelTape> = None;
@@ -948,6 +1308,8 @@ impl GatedDeltaNet {
         if let Some(cache) = cache {
             cache.set(1, new_state)?;
         }
+        #[cfg(test)]
+        note_route(GdnRoute::Chain);
 
         // Reshape z to per-head format: [B, T, value_dim] → [B, T, Hv, Dv]
         let z = z.reshape(&[
@@ -988,8 +1350,17 @@ impl GatedDeltaNet {
         batch: i64,
         seq_len: i64,
         allow_native_prepared: bool,
-    ) -> Option<GdnCompleteOut> {
+        rows: Option<&[usize]>,
+    ) -> Result<Option<CompleteRun>> {
         use crate::array::DType;
+        let whole = |out: GdnCompleteOut| CompleteRun {
+            out: out.out,
+            prepared_sg8: out.prepared_sg8,
+            state: out.state,
+            history: out.history,
+            tape: Some(out.tape),
+            captured: Vec::new(),
+        };
         if batch != 1
             || !(1..=16).contains(&seq_len)
             || mask.is_some()
@@ -1000,26 +1371,29 @@ impl GatedDeltaNet {
             || !(self.tiled_gguf_layout || self.num_k_heads == self.num_v_heads)
             || !crate::engine::persistence::compiled_forward_backend_available()
         {
-            return None;
+            return Ok(None);
         }
-        let conv = self.conv1d_w4_f32.as_ref()?;
-        let scale = self.gdn_scale_f32.as_ref()?;
-        let dt_bias = self.dt_bias_f32.as_ref()?;
+        let (Some(conv), Some(scale), Some(dt_bias)) = (
+            self.conv1d_w4_f32.as_ref(),
+            self.gdn_scale_f32.as_ref(),
+            self.dt_bias_f32.as_ref(),
+        ) else {
+            return Ok(None);
+        };
         let recurrent = cache.and_then(|c| c.get(1));
         if [qkv, z, a, b, self.norm.weight()]
             .iter()
             .any(|x| x.dtype().ok() != Some(DType::BFloat16))
             || recurrent.is_some_and(|s| s.dtype().ok() != Some(DType::Float32))
         {
-            return None;
+            return Ok(None);
         }
         let history = match conv_state {
-            Some(s) => s.squeeze(Some(&[0])).ok()?,
+            Some(s) => s.squeeze(Some(&[0]))?,
             None => MxArray::zeros(
                 &[(self.conv_kernel_dim - 1) as i64, self.conv_dim as i64],
                 Some(DType::BFloat16),
-            )
-            .ok()?,
+            )?,
         };
         let zero_state;
         let state = match recurrent {
@@ -1033,11 +1407,13 @@ impl GatedDeltaNet {
                         self.key_head_dim as i64,
                     ],
                     Some(DType::Float32),
-                )
-                .ok()?;
+                )?;
                 &zero_state
             }
         };
+        if let Some(rows) = rows {
+            return self.complete_split(qkv, z, a, b, &history, state, cache, seq_len, rows);
+        }
         let prologue = GdnPrologue {
             qkv,
             a,
@@ -1063,21 +1439,131 @@ impl GatedDeltaNet {
             && std::env::var("MLX_GDN_PREPARED_SG8").is_ok_and(|v| v == "1");
         if let Some(cache) = cache.filter(|c| c.get(4).is_some()) {
             let pending = [
-                cache.get(4)?,
-                cache.get(5)?,
-                cache.get(6)?,
-                cache.get(7)?,
-                cache.get(8)?,
-                cache.get(9)?,
+                cache.get(4),
+                cache.get(5),
+                cache.get(6),
+                cache.get(7),
+                cache.get(8),
+                cache.get(9),
             ];
-            super::gated_delta::gated_delta_fused_complete_deferred(
-                &prologue, state, &tail, prepared, pending,
+            let [Some(p0), Some(p1), Some(p2), Some(p3), Some(p4), Some(p5)] = pending else {
+                return Ok(None);
+            };
+            Ok(gated_delta_fused_complete_deferred(
+                &prologue,
+                state,
+                &tail,
+                prepared,
+                [p0, p1, p2, p3, p4, p5],
             )
+            .map(whole))
         } else {
-            super::gated_delta::gated_delta_fused_complete_with_prepared(
-                &prologue, state, &tail, prepared,
+            Ok(
+                gated_delta_fused_complete_with_prepared(&prologue, state, &tail, prepared)
+                    .map(whole),
             )
         }
+    }
+
+    /// [`Self::forward_complete`] split at `rows`: the complete kernel on each
+    /// segment, carrying the f32 state and the conv history. The state and
+    /// history destinations (slots 2/3) receive only the window-final
+    /// segment's. No prepared SG8 operands and no kernel tape: a capture
+    /// forward records none.
+    #[allow(clippy::too_many_arguments)]
+    fn complete_split(
+        &self,
+        qkv: &MxArray,
+        z: &MxArray,
+        a: &MxArray,
+        b: &MxArray,
+        history: &MxArray,
+        state: &MxArray,
+        cache: Option<&ArraysCache>,
+        seq_len: i64,
+        rows: &[usize],
+    ) -> Result<Option<CompleteRun>> {
+        let (Some(conv), Some(scale), Some(dt_bias)) = (
+            self.conv1d_w4_f32.as_ref(),
+            self.gdn_scale_f32.as_ref(),
+            self.dt_bias_f32.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        let seq = seq_len as usize;
+        // The first segment meets every contract the whole window does, so
+        // its decline is the window's: the chain runs.
+        let mut declined = false;
+        let split = gated_delta_split_at(
+            seq,
+            rows,
+            GdnCarry {
+                state: Some(state.clone()),
+                history: Some(history.clone()),
+            },
+            |s, e, carry| {
+                let r = |x: &MxArray| window_rows(x, s, e);
+                let (qkv, a, b, z) = (r(qkv)?, r(a)?, r(b)?, r(z)?);
+                let last = e == seq;
+                let (Some(history), Some(state)) = (carry.history.as_ref(), carry.state.as_ref())
+                else {
+                    return Err(Error::from_reason("GDN capture: complete carry is empty"));
+                };
+                let out = gated_delta_fused_complete_with_prepared(
+                    &GdnPrologue {
+                        qkv: &qkv,
+                        a: &a,
+                        b: &b,
+                        conv,
+                        history,
+                        scale,
+                        dt_bias,
+                        history_dst: last.then(|| cache.and_then(|c| c.get(3))).flatten(),
+                    },
+                    state,
+                    &GdnTail {
+                        z: &z,
+                        norm_weight: self.norm.weight(),
+                        eps: self.norm.eps(),
+                        state_dst: last.then(|| cache.and_then(|c| c.get(2))).flatten(),
+                    },
+                    false,
+                );
+                match out {
+                    Some(out) => Ok((
+                        out.out,
+                        GdnCarry {
+                            state: Some(out.state),
+                            history: Some(out.history),
+                        },
+                    )),
+                    None => {
+                        declined = s == 0;
+                        Err(Error::from_reason(
+                            "complete GDN kernel declined a capture segment",
+                        ))
+                    }
+                }
+            },
+        );
+        let split = match split {
+            Ok(split) => split,
+            Err(_) if declined => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let (Some(state), Some(history)) = (split.carry.state, split.carry.history) else {
+            return Err(Error::from_reason(
+                "GDN capture: the split carried no state",
+            ));
+        };
+        Ok(Some(CompleteRun {
+            out: split.y,
+            prepared_sg8: None,
+            state,
+            history,
+            tape: None,
+            captured: captured_states(split.captured)?,
+        }))
     }
 
     /// The conv stage of [`prep_via_conv`]: depthwise conv (fused
@@ -1298,6 +1784,7 @@ impl GatedDeltaNet {
         use_kernel: bool,
         batch: i64,
         seq_len: i64,
+        rows: Option<&[usize]>,
     ) -> Result<Option<PrefillPrep>> {
         if batch != 1
             || seq_len < 64
@@ -1344,35 +1831,93 @@ impl GatedDeltaNet {
                 v,
             }));
         }
-        match gated_delta_fused_prefill(
-            &q_raw,
-            &k_raw,
-            &v,
-            recurrent.as_ref(),
-            &GdnPrefill {
-                a,
-                b,
-                a_log: &self.a_log,
-                dt_bias: &self.dt_bias,
-                wq: &self.qk_norm_w_q,
-                wk: &self.qk_norm_w_k,
-                qk_eps: 1e-6,
-                tiled: self.tiled_gguf_layout,
-                tail: GdnTail {
-                    z,
-                    norm_weight: self.norm.weight(),
-                    eps: self.norm.eps(),
-                    state_dst: None,
+        let window = |s: usize, e: usize, state: Option<&MxArray>| {
+            let whole = (s, e) == (0, seq_len as usize);
+            let r = |x: &MxArray| {
+                if whole {
+                    Ok(x.clone())
+                } else {
+                    window_rows(x, s, e)
+                }
+            };
+            let (a, b, z) = (r(a)?, r(b)?, r(z)?);
+            gated_delta_fused_prefill(
+                &r(&q_raw)?,
+                &r(&k_raw)?,
+                &r(&v)?,
+                state,
+                &GdnPrefill {
+                    a: &a,
+                    b: &b,
+                    a_log: &self.a_log,
+                    dt_bias: &self.dt_bias,
+                    wq: &self.qk_norm_w_q,
+                    wk: &self.qk_norm_w_k,
+                    qk_eps: 1e-6,
+                    tiled: self.tiled_gguf_layout,
+                    tail: GdnTail {
+                        z: &z,
+                        norm_weight: self.norm.weight(),
+                        eps: self.norm.eps(),
+                        state_dst: None,
+                    },
                 },
+            )
+        };
+        let fused = match rows {
+            None => window(0, seq_len as usize, recurrent.as_ref())?
+                .map(|(gated, state)| (gated, state, Vec::new())),
+            Some(rows) => {
+                // The first segment meets every contract the whole window
+                // does, so its decline is the window's: the chain runs.
+                let mut declined = false;
+                let split = gated_delta_split_at(
+                    seq_len as usize,
+                    rows,
+                    GdnCarry {
+                        state: recurrent.clone(),
+                        history: None,
+                    },
+                    |s, e, carry| match window(s, e, carry.state.as_ref())? {
+                        Some((gated, state)) => Ok((
+                            gated,
+                            GdnCarry {
+                                state: Some(state),
+                                history: None,
+                            },
+                        )),
+                        None => {
+                            declined = s == 0;
+                            Err(Error::from_reason(
+                                "fused GDN prefill declined a capture segment",
+                            ))
+                        }
+                    },
+                );
+                match split {
+                    Ok(split) => {
+                        let state = split.carry.state.ok_or_else(|| {
+                            Error::from_reason("GDN capture: the split carried no state")
+                        })?;
+                        Some((split.y, state, captured_states(split.captured)?))
+                    }
+                    Err(_) if declined => None,
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        Ok(Some(match fused {
+            Some((gated, state, captured)) => PrefillPrep::Fused {
+                gated,
+                state,
+                captured,
             },
-        )? {
-            Some((gated, state)) => Ok(Some(PrefillPrep::Fused { gated, state })),
-            None => Ok(Some(PrefillPrep::Raw {
+            None => PrefillPrep::Raw {
                 q: q_raw,
                 k: k_raw,
                 v,
-            })),
-        }
+            },
+        }))
     }
 
     // ========== Weight accessors (standard mode) ==========
@@ -2257,6 +2802,234 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// bf16 values `k / 16`, `k` in `-2..=2`: every product and partial sum
+    /// of a 64-wide dot product is exact in f32, so a projection of these
+    /// gives the same bits at any GEMM M (row count) and tiling.
+    fn exact_bf16(shape: &[i64], seed: u32) -> MxArray {
+        let n: i64 = shape.iter().product();
+        let mut st = seed;
+        let values: Vec<f32> = (0..n)
+            .map(|_| {
+                st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((st >> 16) % 5) as f32 / 16.0 - 2.0 / 16.0
+            })
+            .collect();
+        MxArray::from_float32(&values, shape)
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap()
+    }
+
+    /// The production geometry with f32 `dt_bias`/`a_log` (what every prompt
+    /// route requires), compact tiled heads or the repeat-expanded map. The
+    /// input projections are exact (`exact_bf16`), so a forward of the
+    /// first `c` rows of a window sees the same projected rows as the whole
+    /// window: GEMM M cannot change the recurrence inputs.
+    fn capture_net(tiled: bool) -> GatedDeltaNet {
+        let mut net = kernel_geometry_net();
+        net.set_in_proj_qkvz_weight(&exact_bf16(&[16384, 64], 11))
+            .unwrap();
+        net.set_in_proj_ba_weight(&exact_bf16(&[96, 64], 12))
+            .unwrap();
+        net.tiled_gguf_layout = tiled;
+        net.set_dt_bias(&MxArray::random_normal(&[48], 0.0, 0.3, Some(DType::Float32)).unwrap());
+        net.set_a_log(&MxArray::random_normal(&[48], 0.0, 0.3, Some(DType::Float32)).unwrap())
+            .unwrap();
+        net
+    }
+
+    fn copy_cache(cache: &ArraysCache) -> ArraysCache {
+        let mut copy = ArraysCache::new(2);
+        for slot in 0..2 {
+            if let Some(x) = cache.get(slot) {
+                copy.set(slot, x.clone()).unwrap();
+            }
+        }
+        copy
+    }
+
+    fn aliases(a: &MxArray, b: &MxArray) -> bool {
+        MxArray::eval_arrays(&[a, b]).unwrap();
+        unsafe { sys::mlx_array_aliases(a.as_raw_ptr(), b.as_raw_ptr()) }
+    }
+
+    /// Capturing at rows of a prefill window keeps the layer's route and
+    /// bits: the output and both cache slots match the uncaptured forward
+    /// bit for bit on every prompt route (fused prefill, complete core,
+    /// prepare + fused tail, prepare + chain), cold and with a carried
+    /// state. Each capture owns its buffers (the window-end capture is not
+    /// the live cache array), stays unchanged after a later chunk, and its
+    /// conv history is the raw rows the cache holds after a forward of rows
+    /// `[0, c)`; its state equals that forward's whenever the shorter window
+    /// takes the same route.
+    #[test]
+    fn capture_keeps_route_bits_and_owns_state() -> Result<()> {
+        if !gdn_prepare_backend_probe() || !prefill_fused_enabled() {
+            eprintln!("SKIP capture_keeps_route_bits_and_owns_state: no fused GDN kernels");
+            return Ok(());
+        }
+        let cases: [(bool, usize, &[usize], GdnRoute); 7] = [
+            (
+                false,
+                80,
+                &[1, 2, 3, 16, 33, 64, 79, 80],
+                GdnRoute::FusedPrefill,
+            ),
+            (true, 80, &[2, 31, 32, 63, 64, 80], GdnRoute::FusedPrefill),
+            (true, 16, &[1, 2, 3, 8, 15, 16], GdnRoute::Complete),
+            (false, 16, &[1, 2, 3, 8, 15, 16], GdnRoute::FusedTail),
+            (true, 24, &[1, 3, 17, 24], GdnRoute::FusedTail),
+            (false, 40, &[1, 3, 32, 39, 40], GdnRoute::Chain),
+            (true, 63, &[1, 16, 32, 62, 63], GdnRoute::Chain),
+        ];
+        for (tiled, t, rows, route) in cases {
+            let net = capture_net(tiled);
+            for warm in [false, true] {
+                let tag = format!("tiled={tiled} T={t} warm={warm}");
+                let mut base = ArraysCache::new(2);
+                if warm {
+                    net.forward(&exact_bf16(&[1, 5, 64], 13), None, Some(&mut base), true)?;
+                    MxArray::eval_arrays(&[base.get(0).unwrap(), base.get(1).unwrap()])?;
+                }
+                let x = exact_bf16(&[1, t as i64, 64], 14 + t as u32);
+                x.eval();
+                take_gdn_routes();
+                let mut plain = copy_cache(&base);
+                let out_plain = net.forward(&x, None, Some(&mut plain), true)?;
+                assert_eq!(take_gdn_routes(), [route], "{tag}: uncaptured route");
+                let mut live = copy_cache(&base);
+                let (out, captured) = net.forward_captured(
+                    &x,
+                    Some(&mut live),
+                    true,
+                    None,
+                    &GdnCapturePlan { rows },
+                )?;
+                assert_eq!(take_gdn_routes(), [route], "{tag}: captured route");
+                assert_eq!(raw_bits(&out), raw_bits(&out_plain), "{tag}: output");
+                for slot in 0..2 {
+                    assert_eq!(
+                        raw_bits(live.get(slot).unwrap()),
+                        raw_bits(plain.get(slot).unwrap()),
+                        "{tag}: cache slot {slot}"
+                    );
+                }
+                assert_eq!(captured.len(), rows.len(), "{tag}");
+                let mut fingerprints = Vec::new();
+                let mut same_route = 0;
+                for (&c, capture) in rows.iter().zip(&captured) {
+                    let tag = format!("{tag} c={c}");
+                    assert!(
+                        !aliases(&capture.rec, live.get(1).unwrap())
+                            && !aliases(&capture.conv, live.get(0).unwrap()),
+                        "{tag}: capture shares the live cache buffer"
+                    );
+                    let mut truncated = copy_cache(&base);
+                    net.forward(
+                        &x.slice_axis(1, 0, c as i64)?,
+                        None,
+                        Some(&mut truncated),
+                        true,
+                    )?;
+                    let truncated_route = take_gdn_routes();
+                    assert_eq!(
+                        capture.conv.shape()?.as_ref(),
+                        truncated.get(0).unwrap().shape()?.as_ref(),
+                        "{tag}"
+                    );
+                    assert_eq!(
+                        raw_bits(&capture.conv),
+                        raw_bits(truncated.get(0).unwrap()),
+                        "{tag}: conv history"
+                    );
+                    if truncated_route == [route] {
+                        assert_eq!(
+                            raw_bits(&capture.rec),
+                            raw_bits(truncated.get(1).unwrap()),
+                            "{tag}: state vs the truncated forward"
+                        );
+                        same_route += 1;
+                    }
+                    fingerprints.push((raw_bits(&capture.conv), raw_bits(&capture.rec)));
+                }
+                eprintln!(
+                    "GDN_CAPTURE {tag} route={route:?}: state checked against {same_route}/{} truncated forwards",
+                    rows.len()
+                );
+                assert!(same_route > 0, "{tag}: no truncated forward kept the route");
+                net.forward(&rand_bf16(&[1, 70, 64]), None, Some(&mut live), true)?;
+                MxArray::eval_arrays(&[live.get(0).unwrap(), live.get(1).unwrap()])?;
+                take_gdn_routes();
+                for ((&c, capture), (conv, rec)) in rows.iter().zip(&captured).zip(&fingerprints) {
+                    assert_eq!(&raw_bits(&capture.conv), conv, "{tag} c={c}: conv moved");
+                    assert_eq!(&raw_bits(&capture.rec), rec, "{tag} c={c}: state moved");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A capture plan is a prefill contract: masked or taped forwards and
+    /// out-of-range or unordered rows are refused, and an empty plan is the
+    /// plain forward.
+    #[test]
+    fn capture_refuses_off_contract_windows() -> Result<()> {
+        let net = kernel_geometry_net();
+        let x = rand_bf16(&[1, 8, 64]);
+        let mut cache = ArraysCache::new(2);
+        for rows in [&[0usize][..], &[9], &[4, 4], &[5, 2]] {
+            assert!(
+                net.forward_captured(&x, Some(&mut cache), true, None, &GdnCapturePlan { rows })
+                    .is_err(),
+                "rows {rows:?}"
+            );
+        }
+        let mut taped = None;
+        let mut captured = Vec::new();
+        assert!(
+            net.forward_with_tape_impl(
+                &x,
+                None,
+                Some(&mut ArraysCache::new(2)),
+                true,
+                Some(&mut taped),
+                None,
+                Some((&GdnCapturePlan { rows: &[4] }, &mut captured)),
+            )
+            .is_err()
+        );
+        let mask = MxArray::ones(&[1, 8], Some(DType::Float32))?;
+        assert!(
+            net.forward_with_tape_impl(
+                &x,
+                Some(&mask),
+                Some(&mut ArraysCache::new(2)),
+                true,
+                None,
+                None,
+                Some((&GdnCapturePlan { rows: &[4] }, &mut captured)),
+            )
+            .is_err()
+        );
+        let mut plain = ArraysCache::new(2);
+        let mut empty = ArraysCache::new(2);
+        let out = net.forward(&x, None, Some(&mut plain), true)?;
+        let (got, none) = net.forward_captured(
+            &x,
+            Some(&mut empty),
+            true,
+            None,
+            &GdnCapturePlan { rows: &[] },
+        )?;
+        assert!(none.is_empty());
+        assert_eq!(raw_bits(&got), raw_bits(&out));
+        assert_eq!(
+            raw_bits(empty.get(1).unwrap()),
+            raw_bits(plain.get(1).unwrap())
+        );
         Ok(())
     }
 }

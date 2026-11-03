@@ -8,7 +8,7 @@ use napi::bindgen_prelude::*;
 use super::arrays_cache::ArraysCache;
 use super::attention::{AttentionVerifyIo, Qwen3_5Attention};
 use super::config::Qwen3_5Config;
-use super::gated_delta_net::GatedDeltaNet;
+use super::gated_delta_net::{GatedDeltaNet, GdnCapturePlan, GdnLayerCapture};
 use super::layer_cache::Qwen3_5LayerCache;
 use crate::models::quantized_linear::{MLPVariant, QuantizedLinear};
 
@@ -227,6 +227,30 @@ impl DecoderLayer {
         // Residual + post-attention norm (fused add_rmsnorm when eligible)
         let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
         h.add(&self.mlp.forward(&normed)?)
+    }
+
+    /// Unmasked text-prefill forward ([`Self::forward`] with no mask or
+    /// M-RoPE positions) that also captures this layer's GDN state at every
+    /// row of `plan`. Full-attention layers capture nothing.
+    pub(crate) fn forward_captured(
+        &mut self,
+        x: &MxArray,
+        cache: Option<&mut Qwen3_5LayerCache>,
+        plan: &GdnCapturePlan<'_>,
+    ) -> Result<(MxArray, Vec<GdnLayerCapture>)> {
+        let normed = self.input_layernorm.forward(x)?;
+        let (attn_out, captured) = match &mut self.attn {
+            AttentionType::Linear(gdn) => {
+                let ac = cache.and_then(|c| c.as_arrays_cache_mut());
+                gdn.forward_captured(&normed, ac, true, None, plan)?
+            }
+            AttentionType::Full(attn) => {
+                let kvc = cache.and_then(|c| c.as_kv_cache_mut());
+                (attn.forward(&normed, None, kvc, None)?, Vec::new())
+            }
+        };
+        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
+        Ok((h.add(&self.mlp.forward(&normed)?)?, captured))
     }
 
     /// Compiled-verify forward for the DFlash2 flat-cache path — the same

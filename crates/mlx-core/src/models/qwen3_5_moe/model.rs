@@ -152,10 +152,9 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) dflash2_context: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
     pub(crate) dflash2_turn_state: Option<crate::models::qwen3_5::dflash2_turn::DFlash2TurnState>,
     pub(crate) dflash2_prefix: PrefixTracker,
+    pub(crate) dflash2_states: crate::models::qwen3_5::dflash2_state::flat::FlatStates,
     /// Set only by a tapped flat prefill; every other cache lane invalidates it.
     pub(crate) dflash2_flat_lane_authoritative: bool,
-    /// Normalized owner/root identity supplied by the most recent turn.
-    dflash2_owner_key: Option<(String, String)>,
     pub(crate) dflash2_compiled_verify_disabled: bool,
     pub(crate) dflash2_verify_budget: super::verify_budget::VerifyBudget,
     pub(crate) vision_encoder: Option<Arc<QwenVisionEncoder>>,

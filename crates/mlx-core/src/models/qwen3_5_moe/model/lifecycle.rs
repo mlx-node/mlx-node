@@ -64,6 +64,8 @@ impl Qwen35MoeInner {
         );
 
         let dflash2_prefix = PrefixTracker::new(config.paged_block_size());
+        let dflash2_states =
+            crate::models::qwen3_5::dflash2_state::flat::FlatStates::new(config.paged_block_size());
         Ok(Self {
             config,
             source_moe_policy: Default::default(),
@@ -81,8 +83,8 @@ impl Qwen35MoeInner {
             dflash2_context: None,
             dflash2_turn_state: None,
             dflash2_prefix,
+            dflash2_states,
             dflash2_flat_lane_authoritative: false,
-            dflash2_owner_key: None,
             dflash2_compiled_verify_disabled: false,
             dflash2_verify_budget: super::super::verify_budget::VerifyBudget::default(),
             vision_encoder: None,
@@ -753,6 +755,7 @@ impl Qwen35MoeInner {
         self.scheduled_recurrent = RecurrentStateTable::stage2();
         self.scheduled_mtp = Default::default();
         self.active_scheduled_seq = None;
+        self.dflash2_states.clear();
         self.clear_reuse_state();
         // A full session reset must also clear the MTP acceptance gate
         // state: a new independent chat on this model starts fresh (probes)
@@ -836,9 +839,24 @@ impl Qwen35MoeInner {
         Ok(rows_prefilled)
     }
 
+    /// Parks an exact live DFlash2 state before another lane takes the caches
+    /// over, then drops what is left. A delta turn continues the live caches
+    /// in place, so there the state is dropped.
+    pub(super) fn park_or_invalidate_dflash2_context(
+        &mut self,
+        site: &'static str,
+        is_delta: bool,
+    ) {
+        if !is_delta {
+            crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
+        }
+        self.invalidate_dflash2_context(site);
+    }
+
     /// Discard external-draft state whenever another cache lane takes ownership.
     pub(super) fn invalidate_dflash2_context(&mut self, site: &'static str) {
         self.dflash2_context = None;
+        self.dflash2_states.live_anchor = None;
         self.dflash2_turn_state = None;
         self.dflash2_flat_lane_authoritative = false;
         self.dflash2_prefix.note_drop(site, DropKind::Invalidated);

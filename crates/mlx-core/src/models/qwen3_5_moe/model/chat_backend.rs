@@ -18,14 +18,6 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn set_cache_owner_id(&mut self, owner_id: &str, root_owner_id: Option<&str>) {
-        let owner_key = (
-            owner_id.to_owned(),
-            root_owner_id.unwrap_or(owner_id).to_owned(),
-        );
-        if self.dflash2_owner_key.as_ref() != Some(&owner_key) {
-            self.invalidate_dflash2_context("set_cache_owner_id");
-            self.dflash2_owner_key = Some(owner_key);
-        }
         self.active_cache_owner_id.clear();
         self.active_cache_owner_id.push_str(owner_id);
         if let Some(root_owner_id) = root_owner_id {
@@ -66,6 +58,13 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
+        if scope == ResetScope::PrefixMiss {
+            // The park takes the history with the state; this scope keeps it.
+            let history = self.cached_token_history.clone();
+            if crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self) {
+                self.cached_token_history = history;
+            }
+        }
         self.invalidate_dflash2_context(reset_drop_site(scope));
         match scope {
             // Prefix-miss reset: reset each live layer cache, then install a
@@ -343,7 +342,7 @@ impl ChatBackend for Qwen35MoeInner {
                 crate::models::qwen3_5::dflash2_turn::dflash2_chat_turn(self, args)
             }
             DecoderPlan::Speculative(SpeculativeKind::NativeMtp) => {
-                self.invalidate_dflash2_context("native_mtp_turn");
+                self.park_or_invalidate_dflash2_context("native_mtp_turn", args.plan.is_delta);
                 self.moe_whole_turn(args)
             }
             _ => Err(Error::from_reason(
@@ -353,7 +352,7 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        self.invalidate_dflash2_context("run_multimodal_turn");
+        self.park_or_invalidate_dflash2_context("run_multimodal_turn", args.plan.is_delta);
         self.moe_whole_turn(args)
     }
 }
