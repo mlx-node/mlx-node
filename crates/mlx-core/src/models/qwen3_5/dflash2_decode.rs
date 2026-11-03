@@ -1217,7 +1217,7 @@ impl Qwen35Inner {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::array::DType;
     use crate::engine::backend::SpecFrontier;
@@ -1314,6 +1314,218 @@ mod tests {
                 ))
             })
             .collect()
+    }
+
+    /// Bit goldens of the DFlash2 fixture traces. They are device-specific,
+    /// so they live outside git: `MLX_DFLASH2_GOLDEN_DIR=<dir>` with
+    /// `MLX_DFLASH2_GOLDEN_MODE=write|check`. Without the directory the
+    /// golden tests do nothing.
+    pub(crate) mod golden {
+        use std::fmt::Write as _;
+        use std::path::PathBuf;
+
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Mode {
+            Write,
+            Check,
+        }
+
+        pub(crate) struct GoldenRun {
+            dir: PathBuf,
+            mode: Mode,
+            failures: Vec<String>,
+        }
+
+        /// One case: labelled u32 words compared in order.
+        #[derive(Default)]
+        pub(crate) struct GoldenRecord {
+            entries: Vec<(String, Vec<u32>)>,
+        }
+
+        impl GoldenRecord {
+            pub(crate) fn push(&mut self, label: String, words: impl IntoIterator<Item = u32>) {
+                assert!(
+                    !label.contains(['\t', '\n']),
+                    "golden label must not contain tabs or newlines: {label:?}"
+                );
+                self.entries.push((label, words.into_iter().collect()));
+            }
+
+            pub(crate) fn push_i32(&mut self, label: String, values: &[i32]) {
+                self.push(label, values.iter().map(|&value| value as u32));
+            }
+
+            pub(crate) fn push_u64(&mut self, label: String, value: u64) {
+                self.push(label, [value as u32, (value >> 32) as u32]);
+            }
+
+            pub(crate) fn push_fingerprints(
+                &mut self,
+                label: &str,
+                arrays: &[(Vec<i64>, Vec<u32>)],
+            ) {
+                self.push_u64(format!("{label}.count"), arrays.len() as u64);
+                for (index, (shape, words)) in arrays.iter().enumerate() {
+                    self.push(
+                        format!("{label}[{index}] shape={shape:?}"),
+                        words.iter().copied(),
+                    );
+                }
+            }
+
+            fn encode(&self) -> String {
+                let mut out = String::new();
+                for (label, words) in &self.entries {
+                    out.push_str(label);
+                    out.push('\t');
+                    for (index, word) in words.iter().enumerate() {
+                        if index > 0 {
+                            out.push(' ');
+                        }
+                        write!(out, "{word:08x}").expect("write to String");
+                    }
+                    out.push('\n');
+                }
+                out
+            }
+
+            fn decode(text: &str) -> Result<Self, String> {
+                let mut entries = Vec::new();
+                for (line_no, line) in text.lines().enumerate() {
+                    let (label, words) = line
+                        .split_once('\t')
+                        .ok_or_else(|| format!("line {}: missing tab", line_no + 1))?;
+                    let words = words
+                        .split_ascii_whitespace()
+                        .map(|word| u32::from_str_radix(word, 16))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| format!("line {}: {error}", line_no + 1))?;
+                    entries.push((label.to_string(), words));
+                }
+                Ok(Self { entries })
+            }
+
+            fn compare(&self, expected: &Self) -> Result<(), String> {
+                for (index, ((label, words), (expected_label, expected_words))) in
+                    self.entries.iter().zip(&expected.entries).enumerate()
+                {
+                    if label != expected_label {
+                        return Err(format!(
+                            "entry {index}: label {label:?}, golden {expected_label:?}"
+                        ));
+                    }
+                    if words.len() != expected_words.len() {
+                        return Err(format!(
+                            "{label}: {} words, golden {}",
+                            words.len(),
+                            expected_words.len()
+                        ));
+                    }
+                    if let Some((word, (actual, golden))) = words
+                        .iter()
+                        .zip(expected_words)
+                        .enumerate()
+                        .find(|(_, (actual, golden))| actual != golden)
+                    {
+                        return Err(format!(
+                            "{label}: first mismatch at word {word}: actual={actual:#010x}, golden={golden:#010x}"
+                        ));
+                    }
+                }
+                if self.entries.len() != expected.entries.len() {
+                    return Err(format!(
+                        "{} entries, golden {}",
+                        self.entries.len(),
+                        expected.entries.len()
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        impl GoldenRun {
+            /// `None` when `MLX_DFLASH2_GOLDEN_DIR` is unset.
+            pub(crate) fn from_env() -> Option<Self> {
+                let dir = std::env::var_os("MLX_DFLASH2_GOLDEN_DIR")?;
+                let mode = match std::env::var("MLX_DFLASH2_GOLDEN_MODE").as_deref() {
+                    Ok("write") => Mode::Write,
+                    Ok("check") => Mode::Check,
+                    other => panic!(
+                        "MLX_DFLASH2_GOLDEN_DIR is set: MLX_DFLASH2_GOLDEN_MODE must be write or check, got {other:?}"
+                    ),
+                };
+                Some(Self {
+                    dir: PathBuf::from(dir),
+                    mode,
+                    failures: Vec::new(),
+                })
+            }
+
+            /// Write the case, or check it against the stored golden. Check
+            /// failures are collected so one run reports every case.
+            pub(crate) fn case(&mut self, family: &str, case: &str, record: &GoldenRecord) {
+                let path = self.dir.join(family).join(format!("{case}.golden"));
+                match self.mode {
+                    Mode::Write => {
+                        let parent = path.parent().expect("golden path has a parent");
+                        std::fs::create_dir_all(parent)
+                            .unwrap_or_else(|error| panic!("create {}: {error}", parent.display()));
+                        std::fs::write(&path, record.encode())
+                            .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+                        eprintln!("golden written: {}", path.display());
+                    }
+                    Mode::Check => {
+                        let result = std::fs::read_to_string(&path)
+                            .map_err(|error| format!("read: {error}"))
+                            .and_then(|text| GoldenRecord::decode(&text))
+                            .and_then(|expected| record.compare(&expected));
+                        match result {
+                            Ok(()) => eprintln!("golden ok: {}", path.display()),
+                            Err(error) => self
+                                .failures
+                                .push(format!("{family}/{case} ({}): {error}", path.display())),
+                        }
+                    }
+                }
+            }
+
+            pub(crate) fn finish(self) {
+                assert!(
+                    self.failures.is_empty(),
+                    "DFlash2 golden mismatches:\n{}",
+                    self.failures.join("\n")
+                );
+            }
+        }
+    }
+
+    fn push_trace(record: &mut golden::GoldenRecord, prefix: &str, trace: &ArTrace) {
+        for (cycle, logits) in trace.logits.iter().enumerate() {
+            record.push(format!("{prefix}.logits[{cycle}]"), logits.iter().copied());
+        }
+        record.push_fingerprints(&format!("{prefix}.target"), &trace.target_cache);
+        record.push_fingerprints(&format!("{prefix}.draft"), &trace.draft_cache);
+        record.push(
+            format!("{prefix}.context_tokens"),
+            trace.context_tokens.iter().copied(),
+        );
+        record.push_u64(
+            format!("{prefix}.frontier.attn"),
+            trace.frontier.attn_tokens,
+        );
+        record.push(
+            format!("{prefix}.frontier.recurrent"),
+            trace
+                .frontier
+                .recurrent_tokens
+                .map(|tokens| [1, tokens as u32, (tokens >> 32) as u32])
+                .into_iter()
+                .flatten(),
+        );
+        record.push_i32(
+            format!("{prefix}.continuation_draft"),
+            &trace.continuation_draft,
+        );
     }
 
     fn reset_flat_fixture(inner: &mut Qwen35Inner) {
@@ -2765,5 +2977,177 @@ mod tests {
             "no prefill chunk"
         );
         assert!(inner.dflash2_context.is_some(), "draft context kept");
+    }
+
+    fn run_golden_chat_turn(
+        inner: &mut Qwen35Inner,
+        tokenizer: &std::sync::Arc<crate::tokenizer::Qwen3Tokenizer>,
+        tokens: &[u32],
+    ) -> Result<crate::engine::types::ChatResult> {
+        use crate::engine::plan::{
+            DecoderPlan, MediaCapabilities, MediaInputs, SpeculativeKind, TurnPlan,
+        };
+        let config = ChatConfig {
+            temperature: Some(0.0),
+            max_new_tokens: Some(12),
+            max_consecutive_tokens: Some(0),
+            max_ngram_repeats: Some(0),
+            mtp_adaptive_depth: Some(false),
+            reuse_cache: Some(true),
+            reasoning_effort: Some("none".to_string()),
+            ..ChatConfig::default()
+        };
+        let params = ChatBackend::resolve_params(inner, &config);
+        let thinking = ChatBackend::thinking_setup(inner, &config);
+        let mut args = WholeTurnArgs {
+            tokens,
+            tokenizer,
+            eos_id: u32::MAX,
+            config: &config,
+            params: &params,
+            thinking,
+            plan: TurnPlan {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                use_paged_attention: false,
+                decoder: DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+            },
+            sink: None,
+            cancelled: None,
+            media: MediaInputs {
+                images: &[],
+                audio: &[],
+            },
+        };
+        match inner.dflash2_chat_turn(&mut args)? {
+            TurnOutput::Complete(result) => Ok(*result),
+            TurnOutput::Streamed => panic!("sync DFlash2 turn returned streamed output"),
+        }
+    }
+
+    /// Record the result and the retained flat state of one whole turn.
+    pub(crate) fn push_turn_state(
+        record: &mut golden::GoldenRecord,
+        prefix: &str,
+        result: &crate::engine::types::ChatResult,
+        history: &[u32],
+        target: Vec<&MxArray>,
+        context: Option<&DFlash2ContextCache>,
+    ) -> Result<()> {
+        record.push(
+            format!("{prefix}.result"),
+            [
+                result.num_tokens,
+                result.cached_tokens,
+                result.prompt_tokens,
+            ],
+        );
+        record.push(format!("{prefix}.history"), history.iter().copied());
+        record.push_fingerprints(&format!("{prefix}.target"), &array_fingerprints(target)?);
+        let mut draft = Vec::new();
+        if let Some(context) = context {
+            context.collect_arrays(&mut draft);
+            record.push(
+                format!("{prefix}.context_tokens"),
+                context.token_history().iter().copied(),
+            );
+        }
+        record.push_fingerprints(&format!("{prefix}.draft"), &array_fingerprints(draft)?);
+        Ok(())
+    }
+
+    /// Prompts of the golden whole-turn sequence: a cold turn, a turn that
+    /// extends its saved history, then an unrelated prompt (prefix miss).
+    pub(crate) fn golden_turn_prompts(history: &[u32], turn: usize) -> Vec<u32> {
+        match turn {
+            0 => vec![1, 2, 3, 4, 5, 6],
+            1 => history.iter().copied().chain([9, 10]).collect(),
+            _ => vec![3, 1, 4, 1, 5],
+        }
+    }
+
+    #[test]
+    fn dflash2_golden_traces() -> Result<()> {
+        let Some(mut goldens) = golden::GoldenRun::from_env() else {
+            return Ok(());
+        };
+        assert!(
+            metal_is_default_device(),
+            "DFlash2 goldens are recorded on Metal as the default device"
+        );
+        assert!(
+            std::env::var_os("MLX_DISABLE_COMPILE").is_none(),
+            "DFlash2 goldens are recorded with MLX compilation enabled"
+        );
+        const FAMILY: &str = "qwen3_5";
+
+        for (case, mut inner) in [
+            (
+                "retained_prefix_bf16_d64",
+                tiny_dflash_inner_with_attention_head_dim(0xDFA5_2203, 64),
+            ),
+            (
+                "retained_prefix_bf16_d32",
+                tiny_dflash_inner_with_attention_head_dim(0xDFA5_2203, 32),
+            ),
+            (
+                "retained_prefix_int8_d256",
+                tiny_int8_dflash_inner(0xDFA5_1E79),
+            ),
+        ] {
+            let mut record = golden::GoldenRecord::default();
+            for keep in 1..=8 {
+                let trace = run_retained_prefix_trace(&mut inner, keep)?;
+                push_trace(&mut record, &format!("keep{keep}"), &trace);
+            }
+            goldens.case(FAMILY, case, &record);
+        }
+
+        for (head_dim, seed) in [(64, 0xDFA5_2206), (32, 0xDFA5_2208)] {
+            let mut inner = tiny_dflash_inner_with_attention_head_dim(seed, head_dim);
+            let (drafts, trace) = run_forced_keep_cycles(&mut inner, CycleScheduling::Stepper)?;
+            let mut record = golden::GoldenRecord::default();
+            for (cycle, draft) in drafts.iter().enumerate() {
+                record.push_i32(format!("draft[{cycle}]"), draft);
+            }
+            push_trace(&mut record, "trace", &trace);
+            goldens.case(FAMILY, &format!("forced_keep_d{head_dim}"), &record);
+        }
+
+        let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
+        for (case, mut inner) in [
+            (
+                "chat_turns_bf16_d64",
+                tiny_dflash_inner_with_attention_head_dim(0xDFA5_3504, 64),
+            ),
+            (
+                "chat_turns_bf16_d32",
+                tiny_dflash_inner_with_attention_head_dim(0xDFA5_3504, 32),
+            ),
+            ("chat_turns_int8_d256", tiny_int8_dflash_inner(0xDFA5_3505)),
+        ] {
+            let mut record = golden::GoldenRecord::default();
+            for turn in 0..3 {
+                let prompt = golden_turn_prompts(&inner.cached_token_history, turn);
+                let result = run_golden_chat_turn(&mut inner, &tokenizer, &prompt)?;
+                let mut target = Vec::new();
+                for cache in inner.caches.iter().flatten() {
+                    cache.collect_arrays(&mut target);
+                }
+                push_turn_state(
+                    &mut record,
+                    &format!("turn{turn}"),
+                    &result,
+                    &inner.cached_token_history,
+                    target,
+                    inner.dflash2_context.as_ref(),
+                )?;
+            }
+            goldens.case(FAMILY, case, &record);
+        }
+
+        goldens.finish();
+        Ok(())
     }
 }

@@ -1290,10 +1290,11 @@ mod tests {
         tokenizer: &std::sync::Arc<Qwen3Tokenizer>,
         tokens: &[u32],
         reuse_cache: bool,
+        max_new_tokens: i32,
     ) -> Result<ChatResult> {
         let config = ChatConfig {
             temperature: Some(0.0),
-            max_new_tokens: Some(1),
+            max_new_tokens: Some(max_new_tokens),
             max_consecutive_tokens: Some(0),
             max_ngram_repeats: Some(0),
             mtp_adaptive_depth: Some(false),
@@ -1646,7 +1647,7 @@ mod tests {
 
         let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
         ChatBackend::set_cache_owner_id(&mut inner, "owner", Some("root"));
-        let first = run_tiny_dflash_turn(&mut inner, &tokenizer, &[1, 2, 3, 4], false)?;
+        let first = run_tiny_dflash_turn(&mut inner, &tokenizer, &[1, 2, 3, 4], false, 1)?;
         assert_eq!(first.finish_reason, "length");
         assert_eq!(first.num_tokens, 1);
         assert_eq!(first.cached_tokens, 0);
@@ -1655,7 +1656,7 @@ mod tests {
         // Turn 2 strictly extends it and would reuse five tokens if that
         // history survived the completed reuse_cache=false request.
         ChatBackend::set_cache_owner_id(&mut inner, "owner", Some("root"));
-        let second = run_tiny_dflash_turn(&mut inner, &tokenizer, &[1, 2, 3, 4, 7, 8], true)?;
+        let second = run_tiny_dflash_turn(&mut inner, &tokenizer, &[1, 2, 3, 4, 7, 8], true, 1)?;
         assert_eq!(
             second.cached_tokens, 0,
             "a non-reused completion must leave no prefix for the next request"
@@ -2198,5 +2199,53 @@ mod tests {
         assert_eq!(err.reason, PREFILL_CANCELLED);
         assert_eq!(inner.cached_token_history, [9, 9, 9], "no Command reset");
         assert_eq!(flat_attention_frontier(&inner), Some(0), "no prefill chunk");
+    }
+
+    #[test]
+    fn dflash2_golden_traces() -> Result<()> {
+        use crate::models::qwen3_5::dflash2_decode::tests::{
+            golden, golden_turn_prompts, push_turn_state,
+        };
+        let Some(mut goldens) = golden::GoldenRun::from_env() else {
+            return Ok(());
+        };
+        assert!(
+            crate::engine::persistence::compiled_forward_backend_available()
+                && unsafe { mlx_sys::mlx_default_device() } == 1,
+            "DFlash2 goldens are recorded on Metal as the default device"
+        );
+        assert!(
+            std::env::var_os("MLX_DISABLE_COMPILE").is_none(),
+            "DFlash2 goldens are recorded with MLX compilation enabled"
+        );
+        let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
+        for head_dim in [64, 32] {
+            let mut inner = tiny_dflash_inner_with_head_dim(0xDFA5_3504, head_dim);
+            let mut record = golden::GoldenRecord::default();
+            for turn in 0..3 {
+                let prompt = golden_turn_prompts(&inner.cached_token_history, turn);
+                ChatBackend::set_cache_owner_id(&mut inner, "owner", Some("root"));
+                let result = run_tiny_dflash_turn(&mut inner, &tokenizer, &prompt, true, 12)?;
+                let mut target = Vec::new();
+                for cache in inner.caches.iter().flatten() {
+                    cache.collect_arrays(&mut target);
+                }
+                push_turn_state(
+                    &mut record,
+                    &format!("turn{turn}"),
+                    &result,
+                    &inner.cached_token_history,
+                    target,
+                    inner.dflash2_context.as_ref(),
+                )?;
+            }
+            goldens.case(
+                "qwen3_5_moe",
+                &format!("chat_turns_bf16_d{head_dim}"),
+                &record,
+            );
+        }
+        goldens.finish();
+        Ok(())
     }
 }
