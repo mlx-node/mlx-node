@@ -327,6 +327,9 @@ fn coerce_value(value: &mut Value, schema: &Value) {
         Value::String(s) => {
             if let Some(types) = types {
                 *value = coerce_str(s, types);
+                if value.is_object() || value.is_array() {
+                    coerce_value(value, schema);
+                }
             }
         }
         Value::Object(map) => {
@@ -805,6 +808,19 @@ mod tests {
         assert_eq!(
             schema_types(&json!({"type": "integer", "allOf": [{"type": "string"}]})),
             None
+        );
+    }
+
+    #[test]
+    fn stringified_containers_in_typed_args_coerce_their_children() {
+        let props = r#"{"opts": {"type": "object", "properties": {"limit": {"type": "integer"}}},
+            "ids": {"type": "array", "items": {"type": "integer"}}}"#;
+        assert_eq!(
+            parse_and_coerce(
+                props,
+                r#"<tool_call>{"name":"t","arguments":{"opts":"{\"limit\":\"7\"}","ids":"[\"1\",\"2\"]"}}</tool_call>"#
+            ),
+            json!({"opts": {"limit": 7}, "ids": [1, 2]})
         );
     }
 
