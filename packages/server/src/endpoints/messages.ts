@@ -105,7 +105,6 @@ import {
 import { sanitizeJsonString, stringifyStrictJson } from '../strict-json.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
-import type { TracedChatConfig } from '../turn-trace.js';
 import {
   createVisibility,
   endJson,
@@ -114,6 +113,7 @@ import {
   type TransportVisibility,
   writeFallbackErrorSSE,
 } from '../transport-visibility.js';
+import type { TracedChatConfig } from '../turn-trace.js';
 import type { AnthropicMessagesRequest } from '../types-anthropic.js';
 
 /**
@@ -615,8 +615,7 @@ async function handleStreamingNativeWithAbort(
           // partial_json frame. Sanitize first — byte-identical for
           // compliant input — then emit the sanitized document itself so
           // the inner JSON clients parse incrementally stays strict.
-          const sanitizedArgs =
-            typeof tc.arguments === 'string' ? sanitizeJsonString(tc.arguments) : undefined;
+          const sanitizedArgs = typeof tc.arguments === 'string' ? sanitizeJsonString(tc.arguments) : undefined;
           // The sanitized string text is usually the partial_json payload
           // verbatim, but `partial_json` must assemble into a JSON OBJECT for
           // Anthropic clients — sanitized text that is structurally malformed
@@ -636,11 +635,7 @@ async function handleStreamingNativeWithAbort(
               }
               return '{}';
             }
-            if (
-              typeof tc.arguments === 'object' &&
-              tc.arguments !== null &&
-              !Array.isArray(tc.arguments)
-            ) {
+            if (typeof tc.arguments === 'object' && tc.arguments !== null && !Array.isArray(tc.arguments)) {
               return stringifyStrictJson(tc.arguments);
             }
             return '{}';
@@ -1492,19 +1487,18 @@ export async function handleCreateMessage(
           // reuse on paged-active models is now driven by native
           // content-addressing instead of the JS warm slot, so adding
           // the field is no longer a prerequisite for that use case.
-          // H2 pre-dispatch disconnect check (non-streaming only). A
-          // client that vanished while this request was parked behind
-          // the per-model mutex must not burn a whole prefill+decode
-          // budget producing a JSON body nobody can receive. Checked
+          // H2 pre-dispatch disconnect check, streaming and non-streaming.
+          // A client that vanished while this request was parked behind
+          // the per-model mutex must not start a native turn: even an
+          // immediately-cancelled stream still resets the session and
+          // runs native cache resets / the first prefill chunk. Checked
           // BEFORE the warm-slot lease so no session state is consumed
           // or mutated — the early return composes with the permit
           // lifecycle exactly like the binding-changed return above
           // (the pre-dispatch permit was already consumed atomically by
           // `withExclusive`; the outer `finally` release is an
-          // idempotent no-op after handoff). Streaming keeps its
-          // existing paths: the signal fast-aborts `_runChatStream` and
-          // the SSE drain loop breaks on `clientAborted` at loop-top.
-          if (body.stream !== true && streamSignal.aborted) {
+          // idempotent no-op after handoff).
+          if (streamSignal.aborted) {
             return;
           }
 
