@@ -166,6 +166,26 @@ fn turn_cancelled<T: DFlash2Target>(target: &T) -> bool {
         .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Raises the turn's cancel flag when the prefill polls before this
+    /// chunk index on this thread.
+    pub(crate) static CANCEL_AT_PREFILL_CHUNK: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn prefill_chunk_cancelled<T: DFlash2Target>(target: &T, chunk: usize) -> bool {
+    #[cfg(test)]
+    if CANCEL_AT_PREFILL_CHUNK.with(std::cell::Cell::get) == Some(chunk)
+        && let Some(flag) = target.turn_cancel()
+    {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(test))]
+    let _ = chunk;
+    turn_cancelled(target)
+}
+
 pub(crate) fn dflash2_prefill<T: DFlash2Target>(
     target: &mut T,
     tokens: &[u32],
@@ -184,6 +204,11 @@ pub(crate) fn dflash2_prefill<T: DFlash2Target>(
         .ok_or_else(|| Error::from_reason(format!("{label} has no loaded DFlash2 companion")))?;
     let tap_layers = draft.config.target_layers.clone();
     let draft_config = draft.config.clone();
+    // Polled before the draft context is taken: a cancel here leaves every
+    // live buffer as the resume left it.
+    if prefill_chunk_cancelled(target, 0) {
+        return Err(Error::from_reason(PREFILL_CANCELLED));
+    }
     let mut context = match target.dflash2_context_mut().take() {
         Some(context) if context.logical_len() == position_base => context,
         Some(context) => {
@@ -216,7 +241,7 @@ pub(crate) fn dflash2_prefill<T: DFlash2Target>(
     let mut offset = 0usize;
     let mut last_logits = None;
     while offset < tokens.len() {
-        if turn_cancelled(target) {
+        if offset > 0 && prefill_chunk_cancelled(target, offset / T::PREFILL_STEP_SIZE as usize) {
             return Err(Error::from_reason(PREFILL_CANCELLED));
         }
         let end = (offset + T::PREFILL_STEP_SIZE as usize).min(tokens.len());
@@ -412,6 +437,35 @@ pub(crate) fn reserve_dflash2_turn_kv<T: DFlash2Target>(
         reserve_dflash2_target_kv(target.caches_mut(), rows)?;
     }
     Ok(evicted)
+}
+
+/// A turn that failed after its resume was resolved. A user cancel drops
+/// only the live state the turn was building, or nothing when the prefill
+/// stopped before its first chunk; parked states, the paged prefix cache and
+/// the paged lane's other requests' blocks stay. Any other error fails closed.
+fn dflash2_turn_failed<T: DFlash2Target>(target: &mut T, error: Error, resume: usize) -> Error {
+    if error.reason != PREFILL_CANCELLED {
+        return dflash2_fail_closed(target, error);
+    }
+    let untouched = target.dflash2_turn_state_mut().is_none()
+        && flat_attention_frontier(target) == Some(resume)
+        && target.dflash2_context().is_some() == (resume > 0);
+    if untouched {
+        return error;
+    }
+    target.prefix_tracker_mut().take_drop();
+    target
+        .prefix_tracker_mut()
+        .note_drop("dflash2_cancelled", DropKind::Invalidated);
+    if let Err(drop_error) = drop_live_dflash2_state(target) {
+        tracing::warn!(
+            target: "mlx_core::inference",
+            "DFlash2 cancel could not drop the live state, failing closed: {}",
+            drop_error.reason
+        );
+        return dflash2_fail_closed(target, error);
+    }
+    error
 }
 
 pub(crate) fn dflash2_fail_closed<T: DFlash2Target>(target: &mut T, error: Error) -> Error {
@@ -912,6 +966,7 @@ pub(crate) fn dflash2_chat_turn<T: DFlash2Target + DsparkBackend>(
         Err(error) => return Err(dflash2_fail_closed(target, error)),
     };
     let cached_prefix = resume.used.tokens;
+    target.dflash2_states_mut().live_salt = params.cache_salt;
     let observed = observe_prefix(target, seen, &tokens, params.reuse_cache, &resume);
     let prefill = tokens[cached_prefix..].to_vec();
     let mut capture = observed
@@ -935,7 +990,7 @@ pub(crate) fn dflash2_chat_turn<T: DFlash2Target + DsparkBackend>(
     };
     let evicted = match reserved {
         Ok(evicted) => evicted,
-        Err(error) => return Err(dflash2_fail_closed(target, error)),
+        Err(error) => return Err(dflash2_turn_failed(target, error, cached_prefix)),
     };
     profiler.begin_prefill();
     let (last_logits, state) = match dflash2_prefill(
@@ -946,7 +1001,7 @@ pub(crate) fn dflash2_chat_turn<T: DFlash2Target + DsparkBackend>(
         generation_stream,
     ) {
         Ok(value) => value,
-        Err(error) => return Err(dflash2_fail_closed(target, error)),
+        Err(error) => return Err(dflash2_turn_failed(target, error, cached_prefix)),
     };
     profiler.end_prefill();
 
@@ -955,11 +1010,11 @@ pub(crate) fn dflash2_chat_turn<T: DFlash2Target + DsparkBackend>(
         .and_then(|logits| crate::sampling::sample(&logits, params.sampling_config))
     {
         Ok(token) => token,
-        Err(error) => return Err(dflash2_fail_closed(target, error)),
+        Err(error) => return Err(dflash2_turn_failed(target, error, cached_prefix)),
     };
     y.eval();
     if let Err(error) = target.eval_layer_caches() {
-        return Err(dflash2_fail_closed(target, error));
+        return Err(dflash2_turn_failed(target, error, cached_prefix));
     }
     let first_token_at = Instant::now();
     if report_performance {
@@ -1037,7 +1092,7 @@ pub(crate) fn dflash2_chat_turn<T: DFlash2Target + DsparkBackend>(
     };
     let mut last_in_cache = match outcome {
         Ok(outcome) => outcome.last_in_cache,
-        Err(error) => return Err(dflash2_fail_closed(target, error)),
+        Err(error) => return Err(dflash2_turn_failed(target, error, cached_prefix)),
     };
     let final_token_fits_context = target.dflash2_context().is_some_and(|context| {
         dflash2_final_token_fits_context(context.logical_len(), dflash_context_capacity)
@@ -1048,7 +1103,7 @@ pub(crate) fn dflash2_chat_turn<T: DFlash2Target + DsparkBackend>(
         && let Some(&last) = generated.last()
     {
         if let Err(error) = dflash2_materialize_final(target, last, generation_stream) {
-            return Err(dflash2_fail_closed(target, error));
+            return Err(dflash2_turn_failed(target, error, cached_prefix));
         }
         last_in_cache = true;
     }

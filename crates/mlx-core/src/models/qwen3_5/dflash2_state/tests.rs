@@ -13,14 +13,15 @@ use rand::{RngExt, SeedableRng};
 use crate::array::{DType, MxArray};
 use crate::engine::backend::{ChatBackend, TurnOutput, WholeTurnArgs};
 use crate::engine::types::{ChatConfig, ChatResult};
+use crate::models::forward::PREFILL_CANCELLED;
 use crate::models::qwen3_5::dflash2_decode::tests::{
     array_fingerprints, assert_trace_eq, metal_is_default_device, run_live_extension,
     run_tiny_dflash_turn, tiny_dflash_inner_with_attention_head_dim, tiny_dflash_inner_with_config,
     tiny_dflash_turn_config, tiny_int8_dflash_inner,
 };
 use crate::models::qwen3_5::dflash2_turn::{
-    DFlash2TurnState, KV_BUDGET_OVERRIDE, dflash2_prefill, install_flat_dflash2_anchor,
-    park_flat_dflash2_state, park_live_dflash2_state,
+    CANCEL_AT_PREFILL_CHUNK, DFlash2TurnState, KV_BUDGET_OVERRIDE, dflash2_prefill,
+    install_flat_dflash2_anchor, park_flat_dflash2_state, park_live_dflash2_state,
 };
 use crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache;
 use crate::models::qwen3_5::model::Qwen35Inner;
@@ -546,10 +547,45 @@ fn tiny_budgets_complete_every_turn() -> Result<()> {
     Ok(())
 }
 
-/// (e) A cancel between prefill chunks fails the turn after the armed
-/// capture C(R) was taken in the first chunk but before it is published: no
-/// live anchor, no parked anchor. The same prompt without the cancel arms and
-/// publishes C(R) at that row.
+struct CancelAtChunk;
+
+impl CancelAtChunk {
+    fn arm(chunk: usize) -> Self {
+        CANCEL_AT_PREFILL_CHUNK.with(|at| at.set(Some(chunk)));
+        Self
+    }
+}
+
+impl Drop for CancelAtChunk {
+    fn drop(&mut self) {
+        CANCEL_AT_PREFILL_CHUNK.with(|at| at.set(None));
+    }
+}
+
+/// Runs `tokens` with the user cancel raised when the prefill polls before
+/// chunk `chunk`.
+fn cancelled_turn(
+    inner: &mut Qwen35Inner,
+    tokenizer: &Arc<Qwen3Tokenizer>,
+    tokens: &[u32],
+    chunk: usize,
+) -> Error {
+    inner.turn_cancel = Some(Arc::new(AtomicBool::new(false)));
+    let result = {
+        let _cancel = CancelAtChunk::arm(chunk);
+        turn(inner, tokenizer, tokens)
+    };
+    inner.turn_cancel = None;
+    let error = result.expect_err("cancelled turn");
+    assert_eq!(error.reason, PREFILL_CANCELLED);
+    error
+}
+
+/// (e) A cancel between prefill chunks fails the turn after its armed
+/// capture C(R) was taken in the first chunk: the capture is not published,
+/// the turn's live state is dropped, and the session parked before the turn
+/// keeps its end state and anchor. The same prompt without the cancel arms
+/// and publishes C(R) at that row.
 #[test]
 fn cancelled_prefill_publishes_no_capture() -> Result<()> {
     if !metal_is_default_device() {
@@ -559,25 +595,18 @@ fn cancelled_prefill_publishes_no_capture() -> Result<()> {
     let chunk = crate::models::qwen3_5::model::PREFILL_STEP_SIZE as usize;
     for name in FIXTURES {
         let mut inner = long_fixture(name);
+        let b1 = cat(&[&body(2, 37), &SUFFIX]);
+        turn(&mut inner, &tokenizer, &b1)?;
+        let b_history = inner.cached_token_history.clone();
         let prompt = cat(&[&body(5, chunk as u32), &SUFFIX]);
-        inner.turn_cancel = Some(Arc::new(AtomicBool::new(true)));
-        let error = turn(&mut inner, &tokenizer, &prompt).expect_err("cancelled prefill");
-        assert!(
-            error.reason.contains("prefill cancelled"),
-            "{name}: {}",
-            error.reason
-        );
+        cancelled_turn(&mut inner, &tokenizer, &prompt, 1);
         assert!(inner.dflash2_states.live_anchor.is_none(), "{name}");
-        assert!(
-            inner
-                .dflash2_states
-                .store
-                .entries()
-                .all(|entry| entry.anchor().is_none()),
-            "{name}"
-        );
+        assert!(inner.cached_token_history.is_empty(), "{name}");
+        assert_eq!(inner.dflash2_states.store.bytes().entries, 1, "{name}");
+        let b_entry = parked(&inner, &b_history);
+        assert_eq!(b_entry.kind(), HitKind::End, "{name}");
+        assert_eq!(b_entry.anchor().map(|anchor| anchor.row), Some(R), "{name}");
 
-        inner.turn_cancel = None;
         let result = turn(&mut inner, &tokenizer, &prompt)?;
         assert_eq!(result.cached_tokens, 0, "{name}");
         assert_eq!(
@@ -589,6 +618,91 @@ fn cancelled_prefill_publishes_no_capture() -> Result<()> {
             Some(chunk),
             "{name}: the uncancelled prompt captures at the end of chunk one"
         );
+    }
+    Ok(())
+}
+
+/// X0 + X1: a user cancel mid-prefill drops only the cancelled turn's live
+/// state. B's parked end state keeps every bit (X0), and B's next turn
+/// resumes on it exactly as on a model where B's state stayed live and no
+/// other turn ran (X1: output, state, forced cycles).
+#[test]
+fn cancel_mid_prefill_keeps_parked_states_restorable() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let tokenizer = tokenizer();
+    let chunk = crate::models::qwen3_5::model::PREFILL_STEP_SIZE as u32;
+    for name in FIXTURES {
+        let b1 = body(1, 40);
+        let mut reference = long_fixture(name);
+        turn(&mut reference, &tokenizer, &b1)?;
+        let b_history = reference.cached_token_history.clone();
+        let b2 = cat(&[&b_history, &[4, 5, 6]]);
+        let want = turn(&mut reference, &tokenizer, &b2)?;
+        let want_outcome = outcome(&want, &reference);
+        let want_state = live_state(&reference)?;
+        let want_trace = run_live_extension(&mut reference, &KEEPS, 3, true)?;
+
+        let mut inner = long_fixture(name);
+        turn(&mut inner, &tokenizer, &b1)?;
+        assert!(park_live_dflash2_state(&mut inner), "{name}");
+        let b_bits = array_fingerprints(entry_arrays(parked(&inner, &b_history)))?;
+        cancelled_turn(&mut inner, &tokenizer, &body(7, chunk + 9), 1);
+        assert!(inner.cached_token_history.is_empty(), "{name}");
+        assert!(
+            array_fingerprints(entry_arrays(parked(&inner, &b_history)))? == b_bits,
+            "{name}: X0 parked B after the cancel"
+        );
+
+        let (got, events) = capture_prefix_events(|| turn(&mut inner, &tokenizer, &b2));
+        let got = got?;
+        assert_eq!(events[0]["hit_kind"], "E", "{name}: {events:?}");
+        assert_eq!(outcome(&got, &inner), want_outcome, "{name}: X1 turn");
+        assert!(live_state(&inner)? == want_state, "{name}: X1 state");
+        let got_trace = run_live_extension(&mut inner, &KEEPS, 3, true)?;
+        assert_trace_eq(&got_trace, &want_trace, &format!("{name}: X1 cycles"));
+    }
+    Ok(())
+}
+
+/// X1: a cancel the prefill sees before its first chunk, after the turn
+/// moved B's parked end state in, keeps that state live and A's parked; B's
+/// retried turn resumes on it as a live hit, equal to the run without the
+/// cancel and without A.
+#[test]
+fn cancel_before_the_first_chunk_keeps_the_resumed_state() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let tokenizer = tokenizer();
+    for name in FIXTURES {
+        let b1 = body(1, 40);
+        let mut reference = fixture(name);
+        turn(&mut reference, &tokenizer, &b1)?;
+        let b_history = reference.cached_token_history.clone();
+        let b2 = cat(&[&b_history, &[4, 5, 6]]);
+        let want = turn(&mut reference, &tokenizer, &b2)?;
+        let want_outcome = outcome(&want, &reference);
+        let want_state = live_state(&reference)?;
+        let want_trace = run_live_extension(&mut reference, &KEEPS, 3, true)?;
+
+        let mut inner = fixture(name);
+        turn(&mut inner, &tokenizer, &b1)?;
+        turn(&mut inner, &tokenizer, &body(3, 33))?;
+        let a_history = inner.cached_token_history.clone();
+        cancelled_turn(&mut inner, &tokenizer, &b2, 0);
+        assert_eq!(inner.cached_token_history, b_history, "{name}");
+        assert_eq!(inner.dflash2_states.store.bytes().entries, 1, "{name}");
+        parked(&inner, &a_history);
+
+        let (got, events) = capture_prefix_events(|| turn(&mut inner, &tokenizer, &b2));
+        let got = got?;
+        assert_eq!(events[0]["hit_kind"], "live", "{name}: {events:?}");
+        assert_eq!(outcome(&got, &inner), want_outcome, "{name}: X1 turn");
+        assert!(live_state(&inner)? == want_state, "{name}: X1 state");
+        let got_trace = run_live_extension(&mut inner, &KEEPS, 3, true)?;
+        assert_trace_eq(&got_trace, &want_trace, &format!("{name}: X1 cycles"));
     }
     Ok(())
 }
