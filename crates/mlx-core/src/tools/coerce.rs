@@ -90,8 +90,12 @@ impl ToolArgSchemas {
                 };
                 match (raw_text.map(|m| m.get(key)), schema_types(prop)) {
                     (Some(None), _) => {}
-                    // A valid enum string stays one: `{"enum":["00042",7]}`.
-                    (Some(Some(raw)), _) if enum_has_string(prop, raw) => {
+                    // A valid enum string stays one: `{"enum":["00042",7]}`,
+                    // but not where the effective type excludes strings.
+                    (Some(Some(raw)), types)
+                        if types.is_none_or(|t| t.has(TypeSet::STRING))
+                            && enum_has_string(prop, raw) =>
+                    {
                         *value = Value::String(raw.clone());
                     }
                     (Some(Some(raw)), Some(types)) => {
@@ -939,6 +943,8 @@ mod tests {
             json!({"id": "00042"})
         );
         assert_eq!(parse_and_coerce(props, &call("7")), json!({"id": 7}));
+        let typed = r#"{"id": {"type": "integer", "enum": ["7", 7]}}"#;
+        assert_eq!(parse_and_coerce(typed, &call("7")), json!({"id": 7}));
         for key in ["anyOf", "oneOf"] {
             let props = format!(
                 r#"{{"id": {{"{key}": [{{"enum": ["00042"]}}, {{"type": "integer", "enum": [7]}}]}}}}"#
