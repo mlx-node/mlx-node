@@ -54,7 +54,7 @@ export const MLX_AGENT_RELEASE_REPO = 'mlx-node/grok-build';
  * `latest` pointer is unreachable. Bump only when a release is REQUIRED —
  * resolving `latest` handles ordinary upgrades with no code change here.
  */
-export const MLX_AGENT_MIN_RELEASE = 'mlx-agent-v0.3.0';
+export const MLX_AGENT_MIN_RELEASE = 'mlx-agent-v0.3.1';
 
 /** Options for {@link launchGrokAgent}. */
 export interface GrokAgentLaunchOptions {
