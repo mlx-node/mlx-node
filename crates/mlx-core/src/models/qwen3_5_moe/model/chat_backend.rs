@@ -318,6 +318,11 @@ impl ChatBackend for Qwen35MoeInner {
             args.plan.decoder,
             DecoderPlan::Autoregressive | DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
         ));
+        crate::models::qwen3_5::dflash2_turn::evict_parked_dflash2_for_turn(
+            self,
+            args.tokens.len(),
+            args.params.max_new_tokens,
+        );
         let mut constrained_params = args.params.clone();
         self.preflight_paged_context(args.tokens.len(), &mut constrained_params)?;
         let mut constrained_args = WholeTurnArgs {
@@ -342,6 +347,11 @@ impl ChatBackend for Qwen35MoeInner {
                 crate::models::qwen3_5::dflash2_turn::dflash2_chat_turn(self, args)
             }
             DecoderPlan::Speculative(SpeculativeKind::NativeMtp) => {
+                crate::models::qwen3_5::dflash2_turn::evict_parked_dflash2_for_turn(
+                    self,
+                    args.tokens.len(),
+                    args.params.max_new_tokens,
+                );
                 self.park_or_invalidate_dflash2_context("native_mtp_turn", args.plan.is_delta);
                 self.moe_whole_turn(args)
             }
@@ -352,6 +362,11 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        crate::models::qwen3_5::dflash2_turn::evict_parked_dflash2_for_turn(
+            self,
+            args.tokens.len(),
+            args.params.max_new_tokens,
+        );
         self.park_or_invalidate_dflash2_context("run_multimodal_turn", args.plan.is_delta);
         self.moe_whole_turn(args)
     }

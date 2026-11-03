@@ -1264,7 +1264,7 @@ mod tests {
         fx.drain();
         let need = 100 * ROW;
         let headroom = 0;
-        let r = evict_for_turn_kv(&mut store, need, Some(headroom)).unwrap();
+        let r = evict_for_turn_kv(&mut store, need, 0, Some(headroom)).unwrap();
         assert_eq!(fx.drain(), ["drop end a", "drop end b"]);
         assert!(r.satisfied);
         assert!(
@@ -1272,17 +1272,53 @@ mod tests {
             "freed {} bytes: the budget read back stays under {need}",
             r.freed_kv_bytes
         );
+    }
 
-        // Unreadable limits evict nothing for KV.
-        let c = lineage(3, 100);
+    /// The turn's transients count on top of its KV: a headroom that covers
+    /// the KV budget alone still evicts until it also covers the
+    /// transients, and one that covers both evicts nothing.
+    #[test]
+    fn turn_eviction_also_covers_the_turn_transients() {
+        use crate::models::qwen3_5::dflash2_decode::dflash2_kv_headroom_for;
+        use crate::models::qwen3_5::dflash2_turn::evict_for_turn_kv;
+
+        let fx = Fixture::new();
+        let mut store = Store::with_state_budget(BS, u64::MAX);
+        let a = lineage(1, 100);
         store
-            .insert(Lineage::text(&c, 0), fx.end("c", &c, None, 0))
+            .insert(Lineage::text(&a, 0), fx.end("a", &a, None, 0))
             .unwrap();
         fx.drain();
-        let r = evict_for_turn_kv(&mut store, need, None).unwrap();
+        let need = 10 * ROW;
+        let transient = 50 * ROW;
+        let covered = dflash2_kv_headroom_for(need) + transient;
+        let r = evict_for_turn_kv(&mut store, need, transient, Some(covered)).unwrap();
         assert!(r.satisfied);
-        assert_eq!(store.bytes().entries, 1);
         assert!(fx.drain().is_empty());
+        let r = evict_for_turn_kv(&mut store, need, transient, Some(covered - 1)).unwrap();
+        assert!(r.satisfied);
+        assert_eq!(fx.drain(), ["drop end a"]);
+    }
+
+    /// With unreadable limits parked KV has no headroom to fit in: every
+    /// entry holding KV is evicted, even when the turn needs no new KV.
+    #[test]
+    fn unreadable_limits_evict_every_parked_kv() {
+        use crate::models::qwen3_5::dflash2_turn::evict_for_turn_kv;
+
+        let fx = Fixture::new();
+        let mut store = Store::with_state_budget(BS, u64::MAX);
+        for seed in [1, 2] {
+            let tokens = lineage(seed, 100);
+            store
+                .insert(Lineage::text(&tokens, 0), fx.end("e", &tokens, None, 0))
+                .unwrap();
+        }
+        fx.drain();
+        let r = evict_for_turn_kv(&mut store, 0, 0, None).unwrap();
+        assert!(!r.satisfied);
+        assert_eq!(store.bytes().entries, 0);
+        assert_eq!(store.bytes().kv_bytes, 0);
     }
 
     /// Eviction remembers each resume point it removes: a demotion the end

@@ -31,8 +31,9 @@ use super::dflash2::{DFlash2ContextCache, DFlash2Model};
 use super::dflash2_decode::{
     constrain_dflash2_context_params, dflash2_decode_cache_limit, dflash2_final_token_fits_context,
     dflash2_kv_budget_of, dflash2_kv_headroom_bytes, dflash2_kv_headroom_for,
-    dflash2_kv_need_bytes, dflash2_kv_reserve_rows, dflash2_memory_snapshot, kv_row_bytes,
-    min_fa_capacity, reserve_dflash2_target_kv, reusable_dflash2_prefix,
+    dflash2_kv_need_bytes, dflash2_kv_reserve_rows, dflash2_memory_snapshot,
+    dflash2_turn_transient_bytes, kv_row_bytes, min_fa_capacity, reserve_dflash2_target_kv,
+    reusable_dflash2_prefix,
 };
 use super::dflash2_state::flat::{
     FlatAnchor, FlatBacking, FlatStates, flat_attention_kv, join_flat_anchor, join_flat_caches,
@@ -456,22 +457,123 @@ fn dflash2_kv_headroom_now() -> Option<u64> {
     dflash2_kv_headroom_bytes(dflash2_memory_snapshot())
 }
 
-/// Evicts parked states until the KV budget read back after the frees
-/// covers `need_bytes`. `headroom` is the live headroom past the process
-/// reserve; with `None` (unreadable limits) no KV is evicted.
+/// The reservation parked states are evicted for, and the headroom it is
+/// measured against: `kv_bytes` of target KV plus `transient_bytes` the turn
+/// allocates and frees. With unreadable limits (`headroom` `None`) parked KV
+/// has nothing to fit in, so every entry holding KV goes.
+pub(crate) fn parked_kv_eviction(
+    kv_bytes: u64,
+    transient_bytes: u64,
+    headroom: Option<u64>,
+) -> (Reservation, u64) {
+    let kv_bytes = match headroom {
+        Some(_) => kv_bytes.saturating_add(transient_bytes),
+        None => u64::MAX,
+    };
+    (
+        Reservation {
+            state_bytes: 0,
+            kv_bytes,
+        },
+        headroom.unwrap_or(0),
+    )
+}
+
+/// Evicts parked states until the KV budget read back after the frees covers
+/// `need_bytes` and the live headroom also covers `transient_bytes`.
+/// `headroom` is the live headroom past the process reserve; with `None`
+/// (unreadable limits) every entry holding KV is evicted.
 pub(crate) fn evict_for_turn_kv<B: Backing>(
     store: &mut HybridStateStore<B>,
     need_bytes: u64,
+    transient_bytes: u64,
     headroom: Option<u64>,
 ) -> Result<EvictReport> {
-    store.evict_for(
-        Reservation {
-            state_bytes: 0,
-            kv_bytes: headroom.map_or(0, |_| dflash2_kv_headroom_for(need_bytes)),
-        },
-        headroom.unwrap_or(u64::MAX),
-        None,
-    )
+    let (need, headroom) = parked_kv_eviction(
+        dflash2_kv_headroom_for(need_bytes),
+        transient_bytes,
+        headroom,
+    );
+    store.evict_for(need, headroom, None)
+}
+
+/// Full-attention K/V bytes of one token row on `target`, and its turn
+/// transients for `prompt_len` prompt rows plus `max_new_tokens`.
+fn turn_memory<T: DFlash2Target>(
+    target: &T,
+    prompt_len: usize,
+    max_new_tokens: i32,
+) -> Result<(u64, u64)> {
+    let config = target.dense_config();
+    let full_attention_layers = match target.caches() {
+        Some(caches) => caches
+            .iter()
+            .filter(|cache| matches!(cache, Qwen3_5LayerCache::FullAttention(_)))
+            .count(),
+        None => (0..config.num_layers.max(0) as usize)
+            .filter(|&layer| !config.is_linear_layer(layer))
+            .count(),
+    };
+    let format = dflash2_target_kv_format(target);
+    let row_bytes = kv_row_bytes(
+        full_attention_layers,
+        target.kv_heads(),
+        target.head_dim(),
+        dflash2_target_kv_dtype(target)?,
+        format,
+    );
+    let block_size = target.dflash2().map_or(1, |draft| draft.config.block_size);
+    let transient = dflash2_turn_transient_bytes(
+        &config,
+        block_size,
+        prompt_len,
+        prompt_len as u64 + max_new_tokens.max(0) as u64,
+        format,
+    );
+    Ok((row_bytes, transient))
+}
+
+/// Evicts parked states before a turn of another kind (paged, vision, MTP)
+/// takes the model, until the live headroom covers that turn's
+/// `prompt + max_new` K/V rows and its transients. The live state stays:
+/// its buffers are resident whether it parks or not. A failed eviction
+/// drops every parked state.
+pub(crate) fn evict_parked_dflash2_for_turn<T: DFlash2Target>(
+    target: &mut T,
+    prompt_len: usize,
+    max_new_tokens: i32,
+) {
+    if target.dflash2_states().store.bytes().entries == 0 {
+        return;
+    }
+    let evicted =
+        turn_memory(target, prompt_len, max_new_tokens).and_then(|(row_bytes, transient)| {
+            let rows = prompt_len as u64 + max_new_tokens.max(0) as u64;
+            let (need, headroom) = parked_kv_eviction(
+                rows.saturating_mul(row_bytes),
+                transient,
+                dflash2_kv_headroom_now(),
+            );
+            target
+                .dflash2_states_mut()
+                .store
+                .evict_for(need, headroom, None)
+        });
+    match evicted {
+        Ok(report) if report.freed_kv_bytes > 0 || report.freed_state_bytes > 0 => {
+            crate::array::clear_cache();
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                target: "mlx_core::inference",
+                "DFlash2 parked-state eviction failed, dropping every parked state: {}",
+                error.reason
+            );
+            target.dflash2_states_mut().store.clear();
+            crate::array::clear_cache();
+        }
+    }
 }
 
 /// Size every flat full-attention cache for this turn so decode never
@@ -479,7 +581,8 @@ pub(crate) fn evict_for_turn_kv<B: Backing>(
 /// size for the first allocation; a warm turn copies its prefix once.
 /// Parked states are MLX-active bytes the live budget already excludes, so
 /// they are evicted first, until the budget covers the prompt plus the
-/// minimum look-ahead and the store fits its state budget.
+/// minimum look-ahead and the live headroom also covers the turn's
+/// transients.
 pub(crate) fn reserve_dflash2_turn_kv<T: DFlash2Target>(
     target: &mut T,
     prompt_len: usize,
@@ -488,23 +591,12 @@ pub(crate) fn reserve_dflash2_turn_kv<T: DFlash2Target>(
     let Some(resident_rows) = min_fa_capacity(target.caches())? else {
         return Ok(EvictReport::default());
     };
-    let full_attention_layers = target
-        .caches()
-        .iter()
-        .flatten()
-        .filter(|cache| matches!(cache, Qwen3_5LayerCache::FullAttention(_)))
-        .count();
-    let row_bytes = kv_row_bytes(
-        full_attention_layers,
-        target.kv_heads(),
-        target.head_dim(),
-        dflash2_target_kv_dtype(target)?,
-        dflash2_target_kv_format(target),
-    );
+    let (row_bytes, transient) = turn_memory(target, prompt_len, max_new_tokens)?;
     let need_bytes = dflash2_kv_need_bytes(prompt_len, max_new_tokens, resident_rows, row_bytes)?;
     let evicted = evict_for_turn_kv(
         &mut target.dflash2_states_mut().store,
         need_bytes,
+        transient,
         dflash2_kv_headroom_now(),
     )?;
     if evicted.freed_kv_bytes > 0 || evicted.freed_state_bytes > 0 {

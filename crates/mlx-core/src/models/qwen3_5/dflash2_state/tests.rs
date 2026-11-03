@@ -481,6 +481,75 @@ impl Drop for BudgetOverride {
     }
 }
 
+/// A resumed turn whose KV buffer already holds the whole turn needs no new
+/// KV, yet its transients still need headroom: with none, the reserve evicts
+/// the other session's parked state and the turn completes on its own.
+#[test]
+fn reserve_evicts_for_the_turn_transients() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let tokenizer = tokenizer();
+    for name in FIXTURES {
+        let mut inner = fixture(name);
+        turn(&mut inner, &tokenizer, &body(4, 40))?;
+        let a_history = inner.cached_token_history.clone();
+        turn(&mut inner, &tokenizer, &body(5, 40))?;
+        let a2 = cat(&[&a_history, &[4, 5, 6]]);
+        let _override = BudgetOverride;
+        KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(0)));
+        let (result, events) = capture_prefix_events(|| turn(&mut inner, &tokenizer, &a2));
+        let result = result?;
+        assert_eq!(events[0]["hit_kind"], "E", "{name}: {events:?}");
+        assert_eq!(result.cached_tokens as usize, a_history.len(), "{name}");
+        assert_eq!(events[0]["evictions"], "1", "{name}: {events:?}");
+        assert_eq!(inner.dflash2_states.store.bytes().entries, 0, "{name}");
+    }
+    Ok(())
+}
+
+/// A paged AR turn on the model evicts parked DFlash2 states until the live
+/// headroom covers its KV and transients, before it parks the live state:
+/// with room it keeps them, with no headroom only the state it parked
+/// itself is left.
+#[test]
+fn paged_turn_evicts_parked_states_for_its_memory() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let tokenizer = tokenizer();
+    for name in FIXTURES {
+        for pressure in [false, true] {
+            let case = format!("{name} pressure={pressure}");
+            let mut inner = fixture(name);
+            inner.initialize_paged_adapter()?;
+            turn(&mut inner, &tokenizer, &body(2, 40))?;
+            let a_history = inner.cached_token_history.clone();
+            turn(&mut inner, &tokenizer, &body(6, 40))?;
+            let b_history = inner.cached_token_history.clone();
+            assert_eq!(inner.dflash2_states.store.bytes().entries, 1, "{case}");
+            let _override = BudgetOverride;
+            if pressure {
+                KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(0)));
+            }
+            paged_ar_turn(&mut inner, &tokenizer, &cat(&[&b_history, &[2, 3]]))?;
+            let lineages: Vec<Vec<u32>> = inner
+                .dflash2_states
+                .store
+                .entries()
+                .map(|entry| entry.tokens().to_vec())
+                .collect();
+            let want = if pressure {
+                vec![b_history.clone()]
+            } else {
+                vec![a_history.clone(), b_history.clone()]
+            };
+            assert_eq!(lineages, want, "{case}");
+        }
+    }
+    Ok(())
+}
+
 /// A state budget that holds about one parked state, then no KV
 /// headroom at all: every turn of four interleaved sessions completes, and
 /// after every turn's reserve the store fits the budget. Under the state

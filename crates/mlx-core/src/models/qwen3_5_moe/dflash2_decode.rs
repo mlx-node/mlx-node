@@ -1843,6 +1843,70 @@ mod tests {
         assert_parked_end(&mut inner, &before, "paged AR")
     }
 
+    /// With no KV headroom a paged AR turn evicts the other session's
+    /// parked DFlash2 state before it parks the live one.
+    #[test]
+    fn paged_ar_turn_evicts_parked_states_without_headroom() -> Result<()> {
+        use crate::models::qwen3_5::dflash2_turn::KV_BUDGET_OVERRIDE;
+        struct Override;
+        impl Drop for Override {
+            fn drop(&mut self) {
+                KV_BUDGET_OVERRIDE.with(|budget| budget.set(None));
+            }
+        }
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
+        let mut inner = tiny_dflash_inner(0xDFA5_3613);
+        inner.initialize_paged_adapter()?;
+        run_tiny_dflash_turn(&mut inner, &tokenizer, &owner_prompt(3), true, 2)?;
+        run_tiny_dflash_turn(&mut inner, &tokenizer, &owner_prompt(5), true, 2)?;
+        let live = inner.cached_token_history.clone();
+        assert_eq!(inner.dflash2_states.store.bytes().entries, 1);
+        let paged = extend(&live, &[2, 3]);
+        let config = ChatConfig {
+            temperature: Some(0.0),
+            max_new_tokens: Some(2),
+            reasoning_effort: Some("none".to_string()),
+            ..ChatConfig::default()
+        };
+        let params = ChatBackend::resolve_params(&inner, &config);
+        let thinking = ChatBackend::thinking_setup(&inner, &config);
+        let mut args = WholeTurnArgs {
+            tokens: &paged,
+            tokenizer: &tokenizer,
+            eos_id: u32::MAX,
+            config: &config,
+            params: &params,
+            thinking,
+            plan: TurnPlan {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                use_paged_attention: true,
+                decoder: DecoderPlan::Autoregressive,
+            },
+            sink: None,
+            cancelled: None,
+            media: MediaInputs {
+                images: &[],
+                audio: &[],
+            },
+        };
+        let _override = Override;
+        KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(0)));
+        ChatBackend::run_paged_turn(&mut inner, &mut args)?;
+        let lineages: Vec<Vec<u32>> = inner
+            .dflash2_states
+            .store
+            .entries()
+            .map(|entry| entry.tokens().to_vec())
+            .collect();
+        assert_eq!(lineages, [live]);
+        Ok(())
+    }
+
     /// A continuous-batching activation hands the flat caches to a
     /// scheduled sequence and parks the DFlash2 end state first, whether the
     /// owner's history is installed before the activation or after (X0).

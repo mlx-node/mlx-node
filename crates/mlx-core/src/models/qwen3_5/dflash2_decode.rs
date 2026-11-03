@@ -336,6 +336,38 @@ pub(crate) fn dflash2_decode_cache_limit(
     )
 }
 
+/// First-order estimate of the bytes one turn allocates and frees besides its
+/// KV, `context_rows` being `prompt + max_new`: the larger of a prefill
+/// chunk (one layer's attention and MLP scratch over the chunk rows, plus
+/// one full-attention layer's prefix dequantized from int8 rows) and the
+/// decode phase (one cycle's transients plus the free pool
+/// [`dflash2_decode_cache_limit`] lets them keep).
+pub(crate) fn dflash2_turn_transient_bytes(
+    config: &super::config::Qwen3_5Config,
+    block_size: usize,
+    prompt_len: usize,
+    context_rows: u64,
+    kv_format: KvFormat,
+) -> u64 {
+    let dim = |v: i32| v.max(0) as u64;
+    let chunk_rows = (prompt_len as u64).min(PREFILL_STEP_SIZE as u64);
+    let scratch = chunk_rows
+        .saturating_mul(3)
+        .saturating_mul(dim(config.hidden_size).saturating_add(dim(config.intermediate_size)))
+        .saturating_mul(2);
+    let dequantized_prefix = match kv_format {
+        KvFormat::Int8 => (prompt_len as u64)
+            .saturating_mul(dim(config.num_kv_heads))
+            .saturating_mul(dim(config.head_dim))
+            .saturating_mul(2 * 2),
+        KvFormat::Bf16 => 0,
+    };
+    let prefill = scratch.saturating_add(dequantized_prefix);
+    let cycle = dflash2_cycle_transient(config, block_size, context_rows).total();
+    let decode = cycle.saturating_add(crate::cache_limit::decode_cache_limit(cycle));
+    prefill.max(decode)
+}
+
 /// Below this many keys the attention kernels run one-pass and allocate no
 /// partials (`sdpa_vector_uses_two_pass` in `mlx_segmented_sdpa_plan.h`).
 const SDPA_TWO_PASS_MIN_KEYS: u64 = 4096;
