@@ -243,9 +243,18 @@ fn schema_types(schema: &Value) -> Option<TypeSet> {
     resolve(schema).filter(|set| set.0 != 0)
 }
 
+/// `raw` is a string member of an `enum` in the schema or in any of its
+/// `anyOf` / `oneOf` / `allOf` branches (the branches `schema_types` reads).
 fn enum_has_string(schema: &Value, raw: &str) -> bool {
-    matches!(schema.get("enum"), Some(Value::Array(members))
+    if matches!(schema.get("enum"), Some(Value::Array(members))
         if members.iter().any(|m| m.as_str() == Some(raw)))
+    {
+        return true;
+    }
+    ["anyOf", "oneOf", "allOf"].iter().any(|key| {
+        matches!(schema.get(key), Some(Value::Array(branches))
+            if branches.iter().any(|branch| enum_has_string(branch, raw)))
+    })
 }
 
 /// `Number.MAX_SAFE_INTEGER`. NAPI hands JS a `BigInt` for any integer beyond
@@ -930,6 +939,16 @@ mod tests {
             json!({"id": "00042"})
         );
         assert_eq!(parse_and_coerce(props, &call("7")), json!({"id": 7}));
+        for key in ["anyOf", "oneOf"] {
+            let props = format!(
+                r#"{{"id": {{"{key}": [{{"enum": ["00042"]}}, {{"type": "integer", "enum": [7]}}]}}}}"#
+            );
+            assert_eq!(
+                parse_and_coerce(&props, &call("00042")),
+                json!({"id": "00042"}),
+                "{key}"
+            );
+        }
     }
 
     #[test]
