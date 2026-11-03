@@ -3353,3 +3353,165 @@ fn test_strip_reasoning_cannot_fuse_lfm2_sentinel_fragments() {
         "fused sentinel must not yield a call: {out}"
     );
 }
+
+// ---- schema-driven argument coercion (ToolArgSchemas) ----
+
+fn schemas_for(tools: &[(&str, &str)]) -> std::sync::Arc<ToolArgSchemas> {
+    use crate::tokenizer::{FunctionDefinition, FunctionParameters, ToolDefinition};
+    let tools = tools
+        .iter()
+        .map(|(name, properties)| ToolDefinition {
+            r#type: "function".to_string(),
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description: None,
+                parameters: Some(FunctionParameters {
+                    r#type: "object".to_string(),
+                    properties: Some(properties.to_string()),
+                    required: None,
+                }),
+            },
+        })
+        .collect();
+    ToolArgSchemas::from_config(&crate::engine::types::ChatConfig {
+        tools: Some(tools),
+        ..Default::default()
+    })
+    .expect("schemas")
+}
+
+#[test]
+fn test_coerce_function_call_live_failure_repro() {
+    let input = "<tool_call>\n<function=get_command_or_subagent_output>\n<parameter=task_id>\n42\n</parameter>\n<parameter=timeout_ms>\n300000\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=read_file>\n<parameter=path>\n/tmp/a.rs\n</parameter>\n<parameter=limit>\n700\n</parameter>\n</function>\n</tool_call>";
+    let schemas = schemas_for(&[
+        (
+            "get_command_or_subagent_output",
+            r#"{"task_id": {"type": "string"}, "timeout_ms": {"type": ["integer", "null"]}}"#,
+        ),
+        (
+            "read_file",
+            r#"{"path": {"type": "string"}, "limit": {"type": "integer", "minimum": 0}}"#,
+        ),
+    ]);
+
+    let (_, mut calls) = parse_tool_calls(input);
+    schemas.coerce_calls(&mut calls);
+    assert_eq!(
+        calls[0].arguments,
+        serde_json::json!({"task_id": "42", "timeout_ms": 300000})
+    );
+    assert_eq!(
+        calls[1].arguments,
+        serde_json::json!({"path": "/tmp/a.rs", "limit": 700})
+    );
+
+    // No schema: the parser output is unchanged.
+    let (_, calls) = parse_tool_calls(input);
+    assert_eq!(calls[0].arguments["timeout_ms"], "300000");
+    assert_eq!(calls[1].arguments["limit"], "700");
+}
+
+#[test]
+fn test_coerce_function_call_scalar_types() {
+    let input = "<tool_call>\n<function=f>\n<parameter=ratio>\n1.5\n</parameter>\n<parameter=flag>\ntrue\n</parameter>\n<parameter=off>\nfalse\n</parameter>\n<parameter=label>\n700\n</parameter>\n<parameter=count>\nmany\n</parameter>\n<parameter=opt>\nnull\n</parameter>\n</function>\n</tool_call>";
+    let schemas = schemas_for(&[(
+        "f",
+        r#"{"ratio": {"type": "number"}, "flag": {"type": "boolean"}, "off": {"type": "boolean"},
+            "label": {"type": "string"}, "count": {"type": "integer"},
+            "opt": {"anyOf": [{"type": "integer"}, {"type": "null"}]}}"#,
+    )]);
+    let (_, mut calls) = parse_tool_calls(input);
+    schemas.coerce_calls(&mut calls);
+    assert_eq!(
+        calls[0].arguments,
+        serde_json::json!({
+            "ratio": 1.5,
+            "flag": true,
+            "off": false,
+            "label": "700",
+            "count": "many",
+            "opt": null
+        })
+    );
+}
+
+#[test]
+fn test_coerce_function_call_string_param_keeps_json_looking_text() {
+    let input = "<tool_call>\n<function=write>\n<parameter=content>\n{\"a\": 1}\n</parameter>\n<parameter=items>\n[\"x\", \"y\"]\n</parameter>\n</function>\n</tool_call>";
+
+    let as_string = schemas_for(&[(
+        "write",
+        r#"{"content": {"type": "string"}, "items": {"type": "string"}}"#,
+    )]);
+    let (_, mut calls) = parse_tool_calls(input);
+    as_string.coerce_calls(&mut calls);
+    assert_eq!(calls[0].arguments["content"], "{\"a\": 1}");
+    assert_eq!(calls[0].arguments["items"], "[\"x\", \"y\"]");
+
+    let as_containers = schemas_for(&[(
+        "write",
+        r#"{"content": {"type": "object"}, "items": {"type": "array"}}"#,
+    )]);
+    let (_, mut calls) = parse_tool_calls(input);
+    as_containers.coerce_calls(&mut calls);
+    assert_eq!(calls[0].arguments["content"], serde_json::json!({"a": 1}));
+    assert_eq!(calls[0].arguments["items"], serde_json::json!(["x", "y"]));
+
+    // No schema: the parser's JSON-container heuristic still applies.
+    let (_, calls) = parse_tool_calls(input);
+    assert_eq!(calls[0].arguments["content"], serde_json::json!({"a": 1}));
+}
+
+#[test]
+fn test_coerce_function_call_nested_properties_and_items() {
+    let input = "<tool_call>\n<function=edit>\n<parameter=edits>\n[{\"line\": \"3\", \"text\": \"x\"}]\n</parameter>\n<parameter=opts>\n{\"verbose\": \"true\", \"depth\": 2}\n</parameter>\n</function>\n</tool_call>";
+    let schemas = schemas_for(&[(
+        "edit",
+        r#"{"edits": {"type": "array", "items": {"type": "object", "properties": {"line": {"type": "integer"}, "text": {"type": "string"}}}},
+            "opts": {"type": "object", "properties": {"verbose": {"type": "boolean"}, "depth": {"type": "string"}}}}"#,
+    )]);
+    let (_, mut calls) = parse_tool_calls(input);
+    schemas.coerce_calls(&mut calls);
+    assert_eq!(
+        calls[0].arguments,
+        serde_json::json!({
+            "edits": [{"line": 3, "text": "x"}],
+            "opts": {"verbose": true, "depth": "2"}
+        })
+    );
+}
+
+#[test]
+fn test_coerce_json_tool_call_value_based() {
+    let input = "<tool_call>{\"name\": \"read_file\", \"arguments\": {\"limit\": \"700\", \"path\": 5, \"note\": null, \"free\": \"9\"}}</tool_call>";
+    let schemas = schemas_for(&[(
+        "read_file",
+        r##"{"limit": {"type": "integer"}, "path": {"type": "string"}, "note": {"type": "string"}, "free": {"$ref": "#/$defs/x"}}"##,
+    )]);
+    let (_, mut calls) = parse_tool_calls(input);
+    schemas.coerce_calls(&mut calls);
+    assert_eq!(
+        calls[0].arguments,
+        serde_json::json!({"limit": 700, "path": "5", "note": null, "free": "9"})
+    );
+}
+
+#[test]
+fn test_coerce_leaves_unknown_tools_and_keys_alone() {
+    let input = "<tool_call>\n<function=count>\n<parameter=count>\n42\n</parameter>\n<parameter=other>\n7\n</parameter>\n</function>\n</tool_call>";
+    let unrelated = schemas_for(&[("something_else", r#"{"count": {"type": "integer"}}"#)]);
+    let (_, mut calls) = parse_tool_calls(input);
+    unrelated.coerce_calls(&mut calls);
+    assert_eq!(
+        calls[0].arguments,
+        serde_json::json!({"count": "42", "other": "7"})
+    );
+
+    let partial = schemas_for(&[("count", r#"{"count": {"type": "integer"}}"#)]);
+    let (_, mut calls) = parse_tool_calls(input);
+    partial.coerce_calls(&mut calls);
+    assert_eq!(
+        calls[0].arguments,
+        serde_json::json!({"count": 42, "other": "7"})
+    );
+}

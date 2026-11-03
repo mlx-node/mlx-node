@@ -297,6 +297,9 @@ pub struct ChatSessionCall {
     /// the first `result()` call; a second call rejects.
     pub(crate) result_rx:
         std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<napi::Result<ChatResult>>>>,
+    /// The request's tool schemas; the reply's tool calls are coerced
+    /// against them before it reaches JS.
+    pub(crate) tool_schemas: Option<Arc<crate::tools::ToolArgSchemas>>,
 }
 
 #[napi]
@@ -321,7 +324,10 @@ impl ChatSessionCall {
             .ok_or_else(|| {
                 napi::Error::from_reason("ChatSessionCall.result was already consumed")
             })?;
-        rx.await
-            .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
+        let mut result = rx
+            .await
+            .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))??;
+        crate::tools::coerce_tool_calls(self.tool_schemas.as_deref(), &mut result.tool_calls);
+        Ok(result)
     }
 }

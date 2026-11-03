@@ -7,17 +7,21 @@
 //!
 //! Uses simple string-based parsers instead of regex for clarity and debuggability.
 
+use std::collections::HashMap;
+
 use napi_derive::napi;
 use serde_json::Value;
 use uuid::Uuid;
 
 mod chatml;
+mod coerce;
 mod lfm2;
 mod markup;
 mod reasoning;
 
 use chatml::classify_and_parse_tool_call;
 pub(crate) use chatml::parse_json_tool_call;
+pub(crate) use coerce::{ToolArgSchemas, coerce_chunk, coerce_tool_calls};
 #[cfg(test)]
 use lfm2::MAX_PY_LITERAL_DEPTH;
 use lfm2::parse_lfm2_tool_calls;
@@ -58,6 +62,14 @@ pub struct ToolCallResult {
     /// Defaults to empty string for backward compatibility with older JSON
     #[serde(default)]
     pub raw_content: String,
+    /// Verbatim text of each top-level argument, for formats whose values are
+    /// untyped text. Lets schema coercion keep a string-typed value exactly as
+    /// the model wrote it. When set, a key absent from the map was typed by
+    /// the model itself (K2 `arg_type`) and is never coerced. Never crosses
+    /// NAPI or serde.
+    #[napi(skip)]
+    #[serde(skip)]
+    pub raw_argument_text: Option<HashMap<String, String>>,
 }
 
 impl ToolCallResult {
@@ -70,6 +82,7 @@ impl ToolCallResult {
             status: "ok".to_string(),
             error: None,
             raw_content,
+            raw_argument_text: None,
         }
     }
 
@@ -82,6 +95,7 @@ impl ToolCallResult {
             status: "invalid_json".to_string(),
             error: Some(error_msg),
             raw_content,
+            raw_argument_text: None,
         }
     }
 
@@ -103,7 +117,14 @@ impl ToolCallResult {
             status: "parse_error".to_string(),
             error: Some(error_msg),
             raw_content,
+            raw_argument_text: None,
         }
+    }
+
+    /// Attach the verbatim per-argument text (see [`Self::raw_argument_text`]).
+    pub(crate) fn with_raw_argument_text(mut self, raw: HashMap<String, String>) -> Self {
+        self.raw_argument_text = Some(raw);
+        self
     }
 
     /// Create a tool call result with missing name
@@ -115,6 +136,7 @@ impl ToolCallResult {
             status: "missing_name".to_string(),
             error: Some(format!("Tool call missing name: {raw_content}")),
             raw_content,
+            raw_argument_text: None,
         }
     }
 }

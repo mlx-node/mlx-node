@@ -111,6 +111,7 @@ fn classify_k2_tool_call(inner: &str, raw_content: &str) -> Option<ToolCallResul
     }
 
     let mut args = serde_json::Map::new();
+    let mut raw_text = std::collections::HashMap::new();
     for (i, (_, _, key)) in keys.iter().enumerate() {
         let key = key.trim();
         if key.is_empty() {
@@ -118,12 +119,18 @@ fn classify_k2_tool_call(inner: &str, raw_content: &str) -> Option<ToolCallResul
         }
         let arg_type = types.get(i).map(|(_, _, t)| *t);
         args.insert(key.to_string(), coerce_arg_value(values[i].2, arg_type));
+        if arg_type.is_none() {
+            raw_text.insert(key.to_string(), values[i].2.to_string());
+        }
     }
-    Some(ToolCallResult::ok(
-        name.to_string(),
-        Value::Object(args),
-        raw_content.to_string(),
-    ))
+    Some(
+        ToolCallResult::ok(
+            name.to_string(),
+            Value::Object(args),
+            raw_content.to_string(),
+        )
+        .with_raw_argument_text(raw_text),
+    )
 }
 
 /// `parse_tool_calls` against K2's `<ifm|tool_call>` markup. K2 wraps the
@@ -578,5 +585,81 @@ mod tests {
         let (_t, calls) = parse_tool_calls(text);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "f");
+    }
+    #[test]
+    fn xml_raw_values_let_the_tool_schema_decide_types() {
+        use crate::tokenizer::{FunctionDefinition, FunctionParameters, ToolDefinition};
+
+        let inner = "\nwrite\n<ifm|arg_key>n</ifm|arg_key>\n<ifm|arg_value>42</ifm|arg_value>\n\
+                     <ifm|arg_key>body</ifm|arg_key>\n<ifm|arg_value>{\"a\": 1}</ifm|arg_value>\n";
+        let call = classify_k2_tool_call(inner, inner).unwrap();
+        assert_eq!(
+            call.arguments,
+            serde_json::json!({"n": "42", "body": {"a": 1}})
+        );
+
+        let schemas = tools::ToolArgSchemas::from_config(&crate::engine::types::ChatConfig {
+            tools: Some(vec![ToolDefinition {
+                r#type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: "write".to_string(),
+                    description: None,
+                    parameters: Some(FunctionParameters {
+                        r#type: "object".to_string(),
+                        properties: Some(
+                            r#"{"n": {"type": "integer"}, "body": {"type": "string"}}"#.to_string(),
+                        ),
+                        required: None,
+                    }),
+                },
+            }]),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut calls = vec![call];
+        schemas.coerce_calls(&mut calls);
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"n": 42, "body": "{\"a\": 1}"})
+        );
+    }
+
+    #[test]
+    fn xml_typed_arg_type_wins_over_the_tool_schema() {
+        use crate::tokenizer::{FunctionDefinition, FunctionParameters, ToolDefinition};
+
+        let schemas = tools::ToolArgSchemas::from_config(&crate::engine::types::ChatConfig {
+            tools: Some(vec![ToolDefinition {
+                r#type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: "f".to_string(),
+                    description: None,
+                    parameters: Some(FunctionParameters {
+                        r#type: "object".to_string(),
+                        properties: Some(r#"{"x": {"type": ["integer", "string"]}}"#.to_string()),
+                        required: None,
+                    }),
+                },
+            }]),
+            ..Default::default()
+        })
+        .unwrap();
+        let coerced = |inner: &str| {
+            let mut calls = vec![classify_k2_tool_call(inner, inner).unwrap()];
+            schemas.coerce_calls(&mut calls);
+            calls.remove(0).arguments
+        };
+
+        assert_eq!(
+            coerced(
+                "f\n<ifm|arg_key>x</ifm|arg_key>\n<ifm|arg_type>string</ifm|arg_type>\n\
+                 <ifm|arg_value>5</ifm|arg_value>"
+            ),
+            serde_json::json!({"x": "5"})
+        );
+        assert_eq!(
+            coerced("f\n<ifm|arg_key>x</ifm|arg_key>\n<ifm|arg_value>5</ifm|arg_value>"),
+            serde_json::json!({"x": 5})
+        );
     }
 }

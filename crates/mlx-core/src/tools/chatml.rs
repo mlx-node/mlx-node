@@ -138,6 +138,7 @@ fn parse_function_tool_call(inner: &str, raw_content: &str) -> ToolCallResult {
 
     // Extract all <parameter=key>value</parameter> pairs
     let mut param_map = serde_json::Map::new();
+    let mut raw_text = std::collections::HashMap::new();
     for (_, _, param_inner) in extract_tag_blocks(params_section, "<parameter=", "</parameter>") {
         // param_inner is "key>\nvalue"
         if let Some(idx) = param_inner.find('>') {
@@ -160,7 +161,8 @@ fn parse_function_tool_call(inner: &str, raw_content: &str) -> ToolCallResult {
             // We only parse when the value STARTS with `[` or `{`. The template emits
             // string-typed args as bare text (no quotes), so `"5"` and `5` are
             // indistinguishable at this layer; treating bare values as strings is the
-            // safe choice — schema consumers already know how to coerce.
+            // safe choice here; `coerce` re-types it from the request's tool
+            // schema using `raw_text`.
             let trimmed = param_value.trim();
             let parsed_value = match trimmed.chars().next() {
                 Some('[') | Some('{') => serde_json::from_str::<Value>(trimmed)
@@ -168,6 +170,7 @@ fn parse_function_tool_call(inner: &str, raw_content: &str) -> ToolCallResult {
                 _ => Value::String(param_value.to_string()),
             };
             param_map.insert(param_name.to_string(), parsed_value);
+            raw_text.insert(param_name.to_string(), param_value.to_string());
         }
     }
 
@@ -176,6 +179,7 @@ fn parse_function_tool_call(inner: &str, raw_content: &str) -> ToolCallResult {
         Value::Object(param_map),
         raw_content.to_string(),
     )
+    .with_raw_argument_text(raw_text)
 }
 
 /// Parse an XML format tool call (legacy/training)
