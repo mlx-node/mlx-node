@@ -40,7 +40,9 @@ const CLI_ENTRY = join(REPO_ROOT, 'packages', 'cli', 'dist', 'cli.js');
 // Model load dominates; keep the kill well under the `it` timeout so a
 // hang surfaces as a diagnostic rather than an opaque Vitest timeout.
 const RUN_TIMEOUT = 240_000;
-const EXPECTED = 'hello from mlx agent';
+// A neutral word: "mlx agent" in the prompt sent the 0.8B model on long
+// skill/tool searches that could degenerate past the kill.
+const EXPECTED = 'pong';
 
 interface CliResult {
   code: number | null;
@@ -56,12 +58,19 @@ function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<CliResult> {
       cwd: REPO_ROOT,
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
+      // Own process group: a timeout must also kill the `mlx serve` child,
+      // which otherwise stays alive with the model loaded.
+      detached: true,
     });
 
     let stdout = '';
     let stderr = '';
     const timer = setTimeout(() => {
-      child.kill('SIGKILL');
+      try {
+        process.kill(-child.pid!, 'SIGKILL');
+      } catch {
+        child.kill('SIGKILL');
+      }
       reject(
         new Error(`mlx agent timed out after ${RUN_TIMEOUT}ms\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`),
       );
@@ -116,6 +125,9 @@ describe.skipIf(!MODEL_PATH || !existsSync(CLI_ENTRY))('mlx agent CLI e2e smoke'
           // withDefaultModel injects on a fresh interactive run.
           '--model',
           modelId,
+          // Fewer tool paths: no subagents, no plan mode.
+          '--no-subagents',
+          '--no-plan',
           '-p',
           `Reply with exactly: ${EXPECTED}`,
         ],
