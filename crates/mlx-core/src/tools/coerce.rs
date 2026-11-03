@@ -209,10 +209,12 @@ fn schema_types(schema: &Value) -> Option<TypeSet> {
                 .for_each(|t| set.insert_name(t)),
             _ => {}
         }
-        if let Some(Value::Array(members)) = schema.get("enum") {
-            members.iter().for_each(|m| set.insert_value_kind(m));
-        }
         let mut resolved = (set.0 != 0).then_some(set);
+        if let Some(Value::Array(members)) = schema.get("enum") {
+            let mut kinds = TypeSet::default();
+            members.iter().for_each(|m| kinds.insert_value_kind(m));
+            resolved = Some(resolved.map_or(kinds, |r| r.intersect(kinds)));
+        }
         for key in ["anyOf", "oneOf"] {
             if let Some(Value::Array(choices)) = schema.get(key) {
                 // An untyped choice (`$ref`, `{}`) admits anything, so the
@@ -382,7 +384,8 @@ fn coerce_value(value: &mut Value, schema: &Value) {
 
 /// The schema nodes whose `properties` / `items` apply to a container of
 /// kind `bit`: the node, every `allOf` branch, and the one `anyOf` / `oneOf`
-/// choice admitting that kind (none when several do, as the match is unknown).
+/// choice that can admit that kind (none when several can, untyped ones
+/// included, as the match is unknown).
 fn container_schemas<'a>(schema: &'a Value, bit: u8, out: &mut Vec<&'a Map<String, Value>>) {
     let Some(obj) = schema.as_object() else {
         return;
@@ -397,7 +400,7 @@ fn container_schemas<'a>(schema: &'a Value, bit: u8, out: &mut Vec<&'a Map<Strin
         if let Some(Value::Array(choices)) = obj.get(key) {
             let mut fitting = choices
                 .iter()
-                .filter(|c| schema_types(c).is_some_and(|t| t.has(bit)));
+                .filter(|c| schema_types(c).is_none_or(|t| t.has(bit)));
             if let (Some(only), None) = (fitting.next(), fitting.next()) {
                 container_schemas(only, bit, out);
             }
@@ -886,6 +889,35 @@ mod tests {
                 "<tool_call>\n<function=t>\n<parameter=id>\n00042\n</parameter>\n</function>\n</tool_call>"
             ),
             json!({"id": "00042"})
+        );
+    }
+
+    #[test]
+    fn enum_kinds_intersect_the_explicit_type() {
+        assert_eq!(
+            types(json!({"type": "string", "enum": ["00042", 42]})),
+            types(json!({"type": "string"}))
+        );
+        let props = r#"{"id": {"type": "string", "enum": ["00042", 42]}}"#;
+        assert_eq!(
+            parse_and_coerce(
+                props,
+                "<tool_call>\n<function=t>\n<parameter=id>\n00042\n</parameter>\n</function>\n</tool_call>"
+            ),
+            json!({"id": "00042"})
+        );
+    }
+
+    #[test]
+    fn untyped_choice_makes_container_branch_ambiguous() {
+        let props = r#"{"o": {"anyOf": [{"type": "object", "properties": {"id": {"type": "integer"}}},
+            {"properties": {"id": {"type": "string"}}}]}}"#;
+        assert_eq!(
+            parse_and_coerce(
+                props,
+                "<tool_call>\n<function=t>\n<parameter=o>\n{\"id\": \"00042\"}\n</parameter>\n</function>\n</tool_call>"
+            ),
+            json!({"o": {"id": "00042"}})
         );
     }
 
