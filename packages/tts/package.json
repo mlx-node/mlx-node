@@ -1,6 +1,6 @@
 {
   "name": "@mlx-node/tts",
-  "version": "0.0.19",
+  "version": "0.0.20",
   "description": "Native streaming text-to-speech on MLX",
   "license": "MIT",
   "repository": {
