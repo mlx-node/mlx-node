@@ -615,12 +615,17 @@ function bannerBaseUrl(line: string): string | undefined {
   return /listening on (http:\/\/\S+)/.exec(line)?.[1];
 }
 
+/** `mlx serve` argv. The token is joined to its flag: a base64url token can start with `-`. */
+export function serveArgv(modelsDir: string, token: string): string[] {
+  return ['packages/cli/src/cli.ts', 'serve', '--port', '0', `--auth-token=${token}`, '--models-dir', modelsDir];
+}
+
 async function startServer(
   modelsDir: string,
   logFile: string,
 ): Promise<{ url: string; token: string; stop: () => Promise<void> }> {
   const token = randomBytes(24).toString('base64url');
-  const argv = ['packages/cli/src/cli.ts', 'serve', '--port', '0', '--auth-token', token, '--models-dir', modelsDir];
+  const argv = serveArgv(modelsDir, token);
   console.error(
     `$ MLX_NODE_LOG=${INFERENCE_LOG_FILTER} MLX_NODE_LOG_FILE=$MLX_DFLASH2_REPLAY_OUT/inference.log oxnode ${argv.join(' ').replace(token, '<token>')}`,
   );

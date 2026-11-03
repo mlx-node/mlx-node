@@ -1,3 +1,5 @@
+import { parseArgs } from 'node:util';
+
 import { describe, expect, it } from 'vite-plus/test';
 
 import {
@@ -7,6 +9,7 @@ import {
   offlineRequest,
   recordedTimeline,
   responseStarts,
+  serveArgv,
   type HistoryRow,
   type OfflineTurn,
   type Session,
@@ -188,5 +191,18 @@ describe('dflash2-agent-replay offline checks', () => {
       'a#2: a later-turn miss classified flat_dirty, not cross_session',
       'b#2: replay prefills 180 after a live hit of 90, the recording 170',
     ]);
+  });
+});
+
+describe('dflash2-agent-replay serve argv', () => {
+  it('passes an auth token that starts with a dash', () => {
+    const token = '-Kx9_token';
+    const argv = serveArgv('/models', token);
+    const { values } = parseArgs({
+      args: argv.slice(2),
+      options: { port: { type: 'string' }, 'auth-token': { type: 'string' }, 'models-dir': { type: 'string' } },
+    });
+    expect(values['auth-token']).toBe(token);
+    expect(values['models-dir']).toBe('/models');
   });
 });
