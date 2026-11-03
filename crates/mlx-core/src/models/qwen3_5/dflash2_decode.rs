@@ -119,12 +119,31 @@ pub(crate) fn dflash2_memory_snapshot() -> PagedPrefillMemorySnapshot {
     }
 }
 
+/// Live headroom past the process reserve, or `None` when the device limits
+/// cannot be read.
+pub(crate) fn dflash2_kv_headroom_bytes(snapshot: PagedPrefillMemorySnapshot) -> Option<u64> {
+    live_prefill_headroom(snapshot)
+        .selected_bytes
+        .map(|headroom| headroom.saturating_sub(DFLASH2_KV_HEADROOM_RESERVE_BYTES))
+}
+
+/// The part of [`dflash2_kv_headroom_bytes`] the target KV reservation may
+/// claim.
+pub(crate) fn dflash2_kv_budget_of(headroom: u64) -> u64 {
+    headroom / 10 * 9
+}
+
+/// The least headroom whose [`dflash2_kv_budget_of`] covers `budget` bytes.
+/// Every byte freed raises the budget by only 9/10 of a byte, so eviction
+/// must free against this, not against `budget`.
+pub(crate) fn dflash2_kv_headroom_for(budget: u64) -> u64 {
+    budget.div_ceil(9).saturating_mul(10)
+}
+
 /// Bytes the target KV reservation may claim, or `None` when the device
 /// limits cannot be read.
 pub(crate) fn dflash2_kv_budget_bytes(snapshot: PagedPrefillMemorySnapshot) -> Option<u64> {
-    live_prefill_headroom(snapshot)
-        .selected_bytes
-        .map(|headroom| headroom.saturating_sub(DFLASH2_KV_HEADROOM_RESERVE_BYTES) / 10 * 9)
+    dflash2_kv_headroom_bytes(snapshot).map(dflash2_kv_budget_of)
 }
 
 /// Bytes one token row costs across every full-attention K and V tensor:

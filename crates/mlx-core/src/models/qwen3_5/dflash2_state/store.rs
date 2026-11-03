@@ -1172,6 +1172,60 @@ mod tests {
         );
     }
 
+    /// The turn's KV budget is 9/10 of the headroom, so a freed byte raises
+    /// it by 9/10 of a byte. The turn's eviction keeps going until the
+    /// budget read back after the frees covers the need: here past the first
+    /// end state, whose bytes alone would cover the need only 1:1.
+    #[test]
+    fn turn_eviction_frees_until_the_reread_budget_covers_the_need() {
+        use crate::models::qwen3_5::dflash2_decode::{
+            dflash2_kv_budget_of, dflash2_kv_headroom_for,
+        };
+        use crate::models::qwen3_5::dflash2_turn::evict_for_turn_kv;
+
+        for budget in (0..2000).chain([u64::MAX / 20, 9 * GDN * ROW + 1]) {
+            let headroom = dflash2_kv_headroom_for(budget);
+            assert!(dflash2_kv_budget_of(headroom) >= budget, "{budget}");
+            assert!(
+                headroom == 0 || dflash2_kv_budget_of(headroom - 1) < budget,
+                "{budget}: {headroom} is not the least"
+            );
+        }
+
+        let fx = Fixture::new();
+        let mut store = Store::with_state_budget(BS, u64::MAX);
+        let a = lineage(1, 100);
+        let b = lineage(2, 100);
+        store
+            .insert(Lineage::text(&a, 0), fx.end("a", &a, None, 0))
+            .unwrap();
+        store
+            .insert(Lineage::text(&b, 0), fx.end("b", &b, None, 0))
+            .unwrap();
+        fx.drain();
+        let need = 100 * ROW;
+        let headroom = 0;
+        let r = evict_for_turn_kv(&mut store, need, Some(headroom)).unwrap();
+        assert_eq!(fx.drain(), ["drop end a", "drop end b"]);
+        assert!(r.satisfied);
+        assert!(
+            dflash2_kv_budget_of(headroom + r.freed_kv_bytes) >= need,
+            "freed {} bytes: the budget read back stays under {need}",
+            r.freed_kv_bytes
+        );
+
+        // Unreadable limits evict nothing for KV.
+        let c = lineage(3, 100);
+        store
+            .insert(Lineage::text(&c, 0), fx.end("c", &c, None, 0))
+            .unwrap();
+        fx.drain();
+        let r = evict_for_turn_kv(&mut store, need, None).unwrap();
+        assert!(r.satisfied);
+        assert_eq!(store.bytes().entries, 1);
+        assert!(fx.drain().is_empty());
+    }
+
     #[test]
     fn byte_accounting_tracks_inserts_and_removes() {
         let fx = Fixture::new();

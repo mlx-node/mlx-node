@@ -30,15 +30,15 @@ use super::config::Qwen3_5Config;
 use super::dflash2::{DFlash2ContextCache, DFlash2Model};
 use super::dflash2_decode::{
     constrain_dflash2_context_params, dflash2_decode_cache_limit, dflash2_final_token_fits_context,
-    dflash2_kv_budget_bytes, dflash2_kv_need_bytes, dflash2_kv_reserve_rows,
-    dflash2_memory_snapshot, kv_row_bytes, min_fa_capacity, reserve_dflash2_target_kv,
-    reusable_dflash2_prefix,
+    dflash2_kv_budget_of, dflash2_kv_headroom_bytes, dflash2_kv_headroom_for,
+    dflash2_kv_need_bytes, dflash2_kv_reserve_rows, dflash2_memory_snapshot, kv_row_bytes,
+    min_fa_capacity, reserve_dflash2_target_kv, reusable_dflash2_prefix,
 };
 use super::dflash2_state::flat::{
     FlatAnchor, FlatBacking, FlatStates, join_flat_anchor, join_flat_caches, split_flat_caches,
 };
 use super::dflash2_state::store::{
-    Anchor, EntryParts, EvictReport, Lineage, Reservation, StoreHit,
+    Anchor, Backing, EntryParts, EvictReport, HybridStateStore, Lineage, Reservation, StoreHit,
 };
 use super::dflash2_state::trace::{
     DropKind, Hit, HitKind, LedgerTurn, LiveView, PrefixTracker, StateDesign, StoreView,
@@ -360,17 +360,35 @@ pub(crate) fn dflash2_target_kv_format<T: DFlash2Target>(target: &T) -> KvFormat
 
 #[cfg(test)]
 thread_local! {
-    /// Stands in for the live KV budget on this thread.
+    /// Stands in for the live KV headroom on this thread.
     pub(crate) static KV_BUDGET_OVERRIDE: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
 }
 
-fn dflash2_kv_budget_now() -> Option<u64> {
+fn dflash2_kv_headroom_now() -> Option<u64> {
     #[cfg(test)]
     if let Some(bytes) = KV_BUDGET_OVERRIDE.with(std::cell::Cell::get) {
         return Some(bytes);
     }
-    dflash2_kv_budget_bytes(dflash2_memory_snapshot())
+    dflash2_kv_headroom_bytes(dflash2_memory_snapshot())
+}
+
+/// Evicts parked states until the KV budget read back after the frees
+/// covers `need_bytes`. `headroom` is the live headroom past the process
+/// reserve; with `None` (unreadable limits) no KV is evicted.
+pub(crate) fn evict_for_turn_kv<B: Backing>(
+    store: &mut HybridStateStore<B>,
+    need_bytes: u64,
+    headroom: Option<u64>,
+) -> Result<EvictReport> {
+    store.evict_for(
+        Reservation {
+            state_bytes: 0,
+            kv_bytes: headroom.map_or(0, |_| dflash2_kv_headroom_for(need_bytes)),
+        },
+        headroom.unwrap_or(u64::MAX),
+        None,
+    )
 }
 
 /// Size every flat full-attention cache for this turn so decode never
@@ -401,19 +419,15 @@ pub(crate) fn reserve_dflash2_turn_kv<T: DFlash2Target>(
         dflash2_target_kv_format(target),
     );
     let need_bytes = dflash2_kv_need_bytes(prompt_len, max_new_tokens, resident_rows, row_bytes)?;
-    let headroom = dflash2_kv_budget_now();
-    let evicted = target.dflash2_states_mut().store.evict_for(
-        Reservation {
-            state_bytes: 0,
-            kv_bytes: headroom.map_or(0, |_| need_bytes),
-        },
-        headroom.unwrap_or(u64::MAX),
-        None,
+    let evicted = evict_for_turn_kv(
+        &mut target.dflash2_states_mut().store,
+        need_bytes,
+        dflash2_kv_headroom_now(),
     )?;
     if evicted.freed_kv_bytes > 0 || evicted.freed_state_bytes > 0 {
         crate::array::clear_cache();
     }
-    let budget_bytes = dflash2_kv_budget_now();
+    let budget_bytes = dflash2_kv_headroom_now().map(dflash2_kv_budget_of);
     let rows = dflash2_kv_reserve_rows(
         prompt_len,
         max_new_tokens,
