@@ -284,25 +284,38 @@ fn coerce_str(raw: &str, types: TypeSet) -> Value {
         }
     }
     if types.has(TypeSet::OBJECT)
-        && let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(raw)
+        && let Some(v @ Value::Object(_)) = parse_js_safe(raw)
     {
         return v;
     }
     if types.has(TypeSet::ARRAY)
-        && let Ok(v @ Value::Array(_)) = serde_json::from_str::<Value>(raw)
+        && let Some(v @ Value::Array(_)) = parse_js_safe(raw)
     {
         return v;
     }
     if types.has(TypeSet::STRING) {
         return Value::String(raw.to_string());
     }
-    match serde_json::from_str::<Value>(raw) {
-        Ok(Value::Number(_)) if is_integer_literal(raw) && parse_integer(raw).is_none() => {
-            Value::String(raw.to_string())
-        }
-        Ok(v) => v,
-        Err(_) => Value::String(raw.to_string()),
+    if is_integer_literal(raw) && parse_integer(raw).is_none() {
+        return Value::String(raw.to_string());
     }
+    parse_js_safe(raw).unwrap_or_else(|| Value::String(raw.to_string()))
+}
+
+/// JSON-parse `raw`, refusing any result holding an integer beyond
+/// [`MAX_SAFE_INTEGER`] at any depth.
+fn parse_js_safe(raw: &str) -> Option<Value> {
+    fn safe(v: &Value) -> bool {
+        match v {
+            Value::Number(n) if !n.is_f64() => n
+                .as_i64()
+                .is_some_and(|i| i.unsigned_abs() <= MAX_SAFE_INTEGER as u64),
+            Value::Array(items) => items.iter().all(safe),
+            Value::Object(map) => map.values().all(safe),
+            _ => true,
+        }
+    }
+    serde_json::from_str::<Value>(raw).ok().filter(safe)
 }
 
 fn is_integer_literal(raw: &str) -> bool {
@@ -821,6 +834,31 @@ mod tests {
                 r#"<tool_call>{"name":"t","arguments":{"opts":"{\"limit\":\"7\"}","ids":"[\"1\",\"2\"]"}}</tool_call>"#
             ),
             json!({"opts": {"limit": 7}, "ids": [1, 2]})
+        );
+    }
+
+    #[test]
+    fn stringified_containers_with_unsafe_integers_stay_strings() {
+        let props = r#"{"ids": {"type": "array", "items": {"type": "integer"}},
+            "opts": {"type": "object"}, "any": {}}"#;
+        let ids = r#"[9007199254740993]"#;
+        let opts = r#"{"n":[-9223372036854775808]}"#;
+        assert_eq!(
+            parse_and_coerce(
+                props,
+                &format!(
+                    r#"<tool_call>{{"name":"t","arguments":{{"ids":{},"opts":{}}}}}</tool_call>"#,
+                    serde_json::to_string(ids).unwrap(),
+                    serde_json::to_string(opts).unwrap()
+                )
+            ),
+            json!({"ids": ids, "opts": opts})
+        );
+        let set = types(json!({"type": "boolean"}));
+        assert_eq!(coerce_str(ids, set), json!(ids));
+        assert_eq!(
+            coerce_str("[9007199254740991]", set),
+            json!([9007199254740991_i64])
         );
     }
 
