@@ -5,6 +5,9 @@ pub mod config;
 pub mod decoder_layer;
 pub(crate) mod dflash2;
 pub(crate) mod dflash2_decode;
+#[doc(hidden)]
+pub mod dflash2_state;
+pub(crate) mod dflash2_turn;
 pub mod gated_delta;
 pub mod gated_delta_net;
 pub(crate) mod gdn_blob;

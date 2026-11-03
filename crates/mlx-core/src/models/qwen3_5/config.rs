@@ -267,6 +267,12 @@ fn default_rope_theta() -> f64 {
 }
 
 impl Qwen3_5Config {
+    /// Tokens per paged KV block; also the granularity of DFlash2 prefix
+    /// accounting.
+    pub(crate) fn paged_block_size(&self) -> u32 {
+        self.paged_block_size.unwrap_or(16)
+    }
+
     /// Bytes for one request's complete GDN state: bf16 conv history plus the
     /// f32-carried recurrent state. Full-attention K/V is accounted separately
     /// by the paged allocator.

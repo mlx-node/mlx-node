@@ -64,6 +64,7 @@ use crate::engine::{
     save_cache_state_direct, verify_cache_prefix_direct,
 };
 use crate::models::quantized_linear::LinearProj;
+use crate::models::qwen3_5::dflash2_state::trace::{DropKind, PrefixTracker, reset_drop_site};
 use crate::models::qwen3_5::mtp_decode;
 use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
 use crate::models::qwen3_5_moe::decoder_layer::DecoderLayer;
@@ -149,7 +150,8 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) fa_idx: usize,
     pub(crate) dflash2: Option<crate::models::qwen3_5::dflash2::DFlash2Model>,
     pub(crate) dflash2_context: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
-    pub(crate) dflash2_turn_state: Option<super::dflash2_decode::DFlash2TurnState>,
+    pub(crate) dflash2_turn_state: Option<crate::models::qwen3_5::dflash2_turn::DFlash2TurnState>,
+    pub(crate) dflash2_prefix: PrefixTracker,
     /// Set only by a tapped flat prefill; every other cache lane invalidates it.
     pub(crate) dflash2_flat_lane_authoritative: bool,
     /// Normalized owner/root identity supplied by the most recent turn.

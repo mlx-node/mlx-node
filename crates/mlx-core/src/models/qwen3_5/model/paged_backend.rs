@@ -755,6 +755,8 @@ impl Qwen35Inner {
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
         self.paged_full_attn_caches_dirty = true;
+        self.dflash2_prefix
+            .note_drop("paged_whole_turn", DropKind::Dirtied);
         let mut constrained_args = WholeTurnArgs {
             tokens: args.tokens,
             tokenizer: args.tokenizer,

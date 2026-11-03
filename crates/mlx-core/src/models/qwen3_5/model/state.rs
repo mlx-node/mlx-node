@@ -134,10 +134,10 @@ impl DenseGdnCheckpointStoreTrace {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct TokenPrefixMismatchTrace {
-    pub(super) index: i64,
-    pub(super) prompt_token: i64,
-    pub(super) cached_token: i64,
+pub(crate) struct TokenPrefixMismatchTrace {
+    pub(crate) index: i64,
+    pub(crate) prompt_token: i64,
+    pub(crate) cached_token: i64,
 }
 
 impl Default for TokenPrefixMismatchTrace {
@@ -150,7 +150,7 @@ impl Default for TokenPrefixMismatchTrace {
     }
 }
 
-pub(super) fn token_prefix_mismatch_trace(
+pub(crate) fn token_prefix_mismatch_trace(
     prompt: &[u32],
     cached: &[u32],
 ) -> TokenPrefixMismatchTrace {

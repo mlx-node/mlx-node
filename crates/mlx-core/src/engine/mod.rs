@@ -16,6 +16,7 @@ pub(crate) mod decode;
 pub(crate) mod decode_tuning;
 pub(crate) mod dspark_turn;
 pub(crate) mod finalize;
+pub(crate) mod gen_prompt;
 pub(crate) mod hybrid_scheduler;
 pub(crate) mod model_command;
 pub(crate) mod mtp_turn;

@@ -63,6 +63,7 @@ impl Qwen35MoeInner {
             config.n_mtp_layers
         );
 
+        let dflash2_prefix = PrefixTracker::new(config.paged_block_size());
         Ok(Self {
             config,
             source_moe_policy: Default::default(),
@@ -79,6 +80,7 @@ impl Qwen35MoeInner {
             dflash2: None,
             dflash2_context: None,
             dflash2_turn_state: None,
+            dflash2_prefix,
             dflash2_flat_lane_authoritative: false,
             dflash2_owner_key: None,
             dflash2_compiled_verify_disabled: false,
@@ -137,7 +139,7 @@ impl Qwen35MoeInner {
                 "Qwen3.5 MoE block-paged adapter requires at least one full_attention layer",
             ));
         }
-        let block_size = self.config.paged_block_size.unwrap_or(16);
+        let block_size = self.config.paged_block_size();
         let head_size = self.config.head_dim as u32;
         let num_kv_heads = self.config.num_kv_heads as u32;
         let max_seq_len = self.config.max_position_embeddings as u32;
@@ -835,14 +837,15 @@ impl Qwen35MoeInner {
     }
 
     /// Discard external-draft state whenever another cache lane takes ownership.
-    pub(super) fn invalidate_dflash2_context(&mut self) {
+    pub(super) fn invalidate_dflash2_context(&mut self, site: &'static str) {
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
         self.dflash2_flat_lane_authoritative = false;
+        self.dflash2_prefix.note_drop(site, DropKind::Invalidated);
     }
 
     fn clear_reuse_state(&mut self) {
-        self.invalidate_dflash2_context();
+        self.invalidate_dflash2_context("clear_reuse_state");
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_paged_image_token_positions.clear();

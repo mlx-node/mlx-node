@@ -23,7 +23,7 @@ impl ChatBackend for Qwen35MoeInner {
             root_owner_id.unwrap_or(owner_id).to_owned(),
         );
         if self.dflash2_owner_key.as_ref() != Some(&owner_key) {
-            self.invalidate_dflash2_context();
+            self.invalidate_dflash2_context("set_cache_owner_id");
             self.dflash2_owner_key = Some(owner_key);
         }
         self.active_cache_owner_id.clear();
@@ -66,7 +66,7 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
-        self.invalidate_dflash2_context();
+        self.invalidate_dflash2_context(reset_drop_site(scope));
         match scope {
             // Prefix-miss reset: reset each live layer cache, then install a
             // fresh hybrid cache vec. PRESERVES `cached_token_history` /
@@ -190,7 +190,7 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray> {
-        self.invalidate_dflash2_context();
+        self.invalidate_dflash2_context("prefill");
         // Text-only prefill block (the engine's reset-or-delta split already
         // ran; `self.caches` holds either fresh caches or the live session
         // state). Unlike dense, the MoE `chunked_prefill` returns the
@@ -222,7 +222,7 @@ impl ChatBackend for Qwen35MoeInner {
         Self: 'a;
 
     fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
-        self.invalidate_dflash2_context();
+        self.invalidate_dflash2_context("begin_decode");
         let is_streaming = self.turn_is_streaming.get();
 
         let embedding = self.embedding.clone();
@@ -339,9 +339,11 @@ impl ChatBackend for Qwen35MoeInner {
     fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         debug_assert!(args.media.is_empty());
         match args.plan.decoder {
-            DecoderPlan::Speculative(SpeculativeKind::DraftModel) => self.dflash2_chat_turn(args),
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel) => {
+                crate::models::qwen3_5::dflash2_turn::dflash2_chat_turn(self, args)
+            }
             DecoderPlan::Speculative(SpeculativeKind::NativeMtp) => {
-                self.invalidate_dflash2_context();
+                self.invalidate_dflash2_context("native_mtp_turn");
                 self.moe_whole_turn(args)
             }
             _ => Err(Error::from_reason(
@@ -351,7 +353,7 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        self.invalidate_dflash2_context();
+        self.invalidate_dflash2_context("run_multimodal_turn");
         self.moe_whole_turn(args)
     }
 }

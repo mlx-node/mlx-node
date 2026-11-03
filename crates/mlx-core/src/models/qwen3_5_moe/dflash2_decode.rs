@@ -1,21 +1,9 @@
 //! DFlash2 whole-turn integration for Qwen3.5/3.6/3.8 MoE.
 
-use std::time::Instant;
-
 use napi::bindgen_prelude::*;
 
 use crate::array::{DType, MxArray};
-use crate::decode_profiler::DecodeProfiler;
-use crate::engine::backend::{
-    ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput, FinalizeArgs,
-    ResetScope, TurnOutput, WholeTurnArgs,
-};
-use crate::engine::decode::TurnStreaming;
-use crate::engine::dspark_turn::{DsparkTurnArgs, run_dspark_turn};
-use crate::engine::finalize::compute_performance_metrics;
-use crate::engine::params::generated_capacity_hint;
-use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
-use crate::stream::{Stream, StreamContext};
+use crate::engine::backend::{DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput};
 use crate::transformer::KvFormat;
 
 use super::layer_cache::{
@@ -23,14 +11,10 @@ use super::layer_cache::{
     snapshot_all_mtp,
 };
 use super::model::{PREFILL_STEP_SIZE, Qwen35MoeInner};
-use crate::models::forward::PREFILL_CANCELLED;
 use crate::models::qwen3_5::dflash2::DFlash2ContextCache;
+use crate::models::qwen3_5::dflash2_state::trace::PrefixTracker;
+use crate::models::qwen3_5::dflash2_turn::{DFlash2Target, DFlash2TurnState};
 use crate::models::qwen3_5::gdn_blob::GdnStateBlobs;
-
-pub(crate) struct DFlash2TurnState {
-    context: DFlash2ContextCache,
-    next_position: i32,
-}
 
 struct PendingGdn {
     tape: Vec<Option<super::gated_delta_net::GdnLayerTape>>,
@@ -67,12 +51,6 @@ pub(crate) struct Qwen35MoeDFlash2Stepper<'a> {
     verify_row_budget: Option<MxArray>,
 }
 
-use crate::models::qwen3_5::dflash2_decode::{
-    constrain_dflash2_context_params, dflash2_decode_cache_limit, dflash2_final_token_fits_context,
-    dflash2_kv_budget_bytes, dflash2_kv_reserve_rows, dflash2_memory_snapshot, kv_row_bytes,
-    min_fa_capacity, reserve_dflash2_target_kv, reusable_dflash2_prefix,
-};
-
 fn dflash2_gdn_blob_enabled() -> bool {
     std::env::var("MLX_DFLASH2_GDN_BLOB")
         .ok()
@@ -82,19 +60,6 @@ fn dflash2_gdn_blob_enabled() -> bool {
 // FC+merged-KV costs cross over between retained heights 6 and 7.
 fn prefer_full_width_context(keep: usize) -> bool {
     (7..=8).contains(&keep)
-}
-
-fn flat_attention_frontier(inner: &Qwen35MoeInner) -> Option<usize> {
-    let mut frontiers = inner
-        .caches
-        .as_ref()?
-        .iter()
-        .filter_map(|cache| match cache {
-            Qwen3_5LayerCache::FullAttention(kv) => usize::try_from(kv.get_offset()).ok(),
-            Qwen3_5LayerCache::Linear(_) => None,
-        });
-    let first = frontiers.next()?;
-    frontiers.all(|frontier| frontier == first).then_some(first)
 }
 
 impl Qwen35MoeDFlash2Stepper<'_> {
@@ -716,491 +681,122 @@ impl DsparkBackend for Qwen35MoeInner {
     }
 }
 
-impl Qwen35MoeInner {
-    fn turn_cancelled(&self) -> bool {
-        self.turn_cancel
-            .as_ref()
-            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+impl DFlash2Target for Qwen35MoeInner {
+    const PREFILL_STEP_SIZE: i64 = PREFILL_STEP_SIZE;
+
+    fn label(&self) -> &'static str {
+        "Qwen3.5 MoE"
     }
 
-    fn dflash2_prefill(
+    fn dflash2(&self) -> Option<&crate::models::qwen3_5::dflash2::DFlash2Model> {
+        self.dflash2.as_ref()
+    }
+
+    fn caches(&self) -> &Option<Vec<Qwen3_5LayerCache>> {
+        &self.caches
+    }
+
+    fn caches_mut(&mut self) -> &mut Option<Vec<Qwen3_5LayerCache>> {
+        &mut self.caches
+    }
+
+    fn dflash2_context(&self) -> Option<&DFlash2ContextCache> {
+        self.dflash2_context.as_ref()
+    }
+
+    fn dflash2_context_mut(&mut self) -> &mut Option<DFlash2ContextCache> {
+        &mut self.dflash2_context
+    }
+
+    fn dflash2_turn_state_mut(&mut self) -> &mut Option<DFlash2TurnState> {
+        &mut self.dflash2_turn_state
+    }
+
+    fn prefix_tracker(&self) -> &PrefixTracker {
+        &self.dflash2_prefix
+    }
+
+    fn prefix_tracker_mut(&mut self) -> &mut PrefixTracker {
+        &mut self.dflash2_prefix
+    }
+
+    fn turn_cancel(&self) -> Option<&std::sync::atomic::AtomicBool> {
+        self.turn_cancel.as_deref()
+    }
+
+    fn kv_heads(&self) -> i32 {
+        self.config.num_kv_heads
+    }
+
+    fn head_dim(&self) -> i32 {
+        self.config.head_dim
+    }
+
+    fn max_position_embeddings(&self) -> i32 {
+        self.config.max_position_embeddings
+    }
+
+    fn dense_config(&self) -> std::borrow::Cow<'_, crate::models::qwen3_5::Qwen3_5Config> {
+        std::borrow::Cow::Owned(self.config.to_dense_config())
+    }
+
+    fn set_cached_token_history(&mut self, history: Vec<u32>) {
+        self.cached_token_history = history;
+    }
+
+    fn config_kv_format(&self) -> KvFormat {
+        self.config.to_dense_config().kv_format()
+    }
+
+    fn embedding_dtype(&self) -> Result<DType> {
+        self.embedding
+            .forward(&MxArray::from_int32(&[0], &[1, 1])?)?
+            .dtype()
+    }
+
+    fn forward_with_taps(
         &mut self,
-        tokens: &[u32],
-        position_base: i32,
-        stream: Stream,
-    ) -> Result<(MxArray, DFlash2TurnState)> {
-        if tokens.is_empty() {
-            return Err(Error::from_reason(
-                "Qwen3.5 MoE DFlash2 requires at least one prefill token",
-            ));
-        }
-        let draft = self
-            .dflash2
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE has no loaded DFlash2 companion"))?;
-        let tap_layers = draft.config.target_layers.clone();
-        let draft_config = draft.config.clone();
-        let mut context = match self.dflash2_context.take() {
-            Some(context) if context.logical_len() == position_base => context,
-            Some(context) => {
-                return Err(Error::from_reason(format!(
-                    "Qwen3.5 MoE DFlash2 context length {} does not match cached prefix {position_base}",
-                    context.logical_len()
-                )));
-            }
-            None if position_base == 0 => DFlash2ContextCache::new(&draft_config),
-            None => {
-                return Err(Error::from_reason(format!(
-                    "Qwen3.5 MoE DFlash2 cached prefix {position_base} has no retained draft context"
-                )));
-            }
-        };
-        // Draft-context retention: each layer's sliding cache keeps only the
-        // last `sliding_window - 1` rows, so rows below `keep_from` would be
-        // evicted by later appends without ever being read. Their fc fusion
-        // and per-layer K/V projections are dead work — skip the appends but
-        // still advance logical length and token provenance (`record_only`).
-        let base_usize = position_base.max(0) as usize;
-        let window_rows = draft_config.sliding_window.saturating_sub(1);
-        let keep_from = (base_usize + tokens.len())
-            .saturating_sub(window_rows)
-            .max(base_usize);
-        let mut offset = 0usize;
-        let mut last_logits = None;
-        while offset < tokens.len() {
-            if self.turn_cancelled() {
-                return Err(Error::from_reason(PREFILL_CANCELLED));
-            }
-            let end = (offset + PREFILL_STEP_SIZE as usize).min(tokens.len());
-            let chunk = tokens[offset..end]
-                .iter()
-                .map(|&id| id as i32)
-                .collect::<Vec<_>>();
-            let input = MxArray::from_int32(&chunk, &[1, chunk.len() as i64])?;
-            let (logits, taps, _) = {
-                let _stream = StreamContext::new(stream);
-                super::model::forward_dflash2_with_taps(
-                    self,
-                    &input,
-                    &tap_layers,
-                    false,
-                    super::model::DFlash2LogitsSpan::LastRow,
-                    None,
-                )?
-            };
-            let draft = self
-                .dflash2
-                .as_ref()
-                .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 model disappeared"))?;
-            let chunk_end = base_usize + end;
-            if chunk_end <= keep_from {
-                context.record_only(&tokens[offset..end])?;
-            } else {
-                let head = keep_from.saturating_sub(base_usize + offset);
-                if head > 0 {
-                    context.record_only(&tokens[offset..offset + head])?;
-                }
-                // Rows at or past `keep_from` survive in the sliding window:
-                // fuse + project only that tail (RoPE keys are per-row at
-                // absolute base + row, so a sliced append is identical).
-                let fused = if head == 0 {
-                    draft.fuse_context(&taps)?
-                } else {
-                    let tail_taps = taps
-                        .iter()
-                        .map(|tap| tap.slice_axis(1, head as i64, (end - offset) as i64))
-                        .collect::<Result<Vec<_>>>()?;
-                    draft.fuse_context(&tail_taps)?
-                };
-                context.append(
-                    draft,
-                    &fused,
-                    (base_usize + offset + head) as i32,
-                    &tokens[offset + head..end],
-                )?;
-            }
-            // `LastRow` span already reduced the logits to the chunk's final
-            // row ([1, 1, vocab]); only non-final chunks' rows are dropped.
-            let vocab = logits.shape_at(2)?;
-            last_logits = Some(logits.reshape(&[vocab])?);
-            if end < tokens.len() {
-                crate::models::forward::eval_layer_caches(&self.caches)?;
-                context.eval()?;
-                crate::array::clear_cache();
-            }
-            offset = end;
-        }
-        Ok((
-            last_logits.ok_or_else(|| Error::from_reason("non-empty DFlash2 prefill"))?,
-            DFlash2TurnState {
-                context,
-                next_position: position_base.saturating_add(tokens.len() as i32),
-            },
-        ))
-    }
-
-    /// Activation element type the target's full-attention caches hold (BF16
-    /// format) or quantize from (int8 format): the embedding output dtype,
-    /// or the allocated BF16 buffer's own.
-    fn dflash2_target_kv_dtype(&self) -> Result<DType> {
-        let allocated = self.caches.iter().flatten().find_map(|cache| match cache {
-            Qwen3_5LayerCache::FullAttention(kv) if kv.format() == KvFormat::Bf16 => kv.keys_ref(),
-            _ => None,
-        });
-        match allocated {
-            Some(keys) => keys.dtype(),
-            None => self
-                .embedding
-                .forward(&MxArray::from_int32(&[0], &[1, 1])?)?
-                .dtype(),
-        }
-    }
-
-    /// Row format of the target's full-attention caches (every FA slot
-    /// shares the config's format).
-    fn dflash2_target_kv_format(&self) -> KvFormat {
-        self.caches
-            .iter()
-            .flatten()
-            .find_map(|cache| match cache {
-                Qwen3_5LayerCache::FullAttention(kv) => Some(kv.format()),
-                Qwen3_5LayerCache::Linear(_) => None,
-            })
-            .unwrap_or_else(|| self.config.to_dense_config().kv_format())
-    }
-
-    /// Size every flat full-attention cache for this turn so decode never
-    /// grows it. Runs before prefill: on a cold turn it only records the
-    /// size for the first allocation; a warm turn copies its prefix once.
-    fn reserve_dflash2_turn_kv(&mut self, prompt_len: usize, max_new_tokens: i32) -> Result<()> {
-        let Some(resident_rows) = min_fa_capacity(&self.caches)? else {
-            return Ok(());
-        };
-        let full_attention_layers = self
-            .caches
-            .iter()
-            .flatten()
-            .filter(|cache| matches!(cache, Qwen3_5LayerCache::FullAttention(_)))
-            .count();
-        let row_bytes = kv_row_bytes(
-            full_attention_layers,
-            self.config.num_kv_heads,
-            self.config.head_dim,
-            self.dflash2_target_kv_dtype()?,
-            self.dflash2_target_kv_format(),
-        );
-        let budget_bytes = dflash2_kv_budget_bytes(dflash2_memory_snapshot());
-        let rows = dflash2_kv_reserve_rows(
-            prompt_len,
-            max_new_tokens,
-            resident_rows,
-            row_bytes,
-            budget_bytes,
-        )?;
-        tracing::debug!(
-            target: "mlx_core::inference",
-            prompt_len,
-            max_new_tokens,
-            resident_rows,
-            row_bytes,
-            budget_bytes,
-            reserved_rows = rows,
-            "DFlash2 target KV reservation"
-        );
-        match rows {
-            Some(rows) => reserve_dflash2_target_kv(&mut self.caches, rows),
-            None => Ok(()),
-        }
-    }
-
-    fn dflash2_fail_closed(&mut self, error: Error) -> Error {
-        let _ = ChatBackend::reset_caches(self, ResetScope::Command);
-        self.dflash2_turn_state = None;
-        error
-    }
-
-    fn dflash2_materialize_final(&mut self, token: u32, stream: Stream) -> Result<()> {
-        let tap_layers = self
-            .dflash2
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 model disappeared"))?
-            .config
-            .target_layers
-            .clone();
-        let input = MxArray::from_int32(&[token as i32], &[1, 1])?;
-        let _stream = StreamContext::new(stream);
-        let (_, taps, _) = super::model::forward_dflash2_with_taps(
+        input_ids: &MxArray,
+        tap_layers: &[usize],
+    ) -> Result<(MxArray, Vec<MxArray>)> {
+        let (logits, taps, _) = super::model::forward_dflash2_with_taps(
             self,
-            &input,
-            &tap_layers,
+            input_ids,
+            tap_layers,
             false,
             super::model::DFlash2LogitsSpan::LastRow,
             None,
         )?;
-        let fused = self
-            .dflash2
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 model disappeared"))?
-            .fuse_context(&taps)?;
-        let mut context = self.dflash2_context.take().ok_or_else(|| {
-            Error::from_reason("Qwen3.5 MoE DFlash2 final token has no retained draft context")
-        })?;
-        let base = context.logical_len();
-        let append_result = self
-            .dflash2
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 model disappeared"))
-            .and_then(|draft| context.append(draft, &fused, base, &[token]));
-        self.dflash2_context = Some(context);
-        append_result?;
-        crate::models::forward::eval_layer_caches(&self.caches)
+        Ok((logits, taps))
     }
 
-    pub(crate) fn dflash2_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        let tokenizer = args.tokenizer.clone();
-        let tokens = args.tokens.to_vec();
-        let is_delta = args.plan.is_delta;
-        let is_streaming = args.sink.is_some();
-        let mut params = ChatBackend::resolve_params(self, args.config);
-        params.extra_eos_ids = ChatBackend::extra_eos_ids(self);
-        let dflash_context_capacity = constrain_dflash2_context_params(
-            tokens.len(),
-            self.config.max_position_embeddings,
-            self.dflash2
-                .as_ref()
-                .ok_or_else(|| Error::from_reason("loaded DFlash2 companion"))?
-                .max_position_embeddings(),
-            &mut params,
-        )?;
-        let prior_cached = if is_delta {
-            self.cached_token_history.len()
-        } else {
-            0
-        };
-        let verified_hit = if is_delta {
-            0
-        } else {
-            ChatBackend::verify_cache_prefix(self, &tokens, params.reuse_cache)
-        };
-        let flat_lane_authoritative =
-            self.dflash2_flat_lane_authoritative && !self.flat_mtp_caches_desynced;
-        let cached_prefix = reusable_dflash2_prefix(
-            is_delta,
-            &tokens,
-            prior_cached,
-            verified_hit,
-            self.dflash2_context
-                .as_ref()
-                .map(DFlash2ContextCache::token_history),
-            flat_attention_frontier(self),
-            flat_lane_authoritative,
-        );
-        if self.turn_cancelled() {
-            return Err(Error::from_reason(PREFILL_CANCELLED));
-        }
-        let prefill = if cached_prefix > 0 {
-            tokens[cached_prefix..].to_vec()
-        } else {
-            // A previous turn may have occupied the target's paged lane.
-            // Command reset also releases/purges that request before the
-            // DFlash2 flat-cache prefill rebuilds the complete prompt.
-            ChatBackend::reset_caches(self, ResetScope::Command)?;
-            self.init_caches_sync()?;
-            tokens.clone()
-        };
+    fn init_caches_sync(&mut self) -> Result<()> {
+        Qwen35MoeInner::init_caches_sync(self)
+    }
 
-        let generation_stream = Stream::generation();
-        let report_performance = params.report_performance;
-        let generation_start = report_performance.then(Instant::now);
-        let mut first_token_instant = None;
-        let mut profiler = DecodeProfiler::new(
-            ChatBackend::profiler_label(self, is_delta, is_streaming),
-            ChatBackend::family_name(self),
-        );
-        profiler.set_prompt_tokens(prefill.len() as u32);
-        profiler.snapshot_memory_before();
-        let reserved = {
-            let _stream = StreamContext::new(generation_stream);
-            self.reserve_dflash2_turn_kv(tokens.len(), params.max_new_tokens)
-        };
-        if let Err(error) = reserved {
-            return Err(self.dflash2_fail_closed(error));
-        }
-        profiler.begin_prefill();
-        let (last_logits, state) =
-            match self.dflash2_prefill(&prefill, cached_prefix as i32, generation_stream) {
-                Ok(value) => value,
-                Err(error) => return Err(self.dflash2_fail_closed(error)),
-            };
-        profiler.end_prefill();
+    fn flat_lane_authoritative(&self) -> bool {
+        self.dflash2_flat_lane_authoritative && !self.flat_mtp_caches_desynced
+    }
 
-        let mut token_history = tokens.clone();
-        let y = match apply_all_penalties(last_logits, &token_history, &params)
-            .and_then(|logits| crate::sampling::sample(&logits, params.sampling_config))
-        {
-            Ok(token) => token,
-            Err(error) => return Err(self.dflash2_fail_closed(error)),
-        };
-        y.eval();
-        if let Err(error) = crate::models::forward::eval_layer_caches(&self.caches) {
-            return Err(self.dflash2_fail_closed(error));
-        }
-        if report_performance {
-            first_token_instant = Some(Instant::now());
-        }
-        self.dflash2_turn_state = Some(state);
+    fn on_flat_prefill_done(&mut self) {
         self.dflash2_flat_lane_authoritative = true;
-
-        let mut generated = Vec::with_capacity(generated_capacity_hint(params.max_new_tokens));
-        let mut finish_reason = String::from("length");
-        let mut reasoning = ReasoningTracker::from_setup(&args.thinking, tokenizer.think_end_id());
-        let stream_skip_special = ChatBackend::stream_skip_special_tokens(self);
-        // One streaming bundle — detokenizer + cursors + emitter — built
-        // only when a sink exists so the sync path never runs the emitter
-        // hook.
-        let mut turn_streaming = args.sink.map(|_| {
-            TurnStreaming::new(
-                self,
-                tokenizer.inner(),
-                args.thinking.enabled,
-                stream_skip_special,
-            )
-        });
-        let turn_token_observer = ChatBackend::turn_token_observer(self);
-        let block_size = self
-            .dflash2
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("loaded DFlash2 companion"))?
-            .config
-            .block_size;
-        let mut rng = rand::rng();
-        let outcome = {
-            // Decode-phase allocator ceiling: prefill (2048-row chunks) has
-            // already run under the load-time cap; the verify/propose loop
-            // only needs room to recycle one cycle's transients, so the
-            // free-pool is capped for exactly this scope and lifted on drop.
-            let _decode_cache_cap =
-                crate::cache_limit::coordinator().push_decode_limit(dflash2_decode_cache_limit(
-                    &self.config.to_dense_config(),
-                    block_size,
-                    tokens.len() as u64 + params.max_new_tokens.max(0) as u64,
-                ));
-            let streaming = turn_streaming
-                .as_mut()
-                .and_then(|ts| ts.ctx(args.sink, args.cancelled));
-            run_dspark_turn(
-                self,
-                &mut rng,
-                DsparkTurnArgs {
-                    y,
-                    block_size,
-                    params: &params,
-                    reasoning_tracker: &mut reasoning,
-                    profiler: &mut profiler,
-                    max_new_tokens: params.max_new_tokens,
-                    eos_id: args.eos_id,
-                    generated_tokens: &mut generated,
-                    token_history: &mut token_history,
-                    finish_reason: &mut finish_reason,
-                    first_token_instant: &mut first_token_instant,
-                    report_perf: report_performance,
-                    generation_stream,
-                    cancel_flag: args.cancelled,
-                    turn_token_observer,
-                },
-                streaming,
-            )
-        };
-        let mut last_in_cache = match outcome {
-            Ok(outcome) => outcome.last_in_cache,
-            Err(error) => return Err(self.dflash2_fail_closed(error)),
-        };
-        let final_token_fits_context = self.dflash2_context.as_ref().is_some_and(|context| {
-            dflash2_final_token_fits_context(context.logical_len(), dflash_context_capacity)
-        });
-        if finish_reason == "length"
-            && !last_in_cache
-            && final_token_fits_context
-            && let Some(&last) = generated.last()
-        {
-            if let Err(error) = self.dflash2_materialize_final(last, generation_stream) {
-                return Err(self.dflash2_fail_closed(error));
-            }
-            last_in_cache = true;
-        }
-        let saved_generated = if !last_in_cache && !generated.is_empty() {
-            &generated[..generated.len() - 1]
-        } else {
-            generated.as_slice()
-        };
-        let mut history = tokens.clone();
-        history.extend_from_slice(saved_generated);
-        self.cached_token_history = history;
-        // This specialized path bypasses the generic save hook's non-reuse cleanup.
-        if !params.reuse_cache {
-            ChatBackend::reset_caches(self, ResetScope::Command)?;
-        }
-
-        let performance = if report_performance {
-            compute_performance_metrics(
-                generation_start,
-                first_token_instant,
-                prefill.len(),
-                generated.len(),
-            )
-            .map(|mut metrics| {
-                ChatBackend::augment_performance(self, &profiler, &mut metrics);
-                metrics
-            })
-        } else {
-            None
-        };
-        if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
-            let decoded = tokenizer
-                .decode_sync(&generated, stream_skip_special)
-                .unwrap_or_default();
-            ts.flush_residual(&decoded, params.include_reasoning, sink);
-        }
-        let prompt_tokens = if is_delta && is_streaming {
-            ChatBackend::stream_delta_prompt_tokens(self, tokens.len(), tokens.len() - prior_cached)
-        } else {
-            tokens.len() as u32
-        };
-        let mut result = ChatBackend::finalize_turn(
-            self,
-            FinalizeArgs {
-                tokenizer: &tokenizer,
-                generated_tokens: &generated,
-                finish_reason,
-                think_end_id: tokenizer.think_end_id(),
-                think_end_str: tokenizer.think_end_str(),
-                think_end_extra_ids: &[],
-                performance,
-                include_reasoning: params.include_reasoning,
-                thinking_enabled: args.thinking.enabled,
-                prompt_tokens,
-                reasoning_tokens: reasoning.reasoning_token_count(),
-            },
-        )?;
-        result.cached_tokens = cached_prefix as u32;
-        if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
-            ts.emitter.finish(&result, sink);
-            Ok(TurnOutput::Streamed)
-        } else {
-            Ok(TurnOutput::Complete(Box::new(result)))
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::backend::SpecFrontier;
+    use crate::engine::backend::{ChatBackend, SpecFrontier, TurnOutput, WholeTurnArgs};
     use crate::engine::extract_chat_params;
     use crate::engine::plan::{DecoderPlan, MediaCapabilities, MediaInputs, TurnPlan};
     use crate::engine::types::{ChatConfig, ChatResult};
+    use crate::models::forward::PREFILL_CANCELLED;
     use crate::models::quantized_linear::LinearProj;
+    use crate::models::qwen3_5::dflash2_turn::{
+        dflash2_chat_turn, dflash2_fail_closed, dflash2_prefill, flat_attention_frontier,
+    };
     use crate::nn::Linear;
+    use crate::stream::{Stream, StreamContext};
     use crate::tokenizer::Qwen3Tokenizer;
     use rand::SeedableRng;
 
@@ -1325,7 +921,7 @@ mod tests {
                 audio: &[],
             },
         };
-        match inner.dflash2_chat_turn(&mut args)? {
+        match dflash2_chat_turn(inner, &mut args)? {
             TurnOutput::Complete(result) => Ok(*result),
             TurnOutput::Streamed => panic!("sync DFlash2 turn returned streamed output"),
         }
@@ -1355,7 +951,7 @@ mod tests {
             reset_flat_fixture(inner);
             let stream = Stream::generation();
             let _ctx = StreamContext::new(stream);
-            let (prefill_logits, state) = inner.dflash2_prefill(&[1, 2, 3, 4], 0, stream)?;
+            let (prefill_logits, state) = dflash2_prefill(inner, &[1, 2, 3, 4], 0, stream)?;
             prefill_logits.eval();
             let anchor = prefill_logits.argmax(-1, None)?.item_at_int32(0)? as u32;
             inner.dflash2_turn_state = Some(state);
@@ -1514,7 +1110,7 @@ mod tests {
             let mut traces = Vec::new();
             for packed in [false, true] {
                 reset_flat_fixture(&mut inner);
-                let (_, state) = inner.dflash2_prefill(&[1, 2, 3, 4], 0, stream)?;
+                let (_, state) = dflash2_prefill(&mut inner, &[1, 2, 3, 4], 0, stream)?;
                 inner.dflash2_turn_state = Some(state);
                 let mut step = inner.begin_dspark_decode(2)?;
                 assert!(
@@ -1574,7 +1170,7 @@ mod tests {
         let mut inner = tiny_dflash_inner(0xDFA5_3502);
         reset_flat_fixture(&mut inner);
         let stream = Stream::generation();
-        let (_, state) = inner.dflash2_prefill(&[1, 2, 3, 4], 0, stream)?;
+        let (_, state) = dflash2_prefill(&mut inner, &[1, 2, 3, 4], 0, stream)?;
         inner.dflash2_turn_state = Some(state);
         let mut step = inner.begin_dspark_decode(2)?;
         step.verify(&[3, 4, 5])?.logits.eval();
@@ -1584,7 +1180,7 @@ mod tests {
         );
         drop(step);
         inner.dflash2_flat_lane_authoritative = true;
-        let err = inner.dflash2_fail_closed(Error::from_reason("injected verify failure"));
+        let err = dflash2_fail_closed(&mut inner, Error::from_reason("injected verify failure"));
         assert_eq!(err.reason, "injected verify failure");
         assert!(inner.caches.is_none());
         assert!(inner.cached_token_history.is_empty());
@@ -1689,7 +1285,7 @@ mod tests {
             reset_flat_fixture(inner);
             let stream = Stream::generation();
             let _ctx = StreamContext::new(stream);
-            let (prefill_logits, state) = inner.dflash2_prefill(prefix, 0, stream)?;
+            let (prefill_logits, state) = dflash2_prefill(inner, prefix, 0, stream)?;
             prefill_logits.eval();
             inner.dflash2_turn_state = Some(state);
             let input = MxArray::from_int32(ids, &[1, ids.len() as i64])?;
@@ -1777,7 +1373,7 @@ mod tests {
         let mut reference = None;
         for (rows, builds) in [(None, 1), (Some(8), 1), (Some(1), 0), (Some(4), 0)] {
             reset_flat_fixture(&mut inner);
-            let (prefill, state) = inner.dflash2_prefill(&[1, 2, 3, 4], 0, stream)?;
+            let (prefill, state) = dflash2_prefill(&mut inner, &[1, 2, 3, 4], 0, stream)?;
             prefill.eval();
             inner.dflash2_turn_state = Some(state);
             let budget = rows
@@ -1826,7 +1422,7 @@ mod tests {
         reset_flat_fixture(&mut inner);
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
-        let (prefill_logits, state) = inner.dflash2_prefill(&[1, 2, 3, 4], 0, stream)?;
+        let (prefill_logits, state) = dflash2_prefill(&mut inner, &[1, 2, 3, 4], 0, stream)?;
         // Production loading materializes every weight before tracing. Force
         // the random fixture's target weights before the shapeless invoke too.
         prefill_logits.eval();
@@ -1849,12 +1445,41 @@ mod tests {
             "published offsets roll back before propagating failure"
         );
         drop(step);
-        let _ = inner.dflash2_fail_closed(error);
+        let _ = dflash2_fail_closed(&mut inner, error);
         assert!(inner.caches.is_none());
         assert!(inner.dflash2_context.is_none());
         assert!(!inner.dflash2_flat_lane_authoritative);
         Ok(())
     }
+    #[test]
+    fn prefix_event_names_the_owner_flip() -> Result<()> {
+        use crate::models::qwen3_5::dflash2_state::trace::capture::capture_prefix_events;
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        let mut inner = tiny_dflash_inner(0xDFA5_3603);
+        let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
+        let (result, events) = capture_prefix_events(|| -> Result<u32> {
+            let first: Vec<u32> = (0..20).map(|i| (i * 3) % 15 + 1).collect();
+            ChatBackend::set_cache_owner_id(&mut inner, "owner-a", Some("root"));
+            run_tiny_dflash_turn(&mut inner, &tokenizer, &first, true, 2)?;
+            let second: Vec<u32> = inner
+                .cached_token_history
+                .iter()
+                .copied()
+                .chain([2, 3])
+                .collect();
+            ChatBackend::set_cache_owner_id(&mut inner, "owner-b", Some("root"));
+            Ok(run_tiny_dflash_turn(&mut inner, &tokenizer, &second, true, 2)?.cached_tokens)
+        });
+        assert_eq!(result?, 0);
+        assert_eq!(events.len(), 2, "one event per turn: {events:?}");
+        assert_eq!(events[0]["miss_reason"], "cold_first");
+        assert_eq!(events[1]["hit_kind"], "none");
+        assert_eq!(events[1]["miss_reason"], "invalidated:set_cache_owner_id");
+        Ok(())
+    }
+
     #[test]
     fn retained_draft_context_cannot_cross_owner_or_root_identity() -> Result<()> {
         if !unsafe { mlx_sys::mlx_metal_is_available() } {
@@ -1899,7 +1524,7 @@ mod tests {
         let mut reference = None;
         for pass in 0..2 {
             reset_flat_fixture(&mut inner);
-            let (logits, state) = inner.dflash2_prefill(&[1, 2, 3, 4], 0, stream)?;
+            let (logits, state) = dflash2_prefill(&mut inner, &[1, 2, 3, 4], 0, stream)?;
             logits.eval();
             inner.dflash2_turn_state = Some(state);
             let mut step = inner.begin_dspark_decode(7)?;
@@ -1928,9 +1553,10 @@ mod tests {
                 step.verify(&ids)?.logits.eval();
                 drop(step);
                 inner.dflash2_flat_lane_authoritative = true;
-                let error = inner.dflash2_fail_closed(Error::from_reason(
-                    "injected interruption after full-width context commit",
-                ));
+                let error = dflash2_fail_closed(
+                    &mut inner,
+                    Error::from_reason("injected interruption after full-width context commit"),
+                );
                 assert!(error.reason.contains("injected interruption"));
                 assert!(inner.caches.is_none());
                 assert!(inner.dflash2_context.is_none());
@@ -1994,7 +1620,7 @@ mod tests {
             let mut reference = None;
             for deferred in [false, true] {
                 reset_flat_fixture(&mut inner);
-                let (prefill, state) = inner.dflash2_prefill(&[1, 2, 3, 4], 0, stream)?;
+                let (prefill, state) = dflash2_prefill(&mut inner, &[1, 2, 3, 4], 0, stream)?;
                 prefill.eval();
                 inner.dflash2_turn_state = Some(state);
                 let mut step = inner.begin_dspark_decode(7)?;
@@ -2074,7 +1700,7 @@ mod tests {
         let mut reference = None;
         for pass in 0..3 {
             reset_flat_fixture(&mut inner);
-            let (prefill, state) = inner.dflash2_prefill(&[1, 2, 3, 4], 0, stream)?;
+            let (prefill, state) = dflash2_prefill(&mut inner, &[1, 2, 3, 4], 0, stream)?;
             prefill.eval();
             inner.dflash2_turn_state = Some(state);
             let mut step = inner.begin_dspark_decode(7)?;
@@ -2121,7 +1747,7 @@ mod tests {
                 step.finish()?;
                 break;
             };
-            let _ = inner.dflash2_fail_closed(error);
+            let _ = dflash2_fail_closed(&mut inner, error);
             assert!(inner.caches.is_none());
             assert!(inner.dflash2_context.is_none());
             assert!(inner.dflash2_turn_state.is_none());
@@ -2152,8 +1778,7 @@ mod tests {
             ))),
         );
 
-        let err = inner
-            .dflash2_prefill(&[1, 2, 3, 4], 0, Stream::generation())
+        let err = dflash2_prefill(&mut inner, &[1, 2, 3, 4], 0, Stream::generation())
             .err()
             .expect("a cancelled prefill must not run its first chunk");
         assert_eq!(err.reason, PREFILL_CANCELLED);
@@ -2192,7 +1817,7 @@ mod tests {
                 audio: &[],
             },
         };
-        let err = match inner.dflash2_chat_turn(&mut args) {
+        let err = match dflash2_chat_turn(&mut inner, &mut args) {
             Ok(_) => panic!("a turn cancelled before its prefill must not complete"),
             Err(e) => e,
         };

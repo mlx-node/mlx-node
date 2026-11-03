@@ -171,6 +171,12 @@ fn default_norm_topk_prob() -> bool {
 }
 
 impl Qwen3_5MoeConfig {
+    /// Tokens per paged KV block; also the granularity of DFlash2 prefix
+    /// accounting.
+    pub(crate) fn paged_block_size(&self) -> u32 {
+        self.paged_block_size.unwrap_or(16)
+    }
+
     /// BF16 bytes for one request's complete GDN conv + recurrent state.
     /// The MoE feed-forward layers are stateless; full-attention K/V is
     /// accounted independently by the paged allocator.

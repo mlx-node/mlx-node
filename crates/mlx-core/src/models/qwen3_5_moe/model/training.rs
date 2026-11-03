@@ -1442,7 +1442,7 @@ impl Qwen35MoeInner {
         if let Some(draft) = &self.dflash2 {
             draft.invalidate_compiled();
         }
-        self.invalidate_dflash2_context();
+        self.invalidate_dflash2_context("apply_gradients_inner");
         // Apply updated parameters directly to model fields
         for (name, updated_param) in updated_params.iter() {
             if name == "lm_head.weight" {

@@ -84,6 +84,8 @@ impl ChatBackend for Qwen35Inner {
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
+        self.dflash2_prefix
+            .note_drop(reset_drop_site(scope), DropKind::Invalidated);
         match scope {
             // Prefix-miss reset: reset each live layer cache, then install a
             // fresh hybrid cache vec. PRESERVES `cached_token_history` /
@@ -384,7 +386,9 @@ impl ChatBackend for Qwen35Inner {
         // core retains the algorithm-specific MTP gate and AR fallback.
         debug_assert!(args.media.is_empty());
         match args.plan.decoder {
-            DecoderPlan::Speculative(SpeculativeKind::DraftModel) => self.dflash2_chat_turn(args),
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel) => {
+                crate::models::qwen3_5::dflash2_turn::dflash2_chat_turn(self, args)
+            }
             DecoderPlan::Speculative(SpeculativeKind::NativeMtp) => self.dense_whole_turn(args),
             _ => Err(Error::from_reason(
                 "Qwen3.5 speculative turn received a non-speculative decoder plan",
