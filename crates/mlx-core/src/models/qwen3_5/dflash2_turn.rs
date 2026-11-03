@@ -84,10 +84,8 @@ impl PrefillCapture {
 /// First prompt row whose draft K/V a prefill of `[resume, end)` projects:
 /// each layer's sliding cache keeps only the newest `window_rows` rows, so
 /// older rows would be evicted unread and only advance length and
-/// provenance (`record_only`). A capture armed at `capture > resume` keeps
-/// the rows its snapshot reads, `[capture - window_rows, capture)`. Moving
-/// this row changes the widths of the cold appends, which changes draft K/V
-/// bits on the tiled quantized kernels, so turns without a capture keep it.
+/// provenance (`record_only`). A capture armed at `capture > resume` needs
+/// the rows its snapshot reads, `[capture - window_rows, capture)`.
 pub(crate) fn draft_keep_from(
     resume: usize,
     end: usize,
@@ -174,6 +172,14 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// When set, collects every `(first row, rows)` append the prefill makes
+    /// to the live draft context on this thread.
+    pub(crate) static LIVE_DRAFT_APPENDS: std::cell::RefCell<Option<Vec<(usize, usize)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn prefill_chunk_cancelled<T: DFlash2Target>(target: &T, chunk: usize) -> bool {
     #[cfg(test)]
     if CANCEL_AT_PREFILL_CHUNK.with(std::cell::Cell::get) == Some(chunk)
@@ -226,16 +232,27 @@ pub(crate) fn dflash2_prefill<T: DFlash2Target>(
     };
     let base_usize = position_base.max(0) as usize;
     let window_rows = draft_config.sliding_window.saturating_sub(1);
+    let end_row = base_usize + tokens.len();
     let capture_row = capture
         .as_ref()
         .map(|capture| capture.row)
-        .filter(|&row| row > base_usize && row <= base_usize + tokens.len());
-    let keep_from = draft_keep_from(
-        base_usize,
-        base_usize + tokens.len(),
-        window_rows,
-        capture_row,
-    );
+        .filter(|&row| row > base_usize && row <= end_row);
+    // The live context keeps an unarmed prefill's schedule: the append widths
+    // set the draft K/V bits on the tiled quantized kernels. When the capture
+    // needs rows that schedule only records, a shadow context runs the
+    // capture's schedule up to its row and takes the snapshot.
+    let keep_from = draft_keep_from(base_usize, end_row, window_rows, None);
+    let capture_keep_from = draft_keep_from(base_usize, end_row, window_rows, capture_row);
+    let mut shadow = match capture_row {
+        Some(_) if capture_keep_from < keep_from => Some(if capture_keep_from == base_usize {
+            context.deep_copy()?
+        } else {
+            let mut shadow = DFlash2ContextCache::new(&draft_config);
+            shadow.record_only(context.token_history())?;
+            shadow
+        }),
+        _ => None,
+    };
     let mut snapshot = None;
     let mut cell = None;
     let mut offset = 0usize;
@@ -273,34 +290,36 @@ pub(crate) fn dflash2_prefill<T: DFlash2Target>(
         let draft = target
             .dflash2()
             .ok_or_else(|| Error::from_reason(format!("{label} DFlash2 model disappeared")))?;
-        if chunk_end <= keep_from {
-            context.record_only(&tokens[offset..end])?;
-        } else {
-            let head = keep_from.saturating_sub(base_usize + offset);
-            if head > 0 {
-                context.record_only(&tokens[offset..offset + head])?;
+        let rows = ChunkRows {
+            tokens,
+            base: base_usize,
+            offset,
+            end,
+        };
+        let live_capture = capture_row.filter(|_| shadow.is_none());
+        let (window, _appended) =
+            advance_draft_context(draft, &mut context, &taps, &rows, keep_from, live_capture)?;
+        #[cfg(test)]
+        LIVE_DRAFT_APPENDS.with(|log| {
+            if let (Some(log), Some(appended)) = (log.borrow_mut().as_mut(), _appended) {
+                log.push(appended);
             }
-            // Rows at or past `keep_from` survive in the sliding window:
-            // fuse + project only that tail (RoPE keys are per-row at
-            // absolute base + row, so a sliced append is identical).
-            let fused = if head == 0 {
-                draft.fuse_context(&taps)?
-            } else {
-                let tail_taps = taps
-                    .iter()
-                    .map(|tap| tap.slice_axis(1, head as i64, (end - offset) as i64))
-                    .collect::<Result<Vec<_>>>()?;
-                draft.fuse_context(&tail_taps)?
-            };
-            let appended = &tokens[offset + head..end];
-            let projected = context.project(draft, &fused, (base_usize + offset + head) as i32)?;
-            if let Some(row) = capture_row
-                && base_usize + offset < row
-                && row <= chunk_end
-            {
-                snapshot = Some(context.snapshot_window_at(row as i32, &projected, appended)?);
-            }
-            context.append_projected(projected, appended)?;
+        });
+        if window.is_some() {
+            snapshot = window;
+        }
+        if let Some(shadow_context) = shadow.as_mut()
+            && let (Some(window), _) = advance_draft_context(
+                draft,
+                shadow_context,
+                &taps,
+                &rows,
+                capture_keep_from,
+                capture_row,
+            )?
+        {
+            snapshot = Some(window);
+            shadow = None;
         }
         // `LastRow` span already reduced the logits to the chunk's final
         // row ([1, 1, vocab]); only non-final chunks' rows are dropped.
@@ -309,6 +328,9 @@ pub(crate) fn dflash2_prefill<T: DFlash2Target>(
         if end < tokens.len() {
             target.eval_layer_caches()?;
             context.eval()?;
+            if let Some(shadow_context) = &shadow {
+                shadow_context.eval()?;
+            }
             crate::array::clear_cache();
         }
         offset = end;
@@ -324,6 +346,66 @@ pub(crate) fn dflash2_prefill<T: DFlash2Target>(
             next_position: position_base.saturating_add(tokens.len() as i32),
         },
     ))
+}
+
+/// One prefill chunk: prompt rows `[base + offset, base + end)` of a prefill
+/// of `tokens` at `base`.
+struct ChunkRows<'a> {
+    tokens: &'a [u32],
+    base: usize,
+    offset: usize,
+    end: usize,
+}
+
+/// Advances `context` over one prefill chunk from its taps: rows below
+/// `keep_from` only advance length and provenance, the rest are fused and
+/// projected in one append. Returns the window snapshot at `capture` when
+/// that row lies in the chunk, and the appended `(first row, rows)`.
+fn advance_draft_context(
+    draft: &DFlash2Model,
+    context: &mut DFlash2ContextCache,
+    taps: &[MxArray],
+    rows: &ChunkRows<'_>,
+    keep_from: usize,
+    capture: Option<usize>,
+) -> Result<(Option<DFlash2ContextCache>, Option<(usize, usize)>)> {
+    let ChunkRows {
+        tokens,
+        base,
+        offset,
+        end,
+    } = *rows;
+    let chunk_end = base + end;
+    if chunk_end <= keep_from {
+        context.record_only(&tokens[offset..end])?;
+        return Ok((None, None));
+    }
+    let head = keep_from.saturating_sub(base + offset);
+    if head > 0 {
+        context.record_only(&tokens[offset..offset + head])?;
+    }
+    // Rows at or past `keep_from` survive in the sliding window: fuse +
+    // project only that tail (RoPE keys are per-row at absolute base + row,
+    // so a sliced append is identical).
+    let fused = if head == 0 {
+        draft.fuse_context(taps)?
+    } else {
+        let tail_taps = taps
+            .iter()
+            .map(|tap| tap.slice_axis(1, head as i64, (end - offset) as i64))
+            .collect::<Result<Vec<_>>>()?;
+        draft.fuse_context(&tail_taps)?
+    };
+    let appended = &tokens[offset + head..end];
+    let projected = context.project(draft, &fused, (base + offset + head) as i32)?;
+    let snapshot = match capture {
+        Some(row) if base + offset < row && row <= chunk_end => {
+            Some(context.snapshot_window_at(row as i32, &projected, appended)?)
+        }
+        _ => None,
+    };
+    context.append_projected(projected, appended)?;
+    Ok((snapshot, Some((base + offset + head, appended.len()))))
 }
 
 /// Activation element type the target's full-attention caches hold (BF16

@@ -893,7 +893,8 @@ pub(crate) mod tests {
     use crate::models::forward::PREFILL_CANCELLED;
     use crate::models::quantized_linear::LinearProj;
     use crate::models::qwen3_5::dflash2_turn::{
-        PrefillCapture, dflash2_chat_turn, dflash2_prefill, flat_attention_frontier,
+        LIVE_DRAFT_APPENDS, PrefillCapture, dflash2_chat_turn, dflash2_prefill,
+        flat_attention_frontier,
     };
     use crate::models::qwen3_5::gated_delta_net::{GdnCapturePlan, GdnCell};
     use crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache;
@@ -1413,6 +1414,8 @@ pub(crate) mod tests {
         prefill_windows: Vec<(Vec<i64>, Vec<u32>)>,
         decode_windows: Vec<(Vec<i64>, Vec<u32>)>,
         snapshot: Option<DFlash2ContextCache>,
+        /// `(first row, rows)` of every live draft-context append.
+        appends: Vec<(usize, usize)>,
     }
 
     fn window_fingerprints(context: &DFlash2ContextCache) -> Result<Vec<(Vec<i64>, Vec<u32>)>> {
@@ -1440,7 +1443,12 @@ pub(crate) mod tests {
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let mut capture = capture_row.map(PrefillCapture::at);
-        let (prefill_logits, state) = dflash2_prefill(inner, prompt, 0, capture.as_mut(), stream)?;
+        LIVE_DRAFT_APPENDS.with(|log| *log.borrow_mut() = Some(Vec::new()));
+        let prefilled = dflash2_prefill(inner, prompt, 0, capture.as_mut(), stream);
+        let appends = LIVE_DRAFT_APPENDS
+            .with(|log| log.borrow_mut().take())
+            .unwrap_or_default();
+        let (prefill_logits, state) = prefilled?;
         let prefill_logits = logits_bits(&prefill_logits)?;
         let prefill_windows = window_fingerprints(&state.context)?;
         inner.dflash2_turn_state = Some(state);
@@ -1517,6 +1525,7 @@ pub(crate) mod tests {
             prefill_windows,
             decode_windows,
             snapshot: capture.and_then(|capture| capture.window),
+            appends,
         })
     }
 
@@ -1660,14 +1669,14 @@ pub(crate) mod tests {
             - 1
     }
 
-    /// Arming a window capture widens the prefill's kept draft rows to the
-    /// snapshot's window (here `R < N - window`, so the cold tail append
-    /// grows from 7 to up to 21 rows). On these fixtures that leaves every
-    /// bit of the turn as without a capture (X0): prefill logits, the live
-    /// draft windows after prefill and after forced cycles, every per-cycle
-    /// verify logit, the target caches, provenance, frontier and the
-    /// continuation draft. The full draft buffers are excluded: their layout
-    /// follows the append schedule, not the live rows. The snapshot holds
+    /// Arming a window capture at `R < N - window` needs draft rows an
+    /// unarmed prefill only records; the live context still makes the
+    /// unarmed appends, row for row, since append widths set draft K/V bits
+    /// on the tiled quantized kernels. Every bit of the turn equals the run
+    /// without a capture (X0): prefill logits, the live draft windows after
+    /// prefill and after forced cycles, the full draft buffers, every
+    /// per-cycle verify logit, the target caches, provenance, frontier and
+    /// the continuation draft. The snapshot holds
     /// length R, provenance `[.., R)` and `min(R, window)` rows, and at
     /// `R = N` it is the prefill's own window bit for bit.
     #[test]
@@ -1684,9 +1693,15 @@ pub(crate) mod tests {
             assert!(10 + window_rows < prompt.len(), "{label}: R < N - window");
             let plain = run_prefix_trace(&mut inner, &prompt, None, 3)?;
             assert!(plain.snapshot.is_none());
+            assert_eq!(
+                plain.appends,
+                [(prompt.len() - window_rows, window_rows)],
+                "{label}: the unarmed prefill appends only the newest window"
+            );
             for row in [10usize, 3, 17, 20, 24] {
                 let case = format!("{label} R={row}");
                 let armed = run_prefix_trace(&mut inner, &prompt, Some(row), 3)?;
+                assert_eq!(armed.appends, plain.appends, "{case}: append widths");
                 assert_eq!(
                     armed.prefill_logits, plain.prefill_logits,
                     "{case}: prefill logits"
@@ -1699,9 +1714,7 @@ pub(crate) mod tests {
                     armed.decode_windows, plain.decode_windows,
                     "{case}: decode windows"
                 );
-                let mut armed_trace = armed.trace;
-                armed_trace.draft_cache.clone_from(&plain.trace.draft_cache);
-                assert_trace_eq(&armed_trace, &plain.trace, &case);
+                assert_trace_eq(&armed.trace, &plain.trace, &case);
                 let snapshot = armed.snapshot.expect("armed capture snapshot");
                 assert_snapshot_shape(&snapshot, &prompt, row, window_rows, &case);
                 if row == prompt.len() {
@@ -1724,8 +1737,8 @@ pub(crate) mod tests {
     /// Capture rows across the 2048-row prefill chunk edge and on a warm
     /// prefill whose capture gap is shorter than the window (so the
     /// snapshot reads the previous turn's window rows). The prefill keeps
-    /// its logits, target caches and live draft windows bit for bit vs an
-    /// unarmed prefill (X0 on this fixture). Each snapshot holds length R,
+    /// its live draft appends row for row, and its logits, target caches and
+    /// live draft windows bit for bit, vs an unarmed prefill (X0). Each snapshot holds length R,
     /// provenance `[.., R)`, `min(R, window)` rows, and every row it shares
     /// with the final window, or with the previous turn's window, is
     /// bitwise that row.
@@ -1741,18 +1754,23 @@ pub(crate) mod tests {
                        base: i32,
                        row: Option<usize>|
          -> Result<(
-            Vec<u32>,
+            (Vec<u32>, Vec<(usize, usize)>),
             Vec<(Vec<i64>, Vec<u32>)>,
             DFlash2ContextCache,
             Option<DFlash2ContextCache>,
         )> {
             let mut capture = row.map(PrefillCapture::at);
-            let (logits, state) = dflash2_prefill(inner, prompt, base, capture.as_mut(), stream)?;
+            LIVE_DRAFT_APPENDS.with(|log| *log.borrow_mut() = Some(Vec::new()));
+            let prefilled = dflash2_prefill(inner, prompt, base, capture.as_mut(), stream);
+            let appends = LIVE_DRAFT_APPENDS
+                .with(|log| log.borrow_mut().take())
+                .unwrap_or_default();
+            let (logits, state) = prefilled?;
             let logits = logits_bits(&logits)?;
             let target =
                 live_target_cache_fingerprints(inner.caches.as_ref().expect("fixture caches"))?;
             Ok((
-                logits,
+                (logits, appends),
                 target,
                 state.context,
                 capture.and_then(|capture| capture.window),
@@ -1770,7 +1788,7 @@ pub(crate) mod tests {
             let case = format!("cold R={row}");
             reset_flat_fixture(&mut inner);
             let (logits, target, context, snapshot) = prefill(&mut inner, &prompt, 0, Some(row))?;
-            assert_eq!(logits, plain_logits, "{case}: logits");
+            assert_eq!(logits, plain_logits, "{case}: logits, draft appends");
             assert_eq!(target, plain_target, "{case}: target caches");
             assert_eq!(
                 window_fingerprints(&context)?,
@@ -1804,7 +1822,7 @@ pub(crate) mod tests {
         let previous = cold(&mut inner)?;
         inner.dflash2_context = Some(previous);
         let (logits, target, context, snapshot) = prefill(&mut inner, second, 30, Some(34))?;
-        assert_eq!(logits, plain_logits, "warm: logits");
+        assert_eq!(logits, plain_logits, "warm: logits, draft appends");
         assert_eq!(target, plain_target, "warm: target caches");
         assert_eq!(
             window_fingerprints(&context)?,
@@ -3444,7 +3462,7 @@ pub(crate) mod tests {
         }
 
         // A cold prefill with a window capture armed at R < N - window: the
-        // kept draft rows widen to the snapshot's window.
+        // snapshot reads draft rows the live schedule only records.
         for (case, mut inner) in [
             (
                 "capture_armed_bf16_d64",
