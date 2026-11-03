@@ -431,6 +431,17 @@ export function withDefaultModel(passthrough: string[], defaultModelId: string):
   return ['-m', defaultModelId, ...passthrough];
 }
 
+const DISABLE_WEB_SEARCH_FLAG = '--disable-web-search';
+
+/**
+ * `mlx serve` rejects grok's server-side `web_search` tool type, so every
+ * served launch turns it off (subagents inherit the flag). The flag is a clap
+ * `SetTrue`, which errors when repeated, so a user-supplied one is kept as is.
+ */
+export function withWebSearchDisabled(argv: string[]): string[] {
+  return collectAgentOptionNames(argv).has(DISABLE_WEB_SEARCH_FLAG) ? argv : [DISABLE_WEB_SEARCH_FLAG, ...argv];
+}
+
 /** The default model id grok's `[models]` table persisted. */
 export interface PersistedGrokDefault {
   modelId: string;
@@ -687,7 +698,7 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     models.map((m) => m.name),
     persisted,
   );
-  const agentArgv = withDefaultModel(scan.passthrough, modelId);
+  const agentArgv = withWebSearchDisabled(withDefaultModel(scan.passthrough, modelId));
 
   process.exitCode = await launch({
     argv: agentArgv,

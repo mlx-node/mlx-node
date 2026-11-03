@@ -1896,6 +1896,30 @@ describe('launchGrokAgent server gating', () => {
     expect(spawnAgent.envs[0]!.GROK_MODELS_BASE_URL).toBeUndefined();
   });
 
+  it('turns off the xAI media tools a served launch cannot answer, keeping a user override', async () => {
+    const mediaEnv = ['GROK_IMAGE_GEN', 'GROK_IMAGE_EDIT', 'GROK_VIDEO_GEN'] as const;
+    const saved = mediaEnv.map((name) => process.env[name]);
+    try {
+      for (const name of mediaEnv) delete process.env[name];
+      await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent });
+      for (const name of mediaEnv) expect(spawnAgent.envs[0]![name]).toBe('0');
+
+      process.env.GROK_IMAGE_GEN = '1';
+      await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent });
+      expect(spawnAgent.envs[1]!.GROK_IMAGE_GEN).toBe('1');
+      expect(spawnAgent.envs[1]!.GROK_VIDEO_GEN).toBe('0');
+
+      delete process.env.GROK_IMAGE_GEN;
+      await launchGrokAgent({ argv: ['--version'], needsServer: false, spawnServe, spawnAgent });
+      for (const name of mediaEnv) expect(spawnAgent.envs[2]![name]).toBeUndefined();
+    } finally {
+      mediaEnv.forEach((name, i) => {
+        if (saved[i] === undefined) delete process.env[name];
+        else process.env[name] = saved[i];
+      });
+    }
+  });
+
   it('kills the serve child when readiness fails', async () => {
     // No banner line — the child lives but never reports a port. The
     // rejection must still reap it, or `mlx agent` leaves an orphan serve

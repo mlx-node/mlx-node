@@ -832,6 +832,8 @@ mlx agent --models-dir ./models # use a specific local models directory
 
 Almost every flag belongs to the agent binary and is forwarded verbatim; `mlx agent` only handles the options below before handing off (`--models-dir`, `--trace`/`--trace-dir`, `--no-persist-cache`, and mlx-side help).
 
+Because the backend is the local `mlx serve`, `mlx agent` always passes `--disable-web-search` (grok's `web_search` is an xAI server-side tool) and sets `GROK_IMAGE_GEN=0`, `GROK_IMAGE_EDIT=0` and `GROK_VIDEO_GEN=0` unless you exported them yourself.
+
 For local Qwen3.8 models, `--thinking low`, `medium`, and `xhigh` select the
 checkpoint's reasoning effort. `minimal` aliases `low`; `high` and `max` alias
 `xhigh`. Only `--thinking off` disables reasoning. Independently,

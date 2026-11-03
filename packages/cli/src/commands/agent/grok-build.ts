@@ -22,7 +22,18 @@
 
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync, type Stats } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+  type Stats,
+} from 'node:fs';
 import { connect, createServer, type Server } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -1739,6 +1750,14 @@ function waitForServe(child: ChildProcess, timeoutMs: number): Promise<string> {
 }
 
 /**
+ * Grok's xAI media tools (`image_gen`, `image_edit`, `image_to_video` +
+ * `reference_to_video`) post to the xAI API base URL, which a served launch
+ * points at `mlx serve`; it has no media endpoints. Each env var outranks
+ * `[features]` in grok's flag ladder; a value the user already exported wins.
+ */
+const LOCAL_BACKEND_DISABLED_TOOL_ENV = ['GROK_IMAGE_GEN', 'GROK_IMAGE_EDIT', 'GROK_VIDEO_GEN'] as const;
+
+/**
  * Boot the inference host and exec the Grok Build binary over it.
  * Resolves with the agent's exit code; `run()` maps it to process.exitCode.
  */
@@ -1764,6 +1783,7 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
     env.GROK_XAI_API_BASE_URL = serve.url;
     env.XAI_API_KEY = serve.token || 'mlx-local';
     env.GROK_DISABLE_AUTOUPDATER = '1';
+    for (const name of LOCAL_BACKEND_DISABLED_TOOL_ENV) env[name] ??= '0';
   }
 
   const spawnAgent = opts.spawnAgent ?? ((b, a, so) => spawn(b, a, so));
