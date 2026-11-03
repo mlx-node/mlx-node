@@ -542,10 +542,12 @@ function totalsLine(t: OfflineTotals): string {
 }
 
 function loadWorkload(sessionsDir: string): { sessions: Session[]; requests: AgentRequest[] } {
-  const sessions = readSessions(sessionsDir);
+  const recorded = resolve(sessionsDir) === resolve(RECORDED_SESSIONS_DIR);
+  // The default dir keeps growing with new agent runs; keep only the recorded ones.
+  const sessions = readSessions(sessionsDir).filter((session) => !recorded || session.id in RECORDED_REQUESTS);
   if (sessions.length === 0) throw new Error(`${sessionsDir}: no session folders`);
   const requests = sessions.flatMap((session) => buildRequests(session));
-  if (resolve(sessionsDir) === resolve(RECORDED_SESSIONS_DIR)) {
+  if (recorded) {
     for (const [id, expected] of Object.entries(RECORDED_REQUESTS)) {
       const got = requests.filter((request) => request.session === id).length;
       if (got !== expected) throw new Error(`${id}: ${got} requests, the recorded run made ${expected}`);
