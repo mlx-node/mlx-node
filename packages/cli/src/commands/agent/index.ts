@@ -317,7 +317,9 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   };
 }
 
-const DEFAULT_AGENT_LOG_FILTER = 'mlx_core::inference=info,mlx_core::decode=info';
+// `Targets` picks the longest matching target, so the crate-wide `warn` floors
+// never mask the more specific `info` directives regardless of order.
+const DEFAULT_AGENT_LOG_FILTER = 'mlx_core=warn,mlx_paged_attn=warn,mlx_core::inference=info,mlx_core::decode=info';
 
 export interface AgentTracingSetupOptions {
   /** @internal Hermetic environment seam for tests. */

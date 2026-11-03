@@ -365,7 +365,7 @@ describe('configureAgentTracing', () => {
       const expectedDir = join(home, '.mlx-node', 'logs', 'agent', '2026-07-14T01-02-03-456Z-pid-4242');
       const expectedFile = join(expectedDir, 'inference.log');
       expect(logFile).toBe(expectedFile);
-      expect(env.MLX_NODE_LOG).toBe('mlx_core::inference=info,mlx_core::decode=info');
+      expect(env.MLX_NODE_LOG).toBe('mlx_core=warn,mlx_paged_attn=warn,mlx_core::inference=info,mlx_core::decode=info');
       expect(env.MLX_NODE_LOG_FILE).toBe(expectedFile);
       expect(statSync(expectedDir).mode & 0o777).toBe(0o700);
       expect(statSync(expectedFile).mode & 0o777).toBe(0o600);
@@ -379,7 +379,7 @@ describe('configureAgentTracing', () => {
       const env: NodeJS.ProcessEnv = {};
       const logFile = configureAgentTracing({ trace: false, traceDir }, { env, announce: () => {} });
       expect(logFile).toBe(join(traceDir, 'inference.log'));
-      expect(env.MLX_NODE_LOG).toBe('mlx_core::inference=info,mlx_core::decode=info');
+      expect(env.MLX_NODE_LOG).toBe('mlx_core=warn,mlx_paged_attn=warn,mlx_core::inference=info,mlx_core::decode=info');
       expect(env.MLX_NODE_LOG_FILE).toBe(logFile);
       expect(statSync(traceDir).mode & 0o777).toBe(0o700);
       expect(statSync(logFile!).mode & 0o777).toBe(0o600);
@@ -727,7 +727,9 @@ describe('run() argv routing', () => {
       deps.resolveModelsDir = (explicit) => {
         // This dependency is resolved after the tracing setup, so observing
         // both values here guards the required ordering.
-        expect(process.env.MLX_NODE_LOG).toBe('mlx_core::inference=info,mlx_core::decode=info');
+        expect(process.env.MLX_NODE_LOG).toBe(
+          'mlx_core=warn,mlx_paged_attn=warn,mlx_core::inference=info,mlx_core::decode=info',
+        );
         expect(process.env.MLX_NODE_LOG_FILE).toBe(join(logDir, 'inference.log'));
         return baseResolve(explicit);
       };
