@@ -14,6 +14,12 @@
 //!   accepts any JSON there).
 //! - A typed `null` stays `null` (vLLM turns it into the string `"null"` under
 //!   a string schema, which breaks `Option` fields in strict deserializers).
+//! - A typed scalar (JSON / LFM2 / nested JSON) the schema already admits is
+//!   kept: `"null"` under `["string","null"]` stays a string (vLLM re-coerces
+//!   every string by priority). Priority applies only to bare text and to
+//!   typed values the schema does not admit.
+//! - `allOf` branches intersect (vLLM unions them); an empty intersection
+//!   leaves the value as parsed.
 
 use std::sync::Arc;
 
@@ -158,16 +164,42 @@ impl TypeSet {
             Value::Object(_) => Self::OBJECT,
         };
     }
+
+    /// `allOf` semantics; `integer` is a subset of `number`.
+    fn intersect(self, other: Self) -> Self {
+        let mut bits = self.0 & other.0;
+        if (self.has(Self::NUMBER) && other.has(Self::INTEGER))
+            || (self.has(Self::INTEGER) && other.has(Self::NUMBER))
+        {
+            bits |= Self::INTEGER;
+        }
+        Self(bits)
+    }
+
+    fn admits(self, value: &Value) -> bool {
+        match value {
+            Value::Null => self.has(Self::NULL),
+            Value::Bool(_) => self.has(Self::BOOLEAN),
+            Value::Number(n) if n.is_i64() || n.is_u64() => {
+                self.has(Self::INTEGER) || self.has(Self::NUMBER)
+            }
+            Value::Number(_) => self.has(Self::NUMBER),
+            Value::String(_) => self.has(Self::STRING),
+            Value::Array(_) => self.has(Self::ARRAY),
+            Value::Object(_) => self.has(Self::OBJECT),
+        }
+    }
 }
 
 /// Types a property schema admits, from `type`, `enum` member kinds and
-/// `anyOf` / `oneOf` / `allOf`. `None` when nothing recognizable is declared
-/// (`$ref`-only, untyped, or unknown type names).
+/// `anyOf` / `oneOf` (union) and `allOf` (intersection). `None` when nothing
+/// recognizable is declared (`$ref`-only, untyped, or unknown type names) or
+/// the `allOf` intersection is empty.
 fn schema_types(schema: &Value) -> Option<TypeSet> {
-    fn collect(schema: &Value, set: &mut TypeSet) {
-        let Some(schema) = schema.as_object() else {
-            return;
-        };
+    /// `None` = unconstrained; `Some(TypeSet(0))` = unsatisfiable.
+    fn resolve(schema: &Value) -> Option<TypeSet> {
+        let schema = schema.as_object()?;
+        let mut set = TypeSet::default();
         match schema.get("type") {
             Some(Value::String(t)) => set.insert_name(t),
             Some(Value::Array(ts)) => ts
@@ -179,15 +211,23 @@ fn schema_types(schema: &Value) -> Option<TypeSet> {
         if let Some(Value::Array(members)) = schema.get("enum") {
             members.iter().for_each(|m| set.insert_value_kind(m));
         }
-        for key in ["anyOf", "oneOf", "allOf"] {
+        for key in ["anyOf", "oneOf"] {
             if let Some(Value::Array(choices)) = schema.get(key) {
-                choices.iter().for_each(|c| collect(c, set));
+                choices
+                    .iter()
+                    .filter_map(resolve)
+                    .for_each(|c| set.0 |= c.0);
             }
         }
+        let mut resolved = (set.0 != 0).then_some(set);
+        if let Some(Value::Array(branches)) = schema.get("allOf") {
+            for branch in branches.iter().filter_map(resolve) {
+                resolved = Some(resolved.map_or(branch, |r| r.intersect(branch)));
+            }
+        }
+        resolved
     }
-    let mut set = TypeSet::default();
-    collect(schema, &mut set);
-    (set.0 != 0).then_some(set)
+    resolve(schema).filter(|set| set.0 != 0)
 }
 
 /// `Number.MAX_SAFE_INTEGER`. NAPI hands JS a `BigInt` for any integer beyond
@@ -269,15 +309,20 @@ fn is_integer_literal(raw: &str) -> bool {
 }
 
 /// Coerce an already-typed value against its property schema, recursing
-/// through `properties` and `items`.
+/// through `properties` and `items`. A scalar the schema already admits is
+/// kept as typed.
 fn coerce_value(value: &mut Value, schema: &Value) {
     let Some(schema_obj) = schema.as_object() else {
         return;
     };
+    let types = schema_types(schema);
+    if !value.is_object() && !value.is_array() && types.is_some_and(|t| t.admits(value)) {
+        return;
+    }
     match value {
         Value::Null => {}
         Value::String(s) => {
-            if let Some(types) = schema_types(schema) {
+            if let Some(types) = types {
                 *value = coerce_str(s, types);
             }
         }
@@ -294,7 +339,7 @@ fn coerce_value(value: &mut Value, schema: &Value) {
             }
         }
         Value::Number(_) | Value::Bool(_) => {
-            if let Some(types) = schema_types(schema) {
+            if let Some(types) = types {
                 let coerced = coerce_str(&value.to_string(), types);
                 if coerced != *value && (types.has(TypeSet::STRING) || !coerced.is_string()) {
                     *value = coerced;
@@ -449,6 +494,9 @@ mod tests {
         let mut v = json!(9007199254740993_u64);
         coerce_value(&mut v, &json!({"type": "string"}));
         assert_eq!(v, json!("9007199254740993"));
+        let mut v = json!(9007199254740993_u64);
+        coerce_value(&mut v, &json!({"type": ["integer", "string"]}));
+        assert_eq!(v, json!(9007199254740993_u64));
     }
 
     #[test]
@@ -476,6 +524,10 @@ mod tests {
         assert_eq!(coerce_str("9", types(json!({"type": "int"}))), json!(9));
 
         assert_eq!(schema_types(&json!({"$ref": "#/$defs/x"})), None);
+        assert_eq!(
+            schema_types(&json!({"allOf": [{"$ref": "#/$defs/x"}]})),
+            None
+        );
         assert_eq!(schema_types(&json!({"description": "untyped"})), None);
         assert_eq!(schema_types(&json!({"type": "mystery"})), None);
         assert_eq!(schema_types(&json!("integer")), None);
@@ -505,7 +557,7 @@ mod tests {
 
         let mut v = json!(1.0);
         coerce_value(&mut v, &json!({"type": "number"}));
-        assert_eq!(v, json!(1));
+        assert_eq!(v, json!(1.0));
 
         let mut v = Value::Null;
         coerce_value(&mut v, &json!({"type": "string"}));
@@ -722,5 +774,91 @@ mod tests {
             .unwrap();
         let out = runtime.block_on(call.result()).unwrap();
         assert_eq!(out.tool_calls[0].arguments, json!({"timeout_ms": 300000}));
+    }
+
+    #[test]
+    fn schema_types_intersects_all_of() {
+        let string = types(json!({"type": "string"}));
+        assert_eq!(
+            types(json!({"allOf": [{"type": ["string", "integer"]}, {"type": "string"}]})),
+            string
+        );
+        assert_eq!(
+            types(json!({"type": ["string", "integer"], "allOf": [{"type": "string"}]})),
+            string
+        );
+        assert_eq!(
+            types(json!({"allOf": [{"type": "number"}, {"type": "integer"}]})),
+            types(json!({"type": "integer"}))
+        );
+        assert_eq!(
+            types(json!({"allOf": [{"$ref": "#/$defs/x"}, {"type": "string"}]})),
+            string
+        );
+        assert_eq!(
+            schema_types(&json!({"allOf": [{"type": "integer"}, {"type": "string"}]})),
+            None
+        );
+        assert_eq!(
+            schema_types(&json!({"type": "integer", "allOf": [{"type": "string"}]})),
+            None
+        );
+    }
+
+    const UNION_PROPS: &str =
+        r#"{"content": {"type": ["string", "null"]}, "id": {"type": ["string", "integer"]}}"#;
+    const ALL_OF_PROPS: &str = r#"{"id": {"allOf": [{"type": ["string", "integer"]}, {"type": "string"}]},
+        "n": {"allOf": [{"type": "integer"}, {"type": "string"}]}}"#;
+
+    fn parse_and_coerce(props: &str, text: &str) -> Value {
+        let s = schemas(&[tool("t", Some(props))]);
+        let (_, mut calls) = crate::tools::parse_tool_calls(text);
+        assert_eq!(calls.len(), 1, "{text}");
+        s.coerce_calls(&mut calls);
+        calls.remove(0).arguments
+    }
+
+    #[test]
+    fn typed_json_and_lfm2_values_the_schema_admits_are_kept() {
+        let json_call = "<tool_call>\n{\"name\": \"t\", \"arguments\": {\"content\": \"null\", \"id\": \"00042\"}}\n</tool_call>";
+        assert_eq!(
+            parse_and_coerce(UNION_PROPS, json_call),
+            json!({"content": "null", "id": "00042"})
+        );
+        let lfm2_call = "<|tool_call_start|>[t(content=\"null\", id=\"00042\")]<|tool_call_end|>";
+        assert_eq!(
+            parse_and_coerce(UNION_PROPS, lfm2_call),
+            json!({"content": "null", "id": "00042"})
+        );
+    }
+
+    #[test]
+    fn bare_text_parameters_still_follow_schema_priority() {
+        let chatml = "<tool_call>\n<function=t>\n<parameter=content>\nnull\n</parameter>\n<parameter=id>\n00042\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(
+            parse_and_coerce(UNION_PROPS, chatml),
+            json!({"content": null, "id": 42})
+        );
+    }
+
+    #[test]
+    fn all_of_parameters_coerce_to_the_intersection() {
+        let chatml = "<tool_call>\n<function=t>\n<parameter=id>\n00042\n</parameter>\n<parameter=n>\n7\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(
+            parse_and_coerce(ALL_OF_PROPS, chatml),
+            json!({"id": "00042", "n": "7"})
+        );
+        let json_string =
+            "<tool_call>\n{\"name\": \"t\", \"arguments\": {\"id\": \"00042\"}}\n</tool_call>";
+        assert_eq!(
+            parse_and_coerce(ALL_OF_PROPS, json_string),
+            json!({"id": "00042"})
+        );
+        let json_int =
+            "<tool_call>\n{\"name\": \"t\", \"arguments\": {\"id\": 42, \"n\": 7}}\n</tool_call>";
+        assert_eq!(
+            parse_and_coerce(ALL_OF_PROPS, json_int),
+            json!({"id": "42", "n": 7})
+        );
     }
 }
