@@ -2892,9 +2892,13 @@ mod tests {
         Ok((y, state_carry(state)))
     }
 
-    /// The layer's prompt routing per segment: the fused prefill for a
+    /// A mix of entries chosen per segment length: the fused prefill for a
     /// segment of at least 64 rows, the unfused chain plus the unfused tail
-    /// below that.
+    /// below. Not the layer's routing, which picks one entry for the whole
+    /// window: the fused prefill from 64 rows, the fused tail
+    /// (`gated_delta_update_fused`) for windows of at most 32 rows, and the
+    /// chain for 33..=63 rows. Splitting across entries is bitwise only
+    /// because they agree on any segment.
     fn routed_segment(
         win: &SplitWindow,
         wt: &SplitWeights,
@@ -3027,6 +3031,73 @@ mod tests {
                     assert_eq!(y_ulps, 0, "{} T={t} gated rows differ", tag("routed"));
                     assert_carry_bits(&tag("routed final"), &whole.carry, &routed.carry);
                 }
+            }
+        }
+    }
+
+    /// `gated_delta_update_fused` on rows `[s, e)`: the fused tail the layer
+    /// runs a capture window of at most 32 rows through, segment by segment.
+    fn fused_tail_segment(
+        win: &SplitWindow,
+        wt: &SplitWeights,
+        tiled: bool,
+        s: usize,
+        e: usize,
+        carry: &GdnCarry,
+    ) -> Result<(MxArray, GdnCarry)> {
+        let z = seg(&win.z, s, e);
+        let (out, state) = gated_delta_update_fused(
+            &seg(&win.q_n, s, e),
+            &seg(&win.k_n, s, e),
+            &seg(&win.v, s, e),
+            &seg(&win.a, s, e),
+            &seg(&win.b, s, e),
+            &wt.a_log,
+            &wt.dt_bias,
+            carry.state.as_ref(),
+            None,
+            true,
+            tiled,
+            None,
+            GdnTail {
+                z: &z,
+                norm_weight: &wt.w,
+                eps: 1e-6,
+                state_dst: None,
+            },
+            None,
+        )?
+        .ok_or_else(|| Error::from_reason("fused tail declined"))?;
+        Ok((out, state_carry(state)))
+    }
+
+    /// The fused tail split at every row of a 17..=32-row window (the
+    /// short prefill tails and the prepared-gate windows a capture can land
+    /// in) gives the unsplit dispatch's gated rows and final state bit for
+    /// bit, and each captured state equals the window truncated there.
+    #[test]
+    fn split_fused_tail_matches_unsplit_bit_for_bit() {
+        if !fused_step_launches() {
+            eprintln!("SKIP fused tail split: this device cannot launch the fused GDN step");
+            return;
+        }
+        let wt = split_weights();
+        for (t, tiled) in [(17usize, true), (24, false), (32, true), (32, false)] {
+            let win = split_window(t, &wt);
+            let cuts: Vec<usize> = (1..t).collect();
+            let random = state_carry(rand_f32(&[1, SPLIT_HV, SPLIT_D, SPLIT_D]));
+            let zero = GdnCarry {
+                state: None,
+                history: None,
+            };
+            for (init_name, init) in [("zero", &zero), ("random", &random)] {
+                assert_split_identity(
+                    &format!("fused_tail tiled={tiled} init={init_name}"),
+                    t,
+                    &cuts,
+                    init,
+                    &mut |s, e, c| fused_tail_segment(&win, &wt, tiled, s, e, c),
+                );
             }
         }
     }
