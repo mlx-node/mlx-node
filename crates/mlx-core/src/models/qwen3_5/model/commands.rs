@@ -250,6 +250,10 @@ impl HybridSchedulerBackend for Qwen35Inner {
         self.paged_adapter.as_mut()
     }
 
+    fn release_memory_for_pool_grow(&mut self) -> bool {
+        crate::models::qwen3_5::dflash2_turn::evict_parked_dflash2_for_pool_grow(self)
+    }
+
     fn supports_scheduled_speculation(&self) -> bool {
         self.has_mtp_weights()
             && self.paged_adapter.is_some()

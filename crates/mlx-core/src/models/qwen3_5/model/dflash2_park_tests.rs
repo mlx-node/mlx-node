@@ -317,6 +317,35 @@ fn owner_release_keeps_the_flat_live_state() -> Result<()> {
     Ok(())
 }
 
+/// A scheduled admission whose page-pool grow is declined evicts the parked
+/// DFlash2 states and grows on the retry; with nothing parked the declined
+/// grow still rejects.
+#[test]
+fn scheduled_pool_grow_evicts_parked_states_after_a_decline() -> Result<()> {
+    use crate::engine::hybrid_scheduler::tests::reserve_past_a_declined_grow;
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let tokenizer = tokenizer();
+    for parked in [true, false] {
+        let mut inner = fixture(0xDFA5_1607);
+        inner.initialize_paged_adapter()?;
+        run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(6), true, 12)?;
+        if parked {
+            run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(7), true, 12)?;
+            assert_eq!(inner.dflash2_states.store.bytes().entries, 1);
+        } else {
+            assert_eq!(inner.dflash2_states.store.bytes().entries, 0);
+        }
+        let (admitted, total_blocks, inner) = reserve_past_a_declined_grow(inner);
+        assert_eq!(admitted, parked, "parked={parked}");
+        assert_eq!(total_blocks, if parked { 8 } else { 4 }, "parked={parked}");
+        assert_eq!(inner.dflash2_states.store.bytes().entries, 0);
+        assert!(inner.dflash2_context.is_some(), "the live state stays");
+    }
+    Ok(())
+}
+
 /// A continuous-batching activation hands the flat caches to a scheduled
 /// sequence. It parks the DFlash2 end state first, whether the scheduler
 /// installs the owner's history before activating (a resumed preempted turn)

@@ -576,6 +576,36 @@ pub(crate) fn evict_parked_dflash2_for_turn<T: DFlash2Target>(
     }
 }
 
+/// Evicts every parked state holding bytes after a scheduled admission's
+/// page-pool grow was declined: the probe reads live Metal memory, which
+/// parked states hold. The live state stays. Returns whether anything was
+/// freed.
+pub(crate) fn evict_parked_dflash2_for_pool_grow<T: DFlash2Target>(target: &mut T) -> bool {
+    if target.dflash2_states().store.bytes().entries == 0 {
+        return false;
+    }
+    let need = Reservation {
+        state_bytes: u64::MAX,
+        kv_bytes: u64::MAX,
+    };
+    let freed = match target.dflash2_states_mut().store.evict_for(need, 0, None) {
+        Ok(report) => report.freed_kv_bytes > 0 || report.freed_state_bytes > 0,
+        Err(error) => {
+            tracing::warn!(
+                target: "mlx_core::inference",
+                "DFlash2 parked-state eviction failed, dropping every parked state: {}",
+                error.reason
+            );
+            target.dflash2_states_mut().store.clear();
+            true
+        }
+    };
+    if freed {
+        crate::array::clear_cache();
+    }
+    freed
+}
+
 /// Size every flat full-attention cache for this turn so decode never
 /// grows it. Runs before prefill: on a cold turn it only records the
 /// size for the first allocation; a warm turn copies its prefix once.
