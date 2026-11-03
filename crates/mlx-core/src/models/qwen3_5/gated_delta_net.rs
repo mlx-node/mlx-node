@@ -2864,7 +2864,8 @@ mod tests {
     /// the live cache array), stays unchanged after a later chunk, and its
     /// conv history is the raw rows the cache holds after a forward of rows
     /// `[0, c)`; its state equals that forward's whenever the shorter window
-    /// takes the same route.
+    /// takes the same route (bit for bit, except to bf16 rounding on the chain
+    /// route).
     #[test]
     fn capture_keeps_route_bits_and_owns_state() -> Result<()> {
         use crate::models::qwen3_5::gated_delta::tests::{
@@ -2964,11 +2965,29 @@ mod tests {
                         "{tag}: conv history"
                     );
                     if truncated_route == [route] {
-                        assert_eq!(
-                            raw_bits(&capture.rec),
-                            raw_bits(truncated.get(1).unwrap()),
-                            "{tag}: state vs the truncated forward"
-                        );
+                        let reference = truncated.get(1).unwrap();
+                        if route == GdnRoute::Chain {
+                            // A chain capture inside a 64-row chunk comes from other
+                            // chunk products than the shorter forward: measured 0.5%
+                            // of the state range (about one bf16 step), not bitwise.
+                            let f32s = |v: &MxArray| v.astype(DType::Float32)?.to_float32();
+                            let (got, want) = (f32s(&capture.rec)?, f32s(reference)?);
+                            let range = want.iter().fold(0f32, |m, y| m.max(y.abs()));
+                            let diff = got
+                                .iter()
+                                .zip(want.iter())
+                                .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                            assert!(
+                                diff <= range / 64.0,
+                                "{tag}: state vs the truncated forward: {diff:e} > {range:e}/64"
+                            );
+                        } else {
+                            assert_eq!(
+                                raw_bits(&capture.rec),
+                                raw_bits(reference),
+                                "{tag}: state vs the truncated forward"
+                            );
+                        }
                         same_route += 1;
                     }
                     fingerprints.push((raw_bits(&capture.conv), raw_bits(&capture.rec)));
