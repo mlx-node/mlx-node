@@ -90,6 +90,10 @@ impl ToolArgSchemas {
                 };
                 match (raw_text.map(|m| m.get(key)), schema_types(prop)) {
                     (Some(None), _) => {}
+                    // A valid enum string stays one: `{"enum":["00042",7]}`.
+                    (Some(Some(raw)), _) if enum_has_string(prop, raw) => {
+                        *value = Value::String(raw.clone());
+                    }
                     (Some(Some(raw)), Some(types)) => {
                         *value = coerce_str(raw, types);
                         if value.is_object() || value.is_array() {
@@ -237,6 +241,11 @@ fn schema_types(schema: &Value) -> Option<TypeSet> {
         resolved
     }
     resolve(schema).filter(|set| set.0 != 0)
+}
+
+fn enum_has_string(schema: &Value, raw: &str) -> bool {
+    matches!(schema.get("enum"), Some(Value::Array(members))
+        if members.iter().any(|m| m.as_str() == Some(raw)))
 }
 
 /// `Number.MAX_SAFE_INTEGER`. NAPI hands JS a `BigInt` for any integer beyond
@@ -906,6 +915,21 @@ mod tests {
             ),
             json!({"id": "00042"})
         );
+    }
+
+    #[test]
+    fn bare_text_that_is_an_enum_string_stays_a_string() {
+        let props = r#"{"id": {"enum": ["00042", 7]}}"#;
+        let call = |v: &str| {
+            format!(
+                "<tool_call>\n<function=t>\n<parameter=id>\n{v}\n</parameter>\n</function>\n</tool_call>"
+            )
+        };
+        assert_eq!(
+            parse_and_coerce(props, &call("00042")),
+            json!({"id": "00042"})
+        );
+        assert_eq!(parse_and_coerce(props, &call("7")), json!({"id": 7}));
     }
 
     #[test]
