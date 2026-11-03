@@ -42,6 +42,9 @@ Options:
   --model <name>      Which discovered model is the default. Must match a
                       directory name under --models-dir. Defaults to
                       ANTHROPIC_MODEL env, else the first discovered model.
+  --preload <name>    Start loading this discovered model at boot instead of
+                      on its first request. A failed preload is logged and
+                      the server keeps running.
   --model-residency <mode>  capability (default) or single
   --rerank-config <file>    JSON { policy?, families?, service? } for rerank limits
   --auth-token <tok>  Require this secret on every route except /health,
@@ -69,6 +72,7 @@ export interface ServeArgs {
   host?: string;
   modelsDir?: string;
   model?: string;
+  preload?: string;
   authToken?: string;
   modelResidency?: 'capability' | 'single';
   rerankConfig?: string;
@@ -92,6 +96,7 @@ export function parseServeArgs(argv: string[]): ServeArgs {
       host: { type: 'string' },
       'models-dir': { type: 'string' },
       model: { type: 'string' },
+      preload: { type: 'string' },
       'model-residency': { type: 'string' },
       'rerank-config': { type: 'string' },
       'auth-token': { type: 'string' },
@@ -123,6 +128,7 @@ export function parseServeArgs(argv: string[]): ServeArgs {
     host: values.host,
     modelsDir: values['models-dir'],
     model: values.model,
+    ...(values.preload !== undefined ? { preload: values.preload } : {}),
     ...(modelResidency !== undefined ? { modelResidency } : {}),
     ...(values['rerank-config'] !== undefined ? { rerankConfig: values['rerank-config'] } : {}),
     authToken: values['auth-token'],
@@ -195,6 +201,13 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
   );
   if (host.logDir !== null) console.log(`[mlx] verbose logging → ${host.logDir}`);
   console.log('Press Ctrl+C to stop.');
+
+  if (args.preload !== undefined) {
+    const name = args.preload;
+    void host.loadModel(name).catch((err: unknown) => {
+      console.error(`[mlx] preload of "${name}" failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
 
   const exit = deps.exit ?? ((code: number): void => process.exit(code));
 

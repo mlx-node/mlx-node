@@ -47,6 +47,7 @@ describe('delegate shares agent startup', () => {
       const options = launch.mock.calls[0]![0];
       // The served-launch flags lead the worker profile; positionals fold into -p.
       expect(options.argv.slice(0, 3)).toEqual(['--disable-web-search', '-m', 'local']);
+      expect(options.preloadModel).toBe('local');
       expect(options.argv[options.argv.indexOf('-p') + 1]).toBe('Inspect run 42');
       expect(options.argv).toContain('--append-system-prompt');
       expect(options.argv).not.toContain('--reasoning-effort');

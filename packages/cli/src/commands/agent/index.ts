@@ -442,6 +442,18 @@ export function withWebSearchDisabled(argv: string[]): string[] {
   return collectAgentOptionNames(argv).has(DISABLE_WEB_SEARCH_FLAG) ? argv : [DISABLE_WEB_SEARCH_FLAG, ...argv];
 }
 
+/** The `-m`/`--model` value in option-name position, if any. */
+export function agentModelArg(argv: readonly string[]): string | undefined {
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i]!;
+    if (token === '--') return undefined;
+    if (token.startsWith('--model=')) return token.slice('--model='.length) || undefined;
+    if ((token === '-m' || token === '--model') && i + 1 < argv.length) return argv[i + 1];
+    if (agentOptionConsumesNext(argv, i)) i++;
+  }
+  return undefined;
+}
+
 /** The default model id grok's `[models]` table persisted. */
 export interface PersistedGrokDefault {
   modelId: string;
@@ -699,10 +711,14 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     persisted,
   );
   const agentArgv = withWebSearchDisabled(withDefaultModel(scan.passthrough, modelId));
+  const requestedModel = agentModelArg(agentArgv);
+  const preloadModel =
+    requestedModel !== undefined && models.some((m) => m.name === requestedModel) ? requestedModel : undefined;
 
   process.exitCode = await launch({
     argv: agentArgv,
     modelsDir,
     needsServer: true,
+    ...(preloadModel !== undefined ? { preloadModel } : {}),
   });
 }

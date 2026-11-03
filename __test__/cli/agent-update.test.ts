@@ -1896,6 +1896,16 @@ describe('launchGrokAgent server gating', () => {
     expect(spawnAgent.envs[0]!.GROK_MODELS_BASE_URL).toBeUndefined();
   });
 
+  it('asks the spawned serve to preload the chosen model', async () => {
+    await launchGrokAgent({ argv: ['-m', 'qwen-local'], preloadModel: 'qwen-local', spawnServe, spawnAgent });
+    const serveArgv = spawnServe.mock.calls[0]![0];
+    expect(serveArgv.slice(serveArgv.indexOf('--preload'))).toEqual(['--preload', 'qwen-local']);
+
+    spawnServe.mockClear();
+    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent });
+    expect(spawnServe.mock.calls[0]![0]).not.toContain('--preload');
+  });
+
   it('turns off the xAI media tools a served launch cannot answer, keeping a user override', async () => {
     const mediaEnv = ['GROK_IMAGE_GEN', 'GROK_IMAGE_EDIT', 'GROK_VIDEO_GEN'] as const;
     const saved = mediaEnv.map((name) => process.env[name]);

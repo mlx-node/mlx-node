@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from 'vite-plus/test';
 
 import type { GrokAgentLaunchOptions } from '../../packages/cli/src/commands/agent/grok-build.js';
 import {
+  agentModelArg,
   type AgentRunDeps,
   chooseDefaultModel,
   configureAgentTracing,
@@ -518,6 +519,17 @@ describe('withWebSearchDisabled', () => {
   });
 });
 
+describe('agentModelArg', () => {
+  it('reads -m, --model and --model= in option-name position only', () => {
+    expect(agentModelArg(['-m', 'a', '-p', 'hi'])).toBe('a');
+    expect(agentModelArg(['--disable-web-search', '--model', 'b'])).toBe('b');
+    expect(agentModelArg(['--model=c'])).toBe('c');
+    expect(agentModelArg(['--system-prompt-override', '-m', 'p'])).toBeUndefined();
+    expect(agentModelArg(['--', '-m', 'a'])).toBeUndefined();
+    expect(agentModelArg(['-c'])).toBeUndefined();
+  });
+});
+
 /**
  * Shared agent-dir expansion (re-exported from `@mlx-node/agent/paths`):
  * lone `~` and leading `~/` expand, `file://` URLs resolve, `~user` and
@@ -797,6 +809,24 @@ describe('run() argv routing', () => {
     expect(calls.launch[0]!.argv).toEqual(['--disable-web-search', '-m', 'fake-model', '-p', 'hi']);
     expect(calls.launch[0]!.modelsDir).toBe('/fake/models');
     expect(calls.launch[0]!.needsServer).toBe(true);
+  });
+
+  it('preloads the -m model only when it is a discovered local model', async () => {
+    const fresh = makeDeps();
+    await run(['-p', 'hi'], fresh.deps);
+    expect(fresh.calls.launch[0]!.preloadModel).toBe('fake-model');
+
+    const explicit = makeDeps([[fakeModel('fake-model'), fakeModel('other')]]);
+    await run(['--model', 'other'], explicit.deps);
+    expect(explicit.calls.launch[0]!.preloadModel).toBe('other');
+
+    const unknown = makeDeps();
+    await run(['--model', 'remote-only'], unknown.deps);
+    expect(unknown.calls.launch[0]!.preloadModel).toBeUndefined();
+
+    const resumed = makeDeps();
+    await run(['-c'], resumed.deps);
+    expect(resumed.calls.launch[0]!.preloadModel).toBeUndefined();
   });
 
   it('keeps the server path when --help is the VALUE of --system-prompt-override', async () => {

@@ -770,6 +770,7 @@ mlx serve --verbose                              # capture every HTTP turn to a 
 | `--host <h>`                 | Bind address (default `127.0.0.1`). Non-loopback exposes local models — pair with `--auth-token`                  |
 | `--models-dir <dir>`         | Discovery root (default `~/.mlx-node/models`; also `MLX_MODELS_DIR`, `~/.mlx-node/config.json`)                   |
 | `--model <name>`             | Default model. Falls back to `ANTHROPIC_MODEL`, then the first discovered model                                   |
+| `--preload <name>`           | Start loading this discovered model at boot instead of on its first request. A failed preload is only logged      |
 | `--model-residency <policy>` | `capability` (default) or `single`                                                                                |
 | `--auth-token <tok>`         | Required on every route except `/health`, as `x-api-key` or `Authorization: Bearer`. Also `MLX_SERVER_AUTH_TOKEN` |
 | `-v, --verbose`              | Write every request/response to a log dir                                                                         |
@@ -832,7 +833,7 @@ mlx agent --models-dir ./models # use a specific local models directory
 
 Almost every flag belongs to the agent binary and is forwarded verbatim; `mlx agent` only handles the options below before handing off (`--models-dir`, `--trace`/`--trace-dir`, `--no-persist-cache`, and mlx-side help).
 
-Because the backend is the local `mlx serve`, `mlx agent` always passes `--disable-web-search` (grok's `web_search` is an xAI server-side tool) and sets `GROK_IMAGE_GEN=0`, `GROK_IMAGE_EDIT=0` and `GROK_VIDEO_GEN=0` unless you exported them yourself.
+Because the backend is the local `mlx serve`, `mlx agent` always passes `--disable-web-search` (grok's `web_search` is an xAI server-side tool) and sets `GROK_IMAGE_GEN=0`, `GROK_IMAGE_EDIT=0` and `GROK_VIDEO_GEN=0` unless you exported them yourself. It also starts `mlx serve` with `--preload <model>` for the `-m` model, so the weights load while the agent starts up.
 
 For local Qwen3.8 models, `--thinking low`, `medium`, and `xhigh` select the
 checkpoint's reasoning effort. `minimal` aliases `low`; `high` and `max` alias

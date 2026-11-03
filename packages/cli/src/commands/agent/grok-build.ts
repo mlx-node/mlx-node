@@ -69,6 +69,8 @@ export interface GrokAgentLaunchOptions {
    * (`--system-prompt-override --help`) is data, not a one-shot.
    */
   needsServer?: boolean;
+  /** Discovered model the spawned `mlx serve` starts loading at boot (`--preload`). */
+  preloadModel?: string;
   /** Test seam: custom spawn for the agent binary. */
   spawnAgent?: (bin: string, argv: string[], opts: SpawnOptions) => ChildProcess;
   /** Test seam: custom spawn for `mlx serve`. */
@@ -1696,6 +1698,7 @@ async function spawnInferenceServer(
     '--auth-token',
     token,
     ...(opts.modelsDir ? ['--models-dir', opts.modelsDir] : []),
+    ...(opts.preloadModel !== undefined ? ['--preload', opts.preloadModel] : []),
   ];
   const child = (opts.spawnServe ?? ((argv, so) => spawn(process.execPath, argv, so)))(serveArgv, {
     stdio: ['ignore', 'pipe', 'inherit'],
