@@ -3,7 +3,13 @@ import { spawn } from 'node:child_process';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { detectionCases, selectedText } from '../../../evals/agent-installed/cases.js';
-import { AgentCli, cliInvocation, JsonLines } from '../../../evals/agent-installed/cli.js';
+import {
+  AgentCli,
+  agentLaunchEnv,
+  cliInvocation,
+  JsonLines,
+  serveInvocation,
+} from '../../../evals/agent-installed/cli.js';
 import { evaluateCase, grade, summarize } from '../../../evals/agent-installed/evaluate.js';
 import { physicalFootprint } from '../../../evals/agent-installed/process-memory.js';
 import { evalOptions } from '../../../scripts/eval-agent-installed.js';
@@ -128,6 +134,20 @@ describe('agent-installed eval oracle and execution', () => {
     expect(() => evalOptions(['--entrypoint', 'serve'])).toThrow();
   });
 
+  it('launches like the served `mlx agent`: no web search, no xAI media tools, preloaded model', () => {
+    for (const entrypoint of ['agent', 'delegate'] as const) {
+      expect(cliInvocation('/repo', entrypoint).slice(0, 4)).toEqual([
+        '<mlx-agent>',
+        '--disable-web-search',
+        '-m',
+        '<default model>',
+      ]);
+    }
+    expect(serveInvocation('cli.js', 'tok', '/models', 'local').slice(-2)).toEqual(['--preload', 'local']);
+    const env = agentLaunchEnv('http://127.0.0.1:1', 'tok', { GROK_IMAGE_EDIT: '1' });
+    expect(env).toMatchObject({ GROK_IMAGE_GEN: '0', GROK_IMAGE_EDIT: '1', GROK_VIDEO_GEN: '0' });
+  });
+
   it('refuses empty selections and invalid repeat counts rather than producing empty green reports', () => {
     expect(() => evalOptions(['--repeat', '0'])).toThrow();
     expect(() => evalOptions(['--repeat', 'NaN'])).toThrow();
@@ -154,8 +174,14 @@ describe('agent-installed eval oracle and execution', () => {
 
   it('close() outwaits a stalled agent child instead of clearing the hard-kill timer on serve exit', async () => {
     const cli = new AgentCli('/repo', 'agent', '/tmp/workspace', '/tmp/output');
-    const serve = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => process.exit(0)); setInterval(() => {}, 1000)']);
-    const agent = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => setTimeout(() => process.exit(0), 400)); setInterval(() => {}, 1000)']);
+    const serve = spawn(process.execPath, [
+      '-e',
+      'process.on("SIGTERM", () => process.exit(0)); setInterval(() => {}, 1000)',
+    ]);
+    const agent = spawn(process.execPath, [
+      '-e',
+      'process.on("SIGTERM", () => setTimeout(() => process.exit(0), 400)); setInterval(() => {}, 1000)',
+    ]);
     await new Promise((resolve) => setTimeout(resolve, 100));
     Object.assign(cli, { child: serve, active: { child: agent, reject: () => {} } });
     const events: string[] = [];

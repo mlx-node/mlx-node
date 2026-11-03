@@ -1758,7 +1758,7 @@ function waitForServe(child: ChildProcess, timeoutMs: number): Promise<string> {
  * points at `mlx serve`; it has no media endpoints. Each env var outranks
  * `[features]` in grok's flag ladder; a value the user already exported wins.
  */
-const LOCAL_BACKEND_DISABLED_TOOL_ENV = ['GROK_IMAGE_GEN', 'GROK_IMAGE_EDIT', 'GROK_VIDEO_GEN'] as const;
+export const LOCAL_BACKEND_DISABLED_TOOL_ENV = ['GROK_IMAGE_GEN', 'GROK_IMAGE_EDIT', 'GROK_VIDEO_GEN'] as const;
 
 /**
  * Boot the inference host and exec the Grok Build binary over it.
