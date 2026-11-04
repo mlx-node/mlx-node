@@ -888,4 +888,37 @@ describe('buildProgressPing', () => {
     expect(stalled?.mlx_progress).not.toHaveProperty('decode_tokens_per_second');
     expect(stalled?.mlx_progress.generated_tokens).toBe(330);
   });
+
+  it('omits generated_tokens while the core reports 0 (not counted)', () => {
+    const ping = buildProgressPing({ phase: 'decode', generatedTokens: 0, decodeElapsedMs: 5_000 }, null, 20_000);
+    expect(ping?.mlx_progress).toEqual({ phase: 'decode', elapsed_ms: 20_000 });
+  });
+
+  it('matches the golden frame grok parses', () => {
+    const prev: ChatStreamProgress = {
+      phase: 'prefill',
+      prefillTotal: 20_700,
+      prefillDone: 6_589,
+      cachedTokens: 4_096,
+      prefillElapsedMs: 10_000,
+    };
+    const prefill: ChatStreamProgress = { ...prev, prefillDone: 12_300, prefillElapsedMs: 20_000 };
+    expect(JSON.stringify(buildProgressPing(prefill, prev, 20_000.4))).toBe(
+      '{"type":"ping","mlx_progress":{"phase":"prefill","elapsed_ms":20000,"prefill_total":20700,"prefill_done":12300,"cached_tokens":4096,"prefill_tokens_per_second":571.1}}',
+    );
+    const decode: ChatStreamProgress = {
+      ...prefill,
+      phase: 'decode',
+      prefillDone: 20_700,
+      prefillElapsedMs: 36_000,
+      generatedTokens: 84,
+      decodeElapsedMs: 1_687,
+    };
+    expect(JSON.stringify(buildProgressPing(decode, prefill, 40_000))).toBe(
+      '{"type":"ping","mlx_progress":{"phase":"decode","elapsed_ms":40000,"prefill_total":20700,"prefill_done":20700,"cached_tokens":4096,"generated_tokens":84,"decode_tokens_per_second":49.8}}',
+    );
+    expect(JSON.stringify(buildProgressPing({ phase: 'queued' }, null, 10_000))).toBe(
+      '{"type":"ping","mlx_progress":{"phase":"queued","elapsed_ms":10000}}',
+    );
+  });
 });

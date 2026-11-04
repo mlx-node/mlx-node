@@ -388,7 +388,11 @@ export function buildProgressPing(
     );
     if (rate !== undefined) progress.prefill_tokens_per_second = rate;
   }
-  if (snapshot.generatedTokens !== undefined) progress.generated_tokens = snapshot.generatedTokens;
+  // Cores that do not count kept tokens (gemma4 paged/vision, deepseek_v41,
+  // qianfan_ocr) report 0 for the whole decode: that 0 means unknown.
+  if (snapshot.generatedTokens !== undefined && snapshot.generatedTokens > 0) {
+    progress.generated_tokens = snapshot.generatedTokens;
+  }
   if (snapshot.phase === 'decode') {
     const samePhase = previous?.phase === 'decode';
     const rate = phaseRate(
