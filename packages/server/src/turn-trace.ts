@@ -43,7 +43,12 @@ import {
   type ColdSidecarStats,
   type PerformanceMetrics,
 } from '@mlx-node/core';
-import { mtpAutoDefaultAllowed, type ChatStreamEvent, type SessionCapableModel } from '@mlx-node/lm';
+import {
+  mtpAutoDefaultAllowed,
+  type ChatStreamEvent,
+  type ChatStreamProgressRef,
+  type SessionCapableModel,
+} from '@mlx-node/lm';
 import { canonicalCacheRoot } from '@mlx-node/lm/cold-tier';
 
 import { MetricsTrace, type MetricsTraceInput } from './metrics-trace.js';
@@ -501,10 +506,11 @@ export class TurnTraceModel implements SessionCapableModel {
     messages: ChatMessage[],
     config?: ChatConfig | null,
     signal?: AbortSignal,
+    progressRef?: ChatStreamProgressRef,
   ): AsyncGenerator<ChatStreamEvent> {
     const ctx = this.beginTurn(config);
     try {
-      for await (const event of this.inner[kind](messages, config, signal)) {
+      for await (const event of this.inner[kind](messages, config, signal, progressRef)) {
         if (ctx !== null && event.done && event.finishReason !== 'error') {
           this.finishTurn(ctx, event);
         }
@@ -537,24 +543,27 @@ export class TurnTraceModel implements SessionCapableModel {
     messages: ChatMessage[],
     config?: ChatConfig | null,
     signal?: AbortSignal,
+    progressRef?: ChatStreamProgressRef,
   ): AsyncGenerator<ChatStreamEvent> {
-    return this.streamDispatch('chatStreamSessionStart', messages, config, signal);
+    return this.streamDispatch('chatStreamSessionStart', messages, config, signal, progressRef);
   }
 
   chatStreamSessionContinue(
     messages: ChatMessage[],
     config?: ChatConfig | null,
     signal?: AbortSignal,
+    progressRef?: ChatStreamProgressRef,
   ): AsyncGenerator<ChatStreamEvent> {
-    return this.streamDispatch('chatStreamSessionContinue', messages, config, signal);
+    return this.streamDispatch('chatStreamSessionContinue', messages, config, signal, progressRef);
   }
 
   chatStreamSessionContinueTool(
     messages: ChatMessage[],
     config?: ChatConfig | null,
     signal?: AbortSignal,
+    progressRef?: ChatStreamProgressRef,
   ): AsyncGenerator<ChatStreamEvent> {
-    return this.streamDispatch('chatStreamSessionContinueTool', messages, config, signal);
+    return this.streamDispatch('chatStreamSessionContinueTool', messages, config, signal, progressRef);
   }
 
   resetCaches(): void | Promise<void> {

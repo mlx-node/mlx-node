@@ -1,6 +1,6 @@
 /** ChatResult / ChatStreamEvent → Anthropic Messages API output. */
 
-import type { ChatResult } from '@mlx-node/core';
+import type { ChatResult, ChatStreamProgress } from '@mlx-node/core';
 
 import { sanitizeJsonString } from '../strict-json.js';
 import { mergeTimingUsageExtensions, type PerformanceMetricsForUsage, type ServerTimingForUsage } from '../timing.js';
@@ -14,7 +14,9 @@ import type {
   AnthropicMessageStopEvent,
   AnthropicMessagesRequest,
   AnthropicMessagesResponse,
+  AnthropicPingEvent,
   AnthropicResponseContent,
+  MlxProgress,
 } from '../types-anthropic.js';
 import { genId } from './response.js';
 
@@ -335,4 +337,67 @@ export function buildMessageStop(): AnthropicMessageStopEvent {
   return {
     type: 'message_stop',
   };
+}
+
+/** Tokens per second over a window; `undefined` unless both deltas are positive. */
+function windowRate(tokens: number, ms: number): number | undefined {
+  if (!(tokens > 0) || !(ms > 0)) return undefined;
+  return Math.round((tokens * 10_000) / ms) / 10;
+}
+
+/**
+ * Rate of `count` over `elapsed`, measured from the previous sample when that
+ * sample is from the same phase, otherwise from the phase start.
+ */
+function phaseRate(
+  count: number | undefined,
+  elapsed: number | undefined,
+  prevCount: number | undefined,
+  prevElapsed: number | undefined,
+): number | undefined {
+  if (count === undefined || elapsed === undefined) return undefined;
+  if (prevCount === undefined || prevElapsed === undefined) return windowRate(count, elapsed);
+  return windowRate(count - prevCount, elapsed - prevElapsed);
+}
+
+/**
+ * Build the `ping` frame for one progress tick. `previous` is the snapshot
+ * the last emitted ping was built from. Returns `null` once the native turn
+ * is done: its terminal frames are about to follow.
+ */
+export function buildProgressPing(
+  snapshot: ChatStreamProgress,
+  previous: ChatStreamProgress | null,
+  elapsedMs: number,
+): AnthropicPingEvent | null {
+  if (snapshot.phase === 'done') return null;
+  const progress: MlxProgress = {
+    phase: snapshot.phase,
+    elapsed_ms: Math.max(0, Math.round(elapsedMs)),
+  };
+  if (snapshot.prefillTotal !== undefined) progress.prefill_total = snapshot.prefillTotal;
+  if (snapshot.prefillDone !== undefined) progress.prefill_done = snapshot.prefillDone;
+  if (snapshot.cachedTokens !== undefined) progress.cached_tokens = snapshot.cachedTokens;
+  if (snapshot.phase === 'prefill') {
+    const samePhase = previous?.phase === 'prefill';
+    const rate = phaseRate(
+      snapshot.prefillDone,
+      snapshot.prefillElapsedMs,
+      samePhase ? previous.prefillDone : undefined,
+      samePhase ? previous.prefillElapsedMs : undefined,
+    );
+    if (rate !== undefined) progress.prefill_tokens_per_second = rate;
+  }
+  if (snapshot.generatedTokens !== undefined) progress.generated_tokens = snapshot.generatedTokens;
+  if (snapshot.phase === 'decode') {
+    const samePhase = previous?.phase === 'decode';
+    const rate = phaseRate(
+      snapshot.generatedTokens,
+      snapshot.decodeElapsedMs,
+      samePhase ? previous.generatedTokens : undefined,
+      samePhase ? previous.decodeElapsedMs : undefined,
+    );
+    if (rate !== undefined) progress.decode_tokens_per_second = rate;
+  }
+  return { type: 'ping', mlx_progress: progress };
 }

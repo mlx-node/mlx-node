@@ -89,7 +89,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import type { ChatConfig, ChatMessage, ChatResult, ToolCall, ToolCallResult, ToolDefinition } from '@mlx-node/core';
 
-import type { ChatStreamEvent } from './stream.js';
+import type { ChatStreamEvent, ChatStreamProgressRef } from './stream.js';
 
 /**
  * Typed prefix native media guards use when a history cannot be continued
@@ -462,22 +462,26 @@ export interface SessionCapableModel {
    * cancellation (e.g. HTTP endpoints flipping an AbortController on
    * socket close) can attach one here and the native decode unwinds
    * at the next safepoint via `ChatStreamHandle.cancel()`. Non-signal
-   * callers (the common direct-use path) just omit it.
+   * callers (the common direct-use path) just omit it. `progressRef`
+   * receives a reader for the native turn's progress while it runs.
    */
   chatStreamSessionStart(
     messages: ChatMessage[],
     config?: ChatConfig | null,
     signal?: AbortSignal,
+    progressRef?: ChatStreamProgressRef,
   ): AsyncGenerator<ChatStreamEvent>;
   chatStreamSessionContinue(
     messages: ChatMessage[],
     config?: ChatConfig | null,
     signal?: AbortSignal,
+    progressRef?: ChatStreamProgressRef,
   ): AsyncGenerator<ChatStreamEvent>;
   chatStreamSessionContinueTool(
     messages: ChatMessage[],
     config?: ChatConfig | null,
     signal?: AbortSignal,
+    progressRef?: ChatStreamProgressRef,
   ): AsyncGenerator<ChatStreamEvent>;
   /**
    * Wipe the native KV caches and cached token history.
@@ -1650,7 +1654,11 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * Because history is primed (not appended to), rollback on failure
    * is a no-op: the primed state stays intact so the caller can retry.
    */
-  async *startFromHistoryStream(config?: ChatConfig, signal?: AbortSignal): AsyncGenerator<ChatStreamEvent> {
+  async *startFromHistoryStream(
+    config?: ChatConfig,
+    signal?: AbortSignal,
+    progressRef?: ChatStreamProgressRef,
+  ): AsyncGenerator<ChatStreamEvent> {
     if (this.inFlight) {
       throw new Error('ChatSession: cannot startFromHistoryStream() while a send() is in flight');
     }
@@ -1679,6 +1687,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           historySnapshot,
           withReplayReasoning(constrainedConfig, this.model),
           signal,
+          progressRef,
         )) {
           if (event.done) {
             if (event.finishReason !== 'error') {
