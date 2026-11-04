@@ -1219,7 +1219,7 @@ fn flash_next_load_writes_no_derived_weight_pack() {
             .build()
             .unwrap()
             .block_on(async move {
-                let model = Qwen4ExpModel::load(model_path, None).await.unwrap();
+                let mut model = Qwen4ExpModel::load(model_path, None).await.unwrap();
                 let initial = model.residency_info();
                 assert!(initial.direct);
                 assert!(initial.direct_layers > 0);
@@ -1237,6 +1237,9 @@ fn flash_next_load_writes_no_derived_weight_pack() {
                     );
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
+                // A detached model thread still dropping its state when the
+                // process exits races MLX's static destructors (SIGSEGV).
+                model.thread.shutdown_and_join().unwrap();
             });
         return;
     }
