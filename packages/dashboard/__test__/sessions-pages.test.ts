@@ -484,12 +484,12 @@ describe('Session detail page', () => {
   it('shows prefill only for turns big enough to time, as a token-weighted average', async () => {
     const turns = [
       // 20,700 tokens in 36.25 s and 4,000 in 2 s: 24,700 / 38.25 = 645.75 tok/s.
-      turn({ promptId: 'big', prefillTps: 571.0344827586207, prefillInputTokens: 20_700 }),
-      turn({ promptId: 'mid', prefillTps: 2_000, prefillInputTokens: 4_000 }),
+      turn({ promptId: 'big', prefillTps: 571.0344827586207, prefillInputTokens: 20_700, ttftMs: 36_250 }),
+      turn({ promptId: 'mid', prefillTps: 2_000, prefillInputTokens: 4_000, ttftMs: null }),
       // Fixed per-call cost, not throughput: never plotted or averaged.
-      turn({ promptId: 'small', prefillTps: 50, prefillInputTokens: 20 }),
-      // Rate with no size: cannot be judged.
-      turn({ promptId: 'unsized', prefillTps: 9_000, prefillInputTokens: null }),
+      turn({ promptId: 'small', prefillTps: 50, prefillInputTokens: 20, ttftMs: 400 }),
+      // Rate with neither ttft nor size: cannot be judged.
+      turn({ promptId: 'unsized', prefillTps: 9_000, prefillInputTokens: null, ttftMs: null }),
     ];
     const text = await mountDetail(
       PARENT_ID,
@@ -506,9 +506,9 @@ describe('Session detail page', () => {
 
   it('hides the prefill card and chip when no turn has enough new tokens', async () => {
     const turns = [
-      turn({ prefillTps: 50, prefillInputTokens: 20 }),
-      turn({ prefillTps: 400, prefillInputTokens: PREFILL_MIN_TOKENS - 1 }),
-      turn({ prefillTps: 900, prefillInputTokens: null }),
+      turn({ prefillTps: 50, prefillInputTokens: 20, ttftMs: 400 }),
+      turn({ prefillTps: 400, prefillInputTokens: PREFILL_MIN_TOKENS - 1, ttftMs: null }),
+      turn({ prefillTps: 900, prefillInputTokens: null, ttftMs: null }),
     ];
     const text = await mountDetail(
       PARENT_ID,
@@ -618,22 +618,36 @@ describe('turnTokenBars', () => {
 
 describe('turnPrefill / prefillAverage', () => {
   it('keeps turns from the threshold up, derives seconds, and weights the average by tokens', () => {
-    expect(turnPrefill({ prefillTps: 50, prefillInputTokens: 20 })).toBeNull();
-    expect(turnPrefill({ prefillTps: 640, prefillInputTokens: null })).toBeNull();
-    expect(turnPrefill({ prefillTps: null, prefillInputTokens: 4_000 })).toBeNull();
-    expect(turnPrefill({ prefillTps: 0, prefillInputTokens: 4_000 })).toBeNull();
-    expect(turnPrefill({ prefillTps: 256, prefillInputTokens: PREFILL_MIN_TOKENS })).toEqual({
+    expect(turnPrefill({ prefillTps: 50, prefillInputTokens: 20, ttftMs: null })).toBeNull();
+    expect(turnPrefill({ prefillTps: 640, prefillInputTokens: null, ttftMs: null })).toBeNull();
+    expect(turnPrefill({ prefillTps: null, prefillInputTokens: 4_000, ttftMs: 2_000 })).toBeNull();
+    expect(turnPrefill({ prefillTps: 0, prefillInputTokens: 4_000, ttftMs: 2_000 })).toBeNull();
+    expect(turnPrefill({ prefillTps: 256, prefillInputTokens: PREFILL_MIN_TOKENS, ttftMs: null })).toEqual({
       tokens: 512,
       seconds: 2,
       tps: 256,
     });
 
-    const big = turnPrefill({ prefillTps: 1_000, prefillInputTokens: 30_000 });
-    const small = turnPrefill({ prefillTps: 100, prefillInputTokens: 1_000 });
+    const big = turnPrefill({ prefillTps: 1_000, prefillInputTokens: 30_000, ttftMs: null });
+    const small = turnPrefill({ prefillTps: 100, prefillInputTokens: 1_000, ttftMs: null });
     // 31,000 tokens / (30 s + 10 s), not the mean of the two rates (550).
     expect(prefillAverage([big, small, null])).toBe(775);
     expect(prefillAverage([null])).toBeNull();
     expect(prefillAverage([])).toBeNull();
+  });
+
+  it('times a turn by its ttft, the rate denominator, not by the cached-suffix count', () => {
+    // LFM2 partial hit: 40,000 full-prompt tokens re-prefilled in 100 s, but only a
+    // 1,000-token suffix was uncached. tokens / rate would claim 2.5 s.
+    expect(turnPrefill({ prefillTps: 400, prefillInputTokens: 1_000, ttftMs: 100_000 })).toEqual({
+      tokens: 40_000,
+      seconds: 100,
+      tps: 400,
+    });
+    // A 20-token qwen prefill that took 0.4 s is fixed cost: 50 tok/s x 0.4 s = 20 < threshold.
+    expect(turnPrefill({ prefillTps: 50, prefillInputTokens: 20, ttftMs: 400 })).toBeNull();
+    // A small uncached suffix still counts when the measured work was large.
+    expect(turnPrefill({ prefillTps: 400, prefillInputTokens: 100, ttftMs: 10_000 })?.tokens).toBe(4_000);
   });
 });
 

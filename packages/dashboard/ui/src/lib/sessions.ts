@@ -56,13 +56,29 @@ export interface TurnPrefill {
   tps: number;
 }
 
-/** A turn's prefill, or `null` when it is unreported, too small to judge, or of unknown size. */
-export function turnPrefill(t: Pick<TurnMetric, 'prefillTps' | 'prefillInputTokens'>): TurnPrefill | null {
-  const tokens = t.prefillInputTokens;
+/**
+ * A turn's prefill, or `null` when it is unreported, too small to judge, or of unknown size.
+ *
+ * The engine reports `prefillTps = work tokens / ttft`, and its work tokens can exceed
+ * `prefillInputTokens` (LFM2 / NemotronH re-prefill the whole prompt on a partial hit),
+ * so the size comes from `tps × ttft` whenever ttft is known.
+ */
+export function turnPrefill(t: Pick<TurnMetric, 'prefillTps' | 'prefillInputTokens' | 'ttftMs'>): TurnPrefill | null {
   const tps = t.prefillTps;
-  if (tokens === null || tps === null || !Number.isFinite(tokens) || !Number.isFinite(tps)) return null;
-  if (tokens < PREFILL_MIN_TOKENS || tps <= 0) return null;
-  return { tokens, seconds: tokens / tps, tps };
+  if (tps === null || !Number.isFinite(tps) || tps <= 0) return null;
+  let tokens: number;
+  let seconds: number;
+  if (t.ttftMs !== null && Number.isFinite(t.ttftMs) && t.ttftMs > 0) {
+    seconds = t.ttftMs / 1000;
+    tokens = tps * seconds;
+  } else if (t.prefillInputTokens !== null && Number.isFinite(t.prefillInputTokens)) {
+    tokens = t.prefillInputTokens;
+    seconds = tokens / tps;
+  } else {
+    return null;
+  }
+  if (tokens < PREFILL_MIN_TOKENS) return null;
+  return { tokens, seconds, tps };
 }
 
 /** Token-weighted prefill rate over the qualifying turns: total tokens / total seconds. */
