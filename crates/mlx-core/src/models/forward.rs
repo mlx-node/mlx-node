@@ -408,6 +408,7 @@ pub(crate) fn chunked_prefill_ranges<C>(
         let _ = forward(ctx, offset, offset + chunk_size, false)?;
         between_chunks(ctx)?;
         offset += chunk_size;
+        crate::engine::progress::with_turn_progress(|p| p.prefill_advanced(offset as u32));
     }
     if poll_before_final
         && offset > 0
@@ -478,6 +479,7 @@ pub(crate) fn chunked_prefill_slices<C>(
         });
         if idx != last_idx {
             between_chunks(ctx)?;
+            crate::engine::progress::with_turn_progress(|p| p.prefill_advanced(end as u32));
         }
     }
     last.ok_or_else(|| Error::from_reason("chunked_prefill produced no chunks"))

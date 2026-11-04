@@ -1053,6 +1053,7 @@ impl Qwen35MoeInner {
                     turn_streaming.streamed_text_len,
                 );
                 turn_streaming.streamed_text_len += token_text.len();
+                cb.count_token();
                 if include_reasoning || !is_reasoning {
                     cb.call(
                         Ok(ChatStreamChunk {

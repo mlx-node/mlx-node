@@ -265,6 +265,7 @@ pub struct ChatStreamChunk {
 #[napi]
 pub struct ChatStreamHandle {
     pub(crate) cancelled: Arc<AtomicBool>,
+    pub(crate) progress: Arc<crate::engine::progress::TurnProgress>,
 }
 
 #[napi]
@@ -273,6 +274,37 @@ impl ChatStreamHandle {
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
     }
+
+    /// Snapshot of the turn's prefill/decode progress.
+    #[napi]
+    pub fn progress(&self) -> ChatStreamProgress {
+        self.progress.snapshot()
+    }
+}
+
+/// Point-in-time progress of one streaming turn, read from
+/// [`ChatStreamHandle::progress`]. A field is `None` while it is unknown.
+#[napi(object)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatStreamProgress {
+    /// `queued` until the model thread picks the request up, then
+    /// `prefill`, `decode` from the first sampled token, `done` after the
+    /// terminal chunk or error.
+    #[napi(ts_type = "'queued' | 'prefill' | 'decode' | 'done'")]
+    pub phase: String,
+    /// Tokens this turn prefills, excluding the cached prefix.
+    pub prefill_total: Option<u32>,
+    /// Tokens of `prefill_total` materialized so far. Paths that prefill in
+    /// one shot stay at 0 until the first token.
+    pub prefill_done: Option<u32>,
+    /// Prefix tokens reused from the cache.
+    pub cached_tokens: Option<u32>,
+    /// Tokens kept so far; known from the `decode` phase on.
+    pub generated_tokens: Option<u32>,
+    /// Milliseconds from prefill start to the first token (or to now).
+    pub prefill_elapsed_ms: Option<f64>,
+    /// Milliseconds since the first token.
+    pub decode_elapsed_ms: Option<f64>,
 }
 
 /// In-flight non-streaming chat turn returned by the internal

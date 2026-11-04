@@ -780,6 +780,7 @@ macro_rules! decode_loop {
                     $slen,
                 );
                 $slen += token_text.len();
+                $cb.count_token();
                 // Suppress reasoning (<think>…</think>) deltas from the stream
                 // when include_reasoning == false. Detokenize + length-advance
                 // above stay OUTSIDE this gate so DecodeStream sees every token.

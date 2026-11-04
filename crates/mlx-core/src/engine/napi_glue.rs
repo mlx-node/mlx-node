@@ -16,7 +16,7 @@
 //!         callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
 //!     }
 //! });
-//! Ok(ChatStreamHandle { cancelled })
+//! Ok(ChatStreamHandle { cancelled, progress })
 //! ```
 
 use std::sync::Arc;
@@ -25,8 +25,11 @@ use std::sync::atomic::AtomicBool;
 use napi::Status;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 
+use crate::engine::progress::TurnProgress;
 use crate::engine::types::{ChatResult, ChatStreamChunk, ChatStreamHandle};
-use crate::model_thread::{ModelThread, ResponseTx, StreamTx, send_and_await, stream_channel};
+use crate::model_thread::{
+    ModelThread, ResponseTx, StreamTx, send_and_await, stream_channel_with_progress,
+};
 use crate::tools::{ToolArgSchemas, coerce_chunk, coerce_tool_calls};
 
 /// Bound both the N-API callback queue and the mirrored JS adapter queue.
@@ -73,14 +76,38 @@ pub(crate) fn start_chat_stream(
     callback: ChatStreamCallback,
     tool_schemas: Option<Arc<ToolArgSchemas>>,
 ) -> ChatStreamPlumbing {
+    let (plumbing, stream_rx) = chat_stream_plumbing();
+    spawn_stream_pump(
+        stream_rx,
+        callback,
+        Arc::clone(&plumbing.cancelled),
+        tool_schemas,
+    );
+    plumbing
+}
+
+/// The plumbing for one streaming request plus the receiver the model
+/// thread's chunks arrive on. The handle and `stream_tx` share the cancel
+/// flag and the request's [`TurnProgress`].
+pub(crate) fn chat_stream_plumbing() -> (
+    ChatStreamPlumbing,
+    tokio::sync::mpsc::Receiver<napi::Result<ChatStreamChunk>>,
+) {
     let cancelled = Arc::new(AtomicBool::new(false));
-    let (stream_tx, stream_rx) = stream_channel(CHAT_STREAM_NATIVE_QUEUE_LIMIT);
-    spawn_stream_pump(stream_rx, callback, Arc::clone(&cancelled), tool_schemas);
-    ChatStreamPlumbing {
-        cancelled: cancelled.clone(),
-        stream_tx,
-        handle: ChatStreamHandle { cancelled },
-    }
+    let progress = Arc::new(TurnProgress::new());
+    let (stream_tx, stream_rx) =
+        stream_channel_with_progress(CHAT_STREAM_NATIVE_QUEUE_LIMIT, Arc::clone(&progress));
+    (
+        ChatStreamPlumbing {
+            cancelled: cancelled.clone(),
+            stream_tx,
+            handle: ChatStreamHandle {
+                cancelled,
+                progress,
+            },
+        },
+        stream_rx,
+    )
 }
 
 /// The forwarding pump: drain the model thread's stream channel into

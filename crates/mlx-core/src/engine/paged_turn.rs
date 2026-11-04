@@ -283,6 +283,10 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     // would leave the adapter's request_tokens/block_table advanced with
     // partial/unwritten KV. No live stepper holds `&mut backend` yet, so
     // `abort_paged_turn` can borrow it directly.
+    let progress = args.sink.and_then(|sink| sink.progress());
+    if let Some(progress) = progress {
+        progress.begin_prefill(suffix_len as u32, effective_cached_prefix_len as u32);
+    }
     profiler.begin_prefill();
     let last_logits = match backend.paged_prefill(suffix, &prefix, generation_stream) {
         Ok(l) => l,
@@ -309,6 +313,9 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
         }
     };
     y.eval();
+    if let Some(progress) = progress {
+        progress.first_token();
+    }
 
     // The decode loop stamps TTFT when it emits this token, after the first
     // decode forward; stamping at the sample hides that forward (seconds on a

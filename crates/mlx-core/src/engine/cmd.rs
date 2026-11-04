@@ -605,6 +605,9 @@ mod mock_backend_tests {
         /// models a cancel that lands mid-prefill-forward on a SYNC turn
         /// (H2), observed by the decode loop's first per-step snapshot.
         flip_cancel_in_prefill_knob: Option<Arc<AtomicBool>>,
+        /// Whether a whole-turn progress was installed on this thread when
+        /// each `prefill` ran.
+        progress_installed_in_prefill: Vec<bool>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -648,6 +651,7 @@ mod mock_backend_tests {
                 render_prompt_calls: AtomicUsize::new(0),
                 turn_cancel_events: Vec::new(),
                 flip_cancel_in_prefill_knob: None,
+                progress_installed_in_prefill: Vec::new(),
             }
         }
     }
@@ -931,6 +935,8 @@ mod mock_backend_tests {
         fn prefill(&mut self, prompt_tokens: &[u32], _stream: Stream) -> Result<MxArray> {
             self.eval_caches_calls += 1; // prefill+eval cadence proxy
             self.prefill_calls.push(prompt_tokens.to_vec());
+            self.progress_installed_in_prefill
+                .push(crate::engine::progress::turn_progress_installed());
             // Knob: model a cancel landing DURING the prefill forward
             // (after the pre-start guard, before the decode loop's first
             // per-step snapshot).
@@ -1327,10 +1333,9 @@ mod mock_backend_tests {
         let mut backend =
             MockBackend::new(vec![vec![TOK_HELLO, TOK_THINK_END, TOK_WORLD, TOK_IM_END]]);
 
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(
-            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
-        );
+        let (plumbing, mut stream_rx) = crate::engine::napi_glue::chat_stream_plumbing();
+        let handle = plumbing.handle;
+        assert_eq!(handle.progress().phase, "queued");
 
         handle_chat_cmd(
             &mut backend,
@@ -1344,8 +1349,8 @@ mod mock_backend_tests {
                     include_reasoning: Some(false),
                     ..Default::default()
                 },
-                stream_tx,
-                cancelled,
+                stream_tx: plumbing.stream_tx,
+                cancelled: plumbing.cancelled,
             },
         );
 
@@ -1396,6 +1401,77 @@ mod mock_backend_tests {
             "raw_text must scrub reasoning when include_reasoning=false"
         );
         assert!(last.text.contains("world"));
+
+        // Progress counts every kept token, including the suppressed
+        // reasoning ones the stream never shows.
+        let progress = handle.progress();
+        let prompt_len = backend.prefill_calls[0].len() as u32;
+        assert_eq!(progress.phase, "done");
+        assert_eq!(progress.generated_tokens, Some(4));
+        assert_eq!(progress.prefill_total, Some(prompt_len));
+        assert_eq!(progress.prefill_done, Some(prompt_len));
+        assert_eq!(progress.cached_tokens, Some(0));
+        assert!(progress.prefill_elapsed_ms.is_some());
+        assert!(progress.decode_elapsed_ms.is_some());
+    }
+
+    /// The streaming wrappers install the request's progress for the whole
+    /// turn and clear it on success and error; sync turns never install one.
+    #[test]
+    fn stream_turn_installs_then_clears_turn_progress() {
+        let mut backend = MockBackend::new(vec![
+            vec![TOK_HELLO, TOK_IM_END],
+            vec![TOK_HELLO, TOK_IM_END],
+        ]);
+        let stream_turn = |backend: &mut MockBackend| {
+            let (plumbing, mut stream_rx) = crate::engine::napi_glue::chat_stream_plumbing();
+            handle_chat_cmd(
+                backend,
+                ChatCmd::StreamSessionStart {
+                    messages: user_messages("hello"),
+                    config: greedy_config(),
+                    stream_tx: plumbing.stream_tx,
+                    cancelled: plumbing.cancelled,
+                },
+            );
+            let mut err = None;
+            while let Some(item) = stream_rx.blocking_recv() {
+                if let Err(e) = item {
+                    err = Some(e.reason.clone());
+                }
+            }
+            (plumbing.handle.progress(), err)
+        };
+
+        let (progress, err) = stream_turn(&mut backend);
+        assert!(err.is_none(), "first turn must succeed: {err:?}");
+        assert_eq!(progress.phase, "done");
+        assert!(!crate::engine::progress::turn_progress_installed());
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        handle_chat_cmd(
+            &mut backend,
+            ChatCmd::SessionStart {
+                messages: user_messages("hello"),
+                config: greedy_config(),
+                reply: reply_tx,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        assert!(reply_rx.blocking_recv().is_ok_and(|r| r.is_ok()));
+
+        // Script exhausted: the third turn errors inside prefill.
+        let (progress, err) = stream_turn(&mut backend);
+        assert!(err.is_some_and(|e| e.contains("no script left")));
+        assert_eq!(progress.phase, "done");
+        assert_eq!(progress.generated_tokens, Some(0));
+        assert!(!crate::engine::progress::turn_progress_installed());
+
+        assert_eq!(
+            backend.progress_installed_in_prefill,
+            vec![true, false, true],
+            "installed for streaming turns only"
+        );
     }
 
     /// H1b flag lifecycle: the streaming cores install the turn's cancel

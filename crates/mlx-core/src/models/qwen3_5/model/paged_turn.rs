@@ -1217,6 +1217,7 @@ impl Qwen35Inner {
                     turn_streaming.streamed_text_len,
                 );
                 turn_streaming.streamed_text_len += token_text.len();
+                cb.count_token();
                 if include_reasoning || !is_reasoning {
                     cb.call(
                         Ok(ChatStreamChunk {
@@ -2175,6 +2176,7 @@ impl Qwen35Inner {
                 turn_streaming.streamed_text_len,
             );
             turn_streaming.streamed_text_len += token_text.len();
+            cb.count_token();
             // Suppress reasoning deltas when include_reasoning == false.
             // Detokenize + length-advance above stay OUTSIDE this gate.
             if p.include_reasoning || !is_reasoning {

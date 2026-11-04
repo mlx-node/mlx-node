@@ -233,7 +233,9 @@ impl<'t> TurnStreaming<'t> {
             decode_stream: tokenizer.decode_stream(skip_special),
             streamed_text_len: 0,
             last_is_reasoning: thinking_enabled,
-            emitter: backend.stream_emitter(),
+            emitter: Box::new(crate::engine::backend::ProgressEmitter(
+                backend.stream_emitter(),
+            )),
         }
     }
 

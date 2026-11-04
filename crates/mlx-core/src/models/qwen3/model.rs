@@ -4464,11 +4464,12 @@ impl Qwen3Model {
         tokio::sync::mpsc::Receiver<Result<crate::engine::types::ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
-            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
-        );
+        let (plumbing, stream_rx) = crate::engine::napi_glue::chat_stream_plumbing();
+        let crate::engine::napi_glue::ChatStreamPlumbing {
+            cancelled: cancelled_inner,
+            stream_tx,
+            handle,
+        } = plumbing;
         self.thread
             .send(Qwen3Cmd::from_chat(ChatCmd::StreamSessionStart {
                 messages,
@@ -4476,10 +4477,7 @@ impl Qwen3Model {
                 stream_tx,
                 cancelled: cancelled_inner,
             }))?;
-        Ok((
-            crate::engine::types::ChatStreamHandle { cancelled },
-            stream_rx,
-        ))
+        Ok((handle, stream_rx))
     }
 
     /// Test-only entry point that dispatches
@@ -4495,11 +4493,12 @@ impl Qwen3Model {
         tokio::sync::mpsc::Receiver<Result<crate::engine::types::ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
-            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
-        );
+        let (plumbing, stream_rx) = crate::engine::napi_glue::chat_stream_plumbing();
+        let crate::engine::napi_glue::ChatStreamPlumbing {
+            cancelled: cancelled_inner,
+            stream_tx,
+            handle,
+        } = plumbing;
         self.thread
             .send(Qwen3Cmd::from_chat(ChatCmd::StreamSessionContinue {
                 messages,
@@ -4507,10 +4506,7 @@ impl Qwen3Model {
                 stream_tx,
                 cancelled: cancelled_inner,
             }))?;
-        Ok((
-            crate::engine::types::ChatStreamHandle { cancelled },
-            stream_rx,
-        ))
+        Ok((handle, stream_rx))
     }
 
     /// Fused forward pass using C++ implementation for maximum performance.

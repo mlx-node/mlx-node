@@ -947,11 +947,22 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             .set_turn_cancel_flag(turn.cancelled.as_ref().map(Arc::clone));
         let started = Instant::now();
         turn.payload.profiler.begin_prefill();
-        let first_chunk = start
-            == turn.payload.preemption_replay.as_ref().map_or(
-                turn.payload.prefix.effective_cached_prefix_len(),
-                |replay| replay.cached_prefix as usize,
+        let cached_prefix = turn.payload.preemption_replay.as_ref().map_or(
+            turn.payload.prefix.effective_cached_prefix_len(),
+            |replay| replay.cached_prefix as usize,
+        );
+        let first_chunk = start == cached_prefix;
+        let progress = turn
+            .payload
+            .response
+            .sink()
+            .and_then(|sink| sink.progress());
+        if first_chunk && let Some(progress) = progress {
+            progress.begin_prefill(
+                source_len.saturating_sub(cached_prefix) as u32,
+                cached_prefix as u32,
             );
+        }
         if first_chunk && turn.payload.scheduled_speculation.is_some() {
             match self
                 .inner
@@ -997,6 +1008,14 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         turn.payload.profiler.end_prefill();
         if end < source_len {
             crate::array::synchronize_and_clear_cache();
+            if let Some(progress) = turn
+                .payload
+                .response
+                .sink()
+                .and_then(|sink| sink.progress())
+            {
+                progress.prefill_advanced(end.saturating_sub(cached_prefix) as u32);
+            }
             return Ok(RowStepResult {
                 seq_id: row.seq_id,
                 num_computed_tokens: row.num_tokens,
@@ -1070,6 +1089,14 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         }
         sampled.eval();
         crate::array::synchronize_and_clear_cache();
+        if let Some(progress) = turn
+            .payload
+            .response
+            .sink()
+            .and_then(|sink| sink.progress())
+        {
+            progress.first_token();
+        }
         if turn.payload.params.max_new_tokens == 0 {
             if turn.payload.params.report_performance {
                 turn.payload.first_token_instant = Some(Instant::now());
@@ -2649,7 +2676,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             generation_stream,
             _wired_context: wired_context,
             profiler,
-            emitter: is_streaming.then(|| self.inner.stream_emitter()),
+            emitter: is_streaming.then(|| -> Box<dyn StreamEmitter> {
+                Box::new(engine::backend::ProgressEmitter(
+                    self.inner.stream_emitter(),
+                ))
+            }),
             turn_token_observer: self.inner.turn_token_observer(),
             stream_skip_special: self.inner.stream_skip_special_tokens(),
             decode_ids: Vec::new(),
