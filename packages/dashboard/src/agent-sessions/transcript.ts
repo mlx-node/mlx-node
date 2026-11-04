@@ -442,6 +442,7 @@ export function parseUpdates(text: string): ParsedUpdates {
           reasoningTokens: num(usage?.reasoningTokens) ?? 0,
           elapsedMs,
           ttftMs: num(perf?.ttft_ms),
+          prefillMs: num(perf?.prefill_ms),
           prefillTps: num(perf?.prefill_tokens_per_second),
           prefillInputTokens: num(perf?.prefill_input_tokens),
           decodeTps: num(perf?.decode_tokens_per_second),

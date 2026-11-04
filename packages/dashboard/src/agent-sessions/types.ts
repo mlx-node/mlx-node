@@ -88,6 +88,7 @@ export interface TurnMetric {
   reasoningTokens: number;
   elapsedMs: number | null;
   ttftMs: number | null;
+  prefillMs: number | null;
   prefillTps: number | null;
   prefillInputTokens: number | null;
   decodeTps: number | null;

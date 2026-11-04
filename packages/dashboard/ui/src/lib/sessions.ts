@@ -59,17 +59,21 @@ export interface TurnPrefill {
 /**
  * A turn's prefill, or `null` when it is unreported, too small to judge, or of unknown size.
  *
- * The engine reports `prefillTps = work tokens / ttft`, and its work tokens can exceed
+ * The engine reports `prefillTps = work tokens / prefill time`, and its work tokens can exceed
  * `prefillInputTokens` (LFM2 / NemotronH re-prefill the whole prompt on a partial hit),
- * so the size comes from `tps × ttft` whenever ttft is known.
+ * so the size comes from `tps × time` whenever the time is known. The time is `prefillMs`
+ * when present: once grok reports turn totals, `ttftMs` is only the first call's time.
  */
-export function turnPrefill(t: Pick<TurnMetric, 'prefillTps' | 'prefillInputTokens' | 'ttftMs'>): TurnPrefill | null {
+export function turnPrefill(
+  t: Pick<TurnMetric, 'prefillTps' | 'prefillInputTokens' | 'ttftMs' | 'prefillMs'>,
+): TurnPrefill | null {
   const tps = t.prefillTps;
   if (tps === null || !Number.isFinite(tps) || tps <= 0) return null;
+  const ms = positive(t.prefillMs) ?? positive(t.ttftMs);
   let tokens: number;
   let seconds: number;
-  if (t.ttftMs !== null && Number.isFinite(t.ttftMs) && t.ttftMs > 0) {
-    seconds = t.ttftMs / 1000;
+  if (ms !== null) {
+    seconds = ms / 1000;
     tokens = tps * seconds;
   } else if (t.prefillInputTokens !== null && Number.isFinite(t.prefillInputTokens)) {
     tokens = t.prefillInputTokens;
@@ -79,6 +83,10 @@ export function turnPrefill(t: Pick<TurnMetric, 'prefillTps' | 'prefillInputToke
   }
   if (tokens < PREFILL_MIN_TOKENS) return null;
   return { tokens, seconds, tps };
+}
+
+function positive(v: number | null): number | null {
+  return v !== null && Number.isFinite(v) && v > 0 ? v : null;
 }
 
 /** Token-weighted prefill rate over the qualifying turns: total tokens / total seconds. */

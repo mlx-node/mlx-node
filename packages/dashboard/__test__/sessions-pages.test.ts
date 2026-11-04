@@ -80,6 +80,7 @@ function turn(overrides: Partial<TurnMetric>): TurnMetric {
     reasoningTokens: 0,
     elapsedMs: 4_000,
     ttftMs: 120,
+    prefillMs: null,
     prefillTps: 900,
     prefillInputTokens: null,
     decodeTps: 60,
@@ -618,18 +619,20 @@ describe('turnTokenBars', () => {
 
 describe('turnPrefill / prefillAverage', () => {
   it('keeps turns from the threshold up, derives seconds, and weights the average by tokens', () => {
-    expect(turnPrefill({ prefillTps: 50, prefillInputTokens: 20, ttftMs: null })).toBeNull();
-    expect(turnPrefill({ prefillTps: 640, prefillInputTokens: null, ttftMs: null })).toBeNull();
-    expect(turnPrefill({ prefillTps: null, prefillInputTokens: 4_000, ttftMs: 2_000 })).toBeNull();
-    expect(turnPrefill({ prefillTps: 0, prefillInputTokens: 4_000, ttftMs: 2_000 })).toBeNull();
-    expect(turnPrefill({ prefillTps: 256, prefillInputTokens: PREFILL_MIN_TOKENS, ttftMs: null })).toEqual({
+    expect(turnPrefill({ prefillTps: 50, prefillInputTokens: 20, ttftMs: null, prefillMs: null })).toBeNull();
+    expect(turnPrefill({ prefillTps: 640, prefillInputTokens: null, ttftMs: null, prefillMs: null })).toBeNull();
+    expect(turnPrefill({ prefillTps: null, prefillInputTokens: 4_000, ttftMs: 2_000, prefillMs: null })).toBeNull();
+    expect(turnPrefill({ prefillTps: 0, prefillInputTokens: 4_000, ttftMs: 2_000, prefillMs: null })).toBeNull();
+    expect(
+      turnPrefill({ prefillTps: 256, prefillInputTokens: PREFILL_MIN_TOKENS, ttftMs: null, prefillMs: null }),
+    ).toEqual({
       tokens: 512,
       seconds: 2,
       tps: 256,
     });
 
-    const big = turnPrefill({ prefillTps: 1_000, prefillInputTokens: 30_000, ttftMs: null });
-    const small = turnPrefill({ prefillTps: 100, prefillInputTokens: 1_000, ttftMs: null });
+    const big = turnPrefill({ prefillTps: 1_000, prefillInputTokens: 30_000, ttftMs: null, prefillMs: null });
+    const small = turnPrefill({ prefillTps: 100, prefillInputTokens: 1_000, ttftMs: null, prefillMs: null });
     // 31,000 tokens / (30 s + 10 s), not the mean of the two rates (550).
     expect(prefillAverage([big, small, null])).toBe(775);
     expect(prefillAverage([null])).toBeNull();
@@ -639,15 +642,37 @@ describe('turnPrefill / prefillAverage', () => {
   it('times a turn by its ttft, the rate denominator, not by the cached-suffix count', () => {
     // LFM2 partial hit: 40,000 full-prompt tokens re-prefilled in 100 s, but only a
     // 1,000-token suffix was uncached. tokens / rate would claim 2.5 s.
-    expect(turnPrefill({ prefillTps: 400, prefillInputTokens: 1_000, ttftMs: 100_000 })).toEqual({
+    expect(turnPrefill({ prefillTps: 400, prefillInputTokens: 1_000, ttftMs: 100_000, prefillMs: null })).toEqual({
       tokens: 40_000,
       seconds: 100,
       tps: 400,
     });
     // A 20-token qwen prefill that took 0.4 s is fixed cost: 50 tok/s x 0.4 s = 20 < threshold.
-    expect(turnPrefill({ prefillTps: 50, prefillInputTokens: 20, ttftMs: 400 })).toBeNull();
+    expect(turnPrefill({ prefillTps: 50, prefillInputTokens: 20, ttftMs: 400, prefillMs: null })).toBeNull();
     // A small uncached suffix still counts when the measured work was large.
-    expect(turnPrefill({ prefillTps: 400, prefillInputTokens: 100, ttftMs: 10_000 })?.tokens).toBe(4_000);
+    expect(turnPrefill({ prefillTps: 400, prefillInputTokens: 100, ttftMs: 10_000, prefillMs: null })?.tokens).toBe(
+      4_000,
+    );
+  });
+
+  it("times a turn by its total prefillMs, not the first call's ttft", () => {
+    // A multi-call turn: the first call answered in 0.4 s, all calls prefilled for 36.25 s.
+    expect(turnPrefill({ prefillTps: 571, prefillInputTokens: 20_000, ttftMs: 400, prefillMs: 36_250 })).toEqual({
+      tokens: 571 * 36.25,
+      seconds: 36.25,
+      tps: 571,
+    });
+    // Without a usable prefillMs, ttft still times the turn.
+    expect(turnPrefill({ prefillTps: 400, prefillInputTokens: 1_000, ttftMs: 100_000, prefillMs: 0 })?.seconds).toBe(
+      100,
+    );
+    expect(
+      turnPrefill({ prefillTps: 400, prefillInputTokens: 1_000, ttftMs: 100_000, prefillMs: Number.NaN })?.seconds,
+    ).toBe(100);
+    // Neither time known: the size falls back to the uncached count.
+    expect(turnPrefill({ prefillTps: 400, prefillInputTokens: 1_000, ttftMs: null, prefillMs: null })?.seconds).toBe(
+      2.5,
+    );
   });
 });
 
