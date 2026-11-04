@@ -1,6 +1,6 @@
 {
   "name": "@mlx-node/privacy",
-  "version": "0.0.20",
+  "version": "0.0.21",
   "homepage": "https://github.com/mlx-node/mlx-node",
   "bugs": {
     "url": "https://github.com/mlx-node/mlx-node/issues"
