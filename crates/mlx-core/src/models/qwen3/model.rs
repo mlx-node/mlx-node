@@ -540,6 +540,27 @@ impl QwenStepExecutor<'_> {
                         .preemption_replay
                         .as_ref()
                         .is_some_and(|replay| replay.suppress_sample);
+                    if let Some(progress) = turn
+                        .payload
+                        .response
+                        .sink()
+                        .and_then(|sink| sink.progress())
+                    {
+                        let cached_prefix =
+                            turn.payload.preemption_replay.as_ref().map_or(
+                                turn.payload.prefix.effective_cached_prefix_len,
+                                |replay| replay.cached_prefix as usize,
+                            );
+                        // Slices before `start` are materialized.
+                        if start == cached_prefix {
+                            progress.begin_prefill(
+                                source_len.saturating_sub(cached_prefix) as u32,
+                                cached_prefix as u32,
+                            );
+                        } else {
+                            progress.prefill_advanced(start.saturating_sub(cached_prefix) as u32);
+                        }
+                    }
                     turn.payload.profiler.begin_prefill();
                     forward_rows.push((row.seq_id, tokens));
                     work.push(PreparedRaggedRow {
@@ -2058,7 +2079,7 @@ impl Qwen3Inner {
                         kv_value.eval();
                     }
                     synchronize_and_clear_cache();
-                    Ok(())
+                    Ok(fwd::ChunkBarrier::Finished)
                 },
             )?;
             fwd::slice_last_logits_to_vocab(&logits)?
@@ -2742,7 +2763,7 @@ impl Qwen3Inner {
                         kv_value.eval();
                     }
                     synchronize_and_clear_cache();
-                    Ok(())
+                    Ok(fwd::ChunkBarrier::Finished)
                 },
             )?;
             fwd::slice_last_logits_to_vocab(&logits)?
@@ -3843,7 +3864,7 @@ impl Qwen3Inner {
                     kv_value.eval();
                 }
                 synchronize_and_clear_cache();
-                Ok(())
+                Ok(fwd::ChunkBarrier::Finished)
             },
         )?;
         // Keep as `[1, vocab]` (squeeze only axis 1) so the shape
@@ -4464,11 +4485,12 @@ impl Qwen3Model {
         tokio::sync::mpsc::Receiver<Result<crate::engine::types::ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
-            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
-        );
+        let (plumbing, stream_rx) = crate::engine::napi_glue::chat_stream_plumbing();
+        let crate::engine::napi_glue::ChatStreamPlumbing {
+            cancelled: cancelled_inner,
+            stream_tx,
+            handle,
+        } = plumbing;
         self.thread
             .send(Qwen3Cmd::from_chat(ChatCmd::StreamSessionStart {
                 messages,
@@ -4476,10 +4498,7 @@ impl Qwen3Model {
                 stream_tx,
                 cancelled: cancelled_inner,
             }))?;
-        Ok((
-            crate::engine::types::ChatStreamHandle { cancelled },
-            stream_rx,
-        ))
+        Ok((handle, stream_rx))
     }
 
     /// Test-only entry point that dispatches
@@ -4495,11 +4514,12 @@ impl Qwen3Model {
         tokio::sync::mpsc::Receiver<Result<crate::engine::types::ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
-            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
-        );
+        let (plumbing, stream_rx) = crate::engine::napi_glue::chat_stream_plumbing();
+        let crate::engine::napi_glue::ChatStreamPlumbing {
+            cancelled: cancelled_inner,
+            stream_tx,
+            handle,
+        } = plumbing;
         self.thread
             .send(Qwen3Cmd::from_chat(ChatCmd::StreamSessionContinue {
                 messages,
@@ -4507,10 +4527,7 @@ impl Qwen3Model {
                 stream_tx,
                 cancelled: cancelled_inner,
             }))?;
-        Ok((
-            crate::engine::types::ChatStreamHandle { cancelled },
-            stream_rx,
-        ))
+        Ok((handle, stream_rx))
     }
 
     /// Fused forward pass using C++ implementation for maximum performance.

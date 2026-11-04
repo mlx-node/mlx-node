@@ -1,3 +1,4 @@
+import type { ChatStreamProgress } from '@mlx-node/core';
 import { describe, expect, it } from 'vite-plus/test';
 
 import {
@@ -9,6 +10,7 @@ import {
   buildMessageDelta,
   buildMessageStartEvent,
   buildMessageStop,
+  buildProgressPing,
   internalToolCallIdToAnthropic,
   mapStopReason,
   recoverSuppressedToolCallText,
@@ -803,5 +805,120 @@ describe('recoverSuppressedToolCallText', () => {
   it('drops orphan end sentinels and non-LFM2 families', () => {
     const raw = 'a <|tool_call_end|> b <tool_call>{"name":"x"}</tool_call> c';
     expect(recoverSuppressedToolCallText(raw)).toBe('a  b  c');
+  });
+});
+
+describe('buildProgressPing', () => {
+  it('sends only phase and elapsed_ms while queued', () => {
+    expect(buildProgressPing({ phase: 'queued' }, null, 10_000.4)).toEqual({
+      type: 'ping',
+      mlx_progress: { phase: 'queued', elapsed_ms: 10_000 },
+    });
+  });
+
+  it('returns null once the native turn is done', () => {
+    expect(buildProgressPing({ phase: 'done', generatedTokens: 3 }, null, 1)).toBeNull();
+  });
+
+  it('omits prefill numbers that are not known yet', () => {
+    const ping = buildProgressPing({ phase: 'prefill', prefillElapsedMs: 2_000 }, { phase: 'queued' }, 3_000);
+    expect(ping?.mlx_progress).toEqual({ phase: 'prefill', elapsed_ms: 3_000 });
+  });
+
+  it('measures the first prefill rate from prefill start and later ones from the previous tick', () => {
+    const first: ChatStreamProgress = {
+      phase: 'prefill',
+      prefillTotal: 4_000,
+      prefillDone: 600,
+      cachedTokens: 128,
+      prefillElapsedMs: 4_000,
+    };
+    expect(buildProgressPing(first, { phase: 'queued' }, 10_000)?.mlx_progress).toEqual({
+      phase: 'prefill',
+      elapsed_ms: 10_000,
+      prefill_total: 4_000,
+      prefill_done: 600,
+      cached_tokens: 128,
+      prefill_tokens_per_second: 150,
+    });
+    const second: ChatStreamProgress = { ...first, prefillDone: 2_648, prefillElapsedMs: 14_000 };
+    expect(buildProgressPing(second, first, 20_000)?.mlx_progress.prefill_tokens_per_second).toBe(204.8);
+  });
+
+  it('omits the prefill rate when the window made no progress or went backwards', () => {
+    const prev: ChatStreamProgress = { phase: 'prefill', prefillTotal: 10, prefillDone: 6, prefillElapsedMs: 1_000 };
+    const stalled = buildProgressPing({ ...prev, prefillElapsedMs: 11_000 }, prev, 1);
+    expect(stalled?.mlx_progress).not.toHaveProperty('prefill_tokens_per_second');
+    expect(stalled?.mlx_progress.prefill_done).toBe(6);
+    const replayed = buildProgressPing({ ...prev, prefillDone: 2, prefillElapsedMs: 11_000 }, prev, 1);
+    expect(replayed?.mlx_progress).not.toHaveProperty('prefill_tokens_per_second');
+    const oneShot = buildProgressPing({ ...prev, prefillDone: 0 }, null, 1);
+    expect(oneShot?.mlx_progress).not.toHaveProperty('prefill_tokens_per_second');
+  });
+
+  it('reports decode numbers from the first token, freezing prefill fields without a prefill rate', () => {
+    const prefill: ChatStreamProgress = {
+      phase: 'prefill',
+      prefillTotal: 100,
+      prefillDone: 50,
+      cachedTokens: 0,
+      prefillElapsedMs: 1_000,
+    };
+    const decode: ChatStreamProgress = {
+      phase: 'decode',
+      prefillTotal: 100,
+      prefillDone: 100,
+      cachedTokens: 0,
+      prefillElapsedMs: 2_000,
+      generatedTokens: 30,
+      decodeElapsedMs: 1_500,
+    };
+    expect(buildProgressPing(decode, prefill, 12_000)?.mlx_progress).toEqual({
+      phase: 'decode',
+      elapsed_ms: 12_000,
+      prefill_total: 100,
+      prefill_done: 100,
+      cached_tokens: 0,
+      generated_tokens: 30,
+      decode_tokens_per_second: 20,
+    });
+    const later: ChatStreamProgress = { ...decode, generatedTokens: 330, decodeElapsedMs: 11_500 };
+    expect(buildProgressPing(later, decode, 22_000)?.mlx_progress.decode_tokens_per_second).toBe(30);
+    const stalled = buildProgressPing({ ...later, decodeElapsedMs: 21_500 }, later, 32_000);
+    expect(stalled?.mlx_progress).not.toHaveProperty('decode_tokens_per_second');
+    expect(stalled?.mlx_progress.generated_tokens).toBe(330);
+  });
+
+  it('omits generated_tokens while the core reports 0 (not counted)', () => {
+    const ping = buildProgressPing({ phase: 'decode', generatedTokens: 0, decodeElapsedMs: 5_000 }, null, 20_000);
+    expect(ping?.mlx_progress).toEqual({ phase: 'decode', elapsed_ms: 20_000 });
+  });
+
+  it('matches the golden frame grok parses', () => {
+    const prev: ChatStreamProgress = {
+      phase: 'prefill',
+      prefillTotal: 20_700,
+      prefillDone: 6_589,
+      cachedTokens: 4_096,
+      prefillElapsedMs: 10_000,
+    };
+    const prefill: ChatStreamProgress = { ...prev, prefillDone: 12_300, prefillElapsedMs: 20_000 };
+    expect(JSON.stringify(buildProgressPing(prefill, prev, 20_000.4))).toBe(
+      '{"type":"ping","mlx_progress":{"phase":"prefill","elapsed_ms":20000,"prefill_total":20700,"prefill_done":12300,"cached_tokens":4096,"prefill_tokens_per_second":571.1}}',
+    );
+    const decode: ChatStreamProgress = {
+      ...prefill,
+      phase: 'decode',
+      prefillDone: 20_700,
+      prefillElapsedMs: 36_000,
+      generatedTokens: 84,
+      decodeElapsedMs: 1_687,
+    };
+    expect(JSON.stringify(buildProgressPing(decode, prefill, 40_000))).toBe(
+      '{"type":"ping","mlx_progress":{"phase":"decode","elapsed_ms":40000,"prefill_total":20700,"prefill_done":20700,"cached_tokens":4096,"generated_tokens":84,"decode_tokens_per_second":49.8}}',
+    );
+    expect(JSON.stringify(buildProgressPing({ phase: 'queued' }, null, 10_000))).toBe(
+      '{"type":"ping","mlx_progress":{"phase":"queued","elapsed_ms":10000}}',
+    );
   });
 });

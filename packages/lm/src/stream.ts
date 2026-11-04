@@ -19,6 +19,7 @@ import type {
   ChatResult,
   ChatStreamChunk,
   ChatStreamHandle,
+  ChatStreamProgress,
   PerformanceMetrics,
   ToolDefinition,
   ToolCallResult,
@@ -98,6 +99,14 @@ export interface ChatStreamFinal {
 }
 
 export type ChatStreamEvent = ChatStreamDelta | ChatStreamFinal;
+
+/**
+ * Reader for the live native stream's progress. `read` is set once the
+ * native handle exists and reset to `null` when the stream ends.
+ */
+export interface ChatStreamProgressRef {
+  read: (() => ChatStreamProgress | null) | null;
+}
 
 const modelPathsForTokenizers = new WeakMap<object, string>();
 const tokenizerPromises = new WeakMap<object, Promise<Qwen3Tokenizer>>();
@@ -210,6 +219,7 @@ async function applyChatTemplateFromModelPath(
 export async function* _runChatStream(
   startCall: (callback: (err: Error | null, chunk: ChatStreamChunk) => void) => Promise<ChatStreamHandle>,
   signal?: AbortSignal,
+  progressRef?: ChatStreamProgressRef,
 ): AsyncGenerator<ChatStreamEvent> {
   // The native ThreadsafeFunction uses the same fixed ceiling. This JS-side
   // guard also protects handwritten/test adapters that bypass the Rust glue.
@@ -312,6 +322,11 @@ export async function* _runChatStream(
     }
   }
 
+  if (progressRef != null) {
+    const started = handle;
+    progressRef.read = () => started.progress();
+  }
+
   try {
     loop: while (true) {
       await waitForItem();
@@ -388,6 +403,7 @@ export async function* _runChatStream(
         // a misbehaving signal must not leak out of the finally.
       }
     }
+    if (progressRef != null) progressRef.read = null;
     cancelOnce();
   }
 }
@@ -707,10 +723,12 @@ export function makeStreamingModel<C extends NativeStreamingCtor, const O extend
       messages: ChatMessage[],
       config?: ChatConfig | null,
       signal?: AbortSignal,
+      progressRef?: ChatStreamProgressRef,
     ): AsyncGenerator<ChatStreamEvent> {
       yield* _runChatStream(
         (callback) => nativeStart.call(this, messages as never, (config ?? null) as never, callback as never),
         signal,
+        progressRef,
       );
     }
 
@@ -718,10 +736,12 @@ export function makeStreamingModel<C extends NativeStreamingCtor, const O extend
       messages: ChatMessage[],
       config?: ChatConfig | null,
       signal?: AbortSignal,
+      progressRef?: ChatStreamProgressRef,
     ): AsyncGenerator<ChatStreamEvent> {
       yield* _runChatStream(
         (callback) => nativeContinue.call(this, messages as never, (config ?? null) as never, callback as never),
         signal,
+        progressRef,
       );
     }
 
@@ -729,10 +749,12 @@ export function makeStreamingModel<C extends NativeStreamingCtor, const O extend
       messages: ChatMessage[],
       config?: ChatConfig | null,
       signal?: AbortSignal,
+      progressRef?: ChatStreamProgressRef,
     ): AsyncGenerator<ChatStreamEvent> {
       yield* _runChatStream(
         (callback) => nativeContinueTool.call(this, messages as never, (config ?? null) as never, callback as never),
         signal,
+        progressRef,
       );
     }
   }

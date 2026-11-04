@@ -780,6 +780,26 @@ mlx serve --verbose                              # capture every HTTP turn to a 
 
 Like `mlx launch claude`, it applies the launcher engine policy (`MLX_PAGED_PREFILL_CHUNK_SIZE=2048`) unless the variable is already set in the environment.
 
+### Progress pings on `/v1/messages`
+
+While a streaming `/v1/messages` turn runs, the server writes a standard Anthropic `ping` event every 10 s (`MLX_SSE_PROGRESS_INTERVAL_MS` overrides) carrying an `mlx_progress` extension, so a client can show prefill and decode progress on long prompts. The first ping is 10 s after the stream starts. No ping follows `message_delta`, `message_stop` or `error`, and a tick is skipped while the socket is backpressured or the client has gone. Every field is omitted while unknown. `phase` is `queued` until the model thread starts this request, then `prefill`, then `decode`. Rates cover the window since the previous ping (the first prefill ping counts from prefill start, the first decode ping from the first token) and are omitted when the window shows no progress. `elapsed_ms` is measured from the start of the response stream. There is no ETA field: clients derive it from `prefill_total - prefill_done` and the rate. Non-streaming requests and `/v1/responses` do not send it.
+
+```
+event: ping
+data: {"type":"ping","mlx_progress":{"phase":"prefill","elapsed_ms":20000,"prefill_total":4000,"prefill_done":2600,"cached_tokens":96,"prefill_tokens_per_second":200}}
+```
+
+| Field                       | Meaning                                                |
+| --------------------------- | ------------------------------------------------------ |
+| `phase`                     | `queued`, `prefill` or `decode`                        |
+| `elapsed_ms`                | Integer ms since the response stream started           |
+| `prefill_total`             | Tokens this turn prefills, excluding the cached prefix |
+| `prefill_done`              | Tokens of `prefill_total` done so far                  |
+| `cached_tokens`             | Prefix tokens reused from the cache                    |
+| `prefill_tokens_per_second` | Prefill rate over the last window                      |
+| `generated_tokens`          | Tokens generated so far (from `decode` on)             |
+| `decode_tokens_per_second`  | Decode rate over the last window                       |
+
 ## `mlx launch claude`
 
 Launches the same inference host as `mlx serve` and spawns Claude Code against it — the entry point for using MLX-Node as a Claude Code backend. Use `mlx serve` when you want the server without a Claude Code child (for example to point another client at it, or to reproduce a wedged sidecar in a terminal).

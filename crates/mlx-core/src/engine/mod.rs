@@ -28,6 +28,7 @@ pub(crate) mod params;
 pub(crate) mod penalties;
 pub(crate) mod persistence;
 pub(crate) mod plan;
+pub(crate) mod progress;
 pub(crate) mod recurrent_state;
 pub(crate) mod scheduled_verify;
 pub(crate) mod scheduler;

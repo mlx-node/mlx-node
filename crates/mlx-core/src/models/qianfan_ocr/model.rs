@@ -384,7 +384,7 @@ struct StreamSender(StreamTx<ChatStreamChunk>);
 
 impl StreamSender {
     fn call(&self, result: napi::Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
-        let _ = self.0.send(result);
+        crate::engine::backend::ChunkSink::send(&self.0, result);
     }
 }
 
@@ -969,6 +969,9 @@ impl QianfanOCRInner {
         cancelled: Arc<AtomicBool>,
         eos_token_id: u32,
     ) {
+        let _progress =
+            crate::engine::progress::install_turn_progress(stream_tx.progress().cloned());
+        let progress = stream_tx.progress();
         let sender = StreamSender(stream_tx.clone());
         let emit = |chunk: ChatStreamChunk| {
             sender.call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking);
@@ -1020,6 +1023,12 @@ impl QianfanOCRInner {
                 num_patches_list,
                 cached_tokens,
             } = prepared;
+            if let Some(progress) = progress {
+                progress.begin_prefill(
+                    token_ids.len().saturating_sub(cached_tokens) as u32,
+                    cached_tokens as u32,
+                );
+            }
 
             let mut cache = self.kv_caches.take();
             let prefill_result: Result<MxArray> = {
@@ -1075,6 +1084,9 @@ impl QianfanOCRInner {
 
             let mut token = sample(&last_logits, Some(sampling_config))?;
             token.eval();
+            if let Some(progress) = progress {
+                progress.first_token();
+            }
 
             let first_token_instant = generation_start.map(|_| std::time::Instant::now());
             let prefill_token_count = all_tokens.len();
@@ -1107,6 +1119,9 @@ impl QianfanOCRInner {
                     break;
                 }
                 let is_reasoning = reasoning_tracker.observe_token(token_value);
+                if let Some(progress) = progress {
+                    progress.add_generated(1);
+                }
 
                 // Decode and emit BEFORE repetition check so the
                 // triggering token is streamed to clients
@@ -1315,7 +1330,7 @@ impl QianfanOCRInner {
             // Propagate errors through the same stream; the tokio pump task
             // in `QianfanOCRModel::chat_stream` forwards them to the JS
             // callback's error channel.
-            let _ = stream_tx.send(Err(e));
+            sender.call(Err(e), ThreadsafeFunctionCallMode::NonBlocking);
         }
     }
 
@@ -1959,6 +1974,82 @@ mod cancellation_tests {
         let error = qianfan_sync_turn_reply(Ok(()), &live)
             .expect_err("post-turn cancellation must discard a successful result");
         assert_eq!(error.reason, crate::engine::session::CHAT_SESSION_CANCELLED);
+    }
+}
+
+#[cfg(test)]
+mod stream_progress_tests {
+    use super::*;
+    use crate::engine::progress::TurnProgress;
+
+    fn chunk(text: &str, done: bool) -> ChatStreamChunk {
+        ChatStreamChunk {
+            text: text.to_string(),
+            done,
+            finish_reason: done.then(|| "stop".to_string()),
+            tool_calls: None,
+            thinking: None,
+            thinking_enabled: None,
+            num_tokens: None,
+            prompt_tokens: None,
+            reasoning_tokens: None,
+            raw_text: None,
+            public_raw_text: None,
+            text_authoritative: None,
+            cached_tokens: None,
+            performance: None,
+            is_reasoning: None,
+        }
+    }
+
+    fn sender() -> (
+        Arc<TurnProgress>,
+        StreamSender,
+        tokio::sync::mpsc::Receiver<Result<ChatStreamChunk>>,
+    ) {
+        let progress = Arc::new(TurnProgress::new());
+        let (tx, rx) = crate::model_thread::stream_channel_with_progress(8, Arc::clone(&progress));
+        (progress, StreamSender(tx), rx)
+    }
+
+    #[test]
+    fn stream_sender_reaches_decode_on_first_text_then_done_on_terminal() {
+        let (progress, sender, _rx) = sender();
+        sender.call(
+            Ok(chunk("", false)),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+        assert_eq!(progress.snapshot().phase, "queued");
+        sender.call(
+            Ok(chunk("a", false)),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+        assert_eq!(progress.snapshot().phase, "decode");
+        sender.call(
+            Ok(chunk("a", true)),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+        assert_eq!(progress.snapshot().phase, "done");
+    }
+
+    #[test]
+    fn stream_sender_error_finishes_progress() {
+        let (progress, sender, _rx) = sender();
+        sender.call(
+            Err(Error::from_reason("boom")),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+        assert_eq!(progress.snapshot().phase, "done");
+    }
+
+    #[test]
+    fn guard_stream_error_finishes_progress() {
+        let progress = Arc::new(TurnProgress::new());
+        let (tx, mut rx) =
+            crate::model_thread::stream_channel_with_progress(8, Arc::clone(&progress));
+        crate::engine::send_stream_error(&tx, "guard");
+        assert_eq!(rx.try_recv().unwrap().err().unwrap().reason, "guard");
+        assert_eq!(progress.snapshot().phase, "done");
     }
 }
 

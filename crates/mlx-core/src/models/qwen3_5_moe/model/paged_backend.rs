@@ -25,6 +25,13 @@ impl StreamSender<'_> {
     ) {
         self.0.send(result);
     }
+
+    /// Count one kept token on the request's progress.
+    pub(super) fn count_token(&self) {
+        if let Some(progress) = self.0.progress() {
+            progress.add_generated(1);
+        }
+    }
 }
 
 /// Paged decode state for qwen3_5_moe (the paged analog of the FLAT

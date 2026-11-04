@@ -1565,11 +1565,12 @@ impl K2HorizonModel {
         tokio::sync::mpsc::Receiver<Result<ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
-            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
-        );
+        let (plumbing, stream_rx) = crate::engine::napi_glue::chat_stream_plumbing();
+        let crate::engine::napi_glue::ChatStreamPlumbing {
+            cancelled: cancelled_inner,
+            stream_tx,
+            handle,
+        } = plumbing;
         self.thread
             .send(K2Cmd::Chat(Box::new(ChatCmd::StreamSessionStart {
                 messages,
@@ -1577,7 +1578,7 @@ impl K2HorizonModel {
                 stream_tx,
                 cancelled: cancelled_inner,
             })))?;
-        Ok((ChatStreamHandle { cancelled }, stream_rx))
+        Ok((handle, stream_rx))
     }
 
     /// Test-only entry point that dispatches `ChatStreamSessionContinue`.
@@ -1591,11 +1592,12 @@ impl K2HorizonModel {
         tokio::sync::mpsc::Receiver<Result<ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
-            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
-        );
+        let (plumbing, stream_rx) = crate::engine::napi_glue::chat_stream_plumbing();
+        let crate::engine::napi_glue::ChatStreamPlumbing {
+            cancelled: cancelled_inner,
+            stream_tx,
+            handle,
+        } = plumbing;
         self.thread
             .send(K2Cmd::Chat(Box::new(ChatCmd::StreamSessionContinue {
                 messages,
@@ -1603,7 +1605,7 @@ impl K2HorizonModel {
                 stream_tx,
                 cancelled: cancelled_inner,
             })))?;
-        Ok((ChatStreamHandle { cancelled }, stream_rx))
+        Ok((handle, stream_rx))
     }
 
     /// Get the model configuration.

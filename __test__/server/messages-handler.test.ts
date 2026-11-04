@@ -1,7 +1,7 @@
 import type { ServerResponse } from 'node:http';
 
-import type { ChatMessage, ChatResult, ToolCallResult } from '@mlx-node/core';
-import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
+import type { ChatMessage, ChatResult, ChatStreamProgress, ToolCallResult } from '@mlx-node/core';
+import { ChatSession, type ChatStreamProgressRef, type SessionCapableModel } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
@@ -6486,5 +6486,249 @@ describe('handleCreateMessage', () => {
         primeHistorySpy.mockRestore();
       }
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Progress pings
+// ---------------------------------------------------------------------------
+
+type ProgressStep = { event: Record<string, unknown> } | { error: Error };
+
+const PROGRESS_DONE_EVENT = {
+  text: 'ok',
+  done: true,
+  finishReason: 'stop',
+  toolCalls: [],
+  thinking: null,
+  numTokens: 1,
+  promptTokens: 1,
+  reasoningTokens: 0,
+  rawText: 'ok',
+};
+
+/**
+ * Stream model the test drives one step at a time. While its stream runs it
+ * fills the progress ref with whatever `snapshot.current` holds.
+ */
+function createSteppedStreamModel(): {
+  model: SessionCapableModel;
+  snapshot: { current: ChatStreamProgress | null };
+  push: (step: ProgressStep) => void;
+  refs: Array<ChatStreamProgressRef | undefined>;
+} {
+  const snapshot: { current: ChatStreamProgress | null } = { current: { phase: 'queued' } };
+  const pending: ProgressStep[] = [];
+  const refs: Array<ChatStreamProgressRef | undefined> = [];
+  let wake: (() => void) | null = null;
+  const push = (step: ProgressStep): void => {
+    pending.push(step);
+    const w = wake;
+    wake = null;
+    w?.();
+  };
+  async function* stream(ref: ChatStreamProgressRef | undefined): AsyncGenerator<Record<string, unknown>> {
+    refs.push(ref);
+    if (ref !== undefined) ref.read = () => snapshot.current;
+    try {
+      while (true) {
+        while (pending.length === 0) {
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+          });
+        }
+        const step = pending.shift()!;
+        if ('error' in step) throw step.error;
+        yield step.event;
+        if (step.event['done'] === true) return;
+      }
+    } finally {
+      if (ref !== undefined) ref.read = null;
+    }
+  }
+  const start = vi.fn(
+    (_messages: ChatMessage[], _config: unknown, _signal?: AbortSignal, ref?: ChatStreamProgressRef) => stream(ref),
+  );
+  const model = {
+    chatSessionStart: vi.fn().mockRejectedValue(new Error('Should use chatStreamSessionStart')),
+    chatSessionContinue: vi.fn().mockRejectedValue(new Error('not expected')),
+    chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('not expected')),
+    chatStreamSessionStart: start,
+    chatStreamSessionContinue: start,
+    chatStreamSessionContinueTool: start,
+    resetCaches: vi.fn().mockResolvedValue(undefined),
+  } as unknown as SessionCapableModel;
+  return { model, snapshot, push, refs };
+}
+
+describe('handleCreateMessage progress pings', () => {
+  async function startStream(mock: ReturnType<typeof createSteppedStreamModel>) {
+    const registry = new ModelRegistry();
+    registry.register('test-model', mock.model);
+    const response = createMockRes();
+    const done = handleCreateMessage(
+      response.res,
+      { model: 'test-model', messages: [{ role: 'user', content: 'hi' }], max_tokens: 100, stream: true },
+      registry,
+    );
+    while (mock.refs.length === 0) {
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    return { ...response, done };
+  }
+
+  const pings = (body: string) => parseSSE(body).filter((e) => e.event === 'ping');
+
+  it('pings every interval with the mapped snapshot and stops before message_delta', async () => {
+    vi.useFakeTimers();
+    try {
+      const mock = createSteppedStreamModel();
+      const { getBody, done } = await startStream(mock);
+      expect(mock.refs[0]).toBeDefined();
+
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(pings(getBody())).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(pings(getBody()).map((e) => e.data)).toEqual([
+        { type: 'ping', mlx_progress: { phase: 'queued', elapsed_ms: 10_000 } },
+      ]);
+
+      mock.snapshot.current = {
+        phase: 'prefill',
+        prefillTotal: 4_000,
+        prefillDone: 600,
+        cachedTokens: 96,
+        prefillElapsedMs: 6_000,
+      };
+      await vi.advanceTimersByTimeAsync(10_000);
+      mock.snapshot.current = { ...mock.snapshot.current, prefillDone: 2_600, prefillElapsedMs: 16_000 };
+      await vi.advanceTimersByTimeAsync(10_000);
+      mock.snapshot.current = {
+        phase: 'decode',
+        prefillTotal: 4_000,
+        prefillDone: 4_000,
+        cachedTokens: 96,
+        prefillElapsedMs: 20_000,
+        generatedTokens: 40,
+        decodeElapsedMs: 2_000,
+      };
+      mock.push({ event: { text: 'ok', done: false, isReasoning: false } });
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(pings(getBody()).map((e) => e.data['mlx_progress'])).toEqual([
+        { phase: 'queued', elapsed_ms: 10_000 },
+        {
+          phase: 'prefill',
+          elapsed_ms: 20_000,
+          prefill_total: 4_000,
+          prefill_done: 600,
+          cached_tokens: 96,
+          prefill_tokens_per_second: 100,
+        },
+        {
+          phase: 'prefill',
+          elapsed_ms: 30_000,
+          prefill_total: 4_000,
+          prefill_done: 2_600,
+          cached_tokens: 96,
+          prefill_tokens_per_second: 200,
+        },
+        {
+          phase: 'decode',
+          elapsed_ms: 40_000,
+          prefill_total: 4_000,
+          prefill_done: 4_000,
+          cached_tokens: 96,
+          generated_tokens: 40,
+          decode_tokens_per_second: 20,
+        },
+      ]);
+
+      mock.snapshot.current = { phase: 'done', generatedTokens: 41 };
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(pings(getBody())).toHaveLength(4);
+
+      mock.push({ event: PROGRESS_DONE_EVENT });
+      await vi.advanceTimersByTimeAsync(0);
+      await done;
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      const events = parseSSE(getBody()).map((e) => e.event);
+      expect(events).toContain('message_stop');
+      expect(events.lastIndexOf('ping')).toBeLessThan(events.indexOf('message_delta'));
+      expect(pings(getBody())).toHaveLength(4);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('skips ticks without a snapshot and honours MLX_SSE_PROGRESS_INTERVAL_MS', async () => {
+    const original = process.env.MLX_SSE_PROGRESS_INTERVAL_MS;
+    process.env.MLX_SSE_PROGRESS_INTERVAL_MS = '2000';
+    vi.useFakeTimers();
+    try {
+      const mock = createSteppedStreamModel();
+      mock.snapshot.current = null;
+      const { getBody, done } = await startStream(mock);
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(pings(getBody())).toHaveLength(0);
+
+      mock.snapshot.current = { phase: 'queued' };
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(pings(getBody()).map((e) => e.data['mlx_progress'])).toEqual([{ phase: 'queued', elapsed_ms: 8_000 }]);
+
+      mock.push({ event: PROGRESS_DONE_EVENT });
+      await vi.advanceTimersByTimeAsync(0);
+      await done;
+    } finally {
+      vi.useRealTimers();
+      if (original === undefined) delete process.env.MLX_SSE_PROGRESS_INTERVAL_MS;
+      else process.env.MLX_SSE_PROGRESS_INTERVAL_MS = original;
+    }
+  });
+
+  it('sends no ping after the streaming error frame', async () => {
+    vi.useFakeTimers();
+    try {
+      const mock = createSteppedStreamModel();
+      const { getBody, done } = await startStream(mock);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(pings(getBody())).toHaveLength(1);
+
+      mock.push({ error: new Error('prefill exploded') });
+      await vi.advanceTimersByTimeAsync(0);
+      await done;
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      const events = parseSSE(getBody());
+      const names = events.map((e) => e.event);
+      expect(names[names.length - 1]).toBe('error');
+      expect(pings(getBody())).toHaveLength(1);
+      expect(names.lastIndexOf('ping')).toBeLessThan(names.indexOf('error'));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops pinging once the client disconnects', async () => {
+    vi.useFakeTimers();
+    try {
+      const mock = createSteppedStreamModel();
+      const { res, getBody, done } = await startStream(mock);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(pings(getBody())).toHaveLength(1);
+
+      res.emit('close');
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(pings(getBody())).toHaveLength(1);
+
+      mock.push({ event: PROGRESS_DONE_EVENT });
+      await vi.advanceTimersByTimeAsync(0);
+      await done;
+      expect(parseSSE(getBody()).map((e) => e.event)).not.toContain('message_stop');
+      expect(pings(getBody())).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

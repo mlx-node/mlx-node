@@ -220,6 +220,9 @@ impl Qwen35MoeInner {
         // Text prefill. Image turns never reach here — they early-return onto
         // the paged-vision stream core (or error when no paged adapter is
         // present). This is the text-only flat path.
+        if let Some(progress) = crate::engine::backend::ChunkSink::progress(cb.0) {
+            progress.begin_prefill(prefill_tokens.len() as u32, cached_prefix_len as u32);
+        }
         profiler.begin_prefill();
         let turn_cancel = self.turn_cancel.clone();
         let (mut last_logits, _seq_len) = {
@@ -868,6 +871,13 @@ impl Qwen35MoeInner {
 
         // Text-only prefill of the delta on top of the existing caches.
         // Chunked defensively — see the sync sibling for rationale.
+        if let Some(progress) = crate::engine::backend::ChunkSink::progress(cb.0) {
+            if self.flat_mtp_caches_desynced {
+                progress.begin_prefill(full_token_history.len() as u32, 0);
+            } else {
+                progress.begin_prefill(delta_tokens.len() as u32, prior_cached_len);
+            }
+        }
         profiler.begin_prefill();
         let turn_cancel = self.turn_cancel.clone();
         let prefill_result = if self.flat_mtp_caches_desynced {

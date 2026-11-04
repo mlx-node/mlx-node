@@ -334,6 +334,7 @@ pub(crate) fn dflash2_prefill<T: DFlash2Target>(
                 shadow_context.eval()?;
             }
             crate::array::clear_cache();
+            crate::engine::progress::with_turn_progress(|p| p.prefill_advanced(end as u32));
         }
         offset = end;
     }
@@ -1276,6 +1277,10 @@ pub(crate) fn dflash2_chat_turn<T: DFlash2Target + DsparkBackend>(
         Ok(evicted) => evicted,
         Err(error) => return Err(dflash2_turn_failed(target, error, cached_prefix)),
     };
+    let progress = args.sink.and_then(|sink| sink.progress());
+    if let Some(progress) = progress {
+        progress.begin_prefill(prefill.len() as u32, cached_prefix as u32);
+    }
     profiler.begin_prefill();
     let (last_logits, state) = match dflash2_prefill(
         target,
@@ -1299,6 +1304,9 @@ pub(crate) fn dflash2_chat_turn<T: DFlash2Target + DsparkBackend>(
     y.eval();
     if let Err(error) = target.eval_layer_caches() {
         return Err(dflash2_turn_failed(target, error, cached_prefix));
+    }
+    if let Some(progress) = progress {
+        progress.first_token();
     }
     let first_token_at = Instant::now();
     if report_performance {

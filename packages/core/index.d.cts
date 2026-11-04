@@ -62,6 +62,8 @@ export declare class ChatSessionCall {
  */
 export declare class ChatStreamHandle {
   cancel(): void;
+  /** Snapshot of the turn's prefill/decode progress. */
+  progress(): ChatStreamProgress;
 }
 
 export declare class ClefCancellation {
@@ -3177,6 +3179,34 @@ export interface ChatStreamChunk {
    * Only present on intermediate (non-final) chunks.
    */
   isReasoning?: boolean | undefined;
+}
+
+/**
+ * Point-in-time progress of one streaming turn, read from
+ * [`ChatStreamHandle::progress`]. A field is absent while it is unknown.
+ */
+export interface ChatStreamProgress {
+  /**
+   * `queued` until the model thread picks the request up, then
+   * `prefill`, `decode` from the first sampled token, `done` after the
+   * terminal chunk or error.
+   */
+  phase: 'queued' | 'prefill' | 'decode' | 'done';
+  /** Tokens this turn prefills, excluding the cached prefix. */
+  prefillTotal?: number;
+  /**
+   * Tokens of `prefill_total` materialized so far. Paths that prefill in
+   * one shot stay at 0 until the first token.
+   */
+  prefillDone?: number;
+  /** Prefix tokens reused from the cache. */
+  cachedTokens?: number;
+  /** Tokens kept so far; known from the `decode` phase on. */
+  generatedTokens?: number;
+  /** Milliseconds from prefill start to the first token (or to now). */
+  prefillElapsedMs?: number;
+  /** Milliseconds since the first token. */
+  decodeElapsedMs?: number;
 }
 
 /** Result from classify_and_rotate: orientation info + corrected image bytes. */

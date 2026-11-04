@@ -1430,7 +1430,8 @@ impl PagedBackend for MuseGlimmerInner {
                     cached + start as u32,
                 )
             },
-            |_| Ok(()),
+            // Each slice's settle synchronously evaluates its pool writes.
+            |_| Ok(fwd::ChunkBarrier::Finished),
         )
     }
 

@@ -909,6 +909,7 @@ impl Qwen35MoeInner {
                 turn_streaming.streamed_text_len,
             );
             turn_streaming.streamed_text_len += token_text.len();
+            cb.count_token();
             // Suppress reasoning deltas when include_reasoning == false.
             // Detokenize + length-advance above stay OUTSIDE this gate.
             if p.include_reasoning || !is_reasoning {

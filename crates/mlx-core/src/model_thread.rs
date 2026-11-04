@@ -35,17 +35,25 @@ fn send_init_result<T>(
 #[derive(Debug)]
 pub struct StreamTx<T> {
     inner: tokio::sync::mpsc::Sender<napi::Result<T>>,
+    progress: Option<std::sync::Arc<crate::engine::progress::TurnProgress>>,
 }
 
 impl<T> Clone for StreamTx<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            progress: self.progress.clone(),
         }
     }
 }
 
 impl<T> StreamTx<T> {
+    pub(crate) fn progress(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::engine::progress::TurnProgress>> {
+        self.progress.as_ref()
+    }
+
     pub fn send(
         &self,
         item: napi::Result<T>,
@@ -68,7 +76,23 @@ pub fn stream_channel<T>(
 ) -> (StreamTx<T>, tokio::sync::mpsc::Receiver<napi::Result<T>>) {
     assert!(capacity > 0, "stream mailbox capacity must be non-zero");
     let (tx, rx) = tokio::sync::mpsc::channel(capacity);
-    (StreamTx { inner: tx }, rx)
+    (
+        StreamTx {
+            inner: tx,
+            progress: None,
+        },
+        rx,
+    )
+}
+
+/// [`stream_channel`] whose producer carries the request's progress.
+pub(crate) fn stream_channel_with_progress<T>(
+    capacity: usize,
+    progress: std::sync::Arc<crate::engine::progress::TurnProgress>,
+) -> (StreamTx<T>, tokio::sync::mpsc::Receiver<napi::Result<T>>) {
+    let (mut tx, rx) = stream_channel(capacity);
+    tx.progress = Some(progress);
+    (tx, rx)
 }
 
 /// A dedicated OS thread that owns model state and processes commands.

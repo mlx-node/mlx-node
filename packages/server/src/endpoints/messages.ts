@@ -56,9 +56,9 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
-import type { ChatConfig, ChatMessage, ChatResult, PerformanceMetrics } from '@mlx-node/core';
+import type { ChatConfig, ChatMessage, ChatResult, ChatStreamProgress, PerformanceMetrics } from '@mlx-node/core';
 import { isContextCapacityError } from '@mlx-node/lm';
-import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
+import type { ChatSession, ChatStreamEvent, ChatStreamProgressRef, SessionCapableModel } from '@mlx-node/lm';
 import { ToolCallTagBuffer } from '@mlx-node/lm';
 
 import { resetPreservingNativeCacheForWarmReuse } from '../chat-session-warm-reuse.js';
@@ -79,6 +79,7 @@ import {
   buildMessageDelta,
   buildMessageStartEvent,
   buildMessageStop,
+  buildProgressPing,
   containsToolCallMarkup,
   internalToolCallIdToAnthropic,
   recoverSuppressedToolCallText,
@@ -98,6 +99,7 @@ import {
   awaitDrainOrClose,
   beginSSE,
   endSSE,
+  resolveSSEProgressIntervalMs,
   type SSEClientAbortTracker,
   trackSSEClientAbort,
   writeSSEEvent as writeRawSSEEvent,
@@ -301,6 +303,7 @@ async function handleStreamingNative(
   emitReasoning: boolean,
   stopSequences: string[],
   serverTiming?: ServerTimingForUsage,
+  progressRef?: ChatStreamProgressRef,
 ): Promise<MessagesStreamingHandlerResult> {
   const abort = trackSSEClientAbort(res, httpReq);
   try {
@@ -314,6 +317,7 @@ async function handleStreamingNative(
       emitReasoning,
       stopSequences,
       serverTiming,
+      progressRef,
     );
   } finally {
     abort.dispose();
@@ -330,7 +334,9 @@ async function handleStreamingNativeWithAbort(
   emitReasoning: boolean,
   stopSequences: string[],
   serverTiming?: ServerTimingForUsage,
+  progressRef?: ChatStreamProgressRef,
 ): Promise<MessagesStreamingHandlerResult> {
+  const streamStartMs = Date.now();
   const messageId = genId('msg_');
   // `runSessionStreaming` completed the exact token/capacity preflight before
   // handing us this iterator. Commit SSE immediately instead of entering the
@@ -348,7 +354,13 @@ async function handleStreamingNativeWithAbort(
   const writeSSEEvent = (response: ServerResponse, eventType: string, data: object): void => {
     const ok = writeRawSSEEvent(response, eventType, data);
     if (!ok && pendingDrain === null) {
-      pendingDrain = awaitDrainOrClose(response, { onTimeout: () => abort.markAborted() });
+      const drain = awaitDrainOrClose(response, { onTimeout: () => abort.markAborted() });
+      pendingDrain = drain;
+      // Progress ticks read `pendingDrain` while the loop waits on the native
+      // stream, so it must clear on drain, not on the next native event.
+      void drain.then(() => {
+        if (pendingDrain === drain) pendingDrain = null;
+      });
     }
   };
   const drainPending = async (): Promise<void> => {
@@ -432,6 +444,29 @@ async function handleStreamingNativeWithAbort(
   // The outer wrapper's abort listeners precede the first body write so an
   // asynchronous socket error is authoritative before the drain wait resumes.
   writeSSEEvent(res, 'message_start', buildMessageStartEvent(body, messageId, 0));
+
+  // Progress pings go through the local writer so a full socket buffer sets
+  // `pendingDrain`; a tick never writes while one is pending.
+  let lastProgress: ChatStreamProgress | null = null;
+  const progressTimer =
+    progressRef === undefined
+      ? null
+      : setInterval(() => {
+          if (abort.aborted || pendingDrain !== null || res.writableEnded || res.destroyed) return;
+          let snapshot: ChatStreamProgress | null;
+          try {
+            snapshot = progressRef.read?.() ?? null;
+          } catch {
+            // A throw here would be uncaught in the timer callback.
+            return;
+          }
+          if (snapshot === null) return;
+          const ping = buildProgressPing(snapshot, lastProgress, Date.now() - streamStartMs);
+          if (ping === null) return;
+          lastProgress = snapshot;
+          writeSSEEvent(res, 'ping', ping);
+        }, resolveSSEProgressIntervalMs());
+  progressTimer?.unref();
 
   try {
     for await (const event of chatStream) {
@@ -846,6 +881,7 @@ async function handleStreamingNativeWithAbort(
     // epilogue (single streaming `error` event, no `message_stop`).
     thrownError = err instanceof Error ? err : new Error(String(err));
   } finally {
+    if (progressTimer !== null) clearInterval(progressTimer);
     await drainPending();
   }
 
@@ -1002,6 +1038,8 @@ async function runSessionNonStreaming(
 interface MessagesStreamingOutcome {
   stream: AsyncGenerator<ChatStreamEvent>;
   wasCommitted: () => boolean;
+  /** Filled while the native stream runs; read by the progress ping. */
+  progress: ChatStreamProgressRef;
 }
 
 async function runSessionStreaming(
@@ -1029,9 +1067,11 @@ async function runSessionStreaming(
   }
   session.primeHistory(messages);
   const initialTurns = session.turns;
+  const progress: ChatStreamProgressRef = { read: null };
   return {
-    stream: session.startFromHistoryStream(constrainedConfig, signal),
+    stream: session.startFromHistoryStream(constrainedConfig, signal, progress),
     wasCommitted: () => session.turns > initialTurns,
+    progress,
   };
 }
 
@@ -1584,6 +1624,7 @@ export async function handleCreateMessage(
                 config.includeReasoning !== false,
                 stopSequences,
                 serverTiming,
+                outcome.progress,
               );
               // Warm-slot adopt/drop only applies to the non-paged
               // path. On the paged path the JS-side warm slot plays no

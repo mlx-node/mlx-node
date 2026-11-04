@@ -600,21 +600,19 @@ impl Gemma4Model {
             Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
         })?;
         let config = config.unwrap_or_default();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
-            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
-        );
+        let (plumbing, stream_rx) = crate::engine::napi_glue::chat_stream_plumbing();
+        let crate::engine::napi_glue::ChatStreamPlumbing {
+            cancelled: cancelled_inner,
+            stream_tx,
+            handle,
+        } = plumbing;
         thread.send(Gemma4Cmd::Chat(Box::new(ChatCmd::StreamSessionStart {
             messages,
             config,
             stream_tx,
             cancelled: cancelled_inner,
         })))?;
-        Ok((
-            crate::engine::types::ChatStreamHandle { cancelled },
-            stream_rx,
-        ))
+        Ok((handle, stream_rx))
     }
 }
 

@@ -1837,7 +1837,7 @@ pub(super) fn prefill_body_gemma4(
         |ctx| {
             eval_gemma4_caches(ctx.2)?;
             crate::array::clear_cache();
-            Ok(())
+            Ok(fwd::ChunkBarrier::Finished)
         },
     )?;
 

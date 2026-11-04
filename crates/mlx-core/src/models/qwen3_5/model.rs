@@ -667,11 +667,12 @@ impl Qwen3_5Model {
         tokio::sync::mpsc::Receiver<Result<ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
-            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
-        );
+        let (plumbing, stream_rx) = crate::engine::napi_glue::chat_stream_plumbing();
+        let crate::engine::napi_glue::ChatStreamPlumbing {
+            cancelled: cancelled_inner,
+            stream_tx,
+            handle,
+        } = plumbing;
         self.thread
             .send(Qwen35Cmd::from_chat(ChatCmd::StreamSessionStart {
                 messages,
@@ -679,7 +680,7 @@ impl Qwen3_5Model {
                 stream_tx,
                 cancelled: cancelled_inner,
             }))?;
-        Ok((ChatStreamHandle { cancelled }, stream_rx))
+        Ok((handle, stream_rx))
     }
 
     /// Test-only entry point that dispatches `ChatStreamSessionContinue`
@@ -694,11 +695,12 @@ impl Qwen3_5Model {
         tokio::sync::mpsc::Receiver<Result<ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
-            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
-        );
+        let (plumbing, stream_rx) = crate::engine::napi_glue::chat_stream_plumbing();
+        let crate::engine::napi_glue::ChatStreamPlumbing {
+            cancelled: cancelled_inner,
+            stream_tx,
+            handle,
+        } = plumbing;
         self.thread
             .send(Qwen35Cmd::from_chat(ChatCmd::StreamSessionContinue {
                 messages,
@@ -706,7 +708,7 @@ impl Qwen3_5Model {
                 stream_tx,
                 cancelled: cancelled_inner,
             }))?;
-        Ok((ChatStreamHandle { cancelled }, stream_rx))
+        Ok((handle, stream_rx))
     }
 
     /// Test-only snapshot of the flat-MTP cache state, read *between* turns:
@@ -876,3 +878,6 @@ mod mtp_gate_state_tests;
 
 #[cfg(test)]
 mod dflash2_park_tests;
+
+#[cfg(test)]
+mod stream_progress_tests;

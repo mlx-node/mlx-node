@@ -1365,6 +1365,13 @@ impl Qwen35Inner {
         } else {
             delta_tokens.len() as u32
         });
+        if let Some(progress) = crate::engine::backend::ChunkSink::progress(cb.0) {
+            if rebuild_full_flat_prefill {
+                progress.begin_prefill(full_token_history.len() as u32, 0);
+            } else {
+                progress.begin_prefill(delta_tokens.len() as u32, prior_cached_len);
+            }
+        }
         profiler.begin_prefill();
         let turn_cancel = self.turn_cancel.clone();
         let prefill_result = if rebuild_full_flat_prefill {
@@ -1873,6 +1880,9 @@ impl Qwen35Inner {
         let want_prompt_hidden = eager_mtp && cached_prefix_len == 0;
         let mut prompt_hidden: Option<MxArray> = None;
 
+        if let Some(progress) = crate::engine::backend::ChunkSink::progress(cb.0) {
+            progress.begin_prefill(prefill_tokens.len() as u32, cached_prefix_len as u32);
+        }
         // Text prefill
         profiler.begin_prefill();
         let (mut last_logits, _seq_len) = {

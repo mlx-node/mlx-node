@@ -520,6 +520,9 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             "run_paged_prefill_chunk called with empty suffix",
         ));
     }
+    crate::engine::progress::with_turn_progress(|p| {
+        p.begin_prefill(suffix_tokens.len() as u32, cached_prefix_len)
+    });
 
     // Preserve the public `0 = legacy single-shot` contract. Capturing a
     // sidecar at the stable reusable-block boundary may require splitting
@@ -721,6 +724,9 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
                 }
             }
             crate::array::synchronize_and_clear_cache();
+            crate::engine::progress::with_turn_progress(|p| {
+                p.prefill_advanced(context_after - cached_prefix_len)
+            });
             if let Some(start) = chunk_trace_start {
                 let chunk_elapsed_ms = elapsed_ms(start);
                 let chunk_tok_s = if chunk_elapsed_ms > 0.0 {
@@ -950,6 +956,9 @@ pub(crate) fn run_paged_vlm_prefill(
         .map_err(Error::from_reason)?;
 
     let suffix_tokens = &expanded_tokens[cached_prefix_len_us..];
+    crate::engine::progress::with_turn_progress(|p| {
+        p.begin_prefill(suffix_tokens.len() as u32, cached_prefix_len)
+    });
     let configured_chunk_size = crate::array::paged_prefill_chunk_size();
     let chunk_size = if configured_chunk_size > 0 {
         configured_chunk_size as usize
@@ -1031,6 +1040,9 @@ pub(crate) fn run_paged_vlm_prefill(
         }
         if !is_last_chunk {
             crate::array::synchronize_and_clear_cache();
+            crate::engine::progress::with_turn_progress(|p| {
+                p.prefill_advanced(context_after - cached_prefix_len)
+            });
         }
     }
 
@@ -1083,6 +1095,9 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
             "run_paged_prefill_chunk_with_hidden called with empty suffix",
         ));
     }
+    crate::engine::progress::with_turn_progress(|p| {
+        p.begin_prefill(suffix_tokens.len() as u32, cached_prefix_len)
+    });
 
     // Preserve the public `0 = legacy single-shot` contract. See the
     // non-hidden worker above for why sidecar capture requires chunking.
@@ -1256,6 +1271,9 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
         }
         if !is_last_chunk {
             crate::array::synchronize_and_clear_cache();
+            crate::engine::progress::with_turn_progress(|p| {
+                p.prefill_advanced(context_after - cached_prefix_len)
+            });
         }
         if let Some(start) = chunk_trace_start {
             // This elapsed value includes the existing materialization point:

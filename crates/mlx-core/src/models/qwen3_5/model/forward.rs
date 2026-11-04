@@ -133,7 +133,7 @@ pub(super) fn chunked_prefill_with_size(
         |ctx| {
             fwd::async_eval_layer_caches(&*ctx.2);
             crate::array::clear_cache();
-            Ok(())
+            Ok(fwd::ChunkBarrier::Submitted)
         },
     )
 }
@@ -240,6 +240,7 @@ pub(super) fn chunked_prefill_with_hidden_with_size(
         }
         crate::array::clear_cache();
         offset = end;
+        crate::engine::progress::with_turn_progress(|p| p.prefill_advanced(end as u32));
     }
 
     // Final-remainder boundary poll, mirroring `chunked_prefill_with_size`:

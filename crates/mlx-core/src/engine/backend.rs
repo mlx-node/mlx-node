@@ -21,6 +21,7 @@ use crate::engine::params::{
     extract_chat_params,
 };
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaInputs, TurnPlan};
+use crate::engine::progress::TurnProgress;
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::models::qwen3_5::mtp_decode::{MtpCommitAnchor, MtpVerifyOutput};
 use crate::nn::Embedding;
@@ -210,10 +211,29 @@ pub(crate) trait DecodeStep {
 /// The only production sink is the per-request bounded model-thread mailbox.
 pub(crate) trait ChunkSink {
     fn send(&self, chunk: Result<ChatStreamChunk>);
+
+    /// The request's progress, when the consumer reads one.
+    fn progress(&self) -> Option<&Arc<TurnProgress>> {
+        None
+    }
 }
 
 impl ChunkSink for crate::model_thread::StreamTx<ChatStreamChunk> {
+    fn progress(&self) -> Option<&Arc<TurnProgress>> {
+        crate::model_thread::StreamTx::progress(self)
+    }
+
     fn send(&self, chunk: Result<ChatStreamChunk>) {
+        if let Some(progress) = crate::model_thread::StreamTx::progress(self) {
+            match &chunk {
+                Err(_) | Ok(ChatStreamChunk { done: true, .. }) => progress.finish(),
+                // Cores that never call `first_token()` (gemma4 paged/vision,
+                // deepseek_v41, ...) would otherwise report `prefill` for the
+                // whole decode.
+                Ok(c) if !c.text.is_empty() => progress.first_token(),
+                Ok(_) => {}
+            }
+        }
         // A closed receiver drops the chunk — same policy as the per-family
         // `StreamSender` wrappers. A full receiver backpressures the dedicated
         // model thread, never a Tokio runtime worker.
@@ -373,6 +393,53 @@ impl StreamEmitter for DefaultStreamEmitter {
             performance: result.performance.clone(),
             is_reasoning: None,
         }));
+    }
+}
+
+/// Counts every kept token on the request's progress before the family
+/// emitter sees it. Wraps every emitter the engine builds.
+pub(crate) struct ProgressEmitter(pub(crate) Box<dyn StreamEmitter>);
+
+impl StreamEmitter for ProgressEmitter {
+    fn on_token_id(
+        &mut self,
+        token_id: u32,
+        token_text: &str,
+        is_reasoning: bool,
+        include_reasoning: bool,
+        sink: &dyn ChunkSink,
+    ) {
+        if let Some(progress) = sink.progress() {
+            progress.add_generated(1);
+        }
+        self.0
+            .on_token_id(token_id, token_text, is_reasoning, include_reasoning, sink);
+    }
+
+    fn on_token_text(
+        &mut self,
+        token_text: &str,
+        is_reasoning: bool,
+        include_reasoning: bool,
+        sink: &dyn ChunkSink,
+    ) {
+        self.0
+            .on_token_text(token_text, is_reasoning, include_reasoning, sink);
+    }
+
+    fn on_residual(
+        &mut self,
+        residual: &str,
+        is_reasoning: bool,
+        include_reasoning: bool,
+        sink: &dyn ChunkSink,
+    ) {
+        self.0
+            .on_residual(residual, is_reasoning, include_reasoning, sink);
+    }
+
+    fn finish(&mut self, result: &ChatResult, sink: &dyn ChunkSink) {
+        self.0.finish(result, sink);
     }
 }
 

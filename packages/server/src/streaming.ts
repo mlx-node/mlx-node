@@ -121,6 +121,30 @@ export function resolveSSEDrainTimeoutMs(): number {
   return DEFAULT_SSE_DRAIN_TIMEOUT_MS;
 }
 
+const DEFAULT_SSE_PROGRESS_INTERVAL_MS = 10_000;
+let warnedInvalidSSEProgressInterval = false;
+
+/**
+ * `MLX_SSE_PROGRESS_INTERVAL_MS`: period of the `/v1/messages` progress ping.
+ * Same strict parse as `MLX_SSE_DRAIN_TIMEOUT_MS`; invalid values fall back
+ * to the default and warn once.
+ */
+export function resolveSSEProgressIntervalMs(): number {
+  const raw = process.env.MLX_SSE_PROGRESS_INTERVAL_MS;
+  const normalized = raw?.trim();
+  if (normalized == null || normalized === '') return DEFAULT_SSE_PROGRESS_INTERVAL_MS;
+  const parsed = /^[0-9]+$/.test(normalized) ? Number(normalized) : NaN;
+  if (Number.isSafeInteger(parsed) && parsed > 0 && parsed <= 2_147_483_647) return parsed;
+  if (!warnedInvalidSSEProgressInterval) {
+    warnedInvalidSSEProgressInterval = true;
+    console.warn(
+      `[mlx] ignoring invalid MLX_SSE_PROGRESS_INTERVAL_MS=${JSON.stringify(raw)} ` +
+        `(expected a positive decimal integer; using ${DEFAULT_SSE_PROGRESS_INTERVAL_MS}ms)`,
+    );
+  }
+  return DEFAULT_SSE_PROGRESS_INTERVAL_MS;
+}
+
 export function beginSSE(res: ServerResponse): void {
   activeSSEResponses.add(res);
   // Belt-and-braces cleanup: a stream torn down by a client disconnect (or by

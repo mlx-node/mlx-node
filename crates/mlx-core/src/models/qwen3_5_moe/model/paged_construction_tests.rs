@@ -9,7 +9,7 @@ use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
 use crate::models::qwen3_5_moe::decoder_layer::{AttentionType, MLPType};
 use crate::models::qwen3_5_moe::switch_glu::SwitchGLU;
 
-fn tiny_moe_cfg(use_block_paged: bool) -> Qwen3_5MoeConfig {
+pub(super) fn tiny_moe_cfg(use_block_paged: bool) -> Qwen3_5MoeConfig {
     Qwen3_5MoeConfig {
         vocab_size: 1024,
         hidden_size: 64,

@@ -407,10 +407,39 @@ export interface AnthropicMessageStopEvent {
   type: 'message_stop';
 }
 
+/**
+ * Server extension carried on `ping` frames while a streaming turn runs.
+ * Every field is omitted while unknown.
+ */
+export interface MlxProgress {
+  /** `queued` until the model thread starts this request's prefill. */
+  phase?: 'queued' | 'prefill' | 'decode';
+  /** Milliseconds since the server started this response stream. */
+  elapsed_ms?: number;
+  /** Tokens this turn prefills, excluding the cached prefix. */
+  prefill_total?: number;
+  /** Tokens of `prefill_total` done so far. */
+  prefill_done?: number;
+  /** Prefix tokens reused from the cache. */
+  cached_tokens?: number;
+  /** Prefill rate since the previous ping (first prefill ping: since prefill start). */
+  prefill_tokens_per_second?: number;
+  /** Tokens generated so far. */
+  generated_tokens?: number;
+  /** Decode rate since the previous ping (first decode ping: since the first token). */
+  decode_tokens_per_second?: number;
+}
+
+export interface AnthropicPingEvent {
+  type: 'ping';
+  mlx_progress: MlxProgress;
+}
+
 export type AnthropicStreamEvent =
   | AnthropicMessageStartEvent
   | AnthropicContentBlockStartEvent
   | AnthropicContentBlockDeltaEvent
   | AnthropicContentBlockStopEvent
   | AnthropicMessageDeltaEvent
-  | AnthropicMessageStopEvent;
+  | AnthropicMessageStopEvent
+  | AnthropicPingEvent;

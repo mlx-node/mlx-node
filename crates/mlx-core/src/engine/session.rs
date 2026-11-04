@@ -245,6 +245,7 @@ pub(crate) fn session_start_stream<B: ChatBackend>(
         return;
     }
     backend.set_turn_cancel_flag(Some(Arc::clone(cancelled)));
+    let _progress = crate::engine::progress::install_turn_progress(sink.progress().cloned());
     let turn = chat_turn_core(
         backend,
         messages,
@@ -292,6 +293,7 @@ pub(crate) fn session_continue_stream<B: ChatBackend>(
         return;
     }
     backend.set_turn_cancel_flag(Some(Arc::clone(cancelled)));
+    let _progress = crate::engine::progress::install_turn_progress(sink.progress().cloned());
     let turn = chat_turn_core(
         backend,
         messages,
@@ -339,6 +341,7 @@ pub(crate) fn session_continue_tool_stream<B: ChatBackend>(
         return;
     }
     backend.set_turn_cancel_flag(Some(Arc::clone(cancelled)));
+    let _progress = crate::engine::progress::install_turn_progress(sink.progress().cloned());
     let turn = chat_turn_core(
         backend,
         messages,
@@ -1295,6 +1298,10 @@ fn chat_turn_core<B: ChatBackend>(
     // backend is dropped before fail-closed invalidation borrows it again.
     let flat_turn_result: Result<()> = (|| {
         // --- prefill ---
+        let progress = streaming.as_ref().and_then(|s| s.sink.progress());
+        if let Some(progress) = progress {
+            progress.begin_prefill(prefill_tokens.len() as u32, cached_prefix_len as u32);
+        }
         profiler.begin_prefill();
         let last_logits = backend.prefill(&prefill_tokens, generation_stream)?;
         profiler.end_prefill();
@@ -1303,6 +1310,9 @@ fn chat_turn_core<B: ChatBackend>(
         let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
         let y = crate::sampling::sample(&last_logits, p.sampling_config)?;
         y.eval();
+        if let Some(progress) = progress {
+            progress.first_token();
+        }
 
         // --- eval caches post-prefill ---
         backend.eval_caches()?;
