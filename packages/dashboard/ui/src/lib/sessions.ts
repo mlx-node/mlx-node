@@ -46,3 +46,57 @@ export function turnTokenBars(t: Pick<TurnMetric, 'inputTokens' | 'cachedTokens'
   const cached = Math.min(t.cachedTokens, t.inputTokens);
   return { uncached: t.inputTokens - cached, cached, output: t.outputTokens };
 }
+
+/** Below this many new tokens a turn's prefill time is mostly fixed per-call cost, so its rate means nothing. */
+export const PREFILL_MIN_TOKENS = 512;
+
+export interface TurnPrefill {
+  tokens: number;
+  seconds: number;
+  tps: number;
+}
+
+/**
+ * A turn's prefill, or `null` when it is unreported, too small to judge, or of unknown size.
+ *
+ * The engine reports `prefillTps = work tokens / prefill time`, and its work tokens can exceed
+ * `prefillInputTokens` (LFM2 / NemotronH re-prefill the whole prompt on a partial hit),
+ * so the size comes from `tps × time` whenever the time is known. The time is `prefillMs`
+ * when present: once grok reports turn totals, `ttftMs` is only the first call's time.
+ */
+export function turnPrefill(
+  t: Pick<TurnMetric, 'prefillTps' | 'prefillInputTokens' | 'ttftMs' | 'prefillMs'>,
+): TurnPrefill | null {
+  const tps = t.prefillTps;
+  if (tps === null || !Number.isFinite(tps) || tps <= 0) return null;
+  const ms = positive(t.prefillMs) ?? positive(t.ttftMs);
+  let tokens: number;
+  let seconds: number;
+  if (ms !== null) {
+    seconds = ms / 1000;
+    tokens = tps * seconds;
+  } else if (t.prefillInputTokens !== null && Number.isFinite(t.prefillInputTokens)) {
+    tokens = t.prefillInputTokens;
+    seconds = tokens / tps;
+  } else {
+    return null;
+  }
+  if (tokens < PREFILL_MIN_TOKENS) return null;
+  return { tokens, seconds, tps };
+}
+
+function positive(v: number | null): number | null {
+  return v !== null && Number.isFinite(v) && v > 0 ? v : null;
+}
+
+/** Token-weighted prefill rate over the qualifying turns: total tokens / total seconds. */
+export function prefillAverage(prefills: Array<TurnPrefill | null>): number | null {
+  let tokens = 0;
+  let seconds = 0;
+  for (const p of prefills) {
+    if (p === null) continue;
+    tokens += p.tokens;
+    seconds += p.seconds;
+  }
+  return seconds > 0 ? tokens / seconds : null;
+}

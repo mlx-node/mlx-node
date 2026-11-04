@@ -237,7 +237,9 @@ describe('parseUpdates', () => {
         reasoningTokens: 7,
         elapsedMs: 6082,
         ttftMs: 75.738875,
+        prefillMs: null,
         prefillTps: 290.47170293987074,
+        prefillInputTokens: 22,
         decodeTps: 80.37156392244144,
         model: 'qwen3.5-0.8b-mlx-bf16',
       },
@@ -250,7 +252,9 @@ describe('parseUpdates', () => {
         reasoningTokens: 0,
         elapsedMs: 600000,
         ttftMs: null,
+        prefillMs: null,
         prefillTps: null,
+        prefillInputTokens: null,
         decodeTps: null,
         model: 'qwen3.5-0.8b-mlx-bf16',
       },
@@ -280,6 +284,28 @@ describe('parseUpdates', () => {
     // A complete version of the same line is read.
     const whole = `${text}${xai({ sessionUpdate: 'turn_completed', prompt_id: 'x', stop_reason: 'end_turn' })}\n`;
     expect(parseUpdates(whole).turns).toHaveLength(3);
+  });
+
+  it('reads the prefill time and size next to its rate, and leaves them null when the line has none', () => {
+    const completed = (perf: object) =>
+      xai({ sessionUpdate: 'turn_completed', prompt_id: 'p', stop_reason: 'end_turn', perf });
+    const parsed = parseUpdates(
+      [
+        completed({
+          ttft_ms: 400,
+          prefill_ms: 36_250,
+          prefill_tokens_per_second: 571.2,
+          prefill_input_tokens: 20_700,
+          cached_prefix_tokens: 110_000,
+        }),
+        completed({ prefill_tokens_per_second: 640 }),
+        '',
+      ].join('\n'),
+    );
+    expect(parsed.turns.map((t) => [t.ttftMs, t.prefillMs, t.prefillTps, t.prefillInputTokens])).toEqual([
+      [400, 36_250, 571.2, 20_700],
+      [null, null, 640, null],
+    ]);
   });
 
   it('reports an unterminated turn', () => {
