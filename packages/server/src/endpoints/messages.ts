@@ -354,7 +354,13 @@ async function handleStreamingNativeWithAbort(
   const writeSSEEvent = (response: ServerResponse, eventType: string, data: object): void => {
     const ok = writeRawSSEEvent(response, eventType, data);
     if (!ok && pendingDrain === null) {
-      pendingDrain = awaitDrainOrClose(response, { onTimeout: () => abort.markAborted() });
+      const drain = awaitDrainOrClose(response, { onTimeout: () => abort.markAborted() });
+      pendingDrain = drain;
+      // Progress ticks read `pendingDrain` while the loop waits on the native
+      // stream, so it must clear on drain, not on the next native event.
+      void drain.then(() => {
+        if (pendingDrain === drain) pendingDrain = null;
+      });
     }
   };
   const drainPending = async (): Promise<void> => {

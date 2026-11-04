@@ -1,5 +1,5 @@
-import type { ChatMessage, ChatStreamChunk, ChatStreamHandle } from '@mlx-node/core';
-import type { ChatStreamEvent } from '@mlx-node/lm';
+import type { ChatMessage, ChatStreamChunk, ChatStreamHandle, ChatStreamProgress } from '@mlx-node/core';
+import type { ChatStreamEvent, ChatStreamProgressRef } from '@mlx-node/lm';
 import { _runChatStream } from '@mlx-node/lm';
 import { describe, it, expect, vi } from 'vite-plus/test';
 
@@ -355,5 +355,77 @@ describe('_runChatStream bridge', () => {
       })(),
     ).rejects.toThrow('Native chat stream backlog exceeded 64 buffered events');
     expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('fills the progress ref once the native handle resolves and clears it when the stream ends', async () => {
+    const snapshot: ChatStreamProgress = { phase: 'prefill', prefillTotal: 10, prefillDone: 4 };
+    const progress = vi.fn(() => snapshot);
+    let callback!: (err: Error | null, chunk: ChatStreamChunk) => void;
+    let resolveHandle!: (handle: ChatStreamHandle) => void;
+    const ref: ChatStreamProgressRef = { read: null };
+    const gen = _runChatStream(
+      (cb) => {
+        callback = cb;
+        return new Promise<ChatStreamHandle>((resolve) => {
+          resolveHandle = resolve;
+        });
+      },
+      undefined,
+      ref,
+    );
+
+    const first = gen.next();
+    await Promise.resolve();
+    expect(ref.read).toBeNull();
+
+    resolveHandle({ cancel: vi.fn(), progress } as unknown as ChatStreamHandle);
+    await vi.waitFor(() => expect(ref.read).not.toBeNull());
+    expect(ref.read!()).toBe(snapshot);
+    expect(progress).toHaveBeenCalledTimes(1);
+
+    callback(null, { text: 'a', done: false } as ChatStreamChunk);
+    expect((await first).value).toEqual({ text: 'a', done: false });
+    expect(ref.read).not.toBeNull();
+
+    callback(null, {
+      text: 'a',
+      done: true,
+      finishReason: 'stop',
+      toolCalls: [],
+      thinkingEnabled: false,
+      numTokens: 1,
+      rawText: 'a',
+    } as ChatStreamChunk);
+    expect((await gen.next()).done).toBe(false);
+    expect((await gen.next()).done).toBe(true);
+    expect(ref.read).toBeNull();
+  });
+
+  it('clears the progress ref when the consumer stops early or the stream throws', async () => {
+    const handle = { cancel: vi.fn(), progress: vi.fn(() => ({ phase: 'decode' })) } as unknown as ChatStreamHandle;
+
+    const brokenRef: ChatStreamProgressRef = { read: null };
+    let brokenCallback!: (err: Error | null, chunk: ChatStreamChunk) => void;
+    const broken = _runChatStream(
+      (cb) => {
+        brokenCallback = cb;
+        return Promise.resolve(handle);
+      },
+      undefined,
+      brokenRef,
+    );
+    const pending = broken.next();
+    await vi.waitFor(() => expect(brokenRef.read).not.toBeNull());
+    brokenCallback(new Error('native failure'), { text: '', done: false } as ChatStreamChunk);
+    await expect(pending).rejects.toThrow('native failure');
+    expect(brokenRef.read).toBeNull();
+
+    const earlyRef: ChatStreamProgressRef = { read: null };
+    const native = fakeNativeMethod(3);
+    const early = _runChatStream((cb) => native([], null, cb), undefined, earlyRef);
+    expect((await early.next()).value).toEqual({ text: 'token0', done: false });
+    expect(earlyRef.read).not.toBeNull();
+    await early.return(undefined);
+    expect(earlyRef.read).toBeNull();
   });
 });

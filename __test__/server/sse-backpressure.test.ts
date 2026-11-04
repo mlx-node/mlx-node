@@ -3,11 +3,13 @@ import { request as httpRequest, type IncomingMessage, type ServerResponse } fro
 import type { AddressInfo } from 'node:net';
 import { Writable } from 'node:stream';
 
-import type { ChatResult } from '@mlx-node/core';
-import type { SessionCapableModel } from '@mlx-node/lm';
+import type { ChatMessage, ChatResult, ChatStreamProgress } from '@mlx-node/core';
+import type { ChatStreamProgressRef, SessionCapableModel } from '@mlx-node/lm';
 import { createServer, type ServerInstance } from '@mlx-node/server';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
+import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
+import { ModelRegistry } from '../../packages/server/src/registry.js';
 import * as streaming from '../../packages/server/src/streaming.js';
 
 const TOTAL_CHUNKS = 4_096;
@@ -490,4 +492,115 @@ describe('post-loop residual backpressure', () => {
       expect(instance.registry.getSessionRegistry(modelName)?.size).toBe(0);
     });
   }
+});
+
+/**
+ * Response whose writes succeed but report backpressure for the first frame
+ * containing `holdMarker`, until the test emits `drain`.
+ */
+function createBackpressureRes(holdMarker: string): { res: ServerResponse; body: () => string; held: () => boolean } {
+  let body = '';
+  let held = false;
+  const headers: Record<string, string | string[]> = {};
+  const writable = new Writable({
+    write(chunk: Uint8Array | string, _encoding, callback) {
+      body += chunk.toString();
+      callback();
+    },
+  }) as Writable & Record<string, unknown>;
+  writable.on('error', () => {});
+  const write = writable.write.bind(writable) as (chunk: string, ...rest: unknown[]) => boolean;
+  writable.write = ((chunk: string, ...rest: unknown[]) => {
+    write(chunk, ...rest);
+    if (!held && chunk.includes(holdMarker)) {
+      held = true;
+      return false;
+    }
+    return true;
+  }) as Writable['write'];
+  writable.writeHead = (_status: number, h?: Record<string, string>) => {
+    for (const [k, v] of Object.entries(h ?? {})) headers[k.toLowerCase()] = v;
+    writable.headersSent = true;
+    return writable;
+  };
+  writable.setHeader = (name: string, value: string) => {
+    headers[name.toLowerCase()] = value;
+  };
+  writable.getHeader = (name: string) => headers[name.toLowerCase()];
+  writable.headersSent = false;
+  return { res: writable as unknown as ServerResponse, body: () => body, held: () => held };
+}
+
+describe('progress pings under backpressure', () => {
+  it('Messages API skips ping ticks while a write is waiting for drain', async () => {
+    const original = process.env.MLX_SSE_PROGRESS_INTERVAL_MS;
+    process.env.MLX_SSE_PROGRESS_INTERVAL_MS = '1000';
+    vi.useFakeTimers();
+    try {
+      const snapshot: ChatStreamProgress = { phase: 'decode', generatedTokens: 1, decodeElapsedMs: 100 };
+      const nextEvent = deferred<Record<string, unknown>>();
+      let started = false;
+      async function* stream(ref?: ChatStreamProgressRef): AsyncGenerator<Record<string, unknown>> {
+        started = true;
+        if (ref !== undefined) ref.read = () => snapshot;
+        try {
+          yield { done: false, text: 'held', isReasoning: false };
+          yield await nextEvent.promise;
+        } finally {
+          if (ref !== undefined) ref.read = null;
+        }
+      }
+      const start = vi.fn(
+        (_messages: ChatMessage[], _config: unknown, _signal?: AbortSignal, ref?: ChatStreamProgressRef) => stream(ref),
+      );
+      const model = {
+        chatSessionStart: vi.fn(async () => quickResult()),
+        chatSessionContinue: vi.fn(async () => quickResult()),
+        chatSessionContinueTool: vi.fn(async () => quickResult()),
+        chatStreamSessionStart: start,
+        chatStreamSessionContinue: start,
+        chatStreamSessionContinueTool: start,
+        resetCaches: vi.fn().mockResolvedValue(undefined),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('ping-backpressure', model);
+      const { res, body, held } = createBackpressureRes('event: content_block_delta');
+      const pingCount = () => body().split('event: ping\n').length - 1;
+
+      const done = handleCreateMessage(
+        res,
+        { model: 'ping-backpressure', messages: [{ role: 'user', content: 'hi' }], max_tokens: 8, stream: true },
+        registry,
+      );
+      while (!started || !held()) {
+        await vi.advanceTimersByTimeAsync(0);
+      }
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(pingCount()).toBe(0);
+
+      res.emit('drain');
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(pingCount()).toBe(1);
+
+      nextEvent.resolve({
+        done: true,
+        text: 'held',
+        finishReason: 'stop',
+        toolCalls: [],
+        thinking: null,
+        numTokens: 1,
+        promptTokens: 1,
+        reasoningTokens: 0,
+        rawText: 'held',
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      await done;
+      expect(body()).toContain('event: message_stop');
+    } finally {
+      vi.useRealTimers();
+      if (original === undefined) delete process.env.MLX_SSE_PROGRESS_INTERVAL_MS;
+      else process.env.MLX_SSE_PROGRESS_INTERVAL_MS = original;
+    }
+  });
 });
