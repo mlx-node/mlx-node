@@ -283,7 +283,7 @@ impl ChatStreamHandle {
 }
 
 /// Point-in-time progress of one streaming turn, read from
-/// [`ChatStreamHandle::progress`]. A field is `None` while it is unknown.
+/// [`ChatStreamHandle::progress`]. A field is absent while it is unknown.
 #[napi(object)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatStreamProgress {
