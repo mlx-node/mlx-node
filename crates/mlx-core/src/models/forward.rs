@@ -193,10 +193,12 @@ pub(crate) fn async_eval_layer_caches<C: CollectCacheArrays + ?Sized>(caches: &C
 /// The between-chunk barrier the fixed-stride prefills share: bulk
 /// cache eval, then `crate::array::clear_cache()` to release the
 /// transient allocator state the chunk's graph built.
-pub(crate) fn eval_caches_and_clear<C: CollectCacheArrays + ?Sized>(caches: &C) -> Result<()> {
+pub(crate) fn eval_caches_and_clear<C: CollectCacheArrays + ?Sized>(
+    caches: &C,
+) -> Result<ChunkBarrier> {
     eval_layer_caches(caches)?;
     crate::array::clear_cache();
-    Ok(())
+    Ok(ChunkBarrier::Finished)
 }
 
 // ============================ forward skeleton ============================
@@ -365,6 +367,16 @@ pub(crate) fn slice_last_logits_to_vocab(logits: &MxArray) -> Result<MxArray> {
 
 // ============================ chunked prefill ============================
 
+/// What a chunked prefill's `between_chunks` barrier guarantees about the
+/// chunk before it. Only a `Finished` chunk counts as prefilled progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChunkBarrier {
+    /// The chunk's GPU work has completed.
+    Finished,
+    /// The chunk was only submitted (async eval) and may still be running.
+    Submitted,
+}
+
 /// Fixed-stride chunked prefill driver.
 ///
 /// Polls `turn_cancel` at every looped-chunk boundary and — when
@@ -381,7 +393,8 @@ pub(crate) fn slice_last_logits_to_vocab(logits: &MxArray) -> Result<MxArray> {
 /// (gemma4's precomputed embeds + PLE slice) still share the loop. Its
 /// output is dropped for non-final chunks and returned for the final
 /// remainder. `between_chunks(ctx)` is the cache-eval + `clear_cache`
-/// barrier after each non-final chunk.
+/// barrier after each non-final chunk; the turn's prefill progress
+/// advances past a chunk only when it returns [`ChunkBarrier::Finished`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn chunked_prefill_ranges<C>(
     ctx: &mut C,
@@ -390,7 +403,7 @@ pub(crate) fn chunked_prefill_ranges<C>(
     poll_before_final: bool,
     turn_cancel: impl Fn(&C) -> Option<&AtomicBool>,
     mut forward: impl FnMut(&mut C, i64, i64, bool) -> Result<MxArray>,
-    mut between_chunks: impl FnMut(&mut C) -> Result<()>,
+    mut between_chunks: impl FnMut(&mut C) -> Result<ChunkBarrier>,
 ) -> Result<MxArray> {
     if total_len <= 0 {
         return Err(Error::from_reason("chunked_prefill: empty prompt"));
@@ -406,9 +419,11 @@ pub(crate) fn chunked_prefill_ranges<C>(
             return Err(Error::from_reason(PREFILL_CANCELLED));
         }
         let _ = forward(ctx, offset, offset + chunk_size, false)?;
-        between_chunks(ctx)?;
+        let barrier = between_chunks(ctx)?;
         offset += chunk_size;
-        crate::engine::progress::with_turn_progress(|p| p.prefill_advanced(offset as u32));
+        if barrier == ChunkBarrier::Finished {
+            crate::engine::progress::with_turn_progress(|p| p.prefill_advanced(offset as u32));
+        }
     }
     if poll_before_final
         && offset > 0
@@ -432,7 +447,7 @@ pub(crate) fn chunked_prefill<C>(
     poll_before_final: bool,
     turn_cancel: impl Fn(&C) -> Option<&AtomicBool>,
     mut forward: impl FnMut(&mut C, &MxArray, bool) -> Result<MxArray>,
-    between_chunks: impl FnMut(&mut C) -> Result<()>,
+    between_chunks: impl FnMut(&mut C) -> Result<ChunkBarrier>,
 ) -> Result<MxArray> {
     chunked_prefill_ranges(
         ctx,
@@ -464,7 +479,7 @@ pub(crate) fn chunked_prefill_slices<C>(
     generation_stream: Stream,
     turn_cancel: impl Fn(&C) -> Option<&AtomicBool>,
     mut forward: impl FnMut(&mut C, &MxArray) -> Result<MxArray>,
-    mut between_chunks: impl FnMut(&mut C) -> Result<()>,
+    mut between_chunks: impl FnMut(&mut C) -> Result<ChunkBarrier>,
 ) -> Result<MxArray> {
     let last_idx = slices.len().saturating_sub(1);
     let mut last = None;
@@ -477,8 +492,7 @@ pub(crate) fn chunked_prefill_slices<C>(
             let _stream_ctx = StreamContext::new(generation_stream);
             forward(ctx, &chunk)?
         });
-        if idx != last_idx {
-            between_chunks(ctx)?;
+        if idx != last_idx && between_chunks(ctx)? == ChunkBarrier::Finished {
             crate::engine::progress::with_turn_progress(|p| p.prefill_advanced(end as u32));
         }
     }
@@ -517,4 +531,76 @@ pub(crate) fn save_flat_token_history(
         cached_token_history,
     );
     reuse_cache
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::engine::progress::{TurnProgress, install_turn_progress};
+    use crate::stream::DeviceType;
+
+    fn chunk_output() -> Result<MxArray> {
+        MxArray::from_uint32(&[0], &[1])
+    }
+
+    /// `prefill_done` as seen when each chunk's forward starts, for a
+    /// 10-token prefill in chunks of 4.
+    fn ranges_done_per_chunk(barrier: ChunkBarrier) -> Vec<Option<u32>> {
+        let progress = Arc::new(TurnProgress::new());
+        let _installed = install_turn_progress(Some(Arc::clone(&progress)));
+        progress.begin_prefill(10, 0);
+        let mut seen = Vec::new();
+        chunked_prefill_ranges(
+            &mut (),
+            10,
+            4,
+            true,
+            |_| None,
+            |_, _, _, _| {
+                seen.push(progress.snapshot().prefill_done);
+                chunk_output()
+            },
+            |_| Ok(barrier),
+        )
+        .expect("prefill");
+        seen
+    }
+
+    fn slices_done_per_chunk(barrier: ChunkBarrier) -> Vec<Option<u32>> {
+        let progress = Arc::new(TurnProgress::new());
+        let _installed = install_turn_progress(Some(Arc::clone(&progress)));
+        progress.begin_prefill(10, 0);
+        let prompt = MxArray::from_uint32(&[0; 10], &[1, 10]).expect("prompt");
+        let mut seen = Vec::new();
+        chunked_prefill_slices(
+            &mut (),
+            &prompt,
+            &[(0, 4), (4, 8), (8, 10)],
+            Stream::default(DeviceType::Cpu),
+            |_| None,
+            |_, _| {
+                seen.push(progress.snapshot().prefill_done);
+                chunk_output()
+            },
+            |_| Ok(barrier),
+        )
+        .expect("prefill");
+        seen
+    }
+
+    #[test]
+    fn finished_chunk_barriers_advance_prefill_progress() {
+        let expected = vec![Some(0), Some(4), Some(8)];
+        assert_eq!(ranges_done_per_chunk(ChunkBarrier::Finished), expected);
+        assert_eq!(slices_done_per_chunk(ChunkBarrier::Finished), expected);
+    }
+
+    #[test]
+    fn submitted_chunk_barriers_never_count_as_prefilled() {
+        let expected = vec![Some(0), Some(0), Some(0)];
+        assert_eq!(ranges_done_per_chunk(ChunkBarrier::Submitted), expected);
+        assert_eq!(slices_done_per_chunk(ChunkBarrier::Submitted), expected);
+    }
 }

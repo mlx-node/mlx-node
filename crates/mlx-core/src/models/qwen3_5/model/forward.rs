@@ -133,7 +133,7 @@ pub(super) fn chunked_prefill_with_size(
         |ctx| {
             fwd::async_eval_layer_caches(&*ctx.2);
             crate::array::clear_cache();
-            Ok(())
+            Ok(fwd::ChunkBarrier::Submitted)
         },
     )
 }

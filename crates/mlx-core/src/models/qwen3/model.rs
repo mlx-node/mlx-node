@@ -2079,7 +2079,7 @@ impl Qwen3Inner {
                         kv_value.eval();
                     }
                     synchronize_and_clear_cache();
-                    Ok(())
+                    Ok(fwd::ChunkBarrier::Finished)
                 },
             )?;
             fwd::slice_last_logits_to_vocab(&logits)?
@@ -2763,7 +2763,7 @@ impl Qwen3Inner {
                         kv_value.eval();
                     }
                     synchronize_and_clear_cache();
-                    Ok(())
+                    Ok(fwd::ChunkBarrier::Finished)
                 },
             )?;
             fwd::slice_last_logits_to_vocab(&logits)?
@@ -3864,7 +3864,7 @@ impl Qwen3Inner {
                     kv_value.eval();
                 }
                 synchronize_and_clear_cache();
-                Ok(())
+                Ok(fwd::ChunkBarrier::Finished)
             },
         )?;
         // Keep as `[1, vocab]` (squeeze only axis 1) so the shape
