@@ -151,6 +151,10 @@ impl TurnProgress {
         });
         let decode_elapsed_ms =
             (first_token != UNSET).then(|| ms(now_us.saturating_sub(first_token)));
+        let prefill_total = known(self.prefill_total.load(Ordering::Relaxed));
+        // Relaxed loads can pair a new (smaller) total with an older done.
+        let prefill_done = known(self.prefill_done.load(Ordering::Relaxed))
+            .map(|done| prefill_total.map_or(done, |total| done.min(total)));
         ChatStreamProgress {
             phase: match phase {
                 PHASE_QUEUED => "queued",
@@ -159,8 +163,8 @@ impl TurnProgress {
                 _ => "done",
             }
             .to_string(),
-            prefill_total: known(self.prefill_total.load(Ordering::Relaxed)),
-            prefill_done: known(self.prefill_done.load(Ordering::Relaxed)),
+            prefill_total,
+            prefill_done,
             cached_tokens: known(self.cached_tokens.load(Ordering::Relaxed)),
             generated_tokens: (phase >= PHASE_DECODE)
                 .then(|| self.generated.load(Ordering::Relaxed)),
@@ -293,6 +297,56 @@ mod tests {
         assert_eq!(s.phase, "decode");
         assert_eq!(s.generated_tokens, Some(1));
         assert!(s.decode_elapsed_ms.is_some());
+    }
+
+    #[test]
+    fn snapshot_never_reports_done_above_total() {
+        let p = TurnProgress::new();
+        p.begin_prefill(100, 0);
+        // A reader racing a second `begin_prefill` can see this pair.
+        p.prefill_done.store(500, Ordering::Relaxed);
+        assert_eq!(p.snapshot().prefill_done, Some(100));
+    }
+
+    #[test]
+    fn first_text_chunk_moves_a_silent_core_to_decode() {
+        use crate::engine::backend::ChunkSink;
+        use crate::engine::types::ChatStreamChunk;
+        let chunk = |text: &str, done: bool| ChatStreamChunk {
+            text: text.to_string(),
+            done,
+            finish_reason: None,
+            tool_calls: None,
+            thinking: None,
+            thinking_enabled: None,
+            num_tokens: None,
+            prompt_tokens: None,
+            reasoning_tokens: None,
+            raw_text: None,
+            public_raw_text: None,
+            text_authoritative: None,
+            cached_tokens: None,
+            performance: None,
+            is_reasoning: None,
+        };
+        let p = Arc::new(TurnProgress::new());
+        let (tx, mut rx) =
+            crate::model_thread::stream_channel_with_progress::<ChatStreamChunk>(4, Arc::clone(&p));
+        p.begin_turn();
+        ChunkSink::send(&tx, Ok(chunk("", false)));
+        assert_eq!(
+            p.snapshot().phase,
+            "prefill",
+            "an empty chunk is not a token"
+        );
+        ChunkSink::send(&tx, Ok(chunk("hi", false)));
+        let s = p.snapshot();
+        assert_eq!(s.phase, "decode");
+        assert!(s.decode_elapsed_ms.is_some());
+        ChunkSink::send(&tx, Ok(chunk("", true)));
+        assert_eq!(p.snapshot().phase, "done");
+        drop(tx);
+        while rx.blocking_recv().is_some() {}
     }
 
     #[test]

@@ -224,10 +224,15 @@ impl ChunkSink for crate::model_thread::StreamTx<ChatStreamChunk> {
     }
 
     fn send(&self, chunk: Result<ChatStreamChunk>) {
-        if let Some(progress) = crate::model_thread::StreamTx::progress(self)
-            && matches!(&chunk, Err(_) | Ok(ChatStreamChunk { done: true, .. }))
-        {
-            progress.finish();
+        if let Some(progress) = crate::model_thread::StreamTx::progress(self) {
+            match &chunk {
+                Err(_) | Ok(ChatStreamChunk { done: true, .. }) => progress.finish(),
+                // Cores that never call `first_token()` (gemma4 paged/vision,
+                // deepseek_v41, ...) would otherwise report `prefill` for the
+                // whole decode.
+                Ok(c) if !c.text.is_empty() => progress.first_token(),
+                Ok(_) => {}
+            }
         }
         // A closed receiver drops the chunk — same policy as the per-family
         // `StreamSender` wrappers. A full receiver backpressures the dedicated
