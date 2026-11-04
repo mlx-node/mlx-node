@@ -38,7 +38,7 @@
     "@std/toml": "npm:@jsr/std__toml@^1.0.11",
     "@types/node": "^26.4.0",
     "octokit": "^5.0.5",
-    "openai": "7.47.0",
+    "openai": "7.50.0",
     "oxc-parser": "^0.157.0",
     "prettier": "^3.9.6",
     "typescript": "^7.0.2",
@@ -46,7 +46,7 @@
     "vite-plus": "catalog:"
   },
   "resolutions": {
-    "vite": "npm:@voidzero-dev/vite-plus-core@1.4.0"
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.5.0"
   },
   "packageManager": "yarn@4.18.1"
 }
