@@ -540,6 +540,27 @@ impl QwenStepExecutor<'_> {
                         .preemption_replay
                         .as_ref()
                         .is_some_and(|replay| replay.suppress_sample);
+                    if let Some(progress) = turn
+                        .payload
+                        .response
+                        .sink()
+                        .and_then(|sink| sink.progress())
+                    {
+                        let cached_prefix =
+                            turn.payload.preemption_replay.as_ref().map_or(
+                                turn.payload.prefix.effective_cached_prefix_len,
+                                |replay| replay.cached_prefix as usize,
+                            );
+                        // Slices before `start` are materialized.
+                        if start == cached_prefix {
+                            progress.begin_prefill(
+                                source_len.saturating_sub(cached_prefix) as u32,
+                                cached_prefix as u32,
+                            );
+                        } else {
+                            progress.prefill_advanced(start.saturating_sub(cached_prefix) as u32);
+                        }
+                    }
                     turn.payload.profiler.begin_prefill();
                     forward_rows.push((row.seq_id, tokens));
                     work.push(PreparedRaggedRow {
