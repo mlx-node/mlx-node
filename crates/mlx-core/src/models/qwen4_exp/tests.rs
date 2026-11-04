@@ -8819,3 +8819,44 @@ fn real_model_group_matches_window_at_a_time_during_direct_fill() {
         runs[0].len()
     );
 }
+
+#[test]
+fn exclusive_activation_failure_finishes_stream_progress() {
+    use crate::engine::cmd::ChatCmd;
+    use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, SchedulerOwnerContext};
+    let mut inner = tiny_inner();
+    for seq in 1..=4 {
+        inner.activate_exclusive_seq(seq).unwrap();
+        inner
+            .decoder
+            .prefill_chunk(&[seq + 2], None, false)
+            .unwrap();
+    }
+    let mut sequences = std::collections::HashMap::new();
+    let mut states = std::collections::HashMap::new();
+    let mut next = 5;
+    let progress = Arc::new(crate::engine::progress::TurnProgress::new());
+    let (stream_tx, mut stream_rx) =
+        crate::model_thread::stream_channel_with_progress(16, Arc::clone(&progress));
+    let message: crate::tokenizer::ChatMessage =
+        serde_json::from_value(serde_json::json!({"role":"user","content":"a"})).unwrap();
+    inner.execute_chat_barrier(
+        ChatCmd::StreamSessionStart {
+            messages: vec![message],
+            config: crate::engine::types::ChatConfig {
+                cache_owner_id: Some("over-capacity".into()),
+                ..Default::default()
+            },
+            cancelled: Arc::new(AtomicBool::new(false)),
+            stream_tx,
+        },
+        SchedulerOwnerContext {
+            owner_sequences: &mut sequences,
+            owner_states: &mut states,
+            next_seq_id: &mut next,
+        },
+    );
+    let reason = stream_rx.try_recv().unwrap().err().unwrap().reason;
+    assert!(reason.contains("capacity reached"), "{reason}");
+    assert_eq!(progress.snapshot().phase, "done");
+}

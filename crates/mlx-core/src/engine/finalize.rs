@@ -32,7 +32,10 @@ use crate::tools;
 /// Guard failures MUST come through as `Err` so the error path is
 /// exercised.
 pub(crate) fn send_stream_error(stream_tx: &StreamTx<ChatStreamChunk>, message: &str) {
-    let _ = stream_tx.send(Err(napi::Error::from_reason(message.to_string())));
+    crate::engine::backend::ChunkSink::send(
+        stream_tx,
+        Err(napi::Error::from_reason(message.to_string())),
+    );
 }
 
 /// Compute TTFT / prefill tok/s / decode tok/s performance metrics.

@@ -589,7 +589,7 @@ impl HybridSchedulerBackend for Inner {
                 ChatCmd::StreamSessionStart { stream_tx, .. }
                 | ChatCmd::StreamSessionContinue { stream_tx, .. }
                 | ChatCmd::StreamSessionContinueTool { stream_tx, .. } => {
-                    let _ = stream_tx.send(Err(error));
+                    crate::engine::backend::ChunkSink::send(&stream_tx, Err(error));
                 }
                 _ => unreachable!(),
             }
