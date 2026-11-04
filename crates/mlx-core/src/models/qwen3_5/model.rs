@@ -878,3 +878,6 @@ mod mtp_gate_state_tests;
 
 #[cfg(test)]
 mod dflash2_park_tests;
+
+#[cfg(test)]
+mod stream_progress_tests;

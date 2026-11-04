@@ -7,7 +7,7 @@ use super::*;
 use crate::engine::plan::{MediaInputs, TurnPlan};
 use crate::models::qwen3_5::config::Qwen3_5Config;
 
-fn tiny_cfg() -> Qwen3_5Config {
+pub(super) fn tiny_cfg() -> Qwen3_5Config {
     Qwen3_5Config {
         qwen35_gguf_gdn_layout: None,
         kv_format: None,

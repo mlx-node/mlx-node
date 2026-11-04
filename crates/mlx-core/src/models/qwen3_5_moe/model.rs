@@ -706,3 +706,6 @@ mod eval_teacher_forced_tests;
 
 #[cfg(test)]
 mod paged_speculative_routing_tests;
+
+#[cfg(test)]
+mod stream_progress_tests;
