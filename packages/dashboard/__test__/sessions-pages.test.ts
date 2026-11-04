@@ -11,7 +11,7 @@
 
 import { MessageChannel } from 'node:worker_threads';
 
-import { turnTokenBars } from '@/lib/sessions';
+import { PREFILL_MIN_TOKENS, prefillAverage, turnPrefill, turnTokenBars } from '@/lib/sessions';
 import type {
   SessionDeleteResponse,
   SessionDetail as SessionDetailData,
@@ -81,6 +81,7 @@ function turn(overrides: Partial<TurnMetric>): TurnMetric {
     elapsedMs: 4_000,
     ttftMs: 120,
     prefillTps: 900,
+    prefillInputTokens: null,
     decodeTps: 60,
     model: 'qwen3.8-27b',
     ...overrides,
@@ -480,6 +481,43 @@ describe('Session detail page', () => {
     expect(writeText).toHaveBeenCalledWith(RESUME);
   });
 
+  it('shows prefill only for turns big enough to time, as a token-weighted average', async () => {
+    const turns = [
+      // 20,700 tokens in 36.25 s and 4,000 in 2 s: 24,700 / 38.25 = 645.75 tok/s.
+      turn({ promptId: 'big', prefillTps: 571.0344827586207, prefillInputTokens: 20_700 }),
+      turn({ promptId: 'mid', prefillTps: 2_000, prefillInputTokens: 4_000 }),
+      // Fixed per-call cost, not throughput: never plotted or averaged.
+      turn({ promptId: 'small', prefillTps: 50, prefillInputTokens: 20 }),
+      // Rate with no size: cannot be judged.
+      turn({ promptId: 'unsized', prefillTps: 9_000, prefillInputTokens: null }),
+    ];
+    const text = await mountDetail(
+      PARENT_ID,
+      { [`GET /sessions/${PARENT_ID}`]: { body: { ...detailBody(), turns } } },
+      'Prefill throughput per turn',
+    );
+    expect(text).toContain('Prefill646tok/s avg');
+    expect(text).toContain(`Tokens per second (turns with ${PREFILL_MIN_TOKENS}+ new tokens)`);
+    const card = [...mounted!.container.querySelectorAll('.recharts-wrapper')].find((w) =>
+      w.closest('[data-slot="card"]')?.textContent?.includes('Prefill throughput per turn'),
+    );
+    expect(card?.querySelectorAll('.recharts-line-dot')).toHaveLength(2);
+  });
+
+  it('hides the prefill card and chip when no turn has enough new tokens', async () => {
+    const turns = [
+      turn({ prefillTps: 50, prefillInputTokens: 20 }),
+      turn({ prefillTps: 400, prefillInputTokens: PREFILL_MIN_TOKENS - 1 }),
+      turn({ prefillTps: 900, prefillInputTokens: null }),
+    ];
+    const text = await mountDetail(
+      PARENT_ID,
+      { [`GET /sessions/${PARENT_ID}`]: { body: { ...detailBody(), turns } } },
+      'Decode throughput per turn',
+    );
+    expect(text).not.toContain('Prefill');
+  });
+
   it('links each existing subagent to its child session and leaves a missing one unlinked', async () => {
     await mountDetail(PARENT_ID, { [`GET /sessions/${PARENT_ID}`]: { body: detailBody() } }, 'Subagents');
     const childLinks = [...mounted!.container.querySelectorAll(`a[href="/sessions/${CHILD_ID}"]`)];
@@ -575,6 +613,27 @@ describe('turnTokenBars', () => {
       cached: 10,
       output: 1,
     });
+  });
+});
+
+describe('turnPrefill / prefillAverage', () => {
+  it('keeps turns from the threshold up, derives seconds, and weights the average by tokens', () => {
+    expect(turnPrefill({ prefillTps: 50, prefillInputTokens: 20 })).toBeNull();
+    expect(turnPrefill({ prefillTps: 640, prefillInputTokens: null })).toBeNull();
+    expect(turnPrefill({ prefillTps: null, prefillInputTokens: 4_000 })).toBeNull();
+    expect(turnPrefill({ prefillTps: 0, prefillInputTokens: 4_000 })).toBeNull();
+    expect(turnPrefill({ prefillTps: 256, prefillInputTokens: PREFILL_MIN_TOKENS })).toEqual({
+      tokens: 512,
+      seconds: 2,
+      tps: 256,
+    });
+
+    const big = turnPrefill({ prefillTps: 1_000, prefillInputTokens: 30_000 });
+    const small = turnPrefill({ prefillTps: 100, prefillInputTokens: 1_000 });
+    // 31,000 tokens / (30 s + 10 s), not the mean of the two rates (550).
+    expect(prefillAverage([big, small, null])).toBe(775);
+    expect(prefillAverage([null])).toBeNull();
+    expect(prefillAverage([])).toBeNull();
   });
 });
 

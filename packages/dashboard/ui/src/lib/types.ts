@@ -419,6 +419,7 @@ export interface TurnMetric {
   elapsedMs: number | null;
   ttftMs: number | null;
   prefillTps: number | null;
+  prefillInputTokens: number | null;
   decodeTps: number | null;
   model: string | null;
 }

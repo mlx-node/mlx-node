@@ -443,6 +443,7 @@ export function parseUpdates(text: string): ParsedUpdates {
           elapsedMs,
           ttftMs: num(perf?.ttft_ms),
           prefillTps: num(perf?.prefill_tokens_per_second),
+          prefillInputTokens: num(perf?.prefill_input_tokens),
           decodeTps: num(perf?.decode_tokens_per_second),
           model: turnModel(usage, model),
         });

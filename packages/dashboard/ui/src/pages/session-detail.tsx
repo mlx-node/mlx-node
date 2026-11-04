@@ -5,7 +5,17 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { AXIS_TICK, ChartCard, TOOLTIP_CONTENT_STYLE } from '@/lib/chart';
 import { formatCount, formatNumber, formatRelativeTime } from '@/lib/format';
-import { copyResumeCommand, isoMs, LIVE_HINT, sessionTitle, turnTokenBars, type TurnTokenBars } from '@/lib/sessions';
+import {
+  copyResumeCommand,
+  isoMs,
+  LIVE_HINT,
+  PREFILL_MIN_TOKENS,
+  prefillAverage,
+  sessionTitle,
+  turnPrefill,
+  turnTokenBars,
+  type TurnTokenBars,
+} from '@/lib/sessions';
 import type { SessionDetail as SessionDetailData, SessionDetailResponse, TurnMetric } from '@/lib/types';
 import { useJson } from '@/lib/use-api';
 import { AlertCircle, ArrowLeft, Copy, FileWarning, GitBranch, Inbox } from 'lucide-react';
@@ -36,14 +46,28 @@ function mean(values: number[]): number | null {
 interface TurnPoint extends TurnTokenBars {
   turn: number;
   decodeTps: number | null;
+  prefillTps: number | null;
+  prefillTokens: number | null;
+  prefillSeconds: number | null;
 }
 
 function toPoints(turns: TurnMetric[]): TurnPoint[] {
-  return turns.map((t, i) => ({
-    ...turnTokenBars(t),
-    turn: i + 1,
-    decodeTps: isFiniteNumber(t.decodeTps) ? t.decodeTps : null,
-  }));
+  return turns.map((t, i) => {
+    const prefill = turnPrefill(t);
+    return {
+      ...turnTokenBars(t),
+      turn: i + 1,
+      decodeTps: isFiniteNumber(t.decodeTps) ? t.decodeTps : null,
+      prefillTps: prefill?.tps ?? null,
+      prefillTokens: prefill?.tokens ?? null,
+      prefillSeconds: prefill?.seconds ?? null,
+    };
+  });
+}
+
+function prefillTooltip(point: TurnPoint): string {
+  if (point.prefillTps === null || point.prefillTokens === null || point.prefillSeconds === null) return '';
+  return `${formatNumber(point.prefillTps)} tok/s · ${formatCount(point.prefillTokens)} tokens in ${point.prefillSeconds.toFixed(1)} s`;
 }
 
 function isSubagentKind(kind: string | null): boolean {
@@ -77,11 +101,13 @@ export default function SessionDetail() {
     }
     const avgDecode = mean(turns.map((t) => t.decodeTps).filter(isFiniteNumber));
     const avgTtft = mean(turns.map((t) => t.ttftMs).filter(isFiniteNumber));
-    return { input, output, cached, avgDecode, avgTtft };
+    const avgPrefill = prefillAverage(turns.map(turnPrefill));
+    return { input, output, cached, avgDecode, avgTtft, avgPrefill };
   }, [turns]);
 
   const hasTokenData = points.some((p) => p.uncached + p.cached + p.output > 0);
   const hasDecodeData = points.some((p) => p.decodeTps !== null);
+  const hasPrefillData = points.some((p) => p.prefillTps !== null);
 
   return (
     <div className="space-y-6">
@@ -185,65 +211,70 @@ export default function SessionDetail() {
               {totals.avgTtft !== null && (
                 <MetricChip label="TTFT" value={Math.round(totals.avgTtft).toString()} unit="ms avg" />
               )}
+              {totals.avgPrefill !== null && (
+                <MetricChip label="Prefill" value={formatNumber(totals.avgPrefill)} unit="tok/s avg" />
+              )}
               {totals.avgDecode !== null && (
                 <MetricChip label="Decode" value={totals.avgDecode.toFixed(1)} unit="tok/s avg" />
               )}
             </div>
           )}
 
-          {(hasTokenData || hasDecodeData) && (
+          {(hasTokenData || hasDecodeData || hasPrefillData) && (
             <div className="grid gap-4 lg:grid-cols-2">
               {hasTokenData && (
-                <ChartCard title="Tokens per turn" subtitle="Prompt (uncached and cached) and output tokens by turn">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={points} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" vertical={false} />
-                      <XAxis dataKey="turn" tick={AXIS_TICK} tickLine={false} axisLine={false} />
-                      <YAxis
-                        tick={AXIS_TICK}
-                        tickLine={false}
-                        axisLine={false}
-                        width={44}
-                        tickFormatter={(v) => formatCount(Number(v))}
-                      />
-                      <Tooltip
-                        cursor={{ fill: 'var(--color-muted)', opacity: 0.35 }}
-                        contentStyle={TOOLTIP_CONTENT_STYLE}
-                        labelFormatter={(label) => `Turn ${Number(label)}`}
-                        formatter={(value) => formatNumber(Number(value))}
-                      />
-                      <Legend
-                        wrapperStyle={{ fontSize: 12 }}
-                        formatter={(value) => <span className="text-foreground">{value}</span>}
-                      />
-                      <Bar
-                        dataKey="uncached"
-                        stackId="tokens"
-                        name="Input (uncached)"
-                        fill="var(--viz-input)"
-                        stroke="var(--color-card)"
-                        strokeWidth={1}
-                      />
-                      <Bar
-                        dataKey="cached"
-                        stackId="tokens"
-                        name="Input (cached)"
-                        fill="var(--viz-cached)"
-                        stroke="var(--color-card)"
-                        strokeWidth={1}
-                      />
-                      <Bar
-                        dataKey="output"
-                        stackId="tokens"
-                        name="Output"
-                        fill="var(--viz-output)"
-                        stroke="var(--color-card)"
-                        strokeWidth={1}
-                        radius={[4, 4, 0, 0]}
-                      />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </ChartCard>
+                <div className={hasDecodeData && hasPrefillData ? 'lg:col-span-2' : undefined}>
+                  <ChartCard title="Tokens per turn" subtitle="Prompt (uncached and cached) and output tokens by turn">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={points} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" vertical={false} />
+                        <XAxis dataKey="turn" tick={AXIS_TICK} tickLine={false} axisLine={false} />
+                        <YAxis
+                          tick={AXIS_TICK}
+                          tickLine={false}
+                          axisLine={false}
+                          width={44}
+                          tickFormatter={(v) => formatCount(Number(v))}
+                        />
+                        <Tooltip
+                          cursor={{ fill: 'var(--color-muted)', opacity: 0.35 }}
+                          contentStyle={TOOLTIP_CONTENT_STYLE}
+                          labelFormatter={(label) => `Turn ${Number(label)}`}
+                          formatter={(value) => formatNumber(Number(value))}
+                        />
+                        <Legend
+                          wrapperStyle={{ fontSize: 12 }}
+                          formatter={(value) => <span className="text-foreground">{value}</span>}
+                        />
+                        <Bar
+                          dataKey="uncached"
+                          stackId="tokens"
+                          name="Input (uncached)"
+                          fill="var(--viz-input)"
+                          stroke="var(--color-card)"
+                          strokeWidth={1}
+                        />
+                        <Bar
+                          dataKey="cached"
+                          stackId="tokens"
+                          name="Input (cached)"
+                          fill="var(--viz-cached)"
+                          stroke="var(--color-card)"
+                          strokeWidth={1}
+                        />
+                        <Bar
+                          dataKey="output"
+                          stackId="tokens"
+                          name="Output"
+                          fill="var(--viz-output)"
+                          stroke="var(--color-card)"
+                          strokeWidth={1}
+                          radius={[4, 4, 0, 0]}
+                        />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </ChartCard>
+                </div>
               )}
               {hasDecodeData && (
                 <ChartCard title="Decode throughput per turn" subtitle="Tokens per second (turns that reported it)">
@@ -271,6 +302,42 @@ export default function SessionDetail() {
                         stroke="var(--viz-input)"
                         strokeWidth={2}
                         dot={{ r: 3, fill: 'var(--viz-input)' }}
+                        activeDot={{ r: 5 }}
+                        connectNulls={false}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </ChartCard>
+              )}
+              {hasPrefillData && (
+                <ChartCard
+                  title="Prefill throughput per turn"
+                  subtitle={`Tokens per second (turns with ${PREFILL_MIN_TOKENS}+ new tokens)`}
+                >
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={points} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" vertical={false} />
+                      <XAxis dataKey="turn" tick={AXIS_TICK} tickLine={false} axisLine={false} />
+                      <YAxis
+                        tick={AXIS_TICK}
+                        tickLine={false}
+                        axisLine={false}
+                        width={44}
+                        tickFormatter={(v) => formatCount(Number(v))}
+                      />
+                      <Tooltip
+                        cursor={{ stroke: 'var(--color-muted-foreground)', strokeWidth: 1 }}
+                        contentStyle={TOOLTIP_CONTENT_STYLE}
+                        labelFormatter={(label) => `Turn ${Number(label)}`}
+                        formatter={(_value, _name, item) => prefillTooltip(item.payload as TurnPoint)}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="prefillTps"
+                        name="Prefill"
+                        stroke="var(--viz-series-4)"
+                        strokeWidth={2}
+                        dot={{ r: 3, fill: 'var(--viz-series-4)' }}
                         activeDot={{ r: 5 }}
                         connectNulls={false}
                       />
