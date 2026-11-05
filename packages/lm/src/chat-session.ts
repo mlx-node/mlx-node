@@ -109,13 +109,6 @@ import type { ChatStreamEvent, ChatStreamProgressRef } from './stream.js';
 const IMAGE_CHANGE_RESTART_PREFIX = 'IMAGE_CHANGE_REQUIRES_SESSION_RESTART:';
 
 /**
- * Default resolved by the native shared chat engine when `maxNewTokens` is
- * absent. Keep this in sync with `extract_chat_params()` in
- * `crates/mlx-core/src/engine/params.rs`.
- */
-const NATIVE_DEFAULT_MAX_NEW_TOKENS = 2048;
-
-/**
  * Model wrapper class names whose in-checkpoint MTP head must NOT be
  * auto-enabled. Fallback only: {@link ChatSession#mtpAutoDefaultAllowed}
  * prefers the native {@link SessionCapableModel.mtpAutoEnabled} getter in BOTH
@@ -179,7 +172,8 @@ export class ContextCapacityError extends Error {
   ) {
     super(
       `context_length_exceeded: rendered prompt uses ${promptTokens} tokens, ` +
-        `but this model currently has capacity for ${effectiveWindowTokens} tokens`,
+        `but this model currently has capacity for ${effectiveWindowTokens} tokens ` +
+        `(at most ${Math.max(0, effectiveWindowTokens - 1)} prompt tokens)`,
     );
     this.name = 'ContextCapacityError';
   }
@@ -1964,9 +1958,10 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * both the tokenizer seam and a load-time context snapshot retain their
    * existing behavior.
    *
-   * The returned config is a copy only when `maxNewTokens` needs clamping.
-   * An omitted output budget stays omitted when the native default fits; it is
-   * made explicit only when the remaining window is smaller than that default.
+   * Splash's output budget: a prompt must leave room for one new token,
+   * `maxNewTokens` is clamped to `window - prompt`, and an omitted budget is
+   * the rest of the window. The returned config is a copy only when
+   * `maxNewTokens` changes.
    */
   private async constrainToContextCapacity(messages: ChatMessage[], config: ChatConfig): Promise<ChatConfig> {
     if (typeof this.model.applyChatTemplate !== 'function' || typeof this.model.contextLimits !== 'function') {
@@ -1999,16 +1994,14 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         );
       }
     }
-    if (promptTokens > capacity) {
+    if (promptTokens >= capacity) {
       throw new ContextCapacityError(promptTokens, capacity);
     }
 
-    // The final sampled token is returned without another model forward, so N
-    // generated tokens consume only N-1 additional KV positions.
-    const maxOutput = capacity - promptTokens + 1;
+    const maxOutput = capacity - promptTokens;
     const requested = config.maxNewTokens;
-    if (requested === undefined) {
-      return maxOutput >= NATIVE_DEFAULT_MAX_NEW_TOKENS ? config : { ...config, maxNewTokens: maxOutput };
+    if (requested == null) {
+      return { ...config, maxNewTokens: maxOutput };
     }
     const maxNewTokens = Math.min(requested, maxOutput);
     return maxNewTokens === requested ? config : { ...config, maxNewTokens };

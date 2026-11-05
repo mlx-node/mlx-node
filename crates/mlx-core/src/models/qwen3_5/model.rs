@@ -113,7 +113,7 @@ use self::state::{
 };
 pub(crate) use self::state::{
     TokenPrefixMismatchTrace, arrays_bits_equal_for_test, constrain_paged_context_params,
-    qwen35_dense_vision_active, token_prefix_mismatch_trace,
+    context_output_budget, qwen35_dense_vision_active, token_prefix_mismatch_trace,
 };
 use crate::vision::qwen::cache::{VisionCache, VisionCacheInner, vlm_prepare_vision_features};
 
@@ -635,15 +635,9 @@ impl Qwen3_5Model {
                 batch_size
             )));
         }
-        let prompt_len = prompt_tokens.shape_at(1)? as u32;
-        let capacity = self.context_limits.effective_window_tokens;
-        if prompt_len > capacity {
-            return Err(Error::from_reason(format!(
-                "context_length_exceeded: prompt has {prompt_len} tokens, effective active \
-                 context is {capacity} tokens"
-            )));
-        }
-        let max_output = capacity.saturating_sub(prompt_len).saturating_add(1);
+        let prompt_len = prompt_tokens.shape_at(1)? as usize;
+        let max_output =
+            context_output_budget(prompt_len, self.context_limits.effective_window_tokens)?;
         config.max_new_tokens = config.max_new_tokens.min(max_output as i32);
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35FamilyCommand::Generate {
             prompt_tokens: prompt_tokens.clone(),

@@ -13,22 +13,21 @@ use crate::transformer::paged_kv_cache_adapter::SeqId;
 use napi_derive::napi;
 
 /// Clamp a scheduled turn's requested output to the fixed per-sequence
-/// context window. The final sampled token is returned without another model
-/// forward, so `N` outputs consume only `N - 1` additional cache positions.
+/// context window with Splash's budget: the prompt must leave room for one
+/// new token, and `prompt + max_new` never passes the window.
 pub(crate) fn clamp_scheduled_output_tokens(
     prompt_tokens: u32,
     requested_max_new_tokens: u32,
     per_seq_context: u32,
 ) -> Result<u32, String> {
-    if prompt_tokens > per_seq_context {
+    if prompt_tokens >= per_seq_context {
         return Err(format!(
-            "context_length_exceeded: prompt ({prompt_tokens}) exceeds scheduler per-sequence context {per_seq_context}"
+            "context_length_exceeded: prompt ({prompt_tokens}) leaves no room in scheduler \
+             per-sequence context {per_seq_context} (at most {} prompt tokens)",
+            per_seq_context.saturating_sub(1)
         ));
     }
-    let max_output = per_seq_context
-        .saturating_sub(prompt_tokens)
-        .saturating_add(1);
-    Ok(requested_max_new_tokens.min(max_output))
+    Ok(requested_max_new_tokens.min(per_seq_context - prompt_tokens))
 }
 
 /// Physical cache positions consumed by a scheduled turn at its output cap.
@@ -1390,18 +1389,26 @@ mod tests {
     use super::*;
 
     #[test]
+    /// Mutation: restore the `+ 1` on the remaining window → red (17 ≠ 16).
     fn scheduled_output_hint_clamps_to_remaining_context() {
-        assert_eq!(clamp_scheduled_output_tokens(48, 100, 64), Ok(17));
+        assert_eq!(clamp_scheduled_output_tokens(48, 100, 64), Ok(16));
         assert_eq!(clamp_scheduled_output_tokens(48, 10, 64), Ok(10));
-        assert_eq!(clamp_scheduled_output_tokens(64, 1, 64), Ok(1));
-        assert_eq!(scheduled_materialized_tokens(48, 17), 64);
-        assert_eq!(scheduled_materialized_tokens(64, 1), 64);
+        assert_eq!(clamp_scheduled_output_tokens(63, 100, 64), Ok(1));
+        assert_eq!(scheduled_materialized_tokens(48, 16), 63);
+        assert_eq!(scheduled_materialized_tokens(63, 1), 63);
     }
 
     #[test]
-    fn scheduled_output_hint_rejects_an_oversized_prompt() {
+    /// Mutation: reject only `prompt > context` → red (a 64-token prompt in a
+    /// 64-token window is admitted with a 0-token budget).
+    fn scheduled_output_hint_rejects_a_prompt_that_fills_the_context() {
         let oversized = clamp_scheduled_output_tokens(65, 1, 64).unwrap_err();
         assert!(oversized.starts_with("context_length_exceeded: prompt (65)"));
+        let full = clamp_scheduled_output_tokens(64, 1, 64).unwrap_err();
+        assert!(
+            full.starts_with("context_length_exceeded: prompt (64)"),
+            "{full}"
+        );
     }
 
     #[derive(Default)]

@@ -937,6 +937,40 @@ describe('handleCreateMessage', () => {
   // -----------------------------------------------------------------------
 
   describe('streaming (native)', () => {
+    // Mutation: reject only `prompt > capacity` in `constrainToContextCapacity`
+    // → red (status 200 with a 0-token native start).
+    it('returns a JSON 400 when the prompt exactly fills the window', async () => {
+      const model = Object.assign(createMockStreamModel([]), {
+        contextLimits: () => ({
+          trainedWindowTokens: 262_144,
+          effectiveWindowTokens: 64,
+          pagedBlockCapacity: 4,
+          pagedBlockSize: 16,
+        }),
+        applyChatTemplate: vi.fn(() => new Uint32Array(64)),
+      });
+      const registry = new ModelRegistry();
+      registry.register('test-model', model);
+      const { res, getStatus, getBody, getHeaders } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'exactly full' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(400);
+      expect(getHeaders()['content-type']).toContain('application/json');
+      expect(getBody()).toContain('context_length_exceeded');
+      expect(getBody()).not.toContain('event:');
+      expect((model.chatStreamSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+    });
+
     it('returns a JSON 400 for context overflow before committing SSE or mutating native cache state', async () => {
       const model = Object.assign(createMockStreamModel([]), {
         contextLimits: () => ({

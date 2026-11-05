@@ -3460,13 +3460,14 @@ describe('ChatSession', () => {
       };
     }
 
-    it('clamps an explicit output budget before native start', async () => {
+    // Mutation: clamp to `capacity - prompt + 1` → red (29 ≠ 28).
+    it('clamps an explicit output budget to window minus prompt before native start', async () => {
       const mock = makeMockModel();
       const session = new ChatSession(withCapacity(mock.model, 128, 100));
 
       await session.send('hello', { config: { maxNewTokens: 64 } });
 
-      expect(mock.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBe(29);
+      expect(mock.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBe(28);
     });
 
     it('preflights a complete history without starting inference or mutating the session', async () => {
@@ -3480,7 +3481,7 @@ describe('ChatSession', () => {
 
       const config = await session.preflightContextCapacity(messages, { maxNewTokens: 64 });
 
-      expect(config.maxNewTokens).toBe(29);
+      expect(config.maxNewTokens).toBe(28);
       expect((model.applyChatTemplate as ReturnType<typeof vi.fn>).mock.calls).toEqual([
         [messages, true, null, null, null],
       ]);
@@ -3507,23 +3508,53 @@ describe('ChatSession', () => {
       }
     });
 
-    it('clamps the omitted native output default when the remaining window is smaller', async () => {
+    it('fills the rest of the window when the output budget is omitted on every turn', async () => {
       const mock = makeMockModel();
       const session = new ChatSession(withCapacity(mock.model, 128, 80));
 
       await session.send('first');
       await session.send('second');
 
-      expect(mock.chatSessionContinue.mock.calls[0]?.[1]?.maxNewTokens).toBe(49);
+      expect(mock.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBe(48);
+      expect(mock.chatSessionContinue.mock.calls[0]?.[1]?.maxNewTokens).toBe(48);
     });
 
-    it('preserves the native default when an omitted output budget fits', async () => {
+    // Mutation: leave an omitted budget omitted (native 2048 default) when it
+    // fits → red (undefined ≠ 3996).
+    it('uses the rest of the window, not a fixed default, when the output budget is omitted', async () => {
       const mock = makeMockModel();
       const session = new ChatSession(withCapacity(mock.model, 4096, 100));
 
       await session.send('hello');
 
-      expect(mock.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBeUndefined();
+      expect(mock.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBe(3996);
+    });
+
+    it('leaves an explicit budget inside the window unchanged', async () => {
+      const mock = makeMockModel();
+      const session = new ChatSession(withCapacity(mock.model, 4096, 100));
+
+      await session.send('hello', { config: { maxNewTokens: 3996 } });
+
+      expect(mock.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBe(3996);
+    });
+
+    // Mutation: reject only `prompt > capacity` → red (a 64-token prompt in a
+    // 64-token window reaches native start with a 0-token budget).
+    it('rejects a prompt that exactly fills the window instead of starting a 0-token turn', async () => {
+      const mock = makeMockModel();
+      const session = new ChatSession(withCapacity(mock.model, 64, 64));
+
+      const failure = session.send('exactly full', { config: { maxNewTokens: 16 } });
+      await expect(failure).rejects.toBeInstanceOf(ContextCapacityError);
+      await expect(failure).rejects.toThrow('(at most 63 prompt tokens)');
+      expect(mock.chatSessionStart).not.toHaveBeenCalled();
+      expect(session.turns).toBe(0);
+
+      const lastRow = new ChatSession(withCapacity(makeMockModel().model, 64, 63));
+      await expect(lastRow.preflightContextCapacity([{ role: 'user', content: 'x' }])).resolves.toMatchObject({
+        maxNewTokens: 1,
+      });
     });
 
     it('rejects an oversized prompt before native allocation and preserves turn state', async () => {
@@ -3573,7 +3604,7 @@ describe('ChatSession', () => {
         config: { maxNewTokens: 64 },
       });
 
-      expect(mock.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBe(29);
+      expect(mock.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBe(28);
       expect(expandedPromptTokenCount).toHaveBeenCalledTimes(1);
     });
 
@@ -3599,7 +3630,7 @@ describe('ChatSession', () => {
         { maxNewTokens: 64 },
       );
 
-      expect(config.maxNewTokens).toBe(9);
+      expect(config.maxNewTokens).toBe(8);
       expect(expandedPromptTokenCount).toHaveBeenCalledTimes(1);
       expect(mock.chatSessionStart).not.toHaveBeenCalled();
       expect(mock.chatStreamSessionStart).not.toHaveBeenCalled();

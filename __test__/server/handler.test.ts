@@ -500,7 +500,7 @@ describe('createHandler', () => {
       expect((model.resetCaches as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
     });
 
-    it('preserves the native output default when streaming preflight has room for it', async () => {
+    it('sends the rest of the window as the output budget when max_output_tokens is omitted', async () => {
       const model = Object.assign(
         createMockStreamModel([
           {
@@ -543,7 +543,7 @@ describe('createHandler', () => {
       const config = (model.chatStreamSessionStart as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] as
         | { maxNewTokens?: number }
         | undefined;
-      expect(config?.maxNewTokens).toBeUndefined();
+      expect(config?.maxNewTokens).toBe(3996);
     });
 
     it('commits initial SSE response events before a delayed first native stream event', async () => {

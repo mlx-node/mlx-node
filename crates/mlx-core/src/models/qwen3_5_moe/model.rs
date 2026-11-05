@@ -46,7 +46,7 @@ use crate::models::qwen3_5::gdn_checkpoint_store::{
 };
 use crate::models::qwen3_5::model::{
     Qwen3_5ContextLimits, async_eval_layer_caches, constrain_paged_context_params,
-    eval_layer_caches,
+    context_output_budget, eval_layer_caches,
 };
 use crate::transformer::paged_kv_cache_adapter::SeqId;
 use crate::vision::qwen::encoder::QwenVisionEncoder;
@@ -525,15 +525,9 @@ impl Qwen3_5MoeModel {
                 batch_size
             )));
         }
-        let prompt_len = prompt_tokens.shape_at(1)? as u32;
-        let capacity = self.context_limits.effective_window_tokens;
-        if prompt_len > capacity {
-            return Err(Error::from_reason(format!(
-                "context_length_exceeded: prompt has {prompt_len} tokens, effective active \
-                 context is {capacity} tokens"
-            )));
-        }
-        let max_output = capacity.saturating_sub(prompt_len).saturating_add(1);
+        let prompt_len = prompt_tokens.shape_at(1)? as usize;
+        let max_output =
+            context_output_budget(prompt_len, self.context_limits.effective_window_tokens)?;
         config.max_new_tokens = config.max_new_tokens.min(max_output as i32);
         crate::model_thread::send_and_await(&self.thread, |reply| {
             Qwen35MoeFamilyCommand::Generate {
