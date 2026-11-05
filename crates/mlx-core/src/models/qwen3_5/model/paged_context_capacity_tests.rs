@@ -22,14 +22,21 @@ fn rejects_a_prompt_larger_than_the_physical_pool() {
 }
 
 #[test]
-fn clamps_output_with_last_sampled_token_accounting() {
+fn clamps_output_to_window_minus_prompt() {
     let mut params = make_params(100);
     constrain_paged_context_params("test", 48, 64, &mut params).unwrap();
-    assert_eq!(params.max_new_tokens, 17);
+    assert_eq!(params.max_new_tokens, 16);
+
+    let mut last_row = make_params(100);
+    constrain_paged_context_params("test", 63, 64, &mut last_row).unwrap();
+    assert_eq!(last_row.max_new_tokens, 1);
 
     let mut full_prompt = make_params(100);
-    constrain_paged_context_params("test", 64, 64, &mut full_prompt).unwrap();
-    assert_eq!(full_prompt.max_new_tokens, 1);
+    let err = constrain_paged_context_params("test", 64, 64, &mut full_prompt).unwrap_err();
+    assert!(
+        err.reason
+            .starts_with("context_length_exceeded: rendered prompt has 64 tokens")
+    );
 }
 
 #[test]

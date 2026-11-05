@@ -35,9 +35,10 @@ pub(super) fn begin_paged_mtp_profiler(
     })
 }
 
-/// Enforce one fixed paged-pool token ceiling against already-resolved chat
-/// parameters. Shared by dense and MoE so every native paged executor uses the
-/// same prompt rejection marker and the same last-sampled-token accounting.
+/// Enforce one fixed token window against already-resolved chat parameters.
+/// Shared by dense and MoE so every native executor uses the same prompt
+/// rejection marker. Splash's budget: a prompt must leave room for one new
+/// token, and `prompt + max_new` never passes the window.
 pub(crate) fn constrain_paged_context_params(
     family: &str,
     prompt_tokens: usize,
@@ -45,15 +46,14 @@ pub(crate) fn constrain_paged_context_params(
     params: &mut engine::ChatParams,
 ) -> Result<()> {
     let prompt = u32::try_from(prompt_tokens).unwrap_or(u32::MAX);
-    if prompt > capacity {
+    if prompt >= capacity {
         return Err(Error::from_reason(format!(
             "context_length_exceeded: rendered prompt has {prompt} tokens, effective active \
-             context is {capacity} tokens"
+             context is {capacity} tokens (at most {} prompt tokens)",
+            capacity.saturating_sub(1)
         )));
     }
-    // The final sampled token is returned without another model forward, so N
-    // generated tokens consume only N-1 additional KV positions.
-    let max_output = capacity.saturating_sub(prompt).saturating_add(1);
+    let max_output = capacity - prompt;
     let requested = params.max_new_tokens.max(0) as u32;
     if requested > max_output {
         warn!(

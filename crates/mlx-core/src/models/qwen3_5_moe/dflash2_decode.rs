@@ -746,6 +746,10 @@ impl DFlash2Target for Qwen35MoeInner {
         self.config.max_position_embeddings
     }
 
+    fn dflash2_window(&self) -> Option<u32> {
+        self.dflash2_window.map(|terms| terms.window())
+    }
+
     fn dense_config(&self) -> std::borrow::Cow<'_, crate::models::qwen3_5::Qwen3_5Config> {
         std::borrow::Cow::Owned(self.config.to_dense_config())
     }
