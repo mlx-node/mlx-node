@@ -157,6 +157,31 @@ fn preflight_keeps_the_pool_window_when_a_dflash2_window_is_published() {
     );
 }
 
+/// Gate: the native DFlash2 clamp reads the published window, after its
+/// trained and `MLX_PAGED_PER_SEQ_CTX` caps. Mutation: return
+/// `terms.window()` from `DFlash2Target::dflash2_window` → red (2,024 ≠
+/// 1,024 on the test adapter).
+#[test]
+fn dflash2_clamp_window_is_the_published_window() {
+    use crate::models::qwen3_5::dflash2_turn::DFlash2Target;
+    let Some(mut inner) =
+        dense_inner_with_test_adapter_or_skip("dflash2_clamp_window_is_the_published_window")
+    else {
+        return;
+    };
+    let trained = inner.config.max_position_embeddings as u32;
+    inner.dflash2_window = Some(crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms {
+        trained: u32::MAX,
+        draft_trained: u32::MAX,
+        pool: Some(trained + 1_000),
+        reserve: None,
+        row_bytes: 1,
+    });
+    let (_, published, _, _) = inner.paged_context_limits();
+    assert!(published <= trained, "{published} vs {trained}");
+    assert_eq!(DFlash2Target::dflash2_window(&inner), Some(published));
+}
+
 #[test]
 fn paged_context_limits_and_preflight_use_scheduler_usable_window() {
     let Some(inner) = dense_inner_with_test_adapter_or_skip(

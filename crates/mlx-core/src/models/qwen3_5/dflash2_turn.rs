@@ -122,8 +122,8 @@ pub(crate) trait DFlash2Target: ChatBackend {
     fn kv_heads(&self) -> i32;
     fn head_dim(&self) -> i32;
     fn max_position_embeddings(&self) -> i32;
-    /// The DFlash2 context window published at load, `None` before it is
-    /// fixed.
+    /// The published context window (`paged_context_limits().1`) once the
+    /// DFlash2 window is fixed at load, `None` before.
     fn dflash2_window(&self) -> Option<u32>;
     /// Dense-shaped config the decode-phase cache limit is sized from.
     fn dense_config(&self) -> Cow<'_, Qwen3_5Config>;
