@@ -45,6 +45,22 @@ pub(crate) fn constrain_paged_context_params(
     capacity: u32,
     params: &mut engine::ChatParams,
 ) -> Result<()> {
+    let max_output = context_output_budget(prompt_tokens, capacity)?;
+    let requested = params.max_new_tokens.max(0) as u32;
+    if requested > max_output {
+        warn!(
+            "{family} clamping max_new_tokens from {} to {} for effective context {} \
+             (prompt_tokens={})",
+            requested, max_output, capacity, prompt_tokens
+        );
+        params.max_new_tokens = max_output as i32;
+    }
+    Ok(())
+}
+
+/// Largest output budget a `prompt_tokens` prompt leaves in a `capacity`
+/// window, or the `context_length_exceeded` rejection when it leaves none.
+pub(crate) fn context_output_budget(prompt_tokens: usize, capacity: u32) -> Result<u32> {
     let prompt = u32::try_from(prompt_tokens).unwrap_or(u32::MAX);
     if prompt >= capacity {
         return Err(Error::from_reason(format!(
@@ -53,17 +69,7 @@ pub(crate) fn constrain_paged_context_params(
             capacity.saturating_sub(1)
         )));
     }
-    let max_output = capacity - prompt;
-    let requested = params.max_new_tokens.max(0) as u32;
-    if requested > max_output {
-        warn!(
-            "{family} clamping max_new_tokens from {} to {} for effective context {} \
-             (prompt_tokens={})",
-            requested, max_output, capacity, prompt
-        );
-        params.max_new_tokens = max_output as i32;
-    }
-    Ok(())
+    Ok(capacity - prompt)
 }
 
 pub(super) struct DenseGdnPrefixCheckpoint {

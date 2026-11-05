@@ -21,6 +21,9 @@ fn rejects_a_prompt_larger_than_the_physical_pool() {
     );
 }
 
+/// Mutations in `context_output_budget`: return `capacity - prompt + 1` → red
+/// (17 ≠ 16); reject only `prompt > capacity` → red (a 64-token prompt in a
+/// 64-token window is accepted with a 0-token budget).
 #[test]
 fn clamps_output_to_window_minus_prompt() {
     let mut params = make_params(100);
