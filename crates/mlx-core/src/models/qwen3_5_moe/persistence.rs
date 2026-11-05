@@ -2317,6 +2317,7 @@ pub(crate) async fn load_with_source(
                 inner.image_processor.is_some(),
                 paged_active,
             );
+            inner.freeze_dflash2_window()?;
             let context_limits = crate::models::qwen3_5::model::Qwen3_5ContextLimits::from_tuple(
                 inner.paged_context_limits(),
             );

@@ -153,6 +153,9 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) dflash2_turn_state: Option<crate::models::qwen3_5::dflash2_turn::DFlash2TurnState>,
     pub(crate) dflash2_prefix: PrefixTracker,
     pub(crate) dflash2_states: crate::models::qwen3_5::dflash2_state::flat::FlatStates,
+    /// DFlash2 window terms fixed at load once the paged pool is
+    /// registered; `None` without a draft.
+    pub(crate) dflash2_window: Option<crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms>,
     /// Set only by a tapped flat prefill; every other cache lane invalidates it.
     pub(crate) dflash2_flat_lane_authoritative: bool,
     pub(crate) dflash2_compiled_verify_disabled: bool,

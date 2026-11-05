@@ -170,6 +170,9 @@ pub(crate) struct Qwen35Inner {
     pub(crate) dflash2_turn_state: Option<crate::models::qwen3_5::dflash2_turn::DFlash2TurnState>,
     pub(crate) dflash2_prefix: PrefixTracker,
     pub(crate) dflash2_states: crate::models::qwen3_5::dflash2_state::flat::FlatStates,
+    /// DFlash2 window terms fixed at load once the paged pool is
+    /// registered; `None` without a draft.
+    pub(crate) dflash2_window: Option<crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms>,
     /// Latched when the compiled DFlash2 verify graph fails at trace or
     /// replay — the failure mode is structural, so the stepper stays on the
     /// eager path for the rest of the model's lifetime.

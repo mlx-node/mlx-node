@@ -308,6 +308,22 @@ impl DraftExecutionPolicy {
 }
 
 impl DFlash2Config {
+    /// Bytes of every layer's BF16 K and V draft window buffers at their
+    /// largest capacity (`DraftKvWindow::append`'s cap: window + reserve +
+    /// one growth step).
+    pub(crate) fn kv_ring_bytes(&self) -> u64 {
+        let window = (self.sliding_window as u64).saturating_sub(1).max(1);
+        let rows = window
+            .saturating_add(self.block_size as u64 + 1)
+            .saturating_add(DRAFT_KV_STEP as u64);
+        (self.num_hidden_layers as u64)
+            .saturating_mul(2)
+            .saturating_mul(self.num_key_value_heads as u64)
+            .saturating_mul(self.head_dim as u64)
+            .saturating_mul(2)
+            .saturating_mul(rows)
+    }
+
     fn supports_source_conv(&self, target: [i32; 5]) -> bool {
         self.supports_moe_execution_defaults(target)
             && self.target_layers == [1, 6, 11, 16, 22, 27, 32, 37]
@@ -3195,6 +3211,24 @@ mod tests {
                 (name, array)
             })
             .collect()
+    }
+
+    /// Mutation: drop `DRAFT_KV_STEP` from the ring rows → red.
+    #[test]
+    fn draft_kv_ring_bytes_match_the_window_buffer_cap() {
+        let config = DFlash2Config {
+            num_hidden_layers: 5,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            sliding_window: 2048,
+            block_size: 7,
+            ..checkpoint_inventory_config()
+        };
+        assert_eq!(
+            config.kv_ring_bytes(),
+            (2047 + 8 + 256) * 5 * 2 * 8 * 128 * 2
+        );
+        assert_eq!(config.kv_ring_bytes(), 47_329_280);
     }
 
     #[test]

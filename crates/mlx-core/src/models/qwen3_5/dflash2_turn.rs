@@ -29,11 +29,11 @@ use crate::transformer::KvFormat;
 use super::config::Qwen3_5Config;
 use super::dflash2::{DFlash2ContextCache, DFlash2Model};
 use super::dflash2_decode::{
-    constrain_dflash2_context_params, dflash2_decode_cache_limit, dflash2_final_token_fits_context,
-    dflash2_kv_budget_of, dflash2_kv_headroom_bytes, dflash2_kv_headroom_for,
-    dflash2_kv_need_bytes, dflash2_kv_reserve_rows, dflash2_memory_snapshot,
-    dflash2_turn_transient_bytes, kv_row_bytes, min_fa_capacity, reserve_dflash2_target_kv,
-    reusable_dflash2_prefix,
+    DFlash2WindowTerms, constrain_dflash2_context_params, dflash2_decode_cache_limit,
+    dflash2_final_token_fits_context, dflash2_kv_budget_of, dflash2_kv_headroom_bytes,
+    dflash2_kv_headroom_for, dflash2_kv_need_bytes, dflash2_kv_reserve_rows,
+    dflash2_memory_snapshot, dflash2_turn_transient_bytes, dflash2_window_terms, kv_row_bytes,
+    min_fa_capacity, reserve_dflash2_target_kv, reusable_dflash2_prefix,
 };
 use super::dflash2_state::flat::{
     FlatAnchor, FlatBacking, FlatStates, flat_attention_kv, join_flat_anchor, join_flat_caches,
@@ -122,6 +122,9 @@ pub(crate) trait DFlash2Target: ChatBackend {
     fn kv_heads(&self) -> i32;
     fn head_dim(&self) -> i32;
     fn max_position_embeddings(&self) -> i32;
+    /// The DFlash2 context window published at load, `None` before it is
+    /// fixed.
+    fn dflash2_window(&self) -> Option<u32>;
     /// Dense-shaped config the decode-phase cache limit is sized from.
     fn dense_config(&self) -> Cow<'_, Qwen3_5Config>;
     fn set_cached_token_history(&mut self, history: Vec<u32>);
@@ -496,6 +499,30 @@ pub(crate) fn evict_for_turn_kv<B: Backing>(
         headroom,
     );
     store.evict_for(need, headroom, None)
+}
+
+/// The DFlash2 window terms of `target` with its loaded draft, `None`
+/// without one. `pool_bytes` is the paged pool's maximum; the reservation
+/// term reads the live headroom, so this runs once the pool is registered.
+pub(crate) fn dflash2_published_window<T: DFlash2Target>(
+    target: &T,
+    pool_bytes: Option<u64>,
+) -> Result<Option<DFlash2WindowTerms>> {
+    let Some(draft) = target.dflash2() else {
+        return Ok(None);
+    };
+    let config = target.dense_config();
+    dflash2_window_terms(
+        &config,
+        dflash2_target_kv_format(target),
+        dflash2_target_kv_dtype(target)?,
+        draft.max_position_embeddings(),
+        draft.config.kv_ring_bytes(),
+        draft.config.block_size,
+        pool_bytes,
+        dflash2_kv_headroom_bytes(dflash2_memory_snapshot()),
+    )
+    .map(Some)
 }
 
 /// Full-attention K/V bytes of one token row on `target`, and its turn
@@ -1206,6 +1233,7 @@ pub(crate) fn dflash2_chat_turn<T: DFlash2Target + DsparkBackend>(
             .dflash2()
             .ok_or_else(|| Error::from_reason("loaded DFlash2 companion"))?
             .max_position_embeddings(),
+        target.dflash2_window(),
         &mut params,
     )?;
     let prior_cached = if is_delta {

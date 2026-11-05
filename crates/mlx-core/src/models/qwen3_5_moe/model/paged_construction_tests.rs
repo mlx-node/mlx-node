@@ -94,6 +94,58 @@ fn tiny_hybrid_recurrent_bytes_make_usable_window_stricter_than_raw_pool() {
     );
 }
 
+/// Gate: a DFlash2 window published above the pool leaves paged preflight
+/// on the pool window. Mutation: preflight on `paged_context_limits().1`
+/// → red.
+#[test]
+fn preflight_keeps_the_pool_window_when_a_dflash2_window_is_published() {
+    // M3 Pro trigger inputs: 5,051 one-MiB BF16 blocks less 147 GDN blocks.
+    assert_eq!(
+        crate::engine::hybrid_scheduler::pool_tokens_after_recurrent(
+            5_051 * 16,
+            16,
+            1 << 20,
+            153_944_064
+        ),
+        78_464
+    );
+    let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
+        "preflight_keeps_the_pool_window_when_a_dflash2_window_is_published",
+    ) else {
+        return;
+    };
+    let pool_window = inner.pool_context_limit();
+    let trained = inner.config.max_position_embeddings as u32;
+    assert!(pool_window + 1 < trained, "{pool_window} vs {trained}");
+    inner.dflash2_window = Some(crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms {
+        trained,
+        draft_trained: trained,
+        pool: Some(trained),
+        reserve: None,
+        row_bytes: 1,
+    });
+    let (_, published, _, _) = inner.paged_context_limits();
+    assert!(published > pool_window, "{published} vs {pool_window}");
+
+    let mut params = crate::engine::extract_chat_params(&crate::engine::types::ChatConfig {
+        max_new_tokens: Some(32),
+        ..crate::engine::types::ChatConfig::default()
+    });
+    inner
+        .preflight_paged_context(pool_window as usize - 1, &mut params)
+        .expect("a prompt inside the pool window passes");
+    assert_eq!(params.max_new_tokens, 1);
+    let err = inner
+        .preflight_paged_context(pool_window as usize, &mut params)
+        .expect_err("the pool window, not the published one, bounds paged turns");
+    assert!(
+        err.reason
+            .contains(&format!("effective active context is {pool_window} tokens")),
+        "{}",
+        err.reason
+    );
+}
+
 #[test]
 fn paged_context_limits_and_preflight_use_scheduler_usable_window() {
     let Some(inner) = moe_inner_with_test_adapter_or_skip(
@@ -117,8 +169,11 @@ fn paged_context_limits_and_preflight_use_scheduler_usable_window() {
         ..crate::engine::types::ChatConfig::default()
     });
     inner
+        .preflight_paged_context(effective as usize - 1, &mut params)
+        .expect("a prompt leaving one row of the scheduler window must pass");
+    inner
         .preflight_paged_context(effective as usize, &mut params)
-        .expect("prompt at the scheduler window must pass");
+        .expect_err("a prompt filling the window leaves no room to generate");
     let err = inner
         .preflight_paged_context(pool as usize, &mut params)
         .expect_err("prompt at raw pool tokens must fail after recurrent charge");

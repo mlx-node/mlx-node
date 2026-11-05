@@ -73,10 +73,12 @@ pub(crate) fn constrain_dflash2_context_params(
     prompt_tokens: usize,
     target_capacity: i32,
     draft_capacity: usize,
+    published_window: Option<u32>,
     params: &mut crate::engine::params::ChatParams,
 ) -> Result<usize> {
     let target_capacity = usize::try_from(target_capacity.max(0)).unwrap_or(usize::MAX);
-    let capacity = target_capacity.min(draft_capacity);
+    let window = published_window.map_or(usize::MAX, |window| window as usize);
+    let capacity = target_capacity.min(draft_capacity).min(window);
     super::model::constrain_paged_context_params(
         "Qwen3.8 DFlash2",
         prompt_tokens,
@@ -138,6 +140,134 @@ pub(crate) fn dflash2_kv_budget_of(headroom: u64) -> u64 {
 /// must free against this, not against `budget`.
 pub(crate) fn dflash2_kv_headroom_for(budget: u64) -> u64 {
     budget.div_ceil(9).saturating_mul(10)
+}
+
+/// The bounds a DFlash2 turn's context window is the least of, fixed at
+/// load: the trained windows, the target rows the paged pool's maximum
+/// bytes hold after one lane, and the largest whole turn the target KV
+/// reservation admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DFlash2WindowTerms {
+    pub trained: u32,
+    pub draft_trained: u32,
+    pub pool: Option<u32>,
+    pub reserve: Option<u32>,
+    pub row_bytes: u64,
+}
+
+impl DFlash2WindowTerms {
+    pub fn window(&self) -> u32 {
+        self.trained
+            .min(self.draft_trained)
+            .min(self.pool.unwrap_or(u32::MAX))
+            .min(self.reserve.unwrap_or(u32::MAX))
+            .max(1)
+    }
+}
+
+/// One DFlash2 lane's bytes besides target KV: two GDN cells (the live
+/// state and the pre-verify copy) and the draft's KV window buffers.
+pub(crate) fn dflash2_lane_bytes(recurrent_state_bytes: u64, draft_ring_bytes: u64) -> u64 {
+    recurrent_state_bytes
+        .saturating_mul(2)
+        .saturating_add(draft_ring_bytes)
+}
+
+/// Target rows `pool_bytes` hold for one turn after `lane_bytes`, less the
+/// `scratch_rows` a verify writes past the last kept row.
+pub(crate) fn dflash2_pool_window(
+    pool_bytes: u64,
+    lane_bytes: u64,
+    row_bytes: u64,
+    scratch_rows: u64,
+) -> u32 {
+    if row_bytes == 0 {
+        return u32::MAX;
+    }
+    (pool_bytes.saturating_sub(lane_bytes) / row_bytes)
+        .saturating_sub(scratch_rows)
+        .min(u64::from(u32::MAX)) as u32
+}
+
+/// Whether [`dflash2_kv_reserve_rows`] reserves a whole `window`-row prompt
+/// plus one new token from `headroom` less that turn's transients. The worst
+/// case of every turn the window admits: a shorter prompt has smaller
+/// transients and needs fewer rows.
+pub(crate) fn dflash2_reserve_admits(
+    window: u32,
+    headroom: u64,
+    row_bytes: u64,
+    transient: &dyn Fn(usize) -> u64,
+) -> Result<bool> {
+    let prompt = window as usize;
+    let budget = dflash2_kv_budget_of(headroom.saturating_sub(transient(prompt)));
+    let whole = kv_capacity_round_up(window as i32, 1)? as i64;
+    Ok(dflash2_kv_reserve_rows(prompt, 1, 0, row_bytes, Some(budget))? == Some(whole))
+}
+
+/// Largest window [`dflash2_reserve_admits`] holds for, `0` when none does.
+pub(crate) fn dflash2_reserve_window(
+    headroom: u64,
+    row_bytes: u64,
+    transient: &dyn Fn(usize) -> u64,
+) -> Result<u32> {
+    if row_bytes == 0 {
+        return Ok(u32::MAX);
+    }
+    let (mut low, mut high) = (0u32, (headroom / row_bytes).min(i32::MAX as u64 / 2) as u32);
+    if !dflash2_reserve_admits(low, headroom, row_bytes, transient)? {
+        return Ok(0);
+    }
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if dflash2_reserve_admits(mid, headroom, row_bytes, transient)? {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Ok(low)
+}
+
+/// The published DFlash2 window terms for `config` with a draft whose KV
+/// window buffers take `draft_ring_bytes` and whose verify writes
+/// `scratch_rows` rows past the kept ones. `pool_bytes` is the paged pool's
+/// maximum, `headroom` the live [`dflash2_kv_headroom_bytes`] after that pool
+/// registered; either `None` drops its term.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dflash2_window_terms(
+    config: &super::config::Qwen3_5Config,
+    format: KvFormat,
+    dtype: DType,
+    draft_trained: usize,
+    draft_ring_bytes: u64,
+    draft_block_size: usize,
+    pool_bytes: Option<u64>,
+    headroom: Option<u64>,
+) -> Result<DFlash2WindowTerms> {
+    let row_bytes = kv_row_bytes(
+        config.full_attention_layer_count(),
+        config.num_kv_heads,
+        config.head_dim,
+        dtype,
+        format,
+    );
+    let lane_bytes = dflash2_lane_bytes(config.recurrent_state_bytes(), draft_ring_bytes);
+    let pool = pool_bytes
+        .map(|bytes| dflash2_pool_window(bytes, lane_bytes, row_bytes, draft_block_size as u64));
+    let transient = |prompt: usize| {
+        dflash2_turn_transient_bytes(config, draft_block_size, prompt, prompt as u64 + 1, format)
+    };
+    let reserve = headroom
+        .map(|headroom| dflash2_reserve_window(headroom, row_bytes, &transient))
+        .transpose()?;
+    Ok(DFlash2WindowTerms {
+        trained: config.max_position_embeddings.max(0) as u32,
+        draft_trained: draft_trained.min(u32::MAX as usize) as u32,
+        pool,
+        reserve,
+        row_bytes,
+    })
 }
 
 /// Bytes one token row costs across every full-attention K and V tensor:
@@ -339,7 +469,8 @@ pub(crate) fn dflash2_decode_cache_limit(
 /// First-order estimate of the bytes one turn allocates and frees besides its
 /// KV, `context_rows` being `prompt + max_new`: the larger of a prefill
 /// chunk (one layer's attention and MLP scratch over the chunk rows, plus
-/// one full-attention layer's prefix dequantized from int8 rows) and the
+/// one full-attention layer's prefix dequantized from int8 rows and its
+/// concatenation with the chunk) and the
 /// decode phase (one cycle's transients plus the free pool
 /// [`dflash2_decode_cache_limit`] lets them keep).
 pub(crate) fn dflash2_turn_transient_bytes(
@@ -355,8 +486,12 @@ pub(crate) fn dflash2_turn_transient_bytes(
         .saturating_mul(3)
         .saturating_mul(dim(config.hidden_size).saturating_add(dim(config.intermediate_size)))
         .saturating_mul(2);
+    // An int8 prefill chunk dequantizes the prefix to BF16 K and V, then
+    // concatenates the chunk onto it: both copies are live at once.
     let dequantized_prefix = match kv_format {
         KvFormat::Int8 => (prompt_len as u64)
+            .saturating_mul(2)
+            .saturating_add(chunk_rows)
             .saturating_mul(dim(config.num_kv_heads))
             .saturating_mul(dim(config.head_dim))
             .saturating_mul(2 * 2),
@@ -850,6 +985,10 @@ impl DFlash2Target for Qwen35Inner {
 
     fn max_position_embeddings(&self) -> i32 {
         self.config.max_position_embeddings
+    }
+
+    fn dflash2_window(&self) -> Option<u32> {
+        self.dflash2_window.map(|terms| terms.window())
     }
 
     fn dense_config(&self) -> std::borrow::Cow<'_, crate::models::qwen3_5::Qwen3_5Config> {
@@ -2594,13 +2733,13 @@ pub(crate) mod tests {
             max_new_tokens: Some(64),
             ..ChatConfig::default()
         });
-        let capacity = constrain_dflash2_context_params(10, 16, 12, &mut params)
+        let capacity = constrain_dflash2_context_params(10, 16, 12, None, &mut params)
             .expect("valid prompt is clamped");
         assert_eq!(capacity, 12);
-        assert_eq!(params.max_new_tokens, 3);
+        assert_eq!(params.max_new_tokens, 2);
 
         let mut too_long = extract_chat_params(&ChatConfig::default());
-        let error = constrain_dflash2_context_params(13, 16, 12, &mut too_long)
+        let error = constrain_dflash2_context_params(13, 16, 12, None, &mut too_long)
             .expect_err("prompt beyond draft context must fail before prefill");
         assert!(error.reason.contains("effective active context is 12"));
 
@@ -2609,6 +2748,152 @@ pub(crate) mod tests {
             !dflash2_final_token_fits_context(12, capacity),
             "the final sampled token may be returned at capacity but must not be forwarded"
         );
+    }
+
+    /// Gate: the published window bounds the DFlash2 clamp, with Splash's
+    /// `window - prompt` output budget. Mutation: ignore `published_window`
+    /// in `constrain_dflash2_context_params` → red (122,144 ≠ 8,464).
+    #[test]
+    fn context_budget_is_bounded_by_the_published_window() {
+        let mut params = extract_chat_params(&ChatConfig {
+            max_new_tokens: Some(100_000),
+            ..ChatConfig::default()
+        });
+        let capacity =
+            constrain_dflash2_context_params(140_000, 262_144, 262_144, Some(148_464), &mut params)
+                .expect("prompt inside the window");
+        assert_eq!(capacity, 148_464);
+        assert_eq!(params.max_new_tokens, 148_464 - 140_000);
+
+        let mut at_window = extract_chat_params(&ChatConfig::default());
+        let error = constrain_dflash2_context_params(
+            148_464,
+            262_144,
+            262_144,
+            Some(148_464),
+            &mut at_window,
+        )
+        .expect_err("a prompt filling the window leaves no room to generate");
+        assert!(
+            error
+                .reason
+                .starts_with("context_length_exceeded: rendered prompt has 148464 tokens"),
+            "{}",
+            error.reason
+        );
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// Gate: the Splash full-lane window on the M3 Pro trigger inputs
+    /// (5,051 one-MiB pool blocks, 27B target, 5 x 8 x 128 draft, 8 verify
+    /// rows). Mutations: price rows with `KvFormat::Bf16` in
+    /// `dflash2_window_terms` → red (75,388); charge one GDN cell in
+    /// `dflash2_lane_bytes` → red (154,519).
+    #[test]
+    fn dflash2_pool_window_on_the_m3_pro_inputs() {
+        let cfg = qwen38_27b_cfg();
+        let terms = dflash2_window_terms(
+            &cfg,
+            KvFormat::Int8,
+            DType::BFloat16,
+            262_144,
+            47_329_280,
+            QWEN38_DRAFT_BLOCK,
+            Some(5_051 * MIB),
+            None,
+        )
+        .expect("window terms");
+        assert_eq!(terms.row_bytes, 33_280);
+        assert_eq!(terms.pool, Some(148_464));
+        assert_eq!(terms.reserve, None);
+        assert_eq!(terms.window(), 148_464);
+    }
+
+    /// Gate: with little MLX-active memory the DFlash2 reservation, not the
+    /// pool probe, binds, and the published window still reserves a whole
+    /// turn. Mutation: drop the `reserve` term from
+    /// `DFlash2WindowTerms::window` → red.
+    #[test]
+    fn dflash2_reserve_window_binds_when_active_memory_is_low() {
+        let cfg = super::super::config::Qwen3_5Config {
+            max_position_embeddings: 1_048_576,
+            ..qwen38_27b_cfg()
+        };
+        let working_set = 27 * GIB;
+        let active = 5 * GIB;
+        // The pool probe's max: 0.85·WS − active − 1 GiB − 64 MiB, in blocks.
+        let pool_bytes = (working_set / 100 * 85 - active - GIB - 64 * MIB) / MIB * MIB;
+        let snapshot = PagedPrefillMemorySnapshot {
+            allocator_active_bytes: Some(active),
+            allocator_cached_bytes: Some(0),
+            allocator_limit_bytes: Some(working_set),
+            metal_recommended_working_set_bytes: Some(working_set),
+            metal_current_allocated_bytes: None,
+            paged_pool_allocated_bytes: Some(275 * MIB),
+        };
+        let headroom = dflash2_kv_headroom_bytes(snapshot).expect("readable limits");
+        let terms = dflash2_window_terms(
+            &cfg,
+            KvFormat::Int8,
+            DType::BFloat16,
+            1_048_576,
+            47_329_280,
+            QWEN38_DRAFT_BLOCK,
+            Some(pool_bytes),
+            Some(headroom),
+        )
+        .expect("window terms");
+        let (pool, reserve) = (terms.pool.expect("pool"), terms.reserve.expect("reserve"));
+        assert!(
+            reserve < pool,
+            "reserve {reserve} must bind below pool {pool}"
+        );
+        let window = terms.window();
+        assert_eq!(window, reserve);
+
+        let transient = |prompt: usize| {
+            dflash2_turn_transient_bytes(
+                &cfg,
+                QWEN38_DRAFT_BLOCK,
+                prompt,
+                prompt as u64 + 1,
+                KvFormat::Int8,
+            )
+        };
+        let reserve_at = |window: u32| {
+            let budget = dflash2_kv_budget_of(headroom - transient(window as usize));
+            dflash2_kv_reserve_rows(window as usize, 1, 0, terms.row_bytes, Some(budget))
+                .expect("reserve rows")
+        };
+        let whole = kv_capacity_round_up(window as i32, 1).expect("whole") as i64;
+        assert_eq!(reserve_at(window), Some(whole));
+        assert_ne!(
+            reserve_at(window + 1),
+            Some(kv_capacity_round_up(window as i32 + 1, 1).expect("whole") as i64),
+            "the reserve window is the largest one admitted"
+        );
+    }
+
+    /// Mutation: drop the concat copy (`2 * prompt + chunk` → `prompt`) from
+    /// the int8 prefill term of `dflash2_turn_transient_bytes` → red.
+    #[test]
+    fn int8_prefill_transient_counts_the_prefix_and_concat_copies() {
+        // One query head and a small vocab keep the decode term below the
+        // prefill term, so the int8 copies are what the estimate returns.
+        let cfg = super::super::config::Qwen3_5Config {
+            num_heads: 1,
+            vocab_size: 1024,
+            ..qwen38_27b_cfg()
+        };
+        let prompt = 72_000usize;
+        let transient = |format| {
+            dflash2_turn_transient_bytes(&cfg, QWEN38_DRAFT_BLOCK, prompt, prompt as u64, format)
+        };
+        let scratch = 2048 * 3 * (5120 + 17_408) * 2;
+        let copies = (2 * prompt as u64 + 2048) * 4 * 256 * 2 * 2;
+        assert_eq!(transient(KvFormat::Int8), scratch + copies);
+        assert!(transient(KvFormat::Bf16) < scratch + copies);
     }
 
     #[test]
