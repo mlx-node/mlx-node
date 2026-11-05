@@ -694,24 +694,31 @@ impl Qwen35MoeInner {
 
                 let next_logits = {
                     let _stream_ctx = StreamContext::new(generation_stream);
-                    let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                        Error::from_reason("vision_paged_turn_sync_core: caches dropped mid-decode")
-                    })?;
-                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "vision_paged_turn_sync_core: paged_adapter dropped mid-decode",
-                        )
-                    })?;
-                    let logits = crate::models::qwen3_5_moe::paged_forward::run_paged_decode_step(
-                        token_id,
-                        &embed,
-                        &mut self.layers,
-                        caches_ref,
-                        &self.final_norm,
-                        &self.lm_head,
-                        &layer_kinds,
-                        adapter,
-                        self.cached_rope_deltas.unwrap_or(0),
+                    let logits = crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(
+                        self,
+                        |inner| {
+                            let caches_ref = inner.caches.as_mut().ok_or_else(|| {
+                                Error::from_reason(
+                                    "vision_paged_turn_sync_core: caches dropped mid-decode",
+                                )
+                            })?;
+                            let adapter = inner.paged_adapter.as_mut().ok_or_else(|| {
+                                Error::from_reason(
+                                    "vision_paged_turn_sync_core: paged_adapter dropped mid-decode",
+                                )
+                            })?;
+                            crate::models::qwen3_5_moe::paged_forward::run_paged_decode_step(
+                                token_id,
+                                &embed,
+                                &mut inner.layers,
+                                caches_ref,
+                                &inner.final_norm,
+                                &inner.lm_head,
+                                &layer_kinds,
+                                adapter,
+                                inner.cached_rope_deltas.unwrap_or(0),
+                            )
+                        },
                     )?;
                     logits.squeeze(Some(&[1]))?
                 };
@@ -1092,26 +1099,31 @@ impl Qwen35MoeInner {
 
                 let next_logits = {
                     let _stream_ctx = StreamContext::new(generation_stream);
-                    let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "vision_paged_turn_stream_core: caches dropped mid-decode",
-                        )
-                    })?;
-                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                    let logits = crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(
+                        self,
+                        |inner| {
+                            let caches_ref = inner.caches.as_mut().ok_or_else(|| {
+                                Error::from_reason(
+                                    "vision_paged_turn_stream_core: caches dropped mid-decode",
+                                )
+                            })?;
+                            let adapter = inner.paged_adapter.as_mut().ok_or_else(|| {
                         Error::from_reason(
                             "vision_paged_turn_stream_core: paged_adapter dropped mid-decode",
                         )
                     })?;
-                    let logits = crate::models::qwen3_5_moe::paged_forward::run_paged_decode_step(
-                        token_id,
-                        &embed,
-                        &mut self.layers,
-                        caches_ref,
-                        &self.final_norm,
-                        &self.lm_head,
-                        &layer_kinds,
-                        adapter,
-                        self.cached_rope_deltas.unwrap_or(0),
+                            crate::models::qwen3_5_moe::paged_forward::run_paged_decode_step(
+                                token_id,
+                                &embed,
+                                &mut inner.layers,
+                                caches_ref,
+                                &inner.final_norm,
+                                &inner.lm_head,
+                                &layer_kinds,
+                                adapter,
+                                inner.cached_rope_deltas.unwrap_or(0),
+                            )
+                        },
                     )?;
                     logits.squeeze(Some(&[1]))?
                 };

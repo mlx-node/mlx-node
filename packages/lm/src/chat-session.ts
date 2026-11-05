@@ -109,6 +109,13 @@ import type { ChatStreamEvent, ChatStreamProgressRef } from './stream.js';
 const IMAGE_CHANGE_RESTART_PREFIX = 'IMAGE_CHANGE_REQUIRES_SESSION_RESTART:';
 
 /**
+ * Default resolved by the native shared chat engine when `maxNewTokens` is
+ * absent. Keep this in sync with `extract_chat_params()` in
+ * `crates/mlx-core/src/engine/params.rs`.
+ */
+const NATIVE_DEFAULT_MAX_NEW_TOKENS = 2048;
+
+/**
  * Model wrapper class names whose in-checkpoint MTP head must NOT be
  * auto-enabled. Fallback only: {@link ChatSession#mtpAutoDefaultAllowed}
  * prefers the native {@link SessionCapableModel.mtpAutoEnabled} getter in BOTH
@@ -169,11 +176,12 @@ export class ContextCapacityError extends Error {
   constructor(
     readonly promptTokens: number,
     readonly effectiveWindowTokens: number,
+    maxPromptTokens?: number,
   ) {
     super(
       `context_length_exceeded: rendered prompt uses ${promptTokens} tokens, ` +
-        `but this model currently has capacity for ${effectiveWindowTokens} tokens ` +
-        `(at most ${Math.max(0, effectiveWindowTokens - 1)} prompt tokens)`,
+        `but this model currently has capacity for ${effectiveWindowTokens} tokens` +
+        (maxPromptTokens === undefined ? '' : ` (at most ${maxPromptTokens} prompt tokens)`),
     );
     this.name = 'ContextCapacityError';
   }
@@ -199,6 +207,13 @@ export interface SessionContextLimits {
    * the autoregressive or vision lane and stay on `effectiveWindowTokens`.
    */
   speculativeWindowTokens?: number | null;
+  /**
+   * The output budget fills the window: a prompt must leave room for one new
+   * token, `maxNewTokens` is clamped to `window - prompt`, and an omitted
+   * budget is the rest of the window. Otherwise `maxNewTokens` is clamped to
+   * `window - prompt + 1` and an omitted budget keeps the native default.
+   */
+  restOfWindowOutputBudget?: boolean;
 }
 
 /**
@@ -1967,10 +1982,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * The window is the speculative one only for a text turn with `enableMtp`
    * on, matching the native turn plan; every other turn uses the pool's.
    *
-   * Splash's output budget: a prompt must leave room for one new token,
-   * `maxNewTokens` is clamped to `window - prompt`, and an omitted budget is
-   * the rest of the window. The returned config is a copy only when
-   * `maxNewTokens` changes.
+   * The output budget follows `restOfWindowOutputBudget`. The returned
+   * config is a copy only when `maxNewTokens` changes.
    */
   private async constrainToContextCapacity(messages: ChatMessage[], config: ChatConfig): Promise<ChatConfig> {
     if (typeof this.model.applyChatTemplate !== 'function' || typeof this.model.contextLimits !== 'function') {
@@ -2008,14 +2021,26 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         );
       }
     }
-    if (promptTokens >= capacity) {
-      throw new ContextCapacityError(promptTokens, capacity);
-    }
-
-    const maxOutput = capacity - promptTokens;
     const requested = config.maxNewTokens;
-    if (requested == null) {
-      return { ...config, maxNewTokens: maxOutput };
+    let maxOutput: number;
+    if (limits.restOfWindowOutputBudget === true) {
+      if (promptTokens >= capacity) {
+        throw new ContextCapacityError(promptTokens, capacity, capacity - 1);
+      }
+      maxOutput = capacity - promptTokens;
+      if (requested == null) {
+        return { ...config, maxNewTokens: maxOutput };
+      }
+    } else {
+      if (promptTokens > capacity) {
+        throw new ContextCapacityError(promptTokens, capacity);
+      }
+      // The final sampled token is returned without another model forward, so N
+      // generated tokens consume only N-1 additional KV positions.
+      maxOutput = capacity - promptTokens + 1;
+      if (requested === undefined) {
+        return maxOutput >= NATIVE_DEFAULT_MAX_NEW_TOKENS ? config : { ...config, maxNewTokens: maxOutput };
+      }
     }
     const maxNewTokens = Math.min(requested, maxOutput);
     return maxNewTokens === requested ? config : { ...config, maxNewTokens };

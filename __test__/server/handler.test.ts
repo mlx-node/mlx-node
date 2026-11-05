@@ -420,6 +420,7 @@ function createLaneWindowModel(promptTokens: number, extra: Record<string, unkno
         pagedBlockCapacity: 4,
         pagedBlockSize: 16,
         speculativeWindowTokens: 96,
+        restOfWindowOutputBudget: true,
       }),
       hasMtpWeights: () => true,
       mtpAutoEnabled: () => true,
@@ -532,6 +533,53 @@ describe('createHandler', () => {
       expect((model.resetCaches as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
     });
 
+    // Mutation: ignore `restOfWindowOutputBudget` → red (3996 ≠ undefined).
+    it('preserves the native output default when streaming preflight has room for it', async () => {
+      const model = Object.assign(
+        createMockStreamModel([
+          {
+            done: true,
+            text: 'ok',
+            finishReason: 'stop',
+            toolCalls: [],
+            thinking: null,
+            thinkingEnabled: true,
+            numTokens: 1,
+            promptTokens: 100,
+            reasoningTokens: 0,
+            rawText: 'ok',
+          },
+        ]),
+        {
+          contextLimits: () => ({
+            trainedWindowTokens: 262_144,
+            effectiveWindowTokens: 4096,
+            pagedBlockCapacity: 256,
+            pagedBlockSize: 16,
+          }),
+          applyChatTemplate: vi.fn(() => new Uint32Array(100)),
+        },
+      );
+      const registry = new ModelRegistry();
+      registry.register('test-model', model);
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'hello',
+        stream: true,
+      });
+      const response = createMockRes();
+
+      await handler(req, response.res);
+      await response.waitForEnd();
+
+      expect(response.getStatus()).toBe(200);
+      const config = (model.chatStreamSessionStart as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] as
+        | { maxNewTokens?: number }
+        | undefined;
+      expect(config?.maxNewTokens).toBeUndefined();
+    });
+
     it('sends the rest of the window as the output budget when max_output_tokens is omitted', async () => {
       const model = Object.assign(
         createMockStreamModel([
@@ -554,6 +602,7 @@ describe('createHandler', () => {
             effectiveWindowTokens: 4096,
             pagedBlockCapacity: 256,
             pagedBlockSize: 16,
+            restOfWindowOutputBudget: true,
           }),
           applyChatTemplate: vi.fn(() => new Uint32Array(100)),
         },

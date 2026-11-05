@@ -5245,6 +5245,12 @@ export interface Qwen35ContextLimits {
   pagedBlockCapacity: number;
   pagedBlockSize: number;
   speculativeWindowTokens?: number;
+  /**
+   * The output budget fills the window: a prompt leaves room for one new
+   * token, the budget is clamped to `window - prompt`, and an omitted
+   * budget is the rest of the window.
+   */
+  restOfWindowOutputBudget: boolean;
 }
 
 /** Generation configuration for Qwen3.5 */
