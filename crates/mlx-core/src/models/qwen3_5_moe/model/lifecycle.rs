@@ -710,23 +710,40 @@ impl Qwen35MoeInner {
         scheduled_turn_context(trained, usable, scheduler_per_seq_context_override())
     }
 
-    /// `(trained, published, pool blocks, block size)`. With a DFlash2 draft
-    /// the published window is the one fixed at load by
-    /// [`Self::freeze_dflash2_window`]; otherwise the pool's.
+    /// `(trained, pool window, pool blocks, block size)`. Every turn but a
+    /// DFlash2 one clamps on the pool window.
     pub(crate) fn paged_context_limits(&self) -> (u32, u32, u32, u32) {
-        let trained = self.config.max_position_embeddings.max(0) as u32;
-        let published = match self.dflash2_window {
-            Some(terms) => scheduled_turn_context(
-                trained,
-                terms.window(),
-                scheduler_per_seq_context_override(),
-            ),
-            None => self.pool_context_limit(),
-        };
         let (blocks, block_size) = self.paged_adapter.as_ref().map_or((0, 0), |adapter| {
             (adapter.block_capacity(), adapter.block_size())
         });
-        (trained, published, blocks, block_size)
+        (
+            self.config.max_position_embeddings.max(0) as u32,
+            self.pool_context_limit(),
+            blocks,
+            block_size,
+        )
+    }
+
+    /// The window a DFlash2 turn clamps on, fixed at load by
+    /// [`Self::freeze_dflash2_window`]; `None` without a draft.
+    pub(crate) fn speculative_window(&self) -> Option<u32> {
+        let trained = self.config.max_position_embeddings.max(0) as u32;
+        self.dflash2_window.map(|terms| {
+            scheduled_turn_context(
+                trained,
+                terms.window(),
+                scheduler_per_seq_context_override(),
+            )
+        })
+    }
+
+    pub(crate) fn context_limits_snapshot(
+        &self,
+    ) -> crate::models::qwen3_5::model::Qwen3_5ContextLimits {
+        crate::models::qwen3_5::model::Qwen3_5ContextLimits::from_parts(
+            self.paged_context_limits(),
+            self.speculative_window(),
+        )
     }
 
     /// Fix the DFlash2 window at load, after the paged pool is registered
@@ -750,10 +767,10 @@ impl Qwen35MoeInner {
         };
         self.dflash2_window = Some(terms);
         info!(
-            "Qwen3.5 MoE DFlash2 context window: published_window_tokens={}, pool_window_tokens={}, \
+            "Qwen3.5 MoE DFlash2 context window: speculative_window_tokens={:?}, pool_window_tokens={}, \
              kv_format={:?}, kv_row_bytes={}, trained={}, draft_trained={}, \
              dflash2_pool_window={:?}, dflash2_reserve_window={:?}",
-            self.paged_context_limits().1,
+            self.speculative_window(),
             self.pool_context_limit(),
             crate::models::qwen3_5::dflash2_turn::dflash2_target_kv_format(&*self),
             terms.row_bytes,

@@ -3306,8 +3306,7 @@ async fn load_with_thread_impl(
                 paged_active,
             );
             inner.freeze_dflash2_window()?;
-            let context_limits =
-                super::model::Qwen3_5ContextLimits::from_tuple(inner.paged_context_limits());
+            let context_limits = inner.context_limits_snapshot();
 
             Ok((
                 Qwen35SchedulerState::new(inner)?,

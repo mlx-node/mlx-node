@@ -193,6 +193,12 @@ export interface SessionContextLimits {
   effectiveWindowTokens: number;
   pagedBlockCapacity: number;
   pagedBlockSize: number;
+  /**
+   * Window of a text turn that runs the model's draft-model speculative
+   * decoder. Turns with `enableMtp` off or with images in the history take
+   * the autoregressive or vision lane and stay on `effectiveWindowTokens`.
+   */
+  speculativeWindowTokens?: number | null;
 }
 
 /**
@@ -1958,6 +1964,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * both the tokenizer seam and a load-time context snapshot retain their
    * existing behavior.
    *
+   * The window is the speculative one only for a text turn with `enableMtp`
+   * on, matching the native turn plan; every other turn uses the pool's.
+   *
    * Splash's output budget: a prompt must leave room for one new token,
    * `maxNewTokens` is clamped to `window - prompt`, and an omitted budget is
    * the rest of the window. The returned config is a copy only when
@@ -1968,8 +1977,14 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       return config;
     }
 
+    const hasImages = messages.some((message) => (message.images?.length ?? 0) > 0);
     const limits = this.model.contextLimits();
-    const capacity = Math.floor(limits.effectiveWindowTokens);
+    const speculativeWindow = limits.speculativeWindowTokens;
+    const windowTokens =
+      config.enableMtp === true && !hasImages && speculativeWindow != null
+        ? speculativeWindow
+        : limits.effectiveWindowTokens;
+    const capacity = Math.floor(windowTokens);
     if (!Number.isSafeInteger(capacity) || capacity <= 0) {
       return config;
     }
@@ -1983,7 +1998,6 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       enableThinking,
       effort ?? null,
     );
-    const hasImages = messages.some((message) => (message.images?.length ?? 0) > 0);
     let promptTokens = tokens.length;
     if (hasImages && typeof this.model.expandedPromptTokenCount === 'function') {
       promptTokens = await this.model.expandedPromptTokenCount(tokens, messages);

@@ -105,9 +105,8 @@ fn tiny_hybrid_recurrent_bytes_make_usable_window_stricter_than_raw_pool() {
     );
 }
 
-/// Gate: a DFlash2 window published above the pool leaves paged preflight
-/// on the pool window. Mutation: preflight on `paged_context_limits().1`
-/// → red.
+/// Gate: a DFlash2 window above the pool leaves paged preflight on the
+/// pool window. Mutation: preflight on `speculative_window()` → red.
 #[test]
 fn preflight_keeps_the_pool_window_when_a_dflash2_window_is_published() {
     // M3 Pro trigger inputs: 5,051 one-MiB BF16 blocks less 147 GDN blocks.
@@ -135,8 +134,8 @@ fn preflight_keeps_the_pool_window_when_a_dflash2_window_is_published() {
         reserve: None,
         row_bytes: 1,
     });
-    let (_, published, _, _) = inner.paged_context_limits();
-    assert!(published > pool_window, "{published} vs {pool_window}");
+    let speculative = inner.speculative_window().expect("a DFlash2 window");
+    assert!(speculative > pool_window, "{speculative} vs {pool_window}");
 
     let mut params = crate::engine::extract_chat_params(&crate::engine::types::ChatConfig {
         max_new_tokens: Some(32),
@@ -148,7 +147,7 @@ fn preflight_keeps_the_pool_window_when_a_dflash2_window_is_published() {
     assert_eq!(params.max_new_tokens, 1);
     let err = inner
         .preflight_paged_context(pool_window as usize, &mut params)
-        .expect_err("the pool window, not the published one, bounds paged turns");
+        .expect_err("the pool window, not the DFlash2 one, bounds paged turns");
     assert!(
         err.reason
             .contains(&format!("effective active context is {pool_window} tokens")),
@@ -157,15 +156,15 @@ fn preflight_keeps_the_pool_window_when_a_dflash2_window_is_published() {
     );
 }
 
-/// Gate: the native DFlash2 clamp reads the published window, after its
+/// Gate: the native DFlash2 clamp reads the speculative window, after its
 /// trained and `MLX_PAGED_PER_SEQ_CTX` caps. Mutation: return
 /// `terms.window()` from `DFlash2Target::dflash2_window` → red (2,024 ≠
 /// 1,024 on the test adapter).
 #[test]
-fn dflash2_clamp_window_is_the_published_window() {
+fn dflash2_clamp_window_is_the_speculative_window() {
     use crate::models::qwen3_5::dflash2_turn::DFlash2Target;
     let Some(mut inner) =
-        dense_inner_with_test_adapter_or_skip("dflash2_clamp_window_is_the_published_window")
+        dense_inner_with_test_adapter_or_skip("dflash2_clamp_window_is_the_speculative_window")
     else {
         return;
     };
@@ -177,15 +176,43 @@ fn dflash2_clamp_window_is_the_published_window() {
         reserve: None,
         row_bytes: 1,
     });
-    let (_, published, _, _) = inner.paged_context_limits();
-    assert!(published <= trained, "{published} vs {trained}");
-    assert_eq!(DFlash2Target::dflash2_window(&inner), Some(published));
+    let speculative = inner.speculative_window().expect("a DFlash2 window");
+    assert!(speculative <= trained, "{speculative} vs {trained}");
+    assert_eq!(DFlash2Target::dflash2_window(&inner), Some(speculative));
 }
 
-/// Gate: the DFlash2 pool term charges only the bytes a grow-on-demand
-/// pool has not allocated yet, floored at its paged window. Mutation: pass
-/// `0` as `allocated_blocks` in `dflash2_pool_budget` → red (8 blocks of
-/// bytes, not 5).
+/// Gate: the load snapshot publishes the pool window as the effective
+/// window and the DFlash2 window beside it.
+/// Mutation: build `effective_window_tokens` from `speculative_window()`
+/// → red.
+#[test]
+fn context_limits_publish_both_windows() {
+    let Some(mut inner) =
+        dense_inner_with_test_adapter_or_skip("context_limits_publish_both_windows")
+    else {
+        return;
+    };
+    let pool_window = inner.pool_context_limit();
+    let trained = inner.config.max_position_embeddings as u32;
+    assert!(pool_window + 1 < trained, "{pool_window} vs {trained}");
+    let limits = inner.context_limits_snapshot();
+    assert_eq!(limits.effective_window_tokens, pool_window);
+    assert_eq!(limits.speculative_window_tokens, None);
+    for draft_window in [pool_window + 1, (pool_window + trained) / 2] {
+        inner.dflash2_window = Some(crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms {
+            trained: u32::MAX,
+            draft_trained: u32::MAX,
+            pool: Some(draft_window),
+            reserve: None,
+            row_bytes: 1,
+        });
+        let limits = inner.context_limits_snapshot();
+        assert_eq!(limits.trained_window_tokens, trained);
+        assert_eq!(limits.effective_window_tokens, pool_window);
+        assert_eq!(limits.speculative_window_tokens, Some(draft_window));
+    }
+}
+
 #[test]
 fn dflash2_pool_budget_counts_allocated_blocks_once() {
     const BLOCK_SIZE: u32 = 16;
