@@ -662,14 +662,11 @@ mod tests {
     use crate::utils::gguf::{GgufConversionOptions, GgufTensorType, convert_gguf_to_safetensors};
     use crate::utils::gguf_test_fixtures::{
         IMPORT_FIXTURE_NAMES, ImportFixture, ImportFixtureFamily, convert_import_fixture,
-        safetensors_manifest, sha256_hex, t64_prefixes, write_import_fixture,
+        import_golden_root as golden_root, safetensors_manifest, sha256_hex, t64_prefixes,
+        write_import_fixture,
     };
     #[cfg(debug_assertions)]
     use crate::utils::gguf_test_fixtures::{build_minimal_gguf, fixture_payload};
-
-    fn golden_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/utils/testdata/gguf_import_golden")
-    }
 
     fn work_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("mlx-gguf-plan-{tag}-{}", uuid::Uuid::new_v4()))

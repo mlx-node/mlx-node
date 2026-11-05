@@ -2577,18 +2577,39 @@ mod tests {
     use crate::models::mtp_drafter::strip_wrapper_prefix;
     use serde_json::json;
 
+    /// The preload equals what the directory loader reads from the
+    /// converter's output: the converter's tensors (the checked-in golden
+    /// manifest) plus the biases the loader derives for symmetric blocks.
+    /// Not a live conversion: that flips MLX's process-wide default device to
+    /// CPU under every test running beside it.
     #[tokio::test]
     async fn moe_loader_uses_preload_not_files() {
+        use std::collections::{BTreeMap, HashMap};
+
         use super::{CheckpointSource, load_moe_weights};
-        use crate::engine::persistence::load_all_safetensors;
+        use crate::array::MxArray;
+        use crate::engine::persistence::expand_symmetric_affine_biases;
         use crate::utils::gguf::NativeGgufFamily;
         use crate::utils::gguf_import::gate::manifest;
-        use crate::utils::gguf_test_fixtures::{convert_import_fixture, write_import_fixture};
+        use crate::utils::gguf_test_fixtures::{
+            import_golden_root, sha256_hex, write_import_fixture,
+        };
 
+        const FIXTURE: &str = "qwen35moe-3d-experts";
+        let golden = import_golden_root().join(FIXTURE);
+        let read_json = |name: &str| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(golden.join(name)).unwrap())
+                .unwrap_or_else(|e| panic!("{FIXTURE}/{name}: {e}"))
+        };
         let work = std::env::temp_dir().join(format!("mlx-moe-preload-{}", uuid::Uuid::new_v4()));
-        let fx = write_import_fixture("qwen35moe-3d-experts", &work.join("src"));
-        let converted = convert_import_fixture(&fx, &work.join("converted")).await;
-        let want = manifest(&load_all_safetensors(&converted, false).unwrap());
+        let fx = write_import_fixture(FIXTURE, &work.join("src"));
+        assert_eq!(
+            read_json("fixture.json")["main"].as_str(),
+            Some(sha256_hex(&std::fs::read(&fx.main).unwrap()).as_str()),
+            "fixture builder drifted from the golden"
+        );
+        let converted: BTreeMap<String, serde_json::Value> =
+            serde_json::from_value(read_json("model.manifest.json")).unwrap();
 
         let source = CheckpointSource::resolve_in(
             &fx.main,
@@ -2627,7 +2648,22 @@ mod tests {
                 .map(|e| e.reason.as_str())
                 .unwrap_or_default()
         );
-        let got = manifest(&loaded.unwrap());
+        let loaded = loaded.unwrap();
+        let mut dir_load: HashMap<String, MxArray> = converted
+            .keys()
+            .map(|name| {
+                let array = loaded
+                    .get(name)
+                    .unwrap_or_else(|| panic!("the preload lacks converted tensor {name}"));
+                (name.clone(), array.clone())
+            })
+            .collect();
+        for (name, entry) in &manifest(&dir_load) {
+            assert_eq!(Some(entry), converted.get(name), "tensor {name} differs");
+        }
+        expand_symmetric_affine_biases(&golden, &mut dir_load).unwrap();
+        let want = manifest(&dir_load);
+        let got = manifest(&loaded);
         assert_eq!(
             got.len(),
             want.len(),
