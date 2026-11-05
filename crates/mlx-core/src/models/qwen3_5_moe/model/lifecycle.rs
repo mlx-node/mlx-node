@@ -733,15 +733,18 @@ impl Qwen35MoeInner {
     /// with the cache-limit coordinator (its reservation term reads the live
     /// headroom). A no-op without a draft.
     pub(crate) fn freeze_dflash2_window(&mut self) -> Result<()> {
-        let pool_bytes = match self.paged_adapter.as_ref() {
-            Some(adapter) => Some(
-                u64::from(adapter.max_capacity_tokens() / adapter.block_size().max(1))
-                    .saturating_mul(adapter.bytes_per_block().map_err(Error::from_reason)?),
-            ),
-            None => None,
-        };
+        let pool = self
+            .paged_adapter
+            .as_ref()
+            .map(|adapter| {
+                crate::models::qwen3_5::dflash2_turn::dflash2_pool_budget(
+                    adapter,
+                    self.config.recurrent_state_bytes(),
+                )
+            })
+            .transpose()?;
         let Some(terms) =
-            crate::models::qwen3_5::dflash2_turn::dflash2_published_window(&*self, pool_bytes)?
+            crate::models::qwen3_5::dflash2_turn::dflash2_published_window(&*self, pool)?
         else {
             return Ok(());
         };

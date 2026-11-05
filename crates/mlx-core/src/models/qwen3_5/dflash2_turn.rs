@@ -29,11 +29,12 @@ use crate::transformer::KvFormat;
 use super::config::Qwen3_5Config;
 use super::dflash2::{DFlash2ContextCache, DFlash2Model};
 use super::dflash2_decode::{
-    DFlash2WindowTerms, constrain_dflash2_context_params, dflash2_decode_cache_limit,
-    dflash2_final_token_fits_context, dflash2_kv_budget_of, dflash2_kv_headroom_bytes,
-    dflash2_kv_headroom_for, dflash2_kv_need_bytes, dflash2_kv_reserve_rows,
-    dflash2_memory_snapshot, dflash2_turn_transient_bytes, dflash2_window_terms, kv_row_bytes,
-    min_fa_capacity, reserve_dflash2_target_kv, reusable_dflash2_prefix,
+    DFlash2PoolBudget, DFlash2WindowTerms, constrain_dflash2_context_params,
+    dflash2_decode_cache_limit, dflash2_final_token_fits_context, dflash2_kv_budget_of,
+    dflash2_kv_headroom_bytes, dflash2_kv_headroom_for, dflash2_kv_need_bytes,
+    dflash2_kv_reserve_rows, dflash2_memory_snapshot, dflash2_pool_budget_bytes,
+    dflash2_turn_transient_bytes, dflash2_window_terms, kv_row_bytes, min_fa_capacity,
+    reserve_dflash2_target_kv, reusable_dflash2_prefix,
 };
 use super::dflash2_state::flat::{
     FlatAnchor, FlatBacking, FlatStates, flat_attention_kv, join_flat_anchor, join_flat_caches,
@@ -501,12 +502,37 @@ pub(crate) fn evict_for_turn_kv<B: Backing>(
     store.evict_for(need, headroom, None)
 }
 
+/// The DFlash2 pool term inputs of `adapter`: its maximum's bytes past the
+/// blocks it has allocated, floored at the window it gives a paged turn
+/// after `recurrent_state_bytes`.
+pub(crate) fn dflash2_pool_budget(
+    adapter: &crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter,
+    recurrent_state_bytes: u64,
+) -> Result<DFlash2PoolBudget> {
+    let bytes_per_block = adapter.bytes_per_block().map_err(Error::from_reason)?;
+    let block_size = adapter.block_size().max(1);
+    Ok(DFlash2PoolBudget {
+        bytes: dflash2_pool_budget_bytes(
+            adapter.max_capacity_tokens() / block_size,
+            adapter.block_capacity(),
+            bytes_per_block,
+        ),
+        floor_tokens: crate::engine::hybrid_scheduler::pool_tokens_after_recurrent(
+            adapter.max_capacity_tokens(),
+            block_size,
+            bytes_per_block,
+            recurrent_state_bytes,
+        ),
+    })
+}
+
 /// The DFlash2 window terms of `target` with its loaded draft, `None`
-/// without one. `pool_bytes` is the paged pool's maximum; the reservation
-/// term reads the live headroom, so this runs once the pool is registered.
+/// without one. `pool` is [`dflash2_pool_budget`] of its paged pool; the
+/// reservation term reads the live headroom, so this runs once the pool is
+/// registered.
 pub(crate) fn dflash2_published_window<T: DFlash2Target>(
     target: &T,
-    pool_bytes: Option<u64>,
+    pool: Option<DFlash2PoolBudget>,
 ) -> Result<Option<DFlash2WindowTerms>> {
     let Some(draft) = target.dflash2() else {
         return Ok(None);
@@ -519,7 +545,7 @@ pub(crate) fn dflash2_published_window<T: DFlash2Target>(
         draft.max_position_embeddings(),
         draft.config.kv_ring_bytes(),
         draft.config.block_size,
-        pool_bytes,
+        pool,
         dflash2_kv_headroom_bytes(dflash2_memory_snapshot()),
     )
     .map(Some)

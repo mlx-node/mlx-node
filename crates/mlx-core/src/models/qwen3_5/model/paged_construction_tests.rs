@@ -182,6 +182,54 @@ fn dflash2_clamp_window_is_the_published_window() {
     assert_eq!(DFlash2Target::dflash2_window(&inner), Some(published));
 }
 
+/// Gate: the DFlash2 pool term charges only the bytes a grow-on-demand
+/// pool has not allocated yet, floored at its paged window. Mutation: pass
+/// `0` as `allocated_blocks` in `dflash2_pool_budget` → red (8 blocks of
+/// bytes, not 5).
+#[test]
+fn dflash2_pool_budget_counts_allocated_blocks_once() {
+    const BLOCK_SIZE: u32 = 16;
+    let pool_config = mlx_paged_attn::PagedAttentionConfig {
+        block_size: BLOCK_SIZE,
+        num_kv_heads: 1,
+        head_size: 32,
+        num_layers: 2,
+        ..mlx_paged_attn::PagedAttentionConfig::default()
+    };
+    let pool = match mlx_paged_attn::LayerKVPool::new(
+        pool_config,
+        3,
+        8,
+        mlx_paged_attn::metal::MetalDtype::Float16,
+    ) {
+        Ok(pool) => Arc::new(pool),
+        Err(err) if crate::test_support::metal_device_absent(&err) => {
+            eprintln!("skipping dflash2_pool_budget_counts_allocated_blocks_once: {err}");
+            return;
+        }
+        Err(err) => panic!("unexpected LayerKVPool::new failure: {err}"),
+    };
+    let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
+        3, 8, BLOCK_SIZE,
+    )));
+    let adapter =
+        PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE).expect("test adapter constructs");
+    let bytes_per_block = adapter.bytes_per_block().expect("bytes per block");
+    let recurrent = tiny_cfg(true).recurrent_state_bytes();
+    let budget = crate::models::qwen3_5::dflash2_turn::dflash2_pool_budget(&adapter, recurrent)
+        .expect("pool budget");
+    assert_eq!(budget.bytes, 5 * bytes_per_block);
+    assert_eq!(
+        budget.floor_tokens,
+        crate::engine::hybrid_scheduler::pool_tokens_after_recurrent(
+            8 * BLOCK_SIZE,
+            BLOCK_SIZE,
+            bytes_per_block,
+            recurrent,
+        )
+    );
+}
+
 #[test]
 fn paged_context_limits_and_preflight_use_scheduler_usable_window() {
     let Some(inner) = dense_inner_with_test_adapter_or_skip(

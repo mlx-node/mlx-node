@@ -143,7 +143,7 @@ pub(crate) fn dflash2_kv_headroom_for(budget: u64) -> u64 {
 }
 
 /// The bounds a DFlash2 turn's context window is the least of, fixed at
-/// load: the trained windows, the target rows the paged pool's maximum
+/// load: the trained windows, the target rows the paged pool's unallocated
 /// bytes hold after one lane, and the largest whole turn the target KV
 /// reservation admits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +171,27 @@ pub(crate) fn dflash2_lane_bytes(recurrent_state_bytes: u64, draft_ring_bytes: u
     recurrent_state_bytes
         .saturating_mul(2)
         .saturating_add(draft_ring_bytes)
+}
+
+/// The paged pool's share of a DFlash2 window: the bytes of the pool's
+/// maximum not yet allocated as blocks, and the pool's own usable window as
+/// the term's floor. A pool allocated at its maximum leaves no bytes; without
+/// the floor its window would collapse to one token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DFlash2PoolBudget {
+    pub bytes: u64,
+    pub floor_tokens: u32,
+}
+
+/// Bytes of a `max_blocks` pool that `allocated_blocks` have not taken. The
+/// allocated blocks are already resident, so a DFlash2 turn's target KV
+/// may only claim the rest.
+pub(crate) fn dflash2_pool_budget_bytes(
+    max_blocks: u32,
+    allocated_blocks: u32,
+    bytes_per_block: u64,
+) -> u64 {
+    u64::from(max_blocks.saturating_sub(allocated_blocks)).saturating_mul(bytes_per_block)
 }
 
 /// Target rows `pool_bytes` hold for one turn after `lane_bytes`, less the
@@ -223,8 +244,8 @@ pub(crate) fn dflash2_reserve_window(headroom: u64, row_bytes: u64) -> Result<u3
 
 /// The published DFlash2 window terms for `config` with a draft whose KV
 /// window buffers take `draft_ring_bytes` and whose verify writes
-/// `scratch_rows` rows past the kept ones. `pool_bytes` is the paged pool's
-/// maximum, `headroom` the live [`dflash2_kv_headroom_bytes`] after that pool
+/// `scratch_rows` rows past the kept ones. `pool` is the paged pool's unallocated
+/// budget, `headroom` the live [`dflash2_kv_headroom_bytes`] after that pool
 /// registered; either `None` drops its term.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dflash2_window_terms(
@@ -234,7 +255,7 @@ pub(crate) fn dflash2_window_terms(
     draft_trained: usize,
     draft_ring_bytes: u64,
     draft_block_size: usize,
-    pool_bytes: Option<u64>,
+    pool: Option<DFlash2PoolBudget>,
     headroom: Option<u64>,
 ) -> Result<DFlash2WindowTerms> {
     let row_bytes = kv_row_bytes(
@@ -245,8 +266,10 @@ pub(crate) fn dflash2_window_terms(
         format,
     );
     let lane_bytes = dflash2_lane_bytes(config.recurrent_state_bytes(), draft_ring_bytes);
-    let pool = pool_bytes
-        .map(|bytes| dflash2_pool_window(bytes, lane_bytes, row_bytes, draft_block_size as u64));
+    let pool = pool.map(|budget| {
+        dflash2_pool_window(budget.bytes, lane_bytes, row_bytes, draft_block_size as u64)
+            .max(budget.floor_tokens)
+    });
     let reserve = headroom
         .map(|headroom| dflash2_reserve_window(headroom, row_bytes))
         .transpose()?;
@@ -2775,14 +2798,26 @@ pub(crate) mod tests {
 
     const MIB: u64 = 1024 * 1024;
 
+    /// The M3 Pro pool term inputs: 5,051 one-MiB blocks at most, the
+    /// 275-block runway allocated, 78,464 paged tokens after the GDN charge.
+    fn m3_pro_runway_pool() -> DFlash2PoolBudget {
+        DFlash2PoolBudget {
+            bytes: dflash2_pool_budget_bytes(5_051, 275, MIB),
+            floor_tokens: 78_464,
+        }
+    }
+
     /// Gate: the Splash full-lane window on the M3 Pro trigger inputs
-    /// (5,051 one-MiB pool blocks, 27B target, 5 x 8 x 128 draft, 8 verify
-    /// rows). Mutations: price rows with `KvFormat::Bf16` in
+    /// (5,051 one-MiB pool blocks with the 275-block runway allocated, 27B
+    /// target, 5 x 8 x 128 draft, 8 verify rows) counts the runway once.
+    /// Mutations: ignore `allocated_blocks` in `dflash2_pool_budget_bytes` →
+    /// red (5,296,357,376 bytes, the whole pool); price rows with `KvFormat::Bf16` in
     /// `dflash2_window_terms` → red (row bytes 65,536); charge one GDN cell
-    /// in `dflash2_lane_bytes` → red (153,090).
+    /// in `dflash2_lane_bytes` → red (144,425).
     #[test]
-    fn dflash2_pool_window_on_the_m3_pro_inputs() {
+    fn dflash2_pool_window_counts_the_runway_once() {
         let cfg = qwen38_27b_cfg();
+        assert_eq!(m3_pro_runway_pool().bytes, 5_007_998_976);
         let terms = dflash2_window_terms(
             &cfg,
             KvFormat::Int8,
@@ -2790,22 +2825,48 @@ pub(crate) mod tests {
             262_144,
             47_329_280,
             QWEN38_DRAFT_BLOCK,
-            Some(5_051 * MIB),
+            Some(m3_pro_runway_pool()),
             None,
         )
         .expect("window terms");
         assert_eq!(terms.row_bytes, 33_280);
-        assert_eq!(terms.pool, Some(148_464));
+        assert_eq!(terms.pool, Some(139_800));
         assert_eq!(terms.reserve, None);
-        assert_eq!(terms.window(), 148_464);
+        assert_eq!(terms.window(), 139_800);
+    }
+
+    /// Gate: a pool allocated at its maximum (an explicit initial size of
+    /// the whole pool) leaves no bytes, and the window keeps the pool's own
+    /// 78,464 instead of collapsing. Mutation: drop `.max(budget.floor_tokens)`
+    /// in `dflash2_window_terms` → red (1).
+    #[test]
+    fn pinned_pool_keeps_the_pool_window() {
+        let pool = DFlash2PoolBudget {
+            bytes: dflash2_pool_budget_bytes(5_051, 5_051, MIB),
+            floor_tokens: 78_464,
+        };
+        assert_eq!(pool.bytes, 0);
+        let terms = dflash2_window_terms(
+            &qwen38_27b_cfg(),
+            KvFormat::Int8,
+            DType::BFloat16,
+            262_144,
+            47_329_280,
+            QWEN38_DRAFT_BLOCK,
+            Some(pool),
+            None,
+        )
+        .expect("window terms");
+        assert_eq!(terms.window(), 78_464);
     }
 
     /// Gate: with little MLX-active memory the DFlash2 reservation, not the
     /// pool probe, binds, and the published window still reserves a whole
     /// cold turn. Mutations: drop the `reserve` term from
-    /// `DFlash2WindowTerms::window` → red; subtract the turn transients from
-    /// the headroom in `dflash2_reserve_admits` → red (one row past the
-    /// window still reserves whole: 399,360 rows).
+    /// `DFlash2WindowTerms::window` → red (pool 654,541, reserve 649,644);
+    /// subtract the turn transients from the headroom in
+    /// `dflash2_reserve_admits` → red (one row past the window still
+    /// reserves whole).
     #[test]
     fn dflash2_reserve_window_binds_when_active_memory_is_low() {
         let cfg = super::super::config::Qwen3_5Config {
@@ -2813,8 +2874,9 @@ pub(crate) mod tests {
             ..qwen38_27b_cfg()
         };
         let working_set = 27 * GIB;
-        let active = 5 * GIB;
-        // The pool probe's max: 0.85·WS − active − 1 GiB − 64 MiB, in blocks.
+        let active = GIB;
+        // The pool probe's max: 0.85·WS − active − 1 GiB − 64 MiB, in blocks;
+        // the 275 MiB runway is allocated.
         let pool_bytes = (working_set / 100 * 85 - active - GIB - 64 * MIB) / MIB * MIB;
         let snapshot = PagedPrefillMemorySnapshot {
             allocator_active_bytes: Some(active),
@@ -2832,7 +2894,10 @@ pub(crate) mod tests {
             1_048_576,
             47_329_280,
             QWEN38_DRAFT_BLOCK,
-            Some(pool_bytes),
+            Some(DFlash2PoolBudget {
+                bytes: pool_bytes - 275 * MIB,
+                floor_tokens: 0,
+            }),
             Some(headroom),
         )
         .expect("window terms");
@@ -2866,7 +2931,7 @@ pub(crate) mod tests {
     /// Gate: on the M3 Pro trigger inputs (WS 27 GiB, MLX active 16.95 GiB,
     /// the 275 MiB runway registered) the reservation term matches what
     /// `reserve_dflash2_turn_kv` reserves from the same headroom, so the pool
-    /// term binds at 148,464. Mutation: subtract
+    /// term binds at 139,800. Mutation: subtract
     /// `dflash2_turn_transient_bytes` from the headroom in
     /// `dflash2_reserve_admits` → red (reserve 60,485 binds).
     #[test]
@@ -2888,17 +2953,17 @@ pub(crate) mod tests {
             262_144,
             47_329_280,
             QWEN38_DRAFT_BLOCK,
-            Some(5_051 * MIB),
+            Some(m3_pro_runway_pool()),
             Some(headroom),
         )
         .expect("window terms");
         let reserve = terms.reserve.expect("reserve");
-        assert!(reserve > 148_464, "reserve {reserve} must not bind");
-        assert_eq!(terms.window(), 148_464);
-        let whole = kv_capacity_round_up(148_464, 1).expect("whole") as i64;
+        assert!(reserve > 139_800, "reserve {reserve} must not bind");
+        assert_eq!(terms.window(), 139_800);
+        let whole = kv_capacity_round_up(139_800, 1).expect("whole") as i64;
         assert_eq!(
             dflash2_kv_reserve_rows(
-                148_464,
+                139_800,
                 1,
                 0,
                 terms.row_bytes,
