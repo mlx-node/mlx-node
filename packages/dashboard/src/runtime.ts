@@ -40,7 +40,6 @@ const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5_000;
 export type RuntimeLifecycleEvent = DbWorkerLifecycle;
 
 export interface DashboardRuntimeOptions {
-  connectInference?: CodingAgentsOptions['connect'];
   prepareDelegation?: CodingAgentsOptions['prepareCommand'];
   dbPath?: string;
   modelsDir?: string;
@@ -159,11 +158,6 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
       if (!response.ok) throw new Error(response.message);
       return (response.body as { models: { name: string }[] }).models.map((model) => model.name);
     },
-    connect:
-      opts.connectInference ??
-      (async () => {
-        throw new Error('Open the mlx-node desktop app to connect to your local model.');
-      }),
   });
   const context: MainApiContext = { modelsDir, tracesDir, cacheRoot, downloads, codingAgents };
 
