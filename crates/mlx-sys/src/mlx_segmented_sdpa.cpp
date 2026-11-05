@@ -1059,6 +1059,10 @@ struct BlockCalibration {
   double vector_seconds[kSegmentedCalibrationPoints] = {};
   double block_seconds[kSegmentedCalibrationPoints] = {};
   double elapsed_ms = 0.0;
+  // GPU-stamped time of every sample, warm-up included: the calibration's own
+  // GPU cost, which other queues sharing the GPU cannot inflate the way they
+  // inflate `elapsed_ms`.
+  double gpu_ms = 0.0;
   // Fastest host encode of one dispatch per route (diagnostic).
   double host_vector_seconds = 0.0;
   double host_block_seconds = 0.0;
@@ -1154,6 +1158,7 @@ void measure_block_crossover(metal::Device &device, Stream stream,
     double host = 0.0;
     const double gpu = time_segmented_route(device, stream, point_inputs[point],
                                             head_rows, mode, &host);
+    c.gpu_ms += gpu * 1e3;
     auto &best = mode == SegmentedTileMode::vector ? host_vector : host_block;
     best = std::min(best, host);
     return gpu;
@@ -1670,14 +1675,15 @@ extern "C" int mlx_segmented_sdpa_test_block_min_keys() {
 
 // Test-only: the calibration record (measured now if this process has not
 // yet): per point `keys`, `vector_seconds` and `block_seconds` (up to
-// `capacity` entries), the wall time of the whole calibration, the block
-// kernel it timed (0 none, 1 tile, 2 tensor-op) and the selected crossover.
+// `capacity` entries), the wall time of the whole calibration, the GPU time
+// of its samples, the block kernel it timed (0 none, 1 tile, 2 tensor-op) and the selected crossover.
 // Returns the point count (0 when the measurement
 // failed and the ceiling was recorded; its message on stderr), -1 without
 // Metal or on error.
 extern "C" int mlx_segmented_sdpa_test_block_calibration(
     int *keys, double *vector_seconds, double *block_seconds, size_t capacity,
-    double *out_elapsed_ms, int *out_block_kernel, int *out_result) {
+    double *out_elapsed_ms, double *out_gpu_ms, int *out_block_kernel,
+    int *out_result) {
   using namespace mlx::core;
   try {
     auto stream = default_stream(Device::gpu);
@@ -1697,6 +1703,9 @@ extern "C" int mlx_segmented_sdpa_test_block_calibration(
     }
     if (out_elapsed_ms) {
       *out_elapsed_ms = c.elapsed_ms;
+    }
+    if (out_gpu_ms) {
+      *out_gpu_ms = c.gpu_ms;
     }
     if (out_block_kernel) {
       *out_block_kernel = static_cast<int>(c.block_kernel);
@@ -1817,8 +1826,8 @@ extern "C" int mlx_segmented_sdpa_test_block_min_keys() { return -1; }
 
 extern "C" int mlx_segmented_sdpa_test_block_calibration(int *, double *,
                                                          double *, size_t,
-                                                         double *, int *,
-                                                         int *) {
+                                                         double *, double *,
+                                                         int *, int *) {
   return -1;
 }
 

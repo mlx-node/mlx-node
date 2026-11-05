@@ -3794,7 +3794,7 @@ mod tests {
         let mut keys = [0i32; 8];
         let mut vector_s = [0f64; 8];
         let mut block_s = [0f64; 8];
-        let (mut elapsed_ms, mut kernel, mut result) = (0f64, 0i32, 0i32);
+        let (mut elapsed_ms, mut gpu_ms, mut kernel, mut result) = (0f64, 0f64, 0i32, 0i32);
         let points = unsafe {
             mlx_sys::mlx_segmented_sdpa_test_block_calibration(
                 keys.as_mut_ptr(),
@@ -3802,6 +3802,7 @@ mod tests {
                 block_s.as_mut_ptr(),
                 keys.len(),
                 &mut elapsed_ms,
+                &mut gpu_ms,
                 &mut kernel,
                 &mut result,
             )
@@ -3809,7 +3810,8 @@ mod tests {
         assert!(points >= 0, "calibration query failed");
         let kernel_name = ["none", "tile", "nax"][kernel as usize];
         eprintln!(
-            "block crossover: {result} keys ({kernel_name}), calibrated in {elapsed_ms:.3} ms"
+            "block crossover: {result} keys ({kernel_name}), calibrated in {elapsed_ms:.3} ms \
+             ({gpu_ms:.3} ms GPU)"
         );
         for i in 0..points as usize {
             eprintln!(
@@ -3823,9 +3825,11 @@ mod tests {
             (256..=8192).contains(&result),
             "calibrated crossover {result} outside the clamp range"
         );
+        // GPU time, not wall time: concurrent tests share the GPU and their
+        // queued work lands inside every sample's synchronize.
         assert!(
-            points == 0 || elapsed_ms < 100.0,
-            "calibration took {elapsed_ms:.3} ms"
+            points == 0 || (gpu_ms > 0.0 && gpu_ms < 100.0),
+            "calibration took {gpu_ms:.3} ms of GPU time"
         );
         let min_keys = i64::from(unsafe { mlx_sys::mlx_segmented_sdpa_test_block_min_keys() });
         assert_eq!(

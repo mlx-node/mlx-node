@@ -815,6 +815,12 @@ pub(crate) fn write_import_fixture(name: &str, dir: &Path) -> ImportFixture {
     }
 }
 
+/// The checked-in converter output per import fixture, pinned to the live
+/// converter by `converter_output_equals_base_golden`.
+pub(crate) fn import_golden_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/utils/testdata/gguf_import_golden")
+}
+
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha256::digest(bytes);
