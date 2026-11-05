@@ -5021,6 +5021,92 @@ pub(crate) mod tests {
         );
     }
 
+    /// Reserves one block more than is free for turn 2 while turn 1 is live
+    /// in the scheduler and holds pool blocks. Returns the outcome, the pool
+    /// size after it, and whether turn 1's block table is unchanged.
+    #[cfg(target_os = "macos")]
+    fn reserve_beside_a_live_turn<B: HybridSchedulerBackend>(
+        mut state: HybridSchedulerState<B>,
+    ) -> (MemoryReserveOutcome, u32, bool) {
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        let prompt: Vec<u32> = (0..40).map(|token| token % 16).collect();
+        let live = speculative::tests::request(
+            &mut state.inner,
+            1,
+            prompt,
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let materialized = state.inner.scheduler_materialized_blocks(1);
+        assert!(materialized > 0, "the live turn holds pool blocks");
+        let live_blocks = |state: &HybridSchedulerState<B>| {
+            state
+                .inner
+                .paged_adapter()
+                .and_then(|adapter| adapter.block_table_for(1))
+                .map(|table| table.block_ids())
+        };
+        let before = live_blocks(&state);
+        state
+            .scheduler
+            .enqueue_turn(live.with_block_reservation(materialized + 1, materialized, 16))
+            .expect("enqueue the live turn");
+        assert!(state.scheduler.has_live_turns());
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        assert_eq!(snapshot.blocks.total_blocks, 4);
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, snapshot.blocks.free_blocks + 1, 0, 0, snapshot)
+            .expect("reserve beside the live turn");
+        let total = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter")
+            .blocks
+            .total_blocks;
+        (outcome, total, live_blocks(&state) == before)
+    }
+
+    /// A second turn arrives while the first is live on the runway pool: the
+    /// on-demand family grows the pool and admits it, with the watermark on
+    /// and the live turn's blocks kept; a whole-turn family still defers.
+    /// Mutation: drop the live-turn grow in `try_reserve_with_policy` → red
+    /// (Defer). Mutation: drop its `scheduler_books_on_demand` gate → red
+    /// (the Nemotron turn is admitted).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn second_turn_admits_beside_a_live_turn_by_growing_the_runway_pool() {
+        let Some((state, _)) = growable_qwen35_state() else {
+            return;
+        };
+        let (outcome, total, kept) = reserve_beside_a_live_turn(state);
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "the runway pool must grow for a turn beside a live one: {outcome:?}"
+        );
+        assert!(total > 4, "pool stayed at {total} blocks");
+        assert!(kept, "the grow moved the live turn's blocks");
+
+        let Some((state, _)) = growable_scheduler_state() else {
+            return;
+        };
+        let (outcome, total, kept) = reserve_beside_a_live_turn(state);
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Defer),
+            "a whole-turn family must defer beside a live turn: {outcome:?}"
+        );
+        assert_eq!(total, 4);
+        assert!(kept);
+    }
+
     /// 40 of 100 blocks, 10 free, 20 booked, 5% watermark (2 blocks'
     /// worth): every grown block adds 0.95 of a block, so 13 blocks fit and
     /// 12 do not.
