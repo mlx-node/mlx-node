@@ -190,6 +190,10 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
         crate::models::qwen3_5::dflash2_turn::evict_parked_dflash2_for_pool_grow(self)
     }
 
+    fn scheduler_books_on_demand(&self) -> bool {
+        true
+    }
+
     fn supports_scheduled_speculation(&self) -> bool {
         self.has_mtp_weights()
             && self.dflash2.is_none()

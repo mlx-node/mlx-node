@@ -425,6 +425,10 @@ pub struct Qwen3_5ContextLimits {
     pub paged_block_capacity: u32,
     pub paged_block_size: u32,
     pub speculative_window_tokens: Option<u32>,
+    /// The output budget fills the window: a prompt leaves room for one new
+    /// token, the budget is clamped to `window - prompt`, and an omitted
+    /// budget is the rest of the window.
+    pub rest_of_window_output_budget: bool,
 }
 
 impl Qwen3_5ContextLimits {
@@ -435,6 +439,7 @@ impl Qwen3_5ContextLimits {
             paged_block_capacity: value.2,
             paged_block_size: value.3,
             speculative_window_tokens: speculative,
+            rest_of_window_output_budget: true,
         }
     }
 }

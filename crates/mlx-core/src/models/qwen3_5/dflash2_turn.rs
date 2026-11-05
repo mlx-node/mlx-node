@@ -149,6 +149,9 @@ pub(crate) trait DFlash2Target: ChatBackend {
     /// Releases every live paged request and keeps the allocator's prefix
     /// cache.
     fn release_paged_requests(&mut self) -> Result<()>;
+    fn paged_adapter_ref(
+        &self,
+    ) -> Option<&crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter>;
     /// Whether the flat caches hold the retained prefix (no paged or MTP
     /// turn has moved past them).
     fn flat_lane_authoritative(&self) -> bool;
@@ -587,11 +590,53 @@ fn turn_memory<T: DFlash2Target>(
     Ok((row_bytes, transient))
 }
 
+/// Bytes the live headroom must hold before a paged turn of `tokens` rows
+/// starts: the grown pool buffer, which sits beside the old one while it is
+/// copied, sized to the shortfall over the blocks the pool can hand out; 0
+/// when those already cover the rows. Later decode growth is reclaimed per
+/// step.
+pub(crate) fn paged_turn_grow_bytes(
+    total_blocks: u32,
+    max_total_blocks: u32,
+    available_blocks: u32,
+    block_size: u32,
+    bytes_per_block: u64,
+    tokens: u64,
+) -> u64 {
+    let needed = tokens.div_ceil(u64::from(block_size.max(1)));
+    let shortfall = needed.saturating_sub(u64::from(available_blocks));
+    if shortfall == 0 {
+        return 0;
+    }
+    u64::from(total_blocks)
+        .saturating_add(shortfall)
+        .min(u64::from(max_total_blocks))
+        .saturating_mul(bytes_per_block)
+}
+
+/// Bytes a turn of another kind books before it starts: pool growth for the
+/// prompt plus the first runway of output on a paged turn, those rows of
+/// target K/V otherwise.
+fn turn_kv_need_bytes<T: DFlash2Target>(target: &T, rows: u64, row_bytes: u64) -> Result<u64> {
+    let Some(adapter) = target.paged_adapter_ref() else {
+        return Ok(rows.saturating_mul(row_bytes));
+    };
+    let blocks = adapter.block_telemetry().map_err(Error::from_reason)?;
+    Ok(paged_turn_grow_bytes(
+        blocks.total_blocks,
+        blocks.max_total_blocks,
+        blocks.free_blocks.saturating_add(blocks.reclaimable_blocks),
+        adapter.block_size(),
+        adapter.bytes_per_block().map_err(Error::from_reason)?,
+        rows,
+    ))
+}
+
 /// Evicts parked states before a turn of another kind (paged, vision, MTP)
-/// takes the model, until the live headroom covers that turn's
-/// `prompt + max_new` K/V rows and its transients. The live state stays:
-/// its buffers are resident whether it parks or not. A failed eviction
-/// drops every parked state.
+/// takes the model, until the live headroom covers what that turn books
+/// before it starts (the prompt plus one runway of output) and its
+/// transients. The live state stays: its buffers are resident whether it
+/// parks or not. A failed eviction drops every parked state.
 pub(crate) fn evict_parked_dflash2_for_turn<T: DFlash2Target>(
     target: &mut T,
     prompt_len: usize,
@@ -600,19 +645,21 @@ pub(crate) fn evict_parked_dflash2_for_turn<T: DFlash2Target>(
     if target.dflash2_states().store.bytes().entries == 0 {
         return;
     }
-    let evicted =
-        turn_memory(target, prompt_len, max_new_tokens).and_then(|(row_bytes, transient)| {
-            let rows = prompt_len as u64 + max_new_tokens.max(0) as u64;
-            let (need, headroom) = parked_kv_eviction(
-                rows.saturating_mul(row_bytes),
-                transient,
-                dflash2_kv_headroom_now(),
-            );
-            target
-                .dflash2_states_mut()
-                .store
-                .evict_for(need, headroom, None)
-        });
+    let ahead = max_new_tokens
+        .max(0)
+        .min(super::config::QWEN35_DFLASH2_POOL_RUNWAY_TOKENS as i32);
+    let evicted = turn_memory(target, prompt_len, ahead).and_then(|(row_bytes, transient)| {
+        let rows = prompt_len as u64 + ahead as u64;
+        let (need, headroom) = parked_kv_eviction(
+            turn_kv_need_bytes(target, rows, row_bytes)?,
+            transient,
+            dflash2_kv_headroom_now(),
+        );
+        target
+            .dflash2_states_mut()
+            .store
+            .evict_for(need, headroom, None)
+    });
     match evicted {
         Ok(report) if report.freed_kv_bytes > 0 || report.freed_state_bytes > 0 => {
             crate::array::clear_cache();
@@ -658,6 +705,41 @@ pub(crate) fn evict_parked_dflash2_for_pool_grow<T: DFlash2Target>(target: &mut 
         crate::array::clear_cache();
     }
     freed
+}
+
+/// Runs `step`; when its block growth was refused and `reclaim` frees
+/// memory, runs it once more. A refused paged step has changed nothing:
+/// `record_tokens` allocates before any layer runs.
+pub(crate) fn retry_after_reclaim<T, R>(
+    target: &mut T,
+    mut step: impl FnMut(&mut T) -> Result<R>,
+    reclaim: impl FnOnce(&mut T) -> bool,
+) -> Result<R> {
+    match step(target) {
+        Err(error)
+            if crate::engine::scheduler::is_paged_allocation_blocked(&error.reason)
+                && reclaim(target) =>
+        {
+            step(target)
+        }
+        other => other,
+    }
+}
+
+/// One serial paged decode step that evicts parked states and retries when
+/// the pool could not grow for it: a grow probe reads live memory, which
+/// parked states hold.
+pub(crate) fn paged_step_reclaiming<T: DFlash2Target, R>(
+    target: &mut T,
+    step: impl FnMut(&mut T) -> Result<R>,
+) -> Result<R> {
+    retry_after_reclaim(target, step, |target| {
+        let can_grow = target
+            .paged_adapter_ref()
+            .and_then(|adapter| adapter.block_telemetry().ok())
+            .is_some_and(|blocks| blocks.total_blocks < blocks.max_total_blocks);
+        can_grow && evict_parked_dflash2_for_pool_grow(target)
+    })
 }
 
 /// Size every flat full-attention cache for this turn so decode never
@@ -1864,6 +1946,100 @@ mod tests {
             assert_eq!(inner.dflash2_states.store.bytes().entries, 0, "{name}");
         }
         Ok(())
+    }
+
+    /// The pool grows to cover the prompt plus the runway: 3,048 rows need
+    /// 191 blocks, 100 are free, so 91 more beside the 275 live ones.
+    /// Mutation: return the shortfall's bytes → red.
+    #[test]
+    fn paged_turn_grow_bytes_is_the_grown_pool() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(
+            paged_turn_grow_bytes(275, 5_051, 100, 16, MIB, 1_000 + 2_048),
+            366 * MIB
+        );
+        assert_eq!(paged_turn_grow_bytes(275, 5_051, 191, 16, MIB, 3_048), 0);
+        assert_eq!(
+            paged_turn_grow_bytes(275, 300, 0, 16, MIB, 3_048),
+            300 * MIB
+        );
+    }
+
+    /// A turn of another kind with an omitted budget keeps a parked state
+    /// when the headroom covers its prompt plus one runway of output.
+    /// Mutation: size the rows as `prompt + max_new` → red (state evicted).
+    #[test]
+    fn omitted_budget_turn_keeps_the_parked_state() -> Result<()> {
+        if !metal_is_default_device() {
+            return Ok(());
+        }
+        struct Override;
+        impl Drop for Override {
+            fn drop(&mut self) {
+                KV_BUDGET_OVERRIDE.with(|budget| budget.set(None));
+            }
+        }
+        let tokenizer = tokenizer();
+        for name in FIXTURES {
+            let mut inner = fixture(name);
+            turn(&mut inner, &tokenizer, &body(4, 40));
+            turn(&mut inner, &tokenizer, &body(5, 40));
+            let before = inner.dflash2_states.store.bytes();
+            assert_eq!(before.entries, 1, "{name}");
+            let prompt = 40usize;
+            let ahead = super::super::config::QWEN35_DFLASH2_POOL_RUNWAY_TOKENS as i32;
+            let (row_bytes, transient) = turn_memory(&inner, prompt, ahead)?;
+            let need = (prompt as u64 + ahead as u64) * row_bytes + transient;
+            let _override = Override;
+            KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(need)));
+            evict_parked_dflash2_for_turn(&mut inner, prompt, 100_000);
+            assert_eq!(inner.dflash2_states.store.bytes(), before, "{name}");
+        }
+        Ok(())
+    }
+
+    /// A refused paged step retries once after the reclaim frees memory; it
+    /// fails when nothing is freed, and other errors never reclaim.
+    /// Mutation: return the first result without retrying → red.
+    #[test]
+    fn refused_paged_step_retries_after_reclaim() {
+        let refused = || {
+            Err::<u32, _>(Error::from_reason(
+                "context_length_exceeded: paged decode could not reserve 1 more block(s)",
+            ))
+        };
+        let mut calls = 0u32;
+        let out = retry_after_reclaim(
+            &mut calls,
+            |calls| {
+                *calls += 1;
+                if *calls == 1 { refused() } else { Ok(7) }
+            },
+            |_| true,
+        );
+        assert_eq!((out.ok(), calls), (Some(7), 2));
+
+        let mut calls = 0u32;
+        let out = retry_after_reclaim(
+            &mut calls,
+            |calls| {
+                *calls += 1;
+                refused()
+            },
+            |_| false,
+        );
+        assert!(out.is_err() && calls == 1);
+
+        let mut reclaimed = false;
+        let out = retry_after_reclaim(
+            &mut reclaimed,
+            |_| Err::<u32, _>(Error::from_reason("other failure")),
+            |reclaimed| {
+                *reclaimed = true;
+                true
+            },
+        );
+        assert!(out.is_err() && !reclaimed);
     }
 
     /// Without an armed capture the kept tail is the newest window of the

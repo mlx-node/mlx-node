@@ -219,6 +219,12 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn scheduler_prefill_slice_tokens(&self) -> u32 {
         scheduler_long_prefill_tokens()
     }
+    /// The turn books its prompt plus one block and grows KV per step; a
+    /// blocked step reclaims, then preempts, and a lone blocked row fails.
+    /// Otherwise the whole turn is booked at admission.
+    fn scheduler_books_on_demand(&self) -> bool {
+        !scheduler_reserve_full_isl()
+    }
     fn reset_owner_on_session_start(&self) -> bool {
         false
     }
@@ -706,6 +712,85 @@ fn scheduler_reserve_full_isl() -> bool {
             )
         })
     })
+}
+
+/// Blocks a scheduled turn books at admission, and the tokens they cover.
+/// On demand: the prompt plus one growth block, never more than the whole
+/// turn. Otherwise the whole turn.
+pub(crate) fn scheduled_booking(
+    on_demand: bool,
+    prompt_tokens: u32,
+    max_new_tokens: u32,
+    block_size: u32,
+) -> (u32, u32) {
+    let block_size = block_size.max(1);
+    let requested_tokens =
+        engine::scheduler::scheduled_materialized_tokens(prompt_tokens, max_new_tokens);
+    let full_blocks = requested_tokens.div_ceil(block_size);
+    if !on_demand {
+        return (full_blocks, requested_tokens);
+    }
+    let blocks = prompt_tokens
+        .div_ceil(block_size)
+        .saturating_add(u32::from(max_new_tokens != 0))
+        .min(full_blocks);
+    (
+        blocks,
+        requested_tokens.min(blocks.saturating_mul(block_size)),
+    )
+}
+
+/// Blocks a preempted on-demand turn books to resume: its replayed history
+/// plus the step it blocked at (the pending token and `draft_rows`), never
+/// less than it already booked.
+pub(crate) fn resume_booking_blocks(
+    booked_blocks: u32,
+    history_tokens: u32,
+    draft_rows: u32,
+    block_size: u32,
+) -> u32 {
+    let rows = history_tokens.saturating_add(1).saturating_add(draft_rows);
+    booked_blocks.max(rows.div_ceil(block_size.max(1)))
+}
+
+/// Blocks a pool grow must add before `decision` admits, or `None` when no
+/// grow below the max pool can. Live turns' unallocated bookings and the
+/// watermark are in `decision`; the watermark grows with the pool by
+/// `watermark_fraction` of each added block.
+fn grow_needed_blocks_for(
+    snapshot: &SchedulerCacheSnapshot,
+    decision: &engine::scheduler::MemoryAdmission,
+    watermark_fraction: f64,
+) -> Option<u32> {
+    if snapshot.blocks.total_blocks >= snapshot.max_total_blocks {
+        return None;
+    }
+    let bytes_per_block = snapshot.bytes_per_block.max(1);
+    let available = u64::from(snapshot.blocks.free_blocks)
+        .saturating_add(u64::from(snapshot.blocks.reclaimable_blocks))
+        .saturating_mul(bytes_per_block);
+    let shortfall = decision
+        .reserved_block_bytes
+        .saturating_add(decision.reserved_state_bytes)
+        .saturating_add(decision.watermark_bytes)
+        .saturating_sub(available);
+    if shortfall == 0 {
+        return None;
+    }
+    let fraction = if decision.watermark_bytes > 0 {
+        watermark_fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let per_block = bytes_per_block as f64 * (1.0 - fraction);
+    if per_block <= 0.0 {
+        return None;
+    }
+    let blocks = (shortfall as f64 / per_block).ceil();
+    let room = snapshot
+        .max_total_blocks
+        .saturating_sub(snapshot.blocks.total_blocks);
+    (blocks <= f64::from(room)).then_some(blocks as u32)
 }
 
 pub(crate) enum ScheduledReply {
@@ -2085,21 +2170,19 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         admitted.params.max_new_tokens = max_new_tokens as i32;
         let requested_tokens =
             engine::scheduler::scheduled_materialized_tokens(prompt_tokens, max_new_tokens);
-        let full_blocks = requested_tokens.div_ceil(block_size);
-        let reservation_blocks = if scheduler_reserve_full_isl() {
-            full_blocks
-        } else {
-            prompt_tokens
-                .div_ceil(block_size)
-                .saturating_add(u32::from(max_new_tokens != 0))
-                .min(full_blocks)
-        };
+        let on_demand = self.inner.scheduler_books_on_demand();
+        let (reservation_blocks, booked_tokens) =
+            scheduled_booking(on_demand, prompt_tokens, max_new_tokens, block_size);
         let reservation_state_bytes = self.inner.recurrent_state_bytes().saturating_add(
             if matches!(
                 admitted.plan.decoder,
                 engine::plan::DecoderPlan::Speculative(_)
             ) {
-                self.inner.scheduled_draft_state_bytes(requested_tokens)
+                self.inner.scheduled_draft_state_bytes(if on_demand {
+                    booked_tokens
+                } else {
+                    requested_tokens
+                })
             } else {
                 0
             },
@@ -2241,6 +2324,64 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         Ok(true)
     }
 
+    /// Frees memory for a blocked step without preempting `victim`: first
+    /// memory the family holds beside the pool (then one pool grow), then one
+    /// idle owner's blocks. True only when free plus reclaimable blocks grew,
+    /// so the blocked rows retry and the loop is bounded by what is idle.
+    fn reclaim_for_blocked_step(&mut self, victim: SeqId) -> bool {
+        let available = |state: &Self| {
+            state
+                .inner
+                .scheduler_cache_snapshot()
+                .ok()
+                .flatten()
+                .map(|snapshot| {
+                    u64::from(snapshot.blocks.free_blocks)
+                        + u64::from(snapshot.blocks.reclaimable_blocks)
+                })
+        };
+        let Some(before) = available(self) else {
+            return false;
+        };
+        if self.inner.release_memory_for_pool_grow()
+            && self
+                .inner
+                .paged_adapter_mut()
+                .is_some_and(|adapter| adapter.try_grow_pool(1))
+        {
+            return true;
+        }
+        let Some(owner) = self.idle_block_owner(victim) else {
+            return false;
+        };
+        self.inner.release_scheduled_recurrent_for(owner);
+        self.inner.release_scheduled_speculation(owner);
+        if let Err(error) = self.inner.release_scheduled_cache(owner) {
+            tracing::warn!(
+                "{} could not release idle owner {owner} for a blocked step: {error:?}",
+                B::SCHEDULER_NAME
+            );
+            return false;
+        }
+        available(self).is_some_and(|after| after > before)
+    }
+
+    /// Idle owner whose cache holds pool blocks; recurrent-only owners free
+    /// nothing a blocked step can use.
+    fn idle_block_owner(&self, victim: SeqId) -> Option<SeqId> {
+        let mut candidates: Vec<SeqId> = self.owner_sequences.values().copied().collect();
+        if let Some(adapter) = self.inner.paged_adapter() {
+            candidates.extend(adapter.live_seq_ids());
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates.into_iter().find(|&candidate| {
+            candidate != victim
+                && !self.scheduler.contains_seq(candidate)
+                && self.inner.scheduler_materialized_blocks(candidate) > 0
+        })
+    }
+
     fn idle_reclaim_made_progress(&self, seq_id: SeqId, victim: SeqId) -> bool {
         self.idle_memory_victim(seq_id) != Some(victim)
     }
@@ -2310,12 +2451,41 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         reservation_blocks: u32,
         candidate_state_bytes: u64,
         state_candidate_bytes: u64,
+        snapshot: SchedulerCacheSnapshot,
+        release_cache: F,
+    ) -> Result<MemoryReserveOutcome>
+    where
+        F: FnMut(&mut B, SeqId) -> Result<()>,
+    {
+        let may_wait = self.scheduler.has_live_turns();
+        self.try_reserve_with_policy(
+            seq_id,
+            reservation_blocks,
+            candidate_state_bytes,
+            state_candidate_bytes,
+            snapshot,
+            may_wait,
+            release_cache,
+        )
+    }
+
+    /// `may_wait`: other turns can still free memory, so a reservation that
+    /// does not fit defers instead of rejecting.
+    #[allow(clippy::too_many_arguments)]
+    fn try_reserve_with_policy<F>(
+        &mut self,
+        seq_id: SeqId,
+        reservation_blocks: u32,
+        candidate_state_bytes: u64,
+        state_candidate_bytes: u64,
         mut snapshot: SchedulerCacheSnapshot,
+        may_wait: bool,
         mut release_cache: F,
     ) -> Result<MemoryReserveOutcome>
     where
         F: FnMut(&mut B, SeqId) -> Result<()>,
     {
+        let mut grown_for_live_turns = false;
         loop {
             let decision =
                 self.reserve_memory_decision(&snapshot, reservation_blocks, candidate_state_bytes);
@@ -2336,7 +2506,22 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 return Ok(MemoryReserveOutcome::Admitted);
             }
             if !self.reclaim_one_idle_scheduled_with(seq_id, &mut release_cache)? {
-                if self.scheduler.has_live_turns() {
+                if may_wait {
+                    if self.inner.scheduler_books_on_demand()
+                        && !grown_for_live_turns
+                        && state == ScheduledStateFit::Fits
+                        && let Some(needed) = grow_needed_blocks_for(
+                            &snapshot,
+                            &decision,
+                            scheduler_watermark_fraction(),
+                        )
+                    {
+                        grown_for_live_turns = true;
+                        if let Some(grown) = self.try_grow_pool_by(needed)? {
+                            snapshot = grown;
+                            continue;
+                        }
+                    }
                     return Ok(MemoryReserveOutcome::Defer);
                 }
                 if state != ScheduledStateFit::Fits {
@@ -2397,6 +2582,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         ) else {
             return Ok(None);
         };
+        self.try_grow_pool_by(needed)
+    }
+
+    /// Grows the pool by `needed` blocks, evicting memory the family holds
+    /// outside the pool once if the first grow is declined. Returns the
+    /// fresh snapshot, or `None` when the pool did not grow.
+    fn try_grow_pool_by(&mut self, needed: u32) -> Result<Option<SchedulerCacheSnapshot>> {
         let Some(adapter) = self.inner.paged_adapter_mut() else {
             return Ok(None);
         };
@@ -2473,6 +2665,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 prepared.cancelled.as_ref(),
             );
             return Ok(None);
+        }
+        // A preempted row resumes before any later turn books memory: a
+        // booking taken now can keep the victim from ever fitting again,
+        // while the victim blocks the later turn from running.
+        if self.inner.scheduler_books_on_demand() && self.scheduler.has_preempted() {
+            return Err(prepared);
         }
         if !self.ensure_recurrent_slot(prepared.seq_id) {
             return Err(prepared);
@@ -2900,9 +3098,41 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.fail_preempted(turn, error.reason.clone());
             return;
         }
+        if self.inner.scheduler_books_on_demand() {
+            self.book_resume_of_blocked_step(&mut turn, replay.tokens.len() as u32);
+        }
         turn.payload.preemption_replay = Some(replay);
         self.scheduler.record_preemption_mode(mode);
         self.scheduler.prepend_preempted(turn);
+    }
+
+    /// A victim resumes only into room for its replayed history plus the step
+    /// it was preempted at (the pending token and its draft rows). Booking
+    /// less re-admits it into the same shortage, so it replays and blocks
+    /// again every step.
+    fn book_resume_of_blocked_step(
+        &self,
+        turn: &mut TurnState<ScheduledTurn<B::PrefixState>>,
+        history_tokens: u32,
+    ) {
+        let block_size = turn.block_size.max(1);
+        turn.block_reservation_total = resume_booking_blocks(
+            turn.block_reservation_total,
+            history_tokens,
+            turn.decode_draft_allowance,
+            block_size,
+        );
+        let booked_tokens = turn
+            .payload
+            .requested_tokens
+            .min(turn.block_reservation_total.saturating_mul(block_size));
+        turn.recurrent_state_bytes = self.inner.recurrent_state_bytes().saturating_add(
+            if turn.payload.scheduled_speculation.is_some() {
+                self.inner.scheduled_draft_state_bytes(booked_tokens)
+            } else {
+                0
+            },
+        );
     }
 
     fn try_resume_preempted(&mut self) {
@@ -2940,12 +3170,19 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 turn.payload.requested_tokens,
                 turn.payload.scheduled_speculation.is_some(),
             );
-            match self.try_reserve_reclaiming_idle(
+            let may_wait = if self.inner.scheduler_books_on_demand() {
+                self.scheduler.resume_may_wait(&turn)
+            } else {
+                self.scheduler.has_live_turns()
+            };
+            match self.try_reserve_with_policy(
                 turn.seq_id,
                 charge,
                 turn.recurrent_state_bytes,
                 state_candidate_bytes,
                 snapshot,
+                may_wait,
+                B::release_scheduled_cache,
             ) {
                 Ok(MemoryReserveOutcome::Admitted) => {
                     turn.scheduled_state_bytes = state_candidate_bytes
@@ -3345,7 +3582,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     self.finish_completed(turn);
                 }
                 if let Some(turn) = preempted {
-                    self.handle_preempted(turn);
+                    if self.inner.scheduler_books_on_demand()
+                        && self.reclaim_for_blocked_step(turn.seq_id)
+                    {
+                        self.scheduler.reinstate_running(turn);
+                    } else {
+                        self.handle_preempted(turn);
+                    }
                     may_resume_preempted = false;
                 }
             }
@@ -4655,6 +4898,226 @@ pub(crate) mod tests {
             4,
             "an above-max reservation must not grow the pool"
         );
+    }
+
+    /// Qwen3.5 dense scheduler over the growable fixture (4 live blocks, 16
+    /// max). Returns `None` to skip when Metal is unavailable.
+    fn growable_qwen35_state() -> Option<(HybridSchedulerState<Qwen35Inner>, SchedulerCacheSnapshot)>
+    {
+        let mut inner = match Qwen35Inner::new(tiny_config()) {
+            Ok(inner) => inner,
+            Err(_) => {
+                eprintln!("skipping Qwen3.5 grow-path scheduler test: inner failed");
+                return None;
+            }
+        };
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            eprintln!("skipping Qwen3.5 grow-path scheduler test: Metal unavailable");
+            return None;
+        }
+        inner.paged_adapter = Some(tiny_growable_paged_adapter());
+        let state = HybridSchedulerState::new(inner).expect("construct Qwen3.5 scheduler");
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("scheduler snapshot")
+            .expect("paged adapter present");
+        Some((state, snapshot))
+    }
+
+    /// An omitted budget on the M3 Pro pool window (78,464) books its 1,000
+    /// prompt tokens plus one block, not the whole window.
+    /// Mutation: `scheduled_booking` ignores `on_demand` → red (4904 ≠ 64).
+    #[test]
+    fn on_demand_booking_charges_the_prompt_not_the_window() {
+        let window = 78_464;
+        let (blocks, booked) = scheduled_booking(true, 1_000, window - 1_000, 16);
+        assert_eq!((blocks, booked), (64, 1_024));
+        assert_eq!(
+            scheduled_booking(false, 1_000, window - 1_000, 16),
+            (4_904, 78_463)
+        );
+        assert_eq!(scheduled_booking(true, 1_000, 0, 16), (63, 1_000));
+        assert_eq!(scheduled_booking(true, 1_000, 1, 16), (63, 1_000));
+    }
+
+    /// Mutation: the dense override returns `false` → red.
+    #[test]
+    fn qwen35_families_book_kv_on_demand() {
+        let dense = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let moe = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE model");
+        assert!(dense.scheduler_books_on_demand());
+        assert!(moe.scheduler_books_on_demand());
+        if std::env::var_os("MLX_SCHED_RESERVE_FULL_ISL").is_none()
+            && let Ok(nemotron) = NemotronHInner::new(tiny_nemotron_paged_config())
+        {
+            assert!(!nemotron.scheduler_books_on_demand());
+        }
+    }
+
+    /// With live turns an on-demand reservation grows the runway pool before
+    /// it defers; a whole-turn family still defers.
+    /// Mutation: drop the live-turn grow → red (Defer). Mutation: drop the
+    /// `scheduler_books_on_demand` gate on it → the Nemotron twin is red.
+    #[test]
+    fn live_turn_reservation_grows_the_runway_pool_before_deferring() {
+        let Some((mut state, snapshot)) = growable_qwen35_state() else {
+            return;
+        };
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        let charge = snapshot.blocks.free_blocks + 1;
+        let outcome = state
+            .try_reserve_with_policy(
+                2,
+                charge,
+                0,
+                0,
+                snapshot,
+                true,
+                <Qwen35Inner as HybridSchedulerBackend>::release_scheduled_cache,
+            )
+            .expect("grow + re-reserve");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "an on-demand reservation must grow the runway beside live turns: {outcome:?}"
+        );
+        assert_eq!(
+            state
+                .inner
+                .scheduler_cache_snapshot()
+                .expect("snapshot")
+                .expect("adapter")
+                .blocks
+                .total_blocks,
+            8
+        );
+
+        let Some((mut state, snapshot)) = growable_scheduler_state() else {
+            return;
+        };
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        let outcome = state
+            .try_reserve_with_policy(
+                2,
+                snapshot.blocks.free_blocks + 1,
+                0,
+                0,
+                snapshot,
+                true,
+                <NemotronHInner as HybridSchedulerBackend>::release_scheduled_cache,
+            )
+            .expect("defer");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Defer),
+            "a whole-turn family must keep deferring beside live turns: {outcome:?}"
+        );
+    }
+
+    /// 40 of 100 blocks, 10 free, 20 booked, 5% watermark (2 blocks'
+    /// worth): every grown block adds 0.95 of a block, so 13 blocks fit and
+    /// 12 do not.
+    /// Mutation: size the grow as the plain shortfall → red (12 ≠ 13).
+    #[test]
+    fn live_turn_grow_covers_the_watermark_it_raises() {
+        let snapshot = SchedulerCacheSnapshot {
+            blocks: BlockTelemetry {
+                total_blocks: 40,
+                free_blocks: 10,
+                reclaimable_blocks: 0,
+                allocated_blocks: 30,
+            },
+            max_total_blocks: 100,
+            bytes_per_block: 1_000,
+        };
+        let decision = engine::scheduler::MemoryAdmission {
+            admitted: false,
+            watermark_bytes: 2_000,
+            reserved_block_bytes: 20_000,
+            reserved_state_bytes: 0,
+        };
+        assert_eq!(grow_needed_blocks_for(&snapshot, &decision, 0.05), Some(13));
+        let fits = |grown: u64| {
+            let capacity = (40 + grown) * 1_000;
+            let watermark = (capacity as f64 * 0.05).ceil() as u64;
+            20_000 + watermark <= (10 + grown) * 1_000
+        };
+        assert!(fits(13) && !fits(12));
+        let near_max = SchedulerCacheSnapshot {
+            max_total_blocks: 45,
+            ..snapshot
+        };
+        assert_eq!(grow_needed_blocks_for(&near_max, &decision, 0.05), None);
+    }
+
+    /// A victim preempted at history 63 resumes into 64 rows (4 blocks), 67
+    /// with three draft rows (5 blocks); alone in a pool that cannot grow
+    /// past 4 blocks, the 5-block resume rejects instead of re-admitting.
+    /// Mutation: `resume_booking_blocks` keeps the booked blocks → red.
+    /// Mutation: drop the draft rows → red (4 ≠ 5).
+    #[test]
+    fn lone_victim_resumes_only_into_its_blocked_step() {
+        assert_eq!(resume_booking_blocks(2, 63, 0, 16), 4);
+        assert_eq!(resume_booking_blocks(2, 63, 3, 16), 5);
+        assert_eq!(resume_booking_blocks(9, 63, 3, 16), 9);
+        let Some((mut state, snapshot)) = growable_qwen35_state() else {
+            return;
+        };
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(Arc::new(|_| Ok(4))));
+        let outcome = state
+            .try_reserve_with_policy(
+                2,
+                resume_booking_blocks(2, 63, 3, 16),
+                0,
+                0,
+                snapshot,
+                false,
+                <Qwen35Inner as HybridSchedulerBackend>::release_scheduled_cache,
+            )
+            .expect("reject");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Reject { total_blocks: 4 }),
+            "{outcome:?}"
+        );
+    }
+
+    /// A blocked step frees an idle owner's blocks and keeps its victim
+    /// running; with nothing idle left it preempts.
+    /// Mutation: skip the idle-owner release in `reclaim_for_blocked_step`
+    /// → red.
+    #[test]
+    fn blocked_step_releases_an_idle_owner_before_preempting() {
+        let Some((mut state, _)) = growable_qwen35_state() else {
+            return;
+        };
+        state.owner_sequences.insert("idle".into(), 1);
+        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
+        adapter.begin_request(1).expect("begin idle request");
+        adapter
+            .allocate_suffix_blocks_for(1, 32)
+            .expect("idle owner holds two blocks");
+        assert_eq!(state.idle_block_owner(2), Some(1));
+        assert!(state.reclaim_for_blocked_step(2));
+        assert!(
+            state
+                .inner
+                .paged_adapter()
+                .and_then(|adapter| adapter.block_table_for(1))
+                .is_none(),
+            "the idle owner's table is released"
+        );
+        assert!(!state.reclaim_for_blocked_step(2));
     }
 
     /// Admission's must-fit hard-reject is measured against the MAX pool the

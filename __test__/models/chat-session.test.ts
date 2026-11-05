@@ -3447,7 +3447,12 @@ describe('ChatSession', () => {
   });
 
   describe('physical context-capacity preflight', () => {
-    function withCapacity(model: SessionCapableModel, capacity: number, promptTokens: number): SessionCapableModel {
+    function withCapacity(
+      model: SessionCapableModel,
+      capacity: number,
+      promptTokens: number,
+      restOfWindowOutputBudget = true,
+    ): SessionCapableModel {
       return {
         ...model,
         contextLimits: () => ({
@@ -3455,6 +3460,7 @@ describe('ChatSession', () => {
           effectiveWindowTokens: capacity,
           pagedBlockCapacity: capacity / 16,
           pagedBlockSize: 16,
+          restOfWindowOutputBudget,
         }),
         applyChatTemplate: vi.fn(() => new Uint32Array(promptTokens)),
       };
@@ -3555,6 +3561,28 @@ describe('ChatSession', () => {
       await expect(lastRow.preflightContextCapacity([{ role: 'user', content: 'x' }])).resolves.toMatchObject({
         maxNewTokens: 1,
       });
+    });
+
+    // Mutation: ignore `restOfWindowOutputBudget` → red (28 ≠ 29).
+    it('keeps the native output rule for a model whose budget does not fill the window', async () => {
+      const explicit = makeMockModel();
+      await new ChatSession(withCapacity(explicit.model, 128, 100, false)).send('hello', {
+        config: { maxNewTokens: 64 },
+      });
+      expect(explicit.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBe(29);
+
+      const fits = makeMockModel();
+      await new ChatSession(withCapacity(fits.model, 4096, 100, false)).send('hello');
+      expect(fits.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBeUndefined();
+
+      const short = makeMockModel();
+      await new ChatSession(withCapacity(short.model, 128, 80, false)).send('hello');
+      expect(short.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBe(49);
+
+      const full = new ChatSession(withCapacity(makeMockModel().model, 64, 64, false));
+      await expect(
+        full.preflightContextCapacity([{ role: 'user', content: 'x' }], { maxNewTokens: 16 }),
+      ).resolves.toMatchObject({ maxNewTokens: 1 });
     });
 
     it('rejects an oversized prompt before native allocation and preserves turn state', async () => {
@@ -3691,6 +3719,7 @@ describe('ChatSession', () => {
             pagedBlockCapacity: 4,
             pagedBlockSize: 16,
             speculativeWindowTokens: speculative,
+            restOfWindowOutputBudget: true,
           }),
           applyChatTemplate: vi.fn(() => new Uint32Array(promptTokens)),
           ...extra,

@@ -68,23 +68,27 @@ impl PagedStepModel for Qwen35MoePagedDecode<'_> {
         // re-`item_at_int32` the fresh `input_ids` reshape — that
         // redundant second per-step eval/sync measurably regressed decode.
         let embed = self.inner.embedding.clone();
-        let caches_ref = self.inner.caches.as_mut().ok_or_else(|| {
-            Error::from_reason("Qwen35MoePagedDecode::paged_step: caches dropped mid-decode")
-        })?;
-        let adapter = self.inner.paged_adapter.as_mut().ok_or_else(|| {
-            Error::from_reason("Qwen35MoePagedDecode::paged_step: paged_adapter dropped mid-decode")
-        })?;
-        crate::models::qwen3_5_moe::paged_forward::run_paged_decode_step(
-            token_id,
-            &embed,
-            &mut self.inner.layers,
-            caches_ref,
-            &self.inner.final_norm,
-            &self.inner.lm_head,
-            &self.inner.layer_kinds,
-            adapter,
-            self.inner.cached_rope_deltas.unwrap_or(0),
-        )
+        crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(&mut *self.inner, |inner| {
+            let caches_ref = inner.caches.as_mut().ok_or_else(|| {
+                Error::from_reason("Qwen35MoePagedDecode::paged_step: caches dropped mid-decode")
+            })?;
+            let adapter = inner.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason(
+                    "Qwen35MoePagedDecode::paged_step: paged_adapter dropped mid-decode",
+                )
+            })?;
+            crate::models::qwen3_5_moe::paged_forward::run_paged_decode_step(
+                token_id,
+                &embed,
+                &mut inner.layers,
+                caches_ref,
+                &inner.final_norm,
+                &inner.lm_head,
+                &inner.layer_kinds,
+                adapter,
+                inner.cached_rope_deltas.unwrap_or(0),
+            )
+        })
     }
 }
 
