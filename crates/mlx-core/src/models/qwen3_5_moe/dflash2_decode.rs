@@ -747,7 +747,7 @@ impl DFlash2Target for Qwen35MoeInner {
     }
 
     fn dflash2_window(&self) -> Option<u32> {
-        self.dflash2_window.map(|terms| terms.window())
+        self.dflash2_window.map(|_| self.paged_context_limits().1)
     }
 
     fn dense_config(&self) -> std::borrow::Cow<'_, crate::models::qwen3_5::Qwen3_5Config> {

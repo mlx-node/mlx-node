@@ -190,37 +190,29 @@ pub(crate) fn dflash2_pool_window(
 }
 
 /// Whether [`dflash2_kv_reserve_rows`] reserves a whole `window`-row prompt
-/// plus one new token from `headroom` less that turn's transients. The worst
-/// case of every turn the window admits: a shorter prompt has smaller
-/// transients and needs fewer rows.
-pub(crate) fn dflash2_reserve_admits(
-    window: u32,
-    headroom: u64,
-    row_bytes: u64,
-    transient: &dyn Fn(usize) -> u64,
-) -> Result<bool> {
-    let prompt = window as usize;
-    let budget = dflash2_kv_budget_of(headroom.saturating_sub(transient(prompt)));
+/// plus one new token from the budget of `headroom`, as
+/// `reserve_dflash2_turn_kv` calls it on a cold turn. A warm turn whose
+/// resident rows sit below its whole turn is charged its prompt again (the
+/// regrowth copies the old buffer), so near the window edge it can fall
+/// back to the growth path.
+pub(crate) fn dflash2_reserve_admits(window: u32, headroom: u64, row_bytes: u64) -> Result<bool> {
+    let budget = dflash2_kv_budget_of(headroom);
     let whole = kv_capacity_round_up(window as i32, 1)? as i64;
-    Ok(dflash2_kv_reserve_rows(prompt, 1, 0, row_bytes, Some(budget))? == Some(whole))
+    Ok(dflash2_kv_reserve_rows(window as usize, 1, 0, row_bytes, Some(budget))? == Some(whole))
 }
 
 /// Largest window [`dflash2_reserve_admits`] holds for, `0` when none does.
-pub(crate) fn dflash2_reserve_window(
-    headroom: u64,
-    row_bytes: u64,
-    transient: &dyn Fn(usize) -> u64,
-) -> Result<u32> {
+pub(crate) fn dflash2_reserve_window(headroom: u64, row_bytes: u64) -> Result<u32> {
     if row_bytes == 0 {
         return Ok(u32::MAX);
     }
     let (mut low, mut high) = (0u32, (headroom / row_bytes).min(i32::MAX as u64 / 2) as u32);
-    if !dflash2_reserve_admits(low, headroom, row_bytes, transient)? {
+    if !dflash2_reserve_admits(low, headroom, row_bytes)? {
         return Ok(0);
     }
     while low < high {
         let mid = low + (high - low).div_ceil(2);
-        if dflash2_reserve_admits(mid, headroom, row_bytes, transient)? {
+        if dflash2_reserve_admits(mid, headroom, row_bytes)? {
             low = mid;
         } else {
             high = mid - 1;
@@ -255,11 +247,8 @@ pub(crate) fn dflash2_window_terms(
     let lane_bytes = dflash2_lane_bytes(config.recurrent_state_bytes(), draft_ring_bytes);
     let pool = pool_bytes
         .map(|bytes| dflash2_pool_window(bytes, lane_bytes, row_bytes, draft_block_size as u64));
-    let transient = |prompt: usize| {
-        dflash2_turn_transient_bytes(config, draft_block_size, prompt, prompt as u64 + 1, format)
-    };
     let reserve = headroom
-        .map(|headroom| dflash2_reserve_window(headroom, row_bytes, &transient))
+        .map(|headroom| dflash2_reserve_window(headroom, row_bytes))
         .transpose()?;
     Ok(DFlash2WindowTerms {
         trained: config.max_position_embeddings.max(0) as u32,
@@ -988,7 +977,7 @@ impl DFlash2Target for Qwen35Inner {
     }
 
     fn dflash2_window(&self) -> Option<u32> {
-        self.dflash2_window.map(|terms| terms.window())
+        self.dflash2_window.map(|_| self.paged_context_limits().1)
     }
 
     fn dense_config(&self) -> std::borrow::Cow<'_, crate::models::qwen3_5::Qwen3_5Config> {
@@ -2752,7 +2741,8 @@ pub(crate) mod tests {
 
     /// Gate: the published window bounds the DFlash2 clamp, with Splash's
     /// `window - prompt` output budget. Mutation: ignore `published_window`
-    /// in `constrain_dflash2_context_params` → red (122,144 ≠ 8,464).
+    /// in `constrain_dflash2_context_params` → red (capacity
+    /// 262,144 ≠ 148,464).
     #[test]
     fn context_budget_is_bounded_by_the_published_window() {
         let mut params = extract_chat_params(&ChatConfig {
@@ -2812,8 +2802,10 @@ pub(crate) mod tests {
 
     /// Gate: with little MLX-active memory the DFlash2 reservation, not the
     /// pool probe, binds, and the published window still reserves a whole
-    /// turn. Mutation: drop the `reserve` term from
-    /// `DFlash2WindowTerms::window` → red.
+    /// cold turn. Mutations: drop the `reserve` term from
+    /// `DFlash2WindowTerms::window` → red; subtract the turn transients from
+    /// the headroom in `dflash2_reserve_admits` → red (one row past the
+    /// window still reserves whole: 399,360 rows).
     #[test]
     fn dflash2_reserve_window_binds_when_active_memory_is_low() {
         let cfg = super::super::config::Qwen3_5Config {
@@ -2852,19 +2844,15 @@ pub(crate) mod tests {
         let window = terms.window();
         assert_eq!(window, reserve);
 
-        let transient = |prompt: usize| {
-            dflash2_turn_transient_bytes(
-                &cfg,
-                QWEN38_DRAFT_BLOCK,
-                prompt,
-                prompt as u64 + 1,
-                KvFormat::Int8,
-            )
-        };
         let reserve_at = |window: u32| {
-            let budget = dflash2_kv_budget_of(headroom - transient(window as usize));
-            dflash2_kv_reserve_rows(window as usize, 1, 0, terms.row_bytes, Some(budget))
-                .expect("reserve rows")
+            dflash2_kv_reserve_rows(
+                window as usize,
+                1,
+                0,
+                terms.row_bytes,
+                Some(dflash2_kv_budget_of(headroom)),
+            )
+            .expect("reserve rows")
         };
         let whole = kv_capacity_round_up(window as i32, 1).expect("whole") as i64;
         assert_eq!(reserve_at(window), Some(whole));
@@ -2872,6 +2860,52 @@ pub(crate) mod tests {
             reserve_at(window + 1),
             Some(kv_capacity_round_up(window as i32 + 1, 1).expect("whole") as i64),
             "the reserve window is the largest one admitted"
+        );
+    }
+
+    /// Gate: on the M3 Pro trigger inputs (WS 27 GiB, MLX active 16.95 GiB,
+    /// the 275 MiB runway registered) the reservation term matches what
+    /// `reserve_dflash2_turn_kv` reserves from the same headroom, so the pool
+    /// term binds at 148,464. Mutation: subtract
+    /// `dflash2_turn_transient_bytes` from the headroom in
+    /// `dflash2_reserve_admits` → red (reserve 60,485 binds).
+    #[test]
+    fn dflash2_reserve_window_on_the_m3_pro_inputs() {
+        let working_set = 27 * GIB;
+        let snapshot = PagedPrefillMemorySnapshot {
+            allocator_active_bytes: Some(17_357 * MIB),
+            allocator_cached_bytes: Some(0),
+            allocator_limit_bytes: Some(working_set),
+            metal_recommended_working_set_bytes: Some(working_set),
+            metal_current_allocated_bytes: None,
+            paged_pool_allocated_bytes: Some(275 * MIB),
+        };
+        let headroom = dflash2_kv_headroom_bytes(snapshot).expect("readable limits");
+        let terms = dflash2_window_terms(
+            &qwen38_27b_cfg(),
+            KvFormat::Int8,
+            DType::BFloat16,
+            262_144,
+            47_329_280,
+            QWEN38_DRAFT_BLOCK,
+            Some(5_051 * MIB),
+            Some(headroom),
+        )
+        .expect("window terms");
+        let reserve = terms.reserve.expect("reserve");
+        assert!(reserve > 148_464, "reserve {reserve} must not bind");
+        assert_eq!(terms.window(), 148_464);
+        let whole = kv_capacity_round_up(148_464, 1).expect("whole") as i64;
+        assert_eq!(
+            dflash2_kv_reserve_rows(
+                148_464,
+                1,
+                0,
+                terms.row_bytes,
+                Some(dflash2_kv_budget_of(headroom)),
+            )
+            .expect("reserve rows"),
+            Some(whole)
         );
     }
 
