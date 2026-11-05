@@ -8,6 +8,21 @@ import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { CodingAgentsService, MANAGED_BEGIN, MANAGED_END, managedBlock } from '../src/coding-agents.js';
 
+const fsHooks = vi.hoisted(() => ({ beforeMkdir: undefined as (() => Promise<void>) | undefined }));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const fs = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...fs,
+    // Lets a test edit the file between the service's read and its write.
+    mkdir: async (...args: Parameters<typeof fs.mkdir>) => {
+      const hook = fsHooks.beforeMkdir;
+      fsHooks.beforeMkdir = undefined;
+      await hook?.();
+      return fs.mkdir(...args);
+    },
+  };
+});
+
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => {
   for (const clean of cleanup.splice(0).reverse()) await clean();
@@ -58,8 +73,7 @@ describe('coding agent instruction paths', () => {
     await chmod(override, 0o000);
     cleanup.push(() => chmod(override, 0o600));
     expect(await row('codex')).toMatchObject({ path: override, status: 'error' });
-    const installed = await service.install('codex');
-    expect(installed.agents.find((agent) => agent.id === 'codex')!.status).toBe('error');
+    await expect(service.install('codex')).rejects.toMatchObject({ code: 'E_CONFLICT' });
     await expect(readFile(join(home, '.codex', 'AGENTS.md'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
@@ -89,7 +103,7 @@ describe('coding agent instruction paths', () => {
     if (kind === 'fifo') execFileSync('mkfifo', [claude]);
     else await mkdir(claude);
     expect(await row()).toMatchObject({ status: 'error', detail: expect.stringContaining('regular file') });
-    expect((await service.install('claude')).agents[0].status).toBe('error');
+    await expect(service.install('claude')).rejects.toThrow('regular file');
   });
 });
 
@@ -180,9 +194,27 @@ describe('managed instruction block', () => {
     const { claude, write, row, service } = await setup();
     await write(`Mine.\n${text}`);
     expect((await row()).status).toBe('error');
-    const state = await service.install('claude');
-    expect(state.agents[0]).toMatchObject({ status: 'error', detail: expect.stringContaining('markers') });
+    await expect(service.install('claude')).rejects.toMatchObject({
+      code: 'E_CONFLICT',
+      message: expect.stringContaining('markers'),
+    });
     expect(await readFile(claude, 'utf8')).toBe(`Mine.\n${text}`);
+  });
+
+  it('fails the request when the file is not writable', async () => {
+    const { claude, write, service } = await setup();
+    await write('Mine.\n');
+    await chmod(claude, 0o400);
+    await expect(service.install('claude')).rejects.toMatchObject({ code: 'E_CONFLICT' });
+    expect(await readFile(claude, 'utf8')).toBe('Mine.\n');
+  });
+
+  it('refuses to overwrite a file that changed during installation', async () => {
+    const { claude, write, service } = await setup();
+    await write('Mine.\n');
+    fsHooks.beforeMkdir = () => writeFile(claude, 'Edited elsewhere.\n');
+    await expect(service.install('claude')).rejects.toThrow('changed during installation');
+    expect(await readFile(claude, 'utf8')).toBe('Edited elsewhere.\n');
   });
 
   it('creates a missing file and its parent directory', async () => {

@@ -120,12 +120,14 @@ export class CodingAgentsService {
           : `${before}${before && !before.endsWith('\n') ? '\n' : ''}${before ? '\n' : ''}${managed}\n`;
         if (after !== before) {
           await mkdir(dirname(row.path), { recursive: true });
+          if ((await this.read(row.path)) !== before)
+            throw new Error('The instruction file changed during installation. Check again.');
           // writeFile follows symlinks and keeps the inode and mode of an existing file.
           await writeFile(row.path, after, { mode: 0o600 });
         }
       } catch (error) {
-        Object.assign(row, { status: 'error', detail: (error as Error).message });
-        return this.snapshot();
+        // A returned error row would be replaced by the page's next refresh, so fail the request.
+        throw ApiError.conflict((error as Error).message);
       }
       return this.scan();
     });
