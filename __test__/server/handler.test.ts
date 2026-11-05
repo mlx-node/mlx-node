@@ -397,6 +397,38 @@ function setupSingleCallChain(followUpText = 'single-ok'): {
 // Tests
 // ---------------------------------------------------------------------------
 
+function createLaneWindowModel(promptTokens: number, extra: Record<string, unknown> = {}) {
+  return Object.assign(
+    createMockStreamModel([
+      {
+        done: true,
+        text: 'ok',
+        finishReason: 'stop',
+        toolCalls: [],
+        thinking: null,
+        numTokens: 1,
+        promptTokens,
+        reasoningTokens: 0,
+        rawText: 'ok',
+      },
+    ]),
+    {
+      // Pool window 64, DFlash2 window 96; the draft turns `enableMtp` on by default.
+      contextLimits: () => ({
+        trainedWindowTokens: 262_144,
+        effectiveWindowTokens: 64,
+        pagedBlockCapacity: 4,
+        pagedBlockSize: 16,
+        speculativeWindowTokens: 96,
+      }),
+      hasMtpWeights: () => true,
+      mtpAutoEnabled: () => true,
+      applyChatTemplate: vi.fn(() => new Uint32Array(promptTokens)),
+      ...extra,
+    },
+  );
+}
+
 describe('createHandler', () => {
   describe('POST /v1/responses', () => {
     it('returns 200 JSON response with simple input', async () => {
@@ -544,6 +576,89 @@ describe('createHandler', () => {
         | { maxNewTokens?: number }
         | undefined;
       expect(config?.maxNewTokens).toBe(3996);
+    });
+
+    describe('per-lane context window', () => {
+      function expectJson400(response: ReturnType<typeof createMockRes>, model: SessionCapableModel) {
+        expect(response.getStatus()).toBe(400);
+        expect(response.getHeaders()['content-type']).toContain('application/json');
+        expect(response.getBody()).toContain('context_length_exceeded');
+        expect(response.getBody()).not.toContain('event:');
+        expect((model.chatStreamSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+        expect((model.resetCaches as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+      }
+
+      // Mutation: always use `speculativeWindowTokens` in
+      // `constrainToContextCapacity` → red (status 200).
+      it('returns a JSON 400 before SSE for a generation_mode=ar prompt above the pool window', async () => {
+        const model = createLaneWindowModel(80);
+        const registry = new ModelRegistry();
+        registry.register('test-model', model);
+        const req = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'autoregressive',
+          stream: true,
+          extra_body: { generation_mode: 'ar' },
+        });
+        const response = createMockRes();
+
+        await createHandler(registry)(req, response.res);
+        await response.waitForEnd();
+
+        expectJson400(response, model);
+      });
+
+      // Mutation: always use `effectiveWindowTokens` → red (status 400).
+      it('streams a speculative text prompt above the pool window but inside the DFlash2 window', async () => {
+        const model = createLaneWindowModel(80);
+        const registry = new ModelRegistry();
+        registry.register('test-model', model);
+        const req = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'speculative',
+          stream: true,
+        });
+        const response = createMockRes();
+
+        await createHandler(registry)(req, response.res);
+        await response.waitForEnd();
+
+        expect(response.getStatus()).toBe(200);
+        const config = (model.chatStreamSessionStart as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] as
+          | { maxNewTokens?: number; enableMtp?: boolean }
+          | undefined;
+        expect(config?.enableMtp).toBe(true);
+        expect(config?.maxNewTokens).toBe(16);
+      });
+
+      // Mutation: drop `!hasImages` from the window choice → red (status 200).
+      it('returns a JSON 400 before SSE for an image prompt above the pool window with generation_mode=mtp', async () => {
+        const model = createLaneWindowModel(4, {
+          expandedPromptTokenCount: vi.fn(() => 80),
+        });
+        const registry = new ModelRegistry();
+        registry.register('test-model', model);
+        const req = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: [
+            {
+              role: 'user',
+              content: [
+                { type: 'input_text', text: 'describe' },
+                { type: 'input_image', image_url: 'data:image/png;base64,AQID' },
+              ],
+            },
+          ],
+          stream: true,
+          extra_body: { generation_mode: 'mtp' },
+        });
+        const response = createMockRes();
+
+        await createHandler(registry)(req, response.res);
+        await response.waitForEnd();
+
+        expectJson400(response, model);
+      });
     });
 
     it('commits initial SSE response events before a delayed first native stream event', async () => {

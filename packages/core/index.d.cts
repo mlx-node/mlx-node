@@ -5236,12 +5236,15 @@ export interface Qwen35Config {
  * derives from the pool's MAX capacity (grow-on-demand pools are preflighted
  * against the ceiling they grow toward), while `paged_block_capacity` is the
  * physical pool size actually allocated at load and may lag after a grow.
+ * `speculative_window_tokens` is set only with a DFlash2 draft: it bounds
+ * text turns that speculate, and `effective_window_tokens` bounds the rest.
  */
 export interface Qwen35ContextLimits {
   trainedWindowTokens: number;
   effectiveWindowTokens: number;
   pagedBlockCapacity: number;
   pagedBlockSize: number;
+  speculativeWindowTokens?: number;
 }
 
 /** Generation configuration for Qwen3.5 */

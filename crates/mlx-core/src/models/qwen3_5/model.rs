@@ -415,6 +415,8 @@ pub struct Qwen3_5GenerationResult {
 /// derives from the pool's MAX capacity (grow-on-demand pools are preflighted
 /// against the ceiling they grow toward), while `paged_block_capacity` is the
 /// physical pool size actually allocated at load and may lag after a grow.
+/// `speculative_window_tokens` is set only with a DFlash2 draft: it bounds
+/// text turns that speculate, and `effective_window_tokens` bounds the rest.
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct Qwen3_5ContextLimits {
@@ -422,15 +424,17 @@ pub struct Qwen3_5ContextLimits {
     pub effective_window_tokens: u32,
     pub paged_block_capacity: u32,
     pub paged_block_size: u32,
+    pub speculative_window_tokens: Option<u32>,
 }
 
 impl Qwen3_5ContextLimits {
-    pub(crate) fn from_tuple(value: (u32, u32, u32, u32)) -> Self {
+    pub(crate) fn from_parts(value: (u32, u32, u32, u32), speculative: Option<u32>) -> Self {
         Self {
             trained_window_tokens: value.0,
             effective_window_tokens: value.1,
             paged_block_capacity: value.2,
             paged_block_size: value.3,
+            speculative_window_tokens: speculative,
         }
     }
 }
