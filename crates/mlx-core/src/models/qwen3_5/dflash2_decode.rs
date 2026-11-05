@@ -2788,8 +2788,8 @@ pub(crate) mod tests {
     /// Gate: the Splash full-lane window on the M3 Pro trigger inputs
     /// (5,051 one-MiB pool blocks, 27B target, 5 x 8 x 128 draft, 8 verify
     /// rows). Mutations: price rows with `KvFormat::Bf16` in
-    /// `dflash2_window_terms` → red (75,388); charge one GDN cell in
-    /// `dflash2_lane_bytes` → red (154,519).
+    /// `dflash2_window_terms` → red (row bytes 65,536); charge one GDN cell
+    /// in `dflash2_lane_bytes` → red (153,090).
     #[test]
     fn dflash2_pool_window_on_the_m3_pro_inputs() {
         let cfg = qwen38_27b_cfg();
