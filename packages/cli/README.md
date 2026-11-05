@@ -111,9 +111,11 @@ caller or opt-in, the worker returns an immediate handoff. The existing explicit
 remain unchanged.
 
 The desktop **Coding Agents** page can add the short routing instruction to a
-global agent file. Setup detects the prompt using the installed default model and
-preserves existing content; it adds no HTML comments or other markers. This is
-command-line integration and does not register an MCP server.
+global agent file. It writes the instruction between
+`<!-- portato managed instructions: begin -->` and
+`<!-- portato managed instructions: end -->` markers, finds it by those markers,
+and leaves the rest of the file unchanged. This is command-line integration and
+does not register an MCP server.
 
 ### Download Model
 

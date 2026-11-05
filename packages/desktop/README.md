@@ -27,27 +27,34 @@ owner-only file and never skips checking that the launcher and runtime still exi
 including its model settings, inference cache, metrics, and saved sessions.
 It has a focused worker prompt, read/bash tools, and inherits Codex's process
 permissions when launched by Codex. Permission or authentication blockers return
-a handoff without recursive subagents. Delegated sessions appear on **Sessions**. The CLI owns its model
-process; the desktop inference service is used separately for installation checks.
+a handoff without recursive subagents. Delegated sessions appear on **Sessions**.
+The CLI owns its model process.
 
-The page uses the installed default local model to read the listed global
-instruction file and recognize active delegation instructions, including manual
-wording. **Install…** appends a short plain-text instruction, preserves existing
-content, and verifies it with that model. No markers are added. Without an
-installed local model, checks and installation are disabled and the page links
-to **Models**. Start a new coding-agent session after setup.
+The page reads each global instruction file and looks for this block:
 
-Opening the page never starts inference. **Check status** checks only new or
-changed nonempty files; missing and empty files are recognized without loading
-the model. Checks run sequentially, with **Waiting…** shown for queued rows.
-The Installed menu offers **Recheck with model** to bypass a cached result.
+```
+<!-- portato managed instructions: begin -->
+…delegation instructions…
+<!-- portato managed instructions: end -->
+```
 
-Semantic results persist in the owner-only `~/.mlx-node/coding-agents.json` file,
-keyed by the instruction content, path, selected model, app command and detection prompt.
-Only hashes, verdicts and check times are stored there, not instruction text.
-Both installed and not-installed results survive restarts and identical file rewrites.
-Active checks poll in-memory status. Idle pages refresh metadata every 30 seconds
-and when focused; model discovery for this page skips recursive directory sizing.
+| File contents                                         | Status        |
+| ----------------------------------------------------- | ------------- |
+| No markers                                            | Not installed |
+| Block matches the current instructions                | Installed     |
+| Block has other content                               | Needs update  |
+| Incomplete or repeated markers, or an unreadable file | Error         |
+
+**Install** appends the block after a blank line and keeps the rest of the file.
+**Update** replaces only the text between the markers. Text outside the markers
+is never changed, and delegation wording there does not count as installed. Fix
+an error by hand, then check again.
+Start a new coding-agent session after setup.
+
+The page needs an installed local model and a working app command. Without a
+model it links to **Models**. If command setup fails, it shows the reason and
+**Retry setup**. Opening or focusing the page reads the files again, and an idle
+page refreshes every 30 seconds.
 
 Supported native global files:
 
@@ -57,19 +64,12 @@ Supported native global files:
 | Codex       | `~/.codex/AGENTS.md`, or a nonempty `AGENTS.override.md` (`CODEX_HOME` supported) |
 | Grok        | `~/.grok/AGENTS.md` (`GROK_HOME` supported)                                       |
 
-**Installed** requires both a working app command and a model-verified prompt
-that uses it. Older prompts using bare `mlx` show **Update…**; the exact previous
-template is upgraded in place without duplicate instructions. Custom wording is
-preserved, with the current routing instruction appended when needed. If command
-setup fails, the page shows the reason and **Retry setup**; it cannot install or
-report a working integration until the command is available. Project
-instructions, imported files and Grok's optional Claude compatibility sources
-are outside this check. Grok may already read a Claude installation through that
-compatibility layer; in that case a second native installation is unnecessary.
-See [Grok's instruction discovery rules](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/12-project-rules.md).
+Project instructions, imported files and Grok's optional Claude compatibility
+sources are outside this check. Grok may already read a Claude installation
+through that compatibility layer; in that case a second native installation is
+unnecessary. See [Grok's instruction discovery rules](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/12-project-rules.md).
 
-Instruction contents stay on this Mac. The control panel requests inference
-credentials over a private process channel; credentials never reach the page.
+Instruction contents stay on this Mac.
 
 ## Updates
 

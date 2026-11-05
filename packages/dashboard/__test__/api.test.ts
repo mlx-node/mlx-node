@@ -143,13 +143,10 @@ describe('dashboard api — models & catalog', () => {
       home,
       env: {},
       listModels,
-      connect: async () => {
-        throw new Error('Discovery must not start inference');
-      },
     });
     try {
       expect(await service.state()).toMatchObject({ model: names[1], available: true, unavailableReason: null });
-      expect(await service.start('detect')).toMatchObject({ available: true });
+      expect(await service.refresh()).toMatchObject({ available: true });
     } finally {
       await service.close();
     }
@@ -177,19 +174,16 @@ describe('dashboard api — models & catalog', () => {
       env: {},
       listModels,
       prepareCommand: async () => join(home, '.mlx-node', 'bin', 'mlx'),
-      connect: async () => {
-        throw new Error('Discovery must not start inference');
-      },
     });
     try {
       expect(await service.state()).toMatchObject({ model: name, available: true, unavailableReason: null });
-      expect(await service.start('detect')).toMatchObject({ available: true });
+      expect(await service.refresh()).toMatchObject({ available: true });
     } finally {
       await service.close();
     }
   });
 
-  it('only offers complete generative models for local prompt detection', async () => {
+  it('only offers complete generative models for coding agent setup', async () => {
     for (const [name, type, weights] of [
       ['partial', 'qwen3', false],
       ['embedding', 'harrier', true],

@@ -77,9 +77,9 @@ export function newSidecarAuthToken(): string {
  * auth posture and stops sending the wildcard at all.
  *
  * A NEW token per call, per process. The startup handshake gives it to MAIN,
- * which can pass it privately to CONTROL PANEL for local prompt detection.
- * The token must never enter renderer RPC, public snapshots, the `info`
- * reply, or supervisor traces. The supervisor polls unauthenticated `/health`.
+ * whose only use is the tray's copy-connect-command items. The token must never
+ * enter renderer RPC, public snapshots, the `info` reply, or supervisor traces.
+ * The supervisor polls unauthenticated `/health`.
  */
 export function sidecarHostOptions(): { port: number; host: string; authToken: string } {
   return { ...SIDECAR_HOST_OPTIONS, authToken: newSidecarAuthToken() };

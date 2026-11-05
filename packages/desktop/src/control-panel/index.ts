@@ -35,7 +35,6 @@ import { writeSync } from 'node:fs';
 import { bindEventEmitterPort, createDashboardRuntime } from '@mlx-node/dashboard';
 
 import { createCliLauncher, type DesktopCliConfig } from '../cli-launcher.js';
-import { createInferenceConnector } from './inference-connection.js';
 import { createControlPanelSession } from './session.js';
 import { CONTROL_PANEL_PROCESS_EXIT_CAP_MS, CONTROL_PANEL_WORKER_SHUTDOWN_STEP_MS } from './shutdown-timings.js';
 
@@ -48,7 +47,6 @@ import { CONTROL_PANEL_PROCESS_EXIT_CAP_MS, CONTROL_PANEL_WORKER_SHUTDOWN_STEP_M
  * import-graph test, for a type that is erased anyway.
  */
 interface ParentPort {
-  postMessage(message: unknown): void;
   on(event: 'message', listener: (event: { data: unknown; ports: unknown[] }) => void): void;
 }
 
@@ -88,7 +86,6 @@ const EXIT_WORKER_DOWN = 70;
  */
 function teardown(code: number): void {
   shuttingDown = true;
-  inference.close();
   // `runtime.close()` spends up to one worker deadline draining ingest, then a
   // SECOND worker deadline closing SQLite/terminating the thread. The enclosing
   // cap includes both sequential phases plus cleanup margin; MAIN's still-larger
@@ -107,12 +104,10 @@ function teardown(code: number): void {
     });
 }
 
-const inference = createInferenceConnector(parentPort);
 const cli = process.env.MLX_DESKTOP_CLI
   ? createCliLauncher(JSON.parse(process.env.MLX_DESKTOP_CLI) as DesktopCliConfig)
   : undefined;
 const runtime = createDashboardRuntime({
-  connectInference: () => inference.connect(),
   prepareDelegation: cli ? () => cli.prepare() : undefined,
   // One budget per sequential worker phase. The process/broker/app caps are
   // derived from this in `shutdown-timings.ts`.

@@ -104,7 +104,7 @@ export const ROUTES: Route[] = [
   workerRoute('GET', '/api/models', handleModels),
   mainRoute('GET', '/api/coding-agents', handleCodingAgents),
   workerRoute('GET', '/api/coding-agents/models', handleCodingAgentModels),
-  mainRoute('POST', '/api/coding-agents', handleCodingAgentAction, { successStatus: 202 }),
+  mainRoute('POST', '/api/coding-agents', handleCodingAgentAction),
   workerRoute('DELETE', '/api/models/:name', handleDeleteModel),
   workerRoute('GET', '/api/catalog', handleCatalog),
   mainRoute('GET', '/api/catalog/updates', handleCatalogUpdates),
