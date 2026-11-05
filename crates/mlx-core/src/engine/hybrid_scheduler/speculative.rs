@@ -620,14 +620,14 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::models::gemma4::dspark_decode::tests::{
         seeded_tiny_paged_inner_with_draft, tiny_qwen_tokenizer, tiny_turn_config,
     };
     use rand::SeedableRng;
 
-    fn request<B: HybridSchedulerBackend>(
+    pub(in crate::engine::hybrid_scheduler) fn request<B: HybridSchedulerBackend>(
         inner: &mut B,
         seq: u32,
         prompt: Vec<u32>,
