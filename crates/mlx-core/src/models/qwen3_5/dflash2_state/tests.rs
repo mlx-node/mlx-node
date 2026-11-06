@@ -508,12 +508,15 @@ fn reserve_evicts_for_the_turn_transients() -> Result<()> {
     Ok(())
 }
 
-/// A paged AR turn on the model evicts parked DFlash2 states until the live
-/// headroom covers its KV and transients, before it parks the live state:
-/// with room it keeps them, with no headroom only the state it parked
-/// itself is left.
+/// A paged AR turn whose pool needs no growth keeps every parked DFlash2
+/// state, with room or with no headroom at all, and parks the live one
+/// beside them: Splash reclaims only inside an allocation that was refused
+/// (Engine.cpp:2056-2104), never before a turn.
+/// Mutation: call `evict_parked_dflash2_for_flat_turn` from
+/// `run_paged_turn` (an up-front eviction) → red (pressure keeps only the
+/// live lineage).
 #[test]
-fn paged_turn_evicts_parked_states_for_its_memory() -> Result<()> {
+fn paged_turn_keeps_parked_states_it_does_not_need() -> Result<()> {
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -539,12 +542,7 @@ fn paged_turn_evicts_parked_states_for_its_memory() -> Result<()> {
                 .entries()
                 .map(|entry| entry.tokens().to_vec())
                 .collect();
-            let want = if pressure {
-                vec![b_history.clone()]
-            } else {
-                vec![a_history.clone(), b_history.clone()]
-            };
-            assert_eq!(lineages, want, "{case}");
+            assert_eq!(lineages, [a_history.clone(), b_history.clone()], "{case}");
         }
     }
     Ok(())

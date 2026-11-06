@@ -167,10 +167,11 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
 
     fn paged_adapter(&self) -> Option<&PagedKVCacheAdapter>;
     fn paged_adapter_mut(&mut self) -> Option<&mut PagedKVCacheAdapter>;
-    /// Frees memory the family holds outside the page pool after the pool
-    /// grow's headroom probe declined. Returns whether anything was freed,
-    /// in which case admission retries the grow once.
-    fn release_memory_for_pool_grow(&mut self) -> bool {
+    /// Frees one item of memory the family holds outside the page pool after
+    /// the pool grow's headroom probe declined. Returns whether anything was
+    /// freed, in which case the caller retries the grow and asks again only
+    /// if it is still declined (Splash's allocate loop, Engine.cpp:2056-2104).
+    fn release_one_for_pool_grow(&mut self) -> bool {
         false
     }
     fn scheduler_cache_available(&self) -> bool {
@@ -2325,12 +2326,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     }
 
     /// Frees memory for a blocked step without preempting `victim`: below
-    /// the max pool, memory the family holds beside the pool (then one pool
-    /// grow, the step's own grow having been declined), then one idle
-    /// owner's blocks. At the max no grow can use freed memory, so nothing
-    /// beside the pool is evicted. True only when free plus reclaimable
-    /// blocks grew, so the blocked rows retry and the loop is bounded by
-    /// what is idle.
+    /// the max pool, one item the family holds beside the pool at a time,
+    /// retrying a one-block grow after each (the step's own grow was
+    /// declined), until one grows; then one idle owner's blocks. At the max
+    /// no grow can use freed memory, so nothing beside the pool is evicted.
+    /// True only when free plus reclaimable blocks grew, so the blocked rows
+    /// retry and the loop is bounded by what is idle.
     fn reclaim_for_blocked_step(&mut self, victim: SeqId) -> bool {
         let snapshot = |state: &Self| state.inner.scheduler_cache_snapshot().ok().flatten();
         let available = |snapshot: &SchedulerCacheSnapshot| {
@@ -2340,14 +2341,16 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return false;
         };
         let before = available(&current);
-        if current.blocks.total_blocks < current.max_total_blocks
-            && self.inner.release_memory_for_pool_grow()
-            && self
-                .inner
-                .paged_adapter_mut()
-                .is_some_and(|adapter| adapter.try_grow_pool(1))
-        {
-            return true;
+        if current.blocks.total_blocks < current.max_total_blocks {
+            while self.inner.release_one_for_pool_grow() {
+                if self
+                    .inner
+                    .paged_adapter_mut()
+                    .is_some_and(|adapter| adapter.try_grow_pool(1))
+                {
+                    return true;
+                }
+            }
         }
         let Some(owner) = self.idle_block_owner(victim) else {
             return false;
@@ -2583,25 +2586,21 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         self.try_grow_pool_by(needed)
     }
 
-    /// Grows the pool by `needed` blocks, evicting memory the family holds
-    /// outside the pool once if the first grow is declined. Returns the
+    /// Grows the pool by `needed` blocks; while the grow is declined, frees
+    /// one item the family holds outside the pool and retries. Returns the
     /// fresh snapshot, or `None` when the pool did not grow.
     fn try_grow_pool_by(&mut self, needed: u32) -> Result<Option<SchedulerCacheSnapshot>> {
-        let Some(adapter) = self.inner.paged_adapter_mut() else {
-            return Ok(None);
-        };
-        if !adapter.try_grow_pool(needed) {
-            if !self.inner.release_memory_for_pool_grow() {
-                return Ok(None);
-            }
+        loop {
             let Some(adapter) = self.inner.paged_adapter_mut() else {
                 return Ok(None);
             };
-            if !adapter.try_grow_pool(needed) {
+            if adapter.try_grow_pool(needed) {
+                return self.inner.scheduler_cache_snapshot();
+            }
+            if !self.inner.release_one_for_pool_grow() {
                 return Ok(None);
             }
         }
-        self.inner.scheduler_cache_snapshot()
     }
 
     fn context_length_exceeded(reservation_blocks: u32, total_blocks: u32) -> Error {
@@ -5198,6 +5197,14 @@ pub(crate) mod tests {
     /// max, a passing grow probe) with one parked DFlash2 state; `None`
     /// without Metal.
     fn qwen35_state_with_a_parked_dflash2_state() -> Option<HybridSchedulerState<Qwen35Inner>> {
+        qwen35_state_with_parked_dflash2_states(2)
+    }
+
+    /// The growable fixture after `turns` DFlash2 turns of distinct prompts:
+    /// `turns - 1` parked states and the last one live.
+    fn qwen35_state_with_parked_dflash2_states(
+        turns: u32,
+    ) -> Option<HybridSchedulerState<Qwen35Inner>> {
         use crate::models::qwen3_5::dflash2_decode::tests::{
             metal_is_default_device, run_tiny_dflash_turn, tiny_int8_dflash_inner,
         };
@@ -5206,12 +5213,12 @@ pub(crate) mod tests {
         }
         let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
         let mut inner = tiny_int8_dflash_inner(0xDFA5_1702);
-        for seed in [4u32, 5] {
+        for seed in 4..4 + turns {
             let body: Vec<u32> = (0..40).map(|i| (seed + i * 7) % 9 + 1).collect();
             run_tiny_dflash_turn(&mut inner, &tokenizer, &body, true, 12)
                 .expect("tiny DFlash2 turn");
         }
-        assert_eq!(parked_dflash2_states(&inner), 1);
+        assert_eq!(parked_dflash2_states(&inner), turns as usize - 1);
         inner.paged_adapter = Some(tiny_growable_paged_adapter());
         let mut state = HybridSchedulerState::new(inner).expect("construct Qwen3.5 scheduler");
         state
@@ -5220,6 +5227,24 @@ pub(crate) mod tests {
             .expect("paged adapter")
             .set_grow_headroom_probe_override(Some(Arc::new(Ok)));
         Some(state)
+    }
+
+    /// Zero live headroom on this thread until dropped, so a store step
+    /// drops a state instead of compacting one.
+    struct NoCompactionHeadroom;
+    impl Drop for NoCompactionHeadroom {
+        fn drop(&mut self) {
+            crate::models::qwen3_5::dflash2_turn::KV_BUDGET_OVERRIDE
+                .with(|budget| budget.set(None));
+        }
+    }
+    fn no_compaction_headroom() -> NoCompactionHeadroom {
+        crate::models::qwen3_5::dflash2_turn::KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(0)));
+        NoCompactionHeadroom
+    }
+
+    fn pool_grow_evictions() -> usize {
+        crate::models::qwen3_5::dflash2_turn::POOL_GROW_EVICTIONS.with(std::cell::Cell::get)
     }
 
     fn parked_dflash2_states(inner: &Qwen35Inner) -> usize {
@@ -5250,6 +5275,132 @@ pub(crate) mod tests {
         assert_eq!(pool_total_blocks(&state), 16);
         assert!(!state.reclaim_for_blocked_step(2));
         assert_eq!(parked_dflash2_states(&state.inner), 1);
+    }
+
+    /// A blocked step below the max pool parks the idle live DFlash2 state,
+    /// evicts one parked state, and grows as soon as the grow passes: the
+    /// other states stay.
+    /// Mutation: drop every parked state at once (`store.clear()` in
+    /// `evict_one_parked_dflash2`) → red (0 ≠ 2).
+    /// Mutation: skip the live-state park in `release_one_for_pool_grow` →
+    /// red (the live context stays).
+    #[test]
+    fn blocked_scheduled_step_evicts_one_then_grows() {
+        let Some(mut state) = qwen35_state_with_parked_dflash2_states(3) else {
+            return;
+        };
+        let _no_compaction = no_compaction_headroom();
+        assert_eq!(parked_dflash2_states(&state.inner), 2);
+        let before = pool_total_blocks(&state);
+        let evictions = pool_grow_evictions();
+        assert!(state.reclaim_for_blocked_step(2));
+        assert_eq!(pool_grow_evictions() - evictions, 1);
+        assert!(pool_total_blocks(&state) > before);
+        assert!(
+            state.inner.dflash2_context.is_none(),
+            "the live state parked"
+        );
+        assert_eq!(parked_dflash2_states(&state.inner), 2);
+    }
+
+    /// A declined admission grow frees one item per retry and stops at the
+    /// first grant: two declines cost the live state's park plus two parked
+    /// states, and one stays.
+    /// Mutation: release once and retry once (the old shape of
+    /// `try_grow_pool_by`) → red (`None`).
+    /// Mutation: drop every parked state at once → red (0 ≠ 1).
+    #[test]
+    fn admission_grow_evicts_one_per_retry() {
+        use std::sync::atomic::AtomicUsize;
+        let Some(mut state) = qwen35_state_with_parked_dflash2_states(3) else {
+            return;
+        };
+        let _no_compaction = no_compaction_headroom();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_calls = Arc::clone(&calls);
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(Arc::new(move |blocks| {
+                Ok(if probe_calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    0
+                } else {
+                    blocks
+                })
+            })));
+        let evictions = pool_grow_evictions();
+        let grown = state
+            .try_grow_pool_by(4)
+            .expect("grow")
+            .expect("the third grow passes");
+        assert!(grown.blocks.total_blocks > 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(pool_grow_evictions() - evictions, 2);
+        assert_eq!(parked_dflash2_states(&state.inner), 1);
+    }
+
+    /// Contention preempts an MTP victim at a long history; alone, it
+    /// resumes into a max pool its replayed rows and its admission state
+    /// charge fill exactly, which draft state re-priced on the whole history
+    /// overflows.
+    /// Mutation: re-price `recurrent_state_bytes` with
+    /// `scheduled_draft_state_bytes` of the booked tokens in
+    /// `book_resume_of_blocked_step` → red (Reject).
+    #[test]
+    fn lone_resume_after_contention_fits_the_max_pool() {
+        let Some((mut state, live)) = growable_qwen35_state() else {
+            return;
+        };
+        let prompt: Vec<u32> = (0..40).map(|token| token % 16).collect();
+        let recurrent = state.inner.recurrent_state_bytes();
+        let admission = recurrent + state.inner.scheduled_draft_state_bytes(56);
+        let mut turn = speculative::tests::request(
+            &mut state.inner,
+            2,
+            prompt,
+            true,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_block_reservation(4, 0, 16)
+        .with_recurrent_state_reservation(admission);
+        turn.payload.requested_tokens = 78_464;
+        state.book_resume_of_blocked_step(&mut turn, 1_000);
+        let blocks = turn.block_reservation_total;
+        let bytes_per_block = live.bytes_per_block;
+        let rows_bytes =
+            u64::from(blocks) * bytes_per_block + state.inner.scheduled_recurrent_bytes();
+        let max_blocks = (rows_bytes + admission).div_ceil(bytes_per_block) as u32;
+        let repriced = recurrent + state.inner.scheduled_draft_state_bytes(blocks * 16);
+        assert!(
+            rows_bytes + repriced > u64::from(max_blocks) * bytes_per_block,
+            "the re-priced charge overflows the max pool"
+        );
+        let snapshot = SchedulerCacheSnapshot {
+            blocks: BlockTelemetry {
+                total_blocks: max_blocks,
+                free_blocks: max_blocks,
+                reclaimable_blocks: 0,
+                allocated_blocks: 0,
+            },
+            max_total_blocks: max_blocks,
+            bytes_per_block,
+        };
+        let outcome = state
+            .try_reserve_with_policy(
+                2,
+                blocks,
+                turn.recurrent_state_bytes,
+                0,
+                snapshot,
+                false,
+                <Qwen35Inner as HybridSchedulerBackend>::release_scheduled_cache,
+            )
+            .expect("resume decision");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "{outcome:?}"
+        );
     }
 
     /// A preempted MTP victim books blocks for its replayed history and keeps

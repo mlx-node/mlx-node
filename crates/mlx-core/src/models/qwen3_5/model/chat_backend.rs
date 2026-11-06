@@ -385,11 +385,6 @@ impl ChatBackend for Qwen35Inner {
         // the streaming eager-MTP path.
         debug_assert!(args.plan.use_paged_attention);
         debug_assert!(self.paged_adapter.is_some());
-        crate::models::qwen3_5::dflash2_turn::evict_parked_dflash2_for_turn(
-            self,
-            args.tokens.len(),
-            args.params.max_new_tokens,
-        );
         self.paged_whole_turn(args)
     }
 
@@ -402,14 +397,7 @@ impl ChatBackend for Qwen35Inner {
             DecoderPlan::Speculative(SpeculativeKind::DraftModel) => {
                 crate::models::qwen3_5::dflash2_turn::dflash2_chat_turn(self, args)
             }
-            DecoderPlan::Speculative(SpeculativeKind::NativeMtp) => {
-                crate::models::qwen3_5::dflash2_turn::evict_parked_dflash2_for_turn(
-                    self,
-                    args.tokens.len(),
-                    args.params.max_new_tokens,
-                );
-                self.dense_whole_turn(args)
-            }
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp) => self.dense_whole_turn(args),
             _ => Err(Error::from_reason(
                 "Qwen3.5 speculative turn received a non-speculative decoder plan",
             )),
@@ -419,11 +407,12 @@ impl ChatBackend for Qwen35Inner {
     fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         // The dense cores own the full image pipeline (VLM prefill, M-RoPE
         // deltas, paged-backend validation, missing-encoder error).
-        crate::models::qwen3_5::dflash2_turn::evict_parked_dflash2_for_turn(
-            self,
-            args.tokens.len(),
-            args.params.max_new_tokens,
-        );
+        if self.paged_adapter.is_none() {
+            crate::models::qwen3_5::dflash2_turn::evict_parked_dflash2_for_flat_turn(
+                self,
+                args.tokens.len(),
+            );
+        }
         self.dense_whole_turn(args)
     }
 }
