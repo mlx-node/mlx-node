@@ -2317,8 +2317,7 @@ pub(crate) async fn load_with_source(
                 inner.image_processor.is_some(),
                 paged_active,
             );
-            inner.freeze_dflash2_window()?;
-            let context_limits = inner.context_limits_snapshot();
+            let context_limits = inner.finish_load_limits()?;
 
             Ok((
                 Qwen35MoeSchedulerState::new(inner)?,

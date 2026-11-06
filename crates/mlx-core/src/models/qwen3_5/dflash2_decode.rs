@@ -3771,6 +3771,46 @@ pub(crate) mod tests {
         assert!(inner.dflash2_context.is_some(), "draft context kept");
     }
 
+    /// Gate: a DFlash2 turn clamps on the window frozen at load. A prompt
+    /// that fills it is rejected before the prefill; one row less runs.
+    /// Mutation: pass `None` for `target.dflash2_window()` in
+    /// `dflash2_chat_turn` → red.
+    #[test]
+    fn dflash2_chat_turn_rejects_prompt_past_the_published_window() -> Result<()> {
+        if !metal_is_default_device() {
+            return Ok(());
+        }
+        let window = |pool| DFlash2WindowTerms {
+            trained: u32::MAX,
+            draft_trained: u32::MAX,
+            pool: Some(pool),
+            reserve: None,
+            row_bytes: 1,
+            extent_rows: 256,
+        };
+        let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
+        let mut inner = tiny_dflash_inner(0xDFA5_220B);
+        reset_flat_fixture(&mut inner);
+        inner.dflash2_window = Some(window(4));
+        assert_eq!(DFlash2Target::dflash2_window(&inner), Some(4));
+        let err = match run_tiny_dflash_turn(&mut inner, &tokenizer, &[1, 2, 3, 4], false, 1) {
+            Ok(_) => panic!("a prompt that fills the published window must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.reason.starts_with("context_length_exceeded")
+                && err.reason.contains("effective active context is 4 tokens"),
+            "{}",
+            err.reason
+        );
+        assert_eq!(flat_attention_frontier(&inner), Some(0), "no prefill chunk");
+
+        inner.dflash2_window = Some(window(5));
+        let result = run_tiny_dflash_turn(&mut inner, &tokenizer, &[1, 2, 3, 4], false, 8)?;
+        assert_eq!(result.num_tokens, 1, "the window leaves one output row");
+        Ok(())
+    }
+
     /// The greedy config [`run_tiny_dflash_turn`] runs a turn with.
     pub(crate) fn tiny_dflash_turn_config(reuse_cache: bool, max_new_tokens: i32) -> ChatConfig {
         ChatConfig {

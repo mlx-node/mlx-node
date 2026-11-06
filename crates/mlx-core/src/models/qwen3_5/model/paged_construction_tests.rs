@@ -307,6 +307,74 @@ fn dflash2_pool_budget_counts_allocated_blocks_once() {
     );
 }
 
+/// Gate: the load limits freeze the DFlash2 window from the paged pool's
+/// unallocated budget and publish it as the speculative window.
+/// Mutation: pass `None` for the pool in `freeze_dflash2_window` → red.
+/// Mutation: drop the freeze from `finish_load_limits` → red.
+#[test]
+fn freeze_dflash2_window_publishes_pool_terms() {
+    const BLOCK_SIZE: u32 = 16;
+    let pool_config = mlx_paged_attn::PagedAttentionConfig {
+        block_size: BLOCK_SIZE,
+        num_kv_heads: 1,
+        head_size: 32,
+        num_layers: 2,
+        ..mlx_paged_attn::PagedAttentionConfig::default()
+    };
+    let pool = match mlx_paged_attn::LayerKVPool::new(
+        pool_config,
+        3,
+        8,
+        mlx_paged_attn::metal::MetalDtype::Float16,
+    ) {
+        Ok(pool) => Arc::new(pool),
+        Err(err) if crate::test_support::metal_device_absent(&err) => {
+            eprintln!("skipping freeze_dflash2_window_publishes_pool_terms: {err}");
+            return;
+        }
+        Err(err) => panic!("unexpected LayerKVPool::new failure: {err}"),
+    };
+    let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
+        3, 8, BLOCK_SIZE,
+    )));
+    let adapter =
+        PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE).expect("test adapter constructs");
+    let mut inner = Qwen35Inner::new(tiny_cfg(true)).expect("construct tiny model");
+    inner.paged_adapter = Some(adapter);
+
+    let limits = inner
+        .finish_load_limits()
+        .expect("load limits without a draft");
+    assert_eq!(inner.dflash2_window, None);
+    assert_eq!(limits.speculative_window_tokens, None);
+
+    inner.dflash2 = Some(
+        crate::models::qwen3_5::dflash2::tiny_dflash2_model_for_stepper_test(&inner.config)
+            .expect("tiny DFlash2 companion"),
+    );
+    let limits = inner
+        .finish_load_limits()
+        .expect("load limits with a draft");
+    let budget = crate::models::qwen3_5::dflash2_turn::dflash2_pool_budget(
+        inner.paged_adapter.as_ref().expect("adapter"),
+        inner.config.recurrent_state_bytes(),
+    )
+    .expect("pool budget");
+    assert!(budget.bytes > 0, "a growable pool leaves unallocated bytes");
+    let expected =
+        crate::models::qwen3_5::dflash2_turn::dflash2_published_window(&inner, Some(budget))
+            .expect("published window")
+            .expect("a draft publishes a window");
+    let frozen = inner.dflash2_window.expect("a frozen DFlash2 window");
+    assert!(frozen.pool.is_some());
+    assert_eq!(frozen.pool, expected.pool);
+    assert_eq!(frozen.extent_rows, expected.extent_rows);
+    assert_eq!(frozen.row_bytes, expected.row_bytes);
+    assert_eq!(frozen.reserve.is_some(), expected.reserve.is_some());
+    assert_eq!(limits.speculative_window_tokens, inner.speculative_window());
+    assert!(limits.speculative_window_tokens.is_some());
+}
+
 #[test]
 fn paged_context_limits_and_preflight_use_scheduler_usable_window() {
     let Some(inner) = dense_inner_with_test_adapter_or_skip(
