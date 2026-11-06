@@ -836,6 +836,8 @@ pub(crate) enum KvGrowthPhase {
 pub(crate) struct KvGrowth {
     pub(crate) grew: bool,
     pub(crate) evicted: EvictReport,
+    /// Bytes the paged pool gave back for the growth.
+    pub(crate) released_pool_bytes: u64,
 }
 
 fn add_eviction(total: &mut EvictReport, step: EvictReport) {
@@ -853,11 +855,11 @@ fn add_eviction(total: &mut EvictReport, step: EvictReport) {
 /// `needed` are written, every full-attention cache holds them. A growth
 /// takes [`DFlash2KvPlan::target_rows`] and goes ahead once the live
 /// headroom's budget covers its KV (the new rows plus one layer's copy) and
-/// the headroom also covers the transients of `phase`; until then parked
-/// states are evicted one step at a time, the headroom read again after
-/// each. With none left the KV alone must fit, else the turn fails with
-/// `context_length_exceeded` and nothing changes. Unreadable limits grow
-/// unchecked.
+/// the headroom also covers the transients of `phase`; until then memory is
+/// reclaimed one step at a time ([`reclaim_one_for_dflash2_kv`]), the
+/// headroom read again after each. With nothing left the KV alone must fit,
+/// else the turn fails with `context_length_exceeded` and the KV is
+/// unchanged. Unreadable limits grow unchecked.
 pub(crate) fn ensure_dflash2_target_rows<T: DFlash2Target>(
     target: &mut T,
     needed: i64,
@@ -934,7 +936,7 @@ pub(crate) fn ensure_dflash2_target_rows_with<T: DFlash2Target>(
 }
 
 /// [`ensure_dflash2_target_rows_with`] with a refused growth as the inner
-/// `Err`: the KV is unchanged. Parked states are evicted for it only when
+/// `Err`: the KV is unchanged. Memory is reclaimed for it only when
 /// `reclaim` is set.
 fn try_ensure_dflash2_target_rows_with<T: DFlash2Target>(
     target: &mut T,
@@ -955,10 +957,13 @@ fn try_ensure_dflash2_target_rows_with<T: DFlash2Target>(
         });
         if !grows && let Some(live) = live {
             if reclaim
-                && let Some(step) = target.dflash2_states_mut().store.evict_one(live, None)?
+                && let Some(step) = reclaim_one_for_dflash2_kv(
+                    target,
+                    live,
+                    dflash2_kv_growth_shortfall(live, &need),
+                )?
             {
-                add_eviction(&mut growth.evicted, step);
-                crate::array::clear_cache();
+                add_reclaimed(&mut growth, step);
                 continue;
             }
             if dflash2_kv_budget_of(live) < need.kv_bytes {
@@ -984,10 +989,78 @@ fn try_ensure_dflash2_target_rows_with<T: DFlash2Target>(
             evicted_states = growth.evicted.demoted
                 + growth.evicted.dropped_captures
                 + growth.evicted.dropped_ends,
+            released_pool_bytes = growth.released_pool_bytes,
             "DFlash2 target KV growth"
         );
         growth.grew = true;
         return Ok(Ok(growth));
+    }
+}
+
+/// Bytes a growth needing `need` is short of in `live` headroom.
+pub(crate) fn dflash2_kv_growth_shortfall(live: u64, need: &KvGrowthNeed) -> u64 {
+    dflash2_kv_headroom_for(need.kv_bytes)
+        .saturating_add(need.transient_bytes)
+        .saturating_sub(live)
+}
+
+/// What one [`reclaim_one_for_dflash2_kv`] step gave back.
+enum Reclaimed {
+    Pool(u64),
+    State(EvictReport),
+}
+
+/// One reclaim step for DFlash2 target KV memory the live headroom refused,
+/// `shortfall` bytes short, in Splash's order for a state's memory
+/// (`Cache::reclaimForMemory`, Cache.cpp:704-726): free paged pool extents
+/// first, which loses nothing; then one parked state; then the idle paged
+/// requests go and the pool's oldest cached leaf blocks with them until
+/// extents empty, never below the pool's runway. A turn here runs alone, so
+/// with nothing left the caller fails as Splash's lone lane does
+/// (Engine.cpp:2040-2054). A cut's one-layer copy comes out of the process
+/// reserve the live headroom keeps back; a refused buffer declines it.
+/// `None` when nothing is left.
+fn reclaim_one_for_dflash2_kv<T: DFlash2Target>(
+    target: &mut T,
+    live: u64,
+    shortfall: u64,
+) -> Result<Option<Reclaimed>> {
+    let pool_cuttable = |target: &T| {
+        target
+            .paged_adapter_ref()
+            .is_some_and(|adapter| adapter.grows_by_extent())
+    };
+    if pool_cuttable(target)
+        && let Some(adapter) = target.paged_adapter_mut_ref()
+    {
+        let released = adapter.try_release_pool_extents(shortfall, false);
+        if released > 0 {
+            return Ok(Some(Reclaimed::Pool(released)));
+        }
+    }
+    if let Some(step) = target.dflash2_states_mut().store.evict_one(live, None)? {
+        return Ok(Some(Reclaimed::State(step)));
+    }
+    if !pool_cuttable(target) {
+        return Ok(None);
+    }
+    target.release_paged_requests()?;
+    let released = target.paged_adapter_mut_ref().map_or(0, |adapter| {
+        adapter.try_release_pool_extents(shortfall, true)
+    });
+    Ok((released > 0).then_some(Reclaimed::Pool(released)))
+}
+
+/// Folds one reclaim step into `growth`.
+fn add_reclaimed(growth: &mut KvGrowth, step: Reclaimed) {
+    match step {
+        Reclaimed::Pool(bytes) => {
+            growth.released_pool_bytes = growth.released_pool_bytes.saturating_add(bytes);
+        }
+        Reclaimed::State(step) => {
+            add_eviction(&mut growth.evicted, step);
+            crate::array::clear_cache();
+        }
     }
 }
 
@@ -1028,15 +1101,14 @@ pub(crate) fn reserve_dflash2_turn_kv<T: DFlash2Target>(
     )?;
     add_eviction(&mut growth.evicted, over_budget);
     // The turn's transients have no fixed reservation here, unlike Splash's
-    // scratch: parked KV gives way to them, best effort.
+    // scratch: reclaimed memory gives way to them, best effort.
     if let Some(rows) = min_fa_reserved_rows(target.caches())? {
         let transient = turn_memory(target, prompt_len, rows.max(0) as u64)?.1;
         while let Some(live) = dflash2_kv_headroom_now().filter(|&live| live < transient) {
-            let Some(step) = target.dflash2_states_mut().store.evict_one(live, None)? else {
+            let Some(step) = reclaim_one_for_dflash2_kv(target, live, transient - live)? else {
                 break;
             };
-            add_eviction(&mut growth.evicted, step);
-            crate::array::clear_cache();
+            add_reclaimed(&mut growth, step);
         }
     }
     if growth.evicted.freed_kv_bytes > 0 || growth.evicted.freed_state_bytes > 0 {
@@ -1052,6 +1124,7 @@ pub(crate) fn reserve_dflash2_turn_kv<T: DFlash2Target>(
             + growth.evicted.dropped_captures
             + growth.evicted.dropped_ends,
         freed_kv_bytes = growth.evicted.freed_kv_bytes,
+        released_pool_bytes = growth.released_pool_bytes,
         "DFlash2 target KV reservation"
     );
     Ok(growth.evicted)
@@ -2631,6 +2704,208 @@ mod tests {
             assert_eq!(min_fa_capacity(&inner.caches)?, Some(256), "{name}");
             assert_eq!(flat_attention_frontier(&inner), offset, "{name}");
         }
+        Ok(())
+    }
+
+    /// Blocks of one pool extent in the AR-growth fixtures.
+    const POOL_EXTENT: u32 = 4;
+
+    /// The int8 fixture after `turns` DFlash2 turns, on a draft-loaded
+    /// runway pool of `POOL_EXTENT`-block extents that an AR request grew by
+    /// one extent and released, its blocks cached as a prefix when `cached`.
+    /// Returns the runway's blocks and bytes and the AR tokens.
+    fn ar_grown_runway(turns: u32, cached: bool) -> Result<(Qwen35Inner, u32, u64, Vec<u32>)> {
+        let tokenizer = tokenizer();
+        let mut inner = fixture("int8_d256");
+        for seed in 4..4 + turns {
+            turn(&mut inner, &tokenizer, &body(seed, 40));
+        }
+        inner.config.paged_cache_memory_mb = Some(256);
+        inner.paged_adapter = None;
+        inner.initialize_paged_adapter()?;
+        let adapter = inner.paged_adapter.as_mut().expect("paged adapter");
+        assert!(
+            adapter.grows_by_extent(),
+            "a draft-loaded pool starts at the runway"
+        );
+        adapter.set_extent_growth(POOL_EXTENT);
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        let runway = adapter
+            .block_telemetry()
+            .map_err(Error::from_reason)?
+            .total_blocks;
+        let block_size = adapter.block_size();
+        let runway_bytes =
+            u64::from(runway) * adapter.bytes_per_block().map_err(Error::from_reason)?;
+        let tokens: Vec<u32> = (0..(runway + POOL_EXTENT) * block_size)
+            .map(|i| i % 13 + 1)
+            .collect();
+        adapter
+            .reset_for_new_request(1)
+            .map_err(Error::from_reason)?;
+        adapter
+            .allocate_suffix_blocks(tokens.len() as u32)
+            .map_err(Error::from_reason)?;
+        adapter.record_tokens(&tokens).map_err(Error::from_reason)?;
+        if cached {
+            adapter
+                .register_full_blocks_for_reuse(&[], 0)
+                .map_err(Error::from_reason)?;
+        }
+        let blocks = adapter.block_telemetry().map_err(Error::from_reason)?;
+        assert_eq!(blocks.total_blocks, runway + POOL_EXTENT);
+        Ok((inner, runway, runway_bytes, tokens))
+    }
+
+    fn pool_blocks(inner: &Qwen35Inner) -> u32 {
+        inner
+            .paged_adapter
+            .as_ref()
+            .expect("paged adapter")
+            .layer_kv_pool()
+            .num_blocks()
+    }
+
+    fn pool_bytes(inner: &Qwen35Inner) -> u64 {
+        inner
+            .paged_adapter
+            .as_ref()
+            .map_or(0, |adapter| adapter.layer_kv_pool().total_bytes())
+    }
+
+    /// Tokens of `tokens` the pool's prefix cache still hits.
+    fn cached_prefix(inner: &Qwen35Inner, tokens: &[u32]) -> usize {
+        let adapter = inner.paged_adapter.as_ref().expect("paged adapter");
+        let mut allocator = adapter.allocator().lock().expect("allocator");
+        let (hit, cached) = allocator.find_longest_cache_hit(tokens, adapter.block_size(), &[], 0);
+        for block in hit {
+            allocator.free(block);
+        }
+        cached
+    }
+
+    const KV_PLAN: DFlash2KvPlan = DFlash2KvPlan {
+        cap_rows: 1_000,
+        extent_rows: 256,
+    };
+
+    /// An AR turn grew the runway pool by one cached extent and kept its
+    /// request; a DFlash2 turn's booking that fits only once that extent is
+    /// gone releases the request, evicts the extent's cached leaf blocks,
+    /// cuts the pool back to the runway and grows; the AR prefix's head
+    /// still hits. Mutation: skip both pool steps in
+    /// `reclaim_one_for_dflash2_kv` → red (pool not cut).
+    #[test]
+    fn ar_growth_then_dflash2_booking_reclaims_the_pool() -> Result<()> {
+        if !metal_is_default_device() {
+            return Ok(());
+        }
+        let (mut inner, runway, runway_bytes, tokens) = ar_grown_runway(1, true)?;
+        let phase = KvGrowthPhase::TurnStart { prompt_len: 280 };
+        let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
+        let base = dflash2_kv_headroom_for(need.kv_bytes) + need.transient_bytes + runway_bytes;
+        let growth = ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {
+            Some(base.saturating_sub(pool_bytes(inner)))
+        })?;
+        assert!(growth.grew);
+        assert_eq!(pool_blocks(&inner), runway);
+        assert_eq!(pool_bytes(&inner), runway_bytes);
+        assert!(growth.released_pool_bytes > 0);
+        assert_eq!(min_fa_capacity(&inner.caches)?, Some(512));
+        let block_size = inner.paged_adapter.as_ref().expect("adapter").block_size();
+        assert_eq!(
+            cached_prefix(&inner, &tokens),
+            (runway * block_size) as usize,
+            "the AR prefix keeps its head"
+        );
+        Ok(())
+    }
+
+    /// [`ar_growth_then_dflash2_booking_reclaims_the_pool`] for the growth a
+    /// verify makes (`DFlash2DecodeKv::ensure_ahead`'s phase). Mutation: run
+    /// the pool steps only for `KvGrowthPhase::TurnStart` in
+    /// `try_ensure_dflash2_target_rows_with` → red (pool not cut).
+    #[test]
+    fn decode_growth_after_ar_growth_reclaims_the_pool() -> Result<()> {
+        if !metal_is_default_device() {
+            return Ok(());
+        }
+        let (mut inner, runway, runway_bytes, _) = ar_grown_runway(1, true)?;
+        let phase = KvGrowthPhase::Decode;
+        let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
+        let base = dflash2_kv_headroom_for(need.kv_bytes) + need.transient_bytes + runway_bytes;
+        let growth = ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {
+            Some(base.saturating_sub(pool_bytes(inner)))
+        })?;
+        assert!(growth.grew);
+        assert_eq!(pool_blocks(&inner), runway);
+        assert_eq!(min_fa_capacity(&inner.caches)?, Some(512));
+        Ok(())
+    }
+
+    /// One parked state and a free pool tail that covers the shortfall: the
+    /// tail extent goes and the state stays, as Splash releases free
+    /// extents before any victim. Mutation: try the parked state before the
+    /// free extents in `reclaim_one_for_dflash2_kv` → red (the state is
+    /// evicted).
+    #[test]
+    fn free_pool_extents_go_before_parked_states() -> Result<()> {
+        if !metal_is_default_device() {
+            return Ok(());
+        }
+        let (mut inner, runway, runway_bytes, _) = ar_grown_runway(2, false)?;
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("adapter")
+            .release_request()
+            .map_err(Error::from_reason)?;
+        assert_eq!(inner.dflash2_states.store.bytes().entries, 1);
+        let held = |inner: &Qwen35Inner| {
+            let bytes = inner.dflash2_states.store.bytes();
+            bytes.kv_bytes + bytes.state_bytes
+        };
+        let start = held(&inner);
+        let phase = KvGrowthPhase::Decode;
+        let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
+        let base = dflash2_kv_headroom_for(need.kv_bytes) + need.transient_bytes + runway_bytes;
+        let growth = ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {
+            Some(base.saturating_sub(pool_bytes(inner)) + (start - held(inner)))
+        })?;
+        assert!(growth.grew);
+        assert_eq!(pool_blocks(&inner), runway);
+        assert_eq!(
+            inner.dflash2_states.store.bytes().entries,
+            1,
+            "the state stays"
+        );
+        Ok(())
+    }
+
+    /// A headroom too small even with the pool back at its runway: the pool
+    /// stops at the runway and the growth fails, the KV unchanged.
+    /// Mutation: record a 1-block floor in `set_extent_growth` → red (pool
+    /// below the runway).
+    #[test]
+    fn pool_reclaim_stops_at_the_runway() -> Result<()> {
+        if !metal_is_default_device() {
+            return Ok(());
+        }
+        let (mut inner, runway, runway_bytes, _) = ar_grown_runway(1, true)?;
+        let phase = KvGrowthPhase::Decode;
+        let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
+        let base = dflash2_kv_headroom_for(need.kv_bytes) - 10 + runway_bytes;
+        let error = ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {
+            Some(base.saturating_sub(pool_bytes(inner)))
+        })
+        .expect_err("no room even at the runway");
+        assert!(
+            error.reason.starts_with("context_length_exceeded: "),
+            "{}",
+            error.reason
+        );
+        assert_eq!(pool_blocks(&inner), runway);
+        assert_eq!(min_fa_capacity(&inner.caches)?, Some(256));
         Ok(())
     }
 

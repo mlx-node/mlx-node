@@ -3194,6 +3194,47 @@ pub(crate) mod tests {
         assert_eq!(terms.window(), 139_257);
     }
 
+    /// Gate: on the M3 Pro inputs, after a 60,000-token AR turn grew the
+    /// runway pool from 275 to 3,859 blocks (3,923 MiB registered with the
+    /// restore staging), a 100,000-token DFlash2 booking (25 extents of
+    /// 4,096 rows, 3,407,872,000 bytes) is refused; its shortfall takes 6
+    /// pool extents of 128 MiB, and the pool cut to 3,091 blocks books it.
+    /// Mutation: round the extent count down in `pool_extents_for_bytes` →
+    /// red (5 extents, still refused).
+    #[test]
+    fn m3_pro_ar_growth_refuses_100k_and_six_extents_restore_it() {
+        use crate::models::qwen3_5::dflash2_turn::{KvGrowthNeed, dflash2_kv_growth_shortfall};
+        use crate::transformer::paged_kv_cache_adapter::pool_extents_for_bytes;
+        let working_set = 27 * GIB;
+        let snapshot = |pool_blocks: u64| PagedPrefillMemorySnapshot {
+            allocator_active_bytes: Some(17_357 * MIB),
+            allocator_cached_bytes: Some(0),
+            allocator_limit_bytes: Some(working_set),
+            metal_recommended_working_set_bytes: Some(working_set),
+            metal_current_allocated_bytes: None,
+            paged_pool_allocated_bytes: Some((pool_blocks + 64) * MIB),
+        };
+        let need = KvGrowthNeed {
+            from_rows: 0,
+            rows: 102_400,
+            kv_bytes: 102_400 * 33_280,
+            transient_bytes: 0,
+        };
+        assert_eq!(need.kv_bytes, 3_407_872_000);
+        let live = dflash2_kv_headroom_bytes(snapshot(3_859)).expect("readable limits");
+        assert_eq!(live, 3_080_296_857);
+        assert_eq!(dflash2_kv_budget_of(live), 2_772_267_165);
+        assert!(dflash2_kv_budget_of(live) < need.kv_bytes, "refused");
+        let extents = pool_extents_for_bytes(dflash2_kv_growth_shortfall(live, &need), 128 * MIB);
+        assert_eq!(extents, 6);
+        let blocks = 3_859 - u64::from(extents) * 128;
+        assert_eq!(blocks, 3_091);
+        let after = dflash2_kv_headroom_bytes(snapshot(blocks)).expect("readable limits");
+        assert_eq!(after, 3_885_603_225);
+        assert_eq!(dflash2_kv_budget_of(after), 3_497_042_898);
+        assert!(after >= dflash2_kv_headroom_for(need.kv_bytes), "books");
+    }
+
     /// Gate: the headroom the reserve term reads at load holds no lane yet;
     /// a turn's lane takes it before the KV grows. A flat load (no pool)
     /// with 2 GiB of headroom publishes a window whose turn grows its KV in
