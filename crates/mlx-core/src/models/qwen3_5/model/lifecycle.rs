@@ -403,7 +403,7 @@ impl Qwen35Inner {
     }
 
     /// The window a DFlash2 turn clamps on, fixed at load by
-    /// [`Self::freeze_dflash2_window`]; `None` without a draft.
+    /// [`Self::finish_load_limits`]; `None` without a draft.
     pub(crate) fn speculative_window(&self) -> Option<u32> {
         let trained = self.config.max_position_embeddings.max(0) as u32;
         self.dflash2_window.map(|terms| {
@@ -429,10 +429,20 @@ impl Qwen35Inner {
         )
     }
 
+    /// The context limits a load publishes: the DFlash2 window frozen first,
+    /// then the snapshot that carries it. Runs once the paged pool is
+    /// registered with the cache-limit coordinator.
+    pub(crate) fn finish_load_limits(
+        &mut self,
+    ) -> Result<crate::models::qwen3_5::model::Qwen3_5ContextLimits> {
+        self.freeze_dflash2_window()?;
+        Ok(self.context_limits_snapshot())
+    }
+
     /// Fix the DFlash2 window at load, after the paged pool is registered
     /// with the cache-limit coordinator (its reservation term reads the live
     /// headroom). A no-op without a draft.
-    pub(crate) fn freeze_dflash2_window(&mut self) -> Result<()> {
+    fn freeze_dflash2_window(&mut self) -> Result<()> {
         let pool = self
             .paged_adapter
             .as_ref()

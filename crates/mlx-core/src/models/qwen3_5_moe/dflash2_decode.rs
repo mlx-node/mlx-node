@@ -2637,6 +2637,46 @@ mod tests {
         assert_eq!(flat_attention_frontier(&inner), Some(0), "no prefill chunk");
     }
 
+    /// Gate: a DFlash2 turn clamps on the window frozen at load. A prompt
+    /// that fills it is rejected before the prefill; one row less runs.
+    /// Mutation: pass `None` for `target.dflash2_window()` in
+    /// `dflash2_chat_turn` → red.
+    #[test]
+    fn dflash2_chat_turn_rejects_prompt_past_the_published_window() -> Result<()> {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        let window = |pool| crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms {
+            trained: u32::MAX,
+            draft_trained: u32::MAX,
+            pool: Some(pool),
+            reserve: None,
+            row_bytes: 1,
+            extent_rows: 256,
+        };
+        let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
+        let mut inner = tiny_dflash_inner(0xDFA5_350B);
+        reset_flat_fixture(&mut inner);
+        inner.dflash2_window = Some(window(4));
+        assert_eq!(DFlash2Target::dflash2_window(&inner), Some(4));
+        let err = match run_tiny_dflash_turn(&mut inner, &tokenizer, &[1, 2, 3, 4], false, 1) {
+            Ok(_) => panic!("a prompt that fills the published window must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.reason.starts_with("context_length_exceeded")
+                && err.reason.contains("effective active context is 4 tokens"),
+            "{}",
+            err.reason
+        );
+        assert_eq!(flat_attention_frontier(&inner), Some(0), "no prefill chunk");
+
+        inner.dflash2_window = Some(window(5));
+        let result = run_tiny_dflash_turn(&mut inner, &tokenizer, &[1, 2, 3, 4], false, 8)?;
+        assert_eq!(result.num_tokens, 1, "the window leaves one output row");
+        Ok(())
+    }
+
     #[test]
     fn dflash2_golden_traces() -> Result<()> {
         use crate::models::qwen3_5::dflash2_decode::tests::{
