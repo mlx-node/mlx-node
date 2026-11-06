@@ -426,20 +426,36 @@ pub struct Qwen3_5ContextLimits {
     pub paged_block_size: u32,
     pub speculative_window_tokens: Option<u32>,
     /// The output budget fills the window: a prompt leaves room for one new
-    /// token, the budget is clamped to `window - prompt`, and an omitted
-    /// budget is the rest of the window.
+    /// token and the budget is clamped to `window - prompt`.
     pub rest_of_window_output_budget: bool,
+    /// An omitted budget on `effective_window_tokens` is the rest of that
+    /// window. Set only when a paged pool sizes the window from memory; a
+    /// flat load's window is the trained length, so it keeps the native
+    /// default.
+    pub omitted_budget_is_rest_of_window: bool,
+    /// The same for `speculative_window_tokens`: set when that window has a
+    /// memory term (the pool or the live reservation).
+    pub speculative_omitted_budget_is_rest_of_window: bool,
 }
 
 impl Qwen3_5ContextLimits {
-    pub(crate) fn from_parts(value: (u32, u32, u32, u32), speculative: Option<u32>) -> Self {
+    /// `speculative` is the DFlash2 window and whether a memory term bounds
+    /// it; `memory_window` whether a paged pool sizes the effective window.
+    pub(crate) fn from_parts(
+        value: (u32, u32, u32, u32),
+        speculative: Option<(u32, bool)>,
+        memory_window: bool,
+    ) -> Self {
         Self {
             trained_window_tokens: value.0,
             effective_window_tokens: value.1,
             paged_block_capacity: value.2,
             paged_block_size: value.3,
-            speculative_window_tokens: speculative,
+            speculative_window_tokens: speculative.map(|(window, _)| window),
             rest_of_window_output_budget: true,
+            omitted_budget_is_rest_of_window: memory_window,
+            speculative_omitted_budget_is_rest_of_window: speculative
+                .is_some_and(|(_, memory_bound)| memory_bound),
         }
     }
 }

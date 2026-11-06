@@ -418,9 +418,14 @@ impl Qwen35Inner {
     pub(crate) fn context_limits_snapshot(
         &self,
     ) -> crate::models::qwen3_5::model::Qwen3_5ContextLimits {
+        let memory_bound = self
+            .dflash2_window
+            .is_some_and(|terms| terms.pool.is_some() || terms.reserve.is_some());
         crate::models::qwen3_5::model::Qwen3_5ContextLimits::from_parts(
             self.paged_context_limits(),
-            self.speculative_window(),
+            self.speculative_window()
+                .map(|window| (window, memory_bound)),
+            self.paged_adapter.is_some(),
         )
     }
 

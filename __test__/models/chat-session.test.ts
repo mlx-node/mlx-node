@@ -3452,6 +3452,7 @@ describe('ChatSession', () => {
       capacity: number,
       promptTokens: number,
       restOfWindowOutputBudget = true,
+      omittedBudgetIsRestOfWindow = restOfWindowOutputBudget,
     ): SessionCapableModel {
       return {
         ...model,
@@ -3461,6 +3462,7 @@ describe('ChatSession', () => {
           pagedBlockCapacity: capacity / 16,
           pagedBlockSize: 16,
           restOfWindowOutputBudget,
+          omittedBudgetIsRestOfWindow,
         }),
         applyChatTemplate: vi.fn(() => new Uint32Array(promptTokens)),
       };
@@ -3534,6 +3536,24 @@ describe('ChatSession', () => {
       await session.send('hello');
 
       expect(mock.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBe(3996);
+    });
+
+    // Mutation: fill an omitted budget whenever `restOfWindowOutputBudget` is
+    // set → red (3996 ≠ undefined).
+    it('keeps the native default for an omitted budget on a window not sized from memory', async () => {
+      const fits = makeMockModel();
+      await new ChatSession(withCapacity(fits.model, 4096, 100, true, false)).send('hello');
+      expect(fits.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBeUndefined();
+
+      const short = makeMockModel();
+      await new ChatSession(withCapacity(short.model, 128, 80, true, false)).send('hello');
+      expect(short.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBe(48);
+
+      const explicit = makeMockModel();
+      await new ChatSession(withCapacity(explicit.model, 128, 100, true, false)).send('hello', {
+        config: { maxNewTokens: 64 },
+      });
+      expect(explicit.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBe(28);
     });
 
     it('leaves an explicit budget inside the window unchanged', async () => {
@@ -3720,6 +3740,8 @@ describe('ChatSession', () => {
             pagedBlockSize: 16,
             speculativeWindowTokens: speculative,
             restOfWindowOutputBudget: true,
+            omittedBudgetIsRestOfWindow: true,
+            speculativeOmittedBudgetIsRestOfWindow: true,
           }),
           applyChatTemplate: vi.fn(() => new Uint32Array(promptTokens)),
           ...extra,
@@ -3755,6 +3777,37 @@ describe('ChatSession', () => {
         const omitted = await auto.preflightContextCapacity(messages);
         expect(omitted.enableMtp).toBe(true);
         expect(omitted.maxNewTokens).toBe(16);
+      });
+
+      // A flat load: the pool-less window is the trained length, the DFlash2
+      // window has a memory term.
+      // Mutation: read `omittedBudgetIsRestOfWindow` for both lanes → red
+      // (undefined ≠ 8112). Mutation: read the speculative flag for both → red
+      // (4016 ≠ undefined).
+      it('fills an omitted budget only on the window memory sizes', async () => {
+        const mock = makeMockModel();
+        const flat = (limits: Partial<ReturnType<NonNullable<SessionCapableModel['contextLimits']>>>) =>
+          new ChatSession({
+            ...mock.model,
+            contextLimits: () => ({
+              trainedWindowTokens: 4096,
+              effectiveWindowTokens: 4096,
+              pagedBlockCapacity: 0,
+              pagedBlockSize: 0,
+              speculativeWindowTokens: 8192,
+              restOfWindowOutputBudget: true,
+              omittedBudgetIsRestOfWindow: false,
+              speculativeOmittedBudgetIsRestOfWindow: true,
+              ...limits,
+            }),
+            applyChatTemplate: vi.fn(() => new Uint32Array(80)),
+          });
+        const messages: ChatMessage[] = [{ role: 'user', content: 'flat' }];
+
+        const speculative = await flat({}).preflightContextCapacity(messages, { enableMtp: true });
+        expect(speculative.maxNewTokens).toBe(8112);
+        const ar = await flat({}).preflightContextCapacity(messages, { enableMtp: false });
+        expect(ar.maxNewTokens).toBeUndefined();
       });
 
       // Mutation: always use `effectiveWindowTokens` → red (resolves with 8 tokens).

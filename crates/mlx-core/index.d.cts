@@ -5247,10 +5247,21 @@ export interface Qwen35ContextLimits {
   speculativeWindowTokens?: number;
   /**
    * The output budget fills the window: a prompt leaves room for one new
-   * token, the budget is clamped to `window - prompt`, and an omitted
-   * budget is the rest of the window.
+   * token and the budget is clamped to `window - prompt`.
    */
   restOfWindowOutputBudget: boolean;
+  /**
+   * An omitted budget on `effective_window_tokens` is the rest of that
+   * window. Set only when a paged pool sizes the window from memory; a
+   * flat load's window is the trained length, so it keeps the native
+   * default.
+   */
+  omittedBudgetIsRestOfWindow: boolean;
+  /**
+   * The same for `speculative_window_tokens`: set when that window has a
+   * memory term (the pool or the live reservation).
+   */
+  speculativeOmittedBudgetIsRestOfWindow: boolean;
 }
 
 /** Generation configuration for Qwen3.5 */
