@@ -233,6 +233,32 @@ fn install_runway_pool_reclaimed_by_eviction(inner: &mut Qwen35Inner, initial: u
     Ok(())
 }
 
+/// A draft-loaded pool with no initial size starts at the runway and grows
+/// by Splash extents. Mutation: drop the `set_extent_growth` call in dense
+/// `initialize_paged_adapter` → red (`None`).
+#[test]
+fn runway_pool_grows_by_splash_extents() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let mut inner = fixture(0xDFA5_1606);
+    inner.config.paged_cache_memory_mb = Some(256);
+    inner.paged_adapter = None;
+    inner.initialize_paged_adapter()?;
+    let adapter = inner.paged_adapter.as_ref().expect("paged adapter");
+    let blocks = adapter.block_telemetry().map_err(Error::from_reason)?;
+    assert!(
+        blocks.total_blocks < blocks.max_total_blocks,
+        "the pool starts at the runway: {blocks:?}"
+    );
+    let bytes_per_block = adapter.bytes_per_block().map_err(Error::from_reason)?;
+    assert_eq!(
+        adapter.extent_growth_blocks(),
+        Some(crate::models::qwen3_5::dflash2_decode::runway_pool_extent_blocks(bytes_per_block))
+    );
+    Ok(())
+}
+
 /// A paged AR turn right after a DFlash2 turn, with a prompt past the
 /// runway pool: the turn parks the live state, and the pool grow its prompt
 /// needs evicts it (a grow probe reads memory the parked state holds) before
