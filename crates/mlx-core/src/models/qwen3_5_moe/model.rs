@@ -156,6 +156,10 @@ pub(crate) struct Qwen35MoeInner {
     /// DFlash2 window terms fixed at load once the paged pool is
     /// registered; `None` without a draft.
     pub(crate) dflash2_window: Option<crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms>,
+    /// Blocks the load-time sizer gave the paged pool. A runway pool's
+    /// maximum sits below it by the one layer a grow holds; the DFlash2 pool
+    /// term is priced from it. `None` before the pool is built.
+    pub(crate) paged_pool_budget_blocks: Option<u32>,
     /// Set only by a tapped flat prefill; every other cache lane invalidates it.
     pub(crate) dflash2_flat_lane_authoritative: bool,
     pub(crate) dflash2_compiled_verify_disabled: bool,

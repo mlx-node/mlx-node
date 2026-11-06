@@ -64,6 +64,25 @@ pub(crate) fn qwen35_resolve_paged_cache_initial_memory_mb(
 /// a runway for paged turns and grows on demand (Splash `warmupKvPages`).
 pub(crate) const QWEN35_DFLASH2_POOL_RUNWAY_TOKENS: u32 = 2048;
 
+/// Blocks a runway pool asks the load-time sizer for: the requested pool
+/// plus the one layer a grow holds beside it.
+pub(crate) fn qwen35_runway_pool_sizing_request(requested_blocks: u32, layers: u32) -> u32 {
+    requested_blocks.saturating_add(requested_blocks.div_ceil(layers.max(1)))
+}
+
+/// The maximum a runway pool publishes and grows to: the most blocks whose
+/// last grow (the new pool plus one old layer) fits the `sized_blocks` the
+/// sizer selected, never past `requested_blocks`.
+pub(crate) fn qwen35_runway_pool_max_blocks(
+    sized_blocks: u32,
+    requested_blocks: u32,
+    layers: u32,
+) -> u32 {
+    let layers = u64::from(layers.max(1));
+    let fits = u64::from(sized_blocks) * layers / (layers + 1);
+    (fits.min(u64::from(requested_blocks)) as u32).max(1)
+}
+
 /// Convert a resolved initial MiB budget into an initial block count.
 ///
 /// Same MiB→blocks math as the max path (`PagedAttentionConfig::
@@ -406,6 +425,7 @@ mod tests {
     use super::{
         Qwen3_5Config, qwen35_default_paged_cache_memory_mb, qwen35_initial_pool_blocks,
         qwen35_resolve_paged_cache_initial_memory_mb, qwen35_resolve_paged_cache_memory_mb,
+        qwen35_runway_pool_max_blocks, qwen35_runway_pool_sizing_request,
         resolve_qwen35_paged_default,
     };
     use mlx_paged_attn::PagedAttentionConfig;
@@ -644,6 +664,72 @@ mod tests {
         assert_eq!(
             qwen35_initial_pool_blocks(Some(64), max_memory_mb, max_blocks, &pa, true, recurrent),
             Ok((64, Some(64)))
+        );
+    }
+
+    /// Gate: on the M3 Pro inputs (a 5,051-block budget of one-MiB blocks,
+    /// 16 pool layers, the 275-block runway, 128-block extents) the runway
+    /// pool grows by extents all the way to its published max, 4,753 blocks,
+    /// and the published pool window is 73,696. Each grow is admitted as
+    /// `try_grow_pool` admits it: the sizer's selection for the target, with
+    /// `pool_grow_reserved_bytes` reserved, must cover the target or at least
+    /// one more block. Mutations: reserve the whole old pool in
+    /// `pool_grow_reserved_bytes` → red (stalls at 2,579); publish the
+    /// budget as the max in `qwen35_runway_pool_max_blocks` → red (stalls at
+    /// 4,755 of 5,051).
+    #[test]
+    fn runway_pool_reaches_its_published_max() {
+        const MIB: u64 = 1 << 20;
+        const LAYERS: u32 = 16;
+        const BUDGET: u32 = 5_051;
+        const REQUESTED: u32 = 16_384;
+        let probe = |request: u32, reserved: u64| {
+            mlx_paged_attn::profile::compute_load_time_pool_sizing(
+                request,
+                u64::from(BUDGET) * MIB,
+                None,
+                0,
+                1.0,
+                0,
+                MIB,
+                reserved,
+            )
+            .expect("sizing")
+            .selected_blocks
+        };
+        let sized = probe(qwen35_runway_pool_sizing_request(REQUESTED, LAYERS), 0);
+        assert_eq!(sized, BUDGET);
+        let max = qwen35_runway_pool_max_blocks(sized, REQUESTED, LAYERS);
+        let extent = crate::models::qwen3_5::dflash2_decode::runway_pool_extent_blocks(MIB);
+        assert_eq!(extent, 128);
+        let mut blocks = 275u32;
+        while blocks < max {
+            let target = max.min(blocks + extent);
+            let reserved = crate::transformer::paged_kv_cache_adapter::pool_grow_reserved_bytes(
+                u64::from(blocks) * MIB,
+                LAYERS,
+            );
+            let selected = probe(target, reserved);
+            if selected <= blocks {
+                break;
+            }
+            blocks = selected.min(target);
+        }
+        assert_eq!(blocks, max, "the pool stalls below its published max");
+        assert_eq!(max, 4_753);
+        assert_eq!(
+            crate::engine::hybrid_scheduler::pool_tokens_after_recurrent(
+                max * 16,
+                16,
+                MIB,
+                153_944_064,
+            ),
+            73_696
+        );
+        // Where the request binds, not the budget, the max is the request.
+        assert_eq!(
+            qwen35_runway_pool_max_blocks(17_408, REQUESTED, LAYERS),
+            REQUESTED
         );
     }
 

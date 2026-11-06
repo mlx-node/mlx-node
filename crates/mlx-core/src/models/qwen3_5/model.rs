@@ -173,6 +173,10 @@ pub(crate) struct Qwen35Inner {
     /// DFlash2 window terms fixed at load once the paged pool is
     /// registered; `None` without a draft.
     pub(crate) dflash2_window: Option<crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms>,
+    /// Blocks the load-time sizer gave the paged pool. A runway pool's
+    /// maximum sits below it by the one layer a grow holds; the DFlash2 pool
+    /// term is priced from it. `None` before the pool is built.
+    pub(crate) paged_pool_budget_blocks: Option<u32>,
     /// Latched when the compiled DFlash2 verify graph fails at trace or
     /// replay — the failure mode is structural, so the stepper stays on the
     /// eager path for the rest of the model's lifetime.

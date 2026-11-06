@@ -473,18 +473,20 @@ fn dflash2_kv_headroom_now() -> Option<u64> {
     dflash2_kv_headroom_bytes(dflash2_memory_snapshot())
 }
 
-/// The DFlash2 pool term inputs of `adapter`: its maximum's bytes past the
-/// blocks it has allocated, floored at the window it gives a paged turn
-/// after `recurrent_state_bytes`.
+/// The DFlash2 pool term inputs of `adapter`: the bytes of `budget_blocks`
+/// (the load-time sizer's pool budget; `None` prices the pool's maximum)
+/// past the blocks it has allocated, floored at the window it gives a paged
+/// turn after `recurrent_state_bytes`.
 pub(crate) fn dflash2_pool_budget(
     adapter: &crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter,
+    budget_blocks: Option<u32>,
     recurrent_state_bytes: u64,
 ) -> Result<DFlash2PoolBudget> {
     let bytes_per_block = adapter.bytes_per_block().map_err(Error::from_reason)?;
     let block_size = adapter.block_size().max(1);
     Ok(DFlash2PoolBudget {
         bytes: dflash2_pool_budget_bytes(
-            adapter.max_capacity_tokens() / block_size,
+            budget_blocks.unwrap_or(adapter.max_capacity_tokens() / block_size),
             adapter.block_capacity(),
             bytes_per_block,
         ),

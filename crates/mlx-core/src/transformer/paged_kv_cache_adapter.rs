@@ -517,6 +517,13 @@ pub(crate) fn validate_query_input(
     })
 }
 
+/// Bytes a pool grow holds beside the new pool: one old layer of `own_bytes`
+/// spread over `layers`, as `LayerKVPool::grow_to` frees each old layer
+/// before it allocates the next.
+pub(crate) fn pool_grow_reserved_bytes(own_bytes: u64, layers: u32) -> u64 {
+    own_bytes.div_ceil(u64::from(layers.max(1)))
+}
+
 /// The pages a decode query at context length `context` reads: the first
 /// retained logical block and the token count visible from it. Sliding
 /// groups omit whole blocks before their live window (the kernel masks the
@@ -2726,7 +2733,7 @@ impl PagedKVCacheAdapter {
     ///    [`crate::cache_limit::pool_growth_lock`]) and hold it across the
     ///    whole body, so a concurrent grow on another model's thread — or a
     ///    concurrent model load's pool reservation — cannot probe stale
-    ///    `registered_pool_bytes` totals while this grow's old+new transient
+    ///    `registered_pool_bytes` totals while this grow's transient
     ///    is unregistered.
     /// 1. Flush this adapter's pending native pool writes and synchronize
     ///    MLX — the grow blit copies the whole buffer, so no lazy GPU write
@@ -2738,14 +2745,15 @@ impl PagedKVCacheAdapter {
     ///    needed))`, or with extent growth `current` plus `needed` rounded up
     ///    to whole extents; `grow_to` is a no-op `Ok(false)` when the target
     ///    does not exceed the live count.
-    /// 4. Probe the live Metal headroom for the target BEFORE `grow_to`
-    ///    builds the new generation: the blit transiently holds the old and
-    ///    new buffers, so the peak (old live + new + sibling registered
-    ///    pools) must fit the safe budget. A probe that selects fewer
-    ///    blocks declines the grow (step 5 is skipped).
-    /// 5. On success, extend the allocator to match, drop this adapter's
-    ///    per-layer pool views (they wrap the pre-grow buffers), run the
-    ///    growth notifier with the new total bytes, and log one line.
+    /// 4. Probe the live Metal headroom for the target BEFORE `grow_to`:
+    ///    the grow swaps one layer at a time, so the peak (new pool + one old
+    ///    layer + sibling registered pools) must fit the safe budget. A
+    ///    probe that selects fewer blocks declines the grow (step 5 is
+    ///    skipped).
+    /// 5. Drop this adapter's per-layer pool views (they retain the pre-grow
+    ///    buffers) before `grow_to`. On success, extend the allocator to
+    ///    match, run the growth notifier with the new total bytes, and log
+    ///    one line. A grow that fails part way still notifies its new bytes.
     ///
     /// Any failure (flush error, poisoned mutex, headroom probe error or
     /// decline, `Err` from `grow_to`, or a no-op grow) logs at warn and
@@ -2780,7 +2788,8 @@ impl PagedKVCacheAdapter {
         // the underlying Metal buffers.
         crate::array::memory::synchronize();
 
-        let mut guard = match self.allocator.lock() {
+        let allocator = Arc::clone(&self.allocator);
+        let mut guard = match allocator.lock() {
             Ok(guard) => guard,
             Err(e) => {
                 tracing::warn!(
@@ -2838,6 +2847,12 @@ impl PagedKVCacheAdapter {
             }
         }
         let old_total_bytes = self.layer_kv_pool.total_bytes();
+        // This adapter's cached per-layer views retain the pre-grow buffers;
+        // dropped after the grow, each old layer would outlive its swap and
+        // the peak would be the whole old pool plus the new one. Other
+        // adapters sharing the pool rebuild lazily via the generation guard.
+        #[cfg(target_os = "macos")]
+        self.clear_native_graph_state();
         match self.layer_kv_pool.grow_to(new_num_blocks) {
             Ok(true) => {}
             Ok(false) => {
@@ -2846,6 +2861,13 @@ impl PagedKVCacheAdapter {
                 return false;
             }
             Err(e) => {
+                // Layers grown before the failure keep their larger buffers.
+                let total_bytes = self.layer_kv_pool.total_bytes();
+                if total_bytes != old_total_bytes
+                    && let Some(notifier) = self.pool_growth_notifier.as_ref()
+                {
+                    notifier(total_bytes);
+                }
                 tracing::warn!(
                     target: "mlx_core::paged_kv",
                     "paged KV pool grow to {new_num_blocks} blocks failed: {e}"
@@ -2867,12 +2889,6 @@ impl PagedKVCacheAdapter {
         }
         drop(guard);
 
-        // This adapter's cached per-layer views wrap the pre-grow buffers;
-        // drop all of them. Other adapters sharing the pool rebuild lazily
-        // via the generation guard.
-        #[cfg(target_os = "macos")]
-        self.clear_native_graph_state();
-
         let new_total_bytes = self.layer_kv_pool.total_bytes();
         if let Some(notifier) = self.pool_growth_notifier.as_ref() {
             notifier(new_total_bytes);
@@ -2889,10 +2905,10 @@ impl PagedKVCacheAdapter {
 
     /// Pre-grow headroom probe: ask the load-time sizer how many blocks of
     /// the grow-target size the live Metal budget can back, reserving the
-    /// full old+new transient — this pool's current bytes stay live during
-    /// the blit, and every sibling pool registered with the coordinator
-    /// counts against the same budget. Read-only (no allocations); `Err`
-    /// must fail the grow closed.
+    /// grow's transient ([`pool_grow_reserved_bytes`]: one old layer, as
+    /// `LayerKVPool::grow_to` swaps a layer at a time), and every sibling
+    /// pool registered with the coordinator counts against the same budget.
+    /// Read-only (no allocations); `Err` must fail the grow closed.
     #[cfg(target_os = "macos")]
     fn grow_headroom_probe(&self, new_num_blocks: u32) -> Result<u32, String> {
         #[cfg(test)]
@@ -2901,7 +2917,8 @@ impl PagedKVCacheAdapter {
         }
         let config = self.layer_kv_pool.config();
         let own_bytes = self.layer_kv_pool.total_bytes();
-        let extra_reserved_bytes = own_bytes.saturating_add(
+        let layers = self.layer_kv_pool.num_layers() as u32;
+        let extra_reserved_bytes = pool_grow_reserved_bytes(own_bytes, layers).saturating_add(
             crate::cache_limit::coordinator()
                 .registered_pool_bytes()
                 // The sizer reserves this pool's staging pair itself. Growth
@@ -16352,8 +16369,8 @@ mod tests {
     }
 
     /// **Grow decline**: a headroom probe that selects fewer blocks than the
-    /// grow target must decline the grow BEFORE `grow_to` builds the
-    /// transient old+new peak; the pool, allocator, and generation all stay
+    /// grow target must decline the grow BEFORE `grow_to` allocates; the
+    /// pool, allocator, and generation all stay
     /// put and the caller's eviction/error fallback proceeds unchanged.
     /// Skipped on no-Metal hosts.
     #[cfg(target_os = "macos")]

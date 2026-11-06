@@ -263,6 +263,7 @@ fn context_limits_publish_both_windows() {
     }
 }
 
+/// Mutation: ignore `budget_blocks` in `dflash2_pool_budget` → red (5 blocks, not 6).
 #[test]
 fn dflash2_pool_budget_counts_allocated_blocks_once() {
     const BLOCK_SIZE: u32 = 16;
@@ -293,9 +294,16 @@ fn dflash2_pool_budget_counts_allocated_blocks_once() {
         PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE).expect("test adapter constructs");
     let bytes_per_block = adapter.bytes_per_block().expect("bytes per block");
     let recurrent = tiny_cfg(true).recurrent_state_bytes();
-    let budget = crate::models::qwen3_5::dflash2_turn::dflash2_pool_budget(&adapter, recurrent)
-        .expect("pool budget");
+    let budget =
+        crate::models::qwen3_5::dflash2_turn::dflash2_pool_budget(&adapter, None, recurrent)
+            .expect("pool budget");
     assert_eq!(budget.bytes, 5 * bytes_per_block);
+    // A runway pool's term is priced from the sizer's budget, above its max.
+    let sized =
+        crate::models::qwen3_5::dflash2_turn::dflash2_pool_budget(&adapter, Some(9), recurrent)
+            .expect("pool budget");
+    assert_eq!(sized.bytes, 6 * bytes_per_block);
+    assert_eq!(sized.floor_tokens, budget.floor_tokens);
     assert_eq!(
         budget.floor_tokens,
         crate::engine::hybrid_scheduler::pool_tokens_after_recurrent(
@@ -357,6 +365,7 @@ fn freeze_dflash2_window_publishes_pool_terms() {
         .expect("load limits with a draft");
     let budget = crate::models::qwen3_5::dflash2_turn::dflash2_pool_budget(
         inner.paged_adapter.as_ref().expect("adapter"),
+        inner.paged_pool_budget_blocks,
         inner.config.recurrent_state_bytes(),
     )
     .expect("pool budget");
