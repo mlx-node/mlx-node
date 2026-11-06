@@ -183,6 +183,53 @@ fn dflash2_clamp_window_is_the_speculative_window() {
     assert_eq!(DFlash2Target::dflash2_window(&inner), Some(speculative));
 }
 
+/// An omitted budget is the rest of a window only when memory sizes that
+/// window: the pool window of a paged load, the DFlash2 window with a pool
+/// or reservation term. A flat load's window is the trained length.
+/// Mutation: set both omitted flags `true` in `from_parts` → red.
+/// Mutation: read the speculative flag from `memory_window` → red.
+#[test]
+fn flat_load_publishes_no_rest_of_window() {
+    let Some(mut inner) =
+        dense_inner_with_test_adapter_or_skip("flat_load_publishes_no_rest_of_window")
+    else {
+        return;
+    };
+    let terms = |pool, reserve| crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms {
+        trained: u32::MAX,
+        draft_trained: u32::MAX,
+        pool,
+        reserve,
+        row_bytes: 1,
+        extent_rows: 256,
+    };
+    let limits = inner.context_limits_snapshot();
+    assert!(limits.rest_of_window_output_budget);
+    assert!(limits.omitted_budget_is_rest_of_window);
+    assert!(!limits.speculative_omitted_budget_is_rest_of_window);
+
+    inner.paged_adapter = None;
+    let limits = inner.context_limits_snapshot();
+    assert!(
+        limits.rest_of_window_output_budget,
+        "the clamp stays Splash's"
+    );
+    assert!(!limits.omitted_budget_is_rest_of_window);
+    for (pool, reserve, memory_bound) in [
+        (None, Some(1_000), true),
+        (Some(1_000), None, true),
+        (None, None, false),
+    ] {
+        inner.dflash2_window = Some(terms(pool, reserve));
+        let limits = inner.context_limits_snapshot();
+        assert!(!limits.omitted_budget_is_rest_of_window);
+        assert_eq!(
+            limits.speculative_omitted_budget_is_rest_of_window, memory_bound,
+            "{pool:?} {reserve:?}"
+        );
+    }
+}
+
 /// Gate: the load snapshot publishes the pool window as the effective
 /// window and the DFlash2 window beside it.
 /// Mutation: build `effective_window_tokens` from `speculative_window()`

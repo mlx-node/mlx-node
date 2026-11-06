@@ -207,6 +207,8 @@ function createLaneWindowModel(promptTokens: number, extra: Record<string, unkno
         pagedBlockSize: 16,
         speculativeWindowTokens: 96,
         restOfWindowOutputBudget: true,
+        omittedBudgetIsRestOfWindow: true,
+        speculativeOmittedBudgetIsRestOfWindow: true,
       }),
       hasMtpWeights: () => true,
       mtpAutoEnabled: () => true,
@@ -980,6 +982,7 @@ describe('handleCreateMessage', () => {
           pagedBlockCapacity: 4,
           pagedBlockSize: 16,
           restOfWindowOutputBudget: true,
+          omittedBudgetIsRestOfWindow: true,
         }),
         applyChatTemplate: vi.fn(() => new Uint32Array(64)),
       });

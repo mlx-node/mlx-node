@@ -209,11 +209,15 @@ export interface SessionContextLimits {
   speculativeWindowTokens?: number | null;
   /**
    * The output budget fills the window: a prompt must leave room for one new
-   * token, `maxNewTokens` is clamped to `window - prompt`, and an omitted
-   * budget is the rest of the window. Otherwise `maxNewTokens` is clamped to
-   * `window - prompt + 1` and an omitted budget keeps the native default.
+   * token and `maxNewTokens` is clamped to `window - prompt`. Otherwise
+   * `maxNewTokens` is clamped to `window - prompt + 1`. An omitted budget
+   * keeps the native default unless the chosen window's flag below is set.
    */
   restOfWindowOutputBudget?: boolean;
+  /** An omitted budget on `effectiveWindowTokens` is the rest of that window. */
+  omittedBudgetIsRestOfWindow?: boolean;
+  /** An omitted budget on `speculativeWindowTokens` is the rest of that window. */
+  speculativeOmittedBudgetIsRestOfWindow?: boolean;
 }
 
 /**
@@ -1982,7 +1986,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * The window is the speculative one only for a text turn with `enableMtp`
    * on, matching the native turn plan; every other turn uses the pool's.
    *
-   * The output budget follows `restOfWindowOutputBudget`. The returned
+   * The output budget follows `restOfWindowOutputBudget`, and an omitted one
+   * the chosen window's omitted-budget flag. The returned
    * config is a copy only when `maxNewTokens` changes.
    */
   private async constrainToContextCapacity(messages: ChatMessage[], config: ChatConfig): Promise<ChatConfig> {
@@ -1993,10 +1998,11 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     const hasImages = messages.some((message) => (message.images?.length ?? 0) > 0);
     const limits = this.model.contextLimits();
     const speculativeWindow = limits.speculativeWindowTokens;
-    const windowTokens =
-      config.enableMtp === true && !hasImages && speculativeWindow != null
-        ? speculativeWindow
-        : limits.effectiveWindowTokens;
+    const speculative = config.enableMtp === true && !hasImages && speculativeWindow != null;
+    const windowTokens = speculative ? speculativeWindow : limits.effectiveWindowTokens;
+    const omittedIsRestOfWindow = speculative
+      ? limits.speculativeOmittedBudgetIsRestOfWindow === true
+      : limits.omittedBudgetIsRestOfWindow === true;
     const capacity = Math.floor(windowTokens);
     if (!Number.isSafeInteger(capacity) || capacity <= 0) {
       return config;
@@ -2029,7 +2035,10 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       }
       maxOutput = capacity - promptTokens;
       if (requested == null) {
-        return { ...config, maxNewTokens: maxOutput };
+        if (omittedIsRestOfWindow) {
+          return { ...config, maxNewTokens: maxOutput };
+        }
+        return maxOutput >= NATIVE_DEFAULT_MAX_NEW_TOKENS ? config : { ...config, maxNewTokens: maxOutput };
       }
     } else {
       if (promptTokens > capacity) {
