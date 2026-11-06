@@ -56,14 +56,20 @@ their loaders have no initial knob and must not receive one. Checkpoints
 resolved WITHOUT the manager (a library caller loading the path directly)
 keep the historical behavior: unset initial = static full-size pool.
 
-**Transient double memory during grow.** `LayerKVPool::grow_to` allocates the
-new generation's per-layer Metal buffers wholesale and swaps them in; the old
-buffers stay alive until outstanding GPU work and any cached MLX array views
-drop their handles, so peak unified-memory use briefly approaches old + new
-before the old generation is released. The growth notifier
-(`CacheLimitCoordinator::update_pool`) re-debits the coordinator with the new
-total at the same point, so the global cap tracks the grown pool rather than
-the initial one.
+**Transient memory during grow.** `LayerKVPool::grow_to` grows one layer at
+a time: it allocates the layer's larger pair, copies the old bytes, waits,
+swaps the pair in and drops the old one before the next layer, so the peak is
+the new pool plus one old layer (Splash grows by whole extents and copies
+nothing; this is the closest layout without extents). The adapter drops its
+cached MLX views before the grow so they do not keep old layers alive; the
+headroom probe reserves one old layer (`pool_grow_reserved_bytes`). A qwen3_5
+runway pool (DFlash2 draft, no initial size) publishes a max that leaves room
+for that layer: `floor(B * L / (L + 1))` of the sizer's budget `B` over `L`
+pool layers, while the DFlash2 pool term is still priced from `B`. A grow that
+fails part way keeps the grown layers (bytes intact, block count unchanged).
+The growth notifier (`CacheLimitCoordinator::update_pool`) re-debits the
+coordinator with the pool's measured buffer bytes, so the global cap tracks
+the grown pool rather than the initial one.
 
 ## Prefix-cache security domains
 

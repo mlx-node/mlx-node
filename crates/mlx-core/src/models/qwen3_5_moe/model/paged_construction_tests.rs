@@ -304,6 +304,7 @@ fn freeze_dflash2_window_publishes_pool_terms() {
         .expect("load limits with a draft");
     let budget = crate::models::qwen3_5::dflash2_turn::dflash2_pool_budget(
         inner.paged_adapter.as_ref().expect("adapter"),
+        inner.paged_pool_budget_blocks,
         inner.config.recurrent_state_bytes(),
     )
     .expect("pool budget");
