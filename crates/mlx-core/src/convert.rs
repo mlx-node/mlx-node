@@ -11788,6 +11788,11 @@ mod tests {
     /// separates "the lift ran" from "something rescaled the model".
     #[tokio::test]
     async fn convert_model_lifts_nvfp4_ffn_layers() {
+        if !crate::test_support::in_own_process(
+            "convert::tests::convert_model_lifts_nvfp4_ffn_layers",
+        ) {
+            return;
+        }
         const LAYERS: usize = 12;
         const HIDDEN: i64 = 128;
         const INTERMEDIATE: i64 = 64;
@@ -12664,6 +12669,11 @@ mod tests {
 
     #[tokio::test]
     async fn qwen3_asr_native_recipe_rejection_precedes_converter_io() {
+        if !crate::test_support::in_own_process(
+            "convert::tests::qwen3_asr_native_recipe_rejection_precedes_converter_io",
+        ) {
+            return;
+        }
         let base = std::env::temp_dir().join(format!(
             "mlx-asr-invalid-recipe-{}-{}",
             std::process::id(),
@@ -12710,6 +12720,11 @@ mod tests {
     /// re-describe the tiled bytes as row-major.
     #[tokio::test]
     async fn tiled_kquant_artifact_is_refused_before_converter_io() {
+        if !crate::test_support::in_own_process(
+            "convert::tests::tiled_kquant_artifact_is_refused_before_converter_io",
+        ) {
+            return;
+        }
         let base = std::env::temp_dir().join(format!(
             "mlx-tiled-kquant-reconvert-{}-{}",
             std::process::id(),
@@ -12779,6 +12794,11 @@ mod tests {
     /// first.
     #[tokio::test]
     async fn explicit_dense_only_rejection_precedes_converter_io() {
+        if !crate::test_support::in_own_process(
+            "convert::tests::explicit_dense_only_rejection_precedes_converter_io",
+        ) {
+            return;
+        }
         let base = std::env::temp_dir().join(format!(
             "mlx-dense-only-convert-{}-{}",
             std::process::id(),
@@ -12869,6 +12889,11 @@ mod tests {
     /// left to the recipe/unknown-family validation path.
     #[tokio::test]
     async fn implicit_dense_only_sources_reject_quantization_before_tensor_io() {
+        if !crate::test_support::in_own_process(
+            "convert::tests::implicit_dense_only_sources_reject_quantization_before_tensor_io",
+        ) {
+            return;
+        }
         let base = std::env::temp_dir().join(format!(
             "mlx-dense-source-convert-{}-{}",
             std::process::id(),
@@ -20801,6 +20826,11 @@ mod tests {
     #[ignore]
     #[allow(clippy::excessive_precision)]
     async fn convert_model_gemma_qat_integration() {
+        if !crate::test_support::in_own_process(
+            "convert::tests::convert_model_gemma_qat_integration",
+        ) {
+            return;
+        }
         let ckpt = std::path::PathBuf::from(
             "/Users/brooklyn/.mlx-node/models/gemma-4-e2b-it-qat-mobile-transformers",
         );
@@ -21061,6 +21091,11 @@ mod tests {
     /// config.json.
     #[tokio::test]
     async fn convert_model_gemma_prequant_top_level_block_is_honest() {
+        if !crate::test_support::in_own_process(
+            "convert::tests::convert_model_gemma_prequant_top_level_block_is_honest",
+        ) {
+            return;
+        }
         let base = std::env::temp_dir().join(format!(
             "gemma_prequant_toplevel_{}_{}",
             std::process::id(),
@@ -21224,6 +21259,11 @@ mod tests {
 
     #[tokio::test]
     async fn convert_model_nvidia_recipe_rejects_real_config_model_type_despite_m_override() {
+        if !crate::test_support::in_own_process(
+            "convert::tests::convert_model_nvidia_recipe_rejects_real_config_model_type_despite_m_override",
+        ) {
+            return;
+        }
         // `-m qwen3_5` must NOT smuggle a real UNSUPPORTED
         // directory past the nvidia gate. The gate reads the input config.json's
         // actual model_type (lfm2 — still unsupported now that gemma4 is
@@ -21279,6 +21319,11 @@ mod tests {
 
     #[tokio::test]
     async fn convert_model_nvidia_recipe_rejects_gemma4_config_with_qwen_override() {
+        if !crate::test_support::in_own_process(
+            "convert::tests::convert_model_nvidia_recipe_rejects_gemma4_config_with_qwen_override",
+        ) {
+            return;
+        }
         // `-m qwen3_5` on a real gemma4 directory must NOT
         // sanitize as Qwen. The gate now allows gemma4, but the sanitizer
         // dispatches on --model-type; the family-agreement check rejects the
@@ -21337,6 +21382,11 @@ mod tests {
 
     #[tokio::test]
     async fn convert_model_nvidia_recipe_rejects_gemma4_moe_from_text_config() {
+        if !crate::test_support::in_own_process(
+            "convert::tests::convert_model_nvidia_recipe_rejects_gemma4_moe_from_text_config",
+        ) {
+            return;
+        }
         // Real gemma MoE configs carry `enable_moe_block`
         // under `text_config` (the root key is absent), and the loader resolves
         // it nested-first (`get_config_bool`). The gate must mirror that: a
@@ -21397,6 +21447,11 @@ mod tests {
 
     #[tokio::test]
     async fn convert_model_nvidia_recipe_rejects_gemma_qat_via_alias_override() {
+        if !crate::test_support::in_own_process(
+            "convert::tests::convert_model_nvidia_recipe_rejects_gemma_qat_via_alias_override",
+        ) {
+            return;
+        }
         // A gemma-QAT source (`quant_method: "gemma"`) with an
         // aliased `-m gemma4_unified` must NOT slip the already-quantized
         // rejection into the generic quantizer. The FAMILY predicate
@@ -21457,6 +21512,11 @@ mod tests {
 
     #[tokio::test]
     async fn convert_model_rejects_unified_gemma_qat_before_e2b_importer() {
+        if !crate::test_support::in_own_process(
+            "convert::tests::convert_model_rejects_unified_gemma_qat_before_e2b_importer",
+        ) {
+            return;
+        }
         // A gemma4_unified QAT (audio-carrying) must NOT reach the E2B
         // prequantized importer, which is EXACT-"gemma4" only and DROPS AUDIO.
         // The fixture uses the EXACT E2B language schedule, so
@@ -22684,6 +22744,11 @@ mod tests {
 
     #[tokio::test]
     async fn prism_hadamard_marker_rejects_standard_conversion() {
+        if !crate::test_support::in_own_process(
+            "convert::tests::prism_hadamard_marker_rejects_standard_conversion",
+        ) {
+            return;
+        }
         for (label, config) in [
             (
                 "root marker",

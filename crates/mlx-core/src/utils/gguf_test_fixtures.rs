@@ -953,6 +953,11 @@ pub(crate) async fn convert_import_fixture(fixture: &ImportFixture, output_dir: 
 #[tokio::test]
 #[ignore = "writes goldens; set MLX_CAPTURE_FIXTURE_GOLDEN"]
 async fn capture_base_fixture_goldens() {
+    if !crate::test_support::in_own_process(
+        "utils::gguf_test_fixtures::capture_base_fixture_goldens",
+    ) {
+        return;
+    }
     let Some(out_root) = std::env::var_os("MLX_CAPTURE_FIXTURE_GOLDEN").map(PathBuf::from) else {
         panic!("set MLX_CAPTURE_FIXTURE_GOLDEN=<golden dir>");
     };
