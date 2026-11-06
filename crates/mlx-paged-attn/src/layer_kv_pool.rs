@@ -157,9 +157,21 @@ thread_local! {
     /// Layer at which `grow_to` fails on this thread, before allocating it.
     static GROW_FAIL_AT_LAYER: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(any(test, feature = "test-hooks"), target_os = "macos"))]
+thread_local! {
     /// Layer at which `shrink_to` fails on this thread, before allocating it.
     static SHRINK_FAIL_AT_LAYER: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+}
+
+/// Make `LayerKVPool::shrink_to` fail on this thread at `layer`, before
+/// allocating it; `None` clears it.
+#[cfg(all(feature = "test-hooks", target_os = "macos"))]
+#[doc(hidden)]
+pub fn set_shrink_fail_at_layer(layer: Option<usize>) {
+    SHRINK_FAIL_AT_LAYER.with(|cell| cell.set(layer));
 }
 
 /// Shared per-layer Metal KV-cache buffer pool.
@@ -1138,7 +1150,7 @@ impl LayerKVPool {
             if old_key.length() <= new_key_size && old_value.length() <= new_value_size {
                 return Ok(());
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             if SHRINK_FAIL_AT_LAYER.with(std::cell::Cell::get) == Some(layer) {
                 return Err(format!(
                     "LayerKVPool::shrink_to: injected failure at layer {layer}"
@@ -1180,6 +1192,33 @@ impl LayerKVPool {
     #[cfg(not(target_os = "macos"))]
     pub fn shrink_to(&self, _new_num_blocks: u32) -> Result<bool, String> {
         Err("shrink_to is only supported on macOS (Metal backend)".to_string())
+    }
+
+    /// Whether a layer's K or V buffer still holds more than
+    /// [`Self::num_blocks`] block slots: a [`Self::shrink_to`] that failed
+    /// part way, or a [`Self::grow_to`] that did. `shrink_to(num_blocks())`
+    /// gives those bytes back.
+    pub fn shrink_pending(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let Ok((key_block_size, value_block_size)) =
+                Self::block_bytes_for(&self.config, self.cache_dtype)
+            else {
+                return false;
+            };
+            let inner = self.inner_read();
+            let blocks = inner.num_blocks as u64;
+            let key_size = key_block_size.saturating_mul(blocks);
+            let value_size = value_block_size.saturating_mul(blocks);
+            inner
+                .layers
+                .iter()
+                .any(|(k, v)| k.length() > key_size || v.length() > value_size)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 
     /// Number of transformer layers covered by this pool.
@@ -3942,6 +3981,7 @@ mod tests {
         SHRINK_FAIL_AT_LAYER.with(|cell| cell.set(None));
         assert!(failed.is_err(), "the injected failure must surface");
         assert_eq!(pool.num_blocks(), 4);
+        assert!(pool.shrink_pending(), "layers 2 and 3 still hold 8 blocks");
         assert_eq!(pool.generation(), generation + 1);
         for layer in 0..LAYERS {
             let blocks = if (layer as usize) < FAIL_AT { 4 } else { 8 };
@@ -3965,6 +4005,7 @@ mod tests {
         assert!(pool.read_block_all_layers(5).is_err());
 
         assert!(pool.shrink_to(4).expect("retry"));
+        assert!(!pool.shrink_pending());
         assert_eq!(pool.generation(), generation + 2);
         assert_eq!(pool.total_bytes(), 2 * per_side * 4 * LAYERS as u64);
         for (block, seed) in seeds.iter().enumerate().take(4) {

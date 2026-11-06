@@ -2953,6 +2953,7 @@ impl PagedKVCacheAdapter {
             u64::from(extent).saturating_mul(bytes_per_block),
         );
         let floor = self.extent_runway_blocks;
+        let pending = self.layer_kv_pool.shrink_pending();
         {
             let guard = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
             let cuttable = if evict_cached {
@@ -2960,7 +2961,7 @@ impl PagedKVCacheAdapter {
             } else {
                 guard.shrink_plan(floor, extent, extents).is_some()
             };
-            if !cuttable {
+            if !cuttable && !pending {
                 return 0;
             }
         }
@@ -2993,7 +2994,8 @@ impl PagedKVCacheAdapter {
             }
         }
         let Some(plan) = guard.shrink_plan(floor, extent, extents) else {
-            return 0;
+            drop(guard);
+            return self.finish_pending_shrink();
         };
         let old_total_bytes = self.layer_kv_pool.total_bytes();
         #[cfg(target_os = "macos")]
@@ -3037,6 +3039,42 @@ impl PagedKVCacheAdapter {
             old_total_bytes as f64 / (1024.0 * 1024.0),
             new_total_bytes as f64 / (1024.0 * 1024.0),
             plan.moves.len(),
+        );
+        old_total_bytes.saturating_sub(new_total_bytes)
+    }
+
+    /// Give back the layer bytes above the pool's block count that a cut
+    /// which failed part way left behind, as Splash releases an empty extent
+    /// before any cut or eviction, below the runway floor's reach
+    /// (Cache.cpp:704-711, 958-964). Caller holds the growth lock with pool
+    /// writes flushed. Returns the bytes freed; 0 when nothing was pending.
+    fn finish_pending_shrink(&mut self) -> u64 {
+        if !self.layer_kv_pool.shrink_pending() {
+            return 0;
+        }
+        #[cfg(target_os = "macos")]
+        self.clear_native_graph_state();
+        let old_total_bytes = self.layer_kv_pool.total_bytes();
+        let num_blocks = self.layer_kv_pool.num_blocks();
+        let shrunk = self.layer_kv_pool.shrink_to(num_blocks);
+        let new_total_bytes = self.layer_kv_pool.total_bytes();
+        if new_total_bytes != old_total_bytes
+            && let Some(notifier) = self.pool_growth_notifier.as_ref()
+        {
+            notifier(new_total_bytes);
+        }
+        if let Err(e) = shrunk {
+            tracing::warn!(
+                target: "mlx_core::paged_kv",
+                "paged KV pool retry of an unfinished shrink to {num_blocks} blocks failed: {e}"
+            );
+        }
+        tracing::info!(
+            target: "mlx_core::paged_kv",
+            "paged KV pool finished an unfinished shrink to {num_blocks} blocks \
+             ({:.2} -> {:.2} MiB)",
+            old_total_bytes as f64 / (1024.0 * 1024.0),
+            new_total_bytes as f64 / (1024.0 * 1024.0),
         );
         old_total_bytes.saturating_sub(new_total_bytes)
     }
@@ -16601,6 +16639,114 @@ mod tests {
             16,
             "the pool grows again from the runway"
         );
+    }
+
+    /// A 4-layer runway pool grown to 10 whose 10 -> 4 cut fails at layer 2:
+    /// the allocator and pool report 4 blocks while layers 2 and 3 still hold
+    /// 10. The next reclaim, with no new cut left at the runway, gives those
+    /// bytes back and notifies the measured total; the cached chain head
+    /// still hits, a third reclaim frees nothing, and the pool grows again.
+    /// Mutations: drop `&& !pending` from the guard in
+    /// `try_release_pool_extents` → red (retry returns 0); drop the notifier
+    /// call in `finish_pending_shrink` → red (stale last notification).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_pool_cut_is_finished_by_the_next_reclaim_at_the_runway() {
+        const NAME: &str = "failed_pool_cut_is_finished_by_the_next_reclaim_at_the_runway";
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 4,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping {NAME}: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+        adapter.set_extent_growth(3);
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        let notifications: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let notifications = Arc::clone(&notifications);
+            adapter.set_pool_growth_notifier(Some(Arc::new(move |bytes| {
+                notifications.lock().unwrap().push(bytes);
+            })));
+        }
+        let last_notified = || {
+            *notifications
+                .lock()
+                .unwrap()
+                .last()
+                .expect("a notification")
+        };
+        let block_bytes = adapter.bytes_per_block().expect("bytes per block");
+        let layer_block_bytes = block_bytes / 4;
+        let extent_bytes = 3 * block_bytes;
+        let tokens: Vec<u32> = (1..=32).collect();
+
+        adapter.reset_for_new_request(7).unwrap();
+        assert_eq!(adapter.allocate_suffix_blocks(80).unwrap(), 10);
+        assert_eq!(pool.num_blocks(), 10);
+        adapter.record_tokens(&tokens).unwrap();
+        assert_eq!(adapter.register_full_blocks_for_reuse(&[], 0).unwrap(), 4);
+        adapter.release_request().unwrap();
+
+        mlx_paged_attn::set_shrink_fail_at_layer(Some(2));
+        let released = adapter.try_release_pool_extents(2 * extent_bytes, false);
+        mlx_paged_attn::set_shrink_fail_at_layer(None);
+        assert_eq!(released, 2 * 6 * layer_block_bytes, "layers 0 and 1 shrank");
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 4);
+        assert_eq!(pool.num_blocks(), 4);
+        assert!(pool.shrink_pending(), "layers 2 and 3 still hold 10 blocks");
+        assert_eq!(
+            pool.total_bytes(),
+            (2 * 4 + 2 * 10) * layer_block_bytes,
+            "layers 2 and 3 keep 10 blocks"
+        );
+        assert_eq!(last_notified(), pool.total_bytes());
+
+        assert_eq!(
+            adapter.try_release_pool_extents(extent_bytes, false),
+            2 * 6 * layer_block_bytes,
+            "the next reclaim finishes layers 2 and 3"
+        );
+        assert!(!pool.shrink_pending());
+        assert_eq!(pool.num_blocks(), 4);
+        assert_eq!(pool.total_bytes(), 4 * block_bytes);
+        assert_eq!(last_notified(), 4 * block_bytes);
+        {
+            let mut allocator = allocator.lock().unwrap();
+            assert_eq!(allocator.num_blocks(), 4);
+            let (hit, cached) = allocator.find_longest_cache_hit(&tokens, 8, &[], 0);
+            assert_eq!(cached, 32, "the cached chain survives");
+            for block in hit {
+                allocator.free(block);
+            }
+        }
+
+        assert_eq!(adapter.try_release_pool_extents(extent_bytes, false), 0);
+        assert_eq!(adapter.try_release_pool_extents(extent_bytes, true), 0);
+
+        adapter.reset_for_new_request(8).unwrap();
+        assert_eq!(adapter.allocate_suffix_blocks(24).unwrap(), 3);
+        assert_eq!(pool.num_blocks(), 7, "the pool grows again from the runway");
+        assert!(!pool.shrink_pending());
+        assert_eq!(pool.total_bytes(), 7 * block_bytes);
     }
 
     /// **Grow decline**: a headroom probe that selects fewer blocks than the
