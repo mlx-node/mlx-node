@@ -8490,6 +8490,7 @@ pub(crate) fn sweep_env_lock() -> &'static std::sync::Mutex<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::sweep_until_removed;
     use crate::utils::gguf_kquant::{QK_K, q2k_code, repack_kquant};
     use crate::utils::gguf_test_fixtures::{
         build_minimal_gguf, build_qwen35_moe_fixture, complete_muse_glimmer_dflash_metadata,
@@ -12154,6 +12155,11 @@ mod tests {
 
     #[tokio::test]
     async fn k_quant_import_survives_a_global_dtype_request() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf::tests::k_quant_import_survives_a_global_dtype_request",
+        ) {
+            return;
+        }
         // `--dtype` must not touch an imported K-quant triplet: the packed
         // uint32 codes and the int8 / f16 bit patterns beside them are the
         // weights. A float cast would silently rewrite all three.
@@ -12246,6 +12252,11 @@ mod tests {
 
     #[tokio::test]
     async fn qwen35_kquant_linear_attention_rejects_from_header() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf::tests::qwen35_kquant_linear_attention_rejects_from_header",
+        ) {
+            return;
+        }
         // Qwen3.5's `attn_qkv` maps to `linear_attn.in_proj_qkv`, one of the
         // projections whose value-head rows must be reinterleaved. A packed
         // Q5_K array cannot go through the dense-only fixup independently of
@@ -13367,6 +13378,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_primary_copied_dflash_marker_does_not_refuse_the_draft_pass() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf::tests::a_primary_copied_dflash_marker_does_not_refuse_the_draft_pass",
+        ) {
+            return;
+        }
         // `--config-dir` at an already converted Muse directory copies that
         // directory's `dflash_config` into the fresh staged output, so the
         // marker on its own does not mean the staged block has been merged.
@@ -13512,6 +13528,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_dense_primary_keeps_the_copied_block_so_the_draft_pass_is_refused() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf::tests::a_dense_primary_keeps_the_copied_block_so_the_draft_pass_is_refused",
+        ) {
+            return;
+        }
         // The sibling test above covers a primary that rebuilds the block. A
         // primary whose GGUF carries no quantized tensor and that is not asked
         // to quantize writes neither alias, so the previous run's block reaches
@@ -14028,6 +14049,11 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_dflash_metadata_does_not_replace_an_existing_sidecar() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf::tests::invalid_dflash_metadata_does_not_replace_an_existing_sidecar",
+        ) {
+            return;
+        }
         let root = std::env::temp_dir().join(format!(
             "mlx-node-muse-dflash-preflight-{}-{}",
             std::process::id(),
@@ -14092,6 +14118,11 @@ mod tests {
 
     #[tokio::test]
     async fn incomplete_dflash_inventory_fails_preflight_and_preserves_sidecar() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf::tests::incomplete_dflash_inventory_fails_preflight_and_preserves_sidecar",
+        ) {
+            return;
+        }
         let root = std::env::temp_dir().join(format!(
             "mlx-node-muse-dflash-inventory-{}-{}",
             std::process::id(),
@@ -15030,6 +15061,11 @@ mod tests {
     /// row-major import tiled at load, for M in {1, 8, 64}.
     #[tokio::test]
     async fn k_quant_convert_stores_tileable_linears_tiled_and_loads_them_bit_identically() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf::tests::k_quant_convert_stores_tileable_linears_tiled_and_loads_them_bit_identically",
+        ) {
+            return;
+        }
         use crate::models::quant_dispatch::{
             KQuantLayout, PerLayerMode, kquant_tile_rows, parse_quant_block,
         };
@@ -15333,6 +15369,11 @@ mod tests {
 
     #[tokio::test]
     async fn conversion_uses_authoritative_config_assets_and_preserves_source_dtypes() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf::tests::conversion_uses_authoritative_config_assets_and_preserves_source_dtypes",
+        ) {
+            return;
+        }
         let unique = format!(
             "mlx-node-gguf-config-test-{}-{}",
             std::process::id(),
@@ -15548,6 +15589,11 @@ mod tests {
     /// the survival of the destination is.
     #[tokio::test]
     async fn a_contradicted_gemma4_layout_is_rejected_before_the_output_is_touched() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf::tests::a_contradicted_gemma4_layout_is_rejected_before_the_output_is_touched",
+        ) {
+            return;
+        }
         let unique = format!(
             "mlx-node-gguf-preflight-{}-{}",
             std::process::id(),
@@ -15628,6 +15674,11 @@ mod tests {
     /// scalar case stops failing.
     #[tokio::test]
     async fn a_synthesized_gemma4_config_needs_both_kv_head_counts() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf::tests::a_synthesized_gemma4_config_needs_both_kv_head_counts",
+        ) {
+            return;
+        }
         for (label, header) in [
             ("an absent", None),
             ("a scalar", Some(GgufMetaValue::Uint32(8))),
@@ -15726,6 +15777,11 @@ mod tests {
     /// flips to `true` and a top-level `layer_types` appears.
     #[tokio::test]
     async fn an_authoritative_config_outranks_the_measured_gemma4_layout() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf::tests::an_authoritative_config_outranks_the_measured_gemma4_layout",
+        ) {
+            return;
+        }
         let unique = format!(
             "mlx-node-gguf-k-eq-v-scope-{}-{}",
             std::process::id(),
@@ -15838,6 +15894,11 @@ mod tests {
     /// and both conversions succeed again — the `expect_err` fails.
     #[tokio::test]
     async fn quantize_is_rejected_for_a_symmetric_gguf_source() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf::tests::quantize_is_rejected_for_a_symmetric_gguf_source",
+        ) {
+            return;
+        }
         let mut q4 = [0u8; 18];
         q4[..2].copy_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
         q4[2..].fill(0x87);
@@ -15966,6 +16027,11 @@ mod tests {
     /// dequantized-Q6_K case.
     #[tokio::test]
     async fn a_secondary_output_rejects_tensors_that_need_a_config_entry() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf::tests::a_secondary_output_rejects_tensors_that_need_a_config_entry",
+        ) {
+            return;
+        }
         let mut q4 = [0u8; 18];
         q4[..2].copy_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
         q4[2..].fill(0x87);
@@ -16926,6 +16992,11 @@ mod tests {
 
     #[tokio::test]
     async fn prism_hadamard_conversion_rejects_requantization_before_output() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf::tests::prism_hadamard_conversion_rejects_requantization_before_output",
+        ) {
+            return;
+        }
         for (label, mutate) in [
             (
                 "quantize",
@@ -17000,6 +17071,11 @@ mod tests {
 
     #[tokio::test]
     async fn prism_hadamard_conversion_writes_contract_and_preserves_dtypes() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf::tests::prism_hadamard_conversion_writes_contract_and_preserves_dtypes",
+        ) {
+            return;
+        }
         let root = prism_temp_dir("convert");
         let input = write_prism_gguf(&root, &prism_metadata(), &prism_tensors());
         let output = root.join("out");
@@ -17074,6 +17150,11 @@ mod tests {
 
     #[tokio::test]
     async fn prism_hadamard_conversion_rejects_conflicting_supplied_config() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf::tests::prism_hadamard_conversion_rejects_conflicting_supplied_config",
+        ) {
+            return;
+        }
         let root = prism_temp_dir("supplied");
         let input = write_prism_gguf(&root, &prism_metadata(), &prism_tensors());
         fs::write(
@@ -17890,9 +17971,8 @@ mod tests {
         native_gguf_unlease_in_use(&staged);
         assert!(!native_gguf_in_use_dir(&staged));
         native_gguf_unlease_in_use(&output);
-        sweep_native_gguf_cache(&cache_root, "no-such-key");
         assert!(
-            !staged.exists(),
+            sweep_until_removed(&cache_root, "no-such-key", &[&staged]),
             "an unleased staging fallback must be reclaimable"
         );
     }
@@ -17983,9 +18063,8 @@ mod tests {
             "an in-flight key's completed staging dir must survive a sweep"
         );
         in_flight.disarm();
-        sweep_native_gguf_cache(&cache_root, "no-such-key");
         assert!(
-            !staged.exists(),
+            sweep_until_removed(&cache_root, "no-such-key", &[&staged]),
             "once disarmed, the unleased staging dir is reclaimable"
         );
     }
@@ -18023,12 +18102,11 @@ mod tests {
         native_gguf_lease_in_use(&cache_root, &released, None);
         native_gguf_unlease_in_use(&released);
 
-        sweep_native_gguf_cache(&cache_root, "no-such-key");
-        assert!(still_leased.exists(), "a leased live dir must survive");
         assert!(
-            !released.exists(),
+            sweep_until_removed(&cache_root, "no-such-key", &[&released]),
             "a live-pid live dir whose lease was released is reclaimable"
         );
+        assert!(still_leased.exists(), "a leased live dir must survive");
         native_gguf_unlease_in_use(&still_leased);
     }
 

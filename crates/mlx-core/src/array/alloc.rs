@@ -216,6 +216,11 @@ mod tests {
 
     #[test]
     fn cpu_ops_match_convert_guard_bytes() {
+        if !crate::test_support::in_own_process(
+            "array::alloc::tests::cpu_ops_match_convert_guard_bytes",
+        ) {
+            return;
+        }
         let x = special_f32();
         let ours = (
             bits32(&x.log_cpu().unwrap()),

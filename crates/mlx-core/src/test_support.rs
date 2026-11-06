@@ -386,7 +386,9 @@ pub(crate) fn metal_device_absent_when(require_metal: bool, msg: &str) -> bool {
 
 /// Runs the calling test's body alone in a child test process: `true` in the
 /// child (run the body), `false` in the parent once the child passed. `name`
-/// is the test's libtest path (`utils::gguf_plan::tests::foo`).
+/// is the test's libtest path (`utils::gguf_plan::tests::foo`). The child
+/// includes ignored tests, so an `#[ignore]`d caller run with `--ignored`
+/// still runs its body.
 ///
 /// For tests that convert: `CpuConvertGuard` sets MLX's process-wide default
 /// device to CPU for the whole conversion, so a conversion in the shared test
@@ -398,7 +400,7 @@ pub(crate) fn in_own_process(name: &str) -> bool {
         return true;
     }
     let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--test-threads=1"])
+        .args(["--exact", name, "--include-ignored", "--test-threads=1"])
         .env(CHILD, name)
         .output()
         .unwrap();
@@ -408,6 +410,25 @@ pub(crate) fn in_own_process(name: &str) -> bool {
         "{name} in its own process:\n{stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    false
+}
+
+/// Sweeps `cache` until every dir in `gone` is removed (bounded at 5 s). A
+/// pass skips everything while another prepare's sweep holds the sidecar
+/// mutex, and skips an entry while the in-use registry or in-flight key set
+/// is locked: any concurrent in-process prepare or lease, by design.
+pub(crate) fn sweep_until_removed(
+    cache: &std::path::Path,
+    current_key: &str,
+    gone: &[&std::path::Path],
+) -> bool {
+    for _ in 0..500 {
+        crate::utils::gguf::sweep_native_gguf_cache(cache, current_key);
+        if gone.iter().all(|dir| !dir.exists()) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     false
 }
 
