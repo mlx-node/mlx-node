@@ -384,6 +384,21 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/utils/testdata/gguf_import_golden")
     }
 
+    /// Sweeps until every dir in `gone` is removed. A pass skips everything
+    /// while another prepare's sweep holds the sidecar mutex, and skips an
+    /// entry while the in-use registry or in-flight key set is locked: any
+    /// concurrent in-process prepare or lease, by design.
+    fn sweep_until_removed(cache: &Path, gone: &[&Path]) -> bool {
+        for _ in 0..500 {
+            sweep_native_gguf_cache(cache, "unrelated-key");
+            if gone.iter().all(|dir| !dir.exists()) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
     fn family(fx: &ImportFixture) -> NativeGgufFamily {
         match fx.family {
             ImportFixtureFamily::Qwen35 => NativeGgufFamily::Qwen35,
@@ -573,8 +588,10 @@ mod tests {
         sweep_native_gguf_cache(&cache, "unrelated-key");
         assert!(dir.is_dir(), "the sweep removed a leased asset entry");
         native_gguf_unlease_in_use(&dir);
-        sweep_native_gguf_cache(&cache, "unrelated-key");
-        assert!(!dir.exists(), "the stale entry survived without its lease");
+        assert!(
+            sweep_until_removed(&cache, &[&dir]),
+            "the stale entry survived without its lease"
+        );
         fs::remove_dir_all(&work).ok();
     }
 
@@ -609,7 +626,7 @@ mod tests {
             dir
         };
         let (v6, v7, v8) = (entry(6), entry(7), entry(8));
-        sweep_native_gguf_cache(&cache, "unrelated-key");
+        sweep_until_removed(&cache, &[&v6, &v7]);
         assert!(!v6.exists(), "an aged v6 entry must be swept (control)");
         assert!(!v7.exists(), "an aged v7 weight entry must be swept");
         assert!(v8.is_dir(), "a healthy aged v8 asset entry must survive");

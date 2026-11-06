@@ -384,6 +384,33 @@ pub(crate) fn metal_device_absent_when(require_metal: bool, msg: &str) -> bool {
     msg.contains("Metal GPU not available") || msg.contains("No Metal device found")
 }
 
+/// Runs the calling test's body alone in a child test process: `true` in the
+/// child (run the body), `false` in the parent once the child passed. `name`
+/// is the test's libtest path (`utils::gguf_plan::tests::foo`).
+///
+/// For tests that convert: `CpuConvertGuard` sets MLX's process-wide default
+/// device to CPU for the whole conversion, so a conversion in the shared test
+/// process routes every concurrent Metal test to CPU ("PagedKVWrite CPU
+/// NYI", "[GatherMM::eval] Currently only supports float32").
+pub(crate) fn in_own_process(name: &str) -> bool {
+    const CHILD: &str = "MLX_TEST_OWN_PROCESS";
+    if std::env::var(CHILD).is_ok_and(|child| child == name) {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--test-threads=1"])
+        .env(CHILD, name)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "{name} in its own process:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
 #[cfg(test)]
 mod skip_predicate_tests {
     use super::metal_device_absent_when;

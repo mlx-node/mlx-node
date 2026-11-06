@@ -827,6 +827,11 @@ mod tests {
 
     #[tokio::test]
     async fn header_tiled_set_equals_base_golden() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf_plan::tests::header_tiled_set_equals_base_golden",
+        ) {
+            return;
+        }
         let work = work_dir("tiled");
         for name in IMPORT_FIXTURE_NAMES {
             let fixture = checked_fixture(name, &work.join("src").join(name));
@@ -876,6 +881,11 @@ mod tests {
 
     #[tokio::test]
     async fn converter_output_equals_base_golden() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf_plan::tests::converter_output_equals_base_golden",
+        ) {
+            return;
+        }
         let work = work_dir("convert");
         for name in IMPORT_FIXTURE_NAMES {
             let fixture = checked_fixture(name, &work.join("src").join(name));
@@ -953,6 +963,11 @@ mod tests {
     #[cfg(debug_assertions)]
     #[tokio::test]
     async fn converter_tiler_drift_debug_asserts() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf_plan::tests::converter_tiler_drift_debug_asserts",
+        ) {
+            return;
+        }
         let work = work_dir("drift");
         let fixture = checked_fixture("qwen35-dense-untied", &work.join("src/untied"));
         let planned = plan_fixture(&fixture);
