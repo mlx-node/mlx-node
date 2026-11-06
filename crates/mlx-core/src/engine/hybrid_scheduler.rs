@@ -24,8 +24,8 @@ use crate::engine::backend::{
 use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
 use crate::engine::model_command::{FamilyCommand, ModelCommand, handle_model_command};
 use crate::engine::scheduler::{
-    BlockTelemetry, PreemptionMode, PreemptionReplay, RowStepResult, Scheduler, SchedulerAction,
-    SchedulerError, StepExecutor, StepKind, StepPlan, StepResult, TurnState,
+    BlockTelemetry, PreemptedTurn, PreemptionMode, PreemptionReplay, RowStepResult, Scheduler,
+    SchedulerAction, SchedulerError, StepExecutor, StepKind, StepPlan, StepResult, TurnState,
     install_preemption_replay, is_paged_allocation_blocked,
 };
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
@@ -747,16 +747,21 @@ pub(crate) fn scheduled_booking(
     )
 }
 
-/// Blocks a preempted on-demand turn books to resume: its replayed history
-/// plus the step it blocked at (the pending token and `draft_rows`), never
-/// less than it already booked.
+/// Blocks a preempted on-demand turn that blocked books to resume: its
+/// replayed history plus the step it blocked at (the pending token and
+/// `draft_rows`), never past the whole turn and never less than it already
+/// booked. The running step caps its drafts at the output left the same way.
 pub(crate) fn resume_booking_blocks(
     booked_blocks: u32,
     history_tokens: u32,
     draft_rows: u32,
+    requested_tokens: u32,
     block_size: u32,
 ) -> u32 {
-    let rows = history_tokens.saturating_add(1).saturating_add(draft_rows);
+    let next_step = history_tokens.saturating_add(1);
+    let rows = next_step
+        .saturating_add(draft_rows)
+        .min(requested_tokens.max(next_step));
     booked_blocks.max(rows.div_ceil(block_size.max(1)))
 }
 
@@ -2302,7 +2307,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let Some(turn) = self.scheduler.preempt_running(seq_id) else {
             return false;
         };
-        self.handle_preempted(turn);
+        self.handle_preempted(PreemptedTurn {
+            turn,
+            blocked: false,
+        });
         true
     }
 
@@ -3110,7 +3118,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     /// deliberately dropped because they cannot be rewound. Resume enters
     /// through `prime_prefix_state`, whose right-to-left checkpoint/sidecar
     /// lookup reconstructs the deepest GDN boundary that agrees with K/V.
-    fn handle_preempted(&mut self, mut turn: TurnState<ScheduledTurn<B::PrefixState>>) {
+    fn handle_preempted(&mut self, preempted: PreemptedTurn<ScheduledTurn<B::PrefixState>>) {
+        let PreemptedTurn { mut turn, blocked } = preempted;
+        let held_blocks = turn.block_materialized_blocks;
         let prefix_tokens = turn.num_computed_tokens;
         let prompt_tokens = turn.payload.prompt_tokens.clone();
         let replay = match install_preemption_replay(
@@ -3153,30 +3163,39 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return;
         }
         if self.inner.scheduler_books_on_demand() {
-            self.book_resume_of_blocked_step(&mut turn, replay.tokens.len() as u32);
+            self.book_resume(&mut turn, replay.tokens.len() as u32, blocked, held_blocks);
         }
         turn.payload.preemption_replay = Some(replay);
         self.scheduler.record_preemption_mode(mode);
         self.scheduler.prepend_preempted(turn);
     }
 
-    /// A victim resumes only into room for its replayed history plus the step
-    /// it was preempted at (the pending token and its draft rows). Booking
-    /// less re-admits it into the same shortage, so it replays and blocks
-    /// again every step. Its state charge stays the admission one, as a
-    /// running turn's does: pricing draft state on the whole history makes
-    /// a lone victim reject a resume whose rows still fit the max pool.
-    fn book_resume_of_blocked_step(
+    /// A victim that blocked resumes only into room for its replayed history
+    /// plus the step it was preempted at (the pending token and its draft
+    /// rows). Booking less re-admits it into the same shortage, so it replays
+    /// and blocks again every step. A victim that did not block resumes to
+    /// the blocks it held (`held_blocks`, read before replay zeroes them).
+    /// Its state charge stays the admission one, as a running turn's does:
+    /// pricing draft state on the whole history makes a lone victim reject a
+    /// resume whose rows still fit the max pool.
+    fn book_resume(
         &self,
         turn: &mut TurnState<ScheduledTurn<B::PrefixState>>,
         history_tokens: u32,
+        blocked: bool,
+        held_blocks: u32,
     ) {
-        turn.block_reservation_total = resume_booking_blocks(
-            turn.block_reservation_total,
-            history_tokens,
-            turn.decode_draft_allowance,
-            turn.block_size.max(1),
-        );
+        turn.block_reservation_total = if blocked {
+            resume_booking_blocks(
+                turn.block_reservation_total,
+                history_tokens,
+                turn.decode_draft_allowance,
+                turn.payload.requested_tokens,
+                turn.block_size.max(1),
+            )
+        } else {
+            turn.block_reservation_total.max(held_blocks)
+        };
     }
 
     fn try_resume_preempted(&mut self) {
@@ -3625,13 +3644,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 for turn in completed {
                     self.finish_completed(turn);
                 }
-                if let Some(turn) = preempted {
+                if let Some(preempted) = preempted {
                     if self.inner.scheduler_books_on_demand()
-                        && self.reclaim_for_blocked_step(turn.seq_id)
+                        && self.reclaim_for_blocked_step(preempted.turn.seq_id)
                     {
-                        self.scheduler.reinstate_running(turn);
+                        self.scheduler.reinstate_running(preempted.turn);
                     } else {
-                        self.handle_preempted(turn);
+                        self.handle_preempted(preempted);
                     }
                     may_resume_preempted = false;
                 }
@@ -5360,9 +5379,9 @@ pub(crate) mod tests {
     /// Mutation: drop the draft rows → red (4 ≠ 5).
     #[test]
     fn lone_victim_resumes_only_into_its_blocked_step() {
-        assert_eq!(resume_booking_blocks(2, 63, 0, 16), 4);
-        assert_eq!(resume_booking_blocks(2, 63, 3, 16), 5);
-        assert_eq!(resume_booking_blocks(9, 63, 3, 16), 9);
+        assert_eq!(resume_booking_blocks(2, 63, 0, 1_000, 16), 4);
+        assert_eq!(resume_booking_blocks(2, 63, 3, 1_000, 16), 5);
+        assert_eq!(resume_booking_blocks(9, 63, 3, 1_000, 16), 9);
         let Some((mut state, snapshot)) = growable_qwen35_state() else {
             return;
         };
@@ -5374,7 +5393,7 @@ pub(crate) mod tests {
         let outcome = state
             .try_reserve_with_policy(
                 2,
-                resume_booking_blocks(2, 63, 3, 16),
+                resume_booking_blocks(2, 63, 3, 1_000, 16),
                 0,
                 0,
                 snapshot,
@@ -5386,6 +5405,89 @@ pub(crate) mod tests {
             matches!(outcome, MemoryReserveOutcome::Reject { total_blocks: 4 }),
             "{outcome:?}"
         );
+    }
+
+    /// A victim at history 63 with one output token left needs 64 rows: its
+    /// three draft rows run past the whole turn, so it books 4 blocks, not 5,
+    /// and resumes alone in a pool that cannot grow past 4 blocks.
+    /// Mutation: drop the `.min(requested_tokens…)` cap in
+    /// `resume_booking_blocks` → red (5 blocks, Reject).
+    #[test]
+    fn lone_victim_with_one_token_left_resumes_in_its_last_block() {
+        let Some((mut state, _)) = growable_qwen35_state() else {
+            return;
+        };
+        let mut turn = speculative::tests::request(
+            &mut state.inner,
+            2,
+            (0..40).map(|token| token % 16).collect(),
+            true,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_block_reservation(2, 0, 16);
+        turn.payload.requested_tokens = 64;
+        assert_eq!(turn.decode_draft_allowance, 3);
+        state.book_resume(&mut turn, 63, true, 0);
+        state.inner.release_scheduled_recurrent_for(2);
+        state.inner.release_scheduled_speculation(2);
+        state
+            .inner
+            .release_scheduled_cache(2)
+            .expect("release the victim");
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("scheduler snapshot")
+            .expect("paged adapter present");
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(Arc::new(|_| Ok(4))));
+        let outcome = state
+            .try_reserve_with_policy(
+                2,
+                turn.block_reservation_total,
+                0,
+                0,
+                snapshot,
+                false,
+                <Qwen35Inner as HybridSchedulerBackend>::release_scheduled_cache,
+            )
+            .expect("resume decision");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "{outcome:?}"
+        );
+        assert_eq!(resume_booking_blocks(2, 63, 3, 64, 16), 4);
+        assert_eq!(resume_booking_blocks(2, 63, 3, 66, 16), 5);
+        assert_eq!(resume_booking_blocks(2, 63, 3, 67, 16), 5);
+        assert_eq!(resume_booking_blocks(2, 63, 3, 10, 16), 4);
+    }
+
+    /// A victim that did not block resumes to the blocks it held, not to the
+    /// blocked row's step; one that blocked books its own step.
+    /// Mutation: ignore `blocked` in `book_resume` → red (5 ≠ 4).
+    #[test]
+    fn unblocked_victim_resumes_to_held_blocks() {
+        let Some((mut state, _)) = growable_qwen35_state() else {
+            return;
+        };
+        let mut turn = speculative::tests::request(
+            &mut state.inner,
+            2,
+            (0..40).map(|token| token % 16).collect(),
+            true,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_block_reservation(3, 0, 16);
+        turn.payload.requested_tokens = 1_000;
+        state.book_resume(&mut turn, 63, false, 4);
+        assert_eq!(turn.block_reservation_total, 4);
+        state.book_resume(&mut turn, 63, false, 2);
+        assert_eq!(turn.block_reservation_total, 4);
+        state.book_resume(&mut turn, 63, true, 4);
+        assert_eq!(turn.block_reservation_total, 5);
     }
 
     /// A blocked step frees an idle owner's blocks and keeps its victim
@@ -5569,7 +5671,7 @@ pub(crate) mod tests {
     /// overflows.
     /// Mutation: re-price `recurrent_state_bytes` with
     /// `scheduled_draft_state_bytes` of the booked tokens in
-    /// `book_resume_of_blocked_step` → red (Reject).
+    /// `book_resume` → red (Reject).
     #[test]
     fn lone_resume_after_contention_fits_the_max_pool() {
         let Some((mut state, live)) = growable_qwen35_state() else {
@@ -5588,7 +5690,7 @@ pub(crate) mod tests {
         .with_block_reservation(4, 0, 16)
         .with_recurrent_state_reservation(admission);
         turn.payload.requested_tokens = 78_464;
-        state.book_resume_of_blocked_step(&mut turn, 1_000);
+        state.book_resume(&mut turn, 1_000, true, 0);
         let blocks = turn.block_reservation_total;
         let bytes_per_block = live.bytes_per_block;
         let rows_bytes =
@@ -5630,7 +5732,7 @@ pub(crate) mod tests {
     /// its admission state charge, as a running turn does.
     /// Mutation: re-price `recurrent_state_bytes` with
     /// `scheduled_draft_state_bytes` of the booked tokens in
-    /// `book_resume_of_blocked_step` → red.
+    /// `book_resume` → red.
     #[test]
     fn resumed_victim_keeps_its_admission_state_charge() {
         let Some((mut state, _)) = growable_qwen35_state() else {
@@ -5649,10 +5751,10 @@ pub(crate) mod tests {
         .with_block_reservation(4, 0, 16)
         .with_recurrent_state_reservation(admission);
         turn.payload.requested_tokens = 78_464;
-        state.book_resume_of_blocked_step(&mut turn, 40_000);
+        state.book_resume(&mut turn, 40_000, true, 0);
         assert_eq!(
             turn.block_reservation_total,
-            resume_booking_blocks(4, 40_000, 3, 16)
+            resume_booking_blocks(4, 40_000, 3, 78_464, 16)
         );
         assert_eq!(turn.recurrent_state_bytes, admission);
     }
