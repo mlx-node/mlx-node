@@ -447,7 +447,7 @@ impl Qwen35Inner {
         info!(
             "Qwen3.5 DFlash2 context window: speculative_window_tokens={:?}, pool_window_tokens={}, \
              kv_format={:?}, kv_row_bytes={}, trained={}, draft_trained={}, \
-             dflash2_pool_window={:?}, dflash2_reserve_window={:?}",
+             dflash2_pool_window={:?}, dflash2_reserve_window={:?}, kv_extent_rows={}",
             self.speculative_window(),
             self.pool_context_limit(),
             crate::models::qwen3_5::dflash2_turn::dflash2_target_kv_format(&*self),
@@ -456,6 +456,7 @@ impl Qwen35Inner {
             terms.draft_trained,
             terms.pool,
             terms.reserve,
+            terms.extent_rows,
         );
         Ok(())
     }

@@ -646,6 +646,31 @@ impl KVCache {
         self.keys.as_ref().map_or(Ok(0), |keys| keys.shape_at(2))
     }
 
+    /// Rows the cache holds without growing: its capacity, or before the
+    /// first allocation the rows that allocation is sized for.
+    pub(crate) fn reserved_rows(&self) -> Result<i64> {
+        Ok(self.capacity()?.max(self.pending_rows))
+    }
+
+    /// Make the cache hold exactly `rows` rows when it holds fewer, with no
+    /// step rounding. An empty cache only records the size for its first
+    /// allocation; a live cache is [`Self::compact`]ed into the larger buffer.
+    pub(crate) fn grow_exact(&mut self, rows: i64) -> Result<()> {
+        if rows > i64::from(i32::MAX) {
+            return Err(Error::from_reason(format!(
+                "KV cache reservation of {rows} rows is too large"
+            )));
+        }
+        if self.reserved_rows()? >= rows {
+            return Ok(());
+        }
+        if self.keys.is_none() {
+            self.pending_rows = rows;
+            return Ok(());
+        }
+        self.compact(rows)
+    }
+
     /// Copy rows `[0:offset]` into fresh, evaluated buffers of `capacity`
     /// rows and release the old ones. The copy is evaluated before the old
     /// buffers are dropped, so the transient is the new buffers' size.
@@ -1681,6 +1706,47 @@ mod tests {
         assert_eq!(cache.get_offset(), 0);
         assert!(cache.int8_view().is_none());
         assert!(cache.key_scales_ref().is_none());
+    }
+
+    /// `grow_exact` sizes an int8 cache to exactly a capacity that is not
+    /// step-aligned, cold or live at an unaligned frontier, keeps the used
+    /// rows and scales bit for bit, and appends up to that capacity never
+    /// grow it. Mutation: call `self.reserve(rows)` instead of
+    /// `self.compact(rows)` / setting `pending_rows` in `grow_exact` → red
+    /// (capacity 1280 ≠ 1031).
+    #[test]
+    fn grow_exact_holds_the_cap() {
+        if !metal() {
+            return;
+        }
+        const CAP: i64 = 1031;
+        let mut cold = KVCache::with_format(KvFormat::Int8);
+        cold.grow_exact(CAP).unwrap();
+        assert_eq!(cold.reserved_rows().unwrap(), CAP);
+        let (k, v) = rows256(4, 9, 1.5);
+        cold.update_and_fetch_int8(&k, &v).unwrap();
+        assert_eq!(cold.capacity().unwrap(), CAP);
+
+        let mut live = KVCache::with_format(KvFormat::Int8);
+        let (k, v) = rows256(4, 257, 2.5);
+        live.update_and_fetch_int8(&k, &v).unwrap();
+        assert_eq!(live.capacity().unwrap(), 512);
+        let expected = live.int8_view().unwrap();
+        live.grow_exact(CAP).unwrap();
+        assert_eq!(live.capacity().unwrap(), CAP);
+        assert_eq!(live.get_offset(), 257);
+        let after = live.int8_view().unwrap();
+        assert_eq!(bits(&after.keys), bits(&expected.keys));
+        assert_eq!(bits(&after.values), bits(&expected.values));
+        assert_eq!(bits(&after.key_scales), bits(&expected.key_scales));
+        assert_eq!(bits(&after.value_scales), bits(&expected.value_scales));
+        while i64::from(live.get_offset()) + 8 <= CAP {
+            let (k, v) = rows256(4, 8, 0.5);
+            live.update_and_fetch_int8(&k, &v).unwrap();
+            assert_eq!(live.capacity().unwrap(), CAP);
+        }
+        live.grow_exact(CAP - 1).unwrap();
+        assert_eq!(live.capacity().unwrap(), CAP, "never shrinks");
     }
 
     /// Growth across the step boundary without a reservation concatenates
