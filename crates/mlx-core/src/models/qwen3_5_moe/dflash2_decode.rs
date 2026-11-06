@@ -13,7 +13,7 @@ use super::layer_cache::{
 use super::model::{PREFILL_STEP_SIZE, Qwen35MoeInner};
 use crate::models::qwen3_5::dflash2::DFlash2ContextCache;
 use crate::models::qwen3_5::dflash2_state::trace::PrefixTracker;
-use crate::models::qwen3_5::dflash2_turn::{DFlash2Target, DFlash2TurnState};
+use crate::models::qwen3_5::dflash2_turn::{DFlash2DecodeKv, DFlash2Target, DFlash2TurnState};
 use crate::models::qwen3_5::gdn_blob::GdnStateBlobs;
 
 struct PendingGdn {
@@ -49,6 +49,7 @@ pub(crate) struct Qwen35MoeDFlash2Stepper<'a> {
     deferred_gdn: Option<DeferredGdnState>,
     verify_confidence: Option<MxArray>,
     verify_row_budget: Option<MxArray>,
+    kv: DFlash2DecodeKv,
 }
 
 fn dflash2_gdn_blob_enabled() -> bool {
@@ -334,6 +335,7 @@ impl DsparkStepper for Qwen35MoeDFlash2Stepper<'_> {
             ));
         }
         self.ensure_clean("verify")?;
+        self.kv.ensure_ahead(self.inner, verify_ids.len())?;
         // Host verification includes teacher forcing and target-only steps.
         // Its tokens need not be the selector's path, so never mask or label it.
         self.verify_confidence = None;
@@ -360,10 +362,10 @@ impl DsparkStepper for Qwen35MoeDFlash2Stepper<'_> {
     /// shared roots.
     fn verify_device(&mut self, verify_ids: &MxArray) -> Result<DsparkVerifyOutput> {
         self.ensure_clean("verify")?;
-        self.prepare_gdn_verify(
-            usize::try_from(verify_ids.shape_at(0)?)
-                .map_err(|_| Error::from_reason("negative verify rows"))?,
-        )?;
+        let rows = usize::try_from(verify_ids.shape_at(0)?)
+            .map_err(|_| Error::from_reason("negative verify rows"))?;
+        self.kv.ensure_ahead(self.inner, rows)?;
+        self.prepare_gdn_verify(rows)?;
         let snapshot = snapshot_all_mtp(
             self.inner.caches.as_ref().ok_or_else(|| {
                 Error::from_reason("Qwen3.5 MoE DFlash2 target caches are absent")
@@ -663,6 +665,7 @@ impl DsparkBackend for Qwen35MoeInner {
         } else {
             None
         };
+        let kv = DFlash2DecodeKv::begin(&*self, state.kv)?;
         Ok(Qwen35MoeDFlash2Stepper {
             inner: self,
             context: state.context,
@@ -677,6 +680,7 @@ impl DsparkBackend for Qwen35MoeInner {
             deferred_gdn,
             verify_confidence: None,
             verify_row_budget: None,
+            kv,
         })
     }
 }
@@ -748,6 +752,10 @@ impl DFlash2Target for Qwen35MoeInner {
 
     fn dflash2_window(&self) -> Option<u32> {
         self.speculative_window()
+    }
+
+    fn dflash2_kv_extent_rows(&self) -> Option<u64> {
+        self.dflash2_window.map(|terms| terms.extent_rows)
     }
 
     fn dense_config(&self) -> std::borrow::Cow<'_, crate::models::qwen3_5::Qwen3_5Config> {
@@ -1272,6 +1280,7 @@ mod tests {
         inner.dflash2_turn_state = Some(DFlash2TurnState {
             context,
             next_position,
+            kv: None,
         });
         let block_size = inner
             .dflash2
@@ -2066,6 +2075,7 @@ mod tests {
             inner.dflash2_turn_state = Some(DFlash2TurnState {
                 context,
                 next_position,
+                kv: None,
             });
         };
         open(inner);

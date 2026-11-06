@@ -681,6 +681,91 @@ impl<B: Backing> HybridStateStore<B> {
         Ok(report)
     }
 
+    /// Frees parked KV by one step of the [`Self::evict_for`] ladder, for a
+    /// caller that re-reads the live headroom and retries after each step:
+    /// compact one end state's KV slack, else demote one end state whose KV
+    /// shrinks to its anchor, else drop one capture, else drop one end
+    /// state, each least recently used first and holding KV. A copy runs
+    /// only when `kv_headroom` covers it. `None` when no step frees KV;
+    /// `pinned` is never touched.
+    pub(crate) fn evict_one(
+        &mut self,
+        kv_headroom: u64,
+        pinned: Option<EntryId>,
+    ) -> Result<Option<EvictReport>> {
+        let start = self.bytes();
+        let mut report = EvictReport::default();
+        let fits = |plan: &Shrink| plan.frees > 0 && plan.transient <= kv_headroom;
+        let compact = self.lru_ids(true, pinned).into_iter().find_map(|id| {
+            let idx = self.position(id)?;
+            let kv = self.entries[idx].kv.as_ref()?;
+            kv.shrink_plan(kv.rows()).filter(fits).map(|_| idx)
+        });
+        let demote = || {
+            self.lru_ids(true, pinned).into_iter().find_map(|id| {
+                let idx = self.position(id)?;
+                let entry = &self.entries[idx];
+                let row = entry.anchor.as_ref()?.row;
+                let shrinks = entry
+                    .kv
+                    .as_ref()
+                    .and_then(|kv| kv.shrink_plan(row))
+                    .filter(fits)
+                    .is_some();
+                shrinks.then_some((idx, row))
+            })
+        };
+        if let Some(idx) = compact {
+            let entry = &mut self.entries[idx];
+            if let Some(kv) = entry.kv.as_mut() {
+                let rows = kv.rows();
+                kv.shrink(rows)?;
+            }
+            entry.refresh_bytes();
+            report.compacted = 1;
+        } else if let Some((idx, row)) = demote() {
+            let end_depth = self.entries[idx].tokens.len();
+            self.remember_evicted(idx, end_depth);
+            let entry = &mut self.entries[idx];
+            entry.end = None;
+            if let Some(kv) = entry.kv.as_mut() {
+                kv.shrink(row)?;
+            }
+            entry.tokens.truncate(row);
+            entry.chain.truncate(row / entry.block_size as usize);
+            entry.refresh_bytes();
+            report.demoted = 1;
+        } else {
+            let victim = [false, true].into_iter().find_map(|ends| {
+                self.lru_ids(ends, pinned).into_iter().find_map(|id| {
+                    let idx = self.position(id)?;
+                    let entry = &self.entries[idx];
+                    (entry.kv_bytes > 0).then_some((idx, ends))
+                })
+            });
+            let Some((idx, ends)) = victim else {
+                return Ok(None);
+            };
+            let points: Vec<usize> = self.entries[idx]
+                .resume_points()
+                .map(|(_, depth)| depth)
+                .collect();
+            for depth in points {
+                self.remember_evicted(idx, depth);
+            }
+            self.entries.remove(idx);
+            if ends {
+                report.dropped_ends = 1;
+            } else {
+                report.dropped_captures = 1;
+            }
+        }
+        let end = self.bytes();
+        report.freed_state_bytes = start.state_bytes.saturating_sub(end.state_bytes);
+        report.freed_kv_bytes = start.kv_bytes.saturating_sub(end.kv_bytes);
+        Ok(Some(report))
+    }
+
     /// Drops every entry and every remembered eviction (`ResetScope::Command`).
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
@@ -1161,6 +1246,52 @@ mod tests {
         assert!(r.satisfied);
     }
 
+    /// Each `evict_one` call takes exactly one step of the ladder, in the
+    /// order `evict_for` frees: compact, demote, drop captures, drop end
+    /// states, least recently used first; `None` once nothing is left.
+    /// Mutation: run `self.evict_for` with an unbounded need inside
+    /// `evict_one` → red (the first call empties the store).
+    #[test]
+    fn store_evict_one_takes_one_lru_step() {
+        let fx = Fixture::new();
+        let mut store = Store::with_state_budget(BS, u64::MAX);
+        let e_old = lineage(1, 100);
+        let e_new = lineage(2, 100);
+        let c = lineage(3, 64);
+        store
+            .insert(
+                Lineage::text(&e_old, 0),
+                fx.end("old", &e_old, Some(64), 400),
+            )
+            .unwrap();
+        store
+            .insert(Lineage::text(&c, 0), fx.capture("c", 64))
+            .unwrap();
+        store
+            .insert(Lineage::text(&e_new, 0), fx.end("new", &e_new, None, 0))
+            .unwrap();
+        fx.drain();
+        let mut step = |want: &[&str], entries: usize| {
+            let report = store
+                .evict_one(100 * ROW, None)
+                .unwrap()
+                .expect("a step frees bytes");
+            assert_eq!(fx.drain(), want);
+            assert_eq!(store.bytes().entries, entries, "{want:?}");
+            report
+        };
+        let r = step(&["shrink old 100"], 3);
+        assert_eq!((r.compacted, r.freed_kv_bytes), (1, 400 * ROW));
+        let r = step(&["drop end old", "shrink old 64"], 3);
+        assert_eq!((r.demoted, r.freed_kv_bytes), (1, 36 * ROW));
+        let r = step(&["drop anchor old"], 2);
+        assert_eq!(r.dropped_captures, 1);
+        step(&["drop anchor c"], 1);
+        let r = step(&["drop end new"], 0);
+        assert_eq!(r.dropped_ends, 1);
+        assert!(store.evict_one(u64::MAX, None).unwrap().is_none());
+    }
+
     #[test]
     fn compaction_needs_headroom_for_its_copy() {
         let fx = Fixture::new();
@@ -1231,17 +1362,15 @@ mod tests {
         );
     }
 
-    /// The turn's KV budget is 9/10 of the headroom, so a freed byte raises
-    /// it by 9/10 of a byte. The turn's eviction keeps going until the
-    /// budget read back after the frees covers the need: here past the first
-    /// end state, whose bytes alone would cover the need only 1:1.
+    /// The KV budget is 9/10 of the headroom, so a freed byte raises it by
+    /// 9/10 of a byte: `dflash2_kv_headroom_for` is the least headroom whose
+    /// budget covers a need. Mutation: `budget / 9` for `budget.div_ceil(9)`
+    /// in `dflash2_kv_headroom_for` → red.
     #[test]
-    fn turn_eviction_frees_until_the_reread_budget_covers_the_need() {
+    fn kv_headroom_for_is_the_least_covering_headroom() {
         use crate::models::qwen3_5::dflash2_decode::{
             dflash2_kv_budget_of, dflash2_kv_headroom_for,
         };
-        use crate::models::qwen3_5::dflash2_turn::evict_for_turn_kv;
-
         for budget in (0..2000).chain([u64::MAX / 20, 9 * GDN * ROW + 1]) {
             let headroom = dflash2_kv_headroom_for(budget);
             assert!(dflash2_kv_budget_of(headroom) >= budget, "{budget}");
@@ -1250,75 +1379,6 @@ mod tests {
                 "{budget}: {headroom} is not the least"
             );
         }
-
-        let fx = Fixture::new();
-        let mut store = Store::with_state_budget(BS, u64::MAX);
-        let a = lineage(1, 100);
-        let b = lineage(2, 100);
-        store
-            .insert(Lineage::text(&a, 0), fx.end("a", &a, None, 0))
-            .unwrap();
-        store
-            .insert(Lineage::text(&b, 0), fx.end("b", &b, None, 0))
-            .unwrap();
-        fx.drain();
-        let need = 100 * ROW;
-        let headroom = 0;
-        let r = evict_for_turn_kv(&mut store, need, 0, Some(headroom)).unwrap();
-        assert_eq!(fx.drain(), ["drop end a", "drop end b"]);
-        assert!(r.satisfied);
-        assert!(
-            dflash2_kv_budget_of(headroom + r.freed_kv_bytes) >= need,
-            "freed {} bytes: the budget read back stays under {need}",
-            r.freed_kv_bytes
-        );
-    }
-
-    /// The turn's transients count on top of its KV: a headroom that covers
-    /// the KV budget alone still evicts until it also covers the
-    /// transients, and one that covers both evicts nothing.
-    #[test]
-    fn turn_eviction_also_covers_the_turn_transients() {
-        use crate::models::qwen3_5::dflash2_decode::dflash2_kv_headroom_for;
-        use crate::models::qwen3_5::dflash2_turn::evict_for_turn_kv;
-
-        let fx = Fixture::new();
-        let mut store = Store::with_state_budget(BS, u64::MAX);
-        let a = lineage(1, 100);
-        store
-            .insert(Lineage::text(&a, 0), fx.end("a", &a, None, 0))
-            .unwrap();
-        fx.drain();
-        let need = 10 * ROW;
-        let transient = 50 * ROW;
-        let covered = dflash2_kv_headroom_for(need) + transient;
-        let r = evict_for_turn_kv(&mut store, need, transient, Some(covered)).unwrap();
-        assert!(r.satisfied);
-        assert!(fx.drain().is_empty());
-        let r = evict_for_turn_kv(&mut store, need, transient, Some(covered - 1)).unwrap();
-        assert!(r.satisfied);
-        assert_eq!(fx.drain(), ["drop end a"]);
-    }
-
-    /// With unreadable limits parked KV has no headroom to fit in: every
-    /// entry holding KV is evicted, even when the turn needs no new KV.
-    #[test]
-    fn unreadable_limits_evict_every_parked_kv() {
-        use crate::models::qwen3_5::dflash2_turn::evict_for_turn_kv;
-
-        let fx = Fixture::new();
-        let mut store = Store::with_state_budget(BS, u64::MAX);
-        for seed in [1, 2] {
-            let tokens = lineage(seed, 100);
-            store
-                .insert(Lineage::text(&tokens, 0), fx.end("e", &tokens, None, 0))
-                .unwrap();
-        }
-        fx.drain();
-        let r = evict_for_turn_kv(&mut store, 0, 0, None).unwrap();
-        assert!(!r.satisfied);
-        assert_eq!(store.bytes().entries, 0);
-        assert_eq!(store.bytes().kv_bytes, 0);
     }
 
     /// Eviction remembers each resume point it removes: a demotion the end

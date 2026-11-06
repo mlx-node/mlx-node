@@ -122,6 +122,7 @@ fn preflight_keeps_the_pool_window_when_a_dflash2_window_is_published() {
         pool: Some(trained),
         reserve: None,
         row_bytes: 1,
+        extent_rows: 256,
     });
     let speculative = inner.speculative_window().expect("a DFlash2 window");
     assert!(speculative > pool_window, "{speculative} vs {pool_window}");
@@ -164,6 +165,7 @@ fn dflash2_clamp_window_is_the_speculative_window() {
         pool: Some(trained + 1_000),
         reserve: None,
         row_bytes: 1,
+        extent_rows: 256,
     });
     let speculative = inner.speculative_window().expect("a DFlash2 window");
     assert!(speculative <= trained, "{speculative} vs {trained}");
@@ -194,6 +196,7 @@ fn context_limits_publish_both_windows() {
             pool: Some(draft_window),
             reserve: None,
             row_bytes: 1,
+            extent_rows: 256,
         });
         let limits = inner.context_limits_snapshot();
         assert_eq!(limits.trained_window_tokens, trained);

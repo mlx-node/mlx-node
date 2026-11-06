@@ -315,8 +315,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::models::qwen3_5::dflash2_decode::grow_dflash2_target_kv;
     use crate::models::qwen3_5::dflash2_decode::kv_row_bytes;
-    use crate::models::qwen3_5::dflash2_decode::reserve_dflash2_target_kv;
     use crate::models::qwen3_5::dflash2_decode::tests::{
         array_fingerprints, metal_is_default_device, run_tiny_dflash_turn,
         tiny_dflash_inner_with_attention_head_dim, tiny_int8_dflash_inner,
@@ -567,7 +567,7 @@ mod tests {
             let mut inner = fixture(name);
             turn(&mut inner, &tokenizer, &first)?;
             let used = inner.cached_token_history.len();
-            reserve_dflash2_target_kv(&mut inner.caches, (used + COMPACT_SLACK_ROWS + 512) as i64)?;
+            grow_dflash2_target_kv(&mut inner.caches, (used + COMPACT_SLACK_ROWS + 512) as i64)?;
             let before = live_rows(&inner)?;
             let (tokens, parts) = park_flat_dflash2_state(&mut inner).expect("parkable");
             let kv = parts.kv.as_ref().expect("parked KV");
@@ -628,7 +628,7 @@ mod tests {
             turn(&mut inner, &tokenizer, &prompt(1, 40))?;
             let used = inner.cached_token_history.len();
             assert!(used > R);
-            reserve_dflash2_target_kv(&mut inner.caches, (used + COMPACT_SLACK_ROWS + 512) as i64)?;
+            grow_dflash2_target_kv(&mut inner.caches, (used + COMPACT_SLACK_ROWS + 512) as i64)?;
             let below_anchor = attention_rows(live_attention(&inner), R)?;
             let draft_config = inner.dflash2.as_ref().expect("draft").config.clone();
             let (tokens, mut parts) = park_flat_dflash2_state(&mut inner).expect("parkable");
