@@ -156,6 +156,9 @@ pub(crate) trait DFlash2Target: ChatBackend {
     fn paged_adapter_ref(
         &self,
     ) -> Option<&crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter>;
+    fn paged_adapter_mut_ref(
+        &mut self,
+    ) -> Option<&mut crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter>;
     /// Whether the flat caches hold the retained prefix (no paged or MTP
     /// turn has moved past them).
     fn flat_lane_authoritative(&self) -> bool;
@@ -470,28 +473,6 @@ fn dflash2_kv_headroom_now() -> Option<u64> {
     dflash2_kv_headroom_bytes(dflash2_memory_snapshot())
 }
 
-/// The reservation parked states are evicted for, and the headroom it is
-/// measured against: `kv_bytes` of target KV plus `transient_bytes` the turn
-/// allocates and frees. With unreadable limits (`headroom` `None`) parked KV
-/// has nothing to fit in, so every entry holding KV goes.
-pub(crate) fn parked_kv_eviction(
-    kv_bytes: u64,
-    transient_bytes: u64,
-    headroom: Option<u64>,
-) -> (Reservation, u64) {
-    let kv_bytes = match headroom {
-        Some(_) => kv_bytes.saturating_add(transient_bytes),
-        None => u64::MAX,
-    };
-    (
-        Reservation {
-            state_bytes: 0,
-            kv_bytes,
-        },
-        headroom.unwrap_or(0),
-    )
-}
-
 /// The DFlash2 pool term inputs of `adapter`: its maximum's bytes past the
 /// blocks it has allocated, floored at the window it gives a paged turn
 /// after `recurrent_state_bytes`.
@@ -582,113 +563,74 @@ fn turn_memory<T: DFlash2Target>(
     Ok((row_bytes, transient))
 }
 
-/// Bytes the live headroom must hold before a paged turn of `tokens` rows
-/// starts: the grown pool buffer, which sits beside the old one while it is
-/// copied, sized to the shortfall over the blocks the pool can hand out; 0
-/// when those already cover the rows or the pool is at its maximum and
-/// cannot grow. Later decode growth is reclaimed per step.
-pub(crate) fn paged_turn_grow_bytes(
-    total_blocks: u32,
-    max_total_blocks: u32,
-    available_blocks: u32,
-    block_size: u32,
-    bytes_per_block: u64,
-    tokens: u64,
-) -> u64 {
-    let needed = tokens.div_ceil(u64::from(block_size.max(1)));
-    let shortfall = needed.saturating_sub(u64::from(available_blocks));
-    if shortfall == 0 || total_blocks >= max_total_blocks {
-        return 0;
-    }
-    u64::from(total_blocks)
-        .saturating_add(shortfall)
-        .min(u64::from(max_total_blocks))
-        .saturating_mul(bytes_per_block)
-}
-
-/// Bytes a turn of another kind books before it starts: pool growth for the
-/// prompt plus the first runway of output on a paged turn, those rows of
-/// target K/V otherwise.
-fn turn_kv_need_bytes<T: DFlash2Target>(target: &T, rows: u64, row_bytes: u64) -> Result<u64> {
-    let Some(adapter) = target.paged_adapter_ref() else {
-        return Ok(rows.saturating_mul(row_bytes));
-    };
-    let blocks = adapter.block_telemetry().map_err(Error::from_reason)?;
-    Ok(paged_turn_grow_bytes(
-        blocks.total_blocks,
-        blocks.max_total_blocks,
-        blocks.free_blocks.saturating_add(blocks.reclaimable_blocks),
-        adapter.block_size(),
-        adapter.bytes_per_block().map_err(Error::from_reason)?,
-        rows,
-    ))
-}
-
-/// Evicts parked states before a turn of another kind (paged, vision, MTP)
-/// takes the model, until the live headroom covers what that turn books
-/// before it starts (the prompt plus one runway of output) and its
-/// transients. The live state stays: its buffers are resident whether it
-/// parks or not. A failed eviction drops every parked state.
-pub(crate) fn evict_parked_dflash2_for_turn<T: DFlash2Target>(
+/// Before a vision turn on a load without a paged pool: parked states give
+/// way, one store step at a time, until the live headroom covers what the
+/// turn books first (its prompt plus one verify's rows of K/V) and its
+/// transients. The live state stays: a vision turn may continue its prefix.
+/// Unreadable limits evict nothing.
+pub(crate) fn evict_parked_dflash2_for_flat_turn<T: DFlash2Target>(
     target: &mut T,
     prompt_len: usize,
-    max_new_tokens: i32,
+) {
+    evict_parked_dflash2_for_flat_turn_with(target, prompt_len, |_| dflash2_kv_headroom_now());
+}
+
+pub(crate) fn evict_parked_dflash2_for_flat_turn_with<T: DFlash2Target>(
+    target: &mut T,
+    prompt_len: usize,
+    headroom: impl Fn(&T) -> Option<u64>,
 ) {
     if target.dflash2_states().store.bytes().entries == 0 {
         return;
     }
-    let ahead = max_new_tokens.clamp(0, super::config::QWEN35_DFLASH2_POOL_RUNWAY_TOKENS as i32);
-    let rows = prompt_len as u64 + ahead as u64;
-    let evicted = turn_memory(target, prompt_len, rows).and_then(|(row_bytes, transient)| {
-        let (need, headroom) = parked_kv_eviction(
-            turn_kv_need_bytes(target, rows, row_bytes)?,
-            transient,
-            dflash2_kv_headroom_now(),
-        );
-        target
-            .dflash2_states_mut()
-            .store
-            .evict_for(need, headroom, None)
-    });
-    match evicted {
-        Ok(report) if report.freed_kv_bytes > 0 || report.freed_state_bytes > 0 => {
-            crate::array::clear_cache();
-        }
-        Ok(_) => {}
+    let block_size = target.dflash2().map_or(1, |draft| draft.config.block_size);
+    let rows = prompt_len.saturating_add(block_size + 1) as u64;
+    let need = match turn_memory(target, prompt_len, rows) {
+        Ok((row_bytes, transient)) => rows.saturating_mul(row_bytes).saturating_add(transient),
         Err(error) => {
             tracing::warn!(
                 target: "mlx_core::inference",
-                "DFlash2 parked-state eviction failed, dropping every parked state: {}",
+                "DFlash2 parked-state eviction skipped: {}",
                 error.reason
             );
-            target.dflash2_states_mut().store.clear();
-            crate::array::clear_cache();
+            return;
+        }
+    };
+    while let Some(live) = headroom(target).filter(|&live| live < need) {
+        if !evict_one_parked_dflash2(target, live) {
+            return;
         }
     }
 }
 
-/// Evicts every parked state holding bytes after a scheduled admission's
-/// page-pool grow was declined: the probe reads live Metal memory, which
-/// parked states hold. The live state stays. Returns whether anything was
-/// freed.
-pub(crate) fn evict_parked_dflash2_for_pool_grow<T: DFlash2Target>(target: &mut T) -> bool {
-    if target.dflash2_states().store.bytes().entries == 0 {
-        return false;
-    }
-    let need = Reservation {
-        state_bytes: u64::MAX,
-        kv_bytes: u64::MAX,
-    };
-    let freed = match target.dflash2_states_mut().store.evict_for(need, 0, None) {
-        Ok(report) => report.freed_kv_bytes > 0 || report.freed_state_bytes > 0,
+#[cfg(test)]
+thread_local! {
+    /// Parked states this thread evicted for a page-pool grow.
+    pub(crate) static POOL_GROW_EVICTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// One store step of parked-state eviction against `kv_headroom` (which
+/// bounds the copy a compaction may run). Returns whether anything was
+/// freed; a failed step drops every parked state.
+fn evict_one_parked_dflash2<T: DFlash2Target>(target: &mut T, kv_headroom: u64) -> bool {
+    let freed = match target
+        .dflash2_states_mut()
+        .store
+        .evict_one(kv_headroom, None)
+    {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
         Err(error) => {
             tracing::warn!(
                 target: "mlx_core::inference",
                 "DFlash2 parked-state eviction failed, dropping every parked state: {}",
                 error.reason
             );
-            target.dflash2_states_mut().store.clear();
-            true
+            let states = target.dflash2_states_mut();
+            let held = states.store.bytes().entries > 0;
+            states.store.clear();
+            held
         }
     };
     if freed {
@@ -697,28 +639,42 @@ pub(crate) fn evict_parked_dflash2_for_pool_grow<T: DFlash2Target>(target: &mut 
     freed
 }
 
-/// Runs `step`; when its block growth was refused and `reclaim` frees
-/// memory, runs it once more. A refused paged step has changed nothing:
+/// Frees one parked state's step after a page-pool grow was declined (its
+/// probe reads live Metal memory, which parked states hold), as Splash's
+/// allocate loop reclaims one item before it retries (Engine.cpp:2056-2104,
+/// Cache.cpp:676-699). The live state stays. Returns whether anything was
+/// freed, so the caller retries the grow.
+pub(crate) fn evict_one_parked_dflash2_for_pool_grow<T: DFlash2Target>(target: &mut T) -> bool {
+    let live = dflash2_kv_headroom_now().unwrap_or(0);
+    let freed = evict_one_parked_dflash2(target, live);
+    #[cfg(test)]
+    if freed {
+        POOL_GROW_EVICTIONS.with(|count| count.set(count.get() + 1));
+    }
+    freed
+}
+
+/// Runs `step`; while its block growth is refused and `reclaim` frees
+/// memory, runs it again. A refused paged step has changed nothing:
 /// `record_tokens` allocates before any layer runs.
 pub(crate) fn retry_after_reclaim<T, R>(
     target: &mut T,
     mut step: impl FnMut(&mut T) -> Result<R>,
-    reclaim: impl FnOnce(&mut T) -> bool,
+    mut reclaim: impl FnMut(&mut T) -> bool,
 ) -> Result<R> {
-    match step(target) {
-        Err(error)
-            if crate::engine::scheduler::is_paged_allocation_blocked(&error.reason)
-                && reclaim(target) =>
-        {
-            step(target)
+    loop {
+        match step(target) {
+            Err(error)
+                if crate::engine::scheduler::is_paged_allocation_blocked(&error.reason)
+                    && reclaim(target) => {}
+            other => return other,
         }
-        other => other,
     }
 }
 
-/// One serial paged decode step that evicts parked states and retries when
-/// the pool could not grow for it: a grow probe reads live memory, which
-/// parked states hold.
+/// One serial paged decode step that evicts one parked state and retries
+/// while the pool could not grow for it: a grow probe reads live memory,
+/// which parked states hold.
 pub(crate) fn paged_step_reclaiming<T: DFlash2Target, R>(
     target: &mut T,
     step: impl FnMut(&mut T) -> Result<R>,
@@ -728,8 +684,67 @@ pub(crate) fn paged_step_reclaiming<T: DFlash2Target, R>(
             .paged_adapter_ref()
             .and_then(|adapter| adapter.block_telemetry().ok())
             .is_some_and(|blocks| blocks.total_blocks < blocks.max_total_blocks);
-        can_grow && evict_parked_dflash2_for_pool_grow(target)
+        can_grow && evict_one_parked_dflash2_for_pool_grow(target)
     })
+}
+
+/// Grows the page pool so it can hand out every block a serial turn's
+/// `prompt` takes before the turn's prefix lookup runs: an SSD restore
+/// allocates from the pool and cannot grow it, so a runway-sized pool caps
+/// the restore. Splash allocates a restored chain's pages through its
+/// allocate/reclaim loop before the restore starts (Engine.cpp:854-858).
+/// Blocks the live request holds count as available: the turn either
+/// continues on them or releases them. A declined grow reclaims one item
+/// and retries; with nothing left the turn's own allocation decides.
+pub(crate) fn grow_paged_pool_for_prompt<T>(
+    target: &mut T,
+    prompt: &[u32],
+    adapter: impl Fn(
+        &mut T,
+    )
+        -> Option<&mut crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter>,
+    mut reclaim_one: impl FnMut(&mut T) -> bool,
+) {
+    loop {
+        let Some(pool) = adapter(target) else {
+            return;
+        };
+        let Ok(blocks) = pool.block_telemetry() else {
+            return;
+        };
+        if blocks.total_blocks >= blocks.max_total_blocks {
+            return;
+        }
+        let live = pool
+            .active_seq_id()
+            .and_then(|seq_id| pool.block_table_for(seq_id))
+            .map_or(0, |table| table.num_blocks());
+        let available =
+            u64::from(blocks.free_blocks) + u64::from(blocks.reclaimable_blocks) + live as u64;
+        let needed = (prompt.len() as u64).div_ceil(u64::from(pool.block_size().max(1)));
+        let shortfall = needed.saturating_sub(available);
+        if shortfall == 0 {
+            return;
+        }
+        if pool.try_grow_pool(u32::try_from(shortfall).unwrap_or(u32::MAX)) {
+            return;
+        }
+        if !reclaim_one(target) {
+            return;
+        }
+    }
+}
+
+/// [`grow_paged_pool_for_prompt`] on `target`'s pool, reclaiming parked
+/// DFlash2 states. Runs after the turn parked the live state, so that state
+/// is reclaimable too.
+pub(crate) fn ensure_paged_pool_for_prompt<T: DFlash2Target>(target: &mut T, prompt: &[u32]) {
+    grow_paged_pool_for_prompt(
+        target,
+        prompt,
+        |target| target.paged_adapter_mut_ref(),
+        evict_one_parked_dflash2_for_pool_grow,
+    );
 }
 
 /// How a DFlash2 turn's flat target KV grows: to at most `cap_rows` (the
@@ -2218,26 +2233,6 @@ mod tests {
         Ok(())
     }
 
-    /// The pool grows to cover the prompt plus the runway: 3,048 rows need
-    /// 191 blocks, 100 are free, so 91 more beside the 275 live ones. A pool
-    /// at its maximum allocates no grow buffer.
-    /// Mutation: return the shortfall's bytes → red. Mutation: drop the
-    /// `total_blocks >= max_total_blocks` guard → red (5,051 MiB ≠ 0).
-    #[test]
-    fn paged_turn_grow_bytes_is_the_grown_pool() {
-        const MIB: u64 = 1 << 20;
-        assert_eq!(
-            paged_turn_grow_bytes(275, 5_051, 100, 16, MIB, 1_000 + 2_048),
-            366 * MIB
-        );
-        assert_eq!(paged_turn_grow_bytes(275, 5_051, 191, 16, MIB, 3_048), 0);
-        assert_eq!(
-            paged_turn_grow_bytes(275, 300, 0, 16, MIB, 3_048),
-            300 * MIB
-        );
-        assert_eq!(paged_turn_grow_bytes(5_051, 5_051, 0, 16, MIB, 3_048), 0);
-    }
-
     struct BudgetOverride;
     impl Drop for BudgetOverride {
         fn drop(&mut self) {
@@ -2433,42 +2428,45 @@ mod tests {
         Ok(())
     }
 
-    /// A turn of another kind with an omitted budget keeps a parked state
-    /// when the headroom covers its prompt plus one runway of output.
-    /// Mutation: size the rows as `prompt + max_new` → red (state evicted).
+    /// A vision turn on a flat load evicts parked states one store step at a
+    /// time and stops once the headroom covers its prompt plus one verify's
+    /// rows and its transients.
+    /// Mutation: evict every parked state at once (`store.clear()` in
+    /// `evict_parked_dflash2_for_flat_turn_with`) → red (0 ≠ 1 entries).
+    /// Mutation: skip the eviction → red (2 ≠ 1 entries).
     #[test]
-    fn omitted_budget_turn_keeps_the_parked_state() -> Result<()> {
+    fn flat_vision_turn_evicts_one_parked_state_at_a_time() -> Result<()> {
         if !metal_is_default_device() {
             return Ok(());
-        }
-        struct Override;
-        impl Drop for Override {
-            fn drop(&mut self) {
-                KV_BUDGET_OVERRIDE.with(|budget| budget.set(None));
-            }
         }
         let tokenizer = tokenizer();
         for name in FIXTURES {
             let mut inner = fixture(name);
-            turn(&mut inner, &tokenizer, &body(4, 40));
-            turn(&mut inner, &tokenizer, &body(5, 40));
-            let before = inner.dflash2_states.store.bytes();
-            assert_eq!(before.entries, 1, "{name}");
+            for seed in [4, 5, 6] {
+                turn(&mut inner, &tokenizer, &body(seed, 40));
+            }
+            assert_eq!(inner.dflash2_states.store.bytes().entries, 2, "{name}");
             let prompt = 40usize;
-            let ahead = super::super::config::QWEN35_DFLASH2_POOL_RUNWAY_TOKENS as u64;
-            let (row_bytes, transient) = turn_memory(&inner, prompt, prompt as u64 + ahead)?;
-            let need = (prompt as u64 + ahead) * row_bytes + transient;
-            let _override = Override;
-            KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(need)));
-            evict_parked_dflash2_for_turn(&mut inner, prompt, 100_000);
-            assert_eq!(inner.dflash2_states.store.bytes(), before, "{name}");
+            let block_size = inner.dflash2.as_ref().expect("draft").config.block_size;
+            let rows = (prompt + block_size + 1) as u64;
+            let (row_bytes, transient) = turn_memory(&inner, prompt, rows)?;
+            let need = rows * row_bytes + transient;
+            evict_parked_dflash2_for_flat_turn_with(&mut inner, prompt, |inner| {
+                Some(if inner.dflash2_states.store.bytes().entries > 1 {
+                    need - 1
+                } else {
+                    need
+                })
+            });
+            assert_eq!(inner.dflash2_states.store.bytes().entries, 1, "{name}");
         }
         Ok(())
     }
 
-    /// A refused paged step retries once after the reclaim frees memory; it
-    /// fails when nothing is freed, and other errors never reclaim.
+    /// A refused paged step retries after each reclaim that frees memory,
+    /// until it runs or nothing is freed; other errors never reclaim.
     /// Mutation: return the first result without retrying → red.
+    /// Mutation: retry once only → red (the third run never happens).
     #[test]
     fn refused_paged_step_retries_after_reclaim() {
         let refused = || {
@@ -2492,6 +2490,17 @@ mod tests {
             &mut calls,
             |calls| {
                 *calls += 1;
+                if *calls < 3 { refused() } else { Ok(7) }
+            },
+            |_| true,
+        );
+        assert_eq!((out.ok(), calls), (Some(7), 3));
+
+        let mut calls = 0u32;
+        let out = retry_after_reclaim(
+            &mut calls,
+            |calls| {
+                *calls += 1;
                 refused()
             },
             |_| false,
@@ -2508,6 +2517,167 @@ mod tests {
             },
         );
         assert!(out.is_err() && !reclaimed);
+    }
+
+    /// Real adapter over a `initial`-block pool growing to `max` blocks of
+    /// `block_size` tokens; `None` without Metal.
+    fn growable_adapter(
+        initial: u32,
+        max: u32,
+        block_size: u32,
+    ) -> Option<crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter> {
+        let config = mlx_paged_attn::PagedAttentionConfig {
+            block_size,
+            gpu_memory_mb: 256,
+            head_size: 64,
+            num_kv_heads: 1,
+            num_layers: 2,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(max * block_size),
+            max_batch_size: Some(1),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            config,
+            initial,
+            max,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(err) if crate::test_support::metal_device_absent(&err) => return None,
+            Err(err) => panic!("unexpected LayerKVPool::new failure: {err}"),
+        };
+        let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+            initial, max, block_size,
+        )));
+        let mut adapter = crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter::new(
+            allocator, pool, block_size,
+        )
+        .expect("growable adapter");
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        Some(adapter)
+    }
+
+    /// A blocked serial paged step evicts one parked state and retries: the
+    /// other state stays.
+    /// Mutation: drop every parked state at once (`store.clear()` in
+    /// `evict_one_parked_dflash2`) → red (0 ≠ 1).
+    #[test]
+    fn blocked_paged_step_evicts_one_parked_state_and_retries() -> Result<()> {
+        if !metal_is_default_device() {
+            return Ok(());
+        }
+        let tokenizer = tokenizer();
+        for name in FIXTURES {
+            let mut inner = fixture(name);
+            for seed in [4, 5, 6] {
+                turn(&mut inner, &tokenizer, &body(seed, 40));
+            }
+            assert_eq!(inner.dflash2_states.store.bytes().entries, 2, "{name}");
+            inner.paged_adapter = growable_adapter(4, 16, 16);
+            let held = |inner: &Qwen35Inner| {
+                let bytes = inner.dflash2_states.store.bytes();
+                bytes.kv_bytes + bytes.state_bytes
+            };
+            let start = held(&inner);
+            let evictions = POOL_GROW_EVICTIONS.with(std::cell::Cell::get);
+            let _override = BudgetOverride;
+            KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(0)));
+            let mut runs = 0;
+            paged_step_reclaiming(&mut inner, |_| {
+                runs += 1;
+                if runs == 1 {
+                    Err(Error::from_reason(
+                        "context_length_exceeded: paged decode could not reserve 1 more block(s)",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })?;
+            assert_eq!(runs, 2, "{name}");
+            assert_eq!(
+                POOL_GROW_EVICTIONS.with(std::cell::Cell::get) - evictions,
+                1,
+                "{name}"
+            );
+            assert!(held(&inner) < start, "{name}");
+            assert_eq!(inner.dflash2_states.store.bytes().entries, 1, "{name}");
+        }
+        Ok(())
+    }
+
+    /// A serial turn's prompt restores its whole cold chain from a runway
+    /// pool: the pool grows for the prompt before the lookup, since a restore
+    /// allocates from the pool and cannot grow it.
+    /// Mutation: skip `try_grow_pool` in `grow_paged_pool_for_prompt` → red
+    /// (16 ≠ 64 restored tokens).
+    #[test]
+    fn cold_restore_grows_pool_before_prepare() {
+        const BLOCK: u32 = 8;
+        let tokens: Vec<u32> = (0..64u32).map(|i| 700 + i * 3).collect();
+        let fingerprint = mlx_paged_attn::ColdCacheFingerprint::from_components([
+            b"qwen3-5-runway-restore".as_slice(),
+        ]);
+        let root = std::env::temp_dir().join(format!(
+            "mlx-runway-cold-restore-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let open = || {
+            Arc::new(
+                mlx_paged_attn::ColdCacheManager::open_at(root.clone(), 16 * 1024 * 1024, 0, 8)
+                    .expect("temp-dir cold cache"),
+            )
+        };
+        let tier = |manager: &Arc<mlx_paged_attn::ColdCacheManager>| {
+            crate::transformer::paged_kv_cache_adapter::ColdTierContext {
+                manager: Arc::clone(manager),
+                fingerprint,
+                sidecar_policy: None,
+            }
+        };
+        let Some(mut source) = growable_adapter(8, 8, BLOCK) else {
+            return;
+        };
+        let manager = open();
+        source.set_cold_tier(tier(&manager));
+        source.reset_for_new_request(0).expect("reset");
+        source.allocate_suffix_blocks(64).expect("allocate");
+        source.record_tokens(&tokens).expect("record");
+        assert_eq!(
+            source
+                .register_full_blocks_for_reuse(&[], 0)
+                .expect("register"),
+            8
+        );
+        assert!(manager.drain(std::time::Duration::from_secs(10)));
+        drop(source);
+        drop(manager);
+
+        let mut prompt = tokens.clone();
+        prompt.extend(1..=8);
+        let mut restore = growable_adapter(2, 16, BLOCK).expect("Metal");
+        let manager = open();
+        restore.set_cold_tier(tier(&manager));
+        grow_paged_pool_for_prompt(&mut restore, &prompt, |adapter| Some(adapter), |_| false);
+        let plan = restore
+            .prepare_turn_per_block_with_max_cache_hit_tokens(
+                0,
+                &prompt,
+                prompt.len() as u32,
+                true,
+                &vec![Vec::new(); prompt.len() / BLOCK as usize],
+                0,
+                false,
+                prompt.len() as u32 - 1,
+            )
+            .expect("prepare");
+        assert_eq!(plan.cached_prefix_len, 64);
+        drop(restore);
+        drop(manager);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Without an armed capture the kept tail is the newest window of the

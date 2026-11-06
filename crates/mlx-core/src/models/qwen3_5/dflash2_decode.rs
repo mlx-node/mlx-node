@@ -1223,6 +1223,12 @@ impl DFlash2Target for Qwen35Inner {
     ) -> Option<&crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter> {
         self.paged_adapter.as_ref()
     }
+
+    fn paged_adapter_mut_ref(
+        &mut self,
+    ) -> Option<&mut crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter> {
+        self.paged_adapter.as_mut()
+    }
     fn release_paged_requests(&mut self) -> Result<()> {
         if let Some(adapter) = self.paged_adapter.as_mut() {
             adapter.release_all_requests().map_err(|e| {

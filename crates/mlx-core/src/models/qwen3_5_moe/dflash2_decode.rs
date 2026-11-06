@@ -811,6 +811,12 @@ impl DFlash2Target for Qwen35MoeInner {
     ) -> Option<&crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter> {
         self.paged_adapter.as_ref()
     }
+
+    fn paged_adapter_mut_ref(
+        &mut self,
+    ) -> Option<&mut crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter> {
+        self.paged_adapter.as_mut()
+    }
     fn release_paged_requests(&mut self) -> Result<()> {
         if let Some(adapter) = self.paged_adapter.as_mut() {
             adapter.release_all_requests().map_err(|e| {
@@ -1861,10 +1867,14 @@ mod tests {
         assert_parked_end(&mut inner, &before, "paged AR")
     }
 
-    /// With no KV headroom a paged AR turn evicts the other session's
-    /// parked DFlash2 state before it parks the live one.
+    /// With no KV headroom a paged AR turn whose pool needs no growth keeps
+    /// the other session's parked DFlash2 state and parks the live one beside
+    /// it: reclaim runs only inside a refused allocation.
+    /// Mutation: call `evict_parked_dflash2_for_flat_turn` from
+    /// `run_paged_turn` (an up-front eviction) → red (only the live lineage
+    /// is left).
     #[test]
-    fn paged_ar_turn_evicts_parked_states_without_headroom() -> Result<()> {
+    fn paged_ar_turn_keeps_parked_states_it_does_not_need() -> Result<()> {
         use crate::models::qwen3_5::dflash2_turn::KV_BUDGET_OVERRIDE;
         struct Override;
         impl Drop for Override {
@@ -1879,6 +1889,7 @@ mod tests {
         let mut inner = tiny_dflash_inner(0xDFA5_3613);
         inner.initialize_paged_adapter()?;
         run_tiny_dflash_turn(&mut inner, &tokenizer, &owner_prompt(3), true, 2)?;
+        let parked = inner.cached_token_history.clone();
         run_tiny_dflash_turn(&mut inner, &tokenizer, &owner_prompt(5), true, 2)?;
         let live = inner.cached_token_history.clone();
         assert_eq!(inner.dflash2_states.store.bytes().entries, 1);
@@ -1921,35 +1932,63 @@ mod tests {
             .entries()
             .map(|entry| entry.tokens().to_vec())
             .collect();
-        assert_eq!(lineages, [live]);
+        assert_eq!(lineages, [parked, live]);
         Ok(())
     }
 
-    /// A scheduled admission whose page-pool grow is declined evicts the
-    /// parked DFlash2 states and grows on the retry; with nothing parked the
-    /// declined grow still rejects.
+    /// A scheduled admission whose page-pool grow is declined parks the idle
+    /// live DFlash2 state, evicts one state (the least recently used), and
+    /// grows on the retry; with no DFlash2 state at all the declined grow
+    /// still rejects.
+    /// Mutation: skip the live-state park in `release_one_for_pool_grow` →
+    /// red. Mutation: drop every parked state at once → red
+    /// (0 ≠ 1 entries).
     #[test]
-    fn scheduled_pool_grow_evicts_parked_states_after_a_decline() -> Result<()> {
+    fn scheduled_pool_grow_reclaims_one_state_per_decline() -> Result<()> {
         use crate::engine::hybrid_scheduler::tests::reserve_past_a_declined_grow;
+        use crate::models::qwen3_5::dflash2_turn::KV_BUDGET_OVERRIDE;
+        struct Override;
+        impl Drop for Override {
+            fn drop(&mut self) {
+                KV_BUDGET_OVERRIDE.with(|budget| budget.set(None));
+            }
+        }
         if !unsafe { mlx_sys::mlx_metal_is_available() } {
             return Ok(());
         }
         let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
-        for parked in [true, false] {
+        for case in ["parked", "live", "none"] {
             let mut inner = tiny_dflash_inner(0xDFA5_3614);
             inner.initialize_paged_adapter()?;
-            run_tiny_dflash_turn(&mut inner, &tokenizer, &owner_prompt(3), true, 2)?;
-            if parked {
-                run_tiny_dflash_turn(&mut inner, &tokenizer, &owner_prompt(5), true, 2)?;
-                assert_eq!(inner.dflash2_states.store.bytes().entries, 1);
-            } else {
-                assert_eq!(inner.dflash2_states.store.bytes().entries, 0);
+            let mut live = Vec::new();
+            if case != "none" {
+                run_tiny_dflash_turn(&mut inner, &tokenizer, &owner_prompt(3), true, 2)?;
+                live = inner.cached_token_history.clone();
             }
+            if case == "parked" {
+                run_tiny_dflash_turn(&mut inner, &tokenizer, &owner_prompt(5), true, 2)?;
+                live = inner.cached_token_history.clone();
+                assert_eq!(inner.dflash2_states.store.bytes().entries, 1);
+            }
+            let override_guard = Override;
+            KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(0)));
             let (admitted, total_blocks, inner) = reserve_past_a_declined_grow(inner);
-            assert_eq!(admitted, parked, "parked={parked}");
-            assert_eq!(total_blocks, if parked { 8 } else { 4 }, "parked={parked}");
-            assert_eq!(inner.dflash2_states.store.bytes().entries, 0);
-            assert!(inner.dflash2_context.is_some(), "the live state stays");
+            drop(override_guard);
+            assert_eq!(admitted, case != "none", "{case}");
+            assert_eq!(total_blocks, if case == "none" { 4 } else { 8 }, "{case}");
+            let lineages: Vec<Vec<u32>> = inner
+                .dflash2_states
+                .store
+                .entries()
+                .map(|entry| entry.tokens().to_vec())
+                .collect();
+            let want: Vec<Vec<u32>> = if case == "parked" {
+                vec![live]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(lineages, want, "{case}");
+            assert!(inner.dflash2_context.is_none(), "{case}");
         }
         Ok(())
     }

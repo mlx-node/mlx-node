@@ -194,6 +194,9 @@ impl PagedBackend for Qwen35Inner {
                 live_mismatch = token_prefix_mismatch_trace(plan, live_tokens);
             }
         }
+        if self.active_scheduled_seq.is_none() {
+            crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(self, plan);
+        }
         let turn_plan = self
             .paged_adapter
             .as_mut()

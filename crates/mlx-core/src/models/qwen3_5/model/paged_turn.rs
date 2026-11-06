@@ -136,6 +136,7 @@ impl Qwen35Inner {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
         }
+        crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(self, &tokens);
         let plan_result = self
             .paged_adapter
             .as_mut()
@@ -1574,6 +1575,7 @@ impl Qwen35Inner {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
         }
+        crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(self, &tokens);
         let plan_result = self
             .paged_adapter
             .as_mut()
