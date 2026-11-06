@@ -1270,6 +1270,67 @@ mod tests {
         Ok(())
     }
 
+    /// An AR request grew the MoE runway pool by one Splash extent and
+    /// released it; a cold DFlash2 booking that fits only once that extent
+    /// is gone cuts the pool back to the runway and books. Mutation: drop the
+    /// `set_extent_growth` call in MoE `initialize_paged_adapter` → red (no
+    /// extent, no cut: `context_length_exceeded`).
+    #[test]
+    fn moe_ar_growth_then_dflash2_booking_reclaims_the_pool() -> Result<()> {
+        use crate::models::qwen3_5::dflash2_decode::dflash2_kv_headroom_for;
+        use crate::models::qwen3_5::dflash2_turn::{
+            KvGrowthPhase, dflash2_kv_growth_need, ensure_dflash2_target_rows_with,
+        };
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return Ok(());
+        }
+        let mut inner = tiny_dflash_inner(0xDFA5_2209);
+        reset_flat_fixture(&mut inner);
+        inner.config.paged_cache_memory_mb = Some(256);
+        inner.paged_adapter = None;
+        inner.initialize_paged_adapter()?;
+        let adapter = inner.paged_adapter.as_mut().expect("paged adapter");
+        adapter.set_grow_headroom_probe_override(Some(std::sync::Arc::new(Ok)));
+        let runway = adapter
+            .block_telemetry()
+            .map_err(Error::from_reason)?
+            .total_blocks;
+        let runway_bytes =
+            u64::from(runway) * adapter.bytes_per_block().map_err(Error::from_reason)?;
+        adapter
+            .reset_for_new_request(1)
+            .map_err(Error::from_reason)?;
+        adapter
+            .allocate_suffix_blocks((runway + 1) * adapter.block_size())
+            .map_err(Error::from_reason)?;
+        adapter.release_request().map_err(Error::from_reason)?;
+        let pool_bytes = |inner: &Qwen35MoeInner| {
+            inner
+                .paged_adapter
+                .as_ref()
+                .map_or(0, |adapter| adapter.layer_kv_pool().total_bytes())
+        };
+        assert!(
+            pool_bytes(&inner) > runway_bytes,
+            "the AR request grew the pool"
+        );
+
+        let plan = DFlash2KvPlan {
+            cap_rows: 1_000,
+            extent_rows: 256,
+        };
+        let phase = KvGrowthPhase::TurnStart { prompt_len: 280 };
+        let need = dflash2_kv_growth_need(&inner, 300, plan, phase)?.expect("the KV grows");
+        let base = dflash2_kv_headroom_for(need.kv_bytes) + need.transient_bytes + runway_bytes;
+        let growth = ensure_dflash2_target_rows_with(&mut inner, 300, plan, phase, |inner| {
+            Some(base.saturating_sub(pool_bytes(inner)))
+        })?;
+        assert!(growth.grew);
+        assert_eq!(pool_bytes(&inner), runway_bytes);
+        assert_eq!(min_fa_reserved_rows(&inner.caches)?, Some(512));
+        Ok(())
+    }
+
     #[test]
     fn full_width_context_policy_crosses_over_at_keep_seven() {
         for keep in 0..=9 {
