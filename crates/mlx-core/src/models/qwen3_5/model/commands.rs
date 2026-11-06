@@ -276,6 +276,12 @@ impl HybridSchedulerBackend for Qwen35Inner {
             total_tokens,
         )
     }
+    fn scheduled_draft_state_held_bytes(&self, total_tokens: u32) -> u64 {
+        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState::held_bytes(
+            &self.config,
+            total_tokens,
+        )
+    }
     fn begin_scheduled_speculation(&mut self, seq_id: SeqId, position: u32) -> Result<bool> {
         crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::begin_scheduled_mtp(
             self, seq_id, position,

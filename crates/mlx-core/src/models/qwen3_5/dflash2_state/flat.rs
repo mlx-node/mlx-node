@@ -690,6 +690,62 @@ mod tests {
         Ok(())
     }
 
+    /// A turn's state-budget eviction demotes the oldest end state but
+    /// leaves its KV whole when the live headroom cannot hold the shrink
+    /// copy. Mutation: pass `u64::MAX` as the headroom in
+    /// `evict_over_state_budget` → red (the KV shrinks to the anchor).
+    #[test]
+    fn state_budget_demotion_skips_a_shrink_the_headroom_cannot_hold() -> Result<()> {
+        use crate::models::qwen3_5::dflash2_turn::{KV_BUDGET_OVERRIDE, evict_over_state_budget};
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                KV_BUDGET_OVERRIDE.with(|budget| budget.set(None));
+            }
+        }
+        if !metal_is_default_device() {
+            return Ok(());
+        }
+        let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
+        const R: usize = 32;
+        for name in FIXTURES {
+            let mut inner = fixture(name);
+            turn(&mut inner, &tokenizer, &prompt(1, 40))?;
+            let used = inner.cached_token_history.len();
+            assert!(used > R);
+            grow_dflash2_target_kv(&mut inner.caches, (used + COMPACT_SLACK_ROWS + 512) as i64)?;
+            let draft_config = inner.dflash2.as_ref().expect("draft").config.clone();
+            let (tokens, mut parts) = park_flat_dflash2_state(&mut inner).expect("parkable");
+            let end = parts.end.as_ref().expect("parked end state");
+            let (mut conv, mut rec) = (Vec::new(), Vec::new());
+            for (_, state) in &end.linear {
+                conv.push(state.get(0).expect("conv state").deep_copy()?);
+                rec.push(state.get(1).expect("recurrent state").deep_copy()?);
+            }
+            let anchor = FlatAnchor {
+                cell: GdnCell { row: R, conv, rec },
+                window: DFlash2ContextCache::new(&draft_config),
+            };
+            let anchor_bytes = anchor.state_bytes();
+            parts.anchor = Some(Anchor {
+                row: R,
+                state: anchor,
+            });
+            let mut store = HybridStateStore::<FlatBacking>::with_state_budget(16, anchor_bytes);
+            let id = store.insert(Lineage::text(&tokens, 0), parts)?;
+            let kv_bytes = store.get(id).expect("entry").kv_bytes();
+            let _reset = Reset;
+            KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(0)));
+            let report = evict_over_state_budget(&mut store)?;
+            assert_eq!(report.demoted, 1, "{name}: {report:?}");
+            let entry = store.get(id).expect("demoted entry");
+            assert_eq!(entry.kind(), HitKind::Capture, "{name}");
+            assert_eq!(entry.state_bytes(), anchor_bytes, "{name}");
+            assert_eq!(entry.kv_bytes(), kv_bytes, "{name}: the KV was copied");
+        }
+        Ok(())
+    }
+
     /// A live state that is not an exact DFlash2 state of its history is
     /// left in place.
     #[test]

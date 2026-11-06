@@ -251,11 +251,17 @@ impl Qwen35Inner {
                 .map_err(|e| {
                     Error::from_reason(format!("Failed to construct Qwen3.5 KV pool: {e}"))
                 })?;
-        self.paged_adapter = Some(
+        let mut adapter =
             PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
                 Error::from_reason(format!("Failed to construct Qwen3.5 paged adapter: {e}"))
-            })?,
-        );
+            })?;
+        if initial_mb.is_none() && self.dflash2.is_some() && num_blocks < max_num_blocks {
+            let bytes_per_block = adapter.bytes_per_block().map_err(Error::from_reason)?;
+            adapter.set_extent_growth(
+                crate::models::qwen3_5::dflash2_decode::runway_pool_extent_blocks(bytes_per_block),
+            );
+        }
+        self.paged_adapter = Some(adapter);
         info!(
             "Qwen3.5 paged adapter enabled after weight materialization: initial_blocks={}, \
              max_blocks={}, block_size={}, pool_window_tokens={}, trained_window_tokens={}, \

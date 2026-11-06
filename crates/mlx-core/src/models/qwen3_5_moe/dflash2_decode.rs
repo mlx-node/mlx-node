@@ -851,8 +851,10 @@ mod tests {
     use crate::engine::types::{ChatConfig, ChatResult};
     use crate::models::forward::PREFILL_CANCELLED;
     use crate::models::quantized_linear::LinearProj;
+    use crate::models::qwen3_5::dflash2_decode::{min_fa_capacity, min_fa_reserved_rows};
     use crate::models::qwen3_5::dflash2_turn::{
-        dflash2_chat_turn, dflash2_fail_closed, dflash2_prefill, flat_attention_frontier,
+        DFlash2KvPlan, dflash2_chat_turn, dflash2_fail_closed, dflash2_prefill,
+        flat_attention_frontier,
     };
     use crate::models::qwen3_5::gated_delta_net::{GdnCapturePlan, GdnCell};
     use crate::nn::Linear;
@@ -1135,6 +1137,137 @@ mod tests {
             TurnOutput::Complete(result) => Ok(*result),
             TurnOutput::Streamed => panic!("sync DFlash2 turn returned streamed output"),
         }
+    }
+
+    /// Every MoE verify, host or device, grows the target KV first to whole
+    /// extents of the turn's plan, capped at its rows, and the decode
+    /// ceiling follows the grown size. Mutation: remove the `ensure_ahead`
+    /// call in `verify` (or in `verify_device`) → red (capacity below
+    /// frontier + 8); drop the `push_decode_limit` after a growth in
+    /// `DFlash2DecodeKv::ensure_ahead` → red (ceiling sized for 256 of 280
+    /// rows).
+    #[test]
+    fn moe_stepper_ensures_before_every_verify() -> Result<()> {
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return Ok(());
+        }
+        const EXTENT: i64 = 40;
+        const CAP: i64 = 330;
+        for device in [false, true] {
+            let mut inner = tiny_dflash_inner(0xDFA5_2206);
+            reset_flat_fixture(&mut inner);
+            let stream = Stream::generation();
+            let _ctx = StreamContext::new(stream);
+            let prompt = (0..250).map(|i| (i % 15 + 1) as u32).collect::<Vec<_>>();
+            let (logits, state) = dflash2_prefill(&mut inner, &prompt, 0, None, stream)?;
+            logits.eval();
+            assert_eq!(min_fa_capacity(&inner.caches)?, Some(256));
+            inner.dflash2_turn_state = Some(DFlash2TurnState {
+                kv: Some(DFlash2KvPlan {
+                    cap_rows: CAP,
+                    extent_rows: EXTENT,
+                }),
+                ..state
+            });
+            let block_size = inner.dflash2.as_ref().expect("draft").config.block_size;
+            let mut step = inner.begin_dspark_decode(block_size)?;
+            let mut grew = false;
+            for (cycle, keep) in [8, 3, 8, 8, 1, 8, 5, 8, 8, 2].into_iter().enumerate() {
+                let ids = (0..8)
+                    .map(|row| ((row + cycle) % 15 + 1) as u32)
+                    .collect::<Vec<_>>();
+                let frontier = step.frontier().expect("frontier").attn_tokens as i64;
+                let logits = if device {
+                    let ids = ids.iter().map(|&id| id as i32).collect::<Vec<_>>();
+                    step.verify_device(&MxArray::from_int32(&ids, &[8])?)?
+                        .logits
+                } else {
+                    step.verify(&ids)?.logits
+                };
+                logits.eval();
+                let capacity = min_fa_capacity(&step.inner.caches)?.expect("FA caches");
+                assert!(capacity >= frontier + 8, "device={device} cycle={cycle}");
+                assert!(
+                    capacity == 256 || capacity == CAP || capacity % EXTENT == 0,
+                    "device={device} cycle={cycle}: capacity {capacity} is off the extent"
+                );
+                assert_eq!(
+                    step.kv.decode_limit_rows(),
+                    min_fa_reserved_rows(&step.inner.caches)?,
+                    "device={device} cycle={cycle}: the decode ceiling lags the KV"
+                );
+                grew |= capacity != 256;
+                step.commit_with_provenance(keep, ids.len(), &ids)?;
+            }
+            assert!(grew, "device={device}: the trace must grow the KV");
+            step.finish()?;
+        }
+        Ok(())
+    }
+
+    /// A MoE turn's KV plan takes the extent frozen at load
+    /// (`DFlash2WindowTerms::extent_rows`), not one the live headroom sizes.
+    /// Mutation: return `None` from the MoE `dflash2_kv_extent_rows` → red
+    /// (the headroom's extent).
+    #[test]
+    fn moe_kv_plan_uses_the_frozen_extent() -> Result<()> {
+        use crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms;
+        use crate::models::qwen3_5::dflash2_turn::{
+            KV_BUDGET_OVERRIDE, KV_EXTENT_ROWS_OVERRIDE, dflash2_kv_plan,
+        };
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                KV_EXTENT_ROWS_OVERRIDE.with(|rows| rows.set(Some(256)));
+                KV_BUDGET_OVERRIDE.with(|budget| budget.set(None));
+            }
+        }
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return Ok(());
+        }
+        let mut inner = tiny_dflash_inner(0xDFA5_2207);
+        let _reset = Reset;
+        KV_EXTENT_ROWS_OVERRIDE.with(|rows| rows.set(None));
+        KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(1 << 40)));
+        let trained = inner.config.max_position_embeddings as u32;
+        inner.dflash2_window = Some(DFlash2WindowTerms {
+            trained,
+            draft_trained: trained,
+            pool: None,
+            reserve: None,
+            row_bytes: 0,
+            extent_rows: 40,
+        });
+        assert_eq!(dflash2_kv_plan(&inner, 300)?.extent_rows, 40);
+        Ok(())
+    }
+
+    /// A draft-loaded MoE pool with no initial size starts at the runway and
+    /// grows by Splash extents. Mutation: drop the `set_extent_growth` call
+    /// in MoE `initialize_paged_adapter` → red (`None`).
+    #[test]
+    fn moe_runway_pool_grows_by_splash_extents() -> Result<()> {
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return Ok(());
+        }
+        let mut inner = tiny_dflash_inner(0xDFA5_2208);
+        inner.config.paged_cache_memory_mb = Some(256);
+        inner.paged_adapter = None;
+        inner.initialize_paged_adapter()?;
+        let adapter = inner.paged_adapter.as_ref().expect("paged adapter");
+        let blocks = adapter.block_telemetry().map_err(Error::from_reason)?;
+        assert!(
+            blocks.total_blocks < blocks.max_total_blocks,
+            "the pool starts at the runway: {blocks:?}"
+        );
+        let bytes_per_block = adapter.bytes_per_block().map_err(Error::from_reason)?;
+        assert_eq!(
+            adapter.extent_growth_blocks(),
+            Some(
+                crate::models::qwen3_5::dflash2_decode::runway_pool_extent_blocks(bytes_per_block)
+            )
+        );
+        Ok(())
     }
 
     #[test]

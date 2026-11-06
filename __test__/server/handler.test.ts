@@ -535,7 +535,8 @@ describe('createHandler', () => {
       expect((model.resetCaches as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
     });
 
-    // Mutation: ignore `restOfWindowOutputBudget` → red (3996 ≠ undefined).
+    // Mutation: send the whole room for an omitted budget without `restOfWindowOutputBudget`
+    // (drop the `NATIVE_DEFAULT_MAX_NEW_TOKENS` check in its branch) → red (3997 ≠ undefined).
     it('preserves the native output default when streaming preflight has room for it', async () => {
       const model = Object.assign(
         createMockStreamModel([

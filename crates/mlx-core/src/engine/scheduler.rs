@@ -1041,7 +1041,6 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         Some(turn)
     }
 
-    #[cfg(test)]
     pub fn running(&self) -> &[TurnState<P>] {
         &self.running
     }

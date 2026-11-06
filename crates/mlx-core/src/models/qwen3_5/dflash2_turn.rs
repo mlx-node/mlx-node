@@ -694,8 +694,11 @@ pub(crate) fn paged_step_reclaiming<T: DFlash2Target, R>(
 /// the restore. Splash allocates a restored chain's pages through its
 /// allocate/reclaim loop before the restore starts (Engine.cpp:854-858).
 /// Blocks the live request holds count as available: the turn either
-/// continues on them or releases them. A declined grow reclaims one item
-/// and retries; with nothing left the turn's own allocation decides.
+/// continues on them or releases them. An extent-growth pool counts cached
+/// prefix blocks only once a grow is refused (Splash takes free pages, then
+/// an extent, and reclaims after that is denied). A declined grow that
+/// cached blocks cannot cover reclaims one item and retries; with nothing
+/// left the turn's own allocation decides.
 pub(crate) fn grow_paged_pool_for_prompt<T>(
     target: &mut T,
     prompt: &[u32],
@@ -719,8 +722,13 @@ pub(crate) fn grow_paged_pool_for_prompt<T>(
             .active_seq_id()
             .and_then(|seq_id| pool.block_table_for(seq_id))
             .map_or(0, |table| table.num_blocks());
-        let available =
-            u64::from(blocks.free_blocks) + u64::from(blocks.reclaimable_blocks) + live as u64;
+        let held = u64::from(blocks.free_blocks) + live as u64;
+        let cached = u64::from(blocks.reclaimable_blocks);
+        let available = if pool.grows_by_extent() {
+            held
+        } else {
+            held + cached
+        };
         let needed = (prompt.len() as u64).div_ceil(u64::from(pool.block_size().max(1)));
         let shortfall = needed.saturating_sub(available);
         if shortfall == 0 {
@@ -729,7 +737,7 @@ pub(crate) fn grow_paged_pool_for_prompt<T>(
         if pool.try_grow_pool(u32::try_from(shortfall).unwrap_or(u32::MAX)) {
             return;
         }
-        if !reclaim_one(target) {
+        if held + cached >= needed || !reclaim_one(target) {
             return;
         }
     }
@@ -920,23 +928,39 @@ pub(crate) fn ensure_dflash2_target_rows_with<T: DFlash2Target>(
     phase: KvGrowthPhase,
     headroom: impl Fn(&T) -> Option<u64>,
 ) -> Result<KvGrowth> {
+    try_ensure_dflash2_target_rows_with(target, needed, plan, phase, headroom, true)?
+}
+
+/// [`ensure_dflash2_target_rows_with`] with a refused growth as the inner
+/// `Err`: the KV is unchanged. Parked states are evicted for it only when
+/// `reclaim` is set.
+fn try_ensure_dflash2_target_rows_with<T: DFlash2Target>(
+    target: &mut T,
+    needed: i64,
+    plan: DFlash2KvPlan,
+    phase: KvGrowthPhase,
+    headroom: impl Fn(&T) -> Option<u64>,
+    reclaim: bool,
+) -> Result<Result<KvGrowth>> {
     let mut growth = KvGrowth::default();
     loop {
         let Some(need) = dflash2_kv_growth_need(target, needed, plan, phase)? else {
-            return Ok(growth);
+            return Ok(Ok(growth));
         };
         let live = headroom(target);
         let grows = live.is_none_or(|live| {
             live >= dflash2_kv_headroom_for(need.kv_bytes).saturating_add(need.transient_bytes)
         });
         if !grows && let Some(live) = live {
-            if let Some(step) = target.dflash2_states_mut().store.evict_one(live, None)? {
+            if reclaim
+                && let Some(step) = target.dflash2_states_mut().store.evict_one(live, None)?
+            {
                 add_eviction(&mut growth.evicted, step);
                 crate::array::clear_cache();
                 continue;
             }
             if dflash2_kv_budget_of(live) < need.kv_bytes {
-                return Err(Error::from_reason(format!(
+                return Ok(Err(Error::from_reason(format!(
                     "context_length_exceeded: {} DFlash2 target KV could not grow from {} to {} \
                      rows: it needs {} bytes and the live budget holds {}",
                     target.label(),
@@ -944,7 +968,7 @@ pub(crate) fn ensure_dflash2_target_rows_with<T: DFlash2Target>(
                     need.rows,
                     need.kv_bytes,
                     dflash2_kv_budget_of(live)
-                )));
+                ))));
             }
         }
         grow_dflash2_target_kv(target.caches_mut(), need.rows)?;
@@ -961,8 +985,23 @@ pub(crate) fn ensure_dflash2_target_rows_with<T: DFlash2Target>(
             "DFlash2 target KV growth"
         );
         growth.grew = true;
-        return Ok(growth);
+        return Ok(Ok(growth));
     }
+}
+
+/// Brings parked states within the state budget. A demotion shrinks the
+/// demoted state's KV only when the live headroom holds the copy.
+pub(crate) fn evict_over_state_budget(
+    store: &mut super::dflash2_state::store::HybridStateStore<FlatBacking>,
+) -> Result<EvictReport> {
+    store.evict_for(
+        Reservation {
+            state_bytes: 0,
+            kv_bytes: 0,
+        },
+        dflash2_kv_headroom_now().unwrap_or(0),
+        None,
+    )
 }
 
 /// Size every flat full-attention cache for the prompt plus one verify
@@ -978,14 +1017,7 @@ pub(crate) fn reserve_dflash2_turn_kv<T: DFlash2Target>(
 ) -> Result<EvictReport> {
     let block_size = target.dflash2().map_or(1, |draft| draft.config.block_size);
     let needed = i64::try_from(prompt_len.saturating_add(block_size + 1)).unwrap_or(i64::MAX);
-    let over_budget = target.dflash2_states_mut().store.evict_for(
-        Reservation {
-            state_bytes: 0,
-            kv_bytes: 0,
-        },
-        u64::MAX,
-        None,
-    )?;
+    let over_budget = evict_over_state_budget(&mut target.dflash2_states_mut().store)?;
     let mut growth = ensure_dflash2_target_rows(
         target,
         needed,
@@ -1028,7 +1060,8 @@ pub(crate) fn reserve_dflash2_turn_kv<T: DFlash2Target>(
 /// KV it holds.
 pub(crate) struct DFlash2DecodeKv {
     plan: Option<DFlash2KvPlan>,
-    decode_limit: Option<crate::cache_limit::DecodeCacheLimitGuard>,
+    /// The live ceiling and the KV rows it was sized for.
+    decode_limit: Option<(i64, crate::cache_limit::DecodeCacheLimitGuard)>,
 }
 
 impl DFlash2DecodeKv {
@@ -1053,8 +1086,14 @@ impl DFlash2DecodeKv {
         let guard = crate::cache_limit::coordinator().push_decode_limit(
             dflash2_decode_cache_limit(&target.dense_config(), block_size, rows.max(0) as u64),
         );
-        self.decode_limit = Some(guard);
+        self.decode_limit = Some((rows, guard));
         Ok(())
+    }
+
+    /// KV rows the live decode ceiling was sized for.
+    #[cfg(test)]
+    pub(crate) fn decode_limit_rows(&self) -> Option<i64> {
+        self.decode_limit.as_ref().map(|(rows, _)| *rows)
     }
 
     /// Grow the target KV for a verify writing `rows` rows past the
@@ -1172,12 +1211,23 @@ pub(crate) fn dflash2_fail_closed<T: DFlash2Target>(target: &mut T, error: Error
     error
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Final-token KV growths this thread refuses next.
+    pub(crate) static REFUSE_FINAL_TOKEN_GROWTH: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Writes the turn's last token into the caches so the next turn resumes
+/// past it. Splash gives that terminal token no KV row, so the write evicts
+/// no parked state, and a growth the budget refuses skips it (`Ok(false)`)
+/// instead of failing the turn.
 pub(crate) fn dflash2_materialize_final<T: DFlash2Target>(
     target: &mut T,
     token: u32,
     stream: Stream,
     plan: DFlash2KvPlan,
-) -> Result<()> {
+) -> Result<bool> {
     let label = target.label();
     let tap_layers = target
         .dflash2()
@@ -1188,8 +1238,27 @@ pub(crate) fn dflash2_materialize_final<T: DFlash2Target>(
     let input = MxArray::from_int32(&[token as i32], &[1, 1])?;
     let _stream = StreamContext::new(stream);
     if let Some(frontier) = flat_attention_frontier(target) {
+        #[cfg(test)]
+        if REFUSE_FINAL_TOKEN_GROWTH.with(|left| left.replace(left.get().saturating_sub(1))) > 0 {
+            return Ok(false);
+        }
         let needed = i64::try_from(frontier.saturating_add(1)).unwrap_or(i64::MAX);
-        ensure_dflash2_target_rows(target, needed, plan, KvGrowthPhase::Decode)?;
+        let growth = try_ensure_dflash2_target_rows_with(
+            target,
+            needed,
+            plan,
+            KvGrowthPhase::Decode,
+            |_| dflash2_kv_headroom_now(),
+            false,
+        )?;
+        if let Err(refused) = growth {
+            tracing::debug!(
+                target: "mlx_core::inference",
+                "DFlash2 final token left out of the cache: {}",
+                refused.reason
+            );
+            return Ok(false);
+        }
     }
     let (_, taps, _) = target.forward_with_taps(&input, &tap_layers, None)?;
     let fused = target
@@ -1208,7 +1277,8 @@ pub(crate) fn dflash2_materialize_final<T: DFlash2Target>(
         .and_then(|draft| context.append(draft, &fused, base, &[token]));
     *target.dflash2_context_mut() = Some(context);
     append_result?;
-    target.eval_layer_caches()
+    target.eval_layer_caches()?;
+    Ok(true)
 }
 
 /// Common offset of the flat full-attention caches, or `None` when they
@@ -1818,10 +1888,10 @@ pub(crate) fn dflash2_chat_turn<T: DFlash2Target + DsparkBackend>(
         && final_token_fits_context
         && let Some(&last) = generated.last()
     {
-        if let Err(error) = dflash2_materialize_final(target, last, generation_stream, kv_plan) {
-            return Err(dflash2_turn_failed(target, error, cached_prefix));
+        match dflash2_materialize_final(target, last, generation_stream, kv_plan) {
+            Ok(materialized) => last_in_cache = materialized,
+            Err(error) => return Err(dflash2_turn_failed(target, error, cached_prefix)),
         }
-        last_in_cache = true;
     }
     let saved_generated = if !last_in_cache && !generated.is_empty() {
         &generated[..generated.len() - 1]
@@ -2298,6 +2368,140 @@ mod tests {
         Ok(())
     }
 
+    /// A real turn grows its target KV during decode in the extent frozen at
+    /// load (`DFlash2WindowTerms::extent_rows`), not by the cache's own
+    /// 256-row step: a warm 300-token prompt books 320 rows of 40-row
+    /// extents and 63 decoded tokens grow them to 400. Mutations: install the turn state
+    /// with `kv: None` in `dflash2_chat_turn` → red (574); read `None` for
+    /// `dflash2_kv_extent_rows` in `dflash2_kv_plan` → red (1,026).
+    #[test]
+    fn turn_grows_decode_kv_in_the_frozen_extent() -> Result<()> {
+        if !metal_is_default_device() {
+            return Ok(());
+        }
+        let tokenizer = tokenizer();
+        for name in FIXTURES {
+            let mut inner = fixture(name);
+            turn(&mut inner, &tokenizer, &body(4, 40));
+            let mut prompt = ChatBackend::cached_token_history(&inner).to_vec();
+            prompt.extend(body(5, 300 - prompt.len() as u32));
+            assert_eq!(min_fa_capacity(&inner.caches)?, Some(256), "{name}");
+            let _extent = ExtentOverride;
+            KV_EXTENT_ROWS_OVERRIDE.with(|rows| rows.set(None));
+            let _budget = BudgetOverride;
+            KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(1 << 40)));
+            let trained = inner.config.max_position_embeddings as u32;
+            inner.dflash2_window = Some(DFlash2WindowTerms {
+                trained,
+                draft_trained: trained,
+                pool: None,
+                reserve: None,
+                row_bytes: 0,
+                extent_rows: 40,
+            });
+            let cached =
+                run_tiny_dflash_turn(&mut inner, &tokenizer, &prompt, true, 64)?.cached_tokens;
+            assert!(cached > 0, "{name}: the turn must continue the live state");
+            let frontier = flat_attention_frontier(&inner).expect("frontier");
+            assert!(frontier >= 363, "{name}: frontier {frontier}");
+            assert_eq!(min_fa_capacity(&inner.caches)?, Some(400), "{name}");
+        }
+        Ok(())
+    }
+
+    /// The final token of a length-finished turn whose KV is full and whose
+    /// growth the budget refuses stays out of the cache, and the turn
+    /// succeeds: Splash gives the terminal token no KV row, so the write
+    /// evicts no parked state for it either. Mutations: return the refusal
+    /// from `dflash2_materialize_final` as an error → red
+    /// (`context_length_exceeded`); pass `reclaim: true` there → red (the
+    /// parked state is dropped).
+    #[test]
+    fn refused_final_token_growth_leaves_it_uncached() -> Result<()> {
+        if !metal_is_default_device() {
+            return Ok(());
+        }
+        let tokenizer = tokenizer();
+        for name in FIXTURES {
+            let mut inner = fixture(name);
+            turn(&mut inner, &tokenizer, &body(4, 40));
+            turn(&mut inner, &tokenizer, &body(6, 40));
+            assert_eq!(inner.dflash2_states.store.bytes().entries, 1, "{name}");
+            let capacity = min_fa_capacity(&inner.caches)?.expect("FA caches");
+            let frontier = flat_attention_frontier(&inner).expect("frontier");
+            let stream = Stream::generation();
+            {
+                let _stream = StreamContext::new(stream);
+                let fill = (frontier..capacity as usize)
+                    .map(|i| (i % 9 + 1) as i32)
+                    .collect::<Vec<_>>();
+                let input = MxArray::from_int32(&fill, &[1, fill.len() as i64])?;
+                let taps = inner
+                    .dflash2
+                    .as_ref()
+                    .expect("draft")
+                    .config
+                    .target_layers
+                    .clone();
+                inner.forward_with_taps(&input, &taps, None)?;
+                inner.eval_layer_caches()?;
+            }
+            assert_eq!(flat_attention_frontier(&inner), Some(capacity as usize));
+            let plan = DFlash2KvPlan {
+                cap_rows: 1_000,
+                extent_rows: 256,
+            };
+            let _budget = BudgetOverride;
+            KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(0)));
+            let materialized = dflash2_materialize_final(&mut inner, 3, stream, plan)?;
+            assert!(!materialized, "{name}");
+            assert_eq!(min_fa_capacity(&inner.caches)?, Some(capacity), "{name}");
+            assert_eq!(flat_attention_frontier(&inner), Some(capacity as usize));
+            assert_eq!(
+                inner.dflash2_states.store.bytes().entries,
+                1,
+                "{name}: the final token's write evicted a parked state"
+            );
+        }
+        Ok(())
+    }
+
+    /// A length-finished turn whose final token's KV growth is refused saves
+    /// its history at the KV frontier, without that token. Mutation: set
+    /// `last_in_cache = true` for any `Ok` from `dflash2_materialize_final`
+    /// in `dflash2_chat_turn` → red (history one past the frontier).
+    #[test]
+    fn refused_final_token_turn_saves_history_at_the_frontier() -> Result<()> {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                REFUSE_FINAL_TOKEN_GROWTH.with(|left| left.set(0));
+            }
+        }
+        if !metal_is_default_device() {
+            return Ok(());
+        }
+        let tokenizer = tokenizer();
+        for name in FIXTURES {
+            let mut inner = fixture(name);
+            let _reset = Reset;
+            REFUSE_FINAL_TOKEN_GROWTH.with(|left| left.set(1));
+            let prompt = body(4, 40);
+            let result = run_tiny_dflash_turn(&mut inner, &tokenizer, &prompt, true, MAX_NEW)?;
+            assert_eq!(result.finish_reason, "length", "{name}");
+            assert_eq!(
+                REFUSE_FINAL_TOKEN_GROWTH.with(std::cell::Cell::get),
+                0,
+                "{name}: the turn must write its final token"
+            );
+            let frontier = flat_attention_frontier(&inner).expect("frontier");
+            let history = ChatBackend::cached_token_history(&inner).len();
+            assert_eq!(history, frontier, "{name}");
+            assert_eq!(history, prompt.len() + MAX_NEW as usize - 1, "{name}");
+        }
+        Ok(())
+    }
+
     /// A turn keeps a parked state when the headroom covers the KV it books
     /// and the transients at that size, not at its whole window. Mutation:
     /// size the turn-start transient at `plan.cap_rows` in
@@ -2678,6 +2882,36 @@ mod tests {
         drop(restore);
         drop(manager);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An extent-growth pool grows for a serial prompt that its free blocks
+    /// cannot hold before cached prefix blocks are counted: the cached block
+    /// survives. Mutation: count reclaimable blocks as available for an
+    /// extent pool in `grow_paged_pool_for_prompt` → red (pool 4 ≠ 6).
+    #[test]
+    fn prompt_grow_keeps_cached_blocks_on_an_extent_pool() {
+        const BLOCK: u32 = 8;
+        let Some(mut adapter) = growable_adapter(4, 16, BLOCK) else {
+            return;
+        };
+        adapter.set_extent_growth(2);
+        adapter.reset_for_new_request(0).expect("reset");
+        adapter.allocate_suffix_blocks(8).expect("allocate");
+        adapter
+            .record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8])
+            .expect("record");
+        assert_eq!(
+            adapter
+                .register_full_blocks_for_reuse(&[], 0)
+                .expect("register"),
+            1
+        );
+        adapter.release_request().expect("release");
+        let prompt: Vec<u32> = (100..132).collect();
+        grow_paged_pool_for_prompt(&mut adapter, &prompt, |adapter| Some(adapter), |_| false);
+        let blocks = adapter.block_telemetry().expect("telemetry");
+        assert_eq!(blocks.total_blocks, 6);
+        assert_eq!(blocks.reclaimable_blocks, 1);
     }
 
     /// Without an armed capture the kept tail is the newest window of the
