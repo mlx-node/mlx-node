@@ -604,8 +604,16 @@ pub(crate) enum SchedulerAction<P, Exclusive, Barrier> {
         #[cfg(test)]
         plan: StepPlan,
         completed: Vec<TurnState<P>>,
-        preempted: Option<TurnState<P>>,
+        preempted: Option<PreemptedTurn<P>>,
     },
+}
+
+/// A step's preemption victim, and whether its own row was the one that
+/// blocked. A victim that did not block resumes to the KV it held, not to
+/// the blocked row's step (Splash `Engine.cpp` resume target).
+pub(crate) struct PreemptedTurn<P> {
+    pub turn: TurnState<P>,
+    pub blocked: bool,
 }
 
 struct Ordered<T> {
@@ -1217,7 +1225,12 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         let result = executor
             .execute(&plan, &mut self.running)
             .map_err(SchedulerError::Executor)?;
-        let allocation_blocked = result.rows.iter().any(|row| row.allocation_blocked);
+        let blocked_rows: HashSet<SeqId> = result
+            .rows
+            .iter()
+            .filter(|row| row.allocation_blocked)
+            .map(|row| row.seq_id)
+            .collect();
         let executed_decode_batch = result.executed_decode_batch;
         let executed_greedy_epilogue_batch = result.executed_greedy_epilogue_batch;
         let rows_alloc_evicted = result.rows_alloc_evicted;
@@ -1259,13 +1272,15 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         }
 
         let mut preempted = None;
-        if allocation_blocked
+        if !blocked_rows.is_empty()
             && let Some(index) = self
                 .running
                 .iter()
                 .rposition(|turn| turn.status == TurnStatus::Running)
         {
-            preempted = Some(self.preempt_running_at(index));
+            let turn = self.preempt_running_at(index);
+            let blocked = blocked_rows.contains(&turn.seq_id);
+            preempted = Some(PreemptedTurn { turn, blocked });
         }
 
         let mut completed = Vec::new();
@@ -1927,6 +1942,7 @@ mod tests {
     }
 
     /// Mutation: `reinstate_running` keeps the preemption count → red.
+    /// Mutation: report every victim as not blocked → red.
     #[test]
     fn reinstated_victim_runs_as_if_never_preempted() {
         let mut scheduler = Scheduler::<_, (), ()>::new(1, 8).expect("scheduler");
@@ -1938,12 +1954,17 @@ mod tests {
             ..MockStep::default()
         };
         let SchedulerAction::Stepped {
-            preempted: Some(victim),
+            preempted:
+                Some(PreemptedTurn {
+                    turn: victim,
+                    blocked,
+                }),
             ..
         } = scheduler.drive_once(&mut step).expect("blocked step")
         else {
             panic!("expected a preempted victim");
         };
+        assert!(blocked, "the lone row blocked its own step");
         assert_eq!(scheduler.stats().preemptions, 1);
         scheduler.reinstate_running(victim);
         assert_eq!(scheduler.stats().preemptions, 0);
@@ -2012,6 +2033,7 @@ mod tests {
         ));
     }
 
+    /// Mutation: report every victim as blocked → red.
     #[test]
     fn allocation_squeeze_preempts_exactly_one_lifo_victim_without_same_step_readmit() {
         let mut scheduler = Scheduler::<_, (), ()>::new(3, 3).expect("scheduler");
@@ -2033,8 +2055,12 @@ mod tests {
             plan.rows.iter().map(|row| row.seq_id).collect::<Vec<_>>(),
             [1, 2, 3]
         );
-        let victim = preempted.expect("one victim");
+        let PreemptedTurn {
+            turn: victim,
+            blocked,
+        } = preempted.expect("one victim");
         assert_eq!(victim.seq_id, 3, "newest running row is the LIFO victim");
+        assert!(!blocked, "row 1 blocked, not the victim");
         assert_eq!(victim.status, TurnStatus::Preempted);
         assert!(!victim.block_reservation_active);
         assert_eq!(victim.preemptions, 1);
