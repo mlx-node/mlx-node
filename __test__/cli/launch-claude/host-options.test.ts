@@ -1,6 +1,16 @@
-import { describe, expect, it } from 'vite-plus/test';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-import { claudeChildEnv, launchClaudeHostOptions } from '../../../packages/cli/src/commands/launch-claude/index.js';
+import type { LoadableModel } from '@mlx-node/lm';
+import { createInferenceHost } from '@mlx-node/server/host';
+import { describe, expect, it, vi } from 'vite-plus/test';
+
+import {
+  claudeChildEnv,
+  launchClaudeHostOptions,
+  loadServedWindow,
+} from '../../../packages/cli/src/commands/launch-claude/index.js';
 
 /**
  * The one launcher behaviour the shared-host extraction could silently drop.
@@ -115,5 +125,61 @@ describe('claudeChildEnv', () => {
     const parent = { ANTHROPIC_API_KEY: 'sk-ant-the-users-own-key' };
     claudeChildEnv(parent, opts);
     expect(parent.ANTHROPIC_API_KEY).toBe('sk-ant-the-users-own-key');
+  });
+});
+
+/**
+ * The window handed to Claude Code is the one the host serves after it has
+ * loaded the bound model, through the real host and registry.
+ */
+describe('loadServedWindow', () => {
+  // Mutation: skip the load → red (undefined: nothing is resident yet).
+  // Mutation: read the window before the load settles → red (undefined).
+  it('loads the bound model and returns its served window, or undefined when the load fails', async () => {
+    const modelsDir = await mkdtemp(join(tmpdir(), 'mlx-launch-claude-'));
+    try {
+      await mkdir(join(modelsDir, 'qwen'), { recursive: true });
+      await writeFile(join(modelsDir, 'qwen', 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+      const model = {
+        contextLimits: () => ({
+          trainedWindowTokens: 262144,
+          effectiveWindowTokens: 73696,
+          pagedBlockCapacity: 0,
+          pagedBlockSize: 16,
+          speculativeWindowTokens: 139257,
+        }),
+        hasMtpWeights: () => true,
+      };
+      let fail = false;
+      const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const host = await createInferenceHost({
+        port: 0,
+        modelsDir,
+        disableStore: true,
+        sweepOrphanTempRoots: false,
+        pagedModelTypes: [],
+        loadModel: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          if (fail) throw new Error('weights unreadable');
+          return model as unknown as LoadableModel;
+        },
+      });
+      try {
+        expect(host.server.registry.servedContext(host.boundModel)).toBeUndefined();
+        await expect(loadServedWindow(host)).resolves.toBe(139257);
+
+        host.server.registry.unregister(host.boundModel);
+        fail = true;
+        await expect(loadServedWindow(host)).resolves.toBeUndefined();
+        expect(error.mock.calls.flat().join('\n')).toContain('load of "qwen" failed: weights unreadable');
+      } finally {
+        await host.close();
+        log.mockRestore();
+        error.mockRestore();
+      }
+    } finally {
+      await rm(modelsDir, { recursive: true, force: true });
+    }
   });
 });

@@ -15,6 +15,7 @@ import {
   NoModelsDiscoveredError,
   resolveLogDir,
   resolveMlxNodeHome,
+  type InferenceHost,
   type InferenceHostOptions,
 } from '@mlx-node/server/host';
 
@@ -218,6 +219,21 @@ export function claudeChildEnv(
   return env;
 }
 
+/**
+ * Load the bound model before Claude Code starts and return the window its
+ * default text turn gets; `undefined` (after printing why) when the load
+ * fails or the model publishes no window.
+ */
+export async function loadServedWindow(
+  host: Pick<InferenceHost, 'boundModel' | 'loadModel' | 'server'>,
+): Promise<number | undefined> {
+  console.log(`[mlx] loading ${host.boundModel} …`);
+  await host.loadModel(host.boundModel).catch((err: unknown) => {
+    console.error(`[mlx] load of "${host.boundModel}" failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
+  return host.server.registry.servedContext(host.boundModel)?.windowTokens;
+}
+
 export async function run(argv: string[]): Promise<void> {
   const parsed = parseArgs({
     args: argv,
@@ -306,12 +322,7 @@ export async function run(argv: string[]): Promise<void> {
     console.log(`[mlx] tail -f "${join(host.logDir, 'session.log')}"`);
   }
 
-  // Load before Claude Code starts so its env carries the served window.
-  console.log(`[mlx] loading ${host.boundModel} …`);
-  await host.loadModel(host.boundModel).catch((err: unknown) => {
-    console.error(`[mlx] load of "${host.boundModel}" failed: ${err instanceof Error ? err.message : String(err)}`);
-  });
-  const contextTokens = host.server.registry.servedContext(host.boundModel)?.windowTokens;
+  const contextTokens = await loadServedWindow(host);
 
   const child = spawn(claudeBin, claudeArgs, {
     stdio: 'inherit',
