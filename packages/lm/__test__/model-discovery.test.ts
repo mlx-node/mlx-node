@@ -1,6 +1,6 @@
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vite-plus/test';
 
@@ -27,6 +27,139 @@ function minimalGguf(architecture: string): Buffer {
   stringType.writeUInt32LE(8);
   return Buffer.concat([header, string('general.architecture'), stringType, string(architecture)]);
 }
+
+/** Write `files` (path → contents) under a fresh `<tmp>/<name>` models dir; returns the dir. */
+function modelsDir(name: string, files: Record<string, string | Buffer>): string {
+  const dir = join(tmp, name);
+  for (const [path, contents] of Object.entries(files)) {
+    mkdirSync(dirname(join(dir, path)), { recursive: true });
+    writeFileSync(join(dir, path), contents);
+  }
+  return dir;
+}
+
+const FLASH_SHARDS = [1, 2, 3, 4].map((i) => `UD-Q4_K_XL/Flash-UD-Q4_K_XL-0000${i}-of-00004.gguf`);
+/** `mlx download -g "*UD-Q4_K_XL*"` layout: README + marker at the repo root, shards one level down. */
+const flashRepo = (extra: Record<string, string | Buffer> = {}): Record<string, string | Buffer> => ({
+  'flash/README.md': '# Flash',
+  'flash/.mlx-download-complete.json': '{}',
+  ...Object.fromEntries(FLASH_SHARDS.map((path, i) => [`flash/${path}`, i === 0 ? minimalGguf('qwen4exp') : 'shard'])),
+  ...Object.fromEntries(Object.entries(extra).map(([path, contents]) => [`flash/${path}`, contents])),
+});
+
+describe('discoverLocalChatModels — GGUF variant folders', () => {
+  it('lists the first shard of a split set in a variant folder', async () => {
+    const dir = modelsDir('variant-flash', flashRepo());
+    const failures: string[] = [];
+    expect(await discoverLocalChatModels(dir, { onEntryFailure: (_e, path) => failures.push(path) })).toEqual([
+      expect.objectContaining({
+        name: 'Flash-UD-Q4_K_XL-00001-of-00004',
+        path: join(dir, 'flash', FLASH_SHARDS[0]),
+        modelType: 'qwen4_exp',
+      }),
+    ]);
+    expect(failures).toEqual([]);
+  });
+
+  it('does not register the repo folder itself when it has a root config.json', async () => {
+    const dir = modelsDir(
+      'variant-root-config',
+      flashRepo({ 'config.json': JSON.stringify({ model_type: 'qwen4_exp' }) }),
+    );
+    expect((await discoverLocalChatModels(dir)).map((model) => model.path)).toEqual([
+      join(dir, 'flash', FLASH_SHARDS[0]),
+    ]);
+  });
+
+  it('looks into variant folders when the root holds only a projector', async () => {
+    const dir = modelsDir('variant-mmproj-root', flashRepo({ 'mmproj-F16.gguf': minimalGguf('clip') }));
+    expect((await discoverLocalChatModels(dir)).map((model) => model.path)).toEqual([
+      join(dir, 'flash', FLASH_SHARDS[0]),
+    ]);
+  });
+
+  it('lists each variant, sorted, and scopes a clashing name by the repo folder', async () => {
+    const dir = modelsDir('variant-two', {
+      'repo/Q8_0/Model.gguf': minimalGguf('qwen4exp'),
+      'repo/UD-Q4_K_XL/Model.gguf': minimalGguf('qwen4exp'),
+    });
+    expect((await discoverLocalChatModels(dir)).map(({ name, path }) => ({ name, path }))).toEqual([
+      { name: 'Model', path: join(dir, 'repo', 'Q8_0', 'Model.gguf') },
+      { name: 'repo-Model', path: join(dir, 'repo', 'UD-Q4_K_XL', 'Model.gguf') },
+    ]);
+  });
+
+  it('keeps a top-level target authoritative and never looks deeper than one variant level', async () => {
+    const dir = modelsDir('variant-depth', {
+      'top/Model.gguf': minimalGguf('qwen4exp'),
+      'top/UD-Q4_K_XL/Other.gguf': minimalGguf('qwen4exp'),
+      'deep/a/b/Model.gguf': minimalGguf('qwen4exp'),
+    });
+    expect((await discoverLocalChatModels(dir)).map((model) => model.path)).toEqual([join(dir, 'top', 'Model.gguf')]);
+  });
+
+  it('skips companion-only, dot, asset, and safetensors-owned folders without reporting failures', async () => {
+    const dir = modelsDir('variant-skips', {
+      'mtp/MTP/mtp-Q8_0.gguf': minimalGguf('qwen4exp'),
+      'mtp/MTP-Q8_0/mtp-Q4_K_XL.gguf': minimalGguf('qwen4exp'),
+      'dot/.hidden/Model.gguf': minimalGguf('qwen4exp'),
+      'assets/.mlx-qwen4-assets-v2-abc/Model.gguf': minimalGguf('qwen4exp'),
+      'safe/config.json': JSON.stringify({ model_type: 'qwen4_exp' }),
+      'safe/model.safetensors': 'x',
+      'safe/sub/Model.gguf': minimalGguf('qwen4exp'),
+      'owned/sub/model.safetensors': 'x',
+      'owned/sub/Model.gguf': minimalGguf('qwen4exp'),
+    });
+    const failures: string[] = [];
+    const models = await discoverLocalChatModels(dir, { onEntryFailure: (_e, path) => failures.push(path) });
+    expect(models.map((model) => model.path)).toEqual([join(dir, 'safe')]);
+    expect(failures).toEqual([]);
+  });
+
+  it('follows a symlinked variant folder and ignores a dangling one', async () => {
+    const external = modelsDir('variant-link-target', { 'Model.gguf': minimalGguf('qwen4exp') });
+    const dir = modelsDir('variant-link', { 'repo/README.md': '#' });
+    symlinkSync(external, join(dir, 'repo', 'linked'));
+    symlinkSync(join(tmp, 'variant-link-absent'), join(dir, 'repo', 'dangling'));
+    expect((await discoverLocalChatModels(dir)).map((model) => model.path)).toEqual([
+      join(dir, 'repo', 'linked', 'Model.gguf'),
+    ]);
+  });
+
+  it('checks the sidecars of an asset-requiring family beside the variant GGUF', async () => {
+    const config = JSON.stringify({ model_type: 'gemma4' });
+    const dir = modelsDir('variant-gemma', {
+      'gemma/config.json': config,
+      'gemma/tokenizer.json': '{}',
+      'gemma/UD-Q4_K_XL/gemma-UD-Q4_K_XL.gguf': minimalGguf('gemma4'),
+    });
+    // Root sidecars do not count: the loader reads them beside the GGUF.
+    expect(await discoverLocalChatModels(dir)).toEqual([]);
+    writeFileSync(join(dir, 'gemma', 'UD-Q4_K_XL', 'config.json'), config);
+    writeFileSync(join(dir, 'gemma', 'UD-Q4_K_XL', 'tokenizer.json'), '{}');
+    expect(await discoverLocalChatModels(dir)).toEqual([
+      expect.objectContaining({ path: join(dir, 'gemma', 'UD-Q4_K_XL', 'gemma-UD-Q4_K_XL.gguf'), modelType: 'gemma4' }),
+    ]);
+  });
+
+  it.skipIf(!canChmod)('reports an unreadable variant folder and keeps scanning its siblings', async () => {
+    const dir = modelsDir('variant-unreadable', {
+      'repo/A/Model-A.gguf': minimalGguf('qwen4exp'),
+      'repo/B/Model-B.gguf': minimalGguf('qwen4exp'),
+    });
+    const locked = join(dir, 'repo', 'A');
+    chmodSync(locked, 0o000);
+    const failures: string[] = [];
+    try {
+      expect(
+        (await discoverLocalChatModels(dir, { onEntryFailure: (_e, path) => failures.push(path) })).map((m) => m.path),
+      ).toEqual([join(dir, 'repo', 'B', 'Model-B.gguf')]);
+      expect(failures).toEqual([locked]);
+    } finally {
+      chmodSync(locked, 0o700);
+    }
+  });
+});
 
 describe('discoverLocalChatModels', () => {
   it('admits only shard 00001 of a split set, and only for families that allow splits', async () => {
