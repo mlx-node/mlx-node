@@ -517,11 +517,24 @@ pub(crate) fn validate_query_input(
     })
 }
 
-/// Bytes a pool grow holds beside the new pool: one old layer of `own_bytes`
-/// spread over `layers`, as `LayerKVPool::grow_to` frees each old layer
-/// before it allocates the next.
-pub(crate) fn pool_grow_reserved_bytes(own_bytes: u64, layers: u32) -> u64 {
-    own_bytes.div_ceil(u64::from(layers.max(1)))
+/// Bytes a pool grow holds beside the new pool: the peak of
+/// `LayerKVPool::grow_to`'s swaps, which allocate each layer's new buffers
+/// while its old ones are alive and skip a layer already at the new size,
+/// walked over the real `layer_bytes`. Layers differ after a grow or a cut
+/// that failed part way; equal layers give one old layer.
+pub(crate) fn pool_grow_reserved_bytes(layer_bytes: &[u64], new_layer_bytes: u64) -> u64 {
+    let mut live = layer_bytes
+        .iter()
+        .fold(0u64, |total, &bytes| total.saturating_add(bytes));
+    let mut peak = live;
+    for &old in layer_bytes {
+        if old == new_layer_bytes {
+            continue;
+        }
+        peak = peak.max(live.saturating_add(new_layer_bytes));
+        live = live.saturating_add(new_layer_bytes).saturating_sub(old);
+    }
+    peak.saturating_sub(new_layer_bytes.saturating_mul(layer_bytes.len() as u64))
 }
 
 /// Whole pool extents of `extent_bytes` that give back at least
@@ -3081,8 +3094,7 @@ impl PagedKVCacheAdapter {
 
     /// Pre-grow headroom probe: ask the load-time sizer how many blocks of
     /// the grow-target size the live Metal budget can back, reserving the
-    /// grow's transient ([`pool_grow_reserved_bytes`]: one old layer, as
-    /// `LayerKVPool::grow_to` swaps a layer at a time), and every sibling
+    /// grow's transient ([`Self::grow_transient_bytes`]), and every sibling
     /// pool registered with the coordinator counts against the same budget.
     /// Read-only (no allocations); `Err` must fail the grow closed.
     #[cfg(target_os = "macos")]
@@ -3093,8 +3105,7 @@ impl PagedKVCacheAdapter {
         }
         let config = self.layer_kv_pool.config();
         let own_bytes = self.layer_kv_pool.total_bytes();
-        let layers = self.layer_kv_pool.num_layers() as u32;
-        let extra_reserved_bytes = pool_grow_reserved_bytes(own_bytes, layers).saturating_add(
+        let extra_reserved_bytes = self.grow_transient_bytes(new_num_blocks)?.saturating_add(
             crate::cache_limit::coordinator()
                 .registered_pool_bytes()
                 // The sizer reserves this pool's staging pair itself. Growth
@@ -3113,6 +3124,17 @@ impl PagedKVCacheAdapter {
         )
         .map(|sizing| sizing.selected_blocks)
         .map_err(|error| error.to_string())
+    }
+
+    /// Bytes a grow to `new_num_blocks` holds beside the new pool: the peak
+    /// of its layer swaps over the real layer sizes
+    /// ([`pool_grow_reserved_bytes`]).
+    #[cfg(target_os = "macos")]
+    fn grow_transient_bytes(&self, new_num_blocks: u32) -> Result<u64, String> {
+        Ok(pool_grow_reserved_bytes(
+            &self.layer_kv_pool.layer_bytes(),
+            self.layer_kv_pool.layer_bytes_for(new_num_blocks)?,
+        ))
     }
 
     /// Reserve block capacity for `extra` rows past the current cursor
@@ -16747,6 +16769,91 @@ mod tests {
         assert_eq!(pool.num_blocks(), 7, "the pool grows again from the runway");
         assert!(!pool.shrink_pending());
         assert_eq!(pool.total_bytes(), 7 * block_bytes);
+    }
+
+    /// A 4-layer pool whose 10 -> 4 cut fails at layer 2 holds layers
+    /// [4,4,10,10] under a 4-block count. A grow to 7 with no reclaim in
+    /// between peaks at 41 layer-blocks (layer 2 allocates its 7 while its
+    /// 10 is alive), so it reserves 13 beside the new 28, not one average
+    /// layer, and still lands every layer at 7.
+    /// Mutation: average the old layers in `pool_grow_reserved_bytes`
+    /// (`total.div_ceil(layers)`) → red (7 ≠ 13 layer-blocks).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn grow_after_a_failed_cut_reserves_its_real_layer_peak() {
+        const NAME: &str = "grow_after_a_failed_cut_reserves_its_real_layer_peak";
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 4,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping {NAME}: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+        adapter.set_extent_growth(3);
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        let block_bytes = adapter.bytes_per_block().expect("bytes per block");
+        let layer_block_bytes = block_bytes / 4;
+        let extent_bytes = 3 * block_bytes;
+
+        adapter.reset_for_new_request(7).unwrap();
+        assert_eq!(adapter.allocate_suffix_blocks(80).unwrap(), 10);
+        adapter.release_request().unwrap();
+        mlx_paged_attn::set_shrink_fail_at_layer(Some(2));
+        adapter.try_release_pool_extents(2 * extent_bytes, false);
+        mlx_paged_attn::set_shrink_fail_at_layer(None);
+        assert_eq!(pool.num_blocks(), 4);
+        assert_eq!(
+            pool.layer_bytes(),
+            [4, 4, 10, 10].map(|blocks| blocks * layer_block_bytes)
+        );
+
+        assert_eq!(
+            adapter.grow_transient_bytes(7).unwrap(),
+            13 * layer_block_bytes
+        );
+        assert!(adapter.try_grow_pool(3));
+        assert_eq!(pool.num_blocks(), 7);
+        assert!(!pool.shrink_pending());
+        assert_eq!(pool.total_bytes(), 7 * block_bytes);
+    }
+
+    /// The reserve a pool grow holds beside the new pool is the peak of
+    /// `grow_to`'s layer swaps over the real layer sizes, in layer-blocks.
+    /// Mutations: average the old layers (`total.div_ceil(layers)`) → red
+    /// on [4,4,10,10] (7 ≠ 13) and [10,10,10,4] (9 ≠ 13); drop the skip
+    /// of a layer already at the new size → red on [4,4,7,7] (7 ≠ 4).
+    #[test]
+    fn grow_reserve_prices_the_real_per_layer_peak() {
+        for (layers, reserved) in [
+            ([4u64, 4, 10, 10], 13u64),
+            ([10, 10, 10, 4], 13),
+            ([4, 4, 4, 4], 4),
+            ([4, 4, 7, 7], 4),
+        ] {
+            assert_eq!(
+                pool_grow_reserved_bytes(&layers, 7),
+                reserved,
+                "layers {layers:?}"
+            );
+        }
     }
 
     /// **Grow decline**: a headroom probe that selects fewer blocks than the
