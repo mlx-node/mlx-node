@@ -772,6 +772,56 @@ pub(crate) fn resume_booking_blocks(
     booked_blocks.max(rows.div_ceil(block_size.max(1)))
 }
 
+/// State a running on-demand speculative turn holds at `tokens` past the
+/// charge it was admitted or resumed with; 0 for any other turn.
+fn uncharged_draft_state_bytes<B: HybridSchedulerBackend>(
+    inner: &B,
+    turn: &TurnState<ScheduledTurn<B::PrefixState>>,
+    tokens: u32,
+) -> u64 {
+    if !inner.scheduler_books_on_demand()
+        || !turn.recurrent_state_reservation_active
+        || turn.payload.scheduled_speculation.is_none()
+    {
+        return 0;
+    }
+    inner
+        .recurrent_state_bytes()
+        .saturating_add(inner.scheduled_draft_state_held_bytes(tokens))
+        .saturating_sub(turn.recurrent_state_bytes)
+}
+
+/// Largest turn length a lone speculative turn can reach in
+/// `usable_pool_tokens` when its draft state, held outside the pool, grows
+/// with every row: its blocks plus `held(T)` fit the usable pool's bytes.
+pub(crate) fn speculative_window_tokens(
+    usable_pool_tokens: u32,
+    block_size: u32,
+    bytes_per_block: u64,
+    held: impl Fn(u32) -> u64,
+) -> u32 {
+    if bytes_per_block == 0 || block_size == 0 {
+        return usable_pool_tokens.max(1);
+    }
+    let budget = u64::from(usable_pool_tokens / block_size).saturating_mul(bytes_per_block);
+    let fits = |tokens: u32| {
+        u64::from(tokens.div_ceil(block_size))
+            .saturating_mul(bytes_per_block)
+            .saturating_add(held(tokens))
+            <= budget
+    };
+    let (mut low, mut high) = (0u32, usable_pool_tokens);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if fits(mid) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    low.max(1)
+}
+
 /// Blocks a pool grow must add before `decision` admits, or `None` when no
 /// grow below the max pool can. Live turns' unallocated bookings and the
 /// watermark are in `decision`; the watermark grows with the pool by
@@ -2153,22 +2203,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 return None;
             }
         };
-        let adapter = self.inner.paged_adapter();
-        let pool_tokens = adapter
-            .map(crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter::max_capacity_tokens)
-            .unwrap_or(trained_context);
-        let bytes_per_block = adapter
-            .map(|adapter| adapter.bytes_per_block().unwrap_or(0))
-            .unwrap_or(0);
-        let usable_pool = pool_tokens_after_recurrent(
-            pool_tokens,
-            block_size,
-            bytes_per_block,
-            self.inner.recurrent_state_bytes(),
+        let speculative = matches!(
+            admitted.plan.decoder,
+            engine::plan::DecoderPlan::Speculative(_)
         );
         let context = scheduled_turn_context(
             trained_context,
-            usable_pool,
+            self.scheduled_turn_window(block_size, speculative),
             scheduler_per_seq_context_override(),
         );
         let max_new_tokens = match engine::scheduler::clamp_scheduled_output_tokens(
@@ -2192,20 +2233,18 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let on_demand = self.inner.scheduler_books_on_demand();
         let (reservation_blocks, booked_tokens) =
             scheduled_booking(on_demand, prompt_tokens, max_new_tokens, block_size);
-        let reservation_state_bytes = self.inner.recurrent_state_bytes().saturating_add(
-            if matches!(
-                admitted.plan.decoder,
-                engine::plan::DecoderPlan::Speculative(_)
-            ) {
-                self.inner.scheduled_draft_state_bytes(if on_demand {
-                    booked_tokens
+        let reservation_state_bytes =
+            self.inner
+                .recurrent_state_bytes()
+                .saturating_add(if speculative {
+                    self.inner.scheduled_draft_state_bytes(if on_demand {
+                        booked_tokens
+                    } else {
+                        requested_tokens
+                    })
                 } else {
-                    requested_tokens
-                })
-            } else {
-                0
-            },
-        );
+                    0
+                });
         admitted.params.extra_eos_ids = self.inner.extra_eos_ids();
         Some(Box::new(PreparedTurn {
             reservation_state_bytes,
@@ -2219,6 +2258,35 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             block_size,
             requested_tokens,
         }))
+    }
+
+    /// Tokens one scheduled turn can use in the max pool after recurrent
+    /// state. An on-demand speculative turn's draft state grows outside the
+    /// pool with every row and each step must fit it, so its window also
+    /// pays the draft state it holds at its last row.
+    fn scheduled_turn_window(&self, block_size: u32, speculative: bool) -> u32 {
+        let trained_context = u32::try_from(self.inner.max_position_embeddings())
+            .unwrap_or(1)
+            .max(1);
+        let adapter = self.inner.paged_adapter();
+        let pool_tokens = adapter
+            .map(crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter::max_capacity_tokens)
+            .unwrap_or(trained_context);
+        let bytes_per_block = adapter
+            .map(|adapter| adapter.bytes_per_block().unwrap_or(0))
+            .unwrap_or(0);
+        let usable_pool = pool_tokens_after_recurrent(
+            pool_tokens,
+            block_size,
+            bytes_per_block,
+            self.inner.recurrent_state_bytes(),
+        );
+        if !(speculative && self.inner.scheduler_books_on_demand()) {
+            return usable_pool;
+        }
+        speculative_window_tokens(usable_pool, block_size, bytes_per_block, |tokens| {
+            self.inner.scheduled_draft_state_held_bytes(tokens)
+        })
     }
 
     fn cleanup_rejected_prepared(&mut self, prepared: &PreparedTurn) {
@@ -2449,23 +2517,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     /// pool, so what it holds now (and the next step's draft rows) is
     /// charged as it grows.
     fn grown_draft_state_bytes(&self) -> u64 {
-        if !self.inner.scheduler_books_on_demand() {
-            return 0;
-        }
-        let recurrent = self.inner.recurrent_state_bytes();
-        self.scheduler
-            .running()
-            .iter()
-            .filter(|turn| {
-                turn.recurrent_state_reservation_active
-                    && turn.payload.scheduled_speculation.is_some()
-            })
-            .fold(0u64, |sum, turn| {
-                let held = recurrent.saturating_add(self.inner.scheduled_draft_state_held_bytes(
-                    turn.num_tokens.saturating_add(turn.decode_draft_allowance),
-                ));
-                sum.saturating_add(held.saturating_sub(turn.recurrent_state_bytes))
-            })
+        self.scheduler.running().iter().fold(0u64, |sum, turn| {
+            sum.saturating_add(uncharged_draft_state_bytes(
+                &self.inner,
+                turn,
+                turn.num_tokens.saturating_add(turn.decode_draft_allowance),
+            ))
+        })
     }
 
     /// Unified-memory admission decision against one cache snapshot.
@@ -5363,6 +5421,213 @@ pub(crate) mod tests {
             matches!(outcome, MemoryReserveOutcome::Defer),
             "{outcome:?}"
         );
+    }
+
+    /// Qwen3.5 scheduler with one MTP layer, a 4-block pool of 8,192 B
+    /// blocks, and the admission charge of a turn booked at 56 rows
+    /// (435,968 B). The pool grow is declined unless `set_mtp_step_probe`.
+    fn mtp_step_state() -> Option<(HybridSchedulerState<Qwen35Inner>, u64)> {
+        let (mut state, snapshot) = growable_qwen35_state()?;
+        state.inner.config.n_mtp_layers = 1;
+        let admission =
+            state.inner.recurrent_state_bytes() + state.inner.scheduled_draft_state_bytes(56);
+        assert_eq!(admission, 435_968);
+        assert_eq!(snapshot.blocks.total_blocks, 4);
+        assert_eq!(snapshot.bytes_per_block, 8_192);
+        set_mtp_step_probe(&mut state, false);
+        Some((state, admission))
+    }
+
+    fn set_mtp_step_probe(state: &mut HybridSchedulerState<Qwen35Inner>, grows: bool) {
+        let probe: Arc<dyn Fn(u32) -> std::result::Result<u32, String> + Send + Sync> = if grows {
+            Arc::new(Ok)
+        } else {
+            Arc::new(|_| Err("no headroom".to_string()))
+        };
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(probe));
+    }
+
+    /// A running MTP turn at `num_tokens` charged `admission`; its prompt
+    /// blocks go back to the pool so every case reads 4 blocks of room.
+    fn mtp_step_turn(
+        state: &mut HybridSchedulerState<Qwen35Inner>,
+        seq: u32,
+        num_tokens: u32,
+        admission: u64,
+    ) -> TurnState<ScheduledTurn<<Qwen35Inner as PagedBackend>::PrefixState>> {
+        let mut turn = speculative::tests::request(
+            &mut state.inner,
+            seq,
+            (0..40).map(|token| token % 16).collect(),
+            true,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_block_reservation(0, 0, 16)
+        .with_recurrent_state_reservation(admission);
+        turn.num_tokens = num_tokens;
+        state
+            .inner
+            .release_scheduled_cache(seq)
+            .expect("return the prompt blocks");
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("scheduler snapshot")
+            .expect("paged adapter present");
+        assert_eq!(snapshot.blocks.total_blocks, 4);
+        assert_eq!(
+            snapshot.blocks.free_blocks + snapshot.blocks.reclaimable_blocks,
+            4
+        );
+        turn
+    }
+
+    /// A running MTP turn admitted at its 56 booked rows grows draft K/V
+    /// outside the pool every step; each step admits that growth against
+    /// the pool's free bytes (4 blocks, 32,768 B): 14,336 B at 200 tokens
+    /// fits, 65,536 B at 400 does not.
+    /// Mutation: `draft_growth_fits` returns `Ok(true)` → red (400 tokens).
+    #[test]
+    fn running_mtp_step_admits_its_draft_growth() {
+        let Some((mut state, admission)) = mtp_step_state() else {
+            return;
+        };
+        let short = vec![mtp_step_turn(&mut state, 1, 200, admission)];
+        assert_eq!(
+            uncharged_draft_state_bytes(&state.inner, &short[0], 204),
+            14_336
+        );
+        assert!(
+            HybridStepExecutor::new(&mut state.inner)
+                .draft_growth_fits(&short, 0, 4)
+                .expect("short step")
+        );
+        let lone = vec![mtp_step_turn(&mut state, 2, 400, admission)];
+        assert_eq!(
+            uncharged_draft_state_bytes(&state.inner, &lone[0], 404),
+            65_536
+        );
+        assert!(
+            !HybridStepExecutor::new(&mut state.inner)
+                .draft_growth_fits(&lone, 0, 4)
+                .expect("lone step")
+        );
+    }
+
+    /// Two MTP turns at 250 tokens: this step's 27,136 B fits the pool's
+    /// 32,768 B alone, not beside the peer's 26,880 B.
+    /// Mutation: drop the peers' sum in `draft_growth_fits` → red.
+    #[test]
+    fn running_mtp_step_admits_its_peers_draft_growth() {
+        let Some((mut state, admission)) = mtp_step_state() else {
+            return;
+        };
+        let pair = vec![
+            mtp_step_turn(&mut state, 3, 250, admission),
+            mtp_step_turn(&mut state, 4, 250, admission),
+        ];
+        assert_eq!(pair[1].decode_draft_allowance, 3);
+        assert_eq!(
+            uncharged_draft_state_bytes(&state.inner, &pair[0], 254),
+            27_136
+        );
+        assert_eq!(
+            uncharged_draft_state_bytes(&state.inner, &pair[1], 253),
+            26_880
+        );
+        assert!(
+            !HybridStepExecutor::new(&mut state.inner)
+                .draft_growth_fits(&pair, 0, 4)
+                .expect("peer step")
+        );
+        assert!(
+            HybridStepExecutor::new(&mut state.inner)
+                .draft_growth_fits(&pair[..1], 0, 4)
+                .expect("step without the peer")
+        );
+    }
+
+    /// A lone MTP turn at 400 tokens is 4 blocks short; with headroom the
+    /// step grows the pool to 8 blocks and admits its draft growth.
+    /// Mutation: drop the pool grow in `draft_growth_fits` → red.
+    #[test]
+    fn running_mtp_step_grows_the_pool_for_its_draft_growth() {
+        let Some((mut state, admission)) = mtp_step_state() else {
+            return;
+        };
+        let lone = vec![mtp_step_turn(&mut state, 2, 400, admission)];
+        set_mtp_step_probe(&mut state, true);
+        assert!(
+            HybridStepExecutor::new(&mut state.inner)
+                .draft_growth_fits(&lone, 0, 4)
+                .expect("grown step")
+        );
+        let grown = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("scheduler snapshot")
+            .expect("paged adapter present");
+        assert_eq!(grown.blocks.total_blocks, 8);
+    }
+
+    /// 256 usable tokens in 16-token blocks of 8,192 B hold 131,072 B; with
+    /// `1,000 + 256·T` held beside them, T = 160 fits (123,880 B) and
+    /// T = 161 needs 11 blocks (132,328 B).
+    /// Mutation: drop `held(T)` from the fit → red (256 ≠ 160).
+    #[test]
+    fn speculative_window_prices_the_held_draft_state() {
+        let held = |tokens: u32| 1_000 + 256 * u64::from(tokens);
+        assert_eq!(speculative_window_tokens(256, 16, 8_192, held), 160);
+        assert_eq!(speculative_window_tokens(256, 16, 0, held), 256);
+        assert_eq!(speculative_window_tokens(256, 16, 8_192, |_| u64::MAX), 1);
+    }
+
+    /// An MTP turn's window pays the draft state it holds at its last row,
+    /// so a lone turn there passes every step check; an AR turn keeps the
+    /// pool window.
+    /// Mutation: `scheduled_turn_window` ignores `speculative` → red.
+    #[test]
+    fn mtp_turn_window_is_the_speculative_window() {
+        let Some((mut state, _)) = growable_qwen35_state() else {
+            return;
+        };
+        state.inner.config.n_mtp_layers = 1;
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            num_kv_heads: 1,
+            head_size: 128,
+            num_layers: 1,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(8_192),
+            max_batch_size: Some(32),
+        };
+        let pool = mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            512,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        )
+        .expect("MTP window LayerKVPool");
+        let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+            4, 512, 16,
+        )));
+        state.inner.paged_adapter = Some(
+            PagedKVCacheAdapter::new(allocator, Arc::new(pool), 16).expect("MTP window adapter"),
+        );
+        let ar = state.scheduled_turn_window(16, false);
+        let mtp = state.scheduled_turn_window(16, true);
+        assert_eq!(
+            mtp,
+            speculative_window_tokens(ar, 16, 8_192, |tokens| {
+                state.inner.scheduled_draft_state_held_bytes(tokens)
+            })
+        );
+        assert!(1 < mtp && mtp < ar, "{mtp} vs {ar}");
     }
 
     /// 40 of 100 blocks, 10 free, 20 booked, 5% watermark (2 blocks'

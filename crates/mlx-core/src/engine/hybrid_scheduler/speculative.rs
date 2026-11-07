@@ -38,6 +38,80 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         result
     }
 
+    /// Target rows for `queries` and the draft state the step grows
+    /// outside the pool. A refusal blocks the row, so the scheduler
+    /// reclaims or preempts instead of the draft caches outgrowing memory.
+    fn reserve_speculative_step(
+        &mut self,
+        running: &[TurnState<ScheduledTurn<B::PrefixState>>],
+        turn_index: usize,
+        queries: usize,
+    ) -> Result<bool> {
+        if !self
+            .inner
+            .reserve_scheduled_speculation(running[turn_index].seq_id, queries)?
+        {
+            return Ok(false);
+        }
+        self.draft_growth_fits(
+            running,
+            turn_index,
+            u32::try_from(queries).unwrap_or(u32::MAX),
+        )
+    }
+
+    /// Whether the draft state every running turn holds past its charge,
+    /// this turn's at its step's `queries` rows, fits the pool's free and
+    /// reclaimable bytes left after the step's target rows, growing the pool
+    /// once for the shortfall first.
+    pub(super) fn draft_growth_fits(
+        &mut self,
+        running: &[TurnState<ScheduledTurn<B::PrefixState>>],
+        turn_index: usize,
+        queries: u32,
+    ) -> Result<bool> {
+        let need = running.iter().enumerate().fold(0u64, |sum, (index, turn)| {
+            let tokens = if index == turn_index {
+                turn.num_tokens.saturating_add(queries)
+            } else {
+                turn.num_tokens.saturating_add(turn.decode_draft_allowance)
+            };
+            sum.saturating_add(uncharged_draft_state_bytes(&*self.inner, turn, tokens))
+        });
+        if need == 0 {
+            return Ok(true);
+        }
+        let available = |snapshot: &SchedulerCacheSnapshot| {
+            u64::from(snapshot.blocks.free_blocks)
+                .saturating_add(u64::from(snapshot.blocks.reclaimable_blocks))
+                .saturating_mul(snapshot.bytes_per_block)
+        };
+        let Some(snapshot) = self.inner.scheduler_cache_snapshot()? else {
+            return Ok(true);
+        };
+        let free = available(&snapshot);
+        if need <= free {
+            return Ok(true);
+        }
+        if snapshot.blocks.total_blocks >= snapshot.max_total_blocks {
+            return Ok(false);
+        }
+        let shortfall_blocks = (need - free)
+            .div_ceil(snapshot.bytes_per_block.max(1))
+            .min(u64::from(u32::MAX)) as u32;
+        if !self
+            .inner
+            .paged_adapter_mut()
+            .is_some_and(|adapter| adapter.try_grow_pool(shortfall_blocks))
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .inner
+            .scheduler_cache_snapshot()?
+            .is_some_and(|grown| need <= available(&grown)))
+    }
+
     pub(super) fn execute_speculative_rows(
         &mut self,
         plan: &StepPlan,
@@ -166,14 +240,13 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             // Reserve before proposal construction. On pressure retry only the
             // known anchor; the scheduler can preempt if even that cannot fit.
             let reserve = self
-                .inner
-                .reserve_scheduled_speculation(row.seq_id, cap + 1)
+                .reserve_speculative_step(running, turn_index, cap + 1)
                 .and_then(|reserved| {
                     if reserved {
                         Ok(true)
                     } else {
                         cap = 0;
-                        self.inner.reserve_scheduled_speculation(row.seq_id, 1)
+                        self.reserve_speculative_step(running, turn_index, 1)
                     }
                 });
             match reserve {
@@ -183,7 +256,10 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     continue;
                 }
                 Err(error) => {
-                    results.push((plan_index, Self::speculative_failure(turn, row, error)));
+                    results.push((
+                        plan_index,
+                        Self::speculative_failure(&mut running[turn_index], row, error),
+                    ));
                     continue;
                 }
             }
