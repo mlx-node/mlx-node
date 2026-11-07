@@ -1825,6 +1825,8 @@ describe('mlx agent update (run)', () => {
 describe('launchGrokAgent server gating', () => {
   let root: string;
   let health: ReturnType<typeof createHttpServer>;
+  /** `/health` body; an authenticated poll is the preload wait, the bare one the readiness probe. */
+  let healthBody: (authorized: boolean) => unknown;
   let serveBase: string;
   let savedAgentBin: string | undefined;
   let savedAgentTag: string | undefined;
@@ -1857,7 +1859,11 @@ describe('launchGrokAgent server gating', () => {
     savedAgentTag = process.env[MLX_AGENT_TAG_ENV];
     process.env[MLX_AGENT_BIN_ENV] = bin;
     delete process.env[MLX_AGENT_TAG_ENV];
-    health = createHttpServer((_, res) => res.end('ok'));
+    healthBody = () => ({ status: 'ok', models: { resident: ['qwen-local'] }, lastLoad: null });
+    health = createHttpServer((req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify(healthBody(req.headers.authorization?.startsWith('Bearer ') === true)));
+    });
     await new Promise<void>((resolvePromise) => health.listen(0, '127.0.0.1', resolvePromise));
     serveBase = `http://127.0.0.1:${(health.address() as AddressInfo).port}`;
     spawnServe.mockClear();
@@ -1967,6 +1973,48 @@ describe('launchGrokAgent server gating', () => {
       if (saved === undefined) delete process.env.GROK_RESUME_COMMAND;
       else process.env.GROK_RESUME_COMMAND = saved;
     }
+  });
+
+  // Mutation: skip the preload wait → red (grok spawned after 0 polls).
+  // Mutation: keep waiting after a failed load → red (times out).
+  it('starts grok after the preload is resident', async () => {
+    let polls = 0;
+    healthBody = (authorized) => {
+      if (!authorized) return { status: 'ok' };
+      polls += 1;
+      return { status: 'loading', models: { resident: polls > 3 ? ['qwen-local'] : [] }, lastLoad: null };
+    };
+    const spawnedAt: number[] = [];
+    const agentAfterPolls = (bin: string, argv: string[], so: SpawnOptions): ChildProcess => {
+      spawnedAt.push(polls);
+      return spawnAgent(bin, argv, so);
+    };
+    const launch = { argv: ['-c'], preloadModel: 'qwen-local', spawnServe, preloadPollMs: 5 };
+    await launchGrokAgent({ ...launch, spawnAgent: agentAfterPolls });
+    expect(spawnedAt).toEqual([4]);
+
+    healthBody = (authorized) =>
+      authorized
+        ? { status: 'error', models: { resident: [] }, lastLoad: { label: 'qwen-local', ok: false } }
+        : { status: 'ok' };
+    await expect(launchGrokAgent({ ...launch, spawnAgent: agentAfterPolls })).resolves.toBe(0);
+    expect(spawnedAt).toHaveLength(2);
+  });
+
+  it('fails without starting grok when serve exits during the preload', async () => {
+    healthBody = (authorized) => (authorized ? { models: { resident: [] }, lastLoad: null } : { status: 'ok' });
+    spawnServe.mockImplementationOnce((_argv: string[], _so: SpawnOptions) => {
+      const kill = vi.fn();
+      serveKills.push(kill);
+      const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), kill });
+      child.stdout.end(`listening on ${serveBase}\n`);
+      setTimeout(() => child.emit('exit', 1), 50);
+      return child as unknown as ChildProcess;
+    });
+    await expect(
+      launchGrokAgent({ argv: ['-c'], preloadModel: 'qwen-local', spawnServe, spawnAgent, preloadPollMs: 5 }),
+    ).rejects.toThrow('mlx serve exited (1) while loading qwen-local');
+    expect(spawnAgent.envs).toHaveLength(0);
   });
 
   it('kills the serve child when readiness fails', async () => {

@@ -79,6 +79,8 @@ export interface GrokAgentLaunchOptions {
   spawnServe?: (argv: string[], opts: SpawnOptions) => ChildProcess;
   /** Test seam: how long to wait for `GET /health` before failing (default 30s). */
   serveReadyTimeoutMs?: number;
+  /** Test seam: `GET /health` poll interval while the preload runs (default 250 ms). */
+  preloadPollMs?: number;
   /** Test seam: serve URL already running — skip spawning `mlx serve`. */
   serveUrl?: string;
   /** Test seam: serve auth token to use with `serveUrl`. */
@@ -1711,11 +1713,63 @@ async function spawnInferenceServer(
   // retains the handle, so kill it before the launch path unwinds.
   try {
     const url = await waitForServe(child, opts.serveReadyTimeoutMs ?? 30_000);
+    if (opts.preloadModel !== undefined) {
+      console.error(`[mlx] loading ${opts.preloadModel} …`);
+      await waitForPreload(child, url.slice(0, -'/v1'.length), token, opts.preloadModel, opts.preloadPollMs ?? 250);
+    }
     return { child, url, token };
   } catch (err) {
     child.kill('SIGTERM');
     throw err;
   }
+}
+
+/**
+ * Grok reads `/v1/models` once at boot and caches it, so it must start after
+ * the preload settles or it caches the trained window instead of the served
+ * one. Resolves once `model` is resident or its load failed (serve already
+ * printed why); no timeout, since a cold load can take minutes.
+ */
+function waitForPreload(
+  child: ChildProcess,
+  base: string,
+  token: string,
+  model: string,
+  pollMs: number,
+): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    let done = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (err?: Error): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      child.removeListener('exit', onExit);
+      if (err) reject(err);
+      else resolvePromise();
+    };
+    const onExit = (code: number | null): void =>
+      finish(new Error(`mlx serve exited (${code}) while loading ${model}`));
+    child.once('exit', onExit);
+    const poll = (): void => {
+      fetch(`${base}/health`, { headers: { authorization: `Bearer ${token}` } })
+        .then((res) => (res.ok ? (res.json() as Promise<unknown>) : undefined))
+        .then((body) => {
+          const health = body as
+            | { models?: { resident?: unknown }; lastLoad?: { label?: unknown; ok?: unknown } | null }
+            | undefined;
+          const resident = health?.models?.resident;
+          const loaded = Array.isArray(resident) && resident.includes(model);
+          const failed = health?.lastLoad?.label === model && health.lastLoad.ok === false;
+          if (loaded || failed) finish();
+          else if (!done) timer = setTimeout(poll, pollMs);
+        })
+        .catch(() => {
+          if (!done) timer = setTimeout(poll, pollMs);
+        });
+    };
+    poll();
+  });
 }
 
 /**

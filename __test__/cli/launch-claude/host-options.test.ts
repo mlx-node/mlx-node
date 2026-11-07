@@ -87,6 +87,16 @@ describe('claudeChildEnv', () => {
     expect(JSON.stringify(claudeChildEnv({ ANTHROPIC_API_KEY: 'sk-ant-secret' }, opts))).not.toContain('sk-ant-secret');
   });
 
+  // Mutation: drop the two window vars → red.
+  it('hands Claude Code the served window when one is known', () => {
+    const env = claudeChildEnv({ CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1000000' }, { ...opts, contextTokens: 139257 });
+    expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('139257');
+    expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('139257');
+    const unknown = claudeChildEnv({}, opts);
+    expect('CLAUDE_CODE_MAX_CONTEXT_TOKENS' in unknown).toBe(false);
+    expect('CLAUDE_CODE_AUTO_COMPACT_WINDOW' in unknown).toBe(false);
+  });
+
   it('points the child at this host and passes everything else through', () => {
     const env = claudeChildEnv({ PATH: '/usr/bin', TERM: 'xterm' }, opts);
     expect(env.ANTHROPIC_BASE_URL).toBe(opts.baseUrl);

@@ -807,6 +807,8 @@ data: {"type":"ping","mlx_progress":{"phase":"prefill","elapsed_ms":20000,"prefi
 
 Launches the same inference host as `mlx serve` and spawns Claude Code against it — the entry point for using MLX-Node as a Claude Code backend. Use `mlx serve` when you want the server without a Claude Code child (for example to point another client at it, or to reproduce a wedged sidecar in a terminal).
 
+It loads the default model before Claude Code starts and, when the loaded model publishes a window, sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS` and `CLAUDE_CODE_AUTO_COMPACT_WINDOW` to it (as Splash's installer does), so Claude Code compacts before the server rejects a prompt. A failed load is printed and Claude Code starts without the two variables. A `/model` swap inside Claude Code keeps the first model's value.
+
 ## `mlx delegate`
 
 A focused local worker for bounded investigations. It runs on the same
@@ -856,7 +858,7 @@ mlx agent --models-dir ./models # use a specific local models directory
 
 Almost every flag belongs to the agent binary and is forwarded verbatim; `mlx agent` only handles the options below before handing off (`--models-dir`, `--trace`/`--trace-dir`, `--kv-format`, `--no-persist-cache`, and mlx-side help). `--kv-format int8|bf16` is passed to the spawned `mlx serve`.
 
-Because the backend is the local `mlx serve`, `mlx agent` always passes `--disable-web-search` (grok's `web_search` is an xAI server-side tool) and sets `GROK_IMAGE_GEN=0`, `GROK_IMAGE_EDIT=0` and `GROK_VIDEO_GEN=0` unless you exported them yourself. It also starts `mlx serve` with `--preload <model>` for the `-m` model, so the weights load while the agent starts up.
+Because the backend is the local `mlx serve`, `mlx agent` always passes `--disable-web-search` (grok's `web_search` is an xAI server-side tool) and sets `GROK_IMAGE_GEN=0`, `GROK_IMAGE_EDIT=0` and `GROK_VIDEO_GEN=0` unless you exported them yourself. It also starts `mlx serve` with `--preload <model>` for the `-m` model and starts the agent only once that model is resident (or its load failed), because grok reads the served window from `/v1/models` once at boot.
 
 For local Qwen3.8 models, `--thinking low`, `medium`, and `xhigh` select the
 checkpoint's reasoning effort. `minimal` aliases `low`; `high` and `max` alias

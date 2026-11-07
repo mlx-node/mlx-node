@@ -192,7 +192,7 @@ export function launchClaudeHostOptions(flags: LaunchClaudeFlags): InferenceHost
  */
 export function claudeChildEnv(
   parent: NodeJS.ProcessEnv,
-  opts: { baseUrl: string; model: string; authToken: string },
+  opts: { baseUrl: string; model: string; authToken: string; contextTokens?: number },
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...parent,
@@ -209,6 +209,12 @@ export function claudeChildEnv(
   // `delete`, not `= undefined`: `spawn` skipping undefined values is an
   // implementation detail of `child_process`, and this must not depend on it.
   delete env.ANTHROPIC_API_KEY;
+  // The served window, so Claude Code compacts before the server rejects
+  // (Splash `install/clients.py` sets the same two; an inherited value loses).
+  if (opts.contextTokens !== undefined) {
+    env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(opts.contextTokens);
+    env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = String(opts.contextTokens);
+  }
   return env;
 }
 
@@ -300,9 +306,21 @@ export async function run(argv: string[]): Promise<void> {
     console.log(`[mlx] tail -f "${join(host.logDir, 'session.log')}"`);
   }
 
+  // Load before Claude Code starts so its env carries the served window.
+  console.log(`[mlx] loading ${host.boundModel} …`);
+  await host.loadModel(host.boundModel).catch((err: unknown) => {
+    console.error(`[mlx] load of "${host.boundModel}" failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
+  const contextTokens = host.server.registry.servedContext(host.boundModel)?.windowTokens;
+
   const child = spawn(claudeBin, claudeArgs, {
     stdio: 'inherit',
-    env: claudeChildEnv(process.env, { baseUrl: host.url, model: host.boundModel, authToken }),
+    env: claudeChildEnv(process.env, {
+      baseUrl: host.url,
+      model: host.boundModel,
+      authToken,
+      ...(contextTokens !== undefined ? { contextTokens } : {}),
+    }),
   });
 
   let shuttingDown = false;
