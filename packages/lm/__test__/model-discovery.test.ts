@@ -116,6 +116,17 @@ describe('discoverLocalChatModels — GGUF variant folders', () => {
     expect(failures).toEqual([]);
   });
 
+  it('never lists dashboard staging jobs or publish backups, and keeps the installed ID', async () => {
+    const dir = modelsDir('variant-staging', {
+      '.staging/flash@0123456789abcdef0123456789abcdef01234567.42.uuid/Model-UD-Q4_K_XL.gguf': minimalGguf('qwen4exp'),
+      '.staging/flash.backup-42.uuid/Model-UD-Q4_K_XL.gguf': minimalGguf('qwen4exp'),
+      'flash/Model-UD-Q4_K_XL.gguf': minimalGguf('qwen4exp'),
+    });
+    expect((await discoverLocalChatModels(dir)).map(({ name, path }) => ({ name, path }))).toEqual([
+      { name: 'Model-UD-Q4_K_XL', path: join(dir, 'flash', 'Model-UD-Q4_K_XL.gguf') },
+    ]);
+  });
+
   it('follows a symlinked variant folder and ignores a dangling one', async () => {
     const external = modelsDir('variant-link-target', { 'Model.gguf': minimalGguf('qwen4exp') });
     const dir = modelsDir('variant-link', { 'repo/README.md': '#' });

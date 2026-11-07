@@ -374,7 +374,9 @@ export async function discoverLocalChatModels(
         // `mlx download` keeps repo paths, so a variant folder such as
         // `<repo>/UD-Q4_K_XL/*.gguf` sits one level down. A repo with such a
         // variant is never itself a model, even with a root config.json.
-        if (await appendVariantGguf(full, entry.name)) continue;
+        // Dot-folders are never repos: `.staging/` holds the dashboard's
+        // unpublished download jobs and publish backups.
+        if (!entry.name.startsWith('.') && (await appendVariantGguf(full, entry.name))) continue;
         if (inventory.hasGguf) continue;
       }
       const modelType = await detectModelType(full);
