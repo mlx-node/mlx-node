@@ -1727,8 +1727,10 @@ async function spawnInferenceServer(
 /**
  * Grok reads `/v1/models` once at boot and caches it, so it must start after
  * the preload settles or it caches the trained window instead of the served
- * one. Resolves once `model` is resident or its load failed (serve already
- * printed why); no timeout, since a cold load can take minutes.
+ * one. Resolves once `model` is resident, its load failed, or no load ran or
+ * waits (serve rejected the preload before its load bracket, e.g. a model the
+ * serve scan no longer finds); serve already printed why. No timeout, since a
+ * cold load can take minutes.
  */
 function waitForPreload(
   child: ChildProcess,
@@ -1756,12 +1758,20 @@ function waitForPreload(
         .then((res) => (res.ok ? (res.json() as Promise<unknown>) : undefined))
         .then((body) => {
           const health = body as
-            | { models?: { resident?: unknown }; lastLoad?: { label?: unknown; ok?: unknown } | null }
+            | {
+                models?: { resident?: unknown };
+                work?: { writerActive?: unknown; waitingWriters?: unknown };
+                lastLoad?: { label?: unknown; ok?: unknown } | null;
+              }
             | undefined;
           const resident = health?.models?.resident;
           const loaded = Array.isArray(resident) && resident.includes(model);
           const failed = health?.lastLoad?.label === model && health.lastLoad.ok === false;
-          if (loaded || failed) finish();
+          // Serve enters the load bracket in the tick that prints its banner,
+          // so after it nothing loading and nothing loaded means it never will.
+          const neverStarted =
+            health?.lastLoad === null && health.work?.writerActive === false && health.work.waitingWriters === 0;
+          if (loaded || failed || neverStarted) finish();
           else if (!done) timer = setTimeout(poll, pollMs);
         })
         .catch(() => {

@@ -1977,12 +1977,18 @@ describe('launchGrokAgent server gating', () => {
 
   // Mutation: skip the preload wait → red (grok spawned after 0 polls).
   // Mutation: keep waiting after a failed load → red (times out).
+  // Mutation: drop the never-started rule → red (times out).
   it('starts grok after the preload is resident', async () => {
     let polls = 0;
     healthBody = (authorized) => {
       if (!authorized) return { status: 'ok' };
       polls += 1;
-      return { status: 'loading', models: { resident: polls > 3 ? ['qwen-local'] : [] }, lastLoad: null };
+      return {
+        status: 'loading',
+        models: { resident: polls > 3 ? ['qwen-local'] : [] },
+        work: { writerActive: polls <= 3, waitingWriters: 0 },
+        lastLoad: null,
+      };
     };
     const spawnedAt: number[] = [];
     const agentAfterPolls = (bin: string, argv: string[], so: SpawnOptions): ChildProcess => {
@@ -1999,6 +2005,14 @@ describe('launchGrokAgent server gating', () => {
         : { status: 'ok' };
     await expect(launchGrokAgent({ ...launch, spawnAgent: agentAfterPolls })).resolves.toBe(0);
     expect(spawnedAt).toHaveLength(2);
+
+    // Serve rejected the preload before its load bracket: nothing will load.
+    healthBody = (authorized) =>
+      authorized
+        ? { status: 'ok', models: { resident: [] }, work: { writerActive: false, waitingWriters: 0 }, lastLoad: null }
+        : { status: 'ok' };
+    await expect(launchGrokAgent({ ...launch, spawnAgent: agentAfterPolls })).resolves.toBe(0);
+    expect(spawnedAt).toHaveLength(3);
   });
 
   it('fails without starting grok when serve exits during the preload', async () => {
