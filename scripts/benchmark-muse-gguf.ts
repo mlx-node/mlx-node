@@ -111,7 +111,7 @@ async function draftPath() {
   }
   const { ggufArchitecture } = await core();
   const paths = (await readdir(parent))
-    .filter((n) => /^dflash-.*\.gguf$/i.test(n))
+    .filter((n) => n.toLowerCase().startsWith('dflash-') && n.toLowerCase().endsWith('.gguf'))
     .map((n) => join(parent, n))
     .filter((p) => ggufArchitecture(p) === 'dflash');
   assert.equal(paths.length, 1, 'An unambiguous DFlash companion is required');

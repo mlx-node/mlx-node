@@ -13,7 +13,10 @@ import {
   type LaunchPreset,
   type ModelType,
 } from './family-data.js';
+import { isBonsaiPq2GgufName, isGgufCompanionName, isQwen35XlGgufName, parseGgufFileName } from './gguf-name.js';
 import { detectModelType, readGgufArchitecture, readModelConfig } from './model-detection.js';
+
+export { isGgufCompanionName, parseGgufFileName, type GgufFileName } from './gguf-name.js';
 
 /** Native-free inventory shared by the agent, setup UI, and inference host. */
 export interface LocalChatModel {
@@ -32,90 +35,9 @@ interface DiscoveryMetadata {
   draftOnly: boolean;
 }
 
-/**
- * The Qwen3.5/Qwen3.8 discovery filter admits the Unsloth Dynamic target names
- * users download: `Q*_K_XL` / `Q*_K_M` (`UD-Q2_K_XL` included) and the `UD-IQ*`
- * mixes `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ2_M`, `IQ3_XXS`,
- * `IQ3_S`, `IQ3_M`, `IQ4_XS`, `IQ4_NL`. Every ggml tensor type those mixes
- * draw on is importable (Q2_K..Q6_K, IQ4_NL, IQ4_XS, IQ3_S, the IQ1 / IQ2 /
- * IQ3_XXS grid formats, Q8_0, F32); only the per-tensor selection differs.
- * Other variants (`Q4_0`, `Q*_K_S`) and companion artifacts such as
- * imatrix/mmproj/draft stay excluded. Gemma4 and Muse accept all supported
- * tensor formats, including Q4_0 QAT checkpoints.
- */
-const QWEN35_XL_GGUF = /(?:^|[-_.])(?:Q\d+_K_(?:XL|M)|IQ(?:1_[SM]|2_(?:XXS|XS|S|M)|3_(?:XXS|S|M)|4_(?:XS|NL)))\.gguf$/i;
-const BONSAI_PQ2_GGUF = /^ternary-bonsai-2-27b-pq2_0\.gguf$/i;
-// `mtp` joins the rule because the catalog ships MTP weights BESIDE a target
-// (Qwen3.8's `MTP/mtp-*.gguf`, Gemma's `mtp-*.gguf`) and nothing in the runtime
-// pairs a standalone GGUF MTP file: counting one as weights certifies a
-// directory the loader cannot open, and discovery would enumerate the sidecar
-// as a model.
-const GGUF_COMPANION_NAME = /(?:^|[-_.])(?:imatrix|mmproj|dflash|draft|mtp)(?:[-_.]|$)/i;
-
-/**
- * True when a `.gguf` filename is a companion artifact (projector, calibration,
- * draft, MTP) rather than a loadable model payload. Discovery, the dashboard's
- * publish gate, and the CLI's weight classification all key off this one rule —
- * a file any of them certifies as weights is a file the others must accept.
- */
-export function isGgufCompanionName(fileName: string): boolean {
-  return GGUF_COMPANION_NAME.test(fileName);
-}
-
-export interface GgufFileName {
-  /** Path without the `.gguf` and `-NNNNN-of-NNNNN` suffixes. */
-  readonly stem: string;
-  /** 1-based shard number; 1 for a single file. */
-  readonly ordinal: number;
-  /** Shard count; 1 for a single file. */
-  readonly shards: number;
-}
-
-const GGUF_EXTENSION = '.gguf';
-const SPLIT_OF = '-of-';
-const SPLIT_DIGITS = 5;
-
-/** The fixed-width decimal at `text[start, start + SPLIT_DIGITS)`, or undefined. */
-function splitNumber(text: string, start: number): number | undefined {
-  if (start < 0) return undefined;
-  let value = 0;
-  for (let index = start; index < start + SPLIT_DIGITS; index++) {
-    const digit = text.charCodeAt(index) - 48;
-    if (!(digit >= 0 && digit <= 9)) return undefined;
-    value = value * 10 + digit;
-  }
-  return value;
-}
-
-/**
- * Parse `<stem>.gguf` or llama.cpp's split name `<stem>-NNNNN-of-NNNNN.gguf`
- * (the shape `resolve_gguf_shards` rebuilds; the stem may be empty, as there).
- * Undefined for a non-GGUF path.
- */
-export function parseGgufFileName(path: string): GgufFileName | undefined {
-  if (path.length <= GGUF_EXTENSION.length || path.slice(-GGUF_EXTENSION.length).toLowerCase() !== GGUF_EXTENSION)
-    return undefined;
-  const base = path.slice(0, -GGUF_EXTENSION.length);
-  const single: GgufFileName = { stem: base, ordinal: 1, shards: 1 };
-  // Read right to left: `-` ordinal `-of-` count.
-  const countStart = base.length - SPLIT_DIGITS;
-  const ofStart = countStart - SPLIT_OF.length;
-  const ordinalStart = ofStart - SPLIT_DIGITS;
-  const dash = ordinalStart - 1;
-  if (dash < 0 || base[dash] !== '-' || base.slice(ofStart, countStart).toLowerCase() !== SPLIT_OF) return single;
-  const ordinal = splitNumber(base, ordinalStart);
-  const shards = splitNumber(base, countStart);
-  if (ordinal === undefined || shards === undefined) return single;
-  return { stem: base.slice(0, dash), ordinal, shards };
-}
-
 // Match the native loaders' primary files/shards. A draft or projector
 // SafeTensors file beside a GGUF is not a converted target checkpoint.
 const PRIMARY_SAFETENSORS = /^(?:model|weights)\.safetensors$|^model(?:-|\.safetensors-).+-of-.+\.safetensors$/;
-
-function isQwen35XlGguf(name: string): boolean {
-  return QWEN35_XL_GGUF.test(name) && !GGUF_COMPANION_NAME.test(name);
-}
 
 function ggufModelName(name: string): string {
   return name.slice(0, -'.gguf'.length);
@@ -123,14 +45,14 @@ function ggufModelName(name: string): string {
 
 function supportedGgufName(name: string, modelType: ModelType): boolean {
   const policy = familyDataFor(modelType)?.ggufDiscovery;
-  if (!policy || GGUF_COMPANION_NAME.test(name)) return false;
+  if (!policy || isGgufCompanionName(name)) return false;
   const split = parseGgufFileName(name);
   if (split !== undefined && (split.ordinal !== 1 || split.shards !== 1)) {
     const { ordinal, shards } = split;
     if (ordinal !== 1 || shards < 1 || shards > 1024 || (shards > 1 && !policy.split)) return false;
   }
-  if (modelType === 'qwen3_5' && BONSAI_PQ2_GGUF.test(name)) return true;
-  return policy.variants === 'all' || isQwen35XlGguf(name);
+  if (modelType === 'qwen3_5' && isBonsaiPq2GgufName(name)) return true;
+  return policy.variants === 'all' || isQwen35XlGgufName(name);
 }
 
 async function hasGgufAssets(modelDir: string, onIoFailure?: (error: unknown) => void): Promise<boolean> {
@@ -181,7 +103,7 @@ async function modelFileInventory(modelDir: string): Promise<ModelFileInventory>
   const kinds = await Promise.all(entries.map((entry) => resolveDirentKind(modelDir, entry)));
   const files = entries.filter((_, index) => kinds[index] === 'file').map((entry) => entry.name);
   return {
-    targetGgufs: files.filter((name) => name.toLowerCase().endsWith('.gguf') && !GGUF_COMPANION_NAME.test(name)).sort(),
+    targetGgufs: files.filter((name) => name.toLowerCase().endsWith('.gguf') && !isGgufCompanionName(name)).sort(),
     hasGguf: files.some((name) => name.toLowerCase().endsWith('.gguf')),
     hasPrimarySafetensors: files.some((name) => PRIMARY_SAFETENSORS.test(name)),
   };
@@ -402,7 +324,7 @@ export async function discoverLocalChatModels(
     // Dirent kind reflects the link itself, never the target — resolve so a
     // symlinked `.gguf` or model directory classifies by what it points at.
     const kind = await resolveDirentKind(modelsDir, entry);
-    if (kind === 'file' && entry.name.toLowerCase().endsWith('.gguf') && !GGUF_COMPANION_NAME.test(entry.name)) {
+    if (kind === 'file' && entry.name.toLowerCase().endsWith('.gguf') && !isGgufCompanionName(entry.name)) {
       await appendGguf(entry.name, modelsDir, basename(modelsDir));
       continue;
     }
