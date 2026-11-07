@@ -791,6 +791,43 @@ fn uncharged_draft_state_bytes<B: HybridSchedulerBackend>(
         .saturating_sub(turn.recurrent_state_bytes)
 }
 
+/// Off-pool state a running turn holds this step at `tokens`, plus its
+/// booked blocks the pool has not handed out yet. An on-demand speculative
+/// turn is priced at what it holds once decoding (its prefill hidden rows
+/// are freed) and never below its charge while prefilling; any other turn
+/// at its charge.
+fn step_state_bytes<B: HybridSchedulerBackend>(
+    inner: &B,
+    turn: &TurnState<ScheduledTurn<B::PrefixState>>,
+    tokens: u32,
+    bytes_per_block: u64,
+) -> u64 {
+    let state = if !turn.recurrent_state_reservation_active {
+        0
+    } else if inner.scheduler_books_on_demand() && turn.payload.scheduled_speculation.is_some() {
+        let held = inner
+            .recurrent_state_bytes()
+            .saturating_add(inner.scheduled_draft_state_held_bytes(tokens));
+        if turn.num_computed_tokens >= turn.prompt_tokens {
+            held
+        } else {
+            held.max(turn.recurrent_state_bytes)
+        }
+    } else {
+        turn.recurrent_state_bytes
+    };
+    let booked = if turn.block_reservation_active
+        && turn.block_reservation_total != 0
+        && turn.block_size != 0
+    {
+        turn.block_reservation_total
+            .saturating_sub(inner.scheduler_materialized_blocks(turn.seq_id))
+    } else {
+        0
+    };
+    state.saturating_add(u64::from(booked).saturating_mul(bytes_per_block))
+}
+
 /// Largest turn length a lone speculative turn can reach in
 /// `usable_pool_tokens` when its draft state, held outside the pool, grows
 /// with every row: its blocks plus `held(T)` fit the usable pool's bytes.
@@ -5425,17 +5462,49 @@ pub(crate) mod tests {
         );
     }
 
-    /// Qwen3.5 scheduler with one MTP layer, a 4-block pool of 8,192 B
-    /// blocks, and the admission charge of a turn booked at 56 rows
-    /// (435,968 B). The pool grow is declined unless `set_mtp_step_probe`.
+    /// Qwen3.5 scheduler with one MTP layer, a pool of `initial` (up to
+    /// `max`) 8,192 B blocks, and the admission charge of a turn booked at
+    /// 56 rows (435,968 B). The pool grow is declined unless
+    /// `set_mtp_step_probe`.
     #[cfg(target_os = "macos")]
-    fn mtp_step_state() -> Option<(HybridSchedulerState<Qwen35Inner>, u64)> {
-        let (mut state, snapshot) = growable_qwen35_state()?;
+    fn mtp_step_state_with(
+        initial: u32,
+        max: u32,
+    ) -> Option<(HybridSchedulerState<Qwen35Inner>, u64)> {
+        let (mut state, _) = growable_qwen35_state()?;
         state.inner.config.n_mtp_layers = 1;
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            num_kv_heads: 1,
+            head_size: 128,
+            num_layers: 1,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(8_192),
+            max_batch_size: Some(32),
+        };
+        let pool = mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            initial,
+            max,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        )
+        .expect("MTP step LayerKVPool");
+        let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+            initial, max, 16,
+        )));
+        state.inner.paged_adapter = Some(
+            PagedKVCacheAdapter::new(allocator, Arc::new(pool), 16).expect("MTP step adapter"),
+        );
         let admission =
             state.inner.recurrent_state_bytes() + state.inner.scheduled_draft_state_bytes(56);
         assert_eq!(admission, 435_968);
-        assert_eq!(snapshot.blocks.total_blocks, 4);
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("scheduler snapshot")
+            .expect("paged adapter present");
+        assert_eq!(snapshot.blocks.total_blocks, initial);
         assert_eq!(snapshot.bytes_per_block, 8_192);
         set_mtp_step_probe(&mut state, false);
         Some((state, admission))
@@ -5455,24 +5524,27 @@ pub(crate) mod tests {
             .set_grow_headroom_probe_override(Some(probe));
     }
 
-    /// A running MTP turn at `num_tokens` charged `admission`; its prompt
-    /// blocks go back to the pool so every case reads 4 blocks of room.
+    /// A running turn over a `prompt`-token prompt at `num_tokens`, charged
+    /// `charge`; its prompt blocks go back to the pool so every case reads
+    /// the whole pool as room.
     #[cfg(target_os = "macos")]
-    fn mtp_step_turn(
+    fn mtp_step_turn_with(
         state: &mut HybridSchedulerState<Qwen35Inner>,
         seq: u32,
+        prompt: u32,
+        speculative: bool,
         num_tokens: u32,
-        admission: u64,
+        charge: u64,
     ) -> TurnState<ScheduledTurn<<Qwen35Inner as PagedBackend>::PrefixState>> {
         let mut turn = speculative::tests::request(
             &mut state.inner,
             seq,
-            (0..40).map(|token| token % 16).collect(),
-            true,
+            (0..prompt).map(|token| token % 16).collect(),
+            speculative,
             Arc::new(AtomicBool::new(false)),
         )
         .with_block_reservation(0, 0, 16)
-        .with_recurrent_state_reservation(admission);
+        .with_recurrent_state_reservation(charge);
         turn.num_tokens = num_tokens;
         state
             .inner
@@ -5483,91 +5555,94 @@ pub(crate) mod tests {
             .scheduler_cache_snapshot()
             .expect("scheduler snapshot")
             .expect("paged adapter present");
-        assert_eq!(snapshot.blocks.total_blocks, 4);
         assert_eq!(
             snapshot.blocks.free_blocks + snapshot.blocks.reclaimable_blocks,
-            4
+            snapshot.blocks.total_blocks
         );
         turn
     }
 
-    /// A running MTP turn admitted at its 56 booked rows grows draft K/V
-    /// outside the pool every step; each step admits that growth against
-    /// the pool's free bytes (4 blocks, 32,768 B): 14,336 B at 200 tokens
-    /// fits, 65,536 B at 400 does not.
-    /// Mutation: `draft_growth_fits` returns `Ok(true)` → red (400 tokens).
+    /// A decoding MTP turn over a 40-token prompt at `num_tokens`.
+    #[cfg(target_os = "macos")]
+    fn mtp_step_turn(
+        state: &mut HybridSchedulerState<Qwen35Inner>,
+        seq: u32,
+        num_tokens: u32,
+        admission: u64,
+    ) -> TurnState<ScheduledTurn<<Qwen35Inner as PagedBackend>::PrefixState>> {
+        let mut turn = mtp_step_turn_with(state, seq, 40, true, num_tokens, admission);
+        turn.num_computed_tokens = num_tokens - 1;
+        turn
+    }
+
+    /// Each step prices every running MTP turn at the state it holds, its
+    /// charge included, against the 64-block pool (524,288 B): alone at
+    /// 254 rows 463,104 B fits, at 504 rows 527,104 B does not, and two
+    /// turns at 250 (925,952 B) do not, though their state past the
+    /// charges is only 54,016 B.
+    /// Mutations: `draft_growth_fits` returns `Ok(true)` → red (504 rows);
+    /// price turns past their charge (`uncharged_draft_state_bytes`) → red
+    /// (pair); drop the peers → red (pair).
     #[cfg(target_os = "macos")]
     #[test]
-    fn running_mtp_step_admits_its_draft_growth() {
-        let Some((mut state, admission)) = mtp_step_state() else {
+    fn running_mtp_step_prices_every_turns_held_state() {
+        let Some((mut state, admission)) = mtp_step_state_with(64, 64) else {
             return;
         };
-        let short = vec![mtp_step_turn(&mut state, 1, 200, admission)];
+        let short = vec![mtp_step_turn(&mut state, 1, 250, admission)];
         assert_eq!(
-            uncharged_draft_state_bytes(&state.inner, &short[0], 204),
-            14_336
+            step_state_bytes(&state.inner, &short[0], 254, 8_192),
+            463_104
         );
         assert!(
             HybridStepExecutor::new(&mut state.inner)
                 .draft_growth_fits(&short, 0, 4)
                 .expect("short step")
         );
-        let lone = vec![mtp_step_turn(&mut state, 2, 400, admission)];
+        let lone = vec![mtp_step_turn(&mut state, 2, 500, admission)];
         assert_eq!(
-            uncharged_draft_state_bytes(&state.inner, &lone[0], 404),
-            65_536
+            step_state_bytes(&state.inner, &lone[0], 504, 8_192),
+            527_104
         );
         assert!(
             !HybridStepExecutor::new(&mut state.inner)
                 .draft_growth_fits(&lone, 0, 4)
                 .expect("lone step")
         );
-    }
-
-    /// Two MTP turns at 250 tokens: this step's 27,136 B fits the pool's
-    /// 32,768 B alone, not beside the peer's 26,880 B.
-    /// Mutation: drop the peers' sum in `draft_growth_fits` → red.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn running_mtp_step_admits_its_peers_draft_growth() {
-        let Some((mut state, admission)) = mtp_step_state() else {
-            return;
-        };
+        state.inner.release_scheduled_recurrent_for(1);
+        state.inner.release_scheduled_recurrent_for(2);
         let pair = vec![
             mtp_step_turn(&mut state, 3, 250, admission),
             mtp_step_turn(&mut state, 4, 250, admission),
         ];
         assert_eq!(pair[1].decode_draft_allowance, 3);
         assert_eq!(
-            uncharged_draft_state_bytes(&state.inner, &pair[0], 254),
-            27_136
+            step_state_bytes(&state.inner, &pair[1], 253, 8_192),
+            462_848
         );
         assert_eq!(
-            uncharged_draft_state_bytes(&state.inner, &pair[1], 253),
-            26_880
+            uncharged_draft_state_bytes(&state.inner, &pair[0], 254)
+                + uncharged_draft_state_bytes(&state.inner, &pair[1], 253),
+            54_016
         );
         assert!(
             !HybridStepExecutor::new(&mut state.inner)
                 .draft_growth_fits(&pair, 0, 4)
-                .expect("peer step")
-        );
-        assert!(
-            HybridStepExecutor::new(&mut state.inner)
-                .draft_growth_fits(&pair[..1], 0, 4)
-                .expect("step without the peer")
+                .expect("pair step")
         );
     }
 
-    /// A lone MTP turn at 400 tokens is 4 blocks short; with headroom the
-    /// step grows the pool to 8 blocks and admits its draft growth.
+    /// A lone MTP turn at 254 rows holds 463,104 B against a 16-block pool
+    /// (131,072 B); with headroom the step grows its 41-block shortfall to
+    /// 57 blocks (466,944 B) and fits.
     /// Mutation: drop the pool grow in `draft_growth_fits` → red.
     #[cfg(target_os = "macos")]
     #[test]
-    fn running_mtp_step_grows_the_pool_for_its_draft_growth() {
-        let Some((mut state, admission)) = mtp_step_state() else {
+    fn running_mtp_step_grows_the_pool_for_its_held_state() {
+        let Some((mut state, admission)) = mtp_step_state_with(16, 64) else {
             return;
         };
-        let lone = vec![mtp_step_turn(&mut state, 2, 400, admission)];
+        let lone = vec![mtp_step_turn(&mut state, 1, 250, admission)];
         set_mtp_step_probe(&mut state, true);
         assert!(
             HybridStepExecutor::new(&mut state.inner)
@@ -5579,7 +5654,86 @@ pub(crate) mod tests {
             .scheduler_cache_snapshot()
             .expect("scheduler snapshot")
             .expect("paged adapter present");
-        assert_eq!(grown.blocks.total_blocks, 8);
+        assert_eq!(grown.blocks.total_blocks, 57);
+    }
+
+    /// A lone MTP turn admitted over a 128-token prompt (9 booked blocks)
+    /// passes its step at the last row of its window (159 rows, 10 blocks:
+    /// 438,784 B of state in 442,368 B free), priced at what it holds, not
+    /// at its admission charge's prefill hidden rows; at 176 rows (11
+    /// blocks) it is past the window and blocks.
+    /// Mutation: price the own turn at `max(charge, held)` → red (503,552 B).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lone_mtp_turn_passes_every_step_in_its_window() {
+        let Some((mut state, _)) = mtp_step_state_with(64, 64) else {
+            return;
+        };
+        assert_eq!(state.scheduled_turn_window(16, true), 159);
+        let charge =
+            state.inner.recurrent_state_bytes() + state.inner.scheduled_draft_state_bytes(144);
+        let mut turn = mtp_step_turn_with(&mut state, 1, 128, true, 155, charge)
+            .with_block_reservation(9, 9, 16);
+        turn.num_computed_tokens = 154;
+        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
+        adapter.reserve_rows_for(1, 159).expect("window KV");
+        assert_eq!(adapter.block_table_for(1).expect("table").num_blocks(), 10);
+        let lone = vec![turn];
+        assert_eq!(
+            step_state_bytes(&state.inner, &lone[0], 159, 8_192),
+            438_784
+        );
+        assert!(
+            HybridStepExecutor::new(&mut state.inner)
+                .draft_growth_fits(&lone, 0, 4)
+                .expect("last window step")
+        );
+        let mut past = lone;
+        past[0].num_tokens = 172;
+        past[0].num_computed_tokens = 171;
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .reserve_rows_for(1, 176)
+            .expect("past-window KV");
+        assert!(
+            !HybridStepExecutor::new(&mut state.inner)
+                .draft_growth_fits(&past, 0, 4)
+                .expect("past-window step")
+        );
+    }
+
+    /// A peer's booked blocks the pool has not handed out yet count: an AR
+    /// peer still prefilling with 8 unbooked blocks (65,536 B) and its
+    /// recurrent charge (29,184 B) beside a lone MTP turn at 254 rows
+    /// (463,104 B) is 557,824 B, over the 64-block pool's 524,288 B.
+    /// Mutation: drop the bookings from `step_state_bytes` → red (492,288 B).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn running_mtp_step_counts_unmaterialized_bookings() {
+        let Some((mut state, admission)) = mtp_step_state_with(64, 64) else {
+            return;
+        };
+        let recurrent = state.inner.recurrent_state_bytes();
+        let mtp = mtp_step_turn(&mut state, 1, 250, admission);
+        let ar = mtp_step_turn_with(&mut state, 2, 40, false, 40, recurrent)
+            .with_block_reservation(8, 0, 16);
+        let pair = vec![mtp, ar];
+        assert_eq!(
+            step_state_bytes(&state.inner, &pair[1], 40, 8_192),
+            recurrent + 65_536
+        );
+        assert!(
+            !HybridStepExecutor::new(&mut state.inner)
+                .draft_growth_fits(&pair, 0, 4)
+                .expect("step beside a booked peer")
+        );
+        assert!(
+            HybridStepExecutor::new(&mut state.inner)
+                .draft_growth_fits(&pair[..1], 0, 4)
+                .expect("step alone")
+        );
     }
 
     /// 256 usable tokens in 16-token blocks of 8,192 B hold 131,072 B; with

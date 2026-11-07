@@ -60,25 +60,23 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         )
     }
 
-    /// Whether the draft state every running turn holds past its charge,
-    /// this turn's at its step's `queries` rows, fits the pool's free and
-    /// reclaimable bytes left after the step's target rows, growing the pool
-    /// once for the shortfall first.
+    /// Whether every running turn's off-pool state at this step (this
+    /// turn's at its `queries` rows) and the bookings not yet in the pool
+    /// fit the pool's free and reclaimable bytes left after the step's
+    /// target rows, growing the pool once for the shortfall first. State
+    /// lives outside the pool, so target growth never takes it out of the
+    /// free bytes; every charge is counted here instead.
     pub(super) fn draft_growth_fits(
         &mut self,
         running: &[TurnState<ScheduledTurn<B::PrefixState>>],
         turn_index: usize,
         queries: u32,
     ) -> Result<bool> {
-        let need = running.iter().enumerate().fold(0u64, |sum, (index, turn)| {
-            let tokens = if index == turn_index {
-                turn.num_tokens.saturating_add(queries)
-            } else {
-                turn.num_tokens.saturating_add(turn.decode_draft_allowance)
-            };
-            sum.saturating_add(uncharged_draft_state_bytes(&*self.inner, turn, tokens))
-        });
-        if need == 0 {
+        let own = &running[turn_index];
+        if !self.inner.scheduler_books_on_demand()
+            || !own.recurrent_state_reservation_active
+            || own.payload.scheduled_speculation.is_none()
+        {
             return Ok(true);
         }
         let available = |snapshot: &SchedulerCacheSnapshot| {
@@ -89,6 +87,19 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         let Some(snapshot) = self.inner.scheduler_cache_snapshot()? else {
             return Ok(true);
         };
+        let need = running.iter().enumerate().fold(0u64, |sum, (index, turn)| {
+            let tokens = if index == turn_index {
+                turn.num_tokens.saturating_add(queries)
+            } else {
+                turn.num_tokens.saturating_add(turn.decode_draft_allowance)
+            };
+            sum.saturating_add(step_state_bytes(
+                &*self.inner,
+                turn,
+                tokens,
+                snapshot.bytes_per_block,
+            ))
+        });
         let free = available(&snapshot);
         if need <= free {
             return Ok(true);
