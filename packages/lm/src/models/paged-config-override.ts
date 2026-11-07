@@ -92,9 +92,10 @@ export class PagedConfigOverrideManager {
    * deliberately not repeated here: `MlxModelHost` calls this for every
    * allowlisted family, and a second copy of the list would drift.
    *
-   * `dflash2Draft` marks a load that attaches a DFlash2 draft. Without
-   * `MLX_PAGED_CACHE_INITIAL_MB` the qwen3_5 clone then writes no initial
-   * size, so the native loader starts the pool at its DFlash2 runway.
+   * `dflash2Draft` marks a load that attaches a DFlash2 draft. The qwen3_5
+   * clone then writes no initial size, even with `MLX_PAGED_CACHE_INITIAL_MB`
+   * set: the native loader starts that pool at its DFlash2 runway and ignores
+   * any initial size.
    */
   async resolve(
     modelPath: string,
@@ -443,8 +444,11 @@ function resolveQwen35CacheFloorMb(): number {
 }
 
 function resolveQwen35InitialMb(dflash2Draft: boolean): number | undefined {
+  // A DFlash2 load always starts at the native runway (Splash has no initial
+  // size knob), so the env is not read for it.
+  if (dflash2Draft) return undefined;
   const raw = process.env.MLX_PAGED_CACHE_INITIAL_MB;
   const parsed = raw == null || raw === '' ? Number.NaN : Number.parseInt(raw, 10);
   if (Number.isFinite(parsed) && parsed > 0) return parsed;
-  return dflash2Draft ? undefined : DEFAULT_QWEN35_PAGED_CACHE_INITIAL_MB;
+  return DEFAULT_QWEN35_PAGED_CACHE_INITIAL_MB;
 }

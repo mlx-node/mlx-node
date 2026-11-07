@@ -389,7 +389,9 @@ describe('PagedConfigOverrideManager initial pool sizing', () => {
     expect(config.paged_cache_memory_mb).toBe(16_384);
   });
 
-  it('MLX_PAGED_CACHE_INITIAL_MB still wins for a DFlash2-backed load', async () => {
+  // Mutation: read MLX_PAGED_CACHE_INITIAL_MB before the draft check in
+  // resolveQwen35InitialMb → red (512 written).
+  it('ignores MLX_PAGED_CACHE_INITIAL_MB for a DFlash2-backed load', async () => {
     const source = await makeModelDir({ model_type: 'qwen3_5_moe' });
     const manager = new PagedConfigOverrideManager();
     cleanups.push(() => manager.cleanup());
@@ -398,21 +400,12 @@ describe('PagedConfigOverrideManager initial pool sizing', () => {
     process.env.MLX_PAGED_CACHE_INITIAL_MB = '512';
     try {
       const config = await readOverrideConfig(await manager.resolve(source, 'qwen3_5_moe', undefined, true));
-      expect(config.paged_cache_initial_memory_mb).toBe(512);
+      expect('paged_cache_initial_memory_mb' in config).toBe(false);
+      expect(config.paged_cache_memory_mb).toBe(16_384);
     } finally {
       if (previous === undefined) delete process.env.MLX_PAGED_CACHE_INITIAL_MB;
       else process.env.MLX_PAGED_CACHE_INITIAL_MB = previous;
     }
-  });
-
-  it('keeps a source initial for a DFlash2-backed load', async () => {
-    const source = await makeModelDir({ model_type: 'qwen3_5', paged_cache_initial_memory_mb: 300 });
-    const manager = new PagedConfigOverrideManager();
-    cleanups.push(() => manager.cleanup());
-
-    const resolved = await manager.resolve(source, 'qwen3_5', undefined, true);
-    expect(resolved).not.toBe(source);
-    expect((await readOverrideConfig(resolved)).paged_cache_initial_memory_mb).toBe(300);
   });
 
   it('does not reuse the no-draft clone for a draft load', async () => {

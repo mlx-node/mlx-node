@@ -384,6 +384,54 @@ fn freeze_dflash2_window_publishes_pool_terms() {
     assert!(limits.speculative_window_tokens.is_some());
 }
 
+/// Gate: a DFlash2 load ignores a configured initial size: it starts at the
+/// same runway, with the same max and the same frozen pool term, as a load
+/// with no initial size.
+/// Mutation: resolve the initial size for a draft load
+/// (`runway = initial_mb.is_none() && has_dflash2_draft` in
+/// `qwen35_initial_pool_request`) → red (8192 initial blocks ≠ 142).
+#[test]
+fn dflash2_load_starts_at_the_runway_whatever_the_initial_size() {
+    let load = |initial_mb: Option<u32>| {
+        let mut cfg = tiny_paged_forward_cfg();
+        cfg.paged_cache_initial_memory_mb = initial_mb;
+        let mut inner = Qwen35Inner::new(cfg).expect("construct tiny model");
+        inner.dflash2 = Some(
+            crate::models::qwen3_5::dflash2::tiny_dflash2_model_for_stepper_test(&inner.config)
+                .expect("tiny DFlash2 companion"),
+        );
+        if let Err(err) = inner.initialize_paged_adapter() {
+            if crate::test_support::metal_device_absent(&err.reason) {
+                eprintln!(
+                    "skipping dflash2_load_starts_at_the_runway_whatever_the_initial_size: {}",
+                    err.reason
+                );
+                return None;
+            }
+            panic!("paged adapter init failed: {}", err.reason);
+        }
+        inner
+            .finish_load_limits()
+            .expect("load limits with a draft");
+        let adapter = inner
+            .paged_adapter
+            .as_ref()
+            .expect("a runway pool is installed");
+        Some((
+            adapter.block_capacity(),
+            adapter.layer_kv_pool().max_num_blocks(),
+            inner.paged_pool_budget_blocks,
+            inner.dflash2_window.as_ref().and_then(|terms| terms.pool),
+        ))
+    };
+    let Some(unset) = load(None) else {
+        return;
+    };
+    assert!(unset.0 < unset.1, "a draft load starts below its max");
+    assert!(unset.3.is_some());
+    assert_eq!(load(Some(64)), Some(unset));
+}
+
 #[test]
 fn paged_context_limits_and_preflight_use_scheduler_usable_window() {
     let Some(inner) = dense_inner_with_test_adapter_or_skip(

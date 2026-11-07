@@ -23,7 +23,9 @@ attention to separate paged groups and aliases KV-shared layers to their anchor.
 The `qwen3_5` and `qwen3_5_moe` loaders size the paged pool in two steps. The
 **initial** pool is allocated at load from `paged_cache_initial_memory_mb`
 (config.json) or `MLX_PAGED_CACHE_INITIAL_MB` (env wins over the config field;
-a set-but-unparseable env value falls back to config). The **max** is the
+a set-but-unparseable env value falls back to config). A load with a DFlash2
+draft ignores both and starts at the 2048-token runway, as Splash builds its
+pool at `warmupKvPages` with no size knob. The **max** is the
 existing budget — `paged_cache_memory_mb`, or the auto one-full-context default
 when unset — minus whatever `load_time_pool_sizing` clamps for live unified
 memory.
@@ -39,20 +41,20 @@ sides distinctly — `initial_blocks=` plus `effective_window_tokens=` computed
 from the max — and a dynamic pool adds a
 `paged pool is dynamic (grow-on-demand)` line.
 
-| Knob                            | Source                              | Role                                                                                                       |
-| ------------------------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `paged_cache_initial_memory_mb` | config.json (qwen3_5 / qwen3_5_moe) | Initial pool size in MiB. Unset = the max itself, or the 2048-token runway when a DFlash2 draft is loaded. |
-| `MLX_PAGED_CACHE_INITIAL_MB`    | env (wins over the config field)    | Same, u32 MiB. Unparseable values are ignored (config field, then the unset default).                      |
-| `paged_cache_memory_mb`         | config.json                         | MAX pool size in MiB (auto one-full-context when unset).                                                   |
-| `MLX_PAGED_CACHE_MEMORY_MB`     | env (agent override manager only)   | Floor the manager writes for the max into the cloned config; unparseable falls back to the 16 GiB floor.   |
+| Knob                            | Source                              | Role                                                                                                                      |
+| ------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `paged_cache_initial_memory_mb` | config.json (qwen3_5 / qwen3_5_moe) | Initial pool size in MiB. Unset = the max itself. Ignored with a DFlash2 draft: the pool starts at the 2048-token runway. |
+| `MLX_PAGED_CACHE_INITIAL_MB`    | env (wins over the config field)    | Same, u32 MiB. Unparseable values are ignored (config field, then the unset default). Ignored with a DFlash2 draft.       |
+| `paged_cache_memory_mb`         | config.json                         | MAX pool size in MiB (auto one-full-context when unset).                                                                  |
+| `MLX_PAGED_CACHE_MEMORY_MB`     | env (agent override manager only)   | Floor the manager writes for the max into the cloned config; unparseable falls back to the 16 GiB floor.                  |
 
 The agent override manager (`packages/lm/src/models/paged-config-override.ts`)
 writes `paged_cache_initial_memory_mb = 2048` into the cloned config for
 `qwen3_5` / `qwen3_5_moe`, overridable with `MLX_PAGED_CACHE_INITIAL_MB`, and
 clamped to the resolved max so it never exceeds the pool ceiling. A load with a
-DFlash2 draft (the server host passes the draft flag) gets no default: the
-clone keeps the source config's field, or writes none so the loader starts at
-the DFlash2 runway; `MLX_PAGED_CACHE_INITIAL_MB` still wins. Without a
+DFlash2 draft (the server host passes the draft flag) gets no initial size,
+even with `MLX_PAGED_CACHE_INITIAL_MB` set, and the loader ignores a source
+config's field: the pool starts at the DFlash2 runway. Without a
 draft, the override manager normalizes a larger configured initial down to the
 default; raise it
 via `MLX_PAGED_CACHE_INITIAL_MB`. Other families are not given the field —

@@ -127,7 +127,8 @@ impl Qwen35MoeInner {
 
     /// MoE mirror of the dense post-materialization adaptive paged-pool
     /// initialization. The pool starts at `paged_cache_initial_memory_mb`
-    /// (or the max itself when unset) and grows on demand toward the max.
+    /// (or the max itself when unset; the DFlash2 runway with a draft) and
+    /// grows on demand toward the max.
     pub(crate) fn initialize_paged_adapter(&mut self) -> Result<()> {
         if !self.config.use_block_paged_cache.unwrap_or(true)
             || !crate::engine::persistence::compiled_forward_backend_available()
@@ -178,19 +179,18 @@ impl Qwen35MoeInner {
         }
         let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
         // Initial pool: `MLX_PAGED_CACHE_INITIAL_MB` (env wins) or the config
-        // field, clamped into [1 block, max]. Unset → the max itself, or the
-        // DFlash2 runway when a draft is loaded.
-        let initial_mb =
-            crate::models::qwen3_5::config::qwen35_resolve_paged_cache_initial_memory_mb(
-                self.config.paged_cache_initial_memory_mb,
-                std::env::var(crate::models::qwen3_5::config::MLX_PAGED_CACHE_INITIAL_MB_ENV)
-                    .ok()
-                    .as_deref(),
-            );
-        // A runway pool (a DFlash2 draft, no initial size) grows one layer at
-        // a time, so its maximum leaves room for one old layer beside the new
-        // pool. The DFlash2 pool term is priced from the whole budget.
-        let runway = initial_mb.is_none() && self.dflash2.is_some();
+        // field, clamped into [1 block, max]; unset → the max itself. A
+        // DFlash2 load ignores both and starts at the runway. A runway pool
+        // grows one layer at a time, so its maximum leaves room for one old
+        // layer beside the new pool. The DFlash2 pool term is priced from the
+        // whole budget.
+        let (initial_mb, runway) = crate::models::qwen3_5::config::qwen35_initial_pool_request(
+            self.config.paged_cache_initial_memory_mb,
+            std::env::var(crate::models::qwen3_5::config::MLX_PAGED_CACHE_INITIAL_MB_ENV)
+                .ok()
+                .as_deref(),
+            self.dflash2.is_some(),
+        );
         let sizing_request = if runway {
             crate::models::qwen3_5::config::qwen35_runway_pool_sizing_request(
                 requested_blocks,

@@ -5154,7 +5154,8 @@ export interface Qwen35Config {
    * (`paged_cache_memory_mb` or the auto one-full-context default) on
    * exhaustion. Unset (default) makes the initial pool equal the max —
    * the historical fixed-pool behavior. `MLX_PAGED_CACHE_INITIAL_MB` wins
-   * over this field at load time.
+   * over this field at load time. Both are ignored with a DFlash2 draft:
+   * that pool starts at its runway.
    */
   pagedCacheInitialMemoryMb?: number | undefined;
   /**
@@ -5342,7 +5343,8 @@ export interface Qwen35MoeConfig {
    * (`paged_cache_memory_mb` or the auto one-full-context default) on
    * exhaustion. Unset (default) makes the initial pool equal the max —
    * the historical fixed-pool behavior. `MLX_PAGED_CACHE_INITIAL_MB` wins
-   * over this field at load time.
+   * over this field at load time. Both are ignored with a DFlash2 draft:
+   * that pool starts at its runway.
    */
   pagedCacheInitialMemoryMb?: number | undefined;
   /**

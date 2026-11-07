@@ -59,9 +59,29 @@ pub(crate) fn qwen35_resolve_paged_cache_initial_memory_mb(
     }
 }
 
-/// Tokens the paged pool starts with when a DFlash2 draft is loaded and no
-/// initial size is set: DFlash2 turns never write the pool, so it holds only
-/// a runway for paged turns and grows on demand (Splash `warmupKvPages`).
+/// The initial pool size of a load in MiB (`None` = see
+/// [`qwen35_initial_pool_blocks`]) and whether the pool is a runway pool.
+/// A DFlash2 load always starts at the runway and grows on demand: the env
+/// and config initial sizes are ignored, as Splash builds its pool at
+/// `warmupKvPages` with no size knob (RuntimeResources.mm:1141,
+/// Model.hpp:607-610).
+pub(crate) fn qwen35_initial_pool_request(
+    configured_initial: Option<u32>,
+    env_override: Option<&str>,
+    has_dflash2_draft: bool,
+) -> (Option<u32>, bool) {
+    if has_dflash2_draft {
+        return (None, true);
+    }
+    (
+        qwen35_resolve_paged_cache_initial_memory_mb(configured_initial, env_override),
+        false,
+    )
+}
+
+/// Tokens the paged pool starts with when a DFlash2 draft is loaded:
+/// DFlash2 turns never write the pool, so it holds only a runway for paged
+/// turns and grows on demand (Splash `warmupKvPages`).
 pub(crate) const QWEN35_DFLASH2_POOL_RUNWAY_TOKENS: u32 = 2048;
 
 /// Blocks a runway pool asks the load-time sizer for: the requested pool
@@ -209,7 +229,8 @@ pub struct Qwen3_5Config {
     /// (`paged_cache_memory_mb` or the auto one-full-context default) on
     /// exhaustion. Unset (default) makes the initial pool equal the max —
     /// the historical fixed-pool behavior. `MLX_PAGED_CACHE_INITIAL_MB` wins
-    /// over this field at load time.
+    /// over this field at load time. Both are ignored with a DFlash2 draft:
+    /// that pool starts at its runway.
     #[serde(default)]
     #[napi(ts_type = "number | undefined")]
     pub paged_cache_initial_memory_mb: Option<u32>,
@@ -424,9 +445,9 @@ impl Qwen3_5Config {
 mod tests {
     use super::{
         Qwen3_5Config, qwen35_default_paged_cache_memory_mb, qwen35_initial_pool_blocks,
-        qwen35_resolve_paged_cache_initial_memory_mb, qwen35_resolve_paged_cache_memory_mb,
-        qwen35_runway_pool_max_blocks, qwen35_runway_pool_sizing_request,
-        resolve_qwen35_paged_default,
+        qwen35_initial_pool_request, qwen35_resolve_paged_cache_initial_memory_mb,
+        qwen35_resolve_paged_cache_memory_mb, qwen35_runway_pool_max_blocks,
+        qwen35_runway_pool_sizing_request, resolve_qwen35_paged_default,
     };
     use mlx_paged_attn::PagedAttentionConfig;
 
@@ -655,15 +676,58 @@ mod tests {
                 .expect("no draft");
         assert_eq!(blocks, max_blocks);
         assert_eq!(mb, None);
-        // The runway never exceeds the grow ceiling; an explicit initial
-        // size still wins over it.
+        // The runway never exceeds the grow ceiling.
         assert_eq!(
             qwen35_initial_pool_blocks(None, max_memory_mb, 200, &pa, true, recurrent),
             Ok((200, Some(200)))
         );
+    }
+
+    /// Gate: on the 27B inputs a DFlash2 load starts at the 275-block runway
+    /// whatever `MLX_PAGED_CACHE_INITIAL_MB` or the config field says, so its
+    /// pool, and the window frozen from it, equal the unset load's. Without a
+    /// draft the env still wins over the config field.
+    /// Mutation: resolve the env/config initial first and set
+    /// `runway = initial_mb.is_none() && has_dflash2_draft` → red
+    /// (Some(4096) ≠ None).
+    #[test]
+    fn a_dflash2_load_ignores_the_initial_size_and_starts_at_the_runway() {
+        let max_memory_mb = 5_051;
+        let pa = paged_config(max_memory_mb, 256, 4, 16);
+        let max_blocks = pa.calculate_num_blocks();
+        let recurrent = 153_944_064;
+        let unset = qwen35_initial_pool_request(None, None, true);
+        assert_eq!(unset, (None, true));
+        for (configured, env) in [
+            (None, Some("4096")),
+            (Some(300), None),
+            (Some(300), Some("4096")),
+        ] {
+            let (initial, runway) = qwen35_initial_pool_request(configured, env, true);
+            assert_eq!((initial, runway), unset);
+            assert_eq!(
+                qwen35_initial_pool_blocks(
+                    initial,
+                    max_memory_mb,
+                    max_blocks,
+                    &pa,
+                    true,
+                    recurrent
+                ),
+                Ok((275, Some(275)))
+            );
+        }
         assert_eq!(
-            qwen35_initial_pool_blocks(Some(64), max_memory_mb, max_blocks, &pa, true, recurrent),
-            Ok((64, Some(64)))
+            qwen35_initial_pool_request(Some(300), Some("4096"), false),
+            (Some(4_096), false)
+        );
+        assert_eq!(
+            qwen35_initial_pool_request(Some(300), None, false),
+            (Some(300), false)
+        );
+        assert_eq!(
+            qwen35_initial_pool_request(None, None, false),
+            (None, false)
         );
     }
 
