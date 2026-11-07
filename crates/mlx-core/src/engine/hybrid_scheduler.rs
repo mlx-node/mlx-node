@@ -3175,9 +3175,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     /// rows). Booking less re-admits it into the same shortage, so it replays
     /// and blocks again every step. A victim that did not block resumes to
     /// the blocks it held (`held_blocks`, read before replay zeroes them).
-    /// Its state charge stays the admission one, as a running turn's does:
-    /// pricing draft state on the whole history makes a lone victim reject a
-    /// resume whose rows still fit the max pool.
+    /// A speculative victim's replay rebuilds draft state for its whole
+    /// history, so it is charged what a running turn holds at its booked
+    /// rows, never less than its admission charge. Pricing hidden rows for
+    /// the whole history instead makes a lone victim reject a resume whose
+    /// rows still fit the max pool.
     fn book_resume(
         &self,
         turn: &mut TurnState<ScheduledTurn<B::PrefixState>>,
@@ -3196,6 +3198,17 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         } else {
             turn.block_reservation_total.max(held_blocks)
         };
+        if turn.payload.scheduled_speculation.is_some() {
+            let tokens = turn.payload.requested_tokens.min(
+                turn.block_reservation_total
+                    .saturating_mul(turn.block_size.max(1)),
+            );
+            turn.recurrent_state_bytes = turn.recurrent_state_bytes.max(
+                self.inner
+                    .recurrent_state_bytes()
+                    .saturating_add(self.inner.scheduled_draft_state_held_bytes(tokens)),
+            );
+        }
     }
 
     fn try_resume_preempted(&mut self) {
@@ -5728,8 +5741,77 @@ pub(crate) mod tests {
         );
     }
 
-    /// A preempted MTP victim books blocks for its replayed history and keeps
-    /// its admission state charge, as a running turn does.
+    /// A cold replay rebuilds an MTP victim's draft K/V for its whole
+    /// history, so its resume is charged what a running turn holds at the
+    /// booked rows, blocked or not, and a max pool that fits only the
+    /// admission charge beside the rows rejects it.
+    /// Mutation: delete the `scheduled_speculation` re-charge in
+    /// `book_resume` → red (charge 435,968 ≠ 10,642,176).
+    #[test]
+    fn resumed_mtp_victim_charges_its_rebuilt_draft_state() {
+        let Some((mut state, live)) = growable_qwen35_state() else {
+            return;
+        };
+        state.inner.config.n_mtp_layers = 1;
+        let prompt: Vec<u32> = (0..40).map(|token| token % 16).collect();
+        let recurrent = state.inner.recurrent_state_bytes();
+        let admission = recurrent + state.inner.scheduled_draft_state_bytes(56);
+        let victim = |state: &mut HybridSchedulerState<Qwen35Inner>, seq: u32| {
+            let mut turn = speculative::tests::request(
+                &mut state.inner,
+                seq,
+                prompt.clone(),
+                true,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .with_block_reservation(4, 0, 16)
+            .with_recurrent_state_reservation(admission);
+            turn.payload.requested_tokens = 78_464;
+            turn
+        };
+        let rebuilt = recurrent + state.inner.scheduled_draft_state_held_bytes(40_016);
+        let mut turn = victim(&mut state, 2);
+        state.book_resume(&mut turn, 40_000, true, 0);
+        assert_eq!(turn.block_reservation_total, 2_501);
+        assert_eq!(turn.recurrent_state_bytes, rebuilt);
+        let mut unblocked = victim(&mut state, 3);
+        state.book_resume(&mut unblocked, 40_000, false, 2_501);
+        assert_eq!(unblocked.recurrent_state_bytes, rebuilt);
+        let blocks = turn.block_reservation_total;
+        let bytes_per_block = live.bytes_per_block;
+        let rows_bytes =
+            u64::from(blocks) * bytes_per_block + state.inner.scheduled_recurrent_bytes();
+        let max_blocks = (rows_bytes + admission).div_ceil(bytes_per_block) as u32;
+        let snapshot = SchedulerCacheSnapshot {
+            blocks: BlockTelemetry {
+                total_blocks: max_blocks,
+                free_blocks: max_blocks,
+                reclaimable_blocks: 0,
+                allocated_blocks: 0,
+            },
+            max_total_blocks: max_blocks,
+            bytes_per_block,
+        };
+        let outcome = state
+            .try_reserve_with_policy(
+                2,
+                blocks,
+                turn.recurrent_state_bytes,
+                0,
+                snapshot,
+                false,
+                <Qwen35Inner as HybridSchedulerBackend>::release_scheduled_cache,
+            )
+            .expect("resume decision");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Reject { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// A preempted MTP victim books blocks for its replayed history; its
+    /// state charge is never less than its admission charge and prices no
+    /// hidden rows for the whole history.
     /// Mutation: re-price `recurrent_state_bytes` with
     /// `scheduled_draft_state_bytes` of the booked tokens in
     /// `book_resume` → red.
