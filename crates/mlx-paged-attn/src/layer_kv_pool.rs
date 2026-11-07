@@ -1286,6 +1286,32 @@ impl LayerKVPool {
         }
     }
 
+    /// K+V bytes each layer's buffers occupy now, in layer order. Layers
+    /// differ after a grow or a cut that failed part way.
+    pub fn layer_bytes(&self) -> Vec<u64> {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner_read()
+                .layers
+                .iter()
+                .map(|(k, v)| k.length().saturating_add(v.length()))
+                .collect()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let per_layer = self.layer_bytes_for(self.num_blocks()).unwrap_or(0);
+            vec![per_layer; self.num_layers()]
+        }
+    }
+
+    /// K+V bytes one layer of `blocks` blocks occupies.
+    pub fn layer_bytes_for(&self, blocks: u32) -> Result<u64, String> {
+        let (key, value) = Self::block_bytes_for(&self.config, self.cache_dtype)?;
+        key.checked_add(value)
+            .and_then(|bytes| bytes.checked_mul(u64::from(blocks)))
+            .ok_or_else(|| format!("LayerKVPool: layer size overflows u64 ({blocks} blocks)"))
+    }
+
     /// Block size in tokens (alias of `config().block_size`).
     pub fn block_size(&self) -> u32 {
         self.config.block_size

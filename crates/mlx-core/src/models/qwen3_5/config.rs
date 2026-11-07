@@ -706,8 +706,8 @@ mod tests {
         while blocks < max {
             let target = max.min(blocks + extent);
             let reserved = crate::transformer::paged_kv_cache_adapter::pool_grow_reserved_bytes(
-                u64::from(blocks) * MIB,
-                LAYERS,
+                &vec![u64::from(blocks) * MIB / u64::from(LAYERS); LAYERS as usize],
+                u64::from(target) * MIB / u64::from(LAYERS),
             );
             let selected = probe(target, reserved);
             if selected <= blocks {
