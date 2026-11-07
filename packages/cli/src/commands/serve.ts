@@ -46,6 +46,11 @@ Options:
                       on its first request. A failed preload is logged and
                       the server keeps running.
   --model-residency <mode>  capability (default) or single
+  --kv-format <fmt>   Target K/V cache format: int8 or bf16 (default: int8
+                      for dense qwen3_5 on Metal at head 256, else bf16).
+                      Sets the flat cache DFlash2 turns use; the
+                      block-paged pool ignores it and stays bf16. bf16
+                      uses more memory.
   --rerank-config <file>    JSON { policy?, families?, service? } for rerank limits
   --auth-token <tok>  Require this secret on every route except /health,
                       as \`x-api-key\` or \`authorization: Bearer\`. Also
@@ -75,6 +80,7 @@ export interface ServeArgs {
   preload?: string;
   authToken?: string;
   modelResidency?: 'capability' | 'single';
+  kvFormat?: 'int8' | 'bf16';
   rerankConfig?: string;
   logDir?: string;
 }
@@ -98,6 +104,7 @@ export function parseServeArgs(argv: string[]): ServeArgs {
       model: { type: 'string' },
       preload: { type: 'string' },
       'model-residency': { type: 'string' },
+      'kv-format': { type: 'string' },
       'rerank-config': { type: 'string' },
       'auth-token': { type: 'string' },
       verbose: { type: 'boolean', short: 'v', default: false },
@@ -120,6 +127,9 @@ export function parseServeArgs(argv: string[]): ServeArgs {
   const modelResidency = values['model-residency'];
   if (modelResidency !== undefined && modelResidency !== 'single' && modelResidency !== 'capability')
     throw new Error('--model-residency must be capability or single');
+  const kvFormat = values['kv-format'];
+  if (kvFormat !== undefined && kvFormat !== 'int8' && kvFormat !== 'bf16')
+    throw new Error('--kv-format must be int8 or bf16');
   const verbose = (values.verbose ?? false) || values['log-dir'] != null;
 
   return {
@@ -130,6 +140,7 @@ export function parseServeArgs(argv: string[]): ServeArgs {
     model: values.model,
     ...(values.preload !== undefined ? { preload: values.preload } : {}),
     ...(modelResidency !== undefined ? { modelResidency } : {}),
+    ...(kvFormat !== undefined ? { kvFormat } : {}),
     ...(values['rerank-config'] !== undefined ? { rerankConfig: values['rerank-config'] } : {}),
     authToken: values['auth-token'],
     logDir: verbose ? resolveLogDir(values['log-dir'], resolveMlxNodeHome()) : undefined,
@@ -173,6 +184,7 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
       modelsDir: args.modelsDir,
       model: args.model,
       modelResidency: args.modelResidency,
+      ...(args.kvFormat !== undefined ? { kvFormat: args.kvFormat } : {}),
       ...(await readRerankConfig(args.rerankConfig)),
       authToken: args.authToken,
       logDir: args.logDir,

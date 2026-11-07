@@ -1917,6 +1917,18 @@ describe('launchGrokAgent server gating', () => {
     expect(spawnServe.mock.calls[0]![0]).not.toContain('--preload');
   });
 
+  // Mutation: drop the `--kv-format` pair from the serve argv → red.
+  it('hands --kv-format to the spawned serve', async () => {
+    await launchGrokAgent({ argv: ['-c'], kvFormat: 'bf16', spawnServe, spawnAgent });
+    const serveArgv: string[] = spawnServe.mock.calls[0]![0];
+    expect(serveArgv.slice(-2)).toEqual(['--kv-format', 'bf16']);
+    expect(parseServeArgs(serveArgv.slice(2)).kvFormat).toBe('bf16');
+
+    spawnServe.mockClear();
+    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent });
+    expect(spawnServe.mock.calls[0]![0]).not.toContain('--kv-format');
+  });
+
   it('turns off the xAI media tools a served launch cannot answer, keeping a user override', async () => {
     const mediaEnv = ['GROK_IMAGE_GEN', 'GROK_IMAGE_EDIT', 'GROK_VIDEO_GEN'] as const;
     const saved = mediaEnv.map((name) => process.env[name]);

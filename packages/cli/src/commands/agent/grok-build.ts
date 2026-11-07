@@ -71,6 +71,8 @@ export interface GrokAgentLaunchOptions {
   needsServer?: boolean;
   /** Discovered model the spawned `mlx serve` starts loading at boot (`--preload`). */
   preloadModel?: string;
+  /** Flat K/V cache format the spawned `mlx serve` loads with (`--kv-format`). */
+  kvFormat?: 'int8' | 'bf16';
   /** Test seam: custom spawn for the agent binary. */
   spawnAgent?: (bin: string, argv: string[], opts: SpawnOptions) => ChildProcess;
   /** Test seam: custom spawn for `mlx serve`. */
@@ -1699,6 +1701,7 @@ async function spawnInferenceServer(
     `--auth-token=${token}`,
     ...(opts.modelsDir ? ['--models-dir', opts.modelsDir] : []),
     ...(opts.preloadModel !== undefined ? ['--preload', opts.preloadModel] : []),
+    ...(opts.kvFormat !== undefined ? ['--kv-format', opts.kvFormat] : []),
   ];
   const child = (opts.spawnServe ?? ((argv, so) => spawn(process.execPath, argv, so)))(serveArgv, {
     stdio: ['ignore', 'pipe', 'inherit'],

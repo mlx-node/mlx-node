@@ -243,6 +243,8 @@ interface ModelFamilyDataBase {
   /** Backward-compatible fallback when config.json omits model_type or sets it to null. */
   readonly defaultForNullishModelType?: true;
   readonly acceptsDraftModel?: true;
+  /** Native `load` accepts `LoadModelOptions.kvFormat` (the flat K/V cache format). */
+  readonly acceptsKvFormat?: true;
   /**
    * Native `load` accepts a matching auxiliary HF checkpoint directory — the
    * original checkpoint supplying qwen4_exp's MTP and vision weights that a
@@ -425,6 +427,7 @@ export const MODEL_FAMILY_DATA = [
     kind: 'trainable',
     match: { rawModelTypes: ['qwen3_5'] },
     acceptsDraftModel: true,
+    acceptsKvFormat: true,
     coldRestoreEligible: true,
     streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen35'],
@@ -443,6 +446,7 @@ export const MODEL_FAMILY_DATA = [
     ggufDiscovery: { variants: 'qwen35-xl' },
     match: { rawModelTypes: ['qwen3_5_moe'] },
     acceptsDraftModel: true,
+    acceptsKvFormat: true,
     coldRestoreEligible: true,
     streamOpts: { recordModelPath: true },
     traits: { reasoning: true, fallbackContextWindow: 262144 },

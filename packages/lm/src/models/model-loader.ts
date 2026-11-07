@@ -235,7 +235,7 @@ function dispatchLoad(
         `${modelPath} has model_type "${modelType}"`,
     );
   }
-  if (options?.kvFormat !== undefined && modelType !== 'qwen3_5' && modelType !== 'qwen3_5_moe') {
+  if (options?.kvFormat !== undefined && requireFamilyData(modelType).acceptsKvFormat !== true) {
     throw new Error(
       `kvFormat (flat K/V cache format) is only supported by qwen3_5 and qwen3_5_moe models; ` +
         `${modelPath} has model_type "${modelType}"`,
