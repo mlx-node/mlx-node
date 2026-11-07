@@ -54,7 +54,8 @@ const EVAL_ROWS = [
   'The argument for keeping the old bridge was never about the bridge. It was about the road on either side of it, and the fields the road divided, and the fact that no one had ever agreed where the parish ended and the moor began.',
 ];
 
-// Mutation: restore `kvFormat ?? 'bf16'` in the --json line → red.
+// Mutation: `reportJson` writes the CLI's `kvFormat ?? 'bf16'` after `...report` → red.
+// Mutation: drop the `kv_format` line from `formatReport` → red.
 describe('mlx eval report', () => {
   const report = {
     rows: 1,
