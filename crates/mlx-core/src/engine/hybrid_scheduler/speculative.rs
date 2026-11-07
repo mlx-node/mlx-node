@@ -61,8 +61,9 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
     }
 
     /// Whether every running turn's off-pool state at this step (this
-    /// turn's at its `queries` rows) and the bookings not yet in the pool
-    /// fit the pool's free and reclaimable bytes left after the step's
+    /// turn's at its `queries` rows), the idle owners' parked rows, and the
+    /// bookings not yet in the pool fit the pool's free and reclaimable
+    /// bytes left after the step's
     /// target rows, growing the pool once for the shortfall first. State
     /// lives outside the pool, so target growth never takes it out of the
     /// free bytes; every charge is counted here instead.
@@ -100,6 +101,18 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 snapshot.bytes_per_block,
             ))
         });
+        let owned = running
+            .iter()
+            .filter(|turn| {
+                turn.recurrent_state_reservation_active
+                    && self.inner.has_scheduled_recurrent(turn.seq_id)
+            })
+            .count() as u64;
+        let need = need.saturating_add(
+            self.inner
+                .scheduled_recurrent_bytes()
+                .saturating_sub(self.inner.recurrent_state_bytes().saturating_mul(owned)),
+        );
         let free = available(&snapshot);
         if need <= free {
             return Ok(true);
