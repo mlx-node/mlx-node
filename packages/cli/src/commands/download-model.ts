@@ -856,7 +856,51 @@ async function fetchAssetSidecars(opts: {
   return { ensured: fetched, repo: opts.assetsRepo, revision: opts.plan.revision };
 }
 
-const GGUF_SPLIT_NAME = /^(.*)-(\d{5})-of-(\d{5})\.gguf$/i;
+export interface GgufFileName {
+  /** Path without the `.gguf` and `-NNNNN-of-NNNNN` suffixes. */
+  readonly stem: string;
+  /** 1-based shard number; 1 for a single file. */
+  readonly ordinal: number;
+  /** Shard count; 1 for a single file. */
+  readonly shards: number;
+}
+
+const GGUF_EXTENSION = '.gguf';
+const SPLIT_OF = '-of-';
+const SPLIT_DIGITS = 5;
+
+/** The fixed-width decimal at `text[start, start + SPLIT_DIGITS)`, or undefined. */
+function splitNumber(text: string, start: number): number | undefined {
+  if (start < 0) return undefined;
+  let value = 0;
+  for (let index = start; index < start + SPLIT_DIGITS; index++) {
+    const digit = text.charCodeAt(index) - 48;
+    if (!(digit >= 0 && digit <= 9)) return undefined;
+    value = value * 10 + digit;
+  }
+  return value;
+}
+
+/**
+ * Parse `<stem>.gguf` or llama.cpp's split name `<stem>-NNNNN-of-NNNNN.gguf`
+ * (the shape the native shard resolver rebuilds). Undefined for a non-GGUF path.
+ */
+export function parseGgufFileName(path: string): GgufFileName | undefined {
+  if (path.length <= GGUF_EXTENSION.length || path.slice(-GGUF_EXTENSION.length).toLowerCase() !== GGUF_EXTENSION)
+    return undefined;
+  const base = path.slice(0, -GGUF_EXTENSION.length);
+  const single: GgufFileName = { stem: base, ordinal: 1, shards: 1 };
+  // Read right to left: `-` ordinal `-of-` count.
+  const countStart = base.length - SPLIT_DIGITS;
+  const ofStart = countStart - SPLIT_OF.length;
+  const ordinalStart = ofStart - SPLIT_DIGITS;
+  const dash = ordinalStart - 1;
+  if (dash < 1 || base[dash] !== '-' || base.slice(ofStart, countStart).toLowerCase() !== SPLIT_OF) return single;
+  const ordinal = splitNumber(base, ordinalStart);
+  const shards = splitNumber(base, countStart);
+  if (ordinal === undefined || shards === undefined) return single;
+  return { stem: base.slice(0, dash), ordinal, shards };
+}
 
 export interface GgufLoadEntry {
   /** Repo-relative path a loader opens: the single file, or shard 00001 of a split set. */
@@ -874,10 +918,9 @@ export function ggufLoadEntries(weightFiles: readonly string[]): GgufLoadEntry[]
   const order: string[] = [];
   const sets = new Map<string, { stem: string; shards: number; ordinals: Map<number, string> }>();
   for (const path of weightFiles) {
-    if (!path.toLowerCase().endsWith('.gguf')) continue;
-    const split = GGUF_SPLIT_NAME.exec(path);
-    const stem = split ? split[1] : path.slice(0, -'.gguf'.length);
-    const shards = split ? Number(split[3]) : 1;
+    const name = parseGgufFileName(path);
+    if (name === undefined) continue;
+    const { stem, shards } = name;
     const key = `${stem.toLowerCase()}\0${shards}`;
     let set = sets.get(key);
     if (set === undefined) {
@@ -885,7 +928,7 @@ export function ggufLoadEntries(weightFiles: readonly string[]): GgufLoadEntry[]
       sets.set(key, set);
       order.push(key);
     }
-    set.ordinals.set(split ? Number(split[2]) : 1, path);
+    set.ordinals.set(name.ordinal, path);
   }
   return order.map((key) => {
     const { stem, shards, ordinals } = sets.get(key)!;
