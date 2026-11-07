@@ -5257,6 +5257,7 @@ pub(crate) mod tests {
         assert!(kept);
     }
 
+    #[cfg(target_os = "macos")]
     type GrowProbe = Arc<dyn Fn(u32) -> std::result::Result<u32, String> + Send + Sync>;
 
     /// Reserves one block more than is free for turn 2 while idle owner 1
@@ -5361,6 +5362,7 @@ pub(crate) mod tests {
     /// Mutations: return 0 from `grown_draft_state_bytes` → red (Admitted);
     /// price it with `scheduled_draft_state_bytes` → red (40,000 hidden rows
     /// charged).
+    #[cfg(target_os = "macos")]
     #[test]
     fn running_mtp_turn_charges_its_grown_draft_state() {
         let Some((mut state, live)) = growable_qwen35_state() else {
@@ -5426,6 +5428,7 @@ pub(crate) mod tests {
     /// Qwen3.5 scheduler with one MTP layer, a 4-block pool of 8,192 B
     /// blocks, and the admission charge of a turn booked at 56 rows
     /// (435,968 B). The pool grow is declined unless `set_mtp_step_probe`.
+    #[cfg(target_os = "macos")]
     fn mtp_step_state() -> Option<(HybridSchedulerState<Qwen35Inner>, u64)> {
         let (mut state, snapshot) = growable_qwen35_state()?;
         state.inner.config.n_mtp_layers = 1;
@@ -5438,6 +5441,7 @@ pub(crate) mod tests {
         Some((state, admission))
     }
 
+    #[cfg(target_os = "macos")]
     fn set_mtp_step_probe(state: &mut HybridSchedulerState<Qwen35Inner>, grows: bool) {
         let probe: Arc<dyn Fn(u32) -> std::result::Result<u32, String> + Send + Sync> = if grows {
             Arc::new(Ok)
@@ -5453,6 +5457,7 @@ pub(crate) mod tests {
 
     /// A running MTP turn at `num_tokens` charged `admission`; its prompt
     /// blocks go back to the pool so every case reads 4 blocks of room.
+    #[cfg(target_os = "macos")]
     fn mtp_step_turn(
         state: &mut HybridSchedulerState<Qwen35Inner>,
         seq: u32,
@@ -5491,6 +5496,7 @@ pub(crate) mod tests {
     /// the pool's free bytes (4 blocks, 32,768 B): 14,336 B at 200 tokens
     /// fits, 65,536 B at 400 does not.
     /// Mutation: `draft_growth_fits` returns `Ok(true)` → red (400 tokens).
+    #[cfg(target_os = "macos")]
     #[test]
     fn running_mtp_step_admits_its_draft_growth() {
         let Some((mut state, admission)) = mtp_step_state() else {
@@ -5521,6 +5527,7 @@ pub(crate) mod tests {
     /// Two MTP turns at 250 tokens: this step's 27,136 B fits the pool's
     /// 32,768 B alone, not beside the peer's 26,880 B.
     /// Mutation: drop the peers' sum in `draft_growth_fits` → red.
+    #[cfg(target_os = "macos")]
     #[test]
     fn running_mtp_step_admits_its_peers_draft_growth() {
         let Some((mut state, admission)) = mtp_step_state() else {
@@ -5554,6 +5561,7 @@ pub(crate) mod tests {
     /// A lone MTP turn at 400 tokens is 4 blocks short; with headroom the
     /// step grows the pool to 8 blocks and admits its draft growth.
     /// Mutation: drop the pool grow in `draft_growth_fits` → red.
+    #[cfg(target_os = "macos")]
     #[test]
     fn running_mtp_step_grows_the_pool_for_its_draft_growth() {
         let Some((mut state, admission)) = mtp_step_state() else {
@@ -5706,6 +5714,7 @@ pub(crate) mod tests {
     /// and resumes alone in a pool that cannot grow past 4 blocks.
     /// Mutation: drop the `.min(requested_tokens…)` cap in
     /// `resume_booking_blocks` → red (5 blocks, Reject).
+    #[cfg(target_os = "macos")]
     #[test]
     fn lone_victim_with_one_token_left_resumes_in_its_last_block() {
         let Some((mut state, _)) = growable_qwen35_state() else {
@@ -5764,6 +5773,7 @@ pub(crate) mod tests {
     /// prefill replay does not have, and a lone resume fits a 4-block pool.
     /// Mutation: drop the `prefill_replay` branch in `resume_booking_blocks`
     /// → red (5 blocks, Reject).
+    #[cfg(target_os = "macos")]
     #[test]
     fn prefill_victim_resumes_into_its_admission_blocks() {
         assert_eq!(scheduled_booking(true, 64, 1, 16), (4, 64));
@@ -5830,6 +5840,7 @@ pub(crate) mod tests {
     /// A victim that did not block resumes to the blocks it held, not to the
     /// blocked row's step; one that blocked books its own step.
     /// Mutation: ignore `blocked` in `book_resume` → red (5 ≠ 4).
+    #[cfg(target_os = "macos")]
     #[test]
     fn unblocked_victim_resumes_to_held_blocks() {
         let Some((mut state, _)) = growable_qwen35_state() else {
@@ -6034,6 +6045,7 @@ pub(crate) mod tests {
     /// Mutation: re-price `recurrent_state_bytes` with
     /// `scheduled_draft_state_bytes` of the booked tokens in
     /// `book_resume` → red (Reject).
+    #[cfg(target_os = "macos")]
     #[test]
     fn lone_resume_after_contention_fits_the_max_pool() {
         let Some((mut state, live)) = growable_qwen35_state() else {
@@ -6096,6 +6108,7 @@ pub(crate) mod tests {
     /// admission charge beside the rows rejects it.
     /// Mutation: delete the `scheduled_speculation` re-charge in
     /// `book_resume` → red (charge 435,968 ≠ 10,642,176).
+    #[cfg(target_os = "macos")]
     #[test]
     fn resumed_mtp_victim_charges_its_rebuilt_draft_state() {
         let Some((mut state, live)) = growable_qwen35_state() else {
@@ -6164,6 +6177,7 @@ pub(crate) mod tests {
     /// Mutation: re-price `recurrent_state_bytes` with
     /// `scheduled_draft_state_bytes` of the booked tokens in
     /// `book_resume` → red.
+    #[cfg(target_os = "macos")]
     #[test]
     fn resumed_victim_keeps_its_admission_state_charge() {
         let Some((mut state, _)) = growable_qwen35_state() else {
