@@ -101,6 +101,18 @@ describe('ggufNextSteps', () => {
     expect(await ggufNextSteps(dir, ['gemma-4-12b-it-UD-Q4_K_XL.gguf'])).toHaveLength(2);
   });
 
+  it('does not offer --assets-repo for a nested GGUF, whose sidecars it would write to the wrong folder', async () => {
+    const nested = 'UD-Q4_K_XL/gemma-4-12b-it-UD-Q4_K_XL.gguf';
+    writeGguf(join(dir, nested), 'gemma4');
+    writeFileSync(join(dir, 'config.json'), '{}');
+    writeFileSync(join(dir, 'tokenizer.json'), '{}');
+    expect(await ggufNextSteps(dir, [nested])).toEqual([
+      'Load directly (no conversion needed):',
+      `  ${join(dir, nested)}`,
+      `    needs config.json and tokenizer.json in ${join(dir, 'UD-Q4_K_XL')}: copy them there from the base-model repo`,
+    ]);
+  });
+
   it('gives each converted variant its own output directory', async () => {
     writeGguf(join(dir, 'M-Q4_K_M.gguf'), 'llama');
     writeGguf(join(dir, 'M-Q8_0.gguf'), 'llama');

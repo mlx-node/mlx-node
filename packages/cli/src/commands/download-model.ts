@@ -934,8 +934,11 @@ export async function ggufNextSteps(outputDir: string, weightFiles: readonly str
         family.ggufDiscovery?.requiresAssets &&
         !(existsSync(join(folder, 'config.json')) && existsSync(join(folder, 'tokenizer.json')))
       ) {
+        // `--assets-repo` writes sidecars to outputDir only; the loader reads them beside the GGUF.
         direct.push(
-          `    needs config.json and tokenizer.json in ${folder}: run again with --assets-repo <base-model repo>`,
+          folder === resolve(outputDir)
+            ? `    needs config.json and tokenizer.json in ${folder}: run again with --assets-repo <base-model repo>`
+            : `    needs config.json and tokenizer.json in ${folder}: copy them there from the base-model repo`,
         );
       }
     } else if (entry.shards > 1) {
