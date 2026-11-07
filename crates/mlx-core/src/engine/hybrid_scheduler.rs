@@ -5708,7 +5708,7 @@ pub(crate) mod tests {
     /// peer still prefilling with 8 unbooked blocks (65,536 B) and its
     /// recurrent charge (29,184 B) beside a lone MTP turn at 254 rows
     /// (463,104 B) is 557,824 B, over the 64-block pool's 524,288 B.
-    /// Mutation: drop the bookings from `step_state_bytes` → red (492,288 B).
+    /// Mutation: drop the bookings from `step_state_bytes` → red (29,184 B ≠ 94,720 B).
     #[cfg(target_os = "macos")]
     #[test]
     fn running_mtp_step_counts_unmaterialized_bookings() {
@@ -5733,6 +5733,43 @@ pub(crate) mod tests {
             HybridStepExecutor::new(&mut state.inner)
                 .draft_growth_fits(&pair[..1], 0, 4)
                 .expect("step alone")
+        );
+    }
+
+    /// An idle owner's parked row counts: beside it, the lone MTP turn at
+    /// the last row of its window (438,784 B in 442,368 B free) needs
+    /// 467,968 B and blocks; with the row released it fits.
+    /// Mutations: drop the idle rows from `draft_growth_fits` → red (blocks
+    /// beside the row); do not subtract the running turns' own rows → red
+    /// (fits alone).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mtp_step_counts_idle_parked_rows() {
+        let Some((mut state, _)) = mtp_step_state_with(64, 64) else {
+            return;
+        };
+        let recurrent = state.inner.recurrent_state_bytes();
+        drop(mtp_step_turn_with(&mut state, 2, 40, false, 40, recurrent));
+        let charge = recurrent + state.inner.scheduled_draft_state_bytes(144);
+        let mut turn = mtp_step_turn_with(&mut state, 1, 128, true, 155, charge)
+            .with_block_reservation(9, 9, 16);
+        turn.num_computed_tokens = 154;
+        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
+        adapter.reserve_rows_for(1, 159).expect("window KV");
+        assert_eq!(adapter.block_table_for(1).expect("table").num_blocks(), 10);
+        let lone = vec![turn];
+        assert_eq!(state.inner.scheduled_recurrent_bytes(), 58_368);
+        assert!(
+            !HybridStepExecutor::new(&mut state.inner)
+                .draft_growth_fits(&lone, 0, 4)
+                .expect("step beside an idle row")
+        );
+        state.inner.release_scheduled_recurrent_for(2);
+        assert_eq!(state.inner.scheduled_recurrent_bytes(), 29_184);
+        assert!(
+            HybridStepExecutor::new(&mut state.inner)
+                .draft_growth_fits(&lone, 0, 4)
+                .expect("step with the idle row released")
         );
     }
 
