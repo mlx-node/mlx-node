@@ -508,12 +508,15 @@ fn reserve_evicts_for_the_turn_transients() -> Result<()> {
     Ok(())
 }
 
-/// A paged AR turn on the model evicts parked DFlash2 states until the live
-/// headroom covers its KV and transients, before it parks the live state:
-/// with room it keeps them, with no headroom only the state it parked
-/// itself is left.
+/// A paged AR turn whose pool needs no growth keeps every parked DFlash2
+/// state, with room or with no headroom at all, and parks the live one
+/// beside them: Splash reclaims only inside an allocation that was refused
+/// (Engine.cpp:2056-2104), never before a turn.
+/// Mutation: call `evict_parked_dflash2_for_flat_turn` from
+/// `run_paged_turn` (an up-front eviction) → red (pressure keeps only the
+/// live lineage).
 #[test]
-fn paged_turn_evicts_parked_states_for_its_memory() -> Result<()> {
+fn paged_turn_keeps_parked_states_it_does_not_need() -> Result<()> {
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -539,23 +542,21 @@ fn paged_turn_evicts_parked_states_for_its_memory() -> Result<()> {
                 .entries()
                 .map(|entry| entry.tokens().to_vec())
                 .collect();
-            let want = if pressure {
-                vec![b_history.clone()]
-            } else {
-                vec![a_history.clone(), b_history.clone()]
-            };
-            assert_eq!(lineages, want, "{case}");
+            assert_eq!(lineages, [a_history.clone(), b_history.clone()], "{case}");
         }
     }
     Ok(())
 }
 
-/// A state budget that holds about one parked state, then no KV
-/// headroom at all: every turn of four interleaved sessions completes, and
-/// after every turn's reserve the store fits the budget. Under the state
-/// budget the alternating sessions still resume on their parked end states.
+/// A state budget that holds about one parked state: every turn of four
+/// interleaved sessions completes, after every turn's reserve the store
+/// fits the budget, and the alternating sessions still resume on their
+/// parked end states. Then no KV headroom at all: a turn whose KV must grow
+/// evicts every parked state and fails with `context_length_exceeded`, as
+/// Splash fails a lone request it cannot fit. Mutation: grow instead of
+/// returning the error in `ensure_dflash2_target_rows_with` → red.
 #[test]
-fn tiny_budgets_complete_every_turn() -> Result<()> {
+fn tiny_budgets_complete_or_fail_cleanly() -> Result<()> {
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -603,25 +604,23 @@ fn tiny_budgets_complete_every_turn() -> Result<()> {
 
         let _override = BudgetOverride;
         KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(0)));
+        let mut failed = 0;
         for (index, &session) in schedule.iter().enumerate() {
             let prompt = cat(&[&histories[session], &[6, 7]]);
-            let (result, events) = capture_prefix_events(|| turn(&mut inner, &tokenizer, &prompt));
-            let result = result?;
-            assert!(result.num_tokens > 0, "{name}: KV turn {index} completes");
-            if index > 0 {
-                assert_eq!(
-                    (
-                        events[0]["hit_kind"].as_str(),
-                        events[0]["miss_reason"].as_str()
-                    ),
-                    ("none", "evicted"),
-                    "{name}: KV turn {index}: the previous turn evicted this session's state"
-                );
+            match turn(&mut inner, &tokenizer, &prompt) {
+                Ok(result) => assert!(result.num_tokens > 0, "{name}: KV turn {index}"),
+                Err(error) => {
+                    assert!(
+                        error.reason.starts_with("context_length_exceeded: "),
+                        "{name}: KV turn {index}: {}",
+                        error.reason
+                    );
+                    failed += 1;
+                }
             }
-            assert_eq!(events[0]["store_entries"], "0", "{name}: KV turn {index}");
             assert_eq!(inner.dflash2_states.store.bytes().entries, 0, "{name}");
-            histories[session] = inner.cached_token_history.clone();
         }
+        assert!(failed > 0, "{name}: a turn that cannot grow its KV fails");
     }
     Ok(())
 }

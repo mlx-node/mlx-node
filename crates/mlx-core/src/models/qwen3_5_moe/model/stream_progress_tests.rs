@@ -26,15 +26,9 @@ fn tiny_tokenizer() -> Arc<Qwen3Tokenizer> {
                 "unk_token": "<unk>"
             }
         }"#;
-    let dir = std::env::temp_dir().join(format!(
-        "mlx-node-qwen35-moe-stream-progress-tok-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("fixture dir: {e}"));
-    let path = dir.join("tokenizer.json");
-    std::fs::write(&path, json).unwrap_or_else(|e| panic!("fixture write: {e}"));
-    let tok = Qwen3Tokenizer::from_file(&path).unwrap_or_else(|e| panic!("fixture tokenizer: {e}"));
-    let _ = std::fs::remove_dir_all(&dir);
+    let tok = tokenizers::Tokenizer::from_bytes(json)
+        .unwrap_or_else(|e| panic!("fixture tokenizer: {e}"));
+    let tok = Qwen3Tokenizer::from_tokenizer(tok, None);
     Arc::new(tok)
 }
 

@@ -604,8 +604,16 @@ pub(crate) enum SchedulerAction<P, Exclusive, Barrier> {
         #[cfg(test)]
         plan: StepPlan,
         completed: Vec<TurnState<P>>,
-        preempted: Option<TurnState<P>>,
+        preempted: Option<PreemptedTurn<P>>,
     },
+}
+
+/// A step's preemption victim, and whether its own row was the one that
+/// blocked. A victim that did not block resumes to the KV it held, not to
+/// the blocked row's step (Splash `Engine.cpp` resume target).
+pub(crate) struct PreemptedTurn<P> {
+    pub turn: TurnState<P>,
+    pub blocked: bool,
 }
 
 struct Ordered<T> {
@@ -727,6 +735,23 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
 
     pub fn has_live_turns(&self) -> bool {
         !self.waiting.is_empty() || !self.running.is_empty()
+    }
+
+    pub fn has_preempted(&self) -> bool {
+        self.waiting
+            .iter()
+            .any(|turn| turn.status == TurnStatus::Preempted)
+    }
+
+    /// Whether a resuming victim may wait for memory: a running row, or a
+    /// waiter that arrived before it and so may run ahead of it, can still
+    /// free memory. Later waiters and other victims cannot run first, so
+    /// waiting on them never ends.
+    pub fn resume_may_wait(&self, resuming: &TurnState<P>) -> bool {
+        !self.running.is_empty()
+            || self.waiting.iter().any(|turn| {
+                turn.status != TurnStatus::Preempted && turn.arrival_order < resuming.arrival_order
+            })
     }
 
     fn unallocated_reserved_blocks(&self) -> u32 {
@@ -928,6 +953,17 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         victim
     }
 
+    /// Undo [`Self::preempt_running_at`] for a victim whose cache was never
+    /// released: memory was found without preempting it.
+    pub fn reinstate_running(&mut self, mut turn: TurnState<P>) {
+        turn.status = TurnStatus::Running;
+        turn.block_reservation_active = true;
+        turn.recurrent_state_reservation_active = true;
+        turn.preemptions = turn.preemptions.saturating_sub(1);
+        self.stats.preemptions = self.stats.preemptions.saturating_sub(1);
+        self.running.push(turn);
+    }
+
     #[cfg(test)]
     pub fn preempt_running(&mut self, seq_id: SeqId) -> Option<TurnState<P>> {
         let index = self.running.iter().position(|turn| turn.seq_id == seq_id)?;
@@ -1013,7 +1049,6 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         Some(turn)
     }
 
-    #[cfg(test)]
     pub fn running(&self) -> &[TurnState<P>] {
         &self.running
     }
@@ -1190,7 +1225,12 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         let result = executor
             .execute(&plan, &mut self.running)
             .map_err(SchedulerError::Executor)?;
-        let allocation_blocked = result.rows.iter().any(|row| row.allocation_blocked);
+        let blocked_rows: HashSet<SeqId> = result
+            .rows
+            .iter()
+            .filter(|row| row.allocation_blocked)
+            .map(|row| row.seq_id)
+            .collect();
         let executed_decode_batch = result.executed_decode_batch;
         let executed_greedy_epilogue_batch = result.executed_greedy_epilogue_batch;
         let rows_alloc_evicted = result.rows_alloc_evicted;
@@ -1232,13 +1272,15 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         }
 
         let mut preempted = None;
-        if allocation_blocked
+        if !blocked_rows.is_empty()
             && let Some(index) = self
                 .running
                 .iter()
                 .rposition(|turn| turn.status == TurnStatus::Running)
         {
-            preempted = Some(self.preempt_running_at(index));
+            let turn = self.preempt_running_at(index);
+            let blocked = blocked_rows.contains(&turn.seq_id);
+            preempted = Some(PreemptedTurn { turn, blocked });
         }
 
         let mut completed = Vec::new();
@@ -1389,6 +1431,10 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
 mod tests {
     use super::*;
 
+    /// The shared scheduler keeps the `+ 1` budget for every family: the last
+    /// sampled token is never written, so a prompt that fills the window still
+    /// gets one token. Mutation: Splash's clamp (reject `prompt >= context`,
+    /// no `+ 1`) → red (Ok(16) ≠ Ok(17)).
     #[test]
     fn scheduled_output_hint_clamps_to_remaining_context() {
         assert_eq!(clamp_scheduled_output_tokens(48, 100, 64), Ok(17));
@@ -1862,6 +1908,81 @@ mod tests {
         ));
     }
 
+    /// A resuming victim waits only on rows that can run before it: an
+    /// earlier waiter (here parked for SSD) or a running row; a later waiter
+    /// is stuck behind the victim, so waiting on it never ends.
+    /// Mutation: `resume_may_wait` counts every waiter → red.
+    #[test]
+    fn resume_waits_only_on_turns_that_can_run_first() {
+        let mut scheduler = Scheduler::<_, (), ()>::new(2, 8).expect("scheduler");
+        scheduler
+            .enqueue_turn(turn(1, 0, &[4], None))
+            .expect("enqueue earlier waiter");
+        scheduler
+            .park_waiting_for_ssd(1)
+            .expect("park earlier waiter");
+        scheduler
+            .enqueue_turn(turn(2, 0, &[4], None))
+            .expect("enqueue victim");
+        let mut step = MockStep::default();
+        assert!(matches!(
+            scheduler.drive_once(&mut step).expect("step"),
+            SchedulerAction::Stepped { .. }
+        ));
+        let victim = scheduler.preempt_running(2).expect("preempt victim");
+        assert!(scheduler.resume_may_wait(&victim));
+        scheduler
+            .enqueue_turn(turn(3, 0, &[4], None))
+            .expect("enqueue later waiter");
+        scheduler.take_waiting(1).expect("earlier waiter leaves");
+        assert!(!scheduler.resume_may_wait(&victim));
+        assert!(!scheduler.has_preempted());
+        scheduler.prepend_preempted(victim);
+        assert!(scheduler.has_preempted());
+    }
+
+    /// Mutation: `reinstate_running` keeps the preemption count → red.
+    /// Mutation: report every victim as not blocked → red.
+    #[test]
+    fn reinstated_victim_runs_as_if_never_preempted() {
+        let mut scheduler = Scheduler::<_, (), ()>::new(1, 8).expect("scheduler");
+        scheduler
+            .enqueue_turn(turn(1, 0, &[4], None).with_block_reservation(2, 0, 4))
+            .expect("enqueue");
+        let mut step = MockStep {
+            allocation_blocked: HashSet::from([1]),
+            ..MockStep::default()
+        };
+        let SchedulerAction::Stepped {
+            preempted:
+                Some(PreemptedTurn {
+                    turn: victim,
+                    blocked,
+                }),
+            ..
+        } = scheduler.drive_once(&mut step).expect("blocked step")
+        else {
+            panic!("expected a preempted victim");
+        };
+        assert!(blocked, "the lone row blocked its own step");
+        assert_eq!(scheduler.stats().preemptions, 1);
+        scheduler.reinstate_running(victim);
+        assert_eq!(scheduler.stats().preemptions, 0);
+        let turn = &scheduler.running()[0];
+        assert_eq!(turn.status, TurnStatus::Running);
+        assert_eq!(turn.preemptions, 0);
+        assert!(turn.block_reservation_active && turn.recurrent_state_reservation_active);
+        assert_eq!(turn.unallocated_reserved_blocks(), 2);
+        step.allocation_blocked.clear();
+        assert!(matches!(
+            scheduler.drive_once(&mut step).expect("retried step"),
+            SchedulerAction::Stepped {
+                preempted: None,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn ssd_wait_does_not_create_a_phase_queue_or_block_later_runnable_work() {
         let mut scheduler = Scheduler::<_, (), ()>::new(1, 4).expect("scheduler");
@@ -1912,6 +2033,7 @@ mod tests {
         ));
     }
 
+    /// Mutation: report every victim as blocked → red.
     #[test]
     fn allocation_squeeze_preempts_exactly_one_lifo_victim_without_same_step_readmit() {
         let mut scheduler = Scheduler::<_, (), ()>::new(3, 3).expect("scheduler");
@@ -1933,8 +2055,12 @@ mod tests {
             plan.rows.iter().map(|row| row.seq_id).collect::<Vec<_>>(),
             [1, 2, 3]
         );
-        let victim = preempted.expect("one victim");
+        let PreemptedTurn {
+            turn: victim,
+            blocked,
+        } = preempted.expect("one victim");
         assert_eq!(victim.seq_id, 3, "newest running row is the LIFO victim");
+        assert!(!blocked, "row 1 blocked, not the victim");
         assert_eq!(victim.status, TurnStatus::Preempted);
         assert!(!victim.block_reservation_active);
         assert_eq!(victim.preemptions, 1);

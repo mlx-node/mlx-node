@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -632,7 +632,30 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].options).toEqual({ draftModelPath: draft });
     expect(calls[0].path).not.toBe(join(modelsDir, name));
+    const overlay = JSON.parse(await readFile(join(calls[0].path, 'config.json'), 'utf-8')) as Record<string, unknown>;
+    expect(overlay.paged_cache_initial_memory_mb).toBeUndefined();
     expect(host.health().models.resident).toEqual([name]);
+  });
+
+  it.each([
+    ['qwen3_5', 'qwen3.8-27b-mxfp4-mlx'],
+    ['qwen3_5_moe', 'qwen3.6-35b-a3b-q4-k-mlx'],
+  ])('keeps the 2048 MiB initial for a %s directory load without a draft', async (family, name) => {
+    const modelsDir = await makeModelsDir([name]);
+    await writeFile(join(modelsDir, name, 'config.json'), JSON.stringify({ model_type: family }));
+    const calls: Array<{ path: string; options?: LoadModelOptions }> = [];
+    const host = await start({
+      modelsDir,
+      loadModel: async (path, options) => {
+        calls.push({ path, options });
+        return fakeModel();
+      },
+    });
+    await host.loadModel(name);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].options).toBeUndefined();
+    const overlay = JSON.parse(await readFile(join(calls[0].path, 'config.json'), 'utf-8')) as Record<string, unknown>;
+    expect(overlay.paged_cache_initial_memory_mb).toBe(2_048);
   });
 
   it('makes the model resident and records the load on /health', async () => {

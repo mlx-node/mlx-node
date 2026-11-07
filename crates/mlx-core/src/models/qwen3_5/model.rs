@@ -113,7 +113,7 @@ use self::state::{
 };
 pub(crate) use self::state::{
     TokenPrefixMismatchTrace, arrays_bits_equal_for_test, constrain_paged_context_params,
-    qwen35_dense_vision_active, token_prefix_mismatch_trace,
+    context_output_budget, qwen35_dense_vision_active, token_prefix_mismatch_trace,
 };
 use crate::vision::qwen::cache::{VisionCache, VisionCacheInner, vlm_prepare_vision_features};
 
@@ -170,6 +170,13 @@ pub(crate) struct Qwen35Inner {
     pub(crate) dflash2_turn_state: Option<crate::models::qwen3_5::dflash2_turn::DFlash2TurnState>,
     pub(crate) dflash2_prefix: PrefixTracker,
     pub(crate) dflash2_states: crate::models::qwen3_5::dflash2_state::flat::FlatStates,
+    /// DFlash2 window terms fixed at load once the paged pool is
+    /// registered; `None` without a draft.
+    pub(crate) dflash2_window: Option<crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms>,
+    /// Blocks the load-time sizer gave the paged pool. A runway pool's
+    /// maximum sits below it by the one layer a grow holds; the DFlash2 pool
+    /// term is priced from it. `None` before the pool is built.
+    pub(crate) paged_pool_budget_blocks: Option<u32>,
     /// Latched when the compiled DFlash2 verify graph fails at trace or
     /// replay — the failure mode is structural, so the stepper stays on the
     /// eager path for the rest of the model's lifetime.
@@ -412,6 +419,8 @@ pub struct Qwen3_5GenerationResult {
 /// derives from the pool's MAX capacity (grow-on-demand pools are preflighted
 /// against the ceiling they grow toward), while `paged_block_capacity` is the
 /// physical pool size actually allocated at load and may lag after a grow.
+/// `speculative_window_tokens` is set only with a DFlash2 draft: it bounds
+/// text turns that speculate, and `effective_window_tokens` bounds the rest.
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct Qwen3_5ContextLimits {
@@ -419,15 +428,38 @@ pub struct Qwen3_5ContextLimits {
     pub effective_window_tokens: u32,
     pub paged_block_capacity: u32,
     pub paged_block_size: u32,
+    pub speculative_window_tokens: Option<u32>,
+    /// The output budget fills the window: a prompt leaves room for one new
+    /// token and the budget is clamped to `window - prompt`.
+    pub rest_of_window_output_budget: bool,
+    /// An omitted budget on `effective_window_tokens` is the rest of that
+    /// window. Set only when a paged pool sizes the window from memory; a
+    /// flat load's window is the trained length, so it keeps the native
+    /// default.
+    pub omitted_budget_is_rest_of_window: bool,
+    /// The same for `speculative_window_tokens`: set when that window has a
+    /// memory term (the pool or the live reservation).
+    pub speculative_omitted_budget_is_rest_of_window: bool,
 }
 
 impl Qwen3_5ContextLimits {
-    pub(crate) fn from_tuple(value: (u32, u32, u32, u32)) -> Self {
+    /// `speculative` is the DFlash2 window and whether a memory term bounds
+    /// it; `memory_window` whether a paged pool sizes the effective window.
+    pub(crate) fn from_parts(
+        value: (u32, u32, u32, u32),
+        speculative: Option<(u32, bool)>,
+        memory_window: bool,
+    ) -> Self {
         Self {
             trained_window_tokens: value.0,
             effective_window_tokens: value.1,
             paged_block_capacity: value.2,
             paged_block_size: value.3,
+            speculative_window_tokens: speculative.map(|(window, _)| window),
+            rest_of_window_output_budget: true,
+            omitted_budget_is_rest_of_window: memory_window,
+            speculative_omitted_budget_is_rest_of_window: speculative
+                .is_some_and(|(_, memory_bound)| memory_bound),
         }
     }
 }
@@ -632,15 +664,9 @@ impl Qwen3_5Model {
                 batch_size
             )));
         }
-        let prompt_len = prompt_tokens.shape_at(1)? as u32;
-        let capacity = self.context_limits.effective_window_tokens;
-        if prompt_len > capacity {
-            return Err(Error::from_reason(format!(
-                "context_length_exceeded: prompt has {prompt_len} tokens, effective active \
-                 context is {capacity} tokens"
-            )));
-        }
-        let max_output = capacity.saturating_sub(prompt_len).saturating_add(1);
+        let prompt_len = prompt_tokens.shape_at(1)? as usize;
+        let max_output =
+            context_output_budget(prompt_len, self.context_limits.effective_window_tokens)?;
         config.max_new_tokens = config.max_new_tokens.min(max_output as i32);
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35FamilyCommand::Generate {
             prompt_tokens: prompt_tokens.clone(),

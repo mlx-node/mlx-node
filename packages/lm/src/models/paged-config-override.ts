@@ -91,13 +91,22 @@ export class PagedConfigOverrideManager {
    * `crates/mlx-core/src/cold_tier.rs`. It is a SET, not one family, and it is
    * deliberately not repeated here: `MlxModelHost` calls this for every
    * allowlisted family, and a second copy of the list would drift.
+   *
+   * `dflash2Draft` marks a load that attaches a DFlash2 draft. Without
+   * `MLX_PAGED_CACHE_INITIAL_MB` the qwen3_5 clone then writes no initial
+   * size, so the native loader starts the pool at its DFlash2 runway.
    */
-  async resolve(modelPath: string, canonicalModelType?: string, persistPagedCache?: boolean): Promise<string> {
+  async resolve(
+    modelPath: string,
+    canonicalModelType?: string,
+    persistPagedCache?: boolean,
+    dflash2Draft = false,
+  ): Promise<string> {
     if (this.disposed) {
       throw new Error('PagedConfigOverrideManager: resolve() called after cleanup()');
     }
 
-    const operation = this.resolveInternal(modelPath, canonicalModelType, persistPagedCache);
+    const operation = this.resolveInternal(modelPath, canonicalModelType, persistPagedCache, dflash2Draft);
     this.activeResolves.add(operation);
     try {
       return await operation;
@@ -108,8 +117,9 @@ export class PagedConfigOverrideManager {
 
   private async resolveInternal(
     modelPath: string,
-    canonicalModelType?: string,
-    persistPagedCache?: boolean,
+    canonicalModelType: string | undefined,
+    persistPagedCache: boolean | undefined,
+    dflash2Draft: boolean,
   ): Promise<string> {
     const sourcePath = isAbsolute(modelPath) ? modelPath : resolve(modelPath);
     if (extname(sourcePath).toLowerCase() === '.gguf') {
@@ -131,7 +141,7 @@ export class PagedConfigOverrideManager {
       const prepared = await prepareMuseGlimmerGguf(sourcePath);
       let resolved: string;
       try {
-        resolved = await this.resolveInternal(prepared, modelType, persistPagedCache);
+        resolved = await this.resolveInternal(prepared, modelType, persistPagedCache, dflash2Draft);
       } catch (error) {
         releaseNativeGgufLease(prepared);
         throw error;
@@ -190,7 +200,7 @@ export class PagedConfigOverrideManager {
     // A source whose field already equals that value needs no clone; an absent
     // or different field does, or the new start-small default would silently
     // skip every already-paged Qwen3.5 checkpoint (they lack the field).
-    const initialMb = QWEN35_CACHE_FLOOR_MODEL_TYPES.has(modelType) ? resolveQwen35InitialMb() : undefined;
+    const initialMb = QWEN35_CACHE_FLOOR_MODEL_TYPES.has(modelType) ? resolveQwen35InitialMb(dflash2Draft) : undefined;
     const configuredInitialMb = positiveNumber(config.paged_cache_initial_memory_mb);
     const initialSatisfied =
       initialMb === undefined ||
@@ -204,12 +214,12 @@ export class PagedConfigOverrideManager {
       return modelPath;
     }
 
-    // Memoize per (source, resolved family, persist directive): the same
-    // checkpoint resolved with a different persist tri-state must yield a distinct
-    // clone, not the first one cached under the bare path. `cleanup()` iterates
-    // every value, so multiple entries per path are all still disposed.
+    // Memoize per (source, resolved family, persist directive, draft): the same
+    // checkpoint resolved with a different persist tri-state or draft must yield
+    // a distinct clone, not the first one cached under the bare path. `cleanup()`
+    // iterates every value, so multiple entries per path are all still disposed.
     const persistKey = persistPagedCache === undefined ? 'u' : persistPagedCache ? 't' : 'f';
-    const cacheKey = `${sourcePath}\0${modelType}\0${persistKey}`;
+    const cacheKey = `${sourcePath}\0${modelType}\0${persistKey}\0${dflash2Draft ? 'd' : 'n'}`;
     const existing = this.overrides.get(cacheKey);
     if (existing !== undefined) return existing;
 
@@ -432,9 +442,9 @@ function resolveQwen35CacheFloorMb(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_QWEN35_PAGED_CACHE_MB;
 }
 
-function resolveQwen35InitialMb(): number {
+function resolveQwen35InitialMb(dflash2Draft: boolean): number | undefined {
   const raw = process.env.MLX_PAGED_CACHE_INITIAL_MB;
-  if (raw == null || raw === '') return DEFAULT_QWEN35_PAGED_CACHE_INITIAL_MB;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_QWEN35_PAGED_CACHE_INITIAL_MB;
+  const parsed = raw == null || raw === '' ? Number.NaN : Number.parseInt(raw, 10);
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  return dflash2Draft ? undefined : DEFAULT_QWEN35_PAGED_CACHE_INITIAL_MB;
 }

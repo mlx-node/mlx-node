@@ -250,8 +250,17 @@ impl HybridSchedulerBackend for Qwen35Inner {
         self.paged_adapter.as_mut()
     }
 
-    fn release_memory_for_pool_grow(&mut self) -> bool {
-        crate::models::qwen3_5::dflash2_turn::evict_parked_dflash2_for_pool_grow(self)
+    /// An idle live DFlash2 state parks first, so it is reclaimable too; a
+    /// scheduled sequence's installed history is left alone.
+    fn release_one_for_pool_grow(&mut self) -> bool {
+        if self.active_scheduled_seq.is_none() {
+            crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
+        }
+        crate::models::qwen3_5::dflash2_turn::evict_one_parked_dflash2_for_pool_grow(self)
+    }
+
+    fn scheduler_books_on_demand(&self) -> bool {
+        true
     }
 
     fn supports_scheduled_speculation(&self) -> bool {
@@ -263,6 +272,12 @@ impl HybridSchedulerBackend for Qwen35Inner {
     }
     fn scheduled_draft_state_bytes(&self, total_tokens: u32) -> u64 {
         crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState::reservation_bytes(
+            &self.config,
+            total_tokens,
+        )
+    }
+    fn scheduled_draft_state_held_bytes(&self, total_tokens: u32) -> u64 {
+        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState::held_bytes(
             &self.config,
             total_tokens,
         )

@@ -662,14 +662,11 @@ mod tests {
     use crate::utils::gguf::{GgufConversionOptions, GgufTensorType, convert_gguf_to_safetensors};
     use crate::utils::gguf_test_fixtures::{
         IMPORT_FIXTURE_NAMES, ImportFixture, ImportFixtureFamily, convert_import_fixture,
-        safetensors_manifest, sha256_hex, t64_prefixes, write_import_fixture,
+        import_golden_root as golden_root, safetensors_manifest, sha256_hex, t64_prefixes,
+        write_import_fixture,
     };
     #[cfg(debug_assertions)]
     use crate::utils::gguf_test_fixtures::{build_minimal_gguf, fixture_payload};
-
-    fn golden_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/utils/testdata/gguf_import_golden")
-    }
 
     fn work_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("mlx-gguf-plan-{tag}-{}", uuid::Uuid::new_v4()))
@@ -830,6 +827,11 @@ mod tests {
 
     #[tokio::test]
     async fn header_tiled_set_equals_base_golden() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf_plan::tests::header_tiled_set_equals_base_golden",
+        ) {
+            return;
+        }
         let work = work_dir("tiled");
         for name in IMPORT_FIXTURE_NAMES {
             let fixture = checked_fixture(name, &work.join("src").join(name));
@@ -879,6 +881,11 @@ mod tests {
 
     #[tokio::test]
     async fn converter_output_equals_base_golden() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf_plan::tests::converter_output_equals_base_golden",
+        ) {
+            return;
+        }
         let work = work_dir("convert");
         for name in IMPORT_FIXTURE_NAMES {
             let fixture = checked_fixture(name, &work.join("src").join(name));
@@ -956,6 +963,11 @@ mod tests {
     #[cfg(debug_assertions)]
     #[tokio::test]
     async fn converter_tiler_drift_debug_asserts() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf_plan::tests::converter_tiler_drift_debug_asserts",
+        ) {
+            return;
+        }
         let work = work_dir("drift");
         let fixture = checked_fixture("qwen35-dense-untied", &work.join("src/untied"));
         let planned = plan_fixture(&fixture);

@@ -69,6 +69,8 @@ impl Qwen35Inner {
             dflash2_turn_state: None,
             dflash2_prefix,
             dflash2_states,
+            dflash2_window: None,
+            paged_pool_budget_blocks: None,
             caches: None,
             tokenizer: None,
             vision_encoder: None,
@@ -172,7 +174,29 @@ impl Qwen35Inner {
             )));
         }
         let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
-        // `max_num_blocks` is the dynamic ceiling the live pool grows toward;
+        // Initial pool: `MLX_PAGED_CACHE_INITIAL_MB` (env wins) or the config
+        // field, clamped into [1 block, max]. Unset → the max itself, or the
+        // DFlash2 runway when a draft is loaded.
+        let initial_mb =
+            crate::models::qwen3_5::config::qwen35_resolve_paged_cache_initial_memory_mb(
+                self.config.paged_cache_initial_memory_mb,
+                std::env::var(crate::models::qwen3_5::config::MLX_PAGED_CACHE_INITIAL_MB_ENV)
+                    .ok()
+                    .as_deref(),
+            );
+        // A runway pool (a DFlash2 draft, no initial size) grows one layer at
+        // a time, so its maximum leaves room for one old layer beside the new
+        // pool. The DFlash2 pool term is priced from the whole budget.
+        let runway = initial_mb.is_none() && self.dflash2.is_some();
+        let sizing_request = if runway {
+            crate::models::qwen3_5::config::qwen35_runway_pool_sizing_request(
+                requested_blocks,
+                attn_layer_count,
+            )
+        } else {
+            requested_blocks
+        };
+        // `sized_blocks` bounds the dynamic ceiling the live pool grows toward;
         // `load_time_pool_sizing_with_reserved` keeps clamping the MAX only.
         // Sibling pools registered
         // with the cache-limit coordinator hold private Metal buffers the MLX
@@ -181,11 +205,11 @@ impl Qwen35Inner {
         // persistence.rs), so the coordinator read is race-free. The explicit
         // `paged_cache_memory_mb` cap is an operator override and stays
         // unprobed by design.
-        let (max_num_blocks, sizing_source) = if self.config.paged_cache_memory_mb.is_some() {
-            (requested_blocks, "explicit".to_string())
+        let (sized_blocks, sizing_source) = if self.config.paged_cache_memory_mb.is_some() {
+            (sizing_request, "explicit".to_string())
         } else {
             let sizing = mlx_paged_attn::profile::load_time_pool_sizing_with_reserved(
-                requested_blocks,
+                sizing_request,
                 attn_layer_count,
                 num_kv_heads,
                 head_size,
@@ -213,21 +237,24 @@ impl Qwen35Inner {
             )
         };
 
-        // Initial pool: `MLX_PAGED_CACHE_INITIAL_MB` (env wins) or the config
-        // field, clamped into [1 block, max]. Unset → the max itself.
-        let initial_mb =
-            crate::models::qwen3_5::config::qwen35_resolve_paged_cache_initial_memory_mb(
-                self.config.paged_cache_initial_memory_mb,
-                std::env::var(crate::models::qwen3_5::config::MLX_PAGED_CACHE_INITIAL_MB_ENV)
-                    .ok()
-                    .as_deref(),
-            );
+        let budget_blocks = sized_blocks.min(requested_blocks);
+        let max_num_blocks = if runway {
+            crate::models::qwen3_5::config::qwen35_runway_pool_max_blocks(
+                sized_blocks,
+                requested_blocks,
+                attn_layer_count,
+            )
+        } else {
+            budget_blocks
+        };
         let (num_blocks, initial_pool_mib) =
             crate::models::qwen3_5::config::qwen35_initial_pool_blocks(
                 initial_mb,
                 requested_memory_mb,
                 max_num_blocks,
                 &pa_config,
+                self.dflash2.is_some(),
+                self.config.recurrent_state_bytes(),
             )
             .map_err(|()| {
                 Error::from_reason(format!(
@@ -247,18 +274,26 @@ impl Qwen35Inner {
                 .map_err(|e| {
                     Error::from_reason(format!("Failed to construct Qwen3.5 KV pool: {e}"))
                 })?;
-        self.paged_adapter = Some(
+        let mut adapter =
             PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
                 Error::from_reason(format!("Failed to construct Qwen3.5 paged adapter: {e}"))
-            })?,
-        );
+            })?;
+        if runway && num_blocks < max_num_blocks {
+            let bytes_per_block = adapter.bytes_per_block().map_err(Error::from_reason)?;
+            adapter.set_extent_growth(
+                crate::models::qwen3_5::dflash2_decode::runway_pool_extent_blocks(bytes_per_block),
+            );
+        }
+        self.paged_adapter = Some(adapter);
+        self.paged_pool_budget_blocks = Some(budget_blocks);
         info!(
             "Qwen3.5 paged adapter enabled after weight materialization: initial_blocks={}, \
-             block_size={}, effective_window_tokens={}, trained_window_tokens={}, \
-             requested_memory_mib={}, requested_source={}, sizing_source={}",
+             max_blocks={}, block_size={}, pool_window_tokens={}, trained_window_tokens={}, \
+             pool_kv_format=bf16, requested_memory_mib={}, requested_source={}, sizing_source={}",
             num_blocks,
+            max_num_blocks,
             block_size,
-            max_num_blocks.saturating_mul(block_size).min(max_seq_len),
+            self.pool_context_limit(),
             max_seq_len,
             requested_memory_mb,
             requested_source,
@@ -367,26 +402,109 @@ impl Qwen35Inner {
         }
     }
 
-    pub(crate) fn paged_context_limits(&self) -> (u32, u32, u32, u32) {
+    /// Tokens one turn may hold in the paged pool at its maximum size, after
+    /// the recurrent-state charge. Paged and vision turns clamp on this.
+    pub(crate) fn pool_context_limit(&self) -> u32 {
         let trained = self.config.max_position_embeddings.max(0) as u32;
         let Some(adapter) = self.paged_adapter.as_ref() else {
-            return (trained, trained, 0, 0);
+            return trained;
         };
-        let blocks = adapter.block_capacity();
-        let block_size = adapter.block_size();
-        let bytes_per_block = adapter.bytes_per_block().unwrap_or(0);
         let usable = pool_tokens_after_recurrent(
             adapter.max_capacity_tokens(),
-            block_size,
-            bytes_per_block,
+            adapter.block_size(),
+            adapter.bytes_per_block().unwrap_or(0),
             self.config.recurrent_state_bytes(),
         );
+        scheduled_turn_context(trained, usable, scheduler_per_seq_context_override())
+    }
+
+    /// `(trained, pool window, pool blocks, block size)`. Every turn but a
+    /// DFlash2 one clamps on the pool window.
+    pub(crate) fn paged_context_limits(&self) -> (u32, u32, u32, u32) {
+        let (blocks, block_size) = self.paged_adapter.as_ref().map_or((0, 0), |adapter| {
+            (adapter.block_capacity(), adapter.block_size())
+        });
         (
-            trained,
-            scheduled_turn_context(trained, usable, scheduler_per_seq_context_override()),
+            self.config.max_position_embeddings.max(0) as u32,
+            self.pool_context_limit(),
             blocks,
             block_size,
         )
+    }
+
+    /// The window a DFlash2 turn clamps on, fixed at load by
+    /// [`Self::finish_load_limits`]; `None` without a draft.
+    pub(crate) fn speculative_window(&self) -> Option<u32> {
+        let trained = self.config.max_position_embeddings.max(0) as u32;
+        self.dflash2_window.map(|terms| {
+            scheduled_turn_context(
+                trained,
+                terms.window(),
+                scheduler_per_seq_context_override(),
+            )
+        })
+    }
+
+    pub(crate) fn context_limits_snapshot(
+        &self,
+    ) -> crate::models::qwen3_5::model::Qwen3_5ContextLimits {
+        let memory_bound = self
+            .dflash2_window
+            .is_some_and(|terms| terms.pool.is_some() || terms.reserve.is_some());
+        crate::models::qwen3_5::model::Qwen3_5ContextLimits::from_parts(
+            self.paged_context_limits(),
+            self.speculative_window()
+                .map(|window| (window, memory_bound)),
+            self.paged_adapter.is_some(),
+        )
+    }
+
+    /// The context limits a load publishes: the DFlash2 window frozen first,
+    /// then the snapshot that carries it. Runs once the paged pool is
+    /// registered with the cache-limit coordinator.
+    pub(crate) fn finish_load_limits(
+        &mut self,
+    ) -> Result<crate::models::qwen3_5::model::Qwen3_5ContextLimits> {
+        self.freeze_dflash2_window()?;
+        Ok(self.context_limits_snapshot())
+    }
+
+    /// Fix the DFlash2 window at load, after the paged pool is registered
+    /// with the cache-limit coordinator (its reservation term reads the live
+    /// headroom). A no-op without a draft.
+    fn freeze_dflash2_window(&mut self) -> Result<()> {
+        let pool = self
+            .paged_adapter
+            .as_ref()
+            .map(|adapter| {
+                crate::models::qwen3_5::dflash2_turn::dflash2_pool_budget(
+                    adapter,
+                    self.paged_pool_budget_blocks,
+                    self.config.recurrent_state_bytes(),
+                )
+            })
+            .transpose()?;
+        let Some(terms) =
+            crate::models::qwen3_5::dflash2_turn::dflash2_published_window(&*self, pool)?
+        else {
+            return Ok(());
+        };
+        self.dflash2_window = Some(terms);
+        info!(
+            "Qwen3.5 DFlash2 context window: speculative_window_tokens={:?}, pool_window_tokens={}, \
+             kv_format={:?}, kv_row_bytes={}, trained={}, draft_trained={}, \
+             dflash2_pool_window={:?}, dflash2_reserve_window={:?}, kv_extent_rows={}",
+            self.speculative_window(),
+            self.pool_context_limit(),
+            crate::models::qwen3_5::dflash2_turn::dflash2_target_kv_format(&*self),
+            terms.row_bytes,
+            terms.trained,
+            terms.draft_trained,
+            terms.pool,
+            terms.reserve,
+            terms.extent_rows,
+        );
+        Ok(())
     }
 
     pub(super) fn preflight_paged_context(
@@ -399,8 +517,7 @@ impl Qwen35Inner {
                 "context_length_exceeded: paged cache is not initialized",
             ));
         }
-        let (_, capacity, _, _) = self.paged_context_limits();
-        constrain_paged_context_params("Qwen3.5", prompt_tokens, capacity, params)
+        constrain_paged_context_params("Qwen3.5", prompt_tokens, self.pool_context_limit(), params)
     }
 
     /// Store the checkpoint's parsed `generation_config.json` defaults.

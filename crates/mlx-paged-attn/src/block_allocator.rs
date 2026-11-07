@@ -204,6 +204,22 @@ impl PrefixCacheBlockIdentity {
     }
 }
 
+/// A cut of the pool's tail: the block count it shrinks to, and the
+/// cache-only blocks at or above that count that first move into free slots
+/// below it, as `(from, to)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShrinkPlan {
+    pub num_blocks: u32,
+    pub moves: Vec<(u32, u32)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotUse {
+    Free,
+    CacheOnly,
+    Held,
+}
+
 /// One block in an all-or-nothing cold-restore publication.
 ///
 /// The physical block must already be reserved and fully uploaded. Keeping
@@ -1006,6 +1022,168 @@ impl BlockAllocator {
         self.num_blocks = target;
         self.max_prefix_cache_entries = self.num_blocks as usize;
         added
+    }
+
+    /// What every id below `num_blocks` holds: a free slot, a prefix-cache
+    /// entry no request holds, or a block a request (or a reservation) holds.
+    fn slot_uses(&self) -> Vec<SlotUse> {
+        let mut uses = vec![SlotUse::Held; self.num_blocks as usize];
+        for &id in &self.free_blocks {
+            if let Some(slot) = uses.get_mut(id as usize) {
+                *slot = SlotUse::Free;
+            }
+        }
+        for block in self.prefix_cache.values() {
+            if block.get_ref_count() == 1
+                && let Some(slot) = uses.get_mut(block.block_id as usize)
+            {
+                *slot = SlotUse::CacheOnly;
+            }
+        }
+        uses
+    }
+
+    /// Cuts of the tail by `1..=extents` whole extents of `extent` blocks,
+    /// lowest first, none below `floor` or below a held block.
+    fn shrink_candidates(
+        &self,
+        uses: &[SlotUse],
+        floor: u32,
+        extent: u32,
+        extents: u32,
+    ) -> Vec<u32> {
+        let held_end = uses
+            .iter()
+            .rposition(|slot| *slot == SlotUse::Held)
+            .map_or(0, |id| id as u32 + 1);
+        let lowest = floor.max(held_end).max(1);
+        let mut cuts: Vec<u32> = (1..=extents)
+            .rev()
+            .map(|count| {
+                self.num_blocks
+                    .saturating_sub(count.saturating_mul(extent.max(1)))
+                    .max(floor)
+                    .max(1)
+            })
+            .filter(|&cut| cut >= lowest && cut < self.num_blocks)
+            .collect();
+        cuts.dedup();
+        cuts
+    }
+
+    /// The lowest block count a cut by up to `extents` extents may reach once
+    /// enough cache-only blocks are gone: `num_blocks` when none can.
+    pub fn shrink_target(&self, floor: u32, extent: u32, extents: u32) -> u32 {
+        let uses = self.slot_uses();
+        self.shrink_candidates(&uses, floor, extent, extents)
+            .first()
+            .copied()
+            .unwrap_or(self.num_blocks)
+    }
+
+    /// The deepest cut by up to `extents` whole extents of `extent` blocks
+    /// that loses nothing: every block at or above it is free or cache-only,
+    /// and the cache-only ones fit the free slots below it. The cut never
+    /// goes below `floor` or below a held block. `None` when no cut fits.
+    pub fn shrink_plan(&self, floor: u32, extent: u32, extents: u32) -> Option<ShrinkPlan> {
+        let uses = self.slot_uses();
+        for cut in self.shrink_candidates(&uses, floor, extent, extents) {
+            let (below, above) = uses.split_at(cut as usize);
+            let cached: Vec<u32> = above
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| **slot == SlotUse::CacheOnly)
+                .map(|(offset, _)| cut + offset as u32)
+                .collect();
+            let free: Vec<u32> = below
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| **slot == SlotUse::Free)
+                .map(|(id, _)| id as u32)
+                .take(cached.len())
+                .collect();
+            if free.len() == cached.len() {
+                return Some(ShrinkPlan {
+                    num_blocks: cut,
+                    moves: cached.into_iter().zip(free).collect(),
+                });
+            }
+        }
+        None
+    }
+
+    /// Apply a [`Self::shrink_plan`] after the pool copied every moved
+    /// block: each moved entry keeps its hash under its new id, ids at or
+    /// above the cut leave the free queue, and `num_blocks` (with the
+    /// prefix-cache capacity, as [`Self::grow_by`] sets it) becomes the cut.
+    /// Checks the whole plan first; on `Err` nothing changed.
+    pub fn apply_shrink(&mut self, plan: &ShrinkPlan) -> Result<(), &'static str> {
+        let cut = plan.num_blocks;
+        if cut == 0 || cut > self.num_blocks {
+            return Err("shrink plan cut out of range");
+        }
+        let mut uses = self.slot_uses();
+        for &(from, to) in &plan.moves {
+            if from < cut
+                || to >= cut
+                || uses.get(from as usize) != Some(&SlotUse::CacheOnly)
+                || uses.get(to as usize) != Some(&SlotUse::Free)
+            {
+                return Err("shrink plan moves a block that is not cache-only into a free slot");
+            }
+            uses[from as usize] = SlotUse::Free;
+            uses[to as usize] = SlotUse::CacheOnly;
+        }
+        if uses[cut as usize..]
+            .iter()
+            .any(|slot| *slot != SlotUse::Free)
+        {
+            return Err("shrink plan leaves a block at or above the cut");
+        }
+        for &(from, to) in &plan.moves {
+            let Some(hash) = self.block_hashes.remove(&from) else {
+                return Err("shrink plan lost a moved block's hash");
+            };
+            self.allocated.remove(&from);
+            let block = Arc::new(PhysicalBlock::new(to));
+            self.allocated.insert(to, Arc::clone(&block));
+            self.block_hashes.insert(to, hash);
+            self.prefix_cache.insert(hash, block);
+        }
+        let taken: HashSet<u32> = plan.moves.iter().map(|&(_, to)| to).collect();
+        self.free_blocks
+            .retain(|&id| id < cut && !taken.contains(&id));
+        self.num_blocks = cut;
+        self.max_prefix_cache_entries = cut as usize;
+        Ok(())
+    }
+
+    /// Evict the oldest cache-only prefix entry no other cached entry names
+    /// as its parent, so a chain loses its tail and keeps its head. Its id
+    /// goes back to the free queue. `None` when no such entry exists.
+    pub fn evict_oldest_cache_only_leaf(&mut self) -> Option<u32> {
+        let parents: HashSet<u64> = self
+            .prefix_cache_identities
+            .values()
+            .map(|identity| identity.parent_hash)
+            .collect();
+        let hash = self.lru_order.iter().copied().find(|hash| {
+            !parents.contains(hash)
+                && self
+                    .prefix_cache
+                    .get(hash)
+                    .is_some_and(|block| block.get_ref_count() == 1)
+        })?;
+        let block = self.prefix_cache.remove(&hash)?;
+        let block_id = block.block_id;
+        self.prefix_cache_identities.remove(&hash);
+        self.block_hashes.remove(&block_id);
+        self.lru_order.remove(&hash);
+        if block.decref() {
+            self.allocated.remove(&block_id);
+            self.free_blocks.push_back(block_id);
+        }
+        Some(block_id)
     }
 
     /// Get the block size
@@ -3159,6 +3337,102 @@ mod tests {
         }
         assert_eq!(ids, vec![2, 3, 4, 5, 6, 7]);
         assert_eq!(allocator.num_free_blocks(), 0);
+    }
+
+    /// A held block at id 9 floors the cut at 10; once it is cache-only the
+    /// cut reaches the floor, the three cache-only blocks above it move to
+    /// the lowest free slots, both chains still hit under the new ids, and
+    /// no id at or above the cut is handed out again. Mutation: count a
+    /// cached block a request still holds as cache-only (drop
+    /// `get_ref_count() == 1` in `slot_uses`) → red (cut 4 ≠ 10).
+    #[test]
+    fn shrink_plan_moves_cache_only_and_floors_at_held() {
+        let mut allocator = BlockAllocator::new(4, 16, 4);
+        assert_eq!(allocator.grow_by(8), 8);
+        let blocks: Vec<_> = (0..12).map(|_| allocator.allocate().unwrap()).collect();
+        let first: Vec<u32> = (1..=8).collect();
+        let second: Vec<u32> = (101..=104).collect();
+        assert_eq!(
+            allocator
+                .cache_full_blocks(&first, &blocks[6..8], 4, &[], 0)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            allocator
+                .cache_full_blocks(&second, &blocks[9..10], 4, &[], 0)
+                .unwrap(),
+            1
+        );
+        for (id, block) in blocks.iter().enumerate() {
+            if id != 9 {
+                allocator.free(Arc::clone(block));
+            }
+        }
+        assert_eq!(
+            allocator.shrink_plan(4, 2, 4),
+            Some(ShrinkPlan {
+                num_blocks: 10,
+                moves: Vec::new(),
+            })
+        );
+        assert_eq!(allocator.shrink_target(4, 2, 4), 10);
+
+        allocator.free(Arc::clone(&blocks[9]));
+        drop(blocks);
+        let plan = allocator.shrink_plan(4, 2, 4).expect("a cut fits");
+        assert_eq!(
+            plan,
+            ShrinkPlan {
+                num_blocks: 4,
+                moves: vec![(6, 0), (7, 1), (9, 2)],
+            }
+        );
+        allocator.apply_shrink(&plan).expect("apply");
+        assert_eq!(allocator.num_blocks(), 4);
+        let (hit, tokens) = allocator.find_longest_cache_hit(&first, 4, &[], 0);
+        assert_eq!(tokens, 8);
+        assert_eq!(
+            hit.iter().map(|block| block.block_id).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        let (hit, tokens) = allocator.find_longest_cache_hit(&second, 4, &[], 0);
+        assert_eq!(tokens, 4);
+        assert_eq!(hit[0].block_id, 2);
+        let ids: Vec<u32> =
+            std::iter::from_fn(|| allocator.allocate().map(|b| b.block_id)).collect();
+        assert_eq!(ids, vec![3]);
+    }
+
+    /// One leaf eviction of a cached 4-block chain takes its tail and keeps
+    /// the head: the chain still hits 3 blocks, then 2. Mutation: evict the
+    /// `lru_order` front instead → red (hit 0).
+    #[test]
+    fn evicting_a_leaf_keeps_the_chain_head() {
+        let mut allocator = BlockAllocator::new(8, 8, 4);
+        let blocks: Vec<_> = (0..4).map(|_| allocator.allocate().unwrap()).collect();
+        let tokens: Vec<u32> = (1..=16).collect();
+        assert_eq!(
+            allocator
+                .cache_full_blocks(&tokens, &blocks, 4, &[], 0)
+                .unwrap(),
+            4
+        );
+        for block in blocks {
+            allocator.free(block);
+        }
+        let hit_blocks = |allocator: &mut BlockAllocator| {
+            let (hit, cached) = allocator.find_longest_cache_hit(&tokens, 4, &[], 0);
+            for block in hit {
+                block.decref();
+            }
+            cached / 4
+        };
+        assert_eq!(allocator.evict_oldest_cache_only_leaf(), Some(3));
+        assert_eq!(hit_blocks(&mut allocator), 3);
+        assert_eq!(allocator.evict_oldest_cache_only_leaf(), Some(2));
+        assert_eq!(hit_blocks(&mut allocator), 2);
+        assert_eq!(allocator.num_free_blocks(), 6);
     }
 
     #[test]

@@ -815,6 +815,12 @@ pub(crate) fn write_import_fixture(name: &str, dir: &Path) -> ImportFixture {
     }
 }
 
+/// The checked-in converter output per import fixture, pinned to the live
+/// converter by `converter_output_equals_base_golden`.
+pub(crate) fn import_golden_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/utils/testdata/gguf_import_golden")
+}
+
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha256::digest(bytes);
@@ -947,6 +953,11 @@ pub(crate) async fn convert_import_fixture(fixture: &ImportFixture, output_dir: 
 #[tokio::test]
 #[ignore = "writes goldens; set MLX_CAPTURE_FIXTURE_GOLDEN"]
 async fn capture_base_fixture_goldens() {
+    if !crate::test_support::in_own_process(
+        "utils::gguf_test_fixtures::capture_base_fixture_goldens",
+    ) {
+        return;
+    }
     let Some(out_root) = std::env::var_os("MLX_CAPTURE_FIXTURE_GOLDEN").map(PathBuf::from) else {
         panic!("set MLX_CAPTURE_FIXTURE_GOLDEN=<golden dir>");
     };

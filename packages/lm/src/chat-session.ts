@@ -176,10 +176,12 @@ export class ContextCapacityError extends Error {
   constructor(
     readonly promptTokens: number,
     readonly effectiveWindowTokens: number,
+    maxPromptTokens?: number,
   ) {
     super(
       `context_length_exceeded: rendered prompt uses ${promptTokens} tokens, ` +
-        `but this model currently has capacity for ${effectiveWindowTokens} tokens`,
+        `but this model currently has capacity for ${effectiveWindowTokens} tokens` +
+        (maxPromptTokens === undefined ? '' : ` (at most ${maxPromptTokens} prompt tokens)`),
     );
     this.name = 'ContextCapacityError';
   }
@@ -199,6 +201,23 @@ export interface SessionContextLimits {
   effectiveWindowTokens: number;
   pagedBlockCapacity: number;
   pagedBlockSize: number;
+  /**
+   * Window of a text turn that runs the model's draft-model speculative
+   * decoder. Turns with `enableMtp` off or with images in the history take
+   * the autoregressive or vision lane and stay on `effectiveWindowTokens`.
+   */
+  speculativeWindowTokens?: number | null;
+  /**
+   * The output budget fills the window: a prompt must leave room for one new
+   * token and `maxNewTokens` is clamped to `window - prompt`. Otherwise
+   * `maxNewTokens` is clamped to `window - prompt + 1`. An omitted budget
+   * keeps the native default unless the chosen window's flag below is set.
+   */
+  restOfWindowOutputBudget?: boolean;
+  /** An omitted budget on `effectiveWindowTokens` is the rest of that window. */
+  omittedBudgetIsRestOfWindow?: boolean;
+  /** An omitted budget on `speculativeWindowTokens` is the rest of that window. */
+  speculativeOmittedBudgetIsRestOfWindow?: boolean;
 }
 
 /**
@@ -1964,17 +1983,27 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * both the tokenizer seam and a load-time context snapshot retain their
    * existing behavior.
    *
-   * The returned config is a copy only when `maxNewTokens` needs clamping.
-   * An omitted output budget stays omitted when the native default fits; it is
-   * made explicit only when the remaining window is smaller than that default.
+   * The window is the speculative one only for a text turn with `enableMtp`
+   * on, matching the native turn plan; every other turn uses the pool's.
+   *
+   * The output budget follows `restOfWindowOutputBudget`, and an omitted one
+   * the chosen window's omitted-budget flag. The returned
+   * config is a copy only when `maxNewTokens` changes.
    */
   private async constrainToContextCapacity(messages: ChatMessage[], config: ChatConfig): Promise<ChatConfig> {
     if (typeof this.model.applyChatTemplate !== 'function' || typeof this.model.contextLimits !== 'function') {
       return config;
     }
 
+    const hasImages = messages.some((message) => (message.images?.length ?? 0) > 0);
     const limits = this.model.contextLimits();
-    const capacity = Math.floor(limits.effectiveWindowTokens);
+    const speculativeWindow = limits.speculativeWindowTokens;
+    const speculative = config.enableMtp === true && !hasImages && speculativeWindow != null;
+    const windowTokens = speculative ? speculativeWindow : limits.effectiveWindowTokens;
+    const omittedIsRestOfWindow = speculative
+      ? limits.speculativeOmittedBudgetIsRestOfWindow === true
+      : limits.omittedBudgetIsRestOfWindow === true;
+    const capacity = Math.floor(windowTokens);
     if (!Number.isSafeInteger(capacity) || capacity <= 0) {
       return config;
     }
@@ -1988,7 +2017,6 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       enableThinking,
       effort ?? null,
     );
-    const hasImages = messages.some((message) => (message.images?.length ?? 0) > 0);
     let promptTokens = tokens.length;
     if (hasImages && typeof this.model.expandedPromptTokenCount === 'function') {
       promptTokens = await this.model.expandedPromptTokenCount(tokens, messages);
@@ -1999,16 +2027,29 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         );
       }
     }
-    if (promptTokens > capacity) {
-      throw new ContextCapacityError(promptTokens, capacity);
-    }
-
-    // The final sampled token is returned without another model forward, so N
-    // generated tokens consume only N-1 additional KV positions.
-    const maxOutput = capacity - promptTokens + 1;
     const requested = config.maxNewTokens;
-    if (requested === undefined) {
-      return maxOutput >= NATIVE_DEFAULT_MAX_NEW_TOKENS ? config : { ...config, maxNewTokens: maxOutput };
+    let maxOutput: number;
+    if (limits.restOfWindowOutputBudget === true) {
+      if (promptTokens >= capacity) {
+        throw new ContextCapacityError(promptTokens, capacity, capacity - 1);
+      }
+      maxOutput = capacity - promptTokens;
+      if (requested == null) {
+        if (omittedIsRestOfWindow) {
+          return { ...config, maxNewTokens: maxOutput };
+        }
+        return maxOutput >= NATIVE_DEFAULT_MAX_NEW_TOKENS ? config : { ...config, maxNewTokens: maxOutput };
+      }
+    } else {
+      if (promptTokens > capacity) {
+        throw new ContextCapacityError(promptTokens, capacity);
+      }
+      // The final sampled token is returned without another model forward, so N
+      // generated tokens consume only N-1 additional KV positions.
+      maxOutput = capacity - promptTokens + 1;
+      if (requested === undefined) {
+        return maxOutput >= NATIVE_DEFAULT_MAX_NEW_TOKENS ? config : { ...config, maxNewTokens: maxOutput };
+      }
     }
     const maxNewTokens = Math.min(requested, maxOutput);
     return maxNewTokens === requested ? config : { ...config, maxNewTokens };
