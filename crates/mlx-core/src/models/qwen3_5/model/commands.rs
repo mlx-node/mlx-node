@@ -263,6 +263,10 @@ impl HybridSchedulerBackend for Qwen35Inner {
         true
     }
 
+    fn scheduler_output_budget_is_rest_of_window(&self) -> bool {
+        true
+    }
+
     fn supports_scheduled_speculation(&self) -> bool {
         self.has_mtp_weights()
             && self.paged_adapter.is_some()

@@ -29,6 +29,7 @@ use crate::engine::plan::{
     SpeculativePlan,
 };
 use crate::engine::recurrent_state::{HYBRID_LIVE_STATE_UNITS, RecurrentStateTable};
+use crate::engine::scheduler::context_output_budget;
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
@@ -46,7 +47,7 @@ use crate::models::qwen3_5::gdn_checkpoint_store::{
 };
 use crate::models::qwen3_5::model::{
     Qwen3_5ContextLimits, async_eval_layer_caches, constrain_paged_context_params,
-    context_output_budget, eval_layer_caches,
+    eval_layer_caches,
 };
 use crate::transformer::paged_kv_cache_adapter::SeqId;
 use crate::vision::qwen::encoder::QwenVisionEncoder;

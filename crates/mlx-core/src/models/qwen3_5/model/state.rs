@@ -58,20 +58,6 @@ pub(crate) fn constrain_paged_context_params(
     Ok(())
 }
 
-/// Largest output budget a `prompt_tokens` prompt leaves in a `capacity`
-/// window, or the `context_length_exceeded` rejection when it leaves none.
-pub(crate) fn context_output_budget(prompt_tokens: usize, capacity: u32) -> Result<u32> {
-    let prompt = u32::try_from(prompt_tokens).unwrap_or(u32::MAX);
-    if prompt >= capacity {
-        return Err(Error::from_reason(format!(
-            "context_length_exceeded: rendered prompt has {prompt} tokens, effective active \
-             context is {capacity} tokens (at most {} prompt tokens)",
-            capacity.saturating_sub(1)
-        )));
-    }
-    Ok(capacity - prompt)
-}
-
 pub(super) struct DenseGdnPrefixCheckpoint {
     pub(super) owner_id: String,
     pub(super) prefix_len: u32,

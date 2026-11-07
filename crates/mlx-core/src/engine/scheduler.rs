@@ -12,14 +12,38 @@ use std::time::Duration;
 use crate::transformer::paged_kv_cache_adapter::SeqId;
 use napi_derive::napi;
 
+/// Largest output budget a `prompt_tokens` prompt leaves in a `capacity`
+/// window, or the `context_length_exceeded` rejection when it leaves none.
+/// Splash's budget (frontend.py:1212-1222): a prompt must leave room for one
+/// new token, and `prompt + max_new` never passes the window.
+pub(crate) fn context_output_budget(prompt_tokens: usize, capacity: u32) -> napi::Result<u32> {
+    let prompt = u32::try_from(prompt_tokens).unwrap_or(u32::MAX);
+    if prompt >= capacity {
+        return Err(napi::Error::from_reason(format!(
+            "context_length_exceeded: rendered prompt has {prompt} tokens, effective active \
+             context is {capacity} tokens (at most {} prompt tokens)",
+            capacity.saturating_sub(1)
+        )));
+    }
+    Ok(capacity - prompt)
+}
+
 /// Clamp a scheduled turn's requested output to the fixed per-sequence
-/// context window. The final sampled token is returned without another model
-/// forward, so `N` outputs consume only `N - 1` additional cache positions.
+/// context window. With `rest_of_window` the budget is
+/// [`context_output_budget`]. Otherwise the final sampled token is returned
+/// without another model forward, so `N` outputs consume only `N - 1`
+/// additional cache positions and the budget is `window - prompt + 1`.
 pub(crate) fn clamp_scheduled_output_tokens(
     prompt_tokens: u32,
     requested_max_new_tokens: u32,
     per_seq_context: u32,
+    rest_of_window: bool,
 ) -> Result<u32, String> {
+    if rest_of_window {
+        return context_output_budget(prompt_tokens as usize, per_seq_context)
+            .map(|max_output| requested_max_new_tokens.min(max_output))
+            .map_err(|error| error.reason);
+    }
     if prompt_tokens > per_seq_context {
         return Err(format!(
             "context_length_exceeded: prompt ({prompt_tokens}) exceeds scheduler per-sequence context {per_seq_context}"
@@ -1431,23 +1455,40 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
 mod tests {
     use super::*;
 
-    /// The shared scheduler keeps the `+ 1` budget for every family: the last
+    /// Families without the rest-of-window budget keep `+ 1`: the last
     /// sampled token is never written, so a prompt that fills the window still
-    /// gets one token. Mutation: Splash's clamp (reject `prompt >= context`,
-    /// no `+ 1`) → red (Ok(16) ≠ Ok(17)).
+    /// gets one token. Mutation: Splash's clamp regardless of
+    /// `rest_of_window` → red (Ok(16) ≠ Ok(17)).
     #[test]
     fn scheduled_output_hint_clamps_to_remaining_context() {
-        assert_eq!(clamp_scheduled_output_tokens(48, 100, 64), Ok(17));
-        assert_eq!(clamp_scheduled_output_tokens(48, 10, 64), Ok(10));
-        assert_eq!(clamp_scheduled_output_tokens(64, 1, 64), Ok(1));
+        assert_eq!(clamp_scheduled_output_tokens(48, 100, 64, false), Ok(17));
+        assert_eq!(clamp_scheduled_output_tokens(48, 10, 64, false), Ok(10));
+        assert_eq!(clamp_scheduled_output_tokens(64, 1, 64, false), Ok(1));
         assert_eq!(scheduled_materialized_tokens(48, 17), 64);
         assert_eq!(scheduled_materialized_tokens(64, 1), 64);
     }
 
     #[test]
     fn scheduled_output_hint_rejects_an_oversized_prompt() {
-        let oversized = clamp_scheduled_output_tokens(65, 1, 64).unwrap_err();
+        let oversized = clamp_scheduled_output_tokens(65, 1, 64, false).unwrap_err();
         assert!(oversized.starts_with("context_length_exceeded: prompt (65)"));
+    }
+
+    /// Splash's scheduled clamp (frontend.py:1212-1222): `prompt >= window`
+    /// is rejected and the budget is `window - prompt`.
+    /// Mutations: `.saturating_add(1)` on the rest-of-window budget → red
+    /// (Ok(17) ≠ Ok(16)); `prompt >= capacity` → `prompt > capacity` → red
+    /// (a full-window prompt is admitted).
+    #[test]
+    fn rest_of_window_scheduled_clamp_matches_splash() {
+        assert_eq!(clamp_scheduled_output_tokens(48, 100, 64, true), Ok(16));
+        assert_eq!(clamp_scheduled_output_tokens(48, 10, 64, true), Ok(10));
+        assert_eq!(clamp_scheduled_output_tokens(63, 100, 64, true), Ok(1));
+        assert_eq!(scheduled_materialized_tokens(48, 16), 63);
+        let full = clamp_scheduled_output_tokens(64, 1, 64, true).unwrap_err();
+        assert!(full.starts_with("context_length_exceeded: rendered prompt has 64 tokens"));
+        let oversized = clamp_scheduled_output_tokens(65, 1, 64, true).unwrap_err();
+        assert!(oversized.starts_with("context_length_exceeded:"));
     }
 
     #[derive(Default)]

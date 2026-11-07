@@ -113,8 +113,9 @@ use self::state::{
 };
 pub(crate) use self::state::{
     TokenPrefixMismatchTrace, arrays_bits_equal_for_test, constrain_paged_context_params,
-    context_output_budget, qwen35_dense_vision_active, token_prefix_mismatch_trace,
+    qwen35_dense_vision_active, token_prefix_mismatch_trace,
 };
+use crate::engine::scheduler::context_output_budget;
 use crate::vision::qwen::cache::{VisionCache, VisionCacheInner, vlm_prepare_vision_features};
 
 pub(crate) type Qwen35SchedulerState =

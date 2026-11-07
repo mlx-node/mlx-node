@@ -226,6 +226,14 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn scheduler_books_on_demand(&self) -> bool {
         !scheduler_reserve_full_isl()
     }
+    /// The scheduled output budget is the rest of the window: a prompt must
+    /// leave room for one new token and the budget is `window - prompt`. The
+    /// family publishes the same rule to the host
+    /// (`Qwen3_5ContextLimits::rest_of_window_output_budget`). Otherwise the
+    /// budget is `window - prompt + 1`.
+    fn scheduler_output_budget_is_rest_of_window(&self) -> bool {
+        false
+    }
     fn reset_owner_on_session_start(&self) -> bool {
         false
     }
@@ -2253,6 +2261,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             prompt_tokens,
             requested_max_new_tokens,
             context,
+            self.inner.scheduler_output_budget_is_rest_of_window(),
         ) {
             Ok(max_new_tokens) => max_new_tokens,
             Err(error) => {
@@ -5128,6 +5137,18 @@ pub(crate) mod tests {
         assert_eq!(scheduled_booking(true, 1_000, 1, 16), (63, 1_000));
     }
 
+    /// Mutation: the dense (or MoE) override returns `false` → red.
+    #[test]
+    fn qwen35_families_clamp_scheduled_output_to_the_rest_of_the_window() {
+        let dense = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let moe = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE model");
+        assert!(dense.scheduler_output_budget_is_rest_of_window());
+        assert!(moe.scheduler_output_budget_is_rest_of_window());
+        if let Ok(nemotron) = NemotronHInner::new(tiny_nemotron_paged_config()) {
+            assert!(!nemotron.scheduler_output_budget_is_rest_of_window());
+        }
+    }
+
     /// Mutation: the dense override returns `false` → red.
     #[test]
     fn qwen35_families_book_kv_on_demand() {
@@ -6931,9 +6952,13 @@ mod scheduled_context_tests {
         // Incident numbers: 33611 prompt, 32768 old cap, ~349520 pool, 1M trained.
         let cap = scheduled_turn_context(1_048_576, 349_520, None);
         assert_eq!(cap, 349_520);
-        assert!(crate::engine::scheduler::clamp_scheduled_output_tokens(33_611, 1024, cap).is_ok());
         assert!(
-            crate::engine::scheduler::clamp_scheduled_output_tokens(33_611, 1024, 32_768).is_err()
+            crate::engine::scheduler::clamp_scheduled_output_tokens(33_611, 1024, cap, true)
+                .is_ok()
+        );
+        assert!(
+            crate::engine::scheduler::clamp_scheduled_output_tokens(33_611, 1024, 32_768, true)
+                .is_err()
         );
     }
 
@@ -6963,7 +6988,10 @@ mod scheduled_context_tests {
         let pool = 349_520;
         let cap = scheduled_turn_context(trained, pool, None);
         // Output still clamped to remaining window; prompt accepted against the pool.
-        assert!(crate::engine::scheduler::clamp_scheduled_output_tokens(33_611, 1024, cap).is_ok());
+        assert!(
+            crate::engine::scheduler::clamp_scheduled_output_tokens(33_611, 1024, cap, false)
+                .is_ok()
+        );
     }
 
     #[test]
