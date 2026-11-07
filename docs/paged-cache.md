@@ -39,18 +39,22 @@ sides distinctly — `initial_blocks=` plus `effective_window_tokens=` computed
 from the max — and a dynamic pool adds a
 `paged pool is dynamic (grow-on-demand)` line.
 
-| Knob                            | Source                              | Role                                                                                                        |
-| ------------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `paged_cache_initial_memory_mb` | config.json (qwen3_5 / qwen3_5_moe) | Initial pool size in MiB. Unset = the max itself — the historical fixed-size pool, byte-identical behavior. |
-| `MLX_PAGED_CACHE_INITIAL_MB`    | env (wins over the config field)    | Same, u32 MiB. Unparseable values are ignored (config field, then the unset default).                       |
-| `paged_cache_memory_mb`         | config.json                         | MAX pool size in MiB (auto one-full-context when unset).                                                    |
-| `MLX_PAGED_CACHE_MEMORY_MB`     | env (agent override manager only)   | Floor the manager writes for the max into the cloned config; unparseable falls back to the 16 GiB floor.    |
+| Knob                            | Source                              | Role                                                                                                       |
+| ------------------------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `paged_cache_initial_memory_mb` | config.json (qwen3_5 / qwen3_5_moe) | Initial pool size in MiB. Unset = the max itself, or the 2048-token runway when a DFlash2 draft is loaded. |
+| `MLX_PAGED_CACHE_INITIAL_MB`    | env (wins over the config field)    | Same, u32 MiB. Unparseable values are ignored (config field, then the unset default).                      |
+| `paged_cache_memory_mb`         | config.json                         | MAX pool size in MiB (auto one-full-context when unset).                                                   |
+| `MLX_PAGED_CACHE_MEMORY_MB`     | env (agent override manager only)   | Floor the manager writes for the max into the cloned config; unparseable falls back to the 16 GiB floor.   |
 
 The agent override manager (`packages/lm/src/models/paged-config-override.ts`)
 writes `paged_cache_initial_memory_mb = 2048` into the cloned config for
 `qwen3_5` / `qwen3_5_moe`, overridable with `MLX_PAGED_CACHE_INITIAL_MB`, and
-clamped to the resolved max so it never exceeds the pool ceiling. The override
-manager normalizes a larger configured initial down to the default; raise it
+clamped to the resolved max so it never exceeds the pool ceiling. A load with a
+DFlash2 draft (the server host passes the draft flag) gets no default: the
+clone keeps the source config's field, or writes none so the loader starts at
+the DFlash2 runway; `MLX_PAGED_CACHE_INITIAL_MB` still wins. Without a
+draft, the override manager normalizes a larger configured initial down to the
+default; raise it
 via `MLX_PAGED_CACHE_INITIAL_MB`. Other families are not given the field —
 their loaders have no initial knob and must not receive one. Checkpoints
 resolved WITHOUT the manager (a library caller loading the path directly)
