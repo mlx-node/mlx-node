@@ -7,6 +7,8 @@ import { parseArgs } from 'node:util';
 import { downloadFile, listFiles, downloadFileToCacheDir, modelInfo, type ListFileEntry } from '@huggingface/hub';
 // Leaf subpath on purpose: `@mlx-node/server/host` would dlopen the native
 // addon, and downloading a model must work before any of that is needed.
+import { MODEL_FAMILY_DATA, type ModelFamilyData } from '@mlx-node/lm/family-data';
+import { readGgufArchitecture } from '@mlx-node/lm/model-detection';
 import { isGgufCompanionName } from '@mlx-node/lm/model-discovery';
 import { resolveModelsDir } from '@mlx-node/server/host/paths';
 import { ttsComponents } from '@mlx-node/tts/catalog';
@@ -854,6 +856,105 @@ async function fetchAssetSidecars(opts: {
   return { ensured: fetched, repo: opts.assetsRepo, revision: opts.plan.revision };
 }
 
+const GGUF_SPLIT_NAME = /^(.*)-(\d{5})-of-(\d{5})\.gguf$/i;
+
+export interface GgufLoadEntry {
+  /** Repo-relative path a loader opens: the single file, or shard 00001 of a split set. */
+  readonly path: string;
+  /** Shard count declared by the file name; 1 for a single file. */
+  readonly shards: number;
+  /** Distinct shards of the set present in the selection; equals `shards` when the set is complete. */
+  readonly present: number;
+  /** Path without the `.gguf` and `-NNNNN-of-NNNNN` suffixes. */
+  readonly stem: string;
+}
+
+/** Collapse every split set to one entry: loaders and converters open one file, never each shard. */
+export function ggufLoadEntries(weightFiles: readonly string[]): GgufLoadEntry[] {
+  const order: string[] = [];
+  const sets = new Map<string, { stem: string; shards: number; ordinals: Map<number, string> }>();
+  for (const path of weightFiles) {
+    if (!path.toLowerCase().endsWith('.gguf')) continue;
+    const split = GGUF_SPLIT_NAME.exec(path);
+    const stem = split ? split[1] : path.slice(0, -'.gguf'.length);
+    const shards = split ? Number(split[3]) : 1;
+    const key = `${stem.toLowerCase()}\0${shards}`;
+    let set = sets.get(key);
+    if (set === undefined) {
+      set = { stem, shards, ordinals: new Map() };
+      sets.set(key, set);
+      order.push(key);
+    }
+    set.ordinals.set(split ? Number(split[2]) : 1, path);
+  }
+  return order.map((key) => {
+    const { stem, shards, ordinals } = sets.get(key)!;
+    const first = ordinals.get(1) ?? `${stem}-00001-of-${String(shards).padStart(5, '0')}.gguf`;
+    const present = [...ordinals.keys()].filter((ordinal) => ordinal >= 1 && ordinal <= shards).length;
+    return { path: first, shards, present, stem };
+  });
+}
+
+/** The family whose native loader opens this GGUF directly, if any. */
+function directGgufFamily(architecture: string | undefined, shards: number): ModelFamilyData | undefined {
+  if (architecture === undefined) return undefined;
+  const rows: readonly ModelFamilyData[] = MODEL_FAMILY_DATA;
+  const family = rows.find((row) => row.ggufArchitectures?.includes(architecture));
+  if (family === undefined || (shards > 1 && !family.ggufDiscovery?.split)) return undefined;
+  return family;
+}
+
+/**
+ * Post-download guidance for a GGUF selection. Families listed with
+ * `ggufArchitectures` load the file directly. `mlx convert` reads one file, so
+ * converting a split set shard by shard yields a model with one shard's tensors.
+ */
+export async function ggufNextSteps(outputDir: string, weightFiles: readonly string[]): Promise<string[]> {
+  const entries = ggufLoadEntries(weightFiles);
+  const mlxOutput = (entry: GgufLoadEntry): string =>
+    entries.length === 1 ? `${outputDir}-mlx` : `${outputDir}-mlx-${entry.stem.replaceAll('/', '-').toLowerCase()}`;
+  const incomplete: string[] = [];
+  const direct: string[] = [];
+  const merge: string[] = [];
+  const convert: string[] = [];
+  for (const entry of entries) {
+    const fullPath = join(outputDir, entry.path);
+    if (entry.present < entry.shards) {
+      incomplete.push(`  ${join(outputDir, entry.stem)}: ${entry.present} of ${entry.shards} shards selected`);
+      continue;
+    }
+    const architecture = await readGgufArchitecture(fullPath).catch(() => undefined);
+    const family = directGgufFamily(architecture, entry.shards);
+    if (family !== undefined) {
+      direct.push(
+        `  ${fullPath}${entry.shards > 1 ? ` (reads the other ${entry.shards - 1} shard(s) beside it)` : ''}`,
+      );
+      const folder = dirname(fullPath);
+      if (
+        family.ggufDiscovery?.requiresAssets &&
+        !(existsSync(join(folder, 'config.json')) && existsSync(join(folder, 'tokenizer.json')))
+      ) {
+        direct.push(
+          `    needs config.json and tokenizer.json in ${folder}: run again with --assets-repo <base-model repo>`,
+        );
+      }
+    } else if (entry.shards > 1) {
+      const merged = join(outputDir, `${entry.stem}.gguf`);
+      merge.push(`  llama-gguf-split --merge ${fullPath} ${merged}`);
+      merge.push(`  mlx convert -i ${merged} -o ${mlxOutput(entry)}`);
+    } else {
+      convert.push(`  mlx convert -i ${fullPath} -o ${mlxOutput(entry)}`);
+    }
+  }
+  const lines: string[] = [];
+  if (incomplete.length > 0)
+    lines.push('Incomplete split GGUF (select every shard to load or convert it):', ...incomplete);
+  if (direct.length > 0) lines.push('Load directly (no conversion needed):', ...direct);
+  if (merge.length > 0) lines.push('Split GGUF with no split-aware loader: merge the shards, then convert:', ...merge);
+  if (convert.length > 0) lines.push('To convert GGUF to MLX SafeTensors format:', ...convert);
+  return lines;
+}
+
 export async function run(argv: string[]) {
   const { values: args } = parseArgs({
     args: argv,
@@ -1537,11 +1638,7 @@ export async function run(argv: string[]) {
   if (hasGgufFiles) {
     await finalizeSync();
     console.log(`\nDownload complete! ${weightFiles.length} file(s) saved to ${outputDir}\n`);
-    console.log('To convert GGUF to MLX SafeTensors format:');
-    for (const wf of weightFiles) {
-      const ggufPath = join(outputDir, wf);
-      console.log(`  mlx convert -i ${ggufPath} -o ${outputDir}-mlx`);
-    }
+    for (const line of await ggufNextSteps(outputDir, weightFiles)) console.log(line);
     console.log('');
   } else if (weightFiles.length === 0 && globPatterns?.length) {
     if (filesToDownload.length === 0) {
