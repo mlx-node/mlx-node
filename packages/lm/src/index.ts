@@ -102,12 +102,20 @@ export type { NativeStreamingInstance, NativeStreamingMethod, StreamingInstance,
 export {
   ChatSession,
   ContextCapacityError,
+  contextLane,
   isCapacityExhaustedError,
   isContextCapacityError,
   mtpAutoDefaultAllowed,
+  mtpOnByDefault,
 } from './chat-session.js';
 export { ToolCallTagBuffer, longestSuffixPrefixOverlap } from './tool-call-buffer.js';
-export type { ChatSessionOptions, SendOptions, SessionCapableModel, SessionContextLimits } from './chat-session.js';
+export type {
+  ChatSessionOptions,
+  ContextLane,
+  SendOptions,
+  SessionCapableModel,
+  SessionContextLimits,
+} from './chat-session.js';
 
 // Model utilities (TypeScript-only)
 export {

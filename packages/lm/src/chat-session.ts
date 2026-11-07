@@ -117,7 +117,7 @@ const NATIVE_DEFAULT_MAX_NEW_TOKENS = 2048;
 
 /**
  * Model wrapper class names whose in-checkpoint MTP head must NOT be
- * auto-enabled. Fallback only: {@link ChatSession#mtpAutoDefaultAllowed}
+ * auto-enabled. Fallback only: {@link mtpAutoDefaultAllowed}
  * prefers the native {@link SessionCapableModel.mtpAutoEnabled} getter in BOTH
  * directions whenever the binding exposes it.
  *
@@ -227,6 +227,43 @@ export interface SessionContextLimits {
   omittedBudgetIsRestOfWindow?: boolean;
   /** An omitted budget on `speculativeWindowTokens` is the rest of that window. */
   speculativeOmittedBudgetIsRestOfWindow?: boolean;
+  /** Format of the K/V a turn on `effectiveWindowTokens` writes. */
+  kvFormat?: 'int8' | 'bf16';
+  /** Format of the K/V a turn on `speculativeWindowTokens` writes. */
+  speculativeKvFormat?: 'int8' | 'bf16' | null;
+}
+
+/** The window, K/V format and omitted-budget rule of the lane one turn takes. */
+export interface ContextLane {
+  windowTokens: number;
+  kvFormat?: 'int8' | 'bf16';
+  omittedBudgetIsRestOfWindow: boolean;
+}
+
+/**
+ * The lane a turn takes: the speculative one only for a text turn with
+ * `enableMtp` on and a published speculative window, matching the native
+ * turn plan; every other turn takes the pool's.
+ */
+export function contextLane(limits: SessionContextLimits, enableMtp: boolean, hasImages: boolean): ContextLane {
+  const speculativeWindow = limits.speculativeWindowTokens;
+  if (enableMtp && !hasImages && speculativeWindow != null) {
+    return {
+      windowTokens: speculativeWindow,
+      ...(limits.speculativeKvFormat != null ? { kvFormat: limits.speculativeKvFormat } : {}),
+      omittedBudgetIsRestOfWindow: limits.speculativeOmittedBudgetIsRestOfWindow === true,
+    };
+  }
+  return {
+    windowTokens: limits.effectiveWindowTokens,
+    ...(limits.kvFormat !== undefined ? { kvFormat: limits.kvFormat } : {}),
+    omittedBudgetIsRestOfWindow: limits.omittedBudgetIsRestOfWindow === true,
+  };
+}
+
+/** Whether a turn that leaves `enableMtp` unset runs with it on. */
+export function mtpOnByDefault(model: SessionCapableModel): boolean {
+  return typeof model.hasMtpWeights === 'function' && model.hasMtpWeights() && mtpAutoDefaultAllowed(model);
 }
 
 /**
@@ -1926,7 +1963,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * MTP auto-default: if neither `defaultConfig` nor `overlay`
    * sets `enableMtp` AND the underlying model exposes
    * `hasMtpWeights()` returning `true` AND
-   * {@link ChatSession#mtpAutoDefaultAllowed} agrees, set
+   * {@link mtpAutoDefaultAllowed} agrees, set
    * `enableMtp = true` so the speculative-decode path runs out of the
    * box on MTP-capable checkpoints. An explicit `false` from either
    * source wins (the undefined-check below preserves it). This
@@ -1966,12 +2003,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     if (overlay?.tools === undefined && this.activeTools !== undefined) {
       merged.tools = this.activeTools;
     }
-    if (
-      merged.enableMtp === undefined &&
-      typeof this.model.hasMtpWeights === 'function' &&
-      this.model.hasMtpWeights() &&
-      this.mtpAutoDefaultAllowed()
-    ) {
+    if (merged.enableMtp === undefined && mtpOnByDefault(this.model)) {
       merged.enableMtp = true;
     }
     if (this.model.normalizeReasoningEffort) {
@@ -1979,11 +2011,6 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       merged.reasoningEffort = this.model.normalizeReasoningEffort(merged.reasoningEffort);
     }
     return merged;
-  }
-
-  /** See {@link mtpAutoDefaultAllowed} for the getter-then-prototype-walk policy. */
-  private mtpAutoDefaultAllowed(): boolean {
-    return mtpAutoDefaultAllowed(this.model);
   }
 
   /**
@@ -2006,13 +2033,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
 
     const hasImages = messages.some((message) => (message.images?.length ?? 0) > 0);
     const limits = this.model.contextLimits();
-    const speculativeWindow = limits.speculativeWindowTokens;
-    const speculative = config.enableMtp === true && !hasImages && speculativeWindow != null;
-    const windowTokens = speculative ? speculativeWindow : limits.effectiveWindowTokens;
-    const omittedIsRestOfWindow = speculative
-      ? limits.speculativeOmittedBudgetIsRestOfWindow === true
-      : limits.omittedBudgetIsRestOfWindow === true;
-    const capacity = Math.floor(windowTokens);
+    const lane = contextLane(limits, config.enableMtp === true, hasImages);
+    const omittedIsRestOfWindow = lane.omittedBudgetIsRestOfWindow;
+    const capacity = Math.floor(lane.windowTokens);
     if (!Number.isSafeInteger(capacity) || capacity <= 0) {
       return config;
     }

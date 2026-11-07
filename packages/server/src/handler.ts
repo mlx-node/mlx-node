@@ -52,6 +52,9 @@ export interface PublicModelEntry {
    * path `mlx launch claude` already exercises.
    */
   context_window?: number;
+  /** Splash names; the served window once the model is loaded, else the trained window. */
+  max_model_len?: number;
+  context_length?: number;
   api_backend?: 'messages' | 'responses';
   model_family?: string;
   supports_images?: boolean;

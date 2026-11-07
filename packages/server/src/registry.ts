@@ -38,8 +38,9 @@
  */
 
 import type { ChatConfig } from '@mlx-node/core';
-import type { DecisionModel } from '@mlx-node/lm';
+import type { DecisionModel, SessionContextLimits } from '@mlx-node/lm';
 import type { SessionCapableModel } from '@mlx-node/lm';
+import { contextLane, mtpOnByDefault } from '@mlx-node/lm';
 
 import { AudioRegistry } from './audio-registry.js';
 import { DecisionRegistry } from './decision-registry.js';
@@ -61,6 +62,12 @@ function concurrentDispatchCapacity(model: ServableModel): number {
 
 /** Minimal contract for a model that can be served via chat sessions. */
 export type ServableModel = SessionCapableModel;
+
+/** The window and K/V format a default text turn on a loaded model gets. */
+export interface ServedContext {
+  windowTokens: number;
+  kvFormat?: 'int8' | 'bf16';
+}
 
 /** Model entry stored in the registry. */
 export interface ModelEntry {
@@ -108,6 +115,8 @@ interface SessionRegistryBinding {
   inFlight: number;
   pendingPersists: number;
   pendingTeardown: boolean;
+  /** The model's load-time context snapshot, read once with the binding. */
+  context?: { limits: SessionContextLimits; mtpByDefault: boolean };
 }
 
 /**
@@ -338,6 +347,8 @@ export class ModelRegistry {
         pendingPersists: 0,
         pendingTeardown: false,
       };
+      const limits = typeof model.contextLimits === 'function' ? model.contextLimits() : undefined;
+      if (limits !== undefined) binding.context = { limits, mtpByDefault: mtpOnByDefault(model) };
       this.sessionRegistriesByModel.set(model, binding);
     } else {
       if (binding.pendingTeardown) {
@@ -705,21 +716,51 @@ export class ModelRegistry {
   }
 
   /**
-   * List all registered models in the OpenAI /v1/models format.
+   * The window and K/V format of the lane a default text turn on `name`
+   * takes (the same lane the ChatSession clamp picks); `undefined` when
+   * `name` is not a loaded chat model or publishes no load-time context.
    */
-  list(): { id: string; object: string; created: number; owned_by: string }[] {
+  servedContext(name: string): ServedContext | undefined {
+    const entry = this.models.get(name);
+    const context = entry && this.sessionRegistriesByModel.get(entry.model)?.context;
+    if (!entry || !context) return undefined;
+    const enableMtp = entry.sessionRegistry.defaultSamplingConfig?.enableMtp ?? context.mtpByDefault;
+    const lane = contextLane(context.limits, enableMtp, false);
+    const windowTokens = Math.floor(lane.windowTokens);
+    if (!Number.isSafeInteger(windowTokens) || windowTokens <= 0) return undefined;
+    return { windowTokens, ...(lane.kvFormat !== undefined ? { kvFormat: lane.kvFormat } : {}) };
+  }
+
+  /**
+   * List all registered models in the OpenAI /v1/models format. A loaded
+   * chat model with a load-time context also carries its served window.
+   */
+  list(): {
+    id: string;
+    object: string;
+    created: number;
+    owned_by: string;
+    context_window?: number;
+    max_model_len?: number;
+    context_length?: number;
+  }[] {
     const result: {
       id: string;
       object: string;
       created: number;
       owned_by: string;
+      context_window?: number;
+      max_model_len?: number;
+      context_length?: number;
     }[] = [];
     for (const entry of this.models.values()) {
+      const window = this.servedContext(entry.id)?.windowTokens;
       result.push({
         id: entry.id,
         object: 'model',
         created: entry.createdAt,
         owned_by: 'mlx-node',
+        ...(window !== undefined ? { context_window: window, max_model_len: window, context_length: window } : {}),
       });
     }
     return [...result, ...this.decisions.list(), ...this.audio.list(), ...this.rerank.list()];

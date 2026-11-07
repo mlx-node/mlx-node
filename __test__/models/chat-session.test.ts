@@ -20,7 +20,7 @@
  * export is added in T5.
  */
 import type { ChatConfig, ChatMessage, ChatResult } from '@mlx-node/core';
-import { ChatSession, ContextCapacityError, type SessionCapableModel } from '@mlx-node/lm';
+import { ChatSession, ContextCapacityError, contextLane, type SessionCapableModel } from '@mlx-node/lm';
 import type { ChatStreamEvent, ChatStreamFinal } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
@@ -3840,6 +3840,31 @@ describe('ChatSession', () => {
           ).rejects.toMatchObject({ code: 'context_length_exceeded', effectiveWindowTokens: 64 });
         }
         expect(mock.chatSessionStart).not.toHaveBeenCalled();
+      });
+      // Mutation: `contextLane` ignores `hasImages` → red (image + MTP lane 96 ≠ clamp 64).
+      it('contextLane equals the clamp window', async () => {
+        const mock = makeMockModel();
+        const model = withWindows(mock.model, 96, 20, { expandedPromptTokenCount: vi.fn(() => 20) });
+        const limits = {
+          ...model.contextLimits!(),
+          kvFormat: 'bf16' as const,
+          speculativeKvFormat: 'int8' as const,
+        };
+        const session = new ChatSession(model);
+        const seen: number[] = [];
+        for (const enableMtp of [true, false]) {
+          for (const hasImages of [true, false]) {
+            const messages: ChatMessage[] = [
+              { role: 'user', content: 'lane', ...(hasImages ? { images: [new Uint8Array([1])] } : {}) },
+            ];
+            const clamped = await session.preflightContextCapacity(messages, { enableMtp });
+            const lane = contextLane(limits, enableMtp, hasImages);
+            expect(clamped.maxNewTokens).toBe(lane.windowTokens - 20);
+            expect(lane.kvFormat).toBe(lane.windowTokens === 96 ? 'int8' : 'bf16');
+            seen.push(lane.windowTokens);
+          }
+        }
+        expect(seen).toEqual([64, 96, 64, 64]);
       });
     });
 
