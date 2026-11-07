@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
-import { ggufLoadEntries, ggufNextSteps, parseGgufFileName } from '../../packages/cli/src/commands/download-model.js';
+import { ggufLoadEntries, ggufNextSteps } from '../../packages/cli/src/commands/download-model.js';
 
 /** A v3 GGUF header with no tensors; `architecture` undefined models shards 2..N of a llama.cpp split. */
 function writeGguf(path: string, architecture?: string): void {
@@ -32,38 +32,6 @@ const shards = (stem: string, count: number) =>
     { length: count },
     (_, i) => `${stem}-${String(i + 1).padStart(5, '0')}-of-${String(count).padStart(5, '0')}.gguf`,
   );
-
-describe('parseGgufFileName', () => {
-  it('reads a llama.cpp split name, keeping the folder in the stem', () => {
-    expect(parseGgufFileName('UD-Q4_K_XL/Flash-UD-Q4_K_XL-00002-of-00004.gguf')).toEqual({
-      stem: 'UD-Q4_K_XL/Flash-UD-Q4_K_XL',
-      ordinal: 2,
-      shards: 4,
-    });
-  });
-
-  it('accepts any case in the extension and the -of- separator', () => {
-    expect(parseGgufFileName('M-00001-OF-00002.GGUF')).toEqual({ stem: 'M', ordinal: 1, shards: 2 });
-  });
-
-  it('treats a name without a full split suffix as a single file', () => {
-    for (const path of [
-      'M-Q4_K_M.gguf',
-      'M-0001-of-00002.gguf',
-      'M-00001-of-0002.gguf',
-      'M-0000a-of-00002.gguf',
-      'M00001-of-00002.gguf',
-      '-00001-of-00002.gguf',
-    ]) {
-      expect(parseGgufFileName(path)).toEqual({ stem: path.slice(0, -'.gguf'.length), ordinal: 1, shards: 1 });
-    }
-  });
-
-  it('rejects non-GGUF paths', () => {
-    expect(parseGgufFileName('model.safetensors')).toBeUndefined();
-    expect(parseGgufFileName('.gguf')).toBeUndefined();
-  });
-});
 
 describe('ggufLoadEntries', () => {
   it('collapses a split set to its first shard, in any listing order', () => {

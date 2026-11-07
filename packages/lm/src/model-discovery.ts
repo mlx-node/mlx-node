@@ -61,6 +61,54 @@ const GGUF_COMPANION_NAME = /(?:^|[-_.])(?:imatrix|mmproj|dflash|draft|mtp)(?:[-
 export function isGgufCompanionName(fileName: string): boolean {
   return GGUF_COMPANION_NAME.test(fileName);
 }
+
+export interface GgufFileName {
+  /** Path without the `.gguf` and `-NNNNN-of-NNNNN` suffixes. */
+  readonly stem: string;
+  /** 1-based shard number; 1 for a single file. */
+  readonly ordinal: number;
+  /** Shard count; 1 for a single file. */
+  readonly shards: number;
+}
+
+const GGUF_EXTENSION = '.gguf';
+const SPLIT_OF = '-of-';
+const SPLIT_DIGITS = 5;
+
+/** The fixed-width decimal at `text[start, start + SPLIT_DIGITS)`, or undefined. */
+function splitNumber(text: string, start: number): number | undefined {
+  if (start < 0) return undefined;
+  let value = 0;
+  for (let index = start; index < start + SPLIT_DIGITS; index++) {
+    const digit = text.charCodeAt(index) - 48;
+    if (!(digit >= 0 && digit <= 9)) return undefined;
+    value = value * 10 + digit;
+  }
+  return value;
+}
+
+/**
+ * Parse `<stem>.gguf` or llama.cpp's split name `<stem>-NNNNN-of-NNNNN.gguf`
+ * (the shape `resolve_gguf_shards` rebuilds; the stem may be empty, as there).
+ * Undefined for a non-GGUF path.
+ */
+export function parseGgufFileName(path: string): GgufFileName | undefined {
+  if (path.length <= GGUF_EXTENSION.length || path.slice(-GGUF_EXTENSION.length).toLowerCase() !== GGUF_EXTENSION)
+    return undefined;
+  const base = path.slice(0, -GGUF_EXTENSION.length);
+  const single: GgufFileName = { stem: base, ordinal: 1, shards: 1 };
+  // Read right to left: `-` ordinal `-of-` count.
+  const countStart = base.length - SPLIT_DIGITS;
+  const ofStart = countStart - SPLIT_OF.length;
+  const ordinalStart = ofStart - SPLIT_DIGITS;
+  const dash = ordinalStart - 1;
+  if (dash < 0 || base[dash] !== '-' || base.slice(ofStart, countStart).toLowerCase() !== SPLIT_OF) return single;
+  const ordinal = splitNumber(base, ordinalStart);
+  const shards = splitNumber(base, countStart);
+  if (ordinal === undefined || shards === undefined) return single;
+  return { stem: base.slice(0, dash), ordinal, shards };
+}
+
 // Match the native loaders' primary files/shards. A draft or projector
 // SafeTensors file beside a GGUF is not a converted target checkpoint.
 const PRIMARY_SAFETENSORS = /^(?:model|weights)\.safetensors$|^model(?:-|\.safetensors-).+-of-.+\.safetensors$/;
@@ -76,10 +124,10 @@ function ggufModelName(name: string): string {
 function supportedGgufName(name: string, modelType: ModelType): boolean {
   const policy = familyDataFor(modelType)?.ggufDiscovery;
   if (!policy || GGUF_COMPANION_NAME.test(name)) return false;
-  const split = /-(\d{5})-of-(\d{5})\.gguf$/i.exec(name);
-  if (split) {
-    const total = Number(split[2]);
-    if (Number(split[1]) !== 1 || total < 1 || total > 1024 || (total > 1 && !policy.split)) return false;
+  const split = parseGgufFileName(name);
+  if (split !== undefined && (split.ordinal !== 1 || split.shards !== 1)) {
+    const { ordinal, shards } = split;
+    if (ordinal !== 1 || shards < 1 || shards > 1024 || (shards > 1 && !policy.split)) return false;
   }
   if (modelType === 'qwen3_5' && BONSAI_PQ2_GGUF.test(name)) return true;
   return policy.variants === 'all' || isQwen35XlGguf(name);
