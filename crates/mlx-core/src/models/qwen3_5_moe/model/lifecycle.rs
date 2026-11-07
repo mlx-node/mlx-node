@@ -773,11 +773,20 @@ impl Qwen35MoeInner {
         let memory_bound = self
             .dflash2_window
             .is_some_and(|terms| terms.pool.is_some() || terms.reserve.is_some());
+        // The block-paged pool stores BF16 K/V whatever `kv_format` says.
+        let kv_format = if self.paged_adapter.is_some() {
+            crate::transformer::KvFormat::Bf16
+        } else {
+            self.config.kv_format()
+        };
+        let speculative_format =
+            crate::models::qwen3_5::dflash2_turn::dflash2_target_kv_format(self);
         crate::models::qwen3_5::model::Qwen3_5ContextLimits::from_parts(
             self.paged_context_limits(),
             self.speculative_window()
-                .map(|window| (window, memory_bound)),
+                .map(|window| (window, memory_bound, speculative_format)),
             self.paged_adapter.is_some(),
+            kv_format,
         )
     }
 

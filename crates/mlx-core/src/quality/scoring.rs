@@ -170,6 +170,7 @@ impl ScoreTotals {
         top_k: u32,
         teacher_path: String,
         teacher_quantized: bool,
+        kv_format: crate::transformer::KvFormat,
     ) -> Result<EvalReport> {
         if self.positions == 0 {
             return Err(Error::from_reason(
@@ -192,6 +193,7 @@ impl ScoreTotals {
             mean_kl_topk: self.kl_sum / n,
             teacher_tail_mass: self.tail_mass_sum / n,
             top1_agreement: self.top1_matches / n,
+            kv_format: kv_format.as_str().to_string(),
         })
     }
 }
@@ -311,6 +313,9 @@ pub struct EvalReport {
     pub mean_kl_topk: f64,
     pub teacher_tail_mass: f64,
     pub top1_agreement: f64,
+    /// Format of the candidate's K/V cache during the scored prefill.
+    #[napi(ts_type = "'int8' | 'bf16'")]
+    pub kv_format: String,
 }
 
 #[cfg(test)]
@@ -385,7 +390,15 @@ mod tests {
             "student NLL must equal the cached teacher NLL bit for bit"
         );
 
-        let report = totals.into_report(1, 8, "self".to_string(), false).unwrap();
+        let report = totals
+            .into_report(
+                1,
+                8,
+                "self".to_string(),
+                false,
+                crate::transformer::KvFormat::Bf16,
+            )
+            .unwrap();
         assert_eq!(report.mean_kl_topk, 0.0);
         assert_eq!(report.top1_agreement, 1.0);
         assert_eq!(report.mean_nll, report.teacher_mean_nll);
@@ -536,7 +549,13 @@ mod tests {
         let reference = capture_chunk(&teacher, &targets, VOCAB).unwrap();
         let totals = score_chunk(&student, &targets, &reference).unwrap();
         let report = totals
-            .into_report(1, VOCAB as u32, "oracle".to_string(), false)
+            .into_report(
+                1,
+                VOCAB as u32,
+                "oracle".to_string(),
+                false,
+                crate::transformer::KvFormat::Bf16,
+            )
             .unwrap();
 
         let oracle_kl = read_row(&kl_divergence(

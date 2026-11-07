@@ -34,6 +34,9 @@ pub trait EvalBackend {
     /// Project `hidden` through the head, preserving the leading dims
     /// (`[*, hidden] -> [*, vocab]`).
     fn project_head(&self, hidden: &MxArray) -> Result<MxArray>;
+
+    /// Format of the K/V cache [`Self::teacher_forced_hidden`] writes.
+    fn kv_format(&self) -> crate::transformer::KvFormat;
 }
 
 /// Run one eval request against `backend`.
@@ -185,6 +188,7 @@ pub fn run<B: EvalBackend>(backend: &mut B, request: EvalRequest) -> Result<Eval
                 meta.top_k,
                 meta.teacher_path,
                 meta.teacher_quantized,
+                backend.kv_format(),
             )?))
         }
     }
@@ -300,6 +304,7 @@ mod tests {
         /// capture while this one is walking the rows. `eval_guard` is
         /// process-local, so nothing else would serialize them.
         replace_meta_mid_scan: Option<(std::path::PathBuf, String)>,
+        kv_format: crate::transformer::KvFormat,
     }
 
     const FIXTURE_VOCAB: i64 = 24;
@@ -310,6 +315,7 @@ mod tests {
                 vocab: FIXTURE_VOCAB,
                 rows: vec![vec![3, 9, 14, 2, 20, 7, 11], vec![5, 1, 18, 6]],
                 replace_meta_mid_scan: None,
+                kv_format: crate::transformer::KvFormat::Bf16,
             }
         }
     }
@@ -346,6 +352,10 @@ mod tests {
 
         fn project_head(&self, hidden: &MxArray) -> Result<MxArray> {
             Ok(hidden.clone())
+        }
+
+        fn kv_format(&self) -> crate::transformer::KvFormat {
+            self.kv_format
         }
     }
 
@@ -391,6 +401,7 @@ mod tests {
         let mut backend = FixtureBackend {
             vocab: FIXTURE_VOCAB,
             replace_meta_mid_scan: None,
+            kv_format: crate::transformer::KvFormat::Bf16,
             rows: vec![vec![4]],
         };
         let outcome = run(
@@ -435,6 +446,7 @@ mod tests {
         let mut backend = FixtureBackend {
             vocab: FIXTURE_VOCAB,
             replace_meta_mid_scan: None,
+            kv_format: crate::transformer::KvFormat::Bf16,
             rows: vec![vec![4, 5, 6, 7]],
         };
 
@@ -477,6 +489,7 @@ mod tests {
         let mut backend = FixtureBackend {
             vocab: FIXTURE_VOCAB,
             replace_meta_mid_scan: None,
+            kv_format: crate::transformer::KvFormat::Bf16,
             rows: vec![vec![4, 5, 6, 7]],
         };
 
@@ -541,6 +554,7 @@ mod tests {
         let mut backend = FixtureBackend {
             vocab: FIXTURE_VOCAB,
             replace_meta_mid_scan: None,
+            kv_format: crate::transformer::KvFormat::Bf16,
             rows: vec![vec![4, 5, 6, 7], vec![1, 2, 3, 4]],
         };
 
@@ -601,6 +615,7 @@ mod tests {
         let mut backend = FixtureBackend {
             vocab: FIXTURE_VOCAB,
             replace_meta_mid_scan: None,
+            kv_format: crate::transformer::KvFormat::Bf16,
             rows: vec![vec![4, 5, 6, 7]],
         };
 
@@ -654,6 +669,7 @@ mod tests {
         let mut backend = FixtureBackend {
             vocab: FIXTURE_VOCAB,
             replace_meta_mid_scan: None,
+            kv_format: crate::transformer::KvFormat::Bf16,
             rows: vec![vec![4, 5, 6, 7], vec![1, 2, 3, 4]],
         };
 
@@ -759,6 +775,20 @@ mod tests {
             report.teacher_tail_mass
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The report names the K/V format the candidate prefilled with.
+    /// Mutation: `into_report` writes `"bf16"` → red.
+    #[test]
+    fn score_report_names_the_backend_kv_format() {
+        let dir = scratch("kv_format");
+        let mut backend = FixtureBackend::new();
+        capture(&mut backend, &dir, 3);
+        backend.kv_format = crate::transformer::KvFormat::Int8;
+        assert_eq!(score(&mut backend, &dir, 3).kv_format, "int8");
+        backend.kv_format = crate::transformer::KvFormat::Bf16;
+        assert_eq!(score(&mut backend, &dir, 3).kv_format, "bf16");
         std::fs::remove_dir_all(&dir).ok();
     }
 
