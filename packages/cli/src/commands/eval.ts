@@ -35,7 +35,7 @@ export interface EvalScoreOptions {
   cache: string;
   /** Positions per head projection (default 64). */
   logitChunk?: number;
-  /** Flat full-attention K/V cache format of the candidate (dense qwen3_5): 'bf16' (default) or 'int8'. */
+  /** Flat full-attention K/V cache format of the candidate (qwen3_5 / qwen3_5_moe); unset = the load default. */
   kvFormat?: 'int8' | 'bf16';
 }
 
@@ -94,7 +94,13 @@ export function formatReport(modelPath: string, report: EvalReport): string {
     `perplexity       ${report.perplexity.toFixed(3)}   (teacher ${report.teacherPerplexity.toFixed(3)}, ${pplDelta}%)`,
     `kl_topk          ${report.meanKlTopk.toFixed(5)}  (K=${report.topK}, teacher tail mass ${report.teacherTailMass.toFixed(5)})`,
     `top1_agreement   ${(report.top1Agreement * 100).toFixed(2)}%`,
+    `kv_format        ${report.kvFormat}`,
   ].join('\n');
+}
+
+/** The `--json` line: the K/V format is the one the native load resolved. */
+export function reportJson(modelPath: string, report: EvalReport): string {
+  return JSON.stringify({ model: modelPath, ...report });
 }
 
 function printHelp() {
@@ -122,8 +128,9 @@ Cache Arguments:
 Score Arguments:
   --model <path>        Candidate checkpoint to score
   --cache <dir>         Teacher cache directory
-  --kv-format <fmt>     Candidate K/V cache format: bf16 (default) or int8
-                        (dense qwen3_5 flat cache only)
+  --kv-format <fmt>     Candidate flat K/V cache format: int8 or bf16 (qwen3_5
+                        and qwen3_5_moe; default: the load default, int8 for
+                        dense on Metal at head 256, else bf16)
   --json                Emit the report as one JSON object
 
 Shared Arguments:
@@ -246,7 +253,7 @@ export async function run(argv: string[]) {
       }
       const report = await evalScore({ model: modelPath, cache: args.cache, logitChunk, kvFormat });
       if (args.json) {
-        console.log(JSON.stringify({ model: modelPath, kvFormat: kvFormat ?? 'bf16', ...report }));
+        console.log(reportJson(modelPath, report));
         return;
       }
       console.log(formatReport(modelPath, report));

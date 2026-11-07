@@ -681,18 +681,18 @@ kl_topk          0.13782  (K=512, teacher tail mass 0.04045)
 top1_agreement   77.64%
 ```
 
-| Flag            | Purpose                                                                                                                |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `--teacher`     | Reference checkpoint, normally bf16 (`cache` mode, required)                                                           |
-| `--model`, `-m` | Candidate checkpoint to score (`score` mode, required)                                                                 |
-| `--dataset`     | Eval JSONL of `{"text": "..."}` rows (`cache` mode, required)                                                          |
-| `--cache`       | Teacher cache directory (required in both modes)                                                                       |
-| `--rows`        | Dataset rows to capture (default `64`)                                                                                 |
-| `--seq`         | Tokens kept per row (default `512`, minimum `2`)                                                                       |
-| `--top-k`       | Retained support per position (default `1024`, clamped to the vocabulary)                                              |
-| `--logit-chunk` | Positions per head projection (default `64`)                                                                           |
-| `--kv-format`   | Candidate flat K/V cache format, `int8` or `bf16` (dense qwen3_5; unset = the load default, int8 on Metal at head 256) |
-| `--json`        | Emit the report as one JSON object (`score` mode), for A/B scripting                                                   |
+| Flag            | Purpose                                                                                                                                                                                                |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--teacher`     | Reference checkpoint, normally bf16 (`cache` mode, required)                                                                                                                                           |
+| `--model`, `-m` | Candidate checkpoint to score (`score` mode, required)                                                                                                                                                 |
+| `--dataset`     | Eval JSONL of `{"text": "..."}` rows (`cache` mode, required)                                                                                                                                          |
+| `--cache`       | Teacher cache directory (required in both modes)                                                                                                                                                       |
+| `--rows`        | Dataset rows to capture (default `64`)                                                                                                                                                                 |
+| `--seq`         | Tokens kept per row (default `512`, minimum `2`)                                                                                                                                                       |
+| `--top-k`       | Retained support per position (default `1024`, clamped to the vocabulary)                                                                                                                              |
+| `--logit-chunk` | Positions per head projection (default `64`)                                                                                                                                                           |
+| `--kv-format`   | Candidate flat K/V cache format, `int8` or `bf16` (qwen3_5 and qwen3_5_moe; unset = the load default: int8 for dense on Metal at head 256, else bf16). The report's `kv_format` names the resolved one |
+| `--json`        | Emit the report as one JSON object (`score` mode), for A/B scripting                                                                                                                                   |
 
 **Reading the numbers.** `nll`, `perplexity` and `top1_agreement` are exact over
 the full vocabulary. `kl_topk` is a KL over a `K+1`-way partition: one term per
@@ -764,19 +764,22 @@ mlx serve --host 0.0.0.0 --auth-token "$(openssl rand -hex 16)"
 mlx serve --verbose                              # capture every HTTP turn to a log dir
 ```
 
-| Flag                         | Meaning                                                                                                           |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `--port <n>`                 | Port to bind. Omitted ⇒ a free port is picked. `0` ⇒ ephemeral, real port printed                                 |
-| `--host <h>`                 | Bind address (default `127.0.0.1`). Non-loopback exposes local models — pair with `--auth-token`                  |
-| `--models-dir <dir>`         | Discovery root (default `~/.mlx-node/models`; also `MLX_MODELS_DIR`, `~/.mlx-node/config.json`)                   |
-| `--model <name>`             | Default model. Falls back to `ANTHROPIC_MODEL`, then the first discovered model                                   |
-| `--preload <name>`           | Start loading this discovered model at boot instead of on its first request. A failed preload is only logged      |
-| `--model-residency <policy>` | `capability` (default) or `single`                                                                                |
-| `--auth-token <tok>`         | Required on every route except `/health`, as `x-api-key` or `Authorization: Bearer`. Also `MLX_SERVER_AUTH_TOKEN` |
-| `-v, --verbose`              | Write every request/response to a log dir                                                                         |
-| `--log-dir <dir>`            | Override the log directory (implies `--verbose`)                                                                  |
+| Flag                         | Meaning                                                                                                                                                                                               |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--port <n>`                 | Port to bind. Omitted ⇒ a free port is picked. `0` ⇒ ephemeral, real port printed                                                                                                                     |
+| `--host <h>`                 | Bind address (default `127.0.0.1`). Non-loopback exposes local models — pair with `--auth-token`                                                                                                      |
+| `--models-dir <dir>`         | Discovery root (default `~/.mlx-node/models`; also `MLX_MODELS_DIR`, `~/.mlx-node/config.json`)                                                                                                       |
+| `--model <name>`             | Default model. Falls back to `ANTHROPIC_MODEL`, then the first discovered model                                                                                                                       |
+| `--preload <name>`           | Start loading this discovered model at boot instead of on its first request. A failed preload is only logged                                                                                          |
+| `--model-residency <policy>` | `capability` (default) or `single`                                                                                                                                                                    |
+| `--kv-format <fmt>`          | `int8` or `bf16` flat K/V cache for qwen3_5 / qwen3_5_moe (default: int8 for dense on Metal at head 256, else bf16). The block-paged pool ignores it and stays bf16, so only DFlash2 turns write int8 |
+| `--auth-token <tok>`         | Required on every route except `/health`, as `x-api-key` or `Authorization: Bearer`. Also `MLX_SERVER_AUTH_TOKEN`                                                                                     |
+| `-v, --verbose`              | Write every request/response to a log dir                                                                                                                                                             |
+| `--log-dir <dir>`            | Override the log directory (implies `--verbose`)                                                                                                                                                      |
 
-`GET /health` is unauthenticated and reports readiness (`ok` / `loading` / `degraded` / `error`), uptime, pid, resident models, and the last load's outcome — the same body `ServerInstance.health()` returns.
+`GET /health` is unauthenticated and reports readiness (`ok` / `loading` / `degraded` / `error`), uptime, pid, resident models, and the last load's outcome — the same body `ServerInstance.health()` returns. With an auth token, an unauthenticated poll gets only status, uptime and pid. The full body also carries `kv`: per resident model, `maximum_context_tokens` (the window a default text turn gets) and, when known, `format` (`int8` / `bf16`), `quantization` (`symmetric_int8` / `none`) and `scale_type` (`float32` / `none`), as Splash's `/status` names them.
+
+`GET /v1/models` sets `context_window`, `max_model_len` and `context_length` to the trained window before a model loads, and to the window of the lane its default text turn takes once it is loaded: the DFlash2 window when a draft is attached, else the pool window. Eviction or a swap returns the trained window.
 
 Like `mlx launch claude`, it applies the launcher engine policy (`MLX_PAGED_PREFILL_CHUNK_SIZE=2048`) unless the variable is already set in the environment.
 
@@ -851,7 +854,7 @@ mlx agent -r SESSION            # resume a saved session
 mlx agent --models-dir ./models # use a specific local models directory
 ```
 
-Almost every flag belongs to the agent binary and is forwarded verbatim; `mlx agent` only handles the options below before handing off (`--models-dir`, `--trace`/`--trace-dir`, `--no-persist-cache`, and mlx-side help).
+Almost every flag belongs to the agent binary and is forwarded verbatim; `mlx agent` only handles the options below before handing off (`--models-dir`, `--trace`/`--trace-dir`, `--kv-format`, `--no-persist-cache`, and mlx-side help). `--kv-format int8|bf16` is passed to the spawned `mlx serve`.
 
 Because the backend is the local `mlx serve`, `mlx agent` always passes `--disable-web-search` (grok's `web_search` is an xAI server-side tool) and sets `GROK_IMAGE_GEN=0`, `GROK_IMAGE_EDIT=0` and `GROK_VIDEO_GEN=0` unless you exported them yourself. It also starts `mlx serve` with `--preload <model>` for the `-m` model, so the weights load while the agent starts up.
 
