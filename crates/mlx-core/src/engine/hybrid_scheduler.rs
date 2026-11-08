@@ -5709,29 +5709,52 @@ pub(crate) mod tests {
         );
     }
 
-    /// A lone MTP turn at 254 rows holds 463,104 B against a 16-block pool
-    /// (131,072 B); with headroom the step grows its 41-block shortfall to
-    /// 57 blocks (466,944 B) and fits.
-    /// Mutation: drop the pool grow in `draft_growth_fits` → red.
+    /// A 16-block pool (131,072 B free) that may grow to 64 blocks has
+    /// 524,288 B left for state. A lone MTP turn at 254 rows holds
+    /// 463,104 B: it fits in the ungrown room and the pool stays at 16
+    /// blocks, since state lives beside the pool. At 504 rows it holds
+    /// 527,104 B and blocks.
+    /// Mutation: grow the pool by the shortfall over the free bytes in
+    /// `draft_growth_fits` → red (57 blocks ≠ 16).
     #[cfg(target_os = "macos")]
     #[test]
-    fn running_mtp_step_grows_the_pool_for_its_held_state() {
+    fn running_mtp_step_counts_the_ungrown_pool_without_growing_it() {
         let Some((mut state, admission)) = mtp_step_state_with(16, 64) else {
             return;
         };
-        let lone = vec![mtp_step_turn(&mut state, 1, 250, admission)];
         set_mtp_step_probe(&mut state, true);
+        let total_blocks = |state: &HybridSchedulerState<Qwen35Inner>| {
+            state
+                .inner
+                .scheduler_cache_snapshot()
+                .expect("scheduler snapshot")
+                .expect("paged adapter present")
+                .blocks
+                .total_blocks
+        };
+        let lone = vec![mtp_step_turn(&mut state, 1, 250, admission)];
+        assert_eq!(
+            step_state_bytes(&state.inner, &lone[0], 254, 8_192),
+            463_104
+        );
         assert!(
             HybridStepExecutor::new(&mut state.inner)
                 .draft_growth_fits(&lone, 0, 4)
-                .expect("grown step")
+                .expect("step in the ungrown room")
         );
-        let grown = state
-            .inner
-            .scheduler_cache_snapshot()
-            .expect("scheduler snapshot")
-            .expect("paged adapter present");
-        assert_eq!(grown.blocks.total_blocks, 57);
+        assert_eq!(total_blocks(&state), 16);
+        state.inner.release_scheduled_recurrent_for(1);
+        let past = vec![mtp_step_turn(&mut state, 2, 500, admission)];
+        assert_eq!(
+            step_state_bytes(&state.inner, &past[0], 504, 8_192),
+            527_104
+        );
+        assert!(
+            !HybridStepExecutor::new(&mut state.inner)
+                .draft_growth_fits(&past, 0, 4)
+                .expect("step past the max pool")
+        );
+        assert_eq!(total_blocks(&state), 16);
     }
 
     /// A lone MTP turn admitted over a 128-token prompt (9 booked blocks)

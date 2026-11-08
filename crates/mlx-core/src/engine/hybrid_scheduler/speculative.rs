@@ -62,13 +62,13 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
 
     /// Whether every running turn's off-pool state at this step (this
     /// turn's at its `queries` rows), the idle owners' parked rows, and the
-    /// bookings not yet in the pool fit the pool's free and reclaimable
-    /// bytes left after the step's
-    /// target rows, growing the pool once for the shortfall first. State
-    /// lives outside the pool, so target growth never takes it out of the
-    /// free bytes; every charge is counted here instead.
+    /// bookings not yet in the pool fit the bytes the pool may still hand
+    /// out after the step's target rows: free, reclaimable, and not yet
+    /// grown up to its max. State lives outside the pool, so target growth
+    /// never takes it out of those bytes and the pool never grows for it
+    /// (Splash grows only for KV pages, KvPool.cpp:41-75).
     pub(super) fn draft_growth_fits(
-        &mut self,
+        &self,
         running: &[TurnState<ScheduledTurn<B::PrefixState>>],
         turn_index: usize,
         queries: u32,
@@ -80,11 +80,6 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         {
             return Ok(true);
         }
-        let available = |snapshot: &SchedulerCacheSnapshot| {
-            u64::from(snapshot.blocks.free_blocks)
-                .saturating_add(u64::from(snapshot.blocks.reclaimable_blocks))
-                .saturating_mul(snapshot.bytes_per_block)
-        };
         let Some(snapshot) = self.inner.scheduler_cache_snapshot()? else {
             return Ok(true);
         };
@@ -113,27 +108,14 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 .scheduled_recurrent_bytes()
                 .saturating_sub(self.inner.recurrent_state_bytes().saturating_mul(owned)),
         );
-        let free = available(&snapshot);
-        if need <= free {
-            return Ok(true);
-        }
-        if snapshot.blocks.total_blocks >= snapshot.max_total_blocks {
-            return Ok(false);
-        }
-        let shortfall_blocks = (need - free)
-            .div_ceil(snapshot.bytes_per_block.max(1))
-            .min(u64::from(u32::MAX)) as u32;
-        if !self
-            .inner
-            .paged_adapter_mut()
-            .is_some_and(|adapter| adapter.try_grow_pool(shortfall_blocks))
-        {
-            return Ok(false);
-        }
-        Ok(self
-            .inner
-            .scheduler_cache_snapshot()?
-            .is_some_and(|grown| need <= available(&grown)))
+        let ungrown = snapshot
+            .max_total_blocks
+            .saturating_sub(snapshot.blocks.total_blocks);
+        let available = u64::from(snapshot.blocks.free_blocks)
+            .saturating_add(u64::from(snapshot.blocks.reclaimable_blocks))
+            .saturating_add(u64::from(ungrown))
+            .saturating_mul(snapshot.bytes_per_block);
+        Ok(need <= available)
     }
 
     pub(super) fn execute_speculative_rows(
