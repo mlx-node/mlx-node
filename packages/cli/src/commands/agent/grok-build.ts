@@ -1911,6 +1911,12 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
       for (const name of LOCAL_BACKEND_DISABLED_TOOL_ENV) env[name] ??= '0';
     }
 
+    // A startup signal latched the teardown, which never signals an agent
+    // spawned after it: grok would outlive the launcher.
+    if (tearingDown) {
+      await tearingDown;
+      throw new Error('mlx agent: signaled during startup');
+    }
     const spawnAgent = opts.spawnAgent ?? ((b, a, so) => spawn(b, a, so));
     const spawnedAgent = spawnAgent(bin, opts.argv, { stdio: 'inherit', env });
     agent = spawnedAgent;

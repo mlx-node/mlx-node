@@ -2124,6 +2124,8 @@ describe('launchGrokAgent server gating', () => {
    * Run the launcher in its own process against a fake serve stuck in the
    * preload wait. `ignoreSignals` makes serve model a graceful shutdown that
    * never finishes (a preload `host.close()` awaits with no deadline).
+   * `readyOnSignal` makes serve ignore the signal and report the model
+   * resident only after it.
    */
   async function launchDuringPreload(
     signal: NodeJS.Signals,
@@ -2132,23 +2134,34 @@ describe('launchGrokAgent server gating', () => {
       graceMs,
       banner = true,
       readyTimeoutMs,
-    }: { ignoreSignals: boolean; graceMs?: number; banner?: boolean; readyTimeoutMs?: number },
-  ): Promise<{ exitSignal: NodeJS.Signals | null; serveDeadAtExit: boolean; serveDeadAfter: boolean }> {
+      readyOnSignal = false,
+    }: { ignoreSignals: boolean; graceMs?: number; banner?: boolean; readyTimeoutMs?: number; readyOnSignal?: boolean },
+  ): Promise<{
+    exitSignal: NodeJS.Signals | null;
+    serveDeadAtExit: boolean;
+    serveDeadAfter: boolean;
+    agentStarted: boolean;
+  }> {
     const dir = mkdtempSync(join(tmpdir(), 'launch-grok-signal-'));
     const pidFile = join(dir, 'serve.pid');
     const polledFile = join(dir, 'polled');
+    const agentStartedFile = join(dir, 'agent-started');
     const fakeServe = join(dir, 'fake-serve.mjs');
     writeFileSync(
       fakeServe,
       `import { createServer } from 'node:http';
 import { writeFileSync } from 'node:fs';
+let ready = false;
 ${ignoreSignals ? "process.on('SIGINT', () => {});\nprocess.on('SIGTERM', () => {});" : ''}
+${readyOnSignal ? "process.on('SIGINT', () => { ready = true; });\nprocess.on('SIGTERM', () => { ready = true; });" : ''}
 const server = createServer((req, res) => {
   const authorized = req.headers.authorization !== undefined;
   if (authorized) writeFileSync(${JSON.stringify(polledFile)}, '');
   res.setHeader('content-type', 'application/json');
   res.end(JSON.stringify(authorized
-    ? { status: 'loading', models: { resident: [] }, work: { writerActive: true, waitingWriters: 0 }, lastLoad: null }
+    ? ready
+      ? { status: 'ok', models: { resident: ['qwen-local'] }, work: { writerActive: false, waitingWriters: 0 }, lastLoad: { label: 'qwen-local', ok: true } }
+      : { status: 'loading', models: { resident: [] }, work: { writerActive: true, waitingWriters: 0 }, lastLoad: null }
     : { status: 'ok' }));
 });
 server.listen(0, '127.0.0.1', () => {
@@ -2172,6 +2185,7 @@ server.listen(0, '127.0.0.1', () => {
         '--input-type=module',
         '-e',
         `import { spawn } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
 const { launchGrokAgent } = await import(${JSON.stringify(grokBuild)});
 // Like cli.ts: a launcher that throws exits the process.
 await launchGrokAgent({
@@ -2181,7 +2195,10 @@ await launchGrokAgent({
   ${graceMs === undefined ? '' : `serveStopGraceMs: ${graceMs},`}
   ${readyTimeoutMs === undefined ? '' : `serveReadyTimeoutMs: ${readyTimeoutMs},`}
   spawnServe: (_argv, so) => spawn(process.execPath, [${JSON.stringify(fakeServe)}], so),
-  spawnAgent: () => { throw new Error('grok must not start during the preload'); },
+  spawnAgent: () => {
+    writeFileSync(${JSON.stringify(agentStartedFile)}, '');
+    throw new Error('grok must not start during the preload');
+  },
 }).catch((err) => { console.error(err); process.exit(1); });`,
       ],
       { env: launcherEnv, stdio: ['ignore', 'ignore', 'pipe'] },
@@ -2218,7 +2235,12 @@ await launchGrokAgent({
       for (let i = 0; i < 200 && alive(servePid); i++) {
         await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
       }
-      return { exitSignal, serveDeadAtExit, serveDeadAfter: !alive(servePid) };
+      return {
+        exitSignal,
+        serveDeadAtExit,
+        serveDeadAfter: !alive(servePid),
+        agentStarted: existsSync(agentStartedFile),
+      };
     } finally {
       launcher.kill('SIGKILL');
       if (servePid !== undefined && alive(servePid)) process.kill(servePid, 'SIGKILL');
@@ -2257,5 +2279,14 @@ await launchGrokAgent({
     });
     expect(result.exitSignal).toBe('SIGTERM');
     expect(result.serveDeadAtExit).toBe(true);
+  });
+
+  // Mutation: drop the teardown check before spawnAgent → red (grok starts
+  // after the signal and is never signaled).
+  it('never starts the agent when the preload settles after a signal', { timeout: 30_000 }, async () => {
+    const result = await launchDuringPreload('SIGTERM', { ignoreSignals: false, readyOnSignal: true, graceMs: 1_500 });
+    expect(result.exitSignal).toBe('SIGTERM');
+    expect(result.serveDeadAtExit).toBe(true);
+    expect(result.agentStarted).toBe(false);
   });
 });
