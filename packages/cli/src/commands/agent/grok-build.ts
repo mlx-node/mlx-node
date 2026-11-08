@@ -81,6 +81,8 @@ export interface GrokAgentLaunchOptions {
   serveReadyTimeoutMs?: number;
   /** Test seam: `GET /health` poll interval while the preload runs (default 250 ms). */
   preloadPollMs?: number;
+  /** Test seam: how long a signaled serve may take to exit before SIGKILL. */
+  serveStopGraceMs?: number;
   /** Test seam: serve URL already running — skip spawning `mlx serve`. */
   serveUrl?: string;
   /** Test seam: serve auth token to use with `serveUrl`. */
@@ -1827,6 +1829,29 @@ function waitForServe(child: ChildProcess, timeoutMs: number): Promise<string> {
 export const LOCAL_BACKEND_DISABLED_TOOL_ENV = ['GROK_IMAGE_GEN', 'GROK_IMAGE_EDIT', 'GROK_VIDEO_GEN'] as const;
 
 /**
+ * Serve's graceful shutdown awaits in-flight model loads with no deadline
+ * (only its server close is capped at 5 s), so a signaled serve gets this
+ * long before SIGKILL.
+ */
+const SERVE_STOP_GRACE_MS = 10_000;
+
+/** Signal serve, wait up to `graceMs` for it to exit, then SIGKILL it and wait. */
+async function stopServe(child: ChildProcess, signal: NodeJS.Signals, graceMs: number): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise<void>((resolvePromise) => child.once('exit', () => resolvePromise()));
+  child.kill(signal);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const graceOver = new Promise<'grace'>((resolvePromise) => {
+    timer = setTimeout(() => resolvePromise('grace'), graceMs);
+  });
+  const first = await Promise.race([exited, graceOver]);
+  clearTimeout(timer);
+  if (first !== 'grace') return;
+  child.kill('SIGKILL');
+  await exited;
+}
+
+/**
  * Boot the inference host and exec the Grok Build binary over it.
  * Resolves with the agent's exit code; `run()` maps it to process.exitCode.
  */
@@ -1841,16 +1866,19 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
   // Ctrl+C forwards to the TUI; the agent's exit then drives ours, so the
   // serve child is reaped in the finally below. SIGTERM/SIGHUP end the
   // process through the default disposition — which never reaches children.
-  // Tear both down, then re-raise so the launcher still dies with the same
-  // signal (process.once has already detached us). Installed before serve
-  // spawns: its preload wait has no timeout, and a signal then must not
-  // leave serve holding the model.
+  // Tear both down, wait for serve to exit, then re-raise so the launcher
+  // still dies with the same signal (process.once has already detached us).
+  // Installed before serve spawns: its preload wait has no timeout, and a
+  // signal then must not leave serve holding the model.
   let serveChild: ChildProcess | undefined;
   let agent: ChildProcess | undefined;
+  let tearingDown: Promise<void> | undefined;
   const teardown = (signal: NodeJS.Signals): void => {
-    serveChild?.kill(signal);
-    agent?.kill(signal);
-    process.kill(process.pid, signal);
+    tearingDown ??= (async () => {
+      agent?.kill(signal);
+      if (serveChild) await stopServe(serveChild, signal, opts.serveStopGraceMs ?? SERVE_STOP_GRACE_MS);
+      process.kill(process.pid, signal);
+    })();
   };
   const forward = (): void => {
     if (agent) agent.kill('SIGINT');
@@ -1896,7 +1924,10 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
     process.removeListener('SIGINT', forward);
     process.removeListener('SIGTERM', teardown);
     process.removeListener('SIGHUP', teardown);
-    serveChild?.kill('SIGTERM');
+    // A signal ends the launcher once serve is gone; returning or throwing
+    // first would let the caller exit with serve still alive.
+    if (tearingDown) await tearingDown;
+    else serveChild?.kill('SIGTERM');
   }
   return code;
 }
