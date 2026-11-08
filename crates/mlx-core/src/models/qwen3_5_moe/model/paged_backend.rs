@@ -193,23 +193,37 @@ impl PagedBackend for Qwen35MoeInner {
             }
         }
         if self.active_scheduled_seq.is_none() {
-            crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(self, plan);
-        }
-        let turn_plan = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?
-            .prepare_turn_per_block_with_max_cache_hit_tokens(
-                seq_id,
+            crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(
+                self,
                 plan,
-                total_budget,
-                true,
                 &lookup_extra_keys,
                 cache_salt,
-                false,
-                max_cache_hit_tokens,
-            )
-            .map_err(Error::from_reason)?;
+            );
+        }
+        let turn_plan = crate::models::qwen3_5::dflash2_turn::reclaiming(
+            self,
+            crate::models::qwen3_5::dflash2_turn::Keep {
+                tokens: plan,
+                keys: Some((lookup_extra_keys.as_slice(), cache_salt)),
+            },
+            |inner| {
+                inner
+                    .paged_adapter
+                    .as_mut()
+                    .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?
+                    .prepare_turn_per_block_with_max_cache_hit_tokens(
+                        seq_id,
+                        plan,
+                        total_budget,
+                        true,
+                        &lookup_extra_keys,
+                        cache_salt,
+                        false,
+                        max_cache_hit_tokens,
+                    )
+                    .map_err(Error::from_reason)
+            },
+        )?;
         let cached_prefix_len = turn_plan.cached_prefix_len;
         let continued_live_prefix = turn_plan.continued_live_prefix;
         if trace_enabled {
@@ -391,10 +405,17 @@ impl PagedBackend for Qwen35MoeInner {
         // surface as a turn error and invalidate the paged session.
         let rows = u32::try_from(crate::engine::mtp_turn::turn_lookahead_rows(plan, p))
             .unwrap_or(u32::MAX);
-        let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-            Error::from_reason("MoE paged speculative admission: paged_adapter is None")
-        })?;
-        match adapter.reserve_rows(rows) {
+        let reserved = crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(self, |inner| {
+            inner
+                .paged_adapter
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::from_reason("MoE paged speculative admission: paged_adapter is None")
+                })?
+                .reserve_rows(rows)
+                .map_err(Error::from_reason)
+        });
+        match reserved.map_err(|error| error.reason) {
             Ok(_) => Ok(true),
             Err(e) if e.starts_with("context_length_exceeded:") => {
                 tracing::warn!(

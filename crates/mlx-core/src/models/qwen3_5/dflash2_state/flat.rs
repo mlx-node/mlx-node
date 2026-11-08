@@ -2,6 +2,9 @@
 //! state owns the flat caches and draft window it was moved out of; nothing
 //! else holds a handle a later turn could write through.
 
+use std::sync::Arc;
+
+use mlx_paged_attn::CacheRecency;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
@@ -175,14 +178,20 @@ pub(crate) struct FlatStates {
     pub(crate) store: HybridStateStore<FlatBacking>,
     pub(crate) live_salt: u64,
     pub(crate) live_anchor: Option<Anchor<FlatAnchor>>,
+    /// Stamp of the live state's last use (its turn end or install); a park
+    /// keeps it.
+    pub(crate) live_last_used: u64,
 }
 
 impl FlatStates {
-    pub(crate) fn new(block_size: u32) -> Self {
+    pub(crate) fn new(block_size: u32, recency: Arc<CacheRecency>) -> Self {
+        let mut store = HybridStateStore::new(block_size);
+        store.share_recency(recency);
         Self {
-            store: HybridStateStore::new(block_size),
+            store,
             live_salt: 0,
             live_anchor: None,
+            live_last_used: 0,
         }
     }
 
@@ -194,8 +203,9 @@ impl FlatStates {
 
     /// Moves the store out, leaving an empty one with the same geometry.
     pub(crate) fn take_store(&mut self) -> HybridStateStore<FlatBacking> {
-        let empty =
+        let mut empty =
             HybridStateStore::with_state_budget(self.store.block_size(), self.store.state_budget());
+        empty.share_recency(self.store.recency());
         std::mem::replace(&mut self.store, empty)
     }
 }

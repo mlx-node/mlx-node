@@ -195,23 +195,37 @@ impl PagedBackend for Qwen35Inner {
             }
         }
         if self.active_scheduled_seq.is_none() {
-            crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(self, plan);
-        }
-        let turn_plan = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?
-            .prepare_turn_per_block_with_max_cache_hit_tokens(
-                seq_id,
+            crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(
+                self,
                 plan,
-                total_budget,
-                true,
                 &lookup_extra_keys,
                 cache_salt,
-                false,
-                max_cache_hit_tokens,
-            )
-            .map_err(Error::from_reason)?;
+            );
+        }
+        let turn_plan = crate::models::qwen3_5::dflash2_turn::reclaiming(
+            self,
+            crate::models::qwen3_5::dflash2_turn::Keep {
+                tokens: plan,
+                keys: Some((lookup_extra_keys.as_slice(), cache_salt)),
+            },
+            |inner| {
+                inner
+                    .paged_adapter
+                    .as_mut()
+                    .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?
+                    .prepare_turn_per_block_with_max_cache_hit_tokens(
+                        seq_id,
+                        plan,
+                        total_budget,
+                        true,
+                        &lookup_extra_keys,
+                        cache_salt,
+                        false,
+                        max_cache_hit_tokens,
+                    )
+                    .map_err(Error::from_reason)
+            },
+        )?;
         let cached_prefix_len = turn_plan.cached_prefix_len;
         let continued_live_prefix = turn_plan.continued_live_prefix;
         if trace_enabled {

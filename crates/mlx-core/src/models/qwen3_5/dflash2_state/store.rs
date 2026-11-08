@@ -11,6 +11,9 @@
 //! Every byte the store holds is an MLX array the allocator already counts, so
 //! nothing here registers with `cache_limit::coordinator()`.
 
+use std::sync::Arc;
+
+use mlx_paged_attn::CacheRecency;
 use napi::bindgen_prelude::*;
 
 use super::trace::HitKind;
@@ -101,6 +104,23 @@ pub(crate) struct EntryKey {
 }
 
 pub(crate) type EntryId = u64;
+
+/// One lossy step of the eviction ladder on one entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct StoreStep {
+    pub(crate) entry: EntryId,
+    pub(crate) kind: StoreStepKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum StoreStepKind {
+    /// Shrink an end state's KV to its anchor and drop the end.
+    Demote {
+        row: usize,
+    },
+    DropCapture,
+    DropEnd,
+}
 
 pub(crate) struct Entry<B: Backing> {
     id: EntryId,
@@ -339,7 +359,7 @@ pub(crate) struct HybridStateStore<B: Backing> {
     entries: Vec<Entry<B>>,
     evicted: std::collections::VecDeque<EvictedPoint>,
     next_id: EntryId,
-    tick: u64,
+    recency: Arc<CacheRecency>,
 }
 
 impl<B: Backing> HybridStateStore<B> {
@@ -356,8 +376,18 @@ impl<B: Backing> HybridStateStore<B> {
             entries: Vec::new(),
             evicted: std::collections::VecDeque::new(),
             next_id: 1,
-            tick: 0,
+            recency: Arc::new(CacheRecency::new()),
         }
+    }
+
+    /// Stamp from `recency` from now on, the clock the model's other caches
+    /// share.
+    pub(crate) fn share_recency(&mut self, recency: Arc<CacheRecency>) {
+        self.recency = recency;
+    }
+
+    pub(crate) fn recency(&self) -> Arc<CacheRecency> {
+        Arc::clone(&self.recency)
     }
 
     pub(crate) fn block_size(&self) -> u32 {
@@ -418,6 +448,18 @@ impl<B: Backing> HybridStateStore<B> {
     /// Adds an entry. An entry with an end state drops every older end-state
     /// entry whose whole lineage it extends.
     pub(crate) fn insert(&mut self, lineage: Lineage<'_>, parts: EntryParts<B>) -> Result<EntryId> {
+        let last_used = self.recency.next();
+        self.insert_at(lineage, parts, last_used)
+    }
+
+    /// [`Self::insert`] keeping `last_used`: a parked live state keeps the
+    /// stamp of the turn that ended it.
+    pub(crate) fn insert_at(
+        &mut self,
+        lineage: Lineage<'_>,
+        parts: EntryParts<B>,
+        last_used: u64,
+    ) -> Result<EntryId> {
         if parts.end.is_none() && parts.anchor.is_none() {
             return Err(Error::from_reason(
                 "DFlash2 state entry holds neither an end state nor an anchor",
@@ -434,7 +476,6 @@ impl<B: Backing> HybridStateStore<B> {
             self.entries
                 .retain(|old| old.end.is_none() || !old.is_prefix_of(&key));
         }
-        self.tick += 1;
         let id = self.next_id;
         self.next_id += 1;
         let mut entry = Entry {
@@ -448,7 +489,7 @@ impl<B: Backing> HybridStateStore<B> {
             kv: parts.kv,
             state_bytes: 0,
             kv_bytes: 0,
-            last_used: self.tick,
+            last_used,
         };
         entry.refresh_bytes();
         self.entries.push(entry);
@@ -461,20 +502,12 @@ impl<B: Backing> HybridStateStore<B> {
             .position(id)
             .ok_or_else(|| Error::from_reason(format!("DFlash2 state entry {id} is gone")))?;
         self.validate_anchor(anchor.row, self.entries[idx].tokens.len())?;
-        self.tick += 1;
+        let last_used = self.recency.next();
         let entry = &mut self.entries[idx];
         entry.anchor = Some(anchor);
-        entry.last_used = self.tick;
+        entry.last_used = last_used;
         entry.refresh_bytes();
         Ok(())
-    }
-
-    pub(crate) fn touch(&mut self, id: EntryId) {
-        self.tick += 1;
-        let tick = self.tick;
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
-            entry.last_used = tick;
-        }
     }
 
     /// Removes the entry so its buffers can move into the live state.
@@ -683,87 +716,141 @@ impl<B: Backing> HybridStateStore<B> {
 
     /// Frees parked KV by one step of the [`Self::evict_for`] ladder, for a
     /// caller that re-reads the live headroom and retries after each step:
-    /// compact one end state's KV slack, else demote one end state whose KV
-    /// shrinks to its anchor, else drop one capture, else drop one end
-    /// state, each least recently used first and holding KV. A copy runs
-    /// only when `kv_headroom` covers it. `None` when no step frees KV;
-    /// `pinned` is never touched.
+    /// [`Self::compact_one`], else [`Self::next_lossy`]'s step. `None` when
+    /// no step frees KV; `pinned` is never touched.
     pub(crate) fn evict_one(
         &mut self,
         kv_headroom: u64,
         pinned: Option<EntryId>,
     ) -> Result<Option<EvictReport>> {
-        let start = self.bytes();
-        let mut report = EvictReport::default();
+        if let Some(report) = self.compact_one(kv_headroom, pinned)? {
+            return Ok(Some(report));
+        }
+        match self.next_lossy(kv_headroom, pinned) {
+            Some((_, step)) => self.apply_lossy(step).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Compacts one end state's KV slack, least recently used first, when
+    /// `kv_headroom` covers the copy. Loses nothing.
+    pub(crate) fn compact_one(
+        &mut self,
+        kv_headroom: u64,
+        pinned: Option<EntryId>,
+    ) -> Result<Option<EvictReport>> {
         let fits = |plan: &Shrink| plan.frees > 0 && plan.transient <= kv_headroom;
         let compact = self.lru_ids(true, pinned).into_iter().find_map(|id| {
             let idx = self.position(id)?;
             let kv = self.entries[idx].kv.as_ref()?;
             kv.shrink_plan(kv.rows()).filter(fits).map(|_| idx)
         });
-        let demote = || {
-            self.lru_ids(true, pinned).into_iter().find_map(|id| {
-                let idx = self.position(id)?;
-                let entry = &self.entries[idx];
-                let row = entry.anchor.as_ref()?.row;
-                let shrinks = entry
-                    .kv
-                    .as_ref()
-                    .and_then(|kv| kv.shrink_plan(row))
-                    .filter(fits)
-                    .is_some();
-                shrinks.then_some((idx, row))
-            })
+        let Some(idx) = compact else {
+            return Ok(None);
         };
-        if let Some(idx) = compact {
-            let entry = &mut self.entries[idx];
-            if let Some(kv) = entry.kv.as_mut() {
-                let rows = kv.rows();
-                kv.shrink(rows)?;
-            }
-            entry.refresh_bytes();
-            report.compacted = 1;
-        } else if let Some((idx, row)) = demote() {
-            let end_depth = self.entries[idx].tokens.len();
-            self.remember_evicted(idx, end_depth);
-            let entry = &mut self.entries[idx];
-            entry.end = None;
-            if let Some(kv) = entry.kv.as_mut() {
-                kv.shrink(row)?;
-            }
-            entry.tokens.truncate(row);
-            entry.chain.truncate(row / entry.block_size as usize);
-            entry.refresh_bytes();
-            report.demoted = 1;
-        } else {
-            let victim = [false, true].into_iter().find_map(|ends| {
+        let start = self.bytes();
+        let entry = &mut self.entries[idx];
+        if let Some(kv) = entry.kv.as_mut() {
+            let rows = kv.rows();
+            kv.shrink(rows)?;
+        }
+        entry.refresh_bytes();
+        let end = self.bytes();
+        Ok(Some(EvictReport {
+            compacted: 1,
+            freed_state_bytes: start.state_bytes.saturating_sub(end.state_bytes),
+            freed_kv_bytes: start.kv_bytes.saturating_sub(end.kv_bytes),
+            ..EvictReport::default()
+        }))
+    }
+
+    /// The next lossy step and its entry's `last_used`: demote one end
+    /// state whose KV shrinks to its anchor, else drop one capture, else
+    /// drop one end state, each least recently used first and holding KV.
+    pub(crate) fn next_lossy(
+        &self,
+        kv_headroom: u64,
+        pinned: Option<EntryId>,
+    ) -> Option<(u64, StoreStep)> {
+        let fits = |plan: &Shrink| plan.frees > 0 && plan.transient <= kv_headroom;
+        let demote = self.lru_ids(true, pinned).into_iter().find_map(|id| {
+            let entry = &self.entries[self.position(id)?];
+            let row = entry.anchor.as_ref()?.row;
+            let shrinks = entry
+                .kv
+                .as_ref()
+                .and_then(|kv| kv.shrink_plan(row))
+                .filter(fits)
+                .is_some();
+            shrinks.then_some((
+                entry.last_used,
+                StoreStep {
+                    entry: id,
+                    kind: StoreStepKind::Demote { row },
+                },
+            ))
+        });
+        demote.or_else(|| {
+            [false, true].into_iter().find_map(|ends| {
                 self.lru_ids(ends, pinned).into_iter().find_map(|id| {
-                    let idx = self.position(id)?;
-                    let entry = &self.entries[idx];
-                    (entry.kv_bytes > 0).then_some((idx, ends))
+                    let entry = &self.entries[self.position(id)?];
+                    (entry.kv_bytes > 0).then_some((
+                        entry.last_used,
+                        StoreStep {
+                            entry: id,
+                            kind: if ends {
+                                StoreStepKind::DropEnd
+                            } else {
+                                StoreStepKind::DropCapture
+                            },
+                        },
+                    ))
                 })
-            });
-            let Some((idx, ends)) = victim else {
-                return Ok(None);
-            };
-            let points: Vec<usize> = self.entries[idx]
-                .resume_points()
-                .map(|(_, depth)| depth)
-                .collect();
-            for depth in points {
-                self.remember_evicted(idx, depth);
+            })
+        })
+    }
+
+    /// Applies a step [`Self::next_lossy`] returned.
+    pub(crate) fn apply_lossy(&mut self, step: StoreStep) -> Result<EvictReport> {
+        let idx = self.position(step.entry).ok_or_else(|| {
+            Error::from_reason(format!("DFlash2 state entry {} is gone", step.entry))
+        })?;
+        let start = self.bytes();
+        let mut report = EvictReport::default();
+        match step.kind {
+            StoreStepKind::Demote { row } => {
+                let end_depth = self.entries[idx].tokens.len();
+                self.remember_evicted(idx, end_depth);
+                let entry = &mut self.entries[idx];
+                entry.end = None;
+                if let Some(kv) = entry.kv.as_mut() {
+                    kv.shrink(row)?;
+                }
+                entry.tokens.truncate(row);
+                entry.chain.truncate(row / entry.block_size as usize);
+                entry.refresh_bytes();
+                report.demoted = 1;
             }
-            self.entries.remove(idx);
-            if ends {
-                report.dropped_ends = 1;
-            } else {
-                report.dropped_captures = 1;
+            StoreStepKind::DropCapture | StoreStepKind::DropEnd => {
+                let points: Vec<usize> = self.entries[idx]
+                    .resume_points()
+                    .map(|(_, depth)| depth)
+                    .collect();
+                for depth in points {
+                    self.remember_evicted(idx, depth);
+                }
+                self.entries.remove(idx);
+                if step.kind == StoreStepKind::DropEnd {
+                    report.dropped_ends = 1;
+                } else {
+                    report.dropped_captures = 1;
+                }
             }
         }
         let end = self.bytes();
         report.freed_state_bytes = start.state_bytes.saturating_sub(end.state_bytes);
         report.freed_kv_bytes = start.kv_bytes.saturating_sub(end.kv_bytes);
-        Ok(Some(report))
+        Ok(report)
     }
 
     /// Drops every entry and every remembered eviction (`ResetScope::Command`).
@@ -996,22 +1083,45 @@ mod tests {
         assert!(found.beats_live(Some(63)));
         assert!(found.beats_live(None));
 
+        let newer = store.recency().next() + 10;
         let c1 = store
-            .insert(Lineage::text(&longer, 0), fx.capture("c1", 32))
+            .insert_at(Lineage::text(&longer, 0), fx.capture("c1", 32), newer)
             .unwrap();
-        let c2 = store
+        store
             .insert(Lineage::text(&longer, 0), fx.capture("c2", 32))
             .unwrap();
         let probe = fork(&longer, 40, 80, 5);
         assert_eq!(
             store.lookup(Lineage::text(&probe, 0), |_| true).unwrap().id,
-            c2
-        );
-        store.touch(c1);
-        assert_eq!(
-            store.lookup(Lineage::text(&probe, 0), |_| true).unwrap().id,
             c1
         );
+    }
+
+    /// A parked live state keeps the stamp of the turn that ended it, so it
+    /// ranks older than an entry inserted after that turn.
+    /// Mutation: stamp `self.recency.next()` in `insert_at` → red.
+    #[test]
+    fn park_keeps_the_turn_end_stamp() {
+        let fx = Fixture::new();
+        let mut store = Store::with_state_budget(BS, u64::MAX);
+        let parked_tokens = lineage(1, 64);
+        let other_tokens = lineage(2, 64);
+        let turn_end = store.recency().next();
+        store
+            .insert(
+                Lineage::text(&other_tokens, 0),
+                fx.end("other", &other_tokens, None, 0),
+            )
+            .unwrap();
+        let parked = store
+            .insert_at(
+                Lineage::text(&parked_tokens, 0),
+                fx.end("parked", &parked_tokens, None, 0),
+                turn_end,
+            )
+            .unwrap();
+        let (stamp, step) = store.next_lossy(0, None).expect("a lossy step");
+        assert_eq!((stamp, step.entry), (turn_end, parked));
     }
 
     #[test]
@@ -1084,7 +1194,6 @@ mod tests {
                 .id,
             sub_id
         );
-        store.touch(main_id);
         assert_eq!(
             store
                 .lookup(Lineage::text(&sub_next, 0), |_| true)

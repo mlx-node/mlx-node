@@ -82,6 +82,7 @@ fn dirty_latch_refuses_history_checkpoint_persist() {
         image_key: None,
         tokens: vec![1, 2],
         caches: fresh_dense_layer_caches(&inner.config),
+        last_used: 0,
     });
     inner.paged_gdn_state_dirty = true;
 

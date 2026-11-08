@@ -64,8 +64,11 @@ impl Qwen35MoeInner {
         );
 
         let dflash2_prefix = PrefixTracker::new(config.paged_block_size());
-        let dflash2_states =
-            crate::models::qwen3_5::dflash2_state::flat::FlatStates::new(config.paged_block_size());
+        let cache_recency = Arc::new(mlx_paged_attn::CacheRecency::new());
+        let dflash2_states = crate::models::qwen3_5::dflash2_state::flat::FlatStates::new(
+            config.paged_block_size(),
+            Arc::clone(&cache_recency),
+        );
         Ok(Self {
             config,
             source_moe_policy: Default::default(),
@@ -84,6 +87,7 @@ impl Qwen35MoeInner {
             dflash2_turn_state: None,
             dflash2_prefix,
             dflash2_states,
+            cache_recency,
             dflash2_window: None,
             paged_pool_budget_blocks: None,
             dflash2_flat_lane_authoritative: false,
@@ -104,6 +108,8 @@ impl Qwen35MoeInner {
             gdn_root_cache_owner_is_explicit: false,
             gdn_prefix_checkpoints: VecDeque::new(),
             gdn_last_history_checkpoint: None,
+            gdn_in_use: HashMap::new(),
+            gdn_restored_from: None,
             paged_finalize_failed: false,
             paged_mtp_last_rollback_unemitted: 0,
             paged_mtp_gdn_rewinds: 0,
@@ -265,11 +271,14 @@ impl Qwen35MoeInner {
                     initial_mb.unwrap_or(0)
                 ))
             })?;
-        let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-            num_blocks,
-            max_num_blocks,
-            block_size,
-        )));
+        let allocator = Arc::new(std::sync::Mutex::new(
+            mlx_paged_attn::BlockAllocator::with_recency(
+                num_blocks,
+                max_num_blocks,
+                block_size,
+                Arc::clone(&self.cache_recency),
+            ),
+        ));
         let pool =
             mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, max_num_blocks, cache_dtype)
                 .map_err(|e| {
@@ -1006,6 +1015,9 @@ impl Qwen35MoeInner {
         self.cached_rope_deltas = None;
         self.gdn_prefix_checkpoints.clear();
         self.gdn_last_history_checkpoint = None;
+        self.gdn_in_use.clear();
+        self.gdn_restored_from = None;
+        self.sync_gdn_state_marks();
         self.gdn_root_cache_owner_id = None;
         self.gdn_root_cache_owner_is_explicit = false;
         self.paged_finalize_failed = false;

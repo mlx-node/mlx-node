@@ -1216,6 +1216,7 @@ fn test_dense_gdn_root_rotation_and_legacy_retention_policy() {
                 block_hashes: vec![marker as u64],
                 tokens,
                 caches: Vec::new(),
+                last_used: 0,
             });
         inner.prune_dense_gdn_prefix_checkpoints();
     }
@@ -1307,6 +1308,7 @@ fn dense_gdn_retention_follows_the_installed_cold_sidecar_policy() {
                     block_hashes,
                     tokens: tokens[..prefix_len as usize].to_vec(),
                     caches: Vec::new(),
+                    last_used: 0,
                 });
             inner.prune_dense_gdn_prefix_checkpoints();
         }
@@ -1365,6 +1367,7 @@ fn test_dense_ladder_survives_sibling_owners_through_the_model_call_site() {
                 block_hashes: (1..=u64::from(blocks)).collect(),
                 tokens: (0..blocks * 16).collect(),
                 caches: Vec::new(),
+                last_used: 0,
             });
         inner.prune_dense_gdn_prefix_checkpoints();
     }
@@ -3286,6 +3289,48 @@ fn paged_mtp_lookahead_reservation_covers_verify() {
         inner.paged_adapter.is_some(),
         "the adapter stays on the model for the whole speculative turn"
     );
+}
+
+/// The serial MTP gate at the cap reclaims a ladder chain before it falls
+/// back to AR decode.
+/// Mutation: drop the `paged_step_reclaiming` wrapper in
+/// `reserve_paged_mtp_lookahead` → red (`Ok(false)`).
+#[test]
+fn mtp_gate_at_the_cap_reclaims_before_falling_back() {
+    use crate::engine::types::ChatConfig;
+
+    let mut cfg = tiny_paged_forward_cfg();
+    cfg.n_mtp_layers = 1;
+    let Some((mut inner, _cfg)) =
+        paged_inner_with_cfg_or_skip("mtp_gate_at_the_cap_reclaims_before_falling_back", cfg)
+    else {
+        return;
+    };
+    inner.mtp_weights_loaded = true;
+    super::dflash2_park_tests::install_pool(&mut inner, 2, 2, std::sync::Arc::new(Ok))
+        .expect("capped pool");
+    let block_size = inner.paged_adapter.as_ref().expect("adapter").block_size();
+    let chain: Vec<u32> = (0..2 * block_size).map(|i| (i * 5 + 7) % 257).collect();
+    let hashes = super::dflash2_park_tests::cache_chain(&inner, &chain);
+    let stamp = inner.cache_recency.next();
+    inner.push_ladder_entry_for_test(chain.len() as u32, hashes, chain, Vec::new(), stamp);
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .reset_for_new_request(0)
+        .expect("reset request");
+    let mut p = extract_chat_params(&ChatConfig {
+        enable_mtp: Some(true),
+        ..ChatConfig::default()
+    });
+    p.mtp_depth = 1;
+    assert!(
+        inner
+            .reserve_paged_mtp_lookahead(&p, "cap_gate_test")
+            .expect("the gate never errors on exhaustion")
+    );
+    assert!(inner.ladder_entries_for_test().is_empty());
 }
 
 /// Failure path of the same seam: a reservation the pool cannot hold

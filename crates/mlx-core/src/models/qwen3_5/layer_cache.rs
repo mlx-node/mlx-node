@@ -15,6 +15,18 @@ pub enum Qwen3_5LayerCache {
 }
 
 impl Qwen3_5LayerCache {
+    /// Bytes of every linear layer's arrays in `caches`, by their real dtype.
+    pub(crate) fn linear_state_bytes(caches: &[Self]) -> u64 {
+        caches
+            .iter()
+            .filter_map(|cache| match cache {
+                Self::Linear(arrays) => Some(arrays),
+                Self::FullAttention(_) => None,
+            })
+            .flat_map(|arrays| (0..arrays.len()).filter_map(|idx| arrays.get(idx)))
+            .fold(0u64, |sum, array| sum.saturating_add(array.nbytes() as u64))
+    }
+
     /// Create a cache for a linear attention layer.
     pub fn new_linear() -> Self {
         Self::Linear(ArraysCache::new(2)) // 2 slots: conv_state, recurrent_state

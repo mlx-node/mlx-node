@@ -1257,6 +1257,31 @@ impl DFlash2Target for Qwen35Inner {
         self.paged_full_attn_caches_dirty = false;
         self.flat_mtp_caches_desynced = false;
     }
+
+    fn oldest_gdn_state(
+        &self,
+        at_cap: bool,
+        skip: &std::collections::HashSet<crate::engine::reclaim::UnitKey>,
+        keep: &[u32],
+    ) -> Option<crate::engine::reclaim::Unit> {
+        Self::oldest_gdn_state_unit(self, at_cap, skip, keep)
+    }
+
+    fn drop_gdn_state(&mut self, key: &crate::engine::reclaim::UnitKey) -> bool {
+        Self::drop_gdn_state(self, key)
+    }
+
+    fn sync_gdn_state_marks(&self) {
+        Self::sync_gdn_state_marks(self);
+    }
+
+    fn gdn_state_bytes(&self, keep: &[u32]) -> u64 {
+        Self::gdn_state_bytes(self, keep)
+    }
+
+    fn marked_hit_blocks(&self, keep: crate::models::qwen3_5::dflash2_turn::Keep<'_>) -> u32 {
+        Self::marked_hit_blocks(self, keep)
+    }
 }
 
 #[cfg(test)]

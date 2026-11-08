@@ -838,6 +838,31 @@ impl DFlash2Target for Qwen35MoeInner {
     fn on_flat_prefill_done(&mut self) {
         self.dflash2_flat_lane_authoritative = true;
     }
+
+    fn oldest_gdn_state(
+        &self,
+        at_cap: bool,
+        skip: &std::collections::HashSet<crate::engine::reclaim::UnitKey>,
+        keep: &[u32],
+    ) -> Option<crate::engine::reclaim::Unit> {
+        Self::oldest_gdn_state_unit(self, at_cap, skip, keep)
+    }
+
+    fn drop_gdn_state(&mut self, key: &crate::engine::reclaim::UnitKey) -> bool {
+        Self::drop_gdn_state(self, key)
+    }
+
+    fn sync_gdn_state_marks(&self) {
+        Self::sync_gdn_state_marks(self);
+    }
+
+    fn gdn_state_bytes(&self, keep: &[u32]) -> u64 {
+        Self::gdn_state_bytes(self, keep)
+    }
+
+    fn marked_hit_blocks(&self, keep: crate::models::qwen3_5::dflash2_turn::Keep<'_>) -> u32 {
+        Self::marked_hit_blocks(self, keep)
+    }
 }
 
 #[cfg(test)]
@@ -2187,9 +2212,10 @@ mod tests {
     /// live DFlash2 state, evicts one state (the least recently used), and
     /// grows on the retry; with no DFlash2 state at all the declined grow
     /// still rejects.
-    /// Mutation: skip the live-state park in `release_one_for_pool_grow` →
-    /// red. Mutation: drop every parked state at once → red
-    /// (0 ≠ 1 entries).
+    /// Mutation: skip the live-state park in MoE `reclaim_kv` (`park: false`)
+    /// → red.
+    /// Mutation: drop every parked state at once (`store.clear()` in place
+    /// of `apply_lossy` in `take_state_unit`) → red (0 ≠ 1 entries).
     #[test]
     fn scheduled_pool_grow_reclaims_one_state_per_decline() -> Result<()> {
         use crate::engine::hybrid_scheduler::tests::reserve_past_a_declined_grow;

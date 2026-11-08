@@ -326,6 +326,7 @@ impl<P> TurnState<P> {
 pub(crate) struct BlockTelemetry {
     pub total_blocks: u32,
     pub free_blocks: u32,
+    /// Cache-only blocks `allocate` may take; marked chains out.
     pub reclaimable_blocks: u32,
     pub allocated_blocks: u32,
 }
@@ -635,7 +636,7 @@ pub(crate) enum SchedulerAction<P, Exclusive, Barrier> {
         preempted: Option<PreemptedTurn<P>>,
         /// The step's only turn blocked: no other turn holds memory that
         /// could come back, so it stays running, unpreempted, for the model
-        /// to reclaim for or fail (Splash `Engine::judge`, Engine.cpp:2040-2054).
+        /// to reclaim for or fail (Splash `Engine::judge`).
         blocked_alone: Option<SeqId>,
     },
 }

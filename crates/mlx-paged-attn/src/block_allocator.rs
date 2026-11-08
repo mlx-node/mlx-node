@@ -515,6 +515,141 @@ impl BlockAllocator {
         })
     }
 
+    /// Whether `hash` is cached and only the cache holds it.
+    pub fn is_cache_only(&self, hash: u64) -> bool {
+        self.ref_count_of(hash) == Some(1)
+    }
+
+    /// Marks that are cache-only and lie in no other mark's chain: dropping
+    /// every state on one makes at least that block evictable.
+    pub fn tip_marks(&self) -> HashSet<u64> {
+        let mut covered = HashSet::new();
+        for &mark in &self.state_marks {
+            let mut hash = mark;
+            while let Some(identity) = self.prefix_cache_identities.get(&hash) {
+                let parent = identity.parent_hash;
+                if parent == 0
+                    || !self.prefix_cache.contains_key(&parent)
+                    || !covered.insert(parent)
+                {
+                    break;
+                }
+                hash = parent;
+            }
+        }
+        self.state_marks
+            .iter()
+            .copied()
+            .filter(|hash| !covered.contains(hash) && self.is_cache_only(*hash))
+            .collect()
+    }
+
+    /// Of `block_ids`, the cached cache-only blocks: (outside every marked
+    /// chain, inside one).
+    pub fn cache_only_among(&self, block_ids: &HashSet<u32>) -> (u32, u32) {
+        if block_ids.is_empty() {
+            return (0, 0);
+        }
+        let closure = self.marked_closure();
+        let mut outside = 0;
+        let mut inside = 0;
+        for (hash, block) in &self.prefix_cache {
+            if block.get_ref_count() != 1 || !block_ids.contains(&block.block_id) {
+                continue;
+            }
+            if closure.contains(hash) {
+                inside += 1;
+            } else {
+                outside += 1;
+            }
+        }
+        (outside, inside)
+    }
+
+    /// How many distinct `hashes` are cached and cache-only.
+    pub fn cache_only_count(&self, hashes: impl IntoIterator<Item = u64>) -> u32 {
+        hashes
+            .into_iter()
+            .collect::<HashSet<u64>>()
+            .into_iter()
+            .filter(|hash| self.is_cache_only(*hash))
+            .count() as u32
+    }
+
+    /// Of the leading cached hashes of `chain` (a lookup's walk), how many are
+    /// cache-only and inside a marked chain.
+    pub fn marked_hit(&self, chain: &[u64]) -> u32 {
+        if self.state_marks.is_empty() {
+            return 0;
+        }
+        let closure = self.marked_closure();
+        chain
+            .iter()
+            .take_while(|hash| self.prefix_cache.contains_key(hash))
+            .filter(|hash| self.is_cache_only(**hash) && closure.contains(hash))
+            .count() as u32
+    }
+
+    /// The cut [`Self::shrink_target`] would reach if the tables holding
+    /// `table_refs` (block id -> refs) were released: a block counts Free
+    /// when no other ref is left, CacheOnly when it is cached and only the
+    /// cache's ref is left.
+    pub fn shrink_target_as_released(
+        &self,
+        floor: u32,
+        extent: u32,
+        extents: u32,
+        table_refs: &HashMap<u32, u32>,
+    ) -> u32 {
+        let mut uses = self.slot_uses();
+        for (&block_id, block) in &self.allocated {
+            let Some(slot) = uses.get_mut(block_id as usize) else {
+                continue;
+            };
+            *slot = self.use_as_released(block_id, block, table_refs);
+        }
+        self.shrink_candidates(&uses, floor, extent, extents)
+            .first()
+            .copied()
+            .unwrap_or(self.num_blocks)
+    }
+
+    /// Of the blocks in `table_refs` (block id -> refs), those releasing
+    /// those refs would leave free or cache-only.
+    pub fn released_blocks(&self, table_refs: &HashMap<u32, u32>) -> HashSet<u32> {
+        table_refs
+            .keys()
+            .copied()
+            .filter(|block_id| {
+                self.allocated.get(block_id).is_some_and(|block| {
+                    self.use_as_released(*block_id, block, table_refs) != SlotUse::Held
+                })
+            })
+            .collect()
+    }
+
+    fn use_as_released(
+        &self,
+        block_id: u32,
+        block: &PhysicalBlock,
+        table_refs: &HashMap<u32, u32>,
+    ) -> SlotUse {
+        let released = table_refs.get(&block_id).copied().unwrap_or(0);
+        let left = block.get_ref_count().saturating_sub(released);
+        let cached = self
+            .block_hashes
+            .get(&block_id)
+            .and_then(|hash| self.prefix_cache.get(hash))
+            .is_some_and(|cached| cached.block_id == block_id);
+        if left == 0 {
+            SlotUse::Free
+        } else if cached && left == 1 {
+            SlotUse::CacheOnly
+        } else {
+            SlotUse::Held
+        }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn block_stamp(&self, hash: u64) -> Option<u64> {

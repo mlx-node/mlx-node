@@ -186,13 +186,75 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
         self.paged_adapter.as_mut()
     }
 
-    /// An idle live DFlash2 state parks first, so it is reclaimable too; a
-    /// scheduled sequence's installed history is left alone.
-    fn release_one_for_pool_grow(&mut self) -> bool {
+    /// The turn's replay point leaves InUse when it closes.
+    fn scheduled_turn_closed(&mut self, seq_id: SeqId) {
+        self.end_gdn_use(seq_id);
+    }
+
+    fn marked_hit_blocks(&self, prompt: &[u32]) -> u32 {
+        Qwen35MoeInner::marked_hit_blocks(
+            self,
+            crate::models::qwen3_5::dflash2_turn::Keep {
+                tokens: prompt,
+                keys: None,
+            },
+        )
+    }
+
+    fn reclaims_in_order(&self) -> bool {
+        true
+    }
+
+    /// A scheduled sequence's installed history is left alone.
+    fn park_idle_live_state(&mut self) {
         if self.active_scheduled_seq.is_none() {
             crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
         }
-        crate::models::qwen3_5::dflash2_turn::evict_one_parked_dflash2_for_pool_grow(self)
+    }
+
+    fn sync_state_marks(&mut self) {
+        self.sync_gdn_state_marks();
+    }
+
+    fn state_reach_bytes(&self) -> u64 {
+        crate::models::qwen3_5::dflash2_turn::state_reach_bytes(self, &[])
+    }
+
+    fn compact_one_state(&mut self) -> bool {
+        crate::models::qwen3_5::dflash2_turn::compact_one_state(self)
+    }
+
+    fn oldest_state_unit(
+        &self,
+        at_cap: bool,
+        skip: &std::collections::HashSet<crate::engine::reclaim::UnitKey>,
+    ) -> Option<crate::engine::reclaim::Unit> {
+        crate::models::qwen3_5::dflash2_turn::oldest_state_unit(self, at_cap, skip, &[])
+    }
+
+    fn take_state_unit(&mut self, key: &crate::engine::reclaim::UnitKey) -> bool {
+        crate::models::qwen3_5::dflash2_turn::take_state_unit(self, key).is_some()
+    }
+
+    /// Admission parks the idle live state first, as no scheduled sequence
+    /// holds it; its own owner loop ran before.
+    fn reclaim_kv(
+        &mut self,
+        need: crate::engine::reclaim::KvNeed,
+        keep: &[u32],
+    ) -> crate::engine::reclaim::Freed {
+        let park = self.active_scheduled_seq.is_none();
+        crate::engine::reclaim::free_for_kv(
+            &mut crate::models::qwen3_5::dflash2_turn::ModelReclaim {
+                target: self,
+                keep: crate::models::qwen3_5::dflash2_turn::Keep {
+                    tokens: keep,
+                    keys: None,
+                },
+                park,
+            },
+            need,
+        )
     }
 
     fn scheduler_books_on_demand(&self) -> bool {

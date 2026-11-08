@@ -1207,11 +1207,15 @@ impl Qwen35Inner {
         };
         let rows = u32::try_from(crate::engine::mtp_turn::turn_lookahead_rows(plan, p))
             .unwrap_or(u32::MAX);
-        let adapter = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| Error::from_reason(format!("{site}: paged_adapter is None")))?;
-        match adapter.reserve_rows(rows) {
+        let reserved = crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(self, |inner| {
+            inner
+                .paged_adapter
+                .as_mut()
+                .ok_or_else(|| Error::from_reason(format!("{site}: paged_adapter is None")))?
+                .reserve_rows(rows)
+                .map_err(Error::from_reason)
+        });
+        match reserved.map_err(|error| error.reason) {
             Ok(_) => Ok(true),
             Err(e) if e.starts_with("context_length_exceeded:") => {
                 tracing::warn!(
