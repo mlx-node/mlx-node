@@ -107,6 +107,9 @@ pub(crate) struct TurnState<P> {
     /// reservation until its owner exists.
     pub scheduled_state_bytes: u64,
     pub preemptions: u32,
+    /// Parked for an SSD restore: it holds the restore's blocks and runs once
+    /// they land, so it is another lane to a blocked turn. A victim holds none.
+    pub ssd_lane: bool,
     pub payload: P,
     arrival_order: u64,
 }
@@ -227,6 +230,7 @@ impl<P> TurnState<P> {
             recurrent_state_reservation_active: true,
             scheduled_state_bytes: 0,
             preemptions: 0,
+            ssd_lane: false,
             payload,
             arrival_order: 0,
         })
@@ -778,7 +782,8 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
     pub fn resume_may_wait(&self, resuming: &TurnState<P>) -> bool {
         !self.running.is_empty()
             || self.waiting.iter().any(|turn| {
-                turn.status != TurnStatus::Preempted && turn.arrival_order < resuming.arrival_order
+                turn.status != TurnStatus::Preempted
+                    && (turn.ssd_lane || turn.arrival_order < resuming.arrival_order)
             })
     }
 
@@ -911,6 +916,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             return Err(format!("sequence {seq_id} is not admission-waiting"));
         }
         turn.status = TurnStatus::WaitingForSsd;
+        turn.ssd_lane = true;
         self.stats.ssd_restore_waiting = self.stats.ssd_restore_waiting.saturating_add(1);
         Ok(())
     }
@@ -974,6 +980,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
     fn preempt_running_at(&mut self, index: usize) -> TurnState<P> {
         let mut victim = self.running.remove(index);
         victim.status = TurnStatus::Preempted;
+        victim.ssd_lane = false;
         victim.block_reservation_active = false;
         victim.recurrent_state_reservation_active = false;
         victim.preemptions = victim.preemptions.saturating_add(1);
@@ -1026,6 +1033,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
     /// arrival order. It cannot be admitted until `ready_preempted` succeeds.
     pub fn prepend_preempted(&mut self, mut turn: TurnState<P>) {
         turn.status = TurnStatus::Preempted;
+        turn.ssd_lane = false;
         turn.block_reservation_active = false;
         turn.recurrent_state_reservation_active = false;
         self.waiting.push_front(turn);
@@ -1035,6 +1043,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
     pub fn ready_preempted(&mut self, mut turn: TurnState<P>, waiting_for_ssd: bool) {
         turn.block_reservation_active = true;
         turn.recurrent_state_reservation_active = true;
+        turn.ssd_lane = waiting_for_ssd;
         if waiting_for_ssd {
             turn.status = TurnStatus::WaitingForSsd;
             self.stats.ssd_restore_waiting = self.stats.ssd_restore_waiting.saturating_add(1);
@@ -1140,7 +1149,8 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         while self.running.len() < self.max_num_seqs {
             let candidate = self.waiting.iter().position(|turn| {
                 turn.status == TurnStatus::Waiting
-                    && !preempted_order.is_some_and(|order| turn.arrival_order > order)
+                    && (turn.ssd_lane
+                        || !preempted_order.is_some_and(|order| turn.arrival_order > order))
                     && !control_order.is_some_and(|order| turn.arrival_order > order)
             });
             let Some(candidate) = candidate else {
@@ -1312,7 +1322,9 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                 .iter()
                 .rposition(|turn| turn.status == TurnStatus::Running)
         {
-            if self.running.len() == 1 {
+            let another_lane =
+                self.running.len() > 1 || self.waiting.iter().any(|turn| turn.ssd_lane);
+            if !another_lane {
                 blocked_alone = Some(self.running[index].seq_id);
             } else {
                 let turn = self.preempt_running_at(index);
@@ -2078,6 +2090,59 @@ mod tests {
         assert!(scheduler.take_running(1).is_some());
         assert!(scheduler.running().is_empty());
         assert_eq!(scheduler.stats().preemptions, 0);
+    }
+
+    /// A lone blocked turn beside a turn parked for SSD yields: the restore
+    /// holds blocks that come back when that turn ends, so it is not alone.
+    /// The victim waits on the SSD lane, and the lane, once woken, runs ahead.
+    /// Mutation M1: drop `ssd_lane` from drive_once's `another_lane` → red.
+    /// Mutation M2: drop `turn.ssd_lane ||` from resume_may_wait → red.
+    /// Mutation M3: drop `turn.ssd_lane ||` from admit_waiting → red.
+    #[test]
+    fn lone_blocked_turn_beside_an_ssd_lane_yields() {
+        let mut scheduler = Scheduler::<_, (), ()>::new(2, 8).expect("scheduler");
+        scheduler
+            .enqueue_turn(turn(1, 0, &[4], None).with_block_reservation(2, 0, 4))
+            .expect("enqueue running turn");
+        let mut step = MockStep::default();
+        scheduler.drive_once(&mut step).expect("admit turn 1");
+        scheduler
+            .enqueue_turn(turn(2, 0, &[4], None).with_block_reservation(4, 4, 4))
+            .expect("enqueue SSD turn");
+        scheduler.park_waiting_for_ssd(2).expect("park SSD turn");
+        step.allocation_blocked.insert(1);
+        let SchedulerAction::Stepped {
+            preempted:
+                Some(PreemptedTurn {
+                    turn: victim,
+                    blocked,
+                }),
+            blocked_alone: None,
+            ..
+        } = scheduler.drive_once(&mut step).expect("blocked step")
+        else {
+            panic!("a turn beside an SSD lane must yield, not fail alone");
+        };
+        assert_eq!(victim.seq_id, 1);
+        assert!(blocked);
+        assert!(!victim.ssd_lane);
+        assert!(
+            scheduler.resume_may_wait(&victim),
+            "the victim waits on the SSD lane"
+        );
+        scheduler.prepend_preempted(victim);
+        scheduler
+            .wake_from_ssd(2, 0, Duration::from_millis(1))
+            .expect("wake");
+        step.allocation_blocked.clear();
+        let SchedulerAction::Stepped { plan, .. } = scheduler.drive_once(&mut step).expect("step")
+        else {
+            panic!("the woken SSD lane must run ahead of the victim");
+        };
+        assert_eq!(
+            plan.rows.iter().map(|row| row.seq_id).collect::<Vec<_>>(),
+            vec![2]
+        );
     }
 
     #[test]
