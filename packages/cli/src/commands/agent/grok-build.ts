@@ -1867,26 +1867,39 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
   // serve child is reaped in the finally below. SIGTERM/SIGHUP end the
   // process through the default disposition — which never reaches children.
   // Tear both down, wait for serve to exit, then re-raise so the launcher
-  // still dies with the same signal (process.once has already detached us).
+  // still dies with the same signal. The handlers stay installed until the
+  // re-raise: a repeated signal mid-teardown must SIGKILL serve, not take the
+  // default disposition and orphan it.
   // Installed before serve spawns: its preload wait has no timeout, and a
   // signal then must not leave serve holding the model.
   let serveChild: ChildProcess | undefined;
   let agent: ChildProcess | undefined;
   let tearingDown: Promise<void> | undefined;
+  const removeHandlers = (): void => {
+    process.removeListener('SIGINT', forward);
+    process.removeListener('SIGTERM', teardown);
+    process.removeListener('SIGHUP', teardown);
+  };
   const teardown = (signal: NodeJS.Signals): void => {
-    tearingDown ??= (async () => {
+    if (tearingDown) {
+      agent?.kill('SIGKILL');
+      serveChild?.kill('SIGKILL');
+      return;
+    }
+    tearingDown = (async () => {
       agent?.kill(signal);
       if (serveChild) await stopServe(serveChild, signal, opts.serveStopGraceMs ?? SERVE_STOP_GRACE_MS);
+      removeHandlers();
       process.kill(process.pid, signal);
     })();
   };
   const forward = (): void => {
-    if (agent) agent.kill('SIGINT');
+    if (agent && !tearingDown) agent.kill('SIGINT');
     else teardown('SIGINT');
   };
-  process.once('SIGINT', forward);
-  process.once('SIGTERM', teardown);
-  process.once('SIGHUP', teardown);
+  process.on('SIGINT', forward);
+  process.on('SIGTERM', teardown);
+  process.on('SIGHUP', teardown);
 
   let code: number;
   try {
@@ -1927,13 +1940,11 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
       spawnedAgent.once('error', reject);
     });
   } finally {
-    process.removeListener('SIGINT', forward);
-    process.removeListener('SIGTERM', teardown);
-    process.removeListener('SIGHUP', teardown);
     // A signal ends the launcher once serve is gone; returning or throwing
     // first would let the caller exit with serve still alive.
     if (tearingDown) await tearingDown;
     else serveChild?.kill('SIGTERM');
+    removeHandlers();
   }
   return code;
 }

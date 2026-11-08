@@ -2125,7 +2125,8 @@ describe('launchGrokAgent server gating', () => {
    * preload wait. `ignoreSignals` makes serve model a graceful shutdown that
    * never finishes (a preload `host.close()` awaits with no deadline).
    * `readyOnSignal` makes serve ignore the signal and report the model
-   * resident only after it.
+   * resident only after it. `repeat` sends a second signal once the teardown
+   * has started.
    */
   async function launchDuringPreload(
     signal: NodeJS.Signals,
@@ -2135,9 +2136,18 @@ describe('launchGrokAgent server gating', () => {
       banner = true,
       readyTimeoutMs,
       readyOnSignal = false,
-    }: { ignoreSignals: boolean; graceMs?: number; banner?: boolean; readyTimeoutMs?: number; readyOnSignal?: boolean },
+      repeat,
+    }: {
+      ignoreSignals: boolean;
+      graceMs?: number;
+      banner?: boolean;
+      readyTimeoutMs?: number;
+      readyOnSignal?: boolean;
+      repeat?: NodeJS.Signals;
+    },
   ): Promise<{
     exitSignal: NodeJS.Signals | null;
+    exitMs: number;
     serveDeadAtExit: boolean;
     serveDeadAfter: boolean;
     agentStarted: boolean;
@@ -2230,13 +2240,21 @@ await launchGrokAgent({
       servePid = Number(readFileSync(pidFile, 'utf8'));
       expect(alive(servePid)).toBe(true);
 
+      const signaledAt = Date.now();
       launcher.kill(signal);
+      if (repeat !== undefined) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 300));
+        expect(launcher.exitCode === null && launcher.signalCode === null, stderr).toBe(true);
+        launcher.kill(repeat);
+      }
       const exitSignal = await exited;
+      const exitMs = Date.now() - signaledAt;
       for (let i = 0; i < 200 && alive(servePid); i++) {
         await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
       }
       return {
         exitSignal,
+        exitMs,
         serveDeadAtExit,
         serveDeadAfter: !alive(servePid),
         agentStarted: existsSync(agentStartedFile),
@@ -2265,6 +2283,24 @@ await launchGrokAgent({
       const result = await launchDuringPreload(signal, { ignoreSignals: true, graceMs: 300 });
       expect(result.exitSignal).toBe(signal);
       expect(result.serveDeadAtExit).toBe(true);
+    },
+  );
+
+  // Mutation: install the handlers with process.once → red on the same-signal
+  // rows (the repeat takes the default disposition with serve alive).
+  // Mutation: drop the SIGKILLs on a repeat → red (exit waits out the grace).
+  it.each([
+    ['SIGTERM', 'SIGTERM'],
+    ['SIGTERM', 'SIGINT'],
+    ['SIGINT', 'SIGINT'],
+  ] as const)(
+    'SIGKILLs serve at once on a repeated signal (%s then %s), then dies by the first',
+    { timeout: 30_000 },
+    async (first, second) => {
+      const result = await launchDuringPreload(first, { ignoreSignals: true, graceMs: 8_000, repeat: second });
+      expect(result.exitSignal).toBe(first);
+      expect(result.serveDeadAtExit).toBe(true);
+      expect(result.exitMs).toBeLessThan(4_000);
     },
   );
 
