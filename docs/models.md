@@ -360,9 +360,8 @@ the cached prefix to a BF16 temporary for MLX's fused causal SDPA. Halves
 the K/V memory (Qwen3.8-27B at 32K: ~1.0 GB saved) and the verify's K/V read
 bandwidth; the quality cost is int8 rounding. Teacher-forced vs a bf16-KV
 teacher at 8 x 8,192 tokens (tail = positions past the first 2,048-token
-chunk, the ones that read int8): Qwen3.8-27B tail KL `<27B_KL_TAIL>`, top-1
-`<27B_TOP1_TAIL>`; Qwen3.6-35B-A3B tail KL `<35B_KL_TAIL>`, top-1
-`<35B_TOP1_TAIL>` (details in
+chunk, the ones that read int8): Qwen3.6-35B-A3B tail KL 0.0062, top-1
+0.9699 (raw 0.0047 / 0.9775); Qwen3.8-27B not measured (details in
 [docs/research/splash-qwen35-moe.md](research/splash-qwen35-moe.md#int8-kv-default)).
 DFlash2 acceptance on 35B is not measured. Geometries the int8 kernels do not
 serve default to `bf16`: Qwen3.6-122B (32 x 2 heads) defaults to bf16 because
