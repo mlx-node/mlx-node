@@ -1252,6 +1252,13 @@ impl Qwen3_5Attention {
                     key_scales: key_scales.clone(),
                     value_scales: value_scales.clone(),
                 };
+                // The int8 kernels take BF16 queries only; an f32 norm or
+                // projection (or f16 compute) would fail the turn otherwise.
+                let queries = if queries.dtype()? == DType::BFloat16 {
+                    queries
+                } else {
+                    queries.astype(DType::BFloat16)?
+                };
                 let output = segmented_sdpa_int8(&queries, &prefix, &new, self.scale, true)?;
                 *io.out_kv = Some(VerifyKvOut::Int8(new));
                 return self.project_verify_output(&gate, &output, batch, seq_len, residual);

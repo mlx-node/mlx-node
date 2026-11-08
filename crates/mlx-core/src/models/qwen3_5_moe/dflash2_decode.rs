@@ -1765,6 +1765,59 @@ mod tests {
         }
         Ok(())
     }
+
+    /// Gate: f32 input norms (the MoE loader installs norms as stored) make
+    /// f32 queries; the int8 compiled verify must still run and stay enabled,
+    /// since a MoE compiled-verify error fails the turn.
+    /// Mutation: drop the BF16 query cast in the int8 arm of
+    /// `forward_verify_impl` → red (segmented_sdpa rejects f32 queries).
+    #[test]
+    fn int8_compiled_verify_takes_f32_queries() -> Result<()> {
+        if !crate::engine::persistence::compiled_forward_backend_available()
+            || unsafe { mlx_sys::mlx_default_device() } != 1
+        {
+            eprintln!(
+                "SKIP int8_compiled_verify_takes_f32_queries: Metal must be the default device"
+            );
+            return Ok(());
+        }
+        let mut inner = tiny_dflash_inner_with_config(0xDFA5_F32A, |cfg| {
+            cfg.head_dim = 256;
+            cfg.hidden_size = cfg.hidden_size.max(256);
+            cfg.kv_format = Some("int8".to_owned());
+        });
+        for layer in inner.layers.iter_mut() {
+            let weight = layer.get_input_layernorm_weight().astype(DType::Float32)?;
+            layer.set_input_layernorm_weight(&weight)?;
+        }
+        reset_flat_fixture(&mut inner);
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let (prefill_logits, state) = dflash2_prefill(&mut inner, &[1, 2, 3, 4], 0, None, stream)?;
+        prefill_logits.eval();
+        inner.dflash2_turn_state = Some(state);
+        super::super::model::take_dflash2_compiled_test_counts();
+        inner.dflash2_compiled_verify_disabled = false;
+        let input = MxArray::from_int32(&[5, 6, 7, 8, 9, 10, 11, 12], &[1, 8])?;
+        let tap_layers: Vec<usize> = (0..inner.layers.len()).collect();
+        let (logits, _, _, _) = super::super::model::forward_dflash2_with_taps(
+            &mut inner,
+            &input,
+            &tap_layers,
+            true,
+            super::super::model::DFlash2LogitsSpan::All,
+            None,
+            None,
+        )?;
+        logits.eval();
+        assert_eq!(
+            super::super::model::take_dflash2_compiled_test_counts(),
+            (1, 1)
+        );
+        assert!(!inner.dflash2_compiled_verify_disabled);
+        Ok(())
+    }
+
     #[test]
     fn compiled_budget_replays_dynamic_rows_without_changing_physical_width() -> Result<()> {
         if !crate::engine::persistence::compiled_forward_backend_available()

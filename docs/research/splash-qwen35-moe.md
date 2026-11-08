@@ -154,8 +154,13 @@ so the default takes the compute dtype too: the load pins the format after the
 weights give the compute dtype (`Qwen3_5Config::pin_kv_format`), and an f16 load
 gets BF16 K/V. Before, an f16 MoE load failed its compiled DFlash2 verify, and
 dense fell back to the eager int8 read that dequantizes the whole prefix and
-runs SDPA in f32. Gap: an explicit `kvFormat: 'int8'` on an f16 load still
-takes int8 and hits the same failure; no query-dtype guard exists.
+runs SDPA in f32. The compiled int8 verify (`forward_verify_impl`, both
+families) also casts non-BF16 queries to BF16 before the segmented call, as
+Splash's kernels only take bfloat queries. So no turn fails on query dtype: not
+an explicit `kvFormat: 'int8'` on an f16 load, and not a MoE load with f32 layer
+norms, which the MoE loader installs as stored (dense casts them). Gap: the
+eager int8 read (MTP verify, AR decode) still takes the dequantizing route for
+non-BF16 queries.
 
 ### DFlash2 window (35B-A3B, M3 Pro inputs)
 
