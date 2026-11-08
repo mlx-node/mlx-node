@@ -1681,15 +1681,13 @@ export function agentTagFromBinPath(path: string): string | undefined {
 }
 
 /**
- * Spawn `mlx serve` as a subprocess and wait for `/health`.
+ * Spawn `mlx serve` as a subprocess.
  * `--port 0` binds an ephemeral port; the token comes back to us through
  * `--auth-token`. The child CLI is THIS package's entry point — located via
  * `process.argv[1]` (the `mlx` bin) with `src/cli.ts` as a fallback for
  * test/dev invocations.
  */
-async function spawnInferenceServer(
-  opts: GrokAgentLaunchOptions,
-): Promise<{ child: ChildProcess; url: string; token: string }> {
+function spawnInferenceServer(opts: GrokAgentLaunchOptions): { child: ChildProcess; token: string } {
   const token = randomBytes(24).toString('base64url');
   const cliEntry = process.env.MLX_CLI_ENTRY ?? process.argv[1];
   if (!cliEntry) throw new Error('mlx agent: cannot locate the cli entry point for spawning `mlx serve`');
@@ -1708,20 +1706,21 @@ async function spawnInferenceServer(
   const child = (opts.spawnServe ?? ((argv, so) => spawn(process.execPath, argv, so)))(serveArgv, {
     stdio: ['ignore', 'pipe', 'inherit'],
   });
+  return { child, token };
+}
 
-  // A child that never reports a port would otherwise leak: nothing else
-  // retains the handle, so kill it before the launch path unwinds.
-  try {
-    const url = await waitForServe(child, opts.serveReadyTimeoutMs ?? 30_000);
-    if (opts.preloadModel !== undefined) {
-      console.error(`[mlx] loading ${opts.preloadModel} …`);
-      await waitForPreload(child, url.slice(0, -'/v1'.length), token, opts.preloadModel, opts.preloadPollMs ?? 250);
-    }
-    return { child, url, token };
-  } catch (err) {
-    child.kill('SIGTERM');
-    throw err;
+/** Wait for the spawned serve's `/health`, then for its preload to settle; resolves with its `/v1` URL. */
+async function waitForInferenceServer(
+  child: ChildProcess,
+  token: string,
+  opts: GrokAgentLaunchOptions,
+): Promise<string> {
+  const url = await waitForServe(child, opts.serveReadyTimeoutMs ?? 30_000);
+  if (opts.preloadModel !== undefined) {
+    console.error(`[mlx] loading ${opts.preloadModel} …`);
+    await waitForPreload(child, url.slice(0, -'/v1'.length), token, opts.preloadModel, opts.preloadPollMs ?? 250);
   }
+  return url;
 }
 
 /**
@@ -1839,40 +1838,23 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
   // one-shots and starve the turn of local inference.
   const needsServer = opts.needsServer !== false;
 
-  let serve: { child: ChildProcess; url: string; token: string } | undefined;
-  if (opts.serveUrl !== undefined) {
-    serve = { child: undefined as unknown as ChildProcess, url: opts.serveUrl, token: opts.serveToken ?? '' };
-  } else if (needsServer) {
-    serve = await spawnInferenceServer(opts);
-  }
-
-  const env = { ...process.env };
-  // grok's exit hint prints this as the resume command; the bare `grok` is not on PATH.
-  env.GROK_RESUME_COMMAND ??= 'mlx agent';
-  if (serve) {
-    env.GROK_MODELS_BASE_URL = serve.url;
-    env.GROK_CLI_CHAT_PROXY_BASE_URL = serve.url;
-    env.GROK_XAI_API_BASE_URL = serve.url;
-    env.XAI_API_KEY = serve.token || 'mlx-local';
-    env.GROK_DISABLE_AUTOUPDATER = '1';
-    for (const name of LOCAL_BACKEND_DISABLED_TOOL_ENV) env[name] ??= '0';
-  }
-
-  const spawnAgent = opts.spawnAgent ?? ((b, a, so) => spawn(b, a, so));
-  const agent = spawnAgent(bin, opts.argv, { stdio: 'inherit', env });
-
   // Ctrl+C forwards to the TUI; the agent's exit then drives ours, so the
-  // serve child is reaped in the finally below.
-  const forward = (): void => {
-    agent.kill('SIGINT');
-  };
-  // SIGTERM/SIGHUP end the process through the default disposition — which
-  // never reaches children. Tear both down, then re-raise so the launcher
-  // still dies with the same signal (process.once has already detached us).
+  // serve child is reaped in the finally below. SIGTERM/SIGHUP end the
+  // process through the default disposition — which never reaches children.
+  // Tear both down, then re-raise so the launcher still dies with the same
+  // signal (process.once has already detached us). Installed before serve
+  // spawns: its preload wait has no timeout, and a signal then must not
+  // leave serve holding the model.
+  let serveChild: ChildProcess | undefined;
+  let agent: ChildProcess | undefined;
   const teardown = (signal: NodeJS.Signals): void => {
-    serve?.child?.kill(signal);
-    agent.kill(signal);
+    serveChild?.kill(signal);
+    agent?.kill(signal);
     process.kill(process.pid, signal);
+  };
+  const forward = (): void => {
+    if (agent) agent.kill('SIGINT');
+    else teardown('SIGINT');
   };
   process.once('SIGINT', forward);
   process.once('SIGTERM', teardown);
@@ -1880,17 +1862,41 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
 
   let code: number;
   try {
+    let serve: { url: string; token: string } | undefined;
+    if (opts.serveUrl !== undefined) {
+      serve = { url: opts.serveUrl, token: opts.serveToken ?? '' };
+    } else if (needsServer) {
+      const spawned = spawnInferenceServer(opts);
+      serveChild = spawned.child;
+      serve = { url: await waitForInferenceServer(spawned.child, spawned.token, opts), token: spawned.token };
+    }
+
+    const env = { ...process.env };
+    // grok's exit hint prints this as the resume command; the bare `grok` is not on PATH.
+    env.GROK_RESUME_COMMAND ??= 'mlx agent';
+    if (serve) {
+      env.GROK_MODELS_BASE_URL = serve.url;
+      env.GROK_CLI_CHAT_PROXY_BASE_URL = serve.url;
+      env.GROK_XAI_API_BASE_URL = serve.url;
+      env.XAI_API_KEY = serve.token || 'mlx-local';
+      env.GROK_DISABLE_AUTOUPDATER = '1';
+      for (const name of LOCAL_BACKEND_DISABLED_TOOL_ENV) env[name] ??= '0';
+    }
+
+    const spawnAgent = opts.spawnAgent ?? ((b, a, so) => spawn(b, a, so));
+    const spawnedAgent = spawnAgent(bin, opts.argv, { stdio: 'inherit', env });
+    agent = spawnedAgent;
     code = await new Promise<number>((resolvePromise, reject) => {
-      agent.once('exit', (c, signal) => resolvePromise(c ?? (signal === 'SIGINT' ? 130 : 1)));
+      spawnedAgent.once('exit', (c, signal) => resolvePromise(c ?? (signal === 'SIGINT' ? 130 : 1)));
       // A spawn failure emits 'error' with no 'exit' — rejecting routes it
       // through the same teardown so the serve child is never orphaned.
-      agent.once('error', reject);
+      spawnedAgent.once('error', reject);
     });
   } finally {
     process.removeListener('SIGINT', forward);
     process.removeListener('SIGTERM', teardown);
     process.removeListener('SIGHUP', teardown);
-    serve?.child?.kill('SIGTERM');
+    serveChild?.kill('SIGTERM');
   }
   return code;
 }

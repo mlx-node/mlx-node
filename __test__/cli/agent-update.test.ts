@@ -1,4 +1,4 @@
-import { spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import {
@@ -2075,13 +2075,22 @@ describe('launchGrokAgent server gating', () => {
     const baseline = new Set(process.listeners('SIGTERM'));
     const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
     try {
-      const launch = launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent: () => agent });
-      // Poll: the listeners land only after serve readiness resolves.
-      let teardown: ((signal: 'SIGTERM') => void) | undefined;
-      for (let i = 0; i < 100 && teardown === undefined; i++) {
+      let agentSpawned = false;
+      const launch = launchGrokAgent({
+        argv: ['-p', 'hi'],
+        spawnServe,
+        spawnAgent: () => {
+          agentSpawned = true;
+          return agent;
+        },
+      });
+      for (let i = 0; i < 100 && !agentSpawned; i++) {
         await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
-        teardown = process.listeners('SIGTERM').find((listener) => !baseline.has(listener));
       }
+      expect(agentSpawned).toBe(true);
+      const teardown = process.listeners('SIGTERM').find((listener) => !baseline.has(listener)) as
+        | ((signal: 'SIGTERM') => void)
+        | undefined;
       expect(teardown).toBeDefined();
       teardown!('SIGTERM');
       expect(serveKills[0]!).toHaveBeenCalledWith('SIGTERM');
@@ -2091,6 +2100,92 @@ describe('launchGrokAgent server gating', () => {
       await expect(launch).resolves.toBe(143);
     } finally {
       killSpy.mockRestore();
+    }
+  });
+
+  // Mutation: install the signal handlers only after the preload wait → red
+  // (the serve child outlives the launcher).
+  it('stops the serve child when SIGTERM lands during the preload wait', { timeout: 30_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'launch-grok-sigterm-'));
+    const pidFile = join(dir, 'serve.pid');
+    const polledFile = join(dir, 'polled');
+    const fakeServe = join(dir, 'fake-serve.mjs');
+    writeFileSync(
+      fakeServe,
+      `import { createServer } from 'node:http';
+import { writeFileSync } from 'node:fs';
+const server = createServer((req, res) => {
+  const authorized = req.headers.authorization !== undefined;
+  if (authorized) writeFileSync(${JSON.stringify(polledFile)}, '');
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify(authorized
+    ? { status: 'loading', models: { resident: [] }, work: { writerActive: true, waitingWriters: 0 }, lastLoad: null }
+    : { status: 'ok' }));
+});
+server.listen(0, '127.0.0.1', () => {
+  writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+  console.log('listening on http://127.0.0.1:' + server.address().port);
+});
+`,
+    );
+    const grokBuild = new URL('../../packages/cli/src/commands/agent/grok-build.ts', import.meta.url).href;
+    const launcherEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      [MLX_AGENT_BIN_ENV]: join(root, 'mlx-agent'),
+      MLX_CLI_ENTRY: fakeServe,
+    };
+    delete launcherEnv[MLX_AGENT_TAG_ENV];
+    const launcher = spawn(
+      process.execPath,
+      [
+        '--import',
+        '@oxc-node/core/register',
+        '--input-type=module',
+        '-e',
+        `import { spawn } from 'node:child_process';
+const { launchGrokAgent } = await import(${JSON.stringify(grokBuild)});
+await launchGrokAgent({
+  argv: ['-c'],
+  preloadModel: 'qwen-local',
+  preloadPollMs: 20,
+  spawnServe: (_argv, so) => spawn(process.execPath, [${JSON.stringify(fakeServe)}], so),
+  spawnAgent: () => { throw new Error('grok must not start during the preload'); },
+});`,
+      ],
+      { env: launcherEnv, stdio: ['ignore', 'ignore', 'pipe'] },
+    );
+    let stderr = '';
+    launcher.stderr!.on('data', (chunk) => (stderr += String(chunk)));
+    const exited = new Promise<NodeJS.Signals | null>((resolvePromise) =>
+      launcher.once('exit', (_code, signal) => resolvePromise(signal)),
+    );
+    const alive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    let servePid: number | undefined;
+    try {
+      for (let i = 0; i < 400 && !existsSync(polledFile) && launcher.exitCode === null; i++) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+      }
+      expect(existsSync(polledFile), stderr).toBe(true);
+      servePid = Number(readFileSync(pidFile, 'utf8'));
+      expect(alive(servePid)).toBe(true);
+
+      launcher.kill('SIGTERM');
+      expect(await exited).toBe('SIGTERM');
+      for (let i = 0; i < 200 && alive(servePid); i++) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+      }
+      expect(alive(servePid)).toBe(false);
+    } finally {
+      launcher.kill('SIGKILL');
+      if (servePid !== undefined && alive(servePid)) process.kill(servePid, 'SIGKILL');
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });
