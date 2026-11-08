@@ -1544,10 +1544,11 @@ fn serial_prepare_at_the_cap_frees_a_ladder_chain() -> Result<()> {
     Ok(())
 }
 
-/// The dense VLM prepare hits a kept rung's chain whose GDN state cannot
-/// restore, so it restarts cold at the cap: the restart is refused until
-/// the other rung goes. The candidate prepare fits in the free block, so
-/// the restart's reclaim is the only one on the path.
+/// The dense VLM prepare hits a rung's chain whose GDN state cannot
+/// restore, so it restarts cold at the cap: the restart keeps nothing, so
+/// the prompt's own (older) rung goes and the other stays. The candidate
+/// prepare fits in the free block, so the restart's reclaim is the only one
+/// on the path.
 /// Mutation: drop the `reclaiming` wrapper on the cold restart in
 /// `prepare_dense_vlm_paged_prefix` → red (`Err`).
 #[test]
@@ -1565,7 +1566,7 @@ fn vlm_cold_restart_at_the_cap_frees_a_ladder_chain() -> Result<()> {
     let other = chain_tokens(25, 2, block_size);
     let other_hashes = cache_chain(&inner, &other);
     let newer = inner.cache_recency.next();
-    push_rung(&mut inner, other, other_hashes, newer);
+    push_rung(&mut inner, other.clone(), other_hashes, newer);
     inner
         .paged_adapter
         .as_mut()
@@ -1591,6 +1592,142 @@ fn vlm_cold_restart_at_the_cap_frees_a_ladder_chain() -> Result<()> {
     assert_eq!(grow_reclaim_log(), vec![GrowReclaim::Ladder]);
     let left: Vec<(u32, u64, u64)> = inner.ladder_entries_for_test();
     assert_eq!(left.len(), 1);
-    assert_eq!(left[0].0 as usize, kept.len());
+    assert_eq!(left[0].0 as usize, other.len());
+    Ok(())
+}
+
+/// A pool of 3 blocks holding a cached 2-block chain whose first block
+/// carries the only ladder rung; the prompt is that chain plus one block.
+fn vlm_rung_on_the_prompts_chain(seed: u64) -> Result<(Qwen35Inner, Vec<u32>)> {
+    let mut inner = fixture(seed);
+    install_pool(&mut inner, 3, 3, passing_probe())?;
+    let block_size = pool_block_size(&inner);
+    let chain = chain_tokens(24, 2, block_size);
+    let hashes = cache_chain(&inner, &chain);
+    let stamp = inner.cache_recency.next();
+    push_rung(
+        &mut inner,
+        chain[..block_size as usize].to_vec(),
+        hashes[..1].to_vec(),
+        stamp,
+    );
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .reset_for_new_request(0)
+        .map_err(Error::from_reason)?;
+    let mut prompt = chain;
+    prompt.extend(chain_tokens(26, 1, block_size));
+    Ok((inner, prompt))
+}
+
+/// The cold restart restores no replay point, so it takes the prompt's
+/// own rung: the candidate hits the 2-block chain past the rung, and the
+/// restart needs the whole prompt fresh, which only the rung's block can
+/// complete.
+/// Mutation: pass the candidate's `keep` to the cold-restart `reclaiming`
+/// in `prepare_dense_vlm_paged_prefix` → red (`Err`
+/// context_length_exceeded).
+#[test]
+fn vlm_cold_restart_takes_the_prompts_own_rung() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let (mut inner, prompt) = vlm_rung_on_the_prompts_chain(0xDFA5_1818)?;
+    let block_size = pool_block_size(&inner);
+    let keys = per_block_keys(&prompt, block_size);
+    clear_grow_reclaim_log();
+    let resolution = inner.prepare_dense_vlm_paged_prefix(
+        &prompt,
+        prompt.len() as u32,
+        block_size,
+        &keys,
+        true,
+        true,
+        77,
+        0,
+    )?;
+    assert!(resolution.downgraded_to_cold);
+    assert_eq!(resolution.candidate_cached_prefix_len, 2 * block_size);
+    assert_eq!(grow_reclaim_log(), vec![GrowReclaim::Ladder]);
+    assert!(inner.ladder_entries_for_test().is_empty());
+    Ok(())
+}
+
+/// A VLM prepare that skips the lookup keeps nothing: the pool ensure and
+/// the candidate prepare take the prompt's rung for the whole fresh prompt.
+/// Mutation: keep the prompt's `Keep` when `!reuse_cache` in
+/// `prepare_dense_vlm_paged_prefix` → red (`Err`
+/// context_length_exceeded).
+#[test]
+fn vlm_prepare_without_reuse_takes_the_prompts_own_rung() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let (mut inner, prompt) = vlm_rung_on_the_prompts_chain(0xDFA5_1819)?;
+    let block_size = pool_block_size(&inner);
+    let keys = per_block_keys(&prompt, block_size);
+    clear_grow_reclaim_log();
+    let resolution = inner.prepare_dense_vlm_paged_prefix(
+        &prompt,
+        prompt.len() as u32,
+        block_size,
+        &keys,
+        false,
+        true,
+        77,
+        0,
+    )?;
+    assert_eq!(resolution.candidate_cached_prefix_len, 0);
+    assert_eq!(grow_reclaim_log(), vec![GrowReclaim::Ladder]);
+    assert!(inner.ladder_entries_for_test().is_empty());
+    Ok(())
+}
+
+/// A serial turn that released its request still ends its replay point's
+/// use at the history save, for `reuse_cache=false` and for a reuse turn
+/// whose reconcile failed: rung E leaves InUse, becomes the newest rung,
+/// and is a unit the next turn's reclaim can take.
+/// Mutations: drop the `end_gdn_use` call in the `!reuse_cache` branch of
+/// dense `save_paged_history` → red on `reuse false`; drop the one after
+/// the history write → red on `reuse true`.
+#[test]
+fn a_released_serial_turn_ends_the_replay_points_use() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    for (seed, reuse) in [(0xDFA5_181A, false), (0xDFA5_181B, true)] {
+        let (mut inner, e_final, f_final, prompt) = restored_from_rung(seed, false)?;
+        let e_key = rung_key(&inner, 2 * pool_block_size(&inner), e_final);
+        assert_eq!(inner.gdn_in_use_for_test(0), Some(&e_key), "reuse {reuse}");
+        crate::engine::backend::PagedBackend::finalize_paged_turn(&mut inner, false, 0);
+        crate::engine::backend::PagedBackend::save_paged_history(
+            &mut inner,
+            &prompt,
+            &[],
+            false,
+            reuse,
+        )?;
+        assert_eq!(inner.gdn_in_use_for_test(0), None, "reuse {reuse}");
+        let stamp_of = |inner: &Qwen35Inner, hash: u64| {
+            inner
+                .ladder_entries_for_test()
+                .into_iter()
+                .find(|&(_, final_hash, _)| final_hash == hash)
+                .map(|(_, _, stamp)| stamp)
+                .expect("the rung stays")
+        };
+        assert!(
+            stamp_of(&inner, e_final) > stamp_of(&inner, f_final),
+            "reuse {reuse}"
+        );
+        let f_key = rung_key(&inner, pool_block_size(&inner), f_final);
+        let skip: std::collections::HashSet<UnitKey> = [f_key, UnitKey::History].into();
+        let next = inner
+            .oldest_gdn_state_unit(false, &skip, Keep::default())
+            .map(|unit| unit.key);
+        assert_eq!(next, Some(e_key), "reuse {reuse}");
+    }
     Ok(())
 }

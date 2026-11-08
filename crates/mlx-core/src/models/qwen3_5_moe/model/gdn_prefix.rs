@@ -937,17 +937,16 @@ impl Qwen35MoeInner {
         allow_live_continue: bool,
         image_key: u64,
     ) -> Result<engine::VlmPagedPrefixResolution> {
-        crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(
-            self,
-            tokens,
-            extra_keys_per_block,
-            0,
-        );
-        let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        let keep = crate::models::qwen3_5::dflash2_turn::Keep {
-            tokens,
-            keys: Some((extra_keys_per_block, 0)),
+        let keep = if reuse_cache {
+            crate::models::qwen3_5::dflash2_turn::Keep {
+                tokens,
+                keys: Some((extra_keys_per_block, 0)),
+            }
+        } else {
+            crate::models::qwen3_5::dflash2_turn::Keep::default()
         };
+        crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_keeping(self, tokens, keep);
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let candidate_plan_result =
             crate::models::qwen3_5::dflash2_turn::reclaiming(self, keep, |inner| {
                 inner
@@ -996,6 +995,9 @@ impl Qwen35MoeInner {
             candidate_plan,
             gdn_prefix_already_primed,
             || {
+                // A cold restart restores no replay point, so it keeps none
+                // (Splash retries a failed admission with skipCache).
+                let keep = crate::models::qwen3_5::dflash2_turn::Keep::default();
                 crate::models::qwen3_5::dflash2_turn::reclaiming(self, keep, |inner| {
                     inner
                         .paged_adapter

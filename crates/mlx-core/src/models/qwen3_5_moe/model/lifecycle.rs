@@ -110,6 +110,7 @@ impl Qwen35MoeInner {
             gdn_last_history_checkpoint: None,
             gdn_in_use: HashMap::new(),
             gdn_restored_from: None,
+            paged_turn_seq: None,
             paged_finalize_failed: false,
             paged_mtp_last_rollback_unemitted: 0,
             paged_mtp_gdn_rewinds: 0,
@@ -1017,6 +1018,7 @@ impl Qwen35MoeInner {
         self.gdn_last_history_checkpoint = None;
         self.gdn_in_use.clear();
         self.gdn_restored_from = None;
+        self.paged_turn_seq = None;
         self.sync_gdn_state_marks();
         self.gdn_root_cache_owner_id = None;
         self.gdn_root_cache_owner_is_explicit = false;

@@ -515,6 +515,10 @@ impl PagedBackend for Qwen35MoeInner {
         // error must downgrade the session before the engine's unconditional
         // history save can publish image-placeholder history.
         self.paged_finalize_failed = false;
+        self.paged_turn_seq = self
+            .paged_adapter
+            .as_ref()
+            .and_then(PagedKVCacheAdapter::active_seq_id);
         let mut release_pending = false;
         let mut finalize_error = match self.paged_adapter.as_mut() {
             Some(adapter) if reuse_cache => {
@@ -591,6 +595,7 @@ impl PagedBackend for Qwen35MoeInner {
         _keep_all: bool,
         reuse_cache: bool,
     ) -> Result<()> {
+        let turn_seq = self.paged_turn_seq.take();
         if std::mem::take(&mut self.paged_finalize_failed) {
             self.cached_token_history.clear();
             self.cached_image_key = None;
@@ -614,6 +619,9 @@ impl PagedBackend for Qwen35MoeInner {
             self.cached_image_key = None;
             self.cached_paged_image_token_positions.clear();
             self.cached_rope_deltas = None;
+            if let Some(seq_id) = turn_seq {
+                self.end_gdn_use(seq_id);
+            }
             return Ok(());
         }
         let mut full_history = save_tokens.to_vec();
@@ -630,6 +638,9 @@ impl PagedBackend for Qwen35MoeInner {
         // must NOT be published as a reusable warm-continue checkpoint, or the
         // next turn reads corrupt recurrent state.
         let store = self.remember_moe_gdn_history_checkpoint()?;
+        if let Some(seq_id) = turn_seq {
+            self.end_gdn_use(seq_id);
+        }
         if inference_trace_enabled() {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] qwen3.5-moe gdn_history_checkpoint stored={} tokens={} \

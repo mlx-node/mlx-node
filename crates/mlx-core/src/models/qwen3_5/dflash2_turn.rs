@@ -1037,6 +1037,17 @@ pub(crate) fn ensure_paged_pool_for_prompt<T: DFlash2Target>(
         tokens: prompt,
         keys: Some((keys, cache_salt)),
     };
+    ensure_paged_pool_keeping(target, prompt, keep);
+}
+
+/// [`ensure_paged_pool_for_prompt`] keeping `keep`. A prepare that skips
+/// the lookup keeps nothing (Splash keeps the restored chain only when the
+/// request does not skip the cache).
+pub(crate) fn ensure_paged_pool_keeping<T: DFlash2Target>(
+    target: &mut T,
+    prompt: &[u32],
+    keep: Keep<'_>,
+) {
     let marked_hit = target.marked_hit_blocks(keep);
     let mut met_before = MetBefore::default();
     grow_paged_pool_for_prompt(

@@ -220,6 +220,10 @@ pub(crate) struct Qwen35Inner {
     /// Set by the GDN lookups on a hit; the prepare moves it into
     /// `gdn_in_use`.
     gdn_restored_from: Option<crate::engine::reclaim::UnitKey>,
+    /// The finishing paged turn's sequence, read before its request is
+    /// released: the history save ends its replay-point use on every
+    /// terminal path (Splash `Engine::release`).
+    paged_turn_seq: Option<SeqId>,
     /// Set when the infallible [`PagedBackend::finalize_paged_turn`] hook could
     /// not register or release the adapter request. The engine calls
     /// `save_paged_history` immediately afterwards, so that save must consume

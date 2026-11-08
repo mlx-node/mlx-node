@@ -96,6 +96,7 @@ impl Qwen35Inner {
             gdn_last_history_checkpoint: None,
             gdn_in_use: HashMap::new(),
             gdn_restored_from: None,
+            paged_turn_seq: None,
             paged_finalize_failed: false,
             paged_adapter,
             scheduled_recurrent: RecurrentStateTable::stage2(),
@@ -889,6 +890,7 @@ impl Qwen35Inner {
         self.gdn_last_history_checkpoint = None;
         self.gdn_in_use.clear();
         self.gdn_restored_from = None;
+        self.paged_turn_seq = None;
         self.sync_gdn_state_marks();
         self.gdn_root_cache_owner_id = None;
         self.gdn_root_cache_owner_is_explicit = false;

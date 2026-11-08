@@ -197,6 +197,10 @@ pub(crate) struct Qwen35MoeInner {
     /// Set by the GDN lookups on a hit; the prepare moves it into
     /// `gdn_in_use`.
     gdn_restored_from: Option<crate::engine::reclaim::UnitKey>,
+    /// The finishing paged turn's sequence, read before its request is
+    /// released: the history save ends its replay-point use on every
+    /// terminal path (Splash `Engine::release`).
+    paged_turn_seq: Option<SeqId>,
     /// Set when the infallible paged-finalize hook could not register or
     /// release the request. `save_paged_history` consumes this latch instead of
     /// republishing expanded image-placeholder history as a live session.
