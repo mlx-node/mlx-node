@@ -182,3 +182,37 @@ pub(crate) fn seeded_inner_with_config(
     inner.initialize_paged_adapter().unwrap();
     inner
 }
+
+/// The MTP seed after prefill is its own one-row buffer, so the turn holds
+/// only what held_bytes prices once the prompt's hidden rows are dropped.
+/// Mutation: `.deep_copy()` -> `.copy()` on the prefill seed -> red (the seed
+/// is a view at row 5 of the 6-row prompt buffer).
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn prefill_seed_owns_one_row_buffer() {
+    use mlx_paged_attn::metal::{MlxMetalBuffer, synchronize_mlx};
+    let mut inner = seeded_inner(8107);
+    let seq = 7;
+    inner.activate_scheduled_recurrent(seq).unwrap();
+    let prompt = [3u32, 1, 4, 1, 5, 9];
+    let prefix = inner
+        .prime_prefix_state(&prompt, true, 16, &[], seq as u64)
+        .unwrap();
+    assert_eq!(prefix.effective_cached_prefix_len, 0);
+    assert!(inner.begin_scheduled_mtp(seq, 0).unwrap());
+    inner
+        .paged_prefill(&prompt, &prefix, Stream::generation())
+        .unwrap()
+        .eval();
+    let seed = inner.mtp_state().owners[&seq].hidden.clone().unwrap();
+    seed.eval();
+    synchronize_mlx();
+    let hidden = inner.config.hidden_size as usize;
+    assert_eq!(seed.shape().unwrap().as_ref(), &[1, 1, hidden as i64]);
+    let info = unsafe { MlxMetalBuffer::from_mlx_array(seed.as_raw_ptr()) }.unwrap();
+    assert_eq!(
+        info.offset, 0,
+        "seed is a view into the prompt's hidden rows"
+    );
+    assert_eq!(info.data_size, hidden);
+}

@@ -250,11 +250,11 @@ pub(crate) trait ScheduledMtpTarget: Sized {
                 self.append_mtp_history(&history, history_ids, &mut owner.draft_caches)?;
                 owner.committed_frontier = Some(committed + history_ids.len());
             }
-            // A compact GPU copy of one row releases the full prompt buffer.
+            // `copy` aliases the prompt's hidden rows, which held_bytes does not price.
             owner.hidden = Some(
                 hidden
                     .slice_axis(1, ids.len() as i64 - 1, ids.len() as i64)?
-                    .copy()?,
+                    .deep_copy()?,
             );
             owner.frontier = frontier;
             owner.validate_committed_history()
