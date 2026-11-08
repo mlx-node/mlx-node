@@ -12,7 +12,7 @@
 //! ## Storage design
 //!
 //! The adapter holds `(Arc<Mutex<BlockAllocator>>, Arc<LayerKVPool>)`. The
-//! allocator owns the *logical* lifecycle (refcounts / LRU / hashing); the
+//! allocator owns the *logical* lifecycle (refcounts / recency / hashing); the
 //! pool owns the *physical* storage (per-layer K/V Metal buffers). They are
 //! consciously kept separate so the existing legacy `CacheEngineManager`
 //! path (which bundles its own allocator) is left untouched. Option A
@@ -85,7 +85,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mlx_paged_attn::{
-    BlockAllocator, LayerKVPool, PagedAttentionConfig, PhysicalBlock, PrefixKeys,
+    BlockAllocator, CacheRecency, LayerKVPool, PagedAttentionConfig, PhysicalBlock, PrefixKeys,
     SequenceBlockTable,
 };
 
@@ -786,7 +786,10 @@ pub(crate) struct PagedBlockTelemetry {
     pub total_blocks: u32,
     pub max_total_blocks: u32,
     pub free_blocks: u32,
+    /// Every cache-only block, marked chains included.
     pub reclaimable_blocks: u32,
+    /// The cache-only blocks `allocate` may take.
+    pub evictable_blocks: u32,
     pub allocated_blocks: u32,
 }
 
@@ -1047,6 +1050,13 @@ pub struct PagedKVCacheAdapter {
     /// floor [`Self::try_release_pool_extents`] cuts down to.
     extent_runway_blocks: u32,
 
+    /// The allocator's clock, read once at construction.
+    recency: Arc<CacheRecency>,
+
+    /// Stamp taken when a kept table's turn ended, per request. A release
+    /// frees the table's blocks at this stamp.
+    turn_end_stamps: HashMap<SeqId, u64>,
+
     /// Test-only override for the pre-grow headroom probe: receives the
     /// grow-target block count and returns the probe's `selected_blocks`.
     #[cfg(test)]
@@ -1158,7 +1168,7 @@ impl PagedKVCacheAdapter {
                  negative mask width masks every key instead of erroring."
             ));
         }
-        let (allocator_block_size, allocator_num_blocks, allocator_max_num_blocks) = {
+        let (allocator_block_size, allocator_num_blocks, allocator_max_num_blocks, recency) = {
             let guard = allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
@@ -1166,6 +1176,7 @@ impl PagedKVCacheAdapter {
                 guard.block_size(),
                 guard.num_blocks(),
                 guard.max_num_blocks(),
+                guard.recency(),
             )
         };
         if block_size != allocator_block_size {
@@ -1247,6 +1258,8 @@ impl PagedKVCacheAdapter {
             pool_growth_notifier: None,
             extent_growth_blocks: None,
             extent_runway_blocks: 0,
+            recency,
+            turn_end_stamps: HashMap::new(),
             #[cfg(test)]
             grow_headroom_probe_override: None,
         })
@@ -2509,8 +2522,8 @@ impl PagedKVCacheAdapter {
     ///
     /// Errors if the allocator can't fulfil the request (no free blocks).
     /// When the reservation exceeds free + evictable blocks the adapter
-    /// first grows the pool (`try_grow_pool`) BEFORE `allocate` can evict
-    /// LRU cache-only entries, and retries after a `None` from `allocate`
+    /// first grows the pool (`try_grow_pool`) BEFORE `allocate` can take
+    /// cache-only blocks, and retries after a `None` from `allocate`
     /// as a fallback; only if the reservation is still unfulfillable does
     /// the error surface. On partial failure (some allocations succeeded
     /// before the pool ran out), the already-allocated blocks are rolled
@@ -2552,7 +2565,7 @@ impl PagedKVCacheAdapter {
         }
 
         let mut grow_attempted = false;
-        // Growth BEFORE LRU eviction: if the reservation exceeds everything
+        // Growth BEFORE eviction: if the reservation exceeds everything
         // the allocator could hand out (free + evictable cache-only prefix
         // entries), grow the pool first so `allocate` never evicts a cached
         // block the pool could instead cover. Eviction remains the fallback:
@@ -2573,30 +2586,15 @@ impl PagedKVCacheAdapter {
             self.try_grow_pool(shortfall);
         }
 
-        let mut newly_allocated: Vec<Arc<PhysicalBlock>> =
-            Vec::with_capacity(needed_blocks as usize);
-        loop {
-            let mut guard = self
+        let newly_allocated = loop {
+            let reserved = self
                 .allocator
                 .lock()
-                .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            let mut exhausted_at = None;
-            for i in 0..needed_blocks {
-                match guard.allocate() {
-                    Some(block) => newly_allocated.push(block),
-                    None => {
-                        exhausted_at = Some(i);
-                        // Roll back partial allocations to keep the pool consistent.
-                        for partial in newly_allocated.drain(..) {
-                            guard.free(partial);
-                        }
-                        break;
-                    }
-                }
-            }
-            drop(guard);
-            let Some(i) = exhausted_at else {
-                break;
+                .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?
+                .reserve(needed_blocks);
+            let i = match reserved {
+                Ok(blocks) => break blocks,
+                Err(taken) => taken,
             };
             // Exhaustion: grow the pool once and retry the whole
             // reservation; still exhausted -> existing error path. The
@@ -2618,7 +2616,7 @@ impl PagedKVCacheAdapter {
                 ));
             }
             grow_attempted = true;
-        }
+        };
 
         let block_table = self
             .block_table
@@ -2647,8 +2645,8 @@ impl PagedKVCacheAdapter {
     /// `vllm/v1/core/kv_cache_manager.py::allocate_slots`).
     ///
     /// When the reservation exceeds free + evictable blocks the adapter
-    /// first grows the pool (`try_grow_pool`) BEFORE `allocate` can evict
-    /// LRU cache-only entries, and retries after a `None` from `allocate`
+    /// first grows the pool (`try_grow_pool`) BEFORE `allocate` can take
+    /// cache-only blocks, and retries after a `None` from `allocate`
     /// as a fallback; if it is still exhausted, the already-allocated
     /// blocks within this call are rolled back so the request's
     /// block_table is unchanged (caller-visible state stays consistent
@@ -2678,7 +2676,7 @@ impl PagedKVCacheAdapter {
         let to_allocate = needed_total_blocks - current_blocks;
 
         let mut grow_attempted = false;
-        // Growth BEFORE LRU eviction: see `allocate_suffix_blocks`. Eviction
+        // Growth BEFORE eviction: see `allocate_suffix_blocks`. Eviction
         // remains the fallback, and the retry-after-None path stays as a
         // second safety net. The grow is sized by the shortfall over what
         // the allocator can already hand out, not the total reservation.
@@ -2694,29 +2692,15 @@ impl PagedKVCacheAdapter {
             self.try_grow_pool(shortfall);
         }
 
-        let mut newly_allocated: Vec<Arc<PhysicalBlock>> = Vec::with_capacity(to_allocate as usize);
-        loop {
-            let mut guard = self
+        let newly_allocated = loop {
+            let reserved = self
                 .allocator
                 .lock()
-                .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            let mut exhausted_at = None;
-            for i in 0..to_allocate {
-                match guard.allocate() {
-                    Some(block) => newly_allocated.push(block),
-                    None => {
-                        exhausted_at = Some(i);
-                        // Roll back partial allocations to keep the pool consistent.
-                        for partial in newly_allocated.drain(..) {
-                            guard.free(partial);
-                        }
-                        break;
-                    }
-                }
-            }
-            drop(guard);
-            let Some(i) = exhausted_at else {
-                break;
+                .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?
+                .reserve(to_allocate);
+            let i = match reserved {
+                Ok(blocks) => break blocks,
+                Err(taken) => taken,
             };
             // Exhaustion: grow the pool once and retry the whole
             // reservation; still exhausted -> existing error path. The
@@ -2739,7 +2723,7 @@ impl PagedKVCacheAdapter {
                 ));
             }
             grow_attempted = true;
-        }
+        };
 
         let block_table = self
             .block_table
@@ -2753,7 +2737,7 @@ impl PagedKVCacheAdapter {
 
     /// Grow the shared pool (and allocator) once. Called pre-emptively when
     /// a reservation exceeds the blocks `allocate` could hand out
-    /// (free + evictable — growth before LRU eviction), and as the retry
+    /// (free + evictable — growth before eviction), and as the retry
     /// when `allocate` still returns `None`.
     ///
     /// `needed_additional_blocks` is the SHORTFALL — how many additional
@@ -2947,11 +2931,12 @@ impl PagedKVCacheAdapter {
     /// Give an extent-growth pool's memory back to the host: cut its tail by
     /// whole extents, as many as `want_bytes` takes, down to the runway it
     /// started at, as Splash releases an empty extent (else compacts one)
-    /// before it evicts anything (Cache.cpp:704-711, 958-981). Cache-only
+    /// before it evicts anything (Splash `Cache::releaseExtent`,
+    /// `Cache::compactExtent`). Cache-only
     /// blocks above the cut move into free slots below it first; a block a
     /// request holds floors the cut. With `evict_cached` the oldest
     /// cache-only leaf blocks are evicted one at a time until the cut is
-    /// reached or none is left (Splash's victims, Cache.cpp:713-726).
+    /// reached or none is left (Splash's victims, `Cache::evictOne`).
     ///
     /// Same thread contract as [`Self::try_grow_pool`], under the same
     /// growth lock. The notifier sees the measured new total. Returns the
@@ -3006,7 +2991,7 @@ impl PagedKVCacheAdapter {
                 .shrink_plan(floor, extent, extents)
                 .map_or(current, |plan| plan.num_blocks)
                 > target
-                && guard.evict_oldest_cache_only_leaf().is_some()
+                && guard.evict_oldest_dead_leaf().is_some()
             {
                 evicted += 1;
             }
@@ -3064,7 +3049,7 @@ impl PagedKVCacheAdapter {
     /// Give back the layer bytes above the pool's block count that a cut
     /// which failed part way left behind, as Splash releases an empty extent
     /// before any cut or eviction, below the runway floor's reach
-    /// (Cache.cpp:704-711, 958-964). Caller holds the growth lock with pool
+    /// (Splash `Cache::releaseExtent`). Caller holds the growth lock with pool
     /// writes flushed. Returns the bytes freed; 0 when nothing was pending.
     fn finish_pending_shrink(&mut self) -> u64 {
         if !self.layer_kv_pool.shrink_pending() {
@@ -3320,27 +3305,20 @@ impl PagedKVCacheAdapter {
 
         self.release_request_for(seq_id)?;
         self.begin_request(seq_id)?;
-        let allocated = {
-            let mut guard = self
-                .allocator
-                .lock()
-                .map_err(|error| format!("BlockAllocator mutex poisoned: {error}"))?;
-            let mut blocks = Vec::with_capacity(live_blocks as usize);
-            for allocated_count in 0..live_blocks {
-                let Some(block) = guard.allocate() else {
-                    for block in blocks.drain(..) {
-                        guard.free(block);
-                    }
-                    drop(guard);
-                    let _ = self.release_request_for(seq_id);
-                    return Err(format!(
-                        "restore_sliding_prefix_for could allocate only {allocated_count} of \
-                         {live_blocks} live blocks"
-                    ));
-                };
-                blocks.push(block);
+        let reserved = self
+            .allocator
+            .lock()
+            .map_err(|error| format!("BlockAllocator mutex poisoned: {error}"))?
+            .reserve(live_blocks);
+        let allocated = match reserved {
+            Ok(blocks) => blocks,
+            Err(allocated_count) => {
+                let _ = self.release_request_for(seq_id);
+                return Err(format!(
+                    "restore_sliding_prefix_for could allocate only {allocated_count} of \
+                     {live_blocks} live blocks"
+                ));
             }
-            blocks
         };
 
         let Some(table) = self.block_table.as_mut() else {
@@ -3595,6 +3573,52 @@ impl PagedKVCacheAdapter {
         // reads the original "could not reserve" text, which a bare
         // rollback error would drop.
         crate::transformer::paged_policy::record_decode_wave(self, rows, "record_tokens_batched")
+    }
+
+    /// Whether a wave that records `tokens` more tokens for each `(seq,
+    /// tokens)` row fits. Below the max pool it always passes: rows reserve
+    /// one at a time and the pool may grow. At the max the wave reserves all
+    /// or nothing, so free plus evictable blocks must cover the sum of the
+    /// rows' new blocks before any row records.
+    pub(crate) fn check_wave_fits(&self, rows: &[(SeqId, u32)]) -> Result<(), String> {
+        if self.block_size == 0 {
+            return Err("block_size must be > 0".to_string());
+        }
+        let guard = self
+            .allocator
+            .lock()
+            .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+        if guard.num_blocks() < guard.max_num_blocks() {
+            return Ok(());
+        }
+        let capacity = self.max_capacity_tokens();
+        let mut need = 0u64;
+        for &(seq_id, tokens) in rows {
+            let (Some(current), Some(table)) = (
+                self.current_token_count_for(seq_id),
+                self.block_table_for(seq_id),
+            ) else {
+                continue;
+            };
+            let new_total = current.saturating_add(tokens);
+            if new_total > capacity {
+                return Err(format!(
+                    "context_length_exceeded: requested {new_total} tokens during decode, \
+                     paged cache capacity is {capacity} tokens"
+                ));
+            }
+            let needed_total = new_total.div_ceil(self.block_size);
+            need += u64::from(needed_total.saturating_sub(table.num_blocks() as u32));
+        }
+        let need = u32::try_from(need).unwrap_or(u32::MAX);
+        if need > 0 && !guard.can_allocate(need) {
+            return Err(format!(
+                "context_length_exceeded: paged decode could not reserve {need} more block(s) \
+                 for a {}-row wave at the max pool",
+                rows.len()
+            ));
+        }
+        Ok(())
     }
 
     /// Build the slot mapping for a contiguous chunk of tokens starting
@@ -6476,13 +6500,13 @@ impl PagedKVCacheAdapter {
     ///
     /// `BlockAllocator::register_prefix` now manages the prefix-cache's
     /// logical reference internally — it `incref`s on a genuine insertion
-    /// and `decref`s on every removal path (LRU eviction, Case 1
+    /// and `decref`s on every removal path (a take by `allocate`, Case 1
     /// stale-alias displacement). The adapter does NOT need to manually
     /// `incref` the request's blocks before registration: registering
     /// takes the cache's reference, and `release_request()` releases
     /// only the request's own reference, leaving the cache's reference
     /// behind. After release each registered block lands at `ref_count
-    /// >= 1`, surviving until the LRU eviction path drives it back to 0.
+    /// >= 1`, surviving until a take by `allocate` drives it back to 0.
     /// Ownership of the cache's reference lives in the allocator itself, so
     /// the eviction path is the sole releaser — the adapter never holds a
     /// manual incref that could orphan a block at `ref_count=1`.
@@ -6761,8 +6785,11 @@ impl PagedKVCacheAdapter {
                 return Err(format!("BlockAllocator mutex poisoned: {error}"));
             }
         };
+        let turn_end = self
+            .active_seq
+            .and_then(|seq_id| self.turn_end_stamps.remove(&seq_id));
         for block in blocks {
-            guard.free(block);
+            guard.free_at(block, turn_end);
         }
         drop(guard);
         let _released_table = self.block_table.take().ok_or_else(|| {
@@ -6941,6 +6968,9 @@ impl PagedKVCacheAdapter {
         let result = self.register_full_blocks_for_reuse(extra_keys, cache_salt);
         #[cfg(target_os = "macos")]
         self.meta.invalidate(MetadataClear::AttentionInputs);
+        if result.is_ok() {
+            self.stamp_turn_end();
+        }
         result
     }
 
@@ -6981,6 +7011,9 @@ impl PagedKVCacheAdapter {
             self.register_full_blocks_for_reuse_per_block(extra_keys_per_block, cache_salt);
         #[cfg(target_os = "macos")]
         self.meta.invalidate(MetadataClear::AttentionInputs);
+        if result.is_ok() {
+            self.stamp_turn_end();
+        }
         result
     }
 
@@ -7076,6 +7109,7 @@ impl PagedKVCacheAdapter {
             self.prefix_lookup_done = true;
             self.aux_prefix_unbacked = false;
             self.restored_sidecar = None;
+            self.clear_turn_end();
             #[cfg(target_os = "macos")]
             self.meta.invalidate(MetadataClear::ActiveRequest);
             return Ok((prior_token_count, 0));
@@ -7116,6 +7150,7 @@ impl PagedKVCacheAdapter {
         // Restore the prior cached_token_count regardless of outcome.
         self.cached_token_count = prior_cached;
         let newly_allocated = alloc_result?;
+        self.clear_turn_end();
 
         // Clear the "already registered" + "prefix lookup done" flags
         // so the upcoming turn's record_tokens / find_cached_prefix
@@ -7178,9 +7213,30 @@ impl PagedKVCacheAdapter {
         self.eval_pending_pool_writes()?;
         self.already_registered = true;
         self.prefix_lookup_done = true;
+        self.stamp_turn_end();
         #[cfg(target_os = "macos")]
         self.meta.invalidate(MetadataClear::ActiveRequest);
         Ok(())
+    }
+
+    /// The active table outlives its turn: record when the turn ended, so a
+    /// later release stamps its tip as if the request had ended then.
+    fn stamp_turn_end(&mut self) {
+        if let Some(seq_id) = self.active_seq {
+            self.turn_end_stamps.insert(seq_id, self.recency.next());
+        }
+    }
+
+    fn clear_turn_end(&mut self) {
+        if let Some(seq_id) = self.active_seq {
+            self.turn_end_stamps.remove(&seq_id);
+        }
+    }
+
+    /// When `seq_id`'s kept table ended its last turn, if it is kept.
+    #[cfg(test)]
+    pub(crate) fn turn_end_stamp(&self, seq_id: SeqId) -> Option<u64> {
+        self.turn_end_stamps.get(&seq_id).copied()
     }
 
     // ------------------------ Getters ------------------------
@@ -7222,7 +7278,8 @@ impl PagedKVCacheAdapter {
             total_blocks: allocator.num_blocks(),
             max_total_blocks: allocator.max_num_blocks(),
             free_blocks: allocator.num_free_blocks(),
-            reclaimable_blocks: allocator.num_evictable_blocks(),
+            reclaimable_blocks: allocator.num_reusable_blocks(),
+            evictable_blocks: allocator.num_evictable_blocks(),
             allocated_blocks: allocator.num_allocated_blocks(),
         })
     }
@@ -11325,21 +11382,47 @@ mod tests {
 
     /// A mid-batch record failure unwinds the already-recorded rows
     /// newest-first, leaving every request exactly where the wave started.
-    /// Five-block pool: three 1-block rows leave two free blocks, so rows 1
-    /// and 2 cross a block boundary successfully and row 3 exhausts the
-    /// allocator — exercising the reverse-order rollback of both rows.
+    /// A 5-of-6 pool (below the max, so the wave gate passes) with the grow
+    /// probe declining: three 1-block rows leave two free blocks, so rows 1
+    /// and 2 cross a block boundary and row 3 exhausts the allocator —
+    /// exercising the reverse-order rollback of both rows.
+    #[cfg(target_os = "macos")]
     #[test]
     fn record_tokens_batched_rolls_back_prior_rows_on_failure() {
-        let Some(mut adapter) = maybe_adapter(new_allocator(5, 4), 4) else {
-            eprintln!(
-                "skipping record_tokens_batched_rolls_back_prior_rows_on_failure: Metal unavailable"
-            );
-            return;
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
         };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            5,
+            6,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(error) => {
+                eprintln!(
+                    "skipping record_tokens_batched_rolls_back_prior_rows_on_failure: {error}"
+                );
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(5, 6, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(|_: u32| -> Result<u32, String> {
+            Ok(0)
+        })));
+        let prompt: Vec<u32> = (1..=8).collect();
         for seq_id in [1, 2, 3] {
             adapter.begin_request(seq_id).unwrap();
-            adapter.allocate_suffix_blocks_for(seq_id, 4).unwrap();
-            adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+            adapter.allocate_suffix_blocks_for(seq_id, 8).unwrap();
+            adapter.record_tokens(&prompt).unwrap();
         }
 
         let error = adapter
@@ -11350,10 +11433,231 @@ mod tests {
             "got: {error}"
         );
         for seq_id in [1, 2, 3] {
-            assert_eq!(adapter.current_token_count_for(seq_id), Some(4));
-            assert_eq!(adapter.request_tokens_for(seq_id).unwrap(), &[1, 2, 3, 4]);
-            assert_eq!(adapter.block_table_for(seq_id).unwrap().num_tokens(), 4);
+            assert_eq!(adapter.current_token_count_for(seq_id), Some(8));
+            assert_eq!(adapter.request_tokens_for(seq_id).unwrap(), &prompt[..]);
+            assert_eq!(adapter.block_table_for(seq_id).unwrap().num_tokens(), 8);
         }
+    }
+
+    fn cache_dead_chain(allocator: &Arc<Mutex<BlockAllocator>>, tokens: &[u32]) {
+        let mut guard = allocator.lock().unwrap();
+        let block_size = guard.block_size();
+        let blocks: Vec<_> = (0..tokens.len() as u32 / block_size)
+            .map(|_| guard.allocate().expect("a block for the dead chain"))
+            .collect();
+        guard
+            .cache_full_blocks(tokens, &blocks, block_size, &[], 0)
+            .expect("cache the dead chain");
+        for block in blocks {
+            guard.free(block);
+        }
+    }
+
+    fn chain_hit_blocks(allocator: &Arc<Mutex<BlockAllocator>>, tokens: &[u32]) -> usize {
+        let mut guard = allocator.lock().unwrap();
+        let block_size = guard.block_size();
+        let (hit, _) = guard.find_longest_cache_hit(tokens, block_size, &[], 0);
+        let n = hit.len();
+        for block in hit {
+            guard.free(block);
+        }
+        n
+    }
+
+    /// At the max pool a wave records all of its rows or none: two rows at
+    /// a full block each need 2 more blocks against 0 free and 1 evictable.
+    /// Mutation: drop the `check_wave_fits` call in `record_decode_wave` →
+    /// red (row 1 takes the dead leaf, hit 0, the error names sequence 2).
+    #[test]
+    fn max_pool_wave_records_nothing_it_cannot_cover() {
+        let allocator = new_allocator(3, 4);
+        let Some(pool) = maybe_test_pool(3, 4) else {
+            eprintln!("skipping max_pool_wave_records_nothing_it_cannot_cover: Metal unavailable");
+            return;
+        };
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), pool, 4).unwrap();
+        for (seq_id, base) in [(1, 1), (2, 20)] {
+            adapter.begin_request(seq_id).unwrap();
+            adapter.allocate_suffix_blocks_for(seq_id, 4).unwrap();
+            adapter
+                .record_tokens(&[base, base + 1, base + 2, base + 3])
+                .unwrap();
+        }
+        let dead = [50, 51, 52, 53];
+        cache_dead_chain(&allocator, &dead);
+        assert_eq!(allocator.lock().unwrap().num_free_blocks(), 0);
+
+        let error = adapter
+            .record_tokens_batched(&[(1, 9), (2, 9)])
+            .expect_err("the wave needs 2 blocks with 1 evictable");
+        assert!(
+            error.contains("could not reserve 2 more block"),
+            "got: {error}"
+        );
+        assert!(!error.contains("sequence 2"), "got: {error}");
+        assert_eq!(adapter.current_token_count_for(1), Some(4));
+        assert_eq!(adapter.current_token_count_for(2), Some(4));
+        assert_eq!(chain_hit_blocks(&allocator, &dead), 1);
+    }
+
+    /// At the max pool a sliding restore takes nothing it cannot cover.
+    /// Mutation: the bare `allocate()` loop in `restore_sliding_prefix_for`
+    /// → red (the dead chain is evicted and the error says 1 of 2).
+    #[test]
+    fn sliding_restore_at_the_max_evicts_nothing_it_cannot_cover() {
+        let allocator = new_allocator(3, 4);
+        let Some(pool) = maybe_test_pool(3, 4) else {
+            eprintln!(
+                "skipping sliding_restore_at_the_max_evicts_nothing_it_cannot_cover: Metal unavailable"
+            );
+            return;
+        };
+        let num_layers = pool.num_layers();
+        let mut adapter =
+            PagedKVCacheAdapter::new_sliding(Arc::clone(&allocator), pool, 4, 8, 64).unwrap();
+        let dead = [50, 51, 52, 53];
+        cache_dead_chain(&allocator, &dead);
+        let held = allocator
+            .lock()
+            .unwrap()
+            .allocate()
+            .expect("the last free block");
+        assert_eq!(allocator.lock().unwrap().num_free_blocks(), 0);
+
+        let layer_kv = (0..num_layers)
+            .map(|_| {
+                Ok((
+                    MxArray::from_float32(&[0.0], &[1])?,
+                    MxArray::from_float32(&[0.0], &[1])?,
+                ))
+            })
+            .collect::<napi::Result<Vec<_>>>()
+            .expect("placeholder layer arrays");
+        let prompt: Vec<u32> = (0..8).collect();
+        let error = adapter
+            .restore_sliding_prefix_for(7, &prompt, 8, &layer_kv)
+            .expect_err("2 live blocks with 1 evictable");
+        assert!(error.contains("could allocate only 0 of 2"), "got: {error}");
+        assert_eq!(chain_hit_blocks(&allocator, &dead), 1);
+        allocator.lock().unwrap().free(held);
+    }
+
+    /// Below the max (3/6) with the grow declined, 2 free blocks and one
+    /// cached dead leaf: a 4-block prompt fails and takes nothing, so the
+    /// leaf still hits; a 3-block prompt is covered and takes the leaf, as
+    /// before. Mutations: put `self.num_blocks >= self.max_num_blocks &&`
+    /// back in front of the `reserve` gate -> red (the error says reserved
+    /// 3, hit 0); count only free blocks in the gate -> red (the 3-block
+    /// prompt fails).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn below_max_refused_reserve_takes_nothing_after_the_grow() {
+        let dead: Vec<u32> = (50..58).collect();
+        for (blocks, fits) in [(4u32, false), (3, true)] {
+            let cfg = mlx_paged_attn::PagedAttentionConfig {
+                block_size: 8,
+                num_kv_heads: 1,
+                head_size: 64,
+                num_layers: 2,
+                gpu_memory_mb: 256,
+                use_fp8_cache: Some(false),
+                max_seq_len: Some(128),
+                max_batch_size: Some(2),
+            };
+            let pool = match mlx_paged_attn::LayerKVPool::new(
+                cfg,
+                3,
+                6,
+                mlx_paged_attn::metal::MetalDtype::BFloat16,
+            ) {
+                Ok(pool) => Arc::new(pool),
+                Err(error) => {
+                    eprintln!(
+                        "skipping below_max_refused_reserve_takes_nothing_after_the_grow: {error}"
+                    );
+                    return;
+                }
+            };
+            let allocator = Arc::new(Mutex::new(BlockAllocator::new(3, 6, 8)));
+            let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), pool, 8).unwrap();
+            adapter.set_grow_headroom_probe_override(Some(Arc::new(
+                |_: u32| -> Result<u32, String> { Ok(0) },
+            )));
+            cache_dead_chain(&allocator, &dead);
+            assert_eq!(allocator.lock().unwrap().num_free_blocks(), 2);
+
+            adapter.begin_request(1).unwrap();
+            let result = adapter.allocate_suffix_blocks_for(1, blocks * 8);
+            if fits {
+                assert_eq!(result, Ok(3));
+                assert_eq!(chain_hit_blocks(&allocator, &dead), 0);
+            } else {
+                let error = result.expect_err("4 blocks against 2 free and 1 evictable");
+                assert!(error.contains("reserved 0 before rollback"), "got: {error}");
+                assert_eq!(chain_hit_blocks(&allocator, &dead), 1);
+                assert_eq!(allocator.lock().unwrap().num_free_blocks(), 2);
+            }
+        }
+    }
+
+    /// A table kept past its turn is freed at its turn-end stamp, so it is
+    /// older than a request that ended after it. Mutation: `release_request`
+    /// frees with plain `free` → red (seq 2's block is taken).
+    #[test]
+    fn kept_table_release_keeps_its_turn_end_stamp() {
+        let allocator = new_allocator(2, 4);
+        let Some(pool) = maybe_test_pool(2, 4) else {
+            eprintln!("skipping kept_table_release_keeps_its_turn_end_stamp: Metal unavailable");
+            return;
+        };
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), pool, 4).unwrap();
+        let first = [1, 2, 3, 4];
+        adapter
+            .prepare_turn(1, &first, first.len() as u32, true, &[], 0, false)
+            .unwrap();
+        adapter.record_tokens(&first).unwrap();
+        adapter.finalize_turn_keep_live(&[], 0).unwrap();
+        assert!(adapter.turn_end_stamp(1).is_some());
+        let first_id = adapter.block_table_for(1).unwrap().block_ids()[0];
+
+        let second = [20, 21, 22, 23];
+        adapter
+            .prepare_turn(2, &second, second.len() as u32, true, &[], 0, false)
+            .unwrap();
+        adapter.record_tokens(&second).unwrap();
+        adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
+        adapter.release_request().unwrap();
+
+        adapter.release_request_for(1).unwrap();
+        assert_eq!(adapter.turn_end_stamp(1), None);
+
+        adapter.begin_request(3).unwrap();
+        adapter.allocate_suffix_blocks_for(3, 4).unwrap();
+        assert_eq!(adapter.block_table_for(3).unwrap().block_ids()[0], first_id);
+        assert_eq!(chain_hit_blocks(&allocator, &second), 1);
+    }
+
+    /// Telemetry reports a marked chain as reclaimable but not evictable.
+    /// Mutation: `reclaimable_blocks: num_evictable_blocks()` in
+    /// `block_telemetry` → red (0).
+    #[test]
+    fn telemetry_counts_marked_chains_as_reclaimable_only() {
+        let allocator = new_allocator(3, 4);
+        let Some(adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping telemetry_counts_marked_chains_as_reclaimable_only: Metal unavailable"
+            );
+            return;
+        };
+        let tokens: Vec<u32> = (0..8).collect();
+        cache_dead_chain(&allocator, &tokens);
+        let hashes = mlx_paged_attn::chain_hashes(&tokens, 4, &[], 0);
+        allocator.lock().unwrap().set_state_marks([hashes[1]]);
+
+        let telemetry = adapter.block_telemetry().unwrap();
+        assert_eq!(telemetry.reclaimable_blocks, 2);
+        assert_eq!(telemetry.evictable_blocks, 0);
+        assert_eq!(telemetry.free_blocks, 1);
     }
 
     #[test]
@@ -11810,9 +12114,9 @@ mod tests {
     /// Calling `register_full_blocks_for_reuse` twice on the same request
     /// must NOT double-incref. With the BlockAllocator-owned cache
     /// reference, even a duplicate call wouldn't permanently elevate
-    /// ref_count (same-(block, hash) re-register is a pure LRU refresh
-    /// with no incref), but the adapter's idempotency guard still prevents
-    /// the spurious LRU shuffle and re-locking work.
+    /// ref_count (same-(block, hash) re-register is a refresh that
+    /// stamps nothing and does not incref), but the adapter's idempotency
+    /// guard still prevents the re-locking work.
     #[test]
     fn test_register_full_blocks_for_reuse_idempotent_repeat() {
         let allocator = new_allocator(8, 4);
@@ -11957,83 +12261,12 @@ mod tests {
         );
     }
 
-    /// Regression test for the orphaned-block leak: when registered blocks
-    /// are evicted from the prefix cache by capacity pressure, they must
-    /// return to the free pool. Otherwise the pool would drain
-    /// monotonically as long-running requests cycle through unique
-    /// prompts.
-    #[test]
-    fn test_evict_from_prefix_cache_returns_blocks_to_free_pool() {
-        let allocator = new_allocator(8, 4);
-        // Cap the cache at 1 entry so each new register evicts the prior.
-        allocator.lock().unwrap().set_max_prefix_cache_entries(1);
-        let initial_free = allocator.lock().unwrap().num_free_blocks();
-
-        // Helper: do one full register-and-release cycle for a unique
-        // prompt, returning when the request handle has been released.
-        let run_once = |adapter: &mut PagedKVCacheAdapter, tokens: &[u32]| {
-            adapter.reset_for_new_request(0).unwrap();
-            adapter.allocate_suffix_blocks(tokens.len() as u32).unwrap();
-            adapter.record_tokens(tokens).unwrap();
-            adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
-            adapter.release_request().unwrap();
-        };
-
-        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
-            eprintln!(
-                "skipping test_evict_from_prefix_cache_returns_blocks_to_free_pool: \
-                 Metal unavailable"
-            );
-            return;
-        };
-
-        // Cycle 1: register a 1-block prompt. Cache holds it.
-        run_once(&mut adapter, &[1, 2, 3, 4]);
-        // 1 block pinned by the cache → free pool short by 1.
-        assert_eq!(
-            allocator.lock().unwrap().num_free_blocks(),
-            initial_free - 1
-        );
-
-        // Cycle 2: register a different 1-block prompt. The new register
-        // evicts cycle 1's block (capacity = 1). Eviction must release
-        // the cache's logical reference, returning cycle 1's block to
-        // the free pool. Cycle 2's block is now the cache occupant.
-        run_once(&mut adapter, &[10, 20, 30, 40]);
-        assert_eq!(
-            allocator.lock().unwrap().num_free_blocks(),
-            initial_free - 1,
-            "evicted block from cycle 1 must return to free pool; \
-             cycle 2 block is the new cache occupant"
-        );
-
-        // Cycle 3: same pattern. Evicts cycle 2, occupies the cache.
-        run_once(&mut adapter, &[100, 200, 300, 400]);
-        assert_eq!(
-            allocator.lock().unwrap().num_free_blocks(),
-            initial_free - 1,
-            "after three cycles only one block stays pinned (the latest); \
-             previous evictions must have replenished the pool"
-        );
-
-        // Now run many more cycles to confirm the pool isn't draining.
-        for round in 0..16u32 {
-            let base = 1000 + round * 4;
-            run_once(&mut adapter, &[base, base + 1, base + 2, base + 3]);
-            assert_eq!(
-                allocator.lock().unwrap().num_free_blocks(),
-                initial_free - 1,
-                "round {round}: pool must stabilize at initial_free - 1"
-            );
-        }
-    }
-
     /// Regression test for the allocation-pressure / cache-eviction gap:
     /// the adapter must keep making progress when the pool fills up
     /// purely with cache-pinned blocks. With a tiny allocator (2 blocks)
     /// and a large prefix cache, two register-and-release cycles leave
     /// every block pinned by the cache. The next request must succeed
-    /// by evicting the LRU oldest cache-only block.
+    /// by taking the oldest dead leaf.
     #[test]
     fn test_adapter_can_progress_when_pool_exhausted_by_cache() {
         let allocator = new_allocator(2, 4);
@@ -12075,7 +12308,7 @@ mod tests {
 
         // Cycle 3: a third unique prompt P3. find_cached_prefix misses
         // (P3 hash is not in the cache). allocate_suffix_blocks must
-        // succeed by evicting the LRU oldest cache-only block (P1's).
+        // succeed by taking the oldest dead leaf (P1's).
         let p3: [u32; 4] = [100, 200, 300, 400];
         adapter.reset_for_new_request(2).unwrap();
         let cached = adapter.find_cached_prefix(&p3, &[], 0, false).unwrap();
@@ -12083,15 +12316,15 @@ mod tests {
 
         let n_alloc = adapter
             .allocate_suffix_blocks(p3.len() as u32)
-            .expect("allocate must succeed by evicting LRU cache-only block");
+            .expect("allocate must succeed by taking the oldest dead leaf");
         assert_eq!(n_alloc, 1, "single 4-token prompt = 1 block");
 
-        // The newly-issued block should be P1's recycled id (P1 was the
-        // LRU oldest cache entry).
+        // The newly-issued block should be P1's recycled id (P1's leaf
+        // carries the oldest stamp).
         let new_block_id = adapter.block_table().unwrap().blocks()[0].block_id;
         assert_eq!(
             new_block_id, p1_block_id,
-            "evicted block must be P1's (LRU oldest cache entry)"
+            "taken block must be P1's (oldest dead leaf)"
         );
 
         // P2's prefix entry must still resolve — eviction targeted P1
@@ -16331,7 +16564,7 @@ mod tests {
     /// **Growth happy path**: an adapter over a 4-block pool with a 16-block
     /// max grows on allocation exhaustion. Asserts the target arithmetic
     /// (`min(max, max(2*current, current+needed))`), that growth precedes
-    /// LRU eviction (a cache-only prefix block survives both grows), that
+    /// eviction (a cache-only prefix block survives both grows), that
     /// post-grow writes land in the new buffers (round-trip via
     /// `read_kv_range`), and that the growth notifier fires once per grow
     /// with the new total bytes. Skipped on no-Metal hosts.
@@ -16405,7 +16638,7 @@ mod tests {
         }
 
         // Request B needs 5 blocks with 3 free + 1 evictable = 4 available:
-        // growth must engage BEFORE any LRU eviction, so request A's cached
+        // growth must engage BEFORE any eviction, so request A's cached
         // block survives. The grow is sized by the shortfall (5 - 4 = 1), so
         // the doubling floor dominates: min(16, max(2*4, 4+1)) = 8 blocks.
         adapter.reset_for_new_request(8).unwrap();

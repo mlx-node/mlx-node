@@ -3,8 +3,8 @@
 //! This is the GPU-storage counterpart to `BlockAllocator`. They form a
 //! deliberate split:
 //!
-//! - `BlockAllocator` owns the *logical* lifecycle: refcounts, the LRU
-//!   prefix cache, hashing, and the free pool.
+//! - `BlockAllocator` owns the *logical* lifecycle: refcounts, the
+//!   prefix cache and its recency clock, hashing, and the free pool.
 //! - `LayerKVPool` owns the *physical* storage: one (key, value)
 //!   `metal::Buffer` pair per transformer layer, sized for `num_blocks`
 //!   block slots.
@@ -18,7 +18,7 @@
 //!
 //! `CacheEngineManager` already owns its own `BlockAllocator`. The session
 //! adapter takes its allocator from outside (so multiple adapters share
-//! one allocator with shared LRU/prefix state). Using `CacheEngineManager`
+//! one allocator with shared recency/prefix state). Using `CacheEngineManager`
 //! would force us to drop the external allocator and route through
 //! `manager.allocator()`, which conflicts with the adapter's design.
 //!

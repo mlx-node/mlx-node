@@ -205,22 +205,12 @@ impl ColdTierWalk<'_> {
             parent_key = Some(key);
         }
 
-        let mut reserved = Vec::with_capacity(keys.len());
-        {
-            let mut allocator = self
-                .allocator
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for _ in 0..keys.len() {
-                let Some(block) = allocator.allocate() else {
-                    for block in reserved.drain(..) {
-                        allocator.free(block);
-                    }
-                    return None;
-                };
-                reserved.push(block);
-            }
-        }
+        let reserved = self
+            .allocator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reserve(u32::try_from(keys.len()).ok()?)
+            .ok()?;
         let job =
             match self
                 .cold

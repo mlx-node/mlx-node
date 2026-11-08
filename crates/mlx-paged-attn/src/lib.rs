@@ -29,6 +29,7 @@ mod extern_c;
 mod layer_kv_pool;
 mod prefix_registry;
 pub mod profile;
+mod recency;
 
 #[cfg(target_os = "macos")]
 pub mod metal;
@@ -64,3 +65,4 @@ pub use config::*;
 pub use layer_kv_pool::set_shrink_fail_at_layer;
 pub use layer_kv_pool::{LayerKVPool, RESTORE_STAGING_BYTES};
 pub use prefix_registry::{PrefixKeys, chain_hashes, chain_hashes_per_block, hash_tokens};
+pub use recency::CacheRecency;

@@ -164,6 +164,10 @@ pub(crate) fn record_decode_wave(
             .ok_or_else(|| format!("{family} batched decode received unknown sequence {seq_id}"))?;
         planned_rows.push((seq_id, position));
     }
+    let wave: Vec<(SeqId, u32)> = rows.iter().map(|&(seq_id, _)| (seq_id, 1)).collect();
+    adapter
+        .check_wave_fits(&wave)
+        .map_err(|error| format!("{family} batched decode: {error}"))?;
 
     let mut recorded: Vec<(SeqId, u32)> = Vec::with_capacity(rows.len());
     for &(seq_id, token) in rows {
