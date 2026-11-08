@@ -608,19 +608,34 @@ fn chain_tokens(seed: u32, blocks: u32, block_size: u32) -> Vec<u32> {
 /// Caches `tokens` (whole blocks) as a chain nothing holds; returns its
 /// block hashes.
 pub(super) fn cache_chain(inner: &Qwen35Inner, tokens: &[u32]) -> Vec<u64> {
+    cache_keyed_chain(inner, tokens, &[], 0)
+}
+
+/// [`cache_chain`] under per-block `keys` and `salt`.
+fn cache_keyed_chain(
+    inner: &Qwen35Inner,
+    tokens: &[u32],
+    keys: &[Vec<u64>],
+    salt: u64,
+) -> Vec<u64> {
     let adapter = inner.paged_adapter.as_ref().expect("adapter");
     let block_size = adapter.block_size();
+    let prefix_keys = if keys.is_empty() {
+        mlx_paged_attn::PrefixKeys::Uniform(&[])
+    } else {
+        mlx_paged_attn::PrefixKeys::PerBlock(keys)
+    };
     let mut allocator = adapter.allocator().lock().expect("allocator");
     let blocks: Vec<_> = (0..tokens.len() as u32 / block_size)
         .map(|_| allocator.allocate().expect("a block for the chain"))
         .collect();
     allocator
-        .cache_full_blocks(tokens, &blocks, block_size, &[], 0)
+        .cache_full_blocks_with_keys(tokens, &blocks, block_size, prefix_keys, salt)
         .expect("cache the chain");
     for block in blocks {
         allocator.free(block);
     }
-    mlx_paged_attn::chain_hashes(tokens, block_size, &[], 0)
+    prefix_keys.chain_hashes(tokens, block_size, salt)
 }
 
 /// Sequence `seq_id` holds `blocks` uncached blocks.
@@ -1205,7 +1220,7 @@ fn a_replay_point_in_use_is_not_a_unit() -> Result<()> {
         let e_key = rung_key(&inner, 2 * pool_block_size(&inner), e_final);
         assert_eq!(inner.gdn_in_use_for_test(0), Some(&e_key), "vlm {vlm}");
         assert!(
-            inner.gdn_state_bytes(&[]) > 0,
+            inner.gdn_state_bytes(Keep::default()) > 0,
             "vlm {vlm}: the count must pass"
         );
         clear_grow_reclaim_log();
@@ -1314,6 +1329,119 @@ fn cap_prompt_grow_drops_nothing_its_own_hit_inflates() -> Result<()> {
     ensure_paged_pool_for_prompt(&mut inner, &prompt, &keys, 0);
     assert!(grow_reclaim_log().is_empty());
     assert_eq!(inner.ladder_entries_for_test().len(), 2);
+    Ok(())
+}
+
+/// At the cap a rung on the prompt's tokens but cached under `keys` and
+/// `salt` (another chain) is no replay point of the prompt: the prompt
+/// grow drops it and the prompt's four blocks fit.
+fn cap_prompt_grow_drops_a_rung_on_another_chain(
+    seed: u64,
+    keys: impl Fn(&[u32], u32) -> Vec<Vec<u64>>,
+    salt: u64,
+) -> Result<()> {
+    let mut inner = fixture(seed);
+    install_pool(&mut inner, 4, 4, passing_probe())?;
+    let block_size = pool_block_size(&inner);
+    let stale = chain_tokens(30, 3, block_size);
+    let stale_keys = keys(&stale, block_size);
+    let hashes = cache_keyed_chain(&inner, &stale, &stale_keys, salt);
+    let stamp = inner.cache_recency.next();
+    push_rung(&mut inner, stale.clone(), hashes, stamp);
+    let mut prompt = stale;
+    prompt.extend(chain_tokens(31, 1, block_size));
+    let prompt_keys = per_block_keys(&prompt, block_size);
+    clear_grow_reclaim_log();
+    ensure_paged_pool_for_prompt(&mut inner, &prompt, &prompt_keys, 0);
+    assert_eq!(grow_reclaim_log(), vec![GrowReclaim::Ladder]);
+    assert!(inner.ladder_entries_for_test().is_empty());
+    let adapter = inner.paged_adapter.as_mut().expect("adapter");
+    adapter.begin_request(1).map_err(Error::from_reason)?;
+    adapter
+        .reserve_rows_for(1, prompt.len() as u32)
+        .map_err(Error::from_reason)?;
+    Ok(())
+}
+
+/// A rung on another cache salt.
+/// Mutation: restore the token test for ladder entries in
+/// `KeptPoints::keeps` → red (the rung stays, the grow log is empty).
+#[test]
+fn cap_prompt_grow_drops_a_rung_on_another_salt() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    cap_prompt_grow_drops_a_rung_on_another_chain(0xDFA5_1818, per_block_keys, 7)
+}
+
+/// A rung on other image keys.
+/// Mutation: restore the token test for ladder entries in
+/// `KeptPoints::keeps` → red (the rung stays, the grow log is empty).
+#[test]
+fn cap_prompt_grow_drops_a_rung_on_other_image_keys() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    cap_prompt_grow_drops_a_rung_on_another_chain(
+        0xDFA5_1819,
+        |tokens, block_size| vec![vec![0x1A6E]; tokens.len() / block_size as usize],
+        0,
+    )
+}
+
+/// At the cap a rung whose tip is a held tail registered under two
+/// released blocks (a verified-duplicate prefix) is a unit: dropping it
+/// lets those blocks go.
+/// Mutation: keep a mark in `tip_marks` only when the mark itself is
+/// cache-only → red (`Err` "could not reserve", nothing taken).
+#[test]
+fn cap_reclaim_takes_a_rung_over_a_held_tail() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let mut inner = fixture(0xDFA5_1820);
+    install_pool(&mut inner, 5, 5, passing_probe())?;
+    let block_size = pool_block_size(&inner);
+    let chain = chain_tokens(16, 3, block_size);
+    cache_chain(&inner, &chain[..(2 * block_size) as usize]);
+    {
+        let adapter = inner.paged_adapter.as_mut().expect("adapter");
+        adapter.begin_request(9).map_err(Error::from_reason)?;
+        adapter
+            .allocate_suffix_blocks_for(9, 3 * block_size)
+            .map_err(Error::from_reason)?;
+        adapter.record_tokens(&chain).map_err(Error::from_reason)?;
+        adapter
+            .register_full_blocks_for_reuse(&[], 0)
+            .map_err(Error::from_reason)?;
+    }
+    let hashes = mlx_paged_attn::chain_hashes(&chain, block_size, &[], 0);
+    {
+        let adapter = inner.paged_adapter.as_ref().expect("adapter");
+        let allocator = adapter.allocator().lock().expect("allocator");
+        assert_eq!(allocator.cache_only_count(hashes[..2].iter().copied()), 2);
+        assert!(!allocator.is_cache_only(hashes[2]));
+    }
+    push_rung(&mut inner, chain, hashes, 10);
+    let blocks = inner
+        .paged_adapter
+        .as_ref()
+        .expect("adapter")
+        .block_telemetry()
+        .map_err(Error::from_reason)?;
+    assert_eq!((blocks.free_blocks, blocks.evictable_blocks), (0, 0));
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .begin_request(1)
+        .map_err(Error::from_reason)?;
+    clear_grow_reclaim_log();
+    let mut runs = 0;
+    paged_step_reclaiming(&mut inner, reserve_step(&mut runs, 1, block_size))?;
+    assert_eq!(runs, 2);
+    assert_eq!(grow_reclaim_log(), vec![GrowReclaim::Ladder]);
+    assert!(inner.ladder_entries_for_test().is_empty());
     Ok(())
 }
 

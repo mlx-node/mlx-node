@@ -111,12 +111,53 @@ pub(crate) fn draft_keep_from(
 
 /// The prompt a reclaim keeps: its ladder and history entries are no
 /// units, and the marked blocks it hits are out of the count. With the
-/// prompt's block keys and salt the hit is read by hash; without them, by
-/// token prefix.
+/// prompt's block keys and salt the hit and its ladder rungs are read by
+/// hash; without them, by token prefix.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Keep<'a> {
     pub tokens: &'a [u32],
     pub keys: Option<(&'a [Vec<u64>], u64)>,
+}
+
+impl<'a> Keep<'a> {
+    /// The salted, keyed chain hashes the prompt's lookup walks, its last
+    /// token excluded (the lookup leaves one token to prefill); `None`
+    /// without keys.
+    pub(crate) fn hit_chain(&self, block_size: u32) -> Option<Vec<u64>> {
+        let (keys, salt) = self.keys?;
+        let prompt = &self.tokens[..self.tokens.len().saturating_sub(1)];
+        Some(mlx_paged_attn::PrefixKeys::PerBlock(keys).chain_hashes(prompt, block_size, salt))
+    }
+
+    /// The replay points this prompt can restore, resolved once for a
+    /// reclaim (Splash `RestoredChains`).
+    pub(crate) fn points(self, block_size: Option<u32>) -> KeptPoints<'a> {
+        KeptPoints {
+            tokens: self.tokens,
+            chain: block_size.and_then(|block_size| self.hit_chain(block_size)),
+        }
+    }
+}
+
+/// What a [`Keep`] protects from a reclaim. A ladder rung on another salt
+/// or image-key chain is no replay point of the prompt even when its
+/// tokens prefix it: the lookup rejects it by hash (Splash
+/// `Walk::keepsState`).
+pub(crate) struct KeptPoints<'a> {
+    tokens: &'a [u32],
+    chain: Option<Vec<u64>>,
+}
+
+impl KeptPoints<'_> {
+    /// Whether an entry on `tokens` is kept: by hash chain when the prompt
+    /// has keys and the entry sits on blocks (`block_hashes`), else by
+    /// token prefix.
+    pub(crate) fn keeps(&self, tokens: &[u32], block_hashes: Option<&[u64]>) -> bool {
+        match (&self.chain, block_hashes) {
+            (Some(chain), Some(hashes)) => !hashes.is_empty() && chain.starts_with(hashes),
+            _ => !self.tokens.is_empty() && self.tokens.starts_with(tokens),
+        }
+    }
 }
 
 /// A Qwen3.5-family target model that runs DFlash2 turns on its flat caches.
@@ -185,13 +226,17 @@ pub(crate) trait DFlash2Target: ChatBackend {
     fn on_flat_prefill_done(&mut self) {}
 
     /// The oldest ladder or history entry a KV need may take.
-    fn oldest_gdn_state(&self, at_cap: bool, skip: &HashSet<UnitKey>, keep: &[u32])
-    -> Option<Unit>;
+    fn oldest_gdn_state(
+        &self,
+        at_cap: bool,
+        skip: &HashSet<UnitKey>,
+        keep: Keep<'_>,
+    ) -> Option<Unit>;
     /// Drops a ladder or history entry; false when it is gone.
     fn drop_gdn_state(&mut self, key: &UnitKey) -> bool;
     fn sync_gdn_state_marks(&self);
     /// Bytes of the GDN entries a reclaim may take.
-    fn gdn_state_bytes(&self, keep: &[u32]) -> u64;
+    fn gdn_state_bytes(&self, keep: Keep<'_>) -> u64;
     /// Marked cache-only blocks the kept prompt hits.
     fn marked_hit_blocks(&self, keep: Keep<'_>) -> u32;
 
@@ -827,7 +872,7 @@ impl<T: DFlash2Target> KvReclaim for ModelReclaim<'_, T> {
             bytes: if at_cap {
                 0
             } else {
-                state_reach_bytes(&*self.target, self.keep.tokens)
+                state_reach_bytes(&*self.target, self.keep)
             },
         }
     }
@@ -837,7 +882,7 @@ impl<T: DFlash2Target> KvReclaim for ModelReclaim<'_, T> {
     }
 
     fn oldest_state(&self, at_cap: bool, skip: &HashSet<UnitKey>) -> Option<Unit> {
-        oldest_state_unit(&*self.target, at_cap, skip, self.keep.tokens)
+        oldest_state_unit(&*self.target, at_cap, skip, self.keep)
     }
 
     fn take(&mut self, key: &UnitKey) -> bool {
@@ -852,7 +897,7 @@ pub(crate) enum Taken {
 }
 
 /// Bytes every parked state and every GDN entry outside `keep` hold.
-pub(crate) fn state_reach_bytes<T: DFlash2Target>(target: &T, keep: &[u32]) -> u64 {
+pub(crate) fn state_reach_bytes<T: DFlash2Target>(target: &T, keep: Keep<'_>) -> u64 {
     let store = target.dflash2_states().store.bytes();
     store
         .state_bytes
@@ -890,7 +935,7 @@ pub(crate) fn oldest_state_unit<T: DFlash2Target>(
     target: &T,
     at_cap: bool,
     skip: &HashSet<UnitKey>,
-    keep: &[u32],
+    keep: Keep<'_>,
 ) -> Option<Unit> {
     let store = if at_cap {
         None
@@ -1307,7 +1352,7 @@ fn flat_kv_in_reach<T: DFlash2Target>(target: &T, live: u64, need: &KvGrowthNeed
         .paged_adapter_ref()
         .map_or(0, PagedKVCacheAdapter::release_reach_bytes);
     live.saturating_add(cut)
-        .saturating_add(state_reach_bytes(target, &[]))
+        .saturating_add(state_reach_bytes(target, Keep::default()))
         >= dflash2_kv_headroom_for(need.kv_bytes)
 }
 
@@ -1354,7 +1399,7 @@ fn flat_reclaim_one<T: DFlash2Target>(
         }
     }
     loop {
-        let state = oldest_state_unit(&*target, false, skip, &[]);
+        let state = oldest_state_unit(&*target, false, skip, Keep::default());
         let table = target.paged_adapter_ref().and_then(|adapter| {
             if !adapter.extent_within_reach(shortfall) {
                 return None;
@@ -3135,7 +3180,7 @@ mod tests {
                 .expect("the KV grows");
             assert_eq!(inner.dflash2_states.store.bytes().entries, 1, "{name}");
             assert!(
-                state_reach_bytes(&inner, &[]) < dflash2_kv_headroom_for(need.kv_bytes),
+                state_reach_bytes(&inner, Keep::default()) < dflash2_kv_headroom_for(need.kv_bytes),
                 "{name}: the state cannot cover the KV"
             );
             let error = ensure_dflash2_target_rows_with(

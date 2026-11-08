@@ -78,9 +78,7 @@
 //! sequential decode flip the argmax → token streams diverge from the
 //! flat path. See `finalize_turn_keep_live` for full discussion.
 
-#[cfg(target_os = "macos")]
-use std::collections::HashSet;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
