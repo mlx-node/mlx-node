@@ -2220,9 +2220,6 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
         let prompt_tokens = admitted.tokens.len() as u32;
         let requested_max_new_tokens = admitted.params.max_new_tokens.max(0) as u32;
-        let trained_context = u32::try_from(self.inner.max_position_embeddings())
-            .unwrap_or(1)
-            .max(1);
         if !self.inner.scheduler_cache_available() {
             if newly_assigned {
                 self.owner_sequences.remove(&owner_id);
@@ -2252,16 +2249,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             admitted.plan.decoder,
             engine::plan::DecoderPlan::Speculative(_)
         );
-        let context = scheduled_turn_context(
-            trained_context,
-            self.scheduled_turn_window(block_size, speculative),
-            scheduler_per_seq_context_override(),
-        );
-        let max_new_tokens = match engine::scheduler::clamp_scheduled_output_tokens(
+        let max_new_tokens = match self.scheduled_output_budget(
             prompt_tokens,
             requested_max_new_tokens,
-            context,
-            self.inner.scheduler_output_budget_is_rest_of_window(),
+            block_size,
+            speculative,
         ) {
             Ok(max_new_tokens) => max_new_tokens,
             Err(error) => {
@@ -2333,6 +2325,32 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         speculative_window_tokens(usable_pool, block_size, bytes_per_block, |tokens| {
             self.inner.scheduled_draft_state_held_bytes(tokens)
         })
+    }
+
+    /// A scheduled turn's output budget: the request clamped to the turn's
+    /// window by the family's rule
+    /// ([`HybridSchedulerBackend::scheduler_output_budget_is_rest_of_window`]).
+    fn scheduled_output_budget(
+        &self,
+        prompt_tokens: u32,
+        requested_max_new_tokens: u32,
+        block_size: u32,
+        speculative: bool,
+    ) -> std::result::Result<u32, String> {
+        let trained_context = u32::try_from(self.inner.max_position_embeddings())
+            .unwrap_or(1)
+            .max(1);
+        let context = scheduled_turn_context(
+            trained_context,
+            self.scheduled_turn_window(block_size, speculative),
+            scheduler_per_seq_context_override(),
+        );
+        engine::scheduler::clamp_scheduled_output_tokens(
+            prompt_tokens,
+            requested_max_new_tokens,
+            context,
+            self.inner.scheduler_output_budget_is_rest_of_window(),
+        )
     }
 
     fn cleanup_rejected_prepared(&mut self, prepared: &PreparedTurn) {
@@ -5203,6 +5221,57 @@ pub(crate) mod tests {
         if let Ok(nemotron) = NemotronHInner::new(tiny_nemotron_paged_config()) {
             assert!(!nemotron.scheduler_output_budget_is_rest_of_window());
         }
+    }
+
+    /// The window an AR scheduled turn of `state` clamps on.
+    fn scheduled_ar_window<B: HybridSchedulerBackend>(state: &HybridSchedulerState<B>) -> u32 {
+        let block_size = state.inner.scheduler_block_size().expect("block size");
+        scheduled_turn_context(
+            u32::try_from(state.inner.max_position_embeddings()).expect("trained window"),
+            state.scheduled_turn_window(block_size, false),
+            scheduler_per_seq_context_override(),
+        )
+    }
+
+    /// Admission's budget for a Qwen3.5 scheduled turn is the rest of the
+    /// window and a prompt that fills it is refused; a family without that
+    /// rule keeps `window - prompt + 1`.
+    /// Mutation: pass `false` for the backend's rule in
+    /// `scheduled_output_budget` → red (window - 48 + 1 ≠ window - 48).
+    #[test]
+    fn scheduled_admission_budget_follows_the_family_rule() {
+        let Some((state, _)) = growable_qwen35_state() else {
+            return;
+        };
+        let block_size = state.inner.scheduler_block_size().expect("block size");
+        let window = scheduled_ar_window(&state);
+        assert!(window > 48);
+        assert_eq!(
+            state.scheduled_output_budget(48, u32::MAX, block_size, false),
+            Ok(window - 48)
+        );
+        let full = state
+            .scheduled_output_budget(window, 1, block_size, false)
+            .unwrap_err();
+        assert!(full.starts_with("context_length_exceeded:"), "{full}");
+
+        let Ok(nemotron) = NemotronHInner::new(tiny_nemotron_paged_config()) else {
+            return;
+        };
+        if nemotron.paged_adapter.is_none() {
+            return;
+        }
+        let state = HybridSchedulerState::new(nemotron).expect("construct nemotron scheduler");
+        let block_size = state.inner.scheduler_block_size().expect("block size");
+        let window = scheduled_ar_window(&state);
+        assert_eq!(
+            state.scheduled_output_budget(48, u32::MAX, block_size, false),
+            Ok(window - 48 + 1)
+        );
+        assert_eq!(
+            state.scheduled_output_budget(window, 1, block_size, false),
+            Ok(1)
+        );
     }
 
     /// Mutation: the dense override returns `false` → red.
