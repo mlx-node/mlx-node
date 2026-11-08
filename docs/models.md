@@ -349,8 +349,8 @@ the embedded directory.
 
 ### Int8 K/V cache (`kvFormat`, qwen3_5 and qwen3_5_moe)
 
-For dense qwen3_5 by default on Metal with 256-wide heads (`kvFormat: 'bf16'`
-opts out; `'int8'` forces it; qwen3_5_moe defaults to bf16), the loader stores the flat full-attention K/V
+For qwen3_5 and qwen3_5_moe by default on Metal with 256-wide heads and GQA up
+to 8 (`kvFormat: 'bf16'` opts out; `'int8'` forces it), the loader stores the flat full-attention K/V
 cache as per-(token, head) symmetric int8 rows with one fp32 scale each
 (Splash's target KV format: `scale = max|x| / 127`, quantized on write).
 Rows are read as int8 by the segmented SDPA kernels (the DFlash2 / MTP verify
@@ -358,9 +358,15 @@ block kernels take int8 operands straight into `matmul2d`; the AR decode row
 uses the int8 vector kernels), while prefill chunks after the first dequantize
 the cached prefix to a BF16 temporary for MLX's fused causal SDPA. Halves
 the K/V memory (Qwen3.8-27B at 32K: ~1.0 GB saved) and the verify's K/V read
-bandwidth; the quality cost is int8 rounding (measured: teacher-forced KL and
-top-1 agreement unchanged within noise, DFlash2 acceptance unchanged).
-Geometries the int8 kernels do not serve default to `bf16`. The block-paged
+bandwidth; the quality cost is int8 rounding. Teacher-forced vs a bf16-KV
+teacher at 8 x 8,192 tokens (tail = positions past the first 2,048-token
+chunk, the ones that read int8): Qwen3.8-27B tail KL `<27B_KL_TAIL>`, top-1
+`<27B_TOP1_TAIL>`; Qwen3.6-35B-A3B tail KL `<35B_KL_TAIL>`, top-1
+`<35B_TOP1_TAIL>` (details in
+[docs/research/splash-qwen35-moe.md](research/splash-qwen35-moe.md#int8-kv-default)).
+DFlash2 acceptance on 35B is not measured. Geometries the int8 kernels do not
+serve default to `bf16`: Qwen3.6-122B (32 x 2 heads) defaults to bf16 because
+the int8 verify cannot split an 8-row block at gqa 16. The block-paged
 pool ignores the option and stays bf16, so on a paged load only DFlash2 turns
 write int8. `contextLimits().kvFormat` names the format of the pool lane
 (`effectiveWindowTokens`) and `.speculativeKvFormat` the DFlash2 lane's

@@ -93,6 +93,106 @@
   older anomaly or find a defensible production fix. It remains excluded from
   parity claims pending fresh evidence.
 
+## Int8 K/V default
+
+The flat full-attention K/V of `qwen3_5_moe` now takes the same geometry
+default as dense `qwen3_5`: int8 on Metal at head 256 when the GQA factor is at
+most 8, BF16 elsewhere. The old MoE-only BF16 override in
+`Qwen3_5MoeConfig::to_dense_config` is gone. `kvFormat: 'bf16'` (load option,
+`--kv-format bf16`, or a top-level `kv_format` key in `config.json`) opts out.
+MTP and DFlash2 draft K/V stay BF16, and the block-paged pool stays BF16.
+
+Splash reference (`~/workspace/github/splash` at `031a25a6`):
+
+| Cite                                                                   | Fact                                                                                               |
+| ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `runtime/engine/RuntimeResources.hpp:103`                              | `kv::Format kvFormat = kv::Format::Int8;` for every model                                          |
+| `runtime/engine/NativeArguments.hpp:46`, `NativeArguments.cpp:126-129` | CLI default int8; `--kv-format bf16` is the only opt-out                                           |
+| `runtime/engine/RuntimeResources.mm:727-728`                           | `kvLayout.format = config.kvFormat;` no per-family override                                        |
+| `runtime/ops/PagedAttention.cpp:59-65`                                 | one kernel per geometry: 24/4/256, 16/2/256 (`_kv2_g8`), 32/2/256 (`_kv2_g16`), 24/2/256, 32/4/128 |
+| `runtime/ops/PagedAttention.cpp:80`                                    | an unknown layout throws (no silent fallback)                                                      |
+
+Which models change:
+
+| Model                 | q / kv heads, head | gqa | Default             |
+| --------------------- | ------------------ | --- | ------------------- |
+| Qwen3.8-27B (dense)   | 24 / 4, 256        | 6   | int8 (unchanged)    |
+| Qwen3.6-35B-A3B (MoE) | 16 / 2, 256        | 8   | **int8 (was BF16)** |
+| Qwen3.6-122B (MoE)    | 32 / 2, 256        | 16  | BF16 (gap below)    |
+
+### Gap: no gqa-16 int8 verify (122B stays BF16)
+
+Splash serves 32/2/256 with its own `_kv2_g16` kernel. mlx-node's int8
+segmented SDPA has none that serves a wide verify block at gqa 16:
+
+```
+two-pass stage 1 = 32 x gqa x rows threads <= 1024
+gqa 8  -> widest chunk 4 rows -> 8-row verify = 4 + 4   ok
+gqa 16 -> widest chunk 2 rows -> 3-4 rows split ok,
+                                 5-8 rows: segmented_verify_head_rows = -1
+          bf16 verify: falls back (segmented_verify_head_len is None)
+          int8 verify: calls segmented_sdpa_int8 with no fallback
+                       -> "unsupported segmented SDPA verify block"
+```
+
+So at gqa 16 every flat int8 verify block of 5 to 8 rows (MTP depth >= 4,
+DFlash2's 8 rows) would be an error. `KvFormat::default_for_geometry` adds the
+GQA bound (1..=8), and 122B stays BF16 by default. Lift: a gqa-16 int8 verify
+kernel (Splash `_kv2_g16`). The bound is the two-pass pipeline's
+`max_threads_per_threadgroup`; the unit test
+`int8_verify_chunks_bound_the_default_gqa` pins it on the test device only.
+
+### DFlash2 window (35B-A3B, M3 Pro inputs)
+
+`dflash2_window_terms`, the S1 27B trigger inputs (working set 27 GiB, MLX
+active 17,357 MiB, pool budget 5,051 MiB = 16,163 BF16 blocks of 327,680 B,
+325-block runway, the 6 x 8 x 128 `incoai/Qwen3.6-35B-A3B-DFlash2` draft ring
+56,795,136 B, 7 scratch rows), only the geometry swapped:
+
+| Case          | Row bytes | Pool term | Reserve term | Window                    |
+| ------------- | --------- | --------- | ------------ | ------------------------- |
+| 27B int8 (S1) | 33,280    | 139,257   | 166,714      | 139,257                   |
+| 35B BF16      | 20,480    | 244,217   | 275,721      | 244,217                   |
+| 35B int8      | 10,400    | 475,129   | 542,966      | **262,144** (trained cap) |
+
+Row bytes = 10 full-attention layers x 2 (K, V) x 2 KV heads x (512 B BF16 or
+256 + 4 B int8). The int8 window hits the trained 262,144, so the gain shows as
+the cap, not 2x. Pinned by `moe_dflash2_window_prices_the_default_format`.
+Estimate only (not pinned): with 35B Q4_K_M weights on the 36 GB M3 Pro the
+window would move 122,489 -> 237,561; its draft-size premise is not checked.
+
+### Quality gate
+
+Teacher: the same checkpoint with BF16 K/V (a view directory whose
+`config.json` sets `"kv_format": "bf16"`). Data: 8 rows of 24 joined CNN
+articles, `--seq 8192`, `--top-k 1024`. The first 2,048-token prefill chunk has
+an empty prefix and never reads int8, so the tail numbers count only the
+positions past it: `kl_tail = meanKlTopk x P / P_t`,
+`top1_tail = 1 - (1 - top1Agreement) x P / P_t`, `P_t = P - rows x 2,048`.
+Stop band: tail top-1 < 0.97 or tail KL > 0.05.
+
+| Model                  | Run          | kvFormat | rows / positions | meanKlTopk | top1Agreement | tail KL | tail top-1 | teacherMeanNll | teacherTailMass |
+| ---------------------- | ------------ | -------- | ---------------- | ---------- | ------------- | ------- | ---------- | -------------- | --------------- |
+| 35B-A3B (bf16 weights) | bf16 control | `<..>`   | `<..>`           | `<..>`     | `<..>`        | -       | -          | `<..>`         | `<..>`          |
+| 35B-A3B (bf16 weights) | default      | `<..>`   | `<..>`           | `<..>`     | `<..>`        | `<..>`  | `<..>`     | `<..>`         | `<..>`          |
+| 27B (bf16 weights)     | bf16 control | `<..>`   | `<..>`           | `<..>`     | `<..>`        | -       | -          | `<..>`         | `<..>`          |
+| 27B (bf16 weights)     | default      | `<..>`   | `<..>`           | `<..>`     | `<..>`        | `<..>`  | `<..>`     | `<..>`         | `<..>`          |
+
+Commit `<commit>`, device `<device>`.
+
+Gaps:
+
+- DFlash2 acceptance on 35B, int8 vs BF16, teacher-forced: not run (no local
+  35B DFlash2 draft). Lift: download `incoai/Qwen3.6-35B-A3B-DFlash2` and run
+  one fixed transcript teacher-forced.
+- Eval prefill reads the int8 prefix through dequantize + fused SDPA; decode
+  and verify read it with the int8 kernels. Both read the same int8 values;
+  the kernel error vs the dequantized reference is pinned by `kv_int8_tests`.
+- `mlx eval cache` has no format flag and uses the load default, so on
+  head-256 Qwen a teacher past 2,048 tokens is int8 K/V unless the checkpoint
+  config says `bf16`.
+- 122B stays BF16 (above).
+
 ## Correctness and current validation
 
 - After the rare-expert accumulation correction, grouped output and route
