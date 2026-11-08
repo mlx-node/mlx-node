@@ -5109,16 +5109,14 @@ pub(crate) mod tests {
         let Some((mut state, snapshot)) = growable_scheduler_state() else {
             return;
         };
-        // Probe caps the 4 -> 8 doubling target at 7 blocks: above the
-        // shortfall (current 4 + needed 1 = 5), below the target. The grow
-        // must land at the selected count, not decline.
+        // A 7-block ceiling caps the 4 -> 8 doubling target at 7: above the
+        // shortfall (current 4 + needed 1 = 5), below the target. The
+        // re-probe of 7 fits, so the grow must land at 7, not decline.
         state
             .inner
             .paged_adapter_mut()
             .expect("paged adapter")
-            .set_grow_headroom_probe_override(Some(Arc::new(|requested| {
-                Ok(requested.saturating_sub(1))
-            })));
+            .set_grow_headroom_probe_override(Some(Arc::new(|requested| Ok(requested.min(7)))));
         let charge = snapshot.blocks.free_blocks + 1;
         let outcome = state
             .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)

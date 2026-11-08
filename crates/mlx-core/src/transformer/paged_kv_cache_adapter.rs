@@ -2783,9 +2783,11 @@ impl PagedKVCacheAdapter {
     ///    does not exceed the live count.
     /// 4. Probe the live Metal headroom for the target BEFORE `grow_to`:
     ///    the grow swaps one layer at a time, so the peak (new pool + one old
-    ///    layer + sibling registered pools) must fit the safe budget. A
-    ///    probe that selects fewer blocks declines the grow (step 5 is
-    ///    skipped).
+    ///    layer + sibling registered pools) must fit the safe budget. When
+    ///    the probe selects fewer blocks, the grow targets that count only
+    ///    if it covers `current + needed` and a second probe at that count,
+    ///    with its own transient, selects all of it; otherwise the grow is
+    ///    declined (step 5 is skipped).
     /// 5. Drop this adapter's per-layer pool views (they retain the pre-grow
     ///    buffers) before `grow_to`. On success, extend the allocator to
     ///    match, run the growth notifier with the new total bytes, and log
@@ -2851,13 +2853,15 @@ impl PagedKVCacheAdapter {
         #[cfg(target_os = "macos")]
         match self.grow_headroom_probe(new_num_blocks) {
             Ok(selected) if selected < new_num_blocks => {
-                // Partial headroom: the probe's safe ceiling covers the
-                // required shortfall but not the doubling target. Grow to
-                // the selected count — the reservation then admits — rather
-                // than rejecting a request that a safe grow would serve.
-                // Decline only when even the shortfall does not fit.
+                // Partial headroom: grow to the selected count when it covers
+                // the shortfall. The transient depends on the exact target
+                // (after a part-way cut a smaller target swaps more layers),
+                // so the reduced count must pass its own probe.
                 let shortfall_target = current.saturating_add(needed_additional_blocks);
-                if selected >= shortfall_target && selected > current {
+                let reduced_fits = selected >= shortfall_target
+                    && selected > current
+                    && matches!(self.grow_headroom_probe(selected), Ok(fits) if fits >= selected);
+                if reduced_fits {
                     tracing::info!(
                         target: "mlx_core::paged_kv",
                         "paged KV pool grow targeting partial headroom: {selected} blocks \
@@ -2868,7 +2872,8 @@ impl PagedKVCacheAdapter {
                     tracing::warn!(
                         target: "mlx_core::paged_kv",
                         "paged KV pool grow declined: headroom probe caps the pool at {selected} \
-                         blocks (< shortfall {shortfall_target}, {new_num_blocks} requested)"
+                         blocks ({new_num_blocks} requested, shortfall {shortfall_target}), or \
+                         {selected} blocks do not fit their own grow peak"
                     );
                     return false;
                 }
@@ -16835,6 +16840,95 @@ mod tests {
         assert_eq!(pool.total_bytes(), 7 * block_bytes);
     }
 
+    /// After a 7 -> 4 cut fails at layer 2 the layers are [4,4,7,7]. With a
+    /// 30 layer-block ceiling, the probe of the extent target 7 (reserve 4)
+    /// selects 6, which covers the shortfall 6; but a grow to 6 swaps every
+    /// layer and peaks at 24 + 8 = 32 > 30, so its own probe selects 5 and
+    /// the grow is declined with the pool untouched.
+    /// Mutation: drop the `self.grow_headroom_probe(selected)` term from
+    /// `reduced_fits` in `try_grow_pool` → red (grows to 6, peak 32 > 30).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn grow_after_a_failed_cut_reprobes_a_reduced_target() {
+        const NAME: &str = "grow_after_a_failed_cut_reprobes_a_reduced_target";
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 4,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping {NAME}: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+        adapter.set_extent_growth(3);
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        let block_bytes = adapter.bytes_per_block().expect("bytes per block");
+        let layer_block_bytes = block_bytes / 4;
+        let extent_bytes = 3 * block_bytes;
+
+        adapter.reset_for_new_request(7).unwrap();
+        assert_eq!(adapter.allocate_suffix_blocks(56).unwrap(), 7);
+        assert_eq!(pool.num_blocks(), 7);
+        adapter.release_request().unwrap();
+        mlx_paged_attn::set_shrink_fail_at_layer(Some(2));
+        adapter.try_release_pool_extents(extent_bytes, false);
+        mlx_paged_attn::set_shrink_fail_at_layer(None);
+        assert_eq!(pool.num_blocks(), 4);
+        let cut_layers = [4, 4, 7, 7].map(|blocks| blocks * layer_block_bytes);
+        assert_eq!(pool.layer_bytes(), cut_layers);
+
+        let ceiling = 30 * layer_block_bytes;
+        let probe = {
+            let pool = Arc::clone(&pool);
+            move |target: u32| -> Result<u32, String> {
+                let reserved =
+                    pool_grow_reserved_bytes(&pool.layer_bytes(), pool.layer_bytes_for(target)?);
+                let fits = ceiling.saturating_sub(reserved) / block_bytes;
+                Ok(target.min(u32::try_from(fits).unwrap_or(u32::MAX)))
+            }
+        };
+        assert_eq!(probe(7), Ok(6));
+        assert_eq!(probe(6), Ok(5));
+        assert_eq!(
+            6 * block_bytes + adapter.grow_transient_bytes(6).unwrap(),
+            32 * layer_block_bytes,
+            "a grow to 6 peaks past the 30 layer-block ceiling"
+        );
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(probe)));
+        let notified = Arc::new(Mutex::new(Vec::<u64>::new()));
+        {
+            let notified = Arc::clone(&notified);
+            adapter.set_pool_growth_notifier(Some(Arc::new(move |bytes| {
+                notified.lock().unwrap().push(bytes);
+            })));
+        }
+
+        assert!(
+            !adapter.try_grow_pool(2),
+            "a reduced target that does not fit its own peak must decline"
+        );
+        assert_eq!(pool.num_blocks(), 4);
+        assert_eq!(pool.layer_bytes(), cut_layers);
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 4);
+        assert!(notified.lock().unwrap().is_empty());
+    }
+
     /// The reserve a pool grow holds beside the new pool is the peak of
     /// `grow_to`'s layer swaps over the real layer sizes, in layer-blocks.
     /// Mutations: average the old layers (`total.div_ceil(layers)`) → red
@@ -16959,12 +17053,10 @@ mod tests {
         let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
             .expect("adapter");
 
-        // Probe caps the 4 -> 8 doubling target at 7 blocks: above the
-        // shortfall (4 + needed 2 = 6), below the target. The grow must
-        // land at 7, not decline.
-        adapter.set_grow_headroom_probe_override(Some(Arc::new(|requested| {
-            Ok(requested.saturating_sub(1))
-        })));
+        // A 7-block ceiling caps the 4 -> 8 doubling target at 7: above the
+        // shortfall (4 + needed 2 = 6), below the target. The re-probe of 7
+        // fits, so the grow must land at 7, not decline.
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(|requested| Ok(requested.min(7)))));
         assert!(
             adapter.try_grow_pool(2),
             "probe selecting 7 >= shortfall 6 must grow to the selected count"
