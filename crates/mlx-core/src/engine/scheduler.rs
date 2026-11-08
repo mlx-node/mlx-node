@@ -629,6 +629,10 @@ pub(crate) enum SchedulerAction<P, Exclusive, Barrier> {
         plan: StepPlan,
         completed: Vec<TurnState<P>>,
         preempted: Option<PreemptedTurn<P>>,
+        /// The step's only turn blocked: no other turn holds memory that
+        /// could come back, so it stays running, unpreempted, for the model
+        /// to reclaim for or fail (Splash `Engine::judge`, Engine.cpp:2040-2054).
+        blocked_alone: Option<SeqId>,
     },
 }
 
@@ -988,10 +992,15 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         self.running.push(turn);
     }
 
-    #[cfg(test)]
     pub fn preempt_running(&mut self, seq_id: SeqId) -> Option<TurnState<P>> {
         let index = self.running.iter().position(|turn| turn.seq_id == seq_id)?;
         Some(self.preempt_running_at(index))
+    }
+
+    /// Remove a running turn that ends without completing.
+    pub fn take_running(&mut self, seq_id: SeqId) -> Option<TurnState<P>> {
+        let index = self.running.iter().position(|turn| turn.seq_id == seq_id)?;
+        Some(self.running.remove(index))
     }
 
     #[cfg(test)]
@@ -1296,15 +1305,20 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         }
 
         let mut preempted = None;
+        let mut blocked_alone = None;
         if !blocked_rows.is_empty()
             && let Some(index) = self
                 .running
                 .iter()
                 .rposition(|turn| turn.status == TurnStatus::Running)
         {
-            let turn = self.preempt_running_at(index);
-            let blocked = blocked_rows.contains(&turn.seq_id);
-            preempted = Some(PreemptedTurn { turn, blocked });
+            if self.running.len() == 1 {
+                blocked_alone = Some(self.running[index].seq_id);
+            } else {
+                let turn = self.preempt_running_at(index);
+                let blocked = blocked_rows.contains(&turn.seq_id);
+                preempted = Some(PreemptedTurn { turn, blocked });
+            }
         }
 
         let mut completed = Vec::new();
@@ -1323,6 +1337,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             plan,
             completed,
             preempted,
+            blocked_alone,
         })
     }
 
@@ -1982,16 +1997,21 @@ mod tests {
         assert!(scheduler.has_preempted());
     }
 
+    /// A blocked step beside another running turn preempts the newest one.
     /// Mutation: `reinstate_running` keeps the preemption count → red.
     /// Mutation: report every victim as not blocked → red.
+    /// Mutation: treat every blocked step as alone → red (no victim).
     #[test]
     fn reinstated_victim_runs_as_if_never_preempted() {
-        let mut scheduler = Scheduler::<_, (), ()>::new(1, 8).expect("scheduler");
+        let mut scheduler = Scheduler::<_, (), ()>::new(2, 8).expect("scheduler");
         scheduler
-            .enqueue_turn(turn(1, 0, &[4], None).with_block_reservation(2, 0, 4))
+            .enqueue_turn(turn(1, 0, &[4], None))
+            .expect("enqueue peer");
+        scheduler
+            .enqueue_turn(turn(2, 0, &[4], None).with_block_reservation(2, 0, 4))
             .expect("enqueue");
         let mut step = MockStep {
-            allocation_blocked: HashSet::from([1]),
+            allocation_blocked: HashSet::from([2]),
             ..MockStep::default()
         };
         let SchedulerAction::Stepped {
@@ -2000,16 +2020,19 @@ mod tests {
                     turn: victim,
                     blocked,
                 }),
+            blocked_alone: None,
             ..
         } = scheduler.drive_once(&mut step).expect("blocked step")
         else {
             panic!("expected a preempted victim");
         };
-        assert!(blocked, "the lone row blocked its own step");
+        assert_eq!(victim.seq_id, 2);
+        assert!(blocked, "the victim blocked its own step");
         assert_eq!(scheduler.stats().preemptions, 1);
         scheduler.reinstate_running(victim);
         assert_eq!(scheduler.stats().preemptions, 0);
-        let turn = &scheduler.running()[0];
+        let turn = &scheduler.running()[1];
+        assert_eq!(turn.seq_id, 2);
         assert_eq!(turn.status, TurnStatus::Running);
         assert_eq!(turn.preemptions, 0);
         assert!(turn.block_reservation_active && turn.recurrent_state_reservation_active);
@@ -2019,9 +2042,42 @@ mod tests {
             scheduler.drive_once(&mut step).expect("retried step"),
             SchedulerAction::Stepped {
                 preempted: None,
+                blocked_alone: None,
                 ..
             }
         ));
+    }
+
+    /// The only running turn blocked: no turn holds memory that could come
+    /// back, so it is not preempted; it stays running and the step names it.
+    /// Mutation: preempt the lone turn as before → red (a victim, 1
+    /// preemption).
+    #[test]
+    fn lone_blocked_turn_is_reported_not_preempted() {
+        let mut scheduler = Scheduler::<_, (), ()>::new(2, 8).expect("scheduler");
+        scheduler
+            .enqueue_turn(turn(1, 0, &[4], None).with_block_reservation(2, 0, 4))
+            .expect("enqueue");
+        let mut step = MockStep {
+            allocation_blocked: HashSet::from([1]),
+            ..MockStep::default()
+        };
+        let SchedulerAction::Stepped {
+            preempted,
+            blocked_alone,
+            ..
+        } = scheduler.drive_once(&mut step).expect("blocked step")
+        else {
+            panic!("expected a step");
+        };
+        assert!(preempted.is_none(), "a lone turn has no one to yield to");
+        assert_eq!(blocked_alone, Some(1));
+        assert_eq!(scheduler.stats().preemptions, 0);
+        assert_eq!(scheduler.running().len(), 1);
+        assert_eq!(scheduler.running()[0].status, TurnStatus::Running);
+        assert!(scheduler.take_running(1).is_some());
+        assert!(scheduler.running().is_empty());
+        assert_eq!(scheduler.stats().preemptions, 0);
     }
 
     #[test]

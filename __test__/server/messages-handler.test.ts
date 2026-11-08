@@ -3567,6 +3567,30 @@ describe('handleCreateMessage', () => {
       expect(parsed.error.message).toContain('Model crashed');
     });
 
+    // Mutation: drop `isCapacityExhaustedError` from the 400 branch → red (500).
+    it('returns 400 when the native scheduler reports capacity_exhausted', async () => {
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel();
+      const message = "capacity_exhausted: could not allocate KV or draft state for this turn's next step";
+      (mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(new Error(message));
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed).toEqual({ type: 'error', error: { type: 'invalid_request_error', message } });
+    });
+
     it('emits error SSE event when the stream throws after headers are sent', async () => {
       const registry = new ModelRegistry();
       async function* crashingStream() {

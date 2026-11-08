@@ -2463,10 +2463,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     /// Frees memory for a blocked step without preempting `victim`: below
     /// the max pool, one item the family holds beside the pool at a time,
     /// retrying a one-block grow after each (the step's own grow was
-    /// declined), until one grows; then one idle owner's blocks. At the max
-    /// no grow can use freed memory, so nothing beside the pool is evicted.
-    /// True only when free plus reclaimable blocks grew, so the blocked rows
-    /// retry and the loop is bounded by what is idle.
+    /// declined), until one grows; then idle owners, one at a time, until
+    /// one gives back pool blocks or a parked row (a speculative step's fit
+    /// counts idle rows). At the max no grow can use freed memory, so
+    /// nothing beside the pool is evicted. True only when free plus
+    /// reclaimable blocks grew or the parked rows shrank, so the blocked
+    /// rows retry and the loop is bounded by what is idle (Splash reclaims
+    /// idle state before it yields or fails, Engine.cpp:2066-2104).
     fn reclaim_for_blocked_step(&mut self, victim: SeqId) -> bool {
         let snapshot = |state: &Self| state.inner.scheduler_cache_snapshot().ok().flatten();
         let available = |snapshot: &SchedulerCacheSnapshot| {
@@ -2476,6 +2479,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return false;
         };
         let before = available(&current);
+        let rows_before = self.inner.scheduled_recurrent_bytes();
         if current.blocks.total_blocks < current.max_total_blocks {
             while self.inner.release_one_for_pool_grow() {
                 if self
@@ -2487,35 +2491,98 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 }
             }
         }
-        let Some(owner) = self.idle_block_owner(victim) else {
-            return false;
-        };
-        self.inner.release_scheduled_recurrent_for(owner);
-        self.inner.release_scheduled_speculation(owner);
-        if let Err(error) = self.inner.release_scheduled_cache(owner) {
-            tracing::warn!(
-                "{} could not release idle owner {owner} for a blocked step: {error:?}",
-                B::SCHEDULER_NAME
-            );
-            return false;
+        while let Some(owner) = self.idle_memory_victim(victim) {
+            self.inner.release_scheduled_recurrent_for(owner);
+            self.inner.release_scheduled_speculation(owner);
+            if let Err(error) = self.inner.release_scheduled_cache(owner) {
+                tracing::warn!(
+                    "{} could not release idle owner {owner} for a blocked step: {error:?}",
+                    B::SCHEDULER_NAME
+                );
+                return false;
+            }
+            if snapshot(self).is_some_and(|after| available(&after) > before)
+                || self.inner.scheduled_recurrent_bytes() < rows_before
+            {
+                return true;
+            }
+            if self.idle_memory_victim(victim) == Some(owner) {
+                return false;
+            }
         }
-        snapshot(self).is_some_and(|after| available(&after) > before)
+        false
     }
 
-    /// Idle owner whose cache holds pool blocks; recurrent-only owners free
-    /// nothing a blocked step can use.
-    fn idle_block_owner(&self, victim: SeqId) -> Option<SeqId> {
-        let mut candidates: Vec<SeqId> = self.owner_sequences.values().copied().collect();
-        if let Some(adapter) = self.inner.paged_adapter() {
-            candidates.extend(adapter.live_seq_ids());
+    /// Ends the step's completed turns and handles its blocked one. False
+    /// when a turn blocked: no victim resumes in the same round.
+    fn settle_step(
+        &mut self,
+        completed: Vec<TurnState<ScheduledTurn<B::PrefixState>>>,
+        preempted: Option<PreemptedTurn<ScheduledTurn<B::PrefixState>>>,
+        blocked_alone: Option<SeqId>,
+    ) -> bool {
+        for turn in completed {
+            self.finish_completed(turn);
         }
-        candidates.sort_unstable();
-        candidates.dedup();
-        candidates.into_iter().find(|&candidate| {
-            candidate != victim
-                && !self.scheduler.contains_seq(candidate)
-                && self.inner.scheduler_materialized_blocks(candidate) > 0
-        })
+        if let Some(seq_id) = blocked_alone {
+            self.handle_blocked_alone(seq_id);
+            return false;
+        }
+        let Some(preempted) = preempted else {
+            return true;
+        };
+        if self.inner.scheduler_books_on_demand()
+            && self.reclaim_for_blocked_step(preempted.turn.seq_id)
+        {
+            self.scheduler.reinstate_running(preempted.turn);
+        } else {
+            self.handle_preempted(preempted);
+        }
+        false
+    }
+
+    /// The step's only running turn blocked. A family that books on demand
+    /// first reclaims idle memory; with none left the turn cannot fit even
+    /// alone, so it fails with `capacity_exhausted` and is released once,
+    /// never preempted: a replay would block at the same step (Splash
+    /// `judge` fails a lone lane, Engine.cpp:2040-2054, 1800-1812). Other
+    /// families book the whole turn and keep the preempt-and-resume path.
+    fn handle_blocked_alone(&mut self, seq_id: SeqId) {
+        if !self.inner.scheduler_books_on_demand() {
+            if let Some(turn) = self.scheduler.preempt_running(seq_id) {
+                self.handle_preempted(PreemptedTurn {
+                    turn,
+                    blocked: true,
+                });
+            }
+            return;
+        }
+        if self.reclaim_for_blocked_step(seq_id) {
+            return;
+        }
+        let error = self.capacity_exhausted(seq_id);
+        if let Some(turn) = self.scheduler.take_running(seq_id) {
+            self.fail_preempted(turn, error.reason.clone());
+        }
+    }
+
+    fn capacity_exhausted(&self, seq_id: SeqId) -> Error {
+        let held = self.inner.scheduler_materialized_blocks(seq_id);
+        let pool = match self.inner.scheduler_cache_snapshot() {
+            Ok(Some(snapshot)) => format!(
+                "it holds {held} paged blocks; the pool has {} of at most {} blocks, {} free",
+                snapshot.blocks.total_blocks,
+                snapshot.max_total_blocks,
+                u64::from(snapshot.blocks.free_blocks)
+                    + u64::from(snapshot.blocks.reclaimable_blocks)
+            ),
+            _ => format!("it holds {held} paged blocks"),
+        };
+        Error::from_reason(format!(
+            "capacity_exhausted: could not allocate KV or draft state for this turn's next step \
+             ({pool}); the request does not fit in the memory the page pool may use, even alone \
+             after every idle cache owner was released"
+        ))
     }
 
     fn idle_reclaim_made_progress(&self, seq_id: SeqId, victim: SeqId) -> bool {
@@ -3772,21 +3839,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             Ok(SchedulerAction::Stepped {
                 completed,
                 preempted,
+                blocked_alone,
                 ..
             }) => {
-                for turn in completed {
-                    self.finish_completed(turn);
-                }
-                if let Some(preempted) = preempted {
-                    if self.inner.scheduler_books_on_demand()
-                        && self.reclaim_for_blocked_step(preempted.turn.seq_id)
-                    {
-                        self.scheduler.reinstate_running(preempted.turn);
-                    } else {
-                        self.handle_preempted(preempted);
-                    }
-                    may_resume_preempted = false;
-                }
+                may_resume_preempted = self.settle_step(completed, preempted, blocked_alone);
             }
             Err(SchedulerError::Executor(error)) => {
                 tracing::error!(
@@ -5794,6 +5850,144 @@ pub(crate) mod tests {
         );
     }
 
+    /// Every planned row blocks, as a step whose KV or draft state did not fit.
+    #[cfg(target_os = "macos")]
+    struct BlockEveryRow;
+
+    #[cfg(target_os = "macos")]
+    impl<P> StepExecutor<P> for BlockEveryRow {
+        type Error = Error;
+
+        fn execute(
+            &mut self,
+            plan: &StepPlan,
+            _running: &mut [TurnState<P>],
+        ) -> std::result::Result<StepResult, Self::Error> {
+            Ok(StepResult {
+                rows: plan
+                    .rows
+                    .iter()
+                    .map(HybridStepExecutor::<Qwen35Inner>::blocked)
+                    .collect(),
+                executed_decode_batch: 0,
+                executed_greedy_epilogue_batch: 0,
+                rows_alloc_evicted: 0,
+            })
+        }
+    }
+
+    /// Admits `turn`, runs one step in which it blocks, and settles it.
+    #[cfg(target_os = "macos")]
+    fn settle_blocked_step(
+        state: &mut HybridSchedulerState<Qwen35Inner>,
+        turn: TurnState<ScheduledTurn<<Qwen35Inner as PagedBackend>::PrefixState>>,
+    ) {
+        state.scheduler.enqueue_turn(turn).expect("enqueue");
+        let Ok(SchedulerAction::Stepped {
+            completed,
+            preempted,
+            blocked_alone,
+            ..
+        }) = state.scheduler.drive_once(&mut BlockEveryRow)
+        else {
+            panic!("expected a step");
+        };
+        assert!(!state.settle_step(completed, preempted, blocked_alone));
+    }
+
+    /// The only running turn blocks at the max pool with nothing idle to
+    /// release: it fails with `capacity_exhausted`, its KV and row are
+    /// released, and nothing is preempted.
+    /// Mutation: preempt the lone turn in `drive_once` as before → red (no
+    /// reply: the victim waits to replay; 1 preemption).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lone_blocked_turn_fails_capacity_exhausted_without_a_preempt() {
+        let Some((mut state, _)) = mtp_step_state_with(64, 64) else {
+            return;
+        };
+        let mut turn = speculative::tests::request(
+            &mut state.inner,
+            1,
+            (0..40).map(|token| token % 16).collect(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (reply, mut result) = tokio::sync::oneshot::channel();
+        turn.payload.response = ScheduledReply::Sync(reply);
+        assert_eq!(state.inner.scheduler_materialized_blocks(1), 3);
+        assert_eq!(
+            state.inner.scheduled_recurrent_bytes(),
+            state.inner.recurrent_state_bytes()
+        );
+        settle_blocked_step(&mut state, turn);
+        let error = result
+            .try_recv()
+            .expect("the turn has ended")
+            .expect_err("the turn fails");
+        assert!(
+            error.reason.starts_with("capacity_exhausted:"),
+            "{}",
+            error.reason
+        );
+        assert_eq!(state.scheduler.stats().preemptions, 0);
+        assert_eq!(state.live_turns(), 0);
+        assert_eq!(state.inner.scheduler_materialized_blocks(1), 0);
+        assert_eq!(state.inner.scheduled_recurrent_bytes(), 0);
+    }
+
+    /// A lone MTP turn at the last row of its window blocks beside an idle
+    /// owner that holds only its parked row (no blocks): the blocked step
+    /// frees that row and the turn's next step fits.
+    /// Mutation: pick only idle owners with blocks in
+    /// `reclaim_for_blocked_step` (the old `materialized_blocks > 0`
+    /// filter) → red (the turn fails).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lone_mtp_turn_frees_an_idle_row_only_owner() {
+        let Some((mut state, _)) = mtp_step_state_with(64, 64) else {
+            return;
+        };
+        let recurrent = state.inner.recurrent_state_bytes();
+        drop(mtp_step_turn_with(&mut state, 2, 40, false, 40, recurrent));
+        state.owner_sequences.insert("idle".into(), 2);
+        assert_eq!(state.inner.scheduler_materialized_blocks(2), 0);
+        let charge = recurrent + state.inner.scheduled_draft_state_bytes(144);
+        let mut turn = mtp_step_turn_with(&mut state, 1, 128, true, 155, charge)
+            .with_block_reservation(9, 9, 16);
+        turn.num_computed_tokens = 154;
+        let (reply, mut result) = tokio::sync::oneshot::channel();
+        turn.payload.response = ScheduledReply::Sync(reply);
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .reserve_rows_for(1, 159)
+            .expect("window KV");
+        assert_eq!(state.inner.scheduled_recurrent_bytes(), 2 * recurrent);
+        assert!(
+            !HybridStepExecutor::new(&mut state.inner)
+                .draft_growth_fits(std::slice::from_ref(&turn), 0, 4)
+                .expect("step beside the idle row")
+        );
+        settle_blocked_step(&mut state, turn);
+        assert!(
+            matches!(
+                result.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the turn is still running"
+        );
+        assert_eq!(state.scheduler.running().len(), 1);
+        assert_eq!(state.scheduler.stats().preemptions, 0);
+        assert_eq!(state.inner.scheduled_recurrent_bytes(), recurrent);
+        assert!(
+            HybridStepExecutor::new(&mut state.inner)
+                .draft_growth_fits(state.scheduler.running(), 0, 4)
+                .expect("step after the release")
+        );
+    }
+
     /// 256 usable tokens in 16-token blocks of 8,192 B hold 131,072 B; with
     /// `1,000 + 256·T` held beside them, T = 160 fits (123,880 B) and
     /// T = 161 needs 11 blocks (132,328 B).
@@ -6090,7 +6284,7 @@ pub(crate) mod tests {
         adapter
             .allocate_suffix_blocks_for(1, 32)
             .expect("idle owner holds two blocks");
-        assert_eq!(state.idle_block_owner(2), Some(1));
+        assert_eq!(state.idle_memory_victim(2), Some(1));
         assert!(state.reclaim_for_blocked_step(2));
         assert!(
             state

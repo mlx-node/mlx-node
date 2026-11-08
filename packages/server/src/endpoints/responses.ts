@@ -12,12 +12,19 @@ import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ChatConfig, ChatMessage, ChatResult, ResponseStore, StoredResponseRecord } from '@mlx-node/core';
-import { isContextCapacityError } from '@mlx-node/lm';
+import { isCapacityExhaustedError, isContextCapacityError } from '@mlx-node/lm';
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 import { ToolCallTagBuffer } from '@mlx-node/lm';
 
 import { resetPreservingNativeCacheForWarmReuse } from '../chat-session-warm-reuse.js';
-import { sendBadRequest, sendInternalError, sendNotFound, sendRateLimit, sendStorageTimeout } from '../errors.js';
+import {
+  sendBadRequest,
+  sendCapacityExhausted,
+  sendInternalError,
+  sendNotFound,
+  sendRateLimit,
+  sendStorageTimeout,
+} from '../errors.js';
 import type { IdleSweeper } from '../idle-sweeper.js';
 import { withAdmissionControlledInference } from '../inference-admission.js';
 import { mapRequest, reconstructMessagesFromChain, stringifyStoredInputMessages } from '../mappers/request.js';
@@ -3530,6 +3537,8 @@ export async function handleCreateResponse(
               // 500 path so clients can compact/truncate and retry.
               if (isContextCapacityError(err)) {
                 sendBadRequest(res, message);
+              } else if (isCapacityExhaustedError(err)) {
+                sendCapacityExhausted(res, message);
               } else {
                 sendInternalError(res, message);
               }

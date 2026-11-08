@@ -195,6 +195,15 @@ export function isContextCapacityError(error: unknown): boolean {
   );
 }
 
+/**
+ * The native scheduler's verdict for a turn that cannot fit in memory even
+ * alone. It is not a context overflow: compacting the prompt is not what
+ * frees the memory, so agent overflow recovery does not key on it.
+ */
+export function isCapacityExhaustedError(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith('capacity_exhausted:');
+}
+
 /** Physical and trained context limits captured by a native model at load. */
 export interface SessionContextLimits {
   trainedWindowTokens: number;

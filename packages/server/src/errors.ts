@@ -17,12 +17,13 @@ export function sendError(
   type: string,
   message: string,
   param?: string | null,
+  code?: string | null,
 ): void {
   const body: { error: APIError } = {
     error: {
       type,
       message,
-      code: null,
+      code: code ?? null,
       param: param ?? null,
     },
   };
@@ -32,6 +33,14 @@ export function sendError(
 
 export function sendBadRequest(res: ServerResponse, message: string, param?: string): void {
   sendError(res, 400, 'invalid_request_error', message, param);
+}
+
+/**
+ * 400 with `code: 'capacity_exhausted'`: the request does not fit in memory
+ * even alone, so a retry fails the same way (Splash `server/backend.py`).
+ */
+export function sendCapacityExhausted(res: ServerResponse, message: string): void {
+  sendError(res, 400, 'invalid_request_error', message, null, 'capacity_exhausted');
 }
 
 export function sendNotFound(res: ServerResponse, message: string): void {

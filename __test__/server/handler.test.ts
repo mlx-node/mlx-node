@@ -459,6 +459,32 @@ describe('createHandler', () => {
       expect(parsed.output[0].type).toBe('message');
     });
 
+    // Mutation: send a native `capacity_exhausted:` failure through the
+    // `context_length_exceeded` branch (`sendBadRequest`) → red (code null).
+    it('maps a native capacity_exhausted failure to 400 with that code', async () => {
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel();
+      const message =
+        "capacity_exhausted: could not allocate KV or draft state for this turn's next step (it holds 64 paged blocks)";
+      (mockModel.chatSessionStart as ReturnType<typeof vi.fn>).mockRejectedValue(new Error(message));
+      registry.register('test-model', mockModel);
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'Hello' });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error).toEqual({
+        type: 'invalid_request_error',
+        message,
+        code: 'capacity_exhausted',
+        param: null,
+      });
+    });
+
     it('returns a JSON 400 for streaming context overflow before committing SSE or mutating native cache state', async () => {
       const model = Object.assign(createMockStreamModel([]), {
         contextLimits: () => ({

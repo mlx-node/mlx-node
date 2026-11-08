@@ -57,7 +57,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ChatConfig, ChatMessage, ChatResult, ChatStreamProgress, PerformanceMetrics } from '@mlx-node/core';
-import { isContextCapacityError } from '@mlx-node/lm';
+import { isCapacityExhaustedError, isContextCapacityError } from '@mlx-node/lm';
 import type { ChatSession, ChatStreamEvent, ChatStreamProgressRef, SessionCapableModel } from '@mlx-node/lm';
 import { ToolCallTagBuffer } from '@mlx-node/lm';
 
@@ -1754,7 +1754,7 @@ export async function handleCreateMessage(
             sessionReg.drop(MESSAGES_WARM_SLOT_ID);
             const message = err instanceof Error ? err.message : 'Unknown error during inference';
             if (visibility.responseMode === null) {
-              if (isContextCapacityError(err)) {
+              if (isContextCapacityError(err) || isCapacityExhaustedError(err)) {
                 sendAnthropicBadRequest(res, message);
               } else {
                 sendAnthropicInternalError(res, message);
