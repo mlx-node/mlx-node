@@ -133,8 +133,8 @@ pub struct Qwen3_5MoeConfig {
     #[napi(ts_type = "string | undefined")]
     pub qwen35_gguf_gdn_layout: Option<String>,
 
-    /// Flat full-attention cache format. MoE keeps BF16 by default;
-    /// `int8` enables per-row quantized K/V for compatible Metal heads.
+    /// Flat full-attention cache format, `int8` or `bf16`. Unset: the
+    /// geometry default of `Qwen3_5Config::kv_format`.
     #[serde(default)]
     #[napi(ts_type = "string | undefined")]
     pub kv_format: Option<String>,
@@ -220,7 +220,7 @@ impl Qwen3_5MoeConfig {
             persist_paged_cache: None,
             n_mtp_layers: self.n_mtp_layers,
             qwen35_gguf_gdn_layout: self.qwen35_gguf_gdn_layout.clone(),
-            kv_format: self.kv_format.clone().or_else(|| Some("bf16".to_string())),
+            kv_format: self.kv_format.clone(),
         }
     }
 

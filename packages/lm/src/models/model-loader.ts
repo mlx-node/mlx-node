@@ -69,8 +69,8 @@ export interface LoadModelOptions {
    * Flat full-attention K/V cache format for `qwen3_5` and `qwen3_5_moe` targets:
    * `'int8'` — per-token symmetric int8 rows with one fp32 scale each,
    * halving K/V memory and read bandwidth at a small, measured quality
-   * cost — or `'bf16'`. Unset: int8 on Metal with 256-wide heads (the
-   * geometry the int8 kernels serve), bf16 elsewhere. MoE defaults to bf16.
+   * cost — or `'bf16'`. Unset: int8 on Metal with 256-wide heads and GQA
+   * up to 8 (the geometry the int8 kernels serve), bf16 elsewhere.
    * The block-paged cache
    * ignores it; other model families reject it.
    */

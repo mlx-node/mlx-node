@@ -305,8 +305,8 @@ pub struct Qwen3_5Config {
     /// (per-(token, head) symmetric int8 rows with one fp32 scale each —
     /// half the K/V memory and read bandwidth; see `crate::array::kv_int8`)
     /// or `"bf16"`. Unset: int8 where the int8 kernels serve the geometry
-    /// (Metal, head 256), else BF16 — see `kv_format()`. Set from the
-    /// `kvFormat` load option; the paged cache ignores it.
+    /// (Metal, head 256, GQA up to 8), else BF16 — see `kv_format()`. Set
+    /// from the `kvFormat` load option; the paged cache ignores it.
     #[serde(default)]
     #[napi(ts_type = "string | undefined")]
     pub kv_format: Option<String>,
@@ -380,15 +380,20 @@ impl Qwen3_5Config {
     /// Element format of the flat full-attention K/V cache. An explicit
     /// `kv_format` wins (an unparseable value is BF16 — persistence rejects
     /// it at load); otherwise int8, Splash's default, wherever the int8
-    /// segmented kernels serve the geometry (Metal, `head_dim` 256), and
-    /// BF16 elsewhere so no geometry falls onto the dequantizing fallback.
+    /// segmented kernels serve the geometry
+    /// (`KvFormat::default_for_geometry`), and BF16 elsewhere so no geometry
+    /// falls onto the dequantizing fallback.
     pub fn kv_format(&self) -> crate::transformer::KvFormat {
         use crate::transformer::KvFormat;
         match self.kv_format.as_deref() {
             Some(value) if !value.trim().is_empty() => {
                 KvFormat::parse(Some(value)).unwrap_or_default()
             }
-            _ => KvFormat::default_for_geometry(i64::from(self.head_dim)),
+            _ => KvFormat::default_for_geometry(
+                i64::from(self.head_dim),
+                i64::from(self.num_heads),
+                i64::from(self.num_kv_heads),
+            ),
         }
     }
 

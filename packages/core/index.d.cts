@@ -5227,8 +5227,8 @@ export interface Qwen35Config {
    * (per-(token, head) symmetric int8 rows with one fp32 scale each —
    * half the K/V memory and read bandwidth; see `crate::array::kv_int8`)
    * or `"bf16"`. Unset: int8 where the int8 kernels serve the geometry
-   * (Metal, head 256), else BF16 — see `kv_format()`. Set from the
-   * `kvFormat` load option; the paged cache ignores it.
+   * (Metal, head 256, GQA up to 8), else BF16 — see `kv_format()`. Set
+   * from the `kvFormat` load option; the paged cache ignores it.
    */
   kvFormat?: string | undefined;
 }
@@ -5295,8 +5295,8 @@ export interface Qwen35LoadOptions {
    * Element format of the flat full-attention K/V cache: `'int8'`
    * (per-token symmetric int8 rows with one fp32 scale each — half the
    * K/V memory and read bandwidth) or `'bf16'`. When neither this option
-   * nor checkpoint config specifies a format, dense Qwen defaults to int8
-   * on Metal with 256-wide heads and BF16 elsewhere; MoE defaults to BF16.
+   * nor checkpoint config specifies a format, dense and MoE Qwen default
+   * to int8 on Metal with 256-wide heads and GQA up to 8, BF16 elsewhere.
    * The block-paged cache ignores it.
    */
   kvFormat?: 'int8' | 'bf16' | undefined;
@@ -5405,8 +5405,8 @@ export interface Qwen35MoeConfig {
    */
   qwen35GgufGdnLayout?: string | undefined;
   /**
-   * Flat full-attention cache format. MoE keeps BF16 by default;
-   * `int8` enables per-row quantized K/V for compatible Metal heads.
+   * Flat full-attention cache format, `int8` or `bf16`. Unset: the
+   * geometry default of `Qwen3_5Config::kv_format`.
    */
   kvFormat?: string | undefined;
 }

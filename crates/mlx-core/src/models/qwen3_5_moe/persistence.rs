@@ -2675,8 +2675,14 @@ mod tests {
         std::fs::remove_dir_all(&work).ok();
     }
 
+    /// Gate: an unset MoE format is the geometry default (int8 on Metal at
+    /// 16 x 2 x 256), and an explicit value wins both ways.
+    /// Mutation: restore `.or_else(|| Some("bf16".to_string()))` in
+    /// `to_dense_config` → red (dense `kv_format` is `Some("bf16")`; on Metal
+    /// the default is Bf16, not Int8).
     #[test]
-    fn moe_flat_cache_precision_preserves_default_and_explicit_format() {
+    fn moe_flat_cache_precision_follows_the_geometry_default_and_explicit_format() {
+        use crate::transformer::KvFormat;
         let mut raw = json!({
             "hidden_size": 2048,
             "num_hidden_layers": 40,
@@ -2687,14 +2693,93 @@ mod tests {
             "num_experts": 256
         });
         let default = parse_config(&raw).unwrap();
-        assert_eq!(default.kv_format(), crate::transformer::KvFormat::Bf16);
-        raw["kv_format"] = json!("int8");
-        let explicit = parse_config(&raw).unwrap();
-        assert_eq!(explicit.kv_format(), crate::transformer::KvFormat::Int8);
-        assert_eq!(explicit.to_dense_config().kv_format(), explicit.kv_format());
-        let restored: Qwen3_5MoeConfig =
-            serde_json::from_value(serde_json::to_value(&explicit).unwrap()).unwrap();
-        assert_eq!(restored.kv_format(), explicit.kv_format());
+        assert_eq!(default.to_dense_config().kv_format, None);
+        assert_eq!(
+            default.kv_format(),
+            KvFormat::default_for_geometry(256, 16, 2)
+        );
+        let metal = unsafe { mlx_sys::mlx_metal_is_available() }
+            && unsafe { mlx_sys::mlx_default_device() } == 1;
+        if metal {
+            assert_eq!(default.kv_format(), KvFormat::Int8);
+        }
+        for (value, format) in [("bf16", KvFormat::Bf16), ("int8", KvFormat::Int8)] {
+            raw["kv_format"] = json!(value);
+            let explicit = parse_config(&raw).unwrap();
+            assert_eq!(explicit.kv_format(), format);
+            assert_eq!(explicit.to_dense_config().kv_format(), format);
+            let restored: Qwen3_5MoeConfig =
+                serde_json::from_value(serde_json::to_value(&explicit).unwrap()).unwrap();
+            assert_eq!(restored.kv_format(), format);
+        }
+    }
+
+    /// Gate: the 35B-A3B DFlash2 window on the M3 Pro pool budget (5,051 MiB
+    /// = 16,163 BF16 blocks of 327,680 B, 325-block runway allocated, the
+    /// 6 x 8 x 128 draft, 7 scratch rows) prices the default int8 rows:
+    /// 10,400 B/token, pool term 475,129, window = trained 262,144. BF16:
+    /// 20,480 B/token, 244,217.
+    /// Mutations: restore `.or_else(|| Some("bf16".to_string()))` in
+    /// `to_dense_config` → red (20,480 / 244,217); price `KvFormat::Bf16` in
+    /// `dflash2_window_terms` → red.
+    #[test]
+    fn moe_dflash2_window_prices_the_default_format() {
+        use crate::array::DType;
+        use crate::models::qwen3_5::dflash2_decode::{
+            DFlash2PoolBudget, dflash2_pool_budget_bytes, dflash2_window_terms,
+        };
+        use crate::transformer::KvFormat;
+        let metal = unsafe { mlx_sys::mlx_metal_is_available() }
+            && unsafe { mlx_sys::mlx_default_device() } == 1;
+        if !metal {
+            return;
+        }
+        let raw = json!({
+            "hidden_size": 2048,
+            "num_hidden_layers": 40,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "moe_intermediate_size": 512,
+            "num_experts": 256,
+            "num_experts_per_tok": 8,
+            "full_attention_interval": 4,
+            "linear_conv_kernel_dim": 4,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "max_position_embeddings": 262144
+        });
+        let cfg = parse_config(&raw).unwrap();
+        assert_eq!(cfg.recurrent_state_bytes(), 64_389_120);
+        let pool = DFlash2PoolBudget {
+            bytes: dflash2_pool_budget_bytes(16_163, 325, 327_680),
+            floor_tokens: 231_936,
+        };
+        let terms = |format| {
+            dflash2_window_terms(
+                &cfg.to_dense_config(),
+                format,
+                DType::BFloat16,
+                262_144,
+                56_795_136,
+                7,
+                Some(pool),
+                None,
+            )
+            .unwrap()
+        };
+        let int8 = terms(cfg.kv_format());
+        assert_eq!(
+            (int8.row_bytes, int8.pool, int8.window()),
+            (10_400, Some(475_129), 262_144)
+        );
+        let bf16 = terms(KvFormat::Bf16);
+        assert_eq!(
+            (bf16.row_bytes, bf16.pool, bf16.window()),
+            (20_480, Some(244_217), 244_217)
+        );
     }
 
     #[test]

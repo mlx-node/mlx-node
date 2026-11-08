@@ -204,6 +204,7 @@ pub fn flat_clone_model_dir(src: &Path, suffix: &str) -> Result<PathBuf, String>
     let mut cfg: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse config.json: {e}"))?;
     cfg["use_block_paged_cache"] = serde_json::Value::Bool(false);
+    cfg["kv_format"] = serde_json::Value::String("bf16".to_string());
     if let Some(text) = cfg.get_mut("text_config") {
         text["use_block_paged_cache"] = serde_json::Value::Bool(false);
     }

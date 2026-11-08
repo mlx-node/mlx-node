@@ -522,29 +522,39 @@ fn int8_routes_are_counted() -> Result<()> {
     Ok(())
 }
 
-/// A production-geometry attention layer (24 x 4 heads, D = 256) over an
-/// int8 cache against the same layer over a BF16 cache: a prefill chunk, a
-/// second chunk (dequantized prefix + fresh rows), decode rows (the int8
-/// decode kernel) and a verify block (the int8 block kernels). The outputs
-/// stay within the quantization noise of each other and the int8 cache
-/// holds exactly the quantized rows.
+/// A production-geometry attention layer (24 x 4 and 16 x 2 heads, D = 256)
+/// over an int8 cache against the same layer over a BF16 cache: a prefill
+/// chunk, a second chunk (dequantized prefix + fresh rows), decode rows (the
+/// int8 decode kernel) and verify blocks (the int8 block kernels). The
+/// outputs stay within the quantization noise of each other, the decode and
+/// verify rows reach the int8 kernels, and the int8 cache holds exactly the
+/// quantized rows.
+/// Mutation: narrow the gqa bound in `forward_int8_cached` to `1..=6` → red
+/// (16 x 2 dequantizes, int8 kernel count 0; the tolerance alone stays green).
 #[test]
 #[cfg(target_os = "macos")]
 fn eager_forward_over_an_int8_cache_tracks_the_bf16_cache() -> Result<()> {
     if !metal() {
         return Ok(());
     }
+    for (h, kv) in [(24_i64, 4_i64), (16, 2)] {
+        eager_forward_over_an_int8_cache_tracks_the_bf16_cache_at(h, kv)?;
+    }
+    Ok(())
+}
+
+fn eager_forward_over_an_int8_cache_tracks_the_bf16_cache_at(h: i64, kv: i64) -> Result<()> {
     seed_rng(0x1A7_0005);
     let cfg = Qwen3_5Config {
         hidden_size: 64,
-        num_heads: 24,
-        num_kv_heads: 4,
+        num_heads: h as i32,
+        num_kv_heads: kv as i32,
         head_dim: 256,
         partial_rotary_factor: 0.25,
         ..super::tests::tiny_cfg()
     };
     let mut attn = Qwen3_5Attention::new(&cfg)?;
-    let (h, d, hidden, kv) = (24_i64, 256_i64, 64_i64, 4_i64);
+    let (d, hidden) = (256_i64, 64_i64);
     attn.set_q_proj_weight(&normal(&[2 * h * d, hidden], 1.0, 0.08))?;
     attn.set_k_proj_weight(&normal(&[kv * d, hidden], 2.0, 0.08))?;
     attn.set_v_proj_weight(&normal(&[kv * d, hidden], 3.0, 0.08))?;
@@ -574,8 +584,8 @@ fn eager_forward_over_an_int8_cache_tracks_the_bf16_cache() -> Result<()> {
             .zip(&b)
             .fold(0f32, |m, (p, q)| m.max((p - q).abs()))
             / magnitude;
-        eprintln!("{label}: max |bf16 - int8| = {max:.3e} of output magnitude");
-        assert!(max <= tolerance, "{label}: {max} > {tolerance}");
+        eprintln!("{h}x{kv} {label}: max |bf16 - int8| = {max:.3e} of output magnitude");
+        assert!(max <= tolerance, "{h}x{kv} {label}: {max} > {tolerance}");
         *worst = worst.max(max);
         Ok(())
     };
@@ -598,51 +608,88 @@ fn eager_forward_over_an_int8_cache_tracks_the_bf16_cache() -> Result<()> {
         &mut int8,
         &mut worst,
     )?;
-    // Decode rows: the int8 vector kernel over 500+ rows.
-    for step in 0..3 {
-        let label = format!("decode {step}");
+    unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+    let reads = (|| -> Result<()> {
+        // Decode rows: the int8 vector kernel over 500+ rows.
+        for step in 0..3 {
+            let label = format!("decode {step}");
+            compare(
+                &label,
+                &x(1, 20.0 + step as f64),
+                0.03,
+                &mut bf16,
+                &mut int8,
+                &mut worst,
+            )?;
+        }
+        // Verify blocks: the int8 block kernels (or vector split below the
+        // calibrated crossover), then a rejection rewind and a re-append.
         compare(
-            &label,
-            &x(1, 20.0 + step as f64),
+            "verify 8",
+            &x(8, 30.0),
             0.03,
             &mut bf16,
             &mut int8,
             &mut worst,
         )?;
-    }
-    // Verify blocks: the int8 block kernels (or vector split below the
-    // calibrated crossover), then a rejection rewind and a re-append.
-    compare(
-        "verify 8",
-        &x(8, 30.0),
-        0.03,
-        &mut bf16,
-        &mut int8,
-        &mut worst,
-    )?;
-    bf16.trim(bf16.get_offset() - 5);
-    int8.trim(int8.get_offset() - 5);
-    compare(
-        "verify 8 after trim",
-        &x(8, 31.0),
-        0.03,
-        &mut bf16,
-        &mut int8,
-        &mut worst,
-    )?;
-    compare(
-        "verify 5",
-        &x(5, 32.0),
-        0.03,
-        &mut bf16,
-        &mut int8,
-        &mut worst,
-    )?;
+        bf16.trim(bf16.get_offset() - 5);
+        int8.trim(int8.get_offset() - 5);
+        compare(
+            "verify 8 after trim",
+            &x(8, 31.0),
+            0.03,
+            &mut bf16,
+            &mut int8,
+            &mut worst,
+        )?;
+        compare(
+            "verify 5",
+            &x(5, 32.0),
+            0.03,
+            &mut bf16,
+            &mut int8,
+            &mut worst,
+        )
+    })();
+    let int8_reads =
+        unsafe { mlx_sys::mlx_test_kquant_family_count(c"segmented_sdpa_int8".as_ptr()) };
+    unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+    reads?;
+    assert!(
+        int8_reads >= 6,
+        "{h}x{kv}: {int8_reads} int8 kernel reads for 3 decode rows and 3 verify blocks"
+    );
     assert_eq!(int8.format(), KvFormat::Int8);
     let view = int8.int8_view().expect("int8 cache allocated");
     assert_eq!(view.keys.dtype()?, DType::Int8);
     assert_eq!(view.len()?, int8.get_offset() as i64);
-    eprintln!("eager int8 cache vs bf16 cache: worst {worst:.3e} of output magnitude");
+    eprintln!("{h}x{kv} eager int8 cache vs bf16 cache: worst {worst:.3e} of output magnitude");
+    Ok(())
+}
+
+/// Gate: the static GQA bound of `KvFormat::default_for_geometry` (int8 only
+/// at gqa <= 8) matches this device's int8 verify: an 8-row block splits into
+/// chunks of at most 4 rows at gqa 8, and cannot at gqa 16.
+/// Mutation: widen the bound in `default_for_geometry` to `1..=16` → red
+/// (gqa 16 defaults to int8), as is `kv_format_default_needs_an_int8_verify_kernel`.
+#[test]
+#[cfg(target_os = "macos")]
+fn int8_verify_chunks_bound_the_default_gqa() -> Result<()> {
+    if !metal() {
+        return Ok(());
+    }
+    assert!(segmented_max_query_length(8)? >= 4);
+    assert!(segmented_max_query_length(16)? < 4);
+    assert_eq!(
+        KvFormat::default_for_geometry(256, 16, 2),
+        KvFormat::Int8,
+        "gqa 8"
+    );
+    assert_eq!(
+        KvFormat::default_for_geometry(256, 32, 2),
+        KvFormat::Bf16,
+        "gqa 16"
+    );
     Ok(())
 }
 

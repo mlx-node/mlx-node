@@ -27,13 +27,18 @@ impl KvFormat {
 
     /// The format a cache takes when none is requested: int8 (Splash's
     /// default) where the int8 segmented SDPA kernels serve the geometry —
-    /// the Metal device and a 256-wide head — and BF16 everywhere else, so a
-    /// geometry the kernels do not cover never lands on the dequantizing
-    /// fallback by default.
-    pub fn default_for_geometry(head_dim: i64) -> Self {
+    /// the Metal device, a 256-wide head, and a GQA factor whose 8-row
+    /// verify splits into chunks the kernels launch — and BF16 everywhere
+    /// else. The int8 verify has no fallback: at gqa 16 an 8-row block is
+    /// an error, not a slow path.
+    pub fn default_for_geometry(head_dim: i64, q_heads: i64, kv_heads: i64) -> Self {
         let metal = unsafe { mlx_sys::mlx_metal_is_available() }
             && unsafe { mlx_sys::mlx_default_device() } == 1;
-        if metal && head_dim == 256 {
+        // Two-pass stage 1 is 32 x gqa x rows threads (<= 1024): an 8-row
+        // block needs chunks of 4 rows, so gqa <= 8.
+        let gqa_fits =
+            kv_heads > 0 && q_heads % kv_heads == 0 && (1..=8).contains(&(q_heads / kv_heads));
+        if metal && head_dim == 256 && gqa_fits {
             Self::Int8
         } else {
             Self::Bf16
@@ -855,6 +860,32 @@ impl KVCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gate: the geometry default is int8 only where the int8 verify serves
+    /// an 8-row block: D256 at gqa 1..=8; gqa 16 (122B), a non-divisible
+    /// split, and D128 stay BF16.
+    /// Mutation: drop `gqa_fits` from `default_for_geometry` → red at
+    /// (256, 32, 2).
+    #[test]
+    fn kv_format_default_needs_an_int8_verify_kernel() {
+        let metal = unsafe { mlx_sys::mlx_metal_is_available() }
+            && unsafe { mlx_sys::mlx_default_device() } == 1;
+        let int8 = if metal {
+            KvFormat::Int8
+        } else {
+            KvFormat::Bf16
+        };
+        assert_eq!(KvFormat::default_for_geometry(256, 24, 4), int8, "27B");
+        assert_eq!(KvFormat::default_for_geometry(256, 16, 2), int8, "35B");
+        assert_eq!(
+            KvFormat::default_for_geometry(256, 32, 2),
+            KvFormat::Bf16,
+            "122B"
+        );
+        assert_eq!(KvFormat::default_for_geometry(256, 24, 5), KvFormat::Bf16);
+        assert_eq!(KvFormat::default_for_geometry(256, 24, 0), KvFormat::Bf16);
+        assert_eq!(KvFormat::default_for_geometry(128, 24, 4), KvFormat::Bf16);
+    }
 
     fn assert_shape(arr: &MxArray, expected: &[i64]) {
         let shape = arr.shape().unwrap();
