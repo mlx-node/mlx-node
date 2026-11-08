@@ -349,8 +349,8 @@ the embedded directory.
 
 ### Int8 K/V cache (`kvFormat`, qwen3_5 and qwen3_5_moe)
 
-For qwen3_5 and qwen3_5_moe by default on Metal with 256-wide heads and GQA up
-to 8 (`kvFormat: 'bf16'` opts out; `'int8'` forces it), the loader stores the flat full-attention K/V
+For qwen3_5 and qwen3_5_moe by default on Metal with 256-wide heads, GQA up
+to 8 and BF16 compute (`kvFormat: 'bf16'` opts out; `'int8'` forces it), the loader stores the flat full-attention K/V
 cache as per-(token, head) symmetric int8 rows with one fp32 scale each
 (Splash's target KV format: `scale = max|x| / 127`, quantized on write).
 Rows are read as int8 by the segmented SDPA kernels (the DFlash2 / MTP verify
@@ -365,7 +365,9 @@ chunk, the ones that read int8): Qwen3.6-35B-A3B tail KL 0.0062, top-1
 [docs/research/splash-qwen35-moe.md](research/splash-qwen35-moe.md#int8-kv-default)).
 DFlash2 acceptance on 35B is not measured. Geometries the int8 kernels do not
 serve default to `bf16`: Qwen3.6-122B (32 x 2 heads) defaults to bf16 because
-the int8 verify cannot split an 8-row block at gqa 16. The block-paged
+the int8 verify cannot split an 8-row block at gqa 16. An f16-compute checkpoint
+(`mlx convert --dtype float16`) also defaults to bf16 K/V: the int8 kernels take
+BF16 queries. The block-paged
 pool ignores the option and stays bf16, so on a paged load only DFlash2 turns
 write int8. `contextLimits().kvFormat` names the format of the pool lane
 (`effectiveWindowTokens`) and `.speculativeKvFormat` the DFlash2 lane's

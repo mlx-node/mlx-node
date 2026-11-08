@@ -536,7 +536,8 @@ mlx options (handled before the agent binary sees the args):
   --trace-dir <dir>         Write inference.log in this directory (implies
                             --trace; dash-leading paths need --trace-dir=<dir>).
   --kv-format <fmt>         Target K/V cache format: int8 or bf16 (default: int8
-                            on Metal at head 256 and GQA up to 8, else bf16).
+                            on Metal at head 256, GQA up to 8 and BF16 compute,
+                            else bf16).
                             Sets the flat cache DFlash2 turns use; the block-paged
                             pool ignores it and stays bf16. bf16 uses more memory.
   --no-persist-cache        Disable the on-by-default SSD cold tier for persisted

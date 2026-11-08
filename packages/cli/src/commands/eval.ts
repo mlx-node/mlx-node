@@ -130,7 +130,8 @@ Score Arguments:
   --cache <dir>         Teacher cache directory
   --kv-format <fmt>     Candidate flat K/V cache format: int8 or bf16 (qwen3_5
                         and qwen3_5_moe; default: the load default, int8 on
-                        Metal at head 256 and GQA up to 8, else bf16)
+                        Metal at head 256, GQA up to 8 and BF16 compute,
+                        else bf16)
   --json                Emit the report as one JSON object
 
 Shared Arguments:

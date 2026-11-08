@@ -681,12 +681,12 @@ fn int8_verify_chunks_bound_the_default_gqa() -> Result<()> {
     assert!(segmented_max_query_length(8)? >= 4);
     assert!(segmented_max_query_length(16)? < 4);
     assert_eq!(
-        KvFormat::default_for_geometry(256, 16, 2),
+        KvFormat::default_for_geometry(256, 16, 2, DType::BFloat16),
         KvFormat::Int8,
         "gqa 8"
     );
     assert_eq!(
-        KvFormat::default_for_geometry(256, 32, 2),
+        KvFormat::default_for_geometry(256, 32, 2, DType::BFloat16),
         KvFormat::Bf16,
         "gqa 16"
     );

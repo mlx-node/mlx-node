@@ -134,7 +134,8 @@ pub struct Qwen3_5MoeConfig {
     pub qwen35_gguf_gdn_layout: Option<String>,
 
     /// Flat full-attention cache format, `int8` or `bf16`. Unset: the
-    /// geometry default of `Qwen3_5Config::kv_format`.
+    /// default of `Qwen3_5Config::kv_format_for` (int8 on Metal at head 256
+    /// when the GQA factor is at most 8 and compute is BF16, else BF16).
     #[serde(default)]
     #[napi(ts_type = "string | undefined")]
     pub kv_format: Option<String>,
@@ -224,6 +225,23 @@ impl Qwen3_5MoeConfig {
         }
     }
 
+    /// See `Qwen3_5Config::kv_format_for`.
+    pub fn kv_format_for(&self, compute: crate::array::DType) -> crate::transformer::KvFormat {
+        self.to_dense_config().kv_format_for(compute)
+    }
+
+    /// See `Qwen3_5Config::pin_kv_format`.
+    pub(crate) fn pin_kv_format(
+        &mut self,
+        requested: Option<crate::transformer::KvFormat>,
+        compute: crate::array::DType,
+    ) -> crate::transformer::KvFormat {
+        let format = self.to_dense_config().pin_kv_format(requested, compute);
+        self.kv_format = Some(format.as_str().to_string());
+        format
+    }
+
+    /// See `Qwen3_5Config::kv_format`.
     pub fn kv_format(&self) -> crate::transformer::KvFormat {
         self.to_dense_config().kv_format()
     }

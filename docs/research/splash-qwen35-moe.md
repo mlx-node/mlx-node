@@ -97,7 +97,7 @@
 
 The flat full-attention K/V of `qwen3_5_moe` now takes the same geometry
 default as dense `qwen3_5`: int8 on Metal at head 256 when the GQA factor is at
-most 8, BF16 elsewhere. The old MoE-only BF16 override in
+most 8 and compute is BF16, BF16 elsewhere. The old MoE-only BF16 override in
 `Qwen3_5MoeConfig::to_dense_config` is gone. `kvFormat: 'bf16'` (load option,
 `--kv-format bf16`, or a top-level `kv_format` key in `config.json`) opts out.
 MTP and DFlash2 draft K/V stay BF16, and the block-paged pool stays BF16.
@@ -141,6 +141,21 @@ GQA bound (1..=8), and 122B stays BF16 by default. Lift: a gqa-16 int8 verify
 kernel (Splash `_kv2_g16`). The bound is the two-pass pipeline's
 `max_threads_per_threadgroup`; the unit test
 `int8_verify_chunks_bound_the_default_gqa` pins it on the test device only.
+
+### BF16 compute only (an f16 checkpoint stays BF16)
+
+Splash is BF16-only: its int8 verify kernels take `device bfloat *queries`
+(`runtime/metal/kernels/decode/paged_attention.metal:11-13`, entries at
+`:66-72`), and its image writer narrows f16 weights at write
+(`runtime/model/GgufImage.hpp:78,110-122`). mlx-node keeps an f16 checkpoint
+(`mlx convert --dtype float16`) in f16 compute, and the int8 segmented SDPA
+validator needs BF16 queries (`crates/mlx-sys/src/mlx_segmented_sdpa.cpp:57-62`),
+so the default takes the compute dtype too: the load pins the format after the
+weights give the compute dtype (`Qwen3_5Config::pin_kv_format`), and an f16 load
+gets BF16 K/V. Before, an f16 MoE load failed its compiled DFlash2 verify, and
+dense fell back to the eager int8 read that dequantizes the whole prefix and
+runs SDPA in f32. Gap: an explicit `kvFormat: 'int8'` on an f16 load still
+takes int8 and hits the same failure; no query-dtype guard exists.
 
 ### DFlash2 window (35B-A3B, M3 Pro inputs)
 

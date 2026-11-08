@@ -1734,6 +1734,33 @@ fn apply_weights_inner(
     .map(drop)
 }
 
+/// The family's activation dtype: the embedding's dequantized OUTPUT dtype,
+/// which is NOT always the `.scales` dtype: MLX `dequantize` emits
+/// `result_type(scales, biases)` for affine but bf16 for K-quant/IQ/mxfp
+/// (whose `.scales` hold integer sub-block codes — the fp16 super-scale lives
+/// in `.biases`). Dense tables emit their own dtype.
+pub(crate) fn embedding_compute_dtype(params: &HashMap<String, MxArray>) -> DType {
+    params
+        .get("embedding.scales")
+        .and_then(|w| w.dtype().ok())
+        .map(|d| match d {
+            DType::Float16 | DType::BFloat16 | DType::Float32 => d,
+            _ => DType::BFloat16,
+        })
+        .or_else(|| params.get("embedding.weight").and_then(|w| w.dtype().ok()))
+        .unwrap_or(DType::BFloat16)
+}
+
+/// Pins the load's flat full-attention K/V format for the checkpoint's
+/// compute dtype; `params` must be the map the weights install from.
+fn pin_load_kv_format(
+    config: &mut Qwen3_5Config,
+    requested: Option<crate::transformer::KvFormat>,
+    params: &HashMap<String, MxArray>,
+) -> crate::transformer::KvFormat {
+    config.pin_kv_format(requested, embedding_compute_dtype(params))
+}
+
 /// Production load variant that also returns every model-owned plain-E4M3
 /// BF16 reconstruction for eager materialization and resident accounting.
 ///
@@ -1786,23 +1813,9 @@ fn apply_weights_inner_with_residency(
     // drained into `release_tiled_kquant_sources` once their owner is installed.
     let tiled_prefixes = std::cell::RefCell::new(Vec::<String>::new());
 
-    // The family's activation dtype = the embedding's dequantized OUTPUT dtype,
-    // which is NOT always the `.scales` dtype: MLX `dequantize` emits
-    // `result_type(scales, biases)` for affine but bf16 for K-quant/IQ/mxfp
-    // (whose `.scales` hold integer sub-block codes — the fp16 super-scale
-    // lives in `.biases`). Dense tables emit their own dtype.
     // Sidecar params (norm/conv f32 tensors) fold down to THIS dtype — never
     // blanket-bf16, so an f32/f16-compute checkpoint keeps matching numerics.
-    let compute_dtype = params
-        .get("embedding.scales")
-        .and_then(|w| w.dtype().ok())
-        .map(|d| match d {
-            DType::Float16 | DType::BFloat16 | DType::Float32 => d,
-            // K-quant/IQ/mxfp scales are integer codes; MLX emits bf16.
-            _ => DType::BFloat16,
-        })
-        .or_else(|| params.get("embedding.weight").and_then(|w| w.dtype().ok()))
-        .unwrap_or(DType::BFloat16);
+    let compute_dtype = embedding_compute_dtype(params);
 
     // CLEF residency pre-pass (`apply_clef_residency`): rewrites the backbone
     // projections in place and updates the per-layer overrides the builders
@@ -2690,17 +2703,11 @@ async fn load_with_thread_impl(
                         ));
                     }
                 }
-                // The flat full-attention K/V format: the load option wins
-                // over a `kv_format` key in config.json, and both over the
-                // geometry default (`Qwen3_5Config::kv_format`); an unknown
-                // config value is a load error rather than a silent BF16.
+                // An unknown config `kv_format` is a load error rather than a
+                // silent BF16; the format itself is pinned once the weights
+                // give the compute dtype.
                 crate::transformer::KvFormat::parse(config.kv_format.as_deref())
                     .map_err(|message| Error::from_reason(format!("config.json: {message}")))?;
-                let kv_format = kv_format.unwrap_or_else(|| config.kv_format());
-                config.kv_format = Some(kv_format.as_str().to_string());
-                if kv_format == crate::transformer::KvFormat::Int8 {
-                    info!("Qwen3.5 flat full-attention K/V cache format: int8 (per-row scales)");
-                }
 
                 let prism_config =
                     crate::quant::prism_hadamard::PrismHadamardConfig::from_config(&raw)?;
@@ -3036,6 +3043,14 @@ async fn load_with_thread_impl(
                     )?),
                     None => None,
                 };
+
+                // The load option wins over a `kv_format` key in config.json,
+                // and both over the default for the checkpoint's compute dtype.
+                if pin_load_kv_format(&mut config, kv_format, &params)
+                    == crate::transformer::KvFormat::Int8
+                {
+                    info!("Qwen3.5 flat full-attention K/V cache format: int8 (per-row scales)");
+                }
 
                 // Create inner model
                 let mut inner = Qwen35Inner::new(config.clone())?;
@@ -3625,6 +3640,85 @@ mod tests {
         fs::remove_file(dir.join("tokenizer.json")).unwrap();
         assert!(check_clef_assets(&source).is_err());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Gate: the dense load pins the flat K/V format for the embedding's
+    /// compute dtype. A 24 x 4 x 256 checkpoint whose embedding emits f16 (a
+    /// dense f16 table, or affine f16 scales) gets BF16 K/V — the int8 verify
+    /// needs BF16 queries — and a BF16 one (or a K-quant table, which MLX
+    /// dequantizes to BF16) gets int8 on Metal. An explicit int8 (load option
+    /// or config.json) still wins over f16 compute.
+    /// Mutations: pass `DType::BFloat16` to `pin_kv_format` in
+    /// `pin_load_kv_format` → red (f16 gives Int8); apply the compute check
+    /// to an explicit format → red (explicit int8 gives Bf16).
+    #[test]
+    fn dense_load_pins_the_kv_format_for_the_compute_dtype() {
+        use crate::transformer::KvFormat;
+        let metal = unsafe { mlx_sys::mlx_metal_is_available() }
+            && unsafe { mlx_sys::mlx_default_device() } == 1;
+        let bf16_default = if metal {
+            KvFormat::Int8
+        } else {
+            KvFormat::Bf16
+        };
+        let mut raw = json!({
+            "hidden_size": 64,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "intermediate_size": 128
+        });
+        let table = |dtype: DType| {
+            HashMap::from([(
+                "embedding.weight".to_string(),
+                MxArray::from_float32(&[0.0f32; 16], &[8, 2])
+                    .unwrap()
+                    .astype(dtype)
+                    .unwrap(),
+            )])
+        };
+        let affine = |scales: DType| {
+            HashMap::from([
+                (
+                    "embedding.weight".to_string(),
+                    MxArray::from_uint32(&[0u32; 16], &[8, 2]).unwrap(),
+                ),
+                (
+                    "embedding.scales".to_string(),
+                    MxArray::from_float32(&[1.0f32; 16], &[8, 2])
+                        .unwrap()
+                        .astype(scales)
+                        .unwrap(),
+                ),
+            ])
+        };
+        let pin = |raw: &serde_json::Value,
+                   params: &HashMap<String, MxArray>,
+                   requested: Option<KvFormat>| {
+            let mut config = parse_config(raw).unwrap();
+            let format = pin_load_kv_format(&mut config, requested, params);
+            assert_eq!(config.kv_format.as_deref(), Some(format.as_str()));
+            assert_eq!(config.kv_format(), format);
+            format
+        };
+
+        assert_eq!(pin(&raw, &table(DType::Float16), None), KvFormat::Bf16);
+        assert_eq!(pin(&raw, &affine(DType::Float16), None), KvFormat::Bf16);
+        assert_eq!(pin(&raw, &table(DType::Float32), None), KvFormat::Bf16);
+        assert_eq!(pin(&raw, &table(DType::BFloat16), None), bf16_default);
+        assert_eq!(pin(&raw, &affine(DType::Uint8), None), bf16_default);
+        assert_eq!(
+            pin(&raw, &table(DType::Float16), Some(KvFormat::Int8)),
+            KvFormat::Int8,
+            "load option int8 at f16"
+        );
+        raw["kv_format"] = json!("int8");
+        assert_eq!(
+            pin(&raw, &table(DType::Float16), None),
+            KvFormat::Int8,
+            "config.json int8 at f16"
+        );
     }
 
     #[test]
