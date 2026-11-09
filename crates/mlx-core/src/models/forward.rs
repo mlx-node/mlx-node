@@ -39,6 +39,22 @@ use crate::transformer::KVCache;
 /// qwen3's generate threads a config value through).
 pub(crate) const PREFILL_STEP_SIZE: i64 = 2048;
 
+/// Rows one Qwen3.5 paged prefill chunk feeds: `MLX_PAGED_PREFILL_CHUNK_SIZE`
+/// capped at the step, like Splash `ExecutionLimits::prefillTokenBudget`. The
+/// memory plan prices chunks of at most the step; a longer one overruns it.
+pub(crate) fn paged_prefill_chunk_rows() -> usize {
+    capped_paged_prefill_chunk_rows(crate::array::paged_prefill_chunk_size())
+}
+
+pub(crate) fn capped_paged_prefill_chunk_rows(configured: i32) -> usize {
+    let step = PREFILL_STEP_SIZE as usize;
+    if configured > 0 {
+        (configured as usize).min(step)
+    } else {
+        step
+    }
+}
+
 /// The cooperative-cancel reason every chunked-prefill boundary emits.
 /// One literal so the engine's fail-closed arms and the
 /// `err.reason == "prefill cancelled"` tests match on a single string.
@@ -602,5 +618,16 @@ mod tests {
         let expected = vec![Some(0), Some(0), Some(0)];
         assert_eq!(ranges_done_per_chunk(ChunkBarrier::Submitted), expected);
         assert_eq!(slices_done_per_chunk(ChunkBarrier::Submitted), expected);
+    }
+
+    /// The paged prefill chunk is the step unless the env asks for less, like
+    /// Splash `ExecutionLimits::prefillTokenBudget`. Mutations: a `0` arm for
+    /// unset → red; the env value without `.min(step)` → red (8,192).
+    #[test]
+    fn paged_prefill_chunk_is_capped_at_the_step() {
+        assert_eq!(capped_paged_prefill_chunk_rows(0), 2048);
+        assert_eq!(capped_paged_prefill_chunk_rows(8192), 2048);
+        assert_eq!(capped_paged_prefill_chunk_rows(2048), 2048);
+        assert_eq!(capped_paged_prefill_chunk_rows(1024), 1024);
     }
 }

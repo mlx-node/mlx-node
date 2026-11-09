@@ -29,7 +29,18 @@ plan (`crates/mlx-core/src/engine/memory_plan.rs`, Splash
 - **fixed** = MLX active memory, other models' registered pools, restore
   staging and the pipeline/runtime reserves;
 - the **pool max** is what the rest holds after one request's recurrent
-  state and its peak transient, in whole blocks.
+  state and its peak transient, in whole blocks. The recurrent state lives
+  outside the pool (Splash `availableForOneRequestKv = dynamic -
+  laneStateBytes`); the scheduler still also charges it inside the pool, so
+  the window pays it twice (48,601 against Splash's 50,585 on the M3 Pro
+  inputs).
+
+The peak transient is one prefill chunk of at most **2,048 rows**
+(Splash `ExecutionLimits::prefillTokenBudget`). Every Qwen3.5 dense and MoE
+paged prefill, text and media, runs in chunks of that size
+(`forward::paged_prefill_chunk_rows`); `MLX_PAGED_PREFILL_CHUNK_SIZE` can only
+make the chunks smaller, a larger value is capped at 2,048. The GDN checkpoint
+cuts come on top of the chunk cuts.
 
 Every load starts the pool at the **runway**: 2048 tokens of blocks plus one
 GDN cell (`qwen35_runway_blocks`, Splash `warmupKvPages`; 275 blocks on the
@@ -553,8 +564,8 @@ a block-aligned quarter of the one above, and the ladder stops after four rungs 
 when the next would fall to zero or below what is already cached. A 1400-token prompt
 at `block_size` 16 therefore publishes `[16, 80, 336, 1392]`. The recurrent state is
 only materialized at a rung when the prefill **splits** there, so when a GDN cold
-policy is attached `paged_prefill` forces a split at **every** rung it crosses, even
-under the default single-shot chunk size (`Qwen35Inner::cold_gdn_prefill_chunk_size`).
+policy is attached `paged_prefill` forces a split at **every** rung it crosses, on top
+of the 2,048-row chunk cuts (`Qwen35Inner::cold_gdn_prefill_chunk_size`).
 
 Why a ladder rather than the single endpoint boundary: capture may only anchor a
 sidecar where the persisted K/V chain already reaches, and that chain advances by one
@@ -579,9 +590,7 @@ before anything has ever been restored.
 The converse also has to hold, and it is enforced rather than assumed. A turn with
 **no** GDN cold policy takes the break set it took before the ladder existed: the
 single deep `gdn_checkpoint_target`, never the rungs. That is not cosmetic. Chunking
-is on for a persist-off turn whenever `MLX_PAGED_PREFILL_CHUNK_SIZE` is positive, and
-`packages/agent/src/run-agent.ts` plus `packages/cli/src/commands/launch-claude/index.ts`
-both default it to 2048 unconditionally, before any persistence decision — so
+is always on for a Qwen3.5 persist-off turn (2,048-row chunks), so
 `mlx agent --no-persist-cache` reaches a positive chunk size with no policy installed.
 Without the guard a 1400-token prompt there would forward as 5 chunks
 (`M` = 16, 64, 256, 1056, 8) where it used to forward as 2 (`M` = 1392, 8), which by

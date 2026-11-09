@@ -11,6 +11,10 @@ use crate::engine::memory_plan::{
     FlatInput, KvLayout, LaneShape, LiveMemory, MeasuredMemory, MemoryFootprint, MemoryPlan,
     PoolInput, SPECULATIVE_SCRATCH_TOKENS, live_memory, speculative_lane_bytes,
 };
+use crate::models::quant_dispatch::{
+    has_sym8_mode, parse_quant_settings, select_quantization_block,
+};
+use crate::models::quantized_linear::{DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE};
 use crate::transformer::KvFormat;
 use crate::utils::gguf::NativeGgufFamily;
 
@@ -364,6 +368,16 @@ pub(crate) fn estimate_qwen35_load(
     } else {
         crate::models::qwen3_5::persistence::parse_config(&raw)?
     };
+    let (_, _, top_level_mode, per_layer_quant) = parse_quant_settings(
+        select_quantization_block(&raw)?,
+        DEFAULT_QUANT_BITS,
+        DEFAULT_QUANT_GROUP_SIZE,
+    )?;
+    // Both loaders pin a sym8 checkpoint to flat KV after reading its quant block.
+    if has_sym8_mode(top_level_mode, &per_layer_quant) && config.use_block_paged_cache == Some(true)
+    {
+        config.use_block_paged_cache = Some(false);
+    }
     KvFormat::parse(config.kv_format.as_deref())
         .map_err(|message| Error::from_reason(format!("config.json: {message}")))?;
     let format = config.pin_kv_format(input.kv_format, DType::BFloat16);

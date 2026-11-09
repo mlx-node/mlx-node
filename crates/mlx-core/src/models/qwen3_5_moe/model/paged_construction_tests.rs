@@ -1360,28 +1360,23 @@ fn moe_gdn_sidecar_capture_refuses_the_turns_own_media_map() {
 
 /// MoE mirror of the dense chunk-size gate.
 ///
-/// Catches: dropping the policy probe from `cold_gdn_prefill_chunk_size`
-/// (returns 0 with a policy installed), which leaves a persist-cold turn
-/// publishing no ladder rung at all.
+/// Catches: a `0` (single-shot) arm without a policy, or an `i32::MAX` arm
+/// under a policy, in `cold_gdn_prefill_chunk_size`.
 #[test]
-fn moe_cold_gdn_prefill_chunk_size_follows_the_installed_sidecar_policy() {
+fn moe_cold_gdn_prefill_chunk_size_is_the_step_with_or_without_a_sidecar_policy() {
+    if crate::array::paged_prefill_chunk_size() != 0 {
+        return;
+    }
     let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
-        "moe_cold_gdn_prefill_chunk_size_follows_the_installed_sidecar_policy",
+        "moe_cold_gdn_prefill_chunk_size_is_the_step_with_or_without_a_sidecar_policy",
     ) else {
         return;
     };
-    assert_eq!(
-        inner.cold_gdn_prefill_chunk_size(),
-        0,
-        "without a cold GDN policy the prefill stays single-shot"
-    );
+    assert_eq!(inner.cold_gdn_prefill_chunk_size(), 2048);
 
     let root = moe_temp_cold_root("moe-chunk-size-policy");
     install_moe_gdn_cold_tier(&mut inner, &root);
-    assert!(
-        inner.cold_gdn_prefill_chunk_size() > 0,
-        "an installed GdnState policy must make the prefill split at the ladder"
-    );
+    assert_eq!(inner.cold_gdn_prefill_chunk_size(), 2048);
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1758,29 +1753,22 @@ fn run_moe_paged_prefill_with_size_and_checkpoint(
 
 /// Both hand-written MoE cores prefill through `run_moe_core_paged_prefill`,
 /// so this drives that shared body directly: under a GdnState policy it must
-/// publish checkpoint ladder rungs, and with no cold tier it must stay
-/// single-shot. MoE mirror of the dense
+/// publish checkpoint ladder rungs, and with no cold tier it takes the single
+/// pre-ladder boundary. MoE mirror of the dense
 /// `dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy`.
 ///
-/// Catches: passing a literal `0`, or `crate::array::paged_prefill_chunk_size()`
-/// (which is 0 unless the env var is set), where
-/// `self.cold_gdn_prefill_chunk_size()` belongs inside
-/// `run_moe_core_paged_prefill`. Either takes
+/// Catches: passing a literal `0` where `self.cold_gdn_prefill_chunk_size()`
+/// belongs inside `run_moe_core_paged_prefill`. That takes
 /// `run_paged_prefill_chunk_with_size_and_checkpoint`'s `chunk_size <= 0`
 /// arm, which hands back `Vec::new()` for the ladder — no rung is
 /// materialized, so every MoE cold capture anchors nothing. That is the
-/// MTP-turn defect, on the MoE side.
+/// MTP-turn defect, on the MoE side. The sibling
+/// `moe_cold_gdn_prefill_chunk_size_is_the_step_with_or_without_a_sidecar_policy`
+/// cannot see it: that one reads the accessor, never the call site.
 ///
-/// The sibling `moe_cold_gdn_prefill_chunk_size_follows_the_installed_sidecar_policy`
-/// cannot see it: that one reads the accessor, never the call site. The
-/// no-cold-tier leg is load-bearing in the other direction — a hardcoded
-/// `i32::MAX` would chunk prefills that ship today as single-shot.
-///
-/// The two EXPLICIT-chunk-size arms reach the break-set decision with no
-/// policy installed, which `cold_gdn_prefill_chunk_size`'s own 0 can never
-/// do. They catch hardcoding `gdn_cold_sidecar_ladder_wanted`'s result at
-/// the prefill body in either direction; the 64-token arms cannot, because
-/// at that length the ladder is already one rung and both arms agree.
+/// The 200-token arms catch hardcoding `gdn_cold_sidecar_ladder_wanted`'s
+/// result at the prefill body in either direction; the 64-token arms cannot,
+/// because at that length the ladder is already one rung and both agree.
 ///
 /// Runs in CI on the `qwen3_5-dense` `model-test` leg's `lib_tests` filter,
 /// which needs no checkpoint for this one; there is no MoE leg, and
@@ -1804,9 +1792,13 @@ fn moe_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy() {
     let (_, no_cold_ladder) = inner
         .run_moe_core_paged_prefill(&prompt, &prompt, 0, false, &layer_kinds, "ladder prefill")
         .expect("prefill with no cold tier");
-    assert!(
-        no_cold_ladder.is_empty(),
-        "with no cold GDN policy the MoE cores must stay single-shot"
+    assert_eq!(
+        no_cold_ladder
+            .iter()
+            .map(|c| c.prefix_len)
+            .collect::<Vec<_>>(),
+        vec![48],
+        "with no cold GDN policy the MoE cores take the single pre-ladder boundary"
     );
 
     // A prompt long enough that the two break sets DIFFER: ladder

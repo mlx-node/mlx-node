@@ -2532,53 +2532,43 @@ fn history_checkpoint_publish_asserts_the_paged_frontier() {
     );
 }
 
-/// The chunk size every paged prefill reads. Single-shot materializes no GDN
-/// checkpoint, so a sidecar has nothing to anchor on; an installed GdnState
-/// policy has to turn the ladder's rungs into real splits.
+/// The chunk size every paged prefill reads is the 2,048-row step the memory
+/// plan prices, with or without a GDN cold policy (the ladder's rungs are
+/// added as extra cuts).
 ///
-/// Catches: dropping the policy probe from `cold_gdn_prefill_chunk_size`
-/// (returns 0 with a policy installed) — the defect that leaves a persist-cold
-/// turn publishing no rung at all.
+/// Catches: a `0` (single-shot) arm without a policy, or an `i32::MAX` arm
+/// under a policy, in `cold_gdn_prefill_chunk_size`.
 #[test]
-fn dense_cold_gdn_prefill_chunk_size_follows_the_installed_sidecar_policy() {
+fn dense_cold_gdn_prefill_chunk_size_is_the_step_with_or_without_a_sidecar_policy() {
+    if crate::array::paged_prefill_chunk_size() != 0 {
+        return;
+    }
     let Some(mut inner) = dense_inner_with_test_adapter_or_skip(
-        "dense_cold_gdn_prefill_chunk_size_follows_the_installed_sidecar_policy",
+        "dense_cold_gdn_prefill_chunk_size_is_the_step_with_or_without_a_sidecar_policy",
     ) else {
         return;
     };
-    assert_eq!(
-        inner.cold_gdn_prefill_chunk_size(),
-        0,
-        "without a cold GDN policy the prefill stays single-shot"
-    );
+    assert_eq!(inner.cold_gdn_prefill_chunk_size(), 2048);
 
     let root = temp_cold_root("dense-chunk-size-policy");
     install_gdn_cold_tier(&mut inner, &root);
-    assert!(
-        inner.cold_gdn_prefill_chunk_size() > 0,
-        "an installed GdnState policy must make the prefill split at the ladder"
-    );
+    assert_eq!(inner.cold_gdn_prefill_chunk_size(), 2048);
 
     let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Both hand-written cores prefill through `run_dense_core_paged_prefill`, so
 /// this drives that shared body directly: with a GdnState policy installed it
-/// must publish checkpoint ladder rungs, and with no cold tier it must stay
-/// single-shot.
+/// must publish checkpoint ladder rungs, and with no cold tier it takes the
+/// single pre-ladder boundary.
 ///
-/// Catches: passing a literal `0` or `crate::array::paged_prefill_chunk_size()`
-/// instead of `self.cold_gdn_prefill_chunk_size()` inside
-/// `run_dense_core_paged_prefill` — the cold arm then returns no rungs, which
-/// is exactly the MTP-turn defect.
+/// Catches: passing a literal `0` instead of
+/// `self.cold_gdn_prefill_chunk_size()` inside `run_dense_core_paged_prefill`
+/// — the cold arm then returns no rungs, which is exactly the MTP-turn defect.
 ///
-/// The last two arms use an EXPLICIT positive chunk size, which is the only
-/// way to reach the break-set decision with no policy installed — the shape
-/// a persist-off `mlx agent` turn has, since `run-agent.ts` seeds
-/// `MLX_PAGED_PREFILL_CHUNK_SIZE=2048` before any persistence decision. They
-/// catch hardcoding `gdn_cold_sidecar_ladder_wanted`'s result at the prefill
-/// body in either direction, which the arms above cannot: at 64 tokens the
-/// ladder is already a single rung, so both arms agree there.
+/// The 200-token arms catch hardcoding `gdn_cold_sidecar_ladder_wanted`'s
+/// result at the prefill body in either direction, which the 64-token arms
+/// cannot: at 64 tokens the ladder is already a single rung, so both agree.
 #[test]
 #[ignore = "requires Metal GPU; run with --ignored"]
 fn dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy() {
@@ -2606,9 +2596,13 @@ fn dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy() {
         )
         .expect("prefill with no cold tier");
     assert!(hidden.is_none());
-    assert!(
-        cold_checkpoints.is_empty(),
-        "with no cold GDN policy the cores must stay single-shot"
+    assert_eq!(
+        cold_checkpoints
+            .iter()
+            .map(|c| c.prefix_len)
+            .collect::<Vec<_>>(),
+        vec![48],
+        "with no cold GDN policy the cores take the single pre-ladder boundary"
     );
 
     // A prompt long enough that the two break sets DIFFER: ladder

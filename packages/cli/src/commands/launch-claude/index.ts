@@ -55,9 +55,9 @@ Options:
   Environment variables:
     MLX_PAGED_PREFILL_CHUNK_SIZE  Tokens per paged-prefill chunk. Defaults to
                                   2048 under \`mlx launch claude\` to bound
-                                  cold-prefill memory peaks; set to 0 to
-                                  disable chunking, or tune explicitly for
-                                  your workload.
+                                  cold-prefill memory peaks. Qwen3.5 models
+                                  cap it at 2048 (the memory plan prices that
+                                  chunk); set it lower to shrink the chunks.
     MLX_PAGED_PREFILL_EVAL_INTERVAL
                                   Layer cadence for eval+clear during paged
                                   prefill. Defaults to 8.
@@ -163,9 +163,9 @@ export function launchClaudeHostOptions(flags: LaunchClaudeFlags): InferenceHost
     model: flags.model,
     logDir: flags.logDir,
     authToken: flags.authToken,
-    // Launcher policy, not an engine default: the shared native var still
-    // reads 0 as "disable chunking", and a value already set in the user's
-    // shell wins (see `applyEnginePolicy`).
+    // Launcher policy, not an engine default: the shared native var reads 0
+    // as the family default, and a value already set in the user's shell
+    // wins (see `applyEnginePolicy`).
     enginePolicy: LAUNCHER_ENGINE_POLICY,
   };
 }

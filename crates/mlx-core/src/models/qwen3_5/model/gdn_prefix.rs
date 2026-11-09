@@ -429,51 +429,20 @@ impl Qwen35Inner {
         }
     }
 
-    /// Effective paged-prefill chunk size for EVERY paged prefill this model
-    /// runs — the engine's `paged_prefill` and the hand-written sync/stream
-    /// cores alike.
+    /// Paged-prefill chunk size for EVERY paged prefill this model runs — the
+    /// engine's `paged_prefill` and the hand-written sync/stream cores alike.
     ///
-    /// The GDN cold sidecar can only persist recurrent state at a boundary the
-    /// prefill actually materialized state at, and those are exactly the
-    /// `gdn_prefill_checkpoint_boundaries` ladder rungs
-    /// (`paged_prefill_ranges` forces a break at each rung's offset).
-    /// Single-shot prefill (the default when `MLX_PAGED_PREFILL_CHUNK_SIZE` is
-    /// unset) crosses no rung, so it produces none of the in-memory checkpoints
-    /// the capture reads from.
-    ///
-    /// So when the SSD cold tier carries a GDN sidecar policy (persistence on),
-    /// return a chunk size large enough that the ONLY breaks are the ladder's.
-    /// An explicit `MLX_PAGED_PREFILL_CHUNK_SIZE` still wins.
-    ///
-    /// With no cold GDN policy and no env override this is the unchanged
-    /// single-shot default (0), which crosses no boundary at all. With no cold
-    /// GDN policy but the env var SET, chunking is on and the break set is
-    /// `prefill_checkpoint_boundaries(.., want_ladder = false)` — the single
-    /// deep `gdn_checkpoint_target`, exactly what a persist-off turn split at
-    /// before the ladder existed. Both arms read
-    /// `paged_forward::gdn_cold_sidecar_ladder_wanted` so the chunk size and the
-    /// break set cannot disagree about whether this is a persist turn.
-    ///
-    /// Splitting is algebraically transparent — every attention query still
-    /// attends over the whole cumulative range, and a break only marks where
-    /// the recurrent state is snapshotted — but it is NOT numerically
-    /// bit-identical: the chunk length is the GEMM's M, which selects a
-    /// different kernel class and accumulation order. So turning persistence on
-    /// can change the sampled tokens of an otherwise identical request.
+    /// Always positive: the GDN cold sidecar can only persist recurrent state
+    /// at a `gdn_prefill_checkpoint_boundaries` rung the prefill materialized,
+    /// and `paged_prefill_ranges` adds those rungs on top of the chunk cuts.
+    /// The chunk length is the GEMM's M, so a different chunk size can change
+    /// the sampled tokens of an otherwise identical request.
     ///
     /// A caller must read this BEFORE it takes the `&mut self` borrows the
     /// prefill needs (`&mut self.layers` + `&mut self.paged_adapter`); an inline
     /// call in the argument list does not borrow-check.
     pub(super) fn cold_gdn_prefill_chunk_size(&self) -> i32 {
-        let env_chunk = crate::array::paged_prefill_chunk_size();
-        if env_chunk > 0 {
-            return env_chunk;
-        }
-        if self.wants_gdn_checkpoint_ladder() {
-            i32::MAX
-        } else {
-            0
-        }
+        crate::models::forward::paged_prefill_chunk_rows() as i32
     }
 
     /// Whether this turn's prefill should publish the whole checkpoint ladder.

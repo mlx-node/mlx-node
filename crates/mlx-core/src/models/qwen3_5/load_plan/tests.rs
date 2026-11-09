@@ -116,9 +116,9 @@ fn write_27b_fixture(target: &std::path::Path, draft: &std::path::Path) {
 /// with the target's and the draft's weight files as active bytes: on the
 /// M3 Pro working set (27 GiB) with 16,000 MiB of target shards and a
 /// 1,357 MiB draft, the windows equal the load planner's at active
-/// 17,357 MiB (50,585 pool, 61,433 DFlash2 on an M5 Max's kernels).
+/// 17,357 MiB (48,601 pool, 61,433 DFlash2 on an M5 Max's kernels).
 /// Mutation: leave the draft file out of the active bytes in
-/// `estimate_qwen35_load` → red (68,793 / 102,393).
+/// `estimate_qwen35_load` → red (66,873 / 102,393).
 #[test]
 fn estimate_matches_the_load_plan() {
     const MIB: u64 = 1 << 20;
@@ -211,6 +211,51 @@ fn estimate_matches_the_load_plan() {
             window_tokens: plan.pool.map_or(262_144, |pool| pool.lane.window.maximum()),
             speculative_window_tokens: Some(speculative.maximum()),
             bound: "memory".to_string(),
+        }
+    );
+}
+
+/// A sym8 checkpoint asking for paged KV loads flat (the loaders' sym8 pin),
+/// so the estimate is the trained window with no pool. Mutation: drop the
+/// sym8 pin from `estimate_qwen35_load` → red (a memory-bound pool window).
+#[test]
+fn estimate_follows_the_sym8_flat_pin() {
+    let target = estimate_fixture_dir("sym8");
+    let draft = estimate_fixture_dir("sym8-draft");
+    write_27b_fixture(&target, &draft);
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(target.join("config.json")).unwrap())
+            .unwrap();
+    config["use_block_paged_cache"] = serde_json::json!(true);
+    config["quantization"] = serde_json::json!({"mode": "sym8", "bits": 8, "group_size": null});
+    std::fs::write(target.join("config.json"), config.to_string()).unwrap();
+    crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| {
+        cell.set(Some(LiveMemory {
+            working_set_bytes: 27 << 30,
+            active_bytes: 0,
+            registered_pool_bytes: 0,
+        }))
+    });
+    let estimate = estimate_qwen35_load(
+        "Qwen3.5",
+        &EstimateInput {
+            asset_dir: &target,
+            moe: false,
+            weight_bytes: 16_000 << 20,
+            draft_dir: None,
+            kv_format: None,
+            max_memory_bytes: None,
+        },
+    );
+    crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::remove_dir_all(&draft).unwrap();
+    assert_eq!(
+        estimate.expect("estimate").expect("trained window"),
+        Qwen35ContextEstimate {
+            window_tokens: 262_144,
+            speculative_window_tokens: None,
+            bound: "model".to_string(),
         }
     );
 }

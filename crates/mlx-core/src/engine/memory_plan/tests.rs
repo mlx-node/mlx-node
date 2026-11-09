@@ -217,14 +217,15 @@ fn qwen38_27b_lane_bytes_against_splash() {
 }
 
 /// The M3 Pro plan. hard 23,568,633,036, fixed 17,357 MiB with 64 MiB of
-/// staging and the 768 MiB reserves, dynamic 4,496,084,172. Pool lane: the pool keeps 1/17 for
-/// its last grow and pays the last prefill chunk's scratch with the pool
-/// SDPA gather (808,656,896 at the window), so 3,309 blocks and an AR window
-/// of 50,585. DFlash2 lane: 2 cells + ring, the 275 runway blocks held,
-/// one layer's copy, the verify cycle at the window, in 128-page extents:
-/// 61,433. Mutations: no grow copy in `LaneKv::Pool` → red (3,493 blocks);
-/// drop the attention term from `pool_lane_transient` → red (3,787 blocks);
-/// scratch rows 0 in `plan_lane` → red (transient at AR 50,592); no
+/// staging and the 768 MiB reserves, dynamic 4,496,084,172. Pool lane: the
+/// lane state lives outside the pool, the pool keeps 1/17 for its last grow
+/// and pays the last prefill chunk's scratch with the pool SDPA gather
+/// (792,403,968 at the window), so 3,186 blocks and an AR window of 48,601.
+/// DFlash2 lane: 2 cells + ring, the 275 runway blocks held, one layer's
+/// copy, the verify cycle at the window, in 128-page extents: 61,433.
+/// Mutations: no grow copy in `LaneKv::Pool` → red (3,363 blocks); drop the
+/// attention term from `pool_lane_transient` → red (3,648 blocks);
+/// scratch rows 0 in `plan_lane` → red (transient 792,461,312); no
 /// transient on the flat lane → red (106,489); runway held twice → red
 /// (held 576,716,800).
 #[test]
@@ -235,11 +236,11 @@ fn m3_pro_plan_prices_every_term() {
     assert_eq!(plan.fixed_bytes, M3_PRO_ACTIVE + STAGING + 768 * MIB);
     assert_eq!(plan.dynamic_budget_bytes, 4_496_084_172);
     let pool = plan.pool.expect("pool");
-    assert_eq!(pool.max_blocks, 3_309);
-    assert_eq!(pool.max_mib(), 3_309);
+    assert_eq!(pool.max_blocks, 3_186);
+    assert_eq!(pool.max_mib(), 3_186);
     assert_eq!(pool.runway_blocks, QWEN38_RUNWAY_BLOCKS);
-    assert_eq!(pool.lane.transient_bytes, 808_656_896);
-    assert_eq!(pool.lane.window.maximum(), 50_585);
+    assert_eq!(pool.lane.transient_bytes, 792_403_968);
+    assert_eq!(pool.lane.window.maximum(), 48_601);
     assert_eq!(pool.lane.window.bound(), "memory");
     let speculative = plan.speculative.expect("speculative lane");
     assert_eq!(speculative.held_bytes, 275 * MIB);
@@ -247,6 +248,39 @@ fn m3_pro_plan_prices_every_term() {
     assert_eq!(speculative.window.maximum(), 61_433);
     assert_eq!(speculative.window.bound(), "memory");
     assert!(plan.prices_speculative_lane());
+}
+
+/// One request at the pool window fits the dynamic budget with the lane's
+/// GDN cell outside the pool (Splash `availableForOneRequestKv = dynamic -
+/// laneStateBytes`): the pool at its maximum, its last grow's copy, the cell
+/// and the transient at the window. At the lane minimum: 231 blocks, window
+/// 1,314, transient 287,776,768; on the M3 Pro: 3,186 / 48,601 /
+/// 792,403,968. Mutation: leave `lane_bytes` out of the `LaneKv::Pool`
+/// budget → red (271 blocks, 153,935,872 over at the minimum).
+#[test]
+fn pool_lane_peak_fits_dynamic() {
+    let minimum = qwen38_plan(
+        footprint(M3_PRO_WORKING_SET, active_for_dynamic(699_203_584), None),
+        None,
+        false,
+    )
+    .expect("at the lane minimum");
+    for (plan, blocks, window, transient) in [
+        (minimum, 231, 1_314, 287_776_768),
+        (m3_pro_plan(), 3_186, 48_601, 792_403_968),
+    ] {
+        let pool = plan.pool.expect("pool");
+        let pool_bytes = u64::from(pool.max_blocks) * MIB;
+        let peak = pool_bytes + pool_bytes.div_ceil(16) + QWEN38_CELL + pool.lane.transient_bytes;
+        assert!(
+            peak <= plan.dynamic_budget_bytes,
+            "peak {peak} over dynamic {}",
+            plan.dynamic_budget_bytes
+        );
+        assert_eq!(pool.max_blocks, blocks);
+        assert_eq!(pool.lane.window.maximum(), window);
+        assert_eq!(pool.lane.transient_bytes, transient);
+    }
 }
 
 /// The verify cycle at the window, with no allocator free pool beside it,
@@ -310,13 +344,13 @@ fn explicit_pool_above_the_plan_is_refused() {
         err,
         PlanError::PoolAbovePlan {
             requested_mib: 16_384,
-            plan_mib: 3_309,
+            plan_mib: 3_186,
             bound: MemoryBound::DeviceMemory,
         }
     );
     let message = err.message("Qwen3.5");
     assert!(message.contains("this Mac's memory"), "{message}");
-    assert!(message.contains("at most 3309"), "{message}");
+    assert!(message.contains("at most 3186"), "{message}");
 
     let lowered = footprint(M3_PRO_WORKING_SET, M3_PRO_ACTIVE, Some(20 * GIB));
     let err = qwen38_plan(lowered, Some(16_384), true).expect_err("above the plan");
@@ -336,8 +370,8 @@ fn explicit_pool_above_the_plan_is_refused() {
         plan.max_memory_ignored()
     );
 
-    let at_plan = qwen38_plan(m3, Some(3_309), true).expect("at the plan");
-    assert_eq!(at_plan.pool.expect("pool").max_blocks, 3_309);
+    let at_plan = qwen38_plan(m3, Some(3_186), true).expect("at the plan");
+    assert_eq!(at_plan.pool.expect("pool").max_blocks, 3_186);
 
     let plan = qwen38_plan(m3, Some(2_048), true).expect("below the plan");
     let pool = plan.pool.expect("pool");
@@ -505,7 +539,7 @@ fn m5_max_plan_is_bound_by_the_model() {
     let plan = qwen38_plan(footprint(96 * GIB, M3_PRO_ACTIVE, None), None, true).expect("plan");
     let pool = plan.pool.expect("pool");
     assert_eq!(pool.lane.window.maximum(), 262_144);
-    assert_eq!(pool.max_blocks, 58_278);
+    assert_eq!(pool.max_blocks, 58_140);
     let speculative = plan.speculative.expect("speculative lane");
     assert_eq!(speculative.window.maximum(), 262_144);
     assert_eq!(speculative.window.bound(), "model");
@@ -534,8 +568,8 @@ fn describe_lists_every_term() {
         "hard budget: 23568633036 bytes (22476.80 MiB) (this Mac's memory)",
         "fixed runtime: 19072548864 bytes",
         "elastic state/KV budget: 4496084172 bytes",
-        "KV pool: 3309 blocks of 1048576 bytes (1.00 MiB) at most, 275 at the start",
-        "pool lane: context 50585 tokens (memory; window 262144, resident 50585)",
+        "KV pool: 3186 blocks of 1048576 bytes (1.00 MiB) at most, 275 at the start",
+        "pool lane: context 48601 tokens (memory; window 262144, resident 48601)",
         "speculative lane: context 61433 tokens (memory; window 262144, resident 61433)",
     ] {
         assert!(text.contains(line), "{line}\n{text}");
@@ -543,11 +577,11 @@ fn describe_lists_every_term() {
 }
 
 /// Gate: on the M3 Pro plan, after an AR turn grew the runway pool to the
-/// plan's 3,309 blocks (3,373 MiB registered with the restore staging), a
+/// plan's 3,186 blocks (3,250 MiB registered with the restore staging), a
 /// 61,440-row DFlash2 booking (15 extents of 4,096 rows, 2,044,723,200
-/// bytes) is refused under the plan's ceiling (1,026,346,188 live); its
-/// shortfall takes 8 pool extents of 128 MiB, and at 2,285 blocks
-/// (2,100,088,012 live) it books. Mutations: `live / 10 * 9` in
+/// bytes) is refused under the plan's ceiling (1,155,321,036 live); its
+/// shortfall takes 7 pool extents of 128 MiB, and at 2,290 blocks
+/// (2,094,845,132 live) it books. Mutations: `live / 10 * 9` in
 /// `dflash2_growth_fits` → red (still refused after the cut); round the
 /// extent count down in `pool_extents_for_bytes` → red (7 extents).
 #[test]
@@ -557,7 +591,7 @@ fn dflash2_growth_follows_the_plan_headroom() {
     };
     use crate::transformer::paged_kv_cache_adapter::pool_extents_for_bytes;
     let plan = m3_pro_plan();
-    assert_eq!(plan.pool.expect("pool").max_blocks, 3_309);
+    assert_eq!(plan.pool.expect("pool").max_blocks, 3_186);
     assert_eq!(plan.ceiling_bytes(), 22_763_326_668);
     let snapshot = |pool_blocks: u64| PagedPrefillMemorySnapshot {
         allocator_active_bytes: Some(M3_PRO_ACTIVE),
@@ -574,14 +608,14 @@ fn dflash2_growth_follows_the_plan_headroom() {
         transient_bytes: 0,
     };
     assert_eq!(need.kv_bytes, 2_044_723_200);
-    let live = plan.live_headroom(snapshot(3_309)).expect("readable");
-    assert_eq!(live, 1_026_346_188);
+    let live = plan.live_headroom(snapshot(3_186)).expect("readable");
+    assert_eq!(live, 1_155_321_036);
     assert!(!dflash2_growth_fits(live, &need), "refused");
     let extents = pool_extents_for_bytes(dflash2_kv_growth_shortfall(live, &need), 128 * MIB);
-    assert_eq!(extents, 8);
-    let blocks = 3_309 - u64::from(extents) * 128;
-    assert_eq!(blocks, 2_285);
+    assert_eq!(extents, 7);
+    let blocks = 3_186 - u64::from(extents) * 128;
+    assert_eq!(blocks, 2_290);
     let after = plan.live_headroom(snapshot(blocks)).expect("readable");
-    assert_eq!(after, 2_100_088_012);
+    assert_eq!(after, 2_094_845_132);
     assert!(dflash2_growth_fits(after, &need), "books");
 }

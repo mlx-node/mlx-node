@@ -708,6 +708,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     const modelsDir = await makeModelsDir(['qwen', 'gemma']);
     await writeFile(join(modelsDir, 'gemma', 'config.json'), JSON.stringify({ model_type: 'gemma4' }));
     const asked: Array<{ path: string; modelType: string; options?: unknown }> = [];
+    const loaded: string[] = [];
     let settle: () => void = () => undefined;
     const estimated = new Promise<void>((resolve) => (settle = resolve));
     const host = await start({
@@ -717,17 +718,19 @@ describe('createInferenceHost — out-of-band loadModel', () => {
       estimateContextWindow: async (path, modelType, options) => {
         asked.push({ path, modelType, options });
         settle();
-        return { windowTokens: 50_585, speculativeWindowTokens: 61_433, bound: 'memory' };
+        return { windowTokens: 48_601, speculativeWindowTokens: 61_433, bound: 'memory' };
       },
-      loadModel: async () =>
-        ({
+      loadModel: async (path) => {
+        loaded.push(path);
+        return {
           contextLimits: () => ({ trainedWindowTokens: 262_144, effectiveWindowTokens: 40_000 }),
-        }) as unknown as LoadableModel,
+        } as unknown as LoadableModel;
+      },
     });
     await estimated;
     expect(asked).toEqual([
       {
-        path: join(modelsDir, 'qwen'),
+        path: expect.any(String),
         modelType: 'qwen3_5',
         options: { kvFormat: 'int8', maxMemoryBytes: 25_769_803_776 },
       },
@@ -742,7 +745,60 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     expect(before.qwen).toBe(61_433);
     expect(before.gemma).not.toBe(61_433);
     await host.loadModel('qwen');
+    expect(loaded).toEqual([asked[0]?.path]);
     expect((await windows()).qwen).toBe(40_000);
+  });
+
+  // Mutation: estimate on `entry.path` instead of the resolved path → red (the
+  // estimate reads use_block_paged_cache false and differs from the load path).
+  it('estimates the paged overlay the load reads', async () => {
+    const modelsDir = await makeModelsDir(['qwen']);
+    await writeFile(
+      join(modelsDir, 'qwen', 'config.json'),
+      JSON.stringify({ model_type: 'qwen3_5', use_block_paged_cache: false }),
+    );
+    const asked: string[] = [];
+    const estimatedConfigs: Array<Record<string, unknown>> = [];
+    const loaded: string[] = [];
+    const estimated = deferred();
+    const host = await start({
+      modelsDir,
+      estimateContextWindow: async (path) => {
+        asked.push(path);
+        estimatedConfigs.push(
+          JSON.parse(await readFile(join(path, 'config.json'), 'utf-8')) as Record<string, unknown>,
+        );
+        estimated.resolve();
+        return null;
+      },
+      loadModel: async (path) => {
+        loaded.push(path);
+        return fakeModel();
+      },
+    });
+    await estimated.promise;
+    expect(estimatedConfigs[0]?.use_block_paged_cache).toBe(true);
+    await host.loadModel('qwen');
+    expect(asked).toEqual(loaded);
+  });
+
+  // Mutation: estimate on a forced overlay clone → red (an unmanaged family
+  // passes through, so the estimate reads the source directory).
+  it('estimates the source directory when the family has no overlay', async () => {
+    const modelsDir = await makeModelsDir(['qwen']);
+    const asked: string[] = [];
+    const estimated = deferred();
+    await start({
+      modelsDir,
+      pagedModelTypes: [],
+      estimateContextWindow: async (path) => {
+        asked.push(path);
+        estimated.resolve();
+        return null;
+      },
+    });
+    await estimated.promise;
+    expect(asked).toEqual([join(modelsDir, 'qwen')]);
   });
 
   it('makes the model resident and records the load on /health', async () => {

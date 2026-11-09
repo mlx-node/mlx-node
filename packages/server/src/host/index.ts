@@ -416,6 +416,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     models,
     modelsDir,
     opts.estimateContextWindow ?? estimateQwen35ContextWindow,
+    (entry) => pagedConfigOverrides.resolve(entry.path, entry.modelType),
     {
       ...(opts.kvFormat !== undefined ? { kvFormat: opts.kvFormat } : {}),
       ...(opts.maxMemoryBytes !== undefined ? { maxMemoryBytes: opts.maxMemoryBytes } : {}),
@@ -615,6 +616,7 @@ function startContextEstimates(
   models: readonly DiscoveredModel[],
   modelsDir: string,
   estimate: NonNullable<InferenceHostOptions['estimateContextWindow']>,
+  resolvePath: (entry: DiscoveredModel) => Promise<string>,
   options: Pick<Qwen35LoadOptions, 'kvFormat' | 'maxMemoryBytes'>,
 ): Map<string, number> {
   const windows = new Map<string, number>();
@@ -623,7 +625,9 @@ function startContextEstimates(
       if (familyDataFor(entry.modelType)?.acceptsMaxMemory !== true) continue;
       const draftModelPath = findDFlash2Draft(entry.path, entry.modelType, modelsDir);
       try {
-        const result = await estimate(entry.path, entry.modelType, {
+        // Price the config the load reads: the paged overlay can flip use_block_paged_cache.
+        const path = await resolvePath(entry);
+        const result = await estimate(path, entry.modelType, {
           ...options,
           ...(draftModelPath !== undefined ? { draftModelPath } : {}),
         });

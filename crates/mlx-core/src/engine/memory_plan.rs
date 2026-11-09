@@ -576,7 +576,13 @@ impl LaneKv {
                 layers,
                 cap_blocks,
             } => {
-                let pool = u128::from(dynamic.saturating_sub(transient)) * u128::from(layers)
+                // The lane state lives outside the pool (Splash
+                // availableForOneRequestKv = dynamic - laneStateBytes).
+                let pool = u128::from(
+                    dynamic
+                        .saturating_sub(transient)
+                        .saturating_sub(shape.lane_bytes),
+                ) * u128::from(layers)
                     / u128::from(layers + 1);
                 let blocks = (pool / u128::from(bytes_per_block.max(1))) as u64;
                 let blocks = cap_blocks.map_or(blocks, |cap| blocks.min(cap));
