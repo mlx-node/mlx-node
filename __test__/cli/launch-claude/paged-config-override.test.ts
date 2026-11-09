@@ -50,12 +50,8 @@ describe('PagedConfigOverrideManager launch-claude policy', () => {
     }
   });
 
-  it('returns the original path when the paged flag and Qwen memory and initial floors are satisfied', async () => {
-    const src = await makeFixture('qwen3_5', {
-      use_block_paged_cache: true,
-      paged_cache_memory_mb: 32_768,
-      paged_cache_initial_memory_mb: 2_048,
-    });
+  it('returns the original path when the paged flag is already set', async () => {
+    const src = await makeFixture('qwen3_5', { use_block_paged_cache: true });
     const manager = launchClaudeManager();
     try {
       expect(await manager.resolve(src)).toBe(src);
@@ -65,29 +61,20 @@ describe('PagedConfigOverrideManager launch-claude policy', () => {
     }
   });
 
-  it('clones and applies the default Qwen memory floor when memory is unset', async () => {
-    const src = await makeFixture('qwen3_5', { use_block_paged_cache: true });
-    const manager = launchClaudeManager();
-    try {
-      const result = await manager.resolve(src);
-      expect(result).not.toBe(src);
-      const config = await readConfig(result);
-      expect(config.use_block_paged_cache).toBe(true);
-      expect(config.paged_cache_memory_mb).toBeGreaterThanOrEqual(16_384);
-    } finally {
-      await manager.cleanup();
-      await rm(src, { recursive: true, force: true });
-    }
-  });
-
-  it('honors MLX_PAGED_CACHE_MEMORY_MB for Qwen3.5 overrides', async () => {
+  // Mutation: restore the 16,384 MiB floor (MLX_PAGED_CACHE_MEMORY_MB) in the
+  // manager → red. The load's memory plan sizes the pool.
+  it('clones without a pool size, whatever MLX_PAGED_CACHE_MEMORY_MB says', async () => {
     const src = await makeFixture('qwen3_5');
     const manager = launchClaudeManager();
     const previous = process.env.MLX_PAGED_CACHE_MEMORY_MB;
     process.env.MLX_PAGED_CACHE_MEMORY_MB = '24576';
     try {
-      const config = await readConfig(await manager.resolve(src));
-      expect(config.paged_cache_memory_mb).toBe(24_576);
+      const result = await manager.resolve(src);
+      expect(result).not.toBe(src);
+      const config = await readConfig(result);
+      expect(config.use_block_paged_cache).toBe(true);
+      expect('paged_cache_memory_mb' in config).toBe(false);
+      expect('paged_cache_initial_memory_mb' in config).toBe(false);
     } finally {
       if (previous === undefined) delete process.env.MLX_PAGED_CACHE_MEMORY_MB;
       else process.env.MLX_PAGED_CACHE_MEMORY_MB = previous;

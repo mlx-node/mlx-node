@@ -4,10 +4,13 @@ use napi::bindgen_prelude::*;
 
 use crate::array::{DType, MxArray};
 use crate::engine::backend::{DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput};
+use crate::engine::memory_plan::EXTENT_TARGET_BYTES;
 use crate::stream::WiredLimitContext;
 use crate::transformer::KvFormat;
 use crate::transformer::paged_kv_cache_adapter::PagedPrefillMemorySnapshot;
-use crate::transformer::paged_policy::live_prefill_headroom;
+use crate::transformer::paged_policy::{
+    estimate_paged_pool_sdpa_bytes_with_portable, estimate_varlen_paged_attention_bytes,
+};
 
 use super::dflash2::DFlash2ContextCache;
 use super::dflash2_state::trace::PrefixTracker;
@@ -92,11 +95,6 @@ pub(crate) fn dflash2_final_token_fits_context(logical_len: i32, capacity: usize
     usize::try_from(logical_len).is_ok_and(|logical_len| logical_len < capacity)
 }
 
-/// Process reserve kept out of the live headroom before sizing the target KV
-/// growth; 90% of the rest is usable, leaving room for prefill and verify
-/// transients.
-const DFLASH2_KV_HEADROOM_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
 pub(crate) fn dflash2_memory_snapshot() -> PagedPrefillMemorySnapshot {
     let (mut active, mut cached, mut limit) = (0u64, 0u64, 0u64);
     // SAFETY: each probe writes one u64 through a valid pointer and reports
@@ -119,258 +117,12 @@ pub(crate) fn dflash2_memory_snapshot() -> PagedPrefillMemorySnapshot {
     }
 }
 
-/// Live headroom past the process reserve, or `None` when the device limits
-/// cannot be read.
-pub(crate) fn dflash2_kv_headroom_bytes(snapshot: PagedPrefillMemorySnapshot) -> Option<u64> {
-    live_prefill_headroom(snapshot)
-        .selected_bytes
-        .map(|headroom| headroom.saturating_sub(DFLASH2_KV_HEADROOM_RESERVE_BYTES))
-}
-
-/// The part of [`dflash2_kv_headroom_bytes`] the target KV reservation may
-/// claim.
-pub(crate) fn dflash2_kv_budget_of(headroom: u64) -> u64 {
-    headroom / 10 * 9
-}
-
-/// The least headroom whose [`dflash2_kv_budget_of`] covers `budget` bytes.
-/// Every byte freed raises the budget by only 9/10 of a byte, so eviction
-/// must free against this, not against `budget`.
-pub(crate) fn dflash2_kv_headroom_for(budget: u64) -> u64 {
-    budget.div_ceil(9).saturating_mul(10)
-}
-
-/// The bounds a DFlash2 turn's context window is the least of, fixed at
-/// load: the trained windows, the target rows the paged pool's unallocated
-/// bytes hold after one lane, and the largest window the live headroom lets
-/// the target KV grow to. `extent_rows` is the step that KV grows by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DFlash2WindowTerms {
-    pub trained: u32,
-    pub draft_trained: u32,
-    pub pool: Option<u32>,
-    pub reserve: Option<u32>,
-    pub row_bytes: u64,
-    pub extent_rows: u64,
-}
-
-impl DFlash2WindowTerms {
-    pub fn window(&self) -> u32 {
-        self.trained
-            .min(self.draft_trained)
-            .min(self.pool.unwrap_or(u32::MAX))
-            .min(self.reserve.unwrap_or(u32::MAX))
-            .max(1)
-    }
-}
-
-/// One DFlash2 lane's bytes besides target KV: two GDN cells (the live
-/// state and the pre-verify copy) and the draft's KV window buffers.
-pub(crate) fn dflash2_lane_bytes(recurrent_state_bytes: u64, draft_ring_bytes: u64) -> u64 {
-    recurrent_state_bytes
-        .saturating_mul(2)
-        .saturating_add(draft_ring_bytes)
-}
-
-/// The paged pool's share of a DFlash2 window: the bytes of the pool's
-/// maximum not yet allocated as blocks, and the pool's own usable window as
-/// the term's floor. A pool allocated at its maximum leaves no bytes; without
-/// the floor its window would collapse to one token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DFlash2PoolBudget {
-    pub bytes: u64,
-    pub floor_tokens: u32,
-}
-
-/// Bytes of a `max_blocks` pool that `allocated_blocks` have not taken. The
-/// allocated blocks are already resident, so a DFlash2 turn's target KV
-/// may only claim the rest.
-pub(crate) fn dflash2_pool_budget_bytes(
-    max_blocks: u32,
-    allocated_blocks: u32,
-    bytes_per_block: u64,
-) -> u64 {
-    u64::from(max_blocks.saturating_sub(allocated_blocks)).saturating_mul(bytes_per_block)
-}
-
-/// Tokens of one Splash KV page (`kv::kPageTokens`).
-pub(crate) const SPLASH_KV_PAGE_TOKENS: u64 = 32;
-/// Splash `kExtentRegionAlignmentBytes`.
-const SPLASH_EXTENT_REGION_ALIGNMENT_BYTES: u64 = 64 * 1024;
-/// Splash `kAllocationExtentTargetBytes`.
-const SPLASH_EXTENT_TARGET_BYTES: u64 = 128 * 1024 * 1024;
-
 /// Blocks one growth adds to a runway paged pool: the whole blocks nearest
 /// Splash's extent target, at least one.
 pub(crate) fn runway_pool_extent_blocks(bytes_per_block: u64) -> u32 {
     let bytes_per_block = bytes_per_block.max(1);
-    ((SPLASH_EXTENT_TARGET_BYTES + bytes_per_block / 2) / bytes_per_block)
-        .clamp(1, u64::from(u32::MAX)) as u32
-}
-
-fn gcd(mut left: u64, mut right: u64) -> u64 {
-    while right != 0 {
-        (left, right) = (right, left % right);
-    }
-    left
-}
-
-fn lcm(left: u64, right: u64) -> u64 {
-    if left == 0 || right == 0 {
-        0
-    } else {
-        left / gcd(left, right) * right
-    }
-}
-
-fn pages_for_aligned_region(bytes_per_page: u64) -> u64 {
-    if bytes_per_page == 0 {
-        0
-    } else {
-        SPLASH_EXTENT_REGION_ALIGNMENT_BYTES
-            / gcd(SPLASH_EXTENT_REGION_ALIGNMENT_BYTES, bytes_per_page)
-    }
-}
-
-/// The target KV geometry Splash sizes its KV extents from (`kv::Layout`,
-/// no block index): `layers` full-attention layers of `heads` K/V heads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SplashKvLayout {
-    pub layers: u64,
-    pub heads: u64,
-    pub head_dim: u64,
-    pub format: KvFormat,
-    pub activation_bytes: u64,
-}
-
-impl SplashKvLayout {
-    pub(crate) fn of(
-        full_attention_layers: usize,
-        kv_heads: i32,
-        head_dim: i32,
-        dtype: DType,
-        format: KvFormat,
-    ) -> Self {
-        Self {
-            layers: full_attention_layers as u64,
-            heads: kv_heads.max(0) as u64,
-            head_dim: head_dim.max(0) as u64,
-            format,
-            activation_bytes: dtype.byte_size() as u64,
-        }
-    }
-
-    fn data_bytes_per_layer_page(&self) -> u64 {
-        let elements = SPLASH_KV_PAGE_TOKENS * self.heads * self.head_dim;
-        match self.format {
-            KvFormat::Int8 => elements,
-            KvFormat::Bf16 => elements * self.activation_bytes,
-        }
-    }
-
-    fn scale_bytes_per_layer_page(&self) -> u64 {
-        match self.format {
-            KvFormat::Int8 => SPLASH_KV_PAGE_TOKENS * self.heads * 4,
-            KvFormat::Bf16 => 0,
-        }
-    }
-
-    /// K/V bytes of one page across every layer (`bytesPerModelPage`):
-    /// [`SPLASH_KV_PAGE_TOKENS`] rows of [`kv_row_bytes`].
-    pub(crate) fn page_bytes(&self) -> u64 {
-        self.layers * 2 * (self.data_bytes_per_layer_page() + self.scale_bytes_per_layer_page())
-    }
-
-    /// `extentAlignmentPages`.
-    pub(crate) fn extent_alignment_pages(&self) -> u64 {
-        match self.format {
-            KvFormat::Bf16 => pages_for_aligned_region(self.data_bytes_per_layer_page()),
-            KvFormat::Int8 => lcm(
-                pages_for_aligned_region(self.data_bytes_per_layer_page()),
-                pages_for_aligned_region(self.scale_bytes_per_layer_page()),
-            ),
-        }
-    }
-
-    /// `minimumExtentPages`.
-    pub(crate) fn minimum_extent_pages(&self) -> u64 {
-        let unit = self.extent_alignment_pages() * self.page_bytes();
-        if unit == 0 {
-            return 0;
-        }
-        (SPLASH_EXTENT_TARGET_BYTES / 2).div_ceil(unit).max(1) * self.extent_alignment_pages()
-    }
-
-    /// `maximumExtentPages`.
-    fn maximum_extent_pages(&self) -> u64 {
-        let unit = self.extent_alignment_pages() * self.page_bytes();
-        if unit == 0 {
-            return 0;
-        }
-        (SPLASH_EXTENT_TARGET_BYTES * 3 / 2 / unit * self.extent_alignment_pages())
-            .max(self.minimum_extent_pages())
-    }
-
-    /// `extentPagesFor`: of the extent sizes that fit `pages`, the one that
-    /// leaves the fewest pages over, the one nearest the target on a tie; 0
-    /// when `pages` is below the smallest.
-    pub(crate) fn extent_pages_for(&self, pages: u64) -> u64 {
-        let step = self.extent_alignment_pages();
-        let smallest = self.minimum_extent_pages();
-        if smallest == 0 || pages < smallest {
-            return 0;
-        }
-        let largest = self.maximum_extent_pages().min(pages);
-        let (mut best, mut best_left, mut best_distance) = (0u64, 0u64, 0u64);
-        let mut extent = smallest;
-        while extent <= largest {
-            let distance = (extent * self.page_bytes()).abs_diff(SPLASH_EXTENT_TARGET_BYTES);
-            let left = pages % extent;
-            if best == 0 || left < best_left || (left == best_left && distance < best_distance) {
-                (best, best_left, best_distance) = (extent, left, distance);
-            }
-            extent += step;
-        }
-        best
-    }
-
-    /// Rows of the KV extent a budget of `budget_bytes` sizes, the smallest
-    /// extent when the budget holds fewer pages (Splash's runway extent).
-    pub(crate) fn extent_rows_for(&self, budget_bytes: u64) -> u64 {
-        let page = self.page_bytes();
-        if page == 0 {
-            return 0;
-        }
-        let extent = match self.extent_pages_for(budget_bytes / page) {
-            0 => self.minimum_extent_pages(),
-            pages => pages,
-        };
-        extent * SPLASH_KV_PAGE_TOKENS
-    }
-}
-
-/// Target rows `pool_bytes` hold for one turn after `lane_bytes`, as Splash
-/// sizes one request's KV (`kvCapacityPagesFor`): whole extents of the size
-/// that leaves the fewest of the budget's pages over, less the
-/// `scratch_rows` a verify writes past the last kept row.
-pub(crate) fn dflash2_pool_window(
-    pool_bytes: u64,
-    lane_bytes: u64,
-    layout: &SplashKvLayout,
-    scratch_rows: u64,
-) -> u32 {
-    let page = layout.page_bytes();
-    if page == 0 {
-        return u32::MAX;
-    }
-    let pages = pool_bytes.saturating_sub(lane_bytes) / page;
-    let capacity_pages = match layout.extent_pages_for(pages) {
-        0 => 0,
-        extent => pages - pages % extent,
-    };
-    (capacity_pages * SPLASH_KV_PAGE_TOKENS)
-        .saturating_sub(scratch_rows)
-        .min(u64::from(u32::MAX)) as u32
+    ((EXTENT_TARGET_BYTES + bytes_per_block / 2) / bytes_per_block).clamp(1, u64::from(u32::MAX))
+        as u32
 }
 
 /// Bytes the copy of one layer allocates while a live flat target KV grows
@@ -378,107 +130,6 @@ pub(crate) fn dflash2_pool_window(
 /// beside its old one.
 pub(crate) fn dflash2_kv_layer_copy_bytes(rows: u64, row_bytes: u64, fa_layers: u64) -> u64 {
     rows.saturating_mul(row_bytes).div_ceil(fa_layers.max(1))
-}
-
-/// Whether the budget of `headroom` holds a `window`-row turn's target KV at
-/// its peak: `window + scratch_rows` rows plus one layer's growth copy.
-pub(crate) fn dflash2_reserve_admits(
-    window: u32,
-    headroom: u64,
-    row_bytes: u64,
-    fa_layers: u64,
-    scratch_rows: u64,
-) -> bool {
-    let rows = u64::from(window).saturating_add(scratch_rows);
-    rows.saturating_mul(row_bytes)
-        .saturating_add(dflash2_kv_layer_copy_bytes(rows, row_bytes, fa_layers))
-        <= dflash2_kv_budget_of(headroom)
-}
-
-/// Largest window [`dflash2_reserve_admits`] holds for, `0` when none does.
-pub(crate) fn dflash2_reserve_window(
-    headroom: u64,
-    row_bytes: u64,
-    fa_layers: u64,
-    scratch_rows: u64,
-) -> u32 {
-    if row_bytes == 0 {
-        return u32::MAX;
-    }
-    let admits =
-        |window| dflash2_reserve_admits(window, headroom, row_bytes, fa_layers, scratch_rows);
-    let (mut low, mut high) = (0u32, (headroom / row_bytes).min(u64::from(u32::MAX)) as u32);
-    if !admits(low) {
-        return 0;
-    }
-    while low < high {
-        let mid = low + (high - low).div_ceil(2);
-        if admits(mid) {
-            low = mid;
-        } else {
-            high = mid - 1;
-        }
-    }
-    low
-}
-
-/// The published DFlash2 window terms for `config` with a draft whose KV
-/// window buffers take `draft_ring_bytes` and whose verify writes
-/// `scratch_rows` rows past the kept ones. `pool` is the paged pool's unallocated
-/// budget, `headroom` the live [`dflash2_kv_headroom_bytes`] after that pool
-/// registered; either `None` drops its term. Both terms and the KV extent
-/// size one turn's KV from what is left after one lane's state, as Splash's
-/// `dynamicBudgetBytes - laneStateBytes`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn dflash2_window_terms(
-    config: &super::config::Qwen3_5Config,
-    format: KvFormat,
-    dtype: DType,
-    draft_trained: usize,
-    draft_ring_bytes: u64,
-    draft_block_size: usize,
-    pool: Option<DFlash2PoolBudget>,
-    headroom: Option<u64>,
-) -> Result<DFlash2WindowTerms> {
-    let fa_layers = config.full_attention_layer_count();
-    let row_bytes = kv_row_bytes(
-        fa_layers,
-        config.num_kv_heads,
-        config.head_dim,
-        dtype,
-        format,
-    );
-    let layout = SplashKvLayout::of(
-        fa_layers,
-        config.num_kv_heads,
-        config.head_dim,
-        dtype,
-        format,
-    );
-    let lane_bytes = dflash2_lane_bytes(config.recurrent_state_bytes(), draft_ring_bytes);
-    let scratch_rows = draft_block_size as u64;
-    // Read before the lane exists: its state takes this headroom first.
-    let headroom = headroom.map(|headroom| headroom.saturating_sub(lane_bytes));
-    let extent_budget = match (pool, headroom) {
-        (Some(budget), _) => budget.bytes.saturating_sub(lane_bytes),
-        (None, Some(headroom)) => dflash2_kv_budget_of(headroom),
-        (None, None) => 0,
-    };
-    let pool = pool.map(|budget| {
-        dflash2_pool_window(budget.bytes, lane_bytes, &layout, scratch_rows)
-            .max(budget.floor_tokens)
-    });
-    let reserve = headroom.map(|headroom| {
-        dflash2_reserve_window(headroom, row_bytes, fa_layers as u64, scratch_rows)
-    });
-    Ok(DFlash2WindowTerms {
-        trained: config.max_position_embeddings.max(0) as u32,
-        draft_trained: draft_trained.min(u32::MAX as usize) as u32,
-        pool,
-        reserve,
-        row_bytes,
-        extent_rows: layout.extent_rows_for(extent_budget),
-    })
 }
 
 /// Bytes one token row costs across every full-attention K and V tensor:
@@ -618,53 +269,146 @@ pub(crate) fn dflash2_decode_cache_limit(
     )
 }
 
-/// Bytes the decode phase allocates and frees at `context_rows` attended
-/// keys: one cycle's transients plus the free pool
-/// [`dflash2_decode_cache_limit`] lets them keep.
-pub(crate) fn dflash2_decode_transient_bytes(
+/// Bytes one verify cycle allocates and frees at `context_rows` attended
+/// keys. The allocator's free pool is not charged: MLX keeps it only below
+/// its own collection limit and frees it before allocating past it.
+pub(crate) fn dflash2_cycle_transient_bytes(
     config: &super::config::Qwen3_5Config,
     block_size: usize,
     context_rows: u64,
 ) -> u64 {
-    let cycle = dflash2_cycle_transient(config, block_size, context_rows).total();
-    cycle.saturating_add(crate::cache_limit::decode_cache_limit(cycle))
+    dflash2_cycle_transient(config, block_size, context_rows).total()
 }
 
-/// First-order estimate of the bytes one turn allocates and frees besides its
-/// KV, `context_rows` being the rows the target KV holds: the larger of a
+/// Bytes a DFlash2 turn allocates and frees besides its KV at its peak,
+/// `context_rows` being the rows the target KV holds: the larger of a
 /// prefill chunk (one layer's attention and MLP scratch over the chunk rows,
-/// plus one full-attention layer's prefix dequantized from int8 rows and its
-/// concatenation with the chunk) and [`dflash2_decode_transient_bytes`].
+/// the draft's tapped hidden rows of that chunk and, for int8 rows, one
+/// full-attention layer's prefix dequantized beside its concatenation with
+/// the chunk) and one verify cycle.
 pub(crate) fn dflash2_turn_transient_bytes(
     config: &super::config::Qwen3_5Config,
     block_size: usize,
     prompt_len: usize,
     context_rows: u64,
     kv_format: KvFormat,
+    tap_layers: usize,
 ) -> u64 {
     let dim = |v: i32| v.max(0) as u64;
-    let chunk_rows = (prompt_len as u64).min(PREFILL_STEP_SIZE as u64);
-    let scratch = chunk_rows
-        .saturating_mul(3)
-        .saturating_mul(dim(config.hidden_size).saturating_add(dim(config.intermediate_size)))
+    let prompt = prompt_len as u64;
+    let chunk = prompt.min(PREFILL_STEP_SIZE as u64);
+    let taps = chunk
+        .saturating_mul(tap_layers as u64)
+        .saturating_mul(dim(config.hidden_size))
         .saturating_mul(2);
-    // An int8 prefill chunk dequantizes the prefix to BF16 K and V, then
-    // concatenates the chunk onto it: both copies are live at once.
     let dequantized_prefix = match kv_format {
-        KvFormat::Int8 => (prompt_len as u64)
+        KvFormat::Int8 => prompt
             .saturating_mul(2)
-            .saturating_add(chunk_rows)
+            .saturating_add(chunk)
             .saturating_mul(dim(config.num_kv_heads))
             .saturating_mul(dim(config.head_dim))
             .saturating_mul(2 * 2),
         KvFormat::Bf16 => 0,
     };
-    let prefill = scratch.saturating_add(dequantized_prefix);
-    prefill.max(dflash2_decode_transient_bytes(
+    let prefill = prefill_chunk_scratch_bytes(config, prompt)
+        .saturating_add(taps)
+        .saturating_add(dequantized_prefix);
+    prefill.max(dflash2_cycle_transient_bytes(
         config,
         block_size,
         context_rows,
     ))
+}
+
+/// Which fused SDPA kernels a paged prefill chunk can take, as
+/// `select_cache_hit_prefill_plan`'s estimators read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrefillSdpaKernels {
+    pub d256_full: bool,
+    pub portable_d256: bool,
+}
+
+impl PrefillSdpaKernels {
+    /// The kernels a BF16 paged prefill of `head_dim`-wide heads can take on
+    /// this device.
+    pub(crate) fn probe(head_dim: i32) -> Self {
+        Self {
+            d256_full: super::attention::d256_full_sdpa_available(false),
+            portable_d256: head_dim == 256
+                && unsafe { mlx_sys::mlx_metal_portable_d256_sdpa_available() },
+        }
+    }
+}
+
+/// One layer's attention and MLP scratch over a prefill chunk of the first
+/// `window` rows.
+fn prefill_chunk_scratch_bytes(config: &super::config::Qwen3_5Config, window: u64) -> u64 {
+    let dim = |v: i32| v.max(0) as u64;
+    window
+        .min(PREFILL_STEP_SIZE as u64)
+        .saturating_mul(3)
+        .saturating_mul(dim(config.hidden_size).saturating_add(dim(config.intermediate_size)))
+        .saturating_mul(2)
+}
+
+/// Bytes a paged pool turn of `window` tokens allocates besides KV at its
+/// peak: the last prefill chunk's scratch with the cheaper of the two
+/// attention routes the paged prefill picks from, or one decode step.
+pub(crate) fn pool_lane_transient(
+    config: &super::config::Qwen3_5Config,
+    dtype: DType,
+    kernels: PrefillSdpaKernels,
+    window: u32,
+) -> u64 {
+    let dim = |v: i32| v.max(0) as u64;
+    let window = u64::from(window);
+    let chunk = window.min(PREFILL_STEP_SIZE as u64);
+    let (heads, kv_heads, head_dim) = (
+        dim(config.num_heads),
+        dim(config.num_kv_heads),
+        dim(config.head_dim),
+    );
+    let dtype_bytes = dtype.byte_size() as u64;
+    let gathered = estimate_paged_pool_sdpa_bytes_with_portable(
+        chunk,
+        window,
+        heads,
+        kv_heads,
+        head_dim,
+        dtype_bytes,
+        kernels.d256_full,
+        kernels.portable_d256,
+    );
+    let varlen = estimate_varlen_paged_attention_bytes(
+        chunk,
+        window,
+        heads,
+        kv_heads,
+        head_dim,
+        dtype_bytes,
+    );
+    let prefill = prefill_chunk_scratch_bytes(config, window).saturating_add(gathered.min(varlen));
+    prefill.max(dflash2_cycle_transient(config, 0, window).total())
+}
+
+/// Bytes a DFlash2 turn of `window` tokens allocates besides KV at its peak:
+/// its prefill over the window, or one verify cycle over the window and its
+/// scratch rows.
+pub(crate) fn dflash2_lane_transient(
+    config: &super::config::Qwen3_5Config,
+    block_size: usize,
+    kv_format: KvFormat,
+    tap_layers: usize,
+    window: u32,
+) -> u64 {
+    dflash2_turn_transient_bytes(
+        config,
+        block_size,
+        window as usize,
+        u64::from(window).saturating_add(block_size as u64),
+        kv_format,
+        tap_layers,
+    )
 }
 
 /// Below this many keys the attention kernels run one-pass and allocate no
@@ -1181,8 +925,8 @@ impl DFlash2Target for Qwen35Inner {
         self.speculative_window()
     }
 
-    fn dflash2_kv_extent_rows(&self) -> Option<u64> {
-        self.dflash2_window.map(|terms| terms.extent_rows)
+    fn memory_plan(&self) -> Option<&crate::engine::memory_plan::MemoryPlan> {
+        self.memory_plan.as_ref()
     }
 
     fn vision_cache(&self) -> &crate::vision::qwen::cache::VisionCache {
@@ -1313,10 +1057,6 @@ pub(crate) mod tests {
     use rand::SeedableRng;
 
     /// The turn's KV budget for a memory snapshot.
-    fn kv_budget(snapshot: PagedPrefillMemorySnapshot) -> Option<u64> {
-        dflash2_kv_headroom_bytes(snapshot).map(dflash2_kv_budget_of)
-    }
-
     impl Qwen35DFlash2Stepper<'_> {
         fn frontier(&self) -> Option<SpecFrontier> {
             Some(SpecFrontier {
@@ -2559,13 +2299,12 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    const GIB: u64 = 1024 * 1024 * 1024;
     const QWEN38_ROW_BYTES: u64 = 64 * 1024;
 
     /// Qwen3.8-27B text geometry (the DFlash2 production target):
     /// 64 layers (16 full-attention), 24 heads × 256, GDN 16 key heads /
     /// 48 value heads × 128, vocab 248 320.
-    fn qwen38_27b_cfg() -> super::super::config::Qwen3_5Config {
+    pub(crate) fn qwen38_27b_cfg() -> super::super::config::Qwen3_5Config {
         super::super::config::Qwen3_5Config {
             qwen35_gguf_gdn_layout: None,
             kv_format: None,
@@ -2592,7 +2331,6 @@ pub(crate) mod tests {
             partial_rotary_factor: 0.25,
             rope_theta: 10_000_000.0,
             paged_cache_memory_mb: None,
-            paged_cache_initial_memory_mb: None,
             paged_block_size: None,
             use_block_paged_cache: None,
             persist_paged_cache: None,
@@ -2708,36 +2446,6 @@ pub(crate) mod tests {
             kv_row_bytes(16, 4, 256, DType::Float32, KvFormat::Int8),
             kv_row_bytes(16, 4, 256, DType::BFloat16, KvFormat::Int8)
         );
-    }
-
-    #[test]
-    fn kv_budget_uses_the_lower_device_limit_minus_active_and_reserve() {
-        let snapshot = PagedPrefillMemorySnapshot {
-            allocator_active_bytes: Some(30 * GIB),
-            allocator_cached_bytes: Some(7 * GIB),
-            allocator_limit_bytes: Some(200 * GIB),
-            metal_recommended_working_set_bytes: Some(100 * GIB),
-            metal_current_allocated_bytes: None,
-            paged_pool_allocated_bytes: Some(5 * GIB),
-        };
-        // min(200, 95% of 100) - 30 active - 5 pool - 2 reserve = 58 GiB; 90% usable.
-        assert_eq!(kv_budget(snapshot), Some(58 * GIB / 10 * 9));
-        let lower_mlx_limit = PagedPrefillMemorySnapshot {
-            allocator_limit_bytes: Some(60 * GIB),
-            ..snapshot
-        };
-        assert_eq!(kv_budget(lower_mlx_limit), Some(23 * GIB / 10 * 9));
-        let exhausted = PagedPrefillMemorySnapshot {
-            allocator_active_bytes: Some(96 * GIB),
-            ..snapshot
-        };
-        assert_eq!(kv_budget(exhausted), Some(0));
-        let unreadable = PagedPrefillMemorySnapshot {
-            allocator_active_bytes: None,
-            allocator_limit_bytes: None,
-            ..snapshot
-        };
-        assert_eq!(kv_budget(unreadable), None);
     }
 
     fn live_target_cache_fingerprints(
@@ -3020,305 +2728,6 @@ pub(crate) mod tests {
         );
     }
 
-    const MIB: u64 = 1024 * 1024;
-
-    /// The M3 Pro pool term inputs: 5,051 one-MiB blocks at most, the
-    /// 275-block runway allocated, 78,464 paged tokens after the GDN charge.
-    fn m3_pro_runway_pool() -> DFlash2PoolBudget {
-        DFlash2PoolBudget {
-            bytes: dflash2_pool_budget_bytes(5_051, 275, MIB),
-            floor_tokens: 78_464,
-        }
-    }
-
-    /// Splash's extent for the 27B int8 target KV (16 layers, 4 heads,
-    /// 256-wide): the int8 scales need 128-page alignment, and one aligned
-    /// unit (130 MiB) is both the smallest and the largest extent, so every
-    /// budget gets 128 pages = 4,096 rows; a budget under one extent still
-    /// grows by it. Mutation: align on the data region alone in
-    /// `extent_alignment_pages` → red (alignment 2 pages).
-    #[test]
-    fn splash_extent_pages_on_qwen38_27b() {
-        let layout = SplashKvLayout::of(16, 4, 256, DType::BFloat16, KvFormat::Int8);
-        assert_eq!(layout.page_bytes(), 1_064_960);
-        assert_eq!(layout.page_bytes(), 32 * 33_280);
-        assert_eq!(layout.extent_alignment_pages(), 128);
-        for pages in [128, 4_368, 100_000] {
-            assert_eq!(layout.extent_pages_for(pages), 128, "{pages} pages");
-        }
-        assert_eq!(layout.extent_pages_for(127), 0);
-        assert_eq!(layout.extent_rows_for(4_368 * 1_064_960), 4_096);
-        assert_eq!(layout.extent_rows_for(0), 4_096);
-    }
-
-    /// Gate: the Splash full-lane window on the M3 Pro trigger inputs
-    /// (5,051 one-MiB pool blocks with the 275-block runway allocated, 27B
-    /// target, 5 x 8 x 128 draft, 8 verify rows). The runway counts once,
-    /// and the KV capacity is whole extents (`kvCapacityPagesFor`): 4,368
-    /// pages fit, 4,352 = 34 extents of 128 do, 139,264 rows, less 7
-    /// scratch rows. Mutations: ignore `allocated_blocks` in
-    /// `dflash2_pool_budget_bytes` → red (5,296,357,376 pool bytes); price rows with
-    /// `KvFormat::Bf16` in `dflash2_window_terms` → red (row bytes 65,536);
-    /// charge one GDN cell in `dflash2_lane_bytes` → red (143,353); take
-    /// every page instead of whole extents in `dflash2_pool_window` → red
-    /// (139,769).
-    #[test]
-    fn dflash2_pool_window_counts_whole_extents() {
-        let cfg = qwen38_27b_cfg();
-        assert_eq!(m3_pro_runway_pool().bytes, 5_007_998_976);
-        let terms = dflash2_window_terms(
-            &cfg,
-            KvFormat::Int8,
-            DType::BFloat16,
-            262_144,
-            47_329_280,
-            QWEN38_DRAFT_BLOCK,
-            Some(m3_pro_runway_pool()),
-            None,
-        )
-        .expect("window terms");
-        assert_eq!(terms.row_bytes, 33_280);
-        assert_eq!(terms.extent_rows, 4_096);
-        assert_eq!(terms.pool, Some(139_257));
-        assert_eq!(terms.reserve, None);
-        assert_eq!(terms.window(), 139_257);
-    }
-
-    /// Gate: a pool allocated at its maximum (an explicit initial size of
-    /// the whole pool) leaves no bytes, and the window keeps the pool's own
-    /// 78,464 instead of collapsing. Mutation: drop `.max(budget.floor_tokens)`
-    /// in `dflash2_window_terms` → red (1).
-    #[test]
-    fn pinned_pool_keeps_the_pool_window() {
-        let pool = DFlash2PoolBudget {
-            bytes: dflash2_pool_budget_bytes(5_051, 5_051, MIB),
-            floor_tokens: 78_464,
-        };
-        assert_eq!(pool.bytes, 0);
-        let terms = dflash2_window_terms(
-            &qwen38_27b_cfg(),
-            KvFormat::Int8,
-            DType::BFloat16,
-            262_144,
-            47_329_280,
-            QWEN38_DRAFT_BLOCK,
-            Some(pool),
-            None,
-        )
-        .expect("window terms");
-        assert_eq!(terms.window(), 78_464);
-    }
-
-    /// Draft KV window buffers of the 27B DFlash2 draft (5 × 8 × 128).
-    const QWEN38_DRAFT_RING_BYTES: u64 = 47_329_280;
-
-    /// One 27B DFlash2 lane: two GDN cells and the draft's window buffers.
-    fn qwen38_lane_bytes() -> u64 {
-        dflash2_lane_bytes(
-            qwen38_27b_cfg().recurrent_state_bytes(),
-            QWEN38_DRAFT_RING_BYTES,
-        )
-    }
-
-    /// The largest window whose `window + 7` rows plus one of 16 layers'
-    /// growth copy fit the budget of `headroom` less one lane: rows·rb +
-    /// ⌈rows·rb/16⌉ ≤ B holds exactly when rows·rb ≤ ⌊16·B/17⌋.
-    fn qwen38_reserve_window(headroom: u64, row_bytes: u64) -> u32 {
-        let budget = dflash2_kv_budget_of(headroom - qwen38_lane_bytes());
-        (budget * 16 / 17 / row_bytes - QWEN38_DRAFT_BLOCK as u64) as u32
-    }
-
-    /// Gate: with little MLX-active memory the target KV growth, not the
-    /// pool probe, binds: the window is the largest one whose rows and one
-    /// layer's growth copy fit the live budget after one lane. Mutations:
-    /// drop the `reserve` term from `DFlash2WindowTerms::window` → red
-    /// (window 651,257 ≠ 602,623); drop the layer copy from
-    /// `dflash2_reserve_admits` → red (reserve 640,287 ≠ 602,623); drop the
-    /// lane from the headroom in `dflash2_window_terms` → red (reserve
-    /// 611,664 ≠ 602,623).
-    #[test]
-    fn dflash2_reserve_window_binds_when_active_memory_is_low() {
-        let cfg = super::super::config::Qwen3_5Config {
-            max_position_embeddings: 1_048_576,
-            ..qwen38_27b_cfg()
-        };
-        let working_set = 27 * GIB;
-        let active = GIB;
-        // The pool probe's max: 0.85·WS − active − 1 GiB − 64 MiB, in blocks;
-        // the 275 MiB runway is allocated.
-        let pool_bytes = (working_set / 100 * 85 - active - GIB - 64 * MIB) / MIB * MIB;
-        let snapshot = PagedPrefillMemorySnapshot {
-            allocator_active_bytes: Some(active),
-            allocator_cached_bytes: Some(0),
-            allocator_limit_bytes: Some(working_set),
-            metal_recommended_working_set_bytes: Some(working_set),
-            metal_current_allocated_bytes: None,
-            paged_pool_allocated_bytes: Some(275 * MIB),
-        };
-        let headroom = dflash2_kv_headroom_bytes(snapshot).expect("readable limits");
-        let terms = dflash2_window_terms(
-            &cfg,
-            KvFormat::Int8,
-            DType::BFloat16,
-            1_048_576,
-            47_329_280,
-            QWEN38_DRAFT_BLOCK,
-            Some(DFlash2PoolBudget {
-                bytes: pool_bytes - 275 * MIB,
-                floor_tokens: 0,
-            }),
-            Some(headroom),
-        )
-        .expect("window terms");
-        let (pool, reserve) = (terms.pool.expect("pool"), terms.reserve.expect("reserve"));
-        assert!(
-            reserve < pool,
-            "reserve {reserve} must bind below pool {pool}"
-        );
-        assert_eq!(reserve, qwen38_reserve_window(headroom, terms.row_bytes));
-        assert_eq!(terms.window(), reserve);
-        let admits = |window| {
-            dflash2_reserve_admits(
-                window,
-                headroom - qwen38_lane_bytes(),
-                terms.row_bytes,
-                16,
-                QWEN38_DRAFT_BLOCK as u64,
-            )
-        };
-        assert!(admits(reserve));
-        assert!(
-            !admits(reserve + 1),
-            "the reserve window is the largest one admitted"
-        );
-    }
-
-    /// Gate: on the M3 Pro trigger inputs (WS 27 GiB, MLX active 16.95 GiB,
-    /// the 275 MiB runway registered) the growth term sits far above the
-    /// pool term, so the pool term binds at 139,257. Mutations: drop the
-    /// layer copy from `dflash2_reserve_admits` → red (reserve 177,134 ≠
-    /// 166,714); drop the lane from the headroom in `dflash2_window_terms`
-    /// → red (reserve 175,755 ≠ 166,714).
-    #[test]
-    fn dflash2_reserve_window_on_the_m3_pro_inputs() {
-        let working_set = 27 * GIB;
-        let snapshot = PagedPrefillMemorySnapshot {
-            allocator_active_bytes: Some(17_357 * MIB),
-            allocator_cached_bytes: Some(0),
-            allocator_limit_bytes: Some(working_set),
-            metal_recommended_working_set_bytes: Some(working_set),
-            metal_current_allocated_bytes: None,
-            paged_pool_allocated_bytes: Some(275 * MIB),
-        };
-        let headroom = dflash2_kv_headroom_bytes(snapshot).expect("readable limits");
-        let terms = dflash2_window_terms(
-            &qwen38_27b_cfg(),
-            KvFormat::Int8,
-            DType::BFloat16,
-            262_144,
-            47_329_280,
-            QWEN38_DRAFT_BLOCK,
-            Some(m3_pro_runway_pool()),
-            Some(headroom),
-        )
-        .expect("window terms");
-        let reserve = terms.reserve.expect("reserve");
-        assert_eq!(reserve, qwen38_reserve_window(headroom, terms.row_bytes));
-        assert!(reserve > 139_257, "reserve {reserve} must not bind");
-        assert_eq!(terms.window(), 139_257);
-    }
-
-    /// Gate: on the M3 Pro inputs, after a 60,000-token AR turn grew the
-    /// runway pool from 275 to 3,859 blocks (3,923 MiB registered with the
-    /// restore staging), a 100,000-token DFlash2 booking (25 extents of
-    /// 4,096 rows, 3,407,872,000 bytes) is refused; its shortfall takes 6
-    /// pool extents of 128 MiB, and the pool cut to 3,091 blocks books it.
-    /// Mutation: round the extent count down in `pool_extents_for_bytes` →
-    /// red (5 extents, still refused).
-    #[test]
-    fn m3_pro_ar_growth_refuses_100k_and_six_extents_restore_it() {
-        use crate::models::qwen3_5::dflash2_turn::{KvGrowthNeed, dflash2_kv_growth_shortfall};
-        use crate::transformer::paged_kv_cache_adapter::pool_extents_for_bytes;
-        let working_set = 27 * GIB;
-        let snapshot = |pool_blocks: u64| PagedPrefillMemorySnapshot {
-            allocator_active_bytes: Some(17_357 * MIB),
-            allocator_cached_bytes: Some(0),
-            allocator_limit_bytes: Some(working_set),
-            metal_recommended_working_set_bytes: Some(working_set),
-            metal_current_allocated_bytes: None,
-            paged_pool_allocated_bytes: Some((pool_blocks + 64) * MIB),
-        };
-        let need = KvGrowthNeed {
-            from_rows: 0,
-            rows: 102_400,
-            kv_bytes: 102_400 * 33_280,
-            transient_bytes: 0,
-        };
-        assert_eq!(need.kv_bytes, 3_407_872_000);
-        let live = dflash2_kv_headroom_bytes(snapshot(3_859)).expect("readable limits");
-        assert_eq!(live, 3_080_296_857);
-        assert_eq!(dflash2_kv_budget_of(live), 2_772_267_165);
-        assert!(dflash2_kv_budget_of(live) < need.kv_bytes, "refused");
-        let extents = pool_extents_for_bytes(dflash2_kv_growth_shortfall(live, &need), 128 * MIB);
-        assert_eq!(extents, 6);
-        let blocks = 3_859 - u64::from(extents) * 128;
-        assert_eq!(blocks, 3_091);
-        let after = dflash2_kv_headroom_bytes(snapshot(blocks)).expect("readable limits");
-        assert_eq!(after, 3_885_603_225);
-        assert_eq!(dflash2_kv_budget_of(after), 3_497_042_898);
-        assert!(after >= dflash2_kv_headroom_for(need.kv_bytes), "books");
-    }
-
-    /// Gate: the headroom the reserve term reads at load holds no lane yet;
-    /// a turn's lane takes it before the KV grows. A flat load (no pool)
-    /// with 2 GiB of headroom publishes a window whose turn grows its KV in
-    /// whole extents up to the cap, each growth inside the live budget
-    /// after the lane and the KV already held, as
-    /// `ensure_dflash2_target_rows` checks it. Mutation: drop the lane from
-    /// the headroom in `dflash2_window_terms` → red (window 54,651; the
-    /// growth to 53,248 rows needs 247,070,720 bytes, the budget holds
-    /// 140,838,912).
-    #[test]
-    fn dflash2_reserve_window_leaves_room_for_the_lane() {
-        let cfg = qwen38_27b_cfg();
-        let headroom = 2 * GIB;
-        let terms = dflash2_window_terms(
-            &cfg,
-            KvFormat::Int8,
-            DType::BFloat16,
-            262_144,
-            QWEN38_DRAFT_RING_BYTES,
-            QWEN38_DRAFT_BLOCK,
-            None,
-            Some(headroom),
-        )
-        .expect("window terms");
-        let window = terms.window();
-        assert_eq!(window, terms.reserve.expect("reserve"));
-        let plan = super::super::dflash2_turn::DFlash2KvPlan {
-            cap_rows: i64::from(window) + QWEN38_DRAFT_BLOCK as i64,
-            extent_rows: terms.extent_rows as i64,
-        };
-        let (row_bytes, lane) = (terms.row_bytes, qwen38_lane_bytes());
-        let mut held = 0i64;
-        while held < plan.cap_rows {
-            let rows = plan.target_rows(held + 1);
-            let copy = if held > 0 {
-                dflash2_kv_layer_copy_bytes(rows as u64, row_bytes, 16)
-            } else {
-                0
-            };
-            let need = (rows - held) as u64 * row_bytes + copy;
-            let budget = dflash2_kv_budget_of(headroom - lane - held as u64 * row_bytes);
-            assert!(
-                need <= budget,
-                "window {window}: the growth to {rows} rows needs {need} bytes, the budget holds \
-                 {budget}"
-            );
-            held = rows;
-        }
-    }
-
     /// Mutation: drop the concat copy (`2 * prompt + chunk` → `prompt`) from
     /// the int8 prefill term of `dflash2_turn_transient_bytes` → red.
     #[test]
@@ -3332,7 +2741,7 @@ pub(crate) mod tests {
         };
         let prompt = 72_000usize;
         let transient = |format| {
-            dflash2_turn_transient_bytes(&cfg, QWEN38_DRAFT_BLOCK, prompt, prompt as u64, format)
+            dflash2_turn_transient_bytes(&cfg, QWEN38_DRAFT_BLOCK, prompt, prompt as u64, format, 0)
         };
         let scratch = 2048 * 3 * (5120 + 17_408) * 2;
         let copies = (2 * prompt as u64 + 2048) * 4 * 256 * 2 * 2;
@@ -3928,7 +3337,7 @@ pub(crate) mod tests {
         assert!(inner.dflash2_context.is_some(), "draft context kept");
     }
 
-    /// Gate: a DFlash2 turn clamps on the window frozen at load. A prompt
+    /// Gate: a DFlash2 turn clamps on its memory plan's window. A prompt
     /// that fills it is rejected before the prefill; one row less runs.
     /// Mutation: pass `None` for `target.dflash2_window()` in
     /// `dflash2_chat_turn` → red.
@@ -3937,18 +3346,12 @@ pub(crate) mod tests {
         if !metal_is_default_device() {
             return Ok(());
         }
-        let window = |pool| DFlash2WindowTerms {
-            trained: u32::MAX,
-            draft_trained: u32::MAX,
-            pool: Some(pool),
-            reserve: None,
-            row_bytes: 1,
-            extent_rows: 256,
-        };
+        let window =
+            |resident| crate::engine::memory_plan::MemoryPlan::with_speculative_window(resident, 8);
         let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
         let mut inner = tiny_dflash_inner(0xDFA5_220B);
         reset_flat_fixture(&mut inner);
-        inner.dflash2_window = Some(window(4));
+        inner.memory_plan = Some(window(4));
         assert_eq!(DFlash2Target::dflash2_window(&inner), Some(4));
         let err = match run_tiny_dflash_turn(&mut inner, &tokenizer, &[1, 2, 3, 4], false, 1) {
             Ok(_) => panic!("a prompt that fills the published window must be rejected"),
@@ -3962,7 +3365,7 @@ pub(crate) mod tests {
         );
         assert_eq!(flat_attention_frontier(&inner), Some(0), "no prefill chunk");
 
-        inner.dflash2_window = Some(window(5));
+        inner.memory_plan = Some(window(5));
         let result = run_tiny_dflash_turn(&mut inner, &tokenizer, &[1, 2, 3, 4], false, 8)?;
         assert_eq!(result.num_tokens, 1, "the window leaves one output row");
         Ok(())

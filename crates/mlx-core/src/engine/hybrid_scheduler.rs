@@ -268,6 +268,12 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn scheduler_books_on_demand(&self) -> bool {
         !scheduler_reserve_full_isl()
     }
+    /// The window a scheduled turn clamps on when the family's memory plan
+    /// sets it; `speculative` turns also pay the draft state they hold.
+    /// `None` keeps the pool's own window and `MLX_PAGED_PER_SEQ_CTX`.
+    fn planned_turn_window(&self, _speculative: bool) -> Option<u32> {
+        None
+    }
     /// The scheduled output budget is the rest of the window: a prompt must
     /// leave room for one new token and the budget is `window - prompt`. The
     /// family publishes the same rule to the host
@@ -615,6 +621,21 @@ pub(crate) fn scheduler_per_seq_context_override() -> Option<u32> {
     })
 }
 
+/// The context a scheduled turn clamps on: the planned window when the
+/// family's memory plan sets one, else the pool window under
+/// `override_cap`.
+pub(crate) fn scheduled_window(
+    trained_context: u32,
+    planned: Option<u32>,
+    pool_tokens: u32,
+    override_cap: Option<u32>,
+) -> u32 {
+    match planned {
+        Some(window) => scheduled_turn_context(trained_context, window, None),
+        None => scheduled_turn_context(trained_context, pool_tokens, override_cap),
+    }
+}
+
 pub(crate) fn scheduled_turn_context(
     trained_context: u32,
     pool_tokens: u32,
@@ -893,37 +914,6 @@ fn step_state_bytes<B: HybridSchedulerBackend>(
         0
     };
     state.saturating_add(u64::from(booked).saturating_mul(bytes_per_block))
-}
-
-/// Largest turn length a lone speculative turn can reach in
-/// `usable_pool_tokens` when its draft state, held outside the pool, grows
-/// with every row: its blocks plus `held(T)` fit the usable pool's bytes.
-pub(crate) fn speculative_window_tokens(
-    usable_pool_tokens: u32,
-    block_size: u32,
-    bytes_per_block: u64,
-    held: impl Fn(u32) -> u64,
-) -> u32 {
-    if bytes_per_block == 0 || block_size == 0 {
-        return usable_pool_tokens.max(1);
-    }
-    let budget = u64::from(usable_pool_tokens / block_size).saturating_mul(bytes_per_block);
-    let fits = |tokens: u32| {
-        u64::from(tokens.div_ceil(block_size))
-            .saturating_mul(bytes_per_block)
-            .saturating_add(held(tokens))
-            <= budget
-    };
-    let (mut low, mut high) = (0u32, usable_pool_tokens);
-    while low < high {
-        let mid = low + (high - low).div_ceil(2);
-        if fits(mid) {
-            low = mid;
-        } else {
-            high = mid - 1;
-        }
-    }
-    low.max(1)
 }
 
 /// Blocks a pool grow must add before `decision` admits, or `None` when no
@@ -2568,11 +2558,20 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }))
     }
 
-    /// Tokens one scheduled turn can use in the max pool after recurrent
-    /// state. An on-demand speculative turn's draft state grows outside the
-    /// pool with every row and each step must fit it, so its window also
-    /// pays the draft state it holds at its last row.
+    /// Tokens one scheduled turn can use: the family's planned window, else
+    /// the max pool after recurrent state. An on-demand speculative turn's
+    /// draft state grows outside the pool with every row, so its planned
+    /// window also pays the draft state it holds at its last row.
+    #[cfg(test)]
     fn scheduled_turn_window(&self, block_size: u32, speculative: bool) -> u32 {
+        self.inner
+            .planned_turn_window(speculative && self.inner.scheduler_books_on_demand())
+            .unwrap_or_else(|| self.pool_turn_window(block_size))
+    }
+
+    /// Tokens one scheduled turn can use in the max pool after recurrent
+    /// state.
+    fn pool_turn_window(&self, block_size: u32) -> u32 {
         let trained_context = u32::try_from(self.inner.max_position_embeddings())
             .unwrap_or(1)
             .max(1);
@@ -2583,18 +2582,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let bytes_per_block = adapter
             .map(|adapter| adapter.bytes_per_block().unwrap_or(0))
             .unwrap_or(0);
-        let usable_pool = pool_tokens_after_recurrent(
+        pool_tokens_after_recurrent(
             pool_tokens,
             block_size,
             bytes_per_block,
             self.inner.recurrent_state_bytes(),
-        );
-        if !(speculative && self.inner.scheduler_books_on_demand()) {
-            return usable_pool;
-        }
-        speculative_window_tokens(usable_pool, block_size, bytes_per_block, |tokens| {
-            self.inner.scheduled_draft_state_held_bytes(tokens)
-        })
+        )
     }
 
     /// A scheduled turn's output budget: the request clamped to the turn's
@@ -2610,9 +2603,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let trained_context = u32::try_from(self.inner.max_position_embeddings())
             .unwrap_or(1)
             .max(1);
-        let context = scheduled_turn_context(
+        let planned = self
+            .inner
+            .planned_turn_window(speculative && self.inner.scheduler_books_on_demand());
+        let context = scheduled_window(
             trained_context,
-            self.scheduled_turn_window(block_size, speculative),
+            planned,
+            planned.unwrap_or_else(|| self.pool_turn_window(block_size)),
             scheduler_per_seq_context_override(),
         );
         engine::scheduler::clamp_scheduled_output_tokens(
@@ -4437,7 +4434,6 @@ pub(crate) mod tests {
             partial_rotary_factor: 0.25,
             rope_theta: 100_000.0,
             paged_cache_memory_mb: Some(64),
-            paged_cache_initial_memory_mb: None,
             paged_block_size: Some(16),
             use_block_paged_cache: None,
             persist_paged_cache: None,
@@ -4477,7 +4473,6 @@ pub(crate) mod tests {
             norm_topk_prob: true,
             mlp_only_layers: None,
             paged_cache_memory_mb: Some(64),
-            paged_cache_initial_memory_mb: None,
             paged_block_size: Some(16),
             use_block_paged_cache: None,
             persist_paged_cache: None,
@@ -6354,10 +6349,9 @@ pub(crate) mod tests {
     }
 
     /// A lone MTP turn admitted over a 128-token prompt (9 booked blocks)
-    /// passes its step at the last row of its window (159 rows, 10 blocks:
-    /// 438,784 B of state in 442,368 B free), priced at what it holds, not
-    /// at its admission charge's prefill hidden rows; at 176 rows (11
-    /// blocks) it is past the window and blocks.
+    /// passes its step at 159 rows (10 blocks: 438,784 B of state in
+    /// 442,368 B free), priced at what it holds, not at its admission
+    /// charge's prefill hidden rows; at 176 rows (11 blocks) it blocks.
     /// Mutation: price the own turn at `max(charge, held)` → red (503,552 B).
     #[cfg(target_os = "macos")]
     #[test]
@@ -6365,7 +6359,6 @@ pub(crate) mod tests {
         let Some((mut state, _)) = mtp_step_state_with(64, 64) else {
             return;
         };
-        assert_eq!(state.scheduled_turn_window(16, true), 159);
         let charge =
             state.inner.recurrent_state_bytes() + state.inner.scheduled_draft_state_bytes(144);
         let mut turn = mtp_step_turn_with(&mut state, 1, 128, true, 155, charge)
@@ -6900,60 +6893,60 @@ pub(crate) mod tests {
         assert_eq!(state.inner.scheduled_recurrent_bytes(), recurrent);
     }
 
-    /// 256 usable tokens in 16-token blocks of 8,192 B hold 131,072 B; with
-    /// `1,000 + 256·T` held beside them, T = 160 fits (123,880 B) and
-    /// T = 161 needs 11 blocks (132,328 B).
-    /// Mutation: drop `held(T)` from the fit → red (256 ≠ 160).
-    #[test]
-    fn speculative_window_prices_the_held_draft_state() {
-        let held = |tokens: u32| 1_000 + 256 * u64::from(tokens);
-        assert_eq!(speculative_window_tokens(256, 16, 8_192, held), 160);
-        assert_eq!(speculative_window_tokens(256, 16, 0, held), 256);
-        assert_eq!(speculative_window_tokens(256, 16, 8_192, |_| u64::MAX), 1);
-    }
-
     /// An MTP turn's window pays the draft state it holds at its last row,
-    /// so a lone turn there passes every step check; an AR turn keeps the
-    /// pool window.
-    /// Mutation: `scheduled_turn_window` ignores `speculative` → red.
+    /// priced on the plan's pool; an AR turn keeps the pool lane's window.
+    /// On a 64-block pool of 2 MiB blocks in the 27B's bf16 pages (two 64 MiB
+    /// extents, 2,041 rows after the scratch), the held state takes pages.
+    /// Mutation: the dense `planned_turn_window` ignores `speculative` → red
+    /// (2,041).
     #[test]
     fn mtp_turn_window_is_the_speculative_window() {
         let Some((mut state, _)) = growable_qwen35_state() else {
             return;
         };
         state.inner.config.n_mtp_layers = 1;
-        let cfg = mlx_paged_attn::PagedAttentionConfig {
-            block_size: 16,
-            num_kv_heads: 1,
-            head_size: 128,
-            num_layers: 1,
-            gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
-            max_seq_len: Some(8_192),
-            max_batch_size: Some(32),
-        };
-        let pool = mlx_paged_attn::LayerKVPool::new(
-            cfg,
+        let layout = crate::engine::memory_plan::KvLayout::of(
+            16,
             4,
-            512,
-            mlx_paged_attn::metal::MetalDtype::BFloat16,
-        )
-        .expect("MTP window LayerKVPool");
-        let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-            4, 512, 16,
-        )));
-        state.inner.paged_adapter = Some(
-            PagedKVCacheAdapter::new(allocator, Arc::new(pool), 16).expect("MTP window adapter"),
+            256,
+            crate::array::DType::BFloat16,
+            crate::transformer::KvFormat::Bf16,
         );
+        state.inner.memory_plan = Some(crate::engine::memory_plan::MemoryPlan::with_pool_window(
+            64,
+            2 << 20,
+            layout,
+            0,
+            2_041,
+        ));
         let ar = state.scheduled_turn_window(16, false);
         let mtp = state.scheduled_turn_window(16, true);
+        assert_eq!(ar, 2_041);
+        let pool = state
+            .inner
+            .memory_plan
+            .as_ref()
+            .and_then(|plan| plan.pool.as_ref())
+            .expect("pool plan");
         assert_eq!(
             mtp,
-            speculative_window_tokens(ar, 16, 8_192, |tokens| {
-                state.inner.scheduled_draft_state_held_bytes(tokens)
-            })
+            pool.window_with(&|tokens| state.inner.scheduled_draft_state_held_bytes(tokens))
         );
         assert!(1 < mtp && mtp < ar, "{mtp} vs {ar}");
+    }
+
+    /// A planned window is not capped by `MLX_PAGED_PER_SEQ_CTX`; without a
+    /// plan the pool window is.
+    /// Mutation: pass `override_cap` on the planned arm of `scheduled_window`
+    /// → red (1).
+    #[test]
+    fn planned_window_ignores_the_per_seq_cap() {
+        assert_eq!(
+            scheduled_window(262_144, Some(50_585), 1_000, Some(1)),
+            50_585
+        );
+        assert_eq!(scheduled_window(262_144, None, 1_000, Some(1)), 1);
+        assert_eq!(scheduled_window(40_960, Some(50_585), 1_000, None), 40_960);
     }
 
     /// 40 of 100 blocks, 10 free, 20 booked, 5% watermark (2 blocks'

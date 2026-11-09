@@ -65,8 +65,6 @@ Options:
                                   Token cadence for paged decode cache clear.
                                   Defaults to 1024 (mirrors DFlash's
                                   _DECODE_CLEAR_CACHE_INTERVAL_TOKENS).
-    MLX_PAGED_CACHE_MEMORY_MB      Paged KV cache memory budget override for
-                                  paged-aware Qwen3.5 launch.
     MLX_PAGED_NATIVE_KV_WRITE     Set to 0/false/off to disable graph-native
                                   paged KV writes for every paged family.
                                   Batched decode hard-errors when off.

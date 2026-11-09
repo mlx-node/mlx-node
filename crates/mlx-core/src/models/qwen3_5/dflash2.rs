@@ -308,6 +308,10 @@ impl DraftExecutionPolicy {
 }
 
 impl DFlash2Config {
+    pub(crate) fn max_position_embeddings(&self) -> usize {
+        self.max_position_embeddings
+    }
+
     /// Bytes of every layer's BF16 K and V draft window buffers at their
     /// largest capacity (`DraftKvWindow::append`'s cap: window + reserve +
     /// one growth step).
@@ -2953,7 +2957,8 @@ fn validate_tensor_inventory(
     Ok(())
 }
 
-pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
+/// The validated `config.json` of the DFlash2 checkpoint directory `path`.
+pub(crate) fn read_dflash2_config(path: &Path) -> Result<DFlash2Config> {
     if !path.is_dir() {
         return Err(Error::from_reason(format!(
             "DFlash2 path is not a directory: {}",
@@ -2966,7 +2971,21 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
     let raw: RawConfig = serde_json::from_str(&config_data).map_err(|error| {
         Error::from_reason(format!("Failed to parse DFlash2 config.json: {error}"))
     })?;
-    let config = DFlash2Config::from_raw(raw)?;
+    DFlash2Config::from_raw(raw)
+}
+
+/// Bytes of the DFlash2 checkpoint file in `path`, before it loads.
+pub(crate) fn dflash2_file_bytes(path: &Path) -> Result<u64> {
+    let tensor_path = resolve_safetensors(path)?;
+    fs::metadata(&tensor_path)
+        .map(|metadata| metadata.len())
+        .map_err(|error| {
+            Error::from_reason(format!("Failed to stat {}: {error}", tensor_path.display()))
+        })
+}
+
+pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
+    let config = read_dflash2_config(path)?;
     let execution_policy = DraftExecutionPolicy::capture();
     let tensor_path = resolve_safetensors(path)?;
     crate::engine::persistence::prewarm_checkpoint_pages(path);
@@ -4299,7 +4318,6 @@ mod tests {
             partial_rotary_factor: 0.25,
             rope_theta: 10_000.0,
             paged_cache_memory_mb: None,
-            paged_cache_initial_memory_mb: None,
             paged_block_size: None,
             use_block_paged_cache: Some(false),
             persist_paged_cache: None,

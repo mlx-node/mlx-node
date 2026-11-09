@@ -440,6 +440,12 @@ impl Lfm2Inner {
             self.config.head_dim() as u32,
             block_size,
             cache_dtype,
+            crate::engine::memory_plan::automatic_hard_budget().map_err(|error| {
+                Error::from_reason(format!(
+                    "LFM2 paged cache sizing failed safely; refusing an uncapped pool request: {error}"
+                ))
+            })?,
+            0,
         )
         .map_err(|error| {
             Error::from_reason(format!(

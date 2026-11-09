@@ -410,19 +410,25 @@ pub(crate) fn select_live_prefill_headroom(
     }
 }
 
-pub(crate) fn live_prefill_headroom(snapshot: PagedPrefillMemorySnapshot) -> LivePrefillHeadroom {
-    let allocator_ceiling_bytes = snapshot.allocator_limit_bytes.map(|limit| {
-        snapshot
+/// The bytes live use leaves below `ceiling` (a memory plan's), or below
+/// 95% of the recommended working set without one.
+pub(crate) fn live_headroom(
+    snapshot: PagedPrefillMemorySnapshot,
+    ceiling: Option<u64>,
+) -> LivePrefillHeadroom {
+    let allocator_ceiling_bytes = snapshot.allocator_limit_bytes.map(|limit| match ceiling {
+        Some(ceiling) => limit.min(ceiling),
+        None => snapshot
             .metal_recommended_working_set_bytes
             .map(|recommended| limit.min(recommended.saturating_mul(95) / 100))
-            .unwrap_or(limit)
+            .unwrap_or(limit),
     });
     let mut allocator_available_bytes = allocator_ceiling_bytes
         .zip(snapshot.allocator_active_bytes)
         .map(|(ceiling, active)| ceiling.saturating_sub(active));
 
-    let metal_available_bytes = snapshot
-        .metal_recommended_working_set_bytes
+    let metal_available_bytes = ceiling
+        .or(snapshot.metal_recommended_working_set_bytes)
         .zip(snapshot.metal_current_allocated_bytes)
         .map(|(recommended, current)| {
             // MLX's cache is reclaimable at its GC threshold. Add back only

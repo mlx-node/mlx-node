@@ -1771,6 +1771,7 @@ pub async fn load_with_thread(
         &CheckpointSource::Dir(PathBuf::from(model_path)),
         draft_model_path,
         kv_format,
+        None,
     )
     .await
 }
@@ -1804,6 +1805,7 @@ pub(crate) async fn load_with_source(
     source: &CheckpointSource,
     draft_model_path: Option<String>,
     kv_format: Option<crate::transformer::KvFormat>,
+    max_memory_bytes: Option<u64>,
 ) -> Result<Qwen3_5MoeModel> {
     // Snapshot once, before spawning; forward/compiled graphs never read this
     // diagnostic setting and another load cannot change an existing model.
@@ -2082,6 +2084,7 @@ pub(crate) async fn load_with_source(
 
                 // Create inner model
                 let mut inner = Qwen35MoeInner::new(config.clone())?;
+                inner.max_memory_bytes = max_memory_bytes;
                 inner.configure_source_moe_policy(source_moe_policy);
                 if source_moe_policy.active() {
                     info!(
@@ -2371,7 +2374,7 @@ pub(crate) async fn load_with_source(
 }
 
 /// Parse Qwen3.5 MoE config from JSON.
-fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
+pub(crate) fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
     let text_cfg = raw.get("text_config");
     let paged = PagedCacheConfig::from_raw_json(raw);
 
@@ -2484,7 +2487,6 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
                     .collect()
             }),
         paged_cache_memory_mb: paged.paged_cache_memory_mb,
-        paged_cache_initial_memory_mb: paged.paged_cache_initial_memory_mb,
         paged_block_size: paged.paged_block_size,
         use_block_paged_cache: {
             let explicit = paged.use_block_paged_cache;
@@ -2715,20 +2717,15 @@ mod tests {
         }
     }
 
-    /// Gate: the 35B-A3B DFlash2 window on the M3 Pro pool budget (5,051 MiB
-    /// = 16,163 BF16 blocks of 327,680 B, 325-block runway allocated, the
-    /// 6 x 8 x 128 draft, 7 scratch rows) prices the default int8 rows:
-    /// 10,400 B/token, pool term 475,129, window = trained 262,144. BF16:
-    /// 20,480 B/token, 244,217.
-    /// Mutations: restore `.or_else(|| Some("bf16".to_string()))` in
-    /// `to_dense_config` → red (20,480 / 244,217); price `KvFormat::Bf16` in
-    /// `dflash2_window_terms` → red.
+    /// Gate: the 35B-A3B DFlash2 lane is priced in the int8 rows its load
+    /// pins for BF16 compute: 10,400 B/token over its 10 full-attention
+    /// layers; BF16 rows are 20,480.
+    /// Mutation: restore `.or_else(|| Some("bf16".to_string()))` in
+    /// `to_dense_config` → red (20,480).
     #[test]
-    fn moe_dflash2_window_prices_the_default_format() {
+    fn moe_dflash2_lane_prices_the_default_format() {
         use crate::array::DType;
-        use crate::models::qwen3_5::dflash2_decode::{
-            DFlash2PoolBudget, dflash2_pool_budget_bytes, dflash2_window_terms,
-        };
+        use crate::engine::memory_plan::KvLayout;
         use crate::transformer::KvFormat;
         let metal = unsafe { mlx_sys::mlx_metal_is_available() }
             && unsafe { mlx_sys::mlx_default_device() } == 1;
@@ -2752,37 +2749,22 @@ mod tests {
             "linear_value_head_dim": 128,
             "max_position_embeddings": 262144
         });
-        let cfg = parse_config(&raw).unwrap();
+        let mut cfg = parse_config(&raw).unwrap();
         assert_eq!(cfg.recurrent_state_bytes(), 64_389_120);
-        let pool = DFlash2PoolBudget {
-            bytes: dflash2_pool_budget_bytes(16_163, 325, 327_680),
-            floor_tokens: 231_936,
-        };
-        let terms = |format| {
-            dflash2_window_terms(
-                &cfg.to_dense_config(),
-                format,
+        cfg.pin_kv_format(None, DType::BFloat16);
+        let dense = cfg.to_dense_config();
+        let row_bytes = |format| {
+            KvLayout::of(
+                dense.full_attention_layer_count(),
+                dense.num_kv_heads,
+                dense.head_dim,
                 DType::BFloat16,
-                262_144,
-                56_795_136,
-                7,
-                Some(pool),
-                None,
+                format,
             )
-            .unwrap()
+            .row_bytes()
         };
-        // The published 35B-A3B checkpoint computes in BF16, the activation
-        // dtype the terms price.
-        let int8 = terms(cfg.kv_format_for(DType::BFloat16));
-        assert_eq!(
-            (int8.row_bytes, int8.pool, int8.window()),
-            (10_400, Some(475_129), 262_144)
-        );
-        let bf16 = terms(KvFormat::Bf16);
-        assert_eq!(
-            (bf16.row_bytes, bf16.pool, bf16.window()),
-            (20_480, Some(244_217), 244_217)
-        );
+        assert_eq!(row_bytes(dense.kv_format()), 10_400);
+        assert_eq!(row_bytes(KvFormat::Bf16), 20_480);
     }
 
     #[test]
@@ -2795,25 +2777,21 @@ mod tests {
                 "intermediate_size": 128,
                 "num_experts": 2,
                 "paged_cache_memory_mb": 999,
-                "paged_cache_initial_memory_mb": 999,
                 "paged_block_size": 999,
                 "persist_paged_cache": true
             }
         });
         let absent = parse_config(&raw).unwrap();
         assert_eq!(absent.paged_cache_memory_mb, None);
-        assert_eq!(absent.paged_cache_initial_memory_mb, None);
         assert_eq!(absent.paged_block_size, None);
         assert_eq!(absent.persist_paged_cache, None);
         raw["paged_cache_memory_mb"] = json!(4294967360_u64);
-        raw["paged_cache_initial_memory_mb"] = json!(16);
         raw["paged_block_size"] = json!(-1);
         raw["pagedBlockSize"] = json!(32);
         raw["use_block_paged_cache"] = json!(false);
         raw["persist_paged_cache"] = json!(false);
         let config = parse_config(&raw).unwrap();
         assert_eq!(config.paged_cache_memory_mb, Some(64));
-        assert_eq!(config.paged_cache_initial_memory_mb, Some(16));
         assert_eq!(config.paged_block_size, None);
         assert_eq!(config.persist_paged_cache, Some(false));
         let env_override = std::env::var("MLX_QWEN35_PAGED_OVERRIDE").ok();
@@ -3218,7 +3196,6 @@ mod tests {
             norm_topk_prob: true,
             mlp_only_layers: None,
             paged_cache_memory_mb: Some(256),
-            paged_cache_initial_memory_mb: None,
             paged_block_size: Some(16),
             use_block_paged_cache: Some(true),
             persist_paged_cache: None,
@@ -3493,7 +3470,6 @@ mod tests {
             norm_topk_prob: true,
             mlp_only_layers: None,
             paged_cache_memory_mb: None,
-            paged_cache_initial_memory_mb: None,
             paged_block_size: None,
             use_block_paged_cache: None,
             persist_paged_cache: None,

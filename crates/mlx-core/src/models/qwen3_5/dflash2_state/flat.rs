@@ -701,18 +701,12 @@ mod tests {
     }
 
     /// A turn's state-budget eviction demotes the oldest end state but
-    /// leaves its KV whole when the live headroom cannot hold the shrink
-    /// copy. Mutation: pass `u64::MAX` as the headroom in
+    /// leaves its KV whole when the headroom cannot hold the shrink copy.
+    /// Mutation: pass `u64::MAX` as the headroom in
     /// `evict_over_state_budget` → red (the KV shrinks to the anchor).
     #[test]
     fn state_budget_demotion_skips_a_shrink_the_headroom_cannot_hold() -> Result<()> {
-        use crate::models::qwen3_5::dflash2_turn::{KV_BUDGET_OVERRIDE, evict_over_state_budget};
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                KV_BUDGET_OVERRIDE.with(|budget| budget.set(None));
-            }
-        }
+        use crate::models::qwen3_5::dflash2_turn::evict_over_state_budget;
         if !metal_is_default_device() {
             return Ok(());
         }
@@ -744,9 +738,7 @@ mod tests {
             let mut store = HybridStateStore::<FlatBacking>::with_state_budget(16, anchor_bytes);
             let id = store.insert(Lineage::text(&tokens, 0), parts)?;
             let kv_bytes = store.get(id).expect("entry").kv_bytes();
-            let _reset = Reset;
-            KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(0)));
-            let report = evict_over_state_budget(&mut store)?;
+            let report = evict_over_state_budget(&mut store, 0)?;
             assert_eq!(report.demoted, 1, "{name}: {report:?}");
             let entry = store.get(id).expect("demoted entry");
             assert_eq!(entry.kind(), HitKind::Capture, "{name}");

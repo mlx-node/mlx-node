@@ -3709,6 +3709,19 @@ export interface EngineStepMetrics {
 }
 
 /**
+ * The load-free estimate behind `/v1/models`: the plan a load of
+ * `model_path` would make, with the weights' bytes taken from their files
+ * (Splash sizes weights the same way before they load). `None` when the
+ * Metal working set is unreadable. `model_type` is `qwen3_5` or
+ * `qwen3_5_moe`; `options` are the load's.
+ */
+export declare function estimateQwen35ContextWindow(
+  modelPath: string,
+  modelType: string,
+  options?: Qwen35LoadOptions | undefined | null,
+): Promise<Qwen35ContextEstimate | null>;
+
+/**
  * Teacher-forced quality of one checkpoint against a cached reference.
  *
  * `mean_nll`, `perplexity` and `top1_agreement` are EXACT full-vocab numbers.
@@ -5145,21 +5158,11 @@ export interface Qwen35Config {
   partialRotaryFactor: number;
   ropeTheta: number;
   /**
-   * GPU memory budget for paged KV cache in megabytes.
+   * Ceiling of the paged KV pool in MiB, at most the memory plan's.
    * Only used when `use_block_paged_cache` is true.
-   * Default: automatically sized for one full-context sequence.
+   * Default: the memory plan's.
    */
   pagedCacheMemoryMb?: number | undefined;
-  /**
-   * Initial paged KV pool size in MiB for the grow-on-demand pool: the
-   * pool starts at this size and grows toward the max budget
-   * (`paged_cache_memory_mb` or the auto one-full-context default) on
-   * exhaustion. Unset (default) makes the initial pool equal the max —
-   * the historical fixed-pool behavior. `MLX_PAGED_CACHE_INITIAL_MB` wins
-   * over this field at load time. Both are ignored with a DFlash2 draft:
-   * that pool starts at its runway.
-   */
-  pagedCacheInitialMemoryMb?: number | undefined;
   /**
    * Block size for paged attention (tokens per block).
    * Only used when `use_block_paged_cache` is true.
@@ -5234,6 +5237,22 @@ export interface Qwen35Config {
   kvFormat?: string | undefined;
 }
 
+/** What a load of a Qwen3.5 checkpoint would serve, priced before it loads. */
+export interface Qwen35ContextEstimate {
+  /**
+   * Tokens a turn on the paged pool may hold; the trained window without
+   * a pool.
+   */
+  windowTokens: number;
+  /** Tokens a DFlash2 turn may hold; set only with a draft. */
+  speculativeWindowTokens?: number;
+  /**
+   * `'memory'` when the plan binds the window a default turn takes,
+   * `'model'` when the trained window does.
+   */
+  bound: string;
+}
+
 /**
  * Trained and physically available active-context limits for one loaded
  * Qwen3.5 model. Values are snapshots taken at load: `effective_window`
@@ -5302,6 +5321,11 @@ export interface Qwen35LoadOptions {
    * The block-paged cache ignores it.
    */
   kvFormat?: 'int8' | 'bf16' | undefined;
+  /**
+   * Metal memory budget in bytes (`--max-memory`): it can only lower the
+   * automatic budget the load's memory plan derives from the working set.
+   */
+  maxMemoryBytes?: number | undefined;
 }
 
 /**
@@ -5340,21 +5364,11 @@ export interface Qwen35MoeConfig {
   normTopkProb: boolean;
   mlpOnlyLayers?: number[] | undefined;
   /**
-   * GPU memory budget for paged KV cache in megabytes.
+   * Ceiling of the paged KV pool in MiB, at most the memory plan's.
    * Only used when `use_block_paged_cache` is true.
-   * Default: automatically sized for one full-context sequence.
+   * Default: the memory plan's.
    */
   pagedCacheMemoryMb?: number | undefined;
-  /**
-   * Initial paged KV pool size in MiB for the grow-on-demand pool: the
-   * pool starts at this size and grows toward the max budget
-   * (`paged_cache_memory_mb` or the auto one-full-context default) on
-   * exhaustion. Unset (default) makes the initial pool equal the max —
-   * the historical fixed-pool behavior. `MLX_PAGED_CACHE_INITIAL_MB` wins
-   * over this field at load time. Both are ignored with a DFlash2 draft:
-   * that pool starts at its runway.
-   */
-  pagedCacheInitialMemoryMb?: number | undefined;
   /**
    * Block size for paged attention (tokens per block).
    * Only used when `use_block_paged_cache` is true.

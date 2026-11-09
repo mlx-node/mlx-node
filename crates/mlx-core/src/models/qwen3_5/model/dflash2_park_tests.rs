@@ -241,8 +241,7 @@ fn install_runway_pool_reclaimed_by_eviction(inner: &mut Qwen35Inner, initial: u
     Ok(())
 }
 
-/// A draft-loaded pool with no initial size starts at the runway and grows
-/// by Splash extents. Mutation: drop the `set_extent_growth` call in dense
+/// A pool starts at the runway and grows by Splash extents. Mutation: drop the `set_extent_growth` call in dense
 /// `initialize_paged_adapter` → red (`None`).
 #[test]
 fn runway_pool_grows_by_splash_extents() -> Result<()> {

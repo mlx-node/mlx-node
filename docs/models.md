@@ -376,6 +376,19 @@ write int8. `contextLimits().kvFormat` names the format of the pool lane
 --kv-format int8` scores the int8 cache against the same teacher cache and
 the report names the format the load resolved.
 
+**Context windows come from the memory plan.** A qwen3_5 / qwen3_5_moe load
+evaluates one memory plan (Splash `evaluateEngineMemoryPlan`) after its
+weights are resident: the hard budget is the Metal recommended working set
+less 15% and 1 GiB (or `maxMemoryBytes` in the load options when lower), and
+each lane's window is what that budget holds after the fixed memory, one
+request's recurrent state and the lane's peak transient, in whole KV extents,
+capped by the trained context. `effectiveWindowTokens` is the pool lane's and
+`speculativeWindowTokens` the DFlash2 lane's (int8 rows by default). The load
+log prints the plan and which bound wins (`memory` or `model`). A
+`paged_cache_memory_mb` above the plan's pool fails the load with the MiB the
+plan allows, and so does an unreadable Metal working set on a paged load.
+These families do not read `MLX_PAGED_PER_SEQ_CTX`.
+
 ## Server-side sessions
 
 The HTTP endpoints `/v1/responses` and `/v1/messages` live in `@mlx-node/server` (`packages/server/src/endpoints/`). Both route through a per-model `SessionRegistry` (`packages/server/src/session-registry.ts`) that owns the `ChatSession` lifetimes — clients pass `previous_response_id` and the registry handles resume vs. cold-start replay internally.

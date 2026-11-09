@@ -1,0 +1,437 @@
+//! The memory plan a dense or MoE Qwen3.5 load serves its lanes from.
+
+use std::path::Path;
+
+use napi::bindgen_prelude::*;
+use napi_derive::napi;
+
+use crate::array::DType;
+use crate::engine::checkpoint_source::CheckpointSource;
+use crate::engine::memory_plan::{
+    FlatInput, KvLayout, LaneShape, LiveMemory, MeasuredMemory, MemoryFootprint, MemoryPlan,
+    PoolInput, SPECULATIVE_SCRATCH_TOKENS, live_memory, speculative_lane_bytes,
+};
+use crate::transformer::KvFormat;
+use crate::utils::gguf::NativeGgufFamily;
+
+use super::config::Qwen3_5Config;
+use super::dflash2::DFlash2Config;
+use super::dflash2_decode::{PrefillSdpaKernels, dflash2_lane_transient, pool_lane_transient};
+use super::dflash2_turn::{DFlash2Target, dflash2_target_kv_dtype, dflash2_target_kv_format};
+
+/// Tokens of the pool every load starts with (Splash `warmupKvPages`).
+const RUNWAY_TOKENS: u32 = 2048;
+
+/// The blocks a pool starts with: the runway's tokens and one request's
+/// recurrent state.
+pub(crate) fn qwen35_runway_blocks(
+    block_size: u32,
+    bytes_per_block: u64,
+    recurrent_state_bytes: u64,
+) -> u32 {
+    RUNWAY_TOKENS.div_ceil(block_size.max(1)).saturating_add(
+        recurrent_state_bytes
+            .div_ceil(bytes_per_block.max(1))
+            .min(u64::from(u32::MAX)) as u32,
+    )
+}
+
+/// The paged pool a load builds: BF16 blocks over the full-attention layers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PoolGeometry {
+    pub bytes_per_block: u64,
+    pub block_size: u32,
+    pub layers: u32,
+    /// `paged_cache_memory_mb`.
+    pub explicit_mib: Option<u32>,
+}
+
+/// What a DFlash2 draft adds to a plan.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DraftTerms {
+    pub block_size: usize,
+    pub tap_layers: usize,
+    pub trained: u32,
+    pub ring_bytes: u64,
+    pub weight_bytes: u64,
+}
+
+impl DraftTerms {
+    pub(crate) fn of(config: &DFlash2Config, weight_bytes: u64) -> Self {
+        Self {
+            block_size: config.block_size,
+            tap_layers: config.target_layers.len(),
+            trained: config.max_position_embeddings().min(u32::MAX as usize) as u32,
+            ring_bytes: config.kv_ring_bytes(),
+            weight_bytes,
+        }
+    }
+}
+
+/// The lanes one load prices.
+pub(crate) struct LoadLanes<'a> {
+    pub config: &'a Qwen3_5Config,
+    pub recurrent_state_bytes: u64,
+    pub pool: Option<PoolGeometry>,
+    pub draft: Option<DraftTerms>,
+    /// Format and dtype of the DFlash2 lane's flat K/V.
+    pub format: KvFormat,
+    pub dtype: DType,
+}
+
+/// Splash `evaluateEngineMemoryPlan` over `lanes` on the device `live`.
+pub(crate) fn evaluate_qwen35_plan(
+    label: &str,
+    lanes: &LoadLanes<'_>,
+    live: LiveMemory,
+    max_memory_bytes: Option<u64>,
+) -> Result<MemoryPlan> {
+    let config = lanes.config;
+    let draft = lanes.draft;
+    let footprint = MemoryFootprint {
+        working_set_bytes: live.working_set_bytes,
+        max_memory_bytes,
+        active_bytes: live.active_bytes,
+        other_pool_bytes: live.registered_pool_bytes,
+        staging_bytes: if lanes.pool.is_some() {
+            mlx_paged_attn::RESTORE_STAGING_BYTES
+        } else {
+            0
+        },
+        draft_weights_bytes: draft.map_or(0, |draft| draft.weight_bytes),
+    };
+    let recurrent_state_bytes = lanes.recurrent_state_bytes;
+    let trained = config.max_position_embeddings.max(0) as u32;
+    let fa_layers = config.full_attention_layer_count();
+    let kernels = PrefillSdpaKernels::probe(config.head_dim);
+    let pool_transient = |window| pool_lane_transient(config, DType::BFloat16, kernels, window);
+    let pool_input = lanes.pool.map(|geometry| PoolInput {
+        shape: LaneShape {
+            trained,
+            lane_bytes: recurrent_state_bytes,
+            layout: KvLayout::of(
+                fa_layers,
+                config.num_kv_heads,
+                config.head_dim,
+                DType::BFloat16,
+                KvFormat::Bf16,
+            ),
+            scratch_rows: SPECULATIVE_SCRATCH_TOKENS,
+            transient: &pool_transient,
+        },
+        bytes_per_block: geometry.bytes_per_block,
+        layers: u64::from(geometry.layers),
+        runway_blocks: qwen35_runway_blocks(
+            geometry.block_size,
+            geometry.bytes_per_block,
+            recurrent_state_bytes,
+        ),
+        explicit_mib: geometry.explicit_mib,
+    });
+    let (block_size, tap_layers) =
+        draft.map_or((0, 0), |draft| (draft.block_size, draft.tap_layers));
+    let format = lanes.format;
+    let flat_transient =
+        |window| dflash2_lane_transient(config, block_size, format, tap_layers, window);
+    let speculative = draft.map(|draft| FlatInput {
+        shape: LaneShape {
+            trained: trained.min(draft.trained),
+            lane_bytes: speculative_lane_bytes(recurrent_state_bytes, draft.ring_bytes),
+            layout: KvLayout::of(
+                fa_layers,
+                config.num_kv_heads,
+                config.head_dim,
+                lanes.dtype,
+                format,
+            ),
+            scratch_rows: draft.block_size as u64,
+            transient: &flat_transient,
+        },
+        copy_layers: Some(fa_layers as u64),
+    });
+    MemoryPlan::evaluate(footprint, pool_input, speculative)
+        .map_err(|error| Error::from_reason(error.message(label)))
+}
+
+/// The plan of `target`'s load from what the device holds now: the pool lane
+/// when `pool` is set, and the DFlash2 lane with a draft. `None` when the
+/// working set is unreadable or the load has no lane to price.
+pub(crate) fn plan_qwen35_load<T: DFlash2Target>(
+    label: &str,
+    target: &T,
+    recurrent_state_bytes: u64,
+    pool: Option<PoolGeometry>,
+    max_memory_bytes: Option<u64>,
+) -> Result<Option<MemoryPlan>> {
+    let draft = target.dflash2();
+    if pool.is_none() && draft.is_none() {
+        return Ok(None);
+    }
+    let Some(live) = live_memory() else {
+        return Ok(None);
+    };
+    let config = target.dense_config();
+    let lanes = LoadLanes {
+        config: &config,
+        recurrent_state_bytes,
+        pool,
+        draft: draft.map(|draft| DraftTerms::of(&draft.config, draft.weight_bytes)),
+        format: dflash2_target_kv_format(target),
+        dtype: dflash2_target_kv_dtype(target)?,
+    };
+    let plan = evaluate_qwen35_plan(label, &lanes, live, max_memory_bytes)?;
+    if let Some(line) = plan.max_memory_ignored() {
+        tracing::info!("{label} {line}");
+    }
+    tracing::info!("{label} memory plan:\n{}", plan.describe());
+    Ok(Some(plan))
+}
+
+/// Splash `auditActualMemory` at the end of a load: what is resident now
+/// against `plan`. `pool_bytes` is this load's pool, already registered.
+pub(crate) fn audit_qwen35_load(label: &str, plan: &MemoryPlan, pool_bytes: u64) -> Result<()> {
+    let Some(live) = live_memory() else {
+        return Ok(());
+    };
+    crate::engine::memory_plan::audit(plan, measured_after_load(plan, live, pool_bytes)).map_err(
+        |error| {
+            tracing::error!("{label} memory plan:\n{}", plan.describe());
+            Error::from_reason(format!("{label} memory plan audit: {error}"))
+        },
+    )
+}
+
+/// The audit's view of `live` once this load's pool of `pool_bytes` is
+/// registered: the coordinator holds that pool with its staging, which the
+/// audit charges from the plan, so neither is another pool.
+fn measured_after_load(plan: &MemoryPlan, live: LiveMemory, pool_bytes: u64) -> MeasuredMemory {
+    let own = match pool_bytes {
+        0 => 0,
+        bytes => bytes.saturating_add(plan.footprint.staging_bytes),
+    };
+    MeasuredMemory {
+        active_bytes: live.active_bytes,
+        pool_bytes,
+        other_pool_bytes: live.registered_pool_bytes.saturating_sub(own),
+    }
+}
+
+/// The `maxMemoryBytes` load option: a positive byte count.
+pub(crate) fn max_memory_option(label: &str, value: Option<i64>) -> Result<Option<u64>> {
+    match value {
+        None => Ok(None),
+        Some(bytes) if bytes > 0 => Ok(Some(bytes as u64)),
+        Some(_) => Err(Error::from_reason(format!(
+            "{label} load: maxMemoryBytes must be a positive byte count"
+        ))),
+    }
+}
+
+/// What a load of a Qwen3.5 checkpoint would serve, priced before it loads.
+#[napi(object)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen35ContextEstimate {
+    /// Tokens a turn on the paged pool may hold; the trained window without
+    /// a pool.
+    pub window_tokens: u32,
+    /// Tokens a DFlash2 turn may hold; set only with a draft.
+    pub speculative_window_tokens: Option<u32>,
+    /// `'memory'` when the plan binds the window a default turn takes,
+    /// `'model'` when the trained window does.
+    pub bound: String,
+}
+
+/// The load-free estimate behind `/v1/models`: the plan a load of
+/// `model_path` would make, with the weights' bytes taken from their files
+/// (Splash sizes weights the same way before they load). `None` when the
+/// Metal working set is unreadable. `model_type` is `qwen3_5` or
+/// `qwen3_5_moe`; `options` are the load's.
+#[napi]
+pub async fn estimate_qwen35_context_window(
+    model_path: String,
+    model_type: String,
+    options: Option<crate::models::qwen3_5::model::Qwen35LoadOptions>,
+) -> Result<Option<Qwen35ContextEstimate>> {
+    let (moe, family, label) = match model_type.as_str() {
+        "qwen3_5" => (false, NativeGgufFamily::Qwen35, "Qwen3.5"),
+        "qwen3_5_moe" => (true, NativeGgufFamily::Qwen35Moe, "Qwen3.5 MoE"),
+        other => {
+            return Err(Error::from_reason(format!(
+                "Qwen3.5 estimate: model_type {other:?} is not qwen3_5 or qwen3_5_moe"
+            )));
+        }
+    };
+    let options = options.unwrap_or_default();
+    let kv_format = options
+        .kv_format
+        .as_deref()
+        .map(|value| KvFormat::parse(Some(value)))
+        .transpose()
+        .map_err(|message| Error::from_reason(format!("{label} estimate: {message}")))?;
+    let max_memory_bytes = max_memory_option(label, options.max_memory_bytes)?;
+    let source = CheckpointSource::resolve(Path::new(&model_path), family).await?;
+    let estimate = checkpoint_weight_bytes(&source).and_then(|weight_bytes| {
+        estimate_qwen35_load(
+            label,
+            &EstimateInput {
+                asset_dir: source.asset_dir(),
+                moe,
+                weight_bytes,
+                draft_dir: options.draft_model_path.as_deref().map(Path::new),
+                kv_format,
+                max_memory_bytes,
+            },
+        )
+    });
+    source.release_lease();
+    estimate
+}
+
+/// Bytes of a checkpoint's weight files: a directory's top-level
+/// safetensors, or the GGUF and its companion.
+pub(crate) fn checkpoint_weight_bytes(source: &CheckpointSource) -> Result<u64> {
+    let stat = |path: &Path| {
+        std::fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .map_err(|error| {
+                Error::from_reason(format!("Failed to stat {}: {error}", path.display()))
+            })
+    };
+    match source {
+        CheckpointSource::Dir(dir) => {
+            let entries = std::fs::read_dir(dir).map_err(|error| {
+                Error::from_reason(format!("Failed to list {}: {error}", dir.display()))
+            })?;
+            let mut total = 0u64;
+            for entry in entries {
+                let path = entry
+                    .map_err(|error| {
+                        Error::from_reason(format!("Failed to list {}: {error}", dir.display()))
+                    })?
+                    .path();
+                let safetensors = path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("safetensors"));
+                if safetensors && path.is_file() {
+                    total = total.saturating_add(stat(&path)?);
+                }
+            }
+            Ok(total)
+        }
+        CheckpointSource::Gguf(checkpoint) => {
+            let companion = checkpoint
+                .companion
+                .as_ref()
+                .map_or(Ok(0), |(path, _, _)| stat(path))?;
+            Ok(stat(&checkpoint.main.0)?.saturating_add(companion))
+        }
+    }
+}
+
+pub(crate) struct EstimateInput<'a> {
+    /// The directory holding the checkpoint's `config.json`.
+    pub asset_dir: &'a Path,
+    pub moe: bool,
+    pub weight_bytes: u64,
+    pub draft_dir: Option<&'a Path>,
+    pub kv_format: Option<KvFormat>,
+    pub max_memory_bytes: Option<u64>,
+}
+
+/// The plan a load of `input` would make on the device now, with the
+/// target's and the draft's weight files counted as active bytes. The
+/// compute dtype is taken as BF16: the weights that decide it are not read.
+pub(crate) fn estimate_qwen35_load(
+    label: &str,
+    input: &EstimateInput<'_>,
+) -> Result<Option<Qwen35ContextEstimate>> {
+    let config_path = input.asset_dir.join("config.json");
+    let raw: serde_json::Value = std::fs::read_to_string(&config_path)
+        .map_err(|error| {
+            Error::from_reason(format!("Failed to read {}: {error}", config_path.display()))
+        })
+        .and_then(|data| {
+            serde_json::from_str(&data).map_err(|error| {
+                Error::from_reason(format!(
+                    "Failed to parse {}: {error}",
+                    config_path.display()
+                ))
+            })
+        })?;
+    let mut config = if input.moe {
+        crate::models::qwen3_5_moe::persistence::parse_config(&raw)?.to_dense_config()
+    } else {
+        crate::models::qwen3_5::persistence::parse_config(&raw)?
+    };
+    KvFormat::parse(config.kv_format.as_deref())
+        .map_err(|message| Error::from_reason(format!("config.json: {message}")))?;
+    let format = config.pin_kv_format(input.kv_format, DType::BFloat16);
+    let draft = input
+        .draft_dir
+        .map(|dir| {
+            let draft = super::dflash2::read_dflash2_config(dir)?;
+            Ok::<_, Error>(DraftTerms::of(
+                &draft,
+                super::dflash2::dflash2_file_bytes(dir)?,
+            ))
+        })
+        .transpose()?;
+    let pool = if config.use_block_paged_cache.unwrap_or(true)
+        && crate::engine::persistence::compiled_forward_backend_available()
+    {
+        let layers = config.full_attention_layer_count() as u32;
+        let block_size = config.paged_block_size();
+        let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
+            layers,
+            config.num_kv_heads as u32,
+            config.head_dim as u32,
+            block_size,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        )
+        .map_err(|error| Error::from_reason(format!("{label} block-paged adapter: {error}")))?;
+        Some(PoolGeometry {
+            bytes_per_block,
+            block_size,
+            layers,
+            explicit_mib: config.paged_cache_memory_mb,
+        })
+    } else {
+        None
+    };
+    let trained = config.max_position_embeddings.max(0) as u32;
+    if pool.is_none() && draft.is_none() {
+        return Ok(Some(Qwen35ContextEstimate {
+            window_tokens: trained,
+            speculative_window_tokens: None,
+            bound: "model".to_string(),
+        }));
+    }
+    let Some(mut live) = live_memory() else {
+        return Ok(None);
+    };
+    live.active_bytes = live
+        .active_bytes
+        .saturating_add(input.weight_bytes)
+        .saturating_add(draft.map_or(0, |draft| draft.weight_bytes));
+    let lanes = LoadLanes {
+        config: &config,
+        recurrent_state_bytes: config.recurrent_state_bytes(),
+        pool,
+        draft,
+        format,
+        dtype: DType::BFloat16,
+    };
+    let plan = evaluate_qwen35_plan(label, &lanes, live, input.max_memory_bytes)?;
+    let pool_window = plan.pool.as_ref().map(|pool| pool.lane.window);
+    let speculative_window = plan.speculative.as_ref().map(|lane| lane.window);
+    let served = speculative_window.or(pool_window);
+    Ok(Some(Qwen35ContextEstimate {
+        window_tokens: pool_window.map_or(trained, |window| window.maximum()),
+        speculative_window_tokens: speculative_window.map(|window| window.maximum()),
+        bound: served.map_or("model", |window| window.bound()).to_string(),
+    }))
+}
+
+#[cfg(test)]
+mod tests;

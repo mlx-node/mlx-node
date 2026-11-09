@@ -21,9 +21,7 @@ import { CHAT_FAMILY_IDS } from '../family-data.js';
 /** Families historically forced paged by `mlx launch claude`. */
 export const QWEN35_PAGED_MODEL_TYPES = ['qwen3_5', 'qwen3_5_moe'] as const;
 
-const QWEN35_CACHE_FLOOR_MODEL_TYPES = new Set<string>(QWEN35_PAGED_MODEL_TYPES);
-const DEFAULT_QWEN35_PAGED_CACHE_MB = 16_384;
-const DEFAULT_QWEN35_PAGED_CACHE_INITIAL_MB = 2_048;
+const QWEN35_MODEL_TYPES = new Set<string>(QWEN35_PAGED_MODEL_TYPES);
 const QWEN35_MTP_DRAFTER_DIR = 'mtp-drafter';
 const QWEN35_DENSE_NESTED_MTP_SIDECAR = 'mtp/weights.safetensors';
 
@@ -92,22 +90,16 @@ export class PagedConfigOverrideManager {
    * deliberately not repeated here: `MlxModelHost` calls this for every
    * allowlisted family, and a second copy of the list would drift.
    *
-   * `dflash2Draft` marks a load that attaches a DFlash2 draft. The qwen3_5
-   * clone then writes no initial size, even with `MLX_PAGED_CACHE_INITIAL_MB`
-   * set: the native loader starts that pool at its DFlash2 runway and ignores
-   * any initial size.
+   * The clone never sizes the pool: a Qwen3.5 load sizes it from its memory
+   * plan, and a source `paged_cache_memory_mb` passes through to that plan's
+   * check.
    */
-  async resolve(
-    modelPath: string,
-    canonicalModelType?: string,
-    persistPagedCache?: boolean,
-    dflash2Draft = false,
-  ): Promise<string> {
+  async resolve(modelPath: string, canonicalModelType?: string, persistPagedCache?: boolean): Promise<string> {
     if (this.disposed) {
       throw new Error('PagedConfigOverrideManager: resolve() called after cleanup()');
     }
 
-    const operation = this.resolveInternal(modelPath, canonicalModelType, persistPagedCache, dflash2Draft);
+    const operation = this.resolveInternal(modelPath, canonicalModelType, persistPagedCache);
     this.activeResolves.add(operation);
     try {
       return await operation;
@@ -120,7 +112,6 @@ export class PagedConfigOverrideManager {
     modelPath: string,
     canonicalModelType: string | undefined,
     persistPagedCache: boolean | undefined,
-    dflash2Draft: boolean,
   ): Promise<string> {
     const sourcePath = isAbsolute(modelPath) ? modelPath : resolve(modelPath);
     if (extname(sourcePath).toLowerCase() === '.gguf') {
@@ -142,7 +133,7 @@ export class PagedConfigOverrideManager {
       const prepared = await prepareMuseGlimmerGguf(sourcePath);
       let resolved: string;
       try {
-        resolved = await this.resolveInternal(prepared, modelType, persistPagedCache, dflash2Draft);
+        resolved = await this.resolveInternal(prepared, modelType, persistPagedCache);
       } catch (error) {
         releaseNativeGgufLease(prepared);
         throw error;
@@ -193,38 +184,26 @@ export class PagedConfigOverrideManager {
       return modelPath;
     }
 
-    const cacheFloorMb = QWEN35_CACHE_FLOOR_MODEL_TYPES.has(modelType) ? resolveQwen35CacheFloorMb() : undefined;
     const pagedEnabled = config.use_block_paged_cache === true;
-    const configuredMemoryMb = positiveNumber(config.paged_cache_memory_mb);
-    const memorySatisfied = cacheFloorMb === undefined || (configuredMemoryMb ?? 0) >= cacheFloorMb;
-    // The clone writes `paged_cache_initial_memory_mb = min(initialMb, maxMb)`.
-    // A source whose field already equals that value needs no clone; an absent
-    // or different field does, or the new start-small default would silently
-    // skip every already-paged Qwen3.5 checkpoint (they lack the field).
-    const initialMb = QWEN35_CACHE_FLOOR_MODEL_TYPES.has(modelType) ? resolveQwen35InitialMb(dflash2Draft) : undefined;
-    const configuredInitialMb = positiveNumber(config.paged_cache_initial_memory_mb);
-    const initialSatisfied =
-      initialMb === undefined ||
-      configuredInitialMb === Math.min(initialMb, Math.max(configuredMemoryMb ?? 0, cacheFloorMb ?? 0));
     // Even an already-paged Gemma config must be cloned when `draft/` exists:
     // returning the source would expose the draft to native auto-discovery and
     // trigger the flat-speculation/paged-cache conflict. An authoritative
     // persist directive that disagrees with the source likewise blocks the
     // pass-through so the resolved value reaches the loader.
-    if (pagedEnabled && memorySatisfied && initialSatisfied && !hasEmbeddedGemmaDraft && !persistOverrideNeeded) {
+    if (pagedEnabled && !hasEmbeddedGemmaDraft && !persistOverrideNeeded) {
       return modelPath;
     }
 
-    // Memoize per (source, resolved family, persist directive, draft): the same
-    // checkpoint resolved with a different persist tri-state or draft must yield
-    // a distinct clone, not the first one cached under the bare path. `cleanup()`
+    // Memoize per (source, resolved family, persist directive): the same
+    // checkpoint resolved with a different persist tri-state must yield a
+    // distinct clone, not the first one cached under the bare path. `cleanup()`
     // iterates every value, so multiple entries per path are all still disposed.
     const persistKey = persistPagedCache === undefined ? 'u' : persistPagedCache ? 't' : 'f';
-    const cacheKey = `${sourcePath}\0${modelType}\0${persistKey}\0${dflash2Draft ? 'd' : 'n'}`;
+    const cacheKey = `${sourcePath}\0${modelType}\0${persistKey}`;
     const existing = this.overrides.get(cacheKey);
     if (existing !== undefined) return existing;
 
-    const pending = this.createOverride(sourcePath, config, cacheFloorMb, initialMb, modelType, persistPagedCache);
+    const pending = this.createOverride(sourcePath, config, modelType, persistPagedCache);
     this.overrides.set(cacheKey, pending);
     try {
       return await pending;
@@ -280,8 +259,6 @@ export class PagedConfigOverrideManager {
   private async createOverride(
     sourcePath: string,
     sourceConfig: Record<string, unknown>,
-    cacheFloorMb: number | undefined,
-    initialMb: number | undefined,
     modelType: string,
     persistPagedCache: boolean | undefined,
   ): Promise<string> {
@@ -298,17 +275,6 @@ export class PagedConfigOverrideManager {
       // the source config so it can never contradict the authoritative value.
       config.persist_paged_cache = persistPagedCache;
       if ('persistPagedCache' in config) config.persistPagedCache = persistPagedCache;
-    }
-    if (cacheFloorMb !== undefined) {
-      config.paged_cache_memory_mb = Math.max(positiveNumber(sourceConfig.paged_cache_memory_mb) ?? 0, cacheFloorMb);
-    }
-    if (initialMb !== undefined) {
-      // Authoritative initial (grow-on-demand) budget, clamped to the max just
-      // written above so it can never exceed the pool ceiling. `initialMb` is
-      // always >= 1 and the max is floored by `cacheFloorMb` (>= 1) for the
-      // same families, so this never writes 0 — which the native loader rejects.
-      const maxMb = positiveNumber(config.paged_cache_memory_mb) ?? 0;
-      config.paged_cache_initial_memory_mb = Math.min(initialMb, maxMb);
     }
     await writeFile(join(overrideDir, 'config.json'), JSON.stringify(config, null, 2), 'utf-8');
 
@@ -333,7 +299,7 @@ export class PagedConfigOverrideManager {
       }
     }
 
-    if (QWEN35_CACHE_FLOOR_MODEL_TYPES.has(modelType)) {
+    if (QWEN35_MODEL_TYPES.has(modelType)) {
       await preserveQwen35MtpSidecars(sourcePath, overrideDir, sourceConfig, modelType);
     }
 
@@ -430,25 +396,4 @@ async function isDirectory(path: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-function positiveNumber(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
-}
-
-function resolveQwen35CacheFloorMb(): number {
-  const raw = process.env.MLX_PAGED_CACHE_MEMORY_MB;
-  if (raw == null || raw === '') return DEFAULT_QWEN35_PAGED_CACHE_MB;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_QWEN35_PAGED_CACHE_MB;
-}
-
-function resolveQwen35InitialMb(dflash2Draft: boolean): number | undefined {
-  // A DFlash2 load always starts at the native runway (Splash has no initial
-  // size knob), so the env is not read for it.
-  if (dflash2Draft) return undefined;
-  const raw = process.env.MLX_PAGED_CACHE_INITIAL_MB;
-  const parsed = raw == null || raw === '' ? Number.NaN : Number.parseInt(raw, 10);
-  if (Number.isFinite(parsed) && parsed > 0) return parsed;
-  return DEFAULT_QWEN35_PAGED_CACHE_INITIAL_MB;
 }

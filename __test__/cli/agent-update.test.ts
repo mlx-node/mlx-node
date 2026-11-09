@@ -1957,6 +1957,18 @@ describe('launchGrokAgent server gating', () => {
     expect(spawnServe.mock.calls[0]![0]).not.toContain('--kv-format');
   });
 
+  // Mutation: drop the `--max-memory` pair from the serve argv → red.
+  it('hands --max-memory to the spawned serve as bytes', async () => {
+    await launchGrokAgent({ argv: ['-c'], maxMemoryBytes: 30_064_771_072, spawnServe, spawnAgent });
+    const serveArgv: string[] = spawnServe.mock.calls[0]![0];
+    expect(serveArgv.slice(-2)).toEqual(['--max-memory', '30064771072']);
+    expect(parseServeArgs(serveArgv.slice(2)).maxMemoryBytes).toBe(30_064_771_072);
+
+    spawnServe.mockClear();
+    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent });
+    expect(spawnServe.mock.calls[0]![0]).not.toContain('--max-memory');
+  });
+
   it('turns off the xAI media tools a served launch cannot answer, keeping a user override', async () => {
     const mediaEnv = ['GROK_IMAGE_GEN', 'GROK_IMAGE_EDIT', 'GROK_VIDEO_GEN'] as const;
     const saved = mediaEnv.map((name) => process.env[name]);

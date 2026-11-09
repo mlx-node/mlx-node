@@ -40,9 +40,7 @@ extern "C" {
 //
 // Fallible-FFI contract: returns 0 on success and writes the value through
 // `out_value`. Returns -1 if sysctl fails or an exception is caught
-// (`out_value` is left untouched on failure). The Rust profile caller
-// surfaces `ProfileError::TotalMemoryUnavailable` on -1 (or on a successful
-// 0 from a non-macOS host).
+// (`out_value` is left untouched on failure).
 //
 // Wrapped in a catch-all so any unexpected failure (sysctl currently never
 // throws, but this is defense-in-depth: future MLX changes could add a
@@ -190,9 +188,8 @@ mlx_array* mlx_array_from_metal_buffer_view(
 
 // MLX's max recommended working-set size in bytes (the GPU-visible budget
 // MTLDevice reports as `recommendedMaxWorkingSetSize`). On Apple Silicon
-// this is normally ~75% of unified memory — vLLM-style auto-sizers use it
-// as the *upper* bound when `MLX_KV_MEMORY_UTILIZATION` would otherwise
-// over-commit the system.
+// this is normally ~75% of unified memory; the memory plan's hard budget
+// is derived from it.
 //
 // The value comes from `mlx::core::gpu::device_info()["max_recommended_
 // working_set_size"]` (populated in `device_info.cpp`).
@@ -209,9 +206,7 @@ mlx_array* mlx_array_from_metal_buffer_view(
 //   - Returns -1 ONLY if a C++ exception is caught (`out_value` is left
 //     untouched on this path). This is the genuine Metal-failure mode.
 //
-// The Rust auto-sizer caller maps `Ok(0)` to "no working-set bound
-// reported" (falls back to the physical-RAM budget alone) and `-1` to
-// `ProfileError::MetalUnavailable`.
+// Rust callers treat both 0 and -1 as "no working set": no memory plan.
 int32_t mlx_max_recommended_working_set_size(uint64_t* out_value) {
   if (!mlx::core::metal::is_available()) {
     if (out_value != nullptr) {
@@ -224,8 +219,7 @@ int32_t mlx_max_recommended_working_set_size(uint64_t* out_value) {
     auto it = info.find("max_recommended_working_set_size");
     if (it == info.end()) {
       // Schema/version drift: `device_info.cpp` no longer publishes this
-      // key. Surface as success-with-zero so the auto-sizer falls back
-      // to the physical-RAM budget rather than aborting profiling.
+      // key. Surface as success-with-zero.
       if (out_value != nullptr) {
         *out_value = 0;
       }

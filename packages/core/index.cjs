@@ -923,6 +923,7 @@ module.exports.createRandomQwen3Checkpoint = nativeBinding.createRandomQwen3Chec
 module.exports.documentToXlsx = nativeBinding.documentToXlsx;
 module.exports.DType = nativeBinding.DType;
 module.exports.ElementType = nativeBinding.ElementType;
+module.exports.estimateQwen35ContextWindow = nativeBinding.estimateQwen35ContextWindow;
 module.exports.formatDocument = nativeBinding.formatDocument;
 module.exports.getMemorySnapshot = nativeBinding.getMemorySnapshot;
 module.exports.getProfilingData = nativeBinding.getProfilingData;

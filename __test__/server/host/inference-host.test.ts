@@ -109,6 +109,7 @@ async function start(opts: InferenceHostOptions): Promise<InferenceHost> {
     // it opts back in explicitly.
     sweepOrphanTempRoots: false,
     loadModel: async () => fakeModel(),
+    estimateContextWindow: async () => null,
     ...opts,
   });
   hosts.push(host);
@@ -634,13 +635,14 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     expect(calls[0].path).not.toBe(join(modelsDir, name));
     const overlay = JSON.parse(await readFile(join(calls[0].path, 'config.json'), 'utf-8')) as Record<string, unknown>;
     expect(overlay.paged_cache_initial_memory_mb).toBeUndefined();
+    expect(overlay.paged_cache_memory_mb).toBeUndefined();
     expect(host.health().models.resident).toEqual([name]);
   });
 
   it.each([
     ['qwen3_5', 'qwen3.8-27b-mxfp4-mlx'],
     ['qwen3_5_moe', 'qwen3.6-35b-a3b-q4-k-mlx'],
-  ])('keeps the 2048 MiB initial for a %s directory load without a draft', async (family, name) => {
+  ])('writes no pool size for a %s directory load without a draft', async (family, name) => {
     const modelsDir = await makeModelsDir([name]);
     await writeFile(join(modelsDir, name, 'config.json'), JSON.stringify({ model_type: family }));
     const calls: Array<{ path: string; options?: LoadModelOptions }> = [];
@@ -655,7 +657,9 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].options).toBeUndefined();
     const overlay = JSON.parse(await readFile(join(calls[0].path, 'config.json'), 'utf-8')) as Record<string, unknown>;
-    expect(overlay.paged_cache_initial_memory_mb).toBe(2_048);
+    expect(overlay.use_block_paged_cache).toBe(true);
+    expect(overlay.paged_cache_memory_mb).toBeUndefined();
+    expect(overlay.paged_cache_initial_memory_mb).toBeUndefined();
   });
 
   // Mutation: drop the `kvFormat` pass-through → red (qwen3_5 load gets no kvFormat).
@@ -676,6 +680,69 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     await host.loadModel('qwen');
     await host.loadModel('gemma');
     expect(calls.map((call) => call.options)).toEqual([{ kvFormat: 'bf16' }, undefined]);
+  });
+
+  // Mutation: drop the `acceptsMaxMemory` check in the host → red (gemma4
+  // load gets maxMemoryBytes). Mutation: drop the pass-through → red.
+  it('maxMemoryBytes reaches the qwen loader only', async () => {
+    const modelsDir = await makeModelsDir(['qwen', 'gemma']);
+    await writeFile(join(modelsDir, 'gemma', 'config.json'), JSON.stringify({ model_type: 'gemma4' }));
+    const calls: Array<{ path: string; options?: LoadModelOptions }> = [];
+    const host = await start({
+      modelsDir,
+      maxMemoryBytes: 30_064_771_072,
+      loadModel: async (path, options) => {
+        calls.push({ path, options });
+        return fakeModel();
+      },
+    });
+    await host.loadModel('qwen');
+    await host.loadModel('gemma');
+    expect(calls.map((call) => call.options)).toEqual([{ maxMemoryBytes: 30_064_771_072 }, undefined]);
+  });
+
+  // Mutation: fall back to `entry.contextWindow` in `listModels` (ignore the
+  // estimate) → red (262144 before load). Mutation: estimate every family →
+  // red (gemma's estimate is asked for).
+  it('lists the load-free estimate before load and the served window after', async () => {
+    const modelsDir = await makeModelsDir(['qwen', 'gemma']);
+    await writeFile(join(modelsDir, 'gemma', 'config.json'), JSON.stringify({ model_type: 'gemma4' }));
+    const asked: Array<{ path: string; modelType: string; options?: unknown }> = [];
+    let settle: () => void = () => undefined;
+    const estimated = new Promise<void>((resolve) => (settle = resolve));
+    const host = await start({
+      modelsDir,
+      kvFormat: 'int8',
+      maxMemoryBytes: 25_769_803_776,
+      estimateContextWindow: async (path, modelType, options) => {
+        asked.push({ path, modelType, options });
+        settle();
+        return { windowTokens: 50_585, speculativeWindowTokens: 61_433, bound: 'memory' };
+      },
+      loadModel: async () =>
+        ({
+          contextLimits: () => ({ trainedWindowTokens: 262_144, effectiveWindowTokens: 40_000 }),
+        }) as unknown as LoadableModel,
+    });
+    await estimated;
+    expect(asked).toEqual([
+      {
+        path: join(modelsDir, 'qwen'),
+        modelType: 'qwen3_5',
+        options: { kvFormat: 'int8', maxMemoryBytes: 25_769_803_776 },
+      },
+    ]);
+    const windows = async (): Promise<Record<string, number>> => {
+      const body = (await (await fetch(`${host.url}/v1/models`)).json()) as {
+        data: Array<{ id: string; context_window: number }>;
+      };
+      return Object.fromEntries(body.data.map((entry) => [entry.id, entry.context_window]));
+    };
+    const before = await windows();
+    expect(before.qwen).toBe(61_433);
+    expect(before.gemma).not.toBe(61_433);
+    await host.loadModel('qwen');
+    expect((await windows()).qwen).toBe(40_000);
   });
 
   it('makes the model resident and records the load on /health', async () => {

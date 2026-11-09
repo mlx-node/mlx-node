@@ -1068,6 +1068,10 @@ pub struct PagedKVCacheAdapter {
     /// its probe declined the full grow: the live room.
     last_grow_room: u32,
 
+    /// The memory plan's ceiling a pool growth is probed against; `None`
+    /// probes the automatic hard budget.
+    memory_ceiling: Option<u64>,
+
     /// Test-only override for the pre-grow headroom probe: receives the
     /// grow-target block count and returns the probe's `selected_blocks`.
     #[cfg(test)]
@@ -1274,6 +1278,7 @@ impl PagedKVCacheAdapter {
             refusals: Mutex::new(BTreeMap::new()),
             draft_refusals: Mutex::new(BTreeMap::new()),
             last_grow_room: 0,
+            memory_ceiling: None,
             #[cfg(test)]
             grow_headroom_probe_override: None,
         })
@@ -1289,6 +1294,25 @@ impl PagedKVCacheAdapter {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .num_blocks();
+    }
+
+    /// Probe every later growth against the memory plan's ceiling.
+    pub(crate) fn set_memory_ceiling(&mut self, ceiling_bytes: u64) {
+        self.memory_ceiling = Some(ceiling_bytes);
+    }
+
+    /// The memory plan's ceiling, once the load set it.
+    pub(crate) fn memory_ceiling(&self) -> Option<u64> {
+        self.memory_ceiling
+    }
+
+    /// The budget a growth probe sizes against.
+    #[cfg(target_os = "macos")]
+    fn grow_probe_budget(&self) -> Result<u64, String> {
+        match self.memory_ceiling {
+            Some(ceiling) => Ok(ceiling),
+            None => crate::engine::memory_plan::automatic_hard_budget(),
+        }
     }
 
     /// Blocks of one extent growth, if this pool grows by extents.
@@ -3127,7 +3151,7 @@ impl PagedKVCacheAdapter {
     }
 
     /// Pre-grow headroom probe: ask the load-time sizer how many blocks of
-    /// the grow-target size the live Metal budget can back, reserving the
+    /// the grow-target size the memory budget can back, reserving the
     /// grow's transient ([`Self::grow_transient_bytes`]), and every sibling
     /// pool registered with the coordinator counts against the same budget.
     /// Read-only (no allocations); `Err` must fail the grow closed.
@@ -3147,13 +3171,14 @@ impl PagedKVCacheAdapter {
                 // the new one. Sibling reservations retain their staging.
                 .saturating_sub(own_bytes.saturating_add(mlx_paged_attn::RESTORE_STAGING_BYTES)),
         );
-        mlx_paged_attn::profile::load_time_pool_sizing_with_reserved(
+        mlx_paged_attn::profile::load_time_pool_sizing(
             new_num_blocks,
             self.layer_kv_pool.num_layers() as u32,
             config.num_kv_heads,
             config.head_size,
             config.block_size,
             self.layer_kv_pool.cache_dtype(),
+            self.grow_probe_budget()?,
             extra_reserved_bytes,
         )
         .map(|sizing| sizing.selected_blocks)
@@ -12061,6 +12086,45 @@ mod tests {
                 .is_err()
         );
         assert_eq!(adapter.take_refusal(), Some(5));
+    }
+
+    /// A growth probes the memory plan's ceiling once the load sets it, and
+    /// the automatic hard budget before.
+    /// Mutation: return the automatic budget whatever `memory_ceiling` holds
+    /// in `grow_probe_budget` → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn grow_probe_uses_the_plan_ceiling() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(error) => {
+                eprintln!("skipping grow_probe_uses_the_plan_ceiling: {error}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
+        assert_eq!(
+            adapter.grow_probe_budget(),
+            crate::engine::memory_plan::automatic_hard_budget()
+        );
+        adapter.set_memory_ceiling(12_345_678);
+        assert_eq!(adapter.grow_probe_budget(), Ok(12_345_678));
     }
 
     /// The room a declined grow records is the probe's, and every later

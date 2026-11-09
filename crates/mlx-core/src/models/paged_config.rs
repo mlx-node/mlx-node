@@ -24,15 +24,6 @@ pub struct PagedCacheConfig {
     #[serde(default)]
     pub paged_cache_memory_mb: Option<u32>,
 
-    /// Initial paged KV pool size in MiB for the grow-on-demand pool: the
-    /// pool starts at this size and grows toward the max budget
-    /// (`paged_cache_memory_mb` or the family auto default) on exhaustion.
-    /// `None` keeps the historical initial == max behavior. Only the qwen3_5
-    /// dense/MoE configs and loaders consume this key today; other families
-    /// leave it `None`.
-    #[serde(default)]
-    pub paged_cache_initial_memory_mb: Option<u32>,
-
     /// Paged block size in tokens. Universally read as `unwrap_or(16)`.
     #[serde(default)]
     pub paged_block_size: Option<u32>,
@@ -72,10 +63,6 @@ impl PagedCacheConfig {
                 .get("paged_cache_memory_mb")
                 .and_then(Value::as_u64)
                 .map(|v| v as u32),
-            paged_cache_initial_memory_mb: raw
-                .get("paged_cache_initial_memory_mb")
-                .and_then(Value::as_u64)
-                .map(|v| v as u32),
             paged_block_size: raw
                 .get("paged_block_size")
                 .and_then(Value::as_u64)
@@ -105,10 +92,6 @@ impl PagedCacheConfig {
         };
         Self {
             paged_cache_memory_mb: number("paged_cache_memory_mb", "pagedCacheMemoryMb"),
-            paged_cache_initial_memory_mb: number(
-                "paged_cache_initial_memory_mb",
-                "pagedCacheInitialMemoryMb",
-            ),
             paged_block_size: number("paged_block_size", "pagedBlockSize"),
             use_block_paged_cache: boolean("use_block_paged_cache", "useBlockPagedCache"),
             persist_paged_cache: boolean("persist_paged_cache", "persistPagedCache"),
@@ -149,7 +132,6 @@ mod tests {
             host.paged,
             PagedCacheConfig {
                 paged_cache_memory_mb: Some(256),
-                paged_cache_initial_memory_mb: Some(64),
                 paged_block_size: Some(32),
                 use_block_paged_cache: Some(true),
                 persist_paged_cache: Some(false),
@@ -182,7 +164,6 @@ mod tests {
         assert_eq!(paged.paged_block_size, Some(16));
         assert_eq!(paged.use_block_paged_cache, Some(false));
         assert_eq!(paged.persist_paged_cache, Some(true));
-        assert_eq!(paged.paged_cache_initial_memory_mb, Some(128));
 
         // Strict reads: wrong types and negatives land on `None`.
         let raw = json!({

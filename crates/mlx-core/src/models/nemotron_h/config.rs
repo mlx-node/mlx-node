@@ -448,9 +448,8 @@ pub fn parse_config(raw: &Value) -> Result<NemotronHConfig> {
     }
 
     // Shared snake_case reads (`as_u64` → `as u32`, `as_bool`) identical to
-    // the fields they replace; `persist_paged_cache` /
-    // `paged_cache_initial_memory_mb` stay unconsumed — this family has no
-    // such fields.
+    // the fields they replace; `persist_paged_cache` stays unconsumed — this
+    // family has no such field.
     let paged = PagedCacheConfig::from_raw_json(raw);
 
     Ok(NemotronHConfig {

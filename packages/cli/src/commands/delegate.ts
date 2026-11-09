@@ -26,7 +26,7 @@ export const DELEGATE_DEFAULT_ARGS = [
 ];
 
 /** Delegate/mlx-owned flags (not grok options) that still consume the next token as their value. */
-const DELEGATE_VALUE_FLAGS = new Set(['--models-dir', '--trace-dir', '--kv-format', '--repo', '--pr']);
+const DELEGATE_VALUE_FLAGS = new Set(['--models-dir', '--trace-dir', '--kv-format', '--max-memory', '--repo', '--pr']);
 
 /** `-p` takes the prompt as its VALUE — fold every bare positional into it. */
 function foldPositionalsIntoPrint(argv: string[]): string[] {

@@ -754,8 +754,8 @@ impl DFlash2Target for Qwen35MoeInner {
         self.speculative_window()
     }
 
-    fn dflash2_kv_extent_rows(&self) -> Option<u64> {
-        self.dflash2_window.map(|terms| terms.extent_rows)
+    fn memory_plan(&self) -> Option<&crate::engine::memory_plan::MemoryPlan> {
+        self.memory_plan.as_ref()
     }
 
     fn vision_cache(&self) -> &crate::vision::qwen::cache::VisionCache {
@@ -1239,13 +1239,11 @@ mod tests {
         Ok(())
     }
 
-    /// A MoE turn's KV plan takes the extent frozen at load
-    /// (`DFlash2WindowTerms::extent_rows`), not one the live headroom sizes.
-    /// Mutation: return `None` from the MoE `dflash2_kv_extent_rows` → red
-    /// (the headroom's extent).
+    /// A MoE turn's KV plan takes the memory plan's extent, not the layout's
+    /// smallest. Mutation: return `None` from the MoE `memory_plan` → red
+    /// (the layout's smallest extent).
     #[test]
-    fn moe_kv_plan_uses_the_frozen_extent() -> Result<()> {
-        use crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms;
+    fn moe_kv_plan_uses_the_planned_extent() -> Result<()> {
         use crate::models::qwen3_5::dflash2_turn::{
             KV_BUDGET_OVERRIDE, KV_EXTENT_ROWS_OVERRIDE, dflash2_kv_plan,
         };
@@ -1264,20 +1262,14 @@ mod tests {
         KV_EXTENT_ROWS_OVERRIDE.with(|rows| rows.set(None));
         KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(1 << 40)));
         let trained = inner.config.max_position_embeddings as u32;
-        inner.dflash2_window = Some(DFlash2WindowTerms {
-            trained,
-            draft_trained: trained,
-            pool: None,
-            reserve: None,
-            row_bytes: 0,
-            extent_rows: 40,
-        });
-        assert_eq!(dflash2_kv_plan(&inner, 300)?.extent_rows, 40);
+        inner.memory_plan =
+            Some(crate::engine::memory_plan::MemoryPlan::with_speculative_window(trained, 5));
+        assert_eq!(dflash2_kv_plan(&inner, 300)?.extent_rows, 160);
         Ok(())
     }
 
-    /// A draft-loaded MoE pool with no initial size starts at the runway and
-    /// grows by Splash extents. Mutation: drop the `set_extent_growth` call
+    /// A MoE pool starts at the runway and grows by Splash extents.
+    /// Mutation: drop the `set_extent_growth` call
     /// in MoE `initialize_paged_adapter` → red (`None`).
     #[test]
     fn moe_runway_pool_grows_by_splash_extents() -> Result<()> {
@@ -1311,7 +1303,6 @@ mod tests {
     /// extent, no cut: `context_length_exceeded`).
     #[test]
     fn moe_ar_growth_then_dflash2_booking_reclaims_the_pool() -> Result<()> {
-        use crate::models::qwen3_5::dflash2_decode::dflash2_kv_headroom_for;
         use crate::models::qwen3_5::dflash2_turn::{
             KvGrowthPhase, dflash2_kv_growth_need, ensure_dflash2_target_rows_with,
         };
@@ -1355,7 +1346,7 @@ mod tests {
         };
         let phase = KvGrowthPhase::TurnStart { prompt_len: 280 };
         let need = dflash2_kv_growth_need(&inner, 300, plan, phase)?.expect("the KV grows");
-        let base = dflash2_kv_headroom_for(need.kv_bytes) + need.transient_bytes + runway_bytes;
+        let base = need.kv_bytes + need.transient_bytes + runway_bytes;
         let growth = ensure_dflash2_target_rows_with(&mut inner, 300, plan, phase, |inner| {
             Some(base.saturating_sub(pool_bytes(inner)))
         })?;
@@ -2919,7 +2910,7 @@ mod tests {
         assert_eq!(flat_attention_frontier(&inner), Some(0), "no prefill chunk");
     }
 
-    /// Gate: a DFlash2 turn clamps on the window frozen at load. A prompt
+    /// Gate: a DFlash2 turn clamps on its memory plan's window. A prompt
     /// that fills it is rejected before the prefill; one row less runs.
     /// Mutation: pass `None` for `target.dflash2_window()` in
     /// `dflash2_chat_turn` → red.
@@ -2928,18 +2919,12 @@ mod tests {
         if !unsafe { mlx_sys::mlx_metal_is_available() } {
             return Ok(());
         }
-        let window = |pool| crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms {
-            trained: u32::MAX,
-            draft_trained: u32::MAX,
-            pool: Some(pool),
-            reserve: None,
-            row_bytes: 1,
-            extent_rows: 256,
-        };
+        let window =
+            |resident| crate::engine::memory_plan::MemoryPlan::with_speculative_window(resident, 8);
         let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
         let mut inner = tiny_dflash_inner(0xDFA5_350B);
         reset_flat_fixture(&mut inner);
-        inner.dflash2_window = Some(window(4));
+        inner.memory_plan = Some(window(4));
         assert_eq!(DFlash2Target::dflash2_window(&inner), Some(4));
         let err = match run_tiny_dflash_turn(&mut inner, &tokenizer, &[1, 2, 3, 4], false, 1) {
             Ok(_) => panic!("a prompt that fills the published window must be rejected"),
@@ -2953,7 +2938,7 @@ mod tests {
         );
         assert_eq!(flat_attention_frontier(&inner), Some(0), "no prefill chunk");
 
-        inner.dflash2_window = Some(window(5));
+        inner.memory_plan = Some(window(5));
         let result = run_tiny_dflash_turn(&mut inner, &tokenizer, &[1, 2, 3, 4], false, 8)?;
         assert_eq!(result.num_tokens, 1, "the window leaves one output row");
         Ok(())

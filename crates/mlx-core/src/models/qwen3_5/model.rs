@@ -17,10 +17,7 @@ use crate::engine::backend::{
     TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::{ChatCmd, FromTrainCmd, TrainCmd, handle_train_cmd};
-use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, pool_tokens_after_recurrent, scheduled_turn_context,
-    scheduler_per_seq_context_override,
-};
+use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
 use crate::engine::plan::{
     DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
     SpeculativePlan,
@@ -174,13 +171,11 @@ pub(crate) struct Qwen35Inner {
     /// The one clock the allocator, the DFlash2 store, the GDN ladder and
     /// history entries and the scheduler's idle owners stamp with.
     pub(crate) cache_recency: Arc<mlx_paged_attn::CacheRecency>,
-    /// DFlash2 window terms fixed at load once the paged pool is
-    /// registered; `None` without a draft.
-    pub(crate) dflash2_window: Option<crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms>,
-    /// Blocks the load-time sizer gave the paged pool. A runway pool's
-    /// maximum sits below it by the one layer a grow holds; the DFlash2 pool
-    /// term is priced from it. `None` before the pool is built.
-    pub(crate) paged_pool_budget_blocks: Option<u32>,
+    /// The load's memory plan; `None` when the working set is unreadable
+    /// or the load serves no planned lane.
+    pub(crate) memory_plan: Option<crate::engine::memory_plan::MemoryPlan>,
+    /// `--max-memory`: it only lowers the automatic hard budget.
+    pub(crate) max_memory_bytes: Option<u64>,
     /// Latched when the compiled DFlash2 verify graph fails at trace or
     /// replay — the failure mode is structural, so the stepper stays on the
     /// eager path for the rest of the model's lifetime.
@@ -417,6 +412,10 @@ pub struct Qwen35LoadOptions {
     /// The block-paged cache ignores it.
     #[napi(ts_type = "'int8' | 'bf16' | undefined")]
     pub kv_format: Option<String>,
+    /// Metal memory budget in bytes (`--max-memory`): it can only lower the
+    /// automatic budget the load's memory plan derives from the working set.
+    #[napi(ts_type = "number | undefined")]
+    pub max_memory_bytes: Option<i64>,
 }
 
 /// Generation result
@@ -657,12 +656,18 @@ impl Qwen3_5Model {
             .map(|value| crate::transformer::KvFormat::parse(Some(value)))
             .transpose()
             .map_err(|message| Error::from_reason(format!("Qwen3.5 load: {message}")))?;
+        let max_memory_bytes = crate::models::qwen3_5::load_plan::max_memory_option(
+            "Qwen3.5",
+            options.max_memory_bytes,
+        )?;
         let source = crate::engine::checkpoint_source::CheckpointSource::resolve(
             std::path::Path::new(&path),
             crate::utils::gguf::NativeGgufFamily::Qwen35,
         )
         .await?;
-        let loaded = persistence::load_with_source(&source, draft_model_path, kv_format).await;
+        let loaded =
+            persistence::load_with_source(&source, draft_model_path, kv_format, max_memory_bytes)
+                .await;
         if loaded.is_err() {
             source.release_lease();
         }

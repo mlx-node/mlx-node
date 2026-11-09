@@ -25,7 +25,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
  * and the symptom — a slower start and more memory — is invisible in a test suite
  * that only checks behaviour.
  */
-const ADDON_FREE_SUBPATHS = ['host/env-policy.ts', 'host/paths.ts'];
+const ADDON_FREE_SUBPATHS = ['host/env-policy.ts', 'host/max-memory.ts', 'host/paths.ts'];
 
 /** Modules that pull in the native addon, directly or by re-export. */
 const FORBIDDEN = ['@mlx-node/lm', '@mlx-node/core', '@mlx-node/vlm', '@mlx-node/trl'];
@@ -35,7 +35,7 @@ const FORBIDDEN = ['@mlx-node/lm', '@mlx-node/core', '@mlx-node/vlm', '@mlx-node
  *
  * Deliberately stricter than the runtime property. `import type` is erased by tsc
  * and loads nothing, so flagging it is over-strict on its face — but it is one
- * character away from becoming a value import, and these two leaf modules have no
+ * character away from becoming a value import, and these leaf modules have no
  * legitimate need for a type out of the addon packages. The dynamic probe below
  * is what pins the actual runtime behaviour; this is the early warning.
  */
