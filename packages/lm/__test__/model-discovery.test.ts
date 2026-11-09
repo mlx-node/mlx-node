@@ -29,6 +29,21 @@ function minimalGguf(architecture: string): Buffer {
 }
 
 describe('discoverLocalChatModels', () => {
+  it('admits only shard 00001 of a split set, and only for families that allow splits', async () => {
+    const dir = join(tmp, 'split-sets');
+    const qwen4 = join(dir, 'qwen4');
+    const clef = join(dir, 'clef');
+    mkdirSync(qwen4, { recursive: true });
+    mkdirSync(clef, { recursive: true });
+    const first = join(qwen4, 'Flash-UD-Q4_K_XL-00001-of-00002.gguf');
+    writeFileSync(first, minimalGguf('qwen4exp'));
+    writeFileSync(join(clef, 'Clef-Q8_0-00001-of-00002.gguf'), minimalGguf('clef'));
+    writeFileSync(join(clef, 'Clef-Q8_0-00002-of-00001.gguf'), minimalGguf('clef'));
+    expect(await discoverLocalChatModels(dir)).toEqual([
+      expect.objectContaining({ path: first, modelType: 'qwen4_exp' }),
+    ]);
+  });
+
   it('returns [] for a dir that does not exist — nothing is installed', async () => {
     await expect(discoverLocalChatModels(join(tmp, 'absent'))).resolves.toEqual([]);
   });
