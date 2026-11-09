@@ -617,18 +617,21 @@ struct DFlash2Mlp {
 
 impl DFlash2Mlp {
     fn forward(&self, hidden: &MxArray, max_rows: i64) -> Result<MxArray> {
+        self.down_proj.forward(&self.gated(hidden, max_rows)?)
+    }
+
+    fn gated(&self, hidden: &MxArray, max_rows: i64) -> Result<MxArray> {
         let rows = hidden.shape_at(1)?;
-        let gated = match self.gate_up.as_ref().filter(|_| rows <= max_rows) {
+        match self.gate_up.as_ref().filter(|_| rows <= max_rows) {
             Some((gate_up, split)) => {
                 let parts = gate_up.forward(hidden)?.split_sections(&[*split], -1)?;
-                Activations::swiglu_compiled(&parts[0], &parts[1])?
+                Activations::swiglu_compiled(&parts[0], &parts[1])
             }
             None => Activations::swiglu_compiled(
                 &self.gate_proj.forward(hidden)?,
                 &self.up_proj.forward(hidden)?,
-            )?,
-        };
-        self.down_proj.forward(&gated)
+            ),
+        }
     }
 }
 
@@ -4724,13 +4727,21 @@ mod tests {
     /// follows N). At 8 rows the `qmm_m8_nax_t64` split-K count follows N
     /// too (`qmm_m8_nax_splits`: k/v at N = 1024 split 8 ways, the merged
     /// q|k|v at 6144 4 ways), so the merged widths round the fp32 partial
-    /// sums differently in a few last bits: `assert_bits_match` bounds it.
+    /// sums differently in a few last bits: `assert_bits_match` bounds it at
+    /// the merged matmuls' outputs. The MLP is bounded at `gate|up` (the
+    /// swiglu input to `down_proj`), not at its output: `down_proj` spreads
+    /// each flipped intermediate over all 5120 outputs, so the share of
+    /// differing outputs follows the draw (0.01%..8% over 1000 seeds) while
+    /// the swiglu share stays at or under 0.1%.
+    /// Mutation: swap the `gate|up` halves in `DFlash2Mlp::gated` -> red
+    /// ("mlp gate|up: bits differ" at T=1).
     #[test]
     fn merged_draft_projections_match_separate_bits() {
         if !unsafe { mlx_sys::mlx_metal_is_available() } {
             eprintln!("skipping: Metal only");
             return;
         }
+        unsafe { mlx_sys::mlx_seed(0xDF1A_3E26) };
         let mut model = quantized_draft_model(3, 4096);
         let heights = [1i64, 2, 3, 4, 5, 6, 7, 8, 87];
         let inputs = heights
@@ -4771,6 +4782,7 @@ mod tests {
                     bits(&queries),
                     bits(&keys),
                     bits(&values),
+                    bits(&layer.mlp.gated(x, 0).unwrap()),
                     bits(&layer.mlp.forward(x, 0).unwrap()),
                 ));
             }
@@ -4800,7 +4812,7 @@ mod tests {
         // (`qmv_t64` / `qmv_wide_t64` reduce each row identically at any
         // width; the M = 8 NAX tier is the documented exception). Other
         // GPUs pair different kernels at the merged width and differ in
-        // ulps — and unseeded inputs make that marginal equality flaky,
+        // ulps — a draw can land either side of that marginal equality,
         // as the CI VM GPU showed at T = 1. The CPU reference is
         // bit-identical on every device.
         let nax_exact = !unsafe { mlx_sys::mlx_metal_is_available() }
@@ -4815,17 +4827,20 @@ mod tests {
                     .attention
                     .project_block(x, base, model.merged_rows())
                     .unwrap();
-                let (want_q, want_k, want_v, want_mlp) = &per_layer[index];
+                let (want_q, want_k, want_v, want_gated, want_mlp) = &per_layer[index];
                 let label = |what: &str| format!("T={seq} layer {index}: {what}");
                 assert_bits_match(&bits(&queries), want_q, exact, &label("queries"));
                 assert_bits_match(&bits(&keys), want_k, exact, &label("block keys"));
                 assert_bits_match(&bits(&values), want_v, exact, &label("block values"));
-                assert_bits_match(
-                    &bits(&layer.mlp.forward(x, model.merged_rows()).unwrap()),
-                    want_mlp,
-                    exact,
-                    &label("mlp"),
-                );
+                let gated = layer.mlp.gated(x, model.merged_rows()).unwrap();
+                assert_bits_match(&bits(&gated), want_gated, exact, &label("mlp gate|up"));
+                let mlp = bits(&layer.mlp.forward(x, model.merged_rows()).unwrap());
+                let want_mlp = if exact {
+                    want_mlp.clone()
+                } else {
+                    bits(&layer.mlp.down_proj.forward(&gated).unwrap())
+                };
+                assert!(mlp == want_mlp, "{}: bits differ", label("mlp"));
             }
             let got = model.project_context(x, base).unwrap();
             assert_eq!(got.len(), context.len());
