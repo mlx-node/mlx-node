@@ -1004,7 +1004,6 @@ async function runSessionNonStreaming(
   resetNativeCache: boolean,
   signal?: AbortSignal,
 ): Promise<MessagesNonStreamingOutcome> {
-  const constrainedConfig = await session.preflightContextCapacity(messages, config);
   // Dual-branch reset gated by the caller's native-cache policy:
   //
   //   * Full native reset (`resetNativeCache === true`) — run a full
@@ -1028,10 +1027,15 @@ async function runSessionNonStreaming(
   //     the reused prefix on this turn. `primeHistory` requires
   //     `turnCount === 0`, which the helper guarantees by wiping
   //     JS-side state only.
+  //
+  // The JS state resets before `preflightContextCapacity`, whose
+  // `mergeConfig` fills an omitted `tools` from the session (a leased warm
+  // session still holds the previous turn's); the native reset waits for
+  // the preflight so a context-overflow 400 leaves the native cache alone.
+  await resetPreservingNativeCacheForWarmReuse(session);
+  const constrainedConfig = await session.preflightContextCapacity(messages, config);
   if (resetNativeCache) {
     await session.reset();
-  } else {
-    await resetPreservingNativeCacheForWarmReuse(session);
   }
   session.primeHistory(messages);
   const initialTurns = session.turns;
@@ -1071,10 +1075,6 @@ async function runSessionStreaming(
   signal: AbortSignal | undefined,
   resetNativeCache: boolean,
 ): Promise<MessagesStreamingOutcome> {
-  // Validate the exact canonical history before resetting either JS or native
-  // state. This preserves a clean HTTP 400 path for context overflow while
-  // keeping SSE header latency independent from image processing/prefill.
-  const constrainedConfig = await session.preflightContextCapacity(messages, config);
   // Same dual-branch reset as `runSessionNonStreaming`: native-reset
   // requests wipe both JS and native state to block the cross-request
   // cache-affinity leak described at length in `responses.ts`; native-
@@ -1082,10 +1082,14 @@ async function runSessionStreaming(
   // paged content-addressed cache can recover a verified native prefix.
   // `initialTurns` MUST be captured AFTER the reset zeroes `turns` so
   // the committed check reads correctly.
+  //
+  // JS state resets before the preflight and native state after it, as in
+  // `runSessionNonStreaming`. The preflight runs before any SSE byte, so a
+  // context overflow is a clean HTTP 400 that leaves the native cache alone.
+  await resetPreservingNativeCacheForWarmReuse(session);
+  const constrainedConfig = await session.preflightContextCapacity(messages, config);
   if (resetNativeCache) {
     await session.reset();
-  } else {
-    await resetPreservingNativeCacheForWarmReuse(session);
   }
   session.primeHistory(messages);
   const initialTurns = session.turns;

@@ -94,9 +94,11 @@ export function mapStopReason(
 
 /**
  * The answer text a response shows: the parsed text, or the recovered markup
- * of tool calls the request did not allow, followed by the raw block of each
- * call that names no function, which Splash reads as text
- * (`StreamingToolCallProjector._begin_call`).
+ * of tool calls the request did not allow, with the raw block of each call
+ * that names no function read as text where the model wrote it (Splash
+ * `StreamingToolCallProjector._begin_call`). Splash cuts the raw output at a
+ * stop (`CallbackStreamer._emit`) before the projector reads it, so the block
+ * must keep its place for the stop search to cut what follows it.
  */
 export function visibleAnswerText(
   result: Pick<ChatResult, 'text' | 'rawText' | 'toolCalls'>,
@@ -109,11 +111,56 @@ export function visibleAnswerText(
     containsToolCallMarkup(result.rawText)
       ? recoverSuppressedToolCallText(result.rawText)
       : result.text;
+  if (!result.toolCalls.some((call) => call.status === 'missing_name')) return text;
+  const placed = withNamelessCallsInPlace(text, result.rawText, result.toolCalls);
+  if (placed !== null) return placed;
+  // The blocks cannot be placed in `rawText`: they go after the text.
   let nameless = '';
   for (const call of result.toolCalls) {
     if (call.status === 'missing_name') nameless += call.rawContent;
   }
   return text + nameless;
+}
+
+function isWhitespace(ch: string): boolean {
+  return ch.trim().length === 0;
+}
+
+/**
+ * `text` with each nameless call's block put back at its place in `rawText`,
+ * or null when `text` is not `rawText` without the calls' blocks, trimmed and
+ * cut after the reasoning (the native finalize), or a nameless block falls
+ * before the text starts.
+ */
+function withNamelessCallsInPlace(text: string, rawText: string, calls: ChatResult['toolCalls']): string | null {
+  let stripped = '';
+  let kept = '';
+  const namelessAt: number[] = [];
+  let cursor = 0;
+  for (const call of calls) {
+    if (call.rawContent.length === 0) return null;
+    const start = rawText.indexOf(call.rawContent, cursor);
+    if (start < 0) return null;
+    const before = rawText.slice(cursor, start);
+    stripped += before;
+    kept += before;
+    if (call.status === 'missing_name') {
+      namelessAt.push(stripped.length);
+      kept += call.rawContent;
+    }
+    cursor = start + call.rawContent.length;
+  }
+  stripped += rawText.slice(cursor);
+  kept += rawText.slice(cursor);
+
+  const visible = text.trim();
+  const head = stripped.trimEnd();
+  if (!head.endsWith(visible)) return null;
+  let start = head.length - visible.length;
+  while (start > 0 && isWhitespace(stripped[start - 1]!)) start--;
+  if (namelessAt.some((at) => at < start)) return null;
+  // No nameless block precedes `start`, so it is the same offset in `kept`.
+  return kept.slice(start).trim();
 }
 
 export function containsToolCallMarkup(rawText: string): boolean {

@@ -14,6 +14,7 @@ import {
   internalToolCallIdToAnthropic,
   mapStopReason,
   recoverSuppressedToolCallText,
+  visibleAnswerText,
 } from '../../packages/server/src/mappers/anthropic-response.js';
 
 function makeChatResult(overrides: Record<string, unknown> = {}) {
@@ -920,5 +921,22 @@ describe('buildProgressPing', () => {
     expect(JSON.stringify(buildProgressPing({ phase: 'queued' }, null, 10_000))).toBe(
       '{"type":"ping","mlx_progress":{"phase":"queued","elapsed_ms":10000}}',
     );
+  });
+});
+
+// Splash `StreamingToolCallProjector._begin_call` reads a nameless opening as
+// text where it stands. Mutations: append the nameless blocks after the text →
+// red (first case); drop the blocks it cannot place → red (second case).
+describe('visibleAnswerText nameless calls', () => {
+  const block = '<tool_call>\n<function=>\n</function>\n</tool_call>';
+  const nameless = { id: 'n', name: '', arguments: {}, status: 'missing_name', rawContent: block };
+
+  it('places the block after the reasoning and before the prose', () => {
+    const rawText = `plan\n</think>\n\n${block}\nAFTER`;
+    expect(visibleAnswerText({ text: 'AFTER', rawText, toolCalls: [nameless] }, true)).toBe(`${block}\nAFTER`);
+  });
+
+  it('appends a block it cannot find in the raw text', () => {
+    expect(visibleAnswerText({ text: 'AFTER', rawText: 'AFTER', toolCalls: [nameless] }, true)).toBe(`AFTER${block}`);
   });
 });
