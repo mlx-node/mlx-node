@@ -954,7 +954,7 @@ describe('isWeightFile — companion GGUFs (projector, calibration, draft, MTP) 
     // A Gemma-style manifest can carry mmproj without the UD target (partial
     // upstream upload, renamed file). Publishing on the projector alone would
     // certify a directory model-discovery never lists as a model.
-    // Exactly the names discovery excludes (its GGUF_COMPANION_NAME list) —
+    // Exactly the names discovery excludes (its GGUF_COMPANION_TOKENS list) —
     // kept in sync deliberately: a name discovery treats as a candidate is a
     // legitimate payload here too, or the two would disagree.
     expect(isWeightFile('mmproj-BF16.gguf')).toBe(false);

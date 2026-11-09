@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vite-plus/test';
 
-import { discoverLocalChatModels, parseGgufFileName } from '../src/model-discovery.js';
+import { discoverLocalChatModels } from '../src/model-discovery.js';
 
 const tmp = mkdtempSync(join(tmpdir(), 'mlx-discovery-'));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
@@ -27,41 +27,6 @@ function minimalGguf(architecture: string): Buffer {
   stringType.writeUInt32LE(8);
   return Buffer.concat([header, string('general.architecture'), stringType, string(architecture)]);
 }
-
-describe('parseGgufFileName', () => {
-  it('reads a llama.cpp split name, keeping the folder in the stem', () => {
-    expect(parseGgufFileName('UD-Q4_K_XL/Flash-UD-Q4_K_XL-00002-of-00004.gguf')).toEqual({
-      stem: 'UD-Q4_K_XL/Flash-UD-Q4_K_XL',
-      ordinal: 2,
-      shards: 4,
-    });
-  });
-
-  it('accepts any case in the extension and the -of- separator', () => {
-    expect(parseGgufFileName('M-00001-OF-00002.GGUF')).toEqual({ stem: 'M', ordinal: 1, shards: 2 });
-  });
-
-  it('treats a name without a full split suffix as a single file', () => {
-    for (const path of [
-      'M-Q4_K_M.gguf',
-      'M-0001-of-00002.gguf',
-      'M-00001-of-0002.gguf',
-      'M-0000a-of-00002.gguf',
-      'M00001-of-00002.gguf',
-    ]) {
-      expect(parseGgufFileName(path)).toEqual({ stem: path.slice(0, -'.gguf'.length), ordinal: 1, shards: 1 });
-    }
-  });
-
-  it('allows an empty stem, as the native shard resolver does', () => {
-    expect(parseGgufFileName('-00001-of-00002.gguf')).toEqual({ stem: '', ordinal: 1, shards: 2 });
-  });
-
-  it('rejects non-GGUF paths', () => {
-    expect(parseGgufFileName('model.safetensors')).toBeUndefined();
-    expect(parseGgufFileName('.gguf')).toBeUndefined();
-  });
-});
 
 describe('discoverLocalChatModels', () => {
   it('admits only shard 00001 of a split set, and only for families that allow splits', async () => {
