@@ -939,4 +939,28 @@ describe('visibleAnswerText nameless calls', () => {
   it('appends a block it cannot find in the raw text', () => {
     expect(visibleAnswerText({ text: 'AFTER', rawText: 'AFTER', toolCalls: [nameless] }, true)).toBe(`AFTER${block}`);
   });
+
+  // The native parser strips a `<tool_call>` block it cannot read without
+  // listing it. Mutation: keep the unlisted blocks in the rebuild → red (the
+  // nameless block goes after the prose).
+  it('a block the parser does not list does not move the nameless block', () => {
+    const stopBlock = '<tool_call>\n<function=>\n<parameter=x>\nSTOP\n</parameter>\n</function>\n</tool_call>';
+    const unknown = '<tool_call>???</tool_call>';
+    expect(
+      visibleAnswerText(
+        {
+          text: 'BEFORE  AFTER  TAIL',
+          rawText: `BEFORE ${stopBlock} AFTER ${unknown} TAIL`,
+          toolCalls: [{ ...nameless, rawContent: stopBlock }],
+        },
+        true,
+      ),
+    ).toBe(`BEFORE ${stopBlock} AFTER  TAIL`);
+    expect(
+      visibleAnswerText(
+        { text: 'BEFORE  MID STOP AFTER', rawText: `BEFORE ${block} MID STOP AFTER ${unknown}`, toolCalls: [nameless] },
+        true,
+      ),
+    ).toBe(`BEFORE ${block} MID STOP AFTER`);
+  });
 });

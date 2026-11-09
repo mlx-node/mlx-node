@@ -128,9 +128,9 @@ function isWhitespace(ch: string): boolean {
 
 /**
  * `text` with each nameless call's block put back at its place in `rawText`,
- * or null when `text` is not `rawText` without the calls' blocks, trimmed and
- * cut after the reasoning (the native finalize), or a nameless block falls
- * before the text starts.
+ * or null when `text` is not `rawText` without the `<tool_call>` blocks,
+ * trimmed and cut after the reasoning (the native finalize), or a nameless
+ * block falls before the text starts.
  */
 function withNamelessCallsInPlace(text: string, rawText: string, calls: ChatResult['toolCalls']): string | null {
   let stripped = '';
@@ -141,7 +141,7 @@ function withNamelessCallsInPlace(text: string, rawText: string, calls: ChatResu
     if (call.rawContent.length === 0) return null;
     const start = rawText.indexOf(call.rawContent, cursor);
     if (start < 0) return null;
-    const before = rawText.slice(cursor, start);
+    const before = withoutUnlistedToolCallBlocks(rawText.slice(cursor, start));
     stripped += before;
     kept += before;
     if (call.status === 'missing_name') {
@@ -150,8 +150,9 @@ function withNamelessCallsInPlace(text: string, rawText: string, calls: ChatResu
     }
     cursor = start + call.rawContent.length;
   }
-  stripped += rawText.slice(cursor);
-  kept += rawText.slice(cursor);
+  const tail = withoutUnlistedToolCallBlocks(rawText.slice(cursor));
+  stripped += tail;
+  kept += tail;
 
   const visible = text.trim();
   const head = stripped.trimEnd();
@@ -161,6 +162,28 @@ function withNamelessCallsInPlace(text: string, rawText: string, calls: ChatResu
   if (namelessAt.some((at) => at < start)) return null;
   // No nameless block precedes `start`, so it is the same offset in `kept`.
   return kept.slice(start).trim();
+}
+
+const TOOL_CALL_OPEN = '<tool_call>';
+const TOOL_CALL_CLOSE = '</tool_call>';
+
+/**
+ * `segment` without the closed `<tool_call>` blocks the native parser strips
+ * from the text but does not list as calls; the scan stops at an unclosed
+ * open tag like the native `extract_tag_blocks`.
+ */
+function withoutUnlistedToolCallBlocks(segment: string): string {
+  let out = '';
+  let from = 0;
+  for (;;) {
+    const open = segment.indexOf(TOOL_CALL_OPEN, from);
+    if (open < 0) break;
+    const close = segment.indexOf(TOOL_CALL_CLOSE, open + TOOL_CALL_OPEN.length);
+    if (close < 0) break;
+    out += segment.slice(from, open);
+    from = close + TOOL_CALL_CLOSE.length;
+  }
+  return out + segment.slice(from);
 }
 
 export function containsToolCallMarkup(rawText: string): boolean {

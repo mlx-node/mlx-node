@@ -7300,5 +7300,25 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
       expect(got.text).toBe(`BEFORE ${block.replace('xSTOPy', 'xy')} AF `);
       expect(got.stopReason).toBe('stop_sequence');
     });
+
+    // The native parser strips a `<tool_call>` block it cannot read without
+    // listing it. Mutation: keep the unlisted blocks in the rebuild → red (the
+    // nameless block goes after the prose and the text after the stop leaks).
+    const unknown = '<tool_call>???</tool_call>';
+
+    it.each([false, true])('an unlisted block after a stop in the nameless block (stream=%s)', async (stream) => {
+      const raw = `BEFORE ${block} AFTER ${unknown} TAIL`;
+      const got = await answer(raw, 'BEFORE  AFTER  TAIL', [nameless], stream, ['STOP']);
+      expect(got.text).toBe('BEFORE <tool_call>\n<function=>\n<parameter=q>\nx');
+      expect(got.stopReason).toBe('stop_sequence');
+    });
+
+    it.each([false, true])('an unlisted block after a stop in the prose (stream=%s)', async (stream) => {
+      const plain = block.replace('xSTOPy', 'xy');
+      const raw = `BEFORE ${plain} MID STOP AFTER ${unknown}`;
+      const got = await answer(raw, 'BEFORE  MID STOP AFTER', [{ ...nameless, rawContent: plain }], stream, ['STOP']);
+      expect(got.text).toBe(`BEFORE ${plain} MID `);
+      expect(got.stopReason).toBe('stop_sequence');
+    });
   });
 });
