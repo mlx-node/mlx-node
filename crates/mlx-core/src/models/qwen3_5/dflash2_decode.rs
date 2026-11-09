@@ -1185,6 +1185,10 @@ impl DFlash2Target for Qwen35Inner {
         self.dflash2_window.map(|terms| terms.extent_rows)
     }
 
+    fn vision_cache(&self) -> &crate::vision::qwen::cache::VisionCache {
+        &self.vision_cache
+    }
+
     fn dense_config(&self) -> std::borrow::Cow<'_, crate::models::qwen3_5::Qwen3_5Config> {
         std::borrow::Cow::Borrowed(&self.config)
     }

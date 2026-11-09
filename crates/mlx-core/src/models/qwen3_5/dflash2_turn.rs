@@ -217,6 +217,8 @@ pub(crate) trait DFlash2Target: ChatBackend {
     fn paged_adapter_mut_ref(
         &mut self,
     ) -> Option<&mut crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter>;
+    /// The image-feature cache (Splash's `embeddings` pool).
+    fn vision_cache(&self) -> &crate::vision::qwen::cache::VisionCache;
     /// Whether the flat caches hold the retained prefix (no paged or MTP
     /// turn has moved past them).
     fn flat_lane_authoritative(&self) -> bool;
@@ -689,6 +691,7 @@ pub(crate) enum GrowReclaim {
     Ladder,
     History,
     Table,
+    Vision,
 }
 
 #[cfg(test)]
@@ -893,6 +896,28 @@ impl<T: DFlash2Target> KvReclaim for ModelReclaim<'_, T> {
     fn take(&mut self, key: &UnitKey) -> bool {
         take_state_unit(self.target, key).is_some()
     }
+
+    fn rebuilt_bytes(&self) -> u64 {
+        rebuilt_bytes(&*self.target)
+    }
+
+    fn rebuild_one(&mut self) -> bool {
+        release_one_rebuilt(&*self.target)
+    }
+}
+
+/// Bytes of the image features nothing outside the cache holds.
+pub(crate) fn rebuilt_bytes<T: DFlash2Target>(target: &T) -> u64 {
+    crate::vision::qwen::cache::unheld_vision_bytes(target.vision_cache())
+}
+
+/// Drops the least recently used image feature entry nothing holds.
+pub(crate) fn release_one_rebuilt<T: DFlash2Target>(target: &T) -> bool {
+    let released = crate::vision::qwen::cache::release_one_unheld_vision(target.vision_cache());
+    if released {
+        log_reclaim(GrowReclaim::Vision);
+    }
+    released
 }
 
 /// What [`take_state_unit`] took.
@@ -1071,6 +1096,7 @@ pub(crate) fn ensure_paged_pool_keeping<T: DFlash2Target>(
                 over_takeable: false,
                 checked: true,
                 reach_in_use: false,
+                rebuilt: true,
             };
             let freed = free_for_kv(
                 &mut ModelReclaim {
@@ -1168,6 +1194,7 @@ pub(crate) struct KvGrowth {
     pub(crate) released_pool_bytes: u64,
     pub(crate) dropped_gdn_states: u32,
     pub(crate) released_tables: u32,
+    pub(crate) released_vision_entries: u32,
 }
 
 fn add_eviction(total: &mut EvictReport, step: EvictReport) {
@@ -1348,6 +1375,7 @@ fn try_ensure_dflash2_target_rows_with<T: DFlash2Target>(
                 + growth.evicted.dropped_ends,
             dropped_gdn_states = growth.dropped_gdn_states,
             released_tables = growth.released_tables,
+            released_vision_entries = growth.released_vision_entries,
             released_pool_bytes = growth.released_pool_bytes,
             "DFlash2 target KV growth"
         );
@@ -1364,14 +1392,15 @@ pub(crate) fn dflash2_kv_growth_shortfall(live: u64, need: &KvGrowthNeed) -> u64
 }
 
 /// Whether `live` headroom plus every byte a reclaim could free reaches the
-/// growth's KV: the pool cut with every table released, each parked state
-/// and each GDN entry.
+/// growth's KV: the pool cut with every table released, each parked state,
+/// each GDN entry and each image feature entry nothing holds.
 fn flat_kv_in_reach<T: DFlash2Target>(target: &T, live: u64, need: &KvGrowthNeed) -> bool {
     let cut = target
         .paged_adapter_ref()
         .map_or(0, PagedKVCacheAdapter::release_reach_bytes);
     live.saturating_add(cut)
         .saturating_add(state_reach_bytes(target, Keep::default(), false))
+        .saturating_add(rebuilt_bytes(target))
         >= dflash2_kv_headroom_for(need.kv_bytes)
 }
 
@@ -1381,6 +1410,7 @@ enum Reclaimed {
     State(EvictReport),
     Gdn,
     Table,
+    Vision,
 }
 
 /// One unit of the flat lane's take order for target KV memory the live
@@ -1390,8 +1420,9 @@ enum Reclaimed {
 /// on a tie: a store step, a ladder or history entry, or an idle table,
 /// offered only while releasing tables brings an extent cut within reach
 /// (Splash's `leadsToReach` on leaves). A unit that frees nothing goes into
-/// `skip`. A cut's one-layer copy comes out of the process reserve the live
-/// headroom keeps back. `None` when nothing is left.
+/// `skip`. With none left, one image feature entry nothing holds (Splash's
+/// Rebuild stage). A cut's one-layer copy comes out of the process reserve
+/// the live headroom keeps back. `None` when nothing is left.
 fn flat_reclaim_one<T: DFlash2Target>(
     target: &mut T,
     live: u64,
@@ -1435,7 +1466,7 @@ fn flat_reclaim_one<T: DFlash2Target>(
                 })
         });
         let Some(unit) = older_first(state, table) else {
-            return Ok(None);
+            return Ok(release_one_rebuilt(&*target).then_some(Reclaimed::Vision));
         };
         let taken = match &unit.key {
             UnitKey::Table(seq_id) => {
@@ -1513,6 +1544,7 @@ fn add_reclaimed(growth: &mut KvGrowth, step: Reclaimed) {
         Reclaimed::State(step) => add_eviction(&mut growth.evicted, step),
         Reclaimed::Gdn => growth.dropped_gdn_states += 1,
         Reclaimed::Table => growth.released_tables += 1,
+        Reclaimed::Vision => growth.released_vision_entries += 1,
     }
 }
 
@@ -3548,6 +3580,89 @@ mod tests {
         assert_eq!(growth.released_pool_bytes, partial_bytes);
         assert_eq!(pool_blocks(&inner), runway);
         assert_eq!(pool_bytes(&inner), runway_bytes);
+        Ok(())
+    }
+
+    /// One image feature entry nothing holds, `bytes` long.
+    fn insert_unheld_image(inner: &Qwen35Inner, bytes: u64) {
+        let features = MxArray::from_float32(&[1.0], &[1]).expect("features");
+        features.eval();
+        inner
+            .vision_cache
+            .lock()
+            .expect("vision cache")
+            .insert_for_test(1, features, usize::try_from(bytes).expect("bytes"));
+        assert_eq!(rebuilt_bytes(inner), bytes);
+    }
+
+    /// The flat lane's growth with a free pool tail that covers it and one
+    /// image entry nothing holds: the tail goes, the entry stays.
+    /// Mutation: offer the image entry first in `flat_reclaim_one` → red
+    /// (`Vision` in the log, the entry gone).
+    #[test]
+    fn flat_lane_frees_extents_and_states_before_images() -> Result<()> {
+        if !metal_is_default_device() {
+            return Ok(());
+        }
+        let (mut inner, runway, runway_bytes, _) = ar_grown_runway(2, false)?;
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("adapter")
+            .release_request()
+            .map_err(Error::from_reason)?;
+        insert_unheld_image(&inner, 1 << 20);
+        let start = parked_bytes(&inner);
+        let phase = KvGrowthPhase::Decode;
+        let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
+        let base = dflash2_kv_headroom_for(need.kv_bytes) + need.transient_bytes + runway_bytes;
+        clear_grow_reclaim_log();
+        let growth = ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {
+            Some(base.saturating_sub(pool_bytes(inner)) + (start - parked_bytes(inner)))
+        })?;
+        assert!(growth.grew);
+        assert_eq!(pool_blocks(&inner), runway, "the free tail is cut");
+        assert!(!grow_reclaim_log().contains(&GrowReclaim::Vision));
+        assert_eq!(growth.released_vision_entries, 0);
+        assert_eq!(rebuilt_bytes(&inner), 1 << 20, "the entry stays");
+        Ok(())
+    }
+
+    /// No pool, no parked state, no GDN entry: only an image entry nothing
+    /// holds, as long as the whole shortfall at zero headroom, can meet the
+    /// growth. It is counted and taken, and the KV grows.
+    /// Mutation: drop `rebuilt_bytes` from `flat_kv_in_reach` → red
+    /// (`context_length_exceeded`).
+    #[test]
+    fn flat_lane_takes_an_image_entry_when_nothing_else_is_left() -> Result<()> {
+        if !metal_is_default_device() {
+            return Ok(());
+        }
+        let tokenizer = tokenizer();
+        for name in FIXTURES {
+            let mut inner = fixture(name);
+            turn(&mut inner, &tokenizer, &body(4, 40));
+            inner.paged_adapter = None;
+            assert_eq!(
+                state_reach_bytes(&inner, Keep::default(), false),
+                0,
+                "{name}"
+            );
+            let phase = KvGrowthPhase::Decode;
+            let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
+            let bytes = dflash2_kv_headroom_for(need.kv_bytes) + need.transient_bytes;
+            assert!(dflash2_kv_growth_shortfall(0, &need) <= bytes, "{name}");
+            insert_unheld_image(&inner, bytes);
+            clear_grow_reclaim_log();
+            let growth =
+                ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {
+                    Some(bytes - rebuilt_bytes(inner))
+                })?;
+            assert!(growth.grew, "{name}");
+            assert_eq!(growth.released_vision_entries, 1, "{name}");
+            assert_eq!(grow_reclaim_log(), vec![GrowReclaim::Vision], "{name}");
+            assert_eq!(min_fa_capacity(&inner.caches)?, Some(512), "{name}");
+        }
         Ok(())
     }
 

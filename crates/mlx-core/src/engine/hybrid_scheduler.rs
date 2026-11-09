@@ -24,7 +24,8 @@ use crate::engine::backend::{
 use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
 use crate::engine::model_command::{FamilyCommand, ModelCommand, handle_model_command};
 use crate::engine::reclaim::{
-    Freed, KvNeed, KvReclaim, MetBefore, Reach, Unit, UnitKey, free_for_kv,
+    DraftReclaim, DraftRefusal, Freed, KvNeed, KvReclaim, MetBefore, Reach, Unit, UnitKey,
+    free_for_draft, free_for_kv,
 };
 use crate::engine::scheduler::{
     BlockTelemetry, PreemptedTurn, PreemptionMode, PreemptionReplay, RowStepResult, Scheduler,
@@ -196,6 +197,14 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     }
     /// Takes one state unit; false when it freed nothing.
     fn take_state_unit(&mut self, _key: &UnitKey) -> bool {
+        false
+    }
+    /// Bytes of the rebuilt caches nothing holds (image features).
+    fn rebuilt_bytes(&self) -> u64 {
+        0
+    }
+    /// Drops the least recently used rebuilt-cache unit nothing holds.
+    fn release_one_rebuilt(&mut self) -> bool {
         false
     }
     /// The take order for `need`, keeping `keep`'s own entries.
@@ -1937,13 +1946,74 @@ impl<B: HybridSchedulerBackend> KvReclaim for SchedReclaim<'_, B> {
     }
 
     fn oldest_kv(&self, at_cap: bool, skip: &HashSet<UnitKey>) -> Option<Unit> {
-        self.state.oldest_idle_owner(self.victim, at_cap, skip)
+        self.state.oldest_idle_owner(self.victim, !at_cap, skip)
     }
 
     fn take(&mut self, key: &UnitKey) -> bool {
         match key {
             UnitKey::Owner(seq_id) => self.state.release_owner(*seq_id),
             _ => self.state.inner.take_state_unit(key),
+        }
+    }
+
+    fn rebuilt_bytes(&self) -> u64 {
+        self.state.inner.rebuilt_bytes()
+    }
+
+    fn rebuild_one(&mut self) -> bool {
+        self.state.inner.release_one_rebuilt()
+    }
+}
+
+/// A running or preempted scheduled turn.
+type Turn<B> = TurnState<ScheduledTurn<<B as PagedBackend>::PrefixState>>;
+
+/// One step's need in the met list (Splash `Engine::allocate`'s `met`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StepNeed {
+    Blocks(u32),
+    DraftBytes(u64),
+}
+
+/// The draft need's units for a blocked step: the idle owners, by their
+/// own stamps. A row is bytes of the pool budget at any pool size.
+struct DraftUnits<'a, 'p, B: HybridSchedulerBackend> {
+    state: &'a mut HybridSchedulerState<B>,
+    victim: SeqId,
+    refused: &'p [(SeqId, DraftRefusal)],
+    parked: Option<&'p Turn<B>>,
+}
+
+impl<B: HybridSchedulerBackend> DraftReclaim for DraftUnits<'_, '_, B> {
+    fn short(&self) -> u64 {
+        self.state.draft_short_now(self.refused, self.parked)
+    }
+
+    fn reach(&self) -> u64 {
+        let owners = self.state.idle_owners(self.victim);
+        let adapter = self.state.inner.paged_adapter();
+        let bytes_per_block = adapter
+            .and_then(|adapter| adapter.bytes_per_block().ok())
+            .unwrap_or(0);
+        let blocks =
+            adapter.map_or(0, |adapter| adapter.releasable_blocks_of(&owners).len()) as u64;
+        let rows = owners
+            .iter()
+            .filter(|&&seq_id| self.state.inner.has_scheduled_recurrent(seq_id))
+            .count() as u64;
+        blocks
+            .saturating_mul(bytes_per_block)
+            .saturating_add(rows.saturating_mul(self.state.inner.recurrent_state_bytes()))
+    }
+
+    fn oldest(&self, skip: &HashSet<UnitKey>) -> Option<Unit> {
+        self.state.oldest_idle_owner(self.victim, true, skip)
+    }
+
+    fn take(&mut self, key: &UnitKey) -> bool {
+        match key {
+            UnitKey::Owner(seq_id) => self.state.release_owner(*seq_id),
+            _ => false,
         }
     }
 }
@@ -1965,7 +2035,7 @@ pub(crate) struct HybridSchedulerState<B: HybridSchedulerBackend> {
     /// cache clock.
     owner_last_used: HashMap<SeqId, u64>,
     /// Splash `Engine::allocate`'s met list for the blocked step's retries.
-    met_before: MetBefore<(SeqId, u32)>,
+    met_before: MetBefore<(SeqId, StepNeed)>,
     /// The prompt an admission grow keeps (Splash `VictimQuery::kept`).
     reclaim_keep: Vec<u32>,
     next_seq_id: SeqId,
@@ -2604,13 +2674,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     }
 
     /// The idle owner with the oldest turn-end stamp that frees something: a
-    /// block at the cap, a block or a parked row below it. A block counts
-    /// when releasing every idle owner would free it. An owner the
-    /// scheduler never finished goes by its table's turn-end stamp.
+    /// block, or a parked row when `rows_meet`. A block counts when
+    /// releasing every idle owner would free it. An owner the scheduler
+    /// never finished goes by its table's turn-end stamp.
     fn oldest_idle_owner(
         &self,
         victim: SeqId,
-        at_cap: bool,
+        rows_meet: bool,
         skip: &HashSet<UnitKey>,
     ) -> Option<Unit> {
         let adapter = self.inner.paged_adapter();
@@ -2623,7 +2693,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             .filter(|&seq_id| !skip.contains(&UnitKey::Owner(seq_id)))
             .filter(|&seq_id| {
                 adapter.is_some_and(|adapter| adapter.table_holds_any(seq_id, &freed))
-                    || (!at_cap && self.inner.has_scheduled_recurrent(seq_id))
+                    || (rows_meet && self.inner.has_scheduled_recurrent(seq_id))
             })
             .map(|seq_id| {
                 let stamp = self
@@ -2738,44 +2808,89 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     }
 
     /// Frees memory for a blocked step without preempting `victim`. A
-    /// family that reclaims in order sends the step's refused KV need
-    /// through the take order (Splash `MemoryLedger::free`): met in place, a
-    /// count that cannot cover it takes nothing, else states and idle owners
-    /// go oldest first until it is met; a need met or freed for once already
-    /// stops (Splash `Engine::allocate`). `reach_in_use`: the step's turn
-    /// runs alone, so its need goes on to the states suspended and running
-    /// turns use, last (Splash `Engine::growthClass`); a turn that yields
-    /// beside another keeps them. A blocked step that left no KV refusal,
-    /// and every other family, releases idle owners.
-    fn reclaim_for_blocked_step(&mut self, victim: SeqId, reach_in_use: bool) -> bool {
+    /// family that reclaims in order sends each need the step recorded
+    /// through its take order (Splash `MemoryLedger::free`): the refused KV
+    /// through states, idle owners and then the rebuilt caches; the refused
+    /// draft fits through the idle owners. Met in place, a count that
+    /// cannot cover the need takes nothing, else units go oldest first
+    /// until it is met; a need met or freed for once already stops, and a
+    /// step that recorded no need takes nothing (Splash `Engine::allocate`).
+    /// `reach_in_use`: the step's turn runs alone, so its KV need goes on to
+    /// the states suspended and running turns use, last (Splash
+    /// `Engine::growthClass`); a turn that yields beside another keeps them.
+    /// `parked` is the turn the step preempted: its state is in the draft
+    /// need. Every other family releases idle owners.
+    fn reclaim_for_blocked_step(
+        &mut self,
+        victim: SeqId,
+        reach_in_use: bool,
+        parked: Option<&Turn<B>>,
+    ) -> bool {
         if !self.inner.reclaims_in_order() {
             return self.reclaim_idle_owners(victim);
         }
-        let Some(blocks) = self
+        let (blocks, drafts) = self
             .inner
             .paged_adapter()
-            .and_then(PagedKVCacheAdapter::take_refusal)
-        else {
-            return self.reclaim_idle_owners(victim);
-        };
-        let need = (victim, blocks);
-        let retry = !self.met_before.seen(&need) && {
-            let freed = free_for_kv(
-                &mut SchedReclaim {
+            .map_or((None, Vec::new()), |adapter| {
+                (adapter.take_refusal(), adapter.take_draft_refusals())
+            });
+        let mut retry = false;
+        if let Some(blocks) = blocks {
+            let need = (victim, StepNeed::Blocks(blocks));
+            retry |= !self.met_before.seen(&need) && {
+                let freed = free_for_kv(
+                    &mut SchedReclaim {
+                        state: self,
+                        victim,
+                    },
+                    KvNeed {
+                        reach_in_use,
+                        ..KvNeed::in_place(blocks)
+                    },
+                );
+                self.met_before.retry(need, freed)
+            };
+        }
+        if let Some(bytes) = drafts.iter().map(|(_, refusal)| refusal.bytes).max() {
+            let need = (victim, StepNeed::DraftBytes(bytes));
+            retry |= !self.met_before.seen(&need) && {
+                let freed = free_for_draft(&mut DraftUnits {
                     state: self,
                     victim,
-                },
-                KvNeed {
-                    reach_in_use,
-                    ..KvNeed::in_place(blocks)
-                },
-            );
-            self.met_before.retry(need, freed)
-        };
+                    refused: &drafts,
+                    parked,
+                });
+                self.met_before.retry(need, freed)
+            };
+        }
         if !retry {
             self.met_before.clear();
         }
         retry
+    }
+
+    /// The most any refused draft fit lacks now, each at its recorded rows,
+    /// over the running turns and the preempted one. An error reads as met:
+    /// the retried step meets it again and fails the turn with it.
+    fn draft_short_now(&self, refused: &[(SeqId, DraftRefusal)], parked: Option<&Turn<B>>) -> u64 {
+        let running = self.scheduler.running();
+        refused
+            .iter()
+            .filter_map(|&(seq_id, refusal)| {
+                let own = running
+                    .iter()
+                    .find(|turn| turn.seq_id == seq_id)
+                    .or(parked.filter(|turn| turn.seq_id == seq_id))?;
+                let others: Vec<&Turn<B>> = running
+                    .iter()
+                    .chain(parked)
+                    .filter(|turn| turn.seq_id != seq_id)
+                    .collect();
+                speculative::draft_shortfall(&self.inner, own, &others, refusal.queries).ok()
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     /// Idle owners, one at a time, until one gives back pool blocks or a
@@ -2828,7 +2943,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return true;
         };
         if self.inner.scheduler_books_on_demand()
-            && self.reclaim_for_blocked_step(preempted.turn.seq_id, false)
+            && self.reclaim_for_blocked_step(preempted.turn.seq_id, false, Some(&preempted.turn))
         {
             self.scheduler.reinstate_running(preempted.turn);
         } else {
@@ -2853,7 +2968,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             }
             return;
         }
-        if self.reclaim_for_blocked_step(seq_id, true) {
+        if self.reclaim_for_blocked_step(seq_id, true, None) {
             return;
         }
         let error = self.capacity_exhausted(seq_id);
@@ -2875,8 +2990,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             _ => format!("it holds {held} paged blocks"),
         };
         let tried = if self.inner.reclaims_in_order() {
-            "even alone: the parked states and idle cache owners could not free what the step \
-             lacks (none is taken when their count falls short)"
+            "even alone: the parked states and the idle cache owners, plus the unheld image \
+             features below the pool's max, could not free the KV the step lacks, or the idle \
+             cache owners the draft state it lacks (none is taken when their count falls short)"
         } else {
             "even alone after every idle cache owner was released"
         };
@@ -3187,6 +3303,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                         over_takeable: true,
                         checked: false,
                         reach_in_use: false,
+                        rebuilt: true,
                     },
                     &self.reclaim_keep,
                 );
@@ -6020,7 +6137,7 @@ pub(crate) mod tests {
     /// 56 rows (435,968 B). The pool grow is declined unless
     /// `set_mtp_step_probe`.
     #[cfg(target_os = "macos")]
-    fn mtp_step_state_with(
+    pub(in crate::engine::hybrid_scheduler) fn mtp_step_state_with(
         initial: u32,
         max: u32,
     ) -> Option<(HybridSchedulerState<Qwen35Inner>, u64)> {
@@ -6081,7 +6198,7 @@ pub(crate) mod tests {
     /// `charge`; its prompt blocks go back to the pool so every case reads
     /// the whole pool as room.
     #[cfg(target_os = "macos")]
-    fn mtp_step_turn_with(
+    pub(in crate::engine::hybrid_scheduler) fn mtp_step_turn_with(
         state: &mut HybridSchedulerState<Qwen35Inner>,
         seq: u32,
         prompt: u32,
@@ -6133,7 +6250,7 @@ pub(crate) mod tests {
     /// 254 rows 463,104 B fits, at 504 rows 527,104 B does not, and two
     /// turns at 250 (925,952 B) do not, though their state past the
     /// charges is only 54,016 B.
-    /// Mutations: `draft_growth_fits` returns `Ok(true)` → red (504 rows);
+    /// Mutations: `draft_shortfall` returns `Ok(0)` → red (504 rows);
     /// price turns past their charge (`uncharged_draft_state_bytes`) → red
     /// (pair); drop the peers → red (pair).
     #[cfg(target_os = "macos")]
@@ -6191,7 +6308,7 @@ pub(crate) mod tests {
     /// blocks, since state lives beside the pool. At 504 rows it holds
     /// 527,104 B and blocks.
     /// Mutation: grow the pool by the shortfall over the free bytes in
-    /// `draft_growth_fits` → red (57 blocks ≠ 16).
+    /// `draft_shortfall` → red (57 blocks ≠ 16).
     #[cfg(target_os = "macos")]
     #[test]
     fn running_mtp_step_counts_the_ungrown_pool_without_growing_it() {
@@ -6315,7 +6432,7 @@ pub(crate) mod tests {
     /// An idle owner's parked row counts: beside it, the lone MTP turn at
     /// the last row of its window (438,784 B in 442,368 B free) needs
     /// 467,968 B and blocks; with the row released it fits.
-    /// Mutations: drop the idle rows from `draft_growth_fits` → red (blocks
+    /// Mutations: drop the idle rows from `draft_shortfall` → red (blocks
     /// beside the row); do not subtract the running turns' own rows → red
     /// (fits alone).
     #[cfg(target_os = "macos")]
@@ -6438,9 +6555,8 @@ pub(crate) mod tests {
     /// A lone MTP turn at the last row of its window blocks beside an idle
     /// owner that holds only its parked row (no blocks): the blocked step
     /// frees that row and the turn's next step fits.
-    /// Mutation: pick only idle owners with blocks in
-    /// `reclaim_for_blocked_step` (the old `materialized_blocks > 0`
-    /// filter) → red (the turn fails).
+    /// Mutation: pass `!at_cap` as `rows_meet` in the draft path (the
+    /// fixture is at its cap, 64/64) → red (the turn fails).
     #[cfg(target_os = "macos")]
     #[test]
     fn lone_mtp_turn_frees_an_idle_row_only_owner() {
@@ -6466,7 +6582,7 @@ pub(crate) mod tests {
         assert_eq!(state.inner.scheduled_recurrent_bytes(), 2 * recurrent);
         assert!(
             !HybridStepExecutor::new(&mut state.inner)
-                .draft_growth_fits(std::slice::from_ref(&turn), 0, 4)
+                .draft_fits_or_refuse(std::slice::from_ref(&turn), 0, 4)
                 .expect("step beside the idle row")
         );
         settle_blocked_step(&mut state, turn);
@@ -6485,6 +6601,308 @@ pub(crate) mod tests {
                 .draft_growth_fits(state.scheduler.running(), 0, 4)
                 .expect("step after the release")
         );
+    }
+
+    /// Puts `turns` in the running list and records the first one's draft
+    /// fit at 4 rows; whether it fit.
+    #[cfg(target_os = "macos")]
+    fn run_and_refuse(
+        state: &mut HybridSchedulerState<Qwen35Inner>,
+        turns: Vec<Turn<Qwen35Inner>>,
+    ) -> bool {
+        for turn in turns {
+            state.scheduler.reinstate_running(turn);
+        }
+        HybridStepExecutor::new(&mut state.inner)
+            .draft_fits_or_refuse(state.scheduler.running(), 0, 4)
+            .expect("draft fit")
+    }
+
+    /// What the draft fit of running seq 1 at 4 rows lacks now.
+    #[cfg(target_os = "macos")]
+    fn draft_short_of_seq_1(state: &HybridSchedulerState<Qwen35Inner>) -> u64 {
+        state.draft_short_now(
+            &[(
+                1,
+                DraftRefusal {
+                    bytes: 0,
+                    queries: 4,
+                },
+            )],
+            None,
+        )
+    }
+
+    /// 56 of 64 blocks (the grow declined), none free: a lone MTP turn at
+    /// 250 rows (463,104 B at 4 more) holding `turn_blocks`, idle owner 2
+    /// holding `owner_blocks` and newer than a ladder rung over a cache-only
+    /// chain of the rest. The fit reads 55 blocks (450,560 B): the chain and
+    /// the ungrown 8.
+    #[cfg(target_os = "macos")]
+    fn draft_short_state(
+        turn_blocks: u32,
+        owner_blocks: u32,
+        finished_blocks: u32,
+    ) -> Option<HybridSchedulerState<Qwen35Inner>> {
+        let (mut state, admission) = mtp_step_state_with(56, 64)?;
+        let turn = mtp_step_turn(&mut state, 1, 250, admission);
+        assert_eq!(step_state_bytes(&state.inner, &turn, 254, 8_192), 463_104);
+        hold(&mut state, 1, turn_blocks);
+        hold(&mut state, 2, owner_blocks);
+        if finished_blocks > 0 {
+            hold(&mut state, 3, finished_blocks);
+        }
+        state.owner_sequences.insert("idle".into(), 2);
+        state.owner_last_used.insert(2, u64::MAX);
+        rung(
+            &mut state,
+            7,
+            56 - turn_blocks - owner_blocks - finished_blocks,
+            0,
+        );
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        assert_eq!(snapshot.blocks.free_blocks, 0);
+        assert_eq!(snapshot.blocks.total_blocks, 56);
+        assert!(!run_and_refuse(&mut state, vec![turn]));
+        Some(state)
+    }
+
+    /// A draft denial 12,544 B short (≤ 2 blocks) below the cap: the newer
+    /// idle owner's 2 blocks go; the older rung stays (the fit already
+    /// counts its chain) and the pool does not grow.
+    /// Mutation: send the draft need through `free_for_kv` as ⌈short/bpb⌉
+    /// blocks → red (the older rung goes first).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn draft_denial_frees_only_idle_owners_and_never_grows() {
+        let Some(mut state) = draft_short_state(7, 2, 0) else {
+            return;
+        };
+        let short = draft_short_of_seq_1(&state);
+        assert_eq!(short, 12_544);
+        assert!(short <= 2 * 8_192);
+        assert!(state.reclaim_for_blocked_step(1, false, None));
+        assert!(!table_of(&state, 2), "the idle owner's table is released");
+        assert_eq!(rungs(&state), 1, "the rung stays");
+        assert_eq!(pool_total_blocks(&state), 56);
+        assert_eq!(draft_short_of_seq_1(&state), 0);
+    }
+
+    /// The idle owner's one block (8,192 B) cannot cover a 12,544 B short:
+    /// nothing is taken.
+    /// Mutation: drop the reach check in `free_for_draft` → red (the owner
+    /// is released).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn doomed_draft_denial_keeps_idle_owners() {
+        let Some(mut state) = draft_short_state(8, 1, 0) else {
+            return;
+        };
+        assert_eq!(draft_short_of_seq_1(&state), 12_544);
+        assert!(!state.reclaim_for_blocked_step(1, false, None));
+        assert!(table_of(&state, 2), "the idle owner stays");
+        assert_eq!(rungs(&state), 1);
+    }
+
+    /// A turn that finished after the refusal gave back the bytes the fit
+    /// lacked: the need is met in place and the idle owner stays.
+    /// Mutation: drop the `short == 0 → Met` arm in `free_for_draft` → red
+    /// (the owner is released).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn draft_need_met_by_a_finished_turn_takes_nothing() {
+        let Some(mut state) = draft_short_state(5, 2, 2) else {
+            return;
+        };
+        assert_eq!(draft_short_of_seq_1(&state), 12_544);
+        state
+            .inner
+            .release_scheduled_cache(3)
+            .expect("the finished turn's table");
+        assert_eq!(draft_short_of_seq_1(&state), 0);
+        assert!(state.reclaim_for_blocked_step(1, false, None));
+        assert!(table_of(&state, 2), "the idle owner stays");
+    }
+
+    /// A draft refusal left before the step began reaches no reclaim.
+    /// Mutation: leave the draft map in `clear_refusals` → red (the owner
+    /// is released).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_draft_refusal_lasts_only_its_step() {
+        let Some(mut state) = draft_short_state(7, 2, 0) else {
+            return;
+        };
+        state.begin_scheduled_step();
+        assert!(!state.reclaim_for_blocked_step(1, false, None));
+        assert!(table_of(&state, 2), "the idle owner stays");
+    }
+
+    /// Two MTP turns on a 128-block pool; the later one is preempted and
+    /// the earlier one's draft fit, read with it, lacks at most one block,
+    /// which the idle owner holds: the owner goes and the victim is
+    /// reinstated.
+    /// Mutation: pass `None` for the preempted turn in `settle_step` → red
+    /// (the short reads 0, the owner stays).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_preempted_turn_counts_in_the_draft_need() {
+        let Some((mut state, admission)) = mtp_step_state_with(128, 128) else {
+            return;
+        };
+        let first = mtp_step_turn(&mut state, 1, 250, admission);
+        let later = mtp_step_turn(&mut state, 3, 250, admission);
+        let need = step_state_bytes(&state.inner, &first, 254, 8_192)
+            + step_state_bytes(
+                &state.inner,
+                &later,
+                250 + later.decode_draft_allowance,
+                8_192,
+            );
+        let blocks = u32::try_from(need.div_ceil(8_192)).expect("blocks");
+        assert!(blocks < 127, "{blocks}");
+        hold(&mut state, 1, 128 - blocks);
+        hold(&mut state, 2, 1);
+        state.owner_sequences.insert("idle".into(), 2);
+        assert!(!run_and_refuse(&mut state, vec![first, later]));
+        let preempted = state.scheduler.take_running(3).expect("the later turn");
+        let refused = [(
+            1,
+            DraftRefusal {
+                bytes: 0,
+                queries: 4,
+            },
+        )];
+        let with = state.draft_short_now(&refused, Some(&preempted));
+        assert!(with > 0 && with <= 8_192, "{with}");
+        assert_eq!(state.draft_short_now(&refused, None), 0);
+        assert!(!state.settle_step(
+            Vec::new(),
+            Some(PreemptedTurn {
+                turn: preempted,
+                blocked: false,
+            }),
+            None,
+        ));
+        assert_eq!(state.scheduler.running().len(), 2, "the victim is back");
+        assert!(!table_of(&state, 2), "the idle owner's table is released");
+    }
+
+    /// The two MTP turns of `a_preempted_turn_counts_in_the_draft_need`, but
+    /// the refused row is the later turn, which the step preempts: its own
+    /// fit is read from the preempted turn, so the idle owner goes.
+    /// Mutation: drop `.or(parked.filter(..))` in `draft_short_now` → red
+    /// (the short reads 0, the owner stays).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_preempted_refused_row_counts_its_own_draft_need() {
+        let Some((mut state, admission)) = mtp_step_state_with(128, 128) else {
+            return;
+        };
+        let first = mtp_step_turn(&mut state, 1, 250, admission);
+        let later = mtp_step_turn(&mut state, 3, 250, admission);
+        let need = step_state_bytes(&state.inner, &later, 254, 8_192)
+            + step_state_bytes(
+                &state.inner,
+                &first,
+                250 + first.decode_draft_allowance,
+                8_192,
+            );
+        let blocks = u32::try_from(need.div_ceil(8_192)).expect("blocks");
+        assert!(blocks < 127, "{blocks}");
+        hold(&mut state, 1, 128 - blocks);
+        hold(&mut state, 2, 1);
+        state.owner_sequences.insert("idle".into(), 2);
+        state.scheduler.reinstate_running(first);
+        state.scheduler.reinstate_running(later);
+        assert!(
+            !HybridStepExecutor::new(&mut state.inner)
+                .draft_fits_or_refuse(state.scheduler.running(), 1, 4)
+                .expect("draft fit")
+        );
+        let preempted = state.scheduler.take_running(3).expect("the later turn");
+        let refused = [(
+            3,
+            DraftRefusal {
+                bytes: 0,
+                queries: 4,
+            },
+        )];
+        let short = state.draft_short_now(&refused, Some(&preempted));
+        assert!(short > 0 && short <= 8_192, "{short}");
+        assert!(!state.settle_step(
+            Vec::new(),
+            Some(PreemptedTurn {
+                turn: preempted,
+                blocked: false,
+            }),
+            None,
+        ));
+        assert_eq!(state.scheduler.running().len(), 2, "the victim is back");
+        assert!(!table_of(&state, 2), "the idle owner's table is released");
+    }
+
+    /// Two draft refusals in one step after the smaller one was met: the
+    /// step's need is the larger one, which is new, so the idle owner goes.
+    /// Mutation: `.min()` over the draft refusals in
+    /// `reclaim_for_blocked_step` → red (the met need stops the loop, the
+    /// owner stays).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_largest_draft_refusal_is_the_steps_need() {
+        let Some(mut state) = draft_short_state(7, 2, 0) else {
+            return;
+        };
+        assert_eq!(draft_short_of_seq_1(&state), 12_544);
+        assert!(
+            state
+                .met_before
+                .retry((1, StepNeed::DraftBytes(100)), Freed::Took)
+        );
+        state
+            .inner
+            .paged_adapter()
+            .expect("paged adapter")
+            .refuse_draft(
+                9,
+                DraftRefusal {
+                    bytes: 100,
+                    queries: 4,
+                },
+            );
+        assert!(state.reclaim_for_blocked_step(1, false, None));
+        assert!(!table_of(&state, 2), "the idle owner's table is released");
+    }
+
+    /// One step left a KV refusal the free blocks cover and a draft
+    /// refusal an idle row covers: both are served, the row is released.
+    /// Mutation: serve the draft refusal only without a KV refusal (`else
+    /// if`) in `reclaim_for_blocked_step` → red (the row stays).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kv_and_draft_needs_of_one_step_are_both_served() {
+        let Some((mut state, _)) = mtp_step_state_with(64, 64) else {
+            return;
+        };
+        let recurrent = state.inner.recurrent_state_bytes();
+        drop(mtp_step_turn_with(&mut state, 2, 40, false, 40, recurrent));
+        state.owner_sequences.insert("idle".into(), 2);
+        let charge = recurrent + state.inner.scheduled_draft_state_bytes(144);
+        let mut turn = mtp_step_turn_with(&mut state, 1, 128, true, 155, charge)
+            .with_block_reservation(9, 9, 16);
+        turn.num_computed_tokens = 154;
+        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
+        adapter.reserve_rows_for(1, 159).expect("window KV");
+        assert!(adapter.takeable_blocks() >= 1);
+        adapter.refuse_for_test(1, 1);
+        assert!(!run_and_refuse(&mut state, vec![turn]));
+        assert_eq!(state.inner.scheduled_recurrent_bytes(), 2 * recurrent);
+        assert!(state.reclaim_for_blocked_step(1, false, None));
+        assert_eq!(state.inner.scheduled_recurrent_bytes(), recurrent);
     }
 
     /// 256 usable tokens in 16-token blocks of 8,192 B hold 131,072 B; with
@@ -6793,7 +7211,7 @@ pub(crate) mod tests {
                 .refuse_for_test(2, blocks);
         };
         refuse(&state, 3);
-        assert!(state.reclaim_for_blocked_step(2, false));
+        assert!(state.reclaim_for_blocked_step(2, false, None));
         assert!(
             state
                 .inner
@@ -6803,7 +7221,7 @@ pub(crate) mod tests {
             "the idle owner's table is released"
         );
         refuse(&state, 5);
-        assert!(!state.reclaim_for_blocked_step(2, false));
+        assert!(!state.reclaim_for_blocked_step(2, false, None));
     }
 
     /// Qwen3.5 scheduler over the growable pool fixture (4 live blocks, 16
@@ -6937,7 +7355,7 @@ pub(crate) mod tests {
         while adapter.try_grow_pool(16) {}
         adapter.refuse_for_test(2, 17);
         assert_eq!(pool_total_blocks(&state), 16);
-        assert!(!state.reclaim_for_blocked_step(2, false));
+        assert!(!state.reclaim_for_blocked_step(2, false, None));
         assert!(
             state.inner.dflash2_context.is_some(),
             "the live state stays"
@@ -6966,7 +7384,7 @@ pub(crate) mod tests {
         adapter.refuse_for_test(2, 5);
         clear_reclaim_log();
         let evictions = pool_grow_evictions();
-        assert!(state.reclaim_for_blocked_step(2, false));
+        assert!(state.reclaim_for_blocked_step(2, false, None));
         assert_eq!(pool_grow_evictions() - evictions, 1);
         assert!(pool_total_blocks(&state) > before);
         assert!(
@@ -7140,7 +7558,7 @@ pub(crate) mod tests {
             refused(&mut state, 9, 0, 3);
             clear_reclaim_log();
             assert!(
-                state.reclaim_for_blocked_step(9, false),
+                state.reclaim_for_blocked_step(9, false, None),
                 "owner older {owner_older}"
             );
             if owner_older {
@@ -7189,7 +7607,7 @@ pub(crate) mod tests {
             adapter.reserve_rows_for(3, 48).is_err(),
             "the blocked turn is refused 3 blocks"
         );
-        assert!(state.reclaim_for_blocked_step(3, false));
+        assert!(state.reclaim_for_blocked_step(3, false, None));
         assert!(!table_of(&state, 1));
         assert!(table_of(&state, 2));
     }
@@ -7237,7 +7655,7 @@ pub(crate) mod tests {
                 .takeable_blocks(),
             2
         );
-        assert!(state.reclaim_for_blocked_step(9, false));
+        assert!(state.reclaim_for_blocked_step(9, false, None));
         assert!(!table_of(&state, 1));
         assert!(!table_of(&state, 2));
         assert_eq!(
@@ -7284,7 +7702,7 @@ pub(crate) mod tests {
         assert!(!state.owner_last_used.contains_key(&1));
         refused(&mut state, 9, 0, 3);
         clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(9, false));
+        assert!(state.reclaim_for_blocked_step(9, false, None));
         assert!(table_of(&state, 1));
         assert_eq!(reclaim_log(), vec![GrowReclaim::Store]);
     }
@@ -7358,7 +7776,7 @@ pub(crate) mod tests {
         hold(&mut state, 9, 2);
         refused(&mut state, 9, 2, 1);
         clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(9, false));
+        assert!(state.reclaim_for_blocked_step(9, false, None));
         assert_eq!(reclaim_log(), vec![GrowReclaim::Ladder]);
         assert!(table_of(&state, 1));
     }
@@ -7380,7 +7798,7 @@ pub(crate) mod tests {
             .paged_adapter()
             .expect("paged adapter")
             .refuse_for_test(9, 5);
-        assert!(!state.reclaim_for_blocked_step(9, false));
+        assert!(!state.reclaim_for_blocked_step(9, false, None));
         assert_eq!(rungs(&state), 1);
         assert!(table_of(&state, 1));
     }
@@ -7405,10 +7823,10 @@ pub(crate) mod tests {
         assert_eq!(parked_dflash2_states(&state.inner), 1);
     }
 
-    /// A reservation refused outside the step leaves no refusal for the
-    /// step's reclaim.
-    /// Mutation: drop `clear_refusals` from `begin_scheduled_step` → red
-    /// (the rung is dropped).
+    /// A reservation or a draft fit refused outside the step leaves no
+    /// refusal for the step's reclaim.
+    /// Mutation: drop `clear_refusals` from `begin_scheduled_step`, or
+    /// leave the draft map in `clear_refusals` → red (the rung is dropped).
     #[test]
     fn a_failed_reserve_outside_the_step_leaves_no_refusal() {
         let Some(mut state) = qwen35_dflash2_state(2, 4, 4) else {
@@ -7417,8 +7835,19 @@ pub(crate) mod tests {
         rung(&mut state, 5, 2, 0);
         hold(&mut state, 9, 2);
         refused(&mut state, 9, 2, 1);
+        state
+            .inner
+            .paged_adapter()
+            .expect("paged adapter")
+            .refuse_draft(
+                9,
+                DraftRefusal {
+                    bytes: 1,
+                    queries: 4,
+                },
+            );
         state.begin_scheduled_step();
-        assert!(!state.reclaim_for_blocked_step(9, false));
+        assert!(!state.reclaim_for_blocked_step(9, false, None));
         assert_eq!(rungs(&state), 1);
     }
 
@@ -7441,7 +7870,7 @@ pub(crate) mod tests {
         hold(&mut state, 9, 2);
         refused(&mut state, 9, 2, 1);
         clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(9, false));
+        assert!(state.reclaim_for_blocked_step(9, false, None));
         assert_eq!(reclaim_log(), vec![GrowReclaim::Ladder]);
         assert_eq!(parked_dflash2_states(&state.inner), 2);
     }
@@ -7492,7 +7921,7 @@ pub(crate) mod tests {
             Some(2)
         );
         assert!(wave(&mut state).is_err());
-        assert!(!state.reclaim_for_blocked_step(1, false));
+        assert!(!state.reclaim_for_blocked_step(1, false, None));
         assert_eq!(rungs(&state), 1);
     }
 
@@ -7550,7 +7979,7 @@ pub(crate) mod tests {
         hold(&mut state, 9, 4);
         refused(&mut state, 9, 4, 1);
         clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(9, false));
+        assert!(state.reclaim_for_blocked_step(9, false, None));
         assert_eq!(reclaim_log(), vec![GrowReclaim::Store]);
         assert_eq!(parked_dflash2_states(&state.inner), 1);
     }
@@ -7605,7 +8034,7 @@ pub(crate) mod tests {
             .release_request_for(1)
             .expect("the finished turn's table");
         clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(2, false));
+        assert!(state.reclaim_for_blocked_step(2, false, None));
         assert!(reclaim_log().is_empty());
         assert_eq!(parked_dflash2_states(&state.inner), 1);
     }
@@ -7930,7 +8359,7 @@ pub(crate) mod tests {
         let q = *rung(&mut state, 31, 1, 100).last().expect("Q");
         state.inner.use_ladder_entry_for_test(7, r);
         refused(&mut state, 9, 3, 1);
-        assert!(state.reclaim_for_blocked_step(9, true));
+        assert!(state.reclaim_for_blocked_step(9, true, None));
         assert!(!has_rung(&state, q), "Q was taken");
         assert!(has_rung(&state, r), "R stays");
         assert!(matches!(
@@ -8048,7 +8477,7 @@ pub(crate) mod tests {
         let r = *rung(&mut state, 30, 2, 0).last().expect("R");
         state.inner.use_ladder_entry_for_test(7, r);
         refused(&mut state, 9, 3, 1);
-        assert!(state.reclaim_for_blocked_step(9, true));
+        assert!(state.reclaim_for_blocked_step(9, true, None));
         assert!(!has_rung(&state, r));
         assert!(state.inner.gdn_in_use_for_test(7).is_some());
         let rebuilt = *rung(&mut state, 30, 2, 0).last().expect("R again");
@@ -8335,7 +8764,7 @@ pub(crate) mod tests {
 
     /// A lone MTP turn at the cap fits its draft over a marked chain, as it
     /// did before marks: the draft fit is a byte estimate.
-    /// Mutation: drop the `marked` term in `draft_growth_fits` → red.
+    /// Mutation: drop the `marked` term in `draft_shortfall` → red.
     #[cfg(target_os = "macos")]
     #[test]
     fn lone_mtp_turn_at_the_cap_fits_its_draft_over_a_marked_chain() {
@@ -8409,8 +8838,96 @@ pub(crate) mod tests {
             .expect("hold two blocks");
         assert!(adapter.reserve_rows_for(9, 48).is_err());
         clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(9, false));
+        assert!(state.reclaim_for_blocked_step(9, false, None));
         assert_eq!(reclaim_log(), vec![GrowReclaim::Ladder]);
+    }
+
+    /// One image entry nothing holds, `bytes` long, in `cache`.
+    fn insert_unheld_image(cache: &crate::vision::qwen::cache::VisionCache, bytes: u64) {
+        let features = MxArray::from_float32(&[1.0], &[1]).expect("features");
+        features.eval();
+        let mut cache = cache.lock().expect("vision cache");
+        cache.insert_for_test(1, features, usize::try_from(bytes).expect("bytes"));
+        assert_eq!(cache.unheld_bytes() as u64, bytes);
+    }
+
+    /// Below the cap, nothing takeable, no state and no idle owner: the
+    /// blocked step's KV need takes the image entry nothing holds, and the
+    /// grow it counted on then passes.
+    /// Mutation: drop the dense `release_one_rebuilt` override → red
+    /// (`false`: the image stage takes nothing).
+    #[test]
+    fn scheduled_step_takes_an_image_entry_after_owners_and_states() {
+        let Some(mut state) = qwen35_pool_state(4, 16, decline_until_taken(1)) else {
+            return;
+        };
+        hold(&mut state, 2, 4);
+        let bytes = bytes_per_block(&state);
+        insert_unheld_image(&state.inner.vision_cache, bytes);
+        state
+            .inner
+            .paged_adapter()
+            .expect("paged adapter")
+            .refuse_for_test(2, 1);
+        clear_reclaim_log();
+        assert!(state.reclaim_for_blocked_step(2, false, None));
+        assert_eq!(reclaim_log(), vec![GrowReclaim::Vision]);
+        assert_eq!(
+            crate::vision::qwen::cache::unheld_vision_bytes(&state.inner.vision_cache),
+            0
+        );
+    }
+
+    /// Below the cap, the pool held whole and no state: the admission grow
+    /// takes the image entry nothing holds and grows.
+    /// Mutation: `rebuilt: false` in `try_grow_pool_by` → red (`None`, the
+    /// log is empty).
+    #[test]
+    fn admission_grow_takes_an_image_entry_below_the_cap() {
+        let Some(mut state) = qwen35_pool_state(4, 16, decline_until_taken(1)) else {
+            return;
+        };
+        hold(&mut state, 2, 4);
+        let bytes = bytes_per_block(&state);
+        insert_unheld_image(&state.inner.vision_cache, bytes);
+        clear_reclaim_log();
+        let grown = state
+            .try_grow_pool_by(1, &mut MetBefore::default())
+            .expect("grow");
+        assert!(grown.is_some());
+        assert_eq!(reclaim_log(), vec![GrowReclaim::Vision]);
+        assert_eq!(
+            crate::vision::qwen::cache::unheld_vision_bytes(&state.inner.vision_cache),
+            0
+        );
+    }
+
+    /// The MoE family takes an image entry the same way.
+    /// Mutation: drop the MoE `release_one_rebuilt` override → red
+    /// (`false`).
+    #[test]
+    fn moe_scheduled_step_takes_an_image_entry() {
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return;
+        }
+        let Ok(mut inner) = Qwen35MoeInner::new(tiny_moe_config()) else {
+            return;
+        };
+        let recency = Arc::clone(&inner.cache_recency);
+        let mut adapter = tiny_paged_adapter_with(recency, 4, 16);
+        adapter.set_grow_headroom_probe_override(Some(decline_until_taken(1)));
+        let bytes = adapter.bytes_per_block().expect("bytes per block");
+        adapter.begin_request(2).expect("begin");
+        adapter
+            .allocate_suffix_blocks_for(2, 4 * 16)
+            .expect("hold every block");
+        adapter.refuse_for_test(2, 1);
+        inner.paged_adapter = Some(adapter);
+        insert_unheld_image(&inner.vision_cache, bytes);
+        let mut state = HybridSchedulerState::new(inner).expect("construct MoE scheduler");
+        clear_reclaim_log();
+        assert!(state.reclaim_for_blocked_step(2, false, None));
+        assert_eq!(reclaim_log(), vec![GrowReclaim::Vision]);
     }
 
     /// Contention preempts an MTP victim at a long history; alone, it

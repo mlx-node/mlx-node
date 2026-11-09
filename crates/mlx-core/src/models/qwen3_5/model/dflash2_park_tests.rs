@@ -1825,3 +1825,91 @@ fn a_released_serial_turn_ends_the_replay_points_use() -> Result<()> {
     }
     Ok(())
 }
+
+/// Below the cap with nothing takeable: the parked state goes first, then
+/// the image entry nothing holds; the older entry a turn still holds stays.
+/// Mutations: try the image stage before the states in `free_for_kv` → red
+/// (`[Vision, Store]`); drop the `strong_count` test in
+/// `VisionCacheInner::unheld` → red (the held entry goes).
+#[test]
+fn image_entry_goes_after_every_state() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let mut inner = with_parked_state(0xDFA5_1816)?;
+    let _headroom = no_kv_headroom();
+    install_pool(&mut inner, 4, 8, probe_after(2))?;
+    let bytes_per_block = inner
+        .paged_adapter
+        .as_ref()
+        .expect("adapter")
+        .bytes_per_block()
+        .map_err(Error::from_reason)?;
+    assert!(
+        parked_bytes(&inner) >= bytes_per_block,
+        "the count must pass"
+    );
+    let block_size = pool_block_size(&inner);
+    hold_blocks(&mut inner, 1, 4);
+    let held = MxArray::from_float32(&[1.0], &[1])?;
+    held.eval();
+    let unheld = MxArray::from_float32(&[2.0], &[1])?;
+    unheld.eval();
+    {
+        let mut cache = inner.vision_cache.lock().expect("vision cache");
+        cache.insert_for_test(1, held.clone(), bytes_per_block as usize);
+        cache.insert_for_test(2, unheld, bytes_per_block as usize);
+        assert_eq!(cache.unheld_bytes(), bytes_per_block as usize);
+    }
+    clear_grow_reclaim_log();
+    let mut runs = 0;
+    paged_step_reclaiming(&mut inner, reserve_step(&mut runs, 1, 5 * block_size))?;
+    assert_eq!(runs, 2);
+    assert_eq!(
+        grow_reclaim_log(),
+        vec![GrowReclaim::Store, GrowReclaim::Vision]
+    );
+    let cache = inner.vision_cache.lock().expect("vision cache");
+    assert_eq!(cache.len(), 1, "the held entry stays");
+    assert_eq!(cache.unheld_bytes(), 0);
+    drop(held);
+    Ok(())
+}
+
+/// Below the cap, the pool full under the live request and no state: the
+/// prompt grow takes the image entry nothing holds, and the grow it counted
+/// on then passes.
+/// Mutation: `rebuilt: false` in `ensure_paged_pool_keeping` → red (the log
+/// is empty, the entry stays).
+#[test]
+fn prompt_grow_takes_an_image_entry_below_the_cap() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let mut inner = fixture(0xDFA5_1819);
+    let _headroom = no_kv_headroom();
+    install_pool(&mut inner, 4, 8, probe_after(1))?;
+    let bytes_per_block = inner
+        .paged_adapter
+        .as_ref()
+        .expect("adapter")
+        .bytes_per_block()
+        .map_err(Error::from_reason)?;
+    let block_size = pool_block_size(&inner);
+    hold_blocks(&mut inner, 1, 4);
+    let unheld = MxArray::from_float32(&[1.0], &[1])?;
+    unheld.eval();
+    inner
+        .vision_cache
+        .lock()
+        .expect("vision cache")
+        .insert_for_test(1, unheld, bytes_per_block as usize);
+    let prompt = chain_tokens(40, 5, block_size);
+    let keys = per_block_keys(&prompt, block_size);
+    clear_grow_reclaim_log();
+    ensure_paged_pool_for_prompt(&mut inner, &prompt, &keys, 0);
+    assert_eq!(grow_reclaim_log(), vec![GrowReclaim::Vision]);
+    let cache = inner.vision_cache.lock().expect("vision cache");
+    assert_eq!(cache.len(), 0, "the entry is taken");
+    Ok(())
+}

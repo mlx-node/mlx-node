@@ -705,7 +705,10 @@ impl Qwen35Inner {
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
-        let merge = vlm_prepare_vision_features(
+        // Held until the prefill that reads `merge` has run: a reclaim takes
+        // only features nothing holds (Splash `Runtime::prefillAsync` gives
+        // an image's rows to the cache once they are in).
+        let (merge, held_images) = vlm_prepare_vision_features(
             &input_ids,
             &per_image_hashes,
             &processed,
@@ -816,6 +819,7 @@ impl Qwen35Inner {
             let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
             let mut y = sample(&last_logits, sampling_config)?;
             y.eval();
+            drop(held_images);
 
             crate::array::synchronize_and_clear_cache();
             if report_perf {
@@ -1101,7 +1105,10 @@ impl Qwen35Inner {
         let _wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
-        let merge = vlm_prepare_vision_features(
+        // Held until the prefill that reads `merge` has run: a reclaim takes
+        // only features nothing holds (Splash `Runtime::prefillAsync` gives
+        // an image's rows to the cache once they are in).
+        let (merge, held_images) = vlm_prepare_vision_features(
             &input_ids,
             &per_image_hashes,
             &processed,
@@ -1208,6 +1215,7 @@ impl Qwen35Inner {
             let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
             let mut y = sample(&last_logits, sampling_config)?;
             y.eval();
+            drop(held_images);
 
             crate::array::synchronize_and_clear_cache();
             if report_perf {

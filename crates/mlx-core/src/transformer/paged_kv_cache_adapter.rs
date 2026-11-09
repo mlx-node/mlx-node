@@ -1060,6 +1060,10 @@ pub struct PagedKVCacheAdapter {
     /// stays `&self`; it is locked after the allocator, never before.
     refusals: Mutex<BTreeMap<SeqId, u32>>,
 
+    /// Each sequence's last refused draft fit (Splash
+    /// `MemoryLedger::refused`). Locked after the allocator, never before.
+    draft_refusals: Mutex<BTreeMap<SeqId, crate::engine::reclaim::DraftRefusal>>,
+
     /// Blocks the last [`Self::try_grow_pool`] could still have added when
     /// its probe declined the full grow: the live room.
     last_grow_room: u32,
@@ -1268,6 +1272,7 @@ impl PagedKVCacheAdapter {
             recency,
             turn_end_stamps: HashMap::new(),
             refusals: Mutex::new(BTreeMap::new()),
+            draft_refusals: Mutex::new(BTreeMap::new()),
             last_grow_room: 0,
             #[cfg(test)]
             grow_headroom_probe_override: None,
@@ -7315,6 +7320,34 @@ impl PagedKVCacheAdapter {
 
     pub(crate) fn clear_refusals(&self) {
         self.refusals().clear();
+        self.draft_refusals().clear();
+    }
+
+    fn draft_refusals(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<SeqId, crate::engine::reclaim::DraftRefusal>> {
+        self.draft_refusals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn refuse_draft(
+        &self,
+        seq_id: SeqId,
+        refusal: crate::engine::reclaim::DraftRefusal,
+    ) {
+        self.draft_refusals().insert(seq_id, refusal);
+    }
+
+    pub(crate) fn clear_draft_refusal(&self, seq_id: SeqId) {
+        self.draft_refusals().remove(&seq_id);
+    }
+
+    /// Every refused draft fit; the record clears.
+    pub(crate) fn take_draft_refusals(&self) -> Vec<(SeqId, crate::engine::reclaim::DraftRefusal)> {
+        std::mem::take(&mut *self.draft_refusals())
+            .into_iter()
+            .collect()
     }
 
     /// Blocks every refused reservation lacked, summed over sequences; the
