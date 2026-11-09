@@ -160,6 +160,11 @@ export function resolveAuthToken(explicit: string | undefined): string | undefin
 export interface ServerConfig {
   audio?: AudioServiceOptions;
   rerank?: RerankServiceOptions;
+  /**
+   * Thinking tokens of a Messages thinking request that sets no budget, after
+   * which its thinking closes (Splash `--thinking-token-budget`). Default: no cap.
+   */
+  thinkingTokenBudget?: number;
   /** Port to listen on (default: 8080). */
   port?: number;
   /** Hostname to bind to (default: '127.0.0.1'). */
@@ -476,6 +481,7 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     listModels: config?.listModels,
     authToken,
     health,
+    ...(config?.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: config.thinkingTokenBudget } : {}),
   });
   /**
    * Responses owned by THIS HTTP server. The SSE registry is deliberately

@@ -131,6 +131,8 @@ export interface HandlerOptions {
    * `idleSweeper` and `modelWorkCoordinator`.
    */
   health?: () => ServerHealth;
+  /** See `ServerConfig.thinkingTokenBudget`. */
+  thinkingTokenBudget?: number;
 }
 
 export function createHandler(
@@ -220,7 +222,7 @@ export function createHandler(
         resolveModel,
         listModels,
         modelWorkCoordinator,
-        { health, authenticated, audio, rerank },
+        { health, authenticated, audio, rerank, thinkingTokenBudget: options?.thinkingTokenBudget },
       );
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Internal server error';

@@ -52,6 +52,16 @@ function listenersOf(signal: NodeJS.Signals): NodeJS.SignalsListener[] {
 }
 
 describe('parseServeArgs', () => {
+  // Splash `parse_thinking_token_budget`: a nonnegative integer.
+  it('parses --thinking-token-budget as a nonnegative integer', () => {
+    expect(parseServeArgs(['--thinking-token-budget', '4096']).thinkingTokenBudget).toBe(4096);
+    expect(parseServeArgs(['--thinking-token-budget', '0']).thinkingTokenBudget).toBe(0);
+    expect(parseServeArgs([]).thinkingTokenBudget).toBeUndefined();
+    for (const bad of ['-1', 'abc', '1.5', '', '2147483648']) {
+      expect(() => parseServeArgs([`--thinking-token-budget=${bad}`])).toThrow('--thinking-token-budget');
+    }
+  });
+
   it('validates the global residency policy', () => {
     expect(parseServeArgs(['--model-residency', 'single']).modelResidency).toBe('single');
     expect(parseServeArgs(['--model-residency', 'capability']).modelResidency).toBe('capability');

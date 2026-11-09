@@ -16,6 +16,7 @@ import type {
   AnthropicMessagesResponse,
   AnthropicPingEvent,
   AnthropicResponseContent,
+  AnthropicStopReason,
   MlxProgress,
 } from '../types-anthropic.js';
 import { genId } from './response.js';
@@ -76,17 +77,43 @@ export function mapStopReason(
   finishReason: string,
   hasToolCalls: boolean,
   matchedStopSequence?: string | null,
-): 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' {
+  outputClampedToContext = false,
+): AnthropicStopReason {
   if (matchedStopSequence) {
     return 'stop_sequence';
   }
   if (finishReason === 'length') {
-    return 'max_tokens';
+    // Splash `stop_reason`: the context window, not `max_tokens`, ended it.
+    return outputClampedToContext ? 'model_context_window_exceeded' : 'max_tokens';
   }
   if (hasToolCalls) {
     return 'tool_use';
   }
   return 'end_turn';
+}
+
+/**
+ * The answer text a response shows: the parsed text, or the recovered markup
+ * of tool calls the request did not allow, followed by the raw block of each
+ * call that names no function, which Splash reads as text
+ * (`StreamingToolCallProjector._begin_call`).
+ */
+export function visibleAnswerText(
+  result: Pick<ChatResult, 'text' | 'rawText' | 'toolCalls'>,
+  allowToolUse: boolean,
+): string {
+  const text =
+    !allowToolUse &&
+    result.text.length === 0 &&
+    result.toolCalls.some((t) => t.status === 'ok') &&
+    containsToolCallMarkup(result.rawText)
+      ? recoverSuppressedToolCallText(result.rawText)
+      : result.text;
+  let nameless = '';
+  for (const call of result.toolCalls) {
+    if (call.status === 'missing_name') nameless += call.rawContent;
+  }
+  return text + nameless;
 }
 
 export function containsToolCallMarkup(rawText: string): boolean {
@@ -142,14 +169,7 @@ export function buildAnthropicContent(
   // verbatim — the suppressed-markup recovery is skipped because it would
   // re-introduce text that lived after the stop.
   const okToolCalls = stopMatched || !allowToolUse ? [] : parsedToolCalls;
-  const text =
-    !stopMatched &&
-    !allowToolUse &&
-    result.text.length === 0 &&
-    parsedToolCalls.length > 0 &&
-    containsToolCallMarkup(result.rawText)
-      ? recoverSuppressedToolCallText(result.rawText)
-      : result.text;
+  const text = stopMatched ? result.text : visibleAnswerText(result, allowToolUse);
 
   // Emit a text block unless tool calls exist and there is no text.
   if (text || okToolCalls.length === 0) {
@@ -180,6 +200,7 @@ export function buildAnthropicResponse(
   allowToolUse = true,
   serverTiming?: ServerTimingForUsage,
   matchedStopSequence?: string | null,
+  outputClampedToContext = false,
 ): AnthropicMessagesResponse {
   // A matched stop sequence takes precedence over tool_use: suppress the tool
   // calls so `stop_reason: 'stop_sequence'` is never emitted alongside a
@@ -233,7 +254,7 @@ export function buildAnthropicResponse(
     role: 'assistant',
     model: req.model,
     content: buildAnthropicContent(result, allowToolUse, stopMatched),
-    stop_reason: mapStopReason(result.finishReason, hasToolCalls, matchedStopSequence),
+    stop_reason: mapStopReason(result.finishReason, hasToolCalls, matchedStopSequence, outputClampedToContext),
     stop_sequence: matchedStopSequence ?? null,
     usage,
   };

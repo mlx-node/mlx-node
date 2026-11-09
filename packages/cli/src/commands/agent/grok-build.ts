@@ -42,6 +42,8 @@ import { fileURLToPath } from 'node:url';
 
 import semver from 'semver';
 
+import { withLoopbackNoProxy } from '../loopback-env.js';
+
 /** Env override for a locally built or externally installed agent binary. */
 export const MLX_AGENT_BIN_ENV = 'MLX_AGENT_BIN';
 /** Env override to pin a specific release tag instead of resolving latest. */
@@ -1931,7 +1933,7 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
       throw new Error('mlx agent: signaled during startup');
     }
     const spawnAgent = opts.spawnAgent ?? ((b, a, so) => spawn(b, a, so));
-    const spawnedAgent = spawnAgent(bin, opts.argv, { stdio: 'inherit', env });
+    const spawnedAgent = spawnAgent(bin, opts.argv, { stdio: 'inherit', env: withLoopbackNoProxy(env) });
     agent = spawnedAgent;
     code = await new Promise<number>((resolvePromise, reject) => {
       spawnedAgent.once('exit', (c, signal) => resolvePromise(c ?? (signal === 'SIGINT' ? 130 : 1)));

@@ -172,6 +172,8 @@ export interface InferenceHostOptions {
    * Omitted ⇒ the load default.
    */
   kvFormat?: 'int8' | 'bf16';
+  /** See `ServerConfig.thinkingTokenBudget`. */
+  thinkingTokenBudget?: number;
   /** Model types forced onto the block-paged KV cache. Default {@link DEFAULT_PAGED_MODEL_TYPES}. */
   pagedModelTypes?: readonly string[];
   /** Path to the SQLite response store. See `ServerConfig.storePath`. */
@@ -351,6 +353,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     ...(opts.storePath !== undefined ? { storePath: opts.storePath } : {}),
     ...(opts.disableStore !== undefined ? { disableStore: opts.disableStore } : {}),
     ...(opts.maxQueueDepthPerModel !== undefined ? { maxQueueDepthPerModel: opts.maxQueueDepthPerModel } : {}),
+    ...(opts.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: opts.thinkingTokenBudget } : {}),
   };
   const server = await createServer(serverConfig);
 

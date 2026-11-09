@@ -6919,3 +6919,179 @@ describe('handleCreateMessage progress pings', () => {
     }
   });
 });
+
+describe('handleCreateMessage output limits, thinking budget and call text', () => {
+  const windowLimits = () => ({
+    trainedWindowTokens: 262_144,
+    effectiveWindowTokens: 64,
+    pagedBlockCapacity: 4,
+    pagedBlockSize: 16,
+    restOfWindowOutputBudget: true,
+    omittedBudgetIsRestOfWindow: true,
+  });
+
+  function windowModel(model: SessionCapableModel, promptTokens: number): SessionCapableModel {
+    return Object.assign(model, {
+      contextLimits: windowLimits,
+      applyChatTemplate: vi.fn(() => new Uint32Array(promptTokens)),
+    });
+  }
+
+  const lengthEvent = {
+    done: true,
+    text: 'cut',
+    finishReason: 'length',
+    toolCalls: [],
+    thinking: null,
+    numTokens: 16,
+    promptTokens: 48,
+    reasoningTokens: 0,
+    rawText: 'cut',
+  };
+
+  // Splash `stop_reason` + `output_clamped_to_context`. Mutation: drop the
+  // flag (always `max_tokens` on length) → red.
+  it('non-streaming: a window-clamped limit ends as model_context_window_exceeded', async () => {
+    for (const [maxTokens, expected] of [
+      [32_000, 'model_context_window_exceeded'],
+      [8, 'max_tokens'],
+    ] as const) {
+      const registry = new ModelRegistry();
+      const model = windowModel(
+        createMockModel(makeChatResult({ text: 'cut', rawText: 'cut', finishReason: 'length' })),
+        48,
+      );
+      registry.register('test-model', model);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        { model: 'test-model', messages: [{ role: 'user', content: 'go' }], max_tokens: maxTokens },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      expect(JSON.parse(getBody()).stop_reason).toBe(expected);
+      const native = (model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0]?.[1];
+      expect(native?.maxNewTokens).toBe(maxTokens === 8 ? 8 : 16);
+    }
+  });
+
+  it('streaming: a window-clamped limit ends as model_context_window_exceeded', async () => {
+    for (const [maxTokens, expected] of [
+      [32_000, 'model_context_window_exceeded'],
+      [8, 'max_tokens'],
+    ] as const) {
+      const registry = new ModelRegistry();
+      registry.register('test-model', windowModel(createMockStreamModel([lengthEvent]), 48));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        { model: 'test-model', messages: [{ role: 'user', content: 'go' }], max_tokens: maxTokens, stream: true },
+        registry,
+      );
+
+      const delta = parseSSE(getBody()).find((e) => e.event === 'message_delta');
+      expect(delta?.data.delta).toMatchObject({ stop_reason: expected });
+    }
+  });
+
+  // Splash `_stop_sequences`. Mutation: the old silent filter (a string
+  // reaches `.filter` and throws a JS TypeError) → red.
+  it('returns 400 naming stop_sequences for a single string', async () => {
+    const registry = new ModelRegistry();
+    const model = createMockModel();
+    registry.register('test-model', model);
+    const { res, getStatus, getBody } = createMockRes();
+
+    await handleCreateMessage(
+      res,
+      {
+        model: 'test-model',
+        messages: [{ role: 'user', content: 'go' }],
+        max_tokens: 16,
+        stop_sequences: 'x' as unknown as string[],
+      },
+      registry,
+    );
+
+    expect(getStatus()).toBe(400);
+    expect(JSON.parse(getBody()).error.message).toBe('stop_sequences must be an array of strings');
+    expect((model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+  });
+
+  // Splash `--thinking-token-budget`. Mutation: ignore the server default → red.
+  it('gives a thinking request that sets no budget the server default', async () => {
+    const budgetFor = async (extra: Record<string, unknown>): Promise<unknown> => {
+      const registry = new ModelRegistry();
+      const model = createMockModel();
+      registry.register('test-model', model);
+      const { res } = createMockRes();
+      await handleCreateMessage(
+        res,
+        { model: 'test-model', messages: [{ role: 'user', content: 'go' }], max_tokens: 16, ...extra },
+        registry,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        4096,
+      );
+      return (model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]?.thinkingTokenBudget;
+    };
+    expect(await budgetFor({})).toBe(4096);
+    expect(await budgetFor({ thinking: { type: 'adaptive' } })).toBe(4096);
+    expect(await budgetFor({ thinking: { type: 'enabled', budget_tokens: 2048 } })).toBe(2048);
+    expect(await budgetFor({ extra_body: { reasoning_effort: 'none' } })).toBeUndefined();
+  });
+
+  // Splash `StreamingToolCallProjector._begin_call`: an opening that names no function
+  // is text. Mutation: drop the nameless call's raw text → red (empty text).
+  it('returns a tool call that names no function as text', async () => {
+    const raw = '<tool_call>\n<function=>\n<parameter=q>\nx\n</parameter>\n</function>\n</tool_call>';
+    const nameless = {
+      id: 'call_n',
+      name: '',
+      arguments: {},
+      status: 'missing_name',
+      rawContent: raw,
+    } as unknown as ToolCallResult;
+    const tools = [{ name: 'search', input_schema: { type: 'object' as const, properties: {} } }];
+
+    const registry = new ModelRegistry();
+    registry.register(
+      'test-model',
+      createMockModel(makeChatResult({ text: '', rawText: raw, toolCalls: [nameless], finishReason: 'stop' })),
+    );
+    const plain = createMockRes();
+    await handleCreateMessage(
+      plain.res,
+      { model: 'test-model', messages: [{ role: 'user', content: 'go' }], max_tokens: 64, tools },
+      registry,
+    );
+    const parsed = JSON.parse(plain.getBody());
+    expect(parsed.content).toEqual([{ type: 'text', text: raw }]);
+    expect(parsed.stop_reason).toBe('end_turn');
+
+    const streamRegistry = new ModelRegistry();
+    streamRegistry.register(
+      'test-model',
+      createMockStreamModel([
+        { done: false, text: raw, isReasoning: false },
+        { ...lengthEvent, text: '', rawText: raw, toolCalls: [nameless], finishReason: 'stop' },
+      ]),
+    );
+    const streamed = createMockRes();
+    await handleCreateMessage(
+      streamed.res,
+      { model: 'test-model', messages: [{ role: 'user', content: 'go' }], max_tokens: 64, tools, stream: true },
+      streamRegistry,
+    );
+    const text = parseSSE(streamed.getBody())
+      .filter((e) => e.event === 'content_block_delta')
+      .map((e) => (e.data.delta as { text?: string }).text ?? '')
+      .join('');
+    expect(text).toBe(raw);
+  });
+});

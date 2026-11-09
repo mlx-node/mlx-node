@@ -12,11 +12,8 @@ describe('StopSequenceBuffer', () => {
     expect(buffer.matched).toBeNull();
   });
 
-  it('treats only-empty stop sequences as no configuration', () => {
-    const buffer = new StopSequenceBuffer(['', '']);
-
-    expect(buffer.push('anything')).toEqual({ safeText: 'anything', matched: null });
-    expect(buffer.flush()).toEqual({ safeText: '', matched: null });
+  it('refuses an empty stop sequence, which the request validation rejects first', () => {
+    expect(() => new StopSequenceBuffer(['', 'x'])).toThrow('must not be empty');
   });
 
   it('detects a whole stop sequence within a single push and suppresses the rest', () => {
@@ -56,10 +53,10 @@ describe('StopSequenceBuffer', () => {
     expect(buffer.push('aHALTbENDc')).toEqual({ safeText: 'a', matched: 'HALT' });
   });
 
-  it('prefers the longest stop sequence on a tie at the same index', () => {
+  it('takes the first listed stop when two begin at the same index (Splash StopSearch)', () => {
     const buffer = new StopSequenceBuffer(['ab', 'abc']);
 
-    expect(buffer.push('xabc')).toEqual({ safeText: 'x', matched: 'abc' });
+    expect(buffer.push('xabc')).toEqual({ safeText: 'x', matched: 'ab' });
   });
 
   it('never emits a held-back partial suffix prematurely', () => {
@@ -75,70 +72,95 @@ describe('StopSequenceBuffer', () => {
     expect(buffer.flush()).toEqual({ safeText: 'ST', matched: null });
   });
 
-  it('treats whitespace-only stop sequences as no configuration', () => {
-    const buffer = new StopSequenceBuffer([' ', '\n', '\t']);
+  it('honours a whitespace stop; Messages validation is what rejects one', () => {
+    const buffer = new StopSequenceBuffer(['\n']);
 
-    expect(buffer.push('one two\nthree')).toEqual({ safeText: 'one two\nthree', matched: null });
-    expect(buffer.flush()).toEqual({ safeText: '', matched: null });
-    expect(buffer.matched).toBeNull();
+    expect(buffer.push('one two\nthree')).toEqual({ safeText: 'one two', matched: '\n' });
   });
 
-  it('holds a tail match when a longer same-index stop could still complete on a later push', () => {
+  it('commits the first stop to complete, without waiting for a longer one', () => {
     const buffer = new StopSequenceBuffer(['ab', 'abc']);
 
-    // "ab" is complete at the tail, but "abc" (same start index) is still
-    // viable, so the match must be held rather than committed early.
-    expect(buffer.push('xab')).toEqual({ safeText: 'x', matched: null });
-    // The next push completes the longer stop, which wins on the tie.
-    expect(buffer.push('c tail')).toEqual({ safeText: '', matched: 'abc' });
-    expect(buffer.matched).toBe('abc');
+    expect(buffer.push('xab')).toEqual({ safeText: 'x', matched: 'ab' });
+    expect(buffer.push('c tail')).toEqual({ safeText: '', matched: 'ab' });
   });
 
-  it('commits the short stop when the longer same-index stop is broken on a later push', () => {
-    const buffer = new StopSequenceBuffer(['ab', 'abc']);
-
-    expect(buffer.push('xab')).toEqual({ safeText: 'x', matched: null });
-    // No "c" arrives, so the longer "abc" can never complete and "ab" wins.
-    expect(buffer.push(' x')).toEqual({ safeText: '', matched: 'ab' });
-    expect(buffer.matched).toBe('ab');
-  });
-
-  it('resolves a held tail match at flush when no longer stop completes', () => {
-    const buffer = new StopSequenceBuffer(['ab', 'abc']);
-
-    expect(buffer.push('xab')).toEqual({ safeText: 'x', matched: null });
-    // Stream ends with only "ab" present; the held match resolves to "ab".
-    expect(buffer.flush()).toEqual({ safeText: '', matched: 'ab' });
-    expect(buffer.matched).toBe('ab');
-  });
-
-  it('holds a short tail match while an EARLIER-index longer stop could still complete', () => {
-    // Finding A: "xab" contains the short stop "ab" at index 1, but it is also
-    // a viable prefix of the longer stop "xabc" beginning at the EARLIER index
-    // 0. Earliest-match-wins means the short "ab" must be HELD (not committed)
-    // until the earlier "xabc" either completes or is broken.
+  it('commits a stop that completes while an earlier-starting stop is still partial', () => {
     const buffer = new StopSequenceBuffer(['xabc', 'ab']);
 
-    expect(buffer.push('xab')).toEqual({ safeText: '', matched: null });
-    // The next char completes the earlier/longer "xabc", which wins.
-    expect(buffer.push('c')).toEqual({ safeText: '', matched: 'xabc' });
-    expect(buffer.matched).toBe('xabc');
+    expect(buffer.push('xab')).toEqual({ safeText: 'x', matched: 'ab' });
   });
 
-  it('commits the short stop when the earlier longer stop can no longer complete', () => {
-    const buffer = new StopSequenceBuffer(['xabc', 'ab']);
+  // Splash test_native_backend: tokens "a","a","ab" with stops ("ab","aab").
+  it('ends where the earliest-starting stop begins when two complete in one chunk', () => {
+    const buffer = new StopSequenceBuffer(['ab', 'aab']);
 
-    expect(buffer.push('xab')).toEqual({ safeText: '', matched: null });
-    // "z" breaks "xabc" (it needed "c"); the short "ab" at index 1 commits
-    // promptly, emitting the safe "x" before it — no hang, no dropped text.
-    expect(buffer.push('z')).toEqual({ safeText: 'x', matched: 'ab' });
-    expect(buffer.matched).toBe('ab');
+    expect(buffer.push('a')).toEqual({ safeText: '', matched: null });
+    expect(buffer.push('a')).toEqual({ safeText: '', matched: null });
+    expect(buffer.push('ab')).toEqual({ safeText: 'a', matched: 'aab' });
   });
 
   it('matches the earlier longer stop in a single chunk', () => {
     const buffer = new StopSequenceBuffer(['xabc', 'ab']);
 
     expect(buffer.push('xabc')).toEqual({ safeText: '', matched: 'xabc' });
-    expect(buffer.matched).toBe('xabc');
+  });
+
+  it('keeps a self-overlapping partial across pushes (KMP fallback)', () => {
+    const buffer = new StopSequenceBuffer(['aab']);
+
+    expect(buffer.push('aaa')).toEqual({ safeText: 'a', matched: null });
+    expect(buffer.pending).toBe('aa');
+    expect(buffer.push('b!')).toEqual({ safeText: '', matched: 'aab' });
+  });
+
+  // Splash test_callback_streamer_holds_two_long_stops_in_linear_time: the
+  // output runs 10,000 characters into one stop while the other is checked
+  // again on every token. Steps count the characters each string primitive
+  // touches. Mutation: the old per-push indexOf + every-suffix startsWith scan
+  // → red (about 10^8 steps).
+  it('holds two 10,000-character stops over 10,000 tokens in linear steps', () => {
+    const length = 10_000;
+    const buffer = new StopSequenceBuffer(['a'.repeat(length) + 'X', 'b'.repeat(length) + 'Y']);
+    let released = '';
+    const steps = countStringSteps(() => {
+      for (let token = 0; token < length; token++) released += buffer.push('a').safeText;
+      expect(released).toBe('');
+      released += buffer.push('Z').safeText + buffer.flush().safeText;
+    });
+    expect(released).toBe('a'.repeat(length) + 'Z');
+    expect(buffer.matched).toBeNull();
+    expect(steps).toBeLessThan(40 * (length + length));
   });
 });
+
+/** Characters touched by string primitives while `run` executes. */
+function countStringSteps(run: () => void): number {
+  const cost: Record<string, (self: string, args: unknown[], result: unknown) => number> = {
+    charCodeAt: () => 1,
+    indexOf: (self) => self.length,
+    includes: (self) => self.length,
+    startsWith: (_self, args) => String(args[0]).length,
+    endsWith: (_self, args) => String(args[0]).length,
+    slice: (_self, _args, result) => (result as string).length,
+  };
+  const saved = Object.getOwnPropertyDescriptors(String.prototype);
+  let steps = 0;
+  for (const [name, measure] of Object.entries(cost)) {
+    const original = saved[name]!.value as (...args: unknown[]) => unknown;
+    Object.defineProperty(String.prototype, name, {
+      ...saved[name],
+      value(this: string, ...args: unknown[]) {
+        const result = Reflect.apply(original, this, args);
+        steps += measure(this, args, result);
+        return result;
+      },
+    });
+  }
+  try {
+    run();
+  } finally {
+    for (const name of Object.keys(cost)) Object.defineProperty(String.prototype, name, saved[name]!);
+  }
+  return steps;
+}

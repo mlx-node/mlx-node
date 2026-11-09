@@ -2,6 +2,7 @@
 
 import type { ChatConfig, ChatMessage, ToolDefinition } from '@mlx-node/core';
 
+import { MAX_STOP_SEQUENCE_CHARACTERS, MAX_STOP_SEQUENCES } from '../stop-sequence-buffer.js';
 import type {
   AnthropicContentBlock,
   AnthropicCountTokensRequest,
@@ -18,10 +19,8 @@ export interface MappedAnthropicRequest {
   messages: ChatMessage[];
   config: ChatConfig;
   /**
-   * Client-supplied stop strings (Anthropic `stop_sequences`), normalized to
-   * drop absent/empty entries. Carried alongside `config` rather than on it
-   * because `ChatConfig` has no native stop field; a downstream consumer is
-   * responsible for honouring these.
+   * Client-supplied stop strings (Anthropic `stop_sequences`), validated.
+   * Carried alongside `config` because `ChatConfig` has no native stop field.
    */
   stopSequences: string[];
 }
@@ -434,6 +433,10 @@ export function mapAnthropicRequest(
     }
     config.reasoningEffort = effort as ChatConfig['reasoningEffort'];
   }
+  const budgetTokens = enabledThinkingBudget(req.thinking);
+  if (budgetTokens !== undefined) {
+    config.thinkingTokenBudget = budgetTokens;
+  }
   const thinkingBudget = req.extra_body?.thinking_budget;
   if (thinkingBudget !== undefined) {
     if (!Number.isSafeInteger(thinkingBudget) || thinkingBudget < 0 || thinkingBudget > 2_147_483_647) {
@@ -459,14 +462,7 @@ export function mapAnthropicRequest(
     config.topK = req.top_k;
   }
 
-  // `stop_sequences` has no `ChatConfig` field to map onto, so it rides out on
-  // the widened return instead. Normalize to drop absent/null entries, empty
-  // strings (which would match at every position and stop generation
-  // immediately), and whitespace-only entries (which would truncate normal
-  // output at the first space/newline; the real Anthropic API rejects these
-  // with a 400, so making them a no-op is the lowest-risk resolution). A
-  // downstream consumer honours the result.
-  const stopSequences = (req.stop_sequences ?? []).filter((s) => typeof s === 'string' && s.trim().length > 0);
+  const stopSequences = validatedStopSequences(req.stop_sequences);
 
   if (req.tools && req.tools.length > 0) {
     const toolChoice = req.tool_choice;
@@ -501,4 +497,55 @@ export function mapAnthropicRequest(
   applyExtraBodyMtpOverrides(config, req.extra_body);
 
   return { messages, config, stopSequences };
+}
+
+/**
+ * The `budget_tokens` of enabled thinking (Splash `_thinking_budget`): at least
+ * 1024, as Messages requires. Adaptive or absent thinking sets none.
+ */
+function enabledThinkingBudget(thinking: unknown): number | undefined {
+  if (thinking == null || typeof thinking !== 'object' || (thinking as { type?: unknown }).type !== 'enabled') {
+    return undefined;
+  }
+  const budget = (thinking as { budget_tokens?: unknown }).budget_tokens;
+  if (typeof budget !== 'number' || !Number.isInteger(budget) || budget < 1024) {
+    throw new Error('thinking.budget_tokens must be an integer of at least 1024');
+  }
+  // Native `thinking_token_budget` is i32; a budget past `max_tokens` caps nothing.
+  return Math.min(budget, 2_147_483_647);
+}
+
+/**
+ * Messages `stop_sequences` within Splash's limits on stops (`_stop_sequences`,
+ * `Frontend._generation_options`), checked in Splash's order.
+ */
+function validatedStopSequences(stops: unknown): string[] {
+  if (stops == null) return [];
+  if (!Array.isArray(stops) || !stops.every((stop) => typeof stop === 'string')) {
+    throw new Error('stop_sequences must be an array of strings');
+  }
+  const strings = stops as string[];
+  if (!strings.every((stop) => stop.trim().length > 0)) {
+    throw new Error('each of stop_sequences must contain non-whitespace');
+  }
+  if (strings.length > MAX_STOP_SEQUENCES) {
+    throw new Error('stop_sequences must be up to four strings');
+  }
+  if (strings.some((stop) => codePointCount(stop) > MAX_STOP_SEQUENCE_CHARACTERS)) {
+    throw new Error(`each of stop_sequences must be at most ${MAX_STOP_SEQUENCE_CHARACTERS} characters`);
+  }
+  return strings.slice();
+}
+
+function codePointCount(text: string): number {
+  let count = 0;
+  for (let index = 0; index < text.length; index++) {
+    const unit = text.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff && index + 1 < text.length) {
+      const next = text.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) index++;
+    }
+    count++;
+  }
+  return count;
 }

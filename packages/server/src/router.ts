@@ -91,6 +91,8 @@ export interface RouteExtras {
   authenticated?: boolean;
   audio?: AudioService;
   rerank?: RerankService;
+  /** Thinking budget of a Messages thinking request that sets none. */
+  thinkingTokenBudget?: number;
 }
 
 export async function routeRequest(
@@ -246,7 +248,16 @@ export async function routeRequest(
     }
 
     if (rejectAudio(body)) return;
-    await handleCreateMessage(res, body, registry, req, idleSweeper, resolveModel, modelWorkCoordinator);
+    await handleCreateMessage(
+      res,
+      body,
+      registry,
+      req,
+      idleSweeper,
+      resolveModel,
+      modelWorkCoordinator,
+      extras?.thinkingTokenBudget,
+    );
     return;
   }
 
