@@ -145,7 +145,7 @@ impl GgufCheckpoint {
     fn from_asset_dir(dir: &Path, family: NativeGgufFamily) -> Result<Self> {
         let record = read_gguf_source_json(dir)?;
         let main = open_recorded(&record.main)?;
-        family.check_main_header(&main.1)?;
+        family.check_main_header(&main.1, &main.0)?;
         let companion = record.companion.as_ref().map(open_recorded).transpose()?;
         let (opts, main_plan, companion_plan) = native_import_plans(
             family,
