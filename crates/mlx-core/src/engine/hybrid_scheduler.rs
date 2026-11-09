@@ -2938,17 +2938,20 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.handle_blocked_alone(seq_id);
             return false;
         }
-        let Some(preempted) = preempted else {
+        let Some(mut preempted) = preempted else {
             self.met_before.clear();
             return true;
         };
-        if self.inner.scheduler_books_on_demand()
-            && self.reclaim_for_blocked_step(preempted.turn.seq_id, false, Some(&preempted.turn))
-        {
-            self.scheduler.reinstate_running(preempted.turn);
-        } else {
-            self.handle_preempted(preempted);
+        if self.inner.scheduler_books_on_demand() {
+            // Its caches stay resident until handle_preempted releases them.
+            preempted.turn.block_reservation_active = true;
+            preempted.turn.recurrent_state_reservation_active = true;
+            if self.reclaim_for_blocked_step(preempted.turn.seq_id, false, Some(&preempted.turn)) {
+                self.scheduler.reinstate_running(preempted.turn);
+                return false;
+            }
         }
+        self.handle_preempted(preempted);
         false
     }
 
@@ -6742,12 +6745,15 @@ pub(crate) mod tests {
         assert!(table_of(&state, 2), "the idle owner stays");
     }
 
-    /// Two MTP turns on a 128-block pool; the later one is preempted and
-    /// the earlier one's draft fit, read with it, lacks at most one block,
-    /// which the idle owner holds: the owner goes and the victim is
-    /// reinstated.
-    /// Mutation: pass `None` for the preempted turn in `settle_step` → red
-    /// (the short reads 0, the owner stays).
+    /// Two MTP turns on a 128-block pool; the later one, booking 2 blocks
+    /// it does not hold yet, is preempted (its reservation flags cleared)
+    /// and the earlier one's draft fit, read with its state and bookings,
+    /// lacks at most one block, which the idle owner holds: the owner goes
+    /// and the victim is reinstated, not preempted.
+    /// Mutations: pass `None` for the preempted turn in `settle_step` → red;
+    /// drop the flag restore in `settle_step` → red; restore only
+    /// `recurrent_state_reservation_active` there → red (the bookings are
+    /// left out). Each reads the short as 0: the owner stays.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_preempted_turn_counts_in_the_draft_need() {
@@ -6755,7 +6761,7 @@ pub(crate) mod tests {
             return;
         };
         let first = mtp_step_turn(&mut state, 1, 250, admission);
-        let later = mtp_step_turn(&mut state, 3, 250, admission);
+        let later = mtp_step_turn(&mut state, 3, 250, admission).with_block_reservation(2, 0, 16);
         let need = step_state_bytes(&state.inner, &first, 254, 8_192)
             + step_state_bytes(
                 &state.inner,
@@ -6769,17 +6775,10 @@ pub(crate) mod tests {
         hold(&mut state, 2, 1);
         state.owner_sequences.insert("idle".into(), 2);
         assert!(!run_and_refuse(&mut state, vec![first, later]));
-        let preempted = state.scheduler.take_running(3).expect("the later turn");
-        let refused = [(
-            1,
-            DraftRefusal {
-                bytes: 0,
-                queries: 4,
-            },
-        )];
-        let with = state.draft_short_now(&refused, Some(&preempted));
-        assert!(with > 0 && with <= 8_192, "{with}");
-        assert_eq!(state.draft_short_now(&refused, None), 0);
+        let preempted = state.scheduler.preempt_running(3).expect("the later turn");
+        assert!(
+            !preempted.block_reservation_active && !preempted.recurrent_state_reservation_active
+        );
         assert!(!state.settle_step(
             Vec::new(),
             Some(PreemptedTurn {
@@ -6790,13 +6789,16 @@ pub(crate) mod tests {
         ));
         assert_eq!(state.scheduler.running().len(), 2, "the victim is back");
         assert!(!table_of(&state, 2), "the idle owner's table is released");
+        assert_eq!(state.scheduler.stats().preemptions, 0);
     }
 
     /// The two MTP turns of `a_preempted_turn_counts_in_the_draft_need`, but
-    /// the refused row is the later turn, which the step preempts: its own
-    /// fit is read from the preempted turn, so the idle owner goes.
-    /// Mutation: drop `.or(parked.filter(..))` in `draft_short_now` → red
-    /// (the short reads 0, the owner stays).
+    /// the refused row is the later turn, which the step preempts (its
+    /// reservation flags cleared): its own fit is read from the preempted
+    /// turn, so the idle owner goes and the victim is reinstated.
+    /// Mutations: drop `.or(parked.filter(..))` in `draft_short_now` → red;
+    /// drop the flag restore in `settle_step` → red. Each reads the short
+    /// as 0: the owner stays.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_preempted_refused_row_counts_its_own_draft_need() {
@@ -6824,16 +6826,8 @@ pub(crate) mod tests {
                 .draft_fits_or_refuse(state.scheduler.running(), 1, 4)
                 .expect("draft fit")
         );
-        let preempted = state.scheduler.take_running(3).expect("the later turn");
-        let refused = [(
-            3,
-            DraftRefusal {
-                bytes: 0,
-                queries: 4,
-            },
-        )];
-        let short = state.draft_short_now(&refused, Some(&preempted));
-        assert!(short > 0 && short <= 8_192, "{short}");
+        let preempted = state.scheduler.preempt_running(3).expect("the later turn");
+        assert!(!preempted.recurrent_state_reservation_active);
         assert!(!state.settle_step(
             Vec::new(),
             Some(PreemptedTurn {
@@ -6844,6 +6838,7 @@ pub(crate) mod tests {
         ));
         assert_eq!(state.scheduler.running().len(), 2, "the victim is back");
         assert!(!table_of(&state, 2), "the idle owner's table is released");
+        assert_eq!(state.scheduler.stats().preemptions, 0);
     }
 
     /// Two draft refusals in one step after the smaller one was met: the
