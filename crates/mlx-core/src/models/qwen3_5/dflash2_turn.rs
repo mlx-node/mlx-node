@@ -3486,6 +3486,71 @@ mod tests {
         Ok(())
     }
 
+    /// An AR grow that headroom held to 2 blocks of a `POOL_EXTENT`-block
+    /// extent, released: a growth whose KV only that partial extent and
+    /// every state bring within reach is counted as in reach and cuts the
+    /// pool back to the runway.
+    /// Mutation: floor division of the extents in
+    /// `PagedKVCacheAdapter::release_reach_bytes` → red
+    /// (context_length_exceeded).
+    #[test]
+    fn partial_extent_is_reclaimed_for_flat_growth() -> Result<()> {
+        if !metal_is_default_device() {
+            return Ok(());
+        }
+        let tokenizer = tokenizer();
+        let mut inner = fixture("int8_d256");
+        turn(&mut inner, &tokenizer, &body(4, 40));
+        inner.config.paged_cache_memory_mb = Some(256);
+        inner.paged_adapter = None;
+        inner.initialize_paged_adapter()?;
+        let adapter = inner.paged_adapter.as_mut().expect("paged adapter");
+        assert!(adapter.grows_by_extent());
+        adapter.set_extent_growth(POOL_EXTENT);
+        let runway = adapter
+            .block_telemetry()
+            .map_err(Error::from_reason)?
+            .total_blocks;
+        let partial = runway + 2;
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(move |blocks| {
+            Ok(blocks.min(partial))
+        })));
+        let bytes_per_block = adapter.bytes_per_block().map_err(Error::from_reason)?;
+        let runway_bytes = u64::from(runway) * bytes_per_block;
+        adapter
+            .reset_for_new_request(1)
+            .map_err(Error::from_reason)?;
+        adapter
+            .allocate_suffix_blocks(partial * adapter.block_size())
+            .map_err(Error::from_reason)?;
+        adapter.release_request().map_err(Error::from_reason)?;
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        assert_eq!(pool_blocks(&inner), partial, "headroom holds the grow");
+        let partial_bytes = 2 * bytes_per_block;
+        assert_eq!(pool_bytes(&inner), runway_bytes + partial_bytes);
+        let held = |inner: &Qwen35Inner| {
+            let bytes = inner.dflash2_states.store.bytes();
+            bytes.kv_bytes + bytes.state_bytes
+        };
+        let start_held = held(&inner);
+        let start_pool = pool_bytes(&inner);
+        let states = state_reach_bytes(&inner, Keep::default(), false);
+        assert_eq!(states, start_held, "the store holds every state byte");
+        let phase = KvGrowthPhase::Decode;
+        let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
+        let base = dflash2_kv_headroom_for(need.kv_bytes)
+            .checked_sub(partial_bytes + states)
+            .expect("the partial extent and states fall short of the KV");
+        let growth = ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {
+            Some(base + (start_pool - pool_bytes(inner)) + (start_held - held(inner)))
+        })?;
+        assert!(growth.grew);
+        assert_eq!(growth.released_pool_bytes, partial_bytes);
+        assert_eq!(pool_blocks(&inner), runway);
+        assert_eq!(pool_bytes(&inner), runway_bytes);
+        Ok(())
+    }
+
     /// A headroom the grown extent's cut leaves 10 bytes short of the KV:
     /// the count says no take can meet it, so the growth fails at once and
     /// the extent and its cached prefix stay.

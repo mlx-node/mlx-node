@@ -7462,7 +7462,12 @@ impl PagedKVCacheAdapter {
         let refs = self.table_refs();
         let guard = self.allocator_guard();
         let num_blocks = guard.num_blocks();
-        let extents = num_blocks.saturating_sub(self.extent_runway_blocks) / extent;
+        // A grow capped by the pool max or by headroom can end inside an
+        // extent (Splash `KvPool` holds whole extents only); the cut takes
+        // that partial extent down to the runway, so the reach rounds up.
+        let extents = num_blocks
+            .saturating_sub(self.extent_runway_blocks)
+            .div_ceil(extent);
         let cut =
             guard.shrink_target_as_released(self.extent_runway_blocks, extent, extents, &refs);
         drop(guard);
@@ -17485,6 +17490,70 @@ mod tests {
         assert_eq!(pool.num_blocks(), 7, "the pool grows again from the runway");
         assert!(!pool.shrink_pending());
         assert_eq!(pool.total_bytes(), 7 * block_bytes);
+    }
+
+    /// A runway-4 pool with 4-block extents whose grow the pool max caps
+    /// inside an extent: max 6 ends 2 blocks into the first extent, max 10
+    /// 2 blocks into the second. With every table released the reach equals
+    /// what `try_release_pool_extents` frees down to the runway.
+    /// Mutations: floor division of the extents in `release_reach_bytes` →
+    /// red (max 6: 0); `.max(1)` in place of `div_ceil` → red (max 10:
+    /// 4 blocks).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn release_reach_counts_a_grow_capped_inside_an_extent() {
+        const NAME: &str = "release_reach_counts_a_grow_capped_inside_an_extent";
+        for (max_blocks, tokens, grown) in [(6u32, 48u32, 6u32), (10, 80, 10)] {
+            let cfg = mlx_paged_attn::PagedAttentionConfig {
+                block_size: 8,
+                num_kv_heads: 1,
+                head_size: 64,
+                num_layers: 4,
+                gpu_memory_mb: 256,
+                use_fp8_cache: Some(false),
+                max_seq_len: Some(128),
+                max_batch_size: Some(2),
+            };
+            let pool = match mlx_paged_attn::LayerKVPool::new(
+                cfg,
+                4,
+                max_blocks,
+                mlx_paged_attn::metal::MetalDtype::BFloat16,
+            ) {
+                Ok(p) => Arc::new(p),
+                Err(e) => {
+                    eprintln!("skipping {NAME}: {e}");
+                    return;
+                }
+            };
+            let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, max_blocks, 8)));
+            let mut adapter =
+                PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+                    .expect("adapter");
+            adapter.set_extent_growth(4);
+            adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+            let block_bytes = adapter.bytes_per_block().expect("bytes per block");
+
+            adapter.reset_for_new_request(7).unwrap();
+            assert_eq!(adapter.allocate_suffix_blocks(tokens).unwrap(), grown);
+            assert_eq!(pool.num_blocks(), grown, "the pool max caps the grow");
+            adapter.release_request().unwrap();
+
+            let reach = adapter.release_reach_bytes();
+            assert_eq!(
+                reach,
+                u64::from(grown - 4) * block_bytes,
+                "max {max_blocks}: the reach counts the partial extent down to the runway"
+            );
+            assert_eq!(
+                adapter.try_release_pool_extents(reach, false),
+                reach,
+                "max {max_blocks}: the cut frees the reach"
+            );
+            assert_eq!(allocator.lock().unwrap().num_blocks(), 4);
+            assert_eq!(pool.num_blocks(), 4);
+            assert_eq!(adapter.release_reach_bytes(), 0);
+        }
     }
 
     /// A 4-layer pool whose 10 -> 4 cut fails at layer 2 holds layers
