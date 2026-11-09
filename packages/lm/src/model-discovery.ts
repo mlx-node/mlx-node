@@ -198,7 +198,9 @@ export interface DiscoveryScanOptions {
 /**
  * Scan `modelsDir` for chat-capable model subdirectories, Gemma4/Muse/Qwen4 GGUFs, and
  * dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` / `Q<number>_K_M.gguf` / `UD-IQ*.gguf` files. GGUF files may live directly
- * under `modelsDir` or one level inside a downloaded GGUF repository. Each is
+ * under `modelsDir`, one level inside a downloaded GGUF repository, or in one of its
+ * variant folders (`<repo>/UD-Q4_K_XL/*.gguf`) when the repository root holds no
+ * target GGUF and no primary safetensors. Each is
  * registered by filename stem so quant variants remain independently selectable.
  *
  * A MISSING dir yields `[]` — nothing is installed. A dir that exists but
@@ -320,6 +322,33 @@ export async function discoverLocalChatModels(
     }
   };
 
+  /**
+   * Discover target GGUFs in the variant folders of `repoDir` (one level, no
+   * dot-folders, no deeper). True when any variant holds a target file name:
+   * `repoDir` is then a repository, not a model.
+   */
+  const appendVariantGguf = async (repoDir: string, scopeName: string): Promise<boolean> => {
+    const children = await readdir(repoDir, { withFileTypes: true });
+    children.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    let claimed = false;
+    for (const child of children) {
+      if (child.name.startsWith('.') || (await resolveDirentKind(repoDir, child)) !== 'dir') continue;
+      const variantDir = join(repoDir, child.name);
+      try {
+        const inventory = await modelFileInventory(variantDir);
+        if (inventory.hasPrimarySafetensors) continue;
+        for (const name of inventory.targetGgufs) {
+          claimed = true;
+          await appendGguf(name, variantDir, scopeName);
+        }
+      } catch (err) {
+        reportFailure(err, variantDir);
+        if (debug) console.warn(`[mlx] skip ${variantDir}: ${(err as Error).message}`);
+      }
+    }
+    return claimed;
+  };
+
   for (const entry of entries) {
     // Dirent kind reflects the link itself, never the target — resolve so a
     // symlinked `.gguf` or model directory classifies by what it points at.
@@ -337,9 +366,18 @@ export async function discoverLocalChatModels(
       // Prefer converted targets over retained source files or companion weights.
       // Each native GGUF variant is otherwise a separate entry. Header detection
       // also handles Qwen4 split directories with no config/tokenizer sidecars.
-      if (inventory.hasGguf && !inventory.hasPrimarySafetensors) {
-        for (const name of inventory.targetGgufs) await appendGguf(name, full, entry.name);
-        continue;
+      if (!inventory.hasPrimarySafetensors) {
+        if (inventory.targetGgufs.length > 0) {
+          for (const name of inventory.targetGgufs) await appendGguf(name, full, entry.name);
+          continue;
+        }
+        // `mlx download` keeps repo paths, so a variant folder such as
+        // `<repo>/UD-Q4_K_XL/*.gguf` sits one level down. A repo with such a
+        // variant is never itself a model, even with a root config.json.
+        // Dot-folders are never repos: `.staging/` holds the dashboard's
+        // unpublished download jobs and publish backups.
+        if (!entry.name.startsWith('.') && (await appendVariantGguf(full, entry.name))) continue;
+        if (inventory.hasGguf) continue;
       }
       const modelType = await detectModelType(full);
       await append(entry.name, full, full, modelType, entry.name);
