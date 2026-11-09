@@ -7350,6 +7350,8 @@ impl PagedKVCacheAdapter {
     /// order: free blocks, a grow, then the cached blocks `reserve` evicts.
     /// `over_takeable` grows by what free plus evictable blocks lack, as
     /// admission sizes its grow. The grow it tries records the probe's room.
+    /// Met means covered, never grew (Splash `KvPool::takeFreePages`): a
+    /// grow clamped at the pool max can add less than the shortfall.
     pub(crate) fn kv_need_met(&mut self, blocks: u32, over_takeable: bool) -> bool {
         self.last_grow_room = 0;
         let (takeable, shortfall, at_cap) = {
@@ -7369,7 +7371,10 @@ impl PagedKVCacheAdapter {
         if shortfall == 0 {
             return takeable >= blocks;
         }
-        (!at_cap && self.try_grow_pool(shortfall)) || takeable >= blocks
+        if !at_cap && self.try_grow_pool(shortfall) {
+            return self.takeable_blocks() >= blocks;
+        }
+        takeable >= blocks
     }
 
     pub(crate) fn at_cap(&self) -> bool {
@@ -12049,6 +12054,69 @@ mod tests {
         adapter.set_grow_headroom_probe_override(Some(Arc::new(|_| Err("no probe".into()))));
         assert!(!adapter.try_grow_pool(4));
         assert_eq!(adapter.last_grow_room(), 0);
+    }
+
+    /// A 4-block pool, max 8, 4-block extents, every block held by the live
+    /// request: a 5-block need grows to the max (8) and stays short, since
+    /// 4 blocks are takeable; a 4-block need is met by the same grow.
+    /// Mutations: return the grow's result as met in `kv_need_met` → red
+    /// (5 met); return false after any grow → red (4 not met).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kv_need_met_recounts_after_a_capped_grow() {
+        let held = || {
+            let cfg = mlx_paged_attn::PagedAttentionConfig {
+                block_size: 8,
+                num_kv_heads: 1,
+                head_size: 64,
+                num_layers: 2,
+                gpu_memory_mb: 256,
+                use_fp8_cache: Some(false),
+                max_seq_len: Some(128),
+                max_batch_size: Some(2),
+            };
+            let pool = mlx_paged_attn::LayerKVPool::new(
+                cfg,
+                4,
+                8,
+                mlx_paged_attn::metal::MetalDtype::BFloat16,
+            )
+            .map_err(|error| error.to_string())?;
+            let pool = Arc::new(pool);
+            let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8, 8)));
+            let mut adapter = PagedKVCacheAdapter::new(allocator, Arc::clone(&pool), 8)
+                .map_err(|e| e.to_string())?;
+            adapter.set_extent_growth(4);
+            adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+            adapter
+                .reset_for_new_request(7)
+                .map_err(|e| e.to_string())?;
+            assert_eq!(adapter.allocate_suffix_blocks(32).unwrap(), 4);
+            assert_eq!(adapter.takeable_blocks(), 0);
+            Ok::<_, String>((adapter, pool))
+        };
+        for over_takeable in [false, true] {
+            let (mut adapter, pool) = match held() {
+                Ok(held) => held,
+                Err(error) => {
+                    eprintln!("skipping kv_need_met_recounts_after_a_capped_grow: {error}");
+                    return;
+                }
+            };
+            assert!(
+                !adapter.kv_need_met(5, over_takeable),
+                "a grow clamped at the max covers 4 of 5 (over_takeable {over_takeable})"
+            );
+            assert_eq!(pool.num_blocks(), 8);
+            assert_eq!(adapter.takeable_blocks(), 4);
+
+            let (mut adapter, pool) = held().expect("same setup");
+            assert!(
+                adapter.kv_need_met(4, over_takeable),
+                "the grow covers 4 (over_takeable {over_takeable})"
+            );
+            assert_eq!(pool.num_blocks(), 8);
+        }
     }
 
     #[test]

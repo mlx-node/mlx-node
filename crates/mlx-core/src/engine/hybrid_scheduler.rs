@@ -178,14 +178,20 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     /// Moves an idle live state beside the pool where the take order sees it.
     fn park_idle_live_state(&mut self) {}
     fn sync_state_marks(&mut self) {}
-    /// Bytes every state unit could free (an upper bound).
-    fn state_reach_bytes(&self) -> u64 {
+    /// Bytes every state unit could free (an upper bound); the states turns
+    /// use count only with `in_use`.
+    fn state_reach_bytes(&self, _in_use: bool) -> u64 {
         0
     }
     fn compact_one_state(&mut self) -> bool {
         false
     }
-    fn oldest_state_unit(&self, _at_cap: bool, _skip: &HashSet<UnitKey>) -> Option<Unit> {
+    fn oldest_state_unit(
+        &self,
+        _at_cap: bool,
+        _skip: &HashSet<UnitKey>,
+        _in_use: bool,
+    ) -> Option<Unit> {
         None
     }
     /// Takes one state unit; false when it freed nothing.
@@ -1863,7 +1869,7 @@ impl<B: HybridSchedulerBackend> KvReclaim for SchedReclaim<'_, B> {
         self.state.inner.sync_state_marks();
     }
 
-    fn reach(&self, at_cap: bool) -> Reach {
+    fn reach(&self, at_cap: bool, in_use: bool) -> Reach {
         let owners = self.state.idle_owners(self.victim);
         let adapter = self.state.inner.paged_adapter();
         let releasable =
@@ -1879,7 +1885,10 @@ impl<B: HybridSchedulerBackend> KvReclaim for SchedReclaim<'_, B> {
             bytes: if at_cap {
                 0
             } else {
-                self.state.inner.state_reach_bytes().saturating_add(rows)
+                self.state
+                    .inner
+                    .state_reach_bytes(in_use)
+                    .saturating_add(rows)
             },
         }
     }
@@ -1888,8 +1897,8 @@ impl<B: HybridSchedulerBackend> KvReclaim for SchedReclaim<'_, B> {
         self.state.inner.compact_one_state()
     }
 
-    fn oldest_state(&self, at_cap: bool, skip: &HashSet<UnitKey>) -> Option<Unit> {
-        self.state.inner.oldest_state_unit(at_cap, skip)
+    fn oldest_state(&self, at_cap: bool, skip: &HashSet<UnitKey>, in_use: bool) -> Option<Unit> {
+        self.state.inner.oldest_state_unit(at_cap, skip, in_use)
     }
 
     fn oldest_kv(&self, at_cap: bool, skip: &HashSet<UnitKey>) -> Option<Unit> {
@@ -2698,9 +2707,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     /// through the take order (Splash `MemoryLedger::free`): met in place, a
     /// count that cannot cover it takes nothing, else states and idle owners
     /// go oldest first until it is met; a need met or freed for once already
-    /// stops (Splash `Engine::allocate`). A blocked step that left no KV
-    /// refusal, and every other family, releases idle owners.
-    fn reclaim_for_blocked_step(&mut self, victim: SeqId) -> bool {
+    /// stops (Splash `Engine::allocate`). `reach_in_use`: the step's turn
+    /// runs alone, so its need goes on to the states suspended and running
+    /// turns use, last (Splash `Engine::growthClass`); a turn that yields
+    /// beside another keeps them. A blocked step that left no KV refusal,
+    /// and every other family, releases idle owners.
+    fn reclaim_for_blocked_step(&mut self, victim: SeqId, reach_in_use: bool) -> bool {
         if !self.inner.reclaims_in_order() {
             return self.reclaim_idle_owners(victim);
         }
@@ -2718,7 +2730,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     state: self,
                     victim,
                 },
-                KvNeed::in_place(blocks),
+                KvNeed {
+                    reach_in_use,
+                    ..KvNeed::in_place(blocks)
+                },
             );
             self.met_before.retry(need, freed)
         };
@@ -2778,7 +2793,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return true;
         };
         if self.inner.scheduler_books_on_demand()
-            && self.reclaim_for_blocked_step(preempted.turn.seq_id)
+            && self.reclaim_for_blocked_step(preempted.turn.seq_id, false)
         {
             self.scheduler.reinstate_running(preempted.turn);
         } else {
@@ -2803,7 +2818,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             }
             return;
         }
-        if self.reclaim_for_blocked_step(seq_id) {
+        if self.reclaim_for_blocked_step(seq_id, true) {
             return;
         }
         let error = self.capacity_exhausted(seq_id);
@@ -3133,6 +3148,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                         blocks,
                         over_takeable: true,
                         checked: false,
+                        reach_in_use: false,
                     },
                     &self.reclaim_keep,
                 );
@@ -6316,9 +6332,9 @@ pub(crate) mod tests {
 
     /// Admits `turn`, runs one step in which it blocks, and settles it.
     #[cfg(target_os = "macos")]
-    fn settle_blocked_step(
-        state: &mut HybridSchedulerState<Qwen35Inner>,
-        turn: TurnState<ScheduledTurn<<Qwen35Inner as PagedBackend>::PrefixState>>,
+    fn settle_blocked_step<B: HybridSchedulerBackend>(
+        state: &mut HybridSchedulerState<B>,
+        turn: TurnState<ScheduledTurn<B::PrefixState>>,
     ) {
         state.scheduler.enqueue_turn(turn).expect("enqueue");
         let Ok(SchedulerAction::Stepped {
@@ -6732,7 +6748,7 @@ pub(crate) mod tests {
                 .refuse_for_test(2, blocks);
         };
         refuse(&state, 3);
-        assert!(state.reclaim_for_blocked_step(2));
+        assert!(state.reclaim_for_blocked_step(2, false));
         assert!(
             state
                 .inner
@@ -6742,7 +6758,7 @@ pub(crate) mod tests {
             "the idle owner's table is released"
         );
         refuse(&state, 5);
-        assert!(!state.reclaim_for_blocked_step(2));
+        assert!(!state.reclaim_for_blocked_step(2, false));
     }
 
     /// Qwen3.5 scheduler over the growable pool fixture (4 live blocks, 16
@@ -6876,7 +6892,7 @@ pub(crate) mod tests {
         while adapter.try_grow_pool(16) {}
         adapter.refuse_for_test(2, 17);
         assert_eq!(pool_total_blocks(&state), 16);
-        assert!(!state.reclaim_for_blocked_step(2));
+        assert!(!state.reclaim_for_blocked_step(2, false));
         assert!(
             state.inner.dflash2_context.is_some(),
             "the live state stays"
@@ -6905,7 +6921,7 @@ pub(crate) mod tests {
         adapter.refuse_for_test(2, 5);
         clear_reclaim_log();
         let evictions = pool_grow_evictions();
-        assert!(state.reclaim_for_blocked_step(2));
+        assert!(state.reclaim_for_blocked_step(2, false));
         assert_eq!(pool_grow_evictions() - evictions, 1);
         assert!(pool_total_blocks(&state) > before);
         assert!(
@@ -6985,7 +7001,10 @@ pub(crate) mod tests {
     }
 
     /// Caches `tokens` as a chain nothing holds; returns its block hashes.
-    fn cache_dead_chain(state: &HybridSchedulerState<Qwen35Inner>, tokens: &[u32]) -> Vec<u64> {
+    fn cache_dead_chain<B: HybridSchedulerBackend>(
+        state: &HybridSchedulerState<B>,
+        tokens: &[u32],
+    ) -> Vec<u64> {
         let adapter = state.inner.paged_adapter().expect("paged adapter");
         let mut allocator = adapter.allocator().lock().expect("allocator");
         let blocks: Vec<_> = (0..tokens.len() / 16)
@@ -7076,7 +7095,7 @@ pub(crate) mod tests {
             refused(&mut state, 9, 0, 3);
             clear_reclaim_log();
             assert!(
-                state.reclaim_for_blocked_step(9),
+                state.reclaim_for_blocked_step(9, false),
                 "owner older {owner_older}"
             );
             if owner_older {
@@ -7125,7 +7144,7 @@ pub(crate) mod tests {
             adapter.reserve_rows_for(3, 48).is_err(),
             "the blocked turn is refused 3 blocks"
         );
-        assert!(state.reclaim_for_blocked_step(3));
+        assert!(state.reclaim_for_blocked_step(3, false));
         assert!(!table_of(&state, 1));
         assert!(table_of(&state, 2));
     }
@@ -7173,7 +7192,7 @@ pub(crate) mod tests {
                 .takeable_blocks(),
             2
         );
-        assert!(state.reclaim_for_blocked_step(9));
+        assert!(state.reclaim_for_blocked_step(9, false));
         assert!(!table_of(&state, 1));
         assert!(!table_of(&state, 2));
         assert_eq!(
@@ -7220,7 +7239,7 @@ pub(crate) mod tests {
         assert!(!state.owner_last_used.contains_key(&1));
         refused(&mut state, 9, 0, 3);
         clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(9));
+        assert!(state.reclaim_for_blocked_step(9, false));
         assert!(table_of(&state, 1));
         assert_eq!(reclaim_log(), vec![GrowReclaim::Store]);
     }
@@ -7294,7 +7313,7 @@ pub(crate) mod tests {
         hold(&mut state, 9, 2);
         refused(&mut state, 9, 2, 1);
         clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(9));
+        assert!(state.reclaim_for_blocked_step(9, false));
         assert_eq!(reclaim_log(), vec![GrowReclaim::Ladder]);
         assert!(table_of(&state, 1));
     }
@@ -7316,7 +7335,7 @@ pub(crate) mod tests {
             .paged_adapter()
             .expect("paged adapter")
             .refuse_for_test(9, 5);
-        assert!(!state.reclaim_for_blocked_step(9));
+        assert!(!state.reclaim_for_blocked_step(9, false));
         assert_eq!(rungs(&state), 1);
         assert!(table_of(&state, 1));
     }
@@ -7354,7 +7373,7 @@ pub(crate) mod tests {
         hold(&mut state, 9, 2);
         refused(&mut state, 9, 2, 1);
         state.begin_scheduled_step();
-        assert!(!state.reclaim_for_blocked_step(9));
+        assert!(!state.reclaim_for_blocked_step(9, false));
         assert_eq!(rungs(&state), 1);
     }
 
@@ -7377,7 +7396,7 @@ pub(crate) mod tests {
         hold(&mut state, 9, 2);
         refused(&mut state, 9, 2, 1);
         clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(9));
+        assert!(state.reclaim_for_blocked_step(9, false));
         assert_eq!(reclaim_log(), vec![GrowReclaim::Ladder]);
         assert_eq!(parked_dflash2_states(&state.inner), 2);
     }
@@ -7428,7 +7447,7 @@ pub(crate) mod tests {
             Some(2)
         );
         assert!(wave(&mut state).is_err());
-        assert!(!state.reclaim_for_blocked_step(1));
+        assert!(!state.reclaim_for_blocked_step(1, false));
         assert_eq!(rungs(&state), 1);
     }
 
@@ -7486,7 +7505,7 @@ pub(crate) mod tests {
         hold(&mut state, 9, 4);
         refused(&mut state, 9, 4, 1);
         clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(9));
+        assert!(state.reclaim_for_blocked_step(9, false));
         assert_eq!(reclaim_log(), vec![GrowReclaim::Store]);
         assert_eq!(parked_dflash2_states(&state.inner), 1);
     }
@@ -7541,7 +7560,7 @@ pub(crate) mod tests {
             .release_request_for(1)
             .expect("the finished turn's table");
         clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(2));
+        assert!(state.reclaim_for_blocked_step(2, false));
         assert!(reclaim_log().is_empty());
         assert_eq!(parked_dflash2_states(&state.inner), 1);
     }
@@ -7571,6 +7590,298 @@ pub(crate) mod tests {
             "{outcome:?}"
         );
         assert_eq!(rungs(&state), 0);
+    }
+
+    /// A lone admission of 5 blocks on a 4-block pool, max 8, whose 4
+    /// blocks are a ladder chain: the grow clamps at the max and adds 4,
+    /// still short, so the take goes on to the rung and admits.
+    /// Mutation: count a passing grow as met in `kv_need_met` → red
+    /// (`Reject`: the grow came back `Met` with nothing taken).
+    #[test]
+    fn capped_admission_grow_takes_the_ladder() {
+        let Some(mut state) = qwen35_pool_state(4, 8, passing()) else {
+            return;
+        };
+        rung(&mut state, 16, 4, 0);
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        assert_eq!(
+            snapshot.blocks.free_blocks + snapshot.blocks.reclaimable_blocks,
+            0
+        );
+        clear_reclaim_log();
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, 5, 0, 0, snapshot)
+            .expect("reserve");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "{outcome:?}"
+        );
+        assert!(reclaim_log().contains(&GrowReclaim::Ladder));
+        assert_eq!(rungs(&state), 0);
+        assert_eq!(pool_total_blocks(&state), 8);
+    }
+
+    // ---- the lone blocked turn reaches in-use points (Splash `growthClass`) ----
+
+    fn has_rung(state: &HybridSchedulerState<Qwen35Inner>, final_hash: u64) -> bool {
+        state
+            .inner
+            .ladder_entries_for_test()
+            .iter()
+            .any(|&(_, hash, _)| hash == final_hash)
+    }
+
+    /// A running turn over a 40-token prompt (3 blocks) whose reply is
+    /// `result`, on a pool of exactly `max` blocks.
+    #[cfg(target_os = "macos")]
+    fn running_turn<B: HybridSchedulerBackend>(
+        state: &mut HybridSchedulerState<B>,
+        seq: u32,
+    ) -> (
+        TurnState<ScheduledTurn<B::PrefixState>>,
+        tokio::sync::oneshot::Receiver<Result<ChatResult>>,
+    ) {
+        let mut turn = speculative::tests::request(
+            &mut state.inner,
+            seq,
+            (0..40).map(|token| (token + seq) % 16).collect(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (reply, result) = tokio::sync::oneshot::channel();
+        turn.payload.response = ScheduledReply::Sync(reply);
+        assert_eq!(state.inner.scheduler_materialized_blocks(seq), 3);
+        (turn, result)
+    }
+
+    /// The step's only running turn T (3 blocks) blocks for one block at the
+    /// max pool; the rest of the pool is the 2-block cache-only chain of
+    /// rung R, which suspended turn 7 restored from. The lone turn's need
+    /// reaches R, takes it, and runs on.
+    /// Mutation: `handle_blocked_alone` reclaims with `reach_in_use` false
+    /// → red (T fails `capacity_exhausted`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lone_turn_takes_a_suspended_turns_replay_point_last() {
+        let Some(mut state) = qwen35_pool_state(5, 5, passing()) else {
+            return;
+        };
+        let (turn, mut result) = running_turn(&mut state, 1);
+        let r = *rung(&mut state, 30, 2, 0).last().expect("R");
+        state.inner.use_ladder_entry_for_test(7, r);
+        let adapter = state.inner.paged_adapter().expect("paged adapter");
+        assert!(adapter.at_cap());
+        assert_eq!(adapter.takeable_blocks(), 0);
+        adapter.refuse_for_test(1, 1);
+        settle_blocked_step(&mut state, turn);
+        assert!(
+            matches!(
+                result.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the turn is still running"
+        );
+        assert_eq!(state.scheduler.running().len(), 1);
+        assert!(!has_rung(&state, r), "R was taken");
+    }
+
+    /// As above beside an ordinary rung Q (1 block) newer than R: the
+    /// need takes Q and keeps R and its use.
+    /// Mutation: take in-use points in the ordinary loop by stamp in
+    /// `free_for_kv` → red (R, the older, goes first).
+    #[test]
+    fn ordinary_units_go_before_an_in_use_point() {
+        let Some(mut state) = qwen35_pool_state(6, 6, passing()) else {
+            return;
+        };
+        hold(&mut state, 9, 3);
+        let r = *rung(&mut state, 30, 2, 0).last().expect("R");
+        let q = *rung(&mut state, 31, 1, 100).last().expect("Q");
+        state.inner.use_ladder_entry_for_test(7, r);
+        refused(&mut state, 9, 3, 1);
+        assert!(state.reclaim_for_blocked_step(9, true));
+        assert!(!has_rung(&state, q), "Q was taken");
+        assert!(has_rung(&state, r), "R stays");
+        assert!(matches!(
+            state.inner.gdn_in_use_for_test(7),
+            Some(UnitKey::Ladder { final_block_hash, .. }) if *final_block_hash == r
+        ));
+    }
+
+    /// Two running turns at the max pool beside rung R, which the later
+    /// one (2) restored from; both block, so the later one yields: its
+    /// reclaim keeps R and it is preempted, still using R.
+    #[cfg(target_os = "macos")]
+    fn yielding_pair() -> Option<(HybridSchedulerState<Qwen35Inner>, u64)> {
+        let mut state = qwen35_pool_state(8, 8, passing())?;
+        let (first, _) = running_turn(&mut state, 1);
+        let (second, _) = running_turn(&mut state, 2);
+        let r = *rung(&mut state, 30, 2, 0).last().expect("R");
+        state.inner.use_ladder_entry_for_test(2, r);
+        let adapter = state.inner.paged_adapter().expect("paged adapter");
+        assert!(adapter.at_cap());
+        assert_eq!(adapter.takeable_blocks(), 0);
+        adapter.refuse_for_test(2, 1);
+        state.scheduler.enqueue_turn(first).expect("enqueue");
+        state.scheduler.enqueue_turn(second).expect("enqueue");
+        let Ok(SchedulerAction::Stepped {
+            completed,
+            preempted,
+            blocked_alone,
+            ..
+        }) = state.scheduler.drive_once(&mut BlockEveryRow)
+        else {
+            panic!("expected a step");
+        };
+        assert!(blocked_alone.is_none());
+        assert_eq!(preempted.as_ref().map(|turn| turn.turn.seq_id), Some(2));
+        assert!(!state.settle_step(completed, preempted, blocked_alone));
+        Some((state, r))
+    }
+
+    /// Mutation: `settle_step` reclaims with `reach_in_use` true → red (R
+    /// taken, no preemption).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn yielding_lane_does_not_take_in_use() {
+        let Some((state, r)) = yielding_pair() else {
+            return;
+        };
+        assert!(has_rung(&state, r), "R stays");
+        assert_eq!(state.scheduler.stats().preemptions, 1);
+        assert_eq!(state.scheduler.running().len(), 1);
+    }
+
+    /// A preempted turn keeps its replay point in use, suspended or not
+    /// (Splash `Engine::Request::replayPoint`), through a resume that waits.
+    /// Mutation: end the use in `handle_preempted`
+    /// (`scheduled_turn_closed`) → red (`None`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn preemption_keeps_the_use() {
+        let Some((mut state, r)) = yielding_pair() else {
+            return;
+        };
+        let used = |state: &HybridSchedulerState<Qwen35Inner>| {
+            matches!(
+                state.inner.gdn_in_use_for_test(2),
+                Some(UnitKey::Ladder { final_block_hash, .. }) if *final_block_hash == r
+            )
+        };
+        assert!(used(&state));
+        state.try_resume_preempted();
+        assert_eq!(state.scheduler.running().len(), 1, "the resume waits");
+        assert!(used(&state));
+    }
+
+    /// The kept prompt wins over the in-use reach: a prompt that restores
+    /// R keeps it out of the in-use units too.
+    /// Mutation: drop `kept.keeps` from `gdn_unit_excluded` for in-use
+    /// units → red (R offered).
+    #[test]
+    fn kept_prompt_beats_in_use_reach() {
+        let Some(mut state) = qwen35_pool_state(4, 4, passing()) else {
+            return;
+        };
+        let r = *rung(&mut state, 30, 2, 0).last().expect("R");
+        state.inner.use_ladder_entry_for_test(7, r);
+        let mut prompt = tokens_of(30, 2);
+        prompt.push(1);
+        let skip = HashSet::new();
+        let offered = |keep: crate::models::qwen3_5::dflash2_turn::Keep<'_>, in_use| {
+            state
+                .inner
+                .oldest_gdn_state_unit(true, &skip, keep, in_use)
+                .map(|unit| unit.key)
+        };
+        let keep = crate::models::qwen3_5::dflash2_turn::Keep {
+            tokens: &prompt,
+            keys: None,
+        };
+        assert_eq!(offered(keep, true), None);
+        assert_eq!(offered(keep, false), None);
+        assert!(offered(Default::default(), true).is_some());
+        assert_eq!(offered(Default::default(), false), None);
+    }
+
+    /// A taken in-use point keeps its use, as Splash's `StateUse` outlives
+    /// the state: a rung rebuilt on the same chain is in use again until
+    /// the turn ends.
+    /// Mutation: drop the turn's record in `drop_gdn_state` → red (`None`).
+    #[test]
+    fn taken_in_use_point_keeps_its_use() {
+        let Some(mut state) = qwen35_pool_state(5, 5, passing()) else {
+            return;
+        };
+        hold(&mut state, 9, 3);
+        let r = *rung(&mut state, 30, 2, 0).last().expect("R");
+        state.inner.use_ladder_entry_for_test(7, r);
+        refused(&mut state, 9, 3, 1);
+        assert!(state.reclaim_for_blocked_step(9, true));
+        assert!(!has_rung(&state, r));
+        assert!(state.inner.gdn_in_use_for_test(7).is_some());
+        let rebuilt = *rung(&mut state, 30, 2, 0).last().expect("R again");
+        assert_eq!(rebuilt, r);
+        let skip = HashSet::new();
+        let offered = |state: &HybridSchedulerState<Qwen35Inner>, in_use| {
+            state
+                .inner
+                .oldest_gdn_state_unit(false, &skip, Default::default(), in_use)
+                .map(|unit| unit.key)
+        };
+        assert_eq!(offered(&state, false), None, "the rebuilt rung is in use");
+        assert!(offered(&state, true).is_some());
+        state.inner.end_gdn_use(7);
+        assert!(offered(&state, false).is_some());
+    }
+
+    /// MoE twin of `lone_turn_takes_a_suspended_turns_replay_point_last`.
+    /// Mutation: `handle_blocked_alone` reclaims with `reach_in_use` false
+    /// → red (T fails `capacity_exhausted`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn moe_lone_turn_takes_a_suspended_turns_replay_point_last() {
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return;
+        }
+        let mut inner = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE");
+        let mut adapter = tiny_paged_adapter_with(Arc::clone(&inner.cache_recency), 5, 5);
+        adapter.set_grow_headroom_probe_override(Some(passing()));
+        inner.paged_adapter = Some(adapter);
+        let mut state = HybridSchedulerState::new(inner).expect("construct MoE scheduler");
+        let (turn, mut result) = running_turn(&mut state, 1);
+        let tokens = tokens_of(30, 2);
+        let hashes = cache_dead_chain(&state, &tokens);
+        let r = *hashes.last().expect("R");
+        state
+            .inner
+            .push_ladder_entry_for_test(32, hashes, tokens, Vec::new(), 0);
+        state.inner.use_ladder_entry_for_test(7, r);
+        let adapter = state.inner.paged_adapter().expect("paged adapter");
+        assert!(adapter.at_cap());
+        assert_eq!(adapter.takeable_blocks(), 0);
+        adapter.refuse_for_test(1, 1);
+        settle_blocked_step(&mut state, turn);
+        assert!(
+            matches!(
+                result.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the turn is still running"
+        );
+        assert_eq!(state.scheduler.running().len(), 1);
+        assert!(
+            !state
+                .inner
+                .ladder_entries_for_test()
+                .iter()
+                .any(|&(_, hash, _)| hash == r),
+            "R was taken"
+        );
     }
 
     /// Marked chains are out of the snapshot's reclaimable blocks.
@@ -7755,7 +8066,7 @@ pub(crate) mod tests {
             .expect("hold two blocks");
         assert!(adapter.reserve_rows_for(9, 48).is_err());
         clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(9));
+        assert!(state.reclaim_for_blocked_step(9, false));
         assert_eq!(reclaim_log(), vec![GrowReclaim::Ladder]);
     }
 

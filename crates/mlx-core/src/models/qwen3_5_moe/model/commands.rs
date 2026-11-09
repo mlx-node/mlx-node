@@ -216,10 +216,11 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
         self.sync_gdn_state_marks();
     }
 
-    fn state_reach_bytes(&self) -> u64 {
+    fn state_reach_bytes(&self, in_use: bool) -> u64 {
         crate::models::qwen3_5::dflash2_turn::state_reach_bytes(
             self,
             crate::models::qwen3_5::dflash2_turn::Keep::default(),
+            in_use,
         )
     }
 
@@ -231,12 +232,14 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
         &self,
         at_cap: bool,
         skip: &std::collections::HashSet<crate::engine::reclaim::UnitKey>,
+        in_use: bool,
     ) -> Option<crate::engine::reclaim::Unit> {
         crate::models::qwen3_5::dflash2_turn::oldest_state_unit(
             self,
             at_cap,
             skip,
             crate::models::qwen3_5::dflash2_turn::Keep::default(),
+            in_use,
         )
     }
 

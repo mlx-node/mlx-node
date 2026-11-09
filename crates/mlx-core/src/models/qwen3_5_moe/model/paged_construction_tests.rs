@@ -2253,6 +2253,58 @@ fn moe_prompt_grow_counts_no_block_for_its_marked_hit() {
     assert_eq!(probes.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
 
+/// The MoE prompt grow on a 4-block pool, max 8, 4-block extents, its 4
+/// blocks a chain a ladder rung marks; an older history entry holds bytes,
+/// so the grow probe passes once it goes. The 5-block prompt's grow clamps
+/// at the max and adds 4: still short, so the take goes on to the rung.
+/// Mutation: count a passing grow as met in `kv_need_met` → red (the take
+/// stops after `History`, the rung stays).
+#[test]
+fn moe_capped_grow_keeps_taking_until_the_ladder_covers() {
+    let Some(mut inner) = moe_reclaim_inner("moe_capped_grow_keeps_taking_until_the_ladder_covers")
+    else {
+        return;
+    };
+    install_moe_pool(&mut inner, 4, 8, moe_probe_after(1));
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .set_extent_growth(4);
+    let block_size = moe_block_size(&inner);
+    inner.gdn_last_history_checkpoint = Some(MoeGdnHistoryCheckpoint {
+        owner_id: inner.active_cache_owner_id.clone(),
+        image_key: None,
+        tokens: vec![5, 6, 7],
+        caches: moe_ready_caches(&inner.config),
+        last_used: inner.cache_recency.next(),
+    });
+    let chain = moe_chain_tokens(20, 4, block_size);
+    let hashes = moe_cache_chain(&inner, &chain);
+    let stamp = inner.cache_recency.next();
+    moe_push_rung(&mut inner, chain, hashes, stamp);
+    assert_eq!(
+        inner
+            .paged_adapter
+            .as_ref()
+            .expect("adapter")
+            .takeable_blocks(),
+        0
+    );
+    let prompt = moe_chain_tokens(21, 5, block_size);
+    let keys = moe_keys(&prompt, block_size);
+    clear_grow_log();
+    crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(
+        &mut inner, &prompt, &keys, 0,
+    );
+    use crate::models::qwen3_5::dflash2_turn::GrowReclaim;
+    assert_eq!(grow_log(), vec![GrowReclaim::History, GrowReclaim::Ladder]);
+    assert!(moe_ladder(&inner).is_empty());
+    let adapter = inner.paged_adapter.as_ref().expect("adapter");
+    assert_eq!(adapter.layer_kv_pool().num_blocks(), 8);
+    assert!(adapter.takeable_blocks() >= 5);
+}
+
 /// At the cap only the deepest of one owner's nested MoE rungs is a unit.
 /// Mutation: filter on the final block being cache-only instead of
 /// `tip_marks` in MoE `oldest_gdn_state_unit` → red (the older, shallower
@@ -2660,8 +2712,13 @@ fn moe_a_released_serial_turn_ends_the_replay_points_use() {
         // The MoE save runs no frontier check, so a released reuse turn
         // saves no history here.
         let saved: &[u32] = if reuse { &[] } else { &prompt };
-        PagedBackend::finalize_paged_turn(&mut inner, false, 0);
-        PagedBackend::save_paged_history(&mut inner, saved, &[], false, reuse).expect("the save");
+        {
+            // The finalize bumps the global sidecar capture counter.
+            let _serialized = crate::cold_tier::sidecar_counter_test_lock();
+            PagedBackend::finalize_paged_turn(&mut inner, false, 0);
+            PagedBackend::save_paged_history(&mut inner, saved, &[], false, reuse)
+                .expect("the save");
+        }
         assert!(inner.gdn_in_use.is_empty(), "reuse {reuse}");
         let stamp_of = |inner: &Qwen35MoeInner, hash: u64| {
             moe_ladder(inner)
@@ -2682,6 +2739,7 @@ fn moe_a_released_serial_turn_ends_the_replay_points_use() {
                 false,
                 &skip,
                 crate::models::qwen3_5::dflash2_turn::Keep::default(),
+                false,
             )
             .map(|unit| unit.key);
         assert_eq!(next, Some(e_key), "reuse {reuse}");

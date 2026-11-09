@@ -15,6 +15,10 @@ pub(crate) struct KvNeed {
     pub over_takeable: bool,
     /// The caller ran the met check just now: its grow and room stand.
     pub checked: bool,
+    /// The lone running turn's need reaches the states turns use, after
+    /// every ordinary unit (Splash `Engine::growthClass`,
+    /// `ReclaimClass::InUse`).
+    pub reach_in_use: bool,
 }
 
 impl KvNeed {
@@ -23,6 +27,7 @@ impl KvNeed {
             blocks,
             over_takeable: false,
             checked: false,
+            reach_in_use: false,
         }
     }
 }
@@ -106,9 +111,11 @@ pub(crate) trait KvReclaim {
     fn grow_room(&self) -> u32;
     fn before_count(&mut self, _at_cap: bool) {}
     fn sync_marks(&mut self) {}
-    fn reach(&self, at_cap: bool) -> Reach;
+    /// What the units of the need's classes free; may over-count.
+    fn reach(&self, at_cap: bool, in_use: bool) -> Reach;
     fn compact_one(&mut self) -> bool;
-    fn oldest_state(&self, at_cap: bool, skip: &HashSet<UnitKey>) -> Option<Unit>;
+    /// The oldest state unit of one class: in use by a turn, or not.
+    fn oldest_state(&self, at_cap: bool, skip: &HashSet<UnitKey>, in_use: bool) -> Option<Unit>;
     fn oldest_kv(&self, _at_cap: bool, _skip: &HashSet<UnitKey>) -> Option<Unit> {
         None
     }
@@ -126,17 +133,21 @@ pub(crate) fn older_first(state: Option<Unit>, kv: Option<Unit>) -> Option<Unit>
 
 /// Splash `MemoryLedger::free` for a KV need. Marks are synced first: a
 /// stale mark would keep a chain out of both the met check and the count.
-/// A unit that frees nothing is passed over (`MemoryLedger::take`). Every reach term may over-count,
-/// never under-count: an under-count fails a turn a take would save.
+/// A unit that frees nothing is passed over (`MemoryLedger::take`); a grow
+/// in a met miss can reach the cap, so the cap is read again after each.
+/// Every reach term may over-count, never under-count: an under-count
+/// fails a turn a take would save. A need that reaches in-use states takes
+/// them only once no ordinary unit is left, oldest first (Splash
+/// `Cache::nextUnit`'s `Phase::InUse`).
 pub(crate) fn free_for_kv<U: KvReclaim>(units: &mut U, need: KvNeed) -> Freed {
     crate::array::clear_cache();
     units.sync_marks();
     if !need.checked && units.met(need) {
         return Freed::Met;
     }
-    let at_cap = units.at_cap();
+    let mut at_cap = units.at_cap();
     units.before_count(at_cap);
-    let reach = units.reach(at_cap);
+    let reach = units.reach(at_cap, need.reach_in_use);
     let grow = if at_cap {
         0
     } else {
@@ -151,27 +162,35 @@ pub(crate) fn free_for_kv<U: KvReclaim>(units: &mut U, need: KvNeed) -> Freed {
     }
     let mut skip = HashSet::new();
     let mut took = false;
+    let mut met = false;
     loop {
         let freed = if !at_cap && units.compact_one() {
             true
         } else {
-            let state = units.oldest_state(at_cap, &skip);
+            let state = units.oldest_state(at_cap, &skip, false);
             let kv = units.oldest_kv(at_cap, &skip);
             let Some(unit) = older_first(state, kv) else {
                 break;
             };
-            let freed = units.take(&unit.key);
-            if !freed {
-                units.sync_marks();
-                skip.insert(unit.key);
-            }
-            freed
+            take_one(units, unit.key, &mut skip)
         };
         if freed {
             took = true;
             if units.met(need) {
+                met = true;
                 break;
             }
+            at_cap = units.at_cap();
+        }
+    }
+    while need.reach_in_use && !met {
+        let Some(unit) = units.oldest_state(at_cap, &skip, true) else {
+            break;
+        };
+        if take_one(units, unit.key, &mut skip) {
+            took = true;
+            met = units.met(need);
+            at_cap = units.at_cap();
         }
     }
     if took {
@@ -180,6 +199,16 @@ pub(crate) fn free_for_kv<U: KvReclaim>(units: &mut U, need: KvNeed) -> Freed {
     } else {
         Freed::Short
     }
+}
+
+/// Takes `key`; one that frees nothing is passed over from then on.
+fn take_one<U: KvReclaim>(units: &mut U, key: UnitKey, skip: &mut HashSet<UnitKey>) -> bool {
+    let freed = units.take(&key);
+    if !freed {
+        units.sync_marks();
+        skip.insert(key);
+    }
+    freed
 }
 
 #[cfg(test)]
@@ -214,7 +243,7 @@ mod tests {
         fn grow_room(&self) -> u32 {
             0
         }
-        fn reach(&self, _at_cap: bool) -> Reach {
+        fn reach(&self, _at_cap: bool, _in_use: bool) -> Reach {
             Reach {
                 blocks: self
                     .states
@@ -227,7 +256,15 @@ mod tests {
         fn compact_one(&mut self) -> bool {
             false
         }
-        fn oldest_state(&self, _at_cap: bool, skip: &HashSet<UnitKey>) -> Option<Unit> {
+        fn oldest_state(
+            &self,
+            _at_cap: bool,
+            skip: &HashSet<UnitKey>,
+            in_use: bool,
+        ) -> Option<Unit> {
+            if in_use {
+                return None;
+            }
             self.states
                 .iter()
                 .filter(|&&(id, _, _)| !skip.contains(&UnitKey::Owner(id)))
@@ -310,6 +347,210 @@ mod tests {
         assert_eq!(free_for_kv(&mut short, KvNeed::in_place(3)), Freed::Short);
         assert!(short.taken.is_empty());
         assert_eq!(clear_cache_calls() - before, 1);
+    }
+
+    /// Below the cap: two store steps that free bytes and an owner that
+    /// frees a block. The met miss after the first take grows to the cap.
+    struct CapFake {
+        at_cap: bool,
+        takeable: u32,
+        stores: Vec<u64>,
+        owner: Option<u64>,
+        taken: Vec<UnitKey>,
+    }
+
+    fn store_key(entry: u64) -> UnitKey {
+        UnitKey::Store(StoreStep {
+            entry,
+            kind: crate::models::qwen3_5::dflash2_state::store::StoreStepKind::DropEnd,
+        })
+    }
+
+    impl KvReclaim for CapFake {
+        fn at_cap(&self) -> bool {
+            self.at_cap
+        }
+        fn takeable(&self) -> u32 {
+            self.takeable
+        }
+        fn ungrown(&self) -> u32 {
+            if self.at_cap { 0 } else { 4 }
+        }
+        fn bytes_per_block(&self) -> u64 {
+            1
+        }
+        fn met(&mut self, need: KvNeed) -> bool {
+            if !self.taken.is_empty() {
+                self.at_cap = true;
+            }
+            self.takeable >= need.blocks
+        }
+        fn grow_room(&self) -> u32 {
+            0
+        }
+        fn reach(&self, at_cap: bool, _in_use: bool) -> Reach {
+            Reach {
+                blocks: u64::from(self.owner.is_some()),
+                bytes: if at_cap { 0 } else { self.stores.len() as u64 },
+            }
+        }
+        fn compact_one(&mut self) -> bool {
+            false
+        }
+        fn oldest_state(
+            &self,
+            at_cap: bool,
+            skip: &HashSet<UnitKey>,
+            in_use: bool,
+        ) -> Option<Unit> {
+            if at_cap || in_use {
+                return None;
+            }
+            self.stores
+                .iter()
+                .map(|&entry| Unit {
+                    stamp: entry,
+                    key: store_key(entry),
+                })
+                .find(|unit| !skip.contains(&unit.key))
+        }
+        fn oldest_kv(&self, _at_cap: bool, skip: &HashSet<UnitKey>) -> Option<Unit> {
+            self.owner
+                .map(|stamp| Unit {
+                    stamp,
+                    key: UnitKey::Owner(9),
+                })
+                .filter(|unit| !skip.contains(&unit.key))
+        }
+        fn take(&mut self, key: &UnitKey) -> bool {
+            self.taken.push(key.clone());
+            match key {
+                UnitKey::Store(step) => {
+                    self.stores.retain(|&entry| entry != step.entry);
+                    true
+                }
+                UnitKey::Owner(_) => {
+                    self.owner = None;
+                    self.takeable += 1;
+                    true
+                }
+                _ => false,
+            }
+        }
+    }
+
+    /// A grow inside a met miss reaches the cap: the newer store step
+    /// frees no block there and stays.
+    /// Mutation: read `at_cap` once in `free_for_kv` → red (store 2 taken).
+    #[test]
+    fn walk_rereads_the_cap_after_a_grow() {
+        let mut fake = CapFake {
+            at_cap: false,
+            takeable: 0,
+            stores: vec![1, 2],
+            owner: Some(3),
+            taken: Vec::new(),
+        };
+        assert_eq!(free_for_kv(&mut fake, KvNeed::in_place(1)), Freed::Took);
+        assert_eq!(fake.taken, vec![store_key(1), UnitKey::Owner(9)]);
+        assert_eq!(fake.stores, vec![2], "store 2 frees no block at the cap");
+    }
+
+    /// At the cap: ordinary units and units a turn uses, `(id, stamp)`,
+    /// each freeing one block.
+    #[derive(Default)]
+    struct UseFake {
+        takeable: u32,
+        ordinary: Vec<(SeqId, u64)>,
+        used: Vec<(SeqId, u64)>,
+        taken: Vec<SeqId>,
+    }
+
+    impl KvReclaim for UseFake {
+        fn at_cap(&self) -> bool {
+            true
+        }
+        fn takeable(&self) -> u32 {
+            self.takeable
+        }
+        fn ungrown(&self) -> u32 {
+            0
+        }
+        fn bytes_per_block(&self) -> u64 {
+            1
+        }
+        fn met(&mut self, need: KvNeed) -> bool {
+            self.takeable >= need.blocks
+        }
+        fn grow_room(&self) -> u32 {
+            0
+        }
+        fn reach(&self, _at_cap: bool, in_use: bool) -> Reach {
+            let used = if in_use { self.used.len() } else { 0 };
+            Reach {
+                blocks: (self.ordinary.len() + used) as u64,
+                bytes: 0,
+            }
+        }
+        fn compact_one(&mut self) -> bool {
+            false
+        }
+        fn oldest_state(
+            &self,
+            _at_cap: bool,
+            skip: &HashSet<UnitKey>,
+            in_use: bool,
+        ) -> Option<Unit> {
+            if in_use { &self.used } else { &self.ordinary }
+                .iter()
+                .map(|&(id, stamp)| Unit {
+                    stamp,
+                    key: UnitKey::Owner(id),
+                })
+                .filter(|unit| !skip.contains(&unit.key))
+                .min_by_key(|unit| unit.stamp)
+        }
+        fn take(&mut self, key: &UnitKey) -> bool {
+            let UnitKey::Owner(id) = key else {
+                return false;
+            };
+            self.ordinary.retain(|&(unit, _)| unit != *id);
+            self.used.retain(|&(unit, _)| unit != *id);
+            self.taken.push(*id);
+            self.takeable += 1;
+            true
+        }
+    }
+
+    /// A need that reaches in-use units counts them and takes every ordinary
+    /// unit first, though the in-use one is older; one that does not reach
+    /// them neither counts nor takes them.
+    /// Mutations: take in-use units in the first loop by stamp beside the
+    /// ordinary ones → red ([1] ≠ [2]); count with `reach_in_use` false in
+    /// `free_for_kv` → red (the 3-block reach is `Short`).
+    #[test]
+    fn in_use_units_go_after_every_ordinary_unit() {
+        let fake = || UseFake {
+            ordinary: vec![(2, 10), (3, 20)],
+            used: vec![(1, 0)],
+            ..UseFake::default()
+        };
+        let reach = |blocks| KvNeed {
+            reach_in_use: true,
+            ..KvNeed::in_place(blocks)
+        };
+        let mut one = fake();
+        assert_eq!(free_for_kv(&mut one, reach(1)), Freed::Took);
+        assert_eq!(one.taken, vec![2]);
+        let mut all = fake();
+        assert_eq!(free_for_kv(&mut all, reach(3)), Freed::Took);
+        assert_eq!(all.taken, vec![2, 3, 1]);
+        let mut ordinary = fake();
+        assert_eq!(free_for_kv(&mut ordinary, KvNeed::in_place(2)), Freed::Took);
+        assert_eq!(ordinary.taken, vec![2, 3], "the used unit stays");
+        let mut short = fake();
+        assert_eq!(free_for_kv(&mut short, KvNeed::in_place(3)), Freed::Short);
+        assert!(short.taken.is_empty());
     }
 
     /// Mutation: record the need in `MetBefore::retry` only on `Met` → red

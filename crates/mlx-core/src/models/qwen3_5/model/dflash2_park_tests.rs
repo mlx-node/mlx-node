@@ -1118,6 +1118,75 @@ fn cap_reclaim_takes_the_deepest_rung_only() -> Result<()> {
     Ok(())
 }
 
+/// A 4-block pool, max 8, 4-block extents, its 4 blocks a chain a ladder
+/// rung marks; an older history entry holds bytes, so the grow probe
+/// passes once it goes. The 5-block step's grow clamps at the max and adds
+/// 4: still short, so the take goes on to the rung.
+/// Mutation: count a passing grow as met in `kv_need_met` → red (the
+/// retry is refused the same need, `MetBefore` stops the loop: `Err`).
+#[test]
+fn capped_grow_keeps_taking_until_the_ladder_covers() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let tokenizer = tokenizer();
+    let mut inner = fixture(0xDFA5_1811);
+    run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(11), true, 12)?;
+    let caches = restorable_caches(&inner);
+    inner.dflash2_states.store.clear();
+    inner.dflash2_context = None;
+    install_pool(&mut inner, 4, 8, probe_after(1))?;
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .set_extent_growth(4);
+    let block_size = pool_block_size(&inner);
+    inner.gdn_last_history_checkpoint = Some(DenseGdnHistoryCheckpoint {
+        owner_id: inner.active_cache_owner_id.clone(),
+        image_key: None,
+        tokens: vec![5, 6, 7],
+        caches: restorable_caches_from(&inner, &caches),
+        last_used: inner.cache_recency.next(),
+    });
+    let chain = chain_tokens(20, 4, block_size);
+    let hashes = cache_chain(&inner, &chain);
+    let stamp = inner.cache_recency.next();
+    push_rung(&mut inner, chain, hashes, stamp);
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .begin_request(1)
+        .map_err(Error::from_reason)?;
+    assert_eq!(
+        inner
+            .paged_adapter
+            .as_ref()
+            .expect("adapter")
+            .takeable_blocks(),
+        0
+    );
+    clear_grow_reclaim_log();
+    let mut runs = 0;
+    paged_step_reclaiming(&mut inner, reserve_step(&mut runs, 1, 5 * block_size))?;
+    assert_eq!(runs, 2);
+    assert_eq!(
+        grow_reclaim_log(),
+        vec![GrowReclaim::History, GrowReclaim::Ladder]
+    );
+    assert_eq!(
+        inner
+            .paged_adapter
+            .as_ref()
+            .expect("adapter")
+            .layer_kv_pool()
+            .num_blocks(),
+        8
+    );
+    Ok(())
+}
+
 /// GDN caches a ladder rung can restore: the live state of a finished
 /// DFlash2 turn.
 fn restorable_caches(inner: &Qwen35Inner) -> Vec<Qwen3_5LayerCache> {
@@ -1206,6 +1275,27 @@ fn rung_key(inner: &Qwen35Inner, prefix_len: u32, final_block_hash: u64) -> Unit
     }
 }
 
+/// The in-use reach counts the bytes of the rung a turn restored from; the
+/// ordinary count leaves them out.
+/// Mutation: ignore `in_use` in dense `gdn_state_bytes` → red (the counts
+/// are equal).
+#[test]
+fn in_use_reach_counts_the_used_rungs_bytes() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let (inner, e_final, _, _) = restored_from_rung(0xDFA5_181C, false)?;
+    let e_key = rung_key(&inner, 2 * pool_block_size(&inner), e_final);
+    assert_eq!(inner.gdn_in_use_for_test(0), Some(&e_key));
+    let ordinary = inner.gdn_state_bytes(Keep::default(), false);
+    let reach = inner.gdn_state_bytes(Keep::default(), true);
+    assert!(
+        reach > ordinary,
+        "in-use reach {reach}, ordinary {ordinary}"
+    );
+    Ok(())
+}
+
 /// The rung a running turn restored from is InUse: a reclaim passes over
 /// it, though it is older than rung F, for the text and the VLM prepare.
 /// Mutation: ignore `gdn_in_use` in `gdn_unit_excluded` → red (E goes
@@ -1220,7 +1310,7 @@ fn a_replay_point_in_use_is_not_a_unit() -> Result<()> {
         let e_key = rung_key(&inner, 2 * pool_block_size(&inner), e_final);
         assert_eq!(inner.gdn_in_use_for_test(0), Some(&e_key), "vlm {vlm}");
         assert!(
-            inner.gdn_state_bytes(Keep::default()) > 0,
+            inner.gdn_state_bytes(Keep::default(), false) > 0,
             "vlm {vlm}: the count must pass"
         );
         clear_grow_reclaim_log();
@@ -1701,14 +1791,18 @@ fn a_released_serial_turn_ends_the_replay_points_use() -> Result<()> {
         let (mut inner, e_final, f_final, prompt) = restored_from_rung(seed, false)?;
         let e_key = rung_key(&inner, 2 * pool_block_size(&inner), e_final);
         assert_eq!(inner.gdn_in_use_for_test(0), Some(&e_key), "reuse {reuse}");
-        crate::engine::backend::PagedBackend::finalize_paged_turn(&mut inner, false, 0);
-        crate::engine::backend::PagedBackend::save_paged_history(
-            &mut inner,
-            &prompt,
-            &[],
-            false,
-            reuse,
-        )?;
+        {
+            // The finalize bumps the global sidecar capture counter.
+            let _serialized = crate::cold_tier::sidecar_counter_test_lock();
+            crate::engine::backend::PagedBackend::finalize_paged_turn(&mut inner, false, 0);
+            crate::engine::backend::PagedBackend::save_paged_history(
+                &mut inner,
+                &prompt,
+                &[],
+                false,
+                reuse,
+            )?;
+        }
         assert_eq!(inner.gdn_in_use_for_test(0), None, "reuse {reuse}");
         let stamp_of = |inner: &Qwen35Inner, hash: u64| {
             inner
@@ -1725,7 +1819,7 @@ fn a_released_serial_turn_ends_the_replay_points_use() -> Result<()> {
         let f_key = rung_key(&inner, pool_block_size(&inner), f_final);
         let skip: std::collections::HashSet<UnitKey> = [f_key, UnitKey::History].into();
         let next = inner
-            .oldest_gdn_state_unit(false, &skip, Keep::default())
+            .oldest_gdn_state_unit(false, &skip, Keep::default(), false)
             .map(|unit| unit.key);
         assert_eq!(next, Some(e_key), "reuse {reuse}");
     }

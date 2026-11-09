@@ -225,18 +225,21 @@ pub(crate) trait DFlash2Target: ChatBackend {
     /// caches now hold this turn's prompt.
     fn on_flat_prefill_done(&mut self) {}
 
-    /// The oldest ladder or history entry a KV need may take.
+    /// The oldest ladder or history entry a KV need may take, of those a
+    /// turn uses (`in_use`) or of the rest.
     fn oldest_gdn_state(
         &self,
         at_cap: bool,
         skip: &HashSet<UnitKey>,
         keep: Keep<'_>,
+        in_use: bool,
     ) -> Option<Unit>;
     /// Drops a ladder or history entry; false when it is gone.
     fn drop_gdn_state(&mut self, key: &UnitKey) -> bool;
     fn sync_gdn_state_marks(&self);
-    /// Bytes of the GDN entries a reclaim may take.
-    fn gdn_state_bytes(&self, keep: Keep<'_>) -> u64;
+    /// Bytes of the GDN entries a reclaim may take, with `in_use` those
+    /// turns use too.
+    fn gdn_state_bytes(&self, keep: Keep<'_>, in_use: bool) -> u64;
     /// Marked cache-only blocks the kept prompt hits.
     fn marked_hit_blocks(&self, keep: Keep<'_>) -> u32;
 
@@ -862,7 +865,7 @@ impl<T: DFlash2Target> KvReclaim for ModelReclaim<'_, T> {
         self.target.sync_gdn_state_marks();
     }
 
-    fn reach(&self, at_cap: bool) -> Reach {
+    fn reach(&self, at_cap: bool, in_use: bool) -> Reach {
         let marked = self
             .target
             .paged_adapter_ref()
@@ -872,7 +875,7 @@ impl<T: DFlash2Target> KvReclaim for ModelReclaim<'_, T> {
             bytes: if at_cap {
                 0
             } else {
-                state_reach_bytes(&*self.target, self.keep)
+                state_reach_bytes(&*self.target, self.keep, in_use)
             },
         }
     }
@@ -881,8 +884,8 @@ impl<T: DFlash2Target> KvReclaim for ModelReclaim<'_, T> {
         compact_one_state(self.target)
     }
 
-    fn oldest_state(&self, at_cap: bool, skip: &HashSet<UnitKey>) -> Option<Unit> {
-        oldest_state_unit(&*self.target, at_cap, skip, self.keep)
+    fn oldest_state(&self, at_cap: bool, skip: &HashSet<UnitKey>, in_use: bool) -> Option<Unit> {
+        oldest_state_unit(&*self.target, at_cap, skip, self.keep, in_use)
     }
 
     fn take(&mut self, key: &UnitKey) -> bool {
@@ -896,13 +899,14 @@ pub(crate) enum Taken {
     Gdn,
 }
 
-/// Bytes every parked state and every GDN entry outside `keep` hold.
-pub(crate) fn state_reach_bytes<T: DFlash2Target>(target: &T, keep: Keep<'_>) -> u64 {
+/// Bytes every parked state and every GDN entry outside `keep` hold; the
+/// entries turns use count only with `in_use`.
+pub(crate) fn state_reach_bytes<T: DFlash2Target>(target: &T, keep: Keep<'_>, in_use: bool) -> u64 {
     let store = target.dflash2_states().store.bytes();
     store
         .state_bytes
         .saturating_add(store.kv_bytes)
-        .saturating_add(target.gdn_state_bytes(keep))
+        .saturating_add(target.gdn_state_bytes(keep, in_use))
 }
 
 /// One lossless store compaction; whether it freed anything.
@@ -930,14 +934,15 @@ pub(crate) fn compact_one_state<T: DFlash2Target>(target: &mut T) -> bool {
 }
 
 /// The oldest state that meets a KV need. At the cap no store step and no
-/// history entry is one: they sit on no block.
+/// history entry is one: they sit on no block. No store step is in use.
 pub(crate) fn oldest_state_unit<T: DFlash2Target>(
     target: &T,
     at_cap: bool,
     skip: &HashSet<UnitKey>,
     keep: Keep<'_>,
+    in_use: bool,
 ) -> Option<Unit> {
-    let store = if at_cap {
+    let store = if at_cap || in_use {
         None
     } else {
         target
@@ -950,7 +955,7 @@ pub(crate) fn oldest_state_unit<T: DFlash2Target>(
             })
             .filter(|unit| !skip.contains(&unit.key))
     };
-    older_first(store, target.oldest_gdn_state(at_cap, skip, keep))
+    older_first(store, target.oldest_gdn_state(at_cap, skip, keep, in_use))
 }
 
 /// Takes one state unit; `None` when it freed nothing. A failed store step
@@ -1063,6 +1068,7 @@ pub(crate) fn ensure_paged_pool_keeping<T: DFlash2Target>(
                 blocks,
                 over_takeable: false,
                 checked: true,
+                reach_in_use: false,
             };
             let freed = free_for_kv(
                 &mut ModelReclaim {
@@ -1363,7 +1369,7 @@ fn flat_kv_in_reach<T: DFlash2Target>(target: &T, live: u64, need: &KvGrowthNeed
         .paged_adapter_ref()
         .map_or(0, PagedKVCacheAdapter::release_reach_bytes);
     live.saturating_add(cut)
-        .saturating_add(state_reach_bytes(target, Keep::default()))
+        .saturating_add(state_reach_bytes(target, Keep::default(), false))
         >= dflash2_kv_headroom_for(need.kv_bytes)
 }
 
@@ -1410,7 +1416,7 @@ fn flat_reclaim_one<T: DFlash2Target>(
         }
     }
     loop {
-        let state = oldest_state_unit(&*target, false, skip, Keep::default());
+        let state = oldest_state_unit(&*target, false, skip, Keep::default(), false);
         let table = target.paged_adapter_ref().and_then(|adapter| {
             if !adapter.extent_within_reach(shortfall) {
                 return None;
@@ -3191,7 +3197,8 @@ mod tests {
                 .expect("the KV grows");
             assert_eq!(inner.dflash2_states.store.bytes().entries, 1, "{name}");
             assert!(
-                state_reach_bytes(&inner, Keep::default()) < dflash2_kv_headroom_for(need.kv_bytes),
+                state_reach_bytes(&inner, Keep::default(), false)
+                    < dflash2_kv_headroom_for(need.kv_bytes),
                 "{name}: the state cannot cover the KV"
             );
             let error = ensure_dflash2_target_rows_with(

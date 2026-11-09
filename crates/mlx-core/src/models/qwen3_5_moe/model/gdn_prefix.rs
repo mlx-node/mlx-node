@@ -1078,15 +1078,18 @@ impl Qwen35MoeInner {
     }
 
     /// A unit the reclaim may not take: a replay point the prompt can
-    /// restore (Splash `VictimQuery::kept`) or in use by a running turn.
+    /// restore (Splash `VictimQuery::kept`), or one outside the class asked
+    /// for: in use by a turn, suspended or not, or not (`in_use`).
     fn gdn_unit_excluded(
         &self,
         key: &UnitKey,
         tokens: &[u32],
         block_hashes: Option<&[u64]>,
         kept: &KeptPoints<'_>,
+        in_use: bool,
     ) -> bool {
-        kept.keeps(tokens, block_hashes) || self.gdn_in_use.values().any(|used| used == key)
+        kept.keeps(tokens, block_hashes)
+            || self.gdn_in_use.values().any(|used| used == key) != in_use
     }
 
     fn kept_points<'a>(&self, keep: Keep<'a>) -> KeptPoints<'a> {
@@ -1114,6 +1117,7 @@ impl Qwen35MoeInner {
         at_cap: bool,
         skip: &HashSet<UnitKey>,
         keep: Keep<'_>,
+        in_use: bool,
     ) -> Option<Unit> {
         let kept = self.kept_points(keep);
         let tips = at_cap.then(|| {
@@ -1131,8 +1135,13 @@ impl Qwen35MoeInner {
             })
             .map(|entry| (entry, Self::ladder_key(entry)))
             .filter(|(entry, key)| {
-                !self.gdn_unit_excluded(key, &entry.tokens, Some(&entry.block_hashes), &kept)
-                    && !skip.contains(key)
+                !self.gdn_unit_excluded(
+                    key,
+                    &entry.tokens,
+                    Some(&entry.block_hashes),
+                    &kept,
+                    in_use,
+                ) && !skip.contains(key)
             })
             .map(|(entry, key)| Unit {
                 stamp: entry.last_used,
@@ -1145,7 +1154,7 @@ impl Qwen35MoeInner {
             self.gdn_last_history_checkpoint
                 .as_ref()
                 .filter(|entry| {
-                    !self.gdn_unit_excluded(&UnitKey::History, &entry.tokens, None, &kept)
+                    !self.gdn_unit_excluded(&UnitKey::History, &entry.tokens, None, &kept, in_use)
                 })
                 .map(|entry| Unit {
                     stamp: entry.last_used,
@@ -1220,29 +1229,56 @@ impl Qwen35MoeInner {
         adapter.cache_only_count(hashes)
     }
 
-    /// Bytes of the GDN arrays the entries a reclaim may take hold.
-    pub(crate) fn gdn_state_bytes(&self, keep: Keep<'_>) -> u64 {
+    /// Bytes of the GDN arrays the entries a reclaim may take hold; with
+    /// `in_use` the entries turns use count too (Splash
+    /// `StateCache::reclaims`).
+    pub(crate) fn gdn_state_bytes(&self, keep: Keep<'_>, in_use: bool) -> u64 {
         let kept = self.kept_points(keep);
+        let counted = |key: &UnitKey, tokens: &[u32], block_hashes: Option<&[u64]>| {
+            !kept.keeps(tokens, block_hashes)
+                && (in_use || !self.gdn_in_use.values().any(|used| used == key))
+        };
         let ladder = self
             .gdn_prefix_checkpoints
             .iter()
             .filter(|entry| {
-                !self.gdn_unit_excluded(
+                counted(
                     &Self::ladder_key(entry),
                     &entry.tokens,
                     Some(&entry.block_hashes),
-                    &kept,
                 )
             })
             .map(|entry| Qwen3_5LayerCache::linear_state_bytes(&entry.caches));
         let history = self
             .gdn_last_history_checkpoint
             .as_ref()
-            .filter(|entry| !self.gdn_unit_excluded(&UnitKey::History, &entry.tokens, None, &kept))
+            .filter(|entry| counted(&UnitKey::History, &entry.tokens, None))
             .map(|entry| Qwen3_5LayerCache::linear_state_bytes(&entry.caches));
         ladder
             .chain(history)
             .fold(0u64, |sum, bytes| sum.saturating_add(bytes))
+    }
+
+    /// `seq_id` uses the ladder entry on `final_block_hash`, as a prepare
+    /// that restored from it records.
+    #[cfg(test)]
+    pub(crate) fn use_ladder_entry_for_test(&mut self, seq_id: SeqId, final_block_hash: u64) {
+        let key = self
+            .gdn_prefix_checkpoints
+            .iter()
+            .find(|entry| entry.final_block_hash == final_block_hash)
+            .map(Self::ladder_key)
+            .expect("a ladder entry on the hash");
+        self.gdn_in_use.insert(seq_id, key);
+    }
+
+    /// `(prefix_len, final_block_hash, last_used)` of every ladder entry.
+    #[cfg(test)]
+    pub(crate) fn ladder_entries_for_test(&self) -> Vec<(u32, u64, u64)> {
+        self.gdn_prefix_checkpoints
+            .iter()
+            .map(|entry| (entry.prefix_len, entry.final_block_hash, entry.last_used))
+            .collect()
     }
 
     #[cfg(test)]
