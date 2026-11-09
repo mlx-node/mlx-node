@@ -49,7 +49,7 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@fastify/busboy": "^3.2.3",
+    "@fastify/busboy": "^3.2.5",
     "@mlx-node/asr": "workspace:*",
     "@mlx-node/core": "workspace:*",
     "@mlx-node/lm": "workspace:*",

@@ -8,9 +8,9 @@
     "@mlx-node/trl": "workspace:*",
     "@mlx-node/tts": "workspace:*",
     "@mlx-node/vlm": "workspace:*",
-    "@napi-rs/image": "1.14.0",
-    "@openrouter/ai-sdk-provider": "^3.0.0",
-    "ai": "^7.0.85",
-    "zod": "^4.5.4"
+    "@napi-rs/image": "1.16.0",
+    "@openrouter/ai-sdk-provider": "^3.1.0",
+    "ai": "^7.0.166",
+    "zod": "^4.6.7"
   }
 }
