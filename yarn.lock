@@ -704,7 +704,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@inquirer/prompts@npm:^8.7.5":
+"@inquirer/prompts@npm:^8.5.2, @inquirer/prompts@npm:^8.7.5":
   version: 8.7.5
   resolution: "@inquirer/prompts@npm:8.7.5"
   dependencies:
@@ -919,7 +919,7 @@ __metadata:
   resolution: "@mlx-node/core@workspace:packages/core"
   dependencies:
     "@mlx-node/core-darwin-arm64": "workspace:*"
-    "@napi-rs/cli": "npm:^3.10.12"
+    "@napi-rs/cli": "npm:~3.8.6"
     "@oxc-node/cli": "npm:^1.0.1"
     vite-plus: "catalog:"
   dependenciesMeta:
@@ -1072,26 +1072,26 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@napi-rs/cli@npm:^3.10.12":
-  version: 3.10.12
-  resolution: "@napi-rs/cli@npm:3.10.12"
+"@napi-rs/cli@npm:~3.8.6":
+  version: 3.8.6
+  resolution: "@napi-rs/cli@npm:3.8.6"
   dependencies:
-    "@inquirer/prompts": "npm:^8.7.5"
-    "@napi-rs/cross-toolchain": "npm:^1.0.5"
-    "@napi-rs/wasm-tools": "npm:^1.1.2"
+    "@inquirer/prompts": "npm:^8.5.2"
+    "@napi-rs/cross-toolchain": "npm:^1.0.3"
+    "@napi-rs/wasm-tools": "npm:^1.1.0"
     "@octokit/rest": "npm:^22.0.1"
     clipanion: "npm:^4.0.0-rc.4"
     colorette: "npm:^2.0.20"
-    es-toolkit: "npm:^1.53.1"
-    js-yaml: "npm:^5.5.0"
-    obug: "npm:^3.0.0"
-    semver: "npm:^7.8.6"
+    es-toolkit: "npm:^1.47.0"
+    js-yaml: "npm:^4.2.0"
+    obug: "npm:^2.1.2"
+    semver: "npm:^7.8.2"
     typanion: "npm:^3.14.0"
     typescript: "npm:^6.0.3"
   peerDependencies:
-    "@emnapi/core": ^1.7.1 || ^2.0.0-beta.2
-    "@emnapi/runtime": ^1.7.1 || ^2.0.0-beta.2
-    emnapi: ^1.7.1 || ^2.0.0-beta.2
+    "@emnapi/core": ^1.7.1 || ^2.0.0-alpha.4
+    "@emnapi/runtime": ^1.7.1 || ^2.0.0-alpha.4
+    emnapi: ^1.7.1 || ^2.0.0-alpha.4
   peerDependenciesMeta:
     "@emnapi/core":
       optional: true
@@ -1102,11 +1102,11 @@ __metadata:
   bin:
     napi: dist/cli.js
     napi-raw: cli.mjs
-  checksum: 10c0/e5d6f5ee0d04fb910ea4fb52b1faeac329f34df3c05252b3b4abb2a6f290ed774e09bbbe0ac7c01e71076ed6bc24969a76782594604a71eba4f0ba66aedf21fe
+  checksum: 10c0/a6b3c547598ccc105498cfffa66a095ca9a74327e884e54332bc32b1e7826c4adcc621f5820136f9483ff3fb184a8d270eceb09b72d8170abf6ff2f47649e2cd
   languageName: node
   linkType: hard
 
-"@napi-rs/cross-toolchain@npm:^1.0.5":
+"@napi-rs/cross-toolchain@npm:^1.0.3":
   version: 1.0.5
   resolution: "@napi-rs/cross-toolchain@npm:1.0.5"
   dependencies:
@@ -2029,7 +2029,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/wasm-tools@npm:^1.1.2":
+"@napi-rs/wasm-tools@npm:^1.1.0":
   version: 1.1.2
   resolution: "@napi-rs/wasm-tools@npm:1.1.2"
   dependencies:
@@ -4831,13 +4831,6 @@ __metadata:
   languageName: node
   linkType: hard
 
-"argparse@npm:^3.0.3":
-  version: 3.0.4
-  resolution: "argparse@npm:3.0.4"
-  checksum: 10c0/845346e39e677b46f8558cece7c8dad1f7045f8b86af33356d8565b26a16940bf770a14a51d6da40ce76554a141e0e95b514d055d1da17a2f1b42df7d523fa0f
-  languageName: node
-  linkType: hard
-
 "aria-hidden@npm:^1.2.4":
   version: 1.2.6
   resolution: "aria-hidden@npm:1.2.6"
@@ -5939,7 +5932,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"es-toolkit@npm:^1.39.3, es-toolkit@npm:^1.39.7, es-toolkit@npm:^1.53.1":
+"es-toolkit@npm:^1.39.3, es-toolkit@npm:^1.39.7, es-toolkit@npm:^1.47.0":
   version: 1.53.2
   resolution: "es-toolkit@npm:1.53.2"
   dependenciesMeta:
@@ -6772,7 +6765,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"js-yaml@npm:^4.1.0, js-yaml@npm:^4.3.0":
+"js-yaml@npm:^4.1.0, js-yaml@npm:^4.2.0, js-yaml@npm:^4.3.0":
   version: 4.3.2
   resolution: "js-yaml@npm:4.3.2"
   dependencies:
@@ -6780,17 +6773,6 @@ __metadata:
   bin:
     js-yaml: bin/js-yaml.js
   checksum: 10c0/dedd34c2e8fef1d504687f1bc94ed0ee1311a1f78770fa2800352c6d59c635ccf555009d74e9afe529ae62199da2b1ccef30e53dc84dcd8d2d8187c22574bc97
-  languageName: node
-  linkType: hard
-
-"js-yaml@npm:^5.5.0":
-  version: 5.5.0
-  resolution: "js-yaml@npm:5.5.0"
-  dependencies:
-    argparse: "npm:^3.0.3"
-  bin:
-    js-yaml: bin/js-yaml.mjs
-  checksum: 10c0/311619f44dd788657e9b81d4b5c60ff367441f364045e3796bc604a41f25819852748fb173ae82f2553d53cb609d7fdb79e0a74148892cb2c085eebe91839b53
   languageName: node
   linkType: hard
 
@@ -7795,7 +7777,7 @@ __metadata:
     "@mlx-node/trl": "workspace:*"
     "@mlx-node/tts": "workspace:*"
     "@mlx-node/vlm": "workspace:*"
-    "@napi-rs/cli": "npm:^3.10.12"
+    "@napi-rs/cli": "npm:~3.8.6"
     "@napi-rs/simple-git": "npm:^1.2.0"
     "@oxc-node/cli": "npm:^1.0.1"
     "@oxc-node/core": "npm:^1.0.1"
@@ -7939,6 +7921,13 @@ __metadata:
   version: 1.1.1
   resolution: "object-keys@npm:1.1.1"
   checksum: 10c0/b11f7ccdbc6d406d1f186cdadb9d54738e347b2692a14439ca5ac70c225fa6db46db809711b78589866d47b25fc3e8dee0b4c722ac751e11180f9380e3d8601d
+  languageName: node
+  linkType: hard
+
+"obug@npm:^2.1.2":
+  version: 2.2.1
+  resolution: "obug@npm:2.2.1"
+  checksum: 10c0/8a7c001847d880fa6ba83c7bbee6a80fd271ee628439cd508c8647d53b217abb1759e2d5e4aaeb09a35d0a274bdb225a0a5a78eded3213d63e656153cf411b63
   languageName: node
   linkType: hard
 
@@ -8981,7 +8970,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"semver@npm:^7.3.2, semver@npm:^7.3.5, semver@npm:^7.6.3, semver@npm:^7.7.1, semver@npm:^7.7.2, semver@npm:^7.8.5, semver@npm:^7.8.6":
+"semver@npm:^7.3.2, semver@npm:^7.3.5, semver@npm:^7.6.3, semver@npm:^7.7.1, semver@npm:^7.7.2, semver@npm:^7.8.2, semver@npm:^7.8.5, semver@npm:^7.8.6":
   version: 7.8.6
   resolution: "semver@npm:7.8.6"
   bin:
