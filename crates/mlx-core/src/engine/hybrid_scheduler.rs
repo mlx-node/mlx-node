@@ -3762,13 +3762,20 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return;
         }
         if let Some(snapshot) = cache_snapshot {
+            // The resume looks up the replay tokens, prompt and committed
+            // output (Splash `exactTokens`), so it keeps and charges by them.
+            let replay_tokens = turn
+                .payload
+                .preemption_replay
+                .as_ref()
+                .map_or(&turn.payload.prompt_tokens, |replay| &replay.tokens);
             let materialized = self.inner.scheduler_materialized_blocks(turn.seq_id);
             let charge = if materialized > 0 {
                 turn.block_reservation_total.saturating_sub(materialized)
             } else {
                 turn.block_reservation_total
             }
-            .saturating_sub(self.inner.marked_hit_blocks(&turn.payload.prompt_tokens));
+            .saturating_sub(self.inner.marked_hit_blocks(replay_tokens));
             let state_candidate_bytes = self.inner.scheduled_state_candidate_bytes(
                 turn.seq_id,
                 turn.payload.requested_tokens,
@@ -3779,7 +3786,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             } else {
                 self.scheduler.has_live_turns()
             };
-            self.reclaim_keep.clone_from(&turn.payload.prompt_tokens);
+            self.reclaim_keep.clone_from(replay_tokens);
             let reserved = self.try_reserve_with_policy(
                 turn.seq_id,
                 charge,
@@ -7988,6 +7995,122 @@ pub(crate) mod tests {
         let mut prompt = own;
         prompt.extend(tokens_of(15, 2));
         assert_eq!(state.admission_charge(5, 2, &prompt, false), 2);
+    }
+
+    /// A rung at the admitted prompt's own block-aligned end is no replay
+    /// point of it (the lookup leaves the last token out): at the max pool
+    /// the admission takes it and fits.
+    /// Mutation: pass the whole prompt to the token test in `Keep::points`
+    /// → red (`Reject`).
+    #[test]
+    fn admission_drops_a_rung_at_its_own_block_aligned_end() {
+        let Some(mut state) = qwen35_pool_state(4, 4, passing()) else {
+            return;
+        };
+        rung(&mut state, 16, 4, 0);
+        let prompt = tokens_of(16, 4);
+        let charge = state.admission_charge(4, 2, &prompt, false);
+        assert_eq!(charge, 1);
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        state.reclaim_keep.clone_from(&prompt);
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
+            .expect("reserve");
+        state.reclaim_keep.clear();
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "{outcome:?}"
+        );
+        assert_eq!(rungs(&state), 0);
+    }
+
+    /// MoE twin of `admission_drops_a_rung_at_its_own_block_aligned_end`.
+    /// Mutation: pass the whole prompt to the token test in `Keep::points`
+    /// → red (`Reject`).
+    #[test]
+    fn moe_admission_drops_a_rung_at_its_own_block_aligned_end() {
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return;
+        }
+        let Ok(mut inner) = Qwen35MoeInner::new(tiny_moe_config()) else {
+            return;
+        };
+        let mut adapter = tiny_paged_adapter_with(Arc::clone(&inner.cache_recency), 4, 4);
+        adapter.set_grow_headroom_probe_override(Some(passing()));
+        inner.paged_adapter = Some(adapter);
+        let mut state = HybridSchedulerState::new(inner).expect("construct MoE scheduler");
+        let prompt = tokens_of(16, 4);
+        let hashes = cache_dead_chain(&state, &prompt);
+        state
+            .inner
+            .push_ladder_entry_for_test(64, hashes, prompt.clone(), Vec::new(), 0);
+        let charge = state.admission_charge(4, 2, &prompt, false);
+        assert_eq!(charge, 1);
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        state.reclaim_keep.clone_from(&prompt);
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
+            .expect("reserve");
+        state.reclaim_keep.clear();
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "{outcome:?}"
+        );
+        assert!(state.inner.ladder_entries_for_test().is_empty());
+    }
+
+    /// A preempted turn whose 64-token prompt is a rung R's tokens, with one
+    /// output token committed, resumes from its replay tokens, whose lookup
+    /// can restore R: at the max pool its charge leaves R's 4 blocks out and
+    /// fits the free block, and R stays.
+    /// Mutation: the resume charges and keeps by `prompt_tokens` in
+    /// `try_resume_preempted` → red (R taken).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resume_keeps_a_rung_at_its_prompt_end() {
+        let Some(mut state) = qwen35_pool_state(5, 5, passing()) else {
+            return;
+        };
+        let prompt = tokens_of(16, 4);
+        let mut turn = speculative::tests::request(
+            &mut state.inner,
+            2,
+            prompt.clone(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_block_reservation(5, 0, 16);
+        state.inner.release_scheduled_recurrent_for(2);
+        state.inner.release_scheduled_speculation(2);
+        state
+            .inner
+            .release_scheduled_cache(2)
+            .expect("release the victim");
+        let r = *rung(&mut state, 16, 4, 0).last().expect("R");
+        turn.token_history.push(3);
+        turn.num_computed_tokens = 65;
+        let replay = install_preemption_replay(&mut turn, &prompt, 32).expect("decode replay");
+        assert_eq!(replay.tokens.len(), 65);
+        assert_eq!(
+            HybridSchedulerBackend::marked_hit_blocks(&state.inner, &replay.tokens),
+            4
+        );
+        turn.payload.preemption_replay = Some(replay);
+        let adapter = state.inner.paged_adapter().expect("paged adapter");
+        assert!(adapter.at_cap());
+        assert_eq!(adapter.takeable_blocks(), 1, "one free block, R marked");
+        state.scheduler.prepend_preempted(turn);
+        state.try_resume_preempted();
+        assert!(has_rung(&state, r), "R stays");
+        assert!(!state.scheduler.has_preempted(), "the turn resumed");
     }
 
     /// A lone MTP turn at the cap fits its draft over a marked chain, as it

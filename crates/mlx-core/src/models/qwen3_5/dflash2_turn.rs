@@ -130,10 +130,12 @@ impl<'a> Keep<'a> {
     }
 
     /// The replay points this prompt can restore, resolved once for a
-    /// reclaim (Splash `RestoredChains`).
+    /// reclaim (Splash `RestoredChains`). The token test leaves out the
+    /// last token as the lookup does (Splash `Cache::extendMatch`): a point
+    /// at the prompt's own end is no replay point of it.
     pub(crate) fn points(self, block_size: Option<u32>) -> KeptPoints<'a> {
         KeptPoints {
-            tokens: self.tokens,
+            tokens: &self.tokens[..self.tokens.len().saturating_sub(1)],
             chain: block_size.and_then(|block_size| self.hit_chain(block_size)),
         }
     }
@@ -2641,6 +2643,34 @@ mod tests {
         unsafe { mlx_sys::mlx_array_aliases(a.as_raw_ptr(), b.as_raw_ptr()) }
     }
 
+    /// A kept prompt protects only the points its lookup can restore, its
+    /// last token left out: a point at its own end is not kept, keyed or
+    /// not; a shorter one is.
+    /// Mutation: pass the whole prompt to the token test in `Keep::points`
+    /// → red.
+    #[test]
+    fn kept_points_leave_the_prompts_last_token() {
+        let tokens: Vec<u32> = (1..=32).collect();
+        let keyless = Keep {
+            tokens: &tokens,
+            keys: None,
+        }
+        .points(Some(16));
+        assert!(!keyless.keeps(&tokens, None), "its own end");
+        assert!(keyless.keeps(&tokens[..16], None));
+        let keys = vec![Vec::new(); 2];
+        let keyed = Keep {
+            tokens: &tokens,
+            keys: Some((&keys, 0)),
+        };
+        let chain = keyed.hit_chain(16).expect("keys");
+        assert_eq!(chain.len(), 1);
+        let keyed = keyed.points(Some(16));
+        assert!(!keyed.keeps(&tokens, None), "a history entry at its end");
+        assert!(keyed.keeps(&tokens[..16], None));
+        assert!(keyed.keeps(&tokens[..16], Some(&chain)));
+    }
+
     /// A1, then B1 with reuse off, then A2: B1's miss parks A1's end state
     /// (an earlier reuse-on turn built it) and A2 resumes on it. X1: A2's
     /// cached prefix and its final live state (history, used KV rows, GDN,
@@ -3393,6 +3423,66 @@ mod tests {
             1,
             "the state stays"
         );
+        Ok(())
+    }
+
+    /// A cut back to the runway that failed part way leaves layer bytes
+    /// above the pool's block count. A growth whose KV only those bytes and
+    /// every state bring within reach is counted as in reach, and its first
+    /// take finishes the cut.
+    /// Mutations: drop the residual layer bytes from
+    /// `PagedKVCacheAdapter::release_reach_bytes` → red
+    /// (context_length_exceeded); drop `&& !pending` from the guard in
+    /// `try_release_pool_extents` → red (context_length_exceeded).
+    #[test]
+    fn failed_cut_at_runway_is_reclaimed_for_flat_growth() -> Result<()> {
+        if !metal_is_default_device() {
+            return Ok(());
+        }
+        let (mut inner, runway, runway_bytes, _) = ar_grown_runway(1, false)?;
+        let adapter = inner.paged_adapter.as_mut().expect("adapter");
+        adapter.release_request().map_err(Error::from_reason)?;
+        let extent_bytes =
+            u64::from(POOL_EXTENT) * adapter.bytes_per_block().map_err(Error::from_reason)?;
+        mlx_paged_attn::set_shrink_fail_at_layer(Some(1));
+        adapter.try_release_pool_extents(extent_bytes, false);
+        mlx_paged_attn::set_shrink_fail_at_layer(None);
+        assert_eq!(pool_blocks(&inner), runway);
+        let adapter = inner.paged_adapter.as_ref().expect("adapter");
+        assert_eq!(
+            adapter.allocator().lock().expect("allocator").num_blocks(),
+            runway
+        );
+        assert!(adapter.layer_kv_pool().shrink_pending());
+        let residual = pool_bytes(&inner) - runway_bytes;
+        assert!(residual > 0);
+        let held = |inner: &Qwen35Inner| {
+            let bytes = inner.dflash2_states.store.bytes();
+            bytes.kv_bytes + bytes.state_bytes
+        };
+        let start_held = held(&inner);
+        let start_pool = pool_bytes(&inner);
+        let states = state_reach_bytes(&inner, Keep::default(), false);
+        assert_eq!(states, start_held, "the store holds every state byte");
+        let phase = KvGrowthPhase::Decode;
+        let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
+        let base = dflash2_kv_headroom_for(need.kv_bytes)
+            .checked_sub(residual + states)
+            .expect("the residual and states fall short of the KV");
+        let growth = ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {
+            Some(base + (start_pool - pool_bytes(inner)) + (start_held - held(inner)))
+        })?;
+        assert!(growth.grew);
+        assert_eq!(growth.released_pool_bytes, residual);
+        assert!(
+            !inner
+                .paged_adapter
+                .as_ref()
+                .expect("adapter")
+                .layer_kv_pool()
+                .shrink_pending()
+        );
+        assert_eq!(pool_bytes(&inner), runway_bytes);
         Ok(())
     }
 

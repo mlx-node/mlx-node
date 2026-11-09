@@ -7448,7 +7448,10 @@ impl PagedKVCacheAdapter {
         self.allocator_guard().set_state_marks(hashes);
     }
 
-    /// Pool bytes a cut could hand back with every table released.
+    /// Pool bytes a cut could hand back with every table released, plus
+    /// the layer bytes above the pool's block count that a cut or grow
+    /// which failed part way left behind: they cost nothing to give back
+    /// (Splash `MemoryLedger::takeUnsized`).
     pub(crate) fn release_reach_bytes(&self) -> u64 {
         let Some(extent) = self.extent_growth_blocks else {
             return 0;
@@ -7462,7 +7465,15 @@ impl PagedKVCacheAdapter {
         let extents = num_blocks.saturating_sub(self.extent_runway_blocks) / extent;
         let cut =
             guard.shrink_target_as_released(self.extent_runway_blocks, extent, extents, &refs);
-        u64::from(num_blocks.saturating_sub(cut)).saturating_mul(bytes_per_block)
+        drop(guard);
+        let pool = &self.layer_kv_pool;
+        let kept = pool.layer_bytes_for(pool.num_blocks()).unwrap_or(u64::MAX);
+        let residual = pool.layer_bytes().iter().fold(0u64, |sum, bytes| {
+            sum.saturating_add(bytes.saturating_sub(kept))
+        });
+        u64::from(num_blocks.saturating_sub(cut))
+            .saturating_mul(bytes_per_block)
+            .saturating_add(residual)
     }
 
     /// Whether releasing every table would let a cut sized for `want_bytes`
@@ -17362,12 +17373,14 @@ mod tests {
 
     /// A 4-layer runway pool grown to 10 whose 10 -> 4 cut fails at layer 2:
     /// the allocator and pool report 4 blocks while layers 2 and 3 still hold
-    /// 10. The next reclaim, with no new cut left at the runway, gives those
-    /// bytes back and notifies the measured total; the cached chain head
-    /// still hits, a third reclaim frees nothing, and the pool grows again.
+    /// 10. The release reach counts those bytes; the next reclaim, with no
+    /// new cut left at the runway, gives them back and notifies the measured
+    /// total; the cached chain head still hits, a third reclaim frees
+    /// nothing, and the pool grows again.
     /// Mutations: drop `&& !pending` from the guard in
     /// `try_release_pool_extents` → red (retry returns 0); drop the notifier
-    /// call in `finish_pending_shrink` → red (stale last notification).
+    /// call in `finish_pending_shrink` → red (stale last notification); drop
+    /// the residual layer bytes from `release_reach_bytes` → red (0).
     #[cfg(target_os = "macos")]
     #[test]
     fn failed_pool_cut_is_finished_by_the_next_reclaim_at_the_runway() {
@@ -17438,6 +17451,11 @@ mod tests {
             "layers 2 and 3 keep 10 blocks"
         );
         assert_eq!(last_notified(), pool.total_bytes());
+        assert_eq!(
+            adapter.release_reach_bytes(),
+            2 * 6 * layer_block_bytes,
+            "the reach counts the unfinished layers at the runway"
+        );
 
         assert_eq!(
             adapter.try_release_pool_extents(extent_bytes, false),
@@ -17445,6 +17463,7 @@ mod tests {
             "the next reclaim finishes layers 2 and 3"
         );
         assert!(!pool.shrink_pending());
+        assert_eq!(adapter.release_reach_bytes(), 0);
         assert_eq!(pool.num_blocks(), 4);
         assert_eq!(pool.total_bytes(), 4 * block_bytes);
         assert_eq!(last_notified(), 4 * block_bytes);
