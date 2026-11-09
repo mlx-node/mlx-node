@@ -957,6 +957,41 @@ fn grow_needed_blocks_for(
     (blocks <= f64::from(room)).then_some(blocks as u32)
 }
 
+/// `grow_needed_blocks_for` for a family whose grow takes in order: a need
+/// past the room grows to the max pool and takes the rest (Splash
+/// `Engine::allocate` frees before the claim waits). That count is sized
+/// for the max pool's watermark, or the take falls short of admission.
+fn grow_or_take_needed_blocks_for(
+    snapshot: &SchedulerCacheSnapshot,
+    decision: &engine::scheduler::MemoryAdmission,
+    watermark_fraction: f64,
+) -> Option<u32> {
+    if snapshot.blocks.total_blocks >= snapshot.max_total_blocks {
+        return None;
+    }
+    if let Some(blocks) = grow_needed_blocks_for(snapshot, decision, watermark_fraction) {
+        return Some(blocks);
+    }
+    let bytes_per_block = snapshot.bytes_per_block.max(1);
+    let available = u64::from(snapshot.blocks.free_blocks)
+        .saturating_add(u64::from(snapshot.blocks.reclaimable_blocks))
+        .saturating_mul(bytes_per_block);
+    let watermark = if decision.watermark_bytes > 0 {
+        let capacity =
+            u64::from(snapshot.max_total_blocks).saturating_mul(snapshot.bytes_per_block);
+        ((capacity as f64) * watermark_fraction.clamp(0.0, 1.0)).ceil() as u64
+    } else {
+        0
+    };
+    let short = decision
+        .reserved_block_bytes
+        .saturating_add(decision.reserved_state_bytes)
+        .saturating_add(watermark)
+        .saturating_sub(available)
+        .div_ceil(bytes_per_block);
+    (short > 0).then(|| short.min(u64::from(u32::MAX)) as u32)
+}
+
 pub(crate) enum ScheduledReply {
     Sync(ResponseTx<ChatResult>),
     Stream(StreamTx<ChatStreamChunk>),
@@ -3021,25 +3056,28 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     if self.inner.scheduler_books_on_demand()
                         && !grown_for_live_turns
                         && state == ScheduledStateFit::Fits
-                        && let Some(needed) = grow_needed_blocks_for(
-                            &snapshot,
-                            &decision,
-                            scheduler_watermark_fraction(),
-                        )
-                        .or_else(|| {
-                            self.inner
-                                .reclaims_in_order()
-                                .then(|| {
-                                    cap_shortfall_blocks(
-                                        &snapshot,
-                                        decision
-                                            .reserved_block_bytes
-                                            .saturating_add(decision.reserved_state_bytes)
-                                            .saturating_add(decision.watermark_bytes),
-                                    )
-                                })
-                                .flatten()
-                        })
+                        && let Some(needed) = if self.inner.reclaims_in_order() {
+                            grow_or_take_needed_blocks_for(
+                                &snapshot,
+                                &decision,
+                                scheduler_watermark_fraction(),
+                            )
+                            .or_else(|| {
+                                cap_shortfall_blocks(
+                                    &snapshot,
+                                    decision
+                                        .reserved_block_bytes
+                                        .saturating_add(decision.reserved_state_bytes)
+                                        .saturating_add(decision.watermark_bytes),
+                                )
+                            })
+                        } else {
+                            grow_needed_blocks_for(
+                                &snapshot,
+                                &decision,
+                                scheduler_watermark_fraction(),
+                            )
+                        }
                     {
                         grown_for_live_turns = true;
                         if let Some(grown) = self.try_grow_pool_by(needed, &mut met_before)? {
@@ -7627,6 +7665,188 @@ pub(crate) mod tests {
             matches!(outcome, MemoryReserveOutcome::Admitted),
             "{outcome:?}"
         );
+        assert!(reclaim_log().contains(&GrowReclaim::Ladder));
+        assert_eq!(rungs(&state), 0);
+        assert_eq!(pool_total_blocks(&state), 8);
+    }
+
+    fn reserve_waiting(
+        state: &mut HybridSchedulerState<Qwen35Inner>,
+        blocks: u32,
+    ) -> MemoryReserveOutcome {
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        state
+            .try_reserve_with_policy(2, blocks, 0, 0, snapshot, true, |_, _| Ok(()))
+            .expect("reserve")
+    }
+
+    /// A waiting admission of 5 blocks on a 4-block pool, max 8, whose 4
+    /// blocks are a ladder chain: the grow alone (room 4) cannot cover it,
+    /// so the need grows to the max and takes the rung before it waits.
+    /// Mutations: size the waiting need with the room-clamped
+    /// `grow_needed_blocks_for` → red (`Defer`); drop the `reclaims_in_order`
+    /// branch on the waiting edge → red (`Defer`).
+    #[test]
+    fn waiting_admission_below_the_cap_takes_the_ladder() {
+        let Some(mut state) = qwen35_pool_state(4, 8, passing()) else {
+            return;
+        };
+        rung(&mut state, 16, 4, 0);
+        clear_reclaim_log();
+        let outcome = reserve_waiting(&mut state, 5);
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "{outcome:?}"
+        );
+        assert!(reclaim_log().contains(&GrowReclaim::Ladder));
+        assert_eq!(rungs(&state), 0);
+        assert_eq!(pool_total_blocks(&state), 8);
+    }
+
+    /// As above on a 6-block pool, max 10, 2 blocks held: the 9-block need
+    /// is more than the room plus the rung's 4 blocks, so it waits and the
+    /// rung stays.
+    /// Mutation: drop the `most < need` count in `free_for_kv` → red (the
+    /// rung is taken for a need it cannot cover).
+    #[test]
+    fn waiting_admission_below_the_cap_keeps_the_ladder_it_cannot_cover() {
+        let Some(mut state) = qwen35_pool_state(6, 10, passing()) else {
+            return;
+        };
+        hold(&mut state, 9, 2);
+        rung(&mut state, 17, 4, 0);
+        clear_reclaim_log();
+        let outcome = reserve_waiting(&mut state, 9);
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Defer),
+            "{outcome:?}"
+        );
+        assert_eq!(rungs(&state), 1, "the rung stays");
+        assert!(reclaim_log().is_empty());
+    }
+
+    /// A waiting turn holding no block: admission sees live turns, so it
+    /// keeps the watermark, and a later resume may wait on it.
+    #[cfg(target_os = "macos")]
+    fn waiting_peer(state: &mut HybridSchedulerState<Qwen35Inner>, seq: u32) {
+        let turn = speculative::tests::request(
+            &mut state.inner,
+            seq,
+            tokens_of(40 + seq, 1),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        state.inner.release_scheduled_recurrent_for(seq);
+        state.inner.release_scheduled_speculation(seq);
+        state
+            .inner
+            .release_scheduled_cache(seq)
+            .expect("release the peer");
+        state.scheduler.enqueue_turn(turn).expect("enqueue");
+    }
+
+    /// Beside a waiting peer, a 21-block admission on a 4-block pool, max
+    /// 24, whose 4 blocks are four 1-block rungs. The 5% watermark is 0.2
+    /// of a block at 4 blocks and 1.2 at 24: the grow fills the room (20)
+    /// and the take must cover 21 + 1.2, so 3 rungs go and 1 stays.
+    /// Mutation: size the take for the current pool's watermark → red (22
+    /// blocks: 2 rungs taken, then `Defer`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn waiting_admission_sizes_the_take_for_the_grown_watermark() {
+        let Some(mut state) = qwen35_pool_state(4, 24, passing()) else {
+            return;
+        };
+        waiting_peer(&mut state, 1);
+        for seed in 0..4 {
+            rung(&mut state, 50 + seed, 1, u64::from(seed));
+        }
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        assert_eq!(
+            (
+                snapshot.blocks.total_blocks,
+                snapshot.blocks.free_blocks + snapshot.blocks.reclaimable_blocks
+            ),
+            (4, 0)
+        );
+        let decision = state.reserve_memory_decision(&snapshot, 21, 0);
+        assert_eq!(
+            (decision.reserved_block_bytes, decision.reserved_state_bytes),
+            (21 * snapshot.bytes_per_block, 0)
+        );
+        assert!(decision.watermark_bytes > 0);
+        assert_eq!(
+            grow_needed_blocks_for(&snapshot, &decision, scheduler_watermark_fraction()),
+            None
+        );
+        let sized =
+            grow_or_take_needed_blocks_for(&snapshot, &decision, scheduler_watermark_fraction());
+        let outcome = reserve_waiting(&mut state, 21);
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "{outcome:?}, {} rungs left",
+            rungs(&state)
+        );
+        assert_eq!(rungs(&state), 1);
+        assert_eq!(pool_total_blocks(&state), 24);
+        assert_eq!(sized, Some(23));
+    }
+
+    /// A preempted turn resumes behind an earlier waiter (`resume_may_wait`)
+    /// into 5 blocks on a 4-block pool, max 8, whose 4 blocks are a rung:
+    /// its need grows to the max and takes the rung, and it resumes.
+    /// Mutation: size the waiting need with the room-clamped
+    /// `grow_needed_blocks_for` → red (the resume waits).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn waiting_resume_below_the_cap_takes_the_ladder() {
+        let Some(mut state) = qwen35_pool_state(4, 8, passing()) else {
+            return;
+        };
+        waiting_peer(&mut state, 1);
+        let prompt = tokens_of(20, 2);
+        let turn = speculative::tests::request(
+            &mut state.inner,
+            2,
+            prompt.clone(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_block_reservation(5, 0, 16);
+        state.inner.release_scheduled_recurrent_for(2);
+        state.inner.release_scheduled_speculation(2);
+        state
+            .inner
+            .release_scheduled_cache(2)
+            .expect("release the victim");
+        state.scheduler.enqueue_turn(turn).expect("enqueue");
+        let mut turn = state.scheduler.take_waiting(2).expect("the victim");
+        rung(&mut state, 16, 4, 0);
+        turn.token_history.push(3);
+        turn.num_computed_tokens = 33;
+        let replay = install_preemption_replay(&mut turn, &prompt, 32).expect("decode replay");
+        turn.payload.preemption_replay = Some(replay);
+        assert!(state.scheduler.resume_may_wait(&turn));
+        assert_eq!(
+            state
+                .inner
+                .paged_adapter()
+                .expect("paged adapter")
+                .takeable_blocks(),
+            0
+        );
+        state.scheduler.prepend_preempted(turn);
+        clear_reclaim_log();
+        state.try_resume_preempted();
+        assert!(!state.scheduler.has_preempted(), "the turn resumed");
         assert!(reclaim_log().contains(&GrowReclaim::Ladder));
         assert_eq!(rungs(&state), 0);
         assert_eq!(pool_total_blocks(&state), 8);
