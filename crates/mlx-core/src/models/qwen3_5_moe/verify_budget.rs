@@ -1,5 +1,5 @@
 // Single-lane port of Splash runtime/model/VerifyBudget.{hpp,cpp} at
-// 1482f6bbc2abf12375332725302019594150b6cb (Apache-2.0).
+// 9124ff2ce1e6d19dab6bb0f2aa94b214b1271ce2 (Apache-2.0).
 // Keep the source attribution in THIRD_PARTY_NOTICES when integrating.
 // CPU policy only: the GPU consumes parameters() and selects the live prefix.
 
@@ -11,6 +11,7 @@ const EXPLORE_CYCLES: u64 = 32;
 const DECAY: f64 = 0.97;
 const PRIOR_CYCLES: f64 = 5.0;
 const PARAMETERS: usize = POSITIONS + 1;
+const NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Acceptance {
@@ -67,6 +68,8 @@ pub(crate) struct VerifyBudget {
     // Constrained and unconstrained cycles have distinct wall-time models.
     tables: [Cost; 2],
     table_cycles: [u64; 2],
+    cuts: u64,
+    next_notice: Option<std::time::Instant>,
 }
 
 impl Default for VerifyBudget {
@@ -78,6 +81,8 @@ impl Default for VerifyBudget {
             cycles: 0,
             tables: [Cost::default(); 2],
             table_cycles: [0; 2],
+            cuts: 0,
+            next_notice: None,
         }
     }
 }
@@ -145,9 +150,16 @@ impl VerifyBudget {
         let rows = f64::from(lane.verify_rows);
         self.table_cycles[index] += 1;
         if milliseconds.is_finite() && milliseconds > 0.0 {
+            // The mean keeps the cap up where a stall tilted the line to next
+            // to nothing; a cap at the line alone would hold it there.
             if let Some((intercept, slope)) = self.line(constrained) {
-                let expected = (intercept + slope * rows).max(1.0e-3);
-                milliseconds = milliseconds.clamp(0.5 * expected, 2.0 * expected);
+                let cost = self.tables[index];
+                let counted =
+                    milliseconds.min(2.0 * (intercept + slope * rows).max(cost.time / cost.weight));
+                if counted < 0.5 * milliseconds {
+                    self.notice_cut(rows, milliseconds, counted);
+                }
+                milliseconds = counted;
             }
             let cost = &mut self.tables[index];
             cost.weight = DECAY * cost.weight + 1.0;
@@ -184,6 +196,21 @@ impl VerifyBudget {
             self.acceptance = fit(&self.ordered_labels(), self.acceptance);
         }
         Ok(())
+    }
+
+    fn notice_cut(&mut self, rows: f64, milliseconds: f64, counted: f64) {
+        self.cuts += 1;
+        let now = std::time::Instant::now();
+        if self.next_notice.is_some_and(|next| now < next) {
+            return;
+        }
+        let cuts = self.cuts;
+        tracing::warn!(
+            "Verify budget: a cycle of 1 lane and {rows} rows took {milliseconds:.1} ms and counts as {counted:.1} ms ({cuts} {} cut by over half since the last such line)",
+            if cuts == 1 { "cycle" } else { "cycles" }
+        );
+        self.cuts = 0;
+        self.next_notice = Some(now + NOTICE_INTERVAL);
     }
 
     fn ordered_labels(&self) -> Vec<Label> {
@@ -402,18 +429,127 @@ mod tests {
         assert_eq!(policy.tables[0].weight, 1.0);
     }
 
+    // Host mirror of the draft_verify_rows kernel the parameters feed.
+    fn verify_rows(policy: &VerifyBudget, confidence: &[f32; POSITIONS]) -> u32 {
+        let parameters = policy.parameters(false, true);
+        if parameters.every_row {
+            return BLOCK_ROWS as u32;
+        }
+        let mut rows = 1;
+        let mut survival = 1.0_f32;
+        let mut expected = 1.0_f32;
+        let mut best = expected / parameters.costs[1];
+        for (position, confidence) in confidence.iter().enumerate() {
+            let q = confidence.clamp(1.0e-6, 1.0 - 1.0e-6);
+            let z = parameters.acceptance.slope * (q / (1.0 - q)).ln()
+                + parameters.acceptance.intercepts[position];
+            survival *= 1.0 / (1.0 + (-z).exp());
+            expected += survival;
+            let value = expected / parameters.costs[position + 2];
+            if value > best {
+                best = value;
+                rows = position as u32 + 2;
+            }
+        }
+        rows
+    }
+
+    fn spread_rows_policy() -> VerifyBudget {
+        let mut policy = VerifyBudget::default();
+        for index in 0..40 {
+            let rows = if index % 2 == 0 { 1 } else { 8 };
+            policy
+                .observe(cycle(rows, 0), false, 10.0 + f64::from(rows))
+                .unwrap();
+        }
+        policy
+    }
+
     #[test]
-    fn cost_tables_are_separate_positive_and_stall_bounded() {
+    fn cost_tables_are_separate_and_positive() {
         let mut policy = VerifyBudget::default();
         policy.observe(cycle(8, 7), false, 20.0).unwrap();
         let before = policy.costs(false);
         assert_eq!(before[8], 20.0);
         assert_eq!(policy.costs(true)[8], 1.0);
         policy.observe(cycle(8, 7), false, 1.0e9).unwrap();
-        assert!((policy.tables[0].time - (0.97 * 20.0 + 40.0)).abs() < 1.0e-12);
         let costs = policy.costs(false);
         assert!(costs[1..].iter().all(|x| x.is_finite() && *x > 0.0));
         assert!(costs[1..].windows(2).all(|x| x[0] <= x[1]));
+    }
+
+    #[test]
+    fn stalled_cycle_counts_twice_the_larger_of_fit_and_mean() {
+        for rows in [1, 8] {
+            let mut policy = spread_rows_policy();
+            let (intercept, slope) = policy.line(false).unwrap();
+            let fitted = intercept + slope * f64::from(rows);
+            let before = policy.tables[0];
+            let mean = before.time / before.weight;
+            assert_eq!(fitted < mean, rows == 1);
+            policy.observe(cycle(rows, 0), false, 1.0e9).unwrap();
+            assert_eq!(
+                policy.tables[0].time,
+                DECAY * before.time + 2.0 * fitted.max(mean)
+            );
+        }
+    }
+
+    #[test]
+    fn fast_cycle_counts_at_its_own_time() {
+        let mut policy = spread_rows_policy();
+        let (intercept, slope) = policy.line(false).unwrap();
+        let fast = 0.1 * (intercept + slope * 8.0);
+        let before = policy.tables[0];
+        policy.observe(cycle(8, 0), false, fast).unwrap();
+        assert_eq!(policy.tables[0].time, DECAY * before.time + fast);
+        assert_eq!(
+            policy.tables[0].rows_time,
+            DECAY * before.rows_time + 8.0 * fast
+        );
+    }
+
+    #[test]
+    fn one_doubled_cycle_does_not_lock_verification_to_the_anchor() {
+        // A cycle of R rows takes 4 + 0.5 R ms and accepts up to five
+        // proposals; the 224th cycle verifies every row and takes twice that.
+        let confidence = [0.7; POSITIONS];
+        let mut policy = VerifyBudget::default();
+        let mut width = 0;
+        for _ in 0..223 {
+            let rows = verify_rows(&policy, &confidence);
+            if !policy.explores(false) {
+                width = rows;
+            }
+            policy
+                .observe(cycle(rows, rows.min(5)), false, 4.0 + 0.5 * f64::from(rows))
+                .unwrap();
+        }
+        assert_eq!(width, 6);
+        assert!(policy.explores(false));
+        let rows = verify_rows(&policy, &confidence);
+        policy
+            .observe(
+                cycle(rows, rows.min(5)),
+                false,
+                2.0 * (4.0 + 0.5 * f64::from(rows)),
+            )
+            .unwrap();
+        let mut after = Vec::new();
+        for _ in 0..64 {
+            let explores = policy.explores(false);
+            let rows = verify_rows(&policy, &confidence);
+            after.push((explores, rows));
+            policy
+                .observe(cycle(rows, rows.min(5)), false, 4.0 + 0.5 * f64::from(rows))
+                .unwrap();
+        }
+        assert!(after.iter().all(|&(_, rows)| rows > 1));
+        assert!(
+            after[1..]
+                .iter()
+                .all(|&(explores, rows)| rows == if explores { 8 } else { width })
+        );
     }
 
     #[test]
@@ -457,10 +593,11 @@ mod tests {
 
     #[test]
     fn source_cpp_golden_after_3000_mixed_cycles_and_label_ring_wrap() {
-        // These bits were emitted by the unmodified Splash VerifyBudget.cpp
-        // compiled with clang++ -std=c++20 -O2 -ffp-contract=off. This fixture
-        // includes separate constrained timings, a clipped long stall,
-        // forced-label exclusions, refits and a wrapped 4096-label ring.
+        // These bits were emitted by the unmodified Splash VerifyBudget.cpp at
+        // the revision above, compiled with clang++ -std=c++20 -O2
+        // -ffp-contract=off. This fixture includes separate constrained
+        // timings, a clipped long stall, forced-label exclusions, refits and a
+        // wrapped 4096-label ring.
         let mut policy = VerifyBudget::default();
         for i in 0..3000 {
             let mut observation = CycleObservation {
