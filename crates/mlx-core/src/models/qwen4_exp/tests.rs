@@ -477,6 +477,70 @@ fn mtp_turn_near_the_context_limit_is_admitted_against_pages_only() {
     assert_eq!(state.owner_sequences.len(), 1);
 }
 
+/// An AR turn grows the pool to its maximum, and the state budget charges
+/// every block it holds. An MTP start after it takes the free extents back (Splash
+/// `Cache::takeReclaim`) instead of refusing state the cut would cover: its
+/// candidate is above the budget at the grown pool and within it at the
+/// runway. MUTATION: return false from qwen4's
+/// `reclaim_for_scheduled_state`; the MTP start fails with "qwen4_exp working
+/// memory: this turn needs ...".
+#[test]
+fn mtp_start_after_a_long_ar_turn_takes_back_the_pool_growth() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerState;
+    const RUNWAY: u32 = 1;
+    const MAX: u32 = 4;
+    let mut inner = tiny_inner();
+    let c = inner.decoder.config.clone();
+    let mut pool = paged::create_with_blocks(&c, RUNWAY, MAX).unwrap();
+    pool.set_extent_growth(1);
+    let physical = pool.bytes_per_block().unwrap();
+    inner.decoder.paged = Some(pool);
+    let chunk = inner.decoder.prefill_chunk_size;
+    inner.decoder.prefill_window_pin = Some(chunk);
+    let transient = memory::prefill_scratch(&c, chunk, inner.decoder.context_window);
+    let mtp_new = 20;
+    let requested = crate::engine::scheduler::scheduled_materialized_tokens(1, mtp_new);
+    let candidate =
+        memory::row_state_bytes(&c) + memory::draft_state_bytes(&c, u64::from(requested));
+    let charge = |total: u32| memory::PoolCharge {
+        total_blocks: u64::from(total),
+        max_blocks: u64::from(MAX),
+        allocated_blocks: 0,
+        physical_block_bytes: physical,
+        index_block_bytes: super::load_plan::index_block_bytes(&c),
+        growth_copy_bytes: u64::from(total) * physical
+            / (super::load_plan::full_attention_layers(&c) as u64).max(1),
+    };
+    let dynamic = candidate + transient + charge(MAX).bytes() - 1;
+    let budget = |total: u32| memory::scheduled_state_budget(dynamic, transient, &charge(total));
+    assert!(
+        budget(MAX) < candidate && candidate <= budget(RUNWAY),
+        "the MTP candidate {candidate} B must exceed the grown pool's budget {} B and fit the runway's {} B, or this test proves nothing",
+        budget(MAX),
+        budget(RUNWAY)
+    );
+    inner.memory_plan = crate::engine::memory_plan::MemoryPlan::with_dynamic(dynamic);
+    let mut state = HybridSchedulerState::new(inner).unwrap();
+    drive_turn(&mut state, TurnKind::Start, false, 120, Some("ar")).unwrap();
+    // The fixture stops long before its window; the rest of a long turn's
+    // growth is taken directly.
+    let pool = state.inner.decoder.paged.as_mut().unwrap();
+    let grown = pool.block_capacity();
+    assert!(grown > RUNWAY, "the AR turn must grow the pool");
+    assert!(pool.try_grow_pool(MAX - grown));
+    assert_eq!(pool.block_capacity(), MAX);
+    let (_, cycles) = drive_turn(
+        &mut state,
+        TurnKind::Start,
+        true,
+        mtp_new as i32,
+        Some("mtp"),
+    )
+    .unwrap();
+    assert!(cycles.is_some_and(|n| n > 0), "{cycles:?}");
+    assert!(state.inner.decoder.paged.as_ref().unwrap().block_capacity() < MAX);
+}
+
 /// Held off-pool state counts every parked or active row, each owner's draft
 /// K/V and the verify snapshots of an owner inside an MTP turn; a candidate
 /// that already owns a row or a draft frontier is charged only for what it

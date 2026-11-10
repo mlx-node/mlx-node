@@ -230,3 +230,47 @@ fn estimate_is_the_load_plan() {
     let lower = estimate("Qwen4Exp", &c, &inventory(), live(0), Some(16 << 30), false).unwrap();
     assert!(lower.window_tokens <= ar.window_tokens);
 }
+
+/// A transformers checkpoint's stacked experts are the store's experts, not
+/// its fixed weights: 48 BF16 layers inventory 241,591,910,400 B of experts
+/// with a 4,816,896,000 B minimum, and the 36 GB plan streams them under a
+/// cap below the inventory. Mutation: drop the `.mlp.experts.` arm of
+/// `routed_expert_layer` → red (no experts; the floors do not fit).
+#[test]
+fn hf_experts_stream_from_the_plan() {
+    use super::super::weights::{Store, Tensor};
+    let c = flash_next_config();
+    let mut store = Store::open_descriptors(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp/bf16"),
+    )
+    .unwrap();
+    assert!(!store.gguf);
+    store.tensors.clear();
+    let bf16 = |shape: Vec<usize>| {
+        let bytes = shape.iter().product::<usize>() as u64 * 2;
+        Tensor::safe_descriptor(shape, "BF16", bytes)
+    };
+    for layer in 0..48 {
+        store.tensors.insert(
+            format!("layers.{layer}.mlp.experts.gate_up_proj"),
+            bf16(vec![512, 1280, 2560]),
+        );
+        store.tensors.insert(
+            format!("layers.{layer}.mlp.experts.down_proj"),
+            bf16(vec![512, 2560, 640]),
+        );
+    }
+    let fixed_bytes = 4096 * 2560 * 2;
+    store.tensors.insert(
+        "layers.0.self_attn.q_proj.weight".into(),
+        bf16(vec![4096, 2560]),
+    );
+    let inventory = store.load_inventory(&c, false).unwrap();
+    assert_eq!(inventory.experts.all, 241_591_910_400);
+    assert_eq!(inventory.experts.minimum, 4_816_896_000);
+    assert_eq!(inventory.store_fixed_bytes, fixed_bytes);
+    let decision = plan_store("Qwen4Exp", &c, &inventory, live(0), None, false)
+        .unwrap_or_else(|error| panic!("the HF store must stream: {error}"));
+    assert!(!decision.store.whole);
+    assert!(decision.store.expert_cap_bytes < inventory.experts.all);
+}

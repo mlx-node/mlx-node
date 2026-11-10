@@ -554,6 +554,16 @@ impl HybridSchedulerBackend for Inner {
                 + self.mtp.held_bytes(c),
         })
     }
+    /// The state budget is charged for every block the pool holds, and the
+    /// pool only grows: a refused state need takes its free extents back
+    /// (Splash `Cache::releaseExtent`), cached pages last.
+    fn reclaim_for_scheduled_state(&mut self, shortfall: u64) -> bool {
+        let Some(paged) = self.decoder.paged.as_mut() else {
+            return false;
+        };
+        paged.try_release_pool_extents(shortfall, false) > 0
+            || paged.try_release_pool_extents(shortfall, true) > 0
+    }
     fn scheduled_state_candidate_bytes(&self, seq: SeqId, tokens: u32, speculative: bool) -> u64 {
         let c = &self.decoder.config;
         let row = if self.has_scheduled_recurrent(seq) {

@@ -974,8 +974,8 @@ impl Store {
         c: &super::super::config::Config,
         vision: bool,
     ) -> Result<super::super::load_plan::LoadInventory> {
-        let routed = self.slot_routed_bytes()?;
-        let largest = self.largest_routed_layer_bytes()?;
+        let routed = self.routed_expert_bytes()?;
+        let largest = self.largest_routed_expert_layer_bytes()?;
         let experts = c.num_experts.max(1) as u128;
         let minimum = (c.num_experts_per_tok as u128 * u128::from(routed.saturating_add(largest))
             / experts)
@@ -1025,7 +1025,7 @@ impl Store {
     /// A fixture's store plan: every expert whole beside a 2 GiB row cache.
     #[cfg(test)]
     pub(in super::super) fn plan_fixture_store(&mut self) -> Result<()> {
-        let routed = self.slot_routed_bytes()?;
+        let routed = self.routed_expert_bytes()?;
         let fixed = self
             .hot_bytes()?
             .saturating_sub(routed)
@@ -1480,6 +1480,44 @@ impl Store {
         let capacity = if capacity < top { 0 } else { capacity };
         self.slot_capacity = Some(capacity);
         Ok(capacity)
+    }
+
+    /// The layer of a routed main-network expert tensor in either format the
+    /// store reads: GGUF `blk.N.ffn_{gate,up,down}_exps.weight` and
+    /// transformers `layers.N.mlp.experts.{gate_up_proj,down_proj}` (Splash
+    /// `gguf::streamedExperts` makes both expert planes, never fixed bytes).
+    fn routed_expert_layer<'a>(&self, name: &'a str) -> Option<&'a str> {
+        if super::residency::is_auxiliary(name) || self.banks.contains_key(name) {
+            return None;
+        }
+        if let Some((layer, rest)) = name.split_once(".ffn_") {
+            return rest.ends_with("_exps.weight").then_some(layer);
+        }
+        let (layer, projection) = name.split_once(".mlp.experts.")?;
+        matches!(projection, "gate_up_proj" | "down_proj").then_some(layer)
+    }
+
+    /// Routed main-network expert bytes in every format the store reads.
+    fn routed_expert_bytes(&self) -> Result<u64> {
+        self.tensors
+            .iter()
+            .filter(|(name, _)| self.routed_expert_layer(name).is_some())
+            .try_fold(0u64, |n, (_, t)| {
+                t.runtime_bytes().map(|b| n.saturating_add(b))
+            })
+    }
+
+    /// Routed main-network expert bytes of the largest layer, in every
+    /// format the store reads.
+    fn largest_routed_expert_layer_bytes(&self) -> Result<u64> {
+        let mut layer_bytes = HashMap::<&str, u64>::new();
+        for (name, tensor) in &self.tensors {
+            if let Some(layer) = self.routed_expert_layer(name) {
+                let bytes = layer_bytes.entry(layer).or_default();
+                *bytes = bytes.saturating_add(tensor.runtime_bytes()?);
+            }
+        }
+        Ok(layer_bytes.values().copied().max().unwrap_or(0))
     }
 
     /// Routed main-network expert bytes of the largest layer the slots serve.

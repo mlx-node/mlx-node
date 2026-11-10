@@ -93,6 +93,19 @@ pub struct Tensor {
     bytes: u64,
     encoding: Encoding,
 }
+#[cfg(test)]
+impl Tensor {
+    /// A safetensors descriptor of `shape` in `dtype` with no payload.
+    pub(super) fn safe_descriptor(shape: Vec<usize>, dtype: &str, bytes: u64) -> Self {
+        Self {
+            path: PathBuf::new(),
+            shape,
+            offset: 0,
+            bytes,
+            encoding: Encoding::Safe(dtype.into()),
+        }
+    }
+}
 impl Tensor {
     pub fn width(&self) -> Result<usize> {
         self.shape
@@ -2855,13 +2868,27 @@ mod direct_tests {
         header_pad: usize,
         trailing: usize,
     ) {
+        write_fixture_with_fixed(path, layers, experts, parts, &[], header_pad, trailing)
+    }
+
+    /// The routed parts of `write_fixture_layout`, then `fixed` F32
+    /// projections of `(name, rows, width)`.
+    fn write_fixture_with_fixed(
+        path: &Path,
+        layers: usize,
+        experts: usize,
+        parts: &[Part; 3],
+        fixed: &[(&str, usize, usize)],
+        header_pad: usize,
+        trailing: usize,
+    ) {
         let string = |bytes: &mut Vec<u8>, value: &str| {
             bytes.extend((value.len() as u64).to_le_bytes());
             bytes.extend(value.bytes());
         };
         let mut b = b"GGUF".to_vec();
         b.extend(3u32.to_le_bytes());
-        b.extend(((parts.len() * layers) as u64).to_le_bytes());
+        b.extend(((parts.len() * layers + fixed.len()) as u64).to_le_bytes());
         b.extend(1u64.to_le_bytes());
         string(&mut b, "general.architecture");
         b.extend(8u32.to_le_bytes());
@@ -2878,6 +2905,16 @@ mod direct_tests {
                 b.extend(offset.to_le_bytes());
                 offset += (experts * *rows * *row_bytes) as u64;
             }
+        }
+        for (name, rows, width) in fixed {
+            string(&mut b, name);
+            b.extend(2u32.to_le_bytes());
+            for d in [*width as u64, *rows as u64] {
+                b.extend(d.to_le_bytes());
+            }
+            b.extend(0u32.to_le_bytes());
+            b.extend(offset.to_le_bytes());
+            offset += (*rows * *width * 4) as u64;
         }
         b.resize(b.len() + header_pad, 0);
         while !b.len().is_multiple_of(32) {
@@ -3398,6 +3435,79 @@ mod direct_tests {
         assert!(matches!(
             store.live.fallback(),
             Some(Fallback::LoadGate { budget, .. }) if budget == bank_budget
+        ));
+    }
+
+    /// A host that refuses the whole store the plan chose prepares the partial
+    /// store under what it admits now: the fixed banks pass the host, and the
+    /// plan keeps the store at its cap with the rest held back. Mutation: admit
+    /// the store's cap in `prepare_hot_with_admission` → red ("requested 6.0
+    /// GiB, the host leaves 5.0 GiB").
+    #[test]
+    fn host_refusal_partial_store_prepares_under_the_host() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("refusal-prepare.gguf");
+        write_fixture_with_fixed(
+            &gguf,
+            1,
+            EXPERTS,
+            &PARTS,
+            &[("blk.0.attn_qkv.weight", 16, 64)],
+            0,
+            0,
+        );
+        let host = memory::HostMemory {
+            physical: 16 << 30,
+            free: 4 << 30,
+            file: 0,
+            anonymous: 5 << 30,
+            purgeable: 0,
+            wired: 1 << 30,
+            compressor: 1 << 30,
+        };
+        let _host = memory::scoped_test_host(host);
+        let mut store = Store::open_fixture(&gguf, Some(&temp.0.join("cache"))).unwrap();
+        store.plan.physical_bytes = Some(host.physical);
+        store.plan_fixture_store().unwrap();
+        let whole = store.store_plan.unwrap();
+        assert!(whole.whole);
+        let fixed = store.cache_limit - whole.expert_cap_bytes - whole.row_cache_bytes;
+        assert!(fixed > 0, "the fixture must hold a fixed projection bank");
+        let rows = 6u64 << 30;
+        store.set_store_plan(
+            crate::engine::memory_plan::StorePlan {
+                row_cache_bytes: rows,
+                ..whole
+            },
+            fixed,
+        );
+        let planned = store.cache_limit;
+        assert!(
+            planned > 5 << 30,
+            "the planned store must exceed what the host admits, or this test proves nothing"
+        );
+        assert!(
+            store
+                .select_direct_residency_with(
+                    EXPERTS,
+                    fixed + rows,
+                    &mut memory::direct_gate,
+                    &mut |_| panic!("a refused gate must not allocate"),
+                )
+                .unwrap()
+        );
+        assert!(!store.plan.direct);
+        assert!(store.plan.partial_direct_gate);
+        store.prepare_hot().unwrap();
+        assert!(store.banks.contains_key("blk.0.attn_qkv.weight"));
+        assert_eq!(store.cache_limit, planned);
+        assert!(store.held_back_bytes() > 0);
+        assert!(matches!(
+            store.live.fallback(),
+            Some(Fallback::LoadGate { .. })
         ));
     }
 

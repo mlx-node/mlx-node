@@ -309,12 +309,16 @@ impl Store {
         if names.is_empty() {
             return Ok(());
         }
-        // Admit the whole set before reading any payload, then recheck live
-        // headroom during growth in case another application starts allocating.
-        // Direct banks were admitted and allocated by the full-bank selector;
-        // dense banks are admitted individually below to avoid double count.
+        // The store's cap is a plan number the host never grants in one piece
+        // (Splash `ExpertStore` starts at its floor; the plan counts the rest
+        // as `hostHeldBackBytes`): admit the banks this call builds. Slots,
+        // each dense bank and the draft banks pass their own gates.
         if !self.plan.direct {
-            admit(self.cache_limit)?;
+            let mut banks = 0u64;
+            for name in &names {
+                banks = banks.saturating_add(self.descriptor(name)?.bank_bytes(name)?);
+            }
+            admit(banks)?;
         }
         if self.prepare_banks(names, admit)? && admit(super::super::memory::WORKING_BYTES).is_ok() {
             return Ok(());
