@@ -18,6 +18,7 @@ const LOGIT_CHUNK: u32 = 5;
 
 fn tiny_moe_cfg() -> Qwen3_5MoeConfig {
     Qwen3_5MoeConfig {
+        rope_scaling: None,
         vocab_size: 1024,
         hidden_size: 64,
         num_layers: 8,

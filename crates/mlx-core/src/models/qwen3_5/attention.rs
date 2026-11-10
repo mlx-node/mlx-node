@@ -12,6 +12,7 @@ use crate::models::paddleocr_vl::language::{
     MultimodalRoPE, apply_interleaved_rotary, apply_multimodal_rotary_pos_emb_interleaved,
     select_interleaved_cos_sin,
 };
+use crate::nn::rope_scaling::{RopeScaling, rotary_inverse_frequencies};
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
 use crate::transformer::KvFormat;
@@ -453,6 +454,7 @@ impl Qwen3_5Attention {
             || self.num_kv_heads != 2
             || self.head_dim != 256
             || self.mrope.is_some()
+            || self.rope.is_scaled()
             || self.rope.traditional
             || self.rope.dims != 64
             || self.rope.base.to_bits() != 10_000_000_f32.to_bits()
@@ -493,6 +495,7 @@ impl Qwen3_5Attention {
             return Ok(None);
         };
         if self.mrope.is_some()
+            || self.rope.is_scaled()
             || self.rope.traditional
             || queries.shape()?.as_ref() != [1, 8, 16, 256]
             || keys.shape()?.as_ref() != [1, 8, 2, 256]
@@ -642,7 +645,7 @@ impl Qwen3_5Attention {
 
         // Partial RoPE: only rotate a fraction of dimensions
         let rope_dims = config.rope_dims();
-        let rope = RoPE::new(rope_dims, Some(false), Some(config.rope_theta), None);
+        let rope = RoPE::yarn(rope_dims, head_dim, config.rope_theta, &config.scaling())?;
 
         let scale = (head_dim as f32).powf(-0.5);
 
@@ -1107,6 +1110,7 @@ impl Qwen3_5Attention {
         let metal = *METAL.get_or_init(|| unsafe { mlx_sys::mlx_metal_is_available() });
         if !metal
             || self.mrope.is_some()
+            || self.rope.is_scaled()
             || self.rope.traditional
             || self.q_norm.eps_f32() != self.k_norm.eps_f32()
         {
@@ -2300,14 +2304,25 @@ impl Qwen3_5Attention {
         rope_theta: f64,
         max_position_embeddings: i32,
         rope_dims: i32,
+        scaling: &RopeScaling,
     ) -> Result<()> {
         // Use rope_dims (head_dim * partial_rotary_factor), not full head_dim
-        self.mrope = Some(MultimodalRoPE::new(
-            rope_dims,
-            max_position_embeddings,
-            Some(rope_theta),
-            mrope_section,
-        )?);
+        self.mrope = Some(if scaling.yarn() {
+            // Splash `ROPE_BUILD_TABLES`: every M-RoPE axis takes the target table.
+            MultimodalRoPE::with_inverse_frequencies(
+                rope_dims,
+                mrope_section,
+                &rotary_inverse_frequencies(rope_theta as f32, (rope_dims / 2) as u32, scaling)?,
+                scaling.attention_factor(),
+            )?
+        } else {
+            MultimodalRoPE::new(
+                rope_dims,
+                max_position_embeddings,
+                Some(rope_theta),
+                mrope_section,
+            )?
+        });
         Ok(())
     }
 
@@ -5122,6 +5137,7 @@ mod tests {
 
     pub(super) fn tiny_cfg() -> Qwen3_5Config {
         Qwen3_5Config {
+            rope_scaling: None,
             qwen35_gguf_gdn_layout: None,
             kv_format: None,
             vocab_size: 32,
@@ -5907,6 +5923,153 @@ mod tests {
             expected_keys.to_uint16_native()?
         );
         assert_eq!(attn.get_q_norm_weight().to_uint16_native()?, original_q);
+        Ok(())
+    }
+
+    /// The 27B target attention geometry for the YaRN gates.
+    fn yarn_cfg(max_context: Option<u32>) -> Qwen3_5Config {
+        let mut cfg = tiny_cfg();
+        cfg.head_dim = 256;
+        cfg.num_heads = 16;
+        cfg.num_kv_heads = 2;
+        cfg.partial_rotary_factor = 0.25;
+        cfg.rope_theta = 10_000_000.0;
+        cfg.max_position_embeddings = 262_144;
+        cfg.rope_scaling = Some(
+            RopeScaling::served_for("Qwen3.5", 262_144, RopeScaling::default(), max_context)
+                .unwrap(),
+        );
+        cfg
+    }
+
+    fn bits_of(array: &MxArray) -> Vec<u32> {
+        array
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect()
+    }
+
+    /// Gate: at or below the native window the attention keeps today's RoPE
+    /// kernel and its fused paths. Mutation: `<` at the native window in
+    /// `served_for` → red (262,144 turns YaRN on).
+    #[test]
+    fn below_native_attention_is_bit_equal() -> Result<()> {
+        let x = MxArray::random_normal(&[1, 16, 3, 256], 0.0, 1.0, Some(DType::BFloat16))?;
+        for max_context in [None, Some(102_400), Some(262_144)] {
+            let cfg = yarn_cfg(max_context);
+            assert_eq!(cfg.scaling(), RopeScaling::default(), "{max_context:?}");
+            let mut attn = Qwen3_5Attention::new(&cfg)?;
+            attn.q_norm
+                .set_weight(&MxArray::ones(&[256], Some(DType::BFloat16))?)?;
+            attn.k_norm
+                .set_weight(&MxArray::ones(&[256], Some(DType::BFloat16))?)?;
+            assert!(!attn.rope.is_scaled(), "{max_context:?}");
+            let direct = MxArray::from_handle(
+                unsafe { mlx_sys::mlx_fast_rope(x.handle.0, 64, false, 1e7, 1.0, 7) },
+                "rope",
+            )?;
+            assert_eq!(bits_of(&attn.rope.forward(&x, Some(7))?), bits_of(&direct));
+            if unsafe { mlx_sys::mlx_metal_is_available() } {
+                let q = MxArray::random_normal(&[1, 1, 16, 256], 0.0, 1.0, Some(DType::BFloat16))?;
+                let k = MxArray::random_normal(&[1, 1, 2, 256], 0.0, 1.0, Some(DType::BFloat16))?;
+                let offsets = MxArray::from_int32(&[7], &[1])?;
+                assert!(attn.fused_qk_norm_rope(&q, &k, &offsets).is_some());
+            }
+        }
+        Ok(())
+    }
+
+    /// Under YaRN the fused `mlx_qk_norm_rope` (base-only) and the source QK
+    /// diagnostic (an unscaled table) step aside. Mutation: drop the
+    /// `is_scaled()` gate from `fused_qk_norm_rope` → red (`Some`).
+    #[test]
+    fn fused_kernels_step_aside_under_yarn() -> Result<()> {
+        let mut scaled = Qwen3_5Attention::new(&yarn_cfg(Some(409_600)))?;
+        scaled
+            .q_norm
+            .set_weight(&MxArray::ones(&[256], Some(DType::BFloat16))?)?;
+        scaled
+            .k_norm
+            .set_weight(&MxArray::ones(&[256], Some(DType::BFloat16))?)?;
+        let plain = Qwen3_5Attention::new(&yarn_cfg(None))?;
+        assert!(scaled.rope.is_scaled());
+        if unsafe { mlx_sys::mlx_metal_is_available() } {
+            let q = MxArray::random_normal(&[1, 1, 16, 256], 0.0, 1.0, Some(DType::BFloat16))?;
+            let k = MxArray::random_normal(&[1, 1, 2, 256], 0.0, 1.0, Some(DType::BFloat16))?;
+            let offsets = MxArray::from_int32(&[7], &[1])?;
+            assert!(scaled.fused_qk_norm_rope(&q, &k, &offsets).is_none());
+        }
+        let weight = MxArray::from_float32(&[1.0; 256], &[256])?;
+        let frequencies = MxArray::from_float32(&[1.0; 32], &[32])?;
+        assert!(
+            plain
+                .validate_source_qk_weights(&weight, &weight, &frequencies)
+                .is_ok()
+        );
+        assert!(
+            scaled
+                .validate_source_qk_weights(&weight, &weight, &frequencies)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    /// Image rows take the target's YaRN table and factor on every M-RoPE
+    /// axis (Splash `ROPE_BUILD_TABLES`); without YaRN `init_mrope` is
+    /// `MultimodalRoPE::new` bit for bit. Mutation: `init_mrope` ignores
+    /// the scaling → red.
+    #[test]
+    fn mrope_takes_the_yarn_table() -> Result<()> {
+        let section = vec![11, 11, 10];
+        let positions: Vec<i32> = (0..3).flat_map(|_| [0, 3, 4093]).collect();
+        let position_ids = MxArray::from_int32(&positions, &[3, 1, 3])?;
+        let x = MxArray::zeros(&[1, 1, 3, 64], Some(DType::Float32))?;
+
+        let scaling = yarn_cfg(Some(409_600)).scaling();
+        let mut attn = Qwen3_5Attention::new(&yarn_cfg(Some(409_600)))?;
+        attn.init_mrope(section.clone(), 1e7, 262_144, 64, &scaling)?;
+        let (cos, sin) = attn.mrope.as_ref().unwrap().forward(&x, &position_ids)?;
+        let inverse = rotary_inverse_frequencies(1e7, 32, &scaling)?;
+        let factor = scaling.attention_factor();
+        let reference =
+            MultimodalRoPE::with_inverse_frequencies(64, section.clone(), &inverse, factor)?;
+        let (want_cos, want_sin) = reference.forward(&x, &position_ids)?;
+        assert_eq!(bits_of(&cos), bits_of(&want_cos));
+        assert_eq!(bits_of(&sin), bits_of(&want_sin));
+        // The f32 matmul of the angles is not exact on every GPU: the
+        // small positions only, at its precision.
+        let (cos, sin) = (cos.to_float32()?, sin.to_float32()?);
+        assert_eq!(cos.len(), 3 * 3 * 64);
+        for axis in 0..3 {
+            for (t, position) in [0f32, 3.0].into_iter().enumerate() {
+                for dim in 0..64 {
+                    let angle = f64::from(inverse[dim % 32] * position);
+                    let index = (axis * 3 + t) * 64 + dim;
+                    let factor = f64::from(factor);
+                    for (got, want) in [
+                        (cos[index], angle.cos() * factor),
+                        (sin[index], angle.sin() * factor),
+                    ] {
+                        assert!(
+                            (f64::from(got) - want).abs() <= 3e-3,
+                            "axis {axis} t {t} dim {dim}: {got} vs {want}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut plain = Qwen3_5Attention::new(&yarn_cfg(None))?;
+        plain.init_mrope(section.clone(), 1e7, 262_144, 64, &RopeScaling::default())?;
+        let reference = MultimodalRoPE::new(64, 262_144, Some(1e7), section)?;
+        let (a_cos, a_sin) = plain.mrope.as_ref().unwrap().forward(&x, &position_ids)?;
+        let (b_cos, b_sin) = reference.forward(&x, &position_ids)?;
+        assert_eq!(bits_of(&a_cos), bits_of(&b_cos));
+        assert_eq!(bits_of(&a_sin), bits_of(&b_sin));
         Ok(())
     }
 }

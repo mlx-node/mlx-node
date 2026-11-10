@@ -55,6 +55,10 @@ pub struct Config {
     pub attention_bias: bool,
     #[serde(default)]
     pub rope_parameters: serde_json::Value,
+    /// YaRN of a load past the native window (`maxContextTokens`); never
+    /// saved, so `max_position_embeddings` stays the native window.
+    #[serde(skip)]
+    pub rope_scaling: crate::nn::rope_scaling::RopeScaling,
 }
 fn seed() -> u64 {
     1234
@@ -93,8 +97,8 @@ impl Config {
             || self.attention_bias
             || self
                 .rope_parameters
-                .get("type")
-                .or_else(|| self.rope_parameters.get("rope_type"))
+                .get("rope_type")
+                .or_else(|| self.rope_parameters.get("type"))
                 .is_some_and(|v| v.as_str() != Some("default"))
         {
             return Err(Error::from_reason(
@@ -195,6 +199,11 @@ impl Config {
             ));
         }
         Ok(())
+    }
+    /// Splash `servedContextTokens`: the native window, or the YaRN window.
+    pub(crate) fn served_context_tokens(&self) -> u32 {
+        self.rope_scaling
+            .served_context_tokens(self.max_position_embeddings.min(u32::MAX as usize) as u32)
     }
     pub fn linear(&self, layer: usize) -> bool {
         self.layer_types.get(layer).map_or(

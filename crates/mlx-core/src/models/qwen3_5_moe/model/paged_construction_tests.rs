@@ -11,6 +11,7 @@ use crate::models::qwen3_5_moe::switch_glu::SwitchGLU;
 
 pub(super) fn tiny_moe_cfg(use_block_paged: bool) -> Qwen3_5MoeConfig {
     Qwen3_5MoeConfig {
+        rope_scaling: None,
         vocab_size: 1024,
         hidden_size: 64,
         num_layers: 8,
@@ -2900,4 +2901,22 @@ fn moe_serial_prepare_at_the_cap_frees_a_ladder_chain() {
             "{entry}"
         );
     }
+}
+
+/// Gate: with no pool the chat turn core holds the flat lane's capped
+/// window (Splash `Engine::submit`). Mutation: the MoE `context_window`
+/// returns `None` → red.
+#[test]
+fn flat_context_window_is_the_capped_lane() {
+    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct tiny MoE model");
+    assert!(inner.paged_adapter.is_none());
+    assert_eq!(
+        crate::engine::backend::ChatBackend::context_window(&inner),
+        Some(1024)
+    );
+    inner.max_context = Some(100);
+    assert_eq!(
+        crate::engine::backend::ChatBackend::context_window(&inner),
+        Some(100)
+    );
 }

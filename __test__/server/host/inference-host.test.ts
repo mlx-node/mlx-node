@@ -710,6 +710,93 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     ]);
   });
 
+  // Mutation: drop the `acceptsMaxContext` check in the host → red (gemma4
+  // load gets maxContextTokens). Mutation: drop `acceptsMaxContext` from the
+  // qwen4_exp family → red (the Flash Next load gets no count).
+  it('maxContextTokens reaches the qwen and Flash Next loaders only', async () => {
+    const modelsDir = await makeModelsDir(['qwen', 'gemma', 'flash']);
+    await writeFile(join(modelsDir, 'gemma', 'config.json'), JSON.stringify({ model_type: 'gemma4' }));
+    await writeFile(join(modelsDir, 'flash', 'config.json'), JSON.stringify({ model_type: 'qwen4_exp' }));
+    const calls: Array<{ path: string; options?: LoadModelOptions }> = [];
+    const host = await start({
+      modelsDir,
+      maxContextTokens: 102_400,
+      loadModel: async (path, options) => {
+        calls.push({ path, options });
+        return fakeModel();
+      },
+    });
+    await host.loadModel('qwen');
+    await host.loadModel('gemma');
+    await host.loadModel('flash');
+    expect(calls.map((call) => call.options)).toEqual([
+      { maxContextTokens: 102_400 },
+      undefined,
+      { maxContextTokens: 102_400 },
+    ]);
+  });
+
+  // Mutation: drop `maxContextTokens` from the qwen4_exp estimator options in
+  // `nativeContextEstimate` → red.
+  it('hands maxContextTokens to both estimators', async () => {
+    const asked: Array<{ family: string; options?: unknown }> = [];
+    const estimate = nativeContextEstimate(
+      async (_path, modelType, options) => {
+        asked.push({ family: modelType, options });
+        return { windowTokens: 102_400, bound: 'memory' };
+      },
+      async (_path, options) => {
+        asked.push({ family: 'flash-next', options });
+        return { windowTokens: 102_400, bound: 'memory' };
+      },
+    );
+    await estimate('/flash', 'qwen4_exp', { maxContextTokens: 102_400 });
+    await estimate('/flash', 'qwen4_exp', { kvFormat: 'int8' });
+    await estimate('/qwen', 'qwen3_5', { maxContextTokens: 409_600 });
+    expect(asked).toEqual([
+      { family: 'flash-next', options: { maxContextTokens: 102_400 } },
+      { family: 'flash-next', options: null },
+      { family: 'qwen3_5', options: { maxContextTokens: 409_600 } },
+    ]);
+  });
+
+  // Mutation: drop the `--max-context` seed in `startContextEstimates` → red
+  // (262144 before the estimate lands). Mutation: keep the seed when the
+  // estimate fails → red (the trained window is not restored).
+  it('lists the --max-context count before the estimate lands', async () => {
+    const modelsDir = await makeModelsDir(['qwen', 'gemma']);
+    await writeFile(join(modelsDir, 'gemma', 'config.json'), JSON.stringify({ model_type: 'gemma4' }));
+    const asked: unknown[] = [];
+    let fail: (error: Error) => void = () => undefined;
+    const pending = new Promise<never>((_resolve, reject) => (fail = reject));
+    let started: () => void = () => undefined;
+    const estimating = new Promise<void>((resolve) => (started = resolve));
+    const host = await start({
+      modelsDir,
+      maxContextTokens: 102_400,
+      estimateContextWindow: async (_path, _modelType, options) => {
+        asked.push(options);
+        started();
+        return pending;
+      },
+    });
+    const windows = async (): Promise<Record<string, number>> => {
+      const body = (await (await fetch(`${host.url}/v1/models`)).json()) as {
+        data: Array<{ id: string; context_window: number }>;
+      };
+      return Object.fromEntries(body.data.map((entry) => [entry.id, entry.context_window]));
+    };
+    await estimating;
+    expect(asked).toEqual([{ maxContextTokens: 102_400 }]);
+    const before = await windows();
+    expect(before.qwen).toBe(102_400);
+    expect(before.gemma).not.toBe(102_400);
+    fail(new Error("Qwen3.5: --max-context 102400 exceeds the 48601 tokens the model and this Mac's memory allow"));
+    await pending.catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect((await windows()).qwen).toBe(262_144);
+  });
+
   // Mutation: price qwen4_exp with the qwen3_5 estimator in
   // `nativeContextEstimate` → red. Mutation: publish the MTP window → red
   // (61,433; MTP is opt-in on qwen4_exp).

@@ -184,6 +184,13 @@ export interface InferenceHostOptions {
    * budget. Other families never see it. Omitted ⇒ the automatic budget.
    */
   maxMemoryBytes?: number;
+  /**
+   * Context token limit (`--max-context`) for qwen3_5 / qwen3_5_moe /
+   * qwen4_exp loads: every turn holds at most this many tokens, past the
+   * native window with YaRN, and a load whose plan holds fewer fails. Other
+   * families never see it. Omitted ⇒ the window the plan holds.
+   */
+  maxContextTokens?: number;
   /** See `ServerConfig.thinkingTokenBudget`. */
   thinkingTokenBudget?: number;
   /** Model types forced onto the block-paged KV cache. Default {@link DEFAULT_PAGED_MODEL_TYPES}. */
@@ -403,6 +410,9 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
       ...(opts.maxMemoryBytes !== undefined && familyDataFor(entry.modelType)?.acceptsMaxMemory === true
         ? { maxMemoryBytes: opts.maxMemoryBytes }
         : {}),
+      ...(opts.maxContextTokens !== undefined && familyDataFor(entry.modelType)?.acceptsMaxContext === true
+        ? { maxContextTokens: opts.maxContextTokens }
+        : {}),
     };
     try {
       return Object.keys(options).length === 0
@@ -421,6 +431,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     {
       ...(opts.kvFormat !== undefined ? { kvFormat: opts.kvFormat } : {}),
       ...(opts.maxMemoryBytes !== undefined ? { maxMemoryBytes: opts.maxMemoryBytes } : {}),
+      ...(opts.maxContextTokens !== undefined ? { maxContextTokens: opts.maxContextTokens } : {}),
     },
   );
   const chatController = makeSwapController(models, server.registry, loadModelPagedAware, boundEntry.name, (name) =>
@@ -610,7 +621,8 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
  * The native load-free estimate of an entry's family: qwen4_exp has its own
  * memory plan (a streamed expert store), so the qwen3_5 estimator never prices
  * it. A qwen4_exp default turn is autoregressive (MTP is opt-in), so its
- * estimate is the AR window. qwen4_exp takes only `maxMemoryBytes`.
+ * estimate is the AR window. qwen4_exp takes `maxMemoryBytes` and
+ * `maxContextTokens`.
  */
 export function nativeContextEstimate(
   qwen35: typeof estimateQwen35ContextWindow = estimateQwen35ContextWindow,
@@ -618,10 +630,11 @@ export function nativeContextEstimate(
 ): NonNullable<InferenceHostOptions['estimateContextWindow']> {
   return async (path, modelType, options) => {
     if (modelType !== 'qwen4_exp') return qwen35(path, modelType, options);
-    const estimate = await qwen4Exp(
-      path,
-      options?.maxMemoryBytes === undefined ? null : { maxMemoryBytes: options.maxMemoryBytes },
-    );
+    const qwen4Options = {
+      ...(options?.maxMemoryBytes !== undefined ? { maxMemoryBytes: options.maxMemoryBytes } : {}),
+      ...(options?.maxContextTokens !== undefined ? { maxContextTokens: options.maxContextTokens } : {}),
+    };
+    const estimate = await qwen4Exp(path, Object.keys(qwen4Options).length === 0 ? null : qwen4Options);
     return estimate == null ? null : { windowTokens: estimate.windowTokens, bound: estimate.bound };
   };
 }
@@ -631,16 +644,24 @@ export function nativeContextEstimate(
  * from its memory plan before it loads (`/v1/models` shows it until the
  * load's own window replaces it). One estimate at a time, in the background:
  * a GGUF's first estimate prepares its asset directory. A failed estimate
- * leaves the trained window.
+ * leaves the trained window. With `--max-context` a family that takes it
+ * shows that count until its estimate lands: Splash serves exactly that
+ * many tokens or does not start.
  */
 function startContextEstimates(
   models: readonly DiscoveredModel[],
   modelsDir: string,
   estimate: NonNullable<InferenceHostOptions['estimateContextWindow']>,
   resolvePath: (entry: DiscoveredModel) => Promise<string>,
-  options: Pick<Qwen35LoadOptions, 'kvFormat' | 'maxMemoryBytes'>,
+  options: Pick<Qwen35LoadOptions, 'kvFormat' | 'maxMemoryBytes' | 'maxContextTokens'>,
 ): Map<string, number> {
   const windows = new Map<string, number>();
+  const { maxContextTokens } = options;
+  if (maxContextTokens != null) {
+    for (const entry of models) {
+      if (familyDataFor(entry.modelType)?.acceptsMaxContext === true) windows.set(entry.name, maxContextTokens);
+    }
+  }
   void (async () => {
     for (const entry of models) {
       if (familyDataFor(entry.modelType)?.acceptsMaxMemory !== true) continue;
@@ -654,7 +675,8 @@ function startContextEstimates(
         });
         if (result != null) windows.set(entry.name, result.speculativeWindowTokens ?? result.windowTokens);
       } catch {
-        /* a load reports the same failure with its plan */
+        // A load reports the same failure with its plan.
+        windows.delete(entry.name);
       }
     }
   })();
@@ -662,6 +684,7 @@ function startContextEstimates(
 }
 
 export { discoverModels, type DiscoveredModel } from './discover.js';
+export { MAX_CONTEXT_ERROR, MAX_YARN_CONTEXT_TOKENS, parseMaxContext } from './max-context.js';
 export { MAX_MEMORY_ERROR, parseMaxMemory } from './max-memory.js';
 export {
   applyEnginePolicy,

@@ -77,6 +77,8 @@ export interface GrokAgentLaunchOptions {
   kvFormat?: 'int8' | 'bf16';
   /** Metal memory budget in bytes the spawned `mlx serve` plans with (`--max-memory`). */
   maxMemoryBytes?: number;
+  /** Context token limit the spawned `mlx serve` loads with (`--max-context`). */
+  maxContextTokens?: number;
   /** Test seam: custom spawn for the agent binary. */
   spawnAgent?: (bin: string, argv: string[], opts: SpawnOptions) => ChildProcess;
   /** Test seam: custom spawn for `mlx serve`. */
@@ -1709,6 +1711,7 @@ function spawnInferenceServer(opts: GrokAgentLaunchOptions): { child: ChildProce
     ...(opts.preloadModel !== undefined ? ['--preload', opts.preloadModel] : []),
     ...(opts.kvFormat !== undefined ? ['--kv-format', opts.kvFormat] : []),
     ...(opts.maxMemoryBytes !== undefined ? ['--max-memory', String(opts.maxMemoryBytes)] : []),
+    ...(opts.maxContextTokens !== undefined ? ['--max-context', String(opts.maxContextTokens)] : []),
   ];
   const child = (opts.spawnServe ?? ((argv, so) => spawn(process.execPath, argv, so)))(serveArgv, {
     stdio: ['ignore', 'pipe', 'inherit'],

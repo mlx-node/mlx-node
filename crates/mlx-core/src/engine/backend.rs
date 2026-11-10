@@ -1060,6 +1060,14 @@ pub(crate) trait ChatBackend {
         None
     }
 
+    /// Splash `Engine::submit`'s window for a turn no executor of the family
+    /// bounds: the full prompt must leave room for one new token, and the
+    /// output is clamped to the rest, before any cache changes. `None`
+    /// leaves the turn to its executor.
+    fn context_window(&self) -> Option<u32> {
+        None
+    }
+
     /// Byte budget for the turn's `WiredLimitContext`, or `None` for NO
     /// context at all.
     ///

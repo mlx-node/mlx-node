@@ -181,7 +181,8 @@ pub(crate) trait DFlash2Target: ChatBackend {
     fn turn_cancel(&self) -> Option<&AtomicBool>;
     fn kv_heads(&self) -> i32;
     fn head_dim(&self) -> i32;
-    fn max_position_embeddings(&self) -> i32;
+    /// The context a turn may hold (`context_cap`).
+    fn context_tokens(&self) -> u32;
     /// The speculative context window, `None` without a draft.
     fn dflash2_window(&self) -> Option<u32>;
     /// The load's memory plan; `None` when the working set is unreadable.
@@ -2232,11 +2233,7 @@ pub(crate) fn dflash2_chat_turn<T: DFlash2Target + DsparkBackend>(
     params.extra_eos_ids = ChatBackend::extra_eos_ids(target);
     let dflash_context_capacity = constrain_dflash2_context_params(
         tokens.len(),
-        target.max_position_embeddings(),
-        target
-            .dflash2()
-            .ok_or_else(|| Error::from_reason("loaded DFlash2 companion"))?
-            .max_position_embeddings(),
+        target.context_tokens(),
         target.dflash2_window(),
         &mut params,
     )?;

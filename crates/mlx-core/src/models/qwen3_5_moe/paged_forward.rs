@@ -1211,6 +1211,7 @@ mod tests {
         // dims also bumped to 32 so all attention paths share a
         // dtype-compatible layout.
         Qwen3_5MoeConfig {
+            rope_scaling: None,
             vocab_size: 128,
             hidden_size: 128,
             num_layers: 8,

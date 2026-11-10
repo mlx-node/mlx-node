@@ -4428,6 +4428,7 @@ pub(crate) mod tests {
 
     fn tiny_config() -> Qwen3_5Config {
         Qwen3_5Config {
+            rope_scaling: None,
             qwen35_gguf_gdn_layout: None,
             kv_format: None,
             vocab_size: 1024,
@@ -4462,6 +4463,7 @@ pub(crate) mod tests {
 
     fn tiny_moe_config() -> Qwen3_5MoeConfig {
         Qwen3_5MoeConfig {
+            rope_scaling: None,
             vocab_size: 1024,
             hidden_size: 64,
             num_layers: 8,

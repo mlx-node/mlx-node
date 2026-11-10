@@ -53,6 +53,14 @@ impl ChatBackend for Qwen35MoeInner {
         self.gen_defaults.eos_token_ids.clone()
     }
 
+    /// The flat lane has no executor that bounds it; the paged lane keeps
+    /// `preflight_paged_context`, DFlash2 `constrain_dflash2_context_params`.
+    fn context_window(&self) -> Option<u32> {
+        self.paged_adapter
+            .is_none()
+            .then(|| self.pool_context_limit())
+    }
+
     fn cached_token_history(&self) -> &[u32] {
         &self.cached_token_history
     }

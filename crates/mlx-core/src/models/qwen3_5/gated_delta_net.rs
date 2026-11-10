@@ -2224,6 +2224,7 @@ mod tests {
 
     fn kernel_geometry_net_with(weight: impl Fn(&[i64]) -> MxArray) -> GatedDeltaNet {
         let config = Qwen3_5Config {
+            rope_scaling: None,
             qwen35_gguf_gdn_layout: None,
             kv_format: None,
             vocab_size: 32,
@@ -2602,6 +2603,7 @@ mod tests {
     fn quantized_in_proj_net(tile_qkvz: bool) -> GatedDeltaNet {
         let hidden = 256i64;
         let config = Qwen3_5Config {
+            rope_scaling: None,
             qwen35_gguf_gdn_layout: None,
             kv_format: None,
             vocab_size: 32,

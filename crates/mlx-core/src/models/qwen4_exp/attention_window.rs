@@ -29,6 +29,7 @@ impl Decoder {
             self.config.rope_theta(),
             sections,
             interleaved,
+            self.yarn.as_ref(),
         )
     }
 

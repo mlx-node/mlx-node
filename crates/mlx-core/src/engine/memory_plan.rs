@@ -83,11 +83,19 @@ thread_local! {
     /// Stands in for the device on this thread.
     pub(crate) static LIVE_MEMORY_OVERRIDE: std::cell::Cell<Option<LiveMemory>> =
         const { std::cell::Cell::new(None) };
+    /// Makes the device unreadable on this thread.
+    #[cfg(test)]
+    pub(crate) static LIVE_MEMORY_UNREADABLE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// The device now; `None` when the working set or MLX's active bytes are
 /// unreadable.
 pub(crate) fn live_memory() -> Option<LiveMemory> {
+    #[cfg(test)]
+    if LIVE_MEMORY_UNREADABLE.with(std::cell::Cell::get) {
+        return None;
+    }
     #[cfg(test)]
     if let Some(live) = LIVE_MEMORY_OVERRIDE.with(std::cell::Cell::get) {
         return Some(live);
@@ -442,6 +450,23 @@ impl ContextBounds {
     }
 }
 
+/// Splash `ServingRuntime::start` over the default turn's `lane`: an explicit
+/// `max_context` it does not hold fails the load.
+pub(crate) fn check_max_context(
+    lane: ContextBounds,
+    bound: MemoryBound,
+    max_context: Option<u32>,
+) -> Result<(), PlanError> {
+    match max_context {
+        Some(requested) if requested > lane.maximum() => Err(PlanError::ContextAbovePlan {
+            requested,
+            plan: lane.maximum(),
+            bound,
+        }),
+        _ => Ok(()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LanePlan {
     pub window: ContextBounds,
@@ -541,6 +566,19 @@ pub(crate) enum PlanError {
         budget: u64,
         bound: MemoryBound,
     },
+    /// Splash `ServingRuntime::start`: an explicit `--max-context` above the
+    /// context the default turn's lane holds fails the start.
+    ContextAbovePlan {
+        requested: u32,
+        plan: u32,
+        bound: MemoryBound,
+    },
+    /// A `--max-context` past the native window on a load with no memory
+    /// plan, which Splash never starts without.
+    ContextWithoutPlan {
+        requested: u32,
+        native: u32,
+    },
 }
 
 fn bound_advice(bound: MemoryBound) -> &'static str {
@@ -609,6 +647,19 @@ impl PlanError {
                 "{label} memory plan: the floors of the memory plan require {required} bytes but \
                  the Metal memory budget is {budget} bytes; {}",
                 bound_advice(bound)
+            ),
+            Self::ContextAbovePlan {
+                requested,
+                plan,
+                bound,
+            } => format!(
+                "{label}: --max-context {requested} exceeds the {plan} tokens the model and {} \
+                 allow; omit it or pass at most {plan}",
+                bound.flag_text()
+            ),
+            Self::ContextWithoutPlan { requested, native } => format!(
+                "{label}: --max-context {requested} is past the native window of {native}, and \
+                 this load has no memory plan to hold it"
             ),
         }
     }

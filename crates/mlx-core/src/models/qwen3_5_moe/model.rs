@@ -159,6 +159,8 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) memory_plan: Option<crate::engine::memory_plan::MemoryPlan>,
     /// `--max-memory`: it only lowers the automatic hard budget.
     pub(crate) max_memory_bytes: Option<u64>,
+    /// `--max-context`: the context every turn may hold, at most the plan's.
+    pub(crate) max_context: Option<u32>,
     /// Set only by a tapped flat prefill; every other cache lane invalidates it.
     pub(crate) dflash2_flat_lane_authoritative: bool,
     pub(crate) dflash2_compiled_verify_disabled: bool,
@@ -510,14 +512,21 @@ impl Qwen3_5MoeModel {
             "Qwen3.5 MoE",
             options.max_memory_bytes,
         )?;
+        let max_context =
+            crate::nn::rope_scaling::max_context_option("Qwen3.5 MoE", options.max_context_tokens)?;
         let source = crate::engine::checkpoint_source::CheckpointSource::resolve(
             std::path::Path::new(&path),
             crate::utils::gguf::NativeGgufFamily::Qwen35Moe,
         )
         .await?;
-        let loaded =
-            persistence::load_with_source(&source, draft_model_path, kv_format, max_memory_bytes)
-                .await;
+        let loaded = persistence::load_with_source(
+            &source,
+            draft_model_path,
+            kv_format,
+            max_memory_bytes,
+            max_context,
+        )
+        .await;
         if loaded.is_err() {
             source.release_lease();
         }

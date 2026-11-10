@@ -73,6 +73,7 @@ mod flat_turn;
 mod forward;
 mod gdn_prefix;
 mod lifecycle;
+pub(crate) use lifecycle::cold_tier_config_json;
 mod mtp;
 mod paged_backend;
 mod paged_turn;
@@ -176,6 +177,8 @@ pub(crate) struct Qwen35Inner {
     pub(crate) memory_plan: Option<crate::engine::memory_plan::MemoryPlan>,
     /// `--max-memory`: it only lowers the automatic hard budget.
     pub(crate) max_memory_bytes: Option<u64>,
+    /// `--max-context`: the context every turn may hold, at most the plan's.
+    pub(crate) max_context: Option<u32>,
     /// Latched when the compiled DFlash2 verify graph fails at trace or
     /// replay — the failure mode is structural, so the stepper stays on the
     /// eager path for the rest of the model's lifetime.
@@ -416,6 +419,12 @@ pub struct Qwen35LoadOptions {
     /// automatic budget the load's memory plan derives from the working set.
     #[napi(ts_type = "number | undefined")]
     pub max_memory_bytes: Option<i64>,
+    /// Context token limit (`--max-context`), 1 to 1,010,000: every turn
+    /// holds at most this many tokens, and the load fails when its memory
+    /// plan holds fewer. Past the native window the target's RoPE takes
+    /// YaRN, which is static and changes answers at every length.
+    #[napi(ts_type = "number | undefined")]
+    pub max_context_tokens: Option<i64>,
 }
 
 /// Generation result
@@ -661,14 +670,21 @@ impl Qwen3_5Model {
             "Qwen3.5",
             options.max_memory_bytes,
         )?;
+        let max_context =
+            crate::nn::rope_scaling::max_context_option("Qwen3.5", options.max_context_tokens)?;
         let source = crate::engine::checkpoint_source::CheckpointSource::resolve(
             std::path::Path::new(&path),
             crate::utils::gguf::NativeGgufFamily::Qwen35,
         )
         .await?;
-        let loaded =
-            persistence::load_with_source(&source, draft_model_path, kv_format, max_memory_bytes)
-                .await;
+        let loaded = persistence::load_with_source(
+            &source,
+            draft_model_path,
+            kv_format,
+            max_memory_bytes,
+            max_context,
+        )
+        .await;
         if loaded.is_err() {
             source.release_lease();
         }

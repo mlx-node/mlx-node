@@ -396,6 +396,26 @@ These families do not read `MLX_PAGED_PER_SEQ_CTX`. A qwen4_exp (Flash Next)
 load plans its expert store and its windows from the same budget; see
 [Qwen3.8-Flash-Next](qwen38-flash-next.md#memory-and-ssd-residency).
 
+**`maxContextTokens` (`--max-context`).** qwen3_5, qwen3_5_moe and qwen4_exp
+loads take a context token limit from 1 to 1,010,000. At or below the native
+window (`max_position_embeddings`, 262,144) it only caps: `effectiveWindowTokens`,
+`speculativeWindowTokens`, the paged preflight and the scheduler hold at most
+that many tokens. Past the native window the target's RoPE takes static YaRN
+(Splash `RopeScaling` / `rotaryInverseFrequencies`: factor = N ÷ native,
+beta_fast 32, beta_slow 1, the rotated q/k dims scaled by 0.1·ln(factor) + 1;
+image rows take the same table; the DFlash2 draft keeps its own RoPE and is not
+capped by its own trained context) and the memory plan prices N tokens. A load
+whose plan holds fewer than N fails (`--max-context N exceeds the P tokens the
+model and … allow; omit it or pass at most P`), and so does a load past the
+native window without a memory plan (only when the device's memory is
+unreadable: a load with neither pool nor draft plans its flat lane, which
+`--max-context` caps and refuses like the others). `trainedWindowTokens`
+stays native, and the saved `config.json` never carries the factor; the SSD cold-tier key does
+(`rope yarn <factor> <native>`). A checkpoint whose RoPE is already scaled
+(`rope_parameters.rope_type` or `type` not `default`, or a GGUF
+`rope.scaling.type` other than `none`) is refused, and training refuses a model
+loaded with YaRN.
+
 ## Server-side sessions
 
 The HTTP endpoints `/v1/responses` and `/v1/messages` live in `@mlx-node/server` (`packages/server/src/endpoints/`). Both route through a per-model `SessionRegistry` (`packages/server/src/session-registry.ts`) that owns the `ChatSession` lifetimes — clients pass `previous_response_id` and the registry handles resume vs. cold-start replay internally.

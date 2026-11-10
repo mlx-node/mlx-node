@@ -45,7 +45,22 @@ impl MultimodalRoPE {
         mrope_section: Vec<i32>,
     ) -> Result<Self> {
         let base = base.unwrap_or(500000.0) as f32;
+        // Compute inverse frequencies: 1 / (base^(2i/dim))
+        let inv_freq_data: Vec<f32> = (0..dim)
+            .step_by(2)
+            .map(|i| 1.0 / base.powf(i as f32 / dim as f32))
+            .collect();
+        Self::with_inverse_frequencies(dim, mrope_section, &inv_freq_data, 1.0)
+    }
 
+    /// An M-RoPE over `dim` dims whose `dim / 2` inverse frequencies are
+    /// `inverse`, with cos and sin scaled by `attention_scaling`.
+    pub fn with_inverse_frequencies(
+        dim: i32,
+        mrope_section: Vec<i32>,
+        inverse: &[f32],
+        attention_scaling: f32,
+    ) -> Result<Self> {
         if mrope_section.len() != 3 {
             return Err(Error::new(
                 Status::InvalidArg,
@@ -65,26 +80,28 @@ impl MultimodalRoPE {
                 ),
             ));
         }
+        let half_dim = dim / 2;
+        if inverse.len() != half_dim as usize {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "M-RoPE takes {half_dim} inverse frequencies, got {}",
+                    inverse.len()
+                ),
+            ));
+        }
 
         let mrope_section_arr: [i32; 3] = [mrope_section[0], mrope_section[1], mrope_section[2]];
-
-        // Compute inverse frequencies: 1 / (base^(2i/dim))
-        let half_dim = dim / 2;
         let inv_freq_dim = half_dim as i64;
-        let mut inv_freq_data = Vec::with_capacity(half_dim as usize);
-        for i in (0..dim).step_by(2) {
-            let exp = i as f32 / dim as f32;
-            inv_freq_data.push(1.0 / base.powf(exp));
-        }
         // Pre-reshape to [1, 1, half_dim, 1] to avoid reshape+astype in every forward call.
         // Already float32, so no astype needed.
-        let inv_freq = MxArray::from_float32(&inv_freq_data, &[1, 1, inv_freq_dim, 1])?;
+        let inv_freq = MxArray::from_float32(inverse, &[1, 1, inv_freq_dim, 1])?;
 
         Ok(Self {
             mrope_section: mrope_section_arr,
             inv_freq: Arc::new(inv_freq),
             inv_freq_dim,
-            attention_scaling: 1.0,
+            attention_scaling,
         })
     }
 

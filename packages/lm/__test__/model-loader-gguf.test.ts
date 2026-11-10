@@ -117,6 +117,28 @@ describe('standalone GGUF model detection', () => {
     );
   });
 
+  // Mutation: drop `maxContextTokens` from `qwen35LoadOptions`' null test → red
+  // (a lone count never reaches the loader). Mutation: drop the
+  // `acceptsMaxContext` check → red (deepseek_v41 accepts it).
+  it('passes maxContextTokens to the Qwen3.5 and Flash Next loaders and rejects it elsewhere', async () => {
+    const dense = await writeStandaloneGguf('qwen35');
+    const denseSpy = vi.spyOn(Qwen35Model, 'load').mockResolvedValue({} as Qwen35Model);
+    await loadModel(dense.modelPath, { maxContextTokens: 102_400, autoLoadDraft: false });
+    expect(denseSpy).toHaveBeenLastCalledWith(dense.modelPath, { maxContextTokens: 102_400 });
+    const moe = await writeStandaloneGguf('qwen35moe');
+    const moeSpy = vi.spyOn(Qwen35MoeModel, 'load').mockResolvedValue({} as Qwen35MoeModel);
+    await loadModel(moe.modelPath, { maxContextTokens: 409_600, autoLoadDraft: false });
+    expect(moeSpy).toHaveBeenLastCalledWith(moe.modelPath, { maxContextTokens: 409_600 });
+    const flashNext = await writeStandaloneGguf('qwen4exp');
+    const flashNextSpy = vi.spyOn(Qwen4ExpModel, 'load').mockResolvedValue({} as Qwen4ExpModel);
+    await loadModel(flashNext.modelPath, { maxContextTokens: 102_400, autoLoadDraft: false });
+    expect(flashNextSpy).toHaveBeenLastCalledWith(flashNext.modelPath, { maxContextTokens: 102_400 });
+    const other = await writeStandaloneGguf('deepseek41');
+    await expect(loadModel(other.modelPath, { maxContextTokens: 102_400 })).rejects.toThrow(
+      'maxContextTokens (context token limit) is only supported by qwen3_5, qwen3_5_moe and qwen4_exp',
+    );
+  });
+
   it('passes a MoE companion and cache precision to the native loader', async () => {
     const { modelPath } = await writeStandaloneGguf('qwen35moe');
     const loaded = {} as Qwen35MoeModel;

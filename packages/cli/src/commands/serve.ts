@@ -14,6 +14,7 @@ import {
   LAUNCHER_ENGINE_POLICY,
   ModelNotFoundError,
   NoModelsDiscoveredError,
+  parseMaxContext,
   parseMaxMemory,
   resolveLogDir,
   resolveMlxNodeHome,
@@ -56,6 +57,15 @@ Options:
   --max-memory <size> Metal memory budget, e.g. 28G; it can only lower the
                       automatic budget (default: auto). Qwen3.5 dense and
                       MoE loads size their KV pool and windows from it.
+  --max-context <tokens>  Context token limit, e.g. 100K or 1M (K = 1024
+                      tokens, M = 1000000 tokens), up to the model's limit,
+                      at most 1010000; past its native window a model with
+                      YaRN turns it on, which is static and changes answers
+                      at every length, so pass more than the native window
+                      only when a request needs it (default: auto, the
+                      native window when memory holds it). Qwen3.5 dense,
+                      MoE and Qwen3.8 Flash Next take it; a load whose
+                      memory plan holds fewer tokens fails.
   --thinking-token-budget <n>  Thinking tokens of a thinking request that
                       sets no budget, after which its thinking closes
                       (default: no cap).
@@ -90,6 +100,7 @@ export interface ServeArgs {
   modelResidency?: 'capability' | 'single';
   kvFormat?: 'int8' | 'bf16';
   maxMemoryBytes?: number;
+  maxContextTokens?: number;
   thinkingTokenBudget?: number;
   rerankConfig?: string;
   logDir?: string;
@@ -116,6 +127,7 @@ export function parseServeArgs(argv: string[]): ServeArgs {
       'model-residency': { type: 'string' },
       'kv-format': { type: 'string' },
       'max-memory': { type: 'string' },
+      'max-context': { type: 'string' },
       'thinking-token-budget': { type: 'string' },
       'rerank-config': { type: 'string' },
       'auth-token': { type: 'string' },
@@ -144,6 +156,8 @@ export function parseServeArgs(argv: string[]): ServeArgs {
     throw new Error('--kv-format must be int8 or bf16');
   const maxMemoryText = values['max-memory'];
   const maxMemoryBytes = maxMemoryText === undefined ? undefined : parseMaxMemory(maxMemoryText);
+  const maxContextText = values['max-context'];
+  const maxContextTokens = maxContextText === undefined ? undefined : parseMaxContext(maxContextText);
   const budgetText = values['thinking-token-budget'];
   const thinkingTokenBudget = budgetText === undefined ? undefined : parseThinkingTokenBudget(budgetText);
   const verbose = (values.verbose ?? false) || values['log-dir'] != null;
@@ -158,6 +172,7 @@ export function parseServeArgs(argv: string[]): ServeArgs {
     ...(modelResidency !== undefined ? { modelResidency } : {}),
     ...(kvFormat !== undefined ? { kvFormat } : {}),
     ...(maxMemoryBytes !== undefined ? { maxMemoryBytes } : {}),
+    ...(maxContextTokens !== undefined ? { maxContextTokens } : {}),
     ...(thinkingTokenBudget !== undefined ? { thinkingTokenBudget } : {}),
     ...(values['rerank-config'] !== undefined ? { rerankConfig: values['rerank-config'] } : {}),
     authToken: values['auth-token'],
@@ -221,6 +236,7 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
       modelResidency: args.modelResidency,
       ...(args.kvFormat !== undefined ? { kvFormat: args.kvFormat } : {}),
       ...(args.maxMemoryBytes !== undefined ? { maxMemoryBytes: args.maxMemoryBytes } : {}),
+      ...(args.maxContextTokens !== undefined ? { maxContextTokens: args.maxContextTokens } : {}),
       ...(args.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: args.thinkingTokenBudget } : {}),
       ...(await readRerankConfig(args.rerankConfig)),
       authToken: args.authToken,

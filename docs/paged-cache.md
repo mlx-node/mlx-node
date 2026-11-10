@@ -52,10 +52,11 @@ already exceeds the hard budget (Splash `auditActualMemory`). The load log
 prints the plan (`memory plan:`), with `initial_blocks=`, `max_blocks=` and
 `pool_window_tokens=`.
 
-| Knob                    | Source                                                                       | Role                                                                                                 |
-| ----------------------- | ---------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `paged_cache_memory_mb` | config.json                                                                  | MAX pool size in MiB, at most the plan's; above it the load fails and names the MiB the plan allows. |
-| `maxMemoryBytes`        | `Qwen35LoadOptions` (napi load), `--max-memory` on `mlx serve` / `mlx agent` | Metal memory budget in bytes; it can only lower the automatic hard budget.                           |
+| Knob                    | Source                                                                        | Role                                                                                                                                                                                                           |
+| ----------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `paged_cache_memory_mb` | config.json                                                                   | MAX pool size in MiB, at most the plan's; above it the load fails and names the MiB the plan allows.                                                                                                           |
+| `maxMemoryBytes`        | `Qwen35LoadOptions` (napi load), `--max-memory` on `mlx serve` / `mlx agent`  | Metal memory budget in bytes; it can only lower the automatic hard budget.                                                                                                                                     |
+| `maxContextTokens`      | `Qwen35LoadOptions` (napi load), `--max-context` on `mlx serve` / `mlx agent` | Context token limit (1 to 1,010,000): caps every window; past the native window the target takes YaRN and the plan prices it; above the plan's window the load fails. The pool's size does not change with it. |
 
 The pool always starts at the runway. The host's paged-config overlay (`PagedConfigOverrideManager`)
 writes no pool size: it only forces `use_block_paged_cache`, and a source

@@ -85,24 +85,44 @@ export interface LoadModelOptions {
    * model families reject it.
    */
   maxMemoryBytes?: number;
+  /**
+   * Context token limit for `qwen3_5`, `qwen3_5_moe` and `qwen4_exp` targets
+   * (`--max-context`), 1 to 1,010,000: every turn holds at most this many
+   * tokens, and the load fails when its memory plan holds fewer. Past the
+   * native window the target's RoPE takes YaRN, which is static and changes
+   * answers at every length. Other model families reject it.
+   */
+  maxContextTokens?: number;
 }
 
 /** The native Qwen3.5 load options of `options`; `null` when none is set. */
 function qwen35LoadOptions(options: LoadModelOptions | undefined): Qwen35LoadOptions | null {
-  if (options?.draftModelPath === undefined && options?.kvFormat === undefined && options?.maxMemoryBytes === undefined)
+  if (
+    options?.draftModelPath === undefined &&
+    options?.kvFormat === undefined &&
+    options?.maxMemoryBytes === undefined &&
+    options?.maxContextTokens === undefined
+  )
     return null;
   return {
     draftModelPath: options.draftModelPath,
     kvFormat: options.kvFormat,
     maxMemoryBytes: options.maxMemoryBytes,
+    maxContextTokens: options.maxContextTokens,
   };
 }
 
 function qwen4ExpLoadOptions(options: LoadModelOptions | undefined): Qwen4ExpLoadOptions | null {
-  if (options?.auxiliaryModelPath === undefined && options?.maxMemoryBytes === undefined) return null;
+  if (
+    options?.auxiliaryModelPath === undefined &&
+    options?.maxMemoryBytes === undefined &&
+    options?.maxContextTokens === undefined
+  )
+    return null;
   return {
     ...(options.auxiliaryModelPath !== undefined ? { auxiliaryModelPath: options.auxiliaryModelPath } : {}),
     ...(options.maxMemoryBytes !== undefined ? { maxMemoryBytes: options.maxMemoryBytes } : {}),
+    ...(options.maxContextTokens !== undefined ? { maxContextTokens: options.maxContextTokens } : {}),
   };
 }
 
@@ -252,6 +272,12 @@ function dispatchLoad(
   if (options?.maxMemoryBytes !== undefined && requireFamilyData(modelType).acceptsMaxMemory !== true) {
     throw new Error(
       `maxMemoryBytes (Metal memory budget) is only supported by qwen3_5, qwen3_5_moe and qwen4_exp models; ` +
+        `${modelPath} has model_type "${modelType}"`,
+    );
+  }
+  if (options?.maxContextTokens !== undefined && requireFamilyData(modelType).acceptsMaxContext !== true) {
+    throw new Error(
+      `maxContextTokens (context token limit) is only supported by qwen3_5, qwen3_5_moe and qwen4_exp models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }

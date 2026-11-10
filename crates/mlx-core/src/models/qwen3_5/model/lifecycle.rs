@@ -75,6 +75,7 @@ impl Qwen35Inner {
             cache_recency,
             memory_plan: None,
             max_memory_bytes: None,
+            max_context: None,
             caches: None,
             tokenizer: None,
             vision_encoder: None,
@@ -142,6 +143,7 @@ impl Qwen35Inner {
                 recurrent,
                 None,
                 self.max_memory_bytes,
+                self.max_context,
             )?;
             return Ok(());
         }
@@ -156,7 +158,7 @@ impl Qwen35Inner {
         let block_size = self.config.paged_block_size();
         let head_size = self.config.head_dim as u32;
         let num_kv_heads = self.config.num_kv_heads as u32;
-        let max_seq_len = self.config.max_position_embeddings as u32;
+        let max_seq_len = self.config.served_context_tokens();
         let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
         let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
             attn_layer_count,
@@ -177,6 +179,7 @@ impl Qwen35Inner {
                 explicit_mib: self.config.paged_cache_memory_mb,
             }),
             self.max_memory_bytes,
+            self.max_context,
         )?
         .ok_or_else(|| {
             Error::from_reason(
@@ -276,8 +279,11 @@ impl Qwen35Inner {
         let geometry = crate::models::qwen3_5::gdn_sidecar::geometry(&self.config, &cache_dtype)?;
         let sidecar_policy =
             crate::models::qwen3_5::gdn_sidecar::policy(&self.config, &cache_dtype)?;
-        let mut config_json = serde_json::to_vec(&self.config).ok()?;
-        config_json.extend_from_slice(&geometry.fingerprint_component());
+        let config_json = cold_tier_config_json(
+            &self.config,
+            &self.config.scaling(),
+            &geometry.fingerprint_component(),
+        )?;
         let pool_geometry = crate::cold_tier::ColdTierGeometry {
             block_size: pool.block_size() as u64,
             num_layers: pool.num_layers() as u64,
@@ -332,9 +338,25 @@ impl Qwen35Inner {
     /// Tokens one paged, vision, MTP or flat autoregressive turn may hold:
     /// the plan's pool lane, or its flat lane on a load with neither pool
     /// nor draft. Without a plan (a pool installed by a test), the pool's
-    /// blocks after one recurrent cell; without a pool, the trained window.
+    /// blocks after one recurrent cell; without a pool, the served window.
+    /// All at most the context cap.
     pub(crate) fn pool_context_limit(&self) -> u32 {
-        let trained = self.config.max_position_embeddings.max(0) as u32;
+        self.pool_lane_limit().min(self.context_cap())
+    }
+
+    /// What the plan's YaRN or native window prices.
+    pub(crate) fn served_context(&self) -> u32 {
+        self.config.served_context_tokens()
+    }
+
+    /// The context every turn may hold: `--max-context`, else the served
+    /// window.
+    pub(crate) fn context_cap(&self) -> u32 {
+        self.max_context.unwrap_or_else(|| self.served_context())
+    }
+
+    fn pool_lane_limit(&self) -> u32 {
+        let trained = self.served_context();
         if let Some(plan) = self.memory_plan.as_ref() {
             if let Some(pool) = plan.pool.as_ref() {
                 return pool.lane.window.maximum();
@@ -369,16 +391,16 @@ impl Qwen35Inner {
     }
 
     /// The window a DFlash2 turn clamps on: the plan's speculative lane, the
-    /// trained windows without a plan; `None` without a draft.
+    /// context cap without a plan, both at most the cap; `None` without a
+    /// draft.
     pub(crate) fn speculative_window(&self) -> Option<u32> {
-        let draft = self.dflash2.as_ref()?;
-        let trained = (self.config.max_position_embeddings.max(0) as u32)
-            .min(draft.max_position_embeddings().min(u32::MAX as usize) as u32);
+        self.dflash2.as_ref()?;
+        let cap = self.context_cap();
         Some(
             self.memory_plan
                 .as_ref()
                 .and_then(|plan| plan.speculative.as_ref())
-                .map_or(trained, |lane| lane.window.maximum()),
+                .map_or(cap, |lane| lane.window.maximum().min(cap)),
         )
     }
 
@@ -969,4 +991,19 @@ impl Drop for Qwen35Inner {
     fn drop(&mut self) {
         self.erase_compiled_verifies();
     }
+}
+
+/// The cold-tier fingerprint's config input: the config, the GDN geometry
+/// and, with YaRN only, Splash `persistentCacheNamespace`'s rope line.
+pub(crate) fn cold_tier_config_json<C: serde::Serialize>(
+    config: &C,
+    scaling: &crate::nn::rope_scaling::RopeScaling,
+    geometry: &[u8],
+) -> Option<Vec<u8>> {
+    let mut config_json = serde_json::to_vec(config).ok()?;
+    config_json.extend_from_slice(geometry);
+    if let Some(line) = scaling.namespace_line() {
+        config_json.extend_from_slice(line.as_bytes());
+    }
+    Some(config_json)
 }

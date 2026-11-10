@@ -5339,6 +5339,13 @@ export interface Qwen35LoadOptions {
    * automatic budget the load's memory plan derives from the working set.
    */
   maxMemoryBytes?: number | undefined;
+  /**
+   * Context token limit (`--max-context`), 1 to 1,010,000: every turn
+   * holds at most this many tokens, and the load fails when its memory
+   * plan holds fewer. Past the native window the target's RoPE takes
+   * YaRN, which is static and changes answers at every length.
+   */
+  maxContextTokens?: number | undefined;
 }
 
 /**
@@ -5717,6 +5724,13 @@ export interface Qwen4ExpLoadOptions {
    * stores, the pool and the windows within.
    */
   maxMemoryBytes?: number;
+  /**
+   * Context token limit (`--max-context`), 1 to 1,010,000: the KV
+   * allowance the stores leave room for and the most any turn holds; the
+   * load fails when its plan holds fewer. Past the native window the
+   * target's RoPE takes YaRN.
+   */
+  maxContextTokens?: number;
 }
 
 /**

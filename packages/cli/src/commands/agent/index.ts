@@ -26,6 +26,7 @@ import { dirname, join, resolve } from 'node:path';
 // the family list must have exactly ONE definition (the drift guard's).
 import { CHAT_FAMILY_IDS, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
 import { readAgentDefaultModel } from '@mlx-node/agent/paths';
+import { MAX_CONTEXT_ERROR, parseMaxContext } from '@mlx-node/server/host/max-context';
 import { MAX_MEMORY_ERROR, parseMaxMemory } from '@mlx-node/server/host/max-memory';
 
 import {
@@ -66,6 +67,10 @@ export interface AgentArgScan {
   maxMemoryBytes?: number;
   /** `--max-memory` had a missing or unparseable value (the raw value, `''` when missing) — usage error. */
   maxMemoryInvalid?: string;
+  /** Tokens of `--max-context` (lifted out of the argv, forwarded to `mlx serve`); unset for `auto`. */
+  maxContextTokens?: number;
+  /** `--max-context` had a missing or unparseable value (the raw value, `''` when missing) — usage error. */
+  maxContextInvalid?: string;
   /**
    * `-h`/`--help` seen and this is NOT a binary-managed subcommand
    * (`models`/`export`/`doctor`/… print their own help inside the binary, so
@@ -239,6 +244,16 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       maxMemoryInvalid = value;
     }
   };
+  let maxContextTokens: number | undefined;
+  let maxContextInvalid: string | undefined;
+  const takeMaxContext = (value: string): void => {
+    try {
+      maxContextTokens = parseMaxContext(value);
+      maxContextInvalid = undefined;
+    } catch {
+      maxContextInvalid = value;
+    }
+  };
   let helpSeen = false;
   let versionSeen = false;
 
@@ -322,6 +337,20 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       takeMaxMemory(arg.slice('--max-memory='.length));
       continue;
     }
+    if (arg === '--max-context') {
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith('-')) {
+        maxContextInvalid = '';
+      } else {
+        takeMaxContext(next);
+        i++;
+      }
+      continue;
+    }
+    if (arg.startsWith('--max-context=')) {
+      takeMaxContext(arg.slice('--max-context='.length));
+      continue;
+    }
     if (arg === '--trace-dir') {
       trace = true;
       const next = argv[i + 1];
@@ -371,6 +400,8 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     ...(kvFormatInvalid !== undefined ? { kvFormatInvalid } : {}),
     ...(maxMemoryBytes !== undefined ? { maxMemoryBytes } : {}),
     ...(maxMemoryInvalid !== undefined ? { maxMemoryInvalid } : {}),
+    ...(maxContextTokens !== undefined ? { maxContextTokens } : {}),
+    ...(maxContextInvalid !== undefined ? { maxContextInvalid } : {}),
     help: helpSeen && !isSubcommand,
     update: leadingCommand === 'update',
     grokOneShot: versionSeen || (isSubcommand && (leadingCommand !== 'agent' || helpSeen)),
@@ -573,6 +604,13 @@ mlx options (handled before the agent binary sees the args):
                             pool ignores it and stays bf16. bf16 uses more memory.
   --max-memory <size>       Metal memory budget, e.g. 28G; it can only lower the
                             automatic budget (default: auto).
+  --max-context <tokens>    Context token limit, e.g. 100K or 1M (K = 1024 tokens,
+                            M = 1000000 tokens), up to the model's limit, at most
+                            1010000; past its native window a model with YaRN
+                            turns it on, which is static and changes answers at
+                            every length, so pass more than the native window
+                            only when a request needs it (default: auto, the
+                            native window when memory holds it).
   --no-persist-cache        Disable the on-by-default SSD cold tier for persisted
                             paged prefix blocks. One switch for ALL restore-eligible
                             families (${coldTierRestoreFamilyList().join(', ')});
@@ -740,6 +778,12 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     return;
   }
 
+  if (scan.maxContextInvalid !== undefined) {
+    console.error(MAX_CONTEXT_ERROR);
+    process.exitCode = 1;
+    return;
+  }
+
   // Must run before the spawned `mlx serve` starts so its native tracing
   // subscriber picks up the env we export here.
   configureAgentTracing(scan);
@@ -804,5 +848,6 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     ...(preloadModel !== undefined ? { preloadModel } : {}),
     ...(scan.kvFormat !== undefined ? { kvFormat: scan.kvFormat } : {}),
     ...(scan.maxMemoryBytes !== undefined ? { maxMemoryBytes: scan.maxMemoryBytes } : {}),
+    ...(scan.maxContextTokens !== undefined ? { maxContextTokens: scan.maxContextTokens } : {}),
   });
 }

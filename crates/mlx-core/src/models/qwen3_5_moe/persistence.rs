@@ -1772,6 +1772,7 @@ pub async fn load_with_thread(
         draft_model_path,
         kv_format,
         None,
+        None,
     )
     .await
 }
@@ -1806,6 +1807,7 @@ pub(crate) async fn load_with_source(
     draft_model_path: Option<String>,
     kv_format: Option<crate::transformer::KvFormat>,
     max_memory_bytes: Option<u64>,
+    max_context: Option<u32>,
 ) -> Result<Qwen3_5MoeModel> {
     // Snapshot once, before spawning; forward/compiled graphs never read this
     // diagnostic setting and another load cannot change an existing model.
@@ -1859,6 +1861,20 @@ pub(crate) async fn load_with_source(
                     .map_err(|e| Error::from_reason(format!("Failed to parse config: {}", e)))?;
 
                 let mut config = parse_config(&raw)?;
+                config.rope_scaling = Some(crate::nn::rope_scaling::RopeScaling::served_for(
+                    "Qwen3.5 MoE",
+                    config.max_position_embeddings.max(0) as u32,
+                    config.scaling(),
+                    max_context,
+                )?);
+                if config.scaling().yarn() {
+                    info!(
+                        "Qwen3.5 MoE {}",
+                        config
+                            .scaling()
+                            .startup_line(config.served_context_tokens())
+                    );
+                }
                 source_moe_policy.validate_mixer_profile(&config)?;
                 source_moe_policy.validate_head_profile(&config)?;
                 if source_qk_request.is_some() {
@@ -2085,6 +2101,7 @@ pub(crate) async fn load_with_source(
                 // Create inner model
                 let mut inner = Qwen35MoeInner::new(config.clone())?;
                 inner.max_memory_bytes = max_memory_bytes;
+                inner.max_context = max_context;
                 inner.configure_source_moe_policy(source_moe_policy);
                 if source_moe_policy.active() {
                     info!(
@@ -2400,6 +2417,7 @@ pub(crate) fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
     let rope_obj = text_cfg
         .and_then(|tc| tc.get("rope_parameters"))
         .or_else(|| raw.get("rope_parameters"));
+    crate::nn::rope_scaling::refuse_scaled_rope("Qwen3.5 MoE", rope_obj)?;
 
     let partial_rotary_factor = rope_obj
         .and_then(|rp| rp["partial_rotary_factor"].as_f64())
@@ -2445,6 +2463,7 @@ pub(crate) fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
     }
 
     Ok(Qwen3_5MoeConfig {
+        rope_scaling: None,
         vocab_size,
         hidden_size,
         num_layers,
@@ -2577,6 +2596,44 @@ pub fn create_random_qwen35_moe_checkpoint<'env>(
 mod tests {
     use crate::models::mtp_drafter::strip_wrapper_prefix;
     use serde_json::json;
+
+    /// The MoE config refuses a scaled rope and hands its YaRN to the dense
+    /// config every attention layer is built from. Mutation:
+    /// `to_dense_config` drops the scaling → red.
+    #[test]
+    fn moe_dense_config_carries_the_scaling() {
+        let raw = json!({
+            "model_type": "qwen3_5_moe",
+            "hidden_size": 64,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "intermediate_size": 128,
+            "num_experts": 2,
+            "max_position_embeddings": 262_144,
+            "rope_parameters": {"rope_type": "default"},
+        });
+        let mut config = super::parse_config(&raw).unwrap();
+        config.rope_scaling = Some(
+            crate::nn::rope_scaling::RopeScaling::served_for(
+                "Qwen3.5 MoE",
+                262_144,
+                config.scaling(),
+                Some(409_600),
+            )
+            .unwrap(),
+        );
+        assert!(config.scaling().yarn());
+        assert_eq!(config.to_dense_config().scaling(), config.scaling());
+        assert_eq!(config.served_context_tokens(), 409_600);
+        let mut scaled = raw.clone();
+        scaled["rope_parameters"] = json!({"rope_type": "yarn"});
+        let error = super::parse_config(&scaled).unwrap_err();
+        assert!(
+            error.reason.starts_with("Qwen3.5 MoE config:"),
+            "{}",
+            error.reason
+        );
+    }
 
     /// The preload equals what the directory loader reads from the
     /// converter's output: the converter's tensors (the checked-in golden
@@ -3166,6 +3223,7 @@ mod tests {
     /// head_dim = 128`. Mirrors `paged_forward::tests::moe_paged_tiny_config`.
     fn moe_paged_tiny_cfg() -> Qwen3_5MoeConfig {
         Qwen3_5MoeConfig {
+            rope_scaling: None,
             vocab_size: 128,
             hidden_size: 128,
             num_layers: 8,
@@ -3440,6 +3498,7 @@ mod tests {
     /// K % 16 == 0 contract.
     fn tiny_sym8_moe_cfg() -> Qwen3_5MoeConfig {
         Qwen3_5MoeConfig {
+            rope_scaling: None,
             vocab_size: 8,
             hidden_size: 64,
             num_layers: 1,

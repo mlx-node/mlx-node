@@ -2420,6 +2420,7 @@ fn inner_over(mut decoder: decoder::Decoder, vision: media::Vision, has_mtp: boo
         media_prefill: None,
         _pool_guard: None,
         memory_plan: crate::engine::memory_plan::MemoryPlan::with_dynamic(memory::WORKING_BYTES),
+        max_context: None,
         open_turns: Default::default(),
         exclusive_turn: false,
     }

@@ -8,13 +8,15 @@ use napi_derive::napi;
 use crate::array::DType;
 use crate::engine::checkpoint_source::CheckpointSource;
 use crate::engine::memory_plan::{
-    FlatInput, KvLayout, LaneShape, LiveMemory, MeasuredMemory, MemoryFootprint, MemoryPlan,
-    PoolInput, SPECULATIVE_SCRATCH_TOKENS, live_memory, speculative_lane_bytes,
+    ContextBounds, FlatInput, KvLayout, LaneShape, LiveMemory, MeasuredMemory, MemoryFootprint,
+    MemoryPlan, PlanError, PoolInput, SPECULATIVE_SCRATCH_TOKENS, check_max_context, live_memory,
+    speculative_lane_bytes,
 };
 use crate::models::quant_dispatch::{
     has_sym8_mode, parse_quant_settings, select_quantization_block,
 };
 use crate::models::quantized_linear::{DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE};
+use crate::nn::rope_scaling::RopeScaling;
 use crate::transformer::KvFormat;
 use crate::utils::gguf::NativeGgufFamily;
 
@@ -57,7 +59,6 @@ pub(crate) struct PoolGeometry {
 pub(crate) struct DraftTerms {
     pub block_size: usize,
     pub tap_layers: usize,
-    pub trained: u32,
     pub ring_bytes: u64,
     pub weight_bytes: u64,
 }
@@ -67,7 +68,6 @@ impl DraftTerms {
         Self {
             block_size: config.block_size,
             tap_layers: config.target_layers.len(),
-            trained: config.max_position_embeddings().min(u32::MAX as usize) as u32,
             ring_bytes: config.kv_ring_bytes(),
             weight_bytes,
         }
@@ -111,7 +111,7 @@ pub(crate) fn evaluate_qwen35_plan(
         held_back_bytes: 0,
     };
     let recurrent_state_bytes = lanes.recurrent_state_bytes;
-    let trained = config.max_position_embeddings.max(0) as u32;
+    let trained = config.served_context_tokens();
     let fa_layers = config.full_attention_layer_count();
     let kernels = PrefillSdpaKernels::probe(config.head_dim);
     let pool_transient = |window| pool_lane_transient(config, DType::BFloat16, kernels, window);
@@ -146,7 +146,7 @@ pub(crate) fn evaluate_qwen35_plan(
         |window| dflash2_lane_transient(config, block_size, format, tap_layers, window);
     let speculative = draft.map(|draft| FlatInput {
         shape: LaneShape {
-            trained: trained.min(draft.trained),
+            trained,
             lane_bytes: speculative_lane_bytes(recurrent_state_bytes, draft.ring_bytes),
             layout: KvLayout::of(
                 fa_layers,
@@ -181,6 +181,45 @@ pub(crate) fn evaluate_qwen35_plan(
         .map_err(|error| Error::from_reason(error.message(label)))
 }
 
+/// The lane a default turn takes: DFlash2 with a draft, else the pool,
+/// else the flat lane of a load with neither.
+fn default_turn_window(plan: &MemoryPlan) -> Option<ContextBounds> {
+    plan.speculative
+        .as_ref()
+        .map(|lane| lane.window)
+        .or(plan.pool.as_ref().map(|pool| pool.lane.window))
+        .or(plan.flat.as_ref().map(|lane| lane.window))
+}
+
+/// Splash `ServingRuntime::start`'s `--max-context` refusal over `plan`.
+pub(crate) fn check_qwen35_max_context(
+    label: &str,
+    plan: &MemoryPlan,
+    max_context: Option<u32>,
+) -> Result<()> {
+    match default_turn_window(plan) {
+        Some(window) => check_max_context(window, plan.bound, max_context)
+            .map_err(|error| Error::from_reason(error.message(label))),
+        None => Ok(()),
+    }
+}
+
+/// A load without a plan (device memory unreadable) serves at most its
+/// native window.
+fn check_unplanned_max_context(
+    label: &str,
+    config: &Qwen3_5Config,
+    max_context: Option<u32>,
+) -> Result<()> {
+    let native = config.max_position_embeddings.max(0) as u32;
+    match max_context {
+        Some(requested) if requested > native => Err(Error::from_reason(
+            PlanError::ContextWithoutPlan { requested, native }.message(label),
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// The plan of `target`'s load from what the device holds now: the pool lane
 /// when `pool` is set, the DFlash2 lane with a draft, the flat lane with
 /// neither. `None` when the working set is unreadable.
@@ -190,12 +229,14 @@ pub(crate) fn plan_qwen35_load<T: DFlash2Target>(
     recurrent_state_bytes: u64,
     pool: Option<PoolGeometry>,
     max_memory_bytes: Option<u64>,
+    max_context: Option<u32>,
 ) -> Result<Option<MemoryPlan>> {
     let draft = target.dflash2();
+    let config = target.dense_config();
     let Some(live) = live_memory() else {
+        check_unplanned_max_context(label, &config, max_context)?;
         return Ok(None);
     };
-    let config = target.dense_config();
     let lanes = LoadLanes {
         config: &config,
         recurrent_state_bytes,
@@ -205,6 +246,7 @@ pub(crate) fn plan_qwen35_load<T: DFlash2Target>(
         dtype: dflash2_target_kv_dtype(target)?,
     };
     let plan = evaluate_qwen35_plan(label, &lanes, live, max_memory_bytes)?;
+    check_qwen35_max_context(label, &plan, max_context)?;
     if let Some(line) = plan.max_memory_ignored() {
         tracing::info!("{label} {line}");
     }
@@ -295,6 +337,8 @@ pub async fn estimate_qwen35_context_window(
         .transpose()
         .map_err(|message| Error::from_reason(format!("{label} estimate: {message}")))?;
     let max_memory_bytes = max_memory_option(label, options.max_memory_bytes)?;
+    let max_context =
+        crate::nn::rope_scaling::max_context_option(label, options.max_context_tokens)?;
     let source = CheckpointSource::resolve(Path::new(&model_path), family).await?;
     let estimate = checkpoint_weight_bytes(&source).and_then(|weight_bytes| {
         estimate_qwen35_load(
@@ -306,6 +350,7 @@ pub async fn estimate_qwen35_context_window(
                 draft_dir: options.draft_model_path.as_deref().map(Path::new),
                 kv_format,
                 max_memory_bytes,
+                max_context,
             },
         )
     });
@@ -363,6 +408,7 @@ pub(crate) struct EstimateInput<'a> {
     pub draft_dir: Option<&'a Path>,
     pub kv_format: Option<KvFormat>,
     pub max_memory_bytes: Option<u64>,
+    pub max_context: Option<u32>,
 }
 
 /// The plan a load of `input` would make on the device now, with the
@@ -390,6 +436,12 @@ pub(crate) fn estimate_qwen35_load(
     } else {
         crate::models::qwen3_5::persistence::parse_config(&raw)?
     };
+    config.rope_scaling = Some(RopeScaling::served_for(
+        label,
+        config.max_position_embeddings.max(0) as u32,
+        config.scaling(),
+        input.max_context,
+    )?);
     let (_, _, top_level_mode, per_layer_quant) = parse_quant_settings(
         select_quantization_block(&raw)?,
         DEFAULT_QUANT_BITS,
@@ -435,8 +487,10 @@ pub(crate) fn estimate_qwen35_load(
     } else {
         None
     };
-    let trained = config.max_position_embeddings.max(0) as u32;
+    let served = config.served_context_tokens();
+    let cap = input.max_context.unwrap_or(served);
     let Some(mut live) = live_memory() else {
+        check_unplanned_max_context(label, &config, input.max_context)?;
         return Ok(None);
     };
     live.active_bytes = live
@@ -452,6 +506,7 @@ pub(crate) fn estimate_qwen35_load(
         dtype: DType::BFloat16,
     };
     let plan = evaluate_qwen35_plan(label, &lanes, live, input.max_memory_bytes)?;
+    check_qwen35_max_context(label, &plan, input.max_context)?;
     let window = plan
         .pool
         .as_ref()
@@ -459,11 +514,13 @@ pub(crate) fn estimate_qwen35_load(
         .or(plan.flat)
         .map(|lane| lane.window);
     let speculative_window = plan.speculative.as_ref().map(|lane| lane.window);
-    let served = speculative_window.or(window);
+    let capped = |tokens: u32| tokens.min(cap);
     Ok(Some(Qwen35ContextEstimate {
-        window_tokens: window.map_or(trained, |window| window.maximum()),
-        speculative_window_tokens: speculative_window.map(|window| window.maximum()),
-        bound: served.map_or("model", |window| window.bound()).to_string(),
+        window_tokens: capped(window.map_or(served, |window| window.maximum())),
+        speculative_window_tokens: speculative_window.map(|window| capped(window.maximum())),
+        bound: default_turn_window(&plan)
+            .map_or("model", |window| window.bound())
+            .to_string(),
     }))
 }
 

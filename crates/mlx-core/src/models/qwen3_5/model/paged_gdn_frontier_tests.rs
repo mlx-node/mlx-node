@@ -7,6 +7,7 @@ use crate::models::qwen3_5::config::Qwen3_5Config;
 
 fn tiny_cfg() -> Qwen3_5Config {
     Qwen3_5Config {
+        rope_scaling: None,
         qwen35_gguf_gdn_layout: None,
         kv_format: None,
         vocab_size: 1024,

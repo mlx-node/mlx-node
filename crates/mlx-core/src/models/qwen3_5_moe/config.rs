@@ -128,6 +128,12 @@ pub struct Qwen3_5MoeConfig {
     #[serde(default)]
     #[napi(ts_type = "string | undefined")]
     pub kv_format: Option<String>,
+
+    /// YaRN of a load past the native window (`maxContextTokens`); never
+    /// saved, so `max_position_embeddings` stays the native window.
+    #[napi(skip_typescript)]
+    #[serde(skip)]
+    pub rope_scaling: Option<crate::nn::rope_scaling::RopeScaling>,
 }
 
 fn default_linear_num_value_heads() -> i32 {
@@ -162,6 +168,18 @@ fn default_norm_topk_prob() -> bool {
 }
 
 impl Qwen3_5MoeConfig {
+    /// Splash `servedContextTokens`: the native window, or the YaRN window.
+    pub(crate) fn served_context_tokens(&self) -> u32 {
+        self.scaling()
+            .served_context_tokens(self.max_position_embeddings.max(0) as u32)
+    }
+
+    /// The YaRN this load serves; none without `maxContextTokens` past the
+    /// native window.
+    pub(crate) fn scaling(&self) -> crate::nn::rope_scaling::RopeScaling {
+        self.rope_scaling.unwrap_or_default()
+    }
+
     /// Tokens per paged KV block; also the granularity of DFlash2 prefix
     /// accounting.
     pub(crate) fn paged_block_size(&self) -> u32 {
@@ -210,6 +228,7 @@ impl Qwen3_5MoeConfig {
             n_mtp_layers: self.n_mtp_layers,
             qwen35_gguf_gdn_layout: self.qwen35_gguf_gdn_layout.clone(),
             kv_format: self.kv_format.clone(),
+            rope_scaling: self.rope_scaling,
         }
     }
 

@@ -16,6 +16,7 @@ use crate::models::qwen3_5::decoder_layer::{self, AttentionType};
 
 fn tiny_cfg(use_block_paged: bool) -> Qwen3_5Config {
     Qwen3_5Config {
+        rope_scaling: None,
         qwen35_gguf_gdn_layout: None,
         kv_format: None,
         vocab_size: 1024,
@@ -3635,4 +3636,97 @@ fn scheduled_mtp_owner_replay_matches_independent() {
         inner.park_active_scheduled_recurrent().unwrap();
     }
     crate::models::qwen3_5::scheduled_mtp::tests::owner_replay_matches_independent(&mut inner);
+}
+
+/// Gate: a `--max-context` cap bounds every reader of the window while the
+/// trained window stays native. Mutation: `context_cap` returns the
+/// served window → red (1,024).
+#[test]
+fn scheduler_and_preflight_follow_the_cap() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
+    inner.max_context = Some(100);
+    let limits = inner.context_limits_snapshot();
+    assert_eq!(limits.effective_window_tokens, 100);
+    assert_eq!(limits.trained_window_tokens, 1024);
+    assert_eq!(HybridSchedulerBackend::max_position_embeddings(&inner), 100);
+    let params = |max_new_tokens| {
+        crate::engine::params::extract_chat_params(&crate::engine::types::ChatConfig {
+            max_new_tokens: Some(max_new_tokens),
+            ..Default::default()
+        })
+    };
+    let mut fits = params(64);
+    constrain_paged_context_params("Qwen3.5", 99, inner.pool_context_limit(), &mut fits)
+        .expect("99 tokens fit a 100-token cap");
+    assert_eq!(fits.max_new_tokens, 1);
+    let error =
+        constrain_paged_context_params("Qwen3.5", 100, inner.pool_context_limit(), &mut params(64))
+            .unwrap_err();
+    assert!(
+        error
+            .reason
+            .starts_with("context_length_exceeded: rendered prompt has 100 tokens"),
+        "{}",
+        error.reason
+    );
+}
+
+/// Gate: with no pool the chat turn core holds the flat lane's capped
+/// window (Splash `Engine::submit`). Mutation: the dense `context_window`
+/// returns `None` → red.
+#[test]
+fn flat_context_window_is_the_capped_lane() {
+    let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
+    assert!(inner.paged_adapter.is_none());
+    assert_eq!(
+        crate::engine::backend::ChatBackend::context_window(&inner),
+        Some(1024)
+    );
+    inner.max_context = Some(100);
+    assert_eq!(
+        crate::engine::backend::ChatBackend::context_window(&inner),
+        Some(100)
+    );
+}
+
+/// The YaRN factor reaches the cold-tier fingerprint (Splash
+/// `persistentCacheNamespace`) but never the saved config. Mutation:
+/// leave the rope line out of `cold_tier_config_json` → red.
+#[test]
+fn yarn_reaches_the_cold_tier_key_not_the_saved_config() {
+    use crate::nn::rope_scaling::RopeScaling;
+    let plain = tiny_cfg(false);
+    let mut scaled = tiny_cfg(false);
+    scaled.rope_scaling = Some(RopeScaling {
+        factor: 1.5625,
+        original_context_tokens: 262_144,
+    });
+    assert_eq!(
+        serde_json::to_vec(&plain).unwrap(),
+        serde_json::to_vec(&scaled).unwrap()
+    );
+    let key = |config: &Qwen3_5Config| {
+        super::cold_tier_config_json(config, &config.scaling(), b"geometry").unwrap()
+    };
+    let mut expected = serde_json::to_vec(&plain).unwrap();
+    expected.extend_from_slice(b"geometry");
+    assert_eq!(key(&plain), expected);
+    expected.extend_from_slice(b"rope yarn 1.5625 262144\n");
+    assert_eq!(key(&scaled), expected);
+    let moe_plain = crate::models::qwen3_5_moe::persistence::parse_config(&serde_json::json!({
+        "model_type": "qwen3_5_moe",
+        "hidden_size": 64,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 2,
+        "intermediate_size": 128,
+        "num_experts": 2,
+    }))
+    .unwrap();
+    let mut moe_scaled = moe_plain.clone();
+    moe_scaled.rope_scaling = scaled.rope_scaling;
+    assert_ne!(
+        super::cold_tier_config_json(&moe_plain, &moe_plain.scaling(), b"g").unwrap(),
+        super::cold_tier_config_json(&moe_scaled, &moe_scaled.scaling(), b"g").unwrap()
+    );
 }

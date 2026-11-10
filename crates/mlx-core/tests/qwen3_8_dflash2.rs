@@ -37,6 +37,7 @@ async fn qwen38_dflash2_loads_and_runs_a_verified_cycle() {
             draft_model_path: Some(draft),
             kv_format: None,
             max_memory_bytes: None,
+            max_context_tokens: None,
         }),
     )
     .await

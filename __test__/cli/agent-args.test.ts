@@ -194,6 +194,36 @@ describe('scanAgentArgs', () => {
     });
   });
 
+  // Mutation: stop lifting `--max-context` (forward it to grok) → red.
+  describe('--max-context extraction', () => {
+    it('lifts both forms out of passthrough as tokens', () => {
+      const spaced = scanAgentArgs(['--max-context', '100K', '-p', 'hi']);
+      expect(spaced.maxContextTokens).toBe(102_400);
+      expect(spaced.maxContextInvalid).toBeUndefined();
+      expect(spaced.passthrough).toEqual(['-p', 'hi']);
+      const inline = scanAgentArgs(['--max-context=1M', '-c']);
+      expect(inline.maxContextTokens).toBe(1_000_000);
+      expect(inline.passthrough).toEqual(['-c']);
+      const auto = scanAgentArgs(['--max-context', 'auto']);
+      expect('maxContextTokens' in auto).toBe(false);
+      expect(auto.maxContextInvalid).toBeUndefined();
+    });
+
+    it('keeps a --max-context sitting in a grok value slot', () => {
+      const scan = scanAgentArgs(['--system-prompt-override', '--max-context', '100K']);
+      expect(scan.maxContextTokens).toBeUndefined();
+      expect(scan.passthrough).toEqual(['--system-prompt-override', '--max-context', '100K']);
+    });
+
+    it('reports a missing or bad value without swallowing the next option', () => {
+      expect(scanAgentArgs(['--max-context', '2M']).maxContextInvalid).toBe('2M');
+      expect(scanAgentArgs(['--max-context=']).maxContextInvalid).toBe('');
+      const missing = scanAgentArgs(['--max-context', '--help']);
+      expect(missing.maxContextInvalid).toBe('');
+      expect(missing.passthrough).toEqual(['--help']);
+    });
+  });
+
   describe('update intercept', () => {
     it('detects a leading update positional', () => {
       expect(scanAgentArgs(['update']).update).toBe(true);
@@ -789,6 +819,32 @@ describe('run() argv routing', () => {
     expect(calls.launch).toHaveLength(1);
     expect(calls.launch[0]!.maxMemoryBytes).toBe(30_064_771_072);
     expect(calls.launch[0]!.argv).not.toContain('--max-memory');
+  });
+
+  // Mutation: drop the `maxContextInvalid` usage check in `run` → red (a bad
+  // count launches). Mutation: drop the launcher pass-through → red.
+  it('exits 1 on a bad --max-context and hands a good one to the launcher', async () => {
+    for (const argv of [['--max-context', '0'], ['--max-context'], ['--max-context=1010001']]) {
+      const { deps, calls } = makeDeps();
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const prevExitCode = process.exitCode;
+      try {
+        await run(argv, deps);
+        expect(process.exitCode).toBe(1);
+        expect(errorSpy.mock.calls.flat().join('\n')).toContain(
+          "--max-context must be 'auto' or a token count up to 1010000, such as 100K or 1M (K = 1024 tokens, M = 1000000 tokens)",
+        );
+      } finally {
+        process.exitCode = prevExitCode;
+        errorSpy.mockRestore();
+      }
+      expect(calls.launch).toHaveLength(0);
+    }
+    const { deps, calls } = makeDeps();
+    await run(['--max-context', '100K'], deps);
+    expect(calls.launch).toHaveLength(1);
+    expect(calls.launch[0]!.maxContextTokens).toBe(102_400);
+    expect(calls.launch[0]!.argv).not.toContain('--max-context');
   });
 
   it('documents the mlx flags and the grok environment in the help preamble', async () => {

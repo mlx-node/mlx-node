@@ -42,6 +42,7 @@ impl Qwen35MoeInner {
         max_position_embeddings: i32,
     ) -> Result<()> {
         let rope_dims = self.config.rope_dims();
+        let scaling = self.config.scaling();
         for layer in self.layers.iter_mut() {
             if let crate::models::qwen3_5_moe::decoder_layer::AttentionType::Full(ref mut attn) =
                 layer.attn
@@ -51,6 +52,7 @@ impl Qwen35MoeInner {
                     rope_theta,
                     max_position_embeddings,
                     rope_dims,
+                    &scaling,
                 )?;
             }
         }
