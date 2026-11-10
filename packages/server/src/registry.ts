@@ -440,6 +440,13 @@ export class ModelRegistry {
     return leases;
   }
 
+  /** Post-commit persists still retaining a chat binding. */
+  get persistRetainCount(): number {
+    let retains = 0;
+    for (const binding of this.sessionRegistriesByModel.values()) retains += binding.pendingPersists;
+    return retains;
+  }
+
   /** Waits for every model disposal a teardown has started. */
   async settleModelDisposals(): Promise<void> {
     await Promise.all(this.modelDisposals);

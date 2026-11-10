@@ -18,6 +18,9 @@ import type { IdleSweeper } from './idle-sweeper.js';
 /** Splash `MemoryControl` beat: a release an unfinished lease refused is tried again this often. */
 export const WEIGHT_RELEASE_RETRY_MS = 500;
 
+/** Node fires a longer timeout after 1 ms: a longer wait is armed in chunks (Splash polls its deadline). */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
 /** Splash `WeightsSnapshot`; `idleReleaseSeconds` is `null` for `off`. */
 export interface WeightsSnapshot {
   idleReleaseSeconds: number | null;
@@ -32,9 +35,15 @@ export interface WeightResidencyOptions {
   idleReleaseMs: number;
   /** Unloads every resident chat model; runs in the coordinator's writer slot. */
   release: () => Promise<void>;
+  /**
+   * Hands the allocator's free pool back to the OS after `release`, still in
+   * the writer slot: MLX keeps freed buffers pooled, Splash
+   * `MetalAllocation::detach` frees them.
+   */
+  drain: () => void;
   /** Runs `fn` in the exclusive writer slot. */
   exclusive: <T>(fn: () => Promise<T>) => Promise<T>;
-  /** Work this count does not see: a load, a queued writer, a dispatch lease. */
+  /** Work this count does not see: a load, a queued writer, a dispatch lease, a response persist. */
   busy: () => boolean;
   /** Whether a chat model is resident. */
   resident: () => boolean;
@@ -98,6 +107,8 @@ export function createWeightResidency(options: WeightResidencyOptions): WeightRe
   let closed = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let releasing: Promise<WeightsSnapshot> | null = null;
+  /** Splash `WeightResidency` `idleSince_`: the release is due `delayMs` after it. */
+  let idleSince = now();
 
   const cancel = (): void => {
     if (timer !== null) {
@@ -109,8 +120,14 @@ export function createWeightResidency(options: WeightResidencyOptions): WeightRe
   const arm = (ms: number): void => {
     cancel();
     if (off || closed || inFlight > 0 || loads > 0) return;
-    timer = setTimeout(onTimer, ms);
+    timer = setTimeout(onTimer, Math.min(ms, MAX_TIMER_MS));
     timer.unref();
+  };
+
+  /** Splash `WeightResidency::idleFrom`. */
+  const idleFrom = (): void => {
+    idleSince = now();
+    arm(delayMs);
   };
 
   const isReleased = (): boolean => released && !options.resident();
@@ -133,7 +150,10 @@ export function createWeightResidency(options: WeightResidencyOptions): WeightRe
     const held = options.resident();
     releasing = (async (): Promise<WeightsSnapshot> => {
       try {
-        await options.exclusive(() => options.release());
+        await options.exclusive(async () => {
+          await options.release();
+          options.drain();
+        });
         released = true;
         if (held) {
           restorePending = true;
@@ -154,6 +174,11 @@ export function createWeightResidency(options: WeightResidencyOptions): WeightRe
   function onTimer(): void {
     timer = null;
     if (inFlight > 0 || loads > 0) return;
+    const left = idleSince + delayMs - now();
+    if (left > 0) {
+      arm(left);
+      return;
+    }
     if (releasing === null && options.busy()) {
       arm(WEIGHT_RELEASE_RETRY_MS);
       return;
@@ -187,7 +212,7 @@ export function createWeightResidency(options: WeightResidencyOptions): WeightRe
           );
         }
       }
-      arm(delayMs);
+      idleFrom();
     };
     let result: T | Promise<T>;
     try {
@@ -222,7 +247,7 @@ export function createWeightResidency(options: WeightResidencyOptions): WeightRe
     endRequest(): void {
       if (inFlight === 0) return;
       inFlight -= 1;
-      if (inFlight === 0) arm(delayMs);
+      if (inFlight === 0) idleFrom();
     },
     withLoad,
     release,

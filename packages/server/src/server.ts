@@ -13,7 +13,12 @@ import type { MemoryReleaseAnswer } from './endpoints/memory-release.js';
 import type { PublicModelEntry } from './handler.js';
 import { createHandler } from './handler.js';
 import { createHealthReporter, type ServerHealth } from './health.js';
-import { createIdleSweeper, DEFAULT_IDLE_CLEAR_CACHE_MS, parseIdleClearCacheEnv } from './idle-sweeper.js';
+import {
+  createIdleSweeper,
+  DEFAULT_IDLE_CLEAR_CACHE_MS,
+  parseIdleClearCacheEnv,
+  resolveClearCache,
+} from './idle-sweeper.js';
 import { runGuardedModelLoad, type LoadModelOptions } from './load-model.js';
 import { ModelWorkCoordinator } from './model-work-coordinator.js';
 import { ModelRegistry } from './registry.js';
@@ -453,12 +458,14 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
       : createWeightResidency({
           idleReleaseMs,
           release: releaseWeights,
+          drain: resolveClearCache(),
           exclusive: (fn) => modelWorkCoordinator.withWeightRelease(fn),
           busy: () =>
             modelWorkCoordinator.writerActive ||
             modelWorkCoordinator.waitingWriters > 0 ||
             modelWorkCoordinator.requestLoadAdmissionCount > 0 ||
-            registry.dispatchLeaseCount > 0,
+            registry.dispatchLeaseCount > 0 ||
+            registry.persistRetainCount > 0,
           resident: () => registry.listSessionRegistries().length > 0,
         });
   // Chat requests and their loads also move the weights' clock; audio and

@@ -17,14 +17,31 @@ import {
 const LIMIT_MS = 600_000;
 
 function harness(over: Partial<WeightResidencyOptions> = {}) {
-  const state = { resident: true, busy: false, releases: 0, lines: [] as string[] };
+  const state = {
+    resident: true,
+    busy: false,
+    writer: false,
+    releases: 0,
+    lines: [] as string[],
+    events: [] as string[],
+  };
   const weights = createWeightResidency({
     idleReleaseMs: LIMIT_MS,
     release: async () => {
+      await Promise.resolve();
       state.releases += 1;
       state.resident = false;
+      state.events.push('released');
     },
-    exclusive: (fn) => fn(),
+    drain: () => state.events.push(state.writer ? 'drain in writer' : 'drain outside writer'),
+    exclusive: async (fn) => {
+      state.writer = true;
+      try {
+        return await fn();
+      } finally {
+        state.writer = false;
+      }
+    },
     busy: () => state.busy,
     resident: () => state.resident,
     log: (line) => state.lines.push(line),
@@ -156,6 +173,44 @@ describe('weight residency idle release', () => {
     });
     expect(weights.snapshot()).toMatchObject({ released: false, restores: 0 });
     expect(state.lines).toEqual([]);
+  });
+
+  // Mutation M16: the release leaves the allocator's free pool undrained → red.
+  it('a release drains the allocator once, after the weights go, in the writer slot', async () => {
+    for (const sweepMs of [30_000, 0]) {
+      const sweeps: number[] = [];
+      const sweeper = createIdleSweeper(sweepMs, () => sweeps.push(Date.now()));
+      const { state, weights } = harness();
+      const chat = trackWeights(sweeper, weights);
+      chat.beginRequest();
+      chat.endRequest();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(sweeps).toHaveLength(sweepMs > 0 ? 1 : 0);
+      expect(state.events).toEqual([]);
+      await vi.advanceTimersByTimeAsync(LIMIT_MS - 30_000);
+      expect(state.events).toEqual(['released', 'drain in writer']);
+      expect(sweeps).toHaveLength(sweepMs > 0 ? 1 : 0);
+      sweeper.close();
+      weights.close();
+    }
+  });
+
+  // Mutation M18: arm the whole limit in one timeout, past Node's 2^31 - 1 ms → red.
+  it('a limit past the longest timeout still releases only at its deadline', async () => {
+    const limitMs = 3_600_000_000;
+    const armed = vi.spyOn(globalThis, 'setTimeout');
+    const { state, weights } = harness({ idleReleaseMs: limitMs });
+    weights.beginRequest();
+    weights.endRequest();
+    for (const [, delay] of armed.mock.calls) expect(delay).toBeLessThanOrEqual(2 ** 31 - 1);
+    armed.mockRestore();
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(86_400_000);
+    expect(state.releases).toBe(0);
+    await vi.advanceTimersByTimeAsync(limitMs - 86_400_001 - 1);
+    expect(state.releases).toBe(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(state.releases).toBe(1);
   });
 
   it('the chat sweeper keeps the 30 s drain and feeds the weights clock', async () => {

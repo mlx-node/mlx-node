@@ -172,6 +172,7 @@ describe('createHealthReporter', () => {
     const weights = createWeightResidency({
       idleReleaseMs: 600_000,
       release: async () => undefined,
+      drain: () => undefined,
       exclusive: (fn) => fn(),
       busy: () => false,
       resident: () => false,

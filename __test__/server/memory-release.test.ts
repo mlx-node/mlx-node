@@ -1,8 +1,9 @@
 import { createServer as createHttpServer } from 'node:http';
 import { connect } from 'node:net';
 
+import type { SessionCapableModel } from '@mlx-node/lm';
 import { createHandler, createServer, ModelRegistry, type ServerInstance } from '@mlx-node/server';
-import { afterEach, describe, expect, it } from 'vite-plus/test';
+import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 /**
  * `POST /v1/memory/release` over HTTP, the cases of Splash
@@ -147,6 +148,34 @@ describe('POST /v1/memory/release', () => {
     finish();
     await reload;
     expect(calls.releases).toBe(1);
+  });
+
+  // Mutation M17: a response persist's retain is not counted as busy → red.
+  it('answers 409 and keeps the model while a response persist retains it', async () => {
+    const dispose = vi.fn(async () => undefined);
+    const model = { chatSessionStart: vi.fn(), resetCaches: vi.fn(), dispose } as unknown as SessionCapableModel;
+    let instance!: ServerInstance;
+    const { server } = await start({
+      releaseWeights: async () => {
+        for (const entry of instance.registry.list()) instance.registry.unregister(entry.id, { dispose: true });
+        await instance.registry.settleModelDisposals();
+      },
+    });
+    instance = server;
+    const port = portOf(server.server);
+    server.registry.register('model-a', model);
+    server.registry.retainBinding(model);
+
+    let answer = await raw(port, 'POST', {});
+    expect([answer.status, answer.json.error.code]).toEqual([409, 'engine_busy']);
+    expect(server.registry.get('model-a')).toBeDefined();
+    expect(dispose).not.toHaveBeenCalled();
+    expect(server.health().weights).toMatchObject({ released: false });
+
+    server.registry.releaseBinding(model);
+    answer = await raw(port, 'POST', {});
+    expect([answer.status, answer.json.released]).toEqual([200, true]);
+    expect(dispose).toHaveBeenCalledTimes(1);
   });
 
   it('answers 405 to another method and 404 when nothing can be released', async () => {
