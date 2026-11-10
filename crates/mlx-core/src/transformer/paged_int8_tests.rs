@@ -64,6 +64,7 @@ fn adapter_for(
     max_blocks: u32,
     dtype: MetalDtype,
 ) -> Option<(PagedKVCacheAdapter, Arc<LayerKVPool>)> {
+    let block_size = config.block_size;
     let pool = match LayerKVPool::new(config, num_blocks, max_blocks, dtype) {
         Ok(pool) => Arc::new(pool),
         Err(error) => {
@@ -72,9 +73,9 @@ fn adapter_for(
         }
     };
     let allocator = Arc::new(Mutex::new(BlockAllocator::new(
-        num_blocks, max_blocks, BS as u32,
+        num_blocks, max_blocks, block_size,
     )));
-    let adapter = PagedKVCacheAdapter::new(allocator, pool.clone(), BS as u32).expect("adapter");
+    let adapter = PagedKVCacheAdapter::new(allocator, pool.clone(), block_size).expect("adapter");
     Some((adapter, pool))
 }
 
@@ -318,26 +319,50 @@ fn bits(array: &MxArray) -> Vec<u16> {
 /// unpacks int8 K with x = 8 → red.
 #[test]
 fn int8_dense_reads_dequantize_like_the_flat_rows() {
-    const TOKENS: usize = 53;
-    let Some((mut adapter, _)) = adapter_for(pool_config_d256(), 4, 4, MetalDtype::Int8) else {
+    dense_reads_match_flat(pool_config_d256(), 53, &[(0, 53), (19, 30)]);
+}
+
+/// A dense gather inside one page hands the dequantize op V rows whose head
+/// dimension has a stride of the block size (the reshape after the page
+/// transpose is a view); they still read exactly the flat rows.
+///
+/// Mutation U1: the dequantize kernel reads the head dimension at stride 1
+/// → red (V).
+#[test]
+fn int8_one_page_dense_reads_dequantize_like_the_flat_rows() {
+    for block_size in [16, 32] {
+        let config = PagedAttentionConfig {
+            block_size,
+            ..pool_config_d256()
+        };
+        dense_reads_match_flat(config, 9, &[(0, 9), (2, 5)]);
+    }
+}
+
+/// Writes `tokens` rows per layer into a 4-block int8 pool, then checks the
+/// dense gathers over `[0, tokens)` and `read_kv_range` over each
+/// `(start, count)` bit for bit against the flat int8 rows' dequantize.
+fn dense_reads_match_flat(config: PagedAttentionConfig, tokens: usize, ranges: &[(u32, u32)]) {
+    let block_size = config.block_size;
+    let Some((mut adapter, _)) = adapter_for(config, 4, 4, MetalDtype::Int8) else {
         return;
     };
     adapter.reset_for_new_request(1).unwrap();
-    adapter.allocate_suffix_blocks(TOKENS as u32).unwrap();
+    adapter.allocate_suffix_blocks(tokens as u32).unwrap();
     adapter
-        .record_tokens(&(0..TOKENS as u32).collect::<Vec<u32>>())
+        .record_tokens(&(0..tokens as u32).collect::<Vec<u32>>())
         .unwrap();
     let mut flat = Vec::new();
     for layer in 0..LAYERS {
         let gain = Some(if layer == 0 { 1.0 } else { 4.0 });
-        let (keys, _) = shaped_rows(TOKENS, D256_HEADS, D256_DIM, 20 + layer, gain);
-        let (values, _) = shaped_rows(TOKENS, D256_HEADS, D256_DIM, 30 + layer, gain);
+        let (keys, _) = shaped_rows(tokens, D256_HEADS, D256_DIM, 20 + layer, gain);
+        let (values, _) = shaped_rows(tokens, D256_HEADS, D256_DIM, 30 + layer, gain);
         adapter
             .update_keys_values_native(layer, &keys, &values, 0)
             .unwrap();
         let rows = Int8KvRows::quantize(
-            &heads_major(&keys, TOKENS, D256_HEADS, D256_DIM),
-            &heads_major(&values, TOKENS, D256_HEADS, D256_DIM),
+            &heads_major(&keys, tokens, D256_HEADS, D256_DIM),
+            &heads_major(&values, tokens, D256_HEADS, D256_DIM),
         )
         .unwrap();
         flat.push(rows);
@@ -345,33 +370,30 @@ fn int8_dense_reads_dequantize_like_the_flat_rows() {
 
     for layer in 0..LAYERS {
         let rows = &flat[layer as usize];
-        let reads: [(&str, (MxArray, MxArray), (i64, i64)); 4] = [
+        let mut reads: Vec<(String, (MxArray, MxArray), (i64, i64))> = vec![
             (
-                "prefill sdpa",
+                "prefill sdpa".to_string(),
                 adapter
-                    .gather_kv_for_prefill_sdpa(layer, TOKENS as u32)
+                    .gather_kv_for_prefill_sdpa(layer, tokens as u32)
                     .unwrap(),
-                (0, TOKENS as i64),
+                (0, tokens as i64),
             ),
             (
-                "dense cache hit",
+                "dense cache hit".to_string(),
                 adapter
-                    .gather_kv_for_dense_cache_hit_prefill(layer, TOKENS as u32)
+                    .gather_kv_for_dense_cache_hit_prefill(layer, tokens as u32)
                     .map(|(keys, values, _)| (keys, values))
                     .unwrap(),
-                (0, TOKENS as i64),
-            ),
-            (
-                "read_kv_range",
-                adapter.read_kv_range(layer, 0, TOKENS as u32).unwrap(),
-                (0, TOKENS as i64),
-            ),
-            (
-                "read_kv_range mid-block",
-                adapter.read_kv_range(layer, 19, 30).unwrap(),
-                (19, 49),
+                (0, tokens as i64),
             ),
         ];
+        for &(start, count) in ranges {
+            reads.push((
+                format!("read_kv_range [{start}, +{count})"),
+                adapter.read_kv_range(layer, start, count).unwrap(),
+                (start as i64, (start + count) as i64),
+            ));
+        }
         for (entry, (keys, values), (start, end)) in reads {
             let (want_keys, want_values) =
                 rows.slice_tokens(start, end).unwrap().dequantize().unwrap();
@@ -379,13 +401,13 @@ fn int8_dense_reads_dequantize_like_the_flat_rows() {
                 assert_eq!(
                     got.shape().unwrap().as_ref(),
                     want.shape().unwrap().as_ref(),
-                    "layer {layer} {entry} {side} shape"
+                    "bs {block_size} layer {layer} {entry} {side} shape"
                 );
                 let (got, want) = (bits(got), bits(want));
                 let differing = got.iter().zip(&want).filter(|(a, b)| a != b).count();
                 assert_eq!(
                     differing, 0,
-                    "layer {layer} {entry} {side}: {differing} bf16 values differ"
+                    "bs {block_size} layer {layer} {entry} {side}: {differing} bf16 values differ"
                 );
             }
         }

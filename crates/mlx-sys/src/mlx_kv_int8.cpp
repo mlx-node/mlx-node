@@ -72,10 +72,9 @@ void validate_rows(const mlx::core::array &rows, mlx::core::Dtype dtype,
 void validate_dequantize_rows(const mlx::core::array &rows) {
   if (rows.ndim() != 4 ||
       (rows.shape(3) != kHeadDimension && rows.shape(3) != 128) ||
-      rows.dtype() != mlx::core::int8 || rows.strides(3) != 1) {
+      rows.dtype() != mlx::core::int8) {
     throw std::invalid_argument(
-        "kv int8 dequantize input must be rank-4 int8 [B, H, N, 128 | 256] "
-        "with a contiguous head dimension");
+        "kv int8 dequantize input must be rank-4 int8 [B, H, N, 128 | 256]");
   }
 }
 

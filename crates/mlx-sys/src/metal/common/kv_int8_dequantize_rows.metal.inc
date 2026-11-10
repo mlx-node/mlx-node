@@ -4,8 +4,9 @@
 // chunk). One simdgroup per row, 8 elements per lane.
 //
 // Bound names:
-//   q        : const device int8_t*     [B, H, N, D], any strides with a
-//              contiguous last axis (q_strides is supplied by MLX)
+//   q        : const device int8_t*     [B, H, N, D], any strides
+//              (q_strides is supplied by MLX; a one-page paged V gather has
+//              a last-axis stride of the block size)
 //   s        : const device float*      [B, H, N], any strides (s_strides)
 //   rows     : const constant int32_t&  B * H * N
 //   heads    : const constant int32_t&  H
@@ -27,11 +28,12 @@ R"(
   const int bh = row / tokens;
   const int h = bh % heads;
   const int b = bh / heads;
+  const int64_t d_stride = q_strides[3];
   const device int8_t* src = q + b * q_strides[0] + h * q_strides[1] +
-      n * q_strides[2] + lane * PER_LANE;
+      n * q_strides[2] + lane * PER_LANE * d_stride;
   const float scale = s[b * s_strides[0] + h * s_strides[1] + n * s_strides[2]];
   device bfloat16_t* dst = out + size_t(row) * D + lane * PER_LANE;
   for (int j = 0; j < PER_LANE; ++j) {
-    dst[j] = bfloat16_t(float(src[j]) * scale);
+    dst[j] = bfloat16_t(float(src[j * d_stride]) * scale);
   }
 )"
