@@ -1288,7 +1288,7 @@ fn flash_next_load_writes_no_derived_weight_pack() {
             .build()
             .unwrap()
             .block_on(async move {
-                let mut model = Qwen4ExpModel::load(model_path, None).await.unwrap();
+                let model = Qwen4ExpModel::load(model_path, None).await.unwrap();
                 let initial = model.residency_info();
                 assert!(initial.direct);
                 assert!(initial.direct_layers > 0);
@@ -2423,6 +2423,7 @@ fn inner_over(mut decoder: decoder::Decoder, vision: media::Vision, has_mtp: boo
         max_context: None,
         open_turns: Default::default(),
         exclusive_turn: false,
+        wired: None,
     }
 }
 
@@ -9003,19 +9004,15 @@ fn qwen4_exp_turn_window_is_the_plan_window() {
     assert!(inner.planned_turn_window(true).is_some());
 }
 
-/// The wired bound of a scheduled turn is the store's budget and the plan's
-/// dynamic budget; the pool's pages are inside the dynamic budget. Mutation:
-/// add the pool's bytes and the 4 GiB working allowance → red.
+/// The model's wired lease is the store's budget and the plan's dynamic
+/// budget; the pool's pages are inside the dynamic budget. Mutation: add the
+/// pool's bytes and the 4 GiB working allowance → red.
 #[test]
 fn qwen4_exp_wired_bytes_follow_the_plan() {
-    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
     let inner = tiny_planned_inner();
     assert_eq!(
-        inner.scheduler_wired_bytes(),
-        Some(
-            (inner.decoder.weights.cache_budget() + inner.memory_plan.dynamic_budget_bytes)
-                as usize
-        )
+        inner.wired_bytes(),
+        (inner.decoder.weights.cache_budget() + inner.memory_plan.dynamic_budget_bytes) as usize
     );
 }
 

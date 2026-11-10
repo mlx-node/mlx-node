@@ -13,6 +13,7 @@ import {
 import { ModelWorkCoordinator } from '../../packages/server/src/model-work-coordinator.js';
 import { ModelRegistry } from '../../packages/server/src/registry.js';
 import { routeRequest } from '../../packages/server/src/router.js';
+import { createWeightResidency } from '../../packages/server/src/weight-residency.js';
 
 /**
  * `deriveHealthStatus` is deliberately a PURE function over a plain input
@@ -164,6 +165,32 @@ describe('createHealthReporter', () => {
     const health = createHealthReporter({ registry })();
     expect(health.models.resident.sort()).toEqual(['m-a', 'm-b']);
     expect(health.models.count).toBe(2);
+  });
+
+  it('reports the weights and their armed release, and stays ok once they are released', async () => {
+    const registry = new ModelRegistry();
+    const weights = createWeightResidency({
+      idleReleaseMs: 600_000,
+      release: async () => undefined,
+      exclusive: (fn) => fn(),
+      busy: () => false,
+      resident: () => false,
+      log: () => undefined,
+    });
+    const report = createHealthReporter({ registry, weights });
+    expect(report().work.releasePending).toBe(true);
+    expect(report().weights).toEqual({
+      idleReleaseSeconds: 600,
+      released: false,
+      restoring: false,
+      restores: 0,
+      restoreFailures: 0,
+    });
+    await weights.release('request');
+    expect(report()).toMatchObject({ status: 'ok', weights: { released: true } });
+    weights.close();
+    expect(report().work.releasePending).toBe(false);
+    expect('weights' in createHealthReporter({ registry })()).toBe(false);
   });
 
   // Mutation: map int8 to `none`/`none` → red.

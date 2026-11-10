@@ -275,9 +275,167 @@ impl WiredLeases {
     }
 }
 
-fn wired_leases() -> &'static std::sync::Mutex<WiredLeases> {
-    static LEASES: std::sync::OnceLock<std::sync::Mutex<WiredLeases>> = std::sync::OnceLock::new();
+fn wired_leases() -> &'static std::sync::Arc<std::sync::Mutex<WiredLeases>> {
+    static LEASES: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<WiredLeases>>> =
+        std::sync::OnceLock::new();
     LEASES.get_or_init(Default::default)
+}
+
+/// A model's MLX wired lease for its life (Splash `metal::Residency` holds
+/// every buffer of the backend). It lapses with the process residency clock
+/// and is taken again by the next command; it never synchronizes a stream.
+pub(crate) struct WiredResidency {
+    clock: std::sync::Arc<mlx_paged_attn::residency::Clock>,
+    leases: std::sync::Arc<std::sync::Mutex<WiredLeases>>,
+    set: fn(usize) -> Option<usize>,
+    max_rec: usize,
+    bytes: Box<dyn Fn() -> usize + Send + Sync>,
+    lease: std::sync::Mutex<Option<u64>>,
+}
+
+impl WiredResidency {
+    /// `bytes` is read at every acquisition and capped at the recommended
+    /// working set; no Metal working set means no lease.
+    pub(crate) fn new(bytes: impl Fn() -> usize + Send + Sync + 'static) -> std::sync::Arc<Self> {
+        let residency = Self::with_parts(
+            std::sync::Arc::clone(mlx_paged_attn::residency::clock()),
+            std::sync::Arc::clone(wired_leases()),
+            set_wired_limit,
+            WiredLimitContext::get_max_working_set_size(),
+            Box::new(bytes),
+        );
+        let resident: std::sync::Arc<dyn mlx_paged_attn::residency::Resident> = residency.clone();
+        mlx_paged_attn::residency::register(std::sync::Arc::downgrade(&resident));
+        residency
+    }
+
+    /// `max_rec` minus the paged pools' own residency sets.
+    pub(crate) fn working_set_minus_pools() -> usize {
+        let pools =
+            usize::try_from(mlx_paged_attn::residency::pool_set_bytes()).unwrap_or(usize::MAX);
+        WiredLimitContext::get_max_working_set_size().saturating_sub(pools)
+    }
+
+    fn with_parts(
+        clock: std::sync::Arc<mlx_paged_attn::residency::Clock>,
+        leases: std::sync::Arc<std::sync::Mutex<WiredLeases>>,
+        set: fn(usize) -> Option<usize>,
+        max_rec: usize,
+        bytes: Box<dyn Fn() -> usize + Send + Sync>,
+    ) -> std::sync::Arc<Self> {
+        let residency = std::sync::Arc::new(Self {
+            clock,
+            leases,
+            set,
+            max_rec,
+            bytes,
+            lease: std::sync::Mutex::new(None),
+        });
+        residency.acquire();
+        mlx_paged_attn::residency::mark(&residency.clock, std::time::Instant::now());
+        residency
+    }
+
+    fn acquire(&self) {
+        let mut lease = self.lease.lock().unwrap_or_else(|e| e.into_inner());
+        if lease.is_some() || self.max_rec == 0 {
+            return;
+        }
+        let requested = (self.bytes)().min(self.max_rec);
+        if requested == 0 {
+            return;
+        }
+        *lease = self
+            .leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .acquire(requested, self.set);
+    }
+
+    fn release(&self) {
+        let Some(id) = self.lease.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        self.leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release(id, self.set);
+    }
+
+    /// One drive iteration: the clock cannot lapse until the guard drops.
+    pub(crate) fn begin(self: &std::sync::Arc<Self>) -> WiredUse {
+        self.clock.open();
+        WiredUse {
+            residency: std::sync::Arc::clone(self),
+            used: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        clock: std::sync::Arc<mlx_paged_attn::residency::Clock>,
+    ) -> std::sync::Arc<Self> {
+        Self::with_parts(
+            clock,
+            std::sync::Arc::default(),
+            |_| Some(0),
+            1,
+            Box::new(|| 1),
+        )
+    }
+
+    #[cfg(test)]
+    fn leased(&self) -> bool {
+        self.lease
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+}
+
+impl mlx_paged_attn::residency::Resident for WiredResidency {
+    fn hold(&self) {
+        self.acquire();
+    }
+
+    fn lapse(&self) {
+        self.release();
+    }
+}
+
+impl Drop for WiredResidency {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// A drive iteration of a model holding a [`WiredResidency`].
+pub(crate) struct WiredUse {
+    residency: std::sync::Arc<WiredResidency>,
+    used: bool,
+}
+
+impl WiredUse {
+    /// Splash `Residency::use` before GPU work: the lease is taken again if
+    /// it lapsed, and the clock is stamped.
+    pub(crate) fn mark(&mut self) {
+        self.residency.acquire();
+        mlx_paged_attn::residency::mark(&self.residency.clock, std::time::Instant::now());
+        self.used = true;
+    }
+
+    /// The iteration submitted GPU work: stamp the clock when it ends.
+    pub(crate) fn used(&mut self) {
+        self.used = true;
+    }
+}
+
+impl Drop for WiredUse {
+    fn drop(&mut self) {
+        self.residency
+            .clock
+            .close(self.used.then(std::time::Instant::now));
+    }
 }
 
 fn set_wired_limit(requested: usize) -> Option<usize> {
@@ -401,8 +559,102 @@ mod generation_stream_tests {
 
 #[cfg(test)]
 mod wired_tests {
-    use super::WiredLeases;
-    use std::cell::Cell;
+    use super::{WiredLeases, WiredResidency};
+    use mlx_paged_attn::residency::{Clock, Resident, beat_with};
+    use std::cell::{Cell, RefCell};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static SET_CALLS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn record(requested: usize) -> Option<usize> {
+        SET_CALLS.with(|calls| calls.borrow_mut().push(requested));
+        Some(0)
+    }
+
+    fn calls() -> Vec<usize> {
+        SET_CALLS.with(|calls| calls.borrow().clone())
+    }
+
+    /// The lease is the model's, not the turn's: two turns ten seconds
+    /// apart keep it, it lapses only after the keep-alive without a command,
+    /// and the next command takes it again (Splash `buffersStayResident`).
+    ///
+    /// Mutation M1: the guard releases the lease when the iteration ends
+    /// (the per-turn lease).
+    #[test]
+    fn wired_residency_holds_across_turns() {
+        SET_CALLS.with(|calls| calls.borrow_mut().clear());
+        let clock = Clock::new(600.0).unwrap();
+        let residency = WiredResidency::with_parts(
+            clock.clone(),
+            Arc::new(Mutex::new(WiredLeases::default())),
+            record,
+            1000,
+            Box::new(|| 700),
+        );
+        assert_eq!(calls(), [700]);
+        for _ in 0..2 {
+            let mut turn = residency.begin();
+            turn.mark();
+            drop(turn);
+            assert!(residency.leased());
+        }
+        let last = Instant::now();
+        let residents: Vec<Arc<dyn Resident>> = vec![residency.clone()];
+        assert!(beat_with(
+            &clock,
+            &residents,
+            last + Duration::from_secs(10),
+            || ()
+        ));
+        assert!(beat_with(
+            &clock,
+            &residents,
+            last + Duration::from_secs(599),
+            || ()
+        ));
+        assert_eq!(calls(), [700]);
+        assert!(!beat_with(
+            &clock,
+            &residents,
+            last + Duration::from_secs(601),
+            || ()
+        ));
+        assert_eq!(calls(), [700, 0]);
+        assert!(!residency.leased());
+        let mut turn = residency.begin();
+        turn.mark();
+        drop(turn);
+        assert!(residency.leased());
+        assert_eq!(calls(), [700, 0, 700]);
+        drop(residents);
+        drop(residency);
+        assert_eq!(calls(), [700, 0, 700, 0]);
+    }
+
+    #[test]
+    fn wired_residency_never_lapses_with_a_turn_open() {
+        SET_CALLS.with(|calls| calls.borrow_mut().clear());
+        let clock = Clock::new(600.0).unwrap();
+        let residency = WiredResidency::with_parts(
+            clock.clone(),
+            Arc::new(Mutex::new(WiredLeases::default())),
+            record,
+            1000,
+            Box::new(|| 2000),
+        );
+        assert_eq!(calls(), [1000]);
+        let mut turn = residency.begin();
+        turn.mark();
+        let residents: Vec<Arc<dyn Resident>> = vec![residency.clone()];
+        let far = Instant::now() + Duration::from_secs(1_000_000);
+        assert!(beat_with(&clock, &residents, far, || ()));
+        assert!(residency.leased());
+        drop(turn);
+    }
 
     #[test]
     fn overlapping_leases_restore_zero_or_nonzero_only_after_last_owner() {

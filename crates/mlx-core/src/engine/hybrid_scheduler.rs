@@ -35,7 +35,7 @@ use crate::engine::scheduler::{
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::model_thread::{LoopControl, ResponseTx, StreamTx};
 use crate::sampling::{check_repetition_cutoff, sample};
-use crate::stream::{DeviceType, Stream, StreamContext, WiredLimitContext};
+use crate::stream::{DeviceType, Stream, StreamContext, WiredResidency};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 
@@ -150,13 +150,12 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     const CANCEL_PRECEDES_EOS: bool = false;
     const STREAM_EOS_TOKEN: bool = false;
 
-    /// Optional independently admitted residency bound for scheduled turns.
-    /// Families opt in explicitly; ordinary turn policies remain unchanged.
-    fn scheduler_wired_bytes(&self) -> Option<usize> {
+    /// The model's wired residency, held across every drive iteration.
+    fn wired_residency(&self) -> Option<Arc<WiredResidency>> {
         None
     }
-    /// `seq_id` was admitted; called before the turn's cancel flag, wired
-    /// context and prefill slices are read, so a backend that changes its
+    /// `seq_id` was admitted; called before the turn's cancel flag and
+    /// prefill slices are read, so a backend that changes its
     /// residency per turn does it here. Every opened turn is closed once, on
     /// whichever path finishes or rejects it.
     fn scheduled_turn_opened(&mut self, _seq_id: SeqId) {}
@@ -1045,7 +1044,6 @@ pub(crate) struct ScheduledTurn<P> {
     pub(crate) generation_start: Option<Instant>,
     pub(crate) first_token_instant: Option<Instant>,
     pub(crate) generation_stream: Stream,
-    pub(crate) _wired_context: Option<WiredLimitContext>,
     pub(crate) profiler: crate::decode_profiler::DecodeProfiler,
     pub(crate) emitter: Option<Box<dyn StreamEmitter>>,
     pub(crate) turn_token_observer: Option<Box<dyn TurnTokenObserver>>,
@@ -3589,10 +3587,6 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         );
         profiler.snapshot_memory_before();
         let generation_start = admitted.params.report_performance.then(Instant::now);
-        let wired_context = self
-            .inner
-            .scheduler_wired_bytes()
-            .map(|bytes| WiredLimitContext::bounded(bytes, vec![generation_stream]));
         let reuse_cache = admitted.plan.is_delta || admitted.params.reuse_cache;
         let payload = ScheduledTurn {
             owner_id,
@@ -3626,7 +3620,6 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             generation_start,
             first_token_instant: None,
             generation_stream,
-            _wired_context: wired_context,
             profiler,
             emitter: is_streaming.then(|| -> Box<dyn StreamEmitter> {
                 Box::new(engine::backend::ProgressEmitter(
@@ -4233,6 +4226,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         while let Ok(command) = receiver.try_recv() {
             self.pending.push_back(command);
         }
+        let mut wired = self.inner.wired_residency().map(|r| r.begin());
         self.reap_cancelled_waiters();
         self.poll_restores();
 
@@ -4256,6 +4250,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         if !self.scheduler.has_pending_control()
             && let Some(prepared) = self.prepared_waiting.take()
         {
+            if let Some(wired) = wired.as_mut() {
+                wired.mark();
+            }
             match self.admit_prepared(prepared) {
                 Ok(Some(turn)) => {
                     self.enqueue_turn_or_reject(turn);
@@ -4325,7 +4322,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                         self.scheduler
                             .enqueue_exclusive(ModelCommand::from_chat(chat));
                         exclusive = true;
-                    } else if let Some(prepared) = self.prepare_chat(chat) {
+                    } else if let Some(prepared) = {
+                        if let Some(wired) = wired.as_mut() {
+                            wired.mark();
+                        }
+                        self.prepare_chat(chat)
+                    } {
                         match self.admit_prepared(prepared) {
                             Ok(Some(turn)) => {
                                 self.enqueue_turn_or_reject(turn);
@@ -4368,6 +4370,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     }
                     Err(command) => command,
                 };
+                if let Some(wired) = wired.as_mut() {
+                    wired.mark();
+                }
                 self.inner.execute_barrier(
                     command,
                     SchedulerOwnerContext {
@@ -4387,6 +4392,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 blocked_alone,
                 ..
             }) => {
+                if let Some(wired) = wired.as_mut() {
+                    wired.used();
+                }
                 may_resume_preempted = self.settle_step(completed, preempted, blocked_alone);
             }
             Err(SchedulerError::Executor(error)) => {
@@ -4650,6 +4658,38 @@ pub(crate) mod tests {
         ));
         assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
         assert!(!after_result.try_recv().unwrap().unwrap().1);
+    }
+
+    /// A drive iteration that runs GPU work stamps the model's residency
+    /// clock and closes its guard; a stats query stamps nothing (Splash
+    /// `Residency::use` runs only at command submit).
+    ///
+    /// Mutation M4: `drive` takes no guard.
+    #[test]
+    fn drive_marks_the_wired_residency_for_gpu_work_only() {
+        use crate::models::qwen3_5::model::Qwen35FamilyCommand;
+
+        let clock = mlx_paged_attn::residency::Clock::new(600.0).unwrap();
+        let mut inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        inner.wired = Some(WiredResidency::for_test(clock.clone()));
+        let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let created = clock.last_use();
+        let (stats_reply, mut stats_result) = tokio::sync::oneshot::channel();
+        assert!(sender.send(Qwen35Cmd::scheduler_stats(stats_reply)).is_ok());
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        assert!(matches!(stats_result.try_recv(), Ok(Ok(_))));
+        assert_eq!(clock.last_use(), created);
+        let (force_reply, mut force_result) = tokio::sync::oneshot::channel();
+        assert!(
+            sender
+                .send(Qwen35FamilyCommand::ForceFlatMtpDesyncForTest { reply: force_reply }.into())
+                .is_ok()
+        );
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        assert!(matches!(force_result.try_recv(), Ok(Ok(()))));
+        assert!(clock.last_use() > created);
+        assert_eq!(clock.open_count(), 0);
     }
 
     /// Paged adapter + a complete native MTP head whose flat core has no

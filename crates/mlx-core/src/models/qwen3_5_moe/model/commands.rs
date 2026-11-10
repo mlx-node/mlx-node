@@ -178,6 +178,10 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
     const SCHEDULER_NAME: &'static str = "Qwen3.5 MoE";
     const ENABLED_BY_DEFAULT: bool = false;
 
+    fn wired_residency(&self) -> Option<std::sync::Arc<crate::stream::WiredResidency>> {
+        self.wired.clone()
+    }
+
     fn paged_adapter(&self) -> Option<&PagedKVCacheAdapter> {
         self.paged_adapter.as_ref()
     }

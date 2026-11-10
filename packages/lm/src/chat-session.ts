@@ -560,6 +560,11 @@ export interface SessionCapableModel {
    * relative to subsequent session calls.
    */
   resetCaches(): void | Promise<void>;
+  /**
+   * Frees the weights, caches and state now; every later call fails. Qwen3.5
+   * dense/MoE and Flash Next expose it; other wrappers free at GC.
+   */
+  dispose?(): Promise<unknown>;
   /** Release scheduler-owned state for one logical session owner. */
   releaseCacheOwner?(ownerId: string): void | Promise<void>;
   /**

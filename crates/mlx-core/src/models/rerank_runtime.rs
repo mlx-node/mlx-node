@@ -112,7 +112,7 @@ impl Runtime {
                 .lock()
                 .map_err(|_| worker_error("thread lock poisoned"))?
                 .take();
-            if let Some(mut thread) = thread {
+            if let Some(thread) = thread {
                 spawn_blocking(move || thread.shutdown_and_join().map_err(worker_error))
                     .await
                     .map_err(worker_error)??;

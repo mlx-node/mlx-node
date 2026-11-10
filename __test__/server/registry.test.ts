@@ -116,6 +116,50 @@ describe('ModelRegistry', () => {
     expect(releaseCacheOwner.mock.calls.map(([releasedOwner]) => releasedOwner)).toEqual([ownerId, ownerId]);
   });
 
+  // Mutation M14: dispose at `unregister` time, before the last lease and
+  // persist release → red.
+  it('disposes a released model only once its last lease and persist release', async () => {
+    const registry = new ModelRegistry();
+    const dispose = vi.fn(async () => undefined);
+    const model = Object.assign(createMockSessionModel(), { dispose });
+    registry.register('model-a', model);
+    registry.register('alias', model);
+    const lease = registry.acquireDispatchLease('model-a')!;
+    registry.retainBinding(model);
+    expect(registry.dispatchLeaseCount).toBe(1);
+
+    registry.unregister('model-a', { dispose: true });
+    registry.unregister('alias', { dispose: true });
+    await registry.settleModelDisposals();
+    expect(dispose).not.toHaveBeenCalled();
+
+    registry.releaseDispatchLease(lease.model);
+    expect(registry.dispatchLeaseCount).toBe(0);
+    await registry.settleModelDisposals();
+    expect(dispose).not.toHaveBeenCalled();
+
+    registry.releaseBinding(model);
+    await registry.settleModelDisposals();
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('a plain unregister or a revived binding never disposes', async () => {
+    const registry = new ModelRegistry();
+    const dispose = vi.fn(async () => undefined);
+    const model = Object.assign(createMockSessionModel(), { dispose });
+    registry.register('model-a', model);
+    registry.unregister('model-a');
+    await registry.settleModelDisposals();
+
+    registry.register('model-a', model);
+    const lease = registry.acquireDispatchLease('model-a')!;
+    registry.unregister('model-a', { dispose: true });
+    registry.register('model-a', model);
+    registry.releaseDispatchLease(lease.model);
+    await registry.settleModelDisposals();
+    expect(dispose).not.toHaveBeenCalled();
+  });
+
   it('returns false when unregistering a non-existent model', () => {
     const registry = new ModelRegistry();
     expect(registry.unregister('nonexistent')).toBe(false);

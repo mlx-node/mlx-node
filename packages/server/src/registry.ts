@@ -115,6 +115,8 @@ interface SessionRegistryBinding {
   inFlight: number;
   pendingPersists: number;
   pendingTeardown: boolean;
+  /** `unregister(name, { dispose: true })`: the teardown also frees the model's weights. */
+  disposeOnTeardown: boolean;
   /** The model's load-time context snapshot, read once with the binding. */
   context?: { limits: SessionContextLimits; mtpByDefault: boolean };
 }
@@ -230,6 +232,7 @@ export class ModelRegistry {
    */
   private readonly retiredInstanceIds = new WeakMap<ServableModel, { instanceId: number; outstandingCount: number }>();
   private modelLoadAdmissionCoordinator: ModelLoadAdmissionCoordinator | undefined;
+  private readonly modelDisposals = new Set<Promise<void>>();
 
   constructor(opts?: ModelRegistryOptions) {
     this.maxQueueDepth = opts?.maxQueueDepth;
@@ -346,6 +349,7 @@ export class ModelRegistry {
         inFlight: 0,
         pendingPersists: 0,
         pendingTeardown: false,
+        disposeOnTeardown: false,
       };
       const limits = typeof model.contextLimits === 'function' ? model.contextLimits() : undefined;
       if (limits !== undefined) binding.context = { limits, mtpByDefault: mtpOnByDefault(model) };
@@ -353,6 +357,7 @@ export class ModelRegistry {
     } else {
       if (binding.pendingTeardown) {
         binding.pendingTeardown = false;
+        binding.disposeOnTeardown = false;
       }
       // Aliasing or reviving an existing binding: if this call passed
       // `samplingDefaults` explicitly, overwrite the shared binding's
@@ -404,9 +409,13 @@ export class ModelRegistry {
    * the `SessionRegistry` it owns — is dropped entirely so cached
    * sessions for the now-unreferenced model are released.
    *
+   * With `dispose`, the binding's teardown (now, or when its last lease and
+   * persist release) also calls the model's `dispose()` once its sessions
+   * are flushed; {@link settleModelDisposals} waits for it.
+   *
    * @returns true if the model was removed.
    */
-  unregister(name: string): boolean {
+  unregister(name: string, opts?: { dispose?: boolean }): boolean {
     const lane = this.decisions.lane(name);
     if (lane) {
       this.modelLoadAdmissionCoordinator?.unbindRequestLoadAdmissions(name, lane);
@@ -416,8 +425,24 @@ export class ModelRegistry {
     if (!entry) return false;
     this.modelLoadAdmissionCoordinator?.unbindRequestLoadAdmissions(name, entry.sessionRegistry);
     this.models.delete(name);
+    if (opts?.dispose === true) {
+      const binding = this.sessionRegistriesByModel.get(entry.model);
+      if (binding) binding.disposeOnTeardown = true;
+    }
     this.dropNameReference(entry.model);
     return true;
+  }
+
+  /** Dispatch leases held across every chat binding. */
+  get dispatchLeaseCount(): number {
+    let leases = 0;
+    for (const binding of this.sessionRegistriesByModel.values()) leases += binding.inFlight;
+    return leases;
+  }
+
+  /** Waits for every model disposal a teardown has started. */
+  async settleModelDisposals(): Promise<void> {
+    await Promise.all(this.modelDisposals);
   }
 
   /**
@@ -475,9 +500,23 @@ export class ModelRegistry {
     // flush while the registry is still in hand: the promise retains it until
     // every pending disposal has settled and every transient failure observed
     // during this flush has received its one bounded retry.
-    void binding.registry.flushPendingDisposals().catch((error: unknown) => {
+    const flushed = binding.registry.flushPendingDisposals().catch((error: unknown) => {
       console.error('[server] failed to flush final chat-session owner disposals:', error);
     });
+    if (binding.disposeOnTeardown && typeof model.dispose === 'function') {
+      // The sessions' owner releases run on the model thread, so they land
+      // before the thread is joined.
+      const disposal = flushed
+        .then(() => model.dispose!())
+        .then(
+          () => undefined,
+          (error: unknown) => {
+            console.error('[server] failed to dispose a released model:', error);
+          },
+        )
+        .finally(() => this.modelDisposals.delete(disposal));
+      this.modelDisposals.add(disposal);
+    }
     this.sessionRegistriesByModel.delete(model);
     this.instanceIds.delete(model);
   }

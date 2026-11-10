@@ -14,6 +14,7 @@ import {
   LAUNCHER_ENGINE_POLICY,
   ModelNotFoundError,
   NoModelsDiscoveredError,
+  parseIdleRelease,
   parseMaxContext,
   parseMaxMemory,
   resolveLogDir,
@@ -66,6 +67,11 @@ Options:
                       native window when memory holds it). Qwen3.5 dense,
                       MoE and Qwen3.8 Flash Next take it; a load whose
                       memory plan holds fewer tokens fails.
+  --idle-release <duration>  Time without a request before the engine unwires
+                      its memory and frees the weights: seconds, or with an
+                      s, m or h suffix, e.g. 30m (default: 10m); off keeps
+                      both, though POST /v1/memory/release still frees the
+                      weights. The next request loads the weights again.
   --thinking-token-budget <n>  Thinking tokens of a thinking request that
                       sets no budget, after which its thinking closes
                       (default: no cap).
@@ -101,6 +107,8 @@ export interface ServeArgs {
   kvFormat?: 'int8' | 'bf16';
   maxMemoryBytes?: number;
   maxContextTokens?: number;
+  /** `--idle-release` in seconds; `Infinity` for `off`. */
+  idleReleaseSeconds?: number;
   thinkingTokenBudget?: number;
   rerankConfig?: string;
   logDir?: string;
@@ -128,6 +136,7 @@ export function parseServeArgs(argv: string[]): ServeArgs {
       'kv-format': { type: 'string' },
       'max-memory': { type: 'string' },
       'max-context': { type: 'string' },
+      'idle-release': { type: 'string' },
       'thinking-token-budget': { type: 'string' },
       'rerank-config': { type: 'string' },
       'auth-token': { type: 'string' },
@@ -158,6 +167,8 @@ export function parseServeArgs(argv: string[]): ServeArgs {
   const maxMemoryBytes = maxMemoryText === undefined ? undefined : parseMaxMemory(maxMemoryText);
   const maxContextText = values['max-context'];
   const maxContextTokens = maxContextText === undefined ? undefined : parseMaxContext(maxContextText);
+  const idleReleaseText = values['idle-release'];
+  const idleReleaseSeconds = idleReleaseText === undefined ? undefined : parseIdleRelease(idleReleaseText);
   const budgetText = values['thinking-token-budget'];
   const thinkingTokenBudget = budgetText === undefined ? undefined : parseThinkingTokenBudget(budgetText);
   const verbose = (values.verbose ?? false) || values['log-dir'] != null;
@@ -173,6 +184,7 @@ export function parseServeArgs(argv: string[]): ServeArgs {
     ...(kvFormat !== undefined ? { kvFormat } : {}),
     ...(maxMemoryBytes !== undefined ? { maxMemoryBytes } : {}),
     ...(maxContextTokens !== undefined ? { maxContextTokens } : {}),
+    ...(idleReleaseSeconds !== undefined ? { idleReleaseSeconds } : {}),
     ...(thinkingTokenBudget !== undefined ? { thinkingTokenBudget } : {}),
     ...(values['rerank-config'] !== undefined ? { rerankConfig: values['rerank-config'] } : {}),
     authToken: values['auth-token'],
@@ -237,6 +249,7 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
       ...(args.kvFormat !== undefined ? { kvFormat: args.kvFormat } : {}),
       ...(args.maxMemoryBytes !== undefined ? { maxMemoryBytes: args.maxMemoryBytes } : {}),
       ...(args.maxContextTokens !== undefined ? { maxContextTokens: args.maxContextTokens } : {}),
+      ...(args.idleReleaseSeconds !== undefined ? { idleReleaseSeconds: args.idleReleaseSeconds } : {}),
       ...(args.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: args.thinkingTokenBudget } : {}),
       ...(await readRerankConfig(args.rerankConfig)),
       authToken: args.authToken,

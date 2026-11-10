@@ -223,6 +223,11 @@ pub struct LayerKVPool {
     #[cfg(target_os = "macos")]
     restore_staging: std::sync::Mutex<Option<(Buffer, Buffer)>>,
 
+    /// The pool's own residency set, for the families that hold their KV
+    /// wired between commands ([`Self::hold_resident`]).
+    #[cfg(target_os = "macos")]
+    residency: std::sync::OnceLock<std::sync::Arc<crate::residency::PoolResidency>>,
+
     #[cfg(not(target_os = "macos"))]
     num_layers: u32,
     #[cfg(not(target_os = "macos"))]
@@ -613,6 +618,7 @@ impl LayerKVPool {
                 restore_identity: std::sync::Arc::new(()),
                 inner: RwLock::new(PoolInner { layers, num_blocks }),
                 restore_staging: std::sync::Mutex::new(None),
+                residency: std::sync::OnceLock::new(),
             })
         }
 
@@ -756,6 +762,7 @@ impl LayerKVPool {
                 restore_identity: std::sync::Arc::new(()),
                 inner: RwLock::new(PoolInner { layers, num_blocks }),
                 restore_staging: std::sync::Mutex::new(None),
+                residency: std::sync::OnceLock::new(),
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -833,6 +840,7 @@ impl LayerKVPool {
                     num_blocks,
                 }),
                 restore_staging: std::sync::Mutex::new(None),
+                residency: std::sync::OnceLock::new(),
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -980,6 +988,7 @@ impl LayerKVPool {
             command_buffer.commit();
             command_buffer.wait_until_completed();
             observe(&command_buffer, "LayerKVPool::grow_to")?;
+            self.swap_resident(&inner.layers[layer], (&key_cache, &value_cache));
             inner.layers[layer] = (key_cache, value_cache);
             swapped = true;
             Ok(())
@@ -1176,6 +1185,7 @@ impl LayerKVPool {
             command_buffer.commit();
             command_buffer.wait_until_completed();
             observe(&command_buffer, "LayerKVPool::shrink_to")?;
+            self.swap_resident(&inner.layers[layer], (&key_cache, &value_cache));
             inner.layers[layer] = (key_cache, value_cache);
             swapped = true;
             Ok(())
@@ -1262,6 +1272,64 @@ impl LayerKVPool {
 
     pub(crate) fn restore_identity(&self) -> std::sync::Arc<()> {
         std::sync::Arc::clone(&self.restore_identity)
+    }
+
+    /// Holds the pool's layer buffers in a residency set of its own, never
+    /// attached to a queue (Splash `metal::Residency`), on the process
+    /// residency clock. A device without residency sets leaves the pool
+    /// unwired, as MLX's own sets do.
+    #[cfg(target_os = "macos")]
+    pub fn hold_resident(&self) -> Result<(), String> {
+        let clock = std::sync::Arc::clone(crate::residency::clock());
+        if let Some(residency) = self.attach_residency(clock)? {
+            let resident: std::sync::Arc<dyn crate::residency::Resident> = residency;
+            crate::residency::register(std::sync::Arc::downgrade(&resident));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn hold_resident(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn attach_residency(
+        &self,
+        clock: std::sync::Arc<crate::residency::Clock>,
+    ) -> Result<Option<std::sync::Arc<crate::residency::PoolResidency>>, String> {
+        use crate::metal::MetalState;
+        if self.residency.get().is_some() {
+            return Ok(None);
+        }
+        let state = MetalState::get()?;
+        let residency = match crate::residency::PoolResidency::new(&state.device, clock) {
+            Ok(residency) => residency,
+            Err(error) => {
+                tracing::warn!("paged KV pool stays unwired: {error}");
+                return Ok(None);
+            }
+        };
+        let inner = self.inner_read();
+        let buffers: Vec<&metal::BufferRef> = inner
+            .layers
+            .iter()
+            .flat_map(|(key, value)| [&**key, &**value])
+            .collect();
+        residency.add_all(&buffers);
+        drop(inner);
+        Ok(self
+            .residency
+            .set(std::sync::Arc::clone(&residency))
+            .is_ok()
+            .then_some(residency))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn swap_resident(&self, old: &(Buffer, Buffer), new: (&Buffer, &Buffer)) {
+        if let Some(residency) = self.residency.get() {
+            residency.swap([&old.0, &old.1], [new.0, new.1]);
+        }
     }
 
     /// Total bytes the pool's K/V buffers currently occupy, summed over both
@@ -4060,6 +4128,77 @@ mod tests {
         assert!(!pool.grow_to(6).expect("grow past max"));
         assert_eq!(pool.num_blocks(), 4);
         assert_eq!(pool.generation(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn resident_pool(
+        layers: u32,
+        blocks: u32,
+        max: u32,
+    ) -> Option<(LayerKVPool, std::sync::Arc<crate::residency::PoolResidency>)> {
+        let pool = match LayerKVPool::new(base_config(layers), blocks, max, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => return None,
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let clock = crate::residency::Clock::new(600.0).unwrap();
+        let residency = pool.attach_residency(clock).unwrap()?;
+        Some((pool, residency))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_set_holds_the_layers(
+        pool: &LayerKVPool,
+        residency: &crate::residency::PoolResidency,
+    ) {
+        let inner = pool.inner_read();
+        assert_eq!(residency.allocation_count(), 2 * inner.layers.len() as u64);
+        for (key, value) in &inner.layers {
+            assert!(residency.contains(key) && residency.contains(value));
+        }
+        drop(inner);
+        assert_eq!(residency.members_bytes(), pool.total_bytes());
+    }
+
+    /// Splash `MetalAllocation::attach` / `detach`: the pool's residency set
+    /// holds exactly its live layer buffers, across a grow and a shrink.
+    ///
+    /// Mutation M6: the grow skips the set's add/remove.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pool_residency_set_holds_every_layer_buffer() {
+        let Some((pool, residency)) = resident_pool(4, 4, 8) else {
+            eprintln!("skipping pool_residency_set_holds_every_layer_buffer: no residency sets");
+            return;
+        };
+        assert_set_holds_the_layers(&pool, &residency);
+        let old: Vec<(Buffer, Buffer)> = pool.inner_read().layers.clone();
+        assert!(pool.grow_to(8).unwrap());
+        assert_eq!(pool.generation(), 1);
+        assert_set_holds_the_layers(&pool, &residency);
+        for (key, value) in &old {
+            assert!(!residency.contains(key) && !residency.contains(value));
+        }
+        assert!(pool.shrink_to(4).unwrap());
+        assert_eq!(pool.generation(), 2);
+        assert_set_holds_the_layers(&pool, &residency);
+    }
+
+    /// Splash `allocationDoesNotRequestResidency`: adding buffers commits the
+    /// set; only the beat requests residency.
+    ///
+    /// Mutation M8: `add_all` / `swap` request residency per buffer.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn allocation_does_not_request_residency() {
+        let Some((pool, residency)) = resident_pool(16, 2, 4) else {
+            eprintln!("skipping allocation_does_not_request_residency: no residency sets");
+            return;
+        };
+        assert_eq!(residency.requests(), 0);
+        assert!(pool.grow_to(4).unwrap());
+        assert_eq!(residency.requests(), 0);
+        assert!(!residency.held());
     }
 
     /// A command buffer that aborts must turn into an `Err`, not a silent

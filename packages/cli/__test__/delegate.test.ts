@@ -126,6 +126,27 @@ describe('delegate agent arguments', () => {
     expect(options.argv).not.toContain('100K');
   });
 
+  // Mutation: drop '--idle-release' from DELEGATE_VALUE_FLAGS → red (the spaced
+  // value folds into the prompt).
+  it.each([[['--idle-release', '30m', 'Check PR #148']], [['-p', 'Check PR #148', '--idle-release', '30m']]])(
+    'reads the --idle-release value, not the prompt: %j',
+    async (argv) => {
+      const launch = vi.fn<NonNullable<AgentRunDeps['launch']>>(async () => 0);
+      await run(argv, {
+        resolveModelsDir: () => '/models',
+        discoverModels: async () => [{ name: 'local' }],
+        readPersistedDefault: () => ({ modelId: 'local' }),
+        launch,
+      });
+      expect(launch).toHaveBeenCalledOnce();
+      const options = launch.mock.calls[0]![0];
+      expect(options).toMatchObject({ idleReleaseSeconds: 1800 });
+      expect(options.argv[options.argv.indexOf('-p') + 1]).toBe('Check PR #148');
+      expect(options.argv.filter((arg) => arg.startsWith('--idle-release'))).toEqual([]);
+      expect(options.argv).not.toContain('30m');
+    },
+  );
+
   it('rejects ambiguous approval values', () => {
     expect(() => parseDelegateArgs(['github', '--caller-approved=false', 'Task'])).toThrow('takes no value');
   });

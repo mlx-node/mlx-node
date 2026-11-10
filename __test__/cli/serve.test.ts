@@ -150,6 +150,15 @@ describe('parseServeArgs', () => {
     );
   });
 
+  it('maps --idle-release to seconds and rejects a bad duration', () => {
+    expect(parseServeArgs(['--idle-release', '30m']).idleReleaseSeconds).toBe(1800);
+    expect(parseServeArgs(['--idle-release=off']).idleReleaseSeconds).toBe(Infinity);
+    expect('idleReleaseSeconds' in parseServeArgs([])).toBe(false);
+    expect(() => parseServeArgs(['--idle-release', '0'])).toThrow(
+      '--idle-release must be off or a positive duration such as 30m, 2h or 600',
+    );
+  });
+
   it('treats --log-dir as implying --verbose', () => {
     expect(parseServeArgs(['--log-dir', '/tmp/mlx-serve-logs']).logDir).toBe('/tmp/mlx-serve-logs');
   });
@@ -285,6 +294,43 @@ describe('mlx serve — end to end', () => {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
         expect(loads).toEqual([{ maxMemoryBytes: 30_064_771_072 }]);
+        const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
+        added[0]!('SIGINT');
+        for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      },
+    });
+    expect(exitCodes).toEqual([0]);
+  });
+
+  // Mutation: drop `idleReleaseSeconds` from the `createInferenceHost` call → red.
+  it('sets the residency keep-alive from --idle-release before any load', async () => {
+    const modelsDir = await makeModelsDir(['alpha']);
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const events: string[] = [];
+    const exitCodes: number[] = [];
+    const sigintBefore = new Set(listenersOf('SIGINT'));
+
+    await run(['--port', '0', '--models-dir', modelsDir, '--preload', 'alpha', '--idle-release', '30m'], {
+      hostOverrides: {
+        disableStore: true,
+        sweepOrphanTempRoots: false,
+        pagedModelTypes: [],
+        estimateContextWindow: async () => null,
+        setResidencyKeepAlive: (seconds: number) => events.push(`keep-alive ${seconds}`),
+        loadModel: async () => {
+          events.push('load');
+          return {} as unknown as LoadableModel;
+        },
+      },
+      exit: (code) => exitCodes.push(code),
+      onReady: async (host) => {
+        for (let i = 0; i < 200 && !events.includes('load'); i++) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(events).toEqual(['keep-alive 1800', 'load']);
+        expect(host.health().weights?.idleReleaseSeconds).toBe(1800);
         const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
         added[0]!('SIGINT');
         for (let i = 0; i < 200 && exitCodes.length === 0; i++) {

@@ -97,11 +97,12 @@ layer. `direct` reports only the full identity-resident plan; partial direct
 fills report `direct: false`. Unsupported source layouts retain the bounded
 per-row CPU checkpoint importer; they do not select another residency format.
 
-Between turns, eligible Metal bank buffers become purgeable. A buffer found
-empty at the next turn is refilled from GGUF before its layer is used. The
-30-second idle fallback explicitly empties banks, and tests cover both that
-path and purge/refill equality. A full fill from a slow source keeps its banks
-resident at idle instead of repeatedly paying the same source latency.
+Banks stay resident and non-volatile between turns, at any gap (Splash
+`ExpertStore`: no purgeable state, no timed purge). They go only when the idle
+release (`--idle-release`, default 10 minutes without a request) or
+`POST /v1/memory/release` unloads the model; the next request loads it again
+and refills the full planned store, not the floor first (no elastic regrow
+before the expert store comes under the governor).
 
 Fixed projections are retained within their admitted allowance. Sparse
 token/PLE rows stay on SSD: the 17 rows a token needs (its embedding and 16

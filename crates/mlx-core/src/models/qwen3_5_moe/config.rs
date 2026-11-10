@@ -307,28 +307,4 @@ impl Qwen3_5MoeConfig {
     pub fn linear_conv_dim(&self) -> i32 {
         self.linear_key_dim() * 2 + self.linear_value_dim()
     }
-
-    /// Estimate total model memory in bytes (for WiredLimitContext).
-    pub fn estimate_memory_bytes(&self) -> u64 {
-        let h = self.hidden_size as u64;
-        let v = self.vocab_size as u64;
-        let n = self.num_layers as u64;
-
-        let ne = self.num_experts as u64;
-        let moe_i = self.moe_intermediate_size.unwrap_or(self.intermediate_size) as u64;
-        let shared_i = self
-            .shared_expert_intermediate_size
-            .unwrap_or(self.intermediate_size) as u64;
-
-        let embed = v * h;
-        // Expert weights + shared expert + router
-        let mlp_params = ne * 3 * h * moe_i + 3 * h * shared_i + ne * h;
-        let per_layer = mlp_params
-            + h * h * 2  // attention projections (rough)
-            + h * 4; // norms, biases, etc.
-        let total_params = embed * 2 + n * per_layer + h;
-
-        // 2 bytes per param (bf16)
-        total_params * 2
-    }
 }

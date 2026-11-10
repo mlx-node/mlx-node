@@ -3,8 +3,18 @@ use napi_derive::module_init;
 const LOG_FILTER_ENV: &str = "MLX_NODE_LOG";
 const LOG_FILE_ENV: &str = "MLX_NODE_LOG_FILE";
 
+const RESIDENCY_REFRESH_ENV: &str = "MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS";
+
 #[module_init]
 pub fn try_init_tracing() {
+    // MLX's residency sets read this once, at the first Metal device use;
+    // without a 500 ms request (Splash `Residency::kBeat`) a standing
+    // request lapses about two seconds after the last command.
+    if std::env::var_os(RESIDENCY_REFRESH_ENV).is_none() {
+        // SAFETY: runs at addon load, before any MLX call reads the
+        // environment.
+        unsafe { std::env::set_var(RESIDENCY_REFRESH_ENV, "500") };
+    }
     use std::fs::OpenOptions;
     use std::path::Path;
     use std::str::FromStr;

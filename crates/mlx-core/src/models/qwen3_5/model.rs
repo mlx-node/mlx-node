@@ -314,6 +314,9 @@ pub(crate) struct Qwen35Inner {
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
+    /// The model's wired residency; `None` for test inners, CLEF and once
+    /// training starts.
+    pub(crate) wired: Option<Arc<crate::stream::WiredResidency>>,
     /// Optional Multi-Token Prediction head.
     ///
     /// Constructed when `config.n_mtp_layers > 0`. The speculative decode loop
@@ -544,16 +547,15 @@ pub struct Qwen3_5Model {
     /// For direct GGUF loads this is the lossless native-packed cache rather
     /// than the source file path.
     pub(crate) model_assets_path: String,
-    /// RAII: unregisters this model's baseline from the cache-limit
-    /// coordinator on drop, so the global cap can shrink once JS GCs
-    /// the wrapper.
-    pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
-    /// RAII debit for the native paged KV pool. Owned for the whole model
-    /// lifetime so the coordinator entry (updated in place by the adapter's
-    /// growth notifier via `update_pool`) cannot be dropped while the pool
-    /// may still grow. Never read directly — retained for its `Drop`.
-    #[allow(dead_code)]
-    pub(crate) pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
+    /// RAII: this model's baseline and its paged pool's debit with the
+    /// cache-limit coordinator, released by `dispose` or on drop. The pool's
+    /// entry must outlive every grow the adapter makes.
+    pub(crate) cache_limit_guards: std::sync::Mutex<
+        Option<(
+            crate::cache_limit::CacheLimitGuard,
+            Option<crate::cache_limit::PoolCacheLimitGuard>,
+        )>,
+    >,
 }
 
 #[napi]
@@ -915,12 +917,31 @@ impl Qwen3_5Model {
 }
 
 impl Qwen3_5Model {
-    /// Test-only deterministic teardown for memory-constrained real-weight
-    /// integration tests. Requires exclusive command-sender ownership and
-    /// leaves production NAPI drops non-blocking.
-    #[doc(hidden)]
-    pub fn shutdown_for_test(mut self) -> std::result::Result<(), String> {
-        self.thread.shutdown_and_join()
+    /// Joins the model thread once it has dropped the model's state, then
+    /// releases the cache-limit debits. Requires exclusive command-sender
+    /// ownership.
+    pub fn shutdown(&self) -> std::result::Result<(), String> {
+        self.thread.shutdown_and_join()?;
+        self.cache_limit_guards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        Ok(())
+    }
+}
+
+#[napi]
+impl Qwen3_5Model {
+    /// Frees the weights, caches and state now: the model thread drops them
+    /// and exits; every later call fails.
+    #[napi]
+    pub async fn dispose(&self) -> Result<()> {
+        self.thread.dispose().await?;
+        self.cache_limit_guards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        Ok(())
     }
 }
 

@@ -298,25 +298,6 @@ impl Qwen3_5Config {
     pub fn linear_conv_dim(&self) -> i32 {
         self.linear_key_dim() * 2 + self.linear_value_dim()
     }
-
-    /// Estimate total model memory in bytes (for WiredLimitContext).
-    /// Assumes bf16 (2 bytes per param) for the main model weights.
-    pub fn estimate_memory_bytes(&self) -> u64 {
-        let h = self.hidden_size as u64;
-        let v = self.vocab_size as u64;
-        let n = self.num_layers as u64;
-        let i = self.intermediate_size as u64;
-
-        let embed = v * h;
-        let mlp_params = 3 * h * i; // MLP gate/up/down
-        let per_layer = mlp_params
-            + h * h * 2  // attention projections (rough)
-            + h * 4; // norms, biases, etc.
-        let total_params = embed * 2 + n * per_layer + h;
-
-        // 2 bytes per param (bf16)
-        total_params * 2
-    }
 }
 
 #[cfg(test)]

@@ -74,6 +74,7 @@ struct Inner {
     /// A whole turn of the exclusive lane is open (its cancel flag is
     /// installed); it is one window of its own.
     exclusive_turn: bool,
+    wired: Option<Arc<crate::stream::WiredResidency>>,
 }
 
 impl Inner {
@@ -83,22 +84,13 @@ impl Inner {
         self.max_context
             .unwrap_or_else(|| self.decoder.config.served_context_tokens())
     }
-    /// The first turn after an idle gap activates reclaimable banks and
-    /// resumes their direct fill. Admissions beside an open turn share it.
+    /// The first turn after an idle gap resumes the banks' direct fill.
+    /// Admissions beside an open turn share it.
     fn open_turn(&mut self, first: bool) {
         if first && let Err(error) = self.decoder.weights.begin_turn() {
-            tracing::warn!("qwen4 residency: direct banks not activated: {error}");
+            tracing::warn!("qwen4 residency: direct fill not resumed: {error}");
         }
         self.decoder.refresh_prefill_window();
-    }
-
-    fn close_turn_if_idle(&mut self) {
-        if self.open_turns.is_empty()
-            && !self.exclusive_turn
-            && let Err(error) = self.decoder.weights.reclaim_expert_slots()
-        {
-            tracing::warn!("qwen4 residency: slot banks were not made reclaimable: {error}");
-        }
     }
 }
 struct Step<'a>(&'a mut Inner);
@@ -309,8 +301,9 @@ impl ChatBackend for Inner {
     fn eval_caches(&self) -> Result<()> {
         Ok(())
     }
+    /// The model's `WiredResidency` holds the lease for its life.
     fn wired_limit_bytes(&self) -> Option<usize> {
-        Some(usize::MAX)
+        None
     }
     /// The exclusive lane installs its flag once per whole turn and clears
     /// it after; the scheduler installs one per admission and prefill slice
@@ -324,9 +317,6 @@ impl ChatBackend for Inner {
             self.open_turn(true);
         }
         self.decoder.cancelled = flag;
-        if self.decoder.cancelled.is_none() {
-            self.close_turn_if_idle();
-        }
     }
     fn prefill(&mut self, tokens: &[u32], stream: Stream) -> Result<MxArray> {
         let window = self.decoder.context_window;
@@ -479,6 +469,13 @@ pub struct Qwen4ExpModel {
 }
 #[napi]
 impl Qwen4ExpModel {
+    /// Frees the weights, caches and state now: the model thread drops them
+    /// and exits; every later call fails.
+    #[napi]
+    pub async fn dispose(&self) -> Result<()> {
+        self.thread.dispose().await
+    }
+
     #[napi]
     pub async fn load(model_path: String, options: Option<Qwen4ExpLoadOptions>) -> Result<Self> {
         const LABEL: &str = "Qwen4Exp";
@@ -615,7 +612,7 @@ impl Qwen4ExpModel {
                 let live = Arc::clone(&decoder.weights.live);
                 let lookup = Arc::clone(&decoder.weights.lookup);
                 let assets = assets.to_string_lossy().into_owned();
-                let inner = Inner {
+                let mut inner = Inner {
                     decoder,
                     tokenizer,
                     defaults,
@@ -631,7 +628,16 @@ impl Qwen4ExpModel {
                     max_context,
                     open_turns: std::collections::HashSet::new(),
                     exclusive_turn: false,
+                    wired: None,
                 };
+                if let Some(adapter) = inner.decoder.paged.as_ref() {
+                    adapter
+                        .layer_kv_pool()
+                        .hold_resident()
+                        .map_err(Error::from_reason)?;
+                }
+                let wired_bytes = inner.wired_bytes();
+                inner.wired = Some(crate::stream::WiredResidency::new(move || wired_bytes));
                 Ok((
                     crate::engine::hybrid_scheduler::HybridSchedulerState::new(inner)?,
                     (

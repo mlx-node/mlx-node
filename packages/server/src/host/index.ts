@@ -44,6 +44,7 @@ import {
   estimateQwen35ContextWindow,
   estimateQwen4ExpContextWindow,
   releaseNativeGgufLease,
+  setResidencyKeepAlive as setResidencyKeepAliveNative,
   type Qwen35ContextEstimate,
   type Qwen35LoadOptions,
 } from '@mlx-node/core';
@@ -69,6 +70,7 @@ import { discoverAudioModels, loadAudioModel, audioCapabilities, type Discovered
 import { chatCapability, withCapabilityModels } from './capability-models.js';
 import { discoverModels, type DiscoveredModel } from './discover.js';
 import { applyEnginePolicy, type EnginePolicy } from './env-policy.js';
+import { DEFAULT_IDLE_RELEASE_SECONDS } from './idle-release.js';
 import { attachLogger as defaultAttachLogger, type Logger } from './logger.js';
 import { hostUrl, isLoopbackBindHost, normalizeLoopbackBindHost, pickFreePort } from './net.js';
 import { resolveModelsDir } from './paths.js';
@@ -193,6 +195,13 @@ export interface InferenceHostOptions {
   maxContextTokens?: number;
   /** See `ServerConfig.thinkingTokenBudget`. */
   thinkingTokenBudget?: number;
+  /**
+   * Seconds without a request before the residency is unwired and the chat
+   * weights are freed (`--idle-release`); the next request loads them again.
+   * Omitted ⇒ {@link DEFAULT_IDLE_RELEASE_SECONDS} (10 minutes); `Infinity`
+   * keeps both, though `POST /v1/memory/release` still frees the weights.
+   */
+  idleReleaseSeconds?: number;
   /** Model types forced onto the block-paged KV cache. Default {@link DEFAULT_PAGED_MODEL_TYPES}. */
   pagedModelTypes?: readonly string[];
   /** Path to the SQLite response store. See `ServerConfig.storePath`. */
@@ -222,6 +231,8 @@ export interface InferenceHostOptions {
   ) => Promise<Qwen35ContextEstimate | null>;
   /** Test seam: replaces the verbose request logger. */
   attachLogger?: (server: Server, logDir: string) => Logger;
+  /** Test seam: replaces the native residency keep-alive setter. */
+  setResidencyKeepAlive?: (seconds: number) => void;
 }
 
 export interface InferenceHost {
@@ -303,11 +314,18 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   const bindHost = normalizeLoopbackBindHost(host);
   if (opts.modelResidency !== undefined && !['capability', 'single'].includes(opts.modelResidency))
     throw new Error('modelResidency must be capability or single');
+  const idleReleaseSeconds = opts.idleReleaseSeconds ?? DEFAULT_IDLE_RELEASE_SECONDS;
+  if (!(idleReleaseSeconds > 0)) {
+    throw new Error(`idleReleaseSeconds must be positive or Infinity; received ${String(idleReleaseSeconds)}`);
+  }
 
   // FIRST, before anything can touch the engine: the native side latches
   // these via `OnceLock` on first read, so a policy applied after a load has
   // silently done nothing.
   if (opts.enginePolicy !== undefined) applyEnginePolicy(opts.enginePolicy);
+  // Splash keeps one value for both: the residency lapses and the weights go
+  // after the same time without a request.
+  (opts.setResidencyKeepAlive ?? setResidencyKeepAliveNative)(idleReleaseSeconds);
 
   // Reclaim roots left by hosts that never got to run `close()`. Best effort
   // and awaited only so a test can observe it; a failure here is not a reason
@@ -353,6 +371,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   // server needs the controller's callbacks at construction. Bridge via a
   // late-bound holder: the callbacks capture `ctrlRef.current` by closure.
   const ctrlRef: { current: ReturnType<typeof makeSwapController> | null } = { current: null };
+  const chatRef: { current: ReturnType<typeof makeSwapController> | null } = { current: null };
   let acceptingHttpModelLoads = true;
   const activeHttpModelLoads = new Set<Promise<void>>();
 
@@ -374,6 +393,8 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     host: bindHost,
     resolveModel: resolveHttpModel,
     listModels: () => ctrlRef.current!.listModels(),
+    idleReleaseMs: idleReleaseSeconds * 1000,
+    releaseWeights: () => chatRef.current!.releaseAll!(),
     ...(opts.authToken !== undefined ? { authToken: opts.authToken } : {}),
     ...(opts.storePath !== undefined ? { storePath: opts.storePath } : {}),
     ...(opts.disableStore !== undefined ? { disableStore: opts.disableStore } : {}),
@@ -437,6 +458,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   const chatController = makeSwapController(models, server.registry, loadModelPagedAware, boundEntry.name, (name) =>
     estimates.get(name),
   );
+  chatRef.current = chatController;
   const controller = withCapabilityModels(
     [
       chatCapability(chatController, server.registry),
@@ -684,6 +706,7 @@ function startContextEstimates(
 }
 
 export { discoverModels, type DiscoveredModel } from './discover.js';
+export { DEFAULT_IDLE_RELEASE_SECONDS, IDLE_RELEASE_ERROR, idleReleaseText, parseIdleRelease } from './idle-release.js';
 export { MAX_CONTEXT_ERROR, MAX_YARN_CONTEXT_TOKENS, parseMaxContext } from './max-context.js';
 export { MAX_MEMORY_ERROR, parseMaxMemory } from './max-memory.js';
 export {

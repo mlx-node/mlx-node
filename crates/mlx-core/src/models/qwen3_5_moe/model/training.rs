@@ -343,6 +343,7 @@ impl Qwen35MoeInner {
             None
         };
 
+        self.wired = None;
         self.training_state = Some(crate::training_state::ModelThreadTrainingState::new(
             config.learning_rate.unwrap_or(1e-6),
             config.gradient_accumulation_steps.unwrap_or(1),

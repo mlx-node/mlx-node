@@ -5,6 +5,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ResponseStore } from '@mlx-node/core';
 
 import type { AudioService } from './audio-service.js';
+import { handleMemoryRelease, type MemoryReleaseAnswer } from './endpoints/memory-release.js';
 import { handleCountMessageTokens } from './endpoints/messages-count-tokens.js';
 import { handleCreateMessage } from './endpoints/messages.js';
 import { handleListModels } from './endpoints/models.js';
@@ -93,6 +94,8 @@ export interface RouteExtras {
   rerank?: RerankService;
   /** Thinking budget of a Messages thinking request that sets none. */
   thinkingTokenBudget?: number;
+  /** `POST /v1/memory/release`; omitted ⇒ the route is not served. */
+  releaseMemory?: () => Promise<MemoryReleaseAnswer>;
 }
 
 export async function routeRequest(
@@ -164,6 +167,16 @@ export async function routeRequest(
       /* The endpoint reports malformed JSON. */
     }
     await handleSystemOne(req, res, raw, registry, idleSweeper, resolveModel, modelWorkCoordinator);
+    return;
+  }
+
+  if (path === '/v1/memory/release' && extras?.releaseMemory) {
+    // No inference request: it never moves the idle sweeper or the weights' clock.
+    if (req.method !== 'POST') {
+      sendMethodNotAllowed(res, 'POST');
+      return;
+    }
+    await handleMemoryRelease(req, res, extras.releaseMemory);
     return;
   }
 

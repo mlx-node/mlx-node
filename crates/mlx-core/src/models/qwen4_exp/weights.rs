@@ -716,12 +716,8 @@ pub struct Store {
     direct_fill: Option<expert_slots::DirectFill>,
     direct_fill_remaining: usize,
     direct_error: Option<String>,
-    activation_error: Option<String>,
     /// This turn admitted a layer-major prefill beside a direct fill.
     direct_fill_pass: bool,
-    /// A slow source keeps its filled banks instead of purging them at idle.
-    direct_slow_source: bool,
-    slot_reclaim_since: Option<std::time::Instant>,
     wide_routes: HashMap<usize, Vec<u32>>,
     deferred_reduction_layer: Option<usize>,
     slot_capacity: Option<usize>,
@@ -892,10 +888,7 @@ impl Store {
             direct_fill: None,
             direct_fill_remaining: 0,
             direct_error: None,
-            activation_error: None,
             direct_fill_pass: false,
-            direct_slow_source: false,
-            slot_reclaim_since: None,
             wide_routes: HashMap::new(),
             deferred_reduction_layer: None,
             slot_capacity: None,
@@ -2806,9 +2799,6 @@ mod cache_tests {
 mod direct_tests {
     use super::*;
     use crate::models::qwen4_exp::memory;
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    use std::time::{Duration, Instant};
 
     struct Temp(PathBuf);
     impl Temp {
@@ -3262,7 +3252,7 @@ mod direct_tests {
     }
 
     #[test]
-    fn direct_gguf_split_full_capacity_and_refill_match_checkpoint() {
+    fn direct_gguf_split_full_capacity_matches_checkpoint() {
         if !crate::utils::gguf_gpu::gpu_repack_available() {
             return;
         }
@@ -3279,28 +3269,22 @@ mod direct_tests {
         );
         let mut store = open_full(&temp, &paths[0], "split-full-direct", 2, EXPERTS);
         let ids: Vec<u32> = (0..EXPERTS as u32).collect();
-        store.activate_expert_slots().unwrap();
-        for refill in 0..2 {
-            for layer in 0..2 {
-                let (banks, local, capacity) = store
-                    .expert_slots(layer, EXPERTS, 2, &ids)
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(capacity, EXPERTS);
-                assert_eq!(local, ids);
-                assert_banks_match_checkpoint_layer(&store, layer, &PARTS, &banks, &ids, &local);
-            }
-            assert!(store.device_slots_ready(2));
-            assert_eq!(store.slot_misses, 0);
-            assert!(store.plan.direct);
-            assert_eq!(store.plan.direct_layers, 2);
-            assert_eq!(store.plan.direct_bytes, store.slot_bytes);
-            if refill == 0 {
-                store.purge_expert_slots().unwrap();
-                store.activate_expert_slots().unwrap();
-            }
+        store.begin_turn().unwrap();
+        for layer in 0..2 {
+            let (banks, local, capacity) = store
+                .expert_slots(layer, EXPERTS, 2, &ids)
+                .unwrap()
+                .unwrap();
+            assert_eq!(capacity, EXPERTS);
+            assert_eq!(local, ids);
+            assert_banks_match_checkpoint_layer(&store, layer, &PARTS, &banks, &ids, &local);
         }
-        assert_eq!(store.slot_upload_bytes, 2 * store.slot_bytes);
+        assert!(store.device_slots_ready(2));
+        assert_eq!(store.slot_misses, 0);
+        assert!(store.plan.direct);
+        assert_eq!(store.plan.direct_layers, 2);
+        assert_eq!(store.plan.direct_bytes, store.slot_bytes);
+        assert_eq!(store.slot_upload_bytes, store.slot_bytes);
         assert_split_read_windows(&store);
     }
 
@@ -3755,7 +3739,7 @@ mod direct_tests {
     }
 
     #[test]
-    fn direct_gguf_full_capacity_fills_layers_with_identity_and_refills_empty() {
+    fn direct_gguf_full_capacity_fills_layers_with_identity_and_keeps_them() {
         if !crate::utils::gguf_gpu::gpu_repack_available() {
             return;
         }
@@ -3774,7 +3758,7 @@ mod direct_tests {
         let ids: Vec<u32> = (0..EXPERTS as u32).collect();
         assert!(!store.device_slots_ready(LAYERS));
         assert!(store.prefill_device_slots_ready(LAYERS));
-        store.activate_expert_slots().unwrap();
+        store.begin_turn().unwrap();
         assert!(store.direct_fill_pass());
         for layer in [1, 2, 0] {
             let (banks, local, capacity) = store
@@ -3809,11 +3793,9 @@ mod direct_tests {
 
         let allocated = store.slot_bytes;
         let first_upload = store.slot_upload_bytes;
-        store.purge_expert_slots().unwrap();
-        assert!(!store.device_slots_ready(LAYERS));
-        store.activate_expert_slots().unwrap();
-        assert!(store.direct_fill_pass());
-        let before = store.bytes_read;
+        store.begin_turn().unwrap();
+        assert!(!store.direct_fill_pass());
+        assert!(store.device_slots_ready(LAYERS));
         for layer in 0..LAYERS {
             let (banks, local, _) = store
                 .expert_slots(layer, EXPERTS, 2, &ids)
@@ -3822,204 +3804,11 @@ mod direct_tests {
             assert_eq!(local, ids);
             assert_banks_match_checkpoint_layer(&store, layer, &PARTS, &banks, &ids, &local);
         }
-        assert_eq!(store.bytes_read, before + source_bytes);
-        assert_eq!(store.slot_upload_bytes, first_upload + allocated);
+        assert_eq!(store.bytes_read, source_bytes);
+        assert_eq!(store.slot_upload_bytes, first_upload);
         assert_eq!(store.slot_bytes, allocated);
         assert_eq!(store.cache_bytes, allocated);
         assert_eq!(store.slot_misses, 0);
-        assert!(store.device_slots_ready(LAYERS));
-    }
-
-    fn begin_turn_scripted(
-        store: &mut Store,
-        cached: f64,
-        outcomes: Vec<Result<()>>,
-    ) -> (Result<()>, Vec<String>) {
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let mut outcomes = outcomes.into_iter();
-        let mut admit = {
-            let events = Rc::clone(&events);
-            move |bytes| {
-                events.borrow_mut().push(format!("admit:{bytes}"));
-                outcomes.next().expect("unexpected activation admission")
-            }
-        };
-        let mut cache_size = {
-            let events = Rc::clone(&events);
-            move || {
-                events.borrow_mut().push("cache".into());
-                cached
-            }
-        };
-        let mut reclaim = {
-            let events = Rc::clone(&events);
-            move || events.borrow_mut().push("reclaim".into())
-        };
-        let result = store.begin_turn_with_reclaim(&mut admit, &mut cache_size, &mut reclaim);
-        let events = events.borrow().clone();
-        (result, events)
-    }
-
-    #[test]
-    fn direct_gguf_full_purge_reactivates_only_after_fresh_admission() {
-        if !crate::utils::gguf_gpu::gpu_repack_available() {
-            return;
-        }
-        const LAYERS: usize = 2;
-        let temp = Temp::new();
-        let gguf = temp.0.join("full-purge-admission.gguf");
-        write_fixture_layers(&gguf, LAYERS);
-        let mut store = open_full(&temp, &gguf, "full-purge-admission-direct", LAYERS, EXPERTS);
-        let ids: Vec<u32> = (0..EXPERTS as u32).collect();
-        store.activate_expert_slots().unwrap();
-        for layer in 0..LAYERS {
-            store.expert_slots(layer, EXPERTS, 2, &ids).unwrap();
-        }
-        // Join the completed worker so a refused activation cannot be confused
-        // with the preceding load's fill handle.
-        store.start_direct_fill().unwrap();
-        assert!(store.direct_fill.is_none());
-
-        let source_bytes = store.bytes_read;
-        let allocated = store.slot_bytes;
-        let expected_admission = allocated + expert_slots::DIRECT_STAGING_BYTES;
-        store.purge_expert_slots().unwrap();
-        let purge_state = store.slot_suspend_states_for_test();
-        assert!(
-            purge_state
-                .iter()
-                .all(|&(_, suspended, purged)| suspended && purged)
-        );
-        let before_reads = store.bytes_read;
-        let before_upload = store.slot_upload_bytes;
-        let before_windows = store.direct_read_windows.len();
-        let before_filled = store.live.direct_filled_layers.load(Ordering::Acquire);
-
-        let (result, events) = begin_turn_scripted(
-            &mut store,
-            1.0,
-            vec![
-                Err(err("injected full activation pressure A")),
-                Err(err("injected full activation pressure B")),
-            ],
-        );
-        let error = result.unwrap_err();
-        assert!(error.reason.contains("full activation pressure B"));
-        assert_eq!(
-            events,
-            vec![
-                format!("admit:{expected_admission}"),
-                "cache".into(),
-                "reclaim".into(),
-                format!("admit:{expected_admission}"),
-            ]
-        );
-        assert_eq!(
-            store.activation_error.as_deref(),
-            Some("injected full activation pressure B")
-        );
-        assert_eq!(store.slot_suspend_states_for_test(), purge_state);
-        assert!(store.direct_fill.is_none());
-        assert_eq!(store.direct_fill_remaining, 0);
-        assert!(!store.direct_fill_pass());
-        assert!(!store.live.direct_fill_in_progress.load(Ordering::Acquire));
-        assert_eq!(store.bytes_read, before_reads);
-        assert_eq!(store.slot_upload_bytes, before_upload);
-        assert_eq!(store.direct_read_windows.len(), before_windows);
-        assert_eq!(
-            store.live.direct_filled_layers.load(Ordering::Acquire),
-            before_filled
-        );
-
-        let error = store.expert_slots(0, EXPERTS, 2, &ids).err().unwrap();
-        assert!(error.reason.contains("expert bank activation refused"));
-        assert!(error.reason.contains("full activation pressure B"));
-        assert_eq!(store.slot_suspend_states_for_test(), purge_state);
-        assert_eq!(store.bytes_read, before_reads);
-        assert_eq!(store.slot_upload_bytes, before_upload);
-        assert_eq!(store.direct_read_windows.len(), before_windows);
-
-        let (result, events) = begin_turn_scripted(
-            &mut store,
-            1.0,
-            vec![Err(err("transient full activation refusal")), Ok(())],
-        );
-        result.unwrap();
-        assert_eq!(
-            events,
-            vec![
-                format!("admit:{expected_admission}"),
-                "cache".into(),
-                "reclaim".into(),
-                format!("admit:{expected_admission}"),
-            ]
-        );
-        assert!(store.activation_error.is_none());
-        for layer in 0..LAYERS {
-            let (banks, local, capacity) = store
-                .expert_slots(layer, EXPERTS, 2, &ids)
-                .unwrap()
-                .unwrap();
-            assert_eq!(capacity, EXPERTS);
-            assert_eq!(local, ids);
-            assert_banks_match_checkpoint_layer(&store, layer, &PARTS, &banks, &ids, &local);
-        }
-        assert!(store.device_slots_ready(LAYERS));
-        assert_eq!(store.bytes_read, before_reads + source_bytes);
-        assert_eq!(store.slot_upload_bytes, before_upload + allocated);
-        assert_eq!(store.slot_bytes, allocated);
-        assert_eq!(store.cache_bytes, allocated);
-        assert_eq!(store.slot_misses, 0);
-        assert_eq!(
-            store.live.direct_filled_layers.load(Ordering::Acquire),
-            LAYERS as u64
-        );
-        let (result, events) = begin_turn_scripted(&mut store, 1.0, Vec::new());
-        result.unwrap();
-        assert!(events.is_empty());
-
-        // A successful activation retry clears its own refusal, never an
-        // unrelated asynchronous worker failure.
-        store.purge_expert_slots().unwrap();
-        let mut zero_cache_bytes = Vec::new();
-        let error = store
-            .begin_turn_with(&mut |bytes| {
-                zero_cache_bytes.push(bytes);
-                Err(err("second full activation refusal"))
-            })
-            .unwrap_err();
-        assert!(error.reason.contains("second full activation refusal"));
-        assert_eq!(zero_cache_bytes, [expected_admission]);
-        assert_eq!(
-            store.activation_error.as_deref(),
-            Some("second full activation refusal")
-        );
-        store.direct_error = Some("unrelated asynchronous worker error".into());
-        let before_worker_error_reads = store.bytes_read;
-        let (result, events) = begin_turn_scripted(
-            &mut store,
-            1.0,
-            vec![Err(err("transient full worker activation refusal")), Ok(())],
-        );
-        result.unwrap();
-        assert_eq!(
-            events,
-            vec![
-                format!("admit:{expected_admission}"),
-                "cache".into(),
-                "reclaim".into(),
-                format!("admit:{expected_admission}"),
-            ]
-        );
-        assert!(store.activation_error.is_none());
-        assert_eq!(
-            store.direct_error.as_deref(),
-            Some("unrelated asynchronous worker error")
-        );
-        assert!(store.direct_fill.is_none());
-        let error = store.expert_slots(0, EXPERTS, 2, &ids).err().unwrap();
-        assert!(error.reason.contains("unrelated asynchronous worker error"));
-        assert_eq!(store.bytes_read, before_worker_error_reads);
     }
 
     #[test]
@@ -4038,7 +3827,7 @@ mod direct_tests {
         assert!(error.reason.contains("Failed to open GGUF"), "{error}");
         assert!(!store.device_slots_ready(1));
         fs::rename(&held, &gguf).unwrap();
-        store.activate_expert_slots().unwrap();
+        store.begin_turn().unwrap();
         let error = store.expert_slots(0, EXPERTS, 2, &[0]).err().unwrap();
         assert!(error.reason.contains("changed since open"), "{error}");
         assert_eq!(store.slot_misses, 0);
@@ -4046,7 +3835,7 @@ mod direct_tests {
     }
 
     #[test]
-    fn direct_gguf_q5_1_slots_match_cpu_import_eviction_and_purge_refill() {
+    fn direct_gguf_q5_1_slots_match_cpu_import_and_eviction() {
         if !crate::utils::gguf_gpu::gpu_repack_available() {
             return;
         }
@@ -4069,143 +3858,8 @@ mod direct_tests {
         compared += assert_banks_match_checkpoint(&store, &PARTS, &banks, &next, &local).len();
         assert_eq!(store.bytes_read, first_fill + one_fill);
 
-        // Volatile banks either survive or take the same Empty refill path;
-        // explicit Empty guarantees the fallback and requires a full refill.
-        store.reclaim_expert_slots().unwrap();
-        let before = store.bytes_read;
-        let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &next).unwrap().unwrap();
-        compared += assert_banks_match_checkpoint(&store, &PARTS, &banks, &next, &local).len();
-        assert!((store.bytes_read - before) <= first_fill);
-        store.purge_expert_slots().unwrap();
-        let before = store.bytes_read;
-        let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &next).unwrap().unwrap();
-        compared += assert_banks_match_checkpoint(&store, &PARTS, &banks, &next, &local).len();
-        assert_eq!(store.bytes_read, before + first_fill);
         assert!(store.device_slots_ready(1));
-        eprintln!(
-            "P3.0-d Q5_1 parity: {compared} bank bytes, eviction + volatile + explicit Empty refill"
-        );
-    }
-
-    #[test]
-    fn direct_gguf_partial_purge_demand_respects_activation_refusal_and_retry() {
-        if !crate::utils::gguf_gpu::gpu_repack_available() {
-            return;
-        }
-        let temp = Temp::new();
-        let gguf = temp.0.join("partial-purge-admission.gguf");
-        write_fixture(&gguf);
-        let mut store = open_slots(&temp, &gguf, "partial-purge-admission-direct", 2, true);
-        let ids = [0u32, 1];
-        store.expert_slots(0, EXPERTS, 2, &ids).unwrap();
-        let first_fill = raw_fill_bytes(&store, &PARTS, &ids);
-        assert_eq!(store.bytes_read, first_fill);
-        let allocated = store.slot_bytes;
-        let expected_admission = allocated + expert_slots::DIRECT_STAGING_BYTES;
-
-        store.purge_expert_slots().unwrap();
-        let purge_state = store.slot_suspend_states_for_test();
-        let before_reads = store.bytes_read;
-        let before_upload = store.slot_upload_bytes;
-        let before_windows = store.direct_read_windows.len();
-        let before_misses = store.slot_misses;
-        let before_cache = store.cache_bytes;
-        let (result, events) = begin_turn_scripted(
-            &mut store,
-            1.0,
-            vec![
-                Err(err("injected partial activation pressure A")),
-                Err(err("injected partial activation pressure B")),
-            ],
-        );
-        let error = result.unwrap_err();
-        assert!(error.reason.contains("partial activation pressure B"));
-        assert_eq!(
-            events,
-            vec![
-                format!("admit:{expected_admission}"),
-                "cache".into(),
-                "reclaim".into(),
-                format!("admit:{expected_admission}"),
-            ]
-        );
-        assert_eq!(
-            store.activation_error.as_deref(),
-            Some("injected partial activation pressure B")
-        );
-        assert_eq!(store.slot_suspend_states_for_test(), purge_state);
-        assert!(store.direct_fill.is_none());
-        assert_eq!(store.bytes_read, before_reads);
-        assert_eq!(store.slot_upload_bytes, before_upload);
-        assert_eq!(store.direct_read_windows.len(), before_windows);
-        assert_eq!(store.slot_misses, before_misses);
-
-        let error = store.expert_slots(0, EXPERTS, 2, &ids).err().unwrap();
-        assert!(error.reason.contains("expert bank activation refused"));
-        assert!(error.reason.contains("partial activation pressure B"));
-        assert_eq!(store.slot_suspend_states_for_test(), purge_state);
-        assert_eq!(store.bytes_read, before_reads);
-        assert_eq!(store.slot_upload_bytes, before_upload);
-        assert_eq!(store.direct_read_windows.len(), before_windows);
-        assert_eq!(store.slot_misses, before_misses);
-
-        let (result, events) = begin_turn_scripted(
-            &mut store,
-            1.0,
-            vec![Err(err("transient partial activation refusal")), Ok(())],
-        );
-        result.unwrap();
-        assert_eq!(
-            events,
-            vec![
-                format!("admit:{expected_admission}"),
-                "cache".into(),
-                "reclaim".into(),
-                format!("admit:{expected_admission}"),
-            ]
-        );
-        assert!(store.activation_error.is_none());
-        let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
-        assert_eq!(local, ids);
-        assert_banks_match_checkpoint(&store, &PARTS, &banks, &ids, &local);
-        assert_eq!(store.bytes_read, before_reads + first_fill);
-        assert_eq!(store.slot_upload_bytes, before_upload + allocated);
-        assert_eq!(store.slot_bytes, allocated);
-        assert_eq!(store.cache_bytes, before_cache);
-        assert_eq!(store.slot_misses, before_misses + ids.len() as u64);
-        assert!(store.device_slots_ready(1));
-        let (result, events) = begin_turn_scripted(&mut store, 1.0, Vec::new());
-        result.unwrap();
-        assert!(events.is_empty());
-
-        store.purge_expert_slots().unwrap();
-        let before_zero_cache_reads = store.bytes_read;
-        let (result, events) = begin_turn_scripted(
-            &mut store,
-            0.0,
-            vec![Err(err("partial zero-cache activation refusal"))],
-        );
-        let error = result.unwrap_err();
-        assert!(
-            error
-                .reason
-                .contains("partial zero-cache activation refusal")
-        );
-        assert_eq!(
-            events,
-            vec![format!("admit:{expected_admission}"), "cache".into()]
-        );
-        assert_eq!(
-            store.activation_error.as_deref(),
-            Some("partial zero-cache activation refusal")
-        );
-        assert_eq!(store.bytes_read, before_zero_cache_reads);
-
-        let (result, events) = begin_turn_scripted(&mut store, 1.0, vec![Ok(())]);
-        result.unwrap();
-        assert_eq!(events, vec![format!("admit:{expected_admission}")]);
-        assert!(store.activation_error.is_none());
-        assert_eq!(store.bytes_read, before_zero_cache_reads);
+        eprintln!("P3.0-d Q5_1 parity: {compared} bank bytes, eviction");
     }
 
     #[test]
@@ -4233,26 +3887,34 @@ mod direct_tests {
     }
 
     #[test]
-    fn direct_gguf_idle_fallback_forces_a_fresh_fill() {
+    /// A turn after any idle gap keeps the filled banks, non-volatile, and
+    /// reads nothing again (Splash `ExpertStore`: no purgeable state, no
+    /// timed purge).
+    ///
+    /// Mutation M9: the next turn empties the banks first (the old 30 s
+    /// purge).
+    fn idle_gap_keeps_the_expert_banks() {
         if !crate::utils::gguf_gpu::gpu_repack_available() {
             return;
         }
         let _host = memory::scoped_fixture_host();
         let temp = Temp::new();
-        let gguf = temp.0.join("idle-fallback.gguf");
+        let gguf = temp.0.join("idle-gap.gguf");
         write_fixture(&gguf);
-        let mut store = open_slots(&temp, &gguf, "idle-fallback-direct", EXPERTS, true);
+        let mut store = open_slots(&temp, &gguf, "idle-gap-direct", EXPERTS, true);
         let ids = [0u32, 1];
+        store.begin_turn().unwrap();
         store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
-        let first_fill = raw_fill_bytes(&store, &PARTS, &ids);
-        store.reclaim_expert_slots().unwrap();
-        store.slot_reclaim_since = Some(Instant::now() - Duration::from_secs(31));
-        store.activate_expert_slots().unwrap();
-        let before = store.bytes_read;
+        let filled = store.bytes_read;
+        let reclaimable = crate::array::purgeable::reclaimable_purgeable_bytes();
+        store.begin_turn().unwrap();
         let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
         assert_banks_match_checkpoint(&store, &PARTS, &banks, &ids, &local);
-        assert_eq!(store.bytes_read, before + first_fill);
-        assert!(store.slot_reclaim_since.is_none());
+        assert_eq!(store.bytes_read, filled);
+        assert_eq!(
+            crate::array::purgeable::reclaimable_purgeable_bytes(),
+            reclaimable
+        );
     }
 
     #[test]
@@ -4390,7 +4052,7 @@ mod direct_tests {
         let gguf = temp.0.join("identity.gguf");
         write_fixture(&gguf);
         let mut store = open_full(&temp, &gguf, "identity-direct", 1, EXPERTS);
-        store.activate_expert_slots().unwrap();
+        store.begin_turn().unwrap();
         let ids = [4u32, 0, 2, 2, 1, 3];
         let (banks, local, capacity) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
         assert_eq!(local, ids);
@@ -4475,7 +4137,7 @@ mod direct_tests {
                 .select_direct_residency_with(EXPERTS, 0, &mut memory::direct_gate, &mut |_| Ok(()))
                 .unwrap()
         );
-        store.activate_expert_slots().unwrap();
+        store.begin_turn().unwrap();
         let ids: Vec<u32> = (0..EXPERTS as u32).collect();
         let (banks, local, _) = store.expert_slots(0, EXPERTS, 2, &ids).unwrap().unwrap();
         assert_banks_match_checkpoint(&store, &PARTS, &banks, &ids, &local);

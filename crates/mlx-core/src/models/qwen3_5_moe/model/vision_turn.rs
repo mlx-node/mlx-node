@@ -261,9 +261,6 @@ impl Qwen35MoeInner {
         let mut token_history: Vec<u32> = expanded_tokens.clone();
 
         let generation_stream = Stream::generation();
-        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
-        let _wired_ctx =
-            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
         // StreamContext created ONCE for entire prefill+decode
         let _stream_ctx = StreamContext::new(generation_stream);
@@ -536,9 +533,6 @@ impl Qwen35MoeInner {
         let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
 
         let generation_stream = Stream::generation();
-        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
-        let _wired_ctx =
-            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
         // Held until the prefill that reads `merge` has run: a reclaim takes
         // only features nothing holds (Splash `Runtime::prefillAsync` gives
@@ -918,9 +912,6 @@ impl Qwen35MoeInner {
         let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
 
         let generation_stream = Stream::generation();
-        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
-        let _wired_ctx =
-            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
         // Held until the prefill that reads `merge` has run: a reclaim takes
         // only features nothing holds (Splash `Runtime::prefillAsync` gives

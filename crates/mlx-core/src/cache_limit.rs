@@ -854,6 +854,13 @@ pub fn clear_cache() {
     synchronize_and_clear_cache();
 }
 
+/// How long residency stays wired after the last command (Splash
+/// `--idle-release`): positive seconds, `Infinity` for the process's life.
+#[napi]
+pub fn set_residency_keep_alive(seconds: f64) -> napi::Result<()> {
+    mlx_paged_attn::residency::set_keep_alive(seconds).map_err(napi::Error::from_reason)
+}
+
 /// Return a snapshot of the MLX allocator's memory counters. Primarily
 /// useful for dashboards and for debugging the `MLX_CACHE_LIMIT_GB`
 /// override. Read-only — does not mutate allocator state.

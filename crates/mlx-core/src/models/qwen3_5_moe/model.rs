@@ -265,6 +265,9 @@ pub(crate) struct Qwen35MoeInner {
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
+    /// The model's wired residency; `None` for test inners, CLEF and once
+    /// training starts.
+    pub(crate) wired: Option<Arc<crate::stream::WiredResidency>>,
     /// Whether the CURRENT generic-flow turn is streaming. Set by the
     /// [`ChatBackend::profiler_label`] hook (the session core calls it
     /// exactly once per generic-flow turn, before `begin_decode`);
@@ -369,16 +372,30 @@ pub struct Qwen3_5MoeModel {
     /// For direct GGUF loads this is the lossless native-packed cache rather
     /// than the source file path.
     pub(crate) model_assets_path: String,
-    /// RAII: unregisters this model's baseline from the cache-limit
-    /// coordinator on drop.
-    pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
-    /// RAII debit for the native paged KV pool, whose Metal buffers are not
-    /// visible to MLX allocator accounting. Owned for the whole model
-    /// lifetime so the coordinator entry (updated in place by the adapter's
-    /// growth notifier via `update_pool`) cannot be dropped while the pool
-    /// may still grow. Never read directly — retained for its `Drop`.
-    #[allow(dead_code)]
-    pub(crate) pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
+    /// RAII: this model's baseline and its paged pool's debit with the
+    /// cache-limit coordinator, released by `dispose` or on drop. The pool's
+    /// entry must outlive every grow the adapter makes.
+    pub(crate) cache_limit_guards: std::sync::Mutex<
+        Option<(
+            crate::cache_limit::CacheLimitGuard,
+            Option<crate::cache_limit::PoolCacheLimitGuard>,
+        )>,
+    >,
+}
+
+#[napi]
+impl Qwen3_5MoeModel {
+    /// Frees the weights, caches and state now: the model thread drops them
+    /// and exits; every later call fails.
+    #[napi]
+    pub async fn dispose(&self) -> Result<()> {
+        self.thread.dispose().await?;
+        self.cache_limit_guards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        Ok(())
+    }
 }
 
 #[napi]

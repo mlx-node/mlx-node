@@ -2248,8 +2248,7 @@ impl Qwen3AsrModel {
         let sender = self
             .thread
             .cmd_sender()
-            .ok_or_else(|| Error::from_reason("Qwen3-ASR model thread is not running"))?
-            .clone();
+            .ok_or_else(|| Error::from_reason("Qwen3-ASR model thread is not running"))?;
         if self.shutdown.load(Ordering::Acquire) {
             return Err(Error::from_reason("Qwen3-ASR model is disposed"));
         }

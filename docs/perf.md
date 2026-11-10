@@ -253,13 +253,14 @@ in memory on every load. Their native cache entries are small asset directories
 
 ### Memory pool
 
-| Var                         | Effect                                                                                                                                                                                                                          |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MLX_CACHE_LIMIT_GB`        | Hard Metal pool ceiling                                                                                                                                                                                                         |
-| `TTS_MLX_CACHE_LIMIT`       | Optional TTS-lifetime ceiling on the shared MLX free-buffer pool, in GiB (fractional values allowed). Unset/0 adds no constraint; positive ceilings compose by minimum with the global policy. See [TTS memory](tts-memory.md). |
-| `MLX_GPU_HEADROOM_GB`       | Headroom term in the auto-sizing formula                                                                                                                                                                                        |
-| `MLX_RESIDENCY_SET_MAX_PCT` | Upstream MLX: one residency set's size, as % of the recommended working set (default 5). Splits wired memory across sets, never changes how much is wired; `<= 0` or `>= 100` = one set (`mlx/utils.h:205-218`)                 |
-| `MLX_RESIDENCY_DEBUG=1`     | Upstream MLX: log each residency set as it is created                                                                                                                                                                           |
+| Var                                       | Effect                                                                                                                                                                                                                                                       |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `MLX_CACHE_LIMIT_GB`                      | Hard Metal pool ceiling                                                                                                                                                                                                                                      |
+| `TTS_MLX_CACHE_LIMIT`                     | Optional TTS-lifetime ceiling on the shared MLX free-buffer pool, in GiB (fractional values allowed). Unset/0 adds no constraint; positive ceilings compose by minimum with the global policy. See [TTS memory](tts-memory.md).                              |
+| `MLX_GPU_HEADROOM_GB`                     | Headroom term in the auto-sizing formula                                                                                                                                                                                                                     |
+| `MLX_RESIDENCY_SET_MAX_PCT`               | Upstream MLX: one residency set's size, as % of the recommended working set (default 5). Splits wired memory across sets, never changes how much is wired; `<= 0` or `>= 100` = one set (`mlx/utils.h:205-218`)                                              |
+| `MLX_RESIDENCY_DEBUG=1`                   | Upstream MLX: log each residency set as it is created                                                                                                                                                                                                        |
+| `MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS` | MLX fork: how often its residency sets request residency again. The addon sets `500` at load when unset (Splash `Residency` beat), so the model-life wired lease stays wired between turns; `0` turns the beat off. Read once, at the first Metal device use |
 
 ### DeepSeek V4.1 Flash (SSD streaming)
 

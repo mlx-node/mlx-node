@@ -946,4 +946,5 @@ module.exports.resetProfilingData = nativeBinding.resetProfilingData;
 module.exports.saveToXlsx = nativeBinding.saveToXlsx;
 module.exports.scoreAgainstTeacher = nativeBinding.scoreAgainstTeacher;
 module.exports.setProfilingEnabled = nativeBinding.setProfilingEnabled;
+module.exports.setResidencyKeepAlive = nativeBinding.setResidencyKeepAlive;
 module.exports.__internal__ = nativeBinding.__internal__;

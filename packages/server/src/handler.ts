@@ -6,6 +6,7 @@ import type { ResponseStore } from '@mlx-node/core';
 
 import { AudioService, AUDIO_EXPOSE_HEADERS, type AudioServiceOptions } from './audio-service.js';
 import { hasCredential, isAuthorized, sendUnauthorized } from './auth.js';
+import type { MemoryReleaseAnswer } from './endpoints/memory-release.js';
 import { sendInternalError } from './errors.js';
 import { createHealthReporter, type ServerHealth } from './health.js';
 import type { IdleSweeper } from './idle-sweeper.js';
@@ -133,6 +134,8 @@ export interface HandlerOptions {
   health?: () => ServerHealth;
   /** See `ServerConfig.thinkingTokenBudget`. */
   thinkingTokenBudget?: number;
+  /** Serves `POST /v1/memory/release`; supplied by `createServer` when it can release the weights. */
+  releaseMemory?: () => Promise<MemoryReleaseAnswer>;
 }
 
 export function createHandler(
@@ -222,7 +225,14 @@ export function createHandler(
         resolveModel,
         listModels,
         modelWorkCoordinator,
-        { health, authenticated, audio, rerank, thinkingTokenBudget: options?.thinkingTokenBudget },
+        {
+          health,
+          authenticated,
+          audio,
+          rerank,
+          thinkingTokenBudget: options?.thinkingTokenBudget,
+          ...(options?.releaseMemory !== undefined ? { releaseMemory: options.releaseMemory } : {}),
+        },
       );
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Internal server error';

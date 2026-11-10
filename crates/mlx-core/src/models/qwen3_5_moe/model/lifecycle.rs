@@ -71,6 +71,7 @@ impl Qwen35MoeInner {
         );
         Ok(Self {
             config,
+            wired: None,
             source_moe_policy: Default::default(),
             source_norm_identity: None,
             turn_cancel: None,

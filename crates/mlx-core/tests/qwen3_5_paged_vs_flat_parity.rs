@@ -206,7 +206,7 @@ async fn qwen3_5_paged_vs_flat_greedy_token_parity() {
     // plain `drop(flat_model)` is insufficient because normal NAPI teardown
     // intentionally detaches the worker thread.
     flat_model
-        .shutdown_for_test()
+        .shutdown()
         .expect("flat-path Qwen3.5 model thread panicked during teardown");
     mlx_core::array::synchronize_and_clear_cache();
 

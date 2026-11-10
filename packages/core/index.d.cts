@@ -1699,6 +1699,11 @@ export declare class Qwen35Model {
    * Dispatches to model thread.
    */
   saveModel(savePath: string): Promise<undefined>;
+  /**
+   * Frees the weights, caches and state now: the model thread drops them
+   * and exits; every later call fails.
+   */
+  dispose(): Promise<void>;
   /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
   schedulerStats(): Promise<SchedulerStats>;
   /**
@@ -1788,6 +1793,11 @@ export type Qwen3_5Model = Qwen35Model;
  * routed through `TrainingDispatch` to the model thread.
  */
 export declare class Qwen35MoeModel {
+  /**
+   * Frees the weights, caches and state now: the model thread drops them
+   * and exits; every later call fails.
+   */
+  dispose(): Promise<void>;
   /**
    * Resolved directory containing this model's tokenizer/config assets.
    * Streaming wrappers use it after a direct GGUF load so chat templating
@@ -2364,6 +2374,11 @@ export declare class Qwen3Tokenizer {
  * paged scheduling. Inference and cache mutations run on one owned thread.
  */
 export declare class Qwen4ExpModel {
+  /**
+   * Frees the weights, caches and state now: the model thread drops them
+   * and exits; every later call fails.
+   */
+  dispose(): Promise<void>;
   static load(modelPath: string, options?: Qwen4ExpLoadOptions | undefined | null): Promise<Qwen4ExpModel>;
   /** Whether the validated checkpoint has a supported image tower. */
   supportsImages(): boolean;
@@ -5972,6 +5987,12 @@ export declare function scoreAgainstTeacher(
 
 /** Enable or disable profiling globally. */
 export declare function setProfilingEnabled(enabled: boolean): void;
+
+/**
+ * How long residency stays wired after the last command (Splash
+ * `--idle-release`): positive seconds, `Infinity` for the process's life.
+ */
+export declare function setResidencyKeepAlive(seconds: number): void;
 
 /** Configuration for the SFT training engine */
 export interface SftEngineConfig {
