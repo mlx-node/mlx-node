@@ -320,7 +320,7 @@ impl Gemma4Inner {
                     max_seq_len: Some(max_seq_len),
                     max_batch_size: Some(max_concurrent_sequences),
                 };
-                if pa_config.calculate_num_blocks() < desired_blocks {
+                if pa_config.calculate_num_blocks(cache_dtype) < desired_blocks {
                     return Err(napi::Error::from_reason(format!(
                         "Gemma4 KV group {} calculated fewer blocks than the required \
                          {desired_blocks}",

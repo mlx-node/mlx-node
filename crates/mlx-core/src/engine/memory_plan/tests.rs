@@ -1075,3 +1075,18 @@ fn held_back_counts_the_store_at_its_cap() {
         "{text}"
     );
 }
+
+/// The int8 pool block is the Splash page in 16-token blocks, and 5,051 MiB
+/// rounds to whole extents (`kvCapacityPagesFor`). Mutation M7: the int8
+/// scale term of `profile::bytes_per_block` is 0.
+#[test]
+fn int8_block_bytes_match_the_memory_plan() {
+    use mlx_paged_attn::metal::MetalDtype;
+    let block = mlx_paged_attn::profile::bytes_per_block(16, 4, 256, 16, MetalDtype::Int8).unwrap();
+    assert_eq!(block, int8_layout().page_bytes() * 16 / KV_PAGE_TOKENS);
+    assert_eq!(block, 532_480);
+    let page = mlx_paged_attn::profile::bytes_per_block(16, 4, 256, 32, MetalDtype::Int8).unwrap();
+    assert_eq!(page, int8_layout().page_bytes());
+    let (_, pages) = int8_layout().capacity_of(5_051 * MIB);
+    assert_eq!(pages, 4_864);
+}

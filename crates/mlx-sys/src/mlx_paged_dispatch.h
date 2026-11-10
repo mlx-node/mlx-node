@@ -49,7 +49,8 @@
 namespace mlx::core::fast::paged {
 
 /// On-cache element type. Matches the Rust `MetalDtype` enum used in
-/// kernel names: Fp16 → "half", Bf16 → "bfloat16_t", Fp8 → "uchar".
+/// kernel names: Fp16 → "half", Bf16 → "bfloat16_t", Fp8 → "uchar",
+/// Int8 → "char".
 /// (The C++ `KvDtype` enum in `mlx_paged_ops.h` is the public-facing
 /// version; this internal enum is equivalent but lives in its own
 /// namespace so we don't crowd the public header.)
@@ -57,6 +58,7 @@ enum class KvDtype : uint8_t {
   Fp16 = 0,
   Bf16 = 1,
   Fp8 = 2,
+  Int8 = 3,
 };
 
 /// Per-dispatch compute-route hint. This changes only which kernel reads the
@@ -87,9 +89,14 @@ enum class PagedAttentionRouteHint : uint8_t {
 /// the encoder so MLX correctly tracks the in-place mutation when
 /// scheduling subsequent commands.
 ///
-/// `k_scale` / `v_scale` are FP32 scalar arrays of size 1, only
-/// consumed by the kernel for FP8 caches (kernel ignores them
-/// otherwise) — but they participate in the compile graph either way.
+/// `k_scale` / `v_scale` are the primitive's scale outputs (sharing the
+/// scale inputs' buffers). FP8 reads them as `[1]` fp32 scalars; Int8
+/// writes one fp32 scale per stored row into `[num_blocks, num_kv_heads,
+/// block_size]` (Splash `splash_q8_scale_index`); Fp16/Bf16 ignore them.
+///
+/// Int8 runs `reshape_and_cache_int8_kv_bfloat16_t_hd{128,256}`: one
+/// threadgroup of `head_size` threads per K or V row, `2 * num_tokens *
+/// num_kv_heads` threadgroups (Splash `PagedAttention::addPrefillStore`).
 void dispatch_reshape_and_cache(
     mlx::core::metal::CommandEncoder& encoder,
     mlx::core::metal::Device& device,
@@ -98,8 +105,8 @@ void dispatch_reshape_and_cache(
     mlx::core::array& k_pool,
     mlx::core::array& v_pool,
     const mlx::core::array& slot_mapping,
-    const mlx::core::array& k_scale,
-    const mlx::core::array& v_scale,
+    mlx::core::array& k_scale,
+    mlx::core::array& v_scale,
     int num_tokens,
     int num_kv_heads,
     int head_size,

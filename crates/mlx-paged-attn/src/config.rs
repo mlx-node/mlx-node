@@ -1,5 +1,8 @@
 //! Configuration types for PagedAttention
 
+use crate::metal::MetalDtype;
+use crate::profile::bytes_per_block;
+
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 /// The smallest `gpu_memory_mb` that [`PagedAttentionConfig::validate`] accepts.
 pub const MIN_GPU_MEMORY_MB: u32 = 256;
@@ -86,7 +89,8 @@ impl PagedAttentionConfig {
         Ok(())
     }
 
-    /// MiB needed to cache one sequence of `max_seq_len` tokens (bf16 K+V).
+    /// MiB needed to cache one sequence of `max_seq_len` tokens in a
+    /// `cache_dtype` pool ([`crate::profile::bytes_per_block`]).
     ///
     /// `num_layers` is the physical full-attention layer count, not the
     /// model's total mixer count. Zero inputs return the 256 MiB floor.
@@ -96,23 +100,17 @@ impl PagedAttentionConfig {
         head_size: u32,
         num_kv_heads: u32,
         num_layers: u32,
+        cache_dtype: MetalDtype,
     ) -> u32 {
-        if max_seq_len == 0
-            || block_size == 0
-            || head_size == 0
-            || num_kv_heads == 0
-            || num_layers == 0
-        {
+        let Ok(bytes_per_block) =
+            bytes_per_block(num_layers, num_kv_heads, head_size, block_size, cache_dtype)
+        else {
+            return MIN_GPU_MEMORY_MB;
+        };
+        if max_seq_len == 0 {
             return MIN_GPU_MEMORY_MB;
         }
-
         let max_blocks = u64::from(max_seq_len.div_ceil(block_size));
-        let bytes_per_block = 2u64
-            .saturating_mul(u64::from(num_kv_heads))
-            .saturating_mul(u64::from(head_size))
-            .saturating_mul(u64::from(block_size))
-            .saturating_mul(2)
-            .saturating_mul(u64::from(num_layers));
         let required_mb = bytes_per_block
             .saturating_mul(max_blocks)
             .div_ceil(BYTES_PER_MIB)
@@ -120,28 +118,27 @@ impl PagedAttentionConfig {
         u32::try_from(required_mb).unwrap_or(u32::MAX)
     }
 
-    /// Calculate the number of blocks that can be allocated
-    pub fn calculate_num_blocks(&self) -> u32 {
-        let use_fp8 = self.use_fp8_cache.unwrap_or(false);
-        let element_size = if use_fp8 { 1 } else { 2 }; // FP8 = 1 byte, FP16 = 2 bytes
-
-        // Memory per block per layer: 2 * num_kv_heads * head_size * block_size * element_size
-        // (factor of 2 for K and V)
-        let bytes_per_block_per_layer = 2
-            * self.num_kv_heads as u64
-            * self.head_size as u64
-            * self.block_size as u64
-            * element_size as u64;
-
-        let bytes_per_block = bytes_per_block_per_layer * self.num_layers as u64;
-        let total_bytes = self.gpu_memory_mb as u64 * 1024 * 1024;
-
-        (total_bytes / bytes_per_block) as u32
+    /// Whole blocks of a `cache_dtype` pool in `gpu_memory_mb`
+    /// ([`crate::profile::bytes_per_block`], the bytes Splash
+    /// `kv::Layout::bytesPerModelPage` divides a budget by). 0 when a shape
+    /// factor is 0.
+    pub fn calculate_num_blocks(&self, cache_dtype: MetalDtype) -> u32 {
+        let Ok(bytes_per_block) = bytes_per_block(
+            self.num_layers,
+            self.num_kv_heads,
+            self.head_size,
+            self.block_size,
+            cache_dtype,
+        ) else {
+            return 0;
+        };
+        let total_bytes = u64::from(self.gpu_memory_mb) * BYTES_PER_MIB;
+        u32::try_from(total_bytes / bytes_per_block).unwrap_or(u32::MAX)
     }
 
-    /// Calculate maximum tokens that can be cached
-    pub fn max_cached_tokens(&self) -> u64 {
-        self.calculate_num_blocks() as u64 * self.block_size as u64
+    /// Tokens a `cache_dtype` pool of [`Self::calculate_num_blocks`] holds.
+    pub fn max_cached_tokens(&self, cache_dtype: MetalDtype) -> u64 {
+        u64::from(self.calculate_num_blocks(cache_dtype)) * u64::from(self.block_size)
     }
 
     /// Get the use_fp8_cache setting with default
@@ -210,7 +207,7 @@ mod tests {
             ..Default::default()
         };
 
-        let num_blocks = config.calculate_num_blocks();
+        let num_blocks = config.calculate_num_blocks(MetalDtype::BFloat16);
         // 1 GB / (2 * 4 * 128 * 32 * 2 * 28) = 1024*1024*1024 / (2 * 4 * 128 * 32 * 2 * 28)
         // = 1073741824 / 1835008 ≈ 585
         assert!(
@@ -237,8 +234,8 @@ mod tests {
             ..config_fp16.clone()
         };
 
-        let blocks_fp16 = config_fp16.calculate_num_blocks();
-        let blocks_fp8 = config_fp8.calculate_num_blocks();
+        let blocks_fp16 = config_fp16.calculate_num_blocks(MetalDtype::Float16);
+        let blocks_fp8 = config_fp8.calculate_num_blocks(MetalDtype::UChar);
 
         // FP8 should give ~2x the blocks (calculation still works, just validation rejects)
         assert!(blocks_fp8 >= blocks_fp16 * 2 - 1 && blocks_fp8 <= blocks_fp16 * 2 + 1);
@@ -276,7 +273,14 @@ mod tests {
     #[test]
     fn one_full_sequence_mb_for_nemotron_lightning() {
         // 1_048_576 tokens, block 16, head 128, 2 kv, 6 attn layers, bf16 K+V
-        let mb = PagedAttentionConfig::memory_mb_for_one_full_sequence(1_048_576, 16, 128, 2, 6);
+        let mb = PagedAttentionConfig::memory_mb_for_one_full_sequence(
+            1_048_576,
+            16,
+            128,
+            2,
+            6,
+            MetalDtype::BFloat16,
+        );
         assert_eq!(mb, 6144);
         let cfg = PagedAttentionConfig {
             block_size: 16,
@@ -288,12 +292,54 @@ mod tests {
             max_seq_len: Some(1_048_576),
             max_batch_size: Some(32),
         };
-        assert_eq!(cfg.max_cached_tokens(), 1_048_576);
+        assert_eq!(cfg.max_cached_tokens(MetalDtype::BFloat16), 1_048_576);
     }
 
     #[test]
     fn one_full_sequence_mb_matches_qwen35_35b_a3b() {
-        let mb = PagedAttentionConfig::memory_mb_for_one_full_sequence(262_144, 16, 256, 2, 10);
+        let mb = PagedAttentionConfig::memory_mb_for_one_full_sequence(
+            262_144,
+            16,
+            256,
+            2,
+            10,
+            MetalDtype::BFloat16,
+        );
         assert_eq!(mb, 5_120);
+    }
+
+    /// Int8 sizing is `2·L·H·bs·(D+4)` per block in both directions (Splash
+    /// `kv::Layout::bytesPerModelPage`). 27B: L 16, H 4, D 256, bs 16.
+    /// Mutation M8: `calculate_num_blocks` sizes at bf16 whatever the dtype.
+    #[test]
+    fn int8_sizing_is_one_formula() {
+        let config = PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb: 5_051,
+            head_size: 256,
+            num_kv_heads: 4,
+            num_layers: 16,
+            use_fp8_cache: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(config.calculate_num_blocks(MetalDtype::Int8), 9_946);
+        assert_eq!(config.calculate_num_blocks(MetalDtype::BFloat16), 5_051);
+        assert_eq!(config.max_cached_tokens(MetalDtype::Int8), 9_946 * 16);
+
+        let mb = PagedAttentionConfig::memory_mb_for_one_full_sequence(
+            262_144,
+            16,
+            256,
+            4,
+            16,
+            MetalDtype::Int8,
+        );
+        assert_eq!(mb, 8_320);
+        let full = PagedAttentionConfig {
+            gpu_memory_mb: mb,
+            ..config
+        };
+        assert_eq!(full.calculate_num_blocks(MetalDtype::Int8), 16_384);
+        assert_eq!(full.max_cached_tokens(MetalDtype::Int8), 262_144);
     }
 }

@@ -19,6 +19,8 @@ pub mod mlp;
 mod mlp_test;
 pub mod paged_attention_inputs;
 pub(crate) mod paged_flags;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod paged_int8_tests;
 pub mod paged_kv_cache_adapter;
 #[cfg(target_os = "macos")]
 pub(crate) mod paged_metadata_cache;

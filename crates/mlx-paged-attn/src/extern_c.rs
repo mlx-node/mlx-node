@@ -53,6 +53,7 @@ pub enum KvDtypeC {
     Fp16 = 0,
     Bf16 = 1,
     Fp8 = 2,
+    Int8 = 3,
 }
 
 impl KvDtypeC {
@@ -61,6 +62,7 @@ impl KvDtypeC {
             KvDtypeC::Fp16 => MetalDtype::Float16,
             KvDtypeC::Bf16 => MetalDtype::BFloat16,
             KvDtypeC::Fp8 => MetalDtype::UChar,
+            KvDtypeC::Int8 => MetalDtype::Int8,
         }
     }
 
@@ -74,7 +76,7 @@ impl KvDtypeC {
     fn expected_x(self) -> i32 {
         match self {
             KvDtypeC::Fp16 | KvDtypeC::Bf16 => 8,
-            KvDtypeC::Fp8 => 16,
+            KvDtypeC::Fp8 | KvDtypeC::Int8 => 16,
         }
     }
 }
@@ -84,6 +86,7 @@ fn parse_kv_dtype(raw: u8) -> Option<KvDtypeC> {
         0 => Some(KvDtypeC::Fp16),
         1 => Some(KvDtypeC::Bf16),
         2 => Some(KvDtypeC::Fp8),
+        3 => Some(KvDtypeC::Int8),
         _ => None,
     }
 }
@@ -158,6 +161,10 @@ pub unsafe extern "C" fn mlx_paged_attn_reshape_and_cache_dispatch(
         );
         return -1;
     };
+    if kv_dtype == KvDtypeC::Int8 {
+        eprintln!("mlx_paged_attn_reshape_and_cache_dispatch: int8 caches have no Rust kernel");
+        return -1;
+    }
 
     if x_pack != kv_dtype.expected_x() {
         eprintln!(
@@ -322,6 +329,10 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_dispatch(
         );
         return -1;
     };
+    if kv_dtype == KvDtypeC::Int8 {
+        eprintln!("mlx_paged_attn_paged_attention_dispatch: int8 caches have no Rust kernel");
+        return -1;
+    }
     if num_seqs == 0 || num_q_heads == 0 || head_size == 0 {
         eprintln!("mlx_paged_attn_paged_attention_dispatch: zero-sized dispatch");
         return -1;
@@ -535,6 +546,12 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_varlen_dispatch(
         );
         return -1;
     };
+    if kv_dtype == KvDtypeC::Int8 {
+        eprintln!(
+            "mlx_paged_attn_paged_attention_varlen_dispatch: int8 caches have no Rust kernel"
+        );
+        return -1;
+    }
     if num_seqs == 0 || total_queries == 0 || num_q_heads == 0 || head_size == 0 {
         eprintln!("mlx_paged_attn_paged_attention_varlen_dispatch: zero-sized dispatch");
         return -1;
@@ -659,7 +676,8 @@ mod tests {
         assert!(matches!(parse_kv_dtype(0), Some(KvDtypeC::Fp16)));
         assert!(matches!(parse_kv_dtype(1), Some(KvDtypeC::Bf16)));
         assert!(matches!(parse_kv_dtype(2), Some(KvDtypeC::Fp8)));
-        assert!(parse_kv_dtype(3).is_none());
+        assert!(matches!(parse_kv_dtype(3), Some(KvDtypeC::Int8)));
+        assert!(parse_kv_dtype(4).is_none());
     }
 
     #[test]
@@ -667,6 +685,9 @@ mod tests {
         assert_eq!(KvDtypeC::Fp16.expected_x(), 8);
         assert_eq!(KvDtypeC::Bf16.expected_x(), 8);
         assert_eq!(KvDtypeC::Fp8.expected_x(), 16);
+        assert_eq!(KvDtypeC::Int8.expected_x(), 16);
+        assert!(!KvDtypeC::Int8.is_fp8());
+        assert_eq!(KvDtypeC::Int8.to_metal(), MetalDtype::Int8);
     }
 
     #[test]

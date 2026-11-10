@@ -173,6 +173,8 @@ const char* dtype_string(KvDtype d) {
       return "bfloat16_t";
     case KvDtype::Fp8:
       return "uchar";
+    case KvDtype::Int8:
+      return "char";
   }
   // Unreachable — quiet warning.
   return "half";
@@ -181,7 +183,8 @@ const char* dtype_string(KvDtype d) {
 // Map io dtype paired with cache dtype: io == cache for non-FP8,
 // io = bfloat16 for FP8.
 KvDtype io_dtype_for(KvDtype cache) {
-  return cache == KvDtype::Fp8 ? KvDtype::Bf16 : cache;
+  return cache == KvDtype::Fp8 || cache == KvDtype::Int8 ? KvDtype::Bf16
+                                                         : cache;
 }
 
 mlx::core::Dtype mlx_dtype_for(KvDtype d) {
@@ -195,6 +198,8 @@ mlx::core::Dtype mlx_dtype_for(KvDtype d) {
       // MLX. The kernel reinterprets via `to_cache<KV_T, uchar>`. For
       // io we never see Fp8 (io is bf16).
       return mlx::core::uint8;
+    case KvDtype::Int8:
+      return mlx::core::int8;
   }
   return mlx::core::bfloat16;
 }
@@ -205,6 +210,7 @@ size_t dtype_byte_size(KvDtype d) {
     case KvDtype::Bf16:
       return 2;
     case KvDtype::Fp8:
+    case KvDtype::Int8:
       return 1;
   }
   return 2;
@@ -266,6 +272,17 @@ const std::string& reshape_and_cache_kernel_name(
     if (use_fp8) {
       os << "_fp8";
     }
+    return os.str();
+  });
+}
+
+const std::string& reshape_and_cache_int8_kernel_name(int head_size) {
+  static std::mutex mutex;
+  static std::map<int, std::string> cache;
+  return memoized_kernel_name(cache, mutex, head_size, [&] {
+    std::ostringstream os;
+    os << "reshape_and_cache_int8_kv_" << dtype_string(KvDtype::Bf16) << "_hd"
+       << head_size;
     return os.str();
   });
 }
@@ -1009,8 +1026,8 @@ void dispatch_reshape_and_cache(
     mlx::core::array& k_pool,
     mlx::core::array& v_pool,
     const mlx::core::array& slot_mapping,
-    const mlx::core::array& k_scale,
-    const mlx::core::array& v_scale,
+    mlx::core::array& k_scale,
+    mlx::core::array& v_scale,
     int num_tokens,
     int num_kv_heads,
     int head_size,
@@ -1023,12 +1040,37 @@ void dispatch_reshape_and_cache(
     return;
   }
 
+  if (kv_dtype == KvDtype::Int8) {
+    MTL::ComputePipelineState* pipeline =
+        load_pipeline(device, reshape_and_cache_int8_kernel_name(head_size));
+    encoder.set_compute_pipeline_state(pipeline);
+    const int32_t row_stride = num_kv_heads * head_size;
+    encoder.set_input_array(new_k, 0);
+    encoder.set_input_array(new_v, 1);
+    encoder.set_output_array(k_pool, 2);
+    encoder.set_output_array(v_pool, 3);
+    encoder.set_input_array(slot_mapping, 4);
+    encoder.set_output_array(k_scale, 5);
+    encoder.set_output_array(v_scale, 6);
+    encoder.set_bytes(row_stride, 7);
+    encoder.set_bytes(row_stride, 8);
+    encoder.set_bytes<int32_t>(num_kv_heads, 9);
+    encoder.set_bytes<int32_t>(block_size, 10);
+    encoder.set_bytes<int32_t>(num_tokens, 11);
+    MTL::Size group = MTL::Size::Make(static_cast<size_t>(head_size), 1, 1);
+    MTL::Size grid = MTL::Size::Make(
+        2 * static_cast<size_t>(num_tokens) * static_cast<size_t>(num_kv_heads),
+        1,
+        1);
+    encoder.dispatch_threadgroups(grid, group);
+    return;
+  }
+
   // io dtype == cache dtype for non-FP8, BF16 for FP8. The Rust
   // dispatcher derives this; we mirror so the kernel name matches what
   // the metallib instantiated.
   const KvDtype cache_dtype = kv_dtype;
-  const KvDtype input_dtype =
-      cache_dtype == KvDtype::Fp8 ? KvDtype::Bf16 : cache_dtype;
+  const KvDtype input_dtype = io_dtype_for(cache_dtype);
   const bool use_fp8 = cache_dtype == KvDtype::Fp8;
 
   const std::string& kernel_name =

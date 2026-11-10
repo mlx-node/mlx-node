@@ -280,7 +280,8 @@ fn configured_paged_pool_plan(config: &NemotronHConfig) -> Result<Option<Configu
         max_seq_len: Some(config.max_position_embeddings as u32),
         max_batch_size: Some(32),
     };
-    let num_blocks = pa_config.calculate_num_blocks();
+    let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+    let num_blocks = pa_config.calculate_num_blocks(cache_dtype);
     if num_blocks == 0 {
         return Err(Error::from_reason(format!(
             "NemotronH block-paged adapter: gpu_memory_mb={gpu_memory_mb} too small \
@@ -288,7 +289,6 @@ fn configured_paged_pool_plan(config: &NemotronHConfig) -> Result<Option<Configu
             config.head_dim, config.num_key_value_heads
         )));
     }
-    let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
     let pool_bytes = mlx_paged_attn::profile::bytes_per_block(
         attn_layer_count,
         config.num_key_value_heads as u32,
@@ -742,6 +742,7 @@ impl NemotronHInner {
         let head_size = self.config.head_dim as u32;
         let num_kv_heads = self.config.num_key_value_heads as u32;
         let max_seq_len = self.config.max_position_embeddings.max(0) as u32;
+        let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
         let requested_memory_mb =
             mlx_paged_attn::PagedAttentionConfig::memory_mb_for_one_full_sequence(
                 max_seq_len,
@@ -749,6 +750,7 @@ impl NemotronHInner {
                 head_size,
                 num_kv_heads,
                 attn_layer_count,
+                cache_dtype,
             );
         let pa_config = mlx_paged_attn::PagedAttentionConfig {
             block_size,
@@ -760,14 +762,13 @@ impl NemotronHInner {
             max_seq_len: Some(max_seq_len),
             max_batch_size: Some(32),
         };
-        let requested_blocks = pa_config.calculate_num_blocks();
+        let requested_blocks = pa_config.calculate_num_blocks(cache_dtype);
         if requested_blocks == 0 {
             return Err(Error::from_reason(format!(
                 "NemotronH block-paged adapter: requested paged cache {requested_memory_mb} MiB \
                  cannot hold one block"
             )));
         }
-        let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
         // Hold the process-wide pool-growth lock across sizing → CAS
         // reservation → pool allocation. The CAS retry loop only protects
         // against registrations racing between its read and its commit;

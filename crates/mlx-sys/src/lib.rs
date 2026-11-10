@@ -1212,8 +1212,9 @@ unsafe extern "C-unwind" {
     ) -> *mut mlx_array;
 
     /// Emit the MLX C++ `paged_kv_write(...)` Custom primitive and return the
-    /// lazy K/V pool output arrays through `out_k_pool` / `out_v_pool`.
-    /// Returns false for bridge/factory validation errors.
+    /// lazy outputs aliasing `k_pool`, `v_pool`, `k_scale`, `v_scale` (an
+    /// Int8 write stores its scales in place). Every out pointer must be
+    /// non-null. Returns false for bridge/factory validation errors.
     #[allow(clippy::too_many_arguments)]
     pub fn mlx_paged_kv_write_forward(
         k_pool: *mut mlx_array,
@@ -1229,6 +1230,8 @@ unsafe extern "C-unwind" {
         kv_dtype: u8,
         out_k_pool: *mut *mut mlx_array,
         out_v_pool: *mut *mut mlx_array,
+        out_k_scale: *mut *mut mlx_array,
+        out_v_scale: *mut *mut mlx_array,
     ) -> bool;
 
     /// Compare two `PagedKVWrite` primitives via `is_equivalent`.

@@ -1155,7 +1155,8 @@ impl Qwen3Inner {
                 max_batch_size: Some(scheduler_max_num_seqs_for(32) as u32),
             };
 
-            let num_blocks = pa_config.calculate_num_blocks();
+            let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+            let num_blocks = pa_config.calculate_num_blocks(cache_dtype);
             if num_blocks == 0 {
                 return Err(napi::Error::from_reason(format!(
                     "Block-paged adapter: gpu_memory_mb={gpu_memory_mb} too small to hold any \
@@ -1172,7 +1173,6 @@ impl Qwen3Inner {
             )));
 
             // BFloat16 = Qwen3 production dtype.
-            let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
             let pool =
                 mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, num_blocks, cache_dtype)
                     .map_err(|e| {

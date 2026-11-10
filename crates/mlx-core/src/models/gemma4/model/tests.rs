@@ -2741,15 +2741,16 @@ fn test_default_paged_cache_memory_covers_gemma4_full_context() {
         max_seq_len: Some(131_072),
         max_batch_size: Some(32),
     };
-    assert_eq!(cfg.calculate_num_blocks(), 8192);
-    assert_eq!(cfg.max_cached_tokens(), 131_072);
+    let bf16 = mlx_paged_attn::metal::MetalDtype::BFloat16;
+    assert_eq!(cfg.calculate_num_blocks(bf16), 8192);
+    assert_eq!(cfg.max_cached_tokens(bf16), 131_072);
 
     let undersized_cfg = mlx_paged_attn::PagedAttentionConfig {
         gpu_memory_mb: 2048,
         ..cfg
     };
     assert!(
-        undersized_cfg.max_cached_tokens() < 124_920,
+        undersized_cfg.max_cached_tokens(bf16) < 124_920,
         "the previous fixed 2048MiB default cannot hold the failed 124,920-token prompt"
     );
 }
