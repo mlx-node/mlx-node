@@ -407,6 +407,13 @@ impl PoolPlan {
         (u64::from(self.max_blocks) * self.bytes_per_block / MIB).min(u64::from(u32::MAX)) as u32
     }
 
+    /// The pool config's `gpu_memory_mb`: `validate` refuses one under
+    /// [`mlx_paged_attn::MIN_GPU_MEMORY_MB`] though the pool allocates by
+    /// blocks, so a planned pool below it must still construct.
+    pub(crate) fn config_mib(&self) -> u32 {
+        self.max_mib().max(mlx_paged_attn::MIN_GPU_MEMORY_MB)
+    }
+
     /// The longest pool window, at most the lane's, of a lane that also
     /// holds `extra(W)` bytes of the pool for a `W`-token turn.
     pub(crate) fn window_with(&self, extra: &dyn Fn(u32) -> u64) -> u32 {

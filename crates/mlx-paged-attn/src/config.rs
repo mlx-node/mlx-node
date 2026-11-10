@@ -1,7 +1,8 @@
 //! Configuration types for PagedAttention
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
-const MIN_FULL_SEQUENCE_MEMORY_MB: u32 = 256;
+/// The smallest `gpu_memory_mb` that [`PagedAttentionConfig::validate`] accepts.
+pub const MIN_GPU_MEMORY_MB: u32 = 256;
 
 /// Configuration for PagedAttention
 #[derive(Debug, Clone)]
@@ -58,9 +59,9 @@ impl PagedAttentionConfig {
         }
 
         // Validate memory
-        if self.gpu_memory_mb < 256 {
+        if self.gpu_memory_mb < MIN_GPU_MEMORY_MB {
             return Err(format!(
-                "gpu_memory_mb too small: {}. Minimum is 256 MB.",
+                "gpu_memory_mb too small: {}. Minimum is {MIN_GPU_MEMORY_MB} MB.",
                 self.gpu_memory_mb
             ));
         }
@@ -102,7 +103,7 @@ impl PagedAttentionConfig {
             || num_kv_heads == 0
             || num_layers == 0
         {
-            return MIN_FULL_SEQUENCE_MEMORY_MB;
+            return MIN_GPU_MEMORY_MB;
         }
 
         let max_blocks = u64::from(max_seq_len.div_ceil(block_size));
@@ -115,7 +116,7 @@ impl PagedAttentionConfig {
         let required_mb = bytes_per_block
             .saturating_mul(max_blocks)
             .div_ceil(BYTES_PER_MIB)
-            .max(u64::from(MIN_FULL_SEQUENCE_MEMORY_MB));
+            .max(u64::from(MIN_GPU_MEMORY_MB));
         u32::try_from(required_mb).unwrap_or(u32::MAX)
     }
 

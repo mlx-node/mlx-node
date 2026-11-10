@@ -301,11 +301,21 @@ const GIB: u64 = 1 << 30;
 /// A tiny planned load on `cfg` against a 16 GiB working set, `None` with
 /// no Metal device.
 fn planned_load(cfg: Qwen3_5Config, draft: bool) -> Option<Result<Qwen35Inner>> {
+    planned_load_within(cfg, draft, None)
+}
+
+/// [`planned_load`] under a `--max-memory` of `max_memory` bytes.
+fn planned_load_within(
+    cfg: Qwen3_5Config,
+    draft: bool,
+    max_memory: Option<u64>,
+) -> Option<Result<Qwen35Inner>> {
     if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
         return None;
     }
     let _live = LiveMemory::set(16 * GIB, 0);
     let mut inner = Qwen35Inner::new(cfg).expect("construct tiny model");
+    inner.max_memory_bytes = max_memory;
     if draft {
         inner.dflash2 = Some(
             crate::models::qwen3_5::dflash2::tiny_dflash2_model_for_stepper_test(&inner.config)
@@ -385,6 +395,34 @@ fn explicit_pool_size_above_the_plan_fails_load() {
             .max_num_blocks(),
         256 * 1024 * 1024 / 8192
     );
+}
+
+/// Gate: a planned pool under the 256 MiB config floor loads, from the
+/// plan (a 1,200 MiB `--max-memory`) and from an explicit 128 MiB above the lane
+/// minimum (Splash refuses only `KvPoolDoesNotFit`). Mutation: build the
+/// pool config from `max_mib()` in `initialize_paged_adapter` → red
+/// ("gpu_memory_mb too small").
+#[test]
+fn pool_below_the_config_floor_loads() {
+    for (explicit_mib, max_memory) in [(None, Some(1_200 << 20)), (Some(128), None)] {
+        let mut cfg = tiny_paged_forward_cfg();
+        cfg.paged_cache_memory_mb = explicit_mib;
+        let Some(load) = planned_load_within(cfg, false, max_memory) else {
+            return;
+        };
+        let inner = load.unwrap_or_else(|err| panic!("{explicit_mib:?}: {}", err.reason));
+        let pool = inner
+            .memory_plan
+            .as_ref()
+            .and_then(|plan| plan.pool)
+            .expect("pool plan");
+        assert!(pool.max_mib() < 256, "{explicit_mib:?}: {}", pool.max_mib());
+        let adapter = inner.paged_adapter.as_ref().expect("paged adapter");
+        assert_eq!(adapter.layer_kv_pool().max_num_blocks(), pool.max_blocks);
+        if let Some(mib) = explicit_mib {
+            assert_eq!(pool.max_blocks, mib * 1024 * 1024 / 8192);
+        }
+    }
 }
 
 /// Gate: a load whose resident memory left the plan fails at its end

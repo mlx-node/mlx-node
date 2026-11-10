@@ -198,7 +198,7 @@ impl Qwen35MoeInner {
         let (num_blocks, max_num_blocks) = (pool_plan.runway_blocks, pool_plan.max_blocks);
         let pa_config = mlx_paged_attn::PagedAttentionConfig {
             block_size,
-            gpu_memory_mb: pool_plan.max_mib(),
+            gpu_memory_mb: pool_plan.config_mib(),
             head_size,
             num_kv_heads,
             num_layers: attn_layer_count,

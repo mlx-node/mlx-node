@@ -283,6 +283,38 @@ fn pool_lane_peak_fits_dynamic() {
     }
 }
 
+/// A planned pool under the config floor still validates (Splash has no
+/// pool floor): the 27B pool at the lane minimum is 231 MiB and carries
+/// 256; the M3 Pro pool carries its own 3,186. Mutation: `config_mib`
+/// returns `max_mib()` → red (231 vs 256).
+#[test]
+fn pool_below_the_config_floor_validates() {
+    let minimum = qwen38_plan(
+        footprint(M3_PRO_WORKING_SET, active_for_dynamic(699_203_584), None),
+        None,
+        false,
+    )
+    .expect("at the lane minimum");
+    let cfg = qwen38_27b_cfg();
+    for (plan, max_mib, config_mib) in [(minimum, 231, 256), (m3_pro_plan(), 3_186, 3_186)] {
+        let pool = plan.pool.expect("pool");
+        assert_eq!(pool.max_mib(), max_mib);
+        assert_eq!(pool.config_mib(), config_mib);
+        mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb: pool.config_mib(),
+            head_size: cfg.head_dim as u32,
+            num_kv_heads: cfg.num_kv_heads as u32,
+            num_layers: cfg.full_attention_layer_count() as u32,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(cfg.max_position_embeddings as u32),
+            max_batch_size: Some(32),
+        }
+        .validate()
+        .expect("the planned pool's config validates");
+    }
+}
+
 /// The verify cycle at the window, with no allocator free pool beside it,
 /// is the DFlash2 lane's transient at 61,433. Mutation: add
 /// `decode_cache_limit` of the cycle in `dflash2_lane_transient` → red
