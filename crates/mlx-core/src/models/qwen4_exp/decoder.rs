@@ -191,6 +191,9 @@ impl DecoderState {
 }
 pub struct Decoder {
     pub prefill_chunk_size: usize,
+    /// The tokens one sequence may hold: the memory plan's window once the
+    /// load planned it, the trained window before.
+    pub context_window: usize,
     /// A test that sizes admission through the prefill window keeps its
     /// window across the turn opens that re-derive it from the plan.
     #[cfg(test)]
@@ -254,7 +257,8 @@ impl Decoder {
 
     /// The prefill window follows the residency plan in force.
     pub fn refresh_prefill_window(&mut self) {
-        let window = super::memory::prefill_window(&self.config, &self.weights.plan);
+        let window =
+            super::memory::prefill_window(&self.config, &self.weights.plan, self.context_window);
         #[cfg(test)]
         let window = self.prefill_window_pin.unwrap_or(window);
         self.prefill_chunk_size = window;
@@ -290,9 +294,12 @@ impl Decoder {
 
     pub fn new(config: Config, weights: Store) -> Result<Self> {
         // Validate the checkpoint topology before the first tensor payload read.
-        let prefill_chunk_size = super::memory::prefill_window(&config, &weights.plan);
+        let context_window = config.max_position_embeddings;
+        let prefill_chunk_size =
+            super::memory::prefill_window(&config, &weights.plan, context_window);
         let d = Self {
             prefill_chunk_size,
+            context_window,
             #[cfg(test)]
             prefill_window_pin: None,
             caches: (0..config.num_hidden_layers)
@@ -2339,7 +2346,11 @@ impl Decoder {
             return false;
         };
         let need = 22_400 * suffix as u64
-            + super::memory::prefill_scratch(&self.config, super::MAX_PREFILL_CHUNK)
+            + super::memory::prefill_scratch(
+                &self.config,
+                super::MAX_PREFILL_CHUNK,
+                self.context_window,
+            )
             + super::memory::DIRECT_TURN_FLOOR;
         need <= host.available()
     }
@@ -2568,7 +2579,7 @@ impl Decoder {
         if windows
             .iter()
             .any(|w| w.is_empty() || w.len() > super::MAX_PREFILL_CHUNK)
-            || base + total > self.config.effective_context_limit()
+            || base + total > self.context_window
             || windows
                 .iter()
                 .flat_map(|w| w.iter())
@@ -2842,9 +2853,7 @@ impl Decoder {
         self.check_cancelled()?;
         let submit_span = self.decode_submit_span();
         let defer_final = self.deferred_forward_completion();
-        if token as usize >= self.config.vocab_size
-            || self.history.len() >= self.config.effective_context_limit()
-        {
+        if token as usize >= self.config.vocab_size || self.history.len() >= self.context_window {
             return Err(Error::from_reason(
                 "qwen4_exp token/context outside configured limits",
             ));

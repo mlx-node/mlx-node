@@ -17,7 +17,7 @@ All language wrappers share a uniform `ChatSession<M>` surface (`send` / `sendSt
 | **Qwen3**                  |     yes      |     yes     | GRPO + SFT | Speculative decoding; paged attention                                            |
 | **Qwen3.5 Dense**          |     yes      |     yes     | GRPO + SFT | Hybrid GDN/attention; native MTP; Qwen3.8 DFlash2; VLM variant                   |
 | **Qwen3.5 MoE**            |     yes      |     yes     | GRPO + SFT | Compiled C++ forward with expert routing; VLM variant                            |
-| **Qwen3.8-Flash-Next**     |      —       |     yes     |     —      | Bounded SSD loading; native MTP, images, paged QSA and shared scheduling         |
+| **Qwen3.8-Flash-Next**     |      —       |     yes     |     —      | Memory-planned SSD loading and window; native MTP, images, paged QSA, scheduling |
 | **Gemma4**                 |     yes      |     yes     |     —      | Hybrid sliding/global attention + MoE/PLE; DSpark + assistant-MTP spec. decoding |
 | **Muse-Glimmer**           |     yes      |     yes     |     —      | Text decoder; Q4_K import; DFlash; hybrid paged AR                               |
 | **LFM2.5**                 |     yes      |     yes     |     —      | Hybrid conv + attention                                                          |
@@ -392,7 +392,9 @@ the cycle): MLX collects that pool only at 95% of the working set. The load
 log prints the plan and which bound wins (`memory` or `model`). A
 `paged_cache_memory_mb` above the plan's pool fails the load with the MiB the
 plan allows, and so does an unreadable Metal working set on a paged load.
-These families do not read `MLX_PAGED_PER_SEQ_CTX`.
+These families do not read `MLX_PAGED_PER_SEQ_CTX`. A qwen4_exp (Flash Next)
+load plans its expert store and its windows from the same budget; see
+[Qwen3.8-Flash-Next](qwen38-flash-next.md#memory-and-ssd-residency).
 
 ## Server-side sessions
 

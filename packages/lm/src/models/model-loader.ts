@@ -20,6 +20,7 @@ import {
   Qwen35MoeModel as NativeQwen35MoeModel,
   Qwen4ExpModel as NativeQwen4ExpModel,
   type Qwen35LoadOptions,
+  type Qwen4ExpLoadOptions,
 } from '@mlx-node/core';
 
 import { ChatSession, type SessionCapableModel } from '../chat-session.js';
@@ -77,10 +78,11 @@ export interface LoadModelOptions {
    */
   kvFormat?: 'int8' | 'bf16';
   /**
-   * Metal memory budget in bytes for `qwen3_5` and `qwen3_5_moe` targets
-   * (`--max-memory`). It can only lower the automatic budget the load's memory
-   * plan derives from the working set; the plan sizes the KV pool and the
-   * windows from it. Other model families reject it.
+   * Metal memory budget in bytes for `qwen3_5`, `qwen3_5_moe` and `qwen4_exp`
+   * targets (`--max-memory`). It can only lower the automatic budget the
+   * load's memory plan derives from the working set; the plan sizes the KV
+   * pool and the windows from it (and for `qwen4_exp` the expert store). Other
+   * model families reject it.
    */
   maxMemoryBytes?: number;
 }
@@ -93,6 +95,14 @@ function qwen35LoadOptions(options: LoadModelOptions | undefined): Qwen35LoadOpt
     draftModelPath: options.draftModelPath,
     kvFormat: options.kvFormat,
     maxMemoryBytes: options.maxMemoryBytes,
+  };
+}
+
+function qwen4ExpLoadOptions(options: LoadModelOptions | undefined): Qwen4ExpLoadOptions | null {
+  if (options?.auxiliaryModelPath === undefined && options?.maxMemoryBytes === undefined) return null;
+  return {
+    ...(options.auxiliaryModelPath !== undefined ? { auxiliaryModelPath: options.auxiliaryModelPath } : {}),
+    ...(options.maxMemoryBytes !== undefined ? { maxMemoryBytes: options.maxMemoryBytes } : {}),
   };
 }
 
@@ -157,10 +167,7 @@ const LOADER_BINDINGS = {
   },
   qwen4_exp: {
     load: (modelPath: string, options?: LoadModelOptions) =>
-      Qwen4ExpModel.load(
-        modelPath,
-        options?.auxiliaryModelPath === undefined ? null : { auxiliaryModelPath: options.auxiliaryModelPath },
-      ),
+      Qwen4ExpModel.load(modelPath, qwen4ExpLoadOptions(options)),
     nativeModelClass: NativeQwen4ExpModel,
   },
   deepseek_v41: {
@@ -244,7 +251,7 @@ function dispatchLoad(
   }
   if (options?.maxMemoryBytes !== undefined && requireFamilyData(modelType).acceptsMaxMemory !== true) {
     throw new Error(
-      `maxMemoryBytes (Metal memory budget) is only supported by qwen3_5 and qwen3_5_moe models; ` +
+      `maxMemoryBytes (Metal memory budget) is only supported by qwen3_5, qwen3_5_moe and qwen4_exp models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }

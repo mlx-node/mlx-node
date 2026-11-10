@@ -42,6 +42,7 @@ import type { Server } from 'node:http';
 
 import {
   estimateQwen35ContextWindow,
+  estimateQwen4ExpContextWindow,
   releaseNativeGgufLease,
   type Qwen35ContextEstimate,
   type Qwen35LoadOptions,
@@ -179,7 +180,7 @@ export interface InferenceHostOptions {
   kvFormat?: 'int8' | 'bf16';
   /**
    * Metal memory budget in bytes (`--max-memory`) for the families whose load
-   * plans its memory (qwen3_5 / qwen3_5_moe); it can only lower the automatic
+   * plans its memory (qwen3_5 / qwen3_5_moe / qwen4_exp); it can only lower the automatic
    * budget. Other families never see it. Omitted ⇒ the automatic budget.
    */
   maxMemoryBytes?: number;
@@ -415,7 +416,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   const estimates = startContextEstimates(
     models,
     modelsDir,
-    opts.estimateContextWindow ?? estimateQwen35ContextWindow,
+    opts.estimateContextWindow ?? nativeContextEstimate(),
     (entry) => pagedConfigOverrides.resolve(entry.path, entry.modelType),
     {
       ...(opts.kvFormat !== undefined ? { kvFormat: opts.kvFormat } : {}),
@@ -606,7 +607,27 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
 }
 
 /**
- * The window a load of each qwen3_5 / qwen3_5_moe entry would serve, priced
+ * The native load-free estimate of an entry's family: qwen4_exp has its own
+ * memory plan (a streamed expert store), so the qwen3_5 estimator never prices
+ * it. A qwen4_exp default turn is autoregressive (MTP is opt-in), so its
+ * estimate is the AR window. qwen4_exp takes only `maxMemoryBytes`.
+ */
+export function nativeContextEstimate(
+  qwen35: typeof estimateQwen35ContextWindow = estimateQwen35ContextWindow,
+  qwen4Exp: typeof estimateQwen4ExpContextWindow = estimateQwen4ExpContextWindow,
+): NonNullable<InferenceHostOptions['estimateContextWindow']> {
+  return async (path, modelType, options) => {
+    if (modelType !== 'qwen4_exp') return qwen35(path, modelType, options);
+    const estimate = await qwen4Exp(
+      path,
+      options?.maxMemoryBytes === undefined ? null : { maxMemoryBytes: options.maxMemoryBytes },
+    );
+    return estimate == null ? null : { windowTokens: estimate.windowTokens, bound: estimate.bound };
+  };
+}
+
+/**
+ * The window a load of each entry whose family takes `--max-memory` would serve, priced
  * from its memory plan before it loads (`/v1/models` shows it until the
  * load's own window replaces it). One estimate at a time, in the background:
  * a GGUF's first estimate prepares its asset directory. A failed estimate

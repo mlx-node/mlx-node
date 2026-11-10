@@ -180,7 +180,7 @@ impl Inner {
         let refs: Vec<_> = args.media.images.iter().map(Vec::as_slice).collect();
         let counts = processor.plan_merged_token_counts(&refs, 2)?;
         let tokens = inject_image_placeholders(args.tokens, &counts)?;
-        if tokens.len() > self.decoder.config.effective_context_limit() {
+        if tokens.len() > self.decoder.context_window {
             return Err(Error::from_reason(
                 "Qwen4 expanded image prompt exceeds context budget",
             ));

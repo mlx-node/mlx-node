@@ -264,40 +264,21 @@ impl Store {
         self.banks.get(name).cloned()
     }
 
-    /// Fixed projections with their dense compute copies: the hot set minus
-    /// routed experts, which the direct gate holds beside expert banks.
-    pub(super) fn fixed_projection_bytes(&self) -> Result<u64> {
-        self.tensors
-            .iter()
-            .filter(|(name, tensor)| is_fixed_projection(name, tensor))
-            .try_fold(0u64, |n, (name, t)| {
-                n.checked_add(t.bank_bytes(name)?)
-                    .ok_or_else(|| err("Fixed projection inventory overflow"))
-            })
-    }
-
     pub(in super::super) fn prepare_hot(&mut self) -> Result<()> {
         if self.plan.direct || self.slot_bank_budget.is_some() {
-            self.prepare_hot_with_policy(&mut super::super::memory::admit_direct, &mut |_| Ok(()))
+            self.prepare_hot_with_policy(&mut super::super::memory::admit_direct)
         } else {
-            self.prepare_hot_with_policy(
-                &mut super::super::memory::admit,
-                &mut super::super::memory::refresh_plan,
-            )
+            self.prepare_hot_with_policy(&mut super::super::memory::admit)
         }
     }
 
     #[cfg(test)]
     pub(in super::super) fn prepare_fixture_hot(&mut self) -> Result<()> {
-        self.prepare_hot_with_policy(&mut |_| Ok(()), &mut |_| Ok(()))
+        self.prepare_hot_with_policy(&mut |_| Ok(()))
     }
 
-    fn prepare_hot_with_policy(
-        &mut self,
-        admit: &mut impl FnMut(u64) -> Result<()>,
-        refresh: &mut impl FnMut(&mut super::super::memory::Plan) -> Result<()>,
-    ) -> Result<()> {
-        self.prepare_hot_with_admission(admit, refresh)?;
+    fn prepare_hot_with_policy(&mut self, admit: &mut impl FnMut(u64) -> Result<()>) -> Result<()> {
+        self.prepare_hot_with_admission(admit)?;
         if let (Some(experts), Some(top)) = (
             self.metadata
                 .get("qwen4exp.expert_count")
@@ -315,7 +296,6 @@ impl Store {
     fn prepare_hot_with_admission(
         &mut self,
         admit: &mut impl FnMut(u64) -> Result<()>,
-        refresh: &mut impl FnMut(&mut super::super::memory::Plan) -> Result<()>,
     ) -> Result<()> {
         if !self.banks.is_empty() {
             return Ok(());
@@ -324,18 +304,6 @@ impl Store {
             return Err(err(
                 "Qwen4 bank residency must be prepared before expert execution",
             ));
-        }
-        // Pool creation happens after metadata bootstrap and is invisible to
-        // MLX allocation counters. Reconcile against live headroom before IO.
-        // A direct plan already contains its allocated banks and uses the
-        // full-bank gate; the slot bootstrap rule would shrink it incorrectly.
-        if self.cache_bytes == 0
-            && self.plan.available_bytes.is_some()
-            && !self.plan.direct
-            && self.slot_bank_budget.is_none()
-        {
-            refresh(&mut self.plan)?;
-            self.cache_limit = self.plan.budget;
         }
         let names = self.projection_bank_names()?;
         if names.is_empty() {
@@ -372,10 +340,6 @@ impl Store {
             self.plan.partial_expert_slots = 0;
         }
         crate::array::memory::synchronize_and_clear_cache();
-        if self.slot_bank_budget.is_none() {
-            refresh(&mut self.plan)?;
-            self.cache_limit = self.plan.budget;
-        }
         if !self.plan.direct {
             self.slot_capacity = None;
         }
@@ -394,11 +358,11 @@ impl Store {
         let mut names = Vec::new();
         let mut bytes = 0u64;
         // Full direct experts are gated separately: fixed banks may take all
-        // but the LRU room memory::direct_desired reserved.
+        // but the row cache the store plan holds.
         let cap = if self.plan.direct {
             self.cache_limit
                 .saturating_sub(self.slot_bytes)
-                .saturating_sub(2 << 30)
+                .saturating_sub(self.store_plan.map_or(0, |store| store.row_cache_bytes))
         } else {
             self.cache_limit / 4
         };
@@ -1262,26 +1226,17 @@ mod tests {
         {
             store.plan.hot_bytes = store.hot_bytes().unwrap();
             let mut refused = false;
-            let mut refreshed = false;
-            let result = store.prepare_hot_with_admission(
-                &mut |bytes| {
-                    // Simulate headroom loss only after the bank set is
-                    // complete. No large allocation or OS settings change needed.
-                    if bytes == super::super::super::memory::WORKING_BYTES && !refused {
-                        refused = true;
-                        Err(err("simulated post-load headroom loss"))
-                    } else {
-                        Ok(())
-                    }
-                },
-                &mut |plan| {
-                    refreshed = true;
-                    plan.budget = 1 << 30;
+            let result = store.prepare_hot_with_admission(&mut |bytes| {
+                // Simulate headroom loss only after the bank set is
+                // complete. No large allocation or OS settings change needed.
+                if bytes == super::super::super::memory::WORKING_BYTES && !refused {
+                    refused = true;
+                    Err(err("simulated post-load headroom loss"))
+                } else {
                     Ok(())
-                },
-            );
+                }
+            });
             assert!(refused);
-            assert!(refreshed);
             result.unwrap();
         }
         assert!(!store.banks.is_empty());

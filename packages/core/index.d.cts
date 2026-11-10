@@ -3722,6 +3722,17 @@ export declare function estimateQwen35ContextWindow(
 ): Promise<Qwen35ContextEstimate | null>;
 
 /**
+ * The load-free estimate behind `/v1/models`: the plan a load of
+ * `model_path` with `options` would make, from the tensors' descriptors
+ * (no payload read, no pack sweep, no asset written). `None` when the Metal
+ * working set is unreadable.
+ */
+export declare function estimateQwen4ExpContextWindow(
+  modelPath: string,
+  options?: Qwen4ExpLoadOptions | undefined | null,
+): Promise<Qwen4ExpContextEstimate | null>;
+
+/**
  * Teacher-forced quality of one checkpoint against a cached reference.
  *
  * `mean_nll`, `perplexity` and `top1_agreement` are EXACT full-vocab numbers.
@@ -5658,16 +5669,54 @@ export interface Qwen3LmConfig {
   tieWordEmbeddings: boolean;
 }
 
+/**
+ * What a load of a Flash Next checkpoint would serve, priced before it
+ * loads.
+ */
+export interface Qwen4ExpContextEstimate {
+  /** Tokens an AR or image turn may hold. */
+  windowTokens: number;
+  /** Tokens an MTP turn may hold; set only with MTP weights. */
+  speculativeWindowTokens?: number;
+  /**
+   * `'memory'` when the plan binds the AR window, `'model'` when the
+   * trained window does.
+   */
+  bound: string;
+}
+
 export interface Qwen4ExpContextLimits {
   effectiveWindowTokens: number;
   pagedBlockCapacity: number;
   pagedBlockSize: number;
   trainedWindowTokens: number;
+  /**
+   * Tokens an MTP turn may hold: its draft state beside the pool. Set only
+   * with MTP weights.
+   */
+  speculativeWindowTokens?: number;
+  /**
+   * The output budget fills the window: a prompt leaves room for one new
+   * token and the budget is clamped to `window - prompt`.
+   */
+  restOfWindowOutputBudget: boolean;
+  /**
+   * An omitted budget on `effective_window_tokens` is the rest of that
+   * window.
+   */
+  omittedBudgetIsRestOfWindow: boolean;
+  /** The same for `speculative_window_tokens`. */
+  speculativeOmittedBudgetIsRestOfWindow: boolean;
 }
 
 export interface Qwen4ExpLoadOptions {
   /** Original matching HF checkpoint containing MTP/vision omitted by GGUF. */
   auxiliaryModelPath?: string;
+  /**
+   * The Metal memory budget (`--max-memory`) the memory plan sizes the
+   * stores, the pool and the windows within.
+   */
+  maxMemoryBytes?: number;
 }
 
 /**

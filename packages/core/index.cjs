@@ -924,6 +924,7 @@ module.exports.documentToXlsx = nativeBinding.documentToXlsx;
 module.exports.DType = nativeBinding.DType;
 module.exports.ElementType = nativeBinding.ElementType;
 module.exports.estimateQwen35ContextWindow = nativeBinding.estimateQwen35ContextWindow;
+module.exports.estimateQwen4ExpContextWindow = nativeBinding.estimateQwen4ExpContextWindow;
 module.exports.formatDocument = nativeBinding.formatDocument;
 module.exports.getMemorySnapshot = nativeBinding.getMemorySnapshot;
 module.exports.getProfilingData = nativeBinding.getProfilingData;

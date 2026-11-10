@@ -5,9 +5,7 @@ use super::*;
 impl Decoder {
     pub(in super::super) fn scheduled_start(&mut self, token: u32) -> Result<MxArray> {
         self.check_cancelled()?;
-        if token as usize >= self.config.vocab_size
-            || self.history.len() >= self.config.effective_context_limit()
-        {
+        if token as usize >= self.config.vocab_size || self.history.len() >= self.context_window {
             return Err(Error::from_reason(
                 "Qwen4 scheduled token exceeds vocabulary/context",
             ));

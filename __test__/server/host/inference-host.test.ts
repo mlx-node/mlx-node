@@ -18,6 +18,7 @@ import {
   LAUNCHER_ENGINE_POLICY,
   ModelNotFoundError,
   NoModelsDiscoveredError,
+  nativeContextEstimate,
   type InferenceHost,
   type InferenceHostOptions,
 } from '../../../packages/server/src/host/index.js';
@@ -684,9 +685,12 @@ describe('createInferenceHost — out-of-band loadModel', () => {
 
   // Mutation: drop the `acceptsMaxMemory` check in the host → red (gemma4
   // load gets maxMemoryBytes). Mutation: drop the pass-through → red.
-  it('maxMemoryBytes reaches the qwen loader only', async () => {
-    const modelsDir = await makeModelsDir(['qwen', 'gemma']);
+  // Mutation: drop `acceptsMaxMemory` from the qwen4_exp family → red (the
+  // Flash Next load gets no budget).
+  it('maxMemoryBytes reaches the qwen and Flash Next loaders only', async () => {
+    const modelsDir = await makeModelsDir(['qwen', 'gemma', 'flash']);
     await writeFile(join(modelsDir, 'gemma', 'config.json'), JSON.stringify({ model_type: 'gemma4' }));
+    await writeFile(join(modelsDir, 'flash', 'config.json'), JSON.stringify({ model_type: 'qwen4_exp' }));
     const calls: Array<{ path: string; options?: LoadModelOptions }> = [];
     const host = await start({
       modelsDir,
@@ -698,7 +702,44 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     });
     await host.loadModel('qwen');
     await host.loadModel('gemma');
-    expect(calls.map((call) => call.options)).toEqual([{ maxMemoryBytes: 30_064_771_072 }, undefined]);
+    await host.loadModel('flash');
+    expect(calls.map((call) => call.options)).toEqual([
+      { maxMemoryBytes: 30_064_771_072 },
+      undefined,
+      { maxMemoryBytes: 30_064_771_072 },
+    ]);
+  });
+
+  // Mutation: price qwen4_exp with the qwen3_5 estimator in
+  // `nativeContextEstimate` → red. Mutation: publish the MTP window → red
+  // (61,433; MTP is opt-in on qwen4_exp).
+  it('prices a Flash Next entry with its own estimator', async () => {
+    const asked: Array<{ family: string; path: string; options?: unknown }> = [];
+    const estimate = nativeContextEstimate(
+      async (path, modelType, options) => {
+        asked.push({ family: modelType, path, options });
+        return { windowTokens: 48_601, bound: 'memory' };
+      },
+      async (path, options) => {
+        asked.push({ family: 'flash-next', path, options });
+        return { windowTokens: 65_536, speculativeWindowTokens: 61_433, bound: 'memory' };
+      },
+    );
+    expect(
+      await estimate('/flash', 'qwen4_exp', {
+        kvFormat: 'int8',
+        maxMemoryBytes: 25_769_803_776,
+        draftModelPath: '/draft',
+      }),
+    ).toEqual({ windowTokens: 65_536, bound: 'memory' });
+    expect(await estimate('/qwen', 'qwen3_5', { maxMemoryBytes: 1_024 })).toEqual({
+      windowTokens: 48_601,
+      bound: 'memory',
+    });
+    expect(asked).toEqual([
+      { family: 'flash-next', path: '/flash', options: { maxMemoryBytes: 25_769_803_776 } },
+      { family: 'qwen3_5', path: '/qwen', options: { maxMemoryBytes: 1_024 } },
+    ]);
   });
 
   // Mutation: fall back to `entry.contextWindow` in `listModels` (ignore the

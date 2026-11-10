@@ -17,6 +17,14 @@ use std::time::{Duration, Instant};
 
 const DIRECT_READ_BYTES: usize = 8 << 20;
 const DIRECT_STAGING_SLOTS: usize = 4;
+/// The bank bytes of an expert `cap` that also holds the slots' staging: a
+/// slot of every layer stages one more layer's share, so
+/// `slots * (routed + largest) / experts <= cap`.
+fn slot_bank_budget_for(cap: u64, routed: u64, largest_layer: u64) -> u64 {
+    (u128::from(cap) * u128::from(routed) / u128::from(routed.saturating_add(largest_layer)).max(1))
+        as u64
+}
+
 pub(in super::super) const DIRECT_STAGING_BYTES: u64 =
     (DIRECT_READ_BYTES * DIRECT_STAGING_SLOTS) as u64;
 const SLOT_RECLAIM_FALLBACK: Duration = Duration::from_secs(30);
@@ -784,7 +792,11 @@ impl Store {
 
     /// Select full or partial direct GGUF residency. Unsupported sources keep
     /// the existing bounded per-row checkpoint importer.
-    pub(in super::super) fn select_residency(&mut self, pool_bytes: u64) -> Result<()> {
+    ///
+    /// `anonymous_need` is what the plan holds beside the experts (the fixed
+    /// weights, the draft banks, the row cache and the KV allowance); the
+    /// host gate of a whole bank set reads it.
+    pub(in super::super) fn select_residency(&mut self, anonymous_need: u64) -> Result<()> {
         let experts = self
             .metadata
             .get("qwen4exp.expert_count")
@@ -792,8 +804,8 @@ impl Store {
             .unwrap_or(0) as usize;
         let direct = self.select_direct_residency_with(
             experts,
-            pool_bytes,
-            &mut super::super::memory::direct_plan,
+            anonymous_need,
+            &mut super::super::memory::direct_gate,
             &mut super::super::memory::admit_direct,
         )?;
         if !direct {
@@ -803,13 +815,16 @@ impl Store {
         Ok(())
     }
 
-    /// Returns true when direct eligibility was decided, including a gate
-    /// refusal that must use partial slots. False keeps per-row imports.
+    /// The store plan decides: whole experts take direct banks at identity
+    /// capacity, a streamed store partial slots under its cap. A host that
+    /// refuses the whole set lowers the allocation to partial slots of what it
+    /// admits; the plan keeps counting the cap. Returns true when direct
+    /// eligibility was decided; false keeps per-row imports.
     pub(in super::super) fn select_direct_residency_with(
         &mut self,
         experts: usize,
-        pool_bytes: u64,
-        plan: &mut impl FnMut(&mut super::super::memory::Plan, u64, u64, u64) -> Result<()>,
+        anonymous_need: u64,
+        gate: &mut impl FnMut(&mut super::super::memory::Plan, u64, u64) -> Result<()>,
         admit: &mut impl FnMut(u64) -> Result<()>,
     ) -> Result<bool> {
         if !self.gguf
@@ -850,48 +865,60 @@ impl Store {
                 .checked_add(self.descriptor(&name)?.runtime_bytes()?)
                 .ok_or_else(|| err("Qwen4 direct expert bank size overflow"))?;
         }
-        let dense = self.fixed_projection_bytes()?;
+        let store = self
+            .store_plan
+            .ok_or_else(|| err("Qwen4 residency needs the store plan"))?;
         let draft_bank = self.mtp_bank_estimate()?;
+        let largest = self.largest_routed_layer_bytes()?;
+        let top = self
+            .metadata
+            .get("qwen4exp.expert_used_count")
+            .and_then(GgufMetaValue::as_u64)
+            .unwrap_or(0) as usize;
+        let cap_budget = slot_bank_budget_for(store.expert_cap_bytes, bank_bytes, largest);
+        let partial = |store: &mut Self, budget: u64| -> Result<()> {
+            store.plan.direct = false;
+            store.plan.partial_direct_gate = true;
+            store.plan.direct_bytes = 0;
+            store.plan.direct_layers = 0;
+            store.draft_bank_budget = 0;
+            store.slot_capacity = None;
+            store.slot_bank_budget = Some(budget);
+            store.plan.partial_expert_slots = store.expert_slot_capacity(experts, top)?;
+            Ok(())
+        };
+        if !store.whole {
+            let budget = cap_budget;
+            partial(self, budget)?;
+            self.live.store(&self.plan);
+            tracing::info!(
+                "qwen4 residency: streamed experts, {} slots within a {:.1} GiB bank budget of the memory plan",
+                self.plan.partial_expert_slots,
+                budget as f64 / (1u64 << 30) as f64,
+            );
+            return Ok(true);
+        }
         let original = self.plan.clone();
-        let original_cache_limit = self.cache_limit;
         let original_draft_budget = self.draft_bank_budget;
         let original_slot_capacity = self.slot_capacity;
         let original_slot_bank_budget = self.slot_bank_budget;
         let original_slot_bytes = self.slot_bytes;
         let original_cache_bytes = self.cache_bytes;
         let mut candidate = self.plan.clone();
-        if let Err(error) = plan(
-            &mut candidate,
-            dense.saturating_add(draft_bank),
-            pool_bytes,
-            bank_bytes,
-        ) {
-            let bank_budget = candidate.bank_budget;
+        if let Err(error) = gate(&mut candidate, anonymous_need, bank_bytes) {
+            let admitted = candidate.bank_budget;
             self.plan = candidate;
-            self.plan.direct = false;
-            self.plan.partial_direct_gate = true;
-            self.plan.direct_bytes = 0;
-            self.plan.direct_layers = 0;
-            self.plan.budget = self.plan.budget.saturating_add(bank_budget);
-            self.cache_limit = self.plan.budget;
-            self.draft_bank_budget = 0;
-            self.slot_capacity = None;
-            self.slot_bank_budget = Some(bank_budget);
-            let top = self
-                .metadata
-                .get("qwen4exp.expert_used_count")
-                .and_then(GgufMetaValue::as_u64)
-                .unwrap_or(0) as usize;
-            self.plan.partial_expert_slots = self.expert_slot_capacity(experts, top)?;
+            let budget = cap_budget.min(admitted);
+            partial(self, budget)?;
             self.live.set_fallback(Fallback::LoadGate {
                 bank_bytes,
-                budget: bank_budget,
+                budget: admitted,
             });
             self.live.store(&self.plan);
             tracing::warn!(
                 "qwen4 residency: partial direct slots, {error}; {} slots within a {:.1} GiB bank budget",
                 self.plan.partial_expert_slots,
-                bank_budget as f64 / (1u64 << 30) as f64,
+                budget as f64 / (1u64 << 30) as f64,
             );
             return Ok(true);
         }
@@ -900,12 +927,7 @@ impl Store {
         candidate.direct_bytes = bank_bytes;
         candidate.direct_layers = layers.len();
         candidate.partial_expert_slots = experts;
-        candidate.budget = candidate
-            .budget
-            .checked_add(bank_bytes)
-            .ok_or_else(|| err("Qwen4 direct residency budget overflow"))?;
         self.plan = candidate;
-        self.cache_limit = self.plan.budget;
         self.draft_bank_budget = draft_bank;
         self.slot_capacity = Some(experts);
         self.slot_bank_budget = None;
@@ -925,7 +947,6 @@ impl Store {
             self.slot_bytes = original_slot_bytes;
             self.cache_bytes = original_cache_bytes;
             self.plan = original;
-            self.cache_limit = original_cache_limit;
             self.draft_bank_budget = original_draft_budget;
             self.slot_capacity = original_slot_capacity;
             self.slot_bank_budget = original_slot_bank_budget;
@@ -944,6 +965,123 @@ impl Store {
             self.plan.live_non_reclaimable as f64 / (1u64 << 30) as f64,
             self.cache_limit as f64 / (1u64 << 30) as f64,
         );
+        Ok(true)
+    }
+
+    /// The load's inventory from the descriptors, before any payload read.
+    pub(in super::super) fn load_inventory(
+        &self,
+        c: &super::super::config::Config,
+        vision: bool,
+    ) -> Result<super::super::load_plan::LoadInventory> {
+        let routed = self.slot_routed_bytes()?;
+        let largest = self.largest_routed_layer_bytes()?;
+        let experts = c.num_experts.max(1) as u128;
+        let minimum = (c.num_experts_per_tok as u128 * u128::from(routed.saturating_add(largest))
+            / experts)
+            .min(u128::from(routed)) as u64;
+        let store_fixed_bytes = self
+            .hot_bytes()?
+            .saturating_sub(routed)
+            .saturating_add(self.mtp_bank_estimate()?);
+        let vision_bytes = if vision {
+            self.tensors
+                .iter()
+                .filter(|(name, _)| name.starts_with("visual."))
+                .try_fold(0u64, |n, (_, t)| {
+                    Ok::<_, Error>(n.saturating_add((t.rows()? as u64) * (t.width()? as u64) * 2))
+                })?
+        } else {
+            0
+        };
+        Ok(super::super::load_plan::LoadInventory {
+            store_fixed_bytes,
+            vision_bytes,
+            experts: crate::engine::memory_plan::StreamedPart {
+                all: routed,
+                minimum,
+            },
+            rows: super::super::load_plan::row_cache_share(c, MAX_READ_BYTES * 6),
+        })
+    }
+
+    /// Size the store from the memory plan, never from the host (Splash: the
+    /// store starts at what the plan gives it and the host only gates its
+    /// allocations): the weight budget holds the fixed weights with the draft
+    /// banks, the expert cap and the row cache.
+    pub(in super::super) fn set_store_plan(
+        &mut self,
+        store: crate::engine::memory_plan::StorePlan,
+        store_fixed_bytes: u64,
+    ) {
+        self.store_plan = Some(store);
+        self.cache_limit = store_fixed_bytes
+            .saturating_add(store.expert_cap_bytes)
+            .saturating_add(store.row_cache_bytes);
+        self.plan.budget = self.cache_limit;
+        self.slot_capacity = None;
+    }
+
+    /// A fixture's store plan: every expert whole beside a 2 GiB row cache.
+    #[cfg(test)]
+    pub(in super::super) fn plan_fixture_store(&mut self) -> Result<()> {
+        let routed = self.slot_routed_bytes()?;
+        let fixed = self
+            .hot_bytes()?
+            .saturating_sub(routed)
+            .saturating_add(self.mtp_bank_estimate()?);
+        self.set_store_plan(
+            crate::engine::memory_plan::StorePlan {
+                whole: true,
+                expert_cap_bytes: routed,
+                row_cache_bytes: 2 << 30,
+            },
+            fixed,
+        );
+        Ok(())
+    }
+
+    /// The store's planned bytes above what is live (Splash
+    /// `hostHeldBackBytes`): the engine plan counts the store at its cap.
+    pub(in super::super) fn held_back_bytes(&self) -> u64 {
+        self.cache_limit.saturating_sub(self.cache_bytes)
+    }
+
+    /// Give `bytes` of a streamed store's cap back before any slot exists;
+    /// false when the experts are whole or a slot was allocated.
+    pub(in super::super) fn lower_store_cap(&mut self, bytes: u64) -> Result<bool> {
+        let Some(mut store) = self.store_plan else {
+            return Ok(false);
+        };
+        if self.plan.direct || !self.slots.is_empty() || store.expert_cap_bytes < bytes {
+            return Ok(false);
+        }
+        store.expert_cap_bytes -= bytes;
+        self.store_plan = Some(store);
+        self.cache_limit = self.cache_limit.saturating_sub(bytes);
+        self.plan.budget = self.cache_limit;
+        if let Some(budget) = self.slot_bank_budget {
+            let routed = self.slot_routed_bytes()?;
+            let largest = self.largest_routed_layer_bytes()?;
+            self.slot_bank_budget = Some(budget.min(slot_bank_budget_for(
+                store.expert_cap_bytes,
+                routed,
+                largest,
+            )));
+            self.slot_capacity = None;
+            if let (Some(experts), Some(top)) = (
+                self.metadata
+                    .get("qwen4exp.expert_count")
+                    .and_then(GgufMetaValue::as_u64),
+                self.metadata
+                    .get("qwen4exp.expert_used_count")
+                    .and_then(GgufMetaValue::as_u64),
+            ) {
+                self.plan.partial_expert_slots =
+                    self.expert_slot_capacity(experts as usize, top as usize)?;
+            }
+        }
+        self.live.store(&self.plan);
         Ok(true)
     }
 
@@ -1287,22 +1425,8 @@ impl Store {
         if let Some(n) = self.slot_capacity {
             return Ok(n);
         }
-        let mut layer_bytes = HashMap::<&str, u64>::new();
         let routed = self.slot_routed_bytes()?;
-        for (name, tensor) in &self.tensors {
-            if name.contains("_exps.weight")
-                && !super::residency::is_auxiliary(name)
-                && !self.banks.contains_key(name)
-            {
-                let layer = match name.split_once(".ffn_") {
-                    Some((layer, _)) => layer,
-                    None => name.as_str(),
-                };
-                let bytes = layer_bytes.entry(layer).or_default();
-                *bytes = bytes.saturating_add(tensor.runtime_bytes()?);
-            }
-        }
-        let largest_layer = layer_bytes.values().copied().max().unwrap_or(0);
+        let largest_layer = self.largest_routed_layer_bytes()?;
         let fixed = self.plan.hot_bytes.saturating_sub(routed);
         // Auxiliary checkpoints are attached before this bootstrap decision.
         // Reserve their actual inventory up to the existing auxiliary ceiling;
@@ -1356,6 +1480,25 @@ impl Store {
         let capacity = if capacity < top { 0 } else { capacity };
         self.slot_capacity = Some(capacity);
         Ok(capacity)
+    }
+
+    /// Routed main-network expert bytes of the largest layer the slots serve.
+    fn largest_routed_layer_bytes(&self) -> Result<u64> {
+        let mut layer_bytes = HashMap::<&str, u64>::new();
+        for (name, tensor) in &self.tensors {
+            if name.contains("_exps.weight")
+                && !super::residency::is_auxiliary(name)
+                && !self.banks.contains_key(name)
+            {
+                let layer = match name.split_once(".ffn_") {
+                    Some((layer, _)) => layer,
+                    None => name.as_str(),
+                };
+                let bytes = layer_bytes.entry(layer).or_default();
+                *bytes = bytes.saturating_add(tensor.runtime_bytes()?);
+            }
+        }
+        Ok(layer_bytes.values().copied().max().unwrap_or(0))
     }
 
     /// Routed main-network expert bytes the slots serve.
@@ -2422,8 +2565,9 @@ mod tests {
         );
     }
 
-    /// The gate, not the old bootstrap budget, bounds partial banks on the
-    /// released 48-layer geometry. No bank payload is allocated by this check.
+    /// The store plan's cap, less the slots' staging, bounds partial banks on
+    /// the released 48-layer geometry beside the fixed and draft banks and the
+    /// row share. No bank payload is allocated by this check.
     #[test]
     fn gate_sized_partial_capacity_tracks_the_full_bank_shortfall() {
         let Some((mut store, layers)) = draft_bank_store(None) else {
@@ -2431,22 +2575,31 @@ mod tests {
         };
         let routed: u64 = layers.iter().sum();
         assert_eq!(routed, 78_538_342_400);
-        let anonymous = super::super::super::memory::direct_desired(
-            FIXED_BANK_BYTES.saturating_add(3_040_870_400),
-        );
-        for (bank_budget, expected) in [(routed - 1, 511), (72 << 30, 503), (40 << 30, 279)] {
-            store.cache_limit = anonymous.saturating_add(bank_budget);
+        let largest = store.largest_routed_layer_bytes().unwrap();
+        let rows = super::super::super::load_plan::row_cache_share(
+            &super::super::super::memory::flash_next_config(),
+            MAX_READ_BYTES * 6,
+        )
+        .all;
+        let anonymous = FIXED_BANK_BYTES + 3_040_870_400 + rows;
+        let mut capacities = Vec::new();
+        for cap in [routed - 1, 72 << 30, 40 << 30] {
+            let bank_budget = slot_bank_budget_for(cap, routed, largest);
+            store.cache_limit = anonymous.saturating_add(cap);
             store.plan.budget = store.cache_limit;
             store.slot_bank_budget = Some(bank_budget);
             store.slot_capacity = None;
             store.mtp_banks_declined = false;
-            let capacity = store.expert_slot_capacity(512, 10).unwrap();
-            assert_eq!(capacity, expected, "bank budget {bank_budget}");
+            capacities.push(store.expert_slot_capacity(512, 10).unwrap());
             let planned = store.planned_slot_bytes().unwrap();
-            assert!(planned <= bank_budget);
-            assert!(planned > bank_budget.saturating_sub(routed / 512));
-            assert_eq!(store.plan.budget, anonymous + bank_budget);
+            assert!(planned <= bank_budget, "cap {cap}");
+            assert!(
+                planned > bank_budget.saturating_sub(routed / 512),
+                "cap {cap}"
+            );
+            assert_eq!(store.plan.budget, anonymous + cap);
         }
+        assert_eq!(capacities, [498, 490, 272]);
         assert_eq!(store.bytes_read, 0);
         assert_eq!(store.slot_bytes, 0);
     }
@@ -2474,10 +2627,15 @@ mod tests {
         assert_eq!(host.available(), 84 << 30);
         assert_eq!(host.non_reclaimable(), 44 << 30);
         let pool = 1365u64 * 786_432;
-        let anonymous = memory::direct_desired(FIXED_BANK_BYTES);
-        assert_eq!(anonymous, 7 << 30);
+        let rows = super::super::super::load_plan::row_cache_share(
+            &memory::flash_next_config(),
+            MAX_READ_BYTES * 6,
+        )
+        .all;
+        let anonymous = FIXED_BANK_BYTES + rows;
+        assert_eq!(anonymous, 6_989_991_424);
         let gate = memory::bank_gate(&host, anonymous + pool, memory::DIRECT_MARGIN);
-        assert_eq!(gate.bank_budget, 77_309_673_472);
+        assert_eq!(gate.bank_budget, 77_835_874_816);
         assert!(gate.bank_budget < routed);
         let budget = anonymous + gate.bank_budget;
         assert_eq!(budget, 84_825_866_240);
@@ -2501,13 +2659,13 @@ mod tests {
         assert!(store.plan.use_direct_turn_floor());
 
         let c = memory::flash_next_config();
-        let scratch = memory::prefill_scratch(&c, 1024);
+        let scratch = memory::prefill_scratch(&c, 1024, 32_768);
         assert_eq!(scratch, 1_988_100_096);
-        assert_eq!(memory::prefill_window(&c, &store.plan), 1024);
+        assert_eq!(memory::prefill_window(&c, &store.plan, 32_768), 1024);
         let mut ordinary = store.plan.clone();
         ordinary.partial_direct_gate = false;
         assert!(!ordinary.use_direct_turn_floor());
-        assert_eq!(memory::prefill_window(&c, &ordinary), 1);
+        assert_eq!(memory::prefill_window(&c, &ordinary, 32_768), 1);
 
         let post_available = host.available() - FIXED_BANK_BYTES - planned;
         assert_eq!(post_available, 7_944_761_856);
