@@ -383,7 +383,12 @@ less 15% and 1 GiB (or `maxMemoryBytes` in the load options when lower), and
 each lane's window is what that budget holds after the fixed memory, one
 request's recurrent state and the lane's peak transient, in whole KV extents,
 capped by the trained context. `effectiveWindowTokens` is the pool lane's and
-`speculativeWindowTokens` the DFlash2 lane's (int8 rows by default). The load
+`speculativeWindowTokens` the DFlash2 lane's (int8 rows by default). A load
+with neither pool nor draft (`use_block_paged_cache: false`, a sym8
+checkpoint, no compiled backend) is planned on its flat lane, so
+`maxMemoryBytes` bounds it and can refuse it like a paged load. The DFlash2
+transient counts the verify cycle and the free pool MLX keeps of it (twice
+the cycle): MLX collects that pool only at 95% of the working set. The load
 log prints the plan and which bound wins (`memory` or `model`). A
 `paged_cache_memory_mb` above the plan's pool fails the load with the MiB the
 plan allows, and so does an unreadable Metal working set on a paged load.

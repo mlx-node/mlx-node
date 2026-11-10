@@ -269,15 +269,18 @@ pub(crate) fn dflash2_decode_cache_limit(
     )
 }
 
-/// Bytes one verify cycle allocates and frees at `context_rows` attended
-/// keys. The allocator's free pool is not charged: MLX keeps it only below
-/// its own collection limit and frees it before allocating past it.
+/// Bytes the decode phase holds besides KV at `context_rows` attended keys:
+/// one verify cycle and the free pool [`dflash2_decode_cache_limit`] lets
+/// it keep. MLX collects that pool only at min(0.95·WS, its memory limit)
+/// and no load lowers that limit to the plan, so the pool is resident
+/// memory the hard budget must charge (Splash charges every live buffer).
 pub(crate) fn dflash2_cycle_transient_bytes(
     config: &super::config::Qwen3_5Config,
     block_size: usize,
     context_rows: u64,
 ) -> u64 {
-    dflash2_cycle_transient(config, block_size, context_rows).total()
+    let cycle = dflash2_cycle_transient(config, block_size, context_rows).total();
+    cycle.saturating_add(crate::cache_limit::decode_cache_limit(cycle))
 }
 
 /// Bytes a DFlash2 turn allocates and frees besides its KV at its peak,
@@ -294,8 +297,22 @@ pub(crate) fn dflash2_turn_transient_bytes(
     kv_format: KvFormat,
     tap_layers: usize,
 ) -> u64 {
+    prefill_transient_bytes(config, prompt_len as u64, kv_format, tap_layers).max(
+        dflash2_cycle_transient_bytes(config, block_size, context_rows),
+    )
+}
+
+/// One prefill chunk of a flat turn over `prompt` rows: one layer's
+/// attention and MLP scratch, `tap_layers` tapped hidden rows of the chunk
+/// and, for int8 rows, one full-attention layer's prefix dequantized beside
+/// its concatenation with the chunk.
+fn prefill_transient_bytes(
+    config: &super::config::Qwen3_5Config,
+    prompt: u64,
+    kv_format: KvFormat,
+    tap_layers: usize,
+) -> u64 {
     let dim = |v: i32| v.max(0) as u64;
-    let prompt = prompt_len as u64;
     let chunk = prompt.min(PREFILL_STEP_SIZE as u64);
     let taps = chunk
         .saturating_mul(tap_layers as u64)
@@ -310,14 +327,9 @@ pub(crate) fn dflash2_turn_transient_bytes(
             .saturating_mul(2 * 2),
         KvFormat::Bf16 => 0,
     };
-    let prefill = prefill_chunk_scratch_bytes(config, prompt)
+    prefill_chunk_scratch_bytes(config, prompt)
         .saturating_add(taps)
-        .saturating_add(dequantized_prefix);
-    prefill.max(dflash2_cycle_transient_bytes(
-        config,
-        block_size,
-        context_rows,
-    ))
+        .saturating_add(dequantized_prefix)
 }
 
 /// Which fused SDPA kernels a paged prefill chunk can take, as
@@ -389,6 +401,19 @@ pub(crate) fn pool_lane_transient(
     );
     let prefill = prefill_chunk_scratch_bytes(config, window).saturating_add(gathered.min(varlen));
     prefill.max(dflash2_cycle_transient(config, 0, window).total())
+}
+
+/// Bytes a flat autoregressive turn of `window` tokens allocates besides KV
+/// at its peak: its last prefill chunk, or one decode step. No DFlash2
+/// decode cache limit is pushed on this lane.
+pub(crate) fn flat_lane_transient(
+    config: &super::config::Qwen3_5Config,
+    kv_format: KvFormat,
+    window: u32,
+) -> u64 {
+    let window = u64::from(window);
+    prefill_transient_bytes(config, window, kv_format, 0)
+        .max(dflash2_cycle_transient(config, 0, window).total())
 }
 
 /// Bytes a DFlash2 turn of `window` tokens allocates besides KV at its peak:

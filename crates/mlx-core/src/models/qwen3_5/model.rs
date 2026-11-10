@@ -447,8 +447,9 @@ pub struct Qwen3_5ContextLimits {
     /// token and the budget is clamped to `window - prompt`.
     pub rest_of_window_output_budget: bool,
     /// An omitted budget on `effective_window_tokens` is the rest of that
-    /// window. Set only when a paged pool sizes the window from memory; a
-    /// flat load's window is the trained length, so it keeps the native
+    /// window. Set when the plan prices that window: the paged pool, or the
+    /// flat lane of a load with neither pool nor draft. A flat load with a
+    /// draft publishes the trained length there and keeps the native
     /// default.
     pub omitted_budget_is_rest_of_window: bool,
     /// The same for `speculative_window_tokens`: set when that window has a
@@ -464,8 +465,8 @@ pub struct Qwen3_5ContextLimits {
 
 impl Qwen3_5ContextLimits {
     /// `speculative` is the DFlash2 window, whether a memory term bounds it
-    /// and the K/V format it was priced at; `memory_window` whether a paged
-    /// pool sizes the effective window; `kv_format` the effective lane's.
+    /// and the K/V format it was priced at; `memory_window` whether the plan
+    /// sizes the effective window; `kv_format` the effective lane's.
     pub(crate) fn from_parts(
         value: (u32, u32, u32, u32),
         speculative: Option<(u32, bool, crate::transformer::KvFormat)>,

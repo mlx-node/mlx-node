@@ -177,10 +177,13 @@ fn dflash2_clamp_window_is_the_speculative_window() {
 
 /// An omitted budget is the rest of a window whenever the plan prices it:
 /// the pool window of a paged load, the DFlash2 window whenever the plan
-/// has its lane, whatever bounds it. A flat load's pool window is the
-/// trained length.
+/// has its lane, whatever bounds it, and the flat lane's window of a load
+/// with neither pool nor draft. A flat load with a draft keeps the trained
+/// length.
 /// Mutation: set both omitted flags `true` in `from_parts` → red.
 /// Mutation: read the speculative flag from `memory_window` → red.
+/// Mutation: `pool_context_limit` ignores the plan's flat lane → red
+/// (the trained window, not 900).
 #[test]
 fn flat_load_publishes_no_rest_of_window() {
     let Some(mut inner) =
@@ -213,6 +216,15 @@ fn flat_load_publishes_no_rest_of_window() {
     inner.memory_plan = None;
     let limits = inner.context_limits_snapshot();
     assert!(!limits.speculative_omitted_budget_is_rest_of_window);
+
+    inner.dflash2 = None;
+    inner.memory_plan = Some(crate::engine::memory_plan::MemoryPlan::with_flat_window(
+        900,
+    ));
+    let limits = inner.context_limits_snapshot();
+    assert_eq!(limits.effective_window_tokens, 900);
+    assert!(limits.omitted_budget_is_rest_of_window);
+    assert_eq!(limits.speculative_window_tokens, None);
 }
 
 /// Gate: the load snapshot publishes the pool window as the effective

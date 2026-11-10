@@ -438,6 +438,8 @@ pub(crate) struct MemoryPlan {
     pub dynamic_budget_bytes: u64,
     pub pool: Option<PoolPlan>,
     pub speculative: Option<LanePlan>,
+    /// The flat autoregressive lane of a load with neither pool nor draft.
+    pub flat: Option<LanePlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -661,12 +663,14 @@ fn plan_lane(dynamic: u64, shape: &LaneShape<'_>, kv: LaneKv) -> (LanePlan, u64)
 
 impl MemoryPlan {
     /// Splash `evaluateEngineMemoryPlan` over the lanes this load serves:
-    /// the paged pool lane and, with a draft, the speculative flat lane,
-    /// which cannot use the pool's allocated runway.
+    /// the paged pool lane, with a draft the speculative flat lane, which
+    /// cannot use the pool's allocated runway, and the flat autoregressive
+    /// lane of a load with neither.
     pub(crate) fn evaluate(
         footprint: MemoryFootprint,
         pool: Option<PoolInput<'_>>,
         speculative: Option<FlatInput<'_>>,
+        flat: Option<FlatInput<'_>>,
     ) -> Result<Self, PlanError> {
         let working_set = footprint.working_set_bytes;
         let margin_bytes = working_set_margin_bytes(working_set);
@@ -705,7 +709,7 @@ impl MemoryPlan {
         let held_bytes = pool_plan.map_or(0, |pool| {
             u64::from(pool.runway_blocks).saturating_mul(pool.bytes_per_block)
         });
-        let speculative_plan = speculative.as_ref().map(|input| {
+        let flat_lane = |input: &FlatInput<'_>| {
             plan_lane(
                 dynamic,
                 &input.shape,
@@ -715,12 +719,15 @@ impl MemoryPlan {
                 },
             )
             .0
-        });
+        };
+        let speculative_plan = speculative.as_ref().map(flat_lane);
+        let flat_plan = flat.as_ref().map(flat_lane);
 
         let lanes = pool_plan
             .iter()
             .map(|pool| pool.lane)
-            .chain(speculative_plan);
+            .chain(speculative_plan)
+            .chain(flat_plan);
         let minimum = lanes.clone().map(|lane| lane.minimum_bytes).max();
         if let Some(minimum) = minimum
             && (dynamic < minimum || lanes.clone().any(|lane| lane.extent_pages == 0))
@@ -745,6 +752,7 @@ impl MemoryPlan {
             dynamic_budget_bytes: dynamic,
             pool: pool_plan,
             speculative: speculative_plan,
+            flat: flat_plan,
         })
     }
 
@@ -821,6 +829,7 @@ impl MemoryPlan {
             dynamic_budget_bytes: 0,
             pool: None,
             speculative: None,
+            flat: None,
         }
     }
 
@@ -850,6 +859,16 @@ impl MemoryPlan {
         Self {
             hard_budget_bytes: u64::MAX,
             speculative: Some(Self::bare_lane(resident, 0, extent_pages)),
+            ..Self::bare()
+        }
+    }
+
+    /// A plan whose flat lane holds `resident` tokens and nothing else.
+    #[cfg(test)]
+    pub(crate) fn with_flat_window(resident: u32) -> Self {
+        Self {
+            hard_budget_bytes: u64::MAX,
+            flat: Some(Self::bare_lane(resident, 0, 1)),
             ..Self::bare()
         }
     }
@@ -1006,6 +1025,9 @@ impl MemoryPlan {
         }
         if let Some(speculative) = &self.speculative {
             lane(&mut out, "speculative lane", speculative);
+        }
+        if let Some(flat) = &self.flat {
+            lane(&mut out, "flat lane", flat);
         }
         out
     }

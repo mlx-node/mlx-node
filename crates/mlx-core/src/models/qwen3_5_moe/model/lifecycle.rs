@@ -135,8 +135,8 @@ impl Qwen35MoeInner {
     /// Plan this load's memory once its weights are materialized (Splash
     /// `RuntimeResources::create`), then build the paged pool: it starts at
     /// the runway and grows by extents toward the plan's ceiling. A load
-    /// without a pool plans its DFlash2 lane alone. Runs inside the
-    /// process-wide pool-growth lock.
+    /// without a pool plans its DFlash2 lane, or its flat lane without a
+    /// draft. Runs inside the process-wide pool-growth lock.
     pub(crate) fn initialize_paged_adapter(&mut self) -> Result<()> {
         if self.paged_adapter.is_some() {
             return Ok(());
@@ -658,17 +658,19 @@ impl Qwen35MoeInner {
         }
     }
 
-    /// Tokens one paged, vision or MTP turn may hold: the plan's pool lane.
-    /// Without a plan (a pool installed by a test), the pool's blocks after
-    /// one recurrent cell; without a pool, the trained window.
+    /// Tokens one paged, vision, MTP or flat autoregressive turn may hold:
+    /// the plan's pool lane, or its flat lane on a load with neither pool
+    /// nor draft. Without a plan (a pool installed by a test), the pool's
+    /// blocks after one recurrent cell; without a pool, the trained window.
     pub(crate) fn pool_context_limit(&self) -> u32 {
         let trained = self.config.max_position_embeddings.max(0) as u32;
-        if let Some(pool) = self
-            .memory_plan
-            .as_ref()
-            .and_then(|plan| plan.pool.as_ref())
-        {
-            return pool.lane.window.maximum();
+        if let Some(plan) = self.memory_plan.as_ref() {
+            if let Some(pool) = plan.pool.as_ref() {
+                return pool.lane.window.maximum();
+            }
+            if let Some(flat) = plan.flat.as_ref() {
+                return flat.window.maximum();
+            }
         }
         self.paged_adapter.as_ref().map_or(trained, |adapter| {
             crate::engine::hybrid_scheduler::pool_tokens_after_recurrent(
@@ -728,7 +730,11 @@ impl Qwen35MoeInner {
             self.paged_context_limits(),
             self.speculative_window()
                 .map(|window| (window, memory_bound, speculative_format)),
-            self.paged_adapter.is_some(),
+            self.paged_adapter.is_some()
+                || self
+                    .memory_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.flat.is_some()),
             kv_format,
         )
     }

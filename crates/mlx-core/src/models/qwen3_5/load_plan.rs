@@ -20,7 +20,9 @@ use crate::utils::gguf::NativeGgufFamily;
 
 use super::config::Qwen3_5Config;
 use super::dflash2::DFlash2Config;
-use super::dflash2_decode::{PrefillSdpaKernels, dflash2_lane_transient, pool_lane_transient};
+use super::dflash2_decode::{
+    PrefillSdpaKernels, dflash2_lane_transient, flat_lane_transient, pool_lane_transient,
+};
 use super::dflash2_turn::{DFlash2Target, dflash2_target_kv_dtype, dflash2_target_kv_format};
 
 /// Tokens of the pool every load starts with (Splash `warmupKvPages`).
@@ -78,12 +80,15 @@ pub(crate) struct LoadLanes<'a> {
     pub recurrent_state_bytes: u64,
     pub pool: Option<PoolGeometry>,
     pub draft: Option<DraftTerms>,
-    /// Format and dtype of the DFlash2 lane's flat K/V.
+    /// Format and dtype of the flat K/V (the DFlash2 lane's, or the flat
+    /// lane's without a pool and a draft).
     pub format: KvFormat,
     pub dtype: DType,
 }
 
 /// Splash `evaluateEngineMemoryPlan` over `lanes` on the device `live`.
+/// Every load prices a lane: one with neither pool nor draft serves its
+/// turns from flat K/V, priced as the flat lane.
 pub(crate) fn evaluate_qwen35_plan(
     label: &str,
     lanes: &LoadLanes<'_>,
@@ -153,13 +158,30 @@ pub(crate) fn evaluate_qwen35_plan(
         },
         copy_layers: Some(fa_layers as u64),
     });
-    MemoryPlan::evaluate(footprint, pool_input, speculative)
+    let autoregressive_transient = |window| flat_lane_transient(config, format, window);
+    let flat = (lanes.pool.is_none() && draft.is_none()).then(|| FlatInput {
+        shape: LaneShape {
+            trained,
+            lane_bytes: recurrent_state_bytes,
+            layout: KvLayout::of(
+                fa_layers,
+                config.num_kv_heads,
+                config.head_dim,
+                lanes.dtype,
+                format,
+            ),
+            scratch_rows: 0,
+            transient: &autoregressive_transient,
+        },
+        copy_layers: Some(fa_layers as u64),
+    });
+    MemoryPlan::evaluate(footprint, pool_input, speculative, flat)
         .map_err(|error| Error::from_reason(error.message(label)))
 }
 
 /// The plan of `target`'s load from what the device holds now: the pool lane
-/// when `pool` is set, and the DFlash2 lane with a draft. `None` when the
-/// working set is unreadable or the load has no lane to price.
+/// when `pool` is set, the DFlash2 lane with a draft, the flat lane with
+/// neither. `None` when the working set is unreadable.
 pub(crate) fn plan_qwen35_load<T: DFlash2Target>(
     label: &str,
     target: &T,
@@ -168,9 +190,6 @@ pub(crate) fn plan_qwen35_load<T: DFlash2Target>(
     max_memory_bytes: Option<u64>,
 ) -> Result<Option<MemoryPlan>> {
     let draft = target.dflash2();
-    if pool.is_none() && draft.is_none() {
-        return Ok(None);
-    }
     let Some(live) = live_memory() else {
         return Ok(None);
     };
@@ -235,8 +254,9 @@ pub(crate) fn max_memory_option(label: &str, value: Option<i64>) -> Result<Optio
 #[napi(object)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Qwen35ContextEstimate {
-    /// Tokens a turn on the paged pool may hold; the trained window without
-    /// a pool.
+    /// Tokens a non-DFlash2 turn may hold: the pool lane's, the flat lane's
+    /// without a pool and a draft, the trained window with a draft and no
+    /// pool.
     pub window_tokens: u32,
     /// Tokens a DFlash2 turn may hold; set only with a draft.
     pub speculative_window_tokens: Option<u32>,
@@ -414,13 +434,6 @@ pub(crate) fn estimate_qwen35_load(
         None
     };
     let trained = config.max_position_embeddings.max(0) as u32;
-    if pool.is_none() && draft.is_none() {
-        return Ok(Some(Qwen35ContextEstimate {
-            window_tokens: trained,
-            speculative_window_tokens: None,
-            bound: "model".to_string(),
-        }));
-    }
     let Some(mut live) = live_memory() else {
         return Ok(None);
     };
@@ -437,11 +450,16 @@ pub(crate) fn estimate_qwen35_load(
         dtype: DType::BFloat16,
     };
     let plan = evaluate_qwen35_plan(label, &lanes, live, input.max_memory_bytes)?;
-    let pool_window = plan.pool.as_ref().map(|pool| pool.lane.window);
+    let window = plan
+        .pool
+        .as_ref()
+        .map(|pool| pool.lane)
+        .or(plan.flat)
+        .map(|lane| lane.window);
     let speculative_window = plan.speculative.as_ref().map(|lane| lane.window);
-    let served = speculative_window.or(pool_window);
+    let served = speculative_window.or(window);
     Ok(Some(Qwen35ContextEstimate {
-        window_tokens: pool_window.map_or(trained, |window| window.maximum()),
+        window_tokens: window.map_or(trained, |window| window.maximum()),
         speculative_window_tokens: speculative_window.map(|window| window.maximum()),
         bound: served.map_or("model", |window| window.bound()).to_string(),
     }))

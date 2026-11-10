@@ -5240,8 +5240,9 @@ export interface Qwen35Config {
 /** What a load of a Qwen3.5 checkpoint would serve, priced before it loads. */
 export interface Qwen35ContextEstimate {
   /**
-   * Tokens a turn on the paged pool may hold; the trained window without
-   * a pool.
+   * Tokens a non-DFlash2 turn may hold: the pool lane's, the flat lane's
+   * without a pool and a draft, the trained window with a draft and no
+   * pool.
    */
   windowTokens: number;
   /** Tokens a DFlash2 turn may hold; set only with a draft. */
@@ -5275,8 +5276,9 @@ export interface Qwen35ContextLimits {
   restOfWindowOutputBudget: boolean;
   /**
    * An omitted budget on `effective_window_tokens` is the rest of that
-   * window. Set only when a paged pool sizes the window from memory; a
-   * flat load's window is the trained length, so it keeps the native
+   * window. Set when the plan prices that window: the paged pool, or the
+   * flat lane of a load with neither pool nor draft. A flat load with a
+   * draft publishes the trained length there and keeps the native
    * default.
    */
   omittedBudgetIsRestOfWindow: boolean;
