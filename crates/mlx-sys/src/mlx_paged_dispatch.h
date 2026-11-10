@@ -130,6 +130,10 @@ void dispatch_reshape_and_cache(
 ///
 /// `sliding_window`: 0 = disabled, nonzero masks older K positions;
 /// negative is rejected.
+///
+/// `live_blocks`: the distinct pool blocks the block tables reach. The
+/// pool and scale planes are charged to the command buffer for that many
+/// blocks, not the whole pool.
 void dispatch_paged_attention_auto(
     mlx::core::metal::CommandEncoder& encoder,
     mlx::core::metal::Device& device,
@@ -149,6 +153,7 @@ void dispatch_paged_attention_auto(
     int block_size,
     int max_context_len,
     int max_blocks_per_seq,
+    int64_t live_blocks,
     float scale,
     float softcap,
     int sliding_window,
@@ -184,6 +189,7 @@ void dispatch_paged_attention_varlen_auto(
     int block_size,
     int max_context_len,
     int max_blocks_per_seq,
+    int64_t live_blocks,
     float scale,
     float softcap,
     int sliding_window,

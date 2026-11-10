@@ -12,6 +12,7 @@
 #include "mlx_common.h"
 #include "mlx_paged_dispatch.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -57,6 +58,35 @@ constexpr int64_t ceil_div_nonnegative_i32(int32_t value, int32_t divisor) {
 static_assert(
     ceil_div_nonnegative_i32(std::numeric_limits<int32_t>::max(), 16) ==
     134217728);
+
+// Distinct pool blocks the first ceil(seq_len / block_size) entries of every
+// table row reach (Splash `PageStorage::writeTable` sorts and dedups the
+// entries it records): a prefix two rows share counts once. Runs on every
+// read after the runtime bounds checks put each entry in [0, num_blocks).
+int64_t distinct_live_blocks(
+    const int32_t* block_table,
+    const int32_t* seq_lens,
+    uint32_t num_seqs,
+    uint32_t max_blocks_per_seq,
+    int block_size,
+    int32_t num_blocks) {
+  std::vector<uint64_t> seen((static_cast<size_t>(num_blocks) + 63) / 64, 0);
+  int64_t live = 0;
+  for (uint32_t i = 0; i < num_seqs; ++i) {
+    const int64_t used = std::min<int64_t>(
+        ceil_div_nonnegative_i32(seq_lens[i], block_size), max_blocks_per_seq);
+    const int32_t* row =
+        block_table + static_cast<size_t>(i) * max_blocks_per_seq;
+    for (int64_t j = 0; j < used; ++j) {
+      const uint32_t blk = static_cast<uint32_t>(row[j]);
+      uint64_t& word = seen[blk / 64];
+      const uint64_t bit = uint64_t{1} << (blk % 64);
+      live += (word & bit) == 0;
+      word |= bit;
+    }
+  }
+  return live;
+}
 
 // Derive `x_pack` (the inner-axis vLLM K-pool packing factor) from the
 // on-cache KV dtype. `x_pack` is `16 / sizeof(scalar)`:
@@ -156,11 +186,57 @@ void require_known_kv_dtype(uint8_t kv_dtype_raw) {
   }
 }
 
-// An int8 pool has no paged read kernel yet.
-void refuse_int8_reads(KvDtype kv_dtype, const char* op_name) {
-  if (kv_dtype == KvDtype::Int8) {
+// An int8 pool carries one f32 scale per (block, head, token) (Splash
+// splash_q8_scale_index), written in place by the store and read by the
+// attention kernels; a short plane is indexed past. Every other pool takes
+// unit 1-element scales. The int8 kernels exist for head sizes 128 and 256
+// (Splash's) and, on reads, block sizes 16 and 32.
+void validate_kv_scales(
+    const array& k_pool,
+    const array& k_scale,
+    const array& v_scale,
+    int num_kv_heads,
+    int block_size,
+    int head_size,
+    KvDtype kv_dtype,
+    bool read,
+    const char* op_name) {
+  if (k_scale.dtype() != mlx::core::float32 ||
+      v_scale.dtype() != mlx::core::float32) {
     std::ostringstream msg;
-    msg << "[validator] [" << op_name << "] int8 paged reads are not built";
+    msg << "[validator] [" << op_name << "] k_scale / v_scale must be float32";
+    throw std::invalid_argument(msg.str());
+  }
+  if (kv_dtype != KvDtype::Int8) {
+    if (k_scale.size() != 1 || v_scale.size() != 1) {
+      std::ostringstream msg;
+      msg << "[validator] [" << op_name
+          << "] k_scale / v_scale must be 1-element arrays";
+      throw std::invalid_argument(msg.str());
+    }
+    return;
+  }
+  const Shape expected{k_pool.ndim() > 0 ? k_pool.shape(0) : 0,
+                       num_kv_heads,
+                       block_size};
+  if (k_scale.shape() != expected || v_scale.shape() != expected) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name
+        << "] int8 k_scale / v_scale must be float32 [num_blocks, "
+        << "num_kv_heads, block_size] = [" << expected[0] << ", "
+        << expected[1] << ", " << expected[2] << "]";
+    throw std::invalid_argument(msg.str());
+  }
+  if (head_size != 128 && head_size != 256) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] int8 paged pools have head_size "
+        << "128 or 256 only; got " << head_size;
+    throw std::invalid_argument(msg.str());
+  }
+  if (read && block_size != 16 && block_size != 32) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] int8 paged reads have block_size "
+        << "16 or 32 only; got " << block_size;
     throw std::invalid_argument(msg.str());
   }
 }
@@ -357,37 +433,16 @@ void validate_paged_kv_write_inputs(
         << " disagrees with new_v dtype " << new_v.dtype();
     throw std::invalid_argument(msg.str());
   }
-  if (k_scale.dtype() != mlx::core::float32 ||
-      v_scale.dtype() != mlx::core::float32) {
-    std::ostringstream msg;
-    msg << "[validator] [" << op_name << "] k_scale / v_scale must be float32";
-    throw std::invalid_argument(msg.str());
-  }
-  if (kv_dtype == KvDtype::Int8) {
-    // The int8 store writes one scale per (block, head, token) in place
-    // (Splash `splash_q8_scale_index`); a short plane is written past.
-    const Shape expected{k_pool.ndim() > 0 ? k_pool.shape(0) : 0,
-                         num_kv_heads,
-                         block_size};
-    if (k_scale.shape() != expected || v_scale.shape() != expected) {
-      std::ostringstream msg;
-      msg << "[validator] [" << op_name
-          << "] int8 k_scale / v_scale must be float32 [num_blocks, "
-          << "num_kv_heads, block_size] = [" << expected[0] << ", "
-          << expected[1] << ", " << expected[2] << "]";
-      throw std::invalid_argument(msg.str());
-    }
-    if (head_size != 128 && head_size != 256) {
-      std::ostringstream msg;
-      msg << "[validator] [" << op_name << "] int8 paged store has head_size "
-          << "128 or 256 only; got " << head_size;
-      throw std::invalid_argument(msg.str());
-    }
-  } else if (k_scale.size() != 1 || v_scale.size() != 1) {
-    std::ostringstream msg;
-    msg << "[validator] [" << op_name << "] k_scale / v_scale must be 1-element arrays";
-    throw std::invalid_argument(msg.str());
-  }
+  validate_kv_scales(
+      k_pool,
+      k_scale,
+      v_scale,
+      num_kv_heads,
+      block_size,
+      head_size,
+      kv_dtype,
+      /*read=*/false,
+      op_name);
 
   // 4. Pool shape validation. K layout (vLLM):
   //      [num_blocks, num_kv_heads, head_size/x, block_size, x]
@@ -535,7 +590,6 @@ void validate_paged_attention_inputs(
     int sliding_window,
     KvDtype kv_dtype,
     const char* op_name) {
-  refuse_int8_reads(kv_dtype, op_name);
   // 1. Contiguity + zero offset.
   require_row_contiguous_zero_offset(q, op_name, "q");
   require_row_contiguous_zero_offset(k_pool, op_name, "k_pool");
@@ -618,18 +672,17 @@ void validate_paged_attention_inputs(
     throw std::invalid_argument(msg.str());
   }
 
-  // 4. Scale dtype + 1-element shape.
-  if (k_scale.dtype() != mlx::core::float32 ||
-      v_scale.dtype() != mlx::core::float32) {
-    std::ostringstream msg;
-    msg << "[validator] [" << op_name << "] k_scale / v_scale must be float32";
-    throw std::invalid_argument(msg.str());
-  }
-  if (k_scale.size() != 1 || v_scale.size() != 1) {
-    std::ostringstream msg;
-    msg << "[validator] [" << op_name << "] k_scale / v_scale must be 1-element arrays";
-    throw std::invalid_argument(msg.str());
-  }
+  // 4. Scales.
+  validate_kv_scales(
+      k_pool,
+      k_scale,
+      v_scale,
+      num_kv_heads,
+      block_size,
+      head_size,
+      kv_dtype,
+      /*read=*/true,
+      op_name);
 
   // 5. q rank + dtype + per-dim shape.
   if (q.ndim() != 3) {
@@ -1077,6 +1130,13 @@ void PagedAttention::eval_gpu(
     throw std::runtime_error(
         "PagedAttention: max_context_len from seq_lens must be > 0");
   }
+  const int64_t live_blocks = distinct_live_blocks(
+      block_table.data<int32_t>(),
+      seq_lens_data,
+      num_seqs,
+      max_blocks_per_seq,
+      block_size_,
+      static_cast<int32_t>(k_pool.shape(0)));
 
   // Allocate the output buffer via MLX's allocator BEFORE dispatch —
   // the encoder's `set_output_array` reads `out.buffer().ptr()` so
@@ -1110,6 +1170,7 @@ void PagedAttention::eval_gpu(
       block_size_,
       max_context_len,
       static_cast<int>(max_blocks_per_seq),
+      live_blocks,
       scale_,
       softcap_,
       sliding_window_,
@@ -1411,7 +1472,6 @@ void validate_paged_attention_varlen_inputs(
     int sliding_window,
     KvDtype kv_dtype,
     const char* op_name) {
-  refuse_int8_reads(kv_dtype, op_name);
   require_row_contiguous_zero_offset(q, op_name, "q");
   require_row_contiguous_zero_offset(k_pool, op_name, "k_pool");
   require_row_contiguous_zero_offset(v_pool, op_name, "v_pool");
@@ -1468,19 +1528,16 @@ void validate_paged_attention_varlen_inputs(
     throw std::invalid_argument(msg.str());
   }
 
-  if (k_scale.dtype() != mlx::core::float32 ||
-      v_scale.dtype() != mlx::core::float32) {
-    std::ostringstream msg;
-    msg << "[validator] [" << op_name
-        << "] k_scale / v_scale must be float32";
-    throw std::invalid_argument(msg.str());
-  }
-  if (k_scale.size() != 1 || v_scale.size() != 1) {
-    std::ostringstream msg;
-    msg << "[validator] [" << op_name
-        << "] k_scale / v_scale must be 1-element arrays";
-    throw std::invalid_argument(msg.str());
-  }
+  validate_kv_scales(
+      k_pool,
+      k_scale,
+      v_scale,
+      num_kv_heads,
+      block_size,
+      head_size,
+      kv_dtype,
+      /*read=*/true,
+      op_name);
 
   if (q.ndim() != 3) {
     std::ostringstream msg;
@@ -1751,6 +1808,13 @@ void PagedAttentionVarlen::eval_gpu(
     throw std::runtime_error(
         "PagedAttentionVarlen: max_context_len from seq_lens must be > 0");
   }
+  const int64_t live_blocks = distinct_live_blocks(
+      block_table_data,
+      seq_lens_data,
+      num_seqs,
+      max_blocks_per_seq,
+      block_size_,
+      static_cast<int32_t>(k_pool.shape(0)));
 
   out.set_data(allocator::malloc(out.nbytes()));
 
@@ -1779,6 +1843,7 @@ void PagedAttentionVarlen::eval_gpu(
       block_size_,
       max_context_len,
       static_cast<int>(max_blocks_per_seq),
+      live_blocks,
       scale_,
       softcap_,
       sliding_window_,
@@ -7219,3 +7284,97 @@ int mlx_paged_grouped_d512_graph_parity(
 }
 
 } // extern "C"
+
+/// Size commits the paged read's pool binding causes. Runs `dispatches`
+/// reads (`paged_attention`, or `paged_attention_varlen` when `cu_seqlens_q`
+/// is non-null) on a fresh GPU stream through each primitive's `eval_gpu`,
+/// committing as `gpu::eval` does, and counts the commits whose reason
+/// names the size limit. `commit_each` ends the command buffer after every
+/// read (a layer read after its write's commit). -1 on any error.
+extern "C" int64_t mlx_test_paged_attention_commit_count(
+    mlx_array* q_ptr,
+    mlx_array* k_pool_ptr,
+    mlx_array* v_pool_ptr,
+    mlx_array* k_scale_ptr,
+    mlx_array* v_scale_ptr,
+    mlx_array* block_table_ptr,
+    mlx_array* seq_lens_ptr,
+    mlx_array* cu_seqlens_q_ptr,
+    uint8_t kv_dtype_raw,
+    int32_t dispatches,
+    bool commit_each) {
+  if (!q_ptr || !k_pool_ptr || !v_pool_ptr || !k_scale_ptr || !v_scale_ptr ||
+      !block_table_ptr || !seq_lens_ptr || dispatches <= 0) {
+    return -1;
+  }
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::fast;
+    require_known_kv_dtype(kv_dtype_raw);
+    const auto kv_dtype = static_cast<KvDtype>(kv_dtype_raw);
+    auto& q = *reinterpret_cast<array*>(q_ptr);
+    auto& k_pool = *reinterpret_cast<array*>(k_pool_ptr);
+    auto& v_pool = *reinterpret_cast<array*>(v_pool_ptr);
+    auto& k_scale = *reinterpret_cast<array*>(k_scale_ptr);
+    auto& v_scale = *reinterpret_cast<array*>(v_scale_ptr);
+    auto& block_table = *reinterpret_cast<array*>(block_table_ptr);
+    auto& seq_lens = *reinterpret_cast<array*>(seq_lens_ptr);
+    std::vector<array> metadata = {q, block_table, seq_lens};
+    if (cu_seqlens_q_ptr) {
+      metadata.push_back(*reinterpret_cast<array*>(cu_seqlens_q_ptr));
+    }
+    eval(metadata);
+    const int block_size = static_cast<int>(k_pool.shape(3));
+    const int num_kv_heads = static_cast<int>(k_pool.shape(1));
+    const int num_q_heads = static_cast<int>(q.shape(1));
+    const int head_size = static_cast<int>(q.shape(2));
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_size));
+
+    const auto stream = new_stream(Device::gpu);
+    auto& encoder = metal::get_command_encoder(stream);
+    int64_t size_commits = 0;
+    std::vector<array> reads;
+    try {
+      for (int32_t i = 0; i < dispatches; ++i) {
+        array out = cu_seqlens_q_ptr
+            ? paged_attention_varlen(
+                  q, k_pool, v_pool, block_table, seq_lens, metadata.back(),
+                  k_scale, v_scale, scale, 0.0f, 0, block_size, num_q_heads,
+                  num_kv_heads, head_size, kv_dtype, stream)
+            : paged_attention(
+                  q, k_pool, v_pool, block_table, seq_lens, k_scale, v_scale,
+                  scale, 0.0f, 0, block_size, num_q_heads, num_kv_heads,
+                  head_size, kv_dtype, stream);
+        auto outputs = out.outputs();
+        out.primitive().eval_gpu(out.inputs(), outputs);
+        encoder.retain_inputs(out);
+        reads.push_back(out);
+        if (encoder.needs_commit()) {
+          const char* reason = encoder.commit_reason();
+          size_commits += std::strstr(reason, "size") != nullptr;
+          encoder.end_encoding();
+          encoder.commit(nullptr, reason);
+        } else if (commit_each) {
+          encoder.end_encoding();
+          encoder.commit(nullptr, "test");
+        }
+      }
+      encoder.end_encoding();
+      encoder.commit(nullptr, "test");
+      encoder.synchronize();
+    } catch (...) {
+      try {
+        encoder.end_encoding();
+        encoder.synchronize();
+      } catch (...) {
+      }
+      throw;
+    }
+    return size_commits;
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("paged_attention_commit_count", e.what());
+    return -1;
+  } catch (...) {
+    return -1;
+  }
+}

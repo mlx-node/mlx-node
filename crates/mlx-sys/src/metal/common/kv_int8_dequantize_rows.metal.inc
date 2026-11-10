@@ -4,18 +4,18 @@
 // chunk). One simdgroup per row, 8 elements per lane.
 //
 // Bound names:
-//   q        : const device int8_t*     [B, H, N, 256], any strides with a
+//   q        : const device int8_t*     [B, H, N, D], any strides with a
 //              contiguous last axis (q_strides is supplied by MLX)
 //   s        : const device float*      [B, H, N], any strides (s_strides)
 //   rows     : const constant int32_t&  B * H * N
 //   heads    : const constant int32_t&  H
 //   tokens   : const constant int32_t&  N
-//   out      : device bfloat16_t*       [B, H, N, 256] row-major
+//   out      : device bfloat16_t*       [B, H, N, D] row-major
+//   D        : template int             128 or 256
 //
 // Grid: 256 threads per threadgroup (8 rows), ceil(rows / 8) threadgroups
 // along y.
 R"(
-  constexpr int D = 256;
   constexpr int PER_LANE = D / 32;
   const int row = int(threadgroup_position_in_grid.y) * 8 +
       int(simdgroup_index_in_threadgroup);

@@ -9069,17 +9069,11 @@ fn qwen4_gathers_refuse_an_int8_pool() {
     let error = paged::gather_selected(&adapter, 0, &[0, 1], 2, 128)
         .map(drop)
         .unwrap_err();
-    assert!(
-        error.reason.contains("int8 paged reads are not built"),
-        "{error}"
-    );
+    assert!(error.reason.contains("an int8 pool is refused"), "{error}");
     let rows = MxArray::zeros(&[1, 2, 128], Some(crate::array::DType::BFloat16)).unwrap();
     let tokens = MxArray::from_int32(&[0], &[1]).unwrap();
     let error = paged::gather_window(&adapter, 0, &tokens, &rows, &rows, 4)
         .map(drop)
         .unwrap_err();
-    assert!(
-        error.reason.contains("int8 paged reads are not built"),
-        "{error}"
-    );
+    assert!(error.reason.contains("an int8 pool is refused"), "{error}");
 }

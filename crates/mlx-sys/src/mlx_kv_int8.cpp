@@ -68,6 +68,17 @@ void validate_rows(const mlx::core::array &rows, mlx::core::Dtype dtype,
   }
 }
 
+// The paged int8 pool also holds head size 128 rows (its read instances).
+void validate_dequantize_rows(const mlx::core::array &rows) {
+  if (rows.ndim() != 4 ||
+      (rows.shape(3) != kHeadDimension && rows.shape(3) != 128) ||
+      rows.dtype() != mlx::core::int8 || rows.strides(3) != 1) {
+    throw std::invalid_argument(
+        "kv int8 dequantize input must be rank-4 int8 [B, H, N, 128 | 256] "
+        "with a contiguous head dimension");
+  }
+}
+
 bool metal_gpu() {
   return mlx::core::metal::is_available() &&
          mlx::core::default_device() == mlx::core::Device::gpu;
@@ -123,7 +134,7 @@ quantize_rows(const mlx::core::array &input) {
 mlx::core::array dequantize_rows(const mlx::core::array &q,
                                  const mlx::core::array &s) {
   using namespace mlx::core;
-  validate_rows(q, int8, "kv int8 dequantize input");
+  validate_dequantize_rows(q);
   if (s.ndim() != 3 || s.dtype() != float32 || s.shape(0) != q.shape(0) ||
       s.shape(1) != q.shape(1) || s.shape(2) != q.shape(2)) {
     throw std::invalid_argument(
@@ -132,7 +143,7 @@ mlx::core::array dequantize_rows(const mlx::core::array &q,
   if (!metal_gpu()) {
     return dequantize_rows_fallback(q, s);
   }
-  const int B = q.shape(0), H = q.shape(1), N = q.shape(2);
+  const int B = q.shape(0), H = q.shape(1), N = q.shape(2), D = q.shape(3);
   const int rows = B * H * N;
   array rows_arr(rows, int32), heads_arr(H, int32), tokens_arr(N, int32);
   const int groups = (rows + 7) / 8;
@@ -140,9 +151,9 @@ mlx::core::array dequantize_rows(const mlx::core::array &q,
   std::tuple<int, int, int> threadgroup{256, 1, 1};
   auto results = dequantize_kernel()(
       {q, s, rows_arr, heads_arr, tokens_arr},
-      /* output_shapes */ {Shape{B, H, N, kHeadDimension}},
+      /* output_shapes */ {Shape{B, H, N, D}},
       /* output_dtypes */ {bfloat16}, grid, threadgroup,
-      /* template_args */ {}, /* init_value */ std::nullopt,
+      /* template_args */ {{"D", D}}, /* init_value */ std::nullopt,
       /* verbose */ false, default_stream(Device::gpu));
   return results[0];
 }
@@ -180,8 +191,8 @@ extern "C" int mlx_kv_int8_quantize_rows_reference(mlx_array *x,
   }
 }
 
-// int8 rows `[B, H, N, 256]` x fp32 scales `[B, H, N]` -> BF16 rows. Null
-// (message on stderr) on error.
+// int8 rows `[B, H, N, 128 | 256]` x fp32 scales `[B, H, N]` -> BF16 rows.
+// Null (message on stderr) on error.
 extern "C" mlx_array *mlx_kv_int8_dequantize_rows(mlx_array *q, mlx_array *s) {
   try {
     auto out = dequantize_rows(*reinterpret_cast<array *>(q),

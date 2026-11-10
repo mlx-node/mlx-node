@@ -61,7 +61,8 @@ pub(crate) fn quantize_kv_rows_reference(x: &MxArray) -> Result<(MxArray, MxArra
     )
 }
 
-/// int8 rows `[B, H, N, 256]` x fp32 scales `[B, H, N]` -> BF16 rows.
+/// int8 rows `[B, H, N, 128 | 256]` x fp32 scales `[B, H, N]` -> BF16 rows
+/// (the paged int8 pool's dense readers use the 128 form).
 pub fn dequantize_kv_rows(q: &MxArray, s: &MxArray) -> Result<MxArray> {
     // SAFETY: both handles are live arrays; the result is an owned handle or
     // null on failure.

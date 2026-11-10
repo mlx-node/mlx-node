@@ -2033,7 +2033,9 @@ impl LayerKVPool {
         }
         if self.cache_dtype == MetalDtype::Int8 {
             return Err(
-                "LayerKVPool::gather_attention: int8 paged reads are not built".to_string(),
+                "LayerKVPool::gather_attention: the raw Metal route has no int8 \
+                        kernel; int8 pools read through PagedAttention"
+                    .to_string(),
             );
         }
 
@@ -5548,9 +5550,9 @@ mod int8_tests {
             )
         };
         let Err(error) = read else {
-            panic!("an int8 pool must refuse paged reads");
+            panic!("an int8 pool must refuse the raw route");
         };
-        assert!(error.contains("int8 paged reads are not built"));
+        assert!(error.contains("the raw Metal route has no int8 kernel"));
     }
 
     /// Mutation M4: `move_blocks` skips the scale slots.
