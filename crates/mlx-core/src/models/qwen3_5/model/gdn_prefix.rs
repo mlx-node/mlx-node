@@ -543,6 +543,7 @@ impl Qwen35Inner {
                     chunk_size,
                     rope_deltas,
                     turn_cancel.as_deref(),
+                    None,
                 )?;
             Ok((logits, None, checkpoints))
         }
@@ -1063,7 +1064,7 @@ impl Qwen35Inner {
                     entry.last_used = stamp;
                 }
             }
-            UnitKey::Store(_) | UnitKey::Owner(_) | UnitKey::Table(_) => {}
+            UnitKey::Store(_) | UnitKey::Owner(_) => {}
         }
     }
 
@@ -1176,7 +1177,7 @@ impl Qwen35Inner {
                 self.gdn_prefix_checkpoints.len() < before
             }
             UnitKey::History => self.gdn_last_history_checkpoint.take().is_some(),
-            UnitKey::Store(_) | UnitKey::Owner(_) | UnitKey::Table(_) => false,
+            UnitKey::Store(_) | UnitKey::Owner(_) => false,
         };
         if dropped {
             self.sync_gdn_state_marks();

@@ -2317,6 +2317,7 @@ pub(crate) async fn load_with_source(
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     inner.initialize_paged_adapter()?;
+                    inner.require_dflash2_pool()?;
                     let pool_bytes = inner
                         .paged_adapter
                         .as_ref()

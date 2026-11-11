@@ -7,15 +7,13 @@ use napi::bindgen_prelude::*;
 
 use super::attention::Qwen3_5Attention;
 use super::config::Qwen3_5MoeConfig;
-use super::gated_delta_net::{GatedDeltaNet, GdnCapturePlan, GdnLayerCapture};
+use super::gated_delta_net::GatedDeltaNet;
 use super::layer_cache::Qwen3_5LayerCache;
 use super::sparse_moe::SparseMoeBlock;
 use crate::models::quantized_linear::{MLPVariant, QuantizedLinear};
 // Reuse the dense layer-kind enum for MoE; the routing semantics
 // (Linear vs FullAttentionPaged) are identical between dense and MoE.
-pub(crate) use crate::models::qwen3_5::decoder_layer::{
-    LayerVerifyIo, Qwen3_5LayerKind, VerifyResidual,
-};
+pub(crate) use crate::models::qwen3_5::decoder_layer::Qwen3_5LayerKind;
 
 /// Attention type for a decoder layer.
 ///
@@ -50,27 +48,6 @@ impl MLPType {
         match self {
             MLPType::Dense(mlp) => mlp.finalize_gate_up(),
             MLPType::MoE(_) => Ok(()),
-        }
-    }
-}
-
-/// Owned counterpart of VerifyResidual; meaning is fixed by the graph output.
-/// Source combine returns Hidden, while ordinary FFN stays Pending.
-pub(crate) enum VerifyLayerOutput {
-    Hidden(MxArray),
-    Pending { h: MxArray, delta: MxArray },
-}
-impl VerifyLayerOutput {
-    pub(crate) fn as_input(&self) -> VerifyResidual<'_> {
-        match self {
-            Self::Hidden(h) => VerifyResidual::Hidden(h),
-            Self::Pending { h, delta } => VerifyResidual::Pending { h, delta },
-        }
-    }
-    pub(crate) fn normalize(&self, norm: &RMSNorm) -> Result<(MxArray, MxArray)> {
-        match self {
-            Self::Hidden(h) => Ok((h.clone(), norm.forward(h)?)),
-            Self::Pending { h, delta } => DecoderLayer::add_residual_norm(norm, h, delta),
         }
     }
 }
@@ -115,68 +92,6 @@ impl DecoderLayer {
         residual: &MxArray,
     ) -> Result<(MxArray, MxArray)> {
         crate::models::qwen3_5::decoder_layer::DecoderLayer::add_residual_norm(norm, x, residual)
-    }
-
-    pub(crate) fn forward_verify(
-        &mut self,
-        input: VerifyResidual<'_>,
-        io: &mut LayerVerifyIo<'_>,
-        use_kernel: bool,
-        tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
-        row_budget: Option<&MxArray>,
-    ) -> Result<(MxArray, VerifyLayerOutput)> {
-        let (x, normed) = match input {
-            VerifyResidual::Hidden(x) => (x.clone(), self.input_layernorm.forward(x)?),
-            VerifyResidual::Pending { h, delta } => {
-                Self::add_residual_norm(&self.input_layernorm, h, delta)?
-            }
-        };
-        let includes_residual = self.source_mixer_rows(&x)?;
-        let attn_out = match (&mut self.attn, io) {
-            (AttentionType::Linear(gdn), LayerVerifyIo::Linear(ac)) => {
-                if includes_residual {
-                    gdn.forward_source_residual_with_tape(
-                        &normed,
-                        None,
-                        Some(&mut **ac),
-                        use_kernel,
-                        tape_sink,
-                        &x,
-                    )?
-                } else {
-                    gdn.forward_with_tape(&normed, None, Some(&mut **ac), use_kernel, tape_sink)?
-                }
-            }
-            (AttentionType::Full(attn), LayerVerifyIo::FullAttention(aio)) => {
-                if includes_residual {
-                    attn.forward_verify_source_residual(&normed, aio, &x)?
-                } else {
-                    attn.forward_verify(&normed, aio)?
-                }
-            }
-            (AttentionType::Linear(_), _) | (AttentionType::Full(_), _) => {
-                return Err(Error::from_reason(
-                    "Qwen3.5 MoE compiled verify: layer/cache io kind mismatch",
-                ));
-            }
-        };
-
-        let (h, normed) = Self::finish_mixer(
-            &self.post_attention_layernorm,
-            &x,
-            attn_out,
-            includes_residual,
-        )?;
-        if let MLPType::MoE(moe) = &self.mlp
-            && let Some(hidden) = moe.forward_source_residual(&normed, &h, row_budget)?
-        {
-            return Ok((x, VerifyLayerOutput::Hidden(hidden)));
-        }
-        let mlp_out = match &self.mlp {
-            MLPType::Dense(mlp) => mlp.forward(&normed)?,
-            MLPType::MoE(moe) => moe.forward_with_budget(&normed, row_budget)?,
-        };
-        Ok((x, VerifyLayerOutput::Pending { h, delta: mlp_out }))
     }
 
     fn forward_mlp_decode_rows(&self, x: &MxArray) -> Result<MxArray> {
@@ -271,35 +186,6 @@ impl DecoderLayer {
         self.finish_layer(x, attn_out, includes_residual)
     }
 
-    /// Unmasked text-prefill forward ([`Self::forward`] with no mask or
-    /// M-RoPE positions) that also captures this layer's GDN state at every
-    /// row of `plan`. Full-attention layers capture nothing.
-    pub(crate) fn forward_captured(
-        &mut self,
-        x: &MxArray,
-        cache: Option<&mut Qwen3_5LayerCache>,
-        plan: &GdnCapturePlan<'_>,
-    ) -> Result<(MxArray, Vec<GdnLayerCapture>)> {
-        let normed = self.input_layernorm.forward(x)?;
-        let includes_residual = self.source_mixer_rows(x)?;
-        let (attn_out, captured) = match &mut self.attn {
-            AttentionType::Linear(gdn) => {
-                let ac = cache.and_then(|c| c.as_arrays_cache_mut());
-                gdn.forward_captured(&normed, ac, true, includes_residual.then_some(x), plan)?
-            }
-            AttentionType::Full(attn) => {
-                let kvc = cache.and_then(|c| c.as_kv_cache_mut());
-                let out = if includes_residual {
-                    attn.forward_source_residual(&normed, None, kvc, None, x)?
-                } else {
-                    attn.forward(&normed, None, kvc, None)?
-                };
-                (out, Vec::new())
-            }
-        };
-        Ok((self.finish_layer(x, attn_out, includes_residual)?, captured))
-    }
-
     /// Post-attention half of the layer: residual + norm, then the MLP or
     /// expert block and its residual.
     fn finish_layer(
@@ -308,6 +194,18 @@ impl DecoderLayer {
         attn_out: MxArray,
         includes_residual: bool,
     ) -> Result<MxArray> {
+        self.finish_layer_with_budget(x, attn_out, includes_residual, None)
+    }
+
+    /// [`Self::finish_layer`] whose expert tail routes only the rows of
+    /// `row_budget` (Splash `budgetsVerifyRows`).
+    fn finish_layer_with_budget(
+        &self,
+        x: &MxArray,
+        attn_out: MxArray,
+        includes_residual: bool,
+        row_budget: Option<&MxArray>,
+    ) -> Result<MxArray> {
         let (h, normed) = Self::finish_mixer(
             &self.post_attention_layernorm,
             x,
@@ -315,13 +213,13 @@ impl DecoderLayer {
             includes_residual,
         )?;
         if let MLPType::MoE(moe) = &self.mlp
-            && let Some(hidden) = moe.forward_source_residual(&normed, &h, None)?
+            && let Some(hidden) = moe.forward_source_residual(&normed, &h, row_budget)?
         {
             return Ok(hidden);
         }
         let mlp_out = match &self.mlp {
             MLPType::Dense(mlp) => mlp.forward(&normed)?,
-            MLPType::MoE(moe) => moe.forward(&normed)?,
+            MLPType::MoE(moe) => moe.forward_with_budget(&normed, row_budget)?,
         };
 
         h.add(&mlp_out)
@@ -340,6 +238,20 @@ impl DecoderLayer {
         position_ids: Option<&MxArray>,
         use_kernel: bool,
         tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
+    ) -> Result<MxArray> {
+        self.forward_with_tape_budget(x, mask, cache, position_ids, use_kernel, tape_sink, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_tape_budget(
+        &mut self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut Qwen3_5LayerCache>,
+        position_ids: Option<&MxArray>,
+        use_kernel: bool,
+        tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
+        row_budget: Option<&MxArray>,
     ) -> Result<MxArray> {
         let normed = self.input_layernorm.forward(x)?;
         let includes_residual = self.source_mixer_rows(x)?;
@@ -365,7 +277,7 @@ impl DecoderLayer {
             }
         };
 
-        self.finish_layer(x, attn_out, includes_residual)
+        self.finish_layer_with_budget(x, attn_out, includes_residual, row_budget)
     }
 
     /// Paged-or-flat dispatch for the MoE decoder layer.
@@ -465,6 +377,7 @@ impl DecoderLayer {
         flat_cache: Option<&mut Qwen3_5LayerCache>,
         tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
         rope_position_offset: i32,
+        row_budget: Option<&MxArray>,
     ) -> Result<MxArray> {
         match kind {
             Qwen3_5LayerKind::Linear => {
@@ -479,7 +392,9 @@ impl DecoderLayer {
                          applied to a FullAttention operator",
                     ));
                 }
-                self.forward_with_tape(x, None, flat_cache, None, true, tape_sink)
+                self.forward_with_tape_budget(
+                    x, None, flat_cache, None, true, tape_sink, row_budget,
+                )
             }
             Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
                 let _ = flat_cache; // adapter owns K/V for paged layers
@@ -518,7 +433,7 @@ impl DecoderLayer {
                     Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
                 let mlp_out = match &self.mlp {
                     MLPType::Dense(mlp) => mlp.forward(&normed)?,
-                    MLPType::MoE(moe) => moe.forward(&normed)?,
+                    MLPType::MoE(moe) => moe.forward_with_budget(&normed, row_budget)?,
                 };
                 h.add(&mlp_out)
             }

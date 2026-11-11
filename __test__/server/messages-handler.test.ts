@@ -199,16 +199,14 @@ function createLaneWindowModel(promptTokens: number, extra: Record<string, unkno
       },
     ]),
     {
-      // Pool window 64, DFlash2 window 96; the draft turns `enableMtp` on by default.
+      // One window of 64 for every turn; the draft turns `enableMtp` on by default.
       contextLimits: () => ({
         trainedWindowTokens: 262_144,
         effectiveWindowTokens: 64,
         pagedBlockCapacity: 4,
         pagedBlockSize: 16,
-        speculativeWindowTokens: 96,
         restOfWindowOutputBudget: true,
         omittedBudgetIsRestOfWindow: true,
-        speculativeOmittedBudgetIsRestOfWindow: true,
       }),
       hasMtpWeights: () => true,
       mtpAutoEnabled: () => true,
@@ -1091,7 +1089,7 @@ describe('handleCreateMessage', () => {
       expect((model.resetCaches as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
     });
 
-    describe('per-lane context window', () => {
+    describe('one context window', () => {
       function expectJson400(response: ReturnType<typeof createMockRes>, model: SessionCapableModel) {
         expect(response.getStatus()).toBe(400);
         expect(response.getHeaders()['content-type']).toContain('application/json');
@@ -1101,9 +1099,7 @@ describe('handleCreateMessage', () => {
         expect((model.resetCaches as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
       }
 
-      // Mutation: always use `speculativeWindowTokens` in
-      // `constrainToContextCapacity` → red (status 200).
-      it('returns a JSON 400 before SSE for a generation_mode=ar prompt above the pool window', async () => {
+      it('returns a JSON 400 before SSE for a generation_mode=ar prompt above the window', async () => {
         const model = createLaneWindowModel(80);
         const registry = new ModelRegistry();
         registry.register('test-model', model);
@@ -1124,8 +1120,7 @@ describe('handleCreateMessage', () => {
         expectJson400(response, model);
       });
 
-      // Mutation: always use `effectiveWindowTokens` → red (status 400).
-      it('streams a speculative text prompt above the pool window but inside the DFlash2 window', async () => {
+      it('returns a JSON 400 before SSE for a speculative text prompt above the window', async () => {
         const model = createLaneWindowModel(80);
         const registry = new ModelRegistry();
         registry.register('test-model', model);
@@ -1142,16 +1137,10 @@ describe('handleCreateMessage', () => {
           registry,
         );
 
-        expect(response.getStatus()).toBe(200);
-        const config = (model.chatStreamSessionStart as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] as
-          | { maxNewTokens?: number; enableMtp?: boolean }
-          | undefined;
-        expect(config?.enableMtp).toBe(true);
-        expect(config?.maxNewTokens).toBe(16);
+        expectJson400(response, model);
       });
 
-      // Mutation: drop `!hasImages` from the window choice → red (status 200).
-      it('returns a JSON 400 before SSE for an image prompt above the pool window with generation_mode=mtp', async () => {
+      it('returns a JSON 400 before SSE for an image prompt above the window with generation_mode=mtp', async () => {
         const model = createLaneWindowModel(4, {
           expandedPromptTokenCount: vi.fn(() => 80),
         });

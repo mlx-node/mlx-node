@@ -273,13 +273,6 @@ impl HybridSchedulerBackend for Qwen35Inner {
         true
     }
 
-    /// A scheduled sequence's installed history is left alone.
-    fn park_idle_live_state(&mut self) {
-        if self.active_scheduled_seq.is_none() {
-            crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
-        }
-    }
-
     fn sync_state_marks(&mut self) {
         self.sync_gdn_state_marks();
     }
@@ -323,14 +316,11 @@ impl HybridSchedulerBackend for Qwen35Inner {
         crate::models::qwen3_5::dflash2_turn::release_one_rebuilt(self)
     }
 
-    /// Admission parks the idle live state first, as no scheduled sequence
-    /// holds it; its own owner loop ran before.
     fn reclaim_kv(
         &mut self,
         need: crate::engine::reclaim::KvNeed,
         keep: &[u32],
     ) -> crate::engine::reclaim::Freed {
-        let park = self.active_scheduled_seq.is_none();
         crate::engine::reclaim::free_for_kv(
             &mut crate::models::qwen3_5::dflash2_turn::ModelReclaim {
                 target: self,
@@ -338,7 +328,6 @@ impl HybridSchedulerBackend for Qwen35Inner {
                     tokens: keep,
                     keys: None,
                 },
-                park,
             },
             need,
         )
@@ -476,11 +465,10 @@ impl HybridSchedulerBackend for Qwen35Inner {
     }
 
     /// The scheduler installs the owner's history before it activates the
-    /// sequence on some paths, so a DFlash2 state parks here first: without
-    /// its history it is no longer exact.
+    /// sequence on some paths: the live draft window no longer matches it.
     fn install_owner_state(&mut self, _seq_id: SeqId, state: &Self::OwnerState) {
         if self.active_scheduled_seq.is_none() {
-            crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
+            self.drop_live_dflash2_window("install_owner_state");
         }
         self.cached_token_history = state.clone();
     }

@@ -1438,8 +1438,7 @@ impl Qwen35MoeInner {
             crate::training_model::compute_sgd_updates(&gradients, learning_rate, current_params)?;
 
         // A partially failed update also changes captured weights. Erase before
-        // applying any parameter so compiled verification cannot retain stale data.
-        self.erase_compiled_verifies();
+        // applying any parameter so a compiled draft cannot retain stale data.
         if let Some(draft) = &self.dflash2 {
             draft.invalidate_compiled();
         }

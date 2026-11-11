@@ -121,24 +121,16 @@ impl PagedPrefix for Qwen35MoePrefixState {
     }
 }
 
-impl PagedBackend for Qwen35MoeInner {
-    type PagedDecode<'a>
-        = PagedStepper<Qwen35MoePagedDecode<'a>>
-    where
-        Self: 'a;
-    type PrefixState = Qwen35MoePrefixState;
-
-    fn prime_prefix_state(
+impl Qwen35MoeInner {
+    /// The `prepare_turn_…` + `prepare_moe_gdn_prefix_state` block that
+    /// opens a MoE paged turn. `dflash2_hit` is a DFlash2 turn's reusable
+    /// prefix: the prepare then books nothing past it.
+    pub(crate) fn prime_moe_prefix(
         &mut self,
         plan: &[u32],
-        _reuse_cache: bool,
-        _block_size: usize,
-        _extra_keys: &[u64],
         cache_salt: u64,
-    ) -> Result<Self::PrefixState> {
-        self.park_or_invalidate_dflash2_context("prime_prefix_state", false);
-        // The `prepare_turn_…` + `prepare_moe_gdn_prefix_state` block that
-        // opens a MoE paged turn.
+        dflash2_hit: Option<u32>,
+    ) -> Result<Qwen35MoePrefixState> {
         self.paged_finalize_failed = false;
         let trace_enabled = inference_trace_enabled();
         let total_budget = plan.len() as u32;
@@ -207,19 +199,51 @@ impl PagedBackend for Qwen35MoeInner {
                 keys: Some((lookup_extra_keys.as_slice(), cache_salt)),
             },
             |inner| {
-                inner
-                    .paged_adapter
-                    .as_mut()
-                    .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?
-                    .prepare_turn_per_block_with_max_cache_hit_tokens(
+                let adapter = inner.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason("prime_prefix_state: paged_adapter is None")
+                })?;
+                let Some(candidate) = dflash2_hit else {
+                    return adapter
+                        .prepare_turn_per_block_with_max_cache_hit_tokens(
+                            seq_id,
+                            plan,
+                            total_budget,
+                            true,
+                            &lookup_extra_keys,
+                            cache_salt,
+                            false,
+                            max_cache_hit_tokens,
+                        )
+                        .map_err(Error::from_reason);
+                };
+                // A DFlash2 turn resumes only where its draft window ends
+                // (Splash resumes a state at its exact boundary); any other
+                // hit restarts cold.
+                let prepared = adapter
+                    .prepare_turn_per_block_booking_hit_only(
                         seq_id,
                         plan,
                         total_budget,
-                        true,
                         &lookup_extra_keys,
                         cache_salt,
-                        false,
-                        max_cache_hit_tokens,
+                        candidate == 0,
+                        candidate,
+                    )
+                    .map_err(Error::from_reason)?;
+                if prepared.cached_prefix_len == 0
+                    || (prepared.continued_live_prefix && prepared.cached_prefix_len == candidate)
+                {
+                    return Ok(prepared);
+                }
+                adapter
+                    .prepare_turn_per_block_booking_hit_only(
+                        seq_id,
+                        plan,
+                        total_budget,
+                        &lookup_extra_keys,
+                        cache_salt,
+                        true,
+                        0,
                     )
                     .map_err(Error::from_reason)
             },
@@ -297,12 +321,17 @@ impl PagedBackend for Qwen35MoeInner {
         })
     }
 
-    fn paged_prefill(
+    /// The paged prefill; with `draft`, the draft context advanced over the
+    /// prompt from the same forward's taps.
+    pub(crate) fn moe_paged_prefill(
         &mut self,
         suffix_tokens: &[u32],
-        prefix: &Self::PrefixState,
-        _stream: Stream,
-    ) -> Result<MxArray> {
+        prefix: &Qwen35MoePrefixState,
+        draft: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
+    ) -> Result<(
+        MxArray,
+        Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
+    )> {
         // The paged prefill block. `run_paged_prefill_chunk` writes K/V into
         // the adapter pool, populates the GDN linear caches, runs the GDN
         // pre-pass over the cached prefix from `full_tokens` (skipped when
@@ -323,14 +352,32 @@ impl PagedBackend for Qwen35MoeInner {
         // the GDN recurrent state is materialized at every boundary the cold
         // sidecar could anchor on. Byte-inert with no cold GDN policy — the
         // unchanged single-shot default. See `cold_gdn_prefill_chunk_size`.
-        let chunk_size = self.cold_gdn_prefill_chunk_size();
+        let chunk_size = crate::models::qwen3_5::paged_forward::prefill_chunk_rows(
+            self.cold_gdn_prefill_chunk_size(),
+        );
         // Cloned up front (cheap Option<Arc>) so the chunk-loop call below
         // can borrow `self.layers`/`self.caches` mutably at the same time.
         let turn_cancel = self.turn_cancel.clone();
         let mtp_seq = self
             .active_scheduled_seq
             .filter(|seq| self.scheduled_mtp.owners.contains_key(seq));
+        if draft.is_some() && mtp_seq.is_some() {
+            return Err(Error::from_reason(
+                "a DFlash2 prefill never runs on a scheduled MTP sequence",
+            ));
+        }
         let mut mtp_hidden = None;
+        let mut taps = match draft {
+            Some(context) => Some(crate::models::qwen3_5::dflash2_turn::DraftTapSink::new(
+                self.dflash2.as_ref().ok_or_else(|| {
+                    Error::from_reason("Qwen3.5 MoE has no loaded DFlash2 companion")
+                })?,
+                context,
+                &prefix.full_tokens,
+                prefix.effective_cached_prefix_len,
+            )),
+            None => None,
+        };
         let (logits, gdn_checkpoint) = {
             let caches_ref = self
                 .caches
@@ -340,7 +387,7 @@ impl PagedBackend for Qwen35MoeInner {
                 .paged_adapter
                 .as_mut()
                 .ok_or_else(|| Error::from_reason("paged_prefill: paged_adapter dropped"))?;
-            crate::models::qwen3_5_moe::paged_forward::run_paged_prefill_chunk_with_size_and_checkpoint(
+            crate::models::qwen3_5_moe::paged_forward::run_paged_prefill_chunk_tapped(
                 &prefix.full_tokens,
                 suffix_tokens,
                 prefix.effective_cached_prefix_len as u32,
@@ -356,8 +403,12 @@ impl PagedBackend for Qwen35MoeInner {
                 rope_deltas,
                 turn_cancel.as_deref(),
                 mtp_seq.map(|_| &mut mtp_hidden),
+                taps.as_mut().map(|sink| {
+                    sink as &mut dyn crate::models::qwen3_5::paged_forward::PrefillTapSink
+                }),
             )?
         };
+        let context = taps.map(crate::models::qwen3_5::dflash2_turn::DraftTapSink::into_context);
         if let Some(seq) = mtp_seq {
             crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::prefill_scheduled_mtp(
                 self,
@@ -373,7 +424,37 @@ impl PagedBackend for Qwen35MoeInner {
             prefix.checkpoint_cache_salt,
             gdn_checkpoint,
         );
-        Ok(logits)
+        Ok((logits, context))
+    }
+}
+
+impl PagedBackend for Qwen35MoeInner {
+    type PagedDecode<'a>
+        = PagedStepper<Qwen35MoePagedDecode<'a>>
+    where
+        Self: 'a;
+    type PrefixState = Qwen35MoePrefixState;
+
+    fn prime_prefix_state(
+        &mut self,
+        plan: &[u32],
+        _reuse_cache: bool,
+        _block_size: usize,
+        _extra_keys: &[u64],
+        cache_salt: u64,
+    ) -> Result<Self::PrefixState> {
+        self.invalidate_dflash2_context("prime_prefix_state");
+        self.prime_moe_prefix(plan, cache_salt, None)
+    }
+
+    fn paged_prefill(
+        &mut self,
+        suffix_tokens: &[u32],
+        prefix: &Self::PrefixState,
+        _stream: Stream,
+    ) -> Result<MxArray> {
+        self.moe_paged_prefill(suffix_tokens, prefix, None)
+            .map(|(logits, _)| logits)
     }
 
     fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {

@@ -54,7 +54,8 @@ impl Qwen35Inner {
         // longer reflect the conversation. A later streaming dense-MTP fallback
         // must rebuild the flat caches before decoding. See
         // `paged_full_attn_caches_dirty`.
-        crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
+        self.dflash2_context = None;
+        self.dflash2_turn_state = None;
         self.paged_full_attn_caches_dirty = true;
         self.dflash2_prefix
             .note_drop("paged_turn_sync_core", DropKind::Dirtied);
@@ -659,7 +660,8 @@ impl Qwen35Inner {
         // This paged turn writes full-attention K/V into the paged adapter pool,
         // leaving the flat `self.caches` full-attention slots stale. A later
         // dense-MTP fallback must rebuild them first.
-        crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
+        self.dflash2_context = None;
+        self.dflash2_turn_state = None;
         self.paged_full_attn_caches_dirty = true;
         self.dflash2_prefix
             .note_drop("vision_paged_turn_sync_core", DropKind::Dirtied);
@@ -1045,7 +1047,8 @@ impl Qwen35Inner {
                 }
             };
 
-        crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
+        self.dflash2_context = None;
+        self.dflash2_turn_state = None;
         self.paged_full_attn_caches_dirty = true;
         self.dflash2_prefix
             .note_drop("vision_paged_turn_stream_core", DropKind::Dirtied);
@@ -1504,7 +1507,8 @@ impl Qwen35Inner {
         // pool, NOT the flat `self.caches`, so a later streaming dense-MTP
         // fallback must rebuild the flat caches before decoding. See
         // `paged_full_attn_caches_dirty`.
-        crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
+        self.dflash2_context = None;
+        self.dflash2_turn_state = None;
         self.paged_full_attn_caches_dirty = true;
         self.dflash2_prefix
             .note_drop("paged_turn_stream_core", DropKind::Dirtied);

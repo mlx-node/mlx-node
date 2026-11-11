@@ -870,7 +870,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
       estimateContextWindow: async (path, modelType, options) => {
         asked.push({ path, modelType, options });
         settle();
-        return { windowTokens: 48_601, speculativeWindowTokens: 61_433, bound: 'memory' };
+        return { windowTokens: 48_601, bound: 'memory' };
       },
       loadModel: async (path) => {
         loaded.push(path);
@@ -894,8 +894,8 @@ describe('createInferenceHost — out-of-band loadModel', () => {
       return Object.fromEntries(body.data.map((entry) => [entry.id, entry.context_window]));
     };
     const before = await windows();
-    expect(before.qwen).toBe(61_433);
-    expect(before.gemma).not.toBe(61_433);
+    expect(before.qwen).toBe(48_601);
+    expect(before.gemma).not.toBe(48_601);
     await host.loadModel('qwen');
     expect(loaded).toEqual([asked[0]?.path]);
     expect((await windows()).qwen).toBe(40_000);

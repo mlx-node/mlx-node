@@ -355,7 +355,6 @@ describe('makeSwapController', () => {
   });
 
   // Mutation: list `entry.contextWindow` always → red after the load.
-  // Mutation: serve `effectiveWindowTokens` instead of the lane → red (73,696).
   it('reports the served window after load and the trained one before and after eviction', async () => {
     const registry = new ModelRegistry();
     const model = {
@@ -367,9 +366,7 @@ describe('makeSwapController', () => {
         effectiveWindowTokens: 73696,
         pagedBlockCapacity: 0,
         pagedBlockSize: 16,
-        speculativeWindowTokens: 139257,
         kvFormat: 'bf16' as const,
-        speculativeKvFormat: 'int8' as const,
       }),
     };
     const ctrl = makeSwapController(
@@ -383,7 +380,7 @@ describe('makeSwapController', () => {
     };
     expect(windows()).toEqual([262144, 262144, 262144]);
     await ctrl.resolveModel('a');
-    expect(windows()).toEqual([139257, 139257, 139257]);
+    expect(windows()).toEqual([73696, 73696, 73696]);
     registry.unregister('a');
     expect(windows()).toEqual([262144, 262144, 262144]);
   });

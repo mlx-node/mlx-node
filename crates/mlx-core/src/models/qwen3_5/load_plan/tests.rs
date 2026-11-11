@@ -226,10 +226,10 @@ fn write_27b_fixture(target: &std::path::Path, draft: &std::path::Path) {
 /// The load-free estimate prices the plan a load makes on the same device,
 /// with the target's and the draft's weight files as active bytes: on the
 /// M3 Pro working set (27 GiB) with 16,000 MiB of target shards and a
-/// 1,357 MiB draft, the windows equal the load planner's at active
-/// 17,357 MiB (48,601 pool, 61,433 DFlash2 on an M5 Max's kernels).
+/// 1,357 MiB draft, the one window equals the load planner's at active
+/// 17,357 MiB (the int8 pool lane with the draft state, 94,201).
 /// Mutation: leave the draft file out of the active bytes in
-/// `estimate_qwen35_load` → red (66,873 / 102,393).
+/// `estimate_qwen35_load` → red.
 #[test]
 fn estimate_matches_the_load_plan() {
     const MIB: u64 = 1 << 20;
@@ -319,14 +319,13 @@ fn estimate_matches_the_load_plan() {
     std::fs::remove_dir_all(&target).unwrap();
     std::fs::remove_dir_all(&draft).unwrap();
 
-    let speculative = plan.speculative.expect("draft lane").window;
-    assert_eq!(speculative.bound(), "memory");
+    let window = plan.pool.expect("pool lane").lane.window;
+    assert_eq!(window.maximum(), 94_201);
     assert_eq!(
         estimate,
         Qwen35ContextEstimate {
-            window_tokens: plan.pool.map_or(262_144, |pool| pool.lane.window.maximum()),
-            speculative_window_tokens: Some(speculative.maximum()),
-            bound: "memory".to_string(),
+            window_tokens: window.maximum(),
+            bound: window.bound().to_string(),
         }
     );
 }
@@ -373,7 +372,6 @@ fn estimate_follows_the_sym8_flat_pin() {
         estimate.expect("estimate").expect("readable device"),
         Qwen35ContextEstimate {
             window_tokens: 126_976,
-            speculative_window_tokens: None,
             bound: "memory".to_string(),
         }
     );
@@ -440,7 +438,6 @@ fn flat_load_is_planned_under_max_memory() {
         bounded.expect("estimate").expect("readable device"),
         Qwen35ContextEstimate {
             window_tokens: 45_056,
-            speculative_window_tokens: None,
             bound: "memory".to_string(),
         }
     );
@@ -450,8 +447,7 @@ fn flat_load_is_planned_under_max_memory() {
 /// with neither pool nor draft the flat lane is the default turn's, so on
 /// the 4 GiB plan of 45,056 rows a 40,000 cap publishes 40,000 and 45,057
 /// fails with Splash's `ServingRuntime::start` text. Mutation: leave the
-/// flat lane out of `default_turn_window` → red (45,057 is clamped to
-/// 45,056).
+/// flat lane out of `turn_window` → red (45,057 is clamped to 45,056).
 #[test]
 fn max_context_caps_the_flat_lane() {
     let target = estimate_fixture_dir("flat-cap");
@@ -494,7 +490,6 @@ fn max_context_caps_the_flat_lane() {
         capped.expect("estimate").expect("readable device"),
         Qwen35ContextEstimate {
             window_tokens: 40_000,
-            speculative_window_tokens: None,
             bound: "memory".to_string(),
         }
     );
@@ -562,7 +557,6 @@ fn audit_counts_this_pools_staging_once() {
         fixed_bytes: 0,
         dynamic_budget_bytes: 0,
         pool: None,
-        speculative: None,
         flat: None,
     };
     let live = LiveMemory {
@@ -729,16 +723,16 @@ fn plan_27b_lanes(
     .expect("load plan")
 }
 
-/// Splash `ServingRuntime::start`: an explicit `--max-context` above the
-/// default turn's lane fails the load with Splash's text, naming what bound
-/// it. Mutation: clamp instead of refuse in `check_max_context` → red.
+/// Splash `ServingRuntime::start`: an explicit `--max-context` above the one
+/// window fails the load with Splash's text, naming what bound it.
+/// Mutation: clamp instead of refuse in `check_max_context` → red.
 #[test]
 fn max_context_above_the_plan_is_refused() {
     let working_set = 27u64 << 30;
     let unset = estimate_27b("refuse-unset", working_set, None, None)
         .unwrap()
         .unwrap();
-    let plan = unset.speculative_window_tokens.expect("draft lane");
+    let plan = unset.window_tokens;
     let error = estimate_27b("refuse-device", working_set, None, Some(plan + 1)).unwrap_err();
     assert_eq!(
         error.reason,
@@ -760,12 +754,11 @@ fn max_context_above_the_plan_is_refused() {
     let at = estimate_27b("refuse-at", working_set, None, Some(plan))
         .unwrap()
         .unwrap();
-    assert_eq!(at.speculative_window_tokens, Some(plan));
-    assert_eq!(at.window_tokens, unset.window_tokens.min(plan));
+    assert_eq!(at.window_tokens, plan);
 }
 
-/// Gate: a 100K cap publishes 102,400 on both lanes while the plan still
-/// prices the native window. Mutation: publish the lane maximum without
+/// Gate: a 100K cap publishes 102,400 while the plan still prices the
+/// native window. Mutation: publish the lane maximum without
 /// the cap in `estimate_qwen35_load` → red (262,144).
 #[test]
 fn a_100k_cap_gives_window_100k() {
@@ -773,36 +766,32 @@ fn a_100k_cap_gives_window_100k() {
         .unwrap()
         .unwrap();
     assert_eq!(estimate.window_tokens, 102_400);
-    assert_eq!(estimate.speculative_window_tokens, Some(102_400));
     let plan = plan_27b("cap-100k-plan", 128 << 30, Some(102_400));
     assert_eq!(plan.pool.unwrap().lane.window.window, 262_144);
-    assert_eq!(plan.speculative.unwrap().window.window, 262_144);
 }
 
-/// 400K plans the YaRN-served window on both lanes. Mutation: price the
+/// 400K plans the YaRN-served window. Mutation: price the
 /// native window in `evaluate_qwen35_plan` → red (262,144, then refused).
 #[test]
 fn four_hundred_k_plans_the_served_window() {
     let plan = plan_27b("yarn-400k", 128 << 30, Some(409_600));
     assert_eq!(plan.pool.unwrap().lane.window.window, 409_600);
-    assert_eq!(plan.speculative.unwrap().window.window, 409_600);
     let estimate = estimate_27b("yarn-400k-estimate", 128 << 30, None, Some(409_600))
         .unwrap()
         .unwrap();
     assert_eq!(estimate.window_tokens, 409_600);
-    assert_eq!(estimate.speculative_window_tokens, Some(409_600));
     let unset = plan_27b("yarn-unset", 128 << 30, None);
     assert_eq!(unset.pool.unwrap().lane.window.window, 262_144);
 }
 
-/// The draft's trained context no longer bounds the speculative lane
-/// (Splash `readDraftLayout` never reads it): a draft whose config says
-/// 131,072 tokens leaves the lane at the target's 262,144. Mutation: the
-/// draft's 131,072 back as `trained.min(..)` in `evaluate_qwen35_plan` → red.
+/// The draft's trained context does not bound the window (Splash
+/// `readDraftLayout` never reads it): a draft whose config says 131,072
+/// tokens leaves the pool lane at the target's 262,144. Mutation: the
+/// draft's 131,072 as `trained.min(..)` in `evaluate_qwen35_plan` → red.
 #[test]
-fn speculative_lane_takes_the_target_window() {
+fn dflash2_lane_takes_the_target_window() {
     let plan = plan_27b_with_draft("draft-cap", 128 << 30, None, 131_072);
-    assert_eq!(plan.speculative.unwrap().window.window, 262_144);
+    assert_eq!(plan.pool.unwrap().lane.window.window, 262_144);
 }
 
 /// A load whose device memory is unreadable has no plan, so it serves at
@@ -865,47 +854,89 @@ fn unplanned_estimate_refuses_what_the_load_refuses() {
     );
 }
 
-/// The int8 pool window from the plan on the M3 Pro inputs (27 GiB working
-/// set, 17,357 MiB active, the 27B with its DFlash2 draft): the pool lane is
-/// priced in int8 pages (1,064,960 B a 32-token page, 128-page extents), its
-/// runway is one extent plus a GDN cell, and its transient is the bounded
-/// int8 varlen workspace. A bf16 pool on the same inputs holds less than
-/// half the window.
-/// Mutation W1: the pool lane's layout keeps `KvFormat::Bf16` → window
-/// 53,849 → red.
+/// Gate: the DFlash2 lane takes the one pool window (Splash
+/// `CompositeStateLayout::laneBytes`). M3 Pro inputs (27 GiB working set,
+/// 17,357 MiB active, the 27B with its DFlash2 draft), int8 pool: the lane
+/// state (a GDN cell and the draft ring, 201,273,344) sits beside the pool,
+/// the transient is the larger of the tapped prefill chunk and the 8-row
+/// verify cycle with its free pool (524,681,216), the page is 1,064,960 B
+/// in 128-page extents and the runway one extent plus a cell: 6,391 blocks
+/// (3,245 MiB), window 94,201. No flat lane. A bf16 pool on the same
+/// inputs holds less than half the window.
+/// Mutations: drop the draft state from the pool lane in
+/// `evaluate_qwen35_plan` → red (102,393); price the pool transient
+/// without the draft taps → red (98,297); the pool layout keeps
+/// `KvFormat::Bf16` → red.
 #[test]
-fn int8_pool_window_from_the_plan() {
+fn dflash2_takes_the_one_pool_window() {
+    let cell = 153_944_064u64;
     let int8 = plan_27b_as("int8-window", 27 << 30, None, 262_144, Some(KvFormat::Int8));
+    assert!(int8.flat.is_none());
     let pool = int8.pool.expect("pool lane");
     assert_eq!(pool.bytes_per_block, 532_480);
-    assert_eq!(pool.max_blocks, 6_932);
-    assert_eq!(pool.max_mib(), 3_520);
+    assert_eq!(pool.max_blocks, 6_391);
+    assert_eq!(pool.max_mib(), 3_245);
     assert_eq!(pool.runway_blocks, 546);
-    assert_eq!(pool.lane.transient_bytes, 419_823_616);
+    assert_eq!(pool.lane.transient_bytes, 524_681_216);
+    assert_eq!(pool.lane.lane_bytes, cell + 201_273_344);
     assert_eq!(pool.lane.extent_pages, 128);
-    assert_eq!(pool.lane.window.maximum(), 102_393);
+    assert_eq!(pool.lane.window.maximum(), 94_201);
     assert_eq!(pool.lane.window.bound(), "memory");
-    let speculative = int8.speculative.expect("draft lane");
-    assert_eq!(speculative.held_bytes, 546 * 532_480);
-    eprintln!(
-        "int8 pool: DFlash2 lane window {}",
-        speculative.window.maximum()
-    );
 
     let bf16 = plan_27b_as("bf16-window", 27 << 30, None, 262_144, Some(KvFormat::Bf16));
     let pool = bf16.pool.expect("pool lane");
     assert_eq!(pool.bytes_per_block, 1 << 20);
     assert_eq!(pool.runway_blocks, 275);
-    eprintln!(
-        "bf16 pool: window {} max_blocks {} transient {}",
-        pool.lane.window.maximum(),
-        pool.max_blocks,
-        pool.lane.transient_bytes
-    );
-    assert!(2 * pool.lane.window.maximum() < 102_393);
+    assert!(2 * pool.lane.window.maximum() < 94_201);
 }
 
-/// One window for every non-DFlash2 turn: a load that can run MTP turns on
+/// A draft load without a pool is refused before any read: DFlash2 runs
+/// only on the pool. Mutation: drop the check in `estimate_qwen35_load` →
+/// red (`Ok`).
+#[test]
+fn draft_without_a_pool_is_refused() {
+    let target = estimate_fixture_dir("draft-flat");
+    let draft = estimate_fixture_dir("draft-flat-draft");
+    write_27b_fixture(&target, &draft);
+    sparse_file(&draft.join("model.safetensors"), 1_357 * MIB);
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(target.join("config.json")).unwrap())
+            .unwrap();
+    config["use_block_paged_cache"] = serde_json::json!(false);
+    std::fs::write(target.join("config.json"), config.to_string()).unwrap();
+    crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| {
+        cell.set(Some(LiveMemory {
+            working_set_bytes: 27 << 30,
+            active_bytes: 0,
+            registered_pool_bytes: 0,
+        }))
+    });
+    let estimate = estimate_qwen35_load(
+        "Qwen3.5",
+        &EstimateInput {
+            asset_dir: &target,
+            moe: false,
+            weight_bytes: 1 << 30,
+            header: bf16_header(),
+            draft_dir: Some(&draft),
+            kv_format: None,
+            max_memory_bytes: None,
+            max_context: None,
+        },
+    );
+    crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::remove_dir_all(&draft).unwrap();
+    let err = estimate.expect_err("no pool for the draft");
+    assert!(
+        err.reason
+            .contains("DFlash2 runs on the block-paged KV pool"),
+        "{}",
+        err.reason
+    );
+}
+
+/// One window for every turn: a load that can run MTP turns on
 /// the pool lane (MTP heads, no draft) charges the MTP state it holds at the
 /// window once, beside the pool (Splash `laneStateBytes`), and inside the
 /// pool too only when the scheduler books it there. M3 Pro inputs, int8
@@ -938,7 +969,7 @@ fn mtp_state_prices_the_one_pool_window() {
             &config, 55_207
         )
     );
-    assert!(serial.speculative.is_none());
+    assert!(serial.flat.is_none());
     let booked = plan_27b_lanes(
         "mtp-booked",
         27 << 30,

@@ -175,8 +175,6 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn reclaims_in_order(&self) -> bool {
         false
     }
-    /// Moves an idle live state beside the pool where the take order sees it.
-    fn park_idle_live_state(&mut self) {}
     fn sync_state_marks(&mut self) {}
     /// Bytes every state unit could free (an upper bound); the states turns
     /// use count only with `in_use`.
@@ -1896,12 +1894,6 @@ impl<B: HybridSchedulerBackend> KvReclaim for SchedReclaim<'_, B> {
             .inner
             .paged_adapter()
             .map_or(0, PagedKVCacheAdapter::last_grow_room)
-    }
-
-    fn before_count(&mut self, at_cap: bool) {
-        if !at_cap {
-            self.state.inner.park_idle_live_state();
-        }
     }
 
     fn sync_marks(&mut self) {
@@ -5601,54 +5593,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// Swaps `inner`'s paged adapter for the growable fixture, makes the
-    /// headroom probe decline its first call only, and reserves one block
-    /// past the free pool with no live turns. Returns whether admission
-    /// admitted, the pool's blocks after, and `inner`.
-    pub(crate) fn reserve_past_a_declined_grow<B: HybridSchedulerBackend>(
-        mut inner: B,
-    ) -> (bool, u32, B) {
-        let recency = inner.paged_adapter().map_or_else(
-            || Arc::new(mlx_paged_attn::CacheRecency::new()),
-            PagedKVCacheAdapter::recency,
-        );
-        let mut adapter = tiny_paged_adapter_with(recency, 4, 16);
-        let probes = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let calls = Arc::clone(&probes);
-        adapter.set_grow_headroom_probe_override(Some(Arc::new(move |requested| {
-            if calls.fetch_add(1, Ordering::Relaxed) == 0 {
-                Ok(4)
-            } else {
-                Ok(requested)
-            }
-        })));
-        *inner.paged_adapter_mut().expect("paged adapter") = adapter;
-        let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
-        let snapshot = state
-            .inner
-            .scheduler_cache_snapshot()
-            .expect("scheduler snapshot")
-            .expect("paged adapter present");
-        assert_eq!(snapshot.blocks.total_blocks, 4);
-        assert!(!state.scheduler.has_live_turns());
-        let charge = snapshot.blocks.free_blocks + 1;
-        let outcome = state
-            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
-            .expect("reserve");
-        let total = state
-            .inner
-            .scheduler_cache_snapshot()
-            .expect("post-reserve snapshot")
-            .expect("paged adapter present")
-            .blocks
-            .total_blocks;
-        (
-            matches!(outcome, MemoryReserveOutcome::Admitted),
-            total,
-            state.inner,
-        )
-    }
-
     #[test]
     fn declined_grow_preserves_no_live_turns_reject() {
         let Some((mut state, snapshot)) = growable_scheduler_state() else {
@@ -6092,34 +6036,6 @@ pub(crate) mod tests {
             "{outcome:?}"
         );
         assert!(!kept, "a whole-turn family must reclaim before it grows");
-    }
-
-    /// A refused grow before the idle owner is reclaimed frees nothing
-    /// beside the pool: the idle owner's in-pool blocks admit the turn, and
-    /// the live and parked DFlash2 states stay. Mutation: grow through
-    /// `try_grow_pool_by` before `reclaim_one_idle_scheduled_with` in
-    /// `try_reserve_with_policy` → red (the states are evicted, 0 ≠ 2).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn refused_grow_reclaims_the_idle_owner_before_any_dflash2_state() {
-        let Some(mut state) = qwen35_state_with_parked_dflash2_states(3) else {
-            return;
-        };
-        let _no_compaction = no_compaction_headroom();
-        assert_eq!(parked_dflash2_states(&state.inner), 2);
-        let evictions = pool_grow_evictions();
-        let (outcome, kept) = reserve_beside_an_idle_owner(&mut state, Arc::new(|_| Ok(0)));
-        assert!(
-            matches!(outcome, MemoryReserveOutcome::Admitted),
-            "{outcome:?}"
-        );
-        assert!(!kept, "the idle owner's blocks admit the turn");
-        assert_eq!(pool_grow_evictions(), evictions);
-        assert_eq!(parked_dflash2_states(&state.inner), 2);
-        assert!(
-            state.inner.dflash2_context.is_some(),
-            "the live state stays live"
-        );
     }
 
     /// A running MTP turn decoded to 40,000 tokens holds draft K/V far past
@@ -6954,21 +6870,33 @@ pub(crate) mod tests {
         assert_eq!(state.inner.scheduled_recurrent_bytes(), recurrent);
     }
 
-    /// Every non-DFlash2 turn takes the pool lane's one window: the plan
-    /// prices the MTP state into that lane, so an MTP turn, an AR turn, the
-    /// limits the model reports and the window it publishes agree. On a
-    /// 64-block pool of 2 MiB blocks in the 27B's bf16 pages (two 64 MiB
-    /// extents, 2,041 rows after the scratch).
+    /// Every turn takes the pool lane's one window: the plan prices the MTP
+    /// state and the DFlash2 state into that lane, so an MTP turn, an AR
+    /// turn, a DFlash2 turn, the limits the model reports and the window it
+    /// publishes agree. On a 64-block pool of 2 MiB blocks in the 27B's bf16
+    /// pages (two 64 MiB extents, 2,041 rows after the scratch). A DFlash2
+    /// turn one token past the window fails before it books a block.
     /// Mutation O2: the dense `planned_turn_window` prices the held draft
     /// state on top of the pool window for a speculative turn → red
-    /// (mtp < ar).
+    /// (mtp < ar). Mutation O3: the DFlash2 arm of `run_paged_turn` skips
+    /// `preflight_paged_context` → red (the prompt reaches the prime).
     #[test]
-    fn every_non_dflash2_turn_takes_the_pool_window() {
+    fn every_turn_takes_the_pool_window() {
+        use crate::engine::backend::{ChatBackend, WholeTurnArgs};
+        use crate::engine::plan::{
+            DecoderPlan, MediaCapabilities, MediaInputs, SpeculativeKind, TurnPlan,
+        };
         let Some((mut state, _)) = growable_qwen35_state() else {
             return;
         };
         state.inner.config.n_mtp_layers = 1;
         state.inner.config.max_position_embeddings = 4_096;
+        state.inner.dflash2 = Some(
+            crate::models::qwen3_5::dflash2::tiny_dflash2_model_for_stepper_test(
+                &state.inner.config,
+            )
+            .expect("tiny DFlash2 companion"),
+        );
         state.inner.memory_plan = Some(crate::engine::memory_plan::MemoryPlan::with_pool_window(
             64,
             2 << 20,
@@ -6986,6 +6914,57 @@ pub(crate) mod tests {
                 .context_limits_snapshot()
                 .effective_window_tokens,
             ar
+        );
+
+        let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
+        let tokens: Vec<u32> = (0..=ar).map(|i| i % 15 + 1).collect();
+        let config = crate::engine::types::ChatConfig {
+            temperature: Some(0.0),
+            max_new_tokens: Some(2),
+            ..Default::default()
+        };
+        let params = ChatBackend::resolve_params(&state.inner, &config);
+        let thinking = ChatBackend::thinking_setup(&state.inner, &config);
+        let mut args = WholeTurnArgs {
+            tokens: &tokens,
+            tokenizer: &tokenizer,
+            eos_id: u32::MAX,
+            config: &config,
+            params: &params,
+            thinking,
+            plan: TurnPlan {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                use_paged_attention: true,
+                decoder: DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+            },
+            sink: None,
+            cancelled: None,
+            media: MediaInputs {
+                images: &[],
+                audio: &[],
+            },
+        };
+        let err = match ChatBackend::run_paged_turn(&mut state.inner, &mut args) {
+            Ok(_) => panic!("a DFlash2 prompt past the window must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.reason.contains("context_length_exceeded")
+                && err
+                    .reason
+                    .contains(&format!("effective active context is {ar} tokens")),
+            "{}",
+            err.reason
+        );
+        let adapter = state.inner.paged_adapter.as_ref().expect("pool");
+        assert_eq!(adapter.current_token_count(), 0);
+        assert!(
+            adapter
+                .block_table()
+                .is_none_or(|table| table.num_blocks() == 0),
+            "no block booked"
         );
     }
 
@@ -7266,83 +7245,6 @@ pub(crate) mod tests {
         assert!(!state.reclaim_for_blocked_step(2, false, None));
     }
 
-    /// Qwen3.5 scheduler over the growable pool fixture (4 live blocks, 16
-    /// max, a passing grow probe) with one parked DFlash2 state; `None`
-    /// without Metal.
-    fn qwen35_state_with_a_parked_dflash2_state() -> Option<HybridSchedulerState<Qwen35Inner>> {
-        qwen35_state_with_parked_dflash2_states(2)
-    }
-
-    /// The growable fixture after `turns` DFlash2 turns of distinct prompts:
-    /// `turns - 1` parked states and the last one live.
-    fn qwen35_state_with_parked_dflash2_states(
-        turns: u32,
-    ) -> Option<HybridSchedulerState<Qwen35Inner>> {
-        qwen35_dflash2_state(turns, 4, 16)
-    }
-
-    /// [`qwen35_state_with_parked_dflash2_states`] over an `initial`-block
-    /// pool growing to `max`.
-    fn qwen35_dflash2_state(
-        turns: u32,
-        initial: u32,
-        max: u32,
-    ) -> Option<HybridSchedulerState<Qwen35Inner>> {
-        use crate::models::qwen3_5::dflash2_decode::tests::{
-            metal_is_default_device, run_tiny_dflash_turn, tiny_int8_dflash_inner,
-        };
-        if !metal_is_default_device() {
-            return None;
-        }
-        let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
-        let mut inner = tiny_int8_dflash_inner(0xDFA5_1702);
-        for seed in 4..4 + turns {
-            let body: Vec<u32> = (0..40).map(|i| (seed + i * 7) % 9 + 1).collect();
-            run_tiny_dflash_turn(&mut inner, &tokenizer, &body, true, 12)
-                .expect("tiny DFlash2 turn");
-        }
-        assert_eq!(parked_dflash2_states(&inner), turns as usize - 1);
-        inner.paged_adapter = Some(tiny_paged_adapter_with(
-            Arc::clone(&inner.cache_recency),
-            initial,
-            max,
-        ));
-        let mut state = HybridSchedulerState::new(inner).expect("construct Qwen3.5 scheduler");
-        state
-            .inner
-            .paged_adapter_mut()
-            .expect("paged adapter")
-            .set_grow_headroom_probe_override(Some(Arc::new(Ok)));
-        Some(state)
-    }
-
-    /// Zero live headroom on this thread until dropped, so a store step
-    /// drops a state instead of compacting one.
-    struct NoCompactionHeadroom;
-    impl Drop for NoCompactionHeadroom {
-        fn drop(&mut self) {
-            crate::models::qwen3_5::dflash2_turn::KV_BUDGET_OVERRIDE
-                .with(|budget| budget.set(None));
-        }
-    }
-    fn no_compaction_headroom() -> NoCompactionHeadroom {
-        crate::models::qwen3_5::dflash2_turn::KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(0)));
-        NoCompactionHeadroom
-    }
-
-    fn pool_grow_evictions() -> usize {
-        crate::models::qwen3_5::dflash2_turn::grow_reclaim_log().len()
-    }
-
-    fn parked_dflash2_states(inner: &Qwen35Inner) -> usize {
-        inner.dflash2_states.store.bytes().entries
-    }
-
-    fn parked_bytes(state: &HybridSchedulerState<Qwen35Inner>) -> u64 {
-        let bytes = state.inner.dflash2_states.store.bytes();
-        bytes.kv_bytes + bytes.state_bytes
-    }
-
     fn bytes_per_block(state: &HybridSchedulerState<Qwen35Inner>) -> u64 {
         state
             .inner
@@ -7382,98 +7284,6 @@ pub(crate) mod tests {
             .expect("adapter")
             .blocks
             .total_blocks
-    }
-
-    /// A blocked step at the max pool evicts no parked DFlash2 state: no
-    /// grow can use the freed memory, and the state sits on no block.
-    /// Mutation: park the live state at the cap too (drop `!at_cap` in
-    /// `SchedReclaim::before_count`) → red (the live state parks).
-    #[test]
-    fn blocked_step_at_the_max_pool_keeps_parked_dflash2_states() {
-        let Some(mut state) = qwen35_state_with_a_parked_dflash2_state() else {
-            return;
-        };
-        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
-        while adapter.try_grow_pool(16) {}
-        adapter.refuse_for_test(2, 17);
-        assert_eq!(pool_total_blocks(&state), 16);
-        assert!(!state.reclaim_for_blocked_step(2, false, None));
-        assert!(
-            state.inner.dflash2_context.is_some(),
-            "the live state stays"
-        );
-        assert_eq!(parked_dflash2_states(&state.inner), 1);
-    }
-
-    /// A blocked step below the max pool parks the idle live DFlash2 state,
-    /// evicts one parked state, and grows as soon as the grow passes: the
-    /// other states stay.
-    /// Mutation: drop every parked state at once (`store.clear()` in place
-    /// of `apply_lossy` in `take_state_unit`) → red (0 ≠ 2).
-    /// Mutation: skip the park in `park_idle_live_state` → red (the live
-    /// context stays).
-    #[test]
-    fn blocked_scheduled_step_evicts_one_then_grows() {
-        let Some(mut state) = qwen35_state_with_parked_dflash2_states(3) else {
-            return;
-        };
-        let _no_compaction = no_compaction_headroom();
-        assert_eq!(parked_dflash2_states(&state.inner), 2);
-        assert!(parked_bytes(&state) >= bytes_per_block(&state));
-        let before = pool_total_blocks(&state);
-        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
-        adapter.set_grow_headroom_probe_override(Some(decline_until_taken(1)));
-        adapter.refuse_for_test(2, 5);
-        clear_reclaim_log();
-        let evictions = pool_grow_evictions();
-        assert!(state.reclaim_for_blocked_step(2, false, None));
-        assert_eq!(pool_grow_evictions() - evictions, 1);
-        assert!(pool_total_blocks(&state) > before);
-        assert!(
-            state.inner.dflash2_context.is_none(),
-            "the live state parked"
-        );
-        assert_eq!(parked_dflash2_states(&state.inner), 2);
-    }
-
-    /// A declined admission grow takes one unit at a time and stops at the
-    /// first grant: two declines cost the live state's park plus two parked
-    /// states, and one stays.
-    /// Mutation: re-check the need only once nothing is left in
-    /// `free_for_kv` → red (0 ≠ 1).
-    /// Mutation: drop every parked state at once (`store.clear()` in place
-    /// of `apply_lossy` in `take_state_unit`) → red (0 ≠ 1).
-    #[test]
-    fn admission_grow_evicts_one_per_retry() {
-        use std::sync::atomic::AtomicUsize;
-        let Some(mut state) = qwen35_state_with_parked_dflash2_states(3) else {
-            return;
-        };
-        let _no_compaction = no_compaction_headroom();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let probe_calls = Arc::clone(&calls);
-        state
-            .inner
-            .paged_adapter_mut()
-            .expect("paged adapter")
-            .set_grow_headroom_probe_override(Some(Arc::new(move |blocks| {
-                Ok(if probe_calls.fetch_add(1, Ordering::SeqCst) < 2 {
-                    0
-                } else {
-                    blocks
-                })
-            })));
-        assert!(parked_bytes(&state) >= 4 * bytes_per_block(&state));
-        clear_reclaim_log();
-        let evictions = pool_grow_evictions();
-        let grown = state
-            .try_grow_pool_by(4, &mut MetBefore::default())
-            .expect("grow")
-            .expect("the third grow passes");
-        assert!(grown.blocks.total_blocks > 4);
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
-        assert_eq!(pool_grow_evictions() - evictions, 2);
-        assert_eq!(parked_dflash2_states(&state.inner), 1);
     }
 
     // ---- take order (`crate::engine::reclaim`) on the scheduled lane ----
@@ -7576,43 +7386,6 @@ pub(crate) mod tests {
         state.inner.ladder_entries_for_test().len()
     }
 
-    /// A real KV refusal goes to the older of an idle owner and a parked
-    /// state, by their own stamps.
-    /// Mutations: offer owners before states always → red (case b); states
-    /// before owners always → red (case a).
-    #[test]
-    fn kv_denial_takes_the_older_of_an_idle_owner_and_a_state() {
-        for owner_older in [true, false] {
-            let Some(mut state) = qwen35_dflash2_state(2, 4, 16) else {
-                return;
-            };
-            let _no_compaction = no_compaction_headroom();
-            state
-                .inner
-                .paged_adapter_mut()
-                .expect("paged adapter")
-                .set_grow_headroom_probe_override(Some(decline_until_taken(1)));
-            state.owner_sequences.insert("idle".into(), 1);
-            hold(&mut state, 1, 2);
-            state
-                .owner_last_used
-                .insert(1, if owner_older { 0 } else { u64::MAX });
-            refused(&mut state, 9, 0, 3);
-            clear_reclaim_log();
-            assert!(
-                state.reclaim_for_blocked_step(9, false, None),
-                "owner older {owner_older}"
-            );
-            if owner_older {
-                assert!(!table_of(&state, 1));
-                assert!(reclaim_log().is_empty());
-            } else {
-                assert!(table_of(&state, 1));
-                assert_eq!(reclaim_log(), vec![GrowReclaim::Store]);
-            }
-        }
-    }
-
     /// An idle owner whose table frees no block (the blocked turn holds its
     /// chain too) is passed over though it is older.
     /// Mutation: drop the "frees something" filter in `oldest_idle_owner` →
@@ -7708,45 +7481,6 @@ pub(crate) mod tests {
                 .takeable_blocks(),
             4
         );
-    }
-
-    /// An idle table the scheduler never finished goes by its turn-end
-    /// stamp, newer than the parked state, so the state goes first.
-    /// Mutation: stamp an owner with no `owner_last_used` entry 0 in
-    /// `oldest_idle_owner` → red (the table is released).
-    #[test]
-    fn an_unfinished_idle_table_goes_by_its_turn_end_stamp() {
-        let Some(mut state) = qwen35_dflash2_state(2, 4, 16) else {
-            return;
-        };
-        let _no_compaction = no_compaction_headroom();
-        state
-            .inner
-            .paged_adapter_mut()
-            .expect("paged adapter")
-            .set_grow_headroom_probe_override(Some(decline_until_taken(1)));
-        state.owner_sequences.insert("idle".into(), 1);
-        hold(&mut state, 1, 2);
-        state
-            .inner
-            .paged_adapter_mut()
-            .expect("paged adapter")
-            .finalize_turn_keep_live_no_prefix()
-            .expect("keep the table");
-        assert!(
-            state
-                .inner
-                .paged_adapter()
-                .expect("paged adapter")
-                .turn_end_stamp(1)
-                .is_some()
-        );
-        assert!(!state.owner_last_used.contains_key(&1));
-        refused(&mut state, 9, 0, 3);
-        clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(9, false, None));
-        assert!(table_of(&state, 1));
-        assert_eq!(reclaim_log(), vec![GrowReclaim::Store]);
     }
 
     /// A finished owned turn records its table's turn-end stamp for its
@@ -7845,78 +7579,6 @@ pub(crate) mod tests {
         assert!(table_of(&state, 1));
     }
 
-    /// An admission grow at the cap takes the ladder rung, which frees
-    /// blocks, and passes over the older parked state, which frees none.
-    /// Mutation: drop the at-cap store skip in `oldest_state_unit` → red
-    /// (`[Store, Ladder]`).
-    #[test]
-    fn admission_grow_at_the_cap_skips_older_store_states() {
-        let Some(mut state) = qwen35_dflash2_state(2, 4, 4) else {
-            return;
-        };
-        let stamp = state.inner.cache_recency.next();
-        rung(&mut state, 4, 2, stamp);
-        clear_reclaim_log();
-        let grown = state
-            .try_grow_pool_by(1, &mut MetBefore::default())
-            .expect("grow");
-        assert!(grown.is_some());
-        assert_eq!(reclaim_log(), vec![GrowReclaim::Ladder]);
-        assert_eq!(parked_dflash2_states(&state.inner), 1);
-    }
-
-    /// A reservation or a draft fit refused outside the step leaves no
-    /// refusal for the step's reclaim.
-    /// Mutation: drop `clear_refusals` from `begin_scheduled_step`, or
-    /// leave the draft map in `clear_refusals` → red (the rung is dropped).
-    #[test]
-    fn a_failed_reserve_outside_the_step_leaves_no_refusal() {
-        let Some(mut state) = qwen35_dflash2_state(2, 4, 4) else {
-            return;
-        };
-        rung(&mut state, 5, 2, 0);
-        hold(&mut state, 9, 2);
-        refused(&mut state, 9, 2, 1);
-        state
-            .inner
-            .paged_adapter()
-            .expect("paged adapter")
-            .refuse_draft(
-                9,
-                DraftRefusal {
-                    bytes: 1,
-                    queries: 4,
-                },
-            );
-        state.begin_scheduled_step();
-        assert!(!state.reclaim_for_blocked_step(9, false, None));
-        assert_eq!(rungs(&state), 1);
-    }
-
-    /// Below the cap with every grow declined, dropping the oldest rung
-    /// makes its chain takeable: the need is met, the newer state stays.
-    /// Mutation: read takeable blocks as free plus reusable (marked chains
-    /// in) in `kv_need_met` → red (the store state goes too).
-    #[test]
-    fn kv_denial_counts_a_freed_ladder_chain_as_progress() {
-        let Some(mut state) = qwen35_dflash2_state(2, 4, 16) else {
-            return;
-        };
-        let _no_compaction = no_compaction_headroom();
-        state
-            .inner
-            .paged_adapter_mut()
-            .expect("paged adapter")
-            .set_grow_headroom_probe_override(Some(Arc::new(|_| Ok(4))));
-        rung(&mut state, 6, 2, 0);
-        hold(&mut state, 9, 2);
-        refused(&mut state, 9, 2, 1);
-        clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(9, false, None));
-        assert_eq!(reclaim_log(), vec![GrowReclaim::Ladder]);
-        assert_eq!(parked_dflash2_states(&state.inner), 2);
-    }
-
     /// A decode wave at the cap records each row's own need, so the gate
     /// sees the wave's sum. Row 2, the one other table, shares its block
     /// with the blocked row 1, so no idle owner frees a block.
@@ -7965,120 +7627,6 @@ pub(crate) mod tests {
         assert!(wave(&mut state).is_err());
         assert!(!state.reclaim_for_blocked_step(1, false, None));
         assert_eq!(rungs(&state), 1);
-    }
-
-    /// A lone turn whose need no take covers keeps every cache: the count
-    /// stops it after one cache clear.
-    /// Mutations: drop the count in `free_for_kv` → red (the store
-    /// empties); clear the cache only after the count → red (+0).
-    #[test]
-    fn doomed_lone_turn_keeps_the_cache() {
-        let Some(mut state) = qwen35_dflash2_state(2, 4, 16) else {
-            return;
-        };
-        let _no_compaction = no_compaction_headroom();
-        state
-            .inner
-            .paged_adapter_mut()
-            .expect("paged adapter")
-            .set_grow_headroom_probe_override(Some(Arc::new(|_| Ok(4))));
-        let dead = tokens_of(10, 1);
-        cache_dead_chain(&state, &dead);
-        let adapter = state.inner.paged_adapter().expect("paged adapter");
-        let need = adapter.takeable_blocks() + adapter.ungrown_blocks() + 1;
-        adapter.refuse_for_test(9, need);
-        let clears = crate::array::memory::TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get);
-        state.handle_blocked_alone(9);
-        assert_eq!(
-            crate::array::memory::TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get) - clears,
-            1
-        );
-        assert_eq!(parked_dflash2_states(&state.inner), 2);
-        let adapter = state.inner.paged_adapter().expect("paged adapter");
-        let mut allocator = adapter.allocator().lock().expect("allocator");
-        let (hit, cached) = allocator.find_longest_cache_hit(&dead, 16, &[], 0);
-        assert_eq!(cached, 16);
-        for block in hit {
-            allocator.free(block);
-        }
-    }
-
-    /// A need one state covers takes one state.
-    /// Mutation: re-check the need only once nothing is left in
-    /// `free_for_kv` → red (`[Store, Store]`).
-    #[test]
-    fn covered_need_stops_when_covered() {
-        let Some(mut state) = qwen35_dflash2_state(2, 4, 16) else {
-            return;
-        };
-        let _no_compaction = no_compaction_headroom();
-        assert!(parked_bytes(&state) >= bytes_per_block(&state));
-        state
-            .inner
-            .paged_adapter_mut()
-            .expect("paged adapter")
-            .set_grow_headroom_probe_override(Some(decline_until_taken(1)));
-        hold(&mut state, 9, 4);
-        refused(&mut state, 9, 4, 1);
-        clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(9, false, None));
-        assert_eq!(reclaim_log(), vec![GrowReclaim::Store]);
-        assert_eq!(parked_dflash2_states(&state.inner), 1);
-    }
-
-    /// An admission grow no take could cover takes nothing.
-    /// Mutation: drop the count in `free_for_kv` → red (0 entries).
-    #[test]
-    fn admission_grow_takes_nothing_it_cannot_cover() {
-        let Some(mut state) = qwen35_dflash2_state(2, 4, 16) else {
-            return;
-        };
-        let _no_compaction = no_compaction_headroom();
-        state
-            .inner
-            .paged_adapter_mut()
-            .expect("paged adapter")
-            .set_grow_headroom_probe_override(Some(Arc::new(|_| Ok(4))));
-        let needed = state
-            .inner
-            .paged_adapter()
-            .expect("paged adapter")
-            .ungrown_blocks()
-            + 1;
-        let grown = state
-            .try_grow_pool_by(needed, &mut MetBefore::default())
-            .expect("grow");
-        assert!(grown.is_none());
-        assert_eq!(parked_dflash2_states(&state.inner), 2);
-    }
-
-    /// A need a finished turn's released table already covers is met in
-    /// place: nothing is taken.
-    /// Mutation: drop the met check in `free_for_kv` → red (one `Store`).
-    #[test]
-    fn met_need_takes_nothing() {
-        let Some(mut state) = qwen35_dflash2_state(2, 4, 16) else {
-            return;
-        };
-        let _no_compaction = no_compaction_headroom();
-        state
-            .inner
-            .paged_adapter_mut()
-            .expect("paged adapter")
-            .set_grow_headroom_probe_override(Some(Arc::new(|_| Ok(4))));
-        hold(&mut state, 1, 2);
-        hold(&mut state, 2, 2);
-        refused(&mut state, 2, 2, 2);
-        state
-            .inner
-            .paged_adapter_mut()
-            .expect("paged adapter")
-            .release_request_for(1)
-            .expect("the finished turn's table");
-        clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(2, false, None));
-        assert!(reclaim_log().is_empty());
-        assert_eq!(parked_dflash2_states(&state.inner), 1);
     }
 
     /// A lone admission at the cap whose only takeable blocks are a ladder

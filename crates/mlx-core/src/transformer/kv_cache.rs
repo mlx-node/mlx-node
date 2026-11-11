@@ -74,6 +74,7 @@ pub(crate) enum KvBlock {
     /// BF16 `[B, H, T, D]` rows (any strides).
     Bf16 { keys: MxArray, values: MxArray },
     /// Quantized rows plus scales.
+    #[cfg_attr(not(test), expect(dead_code))]
     Int8(Int8KvRows),
 }
 
@@ -388,55 +389,6 @@ impl KVCache {
         self.adopt_store(&out[..plan.dst.len()], plan.seq_len)
     }
 
-    /// [`Self::store_block`] for several caches at once: every block of every
-    /// cache lands in ONE store dispatch (the Metal primitive reads the
-    /// buffers through an address table). Falls back to per-cache stores
-    /// when the batched primitive declines (no residency sets, no Metal).
-    pub(crate) fn store_blocks(entries: &mut [(&mut KVCache, KvBlock)]) -> Result<()> {
-        if entries.len() <= 1 {
-            for (cache, block) in entries.iter_mut() {
-                cache.store_block(block)?;
-            }
-            return Ok(());
-        }
-        let mut plans = Vec::with_capacity(entries.len());
-        for (cache, block) in entries.iter_mut() {
-            plans.push(cache.plan_store(block)?);
-        }
-        let mut dst = Vec::new();
-        let mut src = Vec::new();
-        let mut offsets = Vec::new();
-        for plan in &plans {
-            dst.extend_from_slice(&plan.dst);
-            src.extend_from_slice(&plan.src);
-            offsets.extend(std::iter::repeat_n(plan.offset, plan.dst.len()));
-        }
-        let mut out: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); dst.len()];
-        // SAFETY: as in `store_block`; `out` receives one owned handle per
-        // `dst` entry or stays null.
-        let ok = unsafe {
-            mlx_sys::mlx_kv_store_rows(
-                dst.len() as i32,
-                dst.as_ptr(),
-                src.as_ptr(),
-                offsets.as_ptr(),
-                out.as_mut_ptr(),
-            )
-        };
-        if !ok {
-            for (cache, block) in entries.iter_mut() {
-                cache.store_block(block)?;
-            }
-            return Ok(());
-        }
-        let mut cursor = 0;
-        for ((cache, _), plan) in entries.iter_mut().zip(&plans) {
-            cache.adopt_store(&out[cursor..cursor + plan.dst.len()], plan.seq_len)?;
-            cursor += plan.dst.len();
-        }
-        Ok(())
-    }
-
     /// Grow for `block` and gather the store's (cache, rows) handle pairs:
     /// K, V and, for int8, their scales. The pointers stay valid while the
     /// cache and block are untouched.
@@ -655,31 +607,6 @@ impl KVCache {
     /// allocation).
     pub(crate) fn capacity(&self) -> Result<i64> {
         self.keys.as_ref().map_or(Ok(0), |keys| keys.shape_at(2))
-    }
-
-    /// Rows the cache holds without growing: its capacity, or before the
-    /// first allocation the rows that allocation is sized for.
-    pub(crate) fn reserved_rows(&self) -> Result<i64> {
-        Ok(self.capacity()?.max(self.pending_rows))
-    }
-
-    /// Make the cache hold exactly `rows` rows when it holds fewer, with no
-    /// step rounding. An empty cache only records the size for its first
-    /// allocation; a live cache is [`Self::compact`]ed into the larger buffer.
-    pub(crate) fn grow_exact(&mut self, rows: i64) -> Result<()> {
-        if rows > i64::from(i32::MAX) {
-            return Err(Error::from_reason(format!(
-                "KV cache reservation of {rows} rows is too large"
-            )));
-        }
-        if self.reserved_rows()? >= rows {
-            return Ok(());
-        }
-        if self.keys.is_none() {
-            self.pending_rows = rows;
-            return Ok(());
-        }
-        self.compact(rows)
     }
 
     /// Copy rows `[0:offset]` into fresh, evaluated buffers of `capacity`
@@ -1057,114 +984,6 @@ mod tests {
             &after.slice_axis(2, 20, 28).unwrap(),
             &block.keys
         ));
-    }
-
-    /// Sixteen layers' blocks stored by ONE batched dispatch leave every
-    /// cache byte-identical (buffers, offsets, capacities) to sixteen
-    /// single-layer stores — BF16 and int8, with the verify's transposed
-    /// values view, differing per-cache offsets and a growth boundary.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn store_blocks_matches_single_layer_stores() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
-            return;
-        }
-        let (b, h, d, layers) = (1i64, 2i64, 256i64, 16usize);
-        for format in [KvFormat::Bf16, KvFormat::Int8] {
-            let make = |t: i64| {
-                let keys = rand_bf16(&[b, h, t, d]);
-                let values = rand_bf16(&[b, t, h, d])
-                    .transpose(Some(&[0, 2, 1, 3]))
-                    .unwrap();
-                match format {
-                    KvFormat::Bf16 => KvBlock::Bf16 { keys, values },
-                    KvFormat::Int8 => KvBlock::Int8(Int8KvRows::quantize(&keys, &values).unwrap()),
-                }
-            };
-            let clone_block = |block: &KvBlock| match block {
-                KvBlock::Bf16 { keys, values } => KvBlock::Bf16 {
-                    keys: keys.clone(),
-                    values: values.clone(),
-                },
-                KvBlock::Int8(rows) => KvBlock::Int8(rows.clone()),
-            };
-            let mut single: Vec<KVCache> =
-                (0..layers).map(|_| KVCache::with_format(format)).collect();
-            let mut batched: Vec<KVCache> =
-                (0..layers).map(|_| KVCache::with_format(format)).collect();
-            // Prefill lengths differ per layer so the offsets differ; the
-            // third block crosses a 256-row step for the longer caches.
-            for (step, trim_to) in [(0i64, None), (8, Some(3)), (8, None), (8, None)] {
-                let mut entries = Vec::with_capacity(layers);
-                for (layer, cache) in batched.iter_mut().enumerate() {
-                    let rows = if step == 0 { 240 + layer as i64 } else { step };
-                    let block = make(rows);
-                    single[layer].store_block(&clone_block(&block)).unwrap();
-                    entries.push((cache, block));
-                }
-                if step > 0 {
-                    unsafe { mlx_sys::mlx_test_kquant_counting(true) };
-                }
-                KVCache::store_blocks(&mut entries).unwrap();
-                for cache in &batched {
-                    let mut arrays = Vec::new();
-                    arrays.extend(cache.keys_ref());
-                    arrays.extend(cache.values_ref());
-                    arrays.extend(cache.key_scales_ref());
-                    arrays.extend(cache.value_scales_ref());
-                    MxArray::eval_arrays(&arrays).unwrap();
-                }
-                if step > 0 {
-                    let stores =
-                        unsafe { mlx_sys::mlx_test_kquant_family_count(c"kv_store_rows".as_ptr()) };
-                    unsafe { mlx_sys::mlx_test_kquant_counting(false) };
-                    // One table dispatch where residency sets exist; otherwise
-                    // the per-layer fallback.
-                    let expected = if unsafe { mlx_sys::mlx_kv_store_batched_available() } {
-                        1
-                    } else {
-                        layers as u64
-                    };
-                    assert_eq!(
-                        stores, expected,
-                        "{format:?}: KvStoreRows dispatches for all layers"
-                    );
-                }
-                if let Some(back) = trim_to {
-                    for (s, bt) in single.iter_mut().zip(batched.iter_mut()) {
-                        s.trim(s.get_offset() - back);
-                        bt.trim(bt.get_offset() - back);
-                    }
-                }
-            }
-            for (layer, (s, bt)) in single.iter().zip(&batched).enumerate() {
-                assert_eq!(
-                    s.get_offset(),
-                    bt.get_offset(),
-                    "{format:?} layer {layer} offset"
-                );
-                assert_eq!(
-                    s.capacity().unwrap(),
-                    bt.capacity().unwrap(),
-                    "{format:?} layer {layer} capacity"
-                );
-                let pairs = [
-                    (s.keys_ref(), bt.keys_ref()),
-                    (s.values_ref(), bt.values_ref()),
-                    (s.key_scales_ref(), bt.key_scales_ref()),
-                    (s.value_scales_ref(), bt.value_scales_ref()),
-                ];
-                for (i, (r, f)) in pairs.into_iter().enumerate() {
-                    match (r, f) {
-                        (Some(r), Some(f)) => {
-                            assert!(bits_equal(r, f), "{format:?} layer {layer} buffer {i}")
-                        }
-                        (None, None) => {}
-                        _ => panic!("{format:?} layer {layer} buffer {i} presence differs"),
-                    }
-                }
-            }
-        }
     }
 
     #[test]
@@ -1774,47 +1593,6 @@ mod tests {
         assert_eq!(cache.get_offset(), 0);
         assert!(cache.int8_view().is_none());
         assert!(cache.key_scales_ref().is_none());
-    }
-
-    /// `grow_exact` sizes an int8 cache to exactly a capacity that is not
-    /// step-aligned, cold or live at an unaligned frontier, keeps the used
-    /// rows and scales bit for bit, and appends up to that capacity never
-    /// grow it. Mutation: call `self.reserve(rows)` instead of
-    /// `self.compact(rows)` / setting `pending_rows` in `grow_exact` → red
-    /// (capacity 1280 ≠ 1031).
-    #[test]
-    fn grow_exact_holds_the_cap() {
-        if !metal() {
-            return;
-        }
-        const CAP: i64 = 1031;
-        let mut cold = KVCache::with_format(KvFormat::Int8);
-        cold.grow_exact(CAP).unwrap();
-        assert_eq!(cold.reserved_rows().unwrap(), CAP);
-        let (k, v) = rows256(4, 9, 1.5);
-        cold.update_and_fetch_int8(&k, &v).unwrap();
-        assert_eq!(cold.capacity().unwrap(), CAP);
-
-        let mut live = KVCache::with_format(KvFormat::Int8);
-        let (k, v) = rows256(4, 257, 2.5);
-        live.update_and_fetch_int8(&k, &v).unwrap();
-        assert_eq!(live.capacity().unwrap(), 512);
-        let expected = live.int8_view().unwrap();
-        live.grow_exact(CAP).unwrap();
-        assert_eq!(live.capacity().unwrap(), CAP);
-        assert_eq!(live.get_offset(), 257);
-        let after = live.int8_view().unwrap();
-        assert_eq!(bits(&after.keys), bits(&expected.keys));
-        assert_eq!(bits(&after.values), bits(&expected.values));
-        assert_eq!(bits(&after.key_scales), bits(&expected.key_scales));
-        assert_eq!(bits(&after.value_scales), bits(&expected.value_scales));
-        while i64::from(live.get_offset()) + 8 <= CAP {
-            let (k, v) = rows256(4, 8, 0.5);
-            live.update_and_fetch_int8(&k, &v).unwrap();
-            assert_eq!(live.capacity().unwrap(), CAP);
-        }
-        live.grow_exact(CAP - 1).unwrap();
-        assert_eq!(live.capacity().unwrap(), CAP, "never shrinks");
     }
 
     /// Growth across the step boundary without a reservation concatenates

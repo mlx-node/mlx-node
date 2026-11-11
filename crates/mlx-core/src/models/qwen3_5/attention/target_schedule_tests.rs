@@ -1,7 +1,7 @@
 //! Independent experiments: exact grid permutation, 512-key split policy,
 //! and the separately prepared source-style 256-thread partial reducer.
 use super::*;
-use crate::array::kv_int8::segmented_sdpa_int8_with_route;
+use crate::array::kv_int8::{Int8KvRows, segmented_sdpa_int8_with_route};
 use crate::compiled_graph::{erase_compiled_graphs_matching, invoke_compiled_graph};
 
 const FLAT: &str = "MLX_SEGMENTED_NAX_FLAT_GRID";

@@ -5,28 +5,11 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::transformer::paged_kv_cache_adapter::SeqId;
 use napi::bindgen_prelude::*;
 
-use super::arrays_cache::ArraysCache;
-use super::attention::{AttentionVerifyIo, Qwen3_5Attention};
+use super::attention::Qwen3_5Attention;
 use super::config::Qwen3_5Config;
-use super::gated_delta_net::{GatedDeltaNet, GdnCapturePlan, GdnLayerCapture};
+use super::gated_delta_net::GatedDeltaNet;
 use super::layer_cache::Qwen3_5LayerCache;
 use crate::models::quantized_linear::{MLPVariant, QuantizedLinear};
-
-/// Per-layer cache IO for the compiled DFlash2 verify graph
-/// ([`DecoderLayer::forward_verify`]).
-///
-/// `Linear` is a detached `ArraysCache` seeded with the layer's live
-/// `(conv_state, recurrent_state)` inputs — the GDN forward writes its
-/// (dead) post-window states into it and the caller drops it; commit replays
-/// the accepted prefix from the pre-verify snapshot regardless of what the
-/// verify pass wrote.
-///
-/// `FullAttention` carries the prefix views, RoPE offsets and the new-K/V
-/// sink described by [`AttentionVerifyIo`].
-pub(crate) enum LayerVerifyIo<'a> {
-    Linear(&'a mut ArraysCache),
-    FullAttention(AttentionVerifyIo<'a>),
-}
 
 /// Per-layer routing kind for Qwen3.5's paged dispatch.
 ///
@@ -82,13 +65,6 @@ pub(crate) fn compute_layer_kinds(
         }
     }
     kinds
-}
-
-/// Input of [`DecoderLayer::forward_verify`]: the embedding, or the previous
-/// layer's residual and MLP delta (summed inside this layer's input norm).
-pub(crate) enum VerifyResidual<'a> {
-    Hidden(&'a MxArray),
-    Pending { h: &'a MxArray, delta: &'a MxArray },
 }
 
 /// A single decoder layer in the Qwen3.5 dense model.
@@ -227,73 +203,6 @@ impl DecoderLayer {
         // Residual + post-attention norm (fused add_rmsnorm when eligible)
         let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
         h.add(&self.mlp.forward(&normed)?)
-    }
-
-    /// Unmasked text-prefill forward ([`Self::forward`] with no mask or
-    /// M-RoPE positions) that also captures this layer's GDN state at every
-    /// row of `plan`. Full-attention layers capture nothing.
-    pub(crate) fn forward_captured(
-        &mut self,
-        x: &MxArray,
-        cache: Option<&mut Qwen3_5LayerCache>,
-        plan: &GdnCapturePlan<'_>,
-    ) -> Result<(MxArray, Vec<GdnLayerCapture>)> {
-        let normed = self.input_layernorm.forward(x)?;
-        let (attn_out, captured) = match &mut self.attn {
-            AttentionType::Linear(gdn) => {
-                let ac = cache.and_then(|c| c.as_arrays_cache_mut());
-                gdn.forward_captured(&normed, ac, true, None, plan)?
-            }
-            AttentionType::Full(attn) => {
-                let kvc = cache.and_then(|c| c.as_kv_cache_mut());
-                (attn.forward(&normed, None, kvc, None)?, Vec::new())
-            }
-        };
-        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
-        Ok((h.add(&self.mlp.forward(&normed)?)?, captured))
-    }
-
-    /// Compiled-verify forward for the DFlash2 flat-cache path — the same
-    /// pre-norm → attention → residual → norm → MLP → residual skeleton as
-    /// [`Self::forward_inner_with_tape`] under `mask = None`,
-    /// `position_ids = None`, but every cache interaction flows through `io`
-    /// (graph inputs in, graph outputs out) instead of mutating
-    /// `Qwen3_5LayerCache`. GDN layers still record their tape via
-    /// `tape_sink` — the tape fields become compiled-graph outputs upstream.
-    ///
-    /// Returns `(x, h, mlp_out)`: the materialized layer input, the
-    /// post-attention residual and the MLP delta. The layer output `h +
-    /// mlp_out` is left to the caller, which fuses it into the next norm.
-    pub(crate) fn forward_verify(
-        &mut self,
-        input: VerifyResidual<'_>,
-        io: &mut LayerVerifyIo<'_>,
-        use_kernel: bool,
-        tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
-    ) -> Result<(MxArray, MxArray, MxArray)> {
-        let (x, normed) = match input {
-            VerifyResidual::Hidden(x) => (x.clone(), self.input_layernorm.forward(x)?),
-            VerifyResidual::Pending { h, delta } => {
-                Self::add_residual_norm(&self.input_layernorm, h, delta)?
-            }
-        };
-        let attn_out = match (&mut self.attn, io) {
-            (AttentionType::Linear(gdn), LayerVerifyIo::Linear(ac)) => {
-                gdn.forward_with_tape(&normed, None, Some(&mut **ac), use_kernel, tape_sink)?
-            }
-            (AttentionType::Full(attn), LayerVerifyIo::FullAttention(aio)) => {
-                attn.forward_verify(&normed, aio)?
-            }
-            (AttentionType::Linear(_), _) | (AttentionType::Full(_), _) => {
-                return Err(Error::from_reason(
-                    "Qwen3.5 compiled verify: layer/cache io kind mismatch",
-                ));
-            }
-        };
-
-        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, &x, &attn_out)?;
-        let mlp_out = self.mlp.forward(&normed)?;
-        Ok((x, h, mlp_out))
     }
 
     /// Forward pass with paged-or-flat dispatch for Qwen3.5.

@@ -211,29 +211,19 @@ export interface SessionContextLimits {
   pagedBlockCapacity: number;
   pagedBlockSize: number;
   /**
-   * Window of a text turn that runs the model's draft-model speculative
-   * decoder. Turns with `enableMtp` off or with images in the history take
-   * the autoregressive or vision lane and stay on `effectiveWindowTokens`.
-   */
-  speculativeWindowTokens?: number | null;
-  /**
    * The output budget fills the window: a prompt must leave room for one new
    * token and `maxNewTokens` is clamped to `window - prompt`. Otherwise
    * `maxNewTokens` is clamped to `window - prompt + 1`. An omitted budget
-   * keeps the native default unless the chosen window's flag below is set.
+   * keeps the native default unless the flag below is set.
    */
   restOfWindowOutputBudget?: boolean;
   /** An omitted budget on `effectiveWindowTokens` is the rest of that window. */
   omittedBudgetIsRestOfWindow?: boolean;
-  /** An omitted budget on `speculativeWindowTokens` is the rest of that window. */
-  speculativeOmittedBudgetIsRestOfWindow?: boolean;
   /** Format of the K/V a turn on `effectiveWindowTokens` writes. */
   kvFormat?: 'int8' | 'bf16';
-  /** Format of the K/V a turn on `speculativeWindowTokens` writes. */
-  speculativeKvFormat?: 'int8' | 'bf16' | null;
 }
 
-/** The window, K/V format and omitted-budget rule of the lane one turn takes. */
+/** The window, K/V format and omitted-budget rule every turn takes. */
 export interface ContextLane {
   windowTokens: number;
   kvFormat?: 'int8' | 'bf16';
@@ -241,19 +231,10 @@ export interface ContextLane {
 }
 
 /**
- * The lane a turn takes: the speculative one only for a text turn with
- * `enableMtp` on and a published speculative window, matching the native
- * turn plan; every other turn takes the pool's.
+ * The one window every turn takes, speculative or not (Splash
+ * `EngineMemoryPlan` sizes one context).
  */
-export function contextLane(limits: SessionContextLimits, enableMtp: boolean, hasImages: boolean): ContextLane {
-  const speculativeWindow = limits.speculativeWindowTokens;
-  if (enableMtp && !hasImages && speculativeWindow != null) {
-    return {
-      windowTokens: speculativeWindow,
-      ...(limits.speculativeKvFormat != null ? { kvFormat: limits.speculativeKvFormat } : {}),
-      omittedBudgetIsRestOfWindow: limits.speculativeOmittedBudgetIsRestOfWindow === true,
-    };
-  }
+export function contextLane(limits: SessionContextLimits): ContextLane {
   return {
     windowTokens: limits.effectiveWindowTokens,
     ...(limits.kvFormat !== undefined ? { kvFormat: limits.kvFormat } : {}),
@@ -2054,11 +2035,10 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * both the tokenizer seam and a load-time context snapshot retain their
    * existing behavior.
    *
-   * The window is the speculative one only for a text turn with `enableMtp`
-   * on, matching the native turn plan; every other turn uses the pool's.
+   * Every turn takes the one window the model publishes.
    *
    * The output budget follows `restOfWindowOutputBudget`, and an omitted one
-   * the chosen window's omitted-budget flag. The returned
+   * the window's omitted-budget flag. The returned
    * config is a copy only when `maxNewTokens` or `thinkingTokenBudget` changes.
    */
   private async constrainToContextCapacity(messages: ChatMessage[], config: ChatConfig): Promise<ChatConfig> {
@@ -2066,9 +2046,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       return config;
     }
 
-    const hasImages = messages.some((message) => (message.images?.length ?? 0) > 0);
     const limits = this.model.contextLimits();
-    const lane = contextLane(limits, config.enableMtp === true, hasImages);
+    const lane = contextLane(limits);
     const omittedIsRestOfWindow = lane.omittedBudgetIsRestOfWindow;
     const capacity = Math.floor(lane.windowTokens);
     if (!Number.isSafeInteger(capacity) || capacity <= 0) {

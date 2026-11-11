@@ -49,13 +49,6 @@ pub(crate) struct GdnDestinations {
     pub conv: Vec<MxArray>,
 }
 
-/// All layers' prior tape plus a scalar constructed from a checked host count.
-/// Each input is explicit in the compiled verifier; no first-cycle count is captured.
-pub(crate) struct GdnDeferredInput<'a> {
-    pub tape: &'a [Option<GdnLayerTape>],
-    pub keep: &'a MxArray,
-}
-
 impl GdnStateBlobs {
     /// Pack every linear layer's `(conv_state, recurrent_state)` into blobs
     /// (one concat per kind: a per-turn cost, not a per-cycle one).
@@ -120,48 +113,6 @@ impl GdnStateBlobs {
             spare,
             destinations,
         }))
-    }
-
-    /// Fixed-width zero pending inputs for the first deferred cycle. The count
-    /// is zero, but every byte is initialized and every layer keeps normal shapes.
-    pub(crate) fn empty_deferred_tape(
-        &self,
-        layer_count: usize,
-    ) -> Result<Vec<Option<GdnLayerTape>>> {
-        use super::gated_delta::GdnKernelTape;
-        let mut tape = vec![None; layer_count];
-        let width = self.conv.shape_at(2)?;
-        let hv = self.recurrent.shape_at(1)?;
-        let dv = self.recurrent.shape_at(2)?;
-        let dk = self.recurrent.shape_at(3)?;
-        if dk != 128 || dv != 128 || width <= hv * dv || (width - hv * dv) % (2 * dk) != 0 {
-            return Err(Error::from_reason("deferred GDN geometry is unsupported"));
-        }
-        let hk = (width - hv * dv) / (2 * dk);
-        let k = MxArray::zeros(&[1, 8, hk, dk], Some(DType::BFloat16))?;
-        let v = MxArray::zeros(&[1, 8, hv, dv], Some(DType::BFloat16))?;
-        let g = MxArray::zeros(&[1, 8, hv], Some(DType::Float32))?;
-        let beta = MxArray::zeros(&[1, 8, hv], Some(DType::BFloat16))?;
-        let qkv = MxArray::zeros(&[1, 8, width], Some(DType::BFloat16))?;
-        for &layer in &self.layers {
-            let slot = tape
-                .get_mut(layer)
-                .ok_or_else(|| Error::from_reason("deferred GDN layer bounds"))?;
-            *slot = Some(GdnLayerTape {
-                kernel: GdnKernelTape {
-                    q: k.clone(),
-                    k: k.clone(),
-                    v: v.clone(),
-                    g: g.clone(),
-                    beta: beta.clone(),
-                },
-                qkv: qkv.clone(),
-                conv_kernel_dim: 4,
-                final_state: None,
-                final_conv: None,
-            });
-        }
-        Ok(tape)
     }
 
     pub(crate) fn destinations(&self) -> &GdnDestinations {

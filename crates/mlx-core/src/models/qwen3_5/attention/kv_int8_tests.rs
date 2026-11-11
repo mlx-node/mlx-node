@@ -678,8 +678,10 @@ fn int8_verify_chunks_bound_the_default_gqa() -> Result<()> {
     if !metal() {
         return Ok(());
     }
-    assert!(segmented_max_query_length(8)? >= 4);
-    assert!(segmented_max_query_length(16)? < 4);
+    // SAFETY: a pure query of the loaded metallib's pipeline limits.
+    let max_q = |gqa| unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(gqa) };
+    assert!(max_q(8) >= 4);
+    assert!(max_q(16) < 4);
     assert_eq!(
         KvFormat::default_for_geometry(256, 16, 2, DType::BFloat16),
         KvFormat::Int8,

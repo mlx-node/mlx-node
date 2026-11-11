@@ -28,11 +28,6 @@ fn source_mixer_hidden_is_normalized_once_without_second_residual() -> Result<()
     let (native, native_norm) = DecoderLayer::finish_mixer(&norm, &residual, delta, false)?;
     assert_eq!(bits(&native), bits(&hidden));
     assert_eq!(bits(&native_norm), bits(&normalized));
-    // The next FFN carrier and final norm preserve the one-add meaning.
-    let output = VerifyLayerOutput::Hidden(got);
-    let (tap, final_norm) = output.normalize(&norm)?;
-    assert_eq!(bits(&tap), bits(&hidden));
-    assert_eq!(bits(&final_norm), bits(&norm.forward(&hidden)?));
     Ok(())
 }
 

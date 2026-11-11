@@ -250,21 +250,22 @@ The checkpoint's block size 8 means one verified anchor plus seven proposals.
 Qwen DFlash2 always uses the checkpoint's full proposal width; `mtpDepth`
 does not override it. The final cycle still respects the remaining token budget.
 `mtpAdaptiveDepth` is also ignored for this companion. Native MTP and other
-draft families retain their own adaptive policies. The target verify path is flat because
-accepted-prefix rollback must restore both full-attention KV and Qwen3.8's GDN
-recurrent state; normal `enableMtp: false` requests may still use paged AR.
+draft families retain their own adaptive policies.
 An external DFlash2 companion takes precedence over an inline native MTP head.
 
-The two cache lanes are deliberately owner-isolated. vLLM gives the DFlash
-layers their own scheduler-managed KV groups and derives their physical slots
-from the target request's block tables. mlx-node's current DFlash verifier is
-flat, so it enforces the equivalent invariant with a lane barrier: entering
-paged AR invalidates retained DFlash context; returning to DFlash performs a
-cold full-prompt flat prefill and purges the live paged prefix. Warm DFlash
-continuation is allowed only when the exact retained token prefix, every flat
-full-attention frontier, and the draft-context frontier agree. Equal lengths
-alone are never a cache hit. This makes DFlash -> paged AR -> DFlash safe, but
-the second transition pays a reprefill; it is not a zero-copy cache conversion.
+DFlash2 runs on the block-paged KV pool, like Splash: the tapped prefill
+writes the prompt into the pool and books each chunk end; every cycle drafts
+seven proposals and verifies the anchor plus seven in one fixed 8-row graph
+on the pool (dense and MoE), then commits the kept rows and rolls the rest
+back without freeing a page. The GDN state of the kept prefix comes from the
+verify's spare cell on a full accept, else from the fused commit or a replay.
+The draft state (a second GDN cell and the draft's K/V ring) is priced into
+the one pool window, and every turn, DFlash2 or not, takes that window. A
+DFlash2 turn runs alone on the Barrier lane. An AR, image or MTP turn drops
+the live draft window, and a prefix hit without it prefills the draft context
+from 0: parked DFlash2 states have no store on the pool yet, so there is no
+cross-turn resume of a draft window that another turn dropped. A load with a
+draft and no pool fails.
 
 Loading is fail-closed: the loader requires `DFlash2DraftModel`, validates the
 target hidden size, vocabulary, tap indices, every expected tensor shape, and
@@ -361,10 +362,11 @@ the embedded directory.
 ### Int8 K/V cache (`kvFormat`, qwen3_5, qwen3_5_moe and qwen4_exp)
 
 For qwen3_5 and qwen3_5_moe by default on Metal with 256-wide heads, GQA up
-to 8 and BF16 compute (`kvFormat: 'bf16'` opts out; `'int8'` forces it), the loader stores the flat full-attention K/V
-cache as per-(token, head) symmetric int8 rows with one fp32 scale each
+to 8 and BF16 compute (`kvFormat: 'bf16'` opts out; `'int8'` forces it), the loader stores the full-attention K/V
+(the block-paged pool, or the flat cache of a load without one) as
+per-(token, head) symmetric int8 rows with one fp32 scale each
 (Splash's target KV format: `scale = max|x| / 127`, quantized on write).
-Rows are read as int8 by the segmented SDPA kernels (the DFlash2 / MTP verify
+Flat rows are read as int8 by the segmented SDPA kernels (the MTP verify
 block kernels take int8 operands straight into `matmul2d`; the AR decode row
 uses the int8 vector kernels), while prefill chunks after the first dequantize
 the cached prefix to a BF16 temporary for MLX's fused causal SDPA. Halves
@@ -378,11 +380,10 @@ DFlash2 acceptance on 35B is not measured. Geometries the int8 kernels do not
 serve default to `bf16`: Qwen3.6-122B (32 x 2 heads) defaults to bf16 because
 the int8 verify cannot split an 8-row block at gqa 16. An f16-compute checkpoint
 (`mlx convert --dtype float16`) also defaults to bf16 K/V: the int8 kernels take
-BF16 queries. The option sets both the block-paged pool and the flat
-(DFlash2) cache; an explicit `int8` the kernels cannot serve fails the load.
-`contextLimits().kvFormat` names the format of the pool lane
-(`effectiveWindowTokens`) and `.speculativeKvFormat` the DFlash2 lane's
-(`speculativeWindowTokens`). `mlx serve --kv-format` and `mlx agent
+BF16 queries. The option sets the block-paged pool (and the flat cache of a
+load without one); an explicit `int8` the kernels cannot serve fails the load.
+`contextLimits().kvFormat` names the format of the one window
+(`effectiveWindowTokens`). `mlx serve --kv-format` and `mlx agent
 --kv-format` set it for served qwen3_5 / qwen3_5_moe / qwen4_exp loads.
 For qwen4_exp (Flash Next) unset is int8 where the int8 page kernels serve
 the head (128 or 256, every released checkpoint), else bf16; the option sets
@@ -398,13 +399,19 @@ weights are resident: the hard budget is the Metal recommended working set
 less 15% and 1 GiB (or `maxMemoryBytes` in the load options when lower), and
 each lane's window is what that budget holds after the fixed memory, one
 request's recurrent state and the lane's peak transient, in whole KV extents,
-capped by the trained context. `effectiveWindowTokens` is the pool lane's and
-`speculativeWindowTokens` the DFlash2 lane's (int8 rows by default). A load
-with neither pool nor draft (`use_block_paged_cache: false`, a sym8
-checkpoint, no compiled backend) is planned on its flat lane, so
-`maxMemoryBytes` bounds it and can refuse it like a paged load. The DFlash2
-transient counts the verify cycle and the free pool MLX keeps of it (twice
-the cycle): MLX collects that pool only at 95% of the working set. The load
+capped by the trained context. Every turn takes that one window,
+`effectiveWindowTokens` (Splash's one context): AR, image, MTP and DFlash2
+turns alike. With a DFlash2 draft the pool lane also holds the draft state (a
+second GDN cell and the draft's K/V ring, Splash
+`CompositeStateLayout::laneBytes`) beside the pool, and its transient is the
+larger of the tapped prefill chunk and the 8-row verify cycle with the free
+pool MLX keeps of it (twice the cycle; MLX collects that pool only at 95% of
+the working set). On the M3 Pro inputs (27 GiB working set, the 27B and its
+draft, int8 pool) that is 94,201 tokens for every turn. DFlash2 runs only on
+the block-paged pool: a load with a draft and no pool fails. A load with no
+pool (`use_block_paged_cache: false`, a sym8 checkpoint, no compiled backend)
+is planned on its flat lane, so `maxMemoryBytes` bounds it and can refuse it
+like a paged load. The load
 log prints the plan and which bound wins (`memory` or `model`). A
 `paged_cache_memory_mb` above the plan's pool fails the load with the MiB the
 plan allows, and so does an unreadable Metal working set on a paged load.
@@ -415,8 +422,7 @@ load plans its expert store and its windows from the same budget; see
 **`maxContextTokens` (`--max-context`).** qwen3_5, qwen3_5_moe and qwen4_exp
 loads take a context token limit from 1 to 1,010,000. At or below the native
 window (`max_position_embeddings`, 262,144) it only caps: `effectiveWindowTokens`,
-`speculativeWindowTokens`, the paged preflight and the scheduler hold at most
-that many tokens. Past the native window the target's RoPE takes static YaRN
+the paged preflight and the scheduler hold at most that many tokens. Past the native window the target's RoPE takes static YaRN
 (Splash `RopeScaling` / `rotaryInverseFrequencies`: factor = N ÷ native,
 beta_fast 32, beta_slow 1, the rotated q/k dims scaled by 0.1·ln(factor) + 1;
 image rows take the same table; the DFlash2 draft keeps its own RoPE and is not
@@ -424,7 +430,7 @@ capped by its own trained context) and the memory plan prices N tokens. A load
 whose plan holds fewer than N fails (`--max-context N exceeds the P tokens the
 model and … allow; omit it or pass at most P`), and so does a load past the
 native window without a memory plan (only when the device's memory is
-unreadable: a load with neither pool nor draft plans its flat lane, which
+unreadable: a load without a pool plans its flat lane, which
 `--max-context` caps and refuses like the others). `trainedWindowTokens`
 stays native, and the saved `config.json` never carries the factor; the SSD cold-tier key does
 (`rope yarn <factor> <native>`). A checkpoint whose RoPE is already scaled

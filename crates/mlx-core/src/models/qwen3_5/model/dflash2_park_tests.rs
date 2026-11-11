@@ -1,26 +1,21 @@
-//! Sites that take the flat lane away from a DFlash2 state park it in the
-//! model's state store; resets that end the model's history clear the store.
+//! The take order a refused paged step reclaims through: ladder and history
+//! entries, marked chains and image entries.
 
 use std::sync::Arc;
 
 use super::*;
-use crate::engine::backend::{ChatBackend, ResetScope, WholeTurnArgs};
+use crate::engine::backend::{ChatBackend, WholeTurnArgs};
 use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
 use crate::engine::plan::{DecoderPlan, MediaCapabilities, MediaInputs, TurnPlan};
 use crate::engine::reclaim::UnitKey;
 use crate::engine::types::ChatConfig;
 use crate::models::qwen3_5::dflash2_decode::tests::{
-    array_fingerprints, metal_is_default_device, run_tiny_dflash_turn,
-    tiny_dflash_inner_with_attention_head_dim,
+    metal_is_default_device, tiny_dflash_inner_with_attention_head_dim,
 };
-use crate::models::qwen3_5::dflash2_state::store::Lineage;
-use crate::models::qwen3_5::dflash2_state::trace::HitKind;
 use crate::models::qwen3_5::dflash2_turn::{
     GrowReclaim, Keep, clear_grow_reclaim_log, ensure_paged_pool_for_prompt, grow_reclaim_log,
-    install_flat_dflash2_end, paged_step_reclaiming, park_live_dflash2_state, reclaiming,
+    paged_step_reclaiming, reclaiming,
 };
-
-type Fingerprints = Vec<(Vec<i64>, Vec<u32>)>;
 
 fn fixture(seed: u64) -> Qwen35Inner {
     tiny_dflash_inner_with_attention_head_dim(seed, 32)
@@ -32,33 +27,6 @@ fn tokenizer() -> Arc<Qwen3Tokenizer> {
 
 fn first_prompt(seed: u32) -> Vec<u32> {
     (0..40).map(|i| (seed + i * 7) % 15 + 1).collect()
-}
-
-fn extend(history: &[u32], tail: &[u32]) -> Vec<u32> {
-    history
-        .iter()
-        .copied()
-        .chain(tail.iter().copied())
-        .collect()
-}
-
-/// Every buffer of the live flat state, whole, plus its history.
-fn live_state(inner: &Qwen35Inner) -> Result<(Vec<u32>, Fingerprints, Fingerprints)> {
-    let mut target = Vec::new();
-    for cache in inner.caches.iter().flatten() {
-        cache.collect_arrays(&mut target);
-    }
-    let mut draft = Vec::new();
-    inner
-        .dflash2_context
-        .as_ref()
-        .expect("live draft context")
-        .collect_arrays(&mut draft);
-    Ok((
-        inner.cached_token_history.clone(),
-        array_fingerprints(target)?,
-        array_fingerprints(draft)?,
-    ))
 }
 
 fn ar_config() -> ChatConfig {
@@ -103,144 +71,6 @@ fn run_paged_ar_turn(
     Ok(())
 }
 
-/// The store holds exactly one end state of `history`, and a prompt that
-/// extends `history` resumes on it at full depth.
-fn assert_end_hit(inner: &Qwen35Inner, history: &[u32], label: &str) {
-    let store = &inner.dflash2_states.store;
-    assert_eq!(store.bytes().entries, 1, "{label}: one parked state");
-    let next = extend(history, &[4, 5, 6]);
-    let hit = store
-        .lookup(Lineage::text(&next, 0), |_| true)
-        .unwrap_or_else(|| panic!("{label}: the next prompt misses the store"));
-    assert_eq!(
-        (hit.kind, hit.depth),
-        (HitKind::End, history.len()),
-        "{label}"
-    );
-}
-
-/// X0: the parked entry moved back in gives every buffer of the state it was
-/// parked from, bit for bit. Leaves the state installed.
-fn assert_parked_round_trip(
-    inner: &mut Qwen35Inner,
-    before: &(Vec<u32>, Fingerprints, Fingerprints),
-    label: &str,
-) -> Result<()> {
-    let next = extend(&before.0, &[4, 5, 6]);
-    let hit = inner
-        .dflash2_states
-        .store
-        .lookup(Lineage::text(&next, 0), |_| true)
-        .expect("end hit");
-    let (tokens, parts) = inner
-        .dflash2_states
-        .store
-        .take(hit.id)
-        .expect("entry")
-        .into_parts();
-    inner.dflash2_context = None;
-    inner.dflash2_turn_state = None;
-    install_flat_dflash2_end(inner, tokens, parts)?;
-    assert!(live_state(inner)? == *before, "{label}: X0 parked state");
-    Ok(())
-}
-
-/// A paged AR turn between two DFlash2 turns of one lineage parks the first
-/// turn's end state instead of dropping it, through both the generic paged
-/// turn and the paged sync core. X0 for the parked buffers; X1 for the
-/// DFlash2 turn resumed on them against the same two turns run back to back.
-#[test]
-fn paged_ar_turn_parks_the_dflash2_end_state() -> Result<()> {
-    if !metal_is_default_device() {
-        return Ok(());
-    }
-    let tokenizer = tokenizer();
-    let first = first_prompt(0);
-    let mut reference = fixture(0xDFA5_1601);
-    run_tiny_dflash_turn(&mut reference, &tokenizer, &first, true, 12)?;
-    let second = extend(&reference.cached_token_history, &[4, 5, 6]);
-    let reference_cached = run_tiny_dflash_turn(&mut reference, &tokenizer, &second, true, 12)?;
-    let reference_state = live_state(&reference)?;
-
-    for entry in ["run_paged_turn", "paged_turn_sync_core"] {
-        let mut inner = fixture(0xDFA5_1601);
-        inner.initialize_paged_adapter()?;
-        run_tiny_dflash_turn(&mut inner, &tokenizer, &first, true, 12)?;
-        let before = live_state(&inner)?;
-        let paged = extend(&before.0, &[2, 3]);
-        if entry == "run_paged_turn" {
-            run_paged_ar_turn(&mut inner, &tokenizer, &paged)?;
-        } else {
-            let config = ar_config();
-            let params = ChatBackend::resolve_params(&inner, &config);
-            let thinking = ChatBackend::thinking_setup(&inner, &config);
-            inner.paged_turn_sync_core(
-                paged,
-                tokenizer.clone(),
-                u32::MAX,
-                params,
-                false,
-                thinking,
-            )?;
-        }
-        assert!(inner.paged_full_attn_caches_dirty, "{entry}");
-        assert!(inner.dflash2_context.is_none(), "{entry}");
-        assert_end_hit(&inner, &before.0, entry);
-        assert_parked_round_trip(&mut inner, &before, entry)?;
-
-        // The lane flags are the restoring turn's to clear.
-        inner.paged_full_attn_caches_dirty = false;
-        let resumed = run_tiny_dflash_turn(&mut inner, &tokenizer, &second, true, 12)?;
-        assert_eq!(resumed.cached_tokens, before.0.len() as u32, "{entry}");
-        assert_eq!(resumed.cached_tokens, reference_cached.cached_tokens);
-        assert!(
-            live_state(&inner)? == reference_state,
-            "{entry}: X1 resumed turn"
-        );
-    }
-    Ok(())
-}
-
-/// Swaps the model's paged pool for one of `initial` blocks that grows to
-/// the same maximum, on the model's clock, with a grow probe that declines
-/// until a reclaim on this thread took a unit.
-fn install_runway_pool_reclaimed_by_eviction(inner: &mut Qwen35Inner, initial: u32) -> Result<()> {
-    inner.paged_adapter = None;
-    inner.initialize_paged_adapter()?;
-    let adapter = inner.paged_adapter.take().expect("paged adapter");
-    let block_size = adapter.block_size();
-    let pool = adapter.layer_kv_pool();
-    let (config, max, dtype) = (
-        pool.config().clone(),
-        pool.max_num_blocks(),
-        pool.cache_dtype(),
-    );
-    drop(adapter);
-    assert!(initial < max);
-    let pool = mlx_paged_attn::LayerKVPool::new(config, initial, max, dtype)
-        .map_err(Error::from_reason)?;
-    let allocator = Arc::new(std::sync::Mutex::new(
-        mlx_paged_attn::BlockAllocator::with_recency(
-            initial,
-            max,
-            block_size,
-            Arc::clone(&inner.cache_recency),
-        ),
-    ));
-    let mut adapter = PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size)
-        .map_err(Error::from_reason)?;
-    clear_grow_reclaim_log();
-    adapter.set_grow_headroom_probe_override(Some(Arc::new(|blocks| {
-        Ok(if grow_reclaim_log().is_empty() {
-            0
-        } else {
-            blocks
-        })
-    })));
-    inner.paged_adapter = Some(adapter);
-    Ok(())
-}
-
 /// A pool starts at the runway and grows by Splash extents. Mutation: drop the `set_extent_growth` call in dense
 /// `initialize_paged_adapter` → red (`None`).
 #[test]
@@ -263,283 +93,6 @@ fn runway_pool_grows_by_splash_extents() -> Result<()> {
         adapter.extent_growth_blocks(),
         Some(crate::models::qwen3_5::dflash2_decode::runway_pool_extent_blocks(bytes_per_block))
     );
-    Ok(())
-}
-
-/// A paged AR turn right after a DFlash2 turn, with a prompt past the
-/// runway pool: the turn parks the live state, and the pool grow its prompt
-/// needs takes it (a grow probe reads memory the parked state holds) before
-/// the prefix lookup, through both the generic paged turn and the paged sync
-/// core: a compaction or a store step.
-/// Mutation: skip the park in `paged_whole_turn` → red on `run_paged_turn`;
-/// in `paged_turn_sync_core` → red on that entry.
-#[test]
-fn dflash2_to_ar_transition_reclaims_the_just_parked_state() -> Result<()> {
-    if !metal_is_default_device() {
-        return Ok(());
-    }
-    let tokenizer = tokenizer();
-    for entry in ["run_paged_turn", "paged_turn_sync_core"] {
-        let mut inner = fixture(0xDFA5_1604);
-        run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(3), true, 12)?;
-        assert_eq!(inner.dflash2_states.store.bytes().entries, 0, "{entry}");
-        install_runway_pool_reclaimed_by_eviction(&mut inner, 1)?;
-        let paged = extend(&inner.cached_token_history, &[2, 3]);
-        let block_size = inner.paged_adapter.as_ref().expect("adapter").block_size() as usize;
-        assert!(
-            paged.len() > block_size,
-            "{entry}: the prompt outgrows the runway"
-        );
-        if entry == "run_paged_turn" {
-            run_paged_ar_turn(&mut inner, &tokenizer, &paged)?;
-        } else {
-            let config = ar_config();
-            let params = ChatBackend::resolve_params(&inner, &config);
-            let thinking = ChatBackend::thinking_setup(&inner, &config);
-            inner.paged_turn_sync_core(
-                paged,
-                tokenizer.clone(),
-                u32::MAX,
-                params,
-                false,
-                thinking,
-            )?;
-        }
-        let log = grow_reclaim_log();
-        assert!(
-            log.first()
-                .is_some_and(|taken| matches!(taken, GrowReclaim::Compaction | GrowReclaim::Store)),
-            "{entry}: the just-parked state paid for the grow: {log:?}"
-        );
-        assert!(inner.dflash2_context.is_none(), "{entry}");
-    }
-    Ok(())
-}
-
-/// A vision paged turn parks the DFlash2 state before it dirties the flat
-/// lane. The tiny vocabulary has no image tokens, so the turn fails at
-/// image decode, after the park: X0 only.
-#[test]
-fn vision_paged_turn_parks_the_dflash2_end_state() -> Result<()> {
-    use crate::vision::qwen::encoder::{QwenVisionConfig, QwenVisionEncoder};
-    use crate::vision::qwen::processing::QwenImageProcessor;
-    if !metal_is_default_device() {
-        return Ok(());
-    }
-    let tokenizer = tokenizer();
-    let mut inner = fixture(0xDFA5_1602);
-    inner.initialize_paged_adapter()?;
-    inner.set_vision_encoder(QwenVisionEncoder::new(QwenVisionConfig {
-        hidden_size: 64,
-        intermediate_size: 256,
-        num_heads: 4,
-        num_layers: 2,
-        patch_size: 16,
-        spatial_merge_size: 2,
-        image_size: 256,
-        out_hidden_size: inner.config.hidden_size,
-    })?)?;
-    inner.set_image_processor(QwenImageProcessor::new(None));
-    run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(1), true, 12)?;
-    let before = live_state(&inner)?;
-
-    let config = ar_config();
-    let params = ChatBackend::resolve_params(&inner, &config);
-    let thinking = ChatBackend::thinking_setup(&inner, &config);
-    let turn = inner.vision_paged_turn_sync_core(
-        extend(&before.0, &[2, 3]),
-        &[vec![0u8; 8]],
-        tokenizer.clone(),
-        u32::MAX,
-        params,
-        false,
-        thinking,
-    );
-    assert!(turn.is_err(), "the undecodable image fails the turn");
-    assert!(inner.paged_full_attn_caches_dirty);
-    assert_end_hit(&inner, &before.0, "vision");
-    assert_parked_round_trip(&mut inner, &before, "vision")
-}
-
-/// A prefix-miss reset parks the state and keeps the history this scope
-/// preserves; the first lineage then resumes on the parked end state (X0).
-#[test]
-fn prefix_miss_reset_parks_the_dflash2_end_state() -> Result<()> {
-    if !metal_is_default_device() {
-        return Ok(());
-    }
-    let tokenizer = tokenizer();
-    let mut inner = fixture(0xDFA5_1603);
-    run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(2), true, 12)?;
-    let before = live_state(&inner)?;
-    ChatBackend::reset_caches(&mut inner, ResetScope::PrefixMiss)?;
-    assert_eq!(inner.cached_token_history, before.0);
-    assert!(inner.dflash2_context.is_none());
-    assert!(inner.caches.is_some(), "fresh caches for the missing turn");
-    assert_end_hit(&inner, &before.0, "prefix miss");
-    assert_parked_round_trip(&mut inner, &before, "prefix miss")
-}
-
-/// A command reset, a full cache reset (the generate, calibrate and eval
-/// bodies) and a weight update each empty the store.
-#[test]
-fn command_and_training_resets_empty_the_store() -> Result<()> {
-    if !metal_is_default_device() {
-        return Ok(());
-    }
-    let tokenizer = tokenizer();
-    let mut inner = fixture(0xDFA5_1604);
-    for reset in ["command", "reset_caches_sync", "apply_gradients"] {
-        run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(3), true, 12)?;
-        ChatBackend::reset_caches(&mut inner, ResetScope::PrefixMiss)?;
-        assert_eq!(inner.dflash2_states.store.bytes().entries, 1, "{reset}");
-        match reset {
-            "command" => ChatBackend::reset_caches(&mut inner, ResetScope::Command)?,
-            "reset_caches_sync" => inner.reset_caches_sync()?,
-            _ => inner.apply_gradients_inner(HashMap::new(), 0.0, &HashMap::new())?,
-        }
-        assert_eq!(inner.dflash2_states.store.bytes().entries, 0, "{reset}");
-        inner.reset_caches_sync()?;
-    }
-    Ok(())
-}
-
-/// Releasing a cache owner after its DFlash2 turn leaves the flat live
-/// state alone, so a request from another owner on the same content plus a
-/// delta takes the live hit. X1 against the same two turns with no release.
-#[test]
-fn owner_release_keeps_the_flat_live_state() -> Result<()> {
-    if !metal_is_default_device() {
-        return Ok(());
-    }
-    let tokenizer = tokenizer();
-    let first = first_prompt(4);
-    let mut reference = fixture(0xDFA5_1605);
-    run_tiny_dflash_turn(&mut reference, &tokenizer, &first, true, 12)?;
-    let second = extend(&reference.cached_token_history, &[4, 5, 6]);
-    let reference_cached = run_tiny_dflash_turn(&mut reference, &tokenizer, &second, true, 12)?;
-    let reference_state = live_state(&reference)?;
-
-    let mut inner = fixture(0xDFA5_1605);
-    inner.initialize_paged_adapter()?;
-    ChatBackend::set_cache_owner_id(&mut inner, "owner-a", None);
-    run_tiny_dflash_turn(&mut inner, &tokenizer, &first, true, 12)?;
-    assert_eq!(inner.active_scheduled_seq, None);
-    let history = inner.cached_token_history.clone();
-    HybridSchedulerBackend::release_owner_resources(&mut inner, Some(1), None)?;
-    HybridSchedulerBackend::release_owner_resources(&mut inner, None, None)?;
-    ChatBackend::set_cache_owner_id(&mut inner, "owner-b", None);
-    let resumed = run_tiny_dflash_turn(&mut inner, &tokenizer, &second, true, 12)?;
-    assert_eq!(resumed.cached_tokens, history.len() as u32, "live hit");
-    assert_eq!(resumed.cached_tokens, reference_cached.cached_tokens);
-    assert!(live_state(&inner)? == reference_state, "X1 after release");
-    Ok(())
-}
-
-/// A scheduled admission whose page-pool grow is declined parks the idle
-/// live DFlash2 state, evicts one state (the least recently used), and grows
-/// on the retry; with no DFlash2 state at all the declined grow still
-/// rejects.
-/// Mutation: skip the park in `reclaim_kv` (`park: false`) → red.
-/// Mutation: drop every parked state at once (`store.clear()` in place of
-/// `apply_lossy` in `take_state_unit`) → red (0 ≠ 1 entries).
-#[test]
-fn scheduled_pool_grow_reclaims_one_state_per_decline() -> Result<()> {
-    use crate::engine::hybrid_scheduler::tests::reserve_past_a_declined_grow;
-    use crate::models::qwen3_5::dflash2_turn::KV_BUDGET_OVERRIDE;
-    struct Override;
-    impl Drop for Override {
-        fn drop(&mut self) {
-            KV_BUDGET_OVERRIDE.with(|budget| budget.set(None));
-        }
-    }
-    if !metal_is_default_device() {
-        return Ok(());
-    }
-    let tokenizer = tokenizer();
-    for case in ["parked", "live", "none"] {
-        let mut inner = fixture(0xDFA5_1607);
-        inner.initialize_paged_adapter()?;
-        let mut live = Vec::new();
-        if case != "none" {
-            run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(6), true, 12)?;
-            live = inner.cached_token_history.clone();
-        }
-        if case == "parked" {
-            run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(7), true, 12)?;
-            live = inner.cached_token_history.clone();
-            assert_eq!(inner.dflash2_states.store.bytes().entries, 1);
-        }
-        let override_guard = Override;
-        KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(0)));
-        let (admitted, total_blocks, inner) = reserve_past_a_declined_grow(inner);
-        drop(override_guard);
-        assert_eq!(admitted, case != "none", "{case}");
-        assert_eq!(total_blocks, if case == "none" { 4 } else { 8 }, "{case}");
-        let lineages: Vec<Vec<u32>> = inner
-            .dflash2_states
-            .store
-            .entries()
-            .map(|entry| entry.tokens().to_vec())
-            .collect();
-        let want: Vec<Vec<u32>> = if case == "parked" {
-            vec![live]
-        } else {
-            Vec::new()
-        };
-        assert_eq!(lineages, want, "{case}");
-        assert!(inner.dflash2_context.is_none(), "{case}");
-    }
-    Ok(())
-}
-
-/// A continuous-batching activation hands the flat caches to a scheduled
-/// sequence. It parks the DFlash2 end state first, whether the scheduler
-/// installs the owner's history before activating (a resumed preempted turn)
-/// or after (an admission). X0 for the parked buffers; X1 for the DFlash2
-/// turn resumed on them against the same two turns run back to back.
-#[test]
-fn scheduled_activation_parks_the_dflash2_end_state() -> Result<()> {
-    if !metal_is_default_device() {
-        return Ok(());
-    }
-    let tokenizer = tokenizer();
-    let first = first_prompt(5);
-    let mut reference = fixture(0xDFA5_1606);
-    run_tiny_dflash_turn(&mut reference, &tokenizer, &first, true, 12)?;
-    let second = extend(&reference.cached_token_history, &[4, 5, 6]);
-    let reference_cached = run_tiny_dflash_turn(&mut reference, &tokenizer, &second, true, 12)?;
-    let reference_state = live_state(&reference)?;
-
-    for order in ["activate_first", "install_first"] {
-        let mut inner = fixture(0xDFA5_1606);
-        inner.initialize_paged_adapter()?;
-        run_tiny_dflash_turn(&mut inner, &tokenizer, &first, true, 12)?;
-        let before = live_state(&inner)?;
-        let owner = vec![1u32, 2, 3];
-        if order == "activate_first" {
-            HybridSchedulerBackend::activate_scheduled_recurrent(&mut inner, 3)?;
-            HybridSchedulerBackend::install_owner_state(&mut inner, 3, &owner);
-        } else {
-            HybridSchedulerBackend::install_owner_state(&mut inner, 3, &owner);
-            HybridSchedulerBackend::activate_scheduled_recurrent(&mut inner, 3)?;
-        }
-        assert_eq!(inner.active_scheduled_seq, Some(3), "{order}");
-        assert_eq!(inner.cached_token_history, owner, "{order}");
-        assert_end_hit(&inner, &before.0, order);
-
-        HybridSchedulerBackend::release_scheduled_recurrent_for(&mut inner, 3);
-        assert_parked_round_trip(&mut inner, &before, order)?;
-        let resumed = run_tiny_dflash_turn(&mut inner, &tokenizer, &second, true, 12)?;
-        assert_eq!(
-            resumed.cached_tokens, reference_cached.cached_tokens,
-            "{order}"
-        );
-        assert!(
-            live_state(&inner)? == reference_state,
-            "{order}: X1 resumed turn"
-        );
-    }
     Ok(())
 }
 
@@ -688,21 +241,6 @@ fn no_kv_headroom() -> NoKvHeadroom {
     NoKvHeadroom
 }
 
-/// One parked DFlash2 state, the live state parked by hand.
-fn with_parked_state(seed: u64) -> Result<Qwen35Inner> {
-    let tokenizer = tokenizer();
-    let mut inner = fixture(seed);
-    run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(8), true, 12)?;
-    assert!(park_live_dflash2_state(&mut inner));
-    assert_eq!(inner.dflash2_states.store.bytes().entries, 1);
-    Ok(inner)
-}
-
-fn parked_bytes(inner: &Qwen35Inner) -> u64 {
-    let bytes = inner.dflash2_states.store.bytes();
-    bytes.kv_bytes + bytes.state_bytes
-}
-
 /// At the cap a ladder entry's dropped marks make its chain evictable in the
 /// same take, so the refused step runs on the retry.
 /// Mutation: skip the mark sync in `drop_gdn_state` → red (the retry is
@@ -731,118 +269,6 @@ fn dropping_a_ladder_entry_makes_its_chain_evictable() -> Result<()> {
         .allocate()
         .expect("the other chain block is takeable");
     allocator.free(block);
-    Ok(())
-}
-
-/// Below the cap the take goes by each holder's own stamp: an older ladder
-/// rung, then the parked state, then a newer history entry.
-/// Mutation: offer the store step before the GDN entries in
-/// `oldest_state_unit` → red (`[Store, ..]`).
-#[test]
-fn oldest_state_goes_first_across_holders() -> Result<()> {
-    if !metal_is_default_device() {
-        return Ok(());
-    }
-    let mut inner = with_parked_state(0xDFA5_1802)?;
-    let _headroom = no_kv_headroom();
-    install_pool(&mut inner, 4, 8, probe_after(3))?;
-    let bytes_per_block = inner
-        .paged_adapter
-        .as_ref()
-        .expect("adapter")
-        .bytes_per_block()
-        .map_err(Error::from_reason)?;
-    assert!(
-        parked_bytes(&inner) >= bytes_per_block,
-        "the count must pass"
-    );
-    let block_size = pool_block_size(&inner);
-    hold_blocks(&mut inner, 1, 4);
-    push_rung(&mut inner, vec![3; block_size as usize], vec![0xAB], 0);
-    inner.gdn_last_history_checkpoint = Some(DenseGdnHistoryCheckpoint {
-        owner_id: inner.active_cache_owner_id.clone(),
-        image_key: None,
-        tokens: vec![5, 6, 7],
-        caches: Vec::new(),
-        last_used: inner.cache_recency.next(),
-    });
-    clear_grow_reclaim_log();
-    let mut runs = 0;
-    paged_step_reclaiming(&mut inner, reserve_step(&mut runs, 1, 5 * block_size))?;
-    assert_eq!(runs, 2);
-    assert_eq!(
-        grow_reclaim_log(),
-        vec![
-            GrowReclaim::Ladder,
-            GrowReclaim::Store,
-            GrowReclaim::History
-        ]
-    );
-    Ok(())
-}
-
-/// At the cap the older parked state is no unit (it sits on no block), so
-/// the newer ladder rung goes alone.
-/// Mutation: drop the at-cap store skip in `oldest_state_unit` → red
-/// (`[Store, Ladder]`).
-#[test]
-fn cap_reclaim_takes_a_ladder_entry_by_its_own_stamp() -> Result<()> {
-    if !metal_is_default_device() {
-        return Ok(());
-    }
-    let mut inner = with_parked_state(0xDFA5_1803)?;
-    install_pool(&mut inner, 4, 4, passing_probe())?;
-    let block_size = pool_block_size(&inner);
-    let chain = chain_tokens(2, 4, block_size);
-    let hashes = cache_chain(&inner, &chain);
-    let stamp = inner.cache_recency.next();
-    push_rung(&mut inner, chain, hashes, stamp);
-    inner
-        .paged_adapter
-        .as_mut()
-        .expect("adapter")
-        .begin_request(1)
-        .map_err(Error::from_reason)?;
-    clear_grow_reclaim_log();
-    let mut runs = 0;
-    paged_step_reclaiming(&mut inner, reserve_step(&mut runs, 1, block_size))?;
-    assert_eq!(runs, 2);
-    assert_eq!(grow_reclaim_log(), vec![GrowReclaim::Ladder]);
-    assert_eq!(inner.dflash2_states.store.bytes().entries, 1);
-    Ok(())
-}
-
-/// The allocator, the store and the turn end stamp one clock: a block
-/// registered before a turn ranks older than the state it parked, and one
-/// registered after ranks newer.
-/// Mutation: keep the store on a private clock (drop `share_recency` in
-/// `FlatStates::new`) → red.
-#[test]
-fn store_and_allocator_share_one_clock() -> Result<()> {
-    if !metal_is_default_device() {
-        return Ok(());
-    }
-    let tokenizer = tokenizer();
-    let mut inner = fixture(0xDFA5_1804);
-    inner.initialize_paged_adapter()?;
-    let block_size = pool_block_size(&inner);
-    let first = cache_chain(&inner, &chain_tokens(3, 1, block_size))[0];
-    run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(9), true, 12)?;
-    assert!(park_live_dflash2_state(&mut inner));
-    let second = cache_chain(&inner, &chain_tokens(4, 1, block_size))[0];
-    let (parked, _) = inner
-        .dflash2_states
-        .store
-        .next_lossy(u64::MAX, None)
-        .expect("the parked state");
-    let adapter = inner.paged_adapter.as_ref().expect("adapter");
-    let allocator = adapter.allocator().lock().expect("allocator");
-    let before = allocator.block_stamp(first).expect("first stamp");
-    let after = allocator.block_stamp(second).expect("second stamp");
-    assert!(
-        before < parked && parked < after,
-        "{before} {parked} {after}"
-    );
     Ok(())
 }
 
@@ -1030,55 +456,6 @@ fn stale_marks_are_resynced_before_the_count() -> Result<()> {
     Ok(())
 }
 
-/// The prompt grow charges no block for the marked chain its prompt hits:
-/// with that hit out, the free block covers the need, so no grow is probed
-/// and no state goes.
-/// Mutation: drop `- marked_hit` in `grow_paged_pool_for_prompt` → red
-/// (the grow is probed).
-#[test]
-fn prompt_grow_counts_no_block_for_its_marked_hit() -> Result<()> {
-    if !metal_is_default_device() {
-        return Ok(());
-    }
-    let mut inner = with_parked_state(0xDFA5_1809)?;
-    let probes = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let calls = Arc::clone(&probes);
-    install_pool(
-        &mut inner,
-        4,
-        8,
-        Arc::new(move |_| {
-            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(4)
-        }),
-    )?;
-    let block_size = pool_block_size(&inner);
-    let chain = chain_tokens(14, 3, block_size);
-    let hashes = cache_chain(&inner, &chain);
-    let stamp = inner.cache_recency.next();
-    push_rung(&mut inner, chain.clone(), hashes, stamp);
-    let mut prompt = chain;
-    prompt.extend(chain_tokens(15, 1, block_size));
-    let keys = per_block_keys(&prompt, block_size);
-    let keep = Keep {
-        tokens: &prompt,
-        keys: Some((&keys, 0)),
-    };
-    assert_eq!(inner.marked_hit_blocks(keep), 3);
-    assert_eq!(
-        inner
-            .paged_adapter
-            .as_ref()
-            .expect("adapter")
-            .takeable_blocks(),
-        1
-    );
-    ensure_paged_pool_for_prompt(&mut inner, &prompt, &keys, 0);
-    assert_eq!(probes.load(std::sync::atomic::Ordering::Relaxed), 0);
-    assert_eq!(inner.dflash2_states.store.bytes().entries, 1);
-    Ok(())
-}
-
 /// At the cap only the deepest of one owner's nested rungs is a unit: the
 /// shallower rung lies inside its chain and would free nothing.
 /// Mutation: filter on the final block being cache-only instead of
@@ -1117,75 +494,6 @@ fn cap_reclaim_takes_the_deepest_rung_only() -> Result<()> {
     Ok(())
 }
 
-/// A 4-block pool, max 8, 4-block extents, its 4 blocks a chain a ladder
-/// rung marks; an older history entry holds bytes, so the grow probe
-/// passes once it goes. The 5-block step's grow clamps at the max and adds
-/// 4: still short, so the take goes on to the rung.
-/// Mutation: count a passing grow as met in `kv_need_met` → red (the
-/// retry is refused the same need, `MetBefore` stops the loop: `Err`).
-#[test]
-fn capped_grow_keeps_taking_until_the_ladder_covers() -> Result<()> {
-    if !metal_is_default_device() {
-        return Ok(());
-    }
-    let tokenizer = tokenizer();
-    let mut inner = fixture(0xDFA5_1811);
-    run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(11), true, 12)?;
-    let caches = restorable_caches(&inner);
-    inner.dflash2_states.store.clear();
-    inner.dflash2_context = None;
-    install_pool(&mut inner, 4, 8, probe_after(1))?;
-    inner
-        .paged_adapter
-        .as_mut()
-        .expect("adapter")
-        .set_extent_growth(4);
-    let block_size = pool_block_size(&inner);
-    inner.gdn_last_history_checkpoint = Some(DenseGdnHistoryCheckpoint {
-        owner_id: inner.active_cache_owner_id.clone(),
-        image_key: None,
-        tokens: vec![5, 6, 7],
-        caches: restorable_caches_from(&inner, &caches),
-        last_used: inner.cache_recency.next(),
-    });
-    let chain = chain_tokens(20, 4, block_size);
-    let hashes = cache_chain(&inner, &chain);
-    let stamp = inner.cache_recency.next();
-    push_rung(&mut inner, chain, hashes, stamp);
-    inner
-        .paged_adapter
-        .as_mut()
-        .expect("adapter")
-        .begin_request(1)
-        .map_err(Error::from_reason)?;
-    assert_eq!(
-        inner
-            .paged_adapter
-            .as_ref()
-            .expect("adapter")
-            .takeable_blocks(),
-        0
-    );
-    clear_grow_reclaim_log();
-    let mut runs = 0;
-    paged_step_reclaiming(&mut inner, reserve_step(&mut runs, 1, 5 * block_size))?;
-    assert_eq!(runs, 2);
-    assert_eq!(
-        grow_reclaim_log(),
-        vec![GrowReclaim::History, GrowReclaim::Ladder]
-    );
-    assert_eq!(
-        inner
-            .paged_adapter
-            .as_ref()
-            .expect("adapter")
-            .layer_kv_pool()
-            .num_blocks(),
-        8
-    );
-    Ok(())
-}
-
 /// GDN caches a ladder rung can restore: the live state of a finished
 /// DFlash2 turn.
 fn restorable_caches(inner: &Qwen35Inner) -> Vec<Qwen3_5LayerCache> {
@@ -1203,10 +511,13 @@ fn restorable_caches(inner: &Qwen35Inner) -> Vec<Qwen3_5LayerCache> {
 fn restored_from_rung(seed: u64, vlm: bool) -> Result<(Qwen35Inner, u64, u64, Vec<u32>)> {
     let tokenizer = tokenizer();
     let mut inner = fixture(seed);
-    run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(10), true, 12)?;
+    install_pool(&mut inner, 16, 16, passing_probe())?;
+    run_paged_ar_turn(&mut inner, &tokenizer, &first_prompt(10))?;
     let caches = restorable_caches(&inner);
-    inner.dflash2_states.store.clear();
-    inner.dflash2_context = None;
+    // The pool turn leaves its own ladder and history entries; the rungs
+    // below must be the only ones.
+    inner.gdn_prefix_checkpoints.clear();
+    inner.gdn_last_history_checkpoint = None;
     install_pool(&mut inner, 4, 8, probe_after(1))?;
     let block_size = pool_block_size(&inner);
     let rung = chain_tokens(17, 2, block_size);
@@ -1822,56 +1133,6 @@ fn a_released_serial_turn_ends_the_replay_points_use() -> Result<()> {
             .map(|unit| unit.key);
         assert_eq!(next, Some(e_key), "reuse {reuse}");
     }
-    Ok(())
-}
-
-/// Below the cap with nothing takeable: the parked state goes first, then
-/// the image entry nothing holds; the older entry a turn still holds stays.
-/// Mutations: try the image stage before the states in `free_for_kv` → red
-/// (`[Vision, Store]`); drop the `strong_count` test in
-/// `VisionCacheInner::unheld` → red (the held entry goes).
-#[test]
-fn image_entry_goes_after_every_state() -> Result<()> {
-    if !metal_is_default_device() {
-        return Ok(());
-    }
-    let mut inner = with_parked_state(0xDFA5_1816)?;
-    let _headroom = no_kv_headroom();
-    install_pool(&mut inner, 4, 8, probe_after(2))?;
-    let bytes_per_block = inner
-        .paged_adapter
-        .as_ref()
-        .expect("adapter")
-        .bytes_per_block()
-        .map_err(Error::from_reason)?;
-    assert!(
-        parked_bytes(&inner) >= bytes_per_block,
-        "the count must pass"
-    );
-    let block_size = pool_block_size(&inner);
-    hold_blocks(&mut inner, 1, 4);
-    let held = MxArray::from_float32(&[1.0], &[1])?;
-    held.eval();
-    let unheld = MxArray::from_float32(&[2.0], &[1])?;
-    unheld.eval();
-    {
-        let mut cache = inner.vision_cache.lock().expect("vision cache");
-        cache.insert_for_test(1, held.clone(), bytes_per_block as usize);
-        cache.insert_for_test(2, unheld, bytes_per_block as usize);
-        assert_eq!(cache.unheld_bytes(), bytes_per_block as usize);
-    }
-    clear_grow_reclaim_log();
-    let mut runs = 0;
-    paged_step_reclaiming(&mut inner, reserve_step(&mut runs, 1, 5 * block_size))?;
-    assert_eq!(runs, 2);
-    assert_eq!(
-        grow_reclaim_log(),
-        vec![GrowReclaim::Store, GrowReclaim::Vision]
-    );
-    let cache = inner.vision_cache.lock().expect("vision cache");
-    assert_eq!(cache.len(), 1, "the held entry stays");
-    assert_eq!(cache.unheld_bytes(), 0);
-    drop(held);
     Ok(())
 }
 

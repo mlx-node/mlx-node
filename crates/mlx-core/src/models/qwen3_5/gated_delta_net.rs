@@ -29,48 +29,19 @@ pub(crate) struct GdnCapturePlan<'a> {
 /// fresh buffers: no cache slot, state blob or later chunk can write them.
 #[derive(Clone)]
 pub(crate) struct GdnLayerCapture {
+    #[cfg_attr(not(test), expect(dead_code))]
     pub conv: MxArray,
+    #[cfg_attr(not(test), expect(dead_code))]
     pub rec: MxArray,
 }
 
 /// Every GDN layer's state after chunk rows `[0, row)`, in layer order.
 #[derive(Clone)]
 pub(crate) struct GdnCell {
-    #[cfg_attr(not(test), expect(dead_code))]
+    #[expect(dead_code)]
     pub row: usize,
     pub conv: Vec<MxArray>,
     pub rec: Vec<MxArray>,
-}
-
-/// One [`GdnCell`] per plan row from the per-layer captures (linear layers
-/// in order, one capture per plan row each).
-pub(crate) fn gdn_cells(
-    plan: &GdnCapturePlan<'_>,
-    layers: Vec<Vec<GdnLayerCapture>>,
-) -> Result<Vec<GdnCell>> {
-    let mut cells: Vec<GdnCell> = plan
-        .rows
-        .iter()
-        .map(|&row| GdnCell {
-            row,
-            conv: Vec::with_capacity(layers.len()),
-            rec: Vec::with_capacity(layers.len()),
-        })
-        .collect();
-    for layer in layers {
-        if layer.len() != cells.len() {
-            return Err(Error::from_reason(format!(
-                "GDN capture: a layer captured {} states for {} rows",
-                layer.len(),
-                cells.len()
-            )));
-        }
-        for (cell, capture) in cells.iter_mut().zip(layer) {
-            cell.conv.push(capture.conv);
-            cell.rec.push(capture.rec);
-        }
-    }
-    Ok(cells)
 }
 
 #[cfg(test)]
@@ -504,12 +475,6 @@ impl GatedDeltaNet {
         })
     }
 
-    /// Depthwise conv kernel width — the caller needs it to rebuild
-    /// [`GdnLayerTape`]s from compiled-graph outputs (`keep = kd - 1`).
-    pub(crate) fn conv_kernel_dim(&self) -> i32 {
-        self.conv_kernel_dim
-    }
-
     /// Runs once after every weight of the layer is loaded. Safe to call
     /// repeatedly (idempotent).
     ///
@@ -687,6 +652,7 @@ impl GatedDeltaNet {
     /// layer state at every row of `plan`. Output and cache are bit-identical
     /// to the uncaptured forward: each route runs the entry the whole window
     /// takes on the split segments, carrying the f32 state between them.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn forward_captured(
         &self,
         x: &MxArray,

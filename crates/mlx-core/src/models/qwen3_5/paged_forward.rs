@@ -51,6 +51,52 @@ use super::decoder_layer::{DecoderLayer, Qwen3_5LayerKind};
 use super::layer_cache::Qwen3_5LayerCache;
 use crate::models::quantized_linear::LinearProj;
 
+/// Receives a tapped prefill's per-chunk layer outputs (the DFlash2 draft
+/// context; Splash `Qwen3_5Target::addCapture` on the prefill graph).
+pub(crate) trait PrefillTapSink {
+    /// Decoder layers whose output rows are tapped, in tap order.
+    fn tap_layers(&self) -> &[usize];
+    /// One chunk: prompt rows `[first_row, first_row + chunk.len())` and each
+    /// tapped layer's output over them.
+    fn chunk(&mut self, first_row: usize, chunk: &[u32], taps: &[MxArray]) -> Result<()>;
+    /// Materialize what [`Self::chunk`] queued before the prefill clears the
+    /// cache between chunks.
+    fn eval(&self) -> Result<()>;
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Block counts the prefill's active request holds right before each
+    /// chunk's forward.
+    pub(crate) static PREFILL_CHUNK_BLOCKS: std::cell::RefCell<Option<Vec<usize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Stands in for the configured paged prefill chunk rows on this thread.
+    pub(crate) static PREFILL_CHUNK_ROWS_OVERRIDE: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `configured`, or the test override on this thread.
+pub(crate) fn prefill_chunk_rows(configured: i32) -> i32 {
+    #[cfg(test)]
+    if let Some(rows) = PREFILL_CHUNK_ROWS_OVERRIDE.with(std::cell::Cell::get) {
+        return rows;
+    }
+    configured
+}
+
+#[cfg(test)]
+fn note_prefill_chunk_blocks(adapter: &PagedKVCacheAdapter) {
+    PREFILL_CHUNK_BLOCKS.with(|log| {
+        if let Some(log) = log.borrow_mut().as_mut() {
+            log.push(adapter.block_table().map_or(0, |table| table.num_blocks()));
+        }
+    });
+}
+
 fn bytes_to_mib(bytes: f64) -> f64 {
     bytes / (1024.0 * 1024.0)
 }
@@ -523,6 +569,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     chunk_size: i32,
     cached_rope_deltas: i32,
     turn_cancel: Option<&AtomicBool>,
+    mut taps: Option<&mut dyn PrefillTapSink>,
 ) -> Result<(MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -549,6 +596,8 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             layer_kinds,
             paged_adapter,
             cached_rope_deltas,
+            taps.as_mut()
+                .map(|sink| &mut **sink as &mut dyn PrefillTapSink),
         )
         .map(|logits| (logits, Vec::new()));
     }
@@ -574,6 +623,8 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             layer_kinds,
             paged_adapter,
             cached_rope_deltas,
+            taps.as_mut()
+                .map(|sink| &mut **sink as &mut dyn PrefillTapSink),
         )
         .map(|logits| (logits, Vec::new()));
     }
@@ -630,6 +681,9 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     let mut last_logits: Option<MxArray> = None;
     let mut checkpoints = Vec::new();
     let mut chunk_start_position = cached_prefix_len;
+    let tap_layers = taps
+        .as_deref()
+        .map_or_else(Vec::new, |sink| sink.tap_layers().to_vec());
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
         // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary
@@ -649,8 +703,10 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         paged_adapter
             .record_tokens(chunk)
             .map_err(Error::from_reason)?;
+        #[cfg(test)]
+        note_prefill_chunk_blocks(paged_adapter);
 
-        let hidden_states = run_paged_prefill_one_chunk(
+        let (hidden_states, chunk_taps) = run_paged_prefill_one_chunk_tapped(
             chunk,
             chunk_start_position,
             embed,
@@ -661,7 +717,11 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             /* inputs_embeds */ None,
             /* position_ids */ None,
             cached_rope_deltas,
+            &tap_layers,
         )?;
+        if let Some(sink) = taps.as_deref_mut() {
+            sink.chunk(chunk_start_position as usize, chunk, &chunk_taps)?;
+        }
 
         let context_after = chunk_start_position + chunk.len() as u32;
         let capture_checkpoint = checkpoint_boundaries.contains(&context_after);
@@ -721,6 +781,9 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             }
         } else {
             hidden_states.eval();
+            if let Some(sink) = taps.as_deref() {
+                sink.eval()?;
+            }
             if capture_checkpoint {
                 materialize_linear_layer_caches(caches)?;
                 if let Some(caches) = snapshot_materialized_linear_layer_caches(caches) {
@@ -810,6 +873,7 @@ fn run_paged_prefill_single_shot(
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     cached_rope_deltas: i32,
+    taps: Option<&mut dyn PrefillTapSink>,
 ) -> Result<MxArray> {
     let inference_info_enabled =
         tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
@@ -848,8 +912,13 @@ fn run_paged_prefill_single_shot(
     paged_adapter
         .record_tokens(suffix_tokens)
         .map_err(Error::from_reason)?;
+    #[cfg(test)]
+    note_prefill_chunk_blocks(paged_adapter);
 
-    let hidden_states = run_paged_prefill_one_chunk(
+    let tap_layers = taps
+        .as_deref()
+        .map_or_else(Vec::new, |sink| sink.tap_layers().to_vec());
+    let (hidden_states, chunk_taps) = run_paged_prefill_one_chunk_tapped(
         suffix_tokens,
         cached_prefix_len,
         embed,
@@ -860,7 +929,11 @@ fn run_paged_prefill_single_shot(
         /* inputs_embeds */ None,
         /* position_ids */ None,
         cached_rope_deltas,
+        &tap_layers,
     )?;
+    if let Some(sink) = taps {
+        sink.chunk(cached_prefix_len as usize, suffix_tokens, &chunk_taps)?;
+    }
 
     let logits = project_last_token_logits(&hidden_states, final_norm, lm_head, embed)?;
     if let Some(start) = single_shot_start {
@@ -1422,6 +1495,38 @@ fn run_paged_prefill_one_chunk(
     position_ids: Option<&MxArray>,
     cached_rope_deltas: i32,
 ) -> Result<MxArray> {
+    run_paged_prefill_one_chunk_tapped(
+        chunk_tokens,
+        chunk_first_position,
+        embed,
+        layers,
+        caches,
+        layer_kinds,
+        paged_adapter,
+        inputs_embeds,
+        position_ids,
+        cached_rope_deltas,
+        &[],
+    )
+    .map(|(hidden, _)| hidden)
+}
+
+/// [`run_paged_prefill_one_chunk`] that also returns the output rows of
+/// every layer in `tap_layers`, in that order.
+#[allow(clippy::too_many_arguments)]
+fn run_paged_prefill_one_chunk_tapped(
+    chunk_tokens: &[u32],
+    chunk_first_position: u32,
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    layer_kinds: &[Qwen3_5LayerKind],
+    paged_adapter: &mut PagedKVCacheAdapter,
+    inputs_embeds: Option<&MxArray>,
+    position_ids: Option<&MxArray>,
+    cached_rope_deltas: i32,
+    tap_layers: &[usize],
+) -> Result<(MxArray, Vec<MxArray>)> {
     debug_assert_eq!(layers.len(), caches.len());
     debug_assert_eq!(layers.len(), layer_kinds.len());
 
@@ -1450,6 +1555,7 @@ fn run_paged_prefill_one_chunk(
     // `take_along_axis` gather. Stays `None` (untouched) on the text-only
     // path where `position_ids` is `None`.
     let mut mrope_cache: Option<(MxArray, MxArray)> = None;
+    let mut taps: Vec<Option<MxArray>> = vec![None; tap_layers.len()];
 
     for (layer_idx, ((layer, cache_slot), kind)) in layers
         .iter_mut()
@@ -1477,9 +1583,31 @@ fn run_paged_prefill_one_chunk(
             rope_position_offset,
             &mut mrope_cache,
         )?;
+        for (slot, &tap_layer) in tap_layers.iter().enumerate() {
+            if tap_layer == layer_idx {
+                taps[slot] = Some(hidden_states.clone());
+            }
+        }
         crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
     }
-    Ok(hidden_states)
+    let taps = collect_taps(taps, tap_layers)?;
+    Ok((hidden_states, taps))
+}
+
+pub(crate) fn collect_taps(
+    taps: Vec<Option<MxArray>>,
+    tap_layers: &[usize],
+) -> Result<Vec<MxArray>> {
+    taps.into_iter()
+        .zip(tap_layers)
+        .map(|(tap, &layer)| {
+            tap.ok_or_else(|| {
+                Error::from_reason(format!(
+                    "DFlash2 target tap at layer {layer} was not captured"
+                ))
+            })
+        })
+        .collect()
 }
 
 fn project_last_token_logits(
@@ -1717,6 +1845,111 @@ pub(crate) fn run_paged_verify_step(
     tape: &mut Vec<Option<super::gated_delta_net::GdnLayerTape>>,
     cached_rope_deltas: i32,
 ) -> Result<super::mtp_decode::MtpVerifyOutput> {
+    paged_verify_core(
+        verify_ids,
+        embed,
+        layers,
+        caches,
+        final_norm,
+        lm_head,
+        layer_kinds,
+        paged_adapter,
+        tape,
+        cached_rope_deltas,
+        &[],
+        None,
+    )
+    .map(|(output, _)| output)
+}
+
+/// Splash `PagedAttention::addVerify` check: a paged verify lane's chunk is
+/// exactly the verify rows, its page table covers them, and they stay
+/// inside the window plus its speculative scratch rows
+/// (`chunkedPrefillValidationError`). Runs before anything is recorded.
+pub(crate) fn require_verify_chunk(
+    rows: usize,
+    adapter: &PagedKVCacheAdapter,
+    context_window: u32,
+) -> Result<()> {
+    use super::dflash2::DFLASH2_VERIFY_ROWS;
+    let verify_rows = DFLASH2_VERIFY_ROWS as u64;
+    let end = u64::from(adapter.current_token_count()) + verify_rows;
+    let block = u64::from(adapter.block_size().max(1));
+    let blocks = adapter
+        .block_table()
+        .map_or(0, |table| table.num_blocks() as u64);
+    let cause = if rows != DFLASH2_VERIFY_ROWS {
+        format!("{rows} rows, not {DFLASH2_VERIFY_ROWS}")
+    } else if blocks < end.div_ceil(block) {
+        format!("page table too short: {blocks} blocks for {end} rows of {block}-token blocks")
+    } else if end > u64::from(context_window) + verify_rows - 1 {
+        format!(
+            "context out of range: {end} rows past the {context_window}-token window and its {} scratch rows",
+            verify_rows - 1
+        )
+    } else {
+        return Ok(());
+    };
+    Err(Error::from_reason(format!(
+        "a paged verify lane's chunk is not a verify chunk: {cause}"
+    )))
+}
+
+/// The DFlash2 verify on the pool: [`require_verify_chunk`], then one
+/// 8-row forward that stores every row in the pages before attending over
+/// them (Splash `PagedAttention::addVerify`), returns the logits of all
+/// rows, the output rows of every layer in `tap_layers` (Splash
+/// `Qwen3_5Target::addVerify` captures), and writes each linear layer's
+/// window-final state into `gdn_dst` (the spare GDN cell) when given.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_paged_dflash2_verify_step(
+    verify_ids: &[u32],
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    layer_kinds: &[Qwen3_5LayerKind],
+    paged_adapter: &mut PagedKVCacheAdapter,
+    tape: &mut Vec<Option<super::gated_delta_net::GdnLayerTape>>,
+    cached_rope_deltas: i32,
+    tap_layers: &[usize],
+    gdn_dst: Option<&super::gdn_blob::GdnDestinations>,
+    context_window: u32,
+) -> Result<(MxArray, Vec<MxArray>)> {
+    require_verify_chunk(verify_ids.len(), paged_adapter, context_window)?;
+    paged_verify_core(
+        verify_ids,
+        embed,
+        layers,
+        caches,
+        final_norm,
+        lm_head,
+        layer_kinds,
+        paged_adapter,
+        tape,
+        cached_rope_deltas,
+        tap_layers,
+        gdn_dst,
+    )
+    .map(|(output, taps)| (output.logits, taps))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paged_verify_core(
+    verify_ids: &[u32],
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    layer_kinds: &[Qwen3_5LayerKind],
+    paged_adapter: &mut PagedKVCacheAdapter,
+    tape: &mut Vec<Option<super::gated_delta_net::GdnLayerTape>>,
+    cached_rope_deltas: i32,
+    tap_layers: &[usize],
+    gdn_dst: Option<&super::gdn_blob::GdnDestinations>,
+) -> Result<(super::mtp_decode::MtpVerifyOutput, Vec<MxArray>)> {
     debug_assert_eq!(layers.len(), caches.len());
     debug_assert_eq!(layers.len(), layer_kinds.len());
 
@@ -1726,6 +1959,11 @@ pub(crate) fn run_paged_verify_step(
     if verify_len == 0 {
         return Err(Error::from_reason("MTP verifier requires token IDs"));
     }
+    let n_linear = layer_kinds
+        .iter()
+        .filter(|kind| matches!(kind, Qwen3_5LayerKind::Linear))
+        .count();
+    let gdn_dst = gdn_dst.filter(|dst| dst.state.len() == n_linear && dst.conv.len() == n_linear);
     let chunk_first_position = paged_adapter.current_token_count();
     paged_adapter
         .record_tokens(verify_ids)
@@ -1741,6 +1979,8 @@ pub(crate) fn run_paged_verify_step(
     let num_layers = layers.len();
     tape.clear();
     tape.resize(num_layers, None);
+    let mut taps: Vec<Option<MxArray>> = vec![None; tap_layers.len()];
+    let mut linear_ordinal = 0usize;
     #[allow(clippy::needless_range_loop)]
     for layer_idx in 0..num_layers {
         let kind = layer_kinds[layer_idx];
@@ -1753,18 +1993,71 @@ pub(crate) fn run_paged_verify_step(
             &mut *ptr
         };
         let mut slot: Option<super::gated_delta_net::GdnLayerTape> = None;
-        hidden_states = layer.forward_paged_or_flat_with_tape(
-            &hidden_states,
-            kind,
-            paged_adapter,
-            chunk_first_position,
-            chunk_first_position,
-            /* is_prefill */ true,
-            Some(cache_slot),
-            Some(&mut slot),
-            rope_position_offset,
-        )?;
+        hidden_states = match (kind, gdn_dst) {
+            (Qwen3_5LayerKind::Linear, Some(dst)) => {
+                // Slots 2/3 are the spare cell's rows: the window-final
+                // state lands there, so the live and spare cells are the
+                // lane's two (Splash `QwenStateStorage::swapDecodeParity`).
+                let live = cache_slot.as_arrays_cache_mut().ok_or_else(|| {
+                    Error::from_reason("DFlash2 paged verify: linear layer has no GDN slot")
+                })?;
+                let mut detached = super::arrays_cache::ArraysCache::new(4);
+                if let Some(conv) = live.get(0) {
+                    detached.set(0, conv.clone())?;
+                }
+                if let Some(state) = live.get(1) {
+                    detached.set(1, state.clone())?;
+                }
+                detached.set(2, dst.state[linear_ordinal].clone())?;
+                detached.set(3, dst.conv[linear_ordinal].clone())?;
+                linear_ordinal += 1;
+                let mut detached = Qwen3_5LayerCache::Linear(detached);
+                let hidden = layer.forward_paged_or_flat_with_tape(
+                    &hidden_states,
+                    kind,
+                    paged_adapter,
+                    chunk_first_position,
+                    chunk_first_position,
+                    /* is_prefill */ true,
+                    Some(&mut detached),
+                    Some(&mut slot),
+                    rope_position_offset,
+                )?;
+                let written = detached.as_arrays_cache_mut().ok_or_else(|| {
+                    Error::from_reason("DFlash2 paged verify: detached GDN slot vanished")
+                })?;
+                for index in 0..2 {
+                    if let Some(array) = written.get(index) {
+                        live.set(index, array.clone())?;
+                    }
+                }
+                // The window-final state the commit may adopt (it checks the
+                // array is the spare row itself).
+                if let Some(tape) = slot.as_mut()
+                    && tape.final_state.is_none()
+                {
+                    tape.final_state = written.get(1).cloned();
+                }
+                hidden
+            }
+            _ => layer.forward_paged_or_flat_with_tape(
+                &hidden_states,
+                kind,
+                paged_adapter,
+                chunk_first_position,
+                chunk_first_position,
+                /* is_prefill */ true,
+                Some(cache_slot),
+                Some(&mut slot),
+                rope_position_offset,
+            )?,
+        };
         tape[layer_idx] = slot;
+        for (tap, &tap_layer) in tap_layers.iter().enumerate() {
+            if tap_layer == layer_idx {
+                taps[tap] = Some(hidden_states.clone());
+            }
+        }
         maybe_submit_paged_decode_layer(layer_idx, num_layers, &hidden_states);
     }
 
@@ -1774,8 +2067,9 @@ pub(crate) fn run_paged_verify_step(
     } else {
         embed.as_linear(&hiddens)?
     };
-    Ok(super::mtp_decode::MtpVerifyOutput::logits_only(
-        logits, hiddens,
+    Ok((
+        super::mtp_decode::MtpVerifyOutput::logits_only(logits, hiddens),
+        collect_taps(taps, tap_layers)?,
     ))
 }
 

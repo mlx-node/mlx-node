@@ -697,7 +697,7 @@ function startContextEstimates(
           ...options,
           ...(draftModelPath !== undefined ? { draftModelPath } : {}),
         });
-        if (result != null) windows.set(entry.name, result.speculativeWindowTokens ?? result.windowTokens);
+        if (result != null) windows.set(entry.name, result.windowTokens);
       } catch {
         // A load reports the same failure with its plan.
         windows.delete(entry.name);

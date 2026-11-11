@@ -73,7 +73,7 @@ impl ChatBackend for Qwen35Inner {
     }
 
     /// The flat lane has no executor that bounds it; the paged lane keeps
-    /// `preflight_paged_context`, DFlash2 `constrain_dflash2_context_params`.
+    /// `preflight_paged_context`, DFlash2 included.
     fn context_window(&self) -> Option<u32> {
         self.paged_adapter
             .is_none()
@@ -90,13 +90,6 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
-        if scope == ResetScope::PrefixMiss {
-            // The park takes the history with the state; this scope keeps it.
-            let history = self.cached_token_history.clone();
-            if crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self) {
-                self.cached_token_history = history;
-            }
-        }
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
         self.dflash2_states.live_anchor = None;
@@ -305,10 +298,10 @@ impl ChatBackend for Qwen35Inner {
                 kind: SpeculativeKind::DraftModel,
                 supported_input_media: MediaCapabilities::NONE,
                 supported_context_media: MediaCapabilities::NONE,
-                // DFlash2 verification currently uses the flat hybrid-cache
-                // snapshot/tape replay path. The target's paged adapter stays
-                // installed for ordinary AR turns but is not used here.
-                supports_paged_attention: false,
+                // DFlash2 verifies on the paged pool (Splash has no flat
+                // lane); the draft blocks scheduled speculation, so the lane
+                // is Barrier.
+                supports_paged_attention: true,
                 supports_streaming: true,
             })
         } else {
@@ -389,6 +382,12 @@ impl ChatBackend for Qwen35Inner {
         // the streaming eager-MTP path.
         debug_assert!(args.plan.use_paged_attention);
         debug_assert!(self.paged_adapter.is_some());
+        if matches!(
+            args.plan.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel)
+        ) {
+            return self.paged_dflash2_turn(args);
+        }
         self.paged_whole_turn(args)
     }
 
@@ -398,9 +397,6 @@ impl ChatBackend for Qwen35Inner {
         // core retains the algorithm-specific MTP gate and AR fallback.
         debug_assert!(args.media.is_empty());
         match args.plan.decoder {
-            DecoderPlan::Speculative(SpeculativeKind::DraftModel) => {
-                crate::models::qwen3_5::dflash2_turn::dflash2_chat_turn(self, args)
-            }
             DecoderPlan::Speculative(SpeculativeKind::NativeMtp) => self.dense_whole_turn(args),
             _ => Err(Error::from_reason(
                 "Qwen3.5 speculative turn received a non-speculative decoder plan",
@@ -411,12 +407,6 @@ impl ChatBackend for Qwen35Inner {
     fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         // The dense cores own the full image pipeline (VLM prefill, M-RoPE
         // deltas, paged-backend validation, missing-encoder error).
-        if self.paged_adapter.is_none() {
-            crate::models::qwen3_5::dflash2_turn::evict_parked_dflash2_for_flat_turn(
-                self,
-                args.tokens.len(),
-            );
-        }
         self.dense_whole_turn(args)
     }
 }

@@ -1401,7 +1401,7 @@ impl Qwen35Inner {
         })();
 
         // Any application — full or partial — invalidates the constants the
-        // compiled-verify tapes traced: a `?` mid-loop still applied the
+        // compiled tapes traced: a `?` mid-loop still applied the
         // earlier params, and erasing when nothing changed is a harmless
         // registry scan.
         self.erase_compiled_verifies();

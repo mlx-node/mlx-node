@@ -87,8 +87,7 @@ mod training;
 use self::chat_backend::resolve_qwen35_chat_params;
 pub(crate) use self::commands::{Qwen35Cmd, Qwen35FamilyCommand};
 pub(crate) use self::forward::{
-    DFlash2LogitsSpan, DFlash2TargetForward, PREFILL_STEP_SIZE, async_eval_layer_caches,
-    eval_layer_caches, forward_dflash2_with_taps, partition_prefill_chunks,
+    PREFILL_STEP_SIZE, async_eval_layer_caches, eval_layer_caches, partition_prefill_chunks,
 };
 use self::forward::{
     chunked_prefill, chunked_prefill_with_hidden, eager_verify_step, forward_inner,
@@ -179,10 +178,6 @@ pub(crate) struct Qwen35Inner {
     pub(crate) max_memory_bytes: Option<u64>,
     /// `--max-context`: the context every turn may hold, at most the plan's.
     pub(crate) max_context: Option<u32>,
-    /// Latched when the compiled DFlash2 verify graph fails at trace or
-    /// replay — the failure mode is structural, so the stepper stays on the
-    /// eager path for the rest of the model's lifetime.
-    pub(crate) dflash2_compiled_verify_disabled: bool,
     /// Same latch for the compiled CLEF decide backbone. Per-model state
     /// (not thread-local) so it sticks regardless of which thread runs
     /// `decide_clef`.
@@ -249,7 +244,7 @@ pub(crate) struct Qwen35Inner {
     /// table. Batched decode parks the active owner and stacks table rows.
     scheduled_recurrent: RecurrentStateTable<Vec<Qwen3_5LayerCache>>,
     scheduled_mtp: crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState,
-    active_scheduled_seq: Option<SeqId>,
+    pub(crate) active_scheduled_seq: Option<SeqId>,
     /// True when a paged-core turn has populated
     /// the paged adapter's `LayerKVPool` since the last flat full-attention
     /// prefill, so the flat `self.caches` full-attention slots do NOT
@@ -447,8 +442,7 @@ pub struct Qwen3_5GenerationResult {
 /// derives from the pool's MAX capacity (grow-on-demand pools are preflighted
 /// against the ceiling they grow toward), while `paged_block_capacity` is the
 /// physical pool size actually allocated at load and may lag after a grow.
-/// `speculative_window_tokens` is set only with a DFlash2 draft: it bounds
-/// text turns that speculate, and `effective_window_tokens` bounds the rest.
+/// `effective_window_tokens` bounds every turn, a DFlash2 one included.
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct Qwen3_5ContextLimits {
@@ -456,34 +450,23 @@ pub struct Qwen3_5ContextLimits {
     pub effective_window_tokens: u32,
     pub paged_block_capacity: u32,
     pub paged_block_size: u32,
-    pub speculative_window_tokens: Option<u32>,
     /// The output budget fills the window: a prompt leaves room for one new
     /// token and the budget is clamped to `window - prompt`.
     pub rest_of_window_output_budget: bool,
     /// An omitted budget on `effective_window_tokens` is the rest of that
     /// window. Set when the plan prices that window: the paged pool, or the
-    /// flat lane of a load with neither pool nor draft. A flat load with a
-    /// draft publishes the trained length there and keeps the native
-    /// default.
+    /// flat lane of a load without a pool.
     pub omitted_budget_is_rest_of_window: bool,
-    /// The same for `speculative_window_tokens`: set when that window has a
-    /// memory term (the pool or the live reservation).
-    pub speculative_omitted_budget_is_rest_of_window: bool,
     /// Format of the K/V a turn on `effective_window_tokens` writes.
     #[napi(ts_type = "'int8' | 'bf16'")]
     pub kv_format: String,
-    /// Format of the K/V a turn on `speculative_window_tokens` writes.
-    #[napi(ts_type = "'int8' | 'bf16' | undefined")]
-    pub speculative_kv_format: Option<String>,
 }
 
 impl Qwen3_5ContextLimits {
-    /// `speculative` is the DFlash2 window, whether a memory term bounds it
-    /// and the K/V format it was priced at; `memory_window` whether the plan
-    /// sizes the effective window; `kv_format` the effective lane's.
+    /// `memory_window` is whether the plan sizes the effective window;
+    /// `kv_format` the effective lane's.
     pub(crate) fn from_parts(
         value: (u32, u32, u32, u32),
-        speculative: Option<(u32, bool, crate::transformer::KvFormat)>,
         memory_window: bool,
         kv_format: crate::transformer::KvFormat,
     ) -> Self {
@@ -492,13 +475,9 @@ impl Qwen3_5ContextLimits {
             effective_window_tokens: value.1,
             paged_block_capacity: value.2,
             paged_block_size: value.3,
-            speculative_window_tokens: speculative.map(|(window, _, _)| window),
             rest_of_window_output_budget: true,
             omitted_budget_is_rest_of_window: memory_window,
-            speculative_omitted_budget_is_rest_of_window: speculative
-                .is_some_and(|(_, memory_bound, _)| memory_bound),
             kv_format: kv_format.as_str().to_string(),
-            speculative_kv_format: speculative.map(|(_, _, format)| format.as_str().to_string()),
         }
     }
 }

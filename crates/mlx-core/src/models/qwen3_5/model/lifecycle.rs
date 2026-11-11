@@ -88,7 +88,6 @@ impl Qwen35Inner {
             cached_paged_image_token_positions: Vec::new(),
             cached_rope_deltas: None,
             model_id,
-            dflash2_compiled_verify_disabled: false,
             clef_compiled_decide_disabled: false,
             clef_compiled_decide_shapes: std::collections::HashSet::new(),
             active_cache_owner_id: String::new(),
@@ -347,6 +346,18 @@ impl Qwen35Inner {
         }
     }
 
+    /// A DFlash2 companion verifies on the block-paged pool; a load that
+    /// builds none refuses it (Splash has no flat lane).
+    pub(crate) fn require_dflash2_pool(&self) -> Result<()> {
+        if self.dflash2.is_some() && self.paged_adapter.is_none() {
+            return Err(Error::from_reason(
+                "Qwen3.8 DFlash2 runs on the block-paged KV pool and this load has none; \
+                 load without the companion (autoLoadDraft: false) or with the paged cache",
+            ));
+        }
+        Ok(())
+    }
+
     /// Tokens one paged, vision, MTP or flat autoregressive turn may hold:
     /// the plan's pool lane, or its flat lane on a load with neither pool
     /// nor draft. Without a plan (a pool installed by a test), the pool's
@@ -388,8 +399,8 @@ impl Qwen35Inner {
         })
     }
 
-    /// `(trained, pool window, pool blocks, block size)`. Every turn but a
-    /// DFlash2 one clamps on the pool window.
+    /// `(trained, pool window, pool blocks, block size)`. Every turn clamps
+    /// on the pool window.
     pub(crate) fn paged_context_limits(&self) -> (u32, u32, u32, u32) {
         let (blocks, block_size) = self.paged_adapter.as_ref().map_or((0, 0), |adapter| {
             (adapter.block_capacity(), adapter.block_size())
@@ -402,27 +413,9 @@ impl Qwen35Inner {
         )
     }
 
-    /// The window a DFlash2 turn clamps on: the plan's speculative lane, the
-    /// context cap without a plan, both at most the cap; `None` without a
-    /// draft.
-    pub(crate) fn speculative_window(&self) -> Option<u32> {
-        self.dflash2.as_ref()?;
-        let cap = self.context_cap();
-        Some(
-            self.memory_plan
-                .as_ref()
-                .and_then(|plan| plan.speculative.as_ref())
-                .map_or(cap, |lane| lane.window.maximum().min(cap)),
-        )
-    }
-
     pub(crate) fn context_limits_snapshot(
         &self,
     ) -> crate::models::qwen3_5::model::Qwen3_5ContextLimits {
-        let memory_bound = self
-            .memory_plan
-            .as_ref()
-            .is_some_and(crate::engine::memory_plan::MemoryPlan::prices_speculative_lane);
         let kv_format = match self.paged_adapter.as_ref() {
             Some(adapter) => match adapter.layer_kv_pool().cache_dtype() {
                 mlx_paged_attn::metal::MetalDtype::Int8 => crate::transformer::KvFormat::Int8,
@@ -430,12 +423,8 @@ impl Qwen35Inner {
             },
             None => self.config.kv_format(),
         };
-        let speculative_format =
-            crate::models::qwen3_5::dflash2_turn::dflash2_target_kv_format(self);
         crate::models::qwen3_5::model::Qwen3_5ContextLimits::from_parts(
             self.paged_context_limits(),
-            self.speculative_window()
-                .map(|window| (window, memory_bound, speculative_format)),
             self.paged_adapter.is_some()
                 || self
                     .memory_plan
@@ -587,9 +576,8 @@ impl Qwen35Inner {
             )));
         }
         if self.active_scheduled_seq.is_none() {
-            // The flat caches may hold a DFlash2 turn's state; the scheduled
-            // sequence is about to replace them.
-            crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
+            // The scheduled sequence is about to replace the live caches.
+            self.drop_live_dflash2_window("activate_scheduled");
         }
         self.park_active_scheduled_recurrent()?;
         self.caches = Some(
@@ -819,6 +807,19 @@ impl Qwen35Inner {
         result
     }
 
+    /// Drops the live draft window: a site that moves the live request or
+    /// caches without taps leaves it behind (Splash parks it as a state;
+    /// there is no paged state store for it yet).
+    pub(crate) fn drop_live_dflash2_window(&mut self, site: &'static str) {
+        self.dflash2_context = None;
+        self.dflash2_turn_state = None;
+        self.dflash2_states.live_anchor = None;
+        self.dflash2_prefix.note_drop(
+            site,
+            crate::models::qwen3_5::dflash2_state::trace::DropKind::Invalidated,
+        );
+    }
+
     /// Clear cached token history, image key, and rope deltas.
     fn clear_reuse_state(&mut self) {
         self.cached_token_history.clear();
@@ -982,17 +983,13 @@ impl Qwen35Inner {
 }
 
 impl Qwen35Inner {
-    /// Erase every compiled tape this instance has registered (DFlash2
-    /// verify and the CLEF decide backbone). Each graph id namespaces a
+    /// Erase every compiled tape this instance has registered (the CLEF
+    /// decide backbone). Each graph id namespaces a
     /// process-lifetime C++ registry entry whose tape retains this model's
     /// captured weights: tapes must be invalidated when the weights go away
     /// (drop) or change (training updates), or a later call silently replays
     /// the stale constants.
     pub(super) fn erase_compiled_verifies(&self) {
-        crate::compiled_graph::erase_compiled_graphs_matching(
-            forward::COMPILED_VERIFY_ERASE_MASK,
-            forward::COMPILED_VERIFY_TAG | ((self.model_id & 0x00FF_FFFF) << 8),
-        );
         crate::compiled_graph::erase_compiled_graphs_matching(
             forward::COMPILED_DECIDE_ERASE_MASK,
             forward::COMPILED_DECIDE_TAG | ((self.model_id & 0x00FF_FFFF) << 8),
