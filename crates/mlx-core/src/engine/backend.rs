@@ -578,8 +578,6 @@ pub(crate) struct TurnSetup<'a> {
     /// Delta-continuation flag (this turn appended a text delta on top of
     /// the live KV caches rather than running a fresh prefill).
     pub is_delta: bool,
-    /// Whether this turn carried image input.
-    pub has_images: bool,
     /// Total post-prefill sequence length: cached prefix + freshly
     /// prefilled tokens (i.e. the full prompt; the session-delta paths
     /// pass `cached_history + delta`).

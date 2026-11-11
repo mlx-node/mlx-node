@@ -11,11 +11,6 @@ pub(crate) enum Qwen35FamilyCommand {
         cancelled: Arc<AtomicBool>,
         reply: ResponseTx<String>,
     },
-    Generate {
-        prompt_tokens: MxArray,
-        config: Qwen3_5GenerationConfig,
-        reply: ResponseTx<Qwen3_5GenerationResult>,
-    },
     /// Static FP8 activation-amax calibration prefill (NVIDIA modelopt
     /// `MaxCalibrator`). For each raw text: tokenize WITHOUT the chat template,
     /// truncate to `calib_seq` tokens, then run PREFILL ONLY (no generation, no
@@ -46,27 +41,6 @@ pub(crate) enum Qwen35FamilyCommand {
         save_path: String,
         reply: ResponseTx<()>,
     },
-    /// Test-only: snapshot the flat-MTP cache state between turns —
-    /// `(cached_token_history.len(), flat_mtp_caches_desynced,
-    /// flat_full_reprefill_count, flat_mtp_last_rollback_unemitted)`. The length
-    /// is the committed prompt+generation history (how many tokens a turn
-    /// actually committed, independent of the warm/heal path a later turn
-    /// takes); the flag is whether a mid-cycle stop stranded tokens and armed
-    /// the heal; the count is the monotonic number of full-history re-prefill
-    /// heals taken so far; and the final value is the independently
-    /// engine-computed tail passed to the family rollback hook.
-    #[doc(hidden)]
-    MtpFlatStateForTest {
-        reply: ResponseTx<(usize, bool, u64, usize)>,
-    },
-    /// Test-only: arm the flat-MTP desync heal (`flat_mtp_caches_desynced =
-    /// true`) so the NEXT delta turn takes the discard+re-prefill path
-    /// deterministically. The heal re-prefills from `cached_token_history` and
-    /// ignores the (discarded) cache contents, so arming the flag on a clean
-    /// session faithfully exercises the heal without a host-timing-dependent
-    /// mid-cycle cancel.
-    #[doc(hidden)]
-    ForceFlatMtpDesyncForTest { reply: ResponseTx<()> },
     /// Test-only: snapshot the paged-MTP GDN bookkeeping between turns — see
     /// [`MtpPagedGdnStateForTest`].
     #[doc(hidden)]
@@ -76,7 +50,7 @@ pub(crate) enum Qwen35FamilyCommand {
     /// Test-only: arm the one-shot forced frontier mismatch so the NEXT paged
     /// epilogue takes the refuse-to-persist branch deterministically (the
     /// natural trigger is a swallowed adapter-truncate failure, which no test
-    /// can provoke on demand). Pattern of `ForceFlatMtpDesyncForTest`.
+    /// can provoke on demand).
     #[doc(hidden)]
     ForcePagedGdnMismatchForTest { reply: ResponseTx<()> },
     /// Test-only state oracle: recompute GDN over the persisted history
@@ -175,13 +149,6 @@ impl crate::engine::model_command::FamilyCommand<Qwen35Inner> for Qwen35FamilyCo
             } => {
                 let _ = reply.send(inner.decide_clef(&request, &cancelled));
             }
-            Qwen35FamilyCommand::Generate {
-                prompt_tokens,
-                config,
-                reply,
-            } => {
-                let _ = reply.send(inner.generate_sync(prompt_tokens, config));
-            }
             Qwen35FamilyCommand::CalibratePrefillRaw {
                 texts,
                 calib_seq,
@@ -194,18 +161,6 @@ impl crate::engine::model_command::FamilyCommand<Qwen35Inner> for Qwen35FamilyCo
             }
             Qwen35FamilyCommand::SaveModel { save_path, reply } => {
                 let _ = reply.send(inner.save_model_sync(&save_path));
-            }
-            Qwen35FamilyCommand::MtpFlatStateForTest { reply } => {
-                let _ = reply.send(Ok((
-                    inner.cached_token_history.len(),
-                    inner.flat_mtp_caches_desynced,
-                    inner.flat_full_reprefill_count,
-                    inner.flat_mtp_last_rollback_unemitted,
-                )));
-            }
-            Qwen35FamilyCommand::ForceFlatMtpDesyncForTest { reply } => {
-                inner.flat_mtp_caches_desynced = true;
-                let _ = reply.send(Ok(()));
             }
             Qwen35FamilyCommand::MtpPagedGdnStateForTest { reply } => {
                 let _ = reply.send(Ok(MtpPagedGdnStateForTest {

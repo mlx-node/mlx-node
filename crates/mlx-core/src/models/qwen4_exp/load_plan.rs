@@ -239,7 +239,7 @@ pub(super) fn plan_engine(
         draft_weights_bytes: 0,
         held_back_bytes: held_back,
     };
-    MemoryPlan::evaluate(footprint, Some(pool_input(c, &transient, &state)), None)
+    MemoryPlan::evaluate(footprint, Some(pool_input(c, &transient, &state)))
         .map_err(|error| Error::from_reason(error.message(label)))
 }
 

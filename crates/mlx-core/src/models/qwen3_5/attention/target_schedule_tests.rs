@@ -1,7 +1,6 @@
 //! Independent experiments: exact grid permutation, 512-key split policy,
 //! and the separately prepared source-style 256-thread partial reducer.
 use super::*;
-use crate::array::kv_int8::{Int8KvRows, segmented_sdpa_int8_with_route};
 use crate::compiled_graph::{erase_compiled_graphs_matching, invoke_compiled_graph};
 
 const FLAT: &str = "MLX_SEGMENTED_NAX_FLAT_GRID";
@@ -99,69 +98,28 @@ fn data(shape: &[i64], seed: u32, scale: f32) -> Result<MxArray> {
         .collect();
     MxArray::from_float32(&v, shape)?.astype(DType::BFloat16)
 }
-fn fixture(
-    b: i64,
-    h: i64,
-    kv: i64,
-    r: i64,
-    p: i64,
-    quant: bool,
-    seed: u32,
-    sharp: f32,
-) -> Result<Vec<MxArray>> {
+fn fixture(b: i64, h: i64, kv: i64, r: i64, p: i64, seed: u32, sharp: f32) -> Result<Vec<MxArray>> {
     let q = data(&[b, h, r, 256], seed, sharp)?;
     let pk = data(&[b, kv, p, 256], seed + 1, 1.0)?;
     let pv = data(&[b, kv, p, 256], seed + 2, 1.0)?;
     let nk = data(&[b, kv, r, 256], seed + 3, 1.0)?;
     let nv = data(&[b, kv, r, 256], seed + 4, 1.0)?;
-    let a = if quant {
-        let pre = Int8KvRows::quantize(&pk, &pv)?;
-        let new = Int8KvRows::quantize(&nk, &nv)?;
-        vec![
-            q,
-            pre.keys,
-            pre.values,
-            new.keys,
-            new.values,
-            pre.key_scales,
-            pre.value_scales,
-            new.key_scales,
-            new.value_scales,
-        ]
-    } else {
-        vec![q, pk, pv, nk, nv]
-    };
+    let a = vec![q, pk, pv, nk, nv];
     MxArray::eval_arrays(&a.iter().collect::<Vec<_>>())?;
     Ok(a)
 }
 fn run(a: &[MxArray]) -> Result<MxArray> {
-    if a.len() == 9 {
-        let pre = Int8KvRows {
-            keys: a[1].clone(),
-            values: a[2].clone(),
-            key_scales: a[5].clone(),
-            value_scales: a[6].clone(),
-        };
-        let new = Int8KvRows {
-            keys: a[3].clone(),
-            values: a[4].clone(),
-            key_scales: a[7].clone(),
-            value_scales: a[8].clone(),
-        };
-        segmented_sdpa_int8_with_route(&a[0], &pre, &new, 0.0625, true, 2)
-    } else {
-        let h = unsafe {
-            mlx_sys::mlx_segmented_sdpa_test_forward_nax(
-                a[0].as_raw_ptr(),
-                a[1].as_raw_ptr(),
-                a[2].as_raw_ptr(),
-                a[3].as_raw_ptr(),
-                a[4].as_raw_ptr(),
-                0.0625,
-            )
-        };
-        MxArray::from_handle(h, "strict NAX schedule test")
-    }
+    let h = unsafe {
+        mlx_sys::mlx_segmented_sdpa_test_forward_nax(
+            a[0].as_raw_ptr(),
+            a[1].as_raw_ptr(),
+            a[2].as_raw_ptr(),
+            a[3].as_raw_ptr(),
+            a[4].as_raw_ptr(),
+            0.0625,
+        )
+    };
+    MxArray::from_handle(h, "strict NAX schedule test")
 }
 fn supported() -> bool {
     if !unsafe { mlx_sys::mlx_metal_is_available() } {
@@ -172,7 +130,7 @@ fn supported() -> bool {
 }
 
 /// F64 exact-input reference, all256 output coordinates of the first and last
-/// query in every batch. Int8 operands use their exact F32 per-row scales.
+/// query in every batch.
 fn oracle(a: &[MxArray]) -> Result<Vec<(usize, f32)>> {
     let b = a[0].shape_at(0)? as usize;
     let h = a[0].shape_at(1)? as usize;
@@ -184,12 +142,7 @@ fn oracle(a: &[MxArray]) -> Result<Vec<(usize, f32)>> {
     let read = |plane: usize, batch: usize, head: usize, row: usize, col: usize| -> f64 {
         let n = if plane <= 2 { p } else { r };
         let idx = (batch * kv + head) * n + row;
-        let scale = if a.len() == 9 {
-            f64::from(x[plane + 4][idx])
-        } else {
-            1.0
-        };
-        f64::from(x[plane][idx * 256 + col]) * scale
+        f64::from(x[plane][idx * 256 + col])
     };
     let mut expected = Vec::new();
     for batch in 0..b {
@@ -246,7 +199,6 @@ fn assert_oracle(out: &MxArray, expected: &[(usize, f32)], label: &str) -> Resul
     let max_ulps = max / ulp;
     let mean_ulps = sum / expected.len() as f64 / f64::from(ulp);
     eprintln!("{label}: F64 max={max_ulps:.6} mean={mean_ulps:.6} BF16 peak-ulps");
-    // Identical established independent-F64 gate as int8_verify_routes_match_the_dequantized_reference.
     assert!(
         max_ulps <= 3.0 && mean_ulps <= 0.35,
         "{label}: {max_ulps}/{mean_ulps}"
@@ -269,62 +221,56 @@ fn target_nax_grid_is_exact_and_split_policies_match_f64() -> Result<()> {
         (1, 16, 2, 8, 8192, 16.0),
         (2, 16, 2, 8, 32768, 1.0),
     ] {
-        for quant in [false, true] {
-            let a = fixture(b, h, kv, r, p, quant, 0x12345678, sharp)?;
-            let expected = oracle(&a)?;
-            for keys512 in [false, true] {
-                setting(KEYS, keys512);
-                for reduce256 in [false, true] {
-                    setting(REDUCE, reduce256);
-                    setting(FLAT, false);
-                    let original = run(&a)?;
-                    let old = bits(&original)?;
-                    setting(FLAT, true);
-                    unsafe { mlx_sys::mlx_test_kquant_counting(true) };
-                    let flattened = run(&a)?;
-                    let flat = bits(&flattened)?;
-                    let flat_count = unsafe {
-                        mlx_sys::mlx_test_kquant_family_count(
-                            c"segmented_sdpa_nax_flat_grid".as_ptr(),
-                        )
-                    };
-                    let reduce_count = unsafe {
-                        mlx_sys::mlx_test_kquant_family_count(c"segmented_sdpa_reduce_256".as_ptr())
-                    };
-                    let page_count = unsafe {
-                        mlx_sys::mlx_test_kquant_family_count(
-                            c"segmented_sdpa_nax_page_splits".as_ptr(),
-                        )
-                    };
-                    unsafe { mlx_sys::mlx_test_kquant_counting(false) };
-                    assert_eq!(
-                        page_count > 0,
-                        std::env::var(PAGES).is_ok_and(|v| v == "1"),
-                        "page-split flag did not reach its dispatch"
-                    );
-                    assert!(
-                        flat_count > 0,
-                        "flat-grid flag did not reach the NAX dispatch"
-                    );
-                    assert_eq!(
-                        reduce_count > 0,
-                        reduce256,
-                        "reducer flag did not reach its dispatch"
-                    );
-                    assert_eq!(
-                        flat, old,
-                        "grid changes bits B{b} H{h}/{kv} P{p} quant{quant} keys{keys512} reduce{reduce256}"
-                    );
-                    assert_eq!(flattened.dtype()?, DType::BFloat16);
-                    assert_eq!(flattened.shape()?.as_ref(), &[b, h, r, 256]);
-                    assert_oracle(
-                        &flattened,
-                        &expected,
-                        &format!(
-                            "B{b} H{h}/{kv} P{p} quant{quant} keys{keys512} reduce{reduce256}"
-                        ),
-                    )?;
-                }
+        let a = fixture(b, h, kv, r, p, 0x12345678, sharp)?;
+        let expected = oracle(&a)?;
+        for keys512 in [false, true] {
+            setting(KEYS, keys512);
+            for reduce256 in [false, true] {
+                setting(REDUCE, reduce256);
+                setting(FLAT, false);
+                let original = run(&a)?;
+                let old = bits(&original)?;
+                setting(FLAT, true);
+                unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+                let flattened = run(&a)?;
+                let flat = bits(&flattened)?;
+                let flat_count = unsafe {
+                    mlx_sys::mlx_test_kquant_family_count(c"segmented_sdpa_nax_flat_grid".as_ptr())
+                };
+                let reduce_count = unsafe {
+                    mlx_sys::mlx_test_kquant_family_count(c"segmented_sdpa_reduce_256".as_ptr())
+                };
+                let page_count = unsafe {
+                    mlx_sys::mlx_test_kquant_family_count(
+                        c"segmented_sdpa_nax_page_splits".as_ptr(),
+                    )
+                };
+                unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+                assert_eq!(
+                    page_count > 0,
+                    std::env::var(PAGES).is_ok_and(|v| v == "1"),
+                    "page-split flag did not reach its dispatch"
+                );
+                assert!(
+                    flat_count > 0,
+                    "flat-grid flag did not reach the NAX dispatch"
+                );
+                assert_eq!(
+                    reduce_count > 0,
+                    reduce256,
+                    "reducer flag did not reach its dispatch"
+                );
+                assert_eq!(
+                    flat, old,
+                    "grid changes bits B{b} H{h}/{kv} P{p} keys{keys512} reduce{reduce256}"
+                );
+                assert_eq!(flattened.dtype()?, DType::BFloat16);
+                assert_eq!(flattened.shape()?.as_ref(), &[b, h, r, 256]);
+                assert_oracle(
+                    &flattened,
+                    &expected,
+                    &format!("B{b} H{h}/{kv} P{p} keys{keys512} reduce{reduce256}"),
+                )?;
             }
         }
     }
@@ -340,39 +286,36 @@ fn target_nax_schedule_replays_changing_prefix_partitions() -> Result<()> {
     let _restore = EnvRestore::new();
     unsafe { std::env::remove_var(BLOCKS) };
     for b in [1, 2] {
-        for quant in [false, true] {
-            for keys512 in [false, true] {
-                setting(KEYS, keys512);
-                for reduce256 in [false, true] {
-                    setting(REDUCE, reduce256);
-                    let id = 0xDFCA_7200_0000_0000
-                        | ((b as u64) << 8)
-                        | ((quant as u64) << 2)
-                        | ((keys512 as u64) << 1)
-                        | reduce256 as u64;
-                    erase_compiled_graphs_matching(u64::MAX, id);
-                    let builds = std::cell::Cell::new(0);
-                    let mut builder = |args: &[MxArray]| {
-                        builds.set(builds.get() + 1);
-                        Ok(vec![run(args)?])
-                    };
-                    for (step, p) in [87, 2048, 8192, 8193, 16384, 32768].into_iter().enumerate() {
-                        let a = fixture(b, 16, 2, 8, p, quant, 0xabcdef00 + step as u32, 1.0)?;
-                        let refs = a.iter().collect::<Vec<_>>();
-                        setting(FLAT, true);
-                        let replay = invoke_compiled_graph(id, &refs, 1, true, &mut builder)?
-                            .ok_or_else(|| Error::from_reason("schedule compile failed"))?;
-                        let replay_bits = bits(&replay[0])?;
-                        setting(FLAT, false);
-                        assert_eq!(
-                            replay_bits,
-                            bits(&run(&a)?)?,
-                            "B{b} quant{quant} keys{keys512} reduce{reduce256} P{p}"
-                        );
-                    }
-                    assert_eq!(builds.get(), 1, "partition change retraced");
-                    erase_compiled_graphs_matching(u64::MAX, id);
+        for keys512 in [false, true] {
+            setting(KEYS, keys512);
+            for reduce256 in [false, true] {
+                setting(REDUCE, reduce256);
+                let id = 0xDFCA_7200_0000_0000
+                    | ((b as u64) << 8)
+                    | ((keys512 as u64) << 1)
+                    | reduce256 as u64;
+                erase_compiled_graphs_matching(u64::MAX, id);
+                let builds = std::cell::Cell::new(0);
+                let mut builder = |args: &[MxArray]| {
+                    builds.set(builds.get() + 1);
+                    Ok(vec![run(args)?])
+                };
+                for (step, p) in [87, 2048, 8192, 8193, 16384, 32768].into_iter().enumerate() {
+                    let a = fixture(b, 16, 2, 8, p, 0xabcdef00 + step as u32, 1.0)?;
+                    let refs = a.iter().collect::<Vec<_>>();
+                    setting(FLAT, true);
+                    let replay = invoke_compiled_graph(id, &refs, 1, true, &mut builder)?
+                        .ok_or_else(|| Error::from_reason("schedule compile failed"))?;
+                    let replay_bits = bits(&replay[0])?;
+                    setting(FLAT, false);
+                    assert_eq!(
+                        replay_bits,
+                        bits(&run(&a)?)?,
+                        "B{b} keys{keys512} reduce{reduce256} P{p}"
+                    );
                 }
+                assert_eq!(builds.get(), 1, "partition change retraced");
+                erase_compiled_graphs_matching(u64::MAX, id);
             }
         }
     }
@@ -386,7 +329,7 @@ fn target_nax_schedule_batched_microbenchmark() -> Result<()> {
         return Ok(());
     }
     for p in [2048, 32768] {
-        let a = fixture(1, 16, 2, 8, p, false, 0x54321000, 1.0)?;
+        let a = fixture(1, 16, 2, 8, p, 0x54321000, 1.0)?;
         for _ in 0..8 {
             let o = run(&a)?;
             MxArray::eval_arrays(&[&o])?;
@@ -412,7 +355,7 @@ fn target_nax_schedule_batched_microbenchmark() -> Result<()> {
 
 /// FP32 split numerator/denominator with BF16 probabilities/output. Check
 /// all output dimensions against an independent exact-input F64 oracle,
-/// including many empty splits, INT8 scales and compiled dynamic lengths.
+/// including many empty splits and compiled dynamic lengths.
 #[test]
 #[ignore = "coordinated Metal FP32 partial experiment; --test-threads=1"]
 fn target_nax_fp32_reduction_matches_f64_and_replays() -> Result<()> {
@@ -425,81 +368,77 @@ fn target_nax_fp32_reduction_matches_f64_and_replays() -> Result<()> {
     unsafe { std::env::remove_var(BLOCKS) };
     setting(FLAT, false);
     setting(REDUCE, false);
-    for quant in [false, true] {
-        for keys512 in [false, true] {
-            setting(KEYS, keys512);
-            let id = 0xDFCA_7300_0000_0000 | ((quant as u64) << 1) | keys512 as u64;
-            erase_compiled_graphs_matching(u64::MAX, id);
-            let builds = std::cell::Cell::new(0);
-            let mut builder = |args: &[MxArray]| {
-                builds.set(builds.get() + 1);
-                Ok(vec![run(args)?])
+    for keys512 in [false, true] {
+        setting(KEYS, keys512);
+        let id = 0xDFCA_7300_0000_0000 | keys512 as u64;
+        erase_compiled_graphs_matching(u64::MAX, id);
+        let builds = std::cell::Cell::new(0);
+        let mut builder = |args: &[MxArray]| {
+            builds.set(builds.get() + 1);
+            Ok(vec![run(args)?])
+        };
+        for (step, (b, h, kv, p, sharp)) in [
+            (1, 16, 2, 1, 1.0),
+            (1, 16, 2, 87, 1.0),
+            (2, 16, 2, 2048, 1.0),
+            (2, 24, 4, 1025, 1.0),
+            (1, 16, 2, 8192, 16.0),
+            (1, 16, 2, 32768, 1.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let a = fixture(b, h, kv, 8, p, 0x73abcdef + step as u32, sharp)?;
+            let expected = oracle(&a)?;
+            setting(FP, false);
+            let old = run(&a)?;
+            let old_bits = bits(&old)?;
+            setting(FP, true);
+            unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+            let precise = run(&a)?;
+            let precise_bits = bits(&precise)?;
+            let count = unsafe {
+                mlx_sys::mlx_test_kquant_family_count(c"segmented_sdpa_nax_fp32_reduction".as_ptr())
             };
-            for (step, (b, h, kv, p, sharp)) in [
-                (1, 16, 2, 1, 1.0),
-                (1, 16, 2, 87, 1.0),
-                (2, 16, 2, 2048, 1.0),
-                (2, 24, 4, 1025, 1.0),
-                (1, 16, 2, 8192, 16.0),
-                (1, 16, 2, 32768, 1.0),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let a = fixture(b, h, kv, 8, p, quant, 0x73abcdef + step as u32, sharp)?;
-                let expected = oracle(&a)?;
-                setting(FP, false);
-                let old = run(&a)?;
-                let old_bits = bits(&old)?;
-                setting(FP, true);
-                unsafe { mlx_sys::mlx_test_kquant_counting(true) };
-                let precise = run(&a)?;
-                let precise_bits = bits(&precise)?;
-                let count = unsafe {
-                    mlx_sys::mlx_test_kquant_family_count(
-                        c"segmented_sdpa_nax_fp32_reduction".as_ptr(),
-                    )
-                };
-                unsafe { mlx_sys::mlx_test_kquant_counting(false) };
-                assert!(count > 0, "FP32 flag did not select its primitive");
-                assert_eq!(precise.dtype()?, DType::BFloat16);
-                assert_eq!(precise.shape()?.as_ref(), old.shape()?.as_ref());
-                assert_oracle(
-                    &precise,
-                    &expected,
-                    &format!("FP32 B{b} H{h}/{kv} P{p} quant{quant} keys{keys512}"),
-                )?;
-                eprintln!(
-                    "FP32 B{b} H{h}/{kv} P{p} quant{quant} keys{keys512} changed {}/{}",
-                    precise_bits
-                        .iter()
-                        .zip(&old_bits)
-                        .filter(|(a, b)| a != b)
-                        .count(),
-                    precise_bits.len()
-                );
-                // Keep one family geometry per replay, but change prefix,
-                // partition count, values and scales. Other geometry is eager-only.
-                if b == 1 && h == 16 {
-                    let refs = a.iter().collect::<Vec<_>>();
-                    let replay = invoke_compiled_graph(id, &refs, 1, true, &mut builder)?
-                        .ok_or_else(|| Error::from_reason("FP32 reduction compile failed"))?;
-                    assert_eq!(
-                        bits(&replay[0])?,
-                        precise_bits,
-                        "FP32 replay changed bits at P{p}"
-                    );
-                }
-                setting(FP, false);
+            unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+            assert!(count > 0, "FP32 flag did not select its primitive");
+            assert_eq!(precise.dtype()?, DType::BFloat16);
+            assert_eq!(precise.shape()?.as_ref(), old.shape()?.as_ref());
+            assert_oracle(
+                &precise,
+                &expected,
+                &format!("FP32 B{b} H{h}/{kv} P{p} keys{keys512}"),
+            )?;
+            eprintln!(
+                "FP32 B{b} H{h}/{kv} P{p} keys{keys512} changed {}/{}",
+                precise_bits
+                    .iter()
+                    .zip(&old_bits)
+                    .filter(|(a, b)| a != b)
+                    .count(),
+                precise_bits.len()
+            );
+            // Keep one family geometry per replay, but change prefix,
+            // partition count and values. Other geometry is eager-only.
+            if b == 1 && h == 16 {
+                let refs = a.iter().collect::<Vec<_>>();
+                let replay = invoke_compiled_graph(id, &refs, 1, true, &mut builder)?
+                    .ok_or_else(|| Error::from_reason("FP32 reduction compile failed"))?;
                 assert_eq!(
-                    bits(&run(&a)?)?,
-                    old_bits,
-                    "FP32 evaluation affected baseline"
+                    bits(&replay[0])?,
+                    precise_bits,
+                    "FP32 replay changed bits at P{p}"
                 );
             }
-            assert_eq!(builds.get(), 1, "FP32 prefix replay retraced");
-            erase_compiled_graphs_matching(u64::MAX, id);
+            setting(FP, false);
+            assert_eq!(
+                bits(&run(&a)?)?,
+                old_bits,
+                "FP32 evaluation affected baseline"
+            );
         }
+        assert_eq!(builds.get(), 1, "FP32 prefix replay retraced");
+        erase_compiled_graphs_matching(u64::MAX, id);
     }
     Ok(())
 }
@@ -582,52 +521,47 @@ fn target_nax_exact_splits_match_f64_and_replay() -> Result<()> {
         setting(PAGES, pages);
         for fp32 in [false, true] {
             setting(FP, fp32);
-            for quant in [false, true] {
-                let id = 0xDFCA_7400_0000_0000
-                    | ((pages as u64) << 2)
-                    | ((fp32 as u64) << 1)
-                    | quant as u64;
-                erase_compiled_graphs_matching(u64::MAX, id);
-                let builds = std::cell::Cell::new(0);
-                let mut builder = |args: &[MxArray]| {
-                    builds.set(builds.get() + 1);
-                    Ok(vec![run(args)?])
+            let id = 0xDFCA_7400_0000_0000 | ((pages as u64) << 2) | ((fp32 as u64) << 1);
+            erase_compiled_graphs_matching(u64::MAX, id);
+            let builds = std::cell::Cell::new(0);
+            let mut builder = |args: &[MxArray]| {
+                builds.set(builds.get() + 1);
+                Ok(vec![run(args)?])
+            };
+            for (i, (b, p)) in [(1, 87), (2, 2048), (1, 16377), (2, 32768), (1, 32769)]
+                .into_iter()
+                .enumerate()
+            {
+                let a = fixture(b, 16, 2, 8, p, 0x74abcdef + i as u32, 1.0)?;
+                let expected = oracle(&a)?;
+                setting(FLAT, false);
+                unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+                let old = run(&a)?;
+                let want = bits(&old)?;
+                let count = unsafe {
+                    mlx_sys::mlx_test_kquant_family_count(
+                        c"segmented_sdpa_nax_exact_splits".as_ptr(),
+                    )
                 };
-                for (i, (b, p)) in [(1, 87), (2, 2048), (1, 16377), (2, 32768), (1, 32769)]
-                    .into_iter()
-                    .enumerate()
-                {
-                    let a = fixture(b, 16, 2, 8, p, quant, 0x74abcdef + i as u32, 1.0)?;
-                    let expected = oracle(&a)?;
-                    setting(FLAT, false);
-                    unsafe { mlx_sys::mlx_test_kquant_counting(true) };
-                    let old = run(&a)?;
-                    let want = bits(&old)?;
-                    let count = unsafe {
-                        mlx_sys::mlx_test_kquant_family_count(
-                            c"segmented_sdpa_nax_exact_splits".as_ptr(),
-                        )
-                    };
-                    unsafe { mlx_sys::mlx_test_kquant_counting(false) };
-                    assert!(count > 0, "source split count was not selected");
-                    assert_oracle(
-                        &old,
-                        &expected,
-                        &format!("exact P{p} B{b} quant{quant} pages{pages} fp32{fp32}"),
-                    )?;
-                    setting(FLAT, true);
-                    let refs = a.iter().collect::<Vec<_>>();
-                    let replay = invoke_compiled_graph(id, &refs, 1, true, &mut builder)?
-                        .ok_or_else(|| Error::from_reason("exact split compile failed"))?;
-                    assert_eq!(
-                        bits(&replay[0])?,
-                        want,
-                        "exact split flat replay changed bits"
-                    );
-                }
-                assert_eq!(builds.get(), 1, "exact split replay retraced");
-                erase_compiled_graphs_matching(u64::MAX, id);
+                unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+                assert!(count > 0, "source split count was not selected");
+                assert_oracle(
+                    &old,
+                    &expected,
+                    &format!("exact P{p} B{b} pages{pages} fp32{fp32}"),
+                )?;
+                setting(FLAT, true);
+                let refs = a.iter().collect::<Vec<_>>();
+                let replay = invoke_compiled_graph(id, &refs, 1, true, &mut builder)?
+                    .ok_or_else(|| Error::from_reason("exact split compile failed"))?;
+                assert_eq!(
+                    bits(&replay[0])?,
+                    want,
+                    "exact split flat replay changed bits"
+                );
             }
+            assert_eq!(builds.get(), 1, "exact split replay retraced");
+            erase_compiled_graphs_matching(u64::MAX, id);
         }
     }
     Ok(())

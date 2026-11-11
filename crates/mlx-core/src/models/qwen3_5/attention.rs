@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
-use crate::array::kv_int8::segmented_sdpa_int8;
 use crate::array::{DType, MxArray};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
@@ -14,7 +13,6 @@ use crate::models::paddleocr_vl::language::{
 use crate::nn::rope_scaling::{RopeScaling, rotary_inverse_frequencies};
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
-use crate::transformer::KvFormat;
 use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use napi::bindgen_prelude::*;
@@ -487,6 +485,39 @@ impl Qwen3_5Attention {
         }
     }
 
+    /// Queries, keys and values as the pool takes them: every operand in the
+    /// pool's io dtype (Splash io is always bf16). An f16 or f32 residual
+    /// stream, or a sym8 checkpoint's f32 norm weights (f32 Q and K beside a
+    /// bf16 V), would otherwise reach a pool that writes one element type.
+    pub(super) fn paged_attention_operands(
+        &self,
+        queries: &MxArray,
+        keys: &MxArray,
+        values: &MxArray,
+        cache_dtype: Option<DType>,
+    ) -> Result<(MxArray, MxArray, MxArray)> {
+        let queries = self.paged_attention_operand(queries, cache_dtype)?;
+        let keys = self.paged_attention_operand(keys, cache_dtype)?;
+        let values = self.paged_attention_operand(values, cache_dtype)?;
+        let Some(dtype) = cache_dtype else {
+            let (q, k, v) = (queries.dtype()?, keys.dtype()?, values.dtype()?);
+            if q == k && k == v {
+                return Ok((queries, keys, values));
+            }
+            return Err(Error::from_reason(format!(
+                "paged attention operands {q:?}/{k:?}/{v:?} need the pool's io dtype"
+            )));
+        };
+        let cast = |x: MxArray| -> Result<MxArray> {
+            if x.dtype()? == dtype {
+                Ok(x)
+            } else {
+                x.astype(dtype)
+            }
+        };
+        Ok((cast(queries)?, cast(keys)?, cast(values)?))
+    }
+
     pub(super) fn set_prism_model(&mut self, enabled: bool) {
         self.is_prism_model = enabled;
     }
@@ -812,23 +843,6 @@ impl Qwen3_5Attention {
         };
         let values = values.transpose(Some(&[0, 2, 1, 3]))?;
 
-        // An int8 cache quantizes the block on write and reads the int8 rows
-        // through its own kernels; see `forward_int8_cached`.
-        if cache
-            .as_deref()
-            .is_some_and(|c| c.format() == KvFormat::Int8)
-        {
-            let c = cache.ok_or_else(|| Error::from_reason("int8 KV cache vanished"))?;
-            let output = self.forward_int8_cached(&queries, &keys, &values, mask, c, seq_len)?;
-            let output = output.transpose(Some(&[0, 2, 1, 3]))?;
-            let output =
-                output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
-            let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
-            return self
-                .o_proj
-                .forward_mixer_output(&gated_output, None, residual);
-        }
-
         // Update KV cache (expects [B, H, T, D])
         let (keys, values) = if let Some(c) = cache {
             c.update_and_fetch(&keys, &values)?
@@ -912,78 +926,6 @@ impl Qwen3_5Attention {
         // Output projection
         self.o_proj
             .forward_mixer_output(&gated_output, None, residual)
-    }
-
-    /// SDPA of `queries` `[B, Hq, T, D]` over an int8 `KVCache` after
-    /// appending the BF16 block `keys` / `values` `[B, Hkv, T, D]` to it
-    /// (quantized on write). Returns `[B, Hq, T, D]`.
-    ///
-    /// Readers by block shape:
-    ///   * `T == 1` (AR decode, MTP draft step) and `2..=8` without a mask
-    ///     (eager MTP verify) that the segmented int8 kernels launch
-    ///     (`segmented_int8_covers`): they read the int8 rows directly —
-    ///     prefix `[0, P)` and the block's own rows as the "new" segment,
-    ///     causal for a block.
-    ///   * any other unmasked block of `1..=8` rows over a prefix (a 5..8-row
-    ///     block at gqa above 8, which the segmented kernels cannot split, or
-    ///     a dtype, head size or device they do not take): the cache's own
-    ///     rows `[0, P + T)`
-    ///     are dequantized and MLX's fused SDPA runs over them, so the block
-    ///     reads its own rows int8-rounded like a 1-row decode (Splash
-    ///     `PagedAttention::addVerify` stores the chunk, then attends over the
-    ///     pages).
-    ///   * anything else (prefill chunks, explicit masks): the cached prefix
-    ///     is dequantized to a BF16 temporary (one pass per layer per chunk)
-    ///     and MLX's fused SDPA runs over `concat(prefix, fresh block)`; the
-    ///     block's own rows stay BF16 there.
-    ///
-    /// An empty prefix has no int8 segment to bind, so it also takes the
-    /// BF16 route (the first prefill chunk, a one-token prompt's first step).
-    fn forward_int8_cached(
-        &self,
-        queries: &MxArray,
-        keys: &MxArray,
-        values: &MxArray,
-        mask: Option<&MxArray>,
-        cache: &mut KVCache,
-        seq_len: i64,
-    ) -> Result<MxArray> {
-        let prefix_len = cache.get_offset() as i64;
-        let all = cache.update_and_fetch_int8(keys, values)?;
-        let gqa = (self.num_heads / self.num_kv_heads.max(1)) as i64;
-        let segmented = mask.is_none()
-            && prefix_len > 0
-            && (1..=8).contains(&seq_len)
-            && (1..=32).contains(&gqa)
-            && self.head_dim == 256
-            && queries.dtype()? == DType::BFloat16
-            && unsafe { mlx_sys::mlx_metal_is_available() }
-            && unsafe { mlx_sys::mlx_default_device() } == 1
-            && crate::array::kv_int8::segmented_int8_covers(seq_len, gqa);
-        if segmented {
-            let prefix = all.slice_tokens(0, prefix_len)?;
-            let new = all.slice_tokens(prefix_len, prefix_len + seq_len)?;
-            return segmented_sdpa_int8(queries, &prefix, &new, self.scale, seq_len > 1);
-        }
-        let verify_shaped = mask.is_none() && prefix_len > 0 && (1..=8).contains(&seq_len);
-        let (k, v) = if verify_shaped {
-            all.dequantize()?
-        } else if prefix_len > 0 {
-            let (pk, pv) = all.slice_tokens(0, prefix_len)?.dequantize()?;
-            (
-                MxArray::concatenate(&pk, keys, 2)?,
-                MxArray::concatenate(&pv, values, 2)?,
-            )
-        } else {
-            (keys.clone(), values.clone())
-        };
-        if let Some(m) = mask {
-            scaled_dot_product_attention(queries, &k, &v, self.scale as f64, Some(m))
-        } else if seq_len > 1 {
-            scaled_dot_product_attention_causal(queries, &k, &v, self.scale as f64)
-        } else {
-            scaled_dot_product_attention(queries, &k, &v, self.scale as f64, None)
-        }
     }
 
     /// Forward pass routed through the block-paged KV adapter.
@@ -1110,10 +1052,8 @@ impl Qwen3_5Attention {
             )
         };
 
-        let operand_dtype = adapter.paged_operand_dtype();
-        let queries = self.paged_attention_operand(&queries, operand_dtype)?;
-        let keys = self.paged_attention_operand(&keys, operand_dtype)?;
-        let values = self.paged_attention_operand(&values, operand_dtype)?;
+        let (queries, keys, values) =
+            self.paged_attention_operands(&queries, &keys, &values, adapter.paged_operand_dtype())?;
         let output = paged_store_attend(
             adapter,
             attn_layer_idx,
@@ -1233,10 +1173,8 @@ impl Qwen3_5Attention {
         let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
         let keys = self.rope.forward_with_offsets(&keys, &offsets)?;
         let values = values.transpose(Some(&[0, 2, 1, 3]))?;
-        let operand_dtype = adapter.paged_operand_dtype();
-        let queries = self.paged_attention_operand(&queries, operand_dtype)?;
-        let keys = self.paged_attention_operand(&keys, operand_dtype)?;
-        let values = self.paged_attention_operand(&values, operand_dtype)?;
+        let (queries, keys, values) =
+            self.paged_attention_operands(&queries, &keys, &values, adapter.paged_operand_dtype())?;
 
         let output = if seq_len == 1 {
             let queries = queries.squeeze(Some(&[2]))?;
@@ -1520,9 +1458,6 @@ impl Qwen3_5Attention {
 
 #[cfg(test)]
 mod target_schedule_tests;
-
-#[cfg(test)]
-mod kv_int8_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2581,6 +2516,39 @@ mod tests {
         Ok(())
     }
 
+    /// Gate: a sym8 checkpoint's f32 Q/K beside a bf16 V, and a uniform f32
+    /// or f16 residual stream, reach the pool as one element type, the
+    /// pool's. Mutation N7 (mixed operands pass through uncast) → red;
+    /// mutation F1 (uniform operands pass through uncast) → red.
+    #[test]
+    fn mixed_paged_operands_take_the_pool_dtype() -> Result<()> {
+        let attention = Qwen3_5Attention::new(&tiny_cfg())?;
+        let f32 = MxArray::from_float32(&[0.1, -0.2, 0.3, 0.4], &[1, 1, 4])?;
+        let bf16 = f32.astype(DType::BFloat16)?;
+        let f16 = f32.astype(DType::Float16)?;
+        let (q, k, v) =
+            attention.paged_attention_operands(&f32, &f32, &bf16, Some(DType::BFloat16))?;
+        for operand in [&q, &k, &v] {
+            assert_eq!(operand.dtype()?, DType::BFloat16);
+        }
+        for uniform in [&f32, &f16] {
+            let (q, k, v) = attention.paged_attention_operands(
+                uniform,
+                uniform,
+                uniform,
+                Some(DType::BFloat16),
+            )?;
+            for operand in [&q, &k, &v] {
+                assert_eq!(operand.dtype()?, DType::BFloat16, "{:?}", uniform.dtype()?);
+            }
+        }
+        let (q, k, v) = attention.paged_attention_operands(&f32, &f32, &f32, None)?;
+        for operand in [&q, &k, &v] {
+            assert_eq!(operand.dtype()?, DType::Float32);
+        }
+        Ok(())
+    }
+
     #[test]
     fn prism_hadamard_paged_operands_cast_for_dense_attention() -> Result<()> {
         let mut attention = Qwen3_5Attention::new(&tiny_cfg())?;
@@ -2654,7 +2622,6 @@ mod tests {
             rope_theta: 100_000.0,
             paged_cache_memory_mb: None,
             paged_block_size: None,
-            use_block_paged_cache: None,
             persist_paged_cache: None,
             n_mtp_layers: 0,
         }

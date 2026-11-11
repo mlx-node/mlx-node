@@ -9,13 +9,10 @@
 //! the lfm2 fix in 47d8dc53; qwen3_5_moe shares the identical paged
 //! adapter lifecycle.)
 //!
-//! qwen3_5_moe paged is OPT-IN (default OFF), so the test clones the
-//! checkpoint dir and forces `use_block_paged_cache: true` in
-//! config.json (only config.json is copied; weights are symlinked), then
-//! asserts `has_block_paged_cache()` to confirm the adapter actually
-//! built before exercising the reset. The existing
-//! `qwen3_5_moe_session.rs` tests load WITHOUT forcing paged (so they
-//! run FLAT and do not exercise this path) — hence a dedicated file.
+//! The test clones the checkpoint dir with a small pool in config.json
+//! (only config.json is copied; weights are symlinked), then asserts
+//! `has_block_paged_cache()` to confirm the adapter actually built before
+//! exercising the reset.
 //!
 //! Gated on `MLX_TEST_MODEL_PATH`. Run with:
 //!
@@ -36,8 +33,7 @@ use mlx_core::models::qwen3_5_moe::model::Qwen3_5MoeModel;
 use mlx_core::tokenizer::ChatMessage;
 
 /// Clone the model dir into the workspace target, symlinking the weight
-/// files and copying config.json with `use_block_paged_cache: true`
-/// injected. Mirrors `qwen3_5_moe_paged_vs_flat_parity.rs::clone_model_dir`.
+/// files and copying config.json with a small pool injected.
 fn clone_model_dir_paged(src: &Path, suffix: &str) -> Result<PathBuf, String> {
     let pid = std::process::id();
     let workspace_target = std::env::var_os("CARGO_TARGET_DIR")
@@ -79,7 +75,6 @@ fn clone_model_dir_paged(src: &Path, suffix: &str) -> Result<PathBuf, String> {
         .map_err(|e| format!("read config.json: {e} (path={})", cfg_path.display()))?;
     let mut cfg: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| format!("parse config.json: {e} (path={})", cfg_path.display()))?;
-    cfg["use_block_paged_cache"] = serde_json::Value::Bool(true);
     cfg["paged_cache_memory_mb"] = serde_json::Value::from(1024u32);
     cfg["paged_block_size"] = serde_json::Value::from(16u32);
     let pretty =
@@ -167,8 +162,7 @@ async fn qwen3_5_moe_session_reset_purges_prefix_cache_cold_prefill() {
         .expect("failed to load paged Qwen3.5 MoE model");
     assert!(
         model.has_block_paged_cache(),
-        "expected the paged adapter to be built after forcing \
-         use_block_paged_cache=true, but has_block_paged_cache()==false"
+        "expected the paged adapter to be built, but has_block_paged_cache()==false"
     );
 
     // The prompt MUST render to MORE than one paged block

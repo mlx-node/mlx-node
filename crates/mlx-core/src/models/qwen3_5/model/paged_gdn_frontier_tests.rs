@@ -34,7 +34,6 @@ fn tiny_cfg() -> Qwen3_5Config {
         rope_theta: 100_000.0,
         paged_cache_memory_mb: None,
         paged_block_size: None,
-        use_block_paged_cache: None,
         persist_paged_cache: None,
         n_mtp_layers: 0,
     }
@@ -124,11 +123,7 @@ fn reset_clears_dirty_latch_and_armer() {
     let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
     inner.paged_gdn_state_dirty = true;
     inner.paged_gdn_force_mismatch_for_test = true;
-    inner.paged_full_attn_caches_dirty = true;
-    inner.flat_mtp_caches_desynced = true;
     inner.reset_caches_sync().expect("reset");
     assert!(!inner.paged_gdn_state_dirty);
     assert!(!inner.paged_gdn_force_mismatch_for_test);
-    assert!(!inner.paged_full_attn_caches_dirty);
-    assert!(!inner.flat_mtp_caches_desynced);
 }

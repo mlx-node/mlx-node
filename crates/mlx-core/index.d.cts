@@ -1628,13 +1628,11 @@ export declare class Qwen35Model {
    * instance.
    *
    * `true` iff `Qwen35Inner::paged_adapter` was successfully
-   * constructed at load time (driven by
-   * `Qwen3_5Config::use_block_paged_cache`, default-ON for every compatible
-   * checkpoint). On VLM checkpoints dense image turns ONLY run on the
-   * paged-vision core; a vision turn that reaches a None adapter errors at
-   * dispatch. Surfaced through this NAPI method so
-   * server endpoints can branch on it without round-tripping through
-   * the model thread.
+   * constructed at load time (every load on Metal). On
+   * VLM checkpoints dense image turns ONLY run on the paged-vision core; a
+   * load with no adapter admits no image turn. Surfaced through this NAPI
+   * method so server endpoints can branch on it without round-tripping
+   * through the model thread.
    */
   hasBlockPagedCache(): boolean;
   /**
@@ -1685,8 +1683,6 @@ export declare class Qwen35Model {
    * - tokenizer.json + tokenizer_config.json
    */
   static load(path: string, options?: Qwen35LoadOptions | undefined | null): Promise<Qwen35Model>;
-  /** Generate text from a prompt token sequence. */
-  generate(promptTokens: MxArray, config: Qwen35GenerationConfig): Promise<Qwen35GenerationResult>;
   /**
    * Get the number of parameters in the model.
    *
@@ -1809,11 +1805,9 @@ export declare class Qwen35MoeModel {
    * instance.
    *
    * `true` iff `Qwen35MoeInner::paged_adapter` was successfully
-   * constructed at load time (driven by
-   * `Qwen3_5MoeConfig::use_block_paged_cache`, default-ON for compatible
-   * checkpoints). On VLM checkpoints the adapter can still be active for text-only
-   * inference; image-bearing chat turns are rejected at runtime by
-   * the chat-entry sites. Surfaced through this NAPI method so
+   * constructed at load time (every load on Metal). On
+   * VLM checkpoints image turns run on the paged-vision core; a load with
+   * no adapter admits no image turn. Surfaced through this NAPI method so
    * server endpoints can branch on it without round-tripping through
    * the model thread.
    */
@@ -1859,8 +1853,6 @@ export declare class Qwen35MoeModel {
    * path.
    */
   static load(path: string, options?: Qwen35LoadOptions | undefined | null): Promise<Qwen35MoeModel>;
-  /** Generate text from a prompt token sequence. */
-  generate(promptTokens: MxArray, config: Qwen35MoeGenerationConfig): Promise<Qwen35MoeGenerationResult>;
   /**
    * Get the number of parameters in the model.
    *
@@ -5185,51 +5177,14 @@ export interface Qwen35Config {
   ropeTheta: number;
   /**
    * Ceiling of the paged KV pool in MiB, at most the memory plan's.
-   * Only used when `use_block_paged_cache` is true.
    * Default: the memory plan's.
    */
   pagedCacheMemoryMb?: number | undefined;
   /**
    * Block size for paged attention (tokens per block).
-   * Only used when `use_block_paged_cache` is true.
    * Default: 16.
    */
   pagedBlockSize?: number | undefined;
-  /**
-   * Use the block-paged KV cache adapter (`PagedKVCacheAdapter`) for
-   * full-attention layers.
-   *
-   * When enabled (the default), `Qwen35Inner`
-   * allocates a `BlockAllocator` + `LayerKVPool` pair sized for the
-   * model's full-attention layer count and constructs a
-   * `PagedKVCacheAdapter`. The chat-session forward dispatch routes
-   * full-attention layers through this adapter while linear-attention
-   * (GatedDeltaNet / GDN) layers continue to use the existing
-   * `Qwen3_5LayerCache::Linear(ArraysCache)` path with no
-   * cross-request prefix reuse — vLLM's `MambaManager`-style "no
-   * prefix reuse for recurrent layers" stance.
-   *
-   * **Paged vs flat eager**: this flag selects the eager paged decode
-   * over the eager flat decode. When enabled, full-attention
-   * layers run through the paged adapter (cross-request prefix reuse);
-   * an explicit false runs eager flat decode. Either way the forward is
-   * pure-Rust eager.
-   *
-   * **VLM under paged**: VLM checkpoints also default this flag ON, so
-   * dense image turns ONLY run on the paged-vision core. A fresh single-turn
-   * image-bearing prompt prefills through the paged adapter (M-RoPE positions
-   * feed the rotary; the merged vision embeddings feed the forward) and
-   * decodes plain AR — MTP weights are ignored on image turns. Warm
-   * image-bearing session continues / cache-hit reuse are still rejected at
-   * runtime (the GDN two-pass warm prefix is not byte-exact). A vision turn
-   * that reaches a None adapter (explicit `Some(false)`, non-Metal build, or
-   * a sym8 checkpoint) errors at dispatch.
-   *
-   * Load default: `Some(true)` for compatible text and VLM checkpoints.
-   * Explicit false remains available for flat-path diagnostics; sym8 is
-   * forced flat by persistence after its storage mode is known.
-   */
-  useBlockPagedCache?: boolean | undefined;
   /**
    * Persist the out-of-pool GDN recurrent state (and the paged KV blocks it
    * gates) to the SSD cold tier so warm prefixes survive process restarts.
@@ -5252,12 +5207,12 @@ export interface Qwen35Config {
    */
   qwen35GgufGdnLayout?: string | undefined;
   /**
-   * Element format of the full-attention K/V, the block-paged pool's and
-   * the flat cache's: `"int8"` (per-(token, head) symmetric int8 rows
-   * with one fp32 scale each — half the K/V memory and read bandwidth;
-   * see `crate::array::kv_int8`) or `"bf16"`. Unset: int8 where the int8
-   * kernels serve the model (Metal, head 256, BF16 compute, a 16- or
-   * 32-token paged block), else BF16 — see `kv_format_for()`.
+   * Element format of the block-paged pool's full-attention K/V:
+   * `"int8"` (per-(token, head) symmetric int8 rows with one fp32 scale
+   * each — half the K/V memory and read bandwidth; see
+   * `crate::array::kv_int8`) or `"bf16"`. Unset: int8 where the int8
+   * kernels serve the model (a pool, head 256, BF16 compute, a 16- or
+   * 32-token block), else BF16 — see `kv_format_for()`.
    * Set from the `kvFormat` load option; never saved (a runtime option,
    * like Splash `--kv-format`).
    */
@@ -5268,7 +5223,7 @@ export interface Qwen35Config {
 export interface Qwen35ContextEstimate {
   /**
    * Tokens every turn may hold: the pool lane's (with a DFlash2 draft's
-   * state priced), the flat lane's without a pool.
+   * state priced); the served window without a pool.
    */
   windowTokens: number;
   /**
@@ -5298,29 +5253,11 @@ export interface Qwen35ContextLimits {
   restOfWindowOutputBudget: boolean;
   /**
    * An omitted budget on `effective_window_tokens` is the rest of that
-   * window. Set when the plan prices that window: the paged pool, or the
-   * flat lane of a load without a pool.
+   * window. Set when the plan prices that window: the paged pool.
    */
   omittedBudgetIsRestOfWindow: boolean;
   /** Format of the K/V a turn on `effective_window_tokens` writes. */
   kvFormat: 'int8' | 'bf16';
-}
-
-/** Generation configuration for Qwen3.5 */
-export interface Qwen35GenerationConfig {
-  maxNewTokens: number;
-  temperature?: number | undefined;
-  topK?: number | undefined;
-  topP?: number | undefined;
-  minP?: number | undefined;
-}
-
-/** Generation result */
-export interface Qwen35GenerationResult {
-  tokens: Array<number>;
-  text: string;
-  numTokens: number;
-  finishReason: string;
 }
 
 export interface Qwen35LoadOptions {
@@ -5389,38 +5326,14 @@ export interface Qwen35MoeConfig {
   mlpOnlyLayers?: number[] | undefined;
   /**
    * Ceiling of the paged KV pool in MiB, at most the memory plan's.
-   * Only used when `use_block_paged_cache` is true.
    * Default: the memory plan's.
    */
   pagedCacheMemoryMb?: number | undefined;
   /**
    * Block size for paged attention (tokens per block).
-   * Only used when `use_block_paged_cache` is true.
    * Default: 16.
    */
   pagedBlockSize?: number | undefined;
-  /**
-   * Use the block-paged KV cache adapter for full-attention layers.
-   *
-   * Same semantics as the dense `Qwen3_5Config::use_block_paged_cache`
-   * field. Selects the eager
-   * paged decode over the eager flat decode: routes full-attention
-   * layers through `PagedKVCacheAdapter` (cross-request prefix reuse);
-   * GDN linear-attention layers stay on `Qwen3_5LayerCache::Linear`
-   * either way. When disabled, full-attention layers run the eager flat
-   * decode instead.
-   *
-   * **VLM under paged**: a VLM checkpoint loads with this flag set, and a
-   * fresh single-turn image-bearing prompt prefills through the paged
-   * adapter (M-RoPE positions feed the rotary; the merged vision embeddings
-   * feed the forward). Image-bearing MTP turns are still rejected at
-   * runtime; warm image-bearing session continues / cache-hit reuse are
-   * cold-started (no warm GDN two-pass prefix).
-   *
-   * Default: enabled for compatible Metal checkpoints. Explicit `false`
-   * and `MLX_QWEN35_PAGED_OVERRIDE=0` retain the flat rollback path.
-   */
-  useBlockPagedCache?: boolean | undefined;
   /**
    * Persist the out-of-pool GDN recurrent state (and the paged KV blocks it
    * gates) to the SSD cold tier so warm prefixes survive process restarts.
@@ -5445,31 +5358,14 @@ export interface Qwen35MoeConfig {
    */
   qwen35GgufGdnLayout?: string | undefined;
   /**
-   * Full-attention K/V format of the block-paged pool and the flat
-   * cache, `int8` or `bf16`. Unset: the default of
-   * `Qwen3_5Config::kv_format_for` (int8 on Metal at head 256 when
-   * compute is BF16 and a paged block is 16 or 32 tokens, else BF16).
+   * Full-attention K/V format of the block-paged pool, `int8` or `bf16`.
+   * Unset: the default of `Qwen3_5Config::kv_format_for` (int8 on a pool
+   * at head 256 when compute is BF16 and a block is 16 or 32 tokens,
+   * else BF16).
    * Never saved (a runtime option, like Splash
    * `--kv-format`).
    */
   kvFormat?: string | undefined;
-}
-
-/** Generation configuration for Qwen3.5 MoE */
-export interface Qwen35MoeGenerationConfig {
-  maxNewTokens: number;
-  temperature?: number | undefined;
-  topK?: number | undefined;
-  topP?: number | undefined;
-  minP?: number | undefined;
-}
-
-/** Generation result */
-export interface Qwen35MoeGenerationResult {
-  tokens: Array<number>;
-  text: string;
-  numTokens: number;
-  finishReason: string;
 }
 
 export interface Qwen3AsrAudioDevice {

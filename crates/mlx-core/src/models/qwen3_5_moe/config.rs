@@ -58,44 +58,18 @@ pub struct Qwen3_5MoeConfig {
     #[napi(ts_type = "number[] | undefined")]
     pub mlp_only_layers: Option<Vec<i32>>,
 
-    // Paged attention options (default on for compatible checkpoints; explicit
-    // false and MLX_QWEN35_PAGED_OVERRIDE retain the rollback path).
+    // Block-paged pool options.
     /// Ceiling of the paged KV pool in MiB, at most the memory plan's.
-    /// Only used when `use_block_paged_cache` is true.
     /// Default: the memory plan's.
     #[serde(default)]
     #[napi(ts_type = "number | undefined")]
     pub paged_cache_memory_mb: Option<u32>,
 
     /// Block size for paged attention (tokens per block).
-    /// Only used when `use_block_paged_cache` is true.
     /// Default: 16.
     #[serde(default)]
     #[napi(ts_type = "number | undefined")]
     pub paged_block_size: Option<u32>,
-
-    /// Use the block-paged KV cache adapter for full-attention layers.
-    ///
-    /// Same semantics as the dense `Qwen3_5Config::use_block_paged_cache`
-    /// field. Selects the eager
-    /// paged decode over the eager flat decode: routes full-attention
-    /// layers through `PagedKVCacheAdapter` (cross-request prefix reuse);
-    /// GDN linear-attention layers stay on `Qwen3_5LayerCache::Linear`
-    /// either way. When disabled, full-attention layers run the eager flat
-    /// decode instead.
-    ///
-    /// **VLM under paged**: a VLM checkpoint loads with this flag set, and a
-    /// fresh single-turn image-bearing prompt prefills through the paged
-    /// adapter (M-RoPE positions feed the rotary; the merged vision embeddings
-    /// feed the forward). Image-bearing MTP turns are still rejected at
-    /// runtime; warm image-bearing session continues / cache-hit reuse are
-    /// cold-started (no warm GDN two-pass prefix).
-    ///
-    /// Default: enabled for compatible Metal checkpoints. Explicit `false`
-    /// and `MLX_QWEN35_PAGED_OVERRIDE=0` retain the flat rollback path.
-    #[serde(default)]
-    #[napi(ts_type = "boolean | undefined")]
-    pub use_block_paged_cache: Option<bool>,
 
     /// Persist the out-of-pool GDN recurrent state (and the paged KV blocks it
     /// gates) to the SSD cold tier so warm prefixes survive process restarts.
@@ -122,10 +96,10 @@ pub struct Qwen3_5MoeConfig {
     #[napi(ts_type = "string | undefined")]
     pub qwen35_gguf_gdn_layout: Option<String>,
 
-    /// Full-attention K/V format of the block-paged pool and the flat
-    /// cache, `int8` or `bf16`. Unset: the default of
-    /// `Qwen3_5Config::kv_format_for` (int8 on Metal at head 256 when
-    /// compute is BF16 and a paged block is 16 or 32 tokens, else BF16).
+    /// Full-attention K/V format of the block-paged pool, `int8` or `bf16`.
+    /// Unset: the default of `Qwen3_5Config::kv_format_for` (int8 on a pool
+    /// at head 256 when compute is BF16 and a block is 16 or 32 tokens,
+    /// else BF16).
     /// Never saved (a runtime option, like Splash
     /// `--kv-format`).
     #[serde(default, skip_serializing)]
@@ -224,7 +198,6 @@ impl Qwen3_5MoeConfig {
             rope_theta: self.rope_theta,
             paged_cache_memory_mb: self.paged_cache_memory_mb,
             paged_block_size: self.paged_block_size,
-            use_block_paged_cache: self.use_block_paged_cache,
             // MoE cold-tier persistence is a separate (unproven) family; the
             // dense config it maps to never attaches a cold tier of its own.
             persist_paged_cache: None,

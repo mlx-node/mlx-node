@@ -10,8 +10,7 @@
 //! (`engine::paged_turn`'s
 //! `a_speculative_plan_runs_the_family_core_and_the_shared_epilogue` and
 //! `publishing_the_flag_without_a_core_fails_the_turn_closed`). What THIS
-//! module pins is that MoE reaches that dispatch at all, and that the flat
-//! lane still exists for adapter-less checkpoints.
+//! module pins is that MoE reaches that dispatch at all.
 
 use super::{qwen35_moe_media_plan, qwen35_moe_speculative_plan};
 use crate::engine::plan::{
@@ -66,25 +65,7 @@ fn a_paged_text_turn_that_requested_mtp_plans_native_mtp_not_a_downgrade() {
     }
 }
 
-/// The FLAT lane survives the flip: an adapter-less MoE checkpoint (sym8,
-/// or `use_block_paged_cache: false`) still plans native MTP and still
-/// routes to the flat speculative handler.
-///
-/// Catches, verified by mutation: deleting the flat MTP arm's plan by
-/// gating `speculative` on the adapter — the flat checkpoint then plans
-/// `Autoregressive` and loses MTP entirely.
-#[test]
-fn an_adapter_less_checkpoint_still_plans_flat_native_mtp() {
-    let plan = TurnPlan::resolve(execution(false, true), text_mtp_request(false));
-    assert!(!plan.use_paged_attention);
-    assert_eq!(
-        plan.decoder,
-        DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
-    );
-    assert_eq!(plan.path(), TurnPath::Speculative);
-}
-
-/// An image-bearing turn keeps the autoregressive decoder on both lanes:
+/// An image-bearing turn keeps the autoregressive decoder with or without a pool:
 /// there is no MoE hidden-emitting prefill to seed a drafter from image
 /// features.
 #[test]

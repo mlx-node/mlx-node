@@ -523,17 +523,7 @@ impl Qwen35MoeInner {
 
         // Use fresh caches for training (not shared inference caches)
         let mut training_caches: Option<Vec<Qwen3_5LayerCache>> = Some(
-            (0..self.config.num_layers as usize)
-                .map(|i| {
-                    if self.config.is_linear_layer(i) {
-                        Qwen3_5LayerCache::new_linear()
-                    } else {
-                        Qwen3_5LayerCache::new_full_attention_with(
-                            self.config.to_dense_config().kv_format(),
-                        )
-                    }
-                })
-                .collect(),
+            Qwen3_5LayerCache::fresh_layer_caches(&self.config.to_dense_config()),
         );
 
         let input_tokens = input_ids.to_uint32()?;
@@ -1697,6 +1687,36 @@ impl Qwen35MoeInner {
 }
 
 impl Qwen35MoeInner {
+    /// The post-norm hidden of every row of `ids` from one fresh prefill,
+    /// for `mlx eval` and `mlx calibrate`: on the pool where the load has
+    /// one, else (off Metal) over the model's own caches,
+    /// reset afterwards.
+    pub(crate) fn prefill_hidden_once(&mut self, ids: &[u32]) -> Result<MxArray> {
+        if self.paged_adapter.is_some() {
+            return self.paged_teacher_forced_hidden(ids);
+        }
+        self.init_caches_sync()?;
+        let generation_stream = Stream::generation();
+        let fa_idx = self.fa_idx;
+        let hidden = crate::quality::runner::chunked_hidden(ids, PREFILL_STEP_SIZE, |ids| {
+            let hidden = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                let pre = forward_pre_norm_inner(
+                    ids,
+                    &self.embedding,
+                    &mut self.layers,
+                    &mut self.caches,
+                    fa_idx,
+                )?;
+                self.final_norm.forward(&pre)?
+            };
+            eval_layer_caches(&self.caches)?;
+            Ok(hidden)
+        });
+        self.reset_caches_sync()?;
+        hidden
+    }
+
     /// `mlx eval`'s teacher-forced prefill on the paged pool, the route a
     /// served turn reads (Splash has no flat path): one fresh sequence, no
     /// prefix lookup or publish, its blocks freed at the end. Returns the
@@ -1802,33 +1822,7 @@ impl crate::quality::runner::EvalBackend for Qwen35MoeInner {
     }
 
     fn teacher_forced_hidden(&mut self, tokens: &[u32]) -> Result<MxArray> {
-        if self.paged_adapter.is_some() {
-            return self.paged_teacher_forced_hidden(&tokens[..tokens.len() - 1]);
-        }
-        self.init_caches_sync()?;
-        let generation_stream = Stream::generation();
-        let fa_idx = self.fa_idx;
-        let hidden = crate::quality::runner::chunked_hidden(
-            &tokens[..tokens.len() - 1],
-            PREFILL_STEP_SIZE,
-            |ids| {
-                let hidden = {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    let pre = forward_pre_norm_inner(
-                        ids,
-                        &self.embedding,
-                        &mut self.layers,
-                        &mut self.caches,
-                        fa_idx,
-                    )?;
-                    self.final_norm.forward(&pre)?
-                };
-                eval_layer_caches(&self.caches)?;
-                Ok(hidden)
-            },
-        );
-        self.reset_caches_sync()?;
-        hidden
+        self.prefill_hidden_once(&tokens[..tokens.len() - 1])
     }
 
     fn project_head(&self, hidden: &MxArray) -> Result<MxArray> {

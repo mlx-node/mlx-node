@@ -104,9 +104,8 @@ Every per-family decision above derives from one `MODEL_FAMILY_DATA` row:
 launch presets (`launchPresetFor`), agent traits (`familyTraitsFor`), the
 chat/non-generative split (`NON_GENERATIVE_FAMILY_IDS`, from `kind`), the GGUF
 architecture map (`ggufArchitectures`), and dashboard labels (`matchFamily`).
-`QWEN35_PAGED_MODEL_TYPES` remains the qwen3_5 cache-floor set and the server
-host's `DEFAULT_PAGED_MODEL_TYPES` aliases it; the `PagedConfigOverrideManager`
-default derives from `CHAT_FAMILY_IDS`.
+The `PagedConfigOverrideManager` default derives from `CHAT_FAMILY_IDS`; the
+server host overlays no family unless `pagedModelTypes` names it.
 
 Family detection itself is the pure `matchFamily` in `family-data.ts`
 (byte-identical `MalformedModelConfigError` / `UnsupportedModelTypeError`

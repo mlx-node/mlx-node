@@ -69,7 +69,6 @@ use crate::vision::qwen::prompt::{
 // `#[path]`-declared child in the family. The seams live in `model/`.
 mod chat_backend;
 mod commands;
-mod flat_turn;
 mod forward;
 mod gdn_prefix;
 mod lifecycle;
@@ -86,15 +85,14 @@ mod training;
 #[cfg(test)]
 use self::chat_backend::resolve_qwen35_chat_params;
 pub(crate) use self::commands::{Qwen35Cmd, Qwen35FamilyCommand};
+#[cfg(test)]
+use self::forward::chunked_prefill_with_size;
 pub(crate) use self::forward::{
     PREFILL_STEP_SIZE, async_eval_layer_caches, eval_layer_caches, partition_prefill_chunks,
 };
 use self::forward::{
-    chunked_prefill, chunked_prefill_with_hidden, eager_verify_step, forward_inner,
-    forward_pre_norm_inner, project_logits_from_hidden,
+    chunked_prefill, forward_inner, forward_pre_norm_inner, project_logits_from_hidden,
 };
-#[cfg(test)]
-use self::forward::{chunked_prefill_with_hidden_with_size, chunked_prefill_with_size};
 #[cfg(test)]
 use self::mtp::DenseMtpStepper;
 pub(crate) use self::mtp::Qwen35Decode;
@@ -102,11 +100,11 @@ use self::paged_backend::{Qwen35PrefixState, StreamSender};
 #[cfg(test)]
 use self::state::configure_paged_mtp_profiler;
 use self::state::{
-    ChatDecodeInputs, DenseGdnCheckpointStoreTrace, DenseGdnHistoryCheckpoint,
-    DenseGdnPrefixCheckpoint, DenseGdnPrefixPreparation, apply_qwen35_dense_planned_decoder,
-    begin_paged_mtp_profiler, clone_dense_linear_layer_caches, dense_paged_frontier_skew,
-    dense_paged_linear_caches_ready, fresh_dense_layer_caches, qwen35_dense_media_plan,
-    qwen35_dense_session_media, qwen35_dense_session_media_matches_payloads,
+    DenseGdnCheckpointStoreTrace, DenseGdnHistoryCheckpoint, DenseGdnPrefixCheckpoint,
+    DenseGdnPrefixPreparation, apply_qwen35_dense_planned_decoder, begin_paged_mtp_profiler,
+    clone_dense_linear_layer_caches, dense_paged_frontier_skew, dense_paged_linear_caches_ready,
+    fresh_dense_layer_caches, qwen35_dense_media_plan, qwen35_dense_session_media,
+    qwen35_dense_session_media_matches_payloads,
 };
 pub(crate) use self::state::{
     TokenPrefixMismatchTrace, arrays_bits_equal_for_test, constrain_paged_context_params,
@@ -226,8 +224,7 @@ pub(crate) struct Qwen35Inner {
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache) for
     /// full-attention layers.
     ///
-    /// **Opt-in via `Qwen3_5Config::use_block_paged_cache`** — see the
-    /// flag's rustdoc for the full architectural rationale. When
+    /// Built at load on Metal; `None` off Metal. When
     /// `Some(...)`, full-attention layers route through this adapter
     /// while linear-attention (GDN) layers stay on
     /// `Qwen3_5LayerCache::Linear` with no cross-request prefix reuse.
@@ -245,36 +242,7 @@ pub(crate) struct Qwen35Inner {
     scheduled_recurrent: RecurrentStateTable<Vec<Qwen3_5LayerCache>>,
     scheduled_mtp: crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState,
     pub(crate) active_scheduled_seq: Option<SeqId>,
-    /// True when a paged-core turn has populated
-    /// the paged adapter's `LayerKVPool` since the last flat full-attention
-    /// prefill, so the flat `self.caches` full-attention slots do NOT
-    /// reflect the conversation history. The streaming dense-MTP fallback
-    /// (`chat_stream_tokens_delta_sync_inner`) consults this to decide
-    /// whether it must rebuild the flat caches from the full history before
-    /// decoding. Set by the paged cores; cleared after a flat prefill. This
-    /// keeps the rebuild a ONE-TIME cost on the paged→dense transition
-    /// instead of re-prefilling the whole history on every MTP turn.
-    pub(crate) paged_full_attn_caches_dirty: bool,
-    /// Set when a flat eager-MTP turn stopped mid-cycle leaving `self.caches`
-    /// advanced past the emitted token history (GDN state cannot be rewound).
-    /// Forces the next turn to discard `self.caches` and re-prefill the full
-    /// history. Pure-flat sessions only; the paged path rolls back its adapter
-    /// directly.
-    pub(crate) flat_mtp_caches_desynced: bool,
-    /// Count of full-history flat re-prefills taken by the streaming delta path
-    /// because the caches were desynced (the discard+re-prefill heal at
-    /// `chat_stream_tokens_delta_sync_inner`). Monotonic; lets a test confirm a
-    /// continue turn actually took the heal path (the streaming chunk's
-    /// `prompt_tokens`/`cached_tokens` are reported identically for heal and warm,
-    /// so they can't distinguish the two).
-    pub(crate) flat_full_reprefill_count: u64,
-    /// Engine-observed accepted-token tail passed to the most recent flat MTP
-    /// turn's `rollback_unemitted` hook. Unlike
-    /// `flat_mtp_caches_desynced`, this value is computed before the family
-    /// stepper handles the rollback, so tests can verify that a positive tail
-    /// actually arms the family latch.
-    pub(crate) flat_mtp_last_rollback_unemitted: usize,
-    /// Paged twin of `flat_mtp_last_rollback_unemitted`: the engine-computed
+    /// The engine-computed
     /// accepted-but-unemitted tail of the most recent PAGED MTP turn. The
     /// paged epilogues record it (instead of discarding the turn outcome) so
     /// tests can verify the mid-cycle GDN rewind actually had a tail to act on.
@@ -300,7 +268,7 @@ pub(crate) struct Qwen35Inner {
     paged_gdn_state_dirty: bool,
     /// Test-only one-shot: force the next epilogue frontier check to report a
     /// mismatch so the `paged_gdn_state_dirty` refuse-and-heal path can be
-    /// exercised deterministically (pattern of `ForceFlatMtpDesyncForTest`).
+    /// exercised deterministically.
     paged_gdn_force_mismatch_for_test: bool,
     /// The arm the most recent `prepare_dense_gdn_prefix_state` resolved to
     /// (`"live"`, `"last_history"`, …). Test observability only — the trace
@@ -384,21 +352,6 @@ pub struct MtpPagedGdnStateForTest {
 #[cfg(test)]
 mod qwen35_param_resolution_tests;
 
-/// Generation configuration for Qwen3.5
-#[napi(object)]
-#[derive(Debug, Clone)]
-pub struct Qwen3_5GenerationConfig {
-    pub max_new_tokens: i32,
-    #[napi(ts_type = "number | undefined")]
-    pub temperature: Option<f64>,
-    #[napi(ts_type = "number | undefined")]
-    pub top_k: Option<i32>,
-    #[napi(ts_type = "number | undefined")]
-    pub top_p: Option<f64>,
-    #[napi(ts_type = "number | undefined")]
-    pub min_p: Option<f64>,
-}
-
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct Qwen35LoadOptions {
@@ -427,16 +380,6 @@ pub struct Qwen35LoadOptions {
     pub max_context_tokens: Option<i64>,
 }
 
-/// Generation result
-#[napi(object)]
-#[derive(Debug, Clone)]
-pub struct Qwen3_5GenerationResult {
-    pub tokens: Vec<u32>,
-    pub text: String,
-    pub num_tokens: u32,
-    pub finish_reason: String,
-}
-
 /// Trained and physically available active-context limits for one loaded
 /// Qwen3.5 model. Values are snapshots taken at load: `effective_window`
 /// derives from the pool's MAX capacity (grow-on-demand pools are preflighted
@@ -454,8 +397,7 @@ pub struct Qwen3_5ContextLimits {
     /// token and the budget is clamped to `window - prompt`.
     pub rest_of_window_output_budget: bool,
     /// An omitted budget on `effective_window_tokens` is the rest of that
-    /// window. Set when the plan prices that window: the paged pool, or the
-    /// flat lane of a load without a pool.
+    /// window. Set when the plan prices that window: the paged pool.
     pub omitted_budget_is_rest_of_window: bool,
     /// Format of the K/V a turn on `effective_window_tokens` writes.
     #[napi(ts_type = "'int8' | 'bf16'")]
@@ -553,13 +495,11 @@ impl Qwen3_5Model {
     /// instance.
     ///
     /// `true` iff `Qwen35Inner::paged_adapter` was successfully
-    /// constructed at load time (driven by
-    /// `Qwen3_5Config::use_block_paged_cache`, default-ON for every compatible
-    /// checkpoint). On VLM checkpoints dense image turns ONLY run on the
-    /// paged-vision core; a vision turn that reaches a None adapter errors at
-    /// dispatch. Surfaced through this NAPI method so
-    /// server endpoints can branch on it without round-tripping through
-    /// the model thread.
+    /// constructed at load time (every load on Metal). On
+    /// VLM checkpoints dense image turns ONLY run on the paged-vision core; a
+    /// load with no adapter admits no image turn. Surfaced through this NAPI
+    /// method so server endpoints can branch on it without round-tripping
+    /// through the model thread.
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
@@ -674,38 +614,6 @@ impl Qwen3_5Model {
         loaded
     }
 
-    /// Generate text from a prompt token sequence.
-    #[napi]
-    pub async fn generate(
-        &self,
-        prompt_tokens: &MxArray,
-        mut config: Qwen3_5GenerationConfig,
-    ) -> Result<Qwen3_5GenerationResult> {
-        if config.max_new_tokens <= 0 {
-            return Err(Error::from_reason(format!(
-                "max_new_tokens must be > 0, got {}",
-                config.max_new_tokens
-            )));
-        }
-        let batch_size = prompt_tokens.shape_at(0)?;
-        if batch_size != 1 {
-            return Err(Error::from_reason(format!(
-                "generate() only supports batch_size=1, got batch_size={}",
-                batch_size
-            )));
-        }
-        let prompt_len = prompt_tokens.shape_at(1)? as usize;
-        let max_output =
-            context_output_budget(prompt_len, self.context_limits.effective_window_tokens)?;
-        config.max_new_tokens = config.max_new_tokens.min(max_output as i32);
-        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35FamilyCommand::Generate {
-            prompt_tokens: prompt_tokens.clone(),
-            config,
-            reply,
-        })
-        .await
-    }
-
     // Test-only streaming entry points that bypass ThreadsafeFunction and hand
     // back the mpsc receiver, for `crates/mlx-core/tests/qwen3_5_delta_chat.rs`.
 
@@ -767,43 +675,7 @@ impl Qwen3_5Model {
         Ok((handle, stream_rx))
     }
 
-    /// Test-only snapshot of the flat-MTP cache state, read *between* turns:
-    /// `(committed_history_len, flat_mtp_caches_desynced,
-    /// full_reprefill_count, rollback_unemitted)`.
-    ///
-    /// `committed_history_len` is `cached_token_history.len()` — the prompt plus
-    /// the committed generation of every completed turn — i.e. exactly how many
-    /// tokens a turn committed. Unlike `ChatStreamChunk.prompt_tokens` (hardcoded
-    /// to the delta length on the streaming delta path, heal or warm), it is
-    /// path-independent and comparable across MTP and AR turns.
-    /// `flat_mtp_caches_desynced` reports whether the preceding turn stranded
-    /// tokens mid-cycle and armed the heal. `full_reprefill_count` is the
-    /// monotonic number of discard+re-prefill heals the streaming delta path has
-    /// taken. `rollback_unemitted` is the independently engine-computed accepted
-    /// tail sent to the family rollback hook, so a positive value must agree with
-    /// the desync flag on flat MTP. Serialized behind the model thread, so it
-    /// observes the fully-finalized preceding turn.
-    #[doc(hidden)]
-    pub async fn mtp_flat_state_for_test(&self) -> Result<(usize, bool, u64, usize)> {
-        crate::model_thread::send_and_await(&self.thread, |reply| {
-            Qwen35FamilyCommand::MtpFlatStateForTest { reply }
-        })
-        .await
-    }
-
-    /// Test-only: arm the flat-MTP desync heal so the NEXT delta turn takes the
-    /// discard+re-prefill path. Lets a test exercise the heal deterministically
-    /// (the mid-cycle cancel that naturally arms it is host-timing-dependent).
-    #[doc(hidden)]
-    pub async fn force_flat_mtp_desync_for_test(&self) -> Result<()> {
-        crate::model_thread::send_and_await(&self.thread, |reply| {
-            Qwen35FamilyCommand::ForceFlatMtpDesyncForTest { reply }
-        })
-        .await
-    }
-
-    /// Test-only between-turn snapshot of the paged-MTP GDN bookkeeping —
-    /// the paged twin of [`Self::mtp_flat_state_for_test`]. See
+    /// Test-only between-turn snapshot of the paged-MTP GDN bookkeeping. See
     /// [`MtpPagedGdnStateForTest`].
     #[doc(hidden)]
     pub async fn mtp_paged_gdn_state_for_test(&self) -> Result<MtpPagedGdnStateForTest> {
@@ -953,6 +825,3 @@ mod mtp_gate_state_tests;
 
 #[cfg(test)]
 pub(crate) mod dflash2_park_tests;
-
-#[cfg(test)]
-mod stream_progress_tests;

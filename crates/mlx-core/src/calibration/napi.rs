@@ -261,9 +261,13 @@ pub async fn calibrate_activation_amax_raw(
         // Dense: Qwen35Inner is Send-but-!Sync, so raw-text prefill runs on its
         // dedicated model thread via a command.
         "qwen3_5" => {
-            let model =
-                crate::models::qwen3_5::persistence::load_with_thread(&model_path, None, None)
-                    .await?;
+            // A bf16 pool: the amax must not depend on the serving K/V format.
+            let model = crate::models::qwen3_5::persistence::load_with_thread(
+                &model_path,
+                None,
+                Some(crate::transformer::KvFormat::Bf16),
+            )
+            .await?;
             prefill_and_persist(&model_path, || async {
                 crate::model_thread::send_and_await(&model.thread, |reply| {
                     Qwen35FamilyCommand::CalibratePrefillRaw {
@@ -279,9 +283,13 @@ pub async fn calibrate_activation_amax_raw(
         // MoE: same model-thread pattern; the MoE loader already threads
         // input_amax for its mxfp8 attn/GDN sites (agentworld etc.).
         "qwen3_5_moe" => {
-            let model =
-                crate::models::qwen3_5_moe::persistence::load_with_thread(&model_path, None, None)
-                    .await?;
+            // A bf16 pool: the amax must not depend on the serving K/V format.
+            let model = crate::models::qwen3_5_moe::persistence::load_with_thread(
+                &model_path,
+                None,
+                Some(crate::transformer::KvFormat::Bf16),
+            )
+            .await?;
             prefill_and_persist(&model_path, || async {
                 crate::model_thread::send_and_await(&model.thread, |reply| {
                     Qwen35MoeFamilyCommand::CalibratePrefillRaw {

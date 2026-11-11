@@ -5,7 +5,6 @@ use napi::bindgen_prelude::*;
 use crate::array::{DType, MxArray};
 use crate::engine::backend::{DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput};
 use crate::engine::memory_plan::EXTENT_TARGET_BYTES;
-use crate::transformer::KvFormat;
 
 use super::dflash2::DFlash2ContextCache;
 use super::dflash2_turn::{DFlash2Target, DFlash2TurnState};
@@ -204,36 +203,6 @@ fn dflash2_cycle_transient(
     }
 }
 
-/// One prefill chunk of a flat turn over `prompt` rows: one layer's
-/// attention and MLP scratch, `tap_layers` tapped hidden rows of the chunk
-/// and, for int8 rows, one full-attention layer's prefix dequantized beside
-/// its concatenation with the chunk.
-fn prefill_transient_bytes(
-    config: &super::config::Qwen3_5Config,
-    prompt: u64,
-    kv_format: KvFormat,
-    tap_layers: usize,
-) -> u64 {
-    let dim = |v: i32| v.max(0) as u64;
-    let chunk = prompt.min(PREFILL_STEP_SIZE as u64);
-    let taps = chunk
-        .saturating_mul(tap_layers as u64)
-        .saturating_mul(dim(config.hidden_size))
-        .saturating_mul(2);
-    let dequantized_prefix = match kv_format {
-        KvFormat::Int8 => prompt
-            .saturating_mul(2)
-            .saturating_add(chunk)
-            .saturating_mul(dim(config.num_kv_heads))
-            .saturating_mul(dim(config.head_dim))
-            .saturating_mul(2 * 2),
-        KvFormat::Bf16 => 0,
-    };
-    prefill_chunk_scratch_bytes(config, prompt)
-        .saturating_add(taps)
-        .saturating_add(dequantized_prefix)
-}
-
 /// One layer's attention and MLP scratch over a prefill chunk of the first
 /// `window` rows.
 fn prefill_chunk_scratch_bytes(config: &super::config::Qwen3_5Config, window: u64) -> u64 {
@@ -330,19 +299,6 @@ pub(crate) fn pool_attention_bytes(
     )
 }
 
-/// Bytes a flat autoregressive turn of `window` tokens allocates besides KV
-/// at its peak: its last prefill chunk, or one decode step. No DFlash2
-/// decode cache limit is pushed on this lane.
-pub(crate) fn flat_lane_transient(
-    config: &super::config::Qwen3_5Config,
-    kv_format: KvFormat,
-    window: u32,
-) -> u64 {
-    let window = u64::from(window);
-    prefill_transient_bytes(config, window, kv_format, 0)
-        .max(dflash2_cycle_transient(config, 0, window).total())
-}
-
 /// Below this many keys the attention kernels run one-pass and allocate no
 /// partials (`sdpa_vector_uses_two_pass` in `mlx_segmented_sdpa_plan.h`).
 const SDPA_TWO_PASS_MIN_KEYS: u64 = 4096;
@@ -422,7 +378,6 @@ impl Qwen35DFlash2Stepper<'_> {
                 .caches
                 .as_ref()
                 .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?,
-            true,
         )?;
         let ticket =
             crate::engine::spec_paged::SpecPagedCache::open_core_write_cycle(self, seq, full.len())
@@ -667,14 +622,7 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
                         "Qwen3.8 DFlash2 fused GDN commit declined; per-layer replay for the rest of the turn"
                     );
                 }
-                replay_mtp_snapshot_to(
-                    caches,
-                    &snapshot,
-                    &tape,
-                    keep,
-                    true,
-                    "Qwen3.8 DFlash2 commit",
-                )?;
+                replay_mtp_snapshot_to(caches, &snapshot, &tape, keep, "Qwen3.8 DFlash2 commit")?;
             }
         }
         self.append_tapped(&tapped, &verified_ids[..keep])
@@ -1217,7 +1165,6 @@ pub(crate) mod tests {
             rope_theta: 10_000_000.0,
             paged_cache_memory_mb: None,
             paged_block_size: None,
-            use_block_paged_cache: None,
             persist_paged_cache: None,
             n_mtp_layers: 0,
         }

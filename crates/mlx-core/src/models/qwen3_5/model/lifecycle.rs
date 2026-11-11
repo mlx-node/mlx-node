@@ -103,10 +103,6 @@ impl Qwen35Inner {
             scheduled_recurrent: RecurrentStateTable::stage2(),
             scheduled_mtp: Default::default(),
             active_scheduled_seq: None,
-            paged_full_attn_caches_dirty: false,
-            flat_mtp_caches_desynced: false,
-            flat_full_reprefill_count: 0,
-            flat_mtp_last_rollback_unemitted: 0,
             paged_mtp_last_rollback_unemitted: 0,
             paged_mtp_gdn_rewinds: 0,
             paged_mtp_gdn_invalidations: 0,
@@ -127,8 +123,8 @@ impl Qwen35Inner {
     /// Plan this load's memory once its weights are materialized (Splash
     /// `RuntimeResources::create`), then build the paged pool: it starts at
     /// the runway and grows by extents toward the plan's ceiling. A load
-    /// without a pool plans its DFlash2 lane, or its flat lane without a
-    /// draft. Runs inside the process-wide pool-growth lock.
+    /// without a pool (a CLEF decision model, a load off Metal) plans its
+    /// footprint only. Runs inside the process-wide pool-growth lock.
     pub(crate) fn initialize_paged_adapter(&mut self) -> Result<()> {
         if self.paged_adapter.is_some() {
             return Ok(());
@@ -137,9 +133,11 @@ impl Qwen35Inner {
         // the old one.
         self.dflash2_states.clear();
         let recurrent = self.config.recurrent_state_bytes();
-        if !self.config.use_block_paged_cache.unwrap_or(true)
-            || !crate::engine::persistence::compiled_forward_backend_available()
-        {
+        if self.clef_head.is_some() || !crate::models::qwen3_5::load_plan::qwen35_pool_backend() {
+            crate::models::qwen3_5::load_plan::qwen35_no_pool_format(
+                "Qwen3.5",
+                self.config.kv_format(),
+            )?;
             self.memory_plan = crate::models::qwen3_5::load_plan::plan_qwen35_load(
                 "Qwen3.5",
                 &*self,
@@ -354,18 +352,17 @@ impl Qwen35Inner {
     pub(crate) fn require_dflash2_pool(&self) -> Result<()> {
         if self.dflash2.is_some() && self.paged_adapter.is_none() {
             return Err(Error::from_reason(
-                "Qwen3.8 DFlash2 runs on the block-paged KV pool and this load has none; \
-                 load without the companion (autoLoadDraft: false) or with the paged cache",
+                "Qwen3.8 DFlash2 runs on the block-paged KV pool, which this load has none \
+                 of (it needs Metal); load without the companion (autoLoadDraft: false)",
             ));
         }
         Ok(())
     }
 
-    /// Tokens one paged, vision, MTP or flat autoregressive turn may hold:
-    /// the plan's pool lane, or its flat lane on a load with neither pool
-    /// nor draft. Without a plan (a pool installed by a test), the pool's
-    /// blocks after one recurrent cell; without a pool, the served window.
-    /// All at most the context cap.
+    /// Tokens one turn may hold: the plan's pool lane. Without a plan (a
+    /// pool installed by a test), the pool's blocks after one recurrent cell;
+    /// without a pool (off Metal), the served window. All at most the
+    /// context cap.
     pub(crate) fn pool_context_limit(&self) -> u32 {
         self.pool_lane_limit().min(self.context_cap())
     }
@@ -383,13 +380,12 @@ impl Qwen35Inner {
 
     fn pool_lane_limit(&self) -> u32 {
         let trained = self.served_context();
-        if let Some(plan) = self.memory_plan.as_ref() {
-            if let Some(pool) = plan.pool.as_ref() {
-                return pool.lane.window.maximum();
-            }
-            if let Some(flat) = plan.flat.as_ref() {
-                return flat.window.maximum();
-            }
+        if let Some(pool) = self
+            .memory_plan
+            .as_ref()
+            .and_then(|plan| plan.pool.as_ref())
+        {
+            return pool.lane.window.maximum();
         }
         self.paged_adapter.as_ref().map_or(trained, |adapter| {
             crate::engine::hybrid_scheduler::pool_tokens_after_recurrent(
@@ -428,11 +424,7 @@ impl Qwen35Inner {
         };
         crate::models::qwen3_5::model::Qwen3_5ContextLimits::from_parts(
             self.paged_context_limits(),
-            self.paged_adapter.is_some()
-                || self
-                    .memory_plan
-                    .as_ref()
-                    .is_some_and(|plan| plan.flat.is_some()),
+            self.paged_adapter.is_some(),
             kv_format,
         )
     }
@@ -502,11 +494,6 @@ impl Qwen35Inner {
         self.scheduled_mtp = Default::default();
         self.active_scheduled_seq = None;
         self.clear_reuse_state();
-        // No cache owner remains after a full reset. Clear both transition
-        // latches so the next flat prefill becomes authoritative instead of
-        // inheriting the preceding paged/partial-MTP lane's provenance.
-        self.paged_full_attn_caches_dirty = false;
-        self.flat_mtp_caches_desynced = false;
         // A full session reset must also clear the MTP acceptance gate
         // state: a new independent chat on this model starts fresh (probes)
         // instead of inheriting the previous chat's rejection.
@@ -897,8 +884,6 @@ impl Qwen35Inner {
         self.caches = None;
         self.dflash2_states.drop_unregistered();
         self.clear_reuse_state();
-        self.paged_full_attn_caches_dirty = false;
-        self.flat_mtp_caches_desynced = false;
     }
 
     pub(super) fn invalidate_dense_paged_session(&mut self, context: &str) {
@@ -1048,4 +1033,318 @@ pub(crate) fn cold_tier_config_json<C: serde::Serialize>(
         config_json.extend_from_slice(line.as_bytes());
     }
     Some(config_json)
+}
+
+impl Qwen35Inner {
+    fn first_quantized_save_component(&self) -> Option<String> {
+        if self.embedding.is_quantized() {
+            return Some("embedding".to_string());
+        }
+        for (index, layer) in self.layers.iter().enumerate() {
+            if layer.is_quantized() {
+                return Some(format!("layers.{index}"));
+            }
+        }
+        if self
+            .lm_head
+            .as_ref()
+            .is_some_and(|head| head.is_quantized())
+        {
+            return Some("lm_head".to_string());
+        }
+        if self.mtp_weights_loaded
+            && self
+                .mtp
+                .as_ref()
+                .is_some_and(|mtp| mtp.has_quantized_weights())
+        {
+            return Some("mtp".to_string());
+        }
+        None
+    }
+
+    /// Save model weights and configuration to a directory (synchronous).
+    pub(crate) fn save_model_sync(&self, save_path: &str) -> Result<()> {
+        use crate::models::qwen3_5::decoder_layer::AttentionType;
+
+        if let Some(component) = self.first_quantized_save_component() {
+            return Err(Error::from_reason(format!(
+                "Cannot save model: save_model is dense/BF16-only, but main-model component \
+                 '{component}' contains quantized projections. Refusing before creating the \
+                 destination because packed weights require sidecars and quantization metadata \
+                 that this save format cannot preserve losslessly."
+            )));
+        }
+
+        let mut params = HashMap::new();
+
+        // Embedding
+        params.insert("embedding.weight".to_string(), self.embedding.get_weight());
+
+        // Layers
+        for (i, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("layers.{}", i);
+            match &layer.attn {
+                AttentionType::Linear(gdn) => {
+                    params.insert(
+                        format!("{}.linear_attn.in_proj_qkvz.weight", prefix),
+                        gdn.get_in_proj_qkvz_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.in_proj_ba.weight", prefix),
+                        gdn.get_in_proj_ba_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.conv1d.weight", prefix),
+                        gdn.get_conv1d_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.norm.weight", prefix),
+                        gdn.get_norm_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.out_proj.weight", prefix),
+                        gdn.get_out_proj_weight(),
+                    );
+                    params.insert(format!("{}.linear_attn.dt_bias", prefix), gdn.get_dt_bias());
+                    params.insert(format!("{}.linear_attn.a_log", prefix), gdn.get_a_log());
+                }
+                AttentionType::Full(attn) => {
+                    params.insert(
+                        format!("{}.self_attn.q_proj.weight", prefix),
+                        attn.get_q_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.k_proj.weight", prefix),
+                        attn.get_k_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.v_proj.weight", prefix),
+                        attn.get_v_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.o_proj.weight", prefix),
+                        attn.get_o_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.q_norm.weight", prefix),
+                        attn.get_q_norm_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.k_norm.weight", prefix),
+                        attn.get_k_norm_weight(),
+                    );
+                }
+            }
+            params.insert(
+                format!("{}.mlp.gate_proj.weight", prefix),
+                layer.mlp.get_gate_proj_weight(),
+            );
+            params.insert(
+                format!("{}.mlp.up_proj.weight", prefix),
+                layer.mlp.get_up_proj_weight(),
+            );
+            params.insert(
+                format!("{}.mlp.down_proj.weight", prefix),
+                layer.mlp.get_down_proj_weight(),
+            );
+            params.insert(
+                format!("{}.input_layernorm.weight", prefix),
+                layer.get_input_layernorm_weight(),
+            );
+            params.insert(
+                format!("{}.post_attention_layernorm.weight", prefix),
+                layer.get_post_attention_layernorm_weight(),
+            );
+        }
+
+        // Final norm
+        params.insert(
+            "final_norm.weight".to_string(),
+            self.final_norm.get_weight(),
+        );
+
+        // LM head
+        if !self.config.tie_word_embeddings
+            && let Some(ref lm_head) = self.lm_head
+        {
+            params.insert("lm_head.weight".to_string(), lm_head.get_weight());
+        }
+
+        // Include vision encoder weights
+        if let Some(ref vision_enc) = self.vision_encoder {
+            let vision_params = vision_enc.get_parameters();
+            params.extend(vision_params);
+        }
+
+        // Multi-Token Prediction head. `config.n_mtp_layers` round-trips
+        // through config.json, so a reloaded checkpoint will reconstruct the
+        // MTP module from config and expect the `mtp.*` tensors present —
+        // without this block the loader would find them absent, set
+        // `mtp_weights_loaded = false`, and silently disable speculative
+        // decode (only a `warn!`). The `mtp_weights_loaded` guard is
+        // essential: `mtp.is_some()` alone would serialize a random-init
+        // module (constructed from config even when no weights were loaded).
+        if self.mtp_weights_loaded
+            && let Some(ref mtp) = self.mtp
+        {
+            // The early fail-closed quantized-state gate above guarantees this
+            // MTP head is dense; partial omission would make the saved model
+            // silently lose speculative decoding.
+            params.extend(mtp.get_parameters());
+        }
+
+        // Validate for NaN/Inf
+        for (name, param) in params.iter() {
+            let data = param.to_float32()?;
+            let invalid_count = data
+                .iter()
+                .filter(|v| v.is_nan() || v.is_infinite())
+                .count();
+            if invalid_count > 0 {
+                return Err(napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!(
+                        "Cannot save model: parameter '{}' contains {} NaN/Inf values.",
+                        name, invalid_count
+                    ),
+                ));
+            }
+        }
+
+        let mut params_clone: HashMap<String, MxArray> =
+            params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+        // Weights metadata
+        let mut weights_metadata = serde_json::Map::new();
+        for (key, array) in params.iter() {
+            let shape_data = array.shape()?;
+            let shape: Vec<i64> = shape_data.as_ref().to_vec();
+            let dtype = array.dtype()?;
+            let mut param_info = serde_json::Map::new();
+            param_info.insert("shape".to_string(), serde_json::json!(shape));
+            param_info.insert("dtype".to_string(), serde_json::json!(dtype as i32));
+            weights_metadata.insert(key.clone(), serde_json::Value::Object(param_info));
+        }
+
+        // Config JSON
+        let mut config_value = serde_json::to_value(&self.config).map_err(|e| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Failed to serialize config: {e}"),
+            )
+        })?;
+        if let serde_json::Value::Object(ref mut map) = config_value {
+            map.insert("model_type".to_string(), serde_json::json!("qwen3_5"));
+            // `parse_config` reads the MTP layer count ONLY from the
+            // HF-convention keys `mtp_num_hidden_layers` /
+            // `num_nextn_predict_layers`; the serde field name
+            // `n_mtp_layers` is ignored on load. Without this, a saved MTP
+            // checkpoint reloads with `n_mtp_layers = 0` and its head is
+            // silently dropped. Mirrors the MoE saver
+            // (`qwen3_5_moe::model::Qwen35MoeInner::save_model_sync`).
+            map.insert(
+                "mtp_num_hidden_layers".to_string(),
+                serde_json::json!(self.config.n_mtp_layers),
+            );
+        }
+
+        let weights_json = serde_json::json!({
+            "version": "1.0",
+            "config": config_value,
+            "weights": weights_metadata,
+            "note": "Full weights are in weights.safetensors"
+        });
+
+        let path = std::path::Path::new(save_path);
+        std::fs::create_dir_all(path)?;
+
+        info!("Saving model to {}", save_path);
+
+        let config_path = path.join("config.json");
+        let config_json = serde_json::to_string_pretty(&config_value)?;
+        std::fs::write(&config_path, config_json)?;
+        info!("Saved config.json");
+
+        let safetensors_path = path.join("weights.safetensors");
+        let metadata = Some(serde_json::json!({
+            "format": "mlx-node",
+            "version": "1.0"
+        }));
+        crate::utils::safetensors::save_safetensors(
+            &safetensors_path,
+            &mut params_clone,
+            metadata,
+        )?;
+        info!("Saved weights.safetensors");
+
+        let weights_str = serde_json::to_string_pretty(&weights_json)?;
+        let weights_path = path.join("weights.mlx");
+        std::fs::write(&weights_path, weights_str)?;
+        info!("Saved weights.mlx metadata");
+
+        Ok(())
+    }
+
+    /// Set the tokenizer.
+    pub(crate) fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
+        self.tokenizer = Some(tokenizer);
+    }
+
+    /// Set the vision encoder.
+    ///
+    /// Paged VLM checkpoints wire this alongside the image processor and
+    /// adapter. Image-bearing turns then route through the dedicated paged
+    /// vision prefill/decode cores; incomplete stacks stay backend-validated
+    /// so those cores can report the precise missing component.
+    ///
+    /// For text-only inputs M-RoPE collapses to standard scalar-offset
+    /// RoPE — `Qwen3_5Attention::forward` uses `self.rope` whenever
+    /// `position_ids` is `None`, which is the case for every text-only
+    /// flat call. The paged forward (`Qwen3_5Attention::forward_paged`)
+    /// also goes through `self.rope` unconditionally. Both paths share
+    /// the same RoPE on text-only inputs, so byte-equal parity holds
+    /// on VLM checkpoints provided no images are passed.
+    pub(crate) fn set_vision_encoder(&mut self, enc: QwenVisionEncoder) -> Result<()> {
+        self.vision_encoder = Some(Arc::new(enc));
+        self.vision_cache = Arc::new(Mutex::new(VisionCacheInner::new()));
+        Ok(())
+    }
+
+    /// Set the image processor.
+    pub(crate) fn set_image_processor(&mut self, proc: QwenImageProcessor) {
+        self.image_processor = Some(Arc::new(proc));
+        self.vision_cache = Arc::new(Mutex::new(VisionCacheInner::new()));
+    }
+
+    /// Set spatial merge size.
+    pub(crate) fn set_spatial_merge_size(&mut self, size: i32) {
+        self.spatial_merge_size = Some(size);
+        self.vision_cache = Arc::new(Mutex::new(VisionCacheInner::new()));
+    }
+
+    /// Initialize M-RoPE on all full attention layers (VLM mode).
+    pub(crate) fn init_mrope_layers(
+        &mut self,
+        mrope_section: Vec<i32>,
+        rope_theta: f64,
+        max_position_embeddings: i32,
+    ) -> Result<()> {
+        let rope_dims = self.config.rope_dims();
+        let scaling = self.config.scaling();
+        for layer in self.layers.iter_mut() {
+            if let crate::models::qwen3_5::decoder_layer::AttentionType::Full(ref mut attn) =
+                layer.attn
+            {
+                attn.init_mrope(
+                    mrope_section.clone(),
+                    rope_theta,
+                    max_position_embeddings,
+                    rope_dims,
+                    &scaling,
+                )?;
+            }
+        }
+        Ok(())
+    }
 }

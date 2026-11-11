@@ -1,10 +1,8 @@
-//! Synthetic end-to-end gate for the eager MoE MTP path on the FLAT lane.
-//!
-//! The tiny random checkpoint this drives sets `use_block_paged_cache: false`
-//! (its 16-wide attention head is not valid PagedAttention geometry), so it is
-//! the always-on route through `MoeMtpStepper`'s flat mode. The PAGED mode's
-//! gates need a real checkpoint and live in
-//! `qwen3_5_moe_paged_mtp_parity.rs` / `qwen3_5_moe_paged_mtp_midcycle.rs`.
+//! Synthetic end-to-end gate for the eager MoE MTP path on the block-paged
+//! pool. The tiny random checkpoint has a kernel geometry (8 / 2 heads of
+//! 128), so it is the always-on route through `MoeMtpStepper`. The
+//! real-weights gates live in `qwen3_5_moe_paged_mtp_parity.rs` /
+//! `qwen3_5_moe_paged_mtp_midcycle.rs`.
 //!
 //! Asserts the four deterministic conditions documented in the harness header:
 //! the MTP head engages after reload, the AR baseline and the MTP decode both
@@ -25,5 +23,5 @@ fn synthetic_moe_mtp_gate() {
         .enable_all()
         .build()
         .expect("failed to build tokio runtime")
-        .block_on(common::run_synthetic_mtp_gate("flat lane"));
+        .block_on(common::run_synthetic_mtp_gate("pool"));
 }

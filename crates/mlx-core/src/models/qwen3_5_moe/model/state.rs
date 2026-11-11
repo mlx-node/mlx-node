@@ -56,6 +56,7 @@ pub(super) struct MoeGdnHistoryCheckpoint {
 }
 
 pub(crate) struct MoeGdnPrefixPreparation {
+    #[cfg(test)]
     pub(crate) state: &'static str,
     pub(crate) already_primed: bool,
     pub(crate) restored_prefix_tokens: u32,
@@ -179,15 +180,19 @@ pub(super) const fn qwen35_moe_media_plan(
     has_image_processor: bool,
     has_paged_adapter: bool,
 ) -> MediaPlan {
-    let images_available =
-        qwen35_moe_vision_active(has_vision_encoder, has_image_processor, has_paged_adapter);
-    MediaPlan::with_backend_validation(
-        MediaCapabilities {
-            images: images_available,
+    // Images are admitted only where they run, so the engine refuses the
+    // rest before render (Splash `Engine::submit`).
+    MediaPlan {
+        available: MediaCapabilities {
+            images: qwen35_moe_vision_active(
+                has_vision_encoder,
+                has_image_processor,
+                has_paged_adapter,
+            ),
             audio: false,
         },
-        MediaCapabilities::IMAGES,
-    )
+        backend_validated: MediaCapabilities::NONE,
+    }
 }
 
 /// Media represented by the live MoE session state. Paged text continuations

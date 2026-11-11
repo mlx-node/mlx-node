@@ -276,15 +276,19 @@ pub(super) const fn qwen35_dense_media_plan(
     has_image_processor: bool,
     has_paged_adapter: bool,
 ) -> MediaPlan {
-    let images_available =
-        qwen35_dense_vision_active(has_vision_encoder, has_image_processor, has_paged_adapter);
-    MediaPlan::with_backend_validation(
-        MediaCapabilities {
-            images: images_available,
+    // Images are admitted only where they run, so the engine refuses the
+    // rest before render (Splash `Engine::submit`).
+    MediaPlan {
+        available: MediaCapabilities {
+            images: qwen35_dense_vision_active(
+                has_vision_encoder,
+                has_image_processor,
+                has_paged_adapter,
+            ),
             audio: false,
         },
-        MediaCapabilities::IMAGES,
-    )
+        backend_validated: MediaCapabilities::NONE,
+    }
 }
 
 /// Media represented by the live dense session state.
@@ -327,92 +331,4 @@ pub(super) fn apply_qwen35_dense_planned_decoder(
     );
     config.enable_mtp = Some(planned_mtp);
     planned_mtp
-}
-
-/// Input bundle for [`Qwen35Inner::chat_with_caches_inner`].
-///
-/// Packs every value the shared post-prefill pipeline needs into a single
-/// named struct so callers don't have to thread 20+ positional arguments.
-/// Constructed by the prefill-side of [`Qwen35Inner::vision_mtp_whole_turn_core`] and
-/// [`Qwen35Inner::chat_tokens_delta_sync`].
-///
-/// The caller is responsible for:
-///   - running prefill and packaging the resulting `last_logits` and
-///     `seq_len`.
-pub(crate) struct ChatDecodeInputs {
-    /// Logits for the last position of the prefill chunk. Penalties and
-    /// sampling run against this to produce the first decoded token.
-    pub last_logits: MxArray,
-    /// Total context length after prefill (cached + newly-prefilled).
-    pub seq_len: i64,
-    /// `true` when this invocation is a session DELTA continuation
-    /// (text-only append on top of the live KV cache). Drives the
-    /// post-decode save pathway: deltas keep `cached_image_key` sticky
-    /// so image attention state baked into the KV caches by a prior
-    /// prefill stays addressable; prefills (re)set the key based on
-    /// the fresh turn's `has_images`.
-    pub is_delta: bool,
-
-    /// `true` when the current turn carries images.
-    pub has_images: bool,
-
-    /// Full pre-decode token sequence. Seeds the decode loop's running
-    /// history (mutated in place) and the penalty context.
-    pub token_history_init: Vec<u32>,
-    /// Token snapshot handed to `save_cache_state_direct`. For text-only
-    /// this equals `token_history_init`; for VLM it's the pre-expansion
-    /// tokens.
-    pub save_tokens: Vec<u32>,
-    /// Expanded token sequence (with image placeholders expanded) used by
-    /// the VLM save path. `None` for text-only.
-    pub save_expanded_tokens: Option<Vec<u32>>,
-    /// Image cache key for the current turn. 0 for text-only.
-    pub save_image_cache_key: u64,
-
-    pub tokenizer: Arc<Qwen3Tokenizer>,
-    pub think_end_id: Option<u32>,
-    pub think_end_str: Option<String>,
-    /// Resolved thinking-mode state for the turn — the single source of
-    /// truth, threaded from `WholeTurnArgs::thinking` so the cores share
-    /// one `resolve_enable_thinking` result.
-    pub thinking: ThinkingSetup,
-    /// End-of-sequence token id for the decode loop. For `vision_mtp_whole_turn_core` this
-    /// is `config.eos_token_id`; for the session delta path it's
-    /// `<|im_end|>` so cache boundaries stay clean.
-    pub eos_id: u32,
-
-    pub profiler: crate::decode_profiler::DecodeProfiler,
-    pub generation_start: Option<std::time::Instant>,
-    pub first_token_instant: Option<std::time::Instant>,
-    /// Number of tokens actually prefilled this turn (for throughput math).
-    pub prefill_tokens_len: usize,
-    /// Prompt token count reported on the `ChatResult`.
-    pub prompt_tokens_for_result: u32,
-    /// Length of the reused cached prefix to report on `ChatResult.cached_tokens`.
-    ///
-    /// For fresh prefills this is `cached_prefix_len` (0 on a miss, full
-    /// cached length on an exact-append hit). For the session delta path
-    /// this is the full prior-history length because the delta is
-    /// appended on top of the existing caches — we skip the `cached_prefix_len`
-    /// driver (which only gates the VLM rope-delta replay branch) while
-    /// still reporting the reused prefix accurately for observability.
-    pub cached_tokens_for_result: u32,
-
-    pub embedding: Embedding,
-    pub generation_stream: Stream,
-    pub params: crate::engine::ChatParams,
-
-    /// Post-final-norm hidden state for every prefilled prompt token,
-    /// `[1, prefill_len, hidden]`. `Some` only when MTP is active for this
-    /// turn (`params.enable_mtp && has_mtp_weights`) and the prefill ran
-    /// the hidden-emitting `chunked_prefill_with_hidden`. Consumed once,
-    /// by `begin_mtp_decode`'s prompt-prefix seed, to commit the prompt
-    /// prefix into the MTP committed-history cache.
-    /// `None` for non-MTP turns and for the streaming/delta paths.
-    pub prompt_hidden: Option<MxArray>,
-    /// The exact prompt token ids whose hiddens `prompt_hidden` holds —
-    /// i.e. the `prefill_tokens` slice the hidden-emitting prefill
-    /// forwarded. `prompt_hidden.shape(1) == prompt_hidden_ids.len()`.
-    /// `Some` iff `prompt_hidden` is `Some`.
-    pub prompt_hidden_ids: Option<Vec<u32>>,
 }

@@ -663,11 +663,10 @@ pub(crate) fn run_paged_prefill_single_shot(
 
 /// Image-bearing paged prefill with optional cached-prefix reuse for MoE.
 ///
-/// The paged sibling of the flat `vlm_prefill_moe`: it feeds the vision
-/// encoder's image-merged token embeddings (`merge.inputs_embeds`) through the
-/// paged adapter and applies 3-row M-RoPE over `merge.position_ids` on the
-/// full-attention layers, while GDN/linear layers run with neither mask nor
-/// positions (matching the flat VLM policy).
+/// The MoE image prefill: it feeds the vision encoder's image-merged token
+/// embeddings (`merge.inputs_embeds`) through the paged adapter and applies
+/// 3-row M-RoPE over `merge.position_ids` on the full-attention layers,
+/// while GDN/linear layers run with neither mask nor positions.
 ///
 /// `expanded_tokens` are the placeholder-expanded prompt tokens (one entry per
 /// embedding row). They drive `record_tokens` / the physical slot cursor only;
@@ -1501,7 +1500,6 @@ mod tests {
             mlp_only_layers: None,
             paged_cache_memory_mb: Some(256),
             paged_block_size: Some(16),
-            use_block_paged_cache: Some(true),
             persist_paged_cache: None,
             n_mtp_layers: 0,
             qwen35_gguf_gdn_layout: None,

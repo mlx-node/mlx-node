@@ -2397,7 +2397,6 @@ impl NemotronHInner {
             let turn_setup = TurnSetup {
                 params: &p,
                 is_delta,
-                has_images: false,
                 total_seq_len: tokens.len(),
             };
             let mut step = ChatBackend::begin_decode(self, &turn_setup)?;

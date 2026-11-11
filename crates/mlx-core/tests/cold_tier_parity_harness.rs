@@ -567,7 +567,6 @@ fn clone_model_dir(
             .map_err(|e| format!("read config.json: {e} (path={})", cfg_path.display()))?;
         let mut cfg: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| format!("parse config.json: {e} (path={})", cfg_path.display()))?;
-        cfg["use_block_paged_cache"] = serde_json::Value::Bool(true);
         cfg["persist_paged_cache"] = serde_json::Value::Bool(persist);
         // Bound the adapter pool so the test stays light, and pin the block
         // size the restore assertion is stated in terms of.

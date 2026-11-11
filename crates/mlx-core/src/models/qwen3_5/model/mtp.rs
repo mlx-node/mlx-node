@@ -47,24 +47,18 @@ impl DecodeStep for Qwen35Decode<'_> {
 /// desync latch, the committed-history bookkeeping) are plain fields: the
 /// engine calls the methods strictly sequentially and non-nested.
 ///
-/// Drives BOTH the FLAT and the block-PAGED dense MTP turn, selected by
-/// [`Self::owner`]: with no owner the eager pre-norm forwards run against
-/// `inner.caches`; with one, the main Step-A / verify forwards route through
-/// `inner.paged_adapter`
+/// Drives the block-paged dense MTP turn of [`Self::owner`]: the main
+/// Step-A / verify forwards route through `inner.paged_adapter`
 /// ([`crate::models::qwen3_5::paged_forward::run_paged_step_with_hidden`] /
 /// [`crate::models::qwen3_5::paged_forward::run_paged_verify_step`]) while the GDN recurrent
-/// state stays FLAT in `inner.caches` Linear slots. Only four methods
-/// (`forward_with_hidden`, `verify_step`, `rollback`, `rollback_unemitted`)
-/// branch on it; every other method is path-identical (the drafter and the
-/// committed-history commit are paged-agnostic).
+/// state stays in `inner.caches` Linear slots.
 ///
 /// The adapter stays ON THE MODEL for the whole turn: each paged touch
 /// borrows it back through [`SpecOwner::resolve`], which refuses once the
 /// adapter's active request is no longer this turn's. That refusal is what
 /// makes the borrow-back sound, so nothing has to be moved out and restored.
 pub(crate) struct DenseMtpStepper<'a> {
-    /// The model — owns layers / caches / mtp / final_norm / lm_head and the
-    /// `flat_mtp_caches_desynced` latch.
+    /// The model — owns layers / caches / mtp / final_norm / lm_head.
     inner: &'a mut Qwen35Inner,
     /// Drafter K/V caches. Committed-history mode holds the persistent
     /// committed prefix; cycle-history mode is reset fresh by `begin_cycle`.
@@ -94,13 +88,13 @@ pub(crate) struct DenseMtpStepper<'a> {
     /// verify core's own row write, consumed by [`MtpStepper::rollback`]'s
     /// facade commit — the one place the adapter's speculative rows are
     /// retracted, so the commit arithmetic cannot drift from the
-    /// conformance surface. `None` in flat mode, between cycles, and when
+    /// conformance surface. `None` between cycles, and when
     /// the adapter names no active sequence (the verify core then fails on
     /// its own `record_tokens` and the turn never reaches a rollback).
     pub(super) open_cycle: Option<crate::engine::spec_paged::VerifyTicket>,
     /// Absolute tokens the GDN recurrent state has consumed, reported by
     /// [`MtpStepper::frontier`] against the ATTENTION side's ground truth
-    /// (adapter recorded rows / flat full-attention offset). Seeded from the
+    /// (adapter recorded rows). Seeded from the
     /// attention frontier at construction (the two sides are aligned at turn
     /// entry) and moved ONLY where the recurrent state actually moves:
     /// `forward_with_hidden` +1, `verify_step` +depth+1, replay-driven
@@ -114,18 +108,15 @@ pub(crate) struct DenseMtpStepper<'a> {
     /// Error stashed by the infallible `rollback` replay, surfaced by
     /// `take_replay_error`.
     replay_err: Option<Error>,
-    /// Mid-cycle-stop desync latch (set by `rollback_unemitted`), reported by
-    /// `into_desynced`.
-    mtp_desynced: bool,
     /// The model's embedding lookup and tied-head projection backend.
     embedding: Embedding,
     /// Config clone for the per-cycle drafter cache reset/fresh build.
     config: Qwen3_5Config,
     /// The sequence this turn's paged main-forwards belong to, claimed at
-    /// `begin_mtp_decode`. `None` runs the flat main path.
-    owner: Option<SpecOwner>,
+    /// `begin_mtp_decode`.
+    owner: SpecOwner,
     /// Per-layer attention/linear classification consumed by the paged
-    /// forwards. Empty on the flat path (unused there).
+    /// forwards.
     layer_kinds: Vec<crate::models::qwen3_5::decoder_layer::Qwen3_5LayerKind>,
 }
 
@@ -147,11 +138,9 @@ impl DenseMtpStepper<'_> {
     /// `rollback` (to `accepted_steps`) and the paged `rollback_unemitted`
     /// (to `last_cycle_steps - unemitted`) drive. Pure over
     /// `(snapshot, tape, steps)`: `steps == 0` degenerates to a bare snapshot
-    /// restore. On the flat path full-attention layers rewind via `kv.trim`;
-    /// on the paged path their K/V lives in the pool (rewound by the adapter)
-    /// and the flat shells are skipped.
+    /// restore. Full-attention K/V lives in the pool (rewound by the adapter),
+    /// so the full-attention shells are skipped.
     fn replay_main_linear_to(&mut self, steps: usize) -> Result<()> {
-        let paged = self.owner.is_some();
         let snap = match self.snap.as_ref() {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -178,44 +167,31 @@ impl DenseMtpStepper<'_> {
             snap,
             tape,
             steps,
-            paged,
             "eager MTP replay",
         )
     }
 
     /// The attention side's ground-truth frontier: the paged adapter's
-    /// recorded rows, or the first flat FullAttention cache's offset.
+    /// recorded rows.
     fn attention_frontier(&self) -> Option<u64> {
-        match self.owner {
-            Some(owner) => Some(
-                owner
-                    .resolve_ref(&self.inner.paged_adapter, DENSE_PAGED_MTP)
-                    .ok()?
-                    .request_tokens()
-                    .len() as u64,
-            ),
-            None => {
-                let caches = self.inner.caches.as_ref()?;
-                caches
-                    .iter()
-                    .find(|c| matches!(c, Qwen3_5LayerCache::FullAttention(_)))
-                    .map(|c| c.offset().max(0) as u64)
-            }
-        }
+        Some(
+            self.owner
+                .resolve_ref(&self.inner.paged_adapter, DENSE_PAGED_MTP)
+                .ok()?
+                .request_tokens()
+                .len() as u64,
+        )
     }
 
     /// The paged speculative cache the facade (`engine::spec_paged`)
     /// addresses: the model's adapter, borrowed back through the turn's
     /// owner, iff `seq_id` is that owner. Any other id is refused — a facade
-    /// call must never re-activate a different request mid-turn — and a flat
-    /// turn has no paged cache to hand out.
+    /// call must never re-activate a different request mid-turn.
     fn paged_cache_for(
         &mut self,
         seq_id: u32,
     ) -> std::result::Result<&mut PagedKVCacheAdapter, String> {
-        let owner = self.owner.ok_or_else(|| {
-            format!("{DENSE_PAGED_MTP}: a flat turn has no paged speculative cache")
-        })?;
+        let owner = self.owner;
         owner.accepts(seq_id, DENSE_PAGED_MTP)?;
         owner.resolve(&mut self.inner.paged_adapter, DENSE_PAGED_MTP)
     }
@@ -242,9 +218,7 @@ impl DenseMtpStepper<'_> {
                 "MTP verifier token count does not match depth",
             ));
         }
-        let owner = self.owner.ok_or_else(|| {
-            Error::from_reason("paged_verify_step is only reached on a paged turn")
-        })?;
+        let owner = self.owner;
         self.open_verify_cycle(owner, depth + 1);
         let inner = &mut *self.inner;
         let adapter = owner
@@ -303,7 +277,6 @@ impl DenseMtpStepper<'_> {
     #[cfg(test)]
     pub(super) fn owned_adapter(&self) -> &PagedKVCacheAdapter {
         self.owner
-            .expect("the turn must be paged")
             .resolve_ref(&self.inner.paged_adapter, DENSE_PAGED_MTP)
             .expect("the paged adapter must still answer to the turn's owner")
     }
@@ -311,7 +284,6 @@ impl DenseMtpStepper<'_> {
     #[cfg(test)]
     pub(super) fn owned_adapter_mut(&mut self) -> &mut PagedKVCacheAdapter {
         self.owner
-            .expect("the turn must be paged")
             .resolve(&mut self.inner.paged_adapter, DENSE_PAGED_MTP)
             .expect("the paged adapter must still answer to the turn's owner")
     }
@@ -357,56 +329,40 @@ impl MtpStepper for DenseMtpStepper<'_> {
     fn forward_with_hidden(
         &mut self,
         ids: &MxArray,
-        embedding: &Embedding,
+        _embedding: &Embedding,
     ) -> Result<(MxArray, MxArray, bool)> {
-        let output = match self.owner {
-            None => {
-                let inner = &mut *self.inner;
-                let pre =
-                    forward_pre_norm_inner(ids, embedding, &mut inner.layers, &mut inner.caches)?;
-                let h3 = inner.final_norm.forward(&pre)?;
-                let logits = project_logits_from_hidden(&h3, &inner.lm_head, embedding)?;
-                let hidden = h3.squeeze(Some(&[1]))?;
-                Ok((logits, hidden, true))
-            }
-            Some(owner) => {
-                ids.eval();
-                let token_id = ids.item_at_int32(0)? as u32;
-                let inner = &mut *self.inner;
-                let adapter = owner
-                    .resolve(
-                        &mut inner.paged_adapter,
-                        "eager paged MTP forward_with_hidden",
-                    )
-                    .map_err(Error::from_reason)?;
-                // Cross-turn M-RoPE delta carried by a text turn that warm-
-                // continues an image prefill; 0 for pure-text sessions.
-                let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
-                let caches = inner.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason("eager paged MTP forward_with_hidden: caches is None")
-                })?;
-                let (logits, hidden) =
-                    crate::models::qwen3_5::paged_forward::run_paged_step_with_hidden(
-                        token_id,
-                        &inner.embedding,
-                        &mut inner.layers,
-                        caches,
-                        &inner.final_norm,
-                        &inner.lm_head,
-                        &self.layer_kinds,
-                        adapter,
-                        rope_deltas,
-                    )?;
-                Ok((logits, hidden, true))
-            }
-        };
-        if output.is_ok()
-            && let Some(frontier) = self.recurrent_frontier.as_mut()
-        {
+        ids.eval();
+        let token_id = ids.item_at_int32(0)? as u32;
+        let inner = &mut *self.inner;
+        let adapter = self
+            .owner
+            .resolve(
+                &mut inner.paged_adapter,
+                "eager paged MTP forward_with_hidden",
+            )
+            .map_err(Error::from_reason)?;
+        // Cross-turn M-RoPE delta carried by a text turn that warm-
+        // continues an image prefill; 0 for pure-text sessions.
+        let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
+        let caches = inner.caches.as_mut().ok_or_else(|| {
+            Error::from_reason("eager paged MTP forward_with_hidden: caches is None")
+        })?;
+        let (logits, hidden) = crate::models::qwen3_5::paged_forward::run_paged_step_with_hidden(
+            token_id,
+            &inner.embedding,
+            &mut inner.layers,
+            caches,
+            &inner.final_norm,
+            &inner.lm_head,
+            &self.layer_kinds,
+            adapter,
+            rope_deltas,
+        )?;
+        if let Some(frontier) = self.recurrent_frontier.as_mut() {
             // The main forward consumed one token on the GDN side.
             *frontier += 1;
         }
-        output
+        Ok((logits, hidden, true))
     }
 
     // One MTP draft step on the eager drafter. `h_next` is `[1, 1, hidden]`;
@@ -438,7 +394,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
     fn verify_step(
         &mut self,
         ids: &[u32],
-        embedding: &Embedding,
+        _embedding: &Embedding,
         depth: usize,
     ) -> Result<mtp_decode::MtpVerifyOutput> {
         if ids.len() != depth + 1 {
@@ -446,22 +402,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
                 "MTP verifier token count does not match depth",
             ));
         }
-        let output = if self.owner.is_some() {
-            self.paged_verify_step(ids, depth)
-        } else {
-            let ids = MxArray::from_uint32(ids, &[1, ids.len() as i64])?;
-            let inner = &mut *self.inner;
-            let tape = &mut self.tape;
-            eager_verify_step(
-                &mut inner.layers,
-                &mut inner.caches,
-                &inner.final_norm,
-                &inner.lm_head,
-                &ids,
-                embedding,
-                Some(tape),
-            )
-        };
+        let output = self.paged_verify_step(ids, depth);
         if output.is_ok() {
             // The recorded tape step count for this cycle: the anchor plus D
             // drafts. `rollback` overwrites it with the accepted count.
@@ -485,10 +426,9 @@ impl MtpStepper for DenseMtpStepper<'_> {
         // paged-aware so we capture only the GDN (Linear) state and skip the
         // shells — `rollback` rewinds those via the adapter and never reads
         // their snapshot.
-        let paged = self.owner.is_some();
         let inner = &*self.inner;
         let snap = match inner.caches.as_ref() {
-            Some(caches) => crate::models::qwen3_5::layer_cache::snapshot_all_mtp(caches, paged),
+            Some(caches) => crate::models::qwen3_5::layer_cache::snapshot_all_mtp(caches),
             None => Err(Error::from_reason(
                 "eager MTP snapshot_main_linear: inner.caches is None",
             )),
@@ -504,61 +444,58 @@ impl MtpStepper for DenseMtpStepper<'_> {
         if self.replay_err.is_some() {
             return;
         }
-        // Paged path rewinds the full-attention K/V (which lives in the paged
-        // pool, not `inner.caches`) by `rejected` tokens before the shared GDN
-        // tape replay. On full accept `rejected == 0` (no-op). Flat layers keep
-        // their full-attention K/V in `inner.caches` and rewind it via `kv.trim`
-        // inside the replay loop instead.
+        // Rewind the full-attention K/V (which lives in the paged pool, not
+        // `inner.caches`) by `rejected` tokens before the GDN tape replay. On
+        // full accept `rejected == 0` (no-op).
         //
         // The retraction goes through the cycle `verify_step` opened, so the
         // adapter half of this rollback and the facade's conformance surface
         // are the same arithmetic: the commit derives its rollback as
         // `rows - keep` = `(depth + 1) - (accepted_drafts + 1)`, which is the
         // `depth - accepted_drafts` this path always applied.
-        if let Some(owner) = self.owner {
-            match self.open_cycle.take() {
-                Some(ticket) => {
-                    let seq_id = ticket.seq_id();
-                    // `keep` is CLAMPED to the rows the cycle wrote, exactly
-                    // as the `saturating_sub` it replaces clamped the rejected
-                    // count. `accepted_drafts <= depth` is an engine
-                    // invariant; were it ever broken, the clamp keeps this on
-                    // the commit's checked path — retracting zero rows, as the
-                    // `saturating_sub` did — instead of leaving through an Err
-                    // and a log line.
-                    let keep = (accepted_drafts + 1).min(ticket.rows());
-                    if let Err(e) = crate::engine::spec_paged::SpecPagedCache::commit_cycle(
-                        self, seq_id, ticket, keep,
-                    ) {
-                        tracing::warn!(
-                            target: "mlx_core::qwen3_5::paged",
-                            "eager MTP-paged verify commit (keep {keep} of the cycle's \
-                             rows) failed (ignored): {e}",
-                        );
-                    }
+        let owner = self.owner;
+        match self.open_cycle.take() {
+            Some(ticket) => {
+                let seq_id = ticket.seq_id();
+                // `keep` is CLAMPED to the rows the cycle wrote, exactly
+                // as the `saturating_sub` it replaces clamped the rejected
+                // count. `accepted_drafts <= depth` is an engine
+                // invariant; were it ever broken, the clamp keeps this on
+                // the commit's checked path — retracting zero rows, as the
+                // `saturating_sub` did — instead of leaving through an Err
+                // and a log line.
+                let keep = (accepted_drafts + 1).min(ticket.rows());
+                if let Err(e) = crate::engine::spec_paged::SpecPagedCache::commit_cycle(
+                    self, seq_id, ticket, keep,
+                ) {
+                    tracing::warn!(
+                        target: "mlx_core::qwen3_5::paged",
+                        "eager MTP-paged verify commit (keep {keep} of the cycle's \
+                         rows) failed (ignored): {e}",
+                    );
                 }
-                None => {
-                    // No cycle to close: `verify_step` could not open one,
-                    // which also fails the verify itself, so production never
-                    // lands here. Retract directly rather than leave rejected
-                    // rows recorded.
-                    let rejected = depth.saturating_sub(accepted_drafts);
-                    if rejected > 0
-                        && let Err(e) = owner
-                            .resolve(&mut self.inner.paged_adapter, DENSE_PAGED_MTP)
-                            .map_err(Error::from_reason)
-                            .and_then(|adapter| {
-                                adapter.rollback_last_tokens(rejected as u32).map_err(|e| {
-                                    Error::from_reason(format!("adapter rollback: {e}"))
-                                })
-                            })
-                    {
-                        tracing::warn!(
-                            target: "mlx_core::qwen3_5::paged",
-                            "eager MTP-paged rollback_last_tokens({rejected}) outside a \
-                             verify cycle failed (ignored): {e}",
-                        );
-                    }
+            }
+            None => {
+                // No cycle to close: `verify_step` could not open one,
+                // which also fails the verify itself, so production never
+                // lands here. Retract directly rather than leave rejected
+                // rows recorded.
+                let rejected = depth.saturating_sub(accepted_drafts);
+                if rejected > 0
+                    && let Err(e) = owner
+                        .resolve(&mut self.inner.paged_adapter, DENSE_PAGED_MTP)
+                        .map_err(Error::from_reason)
+                        .and_then(|adapter| {
+                            adapter
+                                .rollback_last_tokens(rejected as u32)
+                                .map_err(|e| Error::from_reason(format!("adapter rollback: {e}")))
+                        })
+                {
+                    tracing::warn!(
+                        target: "mlx_core::qwen3_5::paged",
+                        "eager MTP-paged rollback_last_tokens({rejected}) outside a \
+                         verify cycle failed (ignored): {e}",
+                    );
                 }
             }
         }
@@ -691,13 +628,9 @@ impl MtpStepper for DenseMtpStepper<'_> {
     // `reserve_rows` plus the capacity-exhaustion mapping — lives once, in
     // the stepper's `SpecPagedCache::reserve_lookahead`; this hook only
     // names the turn's active sequence for it. Exhaustion reports AR
-    // fallback with untouched adapter state; the flat mode has no
-    // reservation semantics and is always covered.
+    // fallback with untouched adapter state.
     fn reserve_cycle_lookahead(&mut self, rows: usize) -> Result<bool> {
-        let Some(owner) = self.owner else {
-            return Ok(true);
-        };
-        let seq_id = owner.seq_id();
+        let seq_id = self.owner.seq_id();
         crate::engine::spec_paged::SpecPagedCache::reserve_lookahead(self, seq_id, rows).map_err(
             |e| {
                 Error::from_reason(format!(
@@ -726,14 +659,9 @@ impl MtpStepper for DenseMtpStepper<'_> {
     }
 
     fn rollback_unemitted(&mut self, unemitted: usize) {
-        let Some(owner) = self.owner else {
-            if unemitted > 0 {
-                self.mtp_desynced = true;
-            }
-            return;
-        };
+        let owner = self.owner;
         // Truncate the live paged adapter by the accepted-but-unemitted
-        // tokens; the paged path never sets the FLAT desync latch. An adapter
+        // tokens. An adapter
         // truncate failure is not fatal here: the epilogue's frontier check
         // sees the skew and refuses to persist.
         if let Err(e) = owner
@@ -806,15 +734,12 @@ impl MtpStepper for DenseMtpStepper<'_> {
     }
 
     fn into_desynced(self) -> bool {
-        // Paged rewinds BOTH sides of a mid-cycle stop in `rollback_unemitted`
-        // — the adapter cursor by truncation and the GDN recurrent state by
-        // tape replay — so every paged target-state kind already sits at the
-        // drop-last-of-emitted frontier and reporting `false` is honest; it
-        // never touches the FLAT desync latch. A rewind failure routes through
-        // `take_replay_error` → session invalidation instead. (`self` is
-        // consumed by value rather than destructured because the `Drop` impl
-        // forbids moving fields out.)
-        self.owner.is_none() && self.mtp_desynced
+        // `rollback_unemitted` rewinds BOTH sides of a mid-cycle stop — the
+        // adapter cursor by truncation and the GDN recurrent state by tape
+        // replay — so every target-state kind already sits at the
+        // drop-last-of-emitted frontier. A rewind failure routes through
+        // `take_replay_error` → session invalidation instead.
+        false
     }
 }
 
@@ -941,7 +866,7 @@ impl crate::engine::spec_paged::SpecPagedCache for DenseMtpStepper<'_> {
     }
 
     fn frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
-        self.owner
+        Some(self.owner)
             .filter(|owner| owner.seq_id() == seq_id)
             .and_then(|_| MtpStepper::frontier(self))
     }
@@ -974,11 +899,8 @@ impl MtpBackend for Qwen35Inner {
             && setup.prompt_hidden_ids.is_some_and(|ids| !ids.is_empty());
         let use_committed = has_prompt_seed;
 
-        // Auto-select the main-forward routing: the paged cores leave a paged
-        // adapter on `self`, so the turn claims its active sequence as the
-        // owner and borrows the adapter back per touch; the flat cores have
-        // none and run flat. The paged forwards need the per-layer kind
-        // classification (unused flat).
+        // The turn claims the adapter's active sequence as the owner and
+        // borrows the adapter back per touch.
         let (owner, layer_kinds) = match self.paged_adapter.as_mut() {
             Some(adapter) => {
                 let owner = SpecOwner::claim(adapter.active_seq_id(), "eager paged MTP turn entry")
@@ -1002,9 +924,13 @@ impl MtpBackend for Qwen35Inner {
                 }
                 // Cached once at construction (see the field rustdoc); clone is
                 // a copy of the turn-constant classification.
-                (Some(owner), self.layer_kinds.clone())
+                (owner, self.layer_kinds.clone())
             }
-            None => (None, Vec::new()),
+            None => {
+                return Err(Error::from_reason(
+                    "Qwen3.5 MTP verifies on the block-paged pool; this load has none",
+                ));
+            }
         };
 
         let mut stepper = DenseMtpStepper {
@@ -1020,7 +946,6 @@ impl MtpBackend for Qwen35Inner {
             recurrent_frontier: None,
             recurrent_snapshot_base: None,
             replay_err: None,
-            mtp_desynced: false,
             embedding,
             config,
             owner,

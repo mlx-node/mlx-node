@@ -68,14 +68,15 @@ export interface LoadModelOptions {
    */
   draftModelPath?: string;
   /**
-   * Full-attention K/V format for `qwen3_5`, `qwen3_5_moe` and `qwen4_exp`
-   * targets, in the block-paged pool and (qwen3_5 / MoE) the flat cache:
-   * `'int8'` — per-token symmetric int8 rows with one fp32 scale each,
-   * halving K/V memory and read bandwidth at a small, measured quality
-   * cost — or `'bf16'`. Unset: int8 where the int8 kernels serve the model
-   * (qwen3_5 / MoE: Metal, 256-wide heads, BF16 compute; qwen4_exp: head
-   * 128 or 256), bf16 elsewhere. An explicit `'int8'` the
-   * kernels cannot serve fails the load; other model families reject it.
+   * Full-attention K/V format of the block-paged pool for `qwen3_5`,
+   * `qwen3_5_moe` and `qwen4_exp` targets: `'int8'` — per-token symmetric
+   * int8 rows with one fp32 scale each, halving K/V memory and read
+   * bandwidth at a small, measured quality cost — or `'bf16'`. Unset: int8
+   * where the int8 kernels serve the model (qwen3_5 / MoE: Metal, 256-wide
+   * heads, BF16 compute; qwen4_exp: head 128 or 256), bf16 elsewhere. An
+   * explicit `'int8'` the kernels cannot serve, or on a load with no pool
+   * (qwen3_5 / MoE off Metal), fails the load; other model families reject
+   * it.
    */
   kvFormat?: 'int8' | 'bf16';
   /**

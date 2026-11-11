@@ -68,7 +68,7 @@ fn qwen38_plan(
         state: &|_| 0,
         state_in_pool: false,
     };
-    MemoryPlan::evaluate(footprint, Some(pool), None)
+    MemoryPlan::evaluate(footprint, Some(pool))
 }
 
 fn m3_pro_plan() -> MemoryPlan {
@@ -146,23 +146,20 @@ fn splash_extent_pages_on_qwen38_27b() {
 fn lane_math_reproduces_the_splash_golden_plan() {
     let arenas = 734_396_416 + 160_669_696;
     let transient = |_| arenas;
-    let lane = FlatInput {
-        shape: LaneShape {
-            trained: 262_144,
-            lane_bytes: 350_224_384,
-            layout: int8_layout(),
-            scratch_rows: SPECULATIVE_SCRATCH_TOKENS,
-            transient: &transient,
-        },
-        copy_layers: None,
+    let shape = LaneShape {
+        trained: 262_144,
+        lane_bytes: 350_224_384,
+        layout: int8_layout(),
+        scratch_rows: SPECULATIVE_SCRATCH_TOKENS,
+        transient: &transient,
     };
     let splash_hard = 24_696_061_952;
     let mut golden = footprint(32 * GIB, 4 * GIB, Some(splash_hard));
     golden.staging_bytes = 0;
-    let plan = MemoryPlan::evaluate(golden, None, Some(lane)).expect("plan");
+    let plan = MemoryPlan::evaluate(golden, None).expect("plan");
     assert_eq!(plan.hard_budget_bytes, splash_hard);
     assert_eq!(plan.bound, MemoryBound::MaxMemory);
-    let lane = plan.flat.expect("lane");
+    let (lane, _) = plan_lane(plan.dynamic_budget_bytes, &shape, LaneKv::Extents);
     assert_eq!(plan.fixed_bytes + lane.transient_bytes, 5_995_339_776);
     assert_eq!(
         plan.dynamic_budget_bytes - lane.transient_bytes,
@@ -212,7 +209,6 @@ fn m3_pro_plan_prices_every_term() {
     assert_eq!(pool.lane.transient_bytes, 386_269_184);
     assert_eq!(pool.lane.window.maximum(), 54_425);
     assert_eq!(pool.lane.window.bound(), "memory");
-    assert!(plan.flat.is_none());
 }
 
 /// One request at the pool window fits the dynamic budget with the lane's
@@ -646,7 +642,7 @@ fn flash_next_load(
             draft_weights_bytes: 0,
             held_back_bytes: store.expert_cap_bytes + store.row_cache_bytes,
         };
-        MemoryPlan::evaluate(footprint, Some(pool), None).ok()
+        MemoryPlan::evaluate(footprint, Some(pool)).ok()
     });
     let ar_window = plan
         .as_ref()
@@ -804,7 +800,7 @@ fn off_pool_lane_is_not_inside_the_pool() {
     let c = flash_next_config();
     let transient = |window: u32| prefill_scratch(&c, 1024, window as usize);
     let inside = flash_next_pool(&transient, row_state_bytes(&c), true, &|_| 0);
-    let plan = MemoryPlan::evaluate(footprint, Some(inside), None).expect("plan");
+    let plan = MemoryPlan::evaluate(footprint, Some(inside)).expect("plan");
     assert_eq!(
         footprint.held_back_bytes,
         store.expert_cap_bytes + store.row_cache_bytes
@@ -927,7 +923,7 @@ fn held_back_counts_the_store_at_its_cap() {
     let c = flash_next_config();
     let transient = |window: u32| prefill_scratch(&c, 1024, window as usize);
     let pool = flash_next_pool(&transient, row_state_bytes(&c), false, &|_| 0);
-    let plan = MemoryPlan::evaluate(footprint, Some(pool), None).expect("plan");
+    let plan = MemoryPlan::evaluate(footprint, Some(pool)).expect("plan");
     assert_eq!(plan.dynamic_budget_bytes, 4_468_093_952);
     assert_eq!(plan.pool.expect("pool").lane.window.maximum(), 65_536);
     let text = plan.describe();

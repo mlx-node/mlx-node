@@ -171,11 +171,12 @@ yarn install --immutable
 yarn build:native
 ```
 
-Paged attention is Metal-only, so CUDA inference must use the eager path:
+Paged attention is Metal-only, so off Metal a Qwen3.5 load has no pool and
+serves autoregressive turns on a bf16 flat cache by itself (MTP and DFlash2
+need the pool):
 
 ```bash
-MLX_QWEN35_FORCE_EAGER=1 MLX_QWEN35_PAGED_OVERRIDE=0 \
-  oxnode examples/lm.ts Qwen3.6-27B-UD-Q4_K_XL-mlx
+oxnode examples/lm.ts Qwen3.6-27B-UD-Q4_K_XL-mlx
 ```
 
 Measured results and the test setup are in [docs/cuda-poc-benchmark.md](docs/cuda-poc-benchmark.md).

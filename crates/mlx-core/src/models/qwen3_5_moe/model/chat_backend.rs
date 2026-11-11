@@ -53,8 +53,8 @@ impl ChatBackend for Qwen35MoeInner {
         self.gen_defaults.eos_token_ids.clone()
     }
 
-    /// The flat lane has no executor that bounds it; the paged lane keeps
-    /// `preflight_paged_context`, DFlash2 included.
+    /// The flat lane of a load off Metal has no executor that bounds it;
+    /// the paged lane keeps `preflight_paged_context`, DFlash2 included.
     fn context_window(&self) -> Option<u32> {
         self.paged_adapter
             .is_none()
@@ -131,14 +131,6 @@ impl ChatBackend for Qwen35MoeInner {
         )
     }
 
-    fn flat_caches_desynced(&self) -> bool {
-        self.flat_mtp_caches_desynced
-    }
-
-    fn clear_flat_caches_desynced(&mut self) {
-        self.flat_mtp_caches_desynced = false;
-    }
-
     fn save_cache_state(&mut self, args: SaveStateArgs<'_>) {
         // Delta continuations preserve `cached_image_key` — the KV cache
         // still holds the prior prefill's image attention state even
@@ -190,6 +182,7 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray> {
+        crate::models::qwen3_5::load_plan::qwen35_flat_lane_check("Qwen3.5 MoE")?;
         self.invalidate_dflash2_context("prefill");
         // Text-only prefill block (the engine's reset-or-delta split already
         // ran; `self.caches` holds either fresh caches or the live session
@@ -222,6 +215,7 @@ impl ChatBackend for Qwen35MoeInner {
         Self: 'a;
 
     fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
+        crate::models::qwen3_5::load_plan::qwen35_flat_lane_check("Qwen3.5 MoE")?;
         self.invalidate_dflash2_context("begin_decode");
         let is_streaming = self.turn_is_streaming.get();
 
@@ -251,7 +245,11 @@ impl ChatBackend for Qwen35MoeInner {
             paged_attention: self.paged_adapter.as_ref().map(|_| PagedAttentionPlan {
                 supports_delta: true,
             }),
-            speculative: if self.dflash2.is_some() {
+            // Speculative turns verify on the pool; a load without one
+            // serves autoregressive turns only.
+            speculative: if self.paged_adapter.is_none() {
+                None
+            } else if self.dflash2.is_some() {
                 Some(qwen35_moe_dflash2_plan())
             } else {
                 self.has_mtp_weights().then(qwen35_moe_speculative_plan)
@@ -334,22 +332,43 @@ impl ChatBackend for Qwen35MoeInner {
         crate::engine::paged_turn::run_paged_turn(self, &mut constrained_args)
     }
 
-    fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        debug_assert!(args.media.is_empty());
-        match args.plan.decoder {
-            DecoderPlan::Speculative(SpeculativeKind::NativeMtp) => {
-                self.invalidate_dflash2_context("native_mtp_turn");
-                self.moe_whole_turn(args)
-            }
-            _ => Err(Error::from_reason(
-                "Qwen3.5 MoE received a non-speculative decoder plan",
-            )),
-        }
-    }
-
+    /// An image turn prefills its merged vision embeddings on the pool and
+    /// decodes autoregressively (Splash serves images from the same pages).
+    /// The media plan admits images only on a pool load with an encoder and
+    /// a processor.
     fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         self.invalidate_dflash2_context("run_multimodal_turn");
-        self.moe_whole_turn(args)
+        let (tokenizer, p, report_perf) = self.vision_turn_params(args)?;
+        let tokens = args.tokens.to_vec();
+        match (args.sink, args.cancelled) {
+            (Some(sink), Some(cancelled)) => {
+                let cb = StreamSender(sink);
+                self.vision_paged_turn_stream_core(
+                    tokens,
+                    args.media.images,
+                    tokenizer,
+                    args.eos_id,
+                    p,
+                    report_perf,
+                    &cb,
+                    cancelled,
+                    args.thinking,
+                )?;
+                Ok(TurnOutput::Streamed)
+            }
+            _ => {
+                let result = self.vision_paged_turn_sync_core(
+                    tokens,
+                    args.media.images,
+                    tokenizer,
+                    args.eos_id,
+                    p,
+                    report_perf,
+                    args.thinking,
+                )?;
+                Ok(TurnOutput::Complete(Box::new(result)))
+            }
+        }
     }
 }
 
@@ -359,11 +378,10 @@ impl ChatBackend for Qwen35MoeInner {
 /// routing gate can compose the REAL published plan without standing up a 35B
 /// model.
 ///
-/// Native MTP runs on BOTH lanes: the paged lane through the generic driver's
-/// speculative branch (`PagedBackend::admit_paged_speculative_decode` +
-/// `run_paged_speculative_decode`), the flat lane through
-/// `ChatBackend::run_speculative_turn`. Media stays out of both — an
-/// image-bearing turn has no MoE hidden-emitting prefill to seed a drafter.
+/// Native MTP runs on the pool through the generic driver's speculative
+/// branch (`PagedBackend::admit_paged_speculative_decode` +
+/// `run_paged_speculative_decode`). Media stays out: an image-bearing turn
+/// has no MoE hidden-emitting prefill to seed a drafter.
 pub(super) fn qwen35_moe_speculative_plan() -> SpeculativePlan {
     SpeculativePlan {
         kind: SpeculativeKind::NativeMtp,

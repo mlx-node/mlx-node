@@ -51,7 +51,6 @@ import {
 import {
   loadModel as loadModelNative,
   PagedConfigOverrideManager,
-  QWEN35_PAGED_MODEL_TYPES,
   type LoadableModel,
   type LoadModelOptions,
 } from '@mlx-node/lm';
@@ -77,9 +76,6 @@ import { resolveModelsDir } from './paths.js';
 import { loadRerankModel, rerankCapability } from './rerank-models.js';
 import { makeSwapController } from './swap.js';
 import { hostTempDirPrefix, sweepOrphanHostTempRoots } from './temp-root.js';
-
-/** Families `mlx launch claude` has historically forced onto the paged path. */
-export const DEFAULT_PAGED_MODEL_TYPES = QWEN35_PAGED_MODEL_TYPES;
 
 /** Thrown when `modelsDir` holds nothing servable. Carries the dir for the caller's message. */
 export class NoModelsDiscoveredError extends Error {
@@ -203,7 +199,11 @@ export interface InferenceHostOptions {
    * keeps both, though `POST /v1/memory/release` still frees the weights.
    */
   idleReleaseSeconds?: number;
-  /** Model types forced onto the block-paged KV cache. Default {@link DEFAULT_PAGED_MODEL_TYPES}. */
+  /**
+   * Model types whose loads read a config clone with `use_block_paged_cache:
+   * true`. Default none: Qwen3.5 dense/MoE ignore the key (on Metal they
+   * always serve from the pool).
+   */
   pagedModelTypes?: readonly string[];
   /** Path to the SQLite response store. See `ServerConfig.storePath`. */
   storePath?: string;
@@ -404,12 +404,12 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   };
   const server = await createServer(serverConfig);
 
-  // Wrap the loader so managed families get `use_block_paged_cache: true`
-  // injected via a temp-dir clone with a patched config.json. The temp root is
-  // named after our pid so a SIGKILLed host's root can be reclaimed by the
-  // next host's startup sweep — see `temp-root.ts`.
+  // Wrap the loader so `pagedModelTypes` families get `use_block_paged_cache:
+  // true` injected via a temp-dir clone with a patched config.json. The temp
+  // root is named after our pid so a SIGKILLed host's root can be reclaimed by
+  // the next host's startup sweep — see `temp-root.ts`.
   const pagedConfigOverrides = new PagedConfigOverrideManager({
-    modelTypes: opts.pagedModelTypes ?? DEFAULT_PAGED_MODEL_TYPES,
+    modelTypes: opts.pagedModelTypes ?? [],
     tempDirPrefix: hostTempDirPrefix(),
   });
   const loadModelFn = opts.loadModel ?? loadModelNative;
@@ -691,7 +691,7 @@ function startContextEstimates(
       if (familyDataFor(entry.modelType)?.acceptsMaxMemory !== true) continue;
       const draftModelPath = findDFlash2Draft(entry.path, entry.modelType, modelsDir);
       try {
-        // Price the config the load reads: the paged overlay can flip use_block_paged_cache.
+        // Price the directory the load reads (the paged overlay's clone).
         const path = await resolvePath(entry);
         const result = await estimate(path, entry.modelType, {
           ...options,

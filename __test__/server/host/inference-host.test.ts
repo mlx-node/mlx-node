@@ -640,7 +640,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
   it.each([
     ['qwen3_5', 'qwen3.8-27b-mxfp4-mlx', 'qwen3.8-27b-dflash2'],
     ['qwen3_5_moe', 'qwen3.6-35b-a3b-q4-k-mlx', 'qwen3.6-35b-a3b-dflash2'],
-  ])('finds a new %s draft before applying the target config overlay', async (family, name, draftName) => {
+  ])('finds a new %s draft and loads the source directory', async (family, name, draftName) => {
     const modelsDir = await makeModelsDir([name]);
     await writeFile(join(modelsDir, name, 'config.json'), JSON.stringify({ model_type: family }));
     const calls: Array<{ path: string; options?: LoadModelOptions }> = [];
@@ -658,17 +658,14 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     await host.loadModel(name);
     expect(calls).toHaveLength(1);
     expect(calls[0].options).toEqual({ draftModelPath: draft });
-    expect(calls[0].path).not.toBe(join(modelsDir, name));
-    const overlay = JSON.parse(await readFile(join(calls[0].path, 'config.json'), 'utf-8')) as Record<string, unknown>;
-    expect(overlay.paged_cache_initial_memory_mb).toBeUndefined();
-    expect(overlay.paged_cache_memory_mb).toBeUndefined();
+    expect(calls[0].path).toBe(join(modelsDir, name));
     expect(host.health().models.resident).toEqual([name]);
   });
 
   it.each([
     ['qwen3_5', 'qwen3.8-27b-mxfp4-mlx'],
     ['qwen3_5_moe', 'qwen3.6-35b-a3b-q4-k-mlx'],
-  ])('writes no pool size for a %s directory load without a draft', async (family, name) => {
+  ])('loads a %s directory without a draft from the source, with no overlay', async (family, name) => {
     const modelsDir = await makeModelsDir([name]);
     await writeFile(join(modelsDir, name, 'config.json'), JSON.stringify({ model_type: family }));
     const calls: Array<{ path: string; options?: LoadModelOptions }> = [];
@@ -682,10 +679,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     await host.loadModel(name);
     expect(calls).toHaveLength(1);
     expect(calls[0].options).toBeUndefined();
-    const overlay = JSON.parse(await readFile(join(calls[0].path, 'config.json'), 'utf-8')) as Record<string, unknown>;
-    expect(overlay.use_block_paged_cache).toBe(true);
-    expect(overlay.paged_cache_memory_mb).toBeUndefined();
-    expect(overlay.paged_cache_initial_memory_mb).toBeUndefined();
+    expect(calls[0].path).toBe(join(modelsDir, name));
   });
 
   // Mutation: drop the `kvFormat` pass-through → red (qwen3_5 load gets no kvFormat).
@@ -915,6 +909,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     const estimated = deferred();
     const host = await start({
       modelsDir,
+      pagedModelTypes: ['qwen3_5'],
       estimateContextWindow: async (path) => {
         asked.push(path);
         estimatedConfigs.push(
@@ -1032,6 +1027,8 @@ describe('createInferenceHost — engine policy', () => {
 });
 
 describe('createInferenceHost — paged-override temp roots', () => {
+  // The host overlays only the families it is told to.
+  const pagedModelTypes = ['qwen3_5'];
   it('waits for an active host load before reclaiming its paged config', async () => {
     const modelsDir = await makeModelsDir(['alpha']);
     const before = await ownTempRoots();
@@ -1041,6 +1038,7 @@ describe('createInferenceHost — paged-override temp roots', () => {
 
     const host = await start({
       modelsDir,
+      pagedModelTypes,
       loadModel: async (path) => {
         resolvedPath = path;
         entered.resolve();
@@ -1087,6 +1085,7 @@ describe('createInferenceHost — paged-override temp roots', () => {
 
     const host = await start({
       modelsDir,
+      pagedModelTypes,
       loadModel: async (path) => {
         resolvedPath = path;
         entered.resolve();
@@ -1142,6 +1141,7 @@ describe('createInferenceHost — paged-override temp roots', () => {
 
     const host = await start({
       modelsDir,
+      pagedModelTypes,
       loadModel: async () => {
         const call = loadCount++;
         if (call === 0) {
@@ -1188,7 +1188,7 @@ describe('createInferenceHost — paged-override temp roots', () => {
   it('names its temp root after this pid and removes it on close()', async () => {
     const modelsDir = await makeModelsDir(['alpha']);
     const before = await ownTempRoots();
-    const host = await start({ modelsDir });
+    const host = await start({ modelsDir, pagedModelTypes });
 
     await host.loadModel('alpha');
 
@@ -1206,6 +1206,7 @@ describe('createInferenceHost — paged-override temp roots', () => {
     const before = await ownTempRoots();
     const host = await start({
       modelsDir,
+      pagedModelTypes,
       loadModel: async () => {
         throw new Error('boom');
       },
@@ -1229,6 +1230,7 @@ describe('createInferenceHost — paged-override temp roots', () => {
 
     const host = await start({
       modelsDir,
+      pagedModelTypes,
       logDir,
       attachLogger: () => ({
         logDir,
@@ -1266,6 +1268,7 @@ describe('createInferenceHost — paged-override temp roots', () => {
     let listeningWhenLoggerClosed: boolean | null = null;
     const host = await start({
       modelsDir,
+      pagedModelTypes,
       logDir,
       attachLogger: (srv) => ({
         logDir,
@@ -1282,7 +1285,7 @@ describe('createInferenceHost — paged-override temp roots', () => {
 
   it('is idempotent — a second close() neither throws nor re-runs disposal', async () => {
     const modelsDir = await makeModelsDir(['alpha']);
-    const host = await start({ modelsDir });
+    const host = await start({ modelsDir, pagedModelTypes });
     await host.loadModel('alpha');
     await host.close({ timeoutMs: 0 });
     await expect(host.close({ timeoutMs: 0 })).resolves.toBeUndefined();

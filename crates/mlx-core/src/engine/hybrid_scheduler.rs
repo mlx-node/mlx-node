@@ -4446,7 +4446,6 @@ pub(crate) mod tests {
             rope_theta: 100_000.0,
             paged_cache_memory_mb: Some(64),
             paged_block_size: Some(16),
-            use_block_paged_cache: None,
             persist_paged_cache: None,
             n_mtp_layers: 0,
         }
@@ -4486,7 +4485,6 @@ pub(crate) mod tests {
             mlp_only_layers: None,
             paged_cache_memory_mb: Some(64),
             paged_block_size: Some(16),
-            use_block_paged_cache: None,
             persist_paged_cache: None,
             n_mtp_layers: 0,
             qwen35_gguf_gdn_layout: None,
@@ -4589,7 +4587,8 @@ pub(crate) mod tests {
     fn shared_command_dispatch_orders_family_operations_stats_and_reset() {
         use crate::models::qwen3_5::model::Qwen35FamilyCommand;
 
-        let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let mut inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        inner.cached_token_history = vec![1, 2, 3];
         let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
         state.owner_sequences.insert("owner".into(), 9);
         state.owner_states.insert("owner".into(), vec![7, 8]);
@@ -4600,14 +4599,14 @@ pub(crate) mod tests {
         let (reset_reply, mut reset_result) = tokio::sync::oneshot::channel();
         let (after_reply, mut after_result) = tokio::sync::oneshot::channel();
         for command in [
-            Qwen35FamilyCommand::ForceFlatMtpDesyncForTest { reply: force_reply }.into(),
+            Qwen35FamilyCommand::ForcePagedGdnMismatchForTest { reply: force_reply }.into(),
             Qwen35Cmd::scheduler_stats(stats_reply),
-            Qwen35FamilyCommand::MtpFlatStateForTest {
+            Qwen35FamilyCommand::MtpPagedGdnStateForTest {
                 reply: before_reply,
             }
             .into(),
             Qwen35Cmd::from_chat(ChatCmd::ResetCaches { reply: reset_reply }),
-            Qwen35FamilyCommand::MtpFlatStateForTest { reply: after_reply }.into(),
+            Qwen35FamilyCommand::MtpPagedGdnStateForTest { reply: after_reply }.into(),
         ] {
             assert!(sender.send(command).is_ok());
         }
@@ -4625,7 +4624,7 @@ pub(crate) mod tests {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
         assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
-        assert!(before_result.try_recv().unwrap().unwrap().1);
+        assert!(before_result.try_recv().unwrap().unwrap().history_len > 0);
         assert!(state.owner_states.contains_key("owner"));
         assert!(matches!(
             reset_result.try_recv(),
@@ -4640,7 +4639,7 @@ pub(crate) mod tests {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
         assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
-        assert!(!after_result.try_recv().unwrap().unwrap().1);
+        assert_eq!(after_result.try_recv().unwrap().unwrap().history_len, 0);
     }
 
     /// A drive iteration that runs GPU work stamps the model's residency
@@ -4666,7 +4665,9 @@ pub(crate) mod tests {
         let (force_reply, mut force_result) = tokio::sync::oneshot::channel();
         assert!(
             sender
-                .send(Qwen35FamilyCommand::ForceFlatMtpDesyncForTest { reply: force_reply }.into())
+                .send(
+                    Qwen35FamilyCommand::ForcePagedGdnMismatchForTest { reply: force_reply }.into()
+                )
                 .is_ok()
         );
         assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
@@ -4851,7 +4852,13 @@ pub(crate) mod tests {
     /// fails, since this dense fixture carries no MTP head.
     #[test]
     fn moe_dflash_uses_exclusive_lane_while_disabled_draft_keeps_paged_ar() {
-        let mut inner = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE");
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        let mut inner = crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner_with_config(
+            0xDFA5_3504,
+            |config| config.n_mtp_layers = 0,
+        );
         inner.dflash2 = Some(
             crate::models::qwen3_5::dflash2::tiny_dflash2_model_for_stepper_test(
                 &inner.config.to_dense_config(),
@@ -4886,7 +4893,7 @@ pub(crate) mod tests {
                 plan.decoder,
                 DecoderPlan::Speculative(engine::plan::SpeculativeKind::DraftModel)
             );
-            assert!(!plan.use_paged_attention);
+            assert!(plan.use_paged_attention);
         }
         let (command, _rx) = sync_start(ChatConfig {
             enable_mtp: Some(false),

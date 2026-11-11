@@ -3,114 +3,6 @@
 use super::*;
 
 impl Qwen35Inner {
-    /// Generate text from prompt tokens (synchronous, runs on model thread).
-    pub(crate) fn generate_sync(
-        &mut self,
-        prompt_tokens: MxArray,
-        config: Qwen3_5GenerationConfig,
-    ) -> Result<Qwen3_5GenerationResult> {
-        let tokenizer = self.tokenizer.clone();
-
-        // Init caches
-        self.init_caches_sync()?;
-
-        let embedding = self.embedding.clone();
-        let generation_stream = Stream::generation();
-
-        // Prefill
-        let prompt = prompt_tokens.reshape(&[1, -1])?;
-        let logits = {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            forward_inner(
-                &prompt,
-                &embedding,
-                &mut self.layers,
-                &mut self.caches,
-                &self.final_norm,
-                &self.lm_head,
-            )?
-        };
-
-        let seq_len = logits.shape_at(1)?;
-        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-        let last_logits = last_logits.squeeze(Some(&[1]))?;
-
-        // Request value wins; otherwise fall back to the checkpoint's
-        // generation_config.json default; otherwise the sampler's builtin.
-        // When the request omits temperature, a `do_sample:false` in
-        // generation_config.json forces greedy decoding (temperature 0),
-        // overriding any gen-config temperature (HuggingFace transformers
-        // semantics) — `effective_temperature()` folds that rule in.
-        // This raw `generate` surface exposes only the four SamplingConfig
-        // fields (no repetition/presence/frequency penalty), so a
-        // generation_config repetition_penalty is honored on the ChatSession
-        // path but intentionally not here. ChatSession is the full-parity surface.
-        let sampling_config = Some(SamplingConfig {
-            temperature: config
-                .temperature
-                .or(self.gen_defaults.effective_temperature()),
-            top_k: config.top_k.or(self.gen_defaults.top_k),
-            top_p: config.top_p.or(self.gen_defaults.top_p),
-            min_p: config.min_p.or(self.gen_defaults.min_p),
-        });
-
-        let eos_id = self.config.eos_token_id as u32;
-        // Extra stop ids from generation_config.json (e.g. a second EOS).
-        let extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
-        let is_eos = |t: u32| t == eos_id || extra_eos_ids.contains(&t);
-        let mut generated_tokens: Vec<u32> = Vec::new();
-        let mut y = sample(&last_logits, sampling_config)?;
-
-        for _step in 0..config.max_new_tokens {
-            y.eval();
-            let token_id = y.item_at_int32(0)? as u32;
-            generated_tokens.push(token_id);
-
-            if is_eos(token_id) {
-                break;
-            }
-
-            let next_ids = y.reshape(&[1, 1])?;
-            let logits = {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                forward_inner(
-                    &next_ids,
-                    &embedding,
-                    &mut self.layers,
-                    &mut self.caches,
-                    &self.final_norm,
-                    &self.lm_head,
-                )?
-            };
-
-            let logits = logits.squeeze(Some(&[1]))?;
-            y = sample(&logits, sampling_config)?;
-            MxArray::async_eval_arrays(&[&y]);
-
-            if (_step + 1) % 256 == 0 {
-                crate::array::synchronize_and_clear_cache();
-            }
-        }
-
-        let stopped_on_eos = generated_tokens.last().is_some_and(|&t| is_eos(t));
-        self.reset_caches_sync()?;
-
-        let finish_reason = if stopped_on_eos { "stop" } else { "length" };
-
-        let text = if let Some(ref tok) = tokenizer {
-            tok.decode_sync(&generated_tokens, true).unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        Ok(Qwen3_5GenerationResult {
-            tokens: generated_tokens.clone(),
-            text,
-            num_tokens: generated_tokens.len() as u32,
-            finish_reason: finish_reason.to_string(),
-        })
-    }
-
     /// Static FP8 activation-amax calibration prefill (runs on the model
     /// thread). Inherent body of [`Qwen35FamilyCommand::CalibratePrefillRaw`].
     ///
@@ -120,8 +12,8 @@ impl Qwen35Inner {
     /// (no generation) so every mxfp8 attention/GDN projection's activation tap
     /// fires exactly once over realistic raw-text activations — the NVIDIA
     /// modelopt `MaxCalibrator` is defined over raw-text prefill, NOT
-    /// chat-templated prompts plus a decode step. Caches are re-initialized per
-    /// row so each is an independent turn-0 position-0 prefill.
+    /// chat-templated prompts plus a decode step. Each row is an independent
+    /// position-0 prefill ([`Self::prefill_hidden_once`]).
     ///
     /// This method SELF-ARMS the model thread's thread-local
     /// [`ActivationAmaxCollector`] flag for the prefill's duration (RAII
@@ -160,19 +52,12 @@ impl Qwen35Inner {
                 continue;
             }
 
-            // Fresh turn-0 caches per row (prefill asserts `self.caches` is set,
-            // and a stale cache would append rows into one growing context).
-            self.init_caches_sync()?;
-            let generation_stream = Stream::generation();
-            // PREFILL ONLY — trips every mxfp8 attn/GDN tap once. No generated
-            // token: a decode step would fold a synthetic argmax token's
-            // activations into the amax.
-            let logits = self.prefill(&tokens, generation_stream)?;
-            // Force the row's forward to complete (the taps already `.item()`
-            // each projection input, but eval bounds the lazy graph and makes
-            // per-row memory reclamation deterministic).
-            logits.eval();
-            self.reset_caches_sync()?;
+            // PREFILL ONLY, one fresh sequence per row — trips every mxfp8
+            // attn/GDN tap once. No generated token: a decode step would fold
+            // a synthetic argmax token's activations into the amax. The eval
+            // bounds the lazy graph and makes per-row memory reclamation
+            // deterministic.
+            self.prefill_hidden_once(&tokens)?.eval();
             rows_prefilled += 1;
 
             // Bound resident scratch across many rows (large models × 1024 rows).
@@ -1535,6 +1420,34 @@ impl Qwen35Inner {
 }
 
 impl Qwen35Inner {
+    /// The post-norm hidden of every row of `ids` from one fresh prefill,
+    /// for `mlx eval` and `mlx calibrate`: on the pool where the load has
+    /// one, else (off Metal) over the model's own caches,
+    /// reset afterwards.
+    pub(crate) fn prefill_hidden_once(&mut self, ids: &[u32]) -> Result<MxArray> {
+        if self.paged_adapter.is_some() {
+            return self.paged_teacher_forced_hidden(ids);
+        }
+        self.init_caches_sync()?;
+        let generation_stream = Stream::generation();
+        let hidden = crate::quality::runner::chunked_hidden(ids, PREFILL_STEP_SIZE, |ids| {
+            let hidden = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                let pre = forward_pre_norm_inner(
+                    ids,
+                    &self.embedding,
+                    &mut self.layers,
+                    &mut self.caches,
+                )?;
+                self.final_norm.forward(&pre)?
+            };
+            eval_layer_caches(&self.caches)?;
+            Ok(hidden)
+        });
+        self.reset_caches_sync()?;
+        hidden
+    }
+
     /// `mlx eval`'s teacher-forced prefill on the paged pool, the route a
     /// served turn reads (Splash has no flat path): one fresh sequence, no
     /// prefix lookup or publish, its blocks freed at the end. Returns the
@@ -1638,31 +1551,7 @@ impl crate::quality::runner::EvalBackend for Qwen35Inner {
     }
 
     fn teacher_forced_hidden(&mut self, tokens: &[u32]) -> Result<MxArray> {
-        if self.paged_adapter.is_some() {
-            return self.paged_teacher_forced_hidden(&tokens[..tokens.len() - 1]);
-        }
-        self.init_caches_sync()?;
-        let generation_stream = Stream::generation();
-        let hidden = crate::quality::runner::chunked_hidden(
-            &tokens[..tokens.len() - 1],
-            PREFILL_STEP_SIZE,
-            |ids| {
-                let hidden = {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    let pre = forward_pre_norm_inner(
-                        ids,
-                        &self.embedding,
-                        &mut self.layers,
-                        &mut self.caches,
-                    )?;
-                    self.final_norm.forward(&pre)?
-                };
-                eval_layer_caches(&self.caches)?;
-                Ok(hidden)
-            },
-        );
-        self.reset_caches_sync()?;
-        hidden
+        self.prefill_hidden_once(&tokens[..tokens.len() - 1])
     }
 
     fn project_head(&self, hidden: &MxArray) -> Result<MxArray> {

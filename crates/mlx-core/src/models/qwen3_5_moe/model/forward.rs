@@ -34,48 +34,6 @@ pub(super) fn forward_pre_norm_inner(
     )
 }
 
-/// Like [`forward_pre_norm_inner`], but records a per-layer GDN tape for the
-/// eager-MTP rollback replay. `tape` must be pre-sized to `layers.len()`;
-/// each GDN (`Linear`) layer writes `Some(GdnLayerTape)` into its slot and
-/// full-attention layers leave it `None` — the exact indexing the rollback
-/// replay relies on. The forward output is byte-identical to the non-tape
-/// variant (the tape is a side-channel clone of the kernel inputs). No
-/// explicit mask is built here either — see `forward_pre_norm_inner`.
-fn forward_pre_norm_inner_with_tape(
-    input_ids: &MxArray,
-    embedding: &Embedding,
-    layers: &mut [DecoderLayer],
-    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
-    _fa_idx: usize,
-    tape: &mut [Option<crate::models::qwen3_5_moe::gated_delta_net::GdnLayerTape>],
-) -> Result<MxArray> {
-    debug_assert_eq!(
-        tape.len(),
-        layers.len(),
-        "forward_pre_norm_inner_with_tape: tape length must equal layer count"
-    );
-    fwd::forward_pre_norm_with(
-        input_ids,
-        |ids| embedding.forward(ids),
-        layers,
-        caches,
-        |layer, h, caches, i| {
-            let mut slot = None;
-            let out = layer.forward_with_tape(
-                h,
-                None,
-                caches.as_mut().map(|c| &mut c[i]),
-                None,
-                true,
-                Some(&mut slot),
-            )?;
-            tape[i] = slot;
-            Ok(out)
-        },
-        None,
-    )
-}
-
 /// Project a pre-/post-final-norm hidden to logits, preserving the leading
 /// dims (`[*, hidden] -> [*, vocab]`). Uses the explicit `lm_head` when
 /// present, else the tied embedding's linear projection. Mirrors the dense
@@ -89,35 +47,6 @@ pub(super) fn project_logits_from_hidden(
         Some(head) => head.forward_logits(hidden),
         None => embedding.as_linear(hidden),
     }
-}
-
-/// Batched eager verify: run the `[1, K+1]` verify ids through the MoE main
-/// stack (recording the GDN tape when `tape` is `Some`), apply the final norm,
-/// and project logits. Advances `caches` by `K+1`. Returns the dense logits
-/// `[1, K+1, vocab]` plus the post-final-norm hiddens `[1, K+1, hidden]`
-/// (`MtpVerifyOutput::logits_only`). Mirrors the dense `eager_verify_step`.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn eager_verify_step(
-    layers: &mut [DecoderLayer],
-    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
-    final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
-    fa_idx: usize,
-    verify_ids: &MxArray,
-    embedding: &Embedding,
-    tape: Option<&mut Vec<Option<crate::models::qwen3_5_moe::gated_delta_net::GdnLayerTape>>>,
-) -> Result<mtp_decode::MtpVerifyOutput> {
-    let pre = match tape {
-        Some(tape) => {
-            tape.clear();
-            tape.resize(layers.len(), None);
-            forward_pre_norm_inner_with_tape(verify_ids, embedding, layers, caches, fa_idx, tape)?
-        }
-        None => forward_pre_norm_inner(verify_ids, embedding, layers, caches, fa_idx)?,
-    };
-    let hiddens = final_norm.forward(&pre)?;
-    let logits = project_logits_from_hidden(&hiddens, lm_head, embedding)?;
-    Ok(mtp_decode::MtpVerifyOutput::logits_only(logits, hiddens))
 }
 
 /// Forward pass using already-acquired lock guards (no lock overhead).

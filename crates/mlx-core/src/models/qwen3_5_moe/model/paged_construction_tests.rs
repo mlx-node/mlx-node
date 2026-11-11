@@ -9,7 +9,7 @@ use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
 use crate::models::qwen3_5_moe::decoder_layer::{AttentionType, MLPType};
 use crate::models::qwen3_5_moe::switch_glu::SwitchGLU;
 
-pub(super) fn tiny_moe_cfg(use_block_paged: bool) -> Qwen3_5MoeConfig {
+pub(super) fn tiny_moe_cfg() -> Qwen3_5MoeConfig {
     Qwen3_5MoeConfig {
         rope_scaling: None,
         vocab_size: 1024,
@@ -43,7 +43,6 @@ pub(super) fn tiny_moe_cfg(use_block_paged: bool) -> Qwen3_5MoeConfig {
         mlp_only_layers: None,
         paged_cache_memory_mb: Some(64),
         paged_block_size: Some(16),
-        use_block_paged_cache: if use_block_paged { Some(true) } else { None },
         persist_paged_cache: None,
         n_mtp_layers: 0,
         qwen35_gguf_gdn_layout: None,
@@ -71,7 +70,7 @@ fn expected_scheduler_window(inner: &Qwen35MoeInner) -> (u32, u32, u32) {
 #[test]
 fn tiny_hybrid_recurrent_bytes_make_usable_window_stricter_than_raw_pool() {
     use crate::engine::hybrid_scheduler::{pool_tokens_after_recurrent, scheduled_turn_context};
-    let inner = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct tiny MoE model");
+    let inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
     let rec = inner.config.recurrent_state_bytes();
     assert!(rec > 0, "tiny hybrid MoE config must have GDN state");
     let trained = 1_048_576;
@@ -107,39 +106,6 @@ fn install_plan(inner: &mut Qwen35MoeInner, pool_window: Option<u32>, draft: boo
     inner.memory_plan = Some(plan);
 }
 
-/// An omitted budget is the rest of the window whenever the plan prices
-/// it: the pool window of a paged load and the flat lane's window of a load
-/// without a pool.
-/// Mutation: set the omitted flag `true` in `from_parts` → red.
-/// Mutation: `pool_context_limit` ignores the plan's flat lane → red
-/// (the trained window, not 900).
-#[test]
-fn flat_load_publishes_no_rest_of_window() {
-    let Some(mut inner) =
-        moe_inner_with_test_adapter_or_skip("flat_load_publishes_no_rest_of_window")
-    else {
-        return;
-    };
-    let limits = inner.context_limits_snapshot();
-    assert!(limits.rest_of_window_output_budget);
-    assert!(limits.omitted_budget_is_rest_of_window);
-
-    inner.paged_adapter = None;
-    let limits = inner.context_limits_snapshot();
-    assert!(
-        limits.rest_of_window_output_budget,
-        "the clamp stays Splash's"
-    );
-    assert!(!limits.omitted_budget_is_rest_of_window);
-
-    inner.memory_plan = Some(crate::engine::memory_plan::MemoryPlan::with_flat_window(
-        900,
-    ));
-    let limits = inner.context_limits_snapshot();
-    assert_eq!(limits.effective_window_tokens, 900);
-    assert!(limits.omitted_budget_is_rest_of_window);
-}
-
 /// Gate: a paged load with a DFlash2 draft publishes one window, the pool
 /// lane's, for every turn.
 #[test]
@@ -161,10 +127,10 @@ fn context_limits_publish_one_window() {
 }
 
 /// Gate: the load publishes the K/V format it writes. The block-paged pool
-/// names its own pages (this test pool is f16, so "bf16"); a flat load
-/// names the configured format.
+/// names its own pages (this test pool is f16, so "bf16"); a load without a
+/// pool names the configured format.
 /// Mutation: pool lane reads `config.kv_format()` → red.
-/// Mutation: flat lane hard-codes `KvFormat::Bf16` → red.
+/// Mutation: the no-pool arm hard-codes `KvFormat::Bf16` → red.
 #[test]
 fn context_limits_publish_kv_formats() {
     let Some(mut inner) = moe_inner_with_test_adapter_or_skip("context_limits_publish_kv_formats")
@@ -268,7 +234,6 @@ fn every_load_starts_at_the_runway() {
         assert!(runway < pool.max_blocks, "draft={draft}");
         assert_eq!(adapter.memory_ceiling(), Some(plan.ceiling_bytes()));
         assert_eq!(inner.pool_context_limit(), pool.lane.window.maximum());
-        assert!(plan.flat.is_none(), "draft={draft}");
         assert_eq!(
             pool.lane.lane_bytes > inner.config.recurrent_state_bytes(),
             draft,
@@ -416,7 +381,7 @@ fn paged_context_limits_and_preflight_use_scheduler_usable_window() {
 
 #[test]
 fn all_full_attention_recurrent_lifecycle_is_a_noop() {
-    let mut config = tiny_moe_cfg(false);
+    let mut config = tiny_moe_cfg();
     config.full_attention_interval = 1;
     let mut inner = Qwen35MoeInner::new(config).expect("construct all-full MoE model");
     assert_eq!(inner.config.recurrent_state_bytes(), 0);
@@ -466,7 +431,7 @@ fn inert_mxfp8_switch(out_features: i64, in_features: i64) -> QuantizedSwitchLin
 
 #[test]
 fn save_model_rejects_quantized_moe_experts_before_creating_destination() {
-    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct tiny MoE model");
+    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
     let quantized_switch = SwitchGLU::new_quantized(
         inert_mxfp8_switch(128, 64),
         inert_mxfp8_switch(128, 64),
@@ -499,8 +464,10 @@ fn save_model_rejects_quantized_moe_experts_before_creating_destination() {
     );
 }
 
+/// A config mlx-node saved before the pool became the only lane carries
+/// `use_block_paged_cache`; the key is ignored like any other unknown key.
 #[test]
-fn test_moe_use_block_paged_cache_serde_default_none() {
+fn moe_saved_config_with_the_old_lane_key_still_parses() {
     let json = serde_json::json!({
         "vocab_size": 1024,
         "hidden_size": 64,
@@ -517,16 +484,16 @@ fn test_moe_use_block_paged_cache_serde_default_none() {
         "bos_token_id": 0,
         "num_experts": 4,
         "num_experts_per_tok": 2,
+        "use_block_paged_cache": false,
     });
     let cfg: Qwen3_5MoeConfig = serde_json::from_value(json).unwrap();
-    assert_eq!(cfg.use_block_paged_cache, None);
     assert_eq!(cfg.paged_block_size, None);
     assert_eq!(cfg.paged_cache_memory_mb, None);
 }
 
 #[test]
 fn test_moe_full_attention_layer_count() {
-    let cfg = tiny_moe_cfg(false);
+    let cfg = tiny_moe_cfg();
     assert_eq!(cfg.full_attention_layer_count(), 2);
 }
 
@@ -559,7 +526,7 @@ fn test_moe_gdn_root_rotation_retains_new_root() {
         inner.prune_moe_gdn_prefix_checkpoints();
     }
 
-    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct tiny MoE model");
+    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
     push_checkpoint(&mut inner, "root-0", "root-0", 1);
     push_checkpoint(&mut inner, "root-1", "root-1", 2);
     for (index, owner) in ["child-0", "child-1", "child-2", "child-3"]
@@ -591,7 +558,7 @@ fn test_moe_gdn_root_rotation_retains_new_root() {
     // `@mlx-node/lm` ChatSession publishes under the implicit owner `""`.
     // This model has no paged adapter and so no cold GDN policy, which
     // makes the pre-ladder cap the right one — see the dense twin.
-    let mut legacy = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct legacy MoE");
+    let mut legacy = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct legacy MoE");
     assert!(
         !legacy.wants_gdn_checkpoint_ladder(),
         "a model with no paged adapter cannot have a cold GDN sidecar policy"
@@ -775,9 +742,8 @@ fn test_qwen35_moe_media_plan_requires_complete_paged_vision_stack() {
                 let available = has_encoder && has_processor && has_paged;
                 assert_eq!(plan.available.images, available);
                 assert!(!plan.available.audio);
-                assert_eq!(plan.backend_validated.images, !available);
-                assert!(!plan.backend_validated.audio);
-                assert!(plan.admitted().images);
+                assert!(plan.backend_validated.is_empty());
+                assert_eq!(plan.admitted().images, available);
             }
         }
     }
@@ -829,7 +795,7 @@ fn test_qwen35_moe_session_media_payload_identity() {
 
 #[test]
 fn test_moe_paged_finalize_failure_cannot_republish_image_session() {
-    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct tiny MoE model");
+    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
     inner.caches = Some(fresh_moe_layer_caches(&inner.config));
     inner.cached_token_history = vec![7, 248_056, 248_056, 8];
     inner.cached_image_key = Some(0xA30B);
@@ -871,12 +837,11 @@ fn seed_moe_paged_image_session(inner: &mut Qwen35MoeInner) {
     inner.cached_image_key = Some(0xA30B);
     inner.cached_paged_image_token_positions = vec![(1, 0xA11C), (2, 0xA11C)];
     inner.cached_rope_deltas = Some(-2);
-    inner.flat_mtp_caches_desynced = true;
 }
 
 #[test]
 fn test_moe_manual_paged_finalize_failure_invalidates_session() {
-    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct tiny MoE model");
+    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
     seed_moe_paged_image_session(&mut inner);
 
     let error = inner
@@ -888,12 +853,11 @@ fn test_moe_manual_paged_finalize_failure_invalidates_session() {
     assert!(inner.cached_image_key.is_none());
     assert!(inner.cached_paged_image_token_positions.is_empty());
     assert!(inner.cached_rope_deltas.is_none());
-    assert!(!inner.flat_mtp_caches_desynced);
 }
 
 #[test]
 fn test_moe_vlm_prefix_prepare_failure_invalidates_session() {
-    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct tiny MoE model");
+    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
     seed_moe_paged_image_session(&mut inner);
 
     inner
@@ -919,7 +883,7 @@ fn test_moe_vlm_prefix_prepare_failure_invalidates_session() {
 
 #[test]
 fn test_moe_generic_paged_abort_invalidates_session() {
-    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct tiny MoE model");
+    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
     seed_moe_paged_image_session(&mut inner);
 
     <Qwen35MoeInner as crate::engine::backend::PagedBackend>::abort_paged_turn(&mut inner);
@@ -928,7 +892,6 @@ fn test_moe_generic_paged_abort_invalidates_session() {
     assert!(inner.cached_image_key.is_none());
     assert!(inner.cached_paged_image_token_positions.is_empty());
     assert!(inner.cached_rope_deltas.is_none());
-    assert!(!inner.flat_mtp_caches_desynced);
 }
 
 #[test]
@@ -955,7 +918,7 @@ fn test_qwen35_moe_planned_decoder_overrides_raw_mtp_flag() {
 
 #[test]
 fn test_moe_inner_no_paged_adapter_when_flag_is_none() {
-    let cfg = tiny_moe_cfg(false);
+    let cfg = tiny_moe_cfg();
     let inner =
         Qwen35MoeInner::new(cfg).expect("Qwen35MoeInner::new must succeed without paged adapter");
     assert!(inner.paged_adapter.is_none());
@@ -963,7 +926,7 @@ fn test_moe_inner_no_paged_adapter_when_flag_is_none() {
 
 #[test]
 fn test_fresh_moe_layer_caches_are_not_gdn_reuse_ready() {
-    let cfg = tiny_moe_cfg(true);
+    let cfg = tiny_moe_cfg();
     let caches = fresh_moe_layer_caches(&cfg);
     assert_eq!(caches.len(), cfg.num_layers as usize);
     assert!(
@@ -1027,9 +990,9 @@ fn test_moe_inner_constructs_paged_adapter_when_flag_is_true() {
     if std::env::var_os("MLX_TEST_PAGED").is_none() {
         return;
     }
-    let cfg = tiny_moe_cfg(true);
-    let mut inner = Qwen35MoeInner::new(cfg)
-        .expect("Qwen35MoeInner::new with use_block_paged_cache=true must succeed on Metal host");
+    let cfg = tiny_moe_cfg();
+    let mut inner =
+        Qwen35MoeInner::new(cfg).expect("Qwen35MoeInner::new must succeed on a Metal host");
     inner
         .initialize_paged_adapter()
         .expect("post-load paged adapter initialization must succeed");
@@ -1074,7 +1037,7 @@ fn moe_inner_with_test_adapter_or_skip(test_name: &str) -> Option<Qwen35MoeInner
     )));
     let adapter = PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE)
         .expect("test paged adapter must construct");
-    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg(true)).expect("construct tiny MoE model");
+    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
     inner.paged_adapter = Some(adapter);
     Some(inner)
 }
@@ -1149,7 +1112,7 @@ fn moe_paged_verify_refuses_a_cycle_it_cannot_open() {
 
     let setup = paged_mtp_turn_setup();
     let mut stepper = inner.begin_mtp_decode(&setup).expect("paged MTP stepper");
-    let owner = stepper.owner.expect("a paged turn claims an owner");
+    let owner = stepper.owner;
     // A sequence the turn never claimed: the stepper's `frontier` refuses
     // to name one for it, so the mint fails exactly as it does when the
     // adapter has been re-pointed mid-turn.
@@ -1356,7 +1319,7 @@ fn moe_cold_gdn_prefill_chunk_size_is_the_step_with_or_without_a_sidecar_policy(
 ///   casts routed and shared expert weights too, so the fixture exercises
 ///   genuine sparse MoE layers rather than substituting dense MLPs.
 pub(super) fn tiny_paged_forward_moe_cfg() -> Qwen3_5MoeConfig {
-    let mut cfg = tiny_moe_cfg(true);
+    let mut cfg = tiny_moe_cfg();
     cfg.hidden_size = 128;
     cfg.intermediate_size = 256;
     cfg.num_heads = 8;
@@ -1652,192 +1615,6 @@ fn moe_hybrid_n2_batched_decode_matches_scalar_replay() {
         serial_elapsed.as_secs_f64() * 1_000.0,
         serial_elapsed.as_secs_f64() / batched_elapsed.as_secs_f64().max(f64::EPSILON),
     );
-}
-
-/// Put the adapter where a fresh turn's prefill starts: empty caches, no
-/// cached prefix, suffix blocks allocated for the whole prompt.
-fn reset_moe_paged_request(inner: &mut Qwen35MoeInner, prompt: &[u32]) {
-    let caches = fresh_moe_layer_caches(&inner.config);
-    inner.caches = Some(caches);
-
-    let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-    if adapter.block_table().is_some() {
-        adapter.release_request().expect("release_request");
-    }
-    adapter.reset_for_new_request(0).expect("reset request");
-    let prefix = adapter
-        .find_cached_prefix(prompt, &[], 0, false)
-        .expect("find_cached_prefix");
-    assert_eq!(
-        prefix.cached_token_count, 0,
-        "MoE chunking tests must start from a cold adapter prefix"
-    );
-    adapter
-        .allocate_suffix_blocks(prompt.len() as u32)
-        .expect("allocate suffix blocks");
-}
-
-/// Drive the MoE prefill worker with an EXPLICIT chunk size, bypassing
-/// `cold_gdn_prefill_chunk_size`. That is the only way to reach the break-set
-/// decision with no policy installed — the shape a persist-off `mlx agent`
-/// turn has, since `run-agent.ts` seeds `MLX_PAGED_PREFILL_CHUNK_SIZE=2048`
-/// before any persistence decision.
-fn run_moe_paged_prefill_with_size_and_checkpoint(
-    inner: &mut Qwen35MoeInner,
-    full_tokens: &[u32],
-    suffix_tokens: &[u32],
-    chunk_size: i32,
-) -> Result<(
-    MxArray,
-    Vec<crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint>,
-)> {
-    let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
-        inner.config.num_layers as usize,
-        |i| inner.config.is_linear_layer(i),
-    );
-    let embed = inner.embedding.clone();
-    let caches = inner.caches.as_mut().expect("moe caches initialized");
-    let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-    crate::models::qwen3_5_moe::paged_forward::run_paged_prefill_chunk_with_size_and_checkpoint(
-        full_tokens,
-        suffix_tokens,
-        0,
-        false,
-        &embed,
-        &mut inner.layers,
-        caches,
-        &inner.final_norm,
-        &inner.lm_head,
-        &layer_kinds,
-        adapter,
-        chunk_size,
-        /* cached_rope_deltas */ 0,
-        None,
-        None,
-    )
-}
-
-/// Both hand-written MoE cores prefill through `run_moe_core_paged_prefill`,
-/// so this drives that shared body directly: under a GdnState policy it must
-/// publish checkpoint ladder rungs, and with no cold tier it takes the single
-/// pre-ladder boundary. MoE mirror of the dense
-/// `dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy`.
-///
-/// Catches: passing a literal `0` where `self.cold_gdn_prefill_chunk_size()`
-/// belongs inside `run_moe_core_paged_prefill`. That takes
-/// `run_paged_prefill_chunk_with_size_and_checkpoint`'s `chunk_size <= 0`
-/// arm, which hands back `Vec::new()` for the ladder — no rung is
-/// materialized, so every MoE cold capture anchors nothing. That is the
-/// MTP-turn defect, on the MoE side. The sibling
-/// `moe_cold_gdn_prefill_chunk_size_is_the_step_with_or_without_a_sidecar_policy`
-/// cannot see it: that one reads the accessor, never the call site.
-///
-/// The 200-token arms catch hardcoding `gdn_cold_sidecar_ladder_wanted`'s
-/// result at the prefill body in either direction; the 64-token arms cannot,
-/// because at that length the ladder is already one rung and both agree.
-///
-/// Runs in CI on the `qwen3_5-dense` `model-test` leg's `lib_tests` filter,
-/// which needs no checkpoint for this one; there is no MoE leg, and
-/// `docs/paged-cache.md` records why there cannot be.
-#[test]
-#[ignore = "requires Metal GPU; run with --ignored"]
-fn moe_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy() {
-    let Some(mut inner) = moe_paged_inner_or_skip(
-        "moe_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy",
-    ) else {
-        return;
-    };
-    cast_moe_inner_weights_bf16(&mut inner);
-    let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
-        inner.config.num_layers as usize,
-        |i| inner.config.is_linear_layer(i),
-    );
-    let prompt: Vec<u32> = (0u32..64).map(|i| (i * 5 + 7) % 257).collect();
-
-    reset_moe_paged_request(&mut inner, &prompt);
-    let (_, no_cold_ladder) = inner
-        .run_moe_core_paged_prefill(&prompt, &prompt, 0, false, &layer_kinds, "ladder prefill")
-        .expect("prefill with no cold tier");
-    assert_eq!(
-        no_cold_ladder
-            .iter()
-            .map(|c| c.prefix_len)
-            .collect::<Vec<_>>(),
-        vec![48],
-        "with no cold GDN policy the MoE cores take the single pre-ladder boundary"
-    );
-
-    // A prompt long enough that the two break sets DIFFER: ladder
-    // [48, 192] against the single pre-ladder boundary [192]. Run BEFORE
-    // the cold tier is installed — the adapter has no way to drop one.
-    let long_prompt: Vec<u32> = (0u32..200).map(|i| (i * 5 + 7) % 257).collect();
-    reset_moe_paged_request(&mut inner, &long_prompt);
-    let (_, no_policy_rungs) = run_moe_paged_prefill_with_size_and_checkpoint(
-        &mut inner,
-        &long_prompt,
-        &long_prompt,
-        2048,
-    )
-    .expect("explicit-chunk MoE prefill with no cold tier");
-    assert_eq!(
-        no_policy_rungs
-            .iter()
-            .map(|c| c.prefix_len)
-            .collect::<Vec<_>>(),
-        vec![192],
-        "with no cold GDN policy an explicit chunk size must take the single pre-ladder \
-         boundary, not the ladder — the extra breaks change the prefill GEMM's M and so the \
-         sampled tokens of a persistence-off request"
-    );
-    // Release WITHOUT registering: publishing this prompt's blocks would
-    // give the next arm's shared 64-token prefix a cache hit, and every arm
-    // here has to start cold.
-    inner
-        .paged_adapter
-        .as_mut()
-        .expect("paged_adapter")
-        .release_request()
-        .expect("release_request");
-
-    let root = moe_temp_cold_root("moe-core-ladder");
-    install_moe_gdn_cold_tier(&mut inner, &root);
-    reset_moe_paged_request(&mut inner, &prompt);
-    let (_, ladder) = inner
-        .run_moe_core_paged_prefill(&prompt, &prompt, 0, false, &layer_kinds, "ladder prefill")
-        .expect("prefill under a cold GDN policy");
-    assert!(
-        !ladder.is_empty(),
-        "a persist-cold MoE turn must materialize the GDN checkpoint ladder its sidecar \
-         anchors on"
-    );
-    for checkpoint in &ladder {
-        assert!(
-            checkpoint.prefix_len > 0 && (checkpoint.prefix_len as usize) < prompt.len(),
-            "a rung must sit strictly inside the prompt, got {}",
-            checkpoint.prefix_len
-        );
-    }
-
-    // Same long prompt, same explicit chunk size, policy now installed:
-    // every rung of the ladder is a real break.
-    reset_moe_paged_request(&mut inner, &long_prompt);
-    let (_, cold_rungs) = run_moe_paged_prefill_with_size_and_checkpoint(
-        &mut inner,
-        &long_prompt,
-        &long_prompt,
-        2048,
-    )
-    .expect("explicit-chunk MoE prefill under a cold GDN policy");
-    assert_eq!(
-        cold_rungs.iter().map(|c| c.prefix_len).collect::<Vec<_>>(),
-        vec![48, 192],
-        "an explicit chunk size under a GDN cold policy still publishes the whole ladder"
-    );
-
-    let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-    let _ = adapter.register_full_blocks_for_reuse(&[], 0);
-    adapter.release_request().expect("release_request");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -2745,85 +2522,12 @@ fn moe_mtp_gate_at_the_cap_reclaims_before_falling_back() {
     assert!(moe_ladder(&inner).is_empty());
 }
 
-struct NullSink;
-impl crate::engine::backend::ChunkSink for NullSink {
-    fn send(&self, _chunk: Result<crate::engine::types::ChatStreamChunk>) {}
-}
-
-/// The MoE serial sync and stream turns at the cap, on a pool whose window
-/// leaves the prompt four blocks past the recurrent rows: their prepare is
-/// refused until the take order drops a ladder rung the prompt does not
-/// share; the prompt grow before it takes nothing.
-/// Mutations: drop the `reclaiming` wrapper on the prepare in MoE
-/// `paged_turn_sync_core` → red on `sync` (`Err`); in MoE
-/// `paged_turn_stream_core` → red on `stream` (`Err`).
-#[test]
-fn moe_serial_prepare_at_the_cap_frees_a_ladder_chain() {
-    use crate::engine::backend::ChatBackend;
-    let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
-    for entry in ["sync", "stream"] {
-        let Some(mut inner) =
-            moe_reclaim_inner("moe_serial_prepare_at_the_cap_frees_a_ladder_chain")
-        else {
-            return;
-        };
-        install_moe_pool(&mut inner, 4, 4, Arc::new(Ok));
-        let bytes_per_block = inner
-            .paged_adapter
-            .as_ref()
-            .expect("adapter")
-            .bytes_per_block()
-            .expect("bytes per block");
-        let rows = inner
-            .config
-            .recurrent_state_bytes()
-            .div_ceil(bytes_per_block) as u32;
-        moe_cap_with_a_shared_live_table_of(&mut inner, rows + 4);
-        let block_size = moe_block_size(&inner);
-        let mut prompt = moe_chain_tokens(23, 1, block_size);
-        prompt.extend([2, 3, 4, 5]);
-        let config = crate::engine::types::ChatConfig {
-            temperature: Some(0.0),
-            max_new_tokens: Some(2),
-            reasoning_effort: Some("none".to_string()),
-            ..crate::engine::types::ChatConfig::default()
-        };
-        let params = ChatBackend::resolve_params(&inner, &config);
-        let thinking = ChatBackend::thinking_setup(&inner, &config);
-        clear_grow_log();
-        if entry == "sync" {
-            inner
-                .paged_turn_sync_core(prompt, tokenizer.clone(), u32::MAX, params, false, thinking)
-                .expect("the sync turn runs");
-        } else {
-            let sink = NullSink;
-            inner
-                .paged_turn_stream_core(
-                    prompt,
-                    tokenizer.clone(),
-                    u32::MAX,
-                    params,
-                    false,
-                    &super::paged_backend::StreamSender(&sink),
-                    &std::sync::atomic::AtomicBool::new(false),
-                    thinking,
-                )
-                .expect("the stream turn runs");
-        }
-        assert_eq!(
-            grow_log().first(),
-            Some(&crate::models::qwen3_5::dflash2_turn::GrowReclaim::Ladder),
-            "{entry}"
-        );
-    }
-}
-
-/// Gate: with no pool the chat turn core holds the flat lane's capped
-/// window (Splash `Engine::submit`). Mutation: the MoE `context_window`
+/// Gate: off Metal (no pool) the chat turn core holds the flat lane's
+/// capped window (Splash `Engine::submit`). Mutation: the MoE `context_window`
 /// returns `None` → red.
 #[test]
 fn flat_context_window_is_the_capped_lane() {
-    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct tiny MoE model");
+    let mut inner = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct tiny MoE model");
     assert!(inner.paged_adapter.is_none());
     assert_eq!(
         crate::engine::backend::ChatBackend::context_window(&inner),
@@ -2903,4 +2607,44 @@ fn moe_cold_dflash2_prefill_reclaims_a_marked_live_chain() {
     );
     let adapter = inner.paged_adapter.as_ref().expect("adapter");
     assert_eq!(adapter.current_token_count() as usize, prompt.len());
+}
+
+/// Gate: on Metal a kernel-geometry MoE load builds the pool and every text
+/// turn, MTP requested or not, resolves to the paged path; the flat
+/// autoregressive hooks refuse the load. Mutation N1: `qwen35_pool_backend`
+/// returns false → red (no pool).
+#[test]
+fn moe_metal_load_has_no_flat_lane() {
+    use crate::engine::backend::ChatBackend;
+    use crate::engine::plan::{MediaCapabilities, TurnPath, TurnPlan, TurnRequest};
+    let Some(loaded) = planned_load(tiny_paged_forward_moe_cfg(), false) else {
+        return;
+    };
+    let mut inner = loaded.expect("a kernel geometry loads on the pool");
+    assert!(inner.paged_adapter.is_some(), "no pool");
+    let plan = inner.execution_plan();
+    assert!(plan.paged_attention.is_some());
+    for is_delta in [false, true] {
+        for speculative_requested in [false, true] {
+            let turn = TurnPlan::resolve(
+                plan,
+                TurnRequest {
+                    is_delta,
+                    input_media: MediaCapabilities::NONE,
+                    context_media: MediaCapabilities::NONE,
+                    speculative_requested,
+                    streaming: false,
+                },
+            );
+            assert!(matches!(turn.path(), TurnPath::Paged));
+        }
+    }
+    let refused = ChatBackend::prefill(&mut inner, &[1, 2, 3], Stream::generation())
+        .err()
+        .expect("the flat lane refuses a Metal load");
+    assert!(
+        refused.reason.contains("flat KV lane"),
+        "{}",
+        refused.reason
+    );
 }

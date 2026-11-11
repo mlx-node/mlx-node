@@ -745,24 +745,6 @@ unsafe extern "C-unwind" {
         causal: bool,
     ) -> *mut mlx_array;
 
-    /// TEST-ONLY int8 entry with a forced route: `mode` -1 automatic, 0
-    /// vector, 1 tile, 2 nax. Null (message on stderr) when that route
-    /// cannot serve the block.
-    pub fn mlx_segmented_sdpa_int8_test_forward(
-        q: *mut mlx_array,
-        prefix_k: *mut mlx_array,
-        prefix_v: *mut mlx_array,
-        prefix_ks: *mut mlx_array,
-        prefix_vs: *mut mlx_array,
-        new_k: *mut mlx_array,
-        new_v: *mut mlx_array,
-        new_ks: *mut mlx_array,
-        new_vs: *mut mlx_array,
-        scale: f32,
-        causal: bool,
-        mode: i32,
-    ) -> *mut mlx_array;
-
     /// Per-row symmetric int8 KV quantization: BF16 `[B, H, N, 256]` ->
     /// int8 rows (`out_q`) + fp32 scales `[B, H, N]` (`out_s`), scale =
     /// max|x| / 127, q = clamp(rint(x * 127 / max), -127, 127). 0 on

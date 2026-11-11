@@ -225,23 +225,6 @@ impl DecoderLayer {
         h.add(&mlp_out)
     }
 
-    /// Like [`DecoderLayer::forward`], but threads an eager-MTP tape sink into
-    /// the GDN (`Linear`) sublayer so the verify forward can record the
-    /// per-step recurrence inputs for the rollback replay. Full-attention
-    /// layers ignore the sink (it stays `None` for their tape slot). When
-    /// `tape_sink` is `None`, behavior is byte-identical to `forward`.
-    pub(crate) fn forward_with_tape(
-        &mut self,
-        x: &MxArray,
-        mask: Option<&MxArray>,
-        cache: Option<&mut Qwen3_5LayerCache>,
-        position_ids: Option<&MxArray>,
-        use_kernel: bool,
-        tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
-    ) -> Result<MxArray> {
-        self.forward_with_tape_budget(x, mask, cache, position_ids, use_kernel, tape_sink, None)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn forward_with_tape_budget(
         &mut self,

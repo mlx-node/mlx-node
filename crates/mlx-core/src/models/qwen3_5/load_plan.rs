@@ -9,9 +9,9 @@ use napi_derive::napi;
 use crate::array::DType;
 use crate::engine::checkpoint_source::CheckpointSource;
 use crate::engine::memory_plan::{
-    ContextBounds, FlatInput, KvLayout, LaneShape, LiveMemory, MeasuredMemory, MemoryFootprint,
-    MemoryPlan, PlanError, PoolInput, SPECULATIVE_SCRATCH_TOKENS, check_max_context,
-    dflash2_lane_state_bytes, live_memory,
+    ContextBounds, KvLayout, LaneShape, LiveMemory, MeasuredMemory, MemoryFootprint, MemoryPlan,
+    PlanError, PoolInput, SPECULATIVE_SCRATCH_TOKENS, check_max_context, dflash2_lane_state_bytes,
+    live_memory,
 };
 use crate::models::mtp_drafter::{
     DrafterBodyVariant, detect_drafter_safetensors, missing_mtp_keys, reprefix_drafter_key,
@@ -28,7 +28,7 @@ use crate::utils::safetensors::{SafeTensorDType, SafeTensorsFile, checkpoint_saf
 
 use super::config::Qwen3_5Config;
 use super::dflash2::DFlash2Config;
-use super::dflash2_decode::{flat_lane_transient, pool_lane_transient};
+use super::dflash2_decode::pool_lane_transient;
 use super::dflash2_turn::DFlash2Target;
 use super::persistence::{
     compute_dtype_of, mtp_sidecar_candidates, normalize_mtp_weight_key, qwen35_text_key,
@@ -60,8 +60,8 @@ pub(crate) fn qwen35_pool_cache_dtype(
         && matches!(block_size, 16 | 32))
     {
         return Err(Error::from_reason(format!(
-            "{label}: no paged prefill attention kernel for {}/{} heads, head_dim {}, block size \
-             {block_size}; load with useBlockPagedCache false",
+            "{label}: no paged-attention kernel for layout: {}/{} heads, head_dim {}, block \
+             size {block_size} (query groups 4, 6, 8, 16; head 128, 256; blocks 16, 32)",
             heads.query, heads.kv, heads.dim
         )));
     }
@@ -90,6 +90,53 @@ impl PoolHeads {
             kv: config.num_kv_heads.max(0) as u32,
             dim: config.head_dim.max(0) as u32,
         }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Loads on this thread see no Metal device.
+    pub(crate) static NO_METAL_POOL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn metal_device() -> bool {
+    #[cfg(test)]
+    if NO_METAL_POOL.with(std::cell::Cell::get) {
+        return false;
+    }
+    crate::engine::persistence::compiled_forward_backend_available()
+}
+
+/// Whether a Qwen3.5 load builds the block-paged pool: Splash runs only on
+/// Metal. A load off Metal (the CUDA preview) has no pool: training, eval
+/// and calibration run on it, and its chat turns take the flat lane
+/// ([`qwen35_flat_lane_check`]).
+pub(crate) fn qwen35_pool_backend() -> bool {
+    metal_device()
+}
+
+/// The flat autoregressive lane serves only a load off Metal (the paged
+/// kernels exist only on Metal). On Metal every turn runs on the pool.
+pub(crate) fn qwen35_flat_lane_check(label: &str) -> Result<()> {
+    if !metal_device() {
+        return Ok(());
+    }
+    Err(Error::from_reason(format!(
+        "{label}: the flat KV lane serves only loads off Metal; this load serves every turn \
+         from the block-paged pool"
+    )))
+}
+
+/// A load without a pool keeps its K/V in bf16: int8 K/V lives only in the
+/// pool (Splash `RuntimeResourcesConfig::kvFormat`).
+pub(crate) fn qwen35_no_pool_format(label: &str, format: KvFormat) -> Result<()> {
+    match format {
+        KvFormat::Bf16 => Ok(()),
+        KvFormat::Int8 => Err(Error::from_reason(format!(
+            "{label}: int8 K/V lives in the block-paged pool, which this load has none of (it \
+             needs Metal); load with kvFormat 'bf16'"
+        ))),
     }
 }
 
@@ -145,10 +192,6 @@ pub(crate) struct LoadLanes<'a> {
     pub recurrent_state_bytes: u64,
     pub pool: Option<PoolGeometry>,
     pub draft: Option<DraftTerms>,
-    /// Format and dtype of the flat autoregressive lane's K/V (a load
-    /// without a pool).
-    pub format: KvFormat,
-    pub dtype: DType,
     /// The load can run an MTP turn on the pool lane (MTP heads, no
     /// DFlash2 draft): the lane holds its draft state at the window.
     pub mtp: bool,
@@ -163,9 +206,9 @@ pub(crate) fn qwen35_scheduler_books_state_in_pool() -> bool {
 }
 
 /// Splash `evaluateEngineMemoryPlan` over `lanes` on the device `live`.
-/// Every load prices one lane: the pool lane, whose state carries a DFlash2
-/// draft's (Splash's one window for every turn), or the flat lane of a load
-/// without a pool.
+/// A pool load prices one lane, whose state carries a DFlash2 draft's
+/// (Splash's one window for every turn); a load without a pool prices its
+/// footprint only.
 pub(crate) fn evaluate_qwen35_plan(
     label: &str,
     lanes: &LoadLanes<'_>,
@@ -232,35 +275,13 @@ pub(crate) fn evaluate_qwen35_plan(
             state_in_pool: mtp && lanes.mtp_state_in_pool,
         }
     });
-    let format = lanes.format;
-    let autoregressive_transient = |window| flat_lane_transient(config, format, window);
-    let flat = lanes.pool.is_none().then(|| FlatInput {
-        shape: LaneShape {
-            trained,
-            lane_bytes: recurrent_state_bytes,
-            layout: KvLayout::of(
-                fa_layers,
-                config.num_kv_heads,
-                config.head_dim,
-                lanes.dtype,
-                format,
-            ),
-            scratch_rows: 0,
-            transient: &autoregressive_transient,
-        },
-        copy_layers: Some(fa_layers as u64),
-    });
-    MemoryPlan::evaluate(footprint, pool_input, flat)
+    MemoryPlan::evaluate(footprint, pool_input)
         .map_err(|error| Error::from_reason(error.message(label)))
 }
 
-/// Every turn's window: the pool lane's, else the flat lane's of a load
-/// without a pool.
+/// Every turn's window: the pool lane's.
 fn turn_window(plan: &MemoryPlan) -> Option<ContextBounds> {
-    plan.pool
-        .as_ref()
-        .map(|pool| pool.lane.window)
-        .or(plan.flat.as_ref().map(|lane| lane.window))
+    plan.pool.as_ref().map(|pool| pool.lane.window)
 }
 
 /// Splash `ServingRuntime::start`'s `--max-context` refusal over `plan`.
@@ -293,7 +314,7 @@ fn check_unplanned_max_context(
 }
 
 /// The plan of `target`'s load from what the device holds now: the pool lane
-/// when `pool` is set, else the flat lane. `None` when the working set is
+/// when `pool` is set, else the footprint. `None` when the working set is
 /// unreadable.
 pub(crate) fn plan_qwen35_load<T: DFlash2Target>(
     label: &str,
@@ -315,8 +336,6 @@ pub(crate) fn plan_qwen35_load<T: DFlash2Target>(
         recurrent_state_bytes,
         pool,
         draft: draft.map(|draft| DraftTerms::of(&draft.config, draft.weight_bytes)),
-        format: config.kv_format(),
-        dtype: target.embedding_dtype()?,
         mtp: mtp_weights && draft.is_none(),
         mtp_state_in_pool: qwen35_scheduler_books_state_in_pool(),
     };
@@ -374,7 +393,7 @@ pub(crate) fn max_memory_option(label: &str, value: Option<i64>) -> Result<Optio
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Qwen35ContextEstimate {
     /// Tokens every turn may hold: the pool lane's (with a DFlash2 draft's
-    /// state priced), the flat lane's without a pool.
+    /// state priced); the served window without a pool.
     pub window_tokens: u32,
     /// `'memory'` when the plan binds the window, `'model'` when the trained
     /// window does.
@@ -645,10 +664,6 @@ pub(crate) fn estimate_qwen35_load(
         DEFAULT_QUANT_GROUP_SIZE,
     )?;
     let sym8 = has_sym8_mode(top_level_mode, &per_layer_quant);
-    // Both loaders pin a sym8 checkpoint to flat KV after reading its quant block.
-    if sym8 && config.use_block_paged_cache == Some(true) {
-        config.use_block_paged_cache = Some(false);
-    }
     // The loaders turn the MTP head off for sym8 (both) and K-quant (MoE)
     // checkpoints, and for an incomplete `mtp.*` set.
     let mtp_head = config.n_mtp_layers > 0
@@ -680,9 +695,7 @@ pub(crate) fn estimate_qwen35_load(
             ))
         })
         .transpose()?;
-    let pool = if config.use_block_paged_cache.unwrap_or(true)
-        && crate::engine::persistence::compiled_forward_backend_available()
-    {
+    let pool = if qwen35_pool_backend() {
         let layers = config.full_attention_layer_count() as u32;
         let block_size = config.paged_block_size();
         let cache_dtype =
@@ -703,12 +716,13 @@ pub(crate) fn estimate_qwen35_load(
             explicit_mib: config.paged_cache_memory_mb,
         })
     } else {
+        qwen35_no_pool_format(label, format)?;
         None
     };
     if draft.is_some() && pool.is_none() {
         return Err(Error::from_reason(format!(
-            "{label} DFlash2 runs on the block-paged KV pool and this load has none; load \
-             without the companion (autoLoadDraft: false) or with the paged cache"
+            "{label} DFlash2 runs on the block-paged KV pool, which this load has none of (it \
+             needs Metal); load without the companion (autoLoadDraft: false)"
         )));
     }
     let served = config.served_context_tokens();
@@ -726,8 +740,6 @@ pub(crate) fn estimate_qwen35_load(
         recurrent_state_bytes: config.recurrent_state_bytes(),
         pool,
         draft,
-        format,
-        dtype: compute,
         mtp: mtp_head && draft.is_none(),
         mtp_state_in_pool: qwen35_scheduler_books_state_in_pool(),
     };
