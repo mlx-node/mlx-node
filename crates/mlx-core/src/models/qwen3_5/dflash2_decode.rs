@@ -250,7 +250,8 @@ fn prefill_chunk_scratch_bytes(config: &super::config::Qwen3_5Config, window: u6
 /// workspace bound, or one decode step. With a DFlash2 draft (`draft_taps`
 /// tapped layers) the prefill also holds the chunk's taps, and the decode
 /// step is the 8-row verify on the pool with the free pool its decode cache
-/// limit keeps (Splash prices the one 8-row verify graph).
+/// limit keeps and the prefill-sized workspace the adapter holds (Splash
+/// prices the one 8-row verify graph).
 pub(crate) fn pool_lane_transient(
     config: &super::config::Qwen3_5Config,
     draft_taps: Option<usize>,
@@ -271,12 +272,31 @@ pub(crate) fn pool_lane_transient(
                 .saturating_mul(dim(config.hidden_size))
                 .saturating_mul(2);
             let cycle = pool_verify_cycle_bytes(config, window);
-            prefill
-                .saturating_add(tapped)
-                .max(cycle.saturating_add(crate::cache_limit::decode_cache_limit(cycle)))
+            // The adapter's one workspace keeps the prefill bound through
+            // every verify (Splash `fixedRuntimeBytes` prices the prefill
+            // arena's `PrefillTensor::AttentionPartials` beside the decode
+            // arena's). It is live, not cache: outside `decode_cache_limit`.
+            let held = pool_held_workspace_bytes(config);
+            prefill.saturating_add(tapped).max(
+                cycle
+                    .saturating_add(held)
+                    .saturating_add(crate::cache_limit::decode_cache_limit(cycle)),
+            )
         }
         None => prefill.max(dflash2_cycle_transient(config, 0, window).total()),
     }
+}
+
+/// Bytes the prefill workspace bound holds past the verify bound.
+fn pool_held_workspace_bytes(config: &super::config::Qwen3_5Config) -> u64 {
+    use mlx_paged_attn::prefill_plan::{Pass, workspace_bound_floats};
+    let (heads, head_dim) = (
+        config.num_heads.max(0) as u32,
+        config.head_dim.max(0) as u32,
+    );
+    workspace_bound_floats(Pass::Prefill, heads, head_dim)
+        .saturating_sub(workspace_bound_floats(Pass::Verify, heads, head_dim))
+        .saturating_mul(4)
 }
 
 /// One 8-row DFlash2 verify on the pool over `window` keys: logits, GDN

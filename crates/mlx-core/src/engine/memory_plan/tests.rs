@@ -283,8 +283,10 @@ fn pool_below_the_config_floor_validates() {
 /// 94,201 keys the chunk wins: scratch 276,824,064, the prefill attention
 /// 109,445,120, taps 104,857,600; the cycle is core 43,188,224 and the
 /// verify attention 25,886,720. At 512 keys the cycle (the same 69,074,944,
-/// no window term) wins: x 3. Mutation: drop the `decode_cache_limit` term
-/// from `pool_lane_transient` → red (160,825,344 at 512: the chunk wins).
+/// no window term) wins: x 3, plus the 25,362,432 the adapter's prefill
+/// workspace (50,724,864) holds past the verify bound. Mutation: drop the
+/// `decode_cache_limit` term from `pool_lane_transient` → red (160,825,344
+/// at 512: the chunk wins).
 #[test]
 fn transient_charges_the_decode_free_pool() {
     let cfg = qwen38_27b_cfg();
@@ -293,7 +295,35 @@ fn transient_charges_the_decode_free_pool() {
     assert_eq!(cycle(94_201), 43_188_224 + 25_886_720);
     assert_eq!(lane(94_201), 276_824_064 + 109_445_120 + 104_857_600);
     assert_eq!(cycle(512), 43_188_224 + 25_886_720);
-    assert_eq!(lane(512), 3 * 69_074_944);
+    assert_eq!(lane(512), 3 * 69_074_944 + 25_362_432);
+}
+
+/// The 35B-A3B dense view (hidden 2,048, no dense MLP, 16 heads of 256)
+/// with a 5-tap draft: its verify term wins at every window. The cycle is
+/// core 27,787,264 and verify attention 17,252,352; `decode_cache_limit`
+/// keeps its 128 MiB floor; the adapter's prefill workspace (33,816,576)
+/// stays live through the verify, 16,908,288 past the verify bound.
+/// Mutation V1: the verify charges only the verify bound → red
+/// (179,257,344).
+#[test]
+fn verify_transient_charges_the_held_prefill_workspace() {
+    let cfg = crate::models::qwen3_5::config::Qwen3_5Config {
+        hidden_size: 2048,
+        num_layers: 40,
+        num_heads: 16,
+        num_kv_heads: 2,
+        intermediate_size: 0,
+        linear_num_value_heads: 32,
+        ..qwen38_27b_cfg()
+    };
+    assert_eq!(pool_verify_cycle_bytes(&cfg, 512), 27_787_264 + 17_252_352);
+    for window in [512, 2_048, 262_144] {
+        assert_eq!(
+            pool_lane_transient(&cfg, Some(QWEN38_DRAFT_TAPS), window),
+            27_787_264 + 17_252_352 + 134_217_728 + 16_908_288,
+            "window {window}"
+        );
+    }
 }
 
 /// One 2,048-row chunk: scratch 276,824,064 and the in-place attention
