@@ -409,7 +409,7 @@ pub struct Qwen35LoadOptions {
     /// fp32 scale each — half the K/V memory and read bandwidth) or
     /// `'bf16'`. When neither this option nor checkpoint config specifies a
     /// format, dense and MoE Qwen default to int8 on Metal with 256-wide
-    /// heads, GQA up to 8, BF16 compute and a 16- or 32-token paged block,
+    /// heads, BF16 compute and a 16- or 32-token paged block,
     /// BF16 elsewhere (an f16 checkpoint keeps BF16 K/V). An int8 pool needs
     /// head 128 or 256, a 16- or 32-token block and BF16 compute, else the
     /// load fails.

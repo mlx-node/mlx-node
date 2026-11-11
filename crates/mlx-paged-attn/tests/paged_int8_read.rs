@@ -415,8 +415,9 @@ fn paged(
 }
 
 /// The flat segmented int8 kernel on the same rows: prefix = the first
-/// `c - rows`, new = the last `rows`, causal. Out `[rows][HQ][D]`.
-fn flat(f: &Filled, q: &[u16], rows: usize, c: usize, scale: f32) -> Vec<f32> {
+/// `c - rows`, new = the last `rows`, causal. Out `[rows][HQ][D]`; `None`
+/// when the kernel refuses the block.
+fn flat(f: &Filled, q: &[u16], rows: usize, c: usize, scale: f32) -> Option<Vec<f32>> {
     const D: usize = 256;
     let split = (c - rows) * kv_heads() * D;
     let (pk, pks) = quantize(&f.keys[..split], c - rows, D);
@@ -437,7 +438,9 @@ fn flat(f: &Filled, q: &[u16], rows: usize, c: usize, scale: f32) -> Vec<f32> {
             q.0, pk.0, pv.0, pks.0, pvs.0, nk.0, nv.0, nks.0, nvs.0, scale, true,
         )
     };
-    assert!(!out.is_null(), "flat int8 kernel refused rows {rows} c {c}");
+    if out.is_null() {
+        return None;
+    }
     let out = floats(&Owned(out));
     let mut token_major = vec![0f32; out.len()];
     for r in 0..rows {
@@ -446,7 +449,16 @@ fn flat(f: &Filled, q: &[u16], rows: usize, c: usize, scale: f32) -> Vec<f32> {
                 .copy_from_slice(&out[(qh * rows + r) * D..(qh * rows + r + 1) * D]);
         }
     }
-    token_major
+    Some(token_major)
+}
+
+/// Whether the flat segmented int8 kernel launches a causal block of `rows`:
+/// its widest query chunk at this gqa, or two chunks of it.
+fn flat_serves(rows: usize) -> bool {
+    let gqa = (q_heads() / kv_heads()) as i32;
+    // SAFETY: a pure query of the loaded metallib's pipeline limits.
+    let max_q = unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(gqa) };
+    rows as i32 <= 2 * max_q
 }
 
 struct Case {
@@ -499,8 +511,16 @@ fn check(case: &Case, seed: u64, failures: &mut Vec<String>) {
                  {mean:.4} bf16 ulps"
             ));
         }
-        if d == 256 {
-            let flat_out = flat(&f, &q, rows, c, scale);
+        if d == 256 && !flat_serves(rows) {
+            if flat(&f, &q, rows, c, scale).is_some() {
+                failures.push(format!(
+                    "{h}/{hq} C{c} rows {rows}: the flat int8 kernel launched a block wider than \
+                     two of its query chunks"
+                ));
+            }
+        } else if d == 256 {
+            let flat_out = flat(&f, &q, rows, c, scale)
+                .unwrap_or_else(|| panic!("flat int8 kernel refused rows {rows} c {c}"));
             let ref_bf16 = reference(
                 &q_f32,
                 rows,
@@ -666,6 +686,62 @@ fn paged_int8_attention_gqa_shapes() {
     let mut failures = Vec::new();
     for (i, case) in cases.iter().enumerate() {
         check(case, 0x53_0000 + i as u64, &mut failures);
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The 122B's 32 query / 2 KV heads at D 256 (gqa 16, Splash `_kv2_g16`):
+/// decode (1 row), verify (2 and 8 rows) and a 64-row varlen prefill over
+/// int8 pages, one partition (v1, 300 tokens) and many (v2 + the int8
+/// reducer; 17,000 tokens = 34 partitions, so 60-row varlen tiles and 64
+/// rows cross a tile), against the f64 reference over the dequantized rows.
+/// 32 / 2 is outside the grouped whitelist. The flat kernel serves rows 1
+/// and 2 here and refuses 8.
+///
+/// Mutation G16: query heads >= 8 of a group read the next KV head (a
+/// gqa <= 8 head-mapping assumption in the generic int8 kernels) → red at
+/// every row; `paged_int8_attention_gqa_shapes` and
+/// `paged_int8_attention_tracks_the_flat_int8_kernel` stay green under it.
+#[test]
+fn paged_int8_attention_gqa16() {
+    unsafe { std::env::set_var("MLX_PAGED_GROUPED_QWEN35_TEST_PROBE", "1") };
+    let cases = [
+        Case {
+            heads: (2, 32),
+            d: 256,
+            bs: 16,
+            c: 300,
+            rows: &[1, 2, 8],
+            grouped: &[false, false, false],
+        },
+        Case {
+            heads: (2, 32),
+            d: 256,
+            bs: 16,
+            c: 600,
+            rows: &[1, 2, 8],
+            grouped: &[false, false, false],
+        },
+        Case {
+            heads: (2, 32),
+            d: 256,
+            bs: 16,
+            c: 17_000,
+            rows: &[1, 2, 8, 64],
+            grouped: &[false, false, false, false],
+        },
+        Case {
+            heads: (2, 32),
+            d: 256,
+            bs: 16,
+            c: 33_000,
+            rows: &[1],
+            grouped: &[false],
+        },
+    ];
+    let mut failures = Vec::new();
+    for (i, case) in cases.iter().enumerate() {
+        check(case, 0x54_0000 + i as u64, &mut failures);
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }

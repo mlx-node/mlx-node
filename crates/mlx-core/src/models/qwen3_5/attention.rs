@@ -779,10 +779,12 @@ impl Qwen3_5Attention {
     ///
     /// Readers by block shape:
     ///   * `T == 1` (AR decode, MTP draft step) and `2..=8` without a mask
-    ///     (eager MTP / DFlash2 verify): the segmented int8 kernels read the
-    ///     int8 rows directly — prefix `[0, P)` and the block's own rows as
-    ///     the "new" segment, causal for a block.
-    ///   * anything else (prefill chunks, explicit masks): the cached prefix
+    ///     (eager MTP verify) that the segmented int8 kernels launch
+    ///     (`segmented_int8_covers`): they read the int8 rows directly —
+    ///     prefix `[0, P)` and the block's own rows as the "new" segment,
+    ///     causal for a block.
+    ///   * anything else (prefill chunks, explicit masks, a 5..8-row block at
+    ///     gqa above 8, which the segmented kernels cannot split): the cached prefix
     ///     is dequantized to a BF16 temporary (one pass per layer per chunk)
     ///     and MLX's fused SDPA runs over `concat(prefix, fresh block)`; the
     ///     block's own rows stay BF16 there.
@@ -808,7 +810,8 @@ impl Qwen3_5Attention {
             && self.head_dim == 256
             && queries.dtype()? == DType::BFloat16
             && unsafe { mlx_sys::mlx_metal_is_available() }
-            && unsafe { mlx_sys::mlx_default_device() } == 1;
+            && unsafe { mlx_sys::mlx_default_device() } == 1
+            && crate::array::kv_int8::segmented_int8_covers(seq_len, gqa);
         if segmented {
             let prefix = all.slice_tokens(0, prefix_len)?;
             let new = all.slice_tokens(prefix_len, prefix_len + seq_len)?;

@@ -25,13 +25,12 @@ impl KvFormat {
         }
     }
 
-    /// The format a cache takes when none is requested: int8 (Splash's
-    /// default) where the int8 segmented SDPA kernels serve the model — the
-    /// Metal device, BF16 `compute` (the kernels take BF16 queries; Splash
-    /// is BF16-only), a 256-wide head, and a GQA factor whose 8-row verify
-    /// splits into chunks the kernels launch — and BF16 everywhere else.
-    /// The int8 verify has no fallback: at gqa 16 or with f16 queries a
-    /// block is an error, not a slow path.
+    /// The format a cache takes when none is requested: int8 (Splash
+    /// `RuntimeResourcesConfig::kvFormat`) where the int8 kernels serve the
+    /// model — the Metal device, BF16 `compute` (the kernels take BF16
+    /// queries; Splash is BF16-only), a 256-wide head and whole GQA groups (a
+    /// paged read maps query head h to KV head h / gqa at any gqa) — and BF16
+    /// everywhere else.
     pub fn default_for_geometry(
         head_dim: i64,
         q_heads: i64,
@@ -40,11 +39,8 @@ impl KvFormat {
     ) -> Self {
         let metal = unsafe { mlx_sys::mlx_metal_is_available() }
             && unsafe { mlx_sys::mlx_default_device() } == 1;
-        // Two-pass stage 1 is 32 x gqa x rows threads (<= 1024): an 8-row
-        // block needs chunks of 4 rows, so gqa <= 8.
-        let gqa_fits =
-            kv_heads > 0 && q_heads % kv_heads == 0 && (1..=8).contains(&(q_heads / kv_heads));
-        if metal && compute == DType::BFloat16 && head_dim == 256 && gqa_fits {
+        let whole_groups = kv_heads > 0 && q_heads % kv_heads == 0;
+        if metal && compute == DType::BFloat16 && head_dim == 256 && whole_groups {
             Self::Int8
         } else {
             Self::Bf16
@@ -794,14 +790,14 @@ impl KVCache {
 mod tests {
     use super::*;
 
-    /// Gate: the geometry default is int8 only where the int8 verify serves
-    /// an 8-row block: D256 at gqa 1..=8 with BF16 compute; gqa 16 (122B), a
-    /// non-divisible split, D128, and f16 / f32 compute stay BF16.
-    /// Mutations: drop `gqa_fits` from `default_for_geometry` → red at
-    /// (256, 32, 2); drop the `compute == DType::BFloat16` check → red at
-    /// the f16 / f32 rows.
+    /// Gate: the geometry default is int8 wherever the int8 kernels read the
+    /// model: D256 with whole GQA groups at BF16 compute, the 122B's 32 / 2
+    /// included; a non-divisible split, zero KV heads, D128 and f16 / f32
+    /// compute stay BF16.
+    /// Mutation D1: `default_for_geometry` keeps a `gqa <= 8` clause → red
+    /// at "122B".
     #[test]
-    fn kv_format_default_needs_an_int8_verify_kernel() {
+    fn kv_format_default_is_int8_wherever_the_pool_reads_it() {
         let metal = unsafe { mlx_sys::mlx_metal_is_available() }
             && unsafe { mlx_sys::mlx_default_device() } == 1;
         let int8 = if metal {
@@ -822,7 +818,7 @@ mod tests {
         );
         assert_eq!(
             KvFormat::default_for_geometry(256, 32, 2, bf16),
-            KvFormat::Bf16,
+            int8,
             "122B"
         );
         assert_eq!(

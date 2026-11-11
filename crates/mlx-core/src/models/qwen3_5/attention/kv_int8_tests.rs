@@ -522,28 +522,40 @@ fn int8_routes_are_counted() -> Result<()> {
     Ok(())
 }
 
-/// A production-geometry attention layer (24 x 4 and 16 x 2 heads, D = 256)
-/// over an int8 cache against the same layer over a BF16 cache: a prefill
-/// chunk, a second chunk (dequantized prefix + fresh rows), decode rows (the
-/// int8 decode kernel) and verify blocks (the int8 block kernels). The
-/// outputs stay within the quantization noise of each other, the decode and
-/// verify rows reach the int8 kernels, and the int8 cache holds exactly the
-/// quantized rows.
+/// A production-geometry attention layer (24 x 4, 16 x 2 and the 122B's
+/// 32 x 2 heads, D = 256) over an int8 cache against the same layer over a
+/// BF16 cache: a prefill chunk, a second chunk (dequantized prefix + fresh
+/// rows), decode rows (the int8 decode kernel) and verify blocks of 8 and 5
+/// rows. The outputs stay within the quantization noise of each other, and
+/// the int8 cache holds exactly the quantized rows. Through gqa 8 the decode
+/// and verify rows reach the int8 kernels; at gqa 16 only the decode rows
+/// do: the 8- and 5-row blocks, which the segmented kernels cannot split
+/// there, read the dequantized prefix like a prefill chunk.
 /// Mutation: narrow the gqa bound in `forward_int8_cached` to `1..=6` → red
 /// (16 x 2 dequantizes, int8 kernel count 0; the tolerance alone stays green).
+/// Mutation: `forward_int8_cached` ignores `segmented_int8_covers` → red
+/// (32 x 2 "verify 8": "unsupported segmented SDPA verify block").
 #[test]
 #[cfg(target_os = "macos")]
 fn eager_forward_over_an_int8_cache_tracks_the_bf16_cache() -> Result<()> {
     if !metal() {
         return Ok(());
     }
-    for (h, kv) in [(24_i64, 4_i64), (16, 2)] {
-        eager_forward_over_an_int8_cache_tracks_the_bf16_cache_at(h, kv)?;
+    for (h, kv, int8_reads) in [
+        (24_i64, 4_i64, 6..u64::MAX),
+        (16, 2, 6..u64::MAX),
+        (32, 2, 3..4),
+    ] {
+        eager_forward_over_an_int8_cache_tracks_the_bf16_cache_at(h, kv, int8_reads)?;
     }
     Ok(())
 }
 
-fn eager_forward_over_an_int8_cache_tracks_the_bf16_cache_at(h: i64, kv: i64) -> Result<()> {
+fn eager_forward_over_an_int8_cache_tracks_the_bf16_cache_at(
+    h: i64,
+    kv: i64,
+    expected_int8_reads: std::ops::Range<u64>,
+) -> Result<()> {
     seed_rng(0x1A7_0005);
     let cfg = Qwen3_5Config {
         hidden_size: 64,
@@ -656,8 +668,9 @@ fn eager_forward_over_an_int8_cache_tracks_the_bf16_cache_at(h: i64, kv: i64) ->
     unsafe { mlx_sys::mlx_test_kquant_counting(false) };
     reads?;
     assert!(
-        int8_reads >= 6,
-        "{h}x{kv}: {int8_reads} int8 kernel reads for 3 decode rows and 3 verify blocks"
+        expected_int8_reads.contains(&int8_reads),
+        "{h}x{kv}: {int8_reads} int8 kernel reads for 3 decode rows and 3 verify blocks, \
+         expected {expected_int8_reads:?}"
     );
     assert_eq!(int8.format(), KvFormat::Int8);
     let view = int8.int8_view().expect("int8 cache allocated");
@@ -667,30 +680,34 @@ fn eager_forward_over_an_int8_cache_tracks_the_bf16_cache_at(h: i64, kv: i64) ->
     Ok(())
 }
 
-/// Gate: the static GQA bound of `KvFormat::default_for_geometry` (int8 only
-/// at gqa <= 8) matches this device's int8 verify: an 8-row block splits into
-/// chunks of at most 4 rows at gqa 8, and cannot at gqa 16.
-/// Mutation: widen the bound in `default_for_geometry` to `1..=16` → red
-/// (gqa 16 defaults to int8), as is `kv_format_default_needs_an_int8_verify_kernel`.
+/// Gate: the segmented int8 route splits every block of up to 8 rows through
+/// gqa 8 (the widest query chunk is at least 4 rows, so `segmented_int8_covers`
+/// keeps every flat read there on the segmented kernels), and cannot at gqa
+/// 16 (widest chunk 2 rows): there the C ABI refuses an 8-row block, which
+/// `forward_int8_cached` routes to the dequantizing reader instead.
 #[test]
 #[cfg(target_os = "macos")]
-fn int8_verify_chunks_bound_the_default_gqa() -> Result<()> {
+fn flat_int8_split_covers_every_block_through_gqa_8() -> Result<()> {
     if !metal() {
         return Ok(());
     }
     // SAFETY: a pure query of the loaded metallib's pipeline limits.
     let max_q = |gqa| unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(gqa) };
-    assert!(max_q(8) >= 4);
-    assert!(max_q(16) < 4);
-    assert_eq!(
-        KvFormat::default_for_geometry(256, 16, 2, DType::BFloat16),
-        KvFormat::Int8,
-        "gqa 8"
-    );
-    assert_eq!(
-        KvFormat::default_for_geometry(256, 32, 2, DType::BFloat16),
-        KvFormat::Bf16,
-        "gqa 16"
+    for gqa in 1..=8 {
+        assert!(max_q(gqa) >= 4, "gqa {gqa}: widest chunk {}", max_q(gqa));
+        for rows in 1..=8 {
+            assert!(crate::array::kv_int8::segmented_int8_covers(
+                rows, gqa as i64
+            ));
+        }
+    }
+    assert!(max_q(16) < 4, "gqa 16: widest chunk {}", max_q(16));
+    assert!(crate::array::kv_int8::segmented_int8_covers(4, 16));
+    assert!(!crate::array::kv_int8::segmented_int8_covers(5, 16));
+    let wide = make_case(32, 2, 8, 64, 1.0, 1.0);
+    assert!(
+        segmented_sdpa_int8(&wide.q, &wide.prefix, &wide.new, SCALE, true).is_err(),
+        "32 x 2: an 8-row block must be refused by the segmented kernels"
     );
     Ok(())
 }
