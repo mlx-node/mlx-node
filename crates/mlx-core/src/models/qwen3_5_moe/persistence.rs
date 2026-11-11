@@ -2779,9 +2779,10 @@ mod tests {
             assert_eq!(explicit.kv_format(), format);
             assert_eq!(explicit.kv_format_for(DType::Float16), format);
             assert_eq!(explicit.to_dense_config().kv_format(), format);
+            // A runtime option, never saved (Splash `--kv-format`).
             let restored: Qwen3_5MoeConfig =
                 serde_json::from_value(serde_json::to_value(&explicit).unwrap()).unwrap();
-            assert_eq!(restored.kv_format(), format);
+            assert_eq!(restored.kv_format, None);
         }
     }
 

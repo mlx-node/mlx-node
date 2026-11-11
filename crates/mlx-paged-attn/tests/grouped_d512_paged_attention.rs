@@ -160,8 +160,6 @@ fn run_case(
         q_stride: (num_heads * HEAD_SIZE) as i32,
         kv_block_stride: (num_kv_heads * HEAD_SIZE * BLOCK_SIZE) as i32,
         kv_head_stride: (HEAD_SIZE * BLOCK_SIZE) as i32,
-        k_scale: 1.0,
-        v_scale: 1.0,
         sliding_window: 0,
     };
     let output = unsafe {
@@ -328,8 +326,6 @@ fn benchmark_dispatch(
         q_stride: (num_heads * HEAD_SIZE) as i32,
         kv_block_stride: (num_kv_heads * HEAD_SIZE * BLOCK_SIZE) as i32,
         kv_head_stride: (HEAD_SIZE * BLOCK_SIZE) as i32,
-        k_scale: 1.0,
-        v_scale: 1.0,
         sliding_window: 0,
     };
 
@@ -568,8 +564,6 @@ impl D512OperatorBenchmark {
             q_stride: (TARGET_NUM_HEADS * HEAD_SIZE) as i32,
             kv_block_stride: (TARGET_NUM_KV_HEADS * HEAD_SIZE * BLOCK_SIZE) as i32,
             kv_head_stride: (HEAD_SIZE * BLOCK_SIZE) as i32,
-            k_scale: 1.0,
-            v_scale: 1.0,
             sliding_window: 0,
         };
         let output = state
@@ -605,11 +599,11 @@ impl D512OperatorBenchmark {
         let shared = MTLResourceOptions::StorageModeShared;
         let k_scale = state
             .device
-            .try_new_buffer_with_value(&params.k_scale, shared)
+            .try_new_buffer_with_value(&1.0f32, shared)
             .expect("test buffer-with-value allocation must succeed");
         let v_scale = state
             .device
-            .try_new_buffer_with_value(&params.v_scale, shared)
+            .try_new_buffer_with_value(&1.0f32, shared)
             .expect("test buffer-with-value allocation must succeed");
         let num_kv_heads = state
             .device

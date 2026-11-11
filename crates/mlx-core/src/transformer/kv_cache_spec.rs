@@ -6,7 +6,6 @@ use std::fmt;
 pub enum KVCacheDType {
     Float16,
     BFloat16,
-    Fp8,
 }
 
 /// Physical cache layout. Layers with equal layouts can share a cache group.

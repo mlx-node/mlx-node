@@ -21,8 +21,8 @@ use napi::bindgen_prelude::*;
 /// inputs (non-Metal backend, batch > 1, an unsupported cache dtype, or an
 /// oversized auxiliary buffer), `gather_kv_for_prefill_sdpa` gathers the dense
 /// `[0, total_ctx)` K/V in-graph for an explicit-mask SDPA instead; the
-/// synchronous `read_kv_range` host read remains only as a last resort for
-/// cache dtypes the dense gather cannot serve (FP8).
+/// synchronous `read_kv_range` host read remains only as a last resort when
+/// the dense gather refuses.
 ///
 /// The bridge reads the SAME physical KV bytes as `read_kv_range`; only the
 /// attention kernel differs (fused paged-attn vs explicit-mask SDPA), the

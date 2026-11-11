@@ -122,10 +122,13 @@ pub struct Qwen3_5MoeConfig {
     #[napi(ts_type = "string | undefined")]
     pub qwen35_gguf_gdn_layout: Option<String>,
 
-    /// Flat full-attention cache format, `int8` or `bf16`. Unset: the
-    /// default of `Qwen3_5Config::kv_format_for` (int8 on Metal at head 256
-    /// when the GQA factor is at most 8 and compute is BF16, else BF16).
-    #[serde(default)]
+    /// Full-attention K/V format of the block-paged pool and the flat
+    /// cache, `int8` or `bf16`. Unset: the default of
+    /// `Qwen3_5Config::kv_format_for` (int8 on Metal at head 256 when the
+    /// GQA factor is at most 8, compute is BF16 and a paged block is 16 or
+    /// 32 tokens, else BF16). Never saved (a runtime option, like Splash
+    /// `--kv-format`).
+    #[serde(default, skip_serializing)]
     #[napi(ts_type = "string | undefined")]
     pub kv_format: Option<String>,
 

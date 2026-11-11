@@ -27,26 +27,57 @@ use super::dflash2_decode::{
 };
 use super::dflash2_turn::{DFlash2Target, dflash2_target_kv_dtype, dflash2_target_kv_format};
 
-/// Tokens of the pool every load starts with (Splash `warmupKvPages`).
-const RUNWAY_TOKENS: u32 = 2048;
+/// The pool's element type for `format`. BF16 pages hold any compute dtype
+/// cast to bf16. Int8 pages exist only where mlx-node has the int8 store and
+/// paged attention kernels: head 128 or 256, 16- or 32-token blocks, BF16
+/// rows; any other geometry fails the load, as Splash's start fails when
+/// `compiledAttention` has "no paged-attention kernel for layout" (Splash's
+/// bf16 kernels are geometry-bound the same way).
+pub(crate) fn qwen35_pool_cache_dtype(
+    label: &str,
+    format: KvFormat,
+    head_dim: u32,
+    block_size: u32,
+    compute: DType,
+) -> Result<mlx_paged_attn::metal::MetalDtype> {
+    use mlx_paged_attn::metal::MetalDtype;
+    match format {
+        KvFormat::Bf16 => Ok(MetalDtype::BFloat16),
+        KvFormat::Int8
+            if matches!(head_dim, 128 | 256)
+                && matches!(block_size, 16 | 32)
+                && compute == DType::BFloat16 =>
+        {
+            Ok(MetalDtype::Int8)
+        }
+        KvFormat::Int8 => Err(Error::from_reason(format!(
+            "{label}: no int8 paged attention kernel for head_dim {head_dim}, block size \
+             {block_size}, {compute:?} compute; load with kvFormat 'bf16'"
+        ))),
+    }
+}
 
-/// The blocks a pool starts with: the runway's tokens and one request's
-/// recurrent state.
+/// The blocks a pool starts with: `layout`'s runway pages (Splash
+/// `kvRunwayPages(minimumExtentPages)`) and one request's recurrent state,
+/// which the scheduler charges inside the pool.
 pub(crate) fn qwen35_runway_blocks(
     block_size: u32,
     bytes_per_block: u64,
     recurrent_state_bytes: u64,
+    layout: &KvLayout,
 ) -> u32 {
-    RUNWAY_TOKENS.div_ceil(block_size.max(1)).saturating_add(
-        recurrent_state_bytes
-            .div_ceil(bytes_per_block.max(1))
-            .min(u64::from(u32::MAX)) as u32,
-    )
+    let tokens = layout.runway_pages() * crate::engine::memory_plan::KV_PAGE_TOKENS;
+    tokens
+        .div_ceil(u64::from(block_size.max(1)))
+        .saturating_add(recurrent_state_bytes.div_ceil(bytes_per_block.max(1)))
+        .min(u64::from(u32::MAX)) as u32
 }
 
-/// The paged pool a load builds: BF16 blocks over the full-attention layers.
+/// The paged pool a load builds: blocks of `format` over the full-attention
+/// layers.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PoolGeometry {
+    pub format: KvFormat,
     pub bytes_per_block: u64,
     pub block_size: u32,
     pub layers: u32,
@@ -84,6 +115,17 @@ pub(crate) struct LoadLanes<'a> {
     /// lane's without a pool and a draft).
     pub format: KvFormat,
     pub dtype: DType,
+    /// The load can run an MTP turn on the pool lane (MTP heads, no
+    /// DFlash2 draft): the lane holds its draft state at the window.
+    pub mtp: bool,
+    /// The scheduler books that state inside the pool as well.
+    pub mtp_state_in_pool: bool,
+}
+
+/// Whether the hybrid scheduler serves this process's Qwen3.5 turns: it
+/// books lane state inside the pool.
+pub(crate) fn qwen35_scheduler_books_state_in_pool() -> bool {
+    super::model::Qwen35SchedulerState::continuous_batching_enabled()
 }
 
 /// Splash `evaluateEngineMemoryPlan` over `lanes` on the device `live`.
@@ -114,30 +156,47 @@ pub(crate) fn evaluate_qwen35_plan(
     let trained = config.served_context_tokens();
     let fa_layers = config.full_attention_layer_count();
     let kernels = PrefillSdpaKernels::probe(config.head_dim);
-    let pool_transient = |window| pool_lane_transient(config, DType::BFloat16, kernels, window);
-    let pool_input = lanes.pool.map(|geometry| PoolInput {
-        shape: LaneShape {
-            trained,
-            lane_bytes: recurrent_state_bytes,
-            layout: KvLayout::of(
-                fa_layers,
-                config.num_kv_heads,
-                config.head_dim,
-                DType::BFloat16,
-                KvFormat::Bf16,
+    let pool_format = lanes
+        .pool
+        .map_or(KvFormat::Bf16, |geometry| geometry.format);
+    let pool_transient = |window| pool_lane_transient(config, pool_format, kernels, window);
+    let mtp = lanes.mtp;
+    let mtp_state = |window: u32| {
+        if mtp {
+            super::scheduled_mtp::ScheduledMtpState::held_bytes(config, window)
+        } else {
+            0
+        }
+    };
+    let pool_input = lanes.pool.map(|geometry| {
+        let layout = KvLayout::of(
+            fa_layers,
+            config.num_kv_heads,
+            config.head_dim,
+            DType::BFloat16,
+            geometry.format,
+        );
+        PoolInput {
+            shape: LaneShape {
+                trained,
+                lane_bytes: recurrent_state_bytes,
+                layout,
+                scratch_rows: SPECULATIVE_SCRATCH_TOKENS,
+                transient: &pool_transient,
+            },
+            bytes_per_block: geometry.bytes_per_block,
+            layers: u64::from(geometry.layers),
+            runway_blocks: qwen35_runway_blocks(
+                geometry.block_size,
+                geometry.bytes_per_block,
+                recurrent_state_bytes,
+                &layout,
             ),
-            scratch_rows: SPECULATIVE_SCRATCH_TOKENS,
-            transient: &pool_transient,
-        },
-        bytes_per_block: geometry.bytes_per_block,
-        layers: u64::from(geometry.layers),
-        runway_blocks: qwen35_runway_blocks(
-            geometry.block_size,
-            geometry.bytes_per_block,
-            recurrent_state_bytes,
-        ),
-        explicit_mib: geometry.explicit_mib,
-        lane_in_pool: true,
+            explicit_mib: geometry.explicit_mib,
+            lane_in_pool: true,
+            state: &mtp_state,
+            state_in_pool: mtp && lanes.mtp_state_in_pool,
+        }
     });
     let (block_size, tap_layers) =
         draft.map_or((0, 0), |draft| (draft.block_size, draft.tap_layers));
@@ -227,6 +286,7 @@ pub(crate) fn plan_qwen35_load<T: DFlash2Target>(
     label: &str,
     target: &T,
     recurrent_state_bytes: u64,
+    mtp_weights: bool,
     pool: Option<PoolGeometry>,
     max_memory_bytes: Option<u64>,
     max_context: Option<u32>,
@@ -244,6 +304,8 @@ pub(crate) fn plan_qwen35_load<T: DFlash2Target>(
         draft: draft.map(|draft| DraftTerms::of(&draft.config, draft.weight_bytes)),
         format: dflash2_target_kv_format(target),
         dtype: dflash2_target_kv_dtype(target)?,
+        mtp: mtp_weights && draft.is_none(),
+        mtp_state_in_pool: qwen35_scheduler_books_state_in_pool(),
     };
     let plan = evaluate_qwen35_plan(label, &lanes, live, max_memory_bytes)?;
     check_qwen35_max_context(label, &plan, max_context)?;
@@ -298,9 +360,9 @@ pub(crate) fn max_memory_option(label: &str, value: Option<i64>) -> Result<Optio
 #[napi(object)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Qwen35ContextEstimate {
-    /// Tokens a non-DFlash2 turn may hold: the pool lane's, the flat lane's
-    /// without a pool and a draft, the trained window with a draft and no
-    /// pool.
+    /// Tokens a non-DFlash2 turn (AR, vision, MTP) may hold: the pool
+    /// lane's, the flat lane's without a pool and a draft, the trained
+    /// window with a draft and no pool.
     pub window_tokens: u32,
     /// Tokens a DFlash2 turn may hold; set only with a draft.
     pub speculative_window_tokens: Option<u32>,
@@ -470,15 +532,23 @@ pub(crate) fn estimate_qwen35_load(
     {
         let layers = config.full_attention_layer_count() as u32;
         let block_size = config.paged_block_size();
+        let cache_dtype = qwen35_pool_cache_dtype(
+            label,
+            format,
+            config.head_dim as u32,
+            block_size,
+            DType::BFloat16,
+        )?;
         let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
             layers,
             config.num_kv_heads as u32,
             config.head_dim as u32,
             block_size,
-            mlx_paged_attn::metal::MetalDtype::BFloat16,
+            cache_dtype,
         )
         .map_err(|error| Error::from_reason(format!("{label} block-paged adapter: {error}")))?;
         Some(PoolGeometry {
+            format,
             bytes_per_block,
             block_size,
             layers,
@@ -504,6 +574,8 @@ pub(crate) fn estimate_qwen35_load(
         draft,
         format,
         dtype: DType::BFloat16,
+        mtp: config.n_mtp_layers > 0 && draft.is_none(),
+        mtp_state_in_pool: qwen35_scheduler_books_state_in_pool(),
     };
     let plan = evaluate_qwen35_plan(label, &lanes, live, input.max_memory_bytes)?;
     check_qwen35_max_context(label, &plan, input.max_context)?;

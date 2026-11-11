@@ -58,7 +58,7 @@ fn qwen38_plan(
 ) -> Result<MemoryPlan, PlanError> {
     let cfg = qwen38_27b_cfg();
     assert_eq!(cfg.recurrent_state_bytes(), QWEN38_CELL);
-    let pool_transient = |window| pool_lane_transient(&cfg, DType::BFloat16, KERNELS, window);
+    let pool_transient = |window| pool_lane_transient(&cfg, KvFormat::Bf16, KERNELS, window);
     let flat_transient = |window| {
         dflash2_lane_transient(
             &cfg,
@@ -81,6 +81,8 @@ fn qwen38_plan(
         runway_blocks: QWEN38_RUNWAY_BLOCKS,
         explicit_mib,
         lane_in_pool: true,
+        state: &|_| 0,
+        state_in_pool: false,
     };
     let speculative = draft.then(|| FlatInput {
         shape: LaneShape {
@@ -309,7 +311,6 @@ fn pool_below_the_config_floor_validates() {
             head_size: cfg.head_dim as u32,
             num_kv_heads: cfg.num_kv_heads as u32,
             num_layers: cfg.full_attention_layer_count() as u32,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(cfg.max_position_embeddings as u32),
             max_batch_size: Some(32),
         }
@@ -366,7 +367,7 @@ fn chunk_transient_counts_one_chunk_of_taps() {
         276_824_064 + 104_857_600 + 25_165_824
     );
     assert_eq!(
-        pool_lane_transient(&cfg, DType::BFloat16, KERNELS, 2_048),
+        pool_lane_transient(&cfg, KvFormat::Bf16, KERNELS, 2_048),
         276_824_064 + 134_217_728
     );
 }
@@ -705,6 +706,8 @@ fn flash_next_pool<'a>(
         runway_blocks: layout.runway_pages() as u32,
         explicit_mib: None,
         lane_in_pool,
+        state: &|_| 0,
+        state_in_pool: false,
     }
 }
 

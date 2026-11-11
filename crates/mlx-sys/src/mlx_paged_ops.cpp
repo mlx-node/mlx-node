@@ -91,7 +91,7 @@ int64_t distinct_live_blocks(
 // Derive `x_pack` (the inner-axis vLLM K-pool packing factor) from the
 // on-cache KV dtype. `x_pack` is `16 / sizeof(scalar)`:
 //   - Fp16 / Bf16 (2 bytes) → x_pack = 8
-//   - Fp8 (1 byte)          → x_pack = 16
+//   - Int8 (1 byte)         → x_pack = 16
 // Used by the public factories to validate `k_pool.shape(2)` and
 // `k_pool.shape(4)` against the dtype-derived layout.
 int x_pack_for(KvDtype kv_dtype) {
@@ -99,7 +99,6 @@ int x_pack_for(KvDtype kv_dtype) {
     case KvDtype::Fp16:
     case KvDtype::Bf16:
       return 8;
-    case KvDtype::Fp8:
     case KvDtype::Int8:
       return 16;
   }
@@ -108,17 +107,13 @@ int x_pack_for(KvDtype kv_dtype) {
 }
 
 // Map the `KvDtype` enum to the matching MLX `Dtype` for io tensors:
-//   - non-FP8 cache → io dtype == cache dtype
-//   - FP8 cache     → io dtype == bfloat16 (matches
-//                     `MetalState::reshape_and_cache_kernel_name`'s
-//                     `(bfloat16_t, uchar)` instantiation)
+// io == cache for Fp16/Bf16, bfloat16 for Int8.
 mlx::core::Dtype io_dtype_for_kv_dtype(KvDtype kv_dtype) {
   switch (kv_dtype) {
     case KvDtype::Fp16:
       return mlx::core::float16;
     case KvDtype::Bf16:
       return mlx::core::bfloat16;
-    case KvDtype::Fp8:
     case KvDtype::Int8:
       return mlx::core::bfloat16;
   }
@@ -130,16 +125,13 @@ mlx::core::Dtype io_dtype_for_kv_dtype(KvDtype kv_dtype) {
 // (K/V pool) storage:
 //   - Fp16 cache → float16
 //   - Bf16 cache → bfloat16
-//   - Fp8 cache  → uint8 (FP8 stored opaquely as bytes; the kernel
-//                  reinterprets via `to_cache<KV_T, uchar>` below)
+//   - Int8 cache → int8
 mlx::core::Dtype cache_dtype_for_kv_dtype(KvDtype kv_dtype) {
   switch (kv_dtype) {
     case KvDtype::Fp16:
       return mlx::core::float16;
     case KvDtype::Bf16:
       return mlx::core::bfloat16;
-    case KvDtype::Fp8:
-      return mlx::core::uint8;
     case KvDtype::Int8:
       return mlx::core::int8;
   }
@@ -157,8 +149,6 @@ mlx::core::fast::paged::KvDtype to_paged_dtype(KvDtype d) {
       return mlx::core::fast::paged::KvDtype::Fp16;
     case KvDtype::Bf16:
       return mlx::core::fast::paged::KvDtype::Bf16;
-    case KvDtype::Fp8:
-      return mlx::core::fast::paged::KvDtype::Fp8;
     case KvDtype::Int8:
       return mlx::core::fast::paged::KvDtype::Int8;
   }
@@ -170,18 +160,16 @@ static_assert(
         static_cast<uint8_t>(mlx::core::fast::paged::KvDtype::Fp16) &&
     static_cast<uint8_t>(KvDtype::Bf16) ==
         static_cast<uint8_t>(mlx::core::fast::paged::KvDtype::Bf16) &&
-    static_cast<uint8_t>(KvDtype::Fp8) ==
-        static_cast<uint8_t>(mlx::core::fast::paged::KvDtype::Fp8) &&
     static_cast<uint8_t>(KvDtype::Int8) ==
         static_cast<uint8_t>(mlx::core::fast::paged::KvDtype::Int8));
 
 // Every C ABI entry takes the dtype as a raw byte; one outside the enum
 // would misroute the kernel template selection.
 void require_known_kv_dtype(uint8_t kv_dtype_raw) {
-  if (kv_dtype_raw > static_cast<uint8_t>(KvDtype::Int8)) {
+  if (kv_dtype_raw == 2 || kv_dtype_raw > static_cast<uint8_t>(KvDtype::Int8)) {
     std::ostringstream msg;
     msg << "invalid kv_dtype_raw " << static_cast<int>(kv_dtype_raw)
-        << "; expected 0 (Fp16), 1 (Bf16), 2 (Fp8) or 3 (Int8)";
+        << "; expected 0 (Fp16), 1 (Bf16) or 3 (Int8)";
     throw std::invalid_argument(msg.str());
   }
 }
@@ -406,8 +394,7 @@ void validate_paged_kv_write_inputs(
       msg << "[validator] [" << op_name << "] new_k dtype " << new_k.dtype()
           << " disagrees with the expected io dtype "
           << expected_io_dtype << " for kv_dtype "
-          << static_cast<int>(kv_dtype)
-          << " (FP8 io dtype is bfloat16 per Phase 1 contract)";
+          << static_cast<int>(kv_dtype);
       throw std::invalid_argument(msg.str());
     }
     if (new_v.dtype() != expected_io_dtype) {
@@ -415,8 +402,7 @@ void validate_paged_kv_write_inputs(
       msg << "[validator] [" << op_name << "] new_v dtype " << new_v.dtype()
           << " disagrees with the expected io dtype "
           << expected_io_dtype << " for kv_dtype "
-          << static_cast<int>(kv_dtype)
-          << " (FP8 io dtype is bfloat16 per Phase 1 contract)";
+          << static_cast<int>(kv_dtype);
       throw std::invalid_argument(msg.str());
     }
   }
@@ -698,8 +684,7 @@ void validate_paged_attention_inputs(
       msg << "[validator] [" << op_name << "] q dtype " << q.dtype()
           << " disagrees with the expected io dtype "
           << expected_io_dtype << " for kv_dtype "
-          << static_cast<int>(kv_dtype)
-          << " (FP8 io dtype is bfloat16 per Phase 1 contract)";
+          << static_cast<int>(kv_dtype);
       throw std::invalid_argument(msg.str());
     }
     auto expected_cache_dtype = cache_dtype_for_kv_dtype(kv_dtype);
@@ -2602,8 +2587,7 @@ namespace {
 // Helper: invoke `paged_attention(...)` with a custom (q, k_pool,
 // v_pool, block_table, seq_lens) and well-formed scalar state. Returns
 // 1 on `std::invalid_argument`, 0 otherwise. Used by the negative-test
-// helpers below to keep them concise. `kv_dtype` defaults to `Bf16`;
-// Fp8 cases pass `kv_dtype = Fp8`.
+// helpers below to keep them concise. `kv_dtype` defaults to `Bf16`.
 int call_paged_attention_expecting_throw(
     const mlx::core::array& q,
     const mlx::core::array& k_pool,
@@ -2642,8 +2626,7 @@ int call_paged_attention_expecting_throw(
 }
 
 // Helper: invoke `paged_kv_write(...)` with custom inputs and the
-// supplied (kv_dtype, x_pack) pair. Used with `KvDtype::Fp8 + x_pack=16`
-// to validate FP8 dtype rejection.
+// supplied (kv_dtype, x_pack) pair.
 int call_paged_kv_write_expecting_throw(
     const mlx::core::array& k_pool,
     const mlx::core::array& v_pool,
@@ -3560,36 +3543,6 @@ int mlx_paged_kv_write_factory_rejects_new_v_dtype_bf16() {
       k_pool, v_pool, new_k, new_v, slot_mapping);
 }
 
-/// k_pool dtype is bfloat16 instead of the expected uint8 for Fp8.
-int mlx_paged_kv_write_factory_rejects_k_pool_dtype_fp8() {
-  using namespace mlx::core;
-  using namespace mlx::core::fast;
-  // FP8 expects k_pool/v_pool dtype = uint8, x_pack = 16, head_size/x = 4.
-  // We pass bfloat16 for the pools to trigger the kv_dtype check.
-  array k_pool(Shape{4, 4, 4, 16, 16}, bfloat16, nullptr, {});
-  array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
-  array new_k(Shape{2, 4, 64}, bfloat16, nullptr, {});
-  array new_v(Shape{2, 4, 64}, bfloat16, nullptr, {});
-  array slot_mapping(Shape{2}, int64, nullptr, {});
-  return call_paged_kv_write_expecting_throw(
-      k_pool, v_pool, new_k, new_v, slot_mapping, KvDtype::Fp8, /*x_pack=*/16);
-}
-
-/// new_k dtype is float16 instead of the expected bfloat16 for Fp8.
-int mlx_paged_kv_write_factory_rejects_new_k_dtype_fp8() {
-  using namespace mlx::core;
-  using namespace mlx::core::fast;
-  array k_pool(Shape{4, 4, 4, 16, 16}, uint8, nullptr, {});
-  array v_pool(Shape{4, 4, 64, 16}, uint8, nullptr, {});
-  // new_k/new_v float16 — pair agrees, but the contract demands
-  // bfloat16 io for FP8 cache.
-  array new_k(Shape{2, 4, 64}, float16, nullptr, {});
-  array new_v(Shape{2, 4, 64}, float16, nullptr, {});
-  array slot_mapping(Shape{2}, int64, nullptr, {});
-  return call_paged_kv_write_expecting_throw(
-      k_pool, v_pool, new_k, new_v, slot_mapping, KvDtype::Fp8, /*x_pack=*/16);
-}
-
 // =============================================================================
 // Dtype-mismatch negative tests for paged_attention.
 //
@@ -3599,6 +3552,18 @@ int mlx_paged_kv_write_factory_rejects_new_k_dtype_fp8() {
 // well-formed EXCEPT for one dtype slot, then assert
 // `std::invalid_argument` is thrown.
 // =============================================================================
+
+/// The retired code 2 (paged FP8) is refused like any unknown kv_dtype.
+int mlx_paged_kv_dtype_refuses_retired_code() {
+  try {
+    mlx::core::fast::require_known_kv_dtype(2);
+  } catch (const std::invalid_argument&) {
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+  return 0;
+}
 
 /// q dtype is float32 instead of the expected bfloat16 for Bf16.
 int mlx_paged_attention_factory_rejects_q_dtype_bf16() {
@@ -3613,22 +3578,6 @@ int mlx_paged_attention_factory_rejects_q_dtype_bf16() {
       q, k_pool, v_pool, block_table, seq_lens);
 }
 
-/// q dtype is float16 instead of the expected bfloat16 for Fp8.
-int mlx_paged_attention_factory_rejects_q_dtype_fp8() {
-  using namespace mlx::core;
-  using namespace mlx::core::fast;
-  // FP8 cache: q must be bfloat16. Pass float16 to trigger the throw.
-  // Pools at FP8-correct (uint8, x_pack=16) so the q-dtype check is the
-  // only mismatch.
-  array q(Shape{1, 8, 64}, float16, nullptr, {});
-  array k_pool(Shape{4, 4, 4, 16, 16}, uint8, nullptr, {});
-  array v_pool(Shape{4, 4, 64, 16}, uint8, nullptr, {});
-  array block_table(Shape{1, 4}, int32, nullptr, {});
-  array seq_lens(Shape{1}, int32, nullptr, {});
-  return call_paged_attention_expecting_throw(
-      q, k_pool, v_pool, block_table, seq_lens, KvDtype::Fp8);
-}
-
 /// k_pool dtype is uint8 instead of the expected bfloat16 for Bf16.
 int mlx_paged_attention_factory_rejects_k_pool_dtype_bf16() {
   using namespace mlx::core;
@@ -3640,20 +3589,6 @@ int mlx_paged_attention_factory_rejects_k_pool_dtype_bf16() {
   array seq_lens(Shape{1}, int32, nullptr, {});
   return call_paged_attention_expecting_throw(
       q, k_pool, v_pool, block_table, seq_lens);
-}
-
-/// k_pool dtype is bfloat16 instead of the expected uint8 for Fp8.
-int mlx_paged_attention_factory_rejects_k_pool_dtype_fp8() {
-  using namespace mlx::core;
-  using namespace mlx::core::fast;
-  array q(Shape{1, 8, 64}, bfloat16, nullptr, {});
-  // FP8 expects pools = uint8, x_pack = 16. Pass bfloat16 to trigger.
-  array k_pool(Shape{4, 4, 4, 16, 16}, bfloat16, nullptr, {});
-  array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
-  array block_table(Shape{1, 4}, int32, nullptr, {});
-  array seq_lens(Shape{1}, int32, nullptr, {});
-  return call_paged_attention_expecting_throw(
-      q, k_pool, v_pool, block_table, seq_lens, KvDtype::Fp8);
 }
 
 // =============================================================================
@@ -5917,7 +5852,7 @@ int mlx_paged_kv_write_eval_gpu_rejects_zero_head_size() {
   }
 }
 
-/// Primitive directly constructed with `x_pack_=16` (Fp8 value)
+/// Primitive directly constructed with `x_pack_=16` (Int8 value)
 /// while `kv_dtype_=Bf16` (which expects x_pack=8). eval_gpu's
 /// validator must reject; otherwise the K-pool layout assumed by
 /// the kernel would disagree with what the dispatch path encodes.

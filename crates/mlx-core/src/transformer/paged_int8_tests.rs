@@ -25,7 +25,6 @@ pub(crate) fn pool_config() -> PagedAttentionConfig {
         head_size: DIM as u32,
         num_kv_heads: HEADS as u32,
         num_layers: LAYERS,
-        use_fp8_cache: Some(false),
         max_seq_len: Some(1024),
         max_batch_size: Some(4),
     }
@@ -658,4 +657,129 @@ fn int8_adapter_entries_write_and_read() {
             "{entry}: max |d| {max} > magnitude {magnitude} / 32"
         );
     }
+}
+
+/// `[tokens, heads, dim]` bf16 queries of about ±0.002.
+fn wide_queries(tokens: usize, heads: usize, dim: usize, seed: u32) -> Vec<f32> {
+    let mut state = seed.wrapping_mul(747_796_405).wrapping_add(7);
+    (0..tokens * heads * dim)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (((state >> 8) % 4001) as f32 / 1000.0 - 2.0) / 1000.0
+        })
+        .collect()
+}
+
+fn bf16_array(values: &[f32], shape: &[i64]) -> MxArray {
+    MxArray::from_float32(values, shape)
+        .and_then(|array| array.astype(DType::BFloat16))
+        .expect("bf16 array")
+}
+
+fn host(array: &MxArray) -> Vec<f32> {
+    array
+        .astype(DType::Float32)
+        .and_then(|array| array.to_float32())
+        .expect("read back")
+        .to_vec()
+}
+
+/// One sequence of `tokens` seeded rows in a one-layer int8 pool (D 256,
+/// 4 heads, bs 16), written 2,048 rows at a time.
+fn long_int8_adapter(tokens: u32) -> Option<PagedKVCacheAdapter> {
+    let config = PagedAttentionConfig {
+        num_layers: 1,
+        max_seq_len: Some(tokens + 2048),
+        ..pool_config_d256()
+    };
+    let blocks = tokens.div_ceil(BS as u32) + 1;
+    let (mut adapter, _) = adapter_for(config, blocks, blocks, MetalDtype::Int8)?;
+    adapter.begin_request(1).unwrap();
+    adapter.allocate_suffix_blocks(tokens).unwrap();
+    let mut first = 0u32;
+    while first < tokens {
+        let rows = (tokens - first).min(2048) as usize;
+        adapter
+            .record_tokens(
+                &(first..first + rows as u32)
+                    .map(|t| t % 1000)
+                    .collect::<Vec<u32>>(),
+            )
+            .unwrap();
+        let (keys, _) = shaped_rows(rows, D256_HEADS, D256_DIM, 100 + first, None);
+        let (values, _) = shaped_rows(rows, D256_HEADS, D256_DIM, 200 + first, None);
+        adapter
+            .update_keys_values_native(0, &keys, &values, first)
+            .unwrap();
+        adapter.eval_pending_pool_writes().unwrap();
+        first += rows as u32;
+    }
+    Some(adapter)
+}
+
+/// The varlen read of the last `rows` of `context` tokens, and each sampled
+/// row read alone: the same bits (a row's partitions and reduce read only
+/// that row, however the dispatch tiles the rows).
+fn varlen_rows_match_single_rows(
+    adapter: &mut PagedKVCacheAdapter,
+    context: u32,
+    rows: usize,
+    sampled: &[usize],
+) {
+    const QUERY_HEADS_D256: usize = 24;
+    let scale = 1.0 / (D256_DIM as f32).sqrt();
+    let width = QUERY_HEADS_D256 * D256_DIM;
+    let q = wide_queries(rows, QUERY_HEADS_D256, D256_DIM, context);
+    let prefix = context - rows as u32;
+    let all = adapter
+        .gather_kv_for_prefill_chunk_varlen(
+            0,
+            &bf16_array(&q, &[rows as i64, QUERY_HEADS_D256 as i64, D256_DIM as i64]),
+            prefix,
+            scale,
+        )
+        .unwrap_or_else(|error| panic!("context {context} rows {rows}: {error}"));
+    let all = host(&all);
+    assert!(
+        all.iter().all(|value| value.is_finite()),
+        "context {context}: non-finite output"
+    );
+    for &row in sampled {
+        let one = adapter
+            .gather_kv_for_prefill_chunk_varlen(
+                0,
+                &bf16_array(
+                    &q[row * width..(row + 1) * width],
+                    &[1, QUERY_HEADS_D256 as i64, D256_DIM as i64],
+                ),
+                prefix + row as u32,
+                scale,
+            )
+            .unwrap();
+        let one = host(&one);
+        let got = &all[row * width..(row + 1) * width];
+        assert!(
+            got.iter()
+                .zip(&one)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "context {context} row {row}: the {rows}-row read differs from the row alone"
+        );
+    }
+}
+
+/// An int8 prefill chunk reads past the 87,040-token context where one
+/// launch's partials (2,048 rows x 24 heads x 512-token partitions x 256)
+/// pass INT_MAX: the dispatch runs the rows in tiles of at most 2,048
+/// row-partitions (Splash `PagedAttention::prefillWorkspace`), and every
+/// row keeps the bits of its own one-row read; a 512-row chunk at 9,000
+/// tokens (113-row tiles) too.
+///
+/// Mutation V1: the dispatch runs one tile → INT_MAX refusal → red.
+#[test]
+fn int8_varlen_prefill_reads_past_the_aux_cap() {
+    let Some(mut adapter) = long_int8_adapter(90_000) else {
+        return;
+    };
+    varlen_rows_match_single_rows(&mut adapter, 9_000, 512, &[0, 112, 113, 511]);
+    varlen_rows_match_single_rows(&mut adapter, 90_000, 2048, &[0, 1000, 2047]);
 }

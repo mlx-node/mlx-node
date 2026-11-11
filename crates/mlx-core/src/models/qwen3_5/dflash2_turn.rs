@@ -3912,7 +3912,6 @@ mod tests {
             head_size: 64,
             num_kv_heads: 1,
             num_layers: 2,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(max * block_size),
             max_batch_size: Some(1),
         };

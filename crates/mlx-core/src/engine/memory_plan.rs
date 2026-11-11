@@ -393,15 +393,23 @@ pub(crate) struct PoolInput<'a> {
     /// The lane's state takes pool blocks as well as its own bytes; `false`
     /// holds it beside the pool only.
     pub lane_in_pool: bool,
+    /// Lane state that grows with the window `W` (a speculative turn's
+    /// draft state), charged like `lane_bytes`: Splash `laneStateBytes`
+    /// carries every speculative buffer of the lane beside its KV.
+    pub state: &'a dyn Fn(u32) -> u64,
+    /// `state` takes pool blocks as well (the scheduler books it there).
+    pub state_in_pool: bool,
 }
 
 impl PoolInput<'_> {
-    fn kv(&self, cap_blocks: Option<u64>) -> LaneKv {
+    fn kv(&self, cap_blocks: Option<u64>) -> LaneKv<'_> {
         LaneKv::Pool {
             bytes_per_block: self.bytes_per_block,
             layers: self.layers,
             cap_blocks,
             lane_in_pool: self.lane_in_pool,
+            state: self.state,
+            state_in_pool: self.state_in_pool,
         }
     }
 
@@ -692,12 +700,14 @@ fn largest_window(most: u32, fits: impl Fn(u32) -> bool) -> u32 {
 
 /// How a lane's KV budget at a window follows from the dynamic budget.
 #[derive(Clone, Copy)]
-enum LaneKv {
+enum LaneKv<'a> {
     Pool {
         bytes_per_block: u64,
         layers: u64,
         cap_blocks: Option<u64>,
         lane_in_pool: bool,
+        state: &'a dyn Fn(u32) -> u64,
+        state_in_pool: bool,
     },
     Flat {
         held_bytes: u64,
@@ -705,7 +715,15 @@ enum LaneKv {
     },
 }
 
-impl LaneKv {
+impl LaneKv<'_> {
+    /// The lane's window-dependent state at `window`.
+    fn state_bytes(&self, window: u32) -> u64 {
+        match *self {
+            Self::Pool { state, .. } => state(window),
+            Self::Flat { .. } => 0,
+        }
+    }
+
     fn copy_bytes(&self, shape: &LaneShape<'_>, window: u32) -> u64 {
         match *self {
             Self::Pool { .. }
@@ -730,18 +748,23 @@ impl LaneKv {
                 layers,
                 cap_blocks,
                 lane_in_pool,
+                state,
+                state_in_pool,
             } => {
                 // The lane state lives outside the pool (Splash
                 // availableForOneRequestKv = dynamic - laneStateBytes).
+                let state = state(window);
                 let pool = u128::from(
                     dynamic
                         .saturating_sub(transient)
-                        .saturating_sub(shape.lane_bytes),
+                        .saturating_sub(shape.lane_bytes)
+                        .saturating_sub(state),
                 ) * u128::from(layers)
                     / u128::from(layers + 1);
                 let blocks = (pool / u128::from(bytes_per_block.max(1))) as u64;
                 let blocks = cap_blocks.map_or(blocks, |cap| blocks.min(cap));
-                let in_pool = if lane_in_pool { shape.lane_bytes } else { 0 };
+                let in_pool = if lane_in_pool { shape.lane_bytes } else { 0 }
+                    .saturating_add(if state_in_pool { state } else { 0 });
                 let kv = blocks
                     .saturating_mul(bytes_per_block)
                     .saturating_sub(in_pool);
@@ -767,7 +790,7 @@ impl LaneKv {
 }
 
 /// One lane's plan and the pool blocks at its window (0 for a flat lane).
-fn plan_lane(dynamic: u64, shape: &LaneShape<'_>, kv: LaneKv) -> (LanePlan, u64) {
+fn plan_lane(dynamic: u64, shape: &LaneShape<'_>, kv: LaneKv<'_>) -> (LanePlan, u64) {
     let fits = |window: u32| {
         let (_, bytes) = kv.budget(dynamic, shape, window);
         resident_tokens(&shape.layout, bytes, shape.scratch_rows) >= u64::from(window)
@@ -788,6 +811,7 @@ fn plan_lane(dynamic: u64, shape: &LaneShape<'_>, kv: LaneKv) -> (LanePlan, u64)
     let runway_tokens = (runway_pages * KV_PAGE_TOKENS).min(u64::from(u32::MAX)) as u32;
     let minimum_bytes = shape
         .lane_bytes
+        .saturating_add(kv.state_bytes(runway_tokens))
         .saturating_add(kv.held_bytes())
         .saturating_add(runway_pages.saturating_mul(page))
         .saturating_add((shape.transient)(runway_tokens));
@@ -796,7 +820,7 @@ fn plan_lane(dynamic: u64, shape: &LaneShape<'_>, kv: LaneKv) -> (LanePlan, u64)
             window: shape.trained,
             resident: window,
         },
-        lane_bytes: shape.lane_bytes,
+        lane_bytes: shape.lane_bytes.saturating_add(kv.state_bytes(window)),
         extent_pages,
         capacity_pages,
         kv_bytes,
@@ -910,11 +934,18 @@ impl MemoryPlan {
             });
         }
         let layout = input.shape.layout;
+        let runway_tokens =
+            (layout.runway_pages() * KV_PAGE_TOKENS).min(u64::from(u32::MAX)) as u32;
         let in_pool = if input.lane_in_pool {
             input.shape.lane_bytes
         } else {
             0
-        };
+        }
+        .saturating_add(if input.state_in_pool {
+            (input.state)(runway_tokens)
+        } else {
+            0
+        });
         let minimum_blocks = in_pool
             .saturating_add(layout.runway_pages() * layout.page_bytes())
             .div_ceil(bytes_per_block);

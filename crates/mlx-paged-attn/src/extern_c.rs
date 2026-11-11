@@ -52,7 +52,6 @@ use crate::metal::{
 pub enum KvDtypeC {
     Fp16 = 0,
     Bf16 = 1,
-    Fp8 = 2,
     Int8 = 3,
 }
 
@@ -61,14 +60,8 @@ impl KvDtypeC {
         match self {
             KvDtypeC::Fp16 => MetalDtype::Float16,
             KvDtypeC::Bf16 => MetalDtype::BFloat16,
-            KvDtypeC::Fp8 => MetalDtype::UChar,
             KvDtypeC::Int8 => MetalDtype::Int8,
         }
-    }
-
-    /// Whether this dtype represents an FP8 (1-byte) cache layout.
-    fn is_fp8(self) -> bool {
-        matches!(self, KvDtypeC::Fp8)
     }
 
     /// `x` factor for the vLLM K layout: 16 / sizeof(dtype).
@@ -76,7 +69,7 @@ impl KvDtypeC {
     fn expected_x(self) -> i32 {
         match self {
             KvDtypeC::Fp16 | KvDtypeC::Bf16 => 8,
-            KvDtypeC::Fp8 | KvDtypeC::Int8 => 16,
+            KvDtypeC::Int8 => 16,
         }
     }
 }
@@ -85,7 +78,6 @@ fn parse_kv_dtype(raw: u8) -> Option<KvDtypeC> {
     match raw {
         0 => Some(KvDtypeC::Fp16),
         1 => Some(KvDtypeC::Bf16),
-        2 => Some(KvDtypeC::Fp8),
         3 => Some(KvDtypeC::Int8),
         _ => None,
     }
@@ -142,8 +134,6 @@ pub unsafe extern "C" fn mlx_paged_attn_reshape_and_cache_dispatch(
     block_size: u32,
     x_pack: i32,
     kv_dtype_raw: u8,
-    k_scale: f32,
-    v_scale: f32,
 ) -> i32 {
     if key_pool_buffer.is_null()
         || value_pool_buffer.is_null()
@@ -183,13 +173,8 @@ pub unsafe extern "C" fn mlx_paged_attn_reshape_and_cache_dispatch(
         return 0;
     }
 
-    // io dtype = cache dtype for non-FP8, BF16 for FP8.
     let cache_dtype = kv_dtype.to_metal();
-    let input_dtype = if kv_dtype.is_fp8() {
-        MetalDtype::BFloat16
-    } else {
-        cache_dtype
-    };
+    let input_dtype = cache_dtype.io_dtype();
 
     let key_stride = (num_kv_heads * head_size) as i32;
     let value_stride = key_stride;
@@ -202,8 +187,6 @@ pub unsafe extern "C" fn mlx_paged_attn_reshape_and_cache_dispatch(
         key_stride,
         value_stride,
         x: x_pack,
-        k_scale,
-        v_scale,
     };
 
     let new_keys = RawBufferInfo {
@@ -265,7 +248,7 @@ pub unsafe extern "C" fn mlx_paged_attn_reshape_and_cache_dispatch(
 /// - `block_table`: `[num_seqs, max_blocks_per_seq]` `i32`
 /// - `seq_lens`: `[num_seqs]` `i32`
 /// - `output`: pre-allocated `[num_seqs, num_q_heads, head_size]` in io
-///   dtype matching `kv_dtype` for non-FP8 / BF16 for FP8.
+///   dtype `kv_dtype.io_dtype()`.
 ///
 /// The output is allocated by the C++ side (via MLX `set_data`). This
 /// shim blits the dispatcher's internal output buffer into the
@@ -299,8 +282,6 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_dispatch(
     softcap: f32,
     sliding_window: i32,
     kv_dtype_raw: u8,
-    k_scale: f32,
-    v_scale: f32,
 ) -> i32 {
     if queries_buffer.is_null()
         || key_pool_buffer.is_null()
@@ -343,11 +324,7 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_dispatch(
     }
 
     let cache_dtype = kv_dtype.to_metal();
-    let io_dtype = if kv_dtype.is_fp8() {
-        MetalDtype::BFloat16
-    } else {
-        cache_dtype
-    };
+    let io_dtype = cache_dtype.io_dtype();
 
     // softcap = 0.0 is the C++ caller's "disabled" sentinel; the kernel
     // expects 1.0 to mean disabled. Translate.
@@ -370,8 +347,6 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_dispatch(
         q_stride,
         kv_block_stride,
         kv_head_stride,
-        k_scale,
-        v_scale,
         sliding_window,
     };
 
@@ -518,8 +493,6 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_varlen_dispatch(
     softcap: f32,
     sliding_window: i32,
     kv_dtype_raw: u8,
-    k_scale: f32,
-    v_scale: f32,
 ) -> i32 {
     if queries_buffer.is_null()
         || key_pool_buffer.is_null()
@@ -562,11 +535,7 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_varlen_dispatch(
     }
 
     let cache_dtype = kv_dtype.to_metal();
-    let io_dtype = if kv_dtype.is_fp8() {
-        MetalDtype::BFloat16
-    } else {
-        cache_dtype
-    };
+    let io_dtype = cache_dtype.io_dtype();
 
     // softcap = 0.0 is the C++ "disabled" sentinel; kernel expects 1.0.
     let softcapping = if softcap == 0.0 { 1.0 } else { softcap };
@@ -589,8 +558,6 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_varlen_dispatch(
         q_stride,
         kv_block_stride,
         kv_head_stride,
-        k_scale,
-        v_scale,
         sliding_window,
     };
 
@@ -675,7 +642,7 @@ mod tests {
     fn parse_kv_dtype_roundtrip() {
         assert!(matches!(parse_kv_dtype(0), Some(KvDtypeC::Fp16)));
         assert!(matches!(parse_kv_dtype(1), Some(KvDtypeC::Bf16)));
-        assert!(matches!(parse_kv_dtype(2), Some(KvDtypeC::Fp8)));
+        assert!(parse_kv_dtype(2).is_none());
         assert!(matches!(parse_kv_dtype(3), Some(KvDtypeC::Int8)));
         assert!(parse_kv_dtype(4).is_none());
     }
@@ -684,9 +651,7 @@ mod tests {
     fn expected_x_for_each_dtype() {
         assert_eq!(KvDtypeC::Fp16.expected_x(), 8);
         assert_eq!(KvDtypeC::Bf16.expected_x(), 8);
-        assert_eq!(KvDtypeC::Fp8.expected_x(), 16);
         assert_eq!(KvDtypeC::Int8.expected_x(), 16);
-        assert!(!KvDtypeC::Int8.is_fp8());
         assert_eq!(KvDtypeC::Int8.to_metal(), MetalDtype::Int8);
     }
 
@@ -708,8 +673,6 @@ mod tests {
                 16,
                 8,
                 0,
-                1.0,
-                1.0,
             )
         };
         assert_eq!(rc, -1);
@@ -723,7 +686,7 @@ mod tests {
         let dummy: *mut c_void = std::ptr::dangling_mut::<c_void>();
         let rc = unsafe {
             mlx_paged_attn_reshape_and_cache_dispatch(
-                dummy, dummy, dummy, 0, dummy, 0, dummy, 0, 1, 4, 64, 16, 8, 99, 1.0, 1.0,
+                dummy, dummy, dummy, 0, dummy, 0, dummy, 0, 1, 4, 64, 16, 8, 99,
             )
         };
         assert_eq!(rc, -1);
@@ -736,7 +699,7 @@ mod tests {
         // check.
         let rc = unsafe {
             mlx_paged_attn_reshape_and_cache_dispatch(
-                dummy, dummy, dummy, 0, dummy, 0, dummy, 0, 1, 4, 64, 16, 16, 0, 1.0, 1.0,
+                dummy, dummy, dummy, 0, dummy, 0, dummy, 0, 1, 4, 64, 16, 16, 0,
             )
         };
         assert_eq!(rc, -1);

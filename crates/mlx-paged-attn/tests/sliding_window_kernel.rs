@@ -252,8 +252,6 @@ fn run_dispatch(
         q_stride,
         kv_block_stride,
         kv_head_stride,
-        k_scale: 1.0,
-        v_scale: 1.0,
         sliding_window,
     };
 

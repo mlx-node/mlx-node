@@ -22,7 +22,6 @@ fn paged_continuation() {
         head_size: 256,
         num_kv_heads: 4,
         num_layers: 1,
-        use_fp8_cache: Some(false),
         max_seq_len: Some(512),
         max_batch_size: Some(1),
     };

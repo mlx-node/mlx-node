@@ -86,7 +86,6 @@ fn pool_config(
         head_size: config.head_dim as u32,
         num_kv_heads: config.num_key_value_heads as u32,
         num_layers: super::load_plan::full_attention_layers(config) as u32,
-        use_fp8_cache: Some(false),
         max_seq_len: Some(config.served_context_tokens()),
         max_batch_size: Some(4),
     };

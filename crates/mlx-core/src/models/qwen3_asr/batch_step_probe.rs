@@ -610,7 +610,6 @@ impl Probe {
             head_size: config.head_dim as u32,
             num_kv_heads: config.num_key_value_heads as u32,
             num_layers: config.num_hidden_layers as u32,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(config.max_position_embeddings as u32),
             max_batch_size: Some(64),
         };

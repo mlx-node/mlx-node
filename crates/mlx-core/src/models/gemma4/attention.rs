@@ -3136,7 +3136,6 @@ mod tests {
             head_size: DENSE_HEAD as u32,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(1),
         };
@@ -3700,7 +3699,6 @@ mod tests {
             head_size: 512,
             num_layers: 1,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };

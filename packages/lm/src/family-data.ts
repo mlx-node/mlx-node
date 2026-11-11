@@ -243,7 +243,7 @@ interface ModelFamilyDataBase {
   /** Backward-compatible fallback when config.json omits model_type or sets it to null. */
   readonly defaultForNullishModelType?: true;
   readonly acceptsDraftModel?: true;
-  /** Native `load` accepts `LoadModelOptions.kvFormat` (the flat K/V cache format). */
+  /** Native `load` accepts `LoadModelOptions.kvFormat` (the K/V cache format). */
   readonly acceptsKvFormat?: true;
   /**
    * Native `load` accepts `LoadModelOptions.maxMemoryBytes` (`--max-memory`):

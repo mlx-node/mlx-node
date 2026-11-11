@@ -279,8 +279,6 @@ fn varlen_t1_matches_single_row_kernel() {
         q_stride,
         kv_block_stride,
         kv_head_stride,
-        k_scale: 1.0,
-        v_scale: 1.0,
         sliding_window: 0,
     };
     let q_raw = RawBufferInfo {
@@ -316,8 +314,6 @@ fn varlen_t1_matches_single_row_kernel() {
         q_stride,
         kv_block_stride,
         kv_head_stride,
-        k_scale: 1.0,
-        v_scale: 1.0,
         sliding_window: 0,
     };
     let varlen_out = unsafe {
@@ -566,8 +562,6 @@ fn varlen_ragged_batch_matches_host_reference() {
         q_stride,
         kv_block_stride,
         kv_head_stride,
-        k_scale: 1.0,
-        v_scale: 1.0,
         sliding_window: 0,
     };
     let q_raw = RawBufferInfo {
@@ -791,8 +785,6 @@ fn varlen_v2_high_partition_matches_host_reference() {
         q_stride,
         kv_block_stride,
         kv_head_stride,
-        k_scale: 1.0,
-        v_scale: 1.0,
         sliding_window: 0,
     };
     let q_raw = RawBufferInfo {
@@ -997,8 +989,6 @@ fn varlen_per_query_causal_cutoff_is_enforced() {
         q_stride,
         kv_block_stride,
         kv_head_stride,
-        k_scale: 1.0,
-        v_scale: 1.0,
         sliding_window: 0,
     };
     let q_raw = RawBufferInfo {

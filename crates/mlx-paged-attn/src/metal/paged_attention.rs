@@ -51,6 +51,22 @@ fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
+/// Slots 6 and 7 carry an int8 pool's scale planes; the Rust dispatch
+/// serves only fp16 / bf16 / f32 pools, whose kernels never read them. The
+/// returned buffer must outlive the command buffer.
+fn bind_unused_scale_slots(
+    state: &MetalState,
+    encoder: &metal::ComputeCommandEncoder,
+) -> Result<Buffer, String> {
+    let unused = state
+        .device
+        .try_new_buffer_with_value(&0f32, metal::MTLResourceOptions::StorageModeShared)
+        .ok_or_else(|| "Metal device failed to allocate the unused scale buffer".to_string())?;
+    encoder.set_buffer(6, Some(&unused), 0);
+    encoder.set_buffer(7, Some(&unused), 0);
+    Ok(unused)
+}
+
 /// Parameters for paged_attention kernel
 pub struct PagedAttentionParams {
     /// Number of sequences in the batch
@@ -77,10 +93,6 @@ pub struct PagedAttentionParams {
     pub kv_block_stride: i32,
     /// KV head stride
     pub kv_head_stride: i32,
-    /// K scale for FP8 quantization (1.0 for non-FP8)
-    pub k_scale: f32,
-    /// V scale for FP8 quantization (1.0 for non-FP8)
-    pub v_scale: f32,
     /// Sliding-window mask. When > 0, K positions older than
     /// `context_len - sliding_window` are excluded from attention. When
     /// 0 (default), no sliding mask is applied (full-context attention).
@@ -102,8 +114,6 @@ impl Default for PagedAttentionParams {
             q_stride: 0,
             kv_block_stride: 0,
             kv_head_stride: 0,
-            k_scale: 1.0,
-            v_scale: 1.0,
             sliding_window: 0,
         }
     }
@@ -582,19 +592,6 @@ impl PagedAttentionOutput {
                     *dst = bf16_to_f32(bits);
                 }
             }
-            MetalDtype::UChar => {
-                // FP8 E4M3 format cannot be correctly converted to f32 without the quantization scales.
-                // The raw byte cast (byte as f32) produces completely wrong values because FP8 E4M3
-                // has a different bit layout (1 sign, 4 exponent, 3 mantissa bits).
-                // Proper dequantization requires: f32_value = fp8_to_f32(byte) / scale
-                // where scale was used during quantization.
-                return Err(
-                    "FP8 (UChar) to f32 conversion not yet implemented. \
-                    FP8 dequantization requires k_scale/v_scale values which are not available here. \
-                    Use the raw buffer directly or implement to_host_f32_with_scales() for FP8 data."
-                        .to_string(),
-                );
-            }
             MetalDtype::Int8 => {
                 return Err(
                     "int8 cache to f32 conversion is not built (the scales live in their own \
@@ -653,7 +650,6 @@ impl PagedAttentionOutput {
             MetalDtype::Float32 => 0,
             MetalDtype::Float16 => 2,
             MetalDtype::BFloat16 => 3,
-            MetalDtype::UChar => 5,
             MetalDtype::Int8 => 6,
         };
         let arr = unsafe {
@@ -700,11 +696,7 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
 ) -> Result<PagedAttentionOutput, String> {
     let state = MetalState::get()?;
 
-    // Allocate output buffer using io_dtype.size() (not the cache dtype) —
-    // the kernel writes the io type. For FP8 (cache=uchar) the kernel
-    // dequantizes internally and writes io_dtype-sized elements. Using
-    // cache_dtype.size() here would under-allocate by 2x for FP8 caches with
-    // half/bf16 io.
+    // The kernel writes the io type, whatever the cache dtype.
     let output_element_size = io_dtype.size() as u64;
     let output_size =
         (params.num_seqs * params.num_heads * params.head_size) as u64 * output_element_size;
@@ -754,23 +746,7 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
     encoder.set_buffer(4, Some(key_cache), 0);
     encoder.set_buffer(5, Some(value_cache), 0);
 
-    // k_scale and v_scale - use params values for FP8 support
-    let k_scale_buffer = state
-        .device
-        .try_new_buffer_with_value(
-            &params.k_scale,
-            metal::MTLResourceOptions::StorageModeShared,
-        )
-        .ok_or_else(|| "Metal device failed to allocate k_scale buffer".to_string())?;
-    let v_scale_buffer = state
-        .device
-        .try_new_buffer_with_value(
-            &params.v_scale,
-            metal::MTLResourceOptions::StorageModeShared,
-        )
-        .ok_or_else(|| "Metal device failed to allocate v_scale buffer".to_string())?;
-    encoder.set_buffer(6, Some(&k_scale_buffer), 0);
-    encoder.set_buffer(7, Some(&v_scale_buffer), 0);
+    let _unused_scales = bind_unused_scale_slots(state, &encoder)?;
 
     // Set constant buffers
     let create_int_buffer = |value: i32| -> Result<Buffer, String> {
@@ -855,9 +831,6 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
     command_buffer.wait_until_completed();
     observe(&command_buffer, "dispatch_paged_attention_v1_raw")?;
 
-    // Output dtype is the io_dtype the kernel was templated on (not the
-    // cache dtype). For FP8 (cache=uchar) the kernel dequantizes internally
-    // and writes io_dtype-sized elements.
     Ok(PagedAttentionOutput {
         buffer: output,
         num_seqs: params.num_seqs,
@@ -925,10 +898,7 @@ pub unsafe fn dispatch_paged_attention_v2_raw_with_route(
 ) -> Result<PagedAttentionOutput, String> {
     let state = MetalState::get()?;
 
-    // Allocate output buffer sized by io_dtype — kernel writes io_dtype
-    // elements even for FP8 caches (dequantization happens inside the
-    // kernel). Using cache_dtype.size() would under-allocate by 2x for FP8
-    // with half/bf16 io.
+    // The kernel writes the io type, whatever the cache dtype.
     let output_element_size = io_dtype.size() as u64;
     let output_size =
         (params.num_seqs * params.num_heads * params.head_size) as u64 * output_element_size;
@@ -1027,23 +997,7 @@ pub unsafe fn dispatch_paged_attention_v2_raw_with_route(
         encoder.set_buffer(4, Some(key_cache), 0);
         encoder.set_buffer(5, Some(value_cache), 0);
 
-        // k_scale and v_scale - use params values for FP8 support
-        let k_scale_buffer = state
-            .device
-            .try_new_buffer_with_value(
-                &params.k_scale,
-                metal::MTLResourceOptions::StorageModeShared,
-            )
-            .ok_or_else(|| "Metal device failed to allocate k_scale buffer".to_string())?;
-        let v_scale_buffer = state
-            .device
-            .try_new_buffer_with_value(
-                &params.v_scale,
-                metal::MTLResourceOptions::StorageModeShared,
-            )
-            .ok_or_else(|| "Metal device failed to allocate v_scale buffer".to_string())?;
-        encoder.set_buffer(6, Some(&k_scale_buffer), 0);
-        encoder.set_buffer(7, Some(&v_scale_buffer), 0);
+        let _unused_scales = bind_unused_scale_slots(state, &encoder)?;
 
         // Set constant buffers
         let create_int_buffer = |value: i32| -> Result<Buffer, String> {
@@ -1192,8 +1146,6 @@ pub unsafe fn dispatch_paged_attention_v2_raw_with_route(
         observe(&command_buffer, "dispatch_paged_attention_v2_raw (reduce)")?;
     }
 
-    // Output dtype is io_dtype (kernel writes io-typed elements). FP8
-    // caches dequantize internally — output is still io_dtype.
     Ok(PagedAttentionOutput {
         buffer: output,
         num_seqs: params.num_seqs,
@@ -1343,10 +1295,6 @@ pub struct PagedAttentionVarlenParams {
     pub kv_block_stride: i32,
     /// KV head stride.
     pub kv_head_stride: i32,
-    /// K scale for FP8 quantization (1.0 for non-FP8).
-    pub k_scale: f32,
-    /// V scale for FP8 quantization (1.0 for non-FP8).
-    pub v_scale: f32,
     /// Sliding-window mask. Same semantics as the single-row kernel,
     /// referenced to `effective_context_len` per query token.
     pub sliding_window: i32,
@@ -1368,8 +1316,6 @@ impl Default for PagedAttentionVarlenParams {
             q_stride: 0,
             kv_block_stride: 0,
             kv_head_stride: 0,
-            k_scale: 1.0,
-            v_scale: 1.0,
             sliding_window: 0,
         }
     }
@@ -1406,8 +1352,7 @@ pub unsafe fn dispatch_paged_attention_varlen_v1_raw(
     let state = MetalState::get()?;
 
     // Output sized by total_queries — every query token gets its own
-    // [num_heads, head_size] slab. Allocated in io_dtype regardless of
-    // cache_dtype (FP8 dequantizes internally).
+    // [num_heads, head_size] slab, in io_dtype.
     let output_element_size = io_dtype.size() as u64;
     let output_size = (params.total_queries as u64)
         * (params.num_heads as u64)
@@ -1452,22 +1397,7 @@ pub unsafe fn dispatch_paged_attention_varlen_v1_raw(
     encoder.set_buffer(4, Some(key_cache), 0);
     encoder.set_buffer(5, Some(value_cache), 0);
 
-    let k_scale_buffer = state
-        .device
-        .try_new_buffer_with_value(
-            &params.k_scale,
-            metal::MTLResourceOptions::StorageModeShared,
-        )
-        .ok_or_else(|| "Metal device failed to allocate k_scale buffer".to_string())?;
-    let v_scale_buffer = state
-        .device
-        .try_new_buffer_with_value(
-            &params.v_scale,
-            metal::MTLResourceOptions::StorageModeShared,
-        )
-        .ok_or_else(|| "Metal device failed to allocate v_scale buffer".to_string())?;
-    encoder.set_buffer(6, Some(&k_scale_buffer), 0);
-    encoder.set_buffer(7, Some(&v_scale_buffer), 0);
+    let _unused_scales = bind_unused_scale_slots(state, &encoder)?;
 
     let create_int_buffer = |value: i32| -> Result<Buffer, String> {
         state
@@ -1674,22 +1604,7 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         encoder.set_buffer(4, Some(key_cache), 0);
         encoder.set_buffer(5, Some(value_cache), 0);
 
-        let k_scale_buffer = state
-            .device
-            .try_new_buffer_with_value(
-                &params.k_scale,
-                metal::MTLResourceOptions::StorageModeShared,
-            )
-            .ok_or_else(|| "Metal device failed to allocate k_scale buffer".to_string())?;
-        let v_scale_buffer = state
-            .device
-            .try_new_buffer_with_value(
-                &params.v_scale,
-                metal::MTLResourceOptions::StorageModeShared,
-            )
-            .ok_or_else(|| "Metal device failed to allocate v_scale buffer".to_string())?;
-        encoder.set_buffer(6, Some(&k_scale_buffer), 0);
-        encoder.set_buffer(7, Some(&v_scale_buffer), 0);
+        let _unused_scales = bind_unused_scale_slots(state, &encoder)?;
 
         let create_int_buffer = |value: i32| -> Result<Buffer, String> {
             state

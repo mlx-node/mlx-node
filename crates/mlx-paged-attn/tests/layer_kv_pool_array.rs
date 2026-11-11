@@ -21,7 +21,6 @@ fn cfg(num_layers: u32) -> PagedAttentionConfig {
         head_size: 64,
         num_kv_heads: 2,
         num_layers,
-        use_fp8_cache: Some(false),
         max_seq_len: Some(64),
         max_batch_size: Some(2),
     }
@@ -84,32 +83,6 @@ fn bf16_view_shapes_and_round_trip() {
         "pool must remain usable after view round-trip"
     );
     unsafe { mlx_sys::mlx_array_delete(k2) };
-}
-
-/// FP8 pool: x=16, V layout unchanged. Pins the FP8 path through the
-/// same FFI.
-#[test]
-fn fp8_view_shapes() {
-    let cfg = PagedAttentionConfig {
-        block_size: 16,
-        use_fp8_cache: Some(true),
-        ..cfg(2)
-    };
-    let pool = match LayerKVPool::new(cfg, 4, 4, MetalDtype::UChar) {
-        Ok(p) => p,
-        Err(e) if e.contains("No Metal device found") => {
-            eprintln!("skipping fp8_view_shapes: Metal unavailable");
-            return;
-        }
-        Err(e) => panic!("unexpected new failure: {e}"),
-    };
-    assert_eq!(pool.cache_pack_factor().unwrap(), 16);
-    assert_eq!(pool.key_cache_shape(16), [4, 2, 4, 16, 16]);
-    assert_eq!(pool.value_cache_shape(), [4, 2, 64, 16]);
-
-    let k = pool.key_cache_array_raw(0).expect("k view fp8");
-    assert!(!k.is_null());
-    unsafe { mlx_sys::mlx_array_delete(k) };
 }
 
 /// Out-of-range layer index returns a clear error, not a panic.

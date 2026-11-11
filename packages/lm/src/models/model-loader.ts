@@ -68,13 +68,14 @@ export interface LoadModelOptions {
    */
   draftModelPath?: string;
   /**
-   * Flat full-attention K/V cache format for `qwen3_5` and `qwen3_5_moe` targets:
+   * Full-attention K/V format for `qwen3_5` and `qwen3_5_moe` targets, in the
+   * block-paged pool and the flat cache:
    * `'int8'` — per-token symmetric int8 rows with one fp32 scale each,
    * halving K/V memory and read bandwidth at a small, measured quality
    * cost — or `'bf16'`. Unset: int8 on Metal with 256-wide heads, GQA
    * up to 8 and BF16 compute (what the int8 kernels serve), bf16 elsewhere.
-   * The block-paged cache
-   * ignores it; other model families reject it.
+   * An explicit `'int8'` the kernels cannot serve fails the load; other model
+   * families reject it.
    */
   kvFormat?: 'int8' | 'bf16';
   /**
@@ -283,7 +284,7 @@ function dispatchLoad(
   }
   if (options?.kvFormat !== undefined && requireFamilyData(modelType).acceptsKvFormat !== true) {
     throw new Error(
-      `kvFormat (flat K/V cache format) is only supported by qwen3_5 and qwen3_5_moe models; ` +
+      `kvFormat (K/V cache format) is only supported by qwen3_5 and qwen3_5_moe models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }

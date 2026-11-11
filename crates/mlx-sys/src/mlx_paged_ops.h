@@ -22,7 +22,6 @@ namespace mlx::core::fast {
 enum class KvDtype : uint8_t {
   Fp16 = 0,
   Bf16 = 1,
-  Fp8 = 2,
   Int8 = 3,
 };
 
@@ -36,8 +35,8 @@ enum class KvDtype : uint8_t {
 ///   3: `new_v`     — `[num_tokens, num_kv_heads, head_size]`
 ///   4: `slot_mapping` — `[num_tokens]` of int64
 ///   5: `k_scale`   — Int8: `[num_blocks, num_kv_heads, block_size]` fp32
-///                    scale plane (Splash `splash_q8_scale_index`); FP8:
-///                    `[1]` fp32 divisor; Fp16/Bf16: `[1]` placeholder
+///                    scale plane (Splash `splash_q8_scale_index`);
+///                    Fp16/Bf16: `[1]` placeholder
 ///   6: `v_scale`   — same, for the value side
 ///
 /// Outputs (in order), each sharing its input's allocation (in-place):
@@ -119,12 +118,12 @@ class PagedKVWrite : public Custom {
 ///   2: `v_pool`     — same as PagedKVWrite
 ///   3: `block_table` — `[num_seqs, max_blocks_per_seq]` int32
 ///   4: `seq_lens`   — `[num_seqs]` int32
-///   5: `k_scale`    — `[1]` fp32 (placeholder for non-FP8)
-///   6: `v_scale`    — `[1]` fp32 (placeholder for non-FP8)
+///   5: `k_scale`    — Int8: the pool's scale plane; else `[1]` placeholder
+///   6: `v_scale`    — same, for the value side
 ///
 /// Outputs (in order):
 ///   0: `attn_out`   — `[num_seqs, num_q_heads, head_size]` in io dtype
-///                     (Fp16/Bf16 for non-FP8; Bf16 default for FP8)
+///                     (Fp16/Bf16; Bf16 for Int8)
 class PagedAttention : public Custom {
  public:
   PagedAttention(
@@ -209,15 +208,14 @@ class PagedAttention : public Custom {
 /// k_scale', v_scale')` — arrays that alias inputs 0, 1, 5, 6 (the
 /// primitive writes in place). Int8 scales are the pool's
 /// `[num_blocks, num_kv_heads, block_size]` fp32 planes; every other
-/// dtype takes `[1]` fp32 arrays (callers pass `array(1.0f)`
-/// placeholders when `kv_dtype != Fp8`).
+/// dtype takes `[1]` fp32 `array(1.0f)` placeholders.
 ///
 /// Strict input contract — every dimension and dtype is validated at
 /// the factory and a mismatch throws `std::invalid_argument`:
 ///
 ///   - `k_pool` rank 5 `[num_blocks, num_kv_heads, head_size/x_pack,
 ///     block_size, x_pack]`. `x_pack = 16 / sizeof(kv_dtype)`
-///     (Fp16/Bf16 → 8, Fp8/Int8 → 16). `x_pack` arg must equal that.
+///     (Fp16/Bf16 → 8, Int8 → 16). `x_pack` arg must equal that.
 ///   - `v_pool` rank 4 `[num_blocks, num_kv_heads, head_size, block_size]`.
 ///   - `k_pool.shape(0) == v_pool.shape(0)` (num_blocks parity).
 ///   - `new_k`/`new_v` rank 3 `[num_tokens, num_kv_heads, head_size]`,
@@ -262,7 +260,7 @@ std::array<array, 4> paged_kv_write(
 ///   - `q` rank 3 `[num_seqs, num_q_heads, head_size]`.
 ///   - `k_pool` rank 5 `[num_blocks, num_kv_heads, head_size/x_pack,
 ///     block_size, x_pack]`, with `x_pack` derived from `kv_dtype`
-///     (Fp16/Bf16 → 8, Fp8 → 16). `head_size` must be divisible by
+///     (Fp16/Bf16 → 8, Int8 → 16). `head_size` must be divisible by
 ///     `x_pack`.
 ///   - `v_pool` rank 4 `[num_blocks, num_kv_heads, head_size, block_size]`.
 ///   - `k_pool.shape(0) == v_pool.shape(0)` (num_blocks parity).

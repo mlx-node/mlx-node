@@ -365,8 +365,6 @@ fn dispatch_decode(
         q_stride,
         kv_block_stride,
         kv_head_stride,
-        k_scale: 1.0,
-        v_scale: 1.0,
         sliding_window,
     };
     let q = RawBufferInfo {
@@ -424,8 +422,6 @@ fn dispatch_varlen_two_rows(
         q_stride,
         kv_block_stride,
         kv_head_stride,
-        k_scale: 1.0,
-        v_scale: 1.0,
         sliding_window,
     };
     let q = RawBufferInfo {
@@ -741,8 +737,6 @@ fn run_full_context_stage1_case(state: &MetalState, context_len: usize) {
         q_stride,
         kv_block_stride,
         kv_head_stride,
-        k_scale: 1.0,
-        v_scale: 1.0,
         sliding_window: 0,
     };
     let output = unsafe {
@@ -874,8 +868,6 @@ fn benchmark_context(state: &MetalState, context_len: u32) {
         q_stride,
         kv_block_stride,
         kv_head_stride,
-        k_scale: 1.0,
-        v_scale: 1.0,
         sliding_window: 0,
     };
     let varlen_params = PagedAttentionVarlenParams {
@@ -892,8 +884,6 @@ fn benchmark_context(state: &MetalState, context_len: u32) {
         q_stride,
         kv_block_stride,
         kv_head_stride,
-        k_scale: 1.0,
-        v_scale: 1.0,
         sliding_window: 0,
     };
     let cu_seqlens = [0i32, 2];

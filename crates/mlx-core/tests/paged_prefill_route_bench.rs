@@ -22,7 +22,6 @@ fn compare_short_suffix_attention_routes() {
             head_size: 128,
             num_kv_heads: 8,
             num_layers: 1,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(context),
             max_batch_size: Some(1),
         };

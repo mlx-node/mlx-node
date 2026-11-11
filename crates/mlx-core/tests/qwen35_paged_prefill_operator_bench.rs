@@ -334,7 +334,6 @@ fn build_adapter(context: u32) -> BenchResult<PagedKVCacheAdapter> {
         head_size: HEAD_SIZE,
         num_kv_heads: NUM_KV_HEADS,
         num_layers: NUM_LAYERS,
-        use_fp8_cache: Some(false),
         max_seq_len: Some(context),
         max_batch_size: Some(1),
     };

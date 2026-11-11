@@ -15,7 +15,7 @@
 //!
 //! # Kernel Naming Convention
 //!
-//! - `reshape_and_cache_kv_{type}_cache_{type}[_fp8]`
+//! - `reshape_and_cache_kv_{type}_cache_{type}`
 //! - `paged_attention_{type}_cache_{type}_hs{head}_bs{block}_nt256_nsl32_ps{partition}[_alibi]`
 
 pub(crate) mod command_buffer;

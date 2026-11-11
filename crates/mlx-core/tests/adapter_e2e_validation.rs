@@ -57,7 +57,6 @@ fn try_make_fixture(cache_dtype: MetalDtype) -> Option<Fixture> {
         head_size: HEAD_SIZE,
         num_kv_heads: NUM_KV_HEADS,
         num_layers: 1,
-        use_fp8_cache: Some(false),
         max_seq_len: Some(64),
         max_batch_size: Some(2),
     };

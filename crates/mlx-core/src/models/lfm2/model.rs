@@ -336,7 +336,6 @@ impl Lfm2Inner {
                 // Pool covers only the attention layers — conv layers
                 // continue to use Lfm2LayerCache::Conv.
                 num_layers: attn_layer_count,
-                use_fp8_cache: Some(false),
                 max_seq_len: Some(config.max_position_embeddings as u32),
                 max_batch_size: Some(32),
             };
@@ -459,7 +458,6 @@ impl Lfm2Inner {
             head_size: self.config.head_dim() as u32,
             num_kv_heads: self.config.num_key_value_heads as u32,
             num_layers: attn_layer_count,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(per_seq_context),
             max_batch_size: Some(scheduler_max_num_seqs_for(32) as u32),
         };
@@ -2792,7 +2790,7 @@ mod paged_adapter_construction_tests {
     }
 
     /// Tiny LFM2-shaped config compatible with `LayerKVPool`'s validate
-    /// constraints (head_size in {32, 64, 96, 128, 256}, FP8 off).
+    /// constraints (head_size in {32, 64, 96, 128, 256}).
     /// Two layers: one conv + one full_attention. Mirrors the same hybrid
     /// shape as production LFM2 so the adapter sizing exercises the
     /// "attention layers only" path.

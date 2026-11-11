@@ -254,13 +254,21 @@ fn context_limits_publish_both_windows() {
 }
 
 /// Gate: each lane publishes the K/V format it writes. The block-paged pool
-/// is BF16 whatever `kv_format` says; the DFlash2 lane names the format its
-/// window was priced at; a flat load names the configured format.
-/// Mutation: pool lane reads `config.kv_format()` → red.
-/// Mutation: publish `speculative_kv_format: None` → red.
-/// Mutation: flat lane hard-codes `KvFormat::Bf16` → red.
+/// names its own pages (int8 or bf16, whatever the config says); the
+/// DFlash2 lane names the format its window was priced at; a flat load
+/// names the configured format.
+/// Mutation D3: the snapshot keeps `KvFormat::Bf16` for a pool → red.
 #[test]
 fn context_limits_publish_kv_formats() {
+    let Some(mut int8) = dense_inner_with_test_pool_or_skip(
+        "context_limits_publish_kv_formats",
+        mlx_paged_attn::metal::MetalDtype::Int8,
+        128,
+    ) else {
+        return;
+    };
+    int8.config.kv_format = Some("bf16".to_string());
+    assert_eq!(int8.context_limits_snapshot().kv_format, "int8");
     let Some(mut inner) =
         dense_inner_with_test_adapter_or_skip("context_limits_publish_kv_formats")
     else {
@@ -338,8 +346,71 @@ fn planned_load_within(
     Some(inner.initialize_paged_adapter().map(|()| inner))
 }
 
-/// Gate: every load starts at the runway (2,048 tokens and one GDN cell of
-/// blocks), with or without a draft, and grows by extents toward the plan's
+/// A tiny head-256 paged load with BF16 weights and `kv_format` as given.
+fn planned_head256_load(kv_format: &str, bf16: bool) -> Option<Result<Qwen35Inner>> {
+    if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+        return None;
+    }
+    let _live = LiveMemory::set(16 * GIB, 0);
+    let mut cfg = tiny_paged_forward_cfg();
+    cfg.head_dim = 256;
+    cfg.paged_cache_memory_mb = None;
+    cfg.kv_format = Some(kv_format.to_string());
+    let mut inner = Qwen35Inner::new(cfg).expect("construct tiny model");
+    if bf16 {
+        cast_qwen35_inner_weights_bf16(&mut inner);
+    }
+    Some(inner.initialize_paged_adapter().map(|()| inner))
+}
+
+/// The pool's pages follow `kv_format` (Splash `RuntimeResources::create`:
+/// `kvLayout.format = config.kvFormat` for the whole pool): an int8 load
+/// builds an int8 pool sized at int8 block bytes and publishes "int8"; a
+/// bf16 load keeps bf16 pages. An explicit int8 on a model whose rows are
+/// not BF16 fails the load.
+/// Mutation D1: `initialize_paged_adapter` keeps `MetalDtype::BFloat16` → red.
+#[test]
+fn pool_follows_kv_format() {
+    use mlx_paged_attn::metal::MetalDtype;
+    for (format, dtype) in [("int8", MetalDtype::Int8), ("bf16", MetalDtype::BFloat16)] {
+        let Some(load) = planned_head256_load(format, true) else {
+            return;
+        };
+        let inner = load.unwrap_or_else(|error| panic!("{format} load: {}", error.reason));
+        let adapter = inner.paged_adapter.as_ref().expect("paged adapter");
+        let pool = adapter.layer_kv_pool();
+        assert_eq!(pool.cache_dtype(), dtype, "{format}");
+        let config = &inner.config;
+        assert_eq!(
+            adapter.bytes_per_block().unwrap(),
+            mlx_paged_attn::profile::bytes_per_block(
+                config.full_attention_layer_count() as u32,
+                config.num_kv_heads as u32,
+                256,
+                16,
+                dtype,
+            )
+            .unwrap(),
+            "{format}"
+        );
+        assert_eq!(inner.context_limits_snapshot().kv_format, format);
+    }
+    let Some(load) = planned_head256_load("int8", false) else {
+        return;
+    };
+    let error = match load {
+        Ok(_) => panic!("an int8 pool on f32 rows must fail the load"),
+        Err(error) => error,
+    };
+    assert!(
+        error.reason.contains("no int8 paged attention kernel"),
+        "{}",
+        error.reason
+    );
+}
+
+/// Gate: every load starts at the runway (the layout's `kvRunwayPages` and
+/// one GDN cell of blocks), with or without a draft, and grows by extents toward the plan's
 /// ceiling. Mutation: start at the runway only with a draft in
 /// `initialize_paged_adapter` → red (the no-draft pool starts at its max).
 #[test]
@@ -353,10 +424,18 @@ fn every_load_starts_at_the_runway() {
         let inner = inner.expect("planned load");
         let adapter = inner.paged_adapter.as_ref().expect("paged adapter");
         let bytes_per_block = adapter.bytes_per_block().expect("bytes per block");
+        let layout = crate::engine::memory_plan::KvLayout::of(
+            inner.config.full_attention_layer_count(),
+            inner.config.num_kv_heads,
+            inner.config.head_dim,
+            DType::BFloat16,
+            inner.config.kv_format(),
+        );
         let runway = crate::models::qwen3_5::load_plan::qwen35_runway_blocks(
             16,
             bytes_per_block,
             inner.config.recurrent_state_bytes(),
+            &layout,
         );
         assert_eq!(adapter.block_capacity(), runway, "draft={draft}");
         let plan = inner.memory_plan.as_ref().expect("plan");
@@ -2359,21 +2438,26 @@ fn test_dense_initial_pool_grows_to_hold_a_long_prefill() {
 /// two-layer placeholder pool is enough and runs wherever the adapter's own
 /// lifecycle tests run.
 fn dense_inner_with_test_adapter_or_skip(test_name: &str) -> Option<Qwen35Inner> {
+    dense_inner_with_test_pool_or_skip(test_name, mlx_paged_attn::metal::MetalDtype::Float16, 32)
+}
+
+/// [`dense_inner_with_test_adapter_or_skip`] over a pool of `dtype` and
+/// `head_size`.
+fn dense_inner_with_test_pool_or_skip(
+    test_name: &str,
+    dtype: mlx_paged_attn::metal::MetalDtype,
+    head_size: u32,
+) -> Option<Qwen35Inner> {
     const BLOCK_SIZE: u32 = 16;
     const NUM_BLOCKS: u32 = 8;
     let pool_config = mlx_paged_attn::PagedAttentionConfig {
         block_size: BLOCK_SIZE,
         num_kv_heads: 1,
-        head_size: 32,
+        head_size,
         num_layers: 2,
         ..mlx_paged_attn::PagedAttentionConfig::default()
     };
-    let pool = match mlx_paged_attn::LayerKVPool::new_for_test(
-        pool_config,
-        NUM_BLOCKS,
-        2,
-        mlx_paged_attn::metal::MetalDtype::Float16,
-    ) {
+    let pool = match mlx_paged_attn::LayerKVPool::new_for_test(pool_config, NUM_BLOCKS, 2, dtype) {
         Ok(pool) => Arc::new(pool),
         // Routed through `test_support::metal_device_absent` rather than
         // matching the string inline, so `MLX_TEST_REQUIRE_METAL=1` can
@@ -2403,11 +2487,9 @@ fn dense_inner_with_test_adapter_or_skip(test_name: &str) -> Option<Qwen35Inner>
 fn install_gdn_cold_tier(inner: &mut Qwen35Inner, root: &std::path::Path) {
     let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.to_path_buf())
         .expect("temp-dir cold cache must open");
-    let cache_dtype = {
-        let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
-        format!("{:?}", adapter.layer_kv_pool().cache_dtype())
-    };
-    let policy = crate::models::qwen3_5::gdn_sidecar::policy(&inner.config, &cache_dtype)
+    let activation = crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(&*inner)
+        .expect("activation dtype");
+    let policy = crate::models::qwen3_5::gdn_sidecar::policy(&inner.config, activation)
         .expect("a hybrid config must yield a GDN sidecar policy");
     let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
     adapter.set_cold_tier(
@@ -2498,6 +2580,60 @@ fn dense_manual_paged_finalize_reaches_the_gdn_sidecar_capture() {
         "the capture must reach its boundary selection under a GdnState policy"
     );
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An int8 pool keeps the GDN sidecar: the policy and the capture label the
+/// conv history with the activation dtype, never the pool's K/V format
+/// (Splash `GdnStateLayout::convolutionLayerBytes` never follows the KV
+/// format), so the capture reaches its boundary selection.
+///
+/// Mutation S1: the capture labels from the pool dtype ("Int8") → no
+/// geometry → the capture stops before boundary selection → red.
+#[test]
+fn int8_pool_attaches_the_gdn_sidecar() {
+    let Some(mut inner) = dense_inner_with_test_pool_or_skip(
+        "int8_pool_attaches_the_gdn_sidecar",
+        mlx_paged_attn::metal::MetalDtype::Int8,
+        128,
+    ) else {
+        return;
+    };
+    let root = temp_cold_root("dense-int8-pool-sidecar");
+    install_gdn_cold_tier(&mut inner, &root);
+    let activation =
+        crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(&inner).unwrap();
+    let label = inner
+        .paged_adapter
+        .as_ref()
+        .and_then(|adapter| adapter.cold_tier())
+        .and_then(|cold| cold.sidecar_policy.as_ref())
+        .map(|policy| policy.layout().dtype.clone())
+        .expect("an int8 pool must carry the GDN sidecar policy");
+    assert_eq!(label, format!("{activation:?}"));
+    let prompt: Vec<u32> = (0u32..32).collect();
+    record_whole_paged_request(&mut inner, &prompt);
+
+    let _serialized = crate::cold_tier::sidecar_counter_test_lock();
+    let before = crate::cold_tier::cold_sidecar_telemetry();
+    inner
+        .finalize_dense_manual_paged_turn(&[], 0, prompt.len())
+        .expect("manual paged finalization must succeed");
+    let after = crate::cold_tier::cold_sidecar_telemetry();
+    assert_eq!(
+        inner
+            .paged_adapter
+            .as_ref()
+            .expect("paged_adapter")
+            .cold_captured_blocks(),
+        2,
+        "both whole int8 blocks must have been captured off the pool"
+    );
+    assert_eq!(
+        after.boundary_skips,
+        before.boundary_skips + 1,
+        "the capture must reach its boundary selection on an int8 pool"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -3729,4 +3865,76 @@ fn yarn_reaches_the_cold_tier_key_not_the_saved_config() {
         super::cold_tier_config_json(&moe_plain, &moe_plain.scaling(), b"g").unwrap(),
         super::cold_tier_config_json(&moe_scaled, &moe_scaled.scaling(), b"g").unwrap()
     );
+}
+
+/// Every pool block's bytes, in block order.
+fn pool_bytes(inner: &Qwen35Inner) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+    let pool = inner
+        .paged_adapter
+        .as_ref()
+        .expect("paged adapter")
+        .layer_kv_pool();
+    (0..pool.num_blocks())
+        .map(|block| pool.read_block_all_layers(block).expect("block bytes"))
+        .collect()
+}
+
+/// `mlx eval` reads the pool when the load has one (Splash has no flat
+/// path): its teacher-forced prefill writes pool blocks, leaves no block
+/// allocated and no live request after it, and its hidden matches the flat
+/// prefill on the same weights within bf16 noise.
+/// Mutation E1: the backend keeps the flat path on a paged load → the pool
+/// is never written → red.
+#[test]
+fn eval_reads_the_pool() {
+    use crate::quality::runner::EvalBackend;
+    let Some((mut inner, _cfg)) = paged_inner_or_skip("eval_reads_the_pool") else {
+        return;
+    };
+    cast_qwen35_inner_weights_bf16(&mut inner);
+    let ids: Vec<u32> = (0..70u32).map(|i| 3 + (i * 37) % 1000).collect();
+    let before = pool_bytes(&inner);
+    let paged = inner.teacher_forced_hidden(&ids).expect("paged eval");
+    paged.eval();
+    let after = pool_bytes(&inner);
+    let written = before
+        .iter()
+        .zip(&after)
+        .filter(|(left, right)| left != right)
+        .count();
+    assert!(
+        written >= 69usize.div_ceil(16),
+        "the eval prefill wrote {written} pool blocks"
+    );
+    let adapter = inner.paged_adapter.as_ref().expect("paged adapter");
+    assert_eq!(adapter.num_allocated_blocks(), 0);
+    assert!(adapter.active_seq_id().is_none() || adapter.request_tokens().is_empty());
+
+    // A second eval on the same pool reads the same bits: nothing of the
+    // first sequence survives into it.
+    let again = inner
+        .teacher_forced_hidden(&ids)
+        .expect("second paged eval");
+    let again = again.astype(DType::Float32).unwrap().to_float32().unwrap();
+    let first = paged.astype(DType::Float32).unwrap().to_float32().unwrap();
+    assert!(
+        again
+            .iter()
+            .zip(first.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+    );
+
+    let pool = inner.paged_adapter.take();
+    let flat = inner.teacher_forced_hidden(&ids).expect("flat eval");
+    inner.paged_adapter = pool;
+    assert_eq!(paged.shape_at(1).unwrap(), flat.shape_at(1).unwrap());
+    let paged = paged.astype(DType::Float32).unwrap().to_float32().unwrap();
+    let flat = flat.astype(DType::Float32).unwrap().to_float32().unwrap();
+    let worst = paged
+        .iter()
+        .zip(flat.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(paged.iter().all(|v| v.is_finite()));
+    assert!(worst < 0.25, "paged vs flat eval hidden differ by {worst}");
 }

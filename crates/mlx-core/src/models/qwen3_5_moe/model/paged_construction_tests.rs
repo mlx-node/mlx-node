@@ -245,7 +245,8 @@ fn context_limits_publish_both_windows() {
 }
 
 /// Gate: each lane publishes the K/V format it writes. The block-paged pool
-/// is BF16 whatever `kv_format` says; the DFlash2 lane names the format its
+/// names its own pages (this test pool is f16, so "bf16"); the DFlash2 lane
+/// names the format its
 /// window was priced at; a flat load names the configured format.
 /// Mutation: pool lane reads `config.kv_format()` → red.
 /// Mutation: publish `speculative_kv_format: None` → red.
@@ -330,8 +331,8 @@ fn planned_load_within(
     Some(inner.initialize_paged_adapter().map(|()| inner))
 }
 
-/// Gate: every load starts at the runway (2,048 tokens and one GDN cell of
-/// blocks), with or without a draft, and grows by extents toward the plan's
+/// Gate: every load starts at the runway (the layout's `kvRunwayPages` and
+/// one GDN cell of blocks), with or without a draft, and grows by extents toward the plan's
 /// ceiling. Mutation: start at the runway only with a draft in
 /// `initialize_paged_adapter` → red (the no-draft pool starts at its max).
 #[test]
@@ -345,10 +346,18 @@ fn every_load_starts_at_the_runway() {
         let inner = inner.expect("planned load");
         let adapter = inner.paged_adapter.as_ref().expect("paged adapter");
         let bytes_per_block = adapter.bytes_per_block().expect("bytes per block");
+        let layout = crate::engine::memory_plan::KvLayout::of(
+            inner.config.full_attention_layer_count(),
+            inner.config.num_kv_heads,
+            inner.config.head_dim,
+            DType::BFloat16,
+            inner.config.kv_format(),
+        );
         let runway = crate::models::qwen3_5::load_plan::qwen35_runway_blocks(
             16,
             bytes_per_block,
             inner.config.recurrent_state_bytes(),
+            &layout,
         );
         assert_eq!(adapter.block_capacity(), runway, "draft={draft}");
         let plan = inner.memory_plan.as_ref().expect("plan");
@@ -1168,12 +1177,10 @@ fn moe_inner_with_test_adapter_or_skip(test_name: &str) -> Option<Qwen35MoeInner
 fn install_moe_gdn_cold_tier(inner: &mut Qwen35MoeInner, root: &std::path::Path) {
     let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.to_path_buf())
         .expect("temp-dir cold cache must open");
-    let cache_dtype = {
-        let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
-        format!("{:?}", adapter.layer_kv_pool().cache_dtype())
-    };
+    let activation = crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(&*inner)
+        .expect("activation dtype");
     let policy =
-        crate::models::qwen3_5::gdn_sidecar::policy(&inner.config.to_dense_config(), &cache_dtype)
+        crate::models::qwen3_5::gdn_sidecar::policy(&inner.config.to_dense_config(), activation)
             .expect("a hybrid config must yield a GDN sidecar policy");
     let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
     adapter.set_cold_tier(

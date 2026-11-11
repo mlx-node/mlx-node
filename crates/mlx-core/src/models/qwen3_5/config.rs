@@ -133,14 +133,15 @@ pub struct Qwen3_5Config {
     #[napi(ts_type = "string | undefined")]
     pub qwen35_gguf_gdn_layout: Option<String>,
 
-    /// Element format of the flat full-attention K/V cache: `"int8"`
-    /// (per-(token, head) symmetric int8 rows with one fp32 scale each —
-    /// half the K/V memory and read bandwidth; see `crate::array::kv_int8`)
-    /// or `"bf16"`. Unset: int8 where the int8 kernels serve the model
-    /// (Metal, head 256, GQA up to 8, BF16 compute), else BF16 — see
-    /// `kv_format_for()`. Set from the `kvFormat` load option; the paged
-    /// cache ignores it.
-    #[serde(default)]
+    /// Element format of the full-attention K/V, the block-paged pool's and
+    /// the flat cache's: `"int8"` (per-(token, head) symmetric int8 rows
+    /// with one fp32 scale each — half the K/V memory and read bandwidth;
+    /// see `crate::array::kv_int8`) or `"bf16"`. Unset: int8 where the int8
+    /// kernels serve the model (Metal, head 256, GQA up to 8, BF16 compute,
+    /// a 16- or 32-token paged block), else BF16 — see `kv_format_for()`.
+    /// Set from the `kvFormat` load option; never saved (a runtime option,
+    /// like Splash `--kv-format`).
+    #[serde(default, skip_serializing)]
     #[napi(ts_type = "string | undefined")]
     pub kv_format: Option<String>,
 
@@ -228,25 +229,32 @@ impl Qwen3_5Config {
         !(layer_idx + 1).is_multiple_of(self.full_attention_interval as usize)
     }
 
-    /// Element format of the flat full-attention K/V cache of a model that
-    /// computes in `compute`. An explicit `kv_format` wins (an unparseable
-    /// value is BF16 — persistence rejects it at load); otherwise int8,
-    /// Splash's default, wherever the int8 segmented kernels serve the model
-    /// (`KvFormat::default_for_geometry`: BF16 compute, head 256, GQA up to
-    /// 8), and BF16 elsewhere so no model falls onto the dequantizing
-    /// fallback.
+    /// Element format of the full-attention K/V (pool and flat cache) of a
+    /// model that computes in `compute`. An explicit `kv_format` wins (an
+    /// unparseable value is BF16 — persistence rejects it at load);
+    /// otherwise int8, Splash's default, wherever the int8 kernels serve the
+    /// model (`KvFormat::default_for_geometry`: BF16 compute, head 256, GQA
+    /// up to 8; and a 16- or 32-token block when the load is paged), and
+    /// BF16 elsewhere, so only an explicit int8 can fail a load.
     pub fn kv_format_for(&self, compute: crate::array::DType) -> crate::transformer::KvFormat {
         use crate::transformer::KvFormat;
         match self.kv_format.as_deref() {
             Some(value) if !value.trim().is_empty() => {
                 KvFormat::parse(Some(value)).unwrap_or_default()
             }
-            _ => KvFormat::default_for_geometry(
-                i64::from(self.head_dim),
-                i64::from(self.num_heads),
-                i64::from(self.num_kv_heads),
-                compute,
-            ),
+            _ => {
+                let pool_block_fits = self.use_block_paged_cache == Some(false)
+                    || matches!(self.paged_block_size(), 16 | 32);
+                match KvFormat::default_for_geometry(
+                    i64::from(self.head_dim),
+                    i64::from(self.num_heads),
+                    i64::from(self.num_kv_heads),
+                    compute,
+                ) {
+                    KvFormat::Int8 if pool_block_fits => KvFormat::Int8,
+                    _ => KvFormat::Bf16,
+                }
+            }
         }
     }
 

@@ -379,7 +379,6 @@ fn build_paged_runtime(config: &MuseGlimmerConfig) -> Result<Option<MusePagedRun
             num_layers: u32::try_from(group.physical_layer_indices.len()).map_err(|_| {
                 Error::from_reason("Muse-Glimmer paged physical layer count exceeds u32::MAX")
             })?,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(max_seq_len),
             max_batch_size: Some(max_sequences),
         };

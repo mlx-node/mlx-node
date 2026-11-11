@@ -714,7 +714,7 @@ fn owner_axis() -> String {
 /// Bytes one resident checkpoint costs on `config`, sized by the same geometry
 /// the on-disk sidecar is sized by.
 fn checkpoint_bytes(config: &Qwen3_5Config) -> usize {
-    let geo = gdn_sidecar::geometry(config, "BFloat16").expect("geometry");
+    let geo = gdn_sidecar::geometry(config, crate::array::DType::BFloat16).expect("geometry");
     let layout = gdn_sidecar::layout_at(&geo, 4096);
     layout.bytes_per_tensor * layout.num_layers as usize
 }

@@ -294,17 +294,12 @@ fn metal_io_dtype(cache_dtype: mlx_paged_attn::metal::MetalDtype) -> Result<DTyp
 ///    re-derives strides from `num_kv_heads * head_size`; a mismatch here
 ///    would walk past the end of the input buffer on the GPU.
 /// 4. K/V dtypes are equal (the kernel templates on a single `KV_T`).
-/// 5. The dtype is supported by `LayerKVPool` — i.e. the input occupies the
-///    same element width as the pool's allocated buffers (2 bytes for non-FP8
-///    mode, also 2 bytes for FP8 mode where the *input* is half/bfloat16 and
-///    is quantized into a 1-byte cache by the kernel). `Float32` and any
-///    other 4+ byte dtype is rejected because `LayerKVPool::new` allocates
-///    non-FP8 buffers as 2-byte elements; routing F32 K/V through
-///    `write_kv` would dispatch `reshape_and_cache_kv_float_cache_float`
-///    against a half-sized buffer and corrupt the cache (or write
-///    out-of-bounds on the GPU).
-/// 6. A non-FP8 cache takes rows of its io dtype only (an int8 cache takes
-///    bf16 rows, Splash io is always bf16).
+/// 5. The input is 2-byte (Float16 / BFloat16). `Float32` is rejected:
+///    routing F32 K/V through `write_kv` would dispatch
+///    `reshape_and_cache_kv_float_cache_float` against a half-sized buffer
+///    and corrupt the cache (or write out-of-bounds on the GPU).
+/// 6. The cache takes rows of its io dtype only (an int8 cache takes bf16
+///    rows, Splash io is always bf16).
 ///
 /// Returns `KvInputInfo { num_tokens, input_metal_dtype }` on success.
 pub(crate) fn validate_kv_input(
@@ -394,10 +389,7 @@ pub(crate) fn validate_kv_input(
     // Dtype parity + supported-dtype gate. Distinct K/V dtypes would route
     // through a kernel templated on a single `KV_T`, silently reinterpreting
     // one of the buffers. Then we restrict to dtypes whose element width
-    // matches `LayerKVPool`'s 2-byte allocation: Float16 and BFloat16. FP8
-    // mode keeps the same input requirement — the cache holds 1-byte FP8
-    // values, but the *input* is still the original half/bfloat16 K/V that
-    // the kernel quantizes during the write.
+    // matches `LayerKVPool`'s 2-byte rows: Float16 and BFloat16.
     if keys.dtype != values.dtype {
         return Err(format!(
             "update_keys_values: keys/values dtype mismatch ({:?} vs \
@@ -416,15 +408,13 @@ pub(crate) fn validate_kv_input(
             ));
         }
     }
-    if !cache_dtype.is_fp8() {
-        let io_dtype = metal_io_dtype(cache_dtype)?;
-        if keys.dtype != io_dtype {
-            return Err(format!(
-                "update_keys_values: input dtype {:?} is not the {io_dtype:?} rows a \
-                 {cache_dtype:?} cache stores",
-                keys.dtype
-            ));
-        }
+    let io_dtype = metal_io_dtype(cache_dtype)?;
+    if keys.dtype != io_dtype {
+        return Err(format!(
+            "update_keys_values: input dtype {:?} is not the {io_dtype:?} rows a \
+             {cache_dtype:?} cache stores",
+            keys.dtype
+        ));
     }
 
     #[cfg(target_os = "macos")]
@@ -4096,7 +4086,6 @@ impl PagedKVCacheAdapter {
         match self.layer_kv_pool.cache_dtype() {
             mlx_paged_attn::metal::MetalDtype::Float16 => Ok(0),
             mlx_paged_attn::metal::MetalDtype::BFloat16 => Ok(1),
-            mlx_paged_attn::metal::MetalDtype::UChar => Ok(2),
             mlx_paged_attn::metal::MetalDtype::Int8 => Ok(3),
             mlx_paged_attn::metal::MetalDtype::Float32 => {
                 Err("Float32 KV cache is unsupported".to_string())
@@ -4130,10 +4119,6 @@ impl PagedKVCacheAdapter {
     ///     adapter.update_keys_values(layer, &k[layer], &v[layer], first)?;
     /// }
     /// ```
-    ///
-    /// FP8 scales: `k_scale` / `v_scale` passed to the `reshape_and_cache`
-    /// Metal kernel are always `1.0` — a no-op for the non-FP8 kernel
-    /// template.
     #[cfg(target_os = "macos")]
     pub fn update_keys_values(
         &mut self,
@@ -4227,8 +4212,6 @@ impl PagedKVCacheAdapter {
             ));
         }
 
-        let (k_scale, v_scale) = (1.0, 1.0);
-
         // SAFETY: keys/values are valid `MxArray`s held by the caller for
         // the duration of this call; `as_raw_ptr` returns the borrowed
         // mlx_array handle. The kernel dispatcher waits until completion
@@ -4240,8 +4223,6 @@ impl PagedKVCacheAdapter {
                 values.as_raw_ptr(),
                 &slot_mapping,
                 info.input_metal_dtype,
-                k_scale,
-                v_scale,
             )
         }?;
         if trace_enabled {
@@ -5131,10 +5112,10 @@ impl PagedKVCacheAdapter {
             }
         };
         let cache_dtype = self.layer_kv_pool.cache_dtype();
-        if !cache_dtype.is_fp8() && query_dtype != cache_dtype.io_dtype() {
+        if query_dtype != cache_dtype.io_dtype() {
             return Err(format!(
                 "gather_kv_for_decode_graph_batched: query_dtype ({query_dtype:?}) must equal the io dtype of \
-                 cache_dtype ({cache_dtype:?}) for non-FP8 caches"
+                 cache_dtype ({cache_dtype:?})"
             ));
         }
 
@@ -5231,10 +5212,10 @@ impl PagedKVCacheAdapter {
             }
         };
         let cache_dtype = self.layer_kv_pool.cache_dtype();
-        if !cache_dtype.is_fp8() && query_dtype != cache_dtype.io_dtype() {
+        if query_dtype != cache_dtype.io_dtype() {
             return Err(format!(
                 "gather_kv_for_ragged_graph: query_dtype ({query_dtype:?}) must equal the io dtype of \
-                 cache_dtype ({cache_dtype:?}) for non-FP8 caches"
+                 cache_dtype ({cache_dtype:?})"
             ));
         }
         let (block_tables, seq_lens, cu_seqlens_q, max_context_len, total_queries) =
@@ -5379,10 +5360,10 @@ impl PagedKVCacheAdapter {
             }
         };
         let cache_dtype = self.layer_kv_pool.cache_dtype();
-        if !cache_dtype.is_fp8() && query_dtype != cache_dtype.io_dtype() {
+        if query_dtype != cache_dtype.io_dtype() {
             return Err(format!(
                 "gather_kv_for_decode_graph: query_dtype ({query_dtype:?}) must equal the io dtype of \
-                 cache_dtype ({cache_dtype:?}) for non-FP8 caches"
+                 cache_dtype ({cache_dtype:?})"
             ));
         }
 
@@ -5568,10 +5549,6 @@ impl PagedKVCacheAdapter {
             }
         };
 
-        // 5b. Unit FP8 K/V scales, symmetric with the write path in
-        //     `update_keys_values`.
-        let (k_scale, v_scale) = (1.0, 1.0);
-
         // 6. Dispatch and wrap output in an MLX view over the Metal buffer.
         //    This avoids the old GPU → host → MLX copy in the decode hot path.
         // SAFETY:
@@ -5602,8 +5579,6 @@ impl PagedKVCacheAdapter {
                 scale,
                 softcap,
                 self.sliding_window as i32,
-                k_scale,
-                v_scale,
                 raw_route_hint,
                 grouped_stripes,
             )?
@@ -5724,9 +5699,17 @@ impl PagedKVCacheAdapter {
         let total_context = cached_prefix_len.checked_add(query_len).ok_or_else(|| {
             "gather_kv_for_prefill_chunk_varlen: total context overflow".to_string()
         })?;
+        // An int8 pool runs the rows in tiles of the dispatch's bounded
+        // workspace; one row is the smallest tile.
+        let tile_rows =
+            if self.layer_kv_pool.cache_dtype() == mlx_paged_attn::metal::MetalDtype::Int8 {
+                1
+            } else {
+                query_len
+            };
         if !paged_attention_v2_aux_fits(
             PagedAttentionV2Layout::Varlen,
-            query_len,
+            tile_rows,
             num_query_heads,
             self.layer_kv_pool.config().num_kv_heads,
             total_context,
@@ -5750,10 +5733,10 @@ impl PagedKVCacheAdapter {
             }
         };
         let cache_dtype = self.layer_kv_pool.cache_dtype();
-        if !cache_dtype.is_fp8() && query_dtype != cache_dtype.io_dtype() {
+        if query_dtype != cache_dtype.io_dtype() {
             return Err(format!(
                 "gather_kv_for_prefill_chunk_varlen: query_dtype ({query_dtype:?}) must equal the io dtype of \
-                 cache_dtype ({cache_dtype:?}) for non-FP8 caches"
+                 cache_dtype ({cache_dtype:?})"
             ));
         }
         let kv_dtype_raw = self.kv_dtype_raw()?;
@@ -5813,8 +5796,7 @@ impl PagedKVCacheAdapter {
     /// SDPA-ready arrays without leaving the MLX graph.
     ///
     /// The native pool arrays are used directly, retaining any lazy
-    /// `paged_kv_write` dependency. This path intentionally rejects FP8: a
-    /// plain `take` cannot apply the per-layer dequantization scales.
+    /// `paged_kv_write` dependency.
     ///
     /// **Refuses a windowed group.** A dense gather materializes the retired
     /// null placeholders `prune_sliding_window_for` installed, and this
@@ -5931,18 +5913,11 @@ impl PagedKVCacheAdapter {
             ));
         }
         let cache_dtype = self.layer_kv_pool.cache_dtype();
-        if cache_dtype.is_fp8() {
-            return Err(
-                "gather_kv_for_prefill_sdpa: FP8 cache is unsupported because graph-native \
-                 take does not apply K/V dequantization scales"
-                    .to_string(),
-            );
-        }
         let int8 = cache_dtype == mlx_paged_attn::metal::MetalDtype::Int8;
         let dtype_size = cache_dtype.size();
         if dtype_size != 2 && !int8 {
             return Err(format!(
-                "gather_kv_for_prefill_sdpa: unsupported non-FP8 cache dtype \
+                "gather_kv_for_prefill_sdpa: unsupported cache dtype \
                  {cache_dtype:?} with element size {dtype_size}"
             ));
         }
@@ -6168,10 +6143,10 @@ impl PagedKVCacheAdapter {
             }
         };
         let cache_dtype = self.layer_kv_pool.cache_dtype();
-        if !cache_dtype.is_fp8() && query_dtype != cache_dtype.io_dtype() {
+        if query_dtype != cache_dtype.io_dtype() {
             return Err(format!(
                 "gather_kv_for_prefill_chunk: query_dtype ({query_dtype:?}) must equal the io dtype of \
-                 cache_dtype ({cache_dtype:?}) for non-FP8 caches"
+                 cache_dtype ({cache_dtype:?})"
             ));
         }
         let kv_dtype_raw = self.kv_dtype_raw()?;
@@ -6299,7 +6274,7 @@ impl PagedKVCacheAdapter {
     /// Returns `(K, V)` MxArrays of shape
     /// `[1, num_kv_heads, num_tokens, head_size]` (transposed to the
     /// SDPA-friendly layout). dtype matches `layer_kv_pool.cache_dtype()`
-    /// (currently Float16 or BFloat16; FP8 is rejected).
+    /// (Float16 or BFloat16; an int8 pool reads back dequantized bf16).
     ///
     /// Errors if `start_pos + num_tokens` exceeds
     /// `block_table.num_tokens()`, or if no active request, or if the
@@ -6478,8 +6453,6 @@ impl PagedKVCacheAdapter {
         let head_size = cfg.head_size;
         let cache_dtype = self.layer_kv_pool.cache_dtype();
 
-        // FP8 caches are intentionally rejected — they require k_scale /
-        // v_scale dequantization which the adapter does not yet plumb.
         match cache_dtype {
             mlx_paged_attn::metal::MetalDtype::Float16
             | mlx_paged_attn::metal::MetalDtype::BFloat16
@@ -6487,7 +6460,7 @@ impl PagedKVCacheAdapter {
             other => {
                 return Err(format!(
                     "read_kv_range: cache_dtype {other:?} is not supported (only Float16, \
-                     BFloat16 and Int8; FP8 dequantization is a follow-up)"
+                     BFloat16 and Int8)"
                 ));
             }
         }
@@ -8031,21 +8004,15 @@ impl PagedKVCacheAdapter {
             mlx_paged_attn::metal::MetalDtype::Float16 => Some(DType::Float16),
             mlx_paged_attn::metal::MetalDtype::BFloat16 => Some(DType::BFloat16),
             mlx_paged_attn::metal::MetalDtype::Float32 => Some(DType::Float32),
-            mlx_paged_attn::metal::MetalDtype::UChar | mlx_paged_attn::metal::MetalDtype::Int8 => {
-                None
-            }
+            mlx_paged_attn::metal::MetalDtype::Int8 => None,
         }
     }
 
     /// The dtype a prism/Hadamard f32 operand is cast to before the paged
     /// write and read: the pool's io dtype (bf16 for an int8 pool, Splash io
-    /// is always bf16). `None` for an FP8 pool.
+    /// is always bf16).
     pub(crate) fn paged_operand_dtype(&self) -> Option<DType> {
-        let cache_dtype = self.layer_kv_pool.cache_dtype();
-        if cache_dtype.is_fp8() {
-            return None;
-        }
-        metal_io_dtype(cache_dtype).ok()
+        metal_io_dtype(self.layer_kv_pool.cache_dtype()).ok()
     }
 
     pub(crate) fn cache_dtype(&self) -> mlx_paged_attn::metal::MetalDtype {
@@ -9782,7 +9749,6 @@ mod tests {
             head_size: 64,
             num_kv_heads: 1,
             num_layers: 2,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(1),
         };
@@ -9957,7 +9923,6 @@ mod tests {
             head_size: 64,
             num_kv_heads: 1,
             num_layers: 2,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(1),
         };
@@ -10183,7 +10148,6 @@ mod tests {
             head_size: 64,
             num_kv_heads: 1,
             num_layers: 2,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(1),
         };
@@ -10993,7 +10957,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(2),
         };
@@ -11939,7 +11902,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(2),
         };
@@ -12104,7 +12066,6 @@ mod tests {
                 head_size: 64,
                 num_layers: 2,
                 gpu_memory_mb: 256,
-                use_fp8_cache: Some(false),
                 max_seq_len: Some(128),
                 max_batch_size: Some(2),
             };
@@ -12306,7 +12267,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(2),
         };
@@ -12344,7 +12304,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(2),
         };
@@ -12389,7 +12348,6 @@ mod tests {
                 head_size: 64,
                 num_layers: 2,
                 gpu_memory_mb: 256,
-                use_fp8_cache: Some(false),
                 max_seq_len: Some(128),
                 max_batch_size: Some(2),
             };
@@ -13552,7 +13510,7 @@ mod tests {
     }
 
     /// `validate_kv_input` must reject Float32 K/V input. `LayerKVPool`
-    /// allocates non-FP8 buffers as 2-byte elements (mirroring
+    /// allocates 2-byte bf16/f16 buffers (mirroring
     /// `CacheEngine::initialize`); routing F32 K/V through `write_kv`
     /// would dispatch `reshape_and_cache_kv_float_cache_float` against a
     /// half-sized buffer, silently corrupting the cache or writing
@@ -13612,7 +13570,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };
@@ -13672,7 +13629,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };
@@ -14192,7 +14148,6 @@ mod tests {
             head_size: 64,
             num_layers: 1,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(NUM_BLOCKS * BLOCK_SIZE),
             max_batch_size: Some(1),
         };
@@ -14297,7 +14252,6 @@ mod tests {
             head_size: HEAD_SIZE as u32,
             num_layers: GLOBAL_LAYERS,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(NUM_BLOCKS * BLOCK_SIZE),
             max_batch_size: Some(1),
         };
@@ -14503,7 +14457,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };
@@ -14573,7 +14526,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };
@@ -14652,7 +14604,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };
@@ -14735,7 +14686,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };
@@ -14868,7 +14818,6 @@ mod tests {
             head_size: HEAD_SIZE as u32,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(1),
         };
@@ -15109,7 +15058,6 @@ mod tests {
             head_size: FIX_HEAD_SIZE as u32,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(1),
         };
@@ -15219,7 +15167,6 @@ mod tests {
                 head_size: 512,
                 num_layers: 1,
                 gpu_memory_mb: 256,
-                use_fp8_cache: Some(false),
                 max_seq_len: Some(1024),
                 max_batch_size: Some(1),
             };
@@ -15594,7 +15541,6 @@ mod tests {
                 head_size: D as u32,
                 num_layers: 1,
                 gpu_memory_mb: 256,
-                use_fp8_cache: Some(false),
                 max_seq_len: Some(8192),
                 max_batch_size: Some(1),
             };
@@ -15755,7 +15701,6 @@ mod tests {
                 head_size: D as u32,
                 num_layers: 1,
                 gpu_memory_mb: 256,
-                use_fp8_cache: Some(false),
                 max_seq_len: Some(8192),
                 max_batch_size: Some(1),
             };
@@ -15838,7 +15783,6 @@ mod tests {
             head_size: D as u32,
             num_layers: 1,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(8192),
             max_batch_size: Some(1),
         };
@@ -16381,7 +16325,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(1),
         };
@@ -16606,7 +16549,6 @@ mod tests {
             head_size: DIM as u32,
             num_layers: 1,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(1),
         };
@@ -16700,7 +16642,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };
@@ -16775,7 +16716,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };
@@ -16856,7 +16796,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };
@@ -17005,7 +16944,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };
@@ -17046,8 +16984,8 @@ mod tests {
             }
         }
 
-        // BF16 query of zeros — io_dtype must equal cache_dtype (BF16) for
-        // non-FP8 caches. Float16 would now be rejected by
+        // BF16 query of zeros — io_dtype must equal cache_dtype (BF16).
+        // Float16 would now be rejected by
         // `LayerKVPool::gather_attention`'s mismatch guard.
         let q = MxArray::zeros(&[1, 1, 64], Some(DType::BFloat16)).expect("q zeros");
         q.eval();
@@ -17240,7 +17178,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };
@@ -17354,7 +17291,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(2),
         };
@@ -17523,7 +17459,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(2),
         };
@@ -17598,7 +17533,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(2),
         };
@@ -17698,7 +17632,6 @@ mod tests {
             head_size: 64,
             num_layers: 4,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(2),
         };
@@ -17812,7 +17745,6 @@ mod tests {
                 head_size: 64,
                 num_layers: 4,
                 gpu_memory_mb: 256,
-                use_fp8_cache: Some(false),
                 max_seq_len: Some(128),
                 max_batch_size: Some(2),
             };
@@ -17875,7 +17807,6 @@ mod tests {
             head_size: 64,
             num_layers: 4,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(2),
         };
@@ -17939,7 +17870,6 @@ mod tests {
             head_size: 64,
             num_layers: 4,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(2),
         };
@@ -18046,7 +17976,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(2),
         };
@@ -18115,7 +18044,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(2),
         };
@@ -18162,7 +18090,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(2),
         };
@@ -18232,7 +18159,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(2),
         };
@@ -18304,7 +18230,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(2),
         };
@@ -18376,7 +18301,6 @@ mod tests {
             head_size: 64,
             num_layers: 2,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(128),
             max_batch_size: Some(2),
         };
@@ -18564,7 +18488,6 @@ mod tests {
             head_size,
             num_layers,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };

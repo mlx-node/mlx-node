@@ -268,8 +268,10 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
         !scheduler_reserve_full_isl()
     }
     /// The window a scheduled turn clamps on when the family's memory plan
-    /// sets it; `speculative` turns also pay the draft state they hold.
-    /// `None` keeps the pool's own window and `MLX_PAGED_PER_SEQ_CTX`.
+    /// sets it. A plan that prices the draft state into its lane answers one
+    /// window for both kinds; otherwise `speculative` turns also pay the
+    /// draft state they hold. `None` keeps the pool's own window and
+    /// `MLX_PAGED_PER_SEQ_CTX`.
     fn planned_turn_window(&self, _speculative: bool) -> Option<u32> {
         None
     }
@@ -5486,7 +5488,6 @@ pub(crate) mod tests {
             head_size: 128,
             num_layers: 1,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(512),
             max_batch_size: Some(32),
         };
@@ -6208,7 +6209,6 @@ pub(crate) mod tests {
             head_size: 128,
             num_layers: 1,
             gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(8_192),
             max_batch_size: Some(32),
         };
@@ -6954,18 +6954,21 @@ pub(crate) mod tests {
         assert_eq!(state.inner.scheduled_recurrent_bytes(), recurrent);
     }
 
-    /// An MTP turn's window pays the draft state it holds at its last row,
-    /// priced on the plan's pool; an AR turn keeps the pool lane's window.
-    /// On a 64-block pool of 2 MiB blocks in the 27B's bf16 pages (two 64 MiB
-    /// extents, 2,041 rows after the scratch), the held state takes pages.
-    /// Mutation: the dense `planned_turn_window` ignores `speculative` → red
-    /// (2,041).
+    /// Every non-DFlash2 turn takes the pool lane's one window: the plan
+    /// prices the MTP state into that lane, so an MTP turn, an AR turn, the
+    /// limits the model reports and the window it publishes agree. On a
+    /// 64-block pool of 2 MiB blocks in the 27B's bf16 pages (two 64 MiB
+    /// extents, 2,041 rows after the scratch).
+    /// Mutation O2: the dense `planned_turn_window` prices the held draft
+    /// state on top of the pool window for a speculative turn → red
+    /// (mtp < ar).
     #[test]
-    fn mtp_turn_window_is_the_speculative_window() {
+    fn every_non_dflash2_turn_takes_the_pool_window() {
         let Some((mut state, _)) = growable_qwen35_state() else {
             return;
         };
         state.inner.config.n_mtp_layers = 1;
+        state.inner.config.max_position_embeddings = 4_096;
         let layout = crate::engine::memory_plan::KvLayout::of(
             16,
             4,
@@ -6983,17 +6986,15 @@ pub(crate) mod tests {
         let ar = state.scheduled_turn_window(16, false);
         let mtp = state.scheduled_turn_window(16, true);
         assert_eq!(ar, 2_041);
-        let pool = state
-            .inner
-            .memory_plan
-            .as_ref()
-            .and_then(|plan| plan.pool.as_ref())
-            .expect("pool plan");
+        assert_eq!(mtp, ar);
+        assert_eq!(state.inner.paged_context_limits().1, ar);
         assert_eq!(
-            mtp,
-            pool.window_with(&|tokens| state.inner.scheduled_draft_state_held_bytes(tokens))
+            state
+                .inner
+                .context_limits_snapshot()
+                .effective_window_tokens,
+            ar
         );
-        assert!(1 < mtp && mtp < ar, "{mtp} vs {ar}");
     }
 
     /// A planned window is not capped by `MLX_PAGED_PER_SEQ_CTX`; without a

@@ -23,20 +23,6 @@ fn qwen3_realistic_sizing() {
     assert_eq!(sizing.selected_blocks, 17_437);
 }
 
-/// FP8 cache: half the per-block size of BF16, twice the blocks on the
-/// same budget (the budget is a whole number of BF16 blocks).
-#[test]
-fn fp8_doubles_block_count() {
-    let bpb_bf16 = bytes_per_block(28, 8, 128, 16, MetalDtype::BFloat16).unwrap();
-    let bpb_fp8 = bytes_per_block(28, 8, 128, 16, MetalDtype::UChar).unwrap();
-    assert_eq!(bpb_bf16, 2 * bpb_fp8);
-    let hard = 10 * GIB + 1_000 * bpb_bf16;
-    let bf16 = compute_load_time_pool_sizing(u32::MAX, hard, 10 * GIB, bpb_bf16, 0).unwrap();
-    let fp8 = compute_load_time_pool_sizing(u32::MAX, hard, 10 * GIB, bpb_fp8, 0).unwrap();
-    assert_eq!(bf16.selected_blocks, 1_000);
-    assert_eq!(fp8.selected_blocks, 2_000);
-}
-
 /// Active memory above the hard budget leaves no block.
 #[test]
 fn rejects_active_above_the_budget() {
@@ -68,7 +54,7 @@ fn rejects_zero_blocks() {
 fn dtype_sizes() {
     assert_eq!(dtype_size_for(MetalDtype::BFloat16), 2);
     assert_eq!(dtype_size_for(MetalDtype::Float16), 2);
-    assert_eq!(dtype_size_for(MetalDtype::UChar), 1);
+    assert_eq!(dtype_size_for(MetalDtype::Int8), 1);
 }
 
 /// Zero shape parameters reject deterministically.

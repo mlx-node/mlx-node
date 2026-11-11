@@ -85,7 +85,7 @@ int32_t mlx_total_system_memory(uint64_t* out_value) {
 //   size — we don't sanity-check because the caller already knows the
 //   pool's shape).
 // - `dtype_code`: `BridgeDType` enum value matching the on-buffer element
-//   dtype (Fp16/Bf16 for non-FP8 caches, UChar for FP8).
+//   dtype (Fp16/Bf16, or Int8 for an int8 cache).
 //
 // Returns a heap-allocated `mlx_array*` (caller frees via `mlx_array_free`).
 // Returns nullptr on Metal-unavailable hosts, null buffer pointers, or

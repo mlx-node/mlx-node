@@ -1,12 +1,115 @@
 use super::*;
 
-/// The 27B runway: 2,048 tokens of 16-token blocks and its 153,944,064-byte
-/// GDN cell in 1 MiB blocks (147). Mutation: drop the recurrent cell from
-/// `qwen35_runway_blocks` → red (128).
+/// The runway follows the layout's `kvRunwayPages` and adds one GDN cell of
+/// blocks: bf16 27B 64 pages (2,048 tokens) + 147 = 275; int8 27B one
+/// 128-page extent (4,096 tokens) + 290 = 546; int8 35B (2 heads) one
+/// 256-page extent (8,192 tokens) + its cell. Mutation W2: tokens fixed at
+/// 2,048 → int8 27B 418 → red.
 #[test]
-fn qwen38_27b_runway_is_275_blocks() {
-    assert_eq!(qwen35_runway_blocks(16, 1 << 20, 153_944_064), 128 + 147);
-    assert_eq!(qwen35_runway_blocks(16, 1 << 20, 0), 128);
+fn qwen35_runway_follows_kv_runway_pages() {
+    let layout = |layers, heads, format| KvLayout::of(layers, heads, 256, DType::BFloat16, format);
+    let bf16 = layout(16, 4, KvFormat::Bf16);
+    let int8 = layout(16, 4, KvFormat::Int8);
+    assert_eq!(
+        qwen35_runway_blocks(16, 1 << 20, 153_944_064, &bf16),
+        128 + 147
+    );
+    assert_eq!(qwen35_runway_blocks(16, 1 << 20, 0, &bf16), 128);
+    assert_eq!(
+        qwen35_runway_blocks(16, 532_480, 153_944_064, &int8),
+        256 + 290
+    );
+    let moe = layout(10, 2, KvFormat::Int8);
+    assert_eq!(moe.runway_pages(), 256);
+    let bpb = mlx_paged_attn::profile::bytes_per_block(
+        10,
+        2,
+        256,
+        16,
+        mlx_paged_attn::metal::MetalDtype::Int8,
+    )
+    .unwrap();
+    assert_eq!(bpb, 166_400);
+    assert_eq!(
+        qwen35_runway_blocks(16, bpb, 64_389_120, &moe),
+        512 + 64_389_120u64.div_ceil(166_400) as u32
+    );
+}
+
+/// The pool's element type: bf16 for any geometry; int8 only where the int8
+/// store and paged attention kernels exist (head 128 / 256, 16- / 32-token
+/// blocks, BF16 rows), else the load fails with the kernel named.
+/// Mutation D2: the helper returns Int8 without the kernel check → red.
+#[test]
+fn int8_pool_without_a_kernel_fails_the_load() {
+    use mlx_paged_attn::metal::MetalDtype;
+    let dtype = |format, head, bs, compute| qwen35_pool_cache_dtype("t", format, head, bs, compute);
+    assert_eq!(
+        dtype(KvFormat::Int8, 256, 16, DType::BFloat16).unwrap(),
+        MetalDtype::Int8
+    );
+    assert_eq!(
+        dtype(KvFormat::Int8, 128, 32, DType::BFloat16).unwrap(),
+        MetalDtype::Int8
+    );
+    for (head, bs, compute) in [(256, 16, DType::Float16), (64, 16, DType::BFloat16)] {
+        assert_eq!(
+            dtype(KvFormat::Bf16, head, bs, compute).unwrap(),
+            MetalDtype::BFloat16
+        );
+    }
+    for (head, bs, compute) in [
+        (64, 16, DType::BFloat16),
+        (256, 8, DType::BFloat16),
+        (256, 16, DType::Float16),
+    ] {
+        let error = dtype(KvFormat::Int8, head, bs, compute).unwrap_err();
+        assert!(
+            error.reason.contains("no int8 paged attention kernel")
+                && error.reason.contains("kvFormat 'bf16'"),
+            "{}",
+            error.reason
+        );
+    }
+}
+
+/// The unset default is int8 only where the pool would get int8 pages, so a
+/// default load never fails: a paged 8-token block keeps bf16, a 16-token
+/// block or a flat load takes int8 (Metal, head 256, GQA 6, BF16). An
+/// explicit int8 stays int8.
+/// Mutation B1: the default ignores the block size → red.
+#[test]
+fn unset_kv_format_defaults_to_int8_only_where_the_pool_has_kernels() {
+    if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+        return;
+    }
+    let mut config = crate::models::qwen3_5::dflash2_decode::tests::qwen38_27b_cfg();
+    config.kv_format = None;
+    config.use_block_paged_cache = None;
+    config.paged_block_size = Some(16);
+    assert_eq!(config.kv_format_for(DType::BFloat16), KvFormat::Int8);
+    config.paged_block_size = Some(8);
+    assert_eq!(config.kv_format_for(DType::BFloat16), KvFormat::Bf16);
+    config.use_block_paged_cache = Some(false);
+    assert_eq!(config.kv_format_for(DType::BFloat16), KvFormat::Int8);
+    config.use_block_paged_cache = None;
+    config.kv_format = Some("int8".to_string());
+    assert_eq!(config.kv_format_for(DType::BFloat16), KvFormat::Int8);
+}
+
+/// A saved config never carries the load's pinned `kv_format` (Splash
+/// `--kv-format` is a runtime option), while a source config.json's value is
+/// still read. Mutation: drop `skip_serializing` → red.
+#[test]
+fn pinned_kv_format_is_never_saved() {
+    let mut config = crate::models::qwen3_5::dflash2_decode::tests::qwen38_27b_cfg();
+    config.pin_kv_format(Some(KvFormat::Int8), DType::BFloat16);
+    let saved = serde_json::to_value(&config).unwrap();
+    assert!(saved.get("kv_format").is_none(), "{saved}");
+    let mut source = saved;
+    source["kv_format"] = serde_json::json!("bf16");
+    let read: super::super::config::Qwen3_5Config = serde_json::from_value(source).unwrap();
+    assert_eq!(read.kv_format.as_deref(), Some("bf16"));
 }
 
 /// `maxMemoryBytes` reaches the plan as given and is refused unless
@@ -173,7 +276,7 @@ fn estimate_matches_the_load_plan() {
         4,
         256,
         block_size,
-        mlx_paged_attn::metal::MetalDtype::BFloat16,
+        qwen35_pool_cache_dtype("t", format, 256, block_size, DType::BFloat16).unwrap(),
     )
     .unwrap();
     let lanes = LoadLanes {
@@ -181,6 +284,7 @@ fn estimate_matches_the_load_plan() {
         recurrent_state_bytes: config.recurrent_state_bytes(),
         pool: crate::engine::persistence::compiled_forward_backend_available().then_some(
             PoolGeometry {
+                format,
                 bytes_per_block,
                 block_size,
                 layers: 16,
@@ -190,6 +294,8 @@ fn estimate_matches_the_load_plan() {
         draft: Some(DraftTerms::of(&draft_config, 1_357 * MIB)),
         format,
         dtype: DType::BFloat16,
+        mtp: false,
+        mtp_state_in_pool: false,
     };
     let plan = evaluate_qwen35_plan(
         "Qwen3.5",
@@ -517,6 +623,38 @@ fn plan_27b_with_draft(
     max_context: Option<u32>,
     draft_trained: u32,
 ) -> MemoryPlan {
+    plan_27b_as(tag, working_set, max_context, draft_trained, None)
+}
+
+/// [`plan_27b_with_draft`] with the load's `kvFormat`.
+fn plan_27b_as(
+    tag: &str,
+    working_set: u64,
+    max_context: Option<u32>,
+    draft_trained: u32,
+    kv_format: Option<KvFormat>,
+) -> MemoryPlan {
+    plan_27b_lanes(
+        tag,
+        working_set,
+        max_context,
+        draft_trained,
+        kv_format,
+        None,
+    )
+}
+
+/// [`plan_27b_as`]; with `mtp` set, the target has one MTP layer and no
+/// draft, and `mtp` says whether the scheduler books the MTP state in the
+/// pool.
+fn plan_27b_lanes(
+    tag: &str,
+    working_set: u64,
+    max_context: Option<u32>,
+    draft_trained: u32,
+    kv_format: Option<KvFormat>,
+    mtp: Option<bool>,
+) -> MemoryPlan {
     let target = estimate_fixture_dir(tag);
     let draft = estimate_fixture_dir(&format!("{tag}-draft"));
     write_27b_fixture(&target, &draft);
@@ -531,7 +669,10 @@ fn plan_27b_with_draft(
     let mut config = crate::models::qwen3_5::persistence::parse_config(&raw).unwrap();
     config.rope_scaling =
         Some(RopeScaling::served_for("Qwen3.5", 262_144, config.scaling(), max_context).unwrap());
-    let format = config.pin_kv_format(None, DType::BFloat16);
+    if mtp.is_some() {
+        config.n_mtp_layers = 1;
+    }
+    let format = config.pin_kv_format(kv_format, DType::BFloat16);
     let draft_config = crate::models::qwen3_5::dflash2::read_dflash2_config(&draft).unwrap();
     std::fs::remove_dir_all(&target).unwrap();
     std::fs::remove_dir_all(&draft).unwrap();
@@ -541,21 +682,26 @@ fn plan_27b_with_draft(
         4,
         256,
         block_size,
-        mlx_paged_attn::metal::MetalDtype::BFloat16,
+        qwen35_pool_cache_dtype("t", format, 256, block_size, DType::BFloat16).unwrap(),
     )
     .unwrap();
     let lanes = LoadLanes {
         config: &config,
         recurrent_state_bytes: config.recurrent_state_bytes(),
         pool: Some(PoolGeometry {
+            format,
             bytes_per_block,
             block_size,
             layers: 16,
             explicit_mib: None,
         }),
-        draft: Some(DraftTerms::of(&draft_config, 1_357 * MIB)),
+        draft: mtp
+            .is_none()
+            .then(|| DraftTerms::of(&draft_config, 1_357 * MIB)),
         format,
         dtype: DType::BFloat16,
+        mtp: mtp.is_some(),
+        mtp_state_in_pool: mtp.unwrap_or(false),
     };
     evaluate_qwen35_plan(
         "Qwen3.5",
@@ -702,5 +848,93 @@ fn unplanned_estimate_refuses_what_the_load_refuses() {
         past.expect_err("past native without a plan").reason,
         "Qwen3.5: --max-context 300000 is past the native window of 262144, and this load has \
          no memory plan to hold it"
+    );
+}
+
+/// The int8 pool window from the plan on the M3 Pro inputs (27 GiB working
+/// set, 17,357 MiB active, the 27B with its DFlash2 draft): the pool lane is
+/// priced in int8 pages (1,064,960 B a 32-token page, 128-page extents), its
+/// runway is one extent plus a GDN cell, and its transient is the bounded
+/// int8 varlen workspace. A bf16 pool on the same inputs holds less than
+/// half the window.
+/// Mutation W1: the pool lane's layout keeps `KvFormat::Bf16` → window
+/// 53,849 → red.
+#[test]
+fn int8_pool_window_from_the_plan() {
+    let int8 = plan_27b_as("int8-window", 27 << 30, None, 262_144, Some(KvFormat::Int8));
+    let pool = int8.pool.expect("pool lane");
+    assert_eq!(pool.bytes_per_block, 532_480);
+    assert_eq!(pool.max_blocks, 6_932);
+    assert_eq!(pool.max_mib(), 3_520);
+    assert_eq!(pool.runway_blocks, 546);
+    assert_eq!(pool.lane.transient_bytes, 419_823_616);
+    assert_eq!(pool.lane.extent_pages, 128);
+    assert_eq!(pool.lane.window.maximum(), 102_393);
+    assert_eq!(pool.lane.window.bound(), "memory");
+    let speculative = int8.speculative.expect("draft lane");
+    assert_eq!(speculative.held_bytes, 546 * 532_480);
+    eprintln!(
+        "int8 pool: DFlash2 lane window {}",
+        speculative.window.maximum()
+    );
+
+    let bf16 = plan_27b_as("bf16-window", 27 << 30, None, 262_144, Some(KvFormat::Bf16));
+    let pool = bf16.pool.expect("pool lane");
+    assert_eq!(pool.bytes_per_block, 1 << 20);
+    assert_eq!(pool.runway_blocks, 275);
+    eprintln!(
+        "bf16 pool: window {} max_blocks {} transient {}",
+        pool.lane.window.maximum(),
+        pool.max_blocks,
+        pool.lane.transient_bytes
+    );
+    assert!(2 * pool.lane.window.maximum() < 102_393);
+}
+
+/// One window for every non-DFlash2 turn: a load that can run MTP turns on
+/// the pool lane (MTP heads, no draft) charges the MTP state it holds at the
+/// window once, beside the pool (Splash `laneStateBytes`), and inside the
+/// pool too only when the scheduler books it there. M3 Pro inputs, int8
+/// pool: 55,207 (3,874 blocks) for a serial MTP load, 20,473 when the
+/// scheduler books the state in the pool, against 102,393 without MTP
+/// heads. `lane_bytes` carries the cell and the state at the window.
+/// Mutation O1: `LaneKv::Pool::budget` ignores the state → red (102,393).
+#[test]
+fn mtp_state_prices_the_one_pool_window() {
+    let cell = 153_944_064u64;
+    let config = {
+        let mut config = crate::models::qwen3_5::dflash2_decode::tests::qwen38_27b_cfg();
+        config.n_mtp_layers = 1;
+        config
+    };
+    let serial = plan_27b_lanes(
+        "mtp-serial",
+        27 << 30,
+        None,
+        262_144,
+        Some(KvFormat::Int8),
+        Some(false),
+    );
+    let pool = serial.pool.expect("pool lane");
+    assert_eq!(pool.lane.window.maximum(), 55_207);
+    assert_eq!(pool.max_blocks, 3_874);
+    assert_eq!(
+        pool.lane.lane_bytes,
+        cell + crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState::held_bytes(
+            &config, 55_207
+        )
+    );
+    assert!(serial.speculative.is_none());
+    let booked = plan_27b_lanes(
+        "mtp-booked",
+        27 << 30,
+        None,
+        262_144,
+        Some(KvFormat::Int8),
+        Some(true),
+    );
+    assert_eq!(
+        booked.pool.expect("pool lane").lane.window.maximum(),
+        20_473
     );
 }

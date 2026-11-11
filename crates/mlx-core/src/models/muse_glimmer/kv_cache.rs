@@ -1322,7 +1322,7 @@ mod tests {
         let cfg = MuseGlimmerConfig::from_json_str(&config_json(&text))
             .expect("a non-reference window and context length must still validate");
 
-        let specs = compute_layer_kv_cache_specs(&cfg, 32, KVCacheDType::Fp8)
+        let specs = compute_layer_kv_cache_specs(&cfg, 32, KVCacheDType::Float16)
             .expect("specs must derive for the non-reference config");
         assert_eq!(
             specs[0].attention_kind,
@@ -1332,9 +1332,9 @@ mod tests {
             "the window must come from the config, not from a literal 2048"
         );
         assert_eq!(specs[0].physical_layout.block_size, 32);
-        assert_eq!(specs[0].physical_layout.cache_dtype, KVCacheDType::Fp8);
+        assert_eq!(specs[0].physical_layout.cache_dtype, KVCacheDType::Float16);
 
-        let groups = compute_layer_kv_cache_groups(&cfg, 32, KVCacheDType::Fp8, CHUNK)
+        let groups = compute_layer_kv_cache_groups(&cfg, 32, KVCacheDType::Float16, CHUNK)
             .expect("groups must derive for the non-reference config");
         // full    = div_ceil(65536, 32)                       = 2048
         // sliding = div_ceil(min(1023 + 512, 65536), 32) + 1   = 48 + 1 = 49

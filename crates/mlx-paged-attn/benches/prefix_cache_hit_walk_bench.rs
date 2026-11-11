@@ -70,7 +70,7 @@ fn build_populated_allocator(num_blocks: usize) -> (BlockAllocator, Vec<u32>) {
 /// prefix: `find_longest_cache_hit` looks up all `PREFIX_BLOCKS` blocks in
 /// order and stamps only the last. `num_blocks` (500/2000/8000)
 /// stands in for realistic prefix-cache population sizes (bigger
-/// `gpu_memory_mb`, or FP8 cache doubling block count).
+/// `gpu_memory_mb`, or an int8 pool's near-double block count).
 fn shared_prefix_cache_hit_walk(c: &mut Criterion) {
     let mut group = c.benchmark_group("prefix_cache_hit_walk");
     for &num_blocks in &[500usize, 2000, 8000] {

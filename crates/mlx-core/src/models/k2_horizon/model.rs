@@ -201,7 +201,6 @@ impl K2Inner {
                 head_size: config.head_dim() as u32,
                 num_kv_heads: config.num_key_value_heads as u32,
                 num_layers: config.num_hidden_layers as u32,
-                use_fp8_cache: Some(false),
                 max_seq_len: Some(config.max_position_embeddings as u32),
                 max_batch_size: Some(scheduler_max_num_seqs_for(32) as u32),
             };
@@ -311,7 +310,6 @@ impl K2Inner {
             head_size: self.config.head_dim() as u32,
             num_kv_heads: self.config.num_key_value_heads as u32,
             num_layers: self.config.num_hidden_layers as u32,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(per_seq_context),
             max_batch_size: Some(scheduler_max_num_seqs_for(32) as u32),
         };

@@ -102,6 +102,8 @@ pub(super) fn pool_input<'a>(c: &Config, transient: &'a dyn Fn(u32) -> u64) -> P
         runway_blocks: layout.runway_pages().min(u64::from(u32::MAX)) as u32,
         explicit_mib: None,
         lane_in_pool: false,
+        state: &|_| 0,
+        state_in_pool: false,
     }
 }
 

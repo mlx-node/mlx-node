@@ -142,6 +142,7 @@ impl Qwen35Inner {
                 "Qwen3.5",
                 &*self,
                 recurrent,
+                self.has_mtp_weights(),
                 None,
                 self.max_memory_bytes,
                 self.max_context,
@@ -160,7 +161,14 @@ impl Qwen35Inner {
         let head_size = self.config.head_dim as u32;
         let num_kv_heads = self.config.num_kv_heads as u32;
         let max_seq_len = self.config.served_context_tokens();
-        let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+        let format = self.config.kv_format();
+        let cache_dtype = crate::models::qwen3_5::load_plan::qwen35_pool_cache_dtype(
+            "Qwen3.5 block-paged adapter",
+            format,
+            head_size,
+            block_size,
+            crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(&*self)?,
+        )?;
         let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
             attn_layer_count,
             num_kv_heads,
@@ -173,7 +181,9 @@ impl Qwen35Inner {
             "Qwen3.5",
             &*self,
             recurrent,
+            self.has_mtp_weights(),
             Some(crate::models::qwen3_5::load_plan::PoolGeometry {
+                format,
                 bytes_per_block,
                 block_size,
                 layers: attn_layer_count,
@@ -198,7 +208,6 @@ impl Qwen35Inner {
             head_size,
             num_kv_heads,
             num_layers: attn_layer_count,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(max_seq_len),
             max_batch_size: Some(32),
         };
@@ -229,12 +238,13 @@ impl Qwen35Inner {
         info!(
             "Qwen3.5 paged adapter enabled after weight materialization: initial_blocks={}, \
              max_blocks={}, block_size={}, pool_window_tokens={}, trained_window_tokens={}, \
-             pool_kv_format=bf16",
+             pool_kv_format={}",
             num_blocks,
             max_num_blocks,
             block_size,
             pool_plan.lane.window.maximum(),
             max_seq_len,
+            format.as_str(),
         );
         self.memory_plan = Some(plan);
         Ok(())
@@ -252,8 +262,8 @@ impl Qwen35Inner {
     /// prefix is reduced to the deepest boundary a validated GDN sidecar backs,
     /// and a boundary nothing backs restores nothing.
     ///
-    /// The GDN geometry (and the pool's cache dtype, which the sidecar is
-    /// written and read in) is folded into the fingerprint explicitly:
+    /// The GDN geometry (and the activation dtype the sidecar is written in)
+    /// is folded into the fingerprint explicitly:
     /// [`crate::cold_tier::ColdTierGeometry`] describes the POOL, which here
     /// covers only the full-attention layers, so two configs differing ONLY in
     /// GDN geometry would otherwise share a pool geometry.
@@ -277,9 +287,10 @@ impl Qwen35Inner {
         // No GDN layers means no out-of-pool state — but it also means this is
         // not the hybrid qwen3_5 the sidecar work validated, so stay off rather
         // than silently behaving like a dense family.
-        let geometry = crate::models::qwen3_5::gdn_sidecar::geometry(&self.config, &cache_dtype)?;
-        let sidecar_policy =
-            crate::models::qwen3_5::gdn_sidecar::policy(&self.config, &cache_dtype)?;
+        let activation =
+            crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(self).ok()?;
+        let geometry = crate::models::qwen3_5::gdn_sidecar::geometry(&self.config, activation)?;
+        let sidecar_policy = crate::models::qwen3_5::gdn_sidecar::policy(&self.config, activation)?;
         let config_json = cold_tier_config_json(
             &self.config,
             &self.config.scaling(),
@@ -412,11 +423,12 @@ impl Qwen35Inner {
             .memory_plan
             .as_ref()
             .is_some_and(crate::engine::memory_plan::MemoryPlan::prices_speculative_lane);
-        // The block-paged pool stores BF16 K/V whatever `kv_format` says.
-        let kv_format = if self.paged_adapter.is_some() {
-            crate::transformer::KvFormat::Bf16
-        } else {
-            self.config.kv_format()
+        let kv_format = match self.paged_adapter.as_ref() {
+            Some(adapter) => match adapter.layer_kv_pool().cache_dtype() {
+                mlx_paged_attn::metal::MetalDtype::Int8 => crate::transformer::KvFormat::Int8,
+                _ => crate::transformer::KvFormat::Bf16,
+            },
+            None => self.config.kv_format(),
         };
         let speculative_format =
             crate::models::qwen3_5::dflash2_turn::dflash2_target_kv_format(self);

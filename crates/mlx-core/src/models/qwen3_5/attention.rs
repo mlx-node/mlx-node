@@ -1526,7 +1526,10 @@ impl Qwen3_5Attention {
         let write_info_start =
             (inference_info_enabled && is_prefill && attn_layer_idx == 0 && seq_len > 8)
                 .then(Instant::now);
-        let write_path = if native_kv_write_enabled() {
+        // An int8 pool is written only by the native store (Splash
+        // `PagedAttention::addPrefillStore`); its error is the turn's error.
+        let int8_pool = adapter.cache_dtype() == mlx_paged_attn::metal::MetalDtype::Int8;
+        let write_path = if native_kv_write_enabled() || int8_pool {
             match adapter.update_keys_values_native(
                 attn_layer_idx,
                 &keys_paged,
@@ -1534,6 +1537,7 @@ impl Qwen3_5Attention {
                 first_logical_position,
             ) {
                 Ok(()) => "native",
+                Err(err) if int8_pool => return Err(napi::Error::from_reason(err)),
                 Err(err) => {
                     if trace_enabled {
                         write_inference_trace(format_args!(
@@ -1670,19 +1674,26 @@ impl Qwen3_5Attention {
                     d256_full_sdpa_available,
                     portable_d256_available,
                 );
-                let estimated_varlen_bytes = estimate_varlen_paged_attention_bytes(
-                    seq_len as u64,
-                    total_ctx as u64,
-                    self.num_heads as u64,
-                    self.num_kv_heads as u64,
-                    self.head_dim as u64,
-                    dtype_bytes,
-                );
+                let estimated_varlen_bytes = if int8_pool {
+                    crate::transformer::paged_policy::estimate_int8_varlen_prefill_bytes(
+                        seq_len as u64,
+                        total_ctx as u64,
+                        self.num_heads as u64,
+                        self.head_dim as u64,
+                    )
+                } else {
+                    estimate_varlen_paged_attention_bytes(
+                        seq_len as u64,
+                        total_ctx as u64,
+                        self.num_heads as u64,
+                        self.num_kv_heads as u64,
+                        self.head_dim as u64,
+                        dtype_bytes,
+                    )
+                };
                 let varlen_aux_fits = estimated_varlen_bytes != u64::MAX;
-                let prefill_mode = cache_hit_prefill_mode_for_pool(
-                    cache_hit_prefill_mode(),
-                    adapter.cache_dtype() == mlx_paged_attn::metal::MetalDtype::Int8,
-                );
+                let prefill_mode =
+                    cache_hit_prefill_mode_for_pool(cache_hit_prefill_mode(), int8_pool);
                 // Tiny MTP verification prefills are hard-routed to varlen,
                 // and explicit overrides ignore memory heuristics. Avoid all
                 // live probes on those hot paths. The adapter caches the
@@ -1884,6 +1895,7 @@ impl Qwen3_5Attention {
                     None
                 };
 
+                let mut varlen_error = None;
                 let maybe_paged_attn = if should_try_varlen_after_sdpa(
                     prefill_mode,
                     maybe_sdpa.is_some(),
@@ -1966,6 +1978,7 @@ impl Qwen3_5Attention {
                                 error = %err,
                                 "cache-hit varlen PagedAttention construction failed"
                             );
+                            varlen_error = Some(err);
                             None
                         }
                     }
@@ -1975,6 +1988,15 @@ impl Qwen3_5Attention {
 
                 match maybe_sdpa.or(maybe_paged_attn) {
                     Some(attn) => attn,
+                    // Splash reads int8 pages only in place; there is no
+                    // dequantizing host route.
+                    None if int8_pool => {
+                        return Err(napi::Error::from_reason(format!(
+                            "qwen3.5 int8 cache-hit prefill: the paged varlen read did not run \
+                             (batch {batch}, graph backend {graph_backend_available}): {}",
+                            varlen_error.as_deref().unwrap_or("not attempted")
+                        )));
+                    }
                     None => {
                         // Last-resort graph-construction path. Metal dispatch
                         // errors surface later when the lazy graph evaluates.
@@ -4661,7 +4683,7 @@ mod tests {
         assert_eq!(
             prefill_sdpa_effective_dtype(DType::BFloat16, None),
             None,
-            "FP8 paged caches cannot feed graph-native SDPA without dequantization"
+            "int8 paged caches cannot feed graph-native SDPA without dequantization"
         );
     }
 

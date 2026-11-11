@@ -394,6 +394,11 @@ pub struct ColdSidecarPolicy {
 }
 
 impl ColdSidecarPolicy {
+    /// The geometry template (boundary 0) every sidecar is checked against.
+    pub fn layout(&self) -> &ColdSidecarLayout {
+        &self.layout
+    }
+
     /// Build a policy from a geometry template. Rejects [`ColdGroup::Kv`] and
     /// any geometry a sidecar could never legally be written with, so an
     /// impossible policy cannot be installed and then silently suppress every
@@ -3059,7 +3064,6 @@ mod restore_decomposition_bench {
             head_size: BENCH_HEAD_SIZE,
             num_kv_heads: BENCH_KV_HEADS,
             num_layers: BENCH_LAYERS,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(4096),
             max_batch_size: Some(1),
         };
@@ -4301,7 +4305,6 @@ mod write_decomposition_bench {
                 head_size: geometry.head_size as u32,
                 num_kv_heads: geometry.kv_heads as u32,
                 num_layers: geometry.layers as u32,
-                use_fp8_cache: Some(false),
                 max_seq_len: Some(4096),
                 max_batch_size: Some(1),
             };
@@ -5174,7 +5177,6 @@ mod tests {
             head_size: 64,
             num_kv_heads: 1,
             num_layers: 1,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
@@ -5238,7 +5240,6 @@ mod tests {
             head_size: 64,
             num_kv_heads: 1,
             num_layers: 1,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
@@ -7192,7 +7193,6 @@ mod tests {
             head_size: 64,
             num_kv_heads: 1,
             num_layers: 1,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
@@ -7266,100 +7266,185 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// An int8 block's scale planes ride in the K / V blobs (Splash
-    /// `PageStorage::layerSpans`), byte-exact through capture and restore; a
-    /// layout without the scale bytes, or of another dtype, does not match.
+    /// Int8 blocks round-trip the cold tier byte for byte, scale planes
+    /// included: each blob is the layer's K | Ks and V | Vs (Splash
+    /// `PageStorage::layerSpans` order, the version-0 slot), on a Shared and a
+    /// Private pool, through the single-block restore and the background
+    /// batch restore. A layout without the scale bytes, or of another dtype,
+    /// does not match the pool.
     ///
-    /// Mutation M9: `layout_matches_pool` compares data bytes only.
+    /// Mutation C1: the capture read zeroes the scale tails → the restored
+    /// scales differ → red.
     #[cfg(target_os = "macos")]
     #[test]
-    fn int8_block_round_trips_through_the_cold_tier() {
+    fn int8_blocks_round_trip_the_cold_tier_on_every_restore_path() {
         use crate::metal::MetalDtype;
         use crate::{PagedAttentionConfig, hash_tokens};
 
+        const LAYERS: u32 = 2;
         let config = PagedAttentionConfig {
             block_size: 16,
             gpu_memory_mb: 256,
-            head_size: 128,
-            num_kv_heads: 1,
-            num_layers: 1,
-            use_fp8_cache: Some(false),
+            head_size: 256,
+            num_kv_heads: 4,
+            num_layers: LAYERS,
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
-        let pool = match LayerKVPool::new(config, 2, 2, MetalDtype::Int8) {
-            Ok(pool) => pool,
-            Err(e) if e.contains("No Metal device found") => return,
-            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        let data = 4 * 256 * 16;
+        let scales = 16 * 4 * 4;
+        let blob = data + scales;
+        // Distinct per layer and side; the scale tail is not a continuation
+        // of the data pattern.
+        let blob_of = |layer: usize, side: usize| -> Vec<u8> {
+            (0..blob)
+                .map(|i| {
+                    if i < data {
+                        ((i * (7 + 2 * side) + 31 * layer) % 251) as u8
+                    } else {
+                        ((i * 13 + 97 * layer + 53 * side + 5) % 241) as u8
+                    }
+                })
+                .collect()
         };
-        let data = 128 * 16;
-        let scales = 16 * 4;
-        assert_eq!(
-            pool.block_blob_bytes().unwrap(),
-            ((data + scales) as u64, (data + scales) as u64)
-        );
-        let allocator = Mutex::new(BlockAllocator::new(2, 2, 16));
-        let source = allocator.lock().unwrap().allocate().unwrap();
-        let keys: Vec<u8> = (0..data + scales).map(|i| (i * 7 % 251) as u8).collect();
-        let values: Vec<u8> = (0..data + scales)
-            .map(|i| (250 - (i * 3 % 251)) as u8)
-            .collect();
-        pool.write_blocks_from_host(0, &[source.block_id], &keys, &values)
-            .unwrap();
-
-        let root = temp_root("int8-restore");
-        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
-        let tokens: Vec<u32> = (1..=16).collect();
-        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &tokens, &[], 0, 0);
-        assert!(
-            manager
-                .capture_and_enqueue(&pool, &source, key, fingerprint(), &tokens)
-                .unwrap()
-        );
-        let path = root.join(format!("{}.safetensors", key.to_hex()));
-        for _ in 0..100 {
-            if path.exists() {
-                break;
+        let pools = [
+            (
+                "shared",
+                LayerKVPool::new(config.clone(), 4, 4, MetalDtype::Int8),
+            ),
+            (
+                "private",
+                LayerKVPool::new_private_for_test(config, 4, 4, MetalDtype::Int8),
+            ),
+        ];
+        for (name, pool) in pools {
+            let pool = match pool {
+                Ok(pool) => pool,
+                Err(e) if e.contains("No Metal device found") => return,
+                Err(e) => panic!("unexpected LayerKVPool failure ({name}): {e}"),
+            };
+            assert_eq!(
+                pool.block_blob_bytes().unwrap(),
+                (blob as u64, blob as u64),
+                "{name}"
+            );
+            let allocator = Mutex::new(BlockAllocator::new(4, 4, 16));
+            let source = allocator.lock().unwrap().allocate().unwrap();
+            for layer in 0..LAYERS as usize {
+                pool.write_blocks_from_host(
+                    layer as u32,
+                    &[source.block_id],
+                    &blob_of(layer, 0),
+                    &blob_of(layer, 1),
+                )
+                .unwrap();
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        allocator.lock().unwrap().free(source);
-        let identity = RestorePrefixIdentity {
-            hot_hash: hash_tokens(&tokens, 0, &[]),
-            tokens: tokens.clone(),
-            parent_hot_hash: 0,
-            extra_keys: vec![],
-            cache_salt: 0,
-            block_index: 0,
-        };
-        let restored = manager
-            .restore_block(&pool, &allocator, key, fingerprint(), &identity)
-            .expect("int8 cold block restore");
-        assert_eq!(
-            pool.read_blocks_to_host(0, &[restored.block_id]).unwrap(),
-            (keys, values)
-        );
-        allocator.lock().unwrap().free(restored);
+            let read_back = |block_id: u32| -> Vec<(Vec<u8>, Vec<u8>)> {
+                (0..LAYERS as usize)
+                    .map(|layer| pool.read_blocks_to_host(layer as u32, &[block_id]).unwrap())
+                    .collect()
+            };
+            let written: Vec<_> = (0..LAYERS as usize)
+                .map(|layer| (blob_of(layer, 0), blob_of(layer, 1)))
+                .collect();
+            assert_eq!(read_back(source.block_id), written, "{name}: host write");
 
-        let layout = ColdCacheLayout {
-            block_size: 16,
-            num_layers: 1,
-            num_kv_heads: 1,
-            head_size: 128,
-            cache_dtype: "Int8".to_string(),
-            key_bytes_per_layer: data + scales,
-            value_bytes_per_layer: data + scales,
-        };
-        assert!(layout_matches_pool(&layout, &pool));
-        let mut data_only = layout.clone();
-        data_only.key_bytes_per_layer = data;
-        data_only.value_bytes_per_layer = data;
-        assert!(!layout_matches_pool(&data_only, &pool));
-        let mut bf16 = layout.clone();
-        bf16.cache_dtype = "BFloat16".to_string();
-        assert!(!layout_matches_pool(&bf16, &pool));
-        drop(manager);
-        let _ = fs::remove_dir_all(root);
+            let root = temp_root(&format!("int8-restore-{name}"));
+            let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+            let tokens: Vec<u32> = (1..=16).collect();
+            let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &tokens, &[], 0, 0);
+            assert!(
+                manager
+                    .capture_and_enqueue(&pool, &source, key, fingerprint(), &tokens)
+                    .unwrap(),
+                "{name}: capture"
+            );
+            let path = root.join(format!("{}.safetensors", key.to_hex()));
+            for _ in 0..200 {
+                if path.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(path.exists(), "{name}: the block must reach the disk");
+            allocator.lock().unwrap().free(source);
+            let identity = RestorePrefixIdentity {
+                hot_hash: hash_tokens(&tokens, 0, &[]),
+                tokens: tokens.clone(),
+                parent_hot_hash: 0,
+                extra_keys: vec![],
+                cache_salt: 0,
+                block_index: 0,
+            };
+
+            let restored = manager
+                .restore_block(&pool, &allocator, key, fingerprint(), &identity)
+                .expect("int8 cold block restore");
+            assert_eq!(
+                read_back(restored.block_id),
+                written,
+                "{name}: restore_block is byte-exact with scales"
+            );
+            allocator.lock().unwrap().free(restored);
+
+            let batch_allocator = Mutex::new(BlockAllocator::new(4, 4, 16));
+            let reserved = vec![batch_allocator.lock().unwrap().allocate().unwrap()];
+            let destination = reserved[0].block_id;
+            let identities = vec![identity.clone()];
+            let mut job = manager
+                .begin_restore_batch(&pool, vec![key], fingerprint())
+                .expect("start the batch restore");
+            let batch = (0..400)
+                .find_map(|_| {
+                    let batch = job.poll_upload(&pool, &reserved, &identities);
+                    if batch.is_none() {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    batch
+                })
+                .expect("the batch restore must finish");
+            let commit = manager
+                .commit_restore_batch(
+                    &pool,
+                    &batch_allocator,
+                    batch,
+                    reserved,
+                    &identities,
+                    job.elapsed(),
+                )
+                .expect("int8 batch restore commits");
+            assert_eq!(
+                read_back(destination),
+                written,
+                "{name}: the batch restore is byte-exact with scales"
+            );
+            {
+                let mut allocator = batch_allocator.lock().unwrap();
+                for block in commit.blocks {
+                    allocator.free(block);
+                }
+            }
+
+            let layout = ColdCacheLayout {
+                block_size: 16,
+                num_layers: LAYERS,
+                num_kv_heads: 4,
+                head_size: 256,
+                cache_dtype: "Int8".to_string(),
+                key_bytes_per_layer: blob,
+                value_bytes_per_layer: blob,
+            };
+            assert!(layout_matches_pool(&layout, &pool), "{name}");
+            let mut data_only = layout.clone();
+            data_only.key_bytes_per_layer = data;
+            data_only.value_bytes_per_layer = data;
+            assert!(!layout_matches_pool(&data_only, &pool), "{name}");
+            let mut bf16 = layout.clone();
+            bf16.cache_dtype = "BFloat16".to_string();
+            assert!(!layout_matches_pool(&bf16, &pool), "{name}");
+            drop(manager);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     /// A block that decodes cleanly but then fails a post-decode restore step is
@@ -7381,7 +7466,6 @@ mod tests {
             head_size: 64,
             num_kv_heads: 1,
             num_layers: 1,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
@@ -7477,7 +7561,6 @@ mod tests {
             head_size: 64,
             num_kv_heads: 1,
             num_layers: 1,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
@@ -7561,7 +7644,6 @@ mod tests {
             head_size: 64,
             num_kv_heads: 1,
             num_layers: 1,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
@@ -7673,7 +7755,6 @@ mod tests {
             head_size: 64,
             num_kv_heads: 1,
             num_layers: 1,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
@@ -7793,7 +7874,6 @@ mod tests {
             head_size: 64,
             num_kv_heads: 1,
             num_layers: 1,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(64),
             max_batch_size: Some(1),
         };
