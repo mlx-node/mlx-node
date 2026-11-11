@@ -350,6 +350,13 @@ pub struct Qwen4ExpLoadOptions {
     /// load fails when its plan holds fewer. Past the native window the
     /// target's RoPE takes YaRN.
     pub max_context_tokens: Option<i64>,
+    /// Element format of the attention K/V pages: `'int8'` (per-token
+    /// symmetric int8 rows with one fp32 scale each) or `'bf16'`. Unset:
+    /// int8 where the int8 page kernels serve the head dimension (128 or
+    /// 256), bf16 elsewhere; an explicit `'int8'` they cannot serve fails
+    /// the load.
+    #[napi(ts_type = "'int8' | 'bf16' | undefined")]
+    pub kv_format: Option<String>,
 }
 
 /// Load-time residency decision (the budget is admitted before payload
@@ -410,45 +417,36 @@ pub struct Qwen4ExpContextLimits {
     pub paged_block_capacity: u32,
     pub paged_block_size: u32,
     pub trained_window_tokens: u32,
-    /// Tokens an MTP turn may hold: its draft state beside the pool. Set only
-    /// with MTP weights.
-    pub speculative_window_tokens: Option<u32>,
     /// The output budget fills the window: a prompt leaves room for one new
     /// token and the budget is clamped to `window - prompt`.
     pub rest_of_window_output_budget: bool,
     /// An omitted budget on `effective_window_tokens` is the rest of that
     /// window.
     pub omitted_budget_is_rest_of_window: bool,
-    /// The same for `speculative_window_tokens`.
-    pub speculative_omitted_budget_is_rest_of_window: bool,
+    /// Format of the K/V every turn writes.
+    #[napi(ts_type = "'int8' | 'bf16'")]
+    pub kv_format: String,
 }
 
 impl Qwen4ExpContextLimits {
-    /// The windows of the memory plan the load settled on.
+    /// The window of the memory plan the load settled on, for every turn.
     fn from_plan(
         config: &config::Config,
         plan: &crate::engine::memory_plan::MemoryPlan,
-        has_mtp: bool,
         cap: u32,
     ) -> Result<Self> {
         let pool = plan
             .pool
             .as_ref()
             .ok_or_else(|| Error::from_reason("Qwen4Exp memory plan: the load planned no pool"))?;
-        let speculative = if has_mtp {
-            load_plan::mtp_window(config, plan).map(|window| window.min(cap))
-        } else {
-            None
-        };
         Ok(Self {
             effective_window_tokens: pool.lane.window.maximum().min(cap),
             paged_block_capacity: pool.max_blocks,
             paged_block_size: crate::engine::memory_plan::KV_PAGE_TOKENS as u32,
             trained_window_tokens: config.max_position_embeddings.min(u32::MAX as usize) as u32,
-            speculative_window_tokens: speculative,
             rest_of_window_output_budget: true,
             omitted_budget_is_rest_of_window: true,
-            speculative_omitted_budget_is_rest_of_window: speculative.is_some(),
+            kv_format: config.kv_format.as_str().into(),
         })
     }
 }
@@ -510,6 +508,8 @@ impl Qwen4ExpModel {
                     options.auxiliary_model_path.as_deref(),
                 )?;
                 load_plan::serve_context(LABEL, &mut config, max_context)?;
+                config.kv_format =
+                    load_plan::resolve_kv_format(LABEL, options.kv_format.as_deref(), &config)?;
                 let has_mtp = auxiliary::validate_mtp(&weights, &config)?;
                 let vision = media::Vision::metadata(&raw, &weights, &config)?;
                 let supports_images = vision.available();
@@ -563,6 +563,7 @@ impl Qwen4ExpModel {
                             live,
                             held_back.saturating_add(inventory.vision_bytes),
                             max_memory,
+                            has_mtp,
                         )
                     };
                     let held_back = decoder.weights.held_back_bytes();
@@ -577,6 +578,11 @@ impl Qwen4ExpModel {
                     })?;
                     let adapter = paged::create(&config, &pool_plan, plan.ceiling_bytes())?;
                     let pool_bytes = adapter.pool_allocated_bytes().map_err(Error::from_reason)?;
+                    tracing::info!(
+                        "{LABEL} pool: kv_format={}, {} B blocks",
+                        config.kv_format.as_str(),
+                        adapter.bytes_per_block().map_err(Error::from_reason)?
+                    );
                     decoder.paged = Some(adapter);
                     let guard = crate::cache_limit::coordinator().register_pool(pool_bytes);
                     (guard, plan, pool_bytes)
@@ -596,7 +602,6 @@ impl Qwen4ExpModel {
                 let context_limits = Qwen4ExpContextLimits::from_plan(
                     &config,
                     &memory_plan,
-                    has_mtp,
                     max_context.unwrap_or_else(|| config.served_context_tokens()),
                 )?;
                 decoder.context_window = context_limits.effective_window_tokens as usize;

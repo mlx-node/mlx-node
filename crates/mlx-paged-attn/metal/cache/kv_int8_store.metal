@@ -15,7 +15,10 @@ using namespace metal;
 //                 (Splash `splash_kv_value_element`, dimension-major)
 //   key_scales    [num_blocks, num_heads, block_size] f32
 //   value_scales  (Splash `splash_q8_scale_index`)
-template <uint HeadDim>
+// ValuesTokenMajor (the `_vt` instances): key_cache and value_cache are both
+// [num_blocks, num_heads, block_size, HeadDim] (Splash
+// `splash_kv_key_element`; `splash_kv_value_index` under `ValuesTokenMajor`).
+template <uint HeadDim, bool ValuesTokenMajor>
 [[kernel]] void reshape_and_cache_int8(
     const device bfloat16_t *__restrict__ key [[buffer(0)]],
     const device bfloat16_t *__restrict__ value [[buffer(1)]],
@@ -76,7 +79,13 @@ template <uint HeadDim>
       maximum == 0.0f ? 0 : clamp(int(rint(value_f * 127.0f / maximum)), -127, 127);
 
   const ulong scale_index = block_head * ulong(block_size) + page_token;
-  if (value_tensor) {
+  if (ValuesTokenMajor) {
+    device char *cache = value_tensor ? value_cache : key_cache;
+    cache[scale_index * HeadDim + dimension] = char(quantized);
+    if (dimension == 0) {
+      (value_tensor ? value_scales : key_scales)[scale_index] = scale;
+    }
+  } else if (value_tensor) {
     value_cache[(block_head * HeadDim + dimension) * ulong(block_size) + page_token] =
         char(quantized);
     if (dimension == 0) {
@@ -93,9 +102,10 @@ template <uint HeadDim>
   }
 }
 
-#define instantiate_reshape_and_cache_int8(head_dim)                           \
-  template [[host_name("reshape_and_cache_int8_kv_bfloat16_t_hd" #head_dim)]]  \
-  [[kernel]] void reshape_and_cache_int8<head_dim>(                            \
+#define instantiate_reshape_and_cache_int8(head_dim, vt, suffix)              \
+  template [[host_name("reshape_and_cache_int8_kv_bfloat16_t_hd" #head_dim     \
+                       suffix)]]                                               \
+  [[kernel]] void reshape_and_cache_int8<head_dim, vt>(                        \
       const device bfloat16_t *__restrict__ key [[buffer(0)]],                 \
       const device bfloat16_t *__restrict__ value [[buffer(1)]],               \
       device char *__restrict__ key_cache [[buffer(2)]],                       \
@@ -113,5 +123,7 @@ template <uint HeadDim>
       uint simd_lane [[thread_index_in_simdgroup]],                            \
       uint simd_group [[simdgroup_index_in_threadgroup]]);
 
-instantiate_reshape_and_cache_int8(128);
-instantiate_reshape_and_cache_int8(256);
+instantiate_reshape_and_cache_int8(128, false, "");
+instantiate_reshape_and_cache_int8(256, false, "");
+instantiate_reshape_and_cache_int8(128, true, "_vt");
+instantiate_reshape_and_cache_int8(256, true, "_vt");

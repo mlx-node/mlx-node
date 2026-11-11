@@ -476,6 +476,7 @@ export const MODEL_FAMILY_DATA = [
     kind: 'loadable',
     match: { rawModelTypes: ['qwen4_exp', 'qwen4_exp_text'] },
     acceptsAuxiliaryModel: true,
+    acceptsKvFormat: true,
     acceptsMaxMemory: true,
     acceptsMaxContext: true,
     streamOpts: { recordModelPath: true },

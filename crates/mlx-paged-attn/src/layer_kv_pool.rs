@@ -136,6 +136,31 @@ fn bridge_dtype_code(dtype: MetalDtype) -> Result<i32, String> {
 /// (Splash `PageStorage::layerSpans` order K, K scales, V, V scales).
 pub type BlockLayerBytes = (Vec<u8>, Vec<u8>);
 
+/// How a pool's pages are laid out (Splash `kv::Layout`). The default is
+/// the vLLM page every paged-attention kernel reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageLayout {
+    /// K and V rows token-major, `[num_kv_heads, block_size, head_size]`
+    /// per block (Splash `splash_kv_key_element`, and
+    /// `splash_kv_value_index` under `valuesTokenMajor`, which a
+    /// `SelectedBlocks` layout requires). Else vLLM K
+    /// `[num_kv_heads, head_size/x, block_size, x]`, V
+    /// `[num_kv_heads, head_size, block_size]`.
+    pub values_token_major: bool,
+    /// Pooled index keys per block and layer, bf16 `[index_rows,
+    /// index_dimension]` (Splash `Layout::indexDimension`, the index plane
+    /// of `PageStorage::indexOffset`). 0: no index plane.
+    pub index_rows: u32,
+    pub index_dimension: u32,
+}
+
+impl PageLayout {
+    /// Bytes of one block's index slot in one layer.
+    pub fn index_bytes(&self) -> u64 {
+        u64::from(self.index_rows) * u64::from(self.index_dimension) * 2
+    }
+}
+
 /// One block's byte size in each plane of one layer. `scale` is 0 for a pool
 /// without scale planes (Splash BF16 pages carry no scale bytes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +168,7 @@ pub struct PlaneBytes {
     pub key: u64,
     pub value: u64,
     pub scale: u64,
+    pub index: u64,
 }
 
 impl PlaneBytes {
@@ -157,7 +183,13 @@ impl PlaneBytes {
             Plane::Key => self.key,
             Plane::Value => self.value,
             Plane::KeyScale | Plane::ValueScale => self.scale,
+            Plane::Index => self.index,
         }
+    }
+
+    /// Bytes of one block in one layer, every plane included.
+    pub fn total(&self) -> u64 {
+        self.key + self.value + 2 * self.scale + self.index
     }
 
     /// Where `plane`'s slot sits inside its side's blob.
@@ -167,6 +199,7 @@ impl PlaneBytes {
             Plane::Key | Plane::Value => 0,
             Plane::KeyScale => self.key,
             Plane::ValueScale => self.value,
+            Plane::Index => 0,
         }
     }
 }
@@ -178,6 +211,7 @@ enum Plane {
     KeyScale,
     Value,
     ValueScale,
+    Index,
 }
 
 #[cfg(target_os = "macos")]
@@ -197,6 +231,9 @@ struct LayerPlanes {
     key: Buffer,
     value: Buffer,
     scales: Option<(Buffer, Buffer)>,
+    /// bf16 `[num_blocks, index_rows, index_dimension]` pooled index keys of
+    /// a [`PageLayout`] with an index plane.
+    index: Option<Buffer>,
 }
 
 #[cfg(target_os = "macos")]
@@ -212,6 +249,7 @@ impl LayerPlanes {
             (Plane::KeyScale, key_scale),
             (Plane::Value, Some(&self.value)),
             (Plane::ValueScale, value_scale),
+            (Plane::Index, self.index.as_ref()),
         ]
         .into_iter()
         .filter_map(|(plane, buffer)| buffer.map(|buffer| (plane, buffer)))
@@ -254,10 +292,16 @@ impl LayerPlanes {
         } else {
             None
         };
+        let index = if bytes.index > 0 {
+            Some(allocate(Plane::Index, bytes.index)?)
+        } else {
+            None
+        };
         Ok(Self {
             key: allocate(Plane::Key, bytes.key)?,
             value: allocate(Plane::Value, bytes.value)?,
             scales,
+            index,
         })
     }
 }
@@ -332,6 +376,9 @@ pub struct LayerKVPool {
     ///
     /// `Float32` is rejected at construction: no kernel stores an f32 cache.
     cache_dtype: MetalDtype,
+
+    /// Page order and index plane, fixed at construction.
+    layout: PageLayout,
 
     /// Bumped by every [`Self::grow_to`] or [`Self::shrink_to`] that swapped a layer. Consumers that cache
     /// per-layer MLX array views ([`Self::key_cache_array_raw`] /
@@ -423,14 +470,43 @@ impl LayerKVPool {
     /// read their sizes off this one table.
     #[cfg(target_os = "macos")]
     fn plane_bytes(&self) -> Result<PlaneBytes, String> {
-        Self::plane_bytes_for(&self.config, self.cache_dtype)
+        Self::plane_bytes_for(&self.config, self.cache_dtype, self.layout)
     }
 
     /// Host-transfer bytes of one block in one layer, `(key, value)`, each
     /// side's scale slot included: the length of each half of a
     /// [`BlockLayerBytes`].
     pub fn block_blob_bytes(&self) -> Result<(u64, u64), String> {
-        Self::plane_bytes_for(&self.config, self.cache_dtype).map(|bytes| bytes.blob())
+        Self::plane_bytes_for(&self.config, self.cache_dtype, self.layout).map(|bytes| bytes.blob())
+    }
+
+    /// Bytes one physical block occupies over every layer and plane, the
+    /// index plane included.
+    pub fn bytes_per_block(&self) -> Result<u64, String> {
+        let bytes = Self::plane_bytes_for(&self.config, self.cache_dtype, self.layout)?;
+        bytes
+            .total()
+            .checked_mul(u64::from(self.config.num_layers))
+            .ok_or_else(|| "LayerKVPool: block size overflows u64".to_string())
+    }
+
+    /// The pool's page layout.
+    pub fn layout(&self) -> PageLayout {
+        self.layout
+    }
+
+    /// Refuse an entry point that reads or writes the vLLM page as host
+    /// bytes or through the raw kernels: a token-major or indexed page has
+    /// neither (Splash `SlotFormat` version 1 carries such a page).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn require_vllm_page(&self, context: &str) -> Result<(), String> {
+        if self.layout != PageLayout::default() {
+            return Err(format!(
+                "{context}: a {:?} page has no host blob or raw kernel",
+                self.layout
+            ));
+        }
+        Ok(())
     }
 
     /// [`Self::plane_bytes`] for a config that is not a pool yet.
@@ -440,6 +516,7 @@ impl LayerKVPool {
     fn plane_bytes_for(
         config: &PagedAttentionConfig,
         cache_dtype: MetalDtype,
+        layout: PageLayout,
     ) -> Result<PlaneBytes, String> {
         let (element_size, x) = Self::cache_dtype_layout(cache_dtype)?;
         let x = x as u64;
@@ -469,7 +546,12 @@ impl LayerKVPool {
             .checked_mul(block_size)
             .and_then(|v| v.checked_mul(scale_bytes))
             .ok_or_else(overflow)?;
-        Ok(PlaneBytes { key, value, scale })
+        Ok(PlaneBytes {
+            key,
+            value,
+            scale,
+            index: layout.index_bytes(),
+        })
     }
 
     /// The end offset (exclusive) of physical block `block_id`'s slot in a
@@ -593,10 +675,36 @@ impl LayerKVPool {
         max_num_blocks: u32,
         cache_dtype: MetalDtype,
     ) -> Result<Self, String> {
+        Self::new_with_layout(
+            config,
+            num_blocks,
+            max_num_blocks,
+            cache_dtype,
+            PageLayout::default(),
+        )
+    }
+
+    /// [`Self::new`] with `layout`'s page order and index plane. Only the
+    /// `PagedKVWrite` store and the readers that know the layout touch such
+    /// a pool; host transfers and the raw kernels refuse it.
+    pub fn new_with_layout(
+        config: PagedAttentionConfig,
+        num_blocks: u32,
+        max_num_blocks: u32,
+        cache_dtype: MetalDtype,
+        layout: PageLayout,
+    ) -> Result<Self, String> {
         static CPU_ACCESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let cpu_access = *CPU_ACCESS
             .get_or_init(|| std::env::var("MLX_PAGED_CPU_TRANSFER").as_deref() != Ok("0"));
-        Self::new_inner(config, num_blocks, max_num_blocks, cache_dtype, cpu_access)
+        Self::new_inner_with_layout(
+            config,
+            num_blocks,
+            max_num_blocks,
+            cache_dtype,
+            layout,
+            cpu_access,
+        )
     }
 
     /// Exercise the GPU-staging fallback, including command failure injection.
@@ -610,11 +718,30 @@ impl LayerKVPool {
         Self::new_inner(config, num_blocks, max_num_blocks, cache_dtype, false)
     }
 
+    #[cfg(test)]
     fn new_inner(
         config: PagedAttentionConfig,
         num_blocks: u32,
         max_num_blocks: u32,
         cache_dtype: MetalDtype,
+        cpu_access: bool,
+    ) -> Result<Self, String> {
+        Self::new_inner_with_layout(
+            config,
+            num_blocks,
+            max_num_blocks,
+            cache_dtype,
+            PageLayout::default(),
+            cpu_access,
+        )
+    }
+
+    fn new_inner_with_layout(
+        config: PagedAttentionConfig,
+        num_blocks: u32,
+        max_num_blocks: u32,
+        cache_dtype: MetalDtype,
+        layout: PageLayout,
         _cpu_access: bool,
     ) -> Result<Self, String> {
         config.validate()?;
@@ -629,6 +756,14 @@ impl LayerKVPool {
         }
         if config.num_layers == 0 {
             return Err("LayerKVPool::new: config.num_layers must be > 0".to_string());
+        }
+        if (layout.index_rows == 0) != (layout.index_dimension == 0)
+            || (layout.index_rows > 0 && !config.block_size.is_multiple_of(layout.index_rows))
+        {
+            return Err(format!(
+                "LayerKVPool::new: index plane {} x {} does not divide a {}-token block",
+                layout.index_rows, layout.index_dimension, config.block_size
+            ));
         }
 
         // Run the dtype consistency check on every platform so its rejection
@@ -655,7 +790,7 @@ impl LayerKVPool {
 
             // Same table the blit ranges are addressed from, so a pool can
             // never be allocated to one geometry and transferred at another.
-            let bytes = Self::plane_bytes_for(&config, cache_dtype)?;
+            let bytes = Self::plane_bytes_for(&config, cache_dtype, layout)?;
             let options = pool_storage_options(&state.device, _cpu_access);
             let mut layers = Vec::with_capacity(config.num_layers as usize);
             for _ in 0..config.num_layers {
@@ -669,6 +804,7 @@ impl LayerKVPool {
                 config,
                 max_num_blocks,
                 cache_dtype,
+                layout,
                 generation: AtomicU64::new(0),
                 restore_identity: std::sync::Arc::new(()),
                 inner: RwLock::new(PoolInner { layers, num_blocks }),
@@ -689,6 +825,7 @@ impl LayerKVPool {
                 config,
                 max_num_blocks,
                 cache_dtype,
+                layout,
                 generation: AtomicU64::new(0),
                 restore_identity: std::sync::Arc::new(()),
             })
@@ -759,7 +896,7 @@ impl LayerKVPool {
             use crate::metal::MetalState;
             use metal::MTLResourceOptions;
 
-            let bytes = Self::plane_bytes_for(&cfg, cache_dtype)?;
+            let bytes = Self::plane_bytes_for(&cfg, cache_dtype, PageLayout::default())?;
             let (key_blob, value_blob) = bytes.blob();
             let overflow = || {
                 format!(
@@ -800,6 +937,7 @@ impl LayerKVPool {
                 config: cfg,
                 max_num_blocks: num_blocks,
                 cache_dtype,
+                layout: PageLayout::default(),
                 generation: AtomicU64::new(0),
                 restore_identity: std::sync::Arc::new(()),
                 inner: RwLock::new(PoolInner { layers, num_blocks }),
@@ -815,6 +953,7 @@ impl LayerKVPool {
                 num_blocks,
                 max_num_blocks: num_blocks,
                 cache_dtype,
+                layout: PageLayout::default(),
                 generation: AtomicU64::new(0),
                 restore_identity: std::sync::Arc::new(()),
             })
@@ -875,6 +1014,7 @@ impl LayerKVPool {
                 config: cfg,
                 max_num_blocks: num_blocks,
                 cache_dtype,
+                layout: PageLayout::default(),
                 generation: AtomicU64::new(0),
                 restore_identity: std::sync::Arc::new(()),
                 inner: RwLock::new(PoolInner {
@@ -893,6 +1033,7 @@ impl LayerKVPool {
                 num_blocks,
                 max_num_blocks: num_blocks,
                 cache_dtype,
+                layout: PageLayout::default(),
                 generation: AtomicU64::new(0),
                 restore_identity: std::sync::Arc::new(()),
             })
@@ -1383,9 +1524,9 @@ impl LayerKVPool {
 
     /// Bytes one layer of `blocks` blocks occupies, every plane included.
     pub fn layer_bytes_for(&self, blocks: u32) -> Result<u64, String> {
-        let (key, value) = self.block_blob_bytes()?;
-        key.checked_add(value)
-            .and_then(|bytes| bytes.checked_mul(u64::from(blocks)))
+        Self::plane_bytes_for(&self.config, self.cache_dtype, self.layout)?
+            .total()
+            .checked_mul(u64::from(blocks))
             .ok_or_else(|| format!("LayerKVPool: layer size overflows u64 ({blocks} blocks)"))
     }
 
@@ -1478,8 +1619,7 @@ impl LayerKVPool {
             key_cache.clone()
         };
 
-        let (_element_size, x) = Self::cache_dtype_layout(self.cache_dtype)?;
-        let dims = self.key_cache_shape(x);
+        let dims = self.key_view_shape()?;
         let dtype_code = bridge_dtype_code(self.cache_dtype)?;
 
         // SAFETY: `key_cache` is a retained handle valid for the rest of
@@ -1532,7 +1672,7 @@ impl LayerKVPool {
             value_cache.clone()
         };
 
-        let dims = self.value_cache_shape();
+        let dims = self.value_view_shape();
         let dtype_code = bridge_dtype_code(self.cache_dtype)?;
 
         // SAFETY: as `key_cache_array_raw`.
@@ -1616,6 +1756,78 @@ impl LayerKVPool {
         Ok(arr)
     }
 
+    /// Wrap the index plane of `layer_idx` as a zero-copy bf16 view
+    /// `[num_blocks, index_rows, index_dimension]` (Splash
+    /// `indexer_index_keys`). `Err` for a pool without an index plane.
+    /// Ownership as [`Self::key_cache_array_raw`].
+    #[cfg(target_os = "macos")]
+    pub fn index_array_raw(&self, layer_idx: u32) -> Result<*mut mlx_sys::mlx_array, String> {
+        use crate::metal::is_metal_extraction_supported;
+
+        if !is_metal_extraction_supported() {
+            return Err("Metal GPU not available".to_string());
+        }
+        let buffer = {
+            let inner = self.inner_read();
+            let layer = inner.layers.get(layer_idx as usize).ok_or_else(|| {
+                format!(
+                    "LayerKVPool::index_array_raw: layer_idx {layer_idx} out of range \
+                     (num_layers = {})",
+                    inner.layers.len()
+                )
+            })?;
+            layer.index.clone().ok_or_else(|| {
+                "LayerKVPool::index_array_raw: the pool has no index plane".to_string()
+            })?
+        };
+        let dims = [
+            self.num_blocks() as i64,
+            self.layout.index_rows as i64,
+            self.layout.index_dimension as i64,
+        ];
+        // SAFETY: as `key_cache_array_raw`; code 3 is `BridgeDType::BFLOAT16`.
+        let arr = unsafe {
+            mlx_sys::mlx_array_from_metal_buffer_view(
+                buffer.as_ptr() as *mut _,
+                dims.as_ptr(),
+                dims.len(),
+                3,
+            )
+        };
+        if arr.is_null() {
+            return Err("mlx_array_from_metal_buffer_view returned null".to_string());
+        }
+        Ok(arr)
+    }
+
+    /// The K view shape: [`Self::key_cache_shape`], or `[num_blocks,
+    /// num_kv_heads, block_size, head_size]` for a token-major page.
+    pub fn key_view_shape(&self) -> Result<Vec<i64>, String> {
+        if self.layout.values_token_major {
+            return Ok(self.token_major_shape().to_vec());
+        }
+        let x = self.cache_pack_factor()?;
+        Ok(self.key_cache_shape(x).to_vec())
+    }
+
+    /// The V view shape: [`Self::value_cache_shape`], or the token-major K
+    /// shape for a token-major page.
+    pub fn value_view_shape(&self) -> Vec<i64> {
+        if self.layout.values_token_major {
+            return self.token_major_shape().to_vec();
+        }
+        self.value_cache_shape().to_vec()
+    }
+
+    fn token_major_shape(&self) -> [i64; 4] {
+        [
+            self.num_blocks() as i64,
+            self.config.num_kv_heads as i64,
+            self.config.block_size as i64,
+            self.config.head_size as i64,
+        ]
+    }
+
     /// Scale plane view shape `[num_blocks, num_kv_heads, block_size]`.
     pub fn scale_shape(&self) -> [i64; 3] {
         [
@@ -1691,6 +1903,7 @@ impl LayerKVPool {
         slot_mapping: &[i64],
         input_dtype: crate::metal::MetalDtype,
     ) -> Result<(), String> {
+        self.require_vllm_page("LayerKVPool::write_kv")?;
         use crate::metal::{
             MetalState, MlxMetalBuffer, RawBufferInfo, ReshapeAndCacheParams,
             dispatch_reshape_and_cache_raw, is_metal_extraction_supported, synchronize_mlx,
@@ -1976,6 +2189,7 @@ impl LayerKVPool {
         route_hint: crate::metal::PagedAttentionRouteHint,
         grouped_stripes: u32,
     ) -> Result<crate::metal::PagedAttentionOutput, String> {
+        self.require_vllm_page("LayerKVPool::gather_attention")?;
         use crate::metal::{
             MetalState, MlxMetalBuffer, PagedAttentionParams, RawBufferInfo,
             dispatch_paged_attention_auto_with_route, is_metal_extraction_supported,
@@ -2162,6 +2376,7 @@ impl LayerKVPool {
         layer_idx: u32,
         block_ids: &[u32],
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        self.require_vllm_page("LayerKVPool::read_blocks_to_host")?;
         use crate::metal::command_buffer::observe;
         use crate::metal::is_metal_extraction_supported;
 
@@ -2311,6 +2526,7 @@ impl LayerKVPool {
     /// GPU work at all.
     #[cfg(target_os = "macos")]
     pub fn read_block_all_layers(&self, block_id: u32) -> Result<Vec<BlockLayerBytes>, String> {
+        self.require_vllm_page("LayerKVPool::read_block_all_layers")?;
         use crate::metal::command_buffer::observe;
         use crate::metal::{MetalState, is_metal_extraction_supported};
         use metal::MTLResourceOptions;
@@ -2482,6 +2698,7 @@ impl LayerKVPool {
         keys_bytes: &[u8],
         values_bytes: &[u8],
     ) -> Result<(), String> {
+        self.require_vllm_page("LayerKVPool::write_blocks_from_host")?;
         use crate::metal::command_buffer::observe;
         use crate::metal::{MetalState, is_metal_extraction_supported};
         use metal::MTLResourceOptions;
@@ -2639,6 +2856,7 @@ impl LayerKVPool {
     /// or GPU submission; private buffers retain the bounded blit fallback.
     #[cfg(target_os = "macos")]
     pub fn write_blocks_all_layers(&self, blocks: &[BlockUpload<'_>]) -> Result<(), String> {
+        self.require_vllm_page("LayerKVPool::write_blocks_all_layers")?;
         use crate::metal::MetalState;
         use crate::metal::command_buffer::observe;
         use metal::MTLResourceOptions;
@@ -5141,6 +5359,92 @@ mod int8_tests {
         assert_eq!(MetalDtype::BFloat16.scale_bytes(), 0);
         assert_eq!(LayerKVPool::cache_dtype_layout(int8), Ok((1, 16)));
         assert_eq!(bridge_dtype_code(int8), Ok(6));
+    }
+
+    /// A Flash Next page (Splash `QwenHybridLayout::kvLayout`): K and V
+    /// token-major views, a bf16 index plane after the K/V planes in the
+    /// block (Splash `PageStorage::indexPlaneOffset`), counted in the block
+    /// bytes and kept across a grow; no host blob (Splash slot version 1
+    /// carries such a page) and no raw kernel. Mutation H1:
+    /// `require_vllm_page` accepts every layout → red.
+    #[test]
+    fn selected_block_page_has_an_index_plane_and_no_host_blob() {
+        if !metal() {
+            return;
+        }
+        let layout = PageLayout {
+            values_token_major: true,
+            index_rows: 4,
+            index_dimension: 128,
+        };
+        let pool =
+            LayerKVPool::new_with_layout(int8_config(2), 3, 6, MetalDtype::Int8, layout).unwrap();
+        let index = (4 * 128 * 2) as u64;
+        assert_eq!(
+            pool.bytes_per_block(),
+            Ok(2 * (2 * (DATA + SCALES) as u64 + index))
+        );
+        assert_eq!(
+            pool.layer_bytes_for(3),
+            Ok(3 * (2 * (DATA + SCALES) as u64 + index))
+        );
+        assert!(pool.grow_to(6).unwrap());
+        assert_eq!(pool.total_bytes(), 6 * pool.bytes_per_block().unwrap());
+        {
+            let inner = pool.inner_read();
+            for layer in &inner.layers {
+                assert_eq!(layer.index.as_ref().map(|b| b.length()), Some(6 * index));
+                let order: Vec<Plane> = layer.planes().map(|(plane, _)| plane).collect();
+                assert_eq!(
+                    order,
+                    [
+                        Plane::Key,
+                        Plane::KeyScale,
+                        Plane::Value,
+                        Plane::ValueScale,
+                        Plane::Index
+                    ]
+                );
+            }
+        }
+        for (raw, shape, code) in [
+            (pool.key_cache_array_raw(1).unwrap(), vec![6, 4, 16, 256], 6),
+            (
+                pool.value_cache_array_raw(1).unwrap(),
+                vec![6, 4, 16, 256],
+                6,
+            ),
+            (pool.index_array_raw(1).unwrap(), vec![6, 4, 128], 3),
+        ] {
+            unsafe {
+                let ndim = mlx_sys::mlx_array_ndim(raw);
+                let mut dims = vec![0i64; ndim];
+                mlx_sys::mlx_array_shape(raw, dims.as_mut_ptr());
+                assert_eq!(dims, shape);
+                assert_eq!(mlx_sys::mlx_array_dtype(raw), code);
+                mlx_sys::mlx_array_delete(raw);
+            }
+        }
+        assert!(pool.read_block_all_layers(0).is_err());
+        assert!(pool.read_blocks_to_host(0, &[0]).is_err());
+        let payload = blobs(0, 2);
+        assert!(
+            pool.write_blocks_all_layers(&[upload(0, &payload)])
+                .is_err()
+        );
+        assert!(
+            LayerKVPool::new_with_layout(
+                int8_config(2),
+                3,
+                6,
+                MetalDtype::Int8,
+                PageLayout {
+                    index_rows: 3,
+                    ..layout
+                }
+            )
+            .is_err()
+        );
     }
 
     /// Mutation M2: `plane_bytes_for` leaves the scale bytes out.

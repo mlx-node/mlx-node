@@ -490,25 +490,6 @@ fn draftless_plan_checks_the_pool_lane() {
     assert!(qwen38_plan(at, None, false).is_ok());
 }
 
-/// A lane that also holds pool bytes per token (an MTP draft's state)
-/// gets the longest window whose KV and those bytes the pool holds.
-/// Mutation: ignore `extra` in `PoolPlan::window_with` → red (the lane's
-/// window).
-#[test]
-fn mtp_lane_window_pays_its_held_draft_state() {
-    let pool = m3_pro_plan().pool.expect("pool");
-    let held = |window: u32| u64::from(window) * 4_096;
-    let window = pool.window_with(&held);
-    let fits = |window: u32| {
-        let kv = u64::from(pool.max_blocks) * MIB - QWEN38_CELL - held(window);
-        resident_tokens(&bf16_layout(), kv, SPECULATIVE_SCRATCH_TOKENS) >= u64::from(window)
-    };
-    assert!(window < pool.lane.window.maximum());
-    assert!(fits(window));
-    assert!(!fits(window + 1));
-    assert_eq!(pool.window_with(&|_| 0), pool.lane.window.maximum());
-}
-
 /// Live headroom is the ceiling (hard less the reserves) less what is live,
 /// with no process reserve and no 9/10 share. Mutation: `/ 10 * 9` on the
 /// allocator path of `live_headroom` → red (944,892,799).
@@ -691,6 +672,7 @@ fn flash_next_pool<'a>(
     transient: &'a dyn Fn(u32) -> u64,
     lane_bytes: u64,
     lane_in_pool: bool,
+    state: &'a dyn Fn(u32) -> u64,
 ) -> PoolInput<'a> {
     let layout = flash_next_layout();
     PoolInput {
@@ -706,7 +688,7 @@ fn flash_next_pool<'a>(
         runway_blocks: layout.runway_pages() as u32,
         explicit_mib: None,
         lane_in_pool,
-        state: &|_| 0,
+        state,
         state_in_pool: false,
     }
 }
@@ -721,15 +703,14 @@ fn flash_next_rows() -> StreamedPart {
 }
 
 /// What a Flash Next load plans: the store before any read, then the engine
-/// plan with the store at its cap; the AR window, and with MTP weights the
-/// MTP lane's.
+/// plan with the store at its cap, and its one window (with MTP weights the
+/// lane holds the draft state).
 struct FlashNextLoad {
     allowance: u64,
     minimum_dynamic: u64,
     store: Result<StorePlan, PlanError>,
     plan: Option<MemoryPlan>,
     ar_window: u32,
-    mtp_window: Option<u32>,
 }
 
 fn flash_next_load(
@@ -743,21 +724,18 @@ fn flash_next_load(
     };
     let c = flash_next_config();
     let transient = |window: u32| prefill_scratch(&c, 1024, window as usize);
-    let layout = flash_next_layout();
-    let pool = flash_next_pool(&transient, row_state_bytes(&c), lane_in_pool);
-    let draft = |window: u32| draft_state_bytes(&c, u64::from(window));
-    let ar = |dynamic: u64| pool.plan_at(dynamic).lane.window.maximum();
-    let mtp_lane = |dynamic: u64| pool.plan_at(dynamic).window_with(&draft);
-    let lanes: Vec<&dyn Fn(u64) -> u32> = if mtp { vec![&ar, &mtp_lane] } else { vec![&ar] };
-    let tokens = pool.shape.trained.min(RESIDENT_ALLOWANCE_TOKENS);
-    let allowance = allowance_dynamic_bytes(&lanes, tokens);
-    let runway_tokens = (layout.runway_pages() * KV_PAGE_TOKENS) as u32;
-    let pool_minimum = pool.plan_at(0).lane.minimum_bytes;
-    let minimum_dynamic = if mtp {
-        pool_minimum + draft(runway_tokens)
-    } else {
-        pool_minimum
+    let draft = |window: u32| {
+        if mtp {
+            draft_state_bytes(&c, u64::from(window))
+        } else {
+            0
+        }
     };
+    let pool = flash_next_pool(&transient, row_state_bytes(&c), lane_in_pool, &draft);
+    let ar = |dynamic: u64| pool.plan_at(dynamic).lane.window.maximum();
+    let tokens = pool.shape.trained.min(RESIDENT_ALLOWANCE_TOKENS);
+    let allowance = allowance_dynamic_bytes(&[&ar], tokens);
+    let minimum_dynamic = pool.plan_at(0).lane.minimum_bytes;
     let hard = hard_budget_bytes(working_set, max_memory);
     let store = plan_streamed_store(&StreamedInputs {
         hard,
@@ -787,18 +765,12 @@ fn flash_next_load(
         .as_ref()
         .and_then(|plan| plan.pool)
         .map_or(0, |pool| pool.lane.window.maximum());
-    let mtp_window = mtp.then(|| {
-        plan.as_ref()
-            .and_then(|plan| plan.pool)
-            .map_or(0, |pool| pool.window_with(&draft))
-    });
     FlashNextLoad {
         allowance,
         minimum_dynamic,
         store,
         plan,
         ar_window,
-        mtp_window,
     }
 }
 
@@ -871,7 +843,7 @@ fn streamed_experts_take_all_the_allowance_leaves() {
     let dynamic = load.plan.expect("engine plan").dynamic_budget_bytes;
     let c = flash_next_config();
     let transient = |window: u32| prefill_scratch(&c, 1024, window as usize);
-    let pool = flash_next_pool(&transient, row_state_bytes(&c), false);
+    let pool = flash_next_pool(&transient, row_state_bytes(&c), false, &|_| 0);
     assert!(pool.plan_at(dynamic).lane.window.maximum() >= 65_536);
     assert_eq!(
         pool.plan_at(dynamic - FLASH_NEXT_PAGE)
@@ -944,7 +916,7 @@ fn off_pool_lane_is_not_inside_the_pool() {
     use crate::models::qwen4_exp::{flash_next_config, prefill_scratch, row_state_bytes};
     let c = flash_next_config();
     let transient = |window: u32| prefill_scratch(&c, 1024, window as usize);
-    let inside = flash_next_pool(&transient, row_state_bytes(&c), true);
+    let inside = flash_next_pool(&transient, row_state_bytes(&c), true, &|_| 0);
     let plan = MemoryPlan::evaluate(footprint, Some(inside), None, None).expect("plan");
     assert_eq!(
         footprint.held_back_bytes,
@@ -953,24 +925,23 @@ fn off_pool_lane_is_not_inside_the_pool() {
     assert_eq!(plan.pool.expect("pool").lane.window.maximum(), 61_433);
 }
 
-/// With MTP weights the MTP lane (the cell and the draft state of its
-/// window) holds 64K too: allowance 5,746,994,176, store 13,180,462,934,
-/// pool 2,982 pages, AR 95,225, MTP 65,655. Mutation: check only the first
-/// lane in `allowance_dynamic_bytes` → red (allowance 4,468,093,952).
+/// With MTP weights the one lane holds the cell and the draft state of its
+/// window and still 64K: allowance 5,199,135,744, store 13,728,321,366,
+/// pool 2,080 pages, every turn 65,536. Mutation: leave `state` out of the
+/// pool bytes in `LaneKv::budget` → red (allowance 4,468,093,952).
 #[test]
-fn mtp_lane_holds_the_allowance() {
+fn mtp_state_holds_the_allowance() {
     let load = flash_next_load(STUDIO_WORKING_SET, None, true, false);
-    assert_eq!(load.allowance, 5_746_994_176);
+    assert_eq!(load.allowance, 5_199_135_744);
     assert_eq!(
         load.store.expect("store plan").expert_cap_bytes,
-        13_180_462_934
+        13_728_321_366
     );
     assert_eq!(
         load.plan.expect("plan").pool.expect("pool").max_blocks,
-        2_982
+        2_080
     );
-    assert_eq!(load.ar_window, 95_225);
-    assert_eq!(load.mtp_window, Some(65_655));
+    assert_eq!(load.ar_window, 65_536);
 }
 
 /// The row share is the rows a 128K-token prompt reads (Splash
@@ -1068,7 +1039,7 @@ fn held_back_counts_the_store_at_its_cap() {
     footprint.held_back_bytes += GIB;
     let c = flash_next_config();
     let transient = |window: u32| prefill_scratch(&c, 1024, window as usize);
-    let pool = flash_next_pool(&transient, row_state_bytes(&c), false);
+    let pool = flash_next_pool(&transient, row_state_bytes(&c), false, &|_| 0);
     let plan = MemoryPlan::evaluate(footprint, Some(pool), None, None).expect("plan");
     assert_eq!(plan.dynamic_budget_bytes, 4_468_093_952);
     assert_eq!(plan.pool.expect("pool").lane.window.maximum(), 65_536);

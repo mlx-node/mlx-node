@@ -428,7 +428,8 @@ enum TurnKind {
     StreamContinueTool,
 }
 
-/// A page pool of 6 blocks (48 KiB). A 120-token MTP start needs 4 blocks of
+/// A page pool of 6 blocks (8,448 B each: K/V and the index plane). A
+/// 120-token MTP start needs 4 blocks of
 /// pages but 88,800 B of recurrent row and draft state, which the pool must
 /// not be charged for: on the real model that charge refused every MTP
 /// prompt above ~7.5k tokens ("max pool holds 1365").
@@ -447,7 +448,7 @@ fn mtp_turn_near_the_context_limit_is_admitted_against_pages_only() {
     let mut state = HybridSchedulerState::new(inner).unwrap();
     let adapter = state.inner.decoder.paged.as_ref().unwrap();
     let (blocks, bytes_per_block) = (adapter.block_capacity(), adapter.bytes_per_block().unwrap());
-    assert_eq!((blocks, bytes_per_block), (6, 8192));
+    assert_eq!((blocks, bytes_per_block), (6, 8_448));
     let max_new_tokens = 120;
     let requested = crate::engine::scheduler::scheduled_materialized_tokens(1, max_new_tokens);
     let pages = requested.div_ceil(adapter.block_size());
@@ -505,9 +506,7 @@ fn mtp_start_after_a_long_ar_turn_takes_back_the_pool_growth() {
     let charge = |total: u32| memory::PoolCharge {
         total_blocks: u64::from(total),
         max_blocks: u64::from(MAX),
-        allocated_blocks: 0,
         physical_block_bytes: physical,
-        index_block_bytes: super::load_plan::index_block_bytes(&c),
         growth_copy_bytes: u64::from(total) * physical
             / (super::load_plan::full_attention_layers(&c) as u64).max(1),
     };
@@ -6610,6 +6609,73 @@ fn prefetched_ple_rows_match_this_thread_reads_and_are_consumed() {
     );
 }
 
+/// A paged sequence keeps its complete blocks' pooled index keys in the
+/// pool's index plane (Splash `PageStorage::indexOffset`), none beside the
+/// cache, and reads back the keys a cache without pages holds, bit for bit,
+/// across windows, single tokens and pages. Mutation I1: the plane row
+/// drops the block's place in its page → red.
+#[test]
+fn paged_index_keys_live_in_the_pool_plane() {
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    let path = fixture().join("bf16/paged");
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
+    let mut config = config::Config::parse(&raw).unwrap();
+    config.indexer_budget = 8;
+    let tokens: Vec<u32> = (0..90).map(|i| ((i * 5 + i / 3) % 17 + 3) as u32).collect();
+    let make = |paged: bool| {
+        let mut d = decoder::Decoder::new(
+            config.clone(),
+            weights::Store::open_fixture(&path, None).unwrap(),
+        )
+        .unwrap();
+        if paged {
+            d.paged = Some(paged::create_fixture(&config).unwrap());
+            d.paged.as_mut().unwrap().begin_request(1).unwrap();
+        }
+        d
+    };
+    let (mut flat, mut paged) = (make(false), make(true));
+    let mut offset = 0;
+    for count in [37, 1, 1, 22, 1, 28] {
+        let chunk = &tokens[offset..offset + count];
+        offset += count;
+        flat.prefill_chunk(chunk, None, true).unwrap().eval();
+        paged.prefill_chunk(chunk, None, true).unwrap().eval();
+    }
+    assert_eq!(offset, tokens.len());
+    let mut checked = 0;
+    for layer in 0..config.num_hidden_layers {
+        if config.linear(layer) {
+            continue;
+        }
+        assert!(paged.off_pool_index_keys(layer).is_none());
+        let want = flat.index_keys(layer).unwrap();
+        let got = paged.index_keys(layer).unwrap();
+        assert_eq!(
+            got.shape().unwrap().as_ref(),
+            &[22, config.indexer_head_dim as i64]
+        );
+        assert_eq!(
+            &*got
+                .astype(crate::array::DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap(),
+            &*want
+                .astype(crate::array::DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap(),
+            "layer {layer} index blocks"
+        );
+        checked += 1;
+    }
+    assert!(checked > 0);
+}
+
 /// The batched QSA window (selection + indexed kernel) against the per-token
 /// sparse path: one decoder takes the tokens as multi-token chunks, the other
 /// one token at a time (a width-1 `prefill_chunk` runs the per-token path).
@@ -8085,6 +8151,107 @@ fn real_model_greedy_argmax_matches_expected() {
     );
 }
 
+/// Teacher-forced KL of an int8 page pool against a bf16 one on a real
+/// checkpoint, paged as served: per `QWEN4_EXP_REAL_CASES` case the prompt
+/// less its last `QWEN4_EXP_KL_POSITIONS` tokens (default 256) prefills,
+/// then those tokens decode one at a time, every row reading the pool. Per
+/// row: full-vocab KL(bf16 || int8) and argmax agreement, written to
+/// `QWEN4_EXP_REAL_OUT`; nothing is asserted (the bands are the gate).
+#[test]
+#[ignore = "real checkpoint: QWEN4_EXP_REAL_MODEL, QWEN4_EXP_REAL_INPUTS; --test-threads=1"]
+fn real_model_int8_pool_teacher_forced_kl() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    use crate::transformer::KvFormat;
+    let model = std::env::var("QWEN4_EXP_REAL_MODEL").expect("QWEN4_EXP_REAL_MODEL");
+    let inputs = std::env::var("QWEN4_EXP_REAL_INPUTS").expect("QWEN4_EXP_REAL_INPUTS");
+    let positions: usize = std::env::var("QWEN4_EXP_KL_POSITIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
+    let store = weights::Store::open(Path::new(&model)).unwrap();
+    let config = gguf::config(&store).unwrap();
+    let vision = media::Vision::metadata(&serde_json::Value::Null, &store, &config).unwrap();
+    let mut decoder = decoder::Decoder::new(config.clone(), store).unwrap();
+    let adapter = super::paged::create_fixture(&config).unwrap();
+    let pool_bytes = adapter.bytes_per_block().unwrap() * u64::from(adapter.block_capacity());
+    decoder.paged = Some(adapter);
+    go_live(&mut decoder, pool_bytes);
+    let mut inner = inner_over(decoder, vision, false);
+    let log_softmax = |logits: &MxArray| -> Vec<f64> {
+        let row: Vec<f64> = logits
+            .to_float32()
+            .unwrap()
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect();
+        assert_eq!(row.len(), config.vocab_size, "one row of logits");
+        let max = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let sum: f64 = row.iter().map(|v| (v - max).exp()).sum();
+        let log_sum = max + sum.ln();
+        row.iter().map(|v| v - log_sum).collect()
+    };
+    let top = |row: &[f64]| {
+        row.iter()
+            .enumerate()
+            .fold((0, f64::NEG_INFINITY), |best, (i, &v)| {
+                if v > best.1 { (i, v) } else { best }
+            })
+            .0
+    };
+    let mut out = serde_json::Map::new();
+    let mut seq = 0u32;
+    for case in real_cases() {
+        let prompt = real_prompt(Path::new(&inputs), &case);
+        assert!(
+            prompt.len() > positions,
+            "{case}: prompt shorter than the positions"
+        );
+        let split = prompt.len() - positions;
+        let mut reference: Vec<Vec<f64>> = Vec::with_capacity(positions);
+        let (mut kl, mut agree) = (0.0f64, 0usize);
+        for format in [KvFormat::Bf16, KvFormat::Int8] {
+            std::sync::Arc::make_mut(&mut inner.decoder.config).kv_format = format;
+            inner.decoder.paged = None;
+            inner.decoder.paged =
+                Some(super::paged::create_fixture(&inner.decoder.config).unwrap());
+            inner.decoder.reset();
+            inner.rows.clear();
+            inner.active_seq = None;
+            seq += 1;
+            inner.activate_paged_seq(seq).unwrap();
+            let mut logits = prefill_all(&mut inner.decoder, &prompt[..split]);
+            for i in 0..positions {
+                let row = log_softmax(&logits);
+                if format == KvFormat::Bf16 {
+                    reference.push(row);
+                } else {
+                    let want = &reference[i];
+                    kl += want
+                        .iter()
+                        .zip(&row)
+                        .map(|(p, q)| p.exp() * (p - q))
+                        .sum::<f64>();
+                    agree += usize::from(top(want) == top(&row));
+                }
+                if i + 1 < positions {
+                    logits = inner.decoder.step(prompt[split + i]).unwrap();
+                }
+            }
+        }
+        let result = serde_json::json!({
+            "meanKl": kl / positions as f64,
+            "top1Agreement": agree as f64 / positions as f64,
+            "positions": positions,
+            "kvFormats": ["bf16", "int8"],
+        });
+        eprintln!("int8 pool KL {case}: {result}");
+        out.insert(case, result);
+        if let Ok(path) = std::env::var("QWEN4_EXP_REAL_OUT") {
+            std::fs::write(&path, serde_json::to_vec_pretty(&out).unwrap()).unwrap();
+        }
+    }
+}
+
 /// Real-model verify against AR with full direct banks, paged as served:
 /// owner 1 decodes greedy AR steps; owner 2 runs teacher-forced verifies of
 /// three tokens beside owner 3's one- and two-row verifies, including
@@ -8980,28 +9147,39 @@ fn tiny_planned_inner() -> Inner {
         registered_pool_bytes: 0,
     };
     inner.memory_plan =
-        load_plan::plan_engine("Qwen4Exp", &inner.decoder.config, live, 0, None).unwrap();
+        load_plan::plan_engine("Qwen4Exp", &inner.decoder.config, live, 0, None, false).unwrap();
     inner
 }
 
-/// A scheduled turn clamps on the plan's window: the AR lane's, and the MTP
-/// lane's for a speculative turn. Mutation: drop the `planned_turn_window`
-/// override in `paged.rs` → red (`None`: the pool's own window and
-/// `MLX_PAGED_PER_SEQ_CTX`).
+/// Every scheduled turn (AR or MTP) clamps on the plan's one window, the
+/// published one: on the Flash Next int8 plan with MTP weights, 65,536.
+/// Mutation O2: the speculative arm takes the draft state from the pool
+/// bytes again → red (below 65,536).
 #[test]
 fn qwen4_exp_turn_window_is_the_plan_window() {
     use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
-    let inner = tiny_planned_inner();
-    let pool = inner.memory_plan.pool.unwrap();
+    let mut inner = tiny_inner();
+    let c = load_plan::tests::int8_config();
+    let (_, plan) = load_plan::tests::load_with(&c, true, 30_150_672_384);
+    let pool = plan.pool.unwrap();
+    let limits = Qwen4ExpContextLimits::from_plan(&c, &plan, c.served_context_tokens()).unwrap();
+    inner.decoder.config = c.into();
+    inner.memory_plan = plan;
+    inner.max_context = None;
+    inner.has_mtp = true;
+    assert_eq!(pool.lane.window.maximum(), 65_536);
     assert_eq!(
         inner.planned_turn_window(false),
         Some(pool.lane.window.maximum())
     );
     assert_eq!(
         inner.planned_turn_window(true),
-        load_plan::mtp_window(&inner.decoder.config, &inner.memory_plan)
+        inner.planned_turn_window(false)
     );
-    assert!(inner.planned_turn_window(true).is_some());
+    assert_eq!(
+        inner.planned_turn_window(true),
+        Some(limits.effective_window_tokens)
+    );
 }
 
 /// The model's wired lease is the store's budget and the plan's dynamic
@@ -9057,23 +9235,157 @@ fn active_budget_follows_the_plan_ceiling() {
     memory::check_active_memory_budget(limit, || active as f64, || {}, |_| {}).unwrap();
 }
 
+/// Both qwen4 page gathers read the Flash Next page (K and V token-major,
+/// Splash `splash_kv_key_element`) as the rows the store took: an int8 page
+/// as the BF16 rows of the flat quantize-then-dequantize, a bf16 page as
+/// the rows themselves, bit for bit: every row, a sparse pick, and a window
+/// that mixes pool rows with fresh ones; also before the write that stored
+/// them is evaluated (the scale planes ride the write). The dense gather
+/// refuses a token-major page. Mutations: V1, the gathers read V
+/// dimension-major → red; K1, the store writes the vLLM page → red.
 #[cfg(target_os = "macos")]
 #[test]
-fn qwen4_gathers_refuse_an_int8_pool() {
-    let Some((mut adapter, _)) = crate::transformer::paged_int8_tests::int8_adapter(4, 4) else {
-        return;
+fn token_major_page_gathers_read_the_stored_rows() {
+    use crate::array::DType;
+    use crate::array::kv_int8::Int8KvRows;
+    use crate::transformer::paged_int8_tests::{
+        adapter_with_layout, bits, heads_major, shaped_rows,
     };
-    adapter.reset_for_new_request(1).unwrap();
-    adapter.allocate_suffix_blocks(4).unwrap();
-    adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
-    let error = paged::gather_selected(&adapter, 0, &[0, 1], 2, 128)
-        .map(drop)
-        .unwrap_err();
-    assert!(error.reason.contains("an int8 pool is refused"), "{error}");
-    let rows = MxArray::zeros(&[1, 2, 128], Some(crate::array::DType::BFloat16)).unwrap();
-    let tokens = MxArray::from_int32(&[0], &[1]).unwrap();
-    let error = paged::gather_window(&adapter, 0, &tokens, &rows, &rows, 4)
-        .map(drop)
-        .unwrap_err();
-    assert!(error.reason.contains("an int8 pool is refused"), "{error}");
+    use mlx_paged_attn::metal::MetalDtype;
+    const H: usize = 2;
+    const D: usize = 256;
+    const N: usize = 101;
+    let config = mlx_paged_attn::PagedAttentionConfig {
+        block_size: 32,
+        gpu_memory_mb: 256,
+        head_size: D as u32,
+        num_kv_heads: H as u32,
+        num_layers: 2,
+        max_seq_len: Some(1024),
+        max_batch_size: Some(4),
+    };
+    let layout = mlx_paged_attn::PageLayout {
+        values_token_major: true,
+        index_rows: 8,
+        index_dimension: 128,
+    };
+    for dtype in [MetalDtype::Int8, MetalDtype::BFloat16] {
+        let Some((mut adapter, _)) = adapter_with_layout(config.clone(), 6, 6, dtype, layout)
+        else {
+            return;
+        };
+        adapter.begin_request(1).unwrap();
+        let same = |what: &str, got: &MxArray, want: &MxArray| {
+            assert_eq!(
+                got.shape().unwrap().as_ref(),
+                want.shape().unwrap().as_ref(),
+                "{dtype:?} {what} shape"
+            );
+            let (got, want) = (bits(got), bits(want));
+            let differing = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                differing, 0,
+                "{dtype:?} {what}: {differing} bf16 values differ"
+            );
+        };
+        let mut written: Vec<(Vec<MxArray>, Vec<MxArray>)> = vec![(vec![], vec![]); 2];
+        let mut base = 0usize;
+        for (chunk, n) in [19usize, 82].into_iter().enumerate() {
+            adapter.record_tokens(&vec![3; n]).unwrap();
+            for layer in 0..2u32 {
+                let gain = Some(if layer == 0 { 1.0 } else { 4.0 });
+                let seed = 10 * layer + chunk as u32;
+                let (k, _) = shaped_rows(n, H, D, 20 + seed, gain);
+                let (v, _) = shaped_rows(n, H, D, 40 + seed, gain);
+                paged::write_rows(&mut adapter, layer, &k, &v, base as u32, base as u32).unwrap();
+                written[layer as usize].0.push(k);
+                written[layer as usize].1.push(v);
+            }
+            if chunk == 0 {
+                adapter.eval_pending_pool_writes().unwrap();
+            }
+            base += n;
+        }
+        let flat: Vec<(MxArray, MxArray)> = written
+            .iter()
+            .map(|(k, v)| {
+                let k = MxArray::concatenate_many(k.iter().collect(), Some(0)).unwrap();
+                let v = MxArray::concatenate_many(v.iter().collect(), Some(0)).unwrap();
+                let (k, v) = (heads_major(&k, N, H, D), heads_major(&v, N, H, D));
+                if dtype == MetalDtype::Int8 {
+                    Int8KvRows::quantize(&k, &v).unwrap().dequantize().unwrap()
+                } else {
+                    (
+                        k.astype(DType::BFloat16).unwrap(),
+                        v.astype(DType::BFloat16).unwrap(),
+                    )
+                }
+            })
+            .collect();
+        let all: Vec<i32> = (0..N as i32).collect();
+        for layer in 0..2u32 {
+            let (k, v) = paged::gather_selected(&adapter, layer, &all, H, D).unwrap();
+            let (fk, fv) = &flat[layer as usize];
+            same(&format!("layer {layer} unevaluated K"), &k, fk);
+            same(&format!("layer {layer} unevaluated V"), &v, fv);
+        }
+        adapter.eval_pending_pool_writes().unwrap();
+        for layer in 0..2u32 {
+            let (fk, fv) = &flat[layer as usize];
+            let (k, v) = paged::gather_selected(&adapter, layer, &all, H, D).unwrap();
+            assert_eq!(k.dtype().unwrap(), DType::BFloat16);
+            same(&format!("layer {layer} K"), &k, fk);
+            same(&format!("layer {layer} V"), &v, fv);
+            assert!(adapter.gather_kv_for_prefill_sdpa(layer, N as u32).is_err());
+            let mut picks: Vec<i32> = (0..N as i32).step_by(7).collect();
+            picks.push(N as i32 - 1);
+            let index = MxArray::from_int32(&picks, &[picks.len() as i64]).unwrap();
+            let (k, v) = paged::gather_selected(&adapter, layer, &picks, H, D).unwrap();
+            same(
+                &format!("layer {layer} picked K"),
+                &k,
+                &fk.take(&index, 2).unwrap(),
+            );
+            same(
+                &format!("layer {layer} picked V"),
+                &v,
+                &fv.take(&index, 2).unwrap(),
+            );
+
+            const FRESH: usize = 5;
+            let (rk, _) = shaped_rows(FRESH, H, D, 60 + layer, None);
+            let (rv, _) = shaped_rows(FRESH, H, D, 70 + layer, None);
+            let (rk, rv) = (heads_major(&rk, FRESH, H, D), heads_major(&rv, FRESH, H, D));
+            let offsets = [FRESH as i32 - 1, 0, 2];
+            let mut ids = picks.clone();
+            ids.extend(offsets.iter().map(|&o| N as i32 + o));
+            ids.extend([-1, (N + FRESH) as i32]);
+            let tokens = MxArray::from_int32(&ids, &[ids.len() as i64]).unwrap();
+            let (k, v) = paged::gather_window(&adapter, layer, &tokens, &rk, &rv, N).unwrap();
+            let p = picks.len() as i64;
+            let fresh = MxArray::from_int32(&offsets, &[offsets.len() as i64]).unwrap();
+            let zeros =
+                MxArray::zeros(&[1, H as i64, 2, D as i64], Some(rk.dtype().unwrap())).unwrap();
+            for (side, got, pool, rows) in [("K", &k, fk, &rk), ("V", &v, fv, &rv)] {
+                let want = MxArray::concatenate_many(
+                    vec![
+                        &pool
+                            .take(&index, 2)
+                            .unwrap()
+                            .astype(rows.dtype().unwrap())
+                            .unwrap(),
+                        &rows.take(&fresh, 2).unwrap(),
+                        &zeros,
+                    ],
+                    Some(2),
+                )
+                .unwrap();
+                same(
+                    &format!("layer {layer} window {side} (pool rows 0..{p})"),
+                    got,
+                    &want,
+                );
+            }
+        }
+    }
 }

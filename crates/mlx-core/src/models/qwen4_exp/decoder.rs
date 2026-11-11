@@ -79,16 +79,20 @@ pub struct LayerCache {
     /// may read past its own rows.
     draft_rows: Option<usize>,
     index_tail: Vec<MxArray>,
-    /// `[blocks, indexer_head_dim]`. Snapshots and replay share handles, so
-    /// appending must build a new array, never write into this one.
+    /// `[blocks, indexer_head_dim]` of a cache without pages. Snapshots and
+    /// replay share handles, so appending must build a new array, never
+    /// write into this one.
     index_keys: Option<MxArray>,
+    /// Complete indexer blocks of a paged sequence: their pooled keys live
+    /// in the pool's index plane (Splash `PageStorage::indexOffset`).
+    index_blocks: usize,
     ple_conv: Option<MxArray>,
 }
 impl LayerCache {
     fn index_block_count(&self) -> Result<usize> {
         match &self.index_keys {
             Some(keys) => Ok(keys.shape_at(0)? as usize),
-            None => Ok(0),
+            None => Ok(self.index_blocks),
         }
     }
     fn append_index_keys(&mut self, keys: MxArray) -> Result<&MxArray> {
@@ -357,8 +361,51 @@ impl Decoder {
         }
     }
     #[cfg(test)]
-    pub(super) fn index_keys(&self, layer: usize) -> Option<&MxArray> {
+    pub(super) fn index_keys(&self, layer: usize) -> Option<MxArray> {
+        self.index_blocks(layer, &self.caches[layer]).unwrap()
+    }
+    /// The index keys layer `layer` holds beside its cache.
+    #[cfg(test)]
+    pub(super) fn off_pool_index_keys(&self, layer: usize) -> Option<&MxArray> {
         self.caches[layer].index_keys.as_ref()
+    }
+    /// The pool layer of full-attention layer `i`.
+    fn pool_layer(&self, i: usize) -> u32 {
+        (0..i).filter(|&l| !self.config.linear(l)).count() as u32
+    }
+    /// Append complete blocks' pooled keys (`[n, indexer_head_dim]`) of
+    /// layer `i`: into the pool's index plane for a paged sequence (Splash
+    /// `block_indexer_pool`), else beside the cache. Returns what holds them.
+    pub(super) fn append_index_blocks(
+        &mut self,
+        i: usize,
+        cache: &mut LayerCache,
+        keys: MxArray,
+    ) -> Result<MxArray> {
+        let layer = self.pool_layer(i);
+        if let Some(adapter) = &mut self.paged {
+            let blocks = keys.shape_at(0)? as usize;
+            let plane = adapter
+                .store_index_rows(layer, &keys, cache.index_blocks as u32)
+                .map_err(Error::from_reason)?;
+            cache.index_blocks += blocks;
+            return Ok(plane);
+        }
+        cache.append_index_keys(keys).cloned()
+    }
+    /// The pooled keys of every complete block of layer `i`, `None` before
+    /// the first.
+    pub(super) fn index_blocks(&self, i: usize, cache: &LayerCache) -> Result<Option<MxArray>> {
+        if let Some(adapter) = &self.paged {
+            if cache.index_blocks == 0 {
+                return Ok(None);
+            }
+            return adapter
+                .index_rows(self.pool_layer(i), cache.index_blocks as u32)
+                .map(Some)
+                .map_err(Error::from_reason);
+        }
+        Ok(cache.index_keys.clone())
     }
     pub fn take_state(&mut self) -> DecoderState {
         let state = DecoderState {
@@ -1332,13 +1379,18 @@ impl Decoder {
                 true,
             )?;
             let block = self.rope(&raw, pos + 1 - c.indexer_compress_ratio)?;
-            let keys = cache.append_index_keys(block)?;
-            self.submit_state(&[keys], "qwen4::decoder::block")?;
+            let keys = self.append_index_blocks(i, cache, block)?;
+            self.submit_state(&[&keys], "qwen4::decoder::block")?;
             cache.index_tail.clear();
         }
         let topk = c.indexer_budget / c.indexer_compress_ratio;
         let nb = cache.index_block_count()?;
-        let selected = if let Some(index_keys) = cache.index_keys.as_ref().filter(|_| nb > topk) {
+        let index_keys = if nb > topk {
+            self.index_blocks(i, cache)?
+        } else {
+            None
+        };
+        let selected = if let Some(index_keys) = index_keys.as_ref() {
             let iq = iq.reshape(&[ih, id])?;
             let iq = self.norm(
                 &iq,
@@ -1809,6 +1861,7 @@ impl Decoder {
                 }
                 saved.index_tail = cache.index_tail.clone();
                 saved.index_keys = cache.index_keys.clone();
+                saved.index_blocks = cache.index_blocks;
             }
             self.history.truncate(base);
             let out = MxArray::concatenate_many(outputs.iter().collect(), Some(1))?;

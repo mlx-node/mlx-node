@@ -1772,6 +1772,7 @@ fn write_call(kv_dtype: u8, head_size: i64, rows: u8, scale_shape: &[i64]) -> Wr
             heads as i32,
             head_size as i32,
             kv_dtype,
+            false,
             k,
             v,
             ks,

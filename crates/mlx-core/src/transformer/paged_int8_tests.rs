@@ -57,14 +57,31 @@ fn adapter_with(
     adapter_for(pool_config(), num_blocks, max_blocks, dtype)
 }
 
-fn adapter_for(
+pub(crate) fn adapter_for(
     config: PagedAttentionConfig,
     num_blocks: u32,
     max_blocks: u32,
     dtype: MetalDtype,
 ) -> Option<(PagedKVCacheAdapter, Arc<LayerKVPool>)> {
+    adapter_with_layout(
+        config,
+        num_blocks,
+        max_blocks,
+        dtype,
+        mlx_paged_attn::PageLayout::default(),
+    )
+}
+
+/// [`adapter_for`] over a pool of `layout`'s pages.
+pub(crate) fn adapter_with_layout(
+    config: PagedAttentionConfig,
+    num_blocks: u32,
+    max_blocks: u32,
+    dtype: MetalDtype,
+    layout: mlx_paged_attn::PageLayout,
+) -> Option<(PagedKVCacheAdapter, Arc<LayerKVPool>)> {
     let block_size = config.block_size;
-    let pool = match LayerKVPool::new(config, num_blocks, max_blocks, dtype) {
+    let pool = match LayerKVPool::new_with_layout(config, num_blocks, max_blocks, dtype, layout) {
         Ok(pool) => Arc::new(pool),
         Err(error) => {
             eprintln!("skipping int8 adapter test: {error}");
@@ -87,7 +104,7 @@ fn rows(tokens: usize, seed: u32) -> (MxArray, Vec<f32>) {
 /// [`rows`] over `heads` x `dim`; with a gain, each row times
 /// `gain · 2^((3t + h) mod 5)` (powers of two, exact in bf16), so
 /// neighbouring rows carry different scales.
-fn shaped_rows(
+pub(crate) fn shaped_rows(
     tokens: usize,
     heads: usize,
     dim: usize,
@@ -297,14 +314,14 @@ fn int8_io_dtype_is_bf16() {
 }
 
 /// `[n, H, D]` rows -> `[1, H, n, D]`, the dense readers' layout.
-fn heads_major(rows: &MxArray, tokens: usize, heads: usize, dim: usize) -> MxArray {
+pub(crate) fn heads_major(rows: &MxArray, tokens: usize, heads: usize, dim: usize) -> MxArray {
     rows.reshape(&[1, tokens as i64, heads as i64, dim as i64])
         .and_then(|rows| rows.transpose(Some(&[0, 2, 1, 3])))
         .and_then(|rows| rows.copy())
         .expect("heads-major rows")
 }
 
-fn bits(array: &MxArray) -> Vec<u16> {
+pub(crate) fn bits(array: &MxArray) -> Vec<u16> {
     assert_eq!(array.dtype().unwrap(), DType::BFloat16);
     array.to_uint16_native().expect("bf16 bits")
 }

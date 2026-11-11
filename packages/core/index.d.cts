@@ -5702,12 +5702,10 @@ export interface Qwen3LmConfig {
  * loads.
  */
 export interface Qwen4ExpContextEstimate {
-  /** Tokens an AR or image turn may hold. */
+  /** Tokens any turn (AR, image, MTP) may hold. */
   windowTokens: number;
-  /** Tokens an MTP turn may hold; set only with MTP weights. */
-  speculativeWindowTokens?: number;
   /**
-   * `'memory'` when the plan binds the AR window, `'model'` when the
+   * `'memory'` when the plan binds the window, `'model'` when the
    * trained window does.
    */
   bound: string;
@@ -5719,11 +5717,6 @@ export interface Qwen4ExpContextLimits {
   pagedBlockSize: number;
   trainedWindowTokens: number;
   /**
-   * Tokens an MTP turn may hold: its draft state beside the pool. Set only
-   * with MTP weights.
-   */
-  speculativeWindowTokens?: number;
-  /**
    * The output budget fills the window: a prompt leaves room for one new
    * token and the budget is clamped to `window - prompt`.
    */
@@ -5733,8 +5726,8 @@ export interface Qwen4ExpContextLimits {
    * window.
    */
   omittedBudgetIsRestOfWindow: boolean;
-  /** The same for `speculative_window_tokens`. */
-  speculativeOmittedBudgetIsRestOfWindow: boolean;
+  /** Format of the K/V every turn writes. */
+  kvFormat: 'int8' | 'bf16';
 }
 
 export interface Qwen4ExpLoadOptions {
@@ -5752,6 +5745,14 @@ export interface Qwen4ExpLoadOptions {
    * target's RoPE takes YaRN.
    */
   maxContextTokens?: number;
+  /**
+   * Element format of the attention K/V pages: `'int8'` (per-token
+   * symmetric int8 rows with one fp32 scale each) or `'bf16'`. Unset:
+   * int8 where the int8 page kernels serve the head dimension (128 or
+   * 256), bf16 elsewhere; an explicit `'int8'` they cannot serve fails
+   * the load.
+   */
+  kvFormat?: 'int8' | 'bf16' | undefined;
 }
 
 /**

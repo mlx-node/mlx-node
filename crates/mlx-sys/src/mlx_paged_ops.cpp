@@ -313,6 +313,7 @@ void validate_paged_kv_write_inputs(
     int head_size,
     int x_pack,
     KvDtype kv_dtype,
+    bool values_token_major,
     const char* op_name) {
   // 1. Dense layout on every input; only read-only new K/V accept offsets.
   require_row_contiguous_zero_offset(k_pool, op_name, "k_pool");
@@ -354,7 +355,8 @@ void validate_paged_kv_write_inputs(
   // (`16 / sizeof(kv_dtype)`). A mismatch means caller and dispatcher
   // disagree on the K-pool layout — guaranteed garbage on read.
   {
-    int x_pack_expected = x_pack_for(kv_dtype);
+    // A token-major page is K with x = head_size.
+    int x_pack_expected = values_token_major ? head_size : x_pack_for(kv_dtype);
     if (x_pack != x_pack_expected) {
       std::ostringstream msg;
       msg << "[validator] [" << op_name << "] x_pack (" << x_pack
@@ -433,61 +435,76 @@ void validate_paged_kv_write_inputs(
   // 4. Pool shape validation. K layout (vLLM):
   //      [num_blocks, num_kv_heads, head_size/x, block_size, x]
   //    V layout: [num_blocks, num_kv_heads, head_size, block_size]
-  if (k_pool.ndim() != 5) {
+  //    Token-major: both [num_blocks, num_kv_heads, block_size, head_size].
+  if (values_token_major) {
+    const Shape page{k_pool.ndim() > 0 ? k_pool.shape(0) : 0,
+                     num_kv_heads,
+                     block_size,
+                     head_size};
+    if (k_pool.shape() != page || v_pool.shape() != page) {
+      std::ostringstream msg;
+      msg << "[validator] [" << op_name << "] a token-major page needs K and V "
+          << "[num_blocks, " << num_kv_heads << ", " << block_size << ", "
+          << head_size << "]";
+      throw std::invalid_argument(msg.str());
+    }
+  } else if (k_pool.ndim() != 5) {
     std::ostringstream msg;
     msg << "[validator] [" << op_name << "] k_pool must be rank 5 "
         << "[num_blocks, num_kv_heads, head_size/x, block_size, x]; got rank "
         << k_pool.ndim();
     throw std::invalid_argument(msg.str());
   }
-  if (v_pool.ndim() != 4) {
-    std::ostringstream msg;
-    msg << "[validator] [" << op_name << "] v_pool must be rank 4 "
-        << "[num_blocks, num_kv_heads, head_size, block_size]; got rank "
-        << v_pool.ndim();
-    throw std::invalid_argument(msg.str());
-  }
-  if (k_pool.shape(1) != num_kv_heads) {
-    std::ostringstream msg;
-    msg << "[validator] [" << op_name << "] k_pool.shape(1) (" << k_pool.shape(1)
-        << ") disagrees with num_kv_heads (" << num_kv_heads << ")";
-    throw std::invalid_argument(msg.str());
-  }
-  if (k_pool.shape(2) != head_size / x_pack) {
-    std::ostringstream msg;
-    msg << "[validator] [" << op_name << "] k_pool.shape(2) (" << k_pool.shape(2)
-        << ") disagrees with head_size/x_pack (" << head_size / x_pack << ")";
-    throw std::invalid_argument(msg.str());
-  }
-  if (k_pool.shape(3) != block_size) {
-    std::ostringstream msg;
-    msg << "[validator] [" << op_name << "] k_pool.shape(3) (" << k_pool.shape(3)
-        << ") disagrees with block_size (" << block_size << ")";
-    throw std::invalid_argument(msg.str());
-  }
-  if (k_pool.shape(4) != x_pack) {
-    std::ostringstream msg;
-    msg << "[validator] [" << op_name << "] k_pool.shape(4) (" << k_pool.shape(4)
-        << ") disagrees with x_pack (" << x_pack << ")";
-    throw std::invalid_argument(msg.str());
-  }
-  if (v_pool.shape(1) != num_kv_heads) {
-    std::ostringstream msg;
-    msg << "[validator] [" << op_name << "] v_pool.shape(1) (" << v_pool.shape(1)
-        << ") disagrees with num_kv_heads (" << num_kv_heads << ")";
-    throw std::invalid_argument(msg.str());
-  }
-  if (v_pool.shape(2) != head_size) {
-    std::ostringstream msg;
-    msg << "[validator] [" << op_name << "] v_pool.shape(2) (" << v_pool.shape(2)
-        << ") disagrees with head_size (" << head_size << ")";
-    throw std::invalid_argument(msg.str());
-  }
-  if (v_pool.shape(3) != block_size) {
-    std::ostringstream msg;
-    msg << "[validator] [" << op_name << "] v_pool.shape(3) (" << v_pool.shape(3)
-        << ") disagrees with block_size (" << block_size << ")";
-    throw std::invalid_argument(msg.str());
+  if (!values_token_major) {
+    if (v_pool.ndim() != 4) {
+      std::ostringstream msg;
+      msg << "[validator] [" << op_name << "] v_pool must be rank 4 "
+          << "[num_blocks, num_kv_heads, head_size, block_size]; got rank "
+          << v_pool.ndim();
+      throw std::invalid_argument(msg.str());
+    }
+    if (k_pool.shape(1) != num_kv_heads) {
+      std::ostringstream msg;
+      msg << "[validator] [" << op_name << "] k_pool.shape(1) (" << k_pool.shape(1)
+          << ") disagrees with num_kv_heads (" << num_kv_heads << ")";
+      throw std::invalid_argument(msg.str());
+    }
+    if (k_pool.shape(2) != head_size / x_pack) {
+      std::ostringstream msg;
+      msg << "[validator] [" << op_name << "] k_pool.shape(2) (" << k_pool.shape(2)
+          << ") disagrees with head_size/x_pack (" << head_size / x_pack << ")";
+      throw std::invalid_argument(msg.str());
+    }
+    if (k_pool.shape(3) != block_size) {
+      std::ostringstream msg;
+      msg << "[validator] [" << op_name << "] k_pool.shape(3) (" << k_pool.shape(3)
+          << ") disagrees with block_size (" << block_size << ")";
+      throw std::invalid_argument(msg.str());
+    }
+    if (k_pool.shape(4) != x_pack) {
+      std::ostringstream msg;
+      msg << "[validator] [" << op_name << "] k_pool.shape(4) (" << k_pool.shape(4)
+          << ") disagrees with x_pack (" << x_pack << ")";
+      throw std::invalid_argument(msg.str());
+    }
+    if (v_pool.shape(1) != num_kv_heads) {
+      std::ostringstream msg;
+      msg << "[validator] [" << op_name << "] v_pool.shape(1) (" << v_pool.shape(1)
+          << ") disagrees with num_kv_heads (" << num_kv_heads << ")";
+      throw std::invalid_argument(msg.str());
+    }
+    if (v_pool.shape(2) != head_size) {
+      std::ostringstream msg;
+      msg << "[validator] [" << op_name << "] v_pool.shape(2) (" << v_pool.shape(2)
+          << ") disagrees with head_size (" << head_size << ")";
+      throw std::invalid_argument(msg.str());
+    }
+    if (v_pool.shape(3) != block_size) {
+      std::ostringstream msg;
+      msg << "[validator] [" << op_name << "] v_pool.shape(3) (" << v_pool.shape(3)
+          << ") disagrees with block_size (" << block_size << ")";
+      throw std::invalid_argument(msg.str());
+    }
   }
   if (k_pool.shape(0) != v_pool.shape(0)) {
     std::ostringstream msg;
@@ -868,6 +885,7 @@ void PagedKVWrite::eval_gpu(
       head_size_,
       x_pack_,
       kv_dtype_,
+      values_token_major_,
       "PagedKVWrite::eval_gpu");
 
   // Output arrays semantically alias the input pools (in-place write).
@@ -940,7 +958,8 @@ void PagedKVWrite::eval_gpu(
       head_size_,
       block_size_,
       x_pack_,
-      to_paged_dtype(kv_dtype_));
+      to_paged_dtype(kv_dtype_),
+      values_token_major_);
 }
 
 std::vector<array> PagedKVWrite::vjp(
@@ -966,7 +985,8 @@ bool PagedKVWrite::is_equivalent(const Primitive& other) const {
   const PagedKVWrite& o = static_cast<const PagedKVWrite&>(other);
   return block_size_ == o.block_size_ && num_kv_heads_ == o.num_kv_heads_ &&
       head_size_ == o.head_size_ && x_pack_ == o.x_pack_ &&
-      kv_dtype_ == o.kv_dtype_;
+      kv_dtype_ == o.kv_dtype_ &&
+      values_token_major_ == o.values_token_major_;
 }
 
 // =============================================================================
@@ -1219,7 +1239,8 @@ std::array<array, 4> paged_kv_write(
     int head_size,
     int x_pack,
     KvDtype kv_dtype,
-    StreamOrDevice s_) {
+    StreamOrDevice s_,
+    bool values_token_major) {
   auto s = to_stream(s_);
 
   // No pure-MLX fallback exists (the kernel is the implementation). The
@@ -1248,6 +1269,7 @@ std::array<array, 4> paged_kv_write(
       head_size,
       x_pack,
       kv_dtype,
+      values_token_major,
       "paged_kv_write");
 
   // Slot-id range check (factory-only).
@@ -1310,7 +1332,8 @@ std::array<array, 4> paged_kv_write(
       num_kv_heads,
       head_size,
       x_pack,
-      kv_dtype);
+      kv_dtype,
+      values_token_major);
 
   auto results = array::make_arrays(
       {k_pool.shape(), v_pool.shape(), k_scale.shape(), v_scale.shape()},
@@ -2170,6 +2193,7 @@ bool mlx_paged_kv_write_forward(
     int num_kv_heads,
     int head_size,
     uint8_t kv_dtype_raw,
+    bool values_token_major,
     mlx_array** out_k_pool_ptr,
     mlx_array** out_v_pool_ptr,
     mlx_array** out_k_scale_ptr,
@@ -2218,8 +2242,10 @@ bool mlx_paged_kv_write_forward(
         block_size,
         num_kv_heads,
         head_size,
-        x_pack_for(kv_dtype),
-        kv_dtype);
+        values_token_major ? head_size : x_pack_for(kv_dtype),
+        kv_dtype,
+        StreamOrDevice{},
+        values_token_major);
 
     *out_k_pool_ptr = reinterpret_cast<mlx_array*>(new array(std::move(out[0])));
     *out_v_pool_ptr = reinterpret_cast<mlx_array*>(new array(std::move(out[1])));
@@ -4828,6 +4854,7 @@ int mlx_paged_kv_write_forward_eval_smoke() {
         /*num_kv_heads=*/4,
         /*head_size=*/64,
         /*kv_dtype_raw=*/1,
+        /*values_token_major=*/false,
         &out_k,
         &out_v,
         &out_k_scale,

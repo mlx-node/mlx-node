@@ -174,6 +174,7 @@ fn write(
             H as i32,
             head_size as i32,
             kv_dtype,
+            false,
             k_out,
             v_out,
             ks_out,

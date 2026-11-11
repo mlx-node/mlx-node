@@ -1215,6 +1215,8 @@ unsafe extern "C-unwind" {
     /// lazy outputs aliasing `k_pool`, `v_pool`, `k_scale`, `v_scale` (an
     /// Int8 write stores its scales in place). Every out pointer must be
     /// non-null. Returns false for bridge/factory validation errors.
+    /// `values_token_major`: the pools are token-major pages (K and V
+    /// `[num_blocks, num_kv_heads, block_size, head_size]`).
     #[allow(clippy::too_many_arguments)]
     pub fn mlx_paged_kv_write_forward(
         k_pool: *mut mlx_array,
@@ -1228,6 +1230,7 @@ unsafe extern "C-unwind" {
         num_kv_heads: i32,
         head_size: i32,
         kv_dtype: u8,
+        values_token_major: bool,
         out_k_pool: *mut *mut mlx_array,
         out_v_pool: *mut *mut mlx_array,
         out_k_scale: *mut *mut mlx_array,
@@ -2348,6 +2351,16 @@ unsafe extern "C-unwind" {
     // (Metal device with residency sets).
     pub fn mlx_kv_store_batched_available() -> bool;
 
+    // Store bf16 `rows` `[n, dim]` into a page pool's bf16 index plane at
+    // plane rows `slots` (int32 `[n]`), in place; `out` is the plane handle
+    // to adopt. False without Metal or on a contract violation.
+    pub fn mlx_paged_index_store(
+        plane: *mut mlx_array,
+        rows: *mut mlx_array,
+        slots: *mut mlx_array,
+        out: *mut *mut mlx_array,
+    ) -> bool;
+
     // Fused DFlash2 grouped dynamic causal conv: one elementwise dispatch
     // reproducing the pad/slice/add/mul/add chain bit-exactly (per-op dtype
     // rounding preserved inside the kernel).
@@ -2652,6 +2665,8 @@ unsafe extern "C" {
     pub fn mlx_qwen4_gather_pages(
         keys: *mut mlx_array,
         values: *mut mlx_array,
+        key_scales: *mut mlx_array,
+        value_scales: *mut mlx_array,
         slots: *mut mlx_array,
         heads: i32,
         dim: i32,
@@ -2848,6 +2863,8 @@ unsafe extern "C" {
     pub fn mlx_qwen4_gather_window(
         keys: *mut mlx_array,
         values: *mut mlx_array,
+        key_scales: *mut mlx_array,
+        value_scales: *mut mlx_array,
         table: *mut mlx_array,
         tokens: *mut mlx_array,
         fresh_k: *mut mlx_array,

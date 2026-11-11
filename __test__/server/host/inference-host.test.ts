@@ -762,7 +762,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
   });
 
   // Mutation: drop `maxContextTokens` from the qwen4_exp estimator options in
-  // `nativeContextEstimate` → red.
+  // `nativeContextEstimate` → red. Mutation: drop `kvFormat` from them → red.
   it('hands maxContextTokens to both estimators', async () => {
     const asked: Array<{ family: string; options?: unknown }> = [];
     const estimate = nativeContextEstimate(
@@ -780,7 +780,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     await estimate('/qwen', 'qwen3_5', { maxContextTokens: 409_600 });
     expect(asked).toEqual([
       { family: 'flash-next', options: { maxContextTokens: 102_400 } },
-      { family: 'flash-next', options: null },
+      { family: 'flash-next', options: { kvFormat: 'int8' } },
       { family: 'qwen3_5', options: { maxContextTokens: 409_600 } },
     ]);
   });
@@ -823,8 +823,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
   });
 
   // Mutation: price qwen4_exp with the qwen3_5 estimator in
-  // `nativeContextEstimate` → red. Mutation: publish the MTP window → red
-  // (61,433; MTP is opt-in on qwen4_exp).
+  // `nativeContextEstimate` → red.
   it('prices a Flash Next entry with its own estimator', async () => {
     const asked: Array<{ family: string; path: string; options?: unknown }> = [];
     const estimate = nativeContextEstimate(
@@ -834,7 +833,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
       },
       async (path, options) => {
         asked.push({ family: 'flash-next', path, options });
-        return { windowTokens: 65_536, speculativeWindowTokens: 61_433, bound: 'memory' };
+        return { windowTokens: 65_536, bound: 'memory' };
       },
     );
     expect(
@@ -849,7 +848,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
       bound: 'memory',
     });
     expect(asked).toEqual([
-      { family: 'flash-next', path: '/flash', options: { maxMemoryBytes: 25_769_803_776 } },
+      { family: 'flash-next', path: '/flash', options: { kvFormat: 'int8', maxMemoryBytes: 25_769_803_776 } },
       { family: 'qwen3_5', path: '/qwen', options: { maxMemoryBytes: 1_024 } },
     ]);
   });

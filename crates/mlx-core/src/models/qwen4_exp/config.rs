@@ -59,6 +59,10 @@ pub struct Config {
     /// saved, so `max_position_embeddings` stays the native window.
     #[serde(skip)]
     pub rope_scaling: crate::nn::rope_scaling::RopeScaling,
+    /// Element format of the attention K/V pages, resolved at load
+    /// (`kvFormat`); never saved.
+    #[serde(skip)]
+    pub kv_format: crate::transformer::KvFormat,
 }
 fn seed() -> u64 {
     1234

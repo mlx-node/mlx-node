@@ -91,15 +91,8 @@ fn tiny_hybrid_recurrent_bytes_make_usable_window_stricter_than_raw_pool() {
 /// Installs a memory plan whose pool lane holds `pool_window` tokens and,
 /// with `speculative`, a tiny DFlash2 draft and a lane of that window.
 fn install_plan(inner: &mut Qwen35MoeInner, pool_window: Option<u32>, speculative: Option<u32>) {
-    use crate::engine::memory_plan::{KvLayout, MemoryPlan};
-    let layout = KvLayout::of(
-        1,
-        1,
-        32,
-        DType::BFloat16,
-        crate::transformer::KvFormat::Bf16,
-    );
-    let mut plan = MemoryPlan::with_pool_window(0, 1, layout, 0, pool_window.unwrap_or(0));
+    use crate::engine::memory_plan::MemoryPlan;
+    let mut plan = MemoryPlan::with_pool_window(0, 1, 0, pool_window.unwrap_or(0));
     if pool_window.is_none() {
         plan.pool = None;
     }

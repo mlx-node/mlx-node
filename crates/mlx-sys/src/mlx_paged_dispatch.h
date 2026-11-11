@@ -95,6 +95,10 @@ enum class PagedAttentionRouteHint : uint8_t {
 /// Int8 runs `reshape_and_cache_int8_kv_bfloat16_t_hd{128,256}`: one
 /// threadgroup of `head_size` threads per K or V row, `2 * num_tokens *
 /// num_kv_heads` threadgroups (Splash `PagedAttention::addPrefillStore`).
+///
+/// `values_token_major` runs the `_vt` instances: K and V both
+/// `[num_blocks, num_kv_heads, block_size, head_size]` (Splash
+/// `splash_kv_key_element`), `x_pack == head_size`.
 void dispatch_reshape_and_cache(
     mlx::core::metal::CommandEncoder& encoder,
     mlx::core::metal::Device& device,
@@ -110,7 +114,8 @@ void dispatch_reshape_and_cache(
     int head_size,
     int block_size,
     int x_pack,
-    KvDtype kv_dtype);
+    KvDtype kv_dtype,
+    bool values_token_major);
 
 /// Dispatch the paged-attention kernel (V1 if `max_context_len <=
 /// PARTITION_SIZE`, else V2 in two phases) onto the MLX command

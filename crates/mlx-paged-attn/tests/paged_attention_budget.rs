@@ -108,6 +108,7 @@ fn pool(cache_dtype: MetalDtype) -> Option<Pool> {
             H as i32,
             D as i32,
             kv_dtype,
+            false,
             k_out,
             v_out,
             ks_out,

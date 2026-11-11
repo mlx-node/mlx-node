@@ -54,8 +54,9 @@ less 15% and 1 GiB, lowered by `maxMemoryBytes` (`--max-memory`). In order:
 
 1. The floors (fixed weights, reserves, the expert floor, the row staging and
    the smallest lane) must fit, or the load is refused before it reads a byte.
-2. The KV allowance comes first: the dynamic bytes at which every lane the
-   load serves (the AR lane, and the MTP lane with MTP weights) holds
+2. The KV allowance comes first: the dynamic bytes at which the load's one
+   lane (with MTP weights it also holds the MTP draft state at its window,
+   charged once as Splash charges a lane) holds
    `min(trained, 65,536)` tokens, or `maxContextTokens` (`--max-context`)
    tokens when it is set (Splash `allowance` for a target that cannot spill).
 3. The experts load whole only where they leave the allowance and the row
@@ -201,20 +202,38 @@ block order, the order of the one-simdgroup chain it replaces, before the same
 `simd_sum`. Every F32 sum and BF16 output keeps its bits; a partial sum per
 simdgroup would reassociate the chain and is not used.
 
+**K/V format.** `kvFormat` (`--kv-format`) sets the page format: int8 by
+default where the int8 page kernels serve the head (128 or 256 wide, every
+released checkpoint), else bf16; an explicit `'int8'` they cannot serve fails
+the load. An int8 page holds per-token symmetric int8 rows with one f32 scale
+per row and head (Splash `kv::Format::Int8`). A page is Splash's Flash Next
+page (`QwenHybridLayout::kvLayout`): K and V token-major, and the indexer's
+pooled keys of its complete 4-token blocks in the page's bf16 index plane, so
+the pool block is the priced page: 13,248 B per token in int8 (423,936 B per
+32-token page over the 12 attention layers), 25,344 B in bf16. The keys of the
+open block stay with the owner's state. The page gathers dequantize int8 rows
+to BF16 before attention (Splash applies the scales inside its sparse kernel:
+the same math, another BF16 rounding point), and a turn reads its own fresh
+rows unquantized (Splash stores them first and reads them back as int8), so on
+an int8 pool an MTP verify can differ from AR at T=0 and window-prefill logits
+depend on how the prompt is chunked. Flash Next has no SSD tier, so nothing
+round-trips its pages; the pool refuses host transfers of a token-major page.
+`contextLimits().kvFormat` names the load's format.
+
 The shared scheduler supports up to four live owners. The QSA K/V pool starts at
-a 96-block runway and grows by 171-block extents to the plan's maximum, each
+the format's runway (int8 256 blocks = 8,192 tokens, bf16 96) and grows by
+128 MiB extents (int8 317 blocks, bf16 165) to the plan's maximum, each
 growth checked against the plan's ceiling; a turn books its pages as it writes
-them. Each page is priced with the indexer's block keys beside its K/V. The
-pool, the recurrent rows (one cell per owner, kept beside the pool), the MTP
+them. The pool, the recurrent rows (one cell per owner, kept beside the pool), the MTP
 draft state and the prefill transient share the plan's one dynamic budget: a
 turn's state is admitted against what the pool's blocks and the transient
 leave, and a turn is refused only when that budget cannot hold its state. The
-effective window is the plan's AR window (65,536 tokens on a 36 GB Mac, the
-trained 262,144 when the experts load whole with room to spare); an MTP turn
-takes the MTP lane's window. `maxContextTokens` (`--max-context`) caps both
-windows; past the native 262,144 the target's RoPE, the indexer's pooled keys
+effective window is the plan's window (65,536 tokens on a 36 GB Mac, the
+trained 262,144 when the experts load whole with room to spare); every turn
+(AR, image, MTP) takes that one window. `maxContextTokens` (`--max-context`)
+caps it; past the native 262,144 the target's RoPE, the indexer's pooled keys
 included, takes static YaRN up to 1,010,000 tokens (Splash `Qwen4Exp`
-`yarnContextTokens`), and a load whose AR window holds fewer tokens fails. The output budget is the rest of the window, and
+`yarnContextTokens`), and a load whose window holds fewer tokens fails. The output budget is the rest of the window, and
 an omitted one fills it. Inspect `contextLimits()` for the windows and
 `/v1/models` for the load-free estimate before a load. Multi-owner decode keeps stateful attention per owner and batches stateless
 MLP projections across ready rows. Warm continuation reuses that

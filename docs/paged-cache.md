@@ -114,7 +114,16 @@ else bf16; an explicit `int8` the kernels cannot serve (head not 128 / 256,
 another block size, f16 compute) fails the load. The cold tier stores an int8
 block with its scales (`K | K scales | V | V scales` per layer, Splash slot
 version 0), and the pool format is part of the cache fingerprint, so a bf16
-cache is never read by an int8 load. Every other family's pool stays bf16.
+cache is never read by an int8 load. qwen4_exp (Flash Next) follows
+`kvFormat` the same way (unset: int8 at head 128 or 256, else bf16) on
+Splash's Flash Next page (`QwenHybridLayout::kvLayout`, `SelectedBlocks`):
+K and V token-major (`PageLayout::values_token_major`, the `_vt` store
+instances) and a bf16 index plane of the indexer's pooled block keys in the
+block (`PageLayout::index_rows`, Splash `PageStorage::indexOffset`), so its
+block is the priced page (int8 423,936 B, bf16 811,008 B). Its own page
+gathers read it (int8 dequantized to BF16); the paged-attention kernels, the
+dense gather and the host transfers refuse such a page, and qwen4_exp has no
+cold tier. Every other family's pool stays bf16.
 There is no FP8 KV cache. `contextLimits().kvFormat` reports the pool lane's
 format and `.speculativeKvFormat` the DFlash2 lane's.
 

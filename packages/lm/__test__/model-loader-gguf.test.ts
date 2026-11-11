@@ -85,9 +85,16 @@ describe('standalone GGUF model detection', () => {
     expect(loadSpy).toHaveBeenLastCalledWith(modelPath, { draftModelPath: '/draft', kvFormat: 'bf16' });
   });
 
-  it('rejects kvFormat for other model families', async () => {
-    const { modelPath } = await writeStandaloneGguf('qwen4exp');
-    await expect(loadModel(modelPath, { kvFormat: 'int8' })).rejects.toThrow('only supported by qwen3_5');
+  // Mutation: drop `kvFormat` from `qwen4ExpLoadOptions` → red.
+  it('passes kvFormat to the Flash Next loader; rejects it for gemma4', async () => {
+    const flashNext = await writeStandaloneGguf('qwen4exp');
+    const loadSpy = vi.spyOn(Qwen4ExpModel, 'load').mockResolvedValue({} as Qwen4ExpModel);
+    await loadModel(flashNext.modelPath, { kvFormat: 'int8' });
+    expect(loadSpy).toHaveBeenLastCalledWith(flashNext.modelPath, { kvFormat: 'int8' });
+    const gemma = await writeStandaloneGguf('gemma4');
+    await expect(loadModel(gemma.modelPath, { kvFormat: 'int8' })).rejects.toThrow(
+      'only supported by qwen3_5, qwen3_5_moe and qwen4_exp',
+    );
   });
 
   // Mutation: drop `maxMemoryBytes` from `qwen35LoadOptions` → red. Mutation:
