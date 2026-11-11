@@ -167,7 +167,7 @@ pub(crate) struct Qwen35Inner {
     pub(crate) dflash2_context: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
     pub(crate) dflash2_turn_state: Option<crate::models::qwen3_5::dflash2_turn::DFlash2TurnState>,
     pub(crate) dflash2_prefix: PrefixTracker,
-    pub(crate) dflash2_states: crate::models::qwen3_5::dflash2_state::flat::FlatStates,
+    pub(crate) dflash2_states: crate::models::qwen3_5::dflash2_state::paged::DFlash2States,
     /// The one clock the allocator, the DFlash2 store, the GDN ladder and
     /// history entries and the scheduler's idle owners stamp with.
     pub(crate) cache_recency: Arc<mlx_paged_attn::CacheRecency>,
@@ -305,7 +305,7 @@ pub(crate) struct Qwen35Inner {
     /// The arm the most recent `prepare_dense_gdn_prefix_state` resolved to
     /// (`"live"`, `"last_history"`, …). Test observability only — the trace
     /// line carrying the same value needs a tracing subscriber to see.
-    last_gdn_prefix_prepare_state: &'static str,
+    pub(crate) last_gdn_prefix_prepare_state: &'static str,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
@@ -952,7 +952,7 @@ mod paged_gdn_frontier_tests;
 mod mtp_gate_state_tests;
 
 #[cfg(test)]
-mod dflash2_park_tests;
+pub(crate) mod dflash2_park_tests;
 
 #[cfg(test)]
 mod stream_progress_tests;

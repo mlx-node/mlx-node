@@ -1656,7 +1656,6 @@ impl DFlash2ContextCache {
     /// length `c` and provenance `[.., c)`. Evaluated here because a later
     /// append that overruns the window stores its rows in place over the
     /// rows this reads.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn snapshot_window_at(
         &self,
         c: i32,
@@ -1834,6 +1833,35 @@ impl DFlash2ContextCache {
         } else {
             MxArray::eval_arrays(&arrays)
         }
+    }
+
+    /// An evaluated copy of every layer's window: appends to either never
+    /// reach the other (they write rows in place).
+    pub(crate) fn deep_copy(&self) -> Result<DFlash2ContextCache> {
+        let copy = |buffer: &Option<MxArray>| buffer.as_ref().map(MxArray::deep_copy).transpose();
+        let layers = self
+            .layers
+            .iter()
+            .map(|window| {
+                Ok(DraftKvWindow {
+                    keys: copy(&window.keys)?,
+                    values: copy(&window.values)?,
+                    start: window.start,
+                    end: window.end,
+                    window: window.window,
+                    reserve: window.reserve,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let copied = DFlash2ContextCache {
+            layers,
+            mask_memo: None,
+            logical_len: self.logical_len,
+            kv_end: self.kv_end,
+            token_history: self.token_history.clone(),
+        };
+        copied.eval()?;
+        Ok(copied)
     }
 }
 
@@ -2455,6 +2483,32 @@ pub(crate) fn tiny_dflash2_model_for_stepper_test(
     target: &super::config::Qwen3_5Config,
 ) -> Result<DFlash2Model> {
     tiny_dflash2_model_with_block(target, 2)
+}
+
+/// A one-layer draft geometry for window-only tests.
+#[cfg(test)]
+pub(crate) fn tiny_dflash2_config() -> DFlash2Config {
+    DFlash2Config {
+        block_size: 2,
+        mask_token_id: 0,
+        target_layers: vec![0],
+        target_num_layers: 1,
+        hidden_size: 8,
+        intermediate_size: 16,
+        num_hidden_layers: 1,
+        num_attention_heads: 1,
+        num_key_value_heads: 1,
+        head_dim: 8,
+        vocab_size: 16,
+        rms_norm_eps: 1e-6,
+        max_position_embeddings: 64,
+        sliding_window: 8,
+        conv_group_size: 8,
+        conv_kernel_size: 2,
+        selector_rank: 8,
+        selector_top_k: 4,
+        rope_theta: 1e4,
+    }
 }
 
 #[cfg(test)]

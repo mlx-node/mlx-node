@@ -285,10 +285,6 @@ impl HybridSchedulerBackend for Qwen35Inner {
         )
     }
 
-    fn compact_one_state(&mut self) -> bool {
-        crate::models::qwen3_5::dflash2_turn::compact_one_state(self)
-    }
-
     fn oldest_state_unit(
         &self,
         at_cap: bool,

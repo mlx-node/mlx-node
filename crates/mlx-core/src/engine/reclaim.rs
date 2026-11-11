@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use crate::models::qwen3_5::dflash2_state::store::StoreStep;
+use crate::models::qwen3_5::dflash2_state::store::EntryId;
 use crate::transformer::paged_kv_cache_adapter::SeqId;
 
 /// Blocks a refused attempt takes in place.
@@ -40,7 +40,7 @@ impl KvNeed {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum UnitKey {
-    Store(StoreStep),
+    Store(EntryId),
     Ladder {
         owner_id: String,
         prefix_len: u32,
@@ -117,7 +117,6 @@ pub(crate) trait KvReclaim {
     fn sync_marks(&mut self) {}
     /// What the units of the need's classes free; may over-count.
     fn reach(&self, at_cap: bool, in_use: bool) -> Reach;
-    fn compact_one(&mut self) -> bool;
     /// The oldest state unit of one class: in use by a turn, or not.
     fn oldest_state(&self, at_cap: bool, skip: &HashSet<UnitKey>, in_use: bool) -> Option<Unit>;
     fn oldest_kv(&self, _at_cap: bool, _skip: &HashSet<UnitKey>) -> Option<Unit> {
@@ -181,16 +180,12 @@ pub(crate) fn free_for_kv<U: KvReclaim>(units: &mut U, need: KvNeed) -> Freed {
     let mut took = false;
     let mut met = false;
     loop {
-        let freed = if !at_cap && units.compact_one() {
-            true
-        } else {
-            let state = units.oldest_state(at_cap, &skip, false);
-            let kv = units.oldest_kv(at_cap, &skip);
-            match older_first(state, kv) {
-                Some(unit) => take_one(units, unit.key, &mut skip),
-                None if need.rebuilt && !at_cap && units.rebuild_one() => true,
-                None => break,
-            }
+        let state = units.oldest_state(at_cap, &skip, false);
+        let kv = units.oldest_kv(at_cap, &skip);
+        let freed = match older_first(state, kv) {
+            Some(unit) => take_one(units, unit.key, &mut skip),
+            None if need.rebuilt && !at_cap && units.rebuild_one() => true,
+            None => break,
         };
         if freed {
             took = true;
@@ -328,9 +323,6 @@ mod tests {
                     .saturating_add(self.reach_blocks),
                 bytes: 0,
             }
-        }
-        fn compact_one(&mut self) -> bool {
-            false
         }
         fn oldest_state(
             &self,
@@ -491,10 +483,7 @@ mod tests {
     }
 
     fn store_key(entry: u64) -> UnitKey {
-        UnitKey::Store(StoreStep {
-            entry,
-            kind: crate::models::qwen3_5::dflash2_state::store::StoreStepKind::DropEnd,
-        })
+        UnitKey::Store(entry)
     }
 
     impl KvReclaim for CapFake {
@@ -525,9 +514,6 @@ mod tests {
                 bytes: if at_cap { 0 } else { self.stores.len() as u64 },
             }
         }
-        fn compact_one(&mut self) -> bool {
-            false
-        }
         fn oldest_state(
             &self,
             at_cap: bool,
@@ -556,8 +542,8 @@ mod tests {
         fn take(&mut self, key: &UnitKey) -> bool {
             self.taken.push(key.clone());
             match key {
-                UnitKey::Store(step) => {
-                    self.stores.retain(|&entry| entry != step.entry);
+                UnitKey::Store(id) => {
+                    self.stores.retain(|entry| entry != id);
                     true
                 }
                 UnitKey::Owner(_) => {
@@ -622,9 +608,6 @@ mod tests {
                 blocks: (self.ordinary.len() + used) as u64,
                 bytes: 0,
             }
-        }
-        fn compact_one(&mut self) -> bool {
-            false
         }
         fn oldest_state(
             &self,

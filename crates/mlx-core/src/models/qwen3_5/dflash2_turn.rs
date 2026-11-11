@@ -14,8 +14,8 @@ use crate::engine::reclaim::{
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::dflash2::{DFlash2ContextCache, DFlash2Model};
-use super::dflash2_decode::dflash2_memory_snapshot;
-use super::dflash2_state::flat::FlatStates;
+use super::dflash2_state::paged::{DFlash2States, PagedAnchor};
+use super::dflash2_state::store::{EntryId, Lineage};
 
 /// The draft window a tapped paged prefill built, handed to the turn's
 /// stepper.
@@ -98,10 +98,8 @@ impl KeptPoints<'_> {
 /// A Qwen3.5-family target model that runs DFlash2 turns on its paged pool.
 pub(crate) trait DFlash2Target: ChatBackend {
     fn dflash2(&self) -> Option<&DFlash2Model>;
-    fn dflash2_states(&self) -> &FlatStates;
-    fn dflash2_states_mut(&mut self) -> &mut FlatStates;
-    /// The load's memory plan; `None` when the working set is unreadable.
-    fn memory_plan(&self) -> Option<&crate::engine::memory_plan::MemoryPlan>;
+    fn dflash2_states(&self) -> &DFlash2States;
+    fn dflash2_states_mut(&mut self) -> &mut DFlash2States;
     /// Dense-shaped config the load plan prices.
     fn dense_config(&self) -> std::borrow::Cow<'_, super::config::Qwen3_5Config>;
     /// Embedding output dtype: what an unallocated BF16 cache will hold.
@@ -122,43 +120,347 @@ pub(crate) trait DFlash2Target: ChatBackend {
     ) -> Option<Unit>;
     /// Drops a ladder or history entry; false when it is gone.
     fn drop_gdn_state(&mut self, key: &UnitKey) -> bool;
+    /// Marks every ladder rung's and parked DFlash2 state's block.
     fn sync_gdn_state_marks(&self);
     /// Bytes of the GDN entries a reclaim may take, with `in_use` those
     /// turns use too.
     fn gdn_state_bytes(&self, keep: Keep<'_>, in_use: bool) -> u64;
     /// Marked cache-only blocks the kept prompt hits.
     fn marked_hit_blocks(&self, keep: Keep<'_>) -> u32;
+    /// The blocks the ladder rungs mark.
+    fn ladder_marks(&self) -> HashSet<u64>;
+    /// Fresh per-layer caches for this model.
+    fn fresh_layer_caches(&self) -> Vec<super::layer_cache::Qwen3_5LayerCache>;
+    /// Puts the lane at a parked state's text lineage: its caches, draft
+    /// window and history; no image lineage stays.
+    fn adopt_parked_state(
+        &mut self,
+        caches: Vec<super::layer_cache::Qwen3_5LayerCache>,
+        window: DFlash2ContextCache,
+        history: Vec<u32>,
+    );
+    /// The live GDN state agrees with its tokens and carries no image
+    /// lineage, so a state captured from it is exact on a text chain.
+    fn replay_state_exact(&self) -> bool;
+    /// Drops the draft state a tapped prefill handed the stepper.
+    fn dflash2_turn_state_clear(&mut self);
+}
+
+/// Where a DFlash2 turn resumes: the live request with its draft window, or
+/// a parked state installed at its block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DFlash2Hit {
+    Live(u32),
+    Stored(u32),
+}
+
+/// The prompt a DFlash2 prime keeps from its reclaims: a restored chain is
+/// kept for its request (Splash `Cache::kept`); the live table is no unit.
+pub(crate) fn prime_keep<'a>(
+    plan: &'a [u32],
+    keys: &'a [Vec<u64>],
+    cache_salt: u64,
+    hit: Option<DFlash2Hit>,
+) -> Keep<'a> {
+    match hit {
+        Some(DFlash2Hit::Live(_)) => Keep::default(),
+        None | Some(DFlash2Hit::Stored(_)) => Keep {
+            tokens: plan,
+            keys: Some((keys, cache_salt)),
+        },
+    }
+}
+
+/// The DFlash2 prepare. A turn resumes only at its state's exact block
+/// (Splash resumes a state at its boundary): a live window continues the
+/// live request, a parked state looks its chain up capped at its block. Any
+/// other hit restarts cold.
+pub(crate) fn prepare_dflash2_turn(
+    adapter: &mut PagedKVCacheAdapter,
+    seq_id: u32,
+    plan: &[u32],
+    keys: &[Vec<u64>],
+    cache_salt: u64,
+    hit: DFlash2Hit,
+) -> Result<crate::transformer::paged_kv_cache_adapter::PagedTurnPlan> {
+    let total_budget = u32::try_from(plan.len()).unwrap_or(u32::MAX);
+    let (skip_lookup, candidate) = match hit {
+        DFlash2Hit::Live(depth) => (depth == 0, depth),
+        DFlash2Hit::Stored(depth) => (false, depth),
+    };
+    let prepared = adapter
+        .prepare_turn_per_block_booking_hit_only(
+            seq_id,
+            plan,
+            total_budget,
+            keys,
+            cache_salt,
+            skip_lookup,
+            candidate,
+        )
+        .map_err(Error::from_reason)?;
+    let resumed = match hit {
+        DFlash2Hit::Live(_) => prepared.continued_live_prefix,
+        DFlash2Hit::Stored(_) => !prepared.continued_live_prefix,
+    } && prepared.cached_prefix_len == candidate;
+    if prepared.cached_prefix_len == 0 || resumed {
+        return Ok(prepared);
+    }
+    adapter
+        .prepare_turn_per_block_booking_hit_only(
+            seq_id,
+            plan,
+            total_budget,
+            keys,
+            cache_salt,
+            true,
+            0,
+        )
+        .map_err(Error::from_reason)
+}
+
+/// The deepest parked state a DFlash2 turn of `tokens` resumes from when it
+/// beats the live window of `live` tokens (Splash
+/// `StateCache::acquireDeepest`); `None` without reuse.
+pub(crate) fn parked_state_hit<T: DFlash2Target>(
+    target: &T,
+    tokens: &[u32],
+    reuse_cache: bool,
+    cache_salt: u64,
+    live: usize,
+) -> Option<super::dflash2_state::store::StoreHit> {
+    if !reuse_cache {
+        return None;
+    }
+    target
+        .dflash2_states()
+        .store
+        .lookup(Lineage::text(tokens, cache_salt))
+        .filter(|hit| hit.beats_live((live > 0).then_some(live)))
+}
+
+/// Installs parked state `id` into the lane of `seq`: the live request goes
+/// (a restore resumes only at the state's block), the GDN cell and window
+/// are deep-copied in, the history is the state's lineage, and the state
+/// stays parked with a new stamp (Splash `QwenStateStorage::restore`,
+/// `StateCache::release`). Returns the resume depth.
+pub(crate) fn install_parked_state<T: DFlash2Target>(
+    target: &mut T,
+    id: EntryId,
+    seq: u32,
+) -> Result<u32> {
+    let (mark, depth) = {
+        let entry = target
+            .dflash2_states()
+            .store
+            .get(id)
+            .ok_or_else(|| Error::from_reason(format!("DFlash2 parked state {id} is gone")))?;
+        (entry.mark(), entry.depth())
+    };
+    if !target
+        .paged_adapter_ref()
+        .is_some_and(|adapter| adapter.prefix_cached(mark))
+    {
+        return Err(Error::from_reason(
+            "DFlash2 state outlived its target KV block",
+        ));
+    }
+    if let Some(adapter) = target.paged_adapter_mut_ref() {
+        adapter
+            .release_request_for(seq)
+            .map_err(Error::from_reason)?;
+    }
+    let mut caches = target.fresh_layer_caches();
+    let (window, history) = {
+        let entry = target
+            .dflash2_states()
+            .store
+            .get(id)
+            .ok_or_else(|| Error::from_reason(format!("DFlash2 parked state {id} is gone")))?;
+        super::dflash2_state::paged::install_linear(&mut caches, &entry.state().linear)?;
+        (entry.state().window.deep_copy()?, entry.tokens().to_vec())
+    };
+    target.adopt_parked_state(caches, window, history);
+    target.dflash2_states_mut().store.touch(id);
+    u32::try_from(depth).map_err(|_| Error::from_reason("DFlash2 parked state depth overflow"))
+}
+
+/// Where a DFlash2 turn of `tokens` resumes: the deepest parked state that
+/// beats the live window of `live` tokens, installed, else the live window
+/// (Splash `Cache::lookup` then `QwenStateStorage::restore`). Returns the
+/// parked state's id beside the hit.
+pub(crate) fn resolve_dflash2_resume<T: DFlash2Target>(
+    target: &mut T,
+    tokens: &[u32],
+    reuse_cache: bool,
+    cache_salt: u64,
+    seq: u32,
+    live: usize,
+) -> Result<(DFlash2Hit, Option<EntryId>)> {
+    target.dflash2_turn_state_clear();
+    let Some(hit) = parked_state_hit(&*target, tokens, reuse_cache, cache_salt, live) else {
+        return Ok((DFlash2Hit::Live(u32::try_from(live).unwrap_or(0)), None));
+    };
+    let depth = install_parked_state(target, hit.id, seq)?;
+    Ok((DFlash2Hit::Stored(depth), Some(hit.id)))
+}
+
+/// A turn that resumed parked state `stored` at `cached`, the prompt's own
+/// replay point, uses it until the turn ends (Splash
+/// `Engine::completeAdmission` → `StateCache::useState`).
+pub(crate) fn use_resumed_replay_point<T: DFlash2Target>(
+    target: &mut T,
+    tokens: &[u32],
+    stored: Option<EntryId>,
+    cached: usize,
+) {
+    let Some(id) = stored else {
+        return;
+    };
+    let Some(block_size) = target
+        .paged_adapter_ref()
+        .map(PagedKVCacheAdapter::block_size)
+    else {
+        return;
+    };
+    let states = target.dflash2_states_mut();
+    let replay = crate::engine::gen_prompt::prompt_replay_boundary(
+        tokens,
+        states.generation_suffix.as_deref(),
+        block_size as usize,
+    );
+    if cached > 0
+        && cached == replay
+        && states
+            .store
+            .get(id)
+            .is_some_and(|entry| entry.depth() == cached)
+    {
+        states.use_replay_point(id);
+    }
+}
+
+/// The row a DFlash2 prefill of `tokens` from `cached` captures: the
+/// prompt's replay point (Splash `Engine::promptReplayBoundary`) when the
+/// prefill passes it and the state there is exact.
+pub(crate) fn replay_capture_row<T: DFlash2Target>(
+    target: &T,
+    tokens: &[u32],
+    cached: usize,
+) -> Option<usize> {
+    let block_size = target.paged_adapter_ref()?.block_size() as usize;
+    let row = crate::engine::gen_prompt::prompt_replay_boundary(
+        tokens,
+        target.dflash2_states().generation_suffix.as_deref(),
+        block_size,
+    );
+    (row > cached && row >= block_size && target.replay_state_exact()).then_some(row)
+}
+
+/// Publishes the prefill's replay-point state at once, marked and in use by
+/// the turn (Splash `Engine::publishReachedStateBoundaries` →
+/// `StateCache::useState`). Its blocks register only at finalize, which
+/// keeps it or drops it.
+pub(crate) fn publish_replay_state<T: DFlash2Target>(
+    target: &mut T,
+    tokens: &[u32],
+    cache_salt: u64,
+    anchor: PagedAnchor,
+) {
+    let row = anchor.window.logical_len().max(0) as usize;
+    let Some(lineage) = tokens.get(..row) else {
+        return;
+    };
+    let states = target.dflash2_states_mut();
+    match states
+        .store
+        .insert(Lineage::text(lineage, cache_salt), anchor)
+    {
+        Ok((id, new)) => {
+            if new {
+                states.unregistered = Some(id);
+            }
+            states.use_replay_point(id);
+        }
+        Err(error) => tracing::warn!(
+            target: "mlx_core::inference",
+            "DFlash2 replay-point state not parked: {}",
+            error.reason
+        ),
+    }
+    target.sync_gdn_state_marks();
+}
+
+/// The turn's end: this turn's published state stays only when its block
+/// registered (Splash `Cache::blockAt`), and the turn's replay point is no
+/// longer in use.
+pub(crate) fn settle_replay_state<T: DFlash2Target>(target: &mut T, registered: bool) {
+    let unregistered = target.dflash2_states_mut().unregistered.take();
+    if let Some(id) = unregistered {
+        let mark = target
+            .dflash2_states()
+            .store
+            .get(id)
+            .map(|entry| entry.mark());
+        let cached = registered
+            && mark.is_some_and(|mark| {
+                target
+                    .paged_adapter_ref()
+                    .is_some_and(|adapter| adapter.prefix_cached(mark))
+            });
+        if !cached {
+            drop_parked_state(target, id);
+        }
+    }
+    target.dflash2_states_mut().end_replay_point();
 }
 
 /// The DFlash2 draft context a tapped paged prefill advances chunk by chunk
 /// (Splash `DFlashDraft::addContextCommit` over the prefill's captures).
+/// With a capture row, it also snapshots the draft window and the GDN cell
+/// at that row: the prompt's replay point (Splash
+/// `Engine::publishReachedStateBoundaries`).
 pub(crate) struct DraftTapSink<'a> {
     draft: &'a DFlash2Model,
     context: DFlash2ContextCache,
     keep_from: usize,
     tap_layers: Vec<usize>,
+    capture: Option<usize>,
+    window: Option<DFlash2ContextCache>,
+    linear: Option<Vec<super::layer_cache::Qwen3_5LayerCache>>,
 }
 
 impl<'a> DraftTapSink<'a> {
     /// `tokens` is the whole prompt; the prefill starts at `cached`, where
-    /// `context` ends.
+    /// `context` ends. `capture` is a row in `(cached, tokens.len())`.
     pub(crate) fn new(
         draft: &'a DFlash2Model,
         context: DFlash2ContextCache,
         tokens: &[u32],
         cached: usize,
+        capture: Option<usize>,
     ) -> Self {
         let window_rows = draft.config.sliding_window.saturating_sub(1);
+        let capture = capture.filter(|&row| row > cached && row < tokens.len());
         Self {
-            keep_from: draft_keep_from(cached, tokens.len(), window_rows, None),
+            keep_from: draft_keep_from(cached, tokens.len(), window_rows, capture),
             tap_layers: draft.config.target_layers.clone(),
             draft,
             context,
+            capture,
+            window: None,
+            linear: None,
         }
     }
 
-    pub(crate) fn into_context(self) -> DFlash2ContextCache {
-        self.context
+    /// The draft context, and the state at the capture row when the prefill
+    /// reached it whole.
+    pub(crate) fn into_parts(self) -> (DFlash2ContextCache, Option<PagedAnchor>) {
+        let anchor = match (self.window, self.linear) {
+            (Some(window), Some(linear)) => Some(PagedAnchor { linear, window }),
+            _ => None,
+        };
+        (self.context, anchor)
     }
 }
 
@@ -194,37 +496,32 @@ impl crate::models::qwen3_5::paged_forward::PrefillTapSink for DraftTapSink<'_> 
         let projected = self
             .context
             .project(self.draft, &fused, (first_row + head) as i32)?;
+        if let Some(row) = self.capture.filter(|&row| row > first_row && row <= end) {
+            self.window = Some(self.context.snapshot_window_at(
+                i32::try_from(row).unwrap_or(i32::MAX),
+                &projected,
+                appended,
+            )?);
+        }
         self.context.append_projected(projected, appended)
     }
 
     fn eval(&self) -> Result<()> {
         self.context.eval()
     }
-}
 
-#[cfg(test)]
-thread_local! {
-    /// Stands in for the live KV headroom on this thread.
-    pub(crate) static KV_BUDGET_OVERRIDE: std::cell::Cell<Option<u64>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// The plan's live headroom on `target`; `None` without a plan or a
-/// readable device.
-pub(crate) fn dflash2_kv_headroom_now<T: DFlash2Target>(target: &T) -> Option<u64> {
-    #[cfg(test)]
-    if let Some(bytes) = KV_BUDGET_OVERRIDE.with(std::cell::Cell::get) {
-        return Some(bytes);
+    fn capture_row(&self) -> Option<usize> {
+        self.capture
     }
-    target
-        .memory_plan()?
-        .live_headroom(dflash2_memory_snapshot())
+
+    fn capture_linear(&mut self, linear: Vec<super::layer_cache::Qwen3_5LayerCache>) {
+        self.linear = Some(linear);
+    }
 }
 
 /// What a reclaim took, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GrowReclaim {
-    Compaction,
     Store,
     Ladder,
     History,
@@ -395,10 +692,6 @@ impl<T: DFlash2Target> KvReclaim for ModelReclaim<'_, T> {
         }
     }
 
-    fn compact_one(&mut self) -> bool {
-        compact_one_state(self.target)
-    }
-
     fn oldest_state(&self, at_cap: bool, skip: &HashSet<UnitKey>, in_use: bool) -> Option<Unit> {
         oldest_state_unit(&*self.target, at_cap, skip, self.keep, in_use)
     }
@@ -439,39 +732,28 @@ pub(crate) enum Taken {
 /// Bytes every parked state and every GDN entry outside `keep` hold; the
 /// entries turns use count only with `in_use`.
 pub(crate) fn state_reach_bytes<T: DFlash2Target>(target: &T, keep: Keep<'_>, in_use: bool) -> u64 {
-    let store = target.dflash2_states().store.bytes();
-    store
-        .state_bytes
-        .saturating_add(store.kv_bytes)
-        .saturating_add(target.gdn_state_bytes(keep, in_use))
-}
-
-/// One lossless store compaction; whether it freed anything.
-pub(crate) fn compact_one_state<T: DFlash2Target>(target: &mut T) -> bool {
-    let headroom = dflash2_kv_headroom_now(&*target).unwrap_or(0);
-    match target
-        .dflash2_states_mut()
+    let kept = keep.points(
+        target
+            .paged_adapter_ref()
+            .map(PagedKVCacheAdapter::block_size),
+    );
+    target
+        .dflash2_states()
         .store
-        .compact_one(headroom, None)
-    {
-        Ok(Some(_)) => {
-            log_reclaim(GrowReclaim::Compaction);
-            true
-        }
-        Ok(None) => false,
-        Err(error) => {
-            tracing::warn!(
-                target: "mlx_core::inference",
-                "DFlash2 state compaction failed: {}",
-                error.reason
-            );
-            false
-        }
-    }
+        .entries()
+        .filter(|entry| {
+            (in_use || !entry.in_use()) && !kept.keeps(entry.tokens(), Some(entry.chain()))
+        })
+        .fold(target.gdn_state_bytes(keep, in_use), |sum, entry| {
+            sum.saturating_add(entry.state_bytes())
+        })
 }
 
-/// The oldest state that meets a KV need. At the cap no store step and no
-/// history entry is one: they sit on no block. No store step is in use.
+/// The oldest state that meets a KV need. A parked DFlash2 state is a unit
+/// of its class (in use by the running turn, or not) unless `keep`
+/// restores through it. At the cap it must free a block: its chain holds a
+/// cache-only block (the ladder's tip rule) and no ladder rung marks the same
+/// block.
 pub(crate) fn oldest_state_unit<T: DFlash2Target>(
     target: &T,
     at_cap: bool,
@@ -479,44 +761,61 @@ pub(crate) fn oldest_state_unit<T: DFlash2Target>(
     keep: Keep<'_>,
     in_use: bool,
 ) -> Option<Unit> {
-    let store = if at_cap || in_use {
-        None
-    } else {
-        target
-            .dflash2_states()
-            .store
-            .next_lossy(dflash2_kv_headroom_now(target).unwrap_or(0), None)
-            .map(|(stamp, step)| Unit {
-                stamp,
-                key: UnitKey::Store(step),
-            })
-            .filter(|unit| !skip.contains(&unit.key))
-    };
+    let adapter = target.paged_adapter_ref();
+    let kept = keep.points(adapter.map(PagedKVCacheAdapter::block_size));
+    let tips = at_cap.then(|| {
+        adapter
+            .map(PagedKVCacheAdapter::tip_marks)
+            .unwrap_or_default()
+    });
+    let rungs = at_cap.then(|| target.ladder_marks());
+    let store = target
+        .dflash2_states()
+        .store
+        .oldest_unit(|entry| {
+            entry.in_use() == in_use
+                && !kept.keeps(entry.tokens(), Some(entry.chain()))
+                && !skip.contains(&UnitKey::Store(entry.id()))
+                && tips
+                    .as_ref()
+                    .is_none_or(|tips| tips.contains(&entry.mark()))
+                && rungs
+                    .as_ref()
+                    .is_none_or(|rungs| !rungs.contains(&entry.mark()))
+        })
+        .map(|(stamp, id)| Unit {
+            stamp,
+            key: UnitKey::Store(id),
+        });
     older_first(store, target.oldest_gdn_state(at_cap, skip, keep, in_use))
 }
 
-/// Takes one state unit; `None` when it freed nothing. A failed store step
-/// drops every parked state.
+/// Drops parked state `id` and re-syncs the marks, so its chain becomes
+/// dead leaves (Splash `StateCache::evict` frees no page itself).
+pub(crate) fn drop_parked_state<T: DFlash2Target>(target: &mut T, id: EntryId) -> bool {
+    let states = target.dflash2_states_mut();
+    if !states.store.remove(id) {
+        return false;
+    }
+    if states.replay_point == Some(id) {
+        states.replay_point = None;
+    }
+    if states.unregistered == Some(id) {
+        states.unregistered = None;
+    }
+    target.sync_gdn_state_marks();
+    true
+}
+
+/// Takes one state unit; `None` when it freed nothing.
 pub(crate) fn take_state_unit<T: DFlash2Target>(target: &mut T, key: &UnitKey) -> Option<Taken> {
     match key {
-        UnitKey::Store(step) => {
-            let store = &mut target.dflash2_states_mut().store;
-            match store.apply_lossy(*step) {
-                Ok(_) => {
-                    log_reclaim(GrowReclaim::Store);
-                    Some(Taken::Store)
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        target: "mlx_core::inference",
-                        "DFlash2 parked-state eviction failed, dropping every parked state: {}",
-                        error.reason
-                    );
-                    let held = store.bytes().entries > 0;
-                    store.clear();
-                    held.then_some(Taken::Store)
-                }
+        UnitKey::Store(id) => {
+            let dropped = drop_parked_state(target, *id);
+            if dropped {
+                log_reclaim(GrowReclaim::Store);
             }
+            dropped.then_some(Taken::Store)
         }
         UnitKey::Ladder { .. } | UnitKey::History => {
             let dropped = target.drop_gdn_state(key);

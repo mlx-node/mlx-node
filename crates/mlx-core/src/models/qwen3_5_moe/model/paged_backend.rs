@@ -129,7 +129,7 @@ impl Qwen35MoeInner {
         &mut self,
         plan: &[u32],
         cache_salt: u64,
-        dflash2_hit: Option<u32>,
+        dflash2_hit: Option<crate::models::qwen3_5::dflash2_turn::DFlash2Hit>,
     ) -> Result<Qwen35MoePrefixState> {
         self.paged_finalize_failed = false;
         let trace_enabled = inference_trace_enabled();
@@ -184,16 +184,12 @@ impl Qwen35MoeInner {
                 live_mismatch = token_prefix_mismatch_trace(plan, live_tokens);
             }
         }
-        // A DFlash2 turn reuses only the live table, which no reclaim takes,
-        // so it keeps nothing (Splash keeps a restored chain only for a
-        // request that does not skip the cache).
-        let keep = match dflash2_hit {
-            None => crate::models::qwen3_5::dflash2_turn::Keep {
-                tokens: plan,
-                keys: Some((lookup_extra_keys.as_slice(), cache_salt)),
-            },
-            Some(_) => crate::models::qwen3_5::dflash2_turn::Keep::default(),
-        };
+        let keep = crate::models::qwen3_5::dflash2_turn::prime_keep(
+            plan,
+            &lookup_extra_keys,
+            cache_salt,
+            dflash2_hit,
+        );
         if self.active_scheduled_seq.is_none() {
             crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_keeping(self, plan, keep);
         }
@@ -202,7 +198,7 @@ impl Qwen35MoeInner {
                 .paged_adapter
                 .as_mut()
                 .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?;
-            let Some(candidate) = dflash2_hit else {
+            let Some(hit) = dflash2_hit else {
                 return adapter
                     .prepare_turn_per_block_with_max_cache_hit_tokens(
                         seq_id,
@@ -216,36 +212,14 @@ impl Qwen35MoeInner {
                     )
                     .map_err(Error::from_reason);
             };
-            // A DFlash2 turn resumes only where its draft window ends
-            // (Splash resumes a state at its exact boundary); any other
-            // hit restarts cold.
-            let prepared = adapter
-                .prepare_turn_per_block_booking_hit_only(
-                    seq_id,
-                    plan,
-                    total_budget,
-                    &lookup_extra_keys,
-                    cache_salt,
-                    candidate == 0,
-                    candidate,
-                )
-                .map_err(Error::from_reason)?;
-            if prepared.cached_prefix_len == 0
-                || (prepared.continued_live_prefix && prepared.cached_prefix_len == candidate)
-            {
-                return Ok(prepared);
-            }
-            adapter
-                .prepare_turn_per_block_booking_hit_only(
-                    seq_id,
-                    plan,
-                    total_budget,
-                    &lookup_extra_keys,
-                    cache_salt,
-                    true,
-                    0,
-                )
-                .map_err(Error::from_reason)
+            crate::models::qwen3_5::dflash2_turn::prepare_dflash2_turn(
+                adapter,
+                seq_id,
+                plan,
+                &lookup_extra_keys,
+                cache_salt,
+                hit,
+            )
         })?;
         let cached_prefix_len = turn_plan.cached_prefix_len;
         let continued_live_prefix = turn_plan.continued_live_prefix;
@@ -367,6 +341,11 @@ impl Qwen35MoeInner {
         }
         let mut mtp_hidden = None;
         if let Some(context) = draft {
+            let capture = crate::models::qwen3_5::dflash2_turn::replay_capture_row(
+                self,
+                &prefix.full_tokens,
+                prefix.effective_cached_prefix_len,
+            );
             // The draft leaves the model for the prefill so each chunk can book
             // through the take order on the whole model.
             let model = self
@@ -378,6 +357,7 @@ impl Qwen35MoeInner {
                 context,
                 &prefix.full_tokens,
                 prefix.effective_cached_prefix_len,
+                capture,
             );
             let prefilled =
                 crate::models::qwen3_5_moe::paged_forward::run_paged_prefill_chunk_tapped(
@@ -396,7 +376,7 @@ impl Qwen35MoeInner {
                         &mut sink as &mut dyn crate::models::qwen3_5::paged_forward::PrefillTapSink,
                     ),
                 );
-            let context = sink.into_context();
+            let (context, anchor) = sink.into_parts();
             self.dflash2 = Some(model);
             let (logits, gdn_checkpoint) = prefilled?;
             self.publish_moe_gdn_materialized_prefix_checkpoint(
@@ -405,6 +385,14 @@ impl Qwen35MoeInner {
                 prefix.checkpoint_cache_salt,
                 gdn_checkpoint,
             );
+            if let Some(anchor) = anchor {
+                crate::models::qwen3_5::dflash2_turn::publish_replay_state(
+                    self,
+                    &prefix.full_tokens,
+                    prefix.checkpoint_cache_salt,
+                    anchor,
+                );
+            }
             return Ok((logits, Some(context)));
         }
         let (logits, gdn_checkpoint) = {
@@ -699,6 +687,7 @@ impl PagedBackend for Qwen35MoeInner {
         if release_pending && let Some(adapter) = self.paged_adapter.as_mut() {
             finalize_error = finalize_error.or(adapter.release_request().err());
         }
+        crate::models::qwen3_5::dflash2_turn::settle_replay_state(self, finalize_error.is_none());
         if let Some(error) = finalize_error {
             self.downgrade_failed_paged_finalize(&error);
         }

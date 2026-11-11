@@ -62,6 +62,32 @@ pub(crate) trait PrefillTapSink {
     /// Materialize what [`Self::chunk`] queued before the prefill clears the
     /// cache between chunks.
     fn eval(&self) -> Result<()>;
+    /// An absolute row inside the prefill whose state the sink keeps: a
+    /// chunk ends there (Splash `Engine::workEndOf`).
+    fn capture_row(&self) -> Option<usize> {
+        None
+    }
+    /// The GDN slots once the prefill reached [`Self::capture_row`].
+    fn capture_linear(&mut self, _linear: Vec<Qwen3_5LayerCache>) {}
+}
+
+/// The chunk breaks of a prefill: its checkpoint boundaries plus the sink's
+/// capture row inside `(cached_prefix_len, full_len)`, ascending.
+pub(crate) fn prefill_breaks(
+    checkpoint_boundaries: &[u32],
+    capture_row: Option<u32>,
+    cached_prefix_len: u32,
+    full_len: usize,
+) -> Vec<u32> {
+    let mut breaks = checkpoint_boundaries.to_vec();
+    if let Some(row) =
+        capture_row.filter(|&row| row > cached_prefix_len && (row as usize) < full_len)
+        && !breaks.contains(&row)
+    {
+        breaks.push(row);
+        breaks.sort_unstable();
+    }
+    breaks
 }
 
 /// What a paged prefill runs on.
@@ -638,8 +664,18 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             gdn_cold_sidecar_ladder_wanted(adapter),
         )
     };
+    let capture_row = taps
+        .as_deref()
+        .and_then(PrefillTapSink::capture_row)
+        .and_then(|row| u32::try_from(row).ok());
+    let breaks = prefill_breaks(
+        &checkpoint_boundaries,
+        capture_row,
+        cached_prefix_len,
+        full_tokens.len(),
+    );
 
-    if checkpoint_boundaries.is_empty() && suffix_tokens.len() <= chunk_size as usize {
+    if breaks.is_empty() && suffix_tokens.len() <= chunk_size as usize {
         return run_paged_prefill_single_shot(
             full_tokens,
             suffix_tokens,
@@ -659,7 +695,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     let inference_info_enabled =
         tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
     let chunk_size_usize = chunk_size as usize;
-    let suffix_offsets = checkpoint_suffix_offsets(&checkpoint_boundaries, cached_prefix_len);
+    let suffix_offsets = checkpoint_suffix_offsets(&breaks, cached_prefix_len);
     let chunk_ranges = paged_prefill_ranges(suffix_tokens.len(), chunk_size_usize, &suffix_offsets);
 
     // Pass 1: GDN-only prefill over the cached prefix. This runs once before
@@ -819,6 +855,16 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
                         prefix_len: context_after,
                         caches,
                     });
+                }
+            }
+            if capture_row == Some(context_after)
+                && let Some(sink) = taps.as_deref_mut()
+            {
+                if !capture_checkpoint {
+                    materialize_linear_layer_caches(parts.caches)?;
+                }
+                if let Some(linear) = snapshot_materialized_linear_layer_caches(parts.caches) {
+                    sink.capture_linear(linear);
                 }
             }
             crate::array::synchronize_and_clear_cache();

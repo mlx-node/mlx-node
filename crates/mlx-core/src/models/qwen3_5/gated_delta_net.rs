@@ -35,15 +35,6 @@ pub(crate) struct GdnLayerCapture {
     pub rec: MxArray,
 }
 
-/// Every GDN layer's state after chunk rows `[0, row)`, in layer order.
-#[derive(Clone)]
-pub(crate) struct GdnCell {
-    #[expect(dead_code)]
-    pub row: usize,
-    pub conv: Vec<MxArray>,
-    pub rec: Vec<MxArray>,
-}
-
 #[cfg(test)]
 thread_local! {
     // Recurrence routes the GDN forwards took on this thread, in order.

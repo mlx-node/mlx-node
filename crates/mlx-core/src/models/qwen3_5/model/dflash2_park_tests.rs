@@ -96,11 +96,11 @@ fn runway_pool_grows_by_splash_extents() -> Result<()> {
     Ok(())
 }
 
-type Probe = Arc<dyn Fn(u32) -> std::result::Result<u32, String> + Send + Sync>;
+pub(crate) type Probe = Arc<dyn Fn(u32) -> std::result::Result<u32, String> + Send + Sync>;
 
 /// Swaps the model's pool for one of `initial` blocks that grows to `max`,
 /// its allocator on the model's clock, with `probe` as the grow probe.
-pub(super) fn install_pool(
+pub(crate) fn install_pool(
     inner: &mut Qwen35Inner,
     initial: u32,
     max: u32,
@@ -131,7 +131,7 @@ pub(super) fn install_pool(
     Ok(())
 }
 
-fn passing_probe() -> Probe {
+pub(crate) fn passing_probe() -> Probe {
     Arc::new(Ok)
 }
 
@@ -226,19 +226,6 @@ fn reserve_step(
             .map(|_| ())
             .map_err(Error::from_reason)
     }
-}
-
-/// No compaction and no demotion on this thread until dropped: a store
-/// step drops a state.
-struct NoKvHeadroom;
-impl Drop for NoKvHeadroom {
-    fn drop(&mut self) {
-        crate::models::qwen3_5::dflash2_turn::KV_BUDGET_OVERRIDE.with(|budget| budget.set(None));
-    }
-}
-fn no_kv_headroom() -> NoKvHeadroom {
-    crate::models::qwen3_5::dflash2_turn::KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(0)));
-    NoKvHeadroom
 }
 
 /// At the cap a ladder entry's dropped marks make its chain evictable in the
@@ -1147,7 +1134,6 @@ fn prompt_grow_takes_an_image_entry_below_the_cap() -> Result<()> {
         return Ok(());
     }
     let mut inner = fixture(0xDFA5_1819);
-    let _headroom = no_kv_headroom();
     install_pool(&mut inner, 4, 8, probe_after(1))?;
     let bytes_per_block = inner
         .paged_adapter
@@ -1342,5 +1328,178 @@ fn legacy_dense_cores_end_thinking_with_the_whole_close() -> Result<()> {
         assert_eq!(reasoning_tokens, 2, "{entry}: {raw_text:?}");
         assert!(raw_text.contains("t13 </think>"), "{entry}: {raw_text:?}");
     }
+    Ok(())
+}
+
+/// A parked DFlash2 state on `tokens` (whole blocks) of this model's
+/// geometry, published and marked; returns its id.
+fn park_state(inner: &mut Qwen35Inner, tokens: &[u32]) -> u64 {
+    use crate::models::qwen3_5::dflash2_state::paged::PagedAnchor;
+    use crate::models::qwen3_5::dflash2_state::store::Lineage;
+    let window = crate::models::qwen3_5::dflash2::DFlash2ContextCache::new(
+        &inner.dflash2.as_ref().expect("draft").config,
+    );
+    let mut linear = inner.fresh_dflash2_layer_caches();
+    for cache in &mut linear {
+        if let Qwen3_5LayerCache::Linear(gdn) = cache {
+            gdn.set(
+                0,
+                MxArray::zeros(&[1, 3, 8], Some(crate::array::DType::BFloat16)).unwrap(),
+            )
+            .unwrap();
+            gdn.set(
+                1,
+                MxArray::zeros(&[1, 2, 4, 4], Some(crate::array::DType::Float32)).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+    let (id, new) = inner
+        .dflash2_states
+        .store
+        .insert(Lineage::text(tokens, 0), PagedAnchor { linear, window })
+        .expect("a whole-block state");
+    assert!(new);
+    inner.sync_gdn_state_marks();
+    id
+}
+
+fn evictable(inner: &Qwen35Inner) -> u32 {
+    inner
+        .paged_adapter
+        .as_ref()
+        .expect("adapter")
+        .block_telemetry()
+        .expect("telemetry")
+        .evictable_blocks
+}
+
+/// A parked state keeps its chain out of `allocate` through its mark, and
+/// taking it as a reclaim unit hands the chain back (Splash
+/// `StateCache::evict`: the chain becomes dead leaves).
+/// Mutation LK1 (the take skips the mark re-sync) → red (marked 6, nothing
+/// evictable).
+#[test]
+fn dropping_a_parked_state_returns_its_blocks() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let mut inner = fixture(0xDFA5_1901);
+    install_pool(&mut inner, 8, 8, passing_probe())?;
+    let block_size = pool_block_size(&inner);
+    let tokens = chain_tokens(51, 6, block_size);
+    cache_chain(&inner, &tokens);
+    let before = evictable(&inner);
+    let id = park_state(&mut inner, &tokens);
+    let adapter = inner.paged_adapter.as_ref().expect("adapter");
+    assert_eq!(adapter.marked_blocks(), 6);
+    assert_eq!(evictable(&inner) + 6, before);
+    let taken =
+        crate::models::qwen3_5::dflash2_turn::take_state_unit(&mut inner, &UnitKey::Store(id));
+    assert!(taken.is_some());
+    assert_eq!(inner.dflash2_states.store.bytes().entries, 0);
+    assert_eq!(
+        inner
+            .paged_adapter
+            .as_ref()
+            .expect("adapter")
+            .marked_blocks(),
+        0
+    );
+    assert_eq!(evictable(&inner), before);
+    Ok(())
+}
+
+/// At the cap a parked state is a unit only when dropping it frees a
+/// block: a ladder rung on the same block keeps the chain, so that state
+/// is passed over for the next one.
+/// Mutation CU1 (no rung filter at the cap) → red (the older state on the
+/// rung's block comes first).
+#[test]
+fn cap_reclaim_takes_a_parked_state_that_frees_a_block() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let mut inner = fixture(0xDFA5_1902);
+    install_pool(&mut inner, 8, 8, passing_probe())?;
+    let block_size = pool_block_size(&inner);
+    let shared = chain_tokens(52, 2, block_size);
+    let alone = chain_tokens(53, 2, block_size);
+    let shared_hashes = cache_chain(&inner, &shared);
+    cache_chain(&inner, &alone);
+    let on_rung = park_state(&mut inner, &shared);
+    let free = park_state(&mut inner, &alone);
+    let stamp = inner.cache_recency.next() + 100;
+    push_rung(&mut inner, shared.clone(), shared_hashes, stamp);
+    let unit = crate::models::qwen3_5::dflash2_turn::oldest_state_unit(
+        &inner,
+        true,
+        &Default::default(),
+        Keep::default(),
+        false,
+    )
+    .expect("a unit");
+    assert_ne!(unit.key, UnitKey::Store(on_rung));
+    assert_eq!(unit.key, UnitKey::Store(free));
+    Ok(())
+}
+
+/// A weight update drops every parked state and its marks; a command reset
+/// purges the cache and the store with it.
+/// Mutation RS1 (the training clear skips the mark re-sync) → red
+/// (marked 4).
+#[test]
+fn resets_empty_the_store_and_its_marks() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let mut inner = fixture(0xDFA5_1903);
+    install_pool(&mut inner, 8, 8, passing_probe())?;
+    let block_size = pool_block_size(&inner);
+    let tokens = chain_tokens(54, 4, block_size);
+    cache_chain(&inner, &tokens);
+    park_state(&mut inner, &tokens);
+    let marked = |inner: &Qwen35Inner| inner.paged_adapter.as_ref().expect("a").marked_blocks();
+    assert_eq!(marked(&inner), 4);
+    inner.apply_gradients_inner(Default::default(), 0.0, &Default::default())?;
+    assert_eq!(inner.dflash2_states.store.bytes().entries, 0);
+    assert_eq!(marked(&inner), 0);
+
+    park_state(&mut inner, &tokens);
+    ChatBackend::reset_caches(&mut inner, crate::engine::backend::ResetScope::Command)?;
+    assert_eq!(inner.dflash2_states.store.bytes().entries, 0);
+    assert_eq!(marked(&inner), 0);
+    Ok(())
+}
+
+/// A state never outlives its block (Splash `StateCache::acquireBlock`):
+/// installing one whose block left the cache fails the turn.
+/// Mutation EV1 (no residency check in the install) → red (`Ok`).
+#[test]
+fn installing_a_state_whose_block_is_gone_fails() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let mut inner = fixture(0xDFA5_1904);
+    install_pool(&mut inner, 8, 8, passing_probe())?;
+    let block_size = pool_block_size(&inner);
+    let tokens = chain_tokens(55, 3, block_size);
+    cache_chain(&inner, &tokens);
+    let id = park_state(&mut inner, &tokens);
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .release_request_and_purge_prefix_cache()
+        .map_err(Error::from_reason)?;
+    let error = crate::models::qwen3_5::dflash2_turn::install_parked_state(&mut inner, id, 0)
+        .err()
+        .map(|error| error.reason);
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|reason| reason.contains("outlived its target KV block")),
+        "{error:?}"
+    );
     Ok(())
 }

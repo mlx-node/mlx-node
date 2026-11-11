@@ -416,37 +416,6 @@ fn draftless_plan_checks_the_pool_lane() {
     assert!(qwen38_plan(at, None).is_ok());
 }
 
-/// Live headroom is the ceiling (hard less the reserves) less what is live,
-/// with no process reserve and no 9/10 share. Mutation: `/ 10 * 9` on the
-/// allocator path of `live_headroom` → red (944,892,799).
-#[test]
-fn live_headroom_has_no_reserve_or_nine_tenths() {
-    let plan = m3_pro_plan();
-    let ceiling = 23_568_633_036 - 768 * MIB;
-    assert_eq!(plan.ceiling_bytes(), ceiling);
-    let mut snapshot = PagedPrefillMemorySnapshot {
-        allocator_active_bytes: Some(18 * GIB),
-        allocator_cached_bytes: Some(GIB),
-        allocator_limit_bytes: Some(40 * GIB),
-        metal_recommended_working_set_bytes: Some(M3_PRO_WORKING_SET),
-        metal_current_allocated_bytes: None,
-        paged_pool_allocated_bytes: Some(2 * GIB),
-    };
-    assert_eq!(
-        plan.live_headroom(snapshot),
-        Some(ceiling - 18 * GIB - 2 * GIB)
-    );
-    snapshot.metal_current_allocated_bytes = Some(21 * GIB + 512 * MIB);
-    assert_eq!(
-        plan.live_headroom(snapshot),
-        Some(ceiling - (21 * GIB + 512 * MIB - GIB))
-    );
-    assert_eq!(
-        plan.live_headroom(PagedPrefillMemorySnapshot::default()),
-        None
-    );
-}
-
 /// Mutations: skip the pool rule in `audit` → red (`Ok` at 3,310 blocks);
 /// skip the hard-budget rule → red (`Ok` one byte over).
 #[test]

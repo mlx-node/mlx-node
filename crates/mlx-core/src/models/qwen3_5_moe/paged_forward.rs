@@ -17,7 +17,7 @@ use crate::inference_trace::{
 use crate::models::qwen3_5::paged_forward::{
     MaterializedGdnPrefixCheckpoint, PrefillParts, PrefillTapSink, PrefillTarget,
     checkpoint_suffix_offsets, gdn_checkpoint_target, gdn_cold_sidecar_ladder_wanted,
-    materialize_linear_layer_caches, media_prefill_ranges, paged_prefill_ranges,
+    materialize_linear_layer_caches, media_prefill_ranges, paged_prefill_ranges, prefill_breaks,
     prefill_checkpoint_boundaries, snapshot_materialized_linear_layer_caches,
 };
 use crate::nn::{Embedding, RMSNorm};
@@ -366,7 +366,18 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
         )
     };
 
-    if checkpoint_boundaries.is_empty() && suffix_tokens.len() <= chunk_size_usize {
+    let capture_row = taps
+        .as_deref()
+        .and_then(PrefillTapSink::capture_row)
+        .and_then(|row| u32::try_from(row).ok());
+    let breaks = prefill_breaks(
+        &checkpoint_boundaries,
+        capture_row,
+        cached_prefix_len,
+        full_tokens.len(),
+    );
+
+    if breaks.is_empty() && suffix_tokens.len() <= chunk_size_usize {
         return run_paged_prefill_single_shot(
             full_tokens,
             suffix_tokens,
@@ -413,7 +424,7 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
         .confirm_aux_prefix_primed(cached_prefix_len)
         .map_err(Error::from_reason)?;
 
-    let suffix_offsets = checkpoint_suffix_offsets(&checkpoint_boundaries, cached_prefix_len);
+    let suffix_offsets = checkpoint_suffix_offsets(&breaks, cached_prefix_len);
     let chunk_ranges = paged_prefill_ranges(suffix_tokens.len(), chunk_size_usize, &suffix_offsets);
     let total_chunks = chunk_ranges.len();
     let mut last_logits: Option<MxArray> = None;
@@ -534,6 +545,16 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
                         prefix_len: context_after,
                         caches,
                     });
+                }
+            }
+            if capture_row == Some(context_after)
+                && let Some(sink) = taps.as_deref_mut()
+            {
+                if !capture_checkpoint {
+                    materialize_linear_layer_caches(parts.caches)?;
+                }
+                if let Some(linear) = snapshot_materialized_linear_layer_caches(parts.caches) {
+                    sink.capture_linear(linear);
                 }
             }
             crate::array::synchronize_and_clear_cache();

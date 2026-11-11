@@ -1443,6 +1443,7 @@ impl Qwen35MoeInner {
             draft.invalidate_compiled();
         }
         self.dflash2_states.clear();
+        self.sync_gdn_state_marks();
         self.invalidate_dflash2_context("apply_gradients_inner");
         // Apply updated parameters directly to model fields
         for (name, updated_param) in updated_params.iter() {
