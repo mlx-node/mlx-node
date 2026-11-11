@@ -314,6 +314,23 @@ pub(crate) fn paged_step_reclaiming<T: DFlash2Target, R>(
     reclaiming(target, Keep::default(), step)
 }
 
+/// Books a prefill chunk's rows under [`reclaiming`] (Splash
+/// `Engine::growLane` books each chunk's end through `Engine::allocate`).
+/// The prefix the turn reuses is the request's own table, so the reclaim
+/// keeps nothing.
+pub(crate) fn record_chunk_reclaiming<T: DFlash2Target>(
+    target: &mut T,
+    chunk: &[u32],
+) -> Result<()> {
+    reclaiming(target, Keep::default(), |target| {
+        target
+            .paged_adapter_mut_ref()
+            .ok_or_else(|| Error::from_reason("a paged prefill lost its paged adapter"))?
+            .record_tokens(chunk)
+            .map_err(Error::from_reason)
+    })
+}
+
 /// The model side of the take order: parked states, ladder and history
 /// entries, ordered by their own stamps.
 pub(crate) struct ModelReclaim<'a, T: DFlash2Target> {

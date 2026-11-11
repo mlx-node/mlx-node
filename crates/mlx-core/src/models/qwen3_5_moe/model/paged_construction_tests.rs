@@ -2833,3 +2833,72 @@ fn flat_context_window_is_the_capped_lane() {
         Some(100)
     );
 }
+
+/// The MoE twin of `cold_dflash2_prefill_reclaims_a_marked_live_chain`: a
+/// 6-block live table under a ladder rung on an 8-block pool, then a cold
+/// DFlash2 turn on a 7-block prompt in 2-block chunks; the second chunk
+/// fits once the take order drops the rung.
+/// Mutation R1 (a DFlash2 prefill chunk books with a plain `record_tokens`)
+/// → red (`Err` "could not reserve").
+#[test]
+fn moe_cold_dflash2_prefill_reclaims_a_marked_live_chain() {
+    use crate::engine::backend::PagedPrefix;
+    use crate::engine::dspark_turn::PagedDsparkBackend;
+    use crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE;
+    use crate::stream::{Stream, StreamContext};
+    let Some(mut inner) =
+        moe_reclaim_inner("moe_cold_dflash2_prefill_reclaims_a_marked_live_chain")
+    else {
+        return;
+    };
+    let dense = inner.config.to_dense_config();
+    let draft = crate::models::qwen3_5::dflash2::tiny_dflash2_model_for_stepper_test(&dense)
+        .expect("tiny draft");
+    draft.validate_target(&dense).expect("draft fits target");
+    inner.dflash2 = Some(draft);
+    let stream = Stream::generation();
+    let _ctx = StreamContext::new(stream);
+    install_moe_pool(&mut inner, 8, 8, Arc::new(Ok));
+    let block_size = moe_block_size(&inner);
+    let live = moe_chain_tokens(40, 6, block_size);
+    {
+        let adapter = inner.paged_adapter.as_mut().expect("adapter");
+        adapter
+            .prepare_turn(0, &live, live.len() as u32, true, &[], 0, false)
+            .expect("live prepare");
+        adapter.record_tokens(&live).expect("live record");
+        adapter
+            .register_full_blocks_for_reuse(&[], 0)
+            .expect("live register");
+    }
+    let hashes = mlx_paged_attn::chain_hashes(&live, block_size, &[], 0);
+    let rung_tip = *hashes.last().expect("a chain");
+    let stamp = inner.cache_recency.next();
+    moe_push_rung(&mut inner, live.clone(), hashes, stamp);
+    let mut prompt = live;
+    prompt.extend(moe_chain_tokens(41, 1, block_size));
+    clear_grow_log();
+    PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(2 * block_size as i32)));
+    let result = (|| -> Result<()> {
+        let prefix = inner.prime_dspark_prefix_state(&prompt, true, 0)?;
+        assert_eq!(prefix.effective_cached_prefix_len(), 0);
+        inner
+            .paged_prefill_with_draft_state(&prompt, &prefix, stream)?
+            .eval();
+        Ok(())
+    })();
+    PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+    result.expect("the cold DFlash2 prefill fits after the reclaim");
+    assert_eq!(
+        grow_log(),
+        vec![crate::models::qwen3_5::dflash2_turn::GrowReclaim::Ladder]
+    );
+    assert!(
+        moe_ladder(&inner)
+            .iter()
+            .all(|&(_, tip, used)| (tip, used) != (rung_tip, stamp)),
+        "the rung over the released table went"
+    );
+    let adapter = inner.paged_adapter.as_ref().expect("adapter");
+    assert_eq!(adapter.current_token_count() as usize, prompt.len());
+}

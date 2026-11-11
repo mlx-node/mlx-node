@@ -15,10 +15,10 @@ use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
 use crate::models::qwen3_5::paged_forward::{
-    MaterializedGdnPrefixCheckpoint, PrefillTapSink, checkpoint_suffix_offsets,
-    gdn_checkpoint_target, gdn_cold_sidecar_ladder_wanted, materialize_linear_layer_caches,
-    media_prefill_ranges, paged_prefill_ranges, prefill_checkpoint_boundaries,
-    snapshot_materialized_linear_layer_caches,
+    MaterializedGdnPrefixCheckpoint, PrefillParts, PrefillTapSink, PrefillTarget,
+    checkpoint_suffix_offsets, gdn_checkpoint_target, gdn_cold_sidecar_ladder_wanted,
+    materialize_linear_layer_caches, media_prefill_ranges, paged_prefill_ranges,
+    prefill_checkpoint_boundaries, snapshot_materialized_linear_layer_caches,
 };
 use crate::nn::{Embedding, RMSNorm};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
@@ -297,12 +297,14 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
         cached_prefix_len,
         gdn_prefix_already_primed,
         embed,
-        layers,
-        caches,
-        final_norm,
-        lm_head,
+        &mut PrefillParts {
+            layers,
+            caches,
+            final_norm,
+            lm_head,
+            adapter: paged_adapter,
+        },
         layer_kinds,
-        paged_adapter,
         chunk_size,
         cached_rope_deltas,
         turn_cancel,
@@ -320,12 +322,8 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
     cached_prefix_len: u32,
     gdn_prefix_already_primed: bool,
     embed: &Embedding,
-    layers: &mut [DecoderLayer],
-    caches: &mut [Qwen3_5LayerCache],
-    final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
+    target: &mut dyn PrefillTarget<DecoderLayer>,
     layer_kinds: &[Qwen3_5LayerKind],
-    paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
     cached_rope_deltas: i32,
     turn_cancel: Option<&AtomicBool>,
@@ -347,12 +345,8 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
             cached_prefix_len,
             gdn_prefix_already_primed,
             embed,
-            layers,
-            caches,
-            final_norm,
-            lm_head,
+            target,
             layer_kinds,
-            paged_adapter,
             cached_rope_deltas,
             retained_hidden,
             taps.as_mut()
@@ -362,12 +356,15 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
     }
 
     let chunk_size_usize = chunk_size as usize;
-    let checkpoint_boundaries = prefill_checkpoint_boundaries(
-        full_tokens.len(),
-        cached_prefix_len,
-        paged_adapter.block_size(),
-        gdn_cold_sidecar_ladder_wanted(paged_adapter),
-    );
+    let checkpoint_boundaries = {
+        let adapter = target.parts()?.adapter;
+        prefill_checkpoint_boundaries(
+            full_tokens.len(),
+            cached_prefix_len,
+            adapter.block_size(),
+            gdn_cold_sidecar_ladder_wanted(adapter),
+        )
+    };
 
     if checkpoint_boundaries.is_empty() && suffix_tokens.len() <= chunk_size_usize {
         return run_paged_prefill_single_shot(
@@ -376,12 +373,8 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
             cached_prefix_len,
             gdn_prefix_already_primed,
             embed,
-            layers,
-            caches,
-            final_norm,
-            lm_head,
+            target,
             layer_kinds,
-            paged_adapter,
             cached_rope_deltas,
             retained_hidden,
             taps.as_mut()
@@ -396,7 +389,8 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
     if cached_prefix_len > 0 && !gdn_prefix_already_primed {
         let gdn_trace_start = trace_enabled.then(Instant::now);
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
-        run_gdn_only_prefill(prefix, embed, layers, caches)?;
+        let parts = target.parts()?;
+        run_gdn_only_prefill(prefix, embed, parts.layers, parts.caches)?;
         if let Some(start) = gdn_trace_start {
             let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
             write_inference_trace(format_args!(
@@ -413,7 +407,9 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
     // The recurrent half of the cached prefix is now in hand (either it already
     // was, or the pre-pass above just replayed it from token ids). Clear the
     // adapter's auxiliary-state obligation before the first `record_tokens`.
-    paged_adapter
+    target
+        .parts()?
+        .adapter
         .confirm_aux_prefix_primed(cached_prefix_len)
         .map_err(Error::from_reason)?;
 
@@ -444,9 +440,8 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
         //    BEFORE calling the per-chunk helper so `update_keys_values`
         //    inside the layer loop aligns at
         //    `[chunk_start_position, chunk_start_position+chunk.len())`.
-        paged_adapter
-            .record_tokens(chunk)
-            .map_err(Error::from_reason)?;
+        target.record(chunk)?;
+        let parts = target.parts()?;
 
         // 2. Run the per-chunk forward (embed → layer loop). For chunk N
         //    starting at cumulative position `chunk_start_position`:
@@ -461,10 +456,10 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
             chunk,
             chunk_start_position,
             embed,
-            layers,
-            caches,
+            parts.layers,
+            parts.caches,
             layer_kinds,
-            paged_adapter,
+            parts.adapter,
             /* inputs_embeds */ None,
             /* position_ids */ None,
             cached_rope_deltas,
@@ -475,7 +470,7 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
         }
 
         if retained_hidden.is_some() {
-            let normalized = final_norm.forward(&hidden)?;
+            let normalized = parts.final_norm.forward(&hidden)?;
             normalized.eval();
             hidden_chunks.push(normalized);
         }
@@ -486,11 +481,15 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
             // Last chunk: project final_norm + lm_head and extract
             // last-token logits.
             last_logits = Some(project_last_token_logits_moe(
-                &hidden, final_norm, lm_head, embed, None,
+                &hidden,
+                parts.final_norm,
+                parts.lm_head,
+                embed,
+                None,
             )?);
             if capture_checkpoint {
-                materialize_linear_layer_caches(caches)?;
-                if let Some(caches) = snapshot_materialized_linear_layer_caches(caches) {
+                materialize_linear_layer_caches(parts.caches)?;
+                if let Some(caches) = snapshot_materialized_linear_layer_caches(parts.caches) {
                     checkpoints.push(MaterializedGdnPrefixCheckpoint {
                         prefix_len: context_after,
                         caches,
@@ -529,8 +528,8 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
                 sink.eval()?;
             }
             if capture_checkpoint {
-                materialize_linear_layer_caches(caches)?;
-                if let Some(caches) = snapshot_materialized_linear_layer_caches(caches) {
+                materialize_linear_layer_caches(parts.caches)?;
+                if let Some(caches) = snapshot_materialized_linear_layer_caches(parts.caches) {
                     checkpoints.push(MaterializedGdnPrefixCheckpoint {
                         prefix_len: context_after,
                         caches,
@@ -601,12 +600,8 @@ pub(crate) fn run_paged_prefill_single_shot(
     cached_prefix_len: u32,
     gdn_prefix_already_primed: bool,
     embed: &Embedding,
-    layers: &mut [DecoderLayer],
-    caches: &mut [Qwen3_5LayerCache],
-    final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
+    target: &mut dyn PrefillTarget<DecoderLayer>,
     layer_kinds: &[Qwen3_5LayerKind],
-    paged_adapter: &mut PagedKVCacheAdapter,
     cached_rope_deltas: i32,
     retained_hidden: Option<&mut Option<MxArray>>,
     taps: Option<&mut dyn PrefillTapSink>,
@@ -620,15 +615,17 @@ pub(crate) fn run_paged_prefill_single_shot(
     // caches. Neither one's result depends on the other.
     if cached_prefix_len > 0 && !gdn_prefix_already_primed {
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
-        run_gdn_only_prefill(prefix, embed, layers, caches)?;
+        let parts = target.parts()?;
+        run_gdn_only_prefill(prefix, embed, parts.layers, parts.caches)?;
     }
-    paged_adapter
+    target
+        .parts()?
+        .adapter
         .confirm_aux_prefix_primed(cached_prefix_len)
         .map_err(Error::from_reason)?;
 
-    paged_adapter
-        .record_tokens(suffix_tokens)
-        .map_err(Error::from_reason)?;
+    target.record(suffix_tokens)?;
+    let parts = target.parts()?;
 
     let tap_layers = taps
         .as_deref()
@@ -637,10 +634,10 @@ pub(crate) fn run_paged_prefill_single_shot(
         suffix_tokens,
         cached_prefix_len,
         embed,
-        layers,
-        caches,
+        parts.layers,
+        parts.caches,
         layer_kinds,
-        paged_adapter,
+        parts.adapter,
         /* inputs_embeds */ None,
         /* position_ids */ None,
         cached_rope_deltas,
@@ -649,7 +646,13 @@ pub(crate) fn run_paged_prefill_single_shot(
     if let Some(sink) = taps {
         sink.chunk(cached_prefix_len as usize, suffix_tokens, &chunk_taps)?;
     }
-    project_last_token_logits_moe(&hidden_states, final_norm, lm_head, embed, retained_hidden)
+    project_last_token_logits_moe(
+        &hidden_states,
+        parts.final_norm,
+        parts.lm_head,
+        embed,
+        retained_hidden,
+    )
 }
 
 /// Image-bearing paged prefill with optional cached-prefix reuse for MoE.

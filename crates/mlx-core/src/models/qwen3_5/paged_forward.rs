@@ -64,6 +64,41 @@ pub(crate) trait PrefillTapSink {
     fn eval(&self) -> Result<()>;
 }
 
+/// What a paged prefill runs on.
+pub(crate) struct PrefillParts<'a, L> {
+    pub(crate) layers: &'a mut [L],
+    pub(crate) caches: &'a mut [Qwen3_5LayerCache],
+    pub(crate) final_norm: &'a RMSNorm,
+    pub(crate) lm_head: &'a Option<LinearProj>,
+    pub(crate) adapter: &'a mut PagedKVCacheAdapter,
+}
+
+/// A paged prefill's target: its parts, and the booking of each chunk's
+/// rows before the chunk runs (Splash `Engine::growLane`).
+pub(crate) trait PrefillTarget<L> {
+    fn parts(&mut self) -> Result<PrefillParts<'_, L>>;
+    /// Books `chunk`'s rows and advances the cursor over them.
+    fn record(&mut self, chunk: &[u32]) -> Result<()>;
+}
+
+impl<L> PrefillTarget<L> for PrefillParts<'_, L> {
+    fn parts(&mut self) -> Result<PrefillParts<'_, L>> {
+        Ok(PrefillParts {
+            layers: &mut *self.layers,
+            caches: &mut *self.caches,
+            final_norm: self.final_norm,
+            lm_head: self.lm_head,
+            adapter: &mut *self.adapter,
+        })
+    }
+
+    fn record(&mut self, chunk: &[u32]) -> Result<()> {
+        self.adapter
+            .record_tokens(chunk)
+            .map_err(Error::from_reason)
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Block counts the prefill's active request holds right before each
@@ -560,12 +595,8 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     cached_prefix_len: u32,
     gdn_prefix_already_primed: bool,
     embed: &Embedding,
-    layers: &mut [DecoderLayer],
-    caches: &mut [Qwen3_5LayerCache],
-    final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
+    target: &mut dyn PrefillTarget<DecoderLayer>,
     layer_kinds: &[Qwen3_5LayerKind],
-    paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
     cached_rope_deltas: i32,
     turn_cancel: Option<&AtomicBool>,
@@ -589,12 +620,8 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             cached_prefix_len,
             gdn_prefix_already_primed,
             embed,
-            layers,
-            caches,
-            final_norm,
-            lm_head,
+            target,
             layer_kinds,
-            paged_adapter,
             cached_rope_deltas,
             taps.as_mut()
                 .map(|sink| &mut **sink as &mut dyn PrefillTapSink),
@@ -602,12 +629,15 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         .map(|logits| (logits, Vec::new()));
     }
 
-    let checkpoint_boundaries = prefill_checkpoint_boundaries(
-        full_tokens.len(),
-        cached_prefix_len,
-        paged_adapter.block_size(),
-        gdn_cold_sidecar_ladder_wanted(paged_adapter),
-    );
+    let checkpoint_boundaries = {
+        let adapter = target.parts()?.adapter;
+        prefill_checkpoint_boundaries(
+            full_tokens.len(),
+            cached_prefix_len,
+            adapter.block_size(),
+            gdn_cold_sidecar_ladder_wanted(adapter),
+        )
+    };
 
     if checkpoint_boundaries.is_empty() && suffix_tokens.len() <= chunk_size as usize {
         return run_paged_prefill_single_shot(
@@ -616,12 +646,8 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             cached_prefix_len,
             gdn_prefix_already_primed,
             embed,
-            layers,
-            caches,
-            final_norm,
-            lm_head,
+            target,
             layer_kinds,
-            paged_adapter,
             cached_rope_deltas,
             taps.as_mut()
                 .map(|sink| &mut **sink as &mut dyn PrefillTapSink),
@@ -642,7 +668,8 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         let gdn_trace_start = trace_enabled.then(Instant::now);
         let gdn_info_start = inference_info_enabled.then(Instant::now);
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
-        run_gdn_only_prefill(prefix, embed, layers, caches)?;
+        let parts = target.parts()?;
+        run_gdn_only_prefill(prefix, embed, parts.layers, parts.caches)?;
         if let Some(start) = gdn_trace_start {
             let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
             write_inference_trace(format_args!(
@@ -673,7 +700,9 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     // The recurrent half of the cached prefix is now in hand (either it already
     // was, or the pass above just replayed it from token ids). Clear the
     // adapter's auxiliary-state obligation before the first `record_tokens`.
-    paged_adapter
+    target
+        .parts()?
+        .adapter
         .confirm_aux_prefix_primed(cached_prefix_len)
         .map_err(Error::from_reason)?;
 
@@ -700,20 +729,19 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         let chunk_trace_start = trace_enabled.then(Instant::now);
         let chunk_info_start = inference_info_enabled.then(Instant::now);
 
-        paged_adapter
-            .record_tokens(chunk)
-            .map_err(Error::from_reason)?;
+        target.record(chunk)?;
+        let parts = target.parts()?;
         #[cfg(test)]
-        note_prefill_chunk_blocks(paged_adapter);
+        note_prefill_chunk_blocks(parts.adapter);
 
         let (hidden_states, chunk_taps) = run_paged_prefill_one_chunk_tapped(
             chunk,
             chunk_start_position,
             embed,
-            layers,
-            caches,
+            parts.layers,
+            parts.caches,
             layer_kinds,
-            paged_adapter,
+            parts.adapter,
             /* inputs_embeds */ None,
             /* position_ids */ None,
             cached_rope_deltas,
@@ -729,13 +757,13 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         if is_last_chunk {
             last_logits = Some(project_last_token_logits(
                 &hidden_states,
-                final_norm,
-                lm_head,
+                parts.final_norm,
+                parts.lm_head,
                 embed,
             )?);
             if capture_checkpoint {
-                materialize_linear_layer_caches(caches)?;
-                if let Some(caches) = snapshot_materialized_linear_layer_caches(caches) {
+                materialize_linear_layer_caches(parts.caches)?;
+                if let Some(caches) = snapshot_materialized_linear_layer_caches(parts.caches) {
                     checkpoints.push(MaterializedGdnPrefixCheckpoint {
                         prefix_len: context_after,
                         caches,
@@ -785,8 +813,8 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
                 sink.eval()?;
             }
             if capture_checkpoint {
-                materialize_linear_layer_caches(caches)?;
-                if let Some(caches) = snapshot_materialized_linear_layer_caches(caches) {
+                materialize_linear_layer_caches(parts.caches)?;
+                if let Some(caches) = snapshot_materialized_linear_layer_caches(parts.caches) {
                     checkpoints.push(MaterializedGdnPrefixCheckpoint {
                         prefix_len: context_after,
                         caches,
@@ -866,12 +894,8 @@ fn run_paged_prefill_single_shot(
     cached_prefix_len: u32,
     gdn_prefix_already_primed: bool,
     embed: &Embedding,
-    layers: &mut [DecoderLayer],
-    caches: &mut [Qwen3_5LayerCache],
-    final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
+    target: &mut dyn PrefillTarget<DecoderLayer>,
     layer_kinds: &[Qwen3_5LayerKind],
-    paged_adapter: &mut PagedKVCacheAdapter,
     cached_rope_deltas: i32,
     taps: Option<&mut dyn PrefillTapSink>,
 ) -> Result<MxArray> {
@@ -889,7 +913,8 @@ fn run_paged_prefill_single_shot(
     if cached_prefix_len > 0 && !gdn_prefix_already_primed {
         let gdn_info_start = inference_info_enabled.then(Instant::now);
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
-        run_gdn_only_prefill(prefix, embed, layers, caches)?;
+        let parts = target.parts()?;
+        run_gdn_only_prefill(prefix, embed, parts.layers, parts.caches)?;
         if let Some(start) = gdn_info_start {
             let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
             tracing::info!(
@@ -905,15 +930,16 @@ fn run_paged_prefill_single_shot(
             );
         }
     }
-    paged_adapter
+    target
+        .parts()?
+        .adapter
         .confirm_aux_prefix_primed(cached_prefix_len)
         .map_err(Error::from_reason)?;
 
-    paged_adapter
-        .record_tokens(suffix_tokens)
-        .map_err(Error::from_reason)?;
+    target.record(suffix_tokens)?;
+    let parts = target.parts()?;
     #[cfg(test)]
-    note_prefill_chunk_blocks(paged_adapter);
+    note_prefill_chunk_blocks(parts.adapter);
 
     let tap_layers = taps
         .as_deref()
@@ -922,10 +948,10 @@ fn run_paged_prefill_single_shot(
         suffix_tokens,
         cached_prefix_len,
         embed,
-        layers,
-        caches,
+        parts.layers,
+        parts.caches,
         layer_kinds,
-        paged_adapter,
+        parts.adapter,
         /* inputs_embeds */ None,
         /* position_ids */ None,
         cached_rope_deltas,
@@ -935,7 +961,7 @@ fn run_paged_prefill_single_shot(
         sink.chunk(cached_prefix_len as usize, suffix_tokens, &chunk_taps)?;
     }
 
-    let logits = project_last_token_logits(&hidden_states, final_norm, lm_head, embed)?;
+    let logits = project_last_token_logits(&hidden_states, parts.final_norm, parts.lm_head, embed)?;
     if let Some(start) = single_shot_start {
         let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
         tracing::info!(

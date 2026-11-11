@@ -1173,3 +1173,66 @@ fn prompt_grow_takes_an_image_entry_below_the_cap() -> Result<()> {
     assert_eq!(cache.len(), 0, "the entry is taken");
     Ok(())
 }
+
+/// An AR turn's 6-block live table under a ladder rung on an 8-block pool,
+/// then a cold DFlash2 turn on a 7-block prompt in 2-block chunks: the
+/// prime releases the table into the cache, marked, so the second chunk is
+/// refused until the take order drops the rung (Splash `Engine::growLane`
+/// books each chunk through `Engine::allocate`).
+/// Mutation R1 (a DFlash2 prefill chunk books with a plain `record_tokens`)
+/// → red (`Err` "could not reserve").
+#[test]
+fn cold_dflash2_prefill_reclaims_a_marked_live_chain() -> Result<()> {
+    use crate::engine::backend::PagedPrefix;
+    use crate::engine::dspark_turn::PagedDsparkBackend;
+    use crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE;
+    use crate::stream::{Stream, StreamContext};
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let stream = Stream::generation();
+    let _ctx = StreamContext::new(stream);
+    let mut inner = fixture(0xDFA5_1830);
+    install_pool(&mut inner, 8, 8, passing_probe())?;
+    let block_size = pool_block_size(&inner);
+    let live = chain_tokens(40, 6, block_size);
+    {
+        let adapter = inner.paged_adapter.as_mut().expect("adapter");
+        adapter
+            .prepare_turn(0, &live, live.len() as u32, true, &[], 0, false)
+            .map_err(Error::from_reason)?;
+        adapter.record_tokens(&live).map_err(Error::from_reason)?;
+        adapter
+            .register_full_blocks_for_reuse(&[], 0)
+            .map_err(Error::from_reason)?;
+    }
+    let hashes = mlx_paged_attn::chain_hashes(&live, block_size, &[], 0);
+    let rung_tip = *hashes.last().expect("a chain");
+    let stamp = inner.cache_recency.next();
+    push_rung(&mut inner, live.clone(), hashes, stamp);
+    let mut prompt = live;
+    prompt.extend(chain_tokens(41, 1, block_size));
+    clear_grow_reclaim_log();
+    PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(2 * block_size as i32)));
+    let result = (|| -> Result<()> {
+        let prefix = inner.prime_dspark_prefix_state(&prompt, true, 0)?;
+        assert_eq!(prefix.effective_cached_prefix_len(), 0);
+        inner
+            .paged_prefill_with_draft_state(&prompt, &prefix, stream)?
+            .eval();
+        Ok(())
+    })();
+    PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+    result?;
+    assert_eq!(grow_reclaim_log(), vec![GrowReclaim::Ladder]);
+    assert!(
+        inner
+            .ladder_entries_for_test()
+            .iter()
+            .all(|&(_, tip, used)| (tip, used) != (rung_tip, stamp)),
+        "the rung over the released table went"
+    );
+    let adapter = inner.paged_adapter.as_ref().expect("adapter");
+    assert_eq!(adapter.current_token_count() as usize, prompt.len());
+    Ok(())
+}
