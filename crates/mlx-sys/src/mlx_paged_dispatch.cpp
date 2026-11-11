@@ -2100,4 +2100,214 @@ void dispatch_paged_attention_varlen_auto(
   }
 }
 
+
+// =============================================================================
+// In-place prefill / verify attention (paged_prefill_attention.metal)
+// =============================================================================
+
+namespace {
+
+constexpr int kPagedPrefillGroups[] = {4, 6, 8, 16};
+constexpr int kPagedPrefillHeadDims[] = {128, 256};
+
+// Splash SPLASH_ATTENTION_TILE_PARTS.
+int paged_prefill_tile_parts(int group) {
+  return group <= 8 ? 1 : group <= 16 ? 2 : group <= 32 ? 4 : 8;
+}
+
+std::string paged_prefill_suffix(int group, int head_size) {
+  return "_g" + std::to_string(group) + "_d" + std::to_string(head_size);
+}
+
+std::string paged_prefill_split_name(KvDtype cache_dtype, int group, int head_size) {
+  return std::string("paged_prefill_attention_") +
+      (cache_dtype == KvDtype::Int8 ? "q8" : "bf16") + "_split" +
+      paged_prefill_suffix(group, head_size);
+}
+
+std::string paged_prefill_reduce_name(int group, int head_size) {
+  return "paged_prefill_attention_reduce" + paged_prefill_suffix(group, head_size);
+}
+
+// Splash DeviceCapabilities::validationMessage: people know their chip, not
+// its GPU family.
+std::string apple_gpu_family_name(mlx::core::metal::Device& device) {
+  static constexpr std::pair<MTL::GPUFamily, const char*> kFamilies[] = {
+      {MTL::GPUFamilyApple10, "Apple GPU family 10 (M5)"},
+      {MTL::GPUFamilyApple9, "Apple GPU family 9 (M3, M4)"},
+      {MTL::GPUFamilyApple8, "Apple GPU family 8 (M2)"},
+      {MTL::GPUFamilyApple7, "Apple GPU family 7 (M1)"},
+  };
+  for (const auto& [family, name] : kFamilies) {
+    if (device.mtl_device()->supportsFamily(family)) {
+      return name;
+    }
+  }
+  return "no known Apple GPU family";
+}
+
+std::atomic<uint64_t>& paged_prefill_probe_counter(int kind) {
+  static std::atomic<uint64_t> counters[2] = {{0}, {0}};
+  return counters[kind];
+}
+
+std::atomic<uint32_t>& paged_prefill_probe_last_splits() {
+  static std::atomic<uint32_t> value{0};
+  return value;
+}
+
+std::atomic<uint32_t>& paged_prefill_probe_last_max_splits() {
+  static std::atomic<uint32_t> value{0};
+  return value;
+}
+
+} // namespace
+
+bool paged_prefill_attention_geometry(int group, int head_size) {
+  const bool group_ok = std::find(
+                            std::begin(kPagedPrefillGroups),
+                            std::end(kPagedPrefillGroups),
+                            group) != std::end(kPagedPrefillGroups);
+  const bool dim_ok = std::find(
+                          std::begin(kPagedPrefillHeadDims),
+                          std::end(kPagedPrefillHeadDims),
+                          head_size) != std::end(kPagedPrefillHeadDims);
+  return group_ok && dim_ok;
+}
+
+std::vector<std::string> paged_prefill_attention_kernel_names() {
+  std::vector<std::string> names;
+  for (int group : kPagedPrefillGroups) {
+    for (int head_size : kPagedPrefillHeadDims) {
+      names.push_back(paged_prefill_split_name(KvDtype::Int8, group, head_size));
+      names.push_back(paged_prefill_split_name(KvDtype::Bf16, group, head_size));
+      names.push_back(paged_prefill_reduce_name(group, head_size));
+    }
+  }
+  return names;
+}
+
+MTL::ComputePipelineState* paged_prefill_pipeline(
+    mlx::core::metal::Device& device,
+    const std::string& name) {
+  try {
+    return get_prebuilt_kernel(device, "paged_prefill", "paged prefill attention", name);
+  } catch (const std::exception& e) {
+    throw std::runtime_error(
+        "paged prefill attention kernel " + name + " has no pipeline on " +
+        apple_gpu_family_name(device) + ": " + e.what());
+  }
+}
+
+int64_t build_paged_prefill_attention_pipelines(mlx::core::metal::Device& device) {
+  int64_t built = 0;
+  for (const auto& name : paged_prefill_attention_kernel_names()) {
+    paged_prefill_pipeline(device, name);
+    ++built;
+  }
+  return built;
+}
+
+int64_t paged_prefill_workspace_floats(
+    int rows, int splits, int num_q_heads, int head_size) {
+  const int64_t tiles =
+      (static_cast<int64_t>(rows) + kPagedPrefillTileRows - 1) / kPagedPrefillTileRows;
+  return tiles * splits * kPagedPrefillTileRows * num_q_heads *
+      (static_cast<int64_t>(head_size) + 2);
+}
+
+void dispatch_paged_prefill_attention(
+    mlx::core::metal::CommandEncoder& encoder,
+    mlx::core::metal::Device& device,
+    mlx::core::array& out,
+    mlx::core::array& workspace,
+    const mlx::core::array& q_staged,
+    const mlx::core::array& k_pool,
+    const mlx::core::array& v_pool,
+    const mlx::core::array& k_scale,
+    const mlx::core::array& v_scale,
+    const mlx::core::array& block_table,
+    const PagedPrefillParams& params,
+    int num_q_heads,
+    int head_size,
+    KvDtype cache_dtype,
+    int64_t live_blocks) {
+  const int kv_heads = static_cast<int>(params.kv_heads);
+  const int group = num_q_heads / kv_heads;
+  const int parts = paged_prefill_tile_parts(group);
+  const int tiles = (static_cast<int>(params.rows) + kPagedPrefillTileRows - 1) /
+      kPagedPrefillTileRows;
+  const int64_t partial_floats = static_cast<int64_t>(tiles) * params.split_count *
+      kPagedPrefillTileRows * num_q_heads * head_size;
+
+  {
+    const int kind = params.max_splits == kPagedVerifyMaxSplits ? 1 : 0;
+    paged_prefill_probe_counter(kind).fetch_add(1, std::memory_order_relaxed);
+    paged_prefill_probe_last_splits().store(params.split_count, std::memory_order_relaxed);
+    paged_prefill_probe_last_max_splits().store(
+        params.max_splits, std::memory_order_relaxed);
+  }
+
+  {
+    auto* pipeline =
+        paged_prefill_pipeline(device, paged_prefill_split_name(cache_dtype, group, head_size));
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_input_array(q_staged, 0);
+    encoder.set_output_array(workspace, 1);
+    encoder.set_output_array(workspace, 2, partial_floats * 4);
+    encoder.set_input_array(block_table, 3);
+    bind_pool_planes(encoder, k_pool, v_pool, k_scale, v_scale, live_blocks);
+    encoder.set_bytes(params, 8);
+    encoder.dispatch_threadgroups(
+        MTL::Size::Make(
+            static_cast<size_t>(kv_heads * parts),
+            static_cast<size_t>(tiles),
+            static_cast<size_t>(params.split_count)),
+        MTL::Size::Make(kNumThreads, 1, 1));
+  }
+  // The reduce reads every split's partials.
+  encoder.barrier();
+  {
+    auto* pipeline = paged_prefill_pipeline(device, paged_prefill_reduce_name(group, head_size));
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_input_array(workspace, 0);
+    encoder.set_input_array(workspace, 1, partial_floats * 4);
+    encoder.set_output_array(out, 2);
+    encoder.set_bytes(params, 3);
+    encoder.dispatch_threadgroups(
+        MTL::Size::Make(
+            static_cast<size_t>(kv_heads),
+            static_cast<size_t>(kPagedPrefillTileRows * group),
+            static_cast<size_t>(tiles)),
+        MTL::Size::Make(static_cast<size_t>(head_size), 1, 1));
+  }
+}
+
 } // namespace mlx::core::fast::paged
+
+extern "C" void mlx_paged_prefill_test_probe_reset() {
+  using namespace mlx::core::fast::paged;
+  paged_prefill_probe_counter(0).store(0, std::memory_order_relaxed);
+  paged_prefill_probe_counter(1).store(0, std::memory_order_relaxed);
+  paged_prefill_probe_last_splits().store(0, std::memory_order_relaxed);
+  paged_prefill_probe_last_max_splits().store(0, std::memory_order_relaxed);
+}
+
+// kind 0: prefill launches, 1: verify launches.
+extern "C" uint64_t mlx_paged_prefill_test_probe_count(int kind) {
+  using namespace mlx::core::fast::paged;
+  if (kind != 0 && kind != 1) {
+    return 0;
+  }
+  return paged_prefill_probe_counter(kind).load(std::memory_order_relaxed);
+}
+
+extern "C" uint32_t mlx_paged_prefill_test_last_splits() {
+  using namespace mlx::core::fast::paged;
+  return paged_prefill_probe_last_splits().load(std::memory_order_relaxed);
+}
+
+extern "C" uint32_t mlx_paged_prefill_test_last_max_splits() {
+  using namespace mlx::core::fast::paged;
+  return paged_prefill_probe_last_max_splits().load(std::memory_order_relaxed);
+}

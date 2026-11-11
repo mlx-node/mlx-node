@@ -717,9 +717,8 @@ void qmv_sg8(const Operands &o, int N, int K) {
 // GPU cores from the IORegistry `gpu-core-count` of the accelerator entry
 // behind the Metal device (its registry ID, or an ancestor up to 4 levels;
 // the first IOAccelerator service as the fallback). Metal itself does not
-// expose the count. When nothing publishes it, 8: the smallest Apple
-// silicon GPUs have 7 to 10, so the split rule errs towards fewer splits.
-int gpu_core_count(metal::Device &d) {
+// expose the count. 0 when nothing publishes it.
+int gpu_reported_core_count(metal::Device &d) {
   static const int cores = [&d]() {
     int count = 0;
     auto read = [&count](io_registry_entry_t entry) {
@@ -763,9 +762,16 @@ int gpu_core_count(metal::Device &d) {
         IOObjectRelease(accelerator);
       }
     }
-    return count ? count : 8;
+    return count;
   }();
   return cores;
+}
+
+// The reported cores, or 8 when nothing publishes them: the smallest Apple
+// silicon GPUs have 7 to 10, so the split rule errs towards fewer splits.
+int gpu_core_count(metal::Device &d) {
+  const int cores = gpu_reported_core_count(d);
+  return cores ? cores : 8;
 }
 
 // Source Splash policy: staged decode on Apple GPU family 10 or later,
@@ -1600,11 +1606,19 @@ extern "C" int mlx_gpu_core_count() {
       : 0;
 }
 
+extern "C" int mlx_gpu_reported_core_count() {
+  using namespace mlx::core;
+  return is_available(Device::gpu)
+      ? kquant::gpu_reported_core_count(metal::device(Device::gpu))
+      : 0;
+}
+
 #else
 
 #include <stdexcept>
 
 extern "C" int mlx_gpu_core_count() { return 0; }
+extern "C" int mlx_gpu_reported_core_count() { return 0; }
 
 namespace mlx::core::kquant {
 

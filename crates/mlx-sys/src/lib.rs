@@ -725,22 +725,6 @@ unsafe extern "C-unwind" {
         dtype_code: i32,
     ) -> *mut mlx_array;
 
-    // Segmented BF16 vector attention, with concatenated SDPA fallback for
-    // unsupported pipeline capabilities. A causal block wider than one
-    // supported query chunk is one call with no fallback. Null indicates a
-    // construction error, including prebuilt kernels missing from
-    // paged_attn.metallib (or an unavailable backend, which Rust checks before
-    // calling).
-    pub fn mlx_segmented_sdpa_forward(
-        q: *mut mlx_array,
-        prefix_k: *mut mlx_array,
-        prefix_v: *mut mlx_array,
-        new_k: *mut mlx_array,
-        new_v: *mut mlx_array,
-        scale: f32,
-        causal: bool,
-    ) -> *mut mlx_array;
-
     /// Segmented attention over INT8 K/V rows with one fp32 scale per
     /// (token, head): `*_k` / `*_v` int8 `[B, Hkv, n, 256]`, `*_ks` / `*_vs`
     /// float32 `[B, Hkv, n]` (token stride 1). Never falls back to the
@@ -1210,6 +1194,45 @@ unsafe extern "C-unwind" {
         head_size: i32,
         kv_dtype: u8,
     ) -> *mut mlx_array;
+
+    /// In-place prefill / verify attention of one sequence's chunk over the
+    /// block-paged pool, its rows already stored (Splash
+    /// `PagedAttention::addPrefill`). `q` `[rows, num_q_heads, head_size]`;
+    /// `block_table` int32 with at least ceil((committed + rows) /
+    /// block_size) entries; `workspace` f32 of at least the launch's
+    /// partials and statistics (`mlx_paged_attn::prefill_plan`). `max_splits`
+    /// is 32 for a prefill chunk (rows <= 2048) and 128 for a verify block
+    /// (rows <= 8). Writes the lazy `[rows, num_q_heads, head_size]` bf16
+    /// attention and the workspace (same buffer, ordered after this launch)
+    /// to the out pointers; false on a validation error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_paged_prefill_attention_forward(
+        q: *mut mlx_array,
+        k_pool: *mut mlx_array,
+        v_pool: *mut mlx_array,
+        k_scale: *mut mlx_array,
+        v_scale: *mut mlx_array,
+        block_table: *mut mlx_array,
+        workspace: *mut mlx_array,
+        committed_tokens: i32,
+        splits: i32,
+        max_splits: i32,
+        block_size: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_size: i32,
+        kv_dtype: u8,
+        scale: f32,
+        out_attention: *mut *mut mlx_array,
+        out_workspace: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// Reset/read the in-place prefill attention launch probe (counted at
+    /// every dispatch). `kind` 0 counts prefill launches, 1 verify launches.
+    pub fn mlx_paged_prefill_test_probe_reset();
+    pub fn mlx_paged_prefill_test_probe_count(kind: i32) -> u64;
+    pub fn mlx_paged_prefill_test_last_splits() -> u32;
+    pub fn mlx_paged_prefill_test_last_max_splits() -> u32;
 
     /// Emit the MLX C++ `paged_kv_write(...)` Custom primitive and return the
     /// lazy outputs aliasing `k_pool`, `v_pool`, `k_scale`, `v_scale` (an
@@ -1783,6 +1806,10 @@ unsafe extern "C-unwind" {
     /// 8 when unpublished); 0 without Metal.
     pub fn mlx_gpu_core_count() -> i32;
 
+    /// GPU cores the default Metal device publishes in the IORegistry; 0
+    /// when it publishes none or without Metal.
+    pub fn mlx_gpu_reported_core_count() -> i32;
+
     /// Pure selector guard for the supported BF16 D512/BS16 GQA layouts.
     /// selector_mode: 0=disabled, 1=auto, 2=force.
     pub fn mlx_paged_grouped_d512_shape_guard_for_test(
@@ -2066,6 +2093,14 @@ unsafe extern "C-unwind" {
         family: *const std::ffi::c_char,
         build_pipelines: bool,
         counts: *mut i64,
+        report: *mut std::ffi::c_char,
+        len: usize,
+    ) -> bool;
+    /// TEST-ONLY: the error (NUL-terminated) a paged prefill attention
+    /// pipeline request for function `name` throws; false without Metal,
+    /// when the pipeline builds, or when `len` is too small.
+    pub fn mlx_test_paged_prefill_pipeline_error(
+        name: *const std::ffi::c_char,
         report: *mut std::ffi::c_char,
         len: usize,
     ) -> bool;

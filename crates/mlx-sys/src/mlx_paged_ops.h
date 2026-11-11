@@ -431,6 +431,112 @@ array paged_attention_varlen(
     KvDtype kv_dtype,
     StreamOrDevice s = {});
 
+/// `PagedPrefillAttention`: one prefill chunk or verify block of one
+/// sequence attends in place over the block-paged pool (Splash
+/// `PagedAttention::addPrefill`, split then reduce). The chunk's rows must
+/// already be stored; every row, the chunk's own included, is read back from
+/// the pool pages.
+///
+/// Inputs: `q_staged` bf16 [kv heads][stride][group][head_size] (stride =
+/// rows rounded up to 32, padding rows zero), `k_pool`, `v_pool`, `k_scale`,
+/// `v_scale` (the pool planes), `block_table` int32 holding at least
+/// ceil((committed + rows) / block_size) entries, `workspace` f32 of at least
+/// `paged_prefill_workspace_floats(rows, splits, ...)`.
+/// Outputs: [rows, num_q_heads, head_size] bf16, and the workspace (same
+/// buffer), so the next launch that takes it is ordered after this one.
+class PagedPrefillAttention : public Custom {
+ public:
+  PagedPrefillAttention(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int committed_tokens,
+      int rows,
+      int splits,
+      int max_splits,
+      int block_size,
+      int num_q_heads,
+      int num_kv_heads,
+      int head_size,
+      KvDtype kv_dtype)
+      : Custom(stream, std::move(fallback)),
+        committed_tokens_(committed_tokens),
+        rows_(rows),
+        splits_(splits),
+        max_splits_(max_splits),
+        block_size_(block_size),
+        num_q_heads_(num_q_heads),
+        num_kv_heads_(num_kv_heads),
+        head_size_(head_size),
+        kv_dtype_(kv_dtype) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("PagedPrefillAttention CPU NYI");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  std::vector<array> vjp(
+      const std::vector<array>& primals,
+      const std::vector<array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<array>& outputs) override;
+
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+
+  bool is_equivalent(const Primitive& other) const override;
+
+  DEFINE_NAME(PagedPrefillAttention);
+
+  auto state() const {
+    return std::make_tuple(
+        nullptr,
+        committed_tokens_,
+        rows_,
+        splits_,
+        max_splits_,
+        block_size_,
+        num_q_heads_,
+        num_kv_heads_,
+        head_size_,
+        static_cast<uint8_t>(kv_dtype_));
+  }
+
+ private:
+  int committed_tokens_;
+  int rows_;
+  int splits_;
+  int max_splits_;
+  int block_size_;
+  int num_q_heads_;
+  int num_kv_heads_;
+  int head_size_;
+  KvDtype kv_dtype_;
+};
+
+/// Stages `q` [rows, num_q_heads, head_size] KV-head-major and emits a
+/// `PagedPrefillAttention`. Returns {attention [rows, num_q_heads,
+/// head_size] bf16, workspace'}.
+std::array<array, 2> paged_prefill_attention(
+    const array& q,
+    const array& k_pool,
+    const array& v_pool,
+    const array& k_scale,
+    const array& v_scale,
+    const array& block_table,
+    const array& workspace,
+    int committed_tokens,
+    int splits,
+    int max_splits,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    KvDtype kv_dtype,
+    float scale,
+    StreamOrDevice s = {});
+
 } // namespace mlx::core::fast
 
 // C ABI bridge for Rust callers that need the graph-native ragged-Q primitive.
@@ -455,3 +561,25 @@ extern "C" mlx_array* mlx_paged_attention_varlen_forward(
     int num_kv_heads,
     int head_size,
     uint8_t kv_dtype);
+
+// In-place prefill / verify attention (`PagedPrefillAttention`). False on a
+// validation error; both outputs are then null.
+extern "C" bool mlx_paged_prefill_attention_forward(
+    mlx_array* q,
+    mlx_array* k_pool,
+    mlx_array* v_pool,
+    mlx_array* k_scale,
+    mlx_array* v_scale,
+    mlx_array* block_table,
+    mlx_array* workspace,
+    int committed_tokens,
+    int splits,
+    int max_splits,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    uint8_t kv_dtype,
+    float scale,
+    mlx_array** out_attention,
+    mlx_array** out_workspace);

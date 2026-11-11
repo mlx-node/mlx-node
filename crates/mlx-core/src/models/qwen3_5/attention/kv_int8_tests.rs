@@ -426,10 +426,10 @@ fn int8_verify_error_against_bf16_is_the_quantization_noise() -> Result<()> {
             (max / magnitude, (sum / got.len() as f64) as f32 / magnitude)
         };
         let expected = rel(&ref_int8, &ref_bf16);
-        // BF16 verify over the BF16 rows (production entry).
+        // BF16 verify over the BF16 rows (the vector route).
         let bf16_out = {
             let handle = unsafe {
-                mlx_sys::mlx_segmented_sdpa_forward(
+                mlx_sys::mlx_segmented_sdpa_test_forward(
                     c.q.as_raw_ptr(),
                     c.bf16_prefix.0.as_raw_ptr(),
                     c.bf16_prefix.1.as_raw_ptr(),

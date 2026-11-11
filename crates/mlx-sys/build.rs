@@ -263,6 +263,7 @@ fn compile_paged_attn_metallib(
     let mut jobs = Vec::new();
     for file in [
         "attention/paged_attention.metal",
+        "attention/paged_prefill_attention.metal",
         "cache/reshape_and_cache.metal",
     ] {
         let args = vec![

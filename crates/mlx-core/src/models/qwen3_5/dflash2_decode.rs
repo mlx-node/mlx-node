@@ -6,9 +6,6 @@ use crate::array::{DType, MxArray};
 use crate::engine::backend::{DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput};
 use crate::engine::memory_plan::EXTENT_TARGET_BYTES;
 use crate::transformer::KvFormat;
-use crate::transformer::paged_policy::{
-    estimate_paged_pool_sdpa_bytes_with_portable, estimate_varlen_paged_attention_bytes,
-};
 
 use super::dflash2::DFlash2ContextCache;
 use super::dflash2_turn::{DFlash2Target, DFlash2TurnState};
@@ -237,26 +234,6 @@ fn prefill_transient_bytes(
         .saturating_add(dequantized_prefix)
 }
 
-/// Which fused SDPA kernels a paged prefill chunk can take, as
-/// `select_cache_hit_prefill_plan`'s estimators read them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PrefillSdpaKernels {
-    pub d256_full: bool,
-    pub portable_d256: bool,
-}
-
-impl PrefillSdpaKernels {
-    /// The kernels a BF16 paged prefill of `head_dim`-wide heads can take on
-    /// this device.
-    pub(crate) fn probe(head_dim: i32) -> Self {
-        Self {
-            d256_full: super::attention::d256_full_sdpa_available(false),
-            portable_d256: head_dim == 256
-                && unsafe { mlx_sys::mlx_metal_portable_d256_sdpa_available() },
-        }
-    }
-}
-
 /// One layer's attention and MLP scratch over a prefill chunk of the first
 /// `window` rows.
 fn prefill_chunk_scratch_bytes(config: &super::config::Qwen3_5Config, window: u64) -> u64 {
@@ -269,32 +246,31 @@ fn prefill_chunk_scratch_bytes(config: &super::config::Qwen3_5Config, window: u6
 }
 
 /// Bytes a paged pool turn of `window` tokens allocates besides KV at its
-/// peak: the last prefill chunk's scratch with its attention route, or one
-/// decode step. A bf16 pool takes the cheaper of the two routes the paged
-/// prefill picks from; an int8 pool always reads through the varlen kernel
-/// with its bounded workspace. With a DFlash2 draft (`draft_taps` tapped
-/// layers) the prefill also holds the chunk's taps, and the decode step is
-/// the 8-row verify on the pool with the free pool its decode cache limit
-/// keeps (Splash prices the one 8-row verify graph).
+/// peak: the last prefill chunk's scratch with the in-place attention's
+/// workspace bound, or one decode step. With a DFlash2 draft (`draft_taps`
+/// tapped layers) the prefill also holds the chunk's taps, and the decode
+/// step is the 8-row verify on the pool with the free pool its decode cache
+/// limit keeps (Splash prices the one 8-row verify graph).
 pub(crate) fn pool_lane_transient(
     config: &super::config::Qwen3_5Config,
-    format: KvFormat,
-    kernels: PrefillSdpaKernels,
     draft_taps: Option<usize>,
     window: u32,
 ) -> u64 {
     let dim = |v: i32| v.max(0) as u64;
     let window = u64::from(window);
     let chunk = window.min(PREFILL_STEP_SIZE as u64);
-    let prefill = prefill_chunk_scratch_bytes(config, window)
-        .saturating_add(pool_attention_bytes(config, format, kernels, chunk, window));
+    let prefill = prefill_chunk_scratch_bytes(config, window).saturating_add(pool_attention_bytes(
+        config,
+        chunk,
+        mlx_paged_attn::prefill_plan::Pass::Prefill,
+    ));
     match draft_taps {
         Some(taps) => {
             let tapped = chunk
                 .saturating_mul(taps as u64)
                 .saturating_mul(dim(config.hidden_size))
                 .saturating_mul(2);
-            let cycle = pool_verify_cycle_bytes(config, format, kernels, window);
+            let cycle = pool_verify_cycle_bytes(config, window);
             prefill
                 .saturating_add(tapped)
                 .max(cycle.saturating_add(crate::cache_limit::decode_cache_limit(cycle)))
@@ -304,67 +280,34 @@ pub(crate) fn pool_lane_transient(
 }
 
 /// One 8-row DFlash2 verify on the pool over `window` keys: logits, GDN
-/// tapes and one layer's scratch, and the attention workspace of the 8
-/// rows. The stepper's decode cache limit is sized from it.
-pub(crate) fn pool_verify_cycle_bytes(
-    config: &super::config::Qwen3_5Config,
-    format: KvFormat,
-    kernels: PrefillSdpaKernels,
-    window: u64,
-) -> u64 {
+/// tapes and one layer's scratch, and the verify attention's workspace
+/// bound. The stepper's decode cache limit is sized from it.
+pub(crate) fn pool_verify_cycle_bytes(config: &super::config::Qwen3_5Config, window: u64) -> u64 {
     let rows = super::dflash2::DFLASH2_VERIFY_ROWS;
     dflash2_cycle_transient(config, rows - 1, window)
         .core_bytes
         .saturating_add(pool_attention_bytes(
             config,
-            format,
-            kernels,
             rows as u64,
-            window,
+            mlx_paged_attn::prefill_plan::Pass::Verify,
         ))
 }
 
-/// Attention workspace of `queries` rows over `window` keys on the pool.
-fn pool_attention_bytes(
+/// The in-place pool attention of a launch of up to `rows` rows (Splash
+/// `prefillWorkspace` / `verifyWorkspaceBound` with the query staging, the
+/// output and the K / V rows): no history term, both page formats.
+pub(crate) fn pool_attention_bytes(
     config: &super::config::Qwen3_5Config,
-    format: KvFormat,
-    kernels: PrefillSdpaKernels,
-    queries: u64,
-    window: u64,
+    rows: u64,
+    pass: mlx_paged_attn::prefill_plan::Pass,
 ) -> u64 {
-    let dim = |v: i32| v.max(0) as u64;
-    let (heads, kv_heads, head_dim) = (
-        dim(config.num_heads),
-        dim(config.num_kv_heads),
-        dim(config.head_dim),
-    );
-    match format {
-        KvFormat::Int8 => crate::transformer::paged_policy::estimate_int8_varlen_prefill_bytes(
-            queries, window, heads, head_dim,
-        ),
-        KvFormat::Bf16 => {
-            let dtype_bytes = DType::BFloat16.byte_size() as u64;
-            let gathered = estimate_paged_pool_sdpa_bytes_with_portable(
-                queries,
-                window,
-                heads,
-                kv_heads,
-                head_dim,
-                dtype_bytes,
-                kernels.d256_full,
-                kernels.portable_d256,
-            );
-            let varlen = estimate_varlen_paged_attention_bytes(
-                queries,
-                window,
-                heads,
-                kv_heads,
-                head_dim,
-                dtype_bytes,
-            );
-            gathered.min(varlen)
-        }
-    }
+    mlx_paged_attn::prefill_plan::attention_bytes(
+        u32::try_from(rows).unwrap_or(u32::MAX),
+        config.num_heads.max(0) as u32,
+        config.num_kv_heads.max(0) as u32,
+        config.head_dim.max(0) as u32,
+        pass,
+    )
 }
 
 /// Bytes a flat autoregressive turn of `window` tokens allocates besides KV
@@ -830,8 +773,6 @@ impl DsparkBackend for Qwen35Inner {
             _decode_limit: crate::cache_limit::coordinator().push_decode_limit(
                 crate::cache_limit::decode_cache_limit(pool_verify_cycle_bytes(
                     &self.config,
-                    self.config.kv_format(),
-                    PrefillSdpaKernels::probe(self.config.head_dim),
                     u64::from(context_window),
                 )),
             ),
@@ -1185,13 +1126,6 @@ pub(crate) mod tests {
     use super::*;
     use crate::models::quantized_linear::LinearProj;
     use crate::nn::Linear;
-
-    pub(crate) fn tiny_dflash_inner_with_attention_head_dim(
-        seed: u64,
-        head_dim: i32,
-    ) -> Qwen35Inner {
-        tiny_dflash_inner_with_config(seed, |config| config.head_dim = head_dim)
-    }
 
     /// The seeded fixture without a pool, a sensitive random head and a
     /// tiny draft installed.
@@ -1663,6 +1597,61 @@ mod paged_dflash2_tests {
         Ok(())
     }
 
+    /// Every prefill chunk launches the in-place attention with the prefill
+    /// split rule (Splash `prefillSplits`, max 32) and the 8-row DFlash2
+    /// verify with the verify rule (Splash `kv::verifyAttentionSplits`, max
+    /// 128), one launch per full-attention layer. Mutation R1:
+    /// `paged_verify_core` passes `PagedPass::Prefill` → red (no verify
+    /// launch).
+    #[test]
+    fn verify_takes_the_verify_split_rule() -> Result<()> {
+        let probe = |kind| unsafe { mlx_sys::mlx_paged_prefill_test_probe_count(kind) };
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let mut inner = tiny_paged_int8_dflash_inner(0x5_8010);
+        let layers = inner.config.full_attention_layer_count() as u64;
+        let prompt = prompt(40);
+        let prefix = inner.prime_dspark_prefix_state(&prompt, true, 0)?;
+        unsafe { mlx_sys::mlx_paged_prefill_test_probe_reset() };
+        let logits = inner.paged_prefill_with_draft_state(&prompt, &prefix, stream)?;
+        let anchor = argmax_rows(&logits)?[0];
+        let chunks = probe(0);
+        assert!(
+            chunks > 0 && chunks % layers == 0,
+            "{chunks} prefill launches over {layers} layers"
+        );
+        assert_eq!(probe(1), 0, "a prefill chunk is no verify");
+        assert_eq!(
+            unsafe { mlx_sys::mlx_paged_prefill_test_last_max_splits() },
+            32
+        );
+        let open = cursor(&inner);
+        let params = crate::engine::extract_chat_params(&crate::engine::types::ChatConfig {
+            temperature: Some(0.0),
+            ..Default::default()
+        });
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let mut step = inner.begin_dspark_decode(DFLASH2_DRAFT_PROPOSALS)?;
+        let mut proposal = step.propose(anchor, DFLASH2_DRAFT_PROPOSALS, &params, &mut rng)?;
+        proposal.materialize_draft_ids()?;
+        let mut ids = vec![anchor];
+        ids.extend(proposal.draft_ids.iter().map(|&id| id as u32));
+        step.verify(&ids)?.logits.eval();
+        assert_eq!(probe(1), layers, "one verify launch per layer");
+        assert_eq!(probe(0), chunks);
+        assert_eq!(
+            unsafe { mlx_sys::mlx_paged_prefill_test_last_splits() },
+            mlx_paged_attn::prefill_plan::verify_splits(open)
+        );
+        assert_eq!(
+            unsafe { mlx_sys::mlx_paged_prefill_test_last_max_splits() },
+            128
+        );
+        step.commit_with_provenance(1, ids.len(), &ids)?;
+        step.finish()?;
+        Ok(())
+    }
+
     /// Splash `PagedAttention::addVerify`: a lane chunk that is not the 8
     /// verify rows, a page table short of them, or rows past the window and
     /// its scratch rows are refused before anything is recorded. Mutation K1
@@ -2032,9 +2021,10 @@ mod paged_dflash2_tests {
     /// A1 parks its prompt's replay point (208) on its own chain; an
     /// unrelated Q then runs on a pool that must grow for it; A2 (A1's
     /// prompt to 208, then new text) resumes from the parked state on A1's
-    /// blocks on the installed GDN cell, emits the paged AR tokens of A2,
-    /// and its teacher-forced DFlash2 logits equal those of a run with no Q
-    /// in between, bit for bit.
+    /// blocks on the installed GDN cell, and its tokens and teacher-forced
+    /// DFlash2 logits equal those of a run with no Q in between, bit for bit.
+    /// (Paged AR is no reference: its decode kernel is not the verify's
+    /// in-place attention.)
     /// Mutation MK1 (parked states mark no block) → red (Q's prefill takes
     /// A1's chain instead of growing the pool; A2's install fails).
     /// Mutation GI1 (the install leaves the GDN slots fresh) → red (A2
@@ -2080,11 +2070,6 @@ mod paged_dflash2_tests {
         assert_eq!((x.cached, y.cached), (208, 208));
         assert_eq!(x_ids[..13], x_chain[..], "A2 resumes on A1's blocks");
         assert_eq!(y_ids[..13], y_chain[..]);
-        assert_eq!(
-            x.tokens[..reference.len()],
-            reference[..],
-            "A2 left the AR tokens"
-        );
         assert_eq!(x.tokens, y.tokens);
         assert!(x.logits == y.logits, "teacher-forced logits differ");
         Ok(())

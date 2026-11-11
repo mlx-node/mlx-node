@@ -1,10 +1,11 @@
-//! The segmented SDPA and mixed-affine `qmv_wide` kernels run only from the
-//! prebuilt `paged_attn.metallib`; there is no JIT fallback. These tests take
-//! every kernel name each dispatcher can request (from the same tables and
-//! name builders it uses) and check the loaded metallib both ways: every name
-//! is in it, and it holds no function of the family the dispatcher cannot
-//! name. The pipeline tests build every pipeline through the dispatcher's own
-//! loader, each segmented function-constant specialization included.
+//! The segmented SDPA, mixed-affine `qmv_wide`, Splash MoE and paged prefill
+//! attention kernels run only from the prebuilt `paged_attn.metallib`; there
+//! is no JIT fallback. These tests take every kernel name each dispatcher can
+//! request (from the same tables and name builders it uses) and check the
+//! loaded metallib both ways: every name is in it, and it holds no function
+//! of the family the dispatcher cannot name. The pipeline tests build every
+//! pipeline through the dispatcher's own loader, each segmented
+//! function-constant specialization included.
 //!
 //!   cargo test -p mlx-core --release --test bridge_metallib_names
 //!
@@ -134,4 +135,51 @@ fn every_splash_moe_kernel_builds_a_pipeline() {
     assert!(c.report.is_empty(), "{}", c.report);
     let nax = unsafe { mlx_sys::mlx_metal_is_nax_available() };
     assert_eq!(c.built, if nax { 15 } else { 0 });
+}
+
+/// Split (int8 and bf16 pages) and reduce instances of the in-place paged
+/// prefill attention: groups {4, 6, 8, 16} x head dims {128, 256}.
+const PAGED_PREFILL_NAMES: i64 = 4 * 2 * 3;
+
+#[test]
+fn every_paged_prefill_kernel_is_in_the_metallib() {
+    assert_names("paged_prefill", PAGED_PREFILL_NAMES);
+}
+
+/// The only paged prefill route: every pipeline builds on every device.
+#[test]
+fn every_paged_prefill_kernel_builds_a_pipeline() {
+    let c = check("paged_prefill", true);
+    assert!(c.report.is_empty(), "{}", c.report);
+    assert_eq!(c.built, PAGED_PREFILL_NAMES, "pipelines built");
+}
+
+/// A paged prefill pipeline that does not build fails loudly with the
+/// kernel and the device's Apple GPU family named (Splash
+/// `DeviceCapabilities::validationMessage`); there is no other route.
+/// Mutation F1: the loader rethrows the bare load error → red.
+#[test]
+fn a_paged_prefill_pipeline_failure_names_the_gpu_family() {
+    let name = CString::new("paged_prefill_attention_q8_split_g5_d256").expect("name");
+    let mut report = vec![0 as c_char; 1 << 12];
+    // SAFETY: `name` is NUL-terminated and `report` is a writable buffer of
+    // the length passed.
+    let failed = unsafe {
+        mlx_sys::mlx_test_paged_prefill_pipeline_error(
+            name.as_ptr(),
+            report.as_mut_ptr(),
+            report.len(),
+        )
+    };
+    assert!(
+        failed,
+        "a kernel outside the instance table built a pipeline"
+    );
+    // SAFETY: the hook wrote a NUL-terminated string into `report`.
+    let text = unsafe { CStr::from_ptr(report.as_ptr()) }.to_string_lossy();
+    assert!(
+        text.contains("paged_prefill_attention_q8_split_g5_d256")
+            && text.contains("Apple GPU family"),
+        "{text}"
+    );
 }

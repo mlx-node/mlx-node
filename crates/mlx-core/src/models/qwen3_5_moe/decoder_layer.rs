@@ -5,7 +5,7 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::transformer::paged_kv_cache_adapter::SeqId;
 use napi::bindgen_prelude::*;
 
-use super::attention::Qwen3_5Attention;
+use super::attention::{PagedPass, Qwen3_5Attention};
 use super::config::Qwen3_5MoeConfig;
 use super::gated_delta_net::GatedDeltaNet;
 use super::layer_cache::Qwen3_5LayerCache;
@@ -294,8 +294,7 @@ impl DecoderLayer {
         kind: Qwen3_5LayerKind,
         adapter: &mut PagedKVCacheAdapter,
         first_logical_position: u32,
-        cached_prefix_len: u32,
-        is_prefill: bool,
+        pass: PagedPass,
         mask: Option<&MxArray>,
         flat_cache: Option<&mut Qwen3_5LayerCache>,
         position_ids: Option<&MxArray>,
@@ -307,8 +306,7 @@ impl DecoderLayer {
             Qwen3_5LayerKind::Linear => {
                 let _ = adapter;
                 let _ = first_logical_position;
-                let _ = cached_prefix_len;
-                let _ = is_prefill;
+                let _ = pass;
                 let _ = rope_position_offset;
                 if !matches!(self.attn, AttentionType::Linear(_)) {
                     return Err(Error::from_reason(
@@ -339,8 +337,7 @@ impl DecoderLayer {
                     adapter,
                     paged_idx,
                     first_logical_position,
-                    cached_prefix_len,
-                    is_prefill,
+                    pass,
                     position_ids,
                     rope_position_offset,
                     mrope_cache,
@@ -372,8 +369,7 @@ impl DecoderLayer {
         kind: Qwen3_5LayerKind,
         adapter: &mut PagedKVCacheAdapter,
         first_logical_position: u32,
-        cached_prefix_len: u32,
-        is_prefill: bool,
+        pass: PagedPass,
         flat_cache: Option<&mut Qwen3_5LayerCache>,
         tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
         rope_position_offset: i32,
@@ -383,8 +379,7 @@ impl DecoderLayer {
             Qwen3_5LayerKind::Linear => {
                 let _ = adapter;
                 let _ = first_logical_position;
-                let _ = cached_prefix_len;
-                let _ = is_prefill;
+                let _ = pass;
                 let _ = rope_position_offset;
                 if !matches!(self.attn, AttentionType::Linear(_)) {
                     return Err(Error::from_reason(
@@ -423,8 +418,7 @@ impl DecoderLayer {
                     adapter,
                     paged_idx,
                     first_logical_position,
-                    cached_prefix_len,
-                    is_prefill,
+                    pass,
                     None,
                     rope_position_offset,
                     &mut None,

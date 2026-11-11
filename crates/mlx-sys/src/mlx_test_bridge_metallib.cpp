@@ -9,6 +9,7 @@
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx_affine_mixed_qmm.h"
+#include "mlx_paged_dispatch.h"
 #include "mlx_paged_metallib.h"
 #include "mlx_segmented_sdpa.h"
 
@@ -19,7 +20,8 @@
 #include <vector>
 #endif
 
-// `family` is "segmented_sdpa" or "affine_mixed". `counts` receives {names the
+// `family` is "segmented_sdpa", "affine_mixed", "splash_moe" or
+// "paged_prefill". `counts` receives {names the
 // dispatcher can request, the family's functions in the library, pipelines
 // built}. `report` receives "missing <name>" / "unexpected <name>" lines.
 // `build_pipelines` also builds every pipeline the dispatcher can build (each
@@ -91,6 +93,10 @@ extern "C" bool mlx_test_bridge_metallib_check(const char *family,
           fast::paged::get_prebuilt_kernel(d, "splash_moe", "grouped", name);
         return int64_t(names.size());
       };
+    } else if (std::strcmp(family, "paged_prefill") == 0) {
+      prefix = "paged_prefill_attention_";
+      names = fast::paged::paged_prefill_attention_kernel_names();
+      build = [&d] { return fast::paged::build_paged_prefill_attention_pipelines(d); };
     } else {
       return false;
     }
@@ -134,6 +140,34 @@ extern "C" bool mlx_test_bridge_metallib_check(const char *family,
   (void)family;
   (void)build_pipelines;
   (void)counts;
+  (void)report;
+  (void)len;
+  return false;
+#endif
+}
+
+// The error a paged prefill pipeline request for function `name` throws,
+// NUL-terminated into `report`. False without Metal, when the pipeline
+// builds, or when `report` cannot hold the text.
+extern "C" bool mlx_test_paged_prefill_pipeline_error(const char *name,
+                                                      char *report,
+                                                      size_t len) {
+#ifdef MLX_NODE_METAL_ENABLED
+  using namespace mlx::core;
+  if (!name || !report || len == 0 || !metal::is_available())
+    return false;
+  try {
+    fast::paged::paged_prefill_pipeline(metal::device(Device::gpu), name);
+    return false;
+  } catch (const std::exception &e) {
+    const std::string text = e.what();
+    if (text.size() + 1 > len)
+      return false;
+    std::memcpy(report, text.c_str(), text.size() + 1);
+    return true;
+  }
+#else
+  (void)name;
   (void)report;
   (void)len;
   return false;

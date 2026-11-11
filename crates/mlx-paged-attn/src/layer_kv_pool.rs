@@ -255,6 +255,46 @@ impl LayerPlanes {
         .filter_map(|(plane, buffer)| buffer.map(|buffer| (plane, buffer)))
     }
 
+    /// Zero every plane from block `from_blocks` on. Splash's KV extents
+    /// are fresh zero-filled buffers: the in-place prefill attention runs PV
+    /// over a visible block's never-written V slots with probability 0, and
+    /// 0 x NaN would poison the row.
+    fn zero_from(&self, blit: &metal::BlitCommandEncoder, bytes: &PlaneBytes, from_blocks: u32) {
+        for (plane, buffer) in self.planes() {
+            let offset = bytes
+                .of(plane)
+                .saturating_mul(u64::from(from_blocks))
+                .min(buffer.length());
+            let size = buffer.length() - offset;
+            if size > 0 {
+                blit.fill_buffer(buffer, offset, size, 0);
+            }
+        }
+    }
+
+    /// Zero every plane of `layers`, waiting for the blit.
+    fn zero_all(
+        state: &crate::metal::MetalState,
+        layers: &[LayerPlanes],
+        bytes: &PlaneBytes,
+        context: &'static str,
+    ) -> Result<(), String> {
+        let command_buffer = state
+            .command_queue
+            .try_new_command_buffer()
+            .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+        let blit = command_buffer
+            .try_new_blit_command_encoder()
+            .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
+        for layer in layers {
+            layer.zero_from(&blit, bytes, 0);
+        }
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        crate::metal::command_buffer::observe(&command_buffer, context)
+    }
+
     fn all_shared(&self) -> bool {
         self.planes()
             .all(|(_, buffer)| buffer.storage_mode() == metal::MTLStorageMode::Shared)
@@ -799,6 +839,7 @@ impl LayerKVPool {
                         .map_err(|error| format!("LayerKVPool::new: {error}"))?,
                 );
             }
+            LayerPlanes::zero_all(state, &layers, &bytes, "LayerKVPool::new")?;
 
             Ok(Self {
                 config,
@@ -857,9 +898,7 @@ impl LayerKVPool {
     /// `config.validate()` skipped there is no bound on `block_size`, and a
     /// silent multi-gigabyte allocation is a worse outcome than an `Err`.
     ///
-    /// Buffers are `StorageModePrivate` and **not zeroed**. Reading a block
-    /// that was never written returns whatever the driver handed out. Assert
-    /// on bytes you wrote, never on bytes you did not.
+    /// Buffers are `StorageModePrivate`, zero-filled like every pool.
     ///
     /// `cache_dtype` is recorded on the pool so the gather dispatch path
     /// routes through the correct `(io_t, cache_t)` kernel name. Tests that
@@ -932,6 +971,7 @@ impl LayerKVPool {
                     .map_err(|error| format!("LayerKVPool::new_for_test: {error}"))?,
                 );
             }
+            LayerPlanes::zero_all(state, &layers, &bytes, "LayerKVPool::new_for_test")?;
 
             Ok(Self {
                 config: cfg,
@@ -1153,6 +1193,7 @@ impl LayerKVPool {
             for ((plane, from), (_, to)) in old.planes().zip(grown.planes()) {
                 blit.copy_from_buffer(from, 0, to, 0, size(bytes.of(plane), old_num_blocks)?);
             }
+            grown.zero_from(&blit, &bytes, old_num_blocks);
             blit.end_encoding();
             command_buffer.commit();
             command_buffer.wait_until_completed();
@@ -3271,13 +3312,9 @@ mod tests {
     /// path and return the bytes written, so a neighbouring block can be shown
     /// untouched afterwards.
     ///
-    /// Reading a never-written block and asserting zeros does not work here on
-    /// two counts. Metal makes no guarantee that a fresh `StorageModePrivate`
-    /// allocation reads back zeroed, and these are exactly the small size class
-    /// a process-owned heap suballocates, so a test binary that has already
-    /// churned Metal buffers can see another allocation's bytes. A zero
-    /// assertion is also weaker than it looks: it cannot tell "this block was
-    /// already garbage" apart from "the batched write spilled into it". The
+    /// Reading a never-written block and asserting zeros is weaker than it
+    /// looks: it cannot tell "this block was already garbage" apart from "the
+    /// batched write spilled into it". The
     /// sentinel pattern differs from [`distinct_layer_bytes`] in both
     /// coefficients, so a spill of the payload is always visible.
     #[cfg(target_os = "macos")]
@@ -5746,5 +5783,67 @@ mod int8_tests {
         }
         assert!(pool.shrink_to(4).unwrap());
         holds(&pool);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod zero_fill_tests {
+    use super::*;
+    use crate::metal::MetalState;
+
+    fn config() -> PagedAttentionConfig {
+        PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb: 256,
+            head_size: 128,
+            num_kv_heads: 2,
+            num_layers: 2,
+            max_seq_len: Some(16 * 8),
+            max_batch_size: Some(1),
+        }
+    }
+
+    fn nonzero(pool: &LayerKVPool, blocks: &[u32]) -> usize {
+        (0..pool.num_layers() as u32)
+            .map(|layer| {
+                let (keys, values) = pool.read_blocks_to_host(layer, blocks).unwrap();
+                keys.iter().chain(&values).filter(|&&b| b != 0).count()
+            })
+            .sum()
+    }
+
+    /// The fill a new pool and a grow run (Splash's KV extents are
+    /// zero-filled): planes of 0xFF in every byte read back zero after it,
+    /// and a new pool and the blocks a grow adds read back zero.
+    ///
+    /// Mutation Z1 (the fill skipped) goes red.
+    #[test]
+    fn pool_planes_are_zero_filled() {
+        let Ok(state) = MetalState::get() else {
+            return;
+        };
+        for dtype in [MetalDtype::BFloat16, MetalDtype::Int8] {
+            let pool = LayerKVPool::new(config(), 4, 8, dtype).unwrap();
+            assert_eq!(nonzero(&pool, &[0, 1, 2, 3]), 0, "{dtype:?}: new pool");
+            assert!(pool.grow_to(8).unwrap());
+            assert_eq!(nonzero(&pool, &[4, 5, 6, 7]), 0, "{dtype:?}: grown blocks");
+
+            let (key_blob, value_blob) = pool.block_blob_bytes().unwrap();
+            let ids: Vec<u32> = (0..8).collect();
+            for layer in 0..2 {
+                pool.write_blocks_from_host(
+                    layer,
+                    &ids,
+                    &vec![0xff; 8 * key_blob as usize],
+                    &vec![0xff; 8 * value_blob as usize],
+                )
+                .unwrap();
+            }
+            assert!(nonzero(&pool, &ids) > 0);
+            let bytes = pool.plane_bytes().unwrap();
+            LayerPlanes::zero_all(state, &pool.inner_read().layers, &bytes, "zero_fill_tests")
+                .unwrap();
+            assert_eq!(nonzero(&pool, &ids), 0, "{dtype:?}: filled planes");
+        }
     }
 }

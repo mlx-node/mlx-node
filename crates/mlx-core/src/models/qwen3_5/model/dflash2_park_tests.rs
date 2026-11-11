@@ -10,7 +10,7 @@ use crate::engine::plan::{DecoderPlan, MediaCapabilities, MediaInputs, TurnPlan}
 use crate::engine::reclaim::UnitKey;
 use crate::engine::types::ChatConfig;
 use crate::models::qwen3_5::dflash2_decode::tests::{
-    metal_is_default_device, tiny_dflash_inner_with_attention_head_dim,
+    metal_is_default_device, tiny_dflash_inner_with_config,
 };
 use crate::models::qwen3_5::dflash2_turn::{
     GrowReclaim, Keep, clear_grow_reclaim_log, ensure_paged_pool_for_prompt, grow_reclaim_log,
@@ -18,7 +18,7 @@ use crate::models::qwen3_5::dflash2_turn::{
 };
 
 fn fixture(seed: u64) -> Qwen35Inner {
-    tiny_dflash_inner_with_attention_head_dim(seed, 32)
+    tiny_dflash_inner_with_config(seed, |_| {})
 }
 
 fn tokenizer() -> Arc<Qwen3Tokenizer> {

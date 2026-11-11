@@ -1,7 +1,6 @@
 //! A `paged_attn.metallib` without the prebuilt segmented SDPA kernels is a
 //! packaging error, not "segmented SDPA unsupported here": the capability
-//! probe returns -1 instead of 0 and the forward entry point returns null
-//! instead of falling back to concatenated SDPA.
+//! probe returns -1 instead of 0.
 //!
 //! This binary holds one test because the paged library is loaded once per
 //! process: it points `MLX_PAGED_ATTN_METALLIB` at a metallib without the
@@ -13,8 +12,6 @@
 
 use std::path::Path;
 use std::process::Command;
-
-use mlx_core::array::MxArray;
 
 fn xcrun(args: &[&str], dir: &Path) {
     let status = Command::new("xcrun")
@@ -58,11 +55,6 @@ fn metallib_without_bridge_kernels(dir: &Path) -> std::path::PathBuf {
     dir.join("other.metallib")
 }
 
-fn bf16(shape: &[i64]) -> MxArray {
-    let len = shape.iter().product::<i64>() as usize;
-    MxArray::from_bfloat16(&vec![0x3f80u16; len], shape).expect("bf16 array")
-}
-
 fn metal_required() -> bool {
     std::env::var("MLX_TEST_REQUIRE_METAL").is_ok_and(|value| value.trim() == "1")
 }
@@ -94,28 +86,5 @@ fn missing_segmented_kernels_are_a_hard_error() {
         "a missing segmented kernel must read as a packaging error (-1), not unsupported (0)"
     );
 
-    let q = bf16(&[1, 6, 2, 256]);
-    let pk = bf16(&[1, 1, 4, 256]);
-    let pv = bf16(&[1, 1, 4, 256]);
-    let nk = bf16(&[1, 1, 2, 256]);
-    let nv = bf16(&[1, 1, 2, 256]);
-    for causal in [false, true] {
-        // SAFETY: valid array handles that outlive the call.
-        let out = unsafe {
-            mlx_sys::mlx_segmented_sdpa_forward(
-                q.as_raw_ptr(),
-                pk.as_raw_ptr(),
-                pv.as_raw_ptr(),
-                nk.as_raw_ptr(),
-                nv.as_raw_ptr(),
-                0.0625,
-                causal,
-            )
-        };
-        assert!(
-            out.is_null(),
-            "causal={causal}: segmented SDPA fell back to concatenated K/V with its kernels missing"
-        );
-    }
     let _ = std::fs::remove_dir_all(&dir);
 }

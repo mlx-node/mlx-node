@@ -1,7 +1,7 @@
 use super::*;
 use crate::models::qwen3_5::dflash2_decode::tests::qwen38_27b_cfg;
 use crate::models::qwen3_5::dflash2_decode::{
-    PrefillSdpaKernels, pool_lane_transient, pool_verify_cycle_bytes,
+    pool_attention_bytes, pool_lane_transient, pool_verify_cycle_bytes,
 };
 
 /// Splash `dev/tests/engine/status_golden.json` `memory_plan` working set.
@@ -23,10 +23,6 @@ const SPLASH_QWEN38_LANE: u64 = 356_122_624;
 /// `qwen35_runway_blocks` on the 27B: 2,048 tokens of 16-token blocks and
 /// one GDN cell in 1 MiB blocks.
 const QWEN38_RUNWAY_BLOCKS: u32 = 128 + 147;
-const KERNELS: PrefillSdpaKernels = PrefillSdpaKernels {
-    d256_full: false,
-    portable_d256: true,
-};
 
 fn footprint(working_set: u64, active: u64, max_memory: Option<u64>) -> MemoryFootprint {
     MemoryFootprint {
@@ -55,7 +51,7 @@ fn qwen38_plan(
 ) -> Result<MemoryPlan, PlanError> {
     let cfg = qwen38_27b_cfg();
     assert_eq!(cfg.recurrent_state_bytes(), QWEN38_CELL);
-    let pool_transient = |window| pool_lane_transient(&cfg, KvFormat::Bf16, KERNELS, None, window);
+    let pool_transient = |window| pool_lane_transient(&cfg, None, window);
     let pool = PoolInput {
         shape: LaneShape {
             trained: 262_144,
@@ -196,11 +192,12 @@ fn qwen38_27b_lane_bytes_against_splash() {
 /// The M3 Pro plan. hard 23,568,633,036, fixed 17,357 MiB with 64 MiB of
 /// staging and the 768 MiB reserves, dynamic 4,496,084,172. Pool lane: the
 /// lane state lives outside the pool, the pool keeps 1/17 for its last grow
-/// and pays the last prefill chunk's scratch with the pool SDPA gather
-/// (792,403,968 at the window), so 3,186 blocks and an AR window of 48,601.
-/// Mutations: no grow copy in `LaneKv::Pool` → red (3,363 blocks); drop the
-/// attention term from `pool_lane_transient` → red (3,648 blocks);
-/// scratch rows 0 in `plan_lane` → red (transient 792,461,312).
+/// and pays the last prefill chunk's scratch with the in-place attention's
+/// workspace bound, query staging, output and K / V rows (386,269,184, no
+/// window term), so 3,550 blocks and an AR window of 54,425. Mutations: no
+/// grow copy in `LaneKv::Pool` → red (3,772 blocks); drop the attention
+/// term from `pool_lane_transient` → red (3,648 blocks); scratch rows 0 in
+/// `plan_lane` → red (window 54,432).
 #[test]
 fn m3_pro_plan_prices_every_term() {
     let plan = m3_pro_plan();
@@ -209,11 +206,11 @@ fn m3_pro_plan_prices_every_term() {
     assert_eq!(plan.fixed_bytes, M3_PRO_ACTIVE + STAGING + 768 * MIB);
     assert_eq!(plan.dynamic_budget_bytes, 4_496_084_172);
     let pool = plan.pool.expect("pool");
-    assert_eq!(pool.max_blocks, 3_186);
-    assert_eq!(pool.max_mib(), 3_186);
+    assert_eq!(pool.max_blocks, 3_550);
+    assert_eq!(pool.max_mib(), 3_550);
     assert_eq!(pool.runway_blocks, QWEN38_RUNWAY_BLOCKS);
-    assert_eq!(pool.lane.transient_bytes, 792_403_968);
-    assert_eq!(pool.lane.window.maximum(), 48_601);
+    assert_eq!(pool.lane.transient_bytes, 386_269_184);
+    assert_eq!(pool.lane.window.maximum(), 54_425);
     assert_eq!(pool.lane.window.bound(), "memory");
     assert!(plan.flat.is_none());
 }
@@ -221,20 +218,20 @@ fn m3_pro_plan_prices_every_term() {
 /// One request at the pool window fits the dynamic budget with the lane's
 /// GDN cell outside the pool (Splash `availableForOneRequestKv = dynamic -
 /// laneStateBytes`): the pool at its maximum, its last grow's copy, the cell
-/// and the transient at the window. At the lane minimum: 231 blocks, window
-/// 1,314, transient 287,776,768; on the M3 Pro: 3,186 / 48,601 /
-/// 792,403,968. Mutation: leave `lane_bytes` out of the `LaneKv::Pool`
-/// budget → red (271 blocks, 153,935,872 over at the minimum).
+/// and the transient at the window. At the lane minimum: 229 blocks, window
+/// 1,305, transient 264,622,080; on the M3 Pro: 3,550 / 54,425 /
+/// 386,269,184. Mutation: leave `lane_bytes` out of the `LaneKv::Pool`
+/// budget → red (153,886,720 over dynamic at the minimum).
 #[test]
 fn pool_lane_peak_fits_dynamic() {
     let minimum = qwen38_plan(
-        footprint(M3_PRO_WORKING_SET, active_for_dynamic(699_203_584), None),
+        footprint(M3_PRO_WORKING_SET, active_for_dynamic(674_430_976), None),
         None,
     )
     .expect("at the lane minimum");
     for (plan, blocks, window, transient) in [
-        (minimum, 231, 1_314, 287_776_768),
-        (m3_pro_plan(), 3_186, 48_601, 792_403_968),
+        (minimum, 229, 1_305, 264_622_080),
+        (m3_pro_plan(), 3_550, 54_425, 386_269_184),
     ] {
         let pool = plan.pool.expect("pool");
         let pool_bytes = u64::from(pool.max_blocks) * MIB;
@@ -251,18 +248,18 @@ fn pool_lane_peak_fits_dynamic() {
 }
 
 /// A planned pool under the config floor still validates (Splash has no
-/// pool floor): the 27B pool at the lane minimum is 231 MiB and carries
-/// 256; the M3 Pro pool carries its own 3,186. Mutation: `config_mib`
-/// returns `max_mib()` → red (231 vs 256).
+/// pool floor): the 27B pool at the lane minimum is 229 MiB and carries
+/// 256; the M3 Pro pool carries its own 3,550. Mutation: `config_mib`
+/// returns `max_mib()` → red (229 vs 256).
 #[test]
 fn pool_below_the_config_floor_validates() {
     let minimum = qwen38_plan(
-        footprint(M3_PRO_WORKING_SET, active_for_dynamic(699_203_584), None),
+        footprint(M3_PRO_WORKING_SET, active_for_dynamic(674_430_976), None),
         None,
     )
     .expect("at the lane minimum");
     let cfg = qwen38_27b_cfg();
-    for (plan, max_mib, config_mib) in [(minimum, 231, 256), (m3_pro_plan(), 3_186, 3_186)] {
+    for (plan, max_mib, config_mib) in [(minimum, 229, 256), (m3_pro_plan(), 3_550, 3_550)] {
         let pool = plan.pool.expect("pool");
         assert_eq!(pool.max_mib(), max_mib);
         assert_eq!(pool.config_mib(), config_mib);
@@ -282,52 +279,67 @@ fn pool_below_the_config_floor_validates() {
 
 /// With a draft the pool lane's transient is the larger of the tapped
 /// prefill chunk and the 8-row pool verify cycle with the free pool MLX
-/// keeps of it (twice the cycle, `decode_cache_limit`). On the 27B int8
-/// pool at the one window (94,201) the chunk wins: scratch 276,824,064,
-/// varlen 142,999,552, taps 104,857,600; the cycle is core 43,188,224 and
-/// varlen 103,665,664. At 512 keys the cycle wins: 110,395,392 x 3.
-/// Mutation: drop the `decode_cache_limit` term from `pool_lane_transient`
-/// → red (168,820,736 at 512: the chunk wins).
+/// keeps of it (twice the cycle, `decode_cache_limit`). On the 27B pool at
+/// 94,201 keys the chunk wins: scratch 276,824,064, the prefill attention
+/// 109,445,120, taps 104,857,600; the cycle is core 43,188,224 and the
+/// verify attention 25,886,720. At 512 keys the cycle (the same 69,074,944,
+/// no window term) wins: x 3. Mutation: drop the `decode_cache_limit` term
+/// from `pool_lane_transient` → red (160,825,344 at 512: the chunk wins).
 #[test]
 fn transient_charges_the_decode_free_pool() {
     let cfg = qwen38_27b_cfg();
-    let cycle = |window| pool_verify_cycle_bytes(&cfg, KvFormat::Int8, KERNELS, window);
-    let lane = |window| {
-        pool_lane_transient(
-            &cfg,
-            KvFormat::Int8,
-            KERNELS,
-            Some(QWEN38_DRAFT_TAPS),
-            window,
-        )
-    };
-    assert_eq!(cycle(94_201), 43_188_224 + 103_665_664);
-    assert_eq!(lane(94_201), 276_824_064 + 142_999_552 + 104_857_600);
-    assert_eq!(cycle(512), 110_395_392);
-    assert_eq!(lane(512), 3 * 110_395_392);
+    let cycle = |window| pool_verify_cycle_bytes(&cfg, window);
+    let lane = |window| pool_lane_transient(&cfg, Some(QWEN38_DRAFT_TAPS), window);
+    assert_eq!(cycle(94_201), 43_188_224 + 25_886_720);
+    assert_eq!(lane(94_201), 276_824_064 + 109_445_120 + 104_857_600);
+    assert_eq!(cycle(512), 43_188_224 + 25_886_720);
+    assert_eq!(lane(512), 3 * 69_074_944);
 }
 
-/// One 2,048-row chunk on the bf16 pool: scratch 276,824,064 and the pool
-/// gather (four K/V copies, two query copies and the fixed overhead,
-/// 134,217,728); the draft taps 5 layers of 5,120 bf16 hidden rows
+/// One 2,048-row chunk: scratch 276,824,064 and the in-place attention
+/// (109,445,120); the draft taps 5 layers of 5,120 bf16 hidden rows
 /// (104,857,600), and at 4,000 rows still one chunk of them. Mutations:
 /// drop the taps in `pool_lane_transient` → red (2,048 rows); taps of the
 /// whole window instead of one chunk → red (204,800,000 at 4,000 rows).
 #[test]
 fn chunk_transient_counts_one_chunk_of_taps() {
     let cfg = qwen38_27b_cfg();
-    let lane = |taps: Option<usize>, window| {
-        pool_lane_transient(&cfg, KvFormat::Bf16, KERNELS, taps, window)
-    };
-    assert_eq!(lane(None, 2_048), 276_824_064 + 134_217_728);
+    let lane = |taps: Option<usize>, window| pool_lane_transient(&cfg, taps, window);
+    assert_eq!(lane(None, 2_048), 276_824_064 + 109_445_120);
     assert_eq!(
         lane(Some(QWEN38_DRAFT_TAPS), 2_048),
-        276_824_064 + 134_217_728 + 104_857_600
+        276_824_064 + 109_445_120 + 104_857_600
     );
     assert_eq!(
         lane(Some(QWEN38_DRAFT_TAPS), 4_000) - lane(None, 4_000),
         104_857_600
     );
+}
+
+/// The pool attention term is Splash's workspace bound with the query
+/// staging, the output and the chunk's K / V rows (Splash `ChunkKeys`,
+/// `ChunkValues`), for either page format and any window: 109,445,120 for a
+/// 2,048-row 27B chunk, 25,886,720 for its 8-row verify, and the tapped
+/// prefill chunk past 2,048 rows does not grow with the window. Mutations:
+/// X1, the query staging and output dropped → red; K1, the K / V rows
+/// dropped → red.
+#[test]
+fn pool_attention_term_is_the_splash_workspace() {
+    use mlx_paged_attn::prefill_plan::Pass;
+    let cfg = qwen38_27b_cfg();
+    assert_eq!(
+        pool_attention_bytes(&cfg, 2_048, Pass::Prefill),
+        109_445_120
+    );
+    assert_eq!(pool_attention_bytes(&cfg, 8, Pass::Verify), 25_886_720);
+    let chunk = pool_lane_transient(&cfg, Some(QWEN38_DRAFT_TAPS), 2_048);
+    for window in [4_096, 94_201, 262_144] {
+        assert_eq!(
+            pool_lane_transient(&cfg, Some(QWEN38_DRAFT_TAPS), window),
+            chunk,
+            "window {window}"
+        );
+    }
 }
 
 /// An explicit pool size is checked in blocks against the plan's, printed
@@ -342,13 +354,13 @@ fn explicit_pool_above_the_plan_is_refused() {
         err,
         PlanError::PoolAbovePlan {
             requested_mib: 16_384,
-            plan_mib: 3_186,
+            plan_mib: 3_550,
             bound: MemoryBound::DeviceMemory,
         }
     );
     let message = err.message("Qwen3.5");
     assert!(message.contains("this Mac's memory"), "{message}");
-    assert!(message.contains("at most 3186"), "{message}");
+    assert!(message.contains("at most 3550"), "{message}");
 
     let lowered = footprint(M3_PRO_WORKING_SET, M3_PRO_ACTIVE, Some(20 * GIB));
     let err = qwen38_plan(lowered, Some(16_384)).expect_err("above the plan");
@@ -368,8 +380,8 @@ fn explicit_pool_above_the_plan_is_refused() {
         plan.max_memory_ignored()
     );
 
-    let at_plan = qwen38_plan(m3, Some(3_186)).expect("at the plan");
-    assert_eq!(at_plan.pool.expect("pool").max_blocks, 3_186);
+    let at_plan = qwen38_plan(m3, Some(3_550)).expect("at the plan");
+    assert_eq!(at_plan.pool.expect("pool").max_blocks, 3_550);
 
     let plan = qwen38_plan(m3, Some(2_048)).expect("below the plan");
     let pool = plan.pool.expect("pool");
@@ -393,7 +405,7 @@ fn active_for_dynamic(dynamic: u64) -> u64 {
 }
 
 /// A draftless load's pool lane needs one cell, Splash's bf16 runway of 64
-/// pages (134,217,728) and a 2,048-token turn's transient (411,041,792).
+/// pages (134,217,728) and a 2,048-token turn's transient (386,269,184).
 /// Mutation: skip the pool lane's minimum in `evaluate` → red (`Ok` one
 /// byte under).
 #[test]
@@ -403,7 +415,7 @@ fn draftless_plan_checks_the_pool_lane() {
         .pool
         .expect("pool");
     let minimum = pool.lane.minimum_bytes;
-    assert_eq!(minimum, QWEN38_CELL + 134_217_728 + 411_041_792);
+    assert_eq!(minimum, QWEN38_CELL + 134_217_728 + 386_269_184);
     let under = footprint(M3_PRO_WORKING_SET, active_for_dynamic(minimum - 1), None);
     assert!(
         matches!(
@@ -416,7 +428,7 @@ fn draftless_plan_checks_the_pool_lane() {
     assert!(qwen38_plan(at, None).is_ok());
 }
 
-/// Mutations: skip the pool rule in `audit` → red (`Ok` at 3,310 blocks);
+/// Mutations: skip the pool rule in `audit` → red (`Ok` at 3,674 blocks);
 /// skip the hard-budget rule → red (`Ok` one byte over).
 #[test]
 fn audit_refuses_a_footprint_over_hard() {
@@ -428,7 +440,7 @@ fn audit_refuses_a_footprint_over_hard() {
     };
     assert_eq!(audit(&plan, measured), Ok(()));
     let over_pool = MeasuredMemory {
-        pool_bytes: 3_310 * MIB,
+        pool_bytes: 3_674 * MIB,
         ..measured
     };
     let err = audit(&plan, over_pool).expect_err("pool over its plan");
@@ -454,7 +466,7 @@ fn m5_max_plan_is_bound_by_the_model() {
     let plan = qwen38_plan(footprint(96 * GIB, M3_PRO_ACTIVE, None), None).expect("plan");
     let pool = plan.pool.expect("pool");
     assert_eq!(pool.lane.window.maximum(), 262_144);
-    assert_eq!(pool.max_blocks, 58_140);
+    assert_eq!(pool.max_blocks, 60_075);
     assert_eq!(pool.lane.window.bound(), "model");
 }
 
@@ -480,8 +492,8 @@ fn describe_lists_every_term() {
         "hard budget: 23568633036 bytes (22476.80 MiB) (this Mac's memory)",
         "fixed runtime: 19072548864 bytes",
         "elastic state/KV budget: 4496084172 bytes",
-        "KV pool: 3186 blocks of 1048576 bytes (1.00 MiB) at most, 275 at the start",
-        "pool lane: context 48601 tokens (memory; window 262144, resident 48601)",
+        "KV pool: 3550 blocks of 1048576 bytes (1.00 MiB) at most, 275 at the start",
+        "pool lane: context 54425 tokens (memory; window 262144, resident 54425)",
     ] {
         assert!(text.contains(line), "{line}\n{text}");
     }

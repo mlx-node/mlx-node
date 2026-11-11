@@ -263,32 +263,6 @@ pub(crate) fn estimate_paged_pool_sdpa_bytes(
     dtype_bytes: u64,
     d256_full_sdpa_available: bool,
 ) -> u64 {
-    estimate_paged_pool_sdpa_bytes_with_portable(
-        query_tokens,
-        total_context,
-        num_query_heads,
-        num_kv_heads,
-        head_dim,
-        dtype_bytes,
-        d256_full_sdpa_available,
-        false,
-    )
-}
-
-/// The portable D256 tile handles ragged queries and never allocates scores.
-/// Keep its capability separate from NAX's >=1024 query gate so small
-/// continuations on M1-M4 receive the correct estimate.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn estimate_paged_pool_sdpa_bytes_with_portable(
-    query_tokens: u64,
-    total_context: u64,
-    num_query_heads: u64,
-    num_kv_heads: u64,
-    head_dim: u64,
-    dtype_bytes: u64,
-    d256_full_sdpa_available: bool,
-    portable_d256_available: bool,
-) -> u64 {
     let one_kv = total_context
         .saturating_mul(num_kv_heads)
         .saturating_mul(head_dim)
@@ -301,17 +275,6 @@ pub(crate) fn estimate_paged_pool_sdpa_bytes_with_portable(
         .saturating_mul(4)
         .saturating_add(one_query.saturating_mul(2))
         .saturating_add(PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES);
-    if portable_d256_available
-        && head_dim == 256
-        && dtype_bytes == 2
-        && query_tokens > 8
-        && total_context >= query_tokens
-        && num_kv_heads > 0
-        && num_query_heads > 0
-        && num_query_heads.is_multiple_of(num_kv_heads)
-    {
-        return gathered;
-    }
     if mlx_sdpa_uses_fused_kernel(
         query_tokens,
         num_query_heads,
@@ -330,40 +293,6 @@ pub(crate) fn estimate_paged_pool_sdpa_bytes_with_portable(
         .saturating_mul(head_dim)
         .saturating_mul(4);
     gathered.saturating_add(scores).saturating_add(fp32_output)
-}
-
-/// Row-partitions an int8 varlen prefill's f32 partials hold whatever the
-/// history: the dispatch tiles the query rows to this (Splash
-/// `PagedAttention::prefillWorkspace`, the row-splits of a 2,048-row chunk).
-pub(crate) const INT8_VARLEN_WORKSPACE_ROWS: u64 = 2048;
-
-/// Peak bytes of an int8 varlen prefill of `query_tokens` rows over
-/// `total_context`: the bf16 output, and above one 512-token partition the
-/// f32 partials and softmax state of at most
-/// [`INT8_VARLEN_WORKSPACE_ROWS`] row-partitions.
-pub(crate) fn estimate_int8_varlen_prefill_bytes(
-    query_tokens: u64,
-    total_context: u64,
-    num_query_heads: u64,
-    head_dim: u64,
-) -> u64 {
-    let output = query_tokens
-        .saturating_mul(num_query_heads)
-        .saturating_mul(head_dim)
-        .saturating_mul(2);
-    if total_context <= 512 {
-        return output.saturating_add(PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES);
-    }
-    let partitions = total_context.div_ceil(512);
-    let row_partitions = query_tokens
-        .saturating_mul(partitions)
-        .min(INT8_VARLEN_WORKSPACE_ROWS.max(partitions));
-    let workspace = row_partitions
-        .saturating_mul(num_query_heads)
-        .saturating_mul(head_dim.saturating_mul(4).saturating_add(8));
-    output
-        .saturating_add(workspace)
-        .saturating_add(PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES)
 }
 
 /// Peak auxiliary storage used by the varlen paged kernel. Above one 512-token
@@ -494,5 +423,108 @@ pub(crate) fn live_headroom(
         metal_recommended_working_set_bytes: snapshot.metal_recommended_working_set_bytes,
         metal_current_allocated_bytes: snapshot.metal_current_allocated_bytes,
         paged_pool_allocated_bytes: snapshot.paged_pool_allocated_bytes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mlx_sdpa_fused_shape_gate_matches_metal_dispatcher() {
+        assert!(mlx_sdpa_uses_fused_kernel(2_048, 24, 4, 128, false));
+        assert!(!mlx_sdpa_uses_fused_kernel(2_048, 24, 4, 256, false));
+        assert!(mlx_sdpa_uses_fused_kernel(2_048, 24, 4, 256, true));
+        assert!(!mlx_sdpa_uses_fused_kernel(1_023, 24, 4, 256, true));
+        assert!(mlx_sdpa_uses_fused_kernel(1_024, 24, 4, 256, true));
+        assert!(mlx_sdpa_uses_fused_kernel(1, 24, 4, 256, false));
+        assert!(!mlx_sdpa_uses_fused_kernel(8, 24, 4, 256, true));
+        assert!(!mlx_sdpa_uses_fused_kernel(2_048, 24, 5, 128, true));
+    }
+
+    #[test]
+    fn allocator_and_metal_headroom_are_independent_bounds() {
+        assert_eq!(
+            select_live_prefill_headroom(None, Some(16 * 1024 * 1024 * 1024)),
+            Some(16 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(select_live_prefill_headroom(Some(12), Some(8)), Some(8));
+        assert_eq!(select_live_prefill_headroom(Some(12), None), Some(12));
+        assert_eq!(select_live_prefill_headroom(None, None), None);
+    }
+
+    #[test]
+    fn live_headroom_includes_external_metal_pool_and_reclaimable_cache() {
+        let gib = 1024 * 1024 * 1024;
+        let headroom = live_headroom(
+            PagedPrefillMemorySnapshot {
+                allocator_active_bytes: Some(20 * gib),
+                allocator_cached_bytes: Some(4 * gib),
+                allocator_limit_bytes: Some(120 * gib),
+                metal_recommended_working_set_bytes: Some(100 * gib),
+                metal_current_allocated_bytes: Some(40 * gib),
+                paged_pool_allocated_bytes: Some(16 * gib),
+            },
+            None,
+        );
+
+        // MLX GC ceiling: min(120 GiB, 95% of 100 GiB) - 20 GiB active.
+        assert_eq!(headroom.allocator_ceiling_bytes, Some(95 * gib));
+        assert_eq!(headroom.allocator_available_bytes, Some(75 * gib));
+        // Metal sees the external 16 GiB pool in currentAllocatedSize; only
+        // the 4 GiB MLX cache is reclaimable.
+        assert_eq!(headroom.metal_available_bytes, Some(64 * gib));
+        assert_eq!(headroom.selected_bytes, Some(64 * gib));
+    }
+
+    /// A memory plan's ceiling replaces the 95% working-set rule on both
+    /// paths. Mutation: keep the recommended working set on the Metal path
+    /// in `live_headroom` → red (64 GiB).
+    #[test]
+    fn live_headroom_under_the_plan_ceiling() {
+        let gib = 1024 * 1024 * 1024;
+        let headroom = live_headroom(
+            PagedPrefillMemorySnapshot {
+                allocator_active_bytes: Some(20 * gib),
+                allocator_cached_bytes: Some(4 * gib),
+                allocator_limit_bytes: Some(120 * gib),
+                metal_recommended_working_set_bytes: Some(100 * gib),
+                metal_current_allocated_bytes: Some(40 * gib),
+                paged_pool_allocated_bytes: Some(16 * gib),
+            },
+            Some(50 * gib),
+        );
+        assert_eq!(headroom.allocator_ceiling_bytes, Some(50 * gib));
+        assert_eq!(headroom.allocator_available_bytes, Some(30 * gib));
+        assert_eq!(headroom.metal_available_bytes, Some(14 * gib));
+        assert_eq!(headroom.selected_bytes, Some(14 * gib));
+    }
+
+    #[test]
+    fn missing_metal_probe_subtracts_known_external_pool_from_allocator() {
+        let gib = 1024 * 1024 * 1024;
+        let headroom = live_headroom(
+            PagedPrefillMemorySnapshot {
+                allocator_active_bytes: Some(70 * gib),
+                allocator_cached_bytes: Some(2 * gib),
+                allocator_limit_bytes: Some(100 * gib),
+                paged_pool_allocated_bytes: Some(16 * gib),
+                ..PagedPrefillMemorySnapshot::default()
+            },
+            None,
+        );
+        assert_eq!(headroom.allocator_available_bytes, Some(14 * gib));
+        assert_eq!(headroom.selected_bytes, Some(14 * gib));
+
+        let exhausted = live_headroom(
+            PagedPrefillMemorySnapshot {
+                allocator_active_bytes: Some(95 * gib),
+                allocator_limit_bytes: Some(100 * gib),
+                paged_pool_allocated_bytes: Some(16 * gib),
+                ..PagedPrefillMemorySnapshot::default()
+            },
+            None,
+        );
+        assert_eq!(exhausted.selected_bytes, Some(0));
     }
 }

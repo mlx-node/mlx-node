@@ -32,8 +32,7 @@ plan (`crates/mlx-core/src/engine/memory_plan.rs`, Splash
   state and its peak transient, in whole blocks. The recurrent state lives
   outside the pool (Splash `availableForOneRequestKv = dynamic -
   laneStateBytes`); the scheduler still also charges it inside the pool, so
-  the window pays it twice (48,601 against Splash's 50,585 on the M3 Pro
-  inputs).
+  the window pays it twice (54,425 on the M3 Pro inputs; 56,793 paid once).
 
 The peak transient is one prefill chunk of at most **2,048 rows**
 (Splash `ExecutionLimits::prefillTokenBudget`). Every Qwen3.5 dense and MoE
@@ -41,6 +40,25 @@ paged prefill, text and media, runs in chunks of that size
 (`forward::paged_prefill_chunk_rows`); `MLX_PAGED_PREFILL_CHUNK_SIZE` can only
 make the chunks smaller, a larger value is capped at 2,048. The GDN checkpoint
 cuts come on top of the chunk cuts.
+
+Each chunk, the first one and a cache hit alike, and each MTP or DFlash2
+verify block stores its rows into the pool first and then attends in place
+over the pool pages (`attention/paged_prefill_attention.metal`, Splash
+`QwenTarget::addPrefillMixer`): 8-row tiles with the query group fused (two
+parts at a group of 16), 32-token pages read through the block table, history
+splits by Splash 1.6's rule and a reduce in split order
+(`mlx_paged_attn::prefill_plan`), on int8 and bf16 pages alike. The chunk's
+own rows are read back as stored, int8 · scale on an int8 pool. The plan
+charges the kernel's workspace bound with the query staging, the output and
+the chunk's K / V rows (Splash's `RuntimeArenas` attention tensors for one
+lane), which does not grow with the window: 109,445,120 B for a 2,048-row 27B
+chunk and 25,886,720 B for its 8-row verify. A pool needs a kernel instance (a
+query group of 4, 6, 8 or 16, head 128 or 256, 16- or 32-token blocks); any
+other geometry fails and names `useBlockPagedCache: false`. Every GPU family
+runs the kernel (Splash's Apple9 floor is engine-wide, not this kernel's);
+M1 and M2 take the Apple9 pages-per-split row, unmeasured there. A pipeline
+that does not build fails the turn with the kernel and the Apple GPU family
+named.
 
 Every load starts the pool at the **runway**: 2048 tokens of blocks plus one
 GDN cell (`qwen35_runway_blocks`, Splash `warmupKvPages`; 275 blocks on the
