@@ -130,6 +130,7 @@ pub(crate) fn finish_paged_turn<B: PagedBackend>(
         think_end_id,
         think_end_str: think_end_str_owned,
         think_end_extra_ids,
+        ..
     } = backend.think_end_for_turn(args.config, args.tokenizer);
     let mut result = match backend.finalize_turn(FinalizeArgs {
         tokenizer: args.tokenizer,
@@ -182,11 +183,7 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     let thinking = args.thinking;
     let is_delta = args.plan.is_delta;
     let is_streaming = args.sink.is_some();
-    let ThinkEndResolution {
-        think_end_id,
-        think_end_extra_ids,
-        ..
-    } = backend.think_end_for_turn(args.config, &tokenizer);
+    let close = backend.think_end_for_turn(args.config, &tokenizer);
 
     // Delta turns force `reuse_cache = true` (the engine's delta guards
     // already rejected an explicit `Some(false)`); fresh turns resolve
@@ -259,8 +256,7 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     profiler.set_prompt_tokens(suffix_len as u32);
     profiler.snapshot_memory_before();
 
-    let mut reasoning_tracker =
-        ReasoningTracker::from_setup_multi(&thinking, think_end_id, think_end_extra_ids);
+    let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, &close);
     let extra_eos_ids = backend.extra_eos_ids();
     let eos_before_emit = backend.eos_before_emit();
 

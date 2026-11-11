@@ -64,11 +64,8 @@ pub(crate) enum TurnKind {
 pub(crate) struct AdmittedPagedTurn {
     pub tokenizer: Arc<crate::tokenizer::Qwen3Tokenizer>,
     pub eos_id: u32,
-    pub think_end_id: Option<u32>,
-    pub think_end_str: Option<String>,
-    /// Additional ids that also end reasoning (K2-Horizon's other
-    /// `</ifm|think*>` family members). Empty for single-tag families.
-    pub think_end_extra_ids: Vec<u32>,
+    /// The turn's close of thinking (`ChatBackend::think_end_for_turn`).
+    pub close: ThinkEndResolution,
     pub config: ChatConfig,
     pub params: ChatParams,
     pub thinking: ThinkingSetup,
@@ -987,11 +984,7 @@ pub(crate) fn admit_paged_turn<B: ChatBackend>(
     // Per-turn reasoning close token — the default hook answers the
     // tokenizer-global `</think>`; K2-Horizon's override resolves the
     // effort-dependent `</ifm|think*>` variant.
-    let ThinkEndResolution {
-        think_end_id,
-        think_end_str,
-        think_end_extra_ids,
-    } = backend.think_end_for_turn(&config, &tokenizer);
+    let close = backend.think_end_for_turn(&config, &tokenizer);
     let params = backend.resolve_params(&config);
     let template_thinking_enabled =
         crate::engine::params::resolve_enable_thinking(&config).unwrap_or(true);
@@ -1104,9 +1097,7 @@ pub(crate) fn admit_paged_turn<B: ChatBackend>(
     Ok(AdmittedPagedTurn {
         tokenizer,
         eos_id,
-        think_end_id,
-        think_end_str,
-        think_end_extra_ids,
+        close,
         config,
         params,
         thinking,
@@ -1143,9 +1134,7 @@ fn chat_turn_core<B: ChatBackend>(
     let admitted = admit_paged_turn(backend, messages, config, turn_kind, streaming.is_some())?;
     let tokenizer = admitted.tokenizer;
     let eos_id = admitted.eos_id;
-    let think_end_id = admitted.think_end_id;
-    let think_end_str = admitted.think_end_str;
-    let think_end_extra_ids = admitted.think_end_extra_ids;
+    let close = admitted.close;
     let mut config = admitted.config;
     let mut p = admitted.params;
     let tokens = admitted.tokens;
@@ -1277,8 +1266,7 @@ fn chat_turn_core<B: ChatBackend>(
     profiler.set_prompt_tokens(prefill_tokens.len() as u32);
     profiler.snapshot_memory_before();
 
-    let mut reasoning_tracker =
-        ReasoningTracker::from_setup_multi(&thinking, think_end_id, think_end_extra_ids.clone());
+    let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, &close);
 
     // Stop set + streaming-order knob, resolved ONCE per turn.
     let extra_eos_ids = backend.extra_eos_ids();
@@ -1469,9 +1457,9 @@ fn chat_turn_core<B: ChatBackend>(
         tokenizer: &tokenizer,
         generated_tokens: &generated_tokens,
         finish_reason,
-        think_end_id,
-        think_end_str: think_end_str.as_deref(),
-        think_end_extra_ids: &think_end_extra_ids,
+        think_end_id: close.think_end_id,
+        think_end_str: close.think_end_str.as_deref(),
+        think_end_extra_ids: &close.think_end_extra_ids,
         performance,
         include_reasoning: p.include_reasoning,
         thinking_enabled: thinking.enabled,

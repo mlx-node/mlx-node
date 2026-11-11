@@ -640,10 +640,9 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
 
     // Materialize the prefill-sampled seed once; it is the first anchor.
     y.eval();
-    let mut anchor: u32 = if tracker.should_force_think_end() {
-        tracker.forced_token_id()?
-    } else {
-        y.item_at_int32(0)? as u32
+    let mut anchor: u32 = match tracker.take_forced_token() {
+        Some(forced) => forced,
+        None => y.item_at_int32(0)? as u32,
     };
 
     // `last_in_cache` default `true`: a zero-budget exit emits nothing, so
@@ -855,7 +854,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
 
         // Reserve the boundary token too: no verified/committed speculative
         // prefix may cross the remaining reasoning budget. At zero, verify only
-        // the existing anchor and replace the uncommitted boundary with </think>.
+        // the existing anchor; the boundary is the thinking end's next token.
         if let Some(remaining_thinking) = tracker.unforced_token_budget() {
             let capped = l_cap.min(remaining_thinking.saturating_sub(1));
             if capped != l_cap {
@@ -863,7 +862,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             }
             l_cap = capped;
         }
-        let force_think_end = tracker.should_force_think_end();
+        let forced = tracker.take_forced_token();
 
         // `L_cap == 0` (remaining == 1): skip propose entirely — the cycle
         // degenerates to a single AR step THROUGH verify (verify_ids =
@@ -952,10 +951,10 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         // boundary token (bonus on full accept, residual on rejection).
         profiler.begin("dspark_accept");
         let mut device_budget_observation = None;
-        let accept_res = if force_think_end {
+        let accept_res = if let Some(token) = forced {
             // Force the verify graph before retaining its anchor's cache state.
             logits.eval();
-            Ok((0, tracker.forced_token_id()?))
+            Ok((0, token))
         } else if tf_ids.is_some() {
             tf.accept(&logits, &mut proposal, generated)
         } else if let Some(budget) = step.device_verification_budget() {
@@ -1311,7 +1310,7 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
     let thinking = args.thinking;
     let is_delta = args.plan.is_delta;
     let is_streaming = args.sink.is_some();
-    let think_end_id = tokenizer.think_end_id();
+    let close = backend.think_end_for_turn(args.config, &tokenizer);
 
     // The session core's params (a family's context preflight may have
     // clamped them), plus the stop-set `run_dspark_turn` reads from
@@ -1366,7 +1365,7 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
     profiler.set_prompt_tokens(suffix_len as u32);
     profiler.snapshot_memory_before();
 
-    let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, think_end_id);
+    let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, &close);
     let stream_skip_special = backend.stream_skip_special_tokens();
     // One streaming bundle — detokenizer + cursors + emitter — built only
     // when a sink exists so the sync path never runs the emitter hook.
@@ -2276,7 +2275,7 @@ mod tests {
             rng,
             cancel_flag,
             turn_token_observer,
-            ReasoningTracker::new(false, None, None),
+            ReasoningTracker::new(false, None, &[]),
         )
     }
 
@@ -2740,7 +2739,10 @@ mod tests {
                     cycles.push(script);
                     remaining -= depth + 1;
                 }
-                if budget > 0 {
+                // One one-row cycle per forced end token after the first
+                // (budget 0 forces the first as the prefill anchor).
+                let forced_cycles = if budget > 0 { 2 } else { 1 };
+                for _ in 0..forced_cycles {
                     cycles.push(CycleScript::greedy(vec![], vec![5]));
                 }
                 let mut backend = if sampled {
@@ -2764,7 +2766,7 @@ mod tests {
                     &mut rng,
                     None,
                     None,
-                    ReasoningTracker::new(true, Some(budget), Some(9)),
+                    ReasoningTracker::new(true, Some(budget), &[8, 9]),
                 );
                 assert!(
                     out.result.is_ok(),
@@ -2775,7 +2777,7 @@ mod tests {
                 if budget > 0 {
                     expected[0] = 4;
                 }
-                expected.extend([9, 0, 0, 0]);
+                expected.extend([8, 9, 0, 0]);
                 assert_eq!(
                     out.generated, expected,
                     "budget={budget}, sampled={sampled}"
@@ -2786,16 +2788,26 @@ mod tests {
                     out.generated.len() - 1,
                     "every token except the final boundary is cached exactly once"
                 );
-                let cached_closers = ledger
+                let verifies: Vec<&Vec<u32>> = ledger
                     .iter()
-                    .filter(|call| {
-                        matches!(call,
-                    Call::Verify { ids } if ids.contains(&9))
+                    .filter_map(|call| match call {
+                        Call::Verify { ids } => Some(ids),
+                        _ => None,
                     })
-                    .count();
-                assert_eq!(
-                    cached_closers, 1,
-                    "the forced closer enters the target cache exactly once"
+                    .collect();
+                for id in [8, 9] {
+                    assert_eq!(
+                        verifies.iter().filter(|ids| ids.contains(&id)).count(),
+                        1,
+                        "forced {id} enters the target cache exactly once"
+                    );
+                }
+                // 8's own one-row verify forces 9, and 9 anchors the next verify.
+                let eight = verifies.iter().position(|ids| ids.as_slice() == [8]);
+                let nine = verifies.iter().position(|ids| ids.first() == Some(&9));
+                assert!(
+                    eight.is_some() && nine.is_some() && eight < nine,
+                    "budget={budget}, sampled={sampled}, verifies={verifies:?}"
                 );
             }
         }
@@ -3493,7 +3505,7 @@ mod tests {
         emitter: &mut dyn crate::engine::backend::StreamEmitter,
         turn_token_observer: Option<Box<dyn TurnTokenObserver>>,
     ) -> StreamOut {
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut profiler = DecodeProfiler::new("dspark_stream_test", "test");
         let mut generated: Vec<u32> = Vec::new();
         let mut token_history: Vec<u32> = Vec::new();

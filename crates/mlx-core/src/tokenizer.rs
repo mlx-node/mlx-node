@@ -440,6 +440,10 @@ pub struct Qwen3Tokenizer {
     think_end_id: Option<u32>,
     /// The actual think-end string (e.g., `"</think>"` or `"</longcat_think>"`).
     think_end_str: Option<String>,
+    /// The tokens a thinking budget ends thinking with, the close token last:
+    /// the chat template's close (Qwen: `"\n</think>"`), else the close token
+    /// alone; empty without a close token. See [`Self::probe_thinking_end`].
+    thinking_end: Arc<[u32]>,
     /// Family-specific control markers to strip from caller-supplied content, on
     /// top of the generic ChatML set. Empty for every family that has none —
     /// see [`Qwen3Tokenizer::detect_control_markers`].
@@ -543,7 +547,7 @@ impl Qwen3Tokenizer {
 
                 let control_markers = Self::detect_control_markers(&tokenizer);
 
-                Ok(Self {
+                Self {
                     tokenizer: Arc::new(tokenizer),
                     pad_token_id,
                     eos_token_id,
@@ -551,9 +555,12 @@ impl Qwen3Tokenizer {
                     chat_template,
                     think_end_id,
                     think_end_str,
+                    thinking_end: Arc::from([]),
                     control_markers,
                     generation_suffixes: Arc::default(),
-                })
+                }
+                .with_thinking_end()
+                .map_err(Error::from_reason)
             })
             .await
             .map_err(|join_err| {
@@ -1229,7 +1236,7 @@ impl Qwen3Tokenizer {
 
         let control_markers = Self::detect_control_markers(&tokenizer);
 
-        Ok(Self {
+        Self {
             tokenizer: Arc::new(tokenizer),
             pad_token_id,
             eos_token_id,
@@ -1237,9 +1244,11 @@ impl Qwen3Tokenizer {
             chat_template,
             think_end_id,
             think_end_str,
+            thinking_end: Arc::from([]),
             control_markers,
             generation_suffixes: Arc::default(),
-        })
+        }
+        .with_thinking_end()
     }
 
     /// Resolve special token IDs from tokenizer_config.json.
@@ -2840,12 +2849,15 @@ impl Qwen3Tokenizer {
 
         // Load chat template from tokenizer_config.json (in same directory)
         let chat_template = Self::load_chat_template(tokenizer_path);
-        Ok(Self::from_tokenizer(tokenizer, chat_template))
+        Self::from_tokenizer(tokenizer, chat_template)
     }
 
     /// A tokenizer built in memory (e.g. a GGUF-embedded vocabulary) with the
     /// checkpoint's chat template; the rest as [`Self::load_from_file_sync`].
-    pub(crate) fn from_tokenizer(tokenizer: Tokenizer, chat_template: Option<String>) -> Self {
+    pub(crate) fn from_tokenizer(
+        tokenizer: Tokenizer,
+        chat_template: Option<String>,
+    ) -> Result<Self> {
         let (think_end_id, think_end_str) = Self::detect_think_end(&tokenizer);
         let control_markers = Self::detect_control_markers(&tokenizer);
         Self {
@@ -2856,9 +2868,12 @@ impl Qwen3Tokenizer {
             chat_template,
             think_end_id,
             think_end_str,
+            thinking_end: Arc::from([]),
             control_markers,
             generation_suffixes: Arc::default(),
         }
+        .with_thinking_end()
+        .map_err(Error::from_reason)
     }
 
     /// Returns true if the tokenizer has a chat template loaded.
@@ -3217,6 +3232,7 @@ impl Clone for Qwen3Tokenizer {
             chat_template: self.chat_template.clone(),
             think_end_id: self.think_end_id,
             think_end_str: self.think_end_str.clone(),
+            thinking_end: self.thinking_end.clone(),
             control_markers: self.control_markers,
             generation_suffixes: self.generation_suffixes.clone(),
         }
@@ -3301,6 +3317,119 @@ impl Qwen3Tokenizer {
     /// Get the think-end string (e.g., `"</think>"` or `"</longcat_think>"`).
     pub fn think_end_str(&self) -> Option<&str> {
         self.think_end_str.as_deref()
+    }
+
+    /// This tokenizer's close of thinking for a turn: the close token, its tag,
+    /// and the tokens a thinking budget ends thinking with.
+    pub(crate) fn think_end(&self) -> crate::engine::backend::ThinkEndResolution {
+        crate::engine::backend::ThinkEndResolution {
+            think_end_id: self.think_end_id,
+            think_end_str: self.think_end_str.clone(),
+            thinking_end: self.thinking_end.clone(),
+            think_end_extra_ids: Vec::new(),
+        }
+    }
+
+    fn with_thinking_end(mut self) -> std::result::Result<Self, String> {
+        self.thinking_end = self.probe_thinking_end()?;
+        Ok(self)
+    }
+
+    /// What the chat template writes from the end of a reply's reasoning through
+    /// its close (Splash `chat_templates._thinking_end`: the same four messages,
+    /// tools on, no generation prompt), as tokens checked like Splash
+    /// `backend.thinking_end_tokens`: the close token last, no other added token,
+    /// at most [`crate::engine::gen_prompt::MAX_THINKING_END_TOKENS`]. A close that
+    /// breaks a rule fails the load (Splash `ThinkingEndError` refuses the start).
+    /// A template that renders no close, or fails to render the probe, ends
+    /// thinking with the close token alone (Splash `NativeBackend._thinking_budget`).
+    fn probe_thinking_end(&self) -> std::result::Result<Arc<[u32]>, String> {
+        let (Some(close_id), Some(tag)) = (self.think_end_id, self.think_end_str.as_deref()) else {
+            return Ok(Arc::from([]));
+        };
+        const REASONING: &str = "Look it up";
+        let message = |role: &str, content: &str| ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: None,
+            audio: None,
+        };
+        let messages = [
+            message("system", "Leading instructions"),
+            message("user", "First question"),
+            ChatMessage {
+                reasoning_content: Some(REASONING.to_string()),
+                tool_calls: Some(vec![ToolCall {
+                    id: Some("call_1".to_string()),
+                    name: "lookup".to_string(),
+                    arguments: r#"{"key": "alpha"}"#.to_string(),
+                }]),
+                ..message("assistant", "")
+            },
+            ChatMessage {
+                tool_call_id: Some("call_1".to_string()),
+                ..message("tool", "beta")
+            },
+        ];
+        let tools = [ToolDefinition {
+            r#type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "lookup".to_string(),
+                description: Some("Look up a key.".to_string()),
+                parameters: Some(FunctionParameters {
+                    r#type: "object".to_string(),
+                    properties: Some(r#"{"key": {"type": "string"}}"#.to_string()),
+                    required: Some(vec!["key".to_string()]),
+                }),
+            },
+        }];
+        let Ok(rendered) = self.render_chat_template_sync_with_content_order(
+            &messages,
+            Some(false),
+            Some(&tools),
+            None,
+            MultimodalContentOrder::TextThenMedia,
+            None,
+            RenderContextOptions::default(),
+        ) else {
+            return Ok(Arc::from([close_id]));
+        };
+        let Some(text) =
+            crate::engine::gen_prompt::thinking_end_from_render(&rendered, REASONING, tag)
+        else {
+            return Ok(Arc::from([close_id]));
+        };
+        let ids = Self::encode_internal(&self.tokenizer, text, Some(false))
+            .map_err(|e| e.reason)?
+            .get_ids()
+            .to_vec();
+        let added = self
+            .tokenizer
+            .get_added_vocabulary()
+            .get_added_tokens_decoder();
+        let Some((&last, before)) = ids.split_last() else {
+            return Err(format!(
+                "the thinking end {text:?} must end with {tag} and hold no other special token"
+            ));
+        };
+        if last != close_id || before.iter().any(|id| added.contains_key(id)) {
+            return Err(format!(
+                "the thinking end {text:?} must end with {tag} and hold no other special token"
+            ));
+        }
+        if ids.len() > crate::engine::gen_prompt::MAX_THINKING_END_TOKENS {
+            return Err(format!(
+                "the thinking end {text:?} takes {} tokens; the most is {}",
+                ids.len(),
+                crate::engine::gen_prompt::MAX_THINKING_END_TOKENS
+            ));
+        }
+        Ok(Arc::from(ids))
     }
 
     /// Get the `<|im_end|>` token ID, if the tokenizer has it in its vocab.
@@ -3864,6 +3993,7 @@ pub(crate) fn audio_test_tokenizer() -> Qwen3Tokenizer {
         chat_template: None,
         think_end_id: None,
         think_end_str: None,
+        thinking_end: Arc::from([]),
         control_markers: &[],
         generation_suffixes: Arc::default(),
     }

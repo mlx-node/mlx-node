@@ -1236,3 +1236,111 @@ fn cold_dflash2_prefill_reclaims_a_marked_live_chain() -> Result<()> {
     assert_eq!(adapter.current_token_count() as usize, prompt.len());
     Ok(())
 }
+
+/// A tiny tokenizer whose chat template ends thinking with `t13</think>`
+/// (`</think>` = 15, not special).
+fn closing_tokenizer() -> Arc<Qwen3Tokenizer> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "qwen35_closing_tokenizer_{}_{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut vocab: serde_json::Map<String, serde_json::Value> = (0..15)
+        .map(|i| (format!("t{i}"), serde_json::json!(i)))
+        .collect();
+    vocab.insert("</think>".into(), serde_json::json!(15));
+    let json = serde_json::json!({
+        "version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": [{
+            "id": 15, "content": "</think>", "single_word": false, "lstrip": false,
+            "rstrip": false, "normalized": false, "special": false,
+        }],
+        "normalizer": null, "pre_tokenizer": null, "post_processor": null, "decoder": null,
+        "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "t0" },
+    });
+    std::fs::write(
+        dir.join("tokenizer.json"),
+        serde_json::to_vec(&json).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("chat_template.jinja"),
+        "{%- for m in messages %}{%- if m.reasoning_content %}\
+         {{- m.reasoning_content + 't13</think>' }}{%- endif %}{{- m.content }}{%- endfor %}",
+    )
+    .unwrap();
+    let tok = Qwen3Tokenizer::from_file(&dir.join("tokenizer.json")).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    Arc::new(tok)
+}
+
+struct LastChunk(std::sync::Mutex<Option<crate::engine::types::ChatStreamChunk>>);
+impl crate::engine::backend::ChunkSink for LastChunk {
+    fn send(&self, chunk: Result<crate::engine::types::ChatStreamChunk>) {
+        if let Ok(chunk) = chunk
+            && chunk.done
+        {
+            *self.0.lock().unwrap() = Some(chunk);
+        }
+    }
+}
+
+/// The dense whole-turn cores (sync and stream) end a budget cut with the
+/// template's whole close, one token per step.
+/// Mutation M12: the cores force `</think>` alone → red on both.
+#[test]
+fn legacy_dense_cores_end_thinking_with_the_whole_close() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let tokenizer = closing_tokenizer();
+    assert_eq!(&*tokenizer.think_end().thinking_end, &[13, 15]);
+    let config = ChatConfig {
+        temperature: Some(0.0),
+        max_new_tokens: Some(4),
+        ..ChatConfig::default()
+    };
+    let thinking = ThinkingSetup {
+        enabled: true,
+        budget: Some(1),
+    };
+    for entry in ["sync", "stream"] {
+        let mut inner = fixture(0xDFA5_1831);
+        install_pool(&mut inner, 16, 16, passing_probe())?;
+        let params = ChatBackend::resolve_params(&inner, &config);
+        let (reasoning_tokens, raw_text) = if entry == "sync" {
+            let result = inner.paged_turn_sync_core(
+                first_prompt(3),
+                tokenizer.clone(),
+                u32::MAX,
+                params,
+                false,
+                thinking,
+            )?;
+            (result.reasoning_tokens, result.raw_text)
+        } else {
+            let sink = LastChunk(std::sync::Mutex::new(None));
+            inner.paged_turn_stream_core(
+                first_prompt(3),
+                tokenizer.clone(),
+                u32::MAX,
+                params,
+                false,
+                &super::paged_backend::StreamSender(&sink),
+                &std::sync::atomic::AtomicBool::new(false),
+                thinking,
+            )?;
+            let last = sink.0.lock().unwrap().take().expect("final chunk");
+            (
+                last.reasoning_tokens.unwrap_or_default(),
+                last.raw_text.unwrap_or_default(),
+            )
+        };
+        assert_eq!(reasoning_tokens, 2, "{entry}: {raw_text:?}");
+        assert!(raw_text.contains("t13 </think>"), "{entry}: {raw_text:?}");
+    }
+    Ok(())
+}

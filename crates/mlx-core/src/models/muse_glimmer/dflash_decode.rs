@@ -421,7 +421,7 @@ impl MuseGlimmerInner {
 
         let mut generated = Vec::with_capacity(generated_capacity_hint(params.max_new_tokens));
         let mut finish_reason = String::from("length");
-        let mut reasoning = ReasoningTracker::from_setup(&args.thinking, tokenizer.think_end_id());
+        let mut reasoning = ReasoningTracker::from_setup(&args.thinking, &tokenizer.think_end());
         let stream_skip_special = ChatBackend::stream_skip_special_tokens(self);
         // One streaming bundle — detokenizer + cursors + emitter — built
         // only when a sink exists so the sync path never runs the emitter

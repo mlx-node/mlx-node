@@ -397,12 +397,8 @@ impl QwenStepExecutor<'_> {
         let is_reasoning = turn.payload.reasoning_tracker.observe_token(row.token_id);
         turn.payload.last_is_reasoning = is_reasoning;
         let next_token = if let Some(mut logits) = logits.take() {
-            let sampled = if turn.payload.reasoning_tracker.should_force_think_end() {
-                let forced = match turn.payload.reasoning_tracker.forced_token_id() {
-                    Ok(token) => token as i32,
-                    Err(error) => return Self::fail(turn, planned, error),
-                };
-                match MxArray::from_int32(&[forced], &[1]) {
+            let sampled = if let Some(forced) = turn.payload.reasoning_tracker.take_forced_token() {
+                match MxArray::from_int32(&[forced as i32], &[1]) {
                     Ok(sampled) => sampled,
                     Err(error) => return Self::fail(turn, planned, error),
                 }
@@ -5341,7 +5337,11 @@ mod tests {
             response: engine::hybrid_scheduler::ScheduledReply::Sync(reply),
             generated_tokens: Vec::new(),
             finish_reason: "length".into(),
-            reasoning_tracker: engine::ReasoningTracker::from_setup(&thinking, Some(1)),
+            reasoning_tracker: engine::ReasoningTracker::new(
+                thinking.enabled,
+                thinking.budget,
+                &[3, 1],
+            ),
             extra_eos_ids: Vec::new(),
             generation_start: None,
             first_token_instant: None,
@@ -5417,9 +5417,11 @@ mod tests {
                 for turn in turns {
                     assert!(turn.payload.failure.is_none(), "{:?}", turn.payload.failure);
                     let (budget, enabled) = cases[(turn.seq_id - 10) as usize];
+                    // The end is [3, 1]; token 3 is never sampled either.
                     let mut expected = vec![0; 5];
                     if enabled && let Some(budget) = budget {
-                        expected[budget as usize] = 1;
+                        expected[budget as usize] = 3;
+                        expected[budget as usize + 1] = 1;
                     }
                     assert_eq!(
                         turn.payload.generated_tokens, expected,
@@ -5428,7 +5430,7 @@ mod tests {
                     assert_eq!(
                         turn.payload.reasoning_tracker.reasoning_token_count(),
                         if enabled {
-                            budget.unwrap_or(5) as u32
+                            budget.map_or(5, |budget| budget as u32 + 1)
                         } else {
                             0
                         }

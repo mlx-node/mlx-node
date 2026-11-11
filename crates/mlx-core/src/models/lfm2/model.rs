@@ -2059,16 +2059,9 @@ impl ChatBackend for Lfm2Inner {
         // through `<Lfm2Inner as PagedBackend>` (prime → prefill →
         // begin_paged_decode → decode loop → save).
         //
-        // Think-budget force ordering: `run_decode_loop` forces `</think>`
-        // FORCE-before-OBSERVE — it peeks `should_force_think_end()` for the
-        // NEXT token before observing the current one, so a budget of N
-        // yields N+1 reasoning tokens. That is the engine's
-        // unit-test-locked contract (engine::decode
-        // `budget_forcing_injects_think_end_token`; the observe-after-force
-        // note at decode.rs ~412), shared by lfm2's flat path, paged path,
-        // and qwen3 — so flat and paged agree token-for-token under a
-        // mid-`<think>` budget force. `lfm2_paged_vs_flat_greedy_token_parity`
-        // (budget 32) holds because both paths share this loop.
+        // Think-budget forcing is the shared tracker's: flat and paged run the
+        // same `run_decode_loop`, so they agree token-for-token under a
+        // mid-`<think>` budget cut (`lfm2_paged_vs_flat_greedy_token_parity`).
         crate::engine::paged_turn::run_paged_turn(self, args)
     }
 }

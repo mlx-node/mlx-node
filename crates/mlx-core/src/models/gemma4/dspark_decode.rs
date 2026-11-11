@@ -861,7 +861,7 @@ impl Gemma4Inner {
         profiler.set_prompt_tokens(prefill_tokens.len() as u32);
         profiler.snapshot_memory_before();
 
-        let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, think_end_id);
+        let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, &tokenizer.think_end());
 
         // Streaming decode state (mirrors the generic core) — one bundle:
         // detokenizer + cursors + emitter, built only when a sink exists

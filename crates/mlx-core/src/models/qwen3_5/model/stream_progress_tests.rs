@@ -28,7 +28,7 @@ fn tiny_tokenizer() -> Arc<Qwen3Tokenizer> {
         }"#;
     let tok = tokenizers::Tokenizer::from_bytes(json)
         .unwrap_or_else(|e| panic!("fixture tokenizer: {e}"));
-    let tok = Qwen3Tokenizer::from_tokenizer(tok, None);
+    let tok = Qwen3Tokenizer::from_tokenizer(tok, None).unwrap();
     Arc::new(tok)
 }
 

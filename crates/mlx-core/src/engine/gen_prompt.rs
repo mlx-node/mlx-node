@@ -30,6 +30,23 @@ pub(crate) fn replay_point(tokens: &[u32], suffix: &[u32], block_size: usize) ->
     Some(body - body % block_size)
 }
 
+/// Splash `MAX_THINKING_END_TOKENS` (engine `kMaximumThinkingEndTokens`): the most
+/// tokens a thinking budget may end thinking with.
+pub(crate) const MAX_THINKING_END_TOKENS: usize = 64;
+
+/// What a render writes from the end of `reasoning` through the first `close`
+/// after it (Splash `chat_templates._thinking_end`). `None` when the render holds
+/// no `reasoning`, or no `close` after it.
+pub(crate) fn thinking_end_from_render<'r>(
+    rendered: &'r str,
+    reasoning: &str,
+    close: &str,
+) -> Option<&'r str> {
+    let start = rendered.find(reasoning)?;
+    let end = start + rendered[start..].find(close)?;
+    rendered.get(start + reasoning.len()..end + close.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -38,6 +55,8 @@ mod tests {
 
     const QWEN38_TEMPLATE: &str =
         include_str!("../tokenizer/fixtures/qwen3.8-27b/chat_template.jinja");
+    const QWEN36_TEMPLATE: &str =
+        include_str!("../tokenizer/fixtures/qwen3.6-27b/chat_template.jinja");
 
     struct Fixture {
         dir: std::path::PathBuf,
@@ -53,6 +72,24 @@ mod tests {
     /// A word-level vocabulary that keeps `\n` and spaces as their own tokens and
     /// the ChatML markers as added tokens, next to `template`.
     fn fixture(template: &str) -> Fixture {
+        fixture_with(
+            template,
+            &["<|im_start|>", "<|im_end|>", "<think>", "</think>"],
+            true,
+        )
+    }
+
+    /// [`fixture`] over the added tokens `added` (ids from 100). With `reply`,
+    /// `<think>`/`</think>` are not special (Qwen's) and decoding fuses the
+    /// pieces, so a decoded reply is its exact text.
+    fn fixture_with(template: &str, added: &[&str], reply: bool) -> Fixture {
+        let dir = write_fixture(template, added, reply);
+        let tok = Qwen3Tokenizer::load_from_file_sync(dir.join("tokenizer.json").to_str().unwrap())
+            .unwrap();
+        Fixture { dir, tok }
+    }
+
+    fn write_fixture(template: &str, added: &[&str], reply: bool) -> std::path::PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "mlx-gen-prompt-{}-{}",
@@ -60,16 +97,22 @@ mod tests {
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let added: Vec<serde_json::Value> = ["<|im_start|>", "<|im_end|>", "<think>", "</think>"]
+        let added: Vec<serde_json::Value> = added
             .iter()
             .enumerate()
             .map(|(i, content)| {
+                let special = !(reply && content.contains("think>"));
                 serde_json::json!({
                     "id": 100 + i, "content": content, "single_word": false, "lstrip": false,
-                    "rstrip": false, "normalized": false, "special": true,
+                    "rstrip": false, "normalized": false, "special": special,
                 })
             })
             .collect();
+        let decoder = if reply {
+            serde_json::json!({ "type": "Fuse" })
+        } else {
+            serde_json::Value::Null
+        };
         let tokenizer_json = serde_json::json!({
             "version": "1.0",
             "truncation": null,
@@ -83,7 +126,7 @@ mod tests {
                 "invert": false,
             },
             "post_processor": null,
-            "decoder": null,
+            "decoder": decoder,
             "model": {
                 "type": "WordLevel",
                 "vocab": {
@@ -99,9 +142,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("chat_template.jinja"), template).unwrap();
-        let tok = Qwen3Tokenizer::load_from_file_sync(dir.join("tokenizer.json").to_str().unwrap())
-            .unwrap();
-        Fixture { dir, tok }
+        dir
     }
 
     fn encode(tok: &Qwen3Tokenizer, text: &str) -> Vec<u32> {
@@ -295,5 +336,147 @@ mod tests {
         tokens.extend_from_slice(&suffix);
         assert_eq!(replay_point(&tokens, &suffix, 32), Some(64));
         assert_eq!(replay_point(&tokens, &suffix, 0), None);
+    }
+
+    #[test]
+    fn probe_finds_the_template_close() {
+        for template in [QWEN38_TEMPLATE, QWEN36_TEMPLATE] {
+            let f = fixture(template);
+            let end = f.tok.think_end().thinking_end;
+            assert_eq!(&*end, encode(&f.tok, "\n</think>").as_slice());
+            assert_eq!(&*end, &[1, f.tok.think_end_id().unwrap()]);
+        }
+    }
+
+    #[test]
+    fn probe_falls_back_and_refuses_a_bad_close() {
+        let close = "'\\n</think>\\n\\n' + content";
+        assert!(QWEN38_TEMPLATE.contains(close));
+        let rewritten = |to: &str| QWEN38_TEMPLATE.replace(close, to);
+
+        let none = fixture(&rewritten("'\\n\\n' + content"));
+        assert_eq!(
+            &*none.tok.think_end().thinking_end,
+            &[none.tok.think_end_id().unwrap()]
+        );
+
+        let load = |template: &str| -> String {
+            let dir = write_fixture(
+                template,
+                &["<|im_start|>", "<|im_end|>", "<think>", "</think>"],
+                false,
+            );
+            let loaded =
+                Qwen3Tokenizer::load_from_file_sync(dir.join("tokenizer.json").to_str().unwrap());
+            let _ = std::fs::remove_dir_all(&dir);
+            match loaded {
+                Ok(_) => String::from("loaded"),
+                Err(error) => error.reason,
+            }
+        };
+        let special = load(&rewritten("'<|im_end|></think>\\n\\n' + content"));
+        assert!(
+            special.contains("must end with </think> and hold no other special token"),
+            "{special}"
+        );
+        let long = load(&rewritten(&format!(
+            "'{}</think>\\n\\n' + content",
+            " x".repeat(40)
+        )));
+        assert!(long.contains("takes 81 tokens; the most is 64"), "{long}");
+
+        let no_close = fixture_with(QWEN38_TEMPLATE, &["<|im_start|>", "<|im_end|>"], false);
+        assert!(no_close.tok.think_end().thinking_end.is_empty());
+    }
+
+    /// A budget cut, then the next request's re-render of the whole history:
+    /// the reply's tokens come back through the forced close, so the paged
+    /// prefix hit covers it.
+    #[test]
+    fn budget_cut_rerender_hits_through_the_close() {
+        use crate::engine::backend::ThinkingSetup;
+        use crate::engine::penalties::ReasoningTracker;
+        use mlx_paged_attn::BlockAllocator;
+
+        const BLOCK: u32 = 4;
+        for template in [QWEN38_TEMPLATE, QWEN36_TEMPLATE] {
+            let f = fixture_with(
+                template,
+                &["<|im_start|>", "<|im_end|>", "<think>", "</think>"],
+                true,
+            );
+            let tok = &f.tok;
+            let thinking_on = ChatConfig::default();
+            let prompt1 = tok
+                .apply_chat_template_with_config(&[msg("user", "Hello")], true, &thinking_on, true)
+                .unwrap();
+
+            // A loop that observes, then takes; the budget cuts after "again".
+            let close = tok.think_end();
+            let mut tracker = ReasoningTracker::from_setup(
+                &ThinkingSetup {
+                    enabled: true,
+                    budget: Some(3),
+                },
+                &close,
+            );
+            let im_end = encode(tok, "<|im_end|>")[0];
+            let close_id = close.think_end_id.unwrap();
+            let mut script = [7, 2, 8, 1, 1, 5, im_end].into_iter();
+            let mut generated = Vec::new();
+            loop {
+                let token = match tracker.take_forced_token() {
+                    Some(token) => token,
+                    None => script.next().unwrap(),
+                };
+                tracker.observe_token(token);
+                generated.push(token);
+                if token == im_end {
+                    break;
+                }
+            }
+
+            let raw = tok.decode_sync(&generated, true).unwrap();
+            let (content, _, reasoning) = crate::engine::finalize::parse_thinking_and_tools(
+                &raw,
+                &generated,
+                true,
+                close.think_end_id,
+                close.think_end_str.as_deref(),
+                true,
+            );
+            let reply = ChatMessage {
+                reasoning_content: reasoning,
+                ..msg("assistant", &content)
+            };
+            let history = [msg("user", "Hello"), reply, msg("user", "Hi again")];
+            let turn2 = tok
+                .apply_chat_template_with_config(&history, true, &thinking_on, true)
+                .unwrap();
+
+            let mut turn1 = prompt1.clone();
+            turn1.extend_from_slice(&generated);
+            assert!(turn2.starts_with(&turn1), "{turn1:?}\n{turn2:?}");
+
+            // The last sampled token is never forwarded, so its KV is never cached.
+            let cached = &turn1[..turn1.len() - 1];
+            let mut allocator = BlockAllocator::new(64, 64, BLOCK);
+            let blocks: Vec<_> = (0..cached.len() / BLOCK as usize)
+                .map(|_| allocator.allocate().unwrap())
+                .collect();
+            allocator
+                .cache_full_blocks(cached, &blocks, BLOCK, &[], 0)
+                .unwrap();
+            for block in blocks {
+                allocator.free(block);
+            }
+            let (_, hit) =
+                allocator.find_longest_cache_hit(&turn2[..turn2.len() - 1], BLOCK, &[], 0);
+            let floor = |n: usize| n / BLOCK as usize * BLOCK as usize;
+            assert_eq!(hit, floor(cached.len()));
+            let cut = prompt1.len() + 3;
+            assert!(hit > floor(cut), "the hit must run past the cut");
+            assert_eq!(generated, [7, 2, 8, 1, close_id, 1, 1, 5, im_end]);
+        }
     }
 }
