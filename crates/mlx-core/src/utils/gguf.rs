@@ -214,7 +214,7 @@ impl GgufTensorType {
     /// `(weight, scales, biases)` triplet. False for the K-quants: their
     /// per-16/32-value sub-scales need the K-quant array contract in
     /// `crate::utils::gguf_kquant`, not affine's one f16 scale per block.
-    fn is_mlx_affine_quantized(&self) -> bool {
+    pub(crate) fn is_mlx_affine_quantized(&self) -> bool {
         matches!(
             self,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::PQ2_0
@@ -224,7 +224,7 @@ impl GgufTensorType {
     /// Whether the blocks repack into MLX's native `mxfp4` pair
     /// (`weight`, uint8 E8M0 `scales`, no biases): ggml's MXFP4 is the OCP
     /// MX block MLX already decodes, only with its nibbles interleaved.
-    fn is_mlx_mxfp4_quantized(&self) -> bool {
+    pub(crate) fn is_mlx_mxfp4_quantized(&self) -> bool {
         matches!(self, Self::MXFP4)
     }
 

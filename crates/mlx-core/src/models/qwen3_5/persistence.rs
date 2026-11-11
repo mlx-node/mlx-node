@@ -1740,15 +1740,40 @@ fn apply_weights_inner(
 /// (whose `.scales` hold integer sub-block codes — the fp16 super-scale lives
 /// in `.biases`). Dense tables emit their own dtype.
 pub(crate) fn embedding_compute_dtype(params: &HashMap<String, MxArray>) -> DType {
-    params
-        .get("embedding.scales")
-        .and_then(|w| w.dtype().ok())
+    compute_dtype_of(&params_dtype(params))
+}
+
+/// [`embedding_compute_dtype`] over `dtype_of`, a sanitized key's dtype; the
+/// load-free estimate reads the same keys from the checkpoint headers.
+pub(crate) fn compute_dtype_of(dtype_of: &dyn Fn(&str) -> Option<DType>) -> DType {
+    dtype_of("embedding.scales")
         .map(|d| match d {
             DType::Float16 | DType::BFloat16 | DType::Float32 => d,
             _ => DType::BFloat16,
         })
-        .or_else(|| params.get("embedding.weight").and_then(|w| w.dtype().ok()))
+        .or_else(|| dtype_of("embedding.weight"))
         .unwrap_or(DType::BFloat16)
+}
+
+/// A sanitized key's dtype in `params`.
+pub(crate) fn params_dtype(
+    params: &HashMap<String, MxArray>,
+) -> impl Fn(&str) -> Option<DType> + '_ {
+    |key| params.get(key).and_then(|array| array.dtype().ok())
+}
+
+/// The key the dense and MoE sanitizers give a raw checkpoint key, `None`
+/// for a tensor they drop.
+pub(crate) fn qwen35_text_key(raw: &str) -> Option<String> {
+    crate::engine::persistence::rename_key(
+        raw,
+        &RenameSpec {
+            raw_rules: QWEN35_RAW_DROPS,
+            strip_prefixes: WRAPPER_STRIP_PREFIXES,
+            rules: QWEN35_KEY_RENAMES,
+            ..Default::default()
+        },
+    )
 }
 
 /// Pins the load's flat full-attention K/V format for the checkpoint's

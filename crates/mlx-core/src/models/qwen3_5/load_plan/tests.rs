@@ -255,6 +255,7 @@ fn estimate_matches_the_load_plan() {
             asset_dir: &target,
             moe: false,
             weight_bytes,
+            compute: DType::BFloat16,
             draft_dir: Some(&draft),
             kv_format: None,
             max_memory_bytes: None,
@@ -350,6 +351,7 @@ fn estimate_follows_the_sym8_flat_pin() {
             asset_dir: &target,
             moe: false,
             weight_bytes: 16_000 << 20,
+            compute: DType::BFloat16,
             draft_dir: None,
             kv_format: None,
             max_memory_bytes: None,
@@ -401,6 +403,7 @@ fn flat_load_is_planned_under_max_memory() {
                 asset_dir: &target,
                 moe: false,
                 weight_bytes: 1 << 30,
+                compute: DType::BFloat16,
                 draft_dir: None,
                 kv_format: None,
                 max_memory_bytes,
@@ -465,6 +468,7 @@ fn max_context_caps_the_flat_lane() {
                 asset_dir: &target,
                 moe: false,
                 weight_bytes: 1 << 30,
+                compute: DType::BFloat16,
                 draft_dir: None,
                 kv_format: None,
                 max_memory_bytes: Some(4 << 30),
@@ -599,6 +603,7 @@ fn estimate_27b(
             asset_dir: &target,
             moe: false,
             weight_bytes: 16_000 * MIB,
+            compute: DType::BFloat16,
             draft_dir: Some(&draft),
             kv_format: None,
             max_memory_bytes,
@@ -830,6 +835,7 @@ fn unplanned_estimate_refuses_what_the_load_refuses() {
                 asset_dir: &target,
                 moe: false,
                 weight_bytes: 16_000 << 20,
+                compute: DType::BFloat16,
                 draft_dir: None,
                 kv_format: None,
                 max_memory_bytes: None,
@@ -937,4 +943,212 @@ fn mtp_state_prices_the_one_pool_window() {
         booked.pool.expect("pool lane").lane.window.maximum(),
         20_473
     );
+}
+
+/// A safetensors file of zero-filled `tensors` (name, dtype, shape).
+fn write_safetensors(path: &std::path::Path, tensors: &[(&str, &str, &[usize])]) {
+    let mut header = serde_json::Map::new();
+    let mut end = 0usize;
+    for (name, dtype, shape) in tensors {
+        let width = match *dtype {
+            "F32" | "U32" => 4,
+            "F16" | "BF16" => 2,
+            _ => 1,
+        };
+        let bytes = width * shape.iter().product::<usize>();
+        header.insert(
+            name.to_string(),
+            serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [end, end + bytes]}),
+        );
+        end += bytes;
+    }
+    let mut json = serde_json::Value::Object(header).to_string();
+    while !json.len().is_multiple_of(8) {
+        json.push(' ');
+    }
+    let mut file = (json.len() as u64).to_le_bytes().to_vec();
+    file.extend_from_slice(json.as_bytes());
+    file.resize(file.len() + end, 0);
+    std::fs::write(path, file).unwrap();
+}
+
+/// The window, or the refusal, a load of the 27B fixture whose embedding
+/// computes in `compute` plans with 16,000 MiB of weights and no draft on
+/// the M3 Pro working set: the load's own format pin, pool dtype and lane
+/// dtype for that compute dtype.
+fn load_window(
+    target: &std::path::Path,
+    compute: DType,
+    kv_format: Option<KvFormat>,
+) -> Result<u32> {
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(target.join("config.json")).unwrap())
+            .unwrap();
+    let mut config = crate::models::qwen3_5::persistence::parse_config(&raw).unwrap();
+    config.rope_scaling =
+        Some(RopeScaling::served_for("Qwen3.5", 262_144, config.scaling(), None).unwrap());
+    let format = config.pin_kv_format(kv_format, compute);
+    let pool = if crate::engine::persistence::compiled_forward_backend_available() {
+        let block_size = config.paged_block_size();
+        let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
+            16,
+            4,
+            256,
+            block_size,
+            qwen35_pool_cache_dtype("Qwen3.5", format, 256, block_size, compute)?,
+        )
+        .unwrap();
+        Some(PoolGeometry {
+            format,
+            bytes_per_block,
+            block_size,
+            layers: 16,
+            explicit_mib: None,
+        })
+    } else {
+        None
+    };
+    let lanes = LoadLanes {
+        config: &config,
+        recurrent_state_bytes: config.recurrent_state_bytes(),
+        pool,
+        draft: None,
+        format,
+        dtype: compute,
+        mtp: false,
+        mtp_state_in_pool: false,
+    };
+    let plan = evaluate_qwen35_plan(
+        "Qwen3.5",
+        &lanes,
+        LiveMemory {
+            working_set_bytes: 27 << 30,
+            active_bytes: 16_000 * MIB,
+            registered_pool_bytes: 0,
+        },
+        None,
+    )?;
+    Ok(plan
+        .pool
+        .map(|pool| pool.lane)
+        .or(plan.flat)
+        .expect("a lane")
+        .window
+        .maximum())
+}
+
+/// The estimate resolves the compute dtype from the weights' headers by the
+/// loaders' rule, so it pins the format and sizes the pool as the load
+/// does: an f16 embedding gets the bf16 pool the load builds and an
+/// explicit int8 fails with the load's refusal; a bf16 one gets int8 on
+/// Metal. The header dtype equals what the loaded arrays give the rule.
+/// Mutation CD1: the estimate pins BF16 again → red (f16 sized as int8).
+#[test]
+fn estimate_resolves_the_compute_dtype_like_the_load() {
+    for (tag, dtype, compute) in [
+        ("f16", "F16", DType::Float16),
+        ("bf16", "BF16", DType::BFloat16),
+    ] {
+        let target = estimate_fixture_dir(&format!("compute-{tag}"));
+        let draft = estimate_fixture_dir(&format!("compute-{tag}-draft"));
+        write_27b_fixture(&target, &draft);
+        write_safetensors(
+            &target.join("model.safetensors"),
+            &[
+                ("model.language_model.embed_tokens.weight", dtype, &[8, 4]),
+                ("model.language_model.norm.weight", dtype, &[4]),
+            ],
+        );
+        let resolved = checkpoint_compute_dtype(&CheckpointSource::Dir(target.clone()), false)
+            .expect("header compute dtype");
+        assert_eq!(resolved, compute, "{tag}");
+        let loaded: std::collections::HashMap<String, crate::array::MxArray> =
+            crate::engine::persistence::load_all_safetensors(&target, false)
+                .unwrap()
+                .into_iter()
+                .filter_map(|(key, array)| {
+                    Some((
+                        crate::models::qwen3_5::persistence::qwen35_text_key(&key)?,
+                        array,
+                    ))
+                })
+                .collect();
+        assert_eq!(
+            crate::models::qwen3_5::persistence::embedding_compute_dtype(&loaded),
+            resolved,
+            "{tag}: the load's rule on the loaded arrays"
+        );
+        for kv_format in [None, Some(KvFormat::Int8)] {
+            crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| {
+                cell.set(Some(LiveMemory {
+                    working_set_bytes: 27 << 30,
+                    active_bytes: 0,
+                    registered_pool_bytes: 0,
+                }))
+            });
+            let estimate = estimate_qwen35_load(
+                "Qwen3.5",
+                &EstimateInput {
+                    asset_dir: &target,
+                    moe: false,
+                    weight_bytes: 16_000 * MIB,
+                    compute: resolved,
+                    draft_dir: None,
+                    kv_format,
+                    max_memory_bytes: None,
+                    max_context: None,
+                },
+            );
+            crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
+            match (estimate, load_window(&target, compute, kv_format)) {
+                (Ok(estimate), Ok(window)) => assert_eq!(
+                    estimate.expect("readable device").window_tokens,
+                    window,
+                    "{tag} {kv_format:?}"
+                ),
+                (Err(estimate), Err(load)) => {
+                    assert_eq!(estimate.reason, load.reason, "{tag} {kv_format:?}")
+                }
+                (estimate, load) => panic!(
+                    "{tag} {kv_format:?}: estimate {:?} but load {:?}",
+                    estimate.map(|e| e.map(|e| e.window_tokens)),
+                    load
+                ),
+            }
+        }
+        std::fs::remove_dir_all(&target).unwrap();
+        std::fs::remove_dir_all(&draft).unwrap();
+    }
+}
+
+/// The MoE estimate takes the MoE loader's rule: f16 affine embedding
+/// scales beside bf16 norms are aligned to bf16 (`settle_compute_dtype`),
+/// while the dense loader keeps f16 compute for the same tensors.
+/// Mutation CD2: the MoE estimate takes the dense rule → red (F16).
+#[test]
+fn moe_estimate_aligns_the_affine_embedding() {
+    let target = estimate_fixture_dir("compute-moe");
+    let draft = estimate_fixture_dir("compute-moe-draft");
+    write_27b_fixture(&target, &draft);
+    write_safetensors(
+        &target.join("model.safetensors"),
+        &[
+            ("model.language_model.embed_tokens.weight", "U32", &[8, 1]),
+            ("model.language_model.embed_tokens.scales", "F16", &[8, 1]),
+            ("model.language_model.embed_tokens.biases", "F16", &[8, 1]),
+            (
+                "model.language_model.layers.0.input_layernorm.weight",
+                "BF16",
+                &[4],
+            ),
+            ("model.language_model.norm.weight", "BF16", &[4]),
+        ],
+    );
+    let source = CheckpointSource::Dir(target.clone());
+    let moe = checkpoint_compute_dtype(&source, true).expect("MoE compute dtype");
+    let dense = checkpoint_compute_dtype(&source, false).expect("dense compute dtype");
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::remove_dir_all(&draft).unwrap();
+    assert_eq!(moe, DType::BFloat16);
+    assert_eq!(dense, DType::Float16);
 }

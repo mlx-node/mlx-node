@@ -19,6 +19,8 @@ use crate::models::quantized_linear::{DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SI
 use crate::nn::rope_scaling::RopeScaling;
 use crate::transformer::KvFormat;
 use crate::utils::gguf::NativeGgufFamily;
+use crate::utils::gguf_import::imported_dtypes;
+use crate::utils::safetensors::{SafeTensorDType, SafeTensorsFile, checkpoint_safetensors_files};
 
 use super::config::Qwen3_5Config;
 use super::dflash2::DFlash2Config;
@@ -26,6 +28,8 @@ use super::dflash2_decode::{
     PrefillSdpaKernels, dflash2_lane_transient, flat_lane_transient, pool_lane_transient,
 };
 use super::dflash2_turn::{DFlash2Target, dflash2_target_kv_dtype, dflash2_target_kv_format};
+use super::persistence::{compute_dtype_of, qwen35_text_key};
+use crate::models::qwen3_5_moe::persistence::settled_compute_dtype;
 
 /// The pool's element type for `format`. BF16 pages hold any compute dtype
 /// cast to bf16. Int8 pages exist only where mlx-node has the int8 store and
@@ -409,6 +413,7 @@ pub async fn estimate_qwen35_context_window(
                 asset_dir: source.asset_dir(),
                 moe,
                 weight_bytes,
+                compute: checkpoint_compute_dtype(&source, moe)?,
                 draft_dir: options.draft_model_path.as_deref().map(Path::new),
                 kv_format,
                 max_memory_bytes,
@@ -462,11 +467,76 @@ pub(crate) fn checkpoint_weight_bytes(source: &CheckpointSource) -> Result<u64> 
     }
 }
 
+/// The compute dtype a load of `source` settles on: the loaders' rule over
+/// the dtypes the weights' headers give the sanitized keys. The GGUF ones
+/// are the import's.
+pub(crate) fn checkpoint_compute_dtype(source: &CheckpointSource, moe: bool) -> Result<DType> {
+    let mut raw_dtypes: Vec<(String, DType)> = Vec::new();
+    match source {
+        CheckpointSource::Dir(dir) => {
+            let mut fp8_scaled = std::collections::HashSet::new();
+            for path in checkpoint_safetensors_files(dir) {
+                for (name, info) in SafeTensorsFile::load(&path)?.tensors {
+                    if let Some(weight) = name.strip_suffix("_scale_inv") {
+                        fp8_scaled.insert(weight.to_string());
+                    }
+                    let dtype = match info.dtype {
+                        SafeTensorDType::F32 => DType::Float32,
+                        SafeTensorDType::F16 => DType::Float16,
+                        SafeTensorDType::BF16 => DType::BFloat16,
+                        SafeTensorDType::I32 => DType::Int32,
+                        SafeTensorDType::U32 => DType::Uint32,
+                        SafeTensorDType::I8 => DType::Int8,
+                        SafeTensorDType::U8 | SafeTensorDType::F8_E4M3 => DType::Uint8,
+                        SafeTensorDType::I64 | SafeTensorDType::F64 | SafeTensorDType::BOOL => {
+                            continue;
+                        }
+                    };
+                    raw_dtypes.push((name, dtype));
+                }
+            }
+            // `dequant_fp8_weights` replaces each scaled weight with BF16.
+            for (name, dtype) in &mut raw_dtypes {
+                if fp8_scaled.contains(name.as_str()) {
+                    *dtype = DType::BFloat16;
+                }
+            }
+        }
+        CheckpointSource::Gguf(checkpoint) => {
+            raw_dtypes = imported_dtypes(&checkpoint.main.1, &checkpoint.plans.0, &checkpoint.opts);
+        }
+    }
+    let dtypes: std::collections::HashMap<String, DType> = raw_dtypes
+        .into_iter()
+        .filter_map(|(name, dtype)| Some((qwen35_text_key(&name)?, dtype)))
+        .collect();
+    let dtype_of = |key: &str| dtypes.get(key).copied();
+    if !moe {
+        return Ok(compute_dtype_of(&dtype_of));
+    }
+    let config_path = source.asset_dir().join("config.json");
+    let raw: serde_json::Value = std::fs::read_to_string(&config_path)
+        .map_err(|error| {
+            Error::from_reason(format!("Failed to read {}: {error}", config_path.display()))
+        })
+        .and_then(|data| {
+            serde_json::from_str(&data).map_err(|error| {
+                Error::from_reason(format!(
+                    "Failed to parse {}: {error}",
+                    config_path.display()
+                ))
+            })
+        })?;
+    Ok(settled_compute_dtype(&raw, &dtype_of))
+}
+
 pub(crate) struct EstimateInput<'a> {
     /// The directory holding the checkpoint's `config.json`.
     pub asset_dir: &'a Path,
     pub moe: bool,
     pub weight_bytes: u64,
+    /// [`checkpoint_compute_dtype`].
+    pub compute: DType,
     pub draft_dir: Option<&'a Path>,
     pub kv_format: Option<KvFormat>,
     pub max_memory_bytes: Option<u64>,
@@ -474,8 +544,7 @@ pub(crate) struct EstimateInput<'a> {
 }
 
 /// The plan a load of `input` would make on the device now, with the
-/// target's and the draft's weight files counted as active bytes. The
-/// compute dtype is taken as BF16: the weights that decide it are not read.
+/// target's and the draft's weight files counted as active bytes.
 pub(crate) fn estimate_qwen35_load(
     label: &str,
     input: &EstimateInput<'_>,
@@ -516,7 +585,8 @@ pub(crate) fn estimate_qwen35_load(
     }
     KvFormat::parse(config.kv_format.as_deref())
         .map_err(|message| Error::from_reason(format!("config.json: {message}")))?;
-    let format = config.pin_kv_format(input.kv_format, DType::BFloat16);
+    let compute = input.compute;
+    let format = config.pin_kv_format(input.kv_format, compute);
     let draft = input
         .draft_dir
         .map(|dir| {
@@ -532,13 +602,8 @@ pub(crate) fn estimate_qwen35_load(
     {
         let layers = config.full_attention_layer_count() as u32;
         let block_size = config.paged_block_size();
-        let cache_dtype = qwen35_pool_cache_dtype(
-            label,
-            format,
-            config.head_dim as u32,
-            block_size,
-            DType::BFloat16,
-        )?;
+        let cache_dtype =
+            qwen35_pool_cache_dtype(label, format, config.head_dim as u32, block_size, compute)?;
         let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
             layers,
             config.num_kv_heads as u32,
@@ -573,7 +638,7 @@ pub(crate) fn estimate_qwen35_load(
         pool,
         draft,
         format,
-        dtype: DType::BFloat16,
+        dtype: compute,
         mtp: config.n_mtp_layers > 0 && draft.is_none(),
         mtp_state_in_pool: qwen35_scheduler_books_state_in_pool(),
     };

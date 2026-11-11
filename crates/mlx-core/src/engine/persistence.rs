@@ -1103,6 +1103,45 @@ fn emit_renamed(
     Ok(())
 }
 
+/// The key `spec` emits `key` under, `None` when it drops the tensor.
+pub(crate) fn rename_key(key: &str, spec: &RenameSpec<'_>) -> Option<String> {
+    // Phase 1 — raw-key rules: the FIRST match is terminal.
+    if let Some(outcome) = spec
+        .raw_rules
+        .iter()
+        .find_map(|rule| eval_key_rule(rule, key))
+    {
+        return match outcome {
+            RuleOutcome::Drop => None,
+            RuleOutcome::Keep => Some(key.to_string()),
+            RuleOutcome::Rename(new_key) => Some(new_key),
+        };
+    }
+
+    // Phase 2 — the else-if prefix strip (first match only).
+    let (mut key, stripped) = match spec
+        .strip_prefixes
+        .iter()
+        .find_map(|prefix| key.strip_prefix(prefix))
+    {
+        Some(rest) => (rest.to_string(), true),
+        None => (key.to_string(), false),
+    };
+
+    // Phase 3 — the ordered post-strip rule chain.
+    if stripped || !spec.rules_require_strip {
+        for rule in spec.rules {
+            match eval_key_rule(rule, &key) {
+                Some(RuleOutcome::Drop) => return None,
+                Some(RuleOutcome::Keep) => break,
+                Some(RuleOutcome::Rename(new_key)) => key = new_key,
+                None => {}
+            }
+        }
+    }
+    Some(key)
+}
+
 /// Apply a [`RenameSpec`] to `params`, returning the rewritten weight map.
 ///
 /// Consumes the input map so `&mut`-style callers can hand over ownership via
@@ -1113,47 +1152,10 @@ pub(crate) fn apply_rename_spec(
     spec: &RenameSpec<'_>,
 ) -> Result<HashMap<String, MxArray>> {
     let mut out: HashMap<String, MxArray> = HashMap::with_capacity(params.len());
-    'tensors: for (key, value) in params {
-        // Phase 1 — raw-key rules: the FIRST match is terminal.
-        if let Some(outcome) = spec
-            .raw_rules
-            .iter()
-            .find_map(|rule| eval_key_rule(rule, &key))
-        {
-            match outcome {
-                RuleOutcome::Drop => {}
-                RuleOutcome::Keep => {
-                    emit_renamed(&mut out, spec.reject_duplicate_keys_as, key, value)?
-                }
-                RuleOutcome::Rename(new_key) => {
-                    emit_renamed(&mut out, spec.reject_duplicate_keys_as, new_key, value)?
-                }
-            }
-            continue;
+    for (key, value) in params {
+        if let Some(key) = rename_key(&key, spec) {
+            emit_renamed(&mut out, spec.reject_duplicate_keys_as, key, value)?;
         }
-
-        // Phase 2 — the else-if prefix strip (first match only).
-        let (mut key, stripped) = match spec
-            .strip_prefixes
-            .iter()
-            .find_map(|prefix| key.strip_prefix(prefix))
-        {
-            Some(rest) => (rest.to_string(), true),
-            None => (key, false),
-        };
-
-        // Phase 3 — the ordered post-strip rule chain.
-        if stripped || !spec.rules_require_strip {
-            for rule in spec.rules {
-                match eval_key_rule(rule, &key) {
-                    Some(RuleOutcome::Drop) => continue 'tensors,
-                    Some(RuleOutcome::Keep) => break,
-                    Some(RuleOutcome::Rename(new_key)) => key = new_key,
-                    None => {}
-                }
-            }
-        }
-        emit_renamed(&mut out, spec.reject_duplicate_keys_as, key, value)?;
     }
     Ok(out)
 }
