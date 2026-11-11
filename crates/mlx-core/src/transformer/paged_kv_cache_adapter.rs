@@ -1164,6 +1164,7 @@ impl PagedKVCacheAdapter {
         self.native_pool_arrays
             .iter_mut()
             .for_each(|slot| *slot = None);
+        self.prefill_workspace = None;
         self.meta.invalidate(MetadataClear::ActiveRequest);
     }
 
@@ -7220,6 +7221,13 @@ impl PagedKVCacheAdapter {
     /// Returns the number of block Arc references that were freed (i.e.
     /// the number of blocks in the table at release time).
     pub fn release_request(&mut self) -> Result<u32, String> {
+        // A failed turn leaves the workspace lazy on its abandoned attention
+        // graph and pool writes; the next launch would evaluate that graph.
+        // Splash `AttentionPartials` is plain scratch with no graph.
+        #[cfg(target_os = "macos")]
+        {
+            self.prefill_workspace = None;
+        }
         if let Some(seq_id) = self.active_seq {
             self.clear_refusal(seq_id);
         }
@@ -16835,6 +16843,106 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A turn that fails after `paged_prefill_attention` built its graph
+    /// leaves the held workspace lazy on that graph; every reset must drop it
+    /// so the next launch does not evaluate the abandoned turn. Mutation WS1:
+    /// `release_request` keeps the workspace -> red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_reset_drops_the_held_prefill_workspace() {
+        const ROWS: usize = 16;
+        const KV_HEADS: usize = 2;
+        const QUERY_HEADS: usize = 8;
+        const DIM: usize = 128;
+        let new_adapter = || {
+            let cfg = mlx_paged_attn::PagedAttentionConfig {
+                block_size: 16,
+                num_kv_heads: KV_HEADS as u32,
+                head_size: DIM as u32,
+                num_layers: 1,
+                gpu_memory_mb: 256,
+                max_seq_len: Some(64),
+                max_batch_size: Some(1),
+            };
+            match mlx_paged_attn::LayerKVPool::new(
+                cfg,
+                4,
+                4,
+                mlx_paged_attn::metal::MetalDtype::BFloat16,
+            ) {
+                Ok(pool) => {
+                    let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 16)));
+                    Some(PagedKVCacheAdapter::new(allocator, Arc::new(pool), 16).unwrap())
+                }
+                Err(error) => {
+                    eprintln!("skipping prefill workspace reset: {error}");
+                    None
+                }
+            }
+        };
+        let bf16 = |salt: usize, heads: usize| {
+            let data = (0..ROWS * heads * DIM)
+                .map(|i| ((i * 7 + salt * 31) % 23) as f32 / 16.0 - 0.7)
+                .collect::<Vec<_>>();
+            MxArray::from_float32(&data, &[ROWS as i64, heads as i64, DIM as i64])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap()
+        };
+        let launch = |adapter: &mut PagedKVCacheAdapter, seq_id: u32, salt: usize| {
+            adapter.reset_for_new_request(seq_id).unwrap();
+            adapter.allocate_suffix_blocks(ROWS as u32).unwrap();
+            adapter
+                .record_tokens(&(0..ROWS as u32).collect::<Vec<_>>())
+                .unwrap();
+            adapter
+                .update_keys_values_native(0, &bf16(salt, KV_HEADS), &bf16(salt + 1, KV_HEADS), 0)
+                .unwrap();
+            let attention = adapter
+                .paged_prefill_attention(
+                    0,
+                    &bf16(salt + 2, QUERY_HEADS),
+                    0,
+                    mlx_paged_attn::prefill_plan::Pass::Prefill,
+                    1.0 / (DIM as f32).sqrt(),
+                )
+                .unwrap();
+            assert!(adapter.prefill_workspace.is_some());
+            attention
+        };
+        let Some(mut fresh) = new_adapter() else {
+            return;
+        };
+        let reference = launch(&mut fresh, 1, 5).to_float32().unwrap().to_vec();
+        let Some(mut adapter) = new_adapter() else {
+            return;
+        };
+
+        drop(launch(&mut adapter, 1, 40));
+        adapter.release_request().unwrap();
+        assert!(
+            adapter.prefill_workspace.is_none(),
+            "release_request kept the workspace of the abandoned launch"
+        );
+
+        drop(launch(&mut adapter, 2, 40));
+        adapter.release_request_and_purge_prefix_cache().unwrap();
+        assert!(
+            adapter.prefill_workspace.is_none(),
+            "release_request_and_purge_prefix_cache kept the workspace"
+        );
+
+        drop(launch(&mut adapter, 3, 40));
+        adapter.clear_native_graph_state();
+        assert!(
+            adapter.prefill_workspace.is_none(),
+            "clear_native_graph_state kept the workspace"
+        );
+
+        let reused = launch(&mut adapter, 4, 5).to_float32().unwrap().to_vec();
+        assert_eq!(reused, reference, "a launch on reused blocks drifted");
     }
 
     #[cfg(target_os = "macos")]
