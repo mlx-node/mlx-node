@@ -1713,7 +1713,7 @@ fn project_last_token_logits_with_full_hidden(
     debug_assert_eq!(kept_hidden.shape_at(0)?, 1);
     debug_assert!(kept_hidden.shape_at(1)? >= 1);
     debug_assert_eq!(kept_hidden.shape_at(2)?, hidden_dim);
-    debug_assert_eq!(kept_hidden.dtype()?, crate::array::DType::BFloat16);
+    debug_assert_eq!(kept_hidden.dtype()?, hidden_states.dtype()?);
 
     let logits = logits.squeeze(Some(&[0, 1]))?;
     Ok((logits, kept_hidden))

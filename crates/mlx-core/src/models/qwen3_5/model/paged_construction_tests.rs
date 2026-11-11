@@ -4011,6 +4011,42 @@ fn calibration_reads_the_pool() {
     );
 }
 
+/// An f32 checkpoint calibrates on the pool: a row shorter than one block
+/// takes the single-shot prefill, whose kept hidden stays in the load's
+/// compute dtype (Splash casts only the pool inputs; the residual keeps its
+/// dtype). Mutation CA2: the last-token projection asserts a BFloat16 hidden
+/// → red (the f32 hidden panics the debug assertion).
+#[test]
+fn f32_checkpoint_calibrates_a_short_row_on_the_pool() {
+    use crate::calibration::activation_amax::{ActivationAmaxCollector, CALIB_TEST_LOCK};
+    let Some(loaded) = planned_load(tiny_paged_forward_cfg(), false) else {
+        return;
+    };
+    let mut inner = loaded.expect("an f32 load builds the pool");
+    assert_eq!(
+        inner.embedding.get_weight().dtype().unwrap(),
+        DType::Float32
+    );
+    let block_size = inner.paged_adapter.as_ref().expect("pool").block_size();
+    inner.tokenizer = Some(calibration_tokenizer());
+    let _guard = CALIB_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = ActivationAmaxCollector::take();
+    let row = "a b c";
+    assert!(row.split(' ').count() < block_size as usize);
+    let rows = inner
+        .calibrate_prefill_raw_sync(vec![row.into()], 64)
+        .unwrap_or_else(|error| panic!("f32 calibration on the pool: {}", error.reason));
+    let _ = ActivationAmaxCollector::take();
+    assert_eq!(rows, 1);
+    let hidden = inner
+        .prefill_hidden_once(&[0, 1, 2])
+        .expect("short f32 row");
+    assert_eq!(hidden.dtype().unwrap(), DType::Float32);
+    assert_eq!(hidden.shape().unwrap().as_ref(), [1, 3, 128]);
+}
+
 /// An image turn is admitted only where it runs: a load without a pool
 /// publishes no image capability, so the engine refuses the image before it
 /// renders (Splash `Engine::submit`). Mutation N11: the plan admits images
