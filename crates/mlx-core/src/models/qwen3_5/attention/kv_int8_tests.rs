@@ -530,7 +530,7 @@ fn int8_routes_are_counted() -> Result<()> {
 /// the int8 cache holds exactly the quantized rows. Through gqa 8 the decode
 /// and verify rows reach the int8 kernels; at gqa 16 only the decode rows
 /// do: the 8- and 5-row blocks, which the segmented kernels cannot split
-/// there, read the dequantized prefix like a prefill chunk.
+/// there, read the dequantized cache rows through MLX's SDPA.
 /// Mutation: narrow the gqa bound in `forward_int8_cached` to `1..=6` → red
 /// (16 x 2 dequantizes, int8 kernel count 0; the tolerance alone stays green).
 /// Mutation: `forward_int8_cached` ignores `segmented_int8_covers` → red
@@ -677,6 +677,107 @@ fn eager_forward_over_an_int8_cache_tracks_the_bf16_cache_at(
     assert_eq!(view.keys.dtype()?, DType::Int8);
     assert_eq!(view.len()?, int8.get_offset() as i64);
     eprintln!("{h}x{kv} eager int8 cache vs bf16 cache: worst {worst:.3e} of output magnitude");
+    Ok(())
+}
+
+/// A gqa-16 flat int8 verify block (32 x 2 heads, D 256) of 4..=8 rows
+/// against the same rows fed one at a time through the 1-row int8 decode
+/// kernel over an equal cache: every row reads the same int8 rows, its own
+/// and the earlier block rows included (4 rows take the segmented kernel,
+/// 5..=8 the dequantizing reader). Random rows agree within reduction noise;
+/// zero queries over one zero prefix row and fresh V rows `[127, 0.5, 0..]`
+/// (the int8 store rounds 0.5 away) agree to the BF16 ulp, where a reader of
+/// the BF16 fresh rows outputs at least 0.25 in the second component.
+/// Mutation: `forward_int8_cached` concatenates the BF16 fresh rows onto the
+/// dequantized prefix for a 5..=8-row block → red.
+#[test]
+#[cfg(target_os = "macos")]
+fn flat_int8_verify_at_gqa_16_reads_like_sequential_int8_decode() -> Result<()> {
+    if !metal() {
+        return Ok(());
+    }
+    seed_rng(0x1A7_0016);
+    let (h, kv, d) = (32_i64, 2_i64, D as i64);
+    let cfg = Qwen3_5Config {
+        hidden_size: 64,
+        num_heads: h as i32,
+        num_kv_heads: kv as i32,
+        head_dim: 256,
+        partial_rotary_factor: 0.25,
+        ..super::tests::tiny_cfg()
+    };
+    let attn = Qwen3_5Attention::new(&cfg)?;
+
+    // Per-row arrays so the decode inputs are contiguous, not slices.
+    let run = |prefix: (&MxArray, &MxArray),
+               q: &[MxArray],
+               k: &[MxArray],
+               v: &[MxArray]|
+     -> Result<(Vec<f32>, Vec<f32>)> {
+        let rows = q.len() as i64;
+        let mut block = KVCache::with_format(KvFormat::Int8);
+        let mut sequential = KVCache::with_format(KvFormat::Int8);
+        block.update_and_fetch_int8(prefix.0, prefix.1)?;
+        sequential.update_and_fetch_int8(prefix.0, prefix.1)?;
+        let cat = |rows: &[MxArray]| MxArray::concatenate_many(rows.iter().collect(), Some(2));
+        let verify =
+            attn.forward_int8_cached(&cat(q)?, &cat(k)?, &cat(v)?, None, &mut block, rows)?;
+        let mut decoded = Vec::new();
+        for r in 0..q.len() {
+            decoded.push(attn.forward_int8_cached(
+                &q[r],
+                &k[r],
+                &v[r],
+                None,
+                &mut sequential,
+                1,
+            )?);
+        }
+        let decoded = MxArray::concatenate_many(decoded.iter().collect(), Some(2))?;
+        Ok((f32s(&verify), f32s(&decoded)))
+    };
+
+    for rows in 4..=8_usize {
+        let zero_row_k = normal(&[1, kv, 1, d], 0.0, 1.0);
+        let zero_row_v = MxArray::zeros(&[1, kv, 1, d], Some(DType::BFloat16))?;
+        let mut fresh = vec![0f32; D];
+        fresh[0] = 127.0;
+        fresh[1] = 0.5;
+        let fresh: Vec<f32> = fresh.repeat(kv as usize);
+        let fresh_v = MxArray::from_float32(&fresh, &[1, kv, 1, d])?.astype(DType::BFloat16)?;
+        let q: Vec<_> = (0..rows)
+            .map(|_| MxArray::zeros(&[1, h, 1, d], Some(DType::BFloat16)))
+            .collect::<Result<_>>()?;
+        let k: Vec<_> = (0..rows)
+            .map(|_| normal(&[1, kv, 1, d], 0.0, 1.0))
+            .collect();
+        let v: Vec<_> = (0..rows).map(|_| fresh_v.clone()).collect();
+        let (verify, decoded) = run((&zero_row_k, &zero_row_v), &q, &k, &v)?;
+        for (i, (a, b)) in verify.iter().zip(&decoded).enumerate() {
+            assert!(
+                (a - b).abs() <= bf16_ulp(a.abs().max(b.abs())),
+                "32x2 verify {rows}, row {}, component {}: verify {a} vs decode {b}",
+                (i / D) % rows,
+                i % D
+            );
+        }
+
+        let prefix_k = normal(&[1, kv, 64, d], 0.0, 1.0);
+        let prefix_v = normal(&[1, kv, 64, d], 0.0, 1.0);
+        let q: Vec<_> = (0..rows).map(|_| normal(&[1, h, 1, d], 0.0, 1.0)).collect();
+        let k: Vec<_> = (0..rows)
+            .map(|_| normal(&[1, kv, 1, d], 0.0, 1.0))
+            .collect();
+        let v: Vec<_> = (0..rows)
+            .map(|_| normal(&[1, kv, 1, d], 0.0, 1.0))
+            .collect();
+        let (verify, decoded) = run((&prefix_k, &prefix_v), &q, &k, &v)?;
+        let (max, mean) = error_ulps(&verify, &decoded);
+        eprintln!(
+            "32x2 verify {rows} vs sequential decode: max {max} / mean {mean:.4} BF16 ulps of output magnitude"
+        );
+        assert!(max <= 4.0, "32x2 verify {rows}: max {max} BF16 ulps");
+    }
     Ok(())
 }
 
