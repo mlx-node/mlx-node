@@ -213,11 +213,14 @@ the pool block is the priced page: 13,248 B per token in int8 (423,936 B per
 32-token page over the 12 attention layers), 25,344 B in bf16. The keys of the
 open block stay with the owner's state. The page gathers dequantize int8 rows
 to BF16 before attention (Splash applies the scales inside its sparse kernel:
-the same math, another BF16 rounding point), and a turn reads its own fresh
-rows unquantized (Splash stores them first and reads them back as int8), so on
-an int8 pool an MTP verify can differ from AR at T=0 and window-prefill logits
-depend on how the prompt is chunked. Flash Next has no SSD tier, so nothing
-round-trips its pages; the pool refuses host transfers of a token-major page.
+the same math, another BF16 rounding point). A decode step and every MTP
+verify row store their row first and read it back from the pages with every
+earlier row, the verify window's own included (Splash "Encode the store before
+attention"), so a verify row carries the AR step's logits on either format. A
+prefill window still reads its own rows unquantized, so on an int8 pool
+window-prefill logits depend on how the prompt is chunked. Flash Next has no
+SSD tier, so nothing round-trips its pages; the pool refuses host transfers of
+a token-major page.
 `contextLimits().kvFormat` names the load's format.
 
 The shared scheduler supports up to four live owners. The QSA K/V pool starts at

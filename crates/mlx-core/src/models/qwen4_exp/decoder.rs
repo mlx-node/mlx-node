@@ -1271,7 +1271,7 @@ impl Decoder {
     }
     fn attention(&mut self, x: &MxArray, i: usize, cache: &mut LayerCache) -> Result<MxArray> {
         let projections = self.attention_projections(x, i)?;
-        self.attention_projected(x, i, cache, &projections, true)
+        self.attention_projected(x, i, cache, &projections, true, true)
     }
 
     fn attention_projections(&mut self, x: &MxArray, i: usize) -> Result<AttentionProjections> {
@@ -1306,6 +1306,10 @@ impl Decoder {
 
     /// Projection matrices can span a prompt window while rotary positions,
     /// sparse selection and recurrent/indexer state still advance causally.
+    /// With `store` and pages, the row is written before attention and every
+    /// selected row, its own included, is read from the pages (Splash
+    /// `PagedAttention::addVerify`, "Encode the store before attention"):
+    /// a verify row reads the int8 rows the AR step at its position reads.
     fn attention_projected(
         &mut self,
         x: &MxArray,
@@ -1313,6 +1317,7 @@ impl Decoder {
         cache: &mut LayerCache,
         projections: &AttentionProjections,
         project_output: bool,
+        store: bool,
     ) -> Result<MxArray> {
         let c = self.config.clone();
         let p = format!("layers.{i}.self_attn");
@@ -1346,22 +1351,43 @@ impl Decoder {
             .v
             .reshape(&[1, 1, kh, hd])?
             .transpose(Some(&[0, 2, 1, 3]))?;
-        let (keys, values) = if cache.draft_rows.is_some() {
-            cache.append_draft_kv(&k, &v)?
+        let layer = (0..i).filter(|&l| !self.config.linear(l)).count() as u32;
+        let stored = match &mut self.paged {
+            Some(adapter) if store => {
+                let shape = [1, kh, hd];
+                super::paged::write_rows(
+                    adapter,
+                    layer,
+                    &k.transpose(Some(&[0, 2, 1, 3]))?.reshape(&shape)?,
+                    &v.transpose(Some(&[0, 2, 1, 3]))?.reshape(&shape)?,
+                    pos as u32,
+                    self.paged_chunk_start as u32,
+                )?;
+                true
+            }
+            _ => false,
+        };
+        let (keys, values) = if stored {
+            (k, v)
         } else {
-            let keys = match &cache.keys {
-                Some(old) => MxArray::concatenate(old, &k, 2)?,
-                None => k,
+            let (keys, values) = if cache.draft_rows.is_some() {
+                cache.append_draft_kv(&k, &v)?
+            } else {
+                let keys = match &cache.keys {
+                    Some(old) => MxArray::concatenate(old, &k, 2)?,
+                    None => k,
+                };
+                let values = match &cache.values {
+                    Some(old) => MxArray::concatenate(old, &v, 2)?,
+                    None => v,
+                };
+                (keys, values)
             };
-            let values = match &cache.values {
-                Some(old) => MxArray::concatenate(old, &v, 2)?,
-                None => v,
-            };
+            self.submit_state(&[&keys, &values], "qwen4::decoder::kv")?;
+            cache.keys = Some(keys.clone());
+            cache.values = Some(values.clone());
             (keys, values)
         };
-        self.submit_state(&[&keys, &values], "qwen4::decoder::kv")?;
-        cache.keys = Some(keys.clone());
-        cache.values = Some(values.clone());
         let ih = c.indexer_n_heads as i64;
         let id = c.indexer_head_dim as i64;
         let (iq, ik) = (&projections.iq, &projections.ik);
@@ -1440,15 +1466,12 @@ impl Decoder {
             MxArray::arange(0., (pos + 1) as f64, None, Some(DType::Int32))?
         };
         let (keys, values) = if let Some(adapter) = &self.paged {
-            let layer = (0..i).filter(|&l| !self.config.linear(l)).count() as u32;
-            super::paged::gather_window(
-                adapter,
-                layer,
-                &selected,
-                &keys,
-                &values,
-                self.paged_chunk_start,
-            )?
+            let base = if stored {
+                pos + 1
+            } else {
+                self.paged_chunk_start
+            };
+            super::paged::gather_window(adapter, layer, &selected, &keys, &values, base)?
         } else {
             (keys.take(&selected, 2)?, values.take(&selected, 2)?)
         };
@@ -1853,6 +1876,7 @@ impl Decoder {
                     cache,
                     &projections.row(j)?,
                     false,
+                    true,
                 )?);
                 self.history.push(token);
                 if self.paged.is_none() {
@@ -2824,18 +2848,6 @@ impl Decoder {
             self.history.truncate(base);
             if group {
                 self.paged_chunk_start = base;
-            }
-            if !carry {
-                self.write_window_kv(
-                    i,
-                    &mut cache,
-                    tokens.len(),
-                    base,
-                    base,
-                    async_window,
-                    submit_span,
-                    defer_final,
-                )?;
             }
             self.caches[i] = cache;
             if tokens.len() == 1

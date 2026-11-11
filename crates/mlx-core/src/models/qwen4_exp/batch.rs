@@ -524,6 +524,7 @@ impl Decoder {
                             cache,
                             &projections.row(j)?,
                             false,
+                            false,
                         )?);
                         self.history.push(token);
                     }

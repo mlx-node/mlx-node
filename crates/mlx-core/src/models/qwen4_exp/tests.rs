@@ -3150,6 +3150,209 @@ fn mtp_transaction_restores_every_accepted_frontier_and_continues_exactly() {
     }
 }
 
+/// The paged fixture with its attention heads (target and MTP) widened to
+/// `head_dim` 128, where int8 pages serve, as a checkpoint in `dir`. The
+/// rotary width stays 8.
+fn write_wide_head_fixture(dir: &Path) -> config::Config {
+    let source = fixture().join("bf16/paged");
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(source.join("config.json")).unwrap()).unwrap();
+    raw["text_config"]["head_dim"] = 128.into();
+    raw["text_config"]["rope_parameters"]["partial_rotary_factor"] = 0.0625.into();
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    let c = config::Config::parse(&raw).unwrap();
+    assert_eq!(c.rope_dims(), 8);
+    let (h, hd) = (c.hidden_size, c.head_dim);
+    let (nh, kh) = (c.num_attention_heads, c.num_key_value_heads);
+    let bytes = std::fs::read(source.join("model.safetensors")).unwrap();
+    let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+    let header: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&bytes[8..8 + n]).unwrap();
+    let data = &bytes[8 + n..];
+    let mut tensors: Vec<(String, serde_json::Value, Vec<usize>, Vec<u8>)> = Vec::new();
+    for (name, meta) in &header {
+        if name == "__metadata__" {
+            continue;
+        }
+        let wide = [
+            ("self_attn.q_proj.weight", vec![nh * 2 * hd, h], 0.25),
+            ("self_attn.k_proj.weight", vec![kh * hd, h], 0.25),
+            ("self_attn.v_proj.weight", vec![kh * hd, h], 0.25),
+            ("self_attn.o_proj.weight", vec![h, nh * hd], 0.0625),
+            ("self_attn.q_norm.weight", vec![hd], 0.0),
+            ("self_attn.k_norm.weight", vec![hd], 0.0),
+        ]
+        .into_iter()
+        .find(|(suffix, _, _)| name.ends_with(suffix));
+        if let Some((_, shape, scale)) = wide {
+            let count: usize = shape.iter().product();
+            let seed = name
+                .bytes()
+                .fold(7u64, |a, b| a.wrapping_mul(31).wrapping_add(b.into()));
+            let payload = (0..count as u64)
+                .flat_map(|i| {
+                    let x = (i.wrapping_add(seed)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40;
+                    let value = if scale == 0.0 {
+                        1.0
+                    } else {
+                        ((x % 2001) as f32 / 1000.0 - 1.0) * scale
+                    };
+                    half::bf16::from_f32(value).to_bits().to_le_bytes()
+                })
+                .collect();
+            tensors.push((name.clone(), "BF16".into(), shape, payload));
+        } else {
+            let offsets = meta["data_offsets"].as_array().unwrap();
+            let (a, b) = (
+                offsets[0].as_u64().unwrap() as usize,
+                offsets[1].as_u64().unwrap() as usize,
+            );
+            let shape = meta["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d.as_u64().unwrap() as usize)
+                .collect();
+            tensors.push((
+                name.clone(),
+                meta["dtype"].clone(),
+                shape,
+                data[a..b].to_vec(),
+            ));
+        }
+    }
+    let mut out_header = serde_json::Map::new();
+    let mut offset = 0usize;
+    for (name, dtype, shape, payload) in &tensors {
+        out_header.insert(
+            name.clone(),
+            serde_json::json!({
+                "dtype": dtype,
+                "shape": shape,
+                "data_offsets": [offset, offset + payload.len()],
+            }),
+        );
+        offset += payload.len();
+    }
+    let mut head = serde_json::to_vec(&out_header).unwrap();
+    while !head.len().is_multiple_of(8) {
+        head.push(b' ');
+    }
+    let mut file = (head.len() as u64).to_le_bytes().to_vec();
+    file.extend(head);
+    for (_, _, _, payload) in &tensors {
+        file.extend(payload);
+    }
+    std::fs::write(dir.join("model.safetensors"), file).unwrap();
+    c
+}
+
+/// The widened fixture with the MTP head, its pool in `format`.
+fn wide_head_inner(dir: &Path, format: crate::transformer::KvFormat) -> Inner {
+    let raw = serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    let mut c = config::Config::parse(&raw).unwrap();
+    c.kv_format = format;
+    let store = weights::Store::open_fixture(dir, None).unwrap();
+    let vision = media::Vision::metadata(&serde_json::Value::Null, &store, &c).unwrap();
+    let mut decoder = decoder::Decoder::new(c.clone(), store).unwrap();
+    decoder.paged = Some(super::paged::create_fixture(&c).unwrap());
+    inner_over(decoder, vision, true)
+}
+
+/// A verify row reads every row it attends to, its own and the earlier rows
+/// of its window, from the pages, as the AR step at its position does
+/// (Splash `PagedAttention::addVerify`, "Encode the store before
+/// attention"): on an int8 pool at widths 2, 3 and 4 the verify logits carry
+/// the AR bits, a rejected tail rolls back, and decode and the next verify
+/// continue as AR. A bf16 pool holds too. Mutation V1: decode and verify
+/// read the window's rows unquantized and write them after the layer → red
+/// (int8 only).
+#[test]
+fn int8_verify_rows_read_their_window_like_decode() {
+    use crate::engine::backend::PagedBackend;
+    use crate::engine::hybrid_scheduler::{
+        HybridSchedulerBackend, ScheduledVerifyCommit, ScheduledVerifyRow,
+    };
+    use crate::transformer::KvFormat;
+    let dir = Temp::new();
+    let c = write_wide_head_fixture(&dir.0);
+    let prompt = [3, 9, 5, 2, 7, 11, 12, 8, 10, 9, 13, 7, 4, 3, 11, 8, 6, 5];
+    let stream = [4, 11, 7, 9, 13, 6, 10, 3, 12, 5];
+    let bits = |a: &MxArray| -> Vec<u32> {
+        a.to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    };
+    let poison = |t: u32| (t + 1) % c.vocab_size as u32;
+    for format in [KvFormat::Bf16, KvFormat::Int8] {
+        let mut reference = wide_head_inner(&dir.0, format);
+        reference.activate_paged_seq(1).unwrap();
+        reference
+            .decoder
+            .prefill_chunk(&prompt, None, false)
+            .unwrap();
+        let ar: Vec<Vec<u32>> = stream
+            .iter()
+            .map(|&t| bits(&reference.decoder.step(t).unwrap()))
+            .collect();
+        for width in 2..=4usize {
+            for keep in [width, 1] {
+                let mut inner = wide_head_inner(&dir.0, format);
+                inner.activate_paged_seq(1).unwrap();
+                inner.begin_mtp(1, 0).unwrap();
+                let prefix = inner
+                    .prime_prefix_state(&prompt, false, 32, &[], 0)
+                    .unwrap();
+                inner
+                    .paged_prefill(
+                        &prompt,
+                        &prefix,
+                        Stream::default(crate::stream::DeviceType::Gpu),
+                    )
+                    .unwrap();
+                let mut front = 0usize;
+                for (round, keep) in [(0, keep), (1, width)] {
+                    let mut tokens = stream[front..front + width].to_vec();
+                    for t in &mut tokens[keep..] {
+                        *t = poison(*t);
+                    }
+                    let verified = inner
+                        .verify_mtp(&[ScheduledVerifyRow {
+                            seq_id: 1,
+                            first_position: (prompt.len() + front) as u32,
+                            tokens,
+                            speculative: true,
+                        }])
+                        .unwrap();
+                    for j in 0..keep {
+                        assert!(
+                            bits(&verified.slice_axis(0, j as i64, j as i64 + 1).unwrap())
+                                == ar[front + j],
+                            "{format:?} width {width} round {round}: verify row {j} differs \
+                             from AR step {}",
+                            front + j
+                        );
+                    }
+                    inner
+                        .commit_mtp(&[ScheduledVerifyCommit { seq_id: 1, keep }])
+                        .unwrap()
+                        .remove(0)
+                        .unwrap();
+                    front += keep;
+                    assert!(
+                        bits(&inner.decoder.step(stream[front]).unwrap()) == ar[front],
+                        "{format:?} width {width} round {round} keep {keep}: decode after the \
+                         commit differs from AR step {front}"
+                    );
+                    front += 1;
+                }
+            }
+        }
+    }
+}
+
 /// A prefill window runs the shared projections batched: no weight is
 /// projected one row at a time (an 18-row window exceeds the row kernels'
 /// four rows, so each row would otherwise dispatch its own projection). The
