@@ -594,8 +594,7 @@ impl Qwen3_5MTPModule {
     /// prefix.
     ///
     /// Returns a SUPERSET of the keys the loader requires
-    /// (`persistence::missing_mtp_required_weights` /
-    /// `mtp_drafter::missing_required_mtp_keys`): every top-level norm + fc
+    /// (`mtp_drafter::missing_required_mtp_keys`): every top-level norm + fc
     /// and, per MTP layer, the four attention projections, q/k/v norms, the
     /// three dense-MLP projections, and the two layer norms. Mirrors the
     /// per-layer Full-attention + Standard-MLP serialization branch in

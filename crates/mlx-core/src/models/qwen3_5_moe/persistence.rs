@@ -55,7 +55,7 @@ use crate::models::quantized_linear::{
 };
 
 /// Sanitize weights from HuggingFace format.
-fn sanitize_weights(
+pub(crate) fn sanitize_weights(
     mut params: HashMap<String, MxArray>,
     config: &Qwen3_5MoeConfig,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
@@ -438,6 +438,42 @@ fn normalize_moe_weight_map(
     }
 
     Ok(result)
+}
+
+/// The keys [`normalize_moe_weight_map`] gives the renamed `mtp.*` key `name`,
+/// from the name alone: per-expert tensors stack into `switch_mlp`, a fused
+/// `experts.gate_up_proj` splits into gate and up, `experts.down_proj` moves
+/// to `switch_mlp`. `has_individual_experts` is `sanitize_weights`' flag.
+pub(crate) fn mtp_expert_keys(name: &str, has_individual_experts: bool) -> Vec<String> {
+    let Some((prefix, rest)) = name
+        .split_once(".mlp.experts.")
+        .filter(|_| name.starts_with("mtp."))
+    else {
+        return vec![name.to_string()];
+    };
+    let tensor = |base: &str| {
+        let suffix = if name.ends_with(".scales") {
+            "scales"
+        } else if name.ends_with(".biases") {
+            "biases"
+        } else {
+            "weight"
+        };
+        format!("{prefix}.mlp.switch_mlp.{base}.{suffix}")
+    };
+    let mut parts = rest.split('.');
+    if has_individual_experts
+        && let (Some(_), Some(proj), Some(_)) = (parts.next(), parts.next(), parts.next())
+    {
+        return vec![tensor(proj)];
+    }
+    if rest.starts_with("gate_up_proj") {
+        return vec![tensor("gate_proj"), tensor("up_proj")];
+    }
+    if rest.starts_with("down_proj") {
+        return vec![tensor("down_proj")];
+    }
+    vec![name.to_string()]
 }
 
 pub(crate) fn try_build_quantized_switch_linear(

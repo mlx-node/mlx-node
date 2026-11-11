@@ -1,6 +1,7 @@
 //! The memory plan a dense or MoE Qwen3.5 load serves its lanes from.
 
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -12,8 +13,11 @@ use crate::engine::memory_plan::{
     MemoryPlan, PlanError, PoolInput, SPECULATIVE_SCRATCH_TOKENS, check_max_context, live_memory,
     speculative_lane_bytes,
 };
+use crate::models::mtp_drafter::{
+    DrafterBodyVariant, detect_drafter_safetensors, missing_mtp_keys, reprefix_drafter_key,
+};
 use crate::models::quant_dispatch::{
-    has_sym8_mode, parse_quant_settings, select_quantization_block,
+    has_kquant_mode, has_sym8_mode, parse_quant_settings, select_quantization_block,
 };
 use crate::models::quantized_linear::{DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE};
 use crate::nn::rope_scaling::RopeScaling;
@@ -28,8 +32,10 @@ use super::dflash2_decode::{
     PrefillSdpaKernels, dflash2_lane_transient, flat_lane_transient, pool_lane_transient,
 };
 use super::dflash2_turn::{DFlash2Target, dflash2_target_kv_dtype, dflash2_target_kv_format};
-use super::persistence::{compute_dtype_of, qwen35_text_key};
-use crate::models::qwen3_5_moe::persistence::settled_compute_dtype;
+use super::persistence::{
+    compute_dtype_of, mtp_sidecar_candidates, normalize_mtp_weight_key, qwen35_text_key,
+};
+use crate::models::qwen3_5_moe::persistence::{mtp_expert_keys, settled_compute_dtype};
 
 /// The pool's element type for `format`. BF16 pages hold any compute dtype
 /// cast to bf16. Int8 pages exist only where mlx-node has the int8 store and
@@ -413,7 +419,7 @@ pub async fn estimate_qwen35_context_window(
                 asset_dir: source.asset_dir(),
                 moe,
                 weight_bytes,
-                compute: checkpoint_compute_dtype(&source, moe)?,
+                header: checkpoint_header(&source, moe)?,
                 draft_dir: options.draft_model_path.as_deref().map(Path::new),
                 kv_format,
                 max_memory_bytes,
@@ -467,55 +473,124 @@ pub(crate) fn checkpoint_weight_bytes(source: &CheckpointSource) -> Result<u64> 
     }
 }
 
-/// The compute dtype a load of `source` settles on: the loaders' rule over
-/// the dtypes the weights' headers give the sanitized keys. The GGUF ones
-/// are the import's.
-pub(crate) fn checkpoint_compute_dtype(source: &CheckpointSource, moe: bool) -> Result<DType> {
-    let mut raw_dtypes: Vec<(String, DType)> = Vec::new();
-    match source {
-        CheckpointSource::Dir(dir) => {
-            let mut fp8_scaled = std::collections::HashSet::new();
-            for path in checkpoint_safetensors_files(dir) {
-                for (name, info) in SafeTensorsFile::load(&path)?.tensors {
-                    if let Some(weight) = name.strip_suffix("_scale_inv") {
-                        fp8_scaled.insert(weight.to_string());
-                    }
-                    let dtype = match info.dtype {
-                        SafeTensorDType::F32 => DType::Float32,
-                        SafeTensorDType::F16 => DType::Float16,
-                        SafeTensorDType::BF16 => DType::BFloat16,
-                        SafeTensorDType::I32 => DType::Int32,
-                        SafeTensorDType::U32 => DType::Uint32,
-                        SafeTensorDType::I8 => DType::Int8,
-                        SafeTensorDType::U8 | SafeTensorDType::F8_E4M3 => DType::Uint8,
-                        SafeTensorDType::I64 | SafeTensorDType::F64 | SafeTensorDType::BOOL => {
-                            continue;
-                        }
-                    };
-                    raw_dtypes.push((name, dtype));
-                }
+/// What a load of a checkpoint reads from its weights, taken from the
+/// headers alone.
+pub(crate) struct CheckpointHeader {
+    /// The compute dtype the load settles on.
+    pub compute: DType,
+    /// The sanitized `mtp.*` keys the load's MTP gate sees, with their dtypes.
+    pub mtp: HashMap<String, DType>,
+}
+
+/// Each tensor's dtype in the safetensors files `paths`, an fp8 weight with
+/// a `_scale_inv` as the BF16 `dequant_fp8_weights` makes of it.
+fn safetensors_dtypes(paths: &[PathBuf]) -> Result<Vec<(String, DType)>> {
+    let mut dtypes = Vec::new();
+    let mut fp8_scaled = HashSet::new();
+    for path in paths {
+        for (name, info) in SafeTensorsFile::load(path)?.tensors {
+            if let Some(weight) = name.strip_suffix("_scale_inv") {
+                fp8_scaled.insert(weight.to_string());
             }
-            // `dequant_fp8_weights` replaces each scaled weight with BF16.
-            for (name, dtype) in &mut raw_dtypes {
-                if fp8_scaled.contains(name.as_str()) {
-                    *dtype = DType::BFloat16;
-                }
-            }
-        }
-        CheckpointSource::Gguf(checkpoint) => {
-            raw_dtypes = imported_dtypes(&checkpoint.main.1, &checkpoint.plans.0, &checkpoint.opts);
+            let dtype = match info.dtype {
+                SafeTensorDType::F32 => DType::Float32,
+                SafeTensorDType::F16 => DType::Float16,
+                SafeTensorDType::BF16 => DType::BFloat16,
+                SafeTensorDType::I32 => DType::Int32,
+                SafeTensorDType::U32 => DType::Uint32,
+                SafeTensorDType::I8 => DType::Int8,
+                SafeTensorDType::U8 | SafeTensorDType::F8_E4M3 => DType::Uint8,
+                SafeTensorDType::I64 | SafeTensorDType::F64 | SafeTensorDType::BOOL => continue,
+            };
+            dtypes.push((name, dtype));
         }
     }
-    let dtypes: std::collections::HashMap<String, DType> = raw_dtypes
+    for (name, dtype) in &mut dtypes {
+        if fp8_scaled.contains(name.as_str()) {
+            *dtype = DType::BFloat16;
+        }
+    }
+    Ok(dtypes)
+}
+
+/// The loaders' rule over the dtypes the weights' headers give the
+/// sanitized keys (the GGUF ones are the import's): the compute dtype, and
+/// the `mtp.*` keys from the body, else (no inline MTP) the dense loader's
+/// sidecar, else the split drafter.
+pub(crate) fn checkpoint_header(source: &CheckpointSource, moe: bool) -> Result<CheckpointHeader> {
+    let mut raw_dtypes = match source {
+        CheckpointSource::Dir(dir) => safetensors_dtypes(&checkpoint_safetensors_files(dir))?,
+        CheckpointSource::Gguf(checkpoint) => {
+            imported_dtypes(&checkpoint.main.1, &checkpoint.plans.0, &checkpoint.opts)
+        }
+    };
+    let asset_dir = source.asset_dir();
+    let raw = read_config_json(asset_dir)?;
+    let inline_mtp = raw_dtypes.iter().any(|(name, _)| {
+        if moe {
+            name.contains("mtp.")
+        } else {
+            normalize_mtp_weight_key(name).is_some()
+        }
+    });
+    if !inline_mtp {
+        let mut sidecar = Vec::new();
+        if !moe {
+            for candidate in mtp_sidecar_candidates(asset_dir, &raw) {
+                if !candidate.exists() {
+                    continue;
+                }
+                sidecar = safetensors_dtypes(&[candidate])?
+                    .into_iter()
+                    .filter_map(|(name, dtype)| Some((normalize_mtp_weight_key(&name)?, dtype)))
+                    .collect();
+                if !sidecar.is_empty() {
+                    break;
+                }
+            }
+        }
+        if sidecar.is_empty()
+            && let Some(drafter) = detect_drafter_safetensors(asset_dir)
+        {
+            sidecar = safetensors_dtypes(&[drafter])?
+                .into_iter()
+                .map(|(name, dtype)| (reprefix_drafter_key(&name), dtype))
+                .collect();
+        }
+        raw_dtypes.extend(sidecar);
+    }
+    let has_individual_experts = raw_dtypes
+        .iter()
+        .any(|(name, _)| name.contains(".mlp.experts.0.up_proj.weight"));
+    let dtypes: HashMap<String, DType> = raw_dtypes
         .into_iter()
         .filter_map(|(name, dtype)| Some((qwen35_text_key(&name)?, dtype)))
         .collect();
-    let dtype_of = |key: &str| dtypes.get(key).copied();
-    if !moe {
-        return Ok(compute_dtype_of(&dtype_of));
+    let mut mtp = HashMap::new();
+    for (name, dtype) in &dtypes {
+        if !name.starts_with("mtp.") {
+            continue;
+        }
+        if moe {
+            for key in mtp_expert_keys(name, has_individual_experts) {
+                mtp.insert(key, *dtype);
+            }
+        } else {
+            mtp.insert(name.clone(), *dtype);
+        }
     }
-    let config_path = source.asset_dir().join("config.json");
-    let raw: serde_json::Value = std::fs::read_to_string(&config_path)
+    let dtype_of = |key: &str| dtypes.get(key).copied();
+    let compute = if moe {
+        settled_compute_dtype(&raw, &dtype_of)
+    } else {
+        compute_dtype_of(&dtype_of)
+    };
+    Ok(CheckpointHeader { compute, mtp })
+}
+
+fn read_config_json(dir: &Path) -> Result<serde_json::Value> {
+    let config_path = dir.join("config.json");
+    std::fs::read_to_string(&config_path)
         .map_err(|error| {
             Error::from_reason(format!("Failed to read {}: {error}", config_path.display()))
         })
@@ -526,8 +601,7 @@ pub(crate) fn checkpoint_compute_dtype(source: &CheckpointSource, moe: bool) -> 
                     config_path.display()
                 ))
             })
-        })?;
-    Ok(settled_compute_dtype(&raw, &dtype_of))
+        })
 }
 
 pub(crate) struct EstimateInput<'a> {
@@ -535,8 +609,7 @@ pub(crate) struct EstimateInput<'a> {
     pub asset_dir: &'a Path,
     pub moe: bool,
     pub weight_bytes: u64,
-    /// [`checkpoint_compute_dtype`].
-    pub compute: DType,
+    pub header: CheckpointHeader,
     pub draft_dir: Option<&'a Path>,
     pub kv_format: Option<KvFormat>,
     pub max_memory_bytes: Option<u64>,
@@ -549,23 +622,16 @@ pub(crate) fn estimate_qwen35_load(
     label: &str,
     input: &EstimateInput<'_>,
 ) -> Result<Option<Qwen35ContextEstimate>> {
-    let config_path = input.asset_dir.join("config.json");
-    let raw: serde_json::Value = std::fs::read_to_string(&config_path)
-        .map_err(|error| {
-            Error::from_reason(format!("Failed to read {}: {error}", config_path.display()))
-        })
-        .and_then(|data| {
-            serde_json::from_str(&data).map_err(|error| {
-                Error::from_reason(format!(
-                    "Failed to parse {}: {error}",
-                    config_path.display()
-                ))
-            })
-        })?;
-    let mut config = if input.moe {
-        crate::models::qwen3_5_moe::persistence::parse_config(&raw)?.to_dense_config()
+    let raw = read_config_json(input.asset_dir)?;
+    let (mut config, mtp_body) = if input.moe {
+        let moe = crate::models::qwen3_5_moe::persistence::parse_config(&raw)?;
+        let body = crate::models::qwen3_5_moe::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(&moe);
+        (moe.to_dense_config(), body)
     } else {
-        crate::models::qwen3_5::persistence::parse_config(&raw)?
+        (
+            crate::models::qwen3_5::persistence::parse_config(&raw)?,
+            DrafterBodyVariant::Dense,
+        )
     };
     config.rope_scaling = Some(RopeScaling::served_for(
         label,
@@ -578,14 +644,31 @@ pub(crate) fn estimate_qwen35_load(
         DEFAULT_QUANT_BITS,
         DEFAULT_QUANT_GROUP_SIZE,
     )?;
+    let sym8 = has_sym8_mode(top_level_mode, &per_layer_quant);
     // Both loaders pin a sym8 checkpoint to flat KV after reading its quant block.
-    if has_sym8_mode(top_level_mode, &per_layer_quant) && config.use_block_paged_cache == Some(true)
-    {
+    if sym8 && config.use_block_paged_cache == Some(true) {
         config.use_block_paged_cache = Some(false);
     }
+    // The loaders turn the MTP head off for sym8 (both) and K-quant (MoE)
+    // checkpoints, and for an incomplete `mtp.*` set.
+    let mtp_head = config.n_mtp_layers > 0
+        && !sym8
+        && !(input.moe && has_kquant_mode(top_level_mode, &per_layer_quant))
+        && missing_mtp_keys(
+            &|key| {
+                input
+                    .header
+                    .mtp
+                    .get(key)
+                    .map(|dtype| *dtype == DType::Uint32)
+            },
+            mtp_body,
+            config.n_mtp_layers,
+        )
+        .is_empty();
     KvFormat::parse(config.kv_format.as_deref())
         .map_err(|message| Error::from_reason(format!("config.json: {message}")))?;
-    let compute = input.compute;
+    let compute = input.header.compute;
     let format = config.pin_kv_format(input.kv_format, compute);
     let draft = input
         .draft_dir
@@ -639,7 +722,7 @@ pub(crate) fn estimate_qwen35_load(
         draft,
         format,
         dtype: compute,
-        mtp: config.n_mtp_layers > 0 && draft.is_none(),
+        mtp: mtp_head && draft.is_none(),
         mtp_state_in_pool: qwen35_scheduler_books_state_in_pool(),
     };
     let plan = evaluate_qwen35_plan(label, &lanes, live, input.max_memory_bytes)?;

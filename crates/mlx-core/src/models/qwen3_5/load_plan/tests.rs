@@ -130,6 +130,14 @@ fn max_memory_load_option_reaches_the_plan() {
     }
 }
 
+/// A BF16 checkpoint with no `mtp.*` weights.
+fn bf16_header() -> CheckpointHeader {
+    CheckpointHeader {
+        compute: DType::BFloat16,
+        mtp: HashMap::new(),
+    }
+}
+
 fn estimate_fixture_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "mlx-qwen35-estimate-{tag}-{}-{}",
@@ -255,7 +263,7 @@ fn estimate_matches_the_load_plan() {
             asset_dir: &target,
             moe: false,
             weight_bytes,
-            compute: DType::BFloat16,
+            header: bf16_header(),
             draft_dir: Some(&draft),
             kv_format: None,
             max_memory_bytes: None,
@@ -351,7 +359,7 @@ fn estimate_follows_the_sym8_flat_pin() {
             asset_dir: &target,
             moe: false,
             weight_bytes: 16_000 << 20,
-            compute: DType::BFloat16,
+            header: bf16_header(),
             draft_dir: None,
             kv_format: None,
             max_memory_bytes: None,
@@ -403,7 +411,7 @@ fn flat_load_is_planned_under_max_memory() {
                 asset_dir: &target,
                 moe: false,
                 weight_bytes: 1 << 30,
-                compute: DType::BFloat16,
+                header: bf16_header(),
                 draft_dir: None,
                 kv_format: None,
                 max_memory_bytes,
@@ -468,7 +476,7 @@ fn max_context_caps_the_flat_lane() {
                 asset_dir: &target,
                 moe: false,
                 weight_bytes: 1 << 30,
-                compute: DType::BFloat16,
+                header: bf16_header(),
                 draft_dir: None,
                 kv_format: None,
                 max_memory_bytes: Some(4 << 30),
@@ -603,7 +611,7 @@ fn estimate_27b(
             asset_dir: &target,
             moe: false,
             weight_bytes: 16_000 * MIB,
-            compute: DType::BFloat16,
+            header: bf16_header(),
             draft_dir: Some(&draft),
             kv_format: None,
             max_memory_bytes,
@@ -835,7 +843,7 @@ fn unplanned_estimate_refuses_what_the_load_refuses() {
                 asset_dir: &target,
                 moe: false,
                 weight_bytes: 16_000 << 20,
-                compute: DType::BFloat16,
+                header: bf16_header(),
                 draft_dir: None,
                 kv_format: None,
                 max_memory_bytes: None,
@@ -975,11 +983,12 @@ fn write_safetensors(path: &std::path::Path, tensors: &[(&str, &str, &[usize])])
 /// The window, or the refusal, a load of the 27B fixture whose embedding
 /// computes in `compute` plans with 16,000 MiB of weights and no draft on
 /// the M3 Pro working set: the load's own format pin, pool dtype and lane
-/// dtype for that compute dtype.
+/// dtype for that compute dtype. `mtp` is the load's `has_mtp_weights`.
 fn load_window(
     target: &std::path::Path,
     compute: DType,
     kv_format: Option<KvFormat>,
+    mtp: bool,
 ) -> Result<u32> {
     let raw: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(target.join("config.json")).unwrap())
@@ -1015,8 +1024,8 @@ fn load_window(
         draft: None,
         format,
         dtype: compute,
-        mtp: false,
-        mtp_state_in_pool: false,
+        mtp,
+        mtp_state_in_pool: qwen35_scheduler_books_state_in_pool(),
     };
     let plan = evaluate_qwen35_plan(
         "Qwen3.5",
@@ -1059,8 +1068,9 @@ fn estimate_resolves_the_compute_dtype_like_the_load() {
                 ("model.language_model.norm.weight", dtype, &[4]),
             ],
         );
-        let resolved = checkpoint_compute_dtype(&CheckpointSource::Dir(target.clone()), false)
-            .expect("header compute dtype");
+        let resolved = checkpoint_header(&CheckpointSource::Dir(target.clone()), false)
+            .expect("header compute dtype")
+            .compute;
         assert_eq!(resolved, compute, "{tag}");
         let loaded: std::collections::HashMap<String, crate::array::MxArray> =
             crate::engine::persistence::load_all_safetensors(&target, false)
@@ -1092,7 +1102,10 @@ fn estimate_resolves_the_compute_dtype_like_the_load() {
                     asset_dir: &target,
                     moe: false,
                     weight_bytes: 16_000 * MIB,
-                    compute: resolved,
+                    header: CheckpointHeader {
+                        compute: resolved,
+                        mtp: HashMap::new(),
+                    },
                     draft_dir: None,
                     kv_format,
                     max_memory_bytes: None,
@@ -1100,7 +1113,7 @@ fn estimate_resolves_the_compute_dtype_like_the_load() {
                 },
             );
             crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
-            match (estimate, load_window(&target, compute, kv_format)) {
+            match (estimate, load_window(&target, compute, kv_format, false)) {
                 (Ok(estimate), Ok(window)) => assert_eq!(
                     estimate.expect("readable device").window_tokens,
                     window,
@@ -1145,10 +1158,241 @@ fn moe_estimate_aligns_the_affine_embedding() {
         ],
     );
     let source = CheckpointSource::Dir(target.clone());
-    let moe = checkpoint_compute_dtype(&source, true).expect("MoE compute dtype");
-    let dense = checkpoint_compute_dtype(&source, false).expect("dense compute dtype");
+    let moe = checkpoint_header(&source, true)
+        .expect("MoE compute dtype")
+        .compute;
+    let dense = checkpoint_header(&source, false)
+        .expect("dense compute dtype")
+        .compute;
     std::fs::remove_dir_all(&target).unwrap();
     std::fs::remove_dir_all(&draft).unwrap();
     assert_eq!(moe, DType::BFloat16);
     assert_eq!(dense, DType::Float16);
+}
+
+/// The MTP head's tensors in the raw checkpoint naming, every one present
+/// for one dense MTP layer.
+const DENSE_MTP_HEAD: [&str; 15] = [
+    "mtp.fc.weight",
+    "mtp.norm.weight",
+    "mtp.pre_fc_norm_embedding.weight",
+    "mtp.pre_fc_norm_hidden.weight",
+    "mtp.layers.0.input_layernorm.weight",
+    "mtp.layers.0.post_attention_layernorm.weight",
+    "mtp.layers.0.self_attn.q_norm.weight",
+    "mtp.layers.0.self_attn.k_norm.weight",
+    "mtp.layers.0.self_attn.q_proj.weight",
+    "mtp.layers.0.self_attn.k_proj.weight",
+    "mtp.layers.0.self_attn.v_proj.weight",
+    "mtp.layers.0.self_attn.o_proj.weight",
+    "mtp.layers.0.mlp.gate_proj.weight",
+    "mtp.layers.0.mlp.up_proj.weight",
+    "mtp.layers.0.mlp.down_proj.weight",
+];
+
+/// Adds `fields` to the fixture's `config.json`.
+fn extend_config(target: &std::path::Path, fields: serde_json::Value) {
+    let path = target.join("config.json");
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for (key, value) in fields.as_object().unwrap() {
+        raw[key] = value.clone();
+    }
+    std::fs::write(&path, raw.to_string()).unwrap();
+}
+
+/// The checkpoint's tensors as the load reads them, under the sanitized
+/// (renamed) keys.
+fn loaded_text_params(
+    target: &std::path::Path,
+) -> std::collections::HashMap<String, crate::array::MxArray> {
+    crate::engine::persistence::load_all_safetensors(target, false)
+        .unwrap()
+        .into_iter()
+        .filter_map(|(key, array)| {
+            Some((
+                crate::models::qwen3_5::persistence::qwen35_text_key(&key)?,
+                array,
+            ))
+        })
+        .collect()
+}
+
+/// The estimate charges the MTP state only when the load turns the head on:
+/// the loaders' completeness gate (`missing_required_mtp_keys`) over the
+/// header's `mtp.*` keys. A 27B fixture that declares one MTP layer: with
+/// every head weight the estimate takes the load's MTP window; with
+/// `o_proj` missing the load runs without MTP and so does the estimate.
+/// Mutation M1: the estimate prices MTP from `n_mtp_layers` alone → red
+/// (the partial head charged).
+#[test]
+fn estimate_prices_mtp_only_when_the_load_enables_it() {
+    let mut windows = Vec::new();
+    for missing in [None, Some("mtp.layers.0.self_attn.o_proj.weight")] {
+        let tag = if missing.is_some() {
+            "partial"
+        } else {
+            "complete"
+        };
+        let target = estimate_fixture_dir(&format!("mtp-{tag}"));
+        let draft = estimate_fixture_dir(&format!("mtp-{tag}-draft"));
+        write_27b_fixture(&target, &draft);
+        extend_config(&target, serde_json::json!({"mtp_num_hidden_layers": 1}));
+        let mut tensors: Vec<(&str, &str, &[usize])> = vec![
+            ("model.language_model.embed_tokens.weight", "BF16", &[8, 4]),
+            ("model.language_model.norm.weight", "BF16", &[4]),
+        ];
+        for name in DENSE_MTP_HEAD {
+            if Some(name) != missing {
+                tensors.push((name, "BF16", &[4, 4]));
+            }
+        }
+        write_safetensors(&target.join("model.safetensors"), &tensors);
+        let header = checkpoint_header(&CheckpointSource::Dir(target.clone()), false)
+            .expect("checkpoint header");
+        let loads = crate::models::mtp_drafter::missing_required_mtp_keys(
+            &loaded_text_params(&target),
+            crate::models::mtp_drafter::DrafterBodyVariant::Dense,
+            1,
+        )
+        .is_empty();
+        assert_eq!(loads, missing.is_none(), "{tag}: the load's gate");
+        crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| {
+            cell.set(Some(LiveMemory {
+                working_set_bytes: 27 << 30,
+                active_bytes: 0,
+                registered_pool_bytes: 0,
+            }))
+        });
+        let estimate = estimate_qwen35_load(
+            "Qwen3.5",
+            &EstimateInput {
+                asset_dir: &target,
+                moe: false,
+                weight_bytes: 16_000 * MIB,
+                header,
+                draft_dir: None,
+                kv_format: None,
+                max_memory_bytes: None,
+                max_context: None,
+            },
+        );
+        crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
+        let window = load_window(&target, DType::BFloat16, None, loads).expect("load plan");
+        std::fs::remove_dir_all(&target).unwrap();
+        std::fs::remove_dir_all(&draft).unwrap();
+        assert_eq!(
+            estimate
+                .expect("estimate")
+                .expect("readable device")
+                .window_tokens,
+            window,
+            "{tag}"
+        );
+        windows.push(window);
+    }
+    if crate::engine::persistence::compiled_forward_backend_available() {
+        assert!(
+            windows[0] < windows[1],
+            "the complete head is charged its MTP state: {windows:?}"
+        );
+    }
+}
+
+/// The MoE header names the inline MTP experts as `sanitize_weights` does:
+/// per-expert tensors, and a fused `experts.gate_up_proj` with
+/// `experts.down_proj`, both land on `switch_mlp`, so the loaders' gate
+/// reads the same `mtp.*` keys (and dtypes) from the header as from the
+/// sanitized arrays, and finds the head complete.
+/// Mutation M2: `mtp_expert_keys` keeps the raw name → red.
+#[test]
+fn moe_header_names_mtp_experts_like_the_sanitizer() {
+    let common = [
+        "mtp.fc.weight",
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.layers.0.input_layernorm.weight",
+        "mtp.layers.0.post_attention_layernorm.weight",
+        "mtp.layers.0.self_attn.q_norm.weight",
+        "mtp.layers.0.self_attn.k_norm.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "mtp.layers.0.self_attn.k_proj.weight",
+        "mtp.layers.0.self_attn.v_proj.weight",
+        "mtp.layers.0.self_attn.o_proj.weight",
+        "mtp.layers.0.mlp.gate.weight",
+        "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+        "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+        "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+        "mtp.layers.0.mlp.shared_expert_gate.weight",
+    ];
+    let per_expert: Vec<String> = (0..2)
+        .flat_map(|expert| {
+            ["gate_proj", "up_proj", "down_proj"]
+                .map(|proj| format!("mtp.layers.0.mlp.experts.{expert}.{proj}.weight"))
+        })
+        .collect();
+    let fused = [
+        "mtp.layers.0.mlp.experts.gate_up_proj".to_string(),
+        "mtp.layers.0.mlp.experts.down_proj".to_string(),
+    ];
+    for (tag, experts) in [
+        ("per-expert", per_expert.as_slice()),
+        ("fused", fused.as_slice()),
+    ] {
+        let target = estimate_fixture_dir(&format!("moe-mtp-{tag}"));
+        let draft = estimate_fixture_dir(&format!("moe-mtp-{tag}-draft"));
+        write_27b_fixture(&target, &draft);
+        extend_config(
+            &target,
+            serde_json::json!({
+                "model_type": "qwen3_5_moe",
+                "num_experts": 2,
+                "num_experts_per_tok": 1,
+                "moe_intermediate_size": 4,
+                "mtp_num_hidden_layers": 1,
+            }),
+        );
+        let mut tensors: Vec<(&str, &str, &[usize])> = vec![
+            ("model.language_model.embed_tokens.weight", "BF16", &[8, 4]),
+            ("model.language_model.norm.weight", "BF16", &[4]),
+        ];
+        for name in common {
+            tensors.push((name, "BF16", &[4]));
+        }
+        for name in experts {
+            tensors.push((name.as_str(), "BF16", &[2, 4, 4]));
+        }
+        write_safetensors(&target.join("model.safetensors"), &tensors);
+        let header = checkpoint_header(&CheckpointSource::Dir(target.clone()), true)
+            .expect("checkpoint header");
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(target.join("config.json")).unwrap())
+                .unwrap();
+        let config = crate::models::qwen3_5_moe::persistence::parse_config(&raw).unwrap();
+        let raw_params = crate::engine::persistence::load_all_safetensors(&target, false).unwrap();
+        std::fs::remove_dir_all(&target).unwrap();
+        std::fs::remove_dir_all(&draft).unwrap();
+        let sanitized = crate::models::qwen3_5_moe::persistence::sanitize_weights(
+            raw_params,
+            &config,
+            &HashMap::new(),
+        )
+        .expect("sanitize");
+        let loaded: HashMap<String, DType> = sanitized
+            .iter()
+            .filter(|(key, _)| key.starts_with("mtp."))
+            .map(|(key, array)| (key.clone(), array.dtype().unwrap()))
+            .collect();
+        assert_eq!(header.mtp, loaded, "{tag}");
+        assert!(
+            crate::models::mtp_drafter::missing_required_mtp_keys(
+                &sanitized,
+                crate::models::mtp_drafter::DrafterBodyVariant::Moe,
+                1,
+            )
+            .is_empty(),
+            "{tag}: the fixture is a complete head"
+        );
+    }
 }
