@@ -203,6 +203,25 @@ pub(crate) trait VictimSource {
     fn take(&mut self, query: &VictimQuery, victim: &Victim) -> Taken;
 }
 
+/// A model source's units in two runs (Splash `Cache::WalkCursor::Phase`): `ahead`
+/// (the empty extents, the stored checkpoints no turn uses, oldest first,
+/// then the dead leaves) goes before every other unit of the source;
+/// `merged` is in stamp order, into which the scheduler merges its idle
+/// owners.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct UnitRuns {
+    pub(crate) ahead: Vec<Victim>,
+    pub(crate) merged: Vec<Victim>,
+}
+
+impl UnitRuns {
+    pub(crate) fn into_units(self) -> Vec<Victim> {
+        let mut units = self.ahead;
+        units.extend(self.merged);
+        units
+    }
+}
+
 /// The prompts of requests waiting for a lane (Splash
 /// `Cache::setWantedChains`): a claim without certain reuse keeps the
 /// states they restore through. Matched by tokens: no salt or image keys.

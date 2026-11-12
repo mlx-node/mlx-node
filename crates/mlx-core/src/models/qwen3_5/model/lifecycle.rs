@@ -886,6 +886,19 @@ impl Qwen35Inner {
         !self.paged_gdn_state_dirty && self.cached_paged_image_token_positions.is_empty()
     }
 
+    /// The lane's draft ring and context window go to the idle lane (Splash
+    /// `QwenStateStorage::releaseLane`).
+    pub(crate) fn idle_dflash2_lane(&mut self) {
+        let ring = self.dflash2_context.take();
+        self.dflash2_states.idle_lane.give_ring(ring);
+        let turn = self.dflash2_turn_state.take();
+        self.dflash2_states
+            .idle_lane
+            .give_ring(turn.map(|turn| turn.context));
+        let window = self.dflash2_states.lane_window.take();
+        self.dflash2_states.idle_lane.give_window(window);
+    }
+
     /// Clear cached token history, image key, and rope deltas.
     fn clear_reuse_state(&mut self) {
         self.cached_token_history.clear();
@@ -895,6 +908,7 @@ impl Qwen35Inner {
         self.gdn_prefix_checkpoints.clear();
         self.gdn_last_history_checkpoint = None;
         self.gdn_in_use.clear();
+        self.dflash2_states.end_all_restored();
         self.gdn_restored_from = None;
         self.paged_turn_seq = None;
         self.sync_gdn_state_marks();
@@ -930,7 +944,8 @@ impl Qwen35Inner {
             }
         }
         self.caches = None;
-        self.dflash2_states.drop_unregistered();
+        self.idle_dflash2_lane();
+        self.dflash2_states.end_turn();
         self.clear_reuse_state();
     }
 

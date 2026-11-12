@@ -32,7 +32,8 @@ use crate::engine::governor::governor::{
 };
 use crate::engine::governor::ledger::{
     CertainReuse, ClaimClass, ClaimRank, ClaimSpec, Need, NeedTiming, ReachClass, Stage,
-    Taken as LedgerTaken, UnitKey as LedgerKey, Victim, VictimQuery, VictimSource, WantedChains,
+    Taken as LedgerTaken, UnitKey as LedgerKey, UnitRuns, Victim, VictimQuery, VictimSource,
+    WantedChains,
 };
 use crate::engine::governor::metrics::{GapClock, PassWork, Timeline, TtftClock, WholeTurnScope};
 use crate::engine::governor::wait::{
@@ -208,8 +209,8 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     /// The model's units on the ledger's order, in its take order (Splash's
     /// cache walk), none that `kept` restores through; the scheduler adds
     /// the idle owners.
-    fn victim_units(&self, _query: &VictimQuery, _kept: &[u32]) -> Vec<Victim> {
-        Vec::new()
+    fn victim_units(&self, _query: &VictimQuery, _kept: &[u32]) -> UnitRuns {
+        UnitRuns::default()
     }
     fn take_victim(
         &mut self,
@@ -223,6 +224,12 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     /// have reached goes (Splash restarts the engine).
     /// The model's accounts on the governor's books.
     fn memory_accounts(&self) -> Option<MemoryAccounts> {
+        None
+    }
+    /// The model's DFlash2 states for the governor's status.
+    fn dflash2_state_status(
+        &self,
+    ) -> Option<crate::engine::governor::governor::DFlash2StateStatus> {
         None
     }
     fn reset_after_gpu_oom(&mut self) -> Result<()> {
@@ -2042,17 +2049,18 @@ impl<B: HybridSchedulerBackend> SchedUnits<'_, B> {
 }
 
 impl<B: HybridSchedulerBackend> VictimSource for SchedUnits<'_, B> {
+    /// The model's checkpoints go first (Splash `Phase::Checkpoints`),
+    /// ahead of an older idle owner.
     fn units(&self, query: &VictimQuery) -> Vec<Victim> {
-        let mut units: Vec<(Victim, bool)> = self
-            .state
-            .inner
-            .victim_units(query, self.kept)
+        let UnitRuns { mut ahead, merged } = self.state.inner.victim_units(query, self.kept);
+        let mut units: Vec<(Victim, bool)> = merged
             .into_iter()
             .map(|unit| (unit, false))
             .chain(self.owner_units(query).into_iter().map(|unit| (unit, true)))
             .collect();
         units.sort_by_key(|(unit, owner)| (unit.stage, unit.stamp, *owner));
-        units.into_iter().map(|(unit, _)| unit).collect()
+        ahead.extend(units.into_iter().map(|(unit, _)| unit));
+        ahead
     }
 
     /// An owner's take credits the measured drop in MLX's active bytes and
@@ -4250,6 +4258,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             && let Some(accounts) = self.inner.memory_accounts()
         {
             governor.publish_accounts(model, accounts);
+            if let Some(states) = self.inner.dflash2_state_status() {
+                governor.publish_dflash2_states(model, states);
+            }
             self.accounts_due = now + crate::engine::governor::monitor::MONITOR_PERIOD_SECONDS;
         }
     }
@@ -9618,13 +9629,139 @@ pub(crate) mod tests {
             },
         };
         let listed = |kept: &[u32]| {
-            state.inner.victim_units(&query, kept).into_iter().any(|unit| {
+            state.inner.victim_units(&query, kept).into_units().into_iter().any(|unit| {
                 unit.stage == Stage::InUse
                     && matches!(unit.key, LedgerKey::Ladder { final_block_hash, .. } if final_block_hash == r)
             })
         };
         assert!(!listed(&prompt));
         assert!(listed(&[]));
+    }
+
+    /// Stored checkpoints go first among the model's units (Splash
+    /// `Cache::nextUnit`: `Phase::Checkpoints` before `Phase::Ordinary`),
+    /// ahead of an older idle owner; the rest stays in stamp order. A
+    /// bytes need one unit covers takes the checkpoint. A pages-only walk
+    /// lists no checkpoint.
+    /// Mutation CF1 (`SchedUnits` merges checkpoints into the stamp order)
+    /// → red (the owner is listed first).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn checkpoints_go_before_ordinary_states() {
+        use crate::engine::governor::ledger::TakeRights;
+        use crate::models::qwen3_5::dflash2_state::paged::PagedAnchor;
+        use crate::models::qwen3_5::dflash2_state::store::{Lineage, StateClass};
+        use crate::models::qwen3_5::dflash2_turn::{Keep, model_units};
+        use crate::models::qwen3_5::draft_context::DraftContextWindow;
+        let Some(mut state) = qwen35_pool_state(8, 8, passing()) else {
+            return;
+        };
+        drop(speculative::tests::request(
+            &mut state.inner,
+            2,
+            (0..20).map(|token| 400 + token).collect(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        state.owner_sequences.insert("idle".into(), 2);
+        state.owner_last_used.insert(2, 0);
+        let anchor = || PagedAnchor {
+            linear: Vec::new(),
+            window: DraftContextWindow::new(64, 8).expect("window"),
+        };
+        let (ordinary, checkpoint) = (tokens_of(41, 1), tokens_of(42, 1));
+        let store = &mut state.inner.dflash2_states.store;
+        let o = store
+            .insert(Lineage::text(&ordinary, 0), anchor(), StateClass::Ordinary)
+            .expect("ordinary")
+            .id;
+        let c = store
+            .insert(
+                Lineage::text(&checkpoint, 0),
+                anchor(),
+                StateClass::Checkpoint,
+            )
+            .expect("checkpoint")
+            .id;
+        store.touch(c);
+        let stamp = |id| store.get(id).expect("stored").last_used();
+        let (o_stamp, c_stamp) = (stamp(o), stamp(c));
+        assert!(o_stamp + 1 < c_stamp);
+        let r = rung(&mut state, 43, 1, o_stamp + 1)[0];
+        let r_key = LedgerKey::Ladder {
+            owner_id: String::new(),
+            prefix_len: 16,
+            final_block_hash: r,
+        };
+        let query = |need: Need| VictimQuery {
+            rights: TakeRights {
+                units: true,
+                certain_reuse: CertainReuse::All,
+                ..TakeRights::default()
+            },
+            need,
+        };
+        let bytes = query(Need {
+            bytes: 1,
+            ..Need::default()
+        });
+        let keys = |units: Vec<Victim>| -> Vec<LedgerKey> {
+            units
+                .into_iter()
+                .map(|unit| match unit.key {
+                    LedgerKey::Ladder {
+                        prefix_len,
+                        final_block_hash,
+                        ..
+                    } => LedgerKey::Ladder {
+                        owner_id: String::new(),
+                        prefix_len,
+                        final_block_hash,
+                    },
+                    key => key,
+                })
+                .filter(|key| *key != LedgerKey::Extent)
+                .collect()
+        };
+        assert_eq!(
+            keys(model_units(&state.inner, Keep::default(), &bytes).into_units()),
+            vec![LedgerKey::Store(c), LedgerKey::Store(o), r_key.clone()]
+        );
+        let pages = query(Need {
+            pages: 1,
+            kv: true,
+            host_refused: true,
+            ..Need::default()
+        });
+        assert!(
+            !keys(model_units(&state.inner, Keep::default(), &pages).into_units())
+                .contains(&LedgerKey::Store(c)),
+            "a pages-only walk skips checkpoints"
+        );
+        let mut units = SchedUnits {
+            state: &mut state,
+            claimant: 1,
+            kept: &[],
+        };
+        let listed = keys(units.units(&bytes));
+        assert_eq!(
+            listed,
+            vec![
+                LedgerKey::Store(c),
+                LedgerKey::Owner(2),
+                LedgerKey::Store(o),
+                r_key
+            ]
+        );
+        let head = units
+            .units(&bytes)
+            .into_iter()
+            .find(|unit| unit.key != LedgerKey::Extent)
+            .expect("a unit");
+        units.take(&bytes, &head);
+        let after = keys(units.units(&bytes));
+        assert!(!after.contains(&LedgerKey::Store(c)), "the checkpoint went");
+        assert!(after.contains(&LedgerKey::Owner(2)), "the owner stays");
     }
 
     /// MoE twin of `lone_turn_takes_a_suspended_turns_replay_point_last`.

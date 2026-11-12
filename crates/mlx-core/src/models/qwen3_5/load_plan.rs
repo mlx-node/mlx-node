@@ -172,7 +172,8 @@ pub(crate) struct PoolGeometry {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DraftTerms {
     pub tap_layers: usize,
-    pub ring_bytes: u64,
+    /// The lane's draft ring and context window.
+    pub lane_bytes: u64,
     pub weight_bytes: u64,
 }
 
@@ -180,7 +181,7 @@ impl DraftTerms {
     pub(crate) fn of(config: &DFlash2Config, weight_bytes: u64) -> Self {
         Self {
             tap_layers: config.target_layers.len(),
-            ring_bytes: config.kv_ring_bytes(),
+            lane_bytes: config.lane_bytes(),
             weight_bytes,
         }
     }
@@ -240,7 +241,7 @@ pub(crate) fn evaluate_qwen35_plan(
     // A DFlash2 turn runs alone on the Barrier lane, so its state is never
     // booked in the pool.
     let draft_state =
-        draft.map(|draft| dflash2_lane_state_bytes(recurrent_state_bytes, draft.ring_bytes));
+        draft.map(|draft| dflash2_lane_state_bytes(recurrent_state_bytes, draft.lane_bytes));
     let lane_state = |window: u32| match draft_state {
         Some(bytes) => bytes,
         None if mtp => super::scheduled_mtp::ScheduledMtpState::held_bytes(config, window),

@@ -775,10 +775,11 @@ fn unplanned_estimate_refuses_what_the_load_refuses() {
 /// Gate: the DFlash2 lane takes the one pool window (Splash
 /// `CompositeStateLayout::laneBytes`). M3 Pro inputs (27 GiB working set,
 /// 17,357 MiB active, the 27B with its DFlash2 draft), int8 pool: the lane
-/// state (a GDN cell and the draft ring, 201,273,344) sits beside the pool,
+/// state (a GDN cell, the draft ring and the 4-bit context window,
+/// 201,949,184) sits beside the pool,
 /// the transient is the larger of the tapped prefill chunk and the 8-row
 /// verify cycle with its free pool (491,126,784), the page is 1,064,960 B
-/// in 128-page extents and the runway one extent plus a cell: 14,137 blocks
+/// in 128-page extents and the runway one extent plus a cell: 14,136 blocks
 /// (7,178 MiB), window 221,177. No flat lane. A bf16 pool on the same
 /// inputs holds 112,473.
 /// Mutations: drop the draft state from the pool lane in
@@ -791,11 +792,11 @@ fn dflash2_takes_the_one_pool_window() {
     let int8 = plan_27b_as("int8-window", 27 << 30, None, 262_144, Some(KvFormat::Int8));
     let pool = int8.pool.expect("pool lane");
     assert_eq!(pool.bytes_per_block, 532_480);
-    assert_eq!(pool.max_blocks, 14_137);
+    assert_eq!(pool.max_blocks, 14_136);
     assert_eq!(pool.max_mib(), 7_178);
     assert_eq!(pool.runway_blocks, 546);
     assert_eq!(pool.lane.transient_bytes, 491_126_784);
-    assert_eq!(pool.lane.lane_bytes, cell + 201_273_344);
+    assert_eq!(pool.lane.lane_bytes, cell + 201_949_184);
     assert_eq!(pool.lane.extent_pages, 128);
     assert_eq!(pool.lane.window.maximum(), 221_177);
     assert_eq!(pool.lane.window.bound(), "memory");

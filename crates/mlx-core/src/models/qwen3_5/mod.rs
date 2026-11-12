@@ -8,6 +8,7 @@ pub(crate) mod dflash2_decode;
 #[doc(hidden)]
 pub mod dflash2_state;
 pub(crate) mod dflash2_turn;
+pub(crate) mod draft_context;
 pub mod gated_delta;
 pub mod gated_delta_net;
 pub(crate) mod gdn_blob;

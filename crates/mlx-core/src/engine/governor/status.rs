@@ -4,7 +4,9 @@
 
 use napi_derive::napi;
 
-use super::governor::{Counters, Governor, GovernorSnapshot, ResourceWaitStatus, SchedulerStatus};
+use super::governor::{
+    Counters, DFlash2StateStatus, Governor, GovernorSnapshot, ResourceWaitStatus, SchedulerStatus,
+};
 use super::metrics::{GAP_CAUSES, Metrics, TtftPart};
 use crate::engine::latency::LatencyStats;
 use crate::engine::scheduler::DECODE_GAP_MS;
@@ -17,6 +19,7 @@ pub(crate) struct GovernorStatus {
     pub metrics: Metrics,
     pub decisions: Vec<String>,
     pub scheduler: Vec<SchedulerStatus>,
+    pub dflash2_states: DFlash2StateStatus,
 }
 
 /// `None` while no model is registered.
@@ -31,6 +34,7 @@ pub(crate) fn status(governor: &Governor) -> Option<GovernorStatus> {
         metrics: governor.metrics(),
         decisions: governor.decisions(),
         scheduler: governor.schedulers(),
+        dflash2_states: governor.dflash2_states(),
     })
 }
 
@@ -198,6 +202,53 @@ impl From<SchedulerStatus> for MemoryGovernorScheduler {
     }
 }
 
+/// The DFlash2 states of the registered models, summed (Splash `Engine`
+/// state counters, `lazyJunctions`, and the state cache's snapshot).
+#[napi(object)]
+pub struct MemoryGovernorDFlash2States {
+    pub checkpoint_publications: f64,
+    pub replay_state_publications: f64,
+    pub junction_materializations: f64,
+    pub checkpoint_publication_failures: f64,
+    pub replay_state_publication_failures: f64,
+    pub junction_materialization_failures: f64,
+    pub deduplicated_state_publications: f64,
+    pub recycled_state_publications: f64,
+    pub checkpoint_retirements: f64,
+    pub lazy_junctions: f64,
+    pub checkpoint_evictions: f64,
+    pub evictions: f64,
+    pub entries: f64,
+    pub bytes: f64,
+    pub checkpoint_entries: f64,
+    pub checkpoint_bytes: f64,
+    pub in_use: f64,
+}
+
+impl From<DFlash2StateStatus> for MemoryGovernorDFlash2States {
+    fn from(states: DFlash2StateStatus) -> Self {
+        Self {
+            checkpoint_publications: states.checkpoint_publications as f64,
+            replay_state_publications: states.replay_state_publications as f64,
+            junction_materializations: states.junction_materializations as f64,
+            checkpoint_publication_failures: states.checkpoint_publication_failures as f64,
+            replay_state_publication_failures: states.replay_state_publication_failures as f64,
+            junction_materialization_failures: states.junction_materialization_failures as f64,
+            deduplicated_state_publications: states.deduplicated_state_publications as f64,
+            recycled_state_publications: states.recycled_state_publications as f64,
+            checkpoint_retirements: states.checkpoint_retirements as f64,
+            lazy_junctions: states.lazy_junctions as f64,
+            checkpoint_evictions: states.checkpoint_evictions as f64,
+            evictions: states.evictions as f64,
+            entries: states.entries as f64,
+            bytes: states.bytes as f64,
+            checkpoint_entries: states.checkpoint_entries as f64,
+            checkpoint_bytes: states.checkpoint_bytes as f64,
+            in_use: states.in_use as f64,
+        }
+    }
+}
+
 #[napi(object)]
 pub struct MemoryGovernorStatus {
     pub limit: f64,
@@ -220,6 +271,7 @@ pub struct MemoryGovernorStatus {
     pub decisions: Vec<String>,
     /// One per model whose scheduler registered.
     pub scheduler: Vec<MemoryGovernorScheduler>,
+    pub dflash2_states: MemoryGovernorDFlash2States,
 }
 
 impl From<GovernorStatus> for MemoryGovernorStatus {
@@ -231,6 +283,7 @@ impl From<GovernorStatus> for MemoryGovernorStatus {
             metrics,
             decisions,
             scheduler,
+            dflash2_states,
         } = status;
         let ledger = &snapshot.ledger;
         let cause = |at: usize| MemoryGovernorGapCause {
@@ -313,6 +366,7 @@ impl From<GovernorStatus> for MemoryGovernorStatus {
                 .into_iter()
                 .map(MemoryGovernorScheduler::from)
                 .collect(),
+            dflash2_states: dflash2_states.into(),
         }
     }
 }
@@ -350,6 +404,14 @@ mod tests {
                 embeddings: 0,
             },
         );
+        governor.publish_dflash2_states(
+            7,
+            DFlash2StateStatus {
+                checkpoint_publications: 5,
+                lazy_junctions: 1,
+                ..DFlash2StateStatus::default()
+            },
+        );
         governor.first_tokens(&[0.5, 0.25, 0.0, 0.0]);
         governor.decode_gap(&Gap {
             seconds: 0.75,
@@ -371,6 +433,8 @@ mod tests {
         assert_eq!(js.decode_gap_causes.claim_wait.ms, 750.0);
         assert_eq!(js.decode_gap_ms.max, 750.0);
         assert_eq!(js.counters.capacity_exhausted, 1.0);
+        assert_eq!(js.dflash2_states.checkpoint_publications, 5.0);
+        assert_eq!(js.dflash2_states.lazy_junctions, 1.0);
         assert_eq!(js.pressure, "normal");
         if let Some(process) = memory_governor_status() {
             assert_eq!(

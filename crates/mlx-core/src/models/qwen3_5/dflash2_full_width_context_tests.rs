@@ -4,9 +4,6 @@ fn full_width_test_model() -> super::DFlash2Model {
     model.config.block_size = 7;
     model.config.sliding_window = 8;
     model.selector.top_k = 16;
-    for layer in &mut model.layers {
-        layer.attention.sliding_window = 8;
-    }
     model
 }
 
@@ -79,22 +76,18 @@ fn full_width_context_retained_bits_match_full_m8_projection() {
 }
 
 #[test]
-fn full_width_context_stores_only_retained_prefix_through_compaction() {
+fn full_width_context_stores_only_retained_prefix_through_the_ring_wrap() {
     if !unsafe { mlx_sys::mlx_metal_is_available() } {
         return;
     }
     let mut model = full_width_test_model();
     model.config.sliding_window = 17;
-    for layer in &mut model.layers {
-        layer.attention.sliding_window = 17;
-    }
     let window_rows = 16i64;
     let mut context = super::DFlash2ContextCache::new(&model.config);
     let mut expected: Vec<Option<(MxArray, MxArray)>> =
         (0..model.layers.len()).map(|_| None).collect();
     let mut tokens = Vec::new();
-    let mut saw_compaction = false;
-    let mut previous_end = 0;
+    let mut saw_wrap = false;
     for cycle in 0..80 {
         let keep = [1usize, 3, 8, 2, 7][cycle % 5];
         let taps = full_width_test_taps(&model, 0x8FC0 + cycle as u64);
@@ -137,11 +130,9 @@ fn full_width_context_stores_only_retained_prefix_through_compaction() {
                 tokens.len().min(window_rows as usize)
             );
         }
-        let end = context.layers[0].end;
-        saw_compaction |= end < previous_end;
-        previous_end = end;
+        saw_wrap |= context.layers[0].wrapped();
     }
-    assert!(saw_compaction, "fixture must exhaust reserved capacity");
+    assert!(saw_wrap, "fixture must wrap the ring");
 }
 
 #[test]
@@ -443,7 +434,6 @@ fn compiled_draft_attention_masked_key_growth_and_saturation() {
         num_heads: 32,
         num_kv_heads: 8,
         head_dim: 128,
-        sliding_window: 2048,
     };
     for enabled in [false, true] {
         attention.tensor_attention_enabled = enabled;

@@ -2349,6 +2349,36 @@ unsafe extern "C-unwind" {
     // (Metal device with residency sets).
     pub fn mlx_kv_store_batched_available() -> bool;
 
+    // The DFlash2 4-bit draft context window: a u8 buffer of `slots` rows of
+    // `width` values (codes first, then fp16 scale/minimum per 64-value
+    // group); row p lives in slot p % slots. The store writes bf16 `rows`
+    // `[n, width]` (n <= slots) starting at row `first_row` in place, and
+    // the copy writes `src`'s bytes into `dst` in place; `out` is the window
+    // handle to adopt. The load reads rows `[first_row, first_row + rows)`
+    // as bf16 `[rows, width]`. All return false without Metal or on a
+    // contract violation.
+    pub fn mlx_draft_context_store(
+        window: *mut mlx_array,
+        rows: *mut mlx_array,
+        first_row: u32,
+        width: u32,
+        slots: u32,
+        out: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_draft_context_load(
+        window: *mut mlx_array,
+        first_row: u32,
+        rows: u32,
+        width: u32,
+        slots: u32,
+        out: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_draft_context_copy(
+        dst: *mut mlx_array,
+        src: *mut mlx_array,
+        out: *mut *mut mlx_array,
+    ) -> bool;
+
     // Store bf16 `rows` `[n, dim]` into a page pool's bf16 index plane at
     // plane rows `slots` (int32 `[n]`), in place; `out` is the plane handle
     // to adopt. False without Metal or on a contract violation.

@@ -201,11 +201,35 @@ export interface MemoryGovernorHealth {
   decode_gap_ms: { p50: number; p99: number; max: number };
   decisions: string[];
   scheduler: SchedulerHealth[];
+  /** Splash's DFlash2 state counters and state cache, summed over models. */
+  dflash2_states: DFlash2StatesHealth;
+}
+
+/** Splash's state publication counters and state-cache snapshot, in its keys. */
+export interface DFlash2StatesHealth {
+  checkpoint_publications: number;
+  replay_state_publications: number;
+  junction_materializations: number;
+  checkpoint_publication_failures: number;
+  replay_state_publication_failures: number;
+  junction_materialization_failures: number;
+  deduplicated_state_publications: number;
+  recycled_state_publications: number;
+  checkpoint_retirements: number;
+  lazy_junctions: number;
+  checkpoint_evictions: number;
+  evictions: number;
+  entries: number;
+  bytes: number;
+  checkpoint_entries: number;
+  checkpoint_bytes: number;
+  in_use: number;
 }
 
 /** The native status in `/health`'s keys. */
 export function toMemoryGovernorHealth(status: MemoryGovernorStatus): MemoryGovernorHealth {
   const causes = status.decodeGapCauses;
+  const states = status.dflash2States;
   return {
     limit: status.limit,
     charged: status.charged,
@@ -277,6 +301,25 @@ export function toMemoryGovernorHealth(status: MemoryGovernorStatus): MemoryGove
       bound_cuts: scheduler.boundCuts,
       replans: scheduler.replans,
     })),
+    dflash2_states: {
+      checkpoint_publications: states.checkpointPublications,
+      replay_state_publications: states.replayStatePublications,
+      junction_materializations: states.junctionMaterializations,
+      checkpoint_publication_failures: states.checkpointPublicationFailures,
+      replay_state_publication_failures: states.replayStatePublicationFailures,
+      junction_materialization_failures: states.junctionMaterializationFailures,
+      deduplicated_state_publications: states.deduplicatedStatePublications,
+      recycled_state_publications: states.recycledStatePublications,
+      checkpoint_retirements: states.checkpointRetirements,
+      lazy_junctions: states.lazyJunctions,
+      checkpoint_evictions: states.checkpointEvictions,
+      evictions: states.evictions,
+      entries: states.entries,
+      bytes: states.bytes,
+      checkpoint_entries: states.checkpointEntries,
+      checkpoint_bytes: states.checkpointBytes,
+      in_use: states.inUse,
+    },
   };
 }
 

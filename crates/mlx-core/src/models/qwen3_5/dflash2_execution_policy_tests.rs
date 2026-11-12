@@ -354,7 +354,6 @@ fn source_conv_test_model() -> super::DFlash2Model {
             num_heads: 32,
             num_kv_heads: 8,
             head_dim: 128,
-            sliding_window: 2048,
         },
         mlp: super::DFlash2Mlp {
             gate_proj: source_conv_test_linear(2048, 6144),
@@ -388,9 +387,9 @@ fn source_conv_test_model() -> super::DFlash2Model {
 fn source_conv_test_caches(
     config: &DFlash2Config,
     live: i64,
-    start: i64,
     position: i32,
 ) -> (super::DFlash2ContextCache, super::DFlash2ContextCache) {
+    let end = i64::from(position);
     let mut eager = super::DFlash2ContextCache::new(config);
     let mut compiled = super::DFlash2ContextCache::new(config);
     eager.logical_len = position;
@@ -398,7 +397,7 @@ fn source_conv_test_caches(
     for (left, right) in eager.layers.iter_mut().zip(&mut compiled.layers) {
         for key in [true, false] {
             let data = MxArray::random_normal(
-                &[1, 8, start + live + 16, 128],
+                &[1, 8, config.sliding_window as i64 + 16, 128],
                 0.0,
                 0.25,
                 Some(DType::BFloat16),
@@ -414,10 +413,10 @@ fn source_conv_test_caches(
                 right.values = Some(copy);
             }
         }
-        left.start = start;
-        left.end = start + live;
-        right.start = start;
-        right.end = start + live;
+        left.start = end - live;
+        left.end = end;
+        right.start = end - live;
+        right.end = end;
     }
     (eager, compiled)
 }
@@ -434,13 +433,12 @@ fn source_draft_conv_compiled_replay_preserves_window_and_failure_state() {
         &MxArray::random_normal(&[32, 2048], 0.0, 0.2, Some(DType::BFloat16)).unwrap(),
     )
     .unwrap();
-    for (case, (live, start, position)) in
-        [(3, 0, 3), (7, 2, 100), (2047, 0, 32768), (2047, 3, 33001)]
+    for (case, (live, position)) in [(3, 3), (7, 100), (2047, 32768), (2047, 33001)]
             .into_iter()
             .enumerate()
     {
         let (mut eager, mut compiled) =
-            source_conv_test_caches(&model.config, live, start, position);
+            source_conv_test_caches(&model.config, live, position);
         let original_k = bits(&compiled.layers[0].view().unwrap().0);
         let original_v = bits(&compiled.layers[0].view().unwrap().1);
         let mut confidence = None;
@@ -489,7 +487,10 @@ fn source_draft_conv_compiled_replay_preserves_window_and_failure_state() {
                 bits(right.values.as_ref().unwrap()),
                 "V case{case}"
             );
-            assert_eq!((right.start, right.end), (start, start + live));
+            assert_eq!(
+                (right.start, right.end),
+                (i64::from(position) - live, i64::from(position))
+            );
         }
         assert_eq!(compiled.logical_len, position);
         assert_eq!(
@@ -509,7 +510,7 @@ fn source_draft_conv_compiled_replay_preserves_window_and_failure_state() {
     model.invalidate_compiled();
     let good = model.layers[0].attention_conv.base_kernel.clone();
     model.layers[0].attention_conv.base_kernel = good.astype(DType::Float32).unwrap();
-    let (mut eager, mut compiled) = source_conv_test_caches(&model.config, 3, 0, 3);
+    let (mut eager, mut compiled) = source_conv_test_caches(&model.config, 3, 3);
     let before = (
         bits(compiled.layers[0].keys.as_ref().unwrap()),
         bits(compiled.layers[0].values.as_ref().unwrap()),
@@ -577,7 +578,7 @@ fn source_draft_conv_compiled_replay_preserves_window_and_failure_state() {
         .compiled
         .prepared
         .store(true, super::Ordering::Relaxed);
-    let (mut retry_expected, mut recovered) = source_conv_test_caches(&model.config, 3, 0, 3);
+    let (mut retry_expected, mut recovered) = source_conv_test_caches(&model.config, 3, 3);
     let before = (
         bits(recovered.layers[0].keys.as_ref().unwrap()),
         bits(recovered.layers[0].values.as_ref().unwrap()),

@@ -13,9 +13,10 @@ const M3_PRO_ACTIVE: u64 = 17_357 * MIB;
 const STAGING: u64 = 64 * MIB;
 /// Qwen3.8-27B GDN cell (`Qwen3_5Config::recurrent_state_bytes`).
 const QWEN38_CELL: u64 = 153_944_064;
-/// The 27B draft's KV window buffers: 5 layers x 2 x 8 heads x 128 x 2 B x
-/// 2,311 rows.
-const QWEN38_DRAFT_RING: u64 = 5 * 2 * 8 * 128 * 2 * 2_311;
+/// The 27B draft's lane buffers: the KV ring, 5 layers x 2 x 8 heads x 128 x
+/// 2 B x 2,056 rows (2,048 slots and a 7-token block's 8 rows), and the 4-bit
+/// context window, 2,048 slots x (5,120 / 2 + 80 x 4) B.
+const QWEN38_DRAFT_LANE: u64 = 5 * 2 * 8 * 128 * 2 * 2_056 + 2_048 * (2_560 + 320);
 /// The 27B draft taps 5 target layers (`target_layer_ids`).
 const QWEN38_DRAFT_TAPS: usize = 5;
 /// Splash `family_values_golden.txt` 27B `lane`.
@@ -200,16 +201,15 @@ fn lane_math_reproduces_the_splash_golden_plan() {
 }
 
 /// mlx-node's 27B lane (the pool lane's cell and the DFlash2 state, Splash
-/// `CompositeStateLayout::laneBytes`) against Splash's: no 4-bit draft
-/// context window (−5,898,240), no 16 KiB alignment of the conv state
-/// (−2 x 196,608), a ring of 2,311 rows instead of 2,048 slots
-/// (+5,386,240). Mutation: drop the cell from `dflash2_lane_state_bytes` →
-/// red (201,273,344).
+/// `CompositeStateLayout::laneBytes`) against Splash's: no 16 KiB alignment
+/// of the conv state (−2 x 196,608), a ring of 2,056 rows instead of 2,048
+/// slots (+163,840). Mutation: drop the cell from `dflash2_lane_state_bytes`
+/// → red (201,949,184).
 #[test]
 fn qwen38_27b_lane_bytes_against_splash() {
-    let lane = QWEN38_CELL + dflash2_lane_state_bytes(QWEN38_CELL, QWEN38_DRAFT_RING);
-    assert_eq!(lane, 355_217_408);
-    assert_eq!(SPLASH_QWEN38_LANE - lane, 905_216);
+    let lane = QWEN38_CELL + dflash2_lane_state_bytes(QWEN38_CELL, QWEN38_DRAFT_LANE);
+    assert_eq!(lane, 355_893_248);
+    assert_eq!(SPLASH_QWEN38_LANE - lane, 229_376);
 }
 
 /// The M3 Pro plan. hard 23,568,633,036, fixed 17,357 MiB with 64 MiB of

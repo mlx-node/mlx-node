@@ -11,9 +11,9 @@ use crate::models::qwen3_5::model::{TokenPrefixMismatchTrace, token_prefix_misma
 
 pub(crate) const LEDGER_CAPACITY: usize = 32;
 
-/// A paged prefill captures a junction state at the KV hit only when the hit
-/// is this many tokens past the state it resumes from.
-pub(crate) const JUNCTION_MIN_GAP: usize = 2048;
+/// The draft window the offline designs plan with (Splash
+/// `draftContextTokens` of the 27B draft, the minimum junction gain).
+const DRAFT_WINDOW: u32 = 2048;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HitKind {
@@ -481,12 +481,17 @@ pub(crate) enum StateDesign {
     Paged,
 }
 
-/// The block-aligned depths a turn captures under `design` when it resumes
-/// at `resume` with a KV prefix hit of `kv_hit` tokens.
+/// The block-aligned depths a turn of a `prompt_len`-token prompt captures
+/// under `design` when it resumes at `resume` with a KV prefix hit of
+/// `kv_hit` tokens. The paged design plans the ordinary points only (Splash
+/// `configureDraftStatePlan` without its rolling checkpoints); a prompt
+/// without a known generation prompt replays from its last whole block
+/// before its last token (Splash `promptReplayBoundary`, a one-token tail).
 pub(crate) fn design_captures(
     design: StateDesign,
     block_size: u32,
     replay_point: Option<usize>,
+    prompt_len: usize,
     resume: usize,
     kv_hit: usize,
 ) -> Vec<usize> {
@@ -498,10 +503,24 @@ pub(crate) fn design_captures(
         captures.push(r);
     }
     if design == StateDesign::Paged {
-        let junction = kv_hit - kv_hit % block_size;
-        if junction > resume + JUNCTION_MIN_GAP && replay_point != Some(junction) {
-            captures.push(junction);
-        }
+        let to_u32 = |tokens: usize| u32::try_from(tokens).unwrap_or(u32::MAX);
+        let tail_replay = prompt_len.saturating_sub(1) / block_size * block_size;
+        let replay = to_u32(replay_point.unwrap_or(tail_replay));
+        let plan = super::plan::configure_draft_state_plan(&super::plan::PlanInputs {
+            resume: to_u32(resume),
+            junction: to_u32(kv_hit - kv_hit % block_size),
+            prompt_replay: replay,
+            replay_state: replay,
+            window: DRAFT_WINDOW,
+            interval: 0,
+            chunk: 0,
+        });
+        return plan
+            .boundaries
+            .iter()
+            .filter(|point| !point.disposable)
+            .map(|point| point.tokens as usize)
+            .collect();
     }
     captures
 }
@@ -538,7 +557,14 @@ pub(crate) fn ideal_prefill(
                 StateDesign::Flat => resume,
                 StateDesign::Paged => resume.max(ledger.shadow_hit(turn.prompt)),
             };
-            let captures = design_captures(design, block_size, turn.replay_point, resume, kv_hit);
+            let captures = design_captures(
+                design,
+                block_size,
+                turn.replay_point,
+                turn.prompt.len(),
+                resume,
+                kv_hit,
+            );
             ledger.record(LedgerTurn {
                 history: turn.history,
                 prompt_len: turn.prompt.len(),
@@ -984,7 +1010,14 @@ mod tests {
                 prompt_len: prompt.len(),
                 replay_point: r,
                 is_dflash2: true,
-                captures: &design_captures(StateDesign::Flat, BS, r, used.tokens, used.tokens),
+                captures: &design_captures(
+                    StateDesign::Flat,
+                    BS,
+                    r,
+                    prompt.len(),
+                    used.tokens,
+                    used.tokens,
+                ),
             });
             live_history = history.clone();
             (c, prompt.len(), history)
@@ -1117,8 +1150,20 @@ mod tests {
         let paged = ideal_prefill(StateDesign::Paged, BS, &turns);
         let paged_resume: Vec<usize> = paged.iter().map(|t| t.resume).collect();
         assert_eq!(paged_resume, [0, 0, 0, 123, 4160]);
-        assert_eq!(paged[2].captures, [4208, 4160]);
+        assert_eq!(paged[2].captures, [4160, 4208]);
         assert_eq!(paged[4].captures, [4208]);
         assert_eq!(paged.iter().map(|t| t.prefill).sum::<usize>(), 8_615);
+    }
+
+    /// A paged turn whose prompt has no known generation prompt still
+    /// captures its junction: its replay state is the last whole block
+    /// before its last token (Splash `promptReplayBoundary` with a
+    /// one-token tail), past the junction.
+    /// Mutation TJ1 (the replay state is 0 without a replay point) → red
+    /// (nothing captured).
+    #[test]
+    fn a_paged_turn_without_a_replay_point_keeps_its_junction() {
+        let captures = design_captures(StateDesign::Paged, BS, None, 5_000, 0, 4_100);
+        assert_eq!(captures, [4096, 4992]);
     }
 }

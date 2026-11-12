@@ -84,7 +84,6 @@ impl Qwen35Inner {
         let clone_start = trace_enabled.then(std::time::Instant::now);
         let Some(cloned) = crate::models::qwen3_5::dflash2_turn::publish_claimed(
             self,
-            crate::models::qwen3_5::dflash2_turn::Publication::Optional,
             bytes,
             Keep::default(),
             |inner| {
@@ -183,7 +182,7 @@ impl Qwen35Inner {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> Option<(u32, Vec<Qwen3_5LayerCache>)> {
-        let checkpoint_idx = find_longest_valid_gdn_checkpoint_index(
+        let rung = find_longest_valid_gdn_checkpoint_index(
             &self.gdn_prefix_checkpoints,
             &self.active_cache_owner_id,
             tokens,
@@ -192,7 +191,20 @@ impl Qwen35Inner {
             extra_keys_per_block,
             cache_salt,
             |checkpoint| dense_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)),
-        )?;
+        );
+        let rung_len = rung.map_or(0, |index| self.gdn_prefix_checkpoints[index].prefix_len);
+        if let Some((id, depth, caches)) = crate::models::qwen3_5::dflash2_turn::stored_gdn_prefix(
+            &*self,
+            tokens,
+            extra_keys_per_block,
+            cache_salt,
+            requested_prefix_len,
+            rung_len,
+        ) {
+            self.gdn_restored_from = Some(UnitKey::Store(id));
+            return Some((depth, caches));
+        }
+        let checkpoint_idx = rung?;
         let checkpoint = &self.gdn_prefix_checkpoints[checkpoint_idx];
         let prefix_len = checkpoint.prefix_len;
         let caches = clone_dense_linear_layer_caches(&self.config, &checkpoint.caches)?;
@@ -336,7 +348,6 @@ impl Qwen35Inner {
         let bytes = Qwen3_5LayerCache::linear_state_bytes(&checkpoint.caches);
         if crate::models::qwen3_5::dflash2_turn::publish_claimed(
             self,
-            crate::models::qwen3_5::dflash2_turn::Publication::Optional,
             bytes,
             Keep::default(),
             |_| (),
@@ -1060,6 +1071,9 @@ impl Qwen35Inner {
     fn record_gdn_use(&mut self, seq_id: Option<SeqId>, ok: bool) {
         let restored = self.gdn_restored_from.take();
         if ok && let (Some(seq_id), Some(key)) = (seq_id, restored) {
+            if let UnitKey::Store(id) = key {
+                self.dflash2_states.use_restored(seq_id, id);
+            }
             self.gdn_in_use.insert(seq_id, key);
         }
     }
@@ -1090,11 +1104,8 @@ impl Qwen35Inner {
                     entry.last_used = stamp;
                 }
             }
-            UnitKey::Store(_)
-            | UnitKey::Owner(_)
-            | UnitKey::Extent
-            | UnitKey::DeadLeaves
-            | UnitKey::Vision(_) => {}
+            UnitKey::Store(_) => self.dflash2_states.end_restored(seq_id),
+            UnitKey::Owner(_) | UnitKey::Extent | UnitKey::DeadLeaves | UnitKey::Vision(_) => {}
         }
     }
 
@@ -1213,6 +1224,12 @@ impl Qwen35Inner {
             .iter()
             .map(|entry| (entry.prefix_len, entry.final_block_hash, entry.last_used))
             .collect()
+    }
+
+    /// The dirty latch and the invalidations it counted.
+    #[cfg(test)]
+    pub(crate) fn gdn_dirty_for_test(&self) -> (bool, u64) {
+        (self.paged_gdn_state_dirty, self.paged_mtp_gdn_invalidations)
     }
 
     #[cfg(test)]

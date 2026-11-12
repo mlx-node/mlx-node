@@ -13,7 +13,6 @@ use super::trace::{
 use crate::engine::gen_prompt::replay_point;
 use crate::engine::session::SESSION_PRESERVE_THINKING;
 use crate::engine::types::ChatConfig;
-use crate::models::qwen3_5::dflash2_decode::live_window_prefix;
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 
 /// Token ids of unrecorded requests start here, above every real vocabulary,
@@ -137,6 +136,18 @@ fn history(prompt: &[u32], next: Option<&[u32]>, im_end: Option<u32>) -> (Vec<u3
     }
 }
 
+/// The prefix a turn of `tokens` continues on a live request of `live`
+/// tokens whose draft window ends with it, as the runtime once kept the
+/// lane live between turns: the whole live request when the prompt extends
+/// it by at least one token, else nothing.
+fn live_window_prefix(tokens: &[u32], live: &[u32]) -> usize {
+    if !live.is_empty() && live.len() < tokens.len() && tokens.starts_with(live) {
+        live.len()
+    } else {
+        0
+    }
+}
+
 /// Replays `requests` in order. Every request is a DFlash2 turn on one model.
 pub fn replay(
     tokenizer: &Qwen3Tokenizer,
@@ -207,8 +218,14 @@ pub fn replay(
         });
         let (history, generated_tokens) = &histories[index];
         let resume = classification.ideal.max(cached);
-        let captures =
-            trace::design_captures(StateDesign::Flat, block_size, *replay_point, resume, resume);
+        let captures = trace::design_captures(
+            StateDesign::Flat,
+            block_size,
+            *replay_point,
+            prompt.len(),
+            resume,
+            resume,
+        );
         ledger.record(LedgerTurn {
             history,
             prompt_len: prompt.len(),
