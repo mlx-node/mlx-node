@@ -106,8 +106,11 @@ export {
   countPromptTokens,
   isCapacityExhaustedError,
   isContextCapacityError,
+  isMetalOutOfMemoryError,
+  isResourceTimeoutError,
   mtpAutoDefaultAllowed,
   mtpOnByDefault,
+  retryableErrorCode,
   selectCommittedStreamText,
 } from './chat-session.js';
 export { ToolCallTagBuffer, longestSuffixPrefixOverlap } from './tool-call-buffer.js';

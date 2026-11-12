@@ -7,7 +7,9 @@ use crate::engine::backend::{DsparkBackend, DsparkProposal, DsparkStepper, Dspar
 
 use super::model::Qwen35MoeInner;
 use crate::models::qwen3_5::dflash2::DFlash2ContextCache;
-use crate::models::qwen3_5::dflash2_decode::{DraftedProposals, PagedVerifyLane, full_verify_ids};
+use crate::models::qwen3_5::dflash2_decode::{
+    DraftedProposals, PagedVerifyLane, full_verify_ids, lend_lane, missing_cells, reclaim_lane,
+};
 use crate::models::qwen3_5::dflash2_turn::{DFlash2Target, DFlash2TurnState};
 use crate::models::qwen3_5::gdn_blob::GdnStateBlobs;
 
@@ -20,8 +22,9 @@ pub(crate) struct Qwen35MoeDFlash2Stepper<'a> {
     tapped: Option<Vec<MxArray>>,
     verified_ids: Option<Vec<u32>>,
     /// The lane's two GDN cells and pending tape: each verify folds the
-    /// last commit's retained rows, each commit swaps parity.
-    gdn_blobs: GdnStateBlobs,
+    /// last commit's retained rows, each commit swaps parity. Lent to the
+    /// target across the verify's claim ([`lend_lane`]).
+    gdn_blobs: Option<GdnStateBlobs>,
     verify_confidence: Option<MxArray>,
     verify_row_budget: Option<MxArray>,
     paged: PagedVerifyLane,
@@ -33,6 +36,32 @@ fn prefer_full_width_context(keep: usize) -> bool {
 }
 
 impl Qwen35MoeDFlash2Stepper<'_> {
+    /// The verify's claim suspended and replayed the lane: the stepper takes
+    /// the draft window the tapped replay rebuilt and packs the GDN state
+    /// the replay left in the caches into fresh cells. The old cells and
+    /// their pending rows went with the vacate: the replay fed their
+    /// tokens.
+    fn adopt_replayed_lane(&mut self) -> Result<()> {
+        let Some(state) = self.inner.dflash2_turn_state.take() else {
+            return Ok(());
+        };
+        self.context = state.context;
+        self.next_position = state.next_position;
+        let tiled = self.inner.config.qwen35_gguf_gdn_layout.as_deref() == Some("tiled");
+        let caches =
+            self.inner.caches.as_mut().ok_or_else(|| {
+                Error::from_reason("Qwen3.5 MoE DFlash2 target caches are absent")
+            })?;
+        let gdn = GdnStateBlobs::pack(caches, tiled)?.ok_or_else(|| {
+            Error::from_reason(
+                "Qwen3.5 MoE DFlash2 needs packed GDN state (bf16 conv, f32 recurrent)",
+            )
+        })?;
+        gdn.apply_views(caches)?;
+        self.gdn_blobs = Some(gdn);
+        Ok(())
+    }
+
     fn ensure_clean(&self, operation: &str) -> Result<()> {
         if self.tape.is_some() || self.tapped.is_some() || self.verified_ids.is_some() {
             return Err(Error::from_reason(format!(
@@ -98,15 +127,33 @@ impl Qwen35MoeDFlash2Stepper<'_> {
         };
         let full = full_verify_ids(ids, &drafted)?;
         let (seq, window) = (self.paged.seq, self.paged.context_window);
-        crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(&mut *self.inner, |inner| {
-            inner
-                .paged_adapter
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 paged adapter is absent"))?
-                .reserve_rows(DFLASH2_VERIFY_ROWS as u32)
-                .map(|_| ())
-                .map_err(Error::from_reason)
-        })?;
+        let config = &self
+            .inner
+            .dflash2
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 model disappeared"))?
+            .config;
+        let lent = lend_lane(&mut self.gdn_blobs, &mut self.context, config);
+        self.inner.dflash2_lane = lent;
+        let claimed =
+            crate::models::qwen3_5::dflash2_turn::paged_step_claimed(&mut *self.inner, |inner| {
+                inner
+                    .paged_adapter
+                    .as_mut()
+                    .ok_or_else(|| {
+                        Error::from_reason("Qwen3.5 MoE DFlash2 paged adapter is absent")
+                    })?
+                    .reserve_rows(DFLASH2_VERIFY_ROWS as u32)
+                    .map(|_| ())
+                    .map_err(Error::from_reason)
+            });
+        reclaim_lane(
+            self.inner.dflash2_lane.take(),
+            &mut self.gdn_blobs,
+            &mut self.context,
+        );
+        claimed?;
+        self.adopt_replayed_lane()?;
         let ticket =
             crate::engine::spec_paged::SpecPagedCache::open_core_write_cycle(self, seq, full.len())
                 .map_err(Error::from_reason)?;
@@ -114,8 +161,12 @@ impl Qwen35MoeDFlash2Stepper<'_> {
         let result = {
             let inner = &mut *self.inner;
             let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
-            match (inner.caches.as_mut(), inner.paged_adapter.as_mut()) {
-                (Some(caches), Some(adapter)) => {
+            match (
+                inner.caches.as_mut(),
+                inner.paged_adapter.as_mut(),
+                self.gdn_blobs.as_ref(),
+            ) {
+                (Some(caches), Some(adapter), Some(gdn_blobs)) => {
                     super::paged_forward::run_paged_dflash2_verify_step(
                         &full,
                         &inner.embedding,
@@ -129,7 +180,7 @@ impl Qwen35MoeDFlash2Stepper<'_> {
                         rope_deltas,
                         super::paged_forward::PagedVerifyExtras {
                             tap_layers: &self.tap_layers,
-                            gdn: Some(&self.gdn_blobs),
+                            gdn: Some(gdn_blobs),
                             row_budget: self.verify_row_budget.as_ref(),
                         },
                         window,
@@ -361,7 +412,10 @@ impl DsparkStepper for Qwen35MoeDFlash2Stepper<'_> {
             )));
         }
         self.commit_paged_cycle(keep)?;
-        self.gdn_blobs.retain(&tape, keep)?;
+        self.gdn_blobs
+            .as_mut()
+            .ok_or_else(missing_cells)?
+            .retain(&tape, keep)?;
         self.append_tapped(&tapped, &verified_ids[..keep])
     }
 
@@ -399,7 +453,10 @@ impl DsparkStepper for Qwen35MoeDFlash2Stepper<'_> {
             self.inner.caches.as_mut().ok_or_else(|| {
                 Error::from_reason("Qwen3.5 MoE DFlash2 target caches are absent")
             })?;
-        self.gdn_blobs.settle(caches)?;
+        self.gdn_blobs
+            .as_mut()
+            .ok_or_else(missing_cells)?
+            .settle(caches)?;
         let config = self
             .inner
             .dflash2
@@ -486,6 +543,9 @@ impl DsparkBackend for Qwen35MoeInner {
                 ),
             ),
         };
+        if self.active_scheduled_seq.is_none() {
+            self.serial_decode = Some(crate::models::qwen3_5::dflash2_turn::SerialDecode::DFlash2);
+        }
         Ok(Qwen35MoeDFlash2Stepper {
             inner: self,
             context: state.context,
@@ -494,7 +554,7 @@ impl DsparkBackend for Qwen35MoeInner {
             tape: None,
             tapped: None,
             verified_ids: None,
-            gdn_blobs,
+            gdn_blobs: Some(gdn_blobs),
             verify_confidence: None,
             verify_row_budget: None,
             paged,
@@ -504,6 +564,7 @@ impl DsparkBackend for Qwen35MoeInner {
 
 impl Drop for Qwen35MoeDFlash2Stepper<'_> {
     fn drop(&mut self) {
+        self.inner.serial_decode = None;
         // A turn that failed between the verify write and its commit leaves
         // the cycle open; keeping every row closes the ticket, and the
         // turn's abort releases the request.
@@ -738,17 +799,7 @@ impl DFlash2Target for Qwen35MoeInner {
     ) -> Option<&mut crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter> {
         self.paged_adapter.as_mut()
     }
-    fn oldest_gdn_state(
-        &self,
-        at_cap: bool,
-        skip: &std::collections::HashSet<crate::engine::reclaim::UnitKey>,
-        keep: crate::models::qwen3_5::dflash2_turn::Keep<'_>,
-        in_use: bool,
-    ) -> Option<crate::engine::reclaim::Unit> {
-        Self::oldest_gdn_state_unit(self, at_cap, skip, keep, in_use)
-    }
-
-    fn drop_gdn_state(&mut self, key: &crate::engine::reclaim::UnitKey) -> bool {
+    fn drop_gdn_state(&mut self, key: &crate::engine::governor::ledger::UnitKey) -> bool {
         Self::drop_gdn_state(self, key)
     }
 
@@ -756,21 +807,6 @@ impl DFlash2Target for Qwen35MoeInner {
         Self::sync_gdn_state_marks(self);
     }
 
-    fn gdn_state_bytes(
-        &self,
-        keep: crate::models::qwen3_5::dflash2_turn::Keep<'_>,
-        in_use: bool,
-    ) -> u64 {
-        Self::gdn_state_bytes(self, keep, in_use)
-    }
-
-    fn marked_hit_blocks(&self, keep: crate::models::qwen3_5::dflash2_turn::Keep<'_>) -> u32 {
-        Self::marked_hit_blocks(self, keep)
-    }
-
-    fn ladder_marks(&self) -> std::collections::HashSet<u64> {
-        Self::ladder_marks(self)
-    }
     fn fresh_layer_caches(&self) -> Vec<crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache> {
         self.fresh_dflash2_layer_caches()
     }
@@ -790,6 +826,54 @@ impl DFlash2Target for Qwen35MoeInner {
 
     fn dflash2_turn_state_clear(&mut self) {
         self.dflash2_turn_state = None;
+    }
+
+    fn gdn_state_units(
+        &self,
+        keep: crate::models::qwen3_5::dflash2_turn::Keep<'_>,
+        wanted: &crate::engine::governor::ledger::WantedChains,
+    ) -> Vec<crate::models::qwen3_5::dflash2_turn::GdnStateUnit> {
+        Self::gdn_state_units(self, keep, wanted)
+    }
+
+    fn memory_registration(
+        &self,
+    ) -> Option<&crate::engine::governor::governor::ModelGuard<'static>> {
+        self.memory_registration.as_ref()
+    }
+
+    fn serial_decode(&self) -> Option<crate::models::qwen3_5::dflash2_turn::SerialDecode> {
+        self.serial_decode.filter(|_| {
+            self.active_scheduled_seq.is_none()
+                && self.cached_image_key.is_none()
+                && self.cached_paged_image_token_positions.is_empty()
+        })
+    }
+
+    fn set_serial_decode(
+        &mut self,
+        decode: Option<crate::models::qwen3_5::dflash2_turn::SerialDecode>,
+    ) {
+        self.serial_decode = decode;
+    }
+
+    fn drop_serial_lane_state(&mut self) {
+        self.end_gdn_use(0);
+        self.caches = None;
+        self.dflash2_lane = None;
+        self.dflash2_context = None;
+        self.dflash2_turn_state = None;
+    }
+
+    fn replay_serial_lane(
+        &mut self,
+        tokens: &[u32],
+        cache_salt: u64,
+        plan: &crate::transformer::paged_kv_cache_adapter::PagedTurnPlan,
+        decode: crate::models::qwen3_5::dflash2_turn::SerialDecode,
+        stored: Option<crate::models::qwen3_5::dflash2_state::store::EntryId>,
+    ) -> Result<()> {
+        self.replay_moe_serial_lane(tokens, cache_salt, plan, decode, stored)
     }
 }
 
@@ -1069,7 +1153,10 @@ mod paged_dflash2_tests {
         let params = greedy();
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         let mut step = inner.begin_dspark_decode(DFLASH2_DRAFT_PROPOSALS)?;
-        let mut gdn = GdnTrace::begin(&step.gdn_blobs, step.inner.caches.as_ref().expect("caches"));
+        let mut gdn = GdnTrace::begin(
+            step.gdn_blobs.as_ref().expect("cells"),
+            step.inner.caches.as_ref().expect("caches"),
+        );
         let mut deferred = Vec::new();
         while generated.len() < n {
             let anchor = *generated.last().expect("one token");
@@ -1105,7 +1192,10 @@ mod paged_dflash2_tests {
             generated.extend_from_slice(&ids[1..=accepted]);
             generated.push(rows[accepted]);
         }
-        gdn.before_finish(&step.gdn_blobs, step.inner.caches.as_ref().expect("caches"));
+        gdn.before_finish(
+            step.gdn_blobs.as_ref().expect("cells"),
+            step.inner.caches.as_ref().expect("caches"),
+        );
         step.finish()?;
         gdn.after = cells(inner.caches.as_ref().expect("caches"), &gdn.layers);
         Ok((generated, cursor(inner), deferred, linear, gdn))
@@ -1230,6 +1320,96 @@ mod paged_dflash2_tests {
         assert_eq!(prefix.effective_cached_prefix_len(), 32);
         let logits = inner.paged_prefill_with_draft_state(&a2[32..], &prefix, stream)?;
         logits.eval();
+        Ok(())
+    }
+    /// Splash `Runtime::suspend` → `QwenStateStorage::releaseLane` on the
+    /// MoE serial lane: a verify the host refuses (critical) suspends the
+    /// lane, and its two GDN cells, pending rows and draft window are gone
+    /// before the wait; the replay's fresh lane verifies.
+    /// Mutation R1m (the stepper keeps its lane across the claim) → red.
+    #[test]
+    fn moe_suspended_dflash2_lane_drops_its_cells_and_window() -> Result<()> {
+        use crate::engine::governor::governor::Governor;
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+        use crate::engine::governor::host::Pressure;
+        use crate::models::qwen3_5::dflash2_decode::lane_probe;
+        use std::sync::{Arc, Mutex};
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let io = FakeIo::new(stats(0), host(32 * G, Pressure::Normal));
+        let governor: &'static Governor = Box::leak(Box::new(Governor::new(io.clone())));
+        let mut inner = tiny_paged_int8_moe_dflash_inner(0x5_8105);
+        // A pool of two blocks that grows by two through the governor.
+        let adapter = inner.paged_adapter.take().expect("pool");
+        let block_size = adapter.block_size();
+        let pool = adapter.layer_kv_pool();
+        let (config, dtype) = (pool.config().clone(), pool.cache_dtype());
+        drop(adapter);
+        let pool =
+            mlx_paged_attn::LayerKVPool::new(config, 2, 8, dtype).map_err(Error::from_reason)?;
+        let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::with_recency(
+            2,
+            8,
+            block_size,
+            Arc::clone(&inner.cache_recency),
+        )));
+        let mut adapter = crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter::new(
+            allocator,
+            Arc::new(pool),
+            block_size,
+        )
+        .map_err(Error::from_reason)?;
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        adapter.set_admission(Arc::new(governor));
+        adapter.set_extent_growth(2);
+        inner.paged_adapter = Some(adapter);
+        inner.memory_registration =
+            Some(governor.register_model(model(16 * G, 0)).expect("register"));
+        let in_wait: Arc<Mutex<Option<(usize, usize)>>> = Arc::default();
+        {
+            let seen = Arc::clone(&in_wait);
+            io.with(|state| {
+                state.on_sleep = Some(Box::new(move |state| {
+                    let mut seen = seen.lock().unwrap();
+                    if seen.is_none() {
+                        *seen = Some(lane_probe::held());
+                    }
+                    if state.sleeps >= 3 {
+                        state.host = host(32 * G, Pressure::Normal);
+                    }
+                }));
+            });
+        }
+        // Eight rows left: the first verify fills the second block, the
+        // second needs a third.
+        let prompt = prompt(2 * block_size as usize - 8);
+        let prefix = inner.prime_dspark_prefix_state(&prompt, true, 0)?;
+        let logits = inner.paged_prefill_with_draft_state(&prompt, &prefix, stream)?;
+        let mut anchor = argmax_rows(&logits)?[0];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        let mut step = inner.begin_dspark_decode(DFLASH2_DRAFT_PROPOSALS)?;
+        for cycle in 0..2 {
+            if cycle == 1 {
+                io.with(|state| state.host = host(32 * G, Pressure::Critical));
+            }
+            let mut proposal =
+                step.propose(anchor, DFLASH2_DRAFT_PROPOSALS, &greedy(), &mut rng)?;
+            proposal.materialize_draft_ids()?;
+            let mut ids = vec![anchor];
+            ids.extend(proposal.draft_ids.iter().map(|&id| id as u32));
+            let rows = argmax_rows(&step.verify(&ids)?.logits)?;
+            step.commit_with_provenance(1, ids.len(), &ids)?;
+            anchor = rows[0];
+        }
+        step.finish()?;
+        assert_eq!(governor.suspensions(7), 1);
+        assert_eq!(governor.resumptions(7), 1);
+        let (lent, held) = in_wait.lock().unwrap().expect("the lane waited");
+        assert!(lent > 4, "{lent} lane arrays recorded");
+        assert_eq!(
+            held, 0,
+            "{held} of the lane's {lent} arrays outlived the vacate"
+        );
         Ok(())
     }
 }

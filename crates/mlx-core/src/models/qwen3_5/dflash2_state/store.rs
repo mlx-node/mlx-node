@@ -99,7 +99,6 @@ impl<S> Entry<S> {
         self.state_bytes
     }
 
-    #[cfg(test)]
     pub(crate) fn last_used(&self) -> u64 {
         self.last_used
     }

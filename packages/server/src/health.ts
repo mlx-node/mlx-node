@@ -22,6 +22,8 @@
  * Every field below is read from plain JavaScript state.
  */
 
+import type { MemoryGovernorStatus } from '@mlx-node/core';
+
 import type { IdleSweeper } from './idle-sweeper.js';
 import type { ModelWorkCoordinator } from './model-work-coordinator.js';
 import type { ModelRegistry } from './registry.js';
@@ -115,6 +117,125 @@ export interface ServerHealth {
    * the next request loads them.
    */
   weights?: WeightsSnapshot;
+  /**
+   * The memory governor (Splash `/status` `memory_governor`), while a model
+   * on it is resident: as the last poll of the native status left it.
+   */
+  memory_governor?: MemoryGovernorHealth;
+}
+
+interface GapCauseHealth {
+  gaps: number;
+  ms: number;
+}
+
+/** Splash `/status` `memory_governor`, in its keys. */
+export interface MemoryGovernorHealth {
+  limit: number;
+  charged: number;
+  headroom: number;
+  pressure: string;
+  denied_reservations: number;
+  host: {
+    measured: boolean;
+    available: number;
+    spare: number;
+    spare_reserve: number;
+    headroom: number;
+    system_pressure: string;
+    growth_allowed: boolean;
+  };
+  /** Sums to `charged`: "fixed" is what the other accounts leave. */
+  accounts: { name: string; current: number }[];
+  owed: { bytes: number; transfers: number };
+  claims: { waiting: number; bytes: number; oldest_ms: number };
+  resource_waits: {
+    memory: number;
+    concurrency: number;
+    suspended: number;
+    draining: boolean;
+    held_behind_refusal: number;
+    oldest_ms: number;
+  };
+  counters: {
+    replans: number;
+    resource_suspensions: number;
+    resource_resumptions: number;
+    resource_timeouts: number;
+    capacity_exhausted: number;
+    metal_out_of_memory: number;
+    publications_refused: number;
+  };
+  ttft_parts_ms: { own_prefill: number; claim_wait: number; decode: number; other_prefill: number };
+  decode_gap_causes: {
+    prefill_unit: GapCauseHealth;
+    claim_wait: GapCauseHealth;
+    ssd_read: GapCauseHealth;
+    pool_release: GapCauseHealth;
+    replan: GapCauseHealth;
+    other: GapCauseHealth;
+    prefill_ms: number;
+  };
+  decode_gap_ms: { p50: number; p99: number; max: number };
+  decisions: string[];
+}
+
+/** The native status in `/health`'s keys. */
+export function toMemoryGovernorHealth(status: MemoryGovernorStatus): MemoryGovernorHealth {
+  const causes = status.decodeGapCauses;
+  return {
+    limit: status.limit,
+    charged: status.charged,
+    headroom: status.headroom,
+    pressure: status.pressure,
+    denied_reservations: status.deniedReservations,
+    host: {
+      measured: status.host.measured,
+      available: status.host.available,
+      spare: status.host.spare,
+      spare_reserve: status.host.spareReserve,
+      headroom: status.host.headroom,
+      system_pressure: status.host.systemPressure,
+      growth_allowed: status.host.growthAllowed,
+    },
+    accounts: status.accounts.map((account) => ({ name: account.name, current: account.current })),
+    owed: { bytes: status.owed.bytes, transfers: status.owed.transfers },
+    claims: { waiting: status.claims.waiting, bytes: status.claims.bytes, oldest_ms: status.claims.oldestMs },
+    resource_waits: {
+      memory: status.resourceWaits.memory,
+      concurrency: status.resourceWaits.concurrency,
+      suspended: status.resourceWaits.suspended,
+      draining: status.resourceWaits.draining,
+      held_behind_refusal: status.resourceWaits.heldBehindRefusal,
+      oldest_ms: status.resourceWaits.oldestMs,
+    },
+    counters: {
+      replans: status.counters.replans,
+      resource_suspensions: status.counters.resourceSuspensions,
+      resource_resumptions: status.counters.resourceResumptions,
+      resource_timeouts: status.counters.resourceTimeouts,
+      capacity_exhausted: status.counters.capacityExhausted,
+      metal_out_of_memory: status.counters.metalOutOfMemory,
+      publications_refused: status.counters.publicationsRefused,
+    },
+    ttft_parts_ms: {
+      own_prefill: status.ttftPartsMs.ownPrefill,
+      claim_wait: status.ttftPartsMs.claimWait,
+      decode: status.ttftPartsMs.decode,
+      other_prefill: status.ttftPartsMs.otherPrefill,
+    },
+    decode_gap_causes: {
+      prefill_unit: { ...causes.prefillUnit },
+      claim_wait: { ...causes.claimWait },
+      ssd_read: { ...causes.ssdRead },
+      pool_release: { ...causes.poolRelease },
+      replan: { ...causes.replan },
+      other: { ...causes.other },
+      prefill_ms: causes.prefillMs,
+    },
+    decode_gap_ms: { ...status.decodeGapMs },
+    decisions: [...status.decisions],
+  };
 }
 
 /** Splash's `/status` KV fields for one resident model. */
@@ -174,6 +295,11 @@ export interface HealthReporterDeps {
   modelWorkCoordinator?: ModelWorkCoordinator | null;
   /** Optional: the weights' idle release behind `weights` / `releasePending`. */
   weights?: WeightResidency | null;
+  /**
+   * Optional: the memory governor's status as the server's poller last read
+   * it (plain JS state; `null` while no model on it is resident).
+   */
+  memoryGovernor?: () => MemoryGovernorHealth | null;
   /** Defaults to `Date.now()` at construction. */
   startedAt?: number;
   /** Injectable clock for tests. */
@@ -235,6 +361,7 @@ export function createHealthReporter(deps: HealthReporterDeps): () => ServerHeal
       }
     }
 
+    const memoryGovernor = deps.memoryGovernor?.() ?? null;
     const status = deriveHealthStatus({
       writerActive,
       waitingWriters,
@@ -256,6 +383,7 @@ export function createHealthReporter(deps: HealthReporterDeps): () => ServerHeal
       lastLoad,
       kv,
       ...(deps.weights ? { weights: deps.weights.snapshot() } : {}),
+      ...(memoryGovernor !== null ? { memory_governor: memoryGovernor } : {}),
     };
   };
 }

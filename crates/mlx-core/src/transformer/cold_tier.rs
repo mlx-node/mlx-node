@@ -89,6 +89,8 @@ pub(crate) struct ColdTierWalk<'a> {
     pub(crate) pool: &'a Arc<LayerKVPool>,
     pub(crate) allocator: &'a Arc<Mutex<BlockAllocator>>,
     pub(crate) block_size: u32,
+    /// Blocks held free for waiting claims ranked above the restore's.
+    pub(crate) held: u32,
 }
 
 /// Outcome of one cold-tier restore walk.
@@ -209,7 +211,7 @@ impl ColdTierWalk<'_> {
             .allocator
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .reserve(u32::try_from(keys.len()).ok()?)
+            .reserve(u32::try_from(keys.len()).ok()?, self.held)
             .ok()?;
         let job =
             match self

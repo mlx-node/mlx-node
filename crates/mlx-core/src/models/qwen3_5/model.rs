@@ -164,6 +164,10 @@ pub(crate) struct Qwen35Inner {
     pub(crate) dflash2: Option<crate::models::qwen3_5::dflash2::DFlash2Model>,
     pub(crate) dflash2_context: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
     pub(crate) dflash2_turn_state: Option<crate::models::qwen3_5::dflash2_turn::DFlash2TurnState>,
+    /// The DFlash2 stepper's lane while its verify's claim may suspend it.
+    pub(crate) dflash2_lane: Option<crate::models::qwen3_5::dflash2_decode::DFlash2Lane>,
+    /// The serial text decode running, which a host refusal suspends.
+    pub(crate) serial_decode: Option<crate::models::qwen3_5::dflash2_turn::SerialDecode>,
     pub(crate) dflash2_prefix: PrefixTracker,
     pub(crate) dflash2_states: crate::models::qwen3_5::dflash2_state::paged::DFlash2States,
     /// The one clock the allocator, the DFlash2 store, the GDN ladder and
@@ -172,6 +176,9 @@ pub(crate) struct Qwen35Inner {
     /// The load's memory plan; `None` when the working set is unreadable
     /// or the load serves no planned lane.
     pub(crate) memory_plan: Option<crate::engine::memory_plan::MemoryPlan>,
+    /// This model's registration with the memory governor, from its paged
+    /// pool's load to its drop.
+    pub(crate) memory_registration: Option<crate::engine::governor::governor::ModelGuard<'static>>,
     /// `--max-memory`: it only lowers the automatic hard budget.
     pub(crate) max_memory_bytes: Option<u64>,
     /// `--max-context`: the context every turn may hold, at most the plan's.
@@ -207,10 +214,10 @@ pub(crate) struct Qwen35Inner {
     gdn_last_history_checkpoint: Option<DenseGdnHistoryCheckpoint>,
     /// The replay point each running turn restored from (Splash
     /// `StateCache::useState`): no reclaim unit until its use ends.
-    gdn_in_use: HashMap<SeqId, crate::engine::reclaim::UnitKey>,
+    gdn_in_use: HashMap<SeqId, crate::engine::governor::ledger::UnitKey>,
     /// Set by the GDN lookups on a hit; the prepare moves it into
     /// `gdn_in_use`.
-    gdn_restored_from: Option<crate::engine::reclaim::UnitKey>,
+    gdn_restored_from: Option<crate::engine::governor::ledger::UnitKey>,
     /// The finishing paged turn's sequence, read before its request is
     /// released: the history save ends its replay-point use on every
     /// terminal path (Splash `Engine::release`).

@@ -13,7 +13,12 @@ use crate::model_thread::ResponseTx;
 
 pub(crate) enum ModelCommand<C = Infallible> {
     Chat(Box<ChatCmd>),
-    SchedulerStats { reply: ResponseTx<SchedulerStatsJs> },
+    SchedulerStats {
+        reply: ResponseTx<SchedulerStatsJs>,
+    },
+    /// The memory monitor's wake (Splash `MemoryControl::run`): the model
+    /// thread runs its control pass. It never queues behind work.
+    MemoryControl,
     Family(C),
 }
 
@@ -72,6 +77,22 @@ impl<C: FromTrainCmd> FromTrainCmd for ModelCommand<C> {
     }
 }
 
+/// The memory monitor wakes `model`'s thread through a weak handle on its
+/// command channel, so the waker never keeps the thread alive.
+pub(crate) fn register_memory_waker<C: Send + 'static>(
+    model: u64,
+    sender: &tokio::sync::mpsc::UnboundedSender<ModelCommand<C>>,
+) {
+    let weak = sender.downgrade();
+    crate::engine::governor::monitor::register_waker(
+        model,
+        Box::new(move || {
+            weak.upgrade()
+                .is_some_and(|sender| sender.send(ModelCommand::MemoryControl).is_ok())
+        }),
+    );
+}
+
 /// Shared dispatch for a thread without an active hybrid scheduler, including
 /// random-weight checkpoint creation. The scheduler supplies its live telemetry
 /// and owner-aware chat hook before reaching this fallback.
@@ -87,6 +108,7 @@ where
                 crate::engine::scheduler::SchedulerStats::default().to_js()
             ));
         }
+        ModelCommand::MemoryControl => {}
         ModelCommand::Family(command) => command.execute(backend),
     }
 }

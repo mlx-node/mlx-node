@@ -4709,6 +4709,115 @@ export interface Lfm2Config {
   routedScalingFactor?: number | undefined;
 }
 
+export interface MemoryGovernorAccount {
+  name: string;
+  current: number;
+}
+
+export interface MemoryGovernorClaims {
+  waiting: number;
+  bytes: number;
+  oldestMs: number;
+}
+
+export interface MemoryGovernorCounters {
+  replans: number;
+  resourceSuspensions: number;
+  resourceResumptions: number;
+  resourceTimeouts: number;
+  capacityExhausted: number;
+  metalOutOfMemory: number;
+  publicationsRefused: number;
+}
+
+export interface MemoryGovernorGapCause {
+  gaps: number;
+  ms: number;
+}
+
+/** Decode gaps past 500 ms by Splash `GapCause`. */
+export interface MemoryGovernorGapCauses {
+  prefillUnit: MemoryGovernorGapCause;
+  claimWait: MemoryGovernorGapCause;
+  ssdRead: MemoryGovernorGapCause;
+  poolRelease: MemoryGovernorGapCause;
+  replan: MemoryGovernorGapCause;
+  other: MemoryGovernorGapCause;
+  prefillMs: number;
+}
+
+/** Every gap between two token events of a lane, as log-2 bucket bounds. */
+export interface MemoryGovernorGapLatency {
+  p50: number;
+  p99: number;
+  max: number;
+}
+
+export interface MemoryGovernorHost {
+  measured: boolean;
+  available: number;
+  spare: number;
+  spareReserve: number;
+  headroom: number;
+  systemPressure: string;
+  growthAllowed: boolean;
+}
+
+export interface MemoryGovernorOwed {
+  bytes: number;
+  transfers: number;
+}
+
+export interface MemoryGovernorResourceWaits {
+  memory: number;
+  concurrency: number;
+  suspended: number;
+  draining: boolean;
+  heldBehindRefusal: number;
+  oldestMs: number;
+}
+
+/**
+ * The memory governor's status (Splash `/status` `memory_governor`), or
+ * `null` while no model is registered with it. It reads the governor
+ * alone and never waits for a model thread.
+ */
+export declare function memoryGovernorStatus(): MemoryGovernorStatus | null;
+
+export interface MemoryGovernorStatus {
+  limit: number;
+  charged: number;
+  headroom: number;
+  /**
+   * `critical`, `warning` (also while the host is in its band) or
+   * `normal`.
+   */
+  pressure: string;
+  deniedReservations: number;
+  host: MemoryGovernorHost;
+  accounts: Array<MemoryGovernorAccount>;
+  owed: MemoryGovernorOwed;
+  claims: MemoryGovernorClaims;
+  resourceWaits: MemoryGovernorResourceWaits;
+  counters: MemoryGovernorCounters;
+  ttftPartsMs: MemoryGovernorTtftParts;
+  decodeGapCauses: MemoryGovernorGapCauses;
+  decodeGapMs: MemoryGovernorGapLatency;
+  /** The last 64 decision-log lines, oldest first. */
+  decisions: Array<string>;
+}
+
+/**
+ * Milliseconds by Splash `TtftPart`, summed over the requests' first
+ * tokens; Rest is never accumulated.
+ */
+export interface MemoryGovernorTtftParts {
+  ownPrefill: number;
+  claimWait: number;
+  decode: number;
+  otherPrefill: number;
+}
+
 export interface MemorySnapshot {
   /** Active (non-cached) memory in bytes. */
   activeBytes: number;

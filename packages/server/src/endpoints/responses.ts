@@ -12,7 +12,7 @@ import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ChatConfig, ChatMessage, ChatResult, ResponseStore, StoredResponseRecord } from '@mlx-node/core';
-import { isCapacityExhaustedError, isContextCapacityError } from '@mlx-node/lm';
+import { isCapacityExhaustedError, isContextCapacityError, retryableErrorCode } from '@mlx-node/lm';
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 import { ToolCallTagBuffer } from '@mlx-node/lm';
 
@@ -23,6 +23,7 @@ import {
   sendInternalError,
   sendNotFound,
   sendRateLimit,
+  sendResourceUnavailable,
   sendStorageTimeout,
   sendRequestQuarantined,
 } from '../errors.js';
@@ -300,7 +301,14 @@ function buildFailedTerminal(
   // Only the `reason: 'error'` path carries a diagnostic message —
   // client_abort / stream_exhausted / finish_reason_error are caller
   // or finite-state conditions, not server faults worth surfacing.
-  const error = errorMessage ? { type: 'server_error', message: errorMessage, code: null, param: null } : null;
+  const error = errorMessage
+    ? {
+        type: 'server_error',
+        message: errorMessage,
+        code: retryableErrorCode(errorMessage),
+        param: null,
+      }
+    : null;
   return {
     ...partial,
     status: 'failed',
@@ -3562,10 +3570,13 @@ export async function handleCreateResponse(
               // Capacity failures are deterministic request errors, raised
               // before native cache mutation. Keep them out of the generic
               // 500 path so clients can compact/truncate and retry.
+              const retryable = retryableErrorCode(err);
               if (isContextCapacityError(err)) {
                 sendBadRequest(res, message);
               } else if (isCapacityExhaustedError(err)) {
                 sendCapacityExhausted(res, message);
+              } else if (retryable !== null) {
+                sendResourceUnavailable(res, retryable, message);
               } else {
                 sendInternalError(res, message);
               }
@@ -3594,7 +3605,11 @@ export async function handleCreateResponse(
               // a best-effort streaming `error` frame so the client
               // sees SOMETHING it can parse.
               if (!visibility.terminalEmitted) {
-                writeFallbackErrorSSE(res, 'error', { error_type: 'server_error', message });
+                writeFallbackErrorSSE(res, 'error', {
+                  error_type: 'server_error',
+                  ...(retryableErrorCode(err) === null ? {} : { code: retryableErrorCode(err) }),
+                  message,
+                });
               }
               try {
                 endSSE(res);

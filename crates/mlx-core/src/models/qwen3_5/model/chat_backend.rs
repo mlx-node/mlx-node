@@ -357,6 +357,18 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        self.paged_turn_entry(args)
+            .map_err(|error| crate::models::qwen3_5::dflash2_turn::whole_turn_oom(self, error))
+    }
+
+    fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        self.multimodal_turn_entry(args)
+            .map_err(|error| crate::models::qwen3_5::dflash2_turn::whole_turn_oom(self, error))
+    }
+}
+
+impl Qwen35Inner {
+    fn paged_turn_entry(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         // Both SYNC and STREAMING turns take the paged core. The paged
         // cores self-handle MTP via the `eager_mtp_paged` arm
         // (`paged_turn_sync_core_inner` / `paged_turn_stream_core_inner`),
@@ -376,7 +388,7 @@ impl ChatBackend for Qwen35Inner {
     /// decodes autoregressively (Splash serves images from the same pages).
     /// The media plan admits images only on a pool load with an encoder and
     /// a processor.
-    fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+    fn multimodal_turn_entry(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         let (tokenizer, p, report_perf) = self.vision_turn_params(args)?;
         let tokens = args.tokens.to_vec();
         match (args.sink, args.cancelled) {

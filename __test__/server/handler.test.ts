@@ -483,6 +483,62 @@ describe('createHandler', () => {
       });
     });
 
+    // Splash `ResourceTimeout`: memory did not come free within the wait
+    // limit, so the client retries after a second.
+    // Mutation TS1: send `resource_timeout:` through the 400 branch → red (400).
+    it('maps a native resource_timeout failure to 503 with Retry-After', async () => {
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel();
+      const message =
+        'resource_timeout: memory did not become available within the resource wait limit: macOS is short of memory; close memory-heavy applications';
+      (mockModel.chatSessionStart as ReturnType<typeof vi.fn>).mockRejectedValue(new Error(message));
+      registry.register('test-model', mockModel);
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'Hello' });
+      const { res, getStatus, getBody, getHeaders, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(503);
+      expect(getHeaders()['retry-after']).toBe('1');
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error).toEqual({
+        type: 'server_error',
+        message,
+        code: 'resource_timeout',
+        param: null,
+      });
+    });
+
+    // A GPU command exhausted Metal memory: the native model failed its
+    // running requests and reset its caches; the request was not at fault.
+    // Mutation TS4: `retryableErrorCode` ignores `metal_out_of_memory:` → red (500).
+    it('maps a native metal_out_of_memory failure to 503 with Retry-After', async () => {
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel();
+      const message =
+        'metal_out_of_memory: a GPU command exhausted Metal memory ([METAL] Command buffer execution failed: Insufficient Memory); the request was not at fault; retry';
+      (mockModel.chatSessionStart as ReturnType<typeof vi.fn>).mockRejectedValue(new Error(message));
+      registry.register('test-model', mockModel);
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'Hello' });
+      const { res, getStatus, getBody, getHeaders, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(503);
+      expect(getHeaders()['retry-after']).toBe('1');
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error).toEqual({
+        type: 'server_error',
+        message,
+        code: 'metal_out_of_memory',
+        param: null,
+      });
+    });
+
     it('returns a JSON 400 for streaming context overflow before committing SSE or mutating native cache state', async () => {
       const model = Object.assign(createMockStreamModel([]), {
         contextLimits: () => ({

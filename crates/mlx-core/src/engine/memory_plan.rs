@@ -35,15 +35,30 @@ pub(crate) const RESIDENT_ALLOWANCE_TOKENS: u32 = 65_536;
 /// cache holds.
 pub(crate) const TABLE_SHARE_TOKENS: u64 = 128 * 1024;
 
-/// The share of the working set the automatic budget keeps, less
-/// [`WORKING_SET_RESERVE_BYTES`]; Splash keeps `max(1 GiB, 2%)` instead
-/// (`EngineMemoryPolicy::workingSetMarginBytes`), which arrives with the
-/// memory governor.
+/// The share of the working set an unguarded budget keeps, less
+/// [`WORKING_SET_RESERVE_BYTES`].
 const WORKING_SET_PERCENT: u64 = 85;
 const WORKING_SET_RESERVE_BYTES: u64 = GIB;
+/// Splash `EngineMemoryPolicy::workingSetMarginBytes`: `max(1 GiB, 2%)`.
+const LEDGER_MARGIN_PERCENT: u64 = 2;
+const LEDGER_MARGIN_FLOOR_BYTES: u64 = GIB;
+
+/// Which margin a plan keeps out of the working set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Margin {
+    /// Splash's: the memory governor keeps the model inside its budget.
+    Ledger,
+    /// 15% + 1 GiB, for a model no governor guards.
+    Unguarded,
+}
 
 /// The bytes of the working set kept out of the hard budget.
-pub(crate) fn working_set_margin_bytes(working_set: u64) -> u64 {
+pub(crate) fn working_set_margin_bytes(working_set: u64, margin: Margin) -> u64 {
+    if margin == Margin::Ledger {
+        let share = working_set / 100 * LEDGER_MARGIN_PERCENT
+            + working_set % 100 * LEDGER_MARGIN_PERCENT / 100;
+        return share.max(LEDGER_MARGIN_FLOOR_BYTES).min(working_set);
+    }
     let kept = (working_set / 100 * WORKING_SET_PERCENT
         + working_set % 100 * WORKING_SET_PERCENT / 100)
         .saturating_sub(WORKING_SET_RESERVE_BYTES);
@@ -52,8 +67,8 @@ pub(crate) fn working_set_margin_bytes(working_set: u64) -> u64 {
 
 /// Splash `EngineMemoryPolicy::hardBudgetBytes`: `--max-memory` only lowers
 /// the automatic budget.
-pub(crate) fn hard_budget_bytes(working_set: u64, max_memory: Option<u64>) -> u64 {
-    let automatic = working_set.saturating_sub(working_set_margin_bytes(working_set));
+pub(crate) fn hard_budget_bytes(working_set: u64, max_memory: Option<u64>, margin: Margin) -> u64 {
+    let automatic = working_set.saturating_sub(working_set_margin_bytes(working_set, margin));
     match max_memory {
         Some(max) if max > 0 && max < automatic => max,
         _ => automatic,
@@ -116,7 +131,7 @@ pub(crate) fn live_memory() -> Option<LiveMemory> {
 /// The hard budget with no `--max-memory`, for a load without a plan.
 pub(crate) fn automatic_hard_budget() -> Result<u64, String> {
     recommended_working_set()
-        .map(|working_set| hard_budget_bytes(working_set, None))
+        .map(|working_set| hard_budget_bytes(working_set, None, Margin::Unguarded))
         .ok_or_else(|| "Metal recommended working set unavailable".to_string())
 }
 
@@ -353,6 +368,7 @@ pub(crate) struct MemoryFootprint {
     /// The streamed stores' planned bytes above what is live (Splash
     /// `hostHeldBackBytes`): the plan counts every store at its cap.
     pub held_back_bytes: u64,
+    pub margin: Margin,
 }
 
 /// One lane kind of one request: its state besides KV, the layout its KV
@@ -769,14 +785,15 @@ impl MemoryPlan {
         pool: Option<PoolInput<'_>>,
     ) -> Result<Self, PlanError> {
         let working_set = footprint.working_set_bytes;
-        let margin_bytes = working_set_margin_bytes(working_set);
+        let margin_bytes = working_set_margin_bytes(working_set, footprint.margin);
         if working_set <= margin_bytes {
             return Err(PlanError::WorkingSetTooSmall {
                 working_set,
                 margin: margin_bytes,
             });
         }
-        let hard_budget_bytes = hard_budget_bytes(working_set, footprint.max_memory_bytes);
+        let hard_budget_bytes =
+            hard_budget_bytes(working_set, footprint.max_memory_bytes, footprint.margin);
         let bound = MemoryBound::of(footprint.max_memory_bytes, hard_budget_bytes);
         let fixed_bytes = footprint
             .active_bytes
@@ -885,6 +902,7 @@ impl MemoryPlan {
                 staging_bytes: 0,
                 draft_weights_bytes: 0,
                 held_back_bytes: 0,
+                margin: Margin::Unguarded,
             },
             margin_bytes: 0,
             hard_budget_bytes: 0,
@@ -940,6 +958,19 @@ impl MemoryPlan {
             }),
             ..Self::bare()
         }
+    }
+
+    /// What the memory governor charges beside the allocations it sees:
+    /// the pipeline and runtime reserves and the lane's transient, MLX
+    /// allocations no claim admits.
+    pub(crate) fn untracked_reserve_bytes(&self) -> u64 {
+        PIPELINE_RESERVE_BYTES
+            .saturating_add(RUNTIME_OVERHEAD_RESERVE_BYTES)
+            .saturating_add(
+                self.pool
+                    .as_ref()
+                    .map_or(0, |pool| pool.lane.transient_bytes),
+            )
     }
 
     /// The ceiling every live check uses: the hard budget less the reserves.

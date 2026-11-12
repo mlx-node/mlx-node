@@ -387,8 +387,13 @@ impl BlockAllocator {
 
     /// Marks and every cached ancestor of a mark.
     fn marked_closure(&self) -> HashSet<u64> {
-        let mut closure = HashSet::with_capacity(self.state_marks.len());
-        for &mark in &self.state_marks {
+        self.closure_of(self.state_marks.iter().copied())
+    }
+
+    /// Every block on the chains of `marks`.
+    fn closure_of(&self, marks: impl Iterator<Item = u64>) -> HashSet<u64> {
+        let mut closure = HashSet::new();
+        for mark in marks {
             let mut hash = mark;
             while closure.insert(hash) {
                 let Some(identity) = self.prefix_cache_identities.get(&hash) else {
@@ -406,10 +411,61 @@ impl BlockAllocator {
 
     /// The oldest cached leaf nothing holds and no mark protects.
     fn oldest_dead_leaf(&self) -> Option<u64> {
-        self.leaves
-            .iter()
-            .map(|&(_, hash)| hash)
-            .find(|hash| !self.state_marks.contains(hash) && self.ref_count_of(*hash) == Some(1))
+        self.oldest_dead_leaf_outside(&HashSet::new())
+    }
+
+    /// [`Self::oldest_dead_leaf`] outside `keep`.
+    fn oldest_dead_leaf_outside(&self, keep: &HashSet<u64>) -> Option<u64> {
+        self.leaves.iter().map(|&(_, hash)| hash).find(|hash| {
+            !self.state_marks.contains(hash)
+                && !keep.contains(hash)
+                && self.ref_count_of(*hash) == Some(1)
+        })
+    }
+
+    /// The cached blocks a prompt's lookup walks: those whose chain's tokens
+    /// from the root prefix one of `prompts` (Splash `Walk::keepsBlock`
+    /// over `RestoredChains`, matched by tokens as the queued chains are).
+    pub fn cached_on_prompts(&self, prompts: &[&[u32]]) -> HashSet<u64> {
+        let mut on = HashSet::new();
+        for prompt in prompts {
+            let mut memo: HashMap<u64, bool> = HashMap::new();
+            for &hash in self.prefix_cache.keys() {
+                let mut path = Vec::new();
+                let mut at = hash;
+                let matched = loop {
+                    if let Some(&known) = memo.get(&at) {
+                        break known;
+                    }
+                    let Some(identity) = self.prefix_cache_identities.get(&at) else {
+                        break false;
+                    };
+                    let start = identity
+                        .block_index
+                        .saturating_mul(self.block_size as usize);
+                    let end = start.saturating_add(identity.token_ids.len());
+                    if prompt.get(start..end) != Some(identity.token_ids.as_slice()) {
+                        break false;
+                    }
+                    path.push(at);
+                    if identity.block_index == 0 {
+                        break identity.parent_hash == 0;
+                    }
+                    if !self.prefix_cache.contains_key(&identity.parent_hash) {
+                        break false;
+                    }
+                    at = identity.parent_hash;
+                };
+                for hash in path {
+                    memo.insert(hash, matched);
+                }
+            }
+            on.extend(
+                memo.into_iter()
+                    .filter_map(|(hash, kept)| kept.then_some(hash)),
+            );
+        }
+        on
     }
 
     /// The deepest cache-only block that still has cached children (all of
@@ -474,9 +530,11 @@ impl BlockAllocator {
     /// the count covers the need. Blocks the pool has not grown yet do not
     /// count: the caller grows the pool first, as Splash
     /// `KvPool::takeFreePages` grows an extent before the claim reaches the
-    /// ledger.
-    pub fn reserve(&mut self, n: u32) -> Result<Vec<Arc<PhysicalBlock>>, u32> {
-        if !self.can_allocate(n) {
+    /// ledger. `held` blocks stay free for waiting claims ranked above the
+    /// caller (Splash `KvPool::takeFreePages` hands out a free page only
+    /// while more than `held` are free).
+    pub fn reserve(&mut self, n: u32, held: u32) -> Result<Vec<Arc<PhysicalBlock>>, u32> {
+        if !self.can_allocate(n.saturating_add(held)) {
             return Err(0);
         }
         let mut taken = Vec::with_capacity(n as usize);
@@ -497,7 +555,12 @@ impl BlockAllocator {
 
     /// Evict the oldest dead leaf and put its id back in the free queue.
     pub fn evict_oldest_dead_leaf(&mut self) -> Option<u32> {
-        let hash = self.oldest_dead_leaf()?;
+        self.evict_oldest_dead_leaf_outside(&HashSet::new())
+    }
+
+    /// [`Self::evict_oldest_dead_leaf`], leaving the blocks in `keep`.
+    pub fn evict_oldest_dead_leaf_outside(&mut self, keep: &HashSet<u64>) -> Option<u32> {
+        let hash = self.oldest_dead_leaf_outside(keep)?;
         let block_id = self.take_cached(hash)?;
         self.free_blocks.push_back(block_id);
         Some(block_id)
@@ -592,6 +655,34 @@ impl BlockAllocator {
     }
 
     /// How many distinct `hashes` are cached and cache-only.
+    /// The cache-only blocks dropping each of `marks`, in that order, makes
+    /// takeable: a block counts for the last listed mark whose chain holds
+    /// it, and for none while a mark not listed holds it. A running total
+    /// through a mark is what dropping every mark up to it gives (Splash
+    /// `VictimSource::peek`).
+    pub fn freed_by_marks(&self, marks: &[u64]) -> Vec<u32> {
+        let listed: HashSet<u64> = marks.iter().copied().collect();
+        let held = self.closure_of(
+            self.state_marks
+                .iter()
+                .copied()
+                .filter(|mark| !listed.contains(mark)),
+        );
+        let mut last = HashMap::new();
+        for (index, &mark) in marks.iter().enumerate() {
+            for hash in self.closure_of(std::iter::once(mark)) {
+                last.insert(hash, index);
+            }
+        }
+        let mut freed = vec![0u32; marks.len()];
+        for (hash, index) in last {
+            if !held.contains(&hash) && self.is_cache_only(hash) {
+                freed[index] += 1;
+            }
+        }
+        freed
+    }
+
     pub fn cache_only_count(&self, hashes: impl IntoIterator<Item = u64>) -> u32 {
         hashes
             .into_iter()
@@ -1345,7 +1436,26 @@ impl BlockAllocator {
     /// The lowest block count a cut by up to `extents` extents may reach once
     /// enough cache-only blocks are gone: `num_blocks` when none can.
     pub fn shrink_target(&self, floor: u32, extent: u32, extents: u32) -> u32 {
-        let uses = self.slot_uses();
+        self.shrink_target_keeping(floor, extent, extents, &HashSet::new())
+    }
+
+    /// [`Self::shrink_target`] with the cache-only blocks in `keep` staying
+    /// where they are.
+    pub fn shrink_target_keeping(
+        &self,
+        floor: u32,
+        extent: u32,
+        extents: u32,
+        keep: &HashSet<u64>,
+    ) -> u32 {
+        let mut uses = self.slot_uses();
+        for hash in keep {
+            if let Some(block) = self.prefix_cache.get(hash)
+                && let Some(slot) = uses.get_mut(block.block_id as usize)
+            {
+                *slot = SlotUse::Held;
+            }
+        }
         self.shrink_candidates(&uses, floor, extent, extents)
             .first()
             .copied()
@@ -3731,7 +3841,7 @@ mod tests {
                 allocator.free(block);
             }
             let held = allocator.allocate().unwrap();
-            assert!(matches!(allocator.reserve(3), Err(0)), "pool 3/{max}");
+            assert!(matches!(allocator.reserve(3, 0), Err(0)), "pool 3/{max}");
             assert_eq!(hit_len(&mut allocator, &x_tokens), 2, "pool 3/{max}");
             assert_eq!(allocator.num_free_blocks(), 0, "pool 3/{max}");
             allocator.free(held);
@@ -3778,11 +3888,34 @@ mod tests {
         );
         let hashes = chain_hashes(&tokens, 4, &[], 0);
         allocator.set_state_marks([hashes[1], hashes[2]]);
-        assert!(allocator.reserve(1).is_err());
+        assert!(allocator.reserve(1, 0).is_err());
         assert_eq!(allocator.tip_marks(), [hashes[2]].into_iter().collect());
         allocator.set_state_marks([hashes[1]]);
-        assert!(allocator.reserve(1).is_err());
+        assert!(allocator.reserve(1, 0).is_err());
         allocator.set_state_marks([]);
-        assert!(allocator.reserve(1).is_ok());
+        assert!(allocator.reserve(1, 0).is_ok());
+    }
+
+    /// Blocks held for waiting claims ranked above stay free: a reserve
+    /// that would hand them out takes nothing, not even a cached block.
+    /// Mutation H3: ignore `held` in the gate -> red (`reserve(3, 4)`
+    /// granted).
+    #[test]
+    fn held_blocks_stay_free() {
+        let mut allocator = BlockAllocator::new(6, 6, 4);
+        let tokens: Vec<u32> = (0..4).collect();
+        let (cached, _) = cache_chain(&mut allocator, &tokens);
+        for block in cached {
+            allocator.free(block);
+        }
+        assert_eq!(allocator.num_free_blocks(), 5);
+        assert_eq!(allocator.num_evictable_blocks(), 1);
+        assert!(matches!(allocator.reserve(3, 4), Err(0)));
+        assert_eq!(hit_len(&mut allocator, &tokens), 1, "nothing evicted");
+        let taken = allocator
+            .reserve(2, 4)
+            .expect("two of six beside four held");
+        assert_eq!(taken.len(), 2);
+        assert_eq!(hit_len(&mut allocator, &tokens), 1);
     }
 }

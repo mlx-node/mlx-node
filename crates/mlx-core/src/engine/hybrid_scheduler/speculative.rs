@@ -41,6 +41,8 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
     /// Target rows for `queries` and the draft state the step grows
     /// outside the pool. A refusal blocks the row, so the scheduler
     /// reclaims or preempts instead of the draft caches outgrowing memory.
+    /// A family on the ledger had the growth admitted by the row's step
+    /// claim.
     fn reserve_speculative_step(
         &mut self,
         running: &[Turn<B>],
@@ -48,53 +50,18 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         queries: usize,
     ) -> Result<bool> {
         let seq_id = running[turn_index].seq_id;
-        if let Some(adapter) = self.inner.paged_adapter() {
-            adapter.clear_draft_refusal(seq_id);
-        }
         if !self.inner.reserve_scheduled_speculation(seq_id, queries)? {
             return Ok(false);
         }
-        self.draft_fits_or_refuse(
-            running,
-            turn_index,
-            u32::try_from(queries).unwrap_or(u32::MAX),
-        )
-    }
-
-    /// Whether the step's off-pool state fits; a short fit is recorded for
-    /// the blocked step's reclaim (Splash `MemoryLedger::refused`).
-    pub(super) fn draft_fits_or_refuse(
-        &self,
-        running: &[Turn<B>],
-        turn_index: usize,
-        queries: u32,
-    ) -> Result<bool> {
-        let own = &running[turn_index];
-        let others: Vec<&Turn<B>> = running
-            .iter()
-            .filter(|turn| turn.seq_id != own.seq_id)
-            .collect();
-        let bytes = draft_shortfall(&*self.inner, own, &others, queries)?;
-        if bytes > 0
-            && let Some(adapter) = self.inner.paged_adapter()
-        {
-            adapter.refuse_draft(own.seq_id, DraftRefusal { bytes, queries });
+        if self.inner.reclaims_in_order() {
+            return Ok(true);
         }
-        Ok(bytes == 0)
-    }
-
-    #[cfg(test)]
-    pub(super) fn draft_growth_fits(
-        &self,
-        running: &[Turn<B>],
-        turn_index: usize,
-        queries: u32,
-    ) -> Result<bool> {
         let own = &running[turn_index];
         let others: Vec<&Turn<B>> = running
             .iter()
             .filter(|turn| turn.seq_id != own.seq_id)
             .collect();
+        let queries = u32::try_from(queries).unwrap_or(u32::MAX);
         Ok(draft_shortfall(&*self.inner, own, &others, queries)? == 0)
     }
 
@@ -645,6 +612,9 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     Self::stream_token(turn, token, reasoning);
                 }
             }
+            if !tokens.is_empty() {
+                turn.payload.clock.token_event();
+            }
             let finished = clamp.stop.is_some()
                 || turn.payload.generated_tokens.len()
                     >= turn.payload.params.max_new_tokens.max(0) as usize;
@@ -688,7 +658,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
 /// it fits. State lives outside the pool, so target growth never takes it
 /// out of those bytes and the pool never grows for it (Splash grows only
 /// for KV pages, `KvPool::acquirePages`).
-pub(super) fn draft_shortfall<B: HybridSchedulerBackend>(
+fn draft_shortfall<B: HybridSchedulerBackend>(
     inner: &B,
     own: &Turn<B>,
     others: &[&Turn<B>],
@@ -771,6 +741,13 @@ pub(super) mod tests {
             ScheduledPrefixAdmission::Ready(prefix) => prefix,
             _ => unreachable!(),
         };
+        // The prompt's own blocks, as its prefill slices' claims book them.
+        if let Some(adapter) = inner.paged_adapter_mut() {
+            let booked = adapter.current_token_count_for(seq).unwrap_or(0);
+            adapter
+                .reserve_rows_for(seq, (prompt.len() as u32).saturating_sub(booked))
+                .unwrap();
+        }
         let (reply, _) = tokio::sync::oneshot::channel();
         let requested_tokens = engine::scheduler::scheduled_materialized_tokens(
             prompt.len() as u32,
@@ -816,6 +793,9 @@ pub(super) mod tests {
             allocation_failed: false,
             preemption_replay: None,
             requested_tokens,
+            claim: None,
+            cell: None,
+            clock: Default::default(),
         };
         let mut turn = TurnState::new(seq, prompt, 0, Vec::new(), Some(cancel), payload).unwrap();
         turn.decode_draft_allowance = if speculative { 3 } else { 0 };
@@ -1463,41 +1443,167 @@ pub(super) mod tests {
         }
     }
 
-    /// A reserve whose draft fit falls short records it; the next reserve
-    /// of the same turn that fits leaves no record.
-    /// Mutation: drop the top `clear_draft_refusal` in
-    /// `reserve_speculative_step` → red (one record left).
+    /// A speculative decode row's draft-state growth is a bytes claim under
+    /// its request's claim (Splash: state is an allocation of bytes, never
+    /// of pool pages): with room one byte short of the growth it is denied
+    /// with the growth's bytes and no blocks, though the pool has free
+    /// blocks; for a bytes need the idle owner's parked row is a unit and
+    /// its blocks are not, for a blocks need its blocks are.
+    /// Mutation D1: the draft need counts the pool's free blocks → red (the
+    /// row is granted).
     #[test]
-    fn a_draft_reserve_that_passes_clears_its_refusal() {
-        use crate::engine::hybrid_scheduler::tests::{mtp_step_state_with, mtp_step_turn_with};
+    fn draft_state_is_a_bytes_claim() {
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+        use crate::engine::governor::ledger::TakeRights;
+        use crate::engine::hybrid_scheduler::tests::mtp_step_state_with;
         let Some((mut state, _)) = mtp_step_state_with(64, 64) else {
             return;
         };
-        let recurrent = state.inner.recurrent_state_bytes();
-        drop(mtp_step_turn_with(&mut state, 2, 40, false, 40, recurrent));
-        let charge = recurrent + state.inner.scheduled_draft_state_bytes(144);
-        let mut turn = mtp_step_turn_with(&mut state, 1, 128, true, 155, charge)
-            .with_block_reservation(9, 9, 16);
-        turn.num_computed_tokens = 154;
-        state
-            .inner
-            .paged_adapter_mut()
-            .expect("paged adapter")
-            .reserve_rows_for(1, 159)
-            .expect("window KV");
-        let running = std::slice::from_ref(&turn);
-        assert!(
-            !HybridStepExecutor::new(&mut state.inner)
-                .reserve_speculative_step(running, 0, 4)
-                .expect("short reserve")
+        let cancel = Arc::new(AtomicBool::new(false));
+        drop(request(
+            &mut state.inner,
+            2,
+            (0..40).map(|token| 500 + token).collect(),
+            false,
+            Arc::clone(&cancel),
+        ));
+        state.owner_sequences.insert("idle".into(), 2);
+        let mut turn = request(
+            &mut state.inner,
+            1,
+            (0..40).map(|token| token % 16).collect(),
+            true,
+            cancel,
         );
-        state.inner.release_scheduled_recurrent_for(2);
-        assert!(
-            HybridStepExecutor::new(&mut state.inner)
-                .reserve_speculative_step(running, 0, 1)
-                .expect("reserve that fits")
+        turn.num_computed_tokens = 40;
+        turn.token_history.push(3);
+        turn.num_tokens = 41;
+        let growth = state.inner.scheduled_draft_state_held_bytes(44)
+            - state.inner.scheduled_draft_state_held_bytes(40);
+        assert!(growth > 0);
+        let io = FakeIo::new(
+            stats(0),
+            host(32 * G, crate::engine::governor::host::Pressure::Normal),
         );
-        let adapter = state.inner.paged_adapter().expect("paged adapter");
-        assert!(adapter.take_draft_refusals().is_empty());
+        let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+        state.inner.memory_registration = Some(
+            governor
+                .register_model(model(growth - 1, 0))
+                .expect("register"),
+        );
+        {
+            let units = SchedUnits {
+                state: &mut state,
+                claimant: 1,
+                kept: &[],
+            };
+            let query = |need: Need| VictimQuery {
+                rights: TakeRights {
+                    units: true,
+                    certain_reuse: crate::engine::governor::ledger::CertainReuse::All,
+                    ..TakeRights::default()
+                },
+                need,
+            };
+            let owner = |units: Vec<Victim>| {
+                units
+                    .into_iter()
+                    .find(|unit| unit.key == LedgerKey::Owner(2))
+                    .expect("the idle owner is a unit")
+            };
+            let bytes = owner(units.units(&query(Need {
+                bytes: growth,
+                ..Need::default()
+            })));
+            assert!(bytes.bytes > 0);
+            assert_eq!(bytes.pages, 0);
+            let pages = owner(units.units(&query(Need {
+                pages: 1,
+                kv: true,
+                ..Need::default()
+            })));
+            assert!(pages.pages > 0);
+        }
+        state.scheduler.reinstate_running(turn);
+        let plan = StepPlan {
+            global_step: 0,
+            rows: vec![engine::scheduler::StepRow {
+                seq_id: 1,
+                kind: StepKind::Decode,
+                token_start: 40,
+                num_tokens: 4,
+                cancel_snapshot: false,
+            }],
+            token_budget: 64,
+        };
+        let claims = state.claim_rows_in_order(&plan);
+        let denial = claims.grants[0].expect("the draft growth is refused");
+        assert_eq!(denial.failure, Some(Failure::EngineBudget));
+        assert!(denial.blocks.is_none());
+        let claim = state
+            .scheduler
+            .running_turn_mut(1)
+            .and_then(|turn| turn.payload.claim.as_ref().map(ClaimHandle::id))
+            .expect("the row's claim");
+        let refusal = governor.ledger(|ledger| ledger.claim(claim).map(|state| state.refusal));
+        assert_eq!(refusal.map(|need| need.bytes), Some(growth));
+    }
+
+    /// An MTP prefill slice grows the draft K/V of its rows (Splash
+    /// `Engine::growLane` claims a lane's state to its work end for every
+    /// row): with room one byte short of that growth the slice is denied
+    /// with its bytes and no blocks, though its KV rows are booked.
+    /// Mutation MP1: only decode rows claim draft state → red (the slice
+    /// is granted).
+    #[test]
+    fn an_mtp_prefill_slice_claims_its_draft_growth() {
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+        use crate::engine::hybrid_scheduler::tests::mtp_step_state_with;
+        let Some((mut state, _)) = mtp_step_state_with(64, 64) else {
+            return;
+        };
+        let turn = request(
+            &mut state.inner,
+            1,
+            (0..40).map(|token| token % 16).collect(),
+            true,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let growth = state.inner.scheduled_draft_state_held_bytes(16)
+            - state.inner.scheduled_draft_state_held_bytes(0);
+        assert!(growth > 0);
+        let io = FakeIo::new(
+            stats(0),
+            host(32 * G, crate::engine::governor::host::Pressure::Normal),
+        );
+        let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+        state.inner.memory_registration = Some(
+            governor
+                .register_model(model(growth - 1, 0))
+                .expect("register"),
+        );
+        state.scheduler.reinstate_running(turn);
+        let plan = StepPlan {
+            global_step: 0,
+            rows: vec![engine::scheduler::StepRow {
+                seq_id: 1,
+                kind: StepKind::Prefill,
+                token_start: 0,
+                num_tokens: 16,
+                cancel_snapshot: false,
+            }],
+            token_budget: 64,
+        };
+        let claims = state.claim_rows_in_order(&plan);
+        let denial = claims.grants[0].expect("the draft growth is refused");
+        assert_eq!(denial.failure, Some(Failure::EngineBudget));
+        assert!(denial.blocks.is_none());
+        let claim = state
+            .scheduler
+            .running_turn_mut(1)
+            .and_then(|turn| turn.payload.claim.as_ref().map(ClaimHandle::id))
+            .expect("the row's claim");
+        let refusal = governor.ledger(|ledger| ledger.claim(claim).map(|state| state.refusal));
+        assert_eq!(refusal.map(|need| need.bytes), Some(growth));
     }
 }

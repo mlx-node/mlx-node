@@ -1,11 +1,13 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Writable } from 'node:stream';
 
+import type { MemoryGovernorStatus } from '@mlx-node/core';
 import { describe, expect, it } from 'vite-plus/test';
 
 import {
   createHealthReporter,
   deriveHealthStatus,
+  toMemoryGovernorHealth,
   toMinimalHealth,
   type HealthStatusInputs,
   type ModelLoadRecord,
@@ -278,6 +280,74 @@ describe('createHealthReporter', () => {
     expect(report().uptimeMs).toBe(0);
     clock = 8_500;
     expect(report().uptimeMs).toBe(3_500);
+  });
+
+  // Mutation TS3: copy `memory_governor` into the minimal body → red.
+  it('memory_governor is in the authenticated body only', () => {
+    const cause = { gaps: 0, ms: 0 };
+    const status: MemoryGovernorStatus = {
+      limit: 16,
+      charged: 7,
+      headroom: 9,
+      pressure: 'normal',
+      deniedReservations: 0,
+      host: {
+        measured: true,
+        available: 20,
+        spare: 18,
+        spareReserve: 3,
+        headroom: 15,
+        systemPressure: 'normal',
+        growthAllowed: true,
+      },
+      accounts: [
+        { name: 'fixed', current: 3 },
+        { name: 'kv', current: 4 },
+      ],
+      owed: { bytes: 0, transfers: 0 },
+      claims: { waiting: 0, bytes: 0, oldestMs: 0 },
+      resourceWaits: { memory: 1, concurrency: 0, suspended: 0, draining: false, heldBehindRefusal: 2, oldestMs: 40 },
+      counters: {
+        replans: 1,
+        resourceSuspensions: 0,
+        resourceResumptions: 0,
+        resourceTimeouts: 0,
+        capacityExhausted: 0,
+        metalOutOfMemory: 0,
+        publicationsRefused: 3,
+      },
+      ttftPartsMs: { ownPrefill: 10, claimWait: 5, decode: 0, otherPrefill: 0 },
+      decodeGapCauses: {
+        prefillUnit: { gaps: 1, ms: 600 },
+        claimWait: cause,
+        ssdRead: cause,
+        poolRelease: cause,
+        replan: cause,
+        other: cause,
+        prefillMs: 200,
+      },
+      decodeGapMs: { p50: 1, p99: 2, max: 600 },
+      decisions: ['Memory: start claim needs 1.0 MiB: short'],
+    };
+    const governor = toMemoryGovernorHealth(status);
+    const health = createHealthReporter({ registry: new ModelRegistry(), memoryGovernor: () => governor })();
+    expect(health.memory_governor).toMatchObject({
+      charged: 7,
+      accounts: [
+        { name: 'fixed', current: 3 },
+        { name: 'kv', current: 4 },
+      ],
+      claims: { oldest_ms: 0 },
+      resource_waits: { held_behind_refusal: 2, oldest_ms: 40 },
+      counters: { replans: 1, publications_refused: 3 },
+      ttft_parts_ms: { own_prefill: 10, claim_wait: 5 },
+      decode_gap_causes: { prefill_unit: { gaps: 1, ms: 600 }, prefill_ms: 200 },
+      decode_gap_ms: { max: 600 },
+      owed: { bytes: 0 },
+    });
+    expect(toMinimalHealth(health)).not.toHaveProperty('memory_governor');
+    const none = createHealthReporter({ registry: new ModelRegistry(), memoryGovernor: () => null })();
+    expect('memory_governor' in none).toBe(false);
   });
 
   it('never returns a negative uptime if the clock steps backwards', () => {

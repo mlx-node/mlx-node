@@ -214,74 +214,81 @@ impl HybridSchedulerBackend for Qwen35Inner {
         self.end_gdn_use(seq_id);
     }
 
-    fn marked_hit_blocks(&self, prompt: &[u32]) -> u32 {
-        Qwen35Inner::marked_hit_blocks(
-            self,
-            crate::models::qwen3_5::dflash2_turn::Keep {
-                tokens: prompt,
-                keys: None,
-            },
-        )
-    }
-
     fn reclaims_in_order(&self) -> bool {
         true
+    }
+
+    fn memory_accounts(&self) -> Option<crate::engine::governor::governor::MemoryAccounts> {
+        Some(crate::models::qwen3_5::dflash2_turn::memory_accounts(
+            self,
+            crate::engine::hybrid_scheduler::HybridSchedulerBackend::scheduled_recurrent_bytes(
+                self,
+            ),
+        ))
+    }
+
+    fn reset_after_gpu_oom(&mut self) -> Result<()> {
+        crate::engine::backend::ChatBackend::reset_caches(
+            self,
+            crate::engine::backend::ResetScope::Command,
+        )?;
+        crate::models::qwen3_5::dflash2_turn::drop_unheld_vision(self);
+        Ok(())
+    }
+
+    fn memory_model(&self) -> u64 {
+        self.memory_registration
+            .as_ref()
+            .map_or(0, crate::engine::governor::governor::ModelGuard::model_id)
     }
 
     fn sync_state_marks(&mut self) {
         self.sync_gdn_state_marks();
     }
 
-    fn state_reach_bytes(&self, in_use: bool) -> u64 {
-        crate::models::qwen3_5::dflash2_turn::state_reach_bytes(
-            self,
-            crate::models::qwen3_5::dflash2_turn::Keep::default(),
-            in_use,
-        )
+    fn memory_governor(&self) -> Option<&'static crate::engine::governor::governor::Governor> {
+        self.memory_registration
+            .as_ref()
+            .map(crate::engine::governor::governor::ModelGuard::governor)
     }
 
-    fn oldest_state_unit(
+    fn victim_units(
         &self,
-        at_cap: bool,
-        skip: &std::collections::HashSet<crate::engine::reclaim::UnitKey>,
-        in_use: bool,
-    ) -> Option<crate::engine::reclaim::Unit> {
-        crate::models::qwen3_5::dflash2_turn::oldest_state_unit(
+        query: &crate::engine::governor::ledger::VictimQuery,
+        kept: &[u32],
+    ) -> Vec<crate::engine::governor::ledger::Victim> {
+        crate::models::qwen3_5::dflash2_turn::model_units(
             self,
-            at_cap,
-            skip,
-            crate::models::qwen3_5::dflash2_turn::Keep::default(),
-            in_use,
-        )
-    }
-
-    fn take_state_unit(&mut self, key: &crate::engine::reclaim::UnitKey) -> bool {
-        crate::models::qwen3_5::dflash2_turn::take_state_unit(self, key).is_some()
-    }
-
-    fn rebuilt_bytes(&self) -> u64 {
-        crate::models::qwen3_5::dflash2_turn::rebuilt_bytes(self)
-    }
-
-    fn release_one_rebuilt(&mut self) -> bool {
-        crate::models::qwen3_5::dflash2_turn::release_one_rebuilt(self)
-    }
-
-    fn reclaim_kv(
-        &mut self,
-        need: crate::engine::reclaim::KvNeed,
-        keep: &[u32],
-    ) -> crate::engine::reclaim::Freed {
-        crate::engine::reclaim::free_for_kv(
-            &mut crate::models::qwen3_5::dflash2_turn::ModelReclaim {
-                target: self,
-                keep: crate::models::qwen3_5::dflash2_turn::Keep {
-                    tokens: keep,
-                    keys: None,
-                },
+            crate::models::qwen3_5::dflash2_turn::Keep {
+                tokens: kept,
+                keys: None,
             },
-            need,
+            query,
         )
+    }
+
+    fn take_victim(
+        &mut self,
+        query: &crate::engine::governor::ledger::VictimQuery,
+        victim: &crate::engine::governor::ledger::Victim,
+        kept: &[u32],
+    ) -> crate::engine::governor::ledger::Taken {
+        crate::models::qwen3_5::dflash2_turn::take_model_unit(
+            self,
+            crate::models::qwen3_5::dflash2_turn::Keep {
+                tokens: kept,
+                keys: None,
+            },
+            query,
+            victim,
+        )
+    }
+
+    fn claim_step_rows(
+        state: &mut crate::engine::hybrid_scheduler::HybridSchedulerState<Self>,
+        plan: &crate::engine::scheduler::StepPlan,
+    ) -> crate::engine::hybrid_scheduler::StepClaims {
+        state.claim_rows_in_order(plan)
     }
 
     fn scheduler_books_on_demand(&self) -> bool {

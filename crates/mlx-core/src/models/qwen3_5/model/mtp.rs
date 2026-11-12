@@ -333,31 +333,38 @@ impl MtpStepper for DenseMtpStepper<'_> {
     ) -> Result<(MxArray, MxArray, bool)> {
         ids.eval();
         let token_id = ids.item_at_int32(0)? as u32;
-        let inner = &mut *self.inner;
-        let adapter = self
-            .owner
-            .resolve(
-                &mut inner.paged_adapter,
-                "eager paged MTP forward_with_hidden",
+        let owner = self.owner;
+        let layer_kinds = &self.layer_kinds;
+        // Splash `Engine::growLane`: the AR step's row is claimed like any
+        // decode step's, so a refused growth waits instead of failing the
+        // turn `context_length_exceeded`.
+        let step = |inner: &mut Qwen35Inner| {
+            let adapter = owner
+                .resolve(
+                    &mut inner.paged_adapter,
+                    "eager paged MTP forward_with_hidden",
+                )
+                .map_err(Error::from_reason)?;
+            // Cross-turn M-RoPE delta carried by a text turn that warm-
+            // continues an image prefill; 0 for pure-text sessions.
+            let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
+            let caches = inner.caches.as_mut().ok_or_else(|| {
+                Error::from_reason("eager paged MTP forward_with_hidden: caches is None")
+            })?;
+            crate::models::qwen3_5::paged_forward::run_paged_step_with_hidden(
+                token_id,
+                &inner.embedding,
+                &mut inner.layers,
+                caches,
+                &inner.final_norm,
+                &inner.lm_head,
+                layer_kinds,
+                adapter,
+                rope_deltas,
             )
-            .map_err(Error::from_reason)?;
-        // Cross-turn M-RoPE delta carried by a text turn that warm-
-        // continues an image prefill; 0 for pure-text sessions.
-        let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
-        let caches = inner.caches.as_mut().ok_or_else(|| {
-            Error::from_reason("eager paged MTP forward_with_hidden: caches is None")
-        })?;
-        let (logits, hidden) = crate::models::qwen3_5::paged_forward::run_paged_step_with_hidden(
-            token_id,
-            &inner.embedding,
-            &mut inner.layers,
-            caches,
-            &inner.final_norm,
-            &inner.lm_head,
-            &self.layer_kinds,
-            adapter,
-            rope_deltas,
-        )?;
+        };
+        let (logits, hidden) =
+            crate::models::qwen3_5::dflash2_turn::paged_step_claimed(&mut *self.inner, step)?;
         if let Some(frontier) = self.recurrent_frontier.as_mut() {
             // The main forward consumed one token on the GDN side.
             *frontier += 1;
@@ -621,23 +628,27 @@ impl MtpStepper for DenseMtpStepper<'_> {
         }
     }
 
-    // Per-cycle paged twin of `reserve_paged_mtp_lookahead`: re-reserve the
-    // lookahead region past the adapter's CURRENT cursor so this cycle's
-    // verify writes land in pre-allocated blocks (the turn-entry reservation
-    // only covered the first cycle's cursor). The mechanism — adapter
-    // `reserve_rows` plus the capacity-exhaustion mapping — lives once, in
-    // the stepper's `SpecPagedCache::reserve_lookahead`; this hook only
-    // names the turn's active sequence for it. Exhaustion reports AR
-    // fallback with untouched adapter state.
+    // Per-cycle paged twin of the turn-entry lookahead reservation: the
+    // lookahead past the adapter's CURRENT cursor, booked in the turn's claim
+    // (`dflash2_turn::lookahead_claimed`); a refusal decodes the cycle AR with
+    // untouched adapter state.
     fn reserve_cycle_lookahead(&mut self, rows: usize) -> Result<bool> {
-        let seq_id = self.owner.seq_id();
-        crate::engine::spec_paged::SpecPagedCache::reserve_lookahead(self, seq_id, rows).map_err(
-            |e| {
-                Error::from_reason(format!(
-                    "eager paged MTP per-cycle lookahead reservation ({rows} rows): {e}"
-                ))
-            },
-        )
+        let owner = self.owner;
+        let seq_id = owner.seq_id();
+        let lookahead = u32::try_from(rows).unwrap_or(u32::MAX);
+        crate::models::qwen3_5::dflash2_turn::lookahead_claimed(&mut *self.inner, |inner| {
+            owner
+                .accepts(seq_id, DENSE_PAGED_MTP)
+                .and_then(|()| owner.resolve(&mut inner.paged_adapter, DENSE_PAGED_MTP))
+                .and_then(|adapter| adapter.reserve_rows(lookahead))
+                .map(drop)
+                .map_err(Error::from_reason)
+        })
+        .map_err(|e| {
+            Error::from_reason(format!(
+                "eager paged MTP per-cycle lookahead reservation ({rows} rows): {e}"
+            ))
+        })
     }
 
     // Bound the lazy graph: materialize the token plus the main GDN/full-attn
@@ -766,9 +777,6 @@ fn dense_core_writes_its_own_rows(seq_id: u32) -> String {
 /// PRODUCTION-ROUTED — these are the turn's only path, so conformance and
 /// production cannot drift:
 ///
-/// * `reserve_lookahead` — [`MtpStepper::reserve_cycle_lookahead`] delegates
-///   here for the mechanism ([`PagedKVCacheAdapter::reserve_rows`] plus the
-///   capacity-exhaustion mapping) and only names the active sequence.
 /// * `open_core_write_cycle` + `commit_cycle` — the dense verify core
 ///   records its `[anchor, drafts..]` slice as part of the forward, so
 ///   [`MtpStepper::verify_step`] opens the cycle AROUND that write and
@@ -790,6 +798,8 @@ fn dense_core_writes_its_own_rows(seq_id: u32) -> String {
 ///
 /// NOT production-routed — conformance surface only:
 ///
+/// * `reserve_lookahead`: the turn books each cycle's lookahead in its
+///   claim ([`crate::models::qwen3_5::dflash2_turn::lookahead_claimed`]).
 /// * `settle_committed` / `settle_captures_durable_state` — see below.
 ///
 /// `rollback_unemitted` retracts COMMITTED rows after a mid-cycle stop, past

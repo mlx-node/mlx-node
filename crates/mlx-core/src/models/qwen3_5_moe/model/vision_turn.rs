@@ -294,9 +294,8 @@ impl Qwen35MoeInner {
 
                 let next_logits = {
                     let _stream_ctx = StreamContext::new(generation_stream);
-                    let logits = crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(
-                        self,
-                        |inner| {
+                    let logits =
+                        crate::models::qwen3_5::dflash2_turn::paged_step_claimed(self, |inner| {
                             let caches_ref = inner.caches.as_mut().ok_or_else(|| {
                                 Error::from_reason(
                                     "vision_paged_turn_sync_core: caches dropped mid-decode",
@@ -318,8 +317,7 @@ impl Qwen35MoeInner {
                                 adapter,
                                 inner.cached_rope_deltas.unwrap_or(0),
                             )
-                        },
-                    )?;
+                        })?;
                     logits.squeeze(Some(&[1]))?
                 };
 
@@ -701,9 +699,8 @@ impl Qwen35MoeInner {
 
                 let next_logits = {
                     let _stream_ctx = StreamContext::new(generation_stream);
-                    let logits = crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(
-                        self,
-                        |inner| {
+                    let logits =
+                        crate::models::qwen3_5::dflash2_turn::paged_step_claimed(self, |inner| {
                             let caches_ref = inner.caches.as_mut().ok_or_else(|| {
                                 Error::from_reason(
                                     "vision_paged_turn_stream_core: caches dropped mid-decode",
@@ -725,8 +722,7 @@ impl Qwen35MoeInner {
                                 adapter,
                                 inner.cached_rope_deltas.unwrap_or(0),
                             )
-                        },
-                    )?;
+                        })?;
                     logits.squeeze(Some(&[1]))?
                 };
 

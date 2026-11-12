@@ -3225,31 +3225,29 @@ async fn load_with_thread_impl(
                 drop(plain_fp8_residency);
                 crate::array::memory::synchronize_and_clear_cache();
 
-                // Hold the process-wide pool-growth lock across the sizing
-                // probe → pool allocation → coordinator registration so a
-                // concurrent grow (or another model's load) cannot read
-                // sibling pool totals that miss this in-flight reservation,
-                // and this load cannot read totals that miss an in-flight
-                // grow. See `cache_limit::pool_growth_lock`. Registration is
-                // hoisted into this closure so the guard spans the whole
-                // sequence; the lock itself is dropped before the cold-tier
-                // fingerprint I/O below.
-                let pool_cache_limit_guard = {
-                    let _growth_guard = crate::cache_limit::pool_growth_lock()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    inner.initialize_paged_adapter()?;
-                    inner.require_dflash2_pool()?;
-                    let pool_bytes = inner
-                        .paged_adapter
-                        .as_ref()
-                        .map(PagedKVCacheAdapter::pool_allocated_bytes)
-                        .transpose()
-                        .map_err(Error::from_reason)?
-                        .unwrap_or(0);
-                    (pool_bytes != 0)
-                        .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes))
-                };
+                // Each attempt runs inside the process-wide pool-growth lock across
+                // the sizing probe, the pool allocation and the coordinator's
+                // registration, so a concurrent grow (or another model's load) never
+                // reads sibling pool totals that miss this reservation; the start's
+                // retry waits outside it. See `cache_limit::pool_growth_lock`.
+                let pool_cache_limit_guard =
+                    crate::engine::governor::governor::start_under_growth_lock(
+                        crate::engine::governor::governor(),
+                        || {
+                            inner.initialize_paged_adapter()?;
+                            inner.require_dflash2_pool()?;
+                            let pool_bytes = inner
+                                .paged_adapter
+                                .as_ref()
+                                .map(PagedKVCacheAdapter::pool_allocated_bytes)
+                                .transpose()
+                                .map_err(Error::from_reason)?
+                                .unwrap_or(0);
+                            Ok((pool_bytes != 0).then(|| {
+                                crate::cache_limit::coordinator().register_pool(pool_bytes)
+                            }))
+                        },
+                    )?;
 
                 // Fail-closed revalidation bracketing the WHOLE
                 // load-to-materialize-to-fingerprint span, then attach the SSD cold
@@ -3346,7 +3344,7 @@ async fn load_with_thread_impl(
 
     let (
         config,
-        _model_id,
+        model_id,
         image_processor,
         spatial_merge_size,
         _tokenizer,
@@ -3359,6 +3357,9 @@ async fn load_with_thread_impl(
     ) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
+    if let Some(sender) = thread.cmd_sender() {
+        crate::engine::model_command::register_memory_waker(model_id, &sender);
+    }
 
     Ok(Qwen3_5Model {
         thread,

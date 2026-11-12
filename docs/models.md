@@ -401,7 +401,9 @@ the report names the format the load resolved.
 **Context windows come from the memory plan.** A qwen3_5 / qwen3_5_moe load
 evaluates one memory plan (Splash `evaluateEngineMemoryPlan`) after its
 weights are resident: the hard budget is the Metal recommended working set
-less 15% and 1 GiB (or `maxMemoryBytes` in the load options when lower), and
+less 2% of it, at least 1 GiB (Splash `workingSetMarginBytes`: the memory
+governor keeps the model inside it), or `maxMemoryBytes` in the load options
+when lower, and
 each lane's window is what that budget holds after the fixed memory, one
 request's recurrent state and the lane's peak transient, in whole KV extents,
 capped by the trained context. Every turn takes that one window,
@@ -412,7 +414,7 @@ second GDN cell and the draft's K/V ring, Splash
 larger of the tapped prefill chunk and the 8-row verify cycle with the free
 pool MLX keeps of it (twice the cycle; MLX collects that pool only at 95% of
 the working set). On the M3 Pro inputs (27 GiB working set, the 27B and its
-draft, int8 pool) that is 98,297 tokens for every turn. DFlash2 runs only on
+draft, int8 pool) that is 221,177 tokens for every turn. DFlash2 runs only on
 the block-paged pool: a load with a draft and no pool fails. On Metal every
 Qwen3.5 load serves its turns from the pool (a sym8 checkpoint included);
 only a load off Metal has none, and it plans its weights only. The load

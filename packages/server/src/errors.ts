@@ -48,6 +48,15 @@ export function sendRequestQuarantined(res: ServerResponse, message: string): vo
   sendError(res, 400, 'invalid_request_error', message, null, 'request_quarantined');
 }
 
+/**
+ * 503 with `Retry-After: 1`: the engine could not serve the request now and a
+ * retry may (Splash `server/errors.py` retry statuses), e.g. `resource_timeout`.
+ */
+export function sendResourceUnavailable(res: ServerResponse, code: string, message: string): void {
+  res.writeHead(503, { 'Retry-After': '1', 'Content-Type': 'application/json' });
+  res.end(stringifyStrictJson({ error: { type: 'server_error', message, code, param: null } }));
+}
+
 export function sendNotFound(res: ServerResponse, message: string): void {
   sendError(res, 404, 'not_found_error', message);
 }
@@ -105,6 +114,15 @@ export function sendAnthropicError(res: ServerResponse, status: number, type: st
 
 export function sendAnthropicBadRequest(res: ServerResponse, message: string): void {
   sendAnthropicError(res, 400, 'invalid_request_error', message);
+}
+
+/**
+ * 503 `overloaded_error` with `Retry-After: 1`: the Anthropic twin of
+ * {@link sendResourceUnavailable} (Splash `dialects/anthropic.py`).
+ */
+export function sendAnthropicOverloaded(res: ServerResponse, message: string): void {
+  res.writeHead(503, { 'Retry-After': '1', 'Content-Type': 'application/json' });
+  res.end(stringifyStrictJson({ type: 'error', error: { type: 'overloaded_error', message } }));
 }
 
 export function sendAnthropicNotFound(res: ServerResponse, message: string): void {

@@ -125,13 +125,7 @@ impl Qwen35Inner {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
         }
-        crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(
-            self,
-            &tokens,
-            &lookup_extra_keys,
-            cache_salt,
-        );
-        let plan_result = crate::models::qwen3_5::dflash2_turn::reclaiming(
+        let plan_result = crate::models::qwen3_5::dflash2_turn::claimed(
             self,
             crate::models::qwen3_5::dflash2_turn::Keep {
                 tokens: &tokens,
@@ -559,7 +553,7 @@ impl Qwen35Inner {
             let next_logits = {
                 let embed = self.embedding.clone();
                 let logits =
-                    crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(self, |inner| {
+                    crate::models::qwen3_5::dflash2_turn::paged_step_claimed(self, |inner| {
                         let caches_ref = inner.caches.as_mut().ok_or_else(|| {
                             Error::from_reason(
                                 "paged_turn_sync_core_inner: caches dropped mid-decode",
@@ -847,9 +841,8 @@ impl Qwen35Inner {
 
                 let next_logits = {
                     let _stream_ctx = StreamContext::new(generation_stream);
-                    let logits = crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(
-                        self,
-                        |inner| {
+                    let logits =
+                        crate::models::qwen3_5::dflash2_turn::paged_step_claimed(self, |inner| {
                             let caches_ref = inner.caches.as_mut().ok_or_else(|| {
                                 Error::from_reason(
                                     "vision_paged_turn_sync_core: caches dropped mid-decode",
@@ -871,8 +864,7 @@ impl Qwen35Inner {
                                 adapter,
                                 inner.cached_rope_deltas.unwrap_or(0),
                             )
-                        },
-                    )?;
+                        })?;
                     logits.squeeze(Some(&[1]))?
                 };
 
@@ -1268,9 +1260,8 @@ impl Qwen35Inner {
 
                 let next_logits = {
                     let _stream_ctx = StreamContext::new(generation_stream);
-                    let logits = crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(
-                        self,
-                        |inner| {
+                    let logits =
+                        crate::models::qwen3_5::dflash2_turn::paged_step_claimed(self, |inner| {
                             let caches_ref = inner.caches.as_mut().ok_or_else(|| {
                                 Error::from_reason(
                                     "vision_paged_turn_stream_core: caches dropped mid-decode",
@@ -1292,8 +1283,7 @@ impl Qwen35Inner {
                                 adapter,
                                 inner.cached_rope_deltas.unwrap_or(0),
                             )
-                        },
-                    )?;
+                        })?;
                     logits.squeeze(Some(&[1]))?
                 };
 
@@ -1571,13 +1561,7 @@ impl Qwen35Inner {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
         }
-        crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(
-            self,
-            &tokens,
-            &lookup_extra_keys,
-            cache_salt,
-        );
-        let plan_result = crate::models::qwen3_5::dflash2_turn::reclaiming(
+        let plan_result = crate::models::qwen3_5::dflash2_turn::claimed(
             self,
             crate::models::qwen3_5::dflash2_turn::Keep {
                 tokens: &tokens,
@@ -2245,7 +2229,7 @@ impl Qwen35Inner {
             let next_logits = {
                 let embed = self.embedding.clone();
                 let logits =
-                    crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(self, |inner| {
+                    crate::models::qwen3_5::dflash2_turn::paged_step_claimed(self, |inner| {
                         let caches_ref = inner.caches.as_mut().ok_or_else(|| {
                             Error::from_reason(
                                 "paged_turn_stream_core_inner: caches dropped mid-decode",
@@ -2300,8 +2284,9 @@ impl Qwen35Inner {
     /// [`MtpStepper::reserve_cycle_lookahead`], where exhaustion degrades
     /// that cycle to a Step-A AR token instead of gating the whole turn.
     ///
-    /// `Ok(false)` means the pool cannot hold even one verify cycle: the
-    /// caller must run the turn autoregressively instead of erroring it
+    /// `Ok(false)` means the turn's claim could not book one verify cycle
+    /// (`dflash2_turn::lookahead_claimed`): the caller must run the turn
+    /// autoregressively instead of erroring it
     /// (vLLM schedules such a request without its spec tokens rather than
     /// failing it). AR decode grows one row at a time against the same
     /// lazily-allocated tail, so it can still make progress where a
@@ -2324,28 +2309,29 @@ impl Qwen35Inner {
         };
         let rows = u32::try_from(crate::engine::mtp_turn::turn_lookahead_rows(plan, p))
             .unwrap_or(u32::MAX);
-        let reserved = crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(self, |inner| {
+        let reserved = crate::models::qwen3_5::dflash2_turn::lookahead_claimed(self, |inner| {
             inner
                 .paged_adapter
                 .as_mut()
                 .ok_or_else(|| Error::from_reason(format!("{site}: paged_adapter is None")))?
                 .reserve_rows(rows)
+                .map(drop)
                 .map_err(Error::from_reason)
-        });
-        match reserved.map_err(|error| error.reason) {
-            Ok(_) => Ok(true),
-            Err(e) if e.starts_with("context_length_exceeded:") => {
-                tracing::warn!(
-                    target: "mlx_core::qwen3_5::paged",
-                    lookahead_rows = rows,
-                    "{site}: speculative lookahead reservation exhausted the \
-                     paged pool; falling back to autoregressive decode: {e}"
-                );
-                Ok(false)
-            }
-            Err(e) => Err(Error::from_reason(format!(
-                "{site}: speculative lookahead reservation: {e}"
-            ))),
+        })
+        .map_err(|e| {
+            Error::from_reason(format!(
+                "{site}: speculative lookahead reservation: {}",
+                e.reason
+            ))
+        })?;
+        if !reserved {
+            tracing::warn!(
+                target: "mlx_core::qwen3_5::paged",
+                lookahead_rows = rows,
+                "{site}: speculative lookahead reservation refused; falling back to \
+                 autoregressive decode"
+            );
         }
+        Ok(reserved)
     }
 }

@@ -1,7 +1,7 @@
 import type { ServerResponse } from 'node:http';
 
 import type { ChatMessage, ChatResult, ChatStreamProgress, ToolCallResult } from '@mlx-node/core';
-import { ChatSession, type ChatStreamControl, type SessionCapableModel } from '@mlx-node/lm';
+import { ChatSession, isContextCapacityError, type ChatStreamControl, type SessionCapableModel } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
@@ -3760,6 +3760,67 @@ describe('handleCreateMessage', () => {
       expect(getStatus()).toBe(400);
       const parsed = JSON.parse(getBody());
       expect(parsed).toEqual({ type: 'error', error: { type: 'invalid_request_error', message } });
+    });
+
+    // A request that does not fit even alone is no context overflow: agents
+    // must not compact on it.
+    // Mutation TS2: `isContextCapacityError` also matches `capacity_exhausted:` → red.
+    it('never reads capacity_exhausted as a context overflow', () => {
+      const error = new Error('capacity_exhausted: could not allocate KV target: engine memory budget exceeded');
+      expect(isContextCapacityError(error)).toBe(false);
+    });
+
+    // Splash `ResourceTimeout`: memory did not come free within the wait
+    // limit, so the client retries after a second.
+    // Mutation TS1: send `resource_timeout:` through the 400 branch → red (400).
+    it('returns 503 overloaded_error with Retry-After when the native scheduler reports resource_timeout', async () => {
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel();
+      const message = 'resource_timeout: memory did not become available within the resource wait limit';
+      (mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(new Error(message));
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody, getHeaders } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(503);
+      expect(getHeaders()['retry-after']).toBe('1');
+      const parsed = JSON.parse(getBody());
+      expect(parsed).toEqual({ type: 'error', error: { type: 'overloaded_error', message } });
+    });
+
+    // Mutation TS4: `retryableErrorCode` ignores `metal_out_of_memory:` → red (500).
+    it('returns 503 overloaded_error with Retry-After when a GPU command exhausted Metal memory', async () => {
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel();
+      const message =
+        'metal_out_of_memory: a GPU command exhausted Metal memory ([malloc] Unable to allocate 64 bytes.); the request was not at fault; retry';
+      (mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(new Error(message));
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody, getHeaders } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(503);
+      expect(getHeaders()['retry-after']).toBe('1');
+      const parsed = JSON.parse(getBody());
+      expect(parsed).toEqual({ type: 'error', error: { type: 'overloaded_error', message } });
     });
 
     it('emits error SSE event when the stream throws after headers are sent', async () => {

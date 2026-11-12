@@ -44,6 +44,12 @@ pub(crate) struct Qwen35MoePagedDecode<'a> {
     inner: &'a mut Qwen35MoeInner,
 }
 
+impl Drop for Qwen35MoePagedDecode<'_> {
+    fn drop(&mut self) {
+        self.inner.serial_decode = None;
+    }
+}
+
 impl PagedStepModel for Qwen35MoePagedDecode<'_> {
     /// `SyncTokenAndForcedLogits`: the measured single-completion cadence
     /// of the dense sibling — one synchronous `next_token.eval()` per
@@ -66,7 +72,7 @@ impl PagedStepModel for Qwen35MoePagedDecode<'_> {
         // re-`item_at_int32` the fresh `input_ids` reshape — that
         // redundant second per-step eval/sync measurably regressed decode.
         let embed = self.inner.embedding.clone();
-        crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(&mut *self.inner, |inner| {
+        crate::models::qwen3_5::dflash2_turn::paged_step_claimed(&mut *self.inner, |inner| {
             let caches_ref = inner.caches.as_mut().ok_or_else(|| {
                 Error::from_reason("Qwen35MoePagedDecode::paged_step: caches dropped mid-decode")
             })?;
@@ -188,17 +194,17 @@ impl Qwen35MoeInner {
             cache_salt,
             dflash2_hit,
         );
-        if self.active_scheduled_seq.is_none() {
-            crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_keeping(self, plan, keep);
-        }
-        let turn_plan = crate::models::qwen3_5::dflash2_turn::reclaiming(self, keep, |inner| {
+        let turn_plan = crate::models::qwen3_5::dflash2_turn::claimed(self, keep, |inner| {
             let adapter = inner
                 .paged_adapter
                 .as_mut()
                 .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?;
             let Some(hit) = dflash2_hit else {
-                return adapter
-                    .prepare_turn_per_block_with_max_cache_hit_tokens(
+                // A scheduled lane books nothing past its hit: each prefill
+                // slice's step claim books the slice (Splash
+                // `Engine::workEndOf`).
+                let prepared = if seq_id == 0 {
+                    adapter.prepare_turn_per_block_with_max_cache_hit_tokens(
                         seq_id,
                         plan,
                         total_budget,
@@ -208,7 +214,18 @@ impl Qwen35MoeInner {
                         false,
                         max_cache_hit_tokens,
                     )
-                    .map_err(Error::from_reason);
+                } else {
+                    adapter.prepare_turn_per_block_booking_hit_only(
+                        seq_id,
+                        plan,
+                        total_budget,
+                        &lookup_extra_keys,
+                        cache_salt,
+                        false,
+                        max_cache_hit_tokens,
+                    )
+                };
+                return prepared.map_err(Error::from_reason);
             };
             crate::models::qwen3_5::dflash2_turn::prepare_dflash2_turn(
                 adapter,
@@ -238,13 +255,85 @@ impl Qwen35MoeInner {
             ));
         }
 
+        self.finish_moe_prime(
+            plan,
+            cache_salt,
+            block_size,
+            &lookup_extra_keys,
+            carries_image_lineage,
+            &turn_plan,
+        )
+    }
+
+    /// Splash `replayTokens` for a suspended serial lane: the GDN prime
+    /// over `plan`'s restored prefix, then the prefill of the rest of
+    /// `tokens` with its logits dropped, as at a turn start; a DFlash2 lane's
+    /// prefill is tapped and leaves its draft window in the turn state.
+    pub(crate) fn replay_moe_serial_lane(
+        &mut self,
+        tokens: &[u32],
+        cache_salt: u64,
+        plan: &crate::transformer::paged_kv_cache_adapter::PagedTurnPlan,
+        decode: crate::models::qwen3_5::dflash2_turn::SerialDecode,
+        stored: Option<crate::models::qwen3_5::dflash2_state::store::EntryId>,
+    ) -> Result<()> {
+        let block_size = self
+            .paged_adapter
+            .as_ref()
+            .map(PagedKVCacheAdapter::block_size)
+            .ok_or_else(|| Error::from_reason("a suspended lane lost its paged adapter"))?;
+        let keys = engine::build_paged_extra_keys(tokens.len(), block_size, &[]);
+        let prefix = self.finish_moe_prime(tokens, cache_salt, block_size, &keys, false, plan)?;
+        let cached = prefix.effective_cached_prefix_len;
+        let suffix = tokens
+            .get(cached..)
+            .ok_or_else(|| Error::from_reason("a replay's prefix passed its tokens"))?;
+        let logits = match decode {
+            crate::models::qwen3_5::dflash2_turn::SerialDecode::Autoregressive => {
+                self.moe_paged_prefill(suffix, &prefix, None)?.0
+            }
+            crate::models::qwen3_5::dflash2_turn::SerialDecode::DFlash2 => {
+                if cached == 0 {
+                    self.dflash2_context = None;
+                }
+                crate::models::qwen3_5::dflash2_turn::use_resumed_replay_point(
+                    self, tokens, stored, cached,
+                );
+                crate::engine::dspark_turn::PagedDsparkBackend::paged_prefill_with_draft_state(
+                    self,
+                    suffix,
+                    &prefix,
+                    Stream::generation(),
+                )?
+            }
+        };
+        logits.eval();
+        crate::array::synchronize_and_clear_cache();
+        Ok(())
+    }
+
+    /// The prime after the adapter's prepare: the GDN state over
+    /// `turn_plan`'s cached prefix, the turn's session state, and the
+    /// prefix the prefill continues from.
+    pub(crate) fn finish_moe_prime(
+        &mut self,
+        plan: &[u32],
+        cache_salt: u64,
+        block_size: u32,
+        lookup_extra_keys: &[Vec<u64>],
+        carries_image_lineage: bool,
+        turn_plan: &crate::transformer::paged_kv_cache_adapter::PagedTurnPlan,
+    ) -> Result<Qwen35MoePrefixState> {
+        let cached_prefix_len = turn_plan.cached_prefix_len;
+        let continued_live_prefix = turn_plan.continued_live_prefix;
+        let total_budget = plan.len() as u32;
         // GDN recurrent-state prime (live / checkpoint / replay). No qwen3/lfm2
         // analog — moe carries GDN recurrent state across turns.
         let gdn_prefix_preparation = self.prepare_moe_gdn_prefix_state(
             plan,
             cached_prefix_len,
             block_size,
-            &lookup_extra_keys,
+            lookup_extra_keys,
             cache_salt,
             continued_live_prefix,
         )?;
@@ -287,7 +376,7 @@ impl Qwen35MoeInner {
             suffix_len,
             full_tokens: plan.to_vec(),
             gdn_prefix_already_primed,
-            checkpoint_extra_keys: lookup_extra_keys,
+            checkpoint_extra_keys: lookup_extra_keys.to_vec(),
             checkpoint_cache_salt: cache_salt,
         })
     }
@@ -462,7 +551,7 @@ impl crate::models::qwen3_5::paged_forward::PrefillTarget<DecoderLayer> for Qwen
     }
 
     fn record(&mut self, chunk: &[u32]) -> Result<()> {
-        crate::models::qwen3_5::dflash2_turn::record_chunk_reclaiming(self, chunk)
+        crate::models::qwen3_5::dflash2_turn::record_chunk_claimed(self, chunk)
     }
 }
 
@@ -499,6 +588,10 @@ impl PagedBackend for Qwen35MoeInner {
         // Pure-Rust eager paged decode: the stepper drives
         // `run_paged_decode_step` against the live post-prefill adapter pools +
         // GDN caches. No compiled-graph seeding / lifecycle locks needed.
+        if self.active_scheduled_seq.is_none() {
+            self.serial_decode =
+                Some(crate::models::qwen3_5::dflash2_turn::SerialDecode::Autoregressive);
+        }
         Ok(PagedStepper(Qwen35MoePagedDecode { inner: self }))
     }
 
@@ -524,7 +617,7 @@ impl PagedBackend for Qwen35MoeInner {
         // surface as a turn error and invalidate the paged session.
         let rows = u32::try_from(crate::engine::mtp_turn::turn_lookahead_rows(plan, p))
             .unwrap_or(u32::MAX);
-        let reserved = crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(self, |inner| {
+        let reserved = crate::models::qwen3_5::dflash2_turn::lookahead_claimed(self, |inner| {
             inner
                 .paged_adapter
                 .as_mut()
@@ -532,23 +625,24 @@ impl PagedBackend for Qwen35MoeInner {
                     Error::from_reason("MoE paged speculative admission: paged_adapter is None")
                 })?
                 .reserve_rows(rows)
+                .map(drop)
                 .map_err(Error::from_reason)
-        });
-        match reserved.map_err(|error| error.reason) {
-            Ok(_) => Ok(true),
-            Err(e) if e.starts_with("context_length_exceeded:") => {
-                tracing::warn!(
-                    target: "mlx_core::qwen3_5_moe::paged",
-                    lookahead_rows = rows,
-                    "MoE paged speculative lookahead reservation exhausted the paged \
-                     pool; falling back to autoregressive decode: {e}"
-                );
-                Ok(false)
-            }
-            Err(e) => Err(Error::from_reason(format!(
-                "MoE paged speculative lookahead reservation: {e}"
-            ))),
+        })
+        .map_err(|e| {
+            Error::from_reason(format!(
+                "MoE paged speculative lookahead reservation: {}",
+                e.reason
+            ))
+        })?;
+        if !reserved {
+            tracing::warn!(
+                target: "mlx_core::qwen3_5_moe::paged",
+                lookahead_rows = rows,
+                "MoE paged speculative lookahead reservation refused; falling back to \
+                 autoregressive decode"
+            );
         }
+        Ok(reserved)
     }
 
     fn run_paged_speculative_decode(

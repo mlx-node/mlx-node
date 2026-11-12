@@ -3193,7 +3193,7 @@ fn paged_mtp_lookahead_reservation_covers_verify() {
 
 /// The serial MTP gate at the cap reclaims a ladder chain before it falls
 /// back to AR decode.
-/// Mutation: drop the `paged_step_reclaiming` wrapper in
+/// Mutation: drop the `paged_step_claimed` wrapper in
 /// `reserve_paged_mtp_lookahead` → red (`Ok(false)`).
 #[test]
 fn mtp_gate_at_the_cap_reclaims_before_falling_back() {
@@ -3231,6 +3231,81 @@ fn mtp_gate_at_the_cap_reclaims_before_falling_back() {
             .expect("the gate never errors on exhaustion")
     );
     assert!(inner.ladder_entries_for_test().is_empty());
+}
+
+/// Splash `Engine::growLane`: MTP's AR step (Step A, after a refused
+/// lookahead) claims its row like any decode step. At a block boundary on
+/// a pool that must grow, a host refusal waits in place and the step runs
+/// once the host lets it, never `context_length_exceeded`.
+/// Mutation MA1: Step A runs outside the claim → red
+/// (`context_length_exceeded: paged decode could not reserve`).
+#[test]
+fn mtp_ar_step_waits_for_its_growth() {
+    use crate::engine::governor::governor::Governor;
+    use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+    use crate::engine::governor::host::Pressure;
+
+    let mut cfg = tiny_paged_forward_cfg();
+    cfg.n_mtp_layers = 1;
+    let Some((mut inner, _cfg)) =
+        paged_inner_with_cfg_or_skip("mtp_ar_step_waits_for_its_growth", cfg)
+    else {
+        return;
+    };
+    inner.mtp_weights_loaded = true;
+    super::dflash2_park_tests::install_pool(
+        &mut inner,
+        2,
+        8,
+        super::dflash2_park_tests::passing_probe(),
+    )
+    .expect("growable pool");
+    let io = FakeIo::new(stats(0), host(32 * G, Pressure::Normal));
+    let governor: &'static Governor = Box::leak(Box::new(Governor::new(io.clone())));
+    inner.memory_registration = Some(governor.register_model(model(16 * G, 0)).expect("register"));
+    let block_size = {
+        let adapter = inner.paged_adapter.as_mut().expect("adapter");
+        adapter.set_admission(std::sync::Arc::new(governor));
+        adapter.set_extent_growth(2);
+        adapter.block_size()
+    };
+    let prompt: Vec<u32> = (0..2 * block_size).map(|i| (i * 5 + 7) % 257).collect();
+    reset_paged_request(&mut inner, &prompt);
+    run_dense_paged_prefill_with_size(&mut inner, &prompt, &prompt, 0, 2048)
+        .expect("dense paged prefill")
+        .eval();
+    assert_eq!(
+        inner
+            .paged_adapter
+            .as_ref()
+            .expect("adapter")
+            .num_allocated_blocks(),
+        2
+    );
+    io.with(|state| {
+        state.host = host(32 * G, Pressure::Critical);
+        state.on_sleep = Some(Box::new(|state| {
+            state.host = host(32 * G, Pressure::Normal);
+        }));
+    });
+    let setup = MtpTurnSetup {
+        prompt_hidden: None,
+        prompt_hidden_ids: None,
+        first_sampled_token: 21,
+        lookahead_rows: 0,
+    };
+    let embedding = inner.embedding.clone();
+    let mut step = inner.begin_mtp_decode(&setup).expect("begin_mtp_decode");
+    let ids = MxArray::from_int32(&[21], &[1, 1]).expect("ids");
+    let forward = step.forward_with_hidden(&ids, &embedding);
+    let (logits, _hidden, _) = forward.unwrap_or_else(|error| panic!("{}", error.reason));
+    logits.eval();
+    assert_eq!(
+        step.owned_adapter().current_token_count(),
+        2 * block_size + 1
+    );
+    drop(step);
+    assert!(io.with(|state| state.sleeps) >= 1, "the step waited");
 }
 
 /// Failure path of the same seam: a reservation the pool cannot hold

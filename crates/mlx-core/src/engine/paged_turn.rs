@@ -170,6 +170,27 @@ pub(crate) fn emit_paged_turn_result<B: PagedBackend>(
     Ok(TurnOutput::Complete(Box::new(result)))
 }
 
+/// A decode error of a serial turn. `Ok` when it ended a stopped turn
+/// after its lane was vacated: Splash `Engine::stop` → `finish(Stop)` on
+/// what it generated (finish "cancelled", which the stream sink reports
+/// "stop"). A vacated turn that was cancelled, or stopped before its first
+/// token, reports the cancel error; any other error is returned as is.
+pub(crate) fn vacated_stop(
+    error: Error,
+    generated: &[u32],
+    sink: Option<&dyn ChunkSink>,
+) -> Result<()> {
+    if error.reason != crate::engine::session::LANE_VACATED_CANCELLED {
+        return Err(error);
+    }
+    if generated.is_empty() || !sink.is_some_and(|sink| sink.stop_requested()) {
+        return Err(Error::from_reason(
+            crate::engine::session::CHAT_SESSION_CANCELLED,
+        ));
+    }
+    Ok(())
+}
+
 /// Drive one PAGED whole turn through the generic engine. Returns the
 /// same `Result<TurnOutput>` shape the `ChatBackend::run_paged_turn`
 /// executor expects; honors the streaming Complete-vs-Streamed contract
@@ -451,15 +472,25 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
         // AFTER the export above (declaration-order teardown), and the
         // `&mut backend` borrow is released so `abort_paged_turn` is free.
     })();
-    if let Err(e) = decode_result {
-        // Stepper has dropped (its borrow released); release the live paged
-        // request before propagating. finalize_paged_turn / save_paged_history
-        // / finalize_turn below DO NOT run on this error path.
-        backend.abort_paged_turn();
-        return Err(e);
-    }
+    let vacated = match decode_result {
+        Ok(()) => false,
+        Err(e) => {
+            // Stepper has dropped (its borrow released); release the live
+            // paged request. finalize_paged_turn / save_paged_history do not
+            // run on this path.
+            backend.abort_paged_turn();
+            vacated_stop(e, &generated_tokens, args.sink)?;
+            finish_reason = "cancelled".to_string();
+            true
+        }
+    };
 
-    finish_paged_turn(
+    let finish = if vacated {
+        emit_paged_turn_result::<B>
+    } else {
+        finish_paged_turn::<B>
+    };
+    finish(
         backend,
         FinishPagedTurnArgs {
             tokenizer: &tokenizer,

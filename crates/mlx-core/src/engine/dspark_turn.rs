@@ -1444,10 +1444,16 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
         )
     };
     let outcome = match outcome {
-        Ok(outcome) => outcome,
+        Ok(outcome) => Some(outcome),
         Err(error) => {
-            epilogue.abort(backend);
-            return Err(error);
+            if let Err(error) =
+                crate::engine::paged_turn::vacated_stop(error, &generated_tokens, args.sink)
+            {
+                epilogue.abort(backend);
+                return Err(error);
+            }
+            finish_reason = "cancelled".to_string();
+            None
         }
     };
 
@@ -1458,22 +1464,31 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
     // row moved: the per-cycle settles inside `run_dspark_turn` stop at the
     // last COMMIT, so without this the sliding prune and the cold-rung walk
     // would never see the final token.
-    let tail: Result<()> = (|| {
-        let mut step = backend.begin_paged_decode()?;
-        if finish_reason == "length"
-            && !outcome.last_in_cache
-            && let Some(&final_token) = generated_tokens.last()
-        {
-            step.materialize_final(final_token)?;
-        }
-        step.end_decode()
-    })();
+    let tail: Result<()> = match &outcome {
+        Some(outcome) => (|| {
+            let mut step = backend.begin_paged_decode()?;
+            if finish_reason == "length"
+                && !outcome.last_in_cache
+                && let Some(&final_token) = generated_tokens.last()
+            {
+                step.materialize_final(final_token)?;
+            }
+            step.end_decode()
+        })(),
+        None => Ok(()),
+    };
     if let Err(error) = tail {
         epilogue.abort(backend);
         return Err(error);
     }
 
-    epilogue.finish(
+    let finish = if outcome.is_some() {
+        SpecTurnEpilogue::finish::<B>
+    } else {
+        SpecTurnEpilogue::vacated::<B>
+    };
+    finish(
+        epilogue,
         backend,
         FinishPagedTurnArgs {
             tokenizer: &tokenizer,
