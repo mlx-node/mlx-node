@@ -785,9 +785,12 @@ impl BlockAllocator {
         self.free_at(block, None);
     }
 
-    /// [`Self::free`] for a block whose last use was at `at`. A cached leaf
-    /// left with only the cache's ref is stamped `max(own, at)`, or with a
-    /// fresh stamp when `at` is `None`.
+    /// [`Self::free`] for a block whose last use was at `at`. Every release
+    /// with `Some(at)` raises a cached leaf's stamp to `max(own, at)`; a
+    /// `None` release stamps it fresh only when the cache is left as the
+    /// sole holder. Splash `KvCache::releaseActive` ticks once, at the last
+    /// request end; a kept table releases after its turn end and in any
+    /// order, so the max of the turn ends gives the same stamp.
     pub fn free_at(&mut self, block: Arc<PhysicalBlock>, at: Option<u64>) {
         let block_id = block.block_id;
         if block.decref() {
@@ -797,9 +800,6 @@ impl BlockAllocator {
                 self.block_hashes.remove(&block_id);
             }
             self.free_blocks.push_back(block_id);
-            return;
-        }
-        if block.get_ref_count() != 1 {
             return;
         }
         let Some(&hash) = self.block_hashes.get(&block_id) else {
@@ -813,9 +813,12 @@ impl BlockAllocator {
         {
             return;
         }
+        let held = block.get_ref_count() != 1;
         let stamp = match at {
-            None => self.recency.next(),
+            // Kept tables release out of turn-end order: keep the newest end.
             Some(at) => self.stamps.get(&hash).copied().unwrap_or(0).max(at),
+            None if held => return,
+            None => self.recency.next(),
         };
         self.set_stamp(hash, stamp);
     }
@@ -3709,6 +3712,37 @@ mod tests {
             allocator.free(block);
         }
         assert_eq!(allocator.allocate().unwrap().block_id, y);
+    }
+
+    /// Mutation: a release that leaves another holder drops its `at`
+    /// -> red (stamp t1, L taken first).
+    #[test]
+    fn shared_leaf_keeps_the_newest_release_stamp() {
+        let mut allocator = BlockAllocator::new(2, 2, 4);
+        let l_tokens: Vec<u32> = (0..4).collect();
+        let z_tokens: Vec<u32> = (100..104).collect();
+        let (mut a_blocks, l_hashes) = cache_chain(&mut allocator, &l_tokens);
+        let (mut b_blocks, _) = allocator.find_longest_cache_hit(&l_tokens, 4, &[], 0);
+        let (a, b) = (a_blocks.remove(0), b_blocks.remove(0));
+        let l = l_hashes[0];
+        assert_eq!(a.get_ref_count(), 3);
+
+        let recency = allocator.recency();
+        let t1 = recency.next();
+        let (z_blocks, z_hashes) = cache_chain(&mut allocator, &z_tokens);
+        let z_id = z_blocks[0].block_id;
+        for block in z_blocks {
+            allocator.free(block);
+        }
+        let t2 = recency.next();
+        assert!(allocator.block_stamp(z_hashes[0]) < Some(t2));
+        assert!(allocator.block_stamp(z_hashes[0]) > Some(t1));
+
+        allocator.free_at(b, Some(t2));
+        allocator.free_at(a, Some(t1));
+        assert_eq!(allocator.block_stamp(l), Some(t2));
+        assert_eq!(allocator.allocate().unwrap().block_id, z_id);
+        assert_eq!(hit_len(&mut allocator, &l_tokens), 1);
     }
 
     /// Mutation: no touch in the verified-duplicate skip branch of
