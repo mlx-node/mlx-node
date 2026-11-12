@@ -517,6 +517,34 @@ pub(crate) fn validate_query_input(
     })
 }
 
+/// Bytes a pool grow holds beside the new pool: the peak of
+/// `LayerKVPool::grow_to`'s swaps, which allocate each layer's new buffers
+/// while its old ones are alive and skip a layer already at the new size,
+/// walked over the real `layer_bytes`. Layers differ after a grow or a cut
+/// that failed part way; equal layers give one old layer.
+pub(crate) fn pool_grow_reserved_bytes(layer_bytes: &[u64], new_layer_bytes: u64) -> u64 {
+    let mut live = layer_bytes
+        .iter()
+        .fold(0u64, |total, &bytes| total.saturating_add(bytes));
+    let mut peak = live;
+    for &old in layer_bytes {
+        if old == new_layer_bytes {
+            continue;
+        }
+        peak = peak.max(live.saturating_add(new_layer_bytes));
+        live = live.saturating_add(new_layer_bytes).saturating_sub(old);
+    }
+    peak.saturating_sub(new_layer_bytes.saturating_mul(layer_bytes.len() as u64))
+}
+
+/// Whole pool extents of `extent_bytes` that give back at least
+/// `want_bytes`, at least one.
+pub(crate) fn pool_extents_for_bytes(want_bytes: u64, extent_bytes: u64) -> u32 {
+    u32::try_from(want_bytes.div_ceil(extent_bytes.max(1)))
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
 /// The pages a decode query at context length `context` reads: the first
 /// retained logical block and the token count visible from it. Sliding
 /// groups omit whole blocks before their live window (the kernel masks the
@@ -1002,12 +1030,22 @@ pub struct PagedKVCacheAdapter {
     #[cfg(target_os = "macos")]
     native_pool_arrays: Vec<Option<NativePoolArrays>>,
 
-    /// Optional hook invoked once per successful pool grow with the pool's
+    /// Optional hook invoked once per pool grow or shrink with the pool's
     /// new total K/V bytes (all layers, both sides). The cache-limit pool
     /// re-registration lands through this (see `set_pool_growth_notifier`);
     /// `None` (the default) is a no-op. Follows the `set_cold_tier`
     /// ownership pattern: the adapter shares the `Arc` with its caller.
     pool_growth_notifier: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+
+    /// Blocks one pool growth adds per shortage (a Splash KV extent), set on
+    /// a pool that starts at a runway. Such a pool also grows before it
+    /// evicts cached-only prefix blocks: a cached block is not free. `None`
+    /// doubles and counts cached blocks as available.
+    extent_growth_blocks: Option<u32>,
+
+    /// Block count of an extent-growth pool when its growth was set: the
+    /// floor [`Self::try_release_pool_extents`] cuts down to.
+    extent_runway_blocks: u32,
 
     /// Test-only override for the pre-grow headroom probe: receives the
     /// grow-target block count and returns the probe's `selected_blocks`.
@@ -1207,9 +1245,47 @@ impl PagedKVCacheAdapter {
             #[cfg(target_os = "macos")]
             native_pool_arrays: (0..num_layers).map(|_| None).collect(),
             pool_growth_notifier: None,
+            extent_growth_blocks: None,
+            extent_runway_blocks: 0,
             #[cfg(test)]
             grow_headroom_probe_override: None,
         })
+    }
+
+    /// Grow this pool by whole extents of `blocks` per shortage, from free
+    /// blocks only (Splash `KvPool::takeFreePages`: free pages, then a new
+    /// extent; reclaim only after the extent is refused).
+    pub(crate) fn set_extent_growth(&mut self, blocks: u32) {
+        self.extent_growth_blocks = Some(blocks.max(1));
+        self.extent_runway_blocks = self
+            .allocator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .num_blocks();
+    }
+
+    /// Blocks of one extent growth, if this pool grows by extents.
+    #[cfg(test)]
+    pub(crate) fn extent_growth_blocks(&self) -> Option<u32> {
+        self.extent_growth_blocks
+    }
+
+    /// Whether this pool grows by extents, before it evicts cached blocks.
+    pub(crate) fn grows_by_extent(&self) -> bool {
+        self.extent_growth_blocks.is_some()
+    }
+
+    /// Blocks a reservation of `needed` must grow the pool by before
+    /// `allocate` may evict a cached-only prefix block.
+    fn grow_shortfall(&self, allocator: &BlockAllocator, needed: u32) -> u32 {
+        let available = if self.extent_growth_blocks.is_some()
+            && allocator.num_blocks() < allocator.max_num_blocks()
+        {
+            allocator.num_free_blocks()
+        } else {
+            allocator.free_or_evictable_blocks()
+        };
+        needed.saturating_sub(available)
     }
 
     /// Wire the SSD cold tier into this adapter. Capture/restore paths key
@@ -1218,8 +1294,8 @@ impl PagedKVCacheAdapter {
         self.cold_tier = Some(ctx);
     }
 
-    /// Install (or clear) the callback that fires once per successful pool
-    /// grow with the pool's new total K/V bytes. The cache-limit pool
+    /// Install (or clear) the callback that fires once per pool grow or
+    /// shrink with the pool's new total K/V bytes. The cache-limit pool
     /// re-registration wires this hook; `None` (the default) is a no-op.
     pub fn set_pool_growth_notifier(&mut self, notifier: Option<Arc<dyn Fn(u64) + Send + Sync>>) {
         self.pool_growth_notifier = notifier;
@@ -1361,6 +1437,11 @@ impl PagedKVCacheAdapter {
     /// cold-tier fingerprint.
     pub fn layer_kv_pool(&self) -> &Arc<LayerKVPool> {
         &self.layer_kv_pool
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allocator(&self) -> &Arc<Mutex<BlockAllocator>> {
+        &self.allocator
     }
 
     fn take_active_request_state(&mut self) -> Result<PagedRequestState, String> {
@@ -2485,7 +2566,7 @@ impl PagedKVCacheAdapter {
                 .allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            needed_blocks.saturating_sub(guard.free_or_evictable_blocks())
+            self.grow_shortfall(&guard, needed_blocks)
         };
         if shortfall > 0 {
             grow_attempted = true;
@@ -2526,7 +2607,7 @@ impl PagedKVCacheAdapter {
                     .allocator
                     .lock()
                     .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-                needed_blocks.saturating_sub(guard.free_or_evictable_blocks())
+                self.grow_shortfall(&guard, needed_blocks)
             };
             if grow_attempted || !self.try_grow_pool(retry_shortfall) {
                 return Err(format!(
@@ -2606,7 +2687,7 @@ impl PagedKVCacheAdapter {
                 .allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            to_allocate.saturating_sub(guard.free_or_evictable_blocks())
+            self.grow_shortfall(&guard, to_allocate)
         };
         if shortfall > 0 {
             grow_attempted = true;
@@ -2646,7 +2727,7 @@ impl PagedKVCacheAdapter {
                     .allocator
                     .lock()
                     .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-                to_allocate.saturating_sub(guard.free_or_evictable_blocks())
+                self.grow_shortfall(&guard, to_allocate)
             };
             if grow_attempted || !self.try_grow_pool(retry_shortfall) {
                 return Err(format!(
@@ -2688,7 +2769,7 @@ impl PagedKVCacheAdapter {
     ///    [`crate::cache_limit::pool_growth_lock`]) and hold it across the
     ///    whole body, so a concurrent grow on another model's thread — or a
     ///    concurrent model load's pool reservation — cannot probe stale
-    ///    `registered_pool_bytes` totals while this grow's old+new transient
+    ///    `registered_pool_bytes` totals while this grow's transient
     ///    is unregistered.
     /// 1. Flush this adapter's pending native pool writes and synchronize
     ///    MLX — the grow blit copies the whole buffer, so no lazy GPU write
@@ -2697,16 +2778,20 @@ impl PagedKVCacheAdapter {
     ///    pool's write lock internally) — allocator first, pool second, and
     ///    the pool read lock is never held across the call.
     /// 3. Target `min(pool.max_num_blocks, max(2 × current, current +
-    ///    needed))`; `grow_to` is a no-op `Ok(false)` when the target does
-    ///    not exceed the live count.
-    /// 4. Probe the live Metal headroom for the target BEFORE `grow_to`
-    ///    builds the new generation: the blit transiently holds the old and
-    ///    new buffers, so the peak (old live + new + sibling registered
-    ///    pools) must fit the safe budget. A probe that selects fewer
-    ///    blocks declines the grow (step 5 is skipped).
-    /// 5. On success, extend the allocator to match, drop this adapter's
-    ///    per-layer pool views (they wrap the pre-grow buffers), run the
-    ///    growth notifier with the new total bytes, and log one line.
+    ///    needed))`, or with extent growth `current` plus `needed` rounded up
+    ///    to whole extents; `grow_to` is a no-op `Ok(false)` when the target
+    ///    does not exceed the live count.
+    /// 4. Probe the live Metal headroom for the target BEFORE `grow_to`:
+    ///    the grow swaps one layer at a time, so the peak (new pool + one old
+    ///    layer + sibling registered pools) must fit the safe budget. When
+    ///    the probe selects fewer blocks, the grow targets that count only
+    ///    if it covers `current + needed` and a second probe at that count,
+    ///    with its own transient, selects all of it; otherwise the grow is
+    ///    declined (step 5 is skipped).
+    /// 5. Drop this adapter's per-layer pool views (they retain the pre-grow
+    ///    buffers) before `grow_to`. On success, extend the allocator to
+    ///    match, run the growth notifier with the new total bytes, and log
+    ///    one line. A grow that fails part way still notifies its new bytes.
     ///
     /// Any failure (flush error, poisoned mutex, headroom probe error or
     /// decline, `Err` from `grow_to`, or a no-op grow) logs at warn and
@@ -2741,7 +2826,8 @@ impl PagedKVCacheAdapter {
         // the underlying Metal buffers.
         crate::array::memory::synchronize();
 
-        let mut guard = match self.allocator.lock() {
+        let allocator = Arc::clone(&self.allocator);
+        let mut guard = match allocator.lock() {
             Ok(guard) => guard,
             Err(e) => {
                 tracing::warn!(
@@ -2752,21 +2838,30 @@ impl PagedKVCacheAdapter {
             }
         };
         let current = guard.num_blocks();
-        let mut new_num_blocks = self.layer_kv_pool.max_num_blocks().min(
-            current
+        let target = match self.extent_growth_blocks {
+            Some(extent) => current.saturating_add(
+                needed_additional_blocks
+                    .max(1)
+                    .div_ceil(extent)
+                    .saturating_mul(extent),
+            ),
+            None => current
                 .saturating_mul(2)
                 .max(current.saturating_add(needed_additional_blocks)),
-        );
+        };
+        let mut new_num_blocks = self.layer_kv_pool.max_num_blocks().min(target);
         #[cfg(target_os = "macos")]
         match self.grow_headroom_probe(new_num_blocks) {
             Ok(selected) if selected < new_num_blocks => {
-                // Partial headroom: the probe's safe ceiling covers the
-                // required shortfall but not the doubling target. Grow to
-                // the selected count — the reservation then admits — rather
-                // than rejecting a request that a safe grow would serve.
-                // Decline only when even the shortfall does not fit.
+                // Partial headroom: grow to the selected count when it covers
+                // the shortfall. The transient depends on the exact target
+                // (after a part-way cut a smaller target swaps more layers),
+                // so the reduced count must pass its own probe.
                 let shortfall_target = current.saturating_add(needed_additional_blocks);
-                if selected >= shortfall_target && selected > current {
+                let reduced_fits = selected >= shortfall_target
+                    && selected > current
+                    && matches!(self.grow_headroom_probe(selected), Ok(fits) if fits >= selected);
+                if reduced_fits {
                     tracing::info!(
                         target: "mlx_core::paged_kv",
                         "paged KV pool grow targeting partial headroom: {selected} blocks \
@@ -2777,7 +2872,8 @@ impl PagedKVCacheAdapter {
                     tracing::warn!(
                         target: "mlx_core::paged_kv",
                         "paged KV pool grow declined: headroom probe caps the pool at {selected} \
-                         blocks (< shortfall {shortfall_target}, {new_num_blocks} requested)"
+                         blocks ({new_num_blocks} requested, shortfall {shortfall_target}), or \
+                         {selected} blocks do not fit their own grow peak"
                     );
                     return false;
                 }
@@ -2792,6 +2888,12 @@ impl PagedKVCacheAdapter {
             }
         }
         let old_total_bytes = self.layer_kv_pool.total_bytes();
+        // This adapter's cached per-layer views retain the pre-grow buffers;
+        // dropped after the grow, each old layer would outlive its swap and
+        // the peak would be the whole old pool plus the new one. Other
+        // adapters sharing the pool rebuild lazily via the generation guard.
+        #[cfg(target_os = "macos")]
+        self.clear_native_graph_state();
         match self.layer_kv_pool.grow_to(new_num_blocks) {
             Ok(true) => {}
             Ok(false) => {
@@ -2800,6 +2902,13 @@ impl PagedKVCacheAdapter {
                 return false;
             }
             Err(e) => {
+                // Layers grown before the failure keep their larger buffers.
+                let total_bytes = self.layer_kv_pool.total_bytes();
+                if total_bytes != old_total_bytes
+                    && let Some(notifier) = self.pool_growth_notifier.as_ref()
+                {
+                    notifier(total_bytes);
+                }
                 tracing::warn!(
                     target: "mlx_core::paged_kv",
                     "paged KV pool grow to {new_num_blocks} blocks failed: {e}"
@@ -2821,12 +2930,6 @@ impl PagedKVCacheAdapter {
         }
         drop(guard);
 
-        // This adapter's cached per-layer views wrap the pre-grow buffers;
-        // drop all of them. Other adapters sharing the pool rebuild lazily
-        // via the generation guard.
-        #[cfg(target_os = "macos")]
-        self.clear_native_graph_state();
-
         let new_total_bytes = self.layer_kv_pool.total_bytes();
         if let Some(notifier) = self.pool_growth_notifier.as_ref() {
             notifier(new_total_bytes);
@@ -2841,12 +2944,164 @@ impl PagedKVCacheAdapter {
         true
     }
 
+    /// Give an extent-growth pool's memory back to the host: cut its tail by
+    /// whole extents, as many as `want_bytes` takes, down to the runway it
+    /// started at, as Splash releases an empty extent (else compacts one)
+    /// before it evicts anything (Cache.cpp:704-711, 958-981). Cache-only
+    /// blocks above the cut move into free slots below it first; a block a
+    /// request holds floors the cut. With `evict_cached` the oldest
+    /// cache-only leaf blocks are evicted one at a time until the cut is
+    /// reached or none is left (Splash's victims, Cache.cpp:713-726).
+    ///
+    /// Same thread contract as [`Self::try_grow_pool`], under the same
+    /// growth lock. The notifier sees the measured new total. Returns the
+    /// bytes the pool's buffers shrank by; 0 when nothing was cut.
+    pub(crate) fn try_release_pool_extents(&mut self, want_bytes: u64, evict_cached: bool) -> u64 {
+        let Some(extent) = self.extent_growth_blocks else {
+            return 0;
+        };
+        if want_bytes == 0 {
+            return 0;
+        }
+        let Ok(bytes_per_block) = self.bytes_per_block() else {
+            return 0;
+        };
+        let extents = pool_extents_for_bytes(
+            want_bytes,
+            u64::from(extent).saturating_mul(bytes_per_block),
+        );
+        let floor = self.extent_runway_blocks;
+        let pending = self.layer_kv_pool.shrink_pending();
+        {
+            let guard = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
+            let cuttable = if evict_cached {
+                guard.shrink_target(floor, extent, extents) < guard.num_blocks()
+            } else {
+                guard.shrink_plan(floor, extent, extents).is_some()
+            };
+            if !cuttable && !pending {
+                return 0;
+            }
+        }
+        let _growth_guard = crate::cache_limit::pool_growth_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        #[cfg(target_os = "macos")]
+        if let Err(e) = self.eval_pending_pool_writes() {
+            tracing::warn!(
+                target: "mlx_core::paged_kv",
+                "paged KV pool shrink aborted: could not flush pending pool writes: {e}"
+            );
+            return 0;
+        }
+        crate::array::memory::synchronize();
+
+        let allocator = Arc::clone(&self.allocator);
+        let mut guard = allocator.lock().unwrap_or_else(|e| e.into_inner());
+        let current = guard.num_blocks();
+        let mut evicted = 0u32;
+        if evict_cached {
+            let target = guard.shrink_target(floor, extent, extents);
+            while guard
+                .shrink_plan(floor, extent, extents)
+                .map_or(current, |plan| plan.num_blocks)
+                > target
+                && guard.evict_oldest_cache_only_leaf().is_some()
+            {
+                evicted += 1;
+            }
+        }
+        let Some(plan) = guard.shrink_plan(floor, extent, extents) else {
+            drop(guard);
+            return self.finish_pending_shrink();
+        };
+        let old_total_bytes = self.layer_kv_pool.total_bytes();
+        #[cfg(target_os = "macos")]
+        self.clear_native_graph_state();
+        if let Err(e) = self.layer_kv_pool.move_blocks(&plan.moves) {
+            tracing::warn!(
+                target: "mlx_core::paged_kv",
+                "paged KV pool shrink to {} blocks declined: block moves failed: {e}",
+                plan.num_blocks
+            );
+            return 0;
+        }
+        if let Err(e) = guard.apply_shrink(&plan) {
+            tracing::warn!(
+                target: "mlx_core::paged_kv",
+                "paged KV pool shrink to {} blocks declined: {e}",
+                plan.num_blocks
+            );
+            return 0;
+        }
+        let shrunk = self.layer_kv_pool.shrink_to(plan.num_blocks);
+        drop(guard);
+        let new_total_bytes = self.layer_kv_pool.total_bytes();
+        if new_total_bytes != old_total_bytes
+            && let Some(notifier) = self.pool_growth_notifier.as_ref()
+        {
+            notifier(new_total_bytes);
+        }
+        if let Err(e) = shrunk {
+            tracing::warn!(
+                target: "mlx_core::paged_kv",
+                "paged KV pool shrink to {} blocks failed part way: {e}",
+                plan.num_blocks
+            );
+        }
+        tracing::info!(
+            target: "mlx_core::paged_kv",
+            "paged KV pool shrank {current} -> {} blocks ({:.2} -> {:.2} MiB, {} block(s) \
+             moved, {evicted} cached block(s) evicted)",
+            plan.num_blocks,
+            old_total_bytes as f64 / (1024.0 * 1024.0),
+            new_total_bytes as f64 / (1024.0 * 1024.0),
+            plan.moves.len(),
+        );
+        old_total_bytes.saturating_sub(new_total_bytes)
+    }
+
+    /// Give back the layer bytes above the pool's block count that a cut
+    /// which failed part way left behind, as Splash releases an empty extent
+    /// before any cut or eviction, below the runway floor's reach
+    /// (Cache.cpp:704-711, 958-964). Caller holds the growth lock with pool
+    /// writes flushed. Returns the bytes freed; 0 when nothing was pending.
+    fn finish_pending_shrink(&mut self) -> u64 {
+        if !self.layer_kv_pool.shrink_pending() {
+            return 0;
+        }
+        #[cfg(target_os = "macos")]
+        self.clear_native_graph_state();
+        let old_total_bytes = self.layer_kv_pool.total_bytes();
+        let num_blocks = self.layer_kv_pool.num_blocks();
+        let shrunk = self.layer_kv_pool.shrink_to(num_blocks);
+        let new_total_bytes = self.layer_kv_pool.total_bytes();
+        if new_total_bytes != old_total_bytes
+            && let Some(notifier) = self.pool_growth_notifier.as_ref()
+        {
+            notifier(new_total_bytes);
+        }
+        if let Err(e) = shrunk {
+            tracing::warn!(
+                target: "mlx_core::paged_kv",
+                "paged KV pool retry of an unfinished shrink to {num_blocks} blocks failed: {e}"
+            );
+        }
+        tracing::info!(
+            target: "mlx_core::paged_kv",
+            "paged KV pool finished an unfinished shrink to {num_blocks} blocks \
+             ({:.2} -> {:.2} MiB)",
+            old_total_bytes as f64 / (1024.0 * 1024.0),
+            new_total_bytes as f64 / (1024.0 * 1024.0),
+        );
+        old_total_bytes.saturating_sub(new_total_bytes)
+    }
+
     /// Pre-grow headroom probe: ask the load-time sizer how many blocks of
     /// the grow-target size the live Metal budget can back, reserving the
-    /// full old+new transient — this pool's current bytes stay live during
-    /// the blit, and every sibling pool registered with the coordinator
-    /// counts against the same budget. Read-only (no allocations); `Err`
-    /// must fail the grow closed.
+    /// grow's transient ([`Self::grow_transient_bytes`]), and every sibling
+    /// pool registered with the coordinator counts against the same budget.
+    /// Read-only (no allocations); `Err` must fail the grow closed.
     #[cfg(target_os = "macos")]
     fn grow_headroom_probe(&self, new_num_blocks: u32) -> Result<u32, String> {
         #[cfg(test)]
@@ -2855,7 +3110,7 @@ impl PagedKVCacheAdapter {
         }
         let config = self.layer_kv_pool.config();
         let own_bytes = self.layer_kv_pool.total_bytes();
-        let extra_reserved_bytes = own_bytes.saturating_add(
+        let extra_reserved_bytes = self.grow_transient_bytes(new_num_blocks)?.saturating_add(
             crate::cache_limit::coordinator()
                 .registered_pool_bytes()
                 // The sizer reserves this pool's staging pair itself. Growth
@@ -2874,6 +3129,17 @@ impl PagedKVCacheAdapter {
         )
         .map(|sizing| sizing.selected_blocks)
         .map_err(|error| error.to_string())
+    }
+
+    /// Bytes a grow to `new_num_blocks` holds beside the new pool: the peak
+    /// of its layer swaps over the real layer sizes
+    /// ([`pool_grow_reserved_bytes`]).
+    #[cfg(target_os = "macos")]
+    fn grow_transient_bytes(&self, new_num_blocks: u32) -> Result<u64, String> {
+        Ok(pool_grow_reserved_bytes(
+            &self.layer_kv_pool.layer_bytes(),
+            self.layer_kv_pool.layer_bytes_for(new_num_blocks)?,
+        ))
     }
 
     /// Reserve block capacity for `extra` rows past the current cursor
@@ -16232,9 +16498,461 @@ mod tests {
         assert_eq!(notified[1], pool.total_bytes());
     }
 
+    /// A runway pool with extent growth grows by whole extents of the
+    /// shortfall over its FREE blocks, before `allocate` may evict a cached
+    /// block, at prompt allocation and at decode: 4 blocks + one 3-block
+    /// extent = 7, then 10. Mutations: count evictable blocks as available
+    /// in `grow_shortfall` → red (pool 4, the cached block evicted); ignore
+    /// `extent_growth_blocks` in `try_grow_pool` → red (pool 8, doubled).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn extent_pool_grows_one_extent_before_evicting_cached_blocks() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!(
+                    "skipping extent_pool_grows_one_extent_before_evicting_cached_blocks: {e}"
+                );
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+        adapter.set_extent_growth(3);
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+
+        adapter.reset_for_new_request(7).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let k = MxArray::from_bfloat16(&vec![0u16; 8 * 64], &[8, 1, 64]).expect("k zeros");
+        let v = MxArray::from_bfloat16(&vec![0x3f80u16; 8 * 64], &[8, 1, 64]).expect("v ones");
+        match adapter.update_keys_values(0, &k, &v, 0) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!(
+                    "skipping extent_pool_grows_one_extent_before_evicting_cached_blocks: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected error from update_keys_values: {e}"),
+        }
+        assert_eq!(adapter.register_full_blocks_for_reuse(&[], 0).unwrap(), 1);
+        adapter.release_request().unwrap();
+        let evictable = || allocator.lock().unwrap().num_evictable_blocks();
+        assert_eq!(allocator.lock().unwrap().num_free_blocks(), 3);
+        assert_eq!(evictable(), 1);
+
+        adapter.reset_for_new_request(8).unwrap();
+        assert_eq!(adapter.allocate_suffix_blocks(32).unwrap(), 4);
+        assert_eq!(pool.num_blocks(), 7, "one extent past the free blocks");
+        assert_eq!(evictable(), 1, "the cached block survives the grow");
+
+        adapter
+            .record_tokens(&(11..43).collect::<Vec<u32>>())
+            .unwrap();
+        assert_eq!(adapter.reserve_rows(24).unwrap(), 3);
+        assert_eq!(pool.num_blocks(), 10, "decode grows one more extent");
+        assert_eq!(evictable(), 1, "the cached block survives the decode grow");
+    }
+
+    /// A runway pool of 4 blocks grown by two 3-block extents to 10, then
+    /// released with 7 blocks cached: a cut that evicts nothing frees only
+    /// the free tail extent (10 -> 7); a cut that may evict takes the
+    /// chain's tail blocks and stops at the runway (4), the chain head still
+    /// hits, the notifier sees every total, and the pool grows again.
+    /// Mutations: record a 1-block floor in `set_extent_growth` → red (pool
+    /// 1 ≠ 4); drop the notifier call in `try_release_pool_extents` → red
+    /// (stale bytes).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn runway_pool_releases_free_extents_down_to_the_runway() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping runway_pool_releases_free_extents_down_to_the_runway: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+        adapter.set_extent_growth(3);
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        let notifications: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let notifications = Arc::clone(&notifications);
+            adapter.set_pool_growth_notifier(Some(Arc::new(move |bytes| {
+                notifications.lock().unwrap().push(bytes);
+            })));
+        }
+        let block_bytes = adapter.bytes_per_block().expect("bytes per block");
+        let extent_bytes = 3 * block_bytes;
+        let tokens: Vec<u32> = (1..=56).collect();
+
+        adapter.reset_for_new_request(7).unwrap();
+        assert_eq!(adapter.allocate_suffix_blocks(80).unwrap(), 10);
+        assert_eq!(pool.num_blocks(), 10);
+        adapter.record_tokens(&tokens).unwrap();
+        assert_eq!(adapter.register_full_blocks_for_reuse(&[], 0).unwrap(), 7);
+        adapter.release_request().unwrap();
+        assert_eq!(allocator.lock().unwrap().num_evictable_blocks(), 7);
+
+        assert_eq!(
+            adapter.try_release_pool_extents(2 * extent_bytes, false),
+            3 * block_bytes
+        );
+        assert_eq!(pool.num_blocks(), 7);
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 7);
+        assert_eq!(allocator.lock().unwrap().num_evictable_blocks(), 7);
+        assert_eq!(adapter.try_release_pool_extents(extent_bytes, false), 0);
+
+        assert_eq!(
+            adapter.try_release_pool_extents(3 * extent_bytes, true),
+            3 * block_bytes
+        );
+        assert_eq!(pool.num_blocks(), 4);
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 4);
+        assert_eq!(adapter.try_release_pool_extents(extent_bytes, true), 0);
+        {
+            let mut allocator = allocator.lock().unwrap();
+            let (hit, cached) = allocator.find_longest_cache_hit(&tokens, 8, &[], 0);
+            assert_eq!(cached, 32, "the chain head survives");
+            for block in hit {
+                allocator.free(block);
+            }
+        }
+        let totals: Vec<u64> = [10u64, 7, 4]
+            .iter()
+            .map(|blocks| blocks * block_bytes)
+            .collect();
+        assert_eq!(*notifications.lock().unwrap(), totals);
+        assert_eq!(pool.total_bytes(), 4 * block_bytes);
+
+        adapter.reset_for_new_request(8).unwrap();
+        assert_eq!(adapter.allocate_suffix_blocks(80).unwrap(), 10);
+        assert_eq!(
+            pool.num_blocks(),
+            16,
+            "the pool grows again from the runway"
+        );
+    }
+
+    /// A 4-layer runway pool grown to 10 whose 10 -> 4 cut fails at layer 2:
+    /// the allocator and pool report 4 blocks while layers 2 and 3 still hold
+    /// 10. The next reclaim, with no new cut left at the runway, gives those
+    /// bytes back and notifies the measured total; the cached chain head
+    /// still hits, a third reclaim frees nothing, and the pool grows again.
+    /// Mutations: drop `&& !pending` from the guard in
+    /// `try_release_pool_extents` → red (retry returns 0); drop the notifier
+    /// call in `finish_pending_shrink` → red (stale last notification).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_pool_cut_is_finished_by_the_next_reclaim_at_the_runway() {
+        const NAME: &str = "failed_pool_cut_is_finished_by_the_next_reclaim_at_the_runway";
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 4,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping {NAME}: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+        adapter.set_extent_growth(3);
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        let notifications: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let notifications = Arc::clone(&notifications);
+            adapter.set_pool_growth_notifier(Some(Arc::new(move |bytes| {
+                notifications.lock().unwrap().push(bytes);
+            })));
+        }
+        let last_notified = || {
+            *notifications
+                .lock()
+                .unwrap()
+                .last()
+                .expect("a notification")
+        };
+        let block_bytes = adapter.bytes_per_block().expect("bytes per block");
+        let layer_block_bytes = block_bytes / 4;
+        let extent_bytes = 3 * block_bytes;
+        let tokens: Vec<u32> = (1..=32).collect();
+
+        adapter.reset_for_new_request(7).unwrap();
+        assert_eq!(adapter.allocate_suffix_blocks(80).unwrap(), 10);
+        assert_eq!(pool.num_blocks(), 10);
+        adapter.record_tokens(&tokens).unwrap();
+        assert_eq!(adapter.register_full_blocks_for_reuse(&[], 0).unwrap(), 4);
+        adapter.release_request().unwrap();
+
+        mlx_paged_attn::set_shrink_fail_at_layer(Some(2));
+        let released = adapter.try_release_pool_extents(2 * extent_bytes, false);
+        mlx_paged_attn::set_shrink_fail_at_layer(None);
+        assert_eq!(released, 2 * 6 * layer_block_bytes, "layers 0 and 1 shrank");
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 4);
+        assert_eq!(pool.num_blocks(), 4);
+        assert!(pool.shrink_pending(), "layers 2 and 3 still hold 10 blocks");
+        assert_eq!(
+            pool.total_bytes(),
+            (2 * 4 + 2 * 10) * layer_block_bytes,
+            "layers 2 and 3 keep 10 blocks"
+        );
+        assert_eq!(last_notified(), pool.total_bytes());
+
+        assert_eq!(
+            adapter.try_release_pool_extents(extent_bytes, false),
+            2 * 6 * layer_block_bytes,
+            "the next reclaim finishes layers 2 and 3"
+        );
+        assert!(!pool.shrink_pending());
+        assert_eq!(pool.num_blocks(), 4);
+        assert_eq!(pool.total_bytes(), 4 * block_bytes);
+        assert_eq!(last_notified(), 4 * block_bytes);
+        {
+            let mut allocator = allocator.lock().unwrap();
+            assert_eq!(allocator.num_blocks(), 4);
+            let (hit, cached) = allocator.find_longest_cache_hit(&tokens, 8, &[], 0);
+            assert_eq!(cached, 32, "the cached chain survives");
+            for block in hit {
+                allocator.free(block);
+            }
+        }
+
+        assert_eq!(adapter.try_release_pool_extents(extent_bytes, false), 0);
+        assert_eq!(adapter.try_release_pool_extents(extent_bytes, true), 0);
+
+        adapter.reset_for_new_request(8).unwrap();
+        assert_eq!(adapter.allocate_suffix_blocks(24).unwrap(), 3);
+        assert_eq!(pool.num_blocks(), 7, "the pool grows again from the runway");
+        assert!(!pool.shrink_pending());
+        assert_eq!(pool.total_bytes(), 7 * block_bytes);
+    }
+
+    /// A 4-layer pool whose 10 -> 4 cut fails at layer 2 holds layers
+    /// [4,4,10,10] under a 4-block count. A grow to 7 with no reclaim in
+    /// between peaks at 41 layer-blocks (layer 2 allocates its 7 while its
+    /// 10 is alive), so it reserves 13 beside the new 28, not one average
+    /// layer, and still lands every layer at 7.
+    /// Mutation: average the old layers in `pool_grow_reserved_bytes`
+    /// (`total.div_ceil(layers)`) → red (7 ≠ 13 layer-blocks).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn grow_after_a_failed_cut_reserves_its_real_layer_peak() {
+        const NAME: &str = "grow_after_a_failed_cut_reserves_its_real_layer_peak";
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 4,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping {NAME}: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+        adapter.set_extent_growth(3);
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        let block_bytes = adapter.bytes_per_block().expect("bytes per block");
+        let layer_block_bytes = block_bytes / 4;
+        let extent_bytes = 3 * block_bytes;
+
+        adapter.reset_for_new_request(7).unwrap();
+        assert_eq!(adapter.allocate_suffix_blocks(80).unwrap(), 10);
+        adapter.release_request().unwrap();
+        mlx_paged_attn::set_shrink_fail_at_layer(Some(2));
+        adapter.try_release_pool_extents(2 * extent_bytes, false);
+        mlx_paged_attn::set_shrink_fail_at_layer(None);
+        assert_eq!(pool.num_blocks(), 4);
+        assert_eq!(
+            pool.layer_bytes(),
+            [4, 4, 10, 10].map(|blocks| blocks * layer_block_bytes)
+        );
+
+        assert_eq!(
+            adapter.grow_transient_bytes(7).unwrap(),
+            13 * layer_block_bytes
+        );
+        assert!(adapter.try_grow_pool(3));
+        assert_eq!(pool.num_blocks(), 7);
+        assert!(!pool.shrink_pending());
+        assert_eq!(pool.total_bytes(), 7 * block_bytes);
+    }
+
+    /// After a 7 -> 4 cut fails at layer 2 the layers are [4,4,7,7]. With a
+    /// 30 layer-block ceiling, the probe of the extent target 7 (reserve 4)
+    /// selects 6, which covers the shortfall 6; but a grow to 6 swaps every
+    /// layer and peaks at 24 + 8 = 32 > 30, so its own probe selects 5 and
+    /// the grow is declined with the pool untouched.
+    /// Mutation: drop the `self.grow_headroom_probe(selected)` term from
+    /// `reduced_fits` in `try_grow_pool` → red (grows to 6, peak 32 > 30).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn grow_after_a_failed_cut_reprobes_a_reduced_target() {
+        const NAME: &str = "grow_after_a_failed_cut_reprobes_a_reduced_target";
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 4,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping {NAME}: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+        adapter.set_extent_growth(3);
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        let block_bytes = adapter.bytes_per_block().expect("bytes per block");
+        let layer_block_bytes = block_bytes / 4;
+        let extent_bytes = 3 * block_bytes;
+
+        adapter.reset_for_new_request(7).unwrap();
+        assert_eq!(adapter.allocate_suffix_blocks(56).unwrap(), 7);
+        assert_eq!(pool.num_blocks(), 7);
+        adapter.release_request().unwrap();
+        mlx_paged_attn::set_shrink_fail_at_layer(Some(2));
+        adapter.try_release_pool_extents(extent_bytes, false);
+        mlx_paged_attn::set_shrink_fail_at_layer(None);
+        assert_eq!(pool.num_blocks(), 4);
+        let cut_layers = [4, 4, 7, 7].map(|blocks| blocks * layer_block_bytes);
+        assert_eq!(pool.layer_bytes(), cut_layers);
+
+        let ceiling = 30 * layer_block_bytes;
+        let probe = {
+            let pool = Arc::clone(&pool);
+            move |target: u32| -> Result<u32, String> {
+                let reserved =
+                    pool_grow_reserved_bytes(&pool.layer_bytes(), pool.layer_bytes_for(target)?);
+                let fits = ceiling.saturating_sub(reserved) / block_bytes;
+                Ok(target.min(u32::try_from(fits).unwrap_or(u32::MAX)))
+            }
+        };
+        assert_eq!(probe(7), Ok(6));
+        assert_eq!(probe(6), Ok(5));
+        assert_eq!(
+            6 * block_bytes + adapter.grow_transient_bytes(6).unwrap(),
+            32 * layer_block_bytes,
+            "a grow to 6 peaks past the 30 layer-block ceiling"
+        );
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(probe)));
+        let notified = Arc::new(Mutex::new(Vec::<u64>::new()));
+        {
+            let notified = Arc::clone(&notified);
+            adapter.set_pool_growth_notifier(Some(Arc::new(move |bytes| {
+                notified.lock().unwrap().push(bytes);
+            })));
+        }
+
+        assert!(
+            !adapter.try_grow_pool(2),
+            "a reduced target that does not fit its own peak must decline"
+        );
+        assert_eq!(pool.num_blocks(), 4);
+        assert_eq!(pool.layer_bytes(), cut_layers);
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 4);
+        assert!(notified.lock().unwrap().is_empty());
+    }
+
+    /// The reserve a pool grow holds beside the new pool is the peak of
+    /// `grow_to`'s layer swaps over the real layer sizes, in layer-blocks.
+    /// Mutations: average the old layers (`total.div_ceil(layers)`) → red
+    /// on [4,4,10,10] (7 ≠ 13) and [10,10,10,4] (9 ≠ 13); drop the skip
+    /// of a layer already at the new size → red on [4,4,7,7] (7 ≠ 4).
+    #[test]
+    fn grow_reserve_prices_the_real_per_layer_peak() {
+        for (layers, reserved) in [
+            ([4u64, 4, 10, 10], 13u64),
+            ([10, 10, 10, 4], 13),
+            ([4, 4, 4, 4], 4),
+            ([4, 4, 7, 7], 4),
+        ] {
+            assert_eq!(
+                pool_grow_reserved_bytes(&layers, 7),
+                reserved,
+                "layers {layers:?}"
+            );
+        }
+    }
+
     /// **Grow decline**: a headroom probe that selects fewer blocks than the
-    /// grow target must decline the grow BEFORE `grow_to` builds the
-    /// transient old+new peak; the pool, allocator, and generation all stay
+    /// grow target must decline the grow BEFORE `grow_to` allocates; the
+    /// pool, allocator, and generation all stay
     /// put and the caller's eviction/error fallback proceeds unchanged.
     /// Skipped on no-Metal hosts.
     #[cfg(target_os = "macos")]
@@ -16335,12 +17053,10 @@ mod tests {
         let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
             .expect("adapter");
 
-        // Probe caps the 4 -> 8 doubling target at 7 blocks: above the
-        // shortfall (4 + needed 2 = 6), below the target. The grow must
-        // land at 7, not decline.
-        adapter.set_grow_headroom_probe_override(Some(Arc::new(|requested| {
-            Ok(requested.saturating_sub(1))
-        })));
+        // A 7-block ceiling caps the 4 -> 8 doubling target at 7: above the
+        // shortfall (4 + needed 2 = 6), below the target. The re-probe of 7
+        // fits, so the grow must land at 7, not decline.
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(|requested| Ok(requested.min(7)))));
         assert!(
             adapter.try_grow_pool(2),
             "probe selecting 7 >= shortfall 6 must grow to the selected count"

@@ -136,6 +136,7 @@ impl Qwen35Inner {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
         }
+        crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(self, &tokens);
         let plan_result = self
             .paged_adapter
             .as_mut()
@@ -559,25 +560,30 @@ impl Qwen35Inner {
             // Decode forward (pure-Rust paged step).
             let next_logits = {
                 let embed = self.embedding.clone();
-                let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason("paged_turn_sync_core_inner: caches dropped mid-decode")
-                })?;
-                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "paged_turn_sync_core_inner: paged_adapter dropped mid-decode",
-                    )
-                })?;
-                let logits = crate::models::qwen3_5::paged_forward::run_paged_decode_step(
-                    token_id,
-                    &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &layer_kinds,
-                    adapter,
-                    self.cached_rope_deltas.unwrap_or(0),
-                )?;
+                let logits =
+                    crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(self, |inner| {
+                        let caches_ref = inner.caches.as_mut().ok_or_else(|| {
+                            Error::from_reason(
+                                "paged_turn_sync_core_inner: caches dropped mid-decode",
+                            )
+                        })?;
+                        let adapter = inner.paged_adapter.as_mut().ok_or_else(|| {
+                            Error::from_reason(
+                                "paged_turn_sync_core_inner: paged_adapter dropped mid-decode",
+                            )
+                        })?;
+                        crate::models::qwen3_5::paged_forward::run_paged_decode_step(
+                            token_id,
+                            &embed,
+                            &mut inner.layers,
+                            caches_ref,
+                            &inner.final_norm,
+                            &inner.lm_head,
+                            &layer_kinds,
+                            adapter,
+                            inner.cached_rope_deltas.unwrap_or(0),
+                        )
+                    })?;
                 logits.squeeze(Some(&[1]))?
             };
 
@@ -844,24 +850,31 @@ impl Qwen35Inner {
 
                 let next_logits = {
                     let _stream_ctx = StreamContext::new(generation_stream);
-                    let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                        Error::from_reason("vision_paged_turn_sync_core: caches dropped mid-decode")
-                    })?;
-                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "vision_paged_turn_sync_core: paged_adapter dropped mid-decode",
-                        )
-                    })?;
-                    let logits = crate::models::qwen3_5::paged_forward::run_paged_decode_step(
-                        token_id,
-                        &embed,
-                        &mut self.layers,
-                        caches_ref,
-                        &self.final_norm,
-                        &self.lm_head,
-                        &layer_kinds,
-                        adapter,
-                        self.cached_rope_deltas.unwrap_or(0),
+                    let logits = crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(
+                        self,
+                        |inner| {
+                            let caches_ref = inner.caches.as_mut().ok_or_else(|| {
+                                Error::from_reason(
+                                    "vision_paged_turn_sync_core: caches dropped mid-decode",
+                                )
+                            })?;
+                            let adapter = inner.paged_adapter.as_mut().ok_or_else(|| {
+                                Error::from_reason(
+                                    "vision_paged_turn_sync_core: paged_adapter dropped mid-decode",
+                                )
+                            })?;
+                            crate::models::qwen3_5::paged_forward::run_paged_decode_step(
+                                token_id,
+                                &embed,
+                                &mut inner.layers,
+                                caches_ref,
+                                &inner.final_norm,
+                                &inner.lm_head,
+                                &layer_kinds,
+                                adapter,
+                                inner.cached_rope_deltas.unwrap_or(0),
+                            )
+                        },
                     )?;
                     logits.squeeze(Some(&[1]))?
                 };
@@ -1256,26 +1269,31 @@ impl Qwen35Inner {
 
                 let next_logits = {
                     let _stream_ctx = StreamContext::new(generation_stream);
-                    let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "vision_paged_turn_stream_core: caches dropped mid-decode",
-                        )
-                    })?;
-                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                    let logits = crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(
+                        self,
+                        |inner| {
+                            let caches_ref = inner.caches.as_mut().ok_or_else(|| {
+                                Error::from_reason(
+                                    "vision_paged_turn_stream_core: caches dropped mid-decode",
+                                )
+                            })?;
+                            let adapter = inner.paged_adapter.as_mut().ok_or_else(|| {
                         Error::from_reason(
                             "vision_paged_turn_stream_core: paged_adapter dropped mid-decode",
                         )
                     })?;
-                    let logits = crate::models::qwen3_5::paged_forward::run_paged_decode_step(
-                        token_id,
-                        &embed,
-                        &mut self.layers,
-                        caches_ref,
-                        &self.final_norm,
-                        &self.lm_head,
-                        &layer_kinds,
-                        adapter,
-                        self.cached_rope_deltas.unwrap_or(0),
+                            crate::models::qwen3_5::paged_forward::run_paged_decode_step(
+                                token_id,
+                                &embed,
+                                &mut inner.layers,
+                                caches_ref,
+                                &inner.final_norm,
+                                &inner.lm_head,
+                                &layer_kinds,
+                                adapter,
+                                inner.cached_rope_deltas.unwrap_or(0),
+                            )
+                        },
                     )?;
                     logits.squeeze(Some(&[1]))?
                 };
@@ -1557,6 +1575,7 @@ impl Qwen35Inner {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
         }
+        crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(self, &tokens);
         let plan_result = self
             .paged_adapter
             .as_mut()
@@ -2218,25 +2237,30 @@ impl Qwen35Inner {
             // Decode forward (pure-Rust paged step).
             let next_logits = {
                 let embed = self.embedding.clone();
-                let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason("paged_turn_stream_core_inner: caches dropped mid-decode")
-                })?;
-                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "paged_turn_stream_core_inner: paged_adapter dropped mid-decode",
-                    )
-                })?;
-                let logits = crate::models::qwen3_5::paged_forward::run_paged_decode_step(
-                    token_id,
-                    &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &layer_kinds,
-                    adapter,
-                    self.cached_rope_deltas.unwrap_or(0),
-                )?;
+                let logits =
+                    crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(self, |inner| {
+                        let caches_ref = inner.caches.as_mut().ok_or_else(|| {
+                            Error::from_reason(
+                                "paged_turn_stream_core_inner: caches dropped mid-decode",
+                            )
+                        })?;
+                        let adapter = inner.paged_adapter.as_mut().ok_or_else(|| {
+                            Error::from_reason(
+                                "paged_turn_stream_core_inner: paged_adapter dropped mid-decode",
+                            )
+                        })?;
+                        crate::models::qwen3_5::paged_forward::run_paged_decode_step(
+                            token_id,
+                            &embed,
+                            &mut inner.layers,
+                            caches_ref,
+                            &inner.final_norm,
+                            &inner.lm_head,
+                            &layer_kinds,
+                            adapter,
+                            inner.cached_rope_deltas.unwrap_or(0),
+                        )
+                    })?;
                 logits.squeeze(Some(&[1]))?
             };
 

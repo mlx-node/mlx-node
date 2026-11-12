@@ -197,6 +197,119 @@ fn paged_ar_turn_parks_the_dflash2_end_state() -> Result<()> {
     Ok(())
 }
 
+/// Swaps the model's paged pool for one of `initial` blocks that grows to
+/// the same maximum, with a grow probe that declines until a parked state was
+/// evicted for a pool grow on this thread.
+fn install_runway_pool_reclaimed_by_eviction(inner: &mut Qwen35Inner, initial: u32) -> Result<()> {
+    use crate::models::qwen3_5::dflash2_turn::POOL_GROW_EVICTIONS;
+    inner.paged_adapter = None;
+    inner.initialize_paged_adapter()?;
+    let adapter = inner.paged_adapter.take().expect("paged adapter");
+    let block_size = adapter.block_size();
+    let pool = adapter.layer_kv_pool();
+    let (config, max, dtype) = (
+        pool.config().clone(),
+        pool.max_num_blocks(),
+        pool.cache_dtype(),
+    );
+    drop(adapter);
+    assert!(initial < max);
+    let pool = mlx_paged_attn::LayerKVPool::new(config, initial, max, dtype)
+        .map_err(Error::from_reason)?;
+    let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+        initial, max, block_size,
+    )));
+    let mut adapter = PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size)
+        .map_err(Error::from_reason)?;
+    POOL_GROW_EVICTIONS.with(|count| count.set(0));
+    adapter.set_grow_headroom_probe_override(Some(Arc::new(|blocks| {
+        Ok(if POOL_GROW_EVICTIONS.with(std::cell::Cell::get) > 0 {
+            blocks
+        } else {
+            0
+        })
+    })));
+    inner.paged_adapter = Some(adapter);
+    Ok(())
+}
+
+/// A draft-loaded pool with no initial size starts at the runway and grows
+/// by Splash extents. Mutation: drop the `set_extent_growth` call in dense
+/// `initialize_paged_adapter` → red (`None`).
+#[test]
+fn runway_pool_grows_by_splash_extents() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let mut inner = fixture(0xDFA5_1606);
+    inner.config.paged_cache_memory_mb = Some(256);
+    inner.paged_adapter = None;
+    inner.initialize_paged_adapter()?;
+    let adapter = inner.paged_adapter.as_ref().expect("paged adapter");
+    let blocks = adapter.block_telemetry().map_err(Error::from_reason)?;
+    assert!(
+        blocks.total_blocks < blocks.max_total_blocks,
+        "the pool starts at the runway: {blocks:?}"
+    );
+    let bytes_per_block = adapter.bytes_per_block().map_err(Error::from_reason)?;
+    assert_eq!(
+        adapter.extent_growth_blocks(),
+        Some(crate::models::qwen3_5::dflash2_decode::runway_pool_extent_blocks(bytes_per_block))
+    );
+    Ok(())
+}
+
+/// A paged AR turn right after a DFlash2 turn, with a prompt past the
+/// runway pool: the turn parks the live state, and the pool grow its prompt
+/// needs evicts it (a grow probe reads memory the parked state holds) before
+/// the prefix lookup, through both the generic paged turn and the paged sync
+/// core.
+/// Mutation: drop `ensure_paged_pool_for_prompt` from `prime_prefix_state`
+/// (dense `paged_backend.rs`) → red on `run_paged_turn`
+/// (`context_length_exceeded`); from `paged_turn_sync_core` → red on that
+/// entry.
+#[test]
+fn dflash2_to_ar_transition_reclaims_the_just_parked_state() -> Result<()> {
+    use crate::models::qwen3_5::dflash2_turn::POOL_GROW_EVICTIONS;
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let tokenizer = tokenizer();
+    for entry in ["run_paged_turn", "paged_turn_sync_core"] {
+        let mut inner = fixture(0xDFA5_1604);
+        run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(3), true, 12)?;
+        assert_eq!(inner.dflash2_states.store.bytes().entries, 0, "{entry}");
+        install_runway_pool_reclaimed_by_eviction(&mut inner, 1)?;
+        let paged = extend(&inner.cached_token_history, &[2, 3]);
+        let block_size = inner.paged_adapter.as_ref().expect("adapter").block_size() as usize;
+        assert!(
+            paged.len() > block_size,
+            "{entry}: the prompt outgrows the runway"
+        );
+        if entry == "run_paged_turn" {
+            run_paged_ar_turn(&mut inner, &tokenizer, &paged)?;
+        } else {
+            let config = ar_config();
+            let params = ChatBackend::resolve_params(&inner, &config);
+            let thinking = ChatBackend::thinking_setup(&inner, &config);
+            inner.paged_turn_sync_core(
+                paged,
+                tokenizer.clone(),
+                u32::MAX,
+                params,
+                false,
+                thinking,
+            )?;
+        }
+        assert!(
+            POOL_GROW_EVICTIONS.with(std::cell::Cell::get) > 0,
+            "{entry}: the just-parked state paid for the grow"
+        );
+        assert!(inner.dflash2_context.is_none(), "{entry}");
+    }
+    Ok(())
+}
+
 /// A vision paged turn parks the DFlash2 state before it dirties the flat
 /// lane. The tiny vocabulary has no image tokens, so the turn fails at
 /// image decode, after the park: X0 only.
@@ -317,31 +430,59 @@ fn owner_release_keeps_the_flat_live_state() -> Result<()> {
     Ok(())
 }
 
-/// A scheduled admission whose page-pool grow is declined evicts the parked
-/// DFlash2 states and grows on the retry; with nothing parked the declined
-/// grow still rejects.
+/// A scheduled admission whose page-pool grow is declined parks the idle
+/// live DFlash2 state, evicts one state (the least recently used), and grows
+/// on the retry; with no DFlash2 state at all the declined grow still
+/// rejects.
+/// Mutation: skip the live-state park in `release_one_for_pool_grow` → red.
+/// Mutation: drop every parked state at once → red (0 ≠ 1
+/// entries).
 #[test]
-fn scheduled_pool_grow_evicts_parked_states_after_a_decline() -> Result<()> {
+fn scheduled_pool_grow_reclaims_one_state_per_decline() -> Result<()> {
     use crate::engine::hybrid_scheduler::tests::reserve_past_a_declined_grow;
+    use crate::models::qwen3_5::dflash2_turn::KV_BUDGET_OVERRIDE;
+    struct Override;
+    impl Drop for Override {
+        fn drop(&mut self) {
+            KV_BUDGET_OVERRIDE.with(|budget| budget.set(None));
+        }
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
     let tokenizer = tokenizer();
-    for parked in [true, false] {
+    for case in ["parked", "live", "none"] {
         let mut inner = fixture(0xDFA5_1607);
         inner.initialize_paged_adapter()?;
-        run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(6), true, 12)?;
-        if parked {
-            run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(7), true, 12)?;
-            assert_eq!(inner.dflash2_states.store.bytes().entries, 1);
-        } else {
-            assert_eq!(inner.dflash2_states.store.bytes().entries, 0);
+        let mut live = Vec::new();
+        if case != "none" {
+            run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(6), true, 12)?;
+            live = inner.cached_token_history.clone();
         }
+        if case == "parked" {
+            run_tiny_dflash_turn(&mut inner, &tokenizer, &first_prompt(7), true, 12)?;
+            live = inner.cached_token_history.clone();
+            assert_eq!(inner.dflash2_states.store.bytes().entries, 1);
+        }
+        let override_guard = Override;
+        KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(0)));
         let (admitted, total_blocks, inner) = reserve_past_a_declined_grow(inner);
-        assert_eq!(admitted, parked, "parked={parked}");
-        assert_eq!(total_blocks, if parked { 8 } else { 4 }, "parked={parked}");
-        assert_eq!(inner.dflash2_states.store.bytes().entries, 0);
-        assert!(inner.dflash2_context.is_some(), "the live state stays");
+        drop(override_guard);
+        assert_eq!(admitted, case != "none", "{case}");
+        assert_eq!(total_blocks, if case == "none" { 4 } else { 8 }, "{case}");
+        let lineages: Vec<Vec<u32>> = inner
+            .dflash2_states
+            .store
+            .entries()
+            .map(|entry| entry.tokens().to_vec())
+            .collect();
+        let want: Vec<Vec<u32>> = if case == "parked" {
+            vec![live]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(lineages, want, "{case}");
+        assert!(inner.dflash2_context.is_none(), "{case}");
     }
     Ok(())
 }

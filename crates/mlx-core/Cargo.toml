@@ -44,6 +44,7 @@ features = ["skip_collect_on_exit", "v3"]
 
 [dev-dependencies]
 criterion = { workspace = true }
+mlx-paged-attn = { workspace = true, features = ["test-hooks"] }
 
 [build-dependencies]
 cc = { workspace = true }

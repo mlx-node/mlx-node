@@ -1156,6 +1156,11 @@ mod tests {
 
     #[tokio::test]
     async fn muse_norms_direct_for_gguf() {
+        if !crate::test_support::in_own_process(
+            "models::muse_glimmer::persistence::tests::muse_norms_direct_for_gguf",
+        ) {
+            return;
+        }
         use crate::models::muse_glimmer::config::MuseGlimmerConfig;
         use crate::utils::gguf_import::GgufPreload;
         use crate::utils::gguf_import::gate::manifest;
@@ -1255,6 +1260,11 @@ mod tests {
 
     #[tokio::test]
     async fn muse_draft_from_preload() {
+        if !crate::test_support::in_own_process(
+            "models::muse_glimmer::persistence::tests::muse_draft_from_preload",
+        ) {
+            return;
+        }
         use super::draft_params;
         use crate::models::muse_glimmer::config::MuseGlimmerConfig;
         use crate::utils::gguf_import::GgufPreload;

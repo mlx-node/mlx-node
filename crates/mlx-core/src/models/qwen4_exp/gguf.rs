@@ -818,8 +818,10 @@ mod tests {
         );
         drop(sidecar_guard);
 
-        sweep_native_gguf_cache(&cache, "no-such-key");
-        assert!(!debris.exists(), "dead-pid debris must be reclaimed");
+        assert!(
+            crate::test_support::sweep_until_removed(&cache, "no-such-key", &[&debris]),
+            "dead-pid debris must be reclaimed"
+        );
         assert!(dir.join("complete").is_file());
         native_gguf_unlease_in_use(&dir);
         fs::remove_dir_all(root).unwrap();

@@ -1830,6 +1830,11 @@ mod checkpoint_tests {
 
     #[tokio::test]
     async fn load_checkpoint_preload_equals_dir_load() {
+        if !crate::test_support::in_own_process(
+            "engine::persistence::checkpoint_tests::load_checkpoint_preload_equals_dir_load",
+        ) {
+            return;
+        }
         let work = std::env::temp_dir().join(format!("mlx-load-ckpt-{}", uuid::Uuid::new_v4()));
         let fx = q4_0_main_q4_1_mmproj(&work.join("src"));
 

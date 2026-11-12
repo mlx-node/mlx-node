@@ -916,6 +916,7 @@ impl Qwen35Inner {
         image_key: u64,
         cache_salt: u64,
     ) -> Result<engine::VlmPagedPrefixResolution> {
+        crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(self, tokens);
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let candidate_plan_result = match self.paged_adapter.as_mut() {
             Some(adapter) => adapter

@@ -23,7 +23,9 @@ attention to separate paged groups and aliases KV-shared layers to their anchor.
 The `qwen3_5` and `qwen3_5_moe` loaders size the paged pool in two steps. The
 **initial** pool is allocated at load from `paged_cache_initial_memory_mb`
 (config.json) or `MLX_PAGED_CACHE_INITIAL_MB` (env wins over the config field;
-a set-but-unparseable env value falls back to config). The **max** is the
+a set-but-unparseable env value falls back to config). A load with a DFlash2
+draft ignores both and starts at the 2048-token runway, as Splash builds its
+pool at `warmupKvPages` with no size knob. The **max** is the
 existing budget — `paged_cache_memory_mb`, or the auto one-full-context default
 when unset — minus whatever `load_time_pool_sizing` clamps for live unified
 memory.
@@ -39,31 +41,41 @@ sides distinctly — `initial_blocks=` plus `effective_window_tokens=` computed
 from the max — and a dynamic pool adds a
 `paged pool is dynamic (grow-on-demand)` line.
 
-| Knob                            | Source                              | Role                                                                                                        |
-| ------------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `paged_cache_initial_memory_mb` | config.json (qwen3_5 / qwen3_5_moe) | Initial pool size in MiB. Unset = the max itself — the historical fixed-size pool, byte-identical behavior. |
-| `MLX_PAGED_CACHE_INITIAL_MB`    | env (wins over the config field)    | Same, u32 MiB. Unparseable values are ignored (config field, then the unset default).                       |
-| `paged_cache_memory_mb`         | config.json                         | MAX pool size in MiB (auto one-full-context when unset).                                                    |
-| `MLX_PAGED_CACHE_MEMORY_MB`     | env (agent override manager only)   | Floor the manager writes for the max into the cloned config; unparseable falls back to the 16 GiB floor.    |
+| Knob                            | Source                              | Role                                                                                                                      |
+| ------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `paged_cache_initial_memory_mb` | config.json (qwen3_5 / qwen3_5_moe) | Initial pool size in MiB. Unset = the max itself. Ignored with a DFlash2 draft: the pool starts at the 2048-token runway. |
+| `MLX_PAGED_CACHE_INITIAL_MB`    | env (wins over the config field)    | Same, u32 MiB. Unparseable values are ignored (config field, then the unset default). Ignored with a DFlash2 draft.       |
+| `paged_cache_memory_mb`         | config.json                         | MAX pool size in MiB (auto one-full-context when unset).                                                                  |
+| `MLX_PAGED_CACHE_MEMORY_MB`     | env (agent override manager only)   | Floor the manager writes for the max into the cloned config; unparseable falls back to the 16 GiB floor.                  |
 
 The agent override manager (`packages/lm/src/models/paged-config-override.ts`)
 writes `paged_cache_initial_memory_mb = 2048` into the cloned config for
 `qwen3_5` / `qwen3_5_moe`, overridable with `MLX_PAGED_CACHE_INITIAL_MB`, and
-clamped to the resolved max so it never exceeds the pool ceiling. The override
-manager normalizes a larger configured initial down to the default; raise it
+clamped to the resolved max so it never exceeds the pool ceiling. A load with a
+DFlash2 draft (the server host passes the draft flag) gets no initial size,
+even with `MLX_PAGED_CACHE_INITIAL_MB` set, and the loader ignores a source
+config's field: the pool starts at the DFlash2 runway. Without a
+draft, the override manager normalizes a larger configured initial down to the
+default; raise it
 via `MLX_PAGED_CACHE_INITIAL_MB`. Other families are not given the field —
 their loaders have no initial knob and must not receive one. Checkpoints
 resolved WITHOUT the manager (a library caller loading the path directly)
 keep the historical behavior: unset initial = static full-size pool.
 
-**Transient double memory during grow.** `LayerKVPool::grow_to` allocates the
-new generation's per-layer Metal buffers wholesale and swaps them in; the old
-buffers stay alive until outstanding GPU work and any cached MLX array views
-drop their handles, so peak unified-memory use briefly approaches old + new
-before the old generation is released. The growth notifier
-(`CacheLimitCoordinator::update_pool`) re-debits the coordinator with the new
-total at the same point, so the global cap tracks the grown pool rather than
-the initial one.
+**Transient memory during grow.** `LayerKVPool::grow_to` grows one layer at
+a time: it allocates the layer's larger pair, copies the old bytes, waits,
+swaps the pair in and drops the old one before the next layer, so the peak is
+the new pool plus one old layer (Splash grows by whole extents and copies
+nothing; this is the closest layout without extents). The adapter drops its
+cached MLX views before the grow so they do not keep old layers alive; the
+headroom probe reserves one old layer (`pool_grow_reserved_bytes`). A qwen3_5
+runway pool (DFlash2 draft, no initial size) publishes a max that leaves room
+for that layer: `floor(B * L / (L + 1))` of the sizer's budget `B` over `L`
+pool layers, while the DFlash2 pool term is still priced from `B`. A grow that
+fails part way keeps the grown layers (bytes intact, block count unchanged).
+The growth notifier (`CacheLimitCoordinator::update_pool`) re-debits the
+coordinator with the pool's measured buffer bytes, so the global cap tracks
+the grown pool rather than the initial one.
 
 ## Prefix-cache security domains
 

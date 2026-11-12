@@ -66,7 +66,27 @@ impl ScheduledMtpState {
         self.pending.remove(&seq_id);
     }
 
+    /// What a turn of `total_tokens` charges at admission: its prefill
+    /// holds the hidden rows of the whole prompt.
     pub fn reservation_bytes(config: &super::config::Qwen3_5Config, total_tokens: u32) -> u64 {
+        Self::state_bytes(
+            config,
+            total_tokens,
+            total_tokens.max((MAX_DRAFTS + 3) as u32),
+        )
+    }
+
+    /// What a decoding turn holds at `total_tokens`: after prefill an owner
+    /// keeps one hidden row and a verify at most `MAX_DRAFTS + 1`.
+    pub fn held_bytes(config: &super::config::Qwen3_5Config, total_tokens: u32) -> u64 {
+        Self::state_bytes(config, total_tokens, (MAX_DRAFTS + 3) as u32)
+    }
+
+    fn state_bytes(
+        config: &super::config::Qwen3_5Config,
+        total_tokens: u32,
+        hidden_rows: u32,
+    ) -> u64 {
         let linear_layers = (0..config.num_layers.max(0) as usize)
             .filter(|&i| config.is_linear_layer(i))
             .count() as u64;
@@ -94,7 +114,7 @@ impl ScheduledMtpState {
             .saturating_add(draft_kv)
             .saturating_add(
                 (config.hidden_size.max(0) as u64)
-                    .saturating_mul(u64::from(total_tokens).max((MAX_DRAFTS + 3) as u64))
+                    .saturating_mul(u64::from(hidden_rows))
                     .saturating_mul(8),
             )
     }
@@ -230,11 +250,11 @@ pub(crate) trait ScheduledMtpTarget: Sized {
                 self.append_mtp_history(&history, history_ids, &mut owner.draft_caches)?;
                 owner.committed_frontier = Some(committed + history_ids.len());
             }
-            // A compact GPU copy of one row releases the full prompt buffer.
+            // `copy` aliases the prompt's hidden rows, which held_bytes does not price.
             owner.hidden = Some(
                 hidden
                     .slice_axis(1, ids.len() as i64 - 1, ids.len() as i64)?
-                    .copy()?,
+                    .deep_copy()?,
             );
             owner.frontier = frontier;
             owner.validate_committed_history()

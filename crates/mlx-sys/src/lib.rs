@@ -1014,7 +1014,8 @@ unsafe extern "C-unwind" {
 
     /// TEST-ONLY: the crossover calibration record (measured now if not
     /// yet): per point `keys`, `vector_seconds`, `block_seconds` (up to
-    /// `capacity`), the calibration's wall time, the block kernel timed
+    /// `capacity`), the calibration's wall time, its samples' GPU time, the
+    /// block kernel timed
     /// (0 none, 1 tile, 2 tensor-op) and the selected crossover. Returns the
     /// point count (0 when the measurement failed), -1 without Metal or on
     /// error.
@@ -1024,6 +1025,7 @@ unsafe extern "C-unwind" {
         block_seconds: *mut f64,
         capacity: usize,
         out_elapsed_ms: *mut f64,
+        out_gpu_ms: *mut f64,
         out_block_kernel: *mut i32,
         out_result: *mut i32,
     ) -> i32;

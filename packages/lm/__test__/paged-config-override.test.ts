@@ -379,6 +379,47 @@ describe('PagedConfigOverrideManager initial pool sizing', () => {
     }
   });
 
+  it('leaves the initial unset for a DFlash2-backed qwen3_5 load', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3_5' });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const config = await readOverrideConfig(await manager.resolve(source, 'qwen3_5', undefined, true));
+    expect('paged_cache_initial_memory_mb' in config).toBe(false);
+    expect(config.paged_cache_memory_mb).toBe(16_384);
+  });
+
+  // Mutation: read MLX_PAGED_CACHE_INITIAL_MB before the draft check in
+  // resolveQwen35InitialMb → red (512 written).
+  it('ignores MLX_PAGED_CACHE_INITIAL_MB for a DFlash2-backed load', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3_5_moe' });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const previous = process.env.MLX_PAGED_CACHE_INITIAL_MB;
+    process.env.MLX_PAGED_CACHE_INITIAL_MB = '512';
+    try {
+      const config = await readOverrideConfig(await manager.resolve(source, 'qwen3_5_moe', undefined, true));
+      expect('paged_cache_initial_memory_mb' in config).toBe(false);
+      expect(config.paged_cache_memory_mb).toBe(16_384);
+    } finally {
+      if (previous === undefined) delete process.env.MLX_PAGED_CACHE_INITIAL_MB;
+      else process.env.MLX_PAGED_CACHE_INITIAL_MB = previous;
+    }
+  });
+
+  it('does not reuse the no-draft clone for a draft load', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3_5' });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const plain = await manager.resolve(source, 'qwen3_5');
+    const drafted = await manager.resolve(source, 'qwen3_5', undefined, true);
+    expect(drafted).not.toBe(plain);
+    expect((await readOverrideConfig(plain)).paged_cache_initial_memory_mb).toBe(2_048);
+    expect('paged_cache_initial_memory_mb' in (await readOverrideConfig(drafted))).toBe(false);
+  });
+
   it('leaves non-qwen3_5 families without an initial field', async () => {
     for (const modelType of ['qwen3', 'lfm2', 'gemma4_unified', 'nemotron_h'] as const) {
       const source = await makeModelDir({ model_type: modelType });

@@ -152,6 +152,28 @@ pub const RESTORE_STAGING_BYTES: u64 = 0;
 #[cfg(target_os = "macos")]
 const TEST_POOL_MAX_BYTES: u64 = 256 << 20;
 
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    /// Layer at which `grow_to` fails on this thread, before allocating it.
+    static GROW_FAIL_AT_LAYER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(any(test, feature = "test-hooks"), target_os = "macos"))]
+thread_local! {
+    /// Layer at which `shrink_to` fails on this thread, before allocating it.
+    static SHRINK_FAIL_AT_LAYER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Make `LayerKVPool::shrink_to` fail on this thread at `layer`, before
+/// allocating it; `None` clears it.
+#[cfg(all(feature = "test-hooks", target_os = "macos"))]
+#[doc(hidden)]
+pub fn set_shrink_fail_at_layer(layer: Option<usize>) {
+    SHRINK_FAIL_AT_LAYER.with(|cell| cell.set(layer));
+}
+
 /// Shared per-layer Metal KV-cache buffer pool.
 ///
 /// On non-macOS targets this compiles to a no-op stub so the rest of the
@@ -185,14 +207,14 @@ pub struct LayerKVPool {
     /// dispatch through the wrong kernel-element-size path.
     cache_dtype: MetalDtype,
 
-    /// Bumped on every successful [`Self::grow_to`]. Consumers that cache
+    /// Bumped by every [`Self::grow_to`] or [`Self::shrink_to`] that swapped a layer. Consumers that cache
     /// per-layer MLX array views ([`Self::key_cache_array_raw`] /
     /// [`Self::value_cache_array_raw`]) compare against this to detect that
     /// the buffers their views wrap were swapped out and must be rebuilt.
     generation: AtomicU64,
 
     /// The swappable half of the pool, behind one lock so [`Self::grow_to`]
-    /// can build-then-swap through `&self`.
+    /// can swap layers through `&self`.
     #[cfg(target_os = "macos")]
     inner: RwLock<PoolInner>,
 
@@ -208,9 +230,10 @@ pub struct LayerKVPool {
 }
 
 /// The swappable half of a [`LayerKVPool`]: the per-layer Metal buffers and
-/// the block count they were allocated for. `grow_to` replaces this
-/// wholesale — it never mutates a buffer in place — so a reader holding a
-/// cloned `Buffer` handle keeps a consistent (older) generation of the pool.
+/// the block count every layer holds (a layer's buffer may be larger after a
+/// grow that failed part way). `grow_to` replaces a layer's pair, never a
+/// buffer's bytes in place, so a reader holding a cloned `Buffer` handle
+/// keeps a consistent older buffer.
 #[cfg(target_os = "macos")]
 struct PoolInner {
     /// `(key_cache, value_cache)` per layer. Indexed by `layer_idx`.
@@ -829,20 +852,21 @@ impl LayerKVPool {
     /// Grow the pool's per-layer K/V buffers to hold `new_num_blocks` block
     /// slots, preserving every byte of the existing blocks.
     ///
-    /// For each layer, a new (key, value) `StorageModePrivate` buffer pair is
-    /// allocated at the larger size and the *entire* old buffer is copied to
-    /// offset 0 of the new one with a blit `copy_from_buffer` (the vLLM
-    /// layout keeps block `i` at byte offset `i * block_bytes`, so existing
-    /// block ids address the same bytes before and after). All copies run on
-    /// one committed command buffer that is awaited with
-    /// `wait_until_completed`. Only after the copy has completed successfully
-    /// are the new buffers swapped in and [`Self::generation`] bumped — any
-    /// allocation or blit failure returns `Err` with the old state untouched
-    /// (build-then-swap).
+    /// One layer at a time: allocate the layer's larger (key, value) pair,
+    /// blit the old bytes to offset 0 (block `i` stays at byte offset
+    /// `i * block_bytes`), wait for the copy, swap the pair in and drop the
+    /// old one, then move to the next layer. The peak is the new pool plus
+    /// one old layer, not old plus new. [`Self::generation`] is bumped once
+    /// per call that swapped any layer.
+    ///
+    /// A failure part way returns `Err`: the layers already swapped hold the
+    /// old bytes at the same offsets inside a larger buffer, and
+    /// [`Self::num_blocks`] stays at the old count, so every block id stays
+    /// valid. A retry skips layers already at the target size.
     ///
     /// Returns `Ok(false)` — a no-op — when `new_num_blocks` is `<=` the
     /// current [`Self::num_blocks`] or exceeds [`Self::max_num_blocks`].
-    /// Returns `Ok(true)` when the swap happened.
+    /// Returns `Ok(true)` when every layer holds `new_num_blocks`.
     ///
     /// # Caller contract
     ///
@@ -852,8 +876,9 @@ impl LayerKVPool {
     ///   submitted.
     /// - Any pending pool writes must be flushed (they are — the write paths
     ///   block on completion — so an idle model thread satisfies this).
-    /// - Callers holding cached array views of the old buffers must rebuild
-    ///   them; [`Self::generation`] exists for that lazy invalidation.
+    /// - Callers holding cached array views of the old buffers must drop them
+    ///   before the call, or each old layer stays alive and the peak is old
+    ///   plus new; [`Self::generation`] tells other holders to rebuild.
     /// - The `BlockAllocator` is grown separately (`grow_by`); this method
     ///   only reallocates physical storage.
     #[cfg(target_os = "macos")]
@@ -910,9 +935,6 @@ impl LayerKVPool {
             .checked_mul(old_num_blocks as u64)
             .ok_or_else(|| overflow("value", value_block_size, old_num_blocks))?;
 
-        // Build first: every new buffer is allocated and every copy has
-        // completed before `inner` is touched, so any failure leaves the old
-        // state untouched.
         let state = MetalState::get()?;
         // Preserve the original allocation's CPU accessibility across growth.
         let storage = if inner.layers.iter().all(|(k, v)| {
@@ -923,45 +945,51 @@ impl LayerKVPool {
         } else {
             MTLResourceOptions::StorageModePrivate
         };
-        let mut new_layers = Vec::with_capacity(inner.layers.len());
-        for _ in 0..inner.layers.len() {
+        let mut swapped = false;
+        let mut grow_layer = |layer: usize, inner: &mut PoolInner| -> Result<(), String> {
+            let (old_key, old_value) = &inner.layers[layer];
+            if old_key.length() == new_key_size && old_value.length() == new_value_size {
+                return Ok(());
+            }
+            #[cfg(test)]
+            if GROW_FAIL_AT_LAYER.with(std::cell::Cell::get) == Some(layer) {
+                return Err(format!(
+                    "LayerKVPool::grow_to: injected failure at layer {layer}"
+                ));
+            }
             // Metal hands out nil buffers when an allocation cannot be
-            // backed; the fallible allocator turns that into `None` so we
-            // bail before any blit and the build-then-swap guarantee holds
-            // (old generation untouched on error). `new_buffer` would panic
-            // here instead — while the caller holds the pool write lock.
+            // backed; `new_buffer` would panic here while the caller holds
+            // the pool write lock.
             let key_cache = state.device.try_new_buffer(new_key_size, storage);
             let value_cache = state.device.try_new_buffer(new_value_size, storage);
             let (Some(key_cache), Some(value_cache)) = (key_cache, value_cache) else {
-                return Err(
-                    "LayerKVPool::grow_to: Metal returned a nil buffer for the new generation"
-                        .to_string(),
-                );
+                return Err(format!(
+                    "LayerKVPool::grow_to: Metal returned a nil buffer for layer {layer}"
+                ));
             };
-            new_layers.push((key_cache, value_cache));
+            let command_buffer = state
+                .command_queue
+                .try_new_command_buffer()
+                .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+            let blit = command_buffer
+                .try_new_blit_command_encoder()
+                .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
+            blit.copy_from_buffer(old_key, 0, &key_cache, 0, old_key_bytes);
+            blit.copy_from_buffer(old_value, 0, &value_cache, 0, old_value_bytes);
+            blit.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            observe(&command_buffer, "LayerKVPool::grow_to")?;
+            inner.layers[layer] = (key_cache, value_cache);
+            swapped = true;
+            Ok(())
+        };
+        let grown = (0..inner.layers.len()).try_for_each(|layer| grow_layer(layer, &mut inner));
+        if swapped {
+            self.generation.fetch_add(1, Ordering::AcqRel);
         }
-
-        let command_buffer = state
-            .command_queue
-            .try_new_command_buffer()
-            .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
-        let blit = command_buffer
-            .try_new_blit_command_encoder()
-            .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
-        for ((old_key, old_value), (new_key, new_value)) in
-            inner.layers.iter().zip(new_layers.iter())
-        {
-            blit.copy_from_buffer(old_key, 0, new_key, 0, old_key_bytes);
-            blit.copy_from_buffer(old_value, 0, new_value, 0, old_value_bytes);
-        }
-        blit.end_encoding();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-        observe(&command_buffer, "LayerKVPool::grow_to")?;
-
-        inner.layers = new_layers;
+        grown?;
         inner.num_blocks = new_num_blocks;
-        self.generation.fetch_add(1, Ordering::AcqRel);
         Ok(true)
     }
 
@@ -969,6 +997,228 @@ impl LayerKVPool {
     #[cfg(not(target_os = "macos"))]
     pub fn grow_to(&self, _new_num_blocks: u32) -> Result<bool, String> {
         Err("grow_to is only supported on macOS (Metal backend)".to_string())
+    }
+
+    /// Copy block `from`'s slot onto block `to`'s in every layer, for each
+    /// `(from, to)` pair, in one command buffer that completes before this
+    /// returns. The pairs must name distinct slots. Same caller contract as
+    /// [`Self::grow_to`]: no turn in flight, pending writes flushed.
+    #[cfg(target_os = "macos")]
+    pub fn move_blocks(&self, moves: &[(u32, u32)]) -> Result<(), String> {
+        use crate::metal::command_buffer::observe;
+        use crate::metal::{MetalState, is_metal_extraction_supported};
+
+        if moves.is_empty() {
+            return Ok(());
+        }
+        if !is_metal_extraction_supported() {
+            return Err("Metal GPU not available".to_string());
+        }
+        let (key_block_size, value_block_size) =
+            Self::block_bytes_for(&self.config, self.cache_dtype)?;
+        let inner = self.inner_write();
+        for &(from, to) in moves {
+            for (layer, (key, value)) in inner.layers.iter().enumerate() {
+                for (side, buffer, block_bytes) in [
+                    ("key", key, key_block_size),
+                    ("value", value, value_block_size),
+                ] {
+                    let fits = |id: u32| {
+                        id < inner.num_blocks
+                            && Self::block_slot_end(id, block_bytes)
+                                .is_some_and(|end| end <= buffer.length())
+                    };
+                    if !fits(from) || !fits(to) {
+                        return Err(format!(
+                            "LayerKVPool::move_blocks: layer {layer} {side} buffer cannot hold \
+                             blocks {from} and {to} ({} blocks, {} bytes)",
+                            inner.num_blocks,
+                            buffer.length()
+                        ));
+                    }
+                }
+            }
+        }
+        let state = MetalState::get()?;
+        let command_buffer = state
+            .command_queue
+            .try_new_command_buffer()
+            .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+        let blit = command_buffer
+            .try_new_blit_command_encoder()
+            .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
+        for (key, value) in &inner.layers {
+            for &(from, to) in moves {
+                blit.copy_from_buffer(
+                    key,
+                    from as u64 * key_block_size,
+                    key,
+                    to as u64 * key_block_size,
+                    key_block_size,
+                );
+                blit.copy_from_buffer(
+                    value,
+                    from as u64 * value_block_size,
+                    value,
+                    to as u64 * value_block_size,
+                    value_block_size,
+                );
+            }
+        }
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        observe(&command_buffer, "LayerKVPool::move_blocks")
+    }
+
+    /// Non-macOS stub.
+    #[cfg(not(target_os = "macos"))]
+    pub fn move_blocks(&self, _moves: &[(u32, u32)]) -> Result<(), String> {
+        Err("move_blocks is only supported on macOS (Metal backend)".to_string())
+    }
+
+    /// Shrink the pool's per-layer K/V buffers to `new_num_blocks` block
+    /// slots, keeping the bytes of blocks below it. The caller moves any
+    /// block it keeps from above the cut first ([`Self::move_blocks`]).
+    ///
+    /// [`Self::num_blocks`] drops to the cut first; then one layer at a time
+    /// a smaller pair is allocated, the kept range blitted in, and the pair
+    /// swapped for the old one. A failure part way returns `Err` with the
+    /// remaining layers still larger than the cut, which keeps every block
+    /// below it valid; a retry shrinks those. Bumps [`Self::generation`]
+    /// once per call that swapped a layer. `Ok(false)` when no layer was
+    /// larger than the cut or the cut is above the current count.
+    ///
+    /// Same caller contract as [`Self::grow_to`], and the allocator is
+    /// shrunk separately (`BlockAllocator::apply_shrink`).
+    #[cfg(target_os = "macos")]
+    pub fn shrink_to(&self, new_num_blocks: u32) -> Result<bool, String> {
+        use crate::metal::command_buffer::observe;
+        use crate::metal::{MetalState, is_metal_extraction_supported};
+        use metal::MTLResourceOptions;
+
+        if new_num_blocks == 0 {
+            return Err("LayerKVPool::shrink_to: a pool keeps at least one block".to_string());
+        }
+        {
+            let inner = self.inner_read();
+            if new_num_blocks > inner.num_blocks {
+                return Ok(false);
+            }
+            if inner.layers.is_empty() {
+                return Err(
+                    "LayerKVPool::shrink_to: pool has zero layers (validation-only pool)"
+                        .to_string(),
+                );
+            }
+        }
+        if !is_metal_extraction_supported() {
+            return Err("Metal GPU not available".to_string());
+        }
+        let (key_block_size, value_block_size) =
+            Self::block_bytes_for(&self.config, self.cache_dtype)?;
+        let overflow = |side: &str, per_block: u64| {
+            format!(
+                "LayerKVPool::shrink_to: {side} cache size overflows u64 ({per_block} bytes per \
+                 block x {new_num_blocks} blocks)"
+            )
+        };
+        let new_key_size = key_block_size
+            .checked_mul(new_num_blocks as u64)
+            .ok_or_else(|| overflow("key", key_block_size))?;
+        let new_value_size = value_block_size
+            .checked_mul(new_num_blocks as u64)
+            .ok_or_else(|| overflow("value", value_block_size))?;
+
+        let mut inner = self.inner_write();
+        if new_num_blocks > inner.num_blocks {
+            return Ok(false);
+        }
+        let state = MetalState::get()?;
+        let storage = if inner.layers.iter().all(|(k, v)| {
+            k.storage_mode() == metal::MTLStorageMode::Shared
+                && v.storage_mode() == metal::MTLStorageMode::Shared
+        }) {
+            MTLResourceOptions::StorageModeShared
+        } else {
+            MTLResourceOptions::StorageModePrivate
+        };
+        inner.num_blocks = new_num_blocks;
+        let mut swapped = false;
+        let mut shrink_layer = |layer: usize, inner: &mut PoolInner| -> Result<(), String> {
+            let (old_key, old_value) = &inner.layers[layer];
+            if old_key.length() <= new_key_size && old_value.length() <= new_value_size {
+                return Ok(());
+            }
+            #[cfg(any(test, feature = "test-hooks"))]
+            if SHRINK_FAIL_AT_LAYER.with(std::cell::Cell::get) == Some(layer) {
+                return Err(format!(
+                    "LayerKVPool::shrink_to: injected failure at layer {layer}"
+                ));
+            }
+            let key_cache = state.device.try_new_buffer(new_key_size, storage);
+            let value_cache = state.device.try_new_buffer(new_value_size, storage);
+            let (Some(key_cache), Some(value_cache)) = (key_cache, value_cache) else {
+                return Err(format!(
+                    "LayerKVPool::shrink_to: Metal returned a nil buffer for layer {layer}"
+                ));
+            };
+            let command_buffer = state
+                .command_queue
+                .try_new_command_buffer()
+                .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+            let blit = command_buffer
+                .try_new_blit_command_encoder()
+                .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
+            blit.copy_from_buffer(old_key, 0, &key_cache, 0, new_key_size);
+            blit.copy_from_buffer(old_value, 0, &value_cache, 0, new_value_size);
+            blit.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            observe(&command_buffer, "LayerKVPool::shrink_to")?;
+            inner.layers[layer] = (key_cache, value_cache);
+            swapped = true;
+            Ok(())
+        };
+        let shrunk = (0..inner.layers.len()).try_for_each(|layer| shrink_layer(layer, &mut inner));
+        if swapped {
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+        shrunk?;
+        Ok(swapped)
+    }
+
+    /// Non-macOS stub.
+    #[cfg(not(target_os = "macos"))]
+    pub fn shrink_to(&self, _new_num_blocks: u32) -> Result<bool, String> {
+        Err("shrink_to is only supported on macOS (Metal backend)".to_string())
+    }
+
+    /// Whether a layer's K or V buffer still holds more than
+    /// [`Self::num_blocks`] block slots: a [`Self::shrink_to`] that failed
+    /// part way, or a [`Self::grow_to`] that did. `shrink_to(num_blocks())`
+    /// gives those bytes back.
+    pub fn shrink_pending(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let Ok((key_block_size, value_block_size)) =
+                Self::block_bytes_for(&self.config, self.cache_dtype)
+            else {
+                return false;
+            };
+            let inner = self.inner_read();
+            let blocks = inner.num_blocks as u64;
+            let key_size = key_block_size.saturating_mul(blocks);
+            let value_size = value_block_size.saturating_mul(blocks);
+            inner
+                .layers
+                .iter()
+                .any(|(k, v)| k.length() > key_size || v.length() > value_size)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 
     /// Number of transformer layers covered by this pool.
@@ -1002,8 +1252,8 @@ impl LayerKVPool {
         self.max_num_blocks
     }
 
-    /// Monotonic counter bumped on every successful [`Self::grow_to`];
-    /// starts at 0. Consumers caching per-layer array views compare their
+    /// Monotonic counter bumped by every [`Self::grow_to`] or
+    /// [`Self::shrink_to`] that swapped a layer; starts at 0. Consumers caching per-layer array views compare their
     /// snapshot against this to know the buffers were swapped and the views
     /// must be rebuilt.
     pub fn generation(&self) -> u64 {
@@ -1015,18 +1265,51 @@ impl LayerKVPool {
     }
 
     /// Total bytes the pool's K/V buffers currently occupy, summed over both
-    /// sides and all layers — for cache-limit accounting. Follows
-    /// [`Self::num_blocks`], so it reflects the live allocation after a
-    /// grow. Saturates rather than panicking if the geometry overflows
-    /// `u64` (constructors reject such geometries; this is defensive).
+    /// sides and all layers — for cache-limit accounting. Measures the
+    /// buffers, so a grow that failed part way counts the layers it grew.
     pub fn total_bytes(&self) -> u64 {
-        let per_block_per_layer = match Self::block_bytes_for(&self.config, self.cache_dtype) {
-            Ok((key, value)) => key.saturating_add(value),
-            Err(_) => return 0,
-        };
-        per_block_per_layer
-            .saturating_mul(self.num_blocks() as u64)
-            .saturating_mul(self.num_layers() as u64)
+        #[cfg(target_os = "macos")]
+        {
+            self.inner_read().layers.iter().fold(0u64, |total, (k, v)| {
+                total.saturating_add(k.length()).saturating_add(v.length())
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let per_block_per_layer = match Self::block_bytes_for(&self.config, self.cache_dtype) {
+                Ok((key, value)) => key.saturating_add(value),
+                Err(_) => return 0,
+            };
+            per_block_per_layer
+                .saturating_mul(self.num_blocks() as u64)
+                .saturating_mul(self.num_layers() as u64)
+        }
+    }
+
+    /// K+V bytes each layer's buffers occupy now, in layer order. Layers
+    /// differ after a grow or a cut that failed part way.
+    pub fn layer_bytes(&self) -> Vec<u64> {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner_read()
+                .layers
+                .iter()
+                .map(|(k, v)| k.length().saturating_add(v.length()))
+                .collect()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let per_layer = self.layer_bytes_for(self.num_blocks()).unwrap_or(0);
+            vec![per_layer; self.num_layers()]
+        }
+    }
+
+    /// K+V bytes one layer of `blocks` blocks occupies.
+    pub fn layer_bytes_for(&self, blocks: u32) -> Result<u64, String> {
+        let (key, value) = Self::block_bytes_for(&self.config, self.cache_dtype)?;
+        key.checked_add(value)
+            .and_then(|bytes| bytes.checked_mul(u64::from(blocks)))
+            .ok_or_else(|| format!("LayerKVPool: layer size overflows u64 ({blocks} blocks)"))
     }
 
     /// Block size in tokens (alias of `config().block_size`).
@@ -3531,6 +3814,231 @@ mod tests {
             assert_eq!(
                 &read_back, payload,
                 "block {block} after grown-range writes"
+            );
+        }
+    }
+
+    /// Gate: a grow that fails at layer 2 of 4 keeps layers 0 and 1 swapped
+    /// to the larger size with their bytes, leaves `num_blocks` at the old
+    /// count, counts the real buffer lengths, and a retry finishes. Mutation:
+    /// allocate and blit every layer before swapping any (build-then-swap) →
+    /// red (layer 0 still at the old size).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn grow_to_failing_part_way_keeps_grown_layers_valid() {
+        const LAYERS: u32 = 4;
+        const INITIAL: u32 = 4;
+        const MAX: u32 = 8;
+        const FAIL_AT: usize = 2;
+        let pool = match LayerKVPool::new(base_config(LAYERS), INITIAL, MAX, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping grow_to_failing_part_way_keeps_grown_layers_valid: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let per_side = 2 * 64 * 8 * 2u64;
+        let mut seeds: Vec<Vec<BlockLayerBytes>> = Vec::new();
+        for block in 0..INITIAL {
+            let payload = distinct_layer_bytes(LAYERS as usize, per_side as usize)
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        k.iter().map(|b| b ^ (block as u8)).collect::<Vec<u8>>(),
+                        v.iter().map(|b| b ^ (block as u8)).collect::<Vec<u8>>(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let borrowed: Vec<(&[u8], &[u8])> = payload
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect();
+            pool.write_block_all_layers(block, &borrowed)
+                .expect("seed write");
+            seeds.push(payload);
+        }
+        let layer_len = |layer: u32| {
+            (
+                pool.key_cache(layer).expect("key").length(),
+                pool.value_cache(layer).expect("value").length(),
+            )
+        };
+        let old_len = (per_side * INITIAL as u64, per_side * INITIAL as u64);
+        let new_len = (per_side * MAX as u64, per_side * MAX as u64);
+        let untouched = pool.key_cache(FAIL_AT as u32).expect("key").as_ptr();
+
+        GROW_FAIL_AT_LAYER.with(|cell| cell.set(Some(FAIL_AT)));
+        let failed = pool.grow_to(MAX);
+        GROW_FAIL_AT_LAYER.with(|cell| cell.set(None));
+        assert!(failed.is_err(), "the injected failure must surface");
+        for layer in 0..LAYERS {
+            let expected = if (layer as usize) < FAIL_AT {
+                new_len
+            } else {
+                old_len
+            };
+            assert_eq!(
+                layer_len(layer),
+                expected,
+                "layer {layer} after the failure"
+            );
+        }
+        assert_eq!(
+            pool.key_cache(FAIL_AT as u32).expect("key").as_ptr(),
+            untouched
+        );
+        assert_eq!(pool.num_blocks(), INITIAL);
+        assert_eq!(pool.generation(), 1);
+        assert_eq!(
+            pool.total_bytes(),
+            2 * per_side
+                * (FAIL_AT as u64 * MAX as u64 + (LAYERS as u64 - FAIL_AT as u64) * INITIAL as u64)
+        );
+        for (block, payload) in seeds.iter().enumerate() {
+            assert_eq!(
+                &pool.read_block_all_layers(block as u32).expect("readback"),
+                payload,
+                "block {block} after the failed grow"
+            );
+        }
+
+        assert!(pool.grow_to(MAX).expect("retry"));
+        assert_eq!(pool.num_blocks(), MAX);
+        assert_eq!(pool.generation(), 2);
+        for layer in 0..LAYERS {
+            assert_eq!(layer_len(layer), new_len, "layer {layer} after the retry");
+        }
+        assert_eq!(
+            pool.total_bytes(),
+            2 * per_side * MAX as u64 * LAYERS as u64
+        );
+        for (block, payload) in seeds.iter().enumerate() {
+            assert_eq!(
+                &pool.read_block_all_layers(block as u32).expect("readback"),
+                payload,
+                "block {block} after the retry"
+            );
+        }
+    }
+
+    /// A grown pool seeded with 8 distinct blocks, `None` without Metal.
+    #[cfg(target_os = "macos")]
+    fn seeded_grown_pool(layers: u32) -> Option<(LayerKVPool, Vec<Vec<BlockLayerBytes>>, u64)> {
+        let pool = match LayerKVPool::new(base_config(layers), 4, 8, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => return None,
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        assert!(pool.grow_to(8).expect("grow to 8"));
+        let per_side = 2 * 64 * 8 * 2u64;
+        let mut seeds = Vec::new();
+        for block in 0..8u32 {
+            let payload = distinct_layer_bytes(layers as usize, per_side as usize)
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        k.iter().map(|b| b ^ (block as u8 + 1)).collect::<Vec<u8>>(),
+                        v.iter().map(|b| b ^ (block as u8 + 1)).collect::<Vec<u8>>(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let borrowed: Vec<(&[u8], &[u8])> = payload
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect();
+            pool.write_block_all_layers(block, &borrowed)
+                .expect("seed write");
+            seeds.push(payload);
+        }
+        Some((pool, seeds, per_side))
+    }
+
+    /// Gate: blocks 6 and 7 moved onto 1 and 2, then the pool cut to 4
+    /// blocks: blocks 0 and 3 keep their bytes, 1 and 2 hold the moved
+    /// bytes, block 4 is out of range, the buffers measure 4 blocks and the
+    /// generation moves once. Mutation: return `Ok(())` from `move_blocks`
+    /// before encoding → red (block 1 reads its own old bytes).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shrink_to_keeps_low_and_moved_blocks() {
+        const LAYERS: u32 = 3;
+        let Some((pool, seeds, per_side)) = seeded_grown_pool(LAYERS) else {
+            return;
+        };
+        let generation = pool.generation();
+        pool.move_blocks(&[(6, 1), (7, 2)]).expect("move");
+        assert_eq!(pool.generation(), generation);
+        assert!(pool.shrink_to(4).expect("shrink"));
+        assert_eq!(pool.num_blocks(), 4);
+        assert_eq!(pool.generation(), generation + 1);
+        assert_eq!(pool.total_bytes(), per_side * 2 * 4 * LAYERS as u64);
+        for (block, seed) in [(0u32, 0usize), (1, 6), (2, 7), (3, 3)] {
+            assert_eq!(
+                pool.read_block_all_layers(block).expect("readback"),
+                seeds[seed],
+                "block {block}"
+            );
+        }
+        assert!(pool.read_block_all_layers(4).is_err());
+        assert!(!pool.shrink_to(4).expect("no-op shrink"));
+        assert!(!pool.shrink_to(5).expect("cut above the count"));
+        assert_eq!(pool.generation(), generation + 1);
+        assert!(pool.grow_to(6).expect("regrow"));
+        assert_eq!(pool.read_block_all_layers(1).expect("readback"), seeds[6]);
+    }
+
+    /// Gate: a cut that fails at layer 2 of 4 leaves layers 0 and 1 at the
+    /// cut and 2 and 3 at the old size, `num_blocks` already at the cut,
+    /// every block below it readable in every layer and the measured bytes
+    /// counted; a retry finishes. Mutation: set `num_blocks` only after every
+    /// layer is swapped → red (8 ≠ 4 after the failure).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shrink_to_failing_part_way_keeps_every_block_valid() {
+        const LAYERS: u32 = 4;
+        const FAIL_AT: usize = 2;
+        let Some((pool, seeds, per_side)) = seeded_grown_pool(LAYERS) else {
+            return;
+        };
+        let generation = pool.generation();
+        SHRINK_FAIL_AT_LAYER.with(|cell| cell.set(Some(FAIL_AT)));
+        let failed = pool.shrink_to(4);
+        SHRINK_FAIL_AT_LAYER.with(|cell| cell.set(None));
+        assert!(failed.is_err(), "the injected failure must surface");
+        assert_eq!(pool.num_blocks(), 4);
+        assert!(pool.shrink_pending(), "layers 2 and 3 still hold 8 blocks");
+        assert_eq!(pool.generation(), generation + 1);
+        for layer in 0..LAYERS {
+            let blocks = if (layer as usize) < FAIL_AT { 4 } else { 8 };
+            assert_eq!(
+                pool.key_cache(layer).expect("key").length(),
+                per_side * blocks,
+                "layer {layer}"
+            );
+        }
+        assert_eq!(
+            pool.total_bytes(),
+            2 * per_side * (FAIL_AT as u64 * 4 + (LAYERS as u64 - FAIL_AT as u64) * 8)
+        );
+        for (block, seed) in seeds.iter().enumerate().take(4) {
+            assert_eq!(
+                &pool.read_block_all_layers(block as u32).expect("readback"),
+                seed,
+                "block {block} after the failed cut"
+            );
+        }
+        assert!(pool.read_block_all_layers(5).is_err());
+
+        assert!(pool.shrink_to(4).expect("retry"));
+        assert!(!pool.shrink_pending());
+        assert_eq!(pool.generation(), generation + 2);
+        assert_eq!(pool.total_bytes(), 2 * per_side * 4 * LAYERS as u64);
+        for (block, seed) in seeds.iter().enumerate().take(4) {
+            assert_eq!(
+                &pool.read_block_all_layers(block as u32).expect("readback"),
+                seed,
+                "block {block} after the retry"
             );
         }
     }

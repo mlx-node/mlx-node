@@ -3305,8 +3305,7 @@ async fn load_with_thread_impl(
                 inner.image_processor.is_some(),
                 paged_active,
             );
-            let context_limits =
-                super::model::Qwen3_5ContextLimits::from_tuple(inner.paged_context_limits());
+            let context_limits = inner.finish_load_limits()?;
 
             Ok((
                 Qwen35SchedulerState::new(inner)?,

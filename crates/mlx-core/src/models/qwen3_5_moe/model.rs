@@ -29,6 +29,7 @@ use crate::engine::plan::{
     SpeculativePlan,
 };
 use crate::engine::recurrent_state::{HYBRID_LIVE_STATE_UNITS, RecurrentStateTable};
+use crate::engine::scheduler::context_output_budget;
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
@@ -153,6 +154,13 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) dflash2_turn_state: Option<crate::models::qwen3_5::dflash2_turn::DFlash2TurnState>,
     pub(crate) dflash2_prefix: PrefixTracker,
     pub(crate) dflash2_states: crate::models::qwen3_5::dflash2_state::flat::FlatStates,
+    /// DFlash2 window terms fixed at load once the paged pool is
+    /// registered; `None` without a draft.
+    pub(crate) dflash2_window: Option<crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms>,
+    /// Blocks the load-time sizer gave the paged pool. A runway pool's
+    /// maximum sits below it by the one layer a grow holds; the DFlash2 pool
+    /// term is priced from it. `None` before the pool is built.
+    pub(crate) paged_pool_budget_blocks: Option<u32>,
     /// Set only by a tapped flat prefill; every other cache lane invalidates it.
     pub(crate) dflash2_flat_lane_authoritative: bool,
     pub(crate) dflash2_compiled_verify_disabled: bool,
@@ -522,15 +530,9 @@ impl Qwen3_5MoeModel {
                 batch_size
             )));
         }
-        let prompt_len = prompt_tokens.shape_at(1)? as u32;
-        let capacity = self.context_limits.effective_window_tokens;
-        if prompt_len > capacity {
-            return Err(Error::from_reason(format!(
-                "context_length_exceeded: prompt has {prompt_len} tokens, effective active \
-                 context is {capacity} tokens"
-            )));
-        }
-        let max_output = capacity.saturating_sub(prompt_len).saturating_add(1);
+        let prompt_len = prompt_tokens.shape_at(1)? as usize;
+        let max_output =
+            context_output_budget(prompt_len, self.context_limits.effective_window_tokens)?;
         config.max_new_tokens = config.max_new_tokens.min(max_output as i32);
         crate::model_thread::send_and_await(&self.thread, |reply| {
             Qwen35MoeFamilyCommand::Generate {

@@ -59,11 +59,56 @@ pub(crate) fn qwen35_resolve_paged_cache_initial_memory_mb(
     }
 }
 
+/// The initial pool size of a load in MiB (`None` = see
+/// [`qwen35_initial_pool_blocks`]) and whether the pool is a runway pool.
+/// A DFlash2 load always starts at the runway and grows on demand: the env
+/// and config initial sizes are ignored, as Splash builds its pool at
+/// `warmupKvPages` with no size knob (RuntimeResources.mm:1141,
+/// Model.hpp:607-610).
+pub(crate) fn qwen35_initial_pool_request(
+    configured_initial: Option<u32>,
+    env_override: Option<&str>,
+    has_dflash2_draft: bool,
+) -> (Option<u32>, bool) {
+    if has_dflash2_draft {
+        return (None, true);
+    }
+    (
+        qwen35_resolve_paged_cache_initial_memory_mb(configured_initial, env_override),
+        false,
+    )
+}
+
+/// Tokens the paged pool starts with when a DFlash2 draft is loaded:
+/// DFlash2 turns never write the pool, so it holds only a runway for paged
+/// turns and grows on demand (Splash `warmupKvPages`).
+pub(crate) const QWEN35_DFLASH2_POOL_RUNWAY_TOKENS: u32 = 2048;
+
+/// Blocks a runway pool asks the load-time sizer for: the requested pool
+/// plus the one layer a grow holds beside it.
+pub(crate) fn qwen35_runway_pool_sizing_request(requested_blocks: u32, layers: u32) -> u32 {
+    requested_blocks.saturating_add(requested_blocks.div_ceil(layers.max(1)))
+}
+
+/// The maximum a runway pool publishes and grows to: the most blocks whose
+/// last grow (the new pool plus one old layer) fits the `sized_blocks` the
+/// sizer selected, never past `requested_blocks`.
+pub(crate) fn qwen35_runway_pool_max_blocks(
+    sized_blocks: u32,
+    requested_blocks: u32,
+    layers: u32,
+) -> u32 {
+    let layers = u64::from(layers.max(1));
+    let fits = u64::from(sized_blocks) * layers / (layers + 1);
+    (fits.min(u64::from(requested_blocks)) as u32).max(1)
+}
+
 /// Convert a resolved initial MiB budget into an initial block count.
 ///
 /// Same MiB→blocks math as the max path (`PagedAttentionConfig::
-/// calculate_num_blocks`). `initial_mb == None` → the full max pool. A set
-/// budget is clamped to `min(initial, max)` — first in the MiB domain
+/// calculate_num_blocks`). `initial_mb == None` → the full max pool, or with
+/// a DFlash2 draft the runway plus one request's recurrent-state charge. A
+/// set budget is clamped to `min(initial, max)` — first in the MiB domain
 /// against `max_memory_mb`, then in the block domain against `max_blocks`
 /// (which adaptive load-time sizing may have reduced below what
 /// `max_memory_mb` itself holds). A budget that cannot hold one block is
@@ -73,9 +118,34 @@ pub(crate) fn qwen35_initial_pool_blocks(
     max_memory_mb: u32,
     max_blocks: u32,
     pa_config: &mlx_paged_attn::PagedAttentionConfig,
+    has_dflash2_draft: bool,
+    recurrent_state_bytes: u64,
 ) -> Result<(u32, Option<u32>), ()> {
     let Some(mb) = initial_mb else {
-        return Ok((max_blocks, None));
+        if !has_dflash2_draft {
+            return Ok((max_blocks, None));
+        }
+        let element_bytes: u64 = if pa_config.use_fp8_cache.unwrap_or(false) {
+            1
+        } else {
+            2
+        };
+        let bytes_per_block = (2 * element_bytes)
+            .saturating_mul(u64::from(pa_config.num_kv_heads))
+            .saturating_mul(u64::from(pa_config.head_size))
+            .saturating_mul(u64::from(pa_config.block_size))
+            .saturating_mul(u64::from(pa_config.num_layers))
+            .max(1);
+        let blocks = QWEN35_DFLASH2_POOL_RUNWAY_TOKENS
+            .div_ceil(pa_config.block_size.max(1))
+            .saturating_add(
+                recurrent_state_bytes
+                    .div_ceil(bytes_per_block)
+                    .min(u64::from(u32::MAX)) as u32,
+            )
+            .clamp(1, max_blocks.max(1));
+        let mib = (u64::from(blocks) * bytes_per_block).div_ceil(1024 * 1024);
+        return Ok((blocks, Some(mib.min(u64::from(u32::MAX)) as u32)));
     };
     let clamped_mb = mb.min(max_memory_mb);
     let initial_config = mlx_paged_attn::PagedAttentionConfig {
@@ -159,7 +229,8 @@ pub struct Qwen3_5Config {
     /// (`paged_cache_memory_mb` or the auto one-full-context default) on
     /// exhaustion. Unset (default) makes the initial pool equal the max —
     /// the historical fixed-pool behavior. `MLX_PAGED_CACHE_INITIAL_MB` wins
-    /// over this field at load time.
+    /// over this field at load time. Both are ignored with a DFlash2 draft:
+    /// that pool starts at its runway.
     #[serde(default)]
     #[napi(ts_type = "number | undefined")]
     pub paged_cache_initial_memory_mb: Option<u32>,
@@ -374,8 +445,9 @@ impl Qwen3_5Config {
 mod tests {
     use super::{
         Qwen3_5Config, qwen35_default_paged_cache_memory_mb, qwen35_initial_pool_blocks,
-        qwen35_resolve_paged_cache_initial_memory_mb, qwen35_resolve_paged_cache_memory_mb,
-        resolve_qwen35_paged_default,
+        qwen35_initial_pool_request, qwen35_resolve_paged_cache_initial_memory_mb,
+        qwen35_resolve_paged_cache_memory_mb, qwen35_runway_pool_max_blocks,
+        qwen35_runway_pool_sizing_request, resolve_qwen35_paged_default,
     };
     use mlx_paged_attn::PagedAttentionConfig;
 
@@ -534,8 +606,9 @@ mod tests {
         let pa = paged_config(max_memory_mb, 256, 2, 10);
         let max_blocks = pa.calculate_num_blocks();
         assert_eq!(max_blocks, 16_384);
-        let (blocks, mb) = qwen35_initial_pool_blocks(None, max_memory_mb, max_blocks, &pa)
-            .expect("unset initial must succeed");
+        let (blocks, mb) =
+            qwen35_initial_pool_blocks(None, max_memory_mb, max_blocks, &pa, false, 0)
+                .expect("unset initial must succeed");
         assert_eq!(blocks, max_blocks, "initial == max when unset");
         assert_eq!(mb, None);
     }
@@ -546,8 +619,9 @@ mod tests {
         let pa = paged_config(max_memory_mb, 256, 2, 10);
         let max_blocks = pa.calculate_num_blocks();
         // 1 MiB / (320 KiB per block) = 3 blocks.
-        let (blocks, mb) = qwen35_initial_pool_blocks(Some(1), max_memory_mb, max_blocks, &pa)
-            .expect("a 1 MiB initial budget must succeed");
+        let (blocks, mb) =
+            qwen35_initial_pool_blocks(Some(1), max_memory_mb, max_blocks, &pa, false, 0)
+                .expect("a 1 MiB initial budget must succeed");
         assert_eq!(blocks, 3);
         assert_eq!(mb, Some(1));
         assert!(blocks < max_blocks, "initial must sit below the max pool");
@@ -558,8 +632,9 @@ mod tests {
         let max_memory_mb = 5_120;
         let pa = paged_config(max_memory_mb, 256, 2, 10);
         let max_blocks = pa.calculate_num_blocks();
-        let (blocks, mb) = qwen35_initial_pool_blocks(Some(99_999), max_memory_mb, max_blocks, &pa)
-            .expect("an oversized initial budget clamps instead of failing");
+        let (blocks, mb) =
+            qwen35_initial_pool_blocks(Some(99_999), max_memory_mb, max_blocks, &pa, false, 0)
+                .expect("an oversized initial budget clamps instead of failing");
         assert_eq!(blocks, max_blocks);
         assert_eq!(mb, Some(max_memory_mb));
     }
@@ -572,17 +647,161 @@ mod tests {
         let pa = paged_config(max_memory_mb, 256, 2, 10);
         let adaptive_max_blocks = 100;
         let (blocks, mb) =
-            qwen35_initial_pool_blocks(Some(64), max_memory_mb, adaptive_max_blocks, &pa)
+            qwen35_initial_pool_blocks(Some(64), max_memory_mb, adaptive_max_blocks, &pa, false, 0)
                 .expect("initial within budget must succeed");
         assert_eq!(blocks, adaptive_max_blocks);
         assert_eq!(mb, Some(64));
+    }
+
+    /// Gate: with a DFlash2 draft and no initial size the pool starts at the
+    /// 2048-token runway plus the recurrent charge; without one, at the max.
+    /// Mutation: ignore `has_dflash2_draft` → red (5051 ≠ 275).
+    #[test]
+    fn initial_pool_blocks_with_a_dflash2_draft_start_at_the_runway() {
+        // Qwen3.8-27B: 16 full-attention layers × 4 KV heads × 256, 1 MiB
+        // per 16-token BF16 block; GDN state 153,944,064 B = 147 blocks.
+        let max_memory_mb = 5_051;
+        let pa = paged_config(max_memory_mb, 256, 4, 16);
+        let max_blocks = pa.calculate_num_blocks();
+        assert_eq!(max_blocks, 5_051);
+        let recurrent = 48 * (3 * 10_240 * 2 + 48 * 128 * 128 * 4);
+        assert_eq!(recurrent, 153_944_064);
+        let (blocks, mb) =
+            qwen35_initial_pool_blocks(None, max_memory_mb, max_blocks, &pa, true, recurrent)
+                .expect("runway");
+        assert_eq!(blocks, 128 + 147);
+        assert_eq!(mb, Some(275));
+        let (blocks, mb) =
+            qwen35_initial_pool_blocks(None, max_memory_mb, max_blocks, &pa, false, recurrent)
+                .expect("no draft");
+        assert_eq!(blocks, max_blocks);
+        assert_eq!(mb, None);
+        // The runway never exceeds the grow ceiling.
+        assert_eq!(
+            qwen35_initial_pool_blocks(None, max_memory_mb, 200, &pa, true, recurrent),
+            Ok((200, Some(200)))
+        );
+    }
+
+    /// Gate: on the 27B inputs a DFlash2 load starts at the 275-block runway
+    /// whatever `MLX_PAGED_CACHE_INITIAL_MB` or the config field says, so its
+    /// pool, and the window frozen from it, equal the unset load's. Without a
+    /// draft the env still wins over the config field.
+    /// Mutation: resolve the env/config initial first and set
+    /// `runway = initial_mb.is_none() && has_dflash2_draft` → red
+    /// (Some(4096) ≠ None).
+    #[test]
+    fn a_dflash2_load_ignores_the_initial_size_and_starts_at_the_runway() {
+        let max_memory_mb = 5_051;
+        let pa = paged_config(max_memory_mb, 256, 4, 16);
+        let max_blocks = pa.calculate_num_blocks();
+        let recurrent = 153_944_064;
+        let unset = qwen35_initial_pool_request(None, None, true);
+        assert_eq!(unset, (None, true));
+        for (configured, env) in [
+            (None, Some("4096")),
+            (Some(300), None),
+            (Some(300), Some("4096")),
+        ] {
+            let (initial, runway) = qwen35_initial_pool_request(configured, env, true);
+            assert_eq!((initial, runway), unset);
+            assert_eq!(
+                qwen35_initial_pool_blocks(
+                    initial,
+                    max_memory_mb,
+                    max_blocks,
+                    &pa,
+                    true,
+                    recurrent
+                ),
+                Ok((275, Some(275)))
+            );
+        }
+        assert_eq!(
+            qwen35_initial_pool_request(Some(300), Some("4096"), false),
+            (Some(4_096), false)
+        );
+        assert_eq!(
+            qwen35_initial_pool_request(Some(300), None, false),
+            (Some(300), false)
+        );
+        assert_eq!(
+            qwen35_initial_pool_request(None, None, false),
+            (None, false)
+        );
+    }
+
+    /// Gate: on the M3 Pro inputs (a 5,051-block budget of one-MiB blocks,
+    /// 16 pool layers, the 275-block runway, 128-block extents) the runway
+    /// pool grows by extents all the way to its published max, 4,753 blocks,
+    /// and the published pool window is 73,696. Each grow is admitted as
+    /// `try_grow_pool` admits it: the sizer's selection for the target, with
+    /// `pool_grow_reserved_bytes` reserved, must cover the target or at least
+    /// one more block. Mutations: reserve the whole old pool in
+    /// `pool_grow_reserved_bytes` → red (stalls at 2,579); publish the
+    /// budget as the max in `qwen35_runway_pool_max_blocks` → red (stalls at
+    /// 4,755 of 5,051).
+    #[test]
+    fn runway_pool_reaches_its_published_max() {
+        const MIB: u64 = 1 << 20;
+        const LAYERS: u32 = 16;
+        const BUDGET: u32 = 5_051;
+        const REQUESTED: u32 = 16_384;
+        let probe = |request: u32, reserved: u64| {
+            mlx_paged_attn::profile::compute_load_time_pool_sizing(
+                request,
+                u64::from(BUDGET) * MIB,
+                None,
+                0,
+                1.0,
+                0,
+                MIB,
+                reserved,
+            )
+            .expect("sizing")
+            .selected_blocks
+        };
+        let sized = probe(qwen35_runway_pool_sizing_request(REQUESTED, LAYERS), 0);
+        assert_eq!(sized, BUDGET);
+        let max = qwen35_runway_pool_max_blocks(sized, REQUESTED, LAYERS);
+        let extent = crate::models::qwen3_5::dflash2_decode::runway_pool_extent_blocks(MIB);
+        assert_eq!(extent, 128);
+        let mut blocks = 275u32;
+        while blocks < max {
+            let target = max.min(blocks + extent);
+            let reserved = crate::transformer::paged_kv_cache_adapter::pool_grow_reserved_bytes(
+                &vec![u64::from(blocks) * MIB / u64::from(LAYERS); LAYERS as usize],
+                u64::from(target) * MIB / u64::from(LAYERS),
+            );
+            let selected = probe(target, reserved);
+            if selected <= blocks {
+                break;
+            }
+            blocks = selected.min(target);
+        }
+        assert_eq!(blocks, max, "the pool stalls below its published max");
+        assert_eq!(max, 4_753);
+        assert_eq!(
+            crate::engine::hybrid_scheduler::pool_tokens_after_recurrent(
+                max * 16,
+                16,
+                MIB,
+                153_944_064,
+            ),
+            73_696
+        );
+        // Where the request binds, not the budget, the max is the request.
+        assert_eq!(
+            qwen35_runway_pool_max_blocks(17_408, REQUESTED, LAYERS),
+            REQUESTED
+        );
     }
 
     #[test]
     fn initial_pool_blocks_rejects_a_budget_that_cannot_hold_one_block() {
         let pa = paged_config(5_120, 256, 2, 10);
         assert!(
-            qwen35_initial_pool_blocks(Some(0), 5_120, 16_384, &pa).is_err(),
+            qwen35_initial_pool_blocks(Some(0), 5_120, 16_384, &pa, true, 0).is_err(),
             "0 MiB must fail with the one-block error"
         );
     }

@@ -59,5 +59,8 @@ pub use block_allocator::*;
 pub use block_table::*;
 pub use cold_cache::*;
 pub use config::*;
+#[cfg(all(feature = "test-hooks", target_os = "macos"))]
+#[doc(hidden)]
+pub use layer_kv_pool::set_shrink_fail_at_layer;
 pub use layer_kv_pool::{LayerKVPool, RESTORE_STAGING_BYTES};
 pub use prefix_registry::{PrefixKeys, chain_hashes, chain_hashes_per_block, hash_tokens};

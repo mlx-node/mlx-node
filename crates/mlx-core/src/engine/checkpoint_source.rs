@@ -371,6 +371,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
+    use crate::test_support::sweep_until_removed;
     use crate::utils::gguf::{native_gguf_unlease_in_use, sweep_native_gguf_cache};
     use crate::utils::gguf_test_fixtures::{
         IMPORT_FIXTURE_NAMES, ImportFixture, ImportFixtureFamily, write_import_fixture,
@@ -573,8 +574,10 @@ mod tests {
         sweep_native_gguf_cache(&cache, "unrelated-key");
         assert!(dir.is_dir(), "the sweep removed a leased asset entry");
         native_gguf_unlease_in_use(&dir);
-        sweep_native_gguf_cache(&cache, "unrelated-key");
-        assert!(!dir.exists(), "the stale entry survived without its lease");
+        assert!(
+            sweep_until_removed(&cache, "unrelated-key", &[&dir]),
+            "the stale entry survived without its lease"
+        );
         fs::remove_dir_all(&work).ok();
     }
 
@@ -609,7 +612,7 @@ mod tests {
             dir
         };
         let (v6, v7, v8) = (entry(6), entry(7), entry(8));
-        sweep_native_gguf_cache(&cache, "unrelated-key");
+        sweep_until_removed(&cache, "unrelated-key", &[&v6, &v7]);
         assert!(!v6.exists(), "an aged v6 entry must be swept (control)");
         assert!(!v7.exists(), "an aged v7 weight entry must be swept");
         assert!(v8.is_dir(), "a healthy aged v8 asset entry must survive");

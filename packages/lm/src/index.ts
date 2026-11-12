@@ -99,7 +99,13 @@ export type { NativeStreamingInstance, NativeStreamingMethod, StreamingInstance,
 // generative model wrapper and used as the upper-bound for
 // `ChatSession<M>`; exported so the VLM wrapper can pin a compile-time
 // conformance assertion.
-export { ChatSession, ContextCapacityError, isContextCapacityError, mtpAutoDefaultAllowed } from './chat-session.js';
+export {
+  ChatSession,
+  ContextCapacityError,
+  isCapacityExhaustedError,
+  isContextCapacityError,
+  mtpAutoDefaultAllowed,
+} from './chat-session.js';
 export { ToolCallTagBuffer, longestSuffixPrefixOverlap } from './tool-call-buffer.js';
 export type { ChatSessionOptions, SendOptions, SessionCapableModel, SessionContextLimits } from './chat-session.js';
 

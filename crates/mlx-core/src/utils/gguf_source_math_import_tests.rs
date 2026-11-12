@@ -103,6 +103,11 @@ fn source_operand_identity(input: &Path) -> source_math::ImportIdentity {
 #[tokio::test]
 #[ignore = "bounded native CPU converter; run in a fresh process"]
 async fn original_f32_preservation_keeps_main_safetensors_bytes_exact() {
+    if !crate::test_support::in_own_process(
+        "utils::gguf::tests::original_f32_preservation_keeps_main_safetensors_bytes_exact",
+    ) {
+        return;
+    }
     let temp = GemmaNativeTestDir::new();
     let input = source_operand_fixture(temp.path());
     let native = temp.path().join("native");
@@ -181,6 +186,11 @@ fn source_operand_layout_change_is_moe_only() {
 #[tokio::test]
 #[ignore = "bounded 40+1 inline-MTP CPU converter; run in a fresh process"]
 async fn source_operand_import_excludes_inline_mtp_from_main_geometry() {
+    if !crate::test_support::in_own_process(
+        "utils::gguf::tests::source_operand_import_excludes_inline_mtp_from_main_geometry",
+    ) {
+        return;
+    }
     let temp = GemmaNativeTestDir::new();
     let input = source_operand_fixture_with_inline_mtp(temp.path(), true);
     let output = temp.path().join("preserved");

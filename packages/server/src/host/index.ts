@@ -360,7 +360,12 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     const entry = models.find((model) => model.path === path)!;
     // Resolve against the source directory before creating the paged config overlay.
     const draftModelPath = findDFlash2Draft(path, entry.modelType, modelsDir);
-    const resolvedPath = await pagedConfigOverrides.resolve(path, entry.modelType);
+    const resolvedPath = await pagedConfigOverrides.resolve(
+      path,
+      entry.modelType,
+      undefined,
+      draftModelPath !== undefined,
+    );
     // A muse_glimmer .gguf resolve leased the prepared asset dir; that
     // reference is this attempt's. A successful load keeps the lazy
     // tokenizer/template assets protected for the model's lifetime — a failed
