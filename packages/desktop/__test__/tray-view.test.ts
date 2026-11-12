@@ -21,7 +21,8 @@ function snapshot(state: SupervisorState, over: Partial<SupervisorSnapshot> = {}
     pid: 4242,
     url: 'http://127.0.0.1:51423',
     generation: 1,
-    consecutiveCrashes: 0,
+    streak: 0,
+    shortLivedFailures: 0,
     lastExit: null,
     health: null,
     nativeErrors: [],
@@ -128,7 +129,7 @@ describe('presentTray', () => {
       expect(presentTray(snapshot('running', { health: { status: 'degraded' } })).statusLabel).toContain('degraded');
     });
 
-    it('counts the crashes while restarting and after giving up', () => {
+    it('counts the failures while restarting and says it stopped after giving up', () => {
       const exit = {
         verdict: 'crash' as const,
         reason: 'exited 0 without being asked to',
@@ -137,9 +138,13 @@ describe('presentTray', () => {
         atMs: 1,
         stderrTail: [],
       };
-      expect(presentTray(snapshot('restarting', { consecutiveCrashes: 2, lastExit: exit })).statusLabel).toContain('2');
-      expect(presentTray(snapshot('failed', { consecutiveCrashes: 5, lastExit: exit })).statusLabel).toContain('5');
-      expect(presentTray(snapshot('failed', { consecutiveCrashes: 5, lastExit: exit })).detail).toBe(exit.reason);
+      expect(presentTray(snapshot('restarting', { streak: 2, lastExit: exit })).statusLabel).toBe(
+        'Inference: restarting (failure 2)',
+      );
+      expect(presentTray(snapshot('failed', { streak: 5, lastExit: exit })).statusLabel).toBe(
+        'Inference: stopped restarting',
+      );
+      expect(presentTray(snapshot('failed', { streak: 5, lastExit: exit })).detail).toBe(exit.reason);
     });
 
     it('explains a stopped sidecar that stopped by itself', () => {

@@ -36,7 +36,11 @@ export interface ChildSpec {
 
 /** How a child process ended, normalised across the two transports. */
 export interface ChildExit {
-  /** Exit status. `null` when the OS reported a signal instead. */
+  /**
+   * Exit status. A signal death carries the signal's number under both
+   * transports (`utilityProcess` reports only that), which is what Splash's
+   * `request_caused` reads.
+   */
   code: number | null;
   /**
    * POSIX signal name, or `null`.
@@ -210,8 +214,10 @@ export interface SupervisorSnapshot {
   url: string | null;
   /** How many times we have forked. 1 on the first start. */
   generation: number;
-  /** Crashes since the last child that stayed up long enough to earn a fresh budget. */
-  consecutiveCrashes: number;
+  /** Splash `RestartPolicy.streak`: failures in a row since a full probation of service. */
+  streak: number;
+  /** Splash `RestartPolicy.short_lived_failures`. */
+  shortLivedFailures: number;
   lastExit: ExitRecord | null;
   /** Most recent `/health` body, or `null` if the last poll failed or none has run. */
   health: HealthProbe | null;
@@ -241,7 +247,10 @@ export type SupervisorEvent =
   | { type: 'state'; snapshot: SupervisorSnapshot }
   | { type: 'ready'; url: string }
   | { type: 'crashed'; exit: ExitRecord }
-  | { type: 'gave-up'; consecutiveCrashes: number }
+  /** Restarting stopped until the user starts inference again; `message` is Splash's `_stop_message`. */
+  | { type: 'gave-up'; message: string }
+  /** Splash `Quarantine.after` refused `refused` more fingerprints, `total` in all. */
+  | { type: 'quarantined'; refused: number; total: number }
   | { type: 'lying'; error: NativeError }
   | { type: 'log'; stream: 'stdout' | 'stderr'; line: string };
 

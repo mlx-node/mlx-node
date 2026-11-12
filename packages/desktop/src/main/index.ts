@@ -326,7 +326,13 @@ async function bootstrap(): Promise<void> {
       return;
     }
     if (event.type === 'gave-up') {
-      console.error(`[mlx] inference gave up after ${event.consecutiveCrashes} crashes`);
+      console.error(`[mlx] ${event.message}`);
+      return;
+    }
+    if (event.type === 'quarantined') {
+      console.error(
+        `[mlx] quarantine: ${event.refused} request(s) in flight at two inference crashes in a row refused until inference is started again`,
+      );
       return;
     }
     if (event.type === 'lying') {

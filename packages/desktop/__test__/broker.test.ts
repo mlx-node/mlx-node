@@ -11,6 +11,7 @@
 import { describe, expect, it } from 'vite-plus/test';
 
 import { CONTROL_PANEL_BROKER_KILL_GRACE_MS } from '../src/control-panel/shutdown-timings.js';
+import { EXIT_STARTUP_FAILED } from '../src/inference/exit-codes.js';
 import {
   createControlPanelBroker,
   type ControlPanelChild,
@@ -59,7 +60,7 @@ interface Harness {
   clock: { now: number };
 }
 
-function harness(options: { spawnThrows?: boolean } = {}): Harness {
+function harness(options: { spawnThrows?: boolean | 'ENOENT' } = {}): Harness {
   const spawns: Spawn[] = [];
   const events: BrokerEvent[] = [];
   const ports: TestPort[] = [];
@@ -95,6 +96,9 @@ function harness(options: { spawnThrows?: boolean } = {}): Harness {
     deps: {
       spawn(handlers): ControlPanelChild {
         if (options.spawnThrows === true) throw new Error('fork failed');
+        if (options.spawnThrows === 'ENOENT') {
+          throw Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' });
+        }
         const record: Spawn = {
           killed: 0,
           forceKilled: 0,
@@ -252,7 +256,7 @@ describe('a handshake that cannot be completed', () => {
 
   it('never throws out of attach, even when the fork itself fails', () => {
     const h = harness({ spawnThrows: true });
-    const broker = createControlPanelBroker(h.deps, { restart: { maxConsecutiveCrashes: 2, baseDelayMs: 1 } });
+    const broker = createControlPanelBroker(h.deps, { restart: { backoffBaseMs: 1, probationMs: 1 } });
     const win = renderer();
 
     // `attach` runs inside an `ipcMain` handler. A throw there is an uncaught
@@ -268,12 +272,28 @@ describe('a handshake that cannot be completed', () => {
     h.fire();
     expect(h.events.some((e) => e.type === 'control-panel-gave-up')).toBe(true);
   });
+
+  // Splash `EngineLaunchFailed`: a missing entry stays missing.
+  it('stops at once when the fork finds nothing to run', () => {
+    const h = harness({ spawnThrows: 'ENOENT' });
+    const broker = createControlPanelBroker(h.deps);
+    broker.attach(renderer());
+
+    expect(h.events.filter((e) => e.type === 'control-panel-gave-up')).toEqual([
+      {
+        type: 'control-panel-gave-up',
+        message: expect.stringContaining('control panel failed to fork: spawn ENOENT'),
+      },
+    ]);
+    // No restart is scheduled.
+    expect(h.timers).toEqual([]);
+  });
 });
 
 describe('when CONTROL PANEL dies', () => {
   it('kills, escalates, restarts, and re-brokers a child whose transport wedged', () => {
     const h = harness();
-    const broker = createControlPanelBroker(h.deps, { restart: { baseDelayMs: 10 }, killGraceMs: 25 });
+    const broker = createControlPanelBroker(h.deps, { restart: { backoffBaseMs: 10 }, killGraceMs: 25 });
     const win = renderer();
     broker.attach(win);
     const generation = broker.generation();
@@ -296,7 +316,7 @@ describe('when CONTROL PANEL dies', () => {
 
   it('cancels recovery escalation when SIGTERM succeeds', () => {
     const h = harness();
-    const broker = createControlPanelBroker(h.deps, { restart: { baseDelayMs: 10 }, killGraceMs: 25 });
+    const broker = createControlPanelBroker(h.deps, { restart: { backoffBaseMs: 10 }, killGraceMs: 25 });
     const win = renderer();
     broker.attach(win);
 
@@ -323,7 +343,7 @@ describe('when CONTROL PANEL dies', () => {
 
   it('ignores a queued recovery report after a replacement generation is brokered', () => {
     const h = harness();
-    const broker = createControlPanelBroker(h.deps, { restart: { baseDelayMs: 10 } });
+    const broker = createControlPanelBroker(h.deps, { restart: { backoffBaseMs: 10 } });
     const win = renderer();
     broker.attach(win);
     const staleGeneration = broker.generation();
@@ -350,7 +370,7 @@ describe('when CONTROL PANEL dies', () => {
 
   it('reports it, restarts, and re-brokers to the window that is still open', () => {
     const h = harness();
-    const broker = createControlPanelBroker(h.deps, { restart: { baseDelayMs: 10 } });
+    const broker = createControlPanelBroker(h.deps, { restart: { backoffBaseMs: 10 } });
     const win = renderer();
     broker.attach(win);
     expect(win.received).toHaveLength(1);
@@ -358,7 +378,7 @@ describe('when CONTROL PANEL dies', () => {
     h.clock.now += 60_000;
     h.spawns[0].exit(1);
 
-    expect(h.events.at(-1)).toMatchObject({ type: 'control-panel-exited', code: 1, consecutiveCrashes: 1 });
+    expect(h.events.at(-1)).toMatchObject({ type: 'control-panel-exited', code: 1, streak: 1 });
     expect(broker.running()).toBe(false);
 
     h.fire();
@@ -373,7 +393,7 @@ describe('when CONTROL PANEL dies', () => {
 
   it('does not re-broker to a window that has since been destroyed', () => {
     const h = harness();
-    const broker = createControlPanelBroker(h.deps, { restart: { baseDelayMs: 10 } });
+    const broker = createControlPanelBroker(h.deps, { restart: { backoffBaseMs: 10 } });
     const win = renderer();
     broker.attach(win);
 
@@ -388,9 +408,10 @@ describe('when CONTROL PANEL dies', () => {
     expect(win.received).toHaveLength(1);
   });
 
-  it('gives up after the budget and stops respawning', () => {
+  it('gives up at the short failure whose backoff would reach the cap', () => {
     const h = harness();
-    const broker = createControlPanelBroker(h.deps, { restart: { maxConsecutiveCrashes: 3, baseDelayMs: 1 } });
+    // Splash CRASH_LOOP_FAILURES = 2 + ceil(log2(probation / base)) = 3.
+    const broker = createControlPanelBroker(h.deps, { restart: { backoffBaseMs: 1, probationMs: 2 } });
     broker.attach(renderer());
 
     for (let crash = 0; crash < 3; crash += 1) {
@@ -399,30 +420,39 @@ describe('when CONTROL PANEL dies', () => {
     }
 
     expect(h.events.filter((e) => e.type === 'control-panel-gave-up')).toEqual([
-      { type: 'control-panel-gave-up', consecutiveCrashes: 3 },
+      {
+        type: 'control-panel-gave-up',
+        message: expect.stringContaining('it failed 3 times in a row, each within 0.002 s of starting (exited 1)'),
+      },
     ]);
     expect(h.spawns).toHaveLength(3);
     expect(broker.running()).toBe(false);
   });
 
-  it('reports the give-up to a later handshake instead of silently doing nothing', () => {
+  // `EXIT_STARTUP_FAILED`: CONTROL PANEL not forked as a utilityProcess. A
+  // relaunch meets it again (Splash `permanent()`).
+  it('reports a permanent give-up to a later handshake instead of silently doing nothing', () => {
     const h = harness();
-    const broker = createControlPanelBroker(h.deps, { restart: { maxConsecutiveCrashes: 1, baseDelayMs: 1 } });
+    const broker = createControlPanelBroker(h.deps);
     broker.attach(renderer());
-    h.spawns[0].exit(1);
+    h.spawns[0].exit(EXIT_STARTUP_FAILED);
     h.fire();
+    expect(h.spawns).toHaveLength(1);
 
     const win = renderer('later');
     broker.attach(win);
 
     expect(win.received).toEqual([]);
-    expect(h.events.at(-1)).toMatchObject({ type: 'broker-failed', reason: expect.stringContaining('gave up') });
+    expect(h.events.at(-1)).toMatchObject({
+      type: 'broker-failed',
+      reason: expect.stringContaining('stopped restarting the control panel: exited 78'),
+    });
   });
 
-  it('earns a fresh budget after staying up', () => {
+  it('starts the count anew after a full probation of service', () => {
     const h = harness();
     const broker = createControlPanelBroker(h.deps, {
-      restart: { maxConsecutiveCrashes: 3, baseDelayMs: 1, healthyForMs: 10_000 },
+      restart: { backoffBaseMs: 1, probationMs: 10_000 },
     });
     broker.attach(renderer());
 
@@ -430,24 +460,24 @@ describe('when CONTROL PANEL dies', () => {
     h.fire();
     h.spawns[1].exit(1);
     h.fire();
-    expect(h.events.at(-2)).toMatchObject({ consecutiveCrashes: 2 });
+    expect(h.events.at(-2)).toMatchObject({ streak: 2 });
 
     // This one ran long enough to prove it can. Measured from the fork, which is
     // all the broker knows — CONTROL PANEL has no readiness handshake to measure from.
     h.clock.now += 20_000;
     h.spawns[2].exit(1);
-    expect(h.events.at(-1)).toMatchObject({ type: 'control-panel-exited', consecutiveCrashes: 1 });
+    expect(h.events.at(-1)).toMatchObject({ type: 'control-panel-exited', streak: 1 });
   });
 
   it('treats exit 0 as a crash', () => {
     const h = harness();
-    const broker = createControlPanelBroker(h.deps, { restart: { baseDelayMs: 1 } });
+    const broker = createControlPanelBroker(h.deps, { restart: { backoffBaseMs: 1 } });
     broker.attach(renderer());
     h.spawns[0].exit(0);
 
     // Nothing asks CONTROL PANEL to stop except `dispose()`, so an exit of 0 means it
     // fell off the end of its entry — not that everything is fine.
-    expect(h.events.at(-1)).toMatchObject({ type: 'control-panel-exited', code: 0, consecutiveCrashes: 1 });
+    expect(h.events.at(-1)).toMatchObject({ type: 'control-panel-exited', code: 0, streak: 1 });
     h.fire();
     expect(h.spawns).toHaveLength(2);
   });
@@ -512,7 +542,7 @@ describe('dispose', () => {
 
   it('does not respawn after disposal', async () => {
     const h = harness();
-    const broker = createControlPanelBroker(h.deps, { restart: { baseDelayMs: 1 } });
+    const broker = createControlPanelBroker(h.deps, { restart: { backoffBaseMs: 1 } });
     broker.attach(renderer());
     const done = broker.dispose();
     h.spawns[0].exit(0);

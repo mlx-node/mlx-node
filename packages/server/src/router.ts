@@ -17,6 +17,7 @@ import {
   sendBadRequest,
   sendMethodNotAllowed,
   sendNotFound,
+  sendRequestQuarantined,
 } from './errors.js';
 import type { PublicModelEntry } from './handler.js';
 import { toMinimalHealth, type ServerHealth } from './health.js';
@@ -25,6 +26,7 @@ import type { ModelWorkCoordinator } from './model-work-coordinator.js';
 import type { ModelRegistry } from './registry.js';
 import type { RerankService } from './rerank-service.js';
 import { stringifyStrictJson } from './strict-json.js';
+import { QUARANTINE_MESSAGE, rawRequestFingerprint, type TurnJournal } from './turn-journal.js';
 import type { AnthropicCountTokensRequest, AnthropicMessagesRequest } from './types-anthropic.js';
 import type { ResponsesAPIRequest } from './types.js';
 
@@ -94,6 +96,8 @@ export interface RouteExtras {
   rerank?: RerankService;
   /** Thinking budget of a Messages thinking request that sets none. */
   thinkingTokenBudget?: number;
+  /** The desktop supervisor's turn journal and quarantine. */
+  turnJournal?: TurnJournal;
   /** `POST /v1/memory/release`; omitted ⇒ the route is not served. */
   releaseMemory?: () => Promise<MemoryReleaseAnswer>;
 }
@@ -166,7 +170,22 @@ export async function routeRequest(
     } catch {
       /* The endpoint reports malformed JSON. */
     }
-    await handleSystemOne(req, res, raw, registry, idleSweeper, resolveModel, modelWorkCoordinator);
+    const journal = extras?.turnJournal;
+    const fingerprint = journal === undefined ? null : rawRequestFingerprint(path, raw);
+    if (fingerprint !== null && journal?.refuses(fingerprint) === true) {
+      sendRequestQuarantined(res, QUARANTINE_MESSAGE);
+      return;
+    }
+    await handleSystemOne(
+      req,
+      res,
+      raw,
+      registry,
+      idleSweeper,
+      resolveModel,
+      modelWorkCoordinator,
+      fingerprint === null || journal === undefined ? undefined : () => journal.begin(fingerprint),
+    );
     return;
   }
 
@@ -217,6 +236,7 @@ export async function routeRequest(
       idleSweeper,
       modelWorkCoordinator,
       resolveModel,
+      extras?.turnJournal,
     );
     return;
   }
@@ -270,6 +290,7 @@ export async function routeRequest(
       resolveModel,
       modelWorkCoordinator,
       extras?.thinkingTokenBudget,
+      extras?.turnJournal,
     );
     return;
   }

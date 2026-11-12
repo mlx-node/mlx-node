@@ -1,16 +1,28 @@
+import { constants } from 'node:os';
+
 import { describe, expect, it } from 'vite-plus/test';
 
 import { EXIT_STARTUP_FAILED } from '../src/inference/exit-codes.js';
 import { buildChildEnv } from '../src/main/supervisor/env.js';
 import {
   assessExit,
+  backoffDoublings,
+  crashLoopFailures,
   DEFAULT_RESTART_POLICY,
+  EMPTY_QUARANTINE,
+  FRESH_RESTART_STATE,
   isLoopbackHttpUrl,
+  isPermanentExit,
   isServingStatus,
-  nextCrashCount,
-  planRestart,
   projectState,
+  quarantineAfter,
+  requestCaused,
+  restartAfter,
+  stopCause,
+  type EngineFailure,
+  type QuarantineState,
   type RestartPolicy,
+  type RestartState,
 } from '../src/main/supervisor/state.js';
 import { parseChildMessage } from '../src/main/supervisor/types.js';
 
@@ -81,60 +93,111 @@ describe('assessExit', () => {
   });
 });
 
-describe('planRestart', () => {
-  const policy: RestartPolicy = { maxConsecutiveCrashes: 5, baseDelayMs: 100, maxDelayMs: 400, healthyForMs: 1_000 };
-  // An ordinary crash exit: non-zero, restartable.
-  const crash = { code: 1, signal: null };
+/** Feeds `failures` through `restartAfter`; the delays, then the decision that ended it. */
+function run(
+  policy: RestartPolicy,
+  failures: readonly EngineFailure[],
+  from: RestartState = FRESH_RESTART_STATE,
+): { delays: number[]; last: ReturnType<typeof restartAfter> } {
+  let state = from;
+  const delays: number[] = [];
+  let last = restartAfter(policy, state, failures[0]);
+  for (const failure of failures) {
+    last = restartAfter(policy, state, failure);
+    state = last.state;
+    if (last.decision.action === 'give-up') break;
+    delays.push(last.decision.delayMs);
+  }
+  return { delays, last };
+}
 
-  it('backs off exponentially from the base delay', () => {
-    expect(planRestart(policy, 1, crash)).toEqual({ action: 'restart', delayMs: 100, attempt: 1 });
-    expect(planRestart(policy, 2, crash)).toEqual({ action: 'restart', delayMs: 200, attempt: 2 });
-    expect(planRestart(policy, 3, crash)).toEqual({ action: 'restart', delayMs: 400, attempt: 3 });
-  });
+const short = (n: number, servedMs = 1_000): EngineFailure[] =>
+  Array.from({ length: n }, () => ({ servedMs, permanent: false }));
 
-  it('clamps at the ceiling instead of growing without bound', () => {
-    expect(planRestart(policy, 4, crash)).toEqual({ action: 'restart', delayMs: 400, attempt: 4 });
-  });
-
-  // The boundary, stated exactly: maxConsecutiveCrashes 5 means four restarts
-  // and then a resting `failed` state. A sidecar that dies instantly must not
-  // spin forever.
-  it('gives up on the Nth crash, not the Nth+1', () => {
-    expect(planRestart(policy, 5, crash)).toEqual({ action: 'give-up', attempt: 5 });
-    expect(planRestart(policy, 6, crash)).toEqual({ action: 'give-up', attempt: 6 });
-  });
-
-  it('ships a give-up by default rather than an unbounded loop', () => {
-    expect(Number.isFinite(DEFAULT_RESTART_POLICY.maxConsecutiveCrashes)).toBe(true);
-    expect(planRestart(DEFAULT_RESTART_POLICY, DEFAULT_RESTART_POLICY.maxConsecutiveCrashes, crash).action).toBe(
-      'give-up',
+// Splash dev/tests/server/test_supervision.py `RestartPolicyTests`.
+describe('restartAfter (Splash RestartPolicy.after)', () => {
+  it('the sixth short-lived failure in a row stops', () => {
+    expect(backoffDoublings(DEFAULT_RESTART_POLICY)).toBe(4);
+    expect(crashLoopFailures(DEFAULT_RESTART_POLICY)).toBe(6);
+    const { delays, last } = run(DEFAULT_RESTART_POLICY, short(6));
+    expect(delays).toEqual([0, 5_000, 10_000, 20_000, 40_000]);
+    expect(last.decision).toEqual({ action: 'give-up', permanent: false });
+    expect(last.state.shortLivedFailures).toBe(6);
+    expect(stopCause(DEFAULT_RESTART_POLICY, false, 'exited 1')).toBe(
+      'it failed 6 times in a row, each within 60 s of starting (exited 1)',
     );
   });
 
-  // `EXIT_STARTUP_FAILED` is `createHost` rejecting — classically
-  // NoModelsDiscoveredError. Deterministic: the next fork sees the same empty
-  // models dir, so the first crash is already the verdict.
-  it('never restarts a startup failure, however much budget remains', () => {
-    const startupFailed = { code: EXIT_STARTUP_FAILED, signal: null };
-    expect(planRestart(policy, 1, startupFailed)).toEqual({ action: 'give-up', attempt: 1 });
-    expect(planRestart(policy, 4, startupFailed)).toEqual({ action: 'give-up', attempt: 4 });
-    // And the rule reads the code, not the count: other codes still restart.
-    expect(planRestart(policy, 1, { code: 79, signal: null }).action).toBe('restart');
+  it('a full probation of service starts the count anew', () => {
+    let { delays, last } = run(DEFAULT_RESTART_POLICY, short(5));
+    expect(delays).toEqual([0, 5_000, 10_000, 20_000, 40_000]);
+    const served = restartAfter(DEFAULT_RESTART_POLICY, last.state, { servedMs: 60_000, permanent: false });
+    expect(served.decision).toEqual({ action: 'restart', delayMs: 0 });
+    expect(served.state).toEqual({ streak: 1, shortLivedFailures: 0 });
+    ({ delays, last } = run(DEFAULT_RESTART_POLICY, short(6), served.state));
+    expect(delays).toEqual([5_000, 10_000, 20_000, 40_000, 60_000]);
+    expect(last.decision).toEqual({ action: 'give-up', permanent: false });
+    // One millisecond short of the probation is short-lived.
+    expect(run(DEFAULT_RESTART_POLICY, short(6, 59_999)).last.decision.action).toBe('give-up');
+  });
+
+  it('only a failure a relaunch would meet again stops at once', () => {
+    const permanent = restartAfter(DEFAULT_RESTART_POLICY, FRESH_RESTART_STATE, { servedMs: 0, permanent: true });
+    expect(permanent.decision).toEqual({ action: 'give-up', permanent: true });
+    expect(permanent.state).toEqual(FRESH_RESTART_STATE);
+    expect(stopCause(DEFAULT_RESTART_POLICY, true, 'the entry is missing')).toBe('the entry is missing');
+    expect(isPermanentExit({ code: EXIT_STARTUP_FAILED, signal: null }, false)).toBe(true);
+    expect(isPermanentExit({ code: null, signal: null }, true)).toBe(true);
+    expect(isPermanentExit({ code: 1, signal: null }, false)).toBe(false);
+    // Splash INTERNAL: a start that failed for another reason backs off as any.
+    expect(run(DEFAULT_RESTART_POLICY, short(3, 0)).delays).toEqual([0, 5_000, 10_000]);
+  });
+
+  it('refuses a policy whose probation is shorter than its backoff base', () => {
+    expect(() => backoffDoublings({ backoffBaseMs: 2, probationMs: 1 })).toThrow(RangeError);
+    expect(() => backoffDoublings({ backoffBaseMs: 0, probationMs: 1 })).toThrow(RangeError);
+    expect(crashLoopFailures({ backoffBaseMs: 20, probationMs: 40 })).toBe(3);
+    expect(crashLoopFailures({ backoffBaseMs: 1, probationMs: 1 })).toBe(2);
   });
 });
 
-describe('nextCrashCount', () => {
-  const policy: RestartPolicy = { maxConsecutiveCrashes: 5, baseDelayMs: 100, maxDelayMs: 400, healthyForMs: 1_000 };
+const fp = (c: string): string => c.repeat(64);
 
-  it('accumulates while the child keeps dying quickly', () => {
-    expect(nextCrashCount(policy, 0, 10)).toBe(1);
-    expect(nextCrashCount(policy, 3, 999)).toBe(4);
+// Splash `QuarantineTests`.
+describe('quarantineAfter (Splash Quarantine.after)', () => {
+  it('a request started at two failures in a row is refused', () => {
+    const [x, y, z] = [fp('a'), fp('b'), fp('c')];
+    let q: QuarantineState = EMPTY_QUARANTINE;
+    let counted = quarantineAfter(q, new Set([x, y]));
+    expect([...counted.refused]).toEqual([]);
+    q = counted.state;
+    counted = quarantineAfter(q, new Set([x, z]));
+    expect([...counted.refused]).toEqual([x]);
+    q = counted.state;
+    counted = quarantineAfter(q, new Set([y]));
+    expect([...counted.refused]).toEqual([]);
+    q = counted.state;
+    expect(q.refused.has(x)).toBe(true);
+    expect(q.refused.has(y)).toBe(false);
+    // Never changed in place.
+    expect(EMPTY_QUARANTINE.refused.size).toBe(0);
   });
+});
 
-  // Reset to 1, not 0: the crash that just happened still counts.
-  it('grants a fresh budget to a child that stayed ready long enough', () => {
-    expect(nextCrashCount(policy, 4, 1_000)).toBe(1);
-    expect(nextCrashCount(policy, 4, 5_000)).toBe(1);
+describe('requestCaused (Splash request_caused)', () => {
+  const signals: Readonly<Record<string, number | undefined>> = constants.signals;
+  const code = (name: string): number => signals[name] ?? -1;
+
+  it('only a fault-signal death of a ready child it did not stop counts', () => {
+    for (const name of ['SIGSEGV', 'SIGBUS', 'SIGILL', 'SIGABRT', 'SIGFPE', 'SIGTRAP']) {
+      expect(requestCaused({ intent: 'run', becameReady: true, code: code(name) })).toBe(true);
+    }
+    for (const other of [null, 0, 1, code('SIGKILL'), code('SIGTERM'), EXIT_STARTUP_FAILED]) {
+      expect(requestCaused({ intent: 'run', becameReady: true, code: other })).toBe(false);
+    }
+    expect(requestCaused({ intent: 'stop', becameReady: true, code: code('SIGSEGV') })).toBe(false);
+    expect(requestCaused({ intent: 'abort', becameReady: true, code: code('SIGSEGV') })).toBe(false);
+    expect(requestCaused({ intent: 'run', becameReady: false, code: code('SIGSEGV') })).toBe(false);
   });
 });
 
@@ -252,17 +315,23 @@ describe('parseChildMessage', () => {
 
 describe('buildChildEnv', () => {
   const traceFile = '/tmp/mlx-trace.log';
+  const journal = { turnJournal: '/tmp/mlx-1.turns', quarantined: new Set<string>() };
 
   it('never writes to the environment it was given', () => {
     const baseEnv: NodeJS.ProcessEnv = { PATH: '/usr/bin', HOME: '/Users/x' };
     const before = { ...baseEnv };
-    buildChildEnv({ baseEnv, enginePolicyEnv: { MLX_PAGED_PREFILL_CHUNK_SIZE: '2048' }, traceFile });
+    buildChildEnv({ baseEnv, enginePolicyEnv: { MLX_PAGED_PREFILL_CHUNK_SIZE: '2048' }, traceFile, ...journal });
     expect(baseEnv).toEqual(before);
   });
 
   it('leaves the real process.env alone', () => {
     const before = JSON.stringify(process.env);
-    buildChildEnv({ baseEnv: process.env, enginePolicyEnv: { MLX_PAGED_PREFILL_CHUNK_SIZE: '2048' }, traceFile });
+    buildChildEnv({
+      baseEnv: process.env,
+      enginePolicyEnv: { MLX_PAGED_PREFILL_CHUNK_SIZE: '2048' },
+      traceFile,
+      ...journal,
+    });
     expect(JSON.stringify(process.env)).toBe(before);
   });
 
@@ -273,6 +342,7 @@ describe('buildChildEnv', () => {
       baseEnv: { MLX_PAGED_PREFILL_CHUNK_SIZE: '512' },
       enginePolicyEnv: { MLX_PAGED_PREFILL_CHUNK_SIZE: '2048' },
       traceFile,
+      ...journal,
     });
     expect(env.MLX_PAGED_PREFILL_CHUNK_SIZE).toBe('512');
   });
@@ -282,6 +352,7 @@ describe('buildChildEnv', () => {
       baseEnv: { PATH: '/usr/bin' },
       enginePolicyEnv: { MLX_PAGED_PREFILL_CHUNK_SIZE: '2048' },
       traceFile,
+      ...journal,
     });
     expect(env).toMatchObject({ PATH: '/usr/bin', MLX_PAGED_PREFILL_CHUNK_SIZE: '2048' });
   });
@@ -292,6 +363,7 @@ describe('buildChildEnv', () => {
       enginePolicyEnv: {},
       overrides: { MLX_NODE_MODELS_DIR: '/picked-in-the-ui' },
       traceFile,
+      ...journal,
     });
     expect(env.MLX_NODE_MODELS_DIR).toBe('/picked-in-the-ui');
   });
@@ -306,9 +378,24 @@ describe('buildChildEnv', () => {
       enginePolicyEnv: {},
       overrides: { MLX_INFERENCE_TRACE: 'no', MLX_INFERENCE_TRACE_FILE: '/also/wrong.log' },
       traceFile,
+      ...journal,
     });
     expect(env.MLX_INFERENCE_TRACE).toBe('1');
     expect(env.MLX_INFERENCE_TRACE_FILE).toBe(traceFile);
+  });
+
+  // A shell value would hide the journal from MAIN or lift a quarantine.
+  it('forces the turn journal pair above the shell and overrides', () => {
+    const env = buildChildEnv({
+      baseEnv: { MLX_TURN_JOURNAL: '/elsewhere', MLX_QUARANTINED: '' },
+      enginePolicyEnv: {},
+      overrides: { MLX_TURN_JOURNAL: '/also/elsewhere' },
+      traceFile,
+      turnJournal: '/tmp/mlx-2.turns',
+      quarantined: new Set([fp('a'), fp('b')]),
+    });
+    expect(env.MLX_TURN_JOURNAL).toBe('/tmp/mlx-2.turns');
+    expect(env.MLX_QUARANTINED).toBe(`${fp('a')},${fp('b')}`);
   });
 
   // `fork({ env })` replaces the environment wholesale, so an undefined value
@@ -319,6 +406,7 @@ describe('buildChildEnv', () => {
       baseEnv: { PATH: '/usr/bin', EMPTY: undefined },
       enginePolicyEnv: {},
       traceFile,
+      ...journal,
     });
     expect('EMPTY' in env).toBe(false);
   });

@@ -14,6 +14,7 @@ import { ModelWorkCoordinator } from './model-work-coordinator.js';
 import type { ModelRegistry } from './registry.js';
 import { RerankService, type RerankServiceOptions } from './rerank-service.js';
 import { requestPathname, routeRequest } from './router.js';
+import type { TurnJournal } from './turn-journal.js';
 
 /**
  * Routes reachable WITHOUT a token when one is configured.
@@ -134,6 +135,8 @@ export interface HandlerOptions {
   health?: () => ServerHealth;
   /** See `ServerConfig.thinkingTokenBudget`. */
   thinkingTokenBudget?: number;
+  /** See `ServerConfig.turnJournal`. */
+  turnJournal?: TurnJournal;
   /** Serves `POST /v1/memory/release`; supplied by `createServer` when it can release the weights. */
   releaseMemory?: () => Promise<MemoryReleaseAnswer>;
 }
@@ -231,6 +234,7 @@ export function createHandler(
           audio,
           rerank,
           thinkingTokenBudget: options?.thinkingTokenBudget,
+          ...(options?.turnJournal !== undefined ? { turnJournal: options.turnJournal } : {}),
           ...(options?.releaseMemory !== undefined ? { releaseMemory: options.releaseMemory } : {}),
         },
       );

@@ -24,6 +24,7 @@ import {
   sendNotFound,
   sendRateLimit,
   sendStorageTimeout,
+  sendRequestQuarantined,
 } from '../errors.js';
 import type { IdleSweeper } from '../idle-sweeper.js';
 import { withAdmissionControlledInference } from '../inference-admission.js';
@@ -72,6 +73,7 @@ import {
   type TransportVisibility,
   writeFallbackErrorSSE,
 } from '../transport-visibility.js';
+import { QUARANTINE_MESSAGE, requestFingerprint, type TurnJournal } from '../turn-journal.js';
 import type { TracedChatConfig } from '../turn-trace.js';
 import type {
   FunctionCallOutputItem,
@@ -1641,6 +1643,7 @@ export async function handleCreateResponse(
   modelWorkCoordinator?: ModelWorkCoordinator,
   /** Lazy-load hook. See the call site below and `ServerConfig.resolveModel`. */
   resolveModel?: (name: string) => Promise<void>,
+  turnJournal?: TurnJournal,
 ): Promise<void> {
   if (modelWorkCoordinator) {
     registry.setModelLoadAdmissionCoordinator(modelWorkCoordinator);
@@ -2344,6 +2347,12 @@ export async function handleCreateResponse(
     // Stamp the requesting alias so the shared model wrapper attributes the
     // turn to the name the client used, not the binding's first registration.
     (config as TracedChatConfig).modelAlias = body.model;
+    const turnFingerprint = turnJournal === undefined ? null : requestFingerprint(body.model, messages, config);
+    // Splash `_admit`: refused before admission, never dispatched.
+    if (turnFingerprint !== null && turnJournal?.refuses(turnFingerprint) === true) {
+      sendRequestQuarantined(res, QUARANTINE_MESSAGE);
+      return;
+    }
 
     // New-only messages (what this request added). Instructions are
     // stored separately — persisting them as input messages would
@@ -2867,6 +2876,8 @@ export async function handleCreateResponse(
           // whether a terminal artefact already landed — both signals
           // are authoritative, unlike `res.headersSent`.
           const visibility = createVisibility();
+          // Splash `RuntimeCall.started`: journaled from dispatch to its end.
+          const endTurn = turnFingerprint === null ? null : (turnJournal?.begin(turnFingerprint) ?? null);
 
           try {
             const tier2Hit = previousResponseId == null && lookup.hit;
@@ -3576,6 +3587,7 @@ export async function handleCreateResponse(
               }
             }
           } finally {
+            endTurn?.();
             await disposeUnretainedSession();
             await sessionReg.flushPendingDisposals();
           }
