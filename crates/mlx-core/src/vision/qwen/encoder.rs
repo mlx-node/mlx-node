@@ -454,7 +454,7 @@ impl Clone for QwenVisionEncoder {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::nn::LayerNorm;
     use crate::vision::encoder::{BUILD_ATTENTION_MASK_CALLS, VisionMLP};
@@ -469,7 +469,7 @@ mod tests {
 
     /// Build a tiny encoder (small dims, `num_layers` transformer blocks, no
     /// spatial merge) sufficient to exercise a full `forward()` call.
-    fn tiny_encoder(num_layers: usize) -> QwenVisionEncoder {
+    pub(crate) fn tiny_encoder(num_layers: usize) -> QwenVisionEncoder {
         let hidden = 8i64;
         let heads = 2u32;
         let patch = 2i64;

@@ -311,6 +311,14 @@ impl HybridSchedulerBackend for Qwen35Inner {
         crate::models::qwen3_5::dflash2_turn::take_state_unit(self, key).is_some()
     }
 
+    fn rebuilt_bytes(&self) -> u64 {
+        crate::models::qwen3_5::dflash2_turn::rebuilt_bytes(self)
+    }
+
+    fn release_one_rebuilt(&mut self) -> bool {
+        crate::models::qwen3_5::dflash2_turn::release_one_rebuilt(self)
+    }
+
     /// Admission parks the idle live state first, as no scheduled sequence
     /// holds it; its own owner loop ran before.
     fn reclaim_kv(

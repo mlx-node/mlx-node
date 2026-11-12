@@ -378,9 +378,72 @@ impl VisionCacheInner {
         }
         eviction
     }
+
+    fn unheld(entry: &VisionFeatureCacheEntry) -> bool {
+        Arc::strong_count(&entry.features.handle) == 1
+    }
+
+    /// Bytes of the entries nothing outside the cache holds (Splash
+    /// `EmbeddingsPool`: the held entries are its floor).
+    pub(crate) fn unheld_bytes(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| Self::unheld(entry))
+            .map(|entry| entry.bytes)
+            .sum()
+    }
+
+    /// Drops the least recently used entry nothing outside the cache holds;
+    /// its bytes, `None` when every entry is held.
+    pub(crate) fn release_one_unheld(&mut self) -> Option<usize> {
+        let key = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| Self::unheld(entry))
+            .min_by_key(|(_, entry)| entry.lru_generation)
+            .map(|(key, _)| *key)?;
+        let entry = self.entries.remove(&key)?;
+        self.retained_bytes = self.retained_bytes.saturating_sub(entry.bytes);
+        Some(entry.bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&mut self, word: u64, features: MxArray, bytes: usize) {
+        let key = VisionFeatureCacheKey {
+            image_hash: engine::ImageCacheDigest::from_test_word(word),
+            grid_thw: [1, 1, 1],
+        };
+        self.insert(key, features, bytes, &HashSet::new(), usize::MAX);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 pub(crate) type VisionCache = Arc<Mutex<VisionCacheInner>>;
+
+/// [`VisionCacheInner::unheld_bytes`] of `cache`. While it is locked the
+/// bytes are unknown and read as `u64::MAX`: a count may over-count, never
+/// under-count.
+pub(crate) fn unheld_vision_bytes(cache: &VisionCache) -> u64 {
+    lock_now(cache).map_or(u64::MAX, |cache| cache.unheld_bytes() as u64)
+}
+
+/// [`VisionCacheInner::release_one_unheld`] of `cache`; false while it is
+/// locked or when nothing is unheld.
+pub(crate) fn release_one_unheld_vision(cache: &VisionCache) -> bool {
+    lock_now(cache).is_some_and(|mut cache| cache.release_one_unheld().is_some())
+}
+
+fn lock_now(cache: &VisionCache) -> Option<std::sync::MutexGuard<'_, VisionCacheInner>> {
+    match cache.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
 
 /// Image token ID used by Qwen3.5-VL
 
@@ -567,7 +630,9 @@ fn projected_vision_feature_bytes(
 /// encoder miss batches, embedding merge, and M-RoPE position computation.
 ///
 /// Returns (inputs_embeds, position_ids, rope_deltas) ready for the
-/// language model forward pass. Used by both dense and MoE VLM prefill.
+/// language model forward pass, and the request's image features: while the
+/// caller holds them no reclaim takes their entries. Used by both dense and
+/// MoE VLM prefill.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn vlm_prepare_vision_features(
     input_ids: &MxArray,
@@ -578,7 +643,7 @@ pub(crate) fn vlm_prepare_vision_features(
     text_model_embedding: &Embedding,
     generation_stream: Stream,
     vision_cache: &VisionCache,
-) -> Result<VisionMerge> {
+) -> Result<(VisionMerge, Vec<MxArray>)> {
     // Build the text-embedding graph once up front. The packed backend gathers
     // and dequantizes only the referenced rows; keeping this handle also gives
     // the vision cache planner the exact merge dtype without materializing the
@@ -991,6 +1056,7 @@ pub(crate) fn vlm_prepare_vision_features(
             })
         })
         .collect::<Result<_>>()?;
+    let held = ordered_features.clone();
     let vision_features = if ordered_features.len() == 1 {
         ordered_features.remove(0)
     } else {
@@ -1018,11 +1084,14 @@ pub(crate) fn vlm_prepare_vision_features(
         rope_deltas
     );
 
-    Ok(VisionMerge {
-        inputs_embeds,
-        position_ids,
-        rope_deltas,
-    })
+    Ok((
+        VisionMerge {
+            inputs_embeds,
+            position_ids,
+            rope_deltas,
+        },
+        held,
+    ))
 }
 
 #[cfg(test)]

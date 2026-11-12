@@ -348,3 +348,91 @@ fn memory_budget_saturates_extreme_geometry_without_overflow() {
     assert_eq!(budget.miss_batch_patch_budget, 0);
     assert!(budget.cache_budget_bytes <= VISION_CACHE_MAX_BYTES);
 }
+
+/// Generations 1 (a clone kept), 2 and 3: only the unshared entries count,
+/// and the oldest of them goes.
+/// Mutation: drop the `strong_count` test in `VisionCacheInner::unheld` →
+/// red (generation 1 counts and goes).
+#[test]
+fn release_one_unheld_takes_the_oldest_unshared_entry() {
+    let mut cache = VisionCacheInner::new();
+    let held = feature(1.0);
+    cache.insert_for_test(1, held.clone(), 10);
+    cache.insert_for_test(2, feature(2.0), 20);
+    cache.insert_for_test(3, feature(3.0), 40);
+    assert_eq!(cache.retained_bytes, 70);
+    assert_eq!(cache.unheld_bytes(), 60);
+    assert_eq!(cache.release_one_unheld(), Some(20));
+    assert_eq!(cache.retained_bytes, 50);
+    assert!(cache.entries.contains_key(&key(1, [1, 1, 1])));
+    assert!(!cache.entries.contains_key(&key(2, [1, 1, 1])));
+    assert_eq!(cache.release_one_unheld(), Some(40));
+    assert_eq!(cache.release_one_unheld(), None, "generation 1 is held");
+    drop(held);
+    assert_eq!(cache.unheld_bytes(), 10);
+}
+
+/// A locked cache's unheld bytes are unknown: the count reads them as
+/// covering, so a take is still tried.
+/// Mutation: read a locked cache as 0 in `unheld_vision_bytes` → red (0).
+#[test]
+fn a_locked_vision_cache_never_under_counts() {
+    let cache: VisionCache = Arc::new(Mutex::new(VisionCacheInner::new()));
+    cache.lock().unwrap().insert_for_test(1, feature(1.0), 10);
+    assert_eq!(unheld_vision_bytes(&cache), 10);
+    let guard = cache.lock().unwrap();
+    assert_eq!(unheld_vision_bytes(&cache), u64::MAX);
+    assert!(!release_one_unheld_vision(&cache));
+    drop(guard);
+    assert!(release_one_unheld_vision(&cache));
+}
+
+/// One 2×2-patch image through the tiny encoder: while the caller holds the
+/// returned features the entry is held; dropped, it is unheld.
+/// Mutation: return an empty `held` from `vlm_prepare_vision_features` →
+/// red (`unheld_bytes > 0` at once).
+#[cfg(target_os = "macos")]
+#[test]
+fn prepared_image_features_stay_held_until_dropped() {
+    use crate::models::paddleocr_vl::processing::ProcessedImages;
+    if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+        return;
+    }
+    let encoder = crate::vision::qwen::encoder::tests::tiny_encoder(1);
+    let (_, _, out_hidden) = encoder.memory_widths();
+    assert_eq!(out_hidden, 8);
+    let embedding = Embedding::new(IMAGE_TOKEN_ID as u32 + 1, 8).unwrap();
+    let pixels: Vec<f32> = (0..4 * 3 * 2 * 2).map(|i| i as f32 / 48.0).collect();
+    let pixel_values = MxArray::from_float32(&pixels, &[4, 3, 2, 2]).unwrap();
+    let grid = MxArray::from_int32(&[1, 2, 2], &[1, 3]).unwrap();
+    let processed = ProcessedImages::new(pixel_values, grid);
+    let image = IMAGE_TOKEN_ID as u32;
+    let tokens = [1, image, image, image, image, 2];
+    let input_ids = MxArray::from_uint32(&tokens, &[1, tokens.len() as i64]).unwrap();
+    let cache: VisionCache = Arc::new(Mutex::new(VisionCacheInner::new()));
+    let (merge, held) = vlm_prepare_vision_features(
+        &input_ids,
+        &[digest(7)],
+        &processed,
+        &encoder,
+        1,
+        &embedding,
+        Stream::generation(),
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(
+        held[0].shape().unwrap().as_ref(),
+        &[4, 8],
+        "4 patches, no merge"
+    );
+    merge.inputs_embeds.eval();
+    let retained = cache.lock().unwrap().retained_bytes;
+    assert!(retained > 0);
+    assert_eq!(unheld_vision_bytes(&cache), 0);
+    drop(held);
+    assert_eq!(unheld_vision_bytes(&cache), retained as u64);
+    assert!(release_one_unheld_vision(&cache));
+    assert_eq!(cache.lock().unwrap().retained_bytes, 0);
+}

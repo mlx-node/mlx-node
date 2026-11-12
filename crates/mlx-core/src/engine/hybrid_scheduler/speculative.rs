@@ -43,87 +43,59 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
     /// reclaims or preempts instead of the draft caches outgrowing memory.
     fn reserve_speculative_step(
         &mut self,
-        running: &[TurnState<ScheduledTurn<B::PrefixState>>],
+        running: &[Turn<B>],
         turn_index: usize,
         queries: usize,
     ) -> Result<bool> {
-        if !self
-            .inner
-            .reserve_scheduled_speculation(running[turn_index].seq_id, queries)?
-        {
+        let seq_id = running[turn_index].seq_id;
+        if let Some(adapter) = self.inner.paged_adapter() {
+            adapter.clear_draft_refusal(seq_id);
+        }
+        if !self.inner.reserve_scheduled_speculation(seq_id, queries)? {
             return Ok(false);
         }
-        self.draft_growth_fits(
+        self.draft_fits_or_refuse(
             running,
             turn_index,
             u32::try_from(queries).unwrap_or(u32::MAX),
         )
     }
 
-    /// Whether every running turn's off-pool state at this step (this
-    /// turn's at its `queries` rows), the idle owners' parked rows, and the
-    /// bookings not yet in the pool fit the bytes the pool may still hand
-    /// out after the step's target rows: free, reclaimable, and not yet
-    /// grown up to its max. State lives outside the pool, so target growth
-    /// never takes it out of those bytes and the pool never grows for it
-    /// (Splash grows only for KV pages, `KvPool::acquirePages`).
-    pub(super) fn draft_growth_fits(
+    /// Whether the step's off-pool state fits; a short fit is recorded for
+    /// the blocked step's reclaim (Splash `MemoryLedger::refused`).
+    pub(super) fn draft_fits_or_refuse(
         &self,
-        running: &[TurnState<ScheduledTurn<B::PrefixState>>],
+        running: &[Turn<B>],
         turn_index: usize,
         queries: u32,
     ) -> Result<bool> {
         let own = &running[turn_index];
-        if !self.inner.scheduler_books_on_demand()
-            || !own.recurrent_state_reservation_active
-            || own.payload.scheduled_speculation.is_none()
-        {
-            return Ok(true);
-        }
-        let Some(snapshot) = self.inner.scheduler_cache_snapshot()? else {
-            return Ok(true);
-        };
-        let need = running.iter().enumerate().fold(0u64, |sum, (index, turn)| {
-            let tokens = if index == turn_index {
-                turn.num_tokens.saturating_add(queries)
-            } else {
-                turn.num_tokens.saturating_add(turn.decode_draft_allowance)
-            };
-            sum.saturating_add(step_state_bytes(
-                &*self.inner,
-                turn,
-                tokens,
-                snapshot.bytes_per_block,
-            ))
-        });
-        let owned = running
+        let others: Vec<&Turn<B>> = running
             .iter()
-            .filter(|turn| {
-                turn.recurrent_state_reservation_active
-                    && self.inner.has_scheduled_recurrent(turn.seq_id)
-            })
-            .count() as u64;
-        let need = need.saturating_add(
-            self.inner
-                .scheduled_recurrent_bytes()
-                .saturating_sub(self.inner.recurrent_state_bytes().saturating_mul(owned)),
-        );
-        let ungrown = snapshot
-            .max_total_blocks
-            .saturating_sub(snapshot.blocks.total_blocks);
-        // The snapshot leaves marked chains out of what `allocate` may take;
-        // the draft fit is a byte estimate, not a reservation, so it counts
-        // them as before.
-        let marked = self
-            .inner
-            .paged_adapter()
-            .map_or(0, PagedKVCacheAdapter::marked_blocks);
-        let available = u64::from(snapshot.blocks.free_blocks)
-            .saturating_add(u64::from(snapshot.blocks.reclaimable_blocks))
-            .saturating_add(u64::from(marked))
-            .saturating_add(u64::from(ungrown))
-            .saturating_mul(snapshot.bytes_per_block);
-        Ok(need <= available)
+            .filter(|turn| turn.seq_id != own.seq_id)
+            .collect();
+        let bytes = draft_shortfall(&*self.inner, own, &others, queries)?;
+        if bytes > 0
+            && let Some(adapter) = self.inner.paged_adapter()
+        {
+            adapter.refuse_draft(own.seq_id, DraftRefusal { bytes, queries });
+        }
+        Ok(bytes == 0)
+    }
+
+    #[cfg(test)]
+    pub(super) fn draft_growth_fits(
+        &self,
+        running: &[Turn<B>],
+        turn_index: usize,
+        queries: u32,
+    ) -> Result<bool> {
+        let own = &running[turn_index];
+        let others: Vec<&Turn<B>> = running
+            .iter()
+            .filter(|turn| turn.seq_id != own.seq_id)
+            .collect();
+        Ok(draft_shortfall(&*self.inner, own, &others, queries)? == 0)
     }
 
     pub(super) fn execute_speculative_rows(
@@ -707,6 +679,71 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         }
         Ok((results, occupancy, greedy_occupancy))
     }
+}
+
+/// Bytes the off-pool state of `own` (at its `queries` rows) and of
+/// `others`, the idle owners' parked rows, and the bookings not yet in the
+/// pool lack of what the pool may still hand out after the step's target
+/// rows: free, reclaimable, marked and not yet grown up to its max; 0 when
+/// it fits. State lives outside the pool, so target growth never takes it
+/// out of those bytes and the pool never grows for it (Splash grows only
+/// for KV pages, `KvPool::acquirePages`).
+pub(super) fn draft_shortfall<B: HybridSchedulerBackend>(
+    inner: &B,
+    own: &Turn<B>,
+    others: &[&Turn<B>],
+    queries: u32,
+) -> Result<u64> {
+    if !inner.scheduler_books_on_demand()
+        || !own.recurrent_state_reservation_active
+        || own.payload.scheduled_speculation.is_none()
+    {
+        return Ok(0);
+    }
+    let Some(snapshot) = inner.scheduler_cache_snapshot()? else {
+        return Ok(0);
+    };
+    let need = std::iter::once((own, true))
+        .chain(others.iter().map(|turn| (*turn, false)))
+        .fold(0u64, |sum, (turn, is_own)| {
+            let tokens = if is_own {
+                turn.num_tokens.saturating_add(queries)
+            } else {
+                turn.num_tokens.saturating_add(turn.decode_draft_allowance)
+            };
+            sum.saturating_add(step_state_bytes(
+                inner,
+                turn,
+                tokens,
+                snapshot.bytes_per_block,
+            ))
+        });
+    let owned = std::iter::once(own)
+        .chain(others.iter().copied())
+        .filter(|turn| {
+            turn.recurrent_state_reservation_active && inner.has_scheduled_recurrent(turn.seq_id)
+        })
+        .count() as u64;
+    let need = need.saturating_add(
+        inner
+            .scheduled_recurrent_bytes()
+            .saturating_sub(inner.recurrent_state_bytes().saturating_mul(owned)),
+    );
+    let ungrown = snapshot
+        .max_total_blocks
+        .saturating_sub(snapshot.blocks.total_blocks);
+    // The snapshot leaves marked chains out of what `allocate` may take;
+    // the draft fit is a byte estimate, not a reservation, so it counts
+    // them as before.
+    let marked = inner
+        .paged_adapter()
+        .map_or(0, PagedKVCacheAdapter::marked_blocks);
+    let available = u64::from(snapshot.blocks.free_blocks)
+        .saturating_add(u64::from(snapshot.blocks.reclaimable_blocks))
+        .saturating_add(u64::from(marked))
+        .saturating_add(u64::from(ungrown))
+        .saturating_mul(snapshot.bytes_per_block);
+    Ok(need.saturating_sub(available))
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -1368,5 +1405,43 @@ pub(super) mod tests {
                 emitted_ms
             );
         }
+    }
+
+    /// A reserve whose draft fit falls short records it; the next reserve
+    /// of the same turn that fits leaves no record.
+    /// Mutation: drop the top `clear_draft_refusal` in
+    /// `reserve_speculative_step` → red (one record left).
+    #[test]
+    fn a_draft_reserve_that_passes_clears_its_refusal() {
+        use crate::engine::hybrid_scheduler::tests::{mtp_step_state_with, mtp_step_turn_with};
+        let Some((mut state, _)) = mtp_step_state_with(64, 64) else {
+            return;
+        };
+        let recurrent = state.inner.recurrent_state_bytes();
+        drop(mtp_step_turn_with(&mut state, 2, 40, false, 40, recurrent));
+        let charge = recurrent + state.inner.scheduled_draft_state_bytes(144);
+        let mut turn = mtp_step_turn_with(&mut state, 1, 128, true, 155, charge)
+            .with_block_reservation(9, 9, 16);
+        turn.num_computed_tokens = 154;
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .reserve_rows_for(1, 159)
+            .expect("window KV");
+        let running = std::slice::from_ref(&turn);
+        assert!(
+            !HybridStepExecutor::new(&mut state.inner)
+                .reserve_speculative_step(running, 0, 4)
+                .expect("short reserve")
+        );
+        state.inner.release_scheduled_recurrent_for(2);
+        assert!(
+            HybridStepExecutor::new(&mut state.inner)
+                .reserve_speculative_step(running, 0, 1)
+                .expect("reserve that fits")
+        );
+        let adapter = state.inner.paged_adapter().expect("paged adapter");
+        assert!(adapter.take_draft_refusals().is_empty());
     }
 }
