@@ -27,6 +27,7 @@ use crate::engine::governor::{is_gpu_out_of_memory, metal_out_of_memory};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::dflash2::{DFlash2ContextCache, DFlash2Model};
+use super::dflash2_state::disk;
 use super::dflash2_state::paged::{
     DFlash2States, PagedAnchor, PrefillYield, TurnStates, anchor_bytes,
 };
@@ -216,7 +217,10 @@ pub(crate) fn prepare_dflash2_turn(
 ) -> Result<crate::transformer::paged_kv_cache_adapter::PagedTurnPlan> {
     let total_budget = u32::try_from(plan.len()).unwrap_or(u32::MAX);
     let (skip_lookup, candidate) = match hit {
-        DFlash2Hit::Stored(depth) => (false, depth),
+        DFlash2Hit::Stored(depth) => {
+            adapter.arm_state_restore(depth);
+            (false, depth)
+        }
         DFlash2Hit::Cold => (true, 0),
     };
     let prepared = adapter
@@ -250,8 +254,10 @@ pub(crate) fn prepare_dflash2_turn(
 
 /// The deepest parked state a DFlash2 turn of `tokens` resumes from (Splash
 /// `StateCache::acquireDeepest`); `None` without reuse.
+/// A disk state whose chain cannot come back whole is discarded and the
+/// next deepest taken.
 pub(crate) fn parked_state_hit<T: DFlash2Target>(
-    target: &T,
+    target: &mut T,
     tokens: &[u32],
     reuse_cache: bool,
     cache_salt: u64,
@@ -259,10 +265,47 @@ pub(crate) fn parked_state_hit<T: DFlash2Target>(
     if !reuse_cache {
         return None;
     }
-    target
-        .dflash2_states()
-        .store
-        .lookup(Lineage::text(tokens, cache_salt))
+    for _ in 0..=target.dflash2_states().store.bytes().entries {
+        let hit = target
+            .dflash2_states()
+            .store
+            .lookup(Lineage::text(tokens, cache_salt))?;
+        if disk::restorable(&*target, hit.id) {
+            return Some(hit);
+        }
+        disk::discard_state(target, hit.id);
+    }
+    None
+}
+
+/// The deepest state on disk alone an autoregressive prime of `tokens`
+/// resumes on, at most `cap` deep: its chain comes back from the tier with
+/// the KV lookup. One whose chain cannot come back whole is discarded and
+/// the next deepest taken (Splash `pollRestores` → `discardState`).
+pub(crate) fn disk_state_depth<T: DFlash2Target>(
+    target: &mut T,
+    tokens: &[u32],
+    extra_keys: &[Vec<u64>],
+    cache_salt: u64,
+    cap: u32,
+) -> Option<u32> {
+    for _ in 0..=target.dflash2_states().store.bytes().entries {
+        let store = &target.dflash2_states().store;
+        let hit = store.lookup_within(
+            Lineage {
+                tokens,
+                extra_keys,
+                salt: cache_salt,
+            },
+            cap as usize,
+        )?;
+        store.get(hit.id).filter(|entry| entry.ram().is_none())?;
+        if disk::restorable(&*target, hit.id) {
+            return u32::try_from(hit.depth).ok();
+        }
+        disk::discard_state(target, hit.id);
+    }
+    None
 }
 
 /// The deepest stored state an autoregressive prime of `tokens` restores
@@ -270,31 +313,45 @@ pub(crate) fn parked_state_hit<T: DFlash2Target>(
 /// (the best ladder rung). Returns its id, depth and a deep copy of its GDN
 /// slots (Splash `QwenStateStorage::restore` with `restoreDraftState`
 /// false: a composite state serves a request that needs no draft).
+/// A state on disk alone gives its cell from its object (the window is
+/// read and dropped); one that does not read back is discarded and the
+/// next deepest taken.
 pub(crate) fn stored_gdn_prefix<T: DFlash2Target>(
-    target: &T,
+    target: &mut T,
     tokens: &[u32],
     extra_keys: &[Vec<u64>],
     cache_salt: u64,
     cached: u32,
     deeper_than: u32,
 ) -> Option<(EntryId, u32, Vec<super::layer_cache::Qwen3_5LayerCache>)> {
-    let store = &target.dflash2_states().store;
-    let hit = store.lookup_within(
-        Lineage {
-            tokens,
-            extra_keys,
-            salt: cache_salt,
-        },
-        cached as usize,
-    )?;
-    let depth = u32::try_from(hit.depth).ok()?;
-    if depth <= deeper_than {
-        return None;
+    for _ in 0..=target.dflash2_states().store.bytes().entries {
+        let store = &target.dflash2_states().store;
+        let hit = store.lookup_within(
+            Lineage {
+                tokens,
+                extra_keys,
+                salt: cache_salt,
+            },
+            cached as usize,
+        )?;
+        let depth = u32::try_from(hit.depth).ok()?;
+        if depth <= deeper_than {
+            return None;
+        }
+        let mut caches = target.fresh_layer_caches();
+        if let Some(anchor) = store.get(hit.id)?.ram() {
+            super::dflash2_state::paged::install_linear(&mut caches, &anchor.linear).ok()?;
+            return Some((hit.id, depth, caches));
+        }
+        match disk::read_state(target, hit.id, None) {
+            Some(linear) => {
+                super::dflash2_state::paged::adopt_linear(&mut caches, linear).ok()?;
+                return Some((hit.id, depth, caches));
+            }
+            None => disk::discard_state(target, hit.id),
+        }
     }
-    let entry = store.get(hit.id)?;
-    let mut caches = target.fresh_layer_caches();
-    super::dflash2_state::paged::install_linear(&mut caches, &entry.state().linear).ok()?;
-    Some((hit.id, depth, caches))
+    None
 }
 
 /// Installs parked state `id` into the lane, whose sequence holds no live
@@ -304,23 +361,32 @@ pub(crate) fn stored_gdn_prefix<T: DFlash2Target>(
 /// `restore_draft` the draft ring is projected again from the state's
 /// 4-bit window and the lane's window takes its rows; without it the ring
 /// starts empty at the state's depth (Splash `restoreLengths(.., false)`).
+/// A state on disk alone is read into the lane (Splash `beginRestore`: the
+/// window comes along either way) and waits for the admission to promote
+/// it; one that does not read back is discarded and `None` returned.
 /// Returns the resume depth. The caller holds the restore's claim.
 pub(crate) fn install_parked_state<T: DFlash2Target>(
     target: &mut T,
     id: EntryId,
     restore_draft: bool,
-) -> Result<u32> {
-    let (mark, depth) = {
+) -> Result<Option<u32>> {
+    let (mark, depth, on_disk, history) = {
         let entry = target
             .dflash2_states()
             .store
             .get(id)
             .ok_or_else(|| Error::from_reason(format!("DFlash2 parked state {id} is gone")))?;
-        (entry.mark(), entry.depth())
+        (
+            entry.mark(),
+            entry.depth(),
+            entry.ram().is_none(),
+            entry.tokens().to_vec(),
+        )
     };
-    if !target
-        .paged_adapter_ref()
-        .is_some_and(|adapter| adapter.prefix_cached(mark))
+    if !on_disk
+        && !target
+            .paged_adapter_ref()
+            .is_some_and(|adapter| adapter.prefix_cached(mark))
     {
         return Err(Error::from_reason(
             "DFlash2 state outlived its target KV block",
@@ -334,39 +400,59 @@ pub(crate) fn install_parked_state<T: DFlash2Target>(
         .clone();
     let idle = &mut target.dflash2_states_mut().idle_lane;
     let mut ring = idle.take_ring(&config);
-    let mut lane = if restore_draft {
+    let mut lane = if restore_draft || on_disk {
         Some(idle.take_window(&config)?)
     } else {
         None
     };
-    let history = {
-        let entry = target
+    if on_disk {
+        let Some(linear) = disk::read_state(target, id, lane.as_mut()) else {
+            let idle = &mut target.dflash2_states_mut().idle_lane;
+            idle.give_ring(Some(ring));
+            idle.give_window(lane);
+            disk::discard_state(target, id);
+            return Ok(None);
+        };
+        super::dflash2_state::paged::adopt_linear(&mut caches, linear)?;
+    } else {
+        let anchor = target
             .dflash2_states()
             .store
             .get(id)
-            .ok_or_else(|| Error::from_reason(format!("DFlash2 parked state {id} is gone")))?;
-        let draft = target
-            .dflash2()
-            .ok_or_else(|| Error::from_reason("DFlash2 state install without a draft"))?;
-        super::dflash2_state::paged::install_linear(&mut caches, &entry.state().linear)?;
-        let history = entry.tokens().to_vec();
+            .and_then(|entry| entry.ram())
+            .ok_or_else(|| Error::from_reason(format!("DFlash2 state {id} holds no RAM copy")))?;
+        super::dflash2_state::paged::install_linear(&mut caches, &anchor.linear)?;
         if let Some(lane) = lane.as_mut() {
-            let window = &entry.state().window;
-            ring = DFlash2ContextCache::restore(ring, draft, window, &history)?;
-            lane.copy_from(window)?;
-        } else {
+            lane.copy_from(&anchor.window)?;
+        }
+    }
+    let draft = target
+        .dflash2()
+        .ok_or_else(|| Error::from_reason("DFlash2 state install without a draft"))?;
+    match lane.as_ref().filter(|_| restore_draft) {
+        Some(window) => ring = DFlash2ContextCache::restore(ring, draft, window, &history)?,
+        None => {
             ring.reset();
             ring.record_only(&history)?;
         }
-        history
-    };
+    }
     target.adopt_parked_state(caches, ring, history);
     let states = target.dflash2_states_mut();
+    let (lane, kept) = if restore_draft {
+        (lane, None)
+    } else {
+        (None, lane)
+    };
     states.lane_window = lane;
+    if on_disk {
+        states.disk_read = Some(super::dflash2_state::paged::DiskRead { id, window: kept });
+    }
     states.store.touch(id);
     #[cfg(test)]
     SUSPEND_LOG.with(|log| log.borrow_mut().push(SuspendRecord::Restored { depth }));
-    u32::try_from(depth).map_err(|_| Error::from_reason("DFlash2 parked state depth overflow"))
+    u32::try_from(depth)
+        .map(Some)
+        .map_err(|_| Error::from_reason("DFlash2 parked state depth overflow"))
 }
 
 /// Splash `Engine::configureDraftStatePlan` for a turn of `tokens` that
@@ -526,7 +612,7 @@ fn plan_resume<T: DFlash2Target>(
     reuse_cache: bool,
     cache_salt: u64,
 ) -> Result<ResumePlan> {
-    let hit = parked_state_hit(&*target, tokens, reuse_cache, cache_salt);
+    let hit = parked_state_hit(target, tokens, reuse_cache, cache_salt);
     let resume = match hit {
         Some(hit) => u32::try_from(hit.depth)
             .map_err(|_| Error::from_reason("DFlash2 parked state depth overflow"))?,
@@ -564,11 +650,18 @@ fn plan_resume<T: DFlash2Target>(
     Ok(ResumePlan { hit, restore_draft })
 }
 
-/// What a restore claims for the lane (Splash `admitIdleLane`: the governor
-/// is asked only for what the idle lane lacks): the GDN cell, the ring
-/// bytes the idle ring lacks and, when the draft is rebuilt, a window when
-/// the idle lane holds none.
-fn restore_bytes<T: DFlash2Target>(target: &T, restore_draft: bool) -> u64 {
+/// What a restore of `id` claims for the lane (Splash `admitIdleLane`:
+/// the governor is asked only for what the idle lane lacks): the GDN cell,
+/// the ring bytes the idle ring lacks and, when the draft is rebuilt or
+/// the state is read from disk (the read takes the window along), a window
+/// when the idle lane holds none.
+fn restore_bytes<T: DFlash2Target>(target: &T, id: EntryId, restore_draft: bool) -> u64 {
+    let on_disk = target
+        .dflash2_states()
+        .store
+        .get(id)
+        .is_some_and(|entry| entry.ram().is_none());
+    let restore_draft = restore_draft || on_disk;
     let Some(draft) = target.dflash2() else {
         return 0;
     };
@@ -601,25 +694,103 @@ pub(crate) fn resolve_dflash2_resume<T: DFlash2Target>(
     let states = target.dflash2_states_mut();
     let lane = states.lane_window.take();
     states.idle_lane.give_window(lane);
+    if let Some(read) = states.disk_read.take() {
+        states.idle_lane.give_window(read.window);
+    }
     let prompt = u32::try_from(tokens.len())
         .map_err(|_| Error::from_reason("DFlash2 prompt exceeds u32 tokens"))?;
-    let resume = plan_resume(target, tokens, prompt, reuse_cache, cache_salt)?;
-    let Some(hit) = resume.hit else {
-        return Ok((DFlash2Hit::Cold, None));
-    };
-    let bytes = restore_bytes(&*target, resume.restore_draft);
-    let keep = Keep { tokens, keys: None };
-    let reservation = match claim_restore(target, bytes, keep)? {
-        StateClaim::Refused => {
-            reopen_cold(target, tokens, prompt)?;
+    // A disk state that does not read back is discarded and the lookup
+    // runs again (Splash: a failed restore discards the state, and the next
+    // attempt matches what remains).
+    for _ in 0..=target.dflash2_states().store.bytes().entries {
+        let resume = plan_resume(target, tokens, prompt, reuse_cache, cache_salt)?;
+        let Some(hit) = resume.hit else {
             return Ok((DFlash2Hit::Cold, None));
+        };
+        let bytes = restore_bytes(&*target, hit.id, resume.restore_draft);
+        let keep = Keep { tokens, keys: None };
+        let reservation = match claim_restore(target, bytes, keep)? {
+            StateClaim::Refused => {
+                reopen_cold(target, tokens, prompt)?;
+                return Ok((DFlash2Hit::Cold, None));
+            }
+            StateClaim::Unclaimed => None,
+            StateClaim::Reserved(reservation, _) => Some(reservation),
+        };
+        let depth = install_parked_state(target, hit.id, resume.restore_draft)?;
+        drop(reservation);
+        if let Some(depth) = depth {
+            return Ok((DFlash2Hit::Stored(depth), Some(hit.id)));
         }
-        StateClaim::Unclaimed => None,
-        StateClaim::Reserved(reservation, _) => Some(reservation),
+    }
+    reopen_cold(target, tokens, prompt)?;
+    Ok((DFlash2Hit::Cold, None))
+}
+
+/// Splash `Engine::pollRestores` once the lane's restore of a disk state
+/// is complete: the state turns resident again under an optional,
+/// immediate claim of its RAM copy (`promotedCopy`), the lane's GDN cell
+/// and window copied in; a refusal leaves it on disk. A restore whose KV
+/// did not come back discards the state.
+fn settle_disk_read<T: DFlash2Target>(target: &mut T, tokens: &[u32], resumed: Option<EntryId>) {
+    let Some(read) = target.dflash2_states_mut().disk_read.take() else {
+        return;
     };
-    let depth = install_parked_state(target, hit.id, resume.restore_draft)?;
-    drop(reservation);
-    Ok((DFlash2Hit::Stored(depth), Some(hit.id)))
+    if resumed != Some(read.id) {
+        disk::discard_state(target, read.id);
+    } else if let Some(bytes) = target
+        .dflash2_states()
+        .store
+        .get(read.id)
+        .filter(|entry| entry.ram().is_none())
+        .map(super::dflash2_state::store::Entry::resident_bytes)
+    {
+        let keep = Keep { tokens, keys: None };
+        let snapshot = |target: &mut T| -> Result<PagedAnchor> {
+            let window = match read.window.as_ref() {
+                Some(window) => window.snapshot()?,
+                None => target
+                    .dflash2_states()
+                    .lane_window
+                    .as_ref()
+                    .ok_or_else(|| Error::from_reason("a disk restore left no lane window"))?
+                    .snapshot()?,
+            };
+            Ok(PagedAnchor {
+                linear: target.snapshot_live_linear()?,
+                window,
+            })
+        };
+        let mut made = None;
+        let claim = claim_state(
+            target,
+            CaptureClass::Ordinary,
+            bytes,
+            keep,
+            Refusal::Settled,
+            |target, retry| {
+                if retry {
+                    return false;
+                }
+                made = snapshot(target).ok();
+                made.is_some()
+            },
+        );
+        let (anchor, reservation) = match claim {
+            StateClaim::Unclaimed => (snapshot(target).ok(), None),
+            StateClaim::Reserved(reservation, _) => (made.take(), Some(reservation)),
+            StateClaim::Refused => (None, None),
+        };
+        let promoted = anchor.is_some_and(|anchor| disk::promote(target, read.id, anchor));
+        drop(reservation);
+        if !promoted {
+            disk::promotion_skipped(target.dflash2_states_mut());
+        }
+    }
+    target
+        .dflash2_states_mut()
+        .idle_lane
+        .give_window(read.window);
 }
 
 /// Splash `Engine::completeAdmission` for a turn of `tokens` the prime put
@@ -647,6 +818,7 @@ pub(crate) fn admit_resumed<T: DFlash2Target>(
                 .get(id)
                 .is_some_and(|entry| entry.depth() == cached)
     });
+    settle_disk_read(target, tokens, resumed);
     let prompt = turn_prompt(&*target, tokens);
     let Some(id) = resumed else {
         return reopen_cold(target, tokens, prompt);
@@ -1122,7 +1294,7 @@ fn claim_restore<T: DFlash2Target>(
             return Err(Error::from_reason(resource_timeout(denial.failure)));
         }
         turn_wait.sync(&mut wait, now, epoch);
-        turn_wait.sleep(&wait, now);
+        turn_wait.wait_for_retry(target, &wait, now);
         run_control_pass(governor, model, true, target, keep);
     }
 }
@@ -1135,6 +1307,7 @@ pub(crate) fn reached<T: DFlash2Target>(
     row: u32,
     outcome: Reached<'_>,
 ) -> Result<()> {
+    super::dflash2_state::disk::tick(target, super::dflash2_state::disk::Tick::Poll);
     let Some(salt) = target
         .dflash2_states()
         .turn
@@ -1259,6 +1432,7 @@ fn publish_point<T: DFlash2Target>(
         target.dflash2_states_mut().use_replay_block(block);
     }
     let reused = stored.filter(|&id| target.dflash2_states_mut().store.reuse(id, checkpoint));
+    let depth = u32::try_from(lineage.len()).unwrap_or(u32::MAX);
     let id = match reused {
         Some(id) => {
             target
@@ -1277,31 +1451,60 @@ fn publish_point<T: DFlash2Target>(
                 failed(states);
                 return Ok(());
             }
-            let resident = turn
-                .latest_checkpoint
-                .is_some_and(|(id, _)| states.store.get(id).is_some());
+            // Splash `stateResident`: a checkpoint only on disk gives no
+            // buffers; it retires after the publication.
+            let resident = turn.latest_checkpoint.is_some_and(|(id, _)| {
+                states
+                    .store
+                    .get(id)
+                    .is_some_and(|entry| entry.ram().is_some())
+            });
             if !replay && resident {
                 retire_checkpoint(states, turn);
             }
-            let state = match outcome {
+            let (state, lane) = match outcome {
                 Reached::Captured(anchor, reservation, recycled) => {
-                    Some((anchor, reservation, recycled))
+                    (Some((anchor, reservation, recycled)), None)
                 }
-                Reached::FromLane(sink) => {
-                    from_lane(target, turn, sink, class, row, replay, resident)?
-                }
-                Reached::NoPoint | Reached::Refused => None,
-            };
-            let states = target.dflash2_states_mut();
-            let Some((anchor, reservation, recycled)) = state else {
-                failed(states);
-                return Ok(());
+                Reached::FromLane(sink) => (
+                    from_lane(target, turn, &mut *sink, class, row, replay, resident)?,
+                    Some(sink),
+                ),
+                Reached::Refused(sink) => (None, Some(sink)),
+                Reached::NoPoint => (None, None),
             };
             let class = if checkpoint {
                 StateClass::Checkpoint
             } else {
                 StateClass::Ordinary
             };
+            let Some((anchor, reservation, recycled)) = state else {
+                // No RAM copy takes the state: the tier takes it from the
+                // lane (Splash `publishStateToDisk` with `snapshotToDisk`).
+                let published = match lane {
+                    Some(sink) => {
+                        super::dflash2_state::disk::publish_from_lane(target, sink, text, class)?
+                    }
+                    None => None,
+                };
+                let states = target.dflash2_states_mut();
+                let Some(id) = published else {
+                    failed(states);
+                    return Ok(());
+                };
+                let counters = &mut states.counters;
+                counters.disk_state_publications += 1;
+                *(if checkpoint {
+                    &mut counters.checkpoint_publications
+                } else if replay {
+                    &mut counters.replay_state_publications
+                } else {
+                    &mut counters.junction_materializations
+                }) += 1;
+                finish_publication(target, turn, id, checkpoint, replay, depth);
+                return Ok(());
+            };
+            let states = target.dflash2_states_mut();
             match states.store.insert(text, anchor, class) {
                 Ok(Inserted { id, .. }) => {
                     drop(reservation);
@@ -1330,6 +1533,22 @@ fn publish_point<T: DFlash2Target>(
             }
         }
     };
+    finish_publication(target, turn, id, checkpoint, replay, depth);
+    Ok(())
+}
+
+/// After a point's publication (Splash `publishReachedStateBoundaries`):
+/// the lane's previous checkpoint retires, except at the replay point; an
+/// ordinary point joins the copies ahead.
+fn finish_publication<T: DFlash2Target>(
+    target: &mut T,
+    turn: &mut TurnStates,
+    id: EntryId,
+    checkpoint: bool,
+    replay: bool,
+    depth: u32,
+) {
+    let now = super::dflash2_state::disk::clock(&*target);
     let states = target.dflash2_states_mut();
     if !replay {
         retire_checkpoint(states, turn);
@@ -1339,7 +1558,9 @@ fn publish_point<T: DFlash2Target>(
     } else {
         None
     };
-    Ok(())
+    if !checkpoint {
+        super::dflash2_state::write_behind::published(states, id, depth, now);
+    }
 }
 
 /// Splash `publishReachedStateBoundaries`' `fromLane` arm: the state a
@@ -1408,7 +1629,7 @@ fn retire_checkpoint(states: &mut DFlash2States, turn: &mut TurnStates) -> bool 
         .store
         .get(id)
         .is_some_and(|entry| entry.checkpoint() && entry.publication() == publication)
-        && states.store.remove(id)
+        && super::dflash2_state::disk::erase(states, id)
     {
         states.counters.checkpoint_retirements += 1;
     }
@@ -1669,6 +1890,15 @@ impl crate::models::qwen3_5::paged_forward::PrefillTapSink for DraftTapSink<'_> 
         self.linear = Some((row, linear));
     }
 
+    fn write_lane_window(&mut self, row: usize, out: &mut [u8]) -> Result<Option<u32>> {
+        match self.lane.as_ref() {
+            Some(lane) if lane.end() as usize == row => {
+                Ok(lane.write_bytes(out)?.then(|| lane.begin()))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn snapshot_lane_window(&mut self, row: usize) -> Result<DraftContextWindow> {
         let lane = self
             .lane
@@ -1708,10 +1938,17 @@ fn note_lane_snapshot() {
 /// What a reclaim took, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GrowReclaim {
+    /// A state left with no copy, or its RAM copy beside a disk one.
     Store,
+    /// A state's RAM copy left through a staged write.
+    StoreWrite,
+    /// A disk state's chain was asked to the tier.
+    StoreChain,
     Ladder,
     History,
     Vision,
+    /// An idle owner's row and table.
+    Idle,
 }
 
 #[cfg(test)]
@@ -1743,7 +1980,7 @@ pub(crate) fn clear_grow_reclaim_log() {
     GROW_RECLAIM_LOG.with(|log| log.borrow_mut().clear());
 }
 
-fn log_reclaim(_taken: GrowReclaim) {
+pub(crate) fn log_reclaim(_taken: GrowReclaim) {
     #[cfg(test)]
     GROW_RECLAIM_LOG.with(|log| log.borrow_mut().push(_taken));
 }
@@ -1795,6 +2032,13 @@ fn turn_claim<T: DFlash2Target>(
     (governor, transient, claim, spec, model)
 }
 
+/// What is left of a retry interval of `seconds` that began at `started`
+/// on the governor's clock, at `now`: the state tier's wait already spent
+/// the rest.
+pub(crate) fn retry_left(seconds: f64, started: f64, now: f64) -> f64 {
+    (seconds - (now - started).max(0.0)).max(0.0)
+}
+
 /// A whole turn's claim while it waits (Splash `Engine::syncClaims` for
 /// that request): it holds what lands, or counts in the host's deficit,
 /// only while the wait lasts.
@@ -1819,9 +2063,19 @@ impl TurnWait<'_> {
         );
     }
 
-    /// Sleeps to the wait's retry time: the turn's claim waited.
-    fn sleep(&self, wait: &ResourceWait, now: f64) {
-        self.governor.sleep((wait.retry_at - now).max(0.0));
+    /// Waits to the wait's retry time: the turn's claim waited. The wait
+    /// moves an owed chain at the writer's pace, and a landing retries at
+    /// once (the epoch moved).
+    fn wait_for_retry<T: DFlash2Target>(&self, target: &mut T, wait: &ResourceWait, now: f64) {
+        let seconds = (wait.retry_at - now).max(0.0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds);
+        if !super::dflash2_state::disk::tick(
+            target,
+            super::dflash2_state::disk::Tick::Wait { deadline },
+        ) {
+            self.governor
+                .sleep(retry_left(seconds, now, self.governor.now()));
+        }
         crate::engine::governor::metrics::whole_turn_claim_waited(
             (self.governor.now() - now).max(0.0),
         );
@@ -1963,7 +2217,7 @@ pub(crate) fn claimed<T: DFlash2Target, R>(
             return Err(Error::from_reason(resource_timeout(denial.failure)));
         }
         turn_wait.sync(&mut wait, now, epoch);
-        turn_wait.sleep(&wait, now);
+        turn_wait.wait_for_retry(target, &wait, now);
         run_control_pass(governor, model, true, target, keep);
     }
 }
@@ -2374,7 +2628,7 @@ fn wait_and_resume<T: DFlash2Target>(
             return Err(Error::from_reason(resource_timeout(wait.failure)));
         }
         turn_wait.sync(wait, now, epoch);
-        turn_wait.sleep(wait, now);
+        turn_wait.wait_for_retry(target, wait, now);
         run_control_pass(governor, model, true, target, keep);
         if cancelled() {
             return Err(Error::from_reason(
@@ -2396,7 +2650,7 @@ fn wait_and_resume<T: DFlash2Target>(
                 match resume.hit {
                     None => Some(DFlash2Hit::Cold),
                     Some(hit) => {
-                        let bytes = restore_bytes(&*target, resume.restore_draft);
+                        let bytes = restore_bytes(&*target, hit.id, resume.restore_draft);
                         match restore_attempt(target, claim, spec, bytes, keep, wait.hold_ended) {
                             RestoreAttempt::Granted(reservation) => {
                                 let depth = u32::try_from(hit.depth).map_err(|_| {
@@ -2462,7 +2716,17 @@ fn wait_and_resume<T: DFlash2Target>(
                 });
                 if let Some((id, depth, restore_draft, reservation)) = restore {
                     if plan.cached_prefix_len == depth {
-                        install_parked_state(target, id, restore_draft)?;
+                        if install_parked_state(target, id, restore_draft)?.is_none() {
+                            // The state did not read back: it is gone, and the
+                            // next attempt matches what remains.
+                            if let Some(adapter) = target.paged_adapter_mut_ref() {
+                                adapter
+                                    .release_request_for(SERIAL_SEQ)
+                                    .map_err(Error::from_reason)?;
+                            }
+                            drop(reservation);
+                            continue;
+                        }
                         stored = Some(id);
                     }
                     drop(reservation);
@@ -2637,11 +2901,41 @@ pub(crate) fn state_status<T: DFlash2Target>(
         lazy_junctions: counters.lazy_junctions,
         checkpoint_evictions: counters.checkpoint_evictions,
         evictions: counters.evictions,
+        disk_state_publications: counters.disk_state_publications,
         ..Default::default()
     };
+    if let Some(disk) = states.disk.as_ref() {
+        use crate::engine::governor::governor::{DFlash2DiskStatus, DiskMode};
+        let behind = disk.write_behind.snapshot();
+        status.offloads = disk.counters.offloads;
+        status.offload_failures = disk.counters.offload_failures;
+        status.invalidations = disk.counters.invalidations;
+        status.disk_promotions = disk.counters.promotions;
+        status.disk_promotions_skipped = disk.counters.promotions_skipped;
+        status.disk = DFlash2DiskStatus {
+            mode: if !disk.tier.is_open() {
+                DiskMode::Off
+            } else if disk.tier.persistent {
+                DiskMode::Persistent
+            } else {
+                DiskMode::Temp
+            },
+            limit_bytes: disk.tier.limit,
+            held_bytes: disk.tier.held,
+            taken_back: disk.counters.adopted,
+            write_behind_waiting: u64::from(behind.waiting),
+            write_behind_durable: behind.durable,
+            write_behind_unneeded: behind.unneeded,
+            write_behind_refused: behind.refused,
+        };
+    }
     for entry in states.store.entries() {
         status.entries += 1;
         status.bytes += entry.state_bytes();
+        if let Some(copy) = entry.disk() {
+            status.disk_entries += 1;
+            status.disk_bytes += copy.bytes;
+        }
         if entry.checkpoint() {
             status.checkpoint_entries += 1;
             status.checkpoint_bytes += entry.state_bytes();
@@ -2666,6 +2960,10 @@ pub(crate) struct ModelUnits<'a, T: DFlash2Target> {
 impl<T: DFlash2Target> UnitSources for ModelUnits<'_, T> {
     fn sources(&mut self) -> Vec<&mut dyn VictimSource> {
         vec![self]
+    }
+
+    fn poll_landings(&mut self) {
+        super::dflash2_state::disk::tick(self.target, super::dflash2_state::disk::Tick::Poll);
     }
 }
 
@@ -2707,6 +3005,7 @@ pub(crate) fn model_units<T: DFlash2Target>(
                 bytes,
                 pages: 0,
                 stage: Stage::FreeNow,
+                later: false,
             });
         }
         // Splash `Cache::takeReclaim`: a device need takes the dead leaves
@@ -2724,6 +3023,7 @@ pub(crate) fn model_units<T: DFlash2Target>(
                     bytes,
                     pages: 0,
                     stage: Stage::FreeNow,
+                    later: false,
                 });
             }
         }
@@ -2734,26 +3034,51 @@ pub(crate) fn model_units<T: DFlash2Target>(
             .map(PagedKVCacheAdapter::block_size),
     );
     let state_bytes = |bytes: u64| if pages_only { 0 } else { bytes };
-    let stage = |in_use: bool| if in_use { Stage::InUse } else { Stage::FreeNow };
     // Every state, each with the block it marks and whether the claim's
     // prompt or a waiting one restores through it.
     let mut all: Vec<StateUnit> = Vec::new();
-    let store = &target.dflash2_states().store;
+    let states = target.dflash2_states();
+    let store = &states.store;
+    let writable = states
+        .disk
+        .as_ref()
+        .is_some_and(super::dflash2_state::disk::StateDisk::writable);
     for entry in store.entries() {
         let in_use = store.in_use(entry.mark());
+        let checkpoint = entry.checkpoint() && !in_use;
+        let (write, bytes, marks) = match (entry.ram(), entry.disk()) {
+            // Splash `StateCache::marks`: a disk state needs its chain as it
+            // is until the chain is on the tier too.
+            (None, Some(copy)) if copy.chain_owed => (Write::Chain, 0, true),
+            (None, _) => continue,
+            (Some(_), Some(copy)) if copy.landed => {
+                (Write::None, entry.state_bytes(), !copy.chain_owed)
+            }
+            (Some(_), Some(_)) => (Write::InFlight, entry.state_bytes(), false),
+            (Some(_), None) if writable => (Write::Needed, entry.state_bytes(), in_use),
+            (Some(_), None) => (Write::None, entry.state_bytes(), true),
+        };
+        let key = if write == Write::Chain {
+            UnitKey::StoreChain(entry.id())
+        } else {
+            UnitKey::Store(entry.id())
+        };
         all.push(StateUnit {
             unit: Victim {
-                key: UnitKey::Store(entry.id()),
+                key,
                 stamp: entry.last_used(),
-                bytes: state_bytes(entry.state_bytes()),
+                bytes: state_bytes(bytes),
                 pages: 0,
-                stage: stage(in_use),
+                stage: if in_use { Stage::InUse } else { Stage::FreeNow },
+                later: false,
             },
-            mark: Some(entry.mark()),
+            mark: marks.then(|| entry.mark()),
             kept: kept.keeps(entry.tokens(), Some(entry.chain())),
             wanted: wanted.keeps(entry.tokens()),
             ordinary: !entry.checkpoint(),
-            checkpoint: entry.checkpoint() && !in_use,
+            checkpoint,
+            write,
+            phase: Phase::Merged,
         });
     }
     for unit in target.gdn_state_units(keep, &wanted) {
@@ -2765,17 +3090,23 @@ pub(crate) fn model_units<T: DFlash2Target>(
                 stamp: unit.stamp,
                 bytes: state_bytes(unit.bytes),
                 pages: 0,
-                stage: stage(unit.in_use),
+                stage: if unit.in_use {
+                    Stage::InUse
+                } else {
+                    Stage::FreeNow
+                },
+                later: false,
             },
             mark: unit.mark,
             kept: unit.kept,
             wanted: unit.wanted,
+            write: Write::None,
+            phase: Phase::Merged,
         });
     }
     let resume_point = resume_point(&all);
     let reuse = query.rights.certain_reuse;
-    // States in take order, each with the block it marks.
-    let mut states: Vec<(Victim, Option<u64>, bool)> = all
+    let mut states: Vec<StateUnit> = all
         .into_iter()
         .filter(|state| {
             !state.kept
@@ -2783,45 +3114,142 @@ pub(crate) fn model_units<T: DFlash2Target>(
                 && (reuse != CertainReuse::None || resume_point.as_ref() != Some(&state.unit.key))
                 && !(pages_only && state.checkpoint)
         })
-        .map(|state| (state.unit, state.mark, state.checkpoint))
         .collect();
-    states.sort_by_key(|(unit, _, checkpoint)| (unit.stage, !*checkpoint, unit.stamp));
-    if !states_only && let Some(adapter) = target.paged_adapter_ref() {
-        let marked: Vec<usize> = (0..states.len())
-            .filter(|&index| states[index].1.is_some())
-            .collect();
-        let marks: Vec<u64> = marked.iter().filter_map(|&index| states[index].1).collect();
-        for (index, pages) in marked.into_iter().zip(adapter.freed_by_marks(&marks)) {
-            states[index].0.pages = pages;
+    // Splash `MemoryLedger::Order::stage` over `Cache::stateReclaim`: a
+    // state that needs a write, or whose copy lands later, goes after the
+    // units that free memory now; with no write in flight the first
+    // writable state of the walk is staged and frees at once, the others
+    // wait for the staging buffer (Splash `StateCache::reclaims`).
+    states.sort_by_key(|state| state.unit.stamp);
+    let busy = target
+        .dflash2_states()
+        .disk
+        .as_ref()
+        .is_some_and(super::dflash2_state::disk::StateDisk::writing);
+    let staged = (!busy)
+        .then(|| {
+            let writes = |in_use: bool, checkpoint: Option<bool>| {
+                states.iter().position(|state| {
+                    state.write == Write::Needed
+                        && (state.unit.stage == Stage::InUse) == in_use
+                        && checkpoint.is_none_or(|checkpoint| state.checkpoint == checkpoint)
+                })
+            };
+            writes(false, Some(true))
+                .or_else(|| writes(false, Some(false)))
+                .or_else(|| query.rights.in_use.then(|| writes(true, None)).flatten())
+        })
+        .flatten();
+    for (index, state) in states.iter_mut().enumerate() {
+        let later = match state.write {
+            Write::None => false,
+            Write::Needed => staged != Some(index),
+            Write::InFlight | Write::Chain => true,
+        };
+        if state.write != Write::None && state.unit.stage != Stage::InUse {
+            state.unit.stage = Stage::NeedsWrite;
         }
-    }
-    for (unit, _, checkpoint) in states {
-        if checkpoint {
-            runs.ahead.push(unit);
-        } else {
-            runs.merged.push(unit);
-        }
+        state.unit.later = later;
+        // In use: no write first, then the staged write, then the later
+        // ones (Splash `UsedNow`, `UsedWritten`, `UsedLater`).
+        state.phase = match (state.unit.stage, state.write) {
+            (Stage::InUse, Write::None) => Phase::InUse(0),
+            (Stage::InUse, _) if !state.unit.later => Phase::InUse(1),
+            (Stage::InUse, _) => Phase::InUse(2),
+            _ if state.checkpoint => Phase::Ahead,
+            _ => Phase::Merged,
+        };
     }
     // Splash `Cache::WalkCursor::Phase`: the dead leaves go after the
     // checkpoints, before any ordinary state.
-    runs.ahead.extend(dead_leaves);
+    let mut listed: Vec<(Victim, Option<u64>, Phase)> = Vec::new();
+    listed.extend(runs.ahead.drain(..).map(|unit| (unit, None, Phase::Ahead)));
+    listed.extend(
+        states
+            .iter()
+            .filter(|state| state.phase == Phase::Ahead)
+            .map(|state| (state.unit.clone(), state.mark, Phase::Ahead)),
+    );
+    listed.extend(dead_leaves.map(|unit| (unit, None, Phase::Ahead)));
+    listed.extend(
+        states
+            .iter()
+            .filter(|state| state.phase == Phase::Merged)
+            .map(|state| (state.unit.clone(), state.mark, Phase::Merged)),
+    );
     if !host_refused {
-        for (generation, bytes) in
+        let mut vision: Vec<Victim> =
             crate::vision::qwen::cache::unheld_vision_units(target.vision_cache())
-        {
-            runs.merged.push(Victim {
-                key: UnitKey::Vision(generation),
-                stamp: generation,
-                bytes,
-                pages: 0,
-                stage: Stage::Rebuild,
-            });
+                .into_iter()
+                .map(|(generation, bytes)| Victim {
+                    key: UnitKey::Vision(generation),
+                    stamp: generation,
+                    bytes,
+                    pages: 0,
+                    stage: Stage::Rebuild,
+                    later: false,
+                })
+                .collect();
+        vision.sort_by_key(|unit| unit.stamp);
+        listed.extend(vision.into_iter().map(|unit| (unit, None, Phase::After)));
+    }
+    for group in 0..3 {
+        listed.extend(
+            states
+                .iter()
+                .filter(|state| state.phase == Phase::InUse(group))
+                .map(|state| (state.unit.clone(), state.mark, Phase::After)),
+        );
+    }
+    listed.retain(|(unit, mark, _)| unit.bytes > 0 || unit.pages > 0 || mark.is_some());
+    // The blocks each take hands back, counted in the take order.
+    listed.sort_by_key(|(unit, _, _)| (unit.stage, unit.later));
+    if !states_only && let Some(adapter) = target.paged_adapter_ref() {
+        let marked: Vec<usize> = (0..listed.len())
+            .filter(|&index| listed[index].1.is_some())
+            .collect();
+        let marks: Vec<u64> = marked.iter().filter_map(|&index| listed[index].1).collect();
+        for (index, pages) in marked.into_iter().zip(adapter.freed_by_marks(&marks)) {
+            listed[index].0.pages = pages;
         }
     }
-    runs.ahead.retain(|unit| unit.bytes > 0 || unit.pages > 0);
-    runs.merged.retain(|unit| unit.bytes > 0 || unit.pages > 0);
-    runs.merged.sort_by_key(|unit| (unit.stage, unit.stamp));
+    for (unit, _, phase) in listed {
+        if unit.bytes == 0 && unit.pages == 0 {
+            continue;
+        }
+        match phase {
+            Phase::Ahead => runs.ahead.push(unit),
+            Phase::Merged => runs.merged.push(unit),
+            Phase::InUse(_) | Phase::After => runs.after.push(unit),
+        }
+    }
     runs
+}
+
+/// What a state's take writes (Splash `Cache::stateReclaim`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Write {
+    /// None: it goes, or its RAM copy does beside a landed disk copy.
+    None,
+    /// Its RAM copy leaves through a write.
+    Needed,
+    /// Its copy is in flight: it frees its RAM once that lands.
+    InFlight,
+    /// A disk-only state whose chain blocks are still to be written.
+    Chain,
+}
+
+/// Where a unit sits in the phase order the ledger's stable sort keeps
+/// within each stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    /// Extents, checkpoints no turn uses, dead leaves.
+    Ahead,
+    /// Stamp order, into which the scheduler merges its idle owners.
+    Merged,
+    /// Image features, then the states turns use.
+    After,
+    InUse(u8),
 }
 
 fn wanted_chains<T: DFlash2Target>(target: &T) -> Arc<WantedChains> {
@@ -2859,6 +3287,8 @@ struct StateUnit {
     ordinary: bool,
     /// A stored checkpoint no turn uses (Splash `Phase::Checkpoints`).
     checkpoint: bool,
+    write: Write,
+    phase: Phase,
 }
 
 /// Splash `StateCache::resumePoint`: the newest state no turn uses, an
@@ -2918,7 +3348,16 @@ pub(crate) fn take_model_unit<T: DFlash2Target>(
             }
             released
         }
-        key => take_state_unit(target, key),
+        key => match take_state_unit(target, key) {
+            StateTake::Took => true,
+            StateTake::Nothing => false,
+            StateTake::Pending => {
+                return LedgerTaken {
+                    outcome: FreeOutcome::Pending,
+                    ..LedgerTaken::default()
+                };
+            }
+        },
     };
     let freed = active.saturating_sub(crate::array::memory::active_memory_bytes());
     let now_bytes = freed.saturating_add(pool_bytes);
@@ -2940,6 +3379,7 @@ pub(crate) fn take_model_unit<T: DFlash2Target>(
 
 /// Drops parked state `id` and re-syncs the marks, so its chain becomes
 /// dead leaves (Splash `StateCache::evict` frees no page itself).
+#[cfg(test)]
 pub(crate) fn drop_parked_state<T: DFlash2Target>(target: &mut T, id: EntryId) -> bool {
     let states = target.dflash2_states_mut();
     if !states.store.remove(id) {
@@ -2949,8 +3389,18 @@ pub(crate) fn drop_parked_state<T: DFlash2Target>(target: &mut T, id: EntryId) -
     true
 }
 
-/// Takes one state unit; false when it freed nothing.
-pub(crate) fn take_state_unit<T: DFlash2Target>(target: &mut T, key: &UnitKey) -> bool {
+/// What one state unit's take did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StateTake {
+    Took,
+    /// It frees nothing until a write in flight lands.
+    Pending,
+    Nothing,
+}
+
+/// Takes one state unit.
+pub(crate) fn take_state_unit<T: DFlash2Target>(target: &mut T, key: &UnitKey) -> StateTake {
+    use super::dflash2_state::disk::{Reclaimed, reclaim};
     match key {
         UnitKey::Store(id) => {
             let checkpoint = target
@@ -2958,30 +3408,56 @@ pub(crate) fn take_state_unit<T: DFlash2Target>(target: &mut T, key: &UnitKey) -
                 .store
                 .get(*id)
                 .is_some_and(|entry| entry.checkpoint());
-            let dropped = drop_parked_state(target, *id);
-            if dropped {
-                log_reclaim(GrowReclaim::Store);
-                let counters = &mut target.dflash2_states_mut().counters;
-                if checkpoint {
-                    counters.checkpoint_evictions += 1;
-                } else {
-                    counters.evictions += 1;
+            match reclaim(target, *id) {
+                Reclaimed::Written => {
+                    log_reclaim(GrowReclaim::StoreWrite);
+                    StateTake::Took
                 }
+                Reclaimed::RamDropped => {
+                    log_reclaim(GrowReclaim::Store);
+                    StateTake::Took
+                }
+                Reclaimed::Erased => {
+                    log_reclaim(GrowReclaim::Store);
+                    let counters = &mut target.dflash2_states_mut().counters;
+                    if checkpoint {
+                        counters.checkpoint_evictions += 1;
+                    } else {
+                        counters.evictions += 1;
+                    }
+                    StateTake::Took
+                }
+                Reclaimed::Pending => StateTake::Pending,
+                Reclaimed::Nothing => StateTake::Nothing,
             }
-            dropped
+        }
+        // The chain's pages free once its copies land: the writer takes
+        // what its queue holds now.
+        UnitKey::StoreChain(_) => {
+            log_reclaim(GrowReclaim::StoreChain);
+            super::dflash2_state::disk::tick(
+                target,
+                super::dflash2_state::disk::Tick::Wait {
+                    deadline: std::time::Instant::now(),
+                },
+            );
+            StateTake::Pending
         }
         UnitKey::Ladder { .. } | UnitKey::History => {
             let dropped = target.drop_gdn_state(key);
-            if dropped {
-                log_reclaim(if matches!(key, UnitKey::History) {
-                    GrowReclaim::History
-                } else {
-                    GrowReclaim::Ladder
-                });
+            if !dropped {
+                return StateTake::Nothing;
             }
-            dropped
+            log_reclaim(if matches!(key, UnitKey::History) {
+                GrowReclaim::History
+            } else {
+                GrowReclaim::Ladder
+            });
+            StateTake::Took
         }
-        UnitKey::Owner(_) | UnitKey::Extent | UnitKey::DeadLeaves | UnitKey::Vision(_) => false,
+        UnitKey::Owner(_) | UnitKey::Extent | UnitKey::DeadLeaves | UnitKey::Vision(_) => {
+            StateTake::Nothing
+        }
     }
 }
 
@@ -2990,6 +3466,17 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    /// A claim's retry sleeps only what the state tier's wait left of its
+    /// interval, on the governor's clock: a wait that spent 80 ms of 100
+    /// sleeps 20, one that spent it all sleeps none.
+    /// Mutation RS2 (the whole interval is slept again) → red.
+    #[test]
+    fn a_retry_sleeps_what_the_tier_wait_left() {
+        assert!((retry_left(0.1, 5.0, 5.08) - 0.02).abs() < 1e-9);
+        assert_eq!(retry_left(0.1, 5.0, 5.2), 0.0);
+        assert_eq!(retry_left(0.1, 5.0, 5.0), 0.1);
+    }
 
     /// A kept prompt protects only the points its lookup can restore, its
     /// last token left out: a point at its own end is not kept, keyed or
@@ -3100,7 +3587,7 @@ mod tests {
             crate::transformer::paged_kv_cache_adapter::ColdTierContext {
                 manager: Arc::clone(manager),
                 fingerprint,
-                sidecar_policy: None,
+                backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::KvOnly,
             }
         };
         let Some(mut source) = growable_adapter(8, 8, BLOCK) else {

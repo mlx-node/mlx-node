@@ -800,7 +800,7 @@ pub(super) fn gemma4_sliding_retention_caps(
 /// scheduler publisher and finalizer use the same predicate so a turn without
 /// a SlidingWindow sidecar never retains state that cannot be restored.
 pub(super) fn gemma4_sliding_cold_ladder_wanted(cold: Option<&ColdTierContext>) -> bool {
-    cold.and_then(|cold| cold.sidecar_policy.as_ref())
+    cold.and_then(|cold| cold.sidecar_policy())
         .is_some_and(|policy| policy.group() == mlx_paged_attn::ColdGroup::SlidingWindow)
 }
 

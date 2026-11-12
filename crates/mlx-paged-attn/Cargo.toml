@@ -13,6 +13,7 @@ crate-type = ["rlib"]
 mlx-sys.workspace = true
 libc.workspace = true
 safetensors = "0.8"
+serde_json.workspace = true
 sha2 = "0.11"
 
 [target.'cfg(unix)'.dependencies]

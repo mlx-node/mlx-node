@@ -263,6 +263,12 @@ interface ModelFamilyDataBase {
    */
   readonly acceptsDecodeShare?: true;
   /**
+   * Native `load` accepts `LoadModelOptions.cacheDisk`, `persistentCache` and
+   * `cacheDir` (`--max-cache-disk`, `--persistent-cache`, `--cache-dir`): its
+   * DFlash2 states get an SSD tier (Splash `openDiskTier`).
+   */
+  readonly acceptsCacheDisk?: true;
+  /**
    * Native `load` accepts a matching auxiliary HF checkpoint directory — the
    * original checkpoint supplying qwen4_exp's MTP and vision weights that a
    * GGUF omits. Gates `LoadModelOptions.auxiliaryModelPath` in
@@ -448,7 +454,7 @@ export const MODEL_FAMILY_DATA = [
     acceptsMaxMemory: true,
     acceptsMaxContext: true,
     acceptsDecodeShare: true,
-    coldRestoreEligible: true,
+    acceptsCacheDisk: true,
     streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen35'],
     ggufDiscovery: { variants: 'qwen35-xl', split: true },
@@ -470,7 +476,7 @@ export const MODEL_FAMILY_DATA = [
     acceptsMaxMemory: true,
     acceptsMaxContext: true,
     acceptsDecodeShare: true,
-    coldRestoreEligible: true,
+    acceptsCacheDisk: true,
     streamOpts: { recordModelPath: true },
     traits: { reasoning: true, fallbackContextWindow: 262144 },
     launchPreset: {

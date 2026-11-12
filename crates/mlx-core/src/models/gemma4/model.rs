@@ -387,9 +387,8 @@ const BYTES_PER_MIB: u64 = 1024 * 1024;
 /// Spacing of the cold-sidecar anchor rungs, as a multiple of the paged block
 /// size: `block_size * RATIO^k`, ascending.
 ///
-/// Anchored at ZERO, not at the prompt end — this is the one place gemma4 must
-/// differ from qwen3.5's `gdn_prefill_checkpoint_boundaries`, which walks
-/// `deepest / 4^k` DOWN from the prompt. A rung's cold key is the block chain
+/// Anchored at ZERO, not at the prompt end (a ladder walking `deepest / 4^k`
+/// DOWN from the prompt). A rung's cold key is the block chain
 /// over `tokens[0..b]`, so a grid pinned to 0 makes the SAME sidecar object
 /// reusable by every later turn (and every later process) whose prompt shares
 /// that prefix. A prompt-anchored ladder would land on 112/496/2032 for one
@@ -399,7 +398,7 @@ const BYTES_PER_MIB: u64 = 1024 * 1024;
 const GEMMA4_SLIDING_ANCHOR_RATIO: u32 = 4;
 
 /// How many anchor rungs a ladder may hold, before the byte budget below
-/// trims it further. Mirrors `GDN_CHECKPOINT_LADDER_RUNGS`.
+/// trims it further.
 ///
 /// With `block_size = 16` this is `{64, 256, 1024, 4096}` — two rungs BELOW
 /// gemma4's 1024-token window (where a payload is `min(b, window)` rows and so

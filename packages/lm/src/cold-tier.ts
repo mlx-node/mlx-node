@@ -47,33 +47,19 @@ import { MODEL_FAMILY_DATA } from './family-data.js';
  *    restores every sliding group at the same exact boundary, atomically.
  *  - `muse_glimmer` uses the same hybrid contract for its 13 full-attention
  *    and 39 sliding-attention layers.
- *  - `qwen3_5` (dense) sizes its pool over the full-attention layers only, but
- *    persists its out-of-pool GDN recurrent state (conv + recurrent) as a
- *    `ColdGroup::GdnState` sidecar, and its `ColdSidecarPolicy` reconciles the
- *    native restore down to the deepest block-aligned boundary a validated
- *    sidecar backs (a recurrent state is valid only at its exact prefix length).
- *  - `qwen3_5_moe` keeps the SAME GDN recurrent state outside the pool — same
- *    shapes, same dtype, same layer mapping — so it shares the dense family's
- *    sidecar codec and `ColdSidecarPolicy` verbatim. Its restart-parity gate has
- *    since been run on `Qwen3.6-35B-A3B-mxfp4-mlx`: the restore reconciled
- *    onto ladder rung 304 of `[16, 64, 304, 1248]` with `hits=42` and
- *    `corruptions=0`, and the text matched a no-persist baseline.
  *  - `lfm2` / `lfm2_moe` keep ShortConv state outside the full-attention pool.
  *    A `ColdGroup::ConvState` sidecar persists that state at the same exact
  *    boundary; missing or malformed state reconciles down or restarts at zero.
+ *
+ * `qwen3_5` / `qwen3_5_moe` are not in it: like Splash, their SSD tier holds
+ * DFlash2 states, not per-turn KV, so a KV chain alone never backs a prefix.
  *
  * Widening this set is a correctness decision, never a perf one, and it is
  * authorized by exactly one thing: the family's native restart-parity gate
  * passing on real weights with `hits > 0` and `corruptions == 0`.
  *
- * The `mlx agent --no-persist-cache` flag applies to EVERY family in this
- * set, not to one of them: it is a SINGLE process-wide boolean handed to
- * every allowlisted load. Families off the allowlist are handed no policy
- * at all — not because the flag spares them, but because
- * `cold_tier::resolve_persist_cold` refuses to persist them under ANY
- * setting. The help text says so in exactly one place, built from
- * {@link coldTierRestoreFamilyList} in `packages/cli/src/commands/agent/index.ts`
- * and asserted by `packages/cli/__test__/agent-cmd.test.ts`.
+ * Families off the allowlist never persist: `cold_tier::resolve_persist_cold`
+ * refuses them under ANY setting.
  */
 export const COLD_TIER_RESTORE_FAMILIES: ReadonlySet<string> = new Set<ModelType>(
   MODEL_FAMILY_DATA.filter((row) => 'coldRestoreEligible' in row).map((row) => row.id),

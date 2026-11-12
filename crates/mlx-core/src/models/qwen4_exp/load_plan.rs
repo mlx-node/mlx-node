@@ -240,6 +240,7 @@ pub(super) fn plan_engine(
         active_bytes: live.active_bytes,
         other_pool_bytes: live.registered_pool_bytes,
         staging_bytes: 0,
+        state_staging_bytes: 0,
         draft_weights_bytes: 0,
         held_back_bytes: held_back,
         margin: crate::engine::memory_plan::Margin::Unguarded,

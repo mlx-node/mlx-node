@@ -1703,6 +1703,17 @@ export declare class Qwen35Model {
    */
   saveModel(savePath: string): Promise<undefined>;
   /**
+   * Closes the model's SSD cache at a clean stop (Splash
+   * `closePersistentCache`): a persistent cache first writes every
+   * restore point still waiting, newest first, until `deadlineMs`
+   * (milliseconds on `Date.now()`'s clock, so models closed in turn
+   * share one deadline); a temporary cache is removed. The cache takes no
+   * write afterwards. Resolves false when something missed the deadline.
+   *
+   * Dispatches to model thread.
+   */
+  closeCache(deadlineMs: number): Promise<boolean>;
+  /**
    * Frees the weights, caches and state now: the model thread drops them
    * and exits; every later call fails.
    */
@@ -1872,6 +1883,17 @@ export declare class Qwen35MoeModel {
    * Dispatches to model thread.
    */
   saveModel(savePath: string): Promise<undefined>;
+  /**
+   * Closes the model's SSD cache at a clean stop (Splash
+   * `closePersistentCache`): a persistent cache first writes every
+   * restore point still waiting, newest first, until `deadlineMs`
+   * (milliseconds on `Date.now()`'s clock, so models closed in turn
+   * share one deadline); a temporary cache is removed. The cache takes no
+   * write afterwards. Resolves false when something missed the deadline.
+   *
+   * Dispatches to model thread.
+   */
+  closeCache(deadlineMs: number): Promise<boolean>;
   /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
   schedulerStats(): Promise<SchedulerStats>;
   /**
@@ -3263,9 +3285,9 @@ export interface CleanupStats {
  * or `timeout_ms` elapses. Returns `true` when the drain completed — or when
  * the tier was never opened (nothing to flush) — and `false` on timeout.
  *
- * Called from the agent's one-shot (`mlx agent -p`) shutdown so a prompt's
- * just-persisted prefix blocks reach the drive before the process exits,
- * rather than being abandoned in the write queue.
+ * Called from the host's close after every loaded model's own cache closed,
+ * so the other families' just-persisted prefix blocks reach the drive before
+ * the process exits, rather than being abandoned in the write queue.
  *
  * The payload flush is `fsync(2)`, not `F_FULLFSYNC`: a drained block
  * survives process death and kernel panic, but a sudden power loss can leave
@@ -4731,6 +4753,20 @@ export interface MemoryGovernorCounters {
 }
 
 /**
+ * The SSD tier of the models' DFlash2 states (Splash `/status` `disk`):
+ * `persistent`, `temp` or `off` (the most lasting over the models), its
+ * limit and the bytes of the caches nobody holds under its root, the
+ * states taken back at load, and the write-behind.
+ */
+export interface MemoryGovernorDFlash2Disk {
+  mode: string;
+  limitBytes: number;
+  heldBytes: number;
+  takenBack: number;
+  writeBehind: MemoryGovernorWriteBehind;
+}
+
+/**
  * The DFlash2 states of the registered models, summed (Splash `Engine`
  * state counters, `lazyJunctions`, and the state cache's snapshot).
  */
@@ -4752,6 +4788,15 @@ export interface MemoryGovernorDFlash2States {
   checkpointEntries: number;
   checkpointBytes: number;
   inUse: number;
+  diskEntries: number;
+  diskBytes: number;
+  offloads: number;
+  offloadFailures: number;
+  invalidations: number;
+  diskPromotions: number;
+  diskPromotionsSkipped: number;
+  diskStatePublications: number;
+  disk: MemoryGovernorDFlash2Disk;
 }
 
 export interface MemoryGovernorGapCause {
@@ -4874,6 +4919,14 @@ export interface MemoryGovernorTtftParts {
   claimWait: number;
   decode: number;
   otherPrefill: number;
+}
+
+/** Splash `WriteBehindSnapshot`. */
+export interface MemoryGovernorWriteBehind {
+  waiting: number;
+  durable: number;
+  unneeded: number;
+  refused: number;
 }
 
 export interface MemorySnapshot {
@@ -5370,13 +5423,6 @@ export interface Qwen35Config {
    */
   pagedBlockSize?: number | undefined;
   /**
-   * Persist the out-of-pool GDN recurrent state (and the paged KV blocks it
-   * gates) to the SSD cold tier so warm prefixes survive process restarts.
-   * Off unless explicitly enabled. See `crate::models::qwen3_5::gdn_sidecar`
-   * and `crate::cold_tier::resolve_persist_cold`.
-   */
-  persistPagedCache?: boolean | undefined;
-  /**
    * Number of MTP (Multi-Token Prediction) head layers shipped with the
    * checkpoint. Populated from `mtp_num_hidden_layers` /
    * `num_nextn_predict_layers` in `config.json`. `0` means the
@@ -5482,6 +5528,22 @@ export interface Qwen35LoadOptions {
    * default 0.5; 0 alternates one prefill unit with one decode step.
    */
   decodeShare?: number;
+  /**
+   * SSD cache for a DFlash2 load's states (`--max-cache-disk`): `'auto'`
+   * (the default: up to 32 GiB, a quarter of the volume's room), a byte
+   * count, or `'0'` (off).
+   */
+  cacheDisk?: string;
+  /**
+   * Keep the SSD cache across restarts (`--persistent-cache`) in a
+   * directory of the model's own under `cacheDir`.
+   */
+  persistentCache?: boolean;
+  /**
+   * The persistent cache's root (`--cache-dir`), default
+   * `~/.mlx-node/cache/prefix-cache`; needs `persistentCache`.
+   */
+  cacheDir?: string;
 }
 
 /**
@@ -5529,14 +5591,6 @@ export interface Qwen35MoeConfig {
    * Default: 16.
    */
   pagedBlockSize?: number | undefined;
-  /**
-   * Persist the out-of-pool GDN recurrent state (and the paged KV blocks it
-   * gates) to the SSD cold tier so warm prefixes survive process restarts.
-   * Off unless explicitly enabled. Shares the dense qwen3_5 GDN sidecar codec
-   * (`crate::models::qwen3_5::gdn_sidecar`) via `to_dense_config`; the
-   * precedence rules live in `crate::cold_tier::resolve_persist_cold`.
-   */
-  persistPagedCache?: boolean | undefined;
   /**
    * Number of MTP (Multi-Token Prediction) head layers shipped with
    * the checkpoint. Populated from `mtp_num_hidden_layers` /
@@ -6210,6 +6264,13 @@ export interface StoredResponseRecord {
   configJson?: string;
   expiresAt?: number;
 }
+
+/**
+ * Removes the temporary SSD caches a crashed process left in the temp
+ * directory: every published one whose lock nobody holds. Returns how many
+ * went.
+ */
+export declare function sweepCacheLeftovers(): number;
 
 /** A table structure */
 export interface Table {

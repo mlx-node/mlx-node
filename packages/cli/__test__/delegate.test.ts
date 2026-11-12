@@ -201,9 +201,9 @@ describe('delegate agent arguments', () => {
   );
 
   it('treats tokens after -- as literal prompt text', () => {
-    const args = delegateAgentArgs(['github', '--repo', 'owner/repo', '--', '--model', '--repo', '--no-persist-cache']);
+    const args = delegateAgentArgs(['github', '--repo', 'owner/repo', '--', '--model', '--repo', '--persistent-cache']);
     expect(args).not.toContain('--');
-    expect(args[args.indexOf('-p') + 1]).toBe('--model --repo --no-persist-cache');
+    expect(args[args.indexOf('-p') + 1]).toBe('--model --repo --persistent-cache');
     expect(args[args.indexOf('--append-system-prompt') + 1]).toContain('GitHub repository: owner/repo.');
   });
 

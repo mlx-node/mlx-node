@@ -300,6 +300,21 @@ describe('createHealthReporter', () => {
     checkpointEntries: 0,
     checkpointBytes: 0,
     inUse: 0,
+    diskEntries: 0,
+    diskBytes: 0,
+    offloads: 0,
+    offloadFailures: 0,
+    invalidations: 0,
+    diskPromotions: 0,
+    diskPromotionsSkipped: 0,
+    diskStatePublications: 0,
+    disk: {
+      mode: 'off',
+      limitBytes: 0,
+      heldBytes: 0,
+      takenBack: 0,
+      writeBehind: { waiting: 0, durable: 0, unneeded: 0, refused: 0 },
+    },
   };
 
   // Mutation TS3: copy `memory_governor` into the minimal body → red.
@@ -349,7 +364,15 @@ describe('createHealthReporter', () => {
       decodeGapMs: { p50: 1, p99: 2, max: 600 },
       decisions: ['Memory: start claim needs 1.0 MiB: short'],
       scheduler: [],
-      dflash2States: { ...noStates, checkpointPublications: 5, lazyJunctions: 1, checkpointBytes: 64 },
+      dflash2States: {
+        ...noStates,
+        checkpointPublications: 5,
+        lazyJunctions: 1,
+        checkpointBytes: 64,
+        offloads: 2,
+        diskEntries: 1,
+        disk: { ...noStates.disk, mode: 'persistent', limitBytes: 1024, takenBack: 3 },
+      },
     };
     const governor = toMemoryGovernorHealth(status);
     const health = createHealthReporter({ registry: new ModelRegistry(), memoryGovernor: () => governor })();
@@ -366,7 +389,15 @@ describe('createHealthReporter', () => {
       decode_gap_causes: { prefill_unit: { gaps: 1, ms: 600 }, prefill_ms: 200 },
       decode_gap_ms: { max: 600 },
       owed: { bytes: 0 },
-      dflash2_states: { checkpoint_publications: 5, lazy_junctions: 1, checkpoint_bytes: 64, in_use: 0 },
+      dflash2_states: {
+        checkpoint_publications: 5,
+        lazy_junctions: 1,
+        checkpoint_bytes: 64,
+        in_use: 0,
+        offloads: 2,
+        disk_entries: 1,
+        disk: { mode: 'persistent', limit_bytes: 1024, taken_back: { states: 3 }, write_behind: { durable: 0 } },
+      },
     });
     expect(toMinimalHealth(health)).not.toHaveProperty('memory_governor');
     const none = createHealthReporter({ registry: new ModelRegistry(), memoryGovernor: () => null })();

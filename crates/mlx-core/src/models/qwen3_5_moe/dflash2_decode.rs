@@ -1477,6 +1477,92 @@ mod paged_dflash2_tests {
         Ok(())
     }
 
+    /// The MoE model's `closeCache` command at a clean stop, its deadline in
+    /// milliseconds on `Date.now()`'s clock: a persistent tier writes the
+    /// waiting point with its chain before that deadline and reports it.
+    /// Mutation CC1 (the deadline is read as now) → red.
+    #[test]
+    fn moe_close_cache_command_flushes_by_its_deadline() -> Result<()> {
+        use crate::engine::model_command::FamilyCommand;
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{
+            attach_tier, persistent_test_tier, writable_anchor,
+        };
+        use crate::models::qwen3_5::dflash2_state::store::{Lineage, StateClass};
+        use crate::models::qwen3_5::dflash2_state::write_behind::{MINIMUM_TOKENS, published};
+        use crate::models::qwen3_5::dflash2_turn::DFlash2Target;
+        use crate::models::qwen3_5_moe::model::Qwen35MoeFamilyCommand;
+        let _ctx = StreamContext::new(Stream::generation());
+        let tier = persistent_test_tier("s13-moe-close-command", 1 << 30);
+        let mut inner = tiny_paged_int8_moe_dflash_inner(0x5_8260);
+        let dense = DFlash2Target::dense_config(&inner).into_owned();
+        let window = inner
+            .dflash2
+            .as_ref()
+            .expect("draft")
+            .config
+            .context_window()?;
+        attach_tier(
+            &mut inner.dflash2_states,
+            &dense,
+            inner.paged_adapter.as_ref().expect("pool"),
+            &tier,
+            window.nbytes(),
+            window.slots(),
+        );
+        let adapter = inner.paged_adapter.as_ref().expect("pool");
+        let block_size = adapter.block_size();
+        let blocks = MINIMUM_TOKENS.div_ceil(block_size);
+        let tokens: Vec<u32> = (0..blocks * block_size)
+            .map(|i| (i * 3 + 1) % VOCAB)
+            .collect();
+        {
+            let mut allocator = adapter.allocator().lock().expect("allocator");
+            let held: Vec<_> = (0..blocks)
+                .map(|_| allocator.allocate().expect("a block for the chain"))
+                .collect();
+            allocator
+                .cache_full_blocks_with_keys(
+                    &tokens,
+                    &held,
+                    block_size,
+                    mlx_paged_attn::PrefixKeys::Uniform(&[]),
+                    0,
+                )
+                .expect("cache the chain");
+            for block in held {
+                allocator.free(block);
+            }
+        }
+        let anchor = writable_anchor(&dense, window);
+        let p = inner
+            .dflash2_states
+            .store
+            .insert(Lineage::text(&tokens, 0), anchor, StateClass::Ordinary)
+            .expect("a whole-block state")
+            .id;
+        inner.sync_gdn_state_marks();
+        published(&mut inner.dflash2_states, p, blocks * block_size, 0.0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+            * 1000.0;
+        let (reply, mut flushed) = tokio::sync::oneshot::channel();
+        Qwen35MoeFamilyCommand::CloseCache {
+            deadline_ms: now_ms + 6000.0,
+            reply,
+        }
+        .execute(&mut inner);
+        assert!(flushed.try_recv().expect("a reply")?);
+        let copy = inner
+            .dflash2_states
+            .store
+            .get(p)
+            .and_then(|entry| entry.disk().copied());
+        assert!(copy.is_some_and(|copy| copy.landed && !copy.chain_owed));
+        Ok(())
+    }
+
     /// Splash `Engine::vacateLane` on a MoE DFlash2 turn: the host refuses
     /// the tapped prefill's chunk after 64 of a 100-token prompt, then (a
     /// second run) a verify once the lane fed 113. Each time the lane is

@@ -46,8 +46,7 @@ use crate::models::qwen3_5::decoder_layer::DecoderLayer;
 use crate::models::qwen3_5::dflash2_state::trace::{DropKind, PrefixTracker, reset_drop_site};
 #[cfg(test)]
 use crate::models::qwen3_5::gdn_checkpoint_store::{
-    GDN_PREFIX_CHECKPOINTS_PER_OWNER, GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER,
-    compute_paged_prefix_block_hash,
+    GDN_PREFIX_CHECKPOINTS_PER_OWNER, compute_paged_prefix_block_hash,
 };
 use crate::models::qwen3_5::gdn_checkpoint_store::{
     GdnCheckpointLineage, compute_paged_prefix_block_hashes,
@@ -183,6 +182,8 @@ pub(crate) struct Qwen35Inner {
     pub(crate) memory_registration: Option<crate::engine::governor::governor::ModelGuard<'static>>,
     /// `--max-memory`: it only lowers the automatic hard budget.
     pub(crate) max_memory_bytes: Option<u64>,
+    /// The load's SSD tier options; a model built without a load keeps none.
+    pub(crate) disk_options: crate::disk_tier::DiskTierOptions,
     /// `--max-context`: the context every turn may hold, at most the plan's.
     pub(crate) max_context: Option<u32>,
     /// `--decode-share` (Splash `EngineConfig::decodeShare`).
@@ -215,18 +216,6 @@ pub(crate) struct Qwen35Inner {
     gdn_root_cache_owner_id: Option<String>,
     gdn_root_cache_owner_is_explicit: bool,
     gdn_prefix_checkpoints: VecDeque<DenseGdnPrefixCheckpoint>,
-    /// Per scheduled sequence (`None` = the serial lane), the ladder rungs
-    /// the governor refused RAM for this turn: the deepest, and the deepest
-    /// within the reach predicted for the turn's K/V capture walk
-    /// ([`crate::models::qwen3_5::gdn_checkpoint_store::hold_refused_rung`]).
-    /// They go to the cold tier only (Splash `publishStateToDisk`): the
-    /// sequence's sidecar capture reads them, and its turn's end drops them,
-    /// so a refused host holds at most two extra states per live sequence.
-    /// Keyed by sequence, not `active_cache_owner_id`: the scheduler sets that
-    /// only at admission, so under overlap it names the last admitted owner,
-    /// while each prefill slice and turn end activates its own sequence (one
-    /// per owner).
-    gdn_unclaimed_rungs: HashMap<Option<SeqId>, Vec<DenseGdnPrefixCheckpoint>>,
     gdn_last_history_checkpoint: Option<DenseGdnHistoryCheckpoint>,
     /// The replay point each running turn restored from (Splash
     /// `StateCache::useState`): no reclaim unit until its use ends.
@@ -405,6 +394,28 @@ pub struct Qwen35LoadOptions {
     /// generate (`--decode-share`, Splash's): nonnegative and finite,
     /// default 0.5; 0 alternates one prefill unit with one decode step.
     pub decode_share: Option<f64>,
+    /// SSD cache for a DFlash2 load's states (`--max-cache-disk`): `'auto'`
+    /// (the default: up to 32 GiB, a quarter of the volume's room), a byte
+    /// count, or `'0'` (off).
+    pub cache_disk: Option<String>,
+    /// Keep the SSD cache across restarts (`--persistent-cache`) in a
+    /// directory of the model's own under `cacheDir`.
+    pub persistent_cache: Option<bool>,
+    /// The persistent cache's root (`--cache-dir`), default
+    /// `~/.mlx-node/cache/prefix-cache`; needs `persistentCache`.
+    pub cache_dir: Option<String>,
+}
+
+impl Qwen35LoadOptions {
+    /// The SSD tier these options ask for.
+    pub(crate) fn disk_tier(&self, label: &str) -> Result<crate::disk_tier::DiskTierOptions> {
+        crate::disk_tier::DiskTierOptions::from_load(
+            self.cache_disk.as_deref(),
+            self.persistent_cache,
+            self.cache_dir.clone(),
+        )
+        .map_err(|message| Error::from_reason(format!("{label} load: {message}")))
+    }
 }
 
 /// Trained and physically available active-context limits for one loaded
@@ -612,6 +623,7 @@ impl Qwen3_5Model {
     #[napi]
     pub async fn load(path: String, options: Option<Qwen35LoadOptions>) -> Result<Qwen3_5Model> {
         let options = options.unwrap_or_default();
+        let disk = options.disk_tier("Qwen3.5")?;
         let draft_model_path = options.draft_model_path;
         // Rejected here, before any weight is touched.
         let kv_format = options
@@ -642,6 +654,7 @@ impl Qwen3_5Model {
             max_memory_bytes,
             max_context,
             decode_share,
+            disk,
         )
         .await;
         if loaded.is_err() {
@@ -795,6 +808,32 @@ impl Qwen3_5Model {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.thread.send(Qwen35FamilyCommand::SaveModel {
             save_path,
+            reply: tx,
+        })?;
+        let promise = env.spawn_future(async move {
+            rx.await
+                .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
+        })?;
+        Ok(promise)
+    }
+
+    /// Closes the model's SSD cache at a clean stop (Splash
+    /// `closePersistentCache`): a persistent cache first writes every
+    /// restore point still waiting, newest first, until `deadlineMs`
+    /// (milliseconds on `Date.now()`'s clock, so models closed in turn
+    /// share one deadline); a temporary cache is removed. The cache takes no
+    /// write afterwards. Resolves false when something missed the deadline.
+    ///
+    /// Dispatches to model thread.
+    #[napi]
+    pub fn close_cache<'env>(
+        &self,
+        env: &'env Env,
+        deadline_ms: f64,
+    ) -> Result<PromiseRaw<'env, bool>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.thread.send(Qwen35FamilyCommand::CloseCache {
+            deadline_ms,
             reply: tx,
         })?;
         let promise = env.spawn_future(async move {

@@ -67,6 +67,12 @@ impl DraftContextWindow {
         self.width
     }
 
+    /// The rows the window holds at most.
+    #[cfg(test)]
+    pub(crate) fn slots(&self) -> u32 {
+        self.slots
+    }
+
     /// Empties the window at `row` (a capture span with `reset`).
     pub(crate) fn restart(&mut self, row: u32) {
         self.begin = row;
@@ -226,6 +232,36 @@ impl DraftContextWindow {
     /// Materializes the buffer, so its bytes are real storage.
     pub(crate) fn eval(&self) -> Result<()> {
         MxArray::eval_arrays_with_context(&[&self.buffer], "draft_context_window")
+    }
+
+    /// Copies the window's bytes into `out`; false unless `out` is exactly
+    /// [`Self::nbytes`] long.
+    pub(crate) fn write_bytes(&self, out: &mut [u8]) -> Result<bool> {
+        if out.len() as u64 != self.nbytes() {
+            return Ok(false);
+        }
+        let bytes = self.buffer.to_uint8()?;
+        if bytes.len() != out.len() {
+            return Ok(false);
+        }
+        out.copy_from_slice(&bytes);
+        Ok(true)
+    }
+
+    /// Takes the rows `[begin, end)` [`Self::write_bytes`] wrote into `bytes`
+    /// (Splash `beginRestore` reads a disk state's window into the lane's);
+    /// false unless `bytes` is exactly [`Self::nbytes`] long and the rows
+    /// fit the slots.
+    pub(crate) fn read_bytes(&mut self, bytes: &[u8], begin: u32, end: u32) -> Result<bool> {
+        if bytes.len() as u64 != self.nbytes() || begin > end || end - begin > self.slots {
+            return Ok(false);
+        }
+        let buffer = MxArray::from_uint8(bytes, &[bytes.len() as i64])?;
+        MxArray::eval_arrays_with_context(&[&buffer], "draft_context_read")?;
+        self.buffer = buffer;
+        self.begin = begin;
+        self.end = end;
+        Ok(true)
     }
 
     pub(crate) fn collect_arrays<'a>(&'a self, out: &mut Vec<&'a MxArray>) {

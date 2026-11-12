@@ -22,9 +22,9 @@ describe('delegate shares agent startup', () => {
     ['Summarize this project'],
     ['--reasoning-effort', 'high', '--output-format', 'json', 'Task'],
     ['--resume', 'existing-session', 'Continue'],
-    ['--models-dir', '/other/models', '--model', 'local', '--no-persist-cache', 'Task'],
+    ['--models-dir', '/other/models', '--model', 'local', '--persistent-cache', 'Task'],
     ['--tools', 'read_file,run_terminal_command', '--plugin-dir', './plugin', 'Task'],
-    ['--', '--model', '--no-persist-cache'],
+    ['--', '--model', '--persistent-cache'],
   ])('shares agent runtime configuration apart from the worker profile for %j', async (...args) => {
     const agent = fixture();
     const delegate = fixture();

@@ -10,12 +10,8 @@
 //! | # | persist | prompt | role |
 //! |---|---------|--------|------|
 //! | 1 | on  | `prompt` | fresh prefill; captures full paged blocks to the tier on finalize |
-//! | 2 | on  | `restore_prompt` | fresh model = process-restart stand-in; MUST restore from disk |
-//! | 3 | off | `restore_prompt` | never attaches a `ColdTierContext`; clean fresh-prefill baseline |
-//!
-//! [`ColdTierParitySpec::restore_prompt`] defaults to `None`, in which case it
-//! IS `prompt` and all three instances run the same text — the original
-//! behaviour, unchanged for every family that does not set it.
+//! | 2 | on  | `prompt` | fresh model = process-restart stand-in; MUST restore from disk |
+//! | 3 | off | `prompt` | never attaches a `ColdTierContext`; clean fresh-prefill baseline |
 //!
 //! Instances 1 and 2 load from the SAME on-disk clone so their cold-tier
 //! fingerprints — parsed config bytes, a full per-shard weight-content digest,
@@ -39,18 +35,7 @@
 //!    work is defending against, so it is asserted, not merely logged.
 //! 3. **Parity.** `text` is byte-for-byte equal across all three instances and
 //!    `num_tokens` matches, under greedy/no-penalty decode so any divergence is
-//!    attributable to the cache backend rather than sampling noise. In
-//!    `restore_prompt` mode instance 1 answers a different question, so the
-//!    comparison narrows to 2-vs-3 — a turn that reconciled down onto a
-//!    mid-ladder boundary must produce the same bytes as a clean prefill of the
-//!    same prompt.
-//! 4. **The restore anchored SHALLOW.** `restore_prompt` mode only. The restore
-//!    landed on a checkpoint rung strictly shallower than the capture prompt's
-//!    deepest one. Without this the gate is satisfied by an implementation that
-//!    publishes exactly ONE boundary at the prompt's end — which is what the
-//!    checkpoint ladder replaced, and what a run on a ~90-token prompt cannot
-//!    tell apart from a ladder, because one turn's chain already reaches the
-//!    prompt's end. See [`ColdTierParitySpec::restore_prompt`].
+//!    attributable to the cache backend rather than sampling noise.
 //!
 //! # Process-global constraints
 //!
@@ -121,124 +106,6 @@ pub const DEFAULT_PROMPT: &str = "Please explain, in a few clear sentences, how 
     process restart, and what tradeoffs an engineer should weigh when choosing the \
     block size for such a cache.";
 
-/// Capture-side prompt for a family that wants the ladder gate — the prompt
-/// instance 1 (and every warm-up turn) runs.
-///
-/// Long on purpose. The blindness this exists to fix is a length problem:
-/// [`DEFAULT_PROMPT`] is ~90 tokens, whose whole ladder is `[16, 80]`, and one
-/// turn's chain reach (~8 blocks = 128 tokens) already covers the deepest rung,
-/// so the restore always anchors at the prompt's end and the shallow rungs are
-/// never touched.
-///
-/// MEASURED on `qwen3.5-0.8b-mlx-bf16`, not estimated: 1259 tokens after the
-/// chat template, ladder `[16, 64, 304, 1248]`, deepest rung 78 blocks in —
-/// far past anything a bounded writer queue drains in a handful of turns. The
-/// observed run anchors the restore at 304 (rung 3 of 4). Tokenizers differ
-/// between families, so treat that as the shape, not a constant; every
-/// assertion reads the runtime `prompt_tokens` rather than any number here.
-pub fn ladder_capture_prompt() -> &'static str {
-    ladder_prompt("Ultimately, weigh the checksum cost against the eviction policy")
-}
-
-/// Restore-side prompt — byte-identical body, different closing question.
-///
-/// The two token streams agree for a long prefix and then part. That
-/// divergence is a HARD ceiling on how deep `kv_chain_upper_bound` can
-/// reconcile (it breaks at the first block key not on disk), independent of how
-/// fast the writer queue drained during capture. So the restore is forced onto
-/// a rung below the divergence no matter what the machine's I/O did — which is
-/// what makes the shallow-rung assertion kill the "one boundary at the prompt's
-/// end" implementation unconditionally, rather than only on a slow disk.
-pub fn ladder_restore_prompt() -> &'static str {
-    ladder_prompt("Separately, rank the restore latency below the block size")
-}
-
-/// A fixed 15-note body plus a closing `tail`, leaked to `'static` because
-/// [`ColdTierParitySpec::prompt`] is a `&'static str`.
-///
-/// Lives here rather than in each family's test file so dense and MoE cannot
-/// drift into two differently-sized fixtures making two different claims. The
-/// notes are numbered so the text is not a degenerate repetition, which would
-/// make the block-chain identity uninteresting.
-///
-/// `tail` is the ONLY thing that differs between the two prompts, and the two
-/// tails differ from their FIRST word, so the divergence sits exactly at the
-/// tail boundary rather than smeared past it.
-///
-/// The load-bearing sizing requirement is not the tail's own length but what
-/// follows it: the shared closing sentence after `tail` must be at least two
-/// paged blocks long, so `kv_chain_upper_bound` — which breaks at the first
-/// block key not on disk — is capped strictly BELOW the capture prompt's
-/// deepest rung. That is what forces the restore onto a shallow rung no matter
-/// how fast the writer queue drained. If it ever shrinks, assertion 1b's
-/// `cached_tokens < deepest` check starts firing as a "FIXTURE problem" on a
-/// healthy build. `harness_tests::the_two_ladder_prompts_diverge_at_least_two_
-/// blocks_before_the_end` pins that margin offline, in milliseconds, so nobody
-/// discovers it from a 20-minute GPU gate.
-pub fn ladder_prompt(tail: &str) -> &'static str {
-    let mut prompt =
-        String::from("Answer with a single short paragraph. First, read these notes.\n\n");
-    for index in 1..=15 {
-        prompt.push_str(&format!(
-            "Note {index}: when a block-paged key-value cache persists warm prefixes to local \
-             solid-state storage, the engineer reviewing revision {index} must weigh the block \
-             size, the eviction policy, the checksum cost, the durability barrier each object \
-             pays, and the exact boundary at which any out-of-pool recurrent or sliding-window \
-             state can be resumed soundly rather than guessed from a deeper snapshot.\n",
-        ));
-    }
-    prompt.push('\n');
-    prompt.push_str(tail);
-    prompt.push_str(
-        ", then say which of the two a reviewer should treat as the binding constraint on a \
-         machine whose storage barrier dominates, and explain the reasoning in one sentence \
-         that a reader with no cache background could follow without further context.",
-    );
-    Box::leak(prompt.into_boxed_str())
-}
-
-/// Ascending checkpoint boundaries a cold-start prefill of `prompt_tokens`
-/// publishes, restated from
-/// `qwen3_5::paged_forward::gdn_prefill_checkpoint_boundaries` with
-/// `cached_prefix_len = 0`.
-///
-/// A COPY, not a call, for two reasons. `paged_forward` is `pub(crate)` and out
-/// of reach from an integration test — and more importantly, a gate that
-/// imported the constants it exists to pin would move with the bug: collapsing
-/// `GDN_CHECKPOINT_LADDER_RUNGS` to 1 would collapse the expectation too and
-/// the assertion would still pass.
-///
-/// Warm-up and capture turns that reuse a prefix publish
-/// `gdn_prefill_checkpoint_boundaries(L, cached, bs)`, which starts from the
-/// same deepest rung and truncates earlier (`next <= cached_prefix_len`
-/// breaks) — a suffix subset of this list. So every boundary any turn on this
-/// prompt could have anchored a sidecar at is a member of what this returns.
-fn expected_checkpoint_ladder(prompt_tokens: u32, block_size: u32) -> Vec<u32> {
-    const LADDER_RATIO: u32 = 4;
-    const LADDER_RUNGS: u32 = 4;
-    if block_size == 0 || prompt_tokens == 0 {
-        return Vec::new();
-    }
-    // `gdn_checkpoint_target`: the largest full block strictly before the end
-    // of the prompt, mirroring production's `prompt.len() - 1` reuse cap.
-    let deepest = (prompt_tokens - 1) / block_size * block_size;
-    if deepest == 0 {
-        return Vec::new();
-    }
-    let mut rungs = Vec::with_capacity(LADDER_RUNGS as usize);
-    let mut rung = deepest;
-    for _ in 0..LADDER_RUNGS {
-        rungs.push(rung);
-        let next = rung / LADDER_RATIO / block_size * block_size;
-        if next == 0 || next >= rung {
-            break;
-        }
-        rung = next;
-    }
-    rungs.reverse();
-    rungs
-}
-
 /// What the RESTORE instance (instance 2) did, handed to a family's
 /// [`ColdTierParitySpec::with_restore_inspector`] callback.
 ///
@@ -281,27 +148,11 @@ pub struct ColdTierParitySpec {
     pub model_path_env: &'static str,
     /// `paged_block_size` forced into both clones.
     pub block_size: u32,
-    /// `paged_cache_memory_mb` forced into both clones. `None` leaves it out
-    /// and the memory plan sizes the pool; a size above the plan's fails the
-    /// load.
-    pub pool_memory_mb: Option<u32>,
-    /// Single-turn prompt run by the warm-up turns and by instance 1 (capture).
-    /// Also by instances 2 and 3 unless [`Self::restore_prompt`] is set.
+    /// `paged_cache_memory_mb` forced into both clones — bounded so the test
+    /// stays light.
+    pub pool_memory_mb: u32,
+    /// Single-turn prompt run by the warm-up turns and by all three instances.
     pub prompt: &'static str,
-    /// Prompt for the RESTORE instance (2) and the BASELINE instance (3).
-    ///
-    /// `None` (default) => all three instances share [`Self::prompt`], the
-    /// original behaviour, bit-for-bit.
-    ///
-    /// `Some(p)` => instance 1 captures with `prompt`, instances 2 and 3 run
-    /// `p`, and parity narrows to 2-vs-3. `p` MUST share a long token prefix
-    /// with `prompt` and then diverge — see [`ladder_restore_prompt`]. The
-    /// shared part is what `kv_chain_upper_bound` can still match on disk, and
-    /// the divergence is a hard ceiling on how deep the restore may reconcile,
-    /// so the restore CANNOT land on the capture prompt's deepest rung however
-    /// far the writer queue got. That is what assertion 1b turns into a claim
-    /// about the ladder rather than about one boundary.
-    pub restore_prompt: Option<&'static str>,
     /// Decode budget. Short: the gate is about the prefix, not the tail.
     pub max_new_tokens: i32,
     /// Thinking budget, for families whose template opens a think block.
@@ -323,12 +174,6 @@ pub struct ColdTierParitySpec {
     /// cannot reach that boundary in one turn, and would fail the gate for a
     /// reason that has nothing to do with its restore path.
     ///
-    /// In `restore_prompt` mode the chain only has to reach a SHALLOW rung, not
-    /// the prompt's own endpoint, so fewer turns are needed here, not more.
-    /// Warm-up turn N's logged `cached_tokens` is the rung turn N-1 anchored
-    /// at, which is the fastest way to tell a mis-sized fixture apart from a
-    /// real failure — see the diagnostics printed by [`run_restart_parity`].
-    ///
     /// Warm-up turns are neither compared nor asserted on — the three measured
     /// instances below are unchanged.
     pub capture_warmup_turns: usize,
@@ -347,7 +192,7 @@ pub struct ColdTierParitySpec {
     /// `ColdSidecarPolicy` should set it, because without it their gate's whole
     /// claim is unbacked: `install_*_cold_sidecar` has a long tail of
     /// `Ok(false)` / `Ok(None)` arms, each falling through to a full O(prefix)
-    /// replay that reconstructs CORRECT state. Assertions 1, 1b, 2 and 3 are all
+    /// replay that reconstructs CORRECT state. Assertions 1, 2 and 3 are all
     /// satisfied by that fall-through — the restore walk already counted the
     /// hits and set `cached_tokens` before the install ran, and the replay's
     /// text matches. The counter is the only thing that moves.
@@ -361,9 +206,8 @@ impl ColdTierParitySpec {
             family,
             model_path_env: "MLX_TEST_MODEL_PATH",
             block_size: DEFAULT_BLOCK_SIZE,
-            pool_memory_mb: Some(256),
+            pool_memory_mb: 256,
             prompt: DEFAULT_PROMPT,
-            restore_prompt: None,
             max_new_tokens: 32,
             thinking_token_budget: Some(32),
             min_restored_tokens: None,
@@ -380,30 +224,13 @@ impl ColdTierParitySpec {
     }
 
     pub fn with_pool_memory_mb(mut self, pool_memory_mb: u32) -> Self {
-        self.pool_memory_mb = Some(pool_memory_mb);
-        self
-    }
-
-    /// See [`Self::pool_memory_mb`].
-    pub fn with_planned_pool(mut self) -> Self {
-        self.pool_memory_mb = None;
+        self.pool_memory_mb = pool_memory_mb;
         self
     }
 
     pub fn with_prompt(mut self, prompt: &'static str) -> Self {
         self.prompt = prompt;
         self
-    }
-
-    /// See [`Self::restore_prompt`]. [`Self::prompt`] stays the capture prompt.
-    pub fn with_restore_prompt(mut self, restore_prompt: &'static str) -> Self {
-        self.restore_prompt = Some(restore_prompt);
-        self
-    }
-
-    /// The prompt instances 2 and 3 run.
-    fn measured_prompt(&self) -> &'static str {
-        self.restore_prompt.unwrap_or(self.prompt)
     }
 
     pub fn with_max_new_tokens(mut self, max_new_tokens: i32) -> Self {
@@ -577,16 +404,7 @@ fn clone_model_dir(
         cfg["persist_paged_cache"] = serde_json::Value::Bool(persist);
         // Bound the adapter pool so the test stays light, and pin the block
         // size the restore assertion is stated in terms of.
-        match spec.pool_memory_mb {
-            Some(pool_memory_mb) => {
-                cfg["paged_cache_memory_mb"] = serde_json::Value::from(pool_memory_mb);
-            }
-            None => {
-                if let Some(obj) = cfg.as_object_mut() {
-                    obj.remove("paged_cache_memory_mb");
-                }
-            }
-        }
+        cfg["paged_cache_memory_mb"] = serde_json::Value::from(spec.pool_memory_mb);
         cfg["paged_block_size"] = serde_json::Value::from(spec.block_size);
         let pretty = serde_json::to_string_pretty(&cfg)
             .map_err(|e| format!("serialize config.json: {e}"))?;
@@ -677,7 +495,7 @@ fn assert_text_eq(label_a: &str, a: &str, label_b: &str, b: &str) {
              duplicated K/V blocks, or an out-of-pool state seated at the wrong boundary.\n\
              \x20 deep in the stream => FLOAT DRIFT is the LIKELY cause, but this is a \
              heuristic, not a proof: a restore that seats a slightly wrong out-of-pool state \
-             also diverges late. A persist-on turn splits its prefill at every checkpoint rung \
+             also diverges late. A persist-on turn splits its prefill at every checkpoint boundary \
              it crosses while a persist-off turn runs one shot; the chunk length IS the GEMM's \
              M, so kernel selection and the reduction order change. That is algebraically \
              transparent but not bit-identical, and it lands as an argmax flip at a near-tie \
@@ -768,73 +586,13 @@ impl ColdRoot {
     }
 }
 
-/// Fail loudly when a SINGLE capture turn can reach the prompt's END.
-///
-/// This is the invariant the whole `restore_prompt` fixture rests on and the
-/// one that silently rotted: a turn anchors ONE sidecar, at the deepest rung it
-/// reached, so a turn that covers the full prompt writes only the deepest rung
-/// — the one a diverged restore prompt can never name — and instance 2 restores
-/// zero. That surfaces as "restore did not engage", pointing the reader at the
-/// restore path, when the cause is that nothing shallow was ever written.
-///
-/// Checked against the LADDER rather than the raw block count because the
-/// deepest rung, not the prompt's end, is what a restore can address.
-///
-/// The bound is on ONE turn, not on all of them together — see the comment in
-/// the body for why the cumulative form rejected working fixtures.
-fn assert_capture_reach_leaves_room(spec: &ColdTierParitySpec, ladder: &[u32], prompt_tokens: u32) {
-    let Some(&deepest) = ladder.last() else {
-        return;
-    };
-    // The FIRST turn's reach, not the cumulative reach of all of them.
-    //
-    // Reach ratchets across turns — `paged_kv_cache_adapter.rs` charges the
-    // budget only for blocks it actually enqueues (`outcome.enqueued`), while
-    // already-persisted blocks are re-walked for free — so turn N reaches
-    // roughly `N x CAPTURE_BLOCKS_PER_TURN`. But each turn anchors its sidecar
-    // at the deepest rung ITS OWN reach allows, under a key derived from that
-    // boundary, so the turns write DISTINCT shallow rungs rather than
-    // overwriting one. Turn 1 landing below `deepest` is therefore what
-    // guarantees a shallow sidecar exists.
-    //
-    // The cumulative form this replaces was strictly stronger, and wrong in the
-    // rejecting direction: with `capture_warmup_turns >= 6` it fires on a
-    // fixture whose shallow rungs are on disk and restorable.
-    let reach_tokens = CAPTURE_BLOCKS_PER_TURN as u32 * spec.block_size;
-    assert!(
-        reach_tokens < deepest,
-        "[{}] FIXTURE, not a product fault: one capture turn reaches {} blocks x {} tok = {} tok, \
-         which already covers this prompt's deepest ladder rung ({} tok of {} prompt tok). That \
-         turn anchors its ONE sidecar at the deepest rung, so the shallow rungs instance 2 needs \
-         after its prompt diverges are never written and the restore necessarily finds nothing. \
-         Lengthen the capture prompt or lower CAPTURE_BLOCKS_PER_TURN — do NOT relax the restore \
-         assertions below, which would leave this gate green against a real regression.",
-        spec.family,
-        CAPTURE_BLOCKS_PER_TURN,
-        spec.block_size,
-        reach_tokens,
-        deepest,
-        prompt_tokens
-    );
-}
-
 /// Blocks one capture turn may persist, forced by [`prepare_cold_root`].
 ///
-/// The fixture needs the chain to reach its frontier over SEVERAL turns: a turn
-/// anchors exactly one sidecar, at the deepest rung it reached, so a turn that
-/// walks the whole prompt writes only the deepest rung and leaves the ladder's
-/// shallow rungs empty — which is precisely what instance 2 needs after its
-/// prompt diverges. That used to happen for free, because the walk stopped
-/// wherever the bounded writer queue refused (~12 blocks here). It is now a
-/// policy defaulting to 128 blocks, so on any machine whose disk keeps up, one
-/// turn covers a fixture-sized prompt and the gate fails by construction.
-///
-/// Pinned rather than left to the default so the stop condition is ARITHMETIC.
-/// With this below the prompt's block count the walk always stops on `Budget`,
-/// so no disk or CPU speed can change which rung gets written. [`LADDER_RATIO`]
-/// governs how far apart the rungs are; this only has to be shallow enough that
-/// `(warm-up turns + 1) x this` stays under the deepest rung, which
-/// [`assert_capture_reach_leaves_room`] enforces.
+/// Pinned rather than left to the 128-block default so the walk's stop
+/// condition is ARITHMETIC: below the prompt's block count it always stops on
+/// `Budget`, so no disk or CPU speed changes how far one turn's chain reaches.
+/// A family whose auxiliary state anchors at a deep boundary deepens the chain
+/// with [`ColdTierParitySpec::capture_warmup_turns`].
 const CAPTURE_BLOCKS_PER_TURN: usize = 12;
 
 /// Wall-clock ceiling forced alongside [`CAPTURE_BLOCKS_PER_TURN`].
@@ -864,7 +622,7 @@ fn prepare_cold_root() -> ColdRoot {
             std::time::Duration::from_millis(CAPTURE_BUDGET_MS),
         ),
         "the capture budget was already resolved before the harness pinned it, so this run used \
-         the {}-block DEFAULT and the ladder arithmetic below is meaningless. Something loaded a \
+         the {}-block DEFAULT and the capture reach below is meaningless. Something loaded a \
          model or touched the cold tier before prepare_cold_root().",
         128,
     );
@@ -943,21 +701,10 @@ where
         ),
     };
 
-    // Two closures rather than one, so the capture side and the measured side
-    // cannot silently re-converge on a single prompt after a later edit. With
-    // `restore_prompt: None` they build the same message and every existing
-    // family is bit-for-bit unchanged.
-    let capture_turn = |dir: &PathBuf| {
+    let turn = |dir: &PathBuf| {
         run_turn(
             dir.clone(),
             vec![user_message(spec.prompt)],
-            parity_chat_config(&spec),
-        )
-    };
-    let measured_turn = |dir: &PathBuf| {
-        run_turn(
-            dir.clone(),
-            vec![user_message(spec.measured_prompt())],
             parity_chat_config(&spec),
         )
     };
@@ -967,7 +714,7 @@ where
     // blocks, because blocks already on disk are skipped without re-enqueueing.
     // Nothing here is asserted on — this only deepens what instance 2 can find.
     for turn_index in 0..spec.capture_warmup_turns {
-        let result = capture_turn(&persist_dir).await.unwrap_or_else(|e| {
+        let result = turn(&persist_dir).await.unwrap_or_else(|e| {
             panic!(
                 "[{}] capture warm-up turn {} failed: {e}",
                 spec.family,
@@ -978,9 +725,7 @@ where
         // turn's capture of the very slots it needs to advance the frontier.
         wait_for_cold_writes_drained().await;
         eprintln!(
-            "[{}] warm-up turn {}/{}: cached={} (= the rung the PREVIOUS turn anchored at; \
-             not asserted). If this already equals the capture prompt's deepest rung, one turn \
-             covered the whole prompt and the fixture is too short.",
+            "[{}] warm-up turn {}/{}: cached={} (not asserted)",
             spec.family,
             turn_index + 1,
             spec.capture_warmup_turns,
@@ -992,7 +737,7 @@ where
 
     // Instance 1: persistence on. Fresh prefill; captures full blocks to the
     // cold tier on turn finalize. Dropped by `run_turn` before the restart.
-    let result_a = capture_turn(&persist_dir)
+    let result_a = turn(&persist_dir)
         .await
         .unwrap_or_else(|e| panic!("[{}] instance 1 (capture) failed: {e}", spec.family));
     eprintln!(
@@ -1023,7 +768,7 @@ where
     // Instance 2: fresh model (empty in-memory hot cache) standing in for a
     // process restart. Its `find_cached_prefix*` must miss the hot cache and
     // restore the persisted prefix from the cold tier.
-    let result_b = measured_turn(&persist_dir)
+    let result_b = turn(&persist_dir)
         .await
         .unwrap_or_else(|e| panic!("[{}] instance 2 (restore) failed: {e}", spec.family));
     let restore_trace = inference_trace_since(trace_path.as_deref(), trace_offset);
@@ -1040,7 +785,7 @@ where
 
     // Instance 3: persistence off — a clean fresh-prefill baseline that never
     // touches the tier (no `ColdTierContext`).
-    let result_c = measured_turn(&nopersist_dir)
+    let result_c = turn(&nopersist_dir)
         .await
         .unwrap_or_else(|e| panic!("[{}] instance 3 (no-persist) failed: {e}", spec.family));
     eprintln!(
@@ -1053,16 +798,11 @@ where
     // hour per iteration, and these counters separate the failure modes:
     //
     //   enqueued == 0 && already_persisted == 0 && boundary_skips > 0  =>  every
-    //       turn found the shallowest published boundary out of the chain's
-    //       reach and nothing was ever on disk to dedup against. That is the
-    //       ladder having collapsed to its deepest rung — a real defect.
-    //   already_persisted > 0  =>  a rung WAS written (by an earlier turn, very
-    //       likely a warm-up, which is outside this window) and later turns
-    //       re-selected it. `enqueued == 0` here is the healthy steady state,
-    //       NOT a collapse — which is exactly why that arm has its own counter.
-    //   enqueued >= 1 && warm-up cached == the deepest rung  =>  the writer kept
-    //       up and one turn covered the whole prompt. That is the FIXTURE being
-    //       too short, not a defect.
+    //       turn found its boundary out of the chain's reach and nothing was
+    //       ever on disk to dedup against.
+    //   already_persisted > 0  =>  a sidecar WAS written (by an earlier turn,
+    //       very likely a warm-up, which is outside this window) and later
+    //       turns re-selected it; `enqueued == 0` here is the steady state.
     //
     // Read without forcing the tier open, unlike `cold_cache_stats_snapshot`.
     let sidecar_delta = sidecar_telemetry_delta(&sidecar_before, &sidecar_after);
@@ -1078,40 +818,6 @@ where
         sidecar_delta.queue_drops,
         sidecar_delta.installed
     );
-
-    // ---- 1b-diagnostic. The ladder, printed BEFORE any assertion ----------
-    // `restore_prompt` mode only; inert for every family that does not set it.
-    //
-    // Deliberately ahead of assertion 1. The headline mutation this gate exists
-    // to kill — a checkpoint ladder collapsed to a single endpoint rung — does
-    // NOT surface as "the restore anchored on the wrong rung". It surfaces as
-    // NOTHING being written at all: the one published boundary sits at the
-    // prompt's end, tens of blocks past what a bounded writer queue drains in a
-    // few turns, so every turn skips and instance 2 restores zero. That trips
-    // assertion 1, whose message is about the restore path. Printing the ladder
-    // first is what stops the next reader from starting the hunt in the wrong
-    // subsystem.
-    //
-    // `prompt_tokens` on a sync turn is the FULL prompt length including any
-    // reused prefix (`engine/paged_turn.rs`), so instance 1 reports the capture
-    // prompt's length and the ladder that prompt published is computable here.
-    let ladder = if spec.restore_prompt.is_some() {
-        let ladder = expected_checkpoint_ladder(result_a.prompt_tokens, spec.block_size);
-        eprintln!(
-            "[{}] ladder gate: capture prompt {} tok, restore prompt {} tok, block_size {}, \
-             expected ladder {:?}, restore anchored at {}",
-            spec.family,
-            result_a.prompt_tokens,
-            result_b.prompt_tokens,
-            spec.block_size,
-            ladder,
-            result_b.cached_tokens
-        );
-        assert_capture_reach_leaves_room(&spec, &ladder, result_a.prompt_tokens);
-        ladder
-    } else {
-        Vec::new()
-    };
 
     // ---- 0. The WRITE path worked ----------------------------------------
     //
@@ -1148,63 +854,13 @@ where
     let min_restored = spec.min_restored();
     assert!(
         result_b.cached_tokens >= min_restored,
-        "[{}] cold restore did not engage across restart: cached_tokens={} (expected >= {}).\n\
-         In restore_prompt mode read the `ladder gate:` and `sidecar telemetry` lines above \
-         FIRST — cached_tokens=0 with expected ladder {:?} and enqueued=0/already_persisted=0 \
-         means no sidecar was ever WRITTEN, which is the checkpoint ladder having collapsed to \
-         its deepest rung (no shallow rung within the chain's reach), not a fault in the restore \
-         path. A cached_tokens that is small but nonzero and is a member of that ladder is a \
-         legitimate shallow-rung restore that merely fell below this floor; lower \
-         `min_restored_tokens` rather than chasing the restore walk.",
+        "[{}] cold restore did not engage across restart: cached_tokens={} (expected >= {}). \
+         Read the `sidecar telemetry` line above first: enqueued=0/already_persisted=0 means \
+         no sidecar was ever WRITTEN, which is a capture fault, not a restore one.",
         spec.family,
         result_b.cached_tokens,
-        min_restored,
-        ladder
+        min_restored
     );
-
-    // ---- 1b. The restore anchored on a SHALLOW ladder rung ----------------
-    //
-    // Instance 2's prompt diverges from the capture prompt well before that
-    // prompt's endpoint, so `kv_chain_upper_bound` — which breaks at the first
-    // block key not on disk — cannot reach the deepest rung. Landing on a
-    // shallower one is the ONLY way it can restore at all, which is exactly
-    // what an implementation that publishes a single endpoint boundary removes.
-    if spec.restore_prompt.is_some() {
-        let deepest = ladder.last().copied().unwrap_or(0);
-        assert!(
-            ladder.len() >= 2,
-            "[{}] FIXTURE TOO SHORT: a {}-token capture prompt publishes ladder {:?}. With \
-             fewer than two rungs this gate structurally cannot tell a ladder apart from a \
-             single endpoint boundary, so it would pass either way. Lengthen the capture prompt.",
-            spec.family,
-            result_a.prompt_tokens,
-            ladder
-        );
-        assert!(
-            ladder.contains(&result_b.cached_tokens),
-            "[{}] the restore anchored at {} tokens, which is NOT a rung of the capture \
-             prompt's checkpoint ladder {:?}. Two causes, and the telemetry line above \
-             separates them: with enqueued=0 AND already_persisted=0 the prefill never \
-             published the shallow rungs at all (fix the checkpoint ladder, not the test); \
-             with enqueued>0 or already_persisted>0 a sidecar was written and the two fixture \
-             prompts do not share the token prefix this gate assumes (fix the fixture).",
-            spec.family,
-            result_b.cached_tokens,
-            ladder
-        );
-        assert!(
-            result_b.cached_tokens < deepest,
-            "[{}] the restore anchored at {} = the capture prompt's DEEPEST rung, so this run \
-             proves nothing about the shallower ones and the gate is back to being blind. \
-             This is a FIXTURE problem, not a code one: either one turn's persisted chain \
-             already covered the whole capture prompt (lengthen it — check the warm-up \
-             `cached=` lines above, which show the rung each turn anchored at), or the two \
-             prompts diverge above {} tokens (move the divergence earlier in the shared body).",
-            spec.family,
-            result_b.cached_tokens,
-            deepest
-        );
-    }
 
     // ---- 2. Restore engaged SOUNDLY --------------------------------------
     // A fail-open restore counts the bad object and recomputes, which still
@@ -1304,59 +960,28 @@ where
     }
 
     // ---- 3. Byte-for-byte greedy parity ----------------------------------
-    if spec.restore_prompt.is_some() {
-        // Instance 1 answered a DIFFERENT question, so its text is not
-        // comparable to anything here. It is still the fixture the other two
-        // instances rest on, so assert it produced a real turn rather than
-        // leaving it wholly unchecked: a capture that emitted nothing would
-        // still have prefilled and captured, so the rest of the gate could pass
-        // while the fixture was quietly degenerate.
-        assert!(
-            result_a.num_tokens > 0,
-            "[{}] instance 1 (capture) produced no tokens (finish={}); the capture fixture is \
-             degenerate even though its prefill may have captured normally",
-            spec.family,
-            result_a.finish_reason
-        );
-
-        // The claim that matters is unchanged in force: a turn that reconciled
-        // down onto a mid-ladder boundary must produce the same bytes as a
-        // clean single-shot prefill of the same prompt.
-        assert_text_eq(
-            "instance 3 (no-persist)",
-            &result_c.text,
-            "instance 2 (restore)",
-            &result_b.text,
-        );
-        assert_eq!(
-            result_c.num_tokens, result_b.num_tokens,
-            "[{}] num_tokens diverged: instance 3 (no-persist) = {}, instance 2 (restore) = {}",
-            spec.family, result_c.num_tokens, result_b.num_tokens
-        );
-    } else {
-        assert_text_eq(
-            "instance 3 (no-persist)",
-            &result_c.text,
-            "instance 2 (restore)",
-            &result_b.text,
-        );
-        assert_text_eq(
-            "instance 1 (capture)",
-            &result_a.text,
-            "instance 3 (no-persist)",
-            &result_c.text,
-        );
-        assert_eq!(
-            result_c.num_tokens, result_b.num_tokens,
-            "[{}] num_tokens diverged: instance 3 (no-persist) = {}, instance 2 (restore) = {}",
-            spec.family, result_c.num_tokens, result_b.num_tokens
-        );
-        assert_eq!(
-            result_a.num_tokens, result_c.num_tokens,
-            "[{}] num_tokens diverged: instance 1 = {}, instance 3 (no-persist) = {}",
-            spec.family, result_a.num_tokens, result_c.num_tokens
-        );
-    }
+    assert_text_eq(
+        "instance 3 (no-persist)",
+        &result_c.text,
+        "instance 2 (restore)",
+        &result_b.text,
+    );
+    assert_text_eq(
+        "instance 1 (capture)",
+        &result_a.text,
+        "instance 3 (no-persist)",
+        &result_c.text,
+    );
+    assert_eq!(
+        result_c.num_tokens, result_b.num_tokens,
+        "[{}] num_tokens diverged: instance 3 (no-persist) = {}, instance 2 (restore) = {}",
+        spec.family, result_c.num_tokens, result_b.num_tokens
+    );
+    assert_eq!(
+        result_a.num_tokens, result_c.num_tokens,
+        "[{}] num_tokens diverged: instance 1 = {}, instance 3 (no-persist) = {}",
+        spec.family, result_a.num_tokens, result_c.num_tokens
+    );
 
     eprintln!(
         "[{}] cold-tier restart parity PASS: cached_tokens={} hits={} corruptions=0, \
@@ -1384,23 +1009,12 @@ where
     // plus one root per process means nothing else collides with it.
 }
 
-/// Offline cover for [`expected_checkpoint_ladder`].
-///
-/// The gate it serves needs real weights and several model loads, so the helper
-/// would otherwise be unverified code deciding whether a slow gate passes. These
-/// pin the exact ladders the fixture sizing argument depends on, so a typo in
-/// the restated recurrence breaks a one-microsecond test instead of quietly
-/// widening the set of boundaries assertion 1b will accept.
-///
-/// Each family's test binary compiles this module separately (`mod
-/// cold_tier_parity_harness;`), so these run once per binary. They are pure
-/// arithmetic.
+/// Offline cover for the harness's own setup. Each family's test binary
+/// compiles this module separately (`mod cold_tier_parity_harness;`), so these
+/// run once per binary.
 #[cfg(test)]
 mod harness_tests {
-    use super::{
-        DEFAULT_BLOCK_SIZE, expected_checkpoint_ladder, ladder_capture_prompt,
-        ladder_restore_prompt, prepare_cold_root,
-    };
+    use super::prepare_cold_root;
 
     /// A second gate in the same binary must not replace the tier directory the
     /// first gate's manager is already holding open.
@@ -1449,112 +1063,5 @@ mod harness_tests {
              manager installed by the first gate still holds a descriptor for the unlinked one, \
              so every cache write and read in the second gate fails with ENOENT"
         );
-    }
-
-    /// The fixture's whole R-independence argument rests on the two prompts
-    /// parting company far enough before the end that instance 2's chain
-    /// ceiling lands below the capture prompt's deepest rung. That margin is
-    /// currently ~300 characters of shared closing sentence, which is
-    /// incidental to how the prose was written — nothing enforced it. A
-    /// copy-edit that shortened the closing sentence, or a `block_size` raised
-    /// to 64, would silently turn assertion 1b into a flake on a healthy build.
-    ///
-    /// Bounded in characters because the harness has no tokenizer. Four
-    /// characters per token is conservative for English prose (real ratios run
-    /// 3.5-4.5), so this is a floor on the token margin, not an estimate.
-    #[test]
-    fn the_two_ladder_prompts_diverge_at_least_two_blocks_before_the_end() {
-        let capture = ladder_capture_prompt();
-        let restore = ladder_restore_prompt();
-        assert_ne!(capture, restore);
-
-        let shared = capture
-            .as_bytes()
-            .iter()
-            .zip(restore.as_bytes())
-            .position(|(a, b)| a != b)
-            .expect("neither prompt may be a prefix of the other");
-        let capture_tail = capture.len() - shared;
-        let restore_tail = restore.len() - shared;
-
-        const CHARS_PER_TOKEN: usize = 4;
-        let floor = 2 * DEFAULT_BLOCK_SIZE as usize * CHARS_PER_TOKEN;
-        assert!(
-            capture_tail >= floor && restore_tail >= floor,
-            "the prompts diverge at byte {shared} with only {capture_tail}/{restore_tail} \
-             bytes left. Under {floor} bytes (~2 blocks) the restore's chain ceiling can reach \
-             the capture prompt's deepest rung and the shallow-rung claim evaporates. Lengthen \
-             the shared closing sentence in `ladder_prompt`."
-        );
-    }
-
-    /// The sizing the qwen3_5 / MoE fixtures are built around, and the reason
-    /// the gate needs a long prompt at all.
-    ///
-    /// The literals are shared with
-    /// `qwen3_5::paged_forward::gdn_checkpoint_tests::ladder_rungs_are_quarters_of_the_one_above`,
-    /// which asserts the SAME numbers against the production function. That
-    /// pairing is what keeps this restated copy honest: the copy exists so a
-    /// collapsed ladder cannot collapse the expectation with it, but a copy
-    /// nothing cross-checks is just a second place for the recurrence to be
-    /// wrong. Change one of these two lists and the other must be changed by
-    /// hand, deliberately.
-    #[test]
-    fn a_long_capture_prompt_publishes_four_well_separated_rungs() {
-        assert_eq!(
-            expected_checkpoint_ladder(1400, DEFAULT_BLOCK_SIZE),
-            vec![16, 80, 336, 1392]
-        );
-        assert_eq!(
-            expected_checkpoint_ladder(4096, DEFAULT_BLOCK_SIZE),
-            vec![48, 240, 1008, 4080]
-        );
-    }
-
-    /// Why `DEFAULT_PROMPT` cannot exercise this gate: at ~90 tokens the whole
-    /// ladder is two rungs, and one turn's chain reach (~8 blocks = 128 tokens)
-    /// already covers the deeper one — so the restore always anchors at the
-    /// prompt's end and the shallow rung is never used. Assertion 1b's
-    /// `ladder.len() >= 2` is the floor; the real requirement is that the
-    /// deepest rung sit far past one turn's reach, which 90 tokens does not.
-    #[test]
-    fn the_default_prompt_length_is_too_short_to_prove_anything() {
-        let ladder = expected_checkpoint_ladder(90, DEFAULT_BLOCK_SIZE);
-        assert_eq!(ladder, vec![16, 80]);
-        let deepest = *ladder.last().expect("two rungs");
-        assert!(
-            deepest < 8 * DEFAULT_BLOCK_SIZE,
-            "a {deepest}-token deepest rung is inside one turn's ~128-token chain reach"
-        );
-    }
-
-    /// The recurrence stops when the next rung would be zero after
-    /// block-alignment, so short prompts degenerate rather than loop.
-    #[test]
-    fn short_prompts_degenerate_to_one_rung_or_none() {
-        const NONE: [u32; 0] = [];
-        // 63/16*16 = 48; a quarter of 48 block-aligns to 0, so the ladder stops.
-        assert_eq!(expected_checkpoint_ladder(64, DEFAULT_BLOCK_SIZE), vec![48]);
-        assert_eq!(expected_checkpoint_ladder(17, DEFAULT_BLOCK_SIZE), vec![16]);
-        assert_eq!(expected_checkpoint_ladder(16, DEFAULT_BLOCK_SIZE), NONE);
-        assert_eq!(expected_checkpoint_ladder(1, DEFAULT_BLOCK_SIZE), NONE);
-        assert_eq!(expected_checkpoint_ladder(0, DEFAULT_BLOCK_SIZE), NONE);
-        assert_eq!(expected_checkpoint_ladder(1400, 0), NONE);
-    }
-
-    /// Every rung is a real block boundary strictly inside the prompt — the
-    /// production cap is `prompt_len - 1`, so a block-aligned prompt backs off
-    /// one block rather than publishing a boundary no restore can ask for.
-    #[test]
-    fn every_rung_is_block_aligned_and_strictly_inside_the_prompt() {
-        for tokens in [17u32, 64, 65, 256, 1024, 1400, 4096] {
-            let ladder = expected_checkpoint_ladder(tokens, DEFAULT_BLOCK_SIZE);
-            for rung in &ladder {
-                assert_eq!(rung % DEFAULT_BLOCK_SIZE, 0, "{tokens} -> {ladder:?}");
-                assert!(*rung < tokens, "{tokens} -> {ladder:?}");
-            }
-            assert!(ladder.windows(2).all(|w| w[0] < w[1]), "{ladder:?}");
-            assert!(ladder.len() <= 4, "{ladder:?}");
-        }
     }
 }

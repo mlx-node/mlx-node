@@ -148,26 +148,24 @@ from Node would stall the agent. From mlx-agent v0.3.0 every resident session
 is detected. With an older binary, an idle ACP/headless holder with no recent
 writes cannot be detected.
 
-## Persist paged cache (`persistPagedCache`)
+## Persist paged cache (`persist_paged_cache`)
 
-Phase A wires the existing `ColdCacheManager` SSD cold tier into paged inference.
-When enabled, full paged prefix blocks are captured to the cold tier on publish and
-restored on a hot-cache miss before falling back to a normal prefill.
+The `ColdCacheManager` SSD cold tier of the restore-allowlisted families: when
+enabled, full paged prefix blocks are captured to the cold tier on publish and
+restored on a hot-cache miss before falling back to a normal prefill. Qwen3.5
+dense and MoE are not among them: their SSD tier holds DFlash2 states
+(`mlx serve --max-cache-disk`, `--persistent-cache`; see
+[paged-cache.md](paged-cache.md#dflash2-states-on-ssd-qwen3_5--qwen3_5_moe)), and
+this view does not list it.
 
-- Library default is **off** (`persistPagedCache` per-model config field, TS
-  `persistPagedCache`). `mlx agent` turns it **on by default for every allowlisted
-  family** — `qwen3`, `qwen3_5`, `qwen3_5_moe`, `gemma4`, `lfm2`, and
-  `lfm2_moe` — via a temporary config
-  overlay, so a warm prefix survives a restart without opting in. Disable with
-  `mlx agent --no-persist-cache`. The overlay writes an EXPLICIT value, so the
-  flag beats whatever the checkpoint's `config.json` hard-codes; a family off the
-  allowlist is handed no policy at all and the overlay never touches its field.
-- **Restore is gated to an allowlist: `qwen3`, `qwen3_5`, `qwen3_5_moe`, `gemma4`, `lfm2`, and `lfm2_moe`.**
+- Default is **off**: the model's `config.json` `persist_paged_cache`, else
+  `MLX_PERSIST_PAGED_CACHE`, turns it on.
+- **Restore is gated to an allowlist: `qwen3`, `gemma4`, `muse_glimmer`, `lfm2`, and `lfm2_moe`.**
   Dense qwen3 sizes its pool over every layer, so paged blocks fully determine its
-  layer state. The other three are hybrid — their pools cover the full-attention
-  layers only — but each now persists its out-of-pool state as a cold-tier
-  **sidecar**: grouped sliding-window K/V for gemma4, GDN recurrent state for
-  qwen3.5/3.6 dense and MoE, and ShortConv recurrent state for LFM2/2.5. A
+  layer state. The others are hybrid — their pools cover the full-attention
+  layers only — but each persists its out-of-pool state as a cold-tier
+  **sidecar**: grouped sliding-window K/V for gemma4 and muse_glimmer, and
+  ShortConv recurrent state for LFM2/2.5. A
   `ColdSidecarPolicy` makes the restore
   reconcile DOWN to a boundary a validated sidecar actually backs (vLLM's per-group
   rule), and the `aux_prefix_unbacked` latch fails closed if an in-process hot hit
@@ -177,7 +175,7 @@ restored on a hot-cache miss before falling back to a normal prefill.
   gate passes on real weights with `hits > 0` and `corruptions == 0` — see
   `docs/paged-cache.md`. The allowlist is enforced natively in
   `cold_tier::resolve_persist_cold`, so a family that is off it never persists or
-  restores even under an explicit `persistPagedCache` or `MLX_PERSIST_PAGED_CACHE=1`.
+  restores even under an explicit `persist_paged_cache` or `MLX_PERSIST_PAGED_CACHE=1`.
 - The tier is fail-open: any validation or I/O failure falls through silently to a
   fresh prefill. Quota is 10 % of FS capacity capped at 100 GiB, LRU by rebuilt
   mtime recency. All destructive I/O is descriptor-relative and no-follow, contained

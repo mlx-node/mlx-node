@@ -256,7 +256,7 @@ fn pool_block_size(inner: &Qwen35Inner) -> u32 {
     inner.paged_adapter.as_ref().expect("adapter").block_size()
 }
 
-fn chain_tokens(seed: u32, blocks: u32, block_size: u32) -> Vec<u32> {
+pub(crate) fn chain_tokens(seed: u32, blocks: u32, block_size: u32) -> Vec<u32> {
     (0..blocks * block_size)
         .map(|i| (seed * 11 + i * 7) % 15 + 1)
         .collect()
@@ -264,7 +264,7 @@ fn chain_tokens(seed: u32, blocks: u32, block_size: u32) -> Vec<u32> {
 
 /// Caches `tokens` (whole blocks) as a chain nothing holds; returns its
 /// block hashes.
-pub(super) fn cache_chain(inner: &Qwen35Inner, tokens: &[u32]) -> Vec<u64> {
+pub(crate) fn cache_chain(inner: &Qwen35Inner, tokens: &[u32]) -> Vec<u64> {
     cache_keyed_chain(inner, tokens, &[], 0)
 }
 
@@ -1250,8 +1250,6 @@ fn a_released_serial_turn_ends_the_replay_points_use() -> Result<()> {
         let e_key = rung_key(&inner, 2 * pool_block_size(&inner), e_final);
         assert_eq!(inner.gdn_in_use_for_test(0), Some(&e_key), "reuse {reuse}");
         {
-            // The finalize bumps the global sidecar capture counter.
-            let _serialized = crate::cold_tier::sidecar_counter_test_lock();
             crate::engine::backend::PagedBackend::finalize_paged_turn(&mut inner, false, 0);
             crate::engine::backend::PagedBackend::save_paged_history(
                 &mut inner,
@@ -1560,7 +1558,7 @@ fn dropping_a_parked_state_returns_its_blocks() -> Result<()> {
     assert_eq!(evictable(&inner) + 6, before);
     let taken =
         crate::models::qwen3_5::dflash2_turn::take_state_unit(&mut inner, &UnitKey::Store(id));
-    assert!(taken);
+    assert_eq!(taken, crate::models::qwen3_5::dflash2_turn::StateTake::Took);
     assert_eq!(inner.dflash2_states.store.bytes().entries, 0);
     assert_eq!(
         inner

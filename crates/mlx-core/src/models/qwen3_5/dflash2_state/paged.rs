@@ -70,6 +70,9 @@ pub(crate) struct StateCounters {
     pub(crate) lazy_junctions: u64,
     pub(crate) checkpoint_evictions: u64,
     pub(crate) evictions: u64,
+    /// States no RAM copy took, written from the lane to the SSD tier
+    /// (Splash `diskStatePublications`).
+    pub(crate) disk_state_publications: u64,
 }
 
 /// The running DFlash2 turn's state points (Splash `Request`
@@ -139,6 +142,18 @@ pub(crate) struct DFlash2States {
     /// The refusal that suspended the tapped prefill, until the prefill's
     /// owner vacates the lane.
     pub(crate) prefill_yield: Option<PrefillYield>,
+    /// The model's SSD tier for its states, when a load opened one.
+    pub(crate) disk: Option<super::disk::StateDisk>,
+    /// The disk state the turn's lane read, until the admission promotes
+    /// or discards it (Splash `Engine::pollRestores`).
+    pub(crate) disk_read: Option<DiskRead>,
+}
+
+/// A disk state a lane read (Splash `StateRestore`): the window the read
+/// took when the lane's turn does not keep it.
+pub(crate) struct DiskRead {
+    pub(crate) id: EntryId,
+    pub(crate) window: Option<DraftContextWindow>,
 }
 
 /// A released lane's buffers: the draft ring with its rows dropped and the
@@ -205,6 +220,8 @@ impl DFlash2States {
             idle_lane: IdleLane::default(),
             prefill_suspends: false,
             prefill_yield: None,
+            disk: None,
+            disk_read: None,
         }
     }
 
@@ -214,6 +231,7 @@ impl DFlash2States {
         self.turn = None;
         self.replay_point = None;
         self.lane_window = None;
+        self.disk_read = None;
         self.restore_uses.clear();
         self.idle_lane = IdleLane::default();
     }
@@ -303,6 +321,36 @@ pub(crate) fn install_linear(
         gdn.set(1, rec.deep_copy()?)?;
         *slot = Qwen3_5LayerCache::Linear(gdn);
     }
+    for slot in caches.iter() {
+        if matches!(slot, Qwen3_5LayerCache::Linear(_)) {
+            slot.collect_arrays(&mut arrays);
+        }
+    }
+    if !arrays.is_empty() {
+        MxArray::eval_arrays(&arrays)?;
+    }
+    Ok(())
+}
+
+/// Moves the GDN slots a disk read decoded into `caches`' linear slots, in
+/// layer order, and evaluates them; full-attention slots are left alone.
+pub(crate) fn adopt_linear(
+    caches: &mut [Qwen3_5LayerCache],
+    linear: Vec<Qwen3_5LayerCache>,
+) -> Result<()> {
+    if caches.len() != linear.len() {
+        return Err(Error::from_reason(format!(
+            "a DFlash2 disk state holds {} layers for {} cache slots",
+            linear.len(),
+            caches.len()
+        )));
+    }
+    for (slot, state) in caches.iter_mut().zip(linear) {
+        if matches!(state, Qwen3_5LayerCache::Linear(_)) {
+            *slot = state;
+        }
+    }
+    let mut arrays = Vec::new();
     for slot in caches.iter() {
         if matches!(slot, Qwen3_5LayerCache::Linear(_)) {
             slot.collect_arrays(&mut arrays);

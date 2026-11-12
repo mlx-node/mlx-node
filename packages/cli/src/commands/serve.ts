@@ -10,12 +10,15 @@
 import { parseArgs } from 'node:util';
 
 import {
+  checkCacheDiskArgs,
   createInferenceHost,
   LAUNCHER_ENGINE_POLICY,
   ModelNotFoundError,
   NoModelsDiscoveredError,
+  parseCacheDir,
   parseDecodeShare,
   parseIdleRelease,
+  parseMaxCacheDisk,
   parseMaxContext,
   parseMaxMemory,
   resolveLogDir,
@@ -23,9 +26,7 @@ import {
   type InferenceHost,
   type InferenceHostOptions,
 } from '@mlx-node/server/host';
-
-/** Grace period handed to `close()` on SIGINT/SIGTERM. Matches the server default. */
-const SHUTDOWN_TIMEOUT_MS = 5000;
+import { SERVER_CLOSE_MS } from '@mlx-node/server/supervision';
 
 function printHelp(): void {
   console.log(`
@@ -77,6 +78,17 @@ Options:
                       s, m or h suffix, e.g. 30m (default: 10m); off keeps
                       both, though POST /v1/memory/release still frees the
                       weights. The next request loads the weights again.
+  --max-cache-disk <size>  SSD quota for the DFlash2 states of Qwen3.5 dense
+                      and MoE loads: auto follows the volume, a quarter of
+                      its free space beyond a floor of 10G (5% of a volume
+                      under 200G), at most 32G; a size such as 16G is held
+                      as given while the volume keeps that floor; 0
+                      disables (default: auto).
+  --persistent-cache  Keep the SSD cache across restarts (default: off; the
+                      cache's temporary files go when serve stops).
+  --cache-dir <dir>   Where --persistent-cache keeps its files; needs
+                      --persistent-cache (default:
+                      ~/.mlx-node/cache/prefix-cache).
   --thinking-token-budget <n>  Thinking tokens of a thinking request that
                       sets no budget, after which its thinking closes
                       (default: no cap).
@@ -115,6 +127,10 @@ export interface ServeArgs {
   decodeShare?: number;
   /** `--idle-release` in seconds; `Infinity` for `off`. */
   idleReleaseSeconds?: number;
+  /** `--max-cache-disk` as the native load option's text: `'auto'`, `'0'` or a byte count. */
+  cacheDisk: string;
+  persistentCache: boolean;
+  cacheDir?: string;
   thinkingTokenBudget?: number;
   rerankConfig?: string;
   logDir?: string;
@@ -144,6 +160,9 @@ export function parseServeArgs(argv: string[]): ServeArgs {
       'max-context': { type: 'string' },
       'decode-share': { type: 'string' },
       'idle-release': { type: 'string' },
+      'max-cache-disk': { type: 'string' },
+      'persistent-cache': { type: 'boolean', default: false },
+      'cache-dir': { type: 'string' },
       'thinking-token-budget': { type: 'string' },
       'rerank-config': { type: 'string' },
       'auth-token': { type: 'string' },
@@ -178,6 +197,12 @@ export function parseServeArgs(argv: string[]): ServeArgs {
   const decodeShare = decodeShareText === undefined ? undefined : parseDecodeShare(decodeShareText);
   const idleReleaseText = values['idle-release'];
   const idleReleaseSeconds = idleReleaseText === undefined ? undefined : parseIdleRelease(idleReleaseText);
+  const cacheDiskText = values['max-cache-disk'];
+  const cacheDisk = cacheDiskText === undefined ? 'auto' : parseMaxCacheDisk(cacheDiskText);
+  const persistentCache = values['persistent-cache'] ?? false;
+  const cacheDirText = values['cache-dir'];
+  const cacheDir = cacheDirText === undefined ? undefined : parseCacheDir(cacheDirText);
+  checkCacheDiskArgs({ cacheDisk, persistentCache, ...(cacheDir !== undefined ? { cacheDir } : {}) });
   const budgetText = values['thinking-token-budget'];
   const thinkingTokenBudget = budgetText === undefined ? undefined : parseThinkingTokenBudget(budgetText);
   const verbose = (values.verbose ?? false) || values['log-dir'] != null;
@@ -195,6 +220,9 @@ export function parseServeArgs(argv: string[]): ServeArgs {
     ...(maxContextTokens !== undefined ? { maxContextTokens } : {}),
     ...(decodeShare !== undefined ? { decodeShare } : {}),
     ...(idleReleaseSeconds !== undefined ? { idleReleaseSeconds } : {}),
+    cacheDisk,
+    persistentCache,
+    ...(cacheDir !== undefined ? { cacheDir } : {}),
     ...(thinkingTokenBudget !== undefined ? { thinkingTokenBudget } : {}),
     ...(values['rerank-config'] !== undefined ? { rerankConfig: values['rerank-config'] } : {}),
     authToken: values['auth-token'],
@@ -261,6 +289,9 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
       ...(args.maxContextTokens !== undefined ? { maxContextTokens: args.maxContextTokens } : {}),
       ...(args.decodeShare !== undefined ? { decodeShare: args.decodeShare } : {}),
       ...(args.idleReleaseSeconds !== undefined ? { idleReleaseSeconds: args.idleReleaseSeconds } : {}),
+      cacheDisk: args.cacheDisk,
+      persistentCache: args.persistentCache,
+      ...(args.cacheDir !== undefined ? { cacheDir: args.cacheDir } : {}),
       ...(args.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: args.thinkingTokenBudget } : {}),
       ...(await readRerankConfig(args.rerankConfig)),
       authToken: args.authToken,
@@ -310,7 +341,7 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
     process.removeListener('SIGTERM', onSigterm);
     console.log(`\nReceived ${signal}, shutting down mlx serve…`);
     try {
-      await host.close({ timeoutMs: SHUTDOWN_TIMEOUT_MS });
+      await host.close({ timeoutMs: SERVER_CLOSE_MS });
     } catch {
       /* `close()` guards each disposer; never let shutdown itself throw */
     }

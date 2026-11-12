@@ -43,7 +43,6 @@ pub(super) fn tiny_moe_cfg() -> Qwen3_5MoeConfig {
         mlp_only_layers: None,
         paged_cache_memory_mb: Some(64),
         paged_block_size: Some(16),
-        persist_paged_cache: None,
         n_mtp_layers: 0,
         qwen35_gguf_gdn_layout: None,
         kv_format: None,
@@ -556,13 +555,7 @@ fn test_moe_gdn_root_rotation_retains_new_root() {
     // lands here: `cacheRootOwnerId` is set in exactly one place
     // (`packages/agent/src/provider/chat-config.ts`), so a plain
     // `@mlx-node/lm` ChatSession publishes under the implicit owner `""`.
-    // This model has no paged adapter and so no cold GDN policy, which
-    // makes the pre-ladder cap the right one — see the dense twin.
     let mut legacy = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct legacy MoE");
-    assert!(
-        !legacy.wants_gdn_checkpoint_ladder(),
-        "a model with no paged adapter cannot have a cold GDN sidecar policy"
-    );
     for marker in 1..=(GDN_PREFIX_CHECKPOINTS_PER_OWNER as u32 + 1) {
         crate::engine::backend::ChatBackend::set_cache_owner_id(&mut legacy, "", None);
         let tokens: Vec<u32> = (0..16).map(|offset| marker * 100 + offset).collect();
@@ -583,79 +576,16 @@ fn test_moe_gdn_root_rotation_retains_new_root() {
     assert!(!legacy.gdn_root_cache_owner_is_explicit);
     assert_eq!(
         legacy.gdn_prefix_checkpoints.len(),
-        GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER
+        GDN_PREFIX_CHECKPOINTS_PER_OWNER
     );
 }
 
 /// MoE twin of
-/// `qwen3_5::model::paged_construction_tests::dense_gdn_retention_follows_the_installed_cold_sidecar_policy`.
-/// The retention cap is chosen at the call site, and the twins have two of
-/// them.
-///
-/// Catches: hardcoding either arm in `prune_moe_gdn_prefix_checkpoints`.
-#[test]
-fn moe_gdn_retention_follows_the_installed_cold_sidecar_policy() {
-    let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
-        "moe_gdn_retention_follows_the_installed_cold_sidecar_policy",
-    ) else {
-        return;
-    };
-    let tokens: Vec<u32> = (0..64u32).collect();
-    let extra_keys = vec![Vec::new(); 4];
-
-    let push_ladder = |inner: &mut Qwen35MoeInner| {
-        inner.gdn_prefix_checkpoints.clear();
-        crate::engine::backend::ChatBackend::set_cache_owner_id(inner, "", None);
-        for rung in 1..=4u32 {
-            let prefix_len = rung * 16;
-            let block_hashes =
-                compute_paged_prefix_block_hashes(&tokens, prefix_len, 16, &extra_keys, 0)
-                    .expect("block-aligned rung must hash");
-            inner
-                .gdn_prefix_checkpoints
-                .push_back(MoeGdnPrefixCheckpoint {
-                    owner_id: inner.active_cache_owner_id.clone(),
-                    prefix_len,
-                    block_size: 16,
-                    final_block_hash: block_hashes.last().copied().unwrap_or_default(),
-                    block_hashes,
-                    tokens: tokens[..prefix_len as usize].to_vec(),
-                    caches: Vec::new(),
-                    last_used: 0,
-                });
-            inner.prune_moe_gdn_prefix_checkpoints();
-        }
-        inner.gdn_prefix_checkpoints.len()
-    };
-
-    assert!(!inner.wants_gdn_checkpoint_ladder());
-    assert_eq!(
-        push_ladder(&mut inner),
-        GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER,
-        "with no cold GDN policy the store must stay at the pre-ladder cap"
-    );
-
-    let root = moe_temp_cold_root("moe-gdn-retention-policy");
-    install_moe_gdn_cold_tier(&mut inner, &root);
-    assert!(inner.wants_gdn_checkpoint_ladder());
-    assert_eq!(
-        push_ladder(&mut inner),
-        GDN_PREFIX_CHECKPOINTS_PER_OWNER,
-        "a cold GDN sidecar policy must keep the whole published ladder"
-    );
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// MoE twin of
-/// `qwen3_5::model::paged_construction_tests::test_dense_ladder_survives_sibling_owners_through_the_model_call_site`.
+/// `qwen3_5::model::paged_construction_tests::test_dense_gdn_retention_keeps_sibling_owners_through_the_model_call_site`.
 /// The two share `prune_gdn_checkpoints` but not the call site that tells
 /// it which owner is publishing, which is exactly where they can drift.
-///
-/// Like the dense twin, both arms are driven: publisher deferral exists
-/// only under `GdnRetentionPolicy::Ladder`, so the cold tier has to be
-/// installed for the mutation to be expressible at all.
 #[test]
-fn test_moe_ladder_survives_sibling_owners_through_the_model_call_site() {
+fn test_moe_gdn_retention_keeps_sibling_owners_through_the_model_call_site() {
     fn push(inner: &mut Qwen35MoeInner, owner_id: &str, root_owner_id: &str, blocks: u32) {
         crate::engine::backend::ChatBackend::set_cache_owner_id(
             inner,
@@ -695,12 +625,11 @@ fn test_moe_ladder_survives_sibling_owners_through_the_model_call_site() {
     }
 
     let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
-        "test_moe_ladder_survives_sibling_owners_through_the_model_call_site",
+        "test_moe_gdn_retention_keeps_sibling_owners_through_the_model_call_site",
     ) else {
         return;
     };
 
-    assert!(!inner.wants_gdn_checkpoint_ladder());
     assert_eq!(
         run_fleet(&mut inner),
         vec![
@@ -710,27 +639,8 @@ fn test_moe_ladder_survives_sibling_owners_through_the_model_call_site() {
             ("child-3".to_string(), 256),
             ("child-3".to_string(), 1024),
         ],
-        "a persistence-OFF turn takes the pre-ladder victim order, which \
-         keeps the publisher's DEEPEST rungs and defers nobody"
+        "the retention keeps the publisher's DEEPEST rungs and defers nobody"
     );
-
-    let root = moe_temp_cold_root("moe-ladder-sibling-call-site");
-    install_moe_gdn_cold_tier(&mut inner, &root);
-    assert!(inner.wants_gdn_checkpoint_ladder());
-    assert_eq!(
-        run_fleet(&mut inner),
-        vec![
-            ("root".to_string(), 1024),
-            ("child-0".to_string(), 1024),
-            ("child-1".to_string(), 1024),
-            ("child-3".to_string(), 16),
-            ("child-3".to_string(), 1024),
-        ],
-        "the publishing subagent must keep the shallow rung this turn's \
-         capture anchors on, paid for by the root's spare rung, and no \
-         sibling may be pushed to zero"
-    );
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1042,38 +952,6 @@ fn moe_inner_with_test_adapter_or_skip(test_name: &str) -> Option<Qwen35MoeInner
     Some(inner)
 }
 
-/// Attach the cold tier shape `build_cold_tier_context` installs for MoE.
-fn install_moe_gdn_cold_tier(inner: &mut Qwen35MoeInner, root: &std::path::Path) {
-    let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.to_path_buf())
-        .expect("temp-dir cold cache must open");
-    let activation = crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(&*inner)
-        .expect("activation dtype");
-    let policy =
-        crate::models::qwen3_5::gdn_sidecar::policy(&inner.config.to_dense_config(), activation)
-            .expect("a hybrid config must yield a GDN sidecar policy");
-    let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-    adapter.set_cold_tier(
-        crate::transformer::paged_kv_cache_adapter::ColdTierContext {
-            manager: Arc::new(manager),
-            fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
-                b"qwen3-5-moe-sidecar-test".as_slice(),
-            ]),
-            sidecar_policy: Some(policy),
-        },
-    );
-}
-
-fn moe_temp_cold_root(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "mlx-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ))
-}
-
 fn record_whole_moe_paged_request(inner: &mut Qwen35MoeInner, prompt: &[u32]) {
     let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
     adapter.reset_for_new_request(0).expect("reset request");
@@ -1179,397 +1057,6 @@ fn moe_paged_rollback_without_a_cycle_refuses_instead_of_retracting() {
         prompt.len(),
         "the refusal must leave the adapter untouched — no hand retraction"
     );
-}
-
-/// MoE mirror of the dense case: the hand-written cores finalize through
-/// `finalize_moe_manual_paged_turn`, which must run the GDN sidecar capture.
-///
-/// Catches: deleting `capture_moe_gdn_cold_sidecar` from the `Ok` arm of
-/// `finalize_moe_manual_paged_turn` — both deltas drop to zero.
-#[test]
-fn moe_manual_paged_finalize_reaches_the_gdn_sidecar_capture() {
-    let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
-        "moe_manual_paged_finalize_reaches_the_gdn_sidecar_capture",
-    ) else {
-        return;
-    };
-    let root = moe_temp_cold_root("moe-manual-finalize-capture");
-    install_moe_gdn_cold_tier(&mut inner, &root);
-    let prompt: Vec<u32> = (0u32..32).collect();
-    record_whole_moe_paged_request(&mut inner, &prompt);
-
-    let _serialized = crate::cold_tier::sidecar_counter_test_lock();
-    let before = crate::cold_tier::cold_sidecar_telemetry();
-    inner
-        .finalize_moe_manual_paged_turn(&[], 0)
-        .expect("manual paged finalization must succeed");
-    let after = crate::cold_tier::cold_sidecar_telemetry();
-
-    assert_eq!(
-        after.capture_reached,
-        before.capture_reached + 1,
-        "the manual finalize must enter the GDN sidecar capture exactly once"
-    );
-    // The chain really carried both blocks off the GPU. Asserted here
-    // because everything below depends on it and nothing below can see it:
-    // a pool whose buffers are too small makes `read_block_all_layers`
-    // return `Err`, the chain capture stops at its first block, and the
-    // boundary assertion after this one becomes unreachable rather than
-    // false. Without this line that failure reads as "the capture did not
-    // reach its boundary selection", three layers from the real cause.
-    assert_eq!(
-        inner
-            .paged_adapter
-            .as_ref()
-            .expect("paged_adapter")
-            .cold_captured_blocks(),
-        2,
-        "both whole blocks must have been captured off the pool"
-    );
-    // The finalize published two whole blocks to the cold chain, so the
-    // capture ran to its boundary selection and found no in-memory
-    // checkpoint. Reaching THAT arm proves it got past the policy and media
-    // guards rather than bailing at its first line.
-    assert_eq!(
-        after.boundary_skips,
-        before.boundary_skips + 1,
-        "the capture must reach its boundary selection under a GdnState policy"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// MoE mirror of the dense case: a host short of spare memory refuses a
-/// ladder rung its RAM claim (`HostRule::admits`), so the rung goes to the
-/// cold tier through the turn's sidecar capture instead (Splash
-/// `publishStateToDisk`) and never into RAM. With the capture walk reaching
-/// the whole prompt only the deepest refused rung is held until the capture:
-/// rungs 16 and 32, then 16 again, leave 32.
-///
-/// Mutation F4: drop the refused rung → no rung is held and the capture
-/// finds no checkpoint → red.
-#[test]
-fn moe_rung_refused_ram_still_reaches_the_cold_tier() {
-    let Some(mut inner) =
-        moe_inner_with_test_adapter_or_skip("moe_rung_refused_ram_still_reaches_the_cold_tier")
-    else {
-        return;
-    };
-    let root = moe_temp_cold_root("moe-refused-rung-to-disk");
-    install_moe_gdn_cold_tier(&mut inner, &root);
-    moe_refuse_optional_claims(&mut inner);
-    let prompt: Vec<u32> = (0u32..32).collect();
-    record_whole_moe_paged_request(&mut inner, &prompt);
-
-    let extra_keys = engine::build_paged_extra_keys(prompt.len(), 16, &[]);
-    let rungs = vec![moe_zero_gdn_rung(&inner, 16), moe_zero_gdn_rung(&inner, 32)];
-    inner.publish_moe_gdn_materialized_prefix_checkpoint(&prompt, &extra_keys, 0, rungs);
-    let rungs = vec![moe_zero_gdn_rung(&inner, 16)];
-    inner.publish_moe_gdn_materialized_prefix_checkpoint(&prompt, &extra_keys, 0, rungs);
-    assert!(
-        inner.gdn_prefix_checkpoints.is_empty(),
-        "the host refused the rungs their RAM"
-    );
-    assert_eq!(
-        moe_held_rungs(&inner),
-        vec![(None, 32)],
-        "only the deepest refused rung is held"
-    );
-
-    let _serialized = crate::cold_tier::sidecar_counter_test_lock();
-    let before = crate::cold_tier::cold_sidecar_telemetry();
-    inner
-        .finalize_moe_manual_paged_turn(&[], 0)
-        .expect("manual paged finalization must succeed");
-    let after = crate::cold_tier::cold_sidecar_telemetry();
-    assert_eq!(
-        after.boundary_skips, before.boundary_skips,
-        "the refused rung must anchor the sidecar"
-    );
-    assert_eq!(
-        after.enqueued,
-        before.enqueued + 1,
-        "the refused rung must reach the cold tier"
-    );
-    assert!(
-        inner.gdn_unclaimed_rungs.is_empty(),
-        "the turn's end drops the refused rung"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// MoE mirror: with a one-block capture budget the refused rungs 16, 32 and
-/// 48 leave 48 (the deepest) and 16 (the deepest the walk reaches), and the
-/// capture anchors at 16.
-///
-/// Mutation: hold only the deepest refused rung → the held set is
-/// `[(None, 48)]` and the capture finds no checkpoint within the one-block
-/// chain → red.
-#[test]
-fn moe_refused_rung_within_the_capture_reach_reaches_the_cold_tier() {
-    let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
-        "moe_refused_rung_within_the_capture_reach_reaches_the_cold_tier",
-    ) else {
-        return;
-    };
-    let root = moe_temp_cold_root("moe-refused-rung-within-reach");
-    install_moe_gdn_cold_tier(&mut inner, &root);
-    moe_refuse_optional_claims(&mut inner);
-    inner
-        .paged_adapter
-        .as_mut()
-        .expect("paged_adapter")
-        .set_cold_capture_budget(crate::transformer::cold_tier::ColdCaptureBudget {
-            max_blocks: 1,
-            max_walk: std::time::Duration::from_secs(60),
-        });
-    let prompt: Vec<u32> = (0u32..48).collect();
-    record_whole_moe_paged_request(&mut inner, &prompt);
-
-    let extra_keys = engine::build_paged_extra_keys(prompt.len(), 16, &[]);
-    let rungs = vec![
-        moe_zero_gdn_rung(&inner, 16),
-        moe_zero_gdn_rung(&inner, 32),
-        moe_zero_gdn_rung(&inner, 48),
-    ];
-    inner.publish_moe_gdn_materialized_prefix_checkpoint(&prompt, &extra_keys, 0, rungs);
-    assert_eq!(
-        moe_held_rungs(&inner),
-        vec![(None, 16), (None, 48)],
-        "the deepest refused rung and the deepest within the capture reach are held"
-    );
-
-    let _serialized = crate::cold_tier::sidecar_counter_test_lock();
-    let before = crate::cold_tier::cold_sidecar_telemetry();
-    inner
-        .finalize_moe_manual_paged_turn(&[], 0)
-        .expect("manual paged finalization must succeed");
-    let after = crate::cold_tier::cold_sidecar_telemetry();
-    assert_eq!(
-        after.boundary_skips, before.boundary_skips,
-        "the rung within the capture reach must anchor the sidecar"
-    );
-    assert_eq!(
-        after.enqueued,
-        before.enqueued + 1,
-        "the rung within the capture reach must reach the cold tier"
-    );
-    assert!(
-        inner.gdn_unclaimed_rungs.is_empty(),
-        "the turn's end drops the refused rungs"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// MoE mirror: under the continuous-batching scheduler two sequences
-/// overlap; each prefill slice and each turn end activates its own sequence,
-/// while the cache owner is set only at admission. Each sequence holds its
-/// own deepest refused rung, its turn end captures that one, and a peer's
-/// stays held.
-///
-/// Mutation H1 (one slot for the model, the turn end empties it): B's
-/// deeper rung replaces A's, the held set is `[(None, 48)]` → red.
-#[test]
-fn moe_overlapped_sequences_each_send_their_refused_rung_to_the_cold_tier() {
-    let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
-        "moe_overlapped_sequences_each_send_their_refused_rung_to_the_cold_tier",
-    ) else {
-        return;
-    };
-    let root = moe_temp_cold_root("moe-refused-rung-per-sequence");
-    install_moe_gdn_cold_tier(&mut inner, &root);
-    moe_refuse_optional_claims(&mut inner);
-    let prompt_a: Vec<u32> = (0u32..32).collect();
-    let prompt_b: Vec<u32> = (100u32..148).collect();
-    for (seq_id, owner, prompt) in [(1, "owner-a", &prompt_a), (2, "owner-b", &prompt_b)] {
-        crate::engine::backend::ChatBackend::set_cache_owner_id(&mut inner, owner, None);
-        inner.activate_paged_seq(seq_id).expect("admit sequence");
-        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-        adapter
-            .allocate_suffix_blocks(prompt.len() as u32)
-            .expect("allocate suffix blocks");
-        adapter.record_tokens(prompt).expect("record tokens");
-    }
-    let keys_a = engine::build_paged_extra_keys(prompt_a.len(), 16, &[]);
-    let keys_b = engine::build_paged_extra_keys(prompt_b.len(), 16, &[]);
-    inner.activate_paged_seq(1).expect("A's prefill slice");
-    let rungs = vec![moe_zero_gdn_rung(&inner, 32)];
-    inner.publish_moe_gdn_materialized_prefix_checkpoint(&prompt_a, &keys_a, 0, rungs);
-    inner.activate_paged_seq(2).expect("B's prefill slice");
-    let rungs = vec![moe_zero_gdn_rung(&inner, 48)];
-    inner.publish_moe_gdn_materialized_prefix_checkpoint(&prompt_b, &keys_b, 0, rungs);
-    assert_eq!(
-        moe_held_rungs(&inner),
-        vec![(Some(1), 32), (Some(2), 48)],
-        "each sequence holds its own refused rung"
-    );
-
-    let _serialized = crate::cold_tier::sidecar_counter_test_lock();
-    let before = crate::cold_tier::cold_sidecar_telemetry();
-    inner.activate_paged_seq(1).expect("A's turn end");
-    inner
-        .finalize_moe_manual_paged_turn(&[], 0)
-        .expect("A's finalization must succeed");
-    let after_a = crate::cold_tier::cold_sidecar_telemetry();
-    assert_eq!(
-        after_a.enqueued,
-        before.enqueued + 1,
-        "A's refused rung must reach the cold tier"
-    );
-    assert_eq!(
-        moe_held_rungs(&inner),
-        vec![(Some(2), 48)],
-        "A's turn end leaves B's rung held"
-    );
-
-    inner.activate_paged_seq(2).expect("B's turn end");
-    inner
-        .finalize_moe_manual_paged_turn(&[], 0)
-        .expect("B's finalization must succeed");
-    let after_b = crate::cold_tier::cold_sidecar_telemetry();
-    assert_eq!(
-        after_b.enqueued,
-        after_a.enqueued + 1,
-        "B's refused rung must reach the cold tier"
-    );
-    assert_eq!(
-        after_b.boundary_skips, before.boundary_skips,
-        "both captures anchor on their own rung"
-    );
-    assert!(
-        inner.gdn_unclaimed_rungs.is_empty(),
-        "every turn end drops its own rung"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// A host that keeps its spare-memory margin from every Optional claim
-/// (`HostRule::admits`), so each ladder rung is refused its RAM.
-fn moe_refuse_optional_claims(inner: &mut Qwen35MoeInner) {
-    use crate::engine::governor::governor::Governor;
-    use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
-    use crate::engine::governor::host::Pressure;
-    let io = FakeIo::new(stats(0), host(0, Pressure::Normal));
-    let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
-    inner.memory_registration = Some(governor.register_model(model(16 * G, 0)).expect("register"));
-}
-
-fn moe_held_rungs(inner: &Qwen35MoeInner) -> Vec<(Option<SeqId>, u32)> {
-    let mut held: Vec<_> = inner
-        .gdn_unclaimed_rungs
-        .iter()
-        .flat_map(|(seq_id, rungs)| rungs.iter().map(|rung| (*seq_id, rung.prefix_len)))
-        .collect();
-    held.sort_unstable();
-    held
-}
-
-fn moe_zero_gdn_rung(
-    inner: &Qwen35MoeInner,
-    prefix_len: u32,
-) -> crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint {
-    let activation = crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(inner)
-        .expect("activation dtype");
-    let config = inner.config.to_dense_config();
-    let mut caches = Qwen3_5LayerCache::fresh_layer_caches(&config);
-    for cache in &mut caches {
-        if let Qwen3_5LayerCache::Linear(arrays) = cache {
-            let conv = MxArray::zeros(
-                &[
-                    1,
-                    i64::from(config.linear_conv_kernel_dim - 1),
-                    i64::from(config.linear_conv_dim()),
-                ],
-                Some(activation),
-            )
-            .expect("conv state");
-            let recurrent = MxArray::zeros(
-                &[
-                    1,
-                    i64::from(config.linear_num_value_heads),
-                    i64::from(config.linear_value_head_dim),
-                    i64::from(config.linear_key_head_dim),
-                ],
-                Some(DType::Float32),
-            )
-            .expect("recurrent state");
-            arrays.set(0, conv).expect("set conv");
-            arrays.set(1, recurrent).expect("set recurrent");
-        }
-    }
-    crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint { prefix_len, caches }
-}
-
-/// The v1 text-only guard must read the turn's OWN media map, not
-/// `self.cached_paged_image_token_positions` (cleared mid-turn by the VLM
-/// cores).
-///
-/// Catches: reverting the guard to the `self` field — empty here, so the
-/// capture would run on past it and bump `boundary_skips`.
-#[test]
-fn moe_gdn_sidecar_capture_refuses_the_turns_own_media_map() {
-    let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
-        "moe_gdn_sidecar_capture_refuses_the_turns_own_media_map",
-    ) else {
-        return;
-    };
-    let root = moe_temp_cold_root("moe-manual-finalize-media");
-    install_moe_gdn_cold_tier(&mut inner, &root);
-    let prompt: Vec<u32> = (0u32..32).collect();
-    record_whole_moe_paged_request(&mut inner, &prompt);
-    assert!(
-        inner.cached_paged_image_token_positions.is_empty(),
-        "the model-level media map is empty mid-turn; only the argument carries the truth"
-    );
-
-    let _serialized = crate::cold_tier::sidecar_counter_test_lock();
-    let before = crate::cold_tier::cold_sidecar_telemetry();
-    inner
-        .finalize_moe_manual_paged_turn(&[(4, 99)], 0)
-        .expect("manual paged finalization must succeed");
-    let after = crate::cold_tier::cold_sidecar_telemetry();
-
-    assert_eq!(
-        after.capture_reached,
-        before.capture_reached + 1,
-        "a media turn still enters the capture"
-    );
-    assert_eq!(
-        after.boundary_skips, before.boundary_skips,
-        "a media turn must be refused before the capture inspects the cold chain"
-    );
-    assert_eq!(
-        after.chain_empty, before.chain_empty,
-        "a media turn must be refused before the capture inspects the cold chain"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// MoE mirror of the dense chunk-size gate.
-///
-/// Catches: a `0` (single-shot) arm without a policy, or an `i32::MAX` arm
-/// under a policy, in `cold_gdn_prefill_chunk_size`.
-#[test]
-fn moe_cold_gdn_prefill_chunk_size_is_the_step_with_or_without_a_sidecar_policy() {
-    if crate::array::paged_prefill_chunk_size() != 0 {
-        return;
-    }
-    let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
-        "moe_cold_gdn_prefill_chunk_size_is_the_step_with_or_without_a_sidecar_policy",
-    ) else {
-        return;
-    };
-    assert_eq!(inner.cold_gdn_prefill_chunk_size(), 2048);
-
-    let root = moe_temp_cold_root("moe-chunk-size-policy");
-    install_moe_gdn_cold_tier(&mut inner, &root);
-    assert_eq!(inner.cold_gdn_prefill_chunk_size(), 2048);
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Tiny MoE config shaped for a REAL paged prefill, unlike [`tiny_moe_cfg`].
@@ -2644,8 +2131,6 @@ fn moe_a_released_serial_turn_ends_the_replay_points_use() {
         // saves no history here.
         let saved: &[u32] = if reuse { &[] } else { &prompt };
         {
-            // The finalize bumps the global sidecar capture counter.
-            let _serialized = crate::cold_tier::sidecar_counter_test_lock();
             PagedBackend::finalize_paged_turn(&mut inner, false, 0);
             PagedBackend::save_paged_history(&mut inner, saved, &[], false, reuse)
                 .expect("the save");

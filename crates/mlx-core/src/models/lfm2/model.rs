@@ -526,7 +526,9 @@ impl Lfm2Inner {
             |fingerprint| crate::transformer::paged_kv_cache_adapter::ColdTierContext {
                 manager,
                 fingerprint,
-                sidecar_policy: Some(sidecar_policy),
+                backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::Sidecar(
+                    sidecar_policy,
+                ),
             },
         )
     }
@@ -546,7 +548,7 @@ impl Lfm2Inner {
             .as_ref()
             .filter(|adapter| {
                 adapter.cold_tier().is_some_and(|cold| {
-                    cold.sidecar_policy.as_ref().is_some_and(|policy| {
+                    cold.sidecar_policy().is_some_and(|policy| {
                         policy.group() == mlx_paged_attn::ColdGroup::ConvState
                     })
                 })
@@ -724,7 +726,7 @@ impl Lfm2Inner {
         let Some(cold) = adapter.cold_tier() else {
             return;
         };
-        let Some(policy) = cold.sidecar_policy.as_ref() else {
+        let Some(policy) = cold.sidecar_policy() else {
             return;
         };
         if policy.group() != mlx_paged_attn::ColdGroup::ConvState {

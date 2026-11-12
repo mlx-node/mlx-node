@@ -15,6 +15,8 @@ type TakeLog = Rc<RefCell<Vec<UnitKey>>>;
 struct FakeSource {
     units: Vec<Victim>,
     nothing: HashSet<UnitKey>,
+    /// Keys whose take waits for a copy in flight.
+    pending: HashSet<UnitKey>,
     log: TakeLog,
     takes: usize,
 }
@@ -24,6 +26,7 @@ impl FakeSource {
         Self {
             units,
             nothing: HashSet::new(),
+            pending: HashSet::new(),
             log: log.clone(),
             takes: 0,
         }
@@ -41,6 +44,12 @@ impl VictimSource for FakeSource {
         self.log.borrow_mut().push(victim.key.clone());
         if self.nothing.contains(&victim.key) {
             return Taken::default();
+        }
+        if self.pending.contains(&victim.key) {
+            return Taken {
+                outcome: FreeOutcome::Pending,
+                ..Taken::default()
+            };
         }
         let at = self
             .units
@@ -98,6 +107,7 @@ fn unit(key: UnitKey, stamp: u64, bytes: u64, pages: u32, stage: Stage) -> Victi
         bytes,
         pages,
         stage,
+        later: false,
     }
 }
 
@@ -606,4 +616,163 @@ fn one_log_line_per_lack_and_outcome() {
     let _ = ledger.free(claim, pages(4), room(0), &mut FakePool::empty(), &mut []);
     assert_eq!(lines.lock().unwrap().len(), 2);
     assert!(lines.lock().unwrap()[0].starts_with("Memory: in-service claim of request 7"));
+}
+
+fn later(unit: Victim) -> Victim {
+    Victim {
+        later: true,
+        ..unit
+    }
+}
+
+fn immediate(cls: ClaimClass, request_id: u64) -> ClaimSpec {
+    ClaimSpec {
+        timing: NeedTiming::Immediate,
+        ..lane(cls, request_id, rank(true, 10))
+    }
+}
+
+/// Splash `MemoryLedger::take`: an Immediate claim passes over a unit that
+/// frees memory only once its copy lands, and notes that it reached one; a
+/// claim that waits for writes takes it, and its Pending take holds back
+/// every stage past the writes.
+/// Mutation LT1 (`best` ignores `later`) → red (no `uncopied`).
+#[test]
+fn immediate_claims_pass_what_lands_later() {
+    let units = || {
+        (
+            vec![later(unit(UnitKey::Store(1), 1, G, 0, Stage::NeedsWrite))],
+            vec![
+                unit(UnitKey::Store(5), 5, G, 0, Stage::FreeNow),
+                unit(UnitKey::Vision(6), 6, G, 0, Stage::Rebuild),
+                unit(rung(), 0, G, 0, Stage::InUse),
+            ],
+        )
+    };
+    let query = |spec: &ClaimSpec, need: u64| VictimQuery {
+        rights: take_rights(spec, &bytes(need), false),
+        need: bytes(need),
+    };
+    let lack = |need: u64| Lacking {
+        bytes: need,
+        pages: 0,
+        in_place: false,
+    };
+
+    let log = TakeLog::default();
+    let (writes, rest) = units();
+    let mut writes = FakeSource::new(writes, &log);
+    let mut rest = FakeSource::new(rest, &log);
+    let spec = immediate(ClaimClass::InService, 1);
+    let run = take(&mut [&mut writes, &mut rest], &query(&spec, G), &lack(G));
+    assert_eq!(*log.borrow(), vec![UnitKey::Store(5)]);
+    assert!(run.covered);
+    assert!(
+        run.uncopied,
+        "the Immediate take passed a unit that lands later"
+    );
+    assert!(!run.pending);
+
+    let log = TakeLog::default();
+    let (writes, rest) = units();
+    let mut writes = FakeSource::new(writes, &log);
+    writes.pending.insert(UnitKey::Store(1));
+    let mut rest = FakeSource::new(rest, &log);
+    let spec = lane(ClaimClass::InService, 2, rank(true, 10));
+    let run = take(
+        &mut [&mut writes, &mut rest],
+        &query(&spec, 4 * G),
+        &lack(4 * G),
+    );
+    assert_eq!(
+        *log.borrow(),
+        vec![UnitKey::Store(5), UnitKey::Vision(6), UnitKey::Store(1)]
+    );
+    assert!(run.pending, "the write's take waits for its copy");
+    assert!(run.uncopied);
+    assert!(!run.covered, "the unit in use stays past the writes");
+}
+
+/// Splash `MemoryLedger::copyDemand`: a `free` whose count or take reached
+/// a unit that lands later raises the copy demand for 60 s.
+/// Mutation CD1 (only the take's run sets it) → red (the count-only free
+/// leaves no demand); UC1 (`bound` sets `uncopied` only when it passes the
+/// unit) → red (the CanWait count leaves no demand).
+#[test]
+fn copy_demand_lasts_sixty_seconds() {
+    let sources = |log: &TakeLog| {
+        FakeSource::new(
+            vec![
+                unit(UnitKey::Store(1), 1, G, 0, Stage::FreeNow),
+                later(unit(UnitKey::Store(2), 2, G, 0, Stage::NeedsWrite)),
+            ],
+            log,
+        )
+    };
+
+    // An Immediate count passes the copy and covers nothing: no take.
+    let mut ledger = Ledger::new();
+    let log = TakeLog::default();
+    let claim = ledger.open(immediate(ClaimClass::InService, 1), M);
+    ledger.set_now(0.0);
+    let result = ledger.free(
+        claim,
+        bytes(3 * G / 2),
+        room(0),
+        &mut FakePool::empty(),
+        &mut [&mut sources(&log)],
+    );
+    assert_eq!(result.outcome, FreeOutcome::Short);
+    assert!(log.borrow().is_empty());
+    for now in [0.0, 30.0, 60.0] {
+        assert!(ledger.copy_demand(now), "at {now}");
+    }
+    assert!(!ledger.copy_demand(60.1));
+
+    // A run that reaches no copy leaves none.
+    let mut ledger = Ledger::new();
+    let log = TakeLog::default();
+    let claim = ledger.open(immediate(ClaimClass::InService, 1), M);
+    let result = ledger.free(
+        claim,
+        bytes(G),
+        room(0),
+        &mut FakePool::empty(),
+        &mut [&mut sources(&log)],
+    );
+    assert_eq!(result.outcome, FreeOutcome::Met);
+    assert!(!ledger.copy_demand(0.0));
+
+    // A CanWait count that reaches the copy, short of the need.
+    let mut ledger = Ledger::new();
+    let log = TakeLog::default();
+    let claim = ledger.open(lane(ClaimClass::InService, 1, rank(true, 10)), M);
+    let result = ledger.free(
+        claim,
+        bytes(3 * G),
+        room(0),
+        &mut FakePool::empty(),
+        &mut [&mut sources(&log)],
+    );
+    assert_eq!(result.outcome, FreeOutcome::Short);
+    assert!(log.borrow().is_empty());
+    assert!(
+        ledger.copy_demand(0.0),
+        "the CanWait count reached the copy"
+    );
+
+    // A CanWait take that takes the copy.
+    let mut ledger = Ledger::new();
+    let log = TakeLog::default();
+    let claim = ledger.open(lane(ClaimClass::InService, 1, rank(true, 10)), M);
+    let result = ledger.free(
+        claim,
+        bytes(2 * G),
+        room(0),
+        &mut FakePool::empty(),
+        &mut [&mut sources(&log)],
+    );
+    assert_eq!(result.outcome, FreeOutcome::Met);
+    assert_eq!(*log.borrow(), vec![UnitKey::Store(1), UnitKey::Store(2)]);
+    assert!(ledger.copy_demand(0.0));
 }

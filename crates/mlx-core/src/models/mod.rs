@@ -103,6 +103,7 @@ mod free_released_wiring_tests {
                     None,
                     None,
                     crate::engine::scheduler::DEFAULT_DECODE_SHARE,
+                    crate::disk_tier::DiskTierOptions::default(),
                 )
                 .await
                 .map(drop),
@@ -113,6 +114,7 @@ mod free_released_wiring_tests {
                     None,
                     None,
                     crate::engine::scheduler::DEFAULT_DECODE_SHARE,
+                    crate::disk_tier::DiskTierOptions::default(),
                 )
                 .await
                 .map(drop),

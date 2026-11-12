@@ -100,7 +100,7 @@ use super::paged_metadata_cache::{
 pub(crate) use super::cold_tier::PagedRestoreTicket;
 use super::cold_tier::{self, ColdTierWalk};
 pub use super::cold_tier::{
-    ColdCaptureBudget, ColdCaptureOutcome, ColdCaptureStop, ColdTierContext,
+    ColdCaptureBudget, ColdCaptureOutcome, ColdCaptureStop, ColdContextBacking, ColdTierContext,
 };
 
 use crate::array::{DType, MxArray};
@@ -1037,6 +1037,10 @@ pub struct PagedKVCacheAdapter {
     /// and clears this flag; later same-prompt turns restore normally. Not
     /// armed by the per-turn `release_request` path.
     suppress_cold_restore_once: bool,
+    /// The depth of the disk state the next prefix lookup resumes at: on a
+    /// state-backed tier the only cold walk, restoring the state's chain
+    /// below it whole or not at all. Taken by that lookup.
+    state_restore: Option<usize>,
 
     /// Auxiliary state the last prefix lookup restored, for the caller to
     /// install before it resumes from the cached prefix. Always `None` unless
@@ -1075,7 +1079,7 @@ pub struct PagedKVCacheAdapter {
     /// machine-checked instead of conventional.
     ///
     /// SET by `find_cached_prefix{,_per_block}_inner`, and only when the cold
-    /// tier carries a [`ColdSidecarPolicy`]. With `sidecar_policy: None` (dense
+    /// tier carries a [`ColdSidecarPolicy`]. With `ColdContextBacking::KvOnly` (dense
     /// `qwen3`, and every adapter with no cold tier at all) it is never set, so
     /// those families are bit-for-bit unaffected: every enforcement point below
     /// short-circuits on `false`.
@@ -1398,6 +1402,7 @@ impl PagedKVCacheAdapter {
             request_cache_salt: None,
             cold_tier: None,
             suppress_cold_restore_once: false,
+            state_restore: None,
             restored_sidecar: None,
             aux_prefix_unbacked: false,
             cold_capture: ColdCaptureOutcome::default(),
@@ -1523,35 +1528,6 @@ impl PagedKVCacheAdapter {
         self.cold_tier.as_ref()
     }
 
-    /// Tokens of `tokens` the turn-end capture walk reaches at least, under
-    /// this adapter's per-turn budget ([`ColdTierWalk::capture_reach`]).
-    /// `None` without a cold tier.
-    pub(crate) fn cold_capture_reach_tokens(
-        &self,
-        tokens: &[u32],
-        extra_keys_per_block: &[Vec<u64>],
-        cache_salt: u64,
-    ) -> Option<u32> {
-        let cold = self.cold_tier.as_ref()?;
-        let blocks = ColdTierWalk {
-            cold,
-            pool: &self.layer_kv_pool,
-            allocator: &self.allocator,
-            block_size: self.block_size,
-            held: self.held_blocks(),
-        }
-        .capture_reach(
-            tokens,
-            cache_salt,
-            self.cold_capture_budget.max_blocks,
-            |i| extra_keys_per_block.get(i).map(Vec::as_slice),
-        );
-        Some(
-            u32::try_from((blocks as u64).saturating_mul(u64::from(self.block_size)))
-                .unwrap_or(u32::MAX),
-        )
-    }
-
     /// Take the auxiliary state the last prefix lookup restored, if any.
     ///
     /// `Some` only for a family whose [`ColdTierContext::sidecar_policy`] is
@@ -1560,6 +1536,12 @@ impl PagedKVCacheAdapter {
     /// and the state together, so the caller can install this without
     /// re-checking the boundary. Taking it leaves `None` behind, so a caller
     /// that installs state once cannot accidentally install it twice.
+    /// The next prefix lookup resumes at the disk state `depth` deep (Splash
+    /// restores a disk state's chain with the state).
+    pub(crate) fn arm_state_restore(&mut self, depth: u32) {
+        self.state_restore = Some(depth as usize);
+    }
+
     pub fn take_restored_sidecar(&mut self) -> Option<mlx_paged_attn::ColdSidecar> {
         self.restored_sidecar.take()
     }
@@ -1610,10 +1592,11 @@ impl PagedKVCacheAdapter {
     /// adapter-owned because the latch's enforcement points (below, and the
     /// `record_tokens` / `register_*` / `finalize_*` callers of
     /// [`Self::ensure_aux_prefix_primed`]) are adapter methods.
-    fn aux_prefix_state_missing(&self) -> bool {
+    fn aux_prefix_state_missing(&self, cold_restored_blocks: usize) -> bool {
         cold_tier::aux_prefix_state_missing(
             self.cold_tier.as_ref(),
             self.cached_token_count,
+            cold_restored_blocks,
             self.restored_sidecar.as_ref(),
         )
     }
@@ -1672,7 +1655,6 @@ impl PagedKVCacheAdapter {
         &self.layer_kv_pool
     }
 
-    #[cfg(test)]
     pub(crate) fn allocator(&self) -> &Arc<Mutex<BlockAllocator>> {
         &self.allocator
     }
@@ -1931,7 +1913,7 @@ impl PagedKVCacheAdapter {
         let async_dense = self
             .cold_tier
             .as_ref()
-            .is_some_and(|cold| cold.sidecar_policy.is_none());
+            .is_some_and(ColdTierContext::kv_only);
         if !async_dense {
             return self
                 .prepare_turn_with_max_cache_hit_tokens(
@@ -2599,6 +2581,7 @@ impl PagedKVCacheAdapter {
         // (including the forced-miss `skip_lookup` path below), so exactly the
         // immediately-following request is suppressed.
         let suppress_cold_restore = std::mem::take(&mut self.suppress_cold_restore_once);
+        let state_restore = self.state_restore.take();
         if self.block_table.is_none() {
             return Err(format!("{op} called before reset_for_new_request"));
         }
@@ -2650,13 +2633,24 @@ impl PagedKVCacheAdapter {
         // governor the pool grows first for the blocks the lookup may
         // restore, an allocation of the turn's claim (Splash allocates a
         // restored chain's pages before its restore starts).
+        // A state-backed context restores no KV without its state.
+        let state_only = self
+            .cold_tier
+            .as_ref()
+            .is_some_and(ColdTierContext::state_only);
+        let restore_cold = restore_cold && (!state_only || state_restore.is_some());
+        let mut cold_restored_blocks = 0;
         if restore_cold
             && !suppress_cold_restore
             && self.cold_tier.is_some()
             && self.admission.is_some()
         {
+            let restored_len = match state_restore.filter(|_| state_only) {
+                Some(depth) => depth.min(lookup_len),
+                None => lookup_len,
+            };
             let restorable =
-                (lookup_len / self.block_size.max(1) as usize).saturating_sub(blocks.len());
+                (restored_len / self.block_size.max(1) as usize).saturating_sub(blocks.len());
             let restorable = u32::try_from(restorable).unwrap_or(u32::MAX);
             let held = self.held_blocks();
             let shortfall =
@@ -2669,6 +2663,10 @@ impl PagedKVCacheAdapter {
             && !suppress_cold_restore
             && let Some(cold) = self.cold_tier.as_ref()
         {
+            let backing = match state_restore.filter(|_| state_only) {
+                Some(depth) => cold_tier::ColdBacking::State { depth },
+                None => cold_tier::ColdBacking::Sidecar(cold.sidecar_policy()),
+            };
             let block_size = self.block_size;
             let walk = ColdTierWalk {
                 cold,
@@ -2681,6 +2679,7 @@ impl PagedKVCacheAdapter {
                 lookup_tokens,
                 cached_tokens,
                 cache_salt,
+                backing,
                 |i| keys.get(i),
                 |full_blocks| {
                     keys.chain_hashes(
@@ -2690,6 +2689,7 @@ impl PagedKVCacheAdapter {
                     )
                 },
             );
+            cold_restored_blocks = restored.blocks.len();
             cached_tokens += restored.blocks.len() * block_size as usize;
             blocks.extend(restored.blocks);
             // Backs exactly `cached_tokens` — the walk reduced the prefix and
@@ -2724,7 +2724,7 @@ impl PagedKVCacheAdapter {
         // The prefix above may include blocks the HOT cache served, which the
         // cold walk's reconcile-down never sees. Latch the outstanding
         // auxiliary-state obligation; see the `aux_prefix_unbacked` field doc.
-        self.aux_prefix_unbacked = self.aux_prefix_state_missing();
+        self.aux_prefix_unbacked = self.aux_prefix_state_missing(cold_restored_blocks);
         Ok(CachedPrefix {
             blocks,
             cached_token_count,
@@ -7459,7 +7459,10 @@ impl PagedKVCacheAdapter {
 
         // Persist the same chain to the SSD cold tier (see
         // [`ColdTierWalk::capture_chain`]).
-        if capture_cold && let Some(cold) = self.cold_tier.as_ref() {
+        if capture_cold
+            && let Some(cold) = self.cold_tier.as_ref()
+            && !cold.state_only()
+        {
             let outcome = ColdTierWalk {
                 cold,
                 pool: &self.layer_kv_pool,
@@ -9725,7 +9728,7 @@ mod tests {
         adapter.set_cold_tier(ColdTierContext {
             manager: Arc::new(manager),
             fingerprint,
-            sidecar_policy: None,
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::KvOnly,
         });
 
         let ctx = adapter.cold_tier().expect("context must be stored");
@@ -9758,7 +9761,7 @@ mod tests {
         adapter.set_cold_tier(ColdTierContext {
             manager: Arc::new(manager),
             fingerprint,
-            sidecar_policy: None,
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::KvOnly,
         });
 
         // Per-turn release must NOT arm the suppressor.
@@ -9831,7 +9834,7 @@ mod tests {
         adapter.set_cold_tier(ColdTierContext {
             manager: Arc::clone(&manager),
             fingerprint,
-            sidecar_policy: None,
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::KvOnly,
         });
 
         let tokens: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -9933,7 +9936,7 @@ mod tests {
         adapter.set_cold_tier(ColdTierContext {
             manager: Arc::clone(&manager),
             fingerprint,
-            sidecar_policy: None,
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::KvOnly,
         });
 
         let tokens: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -10057,7 +10060,7 @@ mod tests {
                 tag.as_bytes(),
                 b"capture-budget".as_slice(),
             ]),
-            sidecar_policy: None,
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::KvOnly,
         });
         Some((adapter, manager, root))
     }
@@ -10331,7 +10334,7 @@ mod tests {
             fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
                 b"qwen3-suppress-per-block".as_slice(),
             ]),
-            sidecar_policy: None,
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::KvOnly,
         });
 
         let per_block: Vec<Vec<u64>> = vec![Vec::new(), Vec::new()];
@@ -10442,7 +10445,7 @@ mod tests {
         adapter_src.set_cold_tier(ColdTierContext {
             manager: Arc::clone(&manager_src),
             fingerprint,
-            sidecar_policy: None,
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::KvOnly,
         });
 
         adapter_src.reset_for_new_request(0).unwrap();
@@ -10511,7 +10514,7 @@ mod tests {
         adapter_dst.set_cold_tier(ColdTierContext {
             manager: manager_dst,
             fingerprint,
-            sidecar_policy: None,
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::KvOnly,
         });
 
         adapter_dst.reset_for_new_request(0).unwrap();
@@ -10617,7 +10620,7 @@ mod tests {
         adapter_src.set_cold_tier(ColdTierContext {
             manager: Arc::clone(&manager_src),
             fingerprint,
-            sidecar_policy: None,
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::KvOnly,
         });
 
         adapter_src.reset_for_new_request(0).unwrap();
@@ -10688,7 +10691,7 @@ mod tests {
             adapter.set_cold_tier(ColdTierContext {
                 manager: Arc::new(open_test_cold_cache(root.clone()).expect("reopen cold cache")),
                 fingerprint,
-                sidecar_policy: None,
+                backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::KvOnly,
             });
             adapter.reset_for_new_request(0).unwrap();
             let prefix = adapter
@@ -10742,13 +10745,131 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Splash `QwenPrefixCache`: a qwen3_5 prefix the SSD tier backs needs its
+    /// state object, so a KV chain on disk alone restores nothing — neither
+    /// through the synchronous walk nor the async dense restore — and a
+    /// cold-restored block with no state install leaves the prefix unprimed.
+    /// The `KvOnly` control over the same chain restores all of it.
+    /// Mutation SO1: `StateOnly` treated as `KvOnly` → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn qwen35_cold_walk_needs_a_state() {
+        use crate::transformer::paged_kv_cache_adapter::ColdContextBacking;
+        use mlx_paged_attn::metal::MetalDtype;
+
+        let make_config = || PagedAttentionConfig {
+            block_size: 8,
+            gpu_memory_mb: 256,
+            head_size: 64,
+            num_kv_heads: 1,
+            num_layers: 2,
+            max_seq_len: Some(64),
+            max_batch_size: Some(1),
+        };
+        let pool_src = match LayerKVPool::new(make_config(), 8, 8, MetalDtype::BFloat16) {
+            Ok(pool) => Arc::new(pool),
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping qwen35_cold_walk_needs_a_state: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let tokens: Vec<u32> = (0..64u32).map(|i| 900 + i * 7).collect();
+        let fingerprint =
+            mlx_paged_attn::ColdCacheFingerprint::from_components(
+                [b"qwen35-state-only".as_slice()],
+            );
+        let root = std::env::temp_dir().join(format!(
+            "mlx-adapter-cold-state-only-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mut capture = PagedKVCacheAdapter::new(new_allocator(8, 8), Arc::clone(&pool_src), 8)
+            .expect("capture adapter ctor");
+        let manager =
+            Arc::new(open_test_cold_cache(root.clone()).expect("temp-dir cold cache must open"));
+        capture.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager),
+            fingerprint,
+            backing: ColdContextBacking::KvOnly,
+        });
+        capture.reset_for_new_request(0).unwrap();
+        capture.allocate_suffix_blocks(64).unwrap();
+        capture.record_tokens(&tokens).unwrap();
+        assert_eq!(capture.register_full_blocks_for_reuse(&[], 0).unwrap(), 8);
+        assert!(manager.drain(std::time::Duration::from_secs(10)));
+        drop(capture);
+        drop(manager);
+
+        let fresh = |backing: ColdContextBacking| {
+            let pool =
+                Arc::new(LayerKVPool::new(make_config(), 8, 8, MetalDtype::BFloat16).unwrap());
+            let manager = Arc::new(open_test_cold_cache(root.clone()).expect("reopen cold cache"));
+            let mut adapter = PagedKVCacheAdapter::new(new_allocator(8, 8), pool, 8)
+                .expect("restore adapter ctor");
+            adapter.set_cold_tier(ColdTierContext {
+                manager,
+                fingerprint,
+                backing,
+            });
+            adapter
+        };
+
+        let mut control = fresh(ColdContextBacking::KvOnly);
+        control.reset_for_new_request(0).unwrap();
+        let prefix = control.find_cached_prefix(&tokens, &[], 0, false).unwrap();
+        assert_eq!(
+            prefix.cached_token_count, 64,
+            "the KV-only control restores the chain"
+        );
+        drop(control);
+
+        let mut state_only = fresh(ColdContextBacking::StateOnly);
+        state_only.reset_for_new_request(0).unwrap();
+        let prefix = state_only
+            .find_cached_prefix(&tokens, &[], 0, false)
+            .unwrap();
+        assert_eq!(
+            prefix.cached_token_count, 0,
+            "a KV chain alone backs no qwen3_5 prefix"
+        );
+        assert!(prefix.blocks.is_empty());
+        drop(state_only);
+
+        let mut state_only = fresh(ColdContextBacking::StateOnly);
+        match state_only
+            .prepare_turn_with_async_restore(0, &tokens, 64, true, &[], 0, false, 63)
+            .unwrap()
+        {
+            PagedTurnAdmission::Ready(plan) => assert_eq!(plan.cached_prefix_len, 0),
+            PagedTurnAdmission::Waiting { .. } => {
+                panic!("a state-backed tier starts no async dense restore")
+            }
+        }
+        let context = state_only.cold_tier().expect("cold tier");
+        assert!(
+            crate::transformer::cold_tier::aux_prefix_state_missing(Some(context), 8, 1, None),
+            "a cold-restored block with no state install leaves the prefix unprimed"
+        );
+        assert!(!crate::transformer::cold_tier::aux_prefix_state_missing(
+            Some(context),
+            0,
+            0,
+            None
+        ));
+        drop(state_only);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Geometry of the auxiliary state the reconcile-down test persists.
     /// Deliberately tiny — what is under test is the boundary arithmetic and
     /// the gate, not the payload.
     #[cfg(target_os = "macos")]
     fn reconcile_sidecar_layout(boundary_tokens: u32) -> mlx_paged_attn::ColdSidecarLayout {
         mlx_paged_attn::ColdSidecarLayout {
-            group: mlx_paged_attn::ColdGroup::GdnState,
+            group: mlx_paged_attn::ColdGroup::ConvState,
             boundary_tokens,
             num_layers: 2,
             tensors_per_layer: 2,
@@ -10769,7 +10890,7 @@ mod tests {
     ///
     /// Eight full blocks are persisted once, then read back three ways:
     ///
-    ///   1. CONTROL — `sidecar_policy: None` (dense `qwen3` today) restores all
+    ///   1. CONTROL — `ColdContextBacking::KvOnly` (dense `qwen3` today) restores all
     ///      eight, byte-identical, under golden cold keys. This path must not
     ///      move at all.
     ///   2. A policy whose state is NOWHERE on disk restores ZERO blocks even
@@ -10858,7 +10979,7 @@ mod tests {
         adapter_src.set_cold_tier(ColdTierContext {
             manager: Arc::clone(&manager_src),
             fingerprint,
-            sidecar_policy: None,
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::KvOnly,
         });
         adapter_src.reset_for_new_request(0).unwrap();
         adapter_src.allocate_suffix_blocks(64).unwrap();
@@ -10922,7 +11043,10 @@ mod tests {
             adapter.set_cold_tier(ColdTierContext {
                 manager: Arc::clone(&manager),
                 fingerprint,
-                sidecar_policy: policy,
+                backing: policy.map_or(
+                    crate::transformer::paged_kv_cache_adapter::ColdContextBacking::KvOnly,
+                    crate::transformer::paged_kv_cache_adapter::ColdContextBacking::Sidecar,
+                ),
             });
             adapter.reset_for_new_request(0).unwrap();
             let prefix = if per_block {
@@ -11018,7 +11142,7 @@ mod tests {
 
         // Persist auxiliary state for the 32-token boundary only — block index
         // 3 of the chain, keyed in the sidecar's own group.
-        let sidecar_keys = chain_keys(mlx_paged_attn::ColdGroup::GdnState);
+        let sidecar_keys = chain_keys(mlx_paged_attn::ColdGroup::ConvState);
         let layout = reconcile_sidecar_layout(32);
         let tensor_count = layout.tensor_count().unwrap();
         let state = mlx_paged_attn::ColdSidecar {
@@ -11167,7 +11291,7 @@ mod tests {
         adapter.set_cold_tier(ColdTierContext {
             manager: Arc::clone(&manager),
             fingerprint,
-            sidecar_policy: None,
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::KvOnly,
         });
         adapter.reset_for_new_request(0).unwrap();
         adapter.allocate_suffix_blocks(32).unwrap();
@@ -11183,7 +11307,7 @@ mod tests {
         adapter.set_cold_tier(ColdTierContext {
             manager: Arc::clone(&manager),
             fingerprint,
-            sidecar_policy: Some(
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::Sidecar(
                 mlx_paged_attn::ColdSidecarPolicy::new(reconcile_sidecar_layout(32))
                     .expect("policy geometry must validate"),
             ),
@@ -11220,7 +11344,7 @@ mod tests {
     ///     recording, for registering and for finalizing — until the family
     ///     confirms it holds the out-of-pool state for exactly that prefix, and
     ///     a confirmation for a DIFFERENT boundary is refused too;
-    ///   * the `sidecar_policy: None` control (dense `qwen3`) is untouched: it
+    ///   * the `ColdContextBacking::KvOnly` control (dense `qwen3`) is untouched: it
     ///     is never latched and the confirmation is inert at any value.
     #[cfg(target_os = "macos")]
     #[test]
@@ -11257,11 +11381,11 @@ mod tests {
         let policy = mlx_paged_attn::ColdSidecarPolicy::new(reconcile_sidecar_layout(32))
             .expect("policy geometry must validate");
 
-        // --- CONTROL: `sidecar_policy: None`. Must not move at all. ---
+        // --- CONTROL: `ColdContextBacking::KvOnly`. Must not move at all. ---
         adapter.set_cold_tier(ColdTierContext {
             manager: Arc::clone(&manager),
             fingerprint,
-            sidecar_policy: None,
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::KvOnly,
         });
         adapter.reset_for_new_request(1).unwrap();
         let control = adapter.find_cached_prefix(&tokens, &[], 0, false).unwrap();
@@ -11283,7 +11407,9 @@ mod tests {
         adapter.set_cold_tier(ColdTierContext {
             manager: Arc::clone(&manager),
             fingerprint,
-            sidecar_policy: Some(policy),
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::Sidecar(
+                policy,
+            ),
         });
         adapter.reset_for_new_request(2).unwrap();
         let gated = adapter.find_cached_prefix(&tokens, &[], 0, false).unwrap();
@@ -11394,7 +11520,7 @@ mod tests {
         adapter.set_cold_tier(ColdTierContext {
             manager: Arc::clone(&manager),
             fingerprint,
-            sidecar_policy: Some(
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::Sidecar(
                 mlx_paged_attn::ColdSidecarPolicy::new(reconcile_sidecar_layout(32))
                     .expect("policy geometry must validate"),
             ),

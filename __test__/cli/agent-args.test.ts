@@ -123,17 +123,17 @@ describe('scanAgentArgs', () => {
     });
   });
 
-  describe('--no-persist-cache extraction', () => {
+  describe('--persistent-cache extraction', () => {
     it('lifts the mlx-owned flag out of passthrough', () => {
-      const scan = scanAgentArgs(['--no-persist-cache', '-p', 'hi']);
-      expect(scan.persistPagedCache).toBe(false);
+      const scan = scanAgentArgs(['--persistent-cache', '-p', 'hi']);
+      expect(scan.persistentCache).toBe(true);
       expect(scan.passthrough).toEqual(['-p', 'hi']);
     });
 
     it('does not hijack the flag when it sits in a value-consumer slot', () => {
-      const scan = scanAgentArgs(['--system-prompt-override', '--no-persist-cache']);
-      expect(scan.persistPagedCache).toBe(true);
-      expect(scan.passthrough).toEqual(['--system-prompt-override', '--no-persist-cache']);
+      const scan = scanAgentArgs(['--system-prompt-override', '--persistent-cache']);
+      expect(scan.persistentCache).toBe(false);
+      expect(scan.passthrough).toEqual(['--system-prompt-override', '--persistent-cache']);
     });
   });
 
@@ -776,7 +776,7 @@ describe('run() argv routing', () => {
     for (const argv of [
       ['models', '--models-dir', '--local'],
       ['--models-dir', '--help'],
-      ['--models-dir', '--no-persist-cache', '-p', 'hi'],
+      ['--models-dir', '--persistent-cache', '-p', 'hi'],
       ['--models-dir'],
       ['--models-dir', ''],
     ]) {
@@ -837,6 +837,38 @@ describe('run() argv routing', () => {
     expect(calls.launch).toHaveLength(1);
     expect(calls.launch[0]!.kvFormat).toBe('bf16');
     expect(calls.launch[0]!.argv).not.toContain('--kv-format');
+  });
+
+  // Mutation TSF1: drop `persistentCache` from the launcher pass-through → red.
+  it('exits 1 on bad SSD cache flags and hands good ones to the launcher', async () => {
+    for (const argv of [
+      ['--max-cache-disk', 'lots'],
+      ['--cache-dir', '/c'],
+      ['--persistent-cache', '--max-cache-disk=0'],
+    ]) {
+      const { deps, calls } = makeDeps();
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const prevExitCode = process.exitCode;
+      try {
+        await run(argv, deps);
+        expect(process.exitCode).toBe(1);
+        expect(errorSpy.mock.calls.flat().join('\n')).toContain('--');
+      } finally {
+        process.exitCode = prevExitCode;
+        errorSpy.mockRestore();
+      }
+      expect(calls.launch).toHaveLength(0);
+    }
+    const { deps, calls } = makeDeps();
+    await run(['--max-cache-disk', '64G', '--persistent-cache', '--cache-dir', '/c'], deps);
+    expect(calls.launch).toHaveLength(1);
+    expect(calls.launch[0]).toMatchObject({ cacheDisk: String(64 * 1024 ** 3), persistentCache: true, cacheDir: '/c' });
+    expect(calls.launch[0]!.argv).not.toContain('--persistent-cache');
+
+    const plain = makeDeps();
+    await run([], plain.deps);
+    expect(plain.calls.launch[0]!.persistentCache).toBeUndefined();
+    expect(plain.calls.launch[0]!.cacheDisk).toBeUndefined();
   });
 
   // Mutation: drop the `maxMemoryInvalid` usage check in `run` → red (a bad
@@ -926,7 +958,9 @@ describe('run() argv routing', () => {
       const output = logSpy.mock.calls.flat().join('\n');
       expect(output).toContain('--trace');
       expect(output).toContain('--trace-dir <dir>');
-      expect(output).toContain('--no-persist-cache');
+      expect(output).toContain('--max-cache-disk <size>');
+      expect(output).toContain('--persistent-cache');
+      expect(output).toContain('--cache-dir <dir>');
       expect(output).toContain('MLX_NODE_LOG');
       expect(output).toContain('MLX_NODE_LOG_FILE');
       expect(output).toContain('MLX_AGENT_BIN');

@@ -213,12 +213,28 @@ impl Qwen35Inner {
             tokens: plan,
             keys: Some((&lookup_extra_keys, cache_salt)),
         };
+        // A disk state's chain comes back with the KV lookup.
+        let disk_state = dflash2_hit
+            .is_none()
+            .then(|| {
+                crate::models::qwen3_5::dflash2_turn::disk_state_depth(
+                    self,
+                    plan,
+                    &lookup_extra_keys,
+                    cache_salt,
+                    max_cache_hit_tokens,
+                )
+            })
+            .flatten();
         let turn_plan = crate::models::qwen3_5::dflash2_turn::claimed(self, keep, |inner| {
             let adapter = inner
                 .paged_adapter
                 .as_mut()
                 .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?;
             let Some(hit) = dflash2_hit else {
+                if let Some(depth) = disk_state {
+                    adapter.arm_state_restore(depth);
+                }
                 // A scheduled lane books nothing past its hit: each prefill
                 // slice's step claim books the slice (Splash
                 // `Engine::workEndOf`).
@@ -708,9 +724,7 @@ impl PagedBackend for Qwen35Inner {
                     block_size,
                     &self.cached_paged_image_token_positions,
                 );
-                // The release is attempted below (even when registration fails),
-                // but only AFTER the GDN sidecar capture — releasing resets the
-                // adapter's cold-chain frontier to 0.
+                // The release is attempted below, even when registration fails.
                 release_pending = true;
                 crate::models::qwen3_5::dflash2_turn::log_turn_end("register");
                 adapter
@@ -719,22 +733,6 @@ impl PagedBackend for Qwen35Inner {
             }
             None => Some("paged_adapter is None during dense finalization".to_owned()),
         };
-        // Persist the out-of-pool GDN recurrent state for the SAME chain the
-        // adapter just captured (its `cold_captured_blocks` is now set), so a
-        // later process can resume from the restored K/V prefix instead of
-        // replaying GDN over it. Runs BEFORE the release below, which resets the
-        // captured-chain frontier to 0. Skipped when the finalize failed: the
-        // K/V chain the sidecar would anchor on was not published, so nothing
-        // could ever select it. Also skipped while the refuse-to-persist latch
-        // is armed — same gate as the manual epilogue, so no durable GDN state
-        // is enqueued anywhere while a frontier disagreement stands.
-        if finalize_error.is_none() && !self.paged_gdn_state_dirty {
-            self.capture_dense_gdn_cold_sidecar(
-                &self.cached_paged_image_token_positions,
-                cache_salt,
-            );
-        }
-        self.gdn_unclaimed_rungs.remove(&self.active_scheduled_seq);
         // Always attempt the release for the non-reuse path, even when
         // registration failed.
         if release_pending && let Some(adapter) = self.paged_adapter.as_mut() {

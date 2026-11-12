@@ -23,8 +23,8 @@ use super::host::{
 };
 use super::ledger::{
     Charge, ClaimClass, ClaimId, ClaimRank, ClaimSpec, FreeOutcome, FreePool, FreeResult, Ledger,
-    LedgerSnapshot, Need, NeedTiming, ReachClass, VictimSource, WantedChains, count_available,
-    decide, take_rights,
+    LedgerSnapshot, Need, NeedTiming, ReachClass, Returning, VictimSource, WantedChains,
+    count_available, decide, take_rights,
 };
 use super::metrics::{Gap, Metrics, TtftParts};
 use crate::engine::scheduler::{SchedulerCounterSnapshot, SchedulerCounters};
@@ -384,6 +384,8 @@ struct PublishedAccounts {
     kv: AtomicU64,
     states: AtomicU64,
     embeddings: AtomicU64,
+    /// Blocks the model's tracked SSD writes free once they land.
+    landing_pages: AtomicU64,
 }
 
 /// Splash `ResourceWaitSnapshot` of one model.
@@ -443,6 +445,48 @@ pub(crate) struct DFlash2StateStatus {
     pub checkpoint_entries: u64,
     pub checkpoint_bytes: u64,
     pub in_use: u64,
+    pub disk_entries: u64,
+    pub disk_bytes: u64,
+    pub offloads: u64,
+    pub offload_failures: u64,
+    pub invalidations: u64,
+    pub disk_promotions: u64,
+    pub disk_promotions_skipped: u64,
+    pub disk_state_publications: u64,
+    pub disk: DFlash2DiskStatus,
+}
+
+/// The SSD tier a model keeps its states on (Splash `/status` `disk`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DiskMode {
+    #[default]
+    Off,
+    Temp,
+    Persistent,
+}
+
+impl DiskMode {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            DiskMode::Off => "off",
+            DiskMode::Temp => "temp",
+            DiskMode::Persistent => "persistent",
+        }
+    }
+}
+
+/// Splash `/status` `disk`: the tier's mode and limits, the states it took
+/// back at load, and its write-behind (`WriteBehindSnapshot`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DFlash2DiskStatus {
+    pub mode: DiskMode,
+    pub limit_bytes: u64,
+    pub held_bytes: u64,
+    pub taken_back: u64,
+    pub write_behind_waiting: u64,
+    pub write_behind_durable: u64,
+    pub write_behind_unneeded: u64,
+    pub write_behind_refused: u64,
 }
 
 impl DFlash2StateStatus {
@@ -464,6 +508,23 @@ impl DFlash2StateStatus {
         self.checkpoint_entries += other.checkpoint_entries;
         self.checkpoint_bytes += other.checkpoint_bytes;
         self.in_use += other.in_use;
+        self.disk_entries += other.disk_entries;
+        self.disk_bytes += other.disk_bytes;
+        self.offloads += other.offloads;
+        self.offload_failures += other.offload_failures;
+        self.invalidations += other.invalidations;
+        self.disk_promotions += other.disk_promotions;
+        self.disk_promotions_skipped += other.disk_promotions_skipped;
+        self.disk_state_publications += other.disk_state_publications;
+        let (disk, theirs) = (&mut self.disk, &other.disk);
+        disk.mode = disk.mode.max(theirs.mode);
+        disk.limit_bytes += theirs.limit_bytes;
+        disk.held_bytes += theirs.held_bytes;
+        disk.taken_back += theirs.taken_back;
+        disk.write_behind_waiting += theirs.write_behind_waiting;
+        disk.write_behind_durable += theirs.write_behind_durable;
+        disk.write_behind_unneeded += theirs.write_behind_unneeded;
+        disk.write_behind_refused += theirs.write_behind_refused;
     }
 }
 
@@ -817,6 +878,15 @@ impl Governor {
             model.model_id,
             "embeddings",
             read(|accounts| &accounts.embeddings),
+        );
+        let landing = Arc::clone(&accounts);
+        books.ledger.add_returning(
+            model.model_id,
+            Arc::new(move || Returning {
+                landing_pages: u32::try_from(landing.landing_pages.load(Ordering::Relaxed))
+                    .unwrap_or(u32::MAX),
+                ..Returning::default()
+            }),
         );
         self.registered.fetch_add(1, Ordering::AcqRel);
         books.apply_memory_limit(&*self.io, stats.pools);
@@ -1324,6 +1394,20 @@ impl Governor {
         published
             .embeddings
             .store(accounts.embeddings, Ordering::Relaxed);
+    }
+
+    /// The blocks the model thread's tracked SSD writes free once they land
+    /// (Splash `Cache::returningOf`), read at each decision.
+    pub(crate) fn publish_landing_pages(&self, model: u64, pages: u32) {
+        if let Some(published) = self
+            .lock()
+            .model(model)
+            .map(|entry| Arc::clone(&entry.accounts))
+        {
+            published
+                .landing_pages
+                .store(u64::from(pages), Ordering::Relaxed);
+        }
     }
 
     /// The model thread's DFlash2 states, read by the status.

@@ -11,7 +11,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
-use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard, resolve_persist_cold};
+use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard};
 use crate::models::paged_config::PagedCacheConfig;
 use crate::models::quant_dispatch::{
     PlainFp8Residency, default_per_layer_quant, defer_plain_fp8_materialization, effective_plq_for,
@@ -2557,6 +2557,7 @@ pub async fn load_with_thread(
         None,
         None,
         crate::engine::scheduler::DEFAULT_DECODE_SHARE,
+        crate::disk_tier::DiskTierOptions::default(),
     )
     .await
 }
@@ -2569,6 +2570,7 @@ pub(crate) async fn load_with_source(
     max_memory_bytes: Option<u64>,
     max_context: Option<u32>,
     decode_share: f64,
+    disk: crate::disk_tier::DiskTierOptions,
 ) -> Result<Qwen3_5Model> {
     load_with_thread_impl(
         source,
@@ -2577,6 +2579,7 @@ pub(crate) async fn load_with_source(
         max_memory_bytes,
         max_context,
         decode_share,
+        disk,
         false,
     )
     .await
@@ -2592,6 +2595,10 @@ pub(crate) async fn load_clef_with_source(source: &CheckpointSource) -> Result<Q
         None,
         None,
         crate::engine::scheduler::DEFAULT_DECODE_SHARE,
+        crate::disk_tier::DiskTierOptions {
+            cache_disk: crate::disk_tier::CacheDisk::Off,
+            ..Default::default()
+        },
         true,
     )
     .await
@@ -2646,6 +2653,7 @@ async fn load_with_thread_impl(
     max_memory_bytes: Option<u64>,
     max_context: Option<u32>,
     decode_share: f64,
+    disk: crate::disk_tier::DiskTierOptions,
     clef: bool,
 ) -> Result<Qwen3_5Model> {
     let model_assets_path = source.asset_dir().to_string_lossy().into_owned();
@@ -2703,7 +2711,6 @@ async fn load_with_thread_impl(
                 }
                 // Decision inference never allocates a chat KV pool or speculative head.
                 if clef {
-                    config.persist_paged_cache = Some(false);
                     config.n_mtp_layers = 0;
                     config.kv_format = Some("bf16".into());
                     if config.tie_word_embeddings {
@@ -2743,20 +2750,12 @@ async fn load_with_thread_impl(
                     config.num_layers, config.hidden_size, config.num_heads, config.num_kv_heads,
                 );
 
-                // Cold-tier persistence decision, resolved BEFORE the mmap so the
-                // shard-identity bracket that guards it can straddle the load.
-                // Precedence: explicit per-model config > MLX_PERSIST_PAGED_CACHE
-                // env default > off (see `resolve_persist_cold`).
-                let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
-                let persist_cold = resolve_persist_cold(
-                    "qwen3_5",
-                    persist_env.as_deref(),
-                    config.persist_paged_cache,
-                );
+                // A persistent SSD tier keys its states by the weights' identity,
+                // so its shard-identity bracket straddles the load.
                 let gguf_identity = preload_input.as_ref().map(|input| input.identity());
                 let checkpoint_files = CheckpointFiles::new(path, gguf_identity.as_ref());
                 let mut checkpoint_load =
-                    CheckpointLoadGuard::before_read(checkpoint_files, persist_cold);
+                    CheckpointLoadGuard::before_read(checkpoint_files, disk.reads_identity());
 
                 // Parse quantization metadata before sanitizing: the sanitize
                 // pass may fuse matching GDN split buffers, and it must retain
@@ -3048,6 +3047,7 @@ async fn load_with_thread_impl(
                 // Create inner model
                 let mut inner = Qwen35Inner::new(config.clone())?;
                 inner.max_memory_bytes = max_memory_bytes;
+                inner.disk_options = disk.clone();
                 inner.max_context = max_context;
                 inner.decode_share = decode_share;
                 inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(path));
@@ -3255,35 +3255,12 @@ async fn load_with_thread_impl(
                         },
                     )?;
 
-                // Fail-closed revalidation bracketing the WHOLE
-                // load-to-materialize-to-fingerprint span, then attach the SSD cold
-                // tier. The fingerprint (built from the paged pool geometry + GDN
-                // sidecar geometry, so it needs the adapter that
-                // `initialize_paged_adapter` just built) reads the shards; only if
-                // shard identity is provably unchanged across [before-mmap ..
-                // at-mmap .. after-fingerprint] is the tier committed, so a mid-load
-                // directory swap can never bind OLD weights to a NEW revision's
-                // fingerprint. A hybrid family's context carries a
-                // `ColdSidecarPolicy`, so the restore walk refuses any boundary a
-                // validated GDN sidecar does not back.
-                //
-                // Both steps take the `materialize_weights` witness, so the ordering
-                // that keeps a lazy `pread` from landing after the identity read is
-                // enforced by the compiler rather than by this call order.
-                if persist_cold
-                    && let Some(ctx) =
-                        inner.build_cold_tier_context(checkpoint_files, &weights_resident)
-                {
-                    if checkpoint_load.stable_after_fingerprint() {
-                        inner.attach_cold_tier(ctx, &weights_resident);
-                    } else {
-                        warn!(
-                            "cold-tier persistence disabled for {model_path}: model \
-                             directory changed during load (shard identity mismatch); \
-                             KV persistence stays off for safety"
-                        );
-                    }
-                }
+                inner.build_disk_tier_context(
+                    checkpoint_files,
+                    draft_model_path.as_deref().map(Path::new),
+                    &weights_resident,
+                    &checkpoint_load,
+                );
 
                 Ok((inner, weight_bytes, pool_cache_limit_guard))
             })();
@@ -3496,11 +3473,6 @@ pub(crate) fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         // remain available by setting `paged_cache_memory_mb` explicitly.
         paged_cache_memory_mb: paged.paged_cache_memory_mb,
         paged_block_size: paged.paged_block_size,
-        // Persist the out-of-pool GDN recurrent state to the SSD cold tier. Off
-        // unless explicitly present as a bool (the agent overlay / a config
-        // override). `MLX_PERSIST_PAGED_CACHE` supplies the env default at load
-        // (`resolve_persist_cold`), so this stays a strict tri-state read.
-        persist_paged_cache: paged.persist_paged_cache,
         n_mtp_layers: gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0),
         qwen35_gguf_gdn_layout: raw
             .get("qwen35_gguf_gdn_layout")
@@ -3792,23 +3764,19 @@ mod tests {
                 "intermediate_size": 128,
                 "num_experts": 2,
                 "paged_cache_memory_mb": 999,
-                "paged_block_size": 999,
-                "persist_paged_cache": true
+                "paged_block_size": 999
             }
         });
         let absent = parse_config(&raw).unwrap();
         assert_eq!(absent.paged_cache_memory_mb, None);
         assert_eq!(absent.paged_block_size, None);
-        assert_eq!(absent.persist_paged_cache, None);
         raw["paged_cache_memory_mb"] = json!(4294967360_u64);
         raw["paged_block_size"] = json!(-1);
         raw["pagedBlockSize"] = json!(32);
         raw["use_block_paged_cache"] = json!(false);
-        raw["persist_paged_cache"] = json!(false);
         let config = parse_config(&raw).unwrap();
         assert_eq!(config.paged_cache_memory_mb, Some(64));
         assert_eq!(config.paged_block_size, None);
-        assert_eq!(config.persist_paged_cache, Some(false));
     }
 
     fn packed_projection(rows: i64, weight_cols: i64) -> (MxArray, MxArray, MxArray) {
@@ -4938,7 +4906,6 @@ mod tests {
             rope_theta: 100_000.0,
             paged_cache_memory_mb: None,
             paged_block_size: None,
-            persist_paged_cache: None,
             n_mtp_layers: 0,
         }
     }

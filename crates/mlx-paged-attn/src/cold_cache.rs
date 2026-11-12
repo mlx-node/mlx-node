@@ -21,8 +21,8 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -47,7 +47,7 @@ const OBJECT_SUFFIX: &str = ".safetensors";
 /// (`MLX_COLD_CAPTURE_BLOCKS_PER_TURN`), which waits for a slot rather than
 /// giving up on one, so raising this constant no longer buys reach — it only
 /// buys queue slack, at the cost of host memory.
-const DEFAULT_QUEUE_DEPTH: usize = 8;
+pub const DEFAULT_QUEUE_DEPTH: usize = 8;
 const GIB: u64 = 1024 * 1024 * 1024;
 const MAX_DEFAULT_QUOTA: u64 = 100 * GIB;
 const MIN_FREE_RESERVE: u64 = 5 * GIB;
@@ -106,22 +106,23 @@ impl fmt::Debug for ColdCacheFingerprint {
 pub enum ColdGroup {
     /// Paged KV blocks: `1 + 2*num_layers` tensors per 16-token block.
     Kv,
-    /// GDN recurrent state at a block boundary (qwen3_5 / qwen3_5_moe), which
-    /// lives outside the paged pool and is therefore not covered by any KV
-    /// block.
-    GdnState,
     /// Short-convolution recurrent state at a block boundary (lfm2 /
     /// lfm2_moe), which lives outside the paged full-attention pool.
     ConvState,
     /// Sliding-window (`RotatingKVCache`) state at a block boundary (gemma4),
     /// likewise outside the paged pool.
     SlidingWindow,
+    /// One DFlash2 state object (Splash `QwenCompositeState` slot): byte spans
+    /// in Splash `stateSpans` order, the GDN cell then the draft context
+    /// window. Not a sidecar: it carries its own label and is read straight
+    /// into the caller's buffer.
+    DFlash2State,
 }
 
 impl ColdGroup {
     /// Every non-KV group, in a stable order. Used by name parsing and by the
     /// dashboard-facing filename contract.
-    pub const SIDECAR_GROUPS: [Self; 3] = [Self::GdnState, Self::ConvState, Self::SlidingWindow];
+    pub const SIDECAR_GROUPS: [Self; 2] = [Self::ConvState, Self::SlidingWindow];
 
     /// Domain-separation tag hashed as the first component of every key.
     ///
@@ -133,9 +134,9 @@ impl ColdGroup {
         match self {
             // Byte-identical to the pre-group constant: DO NOT EDIT.
             Self::Kv => b"mlx-node:cold-prefix-block:v1\0",
-            Self::GdnState => b"mlx-node:cold-sidecar-gdn-state:v1\0",
             Self::ConvState => b"mlx-node:cold-sidecar-conv-state:v1\0",
             Self::SlidingWindow => b"mlx-node:cold-sidecar-sliding-window:v1\0",
+            Self::DFlash2State => b"mlx-node:cold-state-dflash2:v1\0",
         }
     }
 
@@ -145,18 +146,18 @@ impl ColdGroup {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Kv => "kv",
-            Self::GdnState => "gdn_state",
             Self::ConvState => "conv_state",
             Self::SlidingWindow => "sliding_window",
+            Self::DFlash2State => "dflash2_state",
         }
     }
 
     fn from_label(label: &str) -> Option<Self> {
         match label {
             "kv" => Some(Self::Kv),
-            "gdn_state" => Some(Self::GdnState),
             "conv_state" => Some(Self::ConvState),
             "sliding_window" => Some(Self::SlidingWindow),
+            "dflash2_state" => Some(Self::DFlash2State),
             _ => None,
         }
     }
@@ -331,8 +332,8 @@ impl ColdSidecarLayout {
     /// half: a policy is a geometry TEMPLATE whose boundary is only known once
     /// a candidate prefix is in hand.
     pub fn validate_geometry(&self) -> Result<(), String> {
-        if self.group == ColdGroup::Kv {
-            return Err("cold-cache sidecars must not use the KV group".to_string());
+        if matches!(self.group, ColdGroup::Kv | ColdGroup::DFlash2State) {
+            return Err("cold-cache sidecars must not use the KV or state group".to_string());
         }
         if self.num_layers == 0 || self.tensors_per_layer == 0 {
             return Err("cold-cache sidecar must carry at least one state tensor".to_string());
@@ -523,6 +524,126 @@ impl ColdSidecar {
         }
         Ok(())
     }
+}
+
+/// Most spans one state object may carry (Splash `stateSpans` has two).
+const MAX_STATE_SPANS: usize = 8;
+
+/// Longest geometry text a state object records; keeps the header bounded.
+const MAX_STATE_GEOMETRY_BYTES: usize = 4096;
+
+/// Header cap for [`ColdCacheManager::state_label`], which reads a header
+/// without knowing its layout: 8 hex digits per label token, so this admits
+/// labels of several million tokens and no forged length past it.
+const STATE_LABEL_HEADER_CAP: u64 = 64 << 20;
+
+/// Shape of one DFlash2 state object: the byte spans in Splash `stateSpans`
+/// order (GDN cell, then the draft context window) and the geometry text the
+/// reader must match (Splash `QwenStateStorage::adopt` refuses any payload but
+/// its own `cachedBytes`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColdStateLayout {
+    /// Prefix tokens the state is valid at; the label carries exactly these.
+    pub boundary_tokens: u32,
+    pub spans: Vec<u64>,
+    pub geometry: String,
+}
+
+impl ColdStateLayout {
+    /// Sum of the spans: the state's `cachedBytes`. `None` on overflow.
+    pub fn payload_bytes(&self) -> Option<u64> {
+        self.spans
+            .iter()
+            .try_fold(0u64, |total, &span| total.checked_add(span))
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.boundary_tokens == 0 {
+            return Err("cold-cache state boundary must be a positive token count".to_string());
+        }
+        if self.spans.is_empty() || self.spans.len() > MAX_STATE_SPANS {
+            return Err("cold-cache state span count out of range".to_string());
+        }
+        if self.spans.contains(&0) {
+            return Err("cold-cache state spans must be non-empty".to_string());
+        }
+        let total = self
+            .payload_bytes()
+            .ok_or_else(|| "cold-cache state payload overflows".to_string())?;
+        if usize::try_from(total).is_err() {
+            return Err("cold-cache state payload exceeds the address space".to_string());
+        }
+        if self.geometry.len() > MAX_STATE_GEOMETRY_BYTES {
+            return Err("cold-cache state geometry text exceeds the bound".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// What a persistent tier needs to adopt a state after a restart (Splash
+/// `StateLabel`), plus the lineage itself: cold KV keys and allocator hashes
+/// derive from the tokens and the block-zero salt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColdStateLabel {
+    pub tokens: Vec<u32>,
+    pub salt: u64,
+    pub last_used: u64,
+    pub checkpoint: bool,
+}
+
+/// One state write. `payload` is the tier's single staging buffer; the writer
+/// hands it back in [`Landed::State`] whatever the outcome.
+#[derive(Debug)]
+pub struct ColdStateObject {
+    pub key: ColdCacheKey,
+    pub fingerprint: ColdCacheFingerprint,
+    pub layout: ColdStateLayout,
+    pub label: ColdStateLabel,
+    pub payload: Vec<u8>,
+}
+
+impl ColdStateObject {
+    fn validate(&self) -> Result<(), String> {
+        self.layout.validate()?;
+        if self.label.tokens.len() != self.layout.boundary_tokens as usize {
+            return Err("cold-cache state label does not carry the boundary tokens".to_string());
+        }
+        if self.layout.payload_bytes() != Some(self.payload.len() as u64) {
+            return Err("cold-cache state payload does not match its spans".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Completion of a tracked write, sent on the caller's channel.
+#[derive(Debug)]
+pub enum Landed {
+    State {
+        key: ColdCacheKey,
+        ok: bool,
+        payload: Vec<u8>,
+    },
+    Block {
+        key: ColdCacheKey,
+        ok: bool,
+    },
+}
+
+/// Whether a tracked write may evict to fit (Splash `startWrite` /
+/// `acquireSlot` `makeRoom`; only a persistent tier makes room for
+/// write-behind).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MakeRoom {
+    Evict,
+    Refuse,
+}
+
+/// A refused [`ColdCacheManager::enqueue_state`]: `Busy` while a state write
+/// is queued, `Gone` once the writer stopped. Both hand the object back.
+#[derive(Debug)]
+pub enum EnqueueRefused<T> {
+    Busy(T),
+    Gone(T),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1148,7 +1269,29 @@ struct Shared {
     /// consistent with the on-disk canonical file.
     #[cfg(test)]
     dir_sync_override: TestSyncOverride,
+    /// Commit order of every object the writer renamed into place.
+    #[cfg(test)]
+    commit_log: Mutex<Vec<ColdCacheKey>>,
+    /// Block snapshot reads started by the capture paths.
+    #[cfg(test)]
+    capture_reads: AtomicU64,
+    /// Jobs sitting in the block lane (blocks, sidecars, barriers): taken
+    /// before the send, given back on a refused send, taken off by the writer
+    /// as it receives one.
+    queued_blocks: AtomicUsize,
+    queue_depth: usize,
+    /// Set by [`ColdCacheManager::close`]; the writer stops and every later
+    /// admission is refused as gone.
+    stopped: AtomicBool,
+    /// A tracked write failed for anything but room (Splash `SlotFile::stop`:
+    /// the file takes no more writes after one failed): every later tracked
+    /// job is refused.
+    tracked_failed: AtomicBool,
+    /// Called after every tracked job (state or tracked block) lands.
+    landing_wake: Mutex<Option<LandingWake>>,
 }
+
+type LandingWake = Arc<dyn Fn() + Send + Sync>;
 
 impl Shared {
     /// Filesystem `(total, available)` bytes backing eviction decisions.
@@ -1180,6 +1323,8 @@ impl Shared {
 /// the property [`ColdCacheManager::drain`] relies on for a shutdown flush.
 enum WriteJob {
     Block(ColdCacheBlock),
+    /// A block whose landing the caller follows ([`Landed::Block`]).
+    Tracked(Box<TrackedBlock>),
     /// A non-KV state sidecar. Persisted through the same durable path and
     /// covered by the same barrier semantics as `Block`.
     Sidecar(Box<ColdSidecar>),
@@ -1190,11 +1335,29 @@ enum WriteJob {
     Barrier(SyncSender<bool>),
 }
 
+struct TrackedBlock {
+    block: ColdCacheBlock,
+    room: MakeRoom,
+    done: Sender<Landed>,
+}
+
+/// The state lane's one job. The writer takes it before the next block-lane
+/// job, so a state never waits behind a queued KV chain.
+struct StateJob {
+    object: Box<ColdStateObject>,
+    room: MakeRoom,
+    done: Sender<Landed>,
+}
+
 /// Bounded background SSD cache. Clones share one queue/index.
 #[derive(Clone)]
 pub struct ColdCacheManager {
     shared: Arc<Shared>,
     sender: SyncSender<WriteJob>,
+    state_sender: SyncSender<StateJob>,
+    /// One token wakes the writer to scan both lanes; a full slot means a
+    /// wake is already pending.
+    wake: SyncSender<()>,
 }
 
 impl ColdCacheManager {
@@ -1264,63 +1427,30 @@ impl ColdCacheManager {
             space_override: Mutex::new(None),
             #[cfg(test)]
             dir_sync_override: Mutex::new(None),
+            #[cfg(test)]
+            commit_log: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            capture_reads: AtomicU64::new(0),
+            queued_blocks: AtomicUsize::new(0),
+            queue_depth,
+            stopped: AtomicBool::new(false),
+            tracked_failed: AtomicBool::new(false),
+            landing_wake: Mutex::new(None),
         });
         let (sender, receiver) = mpsc::sync_channel::<WriteJob>(queue_depth);
+        let (state_sender, state_receiver) = mpsc::sync_channel::<StateJob>(1);
+        let (wake, wake_receiver) = mpsc::sync_channel::<()>(1);
         let worker_shared = Arc::clone(&shared);
         std::thread::Builder::new()
             .name("mlx-paged-ssd-writer".to_string())
-            .spawn(move || {
-                // Whether any block since the last barrier failed to persist.
-                // Inference is still fail-open (the hot block is valid), but the
-                // flag lets a covering drain barrier report durability honestly
-                // instead of acking success unconditionally. Reset after each
-                // barrier so every drain reports only on its own window.
-                let mut failed = false;
-                while let Ok(job) = receiver.recv() {
-                    match job {
-                        // Fail-open: inference already has a valid hot block. A
-                        // persistence error only means the next process
-                        // recomputes — but a pending drain barrier must learn
-                        // that this covered block did not become durable, and
-                        // `write_errors` must learn it too. That counter is the
-                        // ONLY thing standing between a fail-open writer and a
-                        // fail-silent one: the error is returned to nobody, so
-                        // without the bump here a root that accepts no writes
-                        // at all still reports a spotless cache. Counted once
-                        // per accepted job, whatever step of the persist failed,
-                        // because this is the one place that sees every
-                        // outcome of every job the queue admitted.
-                        WriteJob::Block(block) => {
-                            if persist_block(&worker_shared, &block).is_err() {
-                                worker_shared
-                                    .stats
-                                    .write_errors
-                                    .fetch_add(1, Ordering::Relaxed);
-                                failed = true;
-                            }
-                        }
-                        WriteJob::Sidecar(sidecar) => {
-                            if persist_sidecar(&worker_shared, &sidecar).is_err() {
-                                worker_shared
-                                    .stats
-                                    .write_errors
-                                    .fetch_add(1, Ordering::Relaxed);
-                                failed = true;
-                            }
-                        }
-                        // Every earlier `Block` has already been persisted (FIFO,
-                        // single consumer), so acking here signals the drain is
-                        // complete; the ack now reports whether all of them
-                        // succeeded. A gone receiver (drain timed out) is fine.
-                        WriteJob::Barrier(ack) => {
-                            let _ = ack.send(!failed);
-                            failed = false;
-                        }
-                    }
-                }
-            })
+            .spawn(move || writer_loop(&worker_shared, &receiver, &state_receiver, &wake_receiver))
             .map_err(|e| format!("spawn cold-cache writer: {e}"))?;
-        Ok(Self { shared, sender })
+        Ok(Self {
+            shared,
+            sender,
+            state_sender,
+            wake,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -1417,9 +1547,119 @@ impl ColdCacheManager {
         tokens: &[u32],
         deadline: Instant,
     ) -> Result<bool, String> {
+        let captured = self.capture_block(pool, block, key, fingerprint, tokens)?;
+        self.send_before(WriteJob::Block(captured), deadline)
+    }
+
+    /// [`Self::capture_and_enqueue_before`] for a write the caller follows:
+    /// the writer reports it as [`Landed::Block`] on `done` and calls the
+    /// landing wake. Room in the queue is checked BEFORE the snapshot, so a
+    /// queue still full at `deadline` costs no blit; that refusal is
+    /// `Ok(false)` and a `queue_drops`. `room` decides whether the write may
+    /// evict to fit under the quota.
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_and_enqueue_tracked(
+        &self,
+        pool: &LayerKVPool,
+        block: &Arc<PhysicalBlock>,
+        key: ColdCacheKey,
+        fingerprint: ColdCacheFingerprint,
+        tokens: &[u32],
+        deadline: Instant,
+        room: MakeRoom,
+        done: Sender<Landed>,
+    ) -> Result<bool, String> {
+        if !self.takes_tracked_writes() {
+            return Err("cold-cache tracked writes stopped after a failed write".to_string());
+        }
+        if !self.wait_block_room(deadline)? {
+            self.shared
+                .stats
+                .queue_drops
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        let captured = self.capture_block(pool, block, key, fingerprint, tokens)?;
+        self.send_before(
+            WriteJob::Tracked(Box::new(TrackedBlock {
+                block: captured,
+                room,
+                done,
+            })),
+            deadline,
+        )
+    }
+
+    /// Wait until the block lane has a free slot or `deadline` passes.
+    fn wait_block_room(&self, deadline: Instant) -> Result<bool, String> {
+        loop {
+            if self.shared.stopped.load(Ordering::Acquire) {
+                return Err("cold-cache writer stopped".to_string());
+            }
+            if self.has_block_room() {
+                return Ok(true);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(1).min(remaining));
+        }
+    }
+
+    /// The writer takes tracked writes: it is not closed, and none failed
+    /// for anything but room.
+    pub fn takes_tracked_writes(&self) -> bool {
+        !self.shared.stopped.load(Ordering::Acquire)
+            && !self.shared.tracked_failed.load(Ordering::Acquire)
+    }
+
+    /// The free bytes of the volume above the writer's reserve, as a write
+    /// that makes room would find them now; `None` when the volume cannot
+    /// be measured.
+    pub fn room_above_reserve(&self) -> Option<u64> {
+        let (_, available) = self.shared.space().ok()?;
+        Some(available.saturating_sub(self.shared.reserve_bytes))
+    }
+
+    /// Takes the least recently used objects until the index fits the quota
+    /// (Splash `Cache::fitDiskLimit` at adoption: a lower limit than the
+    /// earlier process had takes the oldest copies). Returns how many went.
+    pub fn fit_quota(&self) -> usize {
+        let Ok(mut index) = self.shared.index.lock() else {
+            return 0;
+        };
+        let mut unclearable = Vec::new();
+        let mut evicted = 0;
+        while index.total_bytes > self.shared.quota_bytes {
+            match clear_oldest(&self.shared, &mut index, &mut unclearable) {
+                Some(true) => evicted += 1,
+                Some(false) => {}
+                None => break,
+            }
+        }
+        evicted
+    }
+
+    /// Whether the block lane has a free slot right now.
+    pub fn has_block_room(&self) -> bool {
+        self.shared.queued_blocks.load(Ordering::Acquire) < self.shared.queue_depth
+    }
+
+    /// Snapshot one pinned full block into owned host bytes.
+    fn capture_block(
+        &self,
+        pool: &LayerKVPool,
+        block: &Arc<PhysicalBlock>,
+        key: ColdCacheKey,
+        fingerprint: ColdCacheFingerprint,
+        tokens: &[u32],
+    ) -> Result<ColdCacheBlock, String> {
         if tokens.len() != pool.block_size() as usize {
             return Err("cold cache captures full blocks only".to_string());
         }
+        #[cfg(test)]
+        self.shared.capture_reads.fetch_add(1, Ordering::Relaxed);
 
         // Logical pin prevents allocator eviction/reuse during the snapshot.
         block.incref();
@@ -1454,7 +1694,7 @@ impl ColdCacheManager {
         let _ = block.decref();
         let captured = captured?;
         captured.validate()?;
-        self.send_before(WriteJob::Block(captured), deadline)
+        Ok(captured)
     }
 
     /// Offer `job` to the bounded writer queue, retrying until a slot frees or
@@ -1471,7 +1711,7 @@ impl ColdCacheManager {
     fn send_before(&self, job: WriteJob, deadline: Instant) -> Result<bool, String> {
         let mut job = job;
         loop {
-            match self.sender.try_send(job) {
+            match self.try_send_block_lane(job).map_err(|refused| *refused) {
                 Ok(()) => {
                     self.shared.stats.enqueued.fetch_add(1, Ordering::Relaxed);
                     return Ok(true);
@@ -1496,6 +1736,193 @@ impl ColdCacheManager {
                 }
             }
         }
+    }
+
+    /// One `try_send` onto the block lane, keeping the queued-jobs count and
+    /// waking the writer. A stopped manager reports the writer gone.
+    fn try_send_block_lane(&self, job: WriteJob) -> Result<(), Box<TrySendError<WriteJob>>> {
+        if self.shared.stopped.load(Ordering::Acquire) {
+            return Err(Box::new(TrySendError::Disconnected(job)));
+        }
+        self.shared.queued_blocks.fetch_add(1, Ordering::AcqRel);
+        match self.sender.try_send(job) {
+            Ok(()) => {
+                let _ = self.wake.try_send(());
+                Ok(())
+            }
+            Err(refused) => {
+                self.shared.queued_blocks.fetch_sub(1, Ordering::AcqRel);
+                Err(Box::new(refused))
+            }
+        }
+    }
+
+    /// Offer one state write to the state lane (one slot: the tier has one
+    /// staging buffer, Splash `QwenStateStorage::staging_`). The writer takes
+    /// it before any queued block job, persists it in Splash `stateSpans`
+    /// order, and sends [`Landed::State`] with the payload back on `done`.
+    /// `Busy`: a state write is still queued; `Gone`: the writer stopped.
+    pub fn enqueue_state(
+        &self,
+        object: ColdStateObject,
+        room: MakeRoom,
+        done: Sender<Landed>,
+    ) -> Result<(), EnqueueRefused<Box<ColdStateObject>>> {
+        if !self.takes_tracked_writes() {
+            return Err(EnqueueRefused::Gone(Box::new(object)));
+        }
+        let object = Box::new(object);
+        match self.state_sender.try_send(StateJob { object, room, done }) {
+            Ok(()) => {
+                self.shared.stats.enqueued.fetch_add(1, Ordering::Relaxed);
+                let _ = self.wake.try_send(());
+                Ok(())
+            }
+            Err(TrySendError::Full(job)) => Err(EnqueueRefused::Busy(job.object)),
+            Err(TrySendError::Disconnected(job)) => Err(EnqueueRefused::Gone(job.object)),
+        }
+    }
+
+    /// Install (or clear) the call the writer makes after every tracked job
+    /// lands, so a sleeping model thread learns about progress.
+    pub fn set_landing_wake(&self, wake: Option<Arc<dyn Fn() + Send + Sync>>) {
+        if let Ok(mut slot) = self.shared.landing_wake.lock() {
+            *slot = wake;
+        }
+    }
+
+    /// Drain for at most `timeout`, then stop the writer: every later
+    /// admission is refused as gone, and jobs still queued land as failed.
+    /// Returns the drain's verdict.
+    pub fn close(&self, timeout: Duration) -> bool {
+        let flushed = self.drain(timeout);
+        self.shared.stopped.store(true, Ordering::Release);
+        let _ = self.wake.try_send(());
+        flushed
+    }
+
+    /// Drops `key`'s object from the index and the disk (Splash
+    /// `StateCache::discardDisk` with its slot). False when it is not indexed
+    /// or its name could not be cleared.
+    pub fn remove(&self, key: &ColdCacheKey) -> bool {
+        let Ok(mut index) = self.shared.index.lock() else {
+            return false;
+        };
+        let Some(name) = index.entries.get(key).map(|entry| entry.file_name.clone()) else {
+            return false;
+        };
+        let cleared = match self.shared.root.stat_identity(&name) {
+            Some((_, kind)) => clear_entry(&self.shared.root, &name, kind),
+            None => entry_gone(self.shared.root.unlink(&name)),
+        };
+        if !cleared {
+            return false;
+        }
+        if let Some(entry) = index.entries.remove(key) {
+            index.total_bytes = index.total_bytes.saturating_sub(entry.size);
+        }
+        true
+    }
+
+    /// Bytes the index charges right now (every group, landed objects only).
+    pub fn total_bytes(&self) -> u64 {
+        self.shared
+            .index
+            .lock()
+            .map(|index| index.total_bytes)
+            .unwrap_or(0)
+    }
+
+    /// Keys of every indexed object in `group`.
+    pub fn keys_in(&self, group: ColdGroup) -> Vec<ColdCacheKey> {
+        self.shared
+            .index
+            .lock()
+            .map(|index| {
+                index
+                    .entries
+                    .iter()
+                    .filter(|(_, entry)| entry.group == group)
+                    .map(|(key, _)| *key)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Read the state object for `key` straight into `into`, which must be
+    /// exactly `expected`'s payload. A sound object whose spans, geometry or
+    /// boundary differ from `expected` is a miss that stays on disk (Splash
+    /// `QwenStateStorage::adopt`: the payload must be `cachedBytes`); a
+    /// damaged one is a miss, a corruption, and is pruned. On `None` the
+    /// contents of `into` are unspecified.
+    pub fn load_state(
+        &self,
+        key: ColdCacheKey,
+        fingerprint: ColdCacheFingerprint,
+        expected: &ColdStateLayout,
+        into: &mut [u8],
+    ) -> Option<ColdStateLabel> {
+        if expected.validate().is_err() || expected.payload_bytes() != Some(into.len() as u64) {
+            self.shared.stats.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let cap = state_header_bound(expected);
+        self.load_object_with(key, ColdGroup::DFlash2State, true, |file| {
+            let Ok(header) = read_state_header(file, key, fingerprint, cap) else {
+                return ObjectRead::Corrupt;
+            };
+            if header.layout.boundary_tokens != expected.boundary_tokens
+                || header.layout.geometry != expected.geometry
+                || header.layout.spans != expected.spans
+            {
+                return ObjectRead::Mismatch;
+            }
+            let Some(payload) = header
+                .layout
+                .payload_bytes()
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .filter(|&bytes| bytes <= into.len())
+            else {
+                return ObjectRead::Corrupt;
+            };
+            let target = &mut into[..payload];
+            let mut tail = [0u8; 1];
+            if file.read_exact(target).is_err() || !matches!(file.read(&mut tail), Ok(0)) {
+                return ObjectRead::Corrupt;
+            }
+            let mut hasher = state_checksum_prefix(&header.layout, &header.label);
+            hasher.update(&*target);
+            if hex_encode(&hasher.finalize()) != header.checksum {
+                return ObjectRead::Corrupt;
+            }
+            ObjectRead::Ok(header.label)
+        })
+    }
+
+    /// The layout and label of the state object for `key`, from its header
+    /// alone (no payload read, no checksum, recency untouched). The file's
+    /// size must be exactly header + spans.
+    pub fn state_label(
+        &self,
+        key: ColdCacheKey,
+        fingerprint: ColdCacheFingerprint,
+    ) -> Option<(ColdStateLayout, ColdStateLabel)> {
+        self.load_object_with(key, ColdGroup::DFlash2State, false, |file| {
+            let Ok(header) = read_state_header(file, key, fingerprint, STATE_LABEL_HEADER_CAP)
+            else {
+                return ObjectRead::Corrupt;
+            };
+            let expected = header
+                .layout
+                .payload_bytes()
+                .and_then(|payload| payload.checked_add(header.header_len));
+            match file.metadata() {
+                Ok(meta) if Some(meta.len()) == expected => {
+                    ObjectRead::Ok((header.layout, header.label))
+                }
+                _ => ObjectRead::Corrupt,
+            }
+        })
     }
 
     /// Non-blocking enqueue. A saturated queue deliberately drops the cold
@@ -1569,7 +1996,7 @@ impl ColdCacheManager {
         // through as flags, which is more code than the loop.
         let mut job = WriteJob::Barrier(tx);
         loop {
-            match self.sender.try_send(job) {
+            match self.try_send_block_lane(job).map_err(|refused| *refused) {
                 Ok(()) => break,
                 // Writer thread absent/stopped: no queued block can still be in
                 // flight, so the drain is trivially satisfied.
@@ -1714,6 +2141,40 @@ impl ColdCacheManager {
         max_encoded: u64,
         decode: impl FnOnce(&[u8]) -> Result<T, String>,
     ) -> Option<T> {
+        self.load_object_with(key, group, true, |file| {
+            let mut bytes = Vec::new();
+            // Bounded slurp: cap the read at the caller's geometry-derived
+            // maximum (+1 so an over-cap file is detectable). A sparse
+            // regular file reports a huge `st_size`, but `take` caps the
+            // allocation; anything exceeding the bound is treated as
+            // corruption and never read in full.
+            let read = file
+                .take(max_encoded.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())
+                .and_then(|_| {
+                    if bytes.len() as u64 > max_encoded {
+                        Err("cold-cache entry exceeds geometry bound".to_string())
+                    } else {
+                        decode(&bytes)
+                    }
+                });
+            read.map_or(ObjectRead::Corrupt, ObjectRead::Ok)
+        })
+    }
+
+    /// The open / prune / touch / statistics contract of
+    /// [`Self::load_bounded`] around a caller-supplied `read` of the opened
+    /// file. `ObjectRead::Mismatch` (a sound object of another shape) is a
+    /// miss that keeps the object; `touch` false leaves recency alone (a
+    /// header scan is not a use).
+    fn load_object_with<T>(
+        &self,
+        key: ColdCacheKey,
+        group: ColdGroup,
+        touch: bool,
+        read: impl FnOnce(&mut File) -> ObjectRead<T>,
+    ) -> Option<T> {
         let name = object_file_name(&key, group);
         let mut observed_identity = None;
         let mut opened_file = None;
@@ -1751,30 +2212,19 @@ impl ColdCacheManager {
         let result = match open_result {
             Ok(mut file) => {
                 observed_identity = open_identity(&file);
-                let mut bytes = Vec::new();
-                // Bounded slurp: cap the read at the caller's geometry-derived
-                // maximum (+1 so an over-cap file is detectable). A sparse
-                // regular file reports a huge `st_size`, but `take` caps the
-                // allocation; anything exceeding the bound is treated as
-                // corruption and never read in full.
-                let read = (&mut file)
-                    .take(max_encoded.saturating_add(1))
-                    .read_to_end(&mut bytes)
-                    .map_err(|e| e.to_string())
-                    .and_then(|_| {
-                        if bytes.len() as u64 > max_encoded {
-                            Err("cold-cache entry exceeds geometry bound".to_string())
-                        } else {
-                            decode(&bytes)
-                        }
-                    });
+                let outcome = read(&mut file);
                 opened_file = Some(file);
-                read
+                outcome
             }
-            Err(e) => Err(e.to_string()),
+            Err(_) => ObjectRead::Corrupt,
         };
         match result {
-            Ok(decoded) => {
+            ObjectRead::Mismatch => {
+                self.shared.stats.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            ObjectRead::Ok(decoded) if !touch => Some(decoded),
+            ObjectRead::Ok(decoded) => {
                 // NOTE: the `hits` / `bytes_restored` reuse counters are NOT
                 // bumped here. A successful decode is not yet realized reuse —
                 // `restore_block` still has to validate layout, allocate a
@@ -1806,7 +2256,7 @@ impl ColdCacheManager {
                 }
                 Some(decoded)
             }
-            Err(_) => {
+            ObjectRead::Corrupt => {
                 self.shared.stats.misses.fetch_add(1, Ordering::Relaxed);
                 if opened_file.is_some() {
                     self.shared
@@ -2258,9 +2708,17 @@ fn layout_matches_pool(layout: &ColdCacheLayout, pool: &LayerKVPool) -> bool {
 }
 
 fn persist_block(shared: &Shared, block: &ColdCacheBlock) -> Result<(), String> {
+    Ok(persist_block_in(shared, block, MakeRoom::Evict)?)
+}
+
+fn persist_block_in(
+    shared: &Shared,
+    block: &ColdCacheBlock,
+    room: MakeRoom,
+) -> Result<(), PersistError> {
     block.validate()?;
     let bytes = encode_block(block)?;
-    persist_encoded(shared, block.key, ColdGroup::Kv, &bytes)
+    persist_encoded(shared, block.key, ColdGroup::Kv, &bytes, room)
 }
 
 /// Sidecars go through the identical durable path as blocks — evict to
@@ -2270,7 +2728,47 @@ fn persist_block(shared: &Shared, block: &ColdCacheBlock) -> Result<(), String> 
 fn persist_sidecar(shared: &Shared, sidecar: &ColdSidecar) -> Result<(), String> {
     sidecar.validate()?;
     let bytes = encode_sidecar(sidecar)?;
-    persist_encoded(shared, sidecar.key, sidecar.layout.group, &bytes)
+    Ok(persist_encoded(
+        shared,
+        sidecar.key,
+        sidecar.layout.group,
+        &bytes,
+        MakeRoom::Evict,
+    )?)
+}
+
+/// A state object streams to disk: its header, then the staging buffer as it
+/// is (no second payload buffer). The quota is charged the file's own size,
+/// payload + header (Splash `SlotFile::write` charges `slotBytesFor(payload)`,
+/// never a padded maximum).
+fn persist_state(
+    shared: &Shared,
+    object: &ColdStateObject,
+    room: MakeRoom,
+) -> Result<(), PersistError> {
+    object.validate()?;
+    let mut hasher = state_checksum_prefix(&object.layout, &object.label);
+    hasher.update(&object.payload);
+    let checksum = hex_encode(&hasher.finalize());
+    let header = state_header(
+        object.key,
+        object.fingerprint,
+        &object.layout,
+        &object.label,
+        &checksum,
+    );
+    let size = state_object_bytes(&object.layout, &object.label);
+    persist_with(
+        shared,
+        object.key,
+        ColdGroup::DFlash2State,
+        size,
+        room,
+        |file| {
+            file.write_all(&header)
+                .and_then(|()| file.write_all(&object.payload))
+        },
+    )
 }
 
 fn persist_encoded(
@@ -2278,8 +2776,70 @@ fn persist_encoded(
     key: ColdCacheKey,
     group: ColdGroup,
     bytes: &[u8],
-) -> Result<(), String> {
-    evict_for_write(shared, bytes.len() as u64)?;
+    room: MakeRoom,
+) -> Result<(), PersistError> {
+    persist_with(shared, key, group, bytes.len() as u64, room, |file| {
+        file.write_all(bytes)
+    })
+}
+
+/// Why a persist failed: the room the write needs (Splash
+/// `DiskBudget::reportFull`: the volume's, and the file goes on) or anything
+/// else (Splash `SlotFile::stop`).
+#[derive(Debug)]
+struct PersistError {
+    space: bool,
+    message: String,
+}
+
+impl PersistError {
+    fn space(message: String) -> Self {
+        Self {
+            space: true,
+            message,
+        }
+    }
+
+    fn write(error: std::io::Error) -> Self {
+        let space = error.kind() == std::io::ErrorKind::StorageFull
+            || error.raw_os_error() == Some(rustix::io::Errno::DQUOT.raw_os_error());
+        Self {
+            space,
+            message: format!("write cold-cache file: {error}"),
+        }
+    }
+}
+
+impl From<String> for PersistError {
+    fn from(message: String) -> Self {
+        Self {
+            space: false,
+            message,
+        }
+    }
+}
+
+impl From<PersistError> for String {
+    fn from(error: PersistError) -> Self {
+        error.message
+    }
+}
+
+/// The durable commit every object takes: make room for `size` bytes, write
+/// a writer temp through `write`, check it is exactly `size` bytes, sync,
+/// rename into place, publish to the index, sync the directory.
+fn persist_with(
+    shared: &Shared,
+    key: ColdCacheKey,
+    group: ColdGroup,
+    size: u64,
+    room: MakeRoom,
+    write: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> Result<(), PersistError> {
+    match room {
+        MakeRoom::Evict => evict_for_write(shared, size).map_err(PersistError::space)?,
+        MakeRoom::Refuse => refuse_unless_room(shared, size).map_err(PersistError::space)?,
+    }
     let destination = object_file_name(&key, group);
     let temp = format!(
         ".{}.{}.{}.tmp",
@@ -2288,10 +2848,15 @@ fn persist_encoded(
         now_tick()
     );
     let mut file = shared.root.create_exclusive(&temp)?;
-    let size = bytes.len() as u64;
-    if let Err(error) = (|| -> Result<(), String> {
-        file.write_all(bytes)
-            .map_err(|e| format!("write cold-cache file: {e}"))?;
+    if let Err(error) = (|| -> Result<(), PersistError> {
+        write(&mut file).map_err(PersistError::write)?;
+        let written = file
+            .metadata()
+            .map_err(|e| format!("stat cold-cache file: {e}"))?
+            .len();
+        if written != size {
+            return Err(format!("cold-cache object is {written} bytes, charged {size}").into());
+        }
         sync_payload(&file)?;
         // The index lock spans [rename + index publish] so a concurrent
         // failed-load cleanup can never observe the renamed file without
@@ -2309,6 +2874,10 @@ fn persist_encoded(
         // other failure modes — a read-only root, a full disk, a failed fsync
         // — with no counter at all.
         shared.root.rename(&temp, &destination)?;
+        #[cfg(test)]
+        if let Ok(mut log) = shared.commit_log.lock() {
+            log.push(key);
+        }
         if let Some(old) = index.entries.insert(
             key,
             IndexEntry {
@@ -2339,6 +2908,452 @@ fn persist_encoded(
         .bytes_written
         .fetch_add(size, Ordering::Relaxed);
     Ok(())
+}
+
+/// [`MakeRoom::Refuse`]: the write fits under the quota and above the free
+/// reserve as things stand, or it fails without evicting anything.
+fn refuse_unless_room(shared: &Shared, incoming: u64) -> Result<(), String> {
+    let (_, available) = shared.space()?;
+    let taken = shared
+        .index
+        .lock()
+        .map_err(|_| "cold-cache index mutex poisoned".to_string())?
+        .total_bytes;
+    if taken.saturating_add(incoming) > shared.quota_bytes
+        || available < shared.reserve_bytes.saturating_add(incoming)
+    {
+        return Err(format!(
+            "cold-cache write of {incoming} bytes does not fit and may not make room"
+        ));
+    }
+    Ok(())
+}
+
+enum NextJob {
+    State(StateJob),
+    Lane(WriteJob),
+}
+
+/// The state lane first: a queued state never waits behind a queued KV
+/// chain (Splash keeps the state write ahead of its chain, `Cache::persist`).
+fn next_job(
+    shared: &Shared,
+    blocks: &Receiver<WriteJob>,
+    states: &Receiver<StateJob>,
+) -> Option<NextJob> {
+    if let Ok(job) = states.try_recv() {
+        return Some(NextJob::State(job));
+    }
+    let job = blocks.try_recv().ok()?;
+    shared.queued_blocks.fetch_sub(1, Ordering::AcqRel);
+    Some(NextJob::Lane(job))
+}
+
+fn wake_after_landing(shared: &Shared) {
+    let wake = shared
+        .landing_wake
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone());
+    if let Some(wake) = wake {
+        wake();
+    }
+}
+
+/// The single writer thread. It sleeps on the wake channel while both lanes
+/// are empty, and stops once [`ColdCacheManager::close`] set `stopped` or
+/// every manager is gone (after finishing what was queued).
+///
+/// Fail-open: inference already holds valid state, so a persist error only
+/// means the next process recomputes. Every failure is still counted once in
+/// `write_errors` (the only thing between a fail-open writer and a
+/// fail-silent one), fails a covering drain barrier, and reaches a tracked
+/// job's caller as `ok: false`.
+fn writer_loop(
+    shared: &Shared,
+    blocks: &Receiver<WriteJob>,
+    states: &Receiver<StateJob>,
+    wake: &Receiver<()>,
+) {
+    // Whether any write since the last barrier failed to persist; reset after
+    // each barrier so every drain reports only on its own window.
+    let mut failed = false;
+    let mut disconnected = false;
+    let record = |ok: bool, failed: &mut bool| {
+        if !ok {
+            shared.stats.write_errors.fetch_add(1, Ordering::Relaxed);
+            *failed = true;
+        }
+    };
+    loop {
+        if shared.stopped.load(Ordering::Acquire) {
+            refuse_queued(shared, blocks, states);
+            return;
+        }
+        match next_job(shared, blocks, states) {
+            Some(NextJob::State(job)) => {
+                let StateJob { object, room, done } = job;
+                let object = *object;
+                let ok = persist_tracked(shared, || persist_state(shared, &object, room));
+                record(ok, &mut failed);
+                let _ = done.send(Landed::State {
+                    key: object.key,
+                    ok,
+                    payload: object.payload,
+                });
+                wake_after_landing(shared);
+            }
+            Some(NextJob::Lane(WriteJob::Block(block))) => {
+                record(persist_block(shared, &block).is_ok(), &mut failed);
+            }
+            Some(NextJob::Lane(WriteJob::Tracked(job))) => {
+                let ok = persist_tracked(shared, || persist_block_in(shared, &job.block, job.room));
+                record(ok, &mut failed);
+                let _ = job.done.send(Landed::Block {
+                    key: job.block.key,
+                    ok,
+                });
+                wake_after_landing(shared);
+            }
+            Some(NextJob::Lane(WriteJob::Sidecar(sidecar))) => {
+                record(persist_sidecar(shared, &sidecar).is_ok(), &mut failed);
+            }
+            // Every earlier job has already been persisted (FIFO lane, state
+            // lane first, single consumer), so the ack reports whether all of
+            // them succeeded. A gone receiver (drain timed out) is fine.
+            Some(NextJob::Lane(WriteJob::Barrier(ack))) => {
+                let _ = ack.send(!failed);
+                failed = false;
+            }
+            None if disconnected => return,
+            None => disconnected = wake.recv().is_err(),
+        }
+    }
+}
+
+/// A tracked write runs while no earlier one failed for anything but room;
+/// one that does fails every later one (Splash `SlotFile::store`: a full
+/// volume only refuses that write, any other error stops the file).
+fn persist_tracked(shared: &Shared, persist: impl FnOnce() -> Result<(), PersistError>) -> bool {
+    if shared.tracked_failed.load(Ordering::Acquire) {
+        return false;
+    }
+    match persist() {
+        Ok(()) => true,
+        Err(error) => {
+            if !error.space {
+                shared.tracked_failed.store(true, Ordering::Release);
+            }
+            false
+        }
+    }
+}
+
+/// A stopped writer lands every queued tracked job as failed (a state hands
+/// its payload back) and fails every queued barrier.
+fn refuse_queued(shared: &Shared, blocks: &Receiver<WriteJob>, states: &Receiver<StateJob>) {
+    let mut landed = false;
+    while let Some(job) = next_job(shared, blocks, states) {
+        match job {
+            NextJob::State(job) => {
+                let _ = job.done.send(Landed::State {
+                    key: job.object.key,
+                    ok: false,
+                    payload: job.object.payload,
+                });
+                landed = true;
+            }
+            NextJob::Lane(WriteJob::Tracked(job)) => {
+                let _ = job.done.send(Landed::Block {
+                    key: job.block.key,
+                    ok: false,
+                });
+                landed = true;
+            }
+            NextJob::Lane(WriteJob::Barrier(ack)) => {
+                let _ = ack.send(false);
+            }
+            NextJob::Lane(WriteJob::Block(_) | WriteJob::Sidecar(_)) => {}
+        }
+    }
+    if landed {
+        wake_after_landing(shared);
+    }
+}
+
+/// How a caller-supplied read of an opened object ended.
+enum ObjectRead<T> {
+    Ok(T),
+    /// A sound object of another shape: a miss that stays on disk.
+    Mismatch,
+    /// Unreadable or damaged: a miss, a corruption, and a prune.
+    Corrupt,
+}
+
+/// What a state object's header says about it.
+struct StateHeader {
+    layout: ColdStateLayout,
+    label: ColdStateLabel,
+    checksum: String,
+    /// Bytes before the payload: the length prefix plus the JSON header.
+    header_len: u64,
+}
+
+const STATE_SPAN_PREFIX: &str = "span.";
+
+fn push_json_string(out: &mut String, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            control if (control as u32) < 0x20 => {
+                let code = control as u32 as usize;
+                out.push_str("\\u00");
+                out.push(HEX[code >> 4] as char);
+                out.push(HEX[code & 0x0f] as char);
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+}
+
+fn tokens_hex(tokens: &[u32]) -> String {
+    let bytes: Vec<u8> = tokens
+        .iter()
+        .flat_map(|token| token.to_le_bytes())
+        .collect();
+    hex_encode(&bytes)
+}
+
+fn tokens_from_hex(value: &str) -> Option<Vec<u32>> {
+    let bytes = value.as_bytes();
+    if !bytes.len().is_multiple_of(8) {
+        return None;
+    }
+    let nibble = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    let mut tokens = Vec::with_capacity(bytes.len() / 8);
+    for chunk in bytes.as_chunks::<8>().0 {
+        let mut le = [0u8; 4];
+        for (slot, pair) in le.iter_mut().zip(chunk.as_chunks::<2>().0) {
+            *slot = nibble(pair[0])? << 4 | nibble(pair[1])?;
+        }
+        tokens.push(u32::from_le_bytes(le));
+    }
+    Some(tokens)
+}
+
+/// The safetensors container of a state object: the 8-byte length, then the
+/// JSON header (written here in a fixed order, so its length depends on the
+/// layout and label alone), space-padded to 8 bytes. One `U8` tensor per
+/// span, back to back.
+fn state_header(
+    key: ColdCacheKey,
+    fingerprint: ColdCacheFingerprint,
+    layout: &ColdStateLayout,
+    label: &ColdStateLabel,
+    checksum: &str,
+) -> Vec<u8> {
+    let spans = layout
+        .spans
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let fields: [(&str, String); 12] = [
+        ("abi", CACHE_ABI.to_string()),
+        ("group", ColdGroup::DFlash2State.label().to_string()),
+        ("key", key.to_hex()),
+        ("fingerprint", fingerprint.to_hex()),
+        ("checksum", checksum.to_string()),
+        ("boundary", layout.boundary_tokens.to_string()),
+        ("spans", spans),
+        ("geometry", layout.geometry.clone()),
+        ("tokens", tokens_hex(&label.tokens)),
+        ("salt", label.salt.to_string()),
+        ("last_used", label.last_used.to_string()),
+        ("checkpoint", label.checkpoint.to_string()),
+    ];
+    let mut json = String::from("{\"__metadata__\":{");
+    for (index, (name, value)) in fields.iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        push_json_string(&mut json, name);
+        json.push(':');
+        push_json_string(&mut json, value);
+    }
+    json.push('}');
+    let mut offset = 0u64;
+    for (index, span) in layout.spans.iter().enumerate() {
+        let end = offset.saturating_add(*span);
+        json.push_str(&format!(
+            ",\"{STATE_SPAN_PREFIX}{index}\":{{\"dtype\":\"U8\",\"shape\":[{span}],\"data_offsets\":[{offset},{end}]}}"
+        ));
+        offset = end;
+    }
+    json.push('}');
+    let padded = json.len().next_multiple_of(8);
+    let mut header = Vec::with_capacity(8 + padded);
+    header.extend_from_slice(&(padded as u64).to_le_bytes());
+    header.extend_from_slice(json.as_bytes());
+    header.resize(8 + padded, b' ');
+    header
+}
+
+/// Bytes before the payload of a state object with this layout and label.
+fn state_header_len(layout: &ColdStateLayout, label: &ColdStateLabel) -> u64 {
+    let zero_key = ColdCacheKey([0; 32]);
+    let zero_fingerprint = ColdCacheFingerprint([0; 32]);
+    let checksum = hex_encode(&[0; 32]);
+    state_header(zero_key, zero_fingerprint, layout, label, &checksum).len() as u64
+}
+
+/// The file size of a state object, and what the quota is charged for it:
+/// its payload plus its header (K8).
+pub fn state_object_bytes(layout: &ColdStateLayout, label: &ColdStateLabel) -> u64 {
+    layout
+        .payload_bytes()
+        .unwrap_or(u64::MAX)
+        .saturating_add(state_header_len(layout, label))
+}
+
+/// The most a KV block object of `pool` takes on disk, header included:
+/// what a state's chain is sized by before its blocks are written.
+pub fn block_object_bytes(pool: &LayerKVPool) -> u64 {
+    max_encoded_len_for_pool(pool)
+}
+
+/// The longest header any label of `layout` can have: the read bound, with
+/// the payload, of [`ColdCacheManager::load_state`].
+fn state_header_bound(layout: &ColdStateLayout) -> u64 {
+    let widest = ColdStateLabel {
+        tokens: vec![u32::MAX; layout.boundary_tokens as usize],
+        salt: u64::MAX,
+        last_used: u64::MAX,
+        checkpoint: false,
+    };
+    state_header_len(layout, &widest)
+}
+
+/// Domain, layout and label go into the checksum ahead of the payload, so a
+/// label that no longer matches its payload is damage, not a different state.
+fn state_checksum_prefix(layout: &ColdStateLayout, label: &ColdStateLabel) -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mlx-node:cold-state-payload:v1\0");
+    hasher.update(layout.boundary_tokens.to_le_bytes());
+    hasher.update((layout.spans.len() as u64).to_le_bytes());
+    for span in &layout.spans {
+        hasher.update(span.to_le_bytes());
+    }
+    hasher.update((layout.geometry.len() as u64).to_le_bytes());
+    hasher.update(layout.geometry.as_bytes());
+    hasher.update((label.tokens.len() as u64).to_le_bytes());
+    for token in &label.tokens {
+        hasher.update(token.to_le_bytes());
+    }
+    hasher.update(label.salt.to_le_bytes());
+    hasher.update(label.last_used.to_le_bytes());
+    hasher.update([u8::from(label.checkpoint)]);
+    hasher
+}
+
+/// Read and check a state object's header, leaving `file` at the payload.
+/// `cap` bounds the header (length prefix included) before it is allocated.
+fn read_state_header(
+    file: &mut File,
+    key: ColdCacheKey,
+    fingerprint: ColdCacheFingerprint,
+    cap: u64,
+) -> Result<StateHeader, String> {
+    let mut prefix = [0u8; 8];
+    file.read_exact(&mut prefix)
+        .map_err(|e| format!("read cold-cache state header: {e}"))?;
+    let json_len = u64::from_le_bytes(prefix);
+    let header_len = json_len
+        .checked_add(8)
+        .filter(|&len| len <= cap)
+        .ok_or_else(|| "cold-cache state header exceeds its bound".to_string())?;
+    let mut json = vec![0u8; json_len as usize];
+    file.read_exact(&mut json)
+        .map_err(|e| format!("read cold-cache state header: {e}"))?;
+    let parsed: safetensors::tensor::Metadata =
+        serde_json::from_slice(&json).map_err(|e| e.to_string())?;
+    let metadata = parsed
+        .metadata()
+        .as_ref()
+        .ok_or_else(|| "cold-cache state metadata missing".to_string())?;
+    let get = |name: &str| {
+        metadata
+            .get(name)
+            .map(String::as_str)
+            .ok_or_else(|| format!("cold-cache state metadata `{name}` missing"))
+    };
+    if get("abi")? != CACHE_ABI
+        || get("group")? != ColdGroup::DFlash2State.label()
+        || get("key")? != key.to_hex()
+        || get("fingerprint")? != fingerprint.to_hex()
+    {
+        return Err("cold-cache state identity/ABI mismatch".to_string());
+    }
+    let invalid = |name: &str| format!("invalid cold-cache state metadata `{name}`");
+    let mut spans = Vec::new();
+    for part in get("spans")?.split(',') {
+        if spans.len() == MAX_STATE_SPANS {
+            return Err(invalid("spans"));
+        }
+        spans.push(part.parse::<u64>().map_err(|_| invalid("spans"))?);
+    }
+    let layout = ColdStateLayout {
+        boundary_tokens: get("boundary")?
+            .parse::<u32>()
+            .map_err(|_| invalid("boundary"))?,
+        spans,
+        geometry: get("geometry")?.to_string(),
+    };
+    layout.validate()?;
+    let label = ColdStateLabel {
+        tokens: tokens_from_hex(get("tokens")?).ok_or_else(|| invalid("tokens"))?,
+        salt: get("salt")?.parse::<u64>().map_err(|_| invalid("salt"))?,
+        last_used: get("last_used")?
+            .parse::<u64>()
+            .map_err(|_| invalid("last_used"))?,
+        checkpoint: match get("checkpoint")? {
+            "true" => true,
+            "false" => false,
+            _ => return Err(invalid("checkpoint")),
+        },
+    };
+    if label.tokens.len() != layout.boundary_tokens as usize {
+        return Err("cold-cache state label does not carry the boundary tokens".to_string());
+    }
+    if parsed.tensors().len() != layout.spans.len() {
+        return Err("cold-cache state tensor count does not match its spans".to_string());
+    }
+    let mut offset = 0usize;
+    for (index, &span) in layout.spans.iter().enumerate() {
+        let span = usize::try_from(span).map_err(|_| invalid("spans"))?;
+        let info = parsed
+            .info(&format!("{STATE_SPAN_PREFIX}{index}"))
+            .ok_or_else(|| "cold-cache state span tensor missing".to_string())?;
+        let end = offset.checked_add(span).ok_or_else(|| invalid("spans"))?;
+        if info.dtype != Dtype::U8 || info.shape != [span] || info.data_offsets != (offset, end) {
+            return Err("cold-cache state span tensor does not match its spans".to_string());
+        }
+        offset = end;
+    }
+    Ok(StateHeader {
+        layout,
+        label,
+        checksum: get("checksum")?.to_string(),
+        header_len,
+    })
 }
 
 /// Evict least-recently-used entries until `incoming` fits both the
@@ -2397,37 +3412,55 @@ fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
         if available.saturating_add(reclaimable) < shared.reserve_bytes.saturating_add(incoming) {
             return Err("insufficient disk space for cold-cache write".to_string());
         }
-        let Some((&key, entry)) = index
+        let Some(candidate_size) = index
             .entries
             .iter()
             .filter(|&(key, _)| !unclearable.contains(key))
             .min_by_key(|(_, entry)| entry.last_access)
+            .map(|(_, entry)| entry.size)
         else {
             return Err("insufficient disk space for cold-cache write".to_string());
         };
-        let name = entry.file_name.clone();
-        let candidate_size = entry.size;
-        let cleared = match shared.root.stat_identity(&name) {
-            Some((_, kind)) => clear_entry(&shared.root, &name, kind),
-            // Either the entry already vanished (the unlink then observes
-            // NotFound) or this platform reports no identities and the
-            // plain unlink decides.
-            None => entry_gone(shared.root.unlink(&name)),
-        };
-        if !cleared {
-            unclearable.push(key);
-            reclaimable = reclaimable.saturating_sub(candidate_size);
+        reclaimable = reclaimable.saturating_sub(candidate_size);
+        if clear_oldest(shared, &mut index, &mut unclearable) != Some(true) {
             continue;
-        }
-        if let Some(entry) = index.entries.remove(&key) {
-            index.total_bytes = index.total_bytes.saturating_sub(entry.size);
-            reclaimable = reclaimable.saturating_sub(entry.size);
-            shared.stats.evictions.fetch_add(1, Ordering::Relaxed);
         }
         let (_, resampled) = shared.space()?;
         available = resampled;
     }
     Ok(())
+}
+
+/// Clears the least recently used object not in `unclearable` from the disk
+/// and the index: `None` when there is none, `Some(false)` when its name
+/// could not be cleared (it joins `unclearable`).
+fn clear_oldest(
+    shared: &Shared,
+    index: &mut CacheIndex,
+    unclearable: &mut Vec<ColdCacheKey>,
+) -> Option<bool> {
+    let (&key, entry) = index
+        .entries
+        .iter()
+        .filter(|&(key, _)| !unclearable.contains(key))
+        .min_by_key(|(_, entry)| entry.last_access)?;
+    let name = entry.file_name.clone();
+    let cleared = match shared.root.stat_identity(&name) {
+        Some((_, kind)) => clear_entry(&shared.root, &name, kind),
+        // Either the entry already vanished (the unlink then observes
+        // NotFound) or this platform reports no identities and the plain
+        // unlink decides.
+        None => entry_gone(shared.root.unlink(&name)),
+    };
+    if !cleared {
+        unclearable.push(key);
+        return Some(false);
+    }
+    if let Some(entry) = index.entries.remove(&key) {
+        index.total_bytes = index.total_bytes.saturating_sub(entry.size);
+        shared.stats.evictions.fetch_add(1, Ordering::Relaxed);
+    }
+    Some(true)
 }
 
 /// Cleanup after a failed load, under the same index lock the writer holds
@@ -2586,7 +3619,7 @@ fn sync_payload(file: &File) -> Result<(), String> {
 
 /// Canonical filename for a cold object. KV keeps the historical
 /// `<64-hex>.safetensors`; every other group gets its label as an infix
-/// (`<64-hex>.gdn_state.safetensors`), so the two namespaces are disjoint on
+/// (`<64-hex>.conv_state.safetensors`), so the two namespaces are disjoint on
 /// disk as well as in the key derivation, and the dashboard can account them
 /// separately (packages/dashboard/src/cache.ts).
 fn object_file_name(key: &ColdCacheKey, group: ColdGroup) -> String {
@@ -4551,9 +5584,9 @@ mod tests {
         let fp = fingerprint();
         let groups = [
             ColdGroup::Kv,
-            ColdGroup::GdnState,
             ColdGroup::ConvState,
             ColdGroup::SlidingWindow,
+            ColdGroup::DFlash2State,
         ];
         let parent = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[], 0, 0);
         for (parent, tokens, extra, salt, index) in [
@@ -4622,15 +5655,15 @@ mod tests {
     #[test]
     fn sidecar_roundtrip_preserves_dtype_and_dims() {
         let fp = fingerprint();
-        let key = ColdCacheKey::chain(ColdGroup::GdnState, fp, None, &[1, 2, 3, 4], &[], 0, 0);
-        let original = sidecar(key, ColdGroup::GdnState);
+        let key = ColdCacheKey::chain(ColdGroup::ConvState, fp, None, &[1, 2, 3, 4], &[], 0, 0);
+        let original = sidecar(key, ColdGroup::ConvState);
         let encoded = encode_sidecar(&original).unwrap();
         assert!(
             encoded.len() as u64 <= max_encoded_len_for_sidecar(&original.layout).unwrap(),
             "the read bound must be a true upper bound on the encoder output"
         );
 
-        let decoded = decode_sidecar(&encoded, key, fp, ColdGroup::GdnState).unwrap();
+        let decoded = decode_sidecar(&encoded, key, fp, ColdGroup::ConvState).unwrap();
         assert_eq!(decoded, original);
         assert_eq!(decoded.layout.dtype, "BFloat16");
         assert_eq!(decoded.layout.dims, vec![4, 8, 2]);
@@ -4640,52 +5673,52 @@ mod tests {
         // Wrong group, wrong key, wrong fingerprint: all refused.
         assert!(decode_sidecar(&encoded, key, fp, ColdGroup::SlidingWindow).is_err());
         assert!(decode_sidecar(&encoded, key, fp, ColdGroup::Kv).is_err());
-        let other = ColdCacheKey::chain(ColdGroup::GdnState, fp, None, &[9, 9, 9, 9], &[], 0, 0);
-        assert!(decode_sidecar(&encoded, other, fp, ColdGroup::GdnState).is_err());
+        let other = ColdCacheKey::chain(ColdGroup::ConvState, fp, None, &[9, 9, 9, 9], &[], 0, 0);
+        assert!(decode_sidecar(&encoded, other, fp, ColdGroup::ConvState).is_err());
         let other_fp = ColdCacheFingerprint::from_components([b"other".as_slice()]);
-        assert!(decode_sidecar(&encoded, key, other_fp, ColdGroup::GdnState).is_err());
+        assert!(decode_sidecar(&encoded, key, other_fp, ColdGroup::ConvState).is_err());
 
         // A corrupt payload byte fails the checksum.
         let mut corrupt = encoded.clone();
         *corrupt.last_mut().unwrap() ^= 0xff;
-        assert!(decode_sidecar(&corrupt, key, fp, ColdGroup::GdnState).is_err());
+        assert!(decode_sidecar(&corrupt, key, fp, ColdGroup::ConvState).is_err());
 
         // The two object types are mutually undecodable even with matching
         // identity metadata: neither decoder can be fed the other's bytes.
         assert!(decode_block(&encoded, key, fp).is_err());
         let kv_key = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[], 0, 0);
         let block_bytes = encode_block(&block(kv_key)).unwrap();
-        assert!(decode_sidecar(&block_bytes, kv_key, fp, ColdGroup::GdnState).is_err());
+        assert!(decode_sidecar(&block_bytes, kv_key, fp, ColdGroup::ConvState).is_err());
     }
 
     #[test]
     fn sidecar_rejects_out_of_range_geometry() {
-        let key = ColdCacheKey::chain(ColdGroup::GdnState, fingerprint(), None, &[1], &[], 0, 0);
-        let mut kv_group = sidecar(key, ColdGroup::GdnState);
+        let key = ColdCacheKey::chain(ColdGroup::ConvState, fingerprint(), None, &[1], &[], 0, 0);
+        let mut kv_group = sidecar(key, ColdGroup::ConvState);
         kv_group.layout.group = ColdGroup::Kv;
         assert!(
             kv_group.validate().is_err(),
             "sidecars must not use the KV group"
         );
 
-        let mut zero_boundary = sidecar(key, ColdGroup::GdnState);
+        let mut zero_boundary = sidecar(key, ColdGroup::ConvState);
         zero_boundary.layout.boundary_tokens = 0;
         assert!(zero_boundary.validate().is_err());
 
-        let mut too_many = sidecar(key, ColdGroup::GdnState);
+        let mut too_many = sidecar(key, ColdGroup::ConvState);
         too_many.layout.tensors_per_layer = MAX_SIDECAR_TENSORS_PER_LAYER + 1;
         assert!(too_many.validate().is_err());
         assert_eq!(max_encoded_len_for_sidecar(&too_many.layout), None);
 
-        let mut too_many_dims = sidecar(key, ColdGroup::GdnState);
+        let mut too_many_dims = sidecar(key, ColdGroup::ConvState);
         too_many_dims.layout.dims = vec![1; MAX_SIDECAR_DIMS + 1];
         assert!(too_many_dims.validate().is_err());
 
-        let mut short_tensor = sidecar(key, ColdGroup::GdnState);
+        let mut short_tensor = sidecar(key, ColdGroup::ConvState);
         short_tensor.tensors[1].pop();
         assert!(short_tensor.validate().is_err());
 
-        let mut missing_tensor = sidecar(key, ColdGroup::GdnState);
+        let mut missing_tensor = sidecar(key, ColdGroup::ConvState);
         missing_tensor.tensors.pop();
         assert!(missing_tensor.validate().is_err());
     }
@@ -4700,15 +5733,15 @@ mod tests {
     fn sidecar_policy_is_a_boundary_free_geometry_template() {
         let policy = ColdSidecarPolicy::new(ColdSidecarLayout {
             boundary_tokens: 4096,
-            ..sidecar_layout(ColdGroup::GdnState)
+            ..sidecar_layout(ColdGroup::ConvState)
         })
         .expect("a legal geometry must build a policy");
-        assert_eq!(policy.group(), ColdGroup::GdnState);
+        assert_eq!(policy.group(), ColdGroup::ConvState);
         assert_eq!(
             policy.expected_at(32),
             ColdSidecarLayout {
                 boundary_tokens: 32,
-                ..sidecar_layout(ColdGroup::GdnState)
+                ..sidecar_layout(ColdGroup::ConvState)
             },
             "the constructor's boundary must be dropped and the candidate's used"
         );
@@ -4720,28 +5753,28 @@ mod tests {
         assert!(
             ColdSidecarPolicy::new(ColdSidecarLayout {
                 tensors_per_layer: MAX_SIDECAR_TENSORS_PER_LAYER + 1,
-                ..sidecar_layout(ColdGroup::GdnState)
+                ..sidecar_layout(ColdGroup::ConvState)
             })
             .is_err()
         );
         assert!(
             ColdSidecarPolicy::new(ColdSidecarLayout {
                 dims: Vec::new(),
-                ..sidecar_layout(ColdGroup::GdnState)
+                ..sidecar_layout(ColdGroup::ConvState)
             })
             .is_err()
         );
         assert!(
             ColdSidecarPolicy::new(ColdSidecarLayout {
                 bytes_per_tensor: 0,
-                ..sidecar_layout(ColdGroup::GdnState)
+                ..sidecar_layout(ColdGroup::ConvState)
             })
             .is_err()
         );
         assert!(
             ColdSidecarPolicy::new(ColdSidecarLayout {
                 num_layers: 0,
-                ..sidecar_layout(ColdGroup::GdnState)
+                ..sidecar_layout(ColdGroup::ConvState)
             })
             .is_err()
         );
@@ -4757,7 +5790,7 @@ mod tests {
     /// This test must be green both BEFORE and AFTER a scaled axis exists.
     #[test]
     fn unscaled_policy_stamps_the_boundary_and_nothing_else() {
-        let template = sidecar_layout(ColdGroup::GdnState);
+        let template = sidecar_layout(ColdGroup::ConvState);
         let policy =
             ColdSidecarPolicy::new(template.clone()).expect("a legal geometry must build a policy");
         for boundary in [1u32, 16, 17, 32, 512, 4096, u32::MAX] {
@@ -4888,13 +5921,16 @@ mod tests {
     /// proves no multi-GB reservation happened.
     #[test]
     fn sidecar_decode_rejects_forged_counts() {
-        let key = ColdCacheKey::chain(ColdGroup::GdnState, fingerprint(), None, &[1], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::ConvState, fingerprint(), None, &[1], &[], 0, 0);
         let payload: Vec<u8> = vec![7; 6];
         let view = TensorView::new(Dtype::U8, vec![payload.len()], &payload).unwrap();
         let forged = |num_layers: &str, per_layer: &str| {
             let mut metadata = HashMap::new();
             metadata.insert("abi".to_string(), CACHE_ABI.to_string());
-            metadata.insert("group".to_string(), ColdGroup::GdnState.label().to_string());
+            metadata.insert(
+                "group".to_string(),
+                ColdGroup::ConvState.label().to_string(),
+            );
             metadata.insert("key".to_string(), key.to_hex());
             metadata.insert("fingerprint".to_string(), fingerprint().to_hex());
             metadata.insert("checksum".to_string(), "unused".to_string());
@@ -4922,7 +5958,7 @@ mod tests {
                     &forged(&layers, &per_layer),
                     key,
                     fingerprint(),
-                    ColdGroup::GdnState
+                    ColdGroup::ConvState
                 )
                 .is_err(),
                 "forged counts ({layers}, {per_layer}) must be rejected before allocating"
@@ -4938,22 +5974,22 @@ mod tests {
         let root = temp_root("sidecar-truncated");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
         let fp = fingerprint();
-        let key = ColdCacheKey::chain(ColdGroup::GdnState, fp, None, &[1, 2, 3, 4], &[], 0, 0);
-        let expected = sidecar(key, ColdGroup::GdnState);
+        let key = ColdCacheKey::chain(ColdGroup::ConvState, fp, None, &[1, 2, 3, 4], &[], 0, 0);
+        let expected = sidecar(key, ColdGroup::ConvState);
 
         assert!(manager.enqueue_sidecar(expected.clone()).unwrap());
         assert!(manager.drain(Duration::from_secs(5)));
 
-        let path = root.join(object_file_name(&key, ColdGroup::GdnState));
+        let path = root.join(object_file_name(&key, ColdGroup::ConvState));
         assert!(path.exists(), "the sidecar must land under its own name");
         assert!(
             !root.join(format!("{}.safetensors", key.to_hex())).exists(),
             "a sidecar must never occupy the KV block name"
         );
-        assert!(manager.contains_in(&key, ColdGroup::GdnState));
+        assert!(manager.contains_in(&key, ColdGroup::ConvState));
         assert!(!manager.contains(&key), "a sidecar is not a KV block");
         assert_eq!(
-            manager.load_sidecar(key, fp, &sidecar_layout(ColdGroup::GdnState)),
+            manager.load_sidecar(key, fp, &sidecar_layout(ColdGroup::ConvState)),
             Some(expected.clone())
         );
 
@@ -4964,7 +6000,7 @@ mod tests {
 
         let before = manager.stats();
         assert_eq!(
-            manager.load_sidecar(key, fp, &sidecar_layout(ColdGroup::GdnState)),
+            manager.load_sidecar(key, fp, &sidecar_layout(ColdGroup::ConvState)),
             None,
             "a truncated sidecar must miss, not panic or return partial state"
         );
@@ -4972,7 +6008,7 @@ mod tests {
         assert_eq!(after.corruptions, before.corruptions + 1);
         assert_eq!(after.misses, before.misses + 1);
         assert!(!path.exists(), "the corrupt sidecar file must be pruned");
-        assert!(!manager.contains_in(&key, ColdGroup::GdnState));
+        assert!(!manager.contains_in(&key, ColdGroup::ConvState));
 
         // A sidecar asked for under the wrong group, or with a layout that
         // does not match what was written, is likewise a miss.
@@ -5126,35 +6162,35 @@ mod tests {
         let root = temp_root("sidecar-layout-mismatch");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
         let fp = fingerprint();
-        let key = ColdCacheKey::chain(ColdGroup::GdnState, fp, None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::ConvState, fp, None, &[1, 2, 3, 4], &[], 0, 0);
         assert!(
             manager
-                .enqueue_sidecar(sidecar(key, ColdGroup::GdnState))
+                .enqueue_sidecar(sidecar(key, ColdGroup::ConvState))
                 .unwrap()
         );
         assert!(manager.drain(Duration::from_secs(5)));
 
-        let mut wrong_dtype = sidecar_layout(ColdGroup::GdnState);
+        let mut wrong_dtype = sidecar_layout(ColdGroup::ConvState);
         wrong_dtype.dtype = "Float16".to_string();
         assert_eq!(manager.load_sidecar(key, fp, &wrong_dtype), None);
 
-        let mut wrong_dims = sidecar_layout(ColdGroup::GdnState);
+        let mut wrong_dims = sidecar_layout(ColdGroup::ConvState);
         wrong_dims.dims = vec![4, 8, 3];
         assert_eq!(manager.load_sidecar(key, fp, &wrong_dims), None);
 
-        let mut wrong_boundary = sidecar_layout(ColdGroup::GdnState);
+        let mut wrong_boundary = sidecar_layout(ColdGroup::ConvState);
         wrong_boundary.boundary_tokens = 32;
         assert_eq!(manager.load_sidecar(key, fp, &wrong_boundary), None);
 
         // The file survives every mismatch: it is valid, just not what this
         // caller asked for.
         assert!(
-            root.join(object_file_name(&key, ColdGroup::GdnState))
+            root.join(object_file_name(&key, ColdGroup::ConvState))
                 .exists()
         );
         assert_eq!(
-            manager.load_sidecar(key, fp, &sidecar_layout(ColdGroup::GdnState)),
-            Some(sidecar(key, ColdGroup::GdnState))
+            manager.load_sidecar(key, fp, &sidecar_layout(ColdGroup::ConvState)),
+            Some(sidecar(key, ColdGroup::ConvState))
         );
 
         drop(manager);
@@ -5288,11 +6324,12 @@ mod tests {
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
         let fp = fingerprint();
         let kv_key = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[], 0, 0);
-        let side_key = ColdCacheKey::chain(ColdGroup::GdnState, fp, None, &[1, 2, 3, 4], &[], 0, 0);
+        let side_key =
+            ColdCacheKey::chain(ColdGroup::ConvState, fp, None, &[1, 2, 3, 4], &[], 0, 0);
         assert!(manager.enqueue(block(kv_key)).unwrap());
         assert!(
             manager
-                .enqueue_sidecar(sidecar(side_key, ColdGroup::GdnState))
+                .enqueue_sidecar(sidecar(side_key, ColdGroup::ConvState))
                 .unwrap()
         );
         assert!(manager.drain(Duration::from_secs(5)));
@@ -5302,7 +6339,7 @@ mod tests {
         let index = reopened.shared.index.lock().unwrap();
         assert_eq!(index.entries.len(), 2, "both objects must be indexed");
         assert_eq!(index.entries[&kv_key].group, ColdGroup::Kv);
-        assert_eq!(index.entries[&side_key].group, ColdGroup::GdnState);
+        assert_eq!(index.entries[&side_key].group, ColdGroup::ConvState);
         let on_disk: u64 = [kv_key, side_key]
             .iter()
             .map(|key| index.entries[key].size)
@@ -5574,7 +6611,7 @@ mod tests {
         let mut wedge = block(key);
         wedge.tokens = toks;
         assert!(
-            manager.sender.try_send(WriteJob::Block(wedge)).is_ok(),
+            manager.try_send_block_lane(WriteJob::Block(wedge)).is_ok(),
             "the wedge job must fit an empty queue"
         );
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -5603,7 +6640,10 @@ mod tests {
             let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &toks, &[], 0, 0);
             let mut candidate = block(key);
             candidate.tokens = toks;
-            match manager.sender.try_send(WriteJob::Block(candidate)) {
+            match manager
+                .try_send_block_lane(WriteJob::Block(candidate))
+                .map_err(|refused| *refused)
+            {
                 Ok(()) => accepted += 1,
                 Err(TrySendError::Full(_)) => return accepted,
                 Err(TrySendError::Disconnected(_)) => panic!("writer thread is gone"),
@@ -5675,7 +6715,7 @@ mod tests {
         saturate(&manager, 2);
 
         let key = ColdCacheKey::chain(
-            ColdGroup::GdnState,
+            ColdGroup::ConvState,
             fingerprint(),
             None,
             &[1, 2, 3, 4],
@@ -5686,7 +6726,7 @@ mod tests {
         let start = Instant::now();
         let accepted = manager
             .enqueue_sidecar_before(
-                sidecar(key, ColdGroup::GdnState),
+                sidecar(key, ColdGroup::ConvState),
                 Instant::now() + Duration::from_millis(2_000),
             )
             .unwrap();
@@ -5729,7 +6769,7 @@ mod tests {
 
         let deadline_ms = 100u64;
         let key = ColdCacheKey::chain(
-            ColdGroup::GdnState,
+            ColdGroup::ConvState,
             fingerprint(),
             None,
             &[5, 6, 7, 8],
@@ -5740,7 +6780,7 @@ mod tests {
         let start = Instant::now();
         let accepted = manager
             .enqueue_sidecar_before(
-                sidecar(key, ColdGroup::GdnState),
+                sidecar(key, ColdGroup::ConvState),
                 Instant::now() + Duration::from_millis(deadline_ms),
             )
             .unwrap();
@@ -5790,7 +6830,7 @@ mod tests {
         );
 
         let key = ColdCacheKey::chain(
-            ColdGroup::GdnState,
+            ColdGroup::ConvState,
             fingerprint(),
             None,
             &[4, 3, 2, 1],
@@ -5800,7 +6840,7 @@ mod tests {
         );
         assert!(
             !manager
-                .enqueue_sidecar(sidecar(key, ColdGroup::GdnState))
+                .enqueue_sidecar(sidecar(key, ColdGroup::ConvState))
                 .unwrap(),
             "a full queue refuses the non-blocking sidecar offer"
         );
@@ -6937,7 +7977,7 @@ mod tests {
         let root = temp_root("deleted-root");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 4).unwrap();
         let key = ColdCacheKey::chain(
-            ColdGroup::GdnState,
+            ColdGroup::ConvState,
             fingerprint(),
             None,
             &[9, 9, 9, 9],
@@ -6954,7 +7994,7 @@ mod tests {
 
         assert!(
             manager
-                .enqueue_sidecar(sidecar(key, ColdGroup::GdnState))
+                .enqueue_sidecar(sidecar(key, ColdGroup::ConvState))
                 .unwrap()
         );
         assert!(
@@ -8348,5 +9388,367 @@ mod tests {
         assert_eq!(manager.stats().corruptions, 1);
         drop(manager);
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn state_layout(spans: Vec<u64>) -> ColdStateLayout {
+        ColdStateLayout {
+            boundary_tokens: 4,
+            spans,
+            geometry: "gdn 2 3 4 1 2 2\ndraft 1 1 2 8\ncontext 16 q4 64".to_string(),
+        }
+    }
+
+    fn state_label() -> ColdStateLabel {
+        ColdStateLabel {
+            tokens: vec![1, 2, 3, 4],
+            salt: 7,
+            last_used: 42,
+            checkpoint: true,
+        }
+    }
+
+    fn state_key(seed: u32) -> ColdCacheKey {
+        ColdCacheKey::chain(
+            ColdGroup::DFlash2State,
+            fingerprint(),
+            None,
+            &[seed, 2, 3, 4],
+            &[],
+            7,
+            0,
+        )
+    }
+
+    fn state_object(key: ColdCacheKey, spans: Vec<u64>) -> ColdStateObject {
+        let layout = state_layout(spans);
+        let total = layout.payload_bytes().unwrap() as usize;
+        ColdStateObject {
+            key,
+            fingerprint: fingerprint(),
+            layout,
+            label: state_label(),
+            payload: (0..total).map(|i| (i * 7 % 251) as u8).collect(),
+        }
+    }
+
+    fn landed(rx: &Receiver<Landed>) -> Landed {
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the writer must report the tracked job")
+    }
+
+    /// Park the writer inside its next commit until the returned sender is
+    /// used (or dropped): installs a one-shot dir-sync gate, pushes a wedge
+    /// block, and returns once the writer is inside the gate.
+    fn park_writer(manager: &ColdCacheManager) -> mpsc::Sender<()> {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (parked_tx, parked_rx) = mpsc::channel::<()>();
+        let gate = Mutex::new(Some((release_rx, parked_tx)));
+        *manager.shared.dir_sync_override.lock().unwrap() = Some(Box::new(move || {
+            let taken = gate.lock().unwrap().take();
+            if let Some((release, parked)) = taken {
+                let _ = parked.send(());
+                let _ = release.recv();
+            }
+            Ok(())
+        }));
+        let toks = vec![u32::MAX, u32::MAX - 1, u32::MAX - 2, u32::MAX - 3];
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &toks, &[], 0, 0);
+        let mut wedge = block(key);
+        wedge.tokens = toks;
+        assert!(manager.try_send_block_lane(WriteJob::Block(wedge)).is_ok());
+        parked_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer never reached the gate");
+        release_tx
+    }
+
+    // K8: a state object costs the quota its file size, payload + header,
+    // never the read bound or a padded slot.
+    #[test]
+    fn state_object_charges_its_payload() {
+        let root = temp_root("state-charge");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let key = state_key(1);
+        let object = state_object(key, vec![96, 64]);
+        let (layout, label) = (object.layout.clone(), object.label.clone());
+        let before = manager.total_bytes();
+        let (tx, rx) = mpsc::channel();
+        manager.enqueue_state(object, MakeRoom::Evict, tx).unwrap();
+        assert!(matches!(landed(&rx), Landed::State { ok: true, .. }));
+
+        let file = fs::metadata(root.join(object_file_name(&key, ColdGroup::DFlash2State)))
+            .unwrap()
+            .len();
+        let indexed = manager.shared.index.lock().unwrap().entries[&key].size;
+        assert_eq!(indexed, file, "the index charges the file's own size");
+        assert_eq!(file, 160 + state_header_len(&layout, &label));
+        assert_eq!(state_object_bytes(&layout, &label), file);
+        assert_eq!(manager.total_bytes() - before, file);
+
+        let big = ColdStateLayout {
+            boundary_tokens: 30_000,
+            spans: vec![153_944_064, 5_898_240],
+            geometry: layout.geometry.clone(),
+        };
+        let big_label = ColdStateLabel {
+            tokens: (0..30_000).collect(),
+            ..label
+        };
+        assert_eq!(
+            state_object_bytes(&big, &big_label),
+            159_842_304 + state_header_len(&big, &big_label)
+        );
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // Splash `QwenStateStorage::adopt`: a payload of other spans or another
+    // geometry is refused, and the object stays.
+    #[test]
+    fn state_read_refuses_another_payload() {
+        let root = temp_root("state-payload");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let key = state_key(2);
+        let object = state_object(key, vec![96, 64]);
+        let (layout, label, payload) = (
+            object.layout.clone(),
+            object.label.clone(),
+            object.payload.clone(),
+        );
+        let (tx, rx) = mpsc::channel();
+        manager.enqueue_state(object, MakeRoom::Evict, tx).unwrap();
+        assert!(matches!(landed(&rx), Landed::State { ok: true, .. }));
+
+        let mut into = vec![0u8; 160];
+        assert_eq!(
+            manager.load_state(key, fingerprint(), &layout, &mut into),
+            Some(label.clone())
+        );
+        assert_eq!(into, payload);
+        assert_eq!(
+            manager.state_label(key, fingerprint()),
+            Some((layout.clone(), label))
+        );
+        assert_eq!(manager.keys_in(ColdGroup::DFlash2State), vec![key]);
+
+        let misses = manager.stats().misses;
+        let wider = state_layout(vec![96, 65]);
+        let mut wider_into = vec![0u8; 161];
+        assert_eq!(
+            manager.load_state(key, fingerprint(), &wider, &mut wider_into),
+            None
+        );
+        assert_eq!(manager.stats().misses, misses + 1);
+        let other = ColdStateLayout {
+            geometry: "gdn 2 3 4 1 2 2 bf16".to_string(),
+            ..layout.clone()
+        };
+        assert_eq!(
+            manager.load_state(key, fingerprint(), &other, &mut into),
+            None
+        );
+        assert_eq!(manager.stats().misses, misses + 2);
+        assert_eq!(manager.stats().corruptions, 0);
+        assert!(manager.contains_in(&key, ColdGroup::DFlash2State));
+        assert!(
+            root.join(object_file_name(&key, ColdGroup::DFlash2State))
+                .exists()
+        );
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // The state lane goes ahead of queued blocks; the staging buffer always
+    // comes back; one state at a time; a closed tier refuses as gone; a full
+    // block queue costs no blit; a `Refuse` write evicts nothing.
+    #[test]
+    fn state_lane_goes_before_queued_blocks() {
+        let root = temp_root("state-lane");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 8).unwrap();
+        let wakes = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&wakes);
+        manager.set_landing_wake(Some(Arc::new(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+        })));
+
+        let release = park_writer(&manager);
+        let mut queued = Vec::new();
+        for i in 0..8u32 {
+            let toks = vec![i, i + 100, i + 200, i + 300];
+            let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &toks, &[], 0, 0);
+            let mut candidate = block(key);
+            candidate.tokens = toks;
+            assert!(manager.enqueue(candidate).unwrap());
+            queued.push(key);
+        }
+        let state = state_object(state_key(3), vec![96, 64]);
+        let state_key_3 = state.key;
+        let capacity = state.payload.capacity();
+        let (tx, rx) = mpsc::channel();
+        manager
+            .enqueue_state(state, MakeRoom::Evict, tx.clone())
+            .unwrap();
+        let busy = manager.enqueue_state(
+            state_object(state_key(4), vec![96, 64]),
+            MakeRoom::Evict,
+            tx.clone(),
+        );
+        assert!(
+            matches!(busy, Err(EnqueueRefused::Busy(ref object)) if object.key == state_key(4))
+        );
+        drop(release);
+        match landed(&rx) {
+            Landed::State { key, ok, payload } => {
+                assert_eq!(key, state_key_3);
+                assert!(ok);
+                assert_eq!(
+                    payload.capacity(),
+                    capacity,
+                    "the staging buffer comes back"
+                );
+            }
+            other => panic!("expected the state landing, got {other:?}"),
+        }
+        assert!(manager.drain(Duration::from_secs(10)));
+        let log = manager.shared.commit_log.lock().unwrap().clone();
+        let at = |key: &ColdCacheKey| log.iter().position(|k| k == key).unwrap();
+        assert!(
+            at(&state_key_3) < at(&queued[2]),
+            "the state must commit before the third queued block: {log:?}"
+        );
+        assert!(
+            wakes.load(Ordering::Relaxed) >= 1,
+            "a landing wakes the model"
+        );
+
+        // A failed persist hands the payload back and leaves no object.
+        let blocked = state_object(state_key(5), vec![96, 64]);
+        let blocked_key = blocked.key;
+        fs::create_dir(root.join(object_file_name(&blocked_key, ColdGroup::DFlash2State))).unwrap();
+        manager
+            .enqueue_state(blocked, MakeRoom::Evict, tx.clone())
+            .unwrap();
+        match landed(&rx) {
+            Landed::State { key, ok, payload } => {
+                assert_eq!(key, blocked_key);
+                assert!(!ok);
+                assert_eq!(payload.len(), 160);
+            }
+            other => panic!("expected the failed state landing, got {other:?}"),
+        }
+        assert!(!manager.contains_in(&blocked_key, ColdGroup::DFlash2State));
+
+        // A full block queue at a past deadline reads no block.
+        refused_tracked_writes();
+
+        assert!(
+            !manager.close(Duration::from_secs(10)),
+            "the failed state write is inside the closing drain's window"
+        );
+        let gone = manager.enqueue_state(
+            state_object(state_key(6), vec![96, 64]),
+            MakeRoom::Evict,
+            tx,
+        );
+        assert!(matches!(gone, Err(EnqueueRefused::Gone(_))));
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn refused_tracked_writes() {
+        use crate::PagedAttentionConfig;
+        use crate::metal::MetalDtype;
+
+        let config = PagedAttentionConfig {
+            block_size: 8,
+            gpu_memory_mb: 256,
+            head_size: 64,
+            num_kv_heads: 1,
+            num_layers: 1,
+            max_seq_len: Some(32),
+            max_batch_size: Some(1),
+        };
+        let pool = match LayerKVPool::new_private_for_test(config, 2, 2, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping the tracked-block half: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let allocator = Mutex::new(BlockAllocator::new(2, 2, 8));
+        let source = allocator.lock().unwrap().allocate().unwrap();
+        let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &tokens, &[], 0, 0);
+
+        let full_root = temp_root("state-lane-full");
+        let full = ColdCacheManager::open_at(full_root.clone(), GIB, 0, 2).unwrap();
+        let release = park_writer(&full);
+        saturate(&full, 2);
+        let reads = full.shared.capture_reads.load(Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        let accepted = full
+            .capture_and_enqueue_tracked(
+                &pool,
+                &source,
+                key,
+                fingerprint(),
+                &tokens,
+                Instant::now(),
+                MakeRoom::Evict,
+                tx.clone(),
+            )
+            .unwrap();
+        assert!(!accepted);
+        assert_eq!(
+            full.shared.capture_reads.load(Ordering::Relaxed),
+            reads,
+            "a refused tracked write must not read the block"
+        );
+        drop(release);
+        assert!(full.drain(Duration::from_secs(10)));
+        drop(full);
+        let _ = fs::remove_dir_all(full_root);
+
+        // A `Refuse` write over the quota fails and evicts nothing.
+        let tight_root = temp_root("state-lane-tight");
+        let filler = state_object(state_key(7), vec![64 << 10]);
+        let filler_key = filler.key;
+        let filler_bytes = state_object_bytes(&filler.layout, &filler.label);
+        let tight = ColdCacheManager::open_at(tight_root.clone(), filler_bytes, 0, 2).unwrap();
+        tight
+            .enqueue_state(filler, MakeRoom::Evict, tx.clone())
+            .unwrap();
+        assert!(matches!(landed(&rx), Landed::State { ok: true, .. }));
+        assert!(
+            tight
+                .capture_and_enqueue_tracked(
+                    &pool,
+                    &source,
+                    key,
+                    fingerprint(),
+                    &tokens,
+                    Instant::now() + Duration::from_secs(10),
+                    MakeRoom::Refuse,
+                    tx,
+                )
+                .unwrap()
+        );
+        match landed(&rx) {
+            Landed::Block {
+                key: landed_key,
+                ok,
+            } => {
+                assert_eq!(landed_key, key);
+                assert!(!ok);
+            }
+            other => panic!("expected the block landing, got {other:?}"),
+        }
+        assert_eq!(tight.stats().evictions, 0);
+        assert!(tight.contains_in(&filler_key, ColdGroup::DFlash2State));
+        assert!(!tight.contains(&key));
+        drop(tight);
+        let _ = fs::remove_dir_all(tight_root);
+        allocator.lock().unwrap().free(source);
     }
 }

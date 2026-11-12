@@ -304,6 +304,11 @@ impl BlockAllocator {
         Arc::clone(&self.recency)
     }
 
+    /// The block the prefix cache holds under `hash`.
+    pub fn cached_block(&self, hash: u64) -> Option<Arc<PhysicalBlock>> {
+        self.prefix_cache.get(&hash).cloned()
+    }
+
     fn ref_count_of(&self, hash: u64) -> Option<u32> {
         self.prefix_cache
             .get(&hash)

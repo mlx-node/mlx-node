@@ -360,8 +360,11 @@ pub(crate) struct MemoryFootprint {
     pub active_bytes: u64,
     /// Other models' private KV pools, which MLX's counter does not see.
     pub other_pool_bytes: u64,
-    /// This pool's restore staging (Splash `stateStagingBytes`).
+    /// This pool's KV restore staging.
     pub staging_bytes: u64,
+    /// The SSD tier's state staging buffer, a host buffer of one state's
+    /// size (Splash `stateStagingBytes`); 0 with the tier off.
+    pub state_staging_bytes: u64,
     /// Reported only: it is inside `active_bytes`.
     pub draft_weights_bytes: u64,
     /// The streamed stores' planned bytes above what is live (Splash
@@ -798,6 +801,7 @@ impl MemoryPlan {
             .active_bytes
             .saturating_add(footprint.other_pool_bytes)
             .saturating_add(footprint.staging_bytes)
+            .saturating_add(footprint.state_staging_bytes)
             .saturating_add(footprint.held_back_bytes)
             .saturating_add(PIPELINE_RESERVE_BYTES)
             .saturating_add(RUNTIME_OVERHEAD_RESERVE_BYTES);
@@ -899,6 +903,7 @@ impl MemoryPlan {
                 active_bytes: 0,
                 other_pool_bytes: 0,
                 staging_bytes: 0,
+                state_staging_bytes: 0,
                 draft_weights_bytes: 0,
                 held_back_bytes: 0,
                 margin: Margin::Unguarded,
@@ -960,11 +965,13 @@ impl MemoryPlan {
     }
 
     /// What the memory governor charges beside the allocations it sees:
-    /// the pipeline and runtime reserves and the lane's transient, MLX
-    /// allocations no claim admits.
+    /// the pipeline and runtime reserves, the SSD tier's state staging (a
+    /// host buffer) and the lane's transient, MLX allocations no claim
+    /// admits.
     pub(crate) fn untracked_reserve_bytes(&self) -> u64 {
         PIPELINE_RESERVE_BYTES
             .saturating_add(RUNTIME_OVERHEAD_RESERVE_BYTES)
+            .saturating_add(self.footprint.state_staging_bytes)
             .saturating_add(
                 self.pool
                     .as_ref()
@@ -1036,8 +1043,13 @@ impl MemoryPlan {
         );
         let _ = writeln!(
             out,
-            "SSD cache state staging: {}",
+            "KV restore staging: {}",
             bytes_and_mib(footprint.staging_bytes)
+        );
+        let _ = writeln!(
+            out,
+            "SSD cache state staging: {}",
+            bytes_and_mib(footprint.state_staging_bytes)
         );
         let _ = writeln!(
             out,
@@ -1118,6 +1130,7 @@ pub(crate) fn audit(plan: &MemoryPlan, measured: MeasuredMemory) -> Result<(), S
         .saturating_add(measured.pool_bytes)
         .saturating_add(measured.other_pool_bytes)
         .saturating_add(plan.footprint.staging_bytes)
+        .saturating_add(plan.footprint.state_staging_bytes)
         .saturating_add(PIPELINE_RESERVE_BYTES)
         .saturating_add(RUNTIME_OVERHEAD_RESERVE_BYTES);
     if footprint > plan.hard_budget_bytes {

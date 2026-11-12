@@ -75,28 +75,16 @@ export class PagedConfigOverrideManager {
    * type (for example, `gemma4` for a `gemma4_unified` checkpoint).
    * Unmanaged, unreadable, or malformed checkpoints pass through unchanged.
    *
-   * `persistPagedCache` is a tri-state cold-tier directive. `undefined` leaves
-   * the field untouched (families with no cold-tier opt-in). A boolean is
-   * AUTHORITATIVE: it writes `persist_paged_cache: <value>` into the cloned
-   * config, overriding whatever the source config.json carries (either alias),
-   * and forces a clone whenever the source's value disagrees so the directive
-   * actually reaches the loader. Callers gate the boolean to the families whose
-   * paged cold restore is sound — the allowlist in
-   * `packages/agent/src/cold-tier.ts`, mirrored by `COLD_RESTORE_FAMILIES` in
-   * `crates/mlx-core/src/cold_tier.rs`. It is a SET, not one family, and it is
-   * deliberately not repeated here: `MlxModelHost` calls this for every
-   * allowlisted family, and a second copy of the list would drift.
-   *
    * The clone never sizes the pool: a Qwen3.5 load sizes it from its memory
    * plan, and a source `paged_cache_memory_mb` passes through to that plan's
    * check.
    */
-  async resolve(modelPath: string, canonicalModelType?: string, persistPagedCache?: boolean): Promise<string> {
+  async resolve(modelPath: string, canonicalModelType?: string): Promise<string> {
     if (this.disposed) {
       throw new Error('PagedConfigOverrideManager: resolve() called after cleanup()');
     }
 
-    const operation = this.resolveInternal(modelPath, canonicalModelType, persistPagedCache);
+    const operation = this.resolveInternal(modelPath, canonicalModelType);
     this.activeResolves.add(operation);
     try {
       return await operation;
@@ -105,11 +93,7 @@ export class PagedConfigOverrideManager {
     }
   }
 
-  private async resolveInternal(
-    modelPath: string,
-    canonicalModelType: string | undefined,
-    persistPagedCache: boolean | undefined,
-  ): Promise<string> {
+  private async resolveInternal(modelPath: string, canonicalModelType: string | undefined): Promise<string> {
     const sourcePath = isAbsolute(modelPath) ? modelPath : resolve(modelPath);
     if (extname(sourcePath).toLowerCase() === '.gguf') {
       let modelType = canonicalModelType;
@@ -122,15 +106,15 @@ export class PagedConfigOverrideManager {
       }
       if (modelType !== 'muse_glimmer' || !this.modelTypes.has(modelType)) return modelPath;
       // A symlink to the GGUF would canonicalize back to the original config.
-      // Prepare once, then overlay the small asset dir so paging/persistence
-      // directives reach the loader and the DFlash source record stays attached.
+      // Prepare once, then overlay the small asset dir so the paging directive
+      // reaches the loader and the DFlash source record stays attached.
       // `prepare` protects the assets from stale/debris cleanup with a lease;
       // a resolve failure must release this attempt's reference — the loader is
       // never reached, so the lease would protect them for the process lifetime.
       const prepared = await prepareMuseGlimmerGguf(sourcePath);
       let resolved: string;
       try {
-        resolved = await this.resolveInternal(prepared, modelType, persistPagedCache);
+        resolved = await this.resolveInternal(prepared, modelType);
       } catch (error) {
         releaseNativeGgufLease(prepared);
         throw error;
@@ -161,17 +145,6 @@ export class PagedConfigOverrideManager {
       return modelPath;
     }
 
-    // A boolean persist directive is authoritative: force a clone whenever the
-    // source config's EFFECTIVE value disagrees, so the directive actually reaches
-    // the loader (both `--no-persist-cache` off AND default-on). Mirror the native
-    // parser's snake-first precedence — `persist_paged_cache` wins when present,
-    // else the camelCase alias — so a config with snake=false AND camel=true does
-    // not read as `true` here (an OR) while native reads snake=false, silently
-    // dropping an authoritative `true` request.
-    const sourcePersist =
-      typeof config.persist_paged_cache === 'boolean' ? config.persist_paged_cache : config.persistPagedCache === true;
-    const persistOverrideNeeded = persistPagedCache !== undefined && persistPagedCache !== sourcePersist;
-
     // Gemma4's DSpark / assistant speculative executor currently owns flat KV
     // caches. Preserve native draft discovery only for explicit callers; the
     // default paged clone intentionally omits subdirectories, hiding `draft/`
@@ -184,23 +157,18 @@ export class PagedConfigOverrideManager {
     const pagedEnabled = config.use_block_paged_cache === true;
     // Even an already-paged Gemma config must be cloned when `draft/` exists:
     // returning the source would expose the draft to native auto-discovery and
-    // trigger the flat-speculation/paged-cache conflict. An authoritative
-    // persist directive that disagrees with the source likewise blocks the
-    // pass-through so the resolved value reaches the loader.
-    if (pagedEnabled && !hasEmbeddedGemmaDraft && !persistOverrideNeeded) {
+    // trigger the flat-speculation/paged-cache conflict.
+    if (pagedEnabled && !hasEmbeddedGemmaDraft) {
       return modelPath;
     }
 
-    // Memoize per (source, resolved family, persist directive): the same
-    // checkpoint resolved with a different persist tri-state must yield a
-    // distinct clone, not the first one cached under the bare path. `cleanup()`
-    // iterates every value, so multiple entries per path are all still disposed.
-    const persistKey = persistPagedCache === undefined ? 'u' : persistPagedCache ? 't' : 'f';
-    const cacheKey = `${sourcePath}\0${modelType}\0${persistKey}`;
+    // Memoize per (source, resolved family). `cleanup()` iterates every value,
+    // so multiple entries per path are all still disposed.
+    const cacheKey = `${sourcePath}\0${modelType}`;
     const existing = this.overrides.get(cacheKey);
     if (existing !== undefined) return existing;
 
-    const pending = this.createOverride(sourcePath, config, modelType, persistPagedCache);
+    const pending = this.createOverride(sourcePath, config, modelType);
     this.overrides.set(cacheKey, pending);
     try {
       return await pending;
@@ -257,7 +225,6 @@ export class PagedConfigOverrideManager {
     sourcePath: string,
     sourceConfig: Record<string, unknown>,
     modelType: string,
-    persistPagedCache: boolean | undefined,
   ): Promise<string> {
     const root = await this.getRoot();
     const overrideDir = await mkdtemp(join(root, 'model-'));
@@ -266,13 +233,6 @@ export class PagedConfigOverrideManager {
       ...sourceConfig,
       use_block_paged_cache: true,
     };
-    if (persistPagedCache !== undefined) {
-      // Authoritative: the loader reads snake_case, so that spelling is the one
-      // that decides persistence. Reconcile a stray camelCase alias spread from
-      // the source config so it can never contradict the authoritative value.
-      config.persist_paged_cache = persistPagedCache;
-      if ('persistPagedCache' in config) config.persistPagedCache = persistPagedCache;
-    }
     await writeFile(join(overrideDir, 'config.json'), JSON.stringify(config, null, 2), 'utf-8');
 
     const sourceEntries = await readdir(sourcePath);

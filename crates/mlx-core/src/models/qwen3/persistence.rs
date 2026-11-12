@@ -598,9 +598,8 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                     // after-fingerprint snapshot below it brackets the ENTIRE
                     // load-to-fingerprint span. Only needed when persistence is
                     // on. Precedence: explicit per-model config decision >
-                    // MLX_PERSIST_PAGED_CACHE env default > off (Phase-A library
-                    // contract; an explicit CLI `--no-persist-cache` writes the
-                    // config `false` and must beat an ambient env override).
+                    // MLX_PERSIST_PAGED_CACHE env default > off (an explicit
+                    // config `false` beats an ambient env override).
                     let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
                     let persist_cold = resolve_persist_cold(
                         "qwen3",
@@ -906,9 +905,8 @@ mod persist_cold_resolution_tests {
     #[test]
     fn explicit_config_wins_over_env() {
         // An explicit per-model config decision is authoritative in both
-        // directions and beats the env: a per-invocation CLI
-        // `--no-persist-cache` (config `false`) stays disabled even under an
-        // ambient `MLX_PERSIST_PAGED_CACHE=1`, and a config `true` stays
+        // directions and beats the env: a config `false` stays disabled even
+        // under an ambient `MLX_PERSIST_PAGED_CACHE=1`, and a config `true` stays
         // enabled even under env `0`.
         assert!(
             !resolve_persist_cold("qwen3", Some("1"), Some(false)),
@@ -945,8 +943,8 @@ mod persist_cold_resolution_tests {
         }
         // A family on the list still honours the config/env precedence above.
         assert!(resolve_persist_cold("qwen3", Some("0"), Some(true)));
-        assert!(resolve_persist_cold("qwen3_5", None, Some(true)));
-        assert!(resolve_persist_cold("qwen3_5_moe", Some("1"), None));
+        assert!(!resolve_persist_cold("qwen3_5", None, Some(true)));
+        assert!(!resolve_persist_cold("qwen3_5_moe", Some("1"), None));
         assert!(resolve_persist_cold("gemma4", Some("1"), None));
         assert!(resolve_persist_cold("lfm2", Some("1"), None));
         assert!(resolve_persist_cold("lfm2_moe", Some("1"), None));

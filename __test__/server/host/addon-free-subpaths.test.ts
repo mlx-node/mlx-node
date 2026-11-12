@@ -26,12 +26,14 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
  * that only checks behaviour.
  */
 const ADDON_FREE_SUBPATHS = [
+  'host/cache-disk.ts',
   'host/decode-share.ts',
   'host/env-policy.ts',
   'host/idle-release.ts',
   'host/max-context.ts',
   'host/max-memory.ts',
   'host/paths.ts',
+  'supervision.ts',
 ];
 
 /** Modules that pull in the native addon, directly or by re-export. */

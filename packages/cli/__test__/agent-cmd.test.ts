@@ -1,63 +1,73 @@
 /**
- * `mlx agent` argv scan — the mlx-owned `--no-persist-cache` flag.
- *
- * The flag disables the SSD cold tier the agent otherwise enables by default
- * for EVERY allowlisted family. Like the other mlx-owned flags it is lifted out
- * of the argv and never forwarded to the agent binary, and it must not be
- * hijacked when it lands in a binary value-consumer's value slot.
+ * `mlx agent` argv scan — the SSD cache flags it lifts and forwards to the
+ * `mlx serve` it spawns (`--max-cache-disk`, `--persistent-cache`,
+ * `--cache-dir`, Splash `serve_options.py`). Like the other mlx-owned flags
+ * they never reach the agent binary, and a flag in a binary value-consumer's
+ * value slot stays data.
  */
 
-import { coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
 import { describe, expect, it } from 'vite-plus/test';
 
 import { agentPreambleText, scanAgentArgs } from '../src/commands/agent/index.js';
 
-describe('scanAgentArgs --no-persist-cache', () => {
-  it('defaults persistPagedCache to true when the flag is absent', () => {
+describe('scanAgentArgs SSD cache flags', () => {
+  it('leaves every cache flag unset when none is given (a temporary cache, auto quota)', () => {
     const scan = scanAgentArgs(['-c']);
-    expect(scan.persistPagedCache).toBe(true);
+    expect(scan.cacheDisk).toBeUndefined();
+    expect(scan.persistentCache).toBe(false);
+    expect(scan.cacheDir).toBeUndefined();
+    expect(scan.cacheDiskError).toBeUndefined();
     expect(scan.passthrough).toEqual(['-c']);
   });
 
-  it('is mlx-owned: flips the flag false and is not forwarded to the binary', () => {
+  // Mutation TSF1: stop lifting `--persistent-cache` (forward it to grok) → red.
+  it('lifts the three flags out of the argv in both spellings', () => {
+    const spaced = scanAgentArgs(['--max-cache-disk', '16G', '--persistent-cache', '--cache-dir', '/c', '-c']);
+    expect(spaced).toMatchObject({ cacheDisk: String(16 * 1024 ** 3), persistentCache: true, cacheDir: '/c' });
+    expect(spaced.passthrough).toEqual(['-c']);
+
+    const inline = scanAgentArgs(['--max-cache-disk=0', '-c']);
+    expect(inline.cacheDisk).toBe('0');
+    expect(inline.passthrough).toEqual(['-c']);
+
+    const home = scanAgentArgs(['--persistent-cache', '--cache-dir=~/x']);
+    expect(home.cacheDir).toBe(join(homedir(), 'x'));
+    expect(home.passthrough).toEqual([]);
+  });
+
+  it('keeps a cache flag sitting in a binary value slot', () => {
+    const scan = scanAgentArgs(['--system-prompt', '--persistent-cache']);
+    expect(scan.persistentCache).toBe(false);
+    expect(scan.passthrough).toEqual(['--system-prompt', '--persistent-cache']);
+  });
+
+  it('reports a bad value and the Splash conflicts as usage errors', () => {
+    expect(scanAgentArgs(['--max-cache-disk', 'lots']).cacheDiskError).toBe(
+      '--max-cache-disk must be auto, 0 to disable, or a size such as 16G',
+    );
+    expect(scanAgentArgs(['--max-cache-disk']).cacheDiskError).toBe('Missing value for --max-cache-disk');
+    expect(scanAgentArgs(['--cache-dir', '/c']).cacheDiskError).toBe('--cache-dir needs --persistent-cache');
+    expect(scanAgentArgs(['--persistent-cache', '--max-cache-disk', '0']).cacheDiskError).toBe(
+      '--persistent-cache needs the SSD cache --max-cache-disk 0 turns off',
+    );
+  });
+
+  it('no longer knows --no-persist-cache: it goes to the binary like any unknown flag', () => {
     const scan = scanAgentArgs(['--no-persist-cache', '-c']);
-    expect(scan.persistPagedCache).toBe(false);
-    expect(scan.passthrough).toEqual(['-c']);
-  });
-
-  it('does not hijack the flag when it sits in a binary value-consumer slot', () => {
-    const scan = scanAgentArgs(['--system-prompt', '--no-persist-cache']);
-    // "--no-persist-cache" is the system-prompt VALUE here, so it stays enabled
-    // and passes through verbatim.
-    expect(scan.persistPagedCache).toBe(true);
-    expect(scan.passthrough).toEqual(['--system-prompt', '--no-persist-cache']);
+    expect(scan.persistentCache).toBe(false);
+    expect(scan.passthrough).toEqual(['--no-persist-cache', '-c']);
   });
 });
 
-/**
- * The shipped help said the flag disabled the tier "for qwen3 dense paged
- * prefix blocks (other families unaffected)". Running it against qwen3_5_moe
- * disproved that: the flag is ONE process-wide boolean that
- * `MlxModelHost.runWithResident` hands to every load whose family is on the
- * allowlist. "Other families unaffected" was doubly wrong — non-allowlisted
- * families are unaffected because they can NEVER persist, not because the flag
- * spares them.
- */
-describe('mlx agent help — --no-persist-cache', () => {
-  it('names every family the flag actually disables, from the allowlist itself', () => {
+describe('mlx agent help — SSD cache flags', () => {
+  it('documents the three flags', () => {
     const help = agentPreambleText();
-    const families = coldTierRestoreFamilyList();
-    expect(families.length).toBeGreaterThan(1);
-    for (const family of families) {
-      expect(help, `help text must name ${family}`).toContain(family);
-    }
-  });
-
-  it('no longer promises that other cold-tier families keep persisting', () => {
-    expect(agentPreambleText()).not.toContain('other families unaffected');
-  });
-
-  it('does not single out qwen3 dense as the only affected family', () => {
-    expect(agentPreambleText()).not.toContain('qwen3\n                            dense');
+    expect(help).toContain('--max-cache-disk <size>');
+    expect(help).toContain('--persistent-cache');
+    expect(help).toContain('--cache-dir <dir>');
+    expect(help).not.toContain('--no-persist-cache');
   });
 });

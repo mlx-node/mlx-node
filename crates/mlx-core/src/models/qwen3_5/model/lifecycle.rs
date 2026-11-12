@@ -79,6 +79,10 @@ impl Qwen35Inner {
             memory_plan: None,
             memory_registration: None,
             max_memory_bytes: None,
+            disk_options: crate::disk_tier::DiskTierOptions {
+                cache_disk: crate::disk_tier::CacheDisk::Off,
+                ..Default::default()
+            },
             max_context: None,
             decode_share: crate::engine::scheduler::DEFAULT_DECODE_SHARE,
             caches: None,
@@ -98,7 +102,6 @@ impl Qwen35Inner {
             gdn_root_cache_owner_id: None,
             gdn_root_cache_owner_is_explicit: false,
             gdn_prefix_checkpoints: VecDeque::new(),
-            gdn_unclaimed_rungs: HashMap::new(),
             gdn_last_history_checkpoint: None,
             gdn_in_use: HashMap::new(),
             gdn_restored_from: None,
@@ -151,6 +154,7 @@ impl Qwen35Inner {
                 None,
                 self.max_memory_bytes,
                 self.max_context,
+                self.disk_options.cache_disk,
             )?;
             return Ok(());
         }
@@ -196,6 +200,7 @@ impl Qwen35Inner {
             }),
             self.max_memory_bytes,
             self.max_context,
+            self.disk_options.cache_disk,
         )?
         .ok_or_else(|| {
             Error::from_reason(
@@ -277,100 +282,70 @@ impl Qwen35Inner {
         Ok(())
     }
 
-    /// Build the process-global SSD cold-tier context (manager + COMPLETE
-    /// content fingerprint) for `model_path` WITHOUT attaching it, mirroring
-    /// `Qwen3Inner::build_cold_tier_context` — see its doc for how the weight
-    /// identity is established and why the caller brackets the load around it.
-    ///
-    /// The qwen3_5 difference is the [`mlx_paged_attn::ColdSidecarPolicy`]:
-    /// qwen3_5's pool covers the FULL-ATTENTION layers only, so a K/V-only
-    /// restore would resume from GDN recurrent state the pool never held. The
-    /// policy turns the restore walk into vLLM's reconcile-down — the candidate
-    /// prefix is reduced to the deepest boundary a validated GDN sidecar backs,
-    /// and a boundary nothing backs restores nothing.
-    ///
-    /// The GDN geometry (and the activation dtype the sidecar is written in)
-    /// is folded into the fingerprint explicitly:
-    /// [`crate::cold_tier::ColdTierGeometry`] describes the POOL, which here
-    /// covers only the full-attention layers, so two configs differing ONLY in
-    /// GDN geometry would otherwise share a pool geometry.
-    ///
-    /// Returns `None` (fail-open) when the paged adapter is absent, the tier
-    /// cannot be opened, this checkpoint has no GDN state to persist, or a
-    /// complete content fingerprint cannot be established.
-    ///
-    /// The `weights` witness pins this call after the loader's
-    /// `materialize_weights` pass: MLX preads shard bytes lazily, so an identity
-    /// read before that pass can describe bytes the model never runs.
-    pub(crate) fn build_cold_tier_context(
-        &self,
+    /// Opens the load's SSD tier for its DFlash2 states (Splash
+    /// `openDiskTier`) when the memory plan set its state staging aside, and
+    /// gives the adapter its state-backed cold context. A persistent tier's
+    /// identity is read only after `materialize_weights` (the `weights`
+    /// witness) and only while `guard` shows the shards unchanged.
+    pub(crate) fn build_disk_tier_context(
+        &mut self,
         files: crate::cold_tier::CheckpointFiles<'_>,
+        draft_dir: Option<&std::path::Path>,
         weights: &crate::array::memory::WeightsResident,
-    ) -> Option<crate::transformer::paged_kv_cache_adapter::ColdTierContext> {
-        let adapter = self.paged_adapter.as_ref()?;
-        let manager = crate::cold_tier::global_cold_cache()?;
-        let pool = adapter.layer_kv_pool();
-        let cache_dtype = format!("{:?}", pool.cache_dtype());
-        // No GDN layers means no out-of-pool state — but it also means this is
-        // not the hybrid qwen3_5 the sidecar work validated, so stay off rather
-        // than silently behaving like a dense family.
-        let activation =
-            crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(self).ok()?;
-        let geometry = crate::models::qwen3_5::gdn_sidecar::geometry(&self.config, activation)?;
-        let sidecar_policy = crate::models::qwen3_5::gdn_sidecar::policy(&self.config, activation)?;
-        let config_json = cold_tier_config_json(
+        guard: &crate::cold_tier::CheckpointLoadGuard<'_>,
+    ) {
+        let staged = self
+            .memory_plan
+            .as_ref()
+            .is_some_and(|plan| plan.footprint.state_staging_bytes > 0);
+        let (Some(draft_dir), Some(draft), Some(adapter), true) = (
+            draft_dir,
+            self.dflash2.as_ref(),
+            self.paged_adapter.as_ref(),
+            staged,
+        ) else {
+            return;
+        };
+        let Ok(activation) =
+            crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(&*self)
+        else {
+            return;
+        };
+        let dense = self.config.clone();
+        let Some(geometry) = crate::models::qwen3_5::gdn_sidecar::geometry(&dense, activation)
+        else {
+            return;
+        };
+        let Some(config_json) = cold_tier_config_json(
             &self.config,
             &self.config.scaling(),
             &geometry.fingerprint_component(),
-        )?;
-        let pool_geometry = crate::cold_tier::ColdTierGeometry {
-            block_size: pool.block_size() as u64,
-            num_layers: pool.num_layers() as u64,
-            num_kv_heads: pool.config().num_kv_heads as u64,
-            head_size: pool.config().head_size as u64,
-            cache_dtype,
+        ) else {
+            return;
         };
-        match crate::cold_tier::build_model_fingerprint(
-            "qwen3_5",
+        let load = crate::models::qwen3_5::dflash2_state::disk::TierLoad {
+            family: "qwen3_5",
+            config_json,
+            dense: &dense,
+            activation,
+            draft,
+            draft_dir,
+            adapter,
             files,
-            Some(&config_json),
-            &pool_geometry,
             weights,
-        ) {
-            Some(fingerprint) => Some(
-                crate::transformer::paged_kv_cache_adapter::ColdTierContext {
-                    manager,
-                    fingerprint,
-                    sidecar_policy: Some(sidecar_policy),
-                },
-            ),
-            None => {
-                tracing::warn!(
-                    "cold-tier persistence disabled for {}: could not establish a \
-                     content fingerprint (unreadable or missing weight shard)",
-                    files.label()
-                );
-                None
-            }
-        }
-    }
-
-    /// Attach a previously-built cold-tier context to the paged adapter. A
-    /// no-op (fail-open) when the paged adapter is absent. Split from
-    /// [`Self::build_cold_tier_context`] so the caller can verify shard
-    /// identity is still stable AFTER the fingerprint read and BEFORE the cold
-    /// tier is committed.
-    ///
-    /// Takes the same `materialize_weights` witness as the build step so the
-    /// COMMIT point, not just the identity read, is compiler-pinned below
-    /// materialization.
-    pub(crate) fn attach_cold_tier(
-        &mut self,
-        ctx: crate::transformer::paged_kv_cache_adapter::ColdTierContext,
-        _weights: &crate::array::memory::WeightsResident,
-    ) {
+            guard,
+        };
+        let Some((context, disk)) = crate::models::qwen3_5::dflash2_state::disk::open_state_disk(
+            &load,
+            &self.disk_options,
+            self.model_id,
+        ) else {
+            return;
+        };
         if let Some(adapter) = self.paged_adapter.as_mut() {
-            adapter.set_cold_tier(ctx);
+            adapter.set_cold_tier(context);
+            self.dflash2_states.disk = Some(disk);
+            crate::models::qwen3_5::dflash2_state::disk::adopt_all(self);
         }
     }
 
@@ -641,7 +616,6 @@ impl Qwen35Inner {
 
     pub(super) fn release_scheduled_recurrent_for(&mut self, seq_id: SeqId) {
         self.scheduled_mtp.release(seq_id);
-        self.gdn_unclaimed_rungs.remove(&Some(seq_id));
         if self.active_scheduled_seq == Some(seq_id) {
             self.active_scheduled_seq = None;
             self.caches = Some(fresh_dense_layer_caches(&self.config));
@@ -908,7 +882,6 @@ impl Qwen35Inner {
         self.cached_paged_image_token_positions.clear();
         self.cached_rope_deltas = None;
         self.gdn_prefix_checkpoints.clear();
-        self.gdn_unclaimed_rungs.clear();
         self.gdn_last_history_checkpoint = None;
         self.gdn_in_use.clear();
         self.dflash2_states.end_all_restored();
@@ -994,15 +967,8 @@ impl Qwen35Inner {
     /// Fallible terminal lifecycle for the hand-written paged cores.
     ///
     /// Unlike [`PagedBackend::finalize_paged_turn`], these cores can propagate
-    /// an error directly. Never publish token history or a GDN sidecar after a
-    /// failed registration: release the request and make the session cold.
-    ///
-    /// On success the GDN sidecar capture runs here, mirroring the engine hook —
-    /// these cores own every planned-MTP turn, and without this an MTP session
-    /// persists K/V blocks whose recurrent half no restore can ever reconstruct.
-    /// Unlike the engine hook there is no release to order against: these cores
-    /// only ever keep the request live, so the adapter's cold-chain frontier is
-    /// still set when the capture reads it.
+    /// an error directly. Never publish token history after a failed
+    /// registration: release the request and make the session cold.
     ///
     /// `expected_history_len` is the drop-last history length the caller is
     /// about to publish; the frontier check runs here because these cores set
@@ -1027,17 +993,7 @@ impl Qwen35Inner {
                 adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, cache_salt)
             });
         match finalize_result {
-            Ok(_) => {
-                // A frontier disagreement must not enqueue new durable GDN
-                // state this turn; the prefill-time checkpoints the capture
-                // reads are clean, but the persist surface is refused as a
-                // class while the latch is armed.
-                if !self.paged_gdn_state_dirty {
-                    self.capture_dense_gdn_cold_sidecar(image_token_positions, cache_salt);
-                }
-                self.gdn_unclaimed_rungs.remove(&self.active_scheduled_seq);
-                Ok(())
-            }
+            Ok(_) => Ok(()),
             Err(error) => {
                 self.invalidate_dense_paged_session("manual finalization failure");
                 Err(Error::from_reason(format!(

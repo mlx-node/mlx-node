@@ -620,7 +620,6 @@ jobs:
               --test qwen3_5_session
               --test qwen3_5_delta_chat
               --test p2_paged_thinking_honors_enable
-              --test qwen3_5_cold_tier_parity
             # Name filter for a SECOND `cargo test --lib` invocation. `--lib`
             # cannot be folded into `tests:` above: `-- --ignored` would then run
             # all ~55 of mlx-core's ignored unit tests, and the privacy-filter
@@ -642,7 +641,6 @@ jobs:
             # docs/paged-cache.md) there cannot be one: the smallest published
             # qwen3_5_moe is 35B-A3B.
             lib_tests: >-
-              models::qwen3_5::model::paged_construction_tests::dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy
               models::qwen3_5_moe::model::paged_construction_tests::moe_hybrid_n2_batched_decode_matches_scalar_replay
           - name: lfm2
             model: LiquidAI/LFM2.5-1.2B-Thinking

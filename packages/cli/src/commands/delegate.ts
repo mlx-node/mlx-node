@@ -33,6 +33,8 @@ const DELEGATE_VALUE_FLAGS = new Set([
   '--max-memory',
   '--max-context',
   '--idle-release',
+  '--max-cache-disk',
+  '--cache-dir',
   '--repo',
   '--pr',
 ]);

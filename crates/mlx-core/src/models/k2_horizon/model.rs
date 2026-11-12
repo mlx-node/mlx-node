@@ -400,7 +400,7 @@ impl K2Inner {
                     // Pure standard-KV: the pool already holds every piece of
                     // per-token state the forward carries between turns — no
                     // sidecar to reconcile (the qwen3 `None` control).
-                    sidecar_policy: None,
+                    backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::KvOnly,
                 },
             ),
             None => {

@@ -21,6 +21,7 @@ pub mod convert;
 pub mod convert_gemma_import;
 pub mod dataset;
 pub mod decode_profiler;
+pub(crate) mod disk_tier;
 pub mod engine;
 pub mod grpo;
 pub(crate) mod inference_trace;

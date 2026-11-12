@@ -17,7 +17,7 @@ over its `app://` scheme, and hands the page one end of a `MessageChannel`; the 
 calls `connectDashboardApi(port)` and every API call rides it.
 
 See [`docs/dashboard.md`](../../docs/dashboard.md) for pages, data sources,
-`persistPagedCache`, and the `MLX_AGENT_METRICS` / `MLX_COLD_CACHE_DIR` env vars.
+`persist_paged_cache`, and the `MLX_AGENT_METRICS` / `MLX_COLD_CACHE_DIR` env vars.
 
 ## Design
 

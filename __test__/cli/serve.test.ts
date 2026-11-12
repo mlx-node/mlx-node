@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import type { LoadableModel } from '@mlx-node/lm';
 import type { InferenceHost } from '@mlx-node/server/host';
+import { SERVER_CLOSE_MS } from '@mlx-node/server/supervision';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { parseServeArgs, run } from '../../packages/cli/src/commands/serve.js';
@@ -77,6 +78,8 @@ describe('parseServeArgs', () => {
       model: undefined,
       authToken: undefined,
       logDir: undefined,
+      cacheDisk: 'auto',
+      persistentCache: false,
     });
   });
 
@@ -194,6 +197,7 @@ describe('mlx serve — end to end', () => {
 
     let healthUrl = '';
     let observedUrl = '';
+    let closeSpy: { mock: { calls: unknown[][] } } | undefined;
 
     await run(['--port', '0', '--models-dir', modelsDir], {
       hostOverrides: {
@@ -220,6 +224,8 @@ describe('mlx serve — end to end', () => {
         // The launcher engine policy is applied by `serve`, not by the engine.
         expect(process.env[CHUNK_ENV]).toBe('2048');
 
+        closeSpy = vi.spyOn(host, 'close');
+
         // Invoke the handler `run` actually registered rather than emitting a
         // real signal — emitting would also fire the test runner's own
         // handlers and tear the run down.
@@ -235,6 +241,8 @@ describe('mlx serve — end to end', () => {
 
     expect(observedUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
     expect(exitCodes).toEqual([0]);
+    // Splash `supervision`: the server close leaves the flush its share of STOP_MS.
+    expect(closeSpy?.mock.calls).toEqual([[{ timeoutMs: SERVER_CLOSE_MS }]]);
     await expect(fetch(healthUrl)).rejects.toThrow();
 
     // Handlers detached on shutdown: a leaked one would keep a closed host
@@ -307,7 +315,7 @@ describe('mlx serve — end to end', () => {
         for (let i = 0; i < 200 && loads.length === 0; i++) {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
-        expect(loads).toEqual([{ maxMemoryBytes: 30_064_771_072 }]);
+        expect(loads).toEqual([{ maxMemoryBytes: 30_064_771_072, cacheDisk: 'auto', persistentCache: false }]);
         const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
         added[0]!('SIGINT');
         for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
@@ -379,7 +387,7 @@ describe('mlx serve — end to end', () => {
         for (let i = 0; i < 200 && loads.length === 0; i++) {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
-        expect(loads).toEqual([{ maxContextTokens: 102_400 }]);
+        expect(loads).toEqual([{ maxContextTokens: 102_400, cacheDisk: 'auto', persistentCache: false }]);
         const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
         added[0]!('SIGINT');
         for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
@@ -414,7 +422,7 @@ describe('mlx serve — end to end', () => {
         for (let i = 0; i < 200 && loads.length === 0; i++) {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
-        expect(loads).toEqual([{ decodeShare: 0 }]);
+        expect(loads).toEqual([{ decodeShare: 0, cacheDisk: 'auto', persistentCache: false }]);
         const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
         added[0]!('SIGINT');
         for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
@@ -448,7 +456,7 @@ describe('mlx serve — end to end', () => {
         for (let i = 0; i < 200 && loads.length === 0; i++) {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
-        expect(loads).toEqual([{ kvFormat: 'bf16' }]);
+        expect(loads).toEqual([{ kvFormat: 'bf16', cacheDisk: 'auto', persistentCache: false }]);
         const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
         added[0]!('SIGINT');
         for (let i = 0; i < 200 && exitCodes.length === 0; i++) {

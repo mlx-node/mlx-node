@@ -194,7 +194,7 @@ impl Qwen35Inner {
         );
         let rung_len = rung.map_or(0, |index| self.gdn_prefix_checkpoints[index].prefix_len);
         if let Some((id, depth, caches)) = crate::models::qwen3_5::dflash2_turn::stored_gdn_prefix(
-            &*self,
+            self,
             tokens,
             extra_keys_per_block,
             cache_salt,
@@ -219,103 +219,6 @@ impl Qwen35Inner {
         });
         self.gdn_prefix_checkpoints.push_back(checkpoint);
         Some((prefix_len, caches))
-    }
-
-    /// Install GDN recurrent state the SSD cold tier restored alongside this
-    /// turn's paged K/V prefix.
-    ///
-    /// This is the cold-tier twin of the in-memory checkpoint lookups above:
-    /// same destination (`self.caches`), different source (an on-disk
-    /// [`mlx_paged_attn::ColdSidecar`] instead of a live materialized
-    /// checkpoint). Consulted ONLY after every in-memory source missed, because
-    /// those are already materialized and cost no decode.
-    ///
-    /// `ColdTierWalk::restore_extend` guarantees the sidecar backs EXACTLY the
-    /// prefix the adapter reported. The shared cold-tier preparation re-checks
-    /// group, boundary, and loaded-config geometry before this family decodes
-    /// it. A contract slip degrades to a MISS (`Ok(false)`) that falls through
-    /// to the caller's replay, never state installed at the wrong offset.
-    ///
-    /// Taking the sidecar is unconditional so a rejected one cannot be
-    /// reconsidered later in the same turn. On success the decoded state is also
-    /// fed into the in-memory prefix store so later same-process turns hit RAM.
-    fn install_dense_gdn_cold_sidecar(
-        &mut self,
-        tokens: &[u32],
-        cached_prefix_len: u32,
-        block_size: u32,
-        extra_keys_per_block: &[Vec<u64>],
-        cache_salt: u64,
-    ) -> Result<bool> {
-        let (restored, activation_dtype) = {
-            let Some(adapter) = self.paged_adapter.as_mut() else {
-                return Ok(false);
-            };
-            (
-                adapter.take_restored_sidecar(),
-                adapter
-                    .cold_tier()
-                    .and_then(|cold| cold.sidecar_policy.as_ref())
-                    .and_then(|policy| {
-                        crate::models::qwen3_5::gdn_sidecar::dtype_from_label(
-                            &policy.layout().dtype,
-                        )
-                    }),
-            )
-        };
-        let Some(geometry) = activation_dtype.and_then(|activation| {
-            crate::models::qwen3_5::gdn_sidecar::geometry(&self.config, activation)
-        }) else {
-            return Ok(false);
-        };
-        let expected_layout =
-            crate::models::qwen3_5::gdn_sidecar::layout_at(&geometry, cached_prefix_len);
-        let installed_boundary = crate::cold_tier::try_install_cold_sidecar(
-            restored,
-            &expected_layout,
-            |tensors, boundary| {
-                let Some(caches) = crate::models::qwen3_5::gdn_sidecar::decode_caches(
-                    &self.config,
-                    &geometry,
-                    tensors,
-                    boundary,
-                )?
-                else {
-                    return Ok(None);
-                };
-                self.caches = Some(caches);
-                Ok(Some(boundary))
-            },
-        )?;
-        let Some(boundary) = installed_boundary else {
-            return Ok(false);
-        };
-        // The one observable that separates "the tier restored the recurrent
-        // half" from "the tier read it and every arm above declined". Both
-        // produce identical text, identical `num_tokens` and identical
-        // `cached_tokens`; only the second re-forwards the whole prefix.
-        // Feed the in-memory store so later turns in this process hit RAM
-        // instead of decoding the sidecar again. Best-effort: a failure to
-        // clone/store never invalidates the freshly installed live caches.
-        if let Some(snapshot) = self
-            .caches
-            .as_ref()
-            .and_then(|caches| clone_dense_linear_layer_caches(&self.config, caches))
-        {
-            let checkpoint =
-                crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint {
-                    prefix_len: boundary,
-                    caches: snapshot,
-                };
-            self.remember_dense_gdn_materialized_prefix_checkpoint(
-                tokens,
-                block_size,
-                extra_keys_per_block,
-                cache_salt,
-                checkpoint,
-            );
-        }
-        Ok(true)
     }
 
     fn remember_dense_gdn_materialized_prefix_checkpoint(
@@ -346,74 +249,47 @@ impl Qwen35Inner {
             return false;
         };
         let bytes = Qwen3_5LayerCache::linear_state_bytes(&checkpoint.caches);
-        let claimed = crate::models::qwen3_5::dflash2_turn::publish_claimed(
+        if crate::models::qwen3_5::dflash2_turn::publish_claimed(
             self,
             bytes,
             Keep::default(),
             |_| (),
         )
-        .is_some();
-        if !claimed && !self.wants_gdn_checkpoint_ladder() {
+        .is_none()
+        {
             return false;
         }
-        let owner_id = self.active_cache_owner_id.clone();
-        let same_rung = |existing: &DenseGdnPrefixCheckpoint| {
-            existing.owner_id == owner_id
+
+        self.gdn_prefix_checkpoints.retain(|existing| {
+            !(existing.owner_id == self.active_cache_owner_id
                 && existing.prefix_len == prefix_len
                 && existing.block_size == block_size
                 && existing.final_block_hash == final_block_hash
-                && existing.tokens.as_slice() == prefix_tokens
-        };
-        let rung = DenseGdnPrefixCheckpoint {
-            owner_id: owner_id.clone(),
-            prefix_len,
-            block_size,
-            final_block_hash,
-            block_hashes,
-            tokens: prefix_tokens.to_vec(),
-            caches: checkpoint.caches,
-            last_used: self.cache_recency.next(),
-        };
-        if !claimed {
-            let reach_tokens = self.paged_adapter.as_ref().and_then(|adapter| {
-                adapter.cold_capture_reach_tokens(tokens, extra_keys_per_block, cache_salt)
-            });
-            crate::models::qwen3_5::gdn_checkpoint_store::hold_refused_rung(
-                self.gdn_unclaimed_rungs
-                    .entry(self.active_scheduled_seq)
-                    .or_default(),
-                rung,
-                reach_tokens,
-            );
-            return false;
-        }
+                && existing.tokens.as_slice() == prefix_tokens)
+        });
         self.gdn_prefix_checkpoints
-            .retain(|existing| !same_rung(existing));
-        self.gdn_prefix_checkpoints.push_back(rung);
+            .push_back(DenseGdnPrefixCheckpoint {
+                owner_id: self.active_cache_owner_id.clone(),
+                prefix_len,
+                block_size,
+                final_block_hash,
+                block_hashes,
+                tokens: prefix_tokens.to_vec(),
+                caches: checkpoint.caches,
+                last_used: self.cache_recency.next(),
+            });
         self.prune_dense_gdn_prefix_checkpoints();
         true
     }
 
     pub(super) fn prune_dense_gdn_prefix_checkpoints(&mut self) {
-        // Probe the ladder predicate BEFORE the `&mut self` borrows below:
-        // `get_or_insert_with` takes one and `wants_gdn_checkpoint_ladder`
-        // needs `&self`, so an inline call in the argument list does not
-        // borrow-check.
-        let caps = gdn_retention_caps(
-            self.wants_gdn_checkpoint_ladder(),
-            self.gdn_root_cache_owner_is_explicit,
-        );
+        let caps = gdn_retention_caps(self.gdn_root_cache_owner_is_explicit);
         let active_owner_id = self.active_cache_owner_id.clone();
         let root_owner_id = self
             .gdn_root_cache_owner_id
             .get_or_insert_with(|| active_owner_id.clone())
             .clone();
-        prune_gdn_checkpoints(
-            &mut self.gdn_prefix_checkpoints,
-            caps,
-            &root_owner_id,
-            &active_owner_id,
-        );
+        prune_gdn_checkpoints(&mut self.gdn_prefix_checkpoints, caps, &root_owner_id);
         self.sync_gdn_state_marks();
     }
 
@@ -490,10 +366,8 @@ impl Qwen35Inner {
     /// Paged-prefill chunk size for EVERY paged prefill this model runs — the
     /// engine's `paged_prefill` and the hand-written sync/stream cores alike.
     ///
-    /// Always positive: the GDN cold sidecar can only persist recurrent state
-    /// at a `gdn_prefill_checkpoint_boundaries` rung the prefill materialized,
-    /// and `paged_prefill_ranges` adds those rungs on top of the chunk cuts.
-    /// The chunk length is the GEMM's M, so a different chunk size can change
+    /// Always positive: `paged_prefill_ranges` adds the GDN checkpoint
+    /// boundary on top of the chunk cuts. The chunk length is the GEMM's M, so a different chunk size can change
     /// the sampled tokens of an otherwise identical request.
     ///
     /// A caller must read this BEFORE it takes the `&mut self` borrows the
@@ -503,23 +377,12 @@ impl Qwen35Inner {
         crate::models::forward::paged_prefill_chunk_rows() as i32
     }
 
-    /// Whether this turn's prefill should publish the whole checkpoint ladder.
-    ///
-    /// Thin wrapper over [`crate::models::qwen3_5::paged_forward::gdn_cold_sidecar_ladder_wanted`]
-    /// so the model layer and the prefill body probe the SAME predicate.
-    pub(super) fn wants_gdn_checkpoint_ladder(&self) -> bool {
-        self.paged_adapter
-            .as_ref()
-            .is_some_and(crate::models::qwen3_5::paged_forward::gdn_cold_sidecar_ladder_wanted)
-    }
-
     /// Prefill for the hand-written paged cores (sync + stream, text).
     ///
     /// The engine's `PagedBackend::paged_prefill` serves only AR turns; a
     /// planned-MTP turn returns from `paged_whole_turn` before the engine runs
     /// and prefills here instead. Both cores share this one body so the chunk
-    /// size — and with it the whole checkpoint ladder a cold sidecar is anchored
-    /// on — cannot be right in one core and wrong in the other.
+    /// size cannot be right in one core and wrong in the other.
     ///
     /// `keep_prompt_hidden_tokens` is `Some` exactly when the caller wants the
     /// per-token prompt hidden for the MTP prompt-prefix seed; the returned
@@ -600,46 +463,6 @@ impl Qwen35Inner {
                 )?;
             Ok((logits, None, checkpoints))
         }
-    }
-
-    /// Cold-tier GDN sidecar capture
-    /// ([`crate::models::qwen3_5::gdn_sidecar::capture_gdn_cold_sidecar`]).
-    pub(super) fn capture_dense_gdn_cold_sidecar(
-        &self,
-        image_token_positions: &[(u32, u64)],
-        cache_salt: u64,
-    ) {
-        let checkpoints: VecDeque<&DenseGdnPrefixCheckpoint> = self
-            .gdn_prefix_checkpoints
-            .iter()
-            .chain(
-                self.gdn_unclaimed_rungs
-                    .get(&self.active_scheduled_seq)
-                    .into_iter()
-                    .flatten(),
-            )
-            .collect();
-        crate::models::qwen3_5::gdn_sidecar::capture_gdn_cold_sidecar(
-            "qwen3_5",
-            self.paged_adapter.as_ref(),
-            &checkpoints,
-            &self.active_cache_owner_id,
-            &self.config,
-            image_token_positions,
-            cache_salt,
-            |checkpoint| dense_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)),
-            |checkpoint| &checkpoint.caches,
-            |boundary, error| match error {
-                None => tracing::debug!(
-                    target: "mlx_core::qwen3_5::paged",
-                    "qwen3.5 GDN sidecar dropped at boundary {boundary}: cold-cache writer queue full"
-                ),
-                Some(error) => tracing::debug!(
-                    target: "mlx_core::qwen3_5::paged",
-                    "qwen3.5 GDN sidecar enqueue failed at boundary {boundary}: {error}"
-                ),
-            },
-        );
     }
 
     pub(super) fn prepare_dense_gdn_prefix_state(
@@ -827,24 +650,6 @@ impl Qwen35Inner {
                 restored_prefix_len,
                 replayed_prefix_len,
             ));
-        }
-
-        // Cold-tier GDN sidecar: on-SSD recurrent state the restore walk brought
-        // back for EXACTLY this cached prefix (reconcile-down guarantees the
-        // boundary). Consulted only after every in-memory source above missed —
-        // i.e. the common process-restart case. Text-only: an image-aware
-        // prefix still goes through the exactness gates below.
-        if cached_prefix_len > 0
-            && !image_aware_prefix
-            && self.install_dense_gdn_cold_sidecar(
-                tokens,
-                cached_prefix_len,
-                block_size,
-                extra_keys_per_block,
-                cache_salt,
-            )?
-        {
-            return Ok(finish("cold_sidecar", cached_prefix_len, 0));
         }
 
         let fresh_caches = fresh_dense_layer_caches(&self.config);
@@ -1130,7 +935,11 @@ impl Qwen35Inner {
                 }
             }
             UnitKey::Store(_) => self.dflash2_states.end_restored(seq_id),
-            UnitKey::Owner(_) | UnitKey::Extent | UnitKey::DeadLeaves | UnitKey::Vision(_) => {}
+            UnitKey::Owner(_)
+            | UnitKey::Extent
+            | UnitKey::DeadLeaves
+            | UnitKey::Vision(_)
+            | UnitKey::StoreChain(_) => {}
         }
     }
 
@@ -1213,7 +1022,8 @@ impl Qwen35Inner {
             | UnitKey::Owner(_)
             | UnitKey::Extent
             | UnitKey::DeadLeaves
-            | UnitKey::Vision(_) => false,
+            | UnitKey::Vision(_)
+            | UnitKey::StoreChain(_) => false,
         };
         if dropped {
             self.sync_gdn_state_marks();

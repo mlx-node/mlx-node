@@ -89,6 +89,12 @@ pub(crate) trait PrefillTapSink {
             "this prefill keeps no lane window at row {row}"
         )))
     }
+    /// Writes the lane's context window, which ends at `row`, into `out`
+    /// and returns the first row it holds; `None` when the lane holds none
+    /// there.
+    fn write_lane_window(&mut self, _row: usize, _out: &mut [u8]) -> Result<Option<u32>> {
+        Ok(None)
+    }
 }
 
 /// The chunk breaks of a prefill: its checkpoint boundaries plus the sink's
@@ -140,24 +146,23 @@ pub(crate) enum Reached<'a> {
     /// A point whose state the lane still holds: the live GDN cell and the
     /// sink's lane window end at it until the next chunk runs.
     FromLane(&'a mut (dyn PrefillTapSink + 'a)),
-    /// A point with no state: the use and dedup steps still run.
-    Refused,
+    /// A point with no state: the use and dedup steps still run, and the
+    /// lane, which ends at it, may write it to the SSD tier.
+    Refused(&'a mut (dyn PrefillTapSink + 'a)),
 }
 
-/// The GDN ladder rungs a prefill breaks at. A tapped (DFlash2) prefill
-/// takes none unless the cold GDN sidecar reads them: its states are the
-/// turn's own points, one owner per block.
+/// The GDN checkpoint a prefill breaks at. A tapped (DFlash2) prefill takes
+/// none: its states are the turn's own points, one owner per block.
 pub(crate) fn prefill_ladder(
     adapter: &PagedKVCacheAdapter,
     full_len: usize,
     cached_prefix_len: u32,
     tapped: bool,
 ) -> Vec<u32> {
-    let wanted = gdn_cold_sidecar_ladder_wanted(adapter);
-    if tapped && !wanted {
+    if tapped {
         return Vec::new();
     }
-    prefill_checkpoint_boundaries(full_len, cached_prefix_len, adapter.block_size(), wanted)
+    prefill_checkpoint_boundaries(full_len, cached_prefix_len, adapter.block_size())
 }
 
 pub(crate) fn capture_rows_of(taps: Option<&dyn PrefillTapSink>) -> Vec<u32> {
@@ -233,13 +238,14 @@ pub(crate) fn reach_chunk<L>(
     };
     let outcome = match grant {
         None => Reached::NoPoint,
-        Some(CaptureGrant::Reserved(reservation, recycled)) => sink
-            .take_captured(row as usize)
-            .map_or(Reached::Refused, |anchor| {
-                Reached::Captured(anchor, reservation, recycled)
-            }),
+        Some(CaptureGrant::Reserved(reservation, recycled)) => {
+            match sink.take_captured(row as usize) {
+                Some(anchor) => Reached::Captured(anchor, reservation, recycled),
+                None => Reached::Refused(sink),
+            }
+        }
         Some(CaptureGrant::FromLane) => Reached::FromLane(sink),
-        Some(CaptureGrant::Refused) => Reached::Refused,
+        Some(CaptureGrant::Refused) => Reached::Refused(sink),
     };
     target.reached(row, outcome)
 }
@@ -467,7 +473,7 @@ pub(crate) fn snapshot_materialized_linear_layer_caches(
 ///
 /// Production prefix lookup is capped at `prompt.len() - 1` so at least one
 /// suffix token remains for prefill. Mirroring that cap here keeps the GDN
-/// sidecar on a boundary the next turn can actually restore. This differs from
+/// checkpoint on a boundary the next turn can actually restore. This differs from
 /// the final complete block only when the prompt itself is block-aligned; in
 /// that case it deliberately backs off one block instead of publishing an
 /// unreachable checkpoint.
@@ -485,134 +491,16 @@ pub(crate) fn gdn_checkpoint_target(
     (target > cached_prefix_len).then_some(target)
 }
 
-/// Spacing between checkpoint boundaries. Each rung is a quarter of the one
-/// above it, so whatever prefix the persisted K/V chain has reached, the
-/// deepest usable rung is within a factor of four of it.
-const GDN_CHECKPOINT_LADDER_RATIO: u32 = 4;
-
-/// Boundaries one prefill snapshots at.
-///
-/// A GDN checkpoint is a full recurrent state, and a prefill snapshots every
-/// boundary it crosses before publishing any of them, so a whole ladder is
-/// resident at once ON TOP OF everything `GDN_PREFIX_CHECKPOINT_LIMIT` already
-/// retains. Both halves of that are measured, not estimated:
-///
-/// - One checkpoint on the dense 27B (48 GDN layers; `[1,3,10240]` bf16 conv
-///   plus `[1,48,128,128]` f32 recurrent per layer) is 153,944,064 B of
-///   tensor, ~146.8 MiB — see
-///   `gdn_sidecar::tests::one_gdn_checkpoint_of_the_27b_costs_a_known_number_of_bytes`
-///   and the `#[ignore]`d allocator measurement beside it.
-/// - The peak is the store bound PLUS the whole undrained ladder, 5 + 4 = 9
-///   checkpoints — see
-///   `gdn_checkpoint_store::tests::publishing_a_ladder_peaks_at_the_store_bound_plus_the_whole_ladder`.
-///
-/// So the worst case is ~1.3 GiB, against ~880 MiB for the single-rung
-/// behaviour this replaces: four rungs cost ~590 MiB of transient headroom and
-/// span a 64x range of prefix lengths. Publishing each rung as it is produced instead of
-/// accumulating the ladder would cap the peak at 6 checkpoints, but the forward
-/// pass holds the caches borrowed and cannot reach the store.
-///
-/// This does not rescue turn 1 of a long prompt. The persisted chain reaches
-/// only a handful of blocks after one turn (~128 tokens at block_size 16),
-/// while a 32K prompt's shallowest rung is 32768 / 64 = 512 tokens — still
-/// above it, so turn 1 writes no sidecar. What the ladder changes is turn 2
-/// onward: a single endpoint rung needs the chain to reach the prompt's own
-/// end, which takes tens of turns, whereas the ladder needs it to reach only
-/// a quarter of the deepest rung.
-pub(crate) const GDN_CHECKPOINT_LADDER_RUNGS: u32 = 4;
-
-/// Prefix boundaries this prefill materializes a GDN checkpoint at, ascending.
-///
-/// The deepest rung is [`gdn_checkpoint_target`] — the boundary a warm turn
-/// restores from, unchanged. The shallower rungs exist because the SSD cold
-/// tier's block chain advances only a few blocks per turn (its writer queue is
-/// bounded and the capture walk stops at the first block it refuses), so for
-/// many turns the chain reaches nowhere near the prompt's own end. A sidecar
-/// may only be anchored where the chain already reaches; without a rung down
-/// there, nothing is written and the next process reuses zero blocks.
-///
-/// Every entry is a real block-aligned boundary the forward pass stops at, so
-/// each becomes a genuine recurrent snapshot taken at exactly that prefix
-/// length — never truncated or interpolated from a deeper one, which a running
-/// summary of all preceding tokens does not admit.
-pub(crate) fn gdn_prefill_checkpoint_boundaries(
-    full_tokens_len: usize,
-    cached_prefix_len: u32,
-    block_size: u32,
-) -> Vec<u32> {
-    let Some(deepest) = gdn_checkpoint_target(full_tokens_len, cached_prefix_len, block_size)
-    else {
-        return Vec::new();
-    };
-    let mut boundaries = Vec::with_capacity(GDN_CHECKPOINT_LADDER_RUNGS as usize);
-    let mut rung = deepest;
-    for _ in 0..GDN_CHECKPOINT_LADDER_RUNGS {
-        boundaries.push(rung);
-        // Block-align downwards so the rung is a boundary the paged allocator
-        // can chain-hash, and stop once the ladder would repeat or run out.
-        let next = rung / GDN_CHECKPOINT_LADDER_RATIO / block_size * block_size;
-        if next == 0 || next <= cached_prefix_len || next >= rung {
-            break;
-        }
-        rung = next;
-    }
-    boundaries.reverse();
-    boundaries
-}
-
-/// Whether this adapter's cold tier will actually consume a checkpoint ladder.
-///
-/// The ladder's shallow rungs exist for ONE consumer: a GDN sidecar anchored
-/// where the SSD block chain already reaches. With no such policy installed
-/// nothing can ever read them, so paying for them is pure cost — extra forced
-/// chunk breaks (each one a different GEMM `M`, so a different kernel class and
-/// accumulation order), extra `synchronize_and_clear_cache` barriers, and extra
-/// full GDN snapshots held resident.
-///
-/// This is the single source of truth for "persistence is on for the recurrent
-/// half": both `cold_gdn_prefill_chunk_size` (dense and MoE) and the boundary
-/// selection below read it, so the chunk size and the break set cannot disagree
-/// about whether this turn is a persist turn.
-pub(crate) fn gdn_cold_sidecar_ladder_wanted(adapter: &PagedKVCacheAdapter) -> bool {
-    adapter
-        .cold_tier()
-        .and_then(|cold| cold.sidecar_policy.as_ref())
-        .is_some_and(|policy| policy.group() == mlx_paged_attn::ColdGroup::GdnState)
-}
-
-/// Boundaries a prefill forces a chunk break at, ascending.
-///
-/// `want_ladder` is [`gdn_cold_sidecar_ladder_wanted`] for the turn's adapter:
-///
-/// ```text
-///   want_ladder = true   -> gdn_prefill_checkpoint_boundaries   (up to 4 rungs)
-///   want_ladder = false  -> gdn_checkpoint_target               (0 or 1 rung)
-/// ```
-///
-/// The `false` arm is not an optimization, it is a compatibility contract. A
-/// prefill split at N points is algebraically transparent but NOT numerically
-/// bit-identical, so a turn with no cold tier must take exactly the break set it
-/// took before the ladder existed — a single deep boundary — or the sampled
-/// tokens of a persistence-off request can change. That matters because
-/// `MLX_PAGED_PREFILL_CHUNK_SIZE` is not exotic: `packages/agent/src/run-agent.ts`
-/// and `packages/cli/src/commands/launch-claude/index.ts` both default it to
-/// 2048 unconditionally, so `mlx agent --no-persist-cache` reaches a positive
-/// chunk size with no policy installed. Keeping the deep boundary on that arm
-/// also preserves the warm in-process continuation, which
-/// `find_dense_gdn_prefix_checkpoint` serves from exactly that rung.
+/// Boundaries a prefill forces a chunk break at, ascending: the one deep
+/// [`gdn_checkpoint_target`] a warm turn restores from, or none.
 pub(crate) fn prefill_checkpoint_boundaries(
     full_tokens_len: usize,
     cached_prefix_len: u32,
     block_size: u32,
-    want_ladder: bool,
 ) -> Vec<u32> {
-    if want_ladder {
-        gdn_prefill_checkpoint_boundaries(full_tokens_len, cached_prefix_len, block_size)
-    } else {
-        gdn_checkpoint_target(full_tokens_len, cached_prefix_len, block_size)
-            .into_iter()
-            .collect()
-    }
+    gdn_checkpoint_target(full_tokens_len, cached_prefix_len, block_size)
+        .into_iter()
+        .collect()
 }
 
 /// Rebase absolute checkpoint boundaries onto the uncached suffix the prefill
@@ -1425,7 +1313,6 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
         full_tokens.len(),
         cached_prefix_len,
         paged_adapter.block_size(),
-        gdn_cold_sidecar_ladder_wanted(paged_adapter),
     );
 
     if checkpoint_boundaries.is_empty() && suffix_tokens.len() <= chunk_size as usize {
@@ -2303,121 +2190,7 @@ fn paged_verify_core(
 
 #[cfg(test)]
 mod gdn_checkpoint_tests {
-    use super::{
-        gdn_checkpoint_target, gdn_prefill_checkpoint_boundaries, media_prefill_ranges,
-        paged_prefill_ranges, prefill_checkpoint_boundaries,
-    };
-
-    /// A turn with no GDN cold policy must take the break set it took before the
-    /// ladder existed: the single deep `gdn_checkpoint_target`, never the rungs.
-    ///
-    /// This is a numerical-output contract, not a tidiness one. Chunk length is
-    /// the prefill GEMM's `M`, so a different break set selects a different
-    /// kernel class and accumulation order and can flip an argmax. And a
-    /// persist-off turn DOES reach a positive chunk size without anyone typing
-    /// an env var: `packages/agent/src/run-agent.ts` and
-    /// `packages/cli/src/commands/launch-claude/index.ts` both default
-    /// `MLX_PAGED_PREFILL_CHUNK_SIZE` to 2048 unconditionally, before any
-    /// persistence decision, and `mlx agent --no-persist-cache` forces paged on
-    /// with no flat fallback.
-    ///
-    /// Catches, verified by mutation: calling `gdn_prefill_checkpoint_boundaries`
-    /// unconditionally at the three prefill bodies, i.e. dropping the
-    /// `want_ladder` arm. The `false` rows then return four rungs and the range
-    /// row becomes `[0..16, 16..80, 80..336, 336..1392, 1392..1400]`.
-    ///
-    /// 1400 is load-bearing. At the 64-token prompt the model-layer ladder gates
-    /// use, the ladder is already a single rung, so that length cannot tell the
-    /// two arms apart.
-    #[test]
-    fn no_cold_policy_keeps_the_single_deep_boundary_the_ladder_replaced() {
-        assert_eq!(
-            prefill_checkpoint_boundaries(1400, 0, 16, false),
-            vec![1392],
-            "with no GDN cold policy the break set is the pre-ladder single boundary"
-        );
-        assert_eq!(
-            prefill_checkpoint_boundaries(1400, 0, 16, true),
-            vec![16, 80, 336, 1392],
-            "with a GDN cold policy every rung is a real break the sidecar can anchor on"
-        );
-        assert_eq!(
-            paged_prefill_ranges(1400, 2048, &[1392]),
-            vec![0..1392, 1392..1400],
-            "two chunks, M = 1392 then 8 — what a persist-off turn forwarded before the ladder"
-        );
-
-        // The two arms agree exactly where the ladder degenerates, so a fixture
-        // that only ever exercises a short prompt proves nothing about either.
-        for (len, cached) in [(200usize, 0u32), (64, 0), (4096, 1008)] {
-            assert_eq!(
-                prefill_checkpoint_boundaries(len, cached, 16, false),
-                gdn_checkpoint_target(len, cached, 16)
-                    .into_iter()
-                    .collect::<Vec<_>>(),
-                "the false arm IS gdn_checkpoint_target at {len}/{cached}"
-            );
-        }
-        assert_eq!(
-            prefill_checkpoint_boundaries(4096, 1008, 16, true),
-            prefill_checkpoint_boundaries(4096, 1008, 16, false),
-            "a deep cached prefix collapses the ladder to one rung, so both arms agree"
-        );
-
-        // And where they differ, they differ in the direction that matters: the
-        // ladder is a strict superset ending at the same deepest rung.
-        let ladder = prefill_checkpoint_boundaries(1400, 0, 16, true);
-        let plain = prefill_checkpoint_boundaries(1400, 0, 16, false);
-        assert_eq!(ladder.last(), plain.last());
-        assert!(ladder.len() > plain.len());
-    }
-
-    /// Pin the ladder's exact rung VALUES, not just its shape.
-    ///
-    /// Everything else that touches the ladder checks a property: `len() == 4`,
-    /// `rung * 4 > chain_reach`, "some rung is under the reach". Every one of
-    /// those survives `GDN_CHECKPOINT_LADDER_RATIO 4 -> 2`, because 4 = 2^2
-    /// makes the halved ladder a SUPERSET of the quartered one at the deep end
-    /// (4080 and 1008 appear in both), and a halved ladder still has four
-    /// rungs. So did the multi-minute cold-tier parity gate, which only asks
-    /// that the restore anchor on *a* rung: with a chain reaching ~24 blocks
-    /// both spacings put the deepest usable rung in the same place.
-    ///
-    /// Exact values are the cheapest thing that does not survive it. Held
-    /// against the same literals in
-    /// `cold_tier_parity_harness::harness_tests`, whose restated copy of this
-    /// recurrence is otherwise free to drift away from this one silently.
-    ///
-    /// | mutation   | ladder at 4096 tokens, block 16 |
-    /// |------------|---------------------------------|
-    /// | ratio 4 ✓  | `[48, 240, 1008, 4080]`         |
-    /// | ratio 2    | `[496, 1008, 2032, 4080]`       |
-    /// | ratio 3    | `[144, 448, 1360, 4080]`        |
-    /// | ratio 8    | `[48, 496, 4080]`               |
-    /// | rungs 1    | `[4080]`                        |
-    #[test]
-    fn ladder_rungs_are_quarters_of_the_one_above() {
-        assert_eq!(
-            gdn_prefill_checkpoint_boundaries(4096, 0, 16),
-            vec![48, 240, 1008, 4080]
-        );
-        assert_eq!(
-            gdn_prefill_checkpoint_boundaries(1400, 0, 16),
-            vec![16, 80, 336, 1392]
-        );
-        // A cached prefix truncates the ladder from the BOTTOM: same deepest
-        // rung, same values, the shallow ones this prefill cannot cross are
-        // dropped. That is what makes the harness's `cached = 0` copy a
-        // superset of every warm turn's ladder.
-        assert_eq!(
-            gdn_prefill_checkpoint_boundaries(4096, 240, 16),
-            vec![1008, 4080]
-        );
-        assert_eq!(
-            gdn_prefill_checkpoint_boundaries(4096, 1008, 16),
-            vec![4080]
-        );
-    }
+    use super::{gdn_checkpoint_target, media_prefill_ranges, paged_prefill_ranges};
 
     fn assert_contiguous_cover(ranges: &[std::ops::Range<usize>], suffix_len: usize) {
         let mut cursor = 0;

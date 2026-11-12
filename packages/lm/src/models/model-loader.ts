@@ -101,6 +101,17 @@ export interface LoadModelOptions {
    * and finite, default 0.5. Other model families reject it.
    */
   decodeShare?: number;
+  /**
+   * SSD cache of the DFlash2 states of `qwen3_5` and `qwen3_5_moe` targets
+   * (`--max-cache-disk`): `'auto'` (the default), a decimal byte count, or
+   * `'0'` (off). The cache opens only with a DFlash2 draft. Other model
+   * families reject it, as they do `persistentCache` and `cacheDir`.
+   */
+  cacheDisk?: string;
+  /** Keep that SSD cache across restarts (`--persistent-cache`). */
+  persistentCache?: boolean;
+  /** The persistent cache's root (`--cache-dir`); needs `persistentCache`. */
+  cacheDir?: string;
 }
 
 /** The native Qwen3.5 load options of `options`; `null` when none is set. */
@@ -110,7 +121,10 @@ function qwen35LoadOptions(options: LoadModelOptions | undefined): Qwen35LoadOpt
     options?.kvFormat === undefined &&
     options?.maxMemoryBytes === undefined &&
     options?.maxContextTokens === undefined &&
-    options?.decodeShare === undefined
+    options?.decodeShare === undefined &&
+    options?.cacheDisk === undefined &&
+    options?.persistentCache === undefined &&
+    options?.cacheDir === undefined
   )
     return null;
   return {
@@ -119,6 +133,9 @@ function qwen35LoadOptions(options: LoadModelOptions | undefined): Qwen35LoadOpt
     maxMemoryBytes: options.maxMemoryBytes,
     maxContextTokens: options.maxContextTokens,
     decodeShare: options.decodeShare,
+    cacheDisk: options.cacheDisk,
+    persistentCache: options.persistentCache,
+    cacheDir: options.cacheDir,
   };
 }
 
@@ -296,6 +313,15 @@ function dispatchLoad(
   if (options?.decodeShare !== undefined && requireFamilyData(modelType).acceptsDecodeShare !== true) {
     throw new Error(
       `decodeShare (decode time owed per unit of prefill time) is only supported by qwen3_5 and qwen3_5_moe models; ` +
+        `${modelPath} has model_type "${modelType}"`,
+    );
+  }
+  if (
+    (options?.cacheDisk !== undefined || options?.persistentCache !== undefined || options?.cacheDir !== undefined) &&
+    requireFamilyData(modelType).acceptsCacheDisk !== true
+  ) {
+    throw new Error(
+      `cacheDisk, persistentCache and cacheDir (the SSD cache) are only supported by qwen3_5 and qwen3_5_moe models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }

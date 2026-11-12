@@ -43,7 +43,6 @@ fn tiny_cfg() -> Qwen3_5Config {
         rope_theta: 100_000.0,
         paged_cache_memory_mb: Some(64),
         paged_block_size: Some(16),
-        persist_paged_cache: None,
         n_mtp_layers: 0,
         qwen35_gguf_gdn_layout: None,
         kv_format: None,

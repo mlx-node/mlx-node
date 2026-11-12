@@ -26,8 +26,10 @@
  *
  * The returned host owns, and disposes on {@link InferenceHost.close}:
  *   1. the HTTP server,
- *   2. the verbose request logger (when `logDir` is set),
- *   3. the `PagedConfigOverrideManager`'s temp root.
+ *   2. the SSD caches of the loaded models (their `closeCache`, then the
+ *      process tier's drain),
+ *   3. the verbose request logger (when `logDir` is set),
+ *   4. the `PagedConfigOverrideManager`'s temp root.
  *
  * The server goes first because the logger records a request from that
  * request's own `finish`/`close` handler. Ending the log streams while a
@@ -41,10 +43,12 @@
 import type { Server } from 'node:http';
 
 import {
+  coldCacheDrain as coldCacheDrainNative,
   estimateQwen35ContextWindow,
   estimateQwen4ExpContextWindow,
   releaseNativeGgufLease,
   setResidencyKeepAlive as setResidencyKeepAliveNative,
+  sweepCacheLeftovers as sweepCacheLeftoversNative,
   type Qwen35ContextEstimate,
   type Qwen35LoadOptions,
 } from '@mlx-node/core';
@@ -65,6 +69,7 @@ import type { AudioServiceOptions } from '../audio-service.js';
 import type { ServerHealth } from '../health.js';
 import { resolveRerankLimits, type RerankServiceOptions } from '../rerank-service.js';
 import { createServer, resolveAuthToken, type CloseOptions, type ServerInstance } from '../server.js';
+import { FLUSH_MS } from '../supervision.js';
 import type { TurnJournalOptions } from '../turn-journal.js';
 import { discoverAudioModels, loadAudioModel, audioCapabilities, type DiscoveredAudioModel } from './audio-models.js';
 import { chatCapability, withCapabilityModels } from './capability-models.js';
@@ -192,6 +197,23 @@ export interface InferenceHostOptions {
    */
   maxContextTokens?: number;
   /**
+   * SSD cache size (`--max-cache-disk`) for qwen3_5 / qwen3_5_moe loads:
+   * `'auto'` or a byte count, `'0'` turns the cache off. Their memory plan
+   * sets one DFlash2 state's staging aside while the cache is on. Other
+   * families never see it. Omitted ⇒ `'auto'`.
+   */
+  cacheDisk?: string;
+  /**
+   * Keep the SSD cache across restarts (`--persistent-cache`) for qwen3_5 /
+   * qwen3_5_moe loads. Omitted ⇒ a temporary cache that goes at `close()`.
+   */
+  persistentCache?: boolean;
+  /**
+   * The persistent cache's root (`--cache-dir`); needs `persistentCache`.
+   * Omitted ⇒ `~/.mlx-node/cache/prefix-cache`.
+   */
+  cacheDir?: string;
+  /**
    * Decode time owed per unit of prefill time while other requests generate
    * (`--decode-share`) for qwen3_5 / qwen3_5_moe loads. Other families never
    * see it. Omitted ⇒ 0.5.
@@ -224,10 +246,10 @@ export interface InferenceHostOptions {
    */
   maxQueueDepthPerModel?: number | 'unbounded';
   /**
-   * Remove temp roots left behind by hosts that were killed without running
-   * `close()`. Default `true`; a supervisor that runs several hosts under one
-   * pid namespace and wants to control the timing can turn it off and call
-   * {@link sweepOrphanHostTempRoots} itself.
+   * Remove temp roots and temporary SSD caches left behind by hosts that were
+   * killed without running `close()`. Default `true`; a supervisor that runs
+   * several hosts under one pid namespace and wants to control the timing can
+   * turn it off and call {@link sweepOrphanHostTempRoots} itself.
    */
   sweepOrphanTempRoots?: boolean;
 
@@ -243,6 +265,21 @@ export interface InferenceHostOptions {
   attachLogger?: (server: Server, logDir: string) => Logger;
   /** Test seam: replaces the native residency keep-alive setter. */
   setResidencyKeepAlive?: (seconds: number) => void;
+  /** Test seam: replaces the native sweep of crashed processes' temporary SSD caches. */
+  sweepCacheLeftovers?: () => number;
+  /** Test seam: replaces the native drain of the process-wide cold tier. */
+  coldCacheDrain?: (timeoutMs: number) => boolean;
+  /** Test seam: the clock of the shared flush deadline (`Date.now()`'s). */
+  now?: () => number;
+}
+
+/** A loaded model with an SSD cache to close at a clean stop (qwen3_5 / qwen3_5_moe). */
+interface CacheClosingModel {
+  closeCache(deadlineMs: number): Promise<boolean>;
+}
+
+function hasCacheToClose(model: unknown): model is CacheClosingModel {
+  return typeof (model as Partial<CacheClosingModel> | undefined)?.closeCache === 'function';
 }
 
 export interface InferenceHost {
@@ -291,7 +328,9 @@ export interface InferenceHost {
   loadModel(name: string): Promise<void>;
   /**
    * Stop accepting new HTTP and out-of-band load work, wait for every
-   * out-of-band load already admitted, then dispose the logger and temp root.
+   * out-of-band load already admitted, close the loaded models' SSD caches
+   * within one {@link FLUSH_MS} deadline (Splash `kFlush`), then dispose the
+   * logger and temp root.
    * Idempotent and memoized; disposal steps are individually guarded so one
    * failure cannot strand the remaining steps.
    */
@@ -342,6 +381,11 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   // to refuse to start.
   if (opts.sweepOrphanTempRoots !== false) {
     await sweepOrphanHostTempRoots().catch(() => []);
+    try {
+      (opts.sweepCacheLeftovers ?? sweepCacheLeftoversNative)();
+    } catch {
+      /* the next start sweeps again */
+    }
   }
 
   const modelsDir = resolveModelsDir(opts.modelsDir);
@@ -448,6 +492,13 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
       ...(opts.decodeShare !== undefined && familyDataFor(entry.modelType)?.acceptsDecodeShare === true
         ? { decodeShare: opts.decodeShare }
         : {}),
+      ...(familyDataFor(entry.modelType)?.acceptsCacheDisk === true
+        ? {
+            ...(opts.cacheDisk !== undefined ? { cacheDisk: opts.cacheDisk } : {}),
+            ...(opts.persistentCache !== undefined ? { persistentCache: opts.persistentCache } : {}),
+            ...(opts.cacheDir !== undefined ? { cacheDir: opts.cacheDir } : {}),
+          }
+        : {}),
     };
     try {
       return Object.keys(options).length === 0
@@ -467,6 +518,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
       ...(opts.kvFormat !== undefined ? { kvFormat: opts.kvFormat } : {}),
       ...(opts.maxMemoryBytes !== undefined ? { maxMemoryBytes: opts.maxMemoryBytes } : {}),
       ...(opts.maxContextTokens !== undefined ? { maxContextTokens: opts.maxContextTokens } : {}),
+      ...(opts.cacheDisk !== undefined ? { cacheDisk: opts.cacheDisk } : {}),
     },
   );
   const chatController = makeSwapController(models, server.registry, loadModelPagedAware, boundEntry.name, (name) =>
@@ -541,6 +593,41 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   const activeHostLoads = new Set<Promise<void>>();
   let closePromise: Promise<void> | null = null;
 
+  // Splash `flushRestorePoints` under `kFlush`: one deadline for every loaded
+  // model's cache in turn, then the process tier of the other families. A
+  // model thread still busy past the deadline is not waited for.
+  const now = opts.now ?? Date.now;
+  const closeCaches = async (): Promise<void> => {
+    const deadline = now() + FLUSH_MS;
+    const models = new Set<CacheClosingModel>();
+    for (const { id } of server.registry.list()) {
+      const model = server.registry.get(id);
+      if (hasCacheToClose(model)) models.add(model);
+    }
+    for (const model of models) {
+      const remaining = Math.max(0, deadline - now());
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          model.closeCache(deadline),
+          new Promise<void>((resolveTimer) => {
+            timer = setTimeout(resolveTimer, remaining);
+            timer.unref?.();
+          }),
+        ]);
+      } catch {
+        /* a cache that fails to close loses its waiting points, as a crash would */
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    try {
+      (opts.coldCacheDrain ?? coldCacheDrainNative)(Math.max(0, deadline - now()));
+    } catch {
+      /* best effort, as the per-model closes */
+    }
+  };
+
   return {
     url: hostUrl(host, boundPort),
     port: boundPort,
@@ -614,6 +701,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
         // `allSettled` preserves cleanup when either kind of loader rejects;
         // the original operation still carries that error to its caller.
         await Promise.allSettled([...admittedHostLoads, ...admittedHttpModelLoads]);
+        await closeCaches();
         // Out-of-band capability loads admitted before close may finish after
         // their HTTP service drained. Dispose every late resident even if one
         // capability's cleanup fails.
@@ -690,7 +778,7 @@ function startContextEstimates(
   modelsDir: string,
   estimate: NonNullable<InferenceHostOptions['estimateContextWindow']>,
   resolvePath: (entry: DiscoveredModel) => Promise<string>,
-  options: Pick<Qwen35LoadOptions, 'kvFormat' | 'maxMemoryBytes' | 'maxContextTokens'>,
+  options: Pick<Qwen35LoadOptions, 'kvFormat' | 'maxMemoryBytes' | 'maxContextTokens' | 'cacheDisk'>,
 ): Map<string, number> {
   const windows = new Map<string, number>();
   const { maxContextTokens } = options;
@@ -725,6 +813,14 @@ export { DECODE_SHARE_ERROR, DEFAULT_DECODE_SHARE, parseDecodeShare } from './de
 export { DEFAULT_IDLE_RELEASE_SECONDS, IDLE_RELEASE_ERROR, idleReleaseText, parseIdleRelease } from './idle-release.js';
 export { MAX_CONTEXT_ERROR, MAX_YARN_CONTEXT_TOKENS, parseMaxContext } from './max-context.js';
 export { MAX_MEMORY_ERROR, parseMaxMemory } from './max-memory.js';
+export {
+  CACHE_DIR_ERROR,
+  checkCacheDiskArgs,
+  MAX_CACHE_DISK_ERROR,
+  parseCacheDir,
+  parseMaxCacheDisk,
+  type CacheDiskArgs,
+} from './cache-disk.js';
 export {
   applyEnginePolicy,
   engineEnvFor,

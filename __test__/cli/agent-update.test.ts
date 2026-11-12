@@ -1957,6 +1957,35 @@ describe('launchGrokAgent server gating', () => {
     expect(spawnServe.mock.calls[0]![0]).not.toContain('--kv-format');
   });
 
+  // Mutation TSF1: drop `--persistent-cache` from the serve argv → red.
+  it('hands the SSD cache flags to the spawned serve', async () => {
+    await launchGrokAgent({
+      argv: ['-c'],
+      cacheDisk: '0',
+      spawnServe,
+      spawnAgent,
+    });
+    const offArgv: string[] = spawnServe.mock.calls[0]![0];
+    expect(offArgv.slice(-2)).toEqual(['--max-cache-disk', '0']);
+    expect(parseServeArgs(offArgv.slice(2))).toMatchObject({ cacheDisk: '0', persistentCache: false });
+
+    spawnServe.mockClear();
+    await launchGrokAgent({ argv: ['-c'], persistentCache: true, cacheDir: '/c', spawnServe, spawnAgent });
+    const persistentArgv: string[] = spawnServe.mock.calls[0]![0];
+    expect(persistentArgv.slice(-2)).toEqual(['--persistent-cache', '--cache-dir=/c']);
+    expect(parseServeArgs(persistentArgv.slice(2))).toMatchObject({
+      cacheDisk: 'auto',
+      persistentCache: true,
+      cacheDir: '/c',
+    });
+
+    spawnServe.mockClear();
+    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent });
+    const plainArgv: string[] = spawnServe.mock.calls[0]![0];
+    expect(plainArgv).not.toContain('--persistent-cache');
+    expect(plainArgv).not.toContain('--max-cache-disk');
+  });
+
   // Mutation: drop the `--max-memory` pair from the serve argv → red.
   it('hands --max-memory to the spawned serve as bytes', async () => {
     await launchGrokAgent({ argv: ['-c'], maxMemoryBytes: 30_064_771_072, spawnServe, spawnAgent });

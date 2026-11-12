@@ -1548,19 +1548,22 @@ fn cold_tier_context_with(
             fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
                 b"gemma4-sliding-ladder-test".as_slice(),
             ]),
-            sidecar_policy,
+            backing: sidecar_policy.map_or(
+                crate::transformer::paged_kv_cache_adapter::ColdContextBacking::KvOnly,
+                crate::transformer::paged_kv_cache_adapter::ColdContextBacking::Sidecar,
+            ),
         },
         root,
     )
 }
 
-/// A cold tier belonging to a DIFFERENT hybrid family (qwen3.5's GDN
-/// recurrent state). Present so "wants a ladder" cannot be satisfied by
+/// A cold tier belonging to a DIFFERENT hybrid family (lfm2's ShortConv
+/// state). Present so "wants a ladder" cannot be satisfied by
 /// "some sidecar policy exists": gemma4's rungs are readable only by
 /// gemma4's own sliding capture.
-fn gdn_sidecar_policy() -> mlx_paged_attn::ColdSidecarPolicy {
+fn conv_sidecar_policy() -> mlx_paged_attn::ColdSidecarPolicy {
     mlx_paged_attn::ColdSidecarPolicy::new(mlx_paged_attn::ColdSidecarLayout {
-        group: mlx_paged_attn::ColdGroup::GdnState,
+        group: mlx_paged_attn::ColdGroup::ConvState,
         boundary_tokens: 0,
         num_layers: 4,
         tensors_per_layer: 2,
@@ -1568,7 +1571,7 @@ fn gdn_sidecar_policy() -> mlx_paged_attn::ColdSidecarPolicy {
         dims: vec![1, 8, 128],
         bytes_per_tensor: 8 * 128 * 2,
     })
-    .expect("a GdnState sidecar policy must validate")
+    .expect("a ConvState sidecar policy must validate")
 }
 
 /// The master switch, executed for real.
@@ -1602,7 +1605,7 @@ fn gemma4_sliding_cold_ladder_wants_a_ladder_only_for_a_sliding_window_sidecar()
          installs no sidecar policy, so it has no auxiliary state to anchor"
     );
 
-    let (gdn, root_gdn) = cold_tier_context_with("gdn", Some(gdn_sidecar_policy()));
+    let (gdn, root_gdn) = cold_tier_context_with("gdn", Some(conv_sidecar_policy()));
     assert!(
         !gemma4_sliding_cold_ladder_wanted(Some(&gdn)),
         "another family's sidecar group must not switch gemma4's ladder on"

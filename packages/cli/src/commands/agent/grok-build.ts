@@ -41,6 +41,7 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 import { idleReleaseText } from '@mlx-node/server/host/idle-release';
+import { STOP_MS } from '@mlx-node/server/supervision';
 import semver from 'semver';
 
 import { withLoopbackNoProxy } from '../loopback-env.js';
@@ -84,6 +85,12 @@ export interface GrokAgentLaunchOptions {
   decodeShare?: number;
   /** Seconds without a request before the spawned `mlx serve` frees the weights (`--idle-release`); `Infinity` = off. */
   idleReleaseSeconds?: number;
+  /** SSD cache quota the spawned `mlx serve` loads with (`--max-cache-disk`, its native text). */
+  cacheDisk?: string;
+  /** Keep the spawned `mlx serve`'s SSD cache across restarts (`--persistent-cache`). */
+  persistentCache?: boolean;
+  /** The persistent cache's root (`--cache-dir`). */
+  cacheDir?: string;
   /** Test seam: custom spawn for the agent binary. */
   spawnAgent?: (bin: string, argv: string[], opts: SpawnOptions) => ChildProcess;
   /** Test seam: custom spawn for `mlx serve`. */
@@ -1719,6 +1726,9 @@ function spawnInferenceServer(opts: GrokAgentLaunchOptions): { child: ChildProce
     ...(opts.maxContextTokens !== undefined ? ['--max-context', String(opts.maxContextTokens)] : []),
     ...(opts.decodeShare !== undefined ? ['--decode-share', String(opts.decodeShare)] : []),
     ...(opts.idleReleaseSeconds !== undefined ? ['--idle-release', idleReleaseText(opts.idleReleaseSeconds)] : []),
+    ...(opts.cacheDisk !== undefined ? ['--max-cache-disk', opts.cacheDisk] : []),
+    ...(opts.persistentCache === true ? ['--persistent-cache'] : []),
+    ...(opts.cacheDir !== undefined ? [`--cache-dir=${opts.cacheDir}`] : []),
   ];
   const child = (opts.spawnServe ?? ((argv, so) => spawn(process.execPath, argv, so)))(serveArgv, {
     stdio: ['ignore', 'pipe', 'inherit'],
@@ -1844,14 +1854,11 @@ function waitForServe(child: ChildProcess, timeoutMs: number): Promise<string> {
 export const LOCAL_BACKEND_DISABLED_TOOL_ENV = ['GROK_IMAGE_GEN', 'GROK_IMAGE_EDIT', 'GROK_VIDEO_GEN'] as const;
 
 /**
- * Serve's graceful shutdown awaits in-flight model loads with no deadline
- * (only its server close is capped at 5 s), so a signaled serve gets this
- * long before SIGKILL.
+ * Signal serve, wait up to `graceMs` for it to exit, then SIGKILL it and wait.
+ * The default is Splash `kStop`: serve's server close and its SSD cache flush
+ * both fit in it.
  */
-const SERVE_STOP_GRACE_MS = 10_000;
-
-/** Signal serve, wait up to `graceMs` for it to exit, then SIGKILL it and wait. */
-async function stopServe(child: ChildProcess, signal: NodeJS.Signals, graceMs: number): Promise<void> {
+export async function stopServe(child: ChildProcess, signal: NodeJS.Signals, graceMs = STOP_MS): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   const exited = new Promise<void>((resolvePromise) => child.once('exit', () => resolvePromise()));
   child.kill(signal);
@@ -1903,7 +1910,7 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
     }
     tearingDown = (async () => {
       agent?.kill(signal);
-      if (serveChild) await stopServe(serveChild, signal, opts.serveStopGraceMs ?? SERVE_STOP_GRACE_MS);
+      if (serveChild) await stopServe(serveChild, signal, opts.serveStopGraceMs);
       removeHandlers();
       process.kill(process.pid, signal);
     })();

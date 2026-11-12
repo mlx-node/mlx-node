@@ -71,15 +71,6 @@ pub struct Qwen3_5MoeConfig {
     #[napi(ts_type = "number | undefined")]
     pub paged_block_size: Option<u32>,
 
-    /// Persist the out-of-pool GDN recurrent state (and the paged KV blocks it
-    /// gates) to the SSD cold tier so warm prefixes survive process restarts.
-    /// Off unless explicitly enabled. Shares the dense qwen3_5 GDN sidecar codec
-    /// (`crate::models::qwen3_5::gdn_sidecar`) via `to_dense_config`; the
-    /// precedence rules live in `crate::cold_tier::resolve_persist_cold`.
-    #[serde(default)]
-    #[napi(ts_type = "boolean | undefined")]
-    pub persist_paged_cache: Option<bool>,
-
     /// Number of MTP (Multi-Token Prediction) head layers shipped with
     /// the checkpoint. Populated from `mtp_num_hidden_layers` /
     /// `num_nextn_predict_layers` in `config.json`. `0` means the
@@ -198,9 +189,6 @@ impl Qwen3_5MoeConfig {
             rope_theta: self.rope_theta,
             paged_cache_memory_mb: self.paged_cache_memory_mb,
             paged_block_size: self.paged_block_size,
-            // MoE cold-tier persistence is a separate (unproven) family; the
-            // dense config it maps to never attaches a cold tier of its own.
-            persist_paged_cache: None,
             n_mtp_layers: self.n_mtp_layers,
             qwen35_gguf_gdn_layout: self.qwen35_gguf_gdn_layout.clone(),
             kv_format: self.kv_format.clone(),

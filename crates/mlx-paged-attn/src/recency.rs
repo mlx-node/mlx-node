@@ -25,4 +25,11 @@ impl CacheRecency {
             }
         }
     }
+
+    /// Continues after `stamp`, a stamp an earlier process handed out, for
+    /// what a persistent tier takes back (Splash
+    /// `CacheRecency::continueAfter`).
+    pub fn continue_after(&self, stamp: u64) {
+        self.0.fetch_max(stamp, Relaxed);
+    }
 }

@@ -242,7 +242,7 @@ export interface CacheScope {
    * buckets above cannot report, because a tier-less turn has no hits or
    * misses to put in one. `record_capture_reached()` is the first statement of
    * every family's capture, above its `adapter.cold_tier()` guard, so a hybrid
-   * turn under `--no-persist-cache` or one whose tier failed to open still
+   * turn with persistence off or one whose tier failed to open still
    * counts the capture. Kept out of {@link ColdTierHealth} because these turns
    * name no cache root and `health` promises one.
    */

@@ -405,7 +405,7 @@ pub(crate) fn sidecar_counter_test_lock() -> std::sync::MutexGuard<'static, ()> 
 ///
 ///  * `qwen3` (dense) sizes its pool over all layers, so the pool holds the
 ///    complete KV for the prefix and needs no sidecar
-///    (`ColdTierContext::sidecar_policy` is `None`).
+///    (`ColdContextBacking::KvOnly`).
 ///  * `gemma4` owns full- and sliding-attention state in separate paged groups.
 ///    The full-attention chain is the authority; a `ColdGroup::SlidingWindow`
 ///    sidecar stores every sliding group at the same exact block boundary. A
@@ -413,21 +413,9 @@ pub(crate) fn sidecar_counter_test_lock() -> std::sync::MutexGuard<'static, ()> 
 ///  * `muse_glimmer` uses the same grouped hybrid contract: its 13 full layers
 ///    own the persisted K/V chain and one sidecar restores all 39 sliding
 ///    layers at the reconciled boundary.
-///  * `qwen3_5` (dense) sizes its pool over the full-attention layers only, but
-///    persists its out-of-pool GDN recurrent state (conv + recurrent) as a
-///    `ColdGroup::GdnState` sidecar (`crate::models::qwen3_5::gdn_sidecar`). A
-///    GDN recurrent state is a running summary of every preceding token, so it
-///    is valid ONLY at its exact block-aligned prefix length (vLLM `MambaSpec`);
-///    its `ColdSidecarPolicy` reconciles the restore down to the deepest such
-///    boundary a validated sidecar backs, or to zero.
-///  * `qwen3_5_moe` keeps the SAME GDN recurrent state outside the pool — same
-///    shapes, same dtype, same layer mapping, projected by
-///    `Qwen3_5MoeConfig::to_dense_config` — so it shares the dense family's
-///    sidecar codec and `ColdSidecarPolicy` verbatim. Witnessed on
-///    `Qwen3.6-35B-A3B-mxfp4-mlx`: the restore reconciled onto rung 304 of
-///    the ladder `[16, 64, 304, 1248]` with `hits=42`, `corruptions=0`, and text
-///    matching a no-persist baseline
-///    (`crates/mlx-core/tests/qwen3_5_moe_cold_tier_parity.rs`).
+///  * `qwen3_5` / `qwen3_5_moe` are not here: their KV reaches the SSD only
+///    under a DFlash2 state object of the model's own tier
+///    (`crate::disk_tier`), never through this process tier.
 ///  * `lfm2` / `lfm2_moe` keep ShortConv recurrent state outside the full-
 ///    attention pool. `ColdGroup::ConvState` serializes that state at the same
 ///    exact boundary as the K/V chain, so missing or malformed auxiliary state
@@ -437,15 +425,7 @@ pub(crate) fn sidecar_counter_test_lock() -> std::sync::MutexGuard<'static, ()> 
 /// authorized by exactly one thing: the family's restart-parity gate
 /// (`crates/mlx-core/tests/cold_tier_parity_harness.rs`) passing on real
 /// weights with `hits > 0` and `corruptions == 0`.
-const COLD_RESTORE_FAMILIES: &[&str] = &[
-    "qwen3",
-    "qwen3_5",
-    "qwen3_5_moe",
-    "gemma4",
-    "muse_glimmer",
-    "lfm2",
-    "lfm2_moe",
-];
+const COLD_RESTORE_FAMILIES: &[&str] = &["qwen3", "gemma4", "muse_glimmer", "lfm2", "lfm2_moe"];
 
 /// Whether the cold tier may restore persisted paged blocks for `model_type`
 /// (see [`COLD_RESTORE_FAMILIES`]). Fails closed: an unknown or misspelled
@@ -689,10 +669,8 @@ pub(crate) fn parse_bool_env(value: &str) -> Option<bool> {
 /// Resolve whether cold KV persistence is on, with precedence
 /// **explicit config > env > off**. An *explicit* per-model config decision
 /// (`persist_paged_cache` / `persistPagedCache` present as a bool, i.e.
-/// `Some`) is authoritative and wins over the environment — this is how an
-/// explicit CLI decision reaches the loader: `mlx agent --no-persist-cache`
-/// writes `persist_paged_cache: false` into the model's config overlay, and
-/// that per-invocation intent must beat an ambient `MLX_PERSIST_PAGED_CACHE`
+/// `Some`) is authoritative and wins over the environment: a model's own
+/// `persist_paged_cache: false` beats an ambient `MLX_PERSIST_PAGED_CACHE`
 /// default. The `MLX_PERSIST_PAGED_CACHE` environment variable only supplies a
 /// default when the config is unset (`None`), so a direct library caller —
 /// which has no config plumbing — can still enable or disable persistence,
@@ -854,7 +832,13 @@ fn push_gguf_identity(identity: &GgufIdentity, components: &mut Vec<Vec<u8>>) ->
     Some(())
 }
 
-fn push_dir_identity(dir: &Path, components: &mut Vec<Vec<u8>>) -> Option<()> {
+/// Directory identities ([`push_dir_identity`]) this process read.
+#[cfg(test)]
+pub(crate) static IDENTITY_READS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn push_dir_identity(dir: &Path, components: &mut Vec<Vec<u8>>) -> Option<()> {
+    #[cfg(test)]
+    IDENTITY_READS.fetch_add(1, Ordering::Relaxed);
     // Deterministic (sorted) shard enumeration. A missing/unreadable directory
     // or an empty shard set means there is no weight content to bind to.
     let shard_names = shard_file_names(dir)?;
@@ -1199,9 +1183,9 @@ pub fn cold_sidecar_stats() -> ColdSidecarStatsJs {
 /// or `timeout_ms` elapses. Returns `true` when the drain completed — or when
 /// the tier was never opened (nothing to flush) — and `false` on timeout.
 ///
-/// Called from the agent's one-shot (`mlx agent -p`) shutdown so a prompt's
-/// just-persisted prefix blocks reach the drive before the process exits,
-/// rather than being abandoned in the write queue.
+/// Called from the host's close after every loaded model's own cache closed,
+/// so the other families' just-persisted prefix blocks reach the drive before
+/// the process exits, rather than being abandoned in the write queue.
 ///
 /// The payload flush is `fsync(2)`, not `F_FULLFSYNC`: a drained block
 /// survives process death and kernel panic, but a sudden power loss can leave
@@ -1213,6 +1197,15 @@ pub fn cold_cache_drain(timeout_ms: u32) -> bool {
         Some(manager) => manager.drain(std::time::Duration::from_millis(timeout_ms as u64)),
         None => true,
     }
+}
+
+/// Removes the temporary SSD caches a crashed process left in the temp
+/// directory: every published one whose lock nobody holds. Returns how many
+/// went.
+#[napi]
+pub fn sweep_cache_leftovers() -> u32 {
+    let removed = crate::disk_tier::sweep_temp_leftovers(&std::env::temp_dir());
+    u32::try_from(removed).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -1347,7 +1340,7 @@ mod tests {
     fn cold_sidecar_transaction_validates_once_and_commits_only_after_seating() {
         let _guard = sidecar_counter_test_lock();
         let layout = ColdSidecarLayout {
-            group: ColdGroup::GdnState,
+            group: ColdGroup::ConvState,
             boundary_tokens: 32,
             num_layers: 2,
             tensors_per_layer: 2,
@@ -1395,7 +1388,7 @@ mod tests {
         );
         assert!(!rejected_callback_ran);
         let mut wrong_group = layout.clone();
-        wrong_group.group = ColdGroup::ConvState;
+        wrong_group.group = ColdGroup::SlidingWindow;
         assert!(
             try_install_cold_sidecar(
                 Some(restored_sidecar(layout.clone())),
@@ -1475,17 +1468,10 @@ mod tests {
         assert!(resolve_persist_cold("gemma4", Some("1"), Some(true)));
         assert!(cold_restore_supported("muse_glimmer"));
         assert!(resolve_persist_cold("muse_glimmer", Some("1"), Some(true)));
-        // Hybrid, admitted only because its out-of-pool GDN recurrent state is
-        // persisted as a `ColdGroup::GdnState` sidecar AND its restart-parity
-        // gate passes on real weights
-        // (`crates/mlx-core/tests/qwen3_5_cold_tier_parity.rs`).
-        assert!(cold_restore_supported("qwen3_5"));
-        // Shares qwen3_5's GDN state type and sidecar codec, driven through
-        // `Qwen3_5MoeConfig::to_dense_config()`, and admitted on its OWN
-        // restart-parity gate against a real MoE checkpoint
-        // (`crates/mlx-core/tests/qwen3_5_moe_cold_tier_parity.rs`) — sharing a
-        // codec with a passing family is not evidence, so the MoE ran its own.
-        assert!(cold_restore_supported("qwen3_5_moe"));
+        // A DFlash2 load keeps its cold KV only under a state object of its
+        // own tier (`crate::disk_tier`), never the process tier.
+        assert!(!cold_restore_supported("qwen3_5"));
+        assert!(!cold_restore_supported("qwen3_5_moe"));
         // LFM2 dense and MoE share the same exact-boundary ShortConv codec.
         assert!(cold_restore_supported("lfm2"));
         assert!(cold_restore_supported("lfm2_moe"));
@@ -1514,8 +1500,6 @@ mod tests {
             cold_restore_families(),
             vec![
                 "qwen3".to_string(),
-                "qwen3_5".to_string(),
-                "qwen3_5_moe".to_string(),
                 "gemma4".to_string(),
                 "muse_glimmer".to_string(),
                 "lfm2".to_string(),
@@ -2247,7 +2231,7 @@ mod tests {
         // sidecar fails against the real filesystem rather than a hook.
         let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500));
         let key = mlx_paged_attn::ColdCacheKey::chain(
-            mlx_paged_attn::ColdGroup::GdnState,
+            mlx_paged_attn::ColdGroup::ConvState,
             mlx_paged_attn::ColdCacheFingerprint::from_components([b"counters".as_slice()]),
             None,
             &[1, 2, 3, 4],
@@ -2256,7 +2240,7 @@ mod tests {
             0,
         );
         let layout = mlx_paged_attn::ColdSidecarLayout {
-            group: mlx_paged_attn::ColdGroup::GdnState,
+            group: mlx_paged_attn::ColdGroup::ConvState,
             boundary_tokens: 16,
             num_layers: 1,
             tensors_per_layer: 1,
