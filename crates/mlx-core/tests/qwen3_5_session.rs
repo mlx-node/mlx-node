@@ -77,6 +77,10 @@ fn clone_model_dir_paged(src: &Path, suffix: &str) -> Result<PathBuf, String> {
     let mut cfg: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| format!("parse config.json: {e} (path={})", cfg_path.display()))?;
     cfg["paged_block_size"] = serde_json::Value::from(16u32);
+    // A checkpoint's own pool ceiling can sit above the memory plan and fail the load.
+    if let Some(obj) = cfg.as_object_mut() {
+        obj.remove("paged_cache_memory_mb");
+    }
     let pretty =
         serde_json::to_string_pretty(&cfg).map_err(|e| format!("serialize config.json: {e}"))?;
     fs::write(&cfg_path, pretty)

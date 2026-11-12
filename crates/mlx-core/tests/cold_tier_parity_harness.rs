@@ -577,8 +577,15 @@ fn clone_model_dir(
         cfg["persist_paged_cache"] = serde_json::Value::Bool(persist);
         // Bound the adapter pool so the test stays light, and pin the block
         // size the restore assertion is stated in terms of.
-        if let Some(pool_memory_mb) = spec.pool_memory_mb {
-            cfg["paged_cache_memory_mb"] = serde_json::Value::from(pool_memory_mb);
+        match spec.pool_memory_mb {
+            Some(pool_memory_mb) => {
+                cfg["paged_cache_memory_mb"] = serde_json::Value::from(pool_memory_mb);
+            }
+            None => {
+                if let Some(obj) = cfg.as_object_mut() {
+                    obj.remove("paged_cache_memory_mb");
+                }
+            }
         }
         cfg["paged_block_size"] = serde_json::Value::from(spec.block_size);
         let pretty = serde_json::to_string_pretty(&cfg)
