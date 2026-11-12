@@ -9,7 +9,7 @@
 //! the lfm2 fix in 47d8dc53; qwen3_5 shares the identical paged adapter
 //! lifecycle.)
 //!
-//! The test clones the checkpoint dir with a small pool in config.json
+//! The test clones the checkpoint dir with a pinned block size in config.json
 //! (only config.json is copied; weights are symlinked), then asserts
 //! `has_block_paged_cache()` to confirm the adapter actually built before
 //! exercising the reset.
@@ -33,7 +33,8 @@ use mlx_core::models::qwen3_5::model::Qwen3_5Model;
 use mlx_core::tokenizer::ChatMessage;
 
 /// Clone the model dir into the workspace target, symlinking the weight
-/// files and copying config.json with a small pool injected.
+/// files and copying config.json with the block size pinned; the memory
+/// plan sizes the pool.
 fn clone_model_dir_paged(src: &Path, suffix: &str) -> Result<PathBuf, String> {
     let pid = std::process::id();
     let workspace_target = std::env::var_os("CARGO_TARGET_DIR")
@@ -75,7 +76,6 @@ fn clone_model_dir_paged(src: &Path, suffix: &str) -> Result<PathBuf, String> {
         .map_err(|e| format!("read config.json: {e} (path={})", cfg_path.display()))?;
     let mut cfg: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| format!("parse config.json: {e} (path={})", cfg_path.display()))?;
-    cfg["paged_cache_memory_mb"] = serde_json::Value::from(512u32);
     cfg["paged_block_size"] = serde_json::Value::from(16u32);
     let pretty =
         serde_json::to_string_pretty(&cfg).map_err(|e| format!("serialize config.json: {e}"))?;

@@ -119,11 +119,10 @@ use mlx_core::models::qwen3_5::persistence::load_with_thread as qwen3_5_load_wit
 async fn qwen3_5_cold_tier_restart_parity() {
     harness::run_restart_parity(
         harness::ColdTierParitySpec::new("qwen3_5")
-            // The pool covers only the full-attention layers, so this is ample
-            // for two ~1260-token prompts plus a short decode tail. Raised from
-            // 512 with the prompt: a pool-pressure eviction of the shallow
-            // sidecar this gate depends on would read as a restore failure.
-            .with_pool_memory_mb(1024)
+            // A pool-pressure eviction of the shallow sidecar this gate depends
+            // on would read as a restore failure; the planned pool must hold
+            // two ~1260-token prompts.
+            .with_planned_pool()
             .with_prompt(harness::ladder_capture_prompt())
             .with_restore_prompt(harness::ladder_restore_prompt())
             // Two turns put the persisted chain past a mid ladder rung. Fewer
