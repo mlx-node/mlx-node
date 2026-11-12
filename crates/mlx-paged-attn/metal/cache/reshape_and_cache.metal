@@ -14,7 +14,11 @@ template <> inline bfloat16_t to_cache<bfloat16_t, bfloat16_t>(bfloat16_t v) {
 
 template <> inline half to_cache<half, half>(half v) { return v; }
 
-template <typename KV_T, typename CACHE_T>
+// ValuesTokenMajor (the `_vt` instance): the caller passes x = head_size,
+// which makes K token-major, and V takes K's index: both
+// [num_blocks, num_heads, block_size, head_size] (Splash
+// `splash_kv_key_element`; `splash_kv_value_index` under `ValuesTokenMajor`).
+template <typename KV_T, typename CACHE_T, bool ValuesTokenMajor>
 [[kernel]] void reshape_and_cache(
     const device KV_T *__restrict__ key
     [[buffer(0)]], // [num_tokens, num_heads, head_size]
@@ -60,19 +64,21 @@ template <typename KV_T, typename CACHE_T>
         head_idx * (head_size / x) * block_size * x + x_idx * block_size * x +
         block_offset * x + x_offset;
     const int64_t tgt_value_idx =
-        block_idx * num_heads * head_size * block_size +
-        head_idx * head_size * block_size + head_offset * block_size +
-        block_offset;
+        ValuesTokenMajor
+            ? tgt_key_idx
+            : block_idx * num_heads * head_size * block_size +
+                  head_idx * head_size * block_size +
+                  head_offset * block_size + block_offset;
 
     key_cache[tgt_key_idx] = to_cache<KV_T, CACHE_T>(key[src_key_idx]);
     value_cache[tgt_value_idx] = to_cache<KV_T, CACHE_T>(value[src_value_idx]);
   }
 }
 
-#define instantiate_reshape_and_cache(kv_type, cache_type)                     \
+#define instantiate_reshape_and_cache(kv_type, cache_type, vt, suffix)        \
   template [[host_name("reshape_and_cache_kv_" #kv_type                        \
-                       "_cache_" #cache_type)]] [[kernel]] void                \
-  reshape_and_cache<kv_type, cache_type>(                                      \
+                       "_cache_" #cache_type suffix)]] [[kernel]] void         \
+  reshape_and_cache<kv_type, cache_type, vt>(                                  \
       const device kv_type *__restrict__ key [[buffer(0)]],                    \
       const device kv_type *__restrict__ value [[buffer(1)]],                  \
       device cache_type *__restrict__ key_cache [[buffer(2)]],                 \
@@ -88,6 +94,7 @@ template <typename KV_T, typename CACHE_T>
       uint tid [[thread_position_in_threadgroup]],                             \
       uint threads_per_threadgroup [[threads_per_threadgroup]]);
 
-instantiate_reshape_and_cache(float, float);
-instantiate_reshape_and_cache(bfloat16_t, bfloat16_t);
-instantiate_reshape_and_cache(half, half);
+instantiate_reshape_and_cache(float, float, false, "");
+instantiate_reshape_and_cache(bfloat16_t, bfloat16_t, false, "");
+instantiate_reshape_and_cache(half, half, false, "");
+instantiate_reshape_and_cache(bfloat16_t, bfloat16_t, true, "_vt");

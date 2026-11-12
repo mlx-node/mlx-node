@@ -14,7 +14,31 @@
 #include "mlx/backend/metal/jit/includes.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
+
 #endif
+
+namespace {
+// A Flash Next page (Splash `QwenHybridLayout::kvLayout`, `SelectedBlocks`):
+// K and V token-major, `[blocks, heads, block_size, dim]` (Splash
+// `splash_kv_key_element`; `splash_kv_value_index` under `ValuesTokenMajor`),
+// int8 with one f32 scale per (block, head, token) for each. The gathers
+// return `bfloat16_t(float(q) * scale)` for int8, the bits of
+// `dequantize_kv_rows`: an int8 page is defined over BF16 rows (Splash
+// `splash_sparse_attention_tile` applies the scales inside attention).
+bool token_major_page(const mlx::core::array &k, const mlx::core::array &v,
+                      int heads, int dim, int block_size) {
+  return k.ndim() == 4 && k.shape() == v.shape() && k.shape(1) == heads &&
+         k.shape(2) == block_size && k.shape(3) == dim;
+}
+
+bool int8_page_scales_valid(const mlx::core::array &k,
+                            const mlx::core::array &ks,
+                            const mlx::core::array &vs, int dim) {
+  return ks.dtype() == mlx::core::float32 &&
+         vs.dtype() == mlx::core::float32 && ks.shape() == vs.shape() &&
+         ks.size() * size_t(dim) == k.size();
+}
+} // namespace
 
 extern "C" {
 
@@ -347,16 +371,20 @@ mlx_array *mlx_qwen4_expert_gemv(mlx_array *x, mlx_array *ids,
 }
 
 bool mlx_qwen4_gather_window(mlx_array *keys, mlx_array *values,
+                             mlx_array *key_scales, mlx_array *value_scales,
                              mlx_array *table, mlx_array *tokens,
                              mlx_array *fresh_k, mlx_array *fresh_v, int base,
                              int block_size, mlx_array **out_k,
                              mlx_array **out_v) {
   try {
-    if (!keys || !values || !table || !tokens || !fresh_k || !fresh_v ||
-        !out_k || !out_v || base < 0 || block_size <= 0)
+    if (!keys || !values || !key_scales || !value_scales || !table ||
+        !tokens || !fresh_k || !fresh_v || !out_k || !out_v || base < 0 ||
+        block_size <= 0)
       return false;
     auto k = *reinterpret_cast<array *>(keys),
          v = *reinterpret_cast<array *>(values);
+    auto ks = *reinterpret_cast<array *>(key_scales),
+         vs = *reinterpret_cast<array *>(value_scales);
     auto blocks = *reinterpret_cast<array *>(table),
          ids = *reinterpret_cast<array *>(tokens);
     auto fk = *reinterpret_cast<array *>(fresh_k),
@@ -364,17 +392,22 @@ bool mlx_qwen4_gather_window(mlx_array *keys, mlx_array *values,
     if (fk.ndim() != 4 || fk.shape() != fv.shape() ||
         fk.dtype() != fv.dtype() || ids.ndim() != 1 ||
         ids.dtype() != mlx::core::int32 || blocks.dtype() != mlx::core::int32 ||
-        k.dtype() != v.dtype() || k.size() != v.size() || fk.shape(0) != 1 ||
-        fk.shape(3) % 8)
+        k.dtype() != v.dtype() || fk.shape(0) != 1)
       return false;
     int heads = fk.shape(1), dim = fk.shape(3), count = ids.size();
-    // Sizes that change per row or decode step are runtime arguments: each
-    // distinct template tuple compiles a Metal library that is never evicted.
-    static auto kernel = mlx::core::fast::metal_kernel(
-        "qwen4_gather_window",
-        {"keys", "values", "blocks", "ids", "fk", "fv", "base"}, {"ko", "vo"},
-        R"(
-      const int N = ids_shape[0], FRESH = fk_shape[2];
+    if (!token_major_page(k, v, heads, dim, block_size))
+      return false;
+    if (k.dtype() == mlx::core::int8) {
+      if (!int8_page_scales_valid(k, ks, vs, dim))
+        return false;
+      // Sizes that change per row or decode step are runtime arguments.
+      static auto q8 = mlx::core::fast::metal_kernel(
+          "qwen4_gather_window_q8",
+          {"keys", "values", "key_scales", "value_scales", "blocks", "ids", "fk",
+           "fv", "base"},
+          {"ko", "vo"},
+          R"(
+      const int N = ids_shape[0], FRESH = fk_shape[2], POOL = keys_shape[0];
       uint i = thread_position_in_grid.x;
       if (i >= H * N * D) return;
       uint d = i % D, t = (i / D) % N, h = i / (D * N);
@@ -384,22 +417,60 @@ bool mlx_qwen4_gather_window(mlx_array *keys, mlx_array *values,
         size_t src = (size_t(h) * FRESH + uint(token - base)) * D + d;
         ko[i] = fk[src]; vo[i] = fv[src];
       } else {
-        size_t elements = 1;
-        for (int a = 0; a < keys_ndim; ++a) elements *= size_t(keys_shape[a]);
-        const int POOL = int(elements / (H * D * BS));
         int block = blocks[token / BS];
         if (block < 0 || block >= POOL) { ko[i] = 0; vo[i] = 0; return; }
         uint offset = token % BS;
-        size_t ki = (((size_t(block) * H + h) * (D / 8) + d / 8) * BS + offset) * 8 + d % 8;
-        size_t vi = ((size_t(block) * H + h) * D + d) * BS + offset;
-        ko[i] = keys[ki]; vo[i] = values[vi];
+        size_t si = (size_t(block) * H + h) * BS + offset;
+        size_t ki = si * D + d;
+        ko[i] = static_cast<T>(float(bfloat16_t(float(keys[ki]) * key_scales[si])));
+        vo[i] = static_cast<T>(float(bfloat16_t(float(values[ki]) * value_scales[si])));
+      }
+    )");
+      auto result = q8(
+          {k, v, ks, vs, blocks, ids, fk, fv, array(base, mlx::core::int32)},
+          {{1, heads, count, dim}, {1, heads, count, dim}},
+          {fk.dtype(), fk.dtype()}, {heads * count * dim, 1, 1}, {256, 1, 1},
+          {{"T", fk.dtype()},
+           {"H", heads},
+           {"D", dim},
+           {"BS", block_size}},
+          std::nullopt, false,
+          mlx::core::default_stream(mlx::core::Device::gpu));
+      *out_k = reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
+      *out_v = reinterpret_cast<mlx_array *>(new array(std::move(result[1])));
+      return true;
+    }
+    // Sizes that change per row or decode step are runtime arguments: each
+    // distinct template tuple compiles a Metal library that is never evicted.
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "qwen4_gather_window",
+        {"keys", "values", "blocks", "ids", "fk", "fv", "base"}, {"ko", "vo"},
+        R"(
+      const int N = ids_shape[0], FRESH = fk_shape[2], POOL = keys_shape[0];
+      uint i = thread_position_in_grid.x;
+      if (i >= H * N * D) return;
+      uint d = i % D, t = (i / D) % N, h = i / (D * N);
+      int token = ids[t];
+      if (token < 0 || token >= base + FRESH) { ko[i] = 0; vo[i] = 0; return; }
+      if (token >= base) {
+        size_t src = (size_t(h) * FRESH + uint(token - base)) * D + d;
+        ko[i] = fk[src]; vo[i] = fv[src];
+      } else {
+        int block = blocks[token / BS];
+        if (block < 0 || block >= POOL) { ko[i] = 0; vo[i] = 0; return; }
+        uint offset = token % BS;
+        size_t ki = ((size_t(block) * H + h) * BS + offset) * D + d;
+        ko[i] = keys[ki]; vo[i] = values[ki];
       }
     )");
     auto result = kernel(
         {k, v, blocks, ids, fk, fv, array(base, mlx::core::int32)},
         {{1, heads, count, dim}, {1, heads, count, dim}},
         {fk.dtype(), fk.dtype()}, {heads * count * dim, 1, 1}, {256, 1, 1},
-        {{"H", heads}, {"D", dim}, {"BS", block_size}}, std::nullopt, false,
+        {{"H", heads},
+         {"D", dim},
+         {"BS", block_size}},
+        std::nullopt, false,
         mlx::core::default_stream(mlx::core::Device::gpu));
     *out_k = reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
     *out_v = reinterpret_cast<mlx_array *>(new array(std::move(result[1])));
@@ -956,20 +1027,58 @@ bool mlx_qwen4_route_sort(mlx_array *ids, int experts, mlx_array **order,
 }
 
 bool mlx_qwen4_gather_pages(mlx_array *keys, mlx_array *values,
+                            mlx_array *key_scales, mlx_array *value_scales,
                             mlx_array *slots, int heads, int dim,
                             int block_size, mlx_array **out_keys,
                             mlx_array **out_values) {
   try {
-    if (!keys || !values || !slots || !out_keys || !out_values || heads <= 0 ||
-        dim <= 0 || dim % 8 || block_size <= 0)
+    if (!keys || !values || !key_scales || !value_scales || !slots ||
+        !out_keys || !out_values || heads <= 0 || dim <= 0 || block_size <= 0)
       return false;
     auto &k = *reinterpret_cast<array *>(keys);
     auto &v = *reinterpret_cast<array *>(values);
+    auto &ks = *reinterpret_cast<array *>(key_scales);
+    auto &vs = *reinterpret_cast<array *>(value_scales);
     auto &indices = *reinterpret_cast<array *>(slots);
     if (indices.ndim() != 1 || indices.dtype() != mlx::core::int32 ||
-        k.dtype() != v.dtype() || k.size() != v.size())
+        k.dtype() != v.dtype() || !token_major_page(k, v, heads, dim, block_size))
       return false;
     const int count = indices.size();
+    if (k.dtype() == mlx::core::int8) {
+      if (!int8_page_scales_valid(k, ks, vs, dim))
+        return false;
+      static auto q8 = mlx::core::fast::metal_kernel(
+          "qwen4_gather_pages_q8",
+          {"keys", "values", "key_scales", "value_scales", "slots"},
+          {"ko", "vo"}, R"(
+      const uint TC = slots_shape[0];
+      const uint j = thread_position_in_grid.x;
+      if (j >= HC * TC * DC) return;
+      const uint d = j % DC;
+      const uint t = (j / DC) % TC;
+      const uint h = j / (DC * TC);
+      const uint slot = slots[t];
+      const uint block = slot / BS, offset = slot % BS;
+      const size_t si = (size_t(block) * HC + h) * BS + offset;
+      const size_t ki = si * DC + d;
+      ko[j] = bfloat16_t(float(keys[ki]) * key_scales[si]);
+      vo[j] = bfloat16_t(float(values[ki]) * value_scales[si]);
+    )");
+      auto result = q8(
+          {k, v, ks, vs, indices},
+          {{1, heads, count, dim}, {1, heads, count, dim}},
+          {mlx::core::bfloat16, mlx::core::bfloat16},
+          {heads * count * dim, 1, 1}, {256, 1, 1},
+          {{"HC", heads},
+           {"DC", dim},
+           {"BS", block_size}},
+          std::nullopt, false,
+          mlx::core::default_stream(mlx::core::Device::gpu));
+      *out_keys = reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
+      *out_values =
+          reinterpret_cast<mlx_array *>(new array(std::move(result[1])));
+      return true;
+    }
     static auto kernel = mlx::core::fast::metal_kernel(
         "qwen4_gather_pages", {"keys", "values", "slots"}, {"ko", "vo"}, R"(
       const uint TC = slots_shape[0];
@@ -980,14 +1089,15 @@ bool mlx_qwen4_gather_pages(mlx_array *keys, mlx_array *values,
       const uint h = j / (DC * TC);
       const uint slot = slots[t];
       const uint block = slot / BS, offset = slot % BS;
-      const size_t ki = (((size_t(block) * HC + h) * (DC / 8) + d / 8) * BS + offset) * 8 + d % 8;
-      const size_t vi = ((size_t(block) * HC + h) * DC + d) * BS + offset;
-      ko[j] = keys[ki]; vo[j] = values[vi];
+      const size_t ki = ((size_t(block) * HC + h) * BS + offset) * DC + d;
+      ko[j] = keys[ki]; vo[j] = values[ki];
     )");
     auto result = kernel(
         {k, v, indices}, {{1, heads, count, dim}, {1, heads, count, dim}},
         {k.dtype(), k.dtype()}, {heads * count * dim, 1, 1}, {256, 1, 1},
-        {{"HC", heads}, {"DC", dim}, {"BS", block_size}},
+        {{"HC", heads},
+         {"DC", dim},
+         {"BS", block_size}},
         std::nullopt, false, mlx::core::default_stream(mlx::core::Device::gpu));
     *out_keys = reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
     *out_values =

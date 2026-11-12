@@ -20,7 +20,7 @@ pub fn create(
     ceiling: u64,
 ) -> Result<PagedKVCacheAdapter> {
     let cfg = pool_config(config, plan.max_blocks)?;
-    let mut adapter = build(cfg, plan.runway_blocks, plan.max_blocks)?;
+    let mut adapter = build(config, cfg, plan.runway_blocks, plan.max_blocks)?;
     if plan.runway_blocks < plan.max_blocks {
         adapter.set_extent_growth(
             crate::models::qwen3_5::dflash2_decode::runway_pool_extent_blocks(
@@ -40,39 +40,57 @@ pub fn create_with_blocks(
     max: u32,
 ) -> Result<PagedKVCacheAdapter> {
     let cfg = pool_config(config, max)?;
-    build(cfg, initial, max)
+    build(config, cfg, initial, max)
 }
 
 /// A fixture's pool of four sequences of its trained window (at most
 /// 32,768 tokens) within 1 GiB, at that size from the start.
 #[cfg(test)]
 pub fn create_fixture(config: &super::config::Config) -> Result<PagedKVCacheAdapter> {
-    let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
-        super::load_plan::full_attention_layers(config) as u32,
-        config.num_key_value_heads as u32,
-        config.head_dim as u32,
-        32,
-        mlx_paged_attn::metal::MetalDtype::BFloat16,
-    )
-    .map_err(|e| Error::from_reason(e.to_string()))?;
+    let (_, bytes_per_block) = pool_block(config)?;
     let count = ((1u64 << 30) / bytes_per_block.max(1))
         .min(u64::from(config.max_position_embeddings.min(32_768) as u32).div_ceil(32) * 4)
         as u32;
     create_with_blocks(config, count, count)
 }
 
+/// The Flash Next page (Splash `QwenHybridLayout::kvLayout`, `SelectedBlocks`):
+/// token-major K and V, and the indexer's pooled block keys in the page.
+fn page_layout(config: &super::config::Config) -> mlx_paged_attn::PageLayout {
+    mlx_paged_attn::PageLayout {
+        values_token_major: true,
+        index_rows: (32 / config.indexer_compress_ratio.max(1)) as u32,
+        index_dimension: config.indexer_head_dim as u32,
+    }
+}
+
+/// The pool's block dtype and physical bytes per block in the load's
+/// format: the priced page (Splash `bytesPerModelPage`).
+fn pool_block(config: &super::config::Config) -> Result<(mlx_paged_attn::metal::MetalDtype, u64)> {
+    let dtype = match config.kv_format {
+        crate::transformer::KvFormat::Int8 => mlx_paged_attn::metal::MetalDtype::Int8,
+        crate::transformer::KvFormat::Bf16 => mlx_paged_attn::metal::MetalDtype::BFloat16,
+    };
+    let layers = super::load_plan::full_attention_layers(config) as u32;
+    let bytes = mlx_paged_attn::profile::bytes_per_block(
+        layers,
+        config.num_key_value_heads as u32,
+        config.head_dim as u32,
+        32,
+        dtype,
+    )
+    .map_err(|e| Error::from_reason(e.to_string()))?;
+    Ok((
+        dtype,
+        bytes + u64::from(layers) * page_layout(config).index_bytes(),
+    ))
+}
+
 fn pool_config(
     config: &super::config::Config,
     max_blocks: u32,
 ) -> Result<mlx_paged_attn::PagedAttentionConfig> {
-    let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
-        super::load_plan::full_attention_layers(config) as u32,
-        config.num_key_value_heads as u32,
-        config.head_dim as u32,
-        32,
-        mlx_paged_attn::metal::MetalDtype::BFloat16,
-    )
-    .map_err(|e| Error::from_reason(e.to_string()))?;
+    let (_, bytes_per_block) = pool_block(config)?;
     let cfg = mlx_paged_attn::PagedAttentionConfig {
         block_size: 32,
         // `validate` refuses less than `MIN_GPU_MEMORY_MB`; the block counts
@@ -94,20 +112,18 @@ fn pool_config(
 }
 
 fn build(
+    config: &super::config::Config,
     cfg: mlx_paged_attn::PagedAttentionConfig,
     initial: u32,
     max: u32,
 ) -> Result<PagedKVCacheAdapter> {
+    let (dtype, _) = pool_block(config)?;
     let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
         initial, max, 32,
     )));
-    let pool = mlx_paged_attn::LayerKVPool::new(
-        cfg,
-        initial,
-        max,
-        mlx_paged_attn::metal::MetalDtype::BFloat16,
-    )
-    .map_err(|e| Error::from_reason(e.to_string()))?;
+    let pool =
+        mlx_paged_attn::LayerKVPool::new_with_layout(cfg, initial, max, dtype, page_layout(config))
+            .map_err(|e| Error::from_reason(e.to_string()))?;
     PagedKVCacheAdapter::new(allocator, Arc::new(pool), 32).map_err(Error::from_reason)
 }
 
@@ -136,6 +152,7 @@ pub(super) fn write_rows(
 /// GPU gather from the native paged layout, without materializing the full
 /// sequence or reading its K/V through CPU memory. Only integer addresses
 /// cross the host boundary. Selected rows are ordered by logical position.
+/// An int8 pool comes back as BF16 rows (`dequantize_kv_rows` bits).
 pub fn gather_selected(
     adapter: &PagedKVCacheAdapter,
     layer: u32,
@@ -143,11 +160,6 @@ pub fn gather_selected(
     heads: usize,
     dim: usize,
 ) -> Result<(MxArray, MxArray)> {
-    if adapter.cache_dtype() == mlx_paged_attn::metal::MetalDtype::Int8 {
-        return Err(Error::from_reason(
-            "Qwen4 gather_selected: the qwen4 page gathers read x = 8 bf16 pages; an int8 pool is refused",
-        ));
-    }
     let table = adapter
         .block_table()
         .ok_or_else(|| Error::from_reason("Qwen4 missing page table"))?;
@@ -167,12 +179,17 @@ pub fn gather_selected(
     let v = adapter
         .value_pool_array(layer)
         .map_err(Error::from_reason)?;
+    let (ks, vs) = adapter
+        .scale_pool_arrays(layer)
+        .map_err(Error::from_reason)?;
     let mut ko = std::ptr::null_mut();
     let mut vo = std::ptr::null_mut();
     let ok = unsafe {
         mlx_sys::mlx_qwen4_gather_pages(
             k.as_raw_ptr(),
             v.as_raw_ptr(),
+            ks.as_raw_ptr(),
+            vs.as_raw_ptr(),
             slots.as_raw_ptr(),
             heads as i32,
             dim as i32,
@@ -388,9 +405,7 @@ impl Inner {
         super::memory::PoolCharge {
             total_blocks,
             max_blocks: u64::from(telemetry.max_total_blocks),
-            allocated_blocks: u64::from(telemetry.allocated_blocks),
             physical_block_bytes: physical,
-            index_block_bytes: super::load_plan::index_block_bytes(c),
             growth_copy_bytes: total_blocks.saturating_mul(physical)
                 / (super::load_plan::full_attention_layers(c) as u64).max(1),
         }
@@ -460,10 +475,7 @@ impl HybridSchedulerBackend for Inner {
     }
     fn reserve_scheduled_speculation(&mut self, seq: SeqId, queries: usize) -> Result<bool> {
         self.activate_paged_seq(seq)?;
-        let window = super::load_plan::mtp_window(&self.decoder.config, &self.memory_plan)
-            .map_or(self.decoder.context_window, |window| window as usize)
-            .min(self.context_cap() as usize);
-        if self.decoder.history.len() + queries > window {
+        if self.decoder.history.len() + queries > self.decoder.context_window {
             return Ok(false);
         }
         Ok(self
@@ -527,16 +539,9 @@ impl HybridSchedulerBackend for Inner {
     fn scheduler_books_on_demand(&self) -> bool {
         true
     }
-    fn planned_turn_window(&self, speculative: bool) -> Option<u32> {
+    fn planned_turn_window(&self, _speculative: bool) -> Option<u32> {
         let pool = self.memory_plan.pool.as_ref()?;
-        Some(
-            if speculative {
-                super::load_plan::mtp_window(&self.decoder.config, &self.memory_plan)?
-            } else {
-                pool.lane.window.maximum()
-            }
-            .min(self.context_cap()),
-        )
+        Some(pool.lane.window.maximum().min(self.context_cap()))
     }
     fn scheduler_whole_prompt_prefill(&self, prompt_tokens: u32, cached_prefix: u32) -> bool {
         self.media_prefill.is_none()
@@ -750,6 +755,7 @@ impl HybridSchedulerBackend for Inner {
 
 /// Sparse logical indices stay on GPU. One gather combines prior pages and
 /// the uncommitted current chunk without a CPU readback or split/concatenation.
+/// Int8 pool rows come back as BF16 values (`dequantize_kv_rows` bits).
 pub(super) fn gather_window(
     adapter: &PagedKVCacheAdapter,
     layer: u32,
@@ -758,11 +764,6 @@ pub(super) fn gather_window(
     values: &MxArray,
     base: usize,
 ) -> Result<(MxArray, MxArray)> {
-    if adapter.cache_dtype() == mlx_paged_attn::metal::MetalDtype::Int8 {
-        return Err(Error::from_reason(
-            "Qwen4 gather_window: the qwen4 page gathers read x = 8 bf16 pages; an int8 pool is refused",
-        ));
-    }
     let table = adapter
         .block_table()
         .ok_or_else(|| Error::from_reason("Qwen4 missing page table"))?;
@@ -777,11 +778,16 @@ pub(super) fn gather_window(
     let vp = adapter
         .value_pool_array(layer)
         .map_err(Error::from_reason)?;
+    let (ks, vs) = adapter
+        .scale_pool_arrays(layer)
+        .map_err(Error::from_reason)?;
     let (mut k, mut v) = (std::ptr::null_mut(), std::ptr::null_mut());
     let ok = unsafe {
         mlx_sys::mlx_qwen4_gather_window(
             kp.as_raw_ptr(),
             vp.as_raw_ptr(),
+            ks.as_raw_ptr(),
+            vs.as_raw_ptr(),
             blocks.as_raw_ptr(),
             tokens.as_raw_ptr(),
             keys.as_raw_ptr(),

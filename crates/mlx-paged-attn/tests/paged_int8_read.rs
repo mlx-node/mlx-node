@@ -326,6 +326,7 @@ fn filled(c: usize, d: usize, bs: usize, seed: u64) -> Option<Filled> {
             kv_heads() as i32,
             d as i32,
             3,
+            false,
             k_out,
             v_out,
             ks_out,

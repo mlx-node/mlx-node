@@ -286,6 +286,74 @@ class KvStoreWindowTail final : public fast::Custom {
   }
 };
 
+// The pooled index keys of complete blocks into a page pool's index plane
+// (Splash `block_indexer_pool` through `indexer_index_keys`): row r goes to
+// plane row `slots[r]` of the `[blocks * index_rows, dim]` bf16 plane, in
+// place. Inputs: plane, rows `[n, dim]`, int32 slots `[n]`. The output
+// aliases the plane.
+class PagedIndexStore final : public fast::Custom {
+ public:
+  explicit PagedIndexStore(Stream stream)
+      : Custom(stream, [](std::vector<array>) -> std::vector<array> {
+          throw std::runtime_error("PagedIndexStore has no fallback");
+        }) {}
+  DEFINE_NAME(PagedIndexStore)
+  bool is_equivalent(const Primitive&) const override { return true; }
+  std::vector<Shape> output_shapes(const std::vector<array>& in) override {
+    return {in[0].shape()};
+  }
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("PagedIndexStore requires Metal");
+  }
+  void eval_gpu(const std::vector<array>& in, std::vector<array>& out) override {
+    const auto& plane = in[0];
+    const auto& rows = in[1];
+    const auto& slots = in[2];
+    const int64_t capacity = plane.size() / rows.shape(1);
+    const int32_t* ids = slots.data<int32_t>();
+    for (size_t i = 0; i < slots.size(); ++i) {
+      if (ids[i] < 0 || ids[i] >= capacity) {
+        throw std::invalid_argument(
+            "PagedIndexStore: an index slot lies outside the plane");
+      }
+    }
+    out[0].copy_shared_buffer(plane);
+    auto& device = metal::device(stream().device);
+    auto* library = device.get_library("mlx_node_paged_index_store", [] {
+      return std::string(R"(
+#include <metal_stdlib>
+using namespace metal;
+[[kernel]] void mlx_node_paged_index_store(
+    device ushort* plane [[buffer(0)]],
+    const device ushort* rows [[buffer(1)]],
+    const device int* slots [[buffer(2)]],
+    constant uint& dim [[buffer(3)]],
+    constant uint& count [[buffer(4)]],
+    uint i [[thread_position_in_grid]]) {
+  if (i >= count * dim) return;
+  plane[ulong(slots[i / dim]) * dim + i % dim] = rows[i];
+}
+)");
+    });
+    auto& encoder = metal::get_command_encoder(stream());
+    encoder.set_compute_pipeline_state(
+        device.get_kernel("mlx_node_paged_index_store", library));
+    encoder.set_output_array(out[0], 0);
+    encoder.set_input_array(rows, 1);
+    encoder.set_input_array(slots, 2);
+    const uint32_t dim = rows.shape(1);
+    const uint32_t count = rows.shape(0);
+    encoder.set_bytes(dim, 3);
+    encoder.set_bytes(count, 4);
+    encoder.dispatch_threads(MTL::Size(size_t(dim) * count, 1, 1),
+                             MTL::Size(256, 1, 1));
+  }
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override {
+    throw std::runtime_error("PagedIndexStore is inference-only");
+  }
+};
+
 void expect(bool ok, const char* what) {
   if (!ok) {
     throw std::invalid_argument(std::string("mlx_kv_store_rows: ") + what);
@@ -416,6 +484,45 @@ extern "C" bool mlx_kv_store_window_tail(mlx_array* const* args, mlx_array** out
   }
 #else
   (void)args;
+  return false;
+#endif
+}
+
+// Store `rows` (bf16 `[n, dim]`) into the index plane `plane` (bf16, its
+// last axis `dim`) at plane rows `slots` (int32 `[n]`), in place. `out`
+// receives the plane handle to adopt (same buffer). False (message on
+// stderr) without Metal or on a contract violation.
+extern "C" bool mlx_paged_index_store(mlx_array* plane, mlx_array* rows,
+                                      mlx_array* slots, mlx_array** out) {
+  if (out) *out = nullptr;
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!plane || !rows || !slots || !out) {
+      throw std::invalid_argument("null argument");
+    }
+    const auto& p = *reinterpret_cast<array*>(plane);
+    const auto r = contiguous(*reinterpret_cast<array*>(rows));
+    const auto& s = *reinterpret_cast<array*>(slots);
+    if (!metal::is_available() || !(default_device() == Device::gpu) ||
+        p.dtype() != bfloat16 || r.dtype() != bfloat16 || r.ndim() != 2 ||
+        p.ndim() < 2 || p.shape(p.ndim() - 1) != r.shape(1) || s.ndim() != 1 ||
+        s.dtype() != int32 || s.shape(0) != r.shape(0) ||
+        !p.flags().row_contiguous || p.offset() != 0) {
+      throw std::invalid_argument(
+          "a bf16 plane, bf16 [n, dim] rows and int32 [n] slots");
+    }
+    auto outputs = array::make_arrays(
+        {p.shape()}, {bfloat16},
+        std::make_shared<PagedIndexStore>(default_stream(Device::gpu)),
+        {p, r, s});
+    *out = reinterpret_cast<mlx_array*>(new array(std::move(outputs[0])));
+    return true;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "mlx_paged_index_store: %s\n", e.what());
+    return false;
+  }
+#else
+  (void)plane; (void)rows; (void)slots;
   return false;
 #endif
 }

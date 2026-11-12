@@ -1108,6 +1108,9 @@ struct NativePoolArrays {
     value: MxArray,
     k_scale: MxArray,
     v_scale: MxArray,
+    /// The index plane of a pool that has one, as the last index store
+    /// returned it.
+    index: Option<MxArray>,
     dirty: bool,
     /// [`LayerKVPool::generation`] the views were built against. A grow
     /// swaps the pool's Metal buffers, so any consumer must rebuild when
@@ -3797,6 +3800,19 @@ impl PagedKVCacheAdapter {
         Ok((key, value))
     }
 
+    /// The index plane of `layer_idx` as a fresh bf16 view, `None` for a
+    /// pool without one.
+    #[cfg(target_os = "macos")]
+    fn raw_index_array(&self, layer_idx: u32) -> Result<Option<MxArray>, String> {
+        if self.layer_kv_pool.layout().index_rows == 0 {
+            return Ok(None);
+        }
+        let raw = self.layer_kv_pool.index_array_raw(layer_idx)?;
+        MxArray::from_handle(raw, "index_pool_array")
+            .map(Some)
+            .map_err(|e| format!("index_pool_array: {e}"))
+    }
+
     #[cfg(target_os = "macos")]
     fn native_pool_arrays_for_layer(&mut self, layer_idx: u32) -> Result<PoolLayerArrays, String> {
         let idx = layer_idx as usize;
@@ -3817,11 +3833,13 @@ impl PagedKVCacheAdapter {
             let key = self.raw_key_pool_array(layer_idx)?;
             let value = self.raw_value_pool_array(layer_idx)?;
             let (k_scale, v_scale) = self.raw_scale_arrays(layer_idx)?;
+            let index = self.raw_index_array(layer_idx)?;
             self.native_pool_arrays[idx] = Some(NativePoolArrays {
                 key,
                 value,
                 k_scale,
                 v_scale,
+                index,
                 dirty: false,
                 generation: pool_generation,
             });
@@ -3853,13 +3871,19 @@ impl PagedKVCacheAdapter {
                 self.native_pool_arrays.len()
             ));
         }
+        let generation = self.layer_kv_pool.generation();
+        let index = match self.native_pool_arrays[idx].take() {
+            Some(state) if state.generation == generation => state.index,
+            _ => self.raw_index_array(layer_idx)?,
+        };
         self.native_pool_arrays[idx] = Some(NativePoolArrays {
             key: arrays.key,
             value: arrays.value,
             k_scale: arrays.k_scale,
             v_scale: arrays.v_scale,
+            index,
             dirty: true,
-            generation: self.layer_kv_pool.generation(),
+            generation,
         });
         Ok(())
     }
@@ -3996,6 +4020,7 @@ impl PagedKVCacheAdapter {
                 arrays.push(state.value.clone());
                 arrays.push(state.k_scale.clone());
                 arrays.push(state.v_scale.clone());
+                arrays.extend(state.index.clone());
             }
         }
         if arrays.is_empty() {
@@ -4051,12 +4076,15 @@ impl PagedKVCacheAdapter {
         if !state.dirty {
             return Ok(());
         }
-        let pending = [
+        let pending: Vec<MxArray> = [
             state.key.clone(),
             state.value.clone(),
             state.k_scale.clone(),
             state.v_scale.clone(),
-        ];
+        ]
+        .into_iter()
+        .chain(state.index.clone())
+        .collect();
         let trace_enabled = inference_trace_enabled();
         let trace_start = trace_enabled.then(Instant::now);
         if trace_enabled {
@@ -4399,6 +4427,7 @@ impl PagedKVCacheAdapter {
                 self.layer_kv_pool.config().num_kv_heads as i32,
                 self.layer_kv_pool.config().head_size as i32,
                 kv_dtype_raw,
+                self.layer_kv_pool.layout().values_token_major,
                 &mut out_k_pool,
                 &mut out_v_pool,
                 &mut out_k_scale,
@@ -4593,6 +4622,7 @@ impl PagedKVCacheAdapter {
                 self.layer_kv_pool.config().num_kv_heads as i32,
                 self.layer_kv_pool.config().head_size as i32,
                 self.kv_dtype_raw()?,
+                self.layer_kv_pool.layout().values_token_major,
                 &mut out_k_pool,
                 &mut out_v_pool,
                 &mut out_k_scale,
@@ -5904,6 +5934,13 @@ impl PagedKVCacheAdapter {
     ) -> Result<(MxArray, MxArray), String> {
         if first_token >= total_context {
             return Err("dense K/V range must contain at least one token".to_string());
+        }
+        if self.layer_kv_pool.layout().values_token_major {
+            return Err(
+                "gather_kv_for_prefill_sdpa: a token-major page is read by its model's own \
+                 page gathers"
+                    .to_string(),
+            );
         }
         if (layer_idx as usize) >= self.layer_kv_pool.num_layers() {
             return Err(format!(
@@ -7795,16 +7832,9 @@ impl PagedKVCacheAdapter {
         .map_err(|error| error.to_string())
     }
 
+    /// Bytes of one physical block over every layer and plane.
     pub(crate) fn bytes_per_block(&self) -> Result<u64, String> {
-        let config = self.layer_kv_pool.config();
-        mlx_paged_attn::profile::bytes_per_block(
-            self.layer_kv_pool.num_layers() as u32,
-            config.num_kv_heads,
-            config.head_size,
-            config.block_size,
-            self.layer_kv_pool.cache_dtype(),
-        )
-        .map_err(|error| error.to_string())
+        self.layer_kv_pool.bytes_per_block()
     }
 
     /// Number of physical full-attention K/V layers in the authoritative pool.
@@ -8019,6 +8049,11 @@ impl PagedKVCacheAdapter {
         self.layer_kv_pool.cache_dtype()
     }
 
+    #[cfg(test)]
+    pub(crate) fn page_layout(&self) -> mlx_paged_attn::PageLayout {
+        self.layer_kv_pool.layout()
+    }
+
     pub fn current_token_count(&self) -> u32 {
         self.request_tokens.len() as u32
     }
@@ -8229,6 +8264,148 @@ impl PagedKVCacheAdapter {
             return Ok(state.value.clone());
         }
         self.raw_value_pool_array(layer_idx)
+    }
+
+    /// The K and V scale planes of `layer_idx` for a `&self` reader, like
+    /// [`Self::key_pool_array`]: the last native write's outputs while the
+    /// pool generation matches, else fresh views; the unit `[1]` array for a
+    /// pool without scale planes.
+    #[cfg(target_os = "macos")]
+    pub fn scale_pool_arrays(&self, layer_idx: u32) -> Result<(MxArray, MxArray), String> {
+        if self.layer_kv_pool.cache_dtype().scale_bytes() != 0
+            && let Some(Some(state)) = self.native_pool_arrays.get(layer_idx as usize)
+            && state.generation == self.layer_kv_pool.generation()
+        {
+            return Ok((state.k_scale.clone(), state.v_scale.clone()));
+        }
+        self.raw_scale_arrays(layer_idx)
+    }
+
+    /// The index-plane row of complete index block `block` of the active
+    /// request (Splash `indexer_index_keys`: the block's page, then its
+    /// place in the page).
+    #[cfg(target_os = "macos")]
+    fn index_plane_row(&self, block: u32) -> Result<i32, String> {
+        let rows = self.layer_kv_pool.layout().index_rows;
+        if rows == 0 {
+            return Err("the pool has no index plane".to_string());
+        }
+        let table = self
+            .block_table
+            .as_ref()
+            .ok_or_else(|| "index plane access with no active request".to_string())?;
+        let token = block
+            .checked_mul(self.block_size / rows)
+            .ok_or_else(|| "index block position overflows u32".to_string())?;
+        let slot = table
+            .absolute_slot_index(token)
+            .ok_or_else(|| format!("index block {block} has no page"))?;
+        let page = slot / i64::from(self.block_size);
+        i32::try_from(page * i64::from(rows) + i64::from(block % rows))
+            .map_err(|_| "index plane row overflows i32".to_string())
+    }
+
+    /// Store `rows` (`[n, index_dimension]`), the pooled keys of complete
+    /// index blocks `first_block..first_block + n` of the active request,
+    /// into `layer_idx`'s index plane (Splash `block_indexer_pool`). Returns
+    /// the plane as written, lazily; readers of this adapter see the write.
+    #[cfg(target_os = "macos")]
+    pub fn store_index_rows(
+        &mut self,
+        layer_idx: u32,
+        rows: &MxArray,
+        first_block: u32,
+    ) -> Result<MxArray, String> {
+        let count = rows.shape_at(0).map_err(|e| e.to_string())? as u32;
+        let slots = (first_block..first_block + count)
+            .map(|block| self.index_plane_row(block))
+            .collect::<Result<Vec<_>, _>>()?;
+        let slots = MxArray::from_int32(&slots, &[i64::from(count)]).map_err(|e| e.to_string())?;
+        let rows = rows
+            .astype(crate::array::DType::BFloat16)
+            .map_err(|e| e.to_string())?;
+        self.native_pool_arrays_for_layer(layer_idx)?;
+        let idx = layer_idx as usize;
+        let plane = self.native_pool_arrays[idx]
+            .as_ref()
+            .and_then(|state| state.index.clone())
+            .ok_or_else(|| "the pool has no index plane".to_string())?;
+        let mut out = std::ptr::null_mut();
+        // SAFETY: every input is a live MLX array handle; `out` is written
+        // only on success and is then owned here.
+        let ok = unsafe {
+            mlx_sys::mlx_paged_index_store(
+                plane.as_raw_ptr(),
+                rows.as_raw_ptr(),
+                slots.as_raw_ptr(),
+                &mut out,
+            )
+        };
+        if !ok || out.is_null() {
+            return Err(format!("index plane store failed (layer {layer_idx})"));
+        }
+        let written = MxArray::from_handle(out, "paged_index_store").map_err(|e| e.to_string())?;
+        if let Some(state) = self.native_pool_arrays[idx].as_mut() {
+            state.index = Some(written.clone());
+            state.dirty = true;
+        }
+        Ok(written)
+    }
+
+    /// The pooled keys of the active request's first `blocks` complete index
+    /// blocks of `layer_idx`, `[blocks, index_dimension]` bf16, from the
+    /// index plane as last written.
+    #[cfg(target_os = "macos")]
+    pub fn index_rows(&self, layer_idx: u32, blocks: u32) -> Result<MxArray, String> {
+        let layout = self.layer_kv_pool.layout();
+        let plane = match self.native_pool_arrays.get(layer_idx as usize) {
+            Some(Some(state)) if state.generation == self.layer_kv_pool.generation() => {
+                state.index.clone()
+            }
+            _ => self.raw_index_array(layer_idx)?,
+        }
+        .ok_or_else(|| "the pool has no index plane".to_string())?;
+        let pages = blocks.div_ceil(layout.index_rows);
+        let ids = (0..pages)
+            .map(|page| {
+                self.index_plane_row(page * layout.index_rows)
+                    .map(|row| row / layout.index_rows as i32)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let ids = MxArray::from_int32(&ids, &[i64::from(pages)]).map_err(|e| e.to_string())?;
+        plane
+            .take(&ids, 0)
+            .and_then(|rows| {
+                rows.reshape(&[
+                    i64::from(pages * layout.index_rows),
+                    i64::from(layout.index_dimension),
+                ])
+            })
+            .and_then(|rows| rows.slice_axis(0, 0, i64::from(blocks)))
+            .map_err(|e| e.to_string())
+    }
+
+    /// Non-macOS stub for `store_index_rows`.
+    #[cfg(not(target_os = "macos"))]
+    pub fn store_index_rows(
+        &mut self,
+        _layer_idx: u32,
+        _rows: &MxArray,
+        _first_block: u32,
+    ) -> Result<MxArray, String> {
+        Err("store_index_rows is only supported on macOS (Metal backend)".to_string())
+    }
+
+    /// Non-macOS stub for `index_rows`.
+    #[cfg(not(target_os = "macos"))]
+    pub fn index_rows(&self, _layer_idx: u32, _blocks: u32) -> Result<MxArray, String> {
+        Err("index_rows is only supported on macOS (Metal backend)".to_string())
+    }
+
+    /// Non-macOS stub for `scale_pool_arrays`.
+    #[cfg(not(target_os = "macos"))]
+    pub fn scale_pool_arrays(&self, _layer_idx: u32) -> Result<(MxArray, MxArray), String> {
+        Err("scale_pool_arrays is only supported on macOS (Metal backend)".to_string())
     }
 
     /// Non-macOS stub for `key_pool_array`.
@@ -18436,6 +18613,7 @@ mod tests {
                 v_scale: value.clone(),
                 key,
                 value,
+                index: None,
                 dirty,
                 generation: stale_generation,
             }));

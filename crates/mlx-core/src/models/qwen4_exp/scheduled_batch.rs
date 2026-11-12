@@ -37,33 +37,10 @@ impl Decoder {
         let mut cache = std::mem::take(&mut self.caches[layer]);
         let output = self.attention_block(x, token, layer, &mut cache)?;
         if !self.config.linear(layer) {
-            let index = (0..layer).filter(|&i| !self.config.linear(i)).count() as u32;
-            let shape = [
-                1,
-                self.config.num_key_value_heads as i64,
-                self.config.head_dim as i64,
-            ];
-            let k = cache
-                .keys
-                .take()
-                .ok_or_else(|| Error::from_reason("Qwen4 scheduled attention produced no keys"))?
-                .transpose(Some(&[0, 2, 1, 3]))?
-                .reshape(&shape)?
-                .astype(DType::BFloat16)?;
-            let v = cache
-                .values
-                .take()
-                .ok_or_else(|| Error::from_reason("Qwen4 scheduled attention produced no values"))?
-                .transpose(Some(&[0, 2, 1, 3]))?
-                .reshape(&shape)?
-                .astype(DType::BFloat16)?;
-            let adapter = self.paged.as_mut().ok_or_else(|| {
-                Error::from_reason("Qwen4 scheduled attention has no paged cache")
-            })?;
-            let first = self.history.len() as u32;
-            super::super::paged::write_rows(adapter, index, &k, &v, first, first)?;
-            // Owners share the pool. Complete the write before activating another.
-            adapter
+            // Owners share the pool. Complete the row's write before activating another.
+            self.paged
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("Qwen4 scheduled attention has no paged cache"))?
                 .eval_pending_pool_writes()
                 .map_err(Error::from_reason)?;
         }

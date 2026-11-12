@@ -358,7 +358,7 @@ the embedded directory.
 - **Memory** — the draft loads alongside the target (~6.9 GB extra for the bf16 DSpark 12B draft; ~0.8 GB for an assistant). Both variants run on the flat KV-cache path; a target config that explicitly enables `use_block_paged_cache` is rejected at load.
 - `draftModelPath` is supported by gemma4, qwen3_5 and qwen3_5_moe; other families reject it.
 
-### Int8 K/V cache (`kvFormat`, qwen3_5 and qwen3_5_moe)
+### Int8 K/V cache (`kvFormat`, qwen3_5, qwen3_5_moe and qwen4_exp)
 
 For qwen3_5 and qwen3_5_moe by default on Metal with 256-wide heads, GQA up
 to 8 and BF16 compute (`kvFormat: 'bf16'` opts out; `'int8'` forces it), the loader stores the flat full-attention K/V
@@ -383,7 +383,12 @@ BF16 queries. The option sets both the block-paged pool and the flat
 `contextLimits().kvFormat` names the format of the pool lane
 (`effectiveWindowTokens`) and `.speculativeKvFormat` the DFlash2 lane's
 (`speculativeWindowTokens`). `mlx serve --kv-format` and `mlx agent
---kv-format` set it for served qwen3_5 / qwen3_5_moe loads. `mlx eval score
+--kv-format` set it for served qwen3_5 / qwen3_5_moe / qwen4_exp loads.
+For qwen4_exp (Flash Next) unset is int8 where the int8 page kernels serve
+the head (128 or 256, every released checkpoint), else bf16; the option sets
+its one block-paged pool, whose token-major pages hold the indexer's pooled
+keys too, and every turn (AR, image, MTP) takes the one window
+([docs/qwen38-flash-next.md](qwen38-flash-next.md)). `mlx eval score
 --kv-format int8` scores the int8 cache against the same teacher cache and
 the report names the format the load resolved.
 

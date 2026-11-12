@@ -253,25 +253,32 @@ const std::string& memoized_kernel_name(
 
 const std::string& reshape_and_cache_kernel_name(
     KvDtype input_dtype,
-    KvDtype cache_dtype) {
+    KvDtype cache_dtype,
+    bool values_token_major) {
   static std::mutex mutex;
-  static std::map<std::tuple<KvDtype, KvDtype>, std::string> cache;
+  static std::map<std::tuple<KvDtype, KvDtype, bool>, std::string> cache;
   return memoized_kernel_name(
-      cache, mutex, std::make_tuple(input_dtype, cache_dtype), [&] {
+      cache,
+      mutex,
+      std::make_tuple(input_dtype, cache_dtype, values_token_major),
+      [&] {
     std::ostringstream os;
     os << "reshape_and_cache_kv_" << dtype_string(input_dtype) << "_cache_"
-       << dtype_string(cache_dtype);
+       << dtype_string(cache_dtype) << (values_token_major ? "_vt" : "");
     return os.str();
   });
 }
 
-const std::string& reshape_and_cache_int8_kernel_name(int head_size) {
+const std::string& reshape_and_cache_int8_kernel_name(
+    int head_size,
+    bool values_token_major) {
   static std::mutex mutex;
-  static std::map<int, std::string> cache;
-  return memoized_kernel_name(cache, mutex, head_size, [&] {
+  static std::map<std::tuple<int, bool>, std::string> cache;
+  return memoized_kernel_name(
+      cache, mutex, std::make_tuple(head_size, values_token_major), [&] {
     std::ostringstream os;
     os << "reshape_and_cache_int8_kv_" << dtype_string(KvDtype::Bf16) << "_hd"
-       << head_size;
+       << head_size << (values_token_major ? "_vt" : "");
     return os.str();
   });
 }
@@ -1067,7 +1074,8 @@ void dispatch_reshape_and_cache(
     int head_size,
     int block_size,
     int x_pack,
-    KvDtype kv_dtype) {
+    KvDtype kv_dtype,
+    bool values_token_major) {
   if (num_tokens == 0) {
     // No-op write — avoid encoding a zero-grid dispatch which Metal
     // would refuse anyway.
@@ -1076,7 +1084,9 @@ void dispatch_reshape_and_cache(
 
   if (kv_dtype == KvDtype::Int8) {
     MTL::ComputePipelineState* pipeline =
-        load_pipeline(device, reshape_and_cache_int8_kernel_name(head_size));
+        load_pipeline(
+            device,
+            reshape_and_cache_int8_kernel_name(head_size, values_token_major));
     encoder.set_compute_pipeline_state(pipeline);
     const int32_t row_stride = num_kv_heads * head_size;
     encoder.set_input_array(new_k, 0);
@@ -1104,7 +1114,8 @@ void dispatch_reshape_and_cache(
   const KvDtype input_dtype = io_dtype_for(cache_dtype);
 
   const std::string& kernel_name =
-      reshape_and_cache_kernel_name(input_dtype, cache_dtype);
+      reshape_and_cache_kernel_name(
+          input_dtype, cache_dtype, values_token_major);
   MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
   encoder.set_compute_pipeline_state(pipeline);
 

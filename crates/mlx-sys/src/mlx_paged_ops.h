@@ -31,6 +31,8 @@ enum class KvDtype : uint8_t {
 /// Inputs (in order):
 ///   0: `k_pool`    — `[num_blocks, num_kv_heads, head_size/x, block_size, x]`
 ///   1: `v_pool`    — `[num_blocks, num_kv_heads, head_size, block_size]`
+///                    (`values_token_major`: both `[num_blocks, num_kv_heads,
+///                    block_size, head_size]`, Splash `splash_kv_key_element`)
 ///   2: `new_k`     — `[num_tokens, num_kv_heads, head_size]`
 ///   3: `new_v`     — `[num_tokens, num_kv_heads, head_size]`
 ///   4: `slot_mapping` — `[num_tokens]` of int64
@@ -58,13 +60,15 @@ class PagedKVWrite : public Custom {
       int num_kv_heads,
       int head_size,
       int x_pack,
-      KvDtype kv_dtype)
+      KvDtype kv_dtype,
+      bool values_token_major = false)
       : Custom(stream, std::move(fallback)),
         block_size_(block_size),
         num_kv_heads_(num_kv_heads),
         head_size_(head_size),
         x_pack_(x_pack),
-        kv_dtype_(kv_dtype) {}
+        kv_dtype_(kv_dtype),
+        values_token_major_(values_token_major) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {
@@ -96,7 +100,8 @@ class PagedKVWrite : public Custom {
         num_kv_heads_,
         head_size_,
         x_pack_,
-        static_cast<uint8_t>(kv_dtype_));
+        static_cast<uint8_t>(kv_dtype_),
+        values_token_major_);
   }
 
  private:
@@ -105,6 +110,7 @@ class PagedKVWrite : public Custom {
   int head_size_;
   int x_pack_;
   KvDtype kv_dtype_;
+  bool values_token_major_;
 };
 
 /// `PagedAttention` computes attention with K/V gathered from
@@ -245,7 +251,8 @@ std::array<array, 4> paged_kv_write(
     int head_size,
     int x_pack,
     KvDtype kv_dtype,
-    StreamOrDevice s = {});
+    StreamOrDevice s = {},
+    bool values_token_major = false);
 
 /// Emit a `PagedAttention` primitive. Returns the attention output.
 /// `softcap = 0.0` disables soft-capping (translated to the kernel's

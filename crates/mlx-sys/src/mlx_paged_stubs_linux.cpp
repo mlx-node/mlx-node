@@ -41,7 +41,8 @@ std::array<array, 4> paged_kv_write(
     int,
     int,
     KvDtype,
-    StreamOrDevice) {
+    StreamOrDevice,
+    bool) {
   throw std::runtime_error(
       "paged_kv_write: block-paged KV write requires the Metal backend; "
       "the compiled-paged forward path is unavailable on this host (expected "
@@ -181,6 +182,7 @@ bool mlx_paged_kv_write_forward(
     int,
     int,
     uint8_t,
+    bool,
     mlx_array** out_k_pool,
     mlx_array** out_v_pool,
     mlx_array** out_k_scale,

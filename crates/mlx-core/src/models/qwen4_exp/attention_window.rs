@@ -169,8 +169,8 @@ impl Decoder {
                     (0..blocks).map(|b| base - tail + b * ratio),
                 )?
                 .reshape(&[blocks as i64, id])?;
-            let keys = cache.append_index_keys(rotated)?;
-            self.submit_state(&[keys], "qwen4::window::index_keys")?;
+            let keys = self.append_index_blocks(i, cache, rotated)?;
+            self.submit_state(&[&keys], "qwen4::window::index_keys")?;
         }
         cache.index_tail = (used..tail + t)
             .map(|r| raw.slice_axis(0, r as i64, r as i64 + 1))
@@ -240,9 +240,8 @@ impl Decoder {
         t: usize,
     ) -> Result<(MxArray, MxArray)> {
         let c = self.config.clone();
-        let index_keys = cache
-            .index_keys
-            .as_ref()
+        let index_keys = self
+            .index_blocks(i, cache)?
             .ok_or_else(|| Error::from_reason("Qwen4 sparse window has no indexer blocks"))?;
         let query = self
             .norm(
@@ -261,7 +260,7 @@ impl Decoder {
         let query = self.rope_window(&query, base, t)?;
         math::qsa_select(
             &query,
-            index_keys,
+            &index_keys,
             base,
             c.indexer_compress_ratio,
             c.indexer_budget / c.indexer_compress_ratio,

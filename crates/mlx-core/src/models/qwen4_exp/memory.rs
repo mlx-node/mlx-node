@@ -619,7 +619,8 @@ const STATE_ACTIVATION_BYTES: usize = 2;
 /// `cellBytes` without its 16 KiB alignment): per linear layer the
 /// convolution history of `k - 1` qkv rows and the F32 recurrent matrices,
 /// the PLE history of `(k - 1) * ngram` rows, and the indexer keys that have
-/// not filled a block yet. Pooled index keys are priced in the KV page.
+/// not filled a block yet (Splash `indexerPendingBytes`). Pooled index keys
+/// live in the KV page.
 pub(crate) fn row_state_parts(c: &super::config::Config) -> [u64; 4] {
     let linear = (0..c.num_hidden_layers).filter(|&i| c.linear(i)).count();
     let full = c.num_hidden_layers - linear;
@@ -676,15 +677,13 @@ pub(super) fn draft_owner_bytes(
 }
 
 /// The pool's share of the dynamic budget the scheduled state competes
-/// with: every physical block the pool holds (it never shrinks), the index
-/// keys of the blocks rows use, and, while the pool may still grow, the
-/// one-layer copy a growth makes of it.
+/// with: every physical block the pool holds (it never shrinks; a block is
+/// the whole priced page, index keys included), and, while the pool may
+/// still grow, the one-layer copy a growth makes of it.
 pub(super) struct PoolCharge {
     pub total_blocks: u64,
     pub max_blocks: u64,
-    pub allocated_blocks: u64,
     pub physical_block_bytes: u64,
-    pub index_block_bytes: u64,
     pub growth_copy_bytes: u64,
 }
 
@@ -697,7 +696,6 @@ impl PoolCharge {
         };
         self.total_blocks
             .saturating_mul(self.physical_block_bytes)
-            .saturating_add(self.allocated_blocks.saturating_mul(self.index_block_bytes))
             .saturating_add(growth)
     }
 }

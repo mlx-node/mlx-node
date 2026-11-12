@@ -422,8 +422,6 @@ impl PoolInput<'_> {
             runway_blocks: self.runway_blocks.min(max_blocks),
             bytes_per_block: self.bytes_per_block,
             lane,
-            layout: self.shape.layout,
-            lane_in_pool: self.lane_in_pool,
         }
     }
 }
@@ -499,8 +497,6 @@ pub(crate) struct PoolPlan {
     pub runway_blocks: u32,
     pub bytes_per_block: u64,
     pub lane: LanePlan,
-    layout: KvLayout,
-    lane_in_pool: bool,
 }
 
 impl PoolPlan {
@@ -514,22 +510,6 @@ impl PoolPlan {
     /// blocks, so a planned pool below it must still construct.
     pub(crate) fn config_mib(&self) -> u32 {
         self.max_mib().max(mlx_paged_attn::MIN_GPU_MEMORY_MB)
-    }
-
-    /// The longest pool window, at most the lane's, of a lane that also
-    /// holds `extra(W)` bytes of the pool for a `W`-token turn.
-    pub(crate) fn window_with(&self, extra: &dyn Fn(u32) -> u64) -> u32 {
-        let pool = u64::from(self.max_blocks) * self.bytes_per_block;
-        let lane = if self.lane_in_pool {
-            self.lane.lane_bytes
-        } else {
-            0
-        };
-        let fits = |window: u32| {
-            let kv = pool.saturating_sub(lane).saturating_sub(extra(window));
-            resident_tokens(&self.layout, kv, SPECULATIVE_SCRATCH_TOKENS) >= u64::from(window)
-        };
-        largest_window(self.lane.window.maximum(), fits)
     }
 }
 
@@ -1048,13 +1028,11 @@ impl MemoryPlan {
     }
 
     /// A plan whose pool of `max_blocks` blocks gives its lane of
-    /// `lane_bytes` a `resident`-token window in `layout`, for scheduler
-    /// tests.
+    /// `lane_bytes` a `resident`-token window, for scheduler tests.
     #[cfg(test)]
     pub(crate) fn with_pool_window(
         max_blocks: u32,
         bytes_per_block: u64,
-        layout: KvLayout,
         lane_bytes: u64,
         resident: u32,
     ) -> Self {
@@ -1064,8 +1042,6 @@ impl MemoryPlan {
                 runway_blocks: max_blocks,
                 bytes_per_block,
                 lane: Self::bare_lane(resident, lane_bytes, 0),
-                layout,
-                lane_in_pool: true,
             }),
             ..Self::bare()
         }

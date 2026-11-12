@@ -6969,17 +6969,9 @@ pub(crate) mod tests {
         };
         state.inner.config.n_mtp_layers = 1;
         state.inner.config.max_position_embeddings = 4_096;
-        let layout = crate::engine::memory_plan::KvLayout::of(
-            16,
-            4,
-            256,
-            crate::array::DType::BFloat16,
-            crate::transformer::KvFormat::Bf16,
-        );
         state.inner.memory_plan = Some(crate::engine::memory_plan::MemoryPlan::with_pool_window(
             64,
             2 << 20,
-            layout,
             0,
             2_041,
         ));

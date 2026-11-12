@@ -175,8 +175,9 @@ export interface InferenceHostOptions {
    */
   enginePolicy?: EnginePolicy;
   /**
-   * K/V format of the block-paged pool and the flat (DFlash2) cache for
-   * qwen3_5 / qwen3_5_moe loads; other families never see it.
+   * K/V format of the block-paged pool for qwen3_5 / qwen3_5_moe /
+   * qwen4_exp loads and of the flat (DFlash2) cache for qwen3_5 / MoE; other
+   * families never see it.
    * Omitted ⇒ the load default.
    */
   kvFormat?: 'int8' | 'bf16';
@@ -642,8 +643,8 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
 /**
  * The native load-free estimate of an entry's family: qwen4_exp has its own
  * memory plan (a streamed expert store), so the qwen3_5 estimator never prices
- * it. A qwen4_exp default turn is autoregressive (MTP is opt-in), so its
- * estimate is the AR window. qwen4_exp takes `maxMemoryBytes` and
+ * it. Every qwen4_exp turn (AR or MTP) takes its one window, which is the
+ * estimate. qwen4_exp takes `kvFormat`, `maxMemoryBytes` and
  * `maxContextTokens`.
  */
 export function nativeContextEstimate(
@@ -653,6 +654,7 @@ export function nativeContextEstimate(
   return async (path, modelType, options) => {
     if (modelType !== 'qwen4_exp') return qwen35(path, modelType, options);
     const qwen4Options = {
+      ...(options?.kvFormat !== undefined ? { kvFormat: options.kvFormat } : {}),
       ...(options?.maxMemoryBytes !== undefined ? { maxMemoryBytes: options.maxMemoryBytes } : {}),
       ...(options?.maxContextTokens !== undefined ? { maxContextTokens: options.maxContextTokens } : {}),
     };

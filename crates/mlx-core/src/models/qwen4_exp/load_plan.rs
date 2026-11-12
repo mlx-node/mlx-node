@@ -19,33 +19,50 @@ use crate::transformer::KvFormat;
 use super::config::Config;
 use super::memory::{draft_state_bytes, prefill_scratch, row_state_bytes};
 
-/// The Flash Next KV page (Splash `QwenHybridLayout::kvLayout`): bf16 K/V of
-/// the attention layers and the indexer's block keys beside them.
+/// The Flash Next KV page (Splash `QwenHybridLayout::kvLayout`): K/V of the
+/// attention layers in the load's format and the indexer's bf16 block keys
+/// beside them.
 pub(super) fn flash_next_layout(c: &Config) -> KvLayout {
     KvLayout::of(
         full_attention_layers(c),
         c.num_key_value_heads as i32,
         c.head_dim as i32,
         DType::BFloat16,
-        KvFormat::Bf16,
+        c.kv_format,
     )
     .with_index(c.indexer_head_dim as u64)
 }
 
-pub(super) fn full_attention_layers(c: &Config) -> usize {
-    (0..c.num_hidden_layers).filter(|&i| !c.linear(i)).count()
+/// The page format of a load: `requested` (`kvFormat`), else int8 where the
+/// int8 page store and dequantize serve the head (128 or 256 wide), else
+/// bf16. Splash `RuntimeResources::create` takes `kvFormat` (int8 by default)
+/// for every target and `storeSuffix` refuses a layout it has no kernel for.
+pub(super) fn resolve_kv_format(
+    label: &str,
+    requested: Option<&str>,
+    c: &Config,
+) -> Result<KvFormat> {
+    let served = matches!(c.head_dim, 128 | 256);
+    let Some(requested) = requested else {
+        return Ok(if served {
+            KvFormat::Int8
+        } else {
+            KvFormat::Bf16
+        });
+    };
+    let format = KvFormat::parse(Some(requested))
+        .map_err(|e| Error::from_reason(format!("{label}: {e}")))?;
+    if format == KvFormat::Int8 && !served {
+        return Err(Error::from_reason(format!(
+            "{label}: no int8 page kernels for head_dim {}; load with kvFormat 'bf16'",
+            c.head_dim
+        )));
+    }
+    Ok(format)
 }
 
-/// The index-key bytes of one pool block: kept per row beside the pool, and
-/// priced in the page.
-pub(super) fn index_block_bytes(c: &Config) -> u64 {
-    let layout = flash_next_layout(c);
-    layout.page_bytes()
-        - KvLayout {
-            index_dimension: 0,
-            ..layout
-        }
-        .page_bytes()
+pub(super) fn full_attention_layers(c: &Config) -> usize {
+    (0..c.num_hidden_layers).filter(|&i| !c.linear(i)).count()
 }
 
 /// One lane's transient for a `window`-token turn: one prefill chunk's
@@ -85,9 +102,13 @@ pub(super) fn check_context(
     }
 }
 
-/// The pool lane: one cell held beside the pool, priced pages from the
-/// runway, the served window.
-pub(super) fn pool_input<'a>(c: &Config, transient: &'a dyn Fn(u32) -> u64) -> PoolInput<'a> {
+/// The pool lane: one cell and `state` held beside the pool, priced pages
+/// from the runway, the served window.
+pub(super) fn pool_input<'a>(
+    c: &Config,
+    transient: &'a dyn Fn(u32) -> u64,
+    state: &'a dyn Fn(u32) -> u64,
+) -> PoolInput<'a> {
     let layout = flash_next_layout(c);
     PoolInput {
         shape: LaneShape {
@@ -102,8 +123,21 @@ pub(super) fn pool_input<'a>(c: &Config, transient: &'a dyn Fn(u32) -> u64) -> P
         runway_blocks: layout.runway_pages().min(u64::from(u32::MAX)) as u32,
         explicit_mib: None,
         lane_in_pool: false,
-        state: &|_| 0,
+        state,
         state_in_pool: false,
+    }
+}
+
+/// The lane's state besides the cell: with MTP weights, the MTP draft state
+/// of a `W`-token turn, which grows with `W`. The lane is one and charged
+/// once (Splash `evaluateEngineMemoryPlan` `availableForOneRequestKv`).
+pub(super) fn mtp_state(c: &Config, has_mtp: bool) -> impl Fn(u32) -> u64 + '_ {
+    move |window| {
+        if has_mtp {
+            draft_state_bytes(c, u64::from(window))
+        } else {
+            0
+        }
     }
 }
 
@@ -147,8 +181,8 @@ pub(super) struct StoreDecision {
 
 /// Splash `planStreamedMemory` for a target that cannot spill: the KV
 /// allowance of the requested context, else `min(trained,
-/// kResidentAllowanceTokens)`, on every lane the load serves (the AR lane,
-/// and the MTP lane with MTP weights) comes before the experts.
+/// kResidentAllowanceTokens)`, on the load's one lane (with MTP weights it
+/// holds the MTP draft state) comes before the experts.
 pub(super) fn plan_store(
     label: &str,
     c: &Config,
@@ -159,22 +193,12 @@ pub(super) fn plan_store(
     has_mtp: bool,
 ) -> Result<StoreDecision> {
     let transient = |window: u32| transient(c, window);
-    let pool = pool_input(c, &transient);
-    let draft = |window: u32| draft_state_bytes(c, u64::from(window));
-    let ar = |dynamic: u64| pool.plan_at(dynamic).lane.window.maximum();
-    let mtp = |dynamic: u64| pool.plan_at(dynamic).window_with(&draft);
-    let lanes: Vec<&dyn Fn(u64) -> u32> = if has_mtp { vec![&ar, &mtp] } else { vec![&ar] };
+    let state = mtp_state(c, has_mtp);
+    let pool = pool_input(c, &transient, &state);
+    let lane = |dynamic: u64| pool.plan_at(dynamic).lane.window.maximum();
     let automatic = pool.shape.trained.min(RESIDENT_ALLOWANCE_TOKENS);
-    let allowance = allowance_dynamic_bytes(&lanes, max_context.unwrap_or(automatic));
-    let runway_tokens = (pool.shape.layout.runway_pages()
-        * crate::engine::memory_plan::KV_PAGE_TOKENS)
-        .min(u64::from(u32::MAX)) as u32;
-    let lane_minimum = pool.plan_at(0).lane.minimum_bytes;
-    let minimum_dynamic = if has_mtp {
-        lane_minimum.saturating_add(draft(runway_tokens))
-    } else {
-        lane_minimum
-    };
+    let allowance = allowance_dynamic_bytes(&[&lane], max_context.unwrap_or(automatic));
+    let minimum_dynamic = pool.plan_at(0).lane.minimum_bytes;
     let hard = hard_budget_bytes(live.working_set_bytes, max_memory);
     let fixed = live
         .active_bytes
@@ -202,8 +226,10 @@ pub(super) fn plan_engine(
     live: LiveMemory,
     held_back: u64,
     max_memory: Option<u64>,
+    has_mtp: bool,
 ) -> Result<MemoryPlan> {
     let transient = |window: u32| transient(c, window);
+    let state = mtp_state(c, has_mtp);
     let footprint = MemoryFootprint {
         working_set_bytes: live.working_set_bytes,
         max_memory_bytes: max_memory,
@@ -213,15 +239,13 @@ pub(super) fn plan_engine(
         draft_weights_bytes: 0,
         held_back_bytes: held_back,
     };
-    MemoryPlan::evaluate(footprint, Some(pool_input(c, &transient)), None, None)
-        .map_err(|error| Error::from_reason(error.message(label)))
-}
-
-/// The MTP lane's window on `plan`: the cell and the draft state of its
-/// window beside the pool.
-pub(super) fn mtp_window(c: &Config, plan: &MemoryPlan) -> Option<u32> {
-    let draft = |window: u32| draft_state_bytes(c, u64::from(window));
-    plan.pool.as_ref().map(|pool| pool.window_with(&draft))
+    MemoryPlan::evaluate(
+        footprint,
+        Some(pool_input(c, &transient, &state)),
+        None,
+        None,
+    )
+    .map_err(|error| Error::from_reason(error.message(label)))
 }
 
 /// Splash plans the stores again with their loaded sizes (`storesPlan`): an
@@ -278,11 +302,9 @@ pub(super) fn attach_auxiliary(
 #[napi(object)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Qwen4ExpContextEstimate {
-    /// Tokens an AR or image turn may hold.
+    /// Tokens any turn (AR, image, MTP) may hold.
     pub window_tokens: u32,
-    /// Tokens an MTP turn may hold; set only with MTP weights.
-    pub speculative_window_tokens: Option<u32>,
-    /// `'memory'` when the plan binds the AR window, `'model'` when the
+    /// `'memory'` when the plan binds the window, `'model'` when the
     /// trained window does.
     pub bound: String,
 }
@@ -310,7 +332,7 @@ pub(super) fn estimate(
         .expert_cap_bytes
         .saturating_add(decision.store.row_cache_bytes)
         .saturating_add(inventory.vision_bytes);
-    let plan = plan_engine(label, c, loaded, held_back, max_memory)?;
+    let plan = plan_engine(label, c, loaded, held_back, max_memory, has_mtp)?;
     check_context(label, &plan, max_context)?;
     let pool = plan.pool.as_ref().ok_or_else(|| {
         Error::from_reason(format!("{label} memory plan: the load planned no pool"))
@@ -318,11 +340,6 @@ pub(super) fn estimate(
     let cap = max_context.unwrap_or_else(|| c.served_context_tokens());
     Ok(Qwen4ExpContextEstimate {
         window_tokens: pool.lane.window.maximum().min(cap),
-        speculative_window_tokens: if has_mtp {
-            mtp_window(c, &plan).map(|window| window.min(cap))
-        } else {
-            None
-        },
         bound: pool.lane.window.bound().to_string(),
     })
 }
@@ -356,6 +373,7 @@ pub async fn estimate_qwen4_exp_context_window(
             options.auxiliary_model_path.as_deref(),
         )?;
         serve_context(LABEL, &mut config, max_context)?;
+        config.kv_format = resolve_kv_format(LABEL, options.kv_format.as_deref(), &config)?;
         let has_mtp = super::auxiliary::validate_mtp(&weights, &config)?;
         let vision = super::media::Vision::metadata(&raw, &weights, &config)?.available();
         let inventory = weights.load_inventory(&config, vision)?;
@@ -375,4 +393,4 @@ pub async fn estimate_qwen4_exp_context_window(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
