@@ -755,6 +755,58 @@ fn chain_refuses_and_fails_like_splash() {
     assert_eq!(marked(&inner), 0);
 }
 
+/// Splash `Cache::stateReclaim`: the walk lists a state as `reclaim` takes
+/// it. One the tier cannot hold with its chain leaves with no write, so a
+/// need of blocks reaches it now, its chain's blocks counted, and its take
+/// frees them.
+/// Mutation MU1 (the listing writes every RAM-only state) → red.
+#[test]
+fn a_state_the_tier_cannot_hold_frees_its_chain_now() {
+    let Some((mut inner, _)) = fixture(0x5713_3204, "s13-unfit") else {
+        return;
+    };
+    let block_bytes = mlx_paged_attn::block_object_bytes(
+        inner.paged_adapter.as_ref().expect("pool").layer_kv_pool(),
+    );
+    let small = test_tier("s13-unfit-small", block_bytes);
+    let lane = window(&inner);
+    attach_tier(
+        &mut inner.dflash2_states,
+        &inner.config,
+        inner.paged_adapter.as_ref().expect("pool"),
+        &small,
+        lane.nbytes(),
+        lane.slots(),
+    );
+    let o = park(&mut inner, 76, StateClass::Ordinary);
+    let blocks = VictimQuery {
+        rights: TakeRights {
+            units: true,
+            waits_for_writes: true,
+            certain_reuse: CertainReuse::All,
+            ..TakeRights::default()
+        },
+        need: Need {
+            pages: 1,
+            host_refused: true,
+            ..Need::default()
+        },
+    };
+    let unit = unit_of(&mut inner, &blocks, o);
+    assert_eq!((unit.stage, unit.later), (Stage::FreeNow, false));
+    assert!(unit.pages > 0, "its chain's blocks are counted");
+    let taken = ModelUnits {
+        target: &mut inner,
+        keep: Keep::default(),
+    }
+    .take(&blocks, &unit);
+    assert_eq!(taken.outcome, FreeOutcome::Met);
+    assert_eq!(taken.pages, unit.pages);
+    assert!(inner.dflash2_states.store.get(o).is_none());
+    assert_eq!(marked(&inner), 0);
+    assert_eq!(small.tier.manager.stats().enqueued, 0);
+}
+
 /// The governor's status carries the state tier (Splash `/status`
 /// `state` disk counters and `disk`): after a reclaim wrote one state, one
 /// offload and one disk entry with its bytes, a temporary tier and its

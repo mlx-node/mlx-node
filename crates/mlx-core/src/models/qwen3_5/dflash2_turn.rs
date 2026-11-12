@@ -3039,10 +3039,6 @@ pub(crate) fn model_units<T: DFlash2Target>(
     let mut all: Vec<StateUnit> = Vec::new();
     let states = target.dflash2_states();
     let store = &states.store;
-    let writable = states
-        .disk
-        .as_ref()
-        .is_some_and(super::dflash2_state::disk::StateDisk::writable);
     for entry in store.entries() {
         let in_use = store.in_use(entry.mark());
         let checkpoint = entry.checkpoint() && !in_use;
@@ -3055,7 +3051,9 @@ pub(crate) fn model_units<T: DFlash2Target>(
                 (Write::None, entry.state_bytes(), !copy.chain_owed)
             }
             (Some(_), Some(_)) => (Write::InFlight, entry.state_bytes(), false),
-            (Some(_), None) if writable => (Write::Needed, entry.state_bytes(), in_use),
+            (Some(_), None) if super::dflash2_state::disk::reclaim_writes(states, entry.id()) => {
+                (Write::Needed, entry.state_bytes(), in_use)
+            }
             (Some(_), None) => (Write::None, entry.state_bytes(), true),
         };
         let key = if write == Write::Chain {

@@ -274,13 +274,15 @@ fn label_of<S>(entry: &Entry<S>) -> ColdStateLabel {
 }
 
 /// Splash `StateCache::reclaimWrites`: a RAM copy without a disk copy, on a
-/// tier that takes writes.
+/// tier that takes writes and holds it with its chain. The walk's listing
+/// and [`reclaim`] both follow it (Splash `Cache::stateReclaim`).
 pub(crate) fn reclaim_writes(states: &DFlash2States, id: EntryId) -> bool {
-    states.disk.as_ref().is_some_and(StateDisk::writable)
-        && states
-            .store
-            .get(id)
-            .is_some_and(|entry| entry.ram().is_some() && entry.disk().is_none())
+    let Some(disk) = states.disk.as_ref().filter(|disk| disk.writable()) else {
+        return false;
+    };
+    states.store.get(id).is_some_and(|entry| {
+        entry.ram().is_some() && entry.disk().is_none() && disk.point_fits(entry, MakeRoom::Evict)
+    })
 }
 
 /// What a reclaim of one state did (Splash `StateEviction`).
@@ -316,13 +318,11 @@ pub(crate) fn reclaim<T: DFlash2Target>(target: &mut T, id: EntryId) -> Reclaime
         target.sync_gdn_state_marks();
         return Reclaimed::RamDropped;
     }
-    let disk = states.disk.as_ref();
     let writable = reclaim_writes(states, id);
-    if writable && disk.is_some_and(StateDisk::writing) {
+    if writable && states.disk.as_ref().is_some_and(StateDisk::writing) {
         return Reclaimed::Pending;
     }
-    let fits = disk.is_some_and(|disk| disk.point_fits(entry, MakeRoom::Evict));
-    if writable && fits {
+    if writable {
         match stage(target, id, MakeRoom::Evict, false) {
             Staged::Started => return Reclaimed::Written,
             Staged::Busy => return Reclaimed::Pending,
