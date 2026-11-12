@@ -833,6 +833,36 @@ function computeByteListKey(buffers: Uint8Array[] | undefined): string | null {
 }
 
 /**
+ * The prompt tokens a turn prefills: the chat template rendered with the
+ * turn's tools and reasoning effort, widened for images where the model
+ * expands them. Context clamping and Messages `count_tokens` share it.
+ */
+export async function countPromptTokens(
+  model: Pick<SessionCapableModel, 'applyChatTemplate' | 'expandedPromptTokenCount'>,
+  messages: ChatMessage[],
+  config: Pick<ChatConfig, 'tools' | 'reasoningEffort'>,
+): Promise<number> {
+  if (typeof model.applyChatTemplate !== 'function') {
+    throw new Error('countPromptTokens: the model has no applyChatTemplate()');
+  }
+  const effort = config.reasoningEffort;
+  const enableThinking = effort === undefined ? null : effort !== 'none';
+  const tokens = await model.applyChatTemplate(messages, true, config.tools ?? null, enableThinking, effort ?? null);
+  const hasImages = messages.some((message) => (message.images?.length ?? 0) > 0);
+  if (!hasImages || typeof model.expandedPromptTokenCount !== 'function') {
+    return tokens.length;
+  }
+  const promptTokens = await model.expandedPromptTokenCount(tokens, messages);
+  if (!Number.isSafeInteger(promptTokens) || promptTokens < tokens.length) {
+    throw new Error(
+      `ChatSession: expandedPromptTokenCount returned invalid length ${promptTokens} ` +
+        `(rendered template length is ${tokens.length})`,
+    );
+  }
+  return promptTokens;
+}
+
+/**
  * Cross-model chat session. See module docstring for design notes.
  *
  * The generic parameter `M` statically captures the concrete model
@@ -2024,7 +2054,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    *
    * The output budget follows `restOfWindowOutputBudget`, and an omitted one
    * the chosen window's omitted-budget flag. The returned
-   * config is a copy only when `maxNewTokens` changes.
+   * config is a copy only when `maxNewTokens` or `thinkingTokenBudget` changes.
    */
   private async constrainToContextCapacity(messages: ChatMessage[], config: ChatConfig): Promise<ChatConfig> {
     if (typeof this.model.applyChatTemplate !== 'function' || typeof this.model.contextLimits !== 'function') {
@@ -2040,25 +2070,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       return config;
     }
 
-    const effort = config.reasoningEffort;
-    const enableThinking = effort === undefined ? null : effort !== 'none';
-    const tokens = await this.model.applyChatTemplate(
-      messages,
-      true,
-      config.tools ?? null,
-      enableThinking,
-      effort ?? null,
-    );
-    let promptTokens = tokens.length;
-    if (hasImages && typeof this.model.expandedPromptTokenCount === 'function') {
-      promptTokens = await this.model.expandedPromptTokenCount(tokens, messages);
-      if (!Number.isSafeInteger(promptTokens) || promptTokens < tokens.length) {
-        throw new Error(
-          `ChatSession: expandedPromptTokenCount returned invalid length ${promptTokens} ` +
-            `(rendered template length is ${tokens.length})`,
-        );
-      }
-    }
+    const promptTokens = await countPromptTokens(this.model, messages, config);
     const requested = config.maxNewTokens;
     let maxOutput: number;
     if (limits.restOfWindowOutputBudget === true) {
@@ -2084,6 +2096,25 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       }
     }
     const maxNewTokens = Math.min(requested, maxOutput);
+    const budget = config.thinkingTokenBudget;
+    if (
+      budget != null &&
+      Number.isSafeInteger(budget) &&
+      budget > 0 &&
+      Number.isSafeInteger(maxNewTokens) &&
+      maxNewTokens > 0
+    ) {
+      // Splash `Frontend.chat_job`: thinking keeps its share of the
+      // room the context leaves. A budget the output limit reaches first never
+      // fires, so it is left as sent: an absent one would take the family's
+      // effort default instead.
+      const scaled = Number(
+        (BigInt(budget) * BigInt(maxNewTokens)) / BigInt(Math.min(requested, budget + maxNewTokens)),
+      );
+      if (scaled < maxNewTokens && scaled !== budget) {
+        return { ...config, maxNewTokens, thinkingTokenBudget: scaled };
+      }
+    }
     return maxNewTokens === requested ? config : { ...config, maxNewTokens };
   }
 

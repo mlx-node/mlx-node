@@ -99,6 +99,7 @@ export interface AnthropicMessagesRequest {
   tool_choice?: AnthropicToolChoice;
   stream?: boolean;
   stop_sequences?: string[];
+  thinking?: { type: 'enabled' | 'disabled' | 'adaptive'; budget_tokens?: number; display?: string | null };
   metadata?: { user_id?: string };
   /**
    * MLX-Node extension matching vLLM's Anthropic surface. Separates native
@@ -283,13 +284,20 @@ export interface AnthropicUsage {
 // Response
 // ---------------------------------------------------------------------------
 
+export type AnthropicStopReason =
+  | 'end_turn'
+  | 'max_tokens'
+  | 'model_context_window_exceeded'
+  | 'stop_sequence'
+  | 'tool_use';
+
 export interface AnthropicMessagesResponse {
   id: string;
   type: 'message';
   role: 'assistant';
   model: string;
   content: AnthropicResponseContent[];
-  stop_reason: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' | null;
+  stop_reason: AnthropicStopReason | null;
   stop_sequence: string | null;
   usage: AnthropicUsage;
 }

@@ -166,6 +166,8 @@ describe('POST /v1/messages/count_tokens', () => {
       ],
       true,
       null,
+      null,
+      null,
     );
     expect(model.spies.chatSessionStart).not.toHaveBeenCalled();
     expect(model.spies.chatStreamSessionStart).not.toHaveBeenCalled();
@@ -213,6 +215,60 @@ describe('POST /v1/messages/count_tokens', () => {
         },
       },
     ]);
+  });
+
+  // Splash `Frontend.count_tokens`: the count generation prefills, images
+  // widened and the request's effort applied. Mutation: count the bare
+  // template length (old `applyChatTemplate(messages, true, tools)`) → red.
+  it('counts through the context clamp: images widened, effort passed', async () => {
+    const registry = new ModelRegistry();
+    const model = createCountingModel(4);
+    const expandedPromptTokenCount = vi.fn(() => 300);
+    Object.assign(model, { expandedPromptTokenCount });
+    registry.register('vision-model', model);
+    const handler = createHandler(registry);
+    const req = createMockReq('POST', '/v1/messages/count_tokens', {
+      model: 'vision-model',
+      extra_body: { reasoning_effort: 'low' },
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'describe' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AQID' } },
+          ],
+        },
+      ],
+    });
+    const { res, getStatus, getBody, waitForEnd } = createMockRes();
+
+    await handler(req, res);
+    await waitForEnd();
+
+    expect(getStatus()).toBe(200);
+    expect(JSON.parse(getBody())).toEqual({ input_tokens: 300 });
+    expect(expandedPromptTokenCount).toHaveBeenCalledOnce();
+    const call = model.applyChatTemplate.mock.calls[0] as unknown[];
+    expect(call.slice(1)).toEqual([true, null, true, 'low']);
+  });
+
+  it('routes the handler thinking budget default to /v1/messages', async () => {
+    const registry = new ModelRegistry();
+    const model = createCountingModel(4);
+    registry.register('test-model', model);
+    const handler = createHandler(registry, { thinkingTokenBudget: 3000 });
+    const req = createMockReq('POST', '/v1/messages', {
+      model: 'test-model',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+    const { res, getStatus, waitForEnd } = createMockRes();
+
+    await handler(req, res);
+    await waitForEnd();
+
+    expect(getStatus()).toBe(200);
+    expect(model.spies.chatSessionStart.mock.calls[0]?.[1]?.thinkingTokenBudget).toBe(3000);
   });
 
   it('returns 501 when the registered model lacks a non-generating chat-template tokenizer API', async () => {

@@ -97,6 +97,14 @@ describe('claudeChildEnv', () => {
     expect(JSON.stringify(claudeChildEnv({ ANTHROPIC_API_KEY: 'sk-ant-secret' }, opts))).not.toContain('sk-ant-secret');
   });
 
+  // Splash `_reach_loopback_directly`. Mutation: skip `withLoopbackNoProxy` → red.
+  it('exempts loopback from an inherited proxy so the bearer token never reaches it', () => {
+    const env = claudeChildEnv({ HTTP_PROXY: 'http://proxy.example:3128', NO_PROXY: 'corp.example' }, opts);
+    expect(env.NO_PROXY).toBe('corp.example,127.0.0.1,localhost,::1');
+    expect(env.no_proxy).toBe('corp.example,127.0.0.1,localhost,::1');
+    expect('NO_PROXY' in claudeChildEnv({}, opts)).toBe(false);
+  });
+
   // Mutation: drop the two window vars → red.
   it('hands Claude Code the served window when one is known', () => {
     const env = claudeChildEnv({ CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1000000' }, { ...opts, contextTokens: 139257 });

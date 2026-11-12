@@ -6673,6 +6673,86 @@ describe('handleCreateMessage', () => {
         primeHistorySpy.mockRestore();
       }
     });
+
+    // Mutation: run the JS reset below `preflightContextCapacity` again -> the
+    // leased session's tools fill the omitted `tools`.
+    it.each([
+      { stream: false, tools: undefined },
+      { stream: false, tools: [] },
+      { stream: true, tools: undefined },
+      { stream: true, tools: [] },
+    ])('a warm hit does not reuse the previous tools (stream=$stream, tools=$tools)', async ({ stream, tools }) => {
+      const chatSessionStart = vi.fn().mockResolvedValue(makeChatResult({ text: 'ok', rawText: 'ok' }));
+      const chatStreamSessionStart = vi.fn().mockImplementation(async function* () {
+        yield { text: 'ok', done: false, isReasoning: false };
+        yield {
+          text: 'ok',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 1,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: 'ok',
+        };
+      });
+      const resetCaches = vi.fn();
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        resetCaches,
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('test-model', mockModel);
+      const sessionReg = registry.getSessionRegistry('test-model')!;
+      const start = stream ? chatStreamSessionStart : chatSessionStart;
+
+      const r1 = createMockRes();
+      await handleCreateMessage(
+        r1.res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'A' }],
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+          max_tokens: 100,
+          stream,
+          cache_salt: 'tenant-a/tools',
+        },
+        registry,
+      );
+      expect(r1.getStatus()).toBe(200);
+      expect(sessionReg.size).toBe(1);
+      expect((start.mock.calls[0]![1] as { tools?: unknown[] }).tools).toHaveLength(1);
+      const resetCachesAfterT1 = resetCaches.mock.calls.length;
+
+      const r2 = createMockRes();
+      await handleCreateMessage(
+        r2.res,
+        {
+          model: 'test-model',
+          messages: [
+            { role: 'user', content: 'A' },
+            { role: 'assistant', content: 'ok' },
+            { role: 'user', content: 'B' },
+          ],
+          ...(tools === undefined ? {} : { tools }),
+          max_tokens: 100,
+          stream,
+          cache_salt: 'tenant-a/tools',
+        },
+        registry,
+      );
+      expect(r2.getStatus()).toBe(200);
+      expect(start).toHaveBeenCalledTimes(2);
+      // Warm hit: the JS-only reset ran, not the native one.
+      expect(resetCaches.mock.calls.length).toBe(resetCachesAfterT1);
+      expect((start.mock.calls[1]![1] as { tools?: unknown[] }).tools).toBeUndefined();
+    });
   });
 });
 
@@ -6917,5 +6997,328 @@ describe('handleCreateMessage progress pings', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('handleCreateMessage output limits, thinking budget and call text', () => {
+  const windowLimits = () => ({
+    trainedWindowTokens: 262_144,
+    effectiveWindowTokens: 64,
+    pagedBlockCapacity: 4,
+    pagedBlockSize: 16,
+    restOfWindowOutputBudget: true,
+    omittedBudgetIsRestOfWindow: true,
+  });
+
+  function windowModel(model: SessionCapableModel, promptTokens: number): SessionCapableModel {
+    return Object.assign(model, {
+      contextLimits: windowLimits,
+      applyChatTemplate: vi.fn(() => new Uint32Array(promptTokens)),
+    });
+  }
+
+  const lengthEvent = {
+    done: true,
+    text: 'cut',
+    finishReason: 'length',
+    toolCalls: [],
+    thinking: null,
+    numTokens: 16,
+    promptTokens: 48,
+    reasoningTokens: 0,
+    rawText: 'cut',
+  };
+
+  // Splash `stop_reason` + `output_clamped_to_context`. Mutation: drop the
+  // flag (always `max_tokens` on length) → red.
+  it('non-streaming: a window-clamped limit ends as model_context_window_exceeded', async () => {
+    for (const [maxTokens, expected] of [
+      [32_000, 'model_context_window_exceeded'],
+      [8, 'max_tokens'],
+    ] as const) {
+      const registry = new ModelRegistry();
+      const model = windowModel(
+        createMockModel(makeChatResult({ text: 'cut', rawText: 'cut', finishReason: 'length' })),
+        48,
+      );
+      registry.register('test-model', model);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        { model: 'test-model', messages: [{ role: 'user', content: 'go' }], max_tokens: maxTokens },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      expect(JSON.parse(getBody()).stop_reason).toBe(expected);
+      const native = (model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0]?.[1];
+      expect(native?.maxNewTokens).toBe(maxTokens === 8 ? 8 : 16);
+    }
+  });
+
+  it('streaming: a window-clamped limit ends as model_context_window_exceeded', async () => {
+    for (const [maxTokens, expected] of [
+      [32_000, 'model_context_window_exceeded'],
+      [8, 'max_tokens'],
+    ] as const) {
+      const registry = new ModelRegistry();
+      registry.register('test-model', windowModel(createMockStreamModel([lengthEvent]), 48));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        { model: 'test-model', messages: [{ role: 'user', content: 'go' }], max_tokens: maxTokens, stream: true },
+        registry,
+      );
+
+      const delta = parseSSE(getBody()).find((e) => e.event === 'message_delta');
+      expect(delta?.data.delta).toMatchObject({ stop_reason: expected });
+    }
+  });
+
+  // Splash `_stop_sequences`. Mutation: the old silent filter (a string
+  // reaches `.filter` and throws a JS TypeError) → red.
+  it('returns 400 naming stop_sequences for a single string', async () => {
+    const registry = new ModelRegistry();
+    const model = createMockModel();
+    registry.register('test-model', model);
+    const { res, getStatus, getBody } = createMockRes();
+
+    await handleCreateMessage(
+      res,
+      {
+        model: 'test-model',
+        messages: [{ role: 'user', content: 'go' }],
+        max_tokens: 16,
+        stop_sequences: 'x' as unknown as string[],
+      },
+      registry,
+    );
+
+    expect(getStatus()).toBe(400);
+    expect(JSON.parse(getBody()).error.message).toBe('stop_sequences must be an array of strings');
+    expect((model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+  });
+
+  // Splash `--thinking-token-budget`. Mutation: ignore the server default → red.
+  it('gives a thinking request that sets no budget the server default', async () => {
+    const budgetFor = async (extra: Record<string, unknown>): Promise<unknown> => {
+      const registry = new ModelRegistry();
+      const model = createMockModel();
+      registry.register('test-model', model);
+      const { res } = createMockRes();
+      await handleCreateMessage(
+        res,
+        { model: 'test-model', messages: [{ role: 'user', content: 'go' }], max_tokens: 16, ...extra },
+        registry,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        4096,
+      );
+      return (model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]?.thinkingTokenBudget;
+    };
+    expect(await budgetFor({})).toBe(4096);
+    expect(await budgetFor({ thinking: { type: 'adaptive' } })).toBe(4096);
+    expect(await budgetFor({ thinking: { type: 'enabled', budget_tokens: 2048 } })).toBe(2048);
+    expect(await budgetFor({ extra_body: { reasoning_effort: 'none' } })).toBeUndefined();
+  });
+
+  // Splash `StreamingToolCallProjector._begin_call`: an opening that names no function
+  // is text. Mutation: drop the nameless call's raw text → red (empty text).
+  it('returns a tool call that names no function as text', async () => {
+    const raw = '<tool_call>\n<function=>\n<parameter=q>\nx\n</parameter>\n</function>\n</tool_call>';
+    const nameless = {
+      id: 'call_n',
+      name: '',
+      arguments: {},
+      status: 'missing_name',
+      rawContent: raw,
+    } as unknown as ToolCallResult;
+    const tools = [{ name: 'search', input_schema: { type: 'object' as const, properties: {} } }];
+
+    const registry = new ModelRegistry();
+    registry.register(
+      'test-model',
+      createMockModel(makeChatResult({ text: '', rawText: raw, toolCalls: [nameless], finishReason: 'stop' })),
+    );
+    const plain = createMockRes();
+    await handleCreateMessage(
+      plain.res,
+      { model: 'test-model', messages: [{ role: 'user', content: 'go' }], max_tokens: 64, tools },
+      registry,
+    );
+    const parsed = JSON.parse(plain.getBody());
+    expect(parsed.content).toEqual([{ type: 'text', text: raw }]);
+    expect(parsed.stop_reason).toBe('end_turn');
+
+    const streamRegistry = new ModelRegistry();
+    streamRegistry.register(
+      'test-model',
+      createMockStreamModel([
+        { done: false, text: raw, isReasoning: false },
+        { ...lengthEvent, text: '', rawText: raw, toolCalls: [nameless], finishReason: 'stop' },
+      ]),
+    );
+    const streamed = createMockRes();
+    await handleCreateMessage(
+      streamed.res,
+      { model: 'test-model', messages: [{ role: 'user', content: 'go' }], max_tokens: 64, tools, stream: true },
+      streamRegistry,
+    );
+    const text = parseSSE(streamed.getBody())
+      .filter((e) => e.event === 'content_block_delta')
+      .map((e) => (e.data.delta as { text?: string }).text ?? '')
+      .join('');
+    expect(text).toBe(raw);
+  });
+
+  // Splash cuts the raw output at a stop (`CallbackStreamer._emit`) before
+  // `StreamingToolCallProjector` reads a nameless opening as text, so the block
+  // keeps its place in the answer. Mutation: append the nameless blocks after the
+  // text (skip the in-place placement) → red (AFTER leaks past the stop).
+  describe('a nameless call keeps its place in the answer', () => {
+    const block = '<tool_call>\n<function=>\n<parameter=q>\nxSTOPy\n</parameter>\n</function>\n</tool_call>';
+    const nameless = {
+      id: 'call_n',
+      name: '',
+      arguments: {},
+      status: 'missing_name',
+      rawContent: block,
+    } as unknown as ToolCallResult;
+    const okBlock = '<tool_call>\n<function=search>\n<parameter=q>\nz\n</parameter>\n</function>\n</tool_call>';
+    const okCall = {
+      id: 'call_ok',
+      name: 'search',
+      arguments: { q: 'z' },
+      status: 'ok',
+      rawContent: okBlock,
+    } as unknown as ToolCallResult;
+    const tools = [{ name: 'search', input_schema: { type: 'object' as const, properties: {} } }];
+
+    async function answer(
+      raw: string,
+      cleaned: string,
+      toolCalls: ToolCallResult[],
+      stream: boolean,
+      stopSequences?: string[],
+    ): Promise<{ text: string; stopReason: unknown; toolUses: number }> {
+      const request = {
+        model: 'test-model',
+        messages: [{ role: 'user' as const, content: 'go' }],
+        max_tokens: 64,
+        tools,
+        ...(stopSequences ? { stop_sequences: stopSequences } : {}),
+        ...(stream ? { stream: true } : {}),
+      };
+      const registry = new ModelRegistry();
+      const mock = createMockRes();
+      if (!stream) {
+        registry.register(
+          'test-model',
+          createMockModel(makeChatResult({ text: cleaned, rawText: raw, toolCalls, finishReason: 'stop' })),
+        );
+        await handleCreateMessage(mock.res, request, registry);
+        const parsed = JSON.parse(mock.getBody());
+        const content = parsed.content as Array<{ type: string; text?: string }>;
+        return {
+          text: content
+            .filter((c) => c.type === 'text')
+            .map((c) => c.text)
+            .join(''),
+          stopReason: parsed.stop_reason,
+          toolUses: content.filter((c) => c.type === 'tool_use').length,
+        };
+      }
+      const firstTag = raw.indexOf('<tool_call>');
+      registry.register(
+        'test-model',
+        createMockStreamModel([
+          { done: false, text: raw.slice(0, firstTag), isReasoning: false },
+          { done: false, text: raw.slice(firstTag), isReasoning: false },
+          {
+            done: true,
+            text: cleaned,
+            finishReason: 'stop',
+            toolCalls,
+            thinking: null,
+            numTokens: 16,
+            promptTokens: 8,
+            reasoningTokens: 0,
+            rawText: raw,
+          },
+        ]),
+      );
+      await handleCreateMessage(mock.res, request, registry);
+      const events = parseSSE(mock.getBody());
+      return {
+        text: events
+          .filter((e) => e.event === 'content_block_delta')
+          .map((e) => (e.data.delta as { text?: string }).text ?? '')
+          .join(''),
+        stopReason: (events.find((e) => e.event === 'message_delta')?.data.delta as { stop_reason?: unknown })
+          ?.stop_reason,
+        toolUses: events.filter(
+          (e) => e.event === 'content_block_start' && (e.data.content_block as { type: string }).type === 'tool_use',
+        ).length,
+      };
+    }
+
+    it.each([false, true])('a stop inside the block cuts the text after it (stream=%s)', async (stream) => {
+      const raw = `BEFORE ${block} AFTER`;
+      const got = await answer(raw, 'BEFORE  AFTER', [nameless], stream, ['STOP']);
+      expect(got.text).toBe('BEFORE <tool_call>\n<function=>\n<parameter=q>\nx');
+      expect(got.stopReason).toBe('stop_sequence');
+    });
+
+    it.each([false, true])('without a stop the block sits between the prose (stream=%s)', async (stream) => {
+      const raw = `BEFORE ${block} AFTER`;
+      const got = await answer(raw, 'BEFORE  AFTER', [nameless], stream);
+      expect(got.text).toBe(raw);
+      expect(got.stopReason).toBe('end_turn');
+    });
+
+    it.each([false, true])('a named call leaves the text and the block keeps its place (stream=%s)', async (stream) => {
+      const raw = `BEFORE ${okBlock} MID ${block} AFTER`;
+      const got = await answer(raw, 'BEFORE  MID  AFTER', [okCall, nameless], stream);
+      expect(got.text).toBe(`BEFORE  MID ${block} AFTER`);
+      expect(got.toolUses).toBe(1);
+      expect(got.stopReason).toBe('tool_use');
+    });
+
+    it.each([false, true])('a stop in the prose after the block keeps the block (stream=%s)', async (stream) => {
+      const raw = `BEFORE ${block.replace('xSTOPy', 'xy')} AF HALT TER`;
+      const got = await answer(
+        raw,
+        'BEFORE  AF HALT TER',
+        [{ ...nameless, rawContent: block.replace('xSTOPy', 'xy') }],
+        stream,
+        ['HALT'],
+      );
+      expect(got.text).toBe(`BEFORE ${block.replace('xSTOPy', 'xy')} AF `);
+      expect(got.stopReason).toBe('stop_sequence');
+    });
+
+    // The native parser strips a `<tool_call>` block it cannot read without
+    // listing it. Mutation: keep the unlisted blocks in the rebuild → red (the
+    // nameless block goes after the prose and the text after the stop leaks).
+    const unknown = '<tool_call>???</tool_call>';
+
+    it.each([false, true])('an unlisted block after a stop in the nameless block (stream=%s)', async (stream) => {
+      const raw = `BEFORE ${block} AFTER ${unknown} TAIL`;
+      const got = await answer(raw, 'BEFORE  AFTER  TAIL', [nameless], stream, ['STOP']);
+      expect(got.text).toBe('BEFORE <tool_call>\n<function=>\n<parameter=q>\nx');
+      expect(got.stopReason).toBe('stop_sequence');
+    });
+
+    it.each([false, true])('an unlisted block after a stop in the prose (stream=%s)', async (stream) => {
+      const plain = block.replace('xSTOPy', 'xy');
+      const raw = `BEFORE ${plain} MID STOP AFTER ${unknown}`;
+      const got = await answer(raw, 'BEFORE  MID STOP AFTER', [{ ...nameless, rawContent: plain }], stream, ['STOP']);
+      expect(got.text).toBe(`BEFORE ${plain} MID `);
+      expect(got.stopReason).toBe('stop_sequence');
+    });
   });
 });

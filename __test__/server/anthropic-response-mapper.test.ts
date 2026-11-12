@@ -14,6 +14,7 @@ import {
   internalToolCallIdToAnthropic,
   mapStopReason,
   recoverSuppressedToolCallText,
+  visibleAnswerText,
 } from '../../packages/server/src/mappers/anthropic-response.js';
 
 function makeChatResult(overrides: Record<string, unknown> = {}) {
@@ -920,5 +921,46 @@ describe('buildProgressPing', () => {
     expect(JSON.stringify(buildProgressPing({ phase: 'queued' }, null, 10_000))).toBe(
       '{"type":"ping","mlx_progress":{"phase":"queued","elapsed_ms":10000}}',
     );
+  });
+});
+
+// Splash `StreamingToolCallProjector._begin_call` reads a nameless opening as
+// text where it stands. Mutations: append the nameless blocks after the text →
+// red (first case); drop the blocks it cannot place → red (second case).
+describe('visibleAnswerText nameless calls', () => {
+  const block = '<tool_call>\n<function=>\n</function>\n</tool_call>';
+  const nameless = { id: 'n', name: '', arguments: {}, status: 'missing_name', rawContent: block };
+
+  it('places the block after the reasoning and before the prose', () => {
+    const rawText = `plan\n</think>\n\n${block}\nAFTER`;
+    expect(visibleAnswerText({ text: 'AFTER', rawText, toolCalls: [nameless] }, true)).toBe(`${block}\nAFTER`);
+  });
+
+  it('appends a block it cannot find in the raw text', () => {
+    expect(visibleAnswerText({ text: 'AFTER', rawText: 'AFTER', toolCalls: [nameless] }, true)).toBe(`AFTER${block}`);
+  });
+
+  // The native parser strips a `<tool_call>` block it cannot read without
+  // listing it. Mutation: keep the unlisted blocks in the rebuild → red (the
+  // nameless block goes after the prose).
+  it('a block the parser does not list does not move the nameless block', () => {
+    const stopBlock = '<tool_call>\n<function=>\n<parameter=x>\nSTOP\n</parameter>\n</function>\n</tool_call>';
+    const unknown = '<tool_call>???</tool_call>';
+    expect(
+      visibleAnswerText(
+        {
+          text: 'BEFORE  AFTER  TAIL',
+          rawText: `BEFORE ${stopBlock} AFTER ${unknown} TAIL`,
+          toolCalls: [{ ...nameless, rawContent: stopBlock }],
+        },
+        true,
+      ),
+    ).toBe(`BEFORE ${stopBlock} AFTER  TAIL`);
+    expect(
+      visibleAnswerText(
+        { text: 'BEFORE  MID STOP AFTER', rawText: `BEFORE ${block} MID STOP AFTER ${unknown}`, toolCalls: [nameless] },
+        true,
+      ),
+    ).toBe(`BEFORE ${block} MID STOP AFTER`);
   });
 });

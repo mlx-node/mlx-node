@@ -1891,6 +1891,28 @@ describe('launchGrokAgent server gating', () => {
     expect(spawnAgent.envs[0]!.GROK_MODELS_BASE_URL).toBe(`${serveBase}/v1`);
   });
 
+  // Splash `_reach_loopback_directly`. Mutation: spawn grok with the bare env → red.
+  it('exempts loopback from an inherited proxy in the grok environment', async () => {
+    const saved = {
+      HTTP_PROXY: process.env.HTTP_PROXY,
+      NO_PROXY: process.env.NO_PROXY,
+      no_proxy: process.env.no_proxy,
+    };
+    process.env.HTTP_PROXY = 'http://proxy.example:3128';
+    process.env.NO_PROXY = 'corp.example';
+    delete process.env.no_proxy;
+    try {
+      await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent });
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+    expect(spawnAgent.envs[0]!.NO_PROXY).toBe('corp.example,127.0.0.1,localhost,::1');
+    expect(spawnAgent.envs[0]!.no_proxy).toBe('corp.example,127.0.0.1,localhost,::1');
+  });
+
   it('skips the server only when the caller sets needsServer: false', async () => {
     const code = await launchGrokAgent({
       argv: ['--version'],

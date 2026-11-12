@@ -3556,6 +3556,85 @@ describe('ChatSession', () => {
       expect(explicit.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBe(28);
     });
 
+    // Splash `Frontend.chat_job` thinking share, the release-note
+    // examples. Mutation: skip the scale → red (24,576 ≠ 15,000).
+    it('scales the thinking budget to its share of the room the window leaves', async () => {
+      const mock = makeMockModel();
+      const session = new ChatSession(withCapacity(mock.model, 262_144, 242_144));
+
+      await session.send('hello', { config: { maxNewTokens: 32_768, thinkingTokenBudget: 24_576 } });
+
+      const config = mock.chatSessionStart.mock.calls[0]?.[1];
+      expect(config?.maxNewTokens).toBe(20_000);
+      expect(config?.thinkingTokenBudget).toBe(15_000);
+    });
+
+    // Mutation: scale when the output budget is omitted (as if unbounded) →
+    // red (the omitted row gets 7,676, not 8,192).
+    it('scales a budget under an unbounded limit, and leaves it when the limit is omitted', async () => {
+      const limited = makeMockModel();
+      await new ChatSession(withCapacity(limited.model, 262_144, 140_072)).send('hello', {
+        config: { maxNewTokens: 2_147_483_647, thinkingTokenBudget: 8_192 },
+      });
+      expect(limited.chatSessionStart.mock.calls[0]?.[1]).toMatchObject({
+        maxNewTokens: 122_072,
+        thinkingTokenBudget: 7_676,
+      });
+
+      const omitted = makeMockModel();
+      await new ChatSession(withCapacity(omitted.model, 262_144, 140_072)).send('hello', {
+        config: { thinkingTokenBudget: 8_192 },
+      });
+      expect(omitted.chatSessionStart.mock.calls[0]?.[1]).toMatchObject({
+        maxNewTokens: 122_072,
+        thinkingTokenBudget: 8_192,
+      });
+    });
+
+    it('keeps a thinking budget when the window leaves the full limit, and one the limit reaches first', async () => {
+      const room = makeMockModel();
+      await new ChatSession(withCapacity(room.model, 262_144, 100)).send('hello', {
+        config: { maxNewTokens: 32_768, thinkingTokenBudget: 24_576 },
+      });
+      expect(room.chatSessionStart.mock.calls[0]?.[1]?.thinkingTokenBudget).toBe(24_576);
+
+      const past = makeMockModel();
+      await new ChatSession(withCapacity(past.model, 4_096, 96)).send('hello', {
+        config: { maxNewTokens: 32_768, thinkingTokenBudget: 50_000 },
+      });
+      expect(past.chatSessionStart.mock.calls[0]?.[1]).toMatchObject({
+        maxNewTokens: 4_000,
+        thinkingTokenBudget: 50_000,
+      });
+    });
+
+    // Mutation: drop the `maxNewTokens > 0` guard → red (BigInt division by zero).
+    it('leaves the thinking budget of a zero output limit unscaled', async () => {
+      const mock = makeMockModel();
+      const preflight = await new ChatSession(withCapacity(mock.model, 4_096, 96)).preflightContextCapacity(
+        [{ role: 'user', content: 'hello' }],
+        { maxNewTokens: 0, thinkingTokenBudget: 2_048 },
+      );
+      expect(preflight).toMatchObject({ maxNewTokens: 0, thinkingTokenBudget: 2_048 });
+    });
+
+    it('scales the budget once across a preflight and the send that follows it', async () => {
+      const mock = makeMockModel();
+      const session = new ChatSession(withCapacity(mock.model, 262_144, 242_144));
+      const messages: ChatMessage[] = [{ role: 'user', content: 'hello' }];
+      const preflight = await session.preflightContextCapacity(messages, {
+        maxNewTokens: 32_768,
+        thinkingTokenBudget: 24_576,
+      });
+      expect(preflight).toMatchObject({ maxNewTokens: 20_000, thinkingTokenBudget: 15_000 });
+      session.primeHistory(messages);
+      await session.startFromHistory(preflight);
+      expect(mock.chatSessionStart.mock.calls[0]?.[1]).toMatchObject({
+        maxNewTokens: 20_000,
+        thinkingTokenBudget: 15_000,
+      });
+    });
+
     it('leaves an explicit budget inside the window unchanged', async () => {
       const mock = makeMockModel();
       const session = new ChatSession(withCapacity(mock.model, 4096, 100));

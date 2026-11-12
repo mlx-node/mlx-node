@@ -19,6 +19,8 @@ import {
   type InferenceHostOptions,
 } from '@mlx-node/server/host';
 
+import { withLoopbackNoProxy } from '../loopback-env.js';
+
 function printHelp(): void {
   console.log(`
 Launch Claude Code pointed at a local mlx-node server
@@ -216,7 +218,7 @@ export function claudeChildEnv(
     env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(opts.contextTokens);
     env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = String(opts.contextTokens);
   }
-  return env;
+  return withLoopbackNoProxy(env);
 }
 
 /**

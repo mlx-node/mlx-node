@@ -16,6 +16,7 @@ import type {
   AnthropicMessagesResponse,
   AnthropicPingEvent,
   AnthropicResponseContent,
+  AnthropicStopReason,
   MlxProgress,
 } from '../types-anthropic.js';
 import { genId } from './response.js';
@@ -76,17 +77,113 @@ export function mapStopReason(
   finishReason: string,
   hasToolCalls: boolean,
   matchedStopSequence?: string | null,
-): 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' {
+  outputClampedToContext = false,
+): AnthropicStopReason {
   if (matchedStopSequence) {
     return 'stop_sequence';
   }
   if (finishReason === 'length') {
-    return 'max_tokens';
+    // Splash `stop_reason`: the context window, not `max_tokens`, ended it.
+    return outputClampedToContext ? 'model_context_window_exceeded' : 'max_tokens';
   }
   if (hasToolCalls) {
     return 'tool_use';
   }
   return 'end_turn';
+}
+
+/**
+ * The answer text a response shows: the parsed text, or the recovered markup
+ * of tool calls the request did not allow, with the raw block of each call
+ * that names no function read as text where the model wrote it (Splash
+ * `StreamingToolCallProjector._begin_call`). Splash cuts the raw output at a
+ * stop (`CallbackStreamer._emit`) before the projector reads it, so the block
+ * must keep its place for the stop search to cut what follows it.
+ */
+export function visibleAnswerText(
+  result: Pick<ChatResult, 'text' | 'rawText' | 'toolCalls'>,
+  allowToolUse: boolean,
+): string {
+  const text =
+    !allowToolUse &&
+    result.text.length === 0 &&
+    result.toolCalls.some((t) => t.status === 'ok') &&
+    containsToolCallMarkup(result.rawText)
+      ? recoverSuppressedToolCallText(result.rawText)
+      : result.text;
+  if (!result.toolCalls.some((call) => call.status === 'missing_name')) return text;
+  const placed = withNamelessCallsInPlace(text, result.rawText, result.toolCalls);
+  if (placed !== null) return placed;
+  // The blocks cannot be placed in `rawText`: they go after the text.
+  let nameless = '';
+  for (const call of result.toolCalls) {
+    if (call.status === 'missing_name') nameless += call.rawContent;
+  }
+  return text + nameless;
+}
+
+function isWhitespace(ch: string): boolean {
+  return ch.trim().length === 0;
+}
+
+/**
+ * `text` with each nameless call's block put back at its place in `rawText`,
+ * or null when `text` is not `rawText` without the `<tool_call>` blocks,
+ * trimmed and cut after the reasoning (the native finalize), or a nameless
+ * block falls before the text starts.
+ */
+function withNamelessCallsInPlace(text: string, rawText: string, calls: ChatResult['toolCalls']): string | null {
+  let stripped = '';
+  let kept = '';
+  const namelessAt: number[] = [];
+  let cursor = 0;
+  for (const call of calls) {
+    if (call.rawContent.length === 0) return null;
+    const start = rawText.indexOf(call.rawContent, cursor);
+    if (start < 0) return null;
+    const before = withoutUnlistedToolCallBlocks(rawText.slice(cursor, start));
+    stripped += before;
+    kept += before;
+    if (call.status === 'missing_name') {
+      namelessAt.push(stripped.length);
+      kept += call.rawContent;
+    }
+    cursor = start + call.rawContent.length;
+  }
+  const tail = withoutUnlistedToolCallBlocks(rawText.slice(cursor));
+  stripped += tail;
+  kept += tail;
+
+  const visible = text.trim();
+  const head = stripped.trimEnd();
+  if (!head.endsWith(visible)) return null;
+  let start = head.length - visible.length;
+  while (start > 0 && isWhitespace(stripped[start - 1]!)) start--;
+  if (namelessAt.some((at) => at < start)) return null;
+  // No nameless block precedes `start`, so it is the same offset in `kept`.
+  return kept.slice(start).trim();
+}
+
+const TOOL_CALL_OPEN = '<tool_call>';
+const TOOL_CALL_CLOSE = '</tool_call>';
+
+/**
+ * `segment` without the closed `<tool_call>` blocks the native parser strips
+ * from the text but does not list as calls; the scan stops at an unclosed
+ * open tag like the native `extract_tag_blocks`.
+ */
+function withoutUnlistedToolCallBlocks(segment: string): string {
+  let out = '';
+  let from = 0;
+  for (;;) {
+    const open = segment.indexOf(TOOL_CALL_OPEN, from);
+    if (open < 0) break;
+    const close = segment.indexOf(TOOL_CALL_CLOSE, open + TOOL_CALL_OPEN.length);
+    if (close < 0) break;
+    out += segment.slice(from, open);
+    from = close + TOOL_CALL_CLOSE.length;
+  }
+  return out + segment.slice(from);
 }
 
 export function containsToolCallMarkup(rawText: string): boolean {
@@ -142,14 +239,7 @@ export function buildAnthropicContent(
   // verbatim — the suppressed-markup recovery is skipped because it would
   // re-introduce text that lived after the stop.
   const okToolCalls = stopMatched || !allowToolUse ? [] : parsedToolCalls;
-  const text =
-    !stopMatched &&
-    !allowToolUse &&
-    result.text.length === 0 &&
-    parsedToolCalls.length > 0 &&
-    containsToolCallMarkup(result.rawText)
-      ? recoverSuppressedToolCallText(result.rawText)
-      : result.text;
+  const text = stopMatched ? result.text : visibleAnswerText(result, allowToolUse);
 
   // Emit a text block unless tool calls exist and there is no text.
   if (text || okToolCalls.length === 0) {
@@ -180,6 +270,7 @@ export function buildAnthropicResponse(
   allowToolUse = true,
   serverTiming?: ServerTimingForUsage,
   matchedStopSequence?: string | null,
+  outputClampedToContext = false,
 ): AnthropicMessagesResponse {
   // A matched stop sequence takes precedence over tool_use: suppress the tool
   // calls so `stop_reason: 'stop_sequence'` is never emitted alongside a
@@ -233,7 +324,7 @@ export function buildAnthropicResponse(
     role: 'assistant',
     model: req.model,
     content: buildAnthropicContent(result, allowToolUse, stopMatched),
-    stop_reason: mapStopReason(result.finishReason, hasToolCalls, matchedStopSequence),
+    stop_reason: mapStopReason(result.finishReason, hasToolCalls, matchedStopSequence, outputClampedToContext),
     stop_sequence: matchedStopSequence ?? null,
     usage,
   };

@@ -52,6 +52,9 @@ Options:
                       Sets the flat cache DFlash2 turns use; the
                       block-paged pool ignores it and stays bf16. bf16
                       uses more memory.
+  --thinking-token-budget <n>  Thinking tokens of a thinking request that
+                      sets no budget, after which its thinking closes
+                      (default: no cap).
   --rerank-config <file>    JSON { policy?, families?, service? } for rerank limits
   --auth-token <tok>  Require this secret on every route except /health,
                       as \`x-api-key\` or \`authorization: Bearer\`. Also
@@ -82,6 +85,7 @@ export interface ServeArgs {
   authToken?: string;
   modelResidency?: 'capability' | 'single';
   kvFormat?: 'int8' | 'bf16';
+  thinkingTokenBudget?: number;
   rerankConfig?: string;
   logDir?: string;
 }
@@ -106,6 +110,7 @@ export function parseServeArgs(argv: string[]): ServeArgs {
       preload: { type: 'string' },
       'model-residency': { type: 'string' },
       'kv-format': { type: 'string' },
+      'thinking-token-budget': { type: 'string' },
       'rerank-config': { type: 'string' },
       'auth-token': { type: 'string' },
       verbose: { type: 'boolean', short: 'v', default: false },
@@ -131,6 +136,8 @@ export function parseServeArgs(argv: string[]): ServeArgs {
   const kvFormat = values['kv-format'];
   if (kvFormat !== undefined && kvFormat !== 'int8' && kvFormat !== 'bf16')
     throw new Error('--kv-format must be int8 or bf16');
+  const budgetText = values['thinking-token-budget'];
+  const thinkingTokenBudget = budgetText === undefined ? undefined : parseThinkingTokenBudget(budgetText);
   const verbose = (values.verbose ?? false) || values['log-dir'] != null;
 
   return {
@@ -142,10 +149,28 @@ export function parseServeArgs(argv: string[]): ServeArgs {
     ...(values.preload !== undefined ? { preload: values.preload } : {}),
     ...(modelResidency !== undefined ? { modelResidency } : {}),
     ...(kvFormat !== undefined ? { kvFormat } : {}),
+    ...(thinkingTokenBudget !== undefined ? { thinkingTokenBudget } : {}),
     ...(values['rerank-config'] !== undefined ? { rerankConfig: values['rerank-config'] } : {}),
     authToken: values['auth-token'],
     logDir: verbose ? resolveLogDir(values['log-dir'], resolveMlxNodeHome()) : undefined,
   };
+}
+
+/** A nonnegative decimal integer that fits the native i32 budget. */
+function parseThinkingTokenBudget(text: string): number {
+  let value = 0;
+  for (let index = 0; index < text.length; index++) {
+    const digit = text.charCodeAt(index) - 48;
+    if (digit < 0 || digit > 9) {
+      value = Number.NaN;
+      break;
+    }
+    value = value * 10 + digit;
+  }
+  if (text.length === 0 || !(value <= 2_147_483_647)) {
+    throw new Error(`Invalid --thinking-token-budget "${text}": expected a nonnegative integer.`);
+  }
+  return value;
 }
 
 /** Seams injected only by tests; production callers pass nothing. */
@@ -186,6 +211,7 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
       model: args.model,
       modelResidency: args.modelResidency,
       ...(args.kvFormat !== undefined ? { kvFormat: args.kvFormat } : {}),
+      ...(args.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: args.thinkingTokenBudget } : {}),
       ...(await readRerankConfig(args.rerankConfig)),
       authToken: args.authToken,
       logDir: args.logDir,

@@ -1094,37 +1094,69 @@ describe('mapAnthropicRequest', () => {
     expect(stopSequences).toEqual([]);
   });
 
-  it('filters empty strings out of stop_sequences', () => {
-    const { stopSequences } = mapAnthropicRequest({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 1024,
-      messages: [{ role: 'user', content: 'Hello' }],
-      stop_sequences: ['', 'X'],
-    });
-    expect(stopSequences).toEqual(['X']);
+  // Splash `_stop_sequences` + `Frontend._generation_options` limits, messages
+  // as Splash `test_stop_sequences_follow_messages_and_errors_name_them`.
+  // Mutation: the old silent filter (drop blank entries, accept a string) → red.
+  it.each([
+    ['end', 'stop_sequences must be an array of strings'],
+    [['end', 1], 'stop_sequences must be an array of strings'],
+    [['end', 'end', 'end', 'end', 'end'], 'stop_sequences must be up to four strings'],
+    [[''], 'each of stop_sequences must contain non-whitespace'],
+    [['end', '\n'], 'each of stop_sequences must contain non-whitespace'],
+    [[' \t'], 'each of stop_sequences must contain non-whitespace'],
+    [['x'.repeat(16_385)], 'each of stop_sequences must be at most 16384 characters'],
+  ])('rejects stop_sequences %#', (stops, message) => {
+    expect(() =>
+      mapAnthropicRequest({
+        model: 'local',
+        max_tokens: 16,
+        messages: [{ role: 'user', content: 'Hello' }],
+        stop_sequences: stops as string[],
+      }),
+    ).toThrow(message);
   });
 
-  it('filters whitespace-only strings out of stop_sequences', () => {
-    // The real Anthropic API rejects whitespace-only stops with a 400, and
-    // keeping them live would silently truncate normal output at the first
-    // space/newline. Dropping them makes such entries a no-op.
+  it('accepts four stops of up to 16384 characters, counted as code points', () => {
+    const astral = '\u{1F600}'.repeat(16_384);
     const { stopSequences } = mapAnthropicRequest({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 1024,
+      model: 'local',
+      max_tokens: 16,
       messages: [{ role: 'user', content: 'Hello' }],
-      stop_sequences: [' ', '\n', '\t', '  ', 'X'],
+      stop_sequences: ['\nend ', '\nend ', 'x'.repeat(16_384), astral],
     });
-    expect(stopSequences).toEqual(['X']);
+    expect(stopSequences).toEqual(['\nend ', '\nend ', 'x'.repeat(16_384), astral]);
   });
 
-  it('treats an all-whitespace stop_sequences array as no stop strings', () => {
-    const { stopSequences } = mapAnthropicRequest({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 1024,
+  // Splash `_thinking_budget`. Mutation: drop the 1024 floor → red (1023 maps).
+  it('maps enabled thinking budget_tokens to the thinking budget', () => {
+    const map = (thinking: unknown) =>
+      mapAnthropicRequest({
+        model: 'local',
+        max_tokens: 16,
+        messages: [{ role: 'user', content: 'Hello' }],
+        thinking: thinking as never,
+      }).config.thinkingTokenBudget;
+    expect(map({ type: 'enabled', budget_tokens: 2048 })).toBe(2048);
+    expect(map({ type: 'enabled', budget_tokens: 1024 })).toBe(1024);
+    expect(map({ type: 'adaptive' })).toBeUndefined();
+    expect(map({ type: 'disabled', budget_tokens: 4096 })).toBeUndefined();
+    expect(map(undefined)).toBeUndefined();
+    for (const budget of [1023, 1500.5, '2048', undefined, true]) {
+      expect(() => map({ type: 'enabled', budget_tokens: budget })).toThrow(
+        'thinking.budget_tokens must be an integer of at least 1024',
+      );
+    }
+  });
+
+  it('lets extra_body.thinking_budget override budget_tokens', () => {
+    const { config } = mapAnthropicRequest({
+      model: 'local',
+      max_tokens: 16,
       messages: [{ role: 'user', content: 'Hello' }],
-      stop_sequences: [' ', '\n'],
+      thinking: { type: 'enabled', budget_tokens: 2048 },
+      extra_body: { thinking_budget: 0 },
     });
-    expect(stopSequences).toEqual([]);
+    expect(config.thinkingTokenBudget).toBe(0);
   });
 
   it('maps max_tokens to maxNewTokens in config', () => {

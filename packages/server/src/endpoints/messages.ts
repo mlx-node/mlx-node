@@ -80,10 +80,9 @@ import {
   buildMessageStartEvent,
   buildMessageStop,
   buildProgressPing,
-  containsToolCallMarkup,
   internalToolCallIdToAnthropic,
-  recoverSuppressedToolCallText,
   mapStopReason,
+  visibleAnswerText,
 } from '../mappers/anthropic-response.js';
 import { genId } from '../mappers/response.js';
 import {
@@ -206,6 +205,17 @@ function applyClaudeCodeTitleFastPath(config: ChatConfig, body: AnthropicMessage
   };
 }
 
+/**
+ * The server's `--thinking-token-budget` for a thinking request that sets
+ * none (Splash `Frontend._generation_options`).
+ */
+function applyDefaultThinkingTokenBudget(config: ChatConfig, budget: number | undefined): ChatConfig {
+  if (budget === undefined || config.thinkingTokenBudget !== undefined || config.reasoningEffort === 'none') {
+    return config;
+  }
+  return { ...config, thinkingTokenBudget: budget };
+}
+
 // Non-streaming path
 
 async function handleNonStreaming(
@@ -214,6 +224,7 @@ async function handleNonStreaming(
   body: AnthropicMessagesRequest,
   visibility: TransportVisibility,
   stopSequences: string[],
+  outputClampedToContext: boolean,
   serverTiming?: ServerTimingForUsage,
 ): Promise<void> {
   const messageId = genId('msg_');
@@ -234,13 +245,7 @@ async function handleNonStreaming(
   // left untouched. With no match `responseResult` stays `result` (full text
   // retained — `flush()` releases any held incomplete partial as normal text),
   // so behavior is byte-identical to a request without `stop_sequences`.
-  const visibleText =
-    !requestAllowsToolUse(body) &&
-    result.text.length === 0 &&
-    result.toolCalls.filter((t) => t.status === 'ok').length > 0 &&
-    containsToolCallMarkup(result.rawText)
-      ? recoverSuppressedToolCallText(result.rawText)
-      : result.text;
+  const visibleText = visibleAnswerText(result, requestAllowsToolUse(body));
 
   let matchedStopSequence: string | null = null;
   let responseResult = result;
@@ -269,6 +274,7 @@ async function handleNonStreaming(
     requestAllowsToolUse(body),
     serverTiming,
     matchedStopSequence,
+    outputClampedToContext,
   );
 
   // The request AbortSignal reaches the normal session method, whose wrapper
@@ -302,6 +308,7 @@ async function handleStreamingNative(
   visibility: TransportVisibility,
   emitReasoning: boolean,
   stopSequences: string[],
+  outputClampedToContext: boolean,
   serverTiming?: ServerTimingForUsage,
   progressRef?: ChatStreamProgressRef,
 ): Promise<MessagesStreamingHandlerResult> {
@@ -316,6 +323,7 @@ async function handleStreamingNative(
       visibility,
       emitReasoning,
       stopSequences,
+      outputClampedToContext,
       serverTiming,
       progressRef,
     );
@@ -333,6 +341,7 @@ async function handleStreamingNativeWithAbort(
   visibility: TransportVisibility,
   emitReasoning: boolean,
   stopSequences: string[],
+  outputClampedToContext: boolean,
   serverTiming?: ServerTimingForUsage,
   progressRef?: ChatStreamProgressRef,
 ): Promise<MessagesStreamingHandlerResult> {
@@ -496,13 +505,7 @@ async function handleStreamingNativeWithAbort(
         if (!allowToolUse && parsedToolCalls.length > 0) {
           suppressedToolCalls = true;
         }
-        const finalText =
-          !allowToolUse &&
-          event.text.length === 0 &&
-          parsedToolCalls.length > 0 &&
-          containsToolCallMarkup(event.rawText)
-            ? recoverSuppressedToolCallText(event.rawText)
-            : event.text;
+        const finalText = visibleAnswerText(event, allowToolUse);
 
         // The visible text the stream already RECEIVED, in stream order: what
         // reached the wire (`emittedText`), the parked leading whitespace the
@@ -701,7 +704,12 @@ async function handleStreamingNativeWithAbort(
         // Capture terminal state and break — actual `message_delta` / `message_stop` /
         // `error` emission is deferred until after the loop so `wasCommitted()` reads
         // an authoritative `session.turns` (the producer's finally runs on break).
-        terminalStopReason = mapStopReason(event.finishReason, hasToolCalls, matchedStopSequence);
+        terminalStopReason = mapStopReason(
+          event.finishReason,
+          hasToolCalls,
+          matchedStopSequence,
+          outputClampedToContext,
+        );
         terminalNumTokens = event.numTokens;
         terminalPromptTokens = event.promptTokens;
         terminalCachedTokens = event.cachedTokens;
@@ -975,6 +983,17 @@ async function handleStreamingNativeWithAbort(
 interface MessagesNonStreamingOutcome {
   result: ChatResult;
   committed: boolean;
+  /** The context window, not the request's limit, set the output budget. */
+  outputClampedToContext: boolean;
+}
+
+/** Splash `output_clamped_to_context`: `requested is not None and max_new < requested`. */
+function clampedToContext(requested: ChatConfig, constrained: ChatConfig): boolean {
+  return (
+    requested.maxNewTokens != null &&
+    constrained.maxNewTokens != null &&
+    constrained.maxNewTokens < requested.maxNewTokens
+  );
 }
 
 /** Prime a session with the full history and run a single turn. */
@@ -1008,14 +1027,19 @@ async function runSessionNonStreaming(
   //     the reused prefix on this turn. `primeHistory` requires
   //     `turnCount === 0`, which the helper guarantees by wiping
   //     JS-side state only.
+  //
+  // The JS state resets before `preflightContextCapacity`, whose
+  // `mergeConfig` fills an omitted `tools` from the session (a leased warm
+  // session still holds the previous turn's); the native reset waits for
+  // the preflight so a context-overflow 400 leaves the native cache alone.
+  await resetPreservingNativeCacheForWarmReuse(session);
+  const constrainedConfig = await session.preflightContextCapacity(messages, config);
   if (resetNativeCache) {
     await session.reset();
-  } else {
-    await resetPreservingNativeCacheForWarmReuse(session);
   }
   session.primeHistory(messages);
   const initialTurns = session.turns;
-  const result = await session.startFromHistory(config, { signal });
+  const result = await session.startFromHistory(constrainedConfig, { signal });
   // Mirror the streaming-side dual-gate (`streamResult.ok &&
   // outcome.wasCommitted()`) and the sibling `/v1/responses` adopt
   // gate. `ChatSession.startFromHistory` advances `turnCount`
@@ -1026,7 +1050,7 @@ async function runSessionNonStreaming(
   // `chat_session_start_sync` with `Ok(finish_reason="error")` cannot
   // silently poison the warm slot.
   const committed = session.turns > initialTurns && result.finishReason !== 'error';
-  return { result, committed };
+  return { result, committed, outputClampedToContext: clampedToContext(config, constrainedConfig) };
 }
 
 /**
@@ -1040,6 +1064,8 @@ interface MessagesStreamingOutcome {
   wasCommitted: () => boolean;
   /** Filled while the native stream runs; read by the progress ping. */
   progress: ChatStreamProgressRef;
+  /** The context window, not the request's limit, set the output budget. */
+  outputClampedToContext: boolean;
 }
 
 async function runSessionStreaming(
@@ -1049,10 +1075,6 @@ async function runSessionStreaming(
   signal: AbortSignal | undefined,
   resetNativeCache: boolean,
 ): Promise<MessagesStreamingOutcome> {
-  // Validate the exact canonical history before resetting either JS or native
-  // state. This preserves a clean HTTP 400 path for context overflow while
-  // keeping SSE header latency independent from image processing/prefill.
-  const constrainedConfig = await session.preflightContextCapacity(messages, config);
   // Same dual-branch reset as `runSessionNonStreaming`: native-reset
   // requests wipe both JS and native state to block the cross-request
   // cache-affinity leak described at length in `responses.ts`; native-
@@ -1060,10 +1082,14 @@ async function runSessionStreaming(
   // paged content-addressed cache can recover a verified native prefix.
   // `initialTurns` MUST be captured AFTER the reset zeroes `turns` so
   // the committed check reads correctly.
+  //
+  // JS state resets before the preflight and native state after it, as in
+  // `runSessionNonStreaming`. The preflight runs before any SSE byte, so a
+  // context overflow is a clean HTTP 400 that leaves the native cache alone.
+  await resetPreservingNativeCacheForWarmReuse(session);
+  const constrainedConfig = await session.preflightContextCapacity(messages, config);
   if (resetNativeCache) {
     await session.reset();
-  } else {
-    await resetPreservingNativeCacheForWarmReuse(session);
   }
   session.primeHistory(messages);
   const initialTurns = session.turns;
@@ -1072,6 +1098,7 @@ async function runSessionStreaming(
     stream: session.startFromHistoryStream(constrainedConfig, signal, progress),
     wasCommitted: () => session.turns > initialTurns,
     progress,
+    outputClampedToContext: clampedToContext(config, constrainedConfig),
   };
 }
 
@@ -1085,6 +1112,7 @@ export async function handleCreateMessage(
   idleSweeper?: IdleSweeper | null,
   resolveModel?: (name: string) => Promise<void>,
   modelWorkCoordinator?: ModelWorkCoordinator,
+  defaultThinkingTokenBudget?: number,
 ): Promise<void> {
   if (modelWorkCoordinator) {
     registry.setModelLoadAdmissionCoordinator(modelWorkCoordinator);
@@ -1144,10 +1172,8 @@ export async function handleCreateMessage(
   // resolveModel and use as a cheap pre-flight gate.
   let mappedMessages: ChatMessage[];
   let mappedConfig: ChatConfig;
-  // Client-supplied `stop_sequences`, normalized by the mapper (absent/empty
-  // dropped). Threaded into the streaming + non-streaming handlers, which own
-  // the detection/truncation. `ChatConfig` has no native stop field, so this
-  // rides alongside `config` from the mapper.
+  // Client-supplied `stop_sequences`, validated by the mapper. Threaded into
+  // the streaming + non-streaming handlers, which own the detection/truncation.
   let mappedStopSequences: string[];
   try {
     ({
@@ -1346,6 +1372,7 @@ export async function handleCreateMessage(
     const sessionReg: SessionRegistry = lease.registry;
     mappedConfig = applyOutputTokenLimit(mappedConfig, sessionReg.outputTokenLimit);
     mappedConfig = applyClaudeCodeTitleFastPath(mappedConfig, body);
+    mappedConfig = applyDefaultThinkingTokenBudget(mappedConfig, defaultThinkingTokenBudget);
     // Snapshot the monotonic instance id so the in-mutex re-read can detect a
     // hot-swap that lands between lease acquisition and mutex entry. Unlike
     // `/v1/responses`, the Anthropic handler has no stored-identity check
@@ -1623,6 +1650,7 @@ export async function handleCreateMessage(
                 visibility,
                 config.includeReasoning !== false,
                 stopSequences,
+                outcome.outputClampedToContext,
                 serverTiming,
                 outcome.progress,
               );
@@ -1710,7 +1738,15 @@ export async function handleCreateMessage(
               if (result.cachedTokens > 0) {
                 res.setHeader('X-Cached-Tokens', String(result.cachedTokens));
               }
-              await handleNonStreaming(res, result, body, visibility, stopSequences, serverTiming);
+              await handleNonStreaming(
+                res,
+                result,
+                body,
+                visibility,
+                stopSequences,
+                outcome.outputClampedToContext,
+                serverTiming,
+              );
               // Non-paged success: adopt the warm slot only when the
               // dispatch actually committed. Mirrors the streaming-side
               // dual-gate at `streamResult.ok && outcome.wasCommitted()`

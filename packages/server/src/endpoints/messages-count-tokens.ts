@@ -2,7 +2,7 @@
 
 import type { ServerResponse } from 'node:http';
 
-import type { ChatMessage, ToolDefinition } from '@mlx-node/core';
+import { countPromptTokens } from '@mlx-node/lm';
 
 import {
   sendAnthropicBadRequest,
@@ -13,23 +13,9 @@ import {
 import type { IdleSweeper } from '../idle-sweeper.js';
 import { mapAnthropicRequest } from '../mappers/anthropic-request.js';
 import type { ModelWorkCoordinator } from '../model-work-coordinator.js';
-import type { ModelRegistry, ServableModel } from '../registry.js';
+import type { ModelRegistry } from '../registry.js';
 import { stringifyStrictJson } from '../strict-json.js';
 import type { AnthropicCountTokensRequest, AnthropicCountTokensResponse } from '../types-anthropic.js';
-
-interface ChatTemplateTokenCounter {
-  applyChatTemplate(
-    messages: ChatMessage[],
-    addGenerationPrompt?: boolean | null,
-    tools?: ToolDefinition[] | null,
-    enableThinking?: boolean | null,
-  ): Promise<Uint32Array> | Uint32Array;
-}
-
-function getChatTemplateTokenCounter(model: ServableModel): ChatTemplateTokenCounter | null {
-  const candidate = model as ServableModel & Partial<ChatTemplateTokenCounter>;
-  return typeof candidate.applyChatTemplate === 'function' ? (candidate as ChatTemplateTokenCounter) : null;
-}
 
 function endJson(res: ServerResponse, body: AnthropicCountTokensResponse): void {
   res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -133,8 +119,7 @@ export async function handleCountMessageTokens(
         return;
       }
 
-      const counter = getChatTemplateTokenCounter(leaseModel);
-      if (!counter) {
+      if (typeof leaseModel.applyChatTemplate !== 'function') {
         sendAnthropicNotImplemented(
           res,
           `Model "${body.model}" does not expose applyChatTemplate(); token counting requires a ` +
@@ -144,12 +129,19 @@ export async function handleCountMessageTokens(
       }
 
       try {
-        const tokens = await counter.applyChatTemplate(mapped.messages, true, mapped.config.tools ?? null);
+        // The same count the context clamp uses, with the effort the session would normalize.
+        const effort = leaseModel.normalizeReasoningEffort
+          ? leaseModel.normalizeReasoningEffort(mapped.config.reasoningEffort)
+          : mapped.config.reasoningEffort;
+        const inputTokens = await countPromptTokens(leaseModel, mapped.messages, {
+          tools: mapped.config.tools,
+          reasoningEffort: effort,
+        });
         if (!bindingStillMatchesLease()) {
           rejectChangedBinding('running');
           return;
         }
-        endJson(res, { input_tokens: tokens.length });
+        endJson(res, { input_tokens: inputTokens });
       } catch (err) {
         sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to count tokens');
       }

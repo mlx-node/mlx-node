@@ -103,6 +103,7 @@ export {
   ChatSession,
   ContextCapacityError,
   contextLane,
+  countPromptTokens,
   isCapacityExhaustedError,
   isContextCapacityError,
   mtpAutoDefaultAllowed,
