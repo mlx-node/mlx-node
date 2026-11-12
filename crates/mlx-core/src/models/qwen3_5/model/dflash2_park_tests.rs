@@ -100,6 +100,9 @@ impl crate::engine::backend::ChunkSink for StopAt20<'_> {
 /// place of registering them; the hit stops inside the prompt.
 #[test]
 fn a_stopped_turn_commits_through_the_match() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported("a_stopped_turn_commits_through_the_match") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -747,6 +750,9 @@ fn rung_key(inner: &Qwen35Inner, prefix_len: u32, final_block_hash: u64) -> Unit
 /// goes first).
 #[test]
 fn a_replay_point_in_use_is_not_a_unit() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported("a_replay_point_in_use_is_not_a_unit") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -803,6 +809,11 @@ fn a_replay_point_in_use_is_not_a_unit() -> Result<()> {
 /// `remember_dense_gdn_history_checkpoint` → red (E below the history).
 #[test]
 fn use_end_stamps_the_replay_point_after_the_history() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "use_end_stamps_the_replay_point_after_the_history",
+    ) {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -973,6 +984,11 @@ fn cap_reclaim_takes_a_rung_over_a_held_tail() -> Result<()> {
 /// → red (E stays InUse).
 #[test]
 fn scheduled_turn_close_ends_the_replay_points_use() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "scheduled_turn_close_ends_the_replay_points_use",
+    ) {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -1009,6 +1025,11 @@ impl crate::engine::backend::ChunkSink for NullSink {
 /// `paged_turn_stream_core` → red on `stream` (`Err`).
 #[test]
 fn serial_prepare_at_the_cap_frees_a_ladder_chain() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "serial_prepare_at_the_cap_frees_a_ladder_chain",
+    ) {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -1216,6 +1237,11 @@ fn vlm_prepare_without_reuse_takes_the_prompts_own_rung() -> Result<()> {
 /// the history write → red on `reuse true`.
 #[test]
 fn a_released_serial_turn_ends_the_replay_points_use() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "a_released_serial_turn_ends_the_replay_points_use",
+    ) {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -1265,11 +1291,19 @@ fn a_released_serial_turn_ends_the_replay_points_use() -> Result<()> {
 /// then a cold DFlash2 turn on a 7-block prompt in 2-block chunks: the
 /// prime releases the table into the cache, marked, so the second chunk is
 /// refused until the take order drops the rung (Splash `Engine::growLane`
-/// books each chunk through `Engine::allocate`).
+/// books each chunk through `Engine::allocate`). The turn's own states,
+/// published as its chunks reach them, mark the old table's blocks under
+/// their hashes: the third chunk takes the checkpoint at 64, the last one
+/// the replay point at 96 (Splash takes a state in use last).
 /// Mutation R1 (a DFlash2 prefill chunk books with a plain `record_tokens`)
 /// → red (`Err` "could not reserve").
 #[test]
 fn cold_dflash2_prefill_reclaims_a_marked_live_chain() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "cold_dflash2_prefill_reclaims_a_marked_live_chain",
+    ) {
+        return Ok(());
+    }
     use crate::engine::backend::PagedPrefix;
     use crate::engine::dspark_turn::PagedDsparkBackend;
     use crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE;
@@ -1311,7 +1345,19 @@ fn cold_dflash2_prefill_reclaims_a_marked_live_chain() -> Result<()> {
     })();
     PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
     result?;
-    assert_eq!(grow_reclaim_log(), vec![GrowReclaim::Ladder]);
+    let depths: Vec<usize> = inner
+        .dflash2_states
+        .store
+        .entries()
+        .map(|entry| entry.depth())
+        .collect();
+    assert_eq!(
+        (grow_reclaim_log(), depths),
+        (
+            vec![GrowReclaim::Ladder, GrowReclaim::Store, GrowReclaim::Store],
+            Vec::new()
+        )
+    );
     assert!(
         inner
             .ladder_entries_for_test()
@@ -1380,6 +1426,11 @@ impl crate::engine::backend::ChunkSink for LastChunk {
 /// Mutation M12: the cores force `</think>` alone → red on both.
 #[test]
 fn legacy_dense_cores_end_thinking_with_the_whole_close() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "legacy_dense_cores_end_thinking_with_the_whole_close",
+    ) {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -1436,9 +1487,13 @@ fn legacy_dense_cores_end_thinking_with_the_whole_close() -> Result<()> {
 /// and an empty draft window.
 fn anchor(inner: &Qwen35Inner) -> crate::models::qwen3_5::dflash2_state::paged::PagedAnchor {
     use crate::models::qwen3_5::dflash2_state::paged::PagedAnchor;
-    let window = crate::models::qwen3_5::dflash2::DFlash2ContextCache::new(
-        &inner.dflash2.as_ref().expect("draft").config,
-    );
+    let window = inner
+        .dflash2
+        .as_ref()
+        .expect("draft")
+        .config
+        .context_window()
+        .expect("window");
     let mut linear = inner.fresh_dflash2_layer_caches();
     for cache in &mut linear {
         if let Qwen3_5LayerCache::Linear(gdn) = cache {
@@ -1460,14 +1515,15 @@ fn anchor(inner: &Qwen35Inner) -> crate::models::qwen3_5::dflash2_state::paged::
 /// A parked DFlash2 state on `tokens` (whole blocks) of this model's
 /// geometry, published and marked; returns its id.
 fn park_state(inner: &mut Qwen35Inner, tokens: &[u32]) -> u64 {
-    use crate::models::qwen3_5::dflash2_state::store::Lineage;
+    use crate::models::qwen3_5::dflash2_state::store::{Lineage, StateClass};
     let state = anchor(inner);
-    let (id, new) = inner
+    let inserted = inner
         .dflash2_states
         .store
-        .insert(Lineage::text(tokens, 0), state)
+        .insert(Lineage::text(tokens, 0), state, StateClass::Ordinary)
         .expect("a whole-block state");
-    assert!(new);
+    assert!(inserted.new);
+    let id = inserted.id;
     inner.sync_gdn_state_marks();
     id
 }
@@ -1566,7 +1622,7 @@ fn installing_a_state_whose_block_is_gone_fails() -> Result<()> {
         .expect("adapter")
         .release_request_and_purge_prefix_cache()
         .map_err(Error::from_reason)?;
-    let error = crate::models::qwen3_5::dflash2_turn::install_parked_state(&mut inner, id, 0, &[])
+    let error = crate::models::qwen3_5::dflash2_turn::install_parked_state(&mut inner, id, false)
         .err()
         .map(|error| error.reason);
     assert!(
@@ -1861,12 +1917,12 @@ fn doomed_lone_turn_keeps_the_cache() -> Result<()> {
     Ok(())
 }
 
-/// Splash `HostRule::admits` under macOS Warning: the optional publications
-/// (a ladder rung, a parked state's install) are held back and counted; the
-/// prompt's replay point, in service and reaching what turns use, publishes
-/// past the host since no state it may take meets it; and a decode step
-/// whose pool grow the host refused is granted past it once nothing in
-/// place meets it.
+/// Splash `HostRule::admits` under macOS Warning: the optional publication
+/// of a ladder rung is held back and counted; the
+/// capture of the prompt's replay point, in service and reaching what turns
+/// use, is granted past the host since no state it may take meets it; and a
+/// decode step whose pool grow the host refused is granted past it once
+/// nothing in place meets it.
 /// Mutation W4 (Optional judged as InService) → red (the rung is stored);
 /// W5 (the replay point as Optional) → red (it is refused).
 #[test]
@@ -1874,7 +1930,11 @@ fn warning_holds_back_publications_not_the_lane() -> Result<()> {
     use crate::engine::governor::governor::Governor;
     use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
     use crate::engine::governor::host::Pressure;
-    use crate::models::qwen3_5::dflash2_turn::{install_parked_state, publish_replay_state};
+    use crate::models::qwen3_5::dflash2_state::paged::TurnStates;
+    use crate::models::qwen3_5::dflash2_state::plan::{StateBoundary, StatePlan};
+    use crate::models::qwen3_5::dflash2_state::store::StateBytes;
+    use crate::models::qwen3_5::dflash2_turn::reserve_capture;
+    use crate::models::qwen3_5::paged_forward::CaptureGrant;
     use crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint;
     if !metal_is_default_device() {
         return Ok(());
@@ -1906,30 +1966,33 @@ fn warning_holds_back_publications_not_the_lane() -> Result<()> {
         "the rung is held back"
     );
 
-    let mut replay = chain_tokens(92, 1, block_size);
-    let mut state = anchor(&inner);
-    state.window.record_only(&replay)?;
-    replay.push(1);
-    publish_replay_state(&mut inner, &replay, 0, state);
-    let depths: Vec<usize> = inner
-        .dflash2_states
-        .store
-        .entries()
-        .map(|entry| entry.depth())
-        .collect();
-    assert_eq!(
-        depths,
-        vec![block_size as usize],
-        "the replay point publishes"
+    let row = block_size;
+    inner.dflash2_states.turn = Some(TurnStates {
+        plan: StatePlan {
+            boundaries: vec![StateBoundary {
+                tokens: row,
+                disposable: false,
+            }],
+            prompt_replay: row,
+        },
+        cursor: 0,
+        passed: Vec::new(),
+        anchor_bytes: anchor(&inner).state_bytes(),
+        latest_checkpoint: None,
+        cache_salt: 0,
+        junction: 0,
+        prompt_tokens: row + 1,
+        reuse: true,
+    });
+    assert!(
+        matches!(
+            reserve_capture(&mut inner, row)?,
+            CaptureGrant::Reserved(Some(_), _)
+        ),
+        "the replay point's capture is granted"
     );
-
-    let parked = chain_tokens(93, 1, block_size);
-    cache_chain(&inner, &parked);
-    let id = park_state(&mut inner, &parked);
-    let mut prompt = parked.clone();
-    prompt.push(1);
-    assert_eq!(install_parked_state(&mut inner, id, 1, &prompt)?, None);
-    assert_eq!(governor.publications_refused(7), 2);
+    inner.dflash2_states.turn = None;
+    assert_eq!(governor.publications_refused(7), 1);
 
     let mut lane = fixture(0xDFA5_3802);
     install_pool(&mut lane, 4, 12, passing_probe())?;
@@ -2099,25 +2162,102 @@ fn critical_host_pass_evicts_dead_leaves_to_cut_an_extent() -> Result<()> {
     Ok(())
 }
 
+/// Splash `Cache::WalkCursor::Phase` (`Checkpoints`, `DeadLeaves`,
+/// `Ordinary`): a bytes need lists a stored checkpoint before the pool's
+/// dead leaves, and the dead leaves before an ordinary state.
+/// Mutation DL1 (the dead leaves go ahead of the checkpoints) → red.
+#[test]
+fn dead_leaves_go_after_checkpoints_before_ordinary_states() -> Result<()> {
+    use crate::engine::governor::ledger::{CertainReuse, Need, Reserves, TakeRights, VictimQuery};
+    use crate::models::qwen3_5::dflash2_state::paged::PagedAnchor;
+    use crate::models::qwen3_5::dflash2_state::store::{Lineage, StateClass};
+    use crate::models::qwen3_5::dflash2_turn::model_units;
+    use crate::models::qwen3_5::draft_context::DraftContextWindow;
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let mut inner = fixture(0xDFA5_3912);
+    install_pool(&mut inner, 4, 12, passing_probe())?;
+    let block_size = pool_block_size(&inner);
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .set_extent_growth(4);
+    cache_chain(&inner, &chain_tokens(95, 4, block_size));
+    assert!(
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("adapter")
+            .try_grow_pool(4)
+    );
+    cache_chain(&inner, &chain_tokens(96, 4, block_size));
+    let anchor = || PagedAnchor {
+        linear: Vec::new(),
+        window: DraftContextWindow::new(64, 8).expect("window"),
+    };
+    let (ordinary, checkpoint) = (
+        chain_tokens(97, 1, block_size),
+        chain_tokens(98, 1, block_size),
+    );
+    let store = &mut inner.dflash2_states.store;
+    let o = store
+        .insert(Lineage::text(&ordinary, 0), anchor(), StateClass::Ordinary)
+        .map_err(|error| Error::from_reason(format!("{error:?}")))?
+        .id;
+    let c = store
+        .insert(
+            Lineage::text(&checkpoint, 0),
+            anchor(),
+            StateClass::Checkpoint,
+        )
+        .map_err(|error| Error::from_reason(format!("{error:?}")))?
+        .id;
+    let query = VictimQuery {
+        rights: TakeRights {
+            units: true,
+            certain_reuse: CertainReuse::All,
+            reserves: Reserves::All,
+            ..TakeRights::default()
+        },
+        need: Need {
+            bytes: 1,
+            ..Need::default()
+        },
+    };
+    let keys: Vec<UnitKey> = model_units(&inner, Keep::default(), &query)
+        .into_units()
+        .into_iter()
+        .map(|unit| unit.key)
+        .filter(|key| matches!(key, UnitKey::Store(_) | UnitKey::DeadLeaves))
+        .collect();
+    assert_eq!(
+        keys,
+        vec![UnitKey::Store(c), UnitKey::DeadLeaves, UnitKey::Store(o)]
+    );
+    Ok(())
+}
+
 /// What a streamed turn sent: its text deltas, its done chunks' raw text.
 #[derive(Default)]
-struct StreamLog {
-    deltas: String,
-    done: Vec<String>,
-    tokens: u32,
-    finish: Option<String>,
+pub(crate) struct StreamLog {
+    pub(crate) deltas: String,
+    pub(crate) done: Vec<String>,
+    pub(crate) tokens: u32,
+    pub(crate) finish: Option<String>,
 }
 
 /// Records a streamed turn; at its first chunk it runs `first` once.
 /// `stopped` is its `ChatStreamHandle::stop` bit.
-struct LoggingSink {
-    log: std::sync::Mutex<StreamLog>,
+pub(crate) struct LoggingSink {
+    pub(crate) log: std::sync::Mutex<StreamLog>,
     first: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LoggingSink {
-    fn new(first: Option<Box<dyn FnOnce() + Send>>) -> Self {
+    pub(crate) fn new(first: Option<Box<dyn FnOnce() + Send>>) -> Self {
         Self {
             log: std::sync::Mutex::new(StreamLog::default()),
             first: std::sync::Mutex::new(first),
@@ -2161,8 +2301,8 @@ fn run_streamed_turn(
     run_streamed_turn_for(inner, decoder, tokens, sink, cancelled, SUSPEND_MAX_NEW)
 }
 
-fn run_streamed_turn_for(
-    inner: &mut Qwen35Inner,
+pub(crate) fn run_streamed_turn_for<B: ChatBackend>(
+    inner: &mut B,
     decoder: DecoderPlan,
     tokens: &[u32],
     sink: &LoggingSink,
@@ -2230,7 +2370,7 @@ fn suspending_lane(
     Ok((inner, prompt))
 }
 
-fn fake_governor(
+pub(crate) fn fake_governor(
     pressure: crate::engine::governor::host::Pressure,
 ) -> (
     Arc<crate::engine::governor::governor::tests::FakeIo>,
@@ -2255,6 +2395,9 @@ fn fake_governor(
 /// (a whole turn's wait syncs no claim) → red (0 bytes refused waiting).
 #[test]
 fn host_yield_vacates_and_waits_in_place() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported("host_yield_vacates_and_waits_in_place") {
+        return Ok(());
+    }
     use crate::engine::governor::governor::CancelScope;
     use crate::engine::governor::governor::tests::{G, host};
     use crate::engine::governor::host::Pressure;
@@ -2361,6 +2504,9 @@ fn host_yield_vacates_and_waits_in_place() -> Result<()> {
 /// wait checks its limit before the stop) → red (`resource_timeout`).
 #[test]
 fn a_stop_in_the_suspend_wait_completes() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported("a_stop_in_the_suspend_wait_completes") {
+        return Ok(());
+    }
     use crate::engine::governor::governor::CancelScope;
     use crate::engine::governor::governor::tests::{G, host};
     use crate::engine::governor::host::Pressure;
@@ -2433,6 +2579,9 @@ fn a_stop_in_the_suspend_wait_completes() -> Result<()> {
 /// (`prefill cancelled`).
 #[test]
 fn a_stop_during_the_replay_completes() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported("a_stop_during_the_replay_completes") {
+        return Ok(());
+    }
     use crate::engine::governor::governor::CancelScope;
     use crate::engine::governor::governor::tests::{G, host};
     use crate::engine::governor::host::Pressure;
@@ -2488,12 +2637,12 @@ fn a_stop_during_the_replay_completes() -> Result<()> {
     Ok(())
 }
 
-/// Every linear layer's conv history and recurrent state, as f32.
-fn gdn_cells(inner: &Qwen35Inner) -> Vec<Vec<f32>> {
-    let caches = inner
-        .caches
-        .as_ref()
-        .expect("the turn keeps its live state");
+/// Every linear layer's conv history and recurrent state, as f32, of the
+/// lane the last DFlash2 turn released.
+fn gdn_cells() -> Vec<Vec<f32>> {
+    let caches = crate::models::qwen3_5::dflash2_turn::RELEASED_LANE
+        .with(|lane| lane.borrow_mut().take())
+        .expect("the turn released its live state");
     caches
         .iter()
         .filter_map(|cache| match cache {
@@ -2534,6 +2683,9 @@ fn gdn_gap(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
 /// target).
 #[test]
 fn suspended_turn_replays_to_the_solo_tokens() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported("suspended_turn_replays_to_the_solo_tokens") {
+        return Ok(());
+    }
     use crate::engine::governor::governor::tests::{G, host};
     use crate::engine::governor::host::Pressure;
     use std::sync::atomic::AtomicBool;
@@ -2600,6 +2752,11 @@ fn suspended_turn_replays_to_the_solo_tokens() -> Result<()> {
 /// (the raw MLX text, no recovery noted).
 #[test]
 fn a_verify_oom_outside_the_claim_arms_recovery() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "a_verify_oom_outside_the_claim_arms_recovery",
+    ) {
+        return Ok(());
+    }
     use crate::engine::governor::host::Pressure;
     use std::sync::atomic::AtomicBool;
     if !metal_is_default_device() {
@@ -2641,6 +2798,11 @@ fn a_verify_oom_outside_the_claim_arms_recovery() -> Result<()> {
 /// Mutation AP3 (the fresh cells keep the old pending rows) → red.
 #[test]
 fn a_suspended_dflash2_lane_drops_its_pending_rows() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "a_suspended_dflash2_lane_drops_its_pending_rows",
+    ) {
+        return Ok(());
+    }
     use crate::engine::governor::governor::tests::{G, host};
     use crate::engine::governor::host::Pressure;
     use std::sync::atomic::AtomicBool;
@@ -2668,10 +2830,7 @@ fn a_suspended_dflash2_lane_drops_its_pending_rows() -> Result<()> {
             MAX_NEW,
         )?;
         assert_eq!(governor.suspensions(7), 0, "the solo run grows the pool");
-        (
-            std::mem::take(&mut *sink.log.lock().unwrap()),
-            gdn_cells(&inner),
-        )
+        (std::mem::take(&mut *sink.log.lock().unwrap()), gdn_cells())
     };
     let (io, governor) = fake_governor(Pressure::Normal);
     let (mut inner, prompt) = lane(governor)?;
@@ -2702,18 +2861,23 @@ fn a_suspended_dflash2_lane_drops_its_pending_rows() -> Result<()> {
     assert_eq!(log.done, solo.done, "the solo run's tokens");
     // The replay's prefill rounds apart from the verify kernel's steps
     // (0.012 measured); a pending row folded twice moves the tokens.
-    let gap = gdn_gap(&gdn_cells(&inner), &solo_cells);
+    let gap = gdn_gap(&gdn_cells(), &solo_cells);
     assert!(gap < 0.05, "GDN state {gap} from the solo run's");
     Ok(())
 }
 
 /// Splash `Runtime::suspend` → `QwenStateStorage::releaseLane`: a
-/// suspended DFlash2 lane's two GDN cells, pending rows and draft window
-/// are gone before the wait, so the replay builds its lane beside none of
-/// them.
+/// suspended DFlash2 lane's two GDN cells and pending rows are gone before
+/// the wait, so the replay builds its cells beside none of them; its draft
+/// ring waits in the idle lane for the replay to take.
 /// Mutation R1m (the stepper keeps its lane across the claim) → red.
 #[test]
-fn a_suspended_dflash2_lane_drops_its_cells_and_window() -> Result<()> {
+fn a_suspended_dflash2_lane_drops_its_cells_and_idles_its_ring() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "a_suspended_dflash2_lane_drops_its_cells_and_idles_its_ring",
+    ) {
+        return Ok(());
+    }
     use crate::engine::governor::governor::tests::{G, host};
     use crate::engine::governor::host::Pressure;
     use crate::models::qwen3_5::dflash2_decode::lane_probe;
@@ -2726,7 +2890,8 @@ fn a_suspended_dflash2_lane_drops_its_cells_and_window() -> Result<()> {
     let (mut inner, mut prompt) = suspending_lane(0xDFA5_4A02, governor)?;
     // Eight rows left: the first verify fills the second block.
     prompt.truncate(prompt.len() - 4);
-    let in_wait: Arc<std::sync::Mutex<Option<(usize, usize)>>> = Arc::default();
+    type Held = ((usize, usize), (usize, usize));
+    let in_wait: Arc<std::sync::Mutex<Option<Held>>> = Arc::default();
     {
         let seen = Arc::clone(&in_wait);
         io.with(|state| {
@@ -2756,13 +2921,201 @@ fn a_suspended_dflash2_lane_drops_its_cells_and_window() -> Result<()> {
     )?;
     assert_eq!(governor.suspensions(7), 1);
     assert_eq!(governor.resumptions(7), 1);
-    let (lent, held) = in_wait.lock().unwrap().expect("the lane waited");
-    assert!(lent > 4, "{lent} lane arrays recorded");
+    let ((cells, held), (ring, idle)) = in_wait.lock().unwrap().expect("the lane waited");
+    assert!(cells >= 4, "{cells} cell arrays recorded");
     assert_eq!(
         held, 0,
-        "{held} of the lane's {lent} arrays outlived the vacate"
+        "{held} of the lane's {cells} cell arrays outlived the vacate"
     );
+    assert!(ring > 0, "{ring} ring arrays recorded");
+    assert_eq!(idle, ring, "the idle lane keeps the ring");
     Ok(())
+}
+
+/// Splash `Engine::vacateLane` on a DFlash2 turn: `discardPendingStateBoundaries`,
+/// `model_.suspend`, `cache_.endRequest`, and no state published. (a) The
+/// host refuses the tapped prefill's chunk after 64 of a 100-token prompt
+/// (checkpoints 16..80, replay point 96): the frame unwinds, the lane is
+/// vacated with no turn points and no history entry while the rolling
+/// checkpoint at 64 stays; the resume restores from 64 and replays the rest
+/// of the prompt with the replay point 96 ordinary, which the turn then
+/// uses. (b) The host refuses a verify once the lane fed 113 tokens: the
+/// vacate keeps the replay point's use, the resume restores from 96 and
+/// plans a disposable point at the fed tokens' last block (Splash
+/// `replayStateBoundary`). Both stream an unsuspended run's tokens. The
+/// resume holds its KV target before the state is installed (Splash
+/// `admit`: no restore runs while the KV is refused).
+/// Mutations VC1 (the vacate stores the history entry) and RK1 (the
+/// restore runs before the KV target is held) → red.
+#[test]
+fn vacate_of_a_dflash2_turn_publishes_nothing() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported("vacate_of_a_dflash2_turn_publishes_nothing")
+    {
+        return Ok(());
+    }
+    use crate::engine::governor::governor::tests::{G, model};
+    use crate::engine::governor::host::Pressure;
+    use crate::models::qwen3_5::dflash2_turn::{
+        DFlash2Hit, SUSPEND_LOG, SuspendRecord, YIELD_FROM,
+    };
+    use crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE;
+    use std::sync::atomic::AtomicBool;
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    const MAX_NEW: u32 = 32;
+    let decoder = DecoderPlan::Speculative(crate::engine::plan::SpeculativeKind::DraftModel);
+    let prompt: Vec<u32> = (0..100).map(|i| (i * 7 + 3) % 15 + 1).collect();
+    let run = |yield_from: Option<usize>| -> Result<(StreamLog, Qwen35Inner, u64, u64)> {
+        let (_io, governor) = fake_governor(Pressure::Normal);
+        let mut inner = tiny_dflash_inner_with_config(0xDFA5_5C01, |config| {
+            config.linear_key_head_dim = 128;
+            config.linear_value_head_dim = 128;
+        });
+        install_pool(&mut inner, 12, 12, passing_probe())?;
+        inner.memory_registration =
+            Some(governor.register_model(model(16 * G, 0)).expect("register"));
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("adapter")
+            .set_admission(Arc::new(governor));
+        SUSPEND_LOG.with(|log| log.borrow_mut().clear());
+        YIELD_FROM.with(|from| from.set(yield_from));
+        let sink = LoggingSink::new(None);
+        let ran = run_streamed_turn_for(
+            &mut inner,
+            decoder,
+            &prompt,
+            &sink,
+            &AtomicBool::new(false),
+            MAX_NEW,
+        );
+        YIELD_FROM.with(|from| from.set(None));
+        ran?;
+        let log = std::mem::take(&mut *sink.log.lock().unwrap());
+        Ok((log, inner, governor.suspensions(7), governor.resumptions(7)))
+    };
+    PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(4)));
+    let result = (|| -> Result<()> {
+        let (solo, _, suspensions, _) = run(None)?;
+        assert_eq!(suspensions, 0);
+        assert_eq!(solo.tokens, MAX_NEW);
+
+        let (log, inner, suspensions, resumptions) = run(Some(64))?;
+        assert_eq!((suspensions, resumptions), (1, 1), "prefill");
+        assert_eq!(
+            SUSPEND_LOG.with(|log| log.borrow_mut().split_off(0)),
+            vec![
+                SuspendRecord::Vacated {
+                    fed: 64,
+                    states: vec![(64, true)],
+                    turn: false,
+                    replay_point: false,
+                },
+                SuspendRecord::Resumed {
+                    hit: Some(DFlash2Hit::Stored(64)),
+                    points: vec![(80, true), (96, false)],
+                },
+                SuspendRecord::Restored { depth: 64 },
+            ]
+        );
+        assert_eq!(inner.history_stamp_for_test(), None, "no history entry");
+        let entries: Vec<(usize, bool)> = inner
+            .dflash2_states
+            .store
+            .entries()
+            .map(|entry| (entry.depth(), entry.checkpoint()))
+            .collect();
+        assert!(entries.contains(&(96, false)), "{entries:?}");
+        assert_eq!(inner.dflash2_states.counters.replay_state_publications, 1);
+        assert_eq!(log.done, solo.done, "prefill: the unsuspended tokens");
+
+        let (log, inner, suspensions, resumptions) = run(Some(113))?;
+        assert_eq!((suspensions, resumptions), (1, 1), "decode");
+        let records = SUSPEND_LOG.with(|log| log.borrow_mut().split_off(0));
+        let [
+            SuspendRecord::Vacated {
+                fed,
+                states,
+                turn,
+                replay_point,
+            },
+            SuspendRecord::Resumed { hit, points },
+            SuspendRecord::Restored { depth: 96 },
+        ] = &records[..]
+        else {
+            panic!("{records:?}");
+        };
+        assert!((113..=120).contains(fed), "fed {fed}");
+        assert_eq!(states, &vec![(80, true), (96, false)]);
+        assert!(
+            !turn && *replay_point,
+            "points gone, the replay point in use"
+        );
+        assert_eq!(*hit, Some(DFlash2Hit::Stored(96)));
+        let end = u32::try_from((fed - 1) / 16 * 16).expect("u32");
+        assert_eq!(points, &vec![(end, true)]);
+        assert_eq!(inner.history_stamp_for_test(), None, "no history entry");
+        assert_eq!(log.done, solo.done, "decode: the unsuspended tokens");
+        Ok(())
+    })();
+    PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+    result
+}
+
+/// A lane's lookup junction counts once, when its turn starts (Splash
+/// `completeAdmission` records the lookup only for a request that is not
+/// resuming). A (200 tokens) registers its chain; B shares A's first 150,
+/// finds the junction at 144 when it starts, and the host refuses its
+/// prefill's chunk once it fed 20: the resume finds the junction again
+/// below its checkpoint at 16 and does not count it.
+/// Mutation JR1 (the lookup counts its junction, resumes included) → red.
+#[test]
+fn a_resumed_lane_counts_no_junction() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported("a_resumed_lane_counts_no_junction") {
+        return Ok(());
+    }
+    use crate::engine::governor::governor::tests::{G, model};
+    use crate::engine::governor::host::Pressure;
+    use crate::models::qwen3_5::dflash2_turn::YIELD_FROM;
+    use crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE;
+    use std::sync::atomic::AtomicBool;
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let decoder = DecoderPlan::Speculative(crate::engine::plan::SpeculativeKind::DraftModel);
+    let a: Vec<u32> = (0..200).map(|i| (i * 7 + 3) % 15 + 1).collect();
+    let mut b = a[..150].to_vec();
+    b.extend((0..30).map(|i| (i * 11 + 5) % 15 + 1));
+    let (_io, governor) = fake_governor(Pressure::Normal);
+    let mut inner = tiny_dflash_inner_with_config(0xDFA5_5C02, |config| {
+        config.linear_key_head_dim = 128;
+        config.linear_value_head_dim = 128;
+    });
+    install_pool(&mut inner, 40, 40, passing_probe())?;
+    inner.memory_registration = Some(governor.register_model(model(16 * G, 0)).expect("register"));
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .set_admission(Arc::new(governor));
+    PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(4)));
+    let result = (|| -> Result<()> {
+        let cancel = AtomicBool::new(false);
+        run_streamed_turn_for(&mut inner, decoder, &a, &LoggingSink::new(None), &cancel, 4)?;
+        assert_eq!(inner.dflash2_states.counters.lazy_junctions, 0);
+        YIELD_FROM.with(|from| from.set(Some(20)));
+        let ran =
+            run_streamed_turn_for(&mut inner, decoder, &b, &LoggingSink::new(None), &cancel, 4);
+        YIELD_FROM.with(|from| from.set(None));
+        ran?;
+        assert_eq!(governor.resumptions(7), 1);
+        assert_eq!(inner.dflash2_states.counters.lazy_junctions, 1);
+        Ok(())
+    })();
+    PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+    result
 }
 
 /// A pool at its runway whose grow macOS refuses (critical), sequence 0

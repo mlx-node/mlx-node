@@ -7382,6 +7382,67 @@ impl PagedKVCacheAdapter {
         )
     }
 
+    /// Registers the active request's full blocks below row `upto` in the
+    /// prefix cache while the request runs on (Splash
+    /// `Cache::publishCommittedBlocks` after each prefill command), so a
+    /// state published on them outlives an abort. A block registered before
+    /// is a no-op for the cache, and the turn's finalize registers every
+    /// block again: the request's registration latch is left alone, and no
+    /// cold capture runs. Returns nothing: the count re-walks from block 0.
+    pub(crate) fn register_committed_blocks(
+        &mut self,
+        upto: usize,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+    ) -> Result<(), String> {
+        const OP: &str = "register_committed_blocks";
+        self.bind_request_cache_salt(cache_salt, OP)?;
+        self.ensure_aux_prefix_primed(OP)?;
+        #[cfg(target_os = "macos")]
+        self.eval_pending_pool_writes()?;
+        let block_table = self
+            .block_table
+            .as_ref()
+            .ok_or_else(|| format!("{OP} called before reset_for_new_request"))?;
+        if self.request_tokens.len() != block_table.num_tokens() as usize {
+            return Err(format!(
+                "{OP} invariant violation: request_tokens.len() == {} but block_table.num_tokens() == {}",
+                self.request_tokens.len(),
+                block_table.num_tokens(),
+            ));
+        }
+        let block_size = self.block_size as usize;
+        if block_size == 0 {
+            return Err("block_size must be > 0".to_string());
+        }
+        let blocks = upto.min(self.request_tokens.len()) / block_size;
+        let blocks = blocks.min(block_table.num_blocks());
+        if blocks == 0 {
+            return Ok(());
+        }
+        if extra_keys_per_block.len() < blocks {
+            return Err(format!(
+                "{OP}: extra_keys_per_block has {} entries for {blocks} blocks",
+                extra_keys_per_block.len()
+            ));
+        }
+        let mut guard = self
+            .allocator
+            .lock()
+            .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+        guard
+            .cache_full_blocks_with_keys(
+                &self.request_tokens[..blocks * block_size],
+                &block_table.blocks()[..blocks],
+                self.block_size,
+                PrefixKeys::PerBlock(extra_keys_per_block),
+                cache_salt,
+            )
+            .map_err(|e| format!("{OP} failed: {e}"))?;
+        drop(guard);
+        Ok(())
+    }
+
     /// Release this request's block references. Decrefs every block in
     /// the block_table. Blocks with refcount > 0 (still referenced by
     /// the prefix cache or another in-flight request) survive; blocks
@@ -13243,6 +13304,51 @@ mod tests {
         assert_eq!(res.blocks.len(), 2);
     }
 
+    /// A prefill's committed blocks register while the request runs (Splash
+    /// `Cache::publishCommittedBlocks`): once each, a second pass adds no
+    /// cache reference, and the finalize then registers the whole request
+    /// as it would alone.
+    /// Mutation RB1 (the op sets the registration latch) → red (the
+    /// finalize registers nothing new).
+    #[test]
+    fn committed_blocks_register_once() {
+        const BS: u32 = 16;
+        let tokens: Vec<u32> = (0..80u32).map(|i| i * 3 + 1).collect();
+        let keys = vec![Vec::new(); 5];
+        let run = |committed: bool| -> Option<Vec<u32>> {
+            let allocator = new_allocator(8, BS);
+            let mut adapter = maybe_adapter(Arc::clone(&allocator), BS)?;
+            adapter.reset_for_new_request(0).unwrap();
+            adapter.allocate_suffix_blocks(80).unwrap();
+            adapter.record_tokens(&tokens).unwrap();
+            let refs = |adapter: &PagedKVCacheAdapter| -> Vec<u32> {
+                adapter
+                    .block_table()
+                    .unwrap()
+                    .blocks()
+                    .iter()
+                    .map(|block| block.get_ref_count())
+                    .collect()
+            };
+            if committed {
+                adapter.register_committed_blocks(48, &keys, 0).unwrap();
+                assert_eq!(refs(&adapter), vec![2, 2, 2, 1, 1], "three insertions");
+                adapter.register_committed_blocks(52, &keys, 0).unwrap();
+                assert_eq!(refs(&adapter), vec![2, 2, 2, 1, 1], "none again");
+            }
+            adapter
+                .register_full_blocks_for_reuse_per_block(&keys, 0)
+                .unwrap();
+            Some(refs(&adapter))
+        };
+        let Some(alone) = run(false) else {
+            eprintln!("skipping committed_blocks_register_once: Metal unavailable");
+            return;
+        };
+        assert_eq!(alone, vec![2; 5]);
+        assert_eq!(run(true).unwrap(), alone);
+    }
+
     /// `release_request` must reset the `already_registered` flag so a
     /// later reset → register cycle on the same adapter actually does the
     /// work (rather than seeing a stale `true` and short-circuiting).
@@ -16862,6 +16968,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_reset_drops_the_held_prefill_workspace() {
+        if crate::test_support::paged_prefill_unsupported(
+            "a_reset_drops_the_held_prefill_workspace",
+        ) {
+            return;
+        }
         const ROWS: usize = 16;
         const KV_HEADS: usize = 2;
         const QUERY_HEADS: usize = 8;

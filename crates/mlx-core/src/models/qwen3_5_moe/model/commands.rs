@@ -194,6 +194,12 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
         })
     }
 
+    fn dflash2_state_status(
+        &self,
+    ) -> Option<crate::engine::governor::governor::DFlash2StateStatus> {
+        Some(crate::models::qwen3_5::dflash2_turn::state_status(self))
+    }
+
     fn memory_accounts(&self) -> Option<crate::engine::governor::governor::MemoryAccounts> {
         Some(crate::models::qwen3_5::dflash2_turn::memory_accounts(
             self,
@@ -232,7 +238,7 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
         &self,
         query: &crate::engine::governor::ledger::VictimQuery,
         kept: &[u32],
-    ) -> Vec<crate::engine::governor::ledger::Victim> {
+    ) -> crate::engine::governor::ledger::UnitRuns {
         crate::models::qwen3_5::dflash2_turn::model_units(
             self,
             crate::models::qwen3_5::dflash2_turn::Keep {

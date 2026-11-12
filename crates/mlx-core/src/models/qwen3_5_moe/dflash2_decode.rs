@@ -71,6 +71,15 @@ impl Qwen35MoeDFlash2Stepper<'_> {
         Ok(())
     }
 
+    /// A ring with no buffers, standing in while the lane holds the real one.
+    fn empty_ring(&self) -> Result<DFlash2ContextCache> {
+        self.inner
+            .dflash2
+            .as_ref()
+            .map(|draft| DFlash2ContextCache::new(&draft.config))
+            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 model disappeared"))
+    }
+
     /// A greedy draft of the 7 proposals after `anchor` for a cycle the
     /// driver ran without one (Splash drafts every cycle).
     fn draft_tail(&mut self, anchor: u32) -> Result<Vec<u32>> {
@@ -127,14 +136,10 @@ impl Qwen35MoeDFlash2Stepper<'_> {
         };
         let full = full_verify_ids(ids, &drafted)?;
         let (seq, window) = (self.paged.seq, self.paged.context_window);
-        let config = &self
-            .inner
-            .dflash2
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 model disappeared"))?
-            .config;
-        let lent = lend_lane(&mut self.gdn_blobs, &mut self.context, config);
+        let empty = self.empty_ring()?;
+        let (lent, ring) = lend_lane(&mut self.gdn_blobs, &mut self.context, empty);
         self.inner.dflash2_lane = lent;
+        self.inner.dflash2_context = Some(ring);
         let claimed =
             crate::models::qwen3_5::dflash2_turn::paged_step_claimed(&mut *self.inner, |inner| {
                 inner
@@ -149,6 +154,7 @@ impl Qwen35MoeDFlash2Stepper<'_> {
             });
         reclaim_lane(
             self.inner.dflash2_lane.take(),
+            self.inner.dflash2_context.take(),
             &mut self.gdn_blobs,
             &mut self.context,
         );
@@ -573,6 +579,19 @@ impl Drop for Qwen35MoeDFlash2Stepper<'_> {
             let _ =
                 crate::engine::spec_paged::SpecPagedCache::commit_cycle(self, seq, ticket, rows);
         }
+        // A stepper that ends without `finish` leaves its ring on the lane,
+        // which the turn's end gives to the idle lane.
+        if self.inner.dflash2_context.is_none()
+            && self.context.buffer_bytes() > 0
+            && let Some(config) = self
+                .inner
+                .dflash2
+                .as_ref()
+                .map(|draft| draft.config.clone())
+        {
+            let ring = std::mem::replace(&mut self.context, DFlash2ContextCache::new(&config));
+            self.inner.dflash2_context = Some(ring);
+        }
     }
 }
 
@@ -664,12 +683,14 @@ impl crate::engine::spec_paged::SpecPagedCache for Qwen35MoeDFlash2Stepper<'_> {
     }
 }
 
-impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35MoeInner {
-    fn paged_prefill_with_draft_state(
+impl Qwen35MoeInner {
+    /// The tapped prefill of `suffix_tokens` past `prefix`: the draft ring
+    /// it advances is the restored one, else the idle lane's; it is left in
+    /// the turn state for the stepper.
+    pub(crate) fn tapped_dflash2_prefill(
         &mut self,
         suffix_tokens: &[u32],
-        prefix: &Self::PrefixState,
-        _stream: crate::stream::Stream,
+        prefix: &<Self as crate::engine::backend::PagedBackend>::PrefixState,
     ) -> Result<MxArray> {
         use crate::engine::backend::PagedPrefix;
         let config = self
@@ -683,7 +704,7 @@ impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35MoeInner {
             Some(context) if cached > 0 && usize::try_from(context.logical_len()) == Ok(cached) => {
                 context
             }
-            _ if cached == 0 => DFlash2ContextCache::new(&config),
+            _ if cached == 0 => self.dflash2_states.idle_lane.take_ring(&config),
             _ => {
                 return Err(Error::from_reason(format!(
                     "Qwen3.5 MoE DFlash2 cached prefix {cached} has no retained draft context"
@@ -699,6 +720,19 @@ impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35MoeInner {
             next_position: i32::try_from(cached + suffix_tokens.len()).unwrap_or(i32::MAX),
         });
         Ok(logits)
+    }
+}
+
+impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35MoeInner {
+    fn paged_prefill_with_draft_state(
+        &mut self,
+        suffix_tokens: &[u32],
+        prefix: &Self::PrefixState,
+        _stream: crate::stream::Stream,
+    ) -> Result<MxArray> {
+        crate::models::qwen3_5::dflash2_turn::suspendable_prefill(self, prefix.tokens(), |inner| {
+            inner.tapped_dflash2_prefill(suffix_tokens, prefix)
+        })
     }
 
     fn dspark_block_size(&self) -> Result<usize> {
@@ -723,35 +757,15 @@ impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35MoeInner {
         reuse_cache: bool,
         cache_salt: u64,
     ) -> Result<Self::PrefixState> {
-        use crate::engine::backend::PagedPrefix;
         let seq = self.active_scheduled_seq.unwrap_or(0);
-        let live = self.paged_adapter.as_ref().map_or(0, |adapter| {
-            crate::models::qwen3_5::dflash2_decode::reusable_paged_dflash2_prefix(
-                tokens,
-                reuse_cache,
-                cache_salt,
-                adapter,
-                seq,
-                self.dflash2_context.as_ref(),
-            )
-        });
-        let (hit, stored) = crate::models::qwen3_5::dflash2_turn::resolve_dflash2_resume(
+        crate::models::qwen3_5::dflash2_turn::prime_dflash2_turn(
             self,
             tokens,
             reuse_cache,
             cache_salt,
             seq,
-            live,
-        )?;
-        let prefix = self.prime_moe_prefix(tokens, cache_salt, Some(hit))?;
-        let cached = prefix.effective_cached_prefix_len();
-        if cached == 0 {
-            self.dflash2_context = None;
-        }
-        crate::models::qwen3_5::dflash2_turn::use_resumed_replay_point(
-            self, tokens, stored, cached,
-        );
-        Ok(prefix)
+            |inner, hit| inner.prime_moe_prefix(tokens, cache_salt, Some(hit)),
+        )
     }
 
     fn set_generation_suffix(&mut self, suffix: Option<std::sync::Arc<[u32]>>) {
@@ -824,8 +838,32 @@ impl DFlash2Target for Qwen35MoeInner {
         self.dflash2_replay_state_exact()
     }
 
+    fn paged_block_keys(&self, tokens: usize) -> Vec<Vec<u64>> {
+        crate::engine::build_paged_extra_keys(
+            tokens,
+            self.paged_adapter
+                .as_ref()
+                .map_or(1, |adapter| adapter.block_size()),
+            &self.cached_paged_image_token_positions,
+        )
+    }
+
     fn dflash2_turn_state_clear(&mut self) {
-        self.dflash2_turn_state = None;
+        let turn = self.dflash2_turn_state.take();
+        self.dflash2_states
+            .idle_lane
+            .give_ring(turn.map(|turn| turn.context));
+    }
+
+    fn clear_draft_context(&mut self) {
+        let ring = self.dflash2_context.take();
+        self.dflash2_states.idle_lane.give_ring(ring);
+    }
+
+    fn snapshot_live_linear(
+        &mut self,
+    ) -> Result<Vec<crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache>> {
+        crate::models::qwen3_5::paged_forward::snapshot_live_linear(self.caches.as_deref())
     }
 
     fn gdn_state_units(
@@ -843,11 +881,13 @@ impl DFlash2Target for Qwen35MoeInner {
     }
 
     fn serial_decode(&self) -> Option<crate::models::qwen3_5::dflash2_turn::SerialDecode> {
-        self.serial_decode.filter(|_| {
-            self.active_scheduled_seq.is_none()
-                && self.cached_image_key.is_none()
-                && self.cached_paged_image_token_positions.is_empty()
-        })
+        self.serial_decode.filter(|_| self.serial_text_lane())
+    }
+
+    fn serial_text_lane(&self) -> bool {
+        self.active_scheduled_seq.is_none()
+            && self.cached_image_key.is_none()
+            && self.cached_paged_image_token_positions.is_empty()
     }
 
     fn set_serial_decode(
@@ -861,8 +901,7 @@ impl DFlash2Target for Qwen35MoeInner {
         self.end_gdn_use(0);
         self.caches = None;
         self.dflash2_lane = None;
-        self.dflash2_context = None;
-        self.dflash2_turn_state = None;
+        self.idle_dflash2_lane();
     }
 
     fn replay_serial_lane(
@@ -872,7 +911,7 @@ impl DFlash2Target for Qwen35MoeInner {
         plan: &crate::transformer::paged_kv_cache_adapter::PagedTurnPlan,
         decode: crate::models::qwen3_5::dflash2_turn::SerialDecode,
         stored: Option<crate::models::qwen3_5::dflash2_state::store::EntryId>,
-    ) -> Result<()> {
+    ) -> Result<MxArray> {
         self.replay_moe_serial_lane(tokens, cache_salt, plan, decode, stored)
     }
 }
@@ -1045,6 +1084,9 @@ mod paged_dflash2_tests {
     /// launch).
     #[test]
     fn verify_takes_the_verify_split_rule() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("verify_takes_the_verify_split_rule") {
+            return Ok(());
+        }
         let probe = |kind| unsafe { mlx_sys::mlx_paged_prefill_test_probe_count(kind) };
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
@@ -1211,6 +1253,11 @@ mod paged_dflash2_tests {
     /// pending tape) turns it red.
     #[test]
     fn paged_moe_dflash2_lands_on_the_ar_cursor_for_every_keep() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "paged_moe_dflash2_lands_on_the_ar_cursor_for_every_keep",
+        ) {
+            return Ok(());
+        }
         use crate::models::qwen3_5::gdn_blob::trace::{assert_cells, kernel_fold, replay_chain};
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
@@ -1245,6 +1292,10 @@ mod paged_dflash2_tests {
     /// clamp removed) turns it red.
     #[test]
     fn paged_moe_verify_clamps_the_row_budget() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("paged_moe_verify_clamps_the_row_budget")
+        {
+            return Ok(());
+        }
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let mut inner = tiny_paged_int8_moe_dflash_inner(0x5_8102);
@@ -1299,6 +1350,11 @@ mod paged_dflash2_tests {
     /// Mutation MS1 (the prime skips the parked-state lookup) → red (hit 0).
     #[test]
     fn moe_parked_replay_point_resumes_the_next_session() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "moe_parked_replay_point_resumes_the_next_session",
+        ) {
+            return Ok(());
+        }
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let a1 = prompt(40);
@@ -1324,11 +1380,16 @@ mod paged_dflash2_tests {
     }
     /// Splash `Runtime::suspend` → `QwenStateStorage::releaseLane` on the
     /// MoE serial lane: a verify the host refuses (critical) suspends the
-    /// lane, and its two GDN cells, pending rows and draft window are gone
-    /// before the wait; the replay's fresh lane verifies.
+    /// lane; its two GDN cells and pending rows are gone before the wait,
+    /// its draft ring waits in the idle lane; the replay's lane verifies.
     /// Mutation R1m (the stepper keeps its lane across the claim) → red.
     #[test]
-    fn moe_suspended_dflash2_lane_drops_its_cells_and_window() -> Result<()> {
+    fn moe_suspended_dflash2_lane_drops_its_cells_and_idles_its_ring() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "moe_suspended_dflash2_lane_drops_its_cells_and_idles_its_ring",
+        ) {
+            return Ok(());
+        }
         use crate::engine::governor::governor::Governor;
         use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
         use crate::engine::governor::host::Pressure;
@@ -1365,7 +1426,8 @@ mod paged_dflash2_tests {
         inner.paged_adapter = Some(adapter);
         inner.memory_registration =
             Some(governor.register_model(model(16 * G, 0)).expect("register"));
-        let in_wait: Arc<Mutex<Option<(usize, usize)>>> = Arc::default();
+        type Held = ((usize, usize), (usize, usize));
+        let in_wait: Arc<Mutex<Option<Held>>> = Arc::default();
         {
             let seen = Arc::clone(&in_wait);
             io.with(|state| {
@@ -1404,12 +1466,95 @@ mod paged_dflash2_tests {
         step.finish()?;
         assert_eq!(governor.suspensions(7), 1);
         assert_eq!(governor.resumptions(7), 1);
-        let (lent, held) = in_wait.lock().unwrap().expect("the lane waited");
-        assert!(lent > 4, "{lent} lane arrays recorded");
+        let ((cells, held), (ring, idle)) = in_wait.lock().unwrap().expect("the lane waited");
+        assert!(cells >= 4, "{cells} cell arrays recorded");
         assert_eq!(
             held, 0,
-            "{held} of the lane's {lent} arrays outlived the vacate"
+            "{held} of the lane's {cells} cell arrays outlived the vacate"
         );
+        assert!(ring > 0, "{ring} ring arrays recorded");
+        assert_eq!(idle, ring, "the idle lane keeps the ring");
         Ok(())
+    }
+
+    /// Splash `Engine::vacateLane` on a MoE DFlash2 turn: the host refuses
+    /// the tapped prefill's chunk after 64 of a 100-token prompt, then (a
+    /// second run) a verify once the lane fed 113. Each time the lane is
+    /// vacated and replayed, streams an unsuspended run's tokens, and its
+    /// draft ring goes to the idle lane and comes back: no ring is
+    /// allocated beyond the unsuspended run's.
+    /// Mutations MVC1 (the MoE vacate drops the lane's buffers) and MVP1
+    /// (the MoE verify keeps its ring off the lane during its claim) → red.
+    #[test]
+    fn moe_suspension_replays_on_the_lane_buffers() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "moe_suspension_replays_on_the_lane_buffers",
+        ) {
+            return Ok(());
+        }
+        use crate::engine::governor::governor::tests::{G, model};
+        use crate::engine::governor::host::Pressure;
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        use crate::models::qwen3_5::dflash2::RING_ALLOCATIONS;
+        use crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device;
+        use crate::models::qwen3_5::dflash2_turn::YIELD_FROM;
+        use crate::models::qwen3_5::model::dflash2_park_tests::{
+            LoggingSink, StreamLog, fake_governor, run_streamed_turn_for,
+        };
+        use crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE;
+        use std::sync::atomic::AtomicBool;
+        if !metal_is_default_device() {
+            return Ok(());
+        }
+        const MAX_NEW: u32 = 32;
+        let decoder = DecoderPlan::Speculative(SpeculativeKind::DraftModel);
+        let prompt = prompt(100);
+        let run = |yield_from: Option<usize>| -> Result<(StreamLog, u64, u64, u64)> {
+            let (_io, governor) = fake_governor(Pressure::Normal);
+            let mut inner = tiny_paged_int8_moe_dflash_inner(0x5_8160);
+            inner.memory_registration =
+                Some(governor.register_model(model(16 * G, 0)).expect("register"));
+            inner
+                .paged_adapter
+                .as_mut()
+                .expect("adapter")
+                .set_admission(std::sync::Arc::new(governor));
+            RING_ALLOCATIONS.with(|count| count.set(0));
+            YIELD_FROM.with(|from| from.set(yield_from));
+            let sink = LoggingSink::new(None);
+            let ran = run_streamed_turn_for(
+                &mut inner,
+                decoder,
+                &prompt,
+                &sink,
+                &AtomicBool::new(false),
+                MAX_NEW,
+            );
+            YIELD_FROM.with(|from| from.set(None));
+            ran?;
+            let log = std::mem::take(&mut *sink.log.lock().unwrap());
+            Ok((
+                log,
+                RING_ALLOCATIONS.with(std::cell::Cell::get),
+                governor.suspensions(7),
+                governor.resumptions(7),
+            ))
+        };
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(4)));
+        let result = (|| -> Result<()> {
+            let (solo, rings, suspensions, _) = run(None)?;
+            assert_eq!(suspensions, 0);
+            assert_eq!(solo.tokens, MAX_NEW);
+            assert!(rings > 0);
+            for (from, what) in [(64, "prefill"), (113, "decode")] {
+                let (log, suspended_rings, suspensions, resumptions) = run(Some(from))?;
+                assert_eq!((suspensions, resumptions), (1, 1), "{what}");
+                assert_eq!(suspended_rings, rings, "{what}: the idle ring comes back");
+                assert_eq!(log.done, solo.done, "{what}: the unsuspended tokens");
+            }
+            Ok(())
+        })();
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+        result
     }
 }

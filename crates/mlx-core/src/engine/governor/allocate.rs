@@ -14,6 +14,9 @@ pub(crate) enum Refusal {
     Waits,
     /// The caller goes on without it.
     Settled,
+    /// The caller goes on without it, and nothing is freed for it: one
+    /// attempt (a capture whose lane holds a state to take it from).
+    SettledOnce,
 }
 
 /// An attempt's result as the loop reads it.
@@ -204,7 +207,7 @@ pub(crate) fn allocate<C: UnitSources, A: Admission>(
     // nothing it counts, one the host refuses after exempting the claim,
     // or a need already freed for once in this allocation.
     let mut met: Vec<Need> = Vec::new();
-    while result.admission.memory_denied() {
+    while refusal != Refusal::SettledOnce && result.admission.memory_denied() {
         let part = result.admission.in_place(governor.held_pages(id));
         let need = governor.need(id, part);
         let exempt =

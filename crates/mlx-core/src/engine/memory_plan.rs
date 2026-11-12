@@ -343,11 +343,10 @@ impl KvLayout {
 }
 
 /// Splash `CompositeStateLayout::laneBytes` beyond the pool lane's cell: the
-/// second GDN cell (the blob spare a verify writes) and the draft KV rings,
-/// constant in the window. mlx-node holds no 4-bit draft context window
-/// (`windowBytes`).
-pub(crate) fn dflash2_lane_state_bytes(recurrent_state_bytes: u64, draft_ring_bytes: u64) -> u64 {
-    recurrent_state_bytes.saturating_add(draft_ring_bytes)
+/// second GDN cell (the blob spare a verify writes), the draft KV rings and
+/// the 4-bit context window, constant in the window.
+pub(crate) fn dflash2_lane_state_bytes(recurrent_state_bytes: u64, draft_lane_bytes: u64) -> u64 {
+    recurrent_state_bytes.saturating_add(draft_lane_bytes)
 }
 
 /// What the load measured (Splash `ModelMemoryFootprint`).

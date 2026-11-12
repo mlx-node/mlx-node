@@ -282,6 +282,26 @@ describe('createHealthReporter', () => {
     expect(report().uptimeMs).toBe(3_500);
   });
 
+  const noStates = {
+    checkpointPublications: 0,
+    replayStatePublications: 0,
+    junctionMaterializations: 0,
+    checkpointPublicationFailures: 0,
+    replayStatePublicationFailures: 0,
+    junctionMaterializationFailures: 0,
+    deduplicatedStatePublications: 0,
+    recycledStatePublications: 0,
+    checkpointRetirements: 0,
+    lazyJunctions: 0,
+    checkpointEvictions: 0,
+    evictions: 0,
+    entries: 0,
+    bytes: 0,
+    checkpointEntries: 0,
+    checkpointBytes: 0,
+    inUse: 0,
+  };
+
   // Mutation TS3: copy `memory_governor` into the minimal body → red.
   it('memory_governor is in the authenticated body only', () => {
     const cause = { gaps: 0, ms: 0 };
@@ -329,6 +349,7 @@ describe('createHealthReporter', () => {
       decodeGapMs: { p50: 1, p99: 2, max: 600 },
       decisions: ['Memory: start claim needs 1.0 MiB: short'],
       scheduler: [],
+      dflash2States: { ...noStates, checkpointPublications: 5, lazyJunctions: 1, checkpointBytes: 64 },
     };
     const governor = toMemoryGovernorHealth(status);
     const health = createHealthReporter({ registry: new ModelRegistry(), memoryGovernor: () => governor })();
@@ -345,6 +366,7 @@ describe('createHealthReporter', () => {
       decode_gap_causes: { prefill_unit: { gaps: 1, ms: 600 }, prefill_ms: 200 },
       decode_gap_ms: { max: 600 },
       owed: { bytes: 0 },
+      dflash2_states: { checkpoint_publications: 5, lazy_junctions: 1, checkpoint_bytes: 64, in_use: 0 },
     });
     expect(toMinimalHealth(health)).not.toHaveProperty('memory_governor');
     const none = createHealthReporter({ registry: new ModelRegistry(), memoryGovernor: () => null })();
@@ -415,6 +437,7 @@ describe('createHealthReporter', () => {
       decodeGapMs: { p50: 0, p99: 0, max: 0 },
       decisions: [],
       scheduler: [scheduler, { ...scheduler, modelId: 8 }],
+      dflash2States: noStates,
     });
     const registry = new ModelRegistry();
     registry.register('qwen', {

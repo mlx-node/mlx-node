@@ -205,7 +205,8 @@ fn user_message(content: &str) -> ChatMessage {
 /// labels messages.
 ///
 /// Graceful skips (eprintln + return) ONLY for environment gaps: non-macOS
-/// (no Metal) or no local Qwen tokenizer. Everything else is a hard failure —
+/// (no Metal), no local Qwen tokenizer, or a GPU of no Apple family (a hosted
+/// VM GPU). Everything else is a hard failure —
 /// in particular `has_mtp_weights() == false` after reload means the
 /// random-save `mtp.*` emission or the `mtp_num_hidden_layers` config
 /// round-trip regressed.
@@ -221,6 +222,13 @@ pub async fn run_synthetic_mtp_gate(mode_label: &str) {
         );
         return;
     };
+    // SAFETY: nullary predicate that catches internally.
+    if unsafe { mlx_sys::mlx_test_gpu_lacks_apple_family() } {
+        eprintln!(
+            "skipping: no Apple GPU family; the paged prefill kernels of this route need Apple7+"
+        );
+        return;
+    }
 
     let ckpt_dir = std::env::temp_dir().join(format!(
         "mlx-moe-mtp-synth-{}-{}",

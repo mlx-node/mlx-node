@@ -3530,6 +3530,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn paged_attention_reads_its_own_rows_back() {
+        if crate::test_support::paged_prefill_unsupported("paged_attention_reads_its_own_rows_back")
+        {
+            return;
+        }
         use crate::transformer::paged_int8_tests::adapter_for;
         use mlx_paged_attn::metal::MetalDtype;
         const HQ: usize = 24;

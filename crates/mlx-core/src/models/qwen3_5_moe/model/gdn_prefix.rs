@@ -232,7 +232,6 @@ impl Qwen35MoeInner {
         let clone_start = trace_enabled.then(std::time::Instant::now);
         let Some(cloned) = crate::models::qwen3_5::dflash2_turn::publish_claimed(
             self,
-            crate::models::qwen3_5::dflash2_turn::Publication::Optional,
             bytes,
             Keep::default(),
             |inner| {
@@ -276,7 +275,7 @@ impl Qwen35MoeInner {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> Option<(u32, Vec<Qwen3_5LayerCache>)> {
-        let checkpoint_idx = find_longest_valid_gdn_checkpoint_index(
+        let rung = find_longest_valid_gdn_checkpoint_index(
             &self.gdn_prefix_checkpoints,
             &self.active_cache_owner_id,
             tokens,
@@ -285,7 +284,20 @@ impl Qwen35MoeInner {
             extra_keys_per_block,
             cache_salt,
             |checkpoint| moe_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)),
-        )?;
+        );
+        let rung_len = rung.map_or(0, |index| self.gdn_prefix_checkpoints[index].prefix_len);
+        if let Some((id, depth, caches)) = crate::models::qwen3_5::dflash2_turn::stored_gdn_prefix(
+            &*self,
+            tokens,
+            extra_keys_per_block,
+            cache_salt,
+            prefix_len,
+            rung_len,
+        ) {
+            self.gdn_restored_from = Some(UnitKey::Store(id));
+            return Some((depth, caches));
+        }
+        let checkpoint_idx = rung?;
         let restored_prefix_len = self.gdn_prefix_checkpoints[checkpoint_idx].prefix_len;
         let caches = clone_moe_linear_layer_caches(
             &self.config,
@@ -332,7 +344,6 @@ impl Qwen35MoeInner {
         let bytes = Qwen3_5LayerCache::linear_state_bytes(&checkpoint.caches);
         if crate::models::qwen3_5::dflash2_turn::publish_claimed(
             self,
-            crate::models::qwen3_5::dflash2_turn::Publication::Optional,
             bytes,
             Keep::default(),
             |_| (),
@@ -995,6 +1006,9 @@ impl Qwen35MoeInner {
     fn record_gdn_use(&mut self, seq_id: Option<SeqId>, ok: bool) {
         let restored = self.gdn_restored_from.take();
         if ok && let (Some(seq_id), Some(key)) = (seq_id, restored) {
+            if let UnitKey::Store(id) = key {
+                self.dflash2_states.use_restored(seq_id, id);
+            }
             self.gdn_in_use.insert(seq_id, key);
         }
     }
@@ -1025,11 +1039,8 @@ impl Qwen35MoeInner {
                     entry.last_used = stamp;
                 }
             }
-            UnitKey::Store(_)
-            | UnitKey::Owner(_)
-            | UnitKey::Extent
-            | UnitKey::DeadLeaves
-            | UnitKey::Vision(_) => {}
+            UnitKey::Store(_) => self.dflash2_states.end_restored(seq_id),
+            UnitKey::Owner(_) | UnitKey::Extent | UnitKey::DeadLeaves | UnitKey::Vision(_) => {}
         }
     }
 

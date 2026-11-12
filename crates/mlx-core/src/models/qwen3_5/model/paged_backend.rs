@@ -66,6 +66,8 @@ impl PagedStepModel for Qwen35PagedDecode<'_> {
     const FINAL_TOKEN_POLICY: FinalTokenPolicy = FinalTokenPolicy::AlwaysDrop;
 
     fn paged_step(&mut self, token_id: u32) -> Result<MxArray> {
+        #[cfg(test)]
+        PAGED_STEPS.with(|steps| steps.set(steps.get() + 1));
         // Pure-Rust eager paged decode step.
         //
         // PERF: `token_id` is HANDED by the engine (already read once at
@@ -117,6 +119,19 @@ pub(crate) struct Qwen35PrefixState {
     pub(super) full_tokens: Vec<u32>,
     pub(super) cache_salt: u64,
     pub(super) gdn_prefix_already_primed: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Eager paged decode steps run on this thread.
+    pub(crate) static PAGED_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+impl Qwen35PrefixState {
+    /// The turn's whole prompt.
+    pub(crate) fn tokens(&self) -> &[u32] {
+        &self.full_tokens
+    }
 }
 
 impl PagedPrefix for Qwen35PrefixState {
@@ -194,12 +209,10 @@ impl Qwen35Inner {
                 live_mismatch = token_prefix_mismatch_trace(plan, live_tokens);
             }
         }
-        let keep = crate::models::qwen3_5::dflash2_turn::prime_keep(
-            plan,
-            &lookup_extra_keys,
-            cache_salt,
-            dflash2_hit,
-        );
+        let keep = crate::models::qwen3_5::dflash2_turn::Keep {
+            tokens: plan,
+            keys: Some((&lookup_extra_keys, cache_salt)),
+        };
         let turn_plan = crate::models::qwen3_5::dflash2_turn::claimed(self, keep, |inner| {
             let adapter = inner
                 .paged_adapter
@@ -273,8 +286,9 @@ impl Qwen35Inner {
 
     /// Splash `replayTokens` for a suspended serial lane: the GDN prime
     /// over `plan`'s restored prefix, then the prefill of the rest of
-    /// `tokens` with its logits dropped, as at a turn start; a DFlash2 lane's
-    /// prefill is tapped and leaves its draft window in the turn state.
+    /// `tokens`, as at a turn start; a DFlash2 lane's prefill is tapped and
+    /// leaves its draft window in the turn state. Returns the last row's
+    /// logits, evaluated.
     pub(crate) fn replay_dense_serial_lane(
         &mut self,
         tokens: &[u32],
@@ -282,7 +296,7 @@ impl Qwen35Inner {
         plan: &crate::transformer::paged_kv_cache_adapter::PagedTurnPlan,
         decode: crate::models::qwen3_5::dflash2_turn::SerialDecode,
         stored: Option<crate::models::qwen3_5::dflash2_state::store::EntryId>,
-    ) -> Result<()> {
+    ) -> Result<MxArray> {
         let block_size = self
             .paged_adapter
             .as_ref()
@@ -302,20 +316,23 @@ impl Qwen35Inner {
                 if cached == 0 {
                     self.dflash2_context = None;
                 }
-                crate::models::qwen3_5::dflash2_turn::use_resumed_replay_point(
-                    self, tokens, stored, cached,
-                );
-                crate::engine::dspark_turn::PagedDsparkBackend::paged_prefill_with_draft_state(
-                    self,
-                    suffix,
-                    &prefix,
-                    Stream::generation(),
-                )?
+                crate::models::qwen3_5::dflash2_turn::admit_resumed(self, tokens, stored, cached)?;
+                self.tapped_dflash2_prefill(suffix, &prefix)?
             }
         };
         logits.eval();
         crate::array::synchronize_and_clear_cache();
-        Ok(())
+        Ok(logits)
+    }
+
+    /// Splash `Runtime::suspend` for the serial lane, before its sequence
+    /// is released: the live GDN cell goes, the draft ring and context
+    /// window go back to the idle lane, the GDN state use ends. Nothing is
+    /// published.
+    pub(crate) fn vacate_dense_lane(&mut self) {
+        self.end_gdn_use(0);
+        self.caches = None;
+        self.idle_dflash2_lane();
     }
 
     /// The prime after the adapter's prepare: the GDN state over
@@ -436,24 +453,45 @@ impl Qwen35Inner {
         }
         let mut mtp_hidden = None;
         if let Some(context) = draft {
-            let capture = crate::models::qwen3_5::dflash2_turn::replay_capture_row(
+            let (plan, captures) = crate::models::qwen3_5::dflash2_turn::turn_plan(
                 self,
                 &prefix.full_tokens,
                 prefix.effective_cached_prefix_len,
-            );
+                prefix.cache_salt,
+                chunk_size,
+            )?;
             // The draft leaves the model for the prefill so each chunk can book
             // through the take order on the whole model.
             let model = self
                 .dflash2
                 .take()
                 .ok_or_else(|| Error::from_reason("Qwen3.8 has no loaded DFlash2 companion"))?;
-            let mut sink = crate::models::qwen3_5::dflash2_turn::DraftTapSink::new(
+            let lane = match self.dflash2_states.lane_window.take() {
+                Some(lane) => lane,
+                None => match self.dflash2_states.idle_lane.take_window(&model.config) {
+                    Ok(lane) => lane,
+                    Err(error) => {
+                        self.dflash2 = Some(model);
+                        return Err(error);
+                    }
+                },
+            };
+            let sink = crate::models::qwen3_5::dflash2_turn::DraftTapSink::new(
                 &model,
                 context,
+                lane,
                 &prefix.full_tokens,
                 prefix.effective_cached_prefix_len,
-                capture,
+                &plan,
+                &captures,
             );
+            let mut sink = match sink {
+                Ok(sink) => sink,
+                Err(error) => {
+                    self.dflash2 = Some(model);
+                    return Err(error);
+                }
+            };
             let prefilled =
                 crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_size(
                     &prefix.full_tokens,
@@ -468,22 +506,21 @@ impl Qwen35Inner {
                     turn_cancel.as_deref(),
                     Some(&mut sink as &mut dyn PrefillTapSink),
                 );
-            let (context, anchor) = sink.into_parts();
+            let (context, lane) = sink.into_parts();
+            self.dflash2_states.idle_lane.give_window(lane);
             self.dflash2 = Some(model);
-            let (logits, checkpoint) = prefilled?;
+            let (logits, checkpoint) = match prefilled {
+                Ok(prefilled) => prefilled,
+                Err(error) => {
+                    self.dflash2_states.idle_lane.give_ring(Some(context));
+                    return Err(error);
+                }
+            };
             self.publish_dense_gdn_materialized_prefix_checkpoint(
                 &prefix.full_tokens,
                 prefix.cache_salt,
                 checkpoint,
             );
-            if let Some(anchor) = anchor {
-                crate::models::qwen3_5::dflash2_turn::publish_replay_state(
-                    self,
-                    &prefix.full_tokens,
-                    prefix.cache_salt,
-                    anchor,
-                );
-            }
             return Ok((logits, Some(context)));
         }
         let (logits, checkpoint) = {
@@ -577,6 +614,21 @@ impl crate::models::qwen3_5::paged_forward::PrefillTarget<DecoderLayer> for Qwen
     fn record(&mut self, chunk: &[u32]) -> Result<()> {
         crate::models::qwen3_5::dflash2_turn::record_chunk_claimed(self, chunk)
     }
+
+    fn prepare_capture(
+        &mut self,
+        row: u32,
+    ) -> Result<crate::models::qwen3_5::paged_forward::CaptureGrant> {
+        crate::models::qwen3_5::dflash2_turn::reserve_capture(self, row)
+    }
+
+    fn reached(
+        &mut self,
+        row: u32,
+        outcome: crate::models::qwen3_5::paged_forward::Reached,
+    ) -> Result<()> {
+        crate::models::qwen3_5::dflash2_turn::reached(self, row, outcome)
+    }
 }
 
 impl PagedBackend for Qwen35Inner {
@@ -631,9 +683,12 @@ impl PagedBackend for Qwen35Inner {
             .paged_adapter
             .as_ref()
             .and_then(PagedKVCacheAdapter::active_seq_id);
+        // A DFlash2 turn's lane is released at its end (Splash
+        // `Engine::release`): its states are the published ones.
+        let dflash2 = self.dflash2_states.turn.is_some();
         let mut release_pending = false;
         let mut finalize_error = match self.paged_adapter.as_mut() {
-            Some(adapter) if reuse_cache => {
+            Some(adapter) if reuse_cache && !dflash2 => {
                 let total_for_finalize = adapter.request_tokens().len();
                 let block_size = adapter.block_size();
                 let finalize_extra_keys = engine::build_paged_extra_keys(
@@ -657,6 +712,7 @@ impl PagedBackend for Qwen35Inner {
                 // but only AFTER the GDN sidecar capture — releasing resets the
                 // adapter's cold-chain frontier to 0.
                 release_pending = true;
+                crate::models::qwen3_5::dflash2_turn::log_turn_end("register");
                 adapter
                     .register_full_blocks_for_reuse_per_block(&finalize_extra_keys, cache_salt)
                     .err()
@@ -681,9 +737,18 @@ impl PagedBackend for Qwen35Inner {
         // Always attempt the release for the non-reuse path, even when
         // registration failed.
         if release_pending && let Some(adapter) = self.paged_adapter.as_mut() {
+            crate::models::qwen3_5::dflash2_turn::log_turn_end("release");
             finalize_error = finalize_error.or(adapter.release_request().err());
         }
-        crate::models::qwen3_5::dflash2_turn::settle_replay_state(self, finalize_error.is_none());
+        crate::models::qwen3_5::dflash2_turn::end_turn_states(self);
+        if dflash2 {
+            let fresh = self.fresh_dflash2_layer_caches();
+            let lane = self.caches.replace(fresh);
+            crate::models::qwen3_5::dflash2_turn::note_released_lane(lane);
+            self.idle_dflash2_lane();
+            self.dflash2_states.released = true;
+            self.paged_gdn_state_dirty = false;
+        }
         if let Some(error) = finalize_error {
             self.downgrade_failed_paged_finalize(&error);
         }
@@ -717,6 +782,7 @@ impl PagedBackend for Qwen35Inner {
         reuse_cache: bool,
     ) -> Result<()> {
         let turn_seq = self.paged_turn_seq.take();
+        let released = std::mem::take(&mut self.dflash2_states.released);
         // `finalize_paged_turn` is an infallible trait hook. When its adapter
         // operation failed it already invalidated the native caches and left
         // this one-turn latch so the engine's unconditional save cannot revive
@@ -756,6 +822,14 @@ impl PagedBackend for Qwen35Inner {
             full_history.extend_from_slice(&generated[..upto]);
         }
         self.cached_token_history = full_history;
+        // A released DFlash2 lane holds no live state to check or keep:
+        // Splash forms no state at a turn's end.
+        if released {
+            if let Some(seq_id) = turn_seq {
+                self.end_gdn_use(seq_id);
+            }
+            return Ok(());
+        }
         // Frontier agreement before any GDN state is keyed on the history
         // just published. A disagreement arms the refuse-to-persist latch the
         // checkpoint store below consumes.

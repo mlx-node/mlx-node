@@ -421,6 +421,52 @@ pub(crate) struct Counters {
     pub publications_refused: u64,
 }
 
+/// A model's DFlash2 states (Splash `Engine` counters, `CacheLookupSnapshot`
+/// `lazyJunctions` and `StateCacheSnapshot`), as its thread last published
+/// them; summed over the models in the status.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DFlash2StateStatus {
+    pub checkpoint_publications: u64,
+    pub replay_state_publications: u64,
+    pub junction_materializations: u64,
+    pub checkpoint_publication_failures: u64,
+    pub replay_state_publication_failures: u64,
+    pub junction_materialization_failures: u64,
+    pub deduplicated_state_publications: u64,
+    pub recycled_state_publications: u64,
+    pub checkpoint_retirements: u64,
+    pub lazy_junctions: u64,
+    pub checkpoint_evictions: u64,
+    pub evictions: u64,
+    pub entries: u64,
+    pub bytes: u64,
+    pub checkpoint_entries: u64,
+    pub checkpoint_bytes: u64,
+    pub in_use: u64,
+}
+
+impl DFlash2StateStatus {
+    fn merge(&mut self, other: &Self) {
+        self.checkpoint_publications += other.checkpoint_publications;
+        self.replay_state_publications += other.replay_state_publications;
+        self.junction_materializations += other.junction_materializations;
+        self.checkpoint_publication_failures += other.checkpoint_publication_failures;
+        self.replay_state_publication_failures += other.replay_state_publication_failures;
+        self.junction_materialization_failures += other.junction_materialization_failures;
+        self.deduplicated_state_publications += other.deduplicated_state_publications;
+        self.recycled_state_publications += other.recycled_state_publications;
+        self.checkpoint_retirements += other.checkpoint_retirements;
+        self.lazy_junctions += other.lazy_junctions;
+        self.checkpoint_evictions += other.checkpoint_evictions;
+        self.evictions += other.evictions;
+        self.entries += other.entries;
+        self.bytes += other.bytes;
+        self.checkpoint_entries += other.checkpoint_entries;
+        self.checkpoint_bytes += other.checkpoint_bytes;
+        self.in_use += other.in_use;
+    }
+}
+
 struct ModelEntry {
     id: u64,
     hard_budget: u64,
@@ -458,6 +504,8 @@ struct ModelEntry {
     /// The model's scheduler, read live (Splash `Status.cpp`
     /// `writeScheduler`, one per engine).
     scheduler: Option<Arc<SchedulerCounters>>,
+    /// What the model thread last published.
+    dflash2_states: DFlash2StateStatus,
 }
 
 /// One model's scheduler as the status reads it.
@@ -749,6 +797,7 @@ impl Governor {
             waits: ResourceWaitStatus::default(),
             replans: 0,
             scheduler: None,
+            dflash2_states: DFlash2StateStatus::default(),
         });
         books
             .ledger
@@ -1275,6 +1324,23 @@ impl Governor {
         published
             .embeddings
             .store(accounts.embeddings, Ordering::Relaxed);
+    }
+
+    /// The model thread's DFlash2 states, read by the status.
+    pub(crate) fn publish_dflash2_states(&self, model: u64, states: DFlash2StateStatus) {
+        if let Some(entry) = self.lock().model(model) {
+            entry.dflash2_states = states;
+        }
+    }
+
+    /// The registered models' DFlash2 states, summed.
+    pub(crate) fn dflash2_states(&self) -> DFlash2StateStatus {
+        let books = self.lock();
+        let mut states = DFlash2StateStatus::default();
+        for entry in &books.models {
+            states.merge(&entry.dflash2_states);
+        }
+        states
     }
 
     /// The model thread's waits and replans, as its last pass left them.

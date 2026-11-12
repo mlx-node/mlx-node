@@ -2,6 +2,7 @@
 //! targets.
 
 pub(crate) mod paged;
+pub(crate) mod plan;
 pub mod replay;
 pub(crate) mod store;
 // The offline ledger has no runtime producer.

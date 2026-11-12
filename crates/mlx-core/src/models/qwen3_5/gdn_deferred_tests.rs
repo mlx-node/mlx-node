@@ -711,7 +711,7 @@ fn grouped_deferred_matches_the_prepare_chain() {
         let [q, k, v, decay, beta, history] =
             outputs.map(|o| MxArray::from_handle(o, "gdn_prepare").unwrap());
         let mut sink = None;
-        let (out, state) = gated_delta_update_fused(
+        let Some((out, state)) = gated_delta_update_fused(
             &q,
             &k,
             &v,
@@ -732,8 +732,14 @@ fn grouped_deferred_matches_the_prepare_chain() {
             },
             Some(&mut sink),
         )
-        .unwrap()
-        .expect("fused tail");
+        .unwrap() else {
+            assert!(
+                !super::tests::fused_step_launches(),
+                "the grouped geometry takes the fused step"
+            );
+            eprintln!("SKIP grouped deferred: this device cannot launch the fused step kernel");
+            return;
+        };
         let first = w
             .complete_heads(false, None, Some((refs(&zero), false)))
             .expect("grouped deferred");

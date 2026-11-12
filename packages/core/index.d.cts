@@ -4730,6 +4730,30 @@ export interface MemoryGovernorCounters {
   publicationsRefused: number;
 }
 
+/**
+ * The DFlash2 states of the registered models, summed (Splash `Engine`
+ * state counters, `lazyJunctions`, and the state cache's snapshot).
+ */
+export interface MemoryGovernorDFlash2States {
+  checkpointPublications: number;
+  replayStatePublications: number;
+  junctionMaterializations: number;
+  checkpointPublicationFailures: number;
+  replayStatePublicationFailures: number;
+  junctionMaterializationFailures: number;
+  deduplicatedStatePublications: number;
+  recycledStatePublications: number;
+  checkpointRetirements: number;
+  lazyJunctions: number;
+  checkpointEvictions: number;
+  evictions: number;
+  entries: number;
+  bytes: number;
+  checkpointEntries: number;
+  checkpointBytes: number;
+  inUse: number;
+}
+
 export interface MemoryGovernorGapCause {
   gaps: number;
   ms: number;
@@ -4838,6 +4862,7 @@ export interface MemoryGovernorStatus {
   decisions: Array<string>;
   /** One per model whose scheduler registered. */
   scheduler: Array<MemoryGovernorScheduler>;
+  dflash2States: MemoryGovernorDFlash2States;
 }
 
 /**

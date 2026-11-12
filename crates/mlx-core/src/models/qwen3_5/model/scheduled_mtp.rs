@@ -185,6 +185,9 @@ pub(crate) fn seeded_inner_with_config(
 #[cfg(all(test, target_os = "macos"))]
 #[test]
 fn prefill_seed_owns_one_row_buffer() {
+    if crate::test_support::paged_prefill_unsupported("prefill_seed_owns_one_row_buffer") {
+        return;
+    }
     use mlx_paged_attn::metal::{MlxMetalBuffer, synchronize_mlx};
     let mut inner = seeded_inner(8107);
     let seq = 7;

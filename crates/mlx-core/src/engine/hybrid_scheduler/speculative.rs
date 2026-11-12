@@ -1145,6 +1145,11 @@ pub(super) mod tests {
     }
     #[test]
     fn native_mtp_scheduler_commits_owner_history_and_isolates_cancellation() {
+        if crate::test_support::paged_prefill_unsupported(
+            "native_mtp_scheduler_commits_owner_history_and_isolates_cancellation",
+        ) {
+            return;
+        }
         fn check<B: HybridSchedulerBackend>(build: impl Fn() -> B) {
             let (ar, _) = run_with(build(), false, false);
             let (spec, occupancy) = run_with(build(), true, false);
@@ -1169,6 +1174,11 @@ pub(super) mod tests {
 
     #[test]
     fn cached_speculative_starts_and_preemption_replay_keep_scheduled_ar() {
+        if crate::test_support::paged_prefill_unsupported(
+            "cached_speculative_starts_and_preemption_replay_keep_scheduled_ar",
+        ) {
+            return;
+        }
         use crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget;
 
         fn check<B: HybridSchedulerBackend>(

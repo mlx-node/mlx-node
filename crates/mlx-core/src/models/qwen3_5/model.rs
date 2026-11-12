@@ -75,6 +75,8 @@ mod lifecycle;
 pub(crate) use lifecycle::cold_tier_config_json;
 mod mtp;
 mod paged_backend;
+#[cfg(test)]
+pub(crate) use paged_backend::PAGED_STEPS;
 mod paged_turn;
 pub(crate) mod scheduled_mtp;
 mod state;

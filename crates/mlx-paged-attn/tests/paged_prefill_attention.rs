@@ -59,6 +59,17 @@ fn eval(arrays: &[&Owned]) {
     assert!(unsafe { mlx_sys::mlx_eval(handles.as_mut_ptr(), handles.len()) });
 }
 
+/// True, after printing a skip, on a GPU of no Apple family: its compiler
+/// rejects the kernel's tensor ops.
+fn no_apple_family(test: &str) -> bool {
+    // SAFETY: nullary predicate that catches internally.
+    let lacks = unsafe { mlx_sys::mlx_test_gpu_lacks_apple_family() };
+    if lacks {
+        eprintln!("skipping {test}: no Apple GPU family; the paged prefill kernels need Apple7+");
+    }
+    lacks
+}
+
 /// Splitmix64 uniform in [-1, 1).
 struct Rng(u64);
 
@@ -525,6 +536,9 @@ fn case(
 /// the last head right) go red.
 #[test]
 fn prefill_attention_tracks_the_f64_reference() {
+    if no_apple_family("prefill_attention_tracks_the_f64_reference") {
+        return;
+    }
     let mut failures = Vec::new();
     for format in [Format::Int8, Format::Bf16] {
         for kv in [4usize, 2] {
@@ -564,6 +578,9 @@ fn prefill_attention_tracks_the_f64_reference() {
 /// whatever the visible tokens) goes red.
 #[test]
 fn a_page_reads_only_visible_blocks() {
+    if no_apple_family("a_page_reads_only_visible_blocks") {
+        return;
+    }
     let mut failures = Vec::new();
     for format in [Format::Bf16, Format::Int8] {
         for (committed, rows) in [(33usize, 7usize), (1023, 8)] {

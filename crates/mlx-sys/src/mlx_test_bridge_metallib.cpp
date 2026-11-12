@@ -20,6 +20,24 @@
 #include <vector>
 #endif
 
+// True on a Metal device of no Apple GPU family (a hosted VM GPU): its
+// compiler rejects the tensor ops the paged prefill kernels are built on.
+extern "C" bool mlx_test_gpu_lacks_apple_family() {
+#ifdef MLX_NODE_METAL_ENABLED
+  using namespace mlx::core;
+  try {
+    if (!metal::is_available())
+      return false;
+    return !metal::device(Device::gpu).mtl_device()->supportsFamily(
+        MTL::GPUFamilyApple7);
+  } catch (const std::exception &) {
+    return false;
+  }
+#else
+  return false;
+#endif
+}
+
 // `family` is "segmented_sdpa", "affine_mixed", "splash_moe" or
 // "paged_prefill". `counts` receives {names the
 // dispatcher can request, the family's functions in the library, pipelines
@@ -96,7 +114,10 @@ extern "C" bool mlx_test_bridge_metallib_check(const char *family,
     } else if (std::strcmp(family, "paged_prefill") == 0) {
       prefix = "paged_prefill_attention_";
       names = fast::paged::paged_prefill_attention_kernel_names();
-      build = [&d] { return fast::paged::build_paged_prefill_attention_pipelines(d); };
+      build = [&d] {
+        if (mlx_test_gpu_lacks_apple_family()) return int64_t(0);
+        return fast::paged::build_paged_prefill_attention_pipelines(d);
+      };
     } else {
       return false;
     }

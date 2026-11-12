@@ -20,6 +20,7 @@ use crate::array::attention::scaled_dot_product_attention;
 use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
 use crate::models::qwen3_5::decoder_layer::DecoderLayer;
+use crate::models::qwen3_5::draft_context::{DRAFT_CONTEXT_GROUP, DraftContextWindow};
 use crate::nn::{Activations, Embedding, Linear, RMSNorm, RoPE};
 use crate::sampling::{SparseDistribution, is_greedy_temperature};
 use crate::utils::safetensors::load_safetensors_lazy;
@@ -148,6 +149,14 @@ impl DFlash2Config {
                 "unsupported DFlash2 configuration (requires non-causal sliding attention, two-tap grouped convolution, and a non-empty selector)",
             ));
         }
+        // Splash `DraftAttention::contextWindowBytes`: the 4-bit context
+        // window quantizes whole 64-value groups of a context row.
+        if !raw.hidden_size.is_multiple_of(DRAFT_CONTEXT_GROUP as usize) {
+            return Err(Error::from_reason(format!(
+                "draft config hidden_size {} is not a multiple of the {DRAFT_CONTEXT_GROUP}-value context group",
+                raw.hidden_size
+            )));
+        }
         // Splash `ModelDescriptor` draft check: the trained block holds the
         // verify rows or more, and a cycle drafts the first of them.
         if draft.block_size < DFLASH2_VERIFY_ROWS {
@@ -220,12 +229,32 @@ fn non_causal_sliding_mask(
     ))
 }
 
-/// The sliding mask is `(query_base - key_base) + i - j < window`: it depends
-/// only on the base gap, `query_len`, `key_len` and `window`, which every
-/// draft layer shares and which repeat from cycle to cycle once the window
-/// is full, so it is built once and every layer of every such propose reuses
-/// the same array.
-type SlidingMaskMemo = Option<((i64, i64, i64, i64), Option<MxArray>)>;
+/// The block's attention mask, keyed by what it depends on, which every
+/// draft layer shares and which repeats from cycle to cycle once the window
+/// is full: so it is built once and every layer of every such propose
+/// reuses the same array.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaskKey {
+    /// `(query_base - key_base) + i - j < window` over keys in logical
+    /// order.
+    Sliding {
+        gap: i64,
+        query_len: i64,
+        key_len: i64,
+        window: i64,
+    },
+    /// The ring's slots in physical order, then the block.
+    Ring {
+        slot: i64,
+        live: i64,
+        gap: i64,
+        rows: i64,
+        slots: i64,
+        window: i64,
+    },
+}
+
+type SlidingMaskMemo = Option<(MaskKey, Option<MxArray>)>;
 
 fn memo_sliding_mask(
     memo: &mut SlidingMaskMemo,
@@ -235,12 +264,12 @@ fn memo_sliding_mask(
     key_len: i64,
     window: i64,
 ) -> Result<Option<MxArray>> {
-    let key = (
-        i64::from(query_base) - i64::from(key_base),
+    let key = MaskKey::Sliding {
+        gap: i64::from(query_base) - i64::from(key_base),
         query_len,
         key_len,
         window,
-    );
+    };
     if let Some((cached, mask)) = memo.as_ref()
         && *cached == key
     {
@@ -248,11 +277,55 @@ fn memo_sliding_mask(
     }
     // Relative positions: the same booleans as the absolute ones, for any
     // base the memo key is later matched at.
-    let gap = i32::try_from(key.0)
+    let gap = i32::try_from(i64::from(query_base) - i64::from(key_base))
         .map_err(|_| Error::from_reason("DFlash2 sliding mask: query/key base gap overflows"))?;
     let mask = non_causal_sliding_mask(gap, query_len, 0, key_len, window)?;
     *memo = Some((key, mask.clone()));
     Ok(mask)
+}
+
+/// Splash `draft_attention_split_phase` over a wrapped ring: query row r
+/// (position `query_base + r`) sees the ring's live rows `[start, end)` no
+/// more than `window - 1` behind it, read in slot order, and every block
+/// row. Row p sits at slot p % slots.
+fn memo_ring_mask(
+    memo: &mut SlidingMaskMemo,
+    query_base: i64,
+    rows: i64,
+    start: i64,
+    end: i64,
+    slots: i64,
+    window: i64,
+) -> Result<Option<MxArray>> {
+    let key = MaskKey::Ring {
+        slot: end % slots,
+        live: end - start,
+        gap: query_base - end,
+        rows,
+        slots,
+        window,
+    };
+    if let Some((cached, mask)) = memo.as_ref()
+        && *cached == key
+    {
+        return Ok(mask.clone());
+    }
+    let key_len = slots + rows;
+    let mut visible = Vec::with_capacity((rows * key_len) as usize);
+    for r in 0..rows {
+        let query = query_base + r;
+        for slot in 0..slots {
+            let row = end - 1 - (end - 1 - slot).rem_euclid(slots);
+            visible.push(u8::from(row >= start && row < end && query - row < window));
+        }
+        for j in 0..rows {
+            visible.push(u8::from(query - (end + j) < window));
+        }
+    }
+    let mask = MxArray::from_uint8(&visible, &[1, 1, rows, key_len])?
+        .not_equal(&MxArray::from_uint8(&[0], &[1])?)?;
+    *memo = Some((key, Some(mask.clone())));
+    Ok(Some(mask))
 }
 
 /// Captured once per loaded companion. A MoE loader may select its measured
@@ -320,20 +393,37 @@ impl DraftExecutionPolicy {
 }
 
 impl DFlash2Config {
-    /// Bytes of every layer's BF16 K and V draft window buffers at their
-    /// largest capacity (`DraftKvWindow::append`'s cap: window + reserve +
-    /// one growth step).
+    /// Bytes of every layer's BF16 K and V draft ring: `sliding_window`
+    /// slots and the rows a proposal's block lands in past them.
     pub(crate) fn kv_ring_bytes(&self) -> u64 {
-        let window = (self.sliding_window as u64).saturating_sub(1).max(1);
-        let rows = window
-            .saturating_add(self.block_size as u64 + 1)
-            .saturating_add(DRAFT_KV_STEP as u64);
+        let rows = (self.sliding_window as u64)
+            .max(2)
+            .saturating_add(self.block_size as u64 + 1);
         (self.num_hidden_layers as u64)
             .saturating_mul(2)
             .saturating_mul(self.num_key_value_heads as u64)
             .saturating_mul(self.head_dim as u64)
             .saturating_mul(2)
             .saturating_mul(rows)
+    }
+
+    /// A lane's draft buffers beyond its GDN cells: the K/V ring and the
+    /// 4-bit context window (Splash `CompositeStateLayout::laneBytes`
+    /// without the cells).
+    pub(crate) fn lane_bytes(&self) -> u64 {
+        self.kv_ring_bytes()
+            .saturating_add(self.context_window_bytes())
+    }
+
+    /// Bytes of the 4-bit context window a state holds (Splash
+    /// `DraftStateLayout::windowBytes`).
+    pub(crate) fn context_window_bytes(&self) -> u64 {
+        DraftContextWindow::bytes(self.hidden_size as u32, self.sliding_window as u32)
+    }
+
+    /// An empty context window of this draft's geometry.
+    pub(crate) fn context_window(&self) -> Result<DraftContextWindow> {
+        DraftContextWindow::new(self.hidden_size as u32, self.sliding_window as u32)
     }
 
     fn supports_source_conv(&self, target: [i32; 5]) -> bool {
@@ -380,7 +470,6 @@ struct DFlash2Attention {
     num_heads: i64,
     num_kv_heads: i64,
     head_dim: i64,
-    sliding_window: i64,
 }
 
 impl DFlash2Attention {
@@ -556,6 +645,7 @@ impl DFlash2Attention {
 
     /// Sliding-window attention of `queries` `[B, HQ, T, D]` over `keys` /
     /// `values` `[B, HK, N, D]` whose first row sits at `key_base`.
+    #[cfg(test)]
     fn attend(
         &self,
         queries: &MxArray,
@@ -563,17 +653,11 @@ impl DFlash2Attention {
         values: &MxArray,
         key_base: i32,
         query_base: i32,
+        window: i64,
         masks: &mut SlidingMaskMemo,
     ) -> Result<MxArray> {
         let seq = queries.shape_at(2)?;
-        let mask = memo_sliding_mask(
-            masks,
-            query_base,
-            seq,
-            key_base,
-            keys.shape_at(2)?,
-            self.sliding_window,
-        )?;
+        let mask = memo_sliding_mask(masks, query_base, seq, key_base, keys.shape_at(2)?, window)?;
         self.attend_masked(queries, keys, values, mask.as_ref())
     }
 
@@ -910,9 +994,8 @@ impl DFlash2Layer {
         &self,
         input: DraftResidual<'_>,
         window: &mut DraftKvWindow,
-        context_base: i32,
         query_base: i32,
-        masks: &mut SlidingMaskMemo,
+        mask: Option<&MxArray>,
         merged_rows: i64,
     ) -> Result<DraftLayerOutput> {
         let (residual, normed) = match input {
@@ -925,15 +1008,10 @@ impl DFlash2Layer {
         let (queries, block_keys, block_values) =
             self.attention
                 .project_block(&prepared, query_base, merged_rows)?;
-        let key_base = if window.len() > 0 {
-            context_base
-        } else {
-            query_base
-        };
         let (keys, values) = window.with_block(&block_keys, &block_values)?;
         let attention = self
             .attention
-            .attend(&queries, &keys, &values, key_base, query_base, masks)?;
+            .attend_masked(&queries, &keys, &values, mask)?;
         let (hidden, normed) = self
             .attention_conv
             .finish_output(&attention, &dynamic, &residual)?
@@ -1302,9 +1380,6 @@ impl CandidateSelector {
     }
 }
 
-/// Rows a draft window buffer grows by.
-const DRAFT_KV_STEP: i64 = 256;
-
 fn store_window_tail(window: &[MxArray], keys: &MxArray, values: &MxArray) -> Result<Vec<MxArray>> {
     if window.len() != 4 {
         return Err(Error::from_reason(
@@ -1342,31 +1417,56 @@ fn kquant_rows_merge(packed: &QuantizedLinear, widths: &[i64]) -> bool {
     split_kquant_layout(packed.mode()).1 && widths.iter().all(|w| w % KQUANT_TILE_ROWS == 0)
 }
 
-/// One draft layer's attention context: the newest `window` rows of K and V
-/// in temporal order, rows `[start, end)` of flat `[B, H, cap, D]` buffers.
-/// Appends write their rows in place (`mlx_kv_store_rows`, one dispatch for
-/// K and V) and the attention view is a slice, so neither the commit nor the
-/// propose copies the window; the buffer is only reallocated when the rows
-/// run past its end (every `DRAFT_KV_STEP` rows once the window is full).
+/// One draft layer's attention context (Splash `draft_attention_split_phase`):
+/// a ring of `slots` K and V rows, row p at slot p % slots, whose live rows
+/// are the newest `slots - 1`, logical rows `[start, end)`. The buffers hold
+/// `reserve` rows past the ring, where a proposal's block lands. Appends
+/// write their slots in place (`mlx_kv_store_rows`), and the attention reads
+/// the buffers in place, so neither the commit nor the propose copies the
+/// window, and nothing ever grows.
 pub(crate) struct DraftKvWindow {
     keys: Option<MxArray>,
     values: Option<MxArray>,
     start: i64,
     end: i64,
-    window: i64,
-    /// Rows kept free past `end` so a propose can place its block in the
-    /// buffer without reallocating.
+    slots: i64,
     reserve: i64,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Draft ring buffers allocated on this thread.
+    pub(crate) static RING_ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn note_ring_allocation() {
+    #[cfg(test)]
+    RING_ALLOCATIONS.with(|count| count.set(count.get() + 1));
+}
+
+/// Where a block's attention keys come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockKeys {
+    /// An empty window: the block alone.
+    Alone,
+    /// Not wrapped: buffer rows `[start, end + rows)` are the live rows and
+    /// the block in logical order.
+    Linear,
+    /// Wrapped: the whole ring in slot order, then the block at `slots`.
+    Ring,
+    /// The block does not fit past the rows: the live rows copied in
+    /// logical order, then the block.
+    Copied,
+}
+
 impl DraftKvWindow {
-    fn new(window: i64, reserve: i64) -> Self {
+    fn new(slots: i64, reserve: i64) -> Self {
         Self {
             keys: None,
             values: None,
             start: 0,
             end: 0,
-            window: window.max(1),
+            slots: slots.max(2),
             reserve: reserve.max(0),
         }
     }
@@ -1376,54 +1476,91 @@ impl DraftKvWindow {
         self.end - self.start
     }
 
+    fn window(&self) -> i64 {
+        self.slots - 1
+    }
+
     fn capacity(&self) -> Result<i64> {
         self.keys.as_ref().map_or(Ok(0), |keys| keys.shape_at(2))
     }
 
-    /// The window `[start, end)` as `[B, H, len, D]` views, `None` when empty.
+    /// Rows past `slots` have been written: live rows sit at `p % slots`.
+    fn wrapped(&self) -> bool {
+        self.end > self.slots
+    }
+
+    /// Drops the rows; the buffers stay.
+    fn reset(&mut self) {
+        self.start = 0;
+        self.end = 0;
+    }
+
+    /// Bytes of the K and V buffers allocated so far.
+    fn buffer_bytes(&self) -> u64 {
+        [&self.keys, &self.values]
+            .into_iter()
+            .flatten()
+            .fold(0u64, |sum, buffer| {
+                sum.saturating_add(buffer.nbytes() as u64)
+            })
+    }
+
+    /// The live rows as `[B, H, len, D]` in logical order, `None` when
+    /// empty; a wrapped window is copied.
     pub(crate) fn view(&self) -> Option<(MxArray, MxArray)> {
         if self.end == self.start {
             return None;
         }
-        Some((
-            self.keys
-                .as_ref()?
-                .slice_axis(2, self.start, self.end)
-                .ok()?,
-            self.values
-                .as_ref()?
-                .slice_axis(2, self.start, self.end)
-                .ok()?,
-        ))
+        let (keys, values) = (self.keys.as_ref()?, self.values.as_ref()?);
+        if !self.wrapped() {
+            return Some((
+                keys.slice_axis(2, self.start, self.end).ok()?,
+                values.slice_axis(2, self.start, self.end).ok()?,
+            ));
+        }
+        let first = self.start % self.slots;
+        let last = (self.end - 1) % self.slots + 1;
+        let read = |buffer: &MxArray| -> Option<MxArray> {
+            if first < last {
+                return buffer.slice_axis(2, first, last).ok();
+            }
+            MxArray::concatenate(
+                &buffer.slice_axis(2, first, self.slots).ok()?,
+                &buffer.slice_axis(2, 0, last).ok()?,
+                2,
+            )
+            .ok()
+        };
+        Some((read(keys)?, read(values)?))
     }
 
-    /// Append `[B, H, T, D]` rows (any strides) after the window; only the
-    /// newest `window` rows stay live.
-    fn append(&mut self, keys: &MxArray, values: &MxArray) -> Result<()> {
+    /// Append `[B, H, T, D]` rows (any strides) at logical row `base`; only
+    /// the newest `slots - 1` rows stay live. Rows that do not continue the
+    /// window replace it.
+    fn append(&mut self, base: i64, keys: &MxArray, values: &MxArray) -> Result<()> {
         let mut rows = keys.shape_at(2)?;
+        let mut base = base;
         let tail;
-        let (keys, values) = if rows > self.window {
-            self.start = 0;
-            self.end = 0;
+        let (keys, values) = if rows > self.window() {
+            let skip = rows - self.window();
             tail = (
-                keys.slice_axis(2, rows - self.window, rows)?,
-                values.slice_axis(2, rows - self.window, rows)?,
+                keys.slice_axis(2, skip, rows)?,
+                values.slice_axis(2, skip, rows)?,
             );
-            rows = self.window;
+            base += skip;
+            rows = self.window();
             (&tail.0, &tail.1)
         } else {
             (keys, values)
         };
-        if self.end + rows + self.reserve > self.capacity()? {
-            // Move the rows that stay live to the front of fresh buffers.
-            let keep = self.len().min(self.window - rows);
-            let needed = keep + rows + self.reserve;
-            let capacity = ((needed + DRAFT_KV_STEP - 1) / DRAFT_KV_STEP * DRAFT_KV_STEP
-                + DRAFT_KV_STEP)
-                .min(self.window + self.reserve + DRAFT_KV_STEP)
-                .max(needed);
-            let fresh = |rows: &MxArray, old: Option<&MxArray>| -> Result<MxArray> {
-                let mut buffer = MxArray::zeros(
+        if base != self.end || rows == self.window() {
+            self.start = base;
+            self.end = base;
+        }
+        if self.keys.is_none() || self.values.is_none() {
+            let capacity = self.slots + self.reserve;
+            let buffer = |rows: &MxArray| -> Result<MxArray> {
+                MxArray::zeros(
                     &[
                         rows.shape_at(0)?,
                         rows.shape_at(1)?,
@@ -1431,54 +1568,116 @@ impl DraftKvWindow {
                         rows.shape_at(3)?,
                     ],
                     Some(rows.dtype()?),
-                )?;
-                if let Some(old) = old
-                    && keep > 0
-                {
-                    let live = old.slice_axis(2, self.end - keep, self.end)?;
-                    buffer.slice_assign_axis_inplace(2, 0, keep, &live)?;
-                }
-                Ok(buffer)
+                )
             };
-            let new_keys = fresh(keys, self.keys.as_ref())?;
-            let new_values = fresh(values, self.values.as_ref())?;
-            self.keys = Some(new_keys);
-            self.values = Some(new_values);
-            self.start = 0;
-            self.end = keep;
+            self.keys = Some(buffer(keys)?);
+            self.values = Some(buffer(values)?);
+            note_ring_allocation();
         }
-        let at = self.end;
-        self.store_rows(at, keys, values)?;
-        self.end += rows;
-        self.start = self.start.max(self.end - self.window);
+        let slot = base % self.slots;
+        let first = rows.min(self.slots - slot);
+        if first == rows {
+            self.store_rows(slot, keys, values)?;
+        } else {
+            self.store_rows(
+                slot,
+                &keys.slice_axis(2, 0, first)?,
+                &values.slice_axis(2, 0, first)?,
+            )?;
+            self.store_rows(
+                0,
+                &keys.slice_axis(2, first, rows)?,
+                &values.slice_axis(2, first, rows)?,
+            )?;
+        }
+        self.end = base + rows;
+        self.start = self.start.max(self.end - self.window());
         Ok(())
     }
 
-    /// The attention view for a block: the window followed by the block's
-    /// `[B, H, T, D]` rows. The block lands in the buffer's free rows past
-    /// `end` (in place, one dispatch) and the view is one slice; a block that
-    /// does not fit, or an empty window, falls back to a concatenation. The
-    /// written rows are dead to the window and are overwritten by the next
-    /// append, whose store is ordered after this one by the shared handle.
+    fn block_keys(&self, rows: i64) -> Result<BlockKeys> {
+        if self.end == self.start {
+            return Ok(BlockKeys::Alone);
+        }
+        let capacity = self.capacity()?;
+        Ok(if !self.wrapped() && self.end + rows <= capacity {
+            BlockKeys::Linear
+        } else if self.wrapped() && self.slots + rows <= capacity {
+            BlockKeys::Ring
+        } else {
+            BlockKeys::Copied
+        })
+    }
+
+    /// The buffer rows a block of `rows` attends over in place, the block
+    /// last; `None` when it does not attend in place.
+    fn block_range(&self, rows: i64) -> Result<Option<(i64, i64)>> {
+        Ok(match self.block_keys(rows)? {
+            BlockKeys::Linear => Some((self.start, self.end + rows)),
+            BlockKeys::Ring => Some((0, self.slots + rows)),
+            BlockKeys::Alone | BlockKeys::Copied => None,
+        })
+    }
+
+    /// The mask of a block of `rows` queries at `query_base` over
+    /// [`Self::with_block`]'s keys.
+    fn block_mask(
+        &self,
+        memo: &mut SlidingMaskMemo,
+        query_base: i32,
+        rows: i64,
+        window: i64,
+    ) -> Result<Option<MxArray>> {
+        match self.block_keys(rows)? {
+            BlockKeys::Alone => memo_sliding_mask(memo, query_base, rows, query_base, rows, window),
+            BlockKeys::Linear | BlockKeys::Copied => {
+                let start = i32::try_from(self.start)
+                    .map_err(|_| Error::from_reason("DFlash2 draft window start exceeds i32"))?;
+                memo_sliding_mask(memo, query_base, rows, start, self.len() + rows, window)
+            }
+            BlockKeys::Ring => memo_ring_mask(
+                memo,
+                i64::from(query_base),
+                rows,
+                self.start,
+                self.end,
+                self.slots,
+                window,
+            ),
+        }
+    }
+
+    /// The attention keys for a block: the window, then the block's
+    /// `[B, H, T, D]` rows, which land past the rows in place (one
+    /// dispatch). The written rows are dead to the window and are
+    /// overwritten by a later append, whose store is ordered after this one
+    /// by the shared handle.
     fn with_block(&mut self, keys: &MxArray, values: &MxArray) -> Result<(MxArray, MxArray)> {
         let rows = keys.shape_at(2)?;
-        let Some((context_keys, context_values)) = self.view() else {
-            return Ok((keys.clone(), values.clone()));
+        let at = match self.block_keys(rows)? {
+            BlockKeys::Alone => return Ok((keys.clone(), values.clone())),
+            BlockKeys::Copied => {
+                let (context_keys, context_values) = self
+                    .view()
+                    .ok_or_else(|| Error::from_reason("DFlash2 draft window lost its rows"))?;
+                return Ok((
+                    MxArray::concatenate(&context_keys, keys, 2)?,
+                    MxArray::concatenate(&context_values, values, 2)?,
+                ));
+            }
+            BlockKeys::Linear => self.end,
+            BlockKeys::Ring => self.slots,
         };
-        if self.end + rows > self.capacity()? {
-            return Ok((
-                MxArray::concatenate(&context_keys, keys, 2)?,
-                MxArray::concatenate(&context_values, values, 2)?,
-            ));
-        }
-        let at = self.end;
         self.store_rows(at, keys, values)?;
+        let (from, to) = self
+            .block_range(rows)?
+            .ok_or_else(|| Error::from_reason("DFlash2 draft block lost its range"))?;
         let (Some(buffer_keys), Some(buffer_values)) = (&self.keys, &self.values) else {
             return Err(Error::from_reason("DFlash2 draft window lost its buffers"));
         };
         Ok((
-            buffer_keys.slice_axis(2, self.start, self.end + rows)?,
-            buffer_values.slice_axis(2, self.start, self.end + rows)?,
+            buffer_keys.slice_axis(2, from, to)?,
+            buffer_values.slice_axis(2, from, to)?,
         ))
     }
 
@@ -1555,10 +1754,7 @@ impl DFlash2ContextCache {
         Self {
             layers: (0..config.num_hidden_layers)
                 .map(|_| {
-                    DraftKvWindow::new(
-                        config.sliding_window as i64 - 1,
-                        config.block_size as i64 + 1,
-                    )
+                    DraftKvWindow::new(config.sliding_window as i64, config.block_size as i64 + 1)
                 })
                 .collect(),
             mask_memo: None,
@@ -1641,97 +1837,12 @@ impl DFlash2ContextCache {
             })?)
             .ok_or_else(|| Error::from_reason("DFlash2 context length overflow"))?;
         for ((keys, values), window) in projected.kv.iter().zip(self.layers.iter_mut()) {
-            window.append(keys, values)?;
+            window.append(i64::from(projected.base), keys, values)?;
         }
         self.logical_len = next;
         self.kv_end = next;
         self.token_history.extend_from_slice(token_ids);
         Ok(())
-    }
-
-    /// The window as it stands once rows `[.., c)` are appended, taken while
-    /// `chunk` (projected at this context's next position, `chunk_tokens`
-    /// its ids) is not yet appended: each window's newest rows, then the
-    /// chunk's rows below `c`. A compact, evaluated deep copy with logical
-    /// length `c` and provenance `[.., c)`. Evaluated here because a later
-    /// append that overruns the window stores its rows in place over the
-    /// rows this reads.
-    pub(crate) fn snapshot_window_at(
-        &self,
-        c: i32,
-        chunk: &ProjectedContext,
-        chunk_tokens: &[u32],
-    ) -> Result<DFlash2ContextCache> {
-        if chunk.base != self.logical_len
-            || usize::try_from(self.logical_len).ok() != Some(self.token_history.len())
-            || chunk.kv.len() != self.layers.len()
-            || usize::try_from(chunk.rows).ok() != Some(chunk_tokens.len())
-        {
-            return Err(Error::from_reason(
-                "DFlash2 window snapshot chunk does not continue this context",
-            ));
-        }
-        let from_chunk = i64::from(c) - i64::from(chunk.base);
-        if !(0..=chunk.rows).contains(&from_chunk) {
-            return Err(Error::from_reason(format!(
-                "DFlash2 window snapshot at {c} is outside the chunk [{}, {})",
-                chunk.base,
-                i64::from(chunk.base) + chunk.rows
-            )));
-        }
-        let mut layers = Vec::with_capacity(self.layers.len());
-        let mut arrays = Vec::with_capacity(2 * self.layers.len());
-        for (window, (chunk_keys, chunk_values)) in self.layers.iter().zip(&chunk.kv) {
-            let rows = window.window.min(i64::from(c));
-            let chunk_rows = from_chunk.min(rows);
-            let ring_rows = rows - chunk_rows;
-            if ring_rows > 0 && (self.kv_end != self.logical_len || window.len() < ring_rows) {
-                return Err(Error::from_reason(format!(
-                    "DFlash2 window snapshot at {c} needs {ring_rows} rows below {} that the draft window does not hold",
-                    chunk.base
-                )));
-            }
-            let mut snapshot = DraftKvWindow::new(window.window, window.reserve);
-            if rows > 0 {
-                let ring = window.view();
-                let take = |chunk_rows_array: &MxArray, ring_part: Option<&MxArray>| {
-                    let tail =
-                        chunk_rows_array.slice_axis(2, from_chunk - chunk_rows, from_chunk)?;
-                    let joined = match ring_part {
-                        Some(ring_part) if ring_rows > 0 => {
-                            let live = ring_part.shape_at(2)?;
-                            let head = ring_part.slice_axis(2, live - ring_rows, live)?;
-                            if chunk_rows > 0 {
-                                MxArray::concatenate(&head, &tail, 2)?
-                            } else {
-                                head
-                            }
-                        }
-                        _ => tail,
-                    };
-                    joined.deep_copy()
-                };
-                snapshot.keys = Some(take(chunk_keys, ring.as_ref().map(|(k, _)| k))?);
-                snapshot.values = Some(take(chunk_values, ring.as_ref().map(|(_, v)| v))?);
-                snapshot.end = rows;
-            }
-            layers.push(snapshot);
-        }
-        for window in &layers {
-            window.collect_arrays(&mut arrays);
-        }
-        if !arrays.is_empty() {
-            MxArray::eval_arrays(&arrays)?;
-        }
-        let mut token_history = self.token_history.clone();
-        token_history.extend_from_slice(&chunk_tokens[..from_chunk as usize]);
-        Ok(DFlash2ContextCache {
-            layers,
-            mask_memo: None,
-            logical_len: c,
-            kv_end: c,
-            token_history,
-        })
     }
 
     /// Project a full eight-row verifier block, then store only its retained
@@ -1780,7 +1891,7 @@ impl DFlash2ContextCache {
             }
         }
         for ((keys, values), window) in prefixes.iter().zip(self.layers.iter_mut()) {
-            window.append(keys, values)?;
+            window.append(i64::from(base), keys, values)?;
         }
         self.logical_len = next;
         self.kv_end = next;
@@ -1810,11 +1921,30 @@ impl DFlash2ContextCache {
         self.logical_len
     }
 
+    /// Bytes of every layer's ring buffers allocated so far.
+    pub(crate) fn buffer_bytes(&self) -> u64 {
+        self.layers.iter().fold(0u64, |sum, window| {
+            sum.saturating_add(window.buffer_bytes())
+        })
+    }
+
+    /// Drops every row and the provenance; the ring buffers stay for the
+    /// next lane (Splash `QwenStateStorage::releaseLane`).
+    pub(crate) fn reset(&mut self) {
+        for window in &mut self.layers {
+            window.reset();
+        }
+        self.logical_len = 0;
+        self.kv_end = 0;
+        self.token_history.clear();
+    }
+
     #[cfg(test)]
     pub(crate) fn window_views(&self) -> Vec<Option<(MxArray, MxArray)>> {
         self.layers.iter().map(DraftKvWindow::view).collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn token_history(&self) -> &[u32] {
         &self.token_history
     }
@@ -1835,33 +1965,38 @@ impl DFlash2ContextCache {
         }
     }
 
-    /// An evaluated copy of every layer's window: appends to either never
-    /// reach the other (they write rows in place).
-    pub(crate) fn deep_copy(&self) -> Result<DFlash2ContextCache> {
-        let copy = |buffer: &Option<MxArray>| buffer.as_ref().map(MxArray::deep_copy).transpose();
-        let layers = self
-            .layers
-            .iter()
-            .map(|window| {
-                Ok(DraftKvWindow {
-                    keys: copy(&window.keys)?,
-                    values: copy(&window.values)?,
-                    start: window.start,
-                    end: window.end,
-                    window: window.window,
-                    reserve: window.reserve,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let copied = DFlash2ContextCache {
-            layers,
-            mask_memo: None,
-            logical_len: self.logical_len,
-            kv_end: self.kv_end,
-            token_history: self.token_history.clone(),
-        };
-        copied.eval()?;
-        Ok(copied)
+    /// Splash `QwenStateStorage::restore` with the draft side: the ring
+    /// of a state at `lineage.len()`, whose newest rows (at most the ring's
+    /// `sliding_window - 1`) are projected again from `window`'s 4-bit rows
+    /// into `ring`'s buffers.
+    pub(crate) fn restore(
+        mut ring: DFlash2ContextCache,
+        model: &DFlash2Model,
+        window: &DraftContextWindow,
+        lineage: &[u32],
+    ) -> Result<DFlash2ContextCache> {
+        let depth = u32::try_from(lineage.len())
+            .map_err(|_| Error::from_reason("DFlash2 state lineage exceeds u32"))?;
+        if window.end() != depth || window.width() as usize != model.config.hidden_size {
+            return Err(Error::from_reason(format!(
+                "DFlash2 context window [{}, {}) of width {} does not end the {depth}-token state",
+                window.begin(),
+                window.end(),
+                window.width()
+            )));
+        }
+        ring.reset();
+        let ring_rows = (model.config.sliding_window as u32).saturating_sub(1);
+        let first = window.begin().max(depth.saturating_sub(ring_rows));
+        ring.record_only(&lineage[..first as usize])?;
+        if first < depth {
+            let rows = window.load_rows(first, depth - first)?;
+            let fused = rows.reshape(&[1, i64::from(depth - first), i64::from(window.width())])?;
+            let projected = ring.project(model, &fused, first as i32)?;
+            ring.append_projected(projected, &lineage[first as usize..])?;
+            ring.eval()?;
+        }
+        Ok(ring)
     }
 }
 
@@ -2183,23 +2318,25 @@ impl DFlash2Model {
         let DFlash2ContextCache {
             layers: windows,
             mask_memo,
-            logical_len,
             ..
         } = context;
+        // Every layer's window holds the same rows, so one mask serves all.
+        let mask = match windows.first() {
+            Some(window) => window.block_mask(
+                mask_memo,
+                query_base,
+                block_ids.shape_at(1)?,
+                self.config.sliding_window as i64,
+            )?,
+            None => None,
+        };
         for (layer, window) in self.layers.iter().zip(windows.iter_mut()) {
-            let context_base = logical_len.saturating_sub(window.len() as i32);
             let input = match &pending {
                 Some(output) => output.as_input(),
                 None => DraftResidual::Hidden(&embedded),
             };
-            let next = layer.forward(
-                input,
-                window,
-                context_base,
-                query_base,
-                mask_memo,
-                self.merged_rows(),
-            )?;
+            let next =
+                layer.forward(input, window, query_base, mask.as_ref(), self.merged_rows())?;
             pending = Some(next);
         }
         match &pending {
@@ -2233,21 +2370,24 @@ impl DFlash2Model {
         if !(2..=256).contains(&rows) || block.shape_at(0)? != 1 {
             return Ok(None);
         }
-        let live = context.layers[0].len();
+        let (start, end) = (context.layers[0].start, context.layers[0].end);
         // An empty window has no full buffer owner; keep the eager path.
-        if live == 0 || context.layers.iter().any(|w| w.len() != live) {
+        if start == end
+            || context
+                .layers
+                .iter()
+                .any(|w| (w.start, w.end) != (start, end))
+        {
             return Ok(None);
         }
         let mut inputs = vec![
             block.clone(),
             MxArray::from_int32(&[context.logical_len], &[1])?,
         ];
-        let mask = memo_sliding_mask(
+        let mask = context.layers[0].block_mask(
             &mut context.mask_memo,
             context.logical_len,
             rows,
-            context.logical_len - live as i32,
-            live + rows,
             self.config.sliding_window as i64,
         )?;
         let has_mask = mask.is_some();
@@ -2260,7 +2400,7 @@ impl DFlash2Model {
             {
                 return Ok(None);
             }
-            let broadcast_mask = mask.broadcast_to(&[1, heads, rows, live + rows])?;
+            let broadcast_mask = mask.broadcast_to(&[1, heads, rows, mask.shape_at(3)?])?;
             inputs.extend([mask, broadcast_mask]);
         }
         let windows_at = inputs.len();
@@ -2268,8 +2408,10 @@ impl DFlash2Model {
             let (Some(keys), Some(values)) = (&window.keys, &window.values) else {
                 return Ok(None);
             };
-            if window.end + rows > window.capacity()?
-                || keys.dtype()? != DType::BFloat16
+            let Some((from, to)) = window.block_range(rows)? else {
+                return Ok(None);
+            };
+            if keys.dtype()? != DType::BFloat16
                 || values.dtype()? != DType::BFloat16
                 || keys.shape_at(0)? != 1
             {
@@ -2278,8 +2420,8 @@ impl DFlash2Model {
             inputs.extend([
                 keys.clone(),
                 values.clone(),
-                keys.slice_axis(2, window.start, window.end + rows)?,
-                values.slice_axis(2, window.start, window.end + rows)?,
+                keys.slice_axis(2, from, to)?,
+                values.slice_axis(2, from, to)?,
             ]);
         }
         let fn_id = COMPILED_DRAFT_TAG
@@ -2493,7 +2635,7 @@ pub(crate) fn tiny_dflash2_config() -> DFlash2Config {
         mask_token_id: 0,
         target_layers: vec![0],
         target_num_layers: 1,
-        hidden_size: 8,
+        hidden_size: 64,
         intermediate_size: 16,
         num_hidden_layers: 1,
         num_attention_heads: 1,
@@ -2508,6 +2650,17 @@ pub(crate) fn tiny_dflash2_config() -> DFlash2Config {
         selector_rank: 8,
         selector_top_k: 4,
         rope_theta: 1e4,
+    }
+}
+
+/// The tiny draft geometry with a context row `hidden` wide and `window`
+/// sliding rows.
+#[cfg(test)]
+pub(crate) fn dflash2_config_with_context(hidden: usize, window: usize) -> DFlash2Config {
+    DFlash2Config {
+        hidden_size: hidden,
+        sliding_window: window,
+        ..tiny_dflash2_config()
     }
 }
 
@@ -2607,7 +2760,6 @@ pub(crate) fn tiny_dflash2_model_with_block(
         num_heads: config.num_attention_heads as i64,
         num_kv_heads: config.num_key_value_heads as i64,
         head_dim: head_dim as i64,
-        sliding_window: config.sliding_window as i64,
     };
     let layer = DFlash2Layer {
         attention,
@@ -3100,7 +3252,6 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
             num_heads: config.num_attention_heads as i64,
             num_kv_heads: config.num_key_value_heads as i64,
             head_dim: config.head_dim as i64,
-            sliding_window: config.sliding_window as i64,
         };
         let mlp_base = format!("{base}.mlp");
         let mlp = DFlash2Mlp {
@@ -3260,7 +3411,8 @@ mod tests {
             .collect()
     }
 
-    /// Mutation: drop `DRAFT_KV_STEP` from the ring rows → red.
+    /// The ring holds `sliding_window` slots and a block's rows past them.
+    /// Mutation: drop the block rows from the ring rows → red.
     #[test]
     fn draft_kv_ring_bytes_match_the_window_buffer_cap() {
         let config = DFlash2Config {
@@ -3271,11 +3423,8 @@ mod tests {
             block_size: 7,
             ..checkpoint_inventory_config()
         };
-        assert_eq!(
-            config.kv_ring_bytes(),
-            (2047 + 8 + 256) * 5 * 2 * 8 * 128 * 2
-        );
-        assert_eq!(config.kv_ring_bytes(), 47_329_280);
+        assert_eq!(config.kv_ring_bytes(), (2048 + 8) * 5 * 2 * 8 * 128 * 2);
+        assert_eq!(config.kv_ring_bytes(), 42_106_880);
     }
 
     #[test]
@@ -4432,7 +4581,15 @@ mod tests {
                 None => (block_keys, block_values, query_base),
             };
             let attention = attention
-                .attend(&queries, &keys, &values, key_base, query_base, &mut fresh)
+                .attend(
+                    &queries,
+                    &keys,
+                    &values,
+                    key_base,
+                    query_base,
+                    model.config.sliding_window as i64,
+                    &mut fresh,
+                )
                 .unwrap();
             hidden = residual
                 .add(&layer.attention_conv.finish(&attention, &dynamic).unwrap())
@@ -4500,7 +4657,6 @@ mod tests {
             num_heads: 32,
             num_kv_heads: 8,
             head_dim: 128,
-            sliding_window: 2048,
         };
         let packed = |heads| {
             MxArray::random_normal(&[1, 8, heads, 128], 0.0, 0.5, Some(DType::BFloat16)).unwrap()
@@ -4627,7 +4783,6 @@ mod tests {
                         num_heads: heads,
                         num_kv_heads: kv_heads,
                         head_dim,
-                        sliding_window: config.sliding_window as i64,
                     },
                     mlp: DFlash2Mlp {
                         gate_proj: quantized(hidden, intermediate),
@@ -4683,9 +4838,14 @@ mod tests {
     /// `with_block` presents the window followed by the block, bit for bit
     /// like a concatenation — while the block rows it parks past the window
     /// never leak into later views.
+    /// Rows appended in chunks of 1, 3 and 8 over three wraps of an
+    /// 8-slot ring, each row at slot p % 8: the live rows read in row order
+    /// equal the newest 7 rows of the whole stream, bit for bit; a gap
+    /// restarts the window.
+    /// Mutation RG1 (an append writes row p at slot (p + 1) % 8) → red.
     #[test]
-    fn draft_kv_window_matches_rolling_concatenation() {
-        let (heads, dim, window) = (2i64, 16i64, 20i64);
+    fn ring_after_n_cycles_holds_the_sliding_rows() {
+        let (heads, dim, slots) = (2i64, 16i64, 8i64);
         let rows = |t: i64| {
             (
                 MxArray::random_normal(&[1, heads, t, dim], 0.0, 1.0, Some(DType::BFloat16))
@@ -4696,75 +4856,89 @@ mod tests {
                     .unwrap(),
             )
         };
-        let mut live = super::DraftKvWindow::new(window, 3);
-        let mut all_keys: Option<MxArray> = None;
-        let mut all_values: Option<MxArray> = None;
-        for (appends, t) in [
-            1i64, 3, 8, 1, 7, 5, 2, 25, 1, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        ]
-        .into_iter()
-        .enumerate()
+        let mut ring = super::DraftKvWindow::new(slots, 3);
+        let mut all: Option<(MxArray, MxArray)> = None;
+        let mut base = 0i64;
+        for (append, t) in [1i64, 3, 8, 1, 3, 1, 8, 3, 3, 1, 1, 8, 3]
+            .into_iter()
+            .enumerate()
         {
-            let (block_keys, block_values) = rows(t);
-            let (keys, values) = live.with_block(&block_keys, &block_values).unwrap();
-            let (want_keys, want_values) = match (&all_keys, &all_values) {
-                (Some(k), Some(v)) => {
-                    let n = k.shape_at(2).unwrap();
-                    let (k, v) = (
-                        k.slice_axis(2, (n - window).max(0), n).unwrap(),
-                        v.slice_axis(2, (n - window).max(0), n).unwrap(),
-                    );
-                    (
-                        MxArray::concatenate(&k, &block_keys, 2).unwrap(),
-                        MxArray::concatenate(&v, &block_values, 2).unwrap(),
-                    )
-                }
-                _ => (block_keys.clone(), block_values.clone()),
-            };
-            assert_eq!(
-                bits(&keys),
-                bits(&want_keys),
-                "append {appends}: block view keys"
-            );
-            assert_eq!(
-                bits(&values),
-                bits(&want_values),
-                "append {appends}: block view values"
-            );
-            let (context_keys, context_values) = rows(t);
-            live.append(&context_keys, &context_values).unwrap();
-            all_keys = Some(match all_keys {
-                Some(k) => MxArray::concatenate(&k, &context_keys, 2).unwrap(),
-                None => context_keys,
-            });
-            all_values = Some(match all_values {
-                Some(v) => MxArray::concatenate(&v, &context_values, 2).unwrap(),
-                None => context_values,
-            });
-            let n = all_keys.as_ref().unwrap().shape_at(2).unwrap();
-            let (keys, values) = live.view().unwrap();
-            assert_eq!(live.len(), n.min(window));
-            assert_eq!(
-                bits(&keys),
-                bits(
-                    &all_keys
-                        .as_ref()
-                        .unwrap()
-                        .slice_axis(2, (n - window).max(0), n)
-                        .unwrap()
+            let (keys, values) = rows(t);
+            ring.append(base, &keys, &values).unwrap();
+            base += t;
+            all = Some(match all {
+                Some((k, v)) => (
+                    MxArray::concatenate(&k, &keys, 2).unwrap(),
+                    MxArray::concatenate(&v, &values, 2).unwrap(),
                 ),
-                "append {appends}: window keys"
+                None => (keys, values),
+            });
+            let (all_keys, all_values) = all.as_ref().unwrap();
+            let n = all_keys.shape_at(2).unwrap();
+            let from = (n - (slots - 1)).max(0);
+            assert_eq!((ring.start, ring.end), (from, n), "append {append}");
+            let (got_keys, got_values) = ring.view().unwrap();
+            assert_eq!(
+                bits(&got_keys),
+                bits(&all_keys.slice_axis(2, from, n).unwrap()),
+                "append {append}: keys"
             );
             assert_eq!(
-                bits(&values),
-                bits(
-                    &all_values
-                        .as_ref()
-                        .unwrap()
-                        .slice_axis(2, (n - window).max(0), n)
-                        .unwrap()
-                ),
-                "append {appends}: window values"
+                bits(&got_values),
+                bits(&all_values.slice_axis(2, from, n).unwrap()),
+                "append {append}: values"
+            );
+        }
+        assert!(base > 3 * slots, "three wraps");
+        let (keys, values) = rows(2);
+        ring.append(base + 5, &keys, &values).unwrap();
+        assert_eq!((ring.start, ring.end), (base + 5, base + 7));
+        assert_eq!(bits(&ring.view().unwrap().0), bits(&keys));
+    }
+
+    /// The draft over a wrapped ring (attention in slot order with the
+    /// per-row mask) against the sliding path (the live rows copied in
+    /// order): 40 one-row commits on an 8-slot ring, then blocks of one row
+    /// and of the block size, every block row's hidden state within
+    /// `assert_bits_match`'s bf16 summation tolerance.
+    /// Mutation DM1 (the ring mask hides for every row only what row 0
+    /// hides) → red.
+    #[test]
+    fn ring_attention_matches_the_sliding_window() {
+        let mut model = three_layer_tiny_draft();
+        model.config.sliding_window = 8;
+        model.config.block_size = 7;
+        let mut embedding = Embedding::new(32, 64).unwrap();
+        embedding
+            .load_weight(
+                &MxArray::random_normal(&[32, 64], 0.0, 0.5, Some(DType::BFloat16)).unwrap(),
+            )
+            .unwrap();
+        let mut context = super::DFlash2ContextCache::new(&model.config);
+        for row in 0..40u32 {
+            let fused =
+                MxArray::random_normal(&[1, 1, 64], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
+            context
+                .append(&model, &fused, row as i32, &[3 + row % 20])
+                .unwrap();
+        }
+        assert!(context.layers[0].wrapped());
+        let block_size = model.config.block_size as i32;
+        for rows in [1, block_size] {
+            let ids: Vec<i32> = (0..rows).map(|i| 7 + i % 5).collect();
+            let block = MxArray::from_int32(&ids, &[1, rows as i64]).unwrap();
+            let base = context.logical_len;
+            let want = reference_forward_hidden(&model, &embedding, &block, base, &context);
+            let got = model
+                .forward_hidden(&embedding, &block, base, &mut context)
+                .unwrap();
+            got.eval();
+            want.eval();
+            assert_bits_match(
+                &got.to_uint16_native().unwrap(),
+                &want.to_uint16_native().unwrap(),
+                false,
+                &format!("block of {rows}"),
             );
         }
     }
@@ -5322,163 +5496,6 @@ mod tests {
         assert_eq!(route_table, want_routes);
     }
 
-    fn window_bits(context: &DFlash2ContextCache) -> Vec<(i64, Vec<u16>, Vec<u16>)> {
-        context
-            .window_views()
-            .iter()
-            .map(|view| match view {
-                Some((keys, values)) => (keys.shape_at(2).unwrap(), bits(keys), bits(values)),
-                None => (0, Vec::new(), Vec::new()),
-            })
-            .collect()
-    }
-
-    /// The first `rows` rows of a projected segment, as a narrower append of
-    /// the same projection (same widths, so the same bits).
-    fn projected_prefix(projected: &super::ProjectedContext, rows: i64) -> super::ProjectedContext {
-        super::ProjectedContext {
-            base: projected.base,
-            rows,
-            kv: projected
-                .kv
-                .iter()
-                .map(|(keys, values)| {
-                    (
-                        keys.slice_axis(2, 0, rows).unwrap(),
-                        values.slice_axis(2, 0, rows).unwrap(),
-                    )
-                })
-                .collect(),
-        }
-    }
-
-    /// A window snapshot at every row `c` of a chunked append schedule (mid
-    /// chunk, at a chunk edge, at a chunk start, below and above the window,
-    /// from a chunk wider than the window) is bit for bit the window of a
-    /// reference context that appended exactly rows `[.., c)` with the same
-    /// projected widths, carries length `c` and provenance `[.., c)`, shares
-    /// no buffer with the live windows, and keeps its bits while the live
-    /// context appends on, including over-window appends that store in place
-    /// over the rows it was read from.
-    #[test]
-    fn window_snapshot_matches_ring_of_exact_appends() {
-        let mut model = three_layer_tiny_draft();
-        model.config.sliding_window = 12;
-        let window_rows = 11i64;
-        let widths = [5i64, 9, 4, 13, 6, 1, 2];
-        let total = widths.iter().sum::<i64>();
-        let fused = (0..widths.len())
-            .map(|i| {
-                MxArray::random_normal(&[1, widths[i], 64], 0.0, 1.0, Some(DType::BFloat16))
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let tokens: Vec<u32> = (0..total as u32).map(|t| 3 + t % 23).collect();
-        let mut checked = 0;
-        for c in 0..=total {
-            let mut live = DFlash2ContextCache::new(&model.config);
-            let mut reference = DFlash2ContextCache::new(&model.config);
-            let mut snapshot = None;
-            let mut base = 0i64;
-            for (chunk, &width) in fused.iter().zip(&widths) {
-                let chunk_tokens = &tokens[base as usize..(base + width) as usize];
-                let projected = live.project(&model, chunk, base as i32).unwrap();
-                // A boundary row is taken at the end of the chunk before it
-                // when odd, at the start of the chunk after it when even.
-                let in_chunk = if c % 2 == 0 {
-                    base <= c && (c < base + width || c == total && c == base + width)
-                } else {
-                    base < c && c <= base + width
-                };
-                if snapshot.is_none() && in_chunk {
-                    let taken = live
-                        .snapshot_window_at(c as i32, &projected, chunk_tokens)
-                        .unwrap();
-                    let from_chunk = c - base;
-                    if from_chunk > 0 {
-                        reference
-                            .append_projected(
-                                projected_prefix(&projected, from_chunk),
-                                &chunk_tokens[..from_chunk as usize],
-                            )
-                            .unwrap();
-                    }
-                    snapshot = Some((taken, window_bits(&reference)));
-                } else if snapshot.is_none() {
-                    reference
-                        .append_projected(projected_prefix(&projected, width), chunk_tokens)
-                        .unwrap();
-                }
-                live.append_projected(projected, chunk_tokens).unwrap();
-                live.eval().unwrap();
-                if let Some((taken, _)) = &snapshot {
-                    let mut owned = Vec::new();
-                    taken.collect_arrays(&mut owned);
-                    let mut live_arrays = Vec::new();
-                    live.collect_arrays(&mut live_arrays);
-                    for array in &owned {
-                        for other in &live_arrays {
-                            assert!(
-                                !unsafe {
-                                    mlx_sys::mlx_array_aliases(
-                                        array.as_raw_ptr(),
-                                        other.as_raw_ptr(),
-                                    )
-                                },
-                                "c={c}: snapshot shares a live window buffer"
-                            );
-                        }
-                    }
-                }
-                base += width;
-            }
-            let (taken, want) = snapshot.expect("every c lies in a chunk");
-            assert_eq!(taken.logical_len(), c as i32, "c={c}: length");
-            assert_eq!(taken.token_history(), &tokens[..c as usize], "c={c}");
-            let got = window_bits(&taken);
-            for (layer, ((rows, keys, values), (want_rows, want_keys, want_values))) in
-                got.iter().zip(&want).enumerate()
-            {
-                assert_eq!(*rows, c.min(window_rows), "c={c} layer {layer}: rows");
-                assert_eq!(rows, want_rows, "c={c} layer {layer}: reference rows");
-                assert!(keys == want_keys, "c={c} layer {layer}: keys");
-                assert!(values == want_values, "c={c} layer {layer}: values");
-            }
-            for window in &taken.layers {
-                if let Some(keys) = &window.keys {
-                    assert_eq!(keys.shape_at(2).unwrap(), window.len(), "c={c}: compact");
-                }
-            }
-            checked += 1;
-        }
-        assert_eq!(checked, total + 1);
-    }
-
-    /// A snapshot never reads rows the windows skipped: after `record_only`
-    /// leaves the windows short of the chunk, a snapshot that needs rows
-    /// below the chunk fails, and one inside the chunk's own rows succeeds.
-    /// Rows outside the chunk are refused too.
-    #[test]
-    fn window_snapshot_refuses_rows_the_windows_skipped() {
-        let mut model = three_layer_tiny_draft();
-        model.config.sliding_window = 8;
-        let rows =
-            |t: i64| MxArray::random_normal(&[1, t, 64], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
-        let mut context = DFlash2ContextCache::new(&model.config);
-        context.append(&model, &rows(10), 0, &[1; 10]).unwrap();
-        context.record_only(&[2; 3]).unwrap();
-        let chunk = context.project(&model, &rows(9), 13).unwrap();
-        assert!(context.snapshot_window_at(15, &chunk, &[3; 9]).is_err());
-        assert!(context.snapshot_window_at(13, &chunk, &[3; 9]).is_err());
-        assert!(context.snapshot_window_at(22, &chunk, &[3; 9]).is_ok());
-        assert!(context.snapshot_window_at(12, &chunk, &[3; 9]).is_err());
-        assert!(context.snapshot_window_at(23, &chunk, &[3; 9]).is_err());
-        let mut fresh = DFlash2ContextCache::new(&model.config);
-        fresh.append(&model, &rows(10), 0, &[1; 10]).unwrap();
-        let chunk = fresh.project(&model, &rows(9), 10).unwrap();
-        assert!(fresh.snapshot_window_at(12, &chunk, &[3; 9]).is_ok());
-    }
-
     /// Splash bounds the draft by its sliding window only: a proposal past
     /// the draft's trained context (256 here) runs. Mutation: the
     /// query-end check back in `propose` → red.
@@ -5486,9 +5503,6 @@ mod tests {
     fn draft_proposes_past_its_trained_context() {
         let mut model = three_layer_tiny_draft();
         model.config.sliding_window = 8;
-        for layer in &mut model.layers {
-            layer.attention.sliding_window = 8;
-        }
         assert_eq!(model.config.max_position_embeddings, 256);
         let embedding = Embedding::from_weight(
             &MxArray::random_normal(&[32, 64], 0.0, 0.5, Some(DType::BFloat16)).unwrap(),
@@ -5503,8 +5517,8 @@ mod tests {
             layer.values = Some(
                 MxArray::random_normal(&[1, 2, 16, 16], 0.0, 0.5, Some(DType::BFloat16)).unwrap(),
             );
-            layer.start = 0;
-            layer.end = 7;
+            layer.start = 293;
+            layer.end = 300;
         }
         model
             .propose(
@@ -5522,27 +5536,24 @@ mod tests {
     }
 
     #[test]
-    fn compiled_draft_replays_positions_windows_masks_and_buffer_compaction() {
+    fn compiled_draft_replays_positions_windows_and_masks() {
         if !unsafe { mlx_sys::mlx_metal_is_available() } {
             return;
         }
         let mut model = three_layer_tiny_draft();
         model.config.sliding_window = 8;
         model.selector.top_k = 16;
-        for layer in &mut model.layers {
-            layer.attention.sliding_window = 8;
-        }
         let mut embedding = Embedding::from_weight(
             &MxArray::random_normal(&[32, 64], 0.0, 0.5, Some(DType::BFloat16)).unwrap(),
         )
         .unwrap();
         let mut previous_path = None;
-        for (case, (live, start, capacity, position, anchor)) in [
-            (3, 0, 16, 3, 7),
-            (5, 2, 24, 100, 19),
-            (7, 0, 16, 7, 2),
-            (7, 4, 32, 211, 23),
-            (3, 0, 16, 37, 4),
+        for (case, (live, capacity, position, anchor)) in [
+            (3, 16, 3, 7),
+            (5, 24, 100, 19),
+            (7, 16, 7, 2),
+            (7, 32, 211, 23),
+            (3, 16, 37, 4),
         ]
         .into_iter()
         .enumerate()
@@ -5580,10 +5591,10 @@ mod tests {
                         right.values = Some(copy);
                     }
                 }
-                left.start = start;
-                left.end = start + live;
-                right.start = start;
-                right.end = start + live;
+                left.start = i64::from(position) - live;
+                left.end = i64::from(position);
+                right.start = i64::from(position) - live;
+                right.end = i64::from(position);
             }
             let mut confidence = None;
             let (expected, _) = model
@@ -5632,7 +5643,10 @@ mod tests {
                     bits(right.values.as_ref().unwrap()),
                     "V case {case}"
                 );
-                assert_eq!((right.start, right.end), (start, start + live));
+                assert_eq!(
+                    (right.start, right.end),
+                    (i64::from(position) - live, i64::from(position))
+                );
             }
             previous_path = Some(path);
         }

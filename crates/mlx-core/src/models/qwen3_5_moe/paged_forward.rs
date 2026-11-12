@@ -15,10 +15,10 @@ use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
 use crate::models::qwen3_5::paged_forward::{
-    MaterializedGdnPrefixCheckpoint, PrefillParts, PrefillTapSink, PrefillTarget,
-    check_prefill_chunk_rows, checkpoint_suffix_offsets, gdn_checkpoint_target,
-    gdn_cold_sidecar_ladder_wanted, materialize_linear_layer_caches, media_prefill_ranges,
-    paged_prefill_ranges, prefill_breaks, prefill_checkpoint_boundaries,
+    CaptureGrant, MaterializedGdnPrefixCheckpoint, PrefillParts, PrefillTapSink, PrefillTarget,
+    book_chunk, capture_chunk_linear, capture_rows_of, check_prefill_chunk_rows,
+    checkpoint_suffix_offsets, gdn_checkpoint_target, materialize_linear_layer_caches,
+    media_prefill_ranges, paged_prefill_ranges, prefill_breaks, prefill_ladder, reach_chunk,
     snapshot_materialized_linear_layer_caches,
 };
 use crate::nn::{Embedding, RMSNorm};
@@ -341,23 +341,16 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
     check_prefill_chunk_rows(chunk_size)?;
 
     let chunk_size_usize = chunk_size as usize;
-    let checkpoint_boundaries = {
-        let adapter = target.parts()?.adapter;
-        prefill_checkpoint_boundaries(
-            full_tokens.len(),
-            cached_prefix_len,
-            adapter.block_size(),
-            gdn_cold_sidecar_ladder_wanted(adapter),
-        )
-    };
-
-    let capture_row = taps
-        .as_deref()
-        .and_then(PrefillTapSink::capture_row)
-        .and_then(|row| u32::try_from(row).ok());
+    let checkpoint_boundaries = prefill_ladder(
+        target.parts()?.adapter,
+        full_tokens.len(),
+        cached_prefix_len,
+        taps.is_some(),
+    );
+    let capture_rows = capture_rows_of(taps.as_deref());
     let breaks = prefill_breaks(
         &checkpoint_boundaries,
-        capture_row,
+        &capture_rows,
         cached_prefix_len,
         full_tokens.len(),
     );
@@ -421,22 +414,28 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
         .map_or_else(Vec::new, |sink| sink.tap_layers().to_vec());
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
-        // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary
-        // instead of running the rest of the prefill. The Err rides the
-        // generic paged engine's `abort_paged_turn` arm, which releases
-        // the live request without registering its blocks (fail closed).
+        // Cooperative cancel at the chunk boundary. The Err rides
+        // `abort_paged_turn`, which releases the live request; only the
+        // blocks a tapped prefill's completed chunks registered stay cached
+        // (Splash `publishCommittedBlocks`).
         if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
             return Err(Error::from_reason("prefill cancelled"));
         }
         let chunk = &suffix_tokens[range];
         let is_last_chunk = chunk_idx + 1 == total_chunks;
         let chunk_trace_start = trace_enabled.then(Instant::now);
-
-        // 1. Advance cursor + grow blocks for this chunk. Must happen
-        //    BEFORE calling the per-chunk helper so `update_keys_values`
-        //    inside the layer loop aligns at
+        // 1. Advance cursor + grow blocks for this chunk, then claim its
+        //    capture. Must happen BEFORE calling the per-chunk helper so
+        //    `update_keys_values` inside the layer loop aligns at
         //    `[chunk_start_position, chunk_start_position+chunk.len())`.
-        target.record(chunk)?;
+        let grant = book_chunk(
+            target,
+            taps.as_deref_mut(),
+            &capture_rows,
+            chunk,
+            chunk_start_position + chunk.len() as u32,
+            is_last_chunk,
+        )?;
         let parts = target.parts()?;
 
         // 2. Run the per-chunk forward (embed → layer loop). For chunk N
@@ -532,17 +531,13 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
                     });
                 }
             }
-            if capture_row == Some(context_after)
+            if grant.as_ref().is_some_and(CaptureGrant::armed)
                 && let Some(sink) = taps.as_deref_mut()
             {
-                if !capture_checkpoint {
-                    materialize_linear_layer_caches(parts.caches)?;
-                }
-                if let Some(linear) = snapshot_materialized_linear_layer_caches(parts.caches) {
-                    sink.capture_linear(linear);
-                }
+                capture_chunk_linear(parts.caches, sink, context_after, capture_checkpoint)?;
             }
             crate::array::synchronize_and_clear_cache();
+            reach_chunk(target, taps.as_deref_mut(), context_after, grant)?;
             if let Some(start) = chunk_trace_start {
                 let chunk_elapsed_ms = elapsed_ms(start);
                 let (active_mib, cache_mib, peak_mib) = trace_memory_mib();

@@ -2484,6 +2484,11 @@ fn flat_context_window_is_the_capped_lane() {
 /// → red (`Err` "could not reserve").
 #[test]
 fn moe_cold_dflash2_prefill_reclaims_a_marked_live_chain() {
+    if crate::test_support::paged_prefill_unsupported(
+        "moe_cold_dflash2_prefill_reclaims_a_marked_live_chain",
+    ) {
+        return;
+    }
     use crate::engine::backend::PagedPrefix;
     use crate::engine::dspark_turn::PagedDsparkBackend;
     use crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE;
@@ -2531,10 +2536,19 @@ fn moe_cold_dflash2_prefill_reclaims_a_marked_live_chain() {
     })();
     PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
     result.expect("the cold DFlash2 prefill fits after the reclaim");
-    assert_eq!(
-        grow_log(),
-        vec![crate::models::qwen3_5::dflash2_turn::GrowReclaim::Ladder]
-    );
+    {
+        use crate::models::qwen3_5::dflash2_turn::GrowReclaim::{Ladder, Store};
+        let depths: Vec<usize> = inner
+            .dflash2_states
+            .store
+            .entries()
+            .map(|entry| entry.depth())
+            .collect();
+        assert_eq!(
+            (grow_log(), depths),
+            (vec![Ladder, Store, Store], Vec::new())
+        );
+    }
     assert!(
         moe_ladder(&inner)
             .iter()

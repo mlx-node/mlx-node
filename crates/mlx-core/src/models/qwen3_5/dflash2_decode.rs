@@ -6,7 +6,7 @@ use crate::array::{DType, MxArray};
 use crate::engine::backend::{DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput};
 use crate::engine::memory_plan::EXTENT_TARGET_BYTES;
 
-use super::dflash2::{DFlash2Config, DFlash2ContextCache};
+use super::dflash2::DFlash2ContextCache;
 use super::dflash2_turn::{DFlash2Target, DFlash2TurnState};
 use super::gdn_blob::GdnStateBlobs;
 use super::model::{PREFILL_STEP_SIZE, Qwen35Inner};
@@ -26,42 +26,39 @@ pub(crate) struct Qwen35DFlash2Stepper<'a> {
     paged: PagedVerifyLane,
 }
 
-/// A DFlash2 lane's buffers: both GDN cells with their pending rows, and
-/// the draft window.
+/// A DFlash2 lane's two GDN cells with their pending rows.
 pub(crate) struct DFlash2Lane {
     gdn: GdnStateBlobs,
-    context: DFlash2ContextCache,
 }
 
 /// Splash `Runtime::suspend` → `QwenStateStorage::releaseLane`: across a
-/// verify's claim the lane's buffers sit on the target, so the vacate of a
-/// suspend drops them before the wait and the replay.
+/// verify's claim the lane sits on the target, so the vacate of a suspend
+/// drops its GDN cells and gives its draft ring to the idle lane before the
+/// wait and the replay. Returns the cells and the ring, `empty` in its place.
 pub(crate) fn lend_lane(
     gdn: &mut Option<GdnStateBlobs>,
-    context: &mut DFlash2ContextCache,
-    config: &DFlash2Config,
-) -> Option<DFlash2Lane> {
+    ring: &mut DFlash2ContextCache,
+    empty: DFlash2ContextCache,
+) -> (Option<DFlash2Lane>, DFlash2ContextCache) {
     #[cfg(test)]
-    if let Some(gdn) = gdn.as_ref() {
-        let mut arrays = gdn.lane_arrays();
-        context.collect_arrays(&mut arrays);
-        lane_probe::record(&arrays);
-    }
-    Some(DFlash2Lane {
-        gdn: gdn.take()?,
-        context: std::mem::replace(context, DFlash2ContextCache::new(config)),
-    })
+    lane_probe::record(gdn.as_ref(), ring);
+    let ring = std::mem::replace(ring, empty);
+    (gdn.take().map(|gdn| DFlash2Lane { gdn }), ring)
 }
 
-/// The lane the claim left on the target, when no suspend dropped it.
+/// The cells and the ring the claim left on the target, when no suspend
+/// took them.
 pub(crate) fn reclaim_lane(
     lent: Option<DFlash2Lane>,
+    ring: Option<DFlash2ContextCache>,
     gdn: &mut Option<GdnStateBlobs>,
     context: &mut DFlash2ContextCache,
 ) {
     if let Some(lane) = lent {
         *gdn = Some(lane.gdn);
-        *context = lane.context;
+    }
+    if let Some(ring) = ring {
+        *context = ring;
     }
 }
 
@@ -94,26 +91,40 @@ pub(crate) mod lane_probe {
     use std::sync::{Arc, Weak};
 
     use crate::array::{MxArray, MxHandle};
+    use crate::models::qwen3_5::dflash2::DFlash2ContextCache;
+    use crate::models::qwen3_5::gdn_blob::GdnStateBlobs;
+
+    type Weaks = Vec<Weak<MxHandle>>;
 
     thread_local! {
-        static LENT: RefCell<Vec<Weak<MxHandle>>> = const { RefCell::new(Vec::new()) };
+        static LENT: RefCell<(Weaks, Weaks)> = const { RefCell::new((Vec::new(), Vec::new())) };
     }
 
-    /// The arrays of the lane the last verify lent.
-    pub(crate) fn record(arrays: &[&MxArray]) {
-        let weak = arrays
+    fn weak(arrays: &[&MxArray]) -> Weaks {
+        arrays
             .iter()
             .map(|array| Arc::downgrade(&array.handle))
-            .collect();
-        LENT.with(|lent| *lent.borrow_mut() = weak);
+            .collect()
     }
 
-    /// (recorded, still held).
-    pub(crate) fn held() -> (usize, usize) {
+    /// The GDN cells and the draft ring the last verify lent.
+    pub(crate) fn record(gdn: Option<&GdnStateBlobs>, ring: &DFlash2ContextCache) {
+        let cells = gdn.map_or_else(Vec::new, |gdn| weak(&gdn.lane_arrays()));
+        let mut arrays = Vec::new();
+        ring.collect_arrays(&mut arrays);
+        let ring = weak(&arrays);
+        LENT.with(|lent| *lent.borrow_mut() = (cells, ring));
+    }
+
+    /// (recorded, still held), for the cells and for the ring.
+    pub(crate) fn held() -> ((usize, usize), (usize, usize)) {
+        let count = |weaks: &Weaks| {
+            let alive = weaks.iter().filter(|weak| weak.strong_count() > 0).count();
+            (weaks.len(), alive)
+        };
         LENT.with(|lent| {
             let lent = lent.borrow();
-            let alive = lent.iter().filter(|weak| weak.strong_count() > 0).count();
-            (lent.len(), alive)
+            (count(&lent.0), count(&lent.1))
         })
     }
 }
@@ -444,6 +455,15 @@ impl Qwen35DFlash2Stepper<'_> {
         Ok(())
     }
 
+    /// A ring with no buffers, standing in while the lane holds the real one.
+    fn empty_ring(&self) -> Result<DFlash2ContextCache> {
+        self.inner
+            .dflash2
+            .as_ref()
+            .map(|draft| DFlash2ContextCache::new(&draft.config))
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 model disappeared"))
+    }
+
     /// A greedy draft of the 7 proposals after `anchor` for a cycle the
     /// driver ran without one (Splash drafts every cycle).
     fn draft_tail(&mut self, anchor: u32) -> Result<Vec<u32>> {
@@ -488,14 +508,10 @@ impl Qwen35DFlash2Stepper<'_> {
         };
         let full = full_verify_ids(ids, &drafted)?;
         let (seq, window) = (self.paged.seq, self.paged.context_window);
-        let config = &self
-            .inner
-            .dflash2
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 model disappeared"))?
-            .config;
-        let lent = lend_lane(&mut self.gdn_blobs, &mut self.context, config);
+        let empty = self.empty_ring()?;
+        let (lent, ring) = lend_lane(&mut self.gdn_blobs, &mut self.context, empty);
         self.inner.dflash2_lane = lent;
+        self.inner.dflash2_context = Some(ring);
         let claimed = super::dflash2_turn::paged_step_claimed(&mut *self.inner, |inner| {
             inner
                 .paged_adapter
@@ -507,6 +523,7 @@ impl Qwen35DFlash2Stepper<'_> {
         });
         reclaim_lane(
             self.inner.dflash2_lane.take(),
+            self.inner.dflash2_context.take(),
             &mut self.gdn_blobs,
             &mut self.context,
         );
@@ -866,6 +883,19 @@ impl Drop for Qwen35DFlash2Stepper<'_> {
             let _ =
                 crate::engine::spec_paged::SpecPagedCache::commit_cycle(self, seq, ticket, rows);
         }
+        // A stepper that ends without `finish` leaves its ring on the lane,
+        // which the turn's end gives to the idle lane.
+        if self.inner.dflash2_context.is_none()
+            && self.context.buffer_bytes() > 0
+            && let Some(config) = self
+                .inner
+                .dflash2
+                .as_ref()
+                .map(|draft| draft.config.clone())
+        {
+            let ring = std::mem::replace(&mut self.context, DFlash2ContextCache::new(&config));
+            self.inner.dflash2_context = Some(ring);
+        }
     }
 }
 
@@ -955,53 +985,14 @@ impl Qwen35DFlash2Stepper<'_> {
     }
 }
 
-/// The prefix a DFlash2 turn on the pool resumes at: the live paged request
-/// of `seq` and the retained draft window end at the same tokens, under the
-/// turn's salt (Splash resumes a state only at its exact boundary).
-pub(crate) fn reusable_paged_dflash2_prefix(
-    tokens: &[u32],
-    reuse_cache: bool,
-    cache_salt: u64,
-    adapter: &crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter,
-    seq: u32,
-    retained: Option<&DFlash2ContextCache>,
-) -> usize {
-    if !reuse_cache
-        || !adapter.is_live_for_continue_for(seq)
-        || adapter.request_cache_salt_for(seq) != Some(cache_salt)
-    {
-        return 0;
-    }
-    let Some(live) = adapter.request_tokens_for(seq) else {
-        return 0;
-    };
-    let window_ends_there = retained.is_some_and(|context| {
-        usize::try_from(context.logical_len()) == Ok(live.len()) && context.token_history() == live
-    });
-    if window_ends_there {
-        live_window_prefix(tokens, live)
-    } else {
-        0
-    }
-}
-
-/// The prefix a turn of `tokens` continues on a live request of `live`
-/// tokens whose draft window ends with it: the whole live request when the
-/// prompt extends it by at least one token, else nothing.
-pub(crate) fn live_window_prefix(tokens: &[u32], live: &[u32]) -> usize {
-    if !live.is_empty() && live.len() < tokens.len() && tokens.starts_with(live) {
-        live.len()
-    } else {
-        0
-    }
-}
-
-impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35Inner {
-    fn paged_prefill_with_draft_state(
+impl Qwen35Inner {
+    /// The tapped prefill of `suffix_tokens` past `prefix`: the draft ring
+    /// it advances is the restored one, else the idle lane's; it is left in
+    /// the turn state for the stepper.
+    pub(crate) fn tapped_dflash2_prefill(
         &mut self,
         suffix_tokens: &[u32],
-        prefix: &Self::PrefixState,
-        _stream: crate::stream::Stream,
+        prefix: &<Self as crate::engine::backend::PagedBackend>::PrefixState,
     ) -> Result<MxArray> {
         use crate::engine::backend::PagedPrefix;
         let config = self
@@ -1015,7 +1006,7 @@ impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35Inner {
             Some(context) if cached > 0 && usize::try_from(context.logical_len()) == Ok(cached) => {
                 context
             }
-            _ if cached == 0 => DFlash2ContextCache::new(&config),
+            _ if cached == 0 => self.dflash2_states.idle_lane.take_ring(&config),
             _ => {
                 return Err(Error::from_reason(format!(
                     "Qwen3.8 DFlash2 cached prefix {cached} has no retained draft context"
@@ -1030,6 +1021,19 @@ impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35Inner {
             next_position: i32::try_from(cached + suffix_tokens.len()).unwrap_or(i32::MAX),
         });
         Ok(logits)
+    }
+}
+
+impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35Inner {
+    fn paged_prefill_with_draft_state(
+        &mut self,
+        suffix_tokens: &[u32],
+        prefix: &Self::PrefixState,
+        _stream: crate::stream::Stream,
+    ) -> Result<MxArray> {
+        crate::models::qwen3_5::dflash2_turn::suspendable_prefill(self, prefix.tokens(), |inner| {
+            inner.tapped_dflash2_prefill(suffix_tokens, prefix)
+        })
     }
 
     fn dspark_block_size(&self) -> Result<usize> {
@@ -1054,35 +1058,15 @@ impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35Inner {
         reuse_cache: bool,
         cache_salt: u64,
     ) -> Result<Self::PrefixState> {
-        use crate::engine::backend::PagedPrefix;
         let seq = self.active_scheduled_seq.unwrap_or(0);
-        let live = self.paged_adapter.as_ref().map_or(0, |adapter| {
-            reusable_paged_dflash2_prefix(
-                tokens,
-                reuse_cache,
-                cache_salt,
-                adapter,
-                seq,
-                self.dflash2_context.as_ref(),
-            )
-        });
-        let (hit, stored) = crate::models::qwen3_5::dflash2_turn::resolve_dflash2_resume(
+        crate::models::qwen3_5::dflash2_turn::prime_dflash2_turn(
             self,
             tokens,
             reuse_cache,
             cache_salt,
             seq,
-            live,
-        )?;
-        let prefix = self.prime_dense_prefix(tokens, cache_salt, Some(hit))?;
-        let cached = prefix.effective_cached_prefix_len();
-        if cached == 0 {
-            self.dflash2_context = None;
-        }
-        crate::models::qwen3_5::dflash2_turn::use_resumed_replay_point(
-            self, tokens, stored, cached,
-        );
-        Ok(prefix)
+            |inner, hit| inner.prime_dense_prefix(tokens, cache_salt, Some(hit)),
+        )
     }
 
     fn set_generation_suffix(&mut self, suffix: Option<std::sync::Arc<[u32]>>) {
@@ -1155,8 +1139,32 @@ impl DFlash2Target for Qwen35Inner {
         self.dflash2_replay_state_exact()
     }
 
+    fn paged_block_keys(&self, tokens: usize) -> Vec<Vec<u64>> {
+        crate::engine::build_paged_extra_keys(
+            tokens,
+            self.paged_adapter
+                .as_ref()
+                .map_or(1, |adapter| adapter.block_size()),
+            &self.cached_paged_image_token_positions,
+        )
+    }
+
     fn dflash2_turn_state_clear(&mut self) {
-        self.dflash2_turn_state = None;
+        let turn = self.dflash2_turn_state.take();
+        self.dflash2_states
+            .idle_lane
+            .give_ring(turn.map(|turn| turn.context));
+    }
+
+    fn clear_draft_context(&mut self) {
+        let ring = self.dflash2_context.take();
+        self.dflash2_states.idle_lane.give_ring(ring);
+    }
+
+    fn snapshot_live_linear(
+        &mut self,
+    ) -> Result<Vec<crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache>> {
+        crate::models::qwen3_5::paged_forward::snapshot_live_linear(self.caches.as_deref())
     }
 
     fn gdn_state_units(
@@ -1174,11 +1182,13 @@ impl DFlash2Target for Qwen35Inner {
     }
 
     fn serial_decode(&self) -> Option<crate::models::qwen3_5::dflash2_turn::SerialDecode> {
-        self.serial_decode.filter(|_| {
-            self.active_scheduled_seq.is_none()
-                && self.cached_image_key.is_none()
-                && self.cached_paged_image_token_positions.is_empty()
-        })
+        self.serial_decode.filter(|_| self.serial_text_lane())
+    }
+
+    fn serial_text_lane(&self) -> bool {
+        self.active_scheduled_seq.is_none()
+            && self.cached_image_key.is_none()
+            && self.cached_paged_image_token_positions.is_empty()
     }
 
     fn set_serial_decode(
@@ -1189,11 +1199,8 @@ impl DFlash2Target for Qwen35Inner {
     }
 
     fn drop_serial_lane_state(&mut self) {
-        self.end_gdn_use(0);
-        self.caches = None;
         self.dflash2_lane = None;
-        self.dflash2_context = None;
-        self.dflash2_turn_state = None;
+        self.vacate_dense_lane();
     }
 
     fn replay_serial_lane(
@@ -1203,7 +1210,7 @@ impl DFlash2Target for Qwen35Inner {
         plan: &crate::transformer::paged_kv_cache_adapter::PagedTurnPlan,
         decode: crate::models::qwen3_5::dflash2_turn::SerialDecode,
         stored: Option<crate::models::qwen3_5::dflash2_state::store::EntryId>,
-    ) -> Result<()> {
+    ) -> Result<MxArray> {
         self.replay_dense_serial_lane(tokens, cache_salt, plan, decode, stored)
     }
 }
@@ -1639,6 +1646,11 @@ mod paged_dflash2_tests {
     /// Mutation K1 (the retained count is 8 whatever the keep) turns it red.
     #[test]
     fn paged_dflash2_matches_paged_ar_for_every_keep() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "paged_dflash2_matches_paged_ar_for_every_keep",
+        ) {
+            return Ok(());
+        }
         use crate::models::qwen3_5::gdn_blob::trace::{assert_cells, replay_chain};
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
@@ -1674,6 +1686,9 @@ mod paged_dflash2_tests {
     /// Mutation U1 (`finish` skips the settle) turns it red.
     #[test]
     fn finish_settles_the_pending_rows() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("finish_settles_the_pending_rows") {
+            return Ok(());
+        }
         use crate::models::qwen3_5::gdn_blob::trace::{assert_cells, kernel_fold};
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
@@ -1758,6 +1773,11 @@ mod paged_dflash2_tests {
     /// verify writes only the driver's rows) turns it red.
     #[test]
     fn dflash2_cycle_runs_eight_rows_and_commits_keep() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "dflash2_cycle_runs_eight_rows_and_commits_keep",
+        ) {
+            return Ok(());
+        }
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let mut inner = tiny_paged_int8_dflash_inner(0x5_8004);
@@ -1832,6 +1852,9 @@ mod paged_dflash2_tests {
     /// launch).
     #[test]
     fn verify_takes_the_verify_split_rule() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("verify_takes_the_verify_split_rule") {
+            return Ok(());
+        }
         let probe = |kind| unsafe { mlx_sys::mlx_paged_prefill_test_probe_count(kind) };
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
@@ -1885,6 +1908,11 @@ mod paged_dflash2_tests {
     /// (the row check removed) turns it red.
     #[test]
     fn paged_dflash2_verify_refuses_a_chunk_that_is_not_eight_rows() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "paged_dflash2_verify_refuses_a_chunk_that_is_not_eight_rows",
+        ) {
+            return Ok(());
+        }
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let mut inner = tiny_paged_int8_dflash_inner(0x5_8005);
@@ -1966,6 +1994,9 @@ mod paged_dflash2_tests {
     /// the whole prompt) turns it red.
     #[test]
     fn dflash2_prefill_books_each_chunk_end() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("dflash2_prefill_books_each_chunk_end") {
+            return Ok(());
+        }
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let mut inner = tiny_paged_int8_dflash_inner(0x5_8006);
@@ -1984,8 +2015,9 @@ mod paged_dflash2_tests {
         let anchor = result?;
         assert_eq!(
             seen,
-            vec![2, 4, 6, 8, 9, 10],
-            "blocks held before each chunk's forward"
+            vec![2, 4, 6, 7, 9, 10],
+            "blocks held before each chunk's forward: chunks end at 32, 64, 96, \
+             112 and 144, past the checkpoints at 48 and 80"
         );
         let mut step = inner.begin_dspark_decode(DFLASH2_DRAFT_PROPOSALS)?;
         step.verify(&[anchor])?.logits.eval();
@@ -1996,14 +2028,22 @@ mod paged_dflash2_tests {
     }
 
     /// The tapped prefill is the plain one: same chunks, same logits bits.
+    /// With 128-row chunks the tapped prefill plans no checkpoint, so both
+    /// end chunks at 128 and 144 (the plain one's GDN rung, the tapped one's
+    /// replay point).
     /// Mutation T0 (the tapped prefill takes its own chunk schedule) turns it
     /// red.
     #[test]
     fn tapped_paged_prefill_keeps_plain_prefill_bits() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "tapped_paged_prefill_keeps_plain_prefill_bits",
+        ) {
+            return Ok(());
+        }
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let prompt = prompt(150);
-        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(32)));
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(128)));
         let result = (|| -> Result<(Vec<u32>, Vec<u32>)> {
             let mut plain = tiny_paged_int8_dflash_inner(0x5_8007);
             let prefix = plain.prime_prefix_state(&prompt, true, 0, &[], 0)?;
@@ -2073,6 +2113,11 @@ mod paged_dflash2_tests {
     /// Mutation C11: the driver re-resolves the config → red (12 tokens).
     #[test]
     fn paged_dflash2_turn_honors_the_session_params() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "paged_dflash2_turn_honors_the_session_params",
+        ) {
+            return Ok(());
+        }
         use crate::engine::backend::{ChatBackend, TurnOutput, WholeTurnArgs};
         use crate::engine::plan::{
             DecoderPlan, MediaCapabilities, MediaInputs, SpeculativeKind, TurnPlan,
@@ -2122,7 +2167,8 @@ mod paged_dflash2_tests {
     }
 
     /// One whole turn of `tokens` through `run_paged_turn` on `decoder`;
-    /// returns the live request it leaves.
+    /// returns the history it saved: the prompt and the generated tokens
+    /// but the last.
     fn whole_turn(
         inner: &mut Qwen35Inner,
         tokens: &[u32],
@@ -2164,70 +2210,7 @@ mod paged_dflash2_tests {
             panic!("a sync turn completes");
         };
         assert_eq!(result.num_tokens, 20);
-        Ok(inner
-            .paged_adapter
-            .as_ref()
-            .expect("pool")
-            .request_tokens()
-            .to_vec())
-    }
-
-    /// A second DFlash2 turn resumes the live request and the draft window
-    /// the first left at the same token (Splash resumes a state only at its
-    /// exact boundary), and both turns emit what two paged AR turns emit.
-    /// Mutations W0 (`finish` drops the draft window) and R0 (the prime
-    /// never reuses the live request) turn it red.
-    #[test]
-    fn second_dflash2_turn_resumes_the_live_window() -> Result<()> {
-        use crate::engine::backend::ChatBackend;
-        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
-        let stream = Stream::generation();
-        let _ctx = StreamContext::new(stream);
-        let dflash2 = DecoderPlan::Speculative(SpeculativeKind::DraftModel);
-        let first = prompt(40);
-        let mut spec = tiny_paged_int8_dflash_inner(0x5_800A);
-        let mut ar = tiny_paged_int8_dflash_inner(0x5_800A);
-        let live = whole_turn(&mut spec, &first, dflash2)?;
-        assert_eq!(
-            live,
-            whole_turn(&mut ar, &first, DecoderPlan::Autoregressive)?
-        );
-        assert_eq!(live.len(), first.len() + 19, "the last token has no K/V");
-        let window = spec
-            .dflash2_context
-            .as_ref()
-            .expect("the turn keeps its window");
-        assert_eq!(window.token_history(), live.as_slice());
-        let mut second = live.clone();
-        second.extend(prompt(9).iter().rev());
-        let adapter = spec.paged_adapter.as_ref().expect("pool");
-        assert_eq!(
-            reusable_paged_dflash2_prefix(
-                &second,
-                true,
-                ChatBackend::resolve_params(&spec, &Default::default()).cache_salt,
-                adapter,
-                0,
-                spec.dflash2_context.as_ref(),
-            ),
-            live.len(),
-            "the second turn resumes the whole live request"
-        );
-        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(4)));
-        PREFILL_CHUNK_BLOCKS.with(|log| *log.borrow_mut() = Some(Vec::new()));
-        let spec_live = whole_turn(&mut spec, &second, dflash2);
-        let seen = PREFILL_CHUNK_BLOCKS
-            .with(|log| log.borrow_mut().take())
-            .unwrap_or_default();
-        let ar_live = whole_turn(&mut ar, &second, DecoderPlan::Autoregressive);
-        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
-        assert_eq!(
-            seen.len(),
-            3,
-            "the second prefill runs only the 9 new tokens"
-        );
-        assert_eq!(spec_live?, ar_live?);
-        Ok(())
+        Ok(inner.cached_token_history.clone())
     }
 
     fn block_ids(inner: &Qwen35Inner) -> Vec<u32> {
@@ -2260,6 +2243,11 @@ mod paged_dflash2_tests {
     /// replays the GDN prefix).
     #[test]
     fn parked_anchor_resume_matches_an_uninterrupted_run() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "parked_anchor_resume_matches_an_uninterrupted_run",
+        ) {
+            return Ok(());
+        }
         use crate::engine::plan::{DecoderPlan, SpeculativeKind};
         use crate::models::qwen3_5::model::dflash2_park_tests::{install_pool, passing_probe};
         let stream = Stream::generation();
@@ -2277,11 +2265,10 @@ mod paged_dflash2_tests {
         ar.dflash2_states.clear();
         ar.sync_gdn_state_marks();
         let (reference, _) = paged_ar(&mut ar, &a2, 24)?;
-        let run = |with_q: bool| -> Result<(Run, Vec<u32>, Vec<u32>)> {
+        let run = |with_q: bool| -> Result<Run> {
             let mut inner = tiny_paged_int8_dflash_inner(0x5_8101);
             install_pool(&mut inner, 16, 64, passing_probe())?;
             whole_turn(&mut inner, &a1, dflash2)?;
-            let chain = block_ids(&inner)[..13].to_vec();
             inner.drop_gdn_states_for_test();
             assert_eq!(parked_depths(&inner), vec![208]);
             if with_q {
@@ -2292,13 +2279,15 @@ mod paged_dflash2_tests {
                 inner.last_gdn_prefix_prepare_state, "last_history",
                 "A2 resumes on the installed GDN cell, with no replay"
             );
-            Ok((run, chain, block_ids(&inner)))
+            Ok(run)
         };
-        let (x, x_chain, x_ids) = run(true)?;
-        let (y, y_chain, y_ids) = run(false)?;
-        assert_eq!((x.cached, y.cached), (208, 208));
-        assert_eq!(x_ids[..13], x_chain[..], "A2 resumes on A1's blocks");
-        assert_eq!(y_ids[..13], y_chain[..]);
+        let x = run(true)?;
+        let y = run(false)?;
+        assert_eq!(
+            (x.cached, y.cached),
+            (208, 208),
+            "A2 resumes on A1's blocks"
+        );
         assert_eq!(x.tokens, y.tokens);
         assert!(x.logits == y.logits, "teacher-forced logits differ");
         Ok(())
@@ -2310,6 +2299,12 @@ mod paged_dflash2_tests {
     /// re-prefills its own copy: no shared ids, 31 >= 30 blocks).
     #[test]
     fn two_sessions_share_the_parked_prefix_blocks() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "two_sessions_share_the_parked_prefix_blocks",
+        ) {
+            return Ok(());
+        }
+        use crate::engine::backend::{ChatBackend, PagedPrefix};
         use crate::engine::plan::{DecoderPlan, SpeculativeKind};
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
@@ -2319,8 +2314,17 @@ mod paged_dflash2_tests {
         b.extend((0..40u32).map(|i| (i * 11 + 4) % VOCAB));
         let mut inner = tiny_paged_int8_dflash_inner(0x5_8102);
         whole_turn(&mut inner, &a1, dflash2)?;
-        let a1_ids = block_ids(&inner);
-        assert_eq!(a1_ids.len(), 15);
+        // The turn released its lane; a chain is read back from a prime of
+        // its own prompt, which restores at its replay point.
+        let primed = |inner: &mut Qwen35Inner, tokens: &[u32], at: usize| -> Result<Vec<u32>> {
+            let salt = ChatBackend::resolve_params(&*inner, &Default::default()).cache_salt;
+            let prefix = inner.prime_dspark_prefix_state(tokens, true, salt)?;
+            assert_eq!(prefix.effective_cached_prefix_len(), at);
+            let ids = block_ids(inner);
+            inner.abort_paged_turn();
+            Ok(ids)
+        };
+        let a1_ids = primed(&mut inner, &a1, 208)?;
         let allocated = |inner: &Qwen35Inner| {
             inner
                 .paged_adapter
@@ -2331,12 +2335,102 @@ mod paged_dflash2_tests {
                 .allocated_blocks as usize
         };
         whole_turn(&mut inner, &b, dflash2)?;
-        let b_ids = block_ids(&inner);
+        let b_ids = primed(&mut inner, &b, 240)?;
         assert_eq!(b_ids[..13], a1_ids[..13], "B sits on A1's chain");
         assert!(
-            allocated(&inner) < 2 * a1_ids.len(),
+            allocated(&inner) < 30,
             "{} blocks for two sessions",
             allocated(&inner)
+        );
+        Ok(())
+    }
+
+    /// The next turn of the prompt that published R restores the draft from
+    /// R's 4-bit window (Splash `planDraftContext`: its first point, the
+    /// prompt's end, lies within a window of R): the ring holds the
+    /// projection of the window's dequantized newest rows, at R, and the
+    /// lane's window takes R's rows. A turn whose first point lies a window
+    /// or more past R starts with an empty ring at R (Splash
+    /// `restoreLengths(.., false)`), and its tokens are paged AR's.
+    /// Mutation RD1 (the restore ignores the flag) → red.
+    #[test]
+    fn restore_rebuilds_the_draft_or_starts_empty() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "restore_rebuilds_the_draft_or_starts_empty",
+        ) {
+            return Ok(());
+        }
+        use crate::engine::backend::{ChatBackend, PagedPrefix};
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let dflash2 = DecoderPlan::Speculative(SpeculativeKind::DraftModel);
+        let first = prompt(50);
+        let mut far = first[..48].to_vec();
+        far.extend((0..40u32).map(|i| (i * 5 + 2) % VOCAB));
+        let turn_one = |decoder| -> Result<Qwen35Inner> {
+            let mut inner = tiny_paged_int8_dflash_inner(0x5_8120);
+            whole_turn(&mut inner, &first, decoder)?;
+            Ok(inner)
+        };
+        let view_bits = |ring: &DFlash2ContextCache| -> Result<Vec<Vec<u32>>> {
+            let mut out = Vec::new();
+            for view in ring.window_views() {
+                let (keys, values) = view.ok_or_else(|| Error::from_reason("empty ring"))?;
+                out.push(bits(&keys)?);
+                out.push(bits(&values)?);
+            }
+            Ok(out)
+        };
+
+        let mut near = turn_one(dflash2)?;
+        assert_eq!(parked_depths(&near), vec![48]);
+        let salt = ChatBackend::resolve_params(&near, &Default::default()).cache_salt;
+        let prefix = near.prime_dspark_prefix_state(&first, true, salt)?;
+        assert_eq!(prefix.effective_cached_prefix_len(), 48);
+        let draft = near.dflash2.as_ref().expect("draft");
+        let window = &near
+            .dflash2_states
+            .store
+            .entries()
+            .next()
+            .expect("R")
+            .state()
+            .window;
+        let begin = window
+            .begin()
+            .max(48 - (draft.config.sliding_window as u32 - 1));
+        let mut want = DFlash2ContextCache::new(&draft.config);
+        want.record_only(&first[..begin as usize])?;
+        let rows = window.load_rows(begin, 48 - begin)?.reshape(&[
+            1,
+            i64::from(48 - begin),
+            i64::from(window.width()),
+        ])?;
+        want.append(draft, &rows, begin as i32, &first[begin as usize..48])?;
+        let ring = near.dflash2_context.as_ref().expect("restored ring");
+        assert_eq!(ring.logical_len(), 48);
+        assert!(view_bits(ring)? == view_bits(&want)?, "restored ring rows");
+        let lane = near.dflash2_states.lane_window.as_ref().expect("lane");
+        assert_eq!((lane.begin(), lane.end()), (window.begin(), 48));
+        assert_eq!(lane.host_bytes()?, window.host_bytes()?);
+
+        let mut cold = turn_one(dflash2)?;
+        let prefix = cold.prime_dspark_prefix_state(&far, true, salt)?;
+        assert_eq!(prefix.effective_cached_prefix_len(), 48);
+        let ring = cold.dflash2_context.as_ref().expect("ring");
+        assert_eq!(ring.logical_len(), 48);
+        assert!(
+            ring.window_views().iter().all(Option::is_none),
+            "a far first point starts the ring empty"
+        );
+        assert!(cold.dflash2_states.lane_window.is_none());
+
+        let mut spec = turn_one(dflash2)?;
+        let mut ar = turn_one(DecoderPlan::Autoregressive)?;
+        assert_eq!(
+            whole_turn(&mut spec, &far, dflash2)?,
+            whole_turn(&mut ar, &far, DecoderPlan::Autoregressive)?
         );
         Ok(())
     }
@@ -2349,6 +2443,9 @@ mod paged_dflash2_tests {
     /// at 192, nothing parked).
     #[test]
     fn tapped_prefill_parks_the_replay_point() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("tapped_prefill_parks_the_replay_point") {
+            return Ok(());
+        }
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let suffix = [11u32, 12, 13, 14, 15];
@@ -2374,7 +2471,7 @@ mod paged_dflash2_tests {
             Ok((seen, inner))
         };
         let (seen, inner) = prefill(&full)?;
-        assert_eq!(seen, vec![8, 12, 13, 14], "chunks end at 128, 192, 208");
+        assert_eq!(seen, vec![8, 12, 14], "chunks end at 128 and 192");
         let (twin_seen, twin) = prefill(&full[..193])?;
         assert_eq!(twin_seen, vec![8, 12, 13]);
         let anchor_bits = |inner: &Qwen35Inner| -> Result<Vec<Vec<u32>>> {
@@ -2385,12 +2482,806 @@ mod paged_dflash2_tests {
                 .next()
                 .ok_or_else(|| Error::from_reason("no parked state"))?;
             assert_eq!(entry.tokens(), &full[..192]);
-            assert_eq!(entry.state().window.logical_len(), 192);
+            assert_eq!(entry.state().window.end(), 192);
             let mut arrays = Vec::new();
             entry.state().collect_arrays(&mut arrays);
             arrays.into_iter().map(bits).collect()
         };
         assert!(anchor_bits(&inner)? == anchor_bits(&twin)?);
+        Ok(())
+    }
+
+    /// The tapped prefill of `prompt` on a fresh fixture with 4-row chunks.
+    fn tapped_prefill_by_four(inner: &mut Qwen35Inner, prompt: &[u32]) -> Result<()> {
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(4)));
+        let result = (|| -> Result<()> {
+            let prefix = inner.prime_dspark_prefix_state(prompt, true, 0)?;
+            inner
+                .paged_prefill_with_draft_state(prompt, &prefix, Stream::generation())?
+                .eval();
+            Ok(())
+        })();
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+        result
+    }
+
+    /// A 100-token prompt with no generation prompt plans checkpoints at
+    /// 16..80 and its replay point at 96 (draft window 8: interval 16,
+    /// margin 4). Each checkpoint retires the one before it (Splash
+    /// `Engine::retireCheckpoint`); the replay point keeps the lane's last
+    /// one. The store ends with 80 (checkpoint) and 96 (ordinary, in use),
+    /// each on a cached block.
+    /// Mutations RC1 (no checkpoint retires: 6 entries) and RP1 (the replay
+    /// point retires it too: 80 gone) → red.
+    #[test]
+    fn rolling_checkpoint_keeps_one_and_the_one_below_r() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "rolling_checkpoint_keeps_one_and_the_one_below_r",
+        ) {
+            return Ok(());
+        }
+        let _ctx = StreamContext::new(Stream::generation());
+        let mut inner = tiny_paged_int8_dflash_inner(0x5_8130);
+        tapped_prefill_by_four(&mut inner, &prompt(100))?;
+        let states = &inner.dflash2_states;
+        let entries: Vec<(usize, bool, bool)> = states
+            .store
+            .entries()
+            .map(|entry| {
+                (
+                    entry.depth(),
+                    entry.checkpoint(),
+                    states.store.in_use(entry.mark()),
+                )
+            })
+            .collect();
+        assert_eq!(entries, vec![(80, true, false), (96, false, true)]);
+        assert_eq!(states.counters.checkpoint_publications, 5);
+        assert_eq!(states.counters.checkpoint_retirements, 4);
+        assert_eq!(states.counters.replay_state_publications, 1);
+        let adapter = inner.paged_adapter.as_ref().expect("pool");
+        assert!(
+            states
+                .store
+                .entries()
+                .all(|entry| adapter.prefix_cached(entry.mark())),
+            "each state sits on a cached block"
+        );
+        Ok(())
+    }
+
+    /// A prefill cancelled after the chunk ending at 52 errors as a cancel,
+    /// and what earlier chunks published stays (Splash publishes after each
+    /// command): the checkpoint at 48 on cached blocks. The next turn of the
+    /// prompt resumes there and emits paged AR's greedy tokens.
+    /// Mutation CN1 (the abort removes the turn's publications) → red.
+    #[test]
+    fn cancelled_prefill_keeps_reached_states() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("cancelled_prefill_keeps_reached_states")
+        {
+            return Ok(());
+        }
+        use crate::models::qwen3_5::paged_forward::PREFILL_CANCEL_AT;
+        let _ctx = StreamContext::new(Stream::generation());
+        let prompt = prompt(100);
+        let (reference, _) = paged_ar(&mut tiny_paged_int8_dflash_inner(0x5_8131), &prompt, 24)?;
+        let mut inner = tiny_paged_int8_dflash_inner(0x5_8131);
+        PREFILL_CANCEL_AT.with(|row| row.set(Some(52)));
+        let result = tapped_prefill_by_four(&mut inner, &prompt);
+        PREFILL_CANCEL_AT.with(|row| row.set(None));
+        let error = result.expect_err("the prefill is cancelled");
+        assert_eq!(error.reason, "prefill cancelled");
+        inner.abort_paged_turn();
+        assert_eq!(parked_depths(&inner), vec![48]);
+        let adapter = inner.paged_adapter.as_ref().expect("pool");
+        assert!(
+            inner
+                .dflash2_states
+                .store
+                .entries()
+                .all(|entry| adapter.prefix_cached(entry.mark())),
+            "the checkpoint's blocks stay cached"
+        );
+        let run = paged_dflash2(&mut inner, &prompt, &reference, 3)?;
+        assert_eq!(run.cached, 48);
+        assert_eq!(run.tokens, reference);
+        Ok(())
+    }
+
+    /// A fixture whose claims go through a ledger of its own: 32 GiB of
+    /// host memory, normal pressure, nothing scripted or logged yet.
+    fn with_ledger(inner: &mut Qwen35Inner) {
+        use crate::engine::governor::governor::Governor;
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+        use crate::models::qwen3_5::dflash2_turn::{STATE_CLAIM_LOG, STATE_CLAIM_SCRIPT};
+        let io = FakeIo::new(
+            stats(0),
+            host(32 * G, crate::engine::governor::host::Pressure::Normal),
+        );
+        let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+        inner.memory_registration =
+            Some(governor.register_model(model(16 * G, 0)).expect("register"));
+        STATE_CLAIM_LOG.with(|log| log.borrow_mut().clear());
+        STATE_CLAIM_SCRIPT.with(|script| script.borrow_mut().clear());
+    }
+
+    fn take_claim_log() -> Vec<crate::models::qwen3_5::dflash2_turn::ClaimLog> {
+        crate::models::qwen3_5::dflash2_turn::STATE_CLAIM_LOG
+            .with(|log| std::mem::take(&mut *log.borrow_mut()))
+    }
+
+    fn script_claims(claims: &[crate::models::qwen3_5::dflash2_turn::ScriptedClaim]) {
+        crate::models::qwen3_5::dflash2_turn::STATE_CLAIM_SCRIPT
+            .with(|script| *script.borrow_mut() = claims.iter().copied().collect());
+    }
+
+    /// Splash `Engine::stateClaim` per captured point of the 100-token
+    /// prompt: checkpoints 16..80 Optional and Immediate, the replay point
+    /// 96 in service and reaching the states turns use; the first claim
+    /// settles, every later one tries once, since the lane then holds a
+    /// checkpoint to take it from (`reserveCapture`). The next turn of the
+    /// prompt claims the lane's buffers for its restore under the turn's
+    /// claim, only what the idle lane lacks (Splash `admitIdleLane`): the
+    /// cell beside an idle ring and window, all three without them. A
+    /// failed claim sends the turn cold; one refused while memory is on its
+    /// way back waits and restores (Splash `admit`: `judge`).
+    /// Mutations SC1 (checkpoints claimed as InService), RB2 (the restore
+    /// claims the ring and window beside idle ones) and RW1 (every refused
+    /// restore goes cold) → red.
+    #[test]
+    fn capture_claims_follow_state_claim() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("capture_claims_follow_state_claim") {
+            return Ok(());
+        }
+        use crate::engine::governor::allocate::Refusal;
+        use crate::engine::governor::ledger::{ClaimClass, NeedTiming, ReachClass};
+        use crate::models::qwen3_5::dflash2_state::paged::anchor_bytes;
+        use crate::models::qwen3_5::dflash2_turn::ScriptedClaim;
+        let _ctx = StreamContext::new(Stream::generation());
+        let prompt = prompt(100);
+        let mut inner = tiny_paged_int8_dflash_inner(0x5_8140);
+        with_ledger(&mut inner);
+        tapped_prefill_by_four(&mut inner, &prompt)?;
+        let log = take_claim_log();
+        let optional = (
+            ClaimClass::Optional,
+            NeedTiming::Immediate,
+            ReachClass::Ordinary,
+        );
+        let in_use = (
+            ClaimClass::InService,
+            NeedTiming::CanWait,
+            ReachClass::InUse,
+        );
+        assert_eq!(
+            log.iter()
+                .map(|claim| (claim.cls, claim.timing, claim.reach))
+                .collect::<Vec<_>>(),
+            [vec![optional; 5], vec![in_use]].concat()
+        );
+        assert_eq!(
+            log.iter().map(|claim| claim.refusal).collect::<Vec<_>>(),
+            [vec![Refusal::Settled], vec![Refusal::SettledOnce; 5]].concat()
+        );
+        inner.abort_paged_turn();
+        assert_eq!(parked_depths(&inner), vec![80, 96]);
+
+        let restore_log = |log: Vec<crate::models::qwen3_5::dflash2_turn::ClaimLog>| {
+            log.iter()
+                .map(|claim| (claim.cls, claim.refusal, claim.bytes))
+                .collect::<Vec<_>>()
+        };
+        let cell = inner.config.recurrent_state_bytes();
+        script_claims(&[ScriptedClaim::Refuse]);
+        let prefix = inner.prime_dspark_prefix_state(&prompt, true, 0)?;
+        assert_eq!(
+            restore_log(take_claim_log()),
+            vec![(ClaimClass::InService, Refusal::Waits, cell)],
+            "the idle lane holds the ring and the window"
+        );
+        assert_eq!(
+            prefix.effective_cached_prefix_len(),
+            0,
+            "a failed restore goes cold"
+        );
+        inner.abort_paged_turn();
+
+        inner.dflash2_states.idle_lane = Default::default();
+        script_claims(&[ScriptedClaim::Wait, ScriptedClaim::Grant { freed: false }]);
+        let prefix = inner.prime_dspark_prefix_state(&prompt, true, 0)?;
+        let draft = inner.dflash2.as_ref().expect("draft");
+        let bytes = anchor_bytes(&inner.config, &draft.config) + draft.config.kv_ring_bytes();
+        assert_eq!(
+            restore_log(take_claim_log()),
+            vec![(ClaimClass::InService, Refusal::Waits, bytes); 2]
+        );
+        assert_eq!(
+            prefix.effective_cached_prefix_len(),
+            96,
+            "a restore refused while memory is on its way back waits"
+        );
+        inner.abort_paged_turn();
+        Ok(())
+    }
+
+    /// The ledger refuses the capture of checkpoint 32 while the lane holds
+    /// 16 (one try): the chunk takes no snapshot, 16 retires to give its
+    /// buffers, and 32 is taken from the lane after the chunk under a claim
+    /// of its own (Splash `fromLane`), recycled when that claim freed units.
+    /// Refused that claim too, 32 is not published and the lane holds no
+    /// checkpoint until 48.
+    /// Mutations FL1 (`FromLane` treated as `Refused`) and FL2 (the chunk
+    /// snapshots a `FromLane` point) → red.
+    #[test]
+    fn refused_checkpoint_comes_from_the_lane() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("refused_checkpoint_comes_from_the_lane")
+        {
+            return Ok(());
+        }
+        use crate::models::qwen3_5::dflash2_turn::{LANE_SNAPSHOTS, ScriptedClaim};
+        let _ctx = StreamContext::new(Stream::generation());
+        let prompt = prompt(100);
+        let run = |claims: &[ScriptedClaim]| -> Result<(Qwen35Inner, usize)> {
+            let mut inner = tiny_paged_int8_dflash_inner(0x5_8141);
+            with_ledger(&mut inner);
+            script_claims(claims);
+            LANE_SNAPSHOTS.with(|count| count.set(0));
+            tapped_prefill_by_four(&mut inner, &prompt)?;
+            Ok((inner, LANE_SNAPSHOTS.with(std::cell::Cell::get)))
+        };
+        let entries = |inner: &Qwen35Inner| -> Vec<(usize, bool)> {
+            inner
+                .dflash2_states
+                .store
+                .entries()
+                .map(|entry| (entry.depth(), entry.checkpoint()))
+                .collect()
+        };
+        let granted = ScriptedClaim::Grant { freed: false };
+        for freed in [true, false] {
+            let (inner, snapshots) = run(&[
+                granted,
+                ScriptedClaim::Refuse,
+                ScriptedClaim::Grant { freed },
+            ])?;
+            let counters = inner.dflash2_states.counters;
+            assert_eq!(snapshots, 6, "five armed points and one from the lane");
+            assert_eq!(entries(&inner), vec![(80, true), (96, false)]);
+            assert_eq!(counters.checkpoint_publications, 5);
+            assert_eq!(counters.checkpoint_retirements, 4);
+            assert_eq!(counters.checkpoint_publication_failures, 0);
+            assert_eq!(counters.recycled_state_publications, u64::from(freed));
+        }
+        let (inner, snapshots) = run(&[granted, ScriptedClaim::Refuse, ScriptedClaim::Refuse])?;
+        let counters = inner.dflash2_states.counters;
+        assert_eq!(snapshots, 5);
+        assert_eq!(entries(&inner), vec![(80, true), (96, false)]);
+        assert_eq!(counters.checkpoint_publications, 4);
+        assert_eq!(counters.checkpoint_publication_failures, 1);
+        assert_eq!(
+            counters.checkpoint_retirements, 3,
+            "16 retired for 32; 48 found no checkpoint to retire"
+        );
+        Ok(())
+    }
+
+    /// The chunk ending at checkpoint 16 grows the pool (its one block is
+    /// held by another request), and the ledger has room for the grow or
+    /// for the checkpoint's buffers, not both, with nothing to reclaim. The
+    /// chunk's KV is booked before the capture is claimed (Splash
+    /// `Engine::prepare`: `growLane`, then `reserveCaptures`), so the
+    /// prefill completes and every state is published.
+    /// Mutation KV1 (the capture is claimed before the chunk's KV) → red
+    /// (the held capture leaves the grow no room: capacity_exhausted).
+    #[test]
+    fn chunk_kv_is_booked_before_its_capture() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("chunk_kv_is_booked_before_its_capture") {
+            return Ok(());
+        }
+        use crate::engine::governor::governor::Governor;
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+        use crate::models::qwen3_5::model::dflash2_park_tests::{install_pool, passing_probe};
+        use crate::transformer::paged_kv_cache_adapter::pool_grow_reserved_bytes;
+        let _ctx = StreamContext::new(Stream::generation());
+        let prompt = prompt(100);
+        let mut inner = tiny_paged_int8_dflash_inner(0x5_8142);
+        install_pool(&mut inner, 1, 16, passing_probe())?;
+        let grow = {
+            let adapter = inner.paged_adapter.as_mut().expect("pool");
+            let block_size = adapter.block_size();
+            assert_eq!(block_size, 16, "the chunk ending at 16 takes one block");
+            adapter.set_extent_growth(15);
+            adapter.begin_request(9).map_err(Error::from_reason)?;
+            adapter
+                .allocate_suffix_blocks_for(9, block_size)
+                .map_err(Error::from_reason)?;
+            let pool = adapter.layer_kv_pool();
+            let layers = pool.layer_bytes();
+            let new_layer = pool.layer_bytes_for(16).map_err(Error::from_reason)?;
+            new_layer * layers.len() as u64 - pool.total_bytes()
+                + pool_grow_reserved_bytes(&layers, new_layer)
+        };
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(16)));
+        let result = (|| -> Result<()> {
+            let prefix = inner.prime_dspark_prefix_state(&prompt, true, 0)?;
+            let anchor = inner
+                .dflash2_states
+                .turn
+                .as_ref()
+                .expect("the turn's plan")
+                .anchor_bytes;
+            let limit = grow.max(anchor) + grow.min(anchor) / 2;
+            let io = FakeIo::new(
+                stats(0),
+                host(32 * G, crate::engine::governor::host::Pressure::Normal),
+            );
+            let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+            inner.memory_registration =
+                Some(governor.register_model(model(limit, 0)).expect("register"));
+            inner
+                .paged_adapter
+                .as_mut()
+                .expect("pool")
+                .set_admission(std::sync::Arc::new(governor));
+            inner
+                .paged_prefill_with_draft_state(&prompt, &prefix, Stream::generation())?
+                .eval();
+            Ok(())
+        })();
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+        result?;
+        let counters = inner.dflash2_states.counters;
+        assert_eq!(counters.checkpoint_publications, 5);
+        assert_eq!(counters.replay_state_publications, 1);
+        assert_eq!(counters.checkpoint_publication_failures, 0);
+        let telemetry = inner
+            .paged_adapter
+            .as_ref()
+            .expect("pool")
+            .block_telemetry()
+            .expect("telemetry");
+        assert_eq!(telemetry.total_blocks, 16, "the chunk grew the pool");
+        Ok(())
+    }
+
+    /// A (200 tokens) keeps 176 (checkpoint) and 192 (its replay point) and
+    /// registers its whole chain. B shares A's first 150 tokens: it resumes
+    /// at 0, its KV hit is 144 with a state below it (Splash `Cache::lookup`
+    /// junction), and it publishes the junction there. C, sharing the same
+    /// 150, resumes at 144. D, whose replay point (160) lies below its KV
+    /// hit (176) with a state below the hit and none at it, finds the
+    /// junction but its plan rejects it.
+    /// Mutation JN1 (`state_below` sees nothing) → red (B finds no junction).
+    #[test]
+    fn junction_at_the_kv_hit() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("junction_at_the_kv_hit") {
+            return Ok(());
+        }
+        use crate::engine::backend::ChatBackend;
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let dflash2 = DecoderPlan::Speculative(SpeculativeKind::DraftModel);
+        let a = prompt(200);
+        let tail = |len: u32, seed: u32| -> Vec<u32> {
+            (0..len).map(|i| (i * seed + 5) % VOCAB).collect()
+        };
+        let mut b = a[..150].to_vec();
+        b.extend(tail(90, 11));
+        let mut c = a[..150].to_vec();
+        c.extend(tail(30, 13));
+        let mut inner = tiny_paged_int8_dflash_inner(0x5_8150);
+        let salt = ChatBackend::resolve_params(&inner, &Default::default()).cache_salt;
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(4)));
+        let result = (|| -> Result<()> {
+            whole_turn(&mut inner, &a, dflash2)?;
+            let depths: Vec<(usize, bool)> = inner
+                .dflash2_states
+                .store
+                .entries()
+                .map(|entry| (entry.depth(), entry.checkpoint()))
+                .collect();
+            assert_eq!(depths, vec![(176, true), (192, false)]);
+            whole_turn(&mut inner, &b, dflash2)?;
+            let counters = inner.dflash2_states.counters;
+            assert_eq!(counters.lazy_junctions, 1);
+            assert_eq!(counters.junction_materializations, 1);
+            assert!(
+                inner
+                    .dflash2_states
+                    .store
+                    .entries()
+                    .any(|entry| entry.depth() == 144 && !entry.checkpoint()),
+                "B published the junction at 144"
+            );
+            let prefix = inner.prime_dspark_prefix_state(&c, true, salt)?;
+            assert_eq!(prefix.effective_cached_prefix_len(), 144);
+            inner.abort_paged_turn();
+
+            let cp = inner
+                .dflash2_states
+                .store
+                .entries()
+                .find(|entry| entry.depth() == 176)
+                .map(|entry| entry.id())
+                .expect("A's checkpoint");
+            crate::models::qwen3_5::dflash2_turn::drop_parked_state(&mut inner, cp);
+            let d = a[..186].to_vec();
+            inner.dflash2_states.generation_suffix = Some(std::sync::Arc::from(&a[166..186]));
+            let prefix = inner.prime_dspark_prefix_state(&d, true, salt)?;
+            assert_eq!(inner.dflash2_states.counters.lazy_junctions, 2);
+            let points: Vec<u32> = inner
+                .dflash2_states
+                .turn
+                .as_ref()
+                .expect("D's turn")
+                .plan
+                .boundaries
+                .iter()
+                .map(|point| point.tokens)
+                .collect();
+            assert_eq!(points, vec![160], "176 lies past D's replay point");
+            let cached = prefix.effective_cached_prefix_len();
+            inner
+                .paged_prefill_with_draft_state(&d[cached..], &prefix, stream)?
+                .eval();
+            assert_eq!(inner.dflash2_states.counters.junction_materializations, 1);
+            inner.abort_paged_turn();
+            Ok(())
+        })();
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+        result
+    }
+
+    /// A DFlash2 turn ends by registering its blocks, releasing its lane and
+    /// then ending its replay point's use (Splash `Engine::release`): no
+    /// live request, ring or GDN state is left, the dirty latch is clear,
+    /// and no history entry is formed. The next turn, which extends the
+    /// first one's history, resumes at the first one's replay point (32),
+    /// publishes its own (64), and emits paged AR's greedy tokens.
+    /// Mutations LV1 (the DFlash2 finalize keeps the request live) and SV1
+    /// (the history save checks the frontier of a released lane) → red.
+    #[test]
+    fn dflash2_turns_resume_at_the_deepest_state() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "dflash2_turns_resume_at_the_deepest_state",
+        ) {
+            return Ok(());
+        }
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        use crate::models::qwen3_5::dflash2_turn::TURN_END_LOG;
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let dflash2 = DecoderPlan::Speculative(SpeculativeKind::DraftModel);
+        let first = prompt(40);
+        let mut spec = tiny_paged_int8_dflash_inner(0x5_800A);
+        let mut ar = tiny_paged_int8_dflash_inner(0x5_800A);
+        let (_, invalidations) = spec.gdn_dirty_for_test();
+        TURN_END_LOG.with(|log| log.borrow_mut().clear());
+        let history = whole_turn(&mut spec, &first, dflash2)?;
+        assert_eq!(
+            history,
+            whole_turn(&mut ar, &first, DecoderPlan::Autoregressive)?
+        );
+        assert_eq!(history.len(), first.len() + 19);
+        assert_eq!(
+            TURN_END_LOG.with(|log| std::mem::take(&mut *log.borrow_mut())),
+            vec!["register", "release", "end_use"]
+        );
+        assert!(
+            !spec
+                .paged_adapter
+                .as_ref()
+                .expect("pool")
+                .is_live_for_continue_for(0),
+            "the lane is released"
+        );
+        assert!(spec.dflash2_context.is_none());
+        assert!(spec.dflash2_turn_state.is_none());
+        assert_eq!(spec.gdn_dirty_for_test(), (false, invalidations));
+        assert!(spec.history_stamp_for_test().is_none(), "no history entry");
+        assert_eq!(parked_depths(&spec), vec![32]);
+
+        let mut second = history.clone();
+        second.extend(prompt(9).iter().rev());
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(4)));
+        PREFILL_CHUNK_BLOCKS.with(|log| *log.borrow_mut() = Some(Vec::new()));
+        let spec_history = whole_turn(&mut spec, &second, dflash2);
+        let seen = PREFILL_CHUNK_BLOCKS
+            .with(|log| log.borrow_mut().take())
+            .unwrap_or_default();
+        let ar_history = whole_turn(&mut ar, &second, DecoderPlan::Autoregressive);
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+        assert_eq!(seen.len(), 9, "the prefill runs [32, 68) by four");
+        assert_eq!(spec.dflash2_states.counters.replay_state_publications, 2);
+        assert!(parked_depths(&spec).contains(&64));
+        assert_eq!(spec_history?, ar_history?);
+        Ok(())
+    }
+
+    /// A DFlash2 lane's draft ring and context window go to the idle lane
+    /// when the turn ends and the next turn takes them (Splash
+    /// `QwenStateStorage::releaseLane`, `acquire`): two turns allocate each
+    /// once.
+    /// Mutation LB1 (a lane never takes the idle buffers) → red.
+    #[test]
+    fn lane_buffers_are_reused_between_turns() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("lane_buffers_are_reused_between_turns") {
+            return Ok(());
+        }
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        use crate::models::qwen3_5::dflash2::RING_ALLOCATIONS;
+        use crate::models::qwen3_5::draft_context::WINDOW_ALLOCATIONS;
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let dflash2 = DecoderPlan::Speculative(SpeculativeKind::DraftModel);
+        let mut inner = tiny_paged_int8_dflash_inner(0x5_8220);
+        RING_ALLOCATIONS.with(|count| count.set(0));
+        WINDOW_ALLOCATIONS.with(|count| count.set(0));
+        let first = prompt(40);
+        let mut second = whole_turn(&mut inner, &first, dflash2)?;
+        assert!(inner.dflash2_states.idle_lane.ring.is_some());
+        assert!(inner.dflash2_states.idle_lane.window.is_some());
+        let rings = RING_ALLOCATIONS.with(std::cell::Cell::get);
+        assert!(rings > 0, "one ring buffer per draft layer");
+        second.extend(prompt(9).iter().rev());
+        whole_turn(&mut inner, &second, dflash2)?;
+        assert_eq!(RING_ALLOCATIONS.with(std::cell::Cell::get), rings);
+        assert_eq!(WINDOW_ALLOCATIONS.with(std::cell::Cell::get), 1);
+        Ok(())
+    }
+
+    /// An aborted DFlash2 turn's draft ring and window go to the idle lane
+    /// (Splash `Engine::release` → `QwenStateStorage::releaseLane`), whether
+    /// the turn state holds the ring (after the prefill) or the decode's
+    /// stepper does (an error ends it without `finish`).
+    /// Mutations AB1 (the abort drops the lane's buffers) and SD1 (a
+    /// dropped stepper keeps its ring) → red.
+    #[test]
+    fn aborted_turns_leave_their_lane_buffers_idle() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "aborted_turns_leave_their_lane_buffers_idle",
+        ) {
+            return Ok(());
+        }
+        use crate::engine::backend::PagedPrefix;
+        use crate::engine::dspark_turn::PagedDsparkBackend;
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let prompt = prompt(40);
+        let mut inner = tiny_paged_int8_dflash_inner(0x5_8230);
+        let idle_ring = |inner: &Qwen35Inner| {
+            inner
+                .dflash2_states
+                .idle_lane
+                .ring
+                .as_ref()
+                .map_or(0, DFlash2ContextCache::buffer_bytes)
+        };
+        let ring_bytes = inner
+            .dflash2
+            .as_ref()
+            .expect("draft")
+            .config
+            .kv_ring_bytes();
+        tapped_prefill_by_four(&mut inner, &prompt)?;
+        inner.dflash2_states.idle_lane = Default::default();
+        inner.abort_paged_turn();
+        assert_eq!(idle_ring(&inner), ring_bytes, "after the prefill");
+
+        let prefix = inner.prime_dspark_prefix_state(&prompt, true, 0)?;
+        let cached = prefix.effective_cached_prefix_len();
+        inner
+            .paged_prefill_with_draft_state(&prompt[cached..], &prefix, stream)?
+            .eval();
+        let block = inner.dflash2.as_ref().expect("draft").config.block_size;
+        let step = inner.begin_dspark_decode(block)?;
+        drop(step);
+        inner.dflash2_states.idle_lane = Default::default();
+        inner.abort_paged_turn();
+        assert_eq!(idle_ring(&inner), ring_bytes, "after a decode error");
+        Ok(())
+    }
+
+    /// The idle lane's ring and window count in the model's states on the
+    /// governor's books (Splash keeps one lane's start buffers).
+    /// Mutation IA1 (the idle lane is not counted) → red.
+    #[test]
+    fn idle_lane_counts_in_the_states_account() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("idle_lane_counts_in_the_states_account")
+        {
+            return Ok(());
+        }
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        use crate::models::qwen3_5::dflash2_turn::memory_accounts;
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let mut inner = tiny_paged_int8_dflash_inner(0x5_8240);
+        whole_turn(
+            &mut inner,
+            &prompt(40),
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+        )?;
+        let draft = &inner.dflash2.as_ref().expect("draft").config;
+        let lane = draft.kv_ring_bytes() + draft.context_window_bytes();
+        let with = memory_accounts(&inner, 0).states;
+        inner.dflash2_states.idle_lane = Default::default();
+        assert_eq!(with - memory_accounts(&inner, 0).states, lane);
+        Ok(())
+    }
+
+    /// A one-chunk DFlash2 prefill with no capture leaves its ring and
+    /// window lazy; the idle lane keeps them materialized, so a restore's
+    /// claim credits only storage that exists (Splash
+    /// `QwenStateStorage::releaseLane` pools allocated rings).
+    /// Mutations IR1 (the idle ring is kept lazy) and IR2 (the idle window
+    /// is) → red.
+    #[test]
+    fn the_idle_lane_holds_materialized_buffers() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "the_idle_lane_holds_materialized_buffers",
+        ) {
+            return Ok(());
+        }
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let prompt = prompt(40);
+        let mut inner = tiny_paged_int8_dflash_inner(0x5_8245);
+        let prefix = inner.prime_dspark_prefix_state(&prompt, false, 0)?;
+        inner
+            .paged_prefill_with_draft_state(&prompt, &prefix, stream)?
+            .eval();
+        inner.abort_paged_turn();
+        let ready = |a: &&MxArray| unsafe { mlx_sys::mlx_array_is_available(a.as_raw_ptr()) };
+        let idle = &inner.dflash2_states.idle_lane;
+        let mut ring = Vec::new();
+        idle.ring
+            .as_ref()
+            .expect("idle ring")
+            .collect_arrays(&mut ring);
+        assert!(!ring.is_empty() && ring.iter().all(ready), "lazy idle ring");
+        let mut window = Vec::new();
+        idle.window
+            .as_ref()
+            .expect("idle window")
+            .collect_arrays(&mut window);
+        assert!(window.iter().all(ready), "lazy idle window");
+        Ok(())
+    }
+
+    /// A DFlash2 turn without cache reuse plans no point yet still has its
+    /// turn state, so its end releases the lane: its prefill publishes
+    /// nothing.
+    /// Mutation RU1 (the plan ignores reuse) → red.
+    #[test]
+    fn a_turn_without_reuse_publishes_no_state() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("a_turn_without_reuse_publishes_no_state")
+        {
+            return Ok(());
+        }
+        use crate::engine::backend::PagedPrefix;
+        use crate::engine::dspark_turn::PagedDsparkBackend;
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let prompt = prompt(100);
+        let mut inner = tiny_paged_int8_dflash_inner(0x5_8250);
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(4)));
+        let result = (|| -> Result<()> {
+            let prefix = inner.prime_dspark_prefix_state(&prompt, false, 0)?;
+            let cached = prefix.effective_cached_prefix_len();
+            inner
+                .paged_prefill_with_draft_state(&prompt[cached..], &prefix, stream)?
+                .eval();
+            Ok(())
+        })();
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+        result?;
+        let turn = inner.dflash2_states.turn.as_ref().expect("the turn state");
+        assert!(
+            turn.plan.boundaries.is_empty(),
+            "{:?}",
+            turn.plan.boundaries
+        );
+        assert_eq!(inner.dflash2_states.store.bytes().entries, 0);
+        inner.abort_paged_turn();
+        Ok(())
+    }
+
+    /// A DFlash2 turn that ends on `length` runs no target forward after
+    /// its last verify: the paged steppers drop the final token
+    /// (`FinalTokenPolicy::AlwaysDrop`), so the saved history leaves it out.
+    /// Mutation TF1 (`PagedStepper::materialize_final` runs a step for an
+    /// `AlwaysDrop` model) → red.
+    #[test]
+    fn length_exit_runs_no_terminal_forward() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("length_exit_runs_no_terminal_forward") {
+            return Ok(());
+        }
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        use crate::models::qwen3_5::model::PAGED_STEPS;
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let first = prompt(40);
+        let mut inner = tiny_paged_int8_dflash_inner(0x5_8230);
+        PAGED_STEPS.with(|steps| steps.set(0));
+        let history = whole_turn(
+            &mut inner,
+            &first,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+        )?;
+        assert_eq!(PAGED_STEPS.with(std::cell::Cell::get), 0);
+        assert_eq!(history.len(), first.len() + 19);
+        Ok(())
+    }
+
+    /// An autoregressive turn after a DFlash2 turn restores its GDN cell
+    /// from the DFlash2 turn's stored replay point (96), the deepest state
+    /// within its cached prefix, and holds it in use for the turn: the
+    /// governor lists it only at `InUse` (Splash `StateCache::useState`).
+    /// Mutation AR1 (store states are no GDN candidates) → red (the prime
+    /// replays the prefix).
+    #[test]
+    fn ar_turn_restores_gdn_from_a_composite_state() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "ar_turn_restores_gdn_from_a_composite_state",
+        ) {
+            return Ok(());
+        }
+        use crate::engine::backend::ChatBackend;
+        use crate::engine::governor::ledger::{
+            CertainReuse, Need, Stage, TakeRights, UnitKey, VictimQuery,
+        };
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        use crate::models::qwen3_5::dflash2_turn::{Keep, model_units};
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let first = prompt(100);
+        let mut inner = tiny_paged_int8_dflash_inner(0x5_8180);
+        let salt = ChatBackend::resolve_params(&inner, &Default::default()).cache_salt;
+        whole_turn(
+            &mut inner,
+            &first,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+        )?;
+        assert!(inner.ladder_entries_for_test().is_empty(), "no rungs");
+        let (id, mark) = inner
+            .dflash2_states
+            .store
+            .entries()
+            .find(|entry| entry.depth() == 96)
+            .map(|entry| (entry.id(), entry.mark()))
+            .expect("the replay point at 96");
+        let mut second = first.clone();
+        second.extend((0..20u32).map(|i| (i * 5 + 1) % VOCAB));
+        let prefix = inner.prime_dense_prefix(&second, salt, None)?;
+        assert_eq!(
+            crate::engine::backend::PagedPrefix::effective_cached_prefix_len(&prefix),
+            96
+        );
+        assert_eq!(inner.last_gdn_prefix_prepare_state, "checkpoint");
+        assert_eq!(inner.gdn_in_use_for_test(0), Some(&UnitKey::Store(id)));
+        assert!(inner.dflash2_states.store.in_use(mark));
+        let query = VictimQuery {
+            rights: TakeRights {
+                units: true,
+                in_use: true,
+                certain_reuse: CertainReuse::All,
+                ..TakeRights::default()
+            },
+            need: Need {
+                bytes: 1,
+                ..Need::default()
+            },
+        };
+        let stages: Vec<Stage> = model_units(&inner, Keep::default(), &query)
+            .into_units()
+            .into_iter()
+            .filter(|unit| unit.key == UnitKey::Store(id))
+            .map(|unit| unit.stage)
+            .collect();
+        assert_eq!(stages, vec![Stage::InUse]);
+        inner.abort_paged_turn();
+        assert!(!inner.dflash2_states.store.in_use(mark));
         Ok(())
     }
 }

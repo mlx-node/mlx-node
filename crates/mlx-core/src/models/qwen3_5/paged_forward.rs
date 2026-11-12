@@ -47,8 +47,12 @@ use crate::inference_trace::{
 use crate::nn::{Embedding, RMSNorm};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
+use crate::engine::governor::governor::Reservation;
+
 use super::attention::PagedPass;
 use super::decoder_layer::{DecoderLayer, Qwen3_5LayerKind};
+use super::dflash2_state::paged::PagedAnchor;
+use super::draft_context::DraftContextWindow;
 use super::layer_cache::Qwen3_5LayerCache;
 use crate::models::quantized_linear::LinearProj;
 
@@ -63,32 +67,197 @@ pub(crate) trait PrefillTapSink {
     /// Materialize what [`Self::chunk`] queued before the prefill clears the
     /// cache between chunks.
     fn eval(&self) -> Result<()>;
-    /// An absolute row inside the prefill whose state the sink keeps: a
-    /// chunk ends there (Splash `Engine::workEndOf`).
-    fn capture_row(&self) -> Option<usize> {
+    /// Rows inside the prefill a chunk ends at for a state capture,
+    /// ascending (Splash `Engine::reserveCaptures`).
+    fn capture_rows(&self) -> &[usize] {
+        &[]
+    }
+    /// Whether the chunk ending at `row` captures: only a capture whose
+    /// bytes the ledger granted takes a snapshot.
+    fn arm(&mut self, _row: usize, _armed: bool) {}
+    /// The GDN slots once the prefill reached armed `row`.
+    fn capture_linear(&mut self, _row: usize, _linear: Vec<Qwen3_5LayerCache>) {}
+    /// The state captured at `row`, once.
+    fn take_captured(&mut self, _row: usize) -> Option<PagedAnchor> {
         None
     }
-    /// The GDN slots once the prefill reached [`Self::capture_row`].
-    fn capture_linear(&mut self, _linear: Vec<Qwen3_5LayerCache>) {}
+    /// The lane's context window as it is now, which ends at `row`: a
+    /// state the ledger refused before its chunk, taken from the lane after
+    /// it (Splash `fromLane`).
+    fn snapshot_lane_window(&mut self, row: usize) -> Result<DraftContextWindow> {
+        Err(Error::from_reason(format!(
+            "this prefill keeps no lane window at row {row}"
+        )))
+    }
 }
 
 /// The chunk breaks of a prefill: its checkpoint boundaries plus the sink's
-/// capture row inside `(cached_prefix_len, full_len)`, ascending.
+/// capture rows inside `(cached_prefix_len, full_len)`, ascending.
 pub(crate) fn prefill_breaks(
     checkpoint_boundaries: &[u32],
-    capture_row: Option<u32>,
+    capture_rows: &[u32],
     cached_prefix_len: u32,
     full_len: usize,
 ) -> Vec<u32> {
     let mut breaks = checkpoint_boundaries.to_vec();
-    if let Some(row) =
-        capture_row.filter(|&row| row > cached_prefix_len && (row as usize) < full_len)
-        && !breaks.contains(&row)
-    {
-        breaks.push(row);
-        breaks.sort_unstable();
-    }
+    breaks.extend(
+        capture_rows
+            .iter()
+            .copied()
+            .filter(|&row| row > cached_prefix_len && (row as usize) < full_len),
+    );
+    breaks.sort_unstable();
+    breaks.dedup();
     breaks
+}
+
+/// What the ledger said to a capture before its chunk ran (Splash
+/// `Engine::reserveCaptures`): its bytes are reserved until the state is
+/// stored (`recycled` when the ledger freed units for them), or it was
+/// refused and no snapshot is taken during the chunk.
+pub(crate) enum CaptureGrant {
+    Reserved(Option<Reservation<'static>>, bool),
+    /// Refused while the lane holds a checkpoint it may retire: the state
+    /// is taken from the lane once the chunk ran (Splash `fromLane`).
+    FromLane,
+    Refused,
+}
+
+impl CaptureGrant {
+    /// The chunk snapshots its state.
+    pub(crate) fn armed(&self) -> bool {
+        matches!(self, Self::Reserved(..))
+    }
+}
+
+/// What a chunk of a tapped prefill reached (Splash `Engine::apply`).
+pub(crate) enum Reached<'a> {
+    /// No capture point: its committed blocks register only.
+    NoPoint,
+    /// The state captured at the point, with the bytes reserved for it and
+    /// whether the ledger freed units for them.
+    Captured(PagedAnchor, Option<Reservation<'static>>, bool),
+    /// A point whose state the lane still holds: the live GDN cell and the
+    /// sink's lane window end at it until the next chunk runs.
+    FromLane(&'a mut (dyn PrefillTapSink + 'a)),
+    /// A point with no state: the use and dedup steps still run.
+    Refused,
+}
+
+/// The GDN ladder rungs a prefill breaks at. A tapped (DFlash2) prefill
+/// takes none unless the cold GDN sidecar reads them: its states are the
+/// turn's own points, one owner per block.
+pub(crate) fn prefill_ladder(
+    adapter: &PagedKVCacheAdapter,
+    full_len: usize,
+    cached_prefix_len: u32,
+    tapped: bool,
+) -> Vec<u32> {
+    let wanted = gdn_cold_sidecar_ladder_wanted(adapter);
+    if tapped && !wanted {
+        return Vec::new();
+    }
+    prefill_checkpoint_boundaries(full_len, cached_prefix_len, adapter.block_size(), wanted)
+}
+
+pub(crate) fn capture_rows_of(taps: Option<&dyn PrefillTapSink>) -> Vec<u32> {
+    taps.map_or_else(Vec::new, |sink| {
+        sink.capture_rows()
+            .iter()
+            .filter_map(|&row| u32::try_from(row).ok())
+            .collect()
+    })
+}
+
+/// Books `chunk`'s rows, then claims the capture at `row` when the chunk
+/// ends there; the sink snapshots only a granted one. The KV comes first
+/// (Splash `Engine::prepare` runs `growLane` before `reserveCaptures`): an
+/// optional state is refused rather than taking the room the chunk needs.
+pub(crate) fn book_chunk<L>(
+    target: &mut dyn PrefillTarget<L>,
+    taps: Option<&mut (dyn PrefillTapSink + '_)>,
+    capture_rows: &[u32],
+    chunk: &[u32],
+    row: u32,
+    is_last_chunk: bool,
+) -> Result<Option<CaptureGrant>> {
+    target.record(chunk)?;
+    let Some(sink) = taps else {
+        return Ok(None);
+    };
+    if is_last_chunk || !capture_rows.contains(&row) {
+        return Ok(None);
+    }
+    let grant = target.prepare_capture(row)?;
+    sink.arm(row as usize, grant.armed());
+    Ok(Some(grant))
+}
+
+/// The live GDN slots, evaluated and snapshotted: the state at the row the
+/// last chunk ended at.
+pub(crate) fn snapshot_live_linear(
+    caches: Option<&[Qwen3_5LayerCache]>,
+) -> Result<Vec<Qwen3_5LayerCache>> {
+    let caches =
+        caches.ok_or_else(|| Error::from_reason("a lane state needs the live GDN cell"))?;
+    materialize_linear_layer_caches(caches)?;
+    snapshot_materialized_linear_layer_caches(caches)
+        .ok_or_else(|| Error::from_reason("the live GDN cell is not materialized"))
+}
+
+/// The GDN slots at an armed capture row, into the sink.
+pub(crate) fn capture_chunk_linear(
+    caches: &mut [Qwen3_5LayerCache],
+    sink: &mut (dyn PrefillTapSink + '_),
+    row: u32,
+    materialized: bool,
+) -> Result<()> {
+    if !materialized {
+        materialize_linear_layer_caches(caches)?;
+    }
+    if let Some(linear) = snapshot_materialized_linear_layer_caches(caches) {
+        sink.capture_linear(row as usize, linear);
+    }
+    Ok(())
+}
+
+/// Hands what a non-last chunk of a tapped prefill reached to the target.
+pub(crate) fn reach_chunk<L>(
+    target: &mut dyn PrefillTarget<L>,
+    taps: Option<&mut (dyn PrefillTapSink + '_)>,
+    row: u32,
+    grant: Option<CaptureGrant>,
+) -> Result<()> {
+    let Some(sink) = taps else {
+        return Ok(());
+    };
+    let outcome = match grant {
+        None => Reached::NoPoint,
+        Some(CaptureGrant::Reserved(reservation, recycled)) => sink
+            .take_captured(row as usize)
+            .map_or(Reached::Refused, |anchor| {
+                Reached::Captured(anchor, reservation, recycled)
+            }),
+        Some(CaptureGrant::FromLane) => Reached::FromLane(sink),
+        Some(CaptureGrant::Refused) => Reached::Refused,
+    };
+    target.reached(row, outcome)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A tapped prefill on this thread is cancelled at the chunk starting
+    /// at this row.
+    pub(crate) static PREFILL_CANCEL_AT: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn cancel_hook(_row: u32) -> bool {
+    #[cfg(test)]
+    if PREFILL_CANCEL_AT.with(std::cell::Cell::get) == Some(_row) {
+        return true;
+    }
+    false
 }
 
 /// What a paged prefill runs on.
@@ -106,6 +275,17 @@ pub(crate) trait PrefillTarget<L> {
     fn parts(&mut self) -> Result<PrefillParts<'_, L>>;
     /// Books `chunk`'s rows and advances the cursor over them.
     fn record(&mut self, chunk: &[u32]) -> Result<()>;
+    /// Claims the state the chunk ending at `row` captures, after the
+    /// chunk's rows are booked and before the chunk runs (Splash
+    /// `Engine::prepare`: `growLane`, then `reserveCaptures`).
+    fn prepare_capture(&mut self, _row: u32) -> Result<CaptureGrant> {
+        Ok(CaptureGrant::Reserved(None, false))
+    }
+    /// A non-last chunk of a tapped prefill ended at `row` (Splash
+    /// `Engine::publishCommittedBlocks`, `publishReachedStateBoundaries`).
+    fn reached(&mut self, _row: u32, _outcome: Reached<'_>) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl<L> PrefillTarget<L> for PrefillParts<'_, L> {
@@ -651,22 +831,16 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
 
     check_prefill_chunk_rows(chunk_size)?;
 
-    let checkpoint_boundaries = {
-        let adapter = target.parts()?.adapter;
-        prefill_checkpoint_boundaries(
-            full_tokens.len(),
-            cached_prefix_len,
-            adapter.block_size(),
-            gdn_cold_sidecar_ladder_wanted(adapter),
-        )
-    };
-    let capture_row = taps
-        .as_deref()
-        .and_then(PrefillTapSink::capture_row)
-        .and_then(|row| u32::try_from(row).ok());
+    let checkpoint_boundaries = prefill_ladder(
+        target.parts()?.adapter,
+        full_tokens.len(),
+        cached_prefix_len,
+        taps.is_some(),
+    );
+    let capture_rows = capture_rows_of(taps.as_deref());
     let breaks = prefill_breaks(
         &checkpoint_boundaries,
-        capture_row,
+        &capture_rows,
         cached_prefix_len,
         full_tokens.len(),
     );
@@ -747,21 +921,28 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         .map_or_else(Vec::new, |sink| sink.tap_layers().to_vec());
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
-        // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary
-        // instead of running the rest of the prefill. The Err rides the
-        // caller's release arm (the generic engine's `abort_paged_turn` /
-        // the dense core's `invalidate_dense_paged_session`), which
-        // releases the live request without registering its blocks (fail
-        // closed).
-        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+        // Cooperative cancel at the chunk boundary. The Err rides the
+        // caller's release arm (`abort_paged_turn` /
+        // `invalidate_dense_paged_session`), which releases the live
+        // request; only the blocks a tapped prefill's completed chunks
+        // registered stay cached (Splash `publishCommittedBlocks`).
+        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed))
+            || cancel_hook(chunk_start_position)
+        {
             return Err(Error::from_reason("prefill cancelled"));
         }
         let chunk = &suffix_tokens[range];
         let is_last_chunk = chunk_idx + 1 == total_chunks;
         let chunk_trace_start = trace_enabled.then(Instant::now);
         let chunk_info_start = inference_info_enabled.then(Instant::now);
-
-        target.record(chunk)?;
+        let grant = book_chunk(
+            target,
+            taps.as_deref_mut(),
+            &capture_rows,
+            chunk,
+            chunk_start_position + chunk.len() as u32,
+            is_last_chunk,
+        )?;
         let parts = target.parts()?;
         #[cfg(test)]
         note_prefill_chunk_blocks(parts.adapter);
@@ -853,17 +1034,13 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
                     });
                 }
             }
-            if capture_row == Some(context_after)
+            if grant.as_ref().is_some_and(CaptureGrant::armed)
                 && let Some(sink) = taps.as_deref_mut()
             {
-                if !capture_checkpoint {
-                    materialize_linear_layer_caches(parts.caches)?;
-                }
-                if let Some(linear) = snapshot_materialized_linear_layer_caches(parts.caches) {
-                    sink.capture_linear(linear);
-                }
+                capture_chunk_linear(parts.caches, sink, context_after, capture_checkpoint)?;
             }
             crate::array::synchronize_and_clear_cache();
+            reach_chunk(target, taps.as_deref_mut(), context_after, grant)?;
             crate::engine::progress::with_turn_progress(|p| {
                 p.prefill_advanced(context_after - cached_prefix_len)
             });
