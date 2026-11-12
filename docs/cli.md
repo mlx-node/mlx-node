@@ -495,6 +495,9 @@ ggml K/IQ formats Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS and the
 grid formats IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S behind
 `--gguf-kquant`.
 
+The input is one GGUF file. A part of a split GGUF (`NAME-00001-of-00003.gguf`)
+is refused; merge the parts first with `llama-gguf-split --merge`.
+
 #### K-quants (Q2_K .. Q6_K, IQ4_NL, IQ4_XS, IQ1_*, IQ2_*, IQ3_XXS, IQ3_S)
 
 ```bash

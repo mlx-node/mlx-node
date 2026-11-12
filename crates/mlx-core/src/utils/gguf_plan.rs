@@ -23,6 +23,7 @@ use super::gguf::{
     symmetric_zero_point, validate_prism_supplied_config, validate_qwen35_standalone_geometry,
     write_embedded_gpt2_tokenizer,
 };
+use super::gguf_source::reject_split;
 use crate::array::DType;
 use crate::models::quant_dispatch::{kquant_mode_params, parse_mode_str};
 
@@ -118,6 +119,7 @@ pub(crate) fn plan_gguf_import(
     opts: &ImportOptions,
     role: OutputRole,
 ) -> Result<ImportPlan> {
+    reject_split(gguf, input)?;
     let prism_contract = prism_hadamard_config(gguf)?;
     if prism_contract.is_some() {
         if opts.requantize {
@@ -657,9 +659,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::engine::checkpoint_source::{CheckpointSource, native_import_plans};
     use crate::utils::gguf::parse_gguf;
     #[cfg(debug_assertions)]
     use crate::utils::gguf::{GgufConversionOptions, GgufTensorType, convert_gguf_to_safetensors};
+    use crate::utils::gguf::{NativeGgufFamily, preflight_muse_dflash_gguf};
     use crate::utils::gguf_test_fixtures::{
         IMPORT_FIXTURE_NAMES, ImportFixture, ImportFixtureFamily, convert_import_fixture,
         import_golden_root as golden_root, safetensors_manifest, sha256_hex, t64_prefixes,
@@ -667,6 +671,7 @@ mod tests {
     };
     #[cfg(debug_assertions)]
     use crate::utils::gguf_test_fixtures::{build_minimal_gguf, fixture_payload};
+    use crate::utils::gguf_test_fixtures::{write_merged_gguf, write_split_gguf};
 
     fn work_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("mlx-gguf-plan-{tag}-{}", uuid::Uuid::new_v4()))
@@ -1088,5 +1093,156 @@ mod tests {
         }
         fs::remove_dir_all(&work).ok();
         assert!(checked > 0, "no golden rows matched");
+    }
+
+    const SPLIT_NAMES: [&str; 3] = [
+        "tiny-00001-of-00003.gguf",
+        "tiny-00002-of-00003.gguf",
+        "tiny-00003-of-00003.gguf",
+    ];
+
+    fn assert_names_parts(text: &str) {
+        for name in SPLIT_NAMES {
+            assert!(text.contains(name), "{text}");
+        }
+    }
+
+    fn tiny_split(dir: &Path, architecture: &str) -> Vec<PathBuf> {
+        write_split_gguf(
+            dir,
+            "tiny",
+            &[(
+                "general.architecture",
+                GgufMetaValue::String(architecture.to_string()),
+            )],
+            &[("a.weight", &[4]), ("b.weight", &[4]), ("c.weight", &[4])],
+            true,
+        )
+    }
+
+    fn entries(dir: &Path) -> usize {
+        fs::read_dir(dir).map(|d| d.count()).unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn plan_refuses_a_lone_split_part() {
+        let work = work_dir("split-plan");
+        let parts = tiny_split(&work.join("src"), "qwen35");
+        let gguf = parse_gguf(&parts[0]).unwrap();
+        let Err(e) = plan_gguf_import(
+            &gguf,
+            &parts[0],
+            &ImportOptions::default(),
+            OutputRole::Primary,
+        ) else {
+            panic!("the plan read a lone split part");
+        };
+        assert_names_parts(&e.reason);
+        let Err(e) = native_import_plans(NativeGgufFamily::Qwen35, (&parts[0], &gguf), None) else {
+            panic!("native plans read a lone split part");
+        };
+        assert_names_parts(&e.reason);
+        let root = work.join("cache");
+        let Err(e) =
+            CheckpointSource::resolve_in(&parts[0], NativeGgufFamily::Qwen35, Some(&root)).await
+        else {
+            panic!("native prepare read a lone split part");
+        };
+        assert_names_parts(&e.reason);
+        assert_eq!(entries(&root), 0, "refused after a cache write");
+        fs::remove_dir_all(&work).ok();
+    }
+
+    #[tokio::test]
+    async fn a_later_part_is_refused_before_the_architecture_check() {
+        let work = work_dir("split-family");
+        let parts = tiny_split(&work.join("src"), "qwen35moe");
+        let root = work.join("cache");
+        let Err(e) =
+            CheckpointSource::resolve_in(&parts[1], NativeGgufFamily::Qwen35Moe, Some(&root)).await
+        else {
+            panic!("native prepare read a lone split part");
+        };
+        assert!(
+            e.reason.contains("part 2 of a split GGUF of 3 parts"),
+            "{}",
+            e.reason
+        );
+        assert_names_parts(&e.reason);
+        assert_eq!(entries(&root), 0, "refused after a cache write");
+
+        let Err(e) = preflight_muse_dflash_gguf(
+            parts[0].to_string_lossy().into_owned(),
+            work.to_string_lossy().into_owned(),
+        ) else {
+            panic!("the draft preflight read a lone split part");
+        };
+        assert_names_parts(&e.reason);
+        fs::remove_dir_all(&work).ok();
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn convert_refuses_a_lone_split_part() {
+        if !crate::test_support::in_own_process(
+            "utils::gguf_plan::tests::convert_refuses_a_lone_split_part",
+        ) {
+            return;
+        }
+        let work = work_dir("split-convert");
+        let metadata = [(
+            "general.architecture",
+            GgufMetaValue::String("gemma4".to_string()),
+        )];
+        let tensors: [(&str, &[u64]); 3] = [
+            ("output_norm.weight", &[1]),
+            ("blk.0.attn_q.weight", &[32, 1]),
+            ("blk.0.attn_norm.weight", &[32]),
+        ];
+        let options = |input: &Path, out: &Path| GgufConversionOptions {
+            input_path: input.to_string_lossy().into_owned(),
+            output_dir: out.to_string_lossy().into_owned(),
+            config_source_dir: None,
+            dtype: None,
+            verbose: Some(false),
+            quantize: Some(false),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            output_filename: None,
+            vlm_key_prefix: Some(false),
+            quant_mxfp: Some(false),
+            import_k_quants: Some(false),
+            native_qwen35_layout: None,
+        };
+        let out = work.join("output");
+        fs::create_dir_all(&out).unwrap();
+        let sentinel = out.join("model.safetensors");
+        fs::write(&sentinel, b"sentinel").unwrap();
+
+        // The first set states no split.tensors.count: split.count alone refuses it.
+        for (dir, tensors_count) in [("bare", false), ("split", true)] {
+            let parts =
+                write_split_gguf(&work.join(dir), "tiny", &metadata, &tensors, tensors_count);
+            match convert_gguf_to_safetensors(options(&parts[0], &out)).await {
+                Ok(result) => panic!(
+                    "{dir}: convert read a lone split part: {} tensors",
+                    result.num_tensors
+                ),
+                Err(e) => assert_names_parts(&e.reason),
+            }
+            assert_eq!(fs::read(&sentinel).unwrap(), b"sentinel", "{dir}");
+        }
+
+        let merged = work.join("merged").join("tiny.gguf");
+        fs::create_dir_all(merged.parent().unwrap()).unwrap();
+        write_merged_gguf(&merged, &metadata, &tensors);
+        let result = convert_gguf_to_safetensors(options(&merged, &work.join("merged-out")))
+            .await
+            .unwrap_or_else(|e| panic!("the merged file must convert: {}", e.reason));
+        assert_eq!(result.num_tensors, 3);
+        fs::remove_dir_all(&work).ok();
     }
 }

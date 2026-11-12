@@ -7,7 +7,9 @@ use napi::{Error, Result};
 use sha2::{Digest, Sha256};
 
 use crate::cold_tier::ShardIdentity;
-use crate::utils::gguf::{GgufFile, source_file_identity_digest};
+use crate::utils::gguf::{
+    GgufFile, GgufMetaValue, resolve_gguf_shards, source_file_identity_digest,
+};
 
 pub(crate) const GGUF_IMPORT_CONTRACT: &str = "gguf-import:v8";
 
@@ -179,21 +181,96 @@ pub(crate) fn check_tensor_bounds(h: &GgufFile, file_len: u64, path: &Path) -> R
 }
 
 pub(crate) fn reject_split(h: &GgufFile, path: &Path) -> Result<()> {
-    let Some(value) = h.metadata.get("split.count") else {
-        return Ok(());
-    };
-    match value.as_u32() {
-        Some(1) => Ok(()),
-        Some(n) if n > 1 => Err(Error::from_reason(format!(
-            "GGUF '{}' is split into {n} files; split GGUFs are not supported. Merge them first \
-             (llama-gguf-split --merge) and load the merged file.",
-            path.display()
-        ))),
-        _ => Err(Error::from_reason(format!(
-            "GGUF '{}' has an invalid split.count",
-            path.display()
-        ))),
+    let count = split_key(h, "split.count").unwrap_or(1);
+    if count > 1 {
+        return Err(lone_split_part(h, path, count));
     }
+    // split.count 0 is what llama-gguf-split --merge writes into its one-file output.
+    if let Some(total) = split_key(h, "split.tensors.count")
+        && total != h.tensors.len() as u64
+    {
+        return Err(Error::from_reason(format!(
+            "GGUF '{}' holds {} tensors but its split.tensors.count is {total}; the file is incomplete",
+            path.display(),
+            h.tensors.len()
+        )));
+    }
+    Ok(())
+}
+
+/// A metadata integer as Splash's `GgufFile` keeps it in `unsigneds`: signed
+/// values cast, a bool as 0 or 1, any other type absent.
+fn split_key(h: &GgufFile, key: &str) -> Option<u64> {
+    Some(match h.metadata.get(key)? {
+        GgufMetaValue::Uint8(v) => u64::from(*v),
+        GgufMetaValue::Uint16(v) => u64::from(*v),
+        GgufMetaValue::Uint32(v) => u64::from(*v),
+        GgufMetaValue::Uint64(v) => *v,
+        GgufMetaValue::Int8(v) => *v as u64,
+        GgufMetaValue::Int16(v) => *v as u64,
+        GgufMetaValue::Int32(v) => *v as u64,
+        GgufMetaValue::Int64(v) => *v as u64,
+        GgufMetaValue::Bool(v) => u64::from(*v),
+        _ => return None,
+    })
+}
+
+fn lone_split_part(h: &GgufFile, path: &Path, count: u64) -> Error {
+    let part = split_key(h, "split.no").unwrap_or(0).saturating_add(1);
+    let mut text = format!(
+        "GGUF '{}' is part {part} of a split GGUF of {count} parts. This path reads one GGUF \
+         file, so this part alone would miss the other parts' tensors.",
+        path.display()
+    );
+    match split_names(path, count) {
+        Some((first, merged)) => {
+            match resolve_gguf_shards(&first, u32::try_from(count).unwrap_or(u32::MAX)) {
+                Ok(parts) if first.is_file() => {
+                    let names: Vec<String> = parts
+                        .iter()
+                        .map(|p| {
+                            p.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned()
+                        })
+                        .collect();
+                    text += &format!(" The parts: {}.", names.join(", "));
+                }
+                Ok(_) => text += &format!(" Its first part '{}' is missing.", first.display()),
+                Err(e) => text += &format!(" The set is incomplete: {}.", e.reason),
+            }
+            text += &format!(
+                " Merge the parts into one file and pass that file: \
+                 llama-gguf-split --merge '{}' '{}'",
+                first.display(),
+                merged.display()
+            );
+        }
+        None => {
+            text += " Its file name is not NAME-0000K-of-0000N.gguf, so its other parts cannot \
+                     be found by name. Merge the parts with llama-gguf-split --merge and pass \
+                     the merged file."
+        }
+    }
+    Error::from_reason(text)
+}
+
+/// The first part and a merged-file name for a part named `NAME-0000K-of-0000N.gguf`.
+fn split_names(path: &Path, count: u64) -> Option<(PathBuf, PathBuf)> {
+    let name = path.file_name()?.to_str()?;
+    let (stem, extension) = name.rsplit_once('.')?;
+    let (head, total) = stem.rsplit_once("-of-")?;
+    let (prefix, number) = head.rsplit_once('-')?;
+    let digits = |s: &str| s.len() == 5 && s.bytes().all(|b| b.is_ascii_digit());
+    if !extension.eq_ignore_ascii_case("gguf") || !digits(number) || total != format!("{count:05}")
+    {
+        return None;
+    }
+    Some((
+        path.with_file_name(format!("{prefix}-00001-of-{total}.{extension}")),
+        path.with_file_name(format!("{prefix}.{extension}")),
+    ))
 }
 
 pub(crate) fn file_identity(
@@ -239,7 +316,9 @@ pub(crate) fn file_identity(
 mod tests {
     use super::*;
     use crate::utils::gguf::{GgufMetaValue, GgufTensorType, parse_gguf};
-    use crate::utils::gguf_test_fixtures::build_minimal_gguf;
+    use crate::utils::gguf_test_fixtures::{
+        build_minimal_gguf, write_merged_gguf, write_split_gguf,
+    };
 
     struct Temp(PathBuf);
     impl Temp {
@@ -313,20 +392,105 @@ mod tests {
         assert!(text.contains("truncated"), "{text}");
     }
 
-    #[test]
-    fn split_gguf_rejected() {
-        let dir = Temp::new();
-        let path = dir.0.join("m-00001-of-00002.gguf");
-        write_gguf(&path, &[("split.count", GgufMetaValue::Uint32(2))], 1.0);
-        let (header, id) = identity_of(&path);
-        let text = err_text(GgufSourceSet::open((&path, header.clone(), &id), None));
-        assert!(text.contains("split into 2 files"), "{text}");
-        assert!(reject_split(&header, &path).is_err());
+    const TINY: [(&str, &[u64]); 3] = [("a.weight", &[4]), ("b.weight", &[4]), ("c.weight", &[4])];
+    const TINY_NAMES: [&str; 3] = [
+        "tiny-00001-of-00003.gguf",
+        "tiny-00002-of-00003.gguf",
+        "tiny-00003-of-00003.gguf",
+    ];
 
-        let one = dir.0.join("one.gguf");
-        write_gguf(&one, &[("split.count", GgufMetaValue::Uint32(1))], 1.0);
-        let (header, id) = identity_of(&one);
-        GgufSourceSet::open((&one, header, &id), None).unwrap();
+    fn tiny_metadata() -> Vec<(&'static str, GgufMetaValue)> {
+        vec![(
+            "general.architecture",
+            GgufMetaValue::String("qwen35".to_string()),
+        )]
+    }
+
+    fn split_err(path: &Path) -> String {
+        err_text(reject_split(&parse_gguf(path).unwrap(), path))
+    }
+
+    #[test]
+    fn a_lone_split_part_names_its_parts() {
+        let dir = Temp::new();
+        let parts = write_split_gguf(&dir.0, "tiny", &tiny_metadata(), &TINY, true);
+
+        let text = split_err(&parts[0]);
+        assert!(text.contains("part 1 of a split GGUF of 3 parts"), "{text}");
+        for name in TINY_NAMES {
+            assert!(text.contains(name), "{text}");
+        }
+        assert!(text.contains("llama-gguf-split --merge"), "{text}");
+        let (header, id) = identity_of(&parts[0]);
+        let text = err_text(GgufSourceSet::open((&parts[0], header, &id), None));
+        for name in TINY_NAMES {
+            assert!(text.contains(name), "load seam: {text}");
+        }
+
+        let text = split_err(&parts[1]);
+        assert!(text.contains("part 2 of a split GGUF of 3 parts"), "{text}");
+        assert!(text.contains(TINY_NAMES[0]), "{text}");
+
+        let lonely = dir.0.join("lonely.gguf");
+        fs::copy(&parts[0], &lonely).unwrap();
+        let text = split_err(&lonely);
+        assert!(text.contains("3 parts"), "{text}");
+        assert!(text.contains("NAME-0000K-of-0000N"), "{text}");
+
+        fs::remove_file(&parts[2]).unwrap();
+        let text = split_err(&parts[0]);
+        assert!(text.contains("tiny-00003-of-00003"), "{text}");
+    }
+
+    #[test]
+    fn a_merged_gguf_reads_as_one_file() {
+        let dir = Temp::new();
+        let merged = dir.0.join("tiny.gguf");
+        write_merged_gguf(&merged, &tiny_metadata(), &TINY);
+        let (header, id) = identity_of(&merged);
+        reject_split(&header, &merged).unwrap();
+        GgufSourceSet::open((&merged, header, &id), None).unwrap();
+
+        let plain = dir.0.join("plain.gguf");
+        write_gguf(&plain, &[], 1.0);
+        reject_split(&parse_gguf(&plain).unwrap(), &plain).unwrap();
+
+        let short = dir.0.join("short.gguf");
+        write_gguf(
+            &short,
+            &[
+                ("split.count", GgufMetaValue::Uint32(1)),
+                ("split.tensors.count", GgufMetaValue::Int32(5)),
+            ],
+            1.0,
+        );
+        let text = split_err(&short);
+        assert!(text.contains("split.tensors.count is 5"), "{text}");
+
+        // Splash keeps only integer keys: a String split.count is absent, an Int16 one is read.
+        let text_count = dir.0.join("text-count.gguf");
+        write_gguf(
+            &text_count,
+            &[("split.count", GgufMetaValue::String("3".to_string()))],
+            1.0,
+        );
+        reject_split(&parse_gguf(&text_count).unwrap(), &text_count).unwrap();
+        let short_count = dir.0.join("short-count.gguf");
+        write_gguf(
+            &short_count,
+            &[("split.count", GgufMetaValue::Int16(3))],
+            1.0,
+        );
+        let text = split_err(&short_count);
+        assert!(text.contains("of 3 parts"), "{text}");
+        let short_total = dir.0.join("short-total.gguf");
+        write_gguf(
+            &short_total,
+            &[("split.tensors.count", GgufMetaValue::Int16(5))],
+            1.0,
+        );
+        let text = split_err(&short_total);
+        assert!(text.contains("split.tensors.count is 5"), "{text}");
     }
 
     #[test]

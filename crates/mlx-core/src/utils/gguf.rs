@@ -5257,6 +5257,7 @@ pub(super) fn convert_tensor_dtype(arr: MxArray, target: DType) -> Result<MxArra
 #[napi]
 pub fn preflight_muse_dflash_gguf(input_path: String, target_config_dir: String) -> Result<()> {
     let gguf = parse_gguf(&input_path)?;
+    super::gguf_source::reject_split(&gguf, Path::new(&input_path))?;
     source_quantization_profiles(&gguf, true)?;
     let mut target: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(Path::new(&target_config_dir).join("config.json")).map_err(
@@ -7825,7 +7826,7 @@ fn gemma4_native_mmproj(input: &Path, kind: Gemma4MmprojKind) -> Result<Option<P
 /// `vision_config` — is converted in the same transaction as the text model.
 fn gemma4_native_preflight(input: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
     let input = input.canonicalize()?;
-    NativeGgufFamily::Gemma4.check_main_header(&parse_gguf(&input)?)?;
+    NativeGgufFamily::Gemma4.check_main_header(&parse_gguf(&input)?, &input)?;
     let parent = input.parent().ok_or_else(|| {
         Error::from_reason(format!(
             "Gemma4 GGUF input '{}' has no parent directory",
@@ -7916,7 +7917,7 @@ fn muse_glimmer_native_draft(input: &Path) -> Result<Option<PathBuf>> {
 
 fn muse_glimmer_native_preflight(input: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
     let input = input.canonicalize()?;
-    NativeGgufFamily::MuseGlimmer.check_main_header(&parse_gguf(&input)?)?;
+    NativeGgufFamily::MuseGlimmer.check_main_header(&parse_gguf(&input)?, &input)?;
     let parent = input.parent().ok_or_else(|| {
         Error::from_reason(format!(
             "Muse-Glimmer GGUF input '{}' has no parent directory",
@@ -7981,9 +7982,12 @@ pub fn release_native_gguf_lease(dir: String) {
 }
 
 impl NativeGgufFamily {
-    /// The main GGUF's architecture check. Dense Qwen3.5 has none here: the
-    /// import plan rejects what it cannot read.
-    pub(crate) fn check_main_header(self, header: &GgufFile) -> Result<()> {
+    /// The main GGUF's split and architecture checks. Dense Qwen3.5 has no
+    /// architecture check here: the import plan rejects what it cannot read.
+    pub(crate) fn check_main_header(self, header: &GgufFile, path: &Path) -> Result<()> {
+        // A later split part has no general.architecture; refuse it as a part first, as Splash's
+        // GgufFile does before any architecture read.
+        super::gguf_source::reject_split(header, path)?;
         let (ok, message) = match self {
             Self::Qwen35 => (true, ""),
             Self::Qwen35Moe => (
@@ -8054,7 +8058,7 @@ pub(crate) fn native_gguf_preflight(
         NativeGgufFamily::Qwen35 => Ok((input.canonicalize()?, None)),
         NativeGgufFamily::Qwen35Moe | NativeGgufFamily::Clef => {
             let input = input.canonicalize()?;
-            family.check_main_header(&parse_gguf(&input)?)?;
+            family.check_main_header(&parse_gguf(&input)?, &input)?;
             Ok((input, None))
         }
         NativeGgufFamily::Gemma4 => gemma4_native_preflight(input),

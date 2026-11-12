@@ -252,6 +252,14 @@ pub(crate) fn build_minimal_gguf(
                 buf.extend_from_slice(&(GgufValueType::Int32 as u32).to_le_bytes());
                 buf.extend_from_slice(&v.to_le_bytes());
             }
+            GgufMetaValue::Uint16(v) => {
+                buf.extend_from_slice(&(GgufValueType::Uint16 as u32).to_le_bytes());
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            GgufMetaValue::Int16(v) => {
+                buf.extend_from_slice(&(GgufValueType::Int16 as u32).to_le_bytes());
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
             GgufMetaValue::Bool(v) => {
                 buf.extend_from_slice(&(GgufValueType::Bool as u32).to_le_bytes());
                 buf.push(u8::from(*v));
@@ -353,6 +361,78 @@ pub(crate) fn build_minimal_gguf(
     }
 
     buf
+}
+
+fn split_tensor_payloads(tensors: &[(&str, &[u64])]) -> Vec<Vec<u8>> {
+    tensors
+        .iter()
+        .enumerate()
+        .map(|(seed, (_, dims))| {
+            let elements = dims.iter().product::<u64>() as usize;
+            fixture_payload(GgufTensorType::F32, elements, seed as u64)
+        })
+        .collect()
+}
+
+/// A split GGUF as llama-gguf-split writes it: `{prefix}-0000K-of-0000N.gguf`,
+/// one F32 tensor per part, `metadata` in part 1 only, split.no / split.count
+/// u16 in every part, and split.tensors.count i32 in every part when
+/// `tensors_count`.
+pub(crate) fn write_split_gguf(
+    dir: &Path,
+    prefix: &str,
+    metadata: &[(&str, GgufMetaValue)],
+    tensors: &[(&str, &[u64])],
+    tensors_count: bool,
+) -> Vec<PathBuf> {
+    let count = tensors.len();
+    let payloads = split_tensor_payloads(tensors);
+    fs::create_dir_all(dir).unwrap();
+    (0..count)
+        .map(|part| {
+            let mut keys: Vec<(&str, GgufMetaValue)> = if part == 0 {
+                metadata.to_vec()
+            } else {
+                Vec::new()
+            };
+            keys.push(("split.no", GgufMetaValue::Uint16(part as u16)));
+            keys.push(("split.count", GgufMetaValue::Uint16(count as u16)));
+            if tensors_count {
+                keys.push(("split.tensors.count", GgufMetaValue::Int32(count as i32)));
+            }
+            let (name, dims) = tensors[part];
+            let path = dir.join(format!("{prefix}-{:05}-of-{count:05}.gguf", part + 1));
+            fs::write(
+                &path,
+                build_minimal_gguf(&keys, &[(name, dims, GgufTensorType::F32, &payloads[part])]),
+            )
+            .unwrap();
+            path
+        })
+        .collect()
+}
+
+/// The one file llama-gguf-split --merge makes of that split: every tensor,
+/// part 1's keys, split.count 0.
+pub(crate) fn write_merged_gguf(
+    path: &Path,
+    metadata: &[(&str, GgufMetaValue)],
+    tensors: &[(&str, &[u64])],
+) {
+    let payloads = split_tensor_payloads(tensors);
+    let mut keys = metadata.to_vec();
+    keys.push(("split.no", GgufMetaValue::Uint16(0)));
+    keys.push(("split.count", GgufMetaValue::Uint16(0)));
+    keys.push((
+        "split.tensors.count",
+        GgufMetaValue::Int32(tensors.len() as i32),
+    ));
+    let described: Vec<(&str, &[u64], GgufTensorType, &[u8])> = tensors
+        .iter()
+        .zip(&payloads)
+        .map(|((name, dims), payload)| (*name, *dims, GgufTensorType::F32, payload.as_slice()))
+        .collect();
+    fs::write(path, build_minimal_gguf(&keys, &described)).unwrap();
 }
 
 /// Header of a structurally complete standalone `qwen35moe` checkpoint:
