@@ -745,7 +745,7 @@ impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35MoeInner {
     ) -> Result<Self::PrefixState> {
         use crate::engine::backend::PagedPrefix;
         let seq = self.active_scheduled_seq.unwrap_or(0);
-        let candidate = self.paged_adapter.as_ref().map_or(0, |adapter| {
+        let live = self.paged_adapter.as_ref().map_or(0, |adapter| {
             crate::models::qwen3_5::dflash2_decode::reusable_paged_dflash2_prefix(
                 tokens,
                 reuse_cache,
@@ -755,16 +755,27 @@ impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35MoeInner {
                 self.dflash2_context.as_ref(),
             )
         });
-        self.dflash2_turn_state = None;
-        let prefix = self.prime_moe_prefix(
+        let (hit, stored) = crate::models::qwen3_5::dflash2_turn::resolve_dflash2_resume(
+            self,
             tokens,
+            reuse_cache,
             cache_salt,
-            Some(u32::try_from(candidate).unwrap_or(0)),
+            seq,
+            live,
         )?;
-        if prefix.effective_cached_prefix_len() == 0 {
+        let prefix = self.prime_moe_prefix(tokens, cache_salt, Some(hit))?;
+        let cached = prefix.effective_cached_prefix_len();
+        if cached == 0 {
             self.dflash2_context = None;
         }
+        crate::models::qwen3_5::dflash2_turn::use_resumed_replay_point(
+            self, tokens, stored, cached,
+        );
         Ok(prefix)
+    }
+
+    fn set_generation_suffix(&mut self, suffix: Option<std::sync::Arc<[u32]>>) {
+        self.dflash2_states.generation_suffix = suffix;
     }
 }
 
@@ -773,18 +784,14 @@ impl DFlash2Target for Qwen35MoeInner {
         self.dflash2.as_ref()
     }
 
-    fn dflash2_states(&self) -> &crate::models::qwen3_5::dflash2_state::flat::FlatStates {
+    fn dflash2_states(&self) -> &crate::models::qwen3_5::dflash2_state::paged::DFlash2States {
         &self.dflash2_states
     }
 
     fn dflash2_states_mut(
         &mut self,
-    ) -> &mut crate::models::qwen3_5::dflash2_state::flat::FlatStates {
+    ) -> &mut crate::models::qwen3_5::dflash2_state::paged::DFlash2States {
         &mut self.dflash2_states
-    }
-
-    fn memory_plan(&self) -> Option<&crate::engine::memory_plan::MemoryPlan> {
-        self.memory_plan.as_ref()
     }
 
     fn vision_cache(&self) -> &crate::vision::qwen::cache::VisionCache {
@@ -840,6 +847,30 @@ impl DFlash2Target for Qwen35MoeInner {
 
     fn marked_hit_blocks(&self, keep: crate::models::qwen3_5::dflash2_turn::Keep<'_>) -> u32 {
         Self::marked_hit_blocks(self, keep)
+    }
+
+    fn ladder_marks(&self) -> std::collections::HashSet<u64> {
+        Self::ladder_marks(self)
+    }
+    fn fresh_layer_caches(&self) -> Vec<crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache> {
+        self.fresh_dflash2_layer_caches()
+    }
+
+    fn adopt_parked_state(
+        &mut self,
+        caches: Vec<crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache>,
+        window: crate::models::qwen3_5::dflash2::DFlash2ContextCache,
+        history: Vec<u32>,
+    ) {
+        self.adopt_parked_dflash2_state(caches, window, history);
+    }
+
+    fn replay_state_exact(&self) -> bool {
+        self.dflash2_replay_state_exact()
+    }
+
+    fn dflash2_turn_state_clear(&mut self) {
+        self.dflash2_turn_state = None;
     }
 }
 
@@ -1179,5 +1210,35 @@ mod paged_dflash2_tests {
             "{}",
             error.reason
         );
+    }
+
+    /// The MoE turn parks its prompt's replay point once its blocks
+    /// register, and the next DFlash2 turn on that prefix resumes there
+    /// though the live window ends elsewhere (Splash `Cache::lookup`).
+    /// Mutation MS1 (the prime skips the parked-state lookup) → red (hit 0).
+    #[test]
+    fn moe_parked_replay_point_resumes_the_next_session() -> Result<()> {
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let a1 = prompt(40);
+        let mut ar_inner = tiny_paged_int8_moe_dflash_inner(0x5_8104);
+        let (reference, _) = paged_ar(&mut ar_inner, &a1, 12)?;
+        let mut inner = tiny_paged_int8_moe_dflash_inner(0x5_8104);
+        paged_dflash2(&mut inner, &a1, &reference, 2)?;
+        inner.finalize_paged_turn(true, 0);
+        let parked: Vec<usize> = inner
+            .dflash2_states
+            .store
+            .entries()
+            .map(|entry| entry.depth())
+            .collect();
+        assert_eq!(parked, vec![32]);
+        let mut a2 = a1[..32].to_vec();
+        a2.extend((0..20u32).map(|i| (i * 5 + 2) % VOCAB));
+        let prefix = inner.prime_dspark_prefix_state(&a2, true, 0)?;
+        assert_eq!(prefix.effective_cached_prefix_len(), 32);
+        let logits = inner.paged_prefill_with_draft_state(&a2[32..], &prefix, stream)?;
+        logits.eval();
+        Ok(())
     }
 }

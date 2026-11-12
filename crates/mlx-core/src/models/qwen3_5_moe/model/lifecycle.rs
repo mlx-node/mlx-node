@@ -65,7 +65,7 @@ impl Qwen35MoeInner {
 
         let dflash2_prefix = PrefixTracker::new(config.paged_block_size());
         let cache_recency = Arc::new(mlx_paged_attn::CacheRecency::new());
-        let dflash2_states = crate::models::qwen3_5::dflash2_state::flat::FlatStates::new(
+        let dflash2_states = crate::models::qwen3_5::dflash2_state::paged::DFlash2States::new(
             config.paged_block_size(),
             Arc::clone(&cache_recency),
         );
@@ -141,6 +141,9 @@ impl Qwen35MoeInner {
         if self.paged_adapter.is_some() {
             return Ok(());
         }
+        // A new pool is a new cache: a parked state's block names a hash of
+        // the old one.
+        self.dflash2_states.clear();
         let recurrent = self.config.recurrent_state_bytes();
         if !self.config.use_block_paged_cache.unwrap_or(true)
             || !crate::engine::persistence::compiled_forward_backend_available()
@@ -921,9 +924,37 @@ impl Qwen35MoeInner {
     /// Discard external-draft state whenever another cache lane takes ownership.
     pub(crate) fn invalidate_dflash2_context(&mut self, site: &'static str) {
         self.dflash2_context = None;
-        self.dflash2_states.live_anchor = None;
         self.dflash2_turn_state = None;
         self.dflash2_prefix.note_drop(site, DropKind::Invalidated);
+    }
+
+    /// Fresh per-layer caches for a parked DFlash2 state's install.
+    pub(crate) fn fresh_dflash2_layer_caches(&self) -> Vec<Qwen3_5LayerCache> {
+        fresh_moe_layer_caches(&self.config)
+    }
+
+    /// Puts the lane at a parked DFlash2 state's text lineage (Splash
+    /// `QwenStateStorage::restore`): an image delta or image keys of an
+    /// earlier turn would rotate or key the resumed text wrongly.
+    pub(crate) fn adopt_parked_dflash2_state(
+        &mut self,
+        caches: Vec<Qwen3_5LayerCache>,
+        window: crate::models::qwen3_5::dflash2::DFlash2ContextCache,
+        history: Vec<u32>,
+    ) {
+        self.caches = Some(caches);
+        self.dflash2_context = Some(window);
+        self.dflash2_turn_state = None;
+        self.cached_token_history = history;
+        self.cached_image_key = None;
+        self.cached_paged_image_token_positions.clear();
+        self.cached_rope_deltas = None;
+    }
+
+    /// The live GDN state agrees with its tokens and no image lineage rides
+    /// on it.
+    pub(crate) fn dflash2_replay_state_exact(&self) -> bool {
+        !self.paged_gdn_state_dirty && self.cached_paged_image_token_positions.is_empty()
     }
 
     fn clear_reuse_state(&mut self) {
@@ -965,6 +996,7 @@ impl Qwen35MoeInner {
             }
         }
         self.caches = None;
+        self.dflash2_states.drop_unregistered();
         self.clear_reuse_state();
         self.flat_mtp_caches_desynced = false;
     }

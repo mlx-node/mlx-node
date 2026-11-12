@@ -7,7 +7,6 @@ use std::fmt::Write as _;
 
 use crate::array::DType;
 use crate::transformer::KvFormat;
-use crate::transformer::paged_kv_cache_adapter::PagedPrefillMemorySnapshot;
 
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
@@ -997,14 +996,6 @@ impl MemoryPlan {
         self.hard_budget_bytes
             .saturating_sub(PIPELINE_RESERVE_BYTES)
             .saturating_sub(RUNTIME_OVERHEAD_RESERVE_BYTES)
-    }
-
-    /// The ceiling less what is live now; `None` when nothing is readable.
-    /// MLX's cache is reclaimable. Registered pool bytes hold every pool's
-    /// staging, and MLX's active counter sees neither.
-    pub(crate) fn live_headroom(&self, snapshot: PagedPrefillMemorySnapshot) -> Option<u64> {
-        crate::transformer::paged_policy::live_headroom(snapshot, Some(self.ceiling_bytes()))
-            .selected_bytes
     }
 
     /// Splash's log line for a `--max-memory` above the automatic budget.

@@ -1409,6 +1409,7 @@ impl Qwen35Inner {
             draft.invalidate_compiled();
         }
         self.dflash2_states.clear();
+        self.sync_gdn_state_marks();
         result
     }
 

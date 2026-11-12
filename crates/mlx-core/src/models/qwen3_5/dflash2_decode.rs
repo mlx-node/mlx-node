@@ -5,9 +5,7 @@ use napi::bindgen_prelude::*;
 use crate::array::{DType, MxArray};
 use crate::engine::backend::{DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput};
 use crate::engine::memory_plan::EXTENT_TARGET_BYTES;
-use crate::stream::WiredLimitContext;
 use crate::transformer::KvFormat;
-use crate::transformer::paged_kv_cache_adapter::PagedPrefillMemorySnapshot;
 use crate::transformer::paged_policy::{
     estimate_paged_pool_sdpa_bytes_with_portable, estimate_varlen_paged_attention_bytes,
 };
@@ -90,28 +88,6 @@ fn dflash2_gdn_blob_enabled() -> bool {
     std::env::var("MLX_DFLASH2_GDN_BLOB")
         .ok()
         .is_none_or(|value| value.trim() != "0")
-}
-
-pub(crate) fn dflash2_memory_snapshot() -> PagedPrefillMemorySnapshot {
-    let (mut active, mut cached, mut limit) = (0u64, 0u64, 0u64);
-    // SAFETY: each probe writes one u64 through a valid pointer and reports
-    // failure through its return code.
-    let allocator_ok = unsafe {
-        mlx_sys::mlx_get_active_memory(&mut active) == 0
-            && mlx_sys::mlx_get_cache_memory(&mut cached) == 0
-            && mlx_sys::mlx_get_memory_limit(&mut limit) == 0
-            && limit > 0
-    };
-    let recommended = WiredLimitContext::get_max_working_set_size() as u64;
-    PagedPrefillMemorySnapshot {
-        allocator_active_bytes: allocator_ok.then_some(active),
-        allocator_cached_bytes: allocator_ok.then_some(cached),
-        allocator_limit_bytes: allocator_ok.then_some(limit),
-        metal_recommended_working_set_bytes: (recommended > 0).then_some(recommended),
-        metal_current_allocated_bytes: None,
-        // Private paged pools are invisible to MLX's active counter.
-        paged_pool_allocated_bytes: Some(crate::cache_limit::coordinator().registered_pool_bytes()),
-    }
 }
 
 /// Blocks one growth adds to a runway paged pool: the whole blocks nearest
@@ -1075,7 +1051,7 @@ impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35Inner {
     ) -> Result<Self::PrefixState> {
         use crate::engine::backend::PagedPrefix;
         let seq = self.active_scheduled_seq.unwrap_or(0);
-        let candidate = self.paged_adapter.as_ref().map_or(0, |adapter| {
+        let live = self.paged_adapter.as_ref().map_or(0, |adapter| {
             reusable_paged_dflash2_prefix(
                 tokens,
                 reuse_cache,
@@ -1085,16 +1061,27 @@ impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35Inner {
                 self.dflash2_context.as_ref(),
             )
         });
-        self.dflash2_turn_state = None;
-        let prefix = self.prime_dense_prefix(
+        let (hit, stored) = crate::models::qwen3_5::dflash2_turn::resolve_dflash2_resume(
+            self,
             tokens,
+            reuse_cache,
             cache_salt,
-            Some(u32::try_from(candidate).unwrap_or(0)),
+            seq,
+            live,
         )?;
-        if prefix.effective_cached_prefix_len() == 0 {
+        let prefix = self.prime_dense_prefix(tokens, cache_salt, Some(hit))?;
+        let cached = prefix.effective_cached_prefix_len();
+        if cached == 0 {
             self.dflash2_context = None;
         }
+        crate::models::qwen3_5::dflash2_turn::use_resumed_replay_point(
+            self, tokens, stored, cached,
+        );
         Ok(prefix)
+    }
+
+    fn set_generation_suffix(&mut self, suffix: Option<std::sync::Arc<[u32]>>) {
+        self.dflash2_states.generation_suffix = suffix;
     }
 }
 
@@ -1103,18 +1090,14 @@ impl DFlash2Target for Qwen35Inner {
         self.dflash2.as_ref()
     }
 
-    fn dflash2_states(&self) -> &crate::models::qwen3_5::dflash2_state::flat::FlatStates {
+    fn dflash2_states(&self) -> &crate::models::qwen3_5::dflash2_state::paged::DFlash2States {
         &self.dflash2_states
     }
 
     fn dflash2_states_mut(
         &mut self,
-    ) -> &mut crate::models::qwen3_5::dflash2_state::flat::FlatStates {
+    ) -> &mut crate::models::qwen3_5::dflash2_state::paged::DFlash2States {
         &mut self.dflash2_states
-    }
-
-    fn memory_plan(&self) -> Option<&crate::engine::memory_plan::MemoryPlan> {
-        self.memory_plan.as_ref()
     }
 
     fn vision_cache(&self) -> &crate::vision::qwen::cache::VisionCache {
@@ -1170,6 +1153,30 @@ impl DFlash2Target for Qwen35Inner {
 
     fn marked_hit_blocks(&self, keep: crate::models::qwen3_5::dflash2_turn::Keep<'_>) -> u32 {
         Self::marked_hit_blocks(self, keep)
+    }
+
+    fn ladder_marks(&self) -> std::collections::HashSet<u64> {
+        Self::ladder_marks(self)
+    }
+    fn fresh_layer_caches(&self) -> Vec<crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache> {
+        self.fresh_dflash2_layer_caches()
+    }
+
+    fn adopt_parked_state(
+        &mut self,
+        caches: Vec<crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache>,
+        window: crate::models::qwen3_5::dflash2::DFlash2ContextCache,
+        history: Vec<u32>,
+    ) {
+        self.adopt_parked_dflash2_state(caches, window, history);
+    }
+
+    fn replay_state_exact(&self) -> bool {
+        self.dflash2_replay_state_exact()
+    }
+
+    fn dflash2_turn_state_clear(&mut self) {
+        self.dflash2_turn_state = None;
     }
 }
 
@@ -1475,6 +1482,17 @@ mod paged_dflash2_tests {
         tokens: Vec<u32>,
         cursor: u32,
         adopts: usize,
+        cached: usize,
+        logits: Vec<Vec<u32>>,
+    }
+
+    fn bits(array: &MxArray) -> Result<Vec<u32>> {
+        let f = array.astype(DType::Float32)?;
+        f.eval();
+        Ok(f.to_float32()?
+            .iter()
+            .map(|value| value.to_bits())
+            .collect())
     }
 
     /// Paged DFlash2 cycles where the first `correct` proposals of each are
@@ -1489,9 +1507,11 @@ mod paged_dflash2_tests {
         PAGED_ADOPTS.with(|count| count.set(0));
         let n = reference.len();
         let prefix = inner.prime_dspark_prefix_state(prompt, true, 0)?;
-        let suffix = prompt[prefix.effective_cached_prefix_len()..].to_vec();
+        let cached = prefix.effective_cached_prefix_len();
+        let suffix = prompt[cached..].to_vec();
         let logits =
             inner.paged_prefill_with_draft_state(&suffix, &prefix, Stream::generation())?;
+        let mut all_logits = vec![bits(&logits)?];
         let mut generated = argmax_rows(&logits)?;
         let params = crate::engine::extract_chat_params(&crate::engine::types::ChatConfig {
             temperature: Some(0.0),
@@ -1515,7 +1535,9 @@ mod paged_dflash2_tests {
                     (reference_id + 1) % VOCAB
                 });
             }
-            let rows = argmax_rows(&step.verify(&ids)?.logits)?;
+            let verified = step.verify(&ids)?.logits;
+            all_logits.push(bits(&verified)?);
+            let rows = argmax_rows(&verified)?;
             assert_eq!(rows.len(), ids.len(), "the driver sees 1 + L logits rows");
             let mut accepted = 0;
             while accepted < l_cap && rows[accepted] == ids[accepted + 1] {
@@ -1530,6 +1552,8 @@ mod paged_dflash2_tests {
             tokens: generated,
             cursor: cursor(inner),
             adopts: PAGED_ADOPTS.with(std::cell::Cell::get),
+            cached,
+            logits: all_logits,
         })
     }
 
@@ -1985,6 +2009,174 @@ mod paged_dflash2_tests {
             "the second prefill runs only the 9 new tokens"
         );
         assert_eq!(spec_live?, ar_live?);
+        Ok(())
+    }
+
+    fn block_ids(inner: &Qwen35Inner) -> Vec<u32> {
+        inner
+            .paged_adapter
+            .as_ref()
+            .and_then(|adapter| adapter.block_table())
+            .map_or_else(Vec::new, |table| table.block_ids())
+    }
+
+    fn parked_depths(inner: &Qwen35Inner) -> Vec<usize> {
+        inner
+            .dflash2_states
+            .store
+            .entries()
+            .map(|entry| entry.depth())
+            .collect()
+    }
+
+    /// A1 parks its prompt's replay point (208) on its own chain; an
+    /// unrelated Q then runs on a pool that must grow for it; A2 (A1's
+    /// prompt to 208, then new text) resumes from the parked state on A1's
+    /// blocks on the installed GDN cell, emits the paged AR tokens of A2,
+    /// and its teacher-forced DFlash2 logits equal those of a run with no Q
+    /// in between, bit for bit.
+    /// Mutation MK1 (parked states mark no block) → red (Q's prefill takes
+    /// A1's chain instead of growing the pool; A2's install fails).
+    /// Mutation GI1 (the install leaves the GDN slots fresh) → red (A2
+    /// replays the GDN prefix).
+    #[test]
+    fn parked_anchor_resume_matches_an_uninterrupted_run() -> Result<()> {
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        use crate::models::qwen3_5::model::dflash2_park_tests::{install_pool, passing_probe};
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let dflash2 = DecoderPlan::Speculative(SpeculativeKind::DraftModel);
+        let a1 = prompt(210);
+        let q: Vec<u32> = (0..210u32).map(|i| (i * 5 + 1) % VOCAB).collect();
+        let mut a2 = a1[..208].to_vec();
+        a2.extend((0..30u32).map(|i| (i * 3 + 2) % VOCAB));
+        // The AR reference resumes A2 at 208 through A1's ladder rung, so
+        // both sides read A1's rows back from the int8 pool.
+        let mut ar = tiny_paged_int8_dflash_inner(0x5_8101);
+        install_pool(&mut ar, 16, 64, passing_probe())?;
+        whole_turn(&mut ar, &a1, dflash2)?;
+        ar.dflash2_states.clear();
+        ar.sync_gdn_state_marks();
+        let (reference, _) = paged_ar(&mut ar, &a2, 24)?;
+        let run = |with_q: bool| -> Result<(Run, Vec<u32>, Vec<u32>)> {
+            let mut inner = tiny_paged_int8_dflash_inner(0x5_8101);
+            install_pool(&mut inner, 16, 64, passing_probe())?;
+            whole_turn(&mut inner, &a1, dflash2)?;
+            let chain = block_ids(&inner)[..13].to_vec();
+            inner.drop_gdn_states_for_test();
+            assert_eq!(parked_depths(&inner), vec![208]);
+            if with_q {
+                whole_turn(&mut inner, &q, dflash2)?;
+            }
+            let run = paged_dflash2(&mut inner, &a2, &reference, 3)?;
+            assert_eq!(
+                inner.last_gdn_prefix_prepare_state, "last_history",
+                "A2 resumes on the installed GDN cell, with no replay"
+            );
+            Ok((run, chain, block_ids(&inner)))
+        };
+        let (x, x_chain, x_ids) = run(true)?;
+        let (y, y_chain, y_ids) = run(false)?;
+        assert_eq!((x.cached, y.cached), (208, 208));
+        assert_eq!(x_ids[..13], x_chain[..], "A2 resumes on A1's blocks");
+        assert_eq!(y_ids[..13], y_chain[..]);
+        assert_eq!(
+            x.tokens[..reference.len()],
+            reference[..],
+            "A2 left the AR tokens"
+        );
+        assert_eq!(x.tokens, y.tokens);
+        assert!(x.logits == y.logits, "teacher-forced logits differ");
+        Ok(())
+    }
+
+    /// Two sessions on one prefix share its blocks: B resumes from A1's
+    /// parked replay point and writes only its own tail.
+    /// Mutation CP1 (a stored-state prepare skips the lookup) → red (B
+    /// re-prefills its own copy: no shared ids, 31 >= 30 blocks).
+    #[test]
+    fn two_sessions_share_the_parked_prefix_blocks() -> Result<()> {
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let dflash2 = DecoderPlan::Speculative(SpeculativeKind::DraftModel);
+        let a1 = prompt(210);
+        let mut b = a1[..208].to_vec();
+        b.extend((0..40u32).map(|i| (i * 11 + 4) % VOCAB));
+        let mut inner = tiny_paged_int8_dflash_inner(0x5_8102);
+        whole_turn(&mut inner, &a1, dflash2)?;
+        let a1_ids = block_ids(&inner);
+        assert_eq!(a1_ids.len(), 15);
+        let allocated = |inner: &Qwen35Inner| {
+            inner
+                .paged_adapter
+                .as_ref()
+                .expect("pool")
+                .block_telemetry()
+                .expect("telemetry")
+                .allocated_blocks as usize
+        };
+        whole_turn(&mut inner, &b, dflash2)?;
+        let b_ids = block_ids(&inner);
+        assert_eq!(b_ids[..13], a1_ids[..13], "B sits on A1's chain");
+        assert!(
+            allocated(&inner) < 2 * a1_ids.len(),
+            "{} blocks for two sessions",
+            allocated(&inner)
+        );
+        Ok(())
+    }
+
+    /// The tapped prefill ends a chunk at the prompt's replay point (Splash
+    /// `Engine::workEndOf`) and parks the GDN cell and draft window there,
+    /// before the generation prompt (Splash `Engine::promptReplayBoundary`).
+    /// A twin prompt cut right after that row parks the same state bits.
+    /// Mutation CA1 (the capture row is no chunk break) → red (no chunk ends
+    /// at 192, nothing parked).
+    #[test]
+    fn tapped_prefill_parks_the_replay_point() -> Result<()> {
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let suffix = [11u32, 12, 13, 14, 15];
+        let mut full = prompt(205);
+        full.extend(suffix);
+        let prefill = |tokens: &[u32]| -> Result<(Vec<usize>, Qwen35Inner)> {
+            let mut inner = tiny_paged_int8_dflash_inner(0x5_8103);
+            inner.dflash2_states.generation_suffix = Some(std::sync::Arc::from(&suffix[..]));
+            PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(128)));
+            PREFILL_CHUNK_BLOCKS.with(|log| *log.borrow_mut() = Some(Vec::new()));
+            let result = (|| -> Result<()> {
+                let prefix = inner.prime_dspark_prefix_state(tokens, true, 0)?;
+                inner
+                    .paged_prefill_with_draft_state(tokens, &prefix, stream)?
+                    .eval();
+                Ok(())
+            })();
+            PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+            let seen = PREFILL_CHUNK_BLOCKS
+                .with(|log| log.borrow_mut().take())
+                .unwrap_or_default();
+            result?;
+            Ok((seen, inner))
+        };
+        let (seen, inner) = prefill(&full)?;
+        assert_eq!(seen, vec![8, 12, 13, 14], "chunks end at 128, 192, 208");
+        let (twin_seen, twin) = prefill(&full[..193])?;
+        assert_eq!(twin_seen, vec![8, 12, 13]);
+        let anchor_bits = |inner: &Qwen35Inner| -> Result<Vec<Vec<u32>>> {
+            let entry = inner
+                .dflash2_states
+                .store
+                .entries()
+                .next()
+                .ok_or_else(|| Error::from_reason("no parked state"))?;
+            assert_eq!(entry.tokens(), &full[..192]);
+            assert_eq!(entry.state().window.logical_len(), 192);
+            let mut arrays = Vec::new();
+            entry.state().collect_arrays(&mut arrays);
+            arrays.into_iter().map(bits).collect()
+        };
+        assert!(anchor_bits(&inner)? == anchor_bits(&twin)?);
         Ok(())
     }
 }

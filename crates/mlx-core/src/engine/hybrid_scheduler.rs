@@ -181,9 +181,6 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn state_reach_bytes(&self, _in_use: bool) -> u64 {
         0
     }
-    fn compact_one_state(&mut self) -> bool {
-        false
-    }
     fn oldest_state_unit(
         &self,
         _at_cap: bool,
@@ -1919,10 +1916,6 @@ impl<B: HybridSchedulerBackend> KvReclaim for SchedReclaim<'_, B> {
                     .saturating_add(rows)
             },
         }
-    }
-
-    fn compact_one(&mut self) -> bool {
-        self.state.inner.compact_one_state()
     }
 
     fn oldest_state(&self, at_cap: bool, skip: &HashSet<UnitKey>, in_use: bool) -> Option<Unit> {

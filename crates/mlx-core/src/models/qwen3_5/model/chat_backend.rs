@@ -92,7 +92,6 @@ impl ChatBackend for Qwen35Inner {
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
-        self.dflash2_states.live_anchor = None;
         self.dflash2_prefix
             .note_drop(reset_drop_site(scope), DropKind::Invalidated);
         match scope {

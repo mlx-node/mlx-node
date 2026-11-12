@@ -515,6 +515,11 @@ impl BlockAllocator {
         })
     }
 
+    /// Whether the prefix cache holds a block under `hash`.
+    pub fn is_cached(&self, hash: u64) -> bool {
+        self.prefix_cache.contains_key(&hash)
+    }
+
     /// Whether `hash` is cached and only the cache holds it.
     pub fn is_cache_only(&self, hash: u64) -> bool {
         self.ref_count_of(hash) == Some(1)

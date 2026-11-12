@@ -30,6 +30,21 @@ pub(crate) fn replay_point(tokens: &[u32], suffix: &[u32], block_size: usize) ->
     Some(body - body % block_size)
 }
 
+/// Splash `Engine::promptReplayBoundary`: the last whole block before the
+/// generation prompt, `(len - max(suffix, 1)) / bs * bs`. A prompt that does
+/// not end with the suffix has a one-token tail.
+pub(crate) fn prompt_replay_boundary(
+    tokens: &[u32],
+    suffix: Option<&[u32]>,
+    block_size: usize,
+) -> usize {
+    let tail = suffix
+        .filter(|suffix| !suffix.is_empty() && tokens.ends_with(suffix))
+        .map_or(1, <[u32]>::len);
+    let body = tokens.len().saturating_sub(tail);
+    body - body % block_size.max(1)
+}
+
 /// Splash `MAX_THINKING_END_TOKENS` (engine `kMaximumThinkingEndTokens`): the most
 /// tokens a thinking budget may end thinking with.
 pub(crate) const MAX_THINKING_END_TOKENS: usize = 64;

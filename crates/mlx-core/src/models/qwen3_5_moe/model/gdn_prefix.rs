@@ -1173,15 +1173,24 @@ impl Qwen35MoeInner {
         dropped
     }
 
-    /// Each ladder entry marks its final block, so `allocate` never takes
-    /// the chain a state restores through.
+    /// The blocks the ladder rungs mark.
+    pub(crate) fn ladder_marks(&self) -> HashSet<u64> {
+        self.gdn_prefix_checkpoints
+            .iter()
+            .map(|entry| entry.final_block_hash)
+            .collect()
+    }
+
+    /// Each ladder entry and parked DFlash2 state marks the block it sits
+    /// on, so `allocate` never takes the chain a state restores through
+    /// (Splash `StateMarks`).
     pub(crate) fn sync_gdn_state_marks(&self) {
         if let Some(adapter) = self.paged_adapter.as_ref() {
-            adapter.set_state_marks(
-                self.gdn_prefix_checkpoints
-                    .iter()
-                    .map(|entry| entry.final_block_hash),
-            );
+            let rungs = self
+                .gdn_prefix_checkpoints
+                .iter()
+                .map(|entry| entry.final_block_hash);
+            adapter.set_state_marks(rungs.chain(self.dflash2_states.store.marks()));
         }
     }
 

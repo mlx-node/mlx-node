@@ -7725,6 +7725,11 @@ impl PagedKVCacheAdapter {
         self.allocator_guard().tip_marks()
     }
 
+    /// Whether the prefix cache holds a block under `hash`.
+    pub(crate) fn prefix_cached(&self, hash: u64) -> bool {
+        self.allocator_guard().is_cached(hash)
+    }
+
     pub(crate) fn cache_only_count(&self, hashes: impl IntoIterator<Item = u64>) -> u32 {
         self.allocator_guard().cache_only_count(hashes)
     }
