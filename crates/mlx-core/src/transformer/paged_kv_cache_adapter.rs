@@ -272,6 +272,16 @@ impl KvTensorMeta {
     }
 }
 
+/// The MLX dtype of the rows a `cache_dtype` pool is written and read with.
+fn metal_io_dtype(cache_dtype: mlx_paged_attn::metal::MetalDtype) -> Result<DType, String> {
+    match cache_dtype.io_dtype() {
+        mlx_paged_attn::metal::MetalDtype::Float16 => Ok(DType::Float16),
+        mlx_paged_attn::metal::MetalDtype::BFloat16 => Ok(DType::BFloat16),
+        mlx_paged_attn::metal::MetalDtype::Float32 => Ok(DType::Float32),
+        _ => Err(format!("{cache_dtype:?} cache has no fixed io dtype")),
+    }
+}
+
 /// Validate that `keys`/`values` metadata is compatible with `config` for a
 /// paged `reshape_and_cache` write. Pure CPU — no pool / Metal access, no
 /// MLX runtime — so it can be unit-tested on any platform, including
@@ -293,12 +303,15 @@ impl KvTensorMeta {
 ///    `write_kv` would dispatch `reshape_and_cache_kv_float_cache_float`
 ///    against a half-sized buffer and corrupt the cache (or write
 ///    out-of-bounds on the GPU).
+/// 6. A non-FP8 cache takes rows of its io dtype only (an int8 cache takes
+///    bf16 rows, Splash io is always bf16).
 ///
 /// Returns `KvInputInfo { num_tokens, input_metal_dtype }` on success.
 pub(crate) fn validate_kv_input(
     keys: &KvTensorMeta,
     values: &KvTensorMeta,
     config: &PagedAttentionConfig,
+    cache_dtype: mlx_paged_attn::metal::MetalDtype,
 ) -> Result<KvInputInfo, String> {
     // Shape sanity. The kernel re-derives its strides from
     // `config.num_kv_heads * config.head_size`; passing e.g.
@@ -400,6 +413,16 @@ pub(crate) fn validate_kv_input(
                 "update_keys_values: input dtype {other:?} not supported by \
                  LayerKVPool (which uses 2-byte cache elements). Supported: \
                  Float16, BFloat16."
+            ));
+        }
+    }
+    if !cache_dtype.is_fp8() {
+        let io_dtype = metal_io_dtype(cache_dtype)?;
+        if keys.dtype != io_dtype {
+            return Err(format!(
+                "update_keys_values: input dtype {:?} is not the {io_dtype:?} rows a \
+                 {cache_dtype:?} cache stores",
+                keys.dtype
             ));
         }
     }
@@ -1000,10 +1023,10 @@ pub struct PagedKVCacheAdapter {
     cold_capture_budget: ColdCaptureBudget,
 
     /// Shared `[1]` fp32 `1.0` scale array returned by
-    /// [`Self::k_scale_array`] / [`Self::v_scale_array`]. The decode write
-    /// path requests a K and a V scale per layer per token, so allocating a
-    /// fresh constant array at each call produced ~2×num_layers node
-    /// creations per step.
+    /// [`Self::k_scale_array`] / [`Self::v_scale_array`] for a pool without
+    /// scale planes. The decode write path requests a K and a V scale per
+    /// layer per token, so allocating a fresh constant array at each call
+    /// produced ~2×num_layers node creations per step.
     #[cfg(target_os = "macos")]
     unit_kv_scale_array: MxArray,
 
@@ -1023,11 +1046,11 @@ pub struct PagedKVCacheAdapter {
     #[cfg(target_os = "macos")]
     meta: PagedMetadataCache,
 
-    /// Per-layer MLX views of the K/V pool that carry native
-    /// `paged_kv_write` dependencies. When a native write returns
-    /// `(k_pool', v_pool')`, later MLX paged-attention calls must consume
-    /// those arrays instead of fresh raw pool views, otherwise MLX has no
-    /// write-before-read graph edge.
+    /// Per-layer MLX views of the K/V pool (and an int8 pool's scale
+    /// planes) that carry native `paged_kv_write` dependencies. When a
+    /// native write returns `(k_pool', v_pool', k_scale', v_scale')`, later
+    /// MLX paged-attention calls must consume those arrays instead of fresh
+    /// raw pool views, otherwise MLX has no write-before-read graph edge.
     #[cfg(target_os = "macos")]
     native_pool_arrays: Vec<Option<NativePoolArrays>>,
 
@@ -1078,10 +1101,23 @@ pub struct PagedKVCacheAdapter {
     grow_headroom_probe_override: Option<Arc<dyn Fn(u32) -> Result<u32, String> + Send + Sync>>,
 }
 
+/// One layer's pool arrays as a native write consumes and returns them.
+/// The scales are the int8 pool's `[num_blocks, num_kv_heads, block_size]`
+/// f32 planes (Splash `splash_q8_scale_index`), else the unit `[1]` array.
+#[cfg(target_os = "macos")]
+struct PoolLayerArrays {
+    key: MxArray,
+    value: MxArray,
+    k_scale: MxArray,
+    v_scale: MxArray,
+}
+
 #[cfg(target_os = "macos")]
 struct NativePoolArrays {
     key: MxArray,
     value: MxArray,
+    k_scale: MxArray,
+    v_scale: MxArray,
     dirty: bool,
     /// [`LayerKVPool::generation`] the views were built against. A grow
     /// swaps the pool's Metal buffers, so any consumer must rebuild when
@@ -3752,11 +3788,27 @@ impl PagedKVCacheAdapter {
         MxArray::from_handle(raw, "value_pool_array").map_err(|e| format!("value_pool_array: {e}"))
     }
 
+    /// The K and V scale planes of `layer_idx` as fresh f32 views, or the
+    /// unit `[1]` array for a pool without scale planes.
     #[cfg(target_os = "macos")]
-    fn native_pool_arrays_for_layer(
-        &mut self,
-        layer_idx: u32,
-    ) -> Result<(MxArray, MxArray), String> {
+    fn raw_scale_arrays(&self, layer_idx: u32) -> Result<(MxArray, MxArray), String> {
+        if self.layer_kv_pool.cache_dtype().scale_bytes() == 0 {
+            return Ok((
+                self.unit_kv_scale_array.clone(),
+                self.unit_kv_scale_array.clone(),
+            ));
+        }
+        let key = self.layer_kv_pool.key_scale_array_raw(layer_idx)?;
+        let key = MxArray::from_handle(key, "key_scale_array")
+            .map_err(|e| format!("key_scale_array: {e}"))?;
+        let value = self.layer_kv_pool.value_scale_array_raw(layer_idx)?;
+        let value = MxArray::from_handle(value, "value_scale_array")
+            .map_err(|e| format!("value_scale_array: {e}"))?;
+        Ok((key, value))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_pool_arrays_for_layer(&mut self, layer_idx: u32) -> Result<PoolLayerArrays, String> {
         let idx = layer_idx as usize;
         if idx >= self.layer_kv_pool.num_layers() {
             return Err(format!(
@@ -3774,9 +3826,12 @@ impl PagedKVCacheAdapter {
             // adapter sharing it) and the cached views wrap dead buffers.
             let key = self.raw_key_pool_array(layer_idx)?;
             let value = self.raw_value_pool_array(layer_idx)?;
+            let (k_scale, v_scale) = self.raw_scale_arrays(layer_idx)?;
             self.native_pool_arrays[idx] = Some(NativePoolArrays {
                 key,
                 value,
+                k_scale,
+                v_scale,
                 dirty: false,
                 generation: pool_generation,
             });
@@ -3786,15 +3841,19 @@ impl PagedKVCacheAdapter {
             .get(idx)
             .and_then(|arrays| arrays.as_ref())
             .ok_or_else(|| "native pool arrays initialized above".to_string())?;
-        Ok((state.key.clone(), state.value.clone()))
+        Ok(PoolLayerArrays {
+            key: state.key.clone(),
+            value: state.value.clone(),
+            k_scale: state.k_scale.clone(),
+            v_scale: state.v_scale.clone(),
+        })
     }
 
     #[cfg(target_os = "macos")]
     fn replace_native_pool_arrays(
         &mut self,
         layer_idx: u32,
-        key: MxArray,
-        value: MxArray,
+        arrays: PoolLayerArrays,
     ) -> Result<(), String> {
         let idx = layer_idx as usize;
         if idx >= self.native_pool_arrays.len() {
@@ -3805,12 +3864,64 @@ impl PagedKVCacheAdapter {
             ));
         }
         self.native_pool_arrays[idx] = Some(NativePoolArrays {
-            key,
-            value,
+            key: arrays.key,
+            value: arrays.value,
+            k_scale: arrays.k_scale,
+            v_scale: arrays.v_scale,
             dirty: true,
             generation: self.layer_kv_pool.generation(),
         });
         Ok(())
+    }
+
+    /// Adopt the four outputs of `mlx_paged_kv_write_forward` as the
+    /// layer's pool arrays. `Ok(false)` (outputs freed) when the call
+    /// failed. A pool without scale planes keeps the unit scale array: its
+    /// scale outputs alias that `[1]` input.
+    #[cfg(target_os = "macos")]
+    fn adopt_native_write(
+        &mut self,
+        layer_idx: u32,
+        ok: bool,
+        outputs: [*mut mlx_sys::mlx_array; 4],
+    ) -> Result<bool, String> {
+        if !ok || outputs.iter().any(|output| output.is_null()) {
+            for output in outputs {
+                if !output.is_null() {
+                    // SAFETY: a non-null output is an owned handle the FFI
+                    // call returned and nothing else holds.
+                    unsafe { mlx_sys::mlx_array_delete(output) };
+                }
+            }
+            return Ok(false);
+        }
+        let [key, value, k_scale, v_scale] = outputs;
+        let key = MxArray::from_handle(key, "paged_kv_write_forward k_pool");
+        let value = MxArray::from_handle(value, "paged_kv_write_forward v_pool");
+        let k_scale = MxArray::from_handle(k_scale, "paged_kv_write_forward k_scale");
+        let v_scale = MxArray::from_handle(v_scale, "paged_kv_write_forward v_scale");
+        let key = key.map_err(|e| format!("paged_kv_write k_pool output: {e}"))?;
+        let value = value.map_err(|e| format!("paged_kv_write v_pool output: {e}"))?;
+        let k_scale = k_scale.map_err(|e| format!("paged_kv_write k_scale output: {e}"))?;
+        let v_scale = v_scale.map_err(|e| format!("paged_kv_write v_scale output: {e}"))?;
+        let (k_scale, v_scale) = if self.layer_kv_pool.cache_dtype().scale_bytes() == 0 {
+            (
+                self.unit_kv_scale_array.clone(),
+                self.unit_kv_scale_array.clone(),
+            )
+        } else {
+            (k_scale, v_scale)
+        };
+        self.replace_native_pool_arrays(
+            layer_idx,
+            PoolLayerArrays {
+                key,
+                value,
+                k_scale,
+                v_scale,
+            },
+        )?;
+        Ok(true)
     }
 
     #[cfg(target_os = "macos")]
@@ -3893,6 +4004,8 @@ impl PagedKVCacheAdapter {
                 dirty_layers.push(layer_idx);
                 arrays.push(state.key.clone());
                 arrays.push(state.value.clone());
+                arrays.push(state.k_scale.clone());
+                arrays.push(state.v_scale.clone());
             }
         }
         if arrays.is_empty() {
@@ -3948,8 +4061,12 @@ impl PagedKVCacheAdapter {
         if !state.dirty {
             return Ok(());
         }
-        let key = state.key.clone();
-        let value = state.value.clone();
+        let pending = [
+            state.key.clone(),
+            state.value.clone(),
+            state.k_scale.clone(),
+            state.v_scale.clone(),
+        ];
         let trace_enabled = inference_trace_enabled();
         let trace_start = trace_enabled.then(Instant::now);
         if trace_enabled {
@@ -3958,7 +4075,8 @@ impl PagedKVCacheAdapter {
                 layer_idx
             ));
         }
-        MxArray::eval_arrays(&[&key, &value])
+        let refs: Vec<&MxArray> = pending.iter().collect();
+        MxArray::eval_arrays(&refs)
             .map_err(|e| format!("eval_pending_pool_write_for_layer: {e}"))?;
         if let Some(Some(state)) = self.native_pool_arrays.get_mut(idx) {
             state.dirty = false;
@@ -3979,6 +4097,7 @@ impl PagedKVCacheAdapter {
             mlx_paged_attn::metal::MetalDtype::Float16 => Ok(0),
             mlx_paged_attn::metal::MetalDtype::BFloat16 => Ok(1),
             mlx_paged_attn::metal::MetalDtype::UChar => Ok(2),
+            mlx_paged_attn::metal::MetalDtype::Int8 => Ok(3),
             mlx_paged_attn::metal::MetalDtype::Float32 => {
                 Err("Float32 KV cache is unsupported".to_string())
             }
@@ -4053,7 +4172,12 @@ impl PagedKVCacheAdapter {
         //    would silently corrupt the cache or write OOB on the GPU.
         let keys_meta = KvTensorMeta::from_array(keys, "keys")?;
         let values_meta = KvTensorMeta::from_array(values, "values")?;
-        let info = validate_kv_input(&keys_meta, &values_meta, self.layer_kv_pool.config())?;
+        let info = validate_kv_input(
+            &keys_meta,
+            &values_meta,
+            self.layer_kv_pool.config(),
+            self.layer_kv_pool.cache_dtype(),
+        )?;
         let num_tokens = info.num_tokens;
         if num_tokens == 0 {
             // Nothing to write — silently succeed rather than dispatch
@@ -4232,7 +4356,12 @@ impl PagedKVCacheAdapter {
 
         let keys_meta = KvTensorMeta::from_array(keys, "keys")?;
         let values_meta = KvTensorMeta::from_array(values, "values")?;
-        let info = validate_kv_input(&keys_meta, &values_meta, self.layer_kv_pool.config())?;
+        let info = validate_kv_input(
+            &keys_meta,
+            &values_meta,
+            self.layer_kv_pool.config(),
+            self.layer_kv_pool.cache_dtype(),
+        )?;
         Ok((info.num_tokens > 0).then_some(info.num_tokens))
     }
 
@@ -4268,40 +4397,35 @@ impl PagedKVCacheAdapter {
             ));
         }
 
-        let (k_pool, v_pool) = self.native_pool_arrays_for_layer(layer_idx)?;
-        let k_scale = self.k_scale_array(layer_idx)?;
-        let v_scale = self.v_scale_array(layer_idx)?;
+        let pool = self.native_pool_arrays_for_layer(layer_idx)?;
         let kv_dtype_raw = self.kv_dtype_raw()?;
 
         let ffi_trace_start = detail_enabled.then(Instant::now);
         let mut out_k_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
         let mut out_v_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_k_scale: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_v_scale: *mut mlx_sys::mlx_array = std::ptr::null_mut();
         let ok = unsafe {
             mlx_sys::mlx_paged_kv_write_forward(
-                k_pool.as_raw_ptr(),
-                v_pool.as_raw_ptr(),
+                pool.key.as_raw_ptr(),
+                pool.value.as_raw_ptr(),
                 keys.as_raw_ptr(),
                 values.as_raw_ptr(),
                 slot_mapping.as_raw_ptr(),
-                k_scale.as_raw_ptr(),
-                v_scale.as_raw_ptr(),
+                pool.k_scale.as_raw_ptr(),
+                pool.v_scale.as_raw_ptr(),
                 self.block_size as i32,
                 self.layer_kv_pool.config().num_kv_heads as i32,
                 self.layer_kv_pool.config().head_size as i32,
                 kv_dtype_raw,
                 &mut out_k_pool,
                 &mut out_v_pool,
+                &mut out_k_scale,
+                &mut out_v_scale,
             )
         };
-        if !ok || out_k_pool.is_null() || out_v_pool.is_null() {
-            unsafe {
-                if !out_k_pool.is_null() {
-                    mlx_sys::mlx_array_delete(out_k_pool);
-                }
-                if !out_v_pool.is_null() {
-                    mlx_sys::mlx_array_delete(out_v_pool);
-                }
-            }
+        let outputs = [out_k_pool, out_v_pool, out_k_scale, out_v_scale];
+        if !self.adopt_native_write(layer_idx, ok, outputs)? {
             if trace_enabled {
                 write_inference_trace(format_args!(
                     "[MLX_TRACE] paged_kv update_keys_values_native_fallback layer={} first_position={} num_tokens={} ffi_ms={:.1}",
@@ -4316,12 +4440,6 @@ impl PagedKVCacheAdapter {
                  (layer={layer_idx}, num_tokens={num_tokens})"
             ));
         }
-
-        let k_out = MxArray::from_handle(out_k_pool, "paged_kv_write_forward k_pool")
-            .map_err(|e| format!("update_keys_values_native: failed to wrap k_pool output: {e}"))?;
-        let v_out = MxArray::from_handle(out_v_pool, "paged_kv_write_forward v_pool")
-            .map_err(|e| format!("update_keys_values_native: failed to wrap v_pool output: {e}"))?;
-        self.replace_native_pool_arrays(layer_idx, k_out, v_out)?;
 
         if trace_enabled {
             write_inference_trace(format_args!(
@@ -4404,7 +4522,12 @@ impl PagedKVCacheAdapter {
         })?;
         let keys_meta = KvTensorMeta::from_array(keys, "keys")?;
         let values_meta = KvTensorMeta::from_array(values, "values")?;
-        let info = validate_kv_input(&keys_meta, &values_meta, self.layer_kv_pool.config())?;
+        let info = validate_kv_input(
+            &keys_meta,
+            &values_meta,
+            self.layer_kv_pool.config(),
+            self.layer_kv_pool.cache_dtype(),
+        )?;
         if info.num_tokens != total_queries {
             return Err(format!(
                 "update_keys_values_native_ragged: keys/values contain {} query rows but metadata names {total_queries}",
@@ -4471,50 +4594,37 @@ impl PagedKVCacheAdapter {
             slot_mapping
         };
 
-        let (k_pool, v_pool) = self.native_pool_arrays_for_layer(layer_idx)?;
-        let k_scale = self.k_scale_array(layer_idx)?;
-        let v_scale = self.v_scale_array(layer_idx)?;
+        let pool = self.native_pool_arrays_for_layer(layer_idx)?;
         let mut out_k_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
         let mut out_v_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_k_scale: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_v_scale: *mut mlx_sys::mlx_array = std::ptr::null_mut();
         let ok = unsafe {
             mlx_sys::mlx_paged_kv_write_forward(
-                k_pool.as_raw_ptr(),
-                v_pool.as_raw_ptr(),
+                pool.key.as_raw_ptr(),
+                pool.value.as_raw_ptr(),
                 keys.as_raw_ptr(),
                 values.as_raw_ptr(),
                 slot_mapping.as_raw_ptr(),
-                k_scale.as_raw_ptr(),
-                v_scale.as_raw_ptr(),
+                pool.k_scale.as_raw_ptr(),
+                pool.v_scale.as_raw_ptr(),
                 self.block_size as i32,
                 self.layer_kv_pool.config().num_kv_heads as i32,
                 self.layer_kv_pool.config().head_size as i32,
                 self.kv_dtype_raw()?,
                 &mut out_k_pool,
                 &mut out_v_pool,
+                &mut out_k_scale,
+                &mut out_v_scale,
             )
         };
-        if !ok || out_k_pool.is_null() || out_v_pool.is_null() {
-            unsafe {
-                if !out_k_pool.is_null() {
-                    mlx_sys::mlx_array_delete(out_k_pool);
-                }
-                if !out_v_pool.is_null() {
-                    mlx_sys::mlx_array_delete(out_v_pool);
-                }
-            }
+        let outputs = [out_k_pool, out_v_pool, out_k_scale, out_v_scale];
+        if !self.adopt_native_write(layer_idx, ok, outputs)? {
             return Err(format!(
                 "update_keys_values_native_ragged: mlx_paged_kv_write_forward returned null (layer={layer_idx}, queries={total_queries})"
             ));
         }
-        let k_out = MxArray::from_handle(out_k_pool, "paged_kv_write_forward ragged k_pool")
-            .map_err(|error| {
-                format!("update_keys_values_native_ragged: failed to wrap k_pool output: {error}")
-            })?;
-        let v_out = MxArray::from_handle(out_v_pool, "paged_kv_write_forward ragged v_pool")
-            .map_err(|error| {
-                format!("update_keys_values_native_ragged: failed to wrap v_pool output: {error}")
-            })?;
-        self.replace_native_pool_arrays(layer_idx, k_out, v_out)
+        Ok(())
     }
 
     /// Non-macOS stub: the underlying Metal kernel is macOS-only. Calling
@@ -5021,11 +5131,13 @@ impl PagedKVCacheAdapter {
             }
         };
         let cache_dtype = self.layer_kv_pool.cache_dtype();
-        if !cache_dtype.is_fp8() && query_dtype != cache_dtype {
+        if !cache_dtype.is_fp8() && query_dtype != cache_dtype.io_dtype() {
             return Err(format!(
-                "gather_kv_for_decode_graph_batched: query_dtype ({query_dtype:?}) must equal cache_dtype ({cache_dtype:?}) for non-FP8 caches"
+                "gather_kv_for_decode_graph_batched: query_dtype ({query_dtype:?}) must equal the io dtype of \
+                 cache_dtype ({cache_dtype:?}) for non-FP8 caches"
             ));
         }
+        self.refuse_int8_reads("gather_kv_for_decode_graph_batched")?;
 
         let (block_tables, seq_lens, max_context_len) =
             self.decode_attention_inputs_batched(seq_ids)?;
@@ -5120,11 +5232,13 @@ impl PagedKVCacheAdapter {
             }
         };
         let cache_dtype = self.layer_kv_pool.cache_dtype();
-        if !cache_dtype.is_fp8() && query_dtype != cache_dtype {
+        if !cache_dtype.is_fp8() && query_dtype != cache_dtype.io_dtype() {
             return Err(format!(
-                "gather_kv_for_ragged_graph: query_dtype ({query_dtype:?}) must equal cache_dtype ({cache_dtype:?}) for non-FP8 caches"
+                "gather_kv_for_ragged_graph: query_dtype ({query_dtype:?}) must equal the io dtype of \
+                 cache_dtype ({cache_dtype:?}) for non-FP8 caches"
             ));
         }
+        self.refuse_int8_reads("gather_kv_for_ragged_graph")?;
         let (block_tables, seq_lens, cu_seqlens_q, max_context_len, total_queries) =
             self.ragged_attention_inputs(rows)?;
         if q_meta.shape[0] != i64::from(total_queries) {
@@ -5148,9 +5262,12 @@ impl PagedKVCacheAdapter {
             ));
         }
 
-        let (k_pool, v_pool) = self.native_pool_arrays_for_layer(layer_idx)?;
-        let k_scale = self.k_scale_array(layer_idx)?;
-        let v_scale = self.v_scale_array(layer_idx)?;
+        let PoolLayerArrays {
+            key: k_pool,
+            value: v_pool,
+            k_scale,
+            v_scale,
+        } = self.native_pool_arrays_for_layer(layer_idx)?;
         let graph_softcap = if softcap == 1.0 { 0.0 } else { softcap };
         let raw = unsafe {
             mlx_sys::mlx_paged_attention_varlen_forward(
@@ -5264,12 +5381,13 @@ impl PagedKVCacheAdapter {
             }
         };
         let cache_dtype = self.layer_kv_pool.cache_dtype();
-        if !cache_dtype.is_fp8() && query_dtype != cache_dtype {
+        if !cache_dtype.is_fp8() && query_dtype != cache_dtype.io_dtype() {
             return Err(format!(
-                "gather_kv_for_decode_graph: query_dtype ({query_dtype:?}) must equal \
+                "gather_kv_for_decode_graph: query_dtype ({query_dtype:?}) must equal the io dtype of \
                  cache_dtype ({cache_dtype:?}) for non-FP8 caches"
             ));
         }
+        self.refuse_int8_reads("gather_kv_for_decode_graph")?;
 
         let (block_table, seq_lens, block_count) = self.decode_attention_inputs()?;
         let grouped_stripes = self.resolve_grouped_d128_stripes(
@@ -5355,6 +5473,8 @@ impl PagedKVCacheAdapter {
         if self.block_table.is_none() {
             return Err("gather_kv_for_decode called before reset_for_new_request".to_string());
         }
+
+        self.refuse_int8_reads("gather_kv_for_decode")?;
 
         // Raw Metal gather reads the pool outside MLX's graph scheduler. If a
         // prior native `paged_kv_write` for this layer is still lazy, force it
@@ -5620,19 +5740,23 @@ impl PagedKVCacheAdapter {
             }
         };
         let cache_dtype = self.layer_kv_pool.cache_dtype();
-        if !cache_dtype.is_fp8() && query_dtype != cache_dtype {
+        if !cache_dtype.is_fp8() && query_dtype != cache_dtype.io_dtype() {
             return Err(format!(
-                "gather_kv_for_prefill_chunk_varlen: query_dtype ({query_dtype:?}) must \
-                 equal cache_dtype ({cache_dtype:?}) for non-FP8 caches"
+                "gather_kv_for_prefill_chunk_varlen: query_dtype ({query_dtype:?}) must equal the io dtype of \
+                 cache_dtype ({cache_dtype:?}) for non-FP8 caches"
             ));
         }
+        self.refuse_int8_reads("gather_kv_for_prefill_chunk_varlen")?;
         let kv_dtype_raw = self.kv_dtype_raw()?;
 
         let (block_table, seq_lens, cu_seqlens_q, block_count, _) =
             self.varlen_prefill_attention_inputs(cached_prefix_len, query_len)?;
-        let (k_pool, v_pool) = self.native_pool_arrays_for_layer(layer_idx)?;
-        let k_scale = self.k_scale_array(layer_idx)?;
-        let v_scale = self.v_scale_array(layer_idx)?;
+        let PoolLayerArrays {
+            key: k_pool,
+            value: v_pool,
+            k_scale,
+            v_scale,
+        } = self.native_pool_arrays_for_layer(layer_idx)?;
 
         let raw = unsafe {
             mlx_sys::mlx_paged_attention_varlen_forward(
@@ -5797,6 +5921,7 @@ impl PagedKVCacheAdapter {
                 self.layer_kv_pool.num_layers()
             ));
         }
+        self.refuse_int8_reads("gather_kv_for_prefill_sdpa")?;
         let cache_dtype = self.layer_kv_pool.cache_dtype();
         if cache_dtype.is_fp8() {
             return Err(
@@ -5830,7 +5955,11 @@ impl PagedKVCacheAdapter {
         let padded_tokens = block_count
             .checked_mul(self.block_size)
             .ok_or_else(|| "gather_kv_for_prefill_sdpa: padded token count overflow".to_string())?;
-        let (k_pool, v_pool) = self.native_pool_arrays_for_layer(layer_idx)?;
+        let PoolLayerArrays {
+            key: k_pool,
+            value: v_pool,
+            ..
+        } = self.native_pool_arrays_for_layer(layer_idx)?;
 
         // K pool: [B,H,D/x,T,x] -> [H,B,T,D/x,x] -> [1,H,B*T,D].
         let k = k_pool
@@ -6006,22 +6135,14 @@ impl PagedKVCacheAdapter {
             }
         };
         let cache_dtype = self.layer_kv_pool.cache_dtype();
-        if !cache_dtype.is_fp8() && query_dtype != cache_dtype {
+        if !cache_dtype.is_fp8() && query_dtype != cache_dtype.io_dtype() {
             return Err(format!(
-                "gather_kv_for_prefill_chunk: query_dtype ({query_dtype:?}) must equal \
+                "gather_kv_for_prefill_chunk: query_dtype ({query_dtype:?}) must equal the io dtype of \
                  cache_dtype ({cache_dtype:?}) for non-FP8 caches"
             ));
         }
-        let kv_dtype_raw = match cache_dtype {
-            mlx_paged_attn::metal::MetalDtype::Float16 => 0u8,
-            mlx_paged_attn::metal::MetalDtype::BFloat16 => 1u8,
-            mlx_paged_attn::metal::MetalDtype::UChar => 2u8,
-            mlx_paged_attn::metal::MetalDtype::Float32 => {
-                return Err(
-                    "gather_kv_for_prefill_chunk: Float32 KV cache is unsupported".to_string(),
-                );
-            }
-        };
+        self.refuse_int8_reads("gather_kv_for_prefill_chunk")?;
+        let kv_dtype_raw = self.kv_dtype_raw()?;
 
         let (block_table, seq_lens, block_count) =
             self.prefill_attention_inputs(cached_prefix_len, num_new_tokens)?;
@@ -6330,6 +6451,9 @@ impl PagedKVCacheAdapter {
         match cache_dtype {
             mlx_paged_attn::metal::MetalDtype::Float16
             | mlx_paged_attn::metal::MetalDtype::BFloat16 => {}
+            mlx_paged_attn::metal::MetalDtype::Int8 => {
+                self.refuse_int8_reads("read_kv_range")?;
+            }
             other => {
                 return Err(format!(
                     "read_kv_range: cache_dtype {other:?} is not supported (only Float16 \
@@ -7845,8 +7969,30 @@ impl PagedKVCacheAdapter {
             mlx_paged_attn::metal::MetalDtype::Float16 => Some(DType::Float16),
             mlx_paged_attn::metal::MetalDtype::BFloat16 => Some(DType::BFloat16),
             mlx_paged_attn::metal::MetalDtype::Float32 => Some(DType::Float32),
-            mlx_paged_attn::metal::MetalDtype::UChar => None,
+            mlx_paged_attn::metal::MetalDtype::UChar | mlx_paged_attn::metal::MetalDtype::Int8 => {
+                None
+            }
         }
+    }
+
+    /// The dtype a prism/Hadamard f32 operand is cast to before the paged
+    /// write and read: the pool's io dtype (bf16 for an int8 pool, Splash io
+    /// is always bf16). `None` for an FP8 pool.
+    pub(crate) fn paged_operand_dtype(&self) -> Option<DType> {
+        let cache_dtype = self.layer_kv_pool.cache_dtype();
+        if cache_dtype.is_fp8() {
+            return None;
+        }
+        metal_io_dtype(cache_dtype).ok()
+    }
+
+    /// Int8 pages are read only by the scale-aware attention kernels
+    /// (Splash `splash_attention_page_softmax`), which are not built.
+    pub(crate) fn refuse_int8_reads(&self, entry: &str) -> Result<(), String> {
+        if self.layer_kv_pool.cache_dtype() == mlx_paged_attn::metal::MetalDtype::Int8 {
+            return Err(format!("{entry}: int8 paged reads are not built"));
+        }
+        Ok(())
     }
 
     pub fn current_token_count(&self) -> u32 {
@@ -8073,27 +8219,29 @@ impl PagedKVCacheAdapter {
         Err("value_pool_array is only supported on macOS (Metal backend)".to_string())
     }
 
-    /// Return a `[1]` fp32 K scale MxArray for `layer_idx`.
+    /// The K scale array of `layer_idx` that the paged write and reads take.
     ///
-    /// The eager paged forward threads a per-layer `k_scale` MxArray into
-    /// the `paged_kv_write` write (see `update_keys_values_native`) and the
-    /// `paged_attention` reads (see `gather_kv_for_decode_graph` /
-    /// `gather_kv_for_prefill_chunk`). The shape is
-    /// always `[1]` and the dtype is always `Float32` — the C++ validator
-    /// in `mlx_paged_ops.cpp` rejects anything else.
-    ///
-    /// The returned scalar is always `1.0`, a no-op for the kernel
-    /// template (`fp8_value = fp32_value * 1.0`).
+    /// An int8 pool: the `[num_blocks, num_kv_heads, block_size]` f32 plane,
+    /// as the last native write returned it while the pool generation
+    /// matches (the write-before-read graph edge, like
+    /// [`Self::key_pool_array`]), else a view built for this generation.
+    /// Any other pool: the shared `[1]` fp32 `1.0`, a no-op for the kernel
+    /// templates.
     #[cfg(target_os = "macos")]
-    pub fn k_scale_array(&mut self, _layer_idx: u32) -> Result<MxArray, String> {
-        Ok(self.unit_kv_scale_array.clone())
+    pub fn k_scale_array(&mut self, layer_idx: u32) -> Result<MxArray, String> {
+        if self.layer_kv_pool.cache_dtype().scale_bytes() == 0 {
+            return Ok(self.unit_kv_scale_array.clone());
+        }
+        Ok(self.native_pool_arrays_for_layer(layer_idx)?.k_scale)
     }
 
-    /// Return a `[1]` fp32 V scale MxArray for `layer_idx`. See
-    /// [`Self::k_scale_array`] for the FP8 contract.
+    /// The V twin of [`Self::k_scale_array`].
     #[cfg(target_os = "macos")]
-    pub fn v_scale_array(&mut self, _layer_idx: u32) -> Result<MxArray, String> {
-        Ok(self.unit_kv_scale_array.clone())
+    pub fn v_scale_array(&mut self, layer_idx: u32) -> Result<MxArray, String> {
+        if self.layer_kv_pool.cache_dtype().scale_bytes() == 0 {
+            return Ok(self.unit_kv_scale_array.clone());
+        }
+        Ok(self.native_pool_arrays_for_layer(layer_idx)?.v_scale)
     }
 
     /// Non-macOS `k_scale_array`: the callers live behind
@@ -13182,8 +13330,8 @@ mod tests {
         adapter.reset_for_new_request(0).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();
         adapter.record_tokens(&[10, 11, 12, 13]).unwrap();
-        let k = dummy_kv(4, 1, 32);
-        let v = dummy_kv(4, 1, 32);
+        let k = dummy_kv_with_dtype(4, 1, 32, crate::array::DType::Float16);
+        let v = dummy_kv_with_dtype(4, 1, 32, crate::array::DType::Float16);
         // Correct value is current(4) - num_tokens(4) = 0. Pass 7 to force misalignment.
         let res = adapter.update_keys_values(0, &k, &v, 7);
         assert!(res.is_err(), "expected alignment error");
@@ -13301,7 +13449,7 @@ mod tests {
         // Pass 4 KV heads instead of 1.
         let k = meta(4, 4, 32, DType::BFloat16);
         let v = meta(4, 4, 32, DType::BFloat16);
-        let res = validate_kv_input(&k, &v, &cfg);
+        let res = validate_kv_input(&k, &v, &cfg, mlx_paged_attn::metal::MetalDtype::BFloat16);
         assert!(res.is_err(), "expected num_kv_heads mismatch error");
         let msg = res.err().unwrap();
         assert!(
@@ -13319,7 +13467,7 @@ mod tests {
         // Pass head_size = 16 instead of 32.
         let k = meta(4, 1, 16, DType::BFloat16);
         let v = meta(4, 1, 16, DType::BFloat16);
-        let res = validate_kv_input(&k, &v, &cfg);
+        let res = validate_kv_input(&k, &v, &cfg, mlx_paged_attn::metal::MetalDtype::BFloat16);
         assert!(res.is_err(), "expected head_size mismatch error");
         let msg = res.err().unwrap();
         assert!(
@@ -13337,7 +13485,7 @@ mod tests {
         let cfg = validation_test_config();
         let k = meta(4, 1, 32, DType::Float16);
         let v = meta(4, 1, 32, DType::BFloat16);
-        let res = validate_kv_input(&k, &v, &cfg);
+        let res = validate_kv_input(&k, &v, &cfg, mlx_paged_attn::metal::MetalDtype::BFloat16);
         assert!(res.is_err(), "expected dtype mismatch error");
         let msg = res.err().unwrap();
         assert!(
@@ -13357,7 +13505,7 @@ mod tests {
         let cfg = validation_test_config();
         let k = meta(4, 1, 32, DType::Float32);
         let v = meta(4, 1, 32, DType::Float32);
-        let res = validate_kv_input(&k, &v, &cfg);
+        let res = validate_kv_input(&k, &v, &cfg, mlx_paged_attn::metal::MetalDtype::BFloat16);
         assert!(res.is_err(), "expected Float32 rejection");
         let msg = res.err().unwrap();
         assert!(
@@ -13379,7 +13527,7 @@ mod tests {
         let cfg = validation_test_config();
         let k = meta(4, 1, 32, DType::Int32);
         let v = meta(4, 1, 32, DType::Int32);
-        let res = validate_kv_input(&k, &v, &cfg);
+        let res = validate_kv_input(&k, &v, &cfg, mlx_paged_attn::metal::MetalDtype::BFloat16);
         assert!(res.is_err(), "expected Int32 rejection");
         let msg = res.err().unwrap();
         assert!(
@@ -18303,6 +18451,8 @@ mod tests {
             let key = MxArray::from_int64(&[1], &[1]).expect("dummy key");
             let value = MxArray::from_int64(&[1], &[1]).expect("dummy value");
             adapter.native_pool_arrays.push(Some(NativePoolArrays {
+                k_scale: key.clone(),
+                v_scale: value.clone(),
                 key,
                 value,
                 dirty,

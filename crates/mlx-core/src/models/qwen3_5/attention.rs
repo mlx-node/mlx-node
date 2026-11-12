@@ -1483,10 +1483,10 @@ impl Qwen3_5Attention {
             )
         };
 
-        let cache_dtype = adapter.prefill_sdpa_cache_dtype();
-        let queries = self.paged_attention_operand(&queries, cache_dtype)?;
-        let keys = self.paged_attention_operand(&keys, cache_dtype)?;
-        let values = self.paged_attention_operand(&values, cache_dtype)?;
+        let operand_dtype = adapter.paged_operand_dtype();
+        let queries = self.paged_attention_operand(&queries, operand_dtype)?;
+        let keys = self.paged_attention_operand(&keys, operand_dtype)?;
+        let values = self.paged_attention_operand(&values, operand_dtype)?;
 
         // Transpose to [B, H, T, D] for SDPA.
         let queries_bhtd = queries.transpose(Some(&[0, 2, 1, 3]))?;
@@ -2232,10 +2232,10 @@ impl Qwen3_5Attention {
         let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
         let keys = self.rope.forward_with_offsets(&keys, &offsets)?;
         let values = values.transpose(Some(&[0, 2, 1, 3]))?;
-        let cache_dtype = adapter.prefill_sdpa_cache_dtype();
-        let queries = self.paged_attention_operand(&queries, cache_dtype)?;
-        let keys = self.paged_attention_operand(&keys, cache_dtype)?;
-        let values = self.paged_attention_operand(&values, cache_dtype)?;
+        let operand_dtype = adapter.paged_operand_dtype();
+        let queries = self.paged_attention_operand(&queries, operand_dtype)?;
+        let keys = self.paged_attention_operand(&keys, operand_dtype)?;
+        let values = self.paged_attention_operand(&values, operand_dtype)?;
 
         let output = if seq_len == 1 {
             let queries = queries.squeeze(Some(&[2]))?;

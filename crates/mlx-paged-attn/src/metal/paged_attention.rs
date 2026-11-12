@@ -595,6 +595,13 @@ impl PagedAttentionOutput {
                         .to_string(),
                 );
             }
+            MetalDtype::Int8 => {
+                return Err(
+                    "int8 cache to f32 conversion is not built (the scales live in their own \
+                     plane)"
+                        .to_string(),
+                );
+            }
         }
 
         Ok(result)
@@ -647,6 +654,7 @@ impl PagedAttentionOutput {
             MetalDtype::Float16 => 2,
             MetalDtype::BFloat16 => 3,
             MetalDtype::UChar => 5,
+            MetalDtype::Int8 => 6,
         };
         let arr = unsafe {
             mlx_sys::mlx_array_from_metal_buffer_view(

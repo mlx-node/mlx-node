@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 #include "mlx/fast_primitives.h"
@@ -22,6 +23,7 @@ enum class KvDtype : uint8_t {
   Fp16 = 0,
   Bf16 = 1,
   Fp8 = 2,
+  Int8 = 3,
 };
 
 /// `PagedKVWrite` writes a chunk of new K/V tokens into the per-layer
@@ -33,13 +35,16 @@ enum class KvDtype : uint8_t {
 ///   2: `new_k`     — `[num_tokens, num_kv_heads, head_size]`
 ///   3: `new_v`     — `[num_tokens, num_kv_heads, head_size]`
 ///   4: `slot_mapping` — `[num_tokens]` of int64
-///   5: `k_scale`   — `[1]` fp32 (placeholder for non-FP8)
-///   6: `v_scale`   — `[1]` fp32 (placeholder for non-FP8)
+///   5: `k_scale`   — Int8: `[num_blocks, num_kv_heads, block_size]` fp32
+///                    scale plane (Splash `splash_q8_scale_index`); FP8:
+///                    `[1]` fp32 divisor; Fp16/Bf16: `[1]` placeholder
+///   6: `v_scale`   — same, for the value side
 ///
-/// Outputs (in order):
-///   0: `k_pool'`   — semantically the same buffer as `k_pool` (in-place
-///                    write; output array shares the input's allocation)
-///   1: `v_pool'`   — same, for the value pool
+/// Outputs (in order), each sharing its input's allocation (in-place):
+///   0: `k_pool'`   — input 0
+///   1: `v_pool'`   — input 1
+///   2: `k_scale'`  — input 5 (Int8 writes one scale per stored row)
+///   3: `v_scale'`  — input 6
 ///
 /// The primitive's scalar state participates in the compile cache key:
 /// re-tracing with different `block_size` / `kv_dtype` etc. yields a
@@ -200,19 +205,19 @@ class PagedAttention : public Custom {
 // Public free functions (the user-facing API for emitting these primitives)
 // =============================================================================
 
-/// Emit a `PagedKVWrite` primitive. Returns `(k_pool', v_pool')` —
-/// arrays that semantically alias the input pools (the primitive
-/// writes in-place). `k_scale` / `v_scale` MUST be `[1]` fp32 arrays
-/// even when `kv_dtype != Fp8` (callers pass `array(1.0f)`
-/// placeholders so the FP8 calibration path can flow through compile
-/// naturally without a separate variant).
+/// Emit a `PagedKVWrite` primitive. Returns `(k_pool', v_pool',
+/// k_scale', v_scale')` — arrays that alias inputs 0, 1, 5, 6 (the
+/// primitive writes in place). Int8 scales are the pool's
+/// `[num_blocks, num_kv_heads, block_size]` fp32 planes; every other
+/// dtype takes `[1]` fp32 arrays (callers pass `array(1.0f)`
+/// placeholders when `kv_dtype != Fp8`).
 ///
 /// Strict input contract — every dimension and dtype is validated at
 /// the factory and a mismatch throws `std::invalid_argument`:
 ///
 ///   - `k_pool` rank 5 `[num_blocks, num_kv_heads, head_size/x_pack,
 ///     block_size, x_pack]`. `x_pack = 16 / sizeof(kv_dtype)`
-///     (Fp16/Bf16 → 8, Fp8 → 16). `x_pack` arg must equal that.
+///     (Fp16/Bf16 → 8, Fp8/Int8 → 16). `x_pack` arg must equal that.
 ///   - `v_pool` rank 4 `[num_blocks, num_kv_heads, head_size, block_size]`.
 ///   - `k_pool.shape(0) == v_pool.shape(0)` (num_blocks parity).
 ///   - `new_k`/`new_v` rank 3 `[num_tokens, num_kv_heads, head_size]`,
@@ -224,10 +229,12 @@ class PagedAttention : public Custom {
 ///     past the K/V allocation.
 ///   - `slot_mapping`'s max value MUST be `< num_blocks * block_size`.
 ///     The factory eval-checks this (skipped during MLX tracing).
-///   - `k_scale`/`v_scale` rank 0/1 of size 1, dtype `float32`.
+///   - `k_scale`/`v_scale` dtype `float32`: Int8 `[num_blocks,
+///     num_kv_heads, block_size]` with `head_size` 128 or 256, else size 1.
+///   - Int8 `new_k`/`new_v` are bfloat16.
 ///   - All inputs are row-contiguous. Read-only `new_k`/`new_v` may
 ///     have nonzero byte offsets; pools and metadata require offset zero.
-std::pair<array, array> paged_kv_write(
+std::array<array, 4> paged_kv_write(
     const array& k_pool,
     const array& v_pool,
     const array& new_k,

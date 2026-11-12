@@ -341,7 +341,8 @@ impl Lfm2Inner {
                 max_batch_size: Some(32),
             };
 
-            let num_blocks = pa_config.calculate_num_blocks();
+            let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+            let num_blocks = pa_config.calculate_num_blocks(cache_dtype);
             if num_blocks == 0 {
                 return Err(Error::from_reason(format!(
                     "LFM2 block-paged adapter: gpu_memory_mb={gpu_memory_mb} too small \
@@ -354,7 +355,6 @@ impl Lfm2Inner {
                 num_blocks, num_blocks, block_size,
             )));
 
-            let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
             let pool =
                 mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, num_blocks, cache_dtype)
                     .map_err(|e| {

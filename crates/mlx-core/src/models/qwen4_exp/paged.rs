@@ -144,6 +144,9 @@ pub fn gather_selected(
     heads: usize,
     dim: usize,
 ) -> Result<(MxArray, MxArray)> {
+    adapter
+        .refuse_int8_reads("Qwen4 gather_selected")
+        .map_err(Error::from_reason)?;
     let table = adapter
         .block_table()
         .ok_or_else(|| Error::from_reason("Qwen4 missing page table"))?;
@@ -754,6 +757,9 @@ pub(super) fn gather_window(
     values: &MxArray,
     base: usize,
 ) -> Result<(MxArray, MxArray)> {
+    adapter
+        .refuse_int8_reads("Qwen4 gather_window")
+        .map_err(Error::from_reason)?;
     let table = adapter
         .block_table()
         .ok_or_else(|| Error::from_reason("Qwen4 missing page table"))?;

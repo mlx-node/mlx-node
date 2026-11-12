@@ -5,9 +5,9 @@
 //!
 //! - `BlockAllocator` owns the *logical* lifecycle: refcounts, the
 //!   prefix cache and its recency clock, hashing, and the free pool.
-//! - `LayerKVPool` owns the *physical* storage: one (key, value)
-//!   `metal::Buffer` pair per transformer layer, sized for `num_blocks`
-//!   block slots.
+//! - `LayerKVPool` owns the *physical* storage: per transformer layer a
+//!   key and a value `metal::Buffer` (plus two f32 scale planes for an int8
+//!   pool), sized for `num_blocks` block slots.
 //!
 //! Both are `Arc`'d and shared by every `PagedKVCacheAdapter` on the same
 //! model. They agree on `num_blocks` (validated when the adapter is
@@ -104,6 +104,7 @@ fn elapsed_ms(start: std::time::Instant) -> f64 {
 /// - `FLOAT16 = 2`
 /// - `BFLOAT16 = 3`
 /// - `UINT8 = 5`
+/// - `INT8 = 6`
 ///
 /// Float32 is rejected here too — `LayerKVPool::new` already rejects it
 /// at construction, but having this match defends against any future
@@ -117,6 +118,7 @@ fn bridge_dtype_code(dtype: MetalDtype) -> Result<i32, String> {
         MetalDtype::Float16 => 2,
         MetalDtype::BFloat16 => 3,
         MetalDtype::UChar => 5,
+        MetalDtype::Int8 => 6,
         MetalDtype::Float32 => {
             return Err(
                 "bridge_dtype_code: Float32 cache dtype is not supported (no kernel \
@@ -130,8 +132,136 @@ fn bridge_dtype_code(dtype: MetalDtype) -> Result<i32, String> {
 /// One physical block's host-side bytes for a single layer, as
 /// `(keys, values)` in the pool's native packed K/V layouts (vLLM K
 /// `[num_kv_heads, head_size/x, block_size, x]`, V
-/// `[num_kv_heads, head_size, block_size]`).
+/// `[num_kv_heads, head_size, block_size]`). An int8 pool appends each
+/// side's f32 `[num_kv_heads, block_size]` scale slot to that side's data
+/// (Splash `PageStorage::layerSpans` order K, K scales, V, V scales).
 pub type BlockLayerBytes = (Vec<u8>, Vec<u8>);
+
+/// One block's byte size in each plane of one layer. `scale` is 0 for a pool
+/// without scale planes (Splash BF16 pages carry no scale bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaneBytes {
+    pub key: u64,
+    pub value: u64,
+    pub scale: u64,
+}
+
+impl PlaneBytes {
+    /// Host-transfer bytes per side, data then scales.
+    pub fn blob(&self) -> (u64, u64) {
+        (self.key + self.scale, self.value + self.scale)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn of(&self, plane: Plane) -> u64 {
+        match plane {
+            Plane::Key => self.key,
+            Plane::Value => self.value,
+            Plane::KeyScale | Plane::ValueScale => self.scale,
+        }
+    }
+
+    /// Where `plane`'s slot sits inside its side's blob.
+    #[cfg(target_os = "macos")]
+    fn blob_offset(&self, plane: Plane) -> u64 {
+        match plane {
+            Plane::Key | Plane::Value => 0,
+            Plane::KeyScale => self.key,
+            Plane::ValueScale => self.value,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Plane {
+    Key,
+    KeyScale,
+    Value,
+    ValueScale,
+}
+
+#[cfg(target_os = "macos")]
+impl Plane {
+    fn is_key_side(self) -> bool {
+        matches!(self, Plane::Key | Plane::KeyScale)
+    }
+}
+
+/// One layer's buffers. `scales` holds an int8 pool's f32
+/// `[num_blocks, num_kv_heads, block_size]` key and value scale planes
+/// (Splash `SPLASH_KV_KEY_SCALES` / `SPLASH_KV_VALUE_SCALES`); each plane is
+/// its own buffer because an MLX buffer view has no byte offset.
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct LayerPlanes {
+    key: Buffer,
+    value: Buffer,
+    scales: Option<(Buffer, Buffer)>,
+}
+
+#[cfg(target_os = "macos")]
+impl LayerPlanes {
+    /// Splash `PageStorage::layerSpans` order.
+    fn planes(&self) -> impl Iterator<Item = (Plane, &Buffer)> {
+        let (key_scale, value_scale) = match &self.scales {
+            Some((key, value)) => (Some(key), Some(value)),
+            None => (None, None),
+        };
+        [
+            (Plane::Key, Some(&self.key)),
+            (Plane::KeyScale, key_scale),
+            (Plane::Value, Some(&self.value)),
+            (Plane::ValueScale, value_scale),
+        ]
+        .into_iter()
+        .filter_map(|(plane, buffer)| buffer.map(|buffer| (plane, buffer)))
+    }
+
+    fn all_shared(&self) -> bool {
+        self.planes()
+            .all(|(_, buffer)| buffer.storage_mode() == metal::MTLStorageMode::Shared)
+    }
+
+    fn length(&self) -> u64 {
+        self.planes().fold(0u64, |total, (_, buffer)| {
+            total.saturating_add(buffer.length())
+        })
+    }
+
+    /// Allocate every plane for `num_blocks` slots. `None` names the plane
+    /// Metal could not back.
+    fn allocate(
+        device: &metal::Device,
+        bytes: &PlaneBytes,
+        num_blocks: u32,
+        options: metal::MTLResourceOptions,
+    ) -> Result<Self, String> {
+        let size = |per_block: u64| {
+            per_block.checked_mul(u64::from(num_blocks)).ok_or_else(|| {
+                format!("{per_block} bytes per block x {num_blocks} blocks overflows u64")
+            })
+        };
+        let allocate = |plane: Plane, per_block: u64| -> Result<Buffer, String> {
+            device
+                .try_new_buffer(size(per_block)?, options)
+                .ok_or_else(|| format!("Metal returned a nil {plane:?} buffer"))
+        };
+        let scales = if bytes.scale > 0 {
+            Some((
+                allocate(Plane::KeyScale, bytes.scale)?,
+                allocate(Plane::ValueScale, bytes.scale)?,
+            ))
+        } else {
+            None
+        };
+        Ok(Self {
+            key: allocate(Plane::Key, bytes.key)?,
+            value: allocate(Plane::Value, bytes.value)?,
+            scales,
+        })
+    }
+}
 
 /// Borrowed native-layout bytes for one destination block, in layer order.
 pub type BlockUpload<'a> = (u32, Vec<(&'a [u8], &'a [u8])>);
@@ -241,8 +371,8 @@ pub struct LayerKVPool {
 /// keeps a consistent older buffer.
 #[cfg(target_os = "macos")]
 struct PoolInner {
-    /// `(key_cache, value_cache)` per layer. Indexed by `layer_idx`.
-    layers: Vec<(Buffer, Buffer)>,
+    /// Indexed by `layer_idx`.
+    layers: Vec<LayerPlanes>,
     /// Number of physical block slots the current buffers were sized for.
     num_blocks: u32,
 }
@@ -275,6 +405,7 @@ impl LayerKVPool {
     /// - `(false, Float16)` — 2-byte cache, x = 8
     /// - `(false, BFloat16)` — 2-byte cache, x = 8
     /// - `(true,  UChar)` — 1-byte FP8 cache, x = 16
+    /// - `(false, Int8)` — 1-byte int8 cache plus f32 scale planes, x = 16
     ///
     /// All other combinations (Float32 cache, FP8 mode with Float16/BFloat16
     /// dtype, non-FP8 mode with UChar dtype, etc.) are rejected — silently
@@ -284,6 +415,7 @@ impl LayerKVPool {
         match (use_fp8, cache_dtype) {
             (false, MetalDtype::Float16) | (false, MetalDtype::BFloat16) => Ok((2u64, 8u32)),
             (true, MetalDtype::UChar) => Ok((1u64, 16u32)),
+            (false, MetalDtype::Int8) => Ok((1u64, 16u32)),
             (true, _) => Err(format!(
                 "LayerKVPool: FP8 mode requires cache_dtype = UChar, got {:?}",
                 cache_dtype
@@ -301,49 +433,34 @@ impl LayerKVPool {
         }
     }
 
-    /// Bytes one physical block occupies in one layer, as `(key, value)`.
+    /// Bytes one physical block occupies in each plane of one layer.
     ///
     /// - K block: `[num_kv_heads, head_size/x, block_size, x]` elements.
     /// - V block: `[num_kv_heads, head_size, block_size]` elements.
+    /// - scale block (int8 only): `[num_kv_heads, block_size]` f32.
     ///
-    /// `head_size / x` then `* x` is spelled out rather than folded away so
-    /// the expression reads term for term like the K buffer's declared shape.
-    /// It never actually truncates: [`Self::new`] refuses to build a pool
-    /// whose `head_size` is not a multiple of `x`, so `(head_size / x) * x`
-    /// always equals `head_size` here and the K and V block sizes always come
-    /// out equal.
-    ///
-    /// Every host<->pool size check inside this type routes through here, so
-    /// the per-layer and whole-block entry points cannot drift apart — a drift
-    /// would let one path accept bytes the other rejects, or worse, blit a
-    /// wrong-sized window. It is *not* the only copy of this product in the
-    /// tree: `cold_cache::pool_layer_bytes` and the mlx-core paged adapter's
-    /// block-gather each re-derive it, so a layout change has to be made in
-    /// all three places. [`Self::new`] and [`Self::new_for_test`] used to be a
-    /// fourth and fifth; they now size their buffers from
-    /// [`Self::block_bytes_for`], which is this function's own body, so a pool
-    /// cannot be allocated to one geometry and blitted at another.
+    /// Buffer allocation, blit addressing, slot checks and host transfers all
+    /// read their sizes off this one table.
     #[cfg(target_os = "macos")]
-    fn block_bytes_per_layer(&self) -> Result<(u64, u64), String> {
-        Self::block_bytes_for(&self.config, self.cache_dtype)
+    fn plane_bytes(&self) -> Result<PlaneBytes, String> {
+        Self::plane_bytes_for(&self.config, self.cache_dtype)
     }
 
-    /// [`Self::block_bytes_per_layer`] for a config that is not a pool yet, so
-    /// buffer *allocation* and blit *addressing* read their sizes off one
-    /// expression.
+    /// Host-transfer bytes of one block in one layer, `(key, value)`, each
+    /// side's scale slot included: the length of each half of a
+    /// [`BlockLayerBytes`].
+    pub fn block_blob_bytes(&self) -> Result<(u64, u64), String> {
+        Self::plane_bytes_for(&self.config, self.cache_dtype).map(|bytes| bytes.blob())
+    }
+
+    /// [`Self::plane_bytes`] for a config that is not a pool yet.
     ///
-    /// Every product is checked. A `PagedAttentionConfig` reaching here has
-    /// not necessarily been through `validate()` — [`Self::new_for_test`]
-    /// skips it deliberately — so `num_kv_heads * head_size * block_size *
-    /// element_size` is free to overflow `u64` on a geometry no allocator
-    /// would ever satisfy. Unchecked, that wraps to a small size in release
-    /// and panics in debug; checked, it is an ordinary `Err`.
-    ///
-    /// Not macOS-gated: [`Self::total_bytes`] needs it on every platform.
-    fn block_bytes_for(
+    /// Every product is checked: [`Self::new_for_test`] skips
+    /// `config.validate()`, so an unchecked product could wrap.
+    fn plane_bytes_for(
         config: &PagedAttentionConfig,
         cache_dtype: MetalDtype,
-    ) -> Result<(u64, u64), String> {
+    ) -> Result<PlaneBytes, String> {
         let (element_size, x) = Self::cache_dtype_layout(config.use_fp8(), cache_dtype)?;
         let x = x as u64;
         let block_size = config.block_size as u64;
@@ -367,7 +484,12 @@ impl LayerKVPool {
             .and_then(|v| v.checked_mul(block_size))
             .and_then(|v| v.checked_mul(element_size))
             .ok_or_else(overflow)?;
-        Ok((key, value))
+        let scale_bytes = cache_dtype.scale_bytes() as u64;
+        let scale = num_kv_heads
+            .checked_mul(block_size)
+            .and_then(|v| v.checked_mul(scale_bytes))
+            .ok_or_else(overflow)?;
+        Ok(PlaneBytes { key, value, scale })
     }
 
     /// The end offset (exclusive) of physical block `block_id`'s slot in a
@@ -404,10 +526,9 @@ impl LayerKVPool {
         context: &str,
         layer_idx: usize,
         block_id: u32,
-        key_block_size: u64,
-        value_block_size: u64,
+        bytes: &PlaneBytes,
     ) -> Result<(), String> {
-        let (key_cache, value_cache) = {
+        let layer = {
             let inner = self.inner_read();
             inner.layers.get(layer_idx).cloned().ok_or_else(|| {
                 format!(
@@ -416,20 +537,18 @@ impl LayerKVPool {
                 )
             })?
         };
-        for (side, buffer, block_bytes) in [
-            ("key", &key_cache, key_block_size),
-            ("value", &value_cache, value_block_size),
-        ] {
+        for (plane, buffer) in layer.planes() {
+            let block_bytes = bytes.of(plane);
             let slot_end = Self::block_slot_end(block_id, block_bytes).ok_or_else(|| {
                 format!(
-                    "{context}: layer {layer_idx} {side} slot for block {block_id} overflows u64 \
-                     ({block_bytes} bytes per block)"
+                    "{context}: layer {layer_idx} {plane:?} slot for block {block_id} overflows \
+                     u64 ({block_bytes} bytes per block)"
                 )
             })?;
             let allocated = buffer.length();
             if slot_end > allocated {
                 return Err(format!(
-                    "{context}: layer {layer_idx} {side} buffer is {allocated} bytes but block \
+                    "{context}: layer {layer_idx} {plane:?} buffer is {allocated} bytes but block \
                      {block_id} occupies bytes {}..{slot_end} ({block_bytes} bytes per block). \
                      The pool's buffers were not allocated for this geometry; blitting anyway \
                      reads or writes past the end of the buffer.",
@@ -448,18 +567,11 @@ impl LayerKVPool {
         &self,
         context: &str,
         block_id: u32,
-        key_block_size: u64,
-        value_block_size: u64,
+        bytes: &PlaneBytes,
     ) -> Result<(), String> {
         let num_layers = self.inner_read().layers.len();
         for layer_idx in 0..num_layers {
-            self.check_slot_fits(
-                context,
-                layer_idx,
-                block_id,
-                key_block_size,
-                value_block_size,
-            )?;
+            self.check_slot_fits(context, layer_idx, block_id, bytes)?;
         }
         Ok(())
     }
@@ -546,7 +658,7 @@ impl LayerKVPool {
 
         // Run the dtype consistency check on every platform so its rejection
         // path is covered by CPU-only test runs. On macOS the byte sizes come
-        // from `block_bytes_for` below, which re-derives the same pair.
+        // from `plane_bytes_for` below, which re-derives the same pair.
         let use_fp8 = config.use_fp8();
         let (_element_size, x) = Self::cache_dtype_layout(use_fp8, cache_dtype)?;
 
@@ -568,46 +680,16 @@ impl LayerKVPool {
                 ));
             }
 
-            // Same expression the blit ranges are addressed from, so a pool
-            // can never be allocated to one geometry and transferred at
-            // another.
-            let (key_block_size, value_block_size) = Self::block_bytes_for(&config, cache_dtype)?;
-            let overflow = |side: &str, per_block: u64| {
-                format!(
-                    "LayerKVPool::new: {side} cache size overflows u64 ({per_block} bytes per \
-                     block x {num_blocks} blocks)"
-                )
-            };
-            let key_cache_size = key_block_size
-                .checked_mul(num_blocks as u64)
-                .ok_or_else(|| overflow("key", key_block_size))?;
-            let value_cache_size = value_block_size
-                .checked_mul(num_blocks as u64)
-                .ok_or_else(|| overflow("value", value_block_size))?;
-
+            // Same table the blit ranges are addressed from, so a pool can
+            // never be allocated to one geometry and transferred at another.
+            let bytes = Self::plane_bytes_for(&config, cache_dtype)?;
+            let options = pool_storage_options(&state.device, _cpu_access);
             let mut layers = Vec::with_capacity(config.num_layers as usize);
             for _ in 0..config.num_layers {
-                let key_cache = state
-                    .device
-                    .try_new_buffer(
-                        key_cache_size,
-                        pool_storage_options(&state.device, _cpu_access),
-                    )
-                    .ok_or_else(|| {
-                        "LayerKVPool::new: Metal device failed to allocate key cache buffer"
-                            .to_string()
-                    })?;
-                let value_cache = state
-                    .device
-                    .try_new_buffer(
-                        value_cache_size,
-                        pool_storage_options(&state.device, _cpu_access),
-                    )
-                    .ok_or_else(|| {
-                        "LayerKVPool::new: Metal device failed to allocate value cache buffer"
-                            .to_string()
-                    })?;
-                layers.push((key_cache, value_cache));
+                layers.push(
+                    LayerPlanes::allocate(&state.device, &bytes, num_blocks, options)
+                        .map_err(|error| format!("LayerKVPool::new: {error}"))?,
+                );
             }
 
             Ok(Self {
@@ -651,7 +733,7 @@ impl LayerKVPool {
     /// kernel dispatch**.
     ///
     /// The buffers themselves are real. They are sized from
-    /// `block_bytes_for` — the same expression the blit ranges are addressed
+    /// `plane_bytes_for` — the same table the blit ranges are addressed
     /// from — so the block-transfer entry points
     /// ([`Self::read_block_all_layers`] and friends) operate entirely
     /// in-bounds. They used to be 1-byte placeholders, which every one of
@@ -705,29 +787,25 @@ impl LayerKVPool {
             use crate::metal::MetalState;
             use metal::MTLResourceOptions;
 
-            let (key_block_size, value_block_size) = Self::block_bytes_for(&cfg, cache_dtype)?;
+            let bytes = Self::plane_bytes_for(&cfg, cache_dtype)?;
+            let (key_blob, value_blob) = bytes.blob();
             let overflow = || {
                 format!(
-                    "LayerKVPool::new_for_test: pool size overflows u64 ({key_block_size} key + \
-                     {value_block_size} value bytes per block x {num_blocks} blocks x \
+                    "LayerKVPool::new_for_test: pool size overflows u64 ({key_blob} key + \
+                     {value_blob} value bytes per block x {num_blocks} blocks x \
                      {num_layers} layers)"
                 )
             };
-            let key_cache_size = key_block_size
-                .checked_mul(num_blocks as u64)
-                .ok_or_else(overflow)?;
-            let value_cache_size = value_block_size
-                .checked_mul(num_blocks as u64)
-                .ok_or_else(overflow)?;
-            let total = key_cache_size
-                .checked_add(value_cache_size)
+            let total = key_blob
+                .checked_add(value_blob)
+                .and_then(|per_block| per_block.checked_mul(num_blocks as u64))
                 .and_then(|per_layer| per_layer.checked_mul(num_layers as u64))
                 .ok_or_else(overflow)?;
             if total > TEST_POOL_MAX_BYTES {
                 return Err(format!(
                     "LayerKVPool::new_for_test: {total} bytes exceeds the {TEST_POOL_MAX_BYTES} \
                      byte test-pool cap ({num_blocks} blocks x {num_layers} layers x \
-                     {key_block_size}+{value_block_size} bytes). `config.validate()` is skipped \
+                     {key_blob}+{value_blob} bytes). `config.validate()` is skipped \
                      here, so nothing else bounds this geometry."
                 ));
             }
@@ -735,23 +813,15 @@ impl LayerKVPool {
             let state = MetalState::get()?;
             let mut layers = Vec::with_capacity(num_layers as usize);
             for _ in 0..num_layers {
-                let k = state
-                    .device
-                    .try_new_buffer(key_cache_size, MTLResourceOptions::StorageModePrivate)
-                    .ok_or_else(|| {
-                        "LayerKVPool::new_for_test: Metal device failed to allocate key cache \
-                         buffer"
-                            .to_string()
-                    })?;
-                let v = state
-                    .device
-                    .try_new_buffer(value_cache_size, MTLResourceOptions::StorageModePrivate)
-                    .ok_or_else(|| {
-                        "LayerKVPool::new_for_test: Metal device failed to allocate value cache \
-                         buffer"
-                            .to_string()
-                    })?;
-                layers.push((k, v));
+                layers.push(
+                    LayerPlanes::allocate(
+                        &state.device,
+                        &bytes,
+                        num_blocks,
+                        MTLResourceOptions::StorageModePrivate,
+                    )
+                    .map_err(|error| format!("LayerKVPool::new_for_test: {error}"))?,
+                );
             }
 
             Ok(Self {
@@ -860,9 +930,9 @@ impl LayerKVPool {
     /// Grow the pool's per-layer K/V buffers to hold `new_num_blocks` block
     /// slots, preserving every byte of the existing blocks.
     ///
-    /// One layer at a time: allocate the layer's larger (key, value) pair,
-    /// blit the old bytes to offset 0 (block `i` stays at byte offset
-    /// `i * block_bytes`), wait for the copy, swap the pair in and drop the
+    /// One layer at a time: allocate the layer's larger planes, blit each
+    /// plane's old bytes to offset 0 (block `i` stays at byte offset
+    /// `i * block_bytes`), wait for the copy, swap the planes in and drop the
     /// old one, then move to the next layer. The peak is the new pool plus
     /// one old layer, not old plus new. [`Self::generation`] is bumped once
     /// per call that swapped any layer.
@@ -912,10 +982,9 @@ impl LayerKVPool {
             return Err("Metal GPU not available".to_string());
         }
 
-        // Same expression the blit ranges are addressed from — allocation
-        // and copy sizes cannot drift apart.
-        let (key_block_size, value_block_size) =
-            Self::block_bytes_for(&self.config, self.cache_dtype)?;
+        // Same table the blit ranges are addressed from — allocation and
+        // copy sizes cannot drift apart.
+        let bytes = self.plane_bytes()?;
 
         let mut inner = self.inner_write();
         // Re-check under the write lock: another grow may have landed while
@@ -924,39 +993,30 @@ impl LayerKVPool {
             return Ok(false);
         }
         let old_num_blocks = inner.num_blocks;
-        let overflow = |side: &str, per_block: u64, blocks: u32| {
-            format!(
-                "LayerKVPool::grow_to: {side} cache size overflows u64 ({per_block} bytes per \
-                 block x {blocks} blocks)"
-            )
+        let size = |per_block: u64, blocks: u32| {
+            per_block.checked_mul(blocks as u64).ok_or_else(|| {
+                format!(
+                    "LayerKVPool::grow_to: cache size overflows u64 ({per_block} bytes per \
+                     block x {blocks} blocks)"
+                )
+            })
         };
-        let new_key_size = key_block_size
-            .checked_mul(new_num_blocks as u64)
-            .ok_or_else(|| overflow("key", key_block_size, new_num_blocks))?;
-        let new_value_size = value_block_size
-            .checked_mul(new_num_blocks as u64)
-            .ok_or_else(|| overflow("value", value_block_size, new_num_blocks))?;
-        let old_key_bytes = key_block_size
-            .checked_mul(old_num_blocks as u64)
-            .ok_or_else(|| overflow("key", key_block_size, old_num_blocks))?;
-        let old_value_bytes = value_block_size
-            .checked_mul(old_num_blocks as u64)
-            .ok_or_else(|| overflow("value", value_block_size, old_num_blocks))?;
 
         let state = MetalState::get()?;
         // Preserve the original allocation's CPU accessibility across growth.
-        let storage = if inner.layers.iter().all(|(k, v)| {
-            k.storage_mode() == metal::MTLStorageMode::Shared
-                && v.storage_mode() == metal::MTLStorageMode::Shared
-        }) {
+        let storage = if inner.layers.iter().all(LayerPlanes::all_shared) {
             MTLResourceOptions::StorageModeShared
         } else {
             MTLResourceOptions::StorageModePrivate
         };
         let mut swapped = false;
         let mut grow_layer = |layer: usize, inner: &mut PoolInner| -> Result<(), String> {
-            let (old_key, old_value) = &inner.layers[layer];
-            if old_key.length() == new_key_size && old_value.length() == new_value_size {
+            let old = &inner.layers[layer];
+            let mut at_target = true;
+            for (plane, buffer) in old.planes() {
+                at_target &= buffer.length() == size(bytes.of(plane), new_num_blocks)?;
+            }
+            if at_target {
                 return Ok(());
             }
             #[cfg(test)]
@@ -968,13 +1028,8 @@ impl LayerKVPool {
             // Metal hands out nil buffers when an allocation cannot be
             // backed; `new_buffer` would panic here while the caller holds
             // the pool write lock.
-            let key_cache = state.device.try_new_buffer(new_key_size, storage);
-            let value_cache = state.device.try_new_buffer(new_value_size, storage);
-            let (Some(key_cache), Some(value_cache)) = (key_cache, value_cache) else {
-                return Err(format!(
-                    "LayerKVPool::grow_to: Metal returned a nil buffer for layer {layer}"
-                ));
-            };
+            let grown = LayerPlanes::allocate(&state.device, &bytes, new_num_blocks, storage)
+                .map_err(|error| format!("LayerKVPool::grow_to: layer {layer}: {error}"))?;
             let command_buffer = state
                 .command_queue
                 .try_new_command_buffer()
@@ -982,14 +1037,15 @@ impl LayerKVPool {
             let blit = command_buffer
                 .try_new_blit_command_encoder()
                 .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
-            blit.copy_from_buffer(old_key, 0, &key_cache, 0, old_key_bytes);
-            blit.copy_from_buffer(old_value, 0, &value_cache, 0, old_value_bytes);
+            for ((plane, from), (_, to)) in old.planes().zip(grown.planes()) {
+                blit.copy_from_buffer(from, 0, to, 0, size(bytes.of(plane), old_num_blocks)?);
+            }
             blit.end_encoding();
             command_buffer.commit();
             command_buffer.wait_until_completed();
             observe(&command_buffer, "LayerKVPool::grow_to")?;
-            self.swap_resident(&inner.layers[layer], (&key_cache, &value_cache));
-            inner.layers[layer] = (key_cache, value_cache);
+            self.swap_resident(&inner.layers[layer], &grown);
+            inner.layers[layer] = grown;
             swapped = true;
             Ok(())
         };
@@ -1023,23 +1079,19 @@ impl LayerKVPool {
         if !is_metal_extraction_supported() {
             return Err("Metal GPU not available".to_string());
         }
-        let (key_block_size, value_block_size) =
-            Self::block_bytes_for(&self.config, self.cache_dtype)?;
+        let bytes = self.plane_bytes()?;
         let inner = self.inner_write();
         for &(from, to) in moves {
-            for (layer, (key, value)) in inner.layers.iter().enumerate() {
-                for (side, buffer, block_bytes) in [
-                    ("key", key, key_block_size),
-                    ("value", value, value_block_size),
-                ] {
+            for (layer, planes) in inner.layers.iter().enumerate() {
+                for (plane, buffer) in planes.planes() {
                     let fits = |id: u32| {
                         id < inner.num_blocks
-                            && Self::block_slot_end(id, block_bytes)
+                            && Self::block_slot_end(id, bytes.of(plane))
                                 .is_some_and(|end| end <= buffer.length())
                     };
                     if !fits(from) || !fits(to) {
                         return Err(format!(
-                            "LayerKVPool::move_blocks: layer {layer} {side} buffer cannot hold \
+                            "LayerKVPool::move_blocks: layer {layer} {plane:?} buffer cannot hold \
                              blocks {from} and {to} ({} blocks, {} bytes)",
                             inner.num_blocks,
                             buffer.length()
@@ -1056,22 +1108,18 @@ impl LayerKVPool {
         let blit = command_buffer
             .try_new_blit_command_encoder()
             .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
-        for (key, value) in &inner.layers {
-            for &(from, to) in moves {
-                blit.copy_from_buffer(
-                    key,
-                    from as u64 * key_block_size,
-                    key,
-                    to as u64 * key_block_size,
-                    key_block_size,
-                );
-                blit.copy_from_buffer(
-                    value,
-                    from as u64 * value_block_size,
-                    value,
-                    to as u64 * value_block_size,
-                    value_block_size,
-                );
+        for planes in &inner.layers {
+            for (plane, buffer) in planes.planes() {
+                let block_bytes = bytes.of(plane);
+                for &(from, to) in moves {
+                    blit.copy_from_buffer(
+                        buffer,
+                        from as u64 * block_bytes,
+                        buffer,
+                        to as u64 * block_bytes,
+                        block_bytes,
+                    );
+                }
             }
         }
         blit.end_encoding();
@@ -1124,30 +1172,22 @@ impl LayerKVPool {
         if !is_metal_extraction_supported() {
             return Err("Metal GPU not available".to_string());
         }
-        let (key_block_size, value_block_size) =
-            Self::block_bytes_for(&self.config, self.cache_dtype)?;
-        let overflow = |side: &str, per_block: u64| {
-            format!(
-                "LayerKVPool::shrink_to: {side} cache size overflows u64 ({per_block} bytes per \
-                 block x {new_num_blocks} blocks)"
-            )
+        let bytes = self.plane_bytes()?;
+        let size = |per_block: u64| {
+            per_block.checked_mul(new_num_blocks as u64).ok_or_else(|| {
+                format!(
+                    "LayerKVPool::shrink_to: cache size overflows u64 ({per_block} bytes per \
+                     block x {new_num_blocks} blocks)"
+                )
+            })
         };
-        let new_key_size = key_block_size
-            .checked_mul(new_num_blocks as u64)
-            .ok_or_else(|| overflow("key", key_block_size))?;
-        let new_value_size = value_block_size
-            .checked_mul(new_num_blocks as u64)
-            .ok_or_else(|| overflow("value", value_block_size))?;
 
         let mut inner = self.inner_write();
         if new_num_blocks > inner.num_blocks {
             return Ok(false);
         }
         let state = MetalState::get()?;
-        let storage = if inner.layers.iter().all(|(k, v)| {
-            k.storage_mode() == metal::MTLStorageMode::Shared
-                && v.storage_mode() == metal::MTLStorageMode::Shared
-        }) {
+        let storage = if inner.layers.iter().all(LayerPlanes::all_shared) {
             MTLResourceOptions::StorageModeShared
         } else {
             MTLResourceOptions::StorageModePrivate
@@ -1155,8 +1195,12 @@ impl LayerKVPool {
         inner.num_blocks = new_num_blocks;
         let mut swapped = false;
         let mut shrink_layer = |layer: usize, inner: &mut PoolInner| -> Result<(), String> {
-            let (old_key, old_value) = &inner.layers[layer];
-            if old_key.length() <= new_key_size && old_value.length() <= new_value_size {
+            let old = &inner.layers[layer];
+            let mut within = true;
+            for (plane, buffer) in old.planes() {
+                within &= buffer.length() <= size(bytes.of(plane))?;
+            }
+            if within {
                 return Ok(());
             }
             #[cfg(any(test, feature = "test-hooks"))]
@@ -1165,13 +1209,8 @@ impl LayerKVPool {
                     "LayerKVPool::shrink_to: injected failure at layer {layer}"
                 ));
             }
-            let key_cache = state.device.try_new_buffer(new_key_size, storage);
-            let value_cache = state.device.try_new_buffer(new_value_size, storage);
-            let (Some(key_cache), Some(value_cache)) = (key_cache, value_cache) else {
-                return Err(format!(
-                    "LayerKVPool::shrink_to: Metal returned a nil buffer for layer {layer}"
-                ));
-            };
+            let shrunk = LayerPlanes::allocate(&state.device, &bytes, new_num_blocks, storage)
+                .map_err(|error| format!("LayerKVPool::shrink_to: layer {layer}: {error}"))?;
             let command_buffer = state
                 .command_queue
                 .try_new_command_buffer()
@@ -1179,14 +1218,15 @@ impl LayerKVPool {
             let blit = command_buffer
                 .try_new_blit_command_encoder()
                 .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
-            blit.copy_from_buffer(old_key, 0, &key_cache, 0, new_key_size);
-            blit.copy_from_buffer(old_value, 0, &value_cache, 0, new_value_size);
+            for ((plane, from), (_, to)) in old.planes().zip(shrunk.planes()) {
+                blit.copy_from_buffer(from, 0, to, 0, size(bytes.of(plane))?);
+            }
             blit.end_encoding();
             command_buffer.commit();
             command_buffer.wait_until_completed();
             observe(&command_buffer, "LayerKVPool::shrink_to")?;
-            self.swap_resident(&inner.layers[layer], (&key_cache, &value_cache));
-            inner.layers[layer] = (key_cache, value_cache);
+            self.swap_resident(&inner.layers[layer], &shrunk);
+            inner.layers[layer] = shrunk;
             swapped = true;
             Ok(())
         };
@@ -1211,19 +1251,16 @@ impl LayerKVPool {
     pub fn shrink_pending(&self) -> bool {
         #[cfg(target_os = "macos")]
         {
-            let Ok((key_block_size, value_block_size)) =
-                Self::block_bytes_for(&self.config, self.cache_dtype)
-            else {
+            let Ok(bytes) = self.plane_bytes() else {
                 return false;
             };
             let inner = self.inner_read();
             let blocks = inner.num_blocks as u64;
-            let key_size = key_block_size.saturating_mul(blocks);
-            let value_size = value_block_size.saturating_mul(blocks);
-            inner
-                .layers
-                .iter()
-                .any(|(k, v)| k.length() > key_size || v.length() > value_size)
+            inner.layers.iter().any(|layer| {
+                layer
+                    .planes()
+                    .any(|(plane, buffer)| buffer.length() > bytes.of(plane).saturating_mul(blocks))
+            })
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -1314,7 +1351,7 @@ impl LayerKVPool {
         let buffers: Vec<&metal::BufferRef> = inner
             .layers
             .iter()
-            .flat_map(|(key, value)| [&**key, &**value])
+            .flat_map(|layer| layer.planes().map(|(_, buffer)| &**buffer))
             .collect();
         residency.add_all(&buffers);
         drop(inner);
@@ -1326,43 +1363,43 @@ impl LayerKVPool {
     }
 
     #[cfg(target_os = "macos")]
-    fn swap_resident(&self, old: &(Buffer, Buffer), new: (&Buffer, &Buffer)) {
+    fn swap_resident(&self, old: &LayerPlanes, new: &LayerPlanes) {
         if let Some(residency) = self.residency.get() {
-            residency.swap([&old.0, &old.1], [new.0, new.1]);
+            fn members(layer: &LayerPlanes) -> Vec<&metal::BufferRef> {
+                layer.planes().map(|(_, buffer)| &**buffer).collect()
+            }
+            residency.swap(&members(old), &members(new));
         }
     }
 
-    /// Total bytes the pool's K/V buffers currently occupy, summed over both
-    /// sides and all layers — for cache-limit accounting. Measures the
-    /// buffers, so a grow that failed part way counts the layers it grew.
+    /// Total bytes the pool's buffers currently occupy, summed over every
+    /// plane and layer — for cache-limit accounting. Measures the buffers,
+    /// so a grow that failed part way counts the layers it grew.
     pub fn total_bytes(&self) -> u64 {
         #[cfg(target_os = "macos")]
         {
-            self.inner_read().layers.iter().fold(0u64, |total, (k, v)| {
-                total.saturating_add(k.length()).saturating_add(v.length())
-            })
+            self.inner_read()
+                .layers
+                .iter()
+                .fold(0u64, |total, layer| total.saturating_add(layer.length()))
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let per_block_per_layer = match Self::block_bytes_for(&self.config, self.cache_dtype) {
-                Ok((key, value)) => key.saturating_add(value),
-                Err(_) => return 0,
-            };
-            per_block_per_layer
-                .saturating_mul(self.num_blocks() as u64)
+            self.layer_bytes_for(self.num_blocks())
+                .unwrap_or(0)
                 .saturating_mul(self.num_layers() as u64)
         }
     }
 
-    /// K+V bytes each layer's buffers occupy now, in layer order. Layers
-    /// differ after a grow or a cut that failed part way.
+    /// Bytes each layer's buffers occupy now, in layer order. Layers differ
+    /// after a grow or a cut that failed part way.
     pub fn layer_bytes(&self) -> Vec<u64> {
         #[cfg(target_os = "macos")]
         {
             self.inner_read()
                 .layers
                 .iter()
-                .map(|(k, v)| k.length().saturating_add(v.length()))
+                .map(LayerPlanes::length)
                 .collect()
         }
         #[cfg(not(target_os = "macos"))]
@@ -1372,9 +1409,9 @@ impl LayerKVPool {
         }
     }
 
-    /// K+V bytes one layer of `blocks` blocks occupies.
+    /// Bytes one layer of `blocks` blocks occupies, every plane included.
     pub fn layer_bytes_for(&self, blocks: u32) -> Result<u64, String> {
-        let (key, value) = Self::block_bytes_for(&self.config, self.cache_dtype)?;
+        let (key, value) = self.block_blob_bytes()?;
         key.checked_add(value)
             .and_then(|bytes| bytes.checked_mul(u64::from(blocks)))
             .ok_or_else(|| format!("LayerKVPool: layer size overflows u64 ({blocks} blocks)"))
@@ -1409,7 +1446,7 @@ impl LayerKVPool {
         self.inner_read()
             .layers
             .get(layer_idx as usize)
-            .map(|(k, _)| k.clone())
+            .map(|layer| layer.key.clone())
     }
 
     /// Get the value cache buffer for a layer. `None` if `layer_idx` is
@@ -1419,7 +1456,7 @@ impl LayerKVPool {
         self.inner_read()
             .layers
             .get(layer_idx as usize)
-            .map(|(_, v)| v.clone())
+            .map(|layer| layer.value.clone())
     }
 
     /// Wrap the K cache buffer for `layer_idx` as a zero-copy MLX `array`
@@ -1454,7 +1491,8 @@ impl LayerKVPool {
         }
         let key_cache = {
             let inner = self.inner_read();
-            let Some((key_cache, _)) = inner.layers.get(layer_idx as usize) else {
+            let Some(LayerPlanes { key: key_cache, .. }) = inner.layers.get(layer_idx as usize)
+            else {
                 return Err(format!(
                     "LayerKVPool::key_cache_array_raw: layer_idx {} out of range \
                      (num_layers = {})",
@@ -1508,7 +1546,10 @@ impl LayerKVPool {
         }
         let value_cache = {
             let inner = self.inner_read();
-            let Some((_, value_cache)) = inner.layers.get(layer_idx as usize) else {
+            let Some(LayerPlanes {
+                value: value_cache, ..
+            }) = inner.layers.get(layer_idx as usize)
+            else {
                 return Err(format!(
                     "LayerKVPool::value_cache_array_raw: layer_idx {} out of range \
                      (num_layers = {})",
@@ -1538,6 +1579,78 @@ impl LayerKVPool {
             );
         }
         Ok(arr)
+    }
+
+    /// Wrap the K scale plane of `layer_idx` as a zero-copy f32 MLX view of
+    /// shape [`Self::scale_shape`] (Splash `splash_q8_scale_index`). `Err`
+    /// for a pool without scale planes. Ownership as
+    /// [`Self::key_cache_array_raw`].
+    #[cfg(target_os = "macos")]
+    pub fn key_scale_array_raw(&self, layer_idx: u32) -> Result<*mut mlx_sys::mlx_array, String> {
+        self.scale_array_raw(layer_idx, true)
+    }
+
+    /// The V twin of [`Self::key_scale_array_raw`].
+    #[cfg(target_os = "macos")]
+    pub fn value_scale_array_raw(&self, layer_idx: u32) -> Result<*mut mlx_sys::mlx_array, String> {
+        self.scale_array_raw(layer_idx, false)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn scale_array_raw(
+        &self,
+        layer_idx: u32,
+        key: bool,
+    ) -> Result<*mut mlx_sys::mlx_array, String> {
+        use crate::metal::is_metal_extraction_supported;
+
+        if !is_metal_extraction_supported() {
+            return Err("Metal GPU not available".to_string());
+        }
+        let buffer = {
+            let inner = self.inner_read();
+            let layer = inner.layers.get(layer_idx as usize).ok_or_else(|| {
+                format!(
+                    "LayerKVPool::scale_array_raw: layer_idx {layer_idx} out of range \
+                     (num_layers = {})",
+                    inner.layers.len()
+                )
+            })?;
+            let (key_scales, value_scales) = layer.scales.as_ref().ok_or_else(|| {
+                format!(
+                    "LayerKVPool::scale_array_raw: a {:?} pool has no scale planes",
+                    self.cache_dtype
+                )
+            })?;
+            if key {
+                key_scales.clone()
+            } else {
+                value_scales.clone()
+            }
+        };
+        let dims = self.scale_shape();
+        // SAFETY: as `key_cache_array_raw`; code 0 is `BridgeDType::FLOAT32`.
+        let arr = unsafe {
+            mlx_sys::mlx_array_from_metal_buffer_view(
+                buffer.as_ptr() as *mut _,
+                dims.as_ptr(),
+                dims.len(),
+                0,
+            )
+        };
+        if arr.is_null() {
+            return Err("mlx_array_from_metal_buffer_view returned null".to_string());
+        }
+        Ok(arr)
+    }
+
+    /// Scale plane view shape `[num_blocks, num_kv_heads, block_size]`.
+    pub fn scale_shape(&self) -> [i64; 3] {
+        [
+            self.num_blocks() as i64,
+            self.config.num_kv_heads as i64,
+            self.config.block_size as i64,
+        ]
     }
 
     /// Compute the K cache view shape for `layer_idx`. `x` is the
@@ -1620,13 +1733,21 @@ impl LayerKVPool {
         if !is_metal_extraction_supported() {
             return Err("Metal GPU not available".to_string());
         }
+        // One store path (Splash `PagedAttention::addPrefillStore`): an int8
+        // pool is written only by the `PagedKVWrite` primitive.
+        if self.cache_dtype == MetalDtype::Int8 {
+            return Err(
+                "LayerKVPool::write_kv: an int8 pool is written only through PagedKVWrite"
+                    .to_string(),
+            );
+        }
 
         let (key_cache, value_cache) = {
             let inner = self.inner_read();
             match inner.layers.get(layer_idx as usize) {
                 // Clone the pair (Metal retains) and drop the lock before
                 // any GPU work.
-                Some(pair) => pair.clone(),
+                Some(layer) => (layer.key.clone(), layer.value.clone()),
                 None => {
                     return Err(format!(
                         "LayerKVPool::write_kv: layer_idx {} out of range (num_layers = {})",
@@ -1910,11 +2031,16 @@ impl LayerKVPool {
         if !is_metal_extraction_supported() {
             return Err("Metal GPU not available".to_string());
         }
+        if self.cache_dtype == MetalDtype::Int8 {
+            return Err(
+                "LayerKVPool::gather_attention: int8 paged reads are not built".to_string(),
+            );
+        }
 
         let (key_cache, value_cache) = {
             let inner = self.inner_read();
             match inner.layers.get(layer_idx as usize) {
-                Some(pair) => pair.clone(),
+                Some(layer) => (layer.key.clone(), layer.value.clone()),
                 None => {
                     return Err(format!(
                         "LayerKVPool::gather_attention: layer_idx {} out of range \
@@ -2021,10 +2147,10 @@ impl LayerKVPool {
         // enough that the original misroute pattern could resurface as a
         // "kernel not found" mystery. Catching it here at the API boundary
         // points right at the caller's bug.
-        if !cache_dtype.is_fp8() && io_dtype != cache_dtype {
+        if !cache_dtype.is_fp8() && io_dtype != cache_dtype.io_dtype() {
             return Err(format!(
-                "LayerKVPool::gather_attention: query_dtype ({:?}) must equal cache_dtype \
-                 ({:?}) for non-FP8 caches; the metal source only instantiates same-dtype \
+                "LayerKVPool::gather_attention: query_dtype ({:?}) must equal the io dtype of \
+                 cache_dtype ({:?}) for non-FP8 caches; the metal source only instantiates same-dtype \
                  (io_t, cache_t) pairs for non-FP8.",
                 io_dtype, cache_dtype
             ));
@@ -2093,9 +2219,9 @@ impl LayerKVPool {
             return Err("Metal GPU not available".to_string());
         }
 
-        let (key_cache, value_cache, num_blocks) = {
+        let (layer, num_blocks) = {
             let inner = self.inner_read();
-            let Some(pair) = inner.layers.get(layer_idx as usize) else {
+            let Some(layer) = inner.layers.get(layer_idx as usize) else {
                 return Err(format!(
                     "LayerKVPool::read_blocks_to_host: layer_idx {} out of range \
                      (num_layers = {})",
@@ -2103,7 +2229,7 @@ impl LayerKVPool {
                     inner.layers.len()
                 ));
             };
-            (pair.0.clone(), pair.1.clone(), inner.num_blocks)
+            (layer.clone(), inner.num_blocks)
         };
         if block_ids.is_empty() {
             return Ok((Vec::new(), Vec::new()));
@@ -2118,7 +2244,7 @@ impl LayerKVPool {
             }
         }
 
-        let (key_block_size, value_block_size) = self.block_bytes_per_layer()?;
+        let bytes = self.plane_bytes()?;
         // The largest id owns the highest slot, so checking it alone bounds
         // every blit this call encodes.
         if let Some(&max_block_id) = block_ids.iter().max() {
@@ -2126,17 +2252,16 @@ impl LayerKVPool {
                 "LayerKVPool::read_blocks_to_host",
                 layer_idx as usize,
                 max_block_id,
-                key_block_size,
-                value_block_size,
+                &bytes,
             )?;
         }
 
-        let total_keys = key_block_size as usize * block_ids.len();
-        let total_values = value_block_size as usize * block_ids.len();
+        let (key_blob, value_blob) = bytes.blob();
+        let total_keys = key_blob as usize * block_ids.len();
+        let total_values = value_blob as usize * block_ids.len();
 
-        // Allocate one shared staging buffer per side, sized for all the
-        // requested blocks. We then issue per-block blits at the right
-        // (src_offset, dst_offset) pairs in a single command buffer.
+        // One shared staging buffer per side, sized for all the requested
+        // blocks; per-block, per-plane blits in a single command buffer.
         use crate::metal::MetalState;
         use metal::MTLResourceOptions;
         let state = MetalState::get()?;
@@ -2166,24 +2291,20 @@ impl LayerKVPool {
             .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
 
         for (i, &block_id) in block_ids.iter().enumerate() {
-            let key_src_offset = block_id as u64 * key_block_size;
-            let value_src_offset = block_id as u64 * value_block_size;
-            let key_dst_offset = i as u64 * key_block_size;
-            let value_dst_offset = i as u64 * value_block_size;
-            blit_encoder.copy_from_buffer(
-                &key_cache,
-                key_src_offset,
-                &key_staging,
-                key_dst_offset,
-                key_block_size,
-            );
-            blit_encoder.copy_from_buffer(
-                &value_cache,
-                value_src_offset,
-                &value_staging,
-                value_dst_offset,
-                value_block_size,
-            );
+            for (plane, buffer) in layer.planes() {
+                let (staging, blob) = if plane.is_key_side() {
+                    (&key_staging, key_blob)
+                } else {
+                    (&value_staging, value_blob)
+                };
+                blit_encoder.copy_from_buffer(
+                    buffer,
+                    block_id as u64 * bytes.of(plane),
+                    staging,
+                    i as u64 * blob + bytes.blob_offset(plane),
+                    bytes.of(plane),
+                );
+            }
         }
         blit_encoder.end_encoding();
         command_buffer.commit();
@@ -2263,70 +2384,58 @@ impl LayerKVPool {
                 block_id, num_blocks
             ));
         }
-        let (key_block_size, value_block_size) = self.block_bytes_per_layer()?;
+        let bytes = self.plane_bytes()?;
+        let (key_blob, value_blob) = bytes.blob();
         let num_layers = layers.len();
-        self.check_slot_fits_all_layers(
-            "LayerKVPool::read_block_all_layers",
-            block_id,
-            key_block_size,
-            value_block_size,
-        )?;
+        self.check_slot_fits_all_layers("LayerKVPool::read_block_all_layers", block_id, &bytes)?;
 
-        if layers.iter().all(|(k, v)| {
-            k.storage_mode() == metal::MTLStorageMode::Shared
-                && v.storage_mode() == metal::MTLStorageMode::Shared
-        }) {
+        if layers.iter().all(LayerPlanes::all_shared) {
             let _copy_guard = self
                 .restore_staging
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             let mut result = Vec::with_capacity(num_layers);
-            for (k, v) in &layers {
-                // SAFETY: the shared buffers are retained, their complete slots
-                // were checked above, and the completed-write/pin contract plus
-                // this transfer lease excludes mutation. The borrowed slices
-                // live only through the copy into independent writer snapshots.
-                let (keys, values) = unsafe {
-                    (
-                        std::slice::from_raw_parts(
-                            (k.contents() as *const u8)
-                                .add(block_id as usize * key_block_size as usize),
-                            key_block_size as usize,
-                        )
-                        .to_vec(),
-                        std::slice::from_raw_parts(
-                            (v.contents() as *const u8)
-                                .add(block_id as usize * value_block_size as usize),
-                            value_block_size as usize,
-                        )
-                        .to_vec(),
-                    )
-                };
+            for layer in &layers {
+                let mut keys = vec![0u8; key_blob as usize];
+                let mut values = vec![0u8; value_blob as usize];
+                for (plane, buffer) in layer.planes() {
+                    let blob = if plane.is_key_side() {
+                        &mut keys
+                    } else {
+                        &mut values
+                    };
+                    let offset = bytes.blob_offset(plane) as usize;
+                    let len = bytes.of(plane) as usize;
+                    // SAFETY: the shared buffers are retained, their complete
+                    // slots were checked above, and the completed-write/pin
+                    // contract plus this transfer lease excludes mutation.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            (buffer.contents() as *const u8).add(block_id as usize * len),
+                            blob[offset..offset + len].as_mut_ptr(),
+                            len,
+                        );
+                    }
+                }
                 result.push((keys, values));
             }
             return Ok(result);
         }
 
         // Exactly two staging buffers for the whole block; layer `i` owns the
-        // window at `i * block_bytes` in each.
-        //
-        // The products are checked rather than bare `*`. Under `Self::new`
-        // they cannot overflow — the pool's own buffers are already allocated
-        // at `num_blocks` times this — but that is a property of the caller,
-        // and this is the only arithmetic in the function that feeds raw
-        // pointer math below.
+        // blob window at `i * blob_bytes` in each.
         let staging_overflow = |side: &str, per_layer: u64| {
             format!(
                 "LayerKVPool::read_block_all_layers: {side} staging size overflows u64 \
                  ({per_layer} bytes x {num_layers} layers)"
             )
         };
-        let key_staging_size = key_block_size
+        let key_staging_size = key_blob
             .checked_mul(num_layers as u64)
-            .ok_or_else(|| staging_overflow("key", key_block_size))?;
-        let value_staging_size = value_block_size
+            .ok_or_else(|| staging_overflow("key", key_blob))?;
+        let value_staging_size = value_blob
             .checked_mul(num_layers as u64)
-            .ok_or_else(|| staging_overflow("value", value_block_size))?;
+            .ok_or_else(|| staging_overflow("value", value_blob))?;
 
         let state = MetalState::get()?;
         let key_staging = state
@@ -2353,21 +2462,21 @@ impl LayerKVPool {
         let blit = command_buffer
             .try_new_blit_command_encoder()
             .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
-        for (layer_idx, (key_cache, value_cache)) in layers.iter().enumerate() {
-            blit.copy_from_buffer(
-                key_cache,
-                block_id as u64 * key_block_size,
-                &key_staging,
-                layer_idx as u64 * key_block_size,
-                key_block_size,
-            );
-            blit.copy_from_buffer(
-                value_cache,
-                block_id as u64 * value_block_size,
-                &value_staging,
-                layer_idx as u64 * value_block_size,
-                value_block_size,
-            );
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            for (plane, buffer) in layer.planes() {
+                let (staging, blob) = if plane.is_key_side() {
+                    (&key_staging, key_blob)
+                } else {
+                    (&value_staging, value_blob)
+                };
+                blit.copy_from_buffer(
+                    buffer,
+                    block_id as u64 * bytes.of(plane),
+                    staging,
+                    layer_idx as u64 * blob + bytes.blob_offset(plane),
+                    bytes.of(plane),
+                );
+            }
         }
         blit.end_encoding();
         command_buffer.commit();
@@ -2378,17 +2487,13 @@ impl LayerKVPool {
         // be restored as corruption by some later process.
         observe(&command_buffer, "LayerKVPool::read_block_all_layers")?;
 
-        let key_bytes = key_block_size as usize;
-        let value_bytes = value_block_size as usize;
+        let key_bytes = key_blob as usize;
+        let value_bytes = value_blob as usize;
         let mut layers = Vec::with_capacity(num_layers);
         // SAFETY: the shared staging buffers are CPU-accessible now that the
         // blit has completed, they stay alive for this whole loop, and each
         // layer reads its own disjoint window. The cursors walk exactly the
-        // `num_layers * block_bytes` the buffers were allocated at, so every
-        // read is in bounds and the final advance lands one past the end,
-        // which `add` permits. Walking a cursor rather than indexing by
-        // `layer_idx * block_bytes` keeps multiplication out of the pointer
-        // arithmetic entirely.
+        // `num_layers * blob_bytes` the buffers were allocated at.
         unsafe {
             let mut key_cursor = key_staging.contents() as *const u8;
             let mut value_cursor = value_staging.contents() as *const u8;
@@ -2434,9 +2539,9 @@ impl LayerKVPool {
         if !is_metal_extraction_supported() {
             return Err("Metal GPU not available".to_string());
         }
-        let (key_cache, value_cache, num_blocks) = {
+        let (layer, num_blocks) = {
             let inner = self.inner_read();
-            let Some(pair) = inner.layers.get(layer_idx as usize) else {
+            let Some(layer) = inner.layers.get(layer_idx as usize) else {
                 return Err(format!(
                     "LayerKVPool::write_blocks_from_host: layer_idx {} out of range \
                      (num_layers = {})",
@@ -2444,7 +2549,7 @@ impl LayerKVPool {
                     inner.layers.len()
                 ));
             };
-            (pair.0.clone(), pair.1.clone(), inner.num_blocks)
+            (layer.clone(), inner.num_blocks)
         };
         for &id in block_ids {
             if id >= num_blocks {
@@ -2455,9 +2560,10 @@ impl LayerKVPool {
             }
         }
 
-        let (key_block_size, value_block_size) = self.block_bytes_per_layer()?;
-        let expected_keys = key_block_size as usize * block_ids.len();
-        let expected_values = value_block_size as usize * block_ids.len();
+        let bytes = self.plane_bytes()?;
+        let (key_blob, value_blob) = bytes.blob();
+        let expected_keys = key_blob as usize * block_ids.len();
+        let expected_values = value_blob as usize * block_ids.len();
         if keys_bytes.len() != expected_keys || values_bytes.len() != expected_values {
             return Err(format!(
                 "LayerKVPool::write_blocks_from_host: byte length mismatch (keys {} != {}, values {} != {})",
@@ -2479,8 +2585,7 @@ impl LayerKVPool {
                 "LayerKVPool::write_blocks_from_host",
                 layer_idx as usize,
                 max_block_id,
-                key_block_size,
-                value_block_size,
+                &bytes,
             )?;
         }
 
@@ -2509,20 +2614,20 @@ impl LayerKVPool {
             .try_new_blit_command_encoder()
             .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
         for (i, &block_id) in block_ids.iter().enumerate() {
-            blit.copy_from_buffer(
-                &key_staging,
-                i as u64 * key_block_size,
-                &key_cache,
-                block_id as u64 * key_block_size,
-                key_block_size,
-            );
-            blit.copy_from_buffer(
-                &value_staging,
-                i as u64 * value_block_size,
-                &value_cache,
-                block_id as u64 * value_block_size,
-                value_block_size,
-            );
+            for (plane, buffer) in layer.planes() {
+                let (staging, blob) = if plane.is_key_side() {
+                    (&key_staging, key_blob)
+                } else {
+                    (&value_staging, value_blob)
+                };
+                blit.copy_from_buffer(
+                    staging,
+                    i as u64 * blob + bytes.blob_offset(plane),
+                    buffer,
+                    block_id as u64 * bytes.of(plane),
+                    bytes.of(plane),
+                );
+            }
         }
         blit.end_encoding();
         command_buffer.commit();
@@ -2595,7 +2700,8 @@ impl LayerKVPool {
         if layers.is_empty() {
             return Err("LayerKVPool::write_block_all_layers: pool has zero layers".into());
         }
-        let (key_bytes, value_bytes) = self.block_bytes_per_layer()?;
+        let bytes = self.plane_bytes()?;
+        let (key_bytes, value_bytes) = bytes.blob();
         let mut destinations = std::collections::HashSet::with_capacity(blocks.len());
         for (block_id, source) in blocks {
             if *block_id >= inner.num_blocks {
@@ -2614,54 +2720,47 @@ impl LayerKVPool {
                     layers.len()
                 ));
             }
-            for (layer, ((keys, values), (key_pool, value_pool))) in
-                source.iter().zip(layers).enumerate()
-            {
+            for (layer, ((keys, values), planes)) in source.iter().zip(layers).enumerate() {
                 if keys.len() as u64 != key_bytes || values.len() as u64 != value_bytes {
                     return Err(format!("restore layer {layer} byte length mismatch"));
                 }
-                for (side, buffer, bytes) in [
-                    ("key", key_pool, key_bytes),
-                    ("value", value_pool, value_bytes),
-                ] {
-                    let end = Self::block_slot_end(*block_id, bytes)
-                        .ok_or_else(|| format!("restore layer {layer} {side} slot overflow"))?;
+                for (plane, buffer) in planes.planes() {
+                    let per_block = bytes.of(plane);
+                    let end = Self::block_slot_end(*block_id, per_block)
+                        .ok_or_else(|| format!("restore layer {layer} {plane:?} slot overflow"))?;
                     if end > buffer.length() {
                         return Err(format!(
-                            "restore layer {layer} {side} buffer is {} bytes but \
-                            block {block_id} requires {end} ({bytes} bytes per block)",
+                            "restore layer {layer} {plane:?} buffer is {} bytes but \
+                            block {block_id} requires {end} ({per_block} bytes per block)",
                             buffer.length()
                         ));
                     }
                 }
             }
         }
-        if layers.iter().all(|(k, v)| {
-            k.storage_mode() == metal::MTLStorageMode::Shared
-                && v.storage_mode() == metal::MTLStorageMode::Shared
-        }) {
+        if layers.iter().all(LayerPlanes::all_shared) {
             let _copy_guard = self
                 .restore_staging
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             for (block_id, source) in blocks {
-                for ((keys, values), (k, v)) in source.iter().zip(layers) {
-                    // SAFETY: all source lengths and destination slots were
-                    // checked before any write. Shared buffers remain retained
-                    // under the generation lock; the transfer lease serializes
-                    // host access and reserved slots exclude live GPU users.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            keys.as_ptr(),
-                            (k.contents() as *mut u8).add(*block_id as usize * key_bytes as usize),
-                            keys.len(),
-                        );
-                        std::ptr::copy_nonoverlapping(
-                            values.as_ptr(),
-                            (v.contents() as *mut u8)
-                                .add(*block_id as usize * value_bytes as usize),
-                            values.len(),
-                        );
+                for ((keys, values), planes) in source.iter().zip(layers) {
+                    for (plane, buffer) in planes.planes() {
+                        let blob = if plane.is_key_side() { keys } else { values };
+                        let offset = bytes.blob_offset(plane) as usize;
+                        let len = bytes.of(plane) as usize;
+                        // SAFETY: all source lengths and destination slots were
+                        // checked before any write. Shared buffers remain
+                        // retained under the generation lock; the transfer
+                        // lease serializes host access and reserved slots
+                        // exclude live GPU users.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                blob[offset..offset + len].as_ptr(),
+                                (buffer.contents() as *mut u8).add(*block_id as usize * len),
+                                len,
+                            );
+                        }
                     }
                 }
             }
@@ -2739,22 +2838,22 @@ impl LayerKVPool {
                 .try_new_blit_command_encoder()
                 .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
             for (position, (block_id, _)) in chunk.iter().enumerate() {
-                for (layer, (key_pool, value_pool)) in layers.iter().enumerate() {
+                for (layer, planes) in layers.iter().enumerate() {
                     let source = (position * layers.len() + layer) as u64;
-                    blit.copy_from_buffer(
-                        key_staging,
-                        source * key_bytes,
-                        key_pool,
-                        u64::from(*block_id) * key_bytes,
-                        key_bytes,
-                    );
-                    blit.copy_from_buffer(
-                        value_staging,
-                        source * value_bytes,
-                        value_pool,
-                        u64::from(*block_id) * value_bytes,
-                        value_bytes,
-                    );
+                    for (plane, buffer) in planes.planes() {
+                        let (staging, blob) = if plane.is_key_side() {
+                            (key_staging, key_bytes)
+                        } else {
+                            (value_staging, value_bytes)
+                        };
+                        blit.copy_from_buffer(
+                            staging,
+                            source * blob + bytes.blob_offset(plane),
+                            buffer,
+                            u64::from(*block_id) * bytes.of(plane),
+                            bytes.of(plane),
+                        );
+                    }
                 }
             }
             blit.end_encoding();
@@ -3368,7 +3467,7 @@ mod tests {
                 config.block_size = 16;
             }
             let pool = LayerKVPool::new_inner(config, 4, 8, dtype, true).unwrap();
-            let (key_bytes, _) = pool.block_bytes_per_layer().unwrap();
+            let (key_bytes, _) = pool.block_blob_bytes().unwrap();
             let payload = distinct_layer_bytes(3, key_bytes as usize);
             let borrow = || {
                 payload
@@ -3416,13 +3515,7 @@ mod tests {
             assert_eq!(pool.read_block_all_layers(2).unwrap(), poison);
             pool.write_blocks_all_layers(&[(7, borrow())]).unwrap();
             assert_eq!(pool.read_block_all_layers(7).unwrap(), payload);
-            assert!(
-                pool.inner_read()
-                    .layers
-                    .iter()
-                    .all(|(k, v)| k.storage_mode() == metal::MTLStorageMode::Shared
-                        && v.storage_mode() == metal::MTLStorageMode::Shared)
-            );
+            assert!(pool.inner_read().layers.iter().all(LayerPlanes::all_shared));
             assert!(
                 pool.restore_staging.lock().unwrap().is_none(),
                 "CPU transfers must not allocate staging"
@@ -3431,14 +3524,11 @@ mod tests {
         let private =
             LayerKVPool::new_inner(base_config(2), 4, 8, MetalDtype::BFloat16, false).unwrap();
         assert!(private.grow_to(8).unwrap());
-        assert!(
-            private
-                .inner_read()
-                .layers
-                .iter()
-                .all(|(k, v)| k.storage_mode() == metal::MTLStorageMode::Private
-                    && v.storage_mode() == metal::MTLStorageMode::Private)
-        );
+        assert!(private.inner_read().layers.iter().all(|layer| {
+            layer
+                .planes()
+                .all(|(_, b)| b.storage_mode() == metal::MTLStorageMode::Private)
+        }));
     }
 
     /// Which side of a layer's `(key, value)` pair a mutation shrinks.
@@ -3460,11 +3550,7 @@ mod tests {
     /// The LAST layer is the victim on purpose: a check that inspects only
     /// layer 0 passes with this in place.
     #[cfg(target_os = "macos")]
-    fn shrink_layer_buffer(
-        pool: &LayerKVPool,
-        layer_idx: usize,
-        side: ShrinkSide,
-    ) -> (Buffer, Buffer) {
+    fn shrink_layer_buffer(pool: &LayerKVPool, layer_idx: usize, side: ShrinkSide) -> LayerPlanes {
         use crate::metal::MetalState;
         use metal::MTLResourceOptions;
         let state = MetalState::get().expect("metal state for the shrink");
@@ -3475,8 +3561,8 @@ mod tests {
             .try_new_buffer(1, MTLResourceOptions::StorageModePrivate)
             .expect("stub buffer must allocate");
         match side {
-            ShrinkSide::Key => inner.layers[layer_idx].0 = stub,
-            ShrinkSide::Value => inner.layers[layer_idx].1 = stub,
+            ShrinkSide::Key => inner.layers[layer_idx].key = stub,
+            ShrinkSide::Value => inner.layers[layer_idx].value = stub,
         }
         saved
     }
@@ -3674,17 +3760,20 @@ mod tests {
             }
             Err(e) => panic!("unexpected LayerKVPool::new_for_test failure: {e}"),
         };
-        let (key_block_size, value_block_size) =
-            pool.block_bytes_per_layer().expect("pool geometry");
+        let PlaneBytes {
+            key: key_block_size,
+            value: value_block_size,
+            ..
+        } = pool.plane_bytes().expect("pool geometry");
         for layer in 0..LAYERS as usize {
             let inner = pool.inner_read();
             assert_eq!(
-                inner.layers[layer].0.length(),
+                inner.layers[layer].key.length(),
                 key_block_size * NUM_BLOCKS as u64,
                 "layer {layer} key buffer must hold every block slot"
             );
             assert_eq!(
-                inner.layers[layer].1.length(),
+                inner.layers[layer].value.length(),
                 value_block_size * NUM_BLOCKS as u64,
                 "layer {layer} value buffer must hold every block slot"
             );
@@ -4152,9 +4241,16 @@ mod tests {
         residency: &crate::residency::PoolResidency,
     ) {
         let inner = pool.inner_read();
-        assert_eq!(residency.allocation_count(), 2 * inner.layers.len() as u64);
-        for (key, value) in &inner.layers {
-            assert!(residency.contains(key) && residency.contains(value));
+        let planes = inner
+            .layers
+            .iter()
+            .map(|layer| layer.planes().count())
+            .sum::<usize>();
+        assert_eq!(residency.allocation_count(), planes as u64);
+        for layer in &inner.layers {
+            for (plane, buffer) in layer.planes() {
+                assert!(residency.contains(buffer), "{plane:?} is not resident");
+            }
         }
         drop(inner);
         assert_eq!(residency.members_bytes(), pool.total_bytes());
@@ -4172,12 +4268,16 @@ mod tests {
             return;
         };
         assert_set_holds_the_layers(&pool, &residency);
-        let old: Vec<(Buffer, Buffer)> = pool.inner_read().layers.clone();
+        let old: Vec<LayerPlanes> = pool.inner_read().layers.clone();
         assert!(pool.grow_to(8).unwrap());
         assert_eq!(pool.generation(), 1);
         assert_set_holds_the_layers(&pool, &residency);
-        for (key, value) in &old {
-            assert!(!residency.contains(key) && !residency.contains(value));
+        for layer in &old {
+            assert!(
+                layer
+                    .planes()
+                    .all(|(_, buffer)| !residency.contains(buffer))
+            );
         }
         assert!(pool.shrink_to(4).unwrap());
         assert_eq!(pool.generation(), 2);
@@ -4565,7 +4665,7 @@ mod upload_batching_bench {
     #[ignore = "measurement harness; run explicitly with --ignored"]
     fn bench_restore_chain_upload_batching() {
         let pool = LayerKVPool::new(cfg(), 32, 32, MetalDtype::BFloat16).unwrap();
-        let (key_bytes, value_bytes) = pool.block_bytes_per_layer().unwrap();
+        let (key_bytes, value_bytes) = pool.block_blob_bytes().unwrap();
         let keys = vec![37u8; key_bytes as usize];
         let values = vec![83u8; value_bytes as usize];
         let layers = (0..L)
@@ -4803,7 +4903,9 @@ mod upload_batching_bench {
                     .try_new_blit_command_encoder()
                     .expect("command buffer must provide a blit encoder");
                 for x in 0..l as usize {
-                    let (kc, vc) = pool.inner_read().layers[x].clone();
+                    let LayerPlanes {
+                        key: kc, value: vc, ..
+                    } = pool.inner_read().layers[x].clone();
                     bl.copy_from_buffer(&ks, 0, &kc, bid as u64 * per_side as u64, per_side as u64);
                     bl.copy_from_buffer(&vs, 0, &vc, bid as u64 * per_side as u64, per_side as u64);
                 }
@@ -4881,7 +4983,9 @@ mod upload_batching_bench {
                 .try_new_blit_command_encoder()
                 .expect("command buffer must provide a blit encoder");
             for l in 0..L as usize {
-                let (kc, vc) = pool.inner_read().layers[l].clone();
+                let LayerPlanes {
+                    key: kc, value: vc, ..
+                } = pool.inner_read().layers[l].clone();
                 blit.copy_from_buffer(
                     &ks,
                     0,
@@ -4939,7 +5043,9 @@ mod upload_batching_bench {
         let t = Instant::now();
         for _ in 0..REPS {
             for l in 0..L as usize {
-                let (kc, vc) = pool.inner_read().layers[l].clone();
+                let LayerPlanes {
+                    key: kc, value: vc, ..
+                } = pool.inner_read().layers[l].clone();
                 let cb = state
                     .command_queue
                     .try_new_command_buffer()
@@ -4989,7 +5095,9 @@ mod upload_batching_bench {
                     .device
                     .try_new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared)
                     .expect("staging values buffer must allocate");
-                let (kc, vc) = pool.inner_read().layers[l].clone();
+                let LayerPlanes {
+                    key: kc, value: vc, ..
+                } = pool.inner_read().layers[l].clone();
                 blit.copy_from_buffer(
                     &ks,
                     0,
@@ -5139,5 +5247,424 @@ mod upload_batching_bench {
             "  batching speedup when busy:  {:8.2}x",
             f(per_layer_busy) / f(batched_busy)
         );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod int8_tests {
+    use super::*;
+
+    const H: usize = 4;
+    const D: usize = 256;
+    const BS: usize = 16;
+    const X: usize = 16;
+    const DATA: usize = H * D * BS;
+    const SCALES: usize = H * BS * 4;
+
+    fn int8_config(num_layers: u32) -> PagedAttentionConfig {
+        PagedAttentionConfig {
+            block_size: BS as u32,
+            gpu_memory_mb: 256,
+            head_size: D as u32,
+            num_kv_heads: H as u32,
+            num_layers,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(256),
+            max_batch_size: Some(1),
+        }
+    }
+
+    fn metal() -> bool {
+        crate::metal::MetalState::get().is_ok()
+    }
+
+    /// The int8 element and f32 scale written for (block, layer, side, head,
+    /// token, dimension); every block, layer and side differs.
+    fn element(block: usize, layer: usize, side: usize, h: usize, t: usize, d: usize) -> i8 {
+        (((block * 131 + layer * 61 + side * 29 + h * 17 + t * 7 + d * 3) % 255) as i32 - 127) as i8
+    }
+
+    fn scale(block: usize, layer: usize, side: usize, h: usize, t: usize) -> f32 {
+        1.0 + (block * 1000 + layer * 100 + side * 50 + h * 16 + t) as f32 / 64.0
+    }
+
+    /// Splash `PageStorage::layerSpans` blob of one side: data in the pool's
+    /// layout (K vLLM x=16, V `splash_kv_value_element`), then the scales at
+    /// `splash_q8_scale_index`.
+    fn blob(block: usize, layer: usize, side: usize) -> Vec<u8> {
+        let mut out = vec![0u8; DATA + SCALES];
+        for h in 0..H {
+            for t in 0..BS {
+                for d in 0..D {
+                    let index = if side == 0 {
+                        ((h * (D / X) + d / X) * BS + t) * X + d % X
+                    } else {
+                        (h * D + d) * BS + t
+                    };
+                    out[index] = element(block, layer, side, h, t, d) as u8;
+                }
+                let at = DATA + (h * BS + t) * 4;
+                out[at..at + 4].copy_from_slice(&scale(block, layer, side, h, t).to_ne_bytes());
+            }
+        }
+        out
+    }
+
+    fn blobs(block: usize, layers: usize) -> Vec<BlockLayerBytes> {
+        (0..layers)
+            .map(|layer| (blob(block, layer, 0), blob(block, layer, 1)))
+            .collect()
+    }
+
+    fn upload(block: u32, payload: &[BlockLayerBytes]) -> BlockUpload<'_> {
+        (
+            block,
+            payload
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect(),
+        )
+    }
+
+    /// Shape, dtype code and host bytes of an MLX view over a Shared buffer.
+    fn view(raw: *mut mlx_sys::mlx_array) -> (Vec<i64>, i32, *const u8) {
+        assert!(!raw.is_null());
+        unsafe {
+            let ndim = mlx_sys::mlx_array_ndim(raw);
+            let mut shape = vec![0i64; ndim];
+            mlx_sys::mlx_array_shape(raw, shape.as_mut_ptr());
+            let dtype = mlx_sys::mlx_array_dtype(raw);
+            let data = mlx_sys::mlx_array_data_ptr(raw) as *const u8;
+            assert!(!data.is_null(), "a Shared pool view has host data");
+            (shape, dtype, data)
+        }
+    }
+
+    fn row_major(shape: &[i64], index: &[usize]) -> usize {
+        shape
+            .iter()
+            .zip(index)
+            .fold(0usize, |flat, (&dim, &i)| flat * dim as usize + i)
+    }
+
+    /// Mutation M1: `is_fp8()` true for Int8.
+    #[test]
+    fn int8_is_its_own_kind() {
+        let int8 = MetalDtype::Int8;
+        assert_eq!(int8.size(), 1);
+        assert!(!int8.is_fp8());
+        assert_eq!(int8.io_dtype(), MetalDtype::BFloat16);
+        assert_eq!(int8.scale_bytes(), 4);
+        assert_eq!(int8.type_string(), "char");
+        assert_eq!(MetalDtype::UChar.io_dtype(), MetalDtype::UChar);
+        assert_eq!(MetalDtype::BFloat16.scale_bytes(), 0);
+        assert_eq!(LayerKVPool::cache_dtype_layout(false, int8), Ok((1, 16)));
+        assert!(LayerKVPool::cache_dtype_layout(true, int8).is_err());
+        assert_eq!(bridge_dtype_code(int8), Ok(6));
+    }
+
+    /// Mutation M2: `plane_bytes_for` leaves the scale bytes out.
+    #[test]
+    fn int8_pool_has_four_planes() {
+        if !metal() {
+            return;
+        }
+        let pool = LayerKVPool::new_for_test(int8_config(2), 5, 2, MetalDtype::Int8).unwrap();
+        {
+            let inner = pool.inner_read();
+            for layer in &inner.layers {
+                assert_eq!(layer.key.length(), (5 * DATA) as u64);
+                assert_eq!(layer.value.length(), (5 * DATA) as u64);
+                let (key_scales, value_scales) = layer.scales.as_ref().expect("int8 scale planes");
+                assert_eq!(key_scales.length(), (5 * SCALES) as u64);
+                assert_eq!(value_scales.length(), (5 * SCALES) as u64);
+                let order: Vec<Plane> = layer.planes().map(|(plane, _)| plane).collect();
+                assert_eq!(
+                    order,
+                    [Plane::Key, Plane::KeyScale, Plane::Value, Plane::ValueScale]
+                );
+            }
+        }
+        assert_eq!(
+            pool.block_blob_bytes(),
+            Ok(((DATA + SCALES) as u64, (DATA + SCALES) as u64))
+        );
+        let per_block =
+            crate::profile::bytes_per_block(2, H as u32, D as u32, BS as u32, MetalDtype::Int8)
+                .unwrap();
+        assert_eq!(pool.total_bytes(), 5 * per_block);
+        assert_eq!(pool.layer_bytes_for(5), Ok(5 * per_block / 2));
+        for (raw, shape, code) in [
+            (
+                pool.key_cache_array_raw(1).unwrap(),
+                vec![5, 4, 16, 16, 16],
+                6,
+            ),
+            (
+                pool.value_cache_array_raw(1).unwrap(),
+                vec![5, 4, 256, 16],
+                6,
+            ),
+            (pool.key_scale_array_raw(1).unwrap(), vec![5, 4, 16], 0),
+            (pool.value_scale_array_raw(1).unwrap(), vec![5, 4, 16], 0),
+        ] {
+            unsafe {
+                let ndim = mlx_sys::mlx_array_ndim(raw);
+                let mut dims = vec![0i64; ndim];
+                mlx_sys::mlx_array_shape(raw, dims.as_mut_ptr());
+                assert_eq!(dims, shape);
+                assert_eq!(mlx_sys::mlx_array_dtype(raw), code);
+                mlx_sys::mlx_array_delete(raw);
+            }
+        }
+
+        let bf16 = LayerKVPool::new_for_test(int8_config(2), 5, 2, MetalDtype::BFloat16).unwrap();
+        assert!(
+            bf16.inner_read()
+                .layers
+                .iter()
+                .all(|layer| layer.scales.is_none())
+        );
+        assert!(bf16.key_scale_array_raw(0).is_err());
+        let bf16_block =
+            crate::profile::bytes_per_block(2, H as u32, D as u32, BS as u32, MetalDtype::BFloat16)
+                .unwrap();
+        assert_eq!(bf16.total_bytes(), 5 * bf16_block);
+        assert_eq!(
+            bf16.block_blob_bytes(),
+            Ok(((2 * DATA) as u64, (2 * DATA) as u64))
+        );
+    }
+
+    /// Layout gate, host half: every K / V / scale element written through
+    /// host IO is read back through the MLX views at the index formulas.
+    ///
+    /// Mutation M3: the V view is built token-major `[nb, H, bs, D]`.
+    #[test]
+    fn int8_layout_matches_the_index_formulas() {
+        if !metal() {
+            return;
+        }
+        let pool = LayerKVPool::new_inner(int8_config(2), 5, 5, MetalDtype::Int8, true).unwrap();
+        if !pool.inner_read().layers.iter().all(LayerPlanes::all_shared) {
+            return;
+        }
+        for block in [0usize, 3] {
+            let (k, v) = (blob(block, 1, 0), blob(block, 1, 1));
+            pool.write_blocks_from_host(1, &[block as u32], &k, &v)
+                .unwrap();
+        }
+        let key = pool.key_cache_array_raw(1).unwrap();
+        let value = pool.value_cache_array_raw(1).unwrap();
+        let key_scale = pool.key_scale_array_raw(1).unwrap();
+        let value_scale = pool.value_scale_array_raw(1).unwrap();
+        let (key_shape, key_code, key_data) = view(key);
+        let (value_shape, value_code, value_data) = view(value);
+        let (scale_shape, _, key_scale_data) = view(key_scale);
+        let (_, _, value_scale_data) = view(value_scale);
+        assert_eq!((key_code, value_code), (6, 6));
+        assert_eq!(key_shape, [5, 4, 16, 16, 16]);
+        assert_eq!(value_shape, [5, 4, 256, 16], "V is dimension-major");
+        assert_eq!(scale_shape, [5, 4, 16]);
+        for block in [0usize, 3] {
+            for h in 0..H {
+                for t in 0..BS {
+                    for d in 0..D {
+                        let k = unsafe {
+                            *key_data.add(row_major(&key_shape, &[block, h, d / X, t, d % X]))
+                        } as i8;
+                        let v =
+                            unsafe { *value_data.add(row_major(&value_shape, &[block, h, d, t])) }
+                                as i8;
+                        assert_eq!(
+                            k,
+                            element(block, 1, 0, h, t, d),
+                            "K b{block} h{h} t{t} d{d}"
+                        );
+                        assert_eq!(
+                            v,
+                            element(block, 1, 1, h, t, d),
+                            "V b{block} h{h} t{t} d{d}"
+                        );
+                    }
+                    let at = row_major(&scale_shape, &[block, h, t]);
+                    let read = |data: *const u8| unsafe { *(data as *const f32).add(at) };
+                    assert_eq!(read(key_scale_data), scale(block, 1, 0, h, t));
+                    assert_eq!(read(value_scale_data), scale(block, 1, 1, h, t));
+                }
+            }
+        }
+        unsafe {
+            for raw in [key, value, key_scale, value_scale] {
+                mlx_sys::mlx_array_delete(raw);
+            }
+        }
+        assert_eq!(
+            pool.read_block_all_layers(3).unwrap()[1],
+            (blob(3, 1, 0), blob(3, 1, 1))
+        );
+        let (keys, values) = pool.read_blocks_to_host(1, &[3, 0]).unwrap();
+        assert_eq!(keys, [blob(3, 1, 0), blob(0, 1, 0)].concat());
+        assert_eq!(values, [blob(3, 1, 1), blob(0, 1, 1)].concat());
+
+        let private = LayerKVPool::new_for_test(int8_config(2), 5, 2, MetalDtype::Int8).unwrap();
+        private
+            .write_blocks_from_host(1, &[3], &blob(3, 1, 0), &blob(3, 1, 1))
+            .unwrap();
+        assert_eq!(
+            private.read_block_all_layers(3).unwrap()[1],
+            (blob(3, 1, 0), blob(3, 1, 1))
+        );
+        assert_eq!(
+            private.read_blocks_to_host(1, &[3]).unwrap(),
+            (blob(3, 1, 0), blob(3, 1, 1))
+        );
+
+        let write = unsafe {
+            pool.write_kv(
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &[0],
+                MetalDtype::BFloat16,
+                1.0,
+                1.0,
+            )
+        };
+        assert!(write.unwrap_err().contains("int8"));
+        let read = unsafe {
+            pool.gather_attention(
+                0,
+                std::ptr::null_mut(),
+                MetalDtype::BFloat16,
+                &[0],
+                1,
+                8,
+                1.0,
+                0.0,
+                0,
+                1.0,
+                1.0,
+            )
+        };
+        let Err(error) = read else {
+            panic!("an int8 pool must refuse paged reads");
+        };
+        assert!(error.contains("int8 paged reads are not built"));
+    }
+
+    /// Mutation M4: `move_blocks` skips the scale slots.
+    #[test]
+    fn int8_host_io_carries_every_plane() {
+        if !metal() {
+            return;
+        }
+        for shared in [true, false] {
+            let pool =
+                LayerKVPool::new_inner(int8_config(2), 4, 4, MetalDtype::Int8, shared).unwrap();
+            let payloads: Vec<Vec<BlockLayerBytes>> = (0..3).map(|block| blobs(block, 2)).collect();
+            pool.write_blocks_all_layers(&[
+                upload(0, &payloads[0]),
+                upload(1, &payloads[1]),
+                upload(2, &payloads[2]),
+            ])
+            .unwrap();
+            for (block, payload) in payloads.iter().enumerate() {
+                assert_eq!(&pool.read_block_all_layers(block as u32).unwrap(), payload);
+            }
+            pool.write_block_all_layers(
+                3,
+                &payloads[2]
+                    .iter()
+                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            assert_eq!(pool.read_block_all_layers(3).unwrap(), payloads[2]);
+            pool.move_blocks(&[(2, 0)]).unwrap();
+            assert_eq!(
+                pool.read_block_all_layers(0).unwrap(),
+                payloads[2],
+                "shared={shared}"
+            );
+            assert!(pool.shrink_to(2).unwrap());
+            assert!(!pool.shrink_pending());
+            assert_eq!(pool.read_block_all_layers(0).unwrap(), payloads[2]);
+            assert_eq!(pool.read_block_all_layers(1).unwrap(), payloads[1]);
+            assert_eq!(pool.total_bytes(), 2 * pool.layer_bytes_for(2).unwrap());
+        }
+    }
+
+    /// Mutation M5: `grow_to` skips the scale planes' blit.
+    #[test]
+    fn grow_to_carries_four_planes() {
+        if !metal() {
+            return;
+        }
+        for shared in [true, false] {
+            let pool =
+                LayerKVPool::new_inner(int8_config(2), 4, 8, MetalDtype::Int8, shared).unwrap();
+            let payloads: Vec<Vec<BlockLayerBytes>> = (0..4).map(|block| blobs(block, 2)).collect();
+            let uploads: Vec<BlockUpload<'_>> = payloads
+                .iter()
+                .enumerate()
+                .map(|(block, payload)| upload(block as u32, payload))
+                .collect();
+            pool.write_blocks_all_layers(&uploads).unwrap();
+            assert!(pool.grow_to(8).unwrap());
+            assert_eq!(pool.generation(), 1);
+            assert_eq!(pool.num_blocks(), 8);
+            for (block, payload) in payloads.iter().enumerate() {
+                assert_eq!(
+                    &pool.read_block_all_layers(block as u32).unwrap(),
+                    payload,
+                    "block {block} shared={shared}"
+                );
+            }
+            let fresh = blobs(7, 2);
+            pool.write_blocks_all_layers(&[upload(7, &fresh)]).unwrap();
+            assert_eq!(pool.read_block_all_layers(7).unwrap(), fresh);
+            let per_block =
+                crate::profile::bytes_per_block(2, H as u32, D as u32, BS as u32, MetalDtype::Int8)
+                    .unwrap();
+            assert_eq!(pool.total_bytes(), 8 * per_block);
+        }
+    }
+
+    /// Mutation M6: `swap_resident` passes K/V only.
+    #[test]
+    fn pool_residency_set_holds_every_plane() {
+        if !metal() {
+            return;
+        }
+        let pool = LayerKVPool::new(int8_config(2), 4, 8, MetalDtype::Int8).unwrap();
+        let clock = crate::residency::Clock::new(600.0).unwrap();
+        let Some(residency) = pool.attach_residency(clock).unwrap() else {
+            return;
+        };
+        let holds = |pool: &LayerKVPool| {
+            let inner = pool.inner_read();
+            assert_eq!(residency.allocation_count(), 4 * inner.layers.len() as u64);
+            for layer in &inner.layers {
+                for (plane, buffer) in layer.planes() {
+                    assert!(residency.contains(buffer), "{plane:?} is not resident");
+                }
+            }
+            drop(inner);
+            assert_eq!(residency.members_bytes(), pool.total_bytes());
+        };
+        holds(&pool);
+        let old: Vec<LayerPlanes> = pool.inner_read().layers.clone();
+        assert!(pool.grow_to(8).unwrap());
+        holds(&pool);
+        for layer in &old {
+            assert!(
+                layer
+                    .planes()
+                    .all(|(_, buffer)| !residency.contains(buffer))
+            );
+        }
+        assert!(pool.shrink_to(4).unwrap());
+        holds(&pool);
     }
 }

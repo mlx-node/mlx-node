@@ -278,6 +278,20 @@ fn compile_paged_attn_metallib(
             args,
         });
     }
+    // Safe math: the int8 store matches the flat quantizer
+    // (`mlx_kv_int8_quantize_rows`, MathMode::Safe) bit for bit; fast math
+    // rounds some exact .5 quotients the other way.
+    jobs.push(AirJob {
+        src: metal_src_dir.join("cache/kv_int8_store.metal"),
+        air: out_dir.join("cache_kv_int8_store.air"),
+        args: vec![
+            "-I".to_string(),
+            metal_src_dir.display().to_string(),
+            "-O3".to_string(),
+            "-fno-fast-math".to_string(),
+            min_os.clone(),
+        ],
+    });
 
     let bridge_dir = manifest_dir.join("src").join("metal");
     let kquant_jobs = |name: &str| -> Vec<AirJob> {

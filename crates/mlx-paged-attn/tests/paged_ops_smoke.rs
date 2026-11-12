@@ -2039,3 +2039,164 @@ fn paged_attention_varlen_compile_trace_smoke() {
         "paged_attention_varlen must compose with mlx::core::compile (rc={rc})"
     );
 }
+
+/// One `mlx_paged_kv_write_forward` over host-built arrays. Returns the 4
+/// outputs (null when refused) and the input scale handles they alias.
+struct WriteCall {
+    outputs: [*mut mlx_sys::mlx_array; 4],
+    inputs: Vec<*mut mlx_sys::mlx_array>,
+    ok: bool,
+}
+
+impl Drop for WriteCall {
+    fn drop(&mut self) {
+        for handle in self.outputs.iter().chain(&self.inputs) {
+            if !handle.is_null() {
+                unsafe { mlx_sys::mlx_array_delete(*handle) };
+            }
+        }
+    }
+}
+
+fn shape_of(handle: *mut mlx_sys::mlx_array) -> Vec<i64> {
+    let mut shape = vec![0i64; unsafe { mlx_sys::mlx_array_ndim(handle) }];
+    unsafe { mlx_sys::mlx_array_shape(handle, shape.as_mut_ptr()) };
+    shape
+}
+
+/// `kv_dtype` 1 (Bf16) or 3 (Int8) pools of 3 blocks, H 4, bs 16; `rows`
+/// 1 = bf16, 0 = f16; `scale_shape` of both scale inputs.
+fn write_call(kv_dtype: u8, head_size: i64, rows: u8, scale_shape: &[i64]) -> WriteCall {
+    let (blocks, heads, bs, tokens) = (3i64, 4i64, 16i64, 2i64);
+    let x = if kv_dtype == 3 { 16 } else { 8 };
+    let k_shape = [blocks, heads, head_size / x, bs, x];
+    let v_shape = [blocks, heads, head_size, bs];
+    let pool_len = (blocks * heads * head_size * bs) as usize;
+    let row_shape = [tokens, heads, head_size];
+    let row_len = (tokens * heads * head_size) as usize;
+    let scale_len: i64 = scale_shape.iter().product();
+    unsafe {
+        let pool = |shape: &[i64]| {
+            if kv_dtype == 3 {
+                mlx_sys::mlx_array_from_int8(
+                    vec![0i8; pool_len].as_ptr(),
+                    shape.as_ptr(),
+                    shape.len(),
+                )
+            } else {
+                mlx_sys::mlx_array_from_bfloat16(
+                    vec![0u16; pool_len].as_ptr(),
+                    shape.as_ptr(),
+                    shape.len(),
+                )
+            }
+        };
+        let row = || {
+            let data = vec![f32_to_bf16_bits(0.5); row_len];
+            if rows == 1 {
+                mlx_sys::mlx_array_from_bfloat16(data.as_ptr(), row_shape.as_ptr(), 3)
+            } else {
+                mlx_sys::mlx_array_from_float16(data.as_ptr(), row_shape.as_ptr(), 3)
+            }
+        };
+        let scale = || {
+            mlx_sys::mlx_array_from_float32(
+                vec![1.0f32; scale_len as usize].as_ptr(),
+                scale_shape.as_ptr(),
+                scale_shape.len(),
+            )
+        };
+        let slots = [0i64, 33];
+        let inputs = vec![
+            pool(&k_shape),
+            pool(&v_shape),
+            row(),
+            row(),
+            mlx_sys::mlx_array_from_int64(slots.as_ptr(), [tokens].as_ptr(), 1),
+            scale(),
+            scale(),
+        ];
+        let mut outputs = [std::ptr::null_mut(); 4];
+        let [k, v, ks, vs] = &mut outputs;
+        let ok = mlx_sys::mlx_paged_kv_write_forward(
+            inputs[0],
+            inputs[1],
+            inputs[2],
+            inputs[3],
+            inputs[4],
+            inputs[5],
+            inputs[6],
+            bs as i32,
+            heads as i32,
+            head_size as i32,
+            kv_dtype,
+            k,
+            v,
+            ks,
+            vs,
+        );
+        WriteCall {
+            outputs,
+            inputs,
+            ok,
+        }
+    }
+}
+
+/// `PagedKVWrite` has 4 outputs: K, V and the two scale inputs, each in
+/// place. Int8 takes `[num_blocks, H, bs]` f32 scale planes, bf16 rows and
+/// head size 128 / 256 only.
+///
+/// Mutation M10 (the validator accepts `[1]` scales for Int8) goes red.
+#[test]
+fn paged_kv_write_has_four_outputs() {
+    if MetalState::get().is_err() {
+        return;
+    }
+    for (kv_dtype, scale_shape) in [(3u8, vec![3i64, 4, 16]), (1, vec![1])] {
+        let mut call = write_call(kv_dtype, 256, 1, &scale_shape);
+        assert!(call.ok, "kv_dtype {kv_dtype} write");
+        assert!(call.outputs.iter().all(|o| !o.is_null()));
+        assert_eq!(shape_of(call.outputs[2]), scale_shape);
+        assert_eq!(shape_of(call.outputs[3]), scale_shape);
+        assert!(unsafe { mlx_sys::mlx_eval(call.outputs.as_mut_ptr(), 4) });
+        for (output, input) in [(0, 0), (1, 1), (2, 5), (3, 6)] {
+            let (out, inp) = unsafe {
+                (
+                    mlx_sys::mlx_array_data_ptr(call.outputs[output]),
+                    mlx_sys::mlx_array_data_ptr(call.inputs[input]),
+                )
+            };
+            assert_eq!(
+                out, inp,
+                "kv_dtype {kv_dtype}: output {output} aliases input {input}"
+            );
+        }
+        if kv_dtype == 3 {
+            // Slots 0 and 33: block 0 token 0 and block 2 token 1 got a
+            // scale of 0.5 / 127; the rest keep the input's 1.0.
+            let mut scales = vec![0f32; 3 * 4 * 16];
+            assert!(unsafe {
+                mlx_sys::mlx_array_to_float32(call.outputs[2], scales.as_mut_ptr(), scales.len())
+            });
+            let written = 0.5f32 / 127.0;
+            for (i, &s) in scales.iter().enumerate() {
+                let (block, token) = (i / 64, i % 16);
+                let hit = (block, token) == (0, 0) || (block, token) == (2, 1);
+                assert_eq!(s, if hit { written } else { 1.0 }, "scale {i}");
+            }
+        }
+    }
+    assert!(!write_call(3, 256, 1, &[1]).ok, "Int8 with [1] scales");
+    assert!(!write_call(3, 256, 0, &[3, 4, 16]).ok, "Int8 with f16 rows");
+    assert!(
+        !write_call(3, 64, 1, &[3, 4, 16]).ok,
+        "Int8 with head size 64"
+    );
+    assert!(!write_call(4, 256, 1, &[3, 4, 16]).ok, "kv_dtype 4");
+    let same =
+        unsafe { mlx_sys::mlx_paged_kv_write_is_equivalent(16, 4, 256, 16, 3, 16, 4, 256, 16, 3) };
+    let differ =
+        unsafe { mlx_sys::mlx_paged_kv_write_is_equivalent(16, 4, 256, 16, 3, 16, 4, 256, 16, 1) };
+    assert!(same && !differ);
+}

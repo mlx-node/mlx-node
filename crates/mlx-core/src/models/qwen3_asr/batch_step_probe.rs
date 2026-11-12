@@ -614,17 +614,13 @@ impl Probe {
             max_seq_len: Some(config.max_position_embeddings as u32),
             max_batch_size: Some(64),
         };
-        let num_blocks = pa_config.calculate_num_blocks();
+        let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+        let num_blocks = pa_config.calculate_num_blocks(cache_dtype);
         let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
             num_blocks, num_blocks, BLOCK_SIZE,
         )));
-        let pool = mlx_paged_attn::LayerKVPool::new(
-            pa_config,
-            num_blocks,
-            num_blocks,
-            mlx_paged_attn::metal::MetalDtype::BFloat16,
-        )
-        .unwrap();
+        let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, num_blocks, cache_dtype)
+            .unwrap();
         let adapter = PagedKVCacheAdapter::new(allocator, Arc::new(pool), BLOCK_SIZE).unwrap();
         (adapter, num_blocks)
     }

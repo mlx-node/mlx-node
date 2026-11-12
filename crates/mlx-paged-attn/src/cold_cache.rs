@@ -2230,25 +2230,6 @@ fn max_encoded_len_for_sidecar(layout: &ColdSidecarLayout) -> Option<u64> {
     payload.checked_add(header_overhead_for_descriptors(tensors))
 }
 
-/// Per-layer K/V byte lengths one block occupies in `pool`, mirroring
-/// `LayerKVPool::read_blocks_to_host` / `write_blocks_from_host` exactly
-/// (including the `head_size / x` integer division on the K side). `None`
-/// for a pool whose dtype/FP8 combination has no kernel layout, which makes
-/// [`layout_matches_pool`] fail closed.
-fn pool_layer_bytes(pool: &LayerKVPool) -> Option<(usize, usize)> {
-    let x = pool.cache_pack_factor().ok()? as u64;
-    if x == 0 {
-        return None;
-    }
-    let element = crate::profile::dtype_size_for(pool.cache_dtype()) as u64;
-    let heads = pool.config().num_kv_heads as u64;
-    let head_size = pool.config().head_size as u64;
-    let block_size = pool.block_size() as u64;
-    let key = heads * (head_size / x) * x * block_size * element;
-    let value = heads * head_size * block_size * element;
-    Some((usize::try_from(key).ok()?, usize::try_from(value).ok()?))
-}
-
 /// Whether a decoded block's layout is exactly this pool's geometry.
 ///
 /// The per-layer byte lengths are compared here, not left to
@@ -2259,7 +2240,7 @@ fn pool_layer_bytes(pool: &LayerKVPool) -> Option<(usize, usize)> {
 /// caught only mid-upload, after a physical block had been allocated and
 /// earlier layers already written into the pool.
 fn layout_matches_pool(layout: &ColdCacheLayout, pool: &LayerKVPool) -> bool {
-    let Some((key_bytes, value_bytes)) = pool_layer_bytes(pool) else {
+    let Ok((key_bytes, value_bytes)) = pool.block_blob_bytes() else {
         return false;
     };
     layout.block_size == pool.block_size()
@@ -2267,8 +2248,8 @@ fn layout_matches_pool(layout: &ColdCacheLayout, pool: &LayerKVPool) -> bool {
         && layout.num_kv_heads == pool.config().num_kv_heads
         && layout.head_size == pool.config().head_size
         && layout.cache_dtype == format!("{:?}", pool.cache_dtype())
-        && layout.key_bytes_per_layer == key_bytes
-        && layout.value_bytes_per_layer == value_bytes
+        && layout.key_bytes_per_layer as u64 == key_bytes
+        && layout.value_bytes_per_layer as u64 == value_bytes
 }
 
 fn persist_block(shared: &Shared, block: &ColdCacheBlock) -> Result<(), String> {
@@ -5208,7 +5189,8 @@ mod tests {
 
         // The pool's own per-layer byte lengths, cross-checked against what
         // `read_blocks_to_host` actually produces.
-        let (key_bytes, value_bytes) = pool_layer_bytes(&pool).unwrap();
+        let (key_bytes, value_bytes) = pool.block_blob_bytes().unwrap();
+        let (key_bytes, value_bytes) = (key_bytes as usize, value_bytes as usize);
         let (keys, values) = pool.read_blocks_to_host(0, &[0]).unwrap();
         assert_eq!((keys.len(), values.len()), (key_bytes, value_bytes));
 
@@ -5282,7 +5264,8 @@ mod tests {
             "the fixture must actually differ in block count"
         );
 
-        let (key_bytes, value_bytes) = pool_layer_bytes(&small).unwrap();
+        let (key_bytes, value_bytes) = small.block_blob_bytes().unwrap();
+        let (key_bytes, value_bytes) = (key_bytes as usize, value_bytes as usize);
         let layout = ColdCacheLayout {
             block_size: small.block_size(),
             num_layers: small.num_layers() as u32,
@@ -7279,6 +7262,102 @@ mod tests {
                 allocator.free(hit);
             }
         }
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// An int8 block's scale planes ride in the K / V blobs (Splash
+    /// `PageStorage::layerSpans`), byte-exact through capture and restore; a
+    /// layout without the scale bytes, or of another dtype, does not match.
+    ///
+    /// Mutation M9: `layout_matches_pool` compares data bytes only.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn int8_block_round_trips_through_the_cold_tier() {
+        use crate::metal::MetalDtype;
+        use crate::{PagedAttentionConfig, hash_tokens};
+
+        let config = PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb: 256,
+            head_size: 128,
+            num_kv_heads: 1,
+            num_layers: 1,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(32),
+            max_batch_size: Some(1),
+        };
+        let pool = match LayerKVPool::new(config, 2, 2, MetalDtype::Int8) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => return,
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let data = 128 * 16;
+        let scales = 16 * 4;
+        assert_eq!(
+            pool.block_blob_bytes().unwrap(),
+            ((data + scales) as u64, (data + scales) as u64)
+        );
+        let allocator = Mutex::new(BlockAllocator::new(2, 2, 16));
+        let source = allocator.lock().unwrap().allocate().unwrap();
+        let keys: Vec<u8> = (0..data + scales).map(|i| (i * 7 % 251) as u8).collect();
+        let values: Vec<u8> = (0..data + scales)
+            .map(|i| (250 - (i * 3 % 251)) as u8)
+            .collect();
+        pool.write_blocks_from_host(0, &[source.block_id], &keys, &values)
+            .unwrap();
+
+        let root = temp_root("int8-restore");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let tokens: Vec<u32> = (1..=16).collect();
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &tokens, &[], 0, 0);
+        assert!(
+            manager
+                .capture_and_enqueue(&pool, &source, key, fingerprint(), &tokens)
+                .unwrap()
+        );
+        let path = root.join(format!("{}.safetensors", key.to_hex()));
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        allocator.lock().unwrap().free(source);
+        let identity = RestorePrefixIdentity {
+            hot_hash: hash_tokens(&tokens, 0, &[]),
+            tokens: tokens.clone(),
+            parent_hot_hash: 0,
+            extra_keys: vec![],
+            cache_salt: 0,
+            block_index: 0,
+        };
+        let restored = manager
+            .restore_block(&pool, &allocator, key, fingerprint(), &identity)
+            .expect("int8 cold block restore");
+        assert_eq!(
+            pool.read_blocks_to_host(0, &[restored.block_id]).unwrap(),
+            (keys, values)
+        );
+        allocator.lock().unwrap().free(restored);
+
+        let layout = ColdCacheLayout {
+            block_size: 16,
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_size: 128,
+            cache_dtype: "Int8".to_string(),
+            key_bytes_per_layer: data + scales,
+            value_bytes_per_layer: data + scales,
+        };
+        assert!(layout_matches_pool(&layout, &pool));
+        let mut data_only = layout.clone();
+        data_only.key_bytes_per_layer = data;
+        data_only.value_bytes_per_layer = data;
+        assert!(!layout_matches_pool(&data_only, &pool));
+        let mut bf16 = layout.clone();
+        bf16.cache_dtype = "BFloat16".to_string();
+        assert!(!layout_matches_pool(&bf16, &pool));
         drop(manager);
         let _ = fs::remove_dir_all(root);
     }

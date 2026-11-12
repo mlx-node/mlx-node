@@ -21,14 +21,14 @@
 
 #if !defined(MLX_NODE_METAL_ENABLED)
 
+#include <array>
 #include <stdexcept>
-#include <utility>
 
 #include "mlx_paged_ops.h"
 
 namespace mlx::core::fast {
 
-std::pair<array, array> paged_kv_write(
+std::array<array, 4> paged_kv_write(
     const array&,
     const array&,
     const array&,
@@ -182,12 +182,13 @@ bool mlx_paged_kv_write_forward(
     int,
     uint8_t,
     mlx_array** out_k_pool,
-    mlx_array** out_v_pool) {
-  if (out_k_pool) {
-    *out_k_pool = nullptr;
-  }
-  if (out_v_pool) {
-    *out_v_pool = nullptr;
+    mlx_array** out_v_pool,
+    mlx_array** out_k_scale,
+    mlx_array** out_v_scale) {
+  for (mlx_array** out : {out_k_pool, out_v_pool, out_k_scale, out_v_scale}) {
+    if (out) {
+      *out = nullptr;
+    }
   }
   return false;
 }

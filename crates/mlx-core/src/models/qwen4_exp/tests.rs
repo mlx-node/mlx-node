@@ -9056,3 +9056,30 @@ fn active_budget_follows_the_plan_ceiling() {
     let active = (20u64 << 30) + 5_746_196_480 + (3 << 30);
     memory::check_active_memory_budget(limit, || active as f64, || {}, |_| {}).unwrap();
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn qwen4_gathers_refuse_an_int8_pool() {
+    let Some((mut adapter, _)) = crate::transformer::paged_int8_tests::int8_adapter(4, 4) else {
+        return;
+    };
+    adapter.reset_for_new_request(1).unwrap();
+    adapter.allocate_suffix_blocks(4).unwrap();
+    adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+    let error = paged::gather_selected(&adapter, 0, &[0, 1], 2, 128)
+        .map(drop)
+        .unwrap_err();
+    assert!(
+        error.reason.contains("int8 paged reads are not built"),
+        "{error}"
+    );
+    let rows = MxArray::zeros(&[1, 2, 128], Some(crate::array::DType::BFloat16)).unwrap();
+    let tokens = MxArray::from_int32(&[0], &[1]).unwrap();
+    let error = paged::gather_window(&adapter, 0, &tokens, &rows, &rows, 4)
+        .map(drop)
+        .unwrap_err();
+    assert!(
+        error.reason.contains("int8 paged reads are not built"),
+        "{error}"
+    );
+}

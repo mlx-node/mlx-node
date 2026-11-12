@@ -70,6 +70,7 @@ int x_pack_for(KvDtype kv_dtype) {
     case KvDtype::Bf16:
       return 8;
     case KvDtype::Fp8:
+    case KvDtype::Int8:
       return 16;
   }
   // Unreachable — quiet the warning.
@@ -88,6 +89,7 @@ mlx::core::Dtype io_dtype_for_kv_dtype(KvDtype kv_dtype) {
     case KvDtype::Bf16:
       return mlx::core::bfloat16;
     case KvDtype::Fp8:
+    case KvDtype::Int8:
       return mlx::core::bfloat16;
   }
   // Unreachable; quiet the warning.
@@ -108,6 +110,8 @@ mlx::core::Dtype cache_dtype_for_kv_dtype(KvDtype kv_dtype) {
       return mlx::core::bfloat16;
     case KvDtype::Fp8:
       return mlx::core::uint8;
+    case KvDtype::Int8:
+      return mlx::core::int8;
   }
   // Unreachable; quiet the warning.
   return mlx::core::bfloat16;
@@ -125,8 +129,40 @@ mlx::core::fast::paged::KvDtype to_paged_dtype(KvDtype d) {
       return mlx::core::fast::paged::KvDtype::Bf16;
     case KvDtype::Fp8:
       return mlx::core::fast::paged::KvDtype::Fp8;
+    case KvDtype::Int8:
+      return mlx::core::fast::paged::KvDtype::Int8;
   }
   return mlx::core::fast::paged::KvDtype::Bf16;
+}
+
+static_assert(
+    static_cast<uint8_t>(KvDtype::Fp16) ==
+        static_cast<uint8_t>(mlx::core::fast::paged::KvDtype::Fp16) &&
+    static_cast<uint8_t>(KvDtype::Bf16) ==
+        static_cast<uint8_t>(mlx::core::fast::paged::KvDtype::Bf16) &&
+    static_cast<uint8_t>(KvDtype::Fp8) ==
+        static_cast<uint8_t>(mlx::core::fast::paged::KvDtype::Fp8) &&
+    static_cast<uint8_t>(KvDtype::Int8) ==
+        static_cast<uint8_t>(mlx::core::fast::paged::KvDtype::Int8));
+
+// Every C ABI entry takes the dtype as a raw byte; one outside the enum
+// would misroute the kernel template selection.
+void require_known_kv_dtype(uint8_t kv_dtype_raw) {
+  if (kv_dtype_raw > static_cast<uint8_t>(KvDtype::Int8)) {
+    std::ostringstream msg;
+    msg << "invalid kv_dtype_raw " << static_cast<int>(kv_dtype_raw)
+        << "; expected 0 (Fp16), 1 (Bf16), 2 (Fp8) or 3 (Int8)";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
+// An int8 pool has no paged read kernel yet.
+void refuse_int8_reads(KvDtype kv_dtype, const char* op_name) {
+  if (kv_dtype == KvDtype::Int8) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] int8 paged reads are not built";
+    throw std::invalid_argument(msg.str());
+  }
 }
 
 // Kernels use dense row-major indexing, so strided inputs need compaction.
@@ -327,7 +363,27 @@ void validate_paged_kv_write_inputs(
     msg << "[validator] [" << op_name << "] k_scale / v_scale must be float32";
     throw std::invalid_argument(msg.str());
   }
-  if (k_scale.size() != 1 || v_scale.size() != 1) {
+  if (kv_dtype == KvDtype::Int8) {
+    // The int8 store writes one scale per (block, head, token) in place
+    // (Splash `splash_q8_scale_index`); a short plane is written past.
+    const Shape expected{k_pool.ndim() > 0 ? k_pool.shape(0) : 0,
+                         num_kv_heads,
+                         block_size};
+    if (k_scale.shape() != expected || v_scale.shape() != expected) {
+      std::ostringstream msg;
+      msg << "[validator] [" << op_name
+          << "] int8 k_scale / v_scale must be float32 [num_blocks, "
+          << "num_kv_heads, block_size] = [" << expected[0] << ", "
+          << expected[1] << ", " << expected[2] << "]";
+      throw std::invalid_argument(msg.str());
+    }
+    if (head_size != 128 && head_size != 256) {
+      std::ostringstream msg;
+      msg << "[validator] [" << op_name << "] int8 paged store has head_size "
+          << "128 or 256 only; got " << head_size;
+      throw std::invalid_argument(msg.str());
+    }
+  } else if (k_scale.size() != 1 || v_scale.size() != 1) {
     std::ostringstream msg;
     msg << "[validator] [" << op_name << "] k_scale / v_scale must be 1-element arrays";
     throw std::invalid_argument(msg.str());
@@ -479,6 +535,7 @@ void validate_paged_attention_inputs(
     int sliding_window,
     KvDtype kv_dtype,
     const char* op_name) {
+  refuse_int8_reads(kv_dtype, op_name);
   // 1. Contiguity + zero offset.
   require_row_contiguous_zero_offset(q, op_name, "q");
   require_row_contiguous_zero_offset(k_pool, op_name, "k_pool");
@@ -737,9 +794,10 @@ void PagedKVWrite::eval_gpu(
         "PagedKVWrite: expected 7 inputs (k_pool, v_pool, new_k, new_v, "
         "slot_mapping, k_scale, v_scale)");
   }
-  if (outputs.size() != 2) {
+  if (outputs.size() != 4) {
     throw std::runtime_error(
-        "PagedKVWrite: expected 2 outputs (k_pool', v_pool')");
+        "PagedKVWrite: expected 4 outputs (k_pool', v_pool', k_scale', "
+        "v_scale')");
   }
 
   const array& k_pool = inputs[0];
@@ -781,6 +839,8 @@ void PagedKVWrite::eval_gpu(
   // the right buffer (the input pool's, shared into the output).
   outputs[0].copy_shared_buffer(k_pool);
   outputs[1].copy_shared_buffer(v_pool);
+  outputs[2].copy_shared_buffer(k_scale);
+  outputs[3].copy_shared_buffer(v_scale);
 
   // Determine num_tokens from new_k's leading dimension. The kernel
   // expects shape [num_tokens, num_kv_heads, head_size]. The validator
@@ -835,8 +895,8 @@ void PagedKVWrite::eval_gpu(
       outputs[0],
       outputs[1],
       slot_mapping,
-      k_scale,
-      v_scale,
+      outputs[2],
+      outputs[3],
       num_tokens,
       num_kv_heads_,
       head_size_,
@@ -855,11 +915,13 @@ std::vector<array> PagedKVWrite::vjp(
 
 std::vector<Shape> PagedKVWrite::output_shapes(
     const std::vector<array>& inputs) {
-  if (inputs.size() < 2) {
+  if (inputs.size() != 7) {
     throw std::runtime_error(
-        "PagedKVWrite::output_shapes: expected at least 2 inputs");
+        "PagedKVWrite::output_shapes: expected 7 inputs");
   }
-  return {inputs[0].shape(), inputs[1].shape()};
+  return {
+      inputs[0].shape(), inputs[1].shape(), inputs[5].shape(),
+      inputs[6].shape()};
 }
 
 bool PagedKVWrite::is_equivalent(const Primitive& other) const {
@@ -1098,7 +1160,7 @@ bool PagedAttention::is_equivalent(const Primitive& other) const {
 // Public free functions
 // =============================================================================
 
-std::pair<array, array> paged_kv_write(
+std::array<array, 4> paged_kv_write(
     const array& k_pool,
     const array& v_pool,
     const array& new_k,
@@ -1205,12 +1267,16 @@ std::pair<array, array> paged_kv_write(
       kv_dtype);
 
   auto results = array::make_arrays(
-      {k_pool.shape(), v_pool.shape()},
-      {k_pool.dtype(), v_pool.dtype()},
+      {k_pool.shape(), v_pool.shape(), k_scale.shape(), v_scale.shape()},
+      {k_pool.dtype(), v_pool.dtype(), k_scale.dtype(), v_scale.dtype()},
       primitive,
       inputs);
 
-  return {std::move(results[0]), std::move(results[1])};
+  return {
+      std::move(results[0]),
+      std::move(results[1]),
+      std::move(results[2]),
+      std::move(results[3])};
 }
 
 array paged_attention(
@@ -1345,6 +1411,7 @@ void validate_paged_attention_varlen_inputs(
     int sliding_window,
     KvDtype kv_dtype,
     const char* op_name) {
+  refuse_int8_reads(kv_dtype, op_name);
   require_row_contiguous_zero_offset(q, op_name, "q");
   require_row_contiguous_zero_offset(k_pool, op_name, "k_pool");
   require_row_contiguous_zero_offset(v_pool, op_name, "v_pool");
@@ -1867,6 +1934,7 @@ mlx_array* mlx_paged_attention_forward_with_plan(
     auto& k_scale         = *reinterpret_cast<array*>(k_scale_ptr);
     auto& v_scale         = *reinterpret_cast<array*>(v_scale_ptr);
 
+    require_known_kv_dtype(kv_dtype_raw);
     auto kv_dtype = static_cast<KvDtype>(kv_dtype_raw);
 
     // The public factory rejects non-row-contiguous/nonzero-offset inputs.
@@ -1981,12 +2049,7 @@ mlx_array* mlx_paged_attention_varlen_forward(
     using namespace mlx::core;
     using namespace mlx::core::fast;
 
-    if (kv_dtype_raw > static_cast<uint8_t>(KvDtype::Fp8)) {
-      std::ostringstream msg;
-      msg << "invalid kv_dtype_raw " << static_cast<int>(kv_dtype_raw)
-          << "; expected 0 (Fp16), 1 (Bf16), or 2 (Fp8)";
-      throw std::invalid_argument(msg.str());
-    }
+    require_known_kv_dtype(kv_dtype_raw);
 
     auto& q_raw             = *reinterpret_cast<array*>(q_ptr);
     auto& k_pool            = *reinterpret_cast<array*>(k_pool_ptr);
@@ -2058,16 +2121,18 @@ bool mlx_paged_kv_write_forward(
     int head_size,
     uint8_t kv_dtype_raw,
     mlx_array** out_k_pool_ptr,
-    mlx_array** out_v_pool_ptr) {
-  if (out_k_pool_ptr) {
-    *out_k_pool_ptr = nullptr;
-  }
-  if (out_v_pool_ptr) {
-    *out_v_pool_ptr = nullptr;
+    mlx_array** out_v_pool_ptr,
+    mlx_array** out_k_scale_ptr,
+    mlx_array** out_v_scale_ptr) {
+  for (mlx_array** out :
+       {out_k_pool_ptr, out_v_pool_ptr, out_k_scale_ptr, out_v_scale_ptr}) {
+    if (out) {
+      *out = nullptr;
+    }
   }
   if (!k_pool_ptr || !v_pool_ptr || !new_k_ptr || !new_v_ptr ||
       !slot_mapping_ptr || !k_scale_ptr || !v_scale_ptr || !out_k_pool_ptr ||
-      !out_v_pool_ptr) {
+      !out_v_pool_ptr || !out_k_scale_ptr || !out_v_scale_ptr) {
     return false;
   }
 
@@ -2083,6 +2148,7 @@ bool mlx_paged_kv_write_forward(
     auto& k_scale      = *reinterpret_cast<array*>(k_scale_ptr);
     auto& v_scale      = *reinterpret_cast<array*>(v_scale_ptr);
 
+    require_known_kv_dtype(kv_dtype_raw);
     auto kv_dtype = static_cast<KvDtype>(kv_dtype_raw);
 
     // Rust model code commonly produces K/V via transpose/reshape chains.
@@ -2105,10 +2171,12 @@ bool mlx_paged_kv_write_forward(
         x_pack_for(kv_dtype),
         kv_dtype);
 
-    *out_k_pool_ptr = reinterpret_cast<mlx_array*>(
-        new array(std::move(out.first)));
-    *out_v_pool_ptr = reinterpret_cast<mlx_array*>(
-        new array(std::move(out.second)));
+    *out_k_pool_ptr = reinterpret_cast<mlx_array*>(new array(std::move(out[0])));
+    *out_v_pool_ptr = reinterpret_cast<mlx_array*>(new array(std::move(out[1])));
+    *out_k_scale_ptr =
+        reinterpret_cast<mlx_array*>(new array(std::move(out[2])));
+    *out_v_scale_ptr =
+        reinterpret_cast<mlx_array*>(new array(std::move(out[3])));
     return true;
   } catch (const std::exception& e) {
     mlx_trace_native_error("paged_kv_write_forward", e.what());
@@ -2966,7 +3034,7 @@ std::vector<mlx::core::array> paged_kv_write_trace_fn(
       /*x_pack=*/8,
       KvDtype::Bf16,
       /*s=*/{});
-  return {out.first, out.second};
+  return {out[0], out[1]};
 }
 
 } // namespace
@@ -3789,7 +3857,7 @@ std::vector<mlx::core::array> paged_kv_write_oob_trace_fn(
       /*x_pack=*/8,
       KvDtype::Bf16,
       /*s=*/{});
-  return {out.first, out.second};
+  return {out[0], out[1]};
 }
 
 } // namespace
@@ -4746,6 +4814,8 @@ int mlx_paged_kv_write_forward_eval_smoke() {
 
     mlx_array* out_k = nullptr;
     mlx_array* out_v = nullptr;
+    mlx_array* out_k_scale = nullptr;
+    mlx_array* out_v_scale = nullptr;
     bool ok = mlx_paged_kv_write_forward(
         reinterpret_cast<mlx_array*>(&k_pool),
         reinterpret_cast<mlx_array*>(&v_pool),
@@ -4759,13 +4829,13 @@ int mlx_paged_kv_write_forward_eval_smoke() {
         /*head_size=*/64,
         /*kv_dtype_raw=*/1,
         &out_k,
-        &out_v);
-    if (!ok || out_k == nullptr || out_v == nullptr) {
-      if (out_k) {
-        delete reinterpret_cast<array*>(out_k);
-      }
-      if (out_v) {
-        delete reinterpret_cast<array*>(out_v);
+        &out_v,
+        &out_k_scale,
+        &out_v_scale);
+    if (!ok || out_k == nullptr || out_v == nullptr ||
+        out_k_scale == nullptr || out_v_scale == nullptr) {
+      for (mlx_array* out : {out_k, out_v, out_k_scale, out_v_scale}) {
+        delete reinterpret_cast<array*>(out);
       }
       return 0;
     }
@@ -4773,8 +4843,9 @@ int mlx_paged_kv_write_forward_eval_smoke() {
     auto* k_out = reinterpret_cast<array*>(out_k);
     auto* v_out = reinterpret_cast<array*>(out_v);
     eval(*k_out, *v_out);
-    delete k_out;
-    delete v_out;
+    for (mlx_array* out : {out_k, out_v, out_k_scale, out_v_scale}) {
+      delete reinterpret_cast<array*>(out);
+    }
     return 1;
   } catch (...) {
     return -1;
@@ -4825,7 +4896,7 @@ std::vector<mlx::core::array> paged_kv_write_non_contig_trace_fn(
       /*x_pack=*/8,
       KvDtype::Bf16,
       /*s=*/{});
-  return {out.first, out.second};
+  return {out[0], out[1]};
 }
 
 std::atomic<int> paged_kv_offset_trace_count{0};
@@ -5408,8 +5479,8 @@ int eval_paged_kv_write_with_bad_state(
   std::vector<array> results;
   try {
     results = array::make_arrays(
-        {k_pool.shape(), v_pool.shape()},
-        {k_pool.dtype(), v_pool.dtype()},
+        {k_pool.shape(), v_pool.shape(), k_scale.shape(), v_scale.shape()},
+        {k_pool.dtype(), v_pool.dtype(), float32, float32},
         primitive,
         inputs);
   } catch (const std::invalid_argument& e) {
@@ -6125,7 +6196,7 @@ extern "C" int mlx_paged_phase2_stress_mixed_graph_v(
 
       array q_offset_ref = mlx::core::add(q_ref, bias_ref);
 
-      auto [k_pool_written, v_pool_written] = paged_kv_write(
+      auto written = paged_kv_write(
           k_pool_ref,
           v_pool_ref,
           new_k_ref,
@@ -6138,6 +6209,8 @@ extern "C" int mlx_paged_phase2_stress_mixed_graph_v(
           kHeadSize,
           kXPack,
           KvDtype::Bf16);
+      array& k_pool_written = written[0];
+      array& v_pool_written = written[1];
 
       // Force the write to complete before the read graph is built.
       // This is the "true reference" guarantee — eval() drains the
@@ -6275,7 +6348,7 @@ extern "C" int mlx_paged_phase2_stress_mixed_graph_v(
       array q_offset = mlx::core::add(q, bias);
 
       // Step 1b: paged_kv_write — fills slots 0..kSeqLen-1.
-      auto [k_pool_after, v_pool_after] = paged_kv_write(
+      auto after = paged_kv_write(
           k_pool,
           v_pool,
           new_k,
@@ -6288,6 +6361,8 @@ extern "C" int mlx_paged_phase2_stress_mixed_graph_v(
           kHeadSize,
           kXPack,
           KvDtype::Bf16);
+      array& k_pool_after = after[0];
+      array& v_pool_after = after[1];
 
       // Step 1c: paged_attention reads from the just-written pools.
       // The encoder must fence between the write (Step 1b) and this
@@ -6557,7 +6632,7 @@ int mlx_paged_attention_varlen_forward_rejects_invalid_kv_dtype() {
       /*num_q_heads=*/8,
       /*num_kv_heads=*/4,
       /*head_size=*/64,
-      /*kv_dtype_raw=*/3);
+      /*kv_dtype_raw=*/255);
   if (out == nullptr) {
     return 1;
   }

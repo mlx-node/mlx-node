@@ -70,8 +70,8 @@ pub fn dtype_size_for(dtype: MetalDtype) -> u32 {
         // Non-FP8 caches are 2 bytes/element regardless of input
         // (kernels only instantiate (half, half) and (bfloat16_t, bfloat16_t)).
         MetalDtype::Float16 | MetalDtype::BFloat16 => 2,
-        // FP8 E4M3 cache: 1 byte/element.
-        MetalDtype::UChar => 1,
+        // FP8 E4M3 and int8 caches: 1 byte/element.
+        MetalDtype::UChar | MetalDtype::Int8 => 1,
         // Float32 caches are not supported (no kernel instantiation). The
         // profile-run path treats them as 4 bytes for consistency, but
         // `LayerKVPool::new` rejects them at construction so we never
@@ -80,9 +80,10 @@ pub fn dtype_size_for(dtype: MetalDtype) -> u32 {
     }
 }
 
-/// Compute per-block bytes following vLLM's KV pool layout:
-/// `2 * num_layers * num_kv_heads * head_size * block_size * dtype_size`
-/// (factor of 2 covers K and V).
+/// Bytes of one block over every layer, K and V sides, scale planes
+/// included: `2 * num_layers * num_kv_heads * block_size * (head_size *
+/// dtype_size + scale_bytes)` (Splash `kv::Layout::bytesPerLayerPage`; int8
+/// gives `2·L·H·bs·(D+4)`).
 ///
 /// Returns `Err(InvalidShape)` if any factor is zero.
 pub fn bytes_per_block(
@@ -99,7 +100,12 @@ pub fn bytes_per_block(
         )));
     }
     let dt = dtype_size_for(dtype) as u64;
-    Ok(2u64 * num_layers as u64 * num_kv_heads as u64 * head_size as u64 * block_size as u64 * dt)
+    let scale = dtype.scale_bytes() as u64;
+    Ok(2u64
+        * num_layers as u64
+        * num_kv_heads as u64
+        * block_size as u64
+        * (head_size as u64 * dt + scale))
 }
 
 /// `min(requested, (hard - active - reserved) / bytes_per_block)` whole
@@ -199,6 +205,29 @@ mod tests {
         let bpb = bytes_per_block(32, 8, 64, 16, MetalDtype::BFloat16).unwrap();
         assert_eq!(bpb, 2 * 32 * 8 * 64 * 16 * 2);
         assert_eq!(bpb, 1024 * 1024);
+    }
+
+    /// Mutation M7: the int8 scale term is 0 → 524,288.
+    #[test]
+    fn bytes_per_block_counts_scales() {
+        assert_eq!(dtype_size_for(MetalDtype::Int8), 1);
+        // 27B: L 16, H 4, D 256. 2·16·4·16·(256+4).
+        assert_eq!(
+            bytes_per_block(16, 4, 256, 16, MetalDtype::Int8).unwrap(),
+            532_480
+        );
+        assert_eq!(
+            bytes_per_block(16, 4, 256, 32, MetalDtype::Int8).unwrap(),
+            1_064_960
+        );
+        assert_eq!(
+            bytes_per_block(16, 4, 256, 16, MetalDtype::BFloat16).unwrap(),
+            1_048_576
+        );
+        assert_eq!(
+            bytes_per_block(16, 4, 256, 16, MetalDtype::UChar).unwrap(),
+            524_288
+        );
     }
 
     #[test]

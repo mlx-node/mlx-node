@@ -390,9 +390,9 @@ mod pool {
             self.used();
         }
 
-        /// A grow or shrink replaced one layer's pair: Splash `add` of the
+        /// A grow or shrink replaced one layer's planes: Splash `add` of the
         /// new buffers and `remove` of the old (their last pool reference).
-        pub(crate) fn swap(&self, old: [&BufferRef; 2], new: [&BufferRef; 2]) {
+        pub(crate) fn swap(&self, old: &[&BufferRef], new: &[&BufferRef]) {
             {
                 let mut state = self.state();
                 let mut bytes = state.members_bytes;
