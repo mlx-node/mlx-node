@@ -43,6 +43,28 @@ function ggufModelName(name: string): string {
   return name.slice(0, -'.gguf'.length);
 }
 
+/**
+ * The parts of a split GGUF name `STEM-0000K-of-0000N.gguf` (any `.gguf`
+ * case; K and N five digits, 1 <= K <= N <= 1024), or null.
+ */
+export function ggufSplitPart(name: string): { stem: string; part: number; total: number } | null {
+  if (name.length < 5 || name.slice(-5).toLowerCase() !== '.gguf') return null;
+  const base = name.slice(0, -5);
+  const digits = (text: string): number | null => {
+    if (text.length !== 5) return null;
+    for (const ch of text) if (ch < '0' || ch > '9') return null;
+    return Number(text);
+  };
+  const of = base.lastIndexOf('-of-');
+  if (of < 0) return null;
+  const total = digits(base.slice(of + 4));
+  const dash = base.lastIndexOf('-', of - 1);
+  if (total === null || dash < 0) return null;
+  const part = digits(base.slice(dash + 1, of));
+  if (part === null || part < 1 || total > 1024 || part > total) return null;
+  return { stem: base.slice(0, dash), part, total };
+}
+
 function supportedGgufName(name: string, modelType: ModelType): boolean {
   const policy = familyDataFor(modelType)?.ggufDiscovery;
   if (!policy || isGgufCompanionName(name)) return false;
@@ -51,8 +73,9 @@ function supportedGgufName(name: string, modelType: ModelType): boolean {
     const { ordinal, shards } = split;
     if (ordinal !== 1 || shards < 1 || shards > 1024 || (shards > 1 && !policy.split)) return false;
   }
-  if (modelType === 'qwen3_5' && isBonsaiPq2GgufName(name)) return true;
-  return policy.variants === 'all' || isQwen35XlGgufName(name);
+  const whole = split === undefined ? name : `${split.stem}.gguf`;
+  if (modelType === 'qwen3_5' && isBonsaiPq2GgufName(whole)) return true;
+  return policy.variants === 'all' || isQwen35XlGgufName(whole);
 }
 
 async function hasGgufAssets(modelDir: string, onIoFailure?: (error: unknown) => void): Promise<boolean> {

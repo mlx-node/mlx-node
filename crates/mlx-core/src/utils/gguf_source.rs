@@ -23,9 +23,14 @@ pub(crate) struct GgufFileHandle {
 }
 
 pub(crate) struct GgufSourceSet {
-    pub main: GgufFileHandle,
+    /// Every part of the main GGUF, in part order.
+    pub main: Vec<GgufFileHandle>,
     pub companion: Option<GgufFileHandle>,
 }
+
+/// One GGUF file a set opens: path, its own header, the identity it was
+/// prepared under.
+pub(crate) type GgufPartRef<'a> = (&'a Path, Arc<GgufFile>, &'a GgufFileIdentity);
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct GgufFileIdentity {
@@ -41,9 +46,9 @@ pub(crate) struct GgufIdentity {
 }
 
 impl GgufIdentity {
-    pub(crate) fn new(main: &GgufFileIdentity, companion: Option<&GgufFileIdentity>) -> Self {
+    pub(crate) fn new(main: &[GgufFileIdentity], companion: Option<&GgufFileIdentity>) -> Self {
         Self {
-            files: std::iter::once(main).chain(companion).cloned().collect(),
+            files: main.iter().chain(companion).cloned().collect(),
             contract: GGUF_IMPORT_CONTRACT,
         }
     }
@@ -79,7 +84,6 @@ impl GgufFileHandle {
         if source_file_identity_digest(&canonical, &meta) != expected.source_identity {
             return Err(changed_since_prepare(&canonical));
         }
-        reject_split(&header, &canonical)?;
         check_tensor_bounds(&header, meta.len(), &canonical)?;
         Ok(Self {
             path: canonical,
@@ -111,11 +115,29 @@ impl GgufFileHandle {
 }
 
 impl GgufSourceSet {
+    /// The main parts must form one GGUF (Splash `GgufFile` over every part);
+    /// the companion is one file.
     pub(crate) fn open(
-        main: (&Path, Arc<GgufFile>, &GgufFileIdentity),
-        companion: Option<(&Path, Arc<GgufFile>, &GgufFileIdentity)>,
+        main: &[GgufPartRef<'_>],
+        companion: Option<GgufPartRef<'_>>,
     ) -> Result<Self> {
-        let main = GgufFileHandle::open(main.0, main.1, main.2)?;
+        match main {
+            [] => return Err(Error::from_reason("a GGUF needs at least one file")),
+            [(path, header, _)] => reject_split(header, path)?,
+            parts => check_split_parts(
+                &parts
+                    .iter()
+                    .map(|(path, header, _)| (*path, &**header))
+                    .collect::<Vec<_>>(),
+            )?,
+        }
+        if let Some((path, header, _)) = &companion {
+            reject_split(header, path)?;
+        }
+        let main = main
+            .iter()
+            .map(|(path, header, identity)| GgufFileHandle::open(path, header.clone(), identity))
+            .collect::<Result<Vec<_>>>()?;
         let companion = companion
             .map(|(path, header, identity)| GgufFileHandle::open(path, header, identity))
             .transpose()?;
@@ -123,7 +145,9 @@ impl GgufSourceSet {
     }
 
     pub(crate) fn recheck(&self) -> Result<()> {
-        self.main.recheck()?;
+        for part in &self.main {
+            part.recheck()?;
+        }
         if let Some(companion) = &self.companion {
             companion.recheck()?;
         }
@@ -133,18 +157,151 @@ impl GgufSourceSet {
     #[cfg(test)]
     pub(crate) fn identity(&self) -> GgufIdentity {
         GgufIdentity::new(
-            &self.main.identity,
+            &self
+                .main
+                .iter()
+                .map(|h| h.identity.clone())
+                .collect::<Vec<_>>(),
             self.companion.as_ref().map(|h| &h.identity),
         )
     }
 
     #[cfg(test)]
     pub(crate) fn data_bytes(&self) -> u64 {
-        std::iter::once(&self.main)
+        self.main
+            .iter()
             .chain(self.companion.as_ref())
             .map(|h| h.len.saturating_sub(h.header.data_offset))
             .sum()
     }
+}
+
+/// The parts of the GGUF `path` names, in part order and canonical: `path`
+/// alone, or the first part of `NAME-0000K-of-0000N.gguf` and its siblings
+/// found by name beside it (before any link is resolved).
+pub(crate) fn resolve_main_parts(path: &Path) -> Result<Vec<PathBuf>> {
+    let canonical = |p: &Path| {
+        fs::canonicalize(p).map_err(|e| {
+            Error::from_reason(format!("Failed to resolve GGUF '{}': {e}", p.display()))
+        })
+    };
+    let header = super::gguf::parse_gguf(path)?;
+    let count = split_key(&header, "split.count").unwrap_or(1);
+    if count <= 1 {
+        return Ok(vec![canonical(path)?]);
+    }
+    let Some((first, _)) = split_names(path, count) else {
+        return Err(lone_split_part(&header, path, count));
+    };
+    let part = split_key(&header, "split.no").unwrap_or(0);
+    if part != 0 {
+        return Err(Error::from_reason(format!(
+            "GGUF '{}' is part {} of a split GGUF of {count} parts; pass its first part '{}'",
+            path.display(),
+            part.saturating_add(1),
+            first.display()
+        )));
+    }
+    let count = u32::try_from(count).map_err(|_| {
+        Error::from_reason(format!("GGUF '{}': invalid split.count", path.display()))
+    })?;
+    resolve_gguf_shards(path, count)
+        .map_err(|e| {
+            Error::from_reason(format!(
+                "GGUF '{}' is part 1 of a split GGUF of {count} parts and the set is \
+                 incomplete: {}",
+                path.display(),
+                e.reason
+            ))
+        })?
+        .iter()
+        .map(|p| canonical(p))
+        .collect()
+}
+
+/// Splash `GgufFile` constructor over several parts: part 1's `split.count`
+/// is the number of parts, a later part's `split.no` (U16 or U32 when
+/// present) is its place, `split.tensors.count` is the tensors of all parts,
+/// and no tensor name repeats.
+pub(crate) fn check_split_parts(parts: &[(&Path, &GgufFile)]) -> Result<()> {
+    let [(first_path, first), rest @ ..] = parts else {
+        return Err(Error::from_reason("a GGUF needs at least one file"));
+    };
+    let count = split_key(first, "split.count").unwrap_or(1);
+    if count != parts.len() as u64 {
+        return Err(Error::from_reason(format!(
+            "GGUF '{}': the GGUF's split.count does not match its {} files",
+            first_path.display(),
+            parts.len()
+        )));
+    }
+    for (place, (path, header)) in rest.iter().enumerate() {
+        let place = place as u64 + 1;
+        let number = match header.metadata.get("split.no") {
+            None => continue,
+            Some(GgufMetaValue::Uint16(v)) => u64::from(*v),
+            Some(GgufMetaValue::Uint32(v)) => u64::from(*v),
+            Some(_) => {
+                return Err(Error::from_reason(format!(
+                    "GGUF '{}': invalid split.no",
+                    path.display()
+                )));
+            }
+        };
+        if number != place {
+            return Err(Error::from_reason(format!(
+                "GGUF split file '{}' is out of order",
+                path.display()
+            )));
+        }
+    }
+    let total: u64 = parts.iter().map(|(_, h)| h.tensors.len() as u64).sum();
+    if split_key(first, "split.tensors.count").unwrap_or(total) != total {
+        return Err(Error::from_reason(format!(
+            "GGUF '{}': the GGUF's split files hold another number of tensors than \
+             split.tensors.count",
+            first_path.display()
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (_, header) in parts {
+        for tensor in &header.tensors {
+            if !seen.insert(tensor.name.as_str()) {
+                return Err(Error::from_reason(format!(
+                    "duplicate GGUF tensor: {}",
+                    tensor.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The one header the plan reads for a GGUF of `parts`: part 1's metadata
+/// without the `split.*` keys and the tensors of every part in part order.
+/// No byte is read through it; each part's reads use that part's header.
+pub(crate) fn merge_split_headers(parts: &[(&Path, &GgufFile)]) -> Result<GgufFile> {
+    match parts {
+        [(path, header)] => reject_split(header, path)?,
+        parts => check_split_parts(parts)?,
+    }
+    let (_, first) = parts[0];
+    let mut metadata = first.metadata.clone();
+    if parts.len() > 1 {
+        metadata.retain(|key, _| !key.starts_with("split."));
+    }
+    let tensors: Vec<_> = parts
+        .iter()
+        .flat_map(|(_, h)| h.tensors.iter().cloned())
+        .collect();
+    Ok(GgufFile {
+        version: first.version,
+        tensor_count: tensors.len() as u64,
+        metadata,
+        tensors,
+        alignment: first.alignment,
+        data_offset: first.data_offset,
+    })
 }
 
 pub(crate) fn check_tensor_bounds(h: &GgufFile, file_len: u64, path: &Path) -> Result<()> {
@@ -273,6 +430,86 @@ fn split_names(path: &Path, count: u64) -> Option<(PathBuf, PathBuf)> {
     ))
 }
 
+/// `NAME-0000K-of-0000N.gguf` (any `.gguf` case) as `(NAME, K, N)`.
+pub(crate) fn split_part(name: &str) -> Option<(&str, u64, u64)> {
+    let (stem, extension) = name.rsplit_once('.')?;
+    let (head, total) = stem.rsplit_once("-of-")?;
+    let (prefix, number) = head.rsplit_once('-')?;
+    let digits = |s: &str| s.len() == 5 && s.bytes().all(|b| b.is_ascii_digit());
+    if !extension.eq_ignore_ascii_case("gguf") || !digits(number) || !digits(total) {
+        return None;
+    }
+    Some((prefix, number.parse().ok()?, total.parse().ok()?))
+}
+
+/// Splash `findTargetGgufs`: the GGUF of a target directory, one file or the
+/// parts `NAME-0000K-of-0000N.gguf` of one NAME, K = 1..N, in part order.
+pub(crate) fn find_target_ggufs(dir: &Path) -> Result<Vec<PathBuf>> {
+    let listing = fs::read_dir(dir).map_err(|e| {
+        Error::from_reason(format!(
+            "cannot list target directory {}: {e}",
+            dir.display()
+        ))
+    })?;
+    let mut found = Vec::new();
+    for entry in listing {
+        let path = entry
+            .map_err(|e| {
+                Error::from_reason(format!(
+                    "cannot list target directory {}: {e}",
+                    dir.display()
+                ))
+            })?
+            .path();
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+        {
+            found.push(path);
+        }
+    }
+    if found.is_empty() {
+        return Err(Error::from_reason(format!(
+            "target directory holds no GGUF: {}",
+            dir.display()
+        )));
+    }
+    if found.len() == 1 {
+        return Ok(found);
+    }
+    found.sort();
+    let not_split = || {
+        Error::from_reason(format!(
+            "target directory holds more than one GGUF, and not the parts of one split GGUF: {}",
+            dir.display()
+        ))
+    };
+    let mut parts = Vec::with_capacity(found.len());
+    for path in &found {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(not_split)?;
+        parts.push(split_part(name).ok_or_else(not_split)?);
+    }
+    let names: std::collections::BTreeSet<&str> = parts.iter().map(|(name, _, _)| *name).collect();
+    if names.len() > 1 {
+        return Err(Error::from_reason(format!(
+            "target directory mixes the parts of several split GGUFs ({}); a split GGUF is the \
+             parts of one name, NAME-0000K-of-0000N.gguf: {}",
+            names.into_iter().collect::<Vec<_>>().join(", "),
+            dir.display()
+        )));
+    }
+    for (index, (_, number, count)) in parts.iter().enumerate() {
+        if *number != index as u64 + 1 || *count != parts.len() as u64 {
+            return Err(not_split());
+        }
+    }
+    Ok(found)
+}
+
 pub(crate) fn file_identity(
     path: &Path,
     header: &GgufFile,
@@ -388,7 +625,7 @@ mod tests {
         let header = Arc::new(header);
         let meta = fs::metadata(&path).unwrap();
         let id = file_identity(&path, &header, &meta).unwrap();
-        let text = err_text(GgufSourceSet::open((&path, header, &id), None));
+        let text = err_text(GgufSourceSet::open(&[(&path, header, &id)], None));
         assert!(text.contains("truncated"), "{text}");
     }
 
@@ -422,7 +659,7 @@ mod tests {
         }
         assert!(text.contains("llama-gguf-split --merge"), "{text}");
         let (header, id) = identity_of(&parts[0]);
-        let text = err_text(GgufSourceSet::open((&parts[0], header, &id), None));
+        let text = err_text(GgufSourceSet::open(&[(&parts[0], header, &id)], None));
         for name in TINY_NAMES {
             assert!(text.contains(name), "load seam: {text}");
         }
@@ -449,7 +686,7 @@ mod tests {
         write_merged_gguf(&merged, &tiny_metadata(), &TINY);
         let (header, id) = identity_of(&merged);
         reject_split(&header, &merged).unwrap();
-        GgufSourceSet::open((&merged, header, &id), None).unwrap();
+        GgufSourceSet::open(&[(&merged, header, &id)], None).unwrap();
 
         let plain = dir.0.join("plain.gguf");
         write_gguf(&plain, &[], 1.0);
@@ -499,7 +736,7 @@ mod tests {
         let path = dir.0.join("m.gguf");
         write_gguf(&path, &[], 1.0);
         let (header, id) = identity_of(&path);
-        let set = GgufSourceSet::open((&path, header.clone(), &id), None).unwrap();
+        let set = GgufSourceSet::open(&[(&path, header.clone(), &id)], None).unwrap();
         set.recheck().unwrap();
         assert_eq!(set.identity().files, vec![id.clone()]);
         assert_eq!(set.identity().contract, GGUF_IMPORT_CONTRACT);
@@ -508,11 +745,11 @@ mod tests {
         let other = dir.0.join("other.gguf");
         write_gguf(&other, &[], 7.0);
         fs::rename(&other, &path).unwrap();
-        let text = err_text(GgufSourceSet::open((&path, header.clone(), &id), None));
+        let text = err_text(GgufSourceSet::open(&[(&path, header.clone(), &id)], None));
         assert!(text.contains("changed since prepare"), "{text}");
 
         let (header, id) = identity_of(&path);
-        let set = GgufSourceSet::open((&path, header, &id), None).unwrap();
+        let set = GgufSourceSet::open(&[(&path, header, &id)], None).unwrap();
         {
             use std::io::Write;
             let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -552,10 +789,129 @@ mod tests {
         let path = dir.0.join("m.gguf");
         write_gguf(&path, &[], 1.0);
         let (header, id) = identity_of(&path);
-        let set = GgufSourceSet::open((&path, header.clone(), &id), None).unwrap();
+        let set = GgufSourceSet::open(&[(&path, header.clone(), &id)], None).unwrap();
         assert_eq!(
             set.data_bytes(),
             fs::metadata(&path).unwrap().len() - header.data_offset
         );
+    }
+
+    fn check_files(paths: &[PathBuf]) -> Result<()> {
+        let headers: Vec<GgufFile> = paths.iter().map(|p| parse_gguf(p).unwrap()).collect();
+        check_split_parts(
+            &paths
+                .iter()
+                .map(PathBuf::as_path)
+                .zip(&headers)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn split_parts_follow_the_gguf_file_rules() {
+        use crate::utils::gguf_test_fixtures::GgufParts;
+        let dir = Temp::new();
+        let parts = write_split_gguf(&dir.0, "tiny", &tiny_metadata(), &TINY, true);
+        let canonical: Vec<PathBuf> = parts.iter().map(|p| p.canonicalize().unwrap()).collect();
+        assert_eq!(resolve_main_parts(&parts[0]).unwrap(), canonical);
+        check_files(&parts).unwrap();
+        let merged = {
+            let headers: Vec<GgufFile> = parts.iter().map(|p| parse_gguf(p).unwrap()).collect();
+            merge_split_headers(
+                &parts
+                    .iter()
+                    .map(PathBuf::as_path)
+                    .zip(&headers)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        assert_eq!(merged.tensors.len(), 3);
+        assert!(merged.metadata.keys().all(|k| !k.starts_with("split.")));
+        reject_split(&merged, &parts[0]).unwrap();
+
+        let text = err_text(resolve_main_parts(&parts[1]));
+        assert!(text.contains("pass its first part"), "{text}");
+        assert!(text.contains(TINY_NAMES[0]), "{text}");
+
+        // A Hugging Face snapshot links each part to a blob of another name.
+        let blobs = dir.0.join("blobs");
+        let snapshot = dir.0.join("snapshot");
+        fs::create_dir_all(&blobs).unwrap();
+        fs::create_dir_all(&snapshot).unwrap();
+        for (i, part) in parts.iter().enumerate() {
+            let blob = blobs.join(format!("blob{i}"));
+            fs::copy(part, &blob).unwrap();
+            std::os::unix::fs::symlink(&blob, snapshot.join(TINY_NAMES[i])).unwrap();
+        }
+        let linked = resolve_main_parts(&snapshot.join(TINY_NAMES[0])).unwrap();
+        assert_eq!(linked.len(), 3);
+        assert_eq!(linked[2], blobs.join("blob2").canonicalize().unwrap());
+
+        let edit = |part: usize, change: &dyn Fn(&mut GgufParts)| -> Vec<PathBuf> {
+            let case = dir.0.join(format!("case-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&case).unwrap();
+            parts
+                .iter()
+                .enumerate()
+                .map(|(i, src)| {
+                    let mut file = GgufParts::read(src);
+                    if i == part {
+                        change(&mut file);
+                    }
+                    let path = case.join(TINY_NAMES[i]);
+                    file.write(&path);
+                    path
+                })
+                .collect()
+        };
+        let swapped = {
+            let mut set = edit(1, &|p| p.set("split.no", GgufMetaValue::Uint16(2)));
+            let third = edit(2, &|p| p.set("split.no", GgufMetaValue::Uint16(1)));
+            set[2] = third[2].clone();
+            set
+        };
+        let text = err_text(check_files(&swapped));
+        assert!(text.contains("is out of order"), "{text}");
+
+        let duplicate = edit(1, &|p| p.tensors[0].0 = "a.weight".into());
+        let text = err_text(check_files(&duplicate));
+        assert!(text.contains("duplicate GGUF tensor: a.weight"), "{text}");
+
+        let short = edit(0, &|p| {
+            p.set("split.tensors.count", GgufMetaValue::Int32(4))
+        });
+        let text = err_text(check_files(&short));
+        assert!(text.contains("split.tensors.count"), "{text}");
+
+        let wide = edit(1, &|p| p.set("split.no", GgufMetaValue::Int32(1)));
+        let text = err_text(check_files(&wide));
+        assert!(text.contains("invalid split.no"), "{text}");
+
+        let unnumbered = edit(1, &|p| p.metadata.retain(|(k, _)| k != "split.no"));
+        check_files(&unnumbered).unwrap();
+
+        let text = err_text(check_files(&parts[..2]));
+        assert!(
+            text.contains("split.count does not match its 2 files"),
+            "{text}"
+        );
+
+        let plain = dir.0.join("plain.gguf");
+        write_gguf(&plain, &[], 1.0);
+        let (main_header, main_id) = identity_of(&plain);
+        let (part_header, part_id) = identity_of(&parts[0]);
+        let text = err_text(GgufSourceSet::open(
+            &[(&plain, main_header, &main_id)],
+            Some((&parts[0], part_header, &part_id)),
+        ));
+        assert!(
+            text.contains("part 1 of a split GGUF of 3 parts"),
+            "companion: {text}"
+        );
+
+        fs::remove_file(&parts[2]).unwrap();
+        let text = err_text(resolve_main_parts(&parts[0]));
+        assert!(text.contains("tiny-00003-of-00003"), "{text}");
     }
 }

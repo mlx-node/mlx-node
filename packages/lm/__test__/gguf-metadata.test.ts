@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { ggufArchitecture } from '@mlx-node/core';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
-import { readGgufArchitecture } from '../src/gguf-metadata.js';
+import { readGgufArchitecture, readGgufHeader } from '../src/gguf-metadata.js';
 import { detectModelType } from '../src/model-detection.js';
 
 function u32(value: number): Buffer {
@@ -64,11 +64,10 @@ describe('native-free GGUF metadata', () => {
     await expect(readGgufArchitecture(path)).resolves.toBe(ggufArchitecture(path));
   });
 
-  it('skips tokenizer strings across buffer boundaries and honors the last architecture', async () => {
+  it('skips tokenizer strings across buffer boundaries', async () => {
     writeFileSync(
       path,
       header([
-        architecture('gemma4'),
         entry(
           'tokenizer.ggml.tokens',
           9,
@@ -80,6 +79,13 @@ describe('native-free GGUF metadata', () => {
     );
     await expect(readGgufArchitecture(path)).resolves.toBe('muse-glimmer');
     await expect(readGgufArchitecture(path)).resolves.toBe(ggufArchitecture(path));
+  });
+
+  // Splash `GgufFile::parse`: a key holds one value.
+  it('refuses a repeated metadata key like the native parser', async () => {
+    writeFileSync(path, header([architecture('gemma4'), architecture('muse-glimmer')]));
+    await expect(readGgufArchitecture(path)).rejects.toThrow('duplicate GGUF metadata key: general.architecture');
+    expect(() => ggufArchitecture(path)).toThrow('duplicate GGUF metadata key: general.architecture');
   });
 
   it.each([
@@ -106,5 +112,61 @@ describe('native-free GGUF metadata', () => {
     await expect(readGgufArchitecture(path)).rejects.toThrow('regular file');
     execFileSync('mkfifo', [join(root, 'config.json')]);
     await expect(detectModelType(root)).rejects.toThrow('Cannot detect model type');
+  });
+});
+
+/** A GGUF of `entries` and F32 `tensors`, and the length of its header. */
+function tinyGguf(entries: Buffer[], tensors: [string, number[]][]): { bytes: Buffer; headerLength: number } {
+  let offset = 0;
+  const table = tensors.map(([name, dims]) => {
+    const descriptor = Buffer.concat([str(name), u32(dims.length), ...dims.map((d) => u64(d)), u32(0), u64(offset)]);
+    offset += Math.ceil((dims.reduce((a, b) => a * b, 1) * 4) / 32) * 32;
+    return descriptor;
+  });
+  const head = Buffer.concat([
+    Buffer.from('GGUF'),
+    u32(3),
+    u64(tensors.length),
+    u64(entries.length),
+    ...entries,
+    ...table,
+  ]);
+  const padded = Math.ceil(head.length / 32) * 32;
+  return { bytes: Buffer.concat([head, Buffer.alloc(padded - head.length + offset)]), headerLength: head.length };
+}
+
+describe('readGgufHeader', () => {
+  const source =
+    (bytes: Uint8Array, reads: [number, number][] = []) =>
+    async (position: number, length: number) => {
+      reads.push([position, length]);
+      return bytes.slice(position, position + length);
+    };
+
+  it('returns the header through the tensor table, across read edges', async () => {
+    const tokens = Array.from({ length: 248_000 }, (_, i) => `t${i}`);
+    const file = tinyGguf(
+      [
+        entry('general.architecture', 8, str('qwen35')),
+        entry('tokenizer.ggml.tokens', 9, Buffer.concat([u32(8), u64(tokens.length), ...tokens.map(str)])),
+        entry('qwen35.block_count', 4, u32(2)),
+      ],
+      [
+        ['a.weight', [8]],
+        ['b.weight', [4, 4]],
+      ],
+    );
+    const reads: [number, number][] = [];
+    const header = await readGgufHeader(source(file.bytes, reads), file.bytes.length, 1000);
+    expect(header.length).toBe(file.headerLength);
+    expect(Buffer.from(header).equals(Buffer.from(file.bytes.subarray(0, file.headerLength)))).toBe(true);
+    expect(reads.length).toBeGreaterThan(2);
+    expect(reads.every(([position], i) => i === 0 || position === reads[i - 1][0] + reads[i - 1][1])).toBe(true);
+  });
+
+  it('refuses more than 16384 tensors', async () => {
+    const bytes = tinyGguf([entry('general.architecture', 8, str('llama'))], [['a.weight', [8]]]).bytes;
+    bytes.writeBigUInt64LE(16385n, 8);
+    await expect(readGgufHeader(source(bytes), bytes.length)).rejects.toThrow(/implausible GGUF header counts/);
   });
 });

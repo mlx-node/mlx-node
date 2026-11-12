@@ -49,6 +49,11 @@
       "types": "./dist/model-discovery.d.ts",
       "import": "./dist/model-discovery.js"
     },
+    "./gguf-metadata": {
+      "@mlx-node/source": "./src/gguf-metadata.ts",
+      "types": "./dist/gguf-metadata.d.ts",
+      "import": "./dist/gguf-metadata.js"
+    },
     "./clef-types": {
       "@mlx-node/source": "./src/clef-types.ts",
       "types": "./dist/clef-types.d.ts",

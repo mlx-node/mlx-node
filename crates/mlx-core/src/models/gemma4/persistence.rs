@@ -1374,16 +1374,15 @@ fn load_gemma_weights(
     };
     input.load_companion = media;
     if config.per_layer_input_embeds {
-        let (_, header, _, plan) = &input.main;
         let ple_shard = plan_dense_row_shards(
-            header,
-            plan,
+            &input.main.header,
+            &input.main.plan,
             &input.opts,
             &is_ple_embed_key,
             DType::BFloat16,
             ple_budget,
         )?;
-        input.main.3.ple_shard = ple_shard;
+        input.main.plan.ple_shard = ple_shard;
     }
     let mut preload = GgufPreload::load(&input)?;
     let stats = &preload.stats;

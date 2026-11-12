@@ -515,8 +515,21 @@ fn expected_file_routes(model: &str, role: ManifestRole, file: &PreloadFile) -> 
     expected_routes(&label, &file.1, &file.3, file_len(model, role, file))
 }
 
+/// Gate 1 rows are one-file GGUFs.
+fn main_as_file(input: &PreloadInput) -> PreloadFile {
+    let [(path, _, identity)] = input.main.parts.as_slice() else {
+        panic!("gate 1 reads one-file GGUFs");
+    };
+    (
+        path.clone(),
+        input.main.header.clone(),
+        identity.clone(),
+        input.main.plan.clone(),
+    )
+}
+
 fn expected_input_routes(row: &GateRow, input: &PreloadInput) -> RouteExpectation {
-    let mut expected = expected_file_routes(&row.model, ManifestRole::Main, &input.main);
+    let mut expected = expected_file_routes(&row.model, ManifestRole::Main, &main_as_file(input));
     if input.load_companion {
         let role = row.companion_role().expect("companion role");
         let companion = input.companion.as_ref().unwrap_or_else(|| {
@@ -971,9 +984,9 @@ pub(crate) fn run() {
     let roles = row.roles();
     let selections = select_flip_cases(
         &row.model,
-        &input.main.1,
-        &input.main.3,
-        file_len(&row.model, ManifestRole::Main, &input.main),
+        &input.main.header,
+        &input.main.plan,
+        file_len(&row.model, ManifestRole::Main, &main_as_file(&input)),
         &baseline[&ManifestRole::Main],
     )
     .unwrap_or_else(|error| panic!("{error}"));
@@ -1088,6 +1101,7 @@ mod tests {
             strict_asset_copies: false,
             muse_secondary: false,
             ple_shard: None,
+            stop_token_ids: Vec::new(),
         }
     }
 

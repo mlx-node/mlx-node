@@ -691,8 +691,11 @@ pub fn parse_gguf<P: AsRef<Path>>(path: P) -> Result<GgufFile> {
     parse_gguf_reader(BufReader::new(file))
 }
 
-/// [`parse_gguf`] over an already opened reader (e.g. an `F_NOCACHE` file).
-pub(crate) fn parse_gguf_reader(mut reader: impl Read + Seek) -> Result<GgufFile> {
+/// The header through the metadata: version, tensor count, metadata (Splash
+/// `GgufFile::parse` key pass: at most 16384 tensors and keys, no key twice).
+fn parse_gguf_metadata(
+    mut reader: &mut impl Read,
+) -> Result<(u32, u64, HashMap<String, GgufMetaValue>)> {
     // Read header
     let magic = read_u32(&mut reader)
         .map_err(|e| Error::from_reason(format!("Failed to read GGUF magic: {e}")))?;
@@ -714,6 +717,11 @@ pub(crate) fn parse_gguf_reader(mut reader: impl Read + Seek) -> Result<GgufFile
         .map_err(|e| Error::from_reason(format!("Failed to read tensor count: {e}")))?;
     let metadata_kv_count = read_u64(&mut reader)
         .map_err(|e| Error::from_reason(format!("Failed to read metadata count: {e}")))?;
+    if tensor_count > GGUF_MAX_HEADER_COUNT || metadata_kv_count > GGUF_MAX_HEADER_COUNT {
+        return Err(Error::from_reason(format!(
+            "implausible GGUF header counts: {tensor_count} tensors, {metadata_kv_count} keys"
+        )));
+    }
 
     // Read metadata
     let mut metadata = HashMap::new();
@@ -728,35 +736,71 @@ pub(crate) fn parse_gguf_reader(mut reader: impl Read + Seek) -> Result<GgufFile
         let value = read_meta_value(&mut reader, vtype).map_err(|e| {
             Error::from_reason(format!("Failed to read metadata value for '{key}': {e}"))
         })?;
+        if metadata.contains_key(&key) {
+            return Err(Error::from_reason(format!(
+                "duplicate GGUF metadata key: {key}"
+            )));
+        }
         metadata.insert(key, value);
     }
+    Ok((version, tensor_count, metadata))
+}
 
-    // Read alignment from metadata (default: 32, minimum: 1 to prevent division by zero)
-    let alignment = metadata
-        .get("general.alignment")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(GGUF_DEFAULT_ALIGNMENT)
-        .max(1);
+/// [`parse_gguf`] over an already opened reader (e.g. an `F_NOCACHE` file).
+pub(crate) fn parse_gguf_reader(mut reader: impl Read + Seek) -> Result<GgufFile> {
+    let (version, tensor_count, metadata) = parse_gguf_metadata(&mut reader)?;
+    // Splash `GgufFile::parse`: a power of two of at most 64 KiB.
+    let alignment = match metadata.get("general.alignment") {
+        None => GGUF_DEFAULT_ALIGNMENT,
+        Some(value) => value
+            .as_u64()
+            .filter(|a| a.is_power_of_two() && *a <= 65536)
+            .ok_or_else(|| Error::from_reason("invalid GGUF alignment"))?,
+    };
 
     // Read tensor info descriptors
     let mut tensors = Vec::with_capacity(tensor_count as usize);
+    let mut names = HashSet::new();
     for _ in 0..tensor_count {
         let name = read_string(&mut reader)
             .map_err(|e| Error::from_reason(format!("Failed to read tensor name: {e}")))?;
         let n_dims = read_u32(&mut reader)
             .map_err(|e| Error::from_reason(format!("Failed to read tensor n_dims: {e}")))?;
+        if n_dims == 0 || n_dims > 4 {
+            return Err(Error::from_reason(format!(
+                "invalid tensor rank for {name}"
+            )));
+        }
         let mut dims = Vec::with_capacity(n_dims as usize);
         for _ in 0..n_dims {
-            dims.push(
-                read_u64(&mut reader)
-                    .map_err(|e| Error::from_reason(format!("Failed to read tensor dim: {e}")))?,
-            );
+            let dim = read_u64(&mut reader)
+                .map_err(|e| Error::from_reason(format!("Failed to read tensor dim: {e}")))?;
+            if dim == 0 {
+                return Err(Error::from_reason(format!(
+                    "zero tensor dimension for {name}"
+                )));
+            }
+            dims.push(dim);
+        }
+        if dims
+            .iter()
+            .try_fold(1u64, |n, &d| n.checked_mul(d))
+            .is_none()
+        {
+            return Err(Error::from_reason(format!(
+                "GGUF tensor '{name}' size overflows u64"
+            )));
         }
         let type_u32 = read_u32(&mut reader)
             .map_err(|e| Error::from_reason(format!("Failed to read tensor type: {e}")))?;
         let tensor_type = GgufTensorType::from_u32(type_u32);
         let offset = read_u64(&mut reader)
             .map_err(|e| Error::from_reason(format!("Failed to read tensor offset: {e}")))?;
+        if !offset.is_multiple_of(alignment) {
+            return Err(Error::from_reason(format!(
+                "tensor data is misaligned: {name}"
+            )));
+        }
 
         let tensor_type = match tensor_type {
             Some(t) => t,
@@ -782,6 +826,14 @@ pub(crate) fn parse_gguf_reader(mut reader: impl Read + Seek) -> Result<GgufFile
             }
         };
 
+        if !dims[0].is_multiple_of(tensor_type.block_size() as u64) {
+            return Err(Error::from_reason(format!(
+                "tensor row is not block aligned: {name}"
+            )));
+        }
+        if !names.insert(name.clone()) {
+            return Err(Error::from_reason(format!("duplicate GGUF tensor: {name}")));
+        }
         tensors.push(GgufTensorInfo {
             name,
             n_dims,
@@ -795,7 +847,18 @@ pub(crate) fn parse_gguf_reader(mut reader: impl Read + Seek) -> Result<GgufFile
     let current_pos = reader
         .stream_position()
         .map_err(|e| Error::from_reason(format!("Failed to get stream position: {e}")))?;
-    let data_offset = align_offset(current_pos, alignment);
+    // A part of no tensors may end at its header (Splash `GgufFile::parse`):
+    // its data section is empty and the padding before it is not written.
+    let ends_at_header = tensors.is_empty()
+        && reader
+            .seek(SeekFrom::End(0))
+            .map_err(|e| Error::from_reason(format!("Failed to seek GGUF end: {e}")))?
+            == current_pos;
+    let data_offset = if ends_at_header {
+        current_pos
+    } else {
+        align_offset(current_pos, alignment)
+    };
 
     Ok(GgufFile {
         version,
@@ -826,6 +889,71 @@ pub fn gguf_architecture(input_path: String) -> Result<String> {
         })?;
     Ok(architecture.to_string())
 }
+
+/// Splash `model-check` over header-only copies (`inspectSourceConfiguration`):
+/// the target GGUF of `dir` (Splash `findTargetGgufs`), every part's header
+/// rules and the split rules, then for qwen35 / qwen35moe the import plan every
+/// load runs (unread tensors, stop ids, every header guard). A family that
+/// reads one GGUF file refuses a split; an architecture no mlx-node loader
+/// reads is not judged.
+#[napi]
+pub fn check_gguf_headers(dir: String) -> Result<()> {
+    use super::gguf_source::{find_target_ggufs, merge_split_headers, reject_split};
+    let dir = Path::new(&dir);
+    let parts = find_target_ggufs(dir)?;
+    let named = |e: Error| {
+        Error::from_reason(format!(
+            "'{}': {}",
+            parts[0].file_name().unwrap_or_default().to_string_lossy(),
+            e.reason
+        ))
+    };
+    let (_, _, metadata) = fs::File::open(&parts[0])
+        .map_err(|e| Error::from_reason(format!("Failed to open GGUF file: {e}")))
+        .and_then(|file| parse_gguf_metadata(&mut BufReader::new(file)))
+        .map_err(named)?;
+    let architecture = metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let family = match architecture.as_str() {
+        "qwen35" => Some(NativeGgufFamily::Qwen35),
+        "qwen35moe" => Some(NativeGgufFamily::Qwen35Moe),
+        "gemma4" | "clef" | "muse-glimmer" | "qwen4exp" | "deepseek41" => None,
+        _ => return Ok(()),
+    };
+    let headers = parts
+        .iter()
+        .map(parse_gguf)
+        .collect::<Result<Vec<_>>>()
+        .map_err(named)?;
+    if family.is_none() && matches!(architecture.as_str(), "gemma4" | "clef" | "muse-glimmer") {
+        return reject_split(&headers[0], &parts[0]).map_err(named);
+    }
+    let mut merged = merge_split_headers(
+        &parts
+            .iter()
+            .map(PathBuf::as_path)
+            .zip(&headers)
+            .collect::<Vec<_>>(),
+    )
+    .map_err(named)?;
+    let Some(family) = family else {
+        return Ok(());
+    };
+    super::gguf_plan::annotate_gguf_header(&mut merged);
+    family
+        .check_main_header(&merged, &parts[0])
+        .map_err(named)?;
+    crate::engine::checkpoint_source::native_import_plans(family, (&parts[0], &merged), None)
+        .map_err(named)?;
+    Ok(())
+}
+
+/// Splash `GgufFile::parse`: at most this many tensors and metadata keys in
+/// one GGUF file.
+const GGUF_MAX_HEADER_COUNT: u64 = 16384;
 
 fn align_offset(offset: u64, alignment: u64) -> u64 {
     let remainder = offset % alignment;
@@ -6267,10 +6395,11 @@ async fn convert_gguf_to_safetensors_inner(
     })
 }
 
-/// v8 native GGUF entries contain only runtime assets and source records;
-/// weights are read from the GGUF at every load. Older weight entries are
-/// stale and age out through the normal sweep grace and lease rules.
-pub(crate) const NATIVE_GGUF_ASSETS_FORMAT: u32 = 8;
+/// Native GGUF entries contain only runtime assets and source records (every
+/// part of a split main GGUF); weights are read from the GGUF at every load.
+/// Older entries are stale and age out through the normal sweep grace and
+/// lease rules.
+pub(crate) const NATIVE_GGUF_ASSETS_FORMAT: u32 = 9;
 
 fn native_gguf_format_is_current(format: u32) -> bool {
     format == NATIVE_GGUF_ASSETS_FORMAT
@@ -7191,15 +7320,34 @@ fn native_gguf_entry_stale_reason(
             None => return Some("unreadable source record"),
         }),
     };
-    let source_meta = match fs::metadata(&source) {
-        Ok(meta) => meta,
-        Err(_) => return Some("source GGUF is gone"),
-    };
-    let identity = digests
-        .identities
-        .entry(source.clone())
-        .or_insert_with(|| Some(source_file_identity_digest(&source, &source_meta)))
-        .clone()?;
+    let mut parts = vec![source.clone()];
+    for line in marker.lines() {
+        if let Some(hex) = line.strip_prefix("part_hex=") {
+            match native_gguf_hex_decode(hex)
+                .and_then(|bytes| native_gguf_path_from_os_bytes(&bytes))
+            {
+                Some(part) => parts.push(part),
+                None => return Some("corrupt part_hex record"),
+            }
+        }
+    }
+    let mut part_identities = Vec::with_capacity(parts.len());
+    for part in &parts {
+        let meta = match fs::metadata(part) {
+            Ok(meta) => meta,
+            Err(_) => return Some("source GGUF is gone"),
+        };
+        part_identities.push(super::gguf_source::GgufFileIdentity {
+            path: part.clone(),
+            source_identity: digests
+                .identities
+                .entry(part.clone())
+                .or_insert_with(|| Some(source_file_identity_digest(part, &meta)))
+                .clone()?,
+            header_digest: [0; 32],
+        });
+    }
+    let identity = parts_identity_digest(&part_identities);
     if Some(identity.as_str()) != field("source_identity_sha256=").as_deref() {
         return Some("source GGUF changed");
     }
@@ -8049,20 +8197,59 @@ impl NativeGgufFamily {
 
 /// Family checks that run before any cache work: the main GGUF's architecture,
 /// required sibling assets, and the companion pick (Gemma4 media projector,
-/// Muse-Glimmer DFlash draft). Returns the canonical main path.
+/// Muse-Glimmer DFlash draft). Returns the canonical main parts: every part
+/// of a split qwen35 / qwen35moe GGUF, one file otherwise.
 pub(crate) fn native_gguf_preflight(
     input: &Path,
     family: NativeGgufFamily,
-) -> Result<(PathBuf, Option<PathBuf>)> {
+) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
+    use super::gguf_source::{merge_split_headers, resolve_main_parts};
     match family {
-        NativeGgufFamily::Qwen35 => Ok((input.canonicalize()?, None)),
-        NativeGgufFamily::Qwen35Moe | NativeGgufFamily::Clef => {
+        NativeGgufFamily::Qwen35 => Ok((resolve_main_parts(input)?, None)),
+        NativeGgufFamily::Qwen35Moe => {
+            let parts = resolve_main_parts(input)?;
+            let headers = parts.iter().map(parse_gguf).collect::<Result<Vec<_>>>()?;
+            let merged = merge_split_headers(
+                &parts
+                    .iter()
+                    .map(PathBuf::as_path)
+                    .zip(&headers)
+                    .collect::<Vec<_>>(),
+            )?;
+            family.check_main_header(&merged, &parts[0])?;
+            Ok((parts, None))
+        }
+        NativeGgufFamily::Clef => {
             let input = input.canonicalize()?;
             family.check_main_header(&parse_gguf(&input)?, &input)?;
-            Ok((input, None))
+            Ok((vec![input], None))
         }
-        NativeGgufFamily::Gemma4 => gemma4_native_preflight(input),
-        NativeGgufFamily::MuseGlimmer => muse_glimmer_native_preflight(input),
+        NativeGgufFamily::Gemma4 => {
+            gemma4_native_preflight(input).map(|(main, companion)| (vec![main], companion))
+        }
+        NativeGgufFamily::MuseGlimmer => {
+            muse_glimmer_native_preflight(input).map(|(main, companion)| (vec![main], companion))
+        }
+    }
+}
+
+/// The identity a cache key and marker record for the main parts: the part's
+/// own for one file, else sha256 over each part's identity and a newline.
+fn parts_identity_digest(parts: &[super::gguf_source::GgufFileIdentity]) -> String {
+    match parts {
+        [one] => one.source_identity.clone(),
+        parts => {
+            let mut hasher = Sha256::new();
+            for part in parts {
+                hasher.update(part.source_identity.as_bytes());
+                hasher.update(b"\n");
+            }
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }
     }
 }
 
@@ -8084,10 +8271,11 @@ pub(crate) async fn prepare_gguf_assets_in(
     cache_root: &Path,
 ) -> Result<crate::engine::checkpoint_source::GgufCheckpoint> {
     use crate::engine::checkpoint_source::{
-        GgufCheckpoint, native_import_plans, open_gguf_source, write_gguf_source_json,
+        GgufCheckpoint, native_import_plans, open_gguf_main, open_gguf_source,
+        write_gguf_source_json,
     };
 
-    let (input, companion) = native_gguf_preflight(input, family)?;
+    let (parts, companion) = native_gguf_preflight(input, family)?;
     let cache_root = initialize_native_gguf_cache_root(cache_root).map_err(|error| {
         Error::from_reason(format!(
             "Failed to create native GGUF cache root '{}': {error}",
@@ -8095,11 +8283,17 @@ pub(crate) async fn prepare_gguf_assets_in(
         ))
     })?;
     let cache_root = cache_root.as_path();
-    let main = open_gguf_source(&input)?;
+    let main = open_gguf_main(&parts)?;
     let companion = companion.as_deref().map(open_gguf_source).transpose()?;
-    let input_path = main.0.clone();
+    let input_path = main.path().to_path_buf();
+    let part_paths: Vec<PathBuf> = main.parts.iter().map(|(path, _, _)| path.clone()).collect();
+    let part_identities: Vec<String> = main
+        .parts
+        .iter()
+        .map(|(_, _, identity)| identity.source_identity.clone())
+        .collect();
     let companion_path = companion.as_ref().map(|(path, _, _)| path.clone());
-    let source_identity_digest = main.2.source_identity.clone();
+    let source_identity_digest = parts_identity_digest(&main.identities());
     let companion_digest = companion
         .as_ref()
         .map(|(_, _, identity)| identity.source_identity.clone())
@@ -8113,19 +8307,19 @@ pub(crate) async fn prepare_gguf_assets_in(
                 ))
             })
         };
-        Ok(
-            source_file_identity_digest(&input_path, &stat(&input_path)?) == source_identity_digest
-                && match &companion_path {
-                    Some(path) => {
-                        source_file_identity_digest(path, &stat(path)?) == companion_digest
-                    }
-                    None => true,
-                },
-        )
+        let mut same = true;
+        for (path, identity) in part_paths.iter().zip(&part_identities) {
+            same &= source_file_identity_digest(path, &stat(path)?) == *identity;
+        }
+        Ok(same
+            && match &companion_path {
+                Some(path) => source_file_identity_digest(path, &stat(path)?) == companion_digest,
+                None => true,
+            })
     };
 
     let prism_contract = if family == NativeGgufFamily::Qwen35 {
-        prism_hadamard_config(&main.1)?
+        prism_hadamard_config(&main.header)?
     } else {
         None
     };
@@ -8138,7 +8332,7 @@ pub(crate) async fn prepare_gguf_assets_in(
     let asset_digest = qwen35_native_asset_digest(parent)?;
     let (opts, main_plan, companion_plan) = native_import_plans(
         family,
-        (&main.0, &main.1),
+        (main.path(), &main.header),
         companion
             .as_ref()
             .map(|(path, header, _)| (path.as_path(), &**header)),
@@ -8152,23 +8346,30 @@ pub(crate) async fn prepare_gguf_assets_in(
         ));
     }
 
-    let metadata = fs::metadata(&input_path).map_err(|error| {
-        Error::from_reason(format!(
-            "Failed to stat GGUF path '{}': {error}",
-            input_path.display()
-        ))
-    })?;
-    if source_file_identity_digest(&input_path, &metadata) != source_identity_digest {
-        return Err(Error::from_reason(
-            "GGUF source changed during native preparation; retry the load",
-        ));
+    let mut size = 0u64;
+    let mut modified = 0u128;
+    for (path, identity) in part_paths.iter().zip(&part_identities) {
+        let metadata = fs::metadata(path).map_err(|error| {
+            Error::from_reason(format!(
+                "Failed to stat GGUF path '{}': {error}",
+                path.display()
+            ))
+        })?;
+        if source_file_identity_digest(path, &metadata) != *identity {
+            return Err(Error::from_reason(
+                "GGUF source changed during native preparation; retry the load",
+            ));
+        }
+        size = size.saturating_add(metadata.len());
+        modified = modified.max(
+            metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0),
+        );
     }
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
     let stem = input_path
         .file_stem()
         .and_then(|value| value.to_str())
@@ -8208,8 +8409,7 @@ pub(crate) async fn prepare_gguf_assets_in(
             .collect::<String>()
     };
     let cache_key = format!(
-        "{stem}-{}-{modified}-v{NATIVE_GGUF_ASSETS_FORMAT}-{source_identity_digest}-{preparation_digest}",
-        metadata.len(),
+        "{stem}-{size}-{modified}-v{NATIVE_GGUF_ASSETS_FORMAT}-{source_identity_digest}-{preparation_digest}",
     );
     let output_dir = cache_root.join(&cache_key);
     let entry_is_current = |dir: &Path| {
@@ -8306,12 +8506,12 @@ pub(crate) async fn prepare_gguf_assets_in(
                 .as_ref()
                 .zip(companion.as_ref())
                 .map(|(plan, (_, header, _))| (plan, &**header)),
-            &main.1,
+            &main.header,
             &staging_dir,
         )?;
         write_gguf_source_json(
             &staging_dir,
-            &main.2,
+            &main.identities(),
             companion.as_ref().map(|(_, _, identity)| identity),
         )?;
         if qwen35_native_asset_digest(parent)? != asset_digest {
@@ -8330,9 +8530,9 @@ pub(crate) async fn prepare_gguf_assets_in(
             staging_dir.join(".complete"),
             native_gguf_marker_text(
                 NATIVE_GGUF_ASSETS_FORMAT,
-                &input_path,
+                &part_paths,
                 &source_identity_digest,
-                metadata.len(),
+                size,
                 modified,
                 &asset_digest,
                 layout,
@@ -8450,7 +8650,7 @@ async fn run_native_gguf_sweep(cache_root: &Path, cache_key: &str) {
 #[allow(clippy::too_many_arguments)]
 fn native_gguf_marker_text(
     format: u32,
-    source: &Path,
+    parts: &[PathBuf],
     source_identity_digest: &str,
     size: u64,
     modified_ns: u128,
@@ -8460,7 +8660,17 @@ fn native_gguf_marker_text(
     companion_digest: &str,
     dtype: &str,
 ) -> String {
+    let source = parts[0].as_path();
     let source_hex = native_gguf_hex_encode(&native_gguf_os_bytes(source));
+    let part_lines: String = parts[1..]
+        .iter()
+        .map(|part| {
+            format!(
+                "part_hex={}\n",
+                native_gguf_hex_encode(&native_gguf_os_bytes(part))
+            )
+        })
+        .collect();
     let companion_hex = companion
         .map(|path| native_gguf_hex_encode(&native_gguf_os_bytes(path)))
         .unwrap_or_else(|| "none".to_string());
@@ -8477,7 +8687,7 @@ fn native_gguf_marker_text(
         None => "companion=none\n".to_string(),
     };
     format!(
-        "format={format}\nsource_hex={source_hex}\nsource_identity_sha256={source_identity_digest}\nsize={size}\nmodified_ns={modified_ns}\nassets_sha256={asset_digest}\nlayout={layout}\ncompanion_hex={companion_hex}\ncompanion_sha256={companion_digest}\ndtype={dtype}\n{source_line}{companion_line}"
+        "format={format}\nsource_hex={source_hex}\n{part_lines}source_identity_sha256={source_identity_digest}\nsize={size}\nmodified_ns={modified_ns}\nassets_sha256={asset_digest}\nlayout={layout}\ncompanion_hex={companion_hex}\ncompanion_sha256={companion_digest}\ndtype={dtype}\n{source_line}{companion_line}"
     )
 }
 
@@ -9473,6 +9683,7 @@ mod tests {
                 ("qwen35.ssm.group_count", GgufMetaValue::Uint32(1)),
                 ("qwen35.ssm.conv_kernel", GgufMetaValue::Uint32(4)),
                 ("qwen35.full_attention_interval", GgufMetaValue::Uint32(2)),
+                ("qwen35.nextn_predict_layers", GgufMetaValue::Uint32(1)),
             ],
             &[
                 ("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0]),
@@ -10449,6 +10660,7 @@ mod tests {
                         GgufMetaValue::String("qwen35".to_string()),
                     ),
                     ("qwen35.block_count", GgufMetaValue::Uint32(1)),
+                    ("qwen35.full_attention_interval", GgufMetaValue::Uint32(4)),
                 ],
                 &[("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0])],
             ),
@@ -10703,6 +10915,7 @@ mod tests {
                 GgufMetaValue::String("qwen35".to_string()),
             ),
             ("qwen35.block_count", GgufMetaValue::Uint32(1)),
+            ("qwen35.full_attention_interval", GgufMetaValue::Uint32(4)),
         ];
         let left_input = root.join("model!.gguf");
         let right_input = root.join("model?.gguf");
@@ -10781,6 +10994,7 @@ mod tests {
                 GgufMetaValue::String("qwen35".to_string()),
             ),
             ("qwen35.block_count", GgufMetaValue::Uint32(1)),
+            ("qwen35.full_attention_interval", GgufMetaValue::Uint32(4)),
         ];
         let input = root.join("model.gguf");
         let replacement = root.join("replacement.gguf");
@@ -15012,15 +15226,15 @@ mod tests {
     }
 
     #[test]
-    fn native_assets_format_is_v8_and_rejects_weight_entries() {
-        assert_eq!(NATIVE_GGUF_ASSETS_FORMAT, 8);
+    fn native_assets_format_is_v9_and_rejects_weight_entries() {
+        assert_eq!(NATIVE_GGUF_ASSETS_FORMAT, 9);
         let root = std::env::temp_dir().join(format!(
             "mlx-node-native-cache-format-{}",
             std::process::id()
         ));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("config.json"), "{}").unwrap();
-        for format in [5, 6, 7] {
+        for format in [5, 6, 7, 8] {
             fs::write(
                 root.join(".complete"),
                 format!(
@@ -15042,7 +15256,7 @@ mod tests {
         }
         fs::write(
             root.join(".complete"),
-            "format=8\nsource=x\nsource_identity_sha256=abc\nsize=1\nmodified_ns=1\nassets_sha256=def\nlayout=tiled\ncompanion_sha256=none\ndtype=bf16\n",
+            "format=9\nsource=x\nsource_identity_sha256=abc\nsize=1\nmodified_ns=1\nassets_sha256=def\nlayout=tiled\ncompanion_sha256=none\ndtype=bf16\n",
         )
         .unwrap();
         assert!(native_gguf_entry_is_current(
@@ -17256,6 +17470,7 @@ mod tests {
                             GgufMetaValue::String("qwen35".to_string()),
                         ),
                         ("qwen35.block_count", GgufMetaValue::Uint32(1)),
+                        ("qwen35.full_attention_interval", GgufMetaValue::Uint32(4)),
                     ],
                     &[("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0])],
                 ),
@@ -17366,7 +17581,7 @@ mod tests {
     /// else under the root is foreign and must survive the sweep.
     #[cfg(unix)]
     fn native_sweep_entry_name(stem: &str) -> String {
-        format!("{stem}-1-1-v8-{}-{}", "a".repeat(64), "b".repeat(64))
+        format!("{stem}-1-1-v9-{}-{}", "a".repeat(64), "b".repeat(64))
     }
 
     // The std Mutex guard must stay held across the awaits below: it
@@ -17413,7 +17628,7 @@ mod tests {
         .unwrap();
 
         // Legacy v7 weight entries are stale once aged.
-        let outdated = cache_root.join(native_sweep_entry_name("outdated").replace("-v8-", "-v7-"));
+        let outdated = cache_root.join(native_sweep_entry_name("outdated").replace("-v9-", "-v7-"));
         fs::create_dir_all(&outdated).unwrap();
         let outdated_marker = outdated.join(".complete");
         fs::write(&outdated_marker, native_sweep_marker(&input, 7, None, true)).unwrap();
@@ -18556,5 +18771,208 @@ mod tests {
             n += a.len();
         }
         println!("joyai tokenizer: {specials} special ids, 50 strings, {n} ids bitwise == HF 1017");
+    }
+
+    #[test]
+    fn check_gguf_headers_reads_header_only_copies() {
+        use crate::utils::gguf_test_fixtures::{GgufParts, split_import_fixture, write_split_gguf};
+        let work = std::env::temp_dir().join(format!("gguf-headers-{}", uuid::Uuid::new_v4()));
+        let full = write_import_fixture("qwen35-dense-untied", &work.join("full")).main;
+        let mut case = 0;
+        let mut check = |files: &[PathBuf]| -> Result<()> {
+            case += 1;
+            let dir = work.join(format!("target-{case}"));
+            fs::create_dir_all(&dir).unwrap();
+            for file in files {
+                let header = parse_gguf(file).unwrap();
+                let bytes = fs::read(file).unwrap();
+                fs::write(
+                    dir.join(file.file_name().unwrap()),
+                    &bytes[..header.data_offset as usize],
+                )
+                .unwrap();
+            }
+            check_gguf_headers(dir.to_string_lossy().into_owned())
+        };
+        let err = |r: Result<()>| match r {
+            Ok(()) => panic!("expected a refusal"),
+            Err(e) => e.reason,
+        };
+
+        check(std::slice::from_ref(&full)).unwrap();
+        let parts = split_import_fixture(&full, &work.join("split"), "m", 3);
+        check(&parts).unwrap();
+        let text = err(check(&[parts[0].clone(), parts[2].clone()]));
+        assert!(text.contains("not the parts of one split GGUF"), "{text}");
+        let text = err(check(&parts[..1]));
+        assert!(text.contains("part 1 of a split GGUF of 3 parts"), "{text}");
+
+        let mut bias = GgufParts::read(&full);
+        bias.add_tensor("blk.1.attn_q.bias", &[512], GgufTensorType::F32);
+        let biased = work.join("bias.gguf");
+        bias.write(&biased);
+        let text = err(check(std::slice::from_ref(&biased)));
+        assert!(text.contains("attn_q.bias (unused) in 1 layer"), "{text}");
+
+        let text = err(check(&[full.clone(), biased.clone()]));
+        assert!(text.contains("holds more than one GGUF"), "{text}");
+
+        let llama = work.join("llama.gguf");
+        let tensor = vec![0u8; 32];
+        let second = vec![0u8; 64];
+        let llama_tensors: [(&str, &[u64], GgufTensorType, &[u8]); 2] = [
+            ("a.weight", &[8], GgufTensorType::F32, &tensor),
+            ("b.weight", &[16], GgufTensorType::F32, &second),
+        ];
+        fs::write(
+            &llama,
+            build_minimal_gguf(
+                &[(
+                    "general.architecture",
+                    GgufMetaValue::String("llama".into()),
+                )],
+                &llama_tensors,
+            ),
+        )
+        .unwrap();
+        check(std::slice::from_ref(&llama)).unwrap();
+
+        // Alignment 64 over offsets the writer aligned to 32: b.weight sits at 32.
+        let misaligned = work.join("misaligned.gguf");
+        fs::write(
+            &misaligned,
+            build_minimal_gguf(
+                &[
+                    (
+                        "general.architecture",
+                        GgufMetaValue::String("qwen35".into()),
+                    ),
+                    ("general.alignment", GgufMetaValue::Uint32(64)),
+                ],
+                &llama_tensors,
+            ),
+        )
+        .unwrap();
+        let dir = work.join("misaligned");
+        fs::create_dir_all(&dir).unwrap();
+        fs::rename(&misaligned, dir.join("misaligned.gguf")).unwrap();
+        let text = err(check_gguf_headers(dir.to_string_lossy().into_owned()));
+        assert!(
+            text.contains("tensor data is misaligned: b.weight"),
+            "{text}"
+        );
+
+        let gemma = write_split_gguf(
+            &work.join("gemma"),
+            "g",
+            &[(
+                "general.architecture",
+                GgufMetaValue::String("gemma4".into()),
+            )],
+            &[("a.weight", &[4]), ("b.weight", &[4])],
+            true,
+        );
+        let text = err(check(&gemma));
+        assert!(text.contains("part 1 of a split GGUF of 2 parts"), "{text}");
+        fs::remove_dir_all(&work).ok();
+    }
+
+    #[test]
+    fn parse_gguf_refuses_what_splash_refuses() {
+        let tensor = vec![0u8; 32];
+        let parse = |metadata: &[(&str, GgufMetaValue)], dims: &[u64], ty: GgufTensorType| {
+            let bytes = build_minimal_gguf(metadata, &[("t.weight", dims, ty, &tensor)]);
+            match parse_gguf_reader(std::io::Cursor::new(bytes)) {
+                Ok(_) => String::new(),
+                Err(e) => e.reason,
+            }
+        };
+        assert_eq!(parse(&[], &[8], GgufTensorType::F32), "");
+        assert!(parse(&[], &[0, 8], GgufTensorType::F32).contains("zero tensor dimension"));
+        assert!(parse(&[], &[1, 1, 1, 1, 8], GgufTensorType::F32).contains("invalid tensor rank"));
+        assert!(parse(&[], &[16], GgufTensorType::Q8_0).contains("not block aligned"));
+        for alignment in [0, 48, 131072] {
+            let text = parse(
+                &[("general.alignment", GgufMetaValue::Uint32(alignment))],
+                &[8],
+                GgufTensorType::F32,
+            );
+            assert!(
+                text.contains("invalid GGUF alignment"),
+                "{alignment}: {text}"
+            );
+        }
+        let twice = parse(
+            &[
+                ("general.name", GgufMetaValue::String("a".into())),
+                ("general.name", GgufMetaValue::String("b".into())),
+            ],
+            &[8],
+            GgufTensorType::F32,
+        );
+        assert!(
+            twice.contains("duplicate GGUF metadata key: general.name"),
+            "{twice}"
+        );
+        let doubled = build_minimal_gguf(
+            &[],
+            &[
+                ("t.weight", &[8], GgufTensorType::F32, &tensor),
+                ("t.weight", &[8], GgufTensorType::F32, &tensor),
+            ],
+        );
+        let text = parse_gguf_reader(std::io::Cursor::new(doubled))
+            .unwrap_err()
+            .reason;
+        assert!(text.contains("duplicate GGUF tensor: t.weight"), "{text}");
+
+        let mut many = build_minimal_gguf(&[], &[]);
+        many[8..16].copy_from_slice(&16385u64.to_le_bytes());
+        let text = parse_gguf_reader(std::io::Cursor::new(many))
+            .unwrap_err()
+            .reason;
+        assert!(text.contains("implausible GGUF header counts"), "{text}");
+
+        // A part of no tensors that ends at its header has its data there.
+        let bare = build_minimal_gguf(&[], &[])[..24].to_vec();
+        let end = bare.len() as u64;
+        let header = parse_gguf_reader(std::io::Cursor::new(bare)).unwrap();
+        assert_eq!(header.data_offset, end);
+    }
+
+    /// The sweep checks every part a split entry's marker lists: a healthy
+    /// aged split entry stays, and one whose later part is gone is stale.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn sweep_reads_every_part_of_a_split_entry() {
+        use crate::utils::gguf_test_fixtures::split_import_fixture;
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let work = std::env::temp_dir().join(format!("gguf-split-sweep-{}", uuid::Uuid::new_v4()));
+        let one = write_import_fixture("qwen35-dense-untied", &work.join("one"));
+        let parts = split_import_fixture(&one.main, &work.join("split"), "m", 3);
+        let ckpt = prepare_gguf_assets_in(&parts[0], NativeGgufFamily::Qwen35, &work.join("cache"))
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.reason));
+        let marker = fs::read_to_string(ckpt.asset_dir.join(".complete")).unwrap();
+        assert_eq!(
+            marker
+                .lines()
+                .filter(|l| l.starts_with("part_hex="))
+                .count(),
+            2,
+            "{marker}"
+        );
+        assert_eq!(
+            native_gguf_entry_stale_reason(&ckpt.asset_dir, &mut NativeGgufSweepDigests::default()),
+            None,
+            "a healthy split entry"
+        );
+        fs::remove_file(&parts[2]).unwrap();
+        assert_eq!(
+            native_gguf_entry_stale_reason(&ckpt.asset_dir, &mut NativeGgufSweepDigests::default()),
+            Some("source GGUF is gone"),
+        );
+        native_gguf_unlease_in_use(&ckpt.asset_dir);
+        fs::remove_dir_all(&work).ok();
     }
 }

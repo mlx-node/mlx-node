@@ -1480,8 +1480,17 @@ fn materialize(map: &mut HashMap<String, MxArray>, views: &HashSet<String>) -> R
 /// identity taken under the prepare lock, and its import plan.
 pub(crate) type PreloadFile = (PathBuf, Arc<GgufFile>, GgufFileIdentity, ImportPlan);
 
+/// The main GGUF of a preload: every part (path, its own header, identity),
+/// the merged header the plan was made from, and that plan.
+#[derive(Clone)]
+pub(crate) struct PreloadMain {
+    pub parts: Vec<(PathBuf, Arc<GgufFile>, GgufFileIdentity)>,
+    pub header: Arc<GgufFile>,
+    pub plan: ImportPlan,
+}
+
 pub(crate) struct PreloadInput {
-    pub main: PreloadFile,
+    pub main: PreloadMain,
     pub companion: Option<PreloadFile>,
     /// Read the companion (gemma: media on; muse: draft present).
     pub load_companion: bool,
@@ -1494,7 +1503,7 @@ pub(crate) struct PreloadInput {
 
 impl PreloadInput {
     pub(crate) fn new(
-        main: PreloadFile,
+        main: PreloadMain,
         companion: Option<PreloadFile>,
         load_companion: bool,
         opts: ImportOptions,
@@ -1513,7 +1522,12 @@ impl PreloadInput {
     /// checkpoint even when this load skips it.
     pub(crate) fn identity(&self) -> GgufIdentity {
         GgufIdentity::new(
-            &self.main.2,
+            &self
+                .main
+                .parts
+                .iter()
+                .map(|(_, _, identity)| identity.clone())
+                .collect::<Vec<_>>(),
             self.companion.as_ref().map(|(_, _, identity, _)| identity),
         )
     }
@@ -1580,12 +1594,18 @@ impl GgufPreload {
     ) -> Result<Self> {
         let started = Instant::now();
         let mode = PageCacheMode::from_env()?;
-        let (main_path, main_header, main_identity, main_plan) = &input.main;
+        let (main_header, main_plan) = (&input.main.header, &input.main.plan);
         let companion = input.companion.as_ref().filter(|_| input.load_companion);
         let set = GgufSourceSet::open(
-            (main_path, main_header.clone(), main_identity),
+            &input
+                .main
+                .parts
+                .iter()
+                .map(|(path, header, identity)| (path.as_path(), header.clone(), identity))
+                .collect::<Vec<_>>(),
             companion.map(|(path, header, identity, _)| (path.as_path(), header.clone(), identity)),
         )?;
+        let mode = split_page_cache_mode(mode, &set.main, physical_memory());
 
         let main_probe = ImportProbe {
             #[cfg(test)]
@@ -1593,6 +1613,9 @@ impl GgufPreload {
             ..ImportProbe::default()
         };
         let streaming = consume.is_some();
+        if streaming && set.main.len() != 1 {
+            return Err(Error::from_reason("streamed CLEF load reads one GGUF file"));
+        }
         let mut groups = std::collections::BTreeMap::<usize, Vec<usize>>::new();
         if streaming {
             for (i, tensor) in main_header.tensors.iter().enumerate() {
@@ -1632,22 +1655,36 @@ impl GgufPreload {
             slot_bytes: if streaming { 63 << 20 } else { SLOT_BYTES },
             ..ReadConfig::default()
         };
-        let raw = read_gguf_tensors_consuming(
-            &set.main.file,
-            &set.main,
-            main_plan,
-            backend,
-            mode,
-            &read_config,
-            &main_probe,
-            streaming.then_some(&mut consumer),
-        )?;
-        let mut stats = raw.stats.clone();
+        let mut raw_map = HashMap::new();
+        let mut raw_ple_shards = None;
+        let mut stats = LoadStats::default();
+        let mut consumer = streaming.then_some(&mut consumer);
+        for (index, part) in set.main.iter().enumerate() {
+            let raw = read_gguf_tensors_consuming(
+                &part.file,
+                part,
+                main_plan,
+                backend,
+                mode,
+                &read_config,
+                &main_probe,
+                consumer.as_deref_mut(),
+            )?;
+            if index == 0 {
+                stats = raw.stats.clone();
+            } else {
+                add_stats(&mut stats, &raw.stats);
+            }
+            raw_map.extend(raw.map);
+            if raw.ple_shards.is_some() {
+                raw_ple_shards = raw.ple_shards;
+            }
+        }
         let ImportedWeights {
             weights: mut main,
             clef_head,
             views,
-        } = transform_imported(raw.map, main_header, main_plan, &input.opts)?;
+        } = transform_imported(raw_map, main_header, main_plan, &input.opts)?;
         materialize(&mut main, &views)?;
 
         let clef_head = match clef_head {
@@ -1663,7 +1700,7 @@ impl GgufPreload {
             None => None,
         };
 
-        let ple_shards = match raw.ple_shards {
+        let ple_shards = match raw_ple_shards {
             Some((name, shards, rows_per_shard)) => {
                 let key = gguf_name_to_hf_for_metadata(&name, &main_header.metadata).ok_or_else(
                     || {
@@ -1712,6 +1749,27 @@ impl GgufPreload {
     }
 }
 
+/// Splash reads a split GGUF as one file: the page-cache decision is taken
+/// once from every part's bytes, not per part.
+fn split_page_cache_mode(
+    mode: PageCacheMode,
+    parts: &[GgufFileHandle],
+    ram: Option<u64>,
+) -> PageCacheMode {
+    if parts.len() < 2 {
+        return mode;
+    }
+    let bytes = parts
+        .iter()
+        .map(|h| h.len.saturating_sub(h.header.data_offset))
+        .sum();
+    if mode.nocache(bytes, ram) {
+        PageCacheMode::Off
+    } else {
+        PageCacheMode::On
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1733,6 +1791,55 @@ mod tests {
     use std::collections::BTreeMap;
 
     const MIB: usize = 1 << 20;
+
+    /// A split GGUF takes one page-cache decision from the bytes of all its
+    /// parts, the decision of the one file it splits.
+    #[test]
+    fn split_reads_share_one_page_cache_decision() {
+        let dir = std::env::temp_dir().join(format!("gguf-split-nocache-{}", uuid::Uuid::new_v4()));
+        let fixture = write_import_fixture("qwen35-dense-untied", &dir.join("one"));
+        let parts = crate::utils::gguf_test_fixtures::split_import_fixture(
+            &fixture.main,
+            &dir.join("split"),
+            "m",
+            3,
+        );
+        let opened: Vec<(PathBuf, Arc<GgufFile>, GgufFileIdentity)> = parts
+            .iter()
+            .map(|path| {
+                let header = Arc::new(parse_gguf(path).unwrap());
+                let id = file_identity(path, &header, &fs::metadata(path).unwrap()).unwrap();
+                (id.path.clone(), header, id)
+            })
+            .collect();
+        let set = GgufSourceSet::open(
+            &opened
+                .iter()
+                .map(|(p, h, id)| (p.as_path(), h.clone(), id))
+                .collect::<Vec<_>>(),
+            None,
+        )
+        .unwrap();
+        let total: u64 = set.main.iter().map(|h| h.len - h.header.data_offset).sum();
+        let largest = set
+            .main
+            .iter()
+            .map(|h| h.len - h.header.data_offset)
+            .max()
+            .unwrap();
+        // RAM where the whole GGUF is over half but every part is under it.
+        let ram = total * 2 - 2;
+        assert!(largest <= ram / 2);
+        let ram = Some(ram);
+        let mode = split_page_cache_mode(PageCacheMode::Auto, &set.main, ram);
+        assert!(mode.nocache(largest, ram), "every part reads uncached");
+        let mode = split_page_cache_mode(PageCacheMode::Auto, &set.main, Some(total * 4));
+        assert!(
+            !mode.nocache(largest, Some(total * 4)),
+            "every part reads cached"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn cpu_pool_second_spawn_panic_closes_first_worker() {
@@ -1867,9 +1974,10 @@ mod tests {
         fs::write(&path, bytes).unwrap();
         let header = Arc::new(parse_gguf(&path).unwrap());
         let identity = file_identity(&path, &header, &fs::metadata(&path).unwrap()).unwrap();
-        let handle = GgufSourceSet::open((&path, header, &identity), None)
+        let handle = GgufSourceSet::open(&[(&path, header, &identity)], None)
             .unwrap()
-            .main;
+            .main
+            .remove(0);
         Fixture { dir, path, handle }
     }
 
@@ -1889,6 +1997,7 @@ mod tests {
             strict_asset_copies: false,
             muse_secondary: false,
             ple_shard: None,
+            stop_token_ids: Vec::new(),
         }
     }
 
@@ -2795,7 +2904,7 @@ mod tests {
             let input = fixture_input(&fx, false);
             let preload = GgufPreload::load(&input).unwrap();
             let mut compared = Vec::new();
-            for (key, dtype) in imported_dtypes(&input.main.1, &input.main.3, &input.opts) {
+            for (key, dtype) in imported_dtypes(&input.main.header, &input.main.plan, &input.opts) {
                 if let Some(array) = preload.main.get(&key) {
                     assert_eq!(array.dtype().unwrap(), dtype, "{name}: {key}");
                     compared.push(key);
@@ -2824,10 +2933,11 @@ mod tests {
         let work = import_work_dir("cpu-ops");
         let fx = write_import_fixture("qwen35-dense-untied", &work);
         let input = fixture_input(&fx, false);
-        let (path, header, identity, plan) = &input.main;
-        let set = GgufSourceSet::open((path, header.clone(), identity), None).unwrap();
+        let (path, header, identity) = &input.main.parts[0];
+        let plan = &input.main.plan;
+        let set = GgufSourceSet::open(&[(path, header.clone(), identity)], None).unwrap();
         let read = || {
-            read_gguf_tensors(&set.main, plan, RepackBackend::Auto, PageCacheMode::On)
+            read_gguf_tensors(&set.main[0], plan, RepackBackend::Auto, PageCacheMode::On)
                 .unwrap()
                 .map
         };
@@ -2882,12 +2992,14 @@ mod tests {
         assert!(!on.companion.is_empty(), "companion missing with media on");
 
         let input = fixture_input(&fx, false);
-        let (path, header, identity, plan) = &input.main;
-        let set = GgufSourceSet::open((path, header.clone(), identity), None).unwrap();
-        let main_bytes = read_gguf_tensors(&set.main, plan, RepackBackend::Auto, PageCacheMode::On)
-            .unwrap()
-            .stats
-            .bytes;
+        let (path, header, identity) = &input.main.parts[0];
+        let plan = &input.main.plan;
+        let set = GgufSourceSet::open(&[(path, header.clone(), identity)], None).unwrap();
+        let main_bytes =
+            read_gguf_tensors(&set.main[0], plan, RepackBackend::Auto, PageCacheMode::On)
+                .unwrap()
+                .stats
+                .bytes;
         assert_eq!(off.stats.bytes, main_bytes, "bytes read with media off");
         assert!(
             on.stats.bytes > main_bytes,
@@ -3047,8 +3159,13 @@ pub(crate) mod gate {
             }
             .to_string(),
         };
+        let (path, header, identity, plan) = file(main, &main_opts, OutputRole::Primary)?;
         Ok(PreloadInput::new(
-            file(main, &main_opts, OutputRole::Primary)?,
+            PreloadMain {
+                parts: vec![(path, header.clone(), identity)],
+                header,
+                plan,
+            },
             companion
                 .map(|c| file(c, &companion_opts, companion_role))
                 .transpose()?,

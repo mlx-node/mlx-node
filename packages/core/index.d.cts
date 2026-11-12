@@ -3223,6 +3223,16 @@ export interface ChatStreamProgress {
   decodeElapsedMs?: number;
 }
 
+/**
+ * Splash `model-check` over header-only copies (`inspectSourceConfiguration`):
+ * the target GGUF of `dir` (Splash `findTargetGgufs`), every part's header
+ * rules and the split rules, then for qwen35 / qwen35moe the import plan every
+ * load runs (unread tensors, stop ids, every header guard). A family that
+ * reads one GGUF file refuses a split; an architecture no mlx-node loader
+ * reads is not judged.
+ */
+export declare function checkGgufHeaders(dir: string): void;
+
 /** Result from classify_and_rotate: orientation info + corrected image bytes. */
 export interface ClassifyRotateResult {
   /** Detected rotation angle (0, 90, 180, or 270 degrees) */

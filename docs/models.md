@@ -12,17 +12,17 @@ output and CoreAudio playback through one native inference path. See
 
 All language wrappers share a uniform `ChatSession<M>` surface (`send` / `sendStream` / `sendToolResult` / `reset`) driven by the native `chatSessionStart` / `chatSessionContinue` / `chatSessionContinueTool` NAPI entry points. The legacy `model.chat()` / `model.chatStream()` methods are removed from every generative model.
 
-| Model                      | `generate()` | Session API |  Training  | Notes                                                                            |
-| -------------------------- | :----------: | :---------: | :--------: | -------------------------------------------------------------------------------- |
-| **Qwen3**                  |     yes      |     yes     | GRPO + SFT | Speculative decoding; paged attention                                            |
-| **Qwen3.5 Dense**          |     yes      |     yes     | GRPO + SFT | Hybrid GDN/attention; native MTP; Qwen3.8 DFlash2; VLM variant                   |
-| **Qwen3.5 MoE**            |     yes      |     yes     | GRPO + SFT | Compiled C++ forward with expert routing; VLM variant                            |
-| **Qwen3.8-Flash-Next**     |      —       |     yes     |     —      | Memory-planned SSD loading and window; native MTP, images, paged QSA, scheduling |
-| **Gemma4**                 |     yes      |     yes     |     —      | Hybrid sliding/global attention + MoE/PLE; DSpark + assistant-MTP spec. decoding |
-| **Muse-Glimmer**           |     yes      |     yes     |     —      | Text decoder; Q4_K import; DFlash; hybrid paged AR                               |
-| **LFM2.5**                 |     yes      |     yes     |     —      | Hybrid conv + attention                                                          |
-| **Nemotron 3.5 Lightning** |     yes      |     yes     |     —      | Hybrid Mamba-2 + MoE + attention; native MTP; inference-only                     |
-| **DeepSeek V4.1 Flash**    |      —       |     yes     |     —      | Split GGUF; routed experts stream from the SSD; text only; 16,384-token context  |
+| Model                      | `generate()` | Session API |  Training  | Notes                                                                              |
+| -------------------------- | :----------: | :---------: | :--------: | ---------------------------------------------------------------------------------- |
+| **Qwen3**                  |     yes      |     yes     | GRPO + SFT | Speculative decoding; paged attention                                              |
+| **Qwen3.5 Dense**          |     yes      |     yes     | GRPO + SFT | Hybrid GDN/attention; native MTP; Qwen3.8 DFlash2; VLM variant; split GGUF: part 1 |
+| **Qwen3.5 MoE**            |     yes      |     yes     | GRPO + SFT | Compiled C++ forward with expert routing; VLM variant; split GGUF: part 1          |
+| **Qwen3.8-Flash-Next**     |      —       |     yes     |     —      | Memory-planned SSD loading and window; native MTP, images, paged QSA, scheduling   |
+| **Gemma4**                 |     yes      |     yes     |     —      | Hybrid sliding/global attention + MoE/PLE; DSpark + assistant-MTP spec. decoding   |
+| **Muse-Glimmer**           |     yes      |     yes     |     —      | Text decoder; Q4_K import; DFlash; hybrid paged AR                                 |
+| **LFM2.5**                 |     yes      |     yes     |     —      | Hybrid conv + attention                                                            |
+| **Nemotron 3.5 Lightning** |     yes      |     yes     |     —      | Hybrid Mamba-2 + MoE + attention; native MTP; inference-only                       |
+| **DeepSeek V4.1 Flash**    |      —       |     yes     |     —      | Split GGUF; routed experts stream from the SSD; text only; 16,384-token context    |
 
 `Qwen3Model | Qwen35Model | Qwen35MoeModel` is the public `TrainableModel` union in `@mlx-node/lm` — Qwen3.8-Flash-Next, Gemma4, Muse-Glimmer, LFM2.5, Nemotron 3.5 Lightning, and DeepSeek V4.1 Flash are inference-only.
 

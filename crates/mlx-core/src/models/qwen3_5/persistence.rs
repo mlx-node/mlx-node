@@ -2774,7 +2774,9 @@ async fn load_with_thread_impl(
                 let mut preload = match preload_input.as_ref() {
                     Some(input)
                         if clef
-                            && GgufPreload::clef_layers_sanitize_independently(&input.main.1) =>
+                            && GgufPreload::clef_layers_sanitize_independently(
+                                &input.main.header,
+                            ) =>
                     {
                         if prism_config.is_some() {
                             return Err(Error::from_reason(

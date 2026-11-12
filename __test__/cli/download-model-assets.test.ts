@@ -4,6 +4,8 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
+import { tinyGgufBytes } from './tiny-gguf.js';
+
 /**
  * The `--assets-repo` top-up must survive the completion short-circuits: a
  * directory whose weight files already look complete (a retry after a sidecar
@@ -32,7 +34,8 @@ const hub = vi.hoisted(() => ({
 }));
 
 vi.mock('@huggingface/hub', () => ({
-  downloadFile: async () => new Blob(['{}']),
+  downloadFile: async (params: { path: string }) =>
+    new Blob([params.path.endsWith('.gguf') ? tinyGgufBytes({ arch: 'llama' }) : '{}']),
   // No resolvable upstream revision → the CLI takes its legacy completeness
   // path, which is exactly where the repair must happen.
   // The CLI calls it as `modelInfo({ name, additionalFields, accessToken })`.

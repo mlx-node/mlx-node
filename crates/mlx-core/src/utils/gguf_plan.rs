@@ -93,6 +93,9 @@ pub(crate) struct ImportPlan {
     /// Dense GGUF tensor the staged read allocates as row shards of this many
     /// rows instead of one buffer (Gemma4 PLE above the shard budget).
     pub ple_shard: Option<(String, usize)>,
+    /// Stop ids from the header that join `generation_config.json`
+    /// `eos_token_id`: Splash `flint_stop_tokens` and the Qwen `.stopTokens`.
+    pub stop_token_ids: Vec<u32>,
 }
 
 /// Record header facts that tensor-name mapping reads from the metadata map.
@@ -412,6 +415,13 @@ pub(crate) fn plan_gguf_import(
         }
     }
 
+    let stop_token_ids = if is_primary && is_qwen35_hybrid_gguf(gguf) {
+        refuse_unread_qwen35_tensors(gguf, qwen35_inline_mtp_index)?;
+        plan_stop_token_ids(gguf)?
+    } else {
+        Vec::new()
+    };
+
     Ok(ImportPlan {
         role,
         import_k_quants,
@@ -427,7 +437,260 @@ pub(crate) fn plan_gguf_import(
         strict_asset_copies: opts.config_source_dir.is_some(),
         muse_secondary: !is_primary && is_muse_companion,
         ple_shard: None,
+        stop_token_ids,
     })
+}
+
+/// Splash `Problems`: each fault named once, counted over the layers it is in.
+#[derive(Default)]
+struct UnreadTensors {
+    faults: Vec<(String, &'static str, u32)>,
+}
+
+impl UnreadTensors {
+    fn add(&mut self, name: &str, fault: &'static str) {
+        let layered = name
+            .strip_prefix("blk.")
+            .and_then(|rest| rest.find('.').map(|dot| &rest[dot + 1..]));
+        let tensor = layered.unwrap_or(name);
+        let at = match self
+            .faults
+            .iter()
+            .position(|(t, f, _)| t == tensor && *f == fault)
+        {
+            Some(at) => at,
+            None => {
+                self.faults.push((tensor.to_string(), fault, 0));
+                self.faults.len() - 1
+            }
+        };
+        self.faults[at].2 += u32::from(layered.is_some());
+    }
+
+    fn text(&self) -> String {
+        self.faults
+            .iter()
+            .map(|(tensor, fault, layers)| match layers {
+                0 => format!("{tensor} ({fault})"),
+                1 => format!("{tensor} ({fault}) in 1 layer"),
+                n => format!("{tensor} ({fault}) in {n} layers"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Block `N` and the rest of a `blk.N.REST` name (Splash `Problems::inBlocks`).
+fn block_of(name: &str) -> Option<(u64, &str)> {
+    let rest = name.strip_prefix("blk.")?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let tail = rest[digits..].strip_prefix('.')?;
+    if digits == 0 {
+        return None;
+    }
+    Some((rest[..digits].parse().ok()?, tail))
+}
+
+const QWEN35_LAYER_TENSORS: [&str; 2] = ["attn_norm.weight", "post_attention_norm.weight"];
+const QWEN35_FULL_ATTENTION_TENSORS: [&str; 6] = [
+    "attn_q.weight",
+    "attn_k.weight",
+    "attn_v.weight",
+    "attn_q_norm.weight",
+    "attn_k_norm.weight",
+    "attn_output.weight",
+];
+const QWEN35_GDN_TENSORS: [&str; 9] = [
+    "attn_qkv.weight",
+    "attn_gate.weight",
+    "ssm_beta.weight",
+    "ssm_alpha.weight",
+    "ssm_conv1d.weight",
+    "ssm_a",
+    "ssm_dt.bias",
+    "ssm_norm.weight",
+    "ssm_out.weight",
+];
+const QWEN35_DENSE_FFN_TENSORS: [&str; 3] = ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"];
+const QWEN35_MOE_FFN_TENSORS: [&str; 8] = [
+    "ffn_gate_inp.weight",
+    "ffn_gate_exps.weight",
+    "ffn_up_exps.weight",
+    "ffn_down_exps.weight",
+    "ffn_gate_shexp.weight",
+    "ffn_up_shexp.weight",
+    "ffn_down_shexp.weight",
+    "ffn_gate_inp_shexp.weight",
+];
+const QWEN35_GLOBAL_TENSORS: [&str; 3] =
+    ["token_embd.weight", "output.weight", "output_norm.weight"];
+
+/// Splash `familyImages<HybridGguf>` then `Problems::addUnread`: every header
+/// tensor is one the qwen35 / qwen35moe loader reads, or one of the
+/// `nextn_predict_layers` blocks after the decoder layers; any other tensor
+/// (an attention or router bias among them) would change what the model
+/// computes, so the GGUF is refused before a weight byte is read.
+pub(crate) fn refuse_unread_qwen35_tensors(gguf: &GgufFile, inline_mtp: Option<u64>) -> Result<()> {
+    let arch = gguf
+        .metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        .unwrap_or_default();
+    let key = |name: &str| format!("{arch}.{name}");
+    let required = |name: &str| {
+        gguf.metadata
+            .get(&key(name))
+            .and_then(GgufMetaValue::as_u64)
+            .ok_or_else(|| Error::from_reason(format!("GGUF metadata '{}' is missing", key(name))))
+    };
+    let block_count = required("block_count")?;
+    let interval = required("full_attention_interval")?;
+    let nextn = gguf
+        .metadata
+        .get(&key("nextn_predict_layers"))
+        .and_then(GgufMetaValue::as_u64)
+        .unwrap_or(0);
+    let consistent = match (nextn, inline_mtp) {
+        (0, None) => true,
+        (1, Some(index)) => index.checked_add(1) == Some(block_count),
+        _ => false,
+    };
+    if !consistent {
+        return Err(Error::from_reason(format!(
+            "GGUF '{}' is {nextn} but {}; this loader reads at most one inline MTP block, the \
+             last of '{}'",
+            key("nextn_predict_layers"),
+            match inline_mtp {
+                Some(index) => format!("the header holds an inline MTP block at blk.{index}"),
+                None => "the header holds no inline MTP block".to_string(),
+            },
+            key("block_count"),
+        )));
+    }
+    let layers = block_count.checked_sub(nextn).ok_or_else(|| {
+        Error::from_reason(format!(
+            "GGUF '{}' exceeds '{}'",
+            key("nextn_predict_layers"),
+            key("block_count")
+        ))
+    })?;
+    let ffn: &[&str] = if arch == "qwen35moe" {
+        &QWEN35_MOE_FFN_TENSORS
+    } else {
+        &QWEN35_DENSE_FFN_TENSORS
+    };
+    let mut unread = UnreadTensors::default();
+    for tensor in &gguf.tensors {
+        let read = match block_of(&tensor.name) {
+            Some((block, _)) if block >= layers && block < block_count => true,
+            Some((block, rest)) if block < layers => {
+                let full = interval != 0 && (block + 1) % interval == 0;
+                let mixer: &[&str] = if full {
+                    &QWEN35_FULL_ATTENTION_TENSORS
+                } else {
+                    &QWEN35_GDN_TENSORS
+                };
+                QWEN35_LAYER_TENSORS
+                    .iter()
+                    .chain(mixer)
+                    .chain(ffn)
+                    .any(|name| *name == rest)
+            }
+            Some(_) => false,
+            None => QWEN35_GLOBAL_TENSORS.contains(&tensor.name.as_str()),
+        };
+        if !read {
+            unread.add(&tensor.name, "unused");
+        }
+    }
+    if unread.faults.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::from_reason(format!(
+            "GGUF tensors this build cannot load: {}",
+            unread.text()
+        )))
+    }
+}
+
+fn is_qwen35_hybrid_gguf(gguf: &GgufFile) -> bool {
+    matches!(
+        gguf.metadata
+            .get("general.architecture")
+            .and_then(GgufMetaValue::as_str),
+        Some("qwen35" | "qwen35moe")
+    )
+}
+
+/// Splash `flint_stop_tokens`: `tokenizer.ggml.eog_token_ids`, when present,
+/// is a non-empty list of ids. Then the Qwen layouts' `.stopTokens` member
+/// `<|endoftext|>` by its vocabulary string (`<|im_end|>` is always a stop).
+fn plan_stop_token_ids(gguf: &GgufFile) -> Result<Vec<u32>> {
+    let invalid = || Error::from_reason("invalid GGUF metadata: tokenizer.ggml.eog_token_ids");
+    let mut ids: Vec<u32> = match gguf.metadata.get("tokenizer.ggml.eog_token_ids") {
+        None => Vec::new(),
+        Some(value) => {
+            let wide: Vec<i128> = match value {
+                GgufMetaValue::ArrayU32(v) => v.iter().map(|&id| i128::from(id)).collect(),
+                GgufMetaValue::ArrayI32(v) => v.iter().map(|&id| i128::from(id)).collect(),
+                GgufMetaValue::ArrayU64(v) => v.iter().map(|&id| i128::from(id)).collect(),
+                GgufMetaValue::ArrayI64(v) => v.iter().map(|&id| i128::from(id)).collect(),
+                _ => return Err(invalid()),
+            };
+            if wide.is_empty() {
+                return Err(invalid());
+            }
+            wide.into_iter()
+                .map(|id| u32::try_from(id).map_err(|_| invalid()))
+                .collect::<Result<_>>()?
+        }
+    };
+    if let Some(GgufMetaValue::ArrayString(tokens)) = gguf.metadata.get("tokenizer.ggml.tokens")
+        && let Some(id) = tokens.iter().position(|token| token == "<|endoftext|>")
+        && let Ok(id) = u32::try_from(id)
+        && !ids.contains(&id)
+    {
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// `generation_config.json` in `out` with `eos_token_id` = its ids, then each
+/// of `ids` not already there; every other key kept.
+fn merge_stop_token_ids(out: &Path, ids: &[u32]) -> Result<()> {
+    let path = out.join("generation_config.json");
+    let mut config = match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|e| Error::from_reason(format!("Failed to parse {}: {e}", path.display())))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => {
+            return Err(Error::from_reason(format!(
+                "Failed to read {}: {e}",
+                path.display()
+            )));
+        }
+    };
+    let obj = config
+        .as_object_mut()
+        .ok_or_else(|| Error::from_reason(format!("{} is not a JSON object", path.display())))?;
+    let mut eos: Vec<serde_json::Value> = match obj.get("eos_token_id") {
+        Some(serde_json::Value::Array(values)) => values.clone(),
+        Some(serde_json::Value::Null) | None => Vec::new(),
+        Some(value) => vec![value.clone()],
+    };
+    for &id in ids {
+        if !eos
+            .iter()
+            .any(|value| value.as_u64() == Some(u64::from(id)))
+        {
+            eos.push(serde_json::Value::from(id));
+        }
+    }
+    obj.insert("eos_token_id".to_string(), serde_json::Value::Array(eos));
+    let text = serde_json::to_string_pretty(&config)
+        .map_err(|e| Error::from_reason(format!("Failed to serialize {}: {e}", path.display())))?;
+    fs::write(&path, text)
+        .map_err(|e| Error::from_reason(format!("Failed to write {}: {e}", path.display())))
 }
 
 fn config_dtype_name(dtype: DType) -> Result<&'static str> {
@@ -630,6 +893,14 @@ pub(crate) fn write_gguf_assets(
         } else {
             info!("Copied {filename}");
         }
+    }
+    // Converting into the GGUF's own folder: the copy source is the user's file.
+    let generation_config_is_source = primary
+        .asset_copies
+        .iter()
+        .any(|(src, filename)| *filename == "generation_config.json" && *src == out.join(filename));
+    if !primary.stop_token_ids.is_empty() && !generation_config_is_source {
+        merge_stop_token_ids(out, &primary.stop_token_ids)?;
     }
     if !out.join("tokenizer.json").exists() && write_embedded_gpt2_tokenizer(&gguf.metadata, out)? {
         info!("Reconstructed tokenizer.json from embedded GGUF GPT-2 metadata");
@@ -1142,13 +1413,18 @@ mod tests {
             panic!("native plans read a lone split part");
         };
         assert_names_parts(&e.reason);
+        fs::remove_file(&parts[2]).unwrap();
         let root = work.join("cache");
         let Err(e) =
             CheckpointSource::resolve_in(&parts[0], NativeGgufFamily::Qwen35, Some(&root)).await
         else {
-            panic!("native prepare read a lone split part");
+            panic!("native prepare read a split GGUF missing a part");
         };
-        assert_names_parts(&e.reason);
+        assert!(
+            e.reason.contains(SPLIT_NAMES[2].trim_end_matches(".gguf")),
+            "{}",
+            e.reason
+        );
         assert_eq!(entries(&root), 0, "refused after a cache write");
         fs::remove_dir_all(&work).ok();
     }
@@ -1168,7 +1444,11 @@ mod tests {
             "{}",
             e.reason
         );
-        assert_names_parts(&e.reason);
+        assert!(
+            e.reason.contains("pass its first part") && e.reason.contains(SPLIT_NAMES[0]),
+            "{}",
+            e.reason
+        );
         assert_eq!(entries(&root), 0, "refused after a cache write");
 
         let Err(e) = preflight_muse_dflash_gguf(
@@ -1243,6 +1523,227 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("the merged file must convert: {}", e.reason));
         assert_eq!(result.num_tensors, 3);
+        fs::remove_dir_all(&work).ok();
+    }
+
+    fn dense_parts(dir: &Path) -> crate::utils::gguf_test_fixtures::GgufParts {
+        let fixture = write_import_fixture("qwen35-dense-untied", dir);
+        let parts = crate::utils::gguf_test_fixtures::GgufParts::read(&fixture.main);
+        fs::remove_file(&fixture.main).unwrap();
+        parts
+    }
+
+    fn plan_of(path: &Path) -> Result<ImportPlan> {
+        let mut gguf = parse_gguf(path)?;
+        annotate_gguf_header(&mut gguf);
+        native_import_plans(NativeGgufFamily::Qwen35, (path, &gguf), None).map(|(_, plan, _)| plan)
+    }
+
+    fn plan_err(path: &Path) -> String {
+        match plan_of(path) {
+            Ok(_) => panic!("{}: the plan must refuse", path.display()),
+            Err(e) => e.reason,
+        }
+    }
+
+    fn stop_ids_written(path: &Path, out: &Path) -> Option<Vec<u32>> {
+        let plan = plan_of(path).unwrap_or_else(|e| panic!("{}", e.reason));
+        let gguf = parse_gguf(path).unwrap();
+        fs::create_dir_all(out).unwrap();
+        write_gguf_assets(&plan, None, &gguf, out).unwrap();
+        out.join("generation_config.json")
+            .exists()
+            .then(|| crate::engine::persistence::parse_generation_defaults(out).eos_token_ids)
+    }
+
+    #[test]
+    fn header_eog_ids_join_generation_config() {
+        let work = work_dir("eog");
+        let src = work.join("src");
+        fs::create_dir_all(&src).unwrap();
+        let base = dense_parts(&src);
+        let path = src.join("m.gguf");
+
+        base.write(&path);
+        assert_eq!(stop_ids_written(&path, &work.join("plain")), None);
+
+        let mut eog = dense_parts(&src);
+        eog.set(
+            "tokenizer.ggml.eog_token_ids",
+            GgufMetaValue::ArrayI32(vec![7, 9]),
+        );
+        eog.write(&path);
+        assert_eq!(stop_ids_written(&path, &work.join("eog")), Some(vec![7, 9]));
+
+        fs::write(
+            src.join("generation_config.json"),
+            r#"{"eos_token_id": 9, "temperature": 0.6}"#,
+        )
+        .unwrap();
+        let out = work.join("merged");
+        assert_eq!(stop_ids_written(&path, &out), Some(vec![9, 7]));
+        let merged = read_json(&out.join("generation_config.json"));
+        assert_eq!(merged["temperature"], serde_json::json!(0.6));
+        fs::remove_file(src.join("generation_config.json")).unwrap();
+
+        let mut vocab = dense_parts(&src);
+        vocab.set(
+            "tokenizer.ggml.tokens",
+            GgufMetaValue::ArrayString(vec![
+                "a".into(),
+                "<|im_end|>".into(),
+                "<|endoftext|>".into(),
+            ]),
+        );
+        vocab.write(&path);
+        assert_eq!(
+            stop_ids_written(&path, &work.join("vocab")),
+            Some(vec![2]),
+            "Splash Qwen .stopTokens: <|endoftext|> stops decode"
+        );
+
+        for bad in [
+            GgufMetaValue::ArrayString(vec!["7".into()]),
+            GgufMetaValue::ArrayI32(Vec::new()),
+            GgufMetaValue::ArrayI32(vec![-1]),
+        ] {
+            let mut parts = dense_parts(&src);
+            parts.set("tokenizer.ggml.eog_token_ids", bad.clone());
+            parts.write(&path);
+            let text = plan_err(&path);
+            assert!(
+                text.contains("invalid GGUF metadata: tokenizer.ggml.eog_token_ids"),
+                "{bad:?}: {text}"
+            );
+        }
+        fs::remove_dir_all(&work).ok();
+    }
+
+    #[tokio::test]
+    async fn plan_refuses_unread_qwen35_tensors() {
+        use GgufTensorType::*;
+        let work = work_dir("unread");
+        let src = work.join("src");
+        fs::create_dir_all(&src).unwrap();
+        let path = src.join("m.gguf");
+
+        dense_parts(&src).write(&path);
+        plan_of(&path).unwrap_or_else(|e| panic!("plain fixture: {}", e.reason));
+
+        let mut bias = dense_parts(&src);
+        bias.add_tensor("blk.1.attn_q.bias", &[512], F32);
+        bias.write(&path);
+        let text = plan_err(&path);
+        assert!(
+            text.contains("GGUF tensors this build cannot load: attn_q.bias (unused) in 1 layer"),
+            "{text}"
+        );
+        let root = work.join("cache");
+        let Err(e) =
+            CheckpointSource::resolve_in(&path, NativeGgufFamily::Qwen35, Some(&root)).await
+        else {
+            panic!("native prepare loaded a GGUF with an unread bias");
+        };
+        assert!(
+            e.reason.contains("attn_q.bias (unused) in 1 layer"),
+            "{}",
+            e.reason
+        );
+        assert_eq!(
+            fs::read_dir(&root)
+                .map(|d| d
+                    .filter(|e| !e
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with('.'))
+                    .count())
+                .unwrap_or(0),
+            0,
+            "refused after a cache write"
+        );
+
+        type Edit = Box<dyn Fn(&mut crate::utils::gguf_test_fixtures::GgufParts)>;
+        let cases: Vec<(&str, Edit)> = vec![
+            (
+                "attn_q.weight (unused) in 1 layer",
+                Box::new(|p| p.add_tensor("blk.0.attn_q.weight", &[256, 512], F32)),
+            ),
+            (
+                "rope_freqs.weight (unused)",
+                Box::new(|p| p.add_tensor("rope_freqs.weight", &[64], F32)),
+            ),
+            (
+                "attn_norm.weight (unused) in 1 layer",
+                Box::new(|p| p.add_tensor("blk.2.attn_norm.weight", &[256], F32)),
+            ),
+            (
+                "is 1 but the header holds no inline MTP block",
+                Box::new(|p| p.set("qwen35.nextn_predict_layers", GgufMetaValue::Uint32(1))),
+            ),
+        ];
+        for (want, edit) in &cases {
+            let mut parts = dense_parts(&src);
+            edit(&mut parts);
+            parts.write(&path);
+            let text = plan_err(&path);
+            assert!(text.contains(want), "{want}: {text}");
+        }
+
+        let mtp = |nextn: Option<u32>, extra: Option<&str>| {
+            let mut parts = dense_parts(&src);
+            parts.set("qwen35.block_count", GgufMetaValue::Uint32(3));
+            if let Some(nextn) = nextn {
+                parts.set("qwen35.nextn_predict_layers", GgufMetaValue::Uint32(nextn));
+            }
+            parts.add_tensor("blk.2.nextn.eh_proj.weight", &[512, 256], F32);
+            for name in [
+                "blk.2.nextn.enorm.weight",
+                "blk.2.nextn.hnorm.weight",
+                "blk.2.nextn.shared_head_norm.weight",
+                "blk.2.attn_norm.weight",
+            ] {
+                parts.add_tensor(name, &[256], F32);
+            }
+            parts.add_tensor("blk.2.attn_q.weight", &[256, 512], F32);
+            if let Some(extra) = extra {
+                parts.add_tensor(extra, &[256], F32);
+            }
+            parts.write(&path);
+        };
+        mtp(Some(1), None);
+        plan_of(&path).unwrap_or_else(|e| panic!("the MTP block is exempt: {}", e.reason));
+        mtp(Some(1), Some("blk.3.attn_norm.weight"));
+        let text = plan_err(&path);
+        assert!(
+            text.contains("attn_norm.weight (unused) in 1 layer"),
+            "{text}"
+        );
+        mtp(None, None);
+        let text = plan_err(&path);
+        assert!(
+            text.contains("is 0 but the header holds an inline MTP block at blk.2"),
+            "{text}"
+        );
+
+        let moe_dir = work.join("moe");
+        let moe = write_import_fixture("qwen35moe-3d-experts", &moe_dir);
+        let mut moe_parts = crate::utils::gguf_test_fixtures::GgufParts::read(&moe.main);
+        moe_parts.add_tensor("blk.0.ffn_gate_up_exps.weight", &[256, 128, 2], F32);
+        moe_parts.write(&moe.main);
+        let mut gguf = parse_gguf(&moe.main).unwrap();
+        annotate_gguf_header(&mut gguf);
+        let Err(e) = native_import_plans(NativeGgufFamily::Qwen35Moe, (&moe.main, &gguf), None)
+        else {
+            panic!("the MoE plan read a fused gate_up stack");
+        };
+        assert!(
+            e.reason
+                .contains("ffn_gate_up_exps.weight (unused) in 1 layer"),
+            "{}",
+            e.reason
+        );
         fs::remove_dir_all(&work).ok();
     }
 }
