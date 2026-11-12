@@ -3947,7 +3947,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             claimant: SeqId::MAX,
             kept: &[],
         };
-        if governor.control_pass(&mut [&mut units]).again() {
+        if governor.control_pass(model, &mut [&mut units]).again() {
             governor.control_again(model);
         }
     }

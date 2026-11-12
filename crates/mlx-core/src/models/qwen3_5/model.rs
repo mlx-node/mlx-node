@@ -164,6 +164,8 @@ pub(crate) struct Qwen35Inner {
     pub(crate) dflash2: Option<crate::models::qwen3_5::dflash2::DFlash2Model>,
     pub(crate) dflash2_context: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
     pub(crate) dflash2_turn_state: Option<crate::models::qwen3_5::dflash2_turn::DFlash2TurnState>,
+    /// The DFlash2 stepper's lane while its verify's claim may suspend it.
+    pub(crate) dflash2_lane: Option<crate::models::qwen3_5::dflash2_decode::DFlash2Lane>,
     /// The serial text decode running, which a host refusal suspends.
     pub(crate) serial_decode: Option<crate::models::qwen3_5::dflash2_turn::SerialDecode>,
     pub(crate) dflash2_prefix: PrefixTracker,

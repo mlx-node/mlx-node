@@ -6,7 +6,7 @@ use crate::array::{DType, MxArray};
 use crate::engine::backend::{DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput};
 use crate::engine::memory_plan::EXTENT_TARGET_BYTES;
 
-use super::dflash2::DFlash2ContextCache;
+use super::dflash2::{DFlash2Config, DFlash2ContextCache};
 use super::dflash2_turn::{DFlash2Target, DFlash2TurnState};
 use super::gdn_blob::GdnStateBlobs;
 use super::model::{PREFILL_STEP_SIZE, Qwen35Inner};
@@ -20,9 +20,83 @@ pub(crate) struct Qwen35DFlash2Stepper<'a> {
     tapped: Option<Vec<MxArray>>,
     verified_ids: Option<Vec<u32>>,
     /// The lane's two GDN cells and pending tape: each verify folds the
-    /// last commit's retained rows, each commit swaps parity.
-    gdn_blobs: GdnStateBlobs,
+    /// last commit's retained rows, each commit swaps parity. Lent to the
+    /// target across the verify's claim ([`lend_lane`]).
+    gdn_blobs: Option<GdnStateBlobs>,
     paged: PagedVerifyLane,
+}
+
+/// A DFlash2 lane's buffers: both GDN cells with their pending rows, and
+/// the draft window.
+pub(crate) struct DFlash2Lane {
+    gdn: GdnStateBlobs,
+    context: DFlash2ContextCache,
+}
+
+/// Splash `Runtime::suspend` → `QwenStateStorage::releaseLane`: across a
+/// verify's claim the lane's buffers sit on the target, so the vacate of a
+/// suspend drops them before the wait and the replay.
+pub(crate) fn lend_lane(
+    gdn: &mut Option<GdnStateBlobs>,
+    context: &mut DFlash2ContextCache,
+    config: &DFlash2Config,
+) -> Option<DFlash2Lane> {
+    #[cfg(test)]
+    if let Some(gdn) = gdn.as_ref() {
+        let mut arrays = gdn.lane_arrays();
+        context.collect_arrays(&mut arrays);
+        lane_probe::record(&arrays);
+    }
+    Some(DFlash2Lane {
+        gdn: gdn.take()?,
+        context: std::mem::replace(context, DFlash2ContextCache::new(config)),
+    })
+}
+
+/// The lane the claim left on the target, when no suspend dropped it.
+pub(crate) fn reclaim_lane(
+    lent: Option<DFlash2Lane>,
+    gdn: &mut Option<GdnStateBlobs>,
+    context: &mut DFlash2ContextCache,
+) {
+    if let Some(lane) = lent {
+        *gdn = Some(lane.gdn);
+        *context = lane.context;
+    }
+}
+
+pub(crate) fn missing_cells() -> Error {
+    Error::from_reason("DFlash2 lane has no GDN cells")
+}
+
+#[cfg(test)]
+pub(crate) mod lane_probe {
+    use std::cell::RefCell;
+    use std::sync::{Arc, Weak};
+
+    use crate::array::{MxArray, MxHandle};
+
+    thread_local! {
+        static LENT: RefCell<Vec<Weak<MxHandle>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// The arrays of the lane the last verify lent.
+    pub(crate) fn record(arrays: &[&MxArray]) {
+        let weak = arrays
+            .iter()
+            .map(|array| Arc::downgrade(&array.handle))
+            .collect();
+        LENT.with(|lent| *lent.borrow_mut() = weak);
+    }
+
+    /// (recorded, still held).
+    pub(crate) fn held() -> (usize, usize) {
+        LENT.with(|lent| {
+            let lent = lent.borrow();
+            let alive = lent.iter().filter(|weak| weak.strong_count() > 0).count();
+            (lent.len(), alive)
+        })
+    }
 }
 
 /// The stepper's verify on the paged pool: one 8-row graph per cycle (Splash
@@ -319,8 +393,9 @@ const SDPA_KEYS_PER_PARTITION: u64 = 64;
 impl Qwen35DFlash2Stepper<'_> {
     /// The verify's claim suspended and replayed the lane: the stepper takes
     /// the draft window the tapped replay rebuilt and packs the GDN state
-    /// the replay left in the caches into fresh cells. The old cells'
-    /// pending rows go with them: the replay fed their tokens.
+    /// the replay left in the caches into fresh cells. The old cells and
+    /// their pending rows went with the vacate: the replay fed their
+    /// tokens.
     fn adopt_replayed_lane(&mut self) -> Result<()> {
         let Some(state) = self.inner.dflash2_turn_state.take() else {
             return Ok(());
@@ -333,10 +408,11 @@ impl Qwen35DFlash2Stepper<'_> {
             .caches
             .as_mut()
             .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?;
-        self.gdn_blobs = GdnStateBlobs::pack(caches, tiled)?.ok_or_else(|| {
+        let gdn = GdnStateBlobs::pack(caches, tiled)?.ok_or_else(|| {
             Error::from_reason("Qwen3.8 DFlash2 needs packed GDN state (bf16 conv, f32 recurrent)")
         })?;
-        self.gdn_blobs.apply_views(caches)?;
+        gdn.apply_views(caches)?;
+        self.gdn_blobs = Some(gdn);
         Ok(())
     }
 
@@ -393,7 +469,15 @@ impl Qwen35DFlash2Stepper<'_> {
         };
         let full = full_verify_ids(ids, &drafted)?;
         let (seq, window) = (self.paged.seq, self.paged.context_window);
-        super::dflash2_turn::paged_step_claimed(&mut *self.inner, |inner| {
+        let config = &self
+            .inner
+            .dflash2
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 model disappeared"))?
+            .config;
+        let lent = lend_lane(&mut self.gdn_blobs, &mut self.context, config);
+        self.inner.dflash2_lane = lent;
+        let claimed = super::dflash2_turn::paged_step_claimed(&mut *self.inner, |inner| {
             inner
                 .paged_adapter
                 .as_mut()
@@ -401,7 +485,13 @@ impl Qwen35DFlash2Stepper<'_> {
                 .reserve_rows(DFLASH2_VERIFY_ROWS as u32)
                 .map(|_| ())
                 .map_err(Error::from_reason)
-        })?;
+        });
+        reclaim_lane(
+            self.inner.dflash2_lane.take(),
+            &mut self.gdn_blobs,
+            &mut self.context,
+        );
+        claimed?;
         self.adopt_replayed_lane()?;
         let ticket =
             crate::engine::spec_paged::SpecPagedCache::open_core_write_cycle(self, seq, full.len())
@@ -412,8 +502,12 @@ impl Qwen35DFlash2Stepper<'_> {
         let result = {
             let inner = &mut *self.inner;
             let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
-            match (inner.caches.as_mut(), inner.paged_adapter.as_mut()) {
-                (Some(caches), Some(adapter)) => {
+            match (
+                inner.caches.as_mut(),
+                inner.paged_adapter.as_mut(),
+                self.gdn_blobs.as_ref(),
+            ) {
+                (Some(caches), Some(adapter), Some(gdn_blobs)) => {
                     super::paged_forward::run_paged_dflash2_verify_step(
                         &full,
                         &inner.embedding,
@@ -426,7 +520,7 @@ impl Qwen35DFlash2Stepper<'_> {
                         &mut tape,
                         rope_deltas,
                         &self.tap_layers,
-                        &self.gdn_blobs,
+                        gdn_blobs,
                         window,
                     )
                 }
@@ -593,7 +687,10 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             )));
         }
         self.commit_paged_cycle(keep)?;
-        self.gdn_blobs.retain(&tape, keep)?;
+        self.gdn_blobs
+            .as_mut()
+            .ok_or_else(missing_cells)?
+            .retain(&tape, keep)?;
         self.append_tapped(&tapped, &verified_ids[..keep])
     }
 
@@ -632,7 +729,10 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             .caches
             .as_mut()
             .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?;
-        self.gdn_blobs.settle(caches)?;
+        self.gdn_blobs
+            .as_mut()
+            .ok_or_else(missing_cells)?
+            .settle(caches)?;
         let config = self
             .inner
             .dflash2
@@ -726,7 +826,7 @@ impl DsparkBackend for Qwen35Inner {
             tape: None,
             tapped: None,
             verified_ids: None,
-            gdn_blobs,
+            gdn_blobs: Some(gdn_blobs),
             paged,
         })
     }
@@ -1068,6 +1168,7 @@ impl DFlash2Target for Qwen35Inner {
     fn drop_serial_lane_state(&mut self) {
         self.end_gdn_use(0);
         self.caches = None;
+        self.dflash2_lane = None;
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
     }
@@ -1442,7 +1543,10 @@ mod paged_dflash2_tests {
         });
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         let mut step = inner.begin_dspark_decode(DFLASH2_DRAFT_PROPOSALS)?;
-        let mut gdn = GdnTrace::begin(&step.gdn_blobs, step.inner.caches.as_ref().expect("caches"));
+        let mut gdn = GdnTrace::begin(
+            step.gdn_blobs.as_ref().expect("cells"),
+            step.inner.caches.as_ref().expect("caches"),
+        );
         let mut deferred = Vec::new();
         while generated.len() < n {
             let anchor = *generated.last().expect("one token");
@@ -1483,7 +1587,10 @@ mod paged_dflash2_tests {
             generated.extend_from_slice(&ids[1..=accepted]);
             generated.push(rows[accepted]);
         }
-        gdn.before_finish(&step.gdn_blobs, step.inner.caches.as_ref().expect("caches"));
+        gdn.before_finish(
+            step.gdn_blobs.as_ref().expect("cells"),
+            step.inner.caches.as_ref().expect("caches"),
+        );
         step.finish()?;
         gdn.after = cells(inner.caches.as_ref().expect("caches"), &gdn.layers);
         Ok(Run {

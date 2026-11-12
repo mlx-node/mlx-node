@@ -71,6 +71,7 @@ impl Qwen35Inner {
             dflash2: None,
             dflash2_context: None,
             dflash2_turn_state: None,
+            dflash2_lane: None,
             serial_decode: None,
             dflash2_prefix,
             dflash2_states,

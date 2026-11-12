@@ -283,6 +283,7 @@ impl Drop for Reservation<'_> {
         if self.bytes > 0 {
             let mut books = self.governor.lock();
             books.reserved = books.reserved.saturating_sub(self.bytes);
+            books.retired = books.retired.wrapping_add(1);
         }
     }
 }
@@ -438,6 +439,10 @@ struct ModelEntry {
     wanted: Arc<WantedChains>,
     /// The next control pass's time (Splash `MemoryControl`'s period).
     next_control: f64,
+    /// Splash `MemoryGovernor::nextHostPassMilliseconds_`, per model: a
+    /// pass sees only its model's units, so one model's pass must not
+    /// spend another's settle time.
+    next_host_pass: f64,
     /// Publications a refused claim skipped.
     publications_refused: u64,
     /// A command exhausted Metal memory and the model's caches are not
@@ -458,7 +463,9 @@ struct Books {
     system_pressure: Pressure,
     host_rule: HostRule,
     ledger: Ledger,
-    next_host_pass: f64,
+    /// Reservations dropped so far. A drop between a sample and the lock
+    /// leaves its bytes in neither: the caller samples again.
+    retired: u64,
     band_waived: bool,
     /// MLX's limit before the first model registered, put back when the
     /// last one leaves.
@@ -634,7 +641,7 @@ impl Governor {
                 system_pressure: Pressure::Normal,
                 host_rule: HostRule::default(),
                 ledger,
-                next_host_pass: 0.0,
+                retired: 0,
                 band_waived: false,
                 limit_before: None,
                 spare_reserve: spare_reserve_bytes(physical),
@@ -647,6 +654,22 @@ impl Governor {
         self.books
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Stats and host sampled outside the books (lock order), then the
+    /// books with no reservation retired since the sample: Splash
+    /// `MemoryGovernor::tryReserve` reads charged and reserved at one
+    /// instant.
+    fn sample_locked(&self) -> (MemoryStats, HostSample, MutexGuard<'_, Books>) {
+        loop {
+            let seen = self.lock().retired;
+            let stats = self.io.stats();
+            let host = self.io.host();
+            let books = self.lock();
+            if books.retired == seen {
+                return (stats, host, books);
+            }
+        }
     }
 
     /// The books, under the mutex. Never count or take units inside.
@@ -666,9 +689,7 @@ impl Governor {
     }
 
     fn try_register(&self, model: ModelRegistration) -> Result<ModelGuard<'_>, (Failure, String)> {
-        let stats = self.io.stats();
-        let host = self.io.host();
-        let mut books = self.lock();
+        let (stats, host, mut books) = self.sample_locked();
         let limit = books.limit().min(model.hard_budget);
         let charged = Charge {
             untracked: books.untracked().saturating_add(model.untracked),
@@ -708,6 +729,7 @@ impl Governor {
             resumptions: 0,
             wanted: Arc::default(),
             next_control: 0.0,
+            next_host_pass: 0.0,
             publications_refused: 0,
             gpu_oom: false,
             metal_out_of_memory: 0,
@@ -832,9 +854,7 @@ impl Governor {
         let Some(claim) = self.scope_claim() else {
             return Err(Failure::OutsideScope);
         };
-        let stats = self.io.stats();
-        let host = self.io.host();
-        let mut books = self.lock();
+        let (stats, host, mut books) = self.sample_locked();
         books.sample_host_rule(&host);
         let Some(state) = books.ledger.claim(claim) else {
             return Err(Failure::OutsideScope);
@@ -1060,12 +1080,16 @@ impl Governor {
         result
     }
 
-    /// Splash `MemoryGovernor::controlPass` over this thread's sources,
-    /// once the host has settled from the last pass. Under critical
+    /// Splash `MemoryGovernor::controlPass` over `model`'s sources, once
+    /// the host has settled from that model's last pass. Under critical
     /// pressure: one host claim of the margin plus what host-refused claims
     /// wait for, once per settle time. Otherwise, with a deficit, the host
     /// claim frees the lesser of the margin and the deficit.
-    pub(crate) fn control_pass(&self, sources: &mut [&mut dyn VictimSource]) -> ControlPass {
+    pub(crate) fn control_pass(
+        &self,
+        model: u64,
+        sources: &mut [&mut dyn VictimSource],
+    ) -> ControlPass {
         let now = self.io.now();
         let host = self.io.host();
         let (target, critical) = {
@@ -1073,13 +1097,18 @@ impl Governor {
             books.ledger.set_now(now);
             books.sample_host_rule(&host);
             let critical = books.critical();
-            let due = now >= books.next_host_pass;
             let refused = books.ledger.host_refused_waiting_bytes();
+            let Some(next) = books.model(model).map(|entry| entry.next_host_pass) else {
+                return ControlPass { pass: None };
+            };
+            let due = now >= next;
             let mut target = None;
             if critical {
                 if due {
                     target = Some(HOST_MARGIN_BYTES.saturating_add(refused));
-                    books.next_host_pass = now + HOST_SETTLE_SECONDS;
+                    if let Some(entry) = books.model(model) {
+                        entry.next_host_pass = now + HOST_SETTLE_SECONDS;
+                    }
                 }
             } else if due {
                 let landing = books.ledger.returning().landing_bytes;
@@ -1100,9 +1129,12 @@ impl Governor {
         if books.host_rule.constrained() {
             books.band_waived = result.outcome == FreeOutcome::Short;
         }
-        if result.now_bytes > 0 || result.later_bytes > 0 || result.outcome == FreeOutcome::Pending
+        if (result.now_bytes > 0
+            || result.later_bytes > 0
+            || result.outcome == FreeOutcome::Pending)
+            && let Some(entry) = books.model(model)
         {
-            books.next_host_pass = now + HOST_SETTLE_SECONDS;
+            entry.next_host_pass = now + HOST_SETTLE_SECONDS;
         }
         ControlPass {
             pass: Some(HostPass { target, result }),

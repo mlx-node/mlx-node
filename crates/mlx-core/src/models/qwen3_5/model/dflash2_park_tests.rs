@@ -590,6 +590,48 @@ fn cap_reclaim_takes_the_deepest_rung_only() -> Result<()> {
     Ok(())
 }
 
+/// Splash `Cache::take`: a take that removed its unit is Met, whatever it
+/// measured, so the ledger lists the model's units again. Parked state S
+/// and the later rung L mark the same chain; L's arrays have another
+/// holder. At the cap L holds the chain's pages and frees nothing
+/// measurable (S still marks it); listed again, S holds them and its take
+/// frees the block the step needs.
+/// Mutation R2m (a take that measured nothing is Short) → red (`Err`: S
+/// is never taken).
+#[test]
+fn a_take_that_frees_nothing_measurable_lists_again() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let mut inner = fixture(0xDFA5_1811);
+    install_pool(&mut inner, 4, 4, passing_probe())?;
+    let block_size = pool_block_size(&inner);
+    let chain = chain_tokens(17, 4, block_size);
+    let hashes = cache_chain(&inner, &chain);
+    park_state(&mut inner, &chain);
+    let caches = owned_caches(&inner.config);
+    let other_holder =
+        super::state::clone_dense_linear_layer_caches(&inner.config, &caches).expect("ready");
+    let stamp = inner.cache_recency.next();
+    inner.push_ladder_entry_for_test(4 * block_size, hashes, chain, caches, stamp);
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .begin_request(1)
+        .map_err(Error::from_reason)?;
+    clear_grow_reclaim_log();
+    let mut runs = 0;
+    paged_step_claimed(&mut inner, reserve_step(&mut runs, 1, block_size))?;
+    assert_eq!(runs, 2);
+    assert_eq!(
+        grow_reclaim_log(),
+        vec![GrowReclaim::Ladder, GrowReclaim::Store]
+    );
+    drop(other_holder);
+    Ok(())
+}
+
 /// GDN caches a ladder rung can restore: the live state of a finished
 /// DFlash2 turn.
 fn restorable_caches(inner: &Qwen35Inner) -> Vec<Qwen3_5LayerCache> {
@@ -2462,6 +2504,64 @@ fn a_suspended_dflash2_lane_drops_its_pending_rows() -> Result<()> {
     // (0.012 measured); a pending row folded twice moves the tokens.
     let gap = gdn_gap(&gdn_cells(&inner), &solo_cells);
     assert!(gap < 0.05, "GDN state {gap} from the solo run's");
+    Ok(())
+}
+
+/// Splash `Runtime::suspend` → `QwenStateStorage::releaseLane`: a
+/// suspended DFlash2 lane's two GDN cells, pending rows and draft window
+/// are gone before the wait, so the replay builds its lane beside none of
+/// them.
+/// Mutation R1m (the stepper keeps its lane across the claim) → red.
+#[test]
+fn a_suspended_dflash2_lane_drops_its_cells_and_window() -> Result<()> {
+    use crate::engine::governor::governor::tests::{G, host};
+    use crate::engine::governor::host::Pressure;
+    use crate::models::qwen3_5::dflash2_decode::lane_probe;
+    use std::sync::atomic::AtomicBool;
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let decoder = DecoderPlan::Speculative(crate::engine::plan::SpeculativeKind::DraftModel);
+    let (io, governor) = fake_governor(Pressure::Normal);
+    let (mut inner, mut prompt) = suspending_lane(0xDFA5_4A02, governor)?;
+    // Eight rows left: the first verify fills the second block.
+    prompt.truncate(prompt.len() - 4);
+    let in_wait: Arc<std::sync::Mutex<Option<(usize, usize)>>> = Arc::default();
+    {
+        let seen = Arc::clone(&in_wait);
+        io.with(|state| {
+            state.on_sleep = Some(Box::new(move |state| {
+                let mut seen = seen.lock().unwrap();
+                if seen.is_none() {
+                    *seen = Some(lane_probe::held());
+                }
+                if state.sleeps >= 3 {
+                    state.host = host(32 * G, Pressure::Normal);
+                }
+            }));
+        });
+    }
+    let critical = {
+        let io = Arc::clone(&io);
+        Box::new(move || io.with(|state| state.host = host(32 * G, Pressure::Critical)))
+    };
+    let sink = LoggingSink::new(Some(critical));
+    run_streamed_turn_for(
+        &mut inner,
+        decoder,
+        &prompt,
+        &sink,
+        &AtomicBool::new(false),
+        16,
+    )?;
+    assert_eq!(governor.suspensions(7), 1);
+    assert_eq!(governor.resumptions(7), 1);
+    let (lent, held) = in_wait.lock().unwrap().expect("the lane waited");
+    assert!(lent > 4, "{lent} lane arrays recorded");
+    assert_eq!(
+        held, 0,
+        "{held} of the lane's {lent} arrays outlived the vacate"
+    );
     Ok(())
 }
 

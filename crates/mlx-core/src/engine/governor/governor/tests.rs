@@ -20,6 +20,8 @@ pub(crate) struct FakeState {
     pub physical: u64,
     /// Runs at every sleep, after the clock moved.
     pub on_sleep: Option<Box<dyn FnMut(&mut FakeState) + Send>>,
+    /// Runs once, at the next stats read, after the sample was taken.
+    pub after_stats: Option<Box<dyn FnOnce(&mut FakeState) + Send>>,
 }
 
 /// Counters, host and clock set by the test; a clear empties the cache, a
@@ -40,6 +42,7 @@ impl FakeIo {
                 limits: Vec::new(),
                 physical: PHYSICAL,
                 on_sleep: None,
+                after_stats: None,
             }),
         })
     }
@@ -51,7 +54,13 @@ impl FakeIo {
 
 impl GovernorIo for FakeIo {
     fn stats(&self) -> MemoryStats {
-        self.with(|state| state.stats)
+        self.with(|state| {
+            let sample = state.stats;
+            if let Some(hook) = state.after_stats.take() {
+                hook(state);
+            }
+            sample
+        })
     }
 
     fn host(&self) -> HostSample {
@@ -317,7 +326,7 @@ fn host_passes_wait_for_the_host_to_settle() {
         let mut targets = Vec::new();
         for now in [0.0, 0.5, 1.0] {
             io.with(|state| state.now = now);
-            let pass = governor.control_pass(&mut [units]);
+            let pass = governor.control_pass(7, &mut [units]);
             assert!(!pass.again());
             if let Some(pass) = pass.pass {
                 targets.push(pass.target);
@@ -329,6 +338,7 @@ fn host_passes_wait_for_the_host_to_settle() {
     // Critical: one host claim of M per settled second, whatever it found.
     let io = FakeIo::new(stats(0), host(4 * G, Pressure::Critical));
     let governor = Governor::new(io.clone());
+    let _model = governor.register_model(model(20 * G, 0)).unwrap();
     let mut none = Units::new(0, 0);
     assert_eq!(
         passes(&governor, &io, &mut none),
@@ -339,6 +349,7 @@ fn host_passes_wait_for_the_host_to_settle() {
     // A deficit of 0.5 GiB; each pass frees it.
     let io = FakeIo::new(stats(0), host(G / 2, Pressure::Normal));
     let governor = Governor::new(io.clone());
+    let _model = governor.register_model(model(20 * G, 0)).unwrap();
     let mut units = Units::new(8, G / 4);
     assert_eq!(governor.deficit_bytes(), G / 2);
     assert_eq!(passes(&governor, &io, &mut units), vec![G / 2, G / 2]);
@@ -346,17 +357,73 @@ fn host_passes_wait_for_the_host_to_settle() {
     assert_eq!(governor.snapshot().pressure, Pressure::Warning);
 
     // Unmeasured: no deficit, no pass.
-    let io = FakeIo::new(
-        stats(0),
-        HostSample {
-            memory: None,
-            pressure: Some(Pressure::Normal),
-        },
-    );
+    let io = FakeIo::new(stats(0), host(4 * G, Pressure::Normal));
     let governor = Governor::new(io.clone());
+    let _model = governor.register_model(model(20 * G, 0)).unwrap();
+    io.with(|state| state.host.memory = None);
     let mut units = Units::new(8, G / 4);
     assert!(passes(&governor, &io, &mut units).is_empty());
     assert_eq!(units.units.len(), 8);
+}
+
+/// Splash `MemoryGovernor::tryReserve` reads charged and reserved at one
+/// instant. Here another model thread's allocation lands and its 80-byte
+/// reservation drops between B's sample and B's lock: B must sample again
+/// and see it. Mutation E1m (no resample) -> red (B is admitted: 160 > 100).
+#[test]
+fn a_reservation_retired_after_the_sample_is_still_charged() {
+    let io = FakeIo::new(stats(0), host(4 * G, Pressure::Normal));
+    let governor: &'static Governor = Box::leak(Box::new(Governor::new(io.clone())));
+    let _model = governor.register_model(model(100, 0)).unwrap();
+    let a = governor.open(lane(ClaimClass::InService, 1, 0), 7);
+    let b = governor.open(lane(ClaimClass::InService, 2, 0), 7);
+    let held = {
+        let _scope = Scope::enter(a.claim());
+        governor.try_reserve(80).expect("80 of 100")
+    };
+    let held = Mutex::new(Some(held));
+    let held: &'static Mutex<Option<Reservation<'static>>> = Box::leak(Box::new(held));
+    io.with(|state| {
+        state.after_stats = Some(Box::new(move |state| {
+            state.stats.active += 80;
+            drop(held.lock().unwrap().take());
+        }));
+    });
+    let _scope = Scope::enter(b.claim());
+    assert_eq!(governor.try_reserve(80).err(), Some(Failure::EngineBudget));
+    assert!(held.lock().unwrap().is_none());
+    assert_eq!(governor.reserved_bytes(), 0);
+    assert!(governor.try_reserve(20).is_ok());
+}
+
+/// Splash runs one engine per governor, so its host deadline and the units
+/// a pass sees share one scope. Two models here: A holds nothing and runs
+/// first at every tick; B holds 2 GiB. Under critical pressure B's own
+/// passes still take a unit each settled second.
+/// Mutation E3m (one deadline for every model) -> red (B never passes).
+#[test]
+fn an_empty_model_does_not_spend_another_models_host_pass() {
+    let io = FakeIo::new(stats(0), host(4 * G, Pressure::Critical));
+    let governor = Governor::new(io.clone());
+    let _a = governor.register_model(model(20 * G, 0)).unwrap();
+    let _b = governor
+        .register_model(ModelRegistration {
+            model_id: 8,
+            ..model(20 * G, 0)
+        })
+        .unwrap();
+    let mut empty = Units::new(0, 0);
+    let mut full = Units::new(8, G / 4);
+    let mut b_passes = 0;
+    for now in [0.0, 0.5, 1.0, 1.5] {
+        io.with(|state| state.now = now);
+        assert!(governor.control_pass(7, &mut [&mut empty]).pass.is_some() == (now % 1.0 == 0.0));
+        if governor.control_pass(8, &mut [&mut full]).pass.is_some() {
+            b_passes += 1;
+        }
+    }
+    assert_eq!(b_passes, 2);
+    assert!(full.units.len() < 8, "B's units were taken");
 }
 
 #[test]

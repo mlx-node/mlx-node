@@ -153,7 +153,8 @@ pub(crate) trait DFlash2Target: ChatBackend {
     fn serial_decode(&self) -> Option<SerialDecode>;
     fn set_serial_decode(&mut self, decode: Option<SerialDecode>);
     /// Splash `Runtime::suspend` once the lane's sequence is released: its
-    /// live GDN cell and draft window go, and its use of a GDN state ends.
+    /// live caches and the lane a DFlash2 verify lent (both GDN cells, the
+    /// pending rows, the draft window) go, and its use of a GDN state ends.
     fn drop_serial_lane_state(&mut self);
     /// Splash `replayTokens`: the GDN prime and the prefill of `tokens`
     /// past `plan`'s restored prefix, output off, as a turn start with that
@@ -548,7 +549,7 @@ fn run_control_pass<T: DFlash2Target>(
         return;
     }
     let mut units = ModelUnits { target, keep };
-    if governor.control_pass(&mut [&mut units]).again() {
+    if governor.control_pass(model, &mut [&mut units]).again() {
         governor.control_again(model);
     }
 }
@@ -1466,7 +1467,9 @@ fn resume_point(states: &[StateUnit]) -> Option<UnitKey> {
 /// Takes one of [`model_units`]' units. Credits what the take measurably
 /// freed: MLX's active bytes (a state a running turn or a pending graph
 /// still holds frees nothing), the pool bytes an extent cut gave back, and
-/// the blocks it made takeable.
+/// the blocks it made takeable. Met whenever the unit went (Splash
+/// `Cache::take`), so the ledger lists again: a state that shared its
+/// block or its arrays hands them to the next one only once it is gone.
 pub(crate) fn take_model_unit<T: DFlash2Target>(
     target: &mut T,
     query: &VictimQuery,
@@ -1477,23 +1480,26 @@ pub(crate) fn take_model_unit<T: DFlash2Target>(
         .paged_adapter_ref()
         .map_or(0, PagedKVCacheAdapter::takeable_blocks);
     let mut pool_bytes = 0u64;
-    match &victim.key {
+    let removed = match &victim.key {
         UnitKey::Extent => {
             let keep_one = query.rights.reserves == Reserves::None;
             if let Some(adapter) = target.paged_adapter_mut_ref() {
                 pool_bytes = adapter.release_free_extents(victim.bytes, keep_one);
             }
+            pool_bytes > 0
         }
         UnitKey::Vision(generation) => {
-            if crate::vision::qwen::cache::release_unheld_vision(target.vision_cache(), *generation)
-            {
+            let released = crate::vision::qwen::cache::release_unheld_vision(
+                target.vision_cache(),
+                *generation,
+            );
+            if released {
                 log_reclaim(GrowReclaim::Vision);
             }
+            released
         }
-        key => {
-            take_state_unit(target, key);
-        }
-    }
+        key => take_state_unit(target, key),
+    };
     let freed = active.saturating_sub(crate::array::memory::active_memory_bytes());
     let now_bytes = freed.saturating_add(pool_bytes);
     let pages = target
@@ -1501,7 +1507,7 @@ pub(crate) fn take_model_unit<T: DFlash2Target>(
         .map_or(0, PagedKVCacheAdapter::takeable_blocks)
         .saturating_sub(takeable);
     LedgerTaken {
-        outcome: if now_bytes > 0 || pages > 0 {
+        outcome: if removed || now_bytes > 0 || pages > 0 {
             FreeOutcome::Met
         } else {
             FreeOutcome::Short

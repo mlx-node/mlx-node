@@ -147,6 +147,16 @@ impl GdnStateBlobs {
         })
     }
 
+    #[cfg(test)]
+    /// Both cells and the pending rows.
+    pub(crate) fn lane_arrays(&self) -> Vec<&MxArray> {
+        let mut arrays = vec![&self.conv, &self.recurrent, &self.spare.0, &self.spare.1];
+        if let Some(pending) = &self.pending {
+            arrays.extend(pending.rows.iter().flatten());
+        }
+        arrays
+    }
+
     pub(crate) fn destinations(&self) -> &GdnDestinations {
         &self.destinations
     }
