@@ -898,7 +898,8 @@ impl Qwen35Inner {
 
         let mut token_history: Vec<u32> = token_history_init;
 
-        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+        let mut reasoning_tracker =
+            engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end());
 
         // Whether the final committed token reached the physical KV/GDN cache.
         // The decode macros write `false` when they stop on an unforwarded
@@ -1446,7 +1447,8 @@ impl Qwen35Inner {
         MxArray::async_eval_arrays(&[&y]);
 
         let starts_in_thinking = thinking.enabled;
-        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+        let mut reasoning_tracker =
+            engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end());
 
         // Pure-Rust ("eager") dense MTP gate for the FLAT streaming delta path.
         // Delta is text-only (no `has_images`) by construction; paged sessions
@@ -1945,7 +1947,8 @@ impl Qwen35Inner {
         MxArray::async_eval_arrays(&[&y]);
 
         let starts_in_thinking = thinking.enabled;
-        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+        let mut reasoning_tracker =
+            engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end());
 
         // The hidden-emitting prefill always covers the whole prompt, so the
         // captured hidden pairs with every prefill token.

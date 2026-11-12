@@ -1366,11 +1366,9 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         // M1–M4; override via `MLX_MTP_CHAINED_CYCLES=0/1`): skip
         // Step A's full main-model forward when a chained verify
         // hidden is available from the prior cycle, unless the
-        // tracker is about to force a think-end token (the
-        // forced-token path needs Step A to forward `y` so its K/V
-        // is committed before we inject the forced token). The gate
-        // is a non-consuming `force_think_end_pending()` peek so the
-        // pending flag survives into Step A's single consume below.
+        // tracker is ending thinking (the forced-token path needs
+        // Step A to forward `y` so its K/V is committed before we
+        // inject the end's next token, which Step A takes below).
         //
         // When chained cycles are disabled (M1–M4 default, or
         // `MLX_MTP_CHAINED_CYCLES=0`): always Step A, byte-exact with
@@ -1387,9 +1385,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         // parity is preserved because verify (= main model) is the
         // ground truth and at T=0 the residual-sampler picks the
         // same token regardless of draft accuracy.
-        let do_step_a = !chained_cycles_enabled
-            || chained_hidden_opt.is_none()
-            || tracker.force_think_end_pending();
+        let do_step_a = !chained_cycles_enabled || chained_hidden_opt.is_none() || tracker.ending();
         let cycle_seed_was_chained = !do_step_a;
 
         let _stream_ctx = crate::stream::StreamContext::new(generation_stream);
@@ -1404,14 +1400,13 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             }
             profiler.end();
 
-            let (next_token, budget_forced) = if tracker.should_force_think_end() {
-                let forced_id = tracker.forced_token_id()? as i32;
+            let (next_token, budget_forced) = if let Some(forced) = tracker.take_forced_token() {
                 tracing::debug!(
                     target: "mlx_core::mtp",
-                    forced_id,
-                    "MTP Step A: forcing think-end token (reasoning budget tripped)"
+                    forced,
+                    "MTP Step A: forcing a thinking end token (reasoning budget ran out)"
                 );
-                (MxArray::from_int32(&[forced_id], &[1])?, true)
+                (MxArray::from_int32(&[forced as i32], &[1])?, true)
             } else {
                 profiler.begin("rep_penalty");
                 logits = apply_all_penalties(logits, hist, p)?;
@@ -1577,15 +1572,12 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             }
             break;
         }
-        if tracker.force_think_end_pending() {
-            // Budget tripped during Step A's observe (after Step A's
-            // consume) — defer the forced token to the NEXT cycle's
-            // Step A. This is a NON-consuming peek: the flag stays set,
-            // so next cycle's routing peek (`do_step_a`) forces Step A
-            // and the single consuming call there emits `</think>`.
+        if tracker.ending() {
+            // Thinking is being ended: no cycle may draft before the close.
+            // The next Step A takes the end's next token.
             tracing::debug!(
                 target: "mlx_core::mtp",
-                "MTP cycle skipped: think-end queued, deferring to next Step A"
+                "MTP cycle skipped: thinking end queued, deferring to next Step A"
             );
             continue;
         }
@@ -3982,7 +3974,7 @@ mod tests {
             eos_id,
             depth,
             cancel_flag,
-            ReasoningTracker::new(false, None, None),
+            ReasoningTracker::new(false, None, &[]),
         )
     }
 
@@ -4074,16 +4066,40 @@ mod tests {
                     15,
                     depth,
                     None,
-                    ReasoningTracker::new(true, Some(budget), Some(9)),
+                    ReasoningTracker::new(true, Some(budget), &[8, 9]),
                 );
+                let b = budget as usize;
                 assert_eq!(
-                    out.generated.iter().position(|&id| id == 9),
-                    Some(budget as usize),
+                    &out.generated[b..b + 2],
+                    &[8, 9],
                     "budget={budget}, depth={depth}, output={:?}",
                     out.generated
                 );
-                assert_eq!(out.generated.iter().filter(|&&id| id == 9).count(), 1);
-                assert_eq!(out.generated.len(), budget as usize + 4);
+                for id in [8, 9] {
+                    assert_eq!(out.generated.iter().filter(|&&t| t == id).count(), 1);
+                }
+                assert_eq!(out.generated.len(), b + 4);
+                // No MTP cycle drafts between the end's tokens: each is a Step A.
+                let forced: Vec<usize> = out
+                    .ledger
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| {
+                        matches!(
+                            c,
+                            Call::EvalStep {
+                                budget_forced: true
+                            }
+                        )
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                assert_eq!(forced.len(), if budget == 0 { 1 } else { 2 });
+                let cycle_before_close = out.ledger[..forced[forced.len() - 1]]
+                    .iter()
+                    .skip(if budget == 0 { 0 } else { forced[0] })
+                    .any(|c| matches!(c, Call::DraftStep | Call::VerifyStep { .. }));
+                assert!(!cycle_before_close, "budget={budget}, depth={depth}");
                 assert!(
                     !out.desynced,
                     "forced reasoning boundary must retain cache synchronization"
@@ -4688,7 +4704,7 @@ mod tests {
         params.max_new_tokens = 1;
         params.mtp_depth = 2;
 
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut profiler =
             crate::decode_profiler::DecodeProfiler::new("mtp_turn_replay_error_test", "test");
         profiler.enable_for_test();

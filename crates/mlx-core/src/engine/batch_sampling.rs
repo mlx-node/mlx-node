@@ -60,17 +60,15 @@ pub(crate) fn can_batch_greedy(params: &ChatParams) -> bool {
 
 /// Whether every row in one scheduled wave can share the greedy epilogue.
 ///
-/// `force_think_end_pending` is kept beside the row parameters because it is
-/// mutable turn state rather than a sampling parameter. Requiring a non-empty
+/// Whether a row is ending thinking is kept beside the row parameters because
+/// it is mutable turn state rather than a sampling parameter. Requiring a non-empty
 /// iterator prevents an empty `.all()` from accidentally engaging the gate.
 pub(crate) fn can_batch_greedy_wave<'a>(
     rows: impl IntoIterator<Item = (&'a ChatParams, bool)>,
 ) -> bool {
     let mut rows = rows.into_iter().peekable();
     rows.peek().is_some()
-        && rows.all(|(params, force_think_end_pending)| {
-            can_batch_greedy(params) && !force_think_end_pending
-        })
+        && rows.all(|(params, ending_thinking)| can_batch_greedy(params) && !ending_thinking)
 }
 
 /// Select one greedy token per row from production-shaped

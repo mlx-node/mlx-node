@@ -234,7 +234,7 @@ pub(crate) fn default_thinking_budget_for_effort(reasoning_effort: Option<&str>)
 /// Declarative thinking-mode policy for one family. [`resolve`] turns
 /// this + the request `ChatConfig` into the concrete
 /// [`crate::engine::backend::ThinkingSetup`] the engine feeds
-/// `ReasoningTracker::new`.
+/// `ReasoningTracker::from_setup`.
 pub(crate) enum ThinkingPolicy {
     /// No think-budget machinery: tracker permanently outside a think
     /// block (`enabled:false, budget:None`). gemma4.

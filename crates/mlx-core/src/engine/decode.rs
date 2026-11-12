@@ -381,7 +381,7 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
             && p.repetition_penalty == 1.0
             && p.presence_penalty == 0.0
             && p.frequency_penalty == 0.0
-            && !reasoning_tracker.force_think_end_pending();
+            && reasoning_tracker.peek_forced_token().is_none();
 
         // Speculative build BEFORE the drain: the stepper records a
         // placeholder (the KV write slot derives from the recorded token
@@ -606,19 +606,19 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
             }
             profiler.end();
 
-            let (next_token, budget_forced) = if reasoning_tracker.should_force_think_end() {
-                let forced_id = reasoning_tracker.forced_token_id()? as i32;
-                (MxArray::from_int32(&[forced_id], &[1])?, true)
-            } else {
-                profiler.begin("rep_penalty");
-                logits = apply_all_penalties(logits, token_history, p)?;
-                profiler.end();
+            let (next_token, budget_forced) =
+                if let Some(forced) = reasoning_tracker.take_forced_token() {
+                    (MxArray::from_int32(&[forced as i32], &[1])?, true)
+                } else {
+                    profiler.begin("rep_penalty");
+                    logits = apply_all_penalties(logits, token_history, p)?;
+                    profiler.end();
 
-                profiler.begin("sample");
-                let t = crate::sampling::sample(&logits, p.sampling_config)?;
-                profiler.end();
-                (t, false)
-            };
+                    profiler.begin("sample");
+                    let t = crate::sampling::sample(&logits, p.sampling_config)?;
+                    profiler.end();
+                    (t, false)
+                };
 
             // `eval_step` only schedules the sampled token/logit graph for
             // asynchronous evaluation. Cache materialization is performed by
@@ -998,7 +998,7 @@ mod run_decode_loop_tests {
     #[test]
     fn stops_at_eos_with_finish_reason_stop() {
         let params = greedy_params(|_| {});
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut step = MockStep::new(vec![7], 16);
 
         let out = drive(&mut step, 3, &params, &mut tracker, 10, 7, &[])
@@ -1017,7 +1017,7 @@ mod run_decode_loop_tests {
         let params = greedy_params(|cfg| {
             cfg.max_consecutive_tokens = Some(3);
         });
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut step = MockStep::new(vec![5], 16);
 
         let out = drive(&mut step, 5, &params, &mut tracker, 20, 7, &[])
@@ -1029,34 +1029,31 @@ mod run_decode_loop_tests {
 
     #[test]
     fn thinking_budget_is_exact_including_initial_sample() {
-        const THINK_END: u32 = 9;
+        // End "\n</think>" = [8, 9].
         for budget in [0, 1, 2, 3, 16] {
             let params = greedy_params(|cfg| {
                 cfg.max_consecutive_tokens = Some(0);
                 cfg.max_ngram_repeats = Some(0);
             });
-            let mut tracker = ReasoningTracker::new(true, Some(budget), Some(THINK_END));
+            let mut tracker = ReasoningTracker::new(true, Some(budget), &[8, 9]);
             let mut step = MockStep::new(vec![5], 16);
             let out = drive(&mut step, 4, &params, &mut tracker, budget + 4, 7, &[])
                 .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
-            assert_eq!(
-                out.generated.iter().position(|&id| id == THINK_END),
-                Some(budget as usize)
-            );
-            assert_eq!(
-                out.generated.iter().filter(|&&id| id == THINK_END).count(),
-                1
-            );
-            assert_eq!(out.generated.len(), budget as usize + 4);
+            let b = budget as usize;
+            assert_eq!(&out.generated[b..b + 2], &[8, 9], "budget {budget}");
+            for id in [8, 9] {
+                assert_eq!(out.generated.iter().filter(|&&t| t == id).count(), 1);
+            }
+            assert_eq!(out.generated.len(), b + 4);
             assert_eq!(out.finish_reason, "length");
-            assert_eq!(tracker.reasoning_token_count(), budget as u32);
+            assert_eq!(tracker.reasoning_token_count(), budget as u32 + 1);
         }
     }
 
     #[test]
     fn thinking_budget_preserves_natural_close() {
         let params = greedy_params(|_| {});
-        let mut tracker = ReasoningTracker::new(true, Some(16), Some(9));
+        let mut tracker = ReasoningTracker::new(true, Some(16), &[9]);
         let mut step = MockStep::new(vec![9, 5], 16);
         let out = drive(&mut step, 4, &params, &mut tracker, 6, 7, &[]).unwrap();
         assert_eq!(out.generated, vec![4, 9, 5, 5, 5, 5]);
@@ -1072,7 +1069,7 @@ mod run_decode_loop_tests {
             cfg.max_consecutive_tokens = Some(0);
             cfg.max_ngram_repeats = Some(0);
         });
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut step = MockStep::new(vec![1], 16);
 
         let out = drive(&mut step, 1, &params, &mut tracker, 400, 15, &[])
@@ -1101,7 +1098,7 @@ mod run_decode_loop_tests {
             cfg.max_consecutive_tokens = Some(0);
             cfg.max_ngram_repeats = Some(0);
         });
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut step = MockStep::new(vec![1], 16);
 
         // >256 steps so the cadence branch fires at least once.
@@ -1180,7 +1177,7 @@ mod run_decode_loop_tests {
         let params = greedy_params(|cfg| {
             cfg.include_reasoning = Some(false);
         });
-        let mut tracker = ReasoningTracker::new(true, None, Some(THINK_END));
+        let mut tracker = ReasoningTracker::new(true, None, &[THINK_END]);
         let mut step = MockStep::new(vec![1, THINK_END, 3, 4, EOS], 7);
 
         let tokenizer = tiny_tokenizer();
@@ -1269,7 +1266,7 @@ mod run_decode_loop_tests {
         // include_reasoning defaults to true → every delta is emitted,
         // reasoning ones tagged is_reasoning == Some(true).
         let params = greedy_params(|_| {});
-        let mut tracker = ReasoningTracker::new(true, None, Some(THINK_END));
+        let mut tracker = ReasoningTracker::new(true, None, &[THINK_END]);
         let mut step = MockStep::new(vec![1, THINK_END, 3, EOS], 7);
 
         let tokenizer = tiny_tokenizer();
@@ -1417,7 +1414,7 @@ mod run_decode_loop_tests {
         let params = greedy_params(|_| {});
         // Thinking disabled: every emitted token flows through (no
         // reasoning suppression confounds the emitted set).
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
 
         // ONE atomic, shared by both the stepper (which flips it) and the
         // StreamingCtx (which the loop reads). Two shared &AtomicBool
@@ -1531,7 +1528,7 @@ mod run_decode_loop_tests {
         let params = greedy_params(|_| {});
 
         let run = |wire_flag: bool| -> (Vec<u32>, String) {
-            let mut tracker = ReasoningTracker::new(false, None, None);
+            let mut tracker = ReasoningTracker::new(false, None, &[]);
             let cancelled = AtomicBool::new(false);
             let mut step = CancelDuringForwardStep {
                 script: vec![3, 4],
@@ -1670,7 +1667,7 @@ mod run_decode_loop_tests {
     #[test]
     fn stops_on_extra_eos_id_with_finish_reason_stop() {
         let params = greedy_params(|_| {});
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut step = MockStep::new(vec![9], 16);
 
         let out = drive(&mut step, 3, &params, &mut tracker, 10, 7, &[9, 11])
@@ -1685,7 +1682,7 @@ mod run_decode_loop_tests {
     #[test]
     fn extra_eos_stops_on_first_prefill_sampled_token() {
         let params = greedy_params(|_| {});
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut step = MockStep::new(vec![1], 16);
 
         let out = drive(&mut step, 9, &params, &mut tracker, 10, 7, &[9])
@@ -1706,7 +1703,7 @@ mod run_decode_loop_tests {
             (true, vec!["t1", " c3"]),
         ] {
             let params = greedy_params(|_| {});
-            let mut tracker = ReasoningTracker::new(false, None, None);
+            let mut tracker = ReasoningTracker::new(false, None, &[]);
             let mut step = MockStep::new(vec![3, EOS], 7);
             let mut emitter = DefaultStreamEmitter;
 
@@ -1743,7 +1740,7 @@ mod run_decode_loop_tests {
         const EOS: u32 = 5;
         for (eos_before_emit, expected_finish) in [(false, "cancelled"), (true, "stop")] {
             let params = greedy_params(|_| {});
-            let mut tracker = ReasoningTracker::new(false, None, None);
+            let mut tracker = ReasoningTracker::new(false, None, &[]);
             let mut step = MockStep::new(vec![1], 7);
             let mut emitter = DefaultStreamEmitter;
 
@@ -1816,7 +1813,7 @@ mod run_decode_loop_tests {
     #[test]
     fn turn_observer_stops_streaming_before_the_next_forward() {
         let params = greedy_params(|_| {});
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut step = MockStep::new(vec![3, 4], 7);
         let mut emitter = DefaultStreamEmitter;
 
@@ -1843,7 +1840,7 @@ mod run_decode_loop_tests {
     #[test]
     fn turn_observer_stops_synchronous_before_the_next_forward() {
         let params = greedy_params(|_| {});
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut step = MockStep::new(vec![3, 4], 7);
 
         let out = drive_with_observer(
@@ -1873,7 +1870,7 @@ mod run_decode_loop_tests {
         let params = greedy_params(|cfg| {
             cfg.include_reasoning = Some(false);
         });
-        let mut tracker = ReasoningTracker::new(true, None, Some(THINK_END));
+        let mut tracker = ReasoningTracker::new(true, None, &[THINK_END]);
         let mut step = MockStep::new(vec![1, THINK_END, 3, EOS], 7);
         let mut emitter = RecordingEmitter {
             seen: Vec::new(),
@@ -1945,7 +1942,7 @@ mod run_decode_loop_tests {
             cfg.max_consecutive_tokens = Some(0);
             cfg.max_ngram_repeats = Some(0);
         });
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut step = TieStep {
             vocab: 16,
             high_id: HIGH,
@@ -2086,7 +2083,7 @@ mod run_decode_loop_tests {
             stop: &str,
             params: &ChatParams,
         ) -> (Vec<u32>, String, Vec<i32>) {
-            let mut tracker = ReasoningTracker::new(false, None, None);
+            let mut tracker = ReasoningTracker::new(false, None, &[]);
             let mut profiler = DecodeProfiler::new("test", "rng");
             let mut generated = Vec::new();
             let mut history = Vec::new();
@@ -2168,7 +2165,7 @@ mod run_decode_loop_tests {
                 cfg.max_consecutive_tokens = Some(0);
                 cfg.max_ngram_repeats = Some(0);
             });
-            let mut tracker = ReasoningTracker::new(false, None, None);
+            let mut tracker = ReasoningTracker::new(false, None, &[]);
             let mut step = PipelinedMockStep::new(vec![7], 16);
             drive(&mut step, 3, &params, &mut tracker, 3, 15, &[]).unwrap();
             let greedy = crate::sampling::is_greedy_temperature(temperature.unwrap_or(1.0));
@@ -2176,7 +2173,7 @@ mod run_decode_loop_tests {
         }
         let mut params = greedy_params(|_| {});
         params.sampling_config = None;
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut step = PipelinedMockStep::new(vec![7], 16);
         drive(&mut step, 3, &params, &mut tracker, 3, 15, &[]).unwrap();
         assert!(!step.ledger.contains(&"lazy_forward"));
@@ -2191,12 +2188,12 @@ mod run_decode_loop_tests {
     #[test]
     fn pipelined_arm_matches_serial_stream_and_rolls_back_terminal_record() {
         let params = greedy_params(|_| {});
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut baseline = MockStep::new(vec![7], 16);
         let serial = drive(&mut baseline, 3, &params, &mut tracker, 10, 7, &[])
             .unwrap_or_else(|e| panic!("serial loop failed: {}", e.reason));
 
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut step = PipelinedMockStep::new(vec![7], 16);
         let out = drive(&mut step, 3, &params, &mut tracker, 10, 7, &[])
             .unwrap_or_else(|e| panic!("pipelined loop failed: {}", e.reason));
@@ -2234,7 +2231,7 @@ mod run_decode_loop_tests {
             cfg.max_consecutive_tokens = Some(0);
             cfg.max_ngram_repeats = Some(0);
         });
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut step = PipelinedMockStep::new(vec![9], 16);
         let out = drive(&mut step, 1, &params, &mut tracker, 4, 15, &[])
             .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
@@ -2269,7 +2266,7 @@ mod run_decode_loop_tests {
             cfg.max_consecutive_tokens = Some(0);
             cfg.max_ngram_repeats = Some(0);
         });
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut step = PipelinedMockStep::new(vec![3, 4], 16);
         let out = drive(&mut step, 1, &params, &mut tracker, 4, 15, &[])
             .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
@@ -2285,20 +2282,20 @@ mod run_decode_loop_tests {
 
         // The serial `MockStep` drive under identical params produces the
         // identical stream — fallback changes mechanics, not results.
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut baseline = MockStep::new(vec![3, 4], 16);
         let serial = drive(&mut baseline, 1, &params, &mut tracker, 4, 15, &[])
             .unwrap_or_else(|e| panic!("serial loop failed: {}", e.reason));
         assert_eq!(out.generated, serial.generated);
     }
 
-    /// Forced token THROUGH the pipeline: a budget=1 tracker arms the
-    /// think-end force at iteration 0's `observe_token`; iteration 1's
-    /// `enforce_next_token` consumes it and swaps the in-flight sample
-    /// for the forced id BEFORE the gate runs, so the pipelined arm
-    /// still builds that step's forward — and `commit_lazy_token`
-    /// patches the placeholder to the FORCED id, not the discarded
-    /// sample. Stream + records must equal the serial baseline.
+    /// Forced tokens THROUGH the pipeline: a budget=1 tracker starts the
+    /// cut at iteration 0's `observe_token`; iterations 1 and 2 take the
+    /// end's tokens at the loop top and swap the in-flight sample for them
+    /// BEFORE the gate runs (a taken token is in flight, nothing waits to be
+    /// taken), so the pipelined arm still builds those steps' forwards — and
+    /// `commit_lazy_token` patches each placeholder to the FORCED id, not the
+    /// discarded sample. Stream + records must equal the serial baseline.
     #[test]
     fn pipelined_arm_commits_forced_token_through_placeholder() {
         const THINK_END: u32 = 9;
@@ -2306,26 +2303,26 @@ mod run_decode_loop_tests {
             cfg.max_consecutive_tokens = Some(0);
             cfg.max_ngram_repeats = Some(0);
         });
-        let mut tracker = ReasoningTracker::new(true, Some(1), Some(THINK_END));
+        let mut tracker = ReasoningTracker::new(true, Some(1), &[8, THINK_END]);
         let mut step = PipelinedMockStep::new(vec![5], 16);
         let out = drive(&mut step, 4, &params, &mut tracker, 6, 7, &[])
             .unwrap_or_else(|e| panic!("pipelined loop failed: {}", e.reason));
 
         // Serial baseline under an identical tracker.
-        let mut tracker = ReasoningTracker::new(true, Some(1), Some(THINK_END));
+        let mut tracker = ReasoningTracker::new(true, Some(1), &[8, THINK_END]);
         let mut baseline = MockStep::new(vec![5], 16);
         let serial = drive(&mut baseline, 4, &params, &mut tracker, 6, 7, &[])
             .unwrap_or_else(|e| panic!("serial loop failed: {}", e.reason));
 
-        // The forced THINK_END lands at position 1 (budget=0 trips on the
+        // The forced end lands at positions 1, 2 (budget 1 trips on the
         // first observed token) in BOTH drives; the discarded speculative
-        // sample never reaches the output.
-        assert_eq!(serial.generated, vec![4, THINK_END, 5, 5, 5, 5]);
+        // samples never reach the output.
+        assert_eq!(serial.generated, vec![4, 8, THINK_END, 5, 5, 5]);
         assert_eq!(out.generated, serial.generated);
         assert_eq!(out.finish_reason, serial.finish_reason);
-        // Iteration 1 — the enforced step — still runs
-        // lazy_forward -> commit, and its record patches to the FORCED
-        // id (9), proving the placeholder picked up the enforced token.
+        // Iterations 1 and 2 — the enforced steps — still run
+        // lazy_forward -> commit, and their records patch to the FORCED
+        // ids, proving the placeholder picked up the enforced tokens.
         assert_eq!(
             step.ledger,
             vec![
@@ -2343,7 +2340,7 @@ mod run_decode_loop_tests {
         );
         assert_eq!(
             step.records,
-            vec![Some(4), Some(THINK_END), Some(5), Some(5), Some(5)]
+            vec![Some(4), Some(8), Some(THINK_END), Some(5), Some(5)]
         );
     }
 
@@ -2356,7 +2353,7 @@ mod run_decode_loop_tests {
     #[test]
     fn pipelined_spec_err_on_terminal_step_still_stops_cleanly() {
         let params = greedy_params(|_| {});
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         // first_token = EOS: iteration 0 drains a terminal token while its
         // speculative forward fails.
         let mut step = PipelinedMockStep::new(vec![9], 16);
@@ -2376,7 +2373,7 @@ mod run_decode_loop_tests {
     #[test]
     fn pipelined_spec_err_on_nonterminal_step_propagates() {
         let params = greedy_params(|_| {});
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut step = PipelinedMockStep::new(vec![9], 16);
         step.fail_lazy_forward_at = Some(0);
         let result = drive(&mut step, 3, &params, &mut tracker, 5, 7, &[]);

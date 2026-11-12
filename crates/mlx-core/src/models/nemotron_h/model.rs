@@ -2365,7 +2365,7 @@ impl NemotronHInner {
         );
         let mut finish_reason = String::from("length");
         let mut reasoning_tracker =
-            crate::engine::ReasoningTracker::from_setup(&args.thinking, think_end_id);
+            crate::engine::ReasoningTracker::from_setup(&args.thinking, &tokenizer.think_end());
         let extra_eos_ids = ChatBackend::extra_eos_ids(self);
         let eos_before_emit = ChatBackend::eos_before_emit(self);
         let stream_skip_special = ChatBackend::stream_skip_special_tokens(self);
@@ -2664,7 +2664,7 @@ impl NemotronHInner {
         self.pending_mtp_draft_seed = Some((mtp_caches, committed_len));
 
         let mut reasoning_tracker =
-            crate::engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+            crate::engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end());
         let mut rng = rand::rng();
         let outcome = crate::engine::mtp_turn::run_mtp_turn(
             self,

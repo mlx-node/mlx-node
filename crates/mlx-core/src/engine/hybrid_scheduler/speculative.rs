@@ -217,9 +217,9 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             if let Some(budget) = turn.payload.reasoning_tracker.unforced_token_budget() {
                 cap = cap.min(budget.saturating_sub(1));
             }
-            let forced = if turn.payload.reasoning_tracker.force_think_end_pending() {
+            let forced = if let Some(token) = turn.payload.reasoning_tracker.peek_forced_token() {
                 cap = 0;
-                Some(turn.payload.reasoning_tracker.forced_token_id()?)
+                Some(token)
             } else {
                 None
             };
@@ -621,7 +621,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     }
                 };
             if item.forced.is_some() {
-                turn.payload.reasoning_tracker.should_force_think_end();
+                turn.payload.reasoning_tracker.take_forced_token();
             }
             if !item.proposal.draft_ids.is_empty() {
                 turn.payload
@@ -793,7 +793,11 @@ pub(super) mod tests {
             response: ScheduledReply::Sync(reply),
             generated_tokens: Vec::new(),
             finish_reason: "length".into(),
-            reasoning_tracker: engine::penalties::ReasoningTracker::from_setup(&thinking, None),
+            reasoning_tracker: engine::penalties::ReasoningTracker::new(
+                thinking.enabled,
+                thinking.budget,
+                &[],
+            ),
             extra_eos_ids: Vec::new(),
             generation_start: None,
             first_token_instant: None,
@@ -974,6 +978,58 @@ pub(super) mod tests {
         let (cancelled, _) = run_with(seeded_inner(1908).unwrap(), true, true);
         assert_eq!(cancelled[1], spec[1]);
         assert!(cancelled[0].1.len() < spec[0].1.len());
+    }
+
+    /// Two owners cut at a thinking budget of 2 with the end `[13, 14]`; owner
+    /// 42 speculates when `speculate_second`.
+    fn run_ending(speculate_second: bool) -> Vec<(u32, Vec<u32>)> {
+        let mut inner = seeded_tiny_paged_inner_with_draft(1729).unwrap();
+        let mut scheduler = Scheduler::<_, (), ()>::new(2, 12).unwrap();
+        for (seq, prompt, speculate) in [
+            (41, vec![0, 1, 2, 3, 4, 5, 6], false),
+            (42, vec![4, 5, 6, 7, 8, 9, 10, 11, 12], speculate_second),
+        ] {
+            let mut turn = request(
+                &mut inner,
+                seq,
+                prompt,
+                speculate,
+                Arc::new(AtomicBool::new(false)),
+            );
+            turn.payload.reasoning_tracker =
+                engine::penalties::ReasoningTracker::new(true, Some(2), &[13, 14]);
+            scheduler.enqueue_turn(turn).unwrap();
+        }
+        let mut completed = Vec::new();
+        for _ in 0..100 {
+            if let SchedulerAction::Stepped {
+                completed: turns, ..
+            } = scheduler
+                .drive_once(&mut HybridStepExecutor::new(&mut inner))
+                .unwrap()
+            {
+                for turn in turns {
+                    assert!(turn.payload.failure.is_none(), "{:?}", turn.payload.failure);
+                    inner.release_scheduled_speculation(turn.seq_id);
+                    completed.push((turn.seq_id, turn.payload.generated_tokens));
+                }
+            }
+            if completed.len() == 2 {
+                break;
+            }
+        }
+        completed.sort_by_key(|(seq, _)| *seq);
+        completed
+    }
+
+    #[test]
+    fn scheduled_rows_end_thinking_with_the_whole_close() {
+        let ar = run_ending(false);
+        let mixed = run_ending(true);
+        for (seq, generated) in &ar {
+            assert_eq!(&generated[2..4], &[13, 14], "owner {seq}: {generated:?}");
+        }
+        assert_eq!(ar, mixed, "a speculative row commits the end exactly as AR");
     }
 
     #[test]

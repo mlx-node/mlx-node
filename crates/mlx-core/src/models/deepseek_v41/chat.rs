@@ -100,7 +100,7 @@ pub(crate) fn gguf_tokenizer(first: &Path) -> Result<(Qwen3Tokenizer, u32)> {
         .get("tokenizer.ggml.eos_token_id")
         .and_then(GgufMetaValue::as_u32)
         .ok_or_else(|| bad("GGUF lacks tokenizer.ggml.eos_token_id"))?;
-    Ok((Qwen3Tokenizer::from_tokenizer(tok, template), eos))
+    Ok((Qwen3Tokenizer::from_tokenizer(tok, template)?, eos))
 }
 
 /// Admission and bank state as of the last turn edge (host values only).

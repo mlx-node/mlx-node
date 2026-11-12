@@ -1,6 +1,8 @@
 //! Sampling penalties and the reasoning/budget tracker shared by the
 //! decode loops.
 
+use std::sync::Arc;
+
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
@@ -42,72 +44,75 @@ pub(crate) fn apply_all_penalties(
 
 /// Tracks reasoning vs content state during token-by-token generation.
 ///
-/// For Qwen3.5: the template injects `<think>\n` when thinking is enabled.
-/// The model generates thinking tokens, then emits `</think>` (think_end_id),
-/// then generates content. This tracker detects the transition at the TOKEN
-/// level — no text parsing needed during decoding.
+/// The template opens `<think>` when thinking is on; the model thinks, then
+/// emits the close token, then content. When a thinking budget runs out the
+/// turn ends thinking with `end`, the chat template's close (Splash
+/// `ThinkingBudget.end`, e.g. Qwen's `"\n</think>"`), one token per step, so
+/// the next request's re-render of the reply matches the tokens decoded.
+///
+/// An end token is in flight from [`Self::take_forced_token`] until it is
+/// observed, and the next one is handed out only after that (Splash
+/// `commitSelected` advances the end on commit). A loop that picks the next
+/// token before observing the current one and a loop that observes first both
+/// emit the end once, in order.
 pub(crate) struct ReasoningTracker {
     in_thinking: bool,
     thinking_token_count: i32,
     budget: Option<i32>,
-    think_end_id: Option<u32>,
+    /// The tokens a budget ends thinking with, the close token last.
+    end: Arc<[u32]>,
     /// Additional token ids that also END reasoning without being the
-    /// forced/budget tag. K2-Horizon opens one of three `<ifm|think*>`
+    /// budget's close. K2-Horizon opens one of three `<ifm|think*>`
     /// blocks per turn but the model may close with a different member
-    /// of the family — the primary `think_end_id` remains the tag the
-    /// budget forces, while these alternates still flip the boundary.
+    /// of the family.
     extra_think_end_ids: Vec<u32>,
-    force_think_end: bool,
-    /// Set after `should_force_think_end` is consumed, prevents re-triggering
-    /// from subsequent `observe_token` calls before the forced token is extracted.
-    end_scheduled: bool,
+    /// The budget ran out and thinking has not closed yet.
+    cut: bool,
+    /// End tokens handed out, and end tokens observed, since the cut.
+    taken: usize,
+    observed: usize,
 }
 
 impl ReasoningTracker {
-    /// Create a new tracker.
-    ///
-    /// `starts_in_thinking`: true when the template injected `<think>\n` (thinking enabled).
-    /// `budget`: maximum thinking tokens before forcing the close tag. None = unlimited.
-    /// `think_end_id`: the turn's primary reasoning-close token id — `</think>`
-    /// for ChatML families, the effort-matched `</ifm|think*>` for K2-Horizon.
-    pub fn new(starts_in_thinking: bool, budget: Option<i32>, think_end_id: Option<u32>) -> Self {
-        // Budget=0 means "no thinking tokens at all" — force </think> immediately
-        // on the first decode step, before any thinking token is generated.
-        let force_immediately = starts_in_thinking && budget == Some(0) && think_end_id.is_some();
+    fn with_end(
+        starts_in_thinking: bool,
+        budget: Option<i32>,
+        end: Arc<[u32]>,
+        extra_think_end_ids: Vec<u32>,
+    ) -> Self {
+        // Budget 0 ends thinking before any thinking token.
+        let cut = starts_in_thinking && budget == Some(0) && !end.is_empty();
         Self {
             in_thinking: starts_in_thinking,
             thinking_token_count: 0,
             budget,
-            think_end_id,
-            extra_think_end_ids: Vec::new(),
-            force_think_end: force_immediately,
-            end_scheduled: false,
+            end,
+            extra_think_end_ids,
+            cut,
+            taken: 0,
+            observed: 0,
         }
     }
 
-    /// Build a tracker from an already-resolved
-    /// [`crate::engine::backend::ThinkingSetup`]. Equivalent to
-    /// `Self::new(setup.enabled, setup.budget, think_end_id)`; this is the
-    /// ONE construction point the whole-turn cores call, so the
-    /// thinking-mode resolution lives in a single place.
-    pub fn from_setup(
-        setup: &crate::engine::backend::ThinkingSetup,
-        think_end_id: Option<u32>,
-    ) -> Self {
-        Self::new(setup.enabled, setup.budget, think_end_id)
+    /// A tracker over explicit end tokens, for tests.
+    #[cfg(test)]
+    pub(crate) fn new(starts_in_thinking: bool, budget: Option<i32>, end: &[u32]) -> Self {
+        Self::with_end(starts_in_thinking, budget, Arc::from(end), Vec::new())
     }
 
-    /// [`from_setup`] plus alternate close-token ids (K2-Horizon's
-    /// `</ifm|think*>` family): any of them ends reasoning, but only the
-    /// primary `think_end_id` is the budget-forced token.
-    pub fn from_setup_multi(
+    /// The one production construction point: the turn's thinking state and
+    /// its close of thinking (`ChatBackend::think_end_for_turn`, or
+    /// `Qwen3Tokenizer::think_end` where a family core resolves no override).
+    pub(crate) fn from_setup(
         setup: &crate::engine::backend::ThinkingSetup,
-        think_end_id: Option<u32>,
-        extra_think_end_ids: Vec<u32>,
+        close: &crate::engine::backend::ThinkEndResolution,
     ) -> Self {
-        let mut tracker = Self::new(setup.enabled, setup.budget, think_end_id);
-        tracker.extra_think_end_ids = extra_think_end_ids;
-        tracker
+        Self::with_end(
+            setup.enabled,
+            setup.budget,
+            close.thinking_end.clone(),
+            close.think_end_extra_ids.clone(),
+        )
     }
 
     /// Process a generated token. Returns whether this token is reasoning content.
@@ -118,73 +123,79 @@ impl ReasoningTracker {
             return false;
         }
 
-        if self.think_end_id == Some(token_id) || self.extra_think_end_ids.contains(&token_id) {
+        if self.end.last() == Some(&token_id) || self.extra_think_end_ids.contains(&token_id) {
             self.in_thinking = false;
-            self.force_think_end = false;
-            self.end_scheduled = false;
-            return true; // </think> itself is part of reasoning
+            self.cut = false;
+            self.taken = 0;
+            self.observed = 0;
+            return true; // the close itself is part of reasoning
         }
 
         self.thinking_token_count += 1;
-        if let Some(budget) = self.budget
+        if self.cut {
+            if self.observed < self.taken && self.end[self.observed] == token_id {
+                self.observed += 1;
+            } else {
+                debug_assert!(false, "thinking went past its budget");
+            }
+        } else if !self.end.is_empty()
+            && let Some(budget) = self.budget
             && self.thinking_token_count >= budget
-            && !self.end_scheduled
         {
-            self.force_think_end = true;
+            self.cut = true;
         }
         true
     }
 
-    /// Whether the next token should be forced to think_end_id.
-    /// Consumes the flag — returns true at most once per budget trigger.
-    ///
-    /// Check this BEFORE building the next decode step's graph.
-    pub fn should_force_think_end(&mut self) -> bool {
-        if self.force_think_end && self.think_end_id.is_some() {
-            self.force_think_end = false;
-            self.end_scheduled = true;
-            true
+    /// Thinking is being ended: the budget ran out and the close has not been
+    /// observed. No token may be drafted or sampled until it closes.
+    pub(crate) fn ending(&self) -> bool {
+        self.in_thinking && self.cut
+    }
+
+    /// The end token the next step must emit, without taking it. `None` while
+    /// a taken end token is still in flight.
+    pub(crate) fn peek_forced_token(&self) -> Option<u32> {
+        if self.ending() && self.taken == self.observed {
+            self.end.get(self.taken).copied()
         } else {
-            false
+            None
         }
+    }
+
+    /// Take the end token the next step must emit; it is in flight until
+    /// [`Self::observe_token`] sees it.
+    pub(crate) fn take_forced_token(&mut self) -> Option<u32> {
+        let token = self.peek_forced_token()?;
+        self.taken += 1;
+        Some(token)
     }
 
     /// Replace a not-yet-committed sample at the reasoning boundary. Finish its
     /// dependency graph before discarding it so lazy cache writes are retained.
     pub(crate) fn enforce_next_token(&mut self, token: &mut MxArray) -> Result<()> {
-        if self.should_force_think_end() {
+        if let Some(forced) = self.take_forced_token() {
             token.eval();
-            *token = MxArray::from_int32(&[self.forced_token_id()? as i32], &[1])?;
+            *token = MxArray::from_int32(&[forced as i32], &[1])?;
         }
         Ok(())
-    }
-
-    /// Non-consuming peek: whether a think-end force is currently pending.
-    /// Unlike `should_force_think_end`, this does NOT clear the flag or set
-    /// `end_scheduled`, so it is safe to call during routing/defer decisions.
-    /// The single consuming call must remain at the actual token-insertion site.
-    pub fn force_think_end_pending(&self) -> bool {
-        self.force_think_end && self.think_end_id.is_some()
-    }
-
-    /// The think_end token ID to force. Only valid when `should_force_think_end()` returned true.
-    pub fn forced_token_id(&self) -> Result<u32> {
-        self.think_end_id.ok_or_else(|| {
-            napi::Error::from_reason("should_force_think_end was true but think_end_id is None")
-        })
     }
 
     /// Largest unforced output prefix whose tokens can be emitted before the
     /// budget requires a forced end token. A speculative cycle cannot cross it.
     pub(crate) fn unforced_token_budget(&self) -> Option<usize> {
-        if !self.in_thinking || self.think_end_id.is_none() || self.end_scheduled {
+        if !self.in_thinking || self.end.is_empty() {
             return None;
+        }
+        if self.cut {
+            return Some(0);
         }
         self.budget
             .map(|budget| budget.saturating_sub(self.thinking_token_count).max(0) as usize)
     }
 
-    /// Number of tokens generated during reasoning (inside <think>...</think>).
+    /// Number of tokens generated during reasoning before the close, the end
+    /// tokens a cut forces included (Splash `count_reasoning_tokens`).
     pub fn reasoning_token_count(&self) -> u32 {
         self.thinking_token_count.max(0) as u32
     }
@@ -198,15 +209,15 @@ mod tests {
 
     #[test]
     fn test_tracker_starts_in_thinking() {
-        let mut tracker = ReasoningTracker::new(true, None, Some(THINK_END_ID));
+        let mut tracker = ReasoningTracker::new(true, None, &[THINK_END_ID]);
         assert!(tracker.observe_token(100)); // reasoning
         assert!(tracker.observe_token(200)); // reasoning
-        assert!(!tracker.should_force_think_end());
+        assert!(!tracker.take_forced_token().is_some());
     }
 
     #[test]
     fn test_tracker_transitions_on_think_end() {
-        let mut tracker = ReasoningTracker::new(true, None, Some(THINK_END_ID));
+        let mut tracker = ReasoningTracker::new(true, None, &[THINK_END_ID]);
         assert!(tracker.observe_token(100)); // reasoning
         assert!(tracker.observe_token(THINK_END_ID)); // </think> is still reasoning
         assert!(!tracker.observe_token(300)); // now content
@@ -227,7 +238,7 @@ mod tests {
         // include_reasoning == false: suppress the 3 reasoning tokens
         // (including the </think> closer), emit the 2 content tokens.
         {
-            let mut tracker = ReasoningTracker::new(true, None, Some(THINK_END_ID));
+            let mut tracker = ReasoningTracker::new(true, None, &[THINK_END_ID]);
             let include_reasoning = false;
             let gate: Vec<bool> = seq
                 .iter()
@@ -241,7 +252,7 @@ mod tests {
 
         // include_reasoning == true: emit everything.
         {
-            let mut tracker = ReasoningTracker::new(true, None, Some(THINK_END_ID));
+            let mut tracker = ReasoningTracker::new(true, None, &[THINK_END_ID]);
             let include_reasoning = true;
             let gate: Vec<bool> = seq
                 .iter()
@@ -256,101 +267,88 @@ mod tests {
 
     #[test]
     fn test_tracker_starts_in_content() {
-        let mut tracker = ReasoningTracker::new(false, None, Some(THINK_END_ID));
+        let mut tracker = ReasoningTracker::new(false, None, &[THINK_END_ID]);
         assert!(!tracker.observe_token(100));
         assert!(!tracker.observe_token(200));
-        assert!(!tracker.should_force_think_end());
+        assert!(!tracker.take_forced_token().is_some());
     }
 
     #[test]
     fn test_tracker_budget_enforcement() {
         // Budget=3: allows exactly 3 thinking tokens, then forces on the 3rd.
-        let mut tracker = ReasoningTracker::new(true, Some(3), Some(THINK_END_ID));
+        let mut tracker = ReasoningTracker::new(true, Some(3), &[THINK_END_ID]);
         assert!(tracker.observe_token(100)); // count→1
-        assert!(!tracker.should_force_think_end());
+        assert!(!tracker.take_forced_token().is_some());
         assert!(tracker.observe_token(200)); // count→2
-        assert!(!tracker.should_force_think_end());
+        assert!(!tracker.take_forced_token().is_some());
         assert!(tracker.observe_token(300)); // count→3, 3>=3 → force!
-        assert!(tracker.should_force_think_end());
-        assert_eq!(tracker.forced_token_id().unwrap(), THINK_END_ID);
+        assert_eq!(tracker.take_forced_token(), Some(THINK_END_ID));
     }
 
     #[test]
     fn test_tracker_budget_zero() {
         // Budget=0: force is set in new() — triggers BEFORE any thinking token.
-        let mut tracker = ReasoningTracker::new(true, Some(0), Some(THINK_END_ID));
-        assert!(tracker.should_force_think_end()); // immediate, no observe needed
+        let mut tracker = ReasoningTracker::new(true, Some(0), &[THINK_END_ID]);
+        assert!(tracker.take_forced_token().is_some()); // immediate, no observe needed
     }
 
     #[test]
     fn test_tracker_budget_zero_vs_one() {
         // Budget=0: force immediately (0 thinking tokens allowed).
-        let mut t0 = ReasoningTracker::new(true, Some(0), Some(THINK_END_ID));
-        assert!(t0.should_force_think_end()); // before any observe
+        let mut t0 = ReasoningTracker::new(true, Some(0), &[THINK_END_ID]);
+        assert!(t0.take_forced_token().is_some()); // before any observe
 
         // Budget=1: allows exactly 1 thinking token before forcing.
-        let mut t1 = ReasoningTracker::new(true, Some(1), Some(THINK_END_ID));
-        assert!(!t1.should_force_think_end()); // not yet
+        let mut t1 = ReasoningTracker::new(true, Some(1), &[THINK_END_ID]);
+        assert!(!t1.take_forced_token().is_some()); // not yet
         assert!(t1.observe_token(100)); // count→1, 1>=1 → force!
-        assert!(t1.should_force_think_end()); // triggers after 1st token
+        assert!(t1.take_forced_token().is_some()); // triggers after 1st token
     }
 
     #[test]
     fn test_tracker_budget_clears_on_think_end() {
-        let mut tracker = ReasoningTracker::new(true, Some(2), Some(THINK_END_ID));
+        let mut tracker = ReasoningTracker::new(true, Some(2), &[THINK_END_ID]);
         assert!(tracker.observe_token(100)); // count→1
-        assert!(!tracker.should_force_think_end());
+        assert!(!tracker.take_forced_token().is_some());
         assert!(tracker.observe_token(200)); // count→2, 2>=2 → force!
-        assert!(tracker.should_force_think_end());
+        assert!(tracker.take_forced_token().is_some());
         // When the forced think_end token is generated:
         assert!(tracker.observe_token(THINK_END_ID)); // transitions to content
-        assert!(!tracker.should_force_think_end()); // force cleared
+        assert!(!tracker.take_forced_token().is_some()); // force cleared
         assert!(!tracker.observe_token(300)); // now content
     }
 
     #[test]
     fn test_tracker_no_double_force_with_pipeline_lag() {
-        // Simulates pipelined decode: after should_force_think_end() is consumed,
-        // the pipeline extracts an over-budget token before the forced </think>
-        // arrives. The tracker must NOT re-trigger forcing.
-        let mut tracker = ReasoningTracker::new(true, Some(3), Some(THINK_END_ID));
-        tracker.observe_token(100); // count→1
-        tracker.observe_token(200); // count→2
-        tracker.observe_token(300); // count→3, 3>=3 → force=true
-
-        // Phase A of step N+1: consume the force flag
-        assert!(tracker.should_force_think_end()); // returns true, sets end_scheduled
-        assert!(!tracker.should_force_think_end()); // already consumed — must be false
-
-        // Phase B of step N+1: the pipeline extracts the over-budget token (not </think>)
-        assert!(tracker.observe_token(400)); // still reasoning, count→4
-        // Must NOT re-trigger forcing despite count(4) >= budget(3)
-        assert!(!tracker.should_force_think_end());
-
-        // Phase B of step N+2: the forced </think> token is finally extracted
-        assert!(tracker.observe_token(THINK_END_ID)); // transitions to content
-        assert!(!tracker.should_force_think_end());
-
-        // Phase B of step N+3: normal content token
+        // A forced token is in flight from take until observed: a second take
+        // before the observe hands nothing.
+        let mut tracker = ReasoningTracker::new(true, Some(3), &[THINK_END_ID]);
+        tracker.observe_token(100);
+        tracker.observe_token(200);
+        tracker.observe_token(300); // count 3 = budget: the cut starts
+        assert_eq!(tracker.take_forced_token(), Some(THINK_END_ID));
+        assert_eq!(tracker.take_forced_token(), None);
+        assert!(tracker.observe_token(THINK_END_ID)); // closes
+        assert_eq!(tracker.take_forced_token(), None);
         assert!(!tracker.observe_token(500)); // content
     }
 
     #[test]
     fn test_tracker_no_budget() {
-        let mut tracker = ReasoningTracker::new(true, None, Some(THINK_END_ID));
+        let mut tracker = ReasoningTracker::new(true, None, &[THINK_END_ID]);
         for i in 0..1000 {
             assert!(tracker.observe_token(i));
-            assert!(!tracker.should_force_think_end());
+            assert!(!tracker.take_forced_token().is_some());
         }
     }
 
     #[test]
     fn test_tracker_no_think_end_id() {
-        let mut tracker = ReasoningTracker::new(true, Some(5), None);
-        // Without think_end_id, should_force_think_end is always false
+        let mut tracker = ReasoningTracker::new(true, Some(5), &[]);
+        // Without a close token nothing is ever forced
         for i in 0..100 {
             tracker.observe_token(i);
-            assert!(!tracker.should_force_think_end());
+            assert!(!tracker.take_forced_token().is_some());
         }
     }
 
@@ -360,59 +358,84 @@ mod tests {
         // renders </think> as multiple tokens), observe_token should still
         // return true (reasoning) for every token — consistent with the
         // text-level finalization that will find reasoning via parsing.
-        let mut tracker = ReasoningTracker::new(true, None, None);
+        let mut tracker = ReasoningTracker::new(true, None, &[]);
         assert!(tracker.observe_token(100)); // reasoning
         assert!(tracker.observe_token(200)); // reasoning
         assert!(tracker.observe_token(300)); // reasoning
         // Never transitions — no think_end_id to match
-        assert!(!tracker.should_force_think_end()); // budget disabled
+        assert!(!tracker.take_forced_token().is_some()); // budget disabled
     }
 
     #[test]
-    fn test_force_think_end_pending_is_non_consuming() {
-        // The non-consuming peek used by the MTP routing/defer decisions
-        // must report a pending force WITHOUT clearing it. Repeated peeks
-        // stay true; only the single consuming call clears it.
-        let mut tracker = ReasoningTracker::new(true, Some(2), Some(THINK_END_ID));
-        assert!(tracker.observe_token(100)); // count→1
-        assert!(!tracker.force_think_end_pending()); // not yet tripped
-        assert!(tracker.observe_token(200)); // count→2, 2>=2 → force=true
-
-        // Peek repeatedly — must stay true, never consuming.
-        assert!(tracker.force_think_end_pending());
-        assert!(tracker.force_think_end_pending());
-        assert!(tracker.force_think_end_pending());
-
-        // The single consuming call returns true exactly once and clears.
-        assert!(tracker.should_force_think_end());
-        assert!(!tracker.should_force_think_end()); // consumed
-        assert!(!tracker.force_think_end_pending()); // peek now reflects cleared flag
-    }
-
-    #[test]
-    fn test_force_think_end_pending_mirrors_chained_routing() {
-        // Mirrors the chained-ON MTP path: the budget trips, the routing
-        // peek (`do_step_a`) and the defer guard both poll the NON-consuming
-        // predicate (possibly many times across cycles), and only the single
-        // token-insertion site consumes + forces exactly once.
-        let mut tracker = ReasoningTracker::new(true, Some(1), Some(THINK_END_ID));
-        assert!(tracker.observe_token(100)); // count→1, 1>=1 → force=true
-
-        // Routing peek for cycle N (do_step_a), then a defer-guard peek, then
-        // routing peek for cycle N+1 — all non-consuming, all stay true.
-        for _ in 0..5 {
-            assert!(
-                tracker.force_think_end_pending(),
-                "peek must remain true until the single consume fires"
-            );
+    fn test_peek_forced_token_is_non_consuming() {
+        let mut tracker = ReasoningTracker::new(true, Some(2), &[THINK_END_ID]);
+        assert!(tracker.observe_token(100));
+        assert_eq!(tracker.peek_forced_token(), None);
+        assert!(!tracker.ending());
+        assert!(tracker.observe_token(200)); // the cut starts
+        for _ in 0..3 {
+            assert_eq!(tracker.peek_forced_token(), Some(THINK_END_ID));
+            assert!(tracker.ending());
         }
+        assert_eq!(tracker.take_forced_token(), Some(THINK_END_ID));
+        assert_eq!(tracker.peek_forced_token(), None); // in flight
+        assert!(tracker.ending()); // until the close is observed
+    }
 
-        // Step A's token-insertion site consumes and forces exactly once.
-        assert!(tracker.should_force_think_end());
-        assert_eq!(tracker.forced_token_id().unwrap(), THINK_END_ID);
+    #[test]
+    fn tracker_without_a_close_never_cuts() {
+        let mut tracker = ReasoningTracker::new(true, Some(1), &[]);
+        for i in 0..4 {
+            tracker.observe_token(i);
+            assert!(!tracker.ending());
+            assert_eq!(tracker.unforced_token_budget(), None);
+            assert_eq!(tracker.take_forced_token(), None);
+        }
+        let zero = ReasoningTracker::new(true, Some(0), &[]);
+        assert!(!zero.ending());
+    }
 
-        // After the consume, no further force fires from peeks or consumes.
-        assert!(!tracker.force_think_end_pending());
-        assert!(!tracker.should_force_think_end());
+    #[test]
+    fn tracker_ends_thinking_with_the_whole_close() {
+        // Budget 2, end "\n</think>" = [8, 9].
+        let mut tracker = ReasoningTracker::new(true, Some(2), &[8, 9]);
+        assert_eq!(tracker.unforced_token_budget(), Some(2));
+        assert!(tracker.observe_token(100));
+        assert_eq!(tracker.unforced_token_budget(), Some(1));
+        assert!(tracker.observe_token(101)); // the cut starts
+        assert!(tracker.ending());
+        assert_eq!(tracker.unforced_token_budget(), Some(0));
+        assert_eq!(tracker.take_forced_token(), Some(8));
+        // 8 is in flight: a loop that takes again before observing gets nothing.
+        assert_eq!(tracker.take_forced_token(), None);
+        assert!(tracker.observe_token(8));
+        // Between the end's tokens nothing may be drafted.
+        assert!(tracker.ending());
+        assert_eq!(tracker.unforced_token_budget(), Some(0));
+        assert_eq!(tracker.take_forced_token(), Some(9));
+        assert!(tracker.observe_token(9)); // the close is reasoning
+        assert!(!tracker.ending());
+        assert_eq!(tracker.unforced_token_budget(), None);
+        assert_eq!(tracker.take_forced_token(), None);
+        assert!(!tracker.observe_token(5));
+        // Splash count_reasoning_tokens: budget + len(end) - 1.
+        assert_eq!(tracker.reasoning_token_count(), 3);
+
+        // Budget 0: the first token is the end's first.
+        let mut zero = ReasoningTracker::new(true, Some(0), &[8, 9]);
+        assert_eq!(zero.take_forced_token(), Some(8));
+        assert_eq!(zero.take_forced_token(), None);
+        zero.observe_token(8);
+        assert_eq!(zero.take_forced_token(), Some(9));
+        zero.observe_token(9);
+        assert_eq!(zero.reasoning_token_count(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "thinking went past its budget")]
+    fn a_token_past_the_budget_is_a_defect() {
+        let mut tracker = ReasoningTracker::new(true, Some(1), &[8, 9]);
+        tracker.observe_token(100); // the cut starts
+        tracker.observe_token(101); // not the end: Splash commitSelected throws
     }
 }

@@ -1094,10 +1094,13 @@ impl QianfanOCRInner {
             let mut generated_tokens: Vec<u32> =
                 Vec::with_capacity(crate::engine::generated_capacity_hint(max_new_tokens));
             let mut finish_reason = "length".to_string();
-            let mut reasoning_tracker = crate::engine::ReasoningTracker::new(
-                thinking_enabled,
-                config.thinking_token_budget,
-                self.tokenizer.think_end_id(),
+            // This loop forces no end token, so its tracker carries no budget.
+            let mut reasoning_tracker = crate::engine::ReasoningTracker::from_setup(
+                &crate::engine::backend::ThinkingSetup {
+                    enabled: thinking_enabled,
+                    budget: None,
+                },
+                &self.tokenizer.think_end(),
             );
 
             // Stateful decoder for correct multi-byte/CJK streaming

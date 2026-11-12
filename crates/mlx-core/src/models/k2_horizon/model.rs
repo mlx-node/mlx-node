@@ -1186,9 +1186,11 @@ impl ChatBackend for K2Inner {
             .filter(|t| **t != tag)
             .filter_map(|t| tok.token_to_id(t.to_string()))
             .collect();
+        let think_end_id = tok.token_to_id(tag.to_string());
         ThinkEndResolution {
-            think_end_id: tok.token_to_id(tag.to_string()),
+            think_end_id,
             think_end_str: Some(tag.to_string()),
+            thinking_end: think_end_id.map_or_else(|| Arc::from([]), |id| Arc::from([id])),
             think_end_extra_ids,
         }
     }

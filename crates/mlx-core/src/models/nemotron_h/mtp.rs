@@ -420,9 +420,7 @@ mod mtp_turn_tests {
     use super::NemotronHMtpModule;
     use crate::array::MxArray;
     use crate::decode_profiler::DecodeProfiler;
-    use crate::engine::backend::{
-        ChatBackend, MtpBackend, MtpStepper, MtpTurnSetup, ThinkingSetup,
-    };
+    use crate::engine::backend::{ChatBackend, MtpBackend, MtpStepper, MtpTurnSetup};
     use crate::engine::mtp_turn::{MtpTurnArgs, run_mtp_turn, turn_lookahead_rows};
     use crate::engine::params::extract_chat_params;
     use crate::engine::penalties::ReasoningTracker;
@@ -666,13 +664,7 @@ mod mtp_turn_tests {
             let y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("prefill + seed");
             let mut profiler = DecodeProfiler::new("nemotron_mtp_test", "nemotron_h");
             profiler.set_prompt_tokens(prompt.len() as u32);
-            let mut tracker = ReasoningTracker::from_setup(
-                &ThinkingSetup {
-                    enabled: false,
-                    budget: None,
-                },
-                None,
-            );
+            let mut tracker = ReasoningTracker::new(false, None, &[]);
             let mut generated: Vec<u32> = Vec::new();
             let mut hist: Vec<u32> = Vec::new();
             let mut finish = String::new();
@@ -1503,13 +1495,7 @@ mod mtp_turn_tests {
         let p = extract_chat_params(&chat_cfg);
         let y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("prefill + seed");
         let mut profiler = DecodeProfiler::new("nemotron_real_mtp_diag", "nemotron_h");
-        let mut tracker = ReasoningTracker::from_setup(
-            &ThinkingSetup {
-                enabled: false,
-                budget: None,
-            },
-            None,
-        );
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut generated: Vec<u32> = Vec::new();
         let mut hist: Vec<u32> = Vec::new();
         let mut finish = String::new();

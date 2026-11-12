@@ -318,7 +318,8 @@ impl Qwen35MoeInner {
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
 
-        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+        let mut reasoning_tracker =
+            engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end());
 
         // Whether the final committed token reached the physical KV/GDN cache;
         // written by the decode driver so the save below drops it when it was
@@ -501,7 +502,8 @@ impl Qwen35MoeInner {
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let thinking_enabled = thinking.enabled;
-        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+        let mut reasoning_tracker =
+            engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end());
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -723,8 +725,8 @@ impl Qwen35MoeInner {
                     logits.squeeze(Some(&[1]))?
                 };
 
-                if reasoning_tracker.should_force_think_end() {
-                    let forced_id = reasoning_tracker.forced_token_id()? as i32;
+                if let Some(forced_id) = reasoning_tracker.take_forced_token() {
+                    let forced_id = forced_id as i32;
                     y = MxArray::from_int32(&[forced_id], &[1])?;
                     y.eval();
                     continue;
@@ -870,7 +872,8 @@ impl Qwen35MoeInner {
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let thinking_enabled = thinking.enabled;
-        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+        let mut reasoning_tracker =
+            engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end());
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -1129,8 +1132,8 @@ impl Qwen35MoeInner {
                     logits.squeeze(Some(&[1]))?
                 };
 
-                if reasoning_tracker.should_force_think_end() {
-                    let forced_id = reasoning_tracker.forced_token_id()? as i32;
+                if let Some(forced_id) = reasoning_tracker.take_forced_token() {
+                    let forced_id = forced_id as i32;
                     y = MxArray::from_int32(&[forced_id], &[1])?;
                     y.eval();
                     continue;

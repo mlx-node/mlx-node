@@ -90,7 +90,7 @@ fn tokenizer(parts: &[P<'_>]) -> Qwen3Tokenizer {
         "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"}
     });
     let tok = tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&spec).unwrap()).unwrap();
-    Qwen3Tokenizer::from_tokenizer(tok, Some(TEMPLATE.to_string()))
+    Qwen3Tokenizer::from_tokenizer(tok, Some(TEMPLATE.to_string())).unwrap()
 }
 
 fn ids(tok: &Qwen3Tokenizer, parts: &[P<'_>]) -> Vec<u32> {

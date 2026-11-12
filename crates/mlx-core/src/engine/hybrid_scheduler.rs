@@ -1456,11 +1456,8 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         turn: &mut TurnState<ScheduledTurn<B::PrefixState>>,
         mut logits: MxArray,
     ) -> Result<engine::batch_sampling::PendingSample> {
-        let sampled = if turn.payload.reasoning_tracker.should_force_think_end() {
-            MxArray::from_int32(
-                &[turn.payload.reasoning_tracker.forced_token_id()? as i32],
-                &[1],
-            )?
+        let sampled = if let Some(forced) = turn.payload.reasoning_tracker.take_forced_token() {
+            MxArray::from_int32(&[forced as i32], &[1])?
         } else {
             turn.payload.profiler.begin("rep_penalty");
             logits = engine::penalties::apply_all_penalties(
@@ -1638,7 +1635,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     })?;
                 Ok((
                     &turn.payload.params,
-                    turn.payload.reasoning_tracker.force_think_end_pending(),
+                    turn.payload.reasoning_tracker.ending(),
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -3605,10 +3602,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             response,
             generated_tokens: Vec::new(),
             finish_reason: String::from("length"),
-            reasoning_tracker: engine::penalties::ReasoningTracker::from_setup_multi(
+            reasoning_tracker: engine::penalties::ReasoningTracker::from_setup(
                 &admitted.thinking,
-                admitted.think_end_id,
-                admitted.think_end_extra_ids,
+                &admitted.close,
             ),
             extra_eos_ids: self.inner.extra_eos_ids(),
             generation_start,

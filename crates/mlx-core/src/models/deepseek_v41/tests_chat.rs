@@ -34,7 +34,7 @@ fn tiny_inner() -> super::chat::Inner {
     let g = parse_gguf(&path).unwrap();
     let json = embedded_gpt2_tokenizer_json(&g.metadata).unwrap().unwrap();
     let tok = tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&json).unwrap()).unwrap();
-    let tok = crate::tokenizer::Qwen3Tokenizer::from_tokenizer(tok, Some(chat_template_fixture()));
+    let tok = crate::tokenizer::Qwen3Tokenizer::from_tokenizer(tok, Some(chat_template_fixture())).unwrap();
     let mut inner = super::chat::Inner::new(store, tok, 1, Default::default());
     inner.probe = Some((Vec::new(), Vec::new()));
     inner

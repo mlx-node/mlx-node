@@ -650,8 +650,8 @@ macro_rules! decode_loop {
                 $profiler.end();
 
                 let (next_token, budget_forced) =
-                    if $tracker.should_force_think_end() {
-                        let forced_id = $tracker.forced_token_id()? as i32;
+                    if let Some(forced_id) = $tracker.take_forced_token() {
+                        let forced_id = forced_id as i32;
                         ($crate::array::MxArray::from_int32(&[forced_id], &[1])?, true)
                     } else {
                         $profiler.begin("rep_penalty");
@@ -1046,7 +1046,7 @@ mod decode_loop_sync_cancel_tests {
             &[vocab, 1],
         )?)?;
         let p = greedy_params(max_new_tokens);
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
         let mut profiler = crate::decode_profiler::DecodeProfiler::new("decode_loop_test", "test");
         let mut generated: Vec<u32> = Vec::new();
         let mut hist: Vec<u32> = Vec::new();
@@ -1096,6 +1096,59 @@ mod decode_loop_sync_cancel_tests {
             1,
             "exactly the pipelined step-0 forward ran before the poll broke the loop"
         );
+        Ok(())
+    }
+
+    /// A budget cut in the pipelined AR `decode_loop!` emits the template's
+    /// whole close, one token per step, each once.
+    #[test]
+    fn decode_loop_ends_thinking_with_the_whole_close() -> Result<()> {
+        let vocab: i64 = 8;
+        let max_new_tokens: i32 = 8;
+        let mut ops = DecodeOps {
+            forward: |_ids: &MxArray, _emb: &Embedding| -> Result<(MxArray, bool)> {
+                Ok((logits_row(vocab, 6)?, false))
+            },
+            eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
+        };
+        let mut y = MxArray::from_int32(&[3], &[1])?;
+        let embedding = Embedding::from_weight(&MxArray::from_float32(
+            &vec![0.0f32; vocab as usize],
+            &[vocab, 1],
+        )?)?;
+        let p = greedy_params(max_new_tokens);
+        // Budget 2, end "\n</think>" = [4, 5].
+        let mut tracker = ReasoningTracker::new(true, Some(2), &[4, 5]);
+        let mut profiler = crate::decode_profiler::DecodeProfiler::new("decode_loop_test", "test");
+        let mut generated: Vec<u32> = Vec::new();
+        let mut hist: Vec<u32> = Vec::new();
+        let mut finish_reason = String::from("length");
+        let mut last_in_cache = true;
+        let mut first_tok: Option<std::time::Instant> = None;
+        let generation_stream = Stream::generation();
+
+        decode_loop!(
+            ops: ops,
+            y: y,
+            embedding_weight: embedding,
+            params: p,
+            reasoning_tracker: tracker,
+            profiler: profiler,
+            max_new_tokens: max_new_tokens,
+            eos_id: 7,
+            generated_tokens: generated,
+            token_history: hist,
+            finish_reason: finish_reason,
+            last_in_cache: last_in_cache,
+            first_token_instant: first_tok,
+            report_perf: false,
+            generation_stream: generation_stream
+        );
+        let _ = (y, last_in_cache);
+
+        assert_eq!(finish_reason, "length");
+        assert_eq!(generated, vec![3, 6, 4, 5, 6, 6, 6, 6]);
+        assert_eq!(tracker.reasoning_token_count(), 3);
         Ok(())
     }
 }

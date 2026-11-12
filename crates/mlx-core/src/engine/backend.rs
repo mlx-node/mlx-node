@@ -474,8 +474,8 @@ pub(crate) struct FinalizeArgs<'a> {
 /// Resolved thinking-mode state for one turn.
 ///
 /// Produced by [`ChatBackend::thinking_setup`]; feeds
-/// `ReasoningTracker::from_setup_multi(&setup, think_end_id, extra_ids)`
-/// at the tracker construction sites. `Copy` so it
+/// `ReasoningTracker::from_setup(&setup, &close)` at the tracker
+/// construction sites. `Copy` so it
 /// threads by value into [`WholeTurnArgs`] and the per-family
 /// whole-turn cores without clone churn.
 #[derive(Clone, Copy)]
@@ -494,12 +494,16 @@ pub(crate) struct ThinkingSetup {
 
 /// Per-turn reasoning-close resolution from
 /// [`ChatBackend::think_end_for_turn`].
+#[derive(Clone)]
 pub(crate) struct ThinkEndResolution {
-    /// Primary close token id — the one the thinking budget forces and
-    /// the default finalization path's boundary check uses.
+    /// Primary close token id: the last of `thinking_end`, and the one the
+    /// default finalization path's boundary check uses.
     pub think_end_id: Option<u32>,
     /// Its tag string, used for the text-level split at finalize.
     pub think_end_str: Option<String>,
+    /// The tokens a thinking budget ends thinking with, `think_end_id` last
+    /// (Splash `ThinkingBudget.end`); empty without a close token.
+    pub thinking_end: Arc<[u32]>,
     /// ADDITIONAL token ids that also end reasoning without being the
     /// budget-forced tag: K2's model may close a `<ifm|think_faster>`
     /// block with a literal `</ifm|think>`, so the tracker must accept
@@ -649,7 +653,7 @@ pub(crate) struct WholeTurnArgs<'a> {
     /// Turn's resolved thinking-mode state:
     /// `backend.thinking_setup(&config)` computed ONCE at turn entry. The
     /// specialized executors (paged/speculative/multimodal) build their
-    /// `ReasoningTracker` from this via `ReasoningTracker::from_setup_multi`
+    /// `ReasoningTracker` from this via `ReasoningTracker::from_setup`
     /// instead of recomputing `resolve_enable_thinking` inline.
     pub thinking: ThinkingSetup,
     /// Request-time feature plan resolved once from the model's immutable
@@ -768,11 +772,7 @@ pub(crate) trait ChatBackend {
     /// `(config, tokenizer)`: same inputs ⇒ same resolution, no side
     /// effects.
     fn think_end_for_turn(&self, _config: &ChatConfig, tok: &Qwen3Tokenizer) -> ThinkEndResolution {
-        ThinkEndResolution {
-            think_end_id: tok.think_end_id(),
-            think_end_str: tok.think_end_str().map(str::to_string),
-            think_end_extra_ids: Vec::new(),
-        }
+        tok.think_end()
     }
 
     /// Resolve the turn's [`ChatParams`] — sampling configuration,

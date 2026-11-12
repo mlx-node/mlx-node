@@ -263,7 +263,8 @@ impl Qwen35MoeInner {
         MxArray::async_eval_arrays(&[&y]);
 
         let starts_in_thinking = thinking.enabled;
-        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+        let mut reasoning_tracker =
+            engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end());
 
         // Whether the final committed token reached the physical KV/GDN cache;
         // written by the decode driver so the save below drops it when it was
@@ -645,7 +646,8 @@ impl Qwen35MoeInner {
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
 
-        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+        let mut reasoning_tracker =
+            engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end());
 
         // Whether the final committed token reached the physical KV/GDN cache;
         // written by the decode driver so the save below drops it when it was
@@ -945,7 +947,8 @@ impl Qwen35MoeInner {
         MxArray::async_eval_arrays(&[&y]);
 
         let starts_in_thinking = thinking.enabled;
-        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+        let mut reasoning_tracker =
+            engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end());
 
         // Whether the final committed token reached the physical KV/GDN cache;
         // written by the decode driver so the save below drops it when it was
