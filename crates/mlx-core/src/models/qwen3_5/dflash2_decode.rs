@@ -3019,6 +3019,40 @@ mod paged_dflash2_tests {
         Ok(())
     }
 
+    /// A one-chunk DFlash2 prefill with no capture leaves its ring and
+    /// window lazy; the idle lane keeps them materialized, so a restore's
+    /// claim credits only storage that exists (Splash
+    /// `QwenStateStorage::releaseLane` pools allocated rings).
+    /// Mutations IR1 (the idle ring is kept lazy) and IR2 (the idle window
+    /// is) → red.
+    #[test]
+    fn the_idle_lane_holds_materialized_buffers() -> Result<()> {
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let prompt = prompt(40);
+        let mut inner = tiny_paged_int8_dflash_inner(0x5_8245);
+        let prefix = inner.prime_dspark_prefix_state(&prompt, false, 0)?;
+        inner
+            .paged_prefill_with_draft_state(&prompt, &prefix, stream)?
+            .eval();
+        inner.abort_paged_turn();
+        let ready = |a: &&MxArray| unsafe { mlx_sys::mlx_array_is_available(a.as_raw_ptr()) };
+        let idle = &inner.dflash2_states.idle_lane;
+        let mut ring = Vec::new();
+        idle.ring
+            .as_ref()
+            .expect("idle ring")
+            .collect_arrays(&mut ring);
+        assert!(!ring.is_empty() && ring.iter().all(ready), "lazy idle ring");
+        let mut window = Vec::new();
+        idle.window
+            .as_ref()
+            .expect("idle window")
+            .collect_arrays(&mut window);
+        assert!(window.iter().all(ready), "lazy idle window");
+        Ok(())
+    }
+
     /// A DFlash2 turn without cache reuse plans no point yet still has its
     /// turn state, so its end releases the lane: its prefill publishes
     /// nothing.

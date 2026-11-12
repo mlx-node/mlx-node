@@ -170,10 +170,12 @@ impl DraftContextWindow {
         MxArray::from_bfloat16(&values, &[i64::from(n), i64::from(self.width)])
     }
 
-    /// An evaluated copy: later stores to either never reach the other.
+    /// An evaluated copy: later stores to either never reach the other. A
+    /// failed copy is an error, never a state (Splash
+    /// `NativeRuntime::executionFailed` publishes nothing).
     pub(crate) fn snapshot(&self) -> Result<Self> {
         let buffer = self.buffer.deep_copy()?;
-        buffer.eval();
+        MxArray::eval_arrays_with_context(&[&buffer], "draft_context_snapshot")?;
         Ok(Self {
             buffer,
             width: self.width,
@@ -184,14 +186,15 @@ impl DraftContextWindow {
     }
 
     /// Takes `other`'s rows by an in-place copy into this window's buffer
-    /// (Splash's restore writes into the lane's window).
+    /// (Splash's restore writes into the lane's window). The bounds move
+    /// only after the copy ran.
     pub(crate) fn copy_from(&mut self, other: &Self) -> Result<()> {
         if other.width != self.width || other.slots != self.slots {
             return Err(Error::from_reason(
                 "draft context windows of different geometry",
             ));
         }
-        if unsafe { sys::mlx_metal_is_available() } {
+        let copied = if unsafe { sys::mlx_metal_is_available() } {
             let mut out = std::ptr::null_mut();
             // SAFETY: both handles are live for the call; `out` receives an
             // owned handle aliasing this window's buffer, or stays null.
@@ -205,11 +208,12 @@ impl DraftContextWindow {
             if !ok {
                 return Err(Error::from_reason("draft context copy contract failed"));
             }
-            self.buffer = MxArray::from_handle(out, "draft_context_copy")?;
+            MxArray::from_handle(out, "draft_context_copy")?
         } else {
-            self.buffer = other.buffer.deep_copy()?;
-        }
-        self.buffer.eval();
+            other.buffer.deep_copy()?
+        };
+        MxArray::eval_arrays_with_context(&[&copied], "draft_context_copy")?;
+        self.buffer = copied;
         self.begin = other.begin;
         self.end = other.end;
         Ok(())
@@ -217,6 +221,11 @@ impl DraftContextWindow {
 
     pub(crate) fn nbytes(&self) -> u64 {
         Self::bytes(self.width, self.slots)
+    }
+
+    /// Materializes the buffer, so its bytes are real storage.
+    pub(crate) fn eval(&self) -> Result<()> {
+        MxArray::eval_arrays_with_context(&[&self.buffer], "draft_context_window")
     }
 
     pub(crate) fn collect_arrays<'a>(&'a self, out: &mut Vec<&'a MxArray>) {
@@ -403,6 +412,50 @@ mod tests {
         assert_eq!((lane.begin(), lane.end()), (8, 16));
         assert_eq!(lane.load_rows(8, 8)?.to_uint16_native()?, tail);
         assert!(window.store_rows(&rows, 3).is_err(), "rows must continue");
+        Ok(())
+    }
+
+    /// A window whose buffer reads a lazy array Metal cannot allocate
+    /// (1 TiB, past its largest buffer), so the copy throws inside eval.
+    fn unallocatable(width: u32, slots: u32) -> Result<DraftContextWindow> {
+        let bytes = DraftContextWindow::bytes(width, slots) as i64;
+        let huge = MxArray::zeros(&[1 << 20, 1 << 20], Some(DType::Uint8))?;
+        Ok(DraftContextWindow {
+            buffer: huge
+                .slice_axis(1, 0, bytes)?
+                .slice_axis(0, 0, 1)?
+                .reshape(&[bytes])?,
+            width,
+            slots,
+            begin: 0,
+            end: 0,
+        })
+    }
+
+    /// A copy that fails on the GPU is an error: the snapshot returns no
+    /// window and the lane keeps its bounds; a later copy still runs.
+    /// Mutations EV1 (the snapshot evaluates without the error) and EV2
+    /// (the copy does) → red.
+    #[test]
+    fn a_failed_window_copy_is_an_error() -> Result<()> {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        let mut source = unallocatable(64, 8)?;
+        source.restart(5);
+        assert!(source.snapshot().is_err(), "a failed snapshot is a window");
+        let mut lane = DraftContextWindow::new(64, 8)?;
+        assert!(
+            lane.copy_from(&source).is_err(),
+            "a failed copy is a window"
+        );
+        assert_eq!((lane.begin(), lane.end()), (0, 0));
+        let mut small = DraftContextWindow::new(64, 8)?;
+        small.store_rows(
+            &MxArray::random_normal(&[3, 64], 0.0, 1.0, Some(DType::BFloat16))?,
+            0,
+        )?;
+        assert_eq!(small.snapshot()?.host_bytes()?, small.host_bytes()?);
         Ok(())
     }
 

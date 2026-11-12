@@ -142,7 +142,9 @@ pub(crate) struct DFlash2States {
 }
 
 /// A released lane's buffers: the draft ring with its rows dropped and the
-/// context window, both kept for the next lane.
+/// context window, both kept for the next lane. Both are materialized: a
+/// restore credits their bytes as storage the lane already holds (Splash
+/// `QwenStateStorage::releaseLane` pools only allocated `DFlashDraftRing`s).
 #[derive(Default)]
 pub(crate) struct IdleLane {
     pub(crate) ring: Option<DFlash2ContextCache>,
@@ -150,16 +152,23 @@ pub(crate) struct IdleLane {
 }
 
 impl IdleLane {
-    /// Keeps `ring`'s buffers, its rows dropped.
+    /// Keeps `ring`'s buffers, its rows dropped; a ring whose buffers fail
+    /// to materialize is dropped.
     pub(crate) fn give_ring(&mut self, ring: Option<DFlash2ContextCache>) {
-        if let Some(mut ring) = ring {
+        if let Some(mut ring) = ring
+            && ring.eval().is_ok()
+        {
             ring.reset();
             self.ring = Some(ring);
         }
     }
 
+    /// Keeps `window`'s buffer, emptied; a window that fails to
+    /// materialize is dropped.
     pub(crate) fn give_window(&mut self, window: Option<DraftContextWindow>) {
-        if let Some(mut window) = window {
+        if let Some(mut window) = window
+            && window.eval().is_ok()
+        {
             window.restart(0);
             self.window = Some(window);
         }
