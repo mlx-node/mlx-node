@@ -91,8 +91,9 @@ describe('standalone GGUF model detection', () => {
   });
 
   // Mutation: drop `maxMemoryBytes` from `qwen35LoadOptions` → red. Mutation:
-  // drop the `acceptsMaxMemory` check → red (qwen4_exp accepts it).
-  it('passes maxMemoryBytes to both Qwen3.5 loaders and rejects it elsewhere', async () => {
+  // drop `maxMemoryBytes` from `qwen4ExpLoadOptions` → red. Mutation: drop the
+  // `acceptsMaxMemory` check → red (deepseek_v41 accepts it).
+  it('passes maxMemoryBytes to the Qwen3.5 and Flash Next loaders and rejects it elsewhere', async () => {
     const dense = await writeStandaloneGguf('qwen35');
     const denseSpy = vi.spyOn(Qwen35Model, 'load').mockResolvedValue({} as Qwen35Model);
     await loadModel(dense.modelPath, { maxMemoryBytes: 30_064_771_072, autoLoadDraft: false });
@@ -101,9 +102,18 @@ describe('standalone GGUF model detection', () => {
     const moeSpy = vi.spyOn(Qwen35MoeModel, 'load').mockResolvedValue({} as Qwen35MoeModel);
     await loadModel(moe.modelPath, { maxMemoryBytes: 1_024, autoLoadDraft: false });
     expect(moeSpy).toHaveBeenLastCalledWith(moe.modelPath, { maxMemoryBytes: 1_024 });
-    const other = await writeStandaloneGguf('qwen4exp');
+    const flashNext = await writeStandaloneGguf('qwen4exp');
+    const flashNextSpy = vi.spyOn(Qwen4ExpModel, 'load').mockResolvedValue({} as Qwen4ExpModel);
+    await loadModel(flashNext.modelPath, { maxMemoryBytes: 2_048, autoLoadDraft: false });
+    expect(flashNextSpy).toHaveBeenLastCalledWith(flashNext.modelPath, { maxMemoryBytes: 2_048 });
+    await loadModel(flashNext.modelPath, { auxiliaryModelPath: '/matching/hf', maxMemoryBytes: 4_096 });
+    expect(flashNextSpy).toHaveBeenLastCalledWith(flashNext.modelPath, {
+      auxiliaryModelPath: '/matching/hf',
+      maxMemoryBytes: 4_096,
+    });
+    const other = await writeStandaloneGguf('deepseek41');
     await expect(loadModel(other.modelPath, { maxMemoryBytes: 1_024 })).rejects.toThrow(
-      'maxMemoryBytes (Metal memory budget) is only supported by qwen3_5 and qwen3_5_moe',
+      'maxMemoryBytes (Metal memory budget) is only supported by qwen3_5, qwen3_5_moe and qwen4_exp',
     );
   });
 

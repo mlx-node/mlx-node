@@ -6,6 +6,7 @@ mod config;
 mod decoder;
 mod gguf;
 mod live;
+mod load_plan;
 mod math;
 mod media;
 mod memory;
@@ -19,6 +20,11 @@ mod row_fetch;
 mod weights;
 
 const MAX_PREFILL_CHUNK: usize = 1024;
+
+pub use load_plan::{Qwen4ExpContextEstimate, estimate_qwen4_exp_context_window};
+
+#[cfg(test)]
+pub(crate) use memory::{draft_state_bytes, flash_next_config, prefill_scratch, row_state_bytes};
 
 /// MLX's own `MLX_ENABLE_TF32` (default on). The NAX kernels refuse TF32-off
 /// processes in C++; the Rust callers check the same setting first so a
@@ -56,6 +62,9 @@ struct Inner {
     vision: media::Vision,
     media_prefill: Option<media::Prepared>,
     _pool_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
+    /// The memory plan the load settled on: the pool, the window and the
+    /// dynamic budget the scheduled state shares with the pool.
+    memory_plan: crate::engine::memory_plan::MemoryPlan,
     /// Scheduled turns admitted and not yet finished; the first to open
     /// after the set emptied starts a live window, every open adds its
     /// turn to the one in progress.
@@ -312,12 +321,11 @@ impl ChatBackend for Inner {
         }
     }
     fn prefill(&mut self, tokens: &[u32], stream: Stream) -> Result<MxArray> {
-        if tokens.len().saturating_add(self.decoder.history.len())
-            > self.decoder.config.effective_context_limit()
-        {
-            return Err(Error::from_reason(
-                "qwen4_exp prompt exceeds the SSD runtime context budget",
-            ));
+        let window = self.decoder.context_window;
+        if tokens.len().saturating_add(self.decoder.history.len()) > window {
+            return Err(Error::from_reason(format!(
+                "qwen4_exp prompt exceeds the {window}-token window of the memory plan"
+            )));
         }
         let _context = StreamContext::new(stream);
         self.decoder.prefill_prompt(tokens)?.squeeze(Some(&[1]))
@@ -332,9 +340,13 @@ impl ChatBackend for Inner {
 }
 
 #[napi(object)]
+#[derive(Default)]
 pub struct Qwen4ExpLoadOptions {
     /// Original matching HF checkpoint containing MTP/vision omitted by GGUF.
     pub auxiliary_model_path: Option<String>,
+    /// The Metal memory budget (`--max-memory`) the memory plan sizes the
+    /// stores, the pool and the windows within.
+    pub max_memory_bytes: Option<i64>,
 }
 
 /// Load-time residency decision (the budget is admitted before payload
@@ -389,11 +401,52 @@ pub struct Qwen4ExpResidencyInfo {
 }
 
 #[napi(object)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Qwen4ExpContextLimits {
     pub effective_window_tokens: u32,
     pub paged_block_capacity: u32,
     pub paged_block_size: u32,
     pub trained_window_tokens: u32,
+    /// Tokens an MTP turn may hold: its draft state beside the pool. Set only
+    /// with MTP weights.
+    pub speculative_window_tokens: Option<u32>,
+    /// The output budget fills the window: a prompt leaves room for one new
+    /// token and the budget is clamped to `window - prompt`.
+    pub rest_of_window_output_budget: bool,
+    /// An omitted budget on `effective_window_tokens` is the rest of that
+    /// window.
+    pub omitted_budget_is_rest_of_window: bool,
+    /// The same for `speculative_window_tokens`.
+    pub speculative_omitted_budget_is_rest_of_window: bool,
+}
+
+impl Qwen4ExpContextLimits {
+    /// The windows of the memory plan the load settled on.
+    fn from_plan(
+        config: &config::Config,
+        plan: &crate::engine::memory_plan::MemoryPlan,
+        has_mtp: bool,
+    ) -> Result<Self> {
+        let pool = plan
+            .pool
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Qwen4Exp memory plan: the load planned no pool"))?;
+        let speculative = if has_mtp {
+            load_plan::mtp_window(config, plan)
+        } else {
+            None
+        };
+        Ok(Self {
+            effective_window_tokens: pool.lane.window.maximum(),
+            paged_block_capacity: pool.max_blocks,
+            paged_block_size: crate::engine::memory_plan::KV_PAGE_TOKENS as u32,
+            trained_window_tokens: config.max_position_embeddings.min(u32::MAX as usize) as u32,
+            speculative_window_tokens: speculative,
+            rest_of_window_output_budget: true,
+            omitted_budget_is_rest_of_window: true,
+            speculative_omitted_budget_is_rest_of_window: speculative.is_some(),
+        })
+    }
 }
 
 /// Qwen3.8-Flash-Next with bounded SSD weights, native MTP, image input and
@@ -404,7 +457,7 @@ pub struct Qwen4ExpModel {
     config: config::Config,
     assets_path: String,
     has_mtp: bool,
-    paged_capacity: u32,
+    context_limits: Qwen4ExpContextLimits,
     residency: memory::Plan,
     live: Arc<live::Live>,
     lookup: Arc<weights::LookupStats>,
@@ -414,6 +467,10 @@ pub struct Qwen4ExpModel {
 impl Qwen4ExpModel {
     #[napi]
     pub async fn load(model_path: String, options: Option<Qwen4ExpLoadOptions>) -> Result<Self> {
+        const LABEL: &str = "Qwen4Exp";
+        let options = options.unwrap_or_default();
+        let max_memory =
+            crate::models::qwen3_5::load_plan::max_memory_option(LABEL, options.max_memory_bytes)?;
         // `gguf::assets` leases the returned sidecar for the model's
         // lifetime; when init fails, the caller must release that reference
         // or the dir is pinned against the cache cap forever.
@@ -423,27 +480,22 @@ impl Qwen4ExpModel {
             move || {
                 let path = PathBuf::from(model_path);
                 let mut weights = weights::Store::open(&path)?;
-                let (mut config, assets) = if weights.gguf {
-                    let c = gguf::config(&weights)?;
-                    let a = gguf::assets(&path, &weights, &c)?;
+                let mut config = load_plan::checkpoint_config(&weights, &path)?;
+                let assets = if weights.gguf {
+                    let a = gguf::assets(&path, &weights, &config)?;
                     *leased_assets_init
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner()) = Some(a.clone());
-                    (c, a)
+                    a
                 } else {
-                    let raw = std::fs::read(path.join("config.json"))
-                        .map_err(|e| Error::from_reason(e.to_string()))?;
-                    let raw = serde_json::from_slice(&raw)
-                        .map_err(|e| Error::from_reason(e.to_string()))?;
-                    (config::Config::parse(&raw)?, path.clone())
+                    path.clone()
                 };
-                let raw = if let Some(aux) = options.and_then(|o| o.auxiliary_model_path) {
-                    auxiliary::attach(&mut weights, &mut config, Path::new(&aux))?
-                } else if !weights.gguf {
-                    serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?
-                } else {
-                    serde_json::Value::Null
-                };
+                let raw = load_plan::attach_auxiliary(
+                    &mut weights,
+                    &mut config,
+                    &path,
+                    options.auxiliary_model_path.as_deref(),
+                )?;
                 let has_mtp = auxiliary::validate_mtp(&weights, &config)?;
                 let vision = media::Vision::metadata(&raw, &weights, &config)?;
                 let supports_images = vision.available();
@@ -455,21 +507,81 @@ impl Qwen4ExpModel {
                 )?);
                 let defaults =
                     crate::engine::persistence::parse_generation_defaults(Path::new(&assets));
+                let live = crate::engine::memory_plan::live_memory().ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "{LABEL} memory plan: the Metal working set is unreadable; refusing an unplanned load"
+                    ))
+                })?;
+                let inventory = weights.load_inventory(&config, supports_images)?;
+                let decision =
+                    load_plan::plan_store(LABEL, &config, &inventory, live, max_memory, has_mtp)?;
+                weights.set_store_plan(decision.store, inventory.store_fixed_bytes);
                 let mut decoder = decoder::Decoder::new(config.clone(), weights)?;
-                let adapter = paged::create(&config)?;
-                let paged_capacity = adapter.block_capacity();
-                let pool_bytes = adapter.bytes_per_block().map_err(Error::from_reason)?
-                    * u64::from(paged_capacity);
-                decoder.paged = Some(adapter);
-                let pool_guard = Some(crate::cache_limit::coordinator().register_pool(pool_bytes));
                 decoder.register_cache_limit();
-                decoder.weights.select_residency(pool_bytes)?;
+                decoder.weights.select_residency(
+                    inventory
+                        .store_fixed_bytes
+                        .saturating_add(decision.store.row_cache_bytes)
+                        .saturating_add(decision.allowance),
+                )?;
                 decoder.weights.prepare_hot()?;
                 decoder.weights.finish_load()?;
+                let (pool_guard, memory_plan, pool_bytes) = {
+                    let _growth_guard = crate::cache_limit::pool_growth_lock()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let engine = |held_back: u64| {
+                        let live = crate::engine::memory_plan::live_memory().ok_or_else(|| {
+                            Error::from_reason(format!(
+                                "{LABEL} memory plan: the Metal working set is unreadable"
+                            ))
+                        })?;
+                        load_plan::plan_engine(
+                            LABEL,
+                            &config,
+                            live,
+                            held_back.saturating_add(inventory.vision_bytes),
+                            max_memory,
+                        )
+                    };
+                    let held_back = decoder.weights.held_back_bytes();
+                    let weights = &mut decoder.weights;
+                    let plan =
+                        load_plan::settle(&engine, held_back, decision.allowance, &mut |bytes| {
+                            weights.lower_store_cap(bytes)
+                        })?;
+                    let pool_plan = plan.pool.ok_or_else(|| {
+                        Error::from_reason(format!("{LABEL} memory plan: the load planned no pool"))
+                    })?;
+                    let adapter = paged::create(&config, &pool_plan, plan.ceiling_bytes())?;
+                    let pool_bytes = adapter.pool_allocated_bytes().map_err(Error::from_reason)?;
+                    decoder.paged = Some(adapter);
+                    let guard = crate::cache_limit::coordinator().register_pool(pool_bytes);
+                    (guard, plan, pool_bytes)
+                };
+                if let Some(adapter) = decoder.paged.as_mut() {
+                    let pool_id = pool_guard.id();
+                    adapter.set_pool_growth_notifier(Some(Arc::new(move |bytes| {
+                        crate::cache_limit::coordinator().update_pool(pool_id, bytes);
+                    })));
+                }
+                tracing::info!("{LABEL} memory plan:\n{}", memory_plan.describe());
+                crate::models::qwen3_5::load_plan::audit_qwen35_load(
+                    LABEL,
+                    &memory_plan,
+                    pool_bytes,
+                )?;
+                let context_limits =
+                    Qwen4ExpContextLimits::from_plan(&config, &memory_plan, has_mtp)?;
+                decoder.context_window = context_limits.effective_window_tokens as usize;
+                decoder
+                    .weights
+                    .set_active_ceiling(memory_plan.ceiling_bytes());
                 decoder.weights.publish_live();
-                // Register the final reconciled budget, rather than retaining
-                // the pre-pool estimate in the process-wide allocator policy.
+                // Register the final budget and the prefill window of the
+                // planned context.
                 decoder.residency_changed();
+                let pool_guard = Some(pool_guard);
                 let residency = decoder.weights.plan.clone();
                 let live = Arc::clone(&decoder.weights.live);
                 let lookup = Arc::clone(&decoder.weights.lookup);
@@ -486,6 +598,7 @@ impl Qwen4ExpModel {
                     vision,
                     media_prefill: None,
                     _pool_guard: pool_guard,
+                    memory_plan,
                     open_turns: std::collections::HashSet::new(),
                     exclusive_turn: false,
                 };
@@ -495,7 +608,7 @@ impl Qwen4ExpModel {
                         config,
                         assets,
                         has_mtp,
-                        paged_capacity,
+                        context_limits,
                         residency,
                         live,
                         lookup,
@@ -509,7 +622,7 @@ impl Qwen4ExpModel {
             config,
             assets_path,
             has_mtp,
-            paged_capacity,
+            context_limits,
             residency,
             live,
             lookup,
@@ -542,7 +655,7 @@ impl Qwen4ExpModel {
             config,
             assets_path,
             has_mtp,
-            paged_capacity,
+            context_limits,
             residency,
             live,
             lookup,
@@ -633,12 +746,7 @@ impl Qwen4ExpModel {
     }
     #[napi]
     pub fn context_limits(&self) -> Qwen4ExpContextLimits {
-        Qwen4ExpContextLimits {
-            effective_window_tokens: self.config.effective_context_limit() as u32,
-            trained_window_tokens: self.config.max_position_embeddings as u32,
-            paged_block_capacity: self.paged_capacity,
-            paged_block_size: 32,
-        }
+        self.context_limits.clone()
     }
     #[napi]
     pub fn get_config(&self) -> Result<serde_json::Value> {

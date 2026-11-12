@@ -40,10 +40,12 @@ pub(super) fn argmax(logits: &MxArray) -> u32 {
         .unwrap()
 }
 
-/// The served load with `pool_bytes` of paged KV beside it.
-pub(super) fn go_live(decoder: &mut decoder::Decoder, pool_bytes: u64) {
+/// The served load with `anonymous_need` bytes of the plan beside the
+/// experts.
+pub(super) fn go_live(decoder: &mut decoder::Decoder, anonymous_need: u64) {
+    decoder.weights.plan_fixture_store().unwrap();
     decoder.register_cache_limit();
-    decoder.weights.select_residency(pool_bytes).unwrap();
+    decoder.weights.select_residency(anonymous_need).unwrap();
     decoder.weights.prepare_hot().unwrap();
     decoder.weights.start_direct_fill().unwrap();
     decoder.weights.publish_live();
@@ -426,24 +428,26 @@ enum TurnKind {
     StreamContinueTool,
 }
 
-/// The fixture's page pool is 16 blocks (128 KiB). A 120-token MTP start needs
-/// 4 blocks of pages but 115 KiB of recurrent row and draft state, which the
-/// pool must not be charged for: on the real model that charge refused every
-/// MTP prompt above ~7.5k tokens ("max pool holds 1365").
+/// A page pool of 6 blocks (48 KiB). A 120-token MTP start needs 4 blocks of
+/// pages but 88,800 B of recurrent row and draft state, which the pool must
+/// not be charged for: on the real model that charge refused every MTP
+/// prompt above ~7.5k tokens ("max pool holds 1365").
 /// MUTATION: charge draft state to the pool again (override
 /// `scheduled_draft_state_bytes` in qwen4's scheduler impl with
-/// `memory::draft_state_bytes`); the start is refused with "max pool holds 16"
+/// `memory::draft_state_bytes`); the start is refused with "max pool holds 6"
 /// and the `unwrap` of the turn fails.
 #[test]
 fn mtp_turn_near_the_context_limit_is_admitted_against_pages_only() {
     use crate::engine::hybrid_scheduler::{
         HybridSchedulerBackend, HybridSchedulerState, reservation_fits_empty_pool,
     };
-    let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
-    let c = state.inner.decoder.config.clone();
+    let mut inner = tiny_inner();
+    let c = inner.decoder.config.clone();
+    inner.decoder.paged = Some(paged::create_with_blocks(&c, 6, 6).unwrap());
+    let mut state = HybridSchedulerState::new(inner).unwrap();
     let adapter = state.inner.decoder.paged.as_ref().unwrap();
     let (blocks, bytes_per_block) = (adapter.block_capacity(), adapter.bytes_per_block().unwrap());
-    assert_eq!((blocks, bytes_per_block), (16, 8192));
+    assert_eq!((blocks, bytes_per_block), (6, 8192));
     let max_new_tokens = 120;
     let requested = crate::engine::scheduler::scheduled_materialized_tokens(1, max_new_tokens);
     let pages = requested.div_ceil(adapter.block_size());
@@ -471,6 +475,70 @@ fn mtp_turn_near_the_context_limit_is_admitted_against_pages_only() {
     .unwrap();
     assert!(cycles.is_some_and(|n| n > 0), "{cycles:?}");
     assert_eq!(state.owner_sequences.len(), 1);
+}
+
+/// An AR turn grows the pool to its maximum, and the state budget charges
+/// every block it holds. An MTP start after it takes the free extents back (Splash
+/// `Cache::takeReclaim`) instead of refusing state the cut would cover: its
+/// candidate is above the budget at the grown pool and within it at the
+/// runway. MUTATION: return false from qwen4's
+/// `reclaim_for_scheduled_state`; the MTP start fails with "qwen4_exp working
+/// memory: this turn needs ...".
+#[test]
+fn mtp_start_after_a_long_ar_turn_takes_back_the_pool_growth() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerState;
+    const RUNWAY: u32 = 1;
+    const MAX: u32 = 4;
+    let mut inner = tiny_inner();
+    let c = inner.decoder.config.clone();
+    let mut pool = paged::create_with_blocks(&c, RUNWAY, MAX).unwrap();
+    pool.set_extent_growth(1);
+    let physical = pool.bytes_per_block().unwrap();
+    inner.decoder.paged = Some(pool);
+    let chunk = inner.decoder.prefill_chunk_size;
+    inner.decoder.prefill_window_pin = Some(chunk);
+    let transient = memory::prefill_scratch(&c, chunk, inner.decoder.context_window);
+    let mtp_new = 20;
+    let requested = crate::engine::scheduler::scheduled_materialized_tokens(1, mtp_new);
+    let candidate =
+        memory::row_state_bytes(&c) + memory::draft_state_bytes(&c, u64::from(requested));
+    let charge = |total: u32| memory::PoolCharge {
+        total_blocks: u64::from(total),
+        max_blocks: u64::from(MAX),
+        allocated_blocks: 0,
+        physical_block_bytes: physical,
+        index_block_bytes: super::load_plan::index_block_bytes(&c),
+        growth_copy_bytes: u64::from(total) * physical
+            / (super::load_plan::full_attention_layers(&c) as u64).max(1),
+    };
+    let dynamic = candidate + transient + charge(MAX).bytes() - 1;
+    let budget = |total: u32| memory::scheduled_state_budget(dynamic, transient, &charge(total));
+    assert!(
+        budget(MAX) < candidate && candidate <= budget(RUNWAY),
+        "the MTP candidate {candidate} B must exceed the grown pool's budget {} B and fit the runway's {} B, or this test proves nothing",
+        budget(MAX),
+        budget(RUNWAY)
+    );
+    inner.memory_plan = crate::engine::memory_plan::MemoryPlan::with_dynamic(dynamic);
+    let mut state = HybridSchedulerState::new(inner).unwrap();
+    drive_turn(&mut state, TurnKind::Start, false, 120, Some("ar")).unwrap();
+    // The fixture stops long before its window; the rest of a long turn's
+    // growth is taken directly.
+    let pool = state.inner.decoder.paged.as_mut().unwrap();
+    let grown = pool.block_capacity();
+    assert!(grown > RUNWAY, "the AR turn must grow the pool");
+    assert!(pool.try_grow_pool(MAX - grown));
+    assert_eq!(pool.block_capacity(), MAX);
+    let (_, cycles) = drive_turn(
+        &mut state,
+        TurnKind::Start,
+        true,
+        mtp_new as i32,
+        Some("mtp"),
+    )
+    .unwrap();
+    assert!(cycles.is_some_and(|n| n > 0), "{cycles:?}");
+    assert!(state.inner.decoder.paged.as_ref().unwrap().block_capacity() < MAX);
 }
 
 /// Held off-pool state counts every parked or active row, each owner's draft
@@ -608,7 +676,8 @@ fn parked_mtp_owners_charge_their_waiting_hidden_rows() {
 /// first owner's draft state does not exist until its first prefill chunk, so
 /// only the reservation kept on its waiting turn can make the second owner
 /// defer. The budget is shrunk through the prefill window to the shape of two
-/// 16k Flash Next owners (`memory::flash_next_scheduled_state_budget_holds_one_long_mtp_owner`):
+/// Flash Next owners
+/// (`load_plan::tests::flash_next_scheduled_state_budget_holds_one_long_mtp_owner`):
 /// two rows and one draft fit, two drafts do not.
 /// MUTATION: drop `outstanding_bytes` from the sum in `scheduled_state_fit`;
 /// both owners are admitted in the first pass and `live_turns() == 1` fails.
@@ -618,15 +687,15 @@ fn queued_mtp_owner_keeps_its_draft_reservation_until_its_owner_exists() {
     use crate::model_thread::LoopControl;
     let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
     let c = state.inner.decoder.config.clone();
-    let adapter = state.inner.decoder.paged.as_ref().unwrap();
-    let pool = adapter.bytes_per_block().unwrap() * u64::from(adapter.block_capacity());
     let max_new_tokens = 120;
     let requested = crate::engine::scheduler::scheduled_materialized_tokens(1, max_new_tokens);
     let row = memory::row_state_bytes(&c);
     let draft = memory::draft_state_bytes(&c, u64::from(requested));
     let target = 4 * row + draft;
-    let budget_at =
-        |chunk: usize| memory::scheduled_state_budget(pool, memory::prefill_scratch(&c, chunk));
+    let mut budget_at = |chunk: usize| {
+        state.inner.decoder.prefill_chunk_size = chunk;
+        state.inner.scheduled_state_capacity().unwrap().budget
+    };
     let (mut lo, mut hi) = (1usize, 1usize << 31);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
@@ -1959,7 +2028,7 @@ fn paged_qsa_matches_flat_across_page_boundaries_sparse_selection_and_owner_swit
     let mut flat_a = make();
     let mut flat_b = make();
     let mut paged = make();
-    paged.paged = Some(super::paged::create(&config).unwrap());
+    paged.paged = Some(super::paged::create_fixture(&config).unwrap());
     let mut states = [None, None];
     for round in 0..5 {
         for (owner, saved_state) in states.iter_mut().enumerate() {
@@ -2278,7 +2347,7 @@ fn media_mrope_matches_reference_including_compressed_indexer_block_positions() 
         )
         .unwrap();
         if pages {
-            let mut a = super::paged::create(&c).unwrap();
+            let mut a = super::paged::create_fixture(&c).unwrap();
             a.begin_request(1).unwrap();
             decoder.paged = Some(a);
         }
@@ -2318,7 +2387,7 @@ fn tiny_decoder() -> (decoder::Decoder, media::Vision) {
     let store = weights::Store::open_fixture(&path, None).unwrap();
     let vision = media::Vision::metadata(&serde_json::Value::Null, &store, &c).unwrap();
     let mut decoder = decoder::Decoder::new(c.clone(), store).unwrap();
-    decoder.paged = Some(super::paged::create(&c).unwrap());
+    decoder.paged = Some(super::paged::create_fixture(&c).unwrap());
     (decoder, vision)
 }
 
@@ -2350,6 +2419,7 @@ fn inner_over(mut decoder: decoder::Decoder, vision: media::Vision, has_mtp: boo
         vision,
         media_prefill: None,
         _pool_guard: None,
+        memory_plan: crate::engine::memory_plan::MemoryPlan::with_dynamic(memory::WORKING_BYTES),
         open_turns: Default::default(),
         exclusive_turn: false,
     }
@@ -2600,9 +2670,9 @@ fn scheduled_turns_open_at_admission_and_close_when_they_finish() {
     assert!(!state.inner.exclusive_turn);
 }
 
-/// The prefill window follows the plan in force: a fallback shrinks the slot
-/// allowance (budget / 16) below what the load admitted, and the next turn to
-/// open prefills with the window that allowance admits, not the load's.
+/// The prefill window follows the plan in force: a host that leaves less
+/// beside the store than the load saw halves it, and the next turn to open
+/// prefills with the window that host admits, not the load's.
 ///
 /// MUTATION: `open_turn` keeps `decoder.prefill_chunk_size`;
 /// the window stays at the load's value.
@@ -2613,16 +2683,21 @@ fn a_turn_opens_with_the_prefill_window_of_the_plan_in_force() {
     let mut inner = tiny_inner();
     let config = Arc::clone(&inner.decoder.config);
     let admitted = inner.decoder.prefill_chunk_size;
+    let context = inner.decoder.context_window;
     assert_eq!(
         admitted,
-        memory::prefill_window(&config, &inner.decoder.weights.plan)
+        memory::prefill_window(&config, &inner.decoder.weights.plan, context)
     );
     assert!(admitted >= 4);
     let mut plan = inner.decoder.weights.plan.clone();
-    plan.available_bytes = None;
-    plan.physical_bytes = None;
-    plan.budget = 16 * memory::prefill_scratch(&config, admitted / 4);
-    let narrow = memory::prefill_window(&config, &plan);
+    plan.partial_direct_gate = false;
+    plan.physical_bytes = Some(16 << 30);
+    plan.available_bytes = Some(
+        plan.budget.saturating_sub(plan.direct_bytes)
+            + (4 << 30)
+            + memory::prefill_scratch(&config, admitted / 4, context),
+    );
+    let narrow = memory::prefill_window(&config, &plan, context);
     assert_eq!(narrow, admitted / 4);
     inner.decoder.weights.plan = plan;
     inner.scheduled_turn_opened(1);
@@ -3971,9 +4046,10 @@ fn prefill_bootstrap_uses_dimensions_and_live_headroom() {
         .unwrap()
         .plan;
     plan.budget = 32 << 30;
-    plan.available_bytes = Some(64 << 30);
+    plan.available_bytes = Some(52 << 30);
     plan.physical_bytes = Some(128 << 30);
-    let small = memory::prefill_window(&config, &plan);
+    let context = config.max_position_embeddings;
+    let small = memory::prefill_window(&config, &plan, context);
     config.hidden_size = 8192;
     config.hc_count = 4;
     config.moe_intermediate_size = 4096;
@@ -3981,17 +4057,17 @@ fn prefill_bootstrap_uses_dimensions_and_live_headroom() {
     config.head_dim = 256;
     config.num_experts_per_tok = 10;
     config.indexer_budget = 2048;
-    let large = memory::prefill_window(&config, &plan);
+    let large = memory::prefill_window(&config, &plan, context);
     assert!(large < small);
     let old_ple = config.ple_conv_kernel_size;
     config.ple_conv_kernel_size = 64;
     assert!(
-        memory::prefill_window(&config, &plan) < large,
+        memory::prefill_window(&config, &plan, context) < large,
         "A dominant PLE stage must reduce the admitted window"
     );
     config.ple_conv_kernel_size = old_ple;
     plan.available_bytes = Some((51 << 30) + (128 << 20));
-    assert!(memory::prefill_window(&config, &plan) < large);
+    assert!(memory::prefill_window(&config, &plan, context) < large);
 }
 
 /// The MTP hidden norm is one RMS per hyper-connection stream: stretching a
@@ -4758,7 +4834,7 @@ fn wide_causal_windows_match_singleton_with_pages_media_and_retained_prefix() {
         weights::Store::open_fixture(&path, None).unwrap(),
     )
     .unwrap();
-    let mut pages = paged::create(&c).unwrap();
+    let mut pages = paged::create_fixture(&c).unwrap();
     pages.begin_request(1).unwrap();
     candidate.paged = Some(pages);
     let positions: Vec<_> = (0..256)
@@ -4818,7 +4894,7 @@ fn paged_writes_accept_offset_projection_views() {
     let path = fixture().join("bf16/paged");
     let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
     let c = config::Config::parse(&raw).unwrap();
-    let mut pages = paged::create(&c).unwrap();
+    let mut pages = paged::create_fixture(&c).unwrap();
     pages.begin_request(1).unwrap();
     let h = c.num_key_value_heads;
     let d = c.head_dim;
@@ -4859,7 +4935,7 @@ fn gather_window_runtime_shapes_match_selected() {
     let path = fixture().join("bf16/paged");
     let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
     let c = config::Config::parse(&raw).unwrap();
-    let mut pages = paged::create(&c).unwrap();
+    let mut pages = paged::create_fixture(&c).unwrap();
     pages.begin_request(1).unwrap();
     let (h, d) = (c.num_key_value_heads, c.head_dim);
     let rows = |shape: &[i64], seed: usize| {
@@ -6572,7 +6648,7 @@ fn batched_qsa_matches_per_token_flat_and_paged() {
                 )
                 .unwrap();
                 if paged {
-                    d.paged = Some(paged::create(&config).unwrap());
+                    d.paged = Some(paged::create_fixture(&config).unwrap());
                     d.paged.as_mut().unwrap().begin_request(1).unwrap();
                 }
                 d
@@ -7293,7 +7369,7 @@ fn bf16_paged_oracle_through_prefill_chunk() {
             let budget = model.config.indexer_budget;
             assert!(budget < tokens.len());
             if paged {
-                model.paged = Some(paged::create(&model.config).unwrap());
+                model.paged = Some(paged::create_fixture(&model.config).unwrap());
             }
             let mut seq = 0;
             let mut maximum = 0f32;
@@ -8026,7 +8102,7 @@ fn real_model_verify_rows_match_ar_steps() {
     let config = gguf::config(&store).unwrap();
     let vision = media::Vision::metadata(&serde_json::Value::Null, &store, &config).unwrap();
     let mut decoder = decoder::Decoder::new(config.clone(), store).unwrap();
-    let adapter = super::paged::create(&config).unwrap();
+    let adapter = super::paged::create_fixture(&config).unwrap();
     let pool_bytes = adapter.bytes_per_block().unwrap() * u64::from(adapter.block_capacity());
     decoder.paged = Some(adapter);
     go_live(&mut decoder, pool_bytes);
@@ -8386,7 +8462,7 @@ fn group_fixture_decoder(width: usize, seq: u32) -> decoder::Decoder {
     let mut decoder = decoder::Decoder::new(config.clone(), store).unwrap();
     decoder.prefill_window_pin = Some(width);
     decoder.prefill_chunk_size = width;
-    let mut adapter = paged::create(&config).unwrap();
+    let mut adapter = paged::create_fixture(&config).unwrap();
     adapter.begin_request(seq).unwrap();
     adapter.allocate_suffix_blocks(53).unwrap();
     decoder.paged = Some(adapter);
@@ -8733,7 +8809,7 @@ fn real_model_group_matches_window_at_a_time_during_direct_fill() {
     let store = weights::Store::open(Path::new(&model)).unwrap();
     let config = gguf::config(&store).unwrap();
     let mut decoder = decoder::Decoder::new(config.clone(), store).unwrap();
-    let adapter = super::paged::create(&config).unwrap();
+    let adapter = super::paged::create_fixture(&config).unwrap();
     let pool_bytes = adapter.bytes_per_block().unwrap() * u64::from(adapter.block_capacity());
     decoder.paged = Some(adapter);
     go_live(&mut decoder, pool_bytes);
@@ -8862,4 +8938,123 @@ fn exclusive_activation_failure_finishes_stream_progress() {
     let reason = stream_rx.try_recv().unwrap().err().unwrap().reason;
     assert!(reason.contains("capacity reached"), "{reason}");
     assert_eq!(progress.snapshot().phase, "done");
+}
+
+/// A scheduled Flash Next turn's output budget is the rest of its window: a
+/// 48-token prompt asking 100 of a 64-token window gets 16. Mutation: drop
+/// the `scheduler_output_budget_is_rest_of_window` override in `paged.rs` →
+/// red (17).
+#[test]
+fn qwen4_exp_clamp_is_rest_of_window() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    use crate::engine::scheduler::clamp_scheduled_output_tokens;
+    let inner = tiny_inner();
+    let rest_of_window = inner.scheduler_output_budget_is_rest_of_window();
+    assert_eq!(
+        clamp_scheduled_output_tokens(48, 100, 64, rest_of_window),
+        Ok(16)
+    );
+    assert!(
+        clamp_scheduled_output_tokens(64, 1, 64, rest_of_window).is_err(),
+        "a prompt that fills the window leaves no output"
+    );
+}
+
+/// Flash Next books its pages as a turn writes them, from the pool's
+/// runway. Mutation: drop the `scheduler_books_on_demand` override in
+/// `paged.rs` → red (the whole turn is booked at admission).
+#[test]
+fn qwen4_exp_books_on_demand() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    assert!(tiny_inner().scheduler_books_on_demand());
+}
+
+/// A planned load: the fixture's engine plan on an 8 GiB working set.
+fn tiny_planned_inner() -> Inner {
+    let mut inner = tiny_inner();
+    let live = crate::engine::memory_plan::LiveMemory {
+        working_set_bytes: 8 << 30,
+        active_bytes: 0,
+        registered_pool_bytes: 0,
+    };
+    inner.memory_plan =
+        load_plan::plan_engine("Qwen4Exp", &inner.decoder.config, live, 0, None).unwrap();
+    inner
+}
+
+/// A scheduled turn clamps on the plan's window: the AR lane's, and the MTP
+/// lane's for a speculative turn. Mutation: drop the `planned_turn_window`
+/// override in `paged.rs` → red (`None`: the pool's own window and
+/// `MLX_PAGED_PER_SEQ_CTX`).
+#[test]
+fn qwen4_exp_turn_window_is_the_plan_window() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    let inner = tiny_planned_inner();
+    let pool = inner.memory_plan.pool.unwrap();
+    assert_eq!(
+        inner.planned_turn_window(false),
+        Some(pool.lane.window.maximum())
+    );
+    assert_eq!(
+        inner.planned_turn_window(true),
+        load_plan::mtp_window(&inner.decoder.config, &inner.memory_plan)
+    );
+    assert!(inner.planned_turn_window(true).is_some());
+}
+
+/// The wired bound of a scheduled turn is the store's budget and the plan's
+/// dynamic budget; the pool's pages are inside the dynamic budget. Mutation:
+/// add the pool's bytes and the 4 GiB working allowance → red.
+#[test]
+fn qwen4_exp_wired_bytes_follow_the_plan() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    let inner = tiny_planned_inner();
+    assert_eq!(
+        inner.scheduler_wired_bytes(),
+        Some(
+            (inner.decoder.weights.cache_budget() + inner.memory_plan.dynamic_budget_bytes)
+                as usize
+        )
+    );
+}
+
+/// A prompt longer than the memory plan's window is refused before any
+/// forward, naming the window; a prompt of the window prefills. Mutation:
+/// check the prompt against the trained window in `Inner::prefill` → red
+/// (the decoder refuses it later, without naming the window).
+#[test]
+fn prompt_over_the_plan_window_is_refused() {
+    use crate::engine::backend::ChatBackend;
+    let mut inner = tiny_inner();
+    inner.decoder.paged = None;
+    inner.decoder.context_window = 16;
+    assert!(inner.decoder.config.max_position_embeddings > 17);
+    let stream = Stream::default(crate::stream::DeviceType::Gpu);
+    let over: Vec<u32> = (0..17).map(|i| i % 3).collect();
+    let Err(error) = inner.prefill(&over, stream) else {
+        panic!("a prompt over the window prefilled");
+    };
+    assert!(error.reason.contains("16-token window"), "{error}");
+    assert!(inner.decoder.history.is_empty());
+    let stream = Stream::default(crate::stream::DeviceType::Gpu);
+    inner.prefill(&over[..16], stream).unwrap();
+    assert_eq!(inner.decoder.history.len(), 16);
+}
+
+/// An SSD read beside a 262K turn's transient (5,746,196,480 B) passes
+/// under the memory plan's ceiling less the KV pools, where the weight
+/// budget plus 4 GiB refused it. Mutation: `Store::active_limit` gives the
+/// weight budget plus 4 GiB → red (limit 25,769,803,776).
+#[test]
+fn active_budget_follows_the_plan_ceiling() {
+    let mut store = weights::Store::open_fixture(&fixture().join("bf16/paged"), None).unwrap();
+    store.set_cache_limit(20 << 30);
+    assert_eq!(store.active_limit(0), None);
+    let ceiling = 115_749_368_627 - (768 << 20);
+    store.set_active_ceiling(ceiling);
+    let pools = 10u64 << 30;
+    let limit = store.active_limit(pools).unwrap();
+    assert_eq!(limit, ceiling - pools);
+    let active = (20u64 << 30) + 5_746_196_480 + (3 << 30);
+    memory::check_active_memory_budget(limit, || active as f64, || {}, |_| {}).unwrap();
 }

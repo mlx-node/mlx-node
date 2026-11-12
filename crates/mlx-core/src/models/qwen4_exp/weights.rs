@@ -93,6 +93,19 @@ pub struct Tensor {
     bytes: u64,
     encoding: Encoding,
 }
+#[cfg(test)]
+impl Tensor {
+    /// A safetensors descriptor of `shape` in `dtype` with no payload.
+    pub(super) fn safe_descriptor(shape: Vec<usize>, dtype: &str, bytes: u64) -> Self {
+        Self {
+            path: PathBuf::new(),
+            shape,
+            offset: 0,
+            bytes,
+            encoding: Encoding::Safe(dtype.into()),
+        }
+    }
+}
 impl Tensor {
     pub fn width(&self) -> Result<usize> {
         self.shape
@@ -712,10 +725,14 @@ pub struct Store {
     wide_routes: HashMap<usize, Vec<u32>>,
     deferred_reduction_layer: Option<usize>,
     slot_capacity: Option<usize>,
-    /// Gate-derived ceiling for direct partial banks. Its presence also keeps
-    /// load reconciliation from replacing the live-pressure plan with the
-    /// older bootstrap rule.
+    /// The bank ceiling of partial direct slots: the streamed store's cap
+    /// less the slots' staging, or what a refusing host admits.
     slot_bank_budget: Option<u64>,
+    /// The memory plan's store: whole experts or a cap, and the row cache.
+    store_plan: Option<crate::engine::memory_plan::StorePlan>,
+    /// The memory plan's ceiling; MLX's active bytes stay within it less the
+    /// registered KV pools. Unset for a store no plan sized (fixtures).
+    active_ceiling: Option<u64>,
     slot_bytes: u64,
     pub slot_upload_bytes: u64,
     pub slot_hits: u64,
@@ -774,11 +791,26 @@ impl Store {
         check()
     }
 
+    /// The store from its descriptors; `set_store_plan` sizes it before any
+    /// payload read.
     pub fn open(path: &Path) -> Result<Self> {
         let mut s = Self::open_metadata(path, None)?;
-        s.plan = super::memory::plan(s.hot_bytes()?)?;
-        s.cache_limit = s.plan.budget;
+        s.plan.hot_bytes = s.hot_bytes()?;
+        super::memory::host_snapshot(&mut s.plan)?;
         Ok(s)
+    }
+
+    /// Hold MLX's active bytes within the memory plan's `ceiling` less the
+    /// registered KV pools.
+    pub(super) fn set_active_ceiling(&mut self, ceiling: u64) {
+        self.active_ceiling = Some(ceiling);
+    }
+
+    /// The active-memory limit of an SSD read: the plan's ceiling less the
+    /// `pool_bytes` registered now.
+    pub(super) fn active_limit(&self, pool_bytes: u64) -> Option<u64> {
+        self.active_ceiling
+            .map(|ceiling| ceiling.saturating_sub(pool_bytes))
     }
 
     /// Tiny synthetic fixtures exercise IO and kernels without reserving the
@@ -808,6 +840,17 @@ impl Store {
     /// Auxiliary source checkpoints contribute only descriptors, so their
     /// unrelated target tensors must not participate in residency admission.
     pub(super) fn open_metadata(path: &Path, root: Option<&Path>) -> Result<Self> {
+        let s = Self::open_descriptors(path)?;
+        if s.gguf {
+            let root =
+                root.map_or_else(|| super::packed_cache::cache_root(path), Path::to_path_buf);
+            super::packed_cache::sweep_old_packs(&root);
+        }
+        Ok(s)
+    }
+
+    /// The tensors' descriptors and nothing else: no pack sweep, no payload.
+    pub(super) fn open_descriptors(path: &Path) -> Result<Self> {
         let cache_limit = CACHE_BYTES;
         let mut s = Self {
             #[cfg(test)]
@@ -857,6 +900,8 @@ impl Store {
             deferred_reduction_layer: None,
             slot_capacity: None,
             slot_bank_budget: None,
+            store_plan: None,
+            active_ceiling: None,
             slot_bytes: 0,
             slot_upload_bytes: 0,
             slot_hits: 0,
@@ -891,11 +936,6 @@ impl Store {
         }
         if s.tensors.is_empty() {
             return Err(err("No model tensors found"));
-        }
-        if s.gguf {
-            let root =
-                root.map_or_else(|| super::packed_cache::cache_root(path), Path::to_path_buf);
-            super::packed_cache::sweep_old_packs(&root);
         }
         Ok(s)
     }
@@ -1503,12 +1543,16 @@ impl Store {
         // Refuse before allocation, also accounting for other models in this
         // process. A freelist spike is transient, so reclaim it and re-poll
         // briefly under the same safety limit before refusing.
-        super::memory::check_active_memory_budget(
-            cache_limit,
-            crate::array::memory::anonymous_active_memory,
-            crate::array::memory::clear_cache,
-            std::thread::sleep,
-        )?;
+        if let Some(limit) =
+            self.active_limit(crate::cache_limit::coordinator().registered_pool_bytes())
+        {
+            super::memory::check_active_memory_budget(
+                limit,
+                crate::array::memory::anonymous_active_memory,
+                crate::array::memory::clear_cache,
+                std::thread::sleep,
+            )?;
+        }
         super::memory::maintain_freelist(self.plan.physical_bytes);
         // Full direct experts do not pass through this per-row importer;
         // token/PLE rows, auxiliary weights and fallback projection chunks
@@ -2824,13 +2868,27 @@ mod direct_tests {
         header_pad: usize,
         trailing: usize,
     ) {
+        write_fixture_with_fixed(path, layers, experts, parts, &[], header_pad, trailing)
+    }
+
+    /// The routed parts of `write_fixture_layout`, then `fixed` F32
+    /// projections of `(name, rows, width)`.
+    fn write_fixture_with_fixed(
+        path: &Path,
+        layers: usize,
+        experts: usize,
+        parts: &[Part; 3],
+        fixed: &[(&str, usize, usize)],
+        header_pad: usize,
+        trailing: usize,
+    ) {
         let string = |bytes: &mut Vec<u8>, value: &str| {
             bytes.extend((value.len() as u64).to_le_bytes());
             bytes.extend(value.bytes());
         };
         let mut b = b"GGUF".to_vec();
         b.extend(3u32.to_le_bytes());
-        b.extend(((parts.len() * layers) as u64).to_le_bytes());
+        b.extend(((parts.len() * layers + fixed.len()) as u64).to_le_bytes());
         b.extend(1u64.to_le_bytes());
         string(&mut b, "general.architecture");
         b.extend(8u32.to_le_bytes());
@@ -2847,6 +2905,16 @@ mod direct_tests {
                 b.extend(offset.to_le_bytes());
                 offset += (experts * *rows * *row_bytes) as u64;
             }
+        }
+        for (name, rows, width) in fixed {
+            string(&mut b, name);
+            b.extend(2u32.to_le_bytes());
+            for d in [*width as u64, *rows as u64] {
+                b.extend(d.to_le_bytes());
+            }
+            b.extend(0u32.to_le_bytes());
+            b.extend(offset.to_le_bytes());
+            offset += (*rows * *width * 4) as u64;
         }
         b.resize(b.len() + header_pad, 0);
         while !b.len().is_multiple_of(32) {
@@ -3056,8 +3124,9 @@ mod direct_tests {
     fn open_full(temp: &Temp, gguf: &Path, label: &str, layers: usize, experts: usize) -> Store {
         let mut store =
             Store::open_fixture(gguf, Some(&temp.0.join(format!("{label}-cache")))).unwrap();
+        store.plan_fixture_store().unwrap();
         let handled = store
-            .select_direct_residency_with(experts, 0, &mut memory::direct_plan, &mut |_| Ok(()))
+            .select_direct_residency_with(experts, 0, &mut memory::direct_gate, &mut |_| Ok(()))
             .unwrap();
         assert!(
             handled,
@@ -3314,8 +3383,14 @@ mod direct_tests {
         );
     }
 
+    /// A host that refuses the whole bank set the plan chose lowers the
+    /// allocation to partial slots of what it admits; the plan keeps the store
+    /// at its cap, so the bytes the slots leave are held back and the window
+    /// does not move. Mutation: lower the weight budget to the admitted banks
+    /// on a refusal in `select_direct_residency_with` → red (cache limit
+    /// 2,147,514,880).
     #[test]
-    fn direct_gguf_full_gate_refusal_selects_bounded_partial_slots() {
+    fn host_refusal_lowers_the_allocation_not_the_plan() {
         if !crate::utils::gguf_gpu::gpu_repack_available() {
             return;
         }
@@ -3323,13 +3398,13 @@ mod direct_tests {
         let gguf = temp.0.join("full-gate-refusal.gguf");
         write_fixture(&gguf);
         let mut store = Store::open_fixture(&gguf, Some(&temp.0.join("cache"))).unwrap();
-        let anonymous_budget = 512 << 20;
+        store.plan_fixture_store().unwrap();
+        let planned_limit = store.cache_limit;
         let handled = store
             .select_direct_residency_with(
                 EXPERTS,
                 0,
-                &mut |plan, _, _, bank_bytes| {
-                    plan.budget = anonymous_budget;
+                &mut |plan, _, bank_bytes| {
                     plan.bank_budget = bank_bytes * 2 / EXPERTS as u64;
                     plan.live_non_reclaimable = 40 << 30;
                     plan.available_bytes = Some(88 << 30);
@@ -3350,7 +3425,9 @@ mod direct_tests {
         assert_eq!(store.expert_slot_capacity(EXPERTS, 2).unwrap(), 2);
         let bank_budget = store.plan.bank_budget;
         assert_eq!(store.slot_bank_budget, Some(bank_budget));
-        assert_eq!(store.plan.budget, anonymous_budget + bank_budget);
+        assert_eq!(store.cache_limit, planned_limit);
+        assert_eq!(store.plan.budget, planned_limit);
+        assert!(store.held_back_bytes() > 0);
         assert!(store.planned_slot_bytes().unwrap() <= bank_budget);
         assert_eq!(store.plan.live_non_reclaimable, 40 << 30);
         assert_eq!(store.plan.direct_bytes, 0);
@@ -3359,6 +3436,142 @@ mod direct_tests {
             store.live.fallback(),
             Some(Fallback::LoadGate { budget, .. }) if budget == bank_budget
         ));
+    }
+
+    /// A host that refuses the whole store the plan chose prepares the partial
+    /// store under what it admits now: the fixed banks pass the host, and the
+    /// plan keeps the store at its cap with the rest held back. Mutation: admit
+    /// the store's cap in `prepare_hot_with_admission` → red ("requested 6.0
+    /// GiB, the host leaves 5.0 GiB").
+    #[test]
+    fn host_refusal_partial_store_prepares_under_the_host() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("refusal-prepare.gguf");
+        write_fixture_with_fixed(
+            &gguf,
+            1,
+            EXPERTS,
+            &PARTS,
+            &[("blk.0.attn_qkv.weight", 16, 64)],
+            0,
+            0,
+        );
+        let host = memory::HostMemory {
+            physical: 16 << 30,
+            free: 4 << 30,
+            file: 0,
+            anonymous: 5 << 30,
+            purgeable: 0,
+            wired: 1 << 30,
+            compressor: 1 << 30,
+        };
+        let _host = memory::scoped_test_host(host);
+        let mut store = Store::open_fixture(&gguf, Some(&temp.0.join("cache"))).unwrap();
+        store.plan.physical_bytes = Some(host.physical);
+        store.plan_fixture_store().unwrap();
+        let whole = store.store_plan.unwrap();
+        assert!(whole.whole);
+        let fixed = store.cache_limit - whole.expert_cap_bytes - whole.row_cache_bytes;
+        assert!(fixed > 0, "the fixture must hold a fixed projection bank");
+        let rows = 6u64 << 30;
+        store.set_store_plan(
+            crate::engine::memory_plan::StorePlan {
+                row_cache_bytes: rows,
+                ..whole
+            },
+            fixed,
+        );
+        let planned = store.cache_limit;
+        assert!(
+            planned > 5 << 30,
+            "the planned store must exceed what the host admits, or this test proves nothing"
+        );
+        assert!(
+            store
+                .select_direct_residency_with(
+                    EXPERTS,
+                    fixed + rows,
+                    &mut memory::direct_gate,
+                    &mut |_| panic!("a refused gate must not allocate"),
+                )
+                .unwrap()
+        );
+        assert!(!store.plan.direct);
+        assert!(store.plan.partial_direct_gate);
+        store.prepare_hot().unwrap();
+        assert!(store.banks.contains_key("blk.0.attn_qkv.weight"));
+        assert_eq!(store.cache_limit, planned);
+        assert!(store.held_back_bytes() > 0);
+        assert!(matches!(
+            store.live.fallback(),
+            Some(Fallback::LoadGate { .. })
+        ));
+    }
+
+    /// A streamed store is sized by its plan whatever the host holds: a quiet
+    /// and a busy host give the same weight budget, slot budget and slots.
+    /// Mutation: cap the streamed slot budget with the host's bank gate in
+    /// `select_direct_residency_with` → red (a zero slot budget and no slots
+    /// on the busy host).
+    #[test]
+    fn store_cap_ignores_the_host() {
+        if !crate::utils::gguf_gpu::gpu_repack_available() {
+            return;
+        }
+        let temp = Temp::new();
+        let gguf = temp.0.join("store-cap.gguf");
+        write_fixture(&gguf);
+        let quiet = memory::HostMemory {
+            physical: 16 << 30,
+            free: 8 << 30,
+            file: 4 << 30,
+            anonymous: 1 << 30,
+            purgeable: 0,
+            wired: 2 << 30,
+            compressor: 1 << 30,
+        };
+        let busy = memory::HostMemory {
+            physical: 8 << 30,
+            free: 4 << 30,
+            file: 0,
+            ..quiet
+        };
+        let sized = |host: memory::HostMemory, label: &str| {
+            let _host = memory::scoped_test_host(host);
+            let mut store =
+                Store::open_fixture(&gguf, Some(&temp.0.join(format!("{label}-cache")))).unwrap();
+            store.plan.physical_bytes = Some(host.physical);
+            store.set_store_plan(
+                crate::engine::memory_plan::StorePlan {
+                    whole: false,
+                    expert_cap_bytes: 1 << 40,
+                    row_cache_bytes: 2 << 30,
+                },
+                1 << 30,
+            );
+            assert!(
+                store
+                    .select_direct_residency_with(
+                        EXPERTS,
+                        1 << 30,
+                        &mut memory::direct_gate,
+                        &mut |_| panic!("a streamed store allocates no full banks"),
+                    )
+                    .unwrap()
+            );
+            (
+                store.cache_limit,
+                store.slot_bank_budget,
+                store.plan.partial_expert_slots,
+            )
+        };
+        let at_quiet = sized(quiet, "quiet");
+        assert_eq!(at_quiet.0, (1 << 40) + (3 << 30));
+        assert_eq!(at_quiet.2, EXPERTS);
+        assert_eq!(sized(busy, "busy"), at_quiet);
     }
 
     #[test]
@@ -3370,13 +3583,13 @@ mod direct_tests {
         let gguf = temp.0.join("zero-bank-gate-refusal.gguf");
         write_fixture(&gguf);
         let mut store = Store::open_fixture(&gguf, Some(&temp.0.join("cache"))).unwrap();
-        let anonymous_budget = 512 << 20;
+        store.plan_fixture_store().unwrap();
+        let planned_limit = store.cache_limit;
         let handled = store
             .select_direct_residency_with(
                 EXPERTS,
                 0,
-                &mut |plan, _, _, _| {
-                    plan.budget = anonymous_budget;
+                &mut |plan, _, _| {
                     plan.bank_budget = 0;
                     Err(err("injected zero-bank full-gate refusal"))
                 },
@@ -3387,7 +3600,7 @@ mod direct_tests {
         assert!(!store.plan.direct);
         assert!(store.plan.partial_direct_gate);
         assert!(store.plan.use_direct_turn_floor());
-        assert_eq!(store.plan.budget, anonymous_budget);
+        assert_eq!(store.plan.budget, planned_limit);
         assert_eq!(store.plan.bank_budget, 0);
         assert_eq!(store.slot_bank_budget, Some(0));
         assert_eq!(store.plan.partial_expert_slots, 0);
@@ -3402,10 +3615,11 @@ mod direct_tests {
         let gguf = temp.0.join("full-allocation-rollback.gguf");
         write_fixture(&gguf);
         let mut store = Store::open_fixture(&gguf, Some(&temp.0.join("cache"))).unwrap();
+        store.plan_fixture_store().unwrap();
         let original_budget = store.plan.budget;
         let original_cache_limit = store.cache_limit;
         let error = store
-            .select_direct_residency_with(EXPERTS, 0, &mut memory::direct_plan, &mut |_| {
+            .select_direct_residency_with(EXPERTS, 0, &mut memory::direct_gate, &mut |_| {
                 Err(err("injected full-bank allocation refusal"))
             })
             .unwrap_err();
@@ -3458,15 +3672,15 @@ mod direct_tests {
         for (capacity, live_gib) in [(2usize, 40u64), (3, 20)] {
             let store = make_store();
             let mut decoder = decoder::Decoder::new(base_config.clone(), store).unwrap();
+            decoder.weights.plan_fixture_store().unwrap();
+            let planned_limit = decoder.weights.cache_limit;
             decoder.register_cache_limit();
-            let anonymous_budget = 512 << 20;
             let handled = decoder
                 .weights
                 .select_direct_residency_with(
                     experts,
                     0,
-                    &mut |plan, _, _, bank_bytes| {
-                        plan.budget = anonymous_budget;
+                    &mut |plan, _, bank_bytes| {
                         plan.bank_budget = bank_bytes * capacity as u64 / experts as u64;
                         plan.live_non_reclaimable = live_gib << 30;
                         plan.available_bytes = Some((128 - live_gib) << 30);
@@ -3488,10 +3702,7 @@ mod direct_tests {
             decoder.weights.prepare_fixture_hot().unwrap();
             decoder.weights.publish_live();
             decoder.residency_changed();
-            assert_eq!(
-                decoder.weights.cache_budget(),
-                anonymous_budget + bank_budget
-            );
+            assert_eq!(decoder.weights.cache_budget(), planned_limit);
 
             decoder.weights.begin_turn().unwrap();
             let mut logits = decoder.prefill_prompt(&prompt).unwrap();
@@ -4258,9 +4469,10 @@ mod direct_tests {
         write_fixture(&gguf);
         let cache = temp.0.join("fresh-research-cache");
         let mut store = Store::open_fixture(&gguf, Some(&cache)).unwrap();
+        store.plan_fixture_store().unwrap();
         assert!(
             store
-                .select_direct_residency_with(EXPERTS, 0, &mut memory::direct_plan, &mut |_| Ok(()))
+                .select_direct_residency_with(EXPERTS, 0, &mut memory::direct_gate, &mut |_| Ok(()))
                 .unwrap()
         );
         store.activate_expert_slots().unwrap();
@@ -4294,26 +4506,23 @@ mod direct_tests {
             .attach_auxiliary(Store::open_fixture(&aux, None).unwrap())
             .unwrap();
         let estimate = store.mtp_bank_estimate().unwrap();
-        let dense = store.fixed_projection_bytes().unwrap();
         assert!(estimate > 0);
+        store.plan_fixture_store().unwrap();
         let mut charged = None;
         assert!(
             store
                 .select_direct_residency_with(
                     EXPERTS,
                     1 << 30,
-                    &mut |plan, need, pool, banks| {
-                        charged = Some((need, pool, banks));
-                        memory::direct_plan(plan, need, pool, banks)
+                    &mut |plan, need, banks| {
+                        charged = Some((need, banks));
+                        memory::direct_gate(plan, need, banks)
                     },
                     &mut |_| Ok(()),
                 )
                 .unwrap()
         );
-        assert_eq!(
-            charged,
-            Some((dense + estimate, 1 << 30, store.plan.direct_bytes))
-        );
+        assert_eq!(charged, Some((1 << 30, store.plan.direct_bytes)));
         assert_eq!(store.draft_bank_budget, estimate);
         store.prepare_fixture_hot().unwrap();
         let live = Arc::clone(&store.live);

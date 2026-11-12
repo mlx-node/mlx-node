@@ -43,20 +43,39 @@ weights load only when used. Text-only GGUF generation needs no auxiliary model.
 
 ## Memory and SSD residency
 
-The weight budget is calculated at bootstrap from actual tensor sizes,
-physical RAM, and live free/file-backed memory. It reserves one eighth of RAM
-for the system (bounded to 2–16 GiB), plus 4 GiB for runtime work, and caps
-weights at 75% of physical RAM. Anonymous inactive and compressed memory do
-not count as available. The budget is reconciled after tokenizer and page-pool
-creation; growth rechecks headroom.
+One memory plan sizes everything, as Splash's `planStreamedMemory` and
+`evaluateEngineMemoryPlan` do. Before any payload read the load prices, from
+the tensor descriptors alone: the fixed weights (the hot set less the routed
+experts, the MTP draft banks, and the vision tower when it is available), the
+routed experts (all of them, and their floor of `top-k` slots), and the
+decoded-row cache's share (the PLE and token rows a 128K-token prompt reads,
+decoded BF16, plus the read staging). The hard budget is the Metal working set
+less 15% and 1 GiB, lowered by `maxMemoryBytes` (`--max-memory`). In order:
 
-For a supported GGUF checkpoint, the load first offers the routed experts full
-direct residency: anonymous banks at the checkpoint's full expert count, with
-slot id equal to expert id. The live-memory gate must admit the whole bank set
-beside fixed projection banks, sparse-row/staging room, the paged KV pool, and
-any MTP draft banks. Its bank allowance is physical RAM minus a 4 GiB margin,
-the host's live non-reclaimable memory (wired, compressor, and anonymous pages
-other than purgeable pages), and that other anonymous need. Full direct banks
+1. The floors (fixed weights, reserves, the expert floor, the row staging and
+   the smallest lane) must fit, or the load is refused before it reads a byte.
+2. The KV allowance comes first: the dynamic bytes at which every lane the
+   load serves (the AR lane, and the MTP lane with MTP weights) holds
+   `min(trained, 65,536)` tokens.
+3. The experts load whole only where they leave the allowance and the row
+   share; otherwise they stream with a cap of what the allowance and the share
+   leave. The row cache takes what the allowance leaves of its share.
+
+The store's weight budget is the fixed weights plus the expert cap plus the
+row cache. The host only gates allocations: a refused allocation is smaller
+(partial slots of what the host admits), but the plan keeps counting the store
+at its cap, so the window does not move. After the load the engine plan is
+evaluated from what is resident with the stores held back at their cap. If
+the measured weights leave the lanes less than the allowance, the shortfall is
+taken back from a streamed cap before any slot exists. A larger budget never
+serves less context.
+
+When the plan loads the experts whole, the load gives them full direct
+residency: anonymous banks at the checkpoint's full expert count, with slot id
+equal to expert id. A host gate still admits the bank set beside the fixed
+weights, the row cache and the KV allowance; its bank allowance is physical
+RAM minus a 4 GiB margin and the host's live non-reclaimable memory (wired,
+compressor, and anonymous pages other than purgeable pages). Full direct banks
 have no misses or LRU replacement.
 
 Eight reader threads fill every layer's three banks from the main GGUF shard
@@ -68,8 +87,9 @@ shard boundaries, and every shard's identity and tensor bounds are checked
 before publication. A changed, missing, or truncated source fails the fill;
 partially written banks are never published.
 
-Below the full-bank gate, the remaining bank budget sizes and caps a partial
-slot capacity. Partial misses use the same direct-GGUF GPU fill pipeline and
+A streamed plan, or a host refusal of the whole bank set, gives partial
+slots: the plan's expert cap (less its staging) sizes and caps the slot
+capacity. Partial misses use the same direct-GGUF GPU fill pipeline and
 8 MiB read bound. Prefill keeps its last-assignment expert groups, whose expert
 sets are disjoint, so a cold window reads each selected expert at most once per
 layer. `direct` reports only the full identity-resident plan; partial direct
@@ -179,14 +199,19 @@ block order, the order of the one-simdgroup chain it replaces, before the same
 `simd_sum`. Every F32 sum and BF16 output keeps its bits; a partial sum per
 simdgroup would reassociate the chain and is not used.
 
-The shared scheduler supports up to four live owners. QSA K/V pages are admitted
-against a pool capped at 1 GiB; recurrent rows and MTP draft state are admitted
-against the 4 GiB working allowance left after that pool and the prefill window
-(a queued turn's reservation counts until its state exists, and a resumed
-turn re-reserves its full token bound), and a turn is refused only when that
-allowance cannot hold its state. The effective
-context is bounded by cache geometry, the trained limit, and 32,768 tokens;
-inspect `contextLimits()` for the admitted geometry. Multi-owner decode keeps stateful attention per owner and batches stateless
+The shared scheduler supports up to four live owners. The QSA K/V pool starts at
+a 96-block runway and grows by 171-block extents to the plan's maximum, each
+growth checked against the plan's ceiling; a turn books its pages as it writes
+them. Each page is priced with the indexer's block keys beside its K/V. The
+pool, the recurrent rows (one cell per owner, kept beside the pool), the MTP
+draft state and the prefill transient share the plan's one dynamic budget: a
+turn's state is admitted against what the pool's blocks and the transient
+leave, and a turn is refused only when that budget cannot hold its state. The
+effective window is the plan's AR window (65,536 tokens on a 36 GB Mac, the
+trained 262,144 when the experts load whole with room to spare); an MTP turn
+takes the MTP lane's window. The output budget is the rest of the window, and
+an omitted one fills it. Inspect `contextLimits()` for the windows and
+`/v1/models` for the load-free estimate before a load. Multi-owner decode keeps stateful attention per owner and batches stateless
 MLP projections across ready rows. Warm continuation reuses that
 owner's full state; standalone KV-only prefix restores are disabled because
 recurrent, PLE, and indexer state are also required.

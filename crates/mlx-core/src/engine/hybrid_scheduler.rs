@@ -377,6 +377,11 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn scheduled_state_capacity(&self) -> Option<ScheduledStateCapacity> {
         None
     }
+    /// Give back memory the state budget is charged for (free pool extents)
+    /// toward `shortfall` bytes; true when anything was freed.
+    fn reclaim_for_scheduled_state(&mut self, _shortfall: u64) -> bool {
+        false
+    }
     /// Off-pool state this turn adds beside what the family already holds.
     fn scheduled_state_candidate_bytes(
         &self,
@@ -3133,16 +3138,27 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 self.scheduler
                     .outstanding_scheduled_state_bytes(|seq| inner.scheduled_state_held_bytes(seq))
             };
-            let state = scheduled_state_fit(
-                self.inner.scheduled_state_capacity(),
-                outstanding_bytes,
-                state_candidate_bytes,
-            );
-            if state == ScheduledStateFit::Never {
-                return Err(self.scheduled_state_exceeded(state_candidate_bytes));
-            }
+            let capacity = self.inner.scheduled_state_capacity();
+            let state = scheduled_state_fit(capacity, outstanding_bytes, state_candidate_bytes);
             if decision.admitted && state == ScheduledStateFit::Fits {
                 return Ok(MemoryReserveOutcome::Admitted);
+            }
+            // Splash `Cache::takeReclaim`: free pool extents first, then idle
+            // owners; state is refused only once neither frees anything.
+            if state != ScheduledStateFit::Fits
+                && let Some(capacity) = capacity
+                && self.inner.reclaim_for_scheduled_state(
+                    capacity
+                        .held
+                        .saturating_add(outstanding_bytes)
+                        .saturating_add(state_candidate_bytes)
+                        .saturating_sub(capacity.budget),
+                )
+            {
+                if let Some(updated) = self.inner.scheduler_cache_snapshot()? {
+                    snapshot = updated;
+                }
+                continue;
             }
             // An on-demand family's pool starts at a runway: ask for the
             // grow once before an idle owner's cache is given up, as Splash
@@ -3168,6 +3184,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 }
             }
             if !self.reclaim_one_idle_scheduled_with(seq_id, &mut release_cache)? {
+                if state == ScheduledStateFit::Never {
+                    return Err(self.scheduled_state_exceeded(state_candidate_bytes));
+                }
                 if may_wait {
                     if self.inner.scheduler_books_on_demand()
                         && !grown_for_live_turns

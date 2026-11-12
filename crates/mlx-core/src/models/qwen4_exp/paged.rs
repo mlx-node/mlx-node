@@ -12,30 +12,100 @@ use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use napi::{Error, Result};
 use std::sync::{Arc, Mutex};
 
-pub fn create(config: &super::config::Config) -> Result<PagedKVCacheAdapter> {
+/// The pool of the memory plan: it starts at the runway and grows by
+/// extents to the plan's pages, each growth probed against `ceiling`.
+pub fn create(
+    config: &super::config::Config,
+    plan: &crate::engine::memory_plan::PoolPlan,
+    ceiling: u64,
+) -> Result<PagedKVCacheAdapter> {
+    let cfg = pool_config(config, plan.max_blocks)?;
+    let mut adapter = build(cfg, plan.runway_blocks, plan.max_blocks)?;
+    if plan.runway_blocks < plan.max_blocks {
+        adapter.set_extent_growth(
+            crate::models::qwen3_5::dflash2_decode::runway_pool_extent_blocks(
+                adapter.bytes_per_block().map_err(Error::from_reason)?,
+            ),
+        );
+    }
+    adapter.set_memory_ceiling(ceiling);
+    Ok(adapter)
+}
+
+/// A pool of `initial` blocks that grows to `max`, for fixtures.
+#[cfg(test)]
+pub fn create_with_blocks(
+    config: &super::config::Config,
+    initial: u32,
+    max: u32,
+) -> Result<PagedKVCacheAdapter> {
+    let cfg = pool_config(config, max)?;
+    build(cfg, initial, max)
+}
+
+/// A fixture's pool of four sequences of its trained window (at most
+/// 32,768 tokens) within 1 GiB, at that size from the start.
+#[cfg(test)]
+pub fn create_fixture(config: &super::config::Config) -> Result<PagedKVCacheAdapter> {
+    let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
+        super::load_plan::full_attention_layers(config) as u32,
+        config.num_key_value_heads as u32,
+        config.head_dim as u32,
+        32,
+        mlx_paged_attn::metal::MetalDtype::BFloat16,
+    )
+    .map_err(|e| Error::from_reason(e.to_string()))?;
+    let count = ((1u64 << 30) / bytes_per_block.max(1))
+        .min(u64::from(config.max_position_embeddings.min(32_768) as u32).div_ceil(32) * 4)
+        as u32;
+    create_with_blocks(config, count, count)
+}
+
+fn pool_config(
+    config: &super::config::Config,
+    max_blocks: u32,
+) -> Result<mlx_paged_attn::PagedAttentionConfig> {
+    let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
+        super::load_plan::full_attention_layers(config) as u32,
+        config.num_key_value_heads as u32,
+        config.head_dim as u32,
+        32,
+        mlx_paged_attn::metal::MetalDtype::BFloat16,
+    )
+    .map_err(|e| Error::from_reason(e.to_string()))?;
     let cfg = mlx_paged_attn::PagedAttentionConfig {
         block_size: 32,
-        gpu_memory_mb: 1024,
+        // `validate` refuses less than `MIN_GPU_MEMORY_MB`; the block counts
+        // size the pool.
+        gpu_memory_mb: (u64::from(max_blocks) * bytes_per_block)
+            .div_ceil(1 << 20)
+            .clamp(
+                u64::from(mlx_paged_attn::MIN_GPU_MEMORY_MB),
+                u64::from(u32::MAX),
+            ) as u32,
         head_size: config.head_dim as u32,
         num_kv_heads: config.num_key_value_heads as u32,
-        num_layers: (0..config.num_hidden_layers)
-            .filter(|&i| !config.linear(i))
-            .count() as u32,
+        num_layers: super::load_plan::full_attention_layers(config) as u32,
         use_fp8_cache: Some(false),
-        max_seq_len: Some(config.effective_context_limit() as u32),
+        max_seq_len: Some(config.max_position_embeddings.min(u32::MAX as usize) as u32),
         max_batch_size: Some(4),
     };
     cfg.validate().map_err(Error::from_reason)?;
-    let count = cfg
-        .calculate_num_blocks()
-        .min((config.effective_context_limit() as u32).div_ceil(32) * 4);
+    Ok(cfg)
+}
+
+fn build(
+    cfg: mlx_paged_attn::PagedAttentionConfig,
+    initial: u32,
+    max: u32,
+) -> Result<PagedKVCacheAdapter> {
     let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
-        count, count, 32,
+        initial, max, 32,
     )));
     let pool = mlx_paged_attn::LayerKVPool::new(
         cfg,
-        count,
-        count,
+        initial,
+        max,
         mlx_paged_attn::metal::MetalDtype::BFloat16,
     )
     .map_err(|e| Error::from_reason(e.to_string()))?;
@@ -301,6 +371,27 @@ impl Inner {
         self.activate_paged_seq(seq)
     }
 
+    /// The pool's share of the dynamic budget now.
+    fn pool_charge(&self) -> super::memory::PoolCharge {
+        let c = &self.decoder.config;
+        let (telemetry, physical) = self
+            .decoder
+            .paged
+            .as_ref()
+            .and_then(|p| Some((p.block_telemetry().ok()?, p.bytes_per_block().ok()?)))
+            .unwrap_or_default();
+        let total_blocks = u64::from(telemetry.total_blocks);
+        super::memory::PoolCharge {
+            total_blocks,
+            max_blocks: u64::from(telemetry.max_total_blocks),
+            allocated_blocks: u64::from(telemetry.allocated_blocks),
+            physical_block_bytes: physical,
+            index_block_bytes: super::load_plan::index_block_bytes(c),
+            growth_copy_bytes: total_blocks.saturating_mul(physical)
+                / (super::load_plan::full_attention_layers(c) as u64).max(1),
+        }
+    }
+
     fn park_row(&mut self) {
         if let Some(seq) = self.active_seq.take() {
             self.rows.insert(seq, self.decoder.take_state());
@@ -324,18 +415,14 @@ impl HybridSchedulerBackend for Inner {
     type OwnerState = Vec<u32>;
     type StepExecutor<'a> = HybridStepExecutor<'a, Self>;
     const SCHEDULER_NAME: &'static str = "qwen4_exp";
+    /// The store's budget and the plan's dynamic budget, which holds the
+    /// pool, the rows' state and the transient.
     fn scheduler_wired_bytes(&self) -> Option<usize> {
-        let pages = self.decoder.paged.as_ref().map_or(Some(0), |p| {
-            p.bytes_per_block()
-                .ok()?
-                .checked_mul(u64::from(p.block_capacity()))
-        })?;
         let bytes = self
             .decoder
             .weights
             .cache_budget()
-            .checked_add(pages)?
-            .checked_add(super::memory::WORKING_BYTES)?;
+            .checked_add(self.memory_plan.dynamic_budget_bytes)?;
         usize::try_from(bytes).ok()
     }
     fn paged_adapter(&self) -> Option<&PagedKVCacheAdapter> {
@@ -363,7 +450,9 @@ impl HybridSchedulerBackend for Inner {
     }
     fn reserve_scheduled_speculation(&mut self, seq: SeqId, queries: usize) -> Result<bool> {
         self.activate_paged_seq(seq)?;
-        if self.decoder.history.len() + queries > self.decoder.config.effective_context_limit() {
+        let window = super::load_plan::mtp_window(&self.decoder.config, &self.memory_plan)
+            .map_or(self.decoder.context_window, |window| window as usize);
+        if self.decoder.history.len() + queries > window {
             return Ok(false);
         }
         Ok(self
@@ -420,6 +509,22 @@ impl HybridSchedulerBackend for Inner {
     fn scheduler_prefill_slice_tokens(&self) -> u32 {
         self.decoder.prefill_slice_size() as u32
     }
+    fn scheduler_output_budget_is_rest_of_window(&self) -> bool {
+        true
+    }
+    /// Splash `Cache::ensureTokens`: the pool starts at its runway and a
+    /// turn books its pages as it writes them.
+    fn scheduler_books_on_demand(&self) -> bool {
+        true
+    }
+    fn planned_turn_window(&self, speculative: bool) -> Option<u32> {
+        let pool = self.memory_plan.pool.as_ref()?;
+        Some(if speculative {
+            super::load_plan::mtp_window(&self.decoder.config, &self.memory_plan)?
+        } else {
+            pool.lane.window.maximum()
+        })
+    }
     fn scheduler_whole_prompt_prefill(&self, prompt_tokens: u32, cached_prefix: u32) -> bool {
         self.media_prefill.is_none()
             && self
@@ -427,24 +532,37 @@ impl HybridSchedulerBackend for Inner {
                 .group_mode(prompt_tokens.saturating_sub(cached_prefix) as usize)
     }
     fn max_position_embeddings(&self) -> i32 {
-        self.decoder.config.effective_context_limit() as i32
+        self.decoder
+            .config
+            .max_position_embeddings
+            .min(i32::MAX as usize) as i32
     }
     fn scheduled_state_capacity(&self) -> Option<ScheduledStateCapacity> {
         let c = &self.decoder.config;
-        let pool = self.decoder.paged.as_ref().map_or(0, |p| {
-            p.bytes_per_block()
-                .unwrap_or(0)
-                .saturating_mul(u64::from(p.block_capacity()))
-        });
         let row = super::memory::row_state_bytes(c);
         Some(ScheduledStateCapacity {
             budget: super::memory::scheduled_state_budget(
-                pool,
-                super::memory::prefill_scratch(c, self.decoder.prefill_chunk_size),
+                self.memory_plan.dynamic_budget_bytes,
+                super::memory::prefill_scratch(
+                    c,
+                    self.decoder.prefill_chunk_size,
+                    self.decoder.context_window,
+                ),
+                &self.pool_charge(),
             ),
             held: (self.rows.len() + usize::from(self.active_seq.is_some())) as u64 * row
                 + self.mtp.held_bytes(c),
         })
+    }
+    /// The state budget is charged for every block the pool holds, and the
+    /// pool only grows: a refused state need takes its free extents back
+    /// (Splash `Cache::releaseExtent`), cached pages last.
+    fn reclaim_for_scheduled_state(&mut self, shortfall: u64) -> bool {
+        let Some(paged) = self.decoder.paged.as_mut() else {
+            return false;
+        };
+        paged.try_release_pool_extents(shortfall, false) > 0
+            || paged.try_release_pool_extents(shortfall, true) > 0
     }
     fn scheduled_state_candidate_bytes(&self, seq: SeqId, tokens: u32, speculative: bool) -> u64 {
         let c = &self.decoder.config;

@@ -108,6 +108,7 @@ pub(crate) fn evaluate_qwen35_plan(
             0
         },
         draft_weights_bytes: draft.map_or(0, |draft| draft.weight_bytes),
+        held_back_bytes: 0,
     };
     let recurrent_state_bytes = lanes.recurrent_state_bytes;
     let trained = config.max_position_embeddings.max(0) as u32;
@@ -136,6 +137,7 @@ pub(crate) fn evaluate_qwen35_plan(
             recurrent_state_bytes,
         ),
         explicit_mib: geometry.explicit_mib,
+        lane_in_pool: true,
     });
     let (block_size, tap_layers) =
         draft.map_or((0, 0), |draft| (draft.block_size, draft.tap_layers));

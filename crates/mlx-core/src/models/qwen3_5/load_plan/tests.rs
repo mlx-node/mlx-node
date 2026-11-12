@@ -364,6 +364,7 @@ fn audit_counts_this_pools_staging_once() {
             other_pool_bytes: others,
             staging_bytes: staging,
             draft_weights_bytes: 0,
+            held_back_bytes: 0,
         },
         margin_bytes: 0,
         hard_budget_bytes: active

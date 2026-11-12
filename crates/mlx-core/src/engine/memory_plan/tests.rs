@@ -37,6 +37,7 @@ fn footprint(working_set: u64, active: u64, max_memory: Option<u64>) -> MemoryFo
         other_pool_bytes: 0,
         staging_bytes: STAGING,
         draft_weights_bytes: 0,
+        held_back_bytes: 0,
     }
 }
 
@@ -79,6 +80,7 @@ fn qwen38_plan(
         layers: 16,
         runway_blocks: QWEN38_RUNWAY_BLOCKS,
         explicit_mib,
+        lane_in_pool: true,
     };
     let speculative = draft.then(|| FlatInput {
         shape: LaneShape {
@@ -656,4 +658,420 @@ fn dflash2_growth_follows_the_plan_headroom() {
     let after = plan.live_headroom(snapshot(blocks)).expect("readable");
     assert_eq!(after, 2_094_845_132);
     assert!(dflash2_growth_fits(after, &need), "books");
+}
+
+/// Splash `engine_memory_plan_test` `kStudio` (M5 Max 36 GB) working set.
+const STUDIO_WORKING_SET: u64 = 30_150_672_384;
+/// Splash `kFlashNext`: the images that load and the routed experts.
+const FLASH_NEXT_LOADED: u64 = 3_076_735_760;
+const FLASH_NEXT_EXPERTS: u64 = 33_976_681_712;
+/// The top 10 of 512 experts of all 48 routed layers and one layer more.
+const FLASH_NEXT_EXPERT_MINIMUM: u64 = 10 * (FLASH_NEXT_EXPERTS + FLASH_NEXT_EXPERTS / 48) / 512;
+/// One Flash Next page: the K/V of 12 layers and their block index.
+const FLASH_NEXT_PAGE: u64 = 811_008;
+/// The row cache's read staging (`MAX_READ_BYTES * 6`).
+const ROW_READ_STAGING: u64 = 6 * 64 * MIB;
+/// PLE: 16 ids a token (8 heads of each of 2 n-gram orders), rows of 160
+/// bf16; token rows of 2,560 bf16 in a 248,320-token vocabulary.
+const PLE_IDS_PER_TOKEN: u64 = 16;
+const PLE_ROW_BYTES: u64 = 320;
+const PLE_ROWS: u64 = 20_000_000;
+const TOKEN_ROWS: u64 = 248_320;
+const TOKEN_ROW_BYTES: u64 = 5_120;
+const FLASH_NEXT_TRAINED: u32 = 262_144;
+
+fn flash_next_layout() -> KvLayout {
+    KvLayout::of(12, 2, 256, DType::BFloat16, KvFormat::Bf16).with_index(128)
+}
+
+/// The Flash Next pool lane: the cell, 1,024-row prefill chunks priced at
+/// the window, 12 layers of priced pages from the 96-page runway.
+fn flash_next_pool<'a>(
+    transient: &'a dyn Fn(u32) -> u64,
+    lane_bytes: u64,
+    lane_in_pool: bool,
+) -> PoolInput<'a> {
+    let layout = flash_next_layout();
+    PoolInput {
+        shape: LaneShape {
+            trained: FLASH_NEXT_TRAINED,
+            lane_bytes,
+            layout,
+            scratch_rows: SPECULATIVE_SCRATCH_TOKENS,
+            transient,
+        },
+        bytes_per_block: layout.page_bytes(),
+        layers: 12,
+        runway_blocks: layout.runway_pages() as u32,
+        explicit_mib: None,
+        lane_in_pool,
+    }
+}
+
+fn flash_next_rows() -> StreamedPart {
+    StreamedPart {
+        all: table_share_bytes(PLE_IDS_PER_TOKEN, PLE_ROWS, PLE_ROW_BYTES)
+            + table_share_bytes(1, TOKEN_ROWS, TOKEN_ROW_BYTES)
+            + ROW_READ_STAGING,
+        minimum: ROW_READ_STAGING,
+    }
+}
+
+/// What a Flash Next load plans: the store before any read, then the engine
+/// plan with the store at its cap; the AR window, and with MTP weights the
+/// MTP lane's.
+struct FlashNextLoad {
+    allowance: u64,
+    minimum_dynamic: u64,
+    store: Result<StorePlan, PlanError>,
+    plan: Option<MemoryPlan>,
+    ar_window: u32,
+    mtp_window: Option<u32>,
+}
+
+fn flash_next_load(
+    working_set: u64,
+    max_memory: Option<u64>,
+    mtp: bool,
+    lane_in_pool: bool,
+) -> FlashNextLoad {
+    use crate::models::qwen4_exp::{
+        draft_state_bytes, flash_next_config, prefill_scratch, row_state_bytes,
+    };
+    let c = flash_next_config();
+    let transient = |window: u32| prefill_scratch(&c, 1024, window as usize);
+    let layout = flash_next_layout();
+    let pool = flash_next_pool(&transient, row_state_bytes(&c), lane_in_pool);
+    let draft = |window: u32| draft_state_bytes(&c, u64::from(window));
+    let ar = |dynamic: u64| pool.plan_at(dynamic).lane.window.maximum();
+    let mtp_lane = |dynamic: u64| pool.plan_at(dynamic).window_with(&draft);
+    let lanes: Vec<&dyn Fn(u64) -> u32> = if mtp { vec![&ar, &mtp_lane] } else { vec![&ar] };
+    let tokens = pool.shape.trained.min(RESIDENT_ALLOWANCE_TOKENS);
+    let allowance = allowance_dynamic_bytes(&lanes, tokens);
+    let runway_tokens = (layout.runway_pages() * KV_PAGE_TOKENS) as u32;
+    let pool_minimum = pool.plan_at(0).lane.minimum_bytes;
+    let minimum_dynamic = if mtp {
+        pool_minimum + draft(runway_tokens)
+    } else {
+        pool_minimum
+    };
+    let hard = hard_budget_bytes(working_set, max_memory);
+    let store = plan_streamed_store(&StreamedInputs {
+        hard,
+        bound: MemoryBound::of(max_memory, hard),
+        fixed: FLASH_NEXT_LOADED,
+        allowance,
+        minimum_dynamic,
+        experts: StreamedPart {
+            all: FLASH_NEXT_EXPERTS,
+            minimum: FLASH_NEXT_EXPERT_MINIMUM,
+        },
+        rows: flash_next_rows(),
+    });
+    let plan = store.as_ref().ok().and_then(|store| {
+        let footprint = MemoryFootprint {
+            working_set_bytes: working_set,
+            max_memory_bytes: max_memory,
+            active_bytes: FLASH_NEXT_LOADED,
+            other_pool_bytes: 0,
+            staging_bytes: 0,
+            draft_weights_bytes: 0,
+            held_back_bytes: store.expert_cap_bytes + store.row_cache_bytes,
+        };
+        MemoryPlan::evaluate(footprint, Some(pool), None, None).ok()
+    });
+    let ar_window = plan
+        .as_ref()
+        .and_then(|plan| plan.pool)
+        .map_or(0, |pool| pool.lane.window.maximum());
+    let mtp_window = mtp.then(|| {
+        plan.as_ref()
+            .and_then(|plan| plan.pool)
+            .map_or(0, |pool| pool.window_with(&draft))
+    });
+    FlashNextLoad {
+        allowance,
+        minimum_dynamic,
+        store,
+        plan,
+        ar_window,
+        mtp_window,
+    }
+}
+
+fn ar_load(working_set: u64, max_memory: Option<u64>) -> FlashNextLoad {
+    flash_next_load(working_set, max_memory, false, false)
+}
+
+/// The 36 GB input: hard 24,554,329,702; the floors leave the allowance of
+/// a 65,536-token window (4,468,093,952), the row share (1,744,830,464) and
+/// a streamed store of 14,459,363,158; the engine plan with the store at
+/// its cap gives that window in 2,080 pages, from a 96-page runway.
+/// Mutation: trained window `.min(32_768)` in the lane → red (allowance
+/// 3,031,544,832).
+#[test]
+fn flash_next_window_for_a_fixed_plan_input() {
+    let load = ar_load(STUDIO_WORKING_SET, None);
+    assert_eq!(hard_budget_bytes(STUDIO_WORKING_SET, None), 24_554_329_702);
+    assert_eq!(load.allowance, 4_468_093_952);
+    let store = load.store.expect("store plan");
+    assert_eq!(
+        store,
+        StorePlan {
+            whole: false,
+            expert_cap_bytes: 14_459_363_158,
+            row_cache_bytes: 1_744_830_464,
+        }
+    );
+    let plan = load.plan.expect("engine plan");
+    assert_eq!(plan.dynamic_budget_bytes, 4_468_093_952);
+    let pool = plan.pool.expect("pool");
+    assert_eq!(pool.lane.window.maximum(), 65_536);
+    assert_eq!(pool.lane.window.bound(), "memory");
+    assert_eq!(pool.max_blocks, 2_080);
+    assert_eq!(pool.runway_blocks, 96);
+    assert_eq!(pool.bytes_per_block, FLASH_NEXT_PAGE);
+}
+
+/// The 64K allowance holds on Splash's 36 GB Mac and on the M3 Pro inputs
+/// (store 13,473,666,492). Mutation: the lane minimum instead of the
+/// allowance in `plan_streamed_store` → red (store 17,081,392,982, window
+/// 0).
+#[test]
+fn flash_next_36gb_plan_keeps_64k() {
+    for (working_set, cap) in [
+        (STUDIO_WORKING_SET, 14_459_363_158),
+        (M3_PRO_WORKING_SET, 13_473_666_492),
+    ] {
+        let load = ar_load(working_set, None);
+        assert_eq!(
+            load.store.expect("store plan").expert_cap_bytes,
+            cap,
+            "{working_set}"
+        );
+        assert!(
+            load.ar_window >= 65_536,
+            "{working_set}: {}",
+            load.ar_window
+        );
+    }
+}
+
+/// The streamed experts take all the allowance leaves: one page less of
+/// dynamic budget and the window drops below 64K (65,529). Mutation: the
+/// allowance plus one 160-page extent in `plan_streamed_store` → red
+/// (68,259 a page under).
+#[test]
+fn streamed_experts_take_all_the_allowance_leaves() {
+    use crate::models::qwen4_exp::{flash_next_config, prefill_scratch, row_state_bytes};
+    let load = ar_load(STUDIO_WORKING_SET, None);
+    let dynamic = load.plan.expect("engine plan").dynamic_budget_bytes;
+    let c = flash_next_config();
+    let transient = |window: u32| prefill_scratch(&c, 1024, window as usize);
+    let pool = flash_next_pool(&transient, row_state_bytes(&c), false);
+    assert!(pool.plan_at(dynamic).lane.window.maximum() >= 65_536);
+    assert_eq!(
+        pool.plan_at(dynamic - FLASH_NEXT_PAGE)
+            .lane
+            .window
+            .maximum(),
+        65_529
+    );
+}
+
+/// The experts load whole at hard 44,071,648,256 (the loaded bytes, the
+/// reserves, every expert, the row share and the allowance), and the
+/// window never shrinks as `--max-memory` grows from 12 GiB to the 128 GiB
+/// working set's hard budget in 16 MiB steps. Mutation: no allowance in
+/// the whole-experts test of `plan_streamed_store` → red (whole at
+/// 39,611,006,976, with no room left for the window).
+#[test]
+fn flash_next_window_never_shrinks_as_the_budget_grows() {
+    const THRESHOLD: u64 = 44_071_648_256;
+    let at = ar_load(128 * GIB, Some(THRESHOLD));
+    assert!(at.store.expect("store plan").whole);
+    assert_eq!(at.ar_window, 65_536);
+    let hard = hard_budget_bytes(128 * GIB, None);
+    let (mut previous, mut max_memory) = (0u32, 12 * GIB);
+    while max_memory <= hard {
+        let load = ar_load(128 * GIB, Some(max_memory));
+        let whole = load.store.expect("store plan").whole;
+        assert_eq!(whole, max_memory >= THRESHOLD, "{max_memory}");
+        assert!(
+            load.ar_window >= previous,
+            "window {} under {previous} at {max_memory}",
+            load.ar_window
+        );
+        previous = load.ar_window;
+        max_memory += 16 * MIB;
+    }
+    assert_eq!(previous, 262_144);
+}
+
+/// The Flash Next page is Splash's: K/V 786,432 and the index plane 24,576
+/// (12 layers of 8 blocks of 128 bf16); the 2,048-byte index region needs
+/// 32-page alignment, so extents run 96..224 pages and the runway is 96.
+/// Mutation: leave the index bytes out of `page_bytes` → red (786,432).
+#[test]
+fn flash_next_page_prices_the_index_plane() {
+    let layout = flash_next_layout();
+    assert_eq!(layout.page_bytes(), FLASH_NEXT_PAGE);
+    assert_eq!(layout.row_bytes(), 25_344);
+    assert_eq!(layout.extent_alignment_pages(), 32);
+    assert_eq!(layout.minimum_extent_pages(), 96);
+    assert_eq!(layout.maximum_extent_pages(), 224);
+    assert_eq!(layout.runway_pages(), 96);
+    assert_eq!(layout.extent_pages_for(2_080), 160);
+    let bare = KvLayout::of(12, 2, 256, DType::BFloat16, KvFormat::Bf16);
+    assert_eq!(bare.page_bytes(), 786_432);
+    assert_eq!(bare.extent_alignment_pages(), 2);
+    assert_eq!(ar_load(STUDIO_WORKING_SET, None).ar_window, 65_536);
+}
+
+/// A cell held beside the pool takes no pool blocks; inside it as well (the
+/// Qwen3.5 shape) the same budget holds 61,433. Mutation: subtract the lane
+/// from the pool KV whatever `lane_in_pool` says → red (the allowance grows
+/// to hold the lane, and the in-pool plan then reads 65,536).
+#[test]
+fn off_pool_lane_is_not_inside_the_pool() {
+    let off = ar_load(STUDIO_WORKING_SET, None);
+    assert_eq!(off.ar_window, 65_536);
+    let store = off.store.expect("store plan");
+    let footprint = off.plan.expect("engine plan").footprint;
+    use crate::models::qwen4_exp::{flash_next_config, prefill_scratch, row_state_bytes};
+    let c = flash_next_config();
+    let transient = |window: u32| prefill_scratch(&c, 1024, window as usize);
+    let inside = flash_next_pool(&transient, row_state_bytes(&c), true);
+    let plan = MemoryPlan::evaluate(footprint, Some(inside), None, None).expect("plan");
+    assert_eq!(
+        footprint.held_back_bytes,
+        store.expert_cap_bytes + store.row_cache_bytes
+    );
+    assert_eq!(plan.pool.expect("pool").lane.window.maximum(), 61_433);
+}
+
+/// With MTP weights the MTP lane (the cell and the draft state of its
+/// window) holds 64K too: allowance 5,746,994,176, store 13,180,462,934,
+/// pool 2,982 pages, AR 95,225, MTP 65,655. Mutation: check only the first
+/// lane in `allowance_dynamic_bytes` → red (allowance 4,468,093,952).
+#[test]
+fn mtp_lane_holds_the_allowance() {
+    let load = flash_next_load(STUDIO_WORKING_SET, None, true, false);
+    assert_eq!(load.allowance, 5_746_994_176);
+    assert_eq!(
+        load.store.expect("store plan").expert_cap_bytes,
+        13_180_462_934
+    );
+    assert_eq!(
+        load.plan.expect("plan").pool.expect("pool").max_blocks,
+        2_982
+    );
+    assert_eq!(load.ar_window, 95_225);
+    assert_eq!(load.mtp_window, Some(65_655));
+}
+
+/// The row share is the rows a 128K-token prompt reads (Splash
+/// `kTableShareTokens`): 2,097,152 PLE rows of 320 B, every token row of
+/// the 131,072 it can read, and the read staging. A table smaller than the
+/// prompt's ids is held whole. Mutation: `TABLE_SHARE_TOKENS` of 256K → red
+/// (1,342,177,280 per table).
+#[test]
+fn row_cache_share_is_a_128k_prompt() {
+    assert_eq!(
+        table_share_bytes(PLE_IDS_PER_TOKEN, PLE_ROWS, PLE_ROW_BYTES),
+        671_088_640
+    );
+    assert_eq!(
+        table_share_bytes(1, TOKEN_ROWS, TOKEN_ROW_BYTES),
+        671_088_640
+    );
+    assert_eq!(table_share_bytes(1, 100_000, TOKEN_ROW_BYTES), 512_000_000);
+    assert_eq!(ROW_READ_STAGING, 402_653_184);
+    assert_eq!(flash_next_rows().all, 1_744_830_464);
+}
+
+/// On a 128 GiB working set the experts load whole and the window is the
+/// trained one (dynamic 76,145,814,323); at the exact whole threshold the
+/// experts load whole, a byte under they stream. Mutation: `>` for `>=` in
+/// the whole-experts test of `plan_streamed_store` → red at the threshold.
+#[test]
+fn whole_experts_on_128g() {
+    let load = ar_load(128 * GIB, None);
+    assert!(load.store.expect("store plan").whole);
+    let plan = load.plan.expect("plan");
+    assert_eq!(plan.dynamic_budget_bytes, 76_145_814_323);
+    let pool = plan.pool.expect("pool");
+    assert_eq!(pool.lane.window.maximum(), 262_144);
+    assert_eq!(pool.lane.window.bound(), "model");
+    let threshold = 44_071_648_256;
+    assert!(
+        ar_load(128 * GIB, Some(threshold))
+            .store
+            .expect("at the threshold")
+            .whole
+    );
+    let under = ar_load(128 * GIB, Some(threshold - 1))
+        .store
+        .expect("a byte under");
+    assert!(!under.whole);
+    assert_eq!(under.expert_cap_bytes, FLASH_NEXT_EXPERTS - 1);
+}
+
+/// One byte under the floors (the loaded bytes, the reserves, the expert
+/// and row-cache minimums, the lane minimum) the plan refuses before any
+/// read, by that byte, with the bound's advice. Mutation: skip the floors
+/// check in `plan_streamed_store` → red (`Ok`).
+#[test]
+fn floors_over_hard_refuse_before_reading() {
+    let probe = ar_load(STUDIO_WORKING_SET, None);
+    let floors = FLASH_NEXT_LOADED
+        + PIPELINE_RESERVE_BYTES
+        + RUNTIME_OVERHEAD_RESERVE_BYTES
+        + FLASH_NEXT_EXPERT_MINIMUM
+        + ROW_READ_STAGING
+        + probe.minimum_dynamic;
+    let under = ar_load(STUDIO_WORKING_SET, Some(floors - 1));
+    let err = under.store.expect_err("under the floors");
+    match err {
+        PlanError::FloorsDoNotFit {
+            required,
+            budget,
+            bound,
+        } => {
+            assert_eq!(required - budget, 1);
+            assert_eq!(bound, MemoryBound::MaxMemory);
+        }
+        ref other => panic!("{other:?}"),
+    }
+    let message = err.message("Qwen4Exp");
+    assert!(
+        message.contains("the floors of the memory plan require")
+            && message.ends_with("raise --max-memory"),
+        "{message}"
+    );
+    assert!(ar_load(STUDIO_WORKING_SET, Some(floors)).store.is_ok());
+}
+
+/// The engine plan counts the expert store at its cap: a GiB less live with
+/// a GiB more held back plans the same window. Mutation: leave
+/// `held_back_bytes` out of the fixed bytes in `evaluate` → red (dynamic
+/// 21,746,029,398).
+#[test]
+fn held_back_counts_the_store_at_its_cap() {
+    use crate::models::qwen4_exp::{flash_next_config, prefill_scratch, row_state_bytes};
+    let load = ar_load(STUDIO_WORKING_SET, None);
+    let mut footprint = load.plan.expect("plan").footprint;
+    footprint.active_bytes -= GIB;
+    footprint.held_back_bytes += GIB;
+    let c = flash_next_config();
+    let transient = |window: u32| prefill_scratch(&c, 1024, window as usize);
+    let pool = flash_next_pool(&transient, row_state_bytes(&c), false);
+    let plan = MemoryPlan::evaluate(footprint, Some(pool), None, None).expect("plan");
+    assert_eq!(plan.dynamic_budget_bytes, 4_468_093_952);
+    assert_eq!(plan.pool.expect("pool").lane.window.maximum(), 65_536);
+    let text = plan.describe();
+    assert!(
+        text.contains("expert store and row cache above what is live: 17277935446 bytes"),
+        "{text}"
+    );
 }

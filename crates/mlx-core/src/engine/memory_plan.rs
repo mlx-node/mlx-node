@@ -26,6 +26,15 @@ const WARMUP_KV_PAGES: u64 = 64;
 const EXTENT_REGION_ALIGNMENT_BYTES: u64 = 64 * 1024;
 /// Splash `kAllocationExtentTargetBytes`.
 pub(crate) const EXTENT_TARGET_BYTES: u64 = 128 * MIB;
+/// Splash `SPLASH_ATTENTION_BLOCK_TOKENS`: the tokens one block-index row
+/// covers.
+const ATTENTION_BLOCK_TOKENS: u64 = 4;
+/// Splash `kResidentAllowanceTokens`: the context a target keeps resident
+/// before its streamed stores take the rest of the budget.
+pub(crate) const RESIDENT_ALLOWANCE_TOKENS: u32 = 65_536;
+/// Splash `kTableShareTokens`: the prompt whose table rows an automatic row
+/// cache holds.
+pub(crate) const TABLE_SHARE_TOKENS: u64 = 128 * 1024;
 
 /// The share of the working set the automatic budget keeps, less
 /// [`WORKING_SET_RESERVE_BYTES`]; Splash keeps `max(1 GiB, 2%)` instead
@@ -151,8 +160,9 @@ fn pages_for_aligned_region(bytes_per_page: u64) -> u64 {
     }
 }
 
-/// The target KV geometry Splash sizes its KV extents from (`kv::Layout`,
-/// no block index): `layers` full-attention layers of `heads` K/V heads.
+/// The target KV geometry Splash sizes its KV extents from (`kv::Layout`):
+/// `layers` full-attention layers of `heads` K/V heads and, with an
+/// `index_dimension`, a bf16 block index beside them in every page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KvLayout {
     pub layers: u64,
@@ -160,6 +170,7 @@ pub(crate) struct KvLayout {
     pub head_dim: u64,
     pub format: KvFormat,
     pub activation_bytes: u64,
+    pub index_dimension: u64,
 }
 
 impl KvLayout {
@@ -176,7 +187,22 @@ impl KvLayout {
             head_dim: head_dim.max(0) as u64,
             format,
             activation_bytes: dtype.byte_size() as u64,
+            index_dimension: 0,
         }
+    }
+
+    /// The layout with a block index of `dimension` per page
+    /// (`Layout::indexDimension`).
+    pub(crate) fn with_index(self, dimension: u64) -> Self {
+        Self {
+            index_dimension: dimension,
+            ..self
+        }
+    }
+
+    /// `indexBytesPerLayerPage`.
+    fn index_bytes_per_layer_page(&self) -> u64 {
+        KV_PAGE_TOKENS / ATTENTION_BLOCK_TOKENS * self.index_dimension * 2
     }
 
     fn data_bytes_per_layer_page(&self) -> u64 {
@@ -194,24 +220,35 @@ impl KvLayout {
         }
     }
 
-    /// K/V bytes of one page across every layer (`bytesPerModelPage`).
+    /// K/V and index bytes of one page across every layer
+    /// (`bytesPerModelPage`).
     pub(crate) fn page_bytes(&self) -> u64 {
-        self.layers * 2 * (self.data_bytes_per_layer_page() + self.scale_bytes_per_layer_page())
+        self.layers
+            * (2 * (self.data_bytes_per_layer_page() + self.scale_bytes_per_layer_page())
+                + self.index_bytes_per_layer_page())
     }
 
-    /// K/V bytes of one token row across every layer.
+    /// K/V and index bytes of one token row across every layer.
     pub(crate) fn row_bytes(&self) -> u64 {
         self.page_bytes() / KV_PAGE_TOKENS
     }
 
     /// `extentAlignmentPages`.
     pub(crate) fn extent_alignment_pages(&self) -> u64 {
-        match self.format {
+        let pages = match self.format {
             KvFormat::Bf16 => pages_for_aligned_region(self.data_bytes_per_layer_page()),
             KvFormat::Int8 => lcm(
                 pages_for_aligned_region(self.data_bytes_per_layer_page()),
                 pages_for_aligned_region(self.scale_bytes_per_layer_page()),
             ),
+        };
+        if self.index_dimension == 0 {
+            pages
+        } else {
+            lcm(
+                pages,
+                pages_for_aligned_region(self.index_bytes_per_layer_page()),
+            )
         }
     }
 
@@ -319,6 +356,9 @@ pub(crate) struct MemoryFootprint {
     pub staging_bytes: u64,
     /// Reported only: it is inside `active_bytes`.
     pub draft_weights_bytes: u64,
+    /// The streamed stores' planned bytes above what is live (Splash
+    /// `hostHeldBackBytes`): the plan counts every store at its cap.
+    pub held_back_bytes: u64,
 }
 
 /// One lane kind of one request: its state besides KV, the layout its KV
@@ -342,6 +382,34 @@ pub(crate) struct PoolInput<'a> {
     pub runway_blocks: u32,
     /// `paged_cache_memory_mb`: a ceiling at or below the plan's.
     pub explicit_mib: Option<u32>,
+    /// The lane's state takes pool blocks as well as its own bytes; `false`
+    /// holds it beside the pool only.
+    pub lane_in_pool: bool,
+}
+
+impl PoolInput<'_> {
+    fn kv(&self, cap_blocks: Option<u64>) -> LaneKv {
+        LaneKv::Pool {
+            bytes_per_block: self.bytes_per_block,
+            layers: self.layers,
+            cap_blocks,
+            lane_in_pool: self.lane_in_pool,
+        }
+    }
+
+    /// The pool this lane plans from a dynamic budget of `dynamic`.
+    pub(crate) fn plan_at(&self, dynamic: u64) -> PoolPlan {
+        let (lane, blocks) = plan_lane(dynamic, &self.shape, self.kv(None));
+        let max_blocks = blocks.min(u64::from(u32::MAX)) as u32;
+        PoolPlan {
+            max_blocks,
+            runway_blocks: self.runway_blocks.min(max_blocks),
+            bytes_per_block: self.bytes_per_block,
+            lane,
+            layout: self.shape.layout,
+            lane_in_pool: self.lane_in_pool,
+        }
+    }
 }
 
 /// A flat KV lane beside the pool: KV grows by a copy of one of
@@ -399,6 +467,7 @@ pub(crate) struct PoolPlan {
     pub bytes_per_block: u64,
     pub lane: LanePlan,
     layout: KvLayout,
+    lane_in_pool: bool,
 }
 
 impl PoolPlan {
@@ -418,10 +487,13 @@ impl PoolPlan {
     /// holds `extra(W)` bytes of the pool for a `W`-token turn.
     pub(crate) fn window_with(&self, extra: &dyn Fn(u32) -> u64) -> u32 {
         let pool = u64::from(self.max_blocks) * self.bytes_per_block;
+        let lane = if self.lane_in_pool {
+            self.lane.lane_bytes
+        } else {
+            0
+        };
         let fits = |window: u32| {
-            let kv = pool
-                .saturating_sub(self.lane.lane_bytes)
-                .saturating_sub(extra(window));
+            let kv = pool.saturating_sub(lane).saturating_sub(extra(window));
             resident_tokens(&self.layout, kv, SPECULATIVE_SCRATCH_TOKENS) >= u64::from(window)
         };
         largest_window(self.lane.window.maximum(), fits)
@@ -462,6 +534,20 @@ pub(crate) enum PlanError {
         requested_mib: u32,
         minimum_mib: u32,
     },
+    /// Splash `planParts`: the floors exceed the hard budget before any
+    /// store is read.
+    FloorsDoNotFit {
+        required: u64,
+        budget: u64,
+        bound: MemoryBound,
+    },
+}
+
+fn bound_advice(bound: MemoryBound) -> &'static str {
+    match bound {
+        MemoryBound::MaxMemory => "raise --max-memory",
+        MemoryBound::DeviceMemory => "choose a smaller model or close other applications",
+    }
 }
 
 fn gibibytes(bytes: u64) -> String {
@@ -487,13 +573,11 @@ impl PlanError {
                 budget,
                 bound,
             } => {
-                let (limit, advice) = match bound {
-                    MemoryBound::MaxMemory => ("the memory limit is", "raise --max-memory"),
-                    MemoryBound::DeviceMemory => (
-                        "this Mac can give it",
-                        "choose a smaller model or close other applications",
-                    ),
+                let limit = match bound {
+                    MemoryBound::MaxMemory => "the memory limit is",
+                    MemoryBound::DeviceMemory => "this Mac can give it",
                 };
+                let advice = bound_advice(bound);
                 format!(
                     "{label} memory plan: the model weights with the runtime reserves, one \
                      lane's state and the KV runway need {} of memory but {limit} {}; {advice}",
@@ -516,6 +600,15 @@ impl PlanError {
             } => format!(
                 "{label}: paged_cache_memory_mb {requested_mib} is below the {minimum_mib} MiB one \
                  lane's state and the KV runway need; omit it or set at least {minimum_mib}"
+            ),
+            Self::FloorsDoNotFit {
+                required,
+                budget,
+                bound,
+            } => format!(
+                "{label} memory plan: the floors of the memory plan require {required} bytes but \
+                 the Metal memory budget is {budget} bytes; {}",
+                bound_advice(bound)
             ),
         }
     }
@@ -553,6 +646,7 @@ enum LaneKv {
         bytes_per_block: u64,
         layers: u64,
         cap_blocks: Option<u64>,
+        lane_in_pool: bool,
     },
     Flat {
         held_bytes: u64,
@@ -584,6 +678,7 @@ impl LaneKv {
                 bytes_per_block,
                 layers,
                 cap_blocks,
+                lane_in_pool,
             } => {
                 // The lane state lives outside the pool (Splash
                 // availableForOneRequestKv = dynamic - laneStateBytes).
@@ -595,9 +690,10 @@ impl LaneKv {
                     / u128::from(layers + 1);
                 let blocks = (pool / u128::from(bytes_per_block.max(1))) as u64;
                 let blocks = cap_blocks.map_or(blocks, |cap| blocks.min(cap));
+                let in_pool = if lane_in_pool { shape.lane_bytes } else { 0 };
                 let kv = blocks
                     .saturating_mul(bytes_per_block)
-                    .saturating_sub(shape.lane_bytes);
+                    .saturating_sub(in_pool);
                 (blocks, kv)
             }
             Self::Flat { held_bytes, .. } => {
@@ -686,26 +782,12 @@ impl MemoryPlan {
             .active_bytes
             .saturating_add(footprint.other_pool_bytes)
             .saturating_add(footprint.staging_bytes)
+            .saturating_add(footprint.held_back_bytes)
             .saturating_add(PIPELINE_RESERVE_BYTES)
             .saturating_add(RUNTIME_OVERHEAD_RESERVE_BYTES);
         let dynamic = hard_budget_bytes.saturating_sub(fixed_bytes);
 
-        let pool_kv = |input: &PoolInput<'_>, cap_blocks| LaneKv::Pool {
-            bytes_per_block: input.bytes_per_block,
-            layers: input.layers,
-            cap_blocks,
-        };
-        let pool_plan = pool.as_ref().map(|input| {
-            let (lane, blocks) = plan_lane(dynamic, &input.shape, pool_kv(input, None));
-            let max_blocks = blocks.min(u64::from(u32::MAX)) as u32;
-            PoolPlan {
-                max_blocks,
-                runway_blocks: input.runway_blocks.min(max_blocks),
-                bytes_per_block: input.bytes_per_block,
-                lane,
-                layout: input.shape.layout,
-            }
-        });
+        let pool_plan = pool.as_ref().map(|input| input.plan_at(dynamic));
         let held_bytes = pool_plan.map_or(0, |pool| {
             u64::from(pool.runway_blocks).saturating_mul(pool.bytes_per_block)
         });
@@ -777,9 +859,12 @@ impl MemoryPlan {
             });
         }
         let layout = input.shape.layout;
-        let minimum_blocks = input
-            .shape
-            .lane_bytes
+        let in_pool = if input.lane_in_pool {
+            input.shape.lane_bytes
+        } else {
+            0
+        };
+        let minimum_blocks = in_pool
             .saturating_add(layout.runway_pages() * layout.page_bytes())
             .div_ceil(bytes_per_block);
         if requested_blocks < minimum_blocks {
@@ -794,12 +879,7 @@ impl MemoryPlan {
             trained: plan.lane.window.maximum(),
             ..input.shape
         };
-        let kv = LaneKv::Pool {
-            bytes_per_block,
-            layers: input.layers,
-            cap_blocks: Some(requested_blocks),
-        };
-        let (mut lane, _) = plan_lane(dynamic, &capped, kv);
+        let (mut lane, _) = plan_lane(dynamic, &capped, input.kv(Some(requested_blocks)));
         lane.window.window = plan.lane.window.window;
         let max_blocks = requested_blocks as u32;
         Ok(PoolPlan {
@@ -821,6 +901,7 @@ impl MemoryPlan {
                 other_pool_bytes: 0,
                 staging_bytes: 0,
                 draft_weights_bytes: 0,
+                held_back_bytes: 0,
             },
             margin_bytes: 0,
             hard_budget_bytes: 0,
@@ -848,6 +929,17 @@ impl MemoryPlan {
             copy_bytes: 0,
             held_bytes: 0,
             minimum_bytes: 0,
+        }
+    }
+
+    /// A plan of `dynamic` bytes for scheduled state and no lanes, for tests
+    /// of a family whose fixtures have no plan.
+    #[cfg(test)]
+    pub(crate) fn with_dynamic(dynamic: u64) -> Self {
+        Self {
+            hard_budget_bytes: u64::MAX,
+            dynamic_budget_bytes: dynamic,
+            ..Self::bare()
         }
     }
 
@@ -891,6 +983,7 @@ impl MemoryPlan {
                 bytes_per_block,
                 lane: Self::bare_lane(resident, lane_bytes, 0),
                 layout,
+                lane_in_pool: true,
             }),
             ..Self::bare()
         }
@@ -976,6 +1069,11 @@ impl MemoryPlan {
             out,
             "SSD cache state staging: {}",
             bytes_and_mib(footprint.staging_bytes)
+        );
+        let _ = writeln!(
+            out,
+            "expert store and row cache above what is live: {}",
+            bytes_and_mib(footprint.held_back_bytes)
         );
         let _ = writeln!(
             out,
@@ -1069,6 +1167,120 @@ pub(crate) fn audit(plan: &MemoryPlan, measured: MeasuredMemory) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+/// The least dynamic budget at which every lane's window, as `lanes` give
+/// it from a dynamic budget, holds `tokens` (Splash's KV allowance of
+/// `planParts`, as the budget a lane plans from); `u64::MAX` when none does.
+/// Each window grows with the budget.
+pub(crate) fn allowance_dynamic_bytes(lanes: &[&dyn Fn(u64) -> u32], tokens: u32) -> u64 {
+    let holds = |dynamic: u64| lanes.iter().all(|window| window(dynamic) >= tokens);
+    let mut high = GIB;
+    while !holds(high) {
+        if high == u64::MAX {
+            return u64::MAX;
+        }
+        high = high.saturating_mul(2);
+    }
+    let mut low = 0u64;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if holds(mid) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    low
+}
+
+/// The rows of a table one id per token of a `TABLE_SHARE_TOKENS`-token
+/// prompt per stage reads, at most the table's `rows` (Splash
+/// `tableShareBytes` without its working bytes).
+pub(crate) fn table_share_bytes(ids_per_token: u64, rows: u64, row_bytes: u64) -> u64 {
+    TABLE_SHARE_TOKENS
+        .saturating_mul(ids_per_token)
+        .min(rows)
+        .saturating_mul(row_bytes)
+}
+
+/// A store the plan may stream (Splash `StreamedPart`): all of it, and what
+/// the floors charge it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamedPart {
+    pub all: u64,
+    pub minimum: u64,
+}
+
+impl StreamedPart {
+    fn above(&self) -> u64 {
+        self.all.saturating_sub(self.minimum)
+    }
+}
+
+/// Splash `StreamedMemoryInputs` of a target that cannot spill, before any
+/// store is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamedInputs {
+    pub hard: u64,
+    pub bound: MemoryBound,
+    /// What loads besides the stores, with the other models' pools and the
+    /// restore staging; the reserves are added here.
+    pub fixed: u64,
+    /// [`allowance_dynamic_bytes`] of the lanes the load serves.
+    pub allowance: u64,
+    /// The largest of those lanes' minimum dynamic bytes.
+    pub minimum_dynamic: u64,
+    pub experts: StreamedPart,
+    /// The row cache: `all` is its share, `minimum` its read staging.
+    pub rows: StreamedPart,
+}
+
+/// Splash `StreamedMemoryPlan` of the stores: the experts whole, or the
+/// store's cap, and the row cache's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StorePlan {
+    pub whole: bool,
+    pub expert_cap_bytes: u64,
+    pub row_cache_bytes: u64,
+}
+
+/// Splash `planParts` without spilling: the floors first, then the KV
+/// allowance; the experts load whole only where they leave it and the row
+/// share, and otherwise stream through what the allowance and the share
+/// leave; the row cache takes what the allowance leaves of its share.
+pub(crate) fn plan_streamed_store(inputs: &StreamedInputs) -> Result<StorePlan, PlanError> {
+    let loaded = inputs
+        .fixed
+        .saturating_add(PIPELINE_RESERVE_BYTES)
+        .saturating_add(RUNTIME_OVERHEAD_RESERVE_BYTES)
+        .saturating_add(inputs.experts.minimum)
+        .saturating_add(inputs.rows.minimum);
+    let floors = loaded.saturating_add(inputs.minimum_dynamic);
+    if floors > inputs.hard {
+        return Err(PlanError::FloorsDoNotFit {
+            required: floors,
+            budget: inputs.hard,
+            bound: inputs.bound,
+        });
+    }
+    let rest = i128::from(inputs.hard - loaded);
+    let allowance = i128::from(inputs.allowance);
+    let experts_above = i128::from(inputs.experts.above());
+    let rows_above = i128::from(inputs.rows.above());
+    let left = rest - allowance - rows_above;
+    let whole = experts_above == 0 || left >= experts_above;
+    let experts_extra = if whole {
+        experts_above
+    } else {
+        left.clamp(0, experts_above)
+    };
+    let rows_extra = (rest - experts_extra - allowance).clamp(0, rows_above);
+    Ok(StorePlan {
+        whole,
+        expert_cap_bytes: inputs.experts.minimum + experts_extra as u64,
+        row_cache_bytes: inputs.rows.minimum + rows_extra as u64,
+    })
 }
 
 #[cfg(test)]

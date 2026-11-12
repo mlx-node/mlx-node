@@ -177,7 +177,6 @@ impl Config {
         if self.num_hidden_layers > 512
             || recurrent_bytes > (1u128 << 30)
             || self.ple_layer_ids.iter().any(|&i| !self.linear(i - 1))
-            || self.effective_context_limit() == 0
         {
             return Err(Error::from_reason(
                 "qwen4_exp configuration exceeds the recurrent/cache safety budget or places PLE on a non-linear layer",
@@ -202,18 +201,6 @@ impl Config {
             !(layer + 1).is_multiple_of(self.full_attention_interval),
             |kind| kind == "linear_attention",
         )
-    }
-    /// Reserve at most 2 GiB for attention/index caches, conservatively sizing
-    /// every value as float32 and reserving room for the append copy.
-    pub fn effective_context_limit(&self) -> usize {
-        let full = (0..self.num_hidden_layers)
-            .filter(|&i| !self.linear(i))
-            .count();
-        let per_token = full as u128
-            * (2 * self.num_key_value_heads as u128 * self.head_dim as u128 * 4
-                + self.indexer_head_dim as u128 * 4);
-        self.max_position_embeddings
-            .min(((2u128 << 30) / per_token.max(1)).min(32_768) as usize)
     }
     pub fn rope_dims(&self) -> usize {
         (self.head_dim as f64
