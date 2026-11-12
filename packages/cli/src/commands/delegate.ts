@@ -26,7 +26,7 @@ export const DELEGATE_DEFAULT_ARGS = [
 ];
 
 /** Delegate/mlx-owned flags (not grok options) that still consume the next token as their value. */
-const DELEGATE_VALUE_FLAGS = new Set(['--models-dir', '--trace-dir', '--repo', '--pr']);
+const DELEGATE_VALUE_FLAGS = new Set(['--models-dir', '--trace-dir', '--kv-format', '--repo', '--pr']);
 
 /** `-p` takes the prompt as its VALUE — fold every bare positional into it. */
 function foldPositionalsIntoPrint(argv: string[]): string[] {
@@ -65,7 +65,7 @@ export function parseDelegateArgs(argv: string[]): { args: string[]; callerAppro
       break;
     }
     // Consume values before recognizing the opt-in: prompt text cannot grant approval.
-    if (agentOptionConsumesNext(argv, i) || ['--models-dir', '--trace-dir', '--repo', '--pr'].includes(arg)) {
+    if (agentOptionConsumesNext(argv, i) || DELEGATE_VALUE_FLAGS.has(arg)) {
       args.push(arg);
       if (i + 1 < argv.length) args.push(argv[++i]!);
     } else if (arg === '--caller-approved') {

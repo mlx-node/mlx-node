@@ -1536,6 +1536,10 @@ impl Qwen35Inner {
 /// the teacher cache live in [`crate::quality::runner`]; this supplies only what
 /// is family-specific.
 impl crate::quality::runner::EvalBackend for Qwen35Inner {
+    fn kv_format(&self) -> crate::transformer::KvFormat {
+        self.config.kv_format()
+    }
+
     fn vocab_size(&self) -> i32 {
         self.config.vocab_size
     }

@@ -15,6 +15,7 @@ import {
   NoModelsDiscoveredError,
   resolveLogDir,
   resolveMlxNodeHome,
+  type InferenceHost,
   type InferenceHostOptions,
 } from '@mlx-node/server/host';
 
@@ -192,7 +193,7 @@ export function launchClaudeHostOptions(flags: LaunchClaudeFlags): InferenceHost
  */
 export function claudeChildEnv(
   parent: NodeJS.ProcessEnv,
-  opts: { baseUrl: string; model: string; authToken: string },
+  opts: { baseUrl: string; model: string; authToken: string; contextTokens?: number },
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...parent,
@@ -209,7 +210,28 @@ export function claudeChildEnv(
   // `delete`, not `= undefined`: `spawn` skipping undefined values is an
   // implementation detail of `child_process`, and this must not depend on it.
   delete env.ANTHROPIC_API_KEY;
+  // The served window, so Claude Code compacts before the server rejects
+  // (Splash `install/clients.py` sets the same two; an inherited value loses).
+  if (opts.contextTokens !== undefined) {
+    env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(opts.contextTokens);
+    env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = String(opts.contextTokens);
+  }
   return env;
+}
+
+/**
+ * Load the bound model before Claude Code starts and return the window its
+ * default text turn gets; `undefined` (after printing why) when the load
+ * fails or the model publishes no window.
+ */
+export async function loadServedWindow(
+  host: Pick<InferenceHost, 'boundModel' | 'loadModel' | 'server'>,
+): Promise<number | undefined> {
+  console.log(`[mlx] loading ${host.boundModel} …`);
+  await host.loadModel(host.boundModel).catch((err: unknown) => {
+    console.error(`[mlx] load of "${host.boundModel}" failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
+  return host.server.registry.servedContext(host.boundModel)?.windowTokens;
 }
 
 export async function run(argv: string[]): Promise<void> {
@@ -300,9 +322,16 @@ export async function run(argv: string[]): Promise<void> {
     console.log(`[mlx] tail -f "${join(host.logDir, 'session.log')}"`);
   }
 
+  const contextTokens = await loadServedWindow(host);
+
   const child = spawn(claudeBin, claudeArgs, {
     stdio: 'inherit',
-    env: claudeChildEnv(process.env, { baseUrl: host.url, model: host.boundModel, authToken }),
+    env: claudeChildEnv(process.env, {
+      baseUrl: host.url,
+      model: host.boundModel,
+      authToken,
+      ...(contextTokens !== undefined ? { contextTokens } : {}),
+    }),
   });
 
   let shuttingDown = false;

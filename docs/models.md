@@ -345,12 +345,12 @@ the embedded directory.
 - **Stats** — `ChatResult.performance` reports `mtpCycles` (actual draft+verify cycles executed) and `mtpMeanAcceptedTokensTotal` (mean committed tokens per speculative cycle, including the always-verified token). DSpark's target-only calibration/fallback cycles remain part of the overall token/decode-speed metrics but are intentionally excluded from these MTP acceptance fields.
 - **Knobs** — DSpark: with both knobs unset, full draft blocks (7 tokens on the v1 draft) are guarded by a short, per-turn target-AR/DSpark throughput calibration; if speculation loses on the current host and context, the remainder of that turn uses exact target-only decoding. The guard activates only when the generation budget can contain the AR probe plus two full-depth speculative probes; shorter generations preserve the fixed-block schedule. An explicit `mtpDepth` caps and pins the block, disabling the guard unless `mtpAdaptiveDepth: true` opts it back in; `mtpAdaptiveDepth: false` always disables it. Assistant: unset `mtpDepth` defaults to 3 drafts per cycle, explicit values clamp to [1, 8], and `mtpAdaptiveDepth` remains ignored.
 - **Memory** — the draft loads alongside the target (~6.9 GB extra for the bf16 DSpark 12B draft; ~0.8 GB for an assistant). Both variants run on the flat KV-cache path; a target config that explicitly enables `use_block_paged_cache` is rejected at load.
-- `draftModelPath` is supported by gemma4 and dense qwen3_5; other families reject it.
+- `draftModelPath` is supported by gemma4, qwen3_5 and qwen3_5_moe; other families reject it.
 
-### Int8 K/V cache (`kvFormat`, dense qwen3_5)
+### Int8 K/V cache (`kvFormat`, qwen3_5 and qwen3_5_moe)
 
-By default on Metal with 256-wide heads (`kvFormat: 'bf16'` opts out;
-`'int8'` forces it), the loader stores the flat full-attention K/V
+For dense qwen3_5 by default on Metal with 256-wide heads (`kvFormat: 'bf16'`
+opts out; `'int8'` forces it; qwen3_5_moe defaults to bf16), the loader stores the flat full-attention K/V
 cache as per-(token, head) symmetric int8 rows with one fp32 scale each
 (Splash's target KV format: `scale = max|x| / 127`, quantized on write).
 Rows are read as int8 by the segmented SDPA kernels (the DFlash2 / MTP verify
@@ -360,9 +360,14 @@ the cached prefix to a BF16 temporary for MLX's fused causal SDPA. Halves
 the K/V memory (Qwen3.8-27B at 32K: ~1.0 GB saved) and the verify's K/V read
 bandwidth; the quality cost is int8 rounding (measured: teacher-forced KL and
 top-1 agreement unchanged within noise, DFlash2 acceptance unchanged).
-Geometries the int8 kernels do not serve default to `bf16`; the block-paged
-cache ignores the option. `mlx eval
-score --kv-format int8` scores the int8 cache against the same teacher cache.
+Geometries the int8 kernels do not serve default to `bf16`. The block-paged
+pool ignores the option and stays bf16, so on a paged load only DFlash2 turns
+write int8. `contextLimits().kvFormat` names the format of the pool lane
+(`effectiveWindowTokens`) and `.speculativeKvFormat` the DFlash2 lane's
+(`speculativeWindowTokens`). `mlx serve --kv-format` and `mlx agent
+--kv-format` set it for served qwen3_5 / qwen3_5_moe loads. `mlx eval score
+--kv-format int8` scores the int8 cache against the same teacher cache and
+the report names the format the load resolved.
 
 ## Server-side sessions
 

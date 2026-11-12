@@ -448,3 +448,54 @@ describe('ModelRegistry', () => {
     });
   });
 });
+
+describe('ModelRegistry.servedContext', () => {
+  function modelWithLimits(hasMtpWeights: boolean) {
+    const contextLimits = vi.fn(() => ({
+      trainedWindowTokens: 262144,
+      effectiveWindowTokens: 73696.5,
+      pagedBlockCapacity: 0,
+      pagedBlockSize: 16,
+      speculativeWindowTokens: 139257,
+      kvFormat: 'bf16' as const,
+      speculativeKvFormat: 'int8' as const,
+    }));
+    const model = Object.assign(createMockSessionModel(), { contextLimits, hasMtpWeights: () => hasMtpWeights });
+    return { model, contextLimits };
+  }
+
+  // Mutation: ignore `defaultSamplingConfig.enableMtp` → red (the AR default).
+  // Mutation: read `contextLimits()` on every call → red (spy count).
+  it('servedContext follows the default text lane', () => {
+    const registry = new ModelRegistry();
+    const draft = modelWithLimits(true);
+    registry.register('draft', draft.model);
+    registry.register('alias', draft.model);
+    expect(registry.servedContext('draft')).toEqual({ windowTokens: 139257, kvFormat: 'int8' });
+    expect(registry.servedContext('alias')).toEqual({ windowTokens: 139257, kvFormat: 'int8' });
+
+    const plain = modelWithLimits(false);
+    registry.register('plain', plain.model);
+    expect(registry.servedContext('plain')).toEqual({ windowTokens: 73696, kvFormat: 'bf16' });
+
+    const ar = modelWithLimits(true);
+    registry.register('ar', ar.model, { samplingDefaults: { enableMtp: false } });
+    expect(registry.servedContext('ar')).toEqual({ windowTokens: 73696, kvFormat: 'bf16' });
+
+    registry.unregister('draft');
+    expect(registry.servedContext('draft')).toBeUndefined();
+    expect(registry.servedContext('alias')).toEqual({ windowTokens: 139257, kvFormat: 'int8' });
+    registry.unregister('alias');
+    expect(registry.servedContext('alias')).toBeUndefined();
+    expect(registry.servedContext('missing')).toBeUndefined();
+    expect(registry.servedContext('ar')).toBeDefined();
+    expect(draft.contextLimits).toHaveBeenCalledTimes(1);
+    expect(ar.contextLimits).toHaveBeenCalledTimes(1);
+
+    expect(registry.list().find((entry) => entry.id === 'plain')).toMatchObject({
+      context_window: 73696,
+      max_model_len: 73696,
+      context_length: 73696,
+    });
+  });
+});

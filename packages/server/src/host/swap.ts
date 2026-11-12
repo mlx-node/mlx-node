@@ -191,20 +191,25 @@ export function makeSwapController(
   }
 
   function listModels(): PublicModelEntry[] {
-    return ordered.map((entry) => ({
-      id: entry.name,
-      object: 'model',
-      created,
-      owned_by: 'mlx-node',
-      // Grok Build prefetch contract: it defaults `api_backend` to
-      // chat_completions, a route this host does not serve. "messages"
-      // (Anthropic wire) is the backend this router fully supports —
-      // the same path `mlx launch claude` drives — so always pin it.
-      context_window: entry.contextWindow,
-      api_backend: 'messages',
-      model_family: String(entry.modelType),
-      supports_images: entry.supportsImages,
-    }));
+    return ordered.map((entry) => {
+      const window = registry.servedContext(entry.name)?.windowTokens ?? entry.contextWindow;
+      return {
+        id: entry.name,
+        object: 'model',
+        created,
+        owned_by: 'mlx-node',
+        // Grok Build prefetch contract: it defaults `api_backend` to
+        // chat_completions, a route this host does not serve. "messages"
+        // (Anthropic wire) is the backend this router fully supports —
+        // the same path `mlx launch claude` drives — so always pin it.
+        context_window: window,
+        max_model_len: window,
+        context_length: window,
+        api_backend: 'messages',
+        model_family: String(entry.modelType),
+        supports_images: entry.supportsImages,
+      };
+    });
   }
 
   async function disposeAll(): Promise<void> {

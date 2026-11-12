@@ -1,4 +1,4 @@
-import { spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import {
@@ -1825,6 +1825,8 @@ describe('mlx agent update (run)', () => {
 describe('launchGrokAgent server gating', () => {
   let root: string;
   let health: ReturnType<typeof createHttpServer>;
+  /** `/health` body; an authenticated poll is the preload wait, the bare one the readiness probe. */
+  let healthBody: (authorized: boolean) => unknown;
   let serveBase: string;
   let savedAgentBin: string | undefined;
   let savedAgentTag: string | undefined;
@@ -1857,7 +1859,11 @@ describe('launchGrokAgent server gating', () => {
     savedAgentTag = process.env[MLX_AGENT_TAG_ENV];
     process.env[MLX_AGENT_BIN_ENV] = bin;
     delete process.env[MLX_AGENT_TAG_ENV];
-    health = createHttpServer((_, res) => res.end('ok'));
+    healthBody = () => ({ status: 'ok', models: { resident: ['qwen-local'] }, lastLoad: null });
+    health = createHttpServer((req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify(healthBody(req.headers.authorization?.startsWith('Bearer ') === true)));
+    });
     await new Promise<void>((resolvePromise) => health.listen(0, '127.0.0.1', resolvePromise));
     serveBase = `http://127.0.0.1:${(health.address() as AddressInfo).port}`;
     spawnServe.mockClear();
@@ -1917,6 +1923,18 @@ describe('launchGrokAgent server gating', () => {
     expect(spawnServe.mock.calls[0]![0]).not.toContain('--preload');
   });
 
+  // Mutation: drop the `--kv-format` pair from the serve argv → red.
+  it('hands --kv-format to the spawned serve', async () => {
+    await launchGrokAgent({ argv: ['-c'], kvFormat: 'bf16', spawnServe, spawnAgent });
+    const serveArgv: string[] = spawnServe.mock.calls[0]![0];
+    expect(serveArgv.slice(-2)).toEqual(['--kv-format', 'bf16']);
+    expect(parseServeArgs(serveArgv.slice(2)).kvFormat).toBe('bf16');
+
+    spawnServe.mockClear();
+    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent });
+    expect(spawnServe.mock.calls[0]![0]).not.toContain('--kv-format');
+  });
+
   it('turns off the xAI media tools a served launch cannot answer, keeping a user override', async () => {
     const mediaEnv = ['GROK_IMAGE_GEN', 'GROK_IMAGE_EDIT', 'GROK_VIDEO_GEN'] as const;
     const saved = mediaEnv.map((name) => process.env[name]);
@@ -1955,6 +1973,62 @@ describe('launchGrokAgent server gating', () => {
       if (saved === undefined) delete process.env.GROK_RESUME_COMMAND;
       else process.env.GROK_RESUME_COMMAND = saved;
     }
+  });
+
+  // Mutation: skip the preload wait → red (grok spawned after 0 polls).
+  // Mutation: keep waiting after a failed load → red (times out).
+  // Mutation: drop the never-started rule → red (times out).
+  it('starts grok after the preload is resident', async () => {
+    let polls = 0;
+    healthBody = (authorized) => {
+      if (!authorized) return { status: 'ok' };
+      polls += 1;
+      return {
+        status: 'loading',
+        models: { resident: polls > 3 ? ['qwen-local'] : [] },
+        work: { writerActive: polls <= 3, waitingWriters: 0 },
+        lastLoad: null,
+      };
+    };
+    const spawnedAt: number[] = [];
+    const agentAfterPolls = (bin: string, argv: string[], so: SpawnOptions): ChildProcess => {
+      spawnedAt.push(polls);
+      return spawnAgent(bin, argv, so);
+    };
+    const launch = { argv: ['-c'], preloadModel: 'qwen-local', spawnServe, preloadPollMs: 5 };
+    await launchGrokAgent({ ...launch, spawnAgent: agentAfterPolls });
+    expect(spawnedAt).toEqual([4]);
+
+    healthBody = (authorized) =>
+      authorized
+        ? { status: 'error', models: { resident: [] }, lastLoad: { label: 'qwen-local', ok: false } }
+        : { status: 'ok' };
+    await expect(launchGrokAgent({ ...launch, spawnAgent: agentAfterPolls })).resolves.toBe(0);
+    expect(spawnedAt).toHaveLength(2);
+
+    // Serve rejected the preload before its load bracket: nothing will load.
+    healthBody = (authorized) =>
+      authorized
+        ? { status: 'ok', models: { resident: [] }, work: { writerActive: false, waitingWriters: 0 }, lastLoad: null }
+        : { status: 'ok' };
+    await expect(launchGrokAgent({ ...launch, spawnAgent: agentAfterPolls })).resolves.toBe(0);
+    expect(spawnedAt).toHaveLength(3);
+  });
+
+  it('fails without starting grok when serve exits during the preload', async () => {
+    healthBody = (authorized) => (authorized ? { models: { resident: [] }, lastLoad: null } : { status: 'ok' });
+    spawnServe.mockImplementationOnce((_argv: string[], _so: SpawnOptions) => {
+      const kill = vi.fn();
+      serveKills.push(kill);
+      const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), kill });
+      child.stdout.end(`listening on ${serveBase}\n`);
+      setTimeout(() => child.emit('exit', 1), 50);
+      return child as unknown as ChildProcess;
+    });
+    await expect(
+      launchGrokAgent({ argv: ['-c'], preloadModel: 'qwen-local', spawnServe, spawnAgent, preloadPollMs: 5 }),
+    ).rejects.toThrow('mlx serve exited (1) while loading qwen-local');
+    expect(spawnAgent.envs).toHaveLength(0);
   });
 
   it('kills the serve child when readiness fails', async () => {
@@ -1998,25 +2072,257 @@ describe('launchGrokAgent server gating', () => {
   it('forwards SIGTERM to both children and re-raises it', async () => {
     const agentKill = vi.fn();
     const agent = Object.assign(new EventEmitter(), { kill: agentKill }) as unknown as ChildProcess;
+    spawnServe.mockImplementationOnce((_argv: string[], _so: SpawnOptions) => {
+      const child = Object.assign(new EventEmitter(), {
+        stdout: new PassThrough(),
+        exitCode: null as number | null,
+        signalCode: null as NodeJS.Signals | null,
+        kill: vi.fn((signal: NodeJS.Signals) => {
+          setImmediate(() => {
+            child.signalCode = signal;
+            child.emit('exit', null, signal);
+          });
+          return true;
+        }),
+      });
+      serveKills.push(child.kill);
+      child.stdout.end(`listening on ${serveBase}\n`);
+      return child as unknown as ChildProcess;
+    });
     const baseline = new Set(process.listeners('SIGTERM'));
     const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
     try {
-      const launch = launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent: () => agent });
-      // Poll: the listeners land only after serve readiness resolves.
-      let teardown: ((signal: 'SIGTERM') => void) | undefined;
-      for (let i = 0; i < 100 && teardown === undefined; i++) {
+      let agentSpawned = false;
+      const launch = launchGrokAgent({
+        argv: ['-p', 'hi'],
+        spawnServe,
+        spawnAgent: () => {
+          agentSpawned = true;
+          return agent;
+        },
+      });
+      for (let i = 0; i < 100 && !agentSpawned; i++) {
         await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
-        teardown = process.listeners('SIGTERM').find((listener) => !baseline.has(listener));
       }
+      expect(agentSpawned).toBe(true);
+      const teardown = process.listeners('SIGTERM').find((listener) => !baseline.has(listener)) as
+        | ((signal: 'SIGTERM') => void)
+        | undefined;
       expect(teardown).toBeDefined();
       teardown!('SIGTERM');
       expect(serveKills[0]!).toHaveBeenCalledWith('SIGTERM');
       expect(agentKill).toHaveBeenCalledWith('SIGTERM');
-      expect(killSpy).toHaveBeenCalledWith(process.pid, 'SIGTERM');
+      await vi.waitFor(() => expect(killSpy).toHaveBeenCalledWith(process.pid, 'SIGTERM'));
       agent.emit('exit', 143, 'SIGTERM');
       await expect(launch).resolves.toBe(143);
     } finally {
       killSpy.mockRestore();
     }
+  });
+
+  /**
+   * Run the launcher in its own process against a fake serve stuck in the
+   * preload wait. `ignoreSignals` makes serve model a graceful shutdown that
+   * never finishes (a preload `host.close()` awaits with no deadline).
+   * `readyOnSignal` makes serve ignore the signal and report the model
+   * resident only after it. `repeat` sends a second signal once the teardown
+   * has started.
+   */
+  async function launchDuringPreload(
+    signal: NodeJS.Signals,
+    {
+      ignoreSignals,
+      graceMs,
+      banner = true,
+      readyTimeoutMs,
+      readyOnSignal = false,
+      repeat,
+    }: {
+      ignoreSignals: boolean;
+      graceMs?: number;
+      banner?: boolean;
+      readyTimeoutMs?: number;
+      readyOnSignal?: boolean;
+      repeat?: NodeJS.Signals;
+    },
+  ): Promise<{
+    exitSignal: NodeJS.Signals | null;
+    exitMs: number;
+    serveDeadAtExit: boolean;
+    serveDeadAfter: boolean;
+    agentStarted: boolean;
+  }> {
+    const dir = mkdtempSync(join(tmpdir(), 'launch-grok-signal-'));
+    const pidFile = join(dir, 'serve.pid');
+    const polledFile = join(dir, 'polled');
+    const agentStartedFile = join(dir, 'agent-started');
+    const fakeServe = join(dir, 'fake-serve.mjs');
+    writeFileSync(
+      fakeServe,
+      `import { createServer } from 'node:http';
+import { writeFileSync } from 'node:fs';
+let ready = false;
+${ignoreSignals ? "process.on('SIGINT', () => {});\nprocess.on('SIGTERM', () => {});" : ''}
+${readyOnSignal ? "process.on('SIGINT', () => { ready = true; });\nprocess.on('SIGTERM', () => { ready = true; });" : ''}
+const server = createServer((req, res) => {
+  const authorized = req.headers.authorization !== undefined;
+  if (authorized) writeFileSync(${JSON.stringify(polledFile)}, '');
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify(authorized
+    ? ready
+      ? { status: 'ok', models: { resident: ['qwen-local'] }, work: { writerActive: false, waitingWriters: 0 }, lastLoad: { label: 'qwen-local', ok: true } }
+      : { status: 'loading', models: { resident: [] }, work: { writerActive: true, waitingWriters: 0 }, lastLoad: null }
+    : { status: 'ok' }));
+});
+server.listen(0, '127.0.0.1', () => {
+  writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+  ${banner ? "console.log('listening on http://127.0.0.1:' + server.address().port);" : ''}
+});
+`,
+    );
+    const grokBuild = new URL('../../packages/cli/src/commands/agent/grok-build.ts', import.meta.url).href;
+    const launcherEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      [MLX_AGENT_BIN_ENV]: join(root, 'mlx-agent'),
+      MLX_CLI_ENTRY: fakeServe,
+    };
+    delete launcherEnv[MLX_AGENT_TAG_ENV];
+    const launcher = spawn(
+      process.execPath,
+      [
+        '--import',
+        '@oxc-node/core/register',
+        '--input-type=module',
+        '-e',
+        `import { spawn } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+const { launchGrokAgent } = await import(${JSON.stringify(grokBuild)});
+// Like cli.ts: a launcher that throws exits the process.
+await launchGrokAgent({
+  argv: ['-c'],
+  preloadModel: 'qwen-local',
+  preloadPollMs: 20,
+  ${graceMs === undefined ? '' : `serveStopGraceMs: ${graceMs},`}
+  ${readyTimeoutMs === undefined ? '' : `serveReadyTimeoutMs: ${readyTimeoutMs},`}
+  spawnServe: (_argv, so) => spawn(process.execPath, [${JSON.stringify(fakeServe)}], so),
+  spawnAgent: () => {
+    writeFileSync(${JSON.stringify(agentStartedFile)}, '');
+    throw new Error('grok must not start during the preload');
+  },
+}).catch((err) => { console.error(err); process.exit(1); });`,
+      ],
+      { env: launcherEnv, stdio: ['ignore', 'ignore', 'pipe'] },
+    );
+    let stderr = '';
+    launcher.stderr!.on('data', (chunk) => (stderr += String(chunk)));
+    const alive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    let servePid: number | undefined;
+    let serveDeadAtExit = false;
+    const exited = new Promise<NodeJS.Signals | null>((resolvePromise) =>
+      launcher.once('exit', (_code, exitSignal) => {
+        serveDeadAtExit = servePid !== undefined && !alive(servePid);
+        resolvePromise(exitSignal);
+      }),
+    );
+    try {
+      const startedFile = banner ? polledFile : pidFile;
+      for (let i = 0; i < 400 && !existsSync(startedFile) && launcher.exitCode === null; i++) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+      }
+      expect(existsSync(startedFile), stderr).toBe(true);
+      servePid = Number(readFileSync(pidFile, 'utf8'));
+      expect(alive(servePid)).toBe(true);
+
+      const signaledAt = Date.now();
+      launcher.kill(signal);
+      if (repeat !== undefined) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 300));
+        expect(launcher.exitCode === null && launcher.signalCode === null, stderr).toBe(true);
+        launcher.kill(repeat);
+      }
+      const exitSignal = await exited;
+      const exitMs = Date.now() - signaledAt;
+      for (let i = 0; i < 200 && alive(servePid); i++) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+      }
+      return {
+        exitSignal,
+        exitMs,
+        serveDeadAtExit,
+        serveDeadAfter: !alive(servePid),
+        agentStarted: existsSync(agentStartedFile),
+      };
+    } finally {
+      launcher.kill('SIGKILL');
+      if (servePid !== undefined && alive(servePid)) process.kill(servePid, 'SIGKILL');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  // Mutation: install the signal handlers only after the preload wait → red
+  // (the serve child outlives the launcher).
+  it('stops the serve child when SIGTERM lands during the preload wait', { timeout: 30_000 }, async () => {
+    const result = await launchDuringPreload('SIGTERM', { ignoreSignals: false });
+    expect(result.exitSignal).toBe('SIGTERM');
+    expect(result.serveDeadAfter).toBe(true);
+  });
+
+  // Mutation: re-raise without waiting for serve → red (launcher exits first).
+  // Mutation: drop the SIGKILL after the grace → red (serve outlives it).
+  it.each(['SIGINT', 'SIGTERM'] as const)(
+    'SIGKILLs a serve that ignores %s after the grace, before the launcher dies',
+    { timeout: 30_000 },
+    async (signal) => {
+      const result = await launchDuringPreload(signal, { ignoreSignals: true, graceMs: 300 });
+      expect(result.exitSignal).toBe(signal);
+      expect(result.serveDeadAtExit).toBe(true);
+    },
+  );
+
+  // Mutation: install the handlers with process.once → red on the same-signal
+  // rows (the repeat takes the default disposition with serve alive).
+  // Mutation: drop the SIGKILLs on a repeat → red (exit waits out the grace).
+  it.each([
+    ['SIGTERM', 'SIGTERM'],
+    ['SIGTERM', 'SIGINT'],
+    ['SIGINT', 'SIGINT'],
+  ] as const)(
+    'SIGKILLs serve at once on a repeated signal (%s then %s), then dies by the first',
+    { timeout: 30_000 },
+    async (first, second) => {
+      const result = await launchDuringPreload(first, { ignoreSignals: true, graceMs: 8_000, repeat: second });
+      expect(result.exitSignal).toBe(first);
+      expect(result.serveDeadAtExit).toBe(true);
+      expect(result.exitMs).toBeLessThan(4_000);
+    },
+  );
+
+  // Mutation: return from the finally without awaiting the teardown → red
+  // (the readiness timeout throws, the caller exits 1 with serve alive).
+  it('keeps the launcher alive through the grace when startup fails mid-teardown', { timeout: 30_000 }, async () => {
+    const result = await launchDuringPreload('SIGTERM', {
+      ignoreSignals: true,
+      graceMs: 2_500,
+      banner: false,
+      readyTimeoutMs: 1_000,
+    });
+    expect(result.exitSignal).toBe('SIGTERM');
+    expect(result.serveDeadAtExit).toBe(true);
+  });
+
+  // Mutation: drop the teardown check before spawnAgent → red (grok starts
+  // after the signal and is never signaled).
+  it('never starts the agent when the preload settles after a signal', { timeout: 30_000 }, async () => {
+    const result = await launchDuringPreload('SIGTERM', { ignoreSignals: false, readyOnSignal: true, graceMs: 1_500 });
+    expect(result.exitSignal).toBe('SIGTERM');
+    expect(result.serveDeadAtExit).toBe(true);
+    expect(result.agentStarted).toBe(false);
   });
 });

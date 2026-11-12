@@ -658,6 +658,26 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     expect(overlay.paged_cache_initial_memory_mb).toBe(2_048);
   });
 
+  // Mutation: drop the `kvFormat` pass-through → red (qwen3_5 load gets no kvFormat).
+  // Mutation: drop the family check → red (gemma4 load gets kvFormat).
+  it('kvFormat reaches the qwen loader only', async () => {
+    const modelsDir = await makeModelsDir(['qwen', 'gemma']);
+    await writeFile(join(modelsDir, 'gemma', 'config.json'), JSON.stringify({ model_type: 'gemma4' }));
+    const calls: Array<{ path: string; options?: LoadModelOptions }> = [];
+    const host = await start({
+      modelsDir,
+      kvFormat: 'bf16',
+      loadModel: async (path, options) => {
+        calls.push({ path, options });
+        return fakeModel();
+      },
+    });
+    expect(host.models.map((model) => model.name).sort()).toEqual(['gemma', 'qwen']);
+    await host.loadModel('qwen');
+    await host.loadModel('gemma');
+    expect(calls.map((call) => call.options)).toEqual([{ kvFormat: 'bf16' }, undefined]);
+  });
+
   it('makes the model resident and records the load on /health', async () => {
     const modelsDir = await makeModelsDir(['alpha', 'beta']);
     const host = await start({ modelsDir });

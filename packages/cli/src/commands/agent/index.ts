@@ -57,6 +57,10 @@ export interface AgentArgScan {
    * to the agent binary.
    */
   persistPagedCache: boolean;
+  /** Value of `--kv-format` (lifted out of the argv, forwarded to `mlx serve`). */
+  kvFormat?: 'int8' | 'bf16';
+  /** `--kv-format` had a missing or unknown value (the raw value, `''` when missing) — usage error. */
+  kvFormatInvalid?: string;
   /**
    * `-h`/`--help` seen and this is NOT a binary-managed subcommand
    * (`models`/`export`/`doctor`/… print their own help inside the binary, so
@@ -210,6 +214,16 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   let traceDir: string | undefined;
   let traceDirMissingValue = false;
   let persistPagedCache = true;
+  let kvFormat: 'int8' | 'bf16' | undefined;
+  let kvFormatInvalid: string | undefined;
+  const takeKvFormat = (value: string): void => {
+    if (value === 'int8' || value === 'bf16') {
+      kvFormat = value;
+      kvFormatInvalid = undefined;
+    } else {
+      kvFormatInvalid = value;
+    }
+  };
   let helpSeen = false;
   let versionSeen = false;
 
@@ -265,6 +279,20 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       persistPagedCache = false;
       continue;
     }
+    if (arg === '--kv-format') {
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith('-')) {
+        kvFormatInvalid = '';
+      } else {
+        takeKvFormat(next);
+        i++;
+      }
+      continue;
+    }
+    if (arg.startsWith('--kv-format=')) {
+      takeKvFormat(arg.slice('--kv-format='.length));
+      continue;
+    }
     if (arg === '--trace-dir') {
       trace = true;
       const next = argv[i + 1];
@@ -310,6 +338,8 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     traceDir,
     traceDirMissingValue,
     persistPagedCache,
+    ...(kvFormat !== undefined ? { kvFormat } : {}),
+    ...(kvFormatInvalid !== undefined ? { kvFormatInvalid } : {}),
     help: helpSeen && !isSubcommand,
     update: leadingCommand === 'update',
     grokOneShot: versionSeen || (isSubcommand && (leadingCommand !== 'agent' || helpSeen)),
@@ -505,6 +535,10 @@ mlx options (handled before the agent binary sees the args):
   --trace                   Enable bounded native inference diagnostics.
   --trace-dir <dir>         Write inference.log in this directory (implies
                             --trace; dash-leading paths need --trace-dir=<dir>).
+  --kv-format <fmt>         Target K/V cache format: int8 or bf16 (default: int8
+                            for dense qwen3_5 on Metal at head 256, else bf16).
+                            Sets the flat cache DFlash2 turns use; the block-paged
+                            pool ignores it and stays bf16. bf16 uses more memory.
   --no-persist-cache        Disable the on-by-default SSD cold tier for persisted
                             paged prefix blocks. One switch for ALL restore-eligible
                             families (${coldTierRestoreFamilyList().join(', ')});
@@ -660,6 +694,12 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     return;
   }
 
+  if (scan.kvFormatInvalid !== undefined) {
+    console.error('--kv-format must be int8 or bf16');
+    process.exitCode = 1;
+    return;
+  }
+
   // Must run before the spawned `mlx serve` starts so its native tracing
   // subscriber picks up the env we export here.
   configureAgentTracing(scan);
@@ -722,5 +762,6 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     modelsDir,
     needsServer: true,
     ...(preloadModel !== undefined ? { preloadModel } : {}),
+    ...(scan.kvFormat !== undefined ? { kvFormat: scan.kvFormat } : {}),
   });
 }

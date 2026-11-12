@@ -137,6 +137,33 @@ describe('scanAgentArgs', () => {
     });
   });
 
+  // Mutation: stop lifting `--kv-format` (forward it to grok) → red.
+  describe('--kv-format extraction', () => {
+    it('lifts both forms out of passthrough', () => {
+      const spaced = scanAgentArgs(['--kv-format', 'int8', '-p', 'hi']);
+      expect(spaced.kvFormat).toBe('int8');
+      expect(spaced.kvFormatInvalid).toBeUndefined();
+      expect(spaced.passthrough).toEqual(['-p', 'hi']);
+      const inline = scanAgentArgs(['--kv-format=bf16', '-c']);
+      expect(inline.kvFormat).toBe('bf16');
+      expect(inline.passthrough).toEqual(['-c']);
+    });
+
+    it('keeps a --kv-format sitting in a grok value slot', () => {
+      const scan = scanAgentArgs(['--system-prompt-override', '--kv-format', 'int8']);
+      expect(scan.kvFormat).toBeUndefined();
+      expect(scan.passthrough).toEqual(['--system-prompt-override', '--kv-format', 'int8']);
+    });
+
+    it('reports a missing or unknown value without swallowing the next option', () => {
+      expect(scanAgentArgs(['--kv-format', 'fp8']).kvFormatInvalid).toBe('fp8');
+      expect(scanAgentArgs(['--kv-format=']).kvFormatInvalid).toBe('');
+      const missing = scanAgentArgs(['--kv-format', '--help']);
+      expect(missing.kvFormatInvalid).toBe('');
+      expect(missing.passthrough).toEqual(['--help']);
+    });
+  });
+
   describe('update intercept', () => {
     it('detects a leading update positional', () => {
       expect(scanAgentArgs(['update']).update).toBe(true);
@@ -684,6 +711,28 @@ describe('run() argv routing', () => {
       expect(calls.discover).toHaveLength(0);
       expect(calls.wizard).toHaveLength(0);
     }
+  });
+
+  it('exits 1 on a bad --kv-format and hands a good one to the launcher', async () => {
+    for (const argv of [['--kv-format', 'fp8'], ['--kv-format'], ['--kv-format=']]) {
+      const { deps, calls } = makeDeps();
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const prevExitCode = process.exitCode;
+      try {
+        await run(argv, deps);
+        expect(process.exitCode).toBe(1);
+        expect(errorSpy.mock.calls.flat().join('\n')).toContain('--kv-format must be int8 or bf16');
+      } finally {
+        process.exitCode = prevExitCode;
+        errorSpy.mockRestore();
+      }
+      expect(calls.launch).toHaveLength(0);
+    }
+    const { deps, calls } = makeDeps();
+    await run(['--kv-format', 'bf16'], deps);
+    expect(calls.launch).toHaveLength(1);
+    expect(calls.launch[0]!.kvFormat).toBe('bf16');
+    expect(calls.launch[0]!.argv).not.toContain('--kv-format');
   });
 
   it('documents the mlx flags and the grok environment in the help preamble', async () => {

@@ -172,6 +172,45 @@ fn dflash2_clamp_window_is_the_speculative_window() {
     assert_eq!(DFlash2Target::dflash2_window(&inner), Some(speculative));
 }
 
+/// Gate: each lane publishes the K/V format it writes. The block-paged pool
+/// is BF16 whatever `kv_format` says; the DFlash2 lane names the format its
+/// window was priced at; a flat load names the configured format.
+/// Mutation: pool lane reads `config.kv_format()` → red.
+/// Mutation: publish `speculative_kv_format: None` → red.
+/// Mutation: flat lane hard-codes `KvFormat::Bf16` → red.
+#[test]
+fn context_limits_publish_kv_formats() {
+    let Some(mut inner) = moe_inner_with_test_adapter_or_skip("context_limits_publish_kv_formats")
+    else {
+        return;
+    };
+    inner.config.kv_format = Some("int8".to_string());
+    inner.caches = None;
+    let limits = inner.context_limits_snapshot();
+    assert_eq!(limits.kv_format, "bf16");
+    assert_eq!(limits.speculative_kv_format, None);
+
+    inner.dflash2_window = Some(crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms {
+        trained: u32::MAX,
+        draft_trained: u32::MAX,
+        pool: Some(1_000),
+        reserve: None,
+        row_bytes: 1,
+        extent_rows: 256,
+    });
+    let priced = crate::models::qwen3_5::dflash2_turn::dflash2_target_kv_format(&inner);
+    assert_eq!(priced, crate::transformer::KvFormat::Int8);
+    let limits = inner.context_limits_snapshot();
+    assert_eq!(limits.kv_format, "bf16");
+    assert_eq!(
+        limits.speculative_kv_format.as_deref(),
+        Some(priced.as_str())
+    );
+
+    inner.paged_adapter = None;
+    assert_eq!(inner.context_limits_snapshot().kv_format, "int8");
+}
+
 /// An omitted budget is the rest of a window only when memory sizes that
 /// window: the pool window of a paged load, the DFlash2 window with a pool
 /// or reservation term. A flat load's window is the trained length.

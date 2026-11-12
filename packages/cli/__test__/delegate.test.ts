@@ -57,6 +57,31 @@ describe('delegate agent arguments', () => {
     expect(parseDelegateArgs(args).callerApproved).toBe(false);
   });
 
+  // Mutation: drop '--kv-format' from DELEGATE_VALUE_FLAGS → red (the spaced
+  // value folds into the prompt and the agent sees a bare --kv-format).
+  it.each([
+    [['--kv-format', 'bf16', 'Check PR #148']],
+    [['--kv-format=bf16', 'Check PR #148']],
+    [['-p', 'Check PR #148', '--kv-format', 'bf16']],
+    [['--kv-format', 'bf16', '-p', 'Check PR #148']],
+    [['-p', 'Check PR #148', '--kv-format=bf16']],
+    [['github', '--repo', 'owner/repo', '--kv-format', 'bf16', 'Check PR #148']],
+  ])('reads the --kv-format value, not the prompt: %j', async (argv) => {
+    const launch = vi.fn<NonNullable<AgentRunDeps['launch']>>(async () => 0);
+    await run(argv, {
+      resolveModelsDir: () => '/models',
+      discoverModels: async () => [{ name: 'local' }],
+      readPersistedDefault: () => ({ modelId: 'local' }),
+      launch,
+    });
+    expect(launch).toHaveBeenCalledOnce();
+    const options = launch.mock.calls[0]![0];
+    expect(options).toMatchObject({ kvFormat: 'bf16' });
+    expect(options.argv[options.argv.indexOf('-p') + 1]).toBe('Check PR #148');
+    expect(options.argv.filter((arg) => arg.startsWith('--kv-format'))).toEqual([]);
+    expect(options.argv).not.toContain('bf16');
+  });
+
   it('rejects ambiguous approval values', () => {
     expect(() => parseDelegateArgs(['github', '--caller-approved=false', 'Task'])).toThrow('takes no value');
   });

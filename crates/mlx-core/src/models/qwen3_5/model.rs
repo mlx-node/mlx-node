@@ -441,26 +441,36 @@ pub struct Qwen3_5ContextLimits {
     /// The same for `speculative_window_tokens`: set when that window has a
     /// memory term (the pool or the live reservation).
     pub speculative_omitted_budget_is_rest_of_window: bool,
+    /// Format of the K/V a turn on `effective_window_tokens` writes.
+    #[napi(ts_type = "'int8' | 'bf16'")]
+    pub kv_format: String,
+    /// Format of the K/V a turn on `speculative_window_tokens` writes.
+    #[napi(ts_type = "'int8' | 'bf16' | undefined")]
+    pub speculative_kv_format: Option<String>,
 }
 
 impl Qwen3_5ContextLimits {
-    /// `speculative` is the DFlash2 window and whether a memory term bounds
-    /// it; `memory_window` whether a paged pool sizes the effective window.
+    /// `speculative` is the DFlash2 window, whether a memory term bounds it
+    /// and the K/V format it was priced at; `memory_window` whether a paged
+    /// pool sizes the effective window; `kv_format` the effective lane's.
     pub(crate) fn from_parts(
         value: (u32, u32, u32, u32),
-        speculative: Option<(u32, bool)>,
+        speculative: Option<(u32, bool, crate::transformer::KvFormat)>,
         memory_window: bool,
+        kv_format: crate::transformer::KvFormat,
     ) -> Self {
         Self {
             trained_window_tokens: value.0,
             effective_window_tokens: value.1,
             paged_block_capacity: value.2,
             paged_block_size: value.3,
-            speculative_window_tokens: speculative.map(|(window, _)| window),
+            speculative_window_tokens: speculative.map(|(window, _, _)| window),
             rest_of_window_output_budget: true,
             omitted_budget_is_rest_of_window: memory_window,
             speculative_omitted_budget_is_rest_of_window: speculative
-                .is_some_and(|(_, memory_bound)| memory_bound),
+                .is_some_and(|(_, memory_bound, _)| memory_bound),
+            kv_format: kv_format.as_str().to_string(),
+            speculative_kv_format: speculative.map(|(_, _, format)| format.as_str().to_string()),
         }
     }
 }

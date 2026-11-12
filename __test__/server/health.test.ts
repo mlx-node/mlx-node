@@ -166,6 +166,34 @@ describe('createHealthReporter', () => {
     expect(health.models.count).toBe(2);
   });
 
+  // Mutation: map int8 to `none`/`none` → red.
+  // Mutation: copy `kv` into the minimal body → red.
+  it("kv lists resident models' format and window", () => {
+    const registry = new ModelRegistry();
+    const model = (window: number, kvFormat?: 'int8' | 'bf16') =>
+      ({
+        chatStreamSessionStart(): void {},
+        contextLimits: () => ({
+          trainedWindowTokens: 262144,
+          effectiveWindowTokens: window,
+          pagedBlockCapacity: 0,
+          pagedBlockSize: 16,
+          ...(kvFormat !== undefined ? { kvFormat } : {}),
+        }),
+      }) as never;
+    registry.register('int8', model(139257, 'int8'));
+    registry.register('bf16', model(73696, 'bf16'));
+    registry.register('unknown', model(4096));
+    registry.register('none', { chatStreamSessionStart(): void {} } as never);
+    const health = createHealthReporter({ registry })();
+    expect(health.kv).toEqual({
+      int8: { maximum_context_tokens: 139257, format: 'int8', quantization: 'symmetric_int8', scale_type: 'float32' },
+      bf16: { maximum_context_tokens: 73696, format: 'bf16', quantization: 'none', scale_type: 'none' },
+      unknown: { maximum_context_tokens: 4096 },
+    });
+    expect(toMinimalHealth(health)).not.toHaveProperty('kv');
+  });
+
   it('keeps `{ status: "ok" }` a strict subset of the full body', () => {
     // Pre-existing consumers poll `/health` and check `body.status === 'ok'`.
     // The richer body must not move or rename that field.

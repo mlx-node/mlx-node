@@ -101,6 +101,19 @@ export interface ServerHealth {
     saturated: boolean;
   };
   lastLoad: ModelLoadRecord | null;
+  /**
+   * Per resident name with a load-time context: the window a default text
+   * turn gets and the format of the K/V it writes (Splash `/status`).
+   */
+  kv: Record<string, ResidentKvStatus>;
+}
+
+/** Splash's `/status` KV fields for one resident model. */
+export interface ResidentKvStatus {
+  maximum_context_tokens: number;
+  format?: 'int8' | 'bf16';
+  quantization?: 'symmetric_int8' | 'none';
+  scale_type?: 'float32' | 'none';
 }
 
 /**
@@ -197,6 +210,20 @@ export function createHealthReporter(deps: HealthReporterDeps): () => ServerHeal
     const inFlight = deps.idleSweeper?.inFlight ?? 0;
     const drainPending = deps.idleSweeper?.isPending ?? false;
 
+    const kv: Record<string, ResidentKvStatus> = {};
+    for (const id of resident) {
+      const served = deps.registry.servedContext(id);
+      if (served === undefined) continue;
+      const maximum_context_tokens = served.windowTokens;
+      if (served.kvFormat === 'int8') {
+        kv[id] = { maximum_context_tokens, format: 'int8', quantization: 'symmetric_int8', scale_type: 'float32' };
+      } else if (served.kvFormat === 'bf16') {
+        kv[id] = { maximum_context_tokens, format: 'bf16', quantization: 'none', scale_type: 'none' };
+      } else {
+        kv[id] = { maximum_context_tokens };
+      }
+    }
+
     const status = deriveHealthStatus({
       writerActive,
       waitingWriters,
@@ -216,6 +243,7 @@ export function createHealthReporter(deps: HealthReporterDeps): () => ServerHeal
       work: { inFlight, drainPending, writerActive, waitingWriters },
       queue: { depth, limit, saturated },
       lastLoad,
+      kv,
     };
   };
 }

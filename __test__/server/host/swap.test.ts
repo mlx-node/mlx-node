@@ -8,7 +8,7 @@ import {
 } from '../../../packages/server/src/host/capability-models.js';
 import type { DiscoveredModel } from '../../../packages/server/src/host/discover.js';
 import { makeSwapController } from '../../../packages/server/src/host/swap.js';
-import type { ModelRegistry } from '../../../packages/server/src/registry.js';
+import { ModelRegistry } from '../../../packages/server/src/registry.js';
 
 interface FakeRegistry {
   getAny: ReturnType<typeof vi.fn<(name: string) => unknown>>;
@@ -18,6 +18,7 @@ interface FakeRegistry {
   unregister: ReturnType<typeof vi.fn>;
   list: () => { id: string }[];
   listSessionRegistries: () => [];
+  servedContext: () => undefined;
 }
 
 function fakeRegistry(): FakeRegistry {
@@ -38,6 +39,7 @@ function fakeRegistry(): FakeRegistry {
     unregister,
     list: () => [...resident.keys()].map((id) => ({ id })),
     listSessionRegistries: () => [],
+    servedContext: () => undefined,
   };
 }
 
@@ -350,6 +352,40 @@ describe('makeSwapController', () => {
     expect(cInstance).toEqual({ marker: '/fake/c' });
     expect(probe('claude-haiku-x')).toBe(cInstance);
     expect(probe('claude-haiku-x')).not.toBe(aInstance);
+  });
+
+  // Mutation: list `entry.contextWindow` always → red after the load.
+  // Mutation: serve `effectiveWindowTokens` instead of the lane → red (73,696).
+  it('reports the served window after load and the trained one before and after eviction', async () => {
+    const registry = new ModelRegistry();
+    const model = {
+      chatSessionStart: vi.fn(),
+      chatStreamSessionStart: vi.fn(),
+      hasMtpWeights: () => true,
+      contextLimits: () => ({
+        trainedWindowTokens: 262144,
+        effectiveWindowTokens: 73696,
+        pagedBlockCapacity: 0,
+        pagedBlockSize: 16,
+        speculativeWindowTokens: 139257,
+        kvFormat: 'bf16' as const,
+        speculativeKvFormat: 'int8' as const,
+      }),
+    };
+    const ctrl = makeSwapController(
+      discovered(['a']),
+      registry,
+      vi.fn(async () => model as unknown as LoadableModel),
+    );
+    const windows = () => {
+      const [entry] = ctrl.listModels();
+      return [entry!.context_window, entry!.max_model_len, entry!.context_length];
+    };
+    expect(windows()).toEqual([262144, 262144, 262144]);
+    await ctrl.resolveModel('a');
+    expect(windows()).toEqual([139257, 139257, 139257]);
+    registry.unregister('a');
+    expect(windows()).toEqual([262144, 262144, 262144]);
   });
 
   it('lists discovered entries in name order', () => {

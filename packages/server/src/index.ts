@@ -17,6 +17,7 @@ export type {
   HealthReporterDeps,
   HealthStatusInputs,
   ModelLoadRecord,
+  ResidentKvStatus,
   ServerHealth,
   ServerHealthMinimal,
   ServerHealthStatus,

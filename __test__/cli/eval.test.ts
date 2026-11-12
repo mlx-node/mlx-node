@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path';
 import { convertModel } from '@mlx-node/core';
 import { afterAll, beforeAll, describe, expect, it } from 'vite-plus/test';
 
-import { evalCache, evalScore } from '../../packages/cli/src/commands/eval.js';
+import { evalCache, evalScore, formatReport, reportJson } from '../../packages/cli/src/commands/eval.js';
 
 /**
  * End-to-end for `mlx eval`: capture a bf16 teacher, then score checkpoints
@@ -53,6 +53,31 @@ const EVAL_ROWS = [
   'She learned the river the way other people learn a language: first the nouns, the shoals and the bends and the drowned oak at the third crossing, and only much later the grammar, which was the way the water answered a week of rain.',
   'The argument for keeping the old bridge was never about the bridge. It was about the road on either side of it, and the fields the road divided, and the fact that no one had ever agreed where the parish ended and the moor began.',
 ];
+
+// Mutation: `reportJson` writes the CLI's `kvFormat ?? 'bf16'` after `...report` → red.
+// Mutation: drop the `kv_format` line from `formatReport` → red.
+describe('mlx eval report', () => {
+  const report = {
+    rows: 1,
+    positions: 8,
+    topK: 4,
+    teacherPath: '/teacher',
+    teacherQuantized: false,
+    meanNll: 1,
+    perplexity: Math.E,
+    teacherMeanNll: 1,
+    teacherPerplexity: Math.E,
+    meanKlTopk: 0,
+    teacherTailMass: 0.1,
+    top1Agreement: 1,
+    kvFormat: 'int8' as const,
+  };
+
+  it('names the resolved K/V format in the text and the --json line', () => {
+    expect(formatReport('/model', report)).toContain('kv_format        int8');
+    expect(JSON.parse(reportJson('/model', report))).toMatchObject({ model: '/model', kvFormat: 'int8' });
+  });
+});
 
 describe.skipIf(baseModel === null)('mlx eval (0.8B teacher-forced quality)', () => {
   let scratch: string;

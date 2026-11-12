@@ -3734,6 +3734,8 @@ export interface EvalReport {
   meanKlTopk: number;
   teacherTailMass: number;
   top1Agreement: number;
+  /** Format of the candidate's K/V cache during the scored prefill. */
+  kvFormat: 'int8' | 'bf16';
 }
 
 export interface ForeignConversionOptions {
@@ -5263,6 +5265,10 @@ export interface Qwen35ContextLimits {
    * memory term (the pool or the live reservation).
    */
   speculativeOmittedBudgetIsRestOfWindow: boolean;
+  /** Format of the K/V a turn on `effective_window_tokens` writes. */
+  kvFormat: 'int8' | 'bf16';
+  /** Format of the K/V a turn on `speculative_window_tokens` writes. */
+  speculativeKvFormat?: 'int8' | 'bf16' | undefined;
 }
 
 /** Generation configuration for Qwen3.5 */

@@ -1701,6 +1701,10 @@ impl Qwen35MoeInner {
 /// `impl EvalBackend for Qwen35Inner`, plus the `fa_idx` the MoE stack threads
 /// through its forward.
 impl crate::quality::runner::EvalBackend for Qwen35MoeInner {
+    fn kv_format(&self) -> crate::transformer::KvFormat {
+        self.config.kv_format()
+    }
+
     fn vocab_size(&self) -> i32 {
         self.config.vocab_size
     }

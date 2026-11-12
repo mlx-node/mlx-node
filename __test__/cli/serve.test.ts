@@ -112,6 +112,13 @@ describe('parseServeArgs', () => {
     expect(parseServeArgs([]).preload).toBeUndefined();
   });
 
+  it('maps --kv-format and rejects any other value', () => {
+    expect(parseServeArgs(['--kv-format', 'bf16']).kvFormat).toBe('bf16');
+    expect(parseServeArgs(['--kv-format=int8']).kvFormat).toBe('int8');
+    expect(parseServeArgs([]).kvFormat).toBeUndefined();
+    expect(() => parseServeArgs(['--kv-format', 'fp8'])).toThrow('--kv-format must be int8 or bf16');
+  });
+
   it('treats --log-dir as implying --verbose', () => {
     expect(parseServeArgs(['--log-dir', '/tmp/mlx-serve-logs']).logDir).toBe('/tmp/mlx-serve-logs');
   });
@@ -212,6 +219,40 @@ describe('mlx serve — end to end', () => {
         expect(errors).toEqual(['[mlx] preload of "beta" failed: weights unreadable']);
         expect((await fetch(`${host.url}/health`)).status).toBe(200);
 
+        const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
+        added[0]!('SIGINT');
+        for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      },
+    });
+    expect(exitCodes).toEqual([0]);
+  });
+
+  // Mutation: drop `kvFormat` from the `createInferenceHost` call → red.
+  it('hands --kv-format to the model loader', async () => {
+    const modelsDir = await makeModelsDir(['alpha']);
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const loads: unknown[] = [];
+    const exitCodes: number[] = [];
+    const sigintBefore = new Set(listenersOf('SIGINT'));
+
+    await run(['--port', '0', '--models-dir', modelsDir, '--preload', 'alpha', '--kv-format', 'bf16'], {
+      hostOverrides: {
+        disableStore: true,
+        sweepOrphanTempRoots: false,
+        pagedModelTypes: [],
+        loadModel: async (_path: string, options?: unknown) => {
+          loads.push(options);
+          return {} as unknown as LoadableModel;
+        },
+      },
+      exit: (code) => exitCodes.push(code),
+      onReady: async () => {
+        for (let i = 0; i < 200 && loads.length === 0; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(loads).toEqual([{ kvFormat: 'bf16' }]);
         const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
         added[0]!('SIGINT');
         for (let i = 0; i < 200 && exitCodes.length === 0; i++) {

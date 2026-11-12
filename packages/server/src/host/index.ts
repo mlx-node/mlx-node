@@ -49,6 +49,7 @@ import {
   type LoadModelOptions,
 } from '@mlx-node/lm';
 import { findDFlash2Draft } from '@mlx-node/lm/draft-companion';
+import { familyDataFor } from '@mlx-node/lm/family-data';
 import { discoverRerankers, type DiscoveredReranker } from '@mlx-node/rerank/catalog';
 import { validateRerankerFamilies, familyLoadOptions } from '@mlx-node/rerank/protocol';
 import type { RerankerFamilyOptions, RerankerModel } from '@mlx-node/rerank/types';
@@ -165,6 +166,12 @@ export interface InferenceHostOptions {
    * read, so mutating them in the child is too late.
    */
   enginePolicy?: EnginePolicy;
+  /**
+   * Flat (DFlash2) K/V cache format for qwen3_5 / qwen3_5_moe loads; other
+   * families never see it. The block-paged pool ignores it and stays bf16.
+   * Omitted ⇒ the load default.
+   */
+  kvFormat?: 'int8' | 'bf16';
   /** Model types forced onto the block-paged KV cache. Default {@link DEFAULT_PAGED_MODEL_TYPES}. */
   pagedModelTypes?: readonly string[];
   /** Path to the SQLite response store. See `ServerConfig.storePath`. */
@@ -372,10 +379,16 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     // one must give it back, or each retry leaves another lease protecting
     // those assets from stale/debris cleanup until process exit.
     const leasedDir = pagedConfigOverrides.claimPreparedLease(resolvedPath);
+    const options: LoadModelOptions = {
+      ...(draftModelPath !== undefined ? { draftModelPath } : {}),
+      ...(opts.kvFormat !== undefined && familyDataFor(entry.modelType)?.acceptsKvFormat === true
+        ? { kvFormat: opts.kvFormat }
+        : {}),
+    };
     try {
-      return draftModelPath === undefined
+      return Object.keys(options).length === 0
         ? await loadModelFn(resolvedPath)
-        : await loadModelFn(resolvedPath, { draftModelPath });
+        : await loadModelFn(resolvedPath, options);
     } catch (error) {
       if (leasedDir !== undefined) releaseNativeGgufLease(leasedDir);
       throw error;
