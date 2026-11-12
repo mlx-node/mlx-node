@@ -166,6 +166,7 @@ function send(
   text: string,
   stream: boolean,
   res: ServerResponse,
+  resolveModel?: (name: string) => Promise<void>,
 ): Promise<void> {
   if (endpoint === 'messages') {
     return handleCreateMessage(
@@ -174,7 +175,7 @@ function send(
       registry,
       undefined,
       undefined,
-      undefined,
+      resolveModel,
       undefined,
       undefined,
       journal,
@@ -189,7 +190,7 @@ function send(
     undefined,
     undefined,
     undefined,
-    undefined,
+    resolveModel,
     journal,
   );
 }
@@ -288,6 +289,34 @@ describe('the turn journal at the chat endpoints', () => {
       expect(other.getStatus()).toBe(200);
     }
   });
+
+  it('a quarantined request is refused before any model load', async () => {
+    for (const endpoint of ENDPOINTS) {
+      const dir = journalDir();
+      const first = new TurnJournal({ dir, quarantined: new Set() });
+      const begin = vi.spyOn(first, 'begin');
+      const { model } = createJournalModel(dir);
+      const resident = new ModelRegistry();
+      resident.register('m', model as never);
+      await send(endpoint, resident, first, 'crashes the model', false, createMockRes().res);
+      const fingerprint = begin.mock.calls[0][0];
+
+      const quarantined = new TurnJournal({ dir, quarantined: new Set([fingerprint]) });
+      const cold = new ModelRegistry();
+      const resolveModel = vi.fn(async (name: string) => {
+        cold.register(name, model as never);
+      });
+      const refused = createMockRes();
+      await send(endpoint, cold, quarantined, 'crashes the model', false, refused.res, resolveModel);
+      expect(refused.getStatus()).toBe(400);
+      expect(resolveModel).not.toHaveBeenCalled();
+
+      const other = createMockRes();
+      await send(endpoint, cold, quarantined, 'crashes the model!', false, other.res, resolveModel);
+      expect(other.getStatus()).toBe(200);
+      expect(resolveModel).toHaveBeenCalledTimes(1);
+    }
+  });
 });
 
 describe('requestFingerprint (Splash request_fingerprint)', () => {
@@ -322,6 +351,12 @@ describe('requestFingerprint (Splash request_fingerprint)', () => {
     expect(same([messages[0], { ...messages[1], images: [new Uint8Array([1, 2, 4])] }], config)).toBe(false);
     expect(same([messages[0], { ...messages[1], images: [new Uint8Array([1, 2, 3, 4])] }], config)).toBe(false);
     expect(same([messages[0], { ...messages[1], images: [new Uint8Array([1, 2, 3])] }], config)).toBe(true);
+
+    // A continuation's stored chain, by its id.
+    const continued = requestFingerprint('m', messages, config, 'resp_a');
+    expect(continued).not.toBe(base);
+    expect(requestFingerprint('m', messages, config, 'resp_b')).not.toBe(continued);
+    expect(requestFingerprint('m', messages, config, 'resp_a')).toBe(continued);
   });
 
   it('a raw route body is keyed by its route', () => {

@@ -1628,6 +1628,21 @@ function readStoredModelIdentity(record: StoredResponseRecord): StoredModelIdent
   return { kind: 'absent' };
 }
 
+/**
+ * Splash `request_fingerprint` of a turn, from the body alone: the stored
+ * chain is read only after the model load, so `previous_response_id` stands
+ * for it. Null when the body does not map; the dispatch mapping rejects it.
+ */
+function responsesFingerprint(body: ResponsesAPIRequest): string | null {
+  let mapped: ReturnType<typeof mapRequest>;
+  try {
+    mapped = mapRequest(body);
+  } catch {
+    return null;
+  }
+  return requestFingerprint(body.model, mapped.messages, mapped.config, body.previous_response_id);
+}
+
 // ---------------------------------------------------------------------------
 // Public handler
 // ---------------------------------------------------------------------------
@@ -1721,6 +1736,13 @@ export async function handleCreateResponse(
     }
   }
   const effectiveRetentionSec = requestedRetentionSec ?? responseRetentionSec;
+
+  const turnFingerprint = turnJournal === undefined ? null : responsesFingerprint(body);
+  // Splash `_admit`: refused before admission and before any model load or swap.
+  if (turnFingerprint !== null && turnJournal?.refuses(turnFingerprint) === true) {
+    sendRequestQuarantined(res, QUARANTINE_MESSAGE);
+    return;
+  }
 
   // Pre-dispatch admission gate (H3, host mode). Resident requests bypass
   // the model-load writer below and proceed toward the continuous-batching
@@ -2347,12 +2369,6 @@ export async function handleCreateResponse(
     // Stamp the requesting alias so the shared model wrapper attributes the
     // turn to the name the client used, not the binding's first registration.
     (config as TracedChatConfig).modelAlias = body.model;
-    const turnFingerprint = turnJournal === undefined ? null : requestFingerprint(body.model, messages, config);
-    // Splash `_admit`: refused before admission, never dispatched.
-    if (turnFingerprint !== null && turnJournal?.refuses(turnFingerprint) === true) {
-      sendRequestQuarantined(res, QUARANTINE_MESSAGE);
-      return;
-    }
 
     // New-only messages (what this request added). Instructions are
     // stored separately — persisting them as input messages would

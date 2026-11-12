@@ -59,12 +59,19 @@ function canonical(value: unknown, skip: ReadonlySet<string> | null): string {
 /**
  * Splash `request_fingerprint`: the SHA-256 of what a turn asks the model,
  * which its retries share. Over the mapped messages and config rather than
- * prompt tokens: the endpoint has none before dispatch.
+ * prompt tokens: the endpoint has none before the model load.
+ * `previousResponseId` stands for a stored chain not yet read.
  */
-export function requestFingerprint(model: string, messages: readonly ChatMessage[], config: ChatConfig): string {
+export function requestFingerprint(
+  model: string,
+  messages: readonly ChatMessage[],
+  config: ChatConfig,
+  previousResponseId?: string,
+): string {
+  const previous = previousResponseId === undefined ? '' : `,"previous":${JSON.stringify(previousResponseId)}`;
   return createHash('sha256')
     .update(
-      `{"config":${canonical(config, UNFINGERPRINTED_CONFIG)},"messages":${canonical(messages, null)},"model":${JSON.stringify(model)}}`,
+      `{"config":${canonical(config, UNFINGERPRINTED_CONFIG)},"messages":${canonical(messages, null)},"model":${JSON.stringify(model)}${previous}}`,
     )
     .digest('hex');
 }

@@ -1275,6 +1275,15 @@ export async function handleCreateMessage(
     sendAnthropicBadRequest(res, err instanceof Error ? err.message : 'Invalid request');
     return;
   }
+  mappedConfig = applyClaudeCodeTitleFastPath(mappedConfig, body);
+  mappedConfig = applyDefaultThinkingTokenBudget(mappedConfig, defaultThinkingTokenBudget);
+  const turnFingerprint =
+    turnJournal === undefined ? null : requestFingerprint(body.model, mappedMessages, mappedConfig);
+  // Splash `_admit`: refused before admission and before any model load or swap.
+  if (turnFingerprint !== null && turnJournal?.refuses(turnFingerprint) === true) {
+    sendAnthropicError(res, 400, 'invalid_request_error', QUARANTINE_MESSAGE);
+    return;
+  }
 
   // Pre-dispatch admission gate (H3, host mode). Mirror of the
   // `/v1/responses` gate — see the long-form rationale there. In host
@@ -1461,8 +1470,6 @@ export async function handleCreateMessage(
   try {
     const sessionReg: SessionRegistry = lease.registry;
     mappedConfig = applyOutputTokenLimit(mappedConfig, sessionReg.outputTokenLimit);
-    mappedConfig = applyClaudeCodeTitleFastPath(mappedConfig, body);
-    mappedConfig = applyDefaultThinkingTokenBudget(mappedConfig, defaultThinkingTokenBudget);
     // Snapshot the monotonic instance id so the in-mutex re-read can detect a
     // hot-swap that lands between lease acquisition and mutex entry. Unlike
     // `/v1/responses`, the Anthropic handler has no stored-identity check
@@ -1478,12 +1485,6 @@ export async function handleCreateMessage(
     // Stamp the requesting alias so the shared model wrapper attributes the
     // turn to the name the client used, not the binding's first registration.
     (config as TracedChatConfig).modelAlias = body.model;
-    const turnFingerprint = turnJournal === undefined ? null : requestFingerprint(body.model, messages, config);
-    // Splash `_admit`: refused before admission, never dispatched.
-    if (turnFingerprint !== null && turnJournal?.refuses(turnFingerprint) === true) {
-      sendAnthropicError(res, 400, 'invalid_request_error', QUARANTINE_MESSAGE);
-      return;
-    }
 
     // Canonicalize every assistant fan-out's trailing tool block against its
     // declared sibling order. Several native session backends pair tool results
