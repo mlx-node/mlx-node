@@ -27,6 +27,7 @@ use super::ledger::{
     decide, take_rights,
 };
 use super::metrics::{Gap, Metrics, TtftParts};
+use crate::engine::scheduler::{SchedulerCounterSnapshot, SchedulerCounters};
 
 const MIB: u64 = 1 << 20;
 /// Splash `MemoryStatusReporter`'s decision log length.
@@ -454,6 +455,17 @@ struct ModelEntry {
     /// What the model thread last published.
     waits: ResourceWaitStatus,
     replans: u64,
+    /// The model's scheduler, read live (Splash `Status.cpp`
+    /// `writeScheduler`, one per engine).
+    scheduler: Option<Arc<SchedulerCounters>>,
+}
+
+/// One model's scheduler as the status reads it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SchedulerStatus {
+    pub model_id: u64,
+    pub counters: SchedulerCounterSnapshot,
+    pub replans: u64,
 }
 
 struct Books {
@@ -736,6 +748,7 @@ impl Governor {
             accounts: Arc::clone(&accounts),
             waits: ResourceWaitStatus::default(),
             replans: 0,
+            scheduler: None,
         });
         books
             .ledger
@@ -1301,6 +1314,39 @@ impl Governor {
         counters.resource_timeouts = metrics.resource_timeouts;
         counters.capacity_exhausted = metrics.capacity_exhausted;
         counters
+    }
+
+    /// The model's scheduler counters, read by the status until the model
+    /// unregisters.
+    pub(crate) fn register_scheduler(&self, model: u64, counters: Arc<SchedulerCounters>) {
+        if let Some(entry) = self.lock().model(model) {
+            entry.scheduler = Some(counters);
+        }
+    }
+
+    /// Each registered model's scheduler, in registration order.
+    pub(crate) fn schedulers(&self) -> Vec<SchedulerStatus> {
+        let registered: Vec<(u64, Arc<SchedulerCounters>, u64)> = {
+            let books = self.lock();
+            books
+                .models
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .scheduler
+                        .as_ref()
+                        .map(|counters| (entry.id, Arc::clone(counters), entry.replans))
+                })
+                .collect()
+        };
+        registered
+            .into_iter()
+            .map(|(model_id, counters, replans)| SchedulerStatus {
+                model_id,
+                counters: counters.snapshot(),
+                replans,
+            })
+            .collect()
     }
 
     /// The model's wait epoch.

@@ -129,6 +129,7 @@ async fn qwen38_dflash2_perf() {
             kv_format: None,
             max_memory_bytes: None,
             max_context_tokens: None,
+            decode_share: None,
         }),
     )
     .await
@@ -803,6 +804,7 @@ async fn run_restore_case(case: RestoreCase) {
             kv_format: None,
             max_memory_bytes: None,
             max_context_tokens: None,
+            decode_share: None,
         }),
     )
     .await

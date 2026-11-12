@@ -1534,7 +1534,8 @@ pub(super) mod tests {
                 num_tokens: 4,
                 cancel_snapshot: false,
             }],
-            token_budget: 64,
+            contended: false,
+            leader_cut: None,
         };
         let claims = state.claim_rows_in_order(&plan);
         let denial = claims.grants[0].expect("the draft growth is refused");
@@ -1592,7 +1593,8 @@ pub(super) mod tests {
                 num_tokens: 16,
                 cancel_snapshot: false,
             }],
-            token_budget: 64,
+            contended: false,
+            leader_cut: None,
         };
         let claims = state.claim_rows_in_order(&plan);
         let denial = claims.grants[0].expect("the draft growth is refused");

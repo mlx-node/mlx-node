@@ -67,6 +67,8 @@ export type ServableModel = SessionCapableModel;
 export interface ServedContext {
   windowTokens: number;
   kvFormat?: 'int8' | 'bf16';
+  /** The model's `model_id` in the memory governor's `scheduler` status. */
+  governorModelId?: number;
 }
 
 /** Model entry stored in the registry. */
@@ -773,7 +775,12 @@ export class ModelRegistry {
     const lane = contextLane(context.limits);
     const windowTokens = Math.floor(lane.windowTokens);
     if (!Number.isSafeInteger(windowTokens) || windowTokens <= 0) return undefined;
-    return { windowTokens, ...(lane.kvFormat !== undefined ? { kvFormat: lane.kvFormat } : {}) };
+    const { governorModelId } = context.limits;
+    return {
+      windowTokens,
+      ...(lane.kvFormat !== undefined ? { kvFormat: lane.kvFormat } : {}),
+      ...(governorModelId != null ? { governorModelId } : {}),
+    };
   }
 
   /**

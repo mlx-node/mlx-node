@@ -159,6 +159,8 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) max_memory_bytes: Option<u64>,
     /// `--max-context`: the context every turn may hold, at most the plan's.
     pub(crate) max_context: Option<u32>,
+    /// `--decode-share` (Splash `EngineConfig::decodeShare`).
+    pub(crate) decode_share: f64,
     pub(crate) dflash2_verify_budget: super::verify_budget::VerifyBudget,
     pub(crate) vision_encoder: Option<Arc<QwenVisionEncoder>>,
     pub(crate) image_processor: Option<Arc<QwenImageProcessor>>,
@@ -490,6 +492,10 @@ impl Qwen3_5MoeModel {
         )?;
         let max_context =
             crate::nn::rope_scaling::max_context_option("Qwen3.5 MoE", options.max_context_tokens)?;
+        let decode_share = crate::models::qwen3_5::load_plan::decode_share_option(
+            "Qwen3.5 MoE",
+            options.decode_share,
+        )?;
         let source = crate::engine::checkpoint_source::CheckpointSource::resolve(
             std::path::Path::new(&path),
             crate::utils::gguf::NativeGgufFamily::Qwen35Moe,
@@ -501,6 +507,7 @@ impl Qwen3_5MoeModel {
             kv_format,
             max_memory_bytes,
             max_context,
+            decode_share,
         )
         .await;
         if loaded.is_err() {

@@ -14,6 +14,7 @@ import {
   LAUNCHER_ENGINE_POLICY,
   ModelNotFoundError,
   NoModelsDiscoveredError,
+  parseDecodeShare,
   parseIdleRelease,
   parseMaxContext,
   parseMaxMemory,
@@ -66,6 +67,11 @@ Options:
                       native window when memory holds it). Qwen3.5 dense,
                       MoE and Qwen3.8 Flash Next take it; a load whose
                       memory plan holds fewer tokens fails.
+  --decode-share <share>  Decode time owed per unit of prefill time while
+                      other requests generate (default: 0.5). Higher keeps
+                      their output faster during a long prompt and slows
+                      that prompt; 0 alternates one command each. Qwen3.5
+                      dense and MoE take it.
   --idle-release <duration>  Time without a request before the engine unwires
                       its memory and frees the weights: seconds, or with an
                       s, m or h suffix, e.g. 30m (default: 10m); off keeps
@@ -106,6 +112,7 @@ export interface ServeArgs {
   kvFormat?: 'int8' | 'bf16';
   maxMemoryBytes?: number;
   maxContextTokens?: number;
+  decodeShare?: number;
   /** `--idle-release` in seconds; `Infinity` for `off`. */
   idleReleaseSeconds?: number;
   thinkingTokenBudget?: number;
@@ -135,6 +142,7 @@ export function parseServeArgs(argv: string[]): ServeArgs {
       'kv-format': { type: 'string' },
       'max-memory': { type: 'string' },
       'max-context': { type: 'string' },
+      'decode-share': { type: 'string' },
       'idle-release': { type: 'string' },
       'thinking-token-budget': { type: 'string' },
       'rerank-config': { type: 'string' },
@@ -166,6 +174,8 @@ export function parseServeArgs(argv: string[]): ServeArgs {
   const maxMemoryBytes = maxMemoryText === undefined ? undefined : parseMaxMemory(maxMemoryText);
   const maxContextText = values['max-context'];
   const maxContextTokens = maxContextText === undefined ? undefined : parseMaxContext(maxContextText);
+  const decodeShareText = values['decode-share'];
+  const decodeShare = decodeShareText === undefined ? undefined : parseDecodeShare(decodeShareText);
   const idleReleaseText = values['idle-release'];
   const idleReleaseSeconds = idleReleaseText === undefined ? undefined : parseIdleRelease(idleReleaseText);
   const budgetText = values['thinking-token-budget'];
@@ -183,6 +193,7 @@ export function parseServeArgs(argv: string[]): ServeArgs {
     ...(kvFormat !== undefined ? { kvFormat } : {}),
     ...(maxMemoryBytes !== undefined ? { maxMemoryBytes } : {}),
     ...(maxContextTokens !== undefined ? { maxContextTokens } : {}),
+    ...(decodeShare !== undefined ? { decodeShare } : {}),
     ...(idleReleaseSeconds !== undefined ? { idleReleaseSeconds } : {}),
     ...(thinkingTokenBudget !== undefined ? { thinkingTokenBudget } : {}),
     ...(values['rerank-config'] !== undefined ? { rerankConfig: values['rerank-config'] } : {}),
@@ -248,6 +259,7 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
       ...(args.kvFormat !== undefined ? { kvFormat: args.kvFormat } : {}),
       ...(args.maxMemoryBytes !== undefined ? { maxMemoryBytes: args.maxMemoryBytes } : {}),
       ...(args.maxContextTokens !== undefined ? { maxContextTokens: args.maxContextTokens } : {}),
+      ...(args.decodeShare !== undefined ? { decodeShare: args.decodeShare } : {}),
       ...(args.idleReleaseSeconds !== undefined ? { idleReleaseSeconds: args.idleReleaseSeconds } : {}),
       ...(args.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: args.thinkingTokenBudget } : {}),
       ...(await readRerankConfig(args.rerankConfig)),

@@ -8,12 +8,11 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::time::Instant;
 
+use crate::engine::latency::LatencyHistogram;
+use crate::engine::scheduler::DECODE_GAP_MS;
 use crate::transformer::paged_kv_cache_adapter::SeqId;
 
 use super::governor::Governor;
-
-/// Splash `EngineConfig::decodeGapMilliseconds`.
-pub(crate) const DECODE_GAP_SECONDS: f64 = 0.5;
 
 /// Splash `TtftPart`, without `Rest`, which is never accumulated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,12 +26,14 @@ pub(crate) enum TtftPart {
 pub(crate) const TTFT_PARTS: usize = 4;
 
 /// What one drive pass ran: Splash's command in flight.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct PassWork {
     /// The requests whose prefill rows ran.
     pub prefill: Vec<SeqId>,
     /// Decode rows ran, or a whole turn.
     pub decode: bool,
+    /// The step's prefill-phase wall.
+    pub prefill_seconds: f64,
 }
 
 impl PassWork {
@@ -51,8 +52,15 @@ impl PassWork {
         (!self.prefill.is_empty()).then_some(TtftPart::OtherPrefill)
     }
 
-    pub(crate) fn ran_prefill(&self) -> bool {
-        !self.prefill.is_empty()
+    /// The prefill units' time `lane` waited through without a row in them
+    /// (Splash's batch completion adds a prefill command's wall to every
+    /// lane outside it).
+    pub(crate) fn prefill_beside(&self, lane: SeqId) -> f64 {
+        if self.prefill.contains(&lane) {
+            0.0
+        } else {
+            self.prefill_seconds
+        }
     }
 }
 
@@ -149,6 +157,12 @@ impl GapClock {
         self.claim_waited |= claim_waited;
     }
 
+    /// The prefill units' time since the last token event.
+    #[cfg(test)]
+    pub(crate) fn prefill_seconds(&self) -> f64 {
+        self.prefill_seconds
+    }
+
     #[cfg(test)]
     /// A cold-tier restore poll ran.
     pub(crate) fn read_ssd(&mut self) {
@@ -181,7 +195,7 @@ impl GapClock {
         } else {
             GapCause::Other
         };
-        let cause = (seconds > DECODE_GAP_SECONDS).then_some(first);
+        let cause = (seconds * 1000.0 > DECODE_GAP_MS).then_some(first);
         Some(Gap {
             seconds,
             cause,
@@ -191,54 +205,6 @@ impl GapClock {
                 0.0
             },
         })
-    }
-}
-
-const BUCKETS: usize = 40;
-
-/// Splash `LatencyHistogram`: latencies in log-2 buckets of microseconds;
-/// a quantile reads as its bucket's upper bound.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct LatencyHistogram {
-    buckets: [u64; BUCKETS],
-    maximum_seconds: f64,
-}
-
-impl Default for LatencyHistogram {
-    fn default() -> Self {
-        Self {
-            buckets: [0; BUCKETS],
-            maximum_seconds: 0.0,
-        }
-    }
-}
-
-impl LatencyHistogram {
-    pub(crate) fn add(&mut self, seconds: f64) {
-        let micros = (seconds.max(0.0) * 1e6) as u64;
-        let bucket = ((u64::BITS - micros.leading_zeros()) as usize).min(BUCKETS - 1);
-        self.buckets[bucket] += 1;
-        self.maximum_seconds = self.maximum_seconds.max(seconds);
-    }
-
-    pub(crate) fn maximum_ms(&self) -> f64 {
-        self.maximum_seconds * 1000.0
-    }
-
-    pub(crate) fn quantile_ms(&self, q: f64) -> f64 {
-        let count: u64 = self.buckets.iter().sum();
-        if count == 0 {
-            return 0.0;
-        }
-        let rank = (q * (count - 1) as f64) as u64 + 1;
-        let mut seen = 0u64;
-        for (bucket, &n) in self.buckets.iter().enumerate() {
-            seen += n;
-            if seen >= rank {
-                return (1u64 << bucket) as f64 / 1000.0;
-            }
-        }
-        self.maximum_ms()
     }
 }
 

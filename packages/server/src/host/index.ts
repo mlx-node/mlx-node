@@ -191,6 +191,12 @@ export interface InferenceHostOptions {
    * families never see it. Omitted ⇒ the window the plan holds.
    */
   maxContextTokens?: number;
+  /**
+   * Decode time owed per unit of prefill time while other requests generate
+   * (`--decode-share`) for qwen3_5 / qwen3_5_moe loads. Other families never
+   * see it. Omitted ⇒ 0.5.
+   */
+  decodeShare?: number;
   /** See `ServerConfig.thinkingTokenBudget`. */
   thinkingTokenBudget?: number;
   /** See `ServerConfig.turnJournal`. */
@@ -438,6 +444,9 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
         : {}),
       ...(opts.maxContextTokens !== undefined && familyDataFor(entry.modelType)?.acceptsMaxContext === true
         ? { maxContextTokens: opts.maxContextTokens }
+        : {}),
+      ...(opts.decodeShare !== undefined && familyDataFor(entry.modelType)?.acceptsDecodeShare === true
+        ? { decodeShare: opts.decodeShare }
         : {}),
     };
     try {
@@ -712,6 +721,7 @@ function startContextEstimates(
 }
 
 export { discoverModels, type DiscoveredModel } from './discover.js';
+export { DECODE_SHARE_ERROR, DEFAULT_DECODE_SHARE, parseDecodeShare } from './decode-share.js';
 export { DEFAULT_IDLE_RELEASE_SECONDS, IDLE_RELEASE_ERROR, idleReleaseText, parseIdleRelease } from './idle-release.js';
 export { MAX_CONTEXT_ERROR, MAX_YARN_CONTEXT_TOKENS, parseMaxContext } from './max-context.js';
 export { MAX_MEMORY_ERROR, parseMaxMemory } from './max-memory.js';

@@ -257,6 +257,12 @@ interface ModelFamilyDataBase {
    */
   readonly acceptsMaxContext?: true;
   /**
+   * Native `load` accepts `LoadModelOptions.decodeShare` (`--decode-share`):
+   * its scheduler cuts prefill beside a decoding lane and owes decoders that
+   * share of each cut's time (Splash `Scheduler::planPrefill`).
+   */
+  readonly acceptsDecodeShare?: true;
+  /**
    * Native `load` accepts a matching auxiliary HF checkpoint directory — the
    * original checkpoint supplying qwen4_exp's MTP and vision weights that a
    * GGUF omits. Gates `LoadModelOptions.auxiliaryModelPath` in
@@ -441,6 +447,7 @@ export const MODEL_FAMILY_DATA = [
     acceptsKvFormat: true,
     acceptsMaxMemory: true,
     acceptsMaxContext: true,
+    acceptsDecodeShare: true,
     coldRestoreEligible: true,
     streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen35'],
@@ -462,6 +469,7 @@ export const MODEL_FAMILY_DATA = [
     acceptsKvFormat: true,
     acceptsMaxMemory: true,
     acceptsMaxContext: true,
+    acceptsDecodeShare: true,
     coldRestoreEligible: true,
     streamOpts: { recordModelPath: true },
     traits: { reasoning: true, fallbackContextWindow: 262144 },

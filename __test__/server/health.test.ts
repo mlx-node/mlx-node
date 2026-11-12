@@ -328,6 +328,7 @@ describe('createHealthReporter', () => {
       },
       decodeGapMs: { p50: 1, p99: 2, max: 600 },
       decisions: ['Memory: start claim needs 1.0 MiB: short'],
+      scheduler: [],
     };
     const governor = toMemoryGovernorHealth(status);
     const health = createHealthReporter({ registry: new ModelRegistry(), memoryGovernor: () => governor })();
@@ -348,6 +349,107 @@ describe('createHealthReporter', () => {
     expect(toMinimalHealth(health)).not.toHaveProperty('memory_governor');
     const none = createHealthReporter({ registry: new ModelRegistry(), memoryGovernor: () => null })();
     expect('memory_governor' in none).toBe(false);
+  });
+
+  // Splash `/status` `scheduler` per engine: each entry is named after the
+  // resident model whose context limits carry its governor id.
+  // Mutation: skip the name join → red (no `model`).
+  it('memory_governor.scheduler names each model it serves', () => {
+    const latency = { p50: 512, p95: 640, p99: 640, max: 640, total: 1152, samples: 2 };
+    const scheduler = {
+      modelId: 7,
+      queued: 1,
+      waitingResources: 0,
+      waitingPrefix: 0,
+      prefilling: 1,
+      decoding: 1,
+      prefillBatches: 3,
+      prefillRows: 1536,
+      decodeBatches: 5,
+      decodeBatchesByWidth: [4, 1],
+      decodeGapTargetMs: 500,
+      contendedPrefillMs: latency,
+      prefillUnits: 3,
+      boundCuts: 2,
+      replans: 0,
+    };
+    const cause = { gaps: 0, ms: 0 };
+    const governor = toMemoryGovernorHealth({
+      limit: 16,
+      charged: 7,
+      headroom: 9,
+      pressure: 'normal',
+      deniedReservations: 0,
+      host: {
+        measured: true,
+        available: 20,
+        spare: 18,
+        spareReserve: 3,
+        headroom: 15,
+        systemPressure: 'normal',
+        growthAllowed: true,
+      },
+      accounts: [],
+      owed: { bytes: 0, transfers: 0 },
+      claims: { waiting: 0, bytes: 0, oldestMs: 0 },
+      resourceWaits: { memory: 0, concurrency: 0, suspended: 0, draining: false, heldBehindRefusal: 0, oldestMs: 0 },
+      counters: {
+        replans: 0,
+        resourceSuspensions: 0,
+        resourceResumptions: 0,
+        resourceTimeouts: 0,
+        capacityExhausted: 0,
+        metalOutOfMemory: 0,
+        publicationsRefused: 0,
+      },
+      ttftPartsMs: { ownPrefill: 0, claimWait: 0, decode: 0, otherPrefill: 0 },
+      decodeGapCauses: {
+        prefillUnit: cause,
+        claimWait: cause,
+        ssdRead: cause,
+        poolRelease: cause,
+        replan: cause,
+        other: cause,
+        prefillMs: 0,
+      },
+      decodeGapMs: { p50: 0, p99: 0, max: 0 },
+      decisions: [],
+      scheduler: [scheduler, { ...scheduler, modelId: 8 }],
+    });
+    const registry = new ModelRegistry();
+    registry.register('qwen', {
+      chatStreamSessionStart(): void {},
+      contextLimits: () => ({
+        trainedWindowTokens: 262144,
+        effectiveWindowTokens: 139257,
+        pagedBlockCapacity: 0,
+        pagedBlockSize: 16,
+        governorModelId: 7,
+      }),
+    } as never);
+    const health = createHealthReporter({ registry, memoryGovernor: () => governor })();
+    expect(health.memory_governor?.scheduler).toEqual([
+      {
+        model: 'qwen',
+        model_id: 7,
+        queued: 1,
+        waiting_resources: 0,
+        waiting_prefix: 0,
+        prefilling: 1,
+        decoding: 1,
+        prefill_batches: 3,
+        prefill_rows: 1536,
+        decode_batches: 5,
+        decode_batches_by_width: { b1: 4, b2: 1 },
+        decode_gap_target_ms: 500,
+        contended_prefill_ms: latency,
+        prefill_units: 3,
+        bound_cuts: 2,
+        replans: 0,
+      },
+      expect.not.objectContaining({ model: expect.anything() }),
+    ]);
+    expect(health.memory_governor?.scheduler[1]?.model_id).toBe(8);
   });
 
   it('never returns a negative uptime if the clock steps backwards', () => {

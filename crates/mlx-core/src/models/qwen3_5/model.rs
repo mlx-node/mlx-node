@@ -183,6 +183,8 @@ pub(crate) struct Qwen35Inner {
     pub(crate) max_memory_bytes: Option<u64>,
     /// `--max-context`: the context every turn may hold, at most the plan's.
     pub(crate) max_context: Option<u32>,
+    /// `--decode-share` (Splash `EngineConfig::decodeShare`).
+    pub(crate) decode_share: f64,
     /// Same latch for the compiled CLEF decide backbone. Per-model state
     /// (not thread-local) so it sticks regardless of which thread runs
     /// `decide_clef`.
@@ -385,6 +387,10 @@ pub struct Qwen35LoadOptions {
     /// YaRN, which is static and changes answers at every length.
     #[napi(ts_type = "number | undefined")]
     pub max_context_tokens: Option<i64>,
+    /// Decode time owed per unit of prefill time while other requests
+    /// generate (`--decode-share`, Splash's): nonnegative and finite,
+    /// default 0.5; 0 alternates one prefill unit with one decode step.
+    pub decode_share: Option<f64>,
 }
 
 /// Trained and physically available active-context limits for one loaded
@@ -409,6 +415,9 @@ pub struct Qwen3_5ContextLimits {
     /// Format of the K/V a turn on `effective_window_tokens` writes.
     #[napi(ts_type = "'int8' | 'bf16'")]
     pub kv_format: String,
+    /// The model's `modelId` in `memoryGovernorStatus().scheduler`; unset
+    /// when the load registered no pool with the memory governor.
+    pub governor_model_id: Option<f64>,
 }
 
 impl Qwen3_5ContextLimits {
@@ -427,6 +436,7 @@ impl Qwen3_5ContextLimits {
             rest_of_window_output_budget: true,
             omitted_budget_is_rest_of_window: memory_window,
             kv_format: kv_format.as_str().to_string(),
+            governor_model_id: None,
         }
     }
 }
@@ -602,6 +612,10 @@ impl Qwen3_5Model {
         )?;
         let max_context =
             crate::nn::rope_scaling::max_context_option("Qwen3.5", options.max_context_tokens)?;
+        let decode_share = crate::models::qwen3_5::load_plan::decode_share_option(
+            "Qwen3.5",
+            options.decode_share,
+        )?;
         let source = crate::engine::checkpoint_source::CheckpointSource::resolve(
             std::path::Path::new(&path),
             crate::utils::gguf::NativeGgufFamily::Qwen35,
@@ -613,6 +627,7 @@ impl Qwen3_5Model {
             kv_format,
             max_memory_bytes,
             max_context,
+            decode_share,
         )
         .await;
         if loaded.is_err() {

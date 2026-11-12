@@ -79,7 +79,6 @@ same-binary uniform/ragged validation with separate model instances:
 | Knob                            | Default | Meaning                                                                                                                                                                                                                                                                                                                                               |
 | ------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `MLX_SCHED_MAX_NUM_SEQS`        | `8`     | Native running-set cap and server admission capacity (hard-clamped to 32).                                                                                                                                                                                                                                                                            |
-| `MLX_SCHED_MAX_BATCHED_TOKENS`  | `2048`  | Total tokens planned in one scheduler step.                                                                                                                                                                                                                                                                                                           |
 | `MLX_SCHED_LONG_PREFILL_TOKENS` | `2048`  | Maximum prefill progress for one request in one step.                                                                                                                                                                                                                                                                                                 |
 | `MLX_SCHED_WATERMARK_FRACTION`  | `0.05`  | Free-block headroom retained while work is already live.                                                                                                                                                                                                                                                                                              |
 | `MLX_SCHED_RAGGED_STEP`         | `0`     | Use one packed varlen Qwen3 forward for mixed prefill/decode slices.                                                                                                                                                                                                                                                                                  |
@@ -100,8 +99,10 @@ Two reproducibility rules are deliberate:
    Scheduled speculation owns each request's RNG; peers cannot consume its
    draws, though numerical changes can still alter the sampling distribution.
 2. Each request's legal prefill break-set is pinned at admission. The shared
-   budget decides when a pinned slice runs, never where it is split; this
-   preserves family-specific chunk-boundary invariants.
+   2048-token step budget decides when a pinned slice runs, never where it is
+   split; this preserves family-specific chunk-boundary invariants. Qwen3.5
+   dense and MoE are the exception: they size prefill rows by the measured
+   cut below and read no grid.
 3. The scheduled lane treats `max_new_tokens` as an upper bound and clamps it
    to the remaining per-sequence context. Large OpenAI/Anthropic output hints
    therefore end at `length` instead of failing admission solely because the
@@ -114,6 +115,63 @@ head-of-line blocking prevents a stream of small arrivals from starving a
 large request or an ordered reset behind it. A `WaitingForSsd` row remains
 charged because its reserved destination blocks and future-growth reservation
 still consume the same unified-memory budget while I/O is parked.
+
+### Prefill beside a decoding lane (Qwen3.5)
+
+Qwen3.5 dense and MoE plan their prefill as Splash `Scheduler::planPrefill`.
+Every other family keeps the fixed 2048-token step budget.
+
+- **The unit.** A step's prefill rows together are one prefill unit, run
+  after the step's decode rows. Decode rows (one token plus any draft rows)
+  sit outside the unit. A unit holds at most four lanes.
+- **Leader.** The ready lanes are sorted Splash `leadsBefore`: a lane passed
+  over by three units that served later arrivals is overdue and leads
+  (oldest overdue first); otherwise the fewest remaining prompt tokens lead,
+  then arrival. Cancelled lanes and lanes whose memory retry is not due are
+  left out, and are not passed over; a lane refused its row in a step is.
+  A cancelled prefill fails in a one-token row after the unit.
+- **Pair bound.** The leader's rows (at most 2048) halve, down to 64, while
+  its attention pairs `rows·position + rows(rows+1)/2` exceed those of a
+  2048-row chunk at the end of the native window.
+- **The cut.** With no lane decoding the unit is 2048 rows. While a lane
+  decodes it is `cutRows`: 512 rows until a unit has been timed, then the
+  rows the last timed unit ran in G = 500 ms, scaled down by how many more
+  pairs the leader reaches at its depth, clamped to [512, 2048]. A rest below
+  512 rows runs with the cut, up to 2048.
+- **Joiners.** Each other ready lane, in lead order, joins with
+  `(remaining − 1) % 2048 + 1` rows (the fewest that spare it a unit of its
+  own) when that fits under the unit and the pair bound.
+- **Sample.** The unit's measure is its rows, pairs and the step's prefill
+  phase wall, taken only when every planned row ran timed. A refused or
+  cancelled row is one the unit ran without.
+- **Decode debt.** A unit run while lanes decode owes them the decode share
+  (0.5) of its wall; while debt is owed the step plans decode rows only, and
+  their wall works it off. The debt drops when no lane decodes.
+- **Admission.** A prepared request takes no memory until the unit it would
+  join serves it: it ends its prompt there, or no lane ahead of it is left
+  with its own prompt unfinished (Splash `prefillAdmissionOrder`). A live
+  continuation is planned from the tokens it keeps; any other cached prefix
+  counts as uncached until a prefix probe exists. A request held back waits
+  for scheduling: its memory wait ends and its claim holds nothing.
+- **G** is one constant, shared with the decode-gap classifier's 500 ms
+  threshold.
+- **Decode share.** `--decode-share` (`mlx serve`, `mlx agent`; load option
+  `decodeShare`) sets the share, a finite number of at least 0; `0`
+  alternates one unit with one decode step. Other families refuse it.
+- **Status.** `/health` `memory_governor.scheduler` has one entry per loaded
+  Qwen3.5 model (Splash `/status` `scheduler`, read live): `model` (the name
+  it serves under), `model_id`, the gauges `queued`, `waiting_resources`,
+  `waiting_prefix`, `prefilling`, `decoding` (each request by phase at the
+  end of the model thread's last pass; a request not yet started is queued,
+  or waits for resources once refused a lane or memory; a running lane
+  waiting for its retry still counts as prefilling or decoding), the counters `prefill_batches`,
+  `prefill_rows`, `prefill_units`, `bound_cuts` (units whose leader was cut),
+  `decode_batches`, `decode_batches_by_width` (`b1`, `b2`, …),
+  `decode_gap_target_ms` (G), `contended_prefill_ms` (`p50 p95 p99 max total
+  samples` over the walls of units run while a lane decoded, 1 ms buckets)
+  and `replans`. `memory_governor.decode_gap_causes.prefill_ms` sums, over
+  the gaps past G that a unit caused, the prefill walls the lane waited
+  through without a row in them.
 
 Outside the chat engine two families break the threading pattern: Harrier
 embeddings run forwards on tokio's blocking pool (`models/harrier/model.rs:104-177`),

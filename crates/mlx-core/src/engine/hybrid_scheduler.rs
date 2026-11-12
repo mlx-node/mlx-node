@@ -36,15 +36,15 @@ use crate::engine::governor::ledger::{
 };
 use crate::engine::governor::metrics::{GapClock, PassWork, Timeline, TtftClock, WholeTurnScope};
 use crate::engine::governor::wait::{
-    LaneWork, ResourceWait, WaitReason, Waiter, defer_resource_retry, note_refusal,
+    LaneWork, ResourceWait, WaitReason, Waiter, defer_resource_retry, defer_wait, note_refusal,
     resource_timeout, retry_ready, sync_claims, tick,
 };
 use crate::engine::model_command::{FamilyCommand, ModelCommand, handle_model_command};
 use crate::engine::scheduler::{
-    BlockTelemetry, JudgePolicy, PreemptedTurn, PreemptionMode, PreemptionReplay, Prepared,
-    RowGrant, RowStepResult, Scheduler, SchedulerAction, SchedulerError, StepExecutor, StepKind,
-    StepPlan, StepResult, TurnState, TurnStatus, install_preemption_replay,
-    is_paged_allocation_blocked,
+    BlockTelemetry, JudgePolicy, MeasuredConfig, PREFILL_CHUNK_ROWS, PreemptedTurn, PreemptionMode,
+    PreemptionReplay, Prepared, RetryClock, RowGrant, RowStepResult, Scheduler, SchedulerAction,
+    SchedulerError, StepExecutor, StepKind, StepPlan, StepResult, TurnState, TurnStatus,
+    install_preemption_replay, is_paged_allocation_blocked,
 };
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::model_thread::{LoopControl, ResponseTx, StreamTx};
@@ -190,6 +190,11 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     /// (`JudgePolicy::Ledger`).
     fn reclaims_in_order(&self) -> bool {
         false
+    }
+    /// The family's prefill rows are cut beside a decoding lane (Splash
+    /// `Scheduler::planPrefill`); `None` plans the fixed step budget.
+    fn measured_prefill_cut(&self) -> Option<MeasuredConfig> {
+        None
     }
     /// The model's id with the memory governor; 0 when not registered.
     fn memory_model(&self) -> u64 {
@@ -576,17 +581,6 @@ pub(crate) fn scheduler_max_num_seqs() -> usize {
     configured_scheduler_capacity(crate::engine::recurrent_state::HYBRID_LIVE_STATE_UNITS)
 }
 
-fn scheduler_max_batched_tokens() -> u32 {
-    static VALUE: OnceLock<u32> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        std::env::var("MLX_SCHED_MAX_BATCHED_TOKENS")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(2048)
-    })
-}
-
 fn scheduler_long_prefill_tokens() -> u32 {
     static VALUE: OnceLock<u32> = OnceLock::new();
     *VALUE.get_or_init(|| {
@@ -768,25 +762,32 @@ fn reusable_keep_live_blocks(
     prompt: &[u32],
     reuse: bool,
 ) -> u32 {
-    if !reuse {
-        return 0;
-    }
-    let Some(adapter) = adapter else {
-        return 0;
-    };
-    if !adapter.is_live_for_continue_for(seq_id) {
-        return 0;
-    }
-    let Some(held) = adapter.request_tokens_for(seq_id) else {
-        return 0;
-    };
-    if !prompt.starts_with(held) {
+    if live_held_prefix(adapter, seq_id, prompt, reuse).is_none() {
         return 0;
     }
     adapter
-        .block_table_for(seq_id)
+        .and_then(|adapter| adapter.block_table_for(seq_id))
         .map(|table| table.num_blocks() as u32)
         .unwrap_or(0)
+}
+
+/// The tokens of `prompt` a live continuation of `seq_id` keeps: the held
+/// request's, when the prompt continues it.
+fn live_held_prefix(
+    adapter: Option<&PagedKVCacheAdapter>,
+    seq_id: SeqId,
+    prompt: &[u32],
+    reuse: bool,
+) -> Option<usize> {
+    if !reuse {
+        return None;
+    }
+    let adapter = adapter?;
+    if !adapter.is_live_for_continue_for(seq_id) {
+        return None;
+    }
+    let held = adapter.request_tokens_for(seq_id)?;
+    prompt.starts_with(held).then_some(held.len())
 }
 
 fn scheduler_watermark_fraction() -> f64 {
@@ -1875,8 +1876,15 @@ impl<B: HybridSchedulerBackend> StepExecutor<ScheduledTurn<B::PrefixState>>
     ) -> std::result::Result<StepResult, Self::Error> {
         let mut rows = Vec::with_capacity(plan.rows.len());
         rows.resize_with(plan.rows.len(), || None);
+        let decode_started = Instant::now();
         let (decode_results, executed_decode_batch, executed_greedy_epilogue_batch) =
             self.execute_decode_rows(plan, running)?;
+        let decode_wall_micros = if plan.rows.iter().any(|row| row.kind == StepKind::Decode) {
+            Self::elapsed_micros(decode_started)
+        } else {
+            0
+        };
+        let mut prefill_started = None;
         let batched_decode_blocked = decode_results
             .iter()
             .any(|(_, result)| result.allocation_blocked);
@@ -1898,11 +1906,13 @@ impl<B: HybridSchedulerBackend> StepExecutor<ScheduledTurn<B::PrefixState>>
                     ))
                 })?;
             let _request = Self::request_scope(turn);
+            prefill_started.get_or_insert_with(Instant::now);
             rows[index] = Some(
                 self.execute_prefill(planned, turn)
                     .unwrap_or_else(|error| Self::fail(turn, planned, error)),
             );
         }
+        let prefill_wall_micros = prefill_started.map_or(0, Self::elapsed_micros);
         Ok(StepResult {
             rows: rows
                 .into_iter()
@@ -1930,6 +1940,8 @@ impl<B: HybridSchedulerBackend> StepExecutor<ScheduledTurn<B::PrefixState>>
                 .iter()
                 .filter(|turn| turn.payload.allocation_failed)
                 .count() as u32,
+            prefill_wall_micros,
+            decode_wall_micros,
         })
     }
 }
@@ -2212,6 +2224,17 @@ pub(crate) struct HybridSchedulerState<B: HybridSchedulerBackend> {
     next_seq_id: SeqId,
 }
 
+/// The tokens a planned row's step writes up to (Splash
+/// `Engine::workEndOf`): a prefill row's own end, wherever it was cut, or
+/// a decode row's pending token (already in `num_tokens`) and its draft
+/// rows.
+fn row_work_end<P>(row: &engine::scheduler::StepRow, turn: &TurnState<P>) -> u32 {
+    match row.kind {
+        StepKind::Prefill => row.token_start.saturating_add(row.num_tokens),
+        StepKind::Decode => turn.num_tokens.saturating_add(turn.decode_draft_allowance),
+    }
+}
+
 /// The pinned prefill ends of one prompt and whether the family runs it as
 /// one whole-prompt step (then the grid is the one end `prompt`).
 fn prefill_breaks<B: HybridSchedulerBackend>(
@@ -2249,12 +2272,18 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let enabled = inner.scheduler_cache_available()
             && (B::ENABLED_BY_DEFAULT || Self::continuous_batching_enabled());
         let max_num_seqs = configured_scheduler_capacity(inner.scheduler_capacity());
-        let max_batched_tokens = scheduler_max_batched_tokens();
+        let mut scheduler =
+            Scheduler::new(max_num_seqs, PREFILL_CHUNK_ROWS).map_err(Error::from_reason)?;
+        if let Some(config) = inner.measured_prefill_cut() {
+            scheduler = scheduler.with_measured_prefill_cut(config);
+        }
+        if let Some(governor) = inner.memory_governor() {
+            governor.register_scheduler(inner.memory_model(), scheduler.counters());
+        }
         Ok(Self {
             inner,
             enabled,
-            scheduler: Scheduler::new(max_num_seqs, max_batched_tokens)
-                .map_err(Error::from_reason)?,
+            scheduler,
             pending: VecDeque::new(),
             prepared_waiting: None,
             pending_restores: HashMap::new(),
@@ -3327,16 +3356,6 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
     }
 
-    /// The tokens a planned row's step writes up to (Splash
-    /// `Engine::workEndOf`): a prefill slice's end, or a decode row's
-    /// pending token (already in `num_tokens`) and its draft rows.
-    fn work_end(row: &engine::scheduler::StepRow, turn: &Turn<B>) -> u32 {
-        match row.kind {
-            StepKind::Prefill => row.token_start.saturating_add(row.num_tokens),
-            StepKind::Decode => turn.num_tokens.saturating_add(turn.decode_draft_allowance),
-        }
-    }
-
     /// Splash `Engine::commit` ends a lane at its stop or length token, so
     /// a decode row whose un-emitted pending token ends the turn writes
     /// nothing: its step finishes it without a forward. The observer stop
@@ -3397,7 +3416,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 claims.grants.push(None);
                 continue;
             }
-            let work_end = Self::work_end(row, turn);
+            let work_end = row_work_end(row, turn);
             let hold_ended = turn.resource_wait.hold_ended;
             let draft_from = match row.kind {
                 StepKind::Prefill => row.token_start,
@@ -3817,18 +3836,22 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         std::result::Result<(StepPlan, StepClaims), Action<B>>,
         SchedulerError<Error>,
     > {
+        let clock = (self.judge_policy() == JudgePolicy::Ledger).then(|| {
+            let governor = self.memory_governor();
+            RetryClock {
+                now: governor.now(),
+                epoch: governor.epoch(self.inner.memory_model()),
+            }
+        });
         let mut plan = match self
             .scheduler
-            .prepare_step()
+            .prepare_step(clock)
             .map_err(SchedulerError::InvalidResult)?
         {
             Prepared::Action(action) => return Ok(Err(action)),
             Prepared::Plan(plan) => plan,
         };
-        if self.judge_policy() == JudgePolicy::Ledger {
-            let governor = self.memory_governor();
-            let model = self.inner.memory_model();
-            let (now, epoch) = (governor.now(), governor.epoch(model));
+        if let Some(RetryClock { now, epoch }) = clock {
             let scheduler = &mut self.scheduler;
             plan.rows.retain(|row| {
                 row.cancel_snapshot
@@ -4128,7 +4151,6 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let now = governor.now();
         let seconds = (now - self.pass_start).max(0.0);
         let work = std::mem::take(&mut self.pass_work);
-        let prefill_seconds = if work.ran_prefill() { seconds } else { 0.0 };
         let releases = governor.pool_releases();
         let replans = self.scheduler.stats().replans;
         let waits = |claim: Option<&ClaimHandle<'static>>| {
@@ -4150,7 +4172,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             let part = work.holder_of(Some(turn.seq_id), claim_waits);
             let clock = &mut turn.payload.clock;
             clock.ttft.hold(seconds, part);
-            clock.gap.worked(prefill_seconds, claim_waits);
+            clock
+                .gap
+                .worked(work.prefill_beside(turn.seq_id), claim_waits);
             if clock.token_events > clock.seen_events {
                 clock.seen_events = clock.token_events;
                 if let Some(parts) = clock.ttft.first_tokens() {
@@ -4697,6 +4721,46 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         ))
     }
 
+    /// Whether the scheduler holds the prepared start back
+    /// (`Scheduler::prefillAdmissionOrder`), which Splash ranks by its
+    /// cached tokens: a live continuation's are the ones it keeps.
+    fn admission_waits(&self, prepared: &PreparedTurn) -> bool {
+        let tokens = &prepared.admitted.tokens;
+        let reuse = prepared.admitted.plan.is_delta || prepared.admitted.params.reuse_cache;
+        let cached = live_held_prefix(self.inner.paged_adapter(), prepared.seq_id, tokens, reuse)
+            .unwrap_or(0);
+        !self.scheduler.serves_candidate(
+            prepared.seq_id,
+            u32::try_from(cached).unwrap_or(u32::MAX),
+            u32::try_from(tokens.len()).unwrap_or(u32::MAX),
+        )
+    }
+
+    /// Splash `Engine::admitQueued`'s `queue` (`deferWait`): a start the
+    /// scheduler holds back waits for scheduling, and its claim holds no
+    /// room meanwhile. A start backing off from a lane wait is left as it
+    /// is.
+    fn defer_admission(&self, prepared: &mut PreparedTurn) {
+        if self.judge_policy() != JudgePolicy::Ledger {
+            return;
+        }
+        let governor = self.memory_governor();
+        let wait = &mut prepared.resource_wait;
+        let epoch = governor.epoch(self.inner.memory_model());
+        if wait.reason == WaitReason::Concurrency && !retry_ready(wait, governor.now(), epoch) {
+            return;
+        }
+        defer_wait(wait);
+        if let Some(claim) = prepared.claim.as_ref() {
+            let id = claim.id();
+            governor.ledger(|ledger| {
+                if ledger.claim(id).is_some_and(|state| state.waiting) {
+                    ledger.set_waiting(id, false);
+                }
+            });
+        }
+    }
+
     fn admit_prepared(
         &mut self,
         mut prepared: Box<PreparedTurn>,
@@ -4714,6 +4778,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 cancelled.as_ref(),
             );
             return Ok(None);
+        }
+        // Splash `Scheduler::prefillAdmissionOrder`: it takes no memory
+        // until the unit it would join serves it.
+        if self.admission_waits(&prepared) {
+            self.defer_admission(&mut prepared);
+            return Err(prepared);
         }
         let cache_snapshot = match self.inner.scheduler_cache_snapshot() {
             Ok(snapshot) => snapshot,
@@ -5910,9 +5980,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 if let Some(wired) = wired.as_mut() {
                     wired.used();
                 }
-                if let SchedulerAction::Stepped { completed, .. } = &mut step {
-                    self.close_pass(completed);
-                }
+                self.close_step_pass(&mut step);
                 may_resume_preempted = self.settle_step(step);
             }
             Err(SchedulerError::Executor(error)) => return self.executor_failed(error),
@@ -5929,10 +5997,50 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.refresh_wanted_chains();
             self.try_resume_preempted();
         }
+        self.publish_gauges();
         if scheduler_idle && (self.scheduler.has_work() || self.prepared_waiting.is_some()) {
             std::thread::sleep(Duration::from_millis(1));
         }
         LoopControl::Continue
+    }
+
+    /// The pass of a step that ran: its prefill phase is time the lanes
+    /// outside it waited (Splash's batch completion).
+    fn close_step_pass(&mut self, step: &mut Action<B>) {
+        if let SchedulerAction::Stepped {
+            completed,
+            prefill_wall_micros,
+            ..
+        } = step
+        {
+            self.pass_work.prefill_seconds = *prefill_wall_micros as f64 / 1e6;
+            self.close_pass(completed);
+        }
+    }
+
+    /// The status gauges after a pass (Splash `Scheduler::snapshot`): the
+    /// scheduler's turns by phase, the chats not yet prepared as queued,
+    /// and the prepared start as waiting for resources once refused a lane
+    /// or memory (`waitForResources`), else queued (`deferAdmission`).
+    fn publish_gauges(&self) {
+        let mut queued = self
+            .pending
+            .iter()
+            .filter(|queued| {
+                queued
+                    .as_chat()
+                    .is_some_and(|chat| !matches!(chat, ChatCmd::ReleaseCacheOwner { .. }))
+            })
+            .count() as u64;
+        let mut waiting_resources = 0;
+        if let Some(prepared) = self.prepared_waiting.as_ref() {
+            if prepared.resource_wait.reason == WaitReason::None {
+                queued += 1;
+            } else {
+                waiting_resources += 1;
+            }
+        }
+        self.scheduler.publish_gauges(queued, waiting_resources);
     }
 }
 
@@ -7713,6 +7821,8 @@ pub(crate) mod tests {
                 executed_decode_batch: 0,
                 executed_greedy_epilogue_batch: 0,
                 rows_alloc_evicted: 0,
+                prefill_wall_micros: 0,
+                decode_wall_micros: 0,
             })
         }
     }
@@ -7763,6 +7873,8 @@ pub(crate) mod tests {
                     .count(),
                 executed_greedy_epilogue_batch: 0,
                 rows_alloc_evicted: 0,
+                prefill_wall_micros: 0,
+                decode_wall_micros: 0,
             })
         }
     }
@@ -7843,7 +7955,8 @@ pub(crate) mod tests {
                 num_tokens: 1,
                 cancel_snapshot: false,
             }],
-            token_budget: 64,
+            contended: false,
+            leader_cut: None,
         };
         let claims = state.claim_rows_in_order(&plan);
         assert!(claims.grants[0].is_none(), "{:?}", claims.grants[0]);
@@ -7912,7 +8025,8 @@ pub(crate) mod tests {
                     num_tokens: 1,
                     cancel_snapshot: false,
                 }],
-                token_budget: 64,
+                contended: false,
+                leader_cut: None,
             };
             let claims = state.claim_rows_in_order(&plan);
             assert!(
@@ -9019,6 +9133,8 @@ pub(crate) mod tests {
                 executed_decode_batch: 0,
                 executed_greedy_epilogue_batch: 0,
                 rows_alloc_evicted: 0,
+                prefill_wall_micros: 0,
+                decode_wall_micros: 0,
             })
         }
     }
@@ -10410,6 +10526,402 @@ pub(crate) mod tests {
             );
             assert_eq!(turn.payload.vacated_stop, vacates, "{}", error.reason);
         }
+    }
+
+    /// Only Qwen3.5 dense and MoE plan the measured prefill cut; every other
+    /// family keeps the fixed step budget.
+    /// Mutation M1: `new` never applies the hook → red (dense false).
+    #[test]
+    fn only_qwen35_measures_the_prefill_cut() {
+        let dense = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let dense = HybridSchedulerState::new(dense).expect("dense scheduler");
+        assert!(dense.scheduler.measures_prefill_cut());
+        let moe = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE model");
+        let moe = HybridSchedulerState::new(moe).expect("MoE scheduler");
+        assert!(moe.scheduler.measures_prefill_cut());
+        if let Ok(nemotron) = NemotronHInner::new(tiny_nemotron_paged_config()) {
+            let nemotron = HybridSchedulerState::new(nemotron).expect("nemotron scheduler");
+            assert!(!nemotron.scheduler.measures_prefill_cut());
+        }
+    }
+
+    /// Splash `Engine::Engine` refuses a negative or non-finite decode
+    /// share and defaults it to 0.5; the share a load takes is the one its
+    /// measured cut owes decoders.
+    /// Mutation D2: the dense hook ignores the load's share → red (0.5).
+    #[test]
+    fn a_load_decode_share_reaches_the_cut() {
+        use crate::models::qwen3_5::load_plan::decode_share_option;
+        assert_eq!(
+            decode_share_option("Qwen3.5", None).expect("unset"),
+            engine::scheduler::DEFAULT_DECODE_SHARE
+        );
+        for refused in [-1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                decode_share_option("Qwen3.5", Some(refused)).is_err(),
+                "{refused}"
+            );
+        }
+        let share = decode_share_option("Qwen3.5", Some(0.0)).expect("zero");
+        let mut dense = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        dense.decode_share = share;
+        let cut = dense.measured_prefill_cut().expect("dense measures");
+        assert_eq!(cut.decode_share, 0.0);
+        let mut moe = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE model");
+        moe.decode_share = share;
+        let cut = moe.measured_prefill_cut().expect("MoE measures");
+        assert_eq!(cut.decode_share, 0.0);
+    }
+
+    /// Splash `Engine::workEndOf`: a prefill row claims to its own end, cut
+    /// or past a pinned break, not to the next break.
+    /// Mutation W2: the prefill claim ends at the next pinned break → red
+    /// (2048 and 2048).
+    #[test]
+    fn a_prefill_claim_ends_at_its_row_end() {
+        let prefill = TurnState::new(1, vec![1; 8192], 512, vec![2048, 4096], None, ())
+            .expect("prefill turn");
+        let row = |kind, token_start, num_tokens| engine::scheduler::StepRow {
+            seq_id: 1,
+            kind,
+            token_start,
+            num_tokens,
+            cancel_snapshot: false,
+        };
+        assert_eq!(
+            row_work_end(&row(StepKind::Prefill, 512, 512), &prefill),
+            1024
+        );
+        assert_eq!(
+            row_work_end(&row(StepKind::Prefill, 512, 2048), &prefill),
+            2560
+        );
+        let mut decoder =
+            TurnState::new(2, vec![1; 16], 16, Vec::new(), None, ()).expect("decoder");
+        decoder.token_history.push(3);
+        decoder.num_tokens = 17;
+        decoder.decode_draft_allowance = 4;
+        assert_eq!(row_work_end(&row(StepKind::Decode, 16, 5), &decoder), 21);
+    }
+
+    /// The executor's step result carries what it ran.
+    #[cfg(target_os = "macos")]
+    struct Recorded<'a, B: HybridSchedulerBackend> {
+        executor: HybridStepExecutor<'a, B>,
+        result: Option<StepResult>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl<B: HybridSchedulerBackend> StepExecutor<ScheduledTurn<B::PrefixState>> for Recorded<'_, B> {
+        type Error = Error;
+
+        fn execute(
+            &mut self,
+            plan: &StepPlan,
+            running: &mut [TurnState<ScheduledTurn<B::PrefixState>>],
+        ) -> std::result::Result<StepResult, Self::Error> {
+            let result = self.executor.execute(plan, running)?;
+            self.result = Some(result.clone());
+            Ok(result)
+        }
+    }
+
+    /// One step of `scheduler` on `inner`'s executor: its plan and result.
+    #[cfg(target_os = "macos")]
+    fn timed_step<B: HybridSchedulerBackend>(
+        scheduler: &mut Scheduler<ScheduledTurn<B::PrefixState>, (), ()>,
+        inner: &mut B,
+    ) -> (StepPlan, StepResult) {
+        let mut recorded = Recorded {
+            executor: HybridStepExecutor::new(inner),
+            result: None,
+        };
+        let SchedulerAction::Stepped { plan, .. } = scheduler.drive_once(&mut recorded).unwrap()
+        else {
+            panic!("expected a step");
+        };
+        (plan, recorded.result.expect("the step ran"))
+    }
+
+    /// The step's prefill phase wall covers its prefill rows and its decode
+    /// phase wall its decode rows, and it times the measured unit; a
+    /// decode-only step has no prefill wall. No decode share, so the unit
+    /// owes the first lane no decode-only step.
+    /// Mutation T1m: the prefill wall is left 0 → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_step_times_its_prefill_phase() {
+        use crate::models::gemma4::dspark_decode::tests::seeded_tiny_paged_inner_with_draft;
+        let mut inner =
+            seeded_tiny_paged_inner_with_draft(1729).expect("the tiny paged gemma4 fixture");
+        let mut scheduler = Scheduler::<_, (), ()>::new(2, 12)
+            .unwrap()
+            .with_measured_prefill_cut(MeasuredConfig {
+                native_window: 262_144,
+                decode_share: 0.0,
+            });
+        let first = speculative::tests::request(
+            &mut inner,
+            41,
+            (0..7).collect(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        scheduler.enqueue_turn(first).unwrap();
+        let (plan, _) = timed_step(&mut scheduler, &mut inner);
+        assert_eq!(plan.rows.len(), 1);
+        assert_eq!(plan.rows[0].kind, StepKind::Prefill);
+        assert_eq!(scheduler.measured_rows(), Some(7));
+        let second = speculative::tests::request(
+            &mut inner,
+            42,
+            (4..13).collect(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        scheduler.enqueue_turn(second).unwrap();
+        let (plan, result) = timed_step(&mut scheduler, &mut inner);
+        let kinds: Vec<_> = plan.rows.iter().map(|row| (row.seq_id, row.kind)).collect();
+        assert_eq!(kinds, vec![(41, StepKind::Decode), (42, StepKind::Prefill)]);
+        assert!(result.rows[1].prefill_micros > 0, "{result:?}");
+        assert!(result.prefill_wall_micros >= result.rows[1].prefill_micros);
+        assert!(result.decode_wall_micros > 0);
+        assert!(plan.contended);
+        assert_eq!(scheduler.measured_rows(), Some(9));
+        let (plan, result) = timed_step(&mut scheduler, &mut inner);
+        assert!(plan.rows.iter().all(|row| row.kind == StepKind::Decode));
+        assert_eq!(result.prefill_wall_micros, 0);
+        assert!(result.decode_wall_micros > 0);
+    }
+
+    /// Every planned row runs; the prefill rows take `0` µs each, which is
+    /// also the step's prefill phase wall.
+    #[cfg(target_os = "macos")]
+    struct PrefillWall(u64);
+
+    #[cfg(target_os = "macos")]
+    impl<P> StepExecutor<P> for PrefillWall {
+        type Error = Error;
+
+        fn execute(
+            &mut self,
+            plan: &StepPlan,
+            running: &mut [TurnState<P>],
+        ) -> std::result::Result<StepResult, Self::Error> {
+            let mut result = RunEveryRow.execute(plan, running)?;
+            for (row, output) in plan.rows.iter().zip(&mut result.rows) {
+                if row.kind == StepKind::Prefill {
+                    output.prefill_micros = self.0;
+                    result.prefill_wall_micros = self.0;
+                }
+            }
+            Ok(result)
+        }
+    }
+
+    /// A ledger state with a running prefill of `prompt_tokens`, none of
+    /// them computed.
+    #[cfg(target_os = "macos")]
+    fn state_prefilling(
+        prompt_tokens: u32,
+    ) -> (HybridSchedulerState<Qwen35Inner>, &'static Governor) {
+        use crate::engine::governor::governor::tests::G;
+        let (mut state, governor, _io) = ledger_state(16 * G, 0).expect("a ledger state");
+        let mut lead = speculative::tests::request(
+            &mut state.inner,
+            1,
+            tokens_of(1, 1),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        lead.prompt_tokens = prompt_tokens;
+        lead.num_tokens = prompt_tokens;
+        state.scheduler.reinstate_running(lead);
+        (state, governor)
+    }
+
+    /// Splash's batch completion adds a prefill command's wall to every lane
+    /// outside it: the step's prefill phase reaches the decoding lane's gap
+    /// clock, not the prefilling lane's.
+    /// Mutation G2: the pass keeps no prefill wall → red (0 s).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_step_prefill_wall_reaches_the_lanes_beside_it() {
+        use crate::engine::governor::governor::tests::G;
+        let (mut state, _governor, _io) = ledger_state(16 * G, 0).expect("a ledger state");
+        let decoder = decoding_turn(&mut state, 1);
+        state.scheduler.reinstate_running(decoder);
+        let prefill = speculative::tests::request(
+            &mut state.inner,
+            2,
+            tokens_of(2, 1),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        state.scheduler.reinstate_running(prefill);
+        let mut step = state.step_with(&mut PrefillWall(600_000)).expect("a step");
+        let SchedulerAction::Stepped { plan, .. } = &step else {
+            panic!("expected a step");
+        };
+        let kinds: Vec<_> = plan.rows.iter().map(|row| (row.seq_id, row.kind)).collect();
+        assert_eq!(kinds, vec![(1, StepKind::Decode), (2, StepKind::Prefill)]);
+        state.close_step_pass(&mut step);
+        let gap = |seq_id: SeqId| {
+            state
+                .scheduler
+                .running()
+                .iter()
+                .find(|turn| turn.seq_id == seq_id)
+                .map(|turn| turn.payload.clock.gap.prefill_seconds())
+        };
+        assert_eq!(gap(1), Some(0.6));
+        assert_eq!(gap(2), Some(0.0));
+    }
+
+    /// Splash `Scheduler::prefillAdmissionOrder` gates admission: a 50,000
+    /// token start beside a 40,000 token prefill would join a unit it does
+    /// not end and then wait out the other's prompt, so it stays prepared
+    /// and takes no memory.
+    /// Mutation S3: admission skips the gate → red (the start is tried).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn admission_holds_a_start_its_unit_would_not_serve() {
+        let (mut state, _governor) = state_prefilling(40_000);
+        let (prepared, _reply) = prepared_turn(&mut state, 2, vec![1; 50_000]);
+        let Err(prepared) = state.admit_prepared(prepared) else {
+            panic!("the start was tried");
+        };
+        assert!(prepared.claim.is_none());
+    }
+
+    /// Splash ranks a candidate by its cached tokens: a live continuation
+    /// that keeps 32 of its 2,050 tokens has fewer left than a 2,047 token
+    /// prefill, so it leads and is served at once.
+    /// Mutation H1: the kept tokens are not counted → red (it waits).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_live_continuation_is_ranked_by_what_it_keeps() {
+        use crate::engine::governor::governor::tests::G;
+        let (mut state, _governor, _io) = ledger_state(16 * G, 0).expect("a ledger state");
+        let held = tokens_of(2, 2);
+        let adapter = state.inner.paged_adapter_mut().expect("a paged adapter");
+        adapter.begin_request(2).expect("begin keep-live request");
+        adapter
+            .find_cached_prefix(&[], &[], 0, false)
+            .expect("prefix lookup");
+        adapter
+            .allocate_suffix_blocks(held.len() as u32)
+            .expect("allocate held blocks");
+        adapter.record_tokens(&held).expect("record held tokens");
+        adapter
+            .finalize_turn_keep_live(&[], 0)
+            .expect("keep-live finalize");
+        let mut lead = speculative::tests::request(
+            &mut state.inner,
+            1,
+            tokens_of(1, 1),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        lead.prompt_tokens = 2_047;
+        lead.num_tokens = 2_047;
+        state.scheduler.reinstate_running(lead);
+        let mut prompt = held;
+        prompt.extend((0..2_018).map(|token| token % 15 + 1));
+        let (mut prepared, _reply) = prepared_turn(&mut state, 2, prompt);
+        prepared.admitted.params.reuse_cache = true;
+        assert!(!state.admission_waits(&prepared));
+    }
+
+    /// Splash `Engine::admitQueued` queues a start the scheduler does not
+    /// want (`deferWait`): its claim stops waiting, and its wait keeps only
+    /// when it began.
+    /// Mutation D3: the held start keeps its wait → red (claim waiting).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_held_start_stops_its_memory_wait() {
+        let (mut state, governor) = state_prefilling(40_000);
+        let (mut prepared, _reply) = prepared_turn(&mut state, 2, vec![1; 50_000]);
+        let claim = governor.open(
+            crate::engine::governor::governor::whole_turn_spec(0),
+            state.inner.memory_model(),
+        );
+        let id = claim.id();
+        governor.ledger(|ledger| ledger.set_waiting(id, true));
+        prepared.claim = Some(claim);
+        prepared.resource_wait = ResourceWait {
+            reason: WaitReason::Memory,
+            started: Some(1.0),
+            pending: true,
+            pending_since: Some(1.0),
+            retry_at: 5.0,
+            deadline: 31.0,
+            ..ResourceWait::default()
+        };
+        let Err(prepared) = state.admit_prepared(prepared) else {
+            panic!("the start was tried");
+        };
+        let waiting = governor.ledger(|ledger| ledger.claim(id).map(|state| state.waiting));
+        assert_eq!(waiting, Some(false));
+        assert_eq!(
+            prepared.resource_wait,
+            ResourceWait {
+                started: Some(1.0),
+                pending_since: Some(1.0),
+                ..ResourceWait::default()
+            }
+        );
+    }
+
+    /// Splash `Scheduler::snapshot` counts the requests not yet started: a
+    /// prepared start is queued, and waits for resources once refused.
+    /// Mutation P1: the prepared start is left out → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_prepared_start_is_in_the_gauges() {
+        let (mut state, _governor) = state_prefilling(40_000);
+        let counters = state.scheduler.counters();
+        let (prepared, _reply) = prepared_turn(&mut state, 2, tokens_of(2, 1));
+        state.prepared_waiting = Some(prepared);
+        let gauges = |state: &HybridSchedulerState<Qwen35Inner>| {
+            state.publish_gauges();
+            let snapshot = counters.snapshot();
+            (
+                snapshot.queued,
+                snapshot.waiting_resources,
+                snapshot.prefilling,
+            )
+        };
+        assert_eq!(gauges(&state), (1, 0, 1));
+        state
+            .prepared_waiting
+            .as_mut()
+            .expect("prepared")
+            .resource_wait
+            .reason = WaitReason::Memory;
+        assert_eq!(gauges(&state), (0, 1, 1));
+    }
+
+    /// A model on the governor hands it its scheduler's counters when its
+    /// scheduler is built.
+    /// Mutation R1: the scheduler is not registered → red (none).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_registered_model_publishes_its_scheduler() {
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+        let io = FakeIo::new(
+            stats(0),
+            host(32 * G, crate::engine::governor::host::Pressure::Normal),
+        );
+        let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+        let mut inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        inner.memory_registration =
+            Some(governor.register_model(model(16 * G, 0)).expect("register"));
+        let model_id = inner.memory_model();
+        let _state = HybridSchedulerState::new(inner).expect("construct Qwen3.5 scheduler");
+        let schedulers = governor.schedulers();
+        assert_eq!(schedulers.len(), 1);
+        assert_eq!(schedulers[0].model_id, model_id);
     }
 }
 

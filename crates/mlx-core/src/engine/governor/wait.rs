@@ -99,6 +99,23 @@ pub(crate) fn note_refusal(wait: &mut ResourceWait, now: f64, denial: &Denial, e
     wait.epoch = epoch;
 }
 
+/// Splash `Engine::deferWait`: a start the scheduler does not want this
+/// pass waits for scheduling, with no retry or limit; one refused memory
+/// keeps when its wait began and what its claim held.
+pub(crate) fn defer_wait(wait: &mut ResourceWait) {
+    *wait = if wait.reason == WaitReason::Memory {
+        ResourceWait {
+            started: wait.started,
+            admitted_before: wait.admitted_before,
+            pending_since: wait.pending_since,
+            hold_ended: wait.hold_ended,
+            ..ResourceWait::default()
+        }
+    } else {
+        ResourceWait::default()
+    };
+}
+
 /// Splash `Engine::resourceDeadline`: none while a pending wait's epoch
 /// moved; else the later of its own deadline and a limit after the latest
 /// earlier lane's work.

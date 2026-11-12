@@ -80,6 +80,8 @@ export interface GrokAgentLaunchOptions {
   maxMemoryBytes?: number;
   /** Context token limit the spawned `mlx serve` loads with (`--max-context`). */
   maxContextTokens?: number;
+  /** Decode share the spawned `mlx serve` loads with (`--decode-share`). */
+  decodeShare?: number;
   /** Seconds without a request before the spawned `mlx serve` frees the weights (`--idle-release`); `Infinity` = off. */
   idleReleaseSeconds?: number;
   /** Test seam: custom spawn for the agent binary. */
@@ -1715,6 +1717,7 @@ function spawnInferenceServer(opts: GrokAgentLaunchOptions): { child: ChildProce
     ...(opts.kvFormat !== undefined ? ['--kv-format', opts.kvFormat] : []),
     ...(opts.maxMemoryBytes !== undefined ? ['--max-memory', String(opts.maxMemoryBytes)] : []),
     ...(opts.maxContextTokens !== undefined ? ['--max-context', String(opts.maxContextTokens)] : []),
+    ...(opts.decodeShare !== undefined ? ['--decode-share', String(opts.decodeShare)] : []),
     ...(opts.idleReleaseSeconds !== undefined ? ['--idle-release', idleReleaseText(opts.idleReleaseSeconds)] : []),
   ];
   const child = (opts.spawnServe ?? ((argv, so) => spawn(process.execPath, argv, so)))(serveArgv, {

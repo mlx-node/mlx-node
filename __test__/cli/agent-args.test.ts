@@ -224,6 +224,22 @@ describe('scanAgentArgs', () => {
     });
   });
 
+  // Mutation: stop lifting `--decode-share` (forward it to grok) → red.
+  describe('--decode-share extraction', () => {
+    it('lifts both forms out of passthrough and reports a bad value', () => {
+      const spaced = scanAgentArgs(['--decode-share', '0', '-p', 'hi']);
+      expect(spaced.decodeShare).toBe(0);
+      expect(spaced.passthrough).toEqual(['-p', 'hi']);
+      const inline = scanAgentArgs(['--decode-share=0.25', '-c']);
+      expect(inline.decodeShare).toBe(0.25);
+      expect(inline.passthrough).toEqual(['-c']);
+      expect(scanAgentArgs(['--decode-share=nan']).decodeShareInvalid).toBe('nan');
+      const missing = scanAgentArgs(['--decode-share', '--help']);
+      expect(missing.decodeShareInvalid).toBe('');
+      expect(missing.passthrough).toEqual(['--help']);
+    });
+  });
+
   // Mutation: stop lifting `--idle-release` (forward it to grok) → red.
   describe('--idle-release extraction', () => {
     it('lifts both forms out of passthrough as seconds', () => {

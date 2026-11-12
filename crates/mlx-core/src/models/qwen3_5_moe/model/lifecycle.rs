@@ -95,6 +95,7 @@ impl Qwen35MoeInner {
             memory_registration: None,
             max_memory_bytes: None,
             max_context: None,
+            decode_share: crate::engine::scheduler::DEFAULT_DECODE_SHARE,
             dflash2_verify_budget: super::super::verify_budget::VerifyBudget::default(),
             vision_encoder: None,
             image_processor: None,
@@ -793,11 +794,17 @@ impl Qwen35MoeInner {
             },
             None => self.config.kv_format(),
         };
-        crate::models::qwen3_5::model::Qwen3_5ContextLimits::from_parts(
-            self.paged_context_limits(),
-            self.paged_adapter.is_some(),
-            kv_format,
-        )
+        crate::models::qwen3_5::model::Qwen3_5ContextLimits {
+            governor_model_id: self
+                .memory_registration
+                .as_ref()
+                .map(|registration| registration.model_id() as f64),
+            ..crate::models::qwen3_5::model::Qwen3_5ContextLimits::from_parts(
+                self.paged_context_limits(),
+                self.paged_adapter.is_some(),
+                kv_format,
+            )
+        }
     }
 
     /// The context limits a load publishes, once its memory passed the

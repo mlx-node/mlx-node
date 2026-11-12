@@ -26,6 +26,7 @@ import { dirname, join, resolve } from 'node:path';
 // the family list must have exactly ONE definition (the drift guard's).
 import { CHAT_FAMILY_IDS, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
 import { readAgentDefaultModel } from '@mlx-node/agent/paths';
+import { DECODE_SHARE_ERROR, parseDecodeShare } from '@mlx-node/server/host/decode-share';
 import { IDLE_RELEASE_ERROR, parseIdleRelease } from '@mlx-node/server/host/idle-release';
 import { MAX_CONTEXT_ERROR, parseMaxContext } from '@mlx-node/server/host/max-context';
 import { MAX_MEMORY_ERROR, parseMaxMemory } from '@mlx-node/server/host/max-memory';
@@ -72,6 +73,10 @@ export interface AgentArgScan {
   maxContextTokens?: number;
   /** `--max-context` had a missing or unparseable value (the raw value, `''` when missing) — usage error. */
   maxContextInvalid?: string;
+  /** Value of `--decode-share` (lifted out of the argv, forwarded to `mlx serve`). */
+  decodeShare?: number;
+  /** `--decode-share` had a missing or unparseable value (the raw value, `''` when missing) — usage error. */
+  decodeShareInvalid?: string;
   /** Seconds of `--idle-release` (lifted out of the argv, forwarded to `mlx serve`); `Infinity` for `off`. */
   idleReleaseSeconds?: number;
   /** `--idle-release` had a missing or unparseable value (the raw value, `''` when missing) — usage error. */
@@ -259,6 +264,16 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       maxContextInvalid = value;
     }
   };
+  let decodeShare: number | undefined;
+  let decodeShareInvalid: string | undefined;
+  const takeDecodeShare = (value: string): void => {
+    try {
+      decodeShare = parseDecodeShare(value);
+      decodeShareInvalid = undefined;
+    } catch {
+      decodeShareInvalid = value;
+    }
+  };
   let idleReleaseSeconds: number | undefined;
   let idleReleaseInvalid: string | undefined;
   const takeIdleRelease = (value: string): void => {
@@ -366,6 +381,20 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       takeMaxContext(arg.slice('--max-context='.length));
       continue;
     }
+    if (arg === '--decode-share') {
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith('-')) {
+        decodeShareInvalid = '';
+      } else {
+        takeDecodeShare(next);
+        i++;
+      }
+      continue;
+    }
+    if (arg.startsWith('--decode-share=')) {
+      takeDecodeShare(arg.slice('--decode-share='.length));
+      continue;
+    }
     if (arg === '--idle-release') {
       const next = argv[i + 1];
       if (next === undefined || next.startsWith('-')) {
@@ -431,6 +460,8 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     ...(maxMemoryInvalid !== undefined ? { maxMemoryInvalid } : {}),
     ...(maxContextTokens !== undefined ? { maxContextTokens } : {}),
     ...(maxContextInvalid !== undefined ? { maxContextInvalid } : {}),
+    ...(decodeShare !== undefined ? { decodeShare } : {}),
+    ...(decodeShareInvalid !== undefined ? { decodeShareInvalid } : {}),
     ...(idleReleaseSeconds !== undefined ? { idleReleaseSeconds } : {}),
     ...(idleReleaseInvalid !== undefined ? { idleReleaseInvalid } : {}),
     help: helpSeen && !isSubcommand,
@@ -642,6 +673,10 @@ mlx options (handled before the agent binary sees the args):
                             every length, so pass more than the native window
                             only when a request needs it (default: auto, the
                             native window when memory holds it).
+  --decode-share <share>    Decode time owed per unit of prefill time while
+                            other requests generate (default: 0.5). Higher
+                            keeps their output faster during a long prompt and
+                            slows that prompt; 0 alternates one command each.
   --idle-release <duration> Time without a request before the engine unwires its
                             memory and frees the weights: seconds, or with an s,
                             m or h suffix, e.g. 30m (default: 10m); off keeps
@@ -820,6 +855,12 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     return;
   }
 
+  if (scan.decodeShareInvalid !== undefined) {
+    console.error(DECODE_SHARE_ERROR);
+    process.exitCode = 1;
+    return;
+  }
+
   if (scan.idleReleaseInvalid !== undefined) {
     console.error(IDLE_RELEASE_ERROR);
     process.exitCode = 1;
@@ -891,6 +932,7 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     ...(scan.kvFormat !== undefined ? { kvFormat: scan.kvFormat } : {}),
     ...(scan.maxMemoryBytes !== undefined ? { maxMemoryBytes: scan.maxMemoryBytes } : {}),
     ...(scan.maxContextTokens !== undefined ? { maxContextTokens: scan.maxContextTokens } : {}),
+    ...(scan.decodeShare !== undefined ? { decodeShare: scan.decodeShare } : {}),
     ...(scan.idleReleaseSeconds !== undefined ? { idleReleaseSeconds: scan.idleReleaseSeconds } : {}),
   });
 }

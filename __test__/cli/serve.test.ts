@@ -150,6 +150,20 @@ describe('parseServeArgs', () => {
     );
   });
 
+  // Splash `parse_decode_share`: a finite number of at least 0, unset 0.5.
+  // Mutation D1: the parser accepts negatives → red (`-1` passes).
+  it('decode_share_parses_as_splash', () => {
+    expect(parseServeArgs(['--decode-share', '0']).decodeShare).toBe(0);
+    expect(parseServeArgs(['--decode-share=0.5']).decodeShare).toBe(0.5);
+    expect(parseServeArgs(['--decode-share', '2']).decodeShare).toBe(2);
+    expect('decodeShare' in parseServeArgs([])).toBe(false);
+    for (const refused of ['-1', '-0.5', 'nan', 'inf', 'x', '']) {
+      expect(() => parseServeArgs([`--decode-share=${refused}`]), refused).toThrow(
+        '--decode-share must be a nonnegative number such as 0.5',
+      );
+    }
+  });
+
   it('maps --idle-release to seconds and rejects a bad duration', () => {
     expect(parseServeArgs(['--idle-release', '30m']).idleReleaseSeconds).toBe(1800);
     expect(parseServeArgs(['--idle-release=off']).idleReleaseSeconds).toBe(Infinity);
@@ -366,6 +380,41 @@ describe('mlx serve — end to end', () => {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
         expect(loads).toEqual([{ maxContextTokens: 102_400 }]);
+        const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
+        added[0]!('SIGINT');
+        for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      },
+    });
+    expect(exitCodes).toEqual([0]);
+  });
+
+  // Mutation: drop `decodeShare` from the `createInferenceHost` call → red.
+  it('hands --decode-share to the qwen model loader', async () => {
+    const modelsDir = await makeModelsDir(['alpha']);
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const loads: unknown[] = [];
+    const exitCodes: number[] = [];
+    const sigintBefore = new Set(listenersOf('SIGINT'));
+
+    await run(['--port', '0', '--models-dir', modelsDir, '--preload', 'alpha', '--decode-share', '0'], {
+      hostOverrides: {
+        disableStore: true,
+        sweepOrphanTempRoots: false,
+        pagedModelTypes: [],
+        estimateContextWindow: async () => null,
+        loadModel: async (_path: string, options?: unknown) => {
+          loads.push(options);
+          return {} as unknown as LoadableModel;
+        },
+      },
+      exit: (code) => exitCodes.push(code),
+      onReady: async () => {
+        for (let i = 0; i < 200 && loads.length === 0; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(loads).toEqual([{ decodeShare: 0 }]);
         const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
         added[0]!('SIGINT');
         for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
